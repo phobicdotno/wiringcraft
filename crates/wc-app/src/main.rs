@@ -2115,6 +2115,11 @@ impl App {
                             .auto_shrink([false, true])
                             .show(ui, |ui| {
                                 report_layout_form::show(ui, form);
+                                // What the layout names that the report or the title block does
+                                // not have, in the scroll area so OK and Cancel stay in view.
+                                for p in form.problems(&o.project) {
+                                    ui.colored_label(theme::Theme::of(ui.ctx()).warning, p);
+                                }
                                 ui.separator();
                                 let inputs = wc_report::Inputs {
                                     project: &o.project,

@@ -387,29 +387,84 @@ pub fn layout_warnings(i: &Inputs<'_>) -> Vec<String> {
             ));
             continue;
         }
-        let builtin = build_builtin(kind, i);
-        let known = |c: &str| builtin.columns.iter().any(|b| b == c);
-        for c in &layout.columns {
-            if !known(&c.from) {
-                out.push(format!(
-                    "report layout for \"{}\": no column \"{}\" (the columns are {})",
-                    layout.kind,
-                    c.from,
-                    builtin.columns.join(", ")
-                ));
-            }
+        out.extend(layout_problems(kind, layout, i));
+    }
+    out
+}
+
+/// What in `layout`, a layout for the report of `kind`, names nothing: a column, sort or
+/// group column the report does not have, or a header key no title block knows. The report
+/// layout dialog shows these for the layout being edited.
+pub fn layout_problems(kind: Kind, layout: &ReportLayout, i: &Inputs<'_>) -> Vec<String> {
+    layout_problems_for(&build_builtin(kind, i).columns, layout, i.project)
+}
+
+/// [`layout_problems`] for a report whose built-in columns are `columns`, for a caller that
+/// has them already (the report layout dialog), so the report is not built again for it.
+pub fn layout_problems_for(columns: &[String], layout: &ReportLayout, project: &Project) -> Vec<String> {
+    let mut out = Vec::new();
+    let known = |c: &str| columns.iter().any(|b| b == c);
+    for c in &layout.columns {
+        if !known(&c.from) {
+            out.push(format!(
+                "report layout for \"{}\": no column \"{}\" (the columns are {})",
+                layout.kind,
+                c.from,
+                columns.join(", ")
+            ));
         }
-        for entry in &layout.sort {
-            let (c, _) = ReportLayout::sort_key(entry);
-            if !known(c) {
-                out.push(format!(
-                    "report layout for \"{}\": cannot sort by \"{c}\", no such column",
-                    layout.kind
-                ));
-            }
+    }
+    for entry in &layout.sort {
+        let (c, _) = ReportLayout::sort_key(entry);
+        if !known(c) {
+            out.push(format!(
+                "report layout for \"{}\": cannot sort by \"{c}\", no such column",
+                layout.kind
+            ));
+        }
+    }
+    if let Some(g) = layout.group.as_deref().map(str::trim)
+        && !known(g)
+    {
+        out.push(format!(
+            "report layout for \"{}\": cannot group by \"{g}\", no such column (the columns are {})",
+            layout.kind,
+            columns.join(", ")
+        ));
+    }
+    let keys = header_keys(project);
+    for key in &layout.header {
+        if !keys.contains(key) {
+            out.push(format!(
+                "report layout for \"{}\": header \"{key}\" is not a title-block field (one of {})",
+                layout.kind,
+                keys.join(", ")
+            ));
         }
     }
     out
+}
+
+/// The keys a report layout's `header` can name: the project name, the page keys a title
+/// block uses, the usual title-block fields and any other the project or one of its pages has.
+fn header_keys(project: &Project) -> Vec<String> {
+    use wc_core::template::{PAGE_NUMBER, PAGE_TITLE, PROJECT_NAME, SHEET};
+    let mut keys: Vec<String> = [PROJECT_NAME, PAGE_TITLE, PAGE_NUMBER, SHEET]
+        .into_iter()
+        .chain(wc_core::project::TITLE_FIELDS.iter().map(|(k, _)| *k))
+        .map(str::to_owned)
+        .collect();
+    let others = project
+        .meta
+        .title_block
+        .keys()
+        .chain(project.pages.iter().flat_map(|p| p.title_block.keys()));
+    for k in others {
+        if !keys.contains(k) {
+            keys.push(k.clone());
+        }
+    }
+    keys
 }
 
 /// The report of `kind` in its built-in layout.

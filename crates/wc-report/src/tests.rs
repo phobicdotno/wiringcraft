@@ -2380,6 +2380,50 @@ fn report_layouts_that_name_nothing_are_reported() {
 }
 
 #[test]
+fn a_report_layouts_unknown_group_column_and_header_keys_are_reported() {
+    use wc_core::report_layout::ReportLayout;
+    let (mut p, s, parts) = fixture();
+    p.meta.title_block.insert("contract".into(), "K-7".into());
+    p.pages[0].title_block.insert("approved_by".into(), "AB".into());
+    p.meta.reports = vec![ReportLayout {
+        kind: "wires".into(),
+        group: Some(" Maker ".into()),
+        header: [
+            "project.name",
+            "revision",
+            "contract",
+            "approved_by",
+            "page.sheet",
+            "revison",
+        ]
+        .map(String::from)
+        .to_vec(),
+        ..Default::default()
+    }];
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let w = layout_warnings(&i);
+    assert_eq!(w.len(), 2, "{w:?}");
+    assert!(w[0].contains("cannot group by \"Maker\", no such column"), "{w:?}");
+    assert!(w[1].contains("header \"revison\" is not a title-block field"), "{w:?}");
+    assert!(w[1].contains("contract") && w[1].contains("approved_by"), "{w:?}");
+
+    // A group column the report has, and known header keys only: nothing to say.
+    let column = build(Kind::Wires, &i).columns[0].clone();
+    p.meta.reports[0].group = Some(column);
+    p.meta.reports[0].header.pop();
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    assert!(layout_warnings(&i).is_empty(), "{:?}", layout_warnings(&i));
+}
+
+#[test]
 fn check_runs_the_projects_own_rules() {
     let (mut p, s, parts) = fixture();
     use wc_core::check_rule::CheckRule;
