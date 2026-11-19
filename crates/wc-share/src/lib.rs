@@ -41,7 +41,7 @@ pub mod transport;
 pub use guest::{Guest, GuestStatus};
 pub use history::{ChangeInfo, ChangeKind, MAX_HISTORY, Parts, note, redo_target, undo_target};
 pub use host::{HOST, Host};
-pub use journal::{Change, GitJournal, Journal, MemoryJournal, write_picture};
+pub use journal::{Change, GitJournal, Journal, MemoryJournal, replace_picture, write_picture};
 pub use protocol::{
     GuestMsg, HostMsg, MAX_ADDED_PICTURE_BYTES, MAX_ADDED_PICTURES, MAX_PICTURE, PROTOCOL_VERSION, Peer, PeerId,
     Picture, ProjectEdit, Refusal, Snapshot, VersionMismatch, apply_edit, same_but_number,

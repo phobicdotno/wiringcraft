@@ -1544,8 +1544,8 @@ pub fn new_pictures(
 /// Copy the picture `file` of `open` under a new name in the same folder, one the session is not
 /// likely to have (the name with a mark of the moment), and make the project name it instead:
 /// only the references in `only` when given (the ones this copy picked it in), else every one.
-/// The old file stays. Returns the new name.
-fn rename_picture(open: &mut Open, file: &str, only: Option<&BTreeSet<PicRef>>) -> Result<String, String> {
+/// The old file stays. Returns the new name, and the content copied there.
+fn rename_picture(open: &mut Open, file: &str, only: Option<&BTreeSet<PicRef>>) -> Result<(String, Vec<u8>), String> {
     // Read as an export reads it: never through a link out of the project folder.
     let data = match wc_pdf::read_picture(&open.dir, file) {
         Ok(Some(data)) => data,
@@ -1608,7 +1608,7 @@ fn rename_picture(open: &mut Open, file: &str, only: Option<&BTreeSet<PicRef>>) 
         }
     }
     open.dirty = true;
-    Ok(new)
+    Ok((new, picture.data))
 }
 
 /// The picture state of [`Share`] that [`rename_pictures`] keeps.
@@ -1620,6 +1620,25 @@ struct Pictures<'a> {
     picks: &'a mut BTreeMap<String, BTreeSet<PicRef>>,
 }
 
+/// [`wc_share::replace_picture`]. Tests can make it report an error after it ran
+/// (`PUT_BACK_FAILS`), as when the moved file could not be read again.
+fn put_back_picture(dir: &Path, picture: &Picture, was: &[u8]) -> wc_share::Result<()> {
+    let done = wc_share::replace_picture(dir, picture, was);
+    #[cfg(test)]
+    if PUT_BACK_FAILS.with(std::cell::Cell::get) {
+        return done.and(Err(
+            std::io::Error::other("the earlier file could not be read again").into()
+        ));
+    }
+    done
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: [`put_back_picture`] reports an error even when the session's file went in.
+    pub(super) static PUT_BACK_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Give the pictures in `taken`, whose names the session has for other files, a name of
 /// their own here, together with those whose rename failed a while ago. A failed rename is
 /// kept and tried again after [`ITEM_RETRY_LATER`] while the project still uses the picture,
@@ -1628,7 +1647,8 @@ struct Pictures<'a> {
 /// A picture whose file here is the session's again (put back since it was sent) is not
 /// renamed: it is taken as the session's (into `pictures_taken`, no longer `replaced`), and
 /// nothing is sent. A picture this copy picked (in `picks`) is renamed only in the references
-/// it was picked in, unless its file replaced the session's (`replaced`): then in all.
+/// it was picked in, unless its file replaced the session's (`replaced`): then in all, and the
+/// session's file is put back under the old name here, taken as the session's.
 /// Returns the pictures renamed.
 fn rename_pictures(
     open: &mut Open,
@@ -1684,12 +1704,46 @@ fn rename_pictures(
         } else {
             picks.get(&file)
         };
+        let everywhere = only.is_none();
         match rename_picture(open, &file, only) {
-            Ok(new) => {
+            Ok((new, copied)) => {
                 pictures_out.remove(&file);
                 renames_due.remove(&file);
                 picks.remove(&file);
                 renamed.insert(file.clone());
+                // The person's file has its own name now; what is left under the old one is no
+                // longer theirs: the session's file goes there, so a later use of the session's
+                // picture shows it here, and it is never taken for a replacement again.
+                // Only while the file there is still what was copied: one changed since is the
+                // person's, and stays.
+                if everywhere && let Some(theirs) = session.get(&file) {
+                    let picture = Picture {
+                        file: file.clone(),
+                        data: theirs.clone(),
+                    };
+                    match put_back_picture(&open.dir, &picture, &copied) {
+                        Ok(()) => {
+                            replaced.remove(&file);
+                            open.underlays.remove(&file);
+                            open.picture_problems.remove(&file);
+                            // The version first: a write after it makes the next look read the
+                            // file again.
+                            let version = picture_version(&open.dir, &file);
+                            if matches!(wc_pdf::read_picture(&open.dir, &file), Ok(Some(data)) if data == *theirs)
+                                && let Some(version) = version
+                            {
+                                pictures_taken.insert(file.clone(), version);
+                            }
+                        }
+                        Err(e) => {
+                            // The name may hold the session's file now: what is there is read again.
+                            open.underlays.remove(&file);
+                            notes.push(format!(
+                                "The session's {file} could not be put back here in place of your earlier file: {e}."
+                            ));
+                        }
+                    }
+                }
                 notes.push(format!(
                     "The session already has another file named {file}; your picture is renamed {new} here and sent again under that name."
                 ));

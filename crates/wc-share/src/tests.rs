@@ -3057,6 +3057,78 @@ fn a_picture_is_put_in_place_whole_and_leaves_no_part_file() -> TestResult {
 }
 
 #[test]
+fn a_picture_is_replaced_only_while_it_holds_what_it_held() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path();
+    write_picture(dir, &picture("pictures/logo.png", b"mine"))?;
+    // Something else there meanwhile: refused, and left as it is.
+    assert!(matches!(
+        replace_picture(dir, &picture("pictures/logo.png", b"theirs"), b"other"),
+        Err(Error::PictureNameTaken(_))
+    ));
+    assert_eq!(std::fs::read(dir.join("pictures/logo.png"))?, b"mine");
+    let names: Vec<_> = std::fs::read_dir(dir.join("pictures"))?
+        .map(|e| e.map(|e| e.file_name()))
+        .collect::<std::io::Result<_>>()?;
+    assert_eq!(names, ["logo.png"], "nothing is left aside");
+    replace_picture(dir, &picture("pictures/logo.png", b"theirs"), b"mine")?;
+    assert_eq!(std::fs::read(dir.join("pictures/logo.png"))?, b"theirs");
+    let names: Vec<_> = std::fs::read_dir(dir.join("pictures"))?
+        .map(|e| e.map(|e| e.file_name()))
+        .collect::<std::io::Result<_>>()?;
+    assert_eq!(names, ["logo.png"], "no part file is left");
+    Ok(())
+}
+
+// Unix only: elsewhere a file another program holds open is not moved at all.
+#[cfg(unix)]
+#[test]
+fn a_picture_written_to_while_it_is_replaced_is_kept() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path();
+    write_picture(dir, &picture("pictures/logo.png", b"mine"))?;
+    // A program that had the file open writes to it once it was compared.
+    let mut open = std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("pictures/logo.png"))?;
+    let wrote = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let result = wrote.clone();
+    crate::journal::AFTER_COMPARE.with(|f| {
+        *f.borrow_mut() = Some(Box::new(move |_: &std::path::Path| {
+            use std::io::Write;
+            *result.borrow_mut() = Some(open.write_all(b"edit").and_then(|()| open.sync_all()));
+        }));
+    });
+    let r = replace_picture(dir, &picture("pictures/logo.png", b"theirs"), b"mine");
+    wrote.borrow_mut().take().ok_or("the hook did not run")??;
+    assert!(matches!(r, Err(Error::PictureNameTaken(_))), "{r:?}");
+    assert_eq!(std::fs::read(dir.join("pictures/logo.png"))?, b"theirs");
+    // The edit is kept beside it.
+    let entries = std::fs::read_dir(dir.join("pictures"))?.collect::<std::io::Result<Vec<_>>>()?;
+    let kept: Vec<Vec<u8>> = entries
+        .iter()
+        .filter(|e| e.file_name() != "logo.png")
+        .map(|e| std::fs::read(e.path()))
+        .collect::<std::io::Result<_>>()?;
+    assert_eq!(kept, [b"edit".to_vec()]);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_picture_is_never_replaced_through_a_link() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let outside = tempfile::tempdir()?;
+    std::fs::write(outside.path().join("logo.png"), b"mine")?;
+    std::fs::create_dir(tmp.path().join("pictures"))?;
+    std::os::unix::fs::symlink(outside.path().join("logo.png"), tmp.path().join("pictures/logo.png"))?;
+    let r = replace_picture(tmp.path(), &picture("pictures/logo.png", b"theirs"), b"mine");
+    assert!(r.is_err(), "{r:?}");
+    assert_eq!(std::fs::read(outside.path().join("logo.png"))?, b"mine");
+    Ok(())
+}
+
+#[test]
 fn a_file_in_the_way_of_a_pictures_folder_is_a_storage_failure_and_not_a_taken_name() -> TestResult {
     let tmp = tempfile::tempdir()?;
     // `create_dir_all` fails with `AlreadyExists` here, which is no other picture's name.
@@ -3730,6 +3802,27 @@ fn a_shared_file_holding_another_symbol_is_the_file_of_neither() {
     assert!(missing.contains(&(ItemKind::Symbol, "a".into())), "{missing:?}");
     assert!(missing.contains(&(ItemKind::Symbol, "b".into())), "{missing:?}");
     assert!(host.files().0.is_empty());
+}
+
+#[test]
+fn a_moved_picture_that_cannot_be_read_again_says_why() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path();
+    write_picture(dir, &picture("pictures/logo.png", b"mine"))?;
+    // Once compared, the moved file becomes something that cannot be read as a file.
+    let made = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let result = made.clone();
+    crate::journal::AFTER_COMPARE.with(|f| {
+        *f.borrow_mut() = Some(Box::new(move |aside: &std::path::Path| {
+            *result.borrow_mut() = Some(std::fs::remove_file(aside).and_then(|()| std::fs::create_dir(aside)));
+        }));
+    });
+    let r = replace_picture(dir, &picture("pictures/logo.png", b"theirs"), b"mine");
+    made.borrow_mut().take().ok_or("the hook did not run")??;
+    let message = r.err().map(|e| e.to_string()).ok_or("no error")?;
+    assert!(message.contains("could not be read again"), "{message}");
+    assert_eq!(std::fs::read(dir.join("pictures/logo.png"))?, b"theirs");
+    Ok(())
 }
 
 #[test]

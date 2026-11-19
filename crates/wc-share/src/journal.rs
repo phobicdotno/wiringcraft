@@ -246,6 +246,165 @@ impl Journal for GitJournal {
 /// show it, or the person picked it here) and is [`crate::Error::PictureNameTaken`]. The file
 /// always lands inside the project, even when a folder on the way is a link.
 pub fn write_picture(dir: &std::path::Path, picture: &Picture) -> Result<()> {
+    use std::io::ErrorKind;
+    let (path, folder) = picture_place(dir, picture)?;
+    let existing = || -> Result<()> {
+        match std::fs::read(&path) {
+            Ok(have) if have == picture.data => Ok(()),
+            Ok(_) => Err(crate::Error::PictureNameTaken(format!(
+                "the project already has another picture named {}",
+                picture.file
+            ))),
+            Err(e) => Err(e.into()),
+        }
+    };
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => return existing(),
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    // The whole file is written beside it first and then put in place without replacing
+    // anything, so a failed write never leaves a cut-off picture under the name.
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("picture");
+    let part = stage(&folder, name, &picture.data)?;
+    let published = publish(&part, &path);
+    let _ = std::fs::remove_file(&part);
+    match published {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => existing(),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Put `picture` in place of the file of its name in the project folder `dir`, which must hold
+/// `was` still: anything else there is [`crate::Error::PictureNameTaken`] and stays. Nothing
+/// written there meanwhile is lost: the file is first moved aside in one step (a later write
+/// makes a new file under the name), compared there, and only then is the new file put under
+/// the name, without replacing anything. The name never holds a cut-off picture. Like
+/// [`write_picture`], never through a link out of the project.
+pub fn replace_picture(dir: &std::path::Path, picture: &Picture, was: &[u8]) -> Result<()> {
+    use std::io::ErrorKind;
+    let (path, folder) = picture_place(dir, picture)?;
+    let changed = || crate::Error::PictureNameTaken(format!("{} changed meanwhile", picture.file));
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("picture");
+    let aside = free_part_name(&folder, "aside")?;
+    std::fs::rename(&path, &aside)?;
+    let held = std::fs::read(&aside);
+    if !held.as_ref().is_ok_and(|have| have == was) {
+        // Not the file it was: it goes back under its name, unless one was written there since;
+        // then both are kept, the moved one beside it.
+        return match publish(&aside, &path) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&aside);
+                Err(held.err().map_or_else(changed, Into::into))
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => Err(crate::Error::PictureNameTaken(format!(
+                "{} changed meanwhile; the earlier file is kept as {}",
+                picture.file,
+                aside.display()
+            ))),
+            Err(e) => Err(e.into()),
+        };
+    }
+    #[cfg(test)]
+    AFTER_COMPARE.with(|f| {
+        if let Some(f) = f.borrow_mut().take() {
+            f(&aside);
+        }
+    });
+    let part = match stage(&folder, name, &picture.data) {
+        Ok(part) => part,
+        Err(e) => return Err(restore_aside(&aside, &path, e)),
+    };
+    let published = publish(&part, &path);
+    let _ = std::fs::remove_file(&part);
+    // The moved file is dropped only while it still holds `was` (the caller's copy): a program
+    // that had it open may have written to it since it was compared. Then it is kept beside the
+    // name, and the error says where.
+    let drop_aside = || -> std::result::Result<(), crate::Error> {
+        match std::fs::read(&aside) {
+            Ok(have) if have == was => {
+                let _ = std::fs::remove_file(&aside);
+                Ok(())
+            }
+            Ok(_) => Err(crate::Error::PictureNameTaken(format!(
+                "{} was written to while it was replaced; that version is kept as {}",
+                picture.file,
+                aside.display()
+            ))),
+            Err(e) => Err(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "the earlier {} could not be read again ({e}); it is kept as {}",
+                    picture.file,
+                    aside.display()
+                ),
+            )
+            .into()),
+        }
+    };
+    match published {
+        Ok(()) => drop_aside(),
+        // Written there since it was moved aside: that one stays.
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => drop_aside().and(Err(changed())),
+        Err(e) => Err(restore_aside(&aside, &path, e)),
+    }
+}
+
+/// Tests: see [`AFTER_COMPARE`].
+#[cfg(test)]
+pub(crate) type AfterCompare = Option<Box<dyn FnOnce(&std::path::Path)>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: run once by [`replace_picture`] on the moved file, right after it was compared.
+    pub(crate) static AFTER_COMPARE: std::cell::RefCell<AfterCompare> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// After `failed`, put the file moved `aside` back at `path`. When that fails too, the error
+/// says both, and where the file is kept.
+fn restore_aside(aside: &std::path::Path, path: &std::path::Path, failed: std::io::Error) -> crate::Error {
+    match publish(aside, path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(aside);
+            failed.into()
+        }
+        Err(e) => std::io::Error::new(
+            failed.kind(),
+            format!(
+                "{failed}; putting {} back failed too ({e}): it is kept as {}",
+                path.display(),
+                aside.display()
+            ),
+        )
+        .into(),
+    }
+}
+
+/// A name in `folder` no file has yet, for a file of this crate's own (`kind`).
+fn free_part_name(folder: &std::path::Path, kind: &str) -> std::io::Result<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    for _ in 0..16 {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = folder.join(format!(".wc-{}-{nanos}-{n}.{kind}", std::process::id()));
+        if std::fs::symlink_metadata(&path).is_err() {
+            return Ok(path);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("no free name for a {kind} file"),
+    ))
+}
+
+/// Where `picture` goes in the project folder `dir`, and its folder (made when missing), once
+/// both are known to be inside the project and the place is no link.
+fn picture_place(dir: &std::path::Path, picture: &Picture) -> Result<(PathBuf, PathBuf)> {
     use std::io::{Error, ErrorKind};
     if let Some(why) = picture.problem() {
         return Err(Error::new(ErrorKind::InvalidInput, why).into());
@@ -276,35 +435,11 @@ pub fn write_picture(dir: &std::path::Path, picture: &Picture) -> Result<()> {
     if !folder.canonicalize()?.starts_with(&root) {
         return Err(outside());
     }
-    let existing = || -> Result<()> {
-        match std::fs::read(&path) {
-            Ok(have) if have == picture.data => Ok(()),
-            Ok(_) => Err(crate::Error::PictureNameTaken(format!(
-                "the project already has another picture named {}",
-                picture.file
-            ))),
-            Err(e) => Err(e.into()),
-        }
-    };
     if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(outside());
     }
-    match std::fs::symlink_metadata(&path) {
-        Ok(_) => return existing(),
-        Err(e) if e.kind() == ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
-    }
-    // The whole file is written beside it first and then put in place without replacing
-    // anything, so a failed write never leaves a cut-off picture under the name.
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("picture");
-    let part = stage(folder, name, &picture.data)?;
-    let published = publish(&part, &path);
-    let _ = std::fs::remove_file(&part);
-    match published {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == ErrorKind::AlreadyExists => existing(),
-        Err(e) => Err(e.into()),
-    }
+    let folder = folder.to_path_buf();
+    Ok((path, folder))
 }
 
 /// Write `data` to a part file in `folder` that this call makes new, under a name no other

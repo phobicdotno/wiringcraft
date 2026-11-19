@@ -2672,6 +2672,90 @@ fn a_picture_replaced_here_under_its_name_reaches_the_session_under_a_name_of_it
 }
 
 #[test]
+fn the_session_picture_a_renamed_replacement_left_shows_here_and_is_not_sent_again() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let src = tmp.path().join("logo.png");
+    std::fs::write(&src, PNG)?;
+    let file = guest_open.set_logo_from(&src)?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    // The guest replaces the session's picture in its folder: refused, and renamed here.
+    let new = b"\x89PNG\r\n\x1a\nanother logo".to_vec();
+    std::fs::write(guest_open.dir.join(&file), &new)?;
+    for _ in 0..5 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    let renamed = guest_open
+        .project
+        .meta
+        .logo
+        .as_ref()
+        .map(|l| l.file.clone())
+        .ok_or("no logo")?;
+    assert_ne!(renamed, file);
+    assert_eq!(file_bytes(&guest_open.dir, &renamed)?, new);
+    // What is left under the old name is the session's picture again.
+    assert_eq!(file_bytes(&guest_open.dir, &file)?, PNG);
+    g.take_notes();
+    // The host then uses its picture of the old name as page 2's underlay.
+    host_open.project.page_mut("p0002").ok_or("no page")?.underlay = Some(wc_core::Underlay {
+        file: file.clone(),
+        min: wc_core::Point::new(0.0, 0.0),
+        max: wc_core::Point::new(10.0, 10.0),
+    });
+    let n = log.messages().len();
+    for _ in 0..6 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    let underlay = |o: &Open| {
+        o.project
+            .page("p0002")
+            .and_then(|p| p.underlay.as_ref())
+            .map(|u| u.file.clone())
+    };
+    assert_eq!(underlay(&host_open).as_deref(), Some(file.as_str()));
+    assert_eq!(underlay(&guest_open).as_deref(), Some(file.as_str()));
+    assert_eq!(file_bytes(&guest_open.dir, &file)?, PNG);
+    assert_eq!(file_bytes(&host_open.dir, &file)?, PNG);
+    // Nothing is sent again or renamed.
+    let notes = g.take_notes();
+    assert!(!notes.iter().any(|n| n.contains("renamed")), "{notes:?}");
+    assert_eq!(log.messages().len(), n + 1, "{:?}", &log.messages()[n..]);
+    Ok(())
+}
+
+#[test]
+fn a_put_back_that_reports_an_error_shows_what_the_name_holds_now() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    let src = tmp.path().join("logo.png");
+    std::fs::write(&src, PNG)?;
+    let file = guest_open.set_logo_from(&src)?;
+    for _ in 0..3 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    // The guest replaces the session's picture in its folder; the window shows it. Putting the
+    // session's file back under the name then goes through, but reports an error.
+    std::fs::write(guest_open.dir.join(&file), b"\x89PNG\r\n\x1a\nanother logo")?;
+    guest_open.underlays.insert(file.clone(), None);
+    super::PUT_BACK_FAILS.with(|f| f.set(true));
+    for _ in 0..5 {
+        frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    }
+    super::PUT_BACK_FAILS.with(|f| f.set(false));
+    let notes = g.take_notes();
+    assert!(notes.iter().any(|n| n.contains("could not be put back")), "{notes:?}");
+    assert_eq!(file_bytes(&guest_open.dir, &file)?, PNG);
+    // What the window showed under the name is read again.
+    assert!(!guest_open.underlays.contains_key(&file));
+    Ok(())
+}
+
+#[test]
 fn a_picture_the_host_replaced_in_its_folder_gets_a_name_of_its_own() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
@@ -3426,7 +3510,7 @@ fn a_picture_renamed_for_some_references_leaves_the_others() -> TestResult {
         min: wc_core::Point::new(0.0, 0.0),
         max: wc_core::Point::new(10.0, 10.0),
     });
-    let new = rename_picture(&mut open, &file, Some(&[PicRef::Logo].into()))?;
+    let (new, _) = rename_picture(&mut open, &file, Some(&[PicRef::Logo].into()))?;
     assert_eq!(
         open.project.meta.logo.as_ref().map(|l| l.file.as_str()),
         Some(new.as_str())
@@ -5920,7 +6004,7 @@ fn a_picture_renamed_for_the_session_keeps_its_name_within_255_bytes() -> TestRe
         file: file.clone(),
         cover: None,
     });
-    let new = rename_picture(&mut open, &file, None)?;
+    let (new, _) = rename_picture(&mut open, &file, None)?;
     let name = new.rsplit('/').next().ok_or("no name")?;
     assert!(name.len() <= 255 && name.ends_with(".png"), "{name}");
     assert_eq!(std::fs::read(open.dir.join(&new))?, PNG);
