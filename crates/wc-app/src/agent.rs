@@ -4985,9 +4985,37 @@ mod tests {
                 .iter()
                 .all(|g| !matches!(g, wc_core::Shape::Text { text, .. } if text == "fallback"))
         );
-        // Cleared by hand, a cell uses the default again.
+        // Typed in and cleared in the dialog, a cell uses the default again.
         let mut form = crate::macro_form::Form::open(&path).unwrap();
-        form.sets[0].stored_empty[2] = false;
+        let ctx = egui::Context::default();
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let cell = crate::macro_form::cell_id(0, 2);
+        for events in [
+            vec![],
+            vec![egui::Event::Text("7".into())],
+            vec![key(egui::Key::Backspace)],
+            vec![],
+        ] {
+            let raw = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| crate::macro_form::show(ui, &mut form));
+                ctx.memory_mut(|m| m.request_focus(cell));
+            });
+        }
+        assert_eq!(form.sets[0].values[2], "");
+        assert!(
+            !form.sets[0].stored_empty[2],
+            "edited, it is no longer the stored empty value"
+        );
         form.save().unwrap();
         let saved = wc_core::macros::read_macro(&path).unwrap();
         assert_eq!(saved.value_set("one").unwrap().values.get("Ø"), None);
@@ -5025,6 +5053,12 @@ mod tests {
         let err = form.save().unwrap_err();
         assert!(err.contains("changed outside"), "{err}");
         assert_eq!(wc_core::macros::read_macro(&path).unwrap(), changed);
+        // A file that cannot be read again says why, not that it changed.
+        let form = crate::macro_form::Form::open(&path).unwrap();
+        std::fs::write(&path, "{ not json").unwrap();
+        let err = form.save().unwrap_err();
+        assert!(err.contains("could not be read again"), "{err}");
+        wc_core::macros::write_macro(&open.dir, "swap", &changed).unwrap();
 
         // A library source named "project" is still a library: its macros are not the project's.
         let lib = tmp.path().join("lib");

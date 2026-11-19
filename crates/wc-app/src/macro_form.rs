@@ -175,7 +175,9 @@ impl Form {
     /// is not written over: the form stays as it is and the change is reported.
     pub fn save(&self) -> Result<PathBuf, String> {
         let m = self.to_macro()?;
-        if wc_core::macros::read_macro(&self.path).ok().as_ref() != Some(&self.base) {
+        let now = wc_core::macros::read_macro(&self.path)
+            .map_err(|e| format!("{} could not be read again before saving: {e}", self.path.display()))?;
+        if now != self.base {
             return Err(format!(
                 "{} was changed outside this dialog since it opened. Close the dialog and open it \
                  again to edit the file as it is now.",
@@ -199,6 +201,11 @@ impl Form {
 fn field(ui: &mut egui::Ui, value: &mut String, width: f32, hint: &str) -> bool {
     ui.add(egui::TextEdit::singleline(value).desired_width(width).hint_text(hint))
         .changed()
+}
+
+/// The id of the text field of value set `set`'s value for placeholder `i`.
+pub fn cell_id(set: usize, i: usize) -> egui::Id {
+    egui::Id::new(("macro-set-cell", set, i))
 }
 
 /// Draw the form.
@@ -260,11 +267,21 @@ pub fn show(ui: &mut egui::Ui, form: &mut Form) {
                     field(ui, &mut s.description, 140.0, "");
                     s.values.resize(form.placeholders.len(), String::new());
                     s.stored_empty.resize(form.placeholders.len(), false);
-                    for ((v, empty), p) in s.values.iter_mut().zip(&mut s.stored_empty).zip(&form.placeholders) {
+                    for (k, ((v, empty), p)) in s
+                        .values
+                        .iter_mut()
+                        .zip(&mut s.stored_empty)
+                        .zip(&form.placeholders)
+                        .enumerate()
+                    {
                         // A value stored empty stays empty until it is edited; cleared, a cell
                         // uses the default.
                         let hint = if *empty { "(empty)" } else { p.default.as_str() };
-                        if field(ui, v, 90.0, hint) {
+                        let edit = egui::TextEdit::singleline(v)
+                            .id(cell_id(i, k))
+                            .desired_width(90.0)
+                            .hint_text(hint);
+                        if ui.add(edit).changed() {
                             *empty = false;
                         }
                     }
