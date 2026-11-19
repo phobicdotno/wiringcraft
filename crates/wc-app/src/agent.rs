@@ -2953,22 +2953,42 @@ impl Guarded {
             let mut files = std::collections::HashSet::new();
             let mut unknown = None;
             let mut todo = roots.clone();
+            // A folder that cannot be listed, or an entry that cannot be looked at, hides
+            // files too, so it is recorded like a file whose identity cannot be read.
+            let mut note = |at: &Path, e: std::io::Error| {
+                unknown.get_or_insert_with(|| format!("{}: {e}", at.display()));
+            };
             while let Some(at) = todo.pop() {
-                let Ok(m) = std::fs::symlink_metadata(&at) else {
-                    continue;
+                let m = match std::fs::symlink_metadata(&at) {
+                    Ok(m) => m,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => {
+                        note(&at, e);
+                        continue;
+                    }
                 };
                 if m.is_dir() {
-                    let entries = std::fs::read_dir(&at).into_iter().flatten().flatten();
-                    todo.extend(entries.filter(|e| e.file_name() != ".git").map(|e| e.path()));
+                    let entries = match std::fs::read_dir(&at) {
+                        Ok(entries) => entries,
+                        Err(e) => {
+                            note(&at, e);
+                            continue;
+                        }
+                    };
+                    for entry in entries {
+                        match entry {
+                            Ok(e) if e.file_name() == ".git" => {}
+                            Ok(e) => todo.push(e.path()),
+                            Err(e) => note(&at, e),
+                        }
+                    }
                 } else if m.is_file() {
                     match file_id(&at) {
                         Ok(Some(id)) => {
                             files.insert(id);
                         }
                         Ok(None) => {}
-                        Err(e) => {
-                            unknown.get_or_insert_with(|| format!("{}: {e}", at.display()));
-                        }
+                        Err(e) => note(&at, e),
                     }
                 }
             }
@@ -6194,6 +6214,31 @@ mod tests {
                 let e = r.unwrap_err();
                 assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
             }
+            // A project folder that cannot be listed hides its files, so a hard link to one of
+            // them is refused with the reason rather than taken as no match.
+            let pages = project.path().join("pages");
+            std::fs::create_dir(&pages).unwrap();
+            std::fs::write(pages.join("p0001.page.json"), "{}").unwrap();
+            let linked = tempfile::tempdir().unwrap();
+            std::fs::hard_link(pages.join("p0001.page.json"), linked.path().join("a.json")).unwrap();
+            let linked_path = linked.path().display().to_string();
+            std::fs::set_permissions(&pages, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let listed = std::fs::read_dir(&pages).is_ok();
+            let blind = Guarded::new(project.path());
+            let r = blind.reached_by(linked.path(), &linked_path);
+            std::fs::set_permissions(&pages, std::fs::Permissions::from_mode(0o700)).unwrap();
+            if !listed {
+                let e = r.unwrap_err();
+                assert!(e.to_string().contains("pages"), "{e}");
+            }
+            // Listed, the link is found and an unrelated copy is still fine.
+            let seen = Guarded::new(project.path());
+            assert!(seen.unknown.is_none());
+            assert!(seen.reached_by(linked.path(), &linked_path).unwrap());
+            let copy = tempfile::tempdir().unwrap();
+            std::fs::write(copy.path().join("a.json"), "{}").unwrap();
+            let copy_path = copy.path().display().to_string();
+            assert!(!seen.reached_by(copy.path(), &copy_path).unwrap());
         }
     }
 
