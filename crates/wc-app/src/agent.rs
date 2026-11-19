@@ -2827,19 +2827,19 @@ fn writes_while_held(args: &[String], dir: &Path, held: &BTreeMap<String, String
             args.join(" ")
         ));
     }
-    let roots = project_roots(dir);
+    let project = Guarded::new(dir);
     // Run from inside the project folder, even a bare file name could land on a held page.
-    if inside(&roots, cwd) {
+    if project.holds(cwd) {
         return Some(format!(
             "`wiringcraft {}` is not run while {who} has a page open in the shared session: this program runs \
              from inside the project folder, so an output file could land on a page. Start it from another folder.",
             args.join(" ")
         ));
     }
-    if let Some(a) = args.iter().find(|a| in_project(&roots, cwd, split_flag(a).1)) {
+    if let Some(a) = args.iter().find(|a| project.reached_by(cwd, split_flag(a).1)) {
         return Some(format!(
-            "`{a}` is in the project folder, and {who} has a page open in the shared session: write the \
-             output outside the project folder."
+            "`{a}` is in the project folder or links to a file in it, and {who} has a page open in the \
+             shared session: write the output to a folder of its own outside the project folder."
         ));
     }
     None
@@ -2853,18 +2853,101 @@ fn split_flag(a: &str) -> (&str, &str) {
     }
 }
 
-/// Whether `value` is a path into the project (see [`project_roots`]): an absolute path, or
-/// one relative to `cwd` that is clearly a path (it has a separator or starts with a dot).
-fn in_project(roots: &[PathBuf], cwd: &Path, value: &str) -> bool {
-    let p = Path::new(value);
-    let path = if p.is_absolute() {
-        p.to_path_buf()
-    } else if value.contains('/') || value.contains('\\') || value.starts_with('.') {
-        cwd.join(p)
-    } else {
-        return false;
-    };
-    inside(roots, &path)
+/// The project's files, to tell whether a command's output could land on one.
+struct Guarded {
+    /// See [`project_roots`].
+    roots: Vec<PathBuf>,
+    /// Device and file number of each project file, so a hard link to one is known too.
+    #[cfg(unix)]
+    files: std::collections::HashSet<(u64, u64)>,
+}
+
+/// How many files in an output folder are looked at; a bigger folder is not used while a
+/// page is held.
+const OUTPUT_FOLDER_FILES: usize = 10_000;
+
+impl Guarded {
+    fn new(project: &Path) -> Self {
+        let roots = project_roots(project);
+        #[cfg(unix)]
+        let files = {
+            use std::os::unix::fs::MetadataExt;
+            let mut files = std::collections::HashSet::new();
+            let mut todo = roots.clone();
+            while let Some(at) = todo.pop() {
+                let Ok(m) = std::fs::symlink_metadata(&at) else {
+                    continue;
+                };
+                if m.is_dir() {
+                    let entries = std::fs::read_dir(&at).into_iter().flatten().flatten();
+                    todo.extend(entries.filter(|e| e.file_name() != ".git").map(|e| e.path()));
+                } else if m.is_file() {
+                    files.insert((m.dev(), m.ino()));
+                }
+            }
+            files
+        };
+        Self {
+            roots,
+            #[cfg(unix)]
+            files,
+        }
+    }
+
+    /// Whether `path`, as the file system resolves it, is in the project or is one of its
+    /// files under another name.
+    fn holds(&self, path: &Path) -> bool {
+        if inside(&self.roots, path) {
+            return true;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let Ok(m) = std::fs::metadata(path) {
+                return m.is_file() && self.files.contains(&(m.dev(), m.ino()));
+            }
+        }
+        false
+    }
+
+    /// Whether writing to `value` could land on a project file: it is a path into the project
+    /// or a link to a file in it, or it is a folder with such a link in it (an export writes
+    /// its own file names there). `value` counts as a path when it is absolute, clearly a
+    /// path (it has a separator or starts with a dot), or names something in `cwd`.
+    fn reached_by(&self, cwd: &Path, value: &str) -> bool {
+        let p = Path::new(value);
+        let path = if p.is_absolute() {
+            p.to_path_buf()
+        } else if value.contains('/')
+            || value.contains('\\')
+            || value.starts_with('.')
+            || (!value.is_empty() && std::fs::symlink_metadata(cwd.join(p)).is_ok())
+        {
+            cwd.join(p)
+        } else {
+            return false;
+        };
+        if self.holds(&path) {
+            return true;
+        }
+        let mut todo = vec![real(&path)];
+        let mut seen = 0;
+        while let Some(d) = todo.pop() {
+            if !d.is_dir() {
+                continue;
+            }
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                seen += 1;
+                if seen > OUTPUT_FOLDER_FILES || self.holds(&e.path()) {
+                    return true;
+                }
+                if e.file_type().is_ok_and(|k| k.is_dir()) {
+                    todo.push(e.path());
+                }
+            }
+        }
+        false
+    }
 }
 
 /// Whether `path`, as the file system resolves it, is in one of `roots`.
@@ -5506,6 +5589,30 @@ mod tests {
         let e = writes_while_held(&args, &dir, &held, &dir.join("pages")).unwrap();
         assert!(e.contains("inside the project folder"), "{e}");
         assert!(writes_while_held(&args, &dir, &held, out.path()).is_none());
+        // An export writes its own file names into the folder it is given: a file there that
+        // links to a held page, by name or as the same file, is a way onto the page.
+        #[cfg(unix)]
+        {
+            let page = dir.join("pages").join("p0002.page.json");
+            let before = std::fs::read(&page).unwrap();
+            let linked = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(&page, linked.path().join("2.svg")).unwrap();
+            let hard = tempfile::tempdir().unwrap();
+            std::fs::create_dir(hard.path().join("deep")).unwrap();
+            std::fs::hard_link(&page, hard.path().join("deep").join("2.svg")).unwrap();
+            for to in [linked.path(), hard.path(), &hard.path().join("deep").join("2.svg")] {
+                let to = to.display().to_string();
+                let e = command_runs(&mut a, &["drawing", to.as_str()]).unwrap_err();
+                assert!(e.contains("links to a file in it"), "{to}: {e}");
+            }
+            assert_eq!(std::fs::read(&page).unwrap(), before);
+            // Named bare, from the folder it is in.
+            let args: Vec<String> = ["drawing", "deep"].map(String::from).to_vec();
+            assert!(writes_while_held(&args, &dir, &held, hard.path()).is_some());
+            // A folder of its own is fine.
+            let args = vec!["drawing".to_owned(), out.path().display().to_string()];
+            assert!(writes_while_held(&args, &dir, &held, out.path()).is_none());
+        }
         let page = dir.join("pages").join("p0002.page.json").display().to_string();
         for args in [
             vec!["vcs".to_owned(), "log".into(), "--svg".into(), page.clone()],
