@@ -699,7 +699,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn a_save_removes_an_unused_case_duplicate_but_keeps_a_link_target() -> Result<()> {
         let tmp = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
@@ -719,6 +719,13 @@ mod tests {
         p.pages.push(page);
         let folder = dir.join(VENDOR_DIR).join(ItemKind::Symbol.dir());
         fs::create_dir_all(&folder).map_err(|e| Error::io(&folder, e))?;
+        // Only on a folder that tells case apart; one that ignores case has no duplicates.
+        fs::write(folder.join("probe.txt"), "").map_err(|e| Error::io("write", e))?;
+        let ignores_case = folder.join("PROBE.txt").exists();
+        fs::remove_file(folder.join("probe.txt")).map_err(|e| Error::io("remove", e))?;
+        if ignores_case {
+            return Ok(());
+        }
         // A folder that tells case apart: the duplicate is its own, unused file.
         for name in ["box.p1.s1.json", "BOX.P1.S1.json", "Box.P1.S2.json"] {
             fs::write(folder.join(name), "{}").map_err(|e| Error::io("write", e))?;
