@@ -2884,6 +2884,21 @@ mod tests {
     }
 
     #[test]
+    fn a_new_project_that_cannot_be_recorded_or_opened_says_both() {
+        let (tmp, mut a) = app(vec![]);
+        // Not a project, and a `.git` git cannot use.
+        let dir = tmp.path().join("broken");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".git"), "not a repository").unwrap();
+        a.finish_new_project(&dir, false);
+        let Some(Dialog::Message(m)) = &a.dialog else {
+            unreachable!("no message")
+        };
+        assert!(m.contains("Could not open"), "{m}");
+        assert!(m.contains("could not be recorded"), "{m}");
+    }
+
+    #[test]
     fn a_project_opened_while_fetching_stays_open() {
         let (tmp, mut a) = app(vec![]);
         let base = tmp.path().join("base");

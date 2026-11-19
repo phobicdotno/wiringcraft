@@ -2333,21 +2333,27 @@ impl App {
             && o.dirty
             && let Err(e) = o.save()
         {
-            self.dialog = Some(Dialog::Message(format!(
+            let mut m = format!(
                 "The new project is in\n{}\nbut the open project could not be saved first, so it stays open:\n{e}",
                 dir.display()
-            )));
+            );
+            if let Err(e) = recorded {
+                m.push_str(&format!(
+                    "\nThe new project's first version could not be recorded either:\n{e}"
+                ));
+            }
+            self.dialog = Some(Dialog::Message(m));
             return;
         }
         let mut prefs = std::mem::take(&mut self.prefs);
         self.open_dir(dir, &mut prefs);
         self.prefs = prefs;
-        if let Err(e) = recorded
-            && self.dialog.is_none()
-        {
-            self.dialog = Some(Dialog::Message(format!(
-                "The new project is open, but its first version could not be recorded:\n{e}"
-            )));
+        if let Err(e) = recorded {
+            self.dialog = Some(Dialog::Message(match self.dialog.take() {
+                // Opening it failed too: both reasons show.
+                Some(Dialog::Message(m)) => format!("{m}\nIts first version could not be recorded either:\n{e}"),
+                _ => format!("The new project is open, but its first version could not be recorded:\n{e}"),
+            }));
         }
     }
 
