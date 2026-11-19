@@ -90,6 +90,9 @@ enum Dialog {
         since: usize,
         before: Vec<wc_core::plc_rack::PlcRack>,
         seen: u64,
+        /// The overview's warnings and the project revision they were made for, so they are
+        /// worked out again only after a change.
+        warnings: Option<(u64, Vec<String>)>,
     },
     PageProps {
         /// The page the dialog edits, by id: in a shared session someone else can remove an
@@ -918,6 +921,7 @@ impl App {
                     since: open.start_live_form(),
                     before: racks,
                     seen: open.history_count(),
+                    warnings: None,
                 });
             }
             Action::ExportPdf => self.dialog = Some(Dialog::Message(export_pdf(open))),
@@ -1706,6 +1710,7 @@ impl App {
                     since,
                     before,
                     seen,
+                    warnings,
                 } => {
                     // A change made elsewhere (an undo, the assistant) is shown in the form.
                     if let Some(o) = self.open.as_ref()
@@ -1720,7 +1725,12 @@ impl App {
                         o.set_racks_live(draft);
                         *seen = o.history_count();
                     }
-                    let warnings = self.open.as_ref().map(rack_warnings).unwrap_or_default();
+                    if let Some(o) = self.open.as_ref()
+                        && warnings.as_ref().is_none_or(|(rev, _)| *rev != o.revision())
+                    {
+                        *warnings = Some((o.revision(), rack_warnings(o)));
+                    }
+                    let warnings = warnings.as_ref().map(|(_, w)| w.as_slice()).unwrap_or_default();
                     let t = theme::Theme::of(ui.ctx());
                     // Many cards can give many warnings: they scroll, so OK and Cancel stay
                     // on screen.
@@ -1729,7 +1739,7 @@ impl App {
                         .id_salt("rack-warnings")
                         .max_height(height)
                         .show(ui, |ui| {
-                            for w in &warnings {
+                            for w in warnings {
                                 ui.label(RichText::new(w).color(t.warning));
                             }
                         });
