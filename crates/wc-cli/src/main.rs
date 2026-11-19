@@ -167,7 +167,7 @@ enum Cmd {
         pages: Vec<String>,
         #[arg(long, default_value = "")]
         date: String,
-        /// Append report pages: contents, parts, devices, wires, nets, terminals, cables, plc, locations, or all.
+        /// Append report pages: contents, parts, devices, wires, nets, terminals, cables, plc, plc-cards, locations, or all.
         #[arg(long = "report")]
         reports: Vec<String>,
     },
@@ -185,7 +185,7 @@ enum Cmd {
         #[arg(long, default_value = "")]
         date: String,
     },
-    /// Print a report (contents, parts, devices, wires, nets, terminals, cables, plc, locations) as a table, CSV or Markdown,
+    /// Print a report (contents, parts, devices, wires, nets, terminals, cables, plc, plc-cards, locations) as a table, CSV or Markdown,
     /// or save it as an Excel workbook (`--format xlsx --out <file>`, one sheet per report).
     Report {
         kind: String,
@@ -1811,8 +1811,12 @@ fn run(cli: Cli) -> Res<()> {
                 parts: &parts,
             };
             warn_report_layouts(&inputs);
+            // `all` leaves out the PLC card overview of a project without racks, so it does
+            // not gain an empty page; naming `plc-cards` prints it anyway.
+            let named_cards = reports.iter().any(|r| r == wc_report::Kind::PlcCards.name());
             let tables = report_kinds(&reports)?
                 .into_iter()
+                .filter(|k| *k != wc_report::Kind::PlcCards || named_cards || !p.meta.racks.is_empty())
                 .map(|k| wc_report::build(k, &inputs))
                 .collect();
             let pictures = wc_pdf::read_pictures(dir, &p);
@@ -2806,10 +2810,15 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
     Ok(())
 }
 
-/// Warns about the project's report layouts that name a report or column it does not have.
+/// Warns about the project's report layouts that name a report or column it does not have,
+/// and about PLC racks with cards that cannot be laid out or points on no card.
 fn warn_report_layouts(inputs: &wc_report::Inputs<'_>) {
     for w in wc_report::layout_warnings(inputs) {
         // The layout comes from the project file: written so it cannot send control sequences.
+        eprintln!("warning: {}", escape_field(&w));
+    }
+    for w in wc_report::plc_rack_warnings(inputs) {
+        // Rack names and tags come from the project too.
         eprintln!("warning: {}", escape_field(&w));
     }
 }
@@ -3184,7 +3193,7 @@ fn report_kinds(names: &[String]) -> Result<Vec<wc_report::Kind>, String> {
         }
         let k = wc_report::Kind::parse(n).ok_or_else(|| {
             format!(
-                "unknown report {n:?} (contents, parts, devices, wires, nets, terminals, cables, plc, locations, all)"
+                "unknown report {n:?} (contents, parts, devices, wires, nets, terminals, cables, plc, plc-cards, locations, all)"
             )
         })?;
         out.push(k);
@@ -5024,6 +5033,40 @@ mod tests {
         save(&dir, &p).unwrap();
         let p = load(&dir).unwrap();
         assert_eq!(p.meta.strip_layout(&x1).unwrap().order, ["4", "7"]);
+    }
+
+    #[test]
+    fn pdf_report_all_prints_the_plc_card_overview_only_with_racks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        // The report title as the PDF writes text: a hex string.
+        let title: String = std::iter::once("<".to_string())
+            .chain("PLC cards".bytes().map(|b| format!("{b:02X}")))
+            .chain(std::iter::once(">".to_string()))
+            .collect();
+        let has_overview = |report: &str| {
+            let out = dir.join("out.pdf");
+            cli(&dir, &["pdf", out.to_str().unwrap(), "--report", report]).unwrap();
+            String::from_utf8_lossy(&std::fs::read(&out).unwrap()).contains(&title)
+        };
+        // No racks: `all` leaves the empty overview out, naming it prints it.
+        assert!(!has_overview("all"));
+        assert!(has_overview("plc-cards"));
+        let mut p = load(&dir).unwrap();
+        p.meta.racks.push(wc_core::plc_rack::PlcRack {
+            name: "-A1".into(),
+            cards: vec![wc_core::plc_rack::PlcCard {
+                slot: 1,
+                channels: 8,
+                start: "%IX0.0".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        save(&dir, &p).unwrap();
+        assert_eq!(load(&dir).unwrap().meta.racks, p.meta.racks);
+        assert!(has_overview("all"));
     }
 
     #[test]

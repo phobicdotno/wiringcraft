@@ -17,6 +17,7 @@ pub mod macros;
 pub mod numbering;
 pub mod panel;
 pub mod part;
+pub mod plc_rack;
 pub mod project;
 pub mod report_layout;
 pub mod review;
