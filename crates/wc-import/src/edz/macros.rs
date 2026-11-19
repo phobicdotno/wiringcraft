@@ -734,6 +734,7 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
     };
     Ok(MacroSymbol {
         symbol: Symbol {
+            source: String::new(),
             id: format!("eplan.{}", id_segment(&stem.chars().take(MAX_STEM).collect::<String>())),
             name: stem.to_owned(),
             category: "EPLAN macros".into(),

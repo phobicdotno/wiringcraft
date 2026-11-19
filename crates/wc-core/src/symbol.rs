@@ -61,6 +61,42 @@ pub struct Symbol {
     pub tag_at: Point,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
+    /// What the symbol is in the library it was imported from, such as a SolidWorks
+    /// Electrical block's GUID, so a later import replaces a copy only with the same item
+    /// (#301). Empty when it was not imported or its source has no such identity.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+}
+
+/// Starts [`Symbol::source`] when the import found more than one item with that identity in one
+/// library: which of them a later import's item is cannot be told.
+pub const AMBIGUOUS_SOURCE: &str = "ambiguous:";
+
+/// Why an imported `new` symbol must not replace the project's copy `old` of the same id, if it
+/// must not: they come from different items of their library, or which item cannot be told
+/// (#301). A copy without a recorded source (from before sources were recorded, or made in the
+/// project) is not refused here.
+pub fn replace_refused(old: &Symbol, new: &Symbol) -> Option<String> {
+    if old.source.is_empty() {
+        return None;
+    }
+    if old.source.starts_with(AMBIGUOUS_SOURCE) || new.source.starts_with(AMBIGUOUS_SOURCE) {
+        return Some(format!(
+            "symbol {}: its library has more than one item it could be ({}), so which one replaces it cannot be told",
+            new.id,
+            if new.source.starts_with(AMBIGUOUS_SOURCE) {
+                &new.source
+            } else {
+                &old.source
+            }
+        ));
+    }
+    (old.source != new.source).then(|| {
+        format!(
+            "symbol {}: the import's item is another one of its library ({}) than the project's copy ({})",
+            new.id, new.source, old.source
+        )
+    })
 }
 
 impl Symbol {
@@ -168,6 +204,7 @@ pub fn black_box(id: &str, name: &str, width: f64, height: f64, pins: &[BoxPin])
         });
     }
     Ok(Symbol {
+        source: String::new(),
         id: id.to_owned(),
         name: name.to_owned(),
         category: "Black box".into(),

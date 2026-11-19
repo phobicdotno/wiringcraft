@@ -4184,6 +4184,7 @@ fn an_update_undone_before_its_sender_looked_is_not_sent_again_and_others_see_no
 fn a_joined_copy_takes_a_library_symbol_only_in_the_version_the_session_pinned() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let item = |id: &str, name: &str| Symbol {
+        source: String::new(),
         id: id.into(),
         name: name.into(),
         category: String::new(),

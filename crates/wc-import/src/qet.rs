@@ -284,6 +284,7 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
         _ => SymbolRole::Standalone,
     };
     let symbol = Symbol {
+        source: String::new(),
         id: id.to_owned(),
         name: qet_name.clone(),
         category: String::new(),

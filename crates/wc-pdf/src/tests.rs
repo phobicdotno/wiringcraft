@@ -5,6 +5,7 @@ use wc_core::{DeviceTag, Endpoint, Page, PageSize, PlacedSymbol, Shape, Wire};
 
 fn sym(id: &str, role: SymbolRole, pins: [&str; 2]) -> Symbol {
     Symbol {
+        source: String::new(),
         id: id.into(),
         name: id.into(),
         category: String::new(),

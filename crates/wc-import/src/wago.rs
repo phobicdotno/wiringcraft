@@ -959,6 +959,7 @@ mod tests {
             .add_jumper(&tag("-X1"), &["1".to_owned(), "2".to_owned()])
             .unwrap();
         let term = Symbol {
+            source: String::new(),
             id: "term".into(),
             name: "Terminal".into(),
             category: String::new(),

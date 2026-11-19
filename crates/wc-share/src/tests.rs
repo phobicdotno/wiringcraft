@@ -2185,6 +2185,7 @@ fn an_in_process_link_reports_an_orderly_end() {
 
 fn symbol(id: &str, name: &str) -> wc_core::Symbol {
     wc_core::Symbol {
+        source: String::new(),
         id: id.into(),
         name: name.into(),
         category: String::new(),

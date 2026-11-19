@@ -183,6 +183,7 @@ pub struct Saved {
 
 fn blank() -> Symbol {
     Symbol {
+        source: String::new(),
         id: String::new(),
         name: String::new(),
         category: String::new(),

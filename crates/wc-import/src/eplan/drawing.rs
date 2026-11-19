@@ -347,6 +347,7 @@ pub fn symbol_for(f: &EplanFunction) -> Option<Symbol> {
     let key: Vec<&str> = pins.iter().map(|p| p.name.as_str()).collect();
     let id = format!("eplan.{kind}.{}", safe(&key.join("-")));
     Some(Symbol {
+        source: String::new(),
         id: if kind == "terminal" {
             format!("eplan.terminal.{}", safe(&f.terminal))
         } else {
