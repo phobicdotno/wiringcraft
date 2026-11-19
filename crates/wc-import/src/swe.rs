@@ -2778,6 +2778,10 @@ pub fn build_with(
                 ),
                 (layouts.no_size, "rail(s) or duct(s) without a length"),
                 (layouts.upright, "upright rail(s): WiringCraft rails run left to right"),
+                (
+                    layouts.far_off,
+                    "item(s) reaching more than 1 km from the page origin",
+                ),
                 (layouts.plates, "plate(s) giving the panel size"),
                 (
                     layouts.other,

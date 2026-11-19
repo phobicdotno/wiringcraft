@@ -10,7 +10,9 @@
 //! linked from the archive's catalog), else the [`DEFAULT_SIZE`] footprint, counted as
 //! estimated; the last two at its insertion point as the top-left corner. A rail or
 //! duct, which has no length then, is left out. WiringCraft rails run left to right, so an
-//! upright rail is left out too. Everything left out is counted with the reason.
+//! upright rail is left out too, and so is an item reaching further than 1 km (`MAX_COORD`,
+//! 1e6 mm) from the page origin, whose box could overflow the panel size. Everything left out is
+//! counted with the reason.
 //!
 //! The plate is the plate symbol's box when the page has one, else the box round every item.
 //! Coordinates turn from the page's y up to the panel's y down from the plate's top-left corner.
@@ -21,6 +23,7 @@ use wc_core::geom::Point;
 use wc_core::panel::{DEFAULT_SIZE, Panel, PanelItem, part_size};
 use wc_core::{Device, DeviceTag, Part};
 
+use super::drawings::MAX_COORD;
 use super::{SweProject, SweSymbol, round, slug};
 
 /// `tew_file.fil_filetype` of a 2D cabinet layout page.
@@ -61,6 +64,8 @@ pub struct Layouts {
     pub other: usize,
     /// Layout pages with no item to place.
     pub empty_pages: usize,
+    /// Items reaching further than 1 km (`MAX_COORD`, 1e6 mm) from the page origin.
+    pub far_off: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -128,6 +133,11 @@ fn boxed(a: Point, b: Point) -> (Point, Point) {
     )
 }
 
+/// Whether a box reaches further than 1 km (`MAX_COORD`, 1e6 mm) from the page origin.
+fn far_off((min, max): (Point, Point)) -> bool {
+    [min.x, min.y, max.x, max.y].iter().any(|v| v.abs() > MAX_COORD)
+}
+
 /// One panel per cabinet layout page that has something to place. `tags` are the components'
 /// device tags; only components that became devices (`devices`) are placed as devices. `parts`
 /// are the parts the devices may name (`Device::part`), for footprints without a box.
@@ -159,6 +169,7 @@ pub fn layouts(
                 .filter(|t| devices.contains_key(*t));
             let size = s.corner.map(|c| boxed(s.at, c));
             match (kind_of(s, p, tag), size) {
+                (Kind::Plate | Kind::Rail | Kind::Duct, Some(b)) if far_off(b) => out.far_off += 1,
                 (Kind::Plate, Some(b)) if plate.is_none() => {
                     plate = Some(b);
                     out.plates += 1;
@@ -171,31 +182,42 @@ pub fn layouts(
                     let Some(tag) = tag else { continue };
                     // A box with no width or no height sizes nothing.
                     let b = b.filter(|(min, max)| max.x > min.x && max.y > min.y);
-                    let drawn = || {
-                        let b = p.drawings.placed_extents(s, &mut budget);
-                        if b.is_some() {
-                            out.from_drawing += 1;
-                        }
-                        b
-                    };
-                    let (min, max) = b.or_else(drawn).unwrap_or_else(|| {
-                        let from_part = devices
-                            .get(tag)
-                            .and_then(|d| d.part.as_deref())
-                            .and_then(|id| part_sizes.get(id).copied());
-                        let (w, h) = match from_part {
-                            Some(size) => {
-                                out.from_part += 1;
-                                size
-                            }
+                    enum From {
+                        Box,
+                        Drawing,
+                        Part,
+                        Default,
+                    }
+                    let (b, from) = match b {
+                        Some(b) => (b, From::Box),
+                        None => match p.drawings.placed_extents(s, &mut budget) {
+                            Some(b) => (b, From::Drawing),
                             None => {
-                                out.estimated += 1;
-                                DEFAULT_SIZE
+                                let from_part = devices
+                                    .get(tag)
+                                    .and_then(|d| d.part.as_deref())
+                                    .and_then(|id| part_sizes.get(id).copied());
+                                let ((w, h), from) = match from_part {
+                                    Some(size) => (size, From::Part),
+                                    None => (DEFAULT_SIZE, From::Default),
+                                };
+                                // The insertion point as the top-left corner.
+                                let b = (Point::new(s.at.x, s.at.y - h), Point::new(s.at.x + w, s.at.y));
+                                (b, from)
                             }
-                        };
-                        // The insertion point as the top-left corner.
-                        (Point::new(s.at.x, s.at.y - h), Point::new(s.at.x + w, s.at.y))
-                    });
+                        },
+                    };
+                    if far_off(b) {
+                        out.far_off += 1;
+                        continue;
+                    }
+                    match from {
+                        From::Box => {}
+                        From::Drawing => out.from_drawing += 1,
+                        From::Part => out.from_part += 1,
+                        From::Default => out.estimated += 1,
+                    }
+                    let (min, max) = b;
                     placed.push((tag.clone(), min, max));
                 }
                 _ => out.other += 1,

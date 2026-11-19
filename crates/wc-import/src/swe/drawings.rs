@@ -543,7 +543,7 @@ fn read_entry<R: Read + std::io::Seek>(
 /// Points that bound `shape`: for an arc only what it sweeps (its ends and the quarter points
 /// it passes), not its whole circle.
 /// How far from the page origin a footprint drawn from a block may reach, in millimetres.
-const MAX_COORD: f64 = 1e6;
+pub(super) const MAX_COORD: f64 = 1e6;
 
 /// The linear map that places a symbol's block: turned by its angle, then scaled along the
 /// page axes, exactly as [`super::place`] places its points.
