@@ -1056,6 +1056,11 @@ fn black_box_tool(
     // A dialog for this box is waiting: the canvas takes no clicks for it meanwhile.
     let asking = ed.ask_box_pin.is_some() || ed.ask_box_tag;
     let cur = ed.cursor;
+    // Where a click or a drag ended, unsnapped: the release itself, since a touch screen
+    // clears the hover position (and so `ed.cursor`) in the frame it lets go.
+    let released_at = primary_release_pos(&resp.ctx)
+        .or(resp.interact_pointer_pos())
+        .map(|p| xf.mm(p));
     match ed.black_box.as_mut() {
         None if !asking => {
             // A drag is only seen once the pointer has moved: its corner is where the button
@@ -1063,10 +1068,10 @@ fn black_box_tool(
             let start = if resp.drag_started_by(egui::PointerButton::Primary) {
                 resp.ctx
                     .input(|i| i.pointer.press_origin())
+                    .or(resp.interact_pointer_pos())
                     .map(|p| snap(xf.mm(p), snap_step))
-                    .or(cur)
             } else if resp.clicked_by(egui::PointerButton::Primary) {
-                cur
+                released_at.map(|p| snap(p, snap_step))
             } else {
                 None
             };
@@ -1078,7 +1083,8 @@ fn black_box_tool(
         Some(d) if d.to.is_none() && !asking => {
             let released =
                 resp.drag_stopped_by(egui::PointerButton::Primary) || resp.clicked_by(egui::PointerButton::Primary);
-            if released && let Some(at) = cur.filter(|at| at.x != d.from.x && at.y != d.from.y) {
+            let at = released_at.map(|p| snap(p, snap_step));
+            if released && let Some(at) = at.filter(|at| at.x != d.from.x && at.y != d.from.y) {
                 d.to = Some(at);
                 ed.message = hint(Some(d)).into();
             }
@@ -1086,11 +1092,11 @@ fn black_box_tool(
         Some(d) if !asking => {
             let Some((min, max)) = d.rect() else { return };
             if resp.clicked_by(egui::PointerButton::Primary)
-                && let Some(at) = resp.interact_pointer_pos().map(|p| xf.mm(p))
+                && let Some(at) = released_at
             {
                 if let Some(hit) = edge_at(min, max, at, tol) {
                     // Snapped along the edge, like every other point on the page.
-                    let snapped = cur.and_then(|c| edge_at(min, max, c, f64::INFINITY));
+                    let snapped = edge_at(min, max, snap(at, snap_step), f64::INFINITY);
                     ed.ask_box_pin = Some(match snapped {
                         Some((side, off)) if side == hit.0 => (side, off),
                         _ => hit,
@@ -2207,6 +2213,32 @@ mod tests {
         click_at(&ctx, &mut open, &mut ed, egui::pos2(400.0, 280.0), 3.0);
         assert!(ed.ask_box_tag);
         assert!(open.project.pages[0].symbols.is_empty());
+
+        // On a touch screen the release comes with PointerGone in the same frame, which clears
+        // the hover position: a tap still starts a box and a second one finishes it.
+        ed.ask_box_tag = false;
+        ed.black_box = None;
+        let tap = |open: &mut Open, ed: &mut Editor, pos: egui::Pos2, t: f64| {
+            painted(
+                &ctx,
+                open,
+                ed,
+                t,
+                vec![egui::Event::PointerMoved(pos), button(pos, true)],
+            );
+            painted(
+                &ctx,
+                open,
+                ed,
+                t + 0.02,
+                vec![button(pos, false), egui::Event::PointerGone],
+            );
+        };
+        tap(&mut open, &mut ed, a, 5.0);
+        assert!(ed.cursor.is_none(), "the hover position is gone after the tap");
+        assert_eq!(ed.black_box.as_ref().map(|d| d.from), Some(corner));
+        tap(&mut open, &mut ed, b, 6.0);
+        assert_eq!(ed.black_box.as_ref().and_then(|d| d.to), Some(other));
 
         // Another tool drops the box being drawn.
         ed.ask_box_tag = false;
