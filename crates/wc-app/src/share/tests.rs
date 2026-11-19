@@ -11,7 +11,7 @@ type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 /// A journal the test can look at.
 #[derive(Clone, Default)]
-struct Log(
+pub(crate) struct Log(
     Rc<RefCell<Vec<Change>>>,
     Rc<std::cell::Cell<bool>>,
     Rc<std::cell::Cell<bool>>,
@@ -138,7 +138,7 @@ fn approve(host: &mut Share, id: PeerId, yes: bool) {
 }
 
 /// Run a few frames of both windows: each shows `page`, nothing is held down.
-fn frames(a: (&mut Share, &mut Open, &str), b: (&mut Share, &mut Open, &str)) {
+pub(crate) fn frames(a: (&mut Share, &mut Open, &str), b: (&mut Share, &mut Open, &str)) {
     for _ in 0..4 {
         a.0.frame(Some(a.1), Some(a.2.to_owned()), false);
         b.0.frame(Some(b.1), Some(b.2.to_owned()), false);
@@ -146,10 +146,10 @@ fn frames(a: (&mut Share, &mut Open, &str), b: (&mut Share, &mut Open, &str)) {
 }
 
 /// The host's share, its journal and project, then the guest's share and project.
-type Session = (Share, Log, Open, Share, Open);
+pub(crate) type Session = (Share, Log, Open, Share, Open);
 
 /// Host and guest, joined, each in its own folder.
-fn session(tmp: &Path) -> std::result::Result<Session, Box<dyn std::error::Error>> {
+pub(crate) fn session(tmp: &Path) -> std::result::Result<Session, Box<dyn std::error::Error>> {
     session_with(tmp, |_| Ok(()))
 }
 

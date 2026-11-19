@@ -4562,4 +4562,4 @@ fn author_email() -> String {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
