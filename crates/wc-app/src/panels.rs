@@ -1792,9 +1792,11 @@ pub fn status_bar(ui: &mut egui::Ui, open: Option<&Open>, ed: &Editor, live: Opt
 
 /// The properties of the panel layout shown: plate size, the picked device, and the devices
 /// with a part that are not on the plate yet.
-fn panel_properties(ui: &mut egui::Ui, open: &Open, ed: &Editor, pi: usize) {
+fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, pi: usize) {
     use wc_core::panel::{PanelItem, on_door, part_size};
     let t = Theme::of(ui.ctx());
+    // The footprint drawing picked below, attached once the panel is drawn.
+    let mut attach: Option<(String, std::path::PathBuf)> = None;
     let Some(panel) = open.project.panels.get(pi) else {
         return;
     };
@@ -1823,6 +1825,29 @@ fn panel_properties(ui: &mut egui::Ui, open: &Open, ed: &Editor, pi: usize) {
                 ui.label(format!("x {:.0}, y {:.0} mm", at.x, at.y));
                 ui.end_row();
             });
+        // A maker's outline drawing for the device's part (#484).
+        let part = dev.and_then(|d| d.part.clone());
+        if let Some(part) = part {
+            let has = open.parts.get(&part).is_some_and(|p| p.footprint.is_some());
+            let label = if has {
+                "Replace footprint drawing..."
+            } else {
+                "Attach footprint drawing..."
+            };
+            if ui
+                .button(label)
+                .on_hover_text(
+                    "Pick the maker's DXF outline (front view, mm at 1:1); it is stored with the part in its library",
+                )
+                .clicked()
+                && let Some(file) = rfd::FileDialog::new()
+                    .set_title("Footprint drawing")
+                    .add_filter("DXF drawings", &["dxf"])
+                    .pick_file()
+            {
+                attach = Some((part, file));
+            }
+        }
         ui.add_space(6.0);
     } else {
         ui.label(RichText::new("Click a device on the plate to see it; drag it to move it.").color(t.faint));
@@ -1851,6 +1876,9 @@ fn panel_properties(ui: &mut egui::Ui, open: &Open, ed: &Editor, pi: usize) {
             ui.label(RichText::new(m).monospace());
         }
         ui.label(RichText::new("Page menu → Arrange devices puts them on the rails.").color(t.faint));
+    }
+    if let Some((part, file)) = attach {
+        ed.message = open.attach_footprint(&part, &file).unwrap_or_else(|e| e);
     }
 }
 
