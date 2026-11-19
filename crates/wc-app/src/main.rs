@@ -3052,11 +3052,14 @@ fn export_pdf_in(open: &Open, langs: &[String]) -> String {
     };
     let (bytes, report) = wc_pdf::export(project, &open.symbols, &options);
     let mut warnings = report.warnings;
-    warnings.extend(
-        missing
-            .iter()
-            .map(|m| format!("no translation for {:?} ({})", m.text, m.used.join(", "))),
-    );
+    // The text itself stays out: this message goes to the diagnostic log, which never holds
+    // drawing content. File, Translations, "Only missing" lists the texts.
+    warnings.extend(missing.iter().map(|m| {
+        format!(
+            "no translation for a text ({}); see File, Translations, Only missing",
+            m.used.join(", ")
+        )
+    }));
     match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, bytes)) {
         Ok(()) => {
             let mut m = format!("Exported {} pages to\n{}", report.pages, path.display());

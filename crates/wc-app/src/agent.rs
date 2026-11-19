@@ -4928,6 +4928,16 @@ mod tests {
         assert!(m.starts_with("Exported"), "{m}");
         assert!(m.contains("no translation for"), "missing texts are warned about: {m}");
         assert!(!m.contains("\"Spare\""), "{m}");
+        // The message is logged, so it names where the text is used but not the text itself.
+        let dict = Dictionary::load(&dir).unwrap();
+        let (_, missing) = wc_core::translate::translate(&open.project, &dict, &["nb".into(), "en".into()]);
+        assert!(!missing.is_empty());
+        for t in &missing {
+            assert!(
+                !m.contains(&format!("{:?}", t.text)),
+                "drawing text stays out of the logged message: {m}"
+            );
+        }
         let pdf_path = std::fs::read_dir(dir.join("export"))
             .unwrap()
             .filter_map(Result::ok)
