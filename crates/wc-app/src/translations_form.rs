@@ -36,6 +36,9 @@ pub struct Form {
     /// Show only the texts missing a translation.
     pub only_missing: bool,
     pub error: Option<String>,
+    /// The row whose cell has the keyboard: it stays shown under "Only missing" until the
+    /// edit ends, though its cells are no longer blank.
+    pub editing: Option<usize>,
 }
 
 impl Form {
@@ -67,6 +70,7 @@ impl Form {
             new_lang: String::new(),
             only_missing: false,
             error: None,
+            editing: None,
         })
     }
 
@@ -106,8 +110,29 @@ impl Form {
     /// saying what was done.
     pub fn save(&self) -> Result<String, String> {
         let mut dict = Dictionary::load(&self.dir).map_err(|e| e.to_string())?;
+        if dict.source() != self.source {
+            // The rows are texts in the old source language: they would be filed under the
+            // wrong one.
+            return Err(format!(
+                "the project's source language changed from {} to {} while the translations were open. Your edits are still here: close the dialog and open it again to translate from {}.",
+                self.source,
+                dict.source(),
+                dict.source()
+            ));
+        }
         if dict.source.is_empty() {
             dict.source = self.source.clone();
+        }
+        // A language added with no translation yet is kept as a column.
+        let known = dict.languages();
+        let new_langs = self.langs.iter().filter(|l| !known.contains(l)).count();
+        if new_langs > 0 {
+            // Every column named in the dialog's order, so the columns keep it when reopened.
+            for l in &self.langs {
+                if !dict.languages.contains(l) {
+                    dict.languages.push(l.clone());
+                }
+            }
         }
         let mut changed = 0;
         for r in &self.rows {
@@ -119,7 +144,7 @@ impl Form {
                 }
             }
         }
-        if changed == 0 {
+        if changed == 0 && new_langs == 0 {
             return Ok("No translation was changed.".into());
         }
         dict.save(&self.dir).map_err(|e| e.to_string())?;
@@ -164,7 +189,8 @@ pub fn show(ui: &mut egui::Ui, form: &mut Form) {
     if form.langs.is_empty() {
         ui.label("Add a language to translate the texts into.");
     }
-    let only_missing = form.only_missing;
+    let (only_missing, was_editing) = (form.only_missing, form.editing);
+    let mut editing = None;
     egui::ScrollArea::both().max_height(420.0).show(ui, |ui| {
         egui::Grid::new("translations")
             .num_columns(form.langs.len() + 1)
@@ -176,24 +202,107 @@ pub fn show(ui: &mut egui::Ui, form: &mut Form) {
                     ui.label(egui::RichText::new(l).strong());
                 }
                 ui.end_row();
-                for r in &mut form.rows {
-                    if only_missing && r.cells.iter().all(|c| !c.trim().is_empty()) {
+                for (i, r) in form.rows.iter_mut().enumerate() {
+                    if only_missing && was_editing != Some(i) && r.cells.iter().all(|c| !c.trim().is_empty()) {
                         continue;
                     }
                     ui.label(&r.text).on_hover_text(r.used.join("\n"));
-                    for c in &mut r.cells {
+                    for (k, c) in r.cells.iter_mut().enumerate() {
                         let blank = c.trim().is_empty();
-                        let mut edit = egui::TextEdit::singleline(c).desired_width(180.0);
+                        let mut edit = egui::TextEdit::singleline(c).id(cell_id(i, k)).desired_width(180.0);
                         if blank {
                             edit = edit.hint_text(egui::RichText::new("missing").color(theme.error));
                         }
-                        ui.add(edit);
+                        if ui.add(edit).has_focus() {
+                            editing = Some(i);
+                        }
                     }
                     ui.end_row();
                 }
             });
     });
+    form.editing = editing;
     if let Some(e) = &form.error {
         ui.colored_label(theme.error, e);
+    }
+}
+
+/// The id of the text field for row `row`, language column `col`.
+pub fn cell_id(row: usize, col: usize) -> egui::Id {
+    egui::Id::new(("translation-cell", row, col))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use wc_core::translate::TRANSLATIONS_FILE;
+
+    fn project() -> wc_core::Project {
+        let mut p = wc_core::Project::new("x");
+        p.pages.push(wc_core::Page::new("p1", "1", "Pumps"));
+        p.pages.push(wc_core::Page::new("p2", "2", "Spare"));
+        p
+    }
+
+    fn form(dict: &str) -> (tempfile::TempDir, Form) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(TRANSLATIONS_FILE), dict).unwrap();
+        let f = Form::open(tmp.path(), &project()).unwrap();
+        (tmp, f)
+    }
+
+    #[test]
+    fn a_source_language_changed_meanwhile_keeps_the_draft_and_writes_nothing() {
+        let (tmp, mut f) = form("source = \"en\"\n[[text]]\nen = \"Pumps\"\nnb = \"Pumper\"\n");
+        f.rows.iter_mut().find(|r| r.text == "Spare").unwrap().cells[0] = "Reserve".into();
+        let changed = "source = \"nb\"\n[[text]]\nnb = \"Pumper\"\nen = \"Pumps\"\n";
+        std::fs::write(tmp.path().join(TRANSLATIONS_FILE), changed).unwrap();
+        let err = f.save().unwrap_err();
+        assert!(err.contains("changed from en to nb"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(TRANSLATIONS_FILE)).unwrap(),
+            changed
+        );
+        assert_eq!(f.rows.iter().find(|r| r.text == "Spare").unwrap().cells[0], "Reserve");
+    }
+
+    #[test]
+    fn a_language_added_without_translations_is_kept() {
+        let (tmp, mut f) = form("source = \"en\"\n");
+        f.new_lang = "de".into();
+        f.add_language().unwrap();
+        assert!(f.save().unwrap().starts_with("Saved"));
+        let again = Form::open(tmp.path(), &project()).unwrap();
+        assert_eq!(again.langs, ["de"]);
+        assert_eq!(again.missing(0), 2);
+    }
+
+    #[test]
+    fn a_row_being_typed_into_stays_shown_under_only_missing() {
+        let (_tmp, mut f) = form("source = \"en\"\nlanguages = [\"nb\"]\n");
+        f.only_missing = true;
+        let row = f.rows.iter().position(|r| r.text == "Spare").unwrap();
+        let ctx = egui::Context::default();
+        let frame = |f: &mut Form, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| show(ui, f));
+            });
+        };
+        frame(&mut f, vec![]);
+        ctx.memory_mut(|m| m.request_focus(cell_id(row, 0)));
+        frame(&mut f, vec![]);
+        for t in ["R", "e", "serve"] {
+            frame(&mut f, vec![egui::Event::Text(t.into())]);
+        }
+        assert_eq!(f.rows[row].cells[0], "Reserve");
+        // Once the edit ends, the row is filtered out like any other with every translation.
+        ctx.memory_mut(|m| m.surrender_focus(cell_id(row, 0)));
+        frame(&mut f, vec![]);
+        assert_eq!(f.editing, None);
     }
 }
