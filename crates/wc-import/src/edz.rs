@@ -422,18 +422,26 @@ pub fn read_all_with(bytes: &[u8], limits: Limits) -> Result<Edz> {
     };
     // The maker of each macro's symbol, for its id: the one maker of the parts naming the macro,
     // else the one maker of all the archive's parts. Generic macro names (`Macro_0001`) from two
-    // makers' archives then get different ids in one library.
-    let maker_of = |p: &Part| id_segment(&p.manufacturer.trim().chars().take(MAX_MAKER).collect::<String>());
-    let mut makers_by_file: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
+    // makers' archives then get different ids in one library. A part's macro is found as its
+    // symbol is below: by file name, and by path when several archive macros share it.
+    let mut archive_macros: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    for f in &report.macro_files {
+        archive_macros
+            .entry(macro_file_name(f))
+            .or_default()
+            .push((macro_path(f), macro_path(f)));
+    }
+    let mut makers_by_macro: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
     let mut makers: std::collections::BTreeSet<String> = Default::default();
     for p in parts.values() {
-        let maker = maker_of(p);
-        if maker.trim_matches('_').is_empty() {
+        let Some(maker) = maker_segment(&p.manufacturer) else {
             continue;
-        }
+        };
         for k in MACRO_PROPERTIES {
-            if let Some(name) = p.properties.get(k) {
-                makers_by_file.entry(file_of(name)).or_default().insert(maker.clone());
+            if let Some(name) = p.properties.get(k)
+                && let Some(found) = archive_macros.get(&file_of(name)).and_then(|m| by_path(name, m))
+            {
+                makers_by_macro.entry(found.clone()).or_default().insert(maker.clone());
             }
         }
         makers.insert(maker);
@@ -443,8 +451,8 @@ pub fn read_all_with(bytes: &[u8], limits: Limits) -> Result<Edz> {
         _ => None,
     };
     let macro_maker = |name: &str| {
-        makers_by_file
-            .get(&macro_file_name(name))
+        makers_by_macro
+            .get(&macro_path(name))
             .and_then(only)
             .or_else(|| only(&makers))
     };
@@ -506,23 +514,7 @@ pub fn read_all_with(bytes: &[u8], limits: Limits) -> Result<Edz> {
 
     // The symbol of the macro a part names: the only macro of that file name, else the one whose
     // path ends with the path the part gives.
-    let symbol_of = |name: &str, file: &str| -> Option<String> {
-        match by_file.get(file)?.as_slice() {
-            [(_, id)] => Some(id.clone()),
-            several => {
-                let mut want = macro_path(name);
-                if !want.ends_with(".ema") {
-                    want.push_str(".ema");
-                }
-                let want = format!("/{}", want.trim_start_matches('/'));
-                let mut hits = several.iter().filter(|(path, _)| format!("/{path}").ends_with(&want));
-                match (hits.next(), hits.next()) {
-                    (Some((_, id)), None) => Some(id.clone()),
-                    _ => None,
-                }
-            }
-        }
-    };
+    let symbol_of = |name: &str, file: &str| -> Option<String> { by_path(name, by_file.get(file)?).cloned() };
     for p in parts.values_mut() {
         let first = report.part_macros.len();
         for k in MACRO_PROPERTIES {
@@ -561,6 +553,46 @@ pub fn read_all_with(bytes: &[u8], limits: Limits) -> Result<Edz> {
         report,
         warnings,
     })
+}
+
+/// Of the archive macros sharing the file name a part gives (each as its path and a value): the
+/// only one, else the one whose path ends with the path the part gives.
+fn by_path<'a, T>(name: &str, macros: &'a [(String, T)]) -> Option<&'a T> {
+    match macros {
+        [(_, v)] => Some(v),
+        several => {
+            let mut want = macro_path(name);
+            if !want.ends_with(".ema") {
+                want.push_str(".ema");
+            }
+            let want = format!("/{}", want.trim_start_matches('/'));
+            let mut hits = several.iter().filter(|(path, _)| format!("/{path}").ends_with(&want));
+            match (hits.next(), hits.next()) {
+                (Some((_, v)), None) => Some(v),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// A maker's name as a symbol id segment, or `None` for an empty one. A name longer than
+/// [`MAX_MAKER`] is cut and ends with a hash of the whole name, so two makers whose names only
+/// differ past the cut still get different segments.
+fn maker_segment(maker: &str) -> Option<String> {
+    let maker = maker.trim();
+    let seg = id_segment(maker);
+    if seg.trim_matches('_').is_empty() {
+        return None;
+    }
+    if seg.chars().count() <= MAX_MAKER {
+        return Some(seg);
+    }
+    // FNV-1a, 32 bits: stable across runs and platforms.
+    let hash = maker
+        .bytes()
+        .fold(0x811c_9dc5u32, |h, b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193));
+    let head: String = seg.chars().take(MAX_MAKER - 9).collect();
+    Some(format!("{head}_{hash:08x}"))
 }
 
 /// One part's EPLAN properties, by name, and the first variant's for what the part leaves empty.

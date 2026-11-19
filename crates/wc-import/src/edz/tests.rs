@@ -617,3 +617,42 @@ fn a_macro_no_part_names_takes_the_archive_maker_and_without_one_is_warned_about
     );
     Ok(())
 }
+
+#[test]
+fn macros_sharing_a_file_name_take_the_maker_of_the_part_naming_each_by_path() -> TestResult {
+    let xml = r#"<partsmanagement><part P_ARTICLE_PARTNR="A.1" P_ARTICLE_MANUFACTURER="A" P_ARTICLE_MACRO="$(MD_MACROS)\A\relay.ema"/><part P_ARTICLE_PARTNR="B.1" P_ARTICLE_MANUFACTURER="B" P_ARTICLE_MACRO="$(MD_MACROS)\B\relay.ema"/></partsmanagement>"#;
+    let got = read_all(&zip(&[
+        ("parts.xml", xml.as_bytes()),
+        ("macros/A/relay.ema", CONTACTOR_MACRO.as_bytes()),
+        ("macros/B/relay.ema", CONTACTOR_MACRO.as_bytes()),
+    ])?)?;
+    let mut ids: Vec<&str> = got.symbols.iter().map(|s| s.id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["eplan.a.relay", "eplan.b.relay"]);
+    let symbol = |maker: &str| {
+        got.parts
+            .iter()
+            .find(|p| p.manufacturer == maker)
+            .and_then(|p| p.symbol.as_deref())
+    };
+    assert_eq!(symbol("A"), Some("eplan.a.relay"));
+    assert_eq!(symbol("B"), Some("eplan.b.relay"));
+    Ok(())
+}
+
+#[test]
+fn long_maker_names_that_differ_past_the_cut_get_different_ids() {
+    let a = "Very Long Manufacturer Name Of Electrical Parts GmbH North";
+    let b = "Very Long Manufacturer Name Of Electrical Parts GmbH South";
+    let (Some(x), Some(y)) = (maker_segment(a), maker_segment(b)) else {
+        unreachable!("both are makers");
+    };
+    assert_ne!(x, y);
+    assert!(
+        x.chars().count() <= MAX_MAKER && y.chars().count() <= MAX_MAKER,
+        "{x} {y}"
+    );
+    assert_eq!(maker_segment(a), Some(x), "the same name gives the same segment");
+    assert_eq!(maker_segment("SIE").as_deref(), Some("sie"));
+    assert_eq!(maker_segment("  "), None);
+}
