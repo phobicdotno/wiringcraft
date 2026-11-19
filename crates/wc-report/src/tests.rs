@@ -1986,6 +1986,72 @@ fn a_report_layout_keeps_page_links_with_their_rows_and_sorts_numbers_by_value()
 }
 
 #[test]
+fn a_sorted_cable_list_keeps_each_core_with_its_cable() {
+    use wc_core::report_layout::ReportLayout;
+    let (mut p, s, parts) = fixture();
+    let w1 = DeviceTag::parse("-W1").unwrap();
+    let w2 = DeviceTag::parse("-W2").unwrap();
+    for (id, cable, core) in [("w1", &w1, "1"), ("w2", &w1, "2"), ("w3", &w2, "1"), ("w4", &w2, "2")] {
+        if let Some(w) = p.pages[0].wires.iter_mut().find(|w| w.id == id) {
+            w.cable = Some(wc_core::CableCore {
+                cable: cable.clone(),
+                core: core.into(),
+            });
+        }
+    }
+    // Without a sort, the built-in grouping is kept.
+    p.meta.reports.push(ReportLayout {
+        kind: "cables".into(),
+        ..Default::default()
+    });
+    let i2 = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let grouped = build(Kind::Cables, &i2);
+    let firsts: Vec<&str> = grouped.rows.iter().map(|r| r[0].as_str()).collect();
+    assert_eq!(firsts, ["-W1", "", "-W2", ""]);
+    // Sorted by core, every row names its own cable.
+    p.meta.reports[0].sort = vec!["Core".into(), "-Cable".into()];
+    let i3 = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let sorted = build(Kind::Cables, &i3);
+    let pairs: Vec<(&str, &str)> = sorted.rows.iter().map(|r| (r[0].as_str(), r[3].as_str())).collect();
+    assert_eq!(pairs, [("-W2", "1"), ("-W1", "1"), ("-W2", "2"), ("-W1", "2")]);
+}
+
+#[test]
+fn a_layout_sorts_by_every_key_in_turn_and_keeps_the_built_in_order_on_ties() {
+    use wc_core::report_layout::ReportLayout;
+    let row = |a: &str, b: &str, n: &str| vec![a.to_string(), b.to_string(), n.to_string()];
+    let t = Table {
+        title: "T".into(),
+        columns: vec!["Group".into(), "Item".into(), "Seen".into()],
+        rows: vec![
+            row("B", "1", "first"),
+            row("A", "2", "second"),
+            row("B", "2", "third"),
+            row("A", "1", "fourth"),
+            row("B", "2", "fifth"),
+        ],
+        ..Default::default()
+    };
+    let sorted = t.with_layout(&ReportLayout {
+        kind: "contents".into(),
+        sort: vec!["Group".into(), "-Item".into()],
+        ..Default::default()
+    });
+    assert_eq!(
+        sorted.rows.iter().map(|r| r[2].as_str()).collect::<Vec<_>>(),
+        ["second", "fourth", "third", "fifth", "first"]
+    );
+}
+
+#[test]
 fn report_layouts_that_name_nothing_are_reported() {
     use wc_core::report_layout::{ReportColumn, ReportLayout};
     let (mut p, s, parts) = fixture();

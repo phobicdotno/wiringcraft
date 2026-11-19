@@ -166,6 +166,21 @@ impl Table {
         }
     }
 
+    /// Rows whose first column is empty take their first `columns` cells from the row above:
+    /// a continuation row gets the group it belongs to written out.
+    fn fill_down(&mut self, columns: usize) {
+        let mut above: Vec<String> = Vec::new();
+        for row in &mut self.rows {
+            if row.first().is_some_and(String::is_empty) && !above.is_empty() {
+                for (cell, value) in row.iter_mut().zip(&above) {
+                    cell.clone_from(value);
+                }
+            } else {
+                above = row.iter().take(columns).cloned().collect();
+            }
+        }
+    }
+
     /// A Markdown table under a level-2 heading.
     pub fn to_markdown(&self) -> String {
         let cell = |s: &str| s.replace('|', "\\|").replace('\n', " ");
@@ -276,9 +291,16 @@ pub struct Inputs<'a> {
 /// The report of `kind`, in the project's own layout for it if it has one
 /// ([`wc_core::report_layout`]), else in the built-in layout.
 pub fn build(kind: Kind, i: &Inputs<'_>) -> Table {
-    let table = build_builtin(kind, i);
+    let mut table = build_builtin(kind, i);
     match layout_for(i.project, kind) {
-        Some(layout) => table.with_layout(layout),
+        Some(layout) => {
+            // The cable list names a cable only on its first core's row. A sort can move
+            // the other rows away from it, so each row then names its cable itself.
+            if kind == Kind::Cables && !layout.sort.is_empty() {
+                table.fill_down(3);
+            }
+            table.with_layout(layout)
+        }
         None => table,
     }
 }
