@@ -1166,6 +1166,8 @@ const CARD_ROW: f64 = 6.0;
 const CARD_TEXT: f64 = 2.5;
 /// Where the channel rows start below the top of the drawing area, in mm (room for the heading).
 const CARD_TOP: f64 = 22.0;
+/// Width, in mm, of the page column of a drawn PLC card, right-aligned at its edge.
+pub const CARD_PAGE: f64 = 12.0;
 
 /// How many rows of a drawn PLC card fit on one sheet of `size` (at least one: use
 /// [`card_size`] for a sheet with room for one).
@@ -1325,9 +1327,14 @@ pub fn draw_card_page(
             (conn_x, base),
             CARD_TEXT,
             0,
-            &fit_at(&point.connected, page_x - conn_x - 14.0, CARD_TEXT),
+            &fit_at(&point.connected, page_x - CARD_PAGE - 2.0 - conn_x, CARD_TEXT),
         );
-        pen.text((page_x, base), CARD_TEXT, 2, &point.page_number);
+        pen.text(
+            (page_x, base),
+            CARD_TEXT,
+            2,
+            &fit_at(&point.page_number, CARD_PAGE, CARD_TEXT),
+        );
         if !point.page_id.is_empty() {
             links.push(Link {
                 min: (lead, y),

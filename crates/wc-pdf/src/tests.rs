@@ -1714,6 +1714,15 @@ fn plc_cards_are_drawn_one_per_sheet_with_their_points_linked() {
     assert!(at("C3 PLC card -K3") < usize::MAX);
     // Each drawn point links to its page: -S1 to page 1, -M1 and -H1 to page 2.
     assert_eq!(text.matches("/Subtype /Link").count(), 3);
+    let targets = |c: &PlcCardSheet| -> Vec<String> {
+        let mut page = Page::new("c", "C1", "card");
+        page.size = layout::card_size(project.pages[0].size, project.meta.template.band_height());
+        let drawn = layout::draw_card_page(&project, &page, 0, 1, c, 0, (1, 1), "");
+        drawn.links.into_iter().map(|l| l.target_page_id).collect()
+    };
+    assert_eq!(targets(&cards[0]), ["p1"], "-S1 links to page 1");
+    assert_eq!(targets(&cards[1]), ["p2", "p2"], "-M1 and -H1 link to page 2");
+    assert!(targets(&cards[2]).is_empty());
     let rows = |c: &PlcCardSheet| layout::card_rows_of(c).len();
     assert_eq!((rows(&cards[0]), rows(&cards[1]), rows(&cards[2])), (8, 9, 8));
 }
@@ -1792,4 +1801,36 @@ fn a_dimension_drawn_by_hand_shows_in_pdf_svg_and_dxf() {
     assert!(svg.contains(">25</text>"), "{svg}");
     let d = dxf(&pages[0]);
     assert!(d.contains("\n1\n25\n"), "the DXF has the length as text");
+}
+
+#[test]
+fn a_long_page_reference_on_a_plc_card_is_cut_to_its_column() {
+    use wc_report::{CardChannel, CardPoint, PlcCardSheet};
+    let project = Project::new("x");
+    let long_page = "=PLANT+ROOM-17/123456789";
+    let card = PlcCardSheet {
+        card: "-K1".into(),
+        channels: vec![CardChannel {
+            channel: 0,
+            address: "%IX0.0".into(),
+            points: vec![CardPoint {
+                device: "-S1".into(),
+                description: "start".into(),
+                connected: "-X1:3 to the terminal strip in the field box".into(),
+                page_number: long_page.into(),
+                page_id: "p1".into(),
+            }],
+        }],
+        ..Default::default()
+    };
+    let page = Page::new("c", "C1", "card");
+    let drawn = layout::draw_card_page(&project, &page, 0, 1, &card, 0, (1, 1), "");
+    let cut = layout::fit_at(long_page, layout::CARD_PAGE, 2.5);
+    assert!(writer::text_width_mm(&cut, 2.5) <= layout::CARD_PAGE);
+    assert_ne!(cut, long_page, "the page reference is too long for its column");
+    assert!(
+        drawn.ops.contains(&writer::pdf_text(&cut)),
+        "the cut page reference is drawn"
+    );
+    assert!(!drawn.ops.contains(&writer::pdf_text(long_page)));
 }
