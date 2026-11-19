@@ -243,23 +243,18 @@ impl Journal for GitJournal {
         self.finish_rollback()?;
         // The save removes black box symbol files nothing uses any more (#490): keep each one
         // as it is, so `restore` can bring it back when the change is not recorded.
-        let boxes = self.box_symbols()?;
+        let known: std::collections::BTreeSet<PathBuf> = self.vendored_before.iter().map(|(p, _)| p.clone()).collect();
         let kept_from = self.vendored_before.len();
-        for (path, bytes) in boxes {
-            if !self.vendored_before.iter().any(|(p, _)| *p == path) {
+        for (path, bytes) in self.box_symbols()? {
+            if !known.contains(&path) {
                 self.vendored_before.push((path, Some(bytes)));
             }
         }
         wc_core::store::save(&self.dir, project)?;
         // Only the removed ones belong to this change; the rest stay out of its commit (#316).
-        let mut i = kept_from;
-        while i < self.vendored_before.len() {
-            if self.vendored_before[i].0.exists() {
-                self.vendored_before.remove(i);
-            } else {
-                i += 1;
-            }
-        }
+        let mut boxes = self.vendored_before.split_off(kept_from);
+        boxes.retain(|(path, _)| !path.exists());
+        self.vendored_before.extend(boxes);
         // Only this change's files (#316): a vendored file the host wrote outside the session,
         // before the save that pins it, stays out of a guest's commit and its lock.
         let vendored: Vec<String> = self
