@@ -2208,3 +2208,36 @@ fn a_long_page_reference_on_a_plc_card_is_cut_to_its_column() {
     assert!(!drawn.ops.contains(&writer::pdf_text(connected)));
     assert!(conn_x + writer::text_width_mm(&shown, 2.5) < page_x - layout::CARD_PAGE);
 }
+
+#[test]
+fn a_declared_node_with_a_blank_tag_keeps_its_box_address_and_station() {
+    use wc_core::network::{Network, Node};
+    let net = Network {
+        name: "PN3".into(),
+        nodes: vec![Node {
+            device: "  ".into(),
+            address: "192.168.0.2".into(),
+            station: "drive-07".into(),
+            ..Node::default()
+        }],
+        ..Network::default()
+    };
+    let opts = Options {
+        networks: vec![net],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&Project::new("x"), &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    assert!(text.contains(&writer::pdf_text("(node 1)")));
+    assert!(text.contains(&writer::pdf_text("192.168.0.2")));
+    assert!(text.contains(&writer::pdf_text("drive-07")));
+    assert!(!text.contains(&writer::pdf_text("No devices on this network.")));
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("network PN3: node 1 is not a device tag")),
+        "{:?}",
+        report.warnings
+    );
+}

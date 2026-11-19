@@ -51,6 +51,14 @@ fn node_key(s: &str) -> String {
     }
 }
 
+/// The box name of node `i` (from 0): its [`node_key`], or `(node N)` when its tag is blank,
+/// so a declared node keeps a box for its address and station. Never a link end's key: those
+/// are blank-free and a tag never starts with `(`.
+fn node_name(i: usize, n: &wc_core::network::Node) -> String {
+    let k = node_key(&n.device);
+    if k.is_empty() { format!("(node {})", i + 1) } else { k }
+}
+
 /// Lay out `net`: devices in node order then in order of first mention by a link, placed by
 /// a breadth-first walk of the links from the first one.
 pub fn layout_network(net: &Network) -> Topology {
@@ -60,8 +68,8 @@ pub fn layout_network(net: &Network) -> Topology {
             names.push(n);
         }
     };
-    for n in &net.nodes {
-        add(node_key(&n.device));
+    for (i, n) in net.nodes.iter().enumerate() {
+        add(node_name(i, n));
     }
     for l in &net.links {
         add(key(&l.from));
@@ -529,7 +537,12 @@ pub fn draw_network_page(
         let tag = name.parse::<wc_core::DeviceTag>().ok();
         // Found by the key the box was laid out under, so a node whose tag is not valid
         // still shows its address and station.
-        let node = net.nodes.iter().find(|n| node_key(&n.device) == *name);
+        let node = net
+            .nodes
+            .iter()
+            .enumerate()
+            .find(|(i, n)| node_name(*i, n) == *name)
+            .map(|(_, n)| n);
         let description = tag
             .as_ref()
             .and_then(|t| project.devices.get(t))

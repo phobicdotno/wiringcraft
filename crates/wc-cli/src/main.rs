@@ -5719,6 +5719,25 @@ mod tests {
         assert!(all.contains(&topology));
         assert!(pdf("networks").contains(&topology));
         assert!(!pdf("parts").contains(&topology));
+        // The list comes first: its bookmark is before the topology page's.
+        let titles = |text: &str| -> Vec<String> {
+            text.split("/Title <")
+                .skip(1)
+                .filter_map(|s| s.split_once('>'))
+                .map(|(h, _)| {
+                    (0..h.len() / 2)
+                        .filter_map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).ok())
+                        .map(char::from)
+                        .collect()
+                })
+                .collect()
+        };
+        let networks = titles(&pdf("networks"));
+        let at = |t: &str| networks.iter().position(|x| x.ends_with(t));
+        let (Some(list), Some(page)) = (at(" Networks"), at("N1 Network PN1")) else {
+            unreachable!("both bookmarks are there: {networks:?}");
+        };
+        assert!(list < page, "{networks:?}");
     }
 
     #[test]
