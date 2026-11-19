@@ -20,19 +20,22 @@ pub fn new_rack(racks: &[PlcRack]) -> PlcRack {
 }
 
 /// A new card in the slot after the rack's last one, with 16 channels. Its start address is
-/// left for the user: the overview warns about it until it is filled in.
-pub fn new_card(rack: &PlcRack) -> PlcCard {
-    PlcCard {
-        slot: rack
-            .cards
-            .iter()
-            .map(|c| c.slot.saturating_add(1))
-            .max()
-            .unwrap_or(1)
-            .min(MAX_SLOT),
+/// left for the user: the overview warns about it until it is filled in. When the slot after
+/// the last is past [`MAX_SLOT`] the card takes the first free slot, and when every slot is
+/// taken there is none.
+pub fn new_card(rack: &PlcRack) -> Option<PlcCard> {
+    let taken = |s: u32| rack.cards.iter().any(|c| c.slot == s);
+    let next = rack.cards.iter().map(|c| c.slot.saturating_add(1)).max().unwrap_or(1);
+    let slot = if next <= MAX_SLOT {
+        next
+    } else {
+        (1..=MAX_SLOT).chain([0]).find(|&s| !taken(s))?
+    };
+    Some(PlcCard {
+        slot,
         channels: 16,
         ..PlcCard::default()
-    }
+    })
 }
 
 /// The id of the start address field of card `card` in rack `rack`.
@@ -129,8 +132,13 @@ pub fn show(ui: &mut egui::Ui, racks: &mut Vec<PlcRack>) -> bool {
                 if let Some(ci) = drop_card {
                     rack.cards.remove(ci);
                 }
-                if ui.button("Add card").clicked() {
-                    let card = new_card(rack);
+                let card = new_card(rack);
+                if ui
+                    .add_enabled(card.is_some(), egui::Button::new("Add card"))
+                    .on_disabled_hover_text(format!("Every slot from 0 to {MAX_SLOT} has a card"))
+                    .clicked()
+                    && let Some(card) = card
+                {
                     rack.cards.push(card);
                     changed = true;
                 }
@@ -164,15 +172,30 @@ mod tests {
         assert_eq!(new_rack(&racks).name, "-A1");
 
         let mut rack = PlcRack::default();
-        assert_eq!(new_card(&rack).slot, 1);
+        assert_eq!(new_card(&rack).unwrap().slot, 1);
         rack.cards.push(PlcCard {
             slot: 4,
             ..PlcCard::default()
         });
-        let card = new_card(&rack);
+        let card = new_card(&rack).unwrap();
         assert_eq!((card.slot, card.channels), (5, 16));
-        rack.cards[0].slot = MAX_SLOT;
-        assert_eq!(new_card(&rack).slot, MAX_SLOT, "the form offers no slot past the last");
+    }
+
+    #[test]
+    fn a_card_added_after_the_last_slot_takes_a_free_one_and_a_full_rack_gets_none() {
+        let card = |slot| PlcCard {
+            slot,
+            ..PlcCard::default()
+        };
+        let mut rack = PlcRack {
+            cards: vec![card(1), card(MAX_SLOT)],
+            ..PlcRack::default()
+        };
+        assert_eq!(new_card(&rack).unwrap().slot, 2, "the first free slot");
+        rack.cards = (0..=MAX_SLOT).filter(|&s| s != 7).map(card).collect();
+        assert_eq!(new_card(&rack).unwrap().slot, 7);
+        rack.cards.push(card(7));
+        assert_eq!(new_card(&rack), None, "every slot is taken");
     }
 
     /// Run the form for one frame with `events`, as the app does.
@@ -212,7 +235,7 @@ mod tests {
     fn typing_into_a_card_changes_it() {
         let mut racks = vec![PlcRack {
             name: "-A1".into(),
-            cards: vec![new_card(&PlcRack::default())],
+            cards: vec![new_card(&PlcRack::default()).unwrap()],
             ..PlcRack::default()
         }];
         let ctx = egui::Context::default();
