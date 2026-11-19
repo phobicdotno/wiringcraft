@@ -273,13 +273,24 @@ impl Xf {
     }
     /// How lengths grow (the mean of the two axes' scales): radii and text heights.
     fn len_scale(&self) -> f64 {
-        // Normalized first, so a huge or tiny scale does not overflow or underflow when squared.
-        let big = self.m.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
-        if big == 0.0 || !big.is_finite() {
+        // Each axis normalized on its own, so a huge or tiny scale does not overflow or underflow
+        // when multiplied, and a tiny axis next to a huge one is not lost.
+        let [a, b, c, d] = self.m;
+        let (nx, ny) = (a.abs().max(c.abs()), b.abs().max(d.abs()));
+        if nx == 0.0 || ny == 0.0 {
+            return 0.0;
+        }
+        if !nx.is_finite() || !ny.is_finite() {
             return self.det().abs().sqrt();
         }
-        let [a, b, c, d] = self.m.map(|v| v / big);
-        big * (a * d - b * c).abs().sqrt()
+        let det = (a / nx) * (d / ny) - (b / ny) * (c / nx);
+        // Multiplied first where that stays in range, so a plain scale of 2 gives exactly 2.
+        let both = nx * ny;
+        if both.is_normal() {
+            (both * det.abs()).sqrt()
+        } else {
+            nx.sqrt() * ny.sqrt() * det.abs().sqrt()
+        }
     }
     /// Whether every direction grows alike (turns, mirrors and one scale), so a circle stays a
     /// circle. A placement scaled differently along x and y makes it an ellipse.
@@ -2126,6 +2137,15 @@ mod tests {
         assert!(
             shapes.iter().all(|(_, s)| matches!(s,
                 Shape::Circle { radius, .. } | Shape::Arc { radius, .. } if (*radius - 1.0).abs() < 1e-9)),
+            "{shapes:?}"
+        );
+        // Scales (1e200, 1e-200) keep a text's mean scale of 1, not a height of 0.
+        let (shapes, _) = draw(
+            "0\nBLOCK\n2\nB\n0\nTEXT\n10\n0\n20\n0\n40\n2.5\n1\nT\n0\nENDBLK\n",
+            "0\nINSERT\n2\nB\n10\n0\n20\n0\n41\n1e200\n42\n1e-200\n",
+        )?;
+        assert!(
+            matches!(&shapes[..], [(_, Shape::Text { height, .. })] if (*height - 2.5).abs() < 1e-9),
             "{shapes:?}"
         );
         // An arc whose angles give no points is left out and said, next to a line that is drawn.
