@@ -859,8 +859,10 @@ impl App {
                 open.delete_many(page, &sel);
             }
             Action::Rotate if self.ed.panel.is_some() => {
-                if let (Some(pi), Some(item)) = (self.ed.panel, self.ed.panel_pick) {
-                    open.rotate_panel_device(pi, item);
+                if let (Some(pi), Some(item)) = (self.ed.panel, self.ed.panel_pick)
+                    && !open.rotate_panel_device(pi, item)
+                {
+                    self.ed.message = "Turned, the device would not fit on the plate.".into();
                 }
             }
             Action::Rotate => open.rotate_many(page, &self.ed.selection),
@@ -4342,10 +4344,9 @@ fn confirm_page_props(
 /// is shown; canvas actions only when the page itself is shown, as in the panel view they work
 /// on the panel.
 fn held_for(a: Action, ed: &Editor, project: &wc_core::Project) -> Option<String> {
-    // With a panel shown these still work on the schematic page under it (Delete goes to the
-    // panel first), so they follow that page's hold.
-    let on_page_under_panel =
-        ed.panel.is_some() && matches!(a, Action::Paste | Action::Cut | Action::Rotate | Action::Mirror);
+    // With a panel shown these still work on the schematic page under it (Delete and Rotate go
+    // to the panel's picked device instead), so they follow that page's hold.
+    let on_page_under_panel = ed.panel.is_some() && matches!(a, Action::Paste | Action::Cut | Action::Mirror);
     let name = if a.edits_page_itself() || on_page_under_panel {
         let page = project.pages.get(ed.page)?;
         // Moving a page up or down renumbers its neighbour too.
@@ -5090,5 +5091,26 @@ fn side_name(side: wc_core::BoxSide) -> &'static str {
         wc_core::BoxSide::Bottom => "bottom",
         wc_core::BoxSide::Left => "left",
         wc_core::BoxSide::Right => "right",
+    }
+}
+
+#[cfg(test)]
+mod held_tests {
+    use super::*;
+
+    #[test]
+    fn rotate_on_a_panel_is_not_held_by_the_page_under_it() {
+        let mut project = wc_core::Project::new("x");
+        project.pages.push(wc_core::Page::new("p1", "1", "Mains"));
+        let mut ed = Editor::default();
+        ed.page = project.pages.len() - 1;
+        ed.held_by.insert("p1".into(), "Kim".into());
+        // On the page itself, Rotate turns its symbols: held.
+        assert_eq!(held_for(Action::Rotate, &ed, &project).as_deref(), Some("Kim"));
+        // With a panel shown, Rotate turns the picked panel device: not held; Paste still is.
+        ed.panel = Some(0);
+        ed.panel_pick = Some(0);
+        assert_eq!(held_for(Action::Rotate, &ed, &project), None);
+        assert_eq!(held_for(Action::Paste, &ed, &project).as_deref(), Some("Kim"));
     }
 }

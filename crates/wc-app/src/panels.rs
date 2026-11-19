@@ -1906,8 +1906,10 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, pi: usi
     if let Some((part, file)) = attach {
         ed.message = open.attach_footprint(&part, &file).unwrap_or_else(|e| e);
     }
-    if let Some(item) = turn {
-        open.rotate_panel_device(pi, item);
+    if let Some(item) = turn
+        && !open.rotate_panel_device(pi, item)
+    {
+        ed.message = "Turned, the device would not fit on the plate.".into();
     }
 }
 

@@ -154,7 +154,8 @@ impl Panel {
     }
 
     /// Turn the device at `index` a quarter clockwise about its middle, keeping it on the plate.
-    /// Returns false when `index` is not a device.
+    /// Returns false, changing nothing, when `index` is not a device or the turned device would
+    /// not fit on the plate.
     pub fn rotate_device(&mut self, index: usize) -> bool {
         let (pw, ph) = (self.width, self.height);
         let Some(PanelItem::Device {
@@ -169,8 +170,13 @@ impl Panel {
         };
         let (w, h) = turned_size(*width, *height, *rotation);
         let middle = Point::new(at.x + w / 2.0, at.y + h / 2.0);
-        *rotation = next_quarter(*rotation);
-        let (w, h) = turned_size(*width, *height, *rotation);
+        let next = next_quarter(*rotation);
+        let (w, h) = turned_size(*width, *height, next);
+        // A turn whose outline is wider or taller than the plate would stick out of it.
+        if w > pw || h > ph {
+            return false;
+        }
+        *rotation = next;
         *at = Point::new(
             (middle.x - w / 2.0).clamp(0.0, (pw - w).max(0.0)),
             (middle.y - h / 2.0).clamp(0.0, (ph - h).max(0.0)),
@@ -670,6 +676,19 @@ mod tests {
             Some((Point::new(0.0, 90.0), Point::new(100.0, 110.0)))
         );
         assert!(!p.rotate_device(9));
+        // Turned, a device longer than the plate is wide would stick out: refused.
+        let mut narrow = Panel::new("n", "N", 60.0, 120.0);
+        let Some(t) = tag("-G2") else { unreachable!() };
+        narrow.items.push(PanelItem::Device {
+            tag: t,
+            at: Point::new(20.0, 10.0),
+            width: 20.0,
+            height: 100.0,
+            rotation: Rotation::R0,
+        });
+        let before = narrow.clone();
+        assert!(!narrow.rotate_device(0));
+        assert_eq!(narrow, before);
     }
 
     #[test]
