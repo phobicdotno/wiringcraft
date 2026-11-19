@@ -9,6 +9,9 @@
 //!
 //! The length unit is read from the file (millimetre, metre, inch, ...). The model's axes are
 //! taken as they are: x across the plate, y up it and z out of it.
+//!
+//! In an assembly each part is measured where it is placed, nested assemblies included (see
+//! [`assembly`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -107,7 +110,8 @@ pub fn model_size(text: &str) -> Result<(ModelSize, Vec<String>)> {
         coords(args.get(1)?)
     };
 
-    let mut pts: Vec<[f64; 3]> = Vec::new();
+    // Each point with the instance it was measured from, to place it in its assembly.
+    let mut pts: Vec<(u64, [f64; 3])> = Vec::new();
     // The instances whose points are measured: their representations pick the length unit.
     let mut measured: BTreeSet<u64> = BTreeSet::new();
     let mut vertices = 0usize;
@@ -116,7 +120,7 @@ pub fn model_size(text: &str) -> Result<(ModelSize, Vec<String>)> {
             if name == "VERTEX_POINT"
                 && let Some(p) = args.get(1).and_then(Value::as_ref_id).and_then(point)
             {
-                pts.push(p);
+                pts.push((*id, p));
                 vertices += 1;
                 measured.insert(*id);
             }
@@ -124,7 +128,7 @@ pub fn model_size(text: &str) -> Result<(ModelSize, Vec<String>)> {
     }
     // Curves: whole circles and ellipses, and the control points of B-spline curves. They bound
     // a B-rep's round edges, and are the geometry of a wireframe model without vertices.
-    let mut curves: Vec<[f64; 3]> = Vec::new();
+    let mut curves: Vec<(u64, [f64; 3])> = Vec::new();
     let mut doubtful = 0usize;
     for (id, inst) in &instances {
         for (name, args) in inst {
@@ -150,7 +154,7 @@ pub fn model_size(text: &str) -> Result<(ModelSize, Vec<String>)> {
             };
             if !found.is_empty() {
                 measured.insert(*id);
-                curves.extend(found);
+                curves.extend(found.into_iter().map(|p| (*id, p)));
             }
         }
     }
@@ -162,7 +166,7 @@ pub fn model_size(text: &str) -> Result<(ModelSize, Vec<String>)> {
                     && let Some(list) = args.get(2).and_then(Value::as_list)
                 {
                     let before = pts.len();
-                    pts.extend(list.iter().filter_map(coords));
+                    pts.extend(list.iter().filter_map(coords).map(|p| (*id, p)));
                     if pts.len() > before {
                         measured.insert(*id);
                     }
@@ -187,7 +191,7 @@ pub fn model_size(text: &str) -> Result<(ModelSize, Vec<String>)> {
             .collect();
         for id in instances.keys().filter(|id| !origins.contains(id)) {
             if let Some(p) = point(*id) {
-                pts.push(p);
+                pts.push((*id, p));
                 measured.insert(*id);
             }
         }
@@ -201,16 +205,22 @@ pub fn model_size(text: &str) -> Result<(ModelSize, Vec<String>)> {
     let (mm, unit_warning) = length_unit(text, &instances, &measured);
     warnings.extend(unit_warning);
 
-    let placed = instances
-        .values()
-        .flatten()
-        .filter(|(name, _)| name == "MAPPED_ITEM" || name == "ITEM_DEFINED_TRANSFORMATION")
-        .count();
-    if placed > 0 {
+    // An assembly's parts, each moved to where it is placed.
+    let placed = assembly::place(text, &instances, pts, &point);
+    if placed.missed > 0 {
         warnings.push(format!(
-            "the model is an assembly ({placed} placed parts); their placements are not applied, so its size may be off"
+            "the model is an assembly ({} placed parts); {} of its placements could not be applied, so its size may be off",
+            placed.placements, placed.missed
         ));
     }
+    if placed.cut {
+        warnings.push(
+            "the assembly nests too deep, places its parts in a loop or uses too many of them; \
+             some parts were measured where they are drawn or by their own box, so its size may be off"
+                .into(),
+        );
+    }
+    let pts = placed.points;
 
     let mut min = [f64::INFINITY; 3];
     let mut max = [f64::NEG_INFINITY; 3];
@@ -806,6 +816,8 @@ impl Parser<'_> {
         }
     }
 }
+
+mod assembly;
 
 #[cfg(test)]
 mod tests;

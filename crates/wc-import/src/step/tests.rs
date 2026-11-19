@@ -326,3 +326,165 @@ fn hostile_text_is_refused_without_a_panic() {
         assert!(model_size(&step(MM, &data)).is_err(), "{}", &data[..data.len().min(80)]);
     }
 }
+
+/// One 10 x 20 x 5 mm box drawn as its own part (representation #300, origin #320), and an
+/// assembly (#400) with `placements`, `uses` and further entities in `rest`.
+fn assembly(uses: &[&str], placements: &str, rest: &str) -> String {
+    let part = box_vertices([0.0; 3], [10.0, 20.0, 5.0]);
+    let vertices: Vec<String> = (1..=8).map(|k| format!("#{}", 2 * k)).collect();
+    step(
+        MM,
+        &format!(
+            "{part}#321=CARTESIAN_POINT('',(0.,0.,0.));\n#320=AXIS2_PLACEMENT_3D('',#321,$,$);\n\
+             #901=(GEOMETRIC_REPRESENTATION_CONTEXT(3) GLOBAL_UNIT_ASSIGNED_CONTEXT((#900)) REPRESENTATION_CONTEXT('',''));\n\
+             #300=ADVANCED_BREP_SHAPE_REPRESENTATION('',(#320,{}),#901);\n\
+             #400=SHAPE_REPRESENTATION('',({}),#901);\n{placements}{rest}",
+            vertices.join(","),
+            uses.join(",")
+        ),
+    )
+}
+
+/// An axis placement `id` at `at`, with axis `z` and reference direction `x`.
+fn axis(id: u32, at: [f64; 3], z: [f64; 3], x: [f64; 3]) -> String {
+    format!(
+        "#{id}=AXIS2_PLACEMENT_3D('',#{},#{},#{});\n#{}=CARTESIAN_POINT('',({:?},{:?},{:?}));\n#{}=DIRECTION('',({:?},{:?},{:?}));\n#{}=DIRECTION('',({:?},{:?},{:?}));\n",
+        id + 1,
+        id + 2,
+        id + 3,
+        id + 1,
+        at[0],
+        at[1],
+        at[2],
+        id + 2,
+        z[0],
+        z[1],
+        z[2],
+        id + 3,
+        x[0],
+        x[1],
+        x[2]
+    )
+}
+
+/// The part placed in the assembly at placement `to` by relationship `id`, with the
+/// transformation's two placements in the order given.
+fn placed_by_relationship(id: u32, a: u32, b: u32) -> String {
+    format!(
+        "#{id}=(REPRESENTATION_RELATIONSHIP('','',#300,#400) REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#{}) SHAPE_REPRESENTATION_RELATIONSHIP());\n#{}=ITEM_DEFINED_TRANSFORMATION('','',#{a},#{b});\n",
+        id + 1,
+        id + 1
+    )
+}
+
+const Z: [f64; 3] = [0.0, 0.0, 1.0];
+const X: [f64; 3] = [1.0, 0.0, 0.0];
+
+#[test]
+fn an_assembly_measures_its_parts_where_they_are_placed() {
+    // Two uses of the box, side by side: x 0..10 and 30..40.
+    let text = assembly(
+        &["#410", "#420"],
+        &format!(
+            "{}{}{}{}",
+            axis(410, [0.0; 3], Z, X),
+            axis(420, [30.0, 0.0, 0.0], Z, X),
+            placed_by_relationship(500, 320, 410),
+            placed_by_relationship(510, 320, 420)
+        ),
+        "",
+    );
+    let (s, warnings) = size(&text);
+    assert_eq!(
+        s,
+        ModelSize {
+            width: 40.0,
+            height: 20.0,
+            depth: 5.0
+        }
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn a_part_turned_a_quarter_swaps_its_width_and_height() {
+    // Its x axis along the assembly's y.
+    let turned = axis(420, [100.0, 0.0, 0.0], Z, [0.0, 1.0, 0.0]);
+    let quarter = ModelSize {
+        width: 20.0,
+        height: 10.0,
+        depth: 5.0,
+    };
+    let text = assembly(
+        &["#420"],
+        &format!("{turned}{}", placed_by_relationship(510, 320, 420)),
+        "",
+    );
+    assert_eq!(size(&text).0, quarter);
+    // Writers that list the placements the other way round: told apart by which
+    // representation each placement belongs to.
+    let text = assembly(
+        &["#420"],
+        &format!("{turned}{}", placed_by_relationship(510, 420, 320)),
+        "",
+    );
+    let (s, warnings) = size(&text);
+    assert_eq!(s, quarter);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    // The same with a mapped item.
+    let text = assembly(
+        &["#600"],
+        &turned,
+        "#601=REPRESENTATION_MAP(#320,#300);\n#600=MAPPED_ITEM('',#601,#420);\n",
+    );
+    let (s, warnings) = size(&text);
+    assert_eq!(s, quarter);
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn nested_assemblies_add_up_their_placements() {
+    // The box in a sub-assembly (#700) shifted 50 along x, and the sub-assembly used twice in
+    // the top assembly, the second 100 further along y and lying on its back (z down).
+    let text = assembly(
+        &["#410", "#420"],
+        &format!(
+            "{}{}{}{}{}{}",
+            axis(410, [0.0; 3], Z, X),
+            axis(420, [0.0, 100.0, 0.0], [0.0, 0.0, -1.0], X),
+            axis(710, [50.0, 0.0, 0.0], Z, X),
+            axis(720, [0.0; 3], Z, X),
+            "#700=SHAPE_REPRESENTATION('',(#710,#720),#901);\n#750=(REPRESENTATION_RELATIONSHIP('','',#300,#700) REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#751) SHAPE_REPRESENTATION_RELATIONSHIP());\n#751=ITEM_DEFINED_TRANSFORMATION('','',#320,#710);\n",
+            "#760=(REPRESENTATION_RELATIONSHIP('','',#700,#400) REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#761) SHAPE_REPRESENTATION_RELATIONSHIP());\n#761=ITEM_DEFINED_TRANSFORMATION('','',#720,#410);\n#770=(REPRESENTATION_RELATIONSHIP('','',#700,#400) REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#771) SHAPE_REPRESENTATION_RELATIONSHIP());\n#771=ITEM_DEFINED_TRANSFORMATION('','',#720,#420);\n"
+        ),
+        "",
+    );
+    let (s, warnings) = size(&text);
+    // x 50..60; y 0..20 and, flipped about x, 80..100; z 0..5 and -5..0.
+    assert_eq!(
+        s,
+        ModelSize {
+            width: 10.0,
+            height: 100.0,
+            depth: 10.0
+        }
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn placements_in_a_loop_end_with_a_warning() {
+    // The part placed in the assembly and the assembly placed back in the part.
+    let text = assembly(
+        &["#410"],
+        &format!(
+            "{}{}#530=(REPRESENTATION_RELATIONSHIP('','',#400,#300) REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#531) SHAPE_REPRESENTATION_RELATIONSHIP());\n#531=ITEM_DEFINED_TRANSFORMATION('','',#410,#320);\n",
+            axis(410, [5.0, 0.0, 0.0], Z, X),
+            placed_by_relationship(500, 320, 410),
+        ),
+        "",
+    );
+    let (s, warnings) = size(&text);
+    assert!(s.is_usable());
+    assert!(warnings.join("\n").contains("in a loop"), "{warnings:?}");
+}
