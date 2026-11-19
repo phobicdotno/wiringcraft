@@ -231,3 +231,85 @@ fn a_failed_commit_without_an_index_copy_says_so() -> Result<()> {
     assert!(e.contains("no copy of the staged files was taken"), "and why: {e}");
     Ok(())
 }
+
+#[test]
+fn a_commit_of_some_paths_leaves_every_other_change() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    let write = |name: &str, text: &str| -> Result<()> {
+        let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| wc_core::Error::io(parent, e))?;
+        }
+        std::fs::write(&path, text).map_err(|e| wc_core::Error::io(&path, e).into())
+    };
+    write("pages/p1.json", "1")?;
+    write("pages/old.json", "old")?;
+    write("vendor/symbols/a.json", "a1")?;
+    let git = Git::new(dir);
+    git.init()?;
+
+    // A page added, one removed, a vendored file changed by someone else, and a staged stray file.
+    write("pages/p2.json", "2")?;
+    std::fs::remove_file(dir.join("pages/old.json")).map_err(|e| wc_core::Error::io("old", e))?;
+    write("vendor/symbols/a.json", "a2")?;
+    write("stray [x].txt", "s")?;
+    git.run(&["add", "--", "stray [x].txt"])?;
+
+    let head = git.commit_paths_as("Pages", "Guest <guest@example.com>", &["pages", "panels", "nothere"])?;
+    assert!(head.is_some());
+    let files = git.run(&["show", "--name-status", "--format=", "HEAD"])?;
+    let mut lines: Vec<&str> = files.lines().collect();
+    lines.sort();
+    assert_eq!(lines, ["A\tpages/p2.json", "D\tpages/old.json"]);
+    assert_eq!(git.author_and_subject("HEAD")?.0, "Guest <guest@example.com>");
+    // The rest is still there to commit, the stray file still staged.
+    let left = git.run(&["status", "--porcelain"])?;
+    assert!(left.contains(" M vendor/symbols/a.json"), "{left}");
+    assert!(
+        left.contains("A  \"stray [x].txt\"") || left.contains("A  stray [x].txt"),
+        "{left}"
+    );
+
+    // Nothing left under the paths: no commit.
+    assert!(
+        git.commit_paths_as("Again", "Guest <guest@example.com>", &["pages"])?
+            .is_none()
+    );
+    // A removal staged with `git rm` is recorded too; a staged file elsewhere stays staged.
+    git.run(&["rm", "-q", "--", "pages/p2.json"])?;
+    git.commit_paths_as("Remove page 2", "Guest <guest@example.com>", &["pages"])?
+        .ok_or("no commit")
+        .map_err(|e| wc_core::Error::Invalid(e.into()))?;
+    let files = git.run(&["show", "--name-status", "--format=", "HEAD"])?;
+    assert_eq!(files.trim(), "D\tpages/p2.json");
+    let left = git.run(&["status", "--porcelain"])?;
+    assert!(left.contains("stray [x].txt"), "{left}");
+    // A file added and removed again, beside a changed one: the changed one is recorded.
+    write("pages/temp.json", "t")?;
+    git.run(&["add", "--", "pages/temp.json"])?;
+    std::fs::remove_file(dir.join("pages/temp.json")).map_err(|e| wc_core::Error::io("temp", e))?;
+    write("pages/p1.json", "1b")?;
+    assert!(
+        git.commit_paths_as("Edit page 1", "Guest <guest@example.com>", &["pages"])?
+            .is_some()
+    );
+    let files = git.run(&["show", "--name-status", "--format=", "HEAD"])?;
+    assert_eq!(files.trim(), "M\tpages/p1.json");
+    // A change staged and then undone in the folder leaves nothing to record: no commit.
+    write("pages/p1.json", "1c")?;
+    git.run(&["add", "--", "pages/p1.json"])?;
+    write("pages/p1.json", "1b")?;
+    let head = git.head();
+    assert!(
+        git.commit_paths_as("Nothing", "Guest <guest@example.com>", &["pages"])?
+            .is_none()
+    );
+    assert_eq!(git.head(), head);
+    // A name with glob characters is taken as it is written.
+    assert!(
+        git.commit_paths_as("Stray", "Guest <guest@example.com>", &["stray [x].txt"])?
+            .is_some()
+    );
+    Ok(())
+}

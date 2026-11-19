@@ -3714,6 +3714,51 @@ fn a_git_journal_puts_vendored_files_back_when_a_change_is_not_recorded() -> Tes
 }
 
 #[test]
+fn a_git_journal_commits_only_the_files_of_the_change_it_records() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path();
+    let mut project = store::create(dir, "Demo")?;
+    let mut journal = GitJournal::open(dir)?;
+    journal.git().commit("start")?;
+    // The host takes a symbol from the library outside the session: its file is written before
+    // the save that pins it (#316), and a stray note lies in the folder.
+    store::write_vendored_symbol(dir, &symbol("lamp", "Lamp"))?;
+    std::fs::write(dir.join("notes.txt"), "mine")?;
+    // A guest's page change is recorded, and a change that vendors its own symbol.
+    project.pages.push(wc_core::Page::new("p0002", "2", "Motor"));
+    journal.vendor(&[symbol("coil", "Coil")], &[])?;
+    let change = Change {
+        by: HOST,
+        author: "Gina Guest <gina@example.com>".into(),
+        page: Some("p0002".into()),
+        message: "Add page 2".into(),
+    };
+    journal.record(&project, &change)?;
+    let git = |args: &[&str]| -> std::io::Result<String> {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()?;
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let committed = git(&["show", "--name-only", "--format=", "HEAD"])?;
+    assert!(committed.contains("pages/p0002.page.json"), "{committed}");
+    assert!(committed.contains("vendor/symbols/coil.json"), "{committed}");
+    assert!(
+        !committed.contains("lamp"),
+        "the host's own vendored file stays out: {committed}"
+    );
+    assert!(!committed.contains("notes.txt"), "{committed}");
+    let left = git(&["status", "--porcelain", "--untracked-files=all"])?;
+    assert!(
+        left.contains("vendor/symbols/lamp.json") && left.contains("notes.txt"),
+        "{left}"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_page_edit_that_places_a_symbol_the_session_does_not_have_is_refused() -> TestResult {
     let mut s = Session::new();
     let (_a, link_a, mut a) = s.join("Ola")?;
