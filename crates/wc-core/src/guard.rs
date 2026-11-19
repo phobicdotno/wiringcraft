@@ -229,7 +229,6 @@ impl ProjectFiles {
         if self.dirs.contains(&dir.id) || inside(&self.roots, &opened) {
             return Err(Fail::Refused("is in the project folder".into()));
         }
-        #[cfg_attr(not(test), allow(unused_variables))]
         let (staged, mut file) = dir.create_new(&name)?;
         let done = (|| {
             use std::io::Write;
@@ -243,12 +242,22 @@ impl ProjectFiles {
             dir.rename(&file, &name)?;
             Ok(())
         })();
-        if done.is_err() {
-            // Only the file this call made goes: it is removed through its own handle, by
-            // no name at all.
-            let _ = win::remove(&file);
+        // Only the file this call made goes: it is removed through its own handle, by no name
+        // at all. A removal that fails too is named after the first failure.
+        match done {
+            Err(fail) => Err(match (fail, win::remove(&file)) {
+                (fail, Ok(())) => fail,
+                (Fail::Refused(why), Err(e)) => Fail::Refused(format!(
+                    "{why} (its new file {} is left: {e})",
+                    staged.to_string_lossy()
+                )),
+                (Fail::Io(first), Err(e)) => Fail::Io(io::Error::new(
+                    first.kind(),
+                    format!("{first} (the new file {} is left: {e})", staged.to_string_lossy()),
+                )),
+            }),
+            Ok(()) => Ok(()),
         }
-        done
     }
 
     /// Write `bytes` as a new file next to `path`, checked by where its name leads, and give it
@@ -1107,12 +1116,13 @@ mod tests {
     /// link).
     #[cfg(windows)]
     fn junction(link: &Path, to: &Path) -> io::Result<()> {
+        use std::os::windows::process::CommandExt;
+        // Quoted for cmd, so characters such as `&` in a path are taken literally (a path
+        // cannot hold a `"`).
+        let quoted = |p: &Path| format!("\"{}\"", p.display());
         let done = std::process::Command::new("cmd")
             .arg("/C")
-            .arg("mklink")
-            .arg("/J")
-            .arg(link)
-            .arg(to)
+            .raw_arg(format!("mklink /J {} {}", quoted(link), quoted(to)))
             .output()?;
         if done.status.success() {
             Ok(())
@@ -1173,9 +1183,15 @@ mod tests {
         let planted = std::rc::Rc::new(std::cell::RefCell::new(std::ffi::OsString::new()));
         let planted2 = planted.clone();
         on("rename", move |_folder: &Path, staged: &std::ffi::OsStr| {
-            if std::fs::rename(&sub2, &moved2).is_ok() {
-                junction(&sub2, &pages2)?;
-                swapped2.set(true);
+            match std::fs::rename(&sub2, &moved2) {
+                Ok(()) => {
+                    junction(&sub2, &pages2)?;
+                    swapped2.set(true);
+                }
+                // Only the refusal to move a folder that holds an open file (access denied or
+                // a sharing violation) lets the test go on without the swap.
+                Err(e) if matches!(e.raw_os_error(), Some(5 | 32)) => {}
+                Err(e) => return Err(e),
             }
             std::fs::write(pages2.join(staged), "planted")?;
             *planted2.borrow_mut() = staged.to_owned();
