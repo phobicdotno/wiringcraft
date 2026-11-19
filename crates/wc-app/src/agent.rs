@@ -2652,7 +2652,8 @@ impl App {
         if let Some(open) = self.open.as_mut() {
             // In a shared session a page someone else has open is read-only here, and the
             // command line writes the project folder directly: only commands that read it run.
-            if let Some(why) = writes_while_held(&args, &open.dir, &open.held_by_others) {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            if let Some(why) = writes_while_held(&args, &open.dir, &open.held_by_others, &cwd) {
                 return Err(why);
             }
             if open.dirty {
@@ -2791,7 +2792,9 @@ fn stem(p: &Path) -> String {
 /// hold pages (`held`, page id to name): it may change the project, or it names a path into the
 /// project folder (an export written over a page). `None` when it runs: nobody holds a page, or
 /// it only reads the project.
-fn writes_while_held(args: &[String], dir: &Path, held: &BTreeMap<String, String>) -> Option<String> {
+///
+/// `cwd` is the folder the command runs in, which relative paths are taken from.
+fn writes_while_held(args: &[String], dir: &Path, held: &BTreeMap<String, String>, cwd: &Path) -> Option<String> {
     if held.is_empty() {
         return None;
     }
@@ -2824,7 +2827,16 @@ fn writes_while_held(args: &[String], dir: &Path, held: &BTreeMap<String, String
             args.join(" ")
         ));
     }
-    if let Some(a) = args.iter().find(|a| in_project(dir, split_flag(a).1).is_some()) {
+    let roots = project_roots(dir);
+    // Run from inside the project folder, even a bare file name could land on a held page.
+    if inside(&roots, cwd) {
+        return Some(format!(
+            "`wiringcraft {}` is not run while {who} has a page open in the shared session: this program runs \
+             from inside the project folder, so an output file could land on a page. Start it from another folder.",
+            args.join(" ")
+        ));
+    }
+    if let Some(a) = args.iter().find(|a| in_project(&roots, cwd, split_flag(a).1)) {
         return Some(format!(
             "`{a}` is in the project folder, and {who} has a page open in the shared session: write the \
              output outside the project folder."
@@ -2841,19 +2853,53 @@ fn split_flag(a: &str) -> (&str, &str) {
     }
 }
 
-/// Where in the project folder `value` points, when it is a path into it: an absolute path,
-/// or a relative one that is clearly a path (it has a separator or starts with a dot).
-fn in_project(project: &Path, value: &str) -> Option<PathBuf> {
+/// Whether `value` is a path into the project (see [`project_roots`]): an absolute path, or
+/// one relative to `cwd` that is clearly a path (it has a separator or starts with a dot).
+fn in_project(roots: &[PathBuf], cwd: &Path, value: &str) -> bool {
     let p = Path::new(value);
     let path = if p.is_absolute() {
         p.to_path_buf()
     } else if value.contains('/') || value.contains('\\') || value.starts_with('.') {
-        std::env::current_dir().ok()?.join(p)
+        cwd.join(p)
     } else {
-        return None;
+        return false;
     };
-    let (path, project) = (normalize(&real(&path)), real(project));
-    path.strip_prefix(&project).ok().map(Path::to_path_buf)
+    inside(roots, &path)
+}
+
+/// Whether `path`, as the file system resolves it, is in one of `roots`.
+fn inside(roots: &[PathBuf], path: &Path) -> bool {
+    let path = normalize(&real(path));
+    roots.iter().any(|r| path.starts_with(r))
+}
+
+/// Where the project's files really are: the project folder, and where each link in it
+/// points (a `pages` folder linked to elsewhere is the project's too), followed through
+/// further links. `.git` is left out.
+fn project_roots(project: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![real(project)];
+    let mut todo = vec![project.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let Ok(kind) = e.file_type() else { continue };
+            if e.file_name() == ".git" {
+                continue;
+            }
+            if kind.is_symlink() {
+                let Ok(to) = e.path().canonicalize() else { continue };
+                if roots.iter().any(|r| to.starts_with(r)) {
+                    continue;
+                }
+                if to.is_dir() {
+                    todo.push(to.clone());
+                }
+                roots.push(to);
+            } else if kind.is_dir() {
+                todo.push(e.path());
+            }
+        }
+    }
+    roots
 }
 
 /// `path` with links and `..` worked out as the file system does, as far as it exists (a link
@@ -5406,8 +5452,8 @@ mod tests {
             .unwrap()
             .held_by_others
             .insert("p0002".into(), "Ola".into());
-        let elsewhere = std::env::temp_dir().join("wiringcraft-test-out.pdf");
-        let elsewhere = elsewhere.display().to_string();
+        let out = tempfile::tempdir().unwrap();
+        let elsewhere = out.path().join("out.pdf").display().to_string();
         for args in [
             vec!["check"],
             vec!["report", "parts"],
@@ -5436,7 +5482,30 @@ mod tests {
                 let e = command_runs(&mut a, &["vcs", "log", "--svg", up.as_str()]).unwrap_err();
                 assert!(e.contains("project folder"), "{up}: {e}");
             }
+            // A folder of the project linked to elsewhere is still the project's: both the
+            // path through the project and the path where it really is are refused.
+            let shared = tempfile::tempdir().unwrap();
+            std::fs::write(shared.path().join("p0009.page.json"), "{}").unwrap();
+            std::os::unix::fs::symlink(shared.path(), dir.join("linked")).unwrap();
+            let deeper = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(deeper.path(), shared.path().join("deeper")).unwrap();
+            for to in [
+                dir.join("linked").join("p0009.page.json"),
+                shared.path().join("new.st"),
+                deeper.path().join("new.st"),
+            ] {
+                let to = to.display().to_string();
+                let e = command_runs(&mut a, &["plc-vars", to.as_str()]).unwrap_err();
+                assert!(e.contains("project folder"), "{to}: {e}");
+            }
+            std::fs::remove_file(dir.join("linked")).unwrap();
         }
+        // Run from inside the project folder, a bare file name is in it too.
+        let held = a.open.as_ref().unwrap().held_by_others.clone();
+        let args: Vec<String> = ["plc-vars", "p0002.page.json"].map(String::from).to_vec();
+        let e = writes_while_held(&args, &dir, &held, &dir.join("pages")).unwrap();
+        assert!(e.contains("inside the project folder"), "{e}");
+        assert!(writes_while_held(&args, &dir, &held, out.path()).is_none());
         let page = dir.join("pages").join("p0002.page.json").display().to_string();
         for args in [
             vec!["vcs".to_owned(), "log".into(), "--svg".into(), page.clone()],
