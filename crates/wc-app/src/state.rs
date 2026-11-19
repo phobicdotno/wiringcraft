@@ -273,6 +273,9 @@ pub struct Open {
     /// Every version of a vendored symbol this window has loaded, by content hash, so Undo
     /// and Redo can put back the version the restored lock names.
     symbol_versions: BTreeMap<String, Symbol>,
+    /// Every version of a vendored part this window has loaded, by content hash, so Undo and
+    /// Redo can put back the version the restored lock names (#498).
+    part_versions: BTreeMap<String, Part>,
     /// Symbols whose vendored file may hold another version than the one loaded, after a
     /// failed Undo or Redo (or a command's result) could not be put back. The next Undo, Redo
     /// or save writes them again.
@@ -284,6 +287,9 @@ pub struct Open {
     /// Tests: whether each coming symbol file write fails, in order.
     #[cfg(test)]
     pub(crate) fail_symbol_writes: std::collections::VecDeque<bool>,
+    /// Tests: whether each coming part file write of Undo or Redo fails, in order.
+    #[cfg(test)]
+    pub(crate) fail_part_writes: std::collections::VecDeque<bool>,
     /// Tests: a file that turns into a folder once the library update has read its backups,
     /// so the update's write of it fails after other items were already written, and so does
     /// putting it back.
@@ -350,10 +356,13 @@ impl Open {
             terminals_before: None,
             held_by_others: BTreeMap::new(),
             symbol_versions: BTreeMap::new(),
+            part_versions: BTreeMap::new(),
             stale_symbol_files: Default::default(),
             unrestored_files: BTreeMap::new(),
             #[cfg(test)]
             fail_symbol_writes: Default::default(),
+            #[cfg(test)]
+            fail_part_writes: Default::default(),
             #[cfg(test)]
             block_after_snapshot: None,
             #[cfg(test)]
@@ -961,12 +970,14 @@ impl Open {
             Some(prev) => {
                 self.forget_terminal_change();
                 self.redo.push(std::mem::replace(&mut self.project, prev));
-                if let Err(e) = self.sync_symbols() {
-                    // The symbol files could not follow: keep the project as it was.
+                let left = self.redo.last().map(|p| p.lock.parts.clone()).unwrap_or_default();
+                if let Err(e) = self.sync_vendored(&left) {
+                    // The vendored files could not follow: keep the project as it was.
                     if let Some(cur) = self.redo.pop() {
-                        self.undo.push(std::mem::replace(&mut self.project, cur));
+                        let restored = std::mem::replace(&mut self.project, cur);
+                        self.undo_error = Some(e);
+                        self.undo.push(restored);
                     }
-                    self.undo_error = Some(e);
                     return false;
                 }
                 let sources = self.redo.last().map(|p| &p.meta.libraries) != Some(&self.project.meta.libraries);
@@ -985,11 +996,13 @@ impl Open {
             Some(next) => {
                 self.forget_terminal_change();
                 self.undo.push(std::mem::replace(&mut self.project, next));
-                if let Err(e) = self.sync_symbols() {
+                let left = self.undo.last().map(|p| p.lock.parts.clone()).unwrap_or_default();
+                if let Err(e) = self.sync_vendored(&left) {
                     if let Some(cur) = self.undo.pop() {
-                        self.redo.push(std::mem::replace(&mut self.project, cur));
+                        let restored = std::mem::replace(&mut self.project, cur);
+                        self.undo_error = Some(e);
+                        self.redo.push(restored);
                     }
-                    self.undo_error = Some(e);
                     return false;
                 }
                 let sources = self.undo.last().map(|p| &p.meta.libraries) != Some(&self.project.meta.libraries);
@@ -1061,6 +1074,140 @@ impl Open {
         }
         self.symbols = syms;
         self.touch();
+    }
+
+    /// After Undo or Redo: the parts whose pin the step changed (`left` is the part lock of the
+    /// state left), then the vendored symbols, as the restored lock names them. When the
+    /// symbols cannot follow, the part files written are put back first, so a failed step
+    /// leaves nothing half done.
+    fn sync_vendored(&mut self, left: &BTreeMap<String, wc_core::LockEntry>) -> Result<(), String> {
+        let writes = self.sync_parts(left)?;
+        if let Err(e) = self.sync_symbols() {
+            let unrestored = self.undo_part_writes(writes, left);
+            return Err(with_unrestored(e, &unrestored));
+        }
+        // The files written now hold the version the lock names: a backup still waiting from
+        // an earlier failure is done with, and a later save must not write it over the copy.
+        for w in &writes {
+            self.unrestored_files.remove(&w.path);
+        }
+        Ok(())
+    }
+
+    /// After Undo or Redo: put back the project copy of each part whose pin the step changed
+    /// (`left` being the part lock of the state left), in the project folder and, when it is
+    /// loaded, in memory, so the copy is the version the restored lock names. A part whose pin
+    /// the step did not touch is left alone, so a copy changed in the project keeps its
+    /// changes. Returns what was written, for [`Open::undo_part_writes`]; when a file cannot
+    /// be written, the files already written are put back and nothing changes.
+    fn sync_parts(&mut self, left: &BTreeMap<String, wc_core::LockEntry>) -> Result<Vec<PartWrite>, String> {
+        let mut wanted: Vec<(Part, PathBuf)> = Vec::new();
+        for (id, entry) in &self.project.lock.parts {
+            if left.get(id) == Some(entry) {
+                continue;
+            }
+            let path = store::vendor_path(&self.dir, ItemKind::Part, id).map_err(|e| e.to_string())?;
+            let file = store::read_vendored_part(&self.dir, id);
+            let file_fits = file.as_ref().is_ok_and(|p| p.hash() == entry.hash && p.id == *id);
+            let loaded_fits = self.parts.get(id).is_none_or(|p| p.hash() == entry.hash);
+            if file_fits && loaded_fits {
+                continue;
+            }
+            let version = match (self.part_versions.get(&entry.hash), file) {
+                (Some(p), _) => p.clone(),
+                (None, Ok(p)) if file_fits => p,
+                (None, Ok(_)) => {
+                    return Err(format!(
+                        "the version of part {id} this step names is not known any more"
+                    ));
+                }
+                (None, Err(e)) => {
+                    return Err(format!(
+                        "the version of part {id} this step names is not known any more, and its file cannot be read: {e}"
+                    ));
+                }
+            };
+            wanted.push((version, path));
+        }
+        let mut writes: Vec<PartWrite> = Vec::new();
+        for (want, path) in wanted {
+            let was = match snapshot_file(&path) {
+                Ok(was) => was,
+                Err(e) => {
+                    let unrestored = self.undo_part_writes(writes, left);
+                    return Err(with_unrestored(
+                        format!("part {} could not be put back: {e}", want.id),
+                        &unrestored,
+                    ));
+                }
+            };
+            if let Err(e) = self.write_part_file(&want) {
+                let unrestored = self.undo_part_writes(writes, left);
+                return Err(with_unrestored(
+                    format!("part {} could not be put back: {e}", want.id),
+                    &unrestored,
+                ));
+            }
+            self.part_versions.insert(want.hash(), want.clone());
+            let loaded = self.parts.get(&want.id).cloned();
+            if let Some(old) = &loaded {
+                self.part_versions.insert(old.hash(), old.clone());
+                self.parts.insert(want.id.clone(), want.clone());
+            }
+            writes.push(PartWrite {
+                id: want.id.clone(),
+                path,
+                was,
+                loaded,
+            });
+        }
+        Ok(writes)
+    }
+
+    /// Take back part files [`Open::sync_parts`] wrote, newest first, with the loaded parts they
+    /// replaced. A file that cannot be put back is kept as an unrestored file under its pin in
+    /// `pins` (the lock the project goes back to): the pinned version stays loaded, and the
+    /// next save writes the file first. Returns what could not be put back.
+    fn undo_part_writes(&mut self, writes: Vec<PartWrite>, pins: &BTreeMap<String, wc_core::LockEntry>) -> Vec<String> {
+        let mut unrestored = Vec::new();
+        for w in writes.into_iter().rev() {
+            if let Some(old) = w.loaded {
+                self.parts.insert(w.id.clone(), old);
+            }
+            #[cfg(test)]
+            let blocked = self.fail_part_writes.pop_front() == Some(true);
+            #[cfg(not(test))]
+            let blocked = false;
+            let put_back = if blocked {
+                Err(std::io::Error::other("test write failure"))
+            } else {
+                restore_file(&w.path, w.was.as_deref())
+            };
+            if let Err(e) = put_back {
+                unrestored.push(format!("{} ({e})", w.id));
+                let pin = pins.get(&w.id).map(|e| e.hash.clone());
+                self.register_unrestored(
+                    w.path,
+                    UnrestoredFile {
+                        kind: ItemKind::Part,
+                        id: w.id,
+                        was: w.was,
+                        pin,
+                    },
+                );
+            }
+        }
+        unrestored
+    }
+
+    fn write_part_file(&mut self, part: &Part) -> Result<(), String> {
+        #[cfg(test)]
+        if self.fail_part_writes.pop_front() == Some(true) {
+            return Err("test write failure".into());
+        }
+        store::write_vendored_part(&self.dir, part)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
     /// After Undo or Redo: put back the vendored symbol versions the restored lock names, both
@@ -1275,6 +1422,17 @@ impl Open {
             std::fs::write(&path, text).map_err(|e| format!("test: {} cannot be rewritten: {e}", path.display()))?;
         }
         self.archive_symbols();
+        // The parts too, loaded or not, so Undo can put back the copies the update replaces.
+        for p in self.parts.values() {
+            self.part_versions.insert(p.hash(), p.clone());
+        }
+        for (kind, id, _) in &todo {
+            if *kind == ItemKind::Part
+                && let Ok(p) = store::read_vendored_part(&self.dir, id)
+            {
+                self.part_versions.insert(p.hash(), p);
+            }
+        }
         self.checkpoint();
         // Tests: a file turns into a folder once the update read its backups, so writing it,
         // and putting it back, fails.
@@ -1323,6 +1481,7 @@ impl Open {
             if *kind == ItemKind::Part {
                 match store::read_vendored_part(&self.dir, id) {
                     Ok(p) => {
+                        self.part_versions.insert(p.hash(), p.clone());
                         self.parts.insert(id.clone(), p);
                     }
                     Err(_) => {
@@ -1408,19 +1567,15 @@ impl Open {
             self.symbols.insert(f.id.clone(), old);
             self.stale_symbol_files.insert(f.id.clone());
         }
-        // A file still waiting from an earlier failed update under the same pin keeps that
-        // backup: this update's backup is of the file as the earlier failure left it.
-        if self.unrestored_files.get(&f.path).is_none_or(|known| known.pin != pin) {
-            self.unrestored_files.insert(
-                f.path.clone(),
-                UnrestoredFile {
-                    kind: f.kind,
-                    id: f.id.clone(),
-                    was: f.was.clone(),
-                    pin,
-                },
-            );
-        }
+        self.register_unrestored(
+            f.path.clone(),
+            UnrestoredFile {
+                kind: f.kind,
+                id: f.id.clone(),
+                was: f.was.clone(),
+                pin,
+            },
+        );
         if f.kind == ItemKind::Part
             && let Some(old) = self
                 .unrestored_files
@@ -1430,7 +1585,20 @@ impl Open {
         {
             self.parts.insert(f.id.clone(), old);
         }
-        // The file still has to be written: unsaved work, so Save is offered and asked for.
+    }
+
+    /// Note a file that could not be put back, to be written before the next save. A file still
+    /// waiting from an earlier failure under the same pin keeps that backup: this one is of the
+    /// file as the earlier failure left it. The file still has to be written: unsaved work, so
+    /// Save is offered and asked for.
+    fn register_unrestored(&mut self, path: PathBuf, file: UnrestoredFile) {
+        if self
+            .unrestored_files
+            .get(&path)
+            .is_none_or(|known| known.pin != file.pin)
+        {
+            self.unrestored_files.insert(path, file);
+        }
         self.edited();
     }
 
@@ -2855,8 +3023,28 @@ struct KeptFile {
     was: Option<Vec<u8>>,
 }
 
-/// A vendored file a failed library update could not put back ([`Open::unrestored_files`]):
-/// its item, what it held, and the version the lock pinned then.
+/// A part file Undo or Redo wrote ([`Open::sync_parts`]): what it held before, and the part
+/// loaded before, if any, so a step that cannot be finished puts both back.
+struct PartWrite {
+    id: String,
+    path: PathBuf,
+    was: Option<Vec<u8>>,
+    loaded: Option<Part>,
+}
+
+/// `err`, naming the part files that could not be put back after it.
+fn with_unrestored(mut err: String, unrestored: &[String]) -> String {
+    if !unrestored.is_empty() {
+        err.push_str(&format!(
+            "; these part files now hold the other version and could not be put back: {}. The pinned version stays loaded and the next save writes them first.",
+            unrestored.join(", ")
+        ));
+    }
+    err
+}
+
+/// A vendored file a failed library update, Undo or Redo could not put back
+/// ([`Open::unrestored_files`]): its item, what it held, and the version the lock pinned then.
 #[derive(Clone)]
 struct UnrestoredFile {
     kind: ItemKind,
@@ -3623,6 +3811,26 @@ pub(crate) mod tests {
         // One undo step takes the project's pin back.
         assert!(o.undo());
         assert_eq!(o.project.lock.parts[pid].hash, pin);
+        // And the project's copy with it, in the folder and loaded (#498).
+        assert_eq!(store::read_vendored_part(&o.dir, pid).unwrap().hash(), pin);
+        assert_eq!(o.parts[pid].hash(), pin);
+        assert!(o.parts[pid].footprint.is_none());
+        // Redo brings the new copy back the same way.
+        assert!(o.redo());
+        assert_eq!(o.project.lock.parts[pid].hash, in_lib.hash());
+        assert_eq!(store::read_vendored_part(&o.dir, pid).unwrap(), in_lib);
+        assert_eq!(o.parts[pid], in_lib);
+        // A copy that cannot be written leaves the step undone, and everything as it was.
+        o.fail_part_writes.push_back(true);
+        assert!(!o.undo());
+        let err = o.take_undo_error().unwrap_or_default();
+        assert!(err.contains(&format!("part {pid} could not be put back")), "{err}");
+        assert_eq!(o.project.lock.parts[pid].hash, in_lib.hash());
+        assert_eq!(store::read_vendored_part(&o.dir, pid).unwrap(), in_lib);
+        assert_eq!(o.parts[pid], in_lib);
+        assert_eq!(o.project.lock.symbols[pid], sym_pin);
+        assert!(o.undo());
+        assert_eq!(o.parts[pid].hash(), pin);
 
         // A drawing it cannot read changes nothing.
         let bad = tmp.path().join("bad.dxf");
@@ -3835,6 +4043,183 @@ pub(crate) mod tests {
         let inside = o.start_live_form();
         o.keep(mark);
         assert_eq!(inside, o.undo_mark());
+    }
+
+    #[test]
+    fn undo_and_redo_of_a_part_update_put_its_project_copy_back() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let pid = "example.ex-ct-9-24dc";
+        o.ensure_part(pid).unwrap();
+        let old = store::read_vendored_part(&o.dir, pid).unwrap();
+        o.parts.insert(pid.to_owned(), old.clone());
+        let new = changed_part_in_mine(&o, tmp.path(), pid);
+        let coil = o.symbols["wc.coil"].clone();
+        let lib = library_first(&mut o, tmp.path(), &coil);
+        let done = o.update_library(&lib, None).unwrap();
+        assert_eq!(done, vec![(ItemKind::Part, pid.to_owned())]);
+        assert_eq!(o.parts[pid], new);
+        // Undo: the lock, the file and the loaded part all name the old version.
+        assert!(o.undo());
+        assert_eq!(o.project.lock.parts[pid].hash, old.hash());
+        assert_eq!(store::read_vendored_part(&o.dir, pid).unwrap(), old);
+        assert_eq!(o.parts[pid], old);
+        o.ensure_part(pid).unwrap();
+        // Redo: the new one again.
+        assert!(o.redo());
+        assert_eq!(o.project.lock.parts[pid].hash, new.hash());
+        assert_eq!(store::read_vendored_part(&o.dir, pid).unwrap(), new);
+        assert_eq!(o.parts[pid], new);
+        o.ensure_part(pid).unwrap();
+        // A copy changed in the project, in a step that does not touch the pin, is left alone.
+        o.checkpoint();
+        o.project.pages[1].title = "Renamed".into();
+        let mut edited = new.clone();
+        edited.description = "Edited in the project".into();
+        o.parts.insert(pid.to_owned(), edited.clone());
+        assert!(o.undo());
+        assert_eq!(o.parts[pid], edited);
+    }
+
+    #[test]
+    fn undo_puts_back_a_part_that_is_not_loaded_and_was_never_loaded_here() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let pid = "example.ex-ct-9-24dc";
+        o.ensure_part(pid).unwrap();
+        let old = store::read_vendored_part(&o.dir, pid).unwrap();
+        // As after reopening: no device uses the part, so it is pinned but not loaded, and
+        // no version of it was seen.
+        o.parts.remove(pid);
+        o.part_versions.clear();
+        let new = changed_part_in_mine(&o, tmp.path(), pid);
+        let coil = o.symbols["wc.coil"].clone();
+        let lib = library_first(&mut o, tmp.path(), &coil);
+        o.update_library(&lib, None).unwrap();
+        assert_eq!(store::read_vendored_part(&o.dir, pid).unwrap(), new);
+        assert!(o.undo(), "{:?}", o.take_undo_error());
+        assert_eq!(o.project.lock.parts[pid].hash, old.hash());
+        assert_eq!(store::read_vendored_part(&o.dir, pid).unwrap(), old);
+        // Not used by any device, and not loaded once the library is read again.
+        o.refresh_library();
+        assert!(!o.parts.contains_key(pid));
+        assert!(o.redo(), "{:?}", o.take_undo_error());
+        assert_eq!(store::read_vendored_part(&o.dir, pid).unwrap(), new);
+    }
+
+    #[test]
+    fn a_part_file_undo_cannot_put_back_is_written_by_the_next_save() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let ids = ["example.ex-ct-9-24dc", "example.ex-tb-2-5"];
+        let mut old = Vec::new();
+        let mut new = Vec::new();
+        for (n, id) in ids.iter().enumerate() {
+            let tag = DeviceTag::parse(&format!("-K{}", n + 1)).unwrap();
+            o.set_device_part(&tag, Some(id)).unwrap();
+            old.push(store::read_vendored_part(&o.dir, id).unwrap());
+            new.push(changed_part_in_mine(&o, tmp.path(), id));
+        }
+        let coil = o.symbols["wc.coil"].clone();
+        let lib = library_first(&mut o, tmp.path(), &coil);
+        o.update_library(&lib, None).unwrap();
+        o.save().unwrap();
+        assert!(!o.dirty);
+        let lock = o.project.lock.clone();
+        // Undo writes the first part, fails on the second, and cannot put the first back.
+        o.fail_part_writes = [false, true, true].into();
+        assert!(!o.undo());
+        assert!(o.dirty, "the file left to put back is unsaved work");
+        let err = o.take_undo_error().unwrap_or_default();
+        assert!(err.contains("could not be put back: example.ex-ct-9-24dc"), "{err}");
+        assert_eq!(o.project.lock, lock, "the step stays where it was");
+        // The pinned (new) version stays loaded, though the file holds the old one.
+        assert_eq!(o.parts[ids[0]], new[0]);
+        assert_eq!(store::read_vendored_part(&o.dir, ids[0]).unwrap(), old[0]);
+        o.refresh_library();
+        assert_eq!(o.parts[ids[0]], new[0], "the pinned version stays loaded");
+        // The next save writes it first.
+        o.save().unwrap();
+        assert_eq!(store::read_vendored_part(&o.dir, ids[0]).unwrap(), new[0]);
+        assert_eq!(store::read_vendored_part(&o.dir, ids[1]).unwrap(), new[1]);
+    }
+
+    #[test]
+    fn a_second_failed_undo_keeps_the_first_backup_of_a_part_file() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let ids = ["example.ex-ct-9-24dc", "example.ex-tb-2-5"];
+        let mut new = Vec::new();
+        for (n, id) in ids.iter().enumerate() {
+            let tag = DeviceTag::parse(&format!("-K{}", n + 1)).unwrap();
+            o.set_device_part(&tag, Some(id)).unwrap();
+            new.push(changed_part_in_mine(&o, tmp.path(), id));
+        }
+        let coil = o.symbols["wc.coil"].clone();
+        let lib = library_first(&mut o, tmp.path(), &coil);
+        o.update_library(&lib, None).unwrap();
+        // Two failed Undos under the same pin: the second one's backup is of the file as the
+        // first left it, so the first backup (the pinned version) is the one kept.
+        for _ in 0..2 {
+            o.fail_part_writes = [false, true, true].into();
+            assert!(!o.undo());
+            let _ = o.take_undo_error();
+        }
+        o.refresh_library();
+        o.save().unwrap();
+        assert_eq!(store::read_vendored_part(&o.dir, ids[0]).unwrap(), new[0]);
+        assert_eq!(o.parts[ids[0]], new[0]);
+    }
+
+    #[test]
+    fn a_backup_a_later_step_made_right_is_not_written_by_a_save() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let ids = ["example.ex-ct-9-24dc", "example.ex-tb-2-5"];
+        let mut new = Vec::new();
+        for (n, id) in ids.iter().enumerate() {
+            let tag = DeviceTag::parse(&format!("-K{}", n + 1)).unwrap();
+            o.set_device_part(&tag, Some(id)).unwrap();
+            new.push(changed_part_in_mine(&o, tmp.path(), id));
+        }
+        let coil = o.symbols["wc.coil"].clone();
+        let lib = library_first(&mut o, tmp.path(), &coil);
+        o.update_library(&lib, None).unwrap();
+        // A failed Undo leaves a backup of the first part's file; Undo and Redo then succeed
+        // and write that file themselves.
+        o.fail_part_writes = [false, true, true].into();
+        assert!(!o.undo());
+        let _ = o.take_undo_error();
+        assert!(o.undo(), "{:?}", o.take_undo_error());
+        assert!(o.redo(), "{:?}", o.take_undo_error());
+        // The project copy changed afterwards keeps its change through a save.
+        let mut edited = new[0].clone();
+        edited.description = "Changed in the project".into();
+        store::write_vendored_part(&o.dir, &edited).unwrap();
+        o.save().unwrap();
+        assert_eq!(store::read_vendored_part(&o.dir, ids[0]).unwrap(), edited);
+    }
+
+    #[test]
+    fn an_undo_whose_symbols_cannot_follow_puts_its_part_files_back() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let pid = "example.ex-ct-9-24dc";
+        o.set_device_part(&DeviceTag::parse("-K1").unwrap(), Some(pid)).unwrap();
+        let new = changed_part_in_mine(&o, tmp.path(), pid);
+        let mut coil = o.symbols["wc.coil"].clone();
+        coil.name = "Coil, changed".into();
+        let lib = library_first(&mut o, tmp.path(), &coil);
+        o.update_library(&lib, None).unwrap();
+        let lock = o.project.lock.clone();
+        o.fail_symbol_writes = [true].into();
+        assert!(!o.undo());
+        assert_eq!(o.project.lock, lock);
+        assert_eq!(store::read_vendored_part(&o.dir, pid).unwrap(), new);
+        assert_eq!(o.parts[pid], new);
+        assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), coil);
+        assert!(o.undo(), "{:?}", o.take_undo_error());
+        assert_ne!(store::read_vendored_part(&o.dir, pid).unwrap(), new);
     }
 
     #[test]
