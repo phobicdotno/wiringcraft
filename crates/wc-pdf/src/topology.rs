@@ -344,6 +344,26 @@ impl Label {
     }
 }
 
+/// A link's port names and cable on one line, `P1 - P2 -W1`, `room` mm wide at most. When it
+/// is too long each of the three is cut to a third of the room, so none is lost.
+fn joined(from: &str, to: &str, cable: &str, room: f64) -> String {
+    let (from, to, cable) = (from.trim(), to.trim(), cable.trim());
+    let whole = format!("{from} - {to} {cable}");
+    if crate::writer::text_width_mm(whole.trim(), TEXT) <= room {
+        return whole.trim().to_owned();
+    }
+    let gaps = crate::writer::text_width_mm(" -  ", TEXT);
+    let third = ((room - gaps) / 3.0).max(0.0);
+    let cut = |s: &str| {
+        if s.is_empty() {
+            String::new()
+        } else {
+            text_fit(s, TEXT, third)
+        }
+    };
+    format!("{} - {} {}", cut(from), cut(to), cut(cable)).trim().to_owned()
+}
+
 /// The lines of every link of `net` laid out as `topo` on grid `g`, on a sheet `w` mm wide,
 /// and their port and cable labels, each cut to the room beside its line.
 pub fn link_drawing(topo: &Topology, g: &Grid, net: &Network, w: f64) -> (Vec<Vec<Pt>>, Vec<Label>) {
@@ -399,7 +419,7 @@ pub fn link_drawing(topo: &Topology, g: &Grid, net: &Network, w: f64) -> (Vec<Ve
                 let c = (lx + rx) / 2.0;
                 let half = (g.step_x - g.box_w) / 2.0 - 1.0;
                 let half = half.min(c - left).min(right - c);
-                let label = format!("{from_port} - {to_port} {cable}");
+                let label = joined(&from_port, &to_port, &cable, 2.0 * half);
                 labels.push(Label::new((c, y), 1, &label, 2.0 * half));
             }
         }
@@ -419,7 +439,7 @@ pub fn link_drawing(topo: &Topology, g: &Grid, net: &Network, w: f64) -> (Vec<Ve
             (false, Some(l), Some(r)) => r.0 - l.0 - 1.0,
             _ => g.box_w - 2.0,
         };
-        let label = format!("{from_port} - {to_port} {cable}");
+        let label = joined(&from_port, &to_port, &cable, room);
         labels.push(Label::new(label_at, 1, &label, room));
         paths.push(path.to_vec());
     }
@@ -697,6 +717,18 @@ mod tests {
         // Three tree links with three labels each; the ring link joins two devices of one
         // column, so its short lane has one label; and a label per loop.
         assert_eq!(labels.len(), 3 * 3 + 1 + 2);
+        // A label holding both port names and the cable keeps a piece of each.
+        let joined: Vec<&Label> = labels.iter().filter(|l| l.text.contains(" - ")).collect();
+        assert_eq!(joined.len(), 3, "{labels:?}");
+        for l in joined {
+            let (ports, cable) = l.text.rsplit_once(' ').unwrap();
+            let (from, to) = ports.split_once(" - ").unwrap();
+            assert!(from.len() > 3 && to.len() > 3, "{l:?} shows both ports");
+            assert!(
+                cable.starts_with("-W") && cable.ends_with("..."),
+                "{l:?} shows the cable"
+            );
+        }
         for l in &labels {
             assert!(l.text.ends_with("..."), "{l:?} is cut");
             let (x0, x1) = l.span();
