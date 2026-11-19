@@ -2967,7 +2967,12 @@ fn a_pick_is_withdrawn_by_the_refusal_of_the_edit_that_carried_it_only() -> Test
     });
     g.frame(Some(&mut guest_open), Some("p0003".into()), false);
     let key = (file.clone(), PicRef::Logo);
-    let carrier = *g.pick_carriers.get(&key).ok_or("no carrier recorded")?;
+    let carrier = g
+        .pick_carriers
+        .get(&key)
+        .copied()
+        .flatten()
+        .ok_or("no carrier recorded")?;
     let Some(Role::Guest(j)) = g.role.as_ref() else {
         return Err("not a guest".into());
     };
@@ -2998,6 +3003,45 @@ fn a_pick_is_withdrawn_by_the_refusal_of_the_edit_that_carried_it_only() -> Test
 }
 
 #[test]
+fn a_pick_sent_with_a_page_edit_keeps_the_target_rule() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session_sharing(tmp.path(), |_| Ok(()), BTreeMap::new())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    // The guest picks its own a.png as the underlay of the page it has open: that goes out with
+    // the page edit, which has no number.
+    let file = "pictures/a.png".to_owned();
+    std::fs::create_dir_all(guest_open.dir.join("pictures"))?;
+    std::fs::write(guest_open.dir.join(&file), PNG)?;
+    guest_open.project.page_mut("p0003").ok_or("no page")?.underlay = Some(wc_core::Underlay {
+        file: file.clone(),
+        min: wc_core::Point::new(0.0, 0.0),
+        max: wc_core::Point::new(10.0, 10.0),
+    });
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    let key = (file.clone(), PicRef::Underlay("p0003".into()));
+    assert_eq!(g.pick_carriers.get(&key), Some(&None), "{:?}", g.pick_carriers);
+    // A later project edit that names the picture there again does not take the pick over.
+    let later = ProjectEdit::SetPages {
+        pages: vec![guest_open.project.page("p0003").ok_or("no page")?.clone()],
+        before: Vec::new(),
+    };
+    assert!(super::first_carried(&g.picks, &g.pick_carriers, |r, f| super::carries(&later, r, f)).is_empty());
+    // So a refused change of the page withdraws it, whatever edit was refused.
+    let Some(Role::Guest(j)) = g.role.as_mut() else {
+        return Err("not a guest".into());
+    };
+    j.guest.refused_pages.insert("p0003".into());
+    j.guest.refused_edits.insert(99);
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    assert!(
+        !g.picks.get(&file).is_some_and(|refs| refs.contains(&key.1)),
+        "{:?}",
+        g.picks
+    );
+    Ok(())
+}
+
+#[test]
 fn a_carried_pick_is_withdrawn_only_with_its_own_edit() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let mut open = project(tmp.path())?;
@@ -3007,7 +3051,7 @@ fn a_carried_pick_is_withdrawn_only_with_its_own_edit() -> TestResult {
         cover: None,
     });
     let mut picks: BTreeMap<String, BTreeSet<PicRef>> = [(a.clone(), [PicRef::Logo].into())].into();
-    let mut carriers: BTreeMap<(String, PicRef), u64> = [((a.clone(), PicRef::Logo), 5)].into();
+    let mut carriers: BTreeMap<(String, PicRef), Option<u64>> = [((a.clone(), PicRef::Logo), Some(5))].into();
     let mut due = BTreeMap::new();
     let mut clashes = Vec::new();
     // A refused edit 7 touched the project settings: the pick edit 5 carried stays.
