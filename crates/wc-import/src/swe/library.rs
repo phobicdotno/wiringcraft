@@ -11,7 +11,9 @@
 //! column pointing at another table's row is `<prefix>_<other prefix>_id` (`wir_cab_id`,
 //! `caw_cab_id` in the project database). The prefixes of these library tables are not fixed
 //! here: each table's prefix is the one most of its columns share, and fields are found by their
-//! name after the prefix (`reference`, `manufacturer`, `txt`, ...). A table without the fields
+//! name after the prefix (`reference`, `manufacturer`, `txt`, ...). Archives from other installations
+//! mix prefixes in one table (#293), so a field without the table's prefix is taken from the one
+//! column that has it under another prefix. A table without the fields
 //! this needs is skipped with a warning, so one odd table never stops the rest.
 //!
 //! Parts become WiringCraft parts (`<manufacturer>.<reference>` ids, as [`Part::make_id`]
@@ -152,26 +154,61 @@ impl Table {
     }
 
     /// The column for the first of `fields` the table has (case-insensitive).
+    ///
+    /// The table's own `<prefix>_<field>` (or a bare `<field>`) comes first. Archives from other
+    /// installations mix prefixes within one table (#293): when no field has the table's prefix,
+    /// a column `<other prefix>_<field>` is taken, but only when exactly one column has that
+    /// field, so a guess between two candidates is never made.
     fn field(&self, fields: &[&str]) -> Option<&str> {
-        fields.iter().find_map(|f| {
-            let want = format!("{}_{f}", self.prefix);
-            self.columns
-                .iter()
-                .find(|c| c.eq_ignore_ascii_case(&want))
-                .map(String::as_str)
-        })
+        fields
+            .iter()
+            .find_map(|f| self.own_field(f))
+            .or_else(|| fields.iter().find_map(|f| self.other_prefix_field(f)))
     }
 
-    /// The column pointing at a row of `other`: `<prefix>_<other prefix>_id`.
+    /// `<prefix>_<field>` or a bare `<field>`.
+    fn own_field(&self, field: &str) -> Option<&str> {
+        let want = format!("{}_{field}", self.prefix);
+        self.columns
+            .iter()
+            .find(|c| c.eq_ignore_ascii_case(&want))
+            .or_else(|| self.columns.iter().find(|c| c.eq_ignore_ascii_case(field)))
+            .map(String::as_str)
+    }
+
+    /// The one column named `<any prefix>_<field>`; `None` when none or several are.
+    fn other_prefix_field(&self, field: &str) -> Option<&str> {
+        let mut found = self.columns.iter().filter(|c| {
+            c.split_once('_')
+                .is_some_and(|(_, rest)| rest.eq_ignore_ascii_case(field))
+        });
+        let first = found.next()?;
+        found.next().is_none().then_some(first.as_str())
+    }
+
+    /// The column pointing at a row of `other`: `<prefix>_<other prefix>_id`, where the other
+    /// prefix is the other table's own, or the one its id column carries when that differs.
     fn link(&self, other: &Table) -> Option<&str> {
-        self.field(&[&format!("{}_id", other.prefix)])
+        let mut prefixes = vec![other.prefix.as_str()];
+        if let Some((p, _)) = other.field(&["id"]).and_then(|c| c.split_once('_'))
+            && !prefixes.iter().any(|q| q.eq_ignore_ascii_case(p))
+        {
+            prefixes.push(p);
+        }
+        prefixes.iter().find_map(|p| self.field(&[&format!("{p}_id")]))
     }
 
-    /// The column for `fields`, or an error naming what is missing.
+    /// The column for `fields`, or an error naming what is missing and the columns there are,
+    /// so a report from an unknown layout says what to map.
     fn need(&self, fields: &[&str]) -> std::result::Result<&str, String> {
+        const SHOWN: usize = 16;
         self.field(fields).ok_or_else(|| {
+            let mut columns = self.columns.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
+            if self.columns.len() > SHOWN {
+                columns.push_str(&format!(", ... ({} in all)", self.columns.len()));
+            }
             format!(
-                "{} has no {}_{} column",
+                "{} has no {}_{} column (its columns: {columns})",
                 self.name,
                 self.prefix,
                 fields.first().copied().unwrap_or_default()
