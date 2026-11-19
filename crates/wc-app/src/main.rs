@@ -2027,6 +2027,7 @@ impl App {
                 Dialog::ReportLayout { form, dir } => {
                     if let Some(o) = self.open.as_ref() {
                         // The form and preview scroll; OK and Cancel stay in view below them.
+                        let mut problems = Vec::new();
                         egui::ScrollArea::vertical()
                             .id_salt("reportlayout-scroll")
                             .max_height(ui.ctx().screen_rect().height() * 0.6)
@@ -2040,10 +2041,15 @@ impl App {
                                     parts: &o.parts,
                                 };
                                 let draft = form.layout();
+                                problems = form.problems(&inputs);
                                 let table = wc_report::build_with(form.kind, &inputs, draft.as_ref());
                                 ui.label(RichText::new(&table.title).strong());
                                 report_table(ui, &table);
                             });
+                        // What the layout names that the report or the title block does not have.
+                        for p in &problems {
+                            ui.colored_label(theme::Theme::of(ui.ctx()).warning, p);
+                        }
                         let bad = form.problem();
                         if let Some(why) = &bad {
                             ui.colored_label(theme::Theme::of(ui.ctx()).error, why);

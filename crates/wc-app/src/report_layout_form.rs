@@ -125,6 +125,18 @@ impl Form {
         }
     }
 
+    /// What the layout being edited names that the report or the title block does not have
+    /// ([`wc_report::layout_problems`]), each without the report it is about.
+    pub fn problems(&self, inputs: &wc_report::Inputs<'_>) -> Vec<String> {
+        let Some(layout) = self.layout() else {
+            return Vec::new();
+        };
+        wc_report::layout_problems(self.kind, &layout, inputs)
+            .into_iter()
+            .map(|p| p.split_once(": ").map_or(p.clone(), |(_, why)| why.to_owned()))
+            .collect()
+    }
+
     /// The layout the form describes, or `None` when it is the built-in one (no layout is kept
     /// then). Columns are written only when they differ from the built-in ones.
     pub fn layout(&self) -> Option<ReportLayout> {
@@ -305,6 +317,35 @@ mod tests {
 
     fn builtin() -> Vec<String> {
         ["Tag", "Part", "Qty"].iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_typed_group_column_or_header_key_that_names_nothing_is_shown() {
+        let project = wc_core::Project::new("x");
+        let (symbols, parts) = (Default::default(), Default::default());
+        let inputs = wc_report::Inputs {
+            project: &project,
+            symbols: &symbols,
+            parts: &parts,
+        };
+        let builtin = wc_report::build_builtin(wc_report::Kind::Parts, &inputs).columns;
+        let mut f = Form::new(wc_report::Kind::Parts, builtin.clone(), None);
+        assert!(
+            f.problems(&inputs).is_empty(),
+            "the built-in layout names nothing wrong"
+        );
+        f.group = "Maker".into();
+        f.header = "project.name, revison".into();
+        let p = f.problems(&inputs);
+        assert_eq!(p.len(), 2, "{p:?}");
+        assert!(p[0].starts_with("cannot group by \"Maker\""), "{p:?}");
+        assert!(
+            p[1].starts_with("header \"revison\" is not a title-block field"),
+            "{p:?}"
+        );
+        f.group.clone_from(&builtin[0]);
+        f.header = "project.name, revision".into();
+        assert!(f.problems(&inputs).is_empty(), "{:?}", f.problems(&inputs));
     }
 
     #[test]

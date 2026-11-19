@@ -186,7 +186,7 @@ For the other areas, the chapter to read in each help is:
 | Device, wire, net, terminal, cable, PLC lists | yes | yes | yes | done |
 | Table of contents | yes | yes | yes, linked in the PDF | done |
 | Report pages in the drawing set | yes | yes | yes | done |
-| Report templates the user designs | yes | yes | partly: `[[report]]` layouts in `project.toml` pick, order, rename and sort the columns of any report, in the PDF, CSV, Markdown and Excel output; `group = "<column>"` prints a heading per group in the PDF (one row per record in the CSV), and `header = [...]` prints title-block values above the table | columns and sort done (#273), grouping and page header fields done (#421); an editor in the app later |
+| Report templates the user designs | yes | yes | partly: `[[report]]` layouts in `project.toml` pick, order, rename and sort the columns of any report, in the PDF, CSV, Markdown and Excel output; `group = "<column>"` prints a heading per group in the PDF (one row per record in the CSV), and `header = [...]` prints title-block values above the table | columns and sort done (#273), grouping and page header fields done (#421), an unknown group column or header key warned about (#481); an editor in the app later |
 | Reports as CSV / Markdown / Excel | yes (Excel) | yes (Excel) | yes: `report --format xlsx`, Reports → Save as Excel | done (#264) |
 
 ## 11. Panel layout and 3D
