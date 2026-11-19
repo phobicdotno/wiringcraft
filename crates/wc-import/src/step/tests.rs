@@ -488,3 +488,95 @@ fn placements_in_a_loop_end_with_a_warning() {
     assert!(s.is_usable());
     assert!(warnings.join("\n").contains("in a loop"), "{warnings:?}");
 }
+
+#[test]
+fn a_circle_turned_by_a_placement_keeps_its_size() {
+    // Two radius-10 circles 5 mm apart along z, in a part turned 45 degrees about z.
+    let r = std::f64::consts::FRAC_1_SQRT_2;
+    let text = step(
+        MM,
+        &format!(
+            "#1=CARTESIAN_POINT('',(0.,0.,0.));\n#2=AXIS2_PLACEMENT_3D('',#1,$,$);\n#3=CIRCLE('',#2,10.);\n\
+             #4=CARTESIAN_POINT('',(0.,0.,5.));\n#5=AXIS2_PLACEMENT_3D('',#4,$,$);\n#6=CIRCLE('',#5,10.);\n\
+             #321=CARTESIAN_POINT('',(0.,0.,0.));\n#320=AXIS2_PLACEMENT_3D('',#321,$,$);\n\
+             #901=(GEOMETRIC_REPRESENTATION_CONTEXT(3) GLOBAL_UNIT_ASSIGNED_CONTEXT((#900)) REPRESENTATION_CONTEXT('',''));\n\
+             #300=SHAPE_REPRESENTATION('',(#320,#3,#6),#901);\n#400=SHAPE_REPRESENTATION('',(#420),#901);\n{}{}",
+            axis(420, [50.0, 0.0, 0.0], Z, [r, r, 0.0]),
+            placed_by_relationship(510, 320, 420)
+        ),
+    );
+    let (s, warnings) = size(&text);
+    assert!(
+        (s.width - 20.0).abs() < 1e-9 && (s.height - 20.0).abs() < 1e-9 && (s.depth - 5.0).abs() < 1e-9,
+        "{s:?}"
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn a_reference_direction_close_to_the_axis_still_gives_the_turn() {
+    // Its part square to the axis points along y: the part's x runs along the assembly's y.
+    let text = assembly(
+        &["#420"],
+        &format!(
+            "{}{}",
+            axis(420, [0.0; 3], Z, [0.0, 0.00001, 1.0]),
+            placed_by_relationship(510, 320, 420)
+        ),
+        "",
+    );
+    assert_eq!(
+        size(&text).0,
+        ModelSize {
+            width: 20.0,
+            height: 10.0,
+            depth: 5.0
+        }
+    );
+}
+
+#[test]
+fn a_relationship_written_as_one_record_is_read() {
+    let single = |id: u32, to: u32| {
+        format!(
+            "#{id}=REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION('','',#300,#400,#{});\n#{}=ITEM_DEFINED_TRANSFORMATION('','',#320,#{to});\n",
+            id + 1,
+            id + 1
+        )
+    };
+    let text = assembly(
+        &["#410", "#420"],
+        &format!(
+            "{}{}{}{}",
+            axis(410, [0.0; 3], Z, X),
+            axis(420, [30.0, 0.0, 0.0], Z, X),
+            single(500, 410),
+            single(510, 420)
+        ),
+        "",
+    );
+    let (s, warnings) = size(&text);
+    assert_eq!(s.width, 40.0);
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn a_placement_used_twice_does_not_hide_one_that_failed() {
+    // #501 places the part twice; #521 names a placement that does not exist.
+    let text = assembly(
+        &["#410"],
+        &format!(
+            "{}{}#510=(REPRESENTATION_RELATIONSHIP('','',#300,#400) REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#501) SHAPE_REPRESENTATION_RELATIONSHIP());\n\
+             #520=(REPRESENTATION_RELATIONSHIP('','',#300,#400) REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#521) SHAPE_REPRESENTATION_RELATIONSHIP());\n\
+             #521=ITEM_DEFINED_TRANSFORMATION('','',#320,#999);\n",
+            axis(410, [0.0; 3], Z, X),
+            placed_by_relationship(500, 320, 410),
+        ),
+        "",
+    );
+    let (_, warnings) = size(&text);
+    assert!(
+        warnings.join("\n").contains("1 of its placements could not be applied"),
+        "{warnings:?}"
+    );
+}
