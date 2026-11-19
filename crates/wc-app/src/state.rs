@@ -3064,6 +3064,33 @@ pub(crate) mod tests {
         assert_eq!(reopened.project.pages[1].symbol(&again).unwrap().symbol, box_id);
         assert_eq!(reopened.symbols[&box_id], o.symbols[&box_id]);
         assert_eq!(reopened.symbols[&box_id].category, "Black box");
+        // The first box, undone, left no symbol file behind (#490).
+        assert!(store::read_vendored_symbol(&o.dir, &symbol_id).is_err());
+    }
+
+    #[test]
+    fn an_undone_black_box_leaves_no_symbol_file_after_a_save_and_redo_brings_it_back() {
+        let (_tmp, mut o) = project();
+        let id = o
+            .add_black_box(1, Point::new(10.0, 10.0), Point::new(30.0, 20.0), &[], None)
+            .unwrap();
+        let symbol_id = format!("box.{}.{id}", o.project.pages[1].id);
+        let placed = o.project.pages[1].symbol(&id).unwrap().clone();
+        assert!(store::read_vendored_symbol(&o.dir, &symbol_id).is_ok());
+        assert!(o.undo());
+        o.save().unwrap();
+        assert!(
+            store::read_vendored_symbol(&o.dir, &symbol_id).is_err(),
+            "no page places it and the lock does not pin it"
+        );
+
+        // Redo after that save puts the box and its file back.
+        assert!(o.redo());
+        assert_eq!(o.project.pages[1].symbol(&id), Some(&placed));
+        o.save().unwrap();
+        let reopened = Open::load(&o.dir).unwrap();
+        assert_eq!(reopened.project.pages[1].symbol(&id), Some(&placed));
+        assert_eq!(reopened.symbols[&symbol_id], o.symbols[&symbol_id]);
     }
 
     #[test]
