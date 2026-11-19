@@ -1192,8 +1192,13 @@ impl App {
     /// drawings changed since the assistant read them, so a write never lands on another one.
     pub(crate) fn agent_tool(&mut self, name: &str, v: &Value) -> Result<String, String> {
         // The pages the tool works on, found before it runs (it may show or remove a page):
-        // its page, and the page a copy goes to.
-        let mut keys = vec![self.graphics_key(v, "page")];
+        // its page (for a toolbar action always the page shown, whatever else it is given),
+        // and the page a copy goes to.
+        let mut keys = vec![if name == "run_action" {
+            self.graphics_key(&Value::Null, "page")
+        } else {
+            self.graphics_key(v, "page")
+        }];
         if name == "copy_items" && v.get("to_page").is_some() {
             keys.push(self.graphics_key(v, "to_page"));
         }
@@ -4364,6 +4369,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(page2(&a).graphics, vec![line(3.0)]);
+        // A page named with a toolbar action does not count: the action works on the page
+        // shown, and that is the page whose drawings the assistant still knows.
+        a.open.as_mut().unwrap().project.pages[1].graphics = vec![line(1.0), line(3.0)];
+        call(&mut a, "get_page", json!({"page": "p0001"})).unwrap();
+        call(&mut a, "get_page", json!({"page": "p0002"})).unwrap();
+        call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap();
+        call(
+            &mut a,
+            "run_action",
+            json!({"action": Action::Delete.name(), "page": "p0001"}),
+        )
+        .unwrap();
+        assert_eq!(page2(&a).graphics, vec![line(3.0)]);
+        call(
+            &mut a,
+            "update_graphic",
+            json!({"page": "p0002", "id": "g0", "shape": line(3.0)}),
+        )
+        .unwrap();
         // A page change refused because it takes the cover mark from a held page is taken
         // back, and so is what the assistant would have known of its drawings.
         call(&mut a, "update_page", json!({"page": "p0001", "cover": true})).unwrap();
