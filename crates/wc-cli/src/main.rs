@@ -643,7 +643,9 @@ enum ImportCmd {
     /// A maker's outline drawing (DXF, the front view, in mm at 1:1) as a part's footprint on
     /// cabinet layouts: stored in the library with the part, and drawn on layout pages instead
     /// of a box. A part without `Width` and `Height` takes its size from the drawing. When the
-    /// project uses the part, its copy in the project is updated too.
+    /// project uses the part, its pinned copy is updated too, unless that copy has local changes
+    /// or the project takes the part from another source (a warning says so). The project's own
+    /// pinned copy cannot be named with --lib.
     FootprintDxf {
         file: PathBuf,
         /// The part's library id.
@@ -654,11 +656,13 @@ enum ImportCmd {
         #[arg(long)]
         lib: Option<PathBuf>,
     },
-    /// A maker's 3D model (STEP) of a part: its bounding box gives the part's width, height and
-    /// depth where the part has no `Width`, `Height` or `Depth` of its own, for cabinet layouts
-    /// and their 3D export. The model's x axis runs across the plate, y up it and z out of it.
-    /// Stored in the library with the part; when the project uses the part, its copy in the
-    /// project is updated too.
+    /// A maker's 3D model (STEP) of a part: its bounding box gives the part's size for cabinet
+    /// layouts and their 3D export. The plate size comes from the part's `Width` and `Height`
+    /// first, then its footprint drawing, and only then the model; the depth from `Depth`, then
+    /// the model. The model's x axis runs across the plate, y up it and z out of it. Stored in
+    /// the library with the part. When the project uses the part, its pinned copy is updated
+    /// too, unless that copy has local changes or the project takes the part from another
+    /// source (a warning says so). The project's own pinned copy cannot be named with --lib.
     ModelStep {
         file: PathBuf,
         /// The part's library id.
@@ -3037,6 +3041,17 @@ fn update_library_part(
                 .path
         }
     };
+    // The project's own pinned copy is not a library: changing it there would leave its pin
+    // naming other bytes.
+    let vendored = store::vendor_path(dir, ItemKind::Part, &part).map_err(e)?;
+    if let (Ok(a), Ok(b)) = (path.canonicalize(), vendored.canonicalize())
+        && a == b
+    {
+        return Err(format!(
+            "{} is the project's pinned copy of {part}, not a library; name the library folder the part comes from",
+            path.display()
+        ));
+    }
     let mut item: wc_core::Part = store::read_json(&path).map_err(|err| format!("{}: {err}", path.display()))?;
     if item.id != part {
         return Err(format!("{} holds part {:?}, not {part:?}", path.display(), item.id));
@@ -3135,7 +3150,8 @@ fn update_library_part(
             Ok(()) => {
                 // The new pin must reach the disk with the copy, or both go back: `save`
                 // can fail after it wrote the lock.
-                if let Err(err) = save(dir, p) {
+                // Only the lock changed with the copy: unrelated project files cannot block it.
+                if let Err(err) = store::save_lock(dir, p).map_err(e) {
                     // Both are tried, and every failure is named.
                     let copy_back = match &before {
                         Ok(bytes) => put_file_back(&vendored, bytes.as_deref()),
@@ -4945,6 +4961,28 @@ mod tests {
             "{sizes:?}"
         );
 
+        // The project's own pinned copy named as the library: refused before anything is written.
+        let vendor = dir.join(store::VENDOR_DIR);
+        let copy_before = std::fs::read(store::vendor_path(&dir, ItemKind::Part, "maker.relay").unwrap()).unwrap();
+        let err = cli(
+            &dir,
+            &[
+                "import",
+                "model-step",
+                file,
+                "--part",
+                "maker.relay",
+                "--lib",
+                vendor.to_str().unwrap(),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.contains("pinned copy"), "{err}");
+        assert_eq!(
+            std::fs::read(store::vendor_path(&dir, ItemKind::Part, "maker.relay").unwrap()).unwrap(),
+            copy_before
+        );
+
         // Not a STEP file: refused, the part is left as it was.
         let bad = tmp.path().join("bad.stp");
         std::fs::write(&bad, "solid nothing").unwrap();
@@ -5054,25 +5092,24 @@ mod tests {
             copy_before
         );
         assert_eq!(load(&dir).unwrap().lock.parts["maker.io-8"].hash, pinned);
-        // The same when `save` fails after it wrote the lock: a panel file that has to be
-        // rewritten cannot be, and both the lock and the copy go back to their bytes.
+        // Only the lock is saved with the copy: a panel file that cannot be written does not
+        // block the refresh.
         let panel_file = dir.join("panels").join("main.panel.json");
         let panel_text = std::fs::read_to_string(&panel_file).unwrap();
         std::fs::write(&panel_file, format!("{panel_text}\n\n")).unwrap();
         let panel_tmp = dir.join("panels").join("main.panel.json.tmp");
         std::fs::create_dir(&panel_tmp).unwrap();
         let lock_bytes = std::fs::read(dir.join(store::LOCK_FILE)).unwrap();
-        let err = cli(&dir, &["import", "footprint-dxf", wide, "--part", "maker.io-8"]).unwrap_err();
+        cli(&dir, &["import", "footprint-dxf", wide, "--part", "maker.io-8"]).unwrap();
         std::fs::remove_dir(&panel_tmp).unwrap();
-        assert!(err.contains("main.panel.json"), "{err}");
-        assert_eq!(std::fs::read(dir.join(store::LOCK_FILE)).unwrap(), lock_bytes);
-        assert_eq!(
-            std::fs::read(store::vendor_path(&dir, ItemKind::Part, "maker.io-8").unwrap()).unwrap(),
-            copy_before
-        );
-        // When neither can be put back (every staging name is taken), the error names both.
+        assert_ne!(load(&dir).unwrap().lock.parts["maker.io-8"].hash, pinned);
+        // Back to the earlier footprint for what follows.
         let copy_file = store::vendor_path(&dir, ItemKind::Part, "maker.io-8").unwrap();
         let lock_file = dir.join(store::LOCK_FILE);
+        std::fs::write(&copy_file, &copy_before).unwrap();
+        std::fs::write(&lock_file, &lock_bytes).unwrap();
+        // When the copy cannot be put back after the lock failed (every staging name is
+        // taken), the error names it.
         let staged = |f: &Path| -> Vec<PathBuf> {
             (0..100)
                 .map(|n| {
@@ -5086,9 +5123,9 @@ mod tests {
         for t in &taken {
             std::fs::write(t, "").unwrap();
         }
-        std::fs::create_dir(&panel_tmp).unwrap();
+        std::fs::create_dir(&blocker).unwrap();
         let err = cli(&dir, &["import", "footprint-dxf", wide, "--part", "maker.io-8"]).unwrap_err();
-        std::fs::remove_dir(&panel_tmp).unwrap();
+        std::fs::remove_dir(&blocker).unwrap();
         for t in &taken {
             std::fs::remove_file(t).unwrap();
         }

@@ -127,7 +127,7 @@ pub fn part_size(part: &Part) -> Option<(f64, f64)> {
     let drawn = part
         .footprint
         .as_ref()
-        .filter(|f| f.width > 0.0 && f.height > 0.0 && f.width <= 5000.0 && f.height <= 5000.0);
+        .filter(|f| crate::part::usable_extent(f.width) && crate::part::usable_extent(f.height));
     let model = part.model.filter(crate::ModelSize::is_usable);
     Some((
         w.or(drawn.map(|f| f.width)).or(model.map(|m| m.width))?,

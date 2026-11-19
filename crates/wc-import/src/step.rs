@@ -78,6 +78,7 @@ const READ: &[&str] = &[
     "LENGTH_MEASURE_WITH_UNIT",
     "ITEM_DEFINED_TRANSFORMATION",
     "MAPPED_ITEM",
+    "GLOBAL_UNIT_ASSIGNED_CONTEXT",
 ];
 
 /// The bounding box of a STEP model and warnings about what may make it wrong. An error when
@@ -86,6 +87,12 @@ pub fn model_size(text: &str) -> Result<(ModelSize, Vec<String>)> {
     if !text.trim_start().starts_with("ISO-10303-21") {
         return Err(Error::Format(
             "not a STEP file: it does not start with ISO-10303-21".into(),
+        ));
+    }
+    // A file cut short could still measure as a smaller part: only a whole exchange is read.
+    if !text.trim_end().ends_with("END-ISO-10303-21;") {
+        return Err(Error::Format(
+            "the STEP file is incomplete: it does not end with END-ISO-10303-21;".into(),
         ));
     }
     let (instances, unread) = parse(text);
@@ -114,30 +121,31 @@ pub fn model_size(text: &str) -> Result<(ModelSize, Vec<String>)> {
             }
         }
     }
-    if vertices > 0 {
-        for inst in instances.values() {
-            for (name, args) in inst {
-                match name.as_str() {
-                    "CIRCLE" | "ELLIPSE" => {
-                        if let Some(extent) = conic_extent(&instances, name, args, &point) {
-                            pts.extend(extent);
-                        }
+    // Curves: whole circles and ellipses, and the control points of B-spline curves. They bound
+    // a B-rep's round edges, and are the geometry of a wireframe model without vertices.
+    let mut curves: Vec<[f64; 3]> = Vec::new();
+    for inst in instances.values() {
+        for (name, args) in inst {
+            match name.as_str() {
+                "CIRCLE" | "ELLIPSE" => {
+                    if let Some(extent) = conic_extent(&instances, name, args, &point) {
+                        curves.extend(extent);
                     }
-                    // Simple instances name the curve first: (name, degree, points, ...); in a
-                    // complex instance B_SPLINE_CURVE(degree, points, ...) has no name.
-                    "B_SPLINE_CURVE_WITH_KNOTS" | "BEZIER_CURVE" | "UNIFORM_CURVE" | "QUASI_UNIFORM_CURVE"
-                        if inst.len() == 1 =>
-                    {
-                        pts.extend(curve_points(args.get(2), &point));
-                    }
-                    "B_SPLINE_CURVE" => pts.extend(curve_points(args.get(1), &point)),
-                    _ => {}
                 }
+                // Simple instances name the curve first: (name, degree, points, ...); in a
+                // complex instance B_SPLINE_CURVE(degree, points, ...) has no name.
+                "B_SPLINE_CURVE_WITH_KNOTS" | "BEZIER_CURVE" | "UNIFORM_CURVE" | "QUASI_UNIFORM_CURVE"
+                    if inst.len() == 1 =>
+                {
+                    curves.extend(curve_points(args.get(2), &point));
+                }
+                "B_SPLINE_CURVE" => curves.extend(curve_points(args.get(1), &point)),
+                _ => {}
             }
         }
-    } else {
-        // Tessellated models (AP242) list their coordinates; else every loose point that is not
-        // the origin of a placement.
+    }
+    if vertices == 0 {
+        // Tessellated models (AP242) list their coordinates.
         for inst in instances.values() {
             for (name, args) in inst {
                 if name == "COORDINATES_LIST"
@@ -147,20 +155,22 @@ pub fn model_size(text: &str) -> Result<(ModelSize, Vec<String>)> {
                 }
             }
         }
-        if pts.is_empty() {
-            let origins: BTreeSet<u64> = instances
-                .values()
-                .flatten()
-                .filter(|(name, _)| name == "AXIS2_PLACEMENT_3D")
-                .filter_map(|(_, args)| args.get(1).and_then(Value::as_ref_id))
-                .collect();
-            pts.extend(
-                instances
-                    .iter()
-                    .filter(|(id, _)| !origins.contains(id))
-                    .filter_map(|(id, _)| point(*id)),
-            );
-        }
+    }
+    pts.extend(curves);
+    if pts.is_empty() {
+        // Else every loose point that is not the origin of a placement.
+        let origins: BTreeSet<u64> = instances
+            .values()
+            .flatten()
+            .filter(|(name, _)| name == "AXIS2_PLACEMENT_3D")
+            .filter_map(|(_, args)| args.get(1).and_then(Value::as_ref_id))
+            .collect();
+        pts.extend(
+            instances
+                .iter()
+                .filter(|(id, _)| !origins.contains(id))
+                .filter_map(|(id, _)| point(*id)),
+        );
     }
     if pts.is_empty() {
         return Err(Error::Format(
@@ -227,53 +237,95 @@ fn curve_points(list: Option<&Value>, point: &impl Fn(u64) -> Option<[f64; 3]>) 
         .unwrap_or_default()
 }
 
-/// The two corners of the box around a whole circle or ellipse: its centre plus and minus, on
-/// each axis, the largest radius times how far the circle's plane spans that axis.
+/// The two corners of the box around a whole circle or ellipse. Its first semi-axis runs along
+/// the placement's reference direction `u` and its second along `v` = axis x `u`; on each model
+/// axis k the curve spans its centre plus and minus hypot(a u_k, b v_k).
 fn conic_extent(
     instances: &BTreeMap<u64, Instance>,
     name: &str,
     args: &[Value],
     point: &impl Fn(u64) -> Option<[f64; 3]>,
 ) -> Option<[[f64; 3]; 2]> {
-    let radius = match name {
-        "CIRCLE" => args.get(2)?.as_num()?,
-        _ => args.get(2)?.as_num()?.max(args.get(3)?.as_num()?),
+    let (a, b) = match name {
+        "CIRCLE" => {
+            let r = args.get(2)?.as_num()?;
+            (r, r)
+        }
+        _ => (args.get(2)?.as_num()?, args.get(3)?.as_num()?),
     };
-    if !(radius.is_finite() && radius > 0.0) {
+    if !(a.is_finite() && a > 0.0 && b.is_finite() && b > 0.0) {
         return None;
     }
     let (kind, placement) = simple(instances, args.get(1)?.as_ref_id()?)?;
     (kind == "AXIS2_PLACEMENT_3D").then_some(())?;
     let centre = point(placement.get(1)?.as_ref_id()?)?;
-    // No axis given: the placement's z axis.
-    let axis = match placement.get(2) {
-        Some(Value::Ref(id)) => {
-            let (kind, d) = simple(instances, *id)?;
-            (kind == "DIRECTION").then_some(())?;
-            coords(d.get(1)?)?
+    let direction = |v: Option<&Value>| -> Option<Option<[f64; 3]>> {
+        match v {
+            Some(Value::Ref(id)) => {
+                let (kind, d) = simple(instances, *id)?;
+                (kind == "DIRECTION").then_some(())?;
+                Some(Some(coords(d.get(1)?)?))
+            }
+            _ => Some(None),
         }
-        _ => [0.0, 0.0, 1.0],
     };
-    let len = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
-    if !(len.is_finite() && len > 0.0) {
-        return None;
-    }
+    // No axis given: the placement's z axis.
+    let n = unit(direction(placement.get(2))?.unwrap_or([0.0, 0.0, 1.0]))?;
+    // The reference direction made square to the axis; without a usable one, any direction in
+    // the curve's plane (the standard's own default).
+    let along = |r: [f64; 3]| {
+        let d = dot(r, n);
+        unit([r[0] - d * n[0], r[1] - d * n[1], r[2] - d * n[2]])
+    };
+    let u = direction(placement.get(3))?
+        .and_then(along)
+        .or_else(|| along([1.0, 0.0, 0.0]))
+        .or_else(|| along([0.0, 1.0, 0.0]))?;
+    let v = [
+        n[1] * u[2] - n[2] * u[1],
+        n[2] * u[0] - n[0] * u[2],
+        n[0] * u[1] - n[1] * u[0],
+    ];
     let mut lo = centre;
     let mut hi = centre;
     for k in 0..3 {
-        let n = axis[k] / len;
-        let e = radius * (1.0 - n * n).max(0.0).sqrt();
+        let e = (a * u[k]).hypot(b * v[k]);
         lo[k] -= e;
         hi[k] += e;
     }
     Some([lo, hi])
 }
 
-/// Millimetres per length unit of the file, and a warning when that is a guess.
+fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+/// `v` scaled to length 1, if it has a usable length.
+fn unit(v: [f64; 3]) -> Option<[f64; 3]> {
+    let len = dot(v, v).sqrt();
+    (len.is_finite() && len > 1e-12).then(|| [v[0] / len, v[1] / len, v[2] / len])
+}
+
+/// Millimetres per length unit of the file, and a warning when that is a guess. The units the
+/// geometry's contexts assign (`GLOBAL_UNIT_ASSIGNED_CONTEXT`) count; only a file without such
+/// a context falls back to every length unit it defines (a conversion-based unit names its base
+/// unit too, so that would find both).
 fn length_unit(instances: &BTreeMap<u64, Instance>) -> (f64, Option<String>) {
+    let assigned: Vec<u64> = instances
+        .values()
+        .flatten()
+        .filter(|(name, _)| name == "GLOBAL_UNIT_ASSIGNED_CONTEXT")
+        .filter_map(|(_, args)| args.first().and_then(Value::as_list))
+        .flat_map(|units| units.iter().filter_map(Value::as_ref_id))
+        .collect();
+    let candidates: Vec<u64> = if assigned.is_empty() {
+        instances.keys().copied().collect()
+    } else {
+        assigned
+    };
     let mut found: Vec<f64> = Vec::new();
-    for id in instances.keys() {
-        if let Some(mm) = unit_mm(instances, *id, 0)
+    for id in candidates {
+        if let Some(mm) = unit_mm(instances, id, 0)
             && !found.iter().any(|f| (f - mm).abs() <= f.abs() * 1e-9)
         {
             found.push(mm);

@@ -56,10 +56,13 @@ fn metres_and_inches_are_turned_into_millimetres() {
     let (s, _) = size(&step(metres, &box_vertices([0.0; 3], [0.0225, 0.09, 0.07])));
     assert!((s.width - 22.5).abs() < 1e-9 && (s.height - 90.0).abs() < 1e-9 && (s.depth - 70.0).abs() < 1e-9);
 
-    let inches = "#900=(CONVERSION_BASED_UNIT('INCH',#901)LENGTH_UNIT()NAMED_UNIT(#902));\n\
-                  #901=LENGTH_MEASURE_WITH_UNIT(LENGTH_MEASURE(25.4),#903);\n\
+    // The millimetre has the lower id, but the geometry's context assigns the inch.
+    let inches = "#900=(LENGTH_UNIT()NAMED_UNIT(*)SI_UNIT(.MILLI.,.METRE.));\n\
+                  #901=LENGTH_MEASURE_WITH_UNIT(LENGTH_MEASURE(25.4),#900);\n\
                   #902=DIMENSIONAL_EXPONENTS(1.,0.,0.,0.,0.,0.,0.);\n\
-                  #903=(LENGTH_UNIT()NAMED_UNIT(*)SI_UNIT(.MILLI.,.METRE.));";
+                  #903=(CONVERSION_BASED_UNIT('INCH',#901)LENGTH_UNIT()NAMED_UNIT(#902));\n\
+                  #904=(PLANE_ANGLE_UNIT()NAMED_UNIT(*)SI_UNIT($,.RADIAN.));\n\
+                  #905=(GEOMETRIC_REPRESENTATION_CONTEXT(3)GLOBAL_UNIT_ASSIGNED_CONTEXT((#903,#904))REPRESENTATION_CONTEXT('',''));";
     let (s, _) = size(&step(inches, &box_vertices([0.0; 3], [1.0, 2.0, 3.0])));
     assert!((s.width - 25.4).abs() < 1e-9 && (s.height - 50.8).abs() < 1e-9 && (s.depth - 76.2).abs() < 1e-9);
 
@@ -84,16 +87,57 @@ fn a_cylinder_counts_its_whole_round_side() {
     assert!((s.height - 10.0).abs() < 1e-9, "{s:?}");
     assert!((s.depth - 40.0).abs() < 1e-9, "{s:?}");
 
-    // A circle in a tilted plane spans each axis by how far its plane does.
+    // An ellipse in a tilted plane spans each axis by its two semi-axes as they lie there: the
+    // first (4) along the reference direction, here x made square to the axis, the second (2)
+    // along y.
     let tilted = "#1=CARTESIAN_POINT('',(0.,0.,0.));#2=VERTEX_POINT('',#1);\n\
                   #5=CARTESIAN_POINT('',(0.,0.,0.));#6=DIRECTION('',(1.,0.,1.));\n\
                   #8=AXIS2_PLACEMENT_3D('',#5,#6,$);#9=ELLIPSE('',#8,4.,2.);";
     let (s, _) = size(&step(MM, tilted));
     let side = 2.0 * 4.0 * (0.5f64).sqrt();
     assert!(
-        (s.width - side).abs() < 1e-9 && (s.height - 8.0).abs() < 1e-9 && (s.depth - side).abs() < 1e-9,
+        (s.width - side).abs() < 1e-9 && (s.height - 4.0).abs() < 1e-9 && (s.depth - side).abs() < 1e-9,
         "{s:?}"
     );
+
+    // A flat ellipse with its long axis along y by its reference direction: 10 x 40 mm, not 40
+    // x 40.
+    let turned = "#1=CARTESIAN_POINT('',(0.,0.,0.));#2=VERTEX_POINT('',#1);#3=VERTEX_POINT('',#20);\n\
+                  #20=CARTESIAN_POINT('',(0.,0.,3.));\n\
+                  #5=CARTESIAN_POINT('',(0.,0.,0.));#6=DIRECTION('',(0.,0.,1.));#7=DIRECTION('',(0.,1.,0.));\n\
+                  #8=AXIS2_PLACEMENT_3D('',#5,#6,#7);#9=ELLIPSE('',#8,20.,5.);";
+    let (s, _) = size(&step(MM, turned));
+    assert!(
+        (s.width - 10.0).abs() < 1e-9 && (s.height - 40.0).abs() < 1e-9 && (s.depth - 3.0).abs() < 1e-9,
+        "{s:?}"
+    );
+}
+
+#[test]
+fn a_wireframe_circle_without_vertices_is_measured() {
+    // A circle of radius 5 whose plane is square to (1, 1, 1): no vertex, and its centre is a
+    // placement origin.
+    let data = "#5=CARTESIAN_POINT('',(0.,0.,0.));#6=DIRECTION('',(1.,1.,1.));\n\
+                #8=AXIS2_PLACEMENT_3D('',#5,#6,$);#9=CIRCLE('',#8,5.);";
+    let (s, _) = size(&step(MM, data));
+    let side = 2.0 * 5.0 * (2.0f64 / 3.0).sqrt();
+    for v in [s.width, s.height, s.depth] {
+        assert!((v - side).abs() < 1e-9, "{s:?}");
+    }
+}
+
+#[test]
+fn a_file_cut_short_is_refused() {
+    let whole = step(MM, &box_vertices([0.0; 3], [10.0, 20.0, 30.0]));
+    assert!(model_size(&whole).is_ok());
+    // Cut after enough vertices for a smaller box.
+    let Some(cut) = whole.find("#9=") else {
+        unreachable!("the box has a ninth instance")
+    };
+    let Err(err) = model_size(&whole[..cut]) else {
+        unreachable!("a truncated exchange is refused")
+    };
+    assert!(err.to_string().contains("incomplete"), "{err}");
 }
 
 #[test]
@@ -184,6 +228,6 @@ fn hostile_text_is_refused_without_a_panic() {
         "#1=(LENGTH_UNIT()CONVERSION_BASED_UNIT('x',#1));#2=CARTESIAN_POINT('',(1.,2.,3.));".to_owned(),
         "#1=VERTEX_POINT('',#1);#2=CIRCLE('',#2,5.);".to_owned(),
     ] {
-        let _ = model_size(&step(MM, &data));
+        assert!(model_size(&step(MM, &data)).is_err(), "{}", &data[..data.len().min(80)]);
     }
 }

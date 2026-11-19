@@ -48,14 +48,21 @@ pub struct ModelSize {
 
 impl ModelSize {
     /// Largest extent a part's model may have on any axis.
-    pub const MAX: f64 = 5000.0;
+    pub const MAX: f64 = MAX_EXTENT;
 
-    /// Whether every extent is a usable size: above zero and at most [`Self::MAX`].
+    /// Whether every extent is a usable size ([`usable_extent`]).
     pub fn is_usable(&self) -> bool {
-        [self.width, self.height, self.depth]
-            .iter()
-            .all(|v| v.is_finite() && *v > 0.0 && *v <= Self::MAX)
+        [self.width, self.height, self.depth].into_iter().all(usable_extent)
     }
+}
+
+/// Largest extent, in millimetres, a part's footprint drawing or 3D model may have.
+pub const MAX_EXTENT: f64 = 5000.0;
+
+/// Whether `v` is a usable extent for a part's drawing or model: finite, above zero and at most
+/// [`MAX_EXTENT`] mm.
+pub fn usable_extent(v: f64) -> bool {
+    v.is_finite() && v > 0.0 && v <= MAX_EXTENT
 }
 
 /// A part's outline drawing for cabinet layouts, in millimetres at 1:1 with y pointing down and
@@ -79,8 +86,7 @@ impl Footprint {
         }
         let (min, max) = crate::geom::bounds_of(&pts);
         let (width, height) = (max.x - min.x, max.y - min.y);
-        let usable = |v: f64| v.is_finite() && v > 0.0 && v <= 5000.0;
-        if !(usable(width) && usable(height)) {
+        if !(usable_extent(width) && usable_extent(height)) {
             return None;
         }
         let shift = crate::Point::new(-min.x, -min.y);
