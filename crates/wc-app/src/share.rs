@@ -2355,14 +2355,29 @@ struct Held {
     was: wc_share::Parts,
     /// The items they wait for, by [`item_name`].
     items: Vec<String>,
-    /// The targets of each device rename that waits ([`Held::hold_renames`]): each group is
-    /// put back all together or not at all; separate renames are kept or lost on their own.
+    /// The targets of each device rename that waits ([`Held::hold_renames`]), and of each new
+    /// device with the waiting pages that name it: each group is put back all together or not
+    /// at all; separate groups are kept or lost on their own.
     renames: Vec<RenameGroup>,
 }
 
 /// See [`Held::renames`].
 #[derive(Debug, Default)]
 struct RenameGroup {
+    pages: BTreeSet<String>,
+    devices: BTreeSet<wc_core::DeviceTag>,
+    panels: BTreeSet<String>,
+    meta: bool,
+    /// Whether a device rename is among them, for the note when they are lost.
+    rename: bool,
+    /// The targets among them that are no part of a rename (they joined through a new device
+    /// sharing a target with one), each named in that note.
+    extra: Box<Extra>,
+}
+
+/// See [`RenameGroup::extra`].
+#[derive(Debug, Default)]
+struct Extra {
     pages: BTreeSet<String>,
     devices: BTreeSet<wc_core::DeviceTag>,
     panels: BTreeSet<String>,
@@ -2375,7 +2390,37 @@ impl RenameGroup {
         self.devices.extend(other.devices);
         self.panels.extend(other.panels);
         self.meta |= other.meta;
+        self.rename |= other.rename;
+        self.extra.pages.extend(other.extra.pages);
+        self.extra.devices.extend(other.extra.devices);
+        self.extra.panels.extend(other.extra.panels);
+        self.extra.meta |= other.extra.meta;
     }
+
+    fn overlaps(&self, other: &RenameGroup) -> bool {
+        !self.pages.is_disjoint(&other.pages)
+            || !self.devices.is_disjoint(&other.devices)
+            || !self.panels.is_disjoint(&other.panels)
+            || (self.meta && other.meta)
+    }
+}
+
+/// `groups` with each two that share a target made one, so each target is in one group only.
+fn join_groups(groups: Vec<RenameGroup>) -> Vec<RenameGroup> {
+    let mut out: Vec<RenameGroup> = Vec::new();
+    for mut group in groups {
+        // A group may join several made so far: all of them become one.
+        let mut i = 0;
+        while i < out.len() {
+            if out[i].overlaps(&group) {
+                group.merge(out.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        out.push(group);
+    }
+    out
 }
 
 /// Devices renamed here and not in the session yet: each first tag with the tags it was
@@ -2510,6 +2555,61 @@ impl Held {
         held.now.devices.extend(new_devices);
         // After those, so a rename to a tag only a waiting page names is held as a pair.
         held.hold_renames(local, base, renamed);
+        // A new device goes back with the waiting pages, panels and jumpers that name it, or not
+        // at all: the session may have made a device of its own under the same tag meanwhile
+        // (tags are chosen from this copy alone), and none of them may then name the session's
+        // device.
+        let mut groups = std::mem::take(&mut held.renames);
+        // What the renames hold, to tell what a new device brings to them.
+        let mut in_renames = RenameGroup::default();
+        for g in &groups {
+            in_renames.pages.extend(g.pages.iter().cloned());
+            in_renames.devices.extend(g.devices.iter().cloned());
+            in_renames.panels.extend(g.panels.iter().cloned());
+            in_renames.meta |= g.meta;
+        }
+        for (tag, device) in &held.now.devices {
+            if device.is_none() || base.devices.contains_key(tag) {
+                continue;
+            }
+            let pages: BTreeSet<String> = held
+                .now
+                .pages
+                .iter()
+                .filter(|(_, p)| p.as_ref().is_some_and(|p| page_mentions(p, &|t| t == tag)))
+                .map(|(id, _)| id.clone())
+                .collect();
+            let panels: BTreeSet<String> = held
+                .now
+                .panels
+                .iter()
+                .filter(|(_, p)| p.as_ref().is_some_and(|p| panel_mentions(p, &|t| t == tag)))
+                .map(|(id, _)| id.clone())
+                .collect();
+            let meta = held
+                .now
+                .meta
+                .as_ref()
+                .is_some_and(|m| m.jumpers.iter().any(|j| &j.strip == tag));
+            if !pages.is_empty() || !panels.is_empty() || meta {
+                let devices: BTreeSet<wc_core::DeviceTag> = [tag.clone()].into_iter().collect();
+                let extra = Extra {
+                    pages: pages.difference(&in_renames.pages).cloned().collect(),
+                    devices: devices.difference(&in_renames.devices).cloned().collect(),
+                    panels: panels.difference(&in_renames.panels).cloned().collect(),
+                    meta: meta && !in_renames.meta,
+                };
+                groups.push(RenameGroup {
+                    pages,
+                    panels,
+                    meta,
+                    devices,
+                    extra: Box::new(extra),
+                    ..Default::default()
+                });
+            }
+        }
+        held.renames = join_groups(groups);
         // A new page's comments wait with it, however it came to wait: the session has no page
         // to put them on.
         let new_pages: Vec<String> = held
@@ -2760,6 +2860,9 @@ impl Held {
                 groups[g].meta = true;
             }
         }
+        for g in &mut groups {
+            g.rename = true;
+        }
         self.renames = groups;
     }
 
@@ -2835,12 +2938,52 @@ impl Held {
         // A rename whose page the session changed must not leave the new tag here without the
         // page that uses it, nor the page without its device.
         for group in &self.renames {
-            let hit = !group.pages.is_disjoint(&gone.pages)
-                || !group.devices.is_disjoint(&gone.devices)
-                || !group.panels.is_disjoint(&gone.panels)
-                || (group.meta && gone.meta);
-            if !hit {
+            if !group.overlaps(&gone) {
                 continue;
+            }
+            if group.rename {
+                lost.push("the device rename that waited with it".into());
+                // What a new device brought to the rename (through a page, panel or the jumpers
+                // they share) is named too.
+                let extra = &group.extra;
+                for id in extra.pages.iter().filter(|id| !gone.pages.contains(*id)) {
+                    if let Some(Some(page)) = keep.pages.get(id) {
+                        lost.push(format!("page {}", page.number));
+                    }
+                }
+                for tag in extra.devices.iter().filter(|t| !gone.devices.contains(*t)) {
+                    if keep.devices.contains_key(tag) {
+                        lost.push(format!("device {tag}"));
+                    }
+                }
+                for id in extra.panels.iter().filter(|id| !gone.panels.contains(*id)) {
+                    if keep.panels.contains_key(id) {
+                        lost.push(format!("panel {id}"));
+                    }
+                }
+                if extra.meta && !gone.meta && keep.meta.is_some() {
+                    lost.push("the project properties".into());
+                }
+            } else {
+                // A new device and what names it: each one not lost itself is named.
+                for id in group.pages.iter().filter(|id| !gone.pages.contains(*id)) {
+                    if let Some(Some(page)) = keep.pages.get(id) {
+                        lost.push(format!("page {}", page.number));
+                    }
+                }
+                for tag in group.devices.iter().filter(|t| !gone.devices.contains(*t)) {
+                    if keep.devices.contains_key(tag) {
+                        lost.push(format!("device {tag}"));
+                    }
+                }
+                for id in group.panels.iter().filter(|id| !gone.panels.contains(*id)) {
+                    if keep.panels.contains_key(id) {
+                        lost.push(format!("panel {id}"));
+                    }
+                }
+                if group.meta && !gone.meta && keep.meta.is_some() {
+                    lost.push("the project properties".into());
+                }
             }
             keep.pages.retain(|id, _| !group.pages.contains(id));
             keep.comments.retain(|id, _| !group.pages.contains(id));
@@ -2849,7 +2992,6 @@ impl Held {
             if group.meta {
                 keep.meta = None;
             }
-            lost.push("the device rename that waited with it".into());
         }
         keep.apply(project);
         // The items they use stay locked here: `incoming` keeps entries the session lacks.
