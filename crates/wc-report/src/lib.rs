@@ -396,16 +396,21 @@ pub fn layout_warnings(i: &Inputs<'_>) -> Vec<String> {
 /// group column the report does not have, or a header key no title block knows. The report
 /// layout dialog shows these for the layout being edited.
 pub fn layout_problems(kind: Kind, layout: &ReportLayout, i: &Inputs<'_>) -> Vec<String> {
+    layout_problems_for(&build_builtin(kind, i).columns, layout, i.project)
+}
+
+/// [`layout_problems`] for a report whose built-in columns are `columns`, for a caller that
+/// has them already (the report layout dialog), so the report is not built again for it.
+pub fn layout_problems_for(columns: &[String], layout: &ReportLayout, project: &Project) -> Vec<String> {
     let mut out = Vec::new();
-    let builtin = build_builtin(kind, i);
-    let known = |c: &str| builtin.columns.iter().any(|b| b == c);
+    let known = |c: &str| columns.iter().any(|b| b == c);
     for c in &layout.columns {
         if !known(&c.from) {
             out.push(format!(
                 "report layout for \"{}\": no column \"{}\" (the columns are {})",
                 layout.kind,
                 c.from,
-                builtin.columns.join(", ")
+                columns.join(", ")
             ));
         }
     }
@@ -424,10 +429,10 @@ pub fn layout_problems(kind: Kind, layout: &ReportLayout, i: &Inputs<'_>) -> Vec
         out.push(format!(
             "report layout for \"{}\": cannot group by \"{g}\", no such column (the columns are {})",
             layout.kind,
-            builtin.columns.join(", ")
+            columns.join(", ")
         ));
     }
-    let keys = header_keys(i.project);
+    let keys = header_keys(project);
     for key in &layout.header {
         if !keys.contains(key) {
             out.push(format!(

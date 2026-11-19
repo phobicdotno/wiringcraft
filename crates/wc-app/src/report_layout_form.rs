@@ -126,12 +126,13 @@ impl Form {
     }
 
     /// What the layout being edited names that the report or the title block does not have
-    /// ([`wc_report::layout_problems`]), each without the report it is about.
-    pub fn problems(&self, inputs: &wc_report::Inputs<'_>) -> Vec<String> {
+    /// ([`wc_report::layout_problems`]), each without the report it is about. The form's
+    /// built-in columns are checked against, so the report is not built for it.
+    pub fn problems(&self, project: &wc_core::Project) -> Vec<String> {
         let Some(layout) = self.layout() else {
             return Vec::new();
         };
-        wc_report::layout_problems(self.kind, &layout, inputs)
+        wc_report::layout_problems_for(&self.builtin, &layout, project)
             .into_iter()
             .map(|p| p.split_once(": ").map_or(p.clone(), |(_, why)| why.to_owned()))
             .collect()
@@ -331,12 +332,12 @@ mod tests {
         let builtin = wc_report::build_builtin(wc_report::Kind::Parts, &inputs).columns;
         let mut f = Form::new(wc_report::Kind::Parts, builtin.clone(), None);
         assert!(
-            f.problems(&inputs).is_empty(),
+            f.problems(&project).is_empty(),
             "the built-in layout names nothing wrong"
         );
         f.group = "Maker".into();
         f.header = "project.name, revison".into();
-        let p = f.problems(&inputs);
+        let p = f.problems(&project);
         assert_eq!(p.len(), 2, "{p:?}");
         assert!(p[0].starts_with("cannot group by \"Maker\""), "{p:?}");
         assert!(
@@ -345,7 +346,7 @@ mod tests {
         );
         f.group.clone_from(&builtin[0]);
         f.header = "project.name, revision".into();
-        assert!(f.problems(&inputs).is_empty(), "{:?}", f.problems(&inputs));
+        assert!(f.problems(&project).is_empty(), "{:?}", f.problems(&project));
     }
 
     #[test]
