@@ -1586,6 +1586,25 @@ struct Pictures<'a> {
     picks: &'a mut BTreeMap<String, BTreeSet<PicRef>>,
 }
 
+/// [`wc_share::replace_picture`]. Tests can make it report an error after it ran
+/// (`PUT_BACK_FAILS`), as when the moved file could not be read again.
+fn put_back_picture(dir: &Path, picture: &Picture, was: &[u8]) -> wc_share::Result<()> {
+    let done = wc_share::replace_picture(dir, picture, was);
+    #[cfg(test)]
+    if PUT_BACK_FAILS.with(std::cell::Cell::get) {
+        return done.and(Err(
+            std::io::Error::other("the earlier file could not be read again").into()
+        ));
+    }
+    done
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: [`put_back_picture`] reports an error even when the session's file went in.
+    pub(super) static PUT_BACK_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Give the pictures in `taken`, whose names the session has for other files, a name of
 /// their own here, together with those whose rename failed a while ago. A failed rename is
 /// kept and tried again after [`ITEM_RETRY_LATER`] while the project still uses the picture,
@@ -1668,7 +1687,7 @@ fn rename_pictures(
                         file: file.clone(),
                         data: theirs.clone(),
                     };
-                    match wc_share::replace_picture(&open.dir, &picture, &copied) {
+                    match put_back_picture(&open.dir, &picture, &copied) {
                         Ok(()) => {
                             replaced.remove(&file);
                             open.underlays.remove(&file);
