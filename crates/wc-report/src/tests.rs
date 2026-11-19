@@ -1900,3 +1900,224 @@ fn a_csv_header_that_looks_like_a_formula_is_written_as_text_too() {
     assert!(t.to_csv_with(';').starts_with("'=1+2;Tag\r\n"));
     assert!(t.to_csv_raw_with(';').starts_with("=1+2;Tag\r\n"));
 }
+
+#[test]
+fn a_report_layout_picks_orders_renames_and_sorts_columns() {
+    use wc_core::report_layout::{ReportColumn, ReportLayout};
+    let (mut p, s, mut parts) = fixture();
+    // A second part, so the rows have something to sort.
+    let part = Part {
+        id: "zeta.lamp".into(),
+        manufacturer: "Zeta".into(),
+        order_number: "L-1".into(),
+        description: "Lamp".into(),
+        ..Default::default()
+    };
+    p.devices.insert(
+        DeviceTag::parse("-P1").unwrap(),
+        Device {
+            part: Some(part.id.clone()),
+            ..Default::default()
+        },
+    );
+    parts.insert(part.id.clone(), part);
+    let column = |from: &str, heading: Option<&str>| ReportColumn {
+        from: from.into(),
+        heading: heading.map(Into::into),
+    };
+    p.meta.reports.push(ReportLayout {
+        kind: "parts".into(),
+        title: Some("Bill of materials".into()),
+        columns: vec![
+            column("Order number", Some("Art. no.")),
+            column("Manufacturer", None),
+            column("Qty", None),
+        ],
+        sort: vec!["-Manufacturer".into()],
+    });
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = build(Kind::Parts, &i);
+    assert_eq!(t.title, "Bill of materials");
+    assert_eq!(t.columns, ["Art. no.", "Manufacturer", "Qty"]);
+    // Descending by maker: Zeta, Acme, then the devices without a part (no maker).
+    assert_eq!(t.rows[0], ["L-1", "Zeta", "1"]);
+    assert_eq!(t.rows[1], ["R-24, DC", "Acme", "1"]);
+    assert_eq!(t.rows.len(), 5);
+    assert_eq!(
+        t.to_csv().lines().take(3).collect::<Vec<_>>(),
+        ["Art. no.,Manufacturer,Qty", "L-1,Zeta,1", "\"R-24, DC\",Acme,1"]
+    );
+    assert!(layout_warnings(&i).is_empty());
+    // The built-in layout is still there for whoever asks for it.
+    assert_eq!(build_builtin(Kind::Parts, &i).columns[0], "Pos");
+    // Other reports keep theirs.
+    assert_eq!(build(Kind::Devices, &i), device_list(&i));
+}
+
+#[test]
+fn a_report_layout_keeps_page_links_with_their_rows_and_sorts_numbers_by_value() {
+    use wc_core::report_layout::ReportLayout;
+    let t = Table {
+        title: "T".into(),
+        columns: vec!["Page".into(), "Title".into()],
+        rows: vec![
+            vec!["2".into(), "b".into()],
+            vec!["10".into(), "c".into()],
+            vec!["1".into(), "a".into()],
+        ],
+        row_pages: vec!["p2".into(), "p10".into()],
+        front: true,
+    };
+    let sorted = t.with_layout(&ReportLayout {
+        kind: "contents".into(),
+        sort: vec!["Page".into()],
+        ..Default::default()
+    });
+    assert_eq!(
+        sorted.rows.iter().map(|r| r[0].as_str()).collect::<Vec<_>>(),
+        ["1", "2", "10"]
+    );
+    assert_eq!(sorted.row_pages, ["", "p2", "p10"]);
+    assert!(sorted.front);
+}
+
+#[test]
+fn a_sorted_cable_list_keeps_each_core_with_its_cable() {
+    use wc_core::report_layout::ReportLayout;
+    let (mut p, s, parts) = fixture();
+    let w1 = DeviceTag::parse("-W1").unwrap();
+    let w2 = DeviceTag::parse("-W2").unwrap();
+    for (id, cable, core) in [("w1", &w1, "1"), ("w2", &w1, "2"), ("w3", &w2, "1"), ("w4", &w2, "2")] {
+        if let Some(w) = p.pages[0].wires.iter_mut().find(|w| w.id == id) {
+            w.cable = Some(wc_core::CableCore {
+                cable: cable.clone(),
+                core: core.into(),
+            });
+        }
+    }
+    // Without a sort, the built-in grouping is kept.
+    p.meta.reports.push(ReportLayout {
+        kind: "cables".into(),
+        ..Default::default()
+    });
+    let i2 = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let grouped = build(Kind::Cables, &i2);
+    let firsts: Vec<&str> = grouped.rows.iter().map(|r| r[0].as_str()).collect();
+    assert_eq!(firsts, ["-W1", "", "-W2", ""]);
+    // Sorted by core, every row names its own cable.
+    p.meta.reports[0].sort = vec!["Core".into(), "-Cable".into()];
+    let i3 = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let sorted = build(Kind::Cables, &i3);
+    let pairs: Vec<(&str, &str)> = sorted.rows.iter().map(|r| (r[0].as_str(), r[3].as_str())).collect();
+    assert_eq!(pairs, [("-W2", "1"), ("-W1", "1"), ("-W2", "2"), ("-W1", "2")]);
+}
+
+#[test]
+fn a_layout_sorts_by_every_key_in_turn_and_keeps_the_built_in_order_on_ties() {
+    use wc_core::report_layout::ReportLayout;
+    let row = |a: &str, b: &str, n: &str| vec![a.to_string(), b.to_string(), n.to_string()];
+    let t = Table {
+        title: "T".into(),
+        columns: vec!["Group".into(), "Item".into(), "Seen".into()],
+        rows: vec![
+            row("B", "1", "first"),
+            row("A", "2", "second"),
+            row("B", "2", "third"),
+            row("A", "1", "fourth"),
+            row("B", "2", "fifth"),
+        ],
+        ..Default::default()
+    };
+    let sorted = t.with_layout(&ReportLayout {
+        kind: "contents".into(),
+        sort: vec!["Group".into(), "-Item".into()],
+        ..Default::default()
+    });
+    assert_eq!(
+        sorted.rows.iter().map(|r| r[2].as_str()).collect::<Vec<_>>(),
+        ["second", "fourth", "third", "fifth", "first"]
+    );
+}
+
+#[test]
+fn layout_headings_with_a_pipe_or_a_line_break_keep_the_markdown_table_whole() {
+    use wc_core::report_layout::{ReportColumn, ReportLayout};
+    let mut t = Table::new("T", &["Tag", "Text"]);
+    t.rows.push(vec!["-K1".into(), "Relay".into()]);
+    let t = t.with_layout(&ReportLayout {
+        kind: "devices".into(),
+        title: Some("Two\nlines".into()),
+        columns: vec![
+            ReportColumn {
+                from: "Tag".into(),
+                heading: Some("Part | number".into()),
+            },
+            ReportColumn {
+                from: "Text".into(),
+                heading: Some("Long\ntext".into()),
+            },
+        ],
+        ..Default::default()
+    });
+    assert_eq!(
+        t.to_markdown(),
+        "## Two lines\n\n| Part \\| number | Long text |\n|---|---|\n| -K1 | Relay |\n"
+    );
+    // Carriage returns end a line too, and angle brackets are not read as HTML.
+    let mut t = Table::new("A\r\nB\rC", &["<b>Tag</b>"]);
+    t.rows.push(vec!["x\r\ny <script>".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## A B C\n\n| &lt;b&gt;Tag&lt;/b&gt; |\n|---|\n| x y &lt;script&gt; |\n"
+    );
+}
+
+#[test]
+fn report_layouts_that_name_nothing_are_reported() {
+    use wc_core::report_layout::{ReportColumn, ReportLayout};
+    let (mut p, s, parts) = fixture();
+    p.meta.reports = vec![
+        ReportLayout {
+            kind: "bom".into(),
+            ..Default::default()
+        },
+        ReportLayout {
+            kind: "wires".into(),
+            columns: vec![ReportColumn {
+                from: "Shade".into(),
+                heading: None,
+            }],
+            sort: vec!["-Length".into()],
+            ..Default::default()
+        },
+        ReportLayout {
+            kind: "wires".into(),
+            ..Default::default()
+        },
+    ];
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let w = layout_warnings(&i);
+    assert_eq!(w.len(), 4, "{w:?}");
+    assert!(w[0].contains("\"bom\": no such report"));
+    assert!(w[1].contains("no column \"Shade\""));
+    assert!(w[2].contains("cannot sort by \"Length\""));
+    assert!(w[3].contains("a second one"));
+    // The unknown column is left out; the report still builds.
+    assert!(build(Kind::Wires, &i).columns.is_empty());
+}

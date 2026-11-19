@@ -17,6 +17,7 @@ pub mod numbering;
 pub mod panel;
 pub mod part;
 pub mod project;
+pub mod report_layout;
 pub mod review;
 pub mod revision;
 pub mod route;

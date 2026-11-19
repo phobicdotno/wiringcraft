@@ -9,6 +9,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use wc_core::connectivity::{self, PinRef};
+use wc_core::report_layout::ReportLayout;
 use wc_core::symbol::SymbolRole;
 use wc_core::{DeviceTag, Endpoint, Part, Project, Symbol};
 
@@ -97,13 +98,104 @@ impl Table {
         out
     }
 
+    /// This table in `layout`: its columns picked, ordered and renamed, and its rows sorted.
+    /// Columns and sort entries naming no column of the table are left out
+    /// ([`layout_warnings`] lists them). Each row keeps its page link.
+    pub fn with_layout(self, layout: &ReportLayout) -> Table {
+        let index = |name: &str| self.columns.iter().position(|c| c == name);
+        let sort: Vec<(usize, bool)> = layout
+            .sort
+            .iter()
+            .filter_map(|entry| {
+                let (c, descending) = ReportLayout::sort_key(entry);
+                index(c).map(|i| (i, descending))
+            })
+            .collect();
+        let picked: Vec<(usize, String)> = if layout.columns.is_empty() {
+            self.columns.iter().cloned().enumerate().collect()
+        } else {
+            layout
+                .columns
+                .iter()
+                .filter_map(|c| index(&c.from).map(|i| (i, c.heading.clone().unwrap_or_else(|| c.from.clone()))))
+                .collect()
+        };
+        let Table {
+            title,
+            rows,
+            row_pages,
+            front,
+            ..
+        } = self;
+        let mut rows: Vec<(Vec<String>, String)> = rows
+            .into_iter()
+            .enumerate()
+            .map(|(n, r)| (r, row_pages.get(n).cloned().unwrap_or_default()))
+            .collect();
+        if !sort.is_empty() {
+            let cell = |r: &[String], i: usize| r.get(i).map(|v| natural_key(v)).unwrap_or_default();
+            // A stable sort: rows equal in every sort column keep the built-in order.
+            rows.sort_by(|(a, _), (b, _)| {
+                sort.iter()
+                    .map(|&(i, descending)| {
+                        let o = cell(a, i).cmp(&cell(b, i));
+                        if descending { o.reverse() } else { o }
+                    })
+                    .find(|o| o.is_ne())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        let mut row_pages: Vec<String> = rows.iter().map(|(_, p)| p.clone()).collect();
+        while row_pages.last().is_some_and(String::is_empty) {
+            row_pages.pop();
+        }
+        Table {
+            title: layout.title.clone().unwrap_or(title),
+            columns: picked.iter().map(|(_, h)| h.clone()).collect(),
+            rows: rows
+                .into_iter()
+                .map(|(r, _)| {
+                    picked
+                        .iter()
+                        .map(|(i, _)| r.get(*i).cloned().unwrap_or_default())
+                        .collect()
+                })
+                .collect(),
+            row_pages,
+            front,
+        }
+    }
+
+    /// Rows whose first column is empty take their first `columns` cells from the row above:
+    /// a continuation row gets the group it belongs to written out.
+    fn fill_down(&mut self, columns: usize) {
+        let mut above: Vec<String> = Vec::new();
+        for row in &mut self.rows {
+            if row.first().is_some_and(String::is_empty) && !above.is_empty() {
+                for (cell, value) in row.iter_mut().zip(&above) {
+                    cell.clone_from(value);
+                }
+            } else {
+                above = row.iter().take(columns).cloned().collect();
+            }
+        }
+    }
+
     /// A Markdown table under a level-2 heading.
     pub fn to_markdown(&self) -> String {
-        let cell = |s: &str| s.replace('|', "\\|").replace('\n', " ");
+        // One line of text: line ends (LF, CR or CRLF) become spaces, and `<` and `>` are
+        // written as entities so a value is never read as HTML.
+        let line = |s: &str| {
+            s.replace("\r\n", " ")
+                .replace(['\r', '\n'], " ")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+        };
+        let cell = |s: &str| line(s).replace('|', "\\|");
         let mut out = format!(
-            "## {}\n\n| {} |\n|{}|\n",
-            self.title,
-            self.columns.join(" | "),
+            "## {}\n\n| {} |\n|{}\n",
+            line(&self.title),
+            self.columns.iter().map(|c| cell(c)).collect::<Vec<_>>().join(" | "),
             "---|".repeat(self.columns.len())
         );
         for r in &self.rows {
@@ -150,7 +242,7 @@ fn plain_number(s: &str) -> bool {
 }
 
 /// Which report to build.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Kind {
     Parts,
     Devices,
@@ -204,7 +296,78 @@ pub struct Inputs<'a> {
     pub parts: &'a BTreeMap<String, Part>,
 }
 
+/// The report of `kind`, in the project's own layout for it if it has one
+/// ([`wc_core::report_layout`]), else in the built-in layout.
 pub fn build(kind: Kind, i: &Inputs<'_>) -> Table {
+    let mut table = build_builtin(kind, i);
+    match layout_for(i.project, kind) {
+        Some(layout) => {
+            // The cable list names a cable only on its first core's row. A sort can move
+            // the other rows away from it, so each row then names its cable itself.
+            if kind == Kind::Cables && !layout.sort.is_empty() {
+                table.fill_down(3);
+            }
+            table.with_layout(layout)
+        }
+        None => table,
+    }
+}
+
+/// The project's layout for `kind`: the first one that names it.
+pub fn layout_for(project: &Project, kind: Kind) -> Option<&ReportLayout> {
+    project.meta.reports.iter().find(|l| l.kind == kind.name())
+}
+
+/// What is wrong with the project's report layouts: an unknown report kind, a second layout
+/// for one kind (only the first is used), or a column or sort entry the report does not have
+/// (left out). Empty when they are all fine.
+pub fn layout_warnings(i: &Inputs<'_>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for layout in &i.project.meta.reports {
+        let Some(kind) = Kind::parse(&layout.kind) else {
+            let names: Vec<&str> = Kind::ALL.iter().map(|k| k.name()).collect();
+            out.push(format!(
+                "report layout for \"{}\": no such report (one of {})",
+                layout.kind,
+                names.join(", ")
+            ));
+            continue;
+        };
+        if !seen.insert(kind) {
+            out.push(format!(
+                "report layout for \"{}\": a second one, left unused",
+                layout.kind
+            ));
+            continue;
+        }
+        let builtin = build_builtin(kind, i);
+        let known = |c: &str| builtin.columns.iter().any(|b| b == c);
+        for c in &layout.columns {
+            if !known(&c.from) {
+                out.push(format!(
+                    "report layout for \"{}\": no column \"{}\" (the columns are {})",
+                    layout.kind,
+                    c.from,
+                    builtin.columns.join(", ")
+                ));
+            }
+        }
+        for entry in &layout.sort {
+            let (c, _) = ReportLayout::sort_key(entry);
+            if !known(c) {
+                out.push(format!(
+                    "report layout for \"{}\": cannot sort by \"{c}\", no such column",
+                    layout.kind
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// The report of `kind` in its built-in layout.
+pub fn build_builtin(kind: Kind, i: &Inputs<'_>) -> Table {
     match kind {
         Kind::Parts => parts_list(i),
         Kind::Devices => device_list(i),

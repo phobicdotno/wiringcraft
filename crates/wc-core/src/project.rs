@@ -60,6 +60,10 @@ pub struct ProjectMeta {
     /// refer to.
     #[serde(default, rename = "revision", skip_serializing_if = "Vec::is_empty")]
     pub revisions: Vec<crate::revision::Revision>,
+    /// Report layouts the user designed, one per report kind: columns, headings, order and
+    /// sort ([`crate::report_layout`]).
+    #[serde(default, rename = "report", skip_serializing_if = "Vec::is_empty")]
+    pub reports: Vec<crate::report_layout::ReportLayout>,
 }
 
 /// The project's logo: a JPEG or PNG file in the project folder. The title block shows it in
@@ -733,6 +737,7 @@ impl ProjectMeta {
             logo: None,
             template: crate::template::PageTemplate::default(),
             revisions: Vec::new(),
+            reports: Vec::new(),
         }
     }
 
