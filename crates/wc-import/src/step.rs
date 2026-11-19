@@ -125,12 +125,14 @@ pub fn model_size(text: &str) -> Result<(ModelSize, Vec<String>)> {
     // Curves: whole circles and ellipses, and the control points of B-spline curves. They bound
     // a B-rep's round edges, and are the geometry of a wireframe model without vertices.
     let mut curves: Vec<[f64; 3]> = Vec::new();
+    let mut doubtful = 0usize;
     for inst in instances.values() {
         for (name, args) in inst {
             match name.as_str() {
                 "CIRCLE" | "ELLIPSE" => {
-                    if let Some(extent) = conic_extent(&instances, name, args, &point) {
+                    if let Some((extent, unsure)) = conic_extent(&instances, name, args, &point) {
                         curves.extend(extent);
+                        doubtful += usize::from(unsure);
                     }
                 }
                 // Simple instances name the curve first: (name, degree, points, ...); in a
@@ -160,6 +162,12 @@ pub fn model_size(text: &str) -> Result<(ModelSize, Vec<String>)> {
         }
     }
     pts.extend(curves);
+    if doubtful > 0 {
+        warnings.push(format!(
+            "{doubtful} ellipses have a reference direction all but along their axis; their turn \
+             about the axis, and so the size, may be off"
+        ));
+    }
     if pts.is_empty() {
         // Else every loose point that is not the origin of a placement.
         let origins: BTreeSet<u64> = instances
@@ -248,7 +256,7 @@ fn conic_extent(
     name: &str,
     args: &[Value],
     point: &impl Fn(u64) -> Option<[f64; 3]>,
-) -> Option<[[f64; 3]; 2]> {
+) -> Option<([[f64; 3]; 2], bool)> {
     let (a, b) = match name {
         "CIRCLE" => {
             let r = args.get(2)?.as_num()?;
@@ -276,19 +284,30 @@ fn conic_extent(
     let n = unit(direction(placement.get(2))?.unwrap_or([0.0, 0.0, 1.0]))?;
     // The reference direction made square to the axis; without a usable one, any direction in
     // the curve's plane (the standard's own default).
-    let along = |r: [f64; 3]| {
-        let r = unit(r)?;
-        // (n x r) x n is r's part square to the axis, of length sin(angle), with no
-        // cancellation of the large along-axis part; any nearly parallel direction keeps its way.
-        let side = cross(n, r);
-        // Along the axis itself: only rounding noise is left, so no direction in the plane.
-        (dot(side, side).sqrt() > 64.0 * f64::EPSILON).then_some(())?;
-        unit(cross(side, n))
+    // (n x r) x n is r's part square to the axis, of length sin(angle), with no cancellation
+    // of the large along-axis part; with the length of n x r, to tell how far from the axis.
+    let along = |r: [f64; 3]| -> Option<([f64; 3], f64)> {
+        let side = cross(n, unit(r)?);
+        Some((unit(cross(side, n))?, dot(side, side).sqrt()))
     };
-    let u = direction(placement.get(3))?
-        .and_then(along)
-        .or_else(|| along([1.0, 0.0, 0.0]))
-        .or_else(|| along([0.0, 1.0, 0.0]))?;
+    // Rounding noise, from a direction along the axis that is not tilted exactly the same.
+    let noise = 64.0 * f64::EPSILON;
+    // The file's own reference direction is taken however close to the axis it lies, as long
+    // as it is not on it; one that close to the axis that rounding could have made it is
+    // reported, as the curve's turn about its axis may then be off.
+    let given = direction(placement.get(3))?.and_then(along);
+    let mut doubtful = false;
+    let u = match given {
+        Some((u, len)) => {
+            doubtful = len <= noise && a != b;
+            u
+        }
+        None => [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+            .into_iter()
+            .filter_map(along)
+            .find(|(_, len)| *len > noise)
+            .map(|(u, _)| u)?,
+    };
     let v = cross(n, u);
     let mut lo = centre;
     let mut hi = centre;
@@ -297,7 +316,7 @@ fn conic_extent(
         lo[k] -= e;
         hi[k] += e;
     }
-    Some([lo, hi])
+    Some(([lo, hi], doubtful))
 }
 
 fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
@@ -435,6 +454,23 @@ fn geometry_contexts(text: &str, instances: &BTreeMap<u64, Instance>, representa
         })
         .map(|(id, _)| *id)
         .collect();
+    // Loose points are measured too when nothing else is there: every point that is not the
+    // origin of a placement.
+    let origins: BTreeSet<u64> = instances
+        .values()
+        .flatten()
+        .filter(|(name, _)| name == "AXIS2_PLACEMENT_3D")
+        .filter_map(|(_, args)| args.get(1).and_then(Value::as_ref_id))
+        .collect();
+    let mut geometry = geometry;
+    if geometry.is_empty() {
+        geometry.extend(
+            instances
+                .iter()
+                .filter(|(id, inst)| !origins.contains(id) && inst.iter().any(|(name, _)| name == "CARTESIAN_POINT"))
+                .map(|(id, _)| *id),
+        );
+    }
     let mut links: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
     for statement in statements(text) {
         let Some((id, body)) = statement.trim().strip_prefix('#').and_then(|r| r.split_once('=')) else {

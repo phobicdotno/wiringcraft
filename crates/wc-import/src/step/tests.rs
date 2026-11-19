@@ -78,6 +78,16 @@ fn metres_and_inches_are_turned_into_millimetres() {
         &box_vertices([0.0; 3], [1.0, 2.0, 3.0]),
     ));
     assert!((s.width - 25.4).abs() < 1e-9 && (s.height - 50.8).abs() < 1e-9 && (s.depth - 76.2).abs() < 1e-9);
+    // Loose points only: the representation that holds them picks the inch, not one that only
+    // holds a placement.
+    let loose = "#1=CARTESIAN_POINT('',(0.,0.,0.));#2=CARTESIAN_POINT('',(1.,2.,3.));\n\
+                 #30=CARTESIAN_POINT('',(0.,0.,0.));#31=AXIS2_PLACEMENT_3D('',#30,$,$);\n\
+                 #880=(GEOMETRIC_REPRESENTATION_CONTEXT(3)GLOBAL_UNIT_ASSIGNED_CONTEXT((#881))REPRESENTATION_CONTEXT('',''));\n\
+                 #881=(LENGTH_UNIT()NAMED_UNIT(*)SI_UNIT(.MILLI.,.METRE.));\n\
+                 #882=SHAPE_REPRESENTATION('other',(#31),#880);\n\
+                 #990=SHAPE_REPRESENTATION('points',(#1,#2),#905);";
+    let (s, _) = size(&step(inches, loose));
+    assert!((s.width - 25.4).abs() < 1e-9 && (s.depth - 76.2).abs() < 1e-9, "{s:?}");
     // And the other way round: the shape in the millimetre context is read in millimetres.
     let shape_mm = "#990=ADVANCED_BREP_SHAPE_REPRESENTATION('part',(#2),#880);";
     let (s, _) = size(&step(
@@ -185,6 +195,16 @@ fn directions_in_tiny_ratios_keep_their_way() {
     assert!(
         (s.width - 10.0).abs() < 1e-9 && (s.height - 40.0).abs() < 1e-9 && (s.depth - 3.0).abs() < 1e-9,
         "{s:?}"
+    );
+    // Closer still, past where rounding could tell: still taken, and reported.
+    let (s, warnings) = size(&step(MM, &nearly.replace("1E-10", "1E-15")));
+    assert!(
+        (s.width - 10.0).abs() < 1e-9 && (s.height - 40.0).abs() < 1e-9 && (s.depth - 3.0).abs() < 1e-9,
+        "{s:?}"
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("all but along their axis")),
+        "{warnings:?}"
     );
 }
 
