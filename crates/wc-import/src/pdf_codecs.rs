@@ -201,10 +201,12 @@ const JBIG2_BUDGET: u64 = 256 << 20;
 /// JBIG2 data in the embedded organization, from their segment headers, the way `hayro-jbig2`
 /// 0.4 stores them: one bit per pixel in rows of whole 32-bit words, and for each pattern of a
 /// dictionary also 64 words per pattern row. The walk follows the decoder's own segment parser,
-/// including regions of unknown length. Data it cannot follow is left to the decoder.
+/// including regions of unknown length. Data it cannot follow is left to the decoder. Data with
+/// a symbol dictionary (7.4.2) is refused, as what it keeps cannot be read from its header.
 fn jbig2_retained_bytes(data: &[u8]) -> Result<u64, String> {
     const REGIONS: [u8; 12] = [4, 6, 7, 20, 22, 23, 36, 38, 39, 40, 42, 43];
     const PATTERNS: u8 = 16;
+    const SYMBOLS: u8 = 0;
     let be32 = |at: usize| -> Option<u32> {
         data.get(at..at.checked_add(4)?)
             .and_then(|b| b.try_into().ok())
@@ -239,6 +241,11 @@ fn jbig2_retained_bytes(data: &[u8]) -> Result<u64, String> {
         let Some(length) = be32(pos) else { break };
         pos = pos.saturating_add(4);
         let kind = flags & 0x3F;
+        if kind == SYMBOLS {
+            // What a symbol dictionary keeps depends on its coded data, not its header, so it
+            // cannot be counted here; such pictures wait for a decoder-side limit (#423).
+            return Err("JBIG2 pictures with symbol dictionaries (text-like scans) are not supported yet".into());
+        }
         if REGIONS.contains(&kind) {
             let (Some(w), Some(h)) = (be32(pos), be32(pos + 4)) else {
                 break;
@@ -437,6 +444,9 @@ mod tests {
         // A small one is not.
         let small = segment(3, 16, &[0, 8, 8, 0, 0, 0, 15]);
         assert!(jbig2_retained_bytes(&small).is_ok_and(|n| n < 1 << 20));
+        // A symbol dictionary is refused: its symbols' sizes are only in its coded data.
+        let symbols = segment(3, 0, &[0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1]);
+        assert!(jbig2_retained_bytes(&symbols).is_err_and(|e| e.contains("symbol dictionaries")));
         // Patterns taller than 32 pixels get no shifted copies: 4096 of 8 x 255 take about
         // 5 MiB.
         let tall = segment(3, 16, &[0, 8, 255, 0, 0, 0x0F, 0xFF]);
