@@ -2870,12 +2870,28 @@ mod tests {
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             done,
         });
-        // A command works on the open project's files: it is not saved or replaced under it.
-        let open = a.open.as_ref().unwrap();
+        // A command works on the open project's files while the window edits it too: neither
+        // is saved over nor replaced until the command is done and reconciled.
+        let open = a.open.as_mut().unwrap();
         a.assistant.command_base = Some((open.dir.clone(), open.project.clone()));
+        let mut by_command = open.project.clone();
+        by_command.meta.name = "Named by the command".into();
+        wc_core::store::save(&before, &by_command).unwrap();
+        open.project.meta.name = "Named in the window".into();
+        open.dirty = true;
         until_fetched_once(&mut a);
         assert!(a.fetch.is_some());
-        a.assistant.command_base = None;
+        assert_eq!(a.open.as_ref().unwrap().dir, before);
+        assert_eq!(
+            wc_core::store::load(&before).unwrap().meta.name,
+            "Named by the command",
+            "not saved over the command"
+        );
+        let _ = a.command_finish(Ok("done".into()));
+        assert!(!a.assistant.command_running());
+        // Reconciled: the window's edit is kept, still unsaved.
+        assert_eq!(a.open.as_ref().unwrap().project.meta.name, "Named in the window");
+        assert!(a.open.as_ref().unwrap().dirty);
         // A dialog open on the project: the same, until it is closed.
         a.dialog = Some(Dialog::Message("about the open project".into()));
         until_fetched_once(&mut a);
@@ -2884,6 +2900,8 @@ mod tests {
         a.dialog = None;
         until_fetched(&mut a);
         assert_eq!(a.open.as_ref().unwrap().dir, dir);
+        // The handoff saved the reconciled project: the window's edit is on disk.
+        assert_eq!(wc_core::store::load(&before).unwrap().meta.name, "Named in the window");
     }
 
     #[test]
