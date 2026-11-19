@@ -3,9 +3,9 @@
 //!
 //! The app looks at a command's output paths before it starts the command line
 //! ([`ProjectFiles::holds`]). That look cannot see a link swapped in afterwards, so the
-//! command line opens each output file through [`ProjectFiles::create`] too: the open itself
-//! does not follow a link at the file, and the file it got is checked before anything in it
-//! changes.
+//! command line writes each output file through [`ProjectFiles::write`] too: it never opens
+//! what is already at the output name, but writes a new file next to it, checks it, and gives
+//! it the name.
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -113,133 +113,111 @@ impl ProjectFiles {
         Ok(id.is_some_and(|id| self.files.contains(&id)))
     }
 
-    /// Open `path` to write an output file into, empty, refusing a project file (#458).
+    /// Write `bytes` to the output file `path`, refusing to land on a project file (#458).
     ///
-    /// The open does not follow a link at `path` itself (a link there is refused), and does
-    /// not empty the file. Only once the file it got is known not to be a project file (by its
-    /// identity, so also a hard link to one, or a folder above swapped for a link) is it
-    /// emptied. A file this call made and then refused is removed again.
-    pub fn create(&self, path: &Path) -> io::Result<File> {
+    /// Nothing already at `path` is opened or changed: the bytes go to a new file of their
+    /// own next to it, which then takes the name. A link or a hard link at `path`, also one
+    /// made after the look before, loses only its name there; the file behind it stays as it
+    /// was. The new file is checked before it takes the name: it must not be in the project
+    /// (a folder above swapped for a link into it shows here) and must still be the file that
+    /// was made. A refused file is removed again.
+    pub fn write(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
         let refuse = |why: &str| {
-            Err(io::Error::new(
+            io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(
                     "{} {why}, and someone else has a page of the project open in the shared session",
                     path.display()
                 ),
-            ))
+            )
         };
         match self.holds(path) {
             Ok(false) => {}
-            Ok(true) => return refuse("is in the project folder or is a project file"),
-            Err(e) => return refuse(&format!("could not be told apart from the project's files ({e})")),
-        }
-        let (file, made) = open_no_follow(path)?;
-        let why = match self.check_opened(path, &file) {
-            Ok(()) => {
-                file.set_len(0)?;
-                return Ok(file);
+            Ok(true) => return Err(refuse("is in the project folder or is a project file")),
+            Err(e) => {
+                return Err(refuse(&format!(
+                    "could not be told apart from the project's files ({e})"
+                )));
             }
-            Err(why) => why,
-        };
+        }
+        let (staged, file) = stage_next_to(path)?;
         let id = handle_id(&file).ok().flatten();
-        drop(file);
-        if made && id.is_some() {
+        let checked = self.check_staged(&staged, &file, id).and_then(|()| {
+            use std::io::Write;
+            let mut file = file;
+            file.write_all(bytes)
+                .and_then(|()| file.sync_all())
+                .map_err(|e| format!("could not be written ({e})"))
+        });
+        let done =
+            checked.and_then(|()| std::fs::rename(&staged, path).map_err(|e| format!("could not take its name ({e})")));
+        done.map_err(|why| {
             // The name may lead elsewhere by now; only the file this call made goes.
-            let at = real(path);
-            if file_id(&at).ok().flatten() == id {
+            let at = real(&staged);
+            if id.is_some() && file_id(&at).ok().flatten() == id {
                 let _ = std::fs::remove_file(&at);
             }
-        }
-        refuse(&why)
+            refuse(&why)
+        })
     }
 
-    /// Why the file `file`, just opened at `path`, must not be written, if it must not.
-    fn check_opened(&self, path: &Path, file: &File) -> Result<(), String> {
+    /// Why the new file `file` (identity `id`), just made at `staged`, must not be written, if
+    /// it must not.
+    fn check_staged(&self, staged: &Path, file: &File, id: Option<(u64, u64)>) -> Result<(), String> {
         let meta = file.metadata().map_err(|e| format!("could not be looked at ({e})"))?;
-        if !meta.is_file() || is_link(&meta) {
+        if !meta.is_file() {
             return Err("is not a plain file".into());
         }
-        let id = handle_id(file).map_err(|e| format!("could not be looked at ({e})"))?;
-        match self.known(id) {
-            Ok(false) => {}
-            Ok(true) => return Err("is a project file".into()),
-            Err(e) => return Err(format!("could not be told apart from the project's files ({e})")),
-        }
         // Where the name leads now: a folder above swapped for a link into the project shows
-        // there, and a name that no longer leads to the opened file means it changed meanwhile.
-        let at = real(path);
+        // there, and a name that no longer leads to the made file means it changed meanwhile.
+        let at = real(staged);
         if inside(&self.roots, &at) {
             return Err("is in the project folder".into());
         }
         match (id, file_id(&at)) {
-            (Some(id), Ok(Some(now))) if id != now => Err("changed while it was opened".into()),
-            (Some(_), Err(e)) => Err(format!("could not be looked at after opening ({e})")),
+            (Some(id), Ok(Some(now))) if id != now => Err("changed while it was written".into()),
+            (Some(_), Err(e)) => Err(format!("could not be looked at after it was made ({e})")),
             _ => Ok(()),
         }
     }
 }
 
 /// Write `bytes` to the output file `path`, through `guard` when there is one
-/// ([`ProjectFiles::create`]), else as [`std::fs::write`] does.
+/// ([`ProjectFiles::write`]), else as [`std::fs::write`] does.
 pub fn write_output(guard: Option<&ProjectFiles>, path: &Path, bytes: impl AsRef<[u8]>) -> io::Result<()> {
     match guard {
         None => std::fs::write(path, bytes),
-        Some(g) => {
-            use std::io::Write;
-            let mut f = g.create(path)?;
-            f.write_all(bytes.as_ref())?;
-            f.sync_all()
-        }
+        Some(g) => g.write(path, bytes.as_ref()),
     }
 }
 
-/// Open `path` to write without following a link at it and without emptying it, made when
-/// nothing is there; with whether this call made it.
-fn open_no_follow(path: &Path) -> io::Result<(File, bool)> {
-    let opts = |new: bool| {
-        let mut o = std::fs::OpenOptions::new();
-        o.write(true);
-        if new {
-            // A new file is never made through a link: an existing name, a link too, fails.
-            o.create_new(true);
-        }
-        no_follow(&mut o);
-        o
+/// A new, empty file in the folder of `path`, with a name nothing had: a name already there,
+/// a link too, is never opened.
+fn stage_next_to(path: &Path) -> io::Result<(PathBuf, File)> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let folder = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
     };
-    match opts(true).open(path) {
-        Ok(f) => Ok((f, true)),
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => opts(false).open(path).map(|f| (f, false)),
-        Err(e) => Err(e),
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut last = None;
+    for _ in 0..16 {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let staged = folder.join(format!(".{name}.{}-{n}-{nanos}.wc-tmp", std::process::id()));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&staged) {
+            Ok(f) => return Ok((staged, f)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(e),
+        }
     }
-}
-
-#[cfg(unix)]
-fn no_follow(o: &mut std::fs::OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt;
-    o.custom_flags(libc::O_NOFOLLOW);
-}
-
-/// On Windows the link itself is opened, and then refused as not a plain file.
-#[cfg(windows)]
-fn no_follow(o: &mut std::fs::OpenOptions) {
-    use std::os::windows::fs::OpenOptionsExt;
-    o.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
-}
-
-#[cfg(not(any(unix, windows)))]
-fn no_follow(_o: &mut std::fs::OpenOptions) {}
-
-/// Whether an opened file is a link itself (Windows opens one as itself, see [`no_follow`]).
-#[cfg(windows)]
-fn is_link(meta: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    meta.file_attributes() & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-#[cfg(not(windows))]
-fn is_link(meta: &std::fs::Metadata) -> bool {
-    meta.file_type().is_symlink()
+    Err(last.unwrap_or_else(|| io::Error::other("no free name for the output file")))
 }
 
 /// What names one file on this machine whatever path reaches it, links followed: device and
@@ -440,11 +418,27 @@ mod tests {
         Ok(())
     }
 
+    /// No look before the write, as if the change came right after the app's look: a guard
+    /// that knows nothing of the project's files.
+    fn blind() -> ProjectFiles {
+        ProjectFiles {
+            roots: vec![],
+            files: HashSet::new(),
+            unknown: None,
+        }
+    }
+
+    fn no_temp_left(folder: &Path) -> io::Result<bool> {
+        Ok(std::fs::read_dir(folder)?
+            .filter_map(Result::ok)
+            .all(|e| !e.file_name().to_string_lossy().ends_with(".wc-tmp")))
+    }
+
     /// The app's look found nothing at the output path; a link to a page is swapped in after
-    /// it, before the command line opens the file (#458).
+    /// it, before the command line writes (#458).
     #[cfg(unix)]
     #[test]
-    fn refuses_a_link_swapped_in_after_the_check() -> TestResult {
+    fn a_link_swapped_in_after_the_check_is_not_written_through() -> TestResult {
         let p = project()?;
         let out = tempfile::tempdir()?;
         let g = ProjectFiles::new(p.path());
@@ -452,46 +446,41 @@ mod tests {
         let file = out.path().join("vars.csv");
         assert!(!g.holds(&file)?);
         std::os::unix::fs::symlink(&page, &file)?;
-        let e = g.create(&file).err().ok_or("a link to a page was opened")?;
+        // With the look: refused.
+        let e = g.write(&file, b"x").err().ok_or("a link to a page was written")?;
         assert!(e.to_string().contains("project"), "{e}");
-        // Even without the look before the open, the open does not follow the link.
-        let blind = ProjectFiles {
-            roots: vec![],
-            ..g.clone()
-        };
-        assert!(blind.create(&file).is_err());
+        // Without it, the write still never goes through the link: the link loses its name.
+        blind().write(&file, b"new list")?;
         assert_eq!(std::fs::read_to_string(&page)?, "page one");
+        assert!(!std::fs::symlink_metadata(&file)?.file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&file)?, "new list");
+        assert!(no_temp_left(out.path())?);
         Ok(())
     }
 
-    /// A hard link to a page made after the look is the page under another name: refused
-    /// before it is emptied.
+    /// A hard link to a page is the page under another name: refused by the look, and without
+    /// the look (a page replaced after the project's files were listed) it loses only its name.
     #[cfg(unix)]
     #[test]
-    fn refuses_a_hard_link_to_a_page() -> TestResult {
+    fn a_hard_link_to_a_page_is_never_emptied() -> TestResult {
         let p = project()?;
         let out = tempfile::tempdir()?;
         let g = ProjectFiles::new(p.path());
         let page = p.path().join("pages").join("p1.page.json");
         let file = out.path().join("vars.csv");
         std::fs::hard_link(&page, &file)?;
-        // `create` looks first; the opened file's identity is checked as well.
-        assert!(g.create(&file).is_err());
-        let blind = ProjectFiles {
-            roots: vec![],
-            ..g.clone()
-        };
-        let opened = std::fs::OpenOptions::new().write(true).open(&file)?;
-        assert!(blind.check_opened(&file, &opened).is_err());
+        assert!(g.write(&file, b"x").is_err());
+        blind().write(&file, b"new list")?;
         assert_eq!(std::fs::read_to_string(&page)?, "page one");
+        assert_eq!(std::fs::read_to_string(&file)?, "new list");
         Ok(())
     }
 
     /// A folder above the output file swapped for a link into the project after the look:
-    /// the new file it made there is refused and removed.
+    /// the file made there is refused and removed.
     #[cfg(unix)]
     #[test]
-    fn refuses_a_folder_swapped_for_a_link_into_the_project() -> TestResult {
+    fn a_folder_swapped_for_a_link_into_the_project_is_refused() -> TestResult {
         let p = project()?;
         let out = tempfile::tempdir()?;
         let g = ProjectFiles::new(p.path());
@@ -499,15 +488,31 @@ mod tests {
         let file = sub.join("list.csv");
         assert!(!g.holds(&file)?);
         std::os::unix::fs::symlink(p.path().join("pages"), &sub)?;
-        // Skip the look before the open, as if the swap came right after it.
-        let (f, made) = open_no_follow(&file)?;
-        assert!(made);
-        assert!(g.check_opened(&file, &f).is_err());
+        // Past the look, as if the swap came right after it.
+        let (staged, f) = stage_next_to(&file)?;
+        let id = handle_id(&f)?;
+        assert!(g.check_staged(&staged, &f, id).is_err());
         drop(f);
-        std::fs::remove_file(&file)?;
-        // Through `create` as a whole: refused and nothing left in the project.
-        assert!(g.create(&file).is_err());
+        std::fs::remove_file(&staged)?;
+        // Through `write` as a whole: refused and nothing left in the project.
+        assert!(g.write(&file, b"x").is_err());
         assert!(!p.path().join("pages").join("list.csv").exists());
+        assert!(no_temp_left(&p.path().join("pages"))?);
+        Ok(())
+    }
+
+    /// A FIFO at the output name is not opened, so the write does not wait for a reader.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_at_the_output_name_is_not_opened() -> TestResult {
+        let out = tempfile::tempdir()?;
+        let file = out.path().join("vars.csv");
+        let made = std::process::Command::new("mkfifo").arg(&file).status();
+        if !made.is_ok_and(|s| s.success()) {
+            return Ok(()); // no mkfifo here
+        }
+        blind().write(&file, b"list")?;
+        assert_eq!(std::fs::read_to_string(&file)?, "list");
         Ok(())
     }
 
