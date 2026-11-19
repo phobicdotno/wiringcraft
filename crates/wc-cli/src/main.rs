@@ -2351,6 +2351,15 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             }
             // A library folder can be given outside a project; without one the project is needed.
             let mut project = load(dir);
+            if lib.is_some()
+                && dir.join(store::PROJECT_FILE).exists()
+                && let Err(err) = &project
+            {
+                eprintln!(
+                    "warning: the project could not be read, so its copy of {part} is not updated: {}",
+                    escape_field(err)
+                );
+            }
             let path = match &lib {
                 Some(root) => {
                     store::check_id(&part).map_err(e)?;
@@ -2394,7 +2403,15 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                     _ => false,
                 };
                 let winner = library.locate(ItemKind::Part, &part);
+                // A copy changed in the project since it was pinned is not overwritten: those
+                // edits must be removed or merged first.
+                let edited = store::read_vendored_part(dir, &part)
+                    .ok()
+                    .is_some_and(|copy| p.lock.parts.get(&part).is_some_and(|pin| pin.hash != copy.hash()));
                 let refreshed = match &winner {
+                    _ if edited => Err(format!(
+                        "it has local changes since it was pinned; remove or merge them, then take {part} again"
+                    )),
                     Some(loc) if same(&loc.path, &path) => wc_library::take(dir, p, &library, ItemKind::Part, &part)
                         .map_err(|err| err.to_string())
                         .and_then(|_| {
@@ -4781,6 +4798,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(load(&dir).unwrap().lock.parts["maker.io-8"].hash, pinned);
+
+        // A pinned copy changed in the project is not overwritten by a new footprint.
+        let mut edited = store::read_vendored_part(&dir, "maker.io-8").unwrap();
+        edited.description = "changed in the project".into();
+        store::write_vendored_part(&dir, &edited).unwrap();
+        cli(&dir, &["import", "footprint-dxf", file, "--part", "maker.io-8"]).unwrap();
+        assert_eq!(store::read_vendored_part(&dir, "maker.io-8").unwrap(), edited);
+        assert_eq!(load(&dir).unwrap().lock.parts["maker.io-8"].hash, pinned);
+        // An unreadable project does not stop an import into a named library folder.
+        let broken = tmp.path().join("broken");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join(store::PROJECT_FILE), "not = [valid").unwrap();
+        let lib_dir = lib.to_str().unwrap();
+        cli(
+            &broken,
+            &[
+                "import",
+                "footprint-dxf",
+                file,
+                "--part",
+                "maker.io-8",
+                "--lib",
+                lib_dir,
+            ],
+        )
+        .unwrap();
 
         // A library folder can be named outside a project; a file holding another part is refused.
         let outside = tmp.path().join("elsewhere");
