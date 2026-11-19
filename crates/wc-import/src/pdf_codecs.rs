@@ -301,52 +301,37 @@ pub(crate) struct Jpx {
     pub samples: Vec<u8>,
 }
 
-/// The boxes of JP2 data, as (type, contents), the way the decoder reads them: a length of 0
-/// runs to the end, 1 gives a 64-bit length. Stops at the first box that does not fit.
-fn jp2_boxes(data: &[u8]) -> Vec<(&[u8], &[u8])> {
+/// The boxes of JP2 data, as (type, contents): a length of 0 runs to the end, 1 gives a 64-bit
+/// length. `None` when a box does not fit in the data, which the decoder would read anyway in
+/// its own way: such data is refused rather than guessed at.
+fn jp2_boxes(data: &[u8]) -> Option<Vec<(&[u8], &[u8])>> {
     let mut out = Vec::new();
     let mut at = 0usize;
     while at < data.len() {
-        let Some(len) = data
-            .get(at..at + 4)
-            .and_then(|b| b.try_into().ok())
-            .map(u32::from_be_bytes)
-        else {
-            break;
-        };
-        let Some(kind) = data.get(at + 4..at + 8) else { break };
+        let len = u32::from_be_bytes(data.get(at..at + 4)?.try_into().ok()?);
+        let kind = data.get(at + 4..at + 8)?;
         let (header, size) = match len {
             0 => (8, data.len() - at),
-            1 => {
-                let Some(n) = data
-                    .get(at + 8..at + 16)
-                    .and_then(|b| b.try_into().ok())
-                    .map(u64::from_be_bytes)
-                    .and_then(|n| usize::try_from(n).ok())
-                else {
-                    break;
-                };
-                (16, n)
-            }
+            1 => (
+                16,
+                usize::try_from(u64::from_be_bytes(data.get(at + 8..at + 16)?.try_into().ok()?)).ok()?,
+            ),
             n => (8, n as usize),
         };
-        let Some(body) = (size >= header)
-            .then(|| data.get(at + header..at.saturating_add(size)))
-            .flatten()
-        else {
-            break;
-        };
-        out.push((kind, body));
+        if size < header {
+            return None;
+        }
+        out.push((kind, data.get(at + header..at.checked_add(size)?)?));
         at += size;
     }
-    out
+    Some(out)
 }
 
 /// How many full-size component buffers the decoder makes for a JPEG 2000 picture: the
-/// component count of the SIZ marker (ISO 15444-1 A.5.1) of the codestream it decodes (in a
-/// JP2 file the last `jp2c` box, as the decoder takes), or, if more, the channels a palette
-/// maps out (the entries of the last `jp2h` box's component mapping, or the palette's columns
-/// when it has none).
+/// component count of the SIZ marker (ISO 15444-1 A.5.1) of its codestream or, if more, the
+/// most channels a palette in its header can map out (component-mapping entries, or palette
+/// columns, which the decoder maps when there is no mapping). `None` for data whose effective
+/// boxes are not plain: a box that does not fit, or a second codestream or header box.
 fn jpx_components(data: &[u8]) -> Option<u16> {
     const CODESTREAM: [u8; 4] = [0xFF, 0x4F, 0xFF, 0x51];
     let csiz = |cs: &[u8]| -> Option<u16> {
@@ -360,21 +345,25 @@ fn jpx_components(data: &[u8]) -> Option<u16> {
     if data.starts_with(&CODESTREAM) {
         return csiz(data);
     }
-    let boxes = jp2_boxes(data);
-    let stored = csiz(boxes.iter().rev().find(|(k, _)| *k == b"jp2c")?.1)?;
-    let mapped = boxes
-        .iter()
-        .rev()
-        .find(|(k, _)| *k == b"jp2h")
-        .map_or(0, |(_, header)| {
-            let children = jp2_boxes(header);
-            let last = |kind: &[u8]| children.iter().rev().find(|(k, _)| *k == kind).map(|(_, b)| *b);
-            match (last(b"cmap"), last(b"pclr")) {
-                (Some(cmap), _) => cmap.len() / 4,
-                (None, Some(pclr)) => pclr.get(2).map_or(0, |n| usize::from(*n)),
-                (None, None) => 0,
-            }
-        });
+    let boxes = jp2_boxes(data)?;
+    let only = |kind: &[u8]| -> Option<Option<&[u8]>> {
+        let mut found = boxes.iter().filter(|(k, _)| *k == kind);
+        let first = found.next().map(|(_, b)| *b);
+        found.next().is_none().then_some(first)
+    };
+    let stored = csiz(only(b"jp2c")??)?;
+    let mapped = match only(b"jp2h")? {
+        None => 0,
+        Some(header) => jp2_boxes(header)?
+            .iter()
+            .map(|(kind, body)| match *kind {
+                b"cmap" => body.len() / 4,
+                b"pclr" => body.get(2).map_or(0, |n| usize::from(*n)),
+                _ => 0,
+            })
+            .max()
+            .unwrap_or(0),
+    };
     Some(stored.max(u16::try_from(mapped).unwrap_or(u16::MAX)))
 }
 
@@ -392,7 +381,8 @@ pub(crate) fn jpx(data: &[u8], declared: Option<u8>) -> Result<Jpx, String> {
         }
         // Each component gets a buffer of the full picture before anything is checked: refuse
         // more than a picture can use, or more samples than the pixel limit, first.
-        let stored = jpx_components(data).ok_or("the JPEG 2000 picture has no readable header")?;
+        let stored =
+            jpx_components(data).ok_or("the JPEG 2000 picture's header is unreadable, cut short or repeated")?;
         let shown = u16::from(image.color_space().num_channels()) + u16::from(image.has_alpha());
         let most = stored.max(shown);
         if !(1..=5).contains(&most) || u64::from(width) * u64::from(height) * u64::from(most) > MAX_PIXELS {
@@ -450,14 +440,20 @@ mod tests {
         jp2.extend_from_slice(b"jp2c");
         jp2.extend_from_slice(&cs);
         assert_eq!(jpx_components(&jp2), Some(3));
-        // The decoder takes the last codestream box: so does the count.
+        // A second codestream box (the decoder takes the last) is refused.
         let mut big = cs.clone();
         big[41] = 6;
         let mut two = jp2.clone();
         two.extend_from_slice(&(8 + big.len() as u32).to_be_bytes());
         two.extend_from_slice(b"jp2c");
         two.extend_from_slice(&big);
-        assert_eq!(jpx_components(&two), Some(6));
+        assert_eq!(jpx_components(&two), None);
+        // So is a box longer than the data (the decoder reads what is there).
+        let mut over = jp2.clone();
+        over.extend_from_slice(&(8 + big.len() as u32 + 100).to_be_bytes());
+        over.extend_from_slice(b"jp2c");
+        over.extend_from_slice(&big);
+        assert_eq!(jpx_components(&over), None);
         // A palette's component mapping makes a buffer per entry: eight entries count as eight.
         let header = |child: &[u8], body: &[u8]| {
             let mut b = (16 + body.len() as u32).to_be_bytes().to_vec();
@@ -474,6 +470,19 @@ mod tests {
         let mut palette = header(b"pclr", &[0, 2, 7, 7, 7, 7, 7, 7, 7]);
         palette.extend_from_slice(&jp2);
         assert_eq!(jpx_components(&palette), Some(7));
+        // Of several palettes the widest counts, valid or not: the decoder skips a bad one
+        // and keeps an earlier one.
+        let mut wide = vec![0, 0, 0, 20];
+        wide.extend_from_slice(b"pclr");
+        wide.extend_from_slice(&[0, 2, 9, 7, 7, 7, 7, 7, 7, 7, 7, 7]);
+        wide.extend_from_slice(&[0, 0, 0, 10]);
+        wide.extend_from_slice(b"pclr");
+        wide.extend_from_slice(&[0, 0]); // invalid: no columns byte
+        let mut both = (8 + wide.len() as u32).to_be_bytes().to_vec();
+        both.extend_from_slice(b"jp2h");
+        both.extend_from_slice(&wide);
+        both.extend_from_slice(&jp2);
+        assert_eq!(jpx_components(&both), Some(9));
         // Cut short or not JPEG 2000: none.
         assert_eq!(jpx_components(&cs[..30]), None);
         assert_eq!(jpx_components(b"%PDF"), None);
