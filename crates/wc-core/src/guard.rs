@@ -187,7 +187,9 @@ impl ProjectFiles {
         let opened = dir
             .path()
             .map_err(|e| Fail::Refused(format!("could not be told apart from the project's files ({e})")))?;
-        if self.dirs.contains(&dir.id) || inside(&self.roots, &opened) {
+        #[cfg(test)]
+        tests::hook("resolved", folder, std::ffi::OsStr::new(""));
+        if self.dirs.contains(&dir.id) || opened_inside(&self.roots, &opened) {
             return Err(Fail::Refused("is in the project folder".into()));
         }
         let (staged, mut file) = dir.create_new(&name)?;
@@ -218,6 +220,7 @@ impl ProjectFiles {
     #[cfg(windows)]
     fn put(&self, path: &Path, bytes: &[u8]) -> Result<(), Fail> {
         let (folder, name) = folder_and_name(path)?;
+        let name = win::win32_name(path, name)?;
         #[cfg(test)]
         tests::hook("open", folder, std::ffi::OsStr::new(""));
         let dir = win::Dir::open(folder)?;
@@ -226,7 +229,9 @@ impl ProjectFiles {
         let opened = dir
             .path()
             .map_err(|e| Fail::Refused(format!("could not be told apart from the project's files ({e})")))?;
-        if self.dirs.contains(&dir.id) || inside(&self.roots, &opened) {
+        #[cfg(test)]
+        tests::hook("resolved", folder, std::ffi::OsStr::new(""));
+        if self.dirs.contains(&dir.id) || opened_inside(&self.roots, &opened) {
             return Err(Fail::Refused("is in the project folder".into()));
         }
         #[cfg(test)]
@@ -539,6 +544,33 @@ mod win {
         io::Error::from_raw_os_error(code as i32)
     }
 
+    /// The name the Win32 path calls give the file `name` of `path`: they drop trailing dots
+    /// and spaces from it, and the native calls this writer makes do not, so `out.csv.` would
+    /// otherwise make a new `out.csv.` and leave `out.csv` as it was (#494 review). A verbatim
+    /// `\\?\` path keeps its name as written, as Win32 does.
+    pub(super) fn win32_name(path: &Path, name: OsString) -> io::Result<OsString> {
+        use std::path::{Component, Prefix};
+        let verbatim = matches!(
+            path.components().next(),
+            Some(Component::Prefix(p))
+                if matches!(p.kind(), Prefix::Verbatim(_) | Prefix::VerbatimUNC(..) | Prefix::VerbatimDisk(_))
+        );
+        if verbatim {
+            return Ok(name);
+        }
+        let mut w: Vec<u16> = name.encode_wide().collect();
+        while matches!(w.last(), Some(&c) if c == u16::from(b'.') || c == u16::from(b' ')) {
+            w.pop();
+        }
+        if w.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the output path names no file",
+            ));
+        }
+        Ok(OsString::from_wide(&w))
+    }
+
     /// `name` as UTF-16, refused when it is too long for a `UNICODE_STRING` or names more
     /// than one entry.
     fn wide(name: &OsStr) -> io::Result<Vec<u16>> {
@@ -793,6 +825,17 @@ fn handle_id(_file: &File) -> io::Result<Option<(u64, u64)>> {
     Ok(None)
 }
 
+/// Whether the open folder found at `opened` (read from its handle, so links are already
+/// worked out) is in one of `roots`. The path is taken as found, not looked up again: a folder
+/// moved and replaced by a link outside the project after the handle was read must not pass
+/// (#494 review). It is also looked up, in case the found path is not in the roots' form; a
+/// project folder found either way is refused.
+#[cfg(any(unix, windows))]
+fn opened_inside(roots: &[PathBuf], opened: &Path) -> bool {
+    let found = normalize(opened);
+    roots.iter().any(|r| found.starts_with(r)) || inside(roots, opened)
+}
+
 /// Whether `path`, as the file system resolves it, is in one of `roots`.
 pub fn inside(roots: &[PathBuf], path: &Path) -> bool {
     let path = normalize(&real(path));
@@ -1027,7 +1070,8 @@ mod tests {
     }
 
     /// Run `swap` when the next write on this thread reaches `step`: `open` (before the output
-    /// folder is opened), `opened` (right after), `checked` (Windows: after the opened folder was
+    /// folder is opened), `opened` (right after), `resolved` (after where the opened folder is
+    /// was read, before it is checked), `checked` (Windows: after the opened folder was
     /// checked, before the new file is made) or `rename` (after every check, before the rename;
     /// it is given the staging file's name).
     #[cfg(any(unix, windows))]
@@ -1086,6 +1130,46 @@ mod tests {
         assert_eq!(std::fs::read_to_string(new.join("page.json"))?, "new page");
         assert!(no_temp_left(&new)?);
         assert!(!file.exists());
+        Ok(())
+    }
+
+    /// A project folder made after the look is opened as the output folder through a swapped
+    /// parent; after where the opened folder is was read, it moves within the project and a
+    /// link to a folder outside takes its old name: the write is still refused, by the place that was read, not by where that name
+    /// leads now, and the project's file is unchanged (#494 review).
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn a_project_folder_swapped_for_a_link_out_after_it_was_found_is_refused() -> TestResult {
+        let p = project()?;
+        let out = tempfile::tempdir()?;
+        let g = ProjectFiles::new(p.path());
+        let new = p.path().join("new");
+        std::fs::create_dir(&new)?;
+        std::fs::write(new.join("page.json"), "new page")?;
+        let parent = out.path().join("parent");
+        std::fs::create_dir_all(parent.join("sub"))?;
+        let file = parent.join("sub").join("page.json");
+        assert!(!g.holds(&file)?);
+        let aside = out.path().join("parent-aside");
+        let (parent2, aside2, project2) = (parent.clone(), aside.clone(), p.path().to_path_buf());
+        on("open", move |_, _| {
+            std::fs::rename(&parent2, &aside2)?;
+            std::os::unix::fs::symlink(&project2, &parent2)?;
+            std::fs::rename(project2.join("new"), project2.join("sub"))
+        });
+        let (aside3, project3) = (aside.clone(), p.path().to_path_buf());
+        on("resolved", move |_, _| {
+            std::fs::rename(project3.join("sub"), project3.join("new"))?;
+            std::os::unix::fs::symlink(aside3.join("sub"), project3.join("sub"))
+        });
+        let e = g
+            .write(&file, b"exported")
+            .err()
+            .ok_or("written into a project folder")?;
+        assert!(e.to_string().contains("project folder"), "{e}");
+        assert_eq!(std::fs::read_to_string(new.join("page.json"))?, "new page");
+        assert!(no_temp_left(&new)?);
+        assert!(!aside.join("sub").join("page.json").exists());
         Ok(())
     }
 
@@ -1211,6 +1295,81 @@ mod tests {
         assert!(no_temp_left(&moved)?);
         // The junction goes before the temporary folder does.
         std::fs::remove_dir(&sub)?;
+        Ok(())
+    }
+
+    /// As on unix: a project folder made after the look is opened as the output folder through
+    /// a swapped parent; after where the opened folder is was read, it moves within the project and a junction to a folder
+    /// outside takes its old name. The write is refused and the project's file is unchanged
+    /// (#494 review).
+    #[cfg(windows)]
+    #[test]
+    fn a_project_folder_swapped_for_a_junction_out_after_it_was_found_is_refused() -> TestResult {
+        let p = project()?;
+        let out = tempfile::tempdir()?;
+        let g = ProjectFiles::new(p.path());
+        let new = p.path().join("new");
+        std::fs::create_dir(&new)?;
+        std::fs::write(new.join("page.json"), "new page")?;
+        let parent = out.path().join("parent");
+        std::fs::create_dir_all(parent.join("sub"))?;
+        let file = parent.join("sub").join("page.json");
+        assert!(!g.holds(&file)?);
+        let aside = out.path().join("parent-aside");
+        let (parent2, aside2, project2) = (parent.clone(), aside.clone(), p.path().to_path_buf());
+        on("open", move |_, _| {
+            std::fs::rename(&parent2, &aside2)?;
+            junction(&parent2, &project2)?;
+            std::fs::rename(project2.join("new"), project2.join("sub"))
+        });
+        let (aside3, project3) = (aside.clone(), p.path().to_path_buf());
+        on("resolved", move |_, _| {
+            std::fs::rename(project3.join("sub"), project3.join("new"))?;
+            junction(&project3.join("sub"), &aside3.join("sub"))
+        });
+        let e = g
+            .write(&file, b"exported")
+            .err()
+            .ok_or("written into a project folder")?;
+        assert!(e.to_string().contains("project folder"), "{e}");
+        assert_eq!(std::fs::read_to_string(new.join("page.json"))?, "new page");
+        assert!(no_temp_left(&new)?);
+        assert!(!aside.join("sub").join("page.json").exists());
+        // The junctions go before the temporary folders do.
+        std::fs::remove_dir(p.path().join("sub"))?;
+        std::fs::remove_dir(&parent)?;
+        Ok(())
+    }
+
+    /// Win32 drops trailing dots and spaces from a file name: `out.csv.` replaces `out.csv`,
+    /// and no entry named `out.csv.` is made (#494 review).
+    #[cfg(windows)]
+    #[test]
+    fn a_trailing_dot_names_the_file_win32_would() -> TestResult {
+        let p = project()?;
+        let out = tempfile::tempdir()?;
+        let g = ProjectFiles::new(p.path());
+        let file = out.path().join("out.csv");
+        g.write(&file, b"first")?;
+        g.write(&out.path().join("out.csv. ."), b"second")?;
+        assert_eq!(std::fs::read_to_string(&file)?, "second");
+        let names: Vec<_> = std::fs::read_dir(out.path())?
+            .filter_map(Result::ok)
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("out.csv")]);
+        assert!(g.write(&out.path().join(" ."), b"x").is_err());
+        Ok(())
+    }
+
+    /// A verbatim path keeps its file name as written; any other loses trailing dots and spaces.
+    #[cfg(windows)]
+    #[test]
+    fn only_a_verbatim_path_keeps_a_trailing_dot() -> TestResult {
+        let name = || std::ffi::OsString::from("a. ");
+        assert_eq!(win::win32_name(Path::new(r"\\?\C:\x\a. "), name())?, "a. ");
+        assert_eq!(win::win32_name(Path::new(r"C:\x\a. "), name())?, "a");
+        assert_eq!(win::win32_name(Path::new("a. "), name())?, "a");
         Ok(())
     }
 
