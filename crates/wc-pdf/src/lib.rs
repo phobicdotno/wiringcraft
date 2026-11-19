@@ -7,6 +7,7 @@
 
 mod layout;
 mod picture;
+mod topology;
 mod vector;
 mod writer;
 
@@ -39,6 +40,8 @@ pub struct Options {
     pub unreadable: BTreeMap<String, String>,
     /// Panel layouts printed after the schematic pages, one sheet each.
     pub panels: Vec<wc_core::panel::Panel>,
+    /// Fieldbus networks drawn as topology pages at the end, one sheet each.
+    pub networks: Vec<wc_core::network::Network>,
 }
 
 impl Default for Options {
@@ -51,6 +54,7 @@ impl Default for Options {
             underlays: BTreeMap::new(),
             unreadable: BTreeMap::new(),
             panels: Vec::new(),
+            networks: Vec::new(),
         }
     }
 }
@@ -117,7 +121,7 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
             .collect()
     };
     let (front_pages, back_pages) = (split(true), split(false));
-    let total = front_pages.len() + pages.len() + options.panels.len() + back_pages.len();
+    let total = front_pages.len() + pages.len() + options.panels.len() + back_pages.len() + options.networks.len();
     report.pages = total;
     let mut doc = writer::Doc::new(&project.meta.name);
     let mut sheet = 0;
@@ -196,6 +200,19 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
         sheet += 1;
     }
     add_reports(&mut doc, back_pages, &mut sheet);
+    // Network topologies close the document, after the network list.
+    for (k, net) in options.networks.iter().enumerate() {
+        let mut page = wc_core::Page::new(
+            format!("network-{}", net.name),
+            format!("N{}", k + 1),
+            format!("Network {}", net.name),
+        );
+        page.size = first_size;
+        let mut drawn = topology::draw_network_page(project, &page, sheet, total, net, &options.date);
+        place_logo(&mut drawn, &page);
+        doc.add_page(first_size.mm(), &format!("{} {}", page.number, page.title), drawn);
+        sheet += 1;
+    }
     // Links resolve against the exported page list, so links to pages left out are dropped.
     let index: BTreeMap<String, usize> = pages
         .iter()

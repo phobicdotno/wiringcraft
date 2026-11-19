@@ -1648,3 +1648,82 @@ fn a_rack_of_three_cards_gives_plc_card_overview_pages() {
         assert!(text.contains(&writer::pdf_text(cell)), "{cell}");
     }
 }
+
+#[test]
+fn a_network_gets_a_topology_page_with_its_devices_addresses_and_cables() {
+    use wc_core::network::{Link as NetLink, Network, Node};
+    let mut project = Project::new("x");
+    let mut p1 = Page::new("p1", "1", "PLC");
+    p1.symbols.push(place("s1", "coil", 50.0, "-K10"));
+    project.pages.push(p1);
+    let node = |d: &str, a: &str| Node {
+        device: d.into(),
+        address: a.into(),
+        ..Node::default()
+    };
+    let link = |a: &str, b: &str, w: &str| NetLink {
+        from: a.into(),
+        to: b.into(),
+        cable: w.into(),
+        ..NetLink::default()
+    };
+    // PLC - switch - two drives, and a ring of three devices back to the first one.
+    let line = Network {
+        name: "PN1".into(),
+        kind: "profinet".into(),
+        nodes: vec![
+            node("-A1", "192.168.0.1"),
+            node("-K10", "192.168.0.10"),
+            node("-T1", "192.168.0.21"),
+            node("-T2", "192.168.0.22"),
+        ],
+        links: vec![
+            link("-A1:X1P1", "-K10:P1", "-W1"),
+            link("-K10:P2", "-T1:X1", "-W2"),
+            link("-K10:P3", "-T2:X1", "-W3"),
+        ],
+        ..Network::default()
+    };
+    let ring = Network {
+        name: "RING".into(),
+        nodes: vec![node("-A5", ""), node("-A6", ""), node("-A7", "")],
+        links: vec![
+            link("-A5:P1", "-A6:P1", "-W51"),
+            link("-A6:P2", "-A7:P1", "-W52"),
+            link("-A7:P2", "-A5:P2", "-W53"),
+        ],
+        ..Network::default()
+    };
+    let opts = Options {
+        networks: vec![line, ring],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    assert_eq!(report.pages, 3);
+    assert!(text.contains(&format!("/Title {}", writer::pdf_text("N1 Network PN1"))));
+    assert!(text.contains(&format!("/Title {}", writer::pdf_text("N2 Network RING"))));
+    for t in [
+        "-A1",
+        "-K10",
+        "-T1",
+        "-T2",
+        "192.168.0.1",
+        "192.168.0.10",
+        "192.168.0.21",
+        "192.168.0.22",
+        "-W1",
+        "-W2",
+        "-W3",
+        "X1P1",
+        "P3",
+    ] {
+        assert!(text.contains(&writer::pdf_text(t)), "{t}");
+    }
+    // Every link of the ring is drawn once, each with its cable tag.
+    for w in ["-W51", "-W52", "-W53"] {
+        assert_eq!(text.matches(&writer::pdf_text(w)).count(), 1, "{w}");
+    }
+    // The switch's box links to the page it is drawn on; the others are on no page.
+    assert_eq!(text.matches("/Subtype /Link").count(), 1);
+}

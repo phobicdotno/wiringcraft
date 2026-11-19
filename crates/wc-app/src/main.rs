@@ -2935,6 +2935,7 @@ fn export_pdf(open: &Open) -> String {
         underlays: pictures.files,
         unreadable: pictures.unreadable,
         panels: open.project.panels.clone(),
+        networks: open.project.meta.networks.clone(),
         ..Default::default()
     };
     let (bytes, report) = wc_pdf::export(&open.project, &open.symbols, &options);

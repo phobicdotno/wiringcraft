@@ -10,8 +10,8 @@ use crate::Options;
 use crate::writer::{Drawn, Layer, Link, Pen, text_width_mm};
 
 pub use wc_core::project::FRAME_COLUMNS;
-const MARGIN: f64 = wc_core::project::FRAME_MARGIN;
-const HEADER: f64 = 6.0;
+pub(crate) const MARGIN: f64 = wc_core::project::FRAME_MARGIN;
+pub(crate) const HEADER: f64 = 6.0;
 #[cfg(test)]
 const TITLE_H: f64 = wc_core::template::TITLE_HEIGHT;
 
@@ -716,7 +716,7 @@ fn cover_marks(project: &Project, (x0, y0, x1, y1): (f64, f64, f64, f64), date: 
     }
 }
 
-fn frame(pen: &mut Pen, project: &Project, page: &Page, index: usize, total: usize, date: &str) {
+pub(crate) fn frame(pen: &mut Pen, project: &Project, page: &Page, index: usize, total: usize, date: &str) {
     for m in frame_marks(project, page, index, total, date) {
         match m.ink {
             Ink::Thick => {
@@ -1046,11 +1046,16 @@ fn column_widths(t: &wc_report::Table, avail: f64) -> Vec<f64> {
 
 /// Cut text to fit a width, marking the cut with "...".
 fn fit(s: &str, width: f64) -> String {
-    if text_width_mm(s, TABLE_TEXT) <= width {
+    text_fit(s, TABLE_TEXT, width)
+}
+
+/// Cut text of `size` to fit a width, marking the cut with "...".
+pub(crate) fn text_fit(s: &str, size: f64, width: f64) -> String {
+    if text_width_mm(s, size) <= width {
         return s.to_owned();
     }
     let mut out: String = s.to_owned();
-    while !out.is_empty() && text_width_mm(&format!("{out}..."), TABLE_TEXT) > width {
+    while !out.is_empty() && text_width_mm(&format!("{out}..."), size) > width {
         out.pop();
     }
     format!("{out}...")

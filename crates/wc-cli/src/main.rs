@@ -1897,15 +1897,21 @@ fn run(cli: Cli) -> Res<()> {
             // list of one without networks, so it does not gain an empty page; naming
             // `plc-cards` or `networks` prints it anyway.
             let named = |k: wc_report::Kind| reports.iter().any(|r| r == k.name());
-            let tables = report_kinds(&reports)?
+            let kinds: Vec<wc_report::Kind> = report_kinds(&reports)?
                 .into_iter()
                 .filter(|k| match k {
                     wc_report::Kind::PlcCards => named(*k) || !p.meta.racks.is_empty(),
                     wc_report::Kind::Networks => named(*k) || !p.meta.networks.is_empty(),
                     _ => true,
                 })
-                .map(|k| wc_report::build(k, &inputs))
                 .collect();
+            // The network list is followed by a topology page per network.
+            let networks = if kinds.contains(&wc_report::Kind::Networks) {
+                p.meta.networks.clone()
+            } else {
+                Vec::new()
+            };
+            let tables = kinds.into_iter().map(|k| wc_report::build(k, &inputs)).collect();
             let pictures = wc_pdf::read_pictures(dir, &p);
             let (bytes, report) = wc_pdf::export(
                 &p,
@@ -1918,6 +1924,7 @@ fn run(cli: Cli) -> Res<()> {
                     underlays: pictures.files,
                     unreadable: pictures.unreadable,
                     panels: p.panels.clone(),
+                    networks,
                 },
             );
             write_out(&out, bytes).map_err(e)?;
