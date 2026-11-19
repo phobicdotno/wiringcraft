@@ -2896,6 +2896,29 @@ mod tests {
         };
         assert!(m.contains("Could not open"), "{m}");
         assert!(m.contains("could not be recorded"), "{m}");
+        assert!(m.contains("invalid gitfile format"), "git's reason: {m}");
+    }
+
+    #[test]
+    fn a_new_project_that_cannot_be_recorded_while_the_open_one_cannot_be_saved_says_both() {
+        let (tmp, mut a) = app(vec![]);
+        let before = a.open.as_ref().unwrap().dir.clone();
+        // The open project has unsaved work and its folder is gone: a file stands in its place.
+        a.open.as_mut().unwrap().dirty = true;
+        std::fs::remove_dir_all(&before).unwrap();
+        std::fs::write(&before, "not a folder").unwrap();
+        let dir = tmp.path().join("broken");
+        wc_core::store::create(&dir, "New").unwrap();
+        std::fs::write(dir.join(".git"), "not a repository").unwrap();
+        a.finish_new_project(&dir, false);
+        let Some(Dialog::Message(m)) = &a.dialog else {
+            unreachable!("no message")
+        };
+        assert!(m.contains("could not be saved first"), "{m}");
+        assert!(m.contains("i/o error"), "the save's reason: {m}");
+        assert!(m.contains("could not be recorded either"), "{m}");
+        assert!(m.contains("invalid gitfile format"), "git's reason: {m}");
+        assert_eq!(a.open.as_ref().unwrap().dir, before, "the open project stays open");
     }
 
     #[test]
