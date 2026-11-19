@@ -5037,7 +5037,8 @@ mod tests {
         m.value_sets[0].values.insert("voltage".into(), "400".into());
         wc_core::macros::write_macro(&open.dir, "swap", &m).unwrap();
         let form = crate::macro_form::Form::open(&path).unwrap();
-        assert!(form.save().is_err(), "the undeclared value is reported");
+        let err = form.save().unwrap_err();
+        assert!(err.contains("voltage"), "the undeclared value is reported: {err}");
         assert_eq!(
             wc_core::macros::read_macro(&path).unwrap(),
             m,
