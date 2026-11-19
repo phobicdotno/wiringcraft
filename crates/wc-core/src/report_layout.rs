@@ -1,5 +1,6 @@
 //! Report layouts the user designs: which columns a report shows, in what order, under which
-//! headings, and how its rows are sorted.
+//! headings, how its rows are sorted and grouped, and which title-block values its pages print
+//! above the table.
 //!
 //! They are kept in `project.toml` as `[[report]]` tables, one per report kind (`parts`,
 //! `wires`, `terminals`, `cables`, `plc`, ...). A report without one keeps its built-in layout.
@@ -9,6 +10,8 @@
 //! kind = "parts"
 //! title = "Bill of materials"
 //! sort = ["Manufacturer", "-Qty"]
+//! group = "Manufacturer"
+//! header = ["project.name", "revision"]
 //!
 //! [[report.column]]
 //! from = "Order number"
@@ -36,6 +39,17 @@ pub struct ReportLayout {
     /// `X10`). Rows equal in every sort column keep the built-in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sort: Vec<String>,
+    /// A column to group the rows by, by its built-in heading. Rows of one value come together
+    /// (in the order of their first row after sorting); the PDF prints a heading with the
+    /// value above each group and leaves the column out of the rows, while a CSV keeps one row
+    /// per record with the value in every row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// Values printed above the table on each of the report's pages, as `Label: value`, by
+    /// the keys a title block uses: `project.name`, or a title-block field such as `revision`,
+    /// `location` or `customer`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub header: Vec<String>,
 }
 
 /// One column of a [`ReportLayout`].
@@ -73,6 +87,8 @@ name = "x"
 kind = "parts"
 title = "Bill of materials"
 sort = ["Manufacturer", "-Qty"]
+group = "Manufacturer"
+header = ["project.name", "revision"]
 
 [[report.column]]
 from = "Order number"
@@ -87,6 +103,8 @@ from = "Qty"
         assert_eq!(l.columns[0].heading.as_deref(), Some("Art. no."));
         assert_eq!(l.columns[1].heading, None);
         assert_eq!(super::ReportLayout::sort_key(&l.sort[1]), ("Qty", true));
+        assert_eq!(l.group.as_deref(), Some("Manufacturer"));
+        assert_eq!(l.header, ["project.name", "revision"]);
         let again: ProjectMeta = toml::from_str(&toml::to_string(&meta).unwrap()).unwrap();
         assert_eq!(again.reports, meta.reports);
         // A project without layouts writes none.

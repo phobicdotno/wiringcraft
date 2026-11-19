@@ -45,6 +45,11 @@ pub struct Table {
     pub row_pages: Vec<String>,
     /// Printed before the schematic pages in a PDF, like the table of contents of a drawing set.
     pub front: bool,
+    /// The column the rows are grouped by ([`ReportLayout::group`]): rows of one value come
+    /// together, and a PDF prints the value once as a heading above them.
+    pub group: Option<usize>,
+    /// Title-block values a PDF prints above the table ([`ReportLayout::header`]).
+    pub header: Vec<String>,
 }
 
 impl Table {
@@ -113,7 +118,7 @@ impl Table {
                 index(c).map(|i| (i, descending))
             })
             .collect();
-        let picked: Vec<(usize, String)> = if layout.columns.is_empty() {
+        let mut picked: Vec<(usize, String)> = if layout.columns.is_empty() {
             self.columns.iter().cloned().enumerate().collect()
         } else {
             layout
@@ -122,6 +127,15 @@ impl Table {
                 .filter_map(|c| index(&c.from).map(|i| (i, c.heading.clone().unwrap_or_else(|| c.from.clone()))))
                 .collect()
         };
+        // The group column, shown first when the layout leaves it out (every row keeps its value).
+        let group = layout.group.as_deref().and_then(|g| index(g.trim()));
+        let shown_group = group.map(|g| match picked.iter().position(|(i, _)| *i == g) {
+            Some(at) => at,
+            None => {
+                picked.insert(0, (g, self.columns[g].clone()));
+                0
+            }
+        });
         let Table {
             title,
             rows,
@@ -147,6 +161,21 @@ impl Table {
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
         }
+        if let Some(g) = group {
+            // Each group where its first row is; within it, the sorted order.
+            let mut order: Vec<String> = Vec::new();
+            for (r, _) in &rows {
+                let v = r.get(g).cloned().unwrap_or_default();
+                if !order.contains(&v) {
+                    order.push(v);
+                }
+            }
+            let rank = |r: &[String]| {
+                let v = r.get(g).map(String::as_str).unwrap_or_default();
+                order.iter().position(|o| o == v).unwrap_or(usize::MAX)
+            };
+            rows.sort_by_key(|(r, _)| rank(r));
+        }
         let mut row_pages: Vec<String> = rows.iter().map(|(_, p)| p.clone()).collect();
         while row_pages.last().is_some_and(String::is_empty) {
             row_pages.pop();
@@ -165,6 +194,8 @@ impl Table {
                 .collect(),
             row_pages,
             front,
+            group: shown_group,
+            header: layout.header.clone(),
         }
     }
 

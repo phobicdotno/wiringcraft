@@ -287,6 +287,7 @@ fn table_of_contents_goes_first_and_its_rows_link_to_pages() {
         rows: vec![vec!["1".into(), "Mains".into()], vec!["2".into(), "Control".into()]],
         row_pages: vec!["p1".into(), "p2".into()],
         front: true,
+        ..Default::default()
     };
     let parts = wc_report::Table {
         title: "Parts list".into(),
@@ -344,6 +345,63 @@ fn a_report_in_the_project_s_own_layout_prints_that_layout() {
     assert!(text.contains(&format!("/Title {}", writer::pdf_text("R1 Bill of materials"))));
     assert!(text.contains(&writer::pdf_text("Art. no.")));
     assert!(!text.contains(&writer::pdf_text("Manufacturer")));
+}
+
+#[test]
+fn grouped_report_pages_print_a_heading_per_group_and_the_header_values() {
+    use layout::TableLine::{Group, Row};
+    let row = |loc: &str, wire: &str| vec![loc.to_string(), wire.to_string()];
+    let mut table = wc_report::Table {
+        title: "Wires".into(),
+        columns: vec!["Location".into(), "Wire".into()],
+        rows: vec![row("+A", "W1"), row("+A", "W2"), row("+A", "W3"), row("+B", "W4")],
+        group: Some(0),
+        ..Default::default()
+    };
+    let g = |v: &str, continued: bool| Group {
+        value: v.into(),
+        continued,
+    };
+    // Four lines a page: +A runs onto the second page under a continued heading, and +B's
+    // heading does not end a page alone.
+    assert_eq!(
+        layout::table_pages(&table, 4),
+        vec![
+            vec![g("+A", false), Row(0), Row(1), Row(2)],
+            vec![g("+B", false), Row(3)],
+        ]
+    );
+    assert_eq!(
+        layout::table_pages(&table, 3),
+        vec![
+            vec![g("+A", false), Row(0), Row(1)],
+            vec![g("+A", true), Row(2)],
+            vec![g("+B", false), Row(3)],
+        ]
+    );
+    // The line of header values takes one line of each page.
+    table.header = vec!["project.name".into(), "revision".into()];
+    assert_eq!(layout::table_pages(&table, 4)[0], vec![g("+A", false), Row(0), Row(1)]);
+
+    let mut project = Project::new("Plant 7");
+    project.pages = vec![Page::new("p1", "1", "Mains")];
+    project.meta.title_block.insert("revision".into(), "C".into());
+    let opts = Options {
+        reports: vec![table],
+        ..Default::default()
+    };
+    let (pdf, _) = export(&project, &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    for shown in [
+        "Location: +A",
+        "Location: +B",
+        "W4",
+        "Project name: Plant 7    Revision: C",
+    ] {
+        assert!(text.contains(&writer::pdf_text(shown)), "{shown}");
+    }
+    // The location is in the headings, not in a column of its own.
+    assert!(!text.contains(&writer::pdf_text("+A")), "no +A cell");
 }
 
 #[test]
