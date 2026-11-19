@@ -521,7 +521,57 @@ fn merge_by_id<T: PartialEq + Clone>(
 /// part the session did not touch is kept and sent as usual. On a page both changed, the local
 /// change is put on top of the session's page when the two touched different things
 /// ([`merge_page`]). Returns the parts whose local change was dropped, named for the person.
+#[cfg(test)]
 pub fn yield_to_session(local: &mut Project, base: &mut Project, auth: &Project) -> Vec<String> {
+    yield_and_check(local, base, auth).0
+}
+
+/// `yield_to_session`, and the clashes it keeps: revision clouds drawn here that carry a
+/// revision the merged project no longer lists, because the session removed it while this
+/// window drew them. The merge works on the project properties and on each page apart, so no
+/// rule spanning both is kept by it; such a cloud is kept, not dropped, and named here for the
+/// person (the project check names it too).
+pub fn yield_and_check(local: &mut Project, base: &mut Project, auth: &Project) -> (Vec<String>, Vec<String>) {
+    // The revisions this window knew of, before the session's properties may replace them.
+    let known: BTreeSet<String> = base
+        .meta
+        .revisions
+        .iter()
+        .chain(&local.meta.revisions)
+        .map(|r| r.letter.trim().to_owned())
+        .collect();
+    let dropped = yield_pages_and_parts(local, base, auth);
+    // The properties the merged project ends up with: this window's when only it changed them
+    // (and so still differs from the last sync), else the session's.
+    let merged = if local.meta != base.meta {
+        &local.meta
+    } else {
+        &auth.meta
+    };
+    let listed: BTreeSet<&str> = merged.revisions.iter().map(|r| r.letter.trim()).collect();
+    let mut clashes = Vec::new();
+    for page in &local.pages {
+        let before = base.page(&page.id);
+        let mut gone: Vec<&str> = page
+            .clouds
+            .iter()
+            .filter(|c| before.is_none_or(|b| !b.clouds.contains(c)))
+            .map(|c| c.revision.trim())
+            .filter(|r| known.contains(*r) && !listed.contains(r))
+            .collect();
+        gone.sort_unstable();
+        gone.dedup();
+        for r in gone {
+            clashes.push(format!(
+                "a cloud on page {} carries revision {r}, which the session removed",
+                page.number
+            ));
+        }
+    }
+    (dropped, clashes)
+}
+
+fn yield_pages_and_parts(local: &mut Project, base: &mut Project, auth: &Project) -> Vec<String> {
     let mut dropped = Vec::new();
 
     if local.meta != base.meta && auth.meta != base.meta {
@@ -3632,11 +3682,16 @@ impl Share {
         if std::mem::take(&mut self.took_back)
             && let Some(auth) = role.project()
         {
-            let lost = yield_to_session(&mut open.project, base, auth);
+            let (lost, clashes) = yield_and_check(&mut open.project, base, auth);
             if !lost.is_empty() {
                 self.notes.push(format!(
                     "Your change to {} was not kept: the session changed it while your undo was on its way.",
                     lost.join(", ")
+                ));
+            }
+            for clash in clashes {
+                self.notes.push(format!(
+                    "Kept, but it clashes: {clash}. Add the revision again or retag the cloud."
                 ));
             }
         }

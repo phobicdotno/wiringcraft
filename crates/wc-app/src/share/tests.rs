@@ -1333,6 +1333,60 @@ fn a_cloud_and_the_revision_table_drawn_here_are_kept_beside_the_sessions_edit()
 }
 
 #[test]
+fn a_cloud_drawn_here_for_a_revision_the_session_removed_is_kept_and_reported() -> TestResult {
+    use wc_core::geom::Point;
+    let revision = |letter: &str| wc_core::Revision {
+        letter: letter.into(),
+        date: String::new(),
+        text: String::new(),
+        author: String::new(),
+    };
+    let (mut base, mut auth, mut local) = three_copies()?;
+    for p in [&mut base, &mut auth, &mut local] {
+        p.meta.revisions = vec![revision("A"), revision("B")];
+    }
+    // The session removed revision A; this window drew a cloud tagged A, and one tagged B.
+    auth.meta.revisions.retain(|r| r.letter != "A");
+    for letter in ["A", "B"] {
+        local.pages[0].clouds.push(wc_core::RevisionCloud::new(
+            Point::new(10.0, 10.0),
+            Point::new(40.0, 30.0),
+            letter,
+        ));
+    }
+    let (lost, clashes) = yield_and_check(&mut local, &mut base, &auth);
+    assert!(lost.is_empty(), "{lost:?}");
+    assert_eq!(
+        clashes,
+        ["a cloud on page 1 carries revision A, which the session removed"]
+    );
+    assert_eq!(local.pages[0].clouds.len(), 2, "the clouds are kept");
+
+    // A cloud of a revision the project never listed is the project check's to report, not a
+    // clash of the merge; nor is one this window had before the sync.
+    let (mut base, auth, mut local) = three_copies()?;
+    local.pages[0].clouds.push(wc_core::RevisionCloud::new(
+        Point::new(10.0, 10.0),
+        Point::new(40.0, 30.0),
+        "Z",
+    ));
+    let (lost, clashes) = yield_and_check(&mut local, &mut base, &auth);
+    assert!(lost.is_empty() && clashes.is_empty(), "{lost:?} {clashes:?}");
+
+    // This window added revision C and a cloud for it; the session left the properties alone.
+    let (mut base, auth, mut local) = three_copies()?;
+    local.meta.revisions.push(revision("C"));
+    local.pages[0].clouds.push(wc_core::RevisionCloud::new(
+        Point::new(10.0, 10.0),
+        Point::new(40.0, 30.0),
+        "C",
+    ));
+    let (_, clashes) = yield_and_check(&mut local, &mut base, &auth);
+    assert!(clashes.is_empty(), "{clashes:?}");
+    Ok(())
+}
+
+#[test]
 fn an_element_changed_on_both_sides_takes_the_sessions_page() -> TestResult {
     let (mut base, mut auth, mut local) = three_copies()?;
     auth.pages[0].symbols[0].at.x = -10.0;
