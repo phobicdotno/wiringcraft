@@ -95,6 +95,99 @@ pub struct Assistant {
     /// The project folder and project when a `run_command` started on its worker thread, so
     /// its end can tell the command's changes from the user's edits made meanwhile.
     command_base: Option<(PathBuf, wc_core::Project)>,
+    /// While someone else holds a page in a shared session, the copy of the project folder
+    /// the running command works on, and the held pages as they were: its result reaches the
+    /// project folder only if it leaves those pages alone.
+    command_staging: Option<Staging>,
+}
+
+/// A copy of a project folder (without its `.git`) that a command runs on, removed when
+/// dropped.
+struct Staging {
+    dir: PathBuf,
+    held: Vec<Page>,
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+impl Staging {
+    /// Copy `project` into a new folder of its own.
+    fn of(project: &Path, held: Vec<Page>) -> Result<Self, String> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("wiringcraft-command-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let me = Self { dir, held };
+        copy_tree(project, &me.dir).map_err(|e| format!("Could not copy the project for the command: {e}"))?;
+        Ok(me)
+    }
+}
+
+/// The folders a command's copy of a project leaves out and never writes back.
+fn staged(name: &std::ffi::OsStr) -> bool {
+    name != ".git"
+}
+
+/// Copy the folder `from` to `to`, leaving out what [`staged`] leaves out.
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for e in std::fs::read_dir(from)? {
+        let e = e?;
+        if !staged(&e.file_name()) {
+            continue;
+        }
+        let (src, dst) = (e.path(), to.join(e.file_name()));
+        if e.file_type()?.is_dir() {
+            copy_tree(&src, &dst)?;
+        } else {
+            std::fs::copy(&src, &dst)?;
+        }
+    }
+    Ok(())
+}
+
+/// Make `to` hold what `from` holds: files new or changed there are written, files gone there
+/// are removed (what [`staged`] leaves out is left alone).
+fn sync_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    let mut seen = std::collections::BTreeSet::new();
+    for e in std::fs::read_dir(from)? {
+        let e = e?;
+        if !staged(&e.file_name()) {
+            continue;
+        }
+        seen.insert(e.file_name());
+        let (src, dst) = (e.path(), to.join(e.file_name()));
+        if e.file_type()?.is_dir() {
+            if dst.is_file() {
+                std::fs::remove_file(&dst)?;
+            }
+            sync_tree(&src, &dst)?;
+        } else {
+            if dst.is_dir() {
+                std::fs::remove_dir_all(&dst)?;
+            }
+            let new = std::fs::read(&src)?;
+            if std::fs::read(&dst).ok().as_deref() != Some(new.as_slice()) {
+                std::fs::write(&dst, new)?;
+            }
+        }
+    }
+    for e in std::fs::read_dir(to)? {
+        let e = e?;
+        if staged(&e.file_name()) && !seen.contains(&e.file_name()) {
+            if e.file_type()?.is_dir() {
+                std::fs::remove_dir_all(e.path())?;
+            } else {
+                std::fs::remove_file(e.path())?;
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Default for Assistant {
@@ -120,6 +213,7 @@ impl Assistant {
             shared: Vec::new(),
             clipboard: screenshot::Clipboard::default(),
             command_base: None,
+            command_staging: None,
         }
     }
 
@@ -2544,12 +2638,34 @@ impl App {
         let bin = cli_path();
         let mut cmd = std::process::Command::new(&bin);
         self.assistant.command_base = None;
+        self.assistant.command_staging = None;
         if let Some(open) = self.open.as_mut() {
+            let held = open.held_pages();
+            // The project's history: it has no copy to work on, and changes no drawing.
+            if !held.is_empty() && args.first().is_some_and(|a| a == "vcs") {
+                let read_only = ["log", "changes", "page-log"];
+                if !args.get(1).is_some_and(|a| read_only.contains(&a.as_str())) {
+                    return Err(format!(
+                        "`wiringcraft {}` is not run while someone else has a page open in the shared session.",
+                        args.join(" ")
+                    ));
+                }
+            }
             if open.dirty {
                 open.save()
                     .map_err(|e| format!("Saving before the command failed: {e}"))?;
             }
-            cmd.arg("-C").arg(&open.dir);
+            // While someone else holds a page, the command works on a copy: what it does
+            // reaches the project folder only once it is known to leave those pages alone.
+            let dir = if held.is_empty() || args.first().is_some_and(|a| a == "vcs") {
+                open.dir.clone()
+            } else {
+                let staging = Staging::of(&open.dir, held)?;
+                let dir = staging.dir.clone();
+                self.assistant.command_staging = Some(staging);
+                dir
+            };
+            cmd.arg("-C").arg(&dir);
             self.assistant.command_base = Some((open.dir.clone(), open.project.clone()));
         }
         cmd.args(&args);
@@ -2577,6 +2693,7 @@ impl App {
     /// answer says so, so the assistant can ask before running it again.
     fn command_finish(&mut self, r: Result<String, String>) -> Result<String, String> {
         let base = self.assistant.command_base.take();
+        let staging = self.assistant.command_staging.take();
         let Some(open) = self.open.as_mut() else {
             return r;
         };
@@ -2586,6 +2703,21 @@ impl App {
         if open.dir != dir {
             // Another project was opened meanwhile; the command worked on the old one.
             return r;
+        }
+        if let Some(staging) = staging {
+            // What the command made of the copy: refused as a whole when it touches a page
+            // someone else holds (as they held it when it started), else written back.
+            let result = Open::load(&staging.dir)?;
+            if let Some(why) = crate::state::held_change_in(&result.project, &open.held_by_others, &staging.held) {
+                let said = match &r {
+                    Ok(t) | Err(t) => t.trim(),
+                };
+                return Err(format!(
+                    "The command's result was not kept, and nothing of it reached the project: {why}\n\n{said}"
+                ));
+            }
+            sync_tree(&staging.dir, &open.dir)
+                .map_err(|e| format!("The command's result could not be written to the project: {e}"))?;
         }
         let fresh = Open::load(&open.dir)?;
         // Pending window changes follow their terminals under the roles they were made with.
@@ -4889,6 +5021,107 @@ mod tests {
         meanwhile(a);
         let r = p.wait();
         a.agent_finish("run_command", &args, r)
+    }
+
+    /// Start `run_command` with `args` as [`command_around`] does.
+    fn command_with(a: &mut App, args: &[&str], meanwhile: impl FnOnce(&mut App)) -> Result<String, String> {
+        let args = json!({ "args": args });
+        let started = wc_agent::Tools::start(&mut AppTools(a), "run_command", &args);
+        assert!(
+            matches!(started, Started::Running(_)),
+            "run_command should run on a worker thread"
+        );
+        let Started::Running(p) = started else {
+            return Err("not started".into());
+        };
+        meanwhile(a);
+        let r = p.wait();
+        a.agent_finish("run_command", &args, r)
+    }
+
+    /// The folder a command started while a page is held works in.
+    fn staging_dir(a: &App) -> PathBuf {
+        a.assistant.command_staging.as_ref().unwrap().dir.clone()
+    }
+
+    #[test]
+    fn a_command_that_changes_a_held_page_changes_nothing() {
+        let (_tmp, mut a) = app(vec![]);
+        let dir = a.open.as_ref().unwrap().dir.clone();
+        let open = a.open.as_mut().unwrap();
+        open.held_by_others.insert("p0002".into(), "Ola".into());
+        let before = Open::load(&dir).unwrap().project;
+        let mut copy = None;
+        let r = command_with(&mut a, &["--help"], |a| {
+            let staging = staging_dir(a);
+            assert_ne!(staging, dir);
+            // The command draws on the held page, and fills in the customer too.
+            let mut disk = Open::load(&staging).unwrap();
+            disk.project.pages.iter_mut().find(|p| p.id == "p0002").unwrap().title = "Changed".into();
+            disk.project.meta.title_block.insert("customer".into(), "Disk".into());
+            disk.dirty = true;
+            disk.save().unwrap();
+            copy = Some(staging);
+        });
+        let e = r.unwrap_err();
+        assert!(e.contains("Ola") && e.contains("not kept"), "{e}");
+        assert_eq!(
+            Open::load(&dir).unwrap().project,
+            before,
+            "the project folder is untouched"
+        );
+        assert_eq!(a.open.as_ref().unwrap().project, before, "and so is the window");
+        assert!(!copy.unwrap().exists(), "the copy is cleaned up");
+    }
+
+    #[test]
+    fn a_command_that_leaves_held_pages_alone_is_kept_in_a_shared_session() {
+        let (_tmp, mut a) = app(vec![]);
+        let dir = a.open.as_ref().unwrap().dir.clone();
+        a.open
+            .as_mut()
+            .unwrap()
+            .held_by_others
+            .insert("p0002".into(), "Ola".into());
+        let r = command_with(&mut a, &["--help"], |a| {
+            let mut disk = Open::load(&staging_dir(a)).unwrap();
+            disk.project.meta.title_block.insert("customer".into(), "Disk".into());
+            disk.dirty = true;
+            disk.save().unwrap();
+        });
+        assert!(!format!("{r:?}").contains("not kept"), "{r:?}");
+        assert_eq!(customer(&a).as_deref(), Some("Disk"), "the command's change is loaded");
+        let disk = Open::load(&dir).unwrap();
+        assert_eq!(
+            disk.project.meta.title_block.get("customer").map(String::as_str),
+            Some("Disk")
+        );
+    }
+
+    #[test]
+    fn history_commands_that_write_are_refused_while_a_page_is_held() {
+        let (_tmp, mut a) = app(vec![]);
+        a.open
+            .as_mut()
+            .unwrap()
+            .held_by_others
+            .insert("p0002".into(), "Ola".into());
+        let v = json!({"args": ["vcs", "commit", "-m", "x"]});
+        let started = wc_agent::Tools::start(&mut AppTools(&mut a), "run_command", &v);
+        assert!(
+            matches!(&started, Started::Done(Err(e)) if e.contains("shared session")),
+            "a history write is refused straight away"
+        );
+        // Reading the history still runs, on the project folder itself.
+        let v = json!({"args": ["vcs", "log"]});
+        let started = wc_agent::Tools::start(&mut AppTools(&mut a), "run_command", &v);
+        assert!(matches!(started, Started::Running(_)), "reading the history runs");
+        assert!(a.assistant.command_staging.is_none());
+        let Started::Running(p) = started else {
+            return;
+        };
+        let r = p.wait();
+        let _ = a.agent_finish("run_command", &v, r);
     }
 
     fn customer(a: &App) -> Option<String> {

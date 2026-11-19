@@ -259,6 +259,25 @@ pub struct Open {
 /// The most Undo steps kept; older ones are dropped.
 const UNDO_STEPS: usize = 200;
 
+/// Why `project` may not be taken as it is: it changed or removed one of the pages someone
+/// else (`held_by_others`, page id to name) held when they were `before`.
+pub fn held_change_in(project: &Project, held_by_others: &BTreeMap<String, String>, before: &[Page]) -> Option<String> {
+    before.iter().find_map(|old| {
+        let who = held_by_others.get(&old.id).map_or("Someone", String::as_str);
+        match project.pages.iter().position(|p| p.id == old.id) {
+            None => Some(format!(
+                "it would remove page {}, which {who} has open; it is read-only here until they leave it.",
+                old.number
+            )),
+            Some(i) if project.pages[i] != *old => Some(format!(
+                "it would change page {}, which {who} has open; it is read-only here until they leave it.",
+                old.number
+            )),
+            Some(_) => None,
+        }
+    })
+}
+
 /// The history as it was before a library update, so a failed one leaves no trace in it.
 struct HistoryState {
     redo: Vec<Project>,
@@ -1660,20 +1679,7 @@ impl Open {
     /// Why a change is refused: it changed or removed one of the pages someone else held when
     /// [`Open::held_pages`] gave `before`.
     pub fn held_change(&self, before: &[Page]) -> Option<String> {
-        before.iter().find_map(|old| {
-            let who = self.held_by_others.get(&old.id).map_or("Someone", String::as_str);
-            match self.project.pages.iter().position(|p| p.id == old.id) {
-                None => Some(format!(
-                    "it would remove page {}, which {who} has open; it is read-only here until they leave it.",
-                    old.number
-                )),
-                Some(i) if self.project.pages[i] != *old => Some(format!(
-                    "it would change page {}, which {who} has open; it is read-only here until they leave it.",
-                    old.number
-                )),
-                Some(_) => None,
-            }
-        })
+        held_change_in(&self.project, &self.held_by_others, before)
     }
 
     /// Start a change that may be refused as a whole: the project and the symbols and parts
