@@ -372,6 +372,11 @@ fn shapes(
             }),
             // Scaled differently along x and y, a circle is an ellipse: drawn by its points.
             "CIRCLE" if !xf.keeps_circles() => {
+                // On a pin layer it marks a pin at its centre, which a symbol takes from the
+                // points as it does for POINT; the outline is drawn on a page like any other.
+                if is_pin_layer(&layer) {
+                    points.push((layer.clone(), q(e.f(10), e.f(20))));
+                }
                 let (unit, closed) = ellipse_points((0.0, 0.0), (1.0, 0.0), 1.0, 0.0, std::f64::consts::TAU);
                 stretched(e, &unit, closed, skipped)
             }
@@ -1758,24 +1763,6 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
     for (layer, s) in raw {
         match (is_pin_layer(&layer), &s) {
             (true, Shape::Circle { center, .. }) => pins.push((None, *center)),
-            // A pin circle in a block stretched along one axis comes as its closed outline.
-            (
-                true,
-                Shape::Polyline {
-                    points, closed: true, ..
-                },
-            ) if !points.is_empty() => {
-                let (lo, hi) = points.iter().fold(
-                    (Point::new(f64::MAX, f64::MAX), Point::new(f64::MIN, f64::MIN)),
-                    |(lo, hi), p| {
-                        (
-                            Point::new(lo.x.min(p.x), lo.y.min(p.y)),
-                            Point::new(hi.x.max(p.x), hi.y.max(p.y)),
-                        )
-                    },
-                );
-                pins.push((None, Point::new(lo.x / 2.0 + hi.x / 2.0, lo.y / 2.0 + hi.y / 2.0)));
-            }
             (true, Shape::Text { at, text, .. }) => labels.push((*at, text.clone())),
             (true, _) => {}
             (false, _) => graphics.push(s),
@@ -2056,7 +2043,9 @@ mod tests {
     fn a_pin_circle_in_a_stretched_block_is_still_a_pin() -> Result<()> {
         let blocks = "0\nBLOCK\n2\nP\n0\nCIRCLE\n8\nPIN\n10\n0\n20\n5\n40\n1\n\
                       0\nLINE\n8\n0\n10\n0\n20\n0\n11\n0\n21\n5\n0\nENDBLK\n";
-        let ents = "0\nINSERT\n2\nP\n10\n0\n20\n0\n41\n4\n42\n1\n0\nPOINT\n8\nPIN\n10\n0\n20\n0\n";
+        // A closed outline drawn on the pin layer is not a pin.
+        let ents = "0\nINSERT\n2\nP\n10\n0\n20\n0\n41\n4\n42\n1\n0\nPOINT\n8\nPIN\n10\n0\n20\n0\n\
+                    0\nLWPOLYLINE\n8\nPIN\n70\n1\n10\n10\n20\n10\n10\n12\n20\n10\n10\n12\n20\n12\n";
         let s = symbol(&dxf(ents, blocks), "my.stretched", "Stretched")?;
         assert_eq!(s.pins.len(), 2, "{:?}", s.pins);
         assert_eq!(s.pins[0].at.distance(s.pins[1].at), 5.0, "{:?}", s.pins);
