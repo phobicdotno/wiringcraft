@@ -529,6 +529,28 @@ mod tests {
         Ok(())
     }
 
+    /// A write or rename that fails for its own reasons is that I/O error, with the output
+    /// path, not a shared-session refusal; the staging file is gone afterwards.
+    #[test]
+    fn a_failed_rename_is_a_plain_io_error() -> TestResult {
+        let p = project()?;
+        let out = tempfile::tempdir()?;
+        let g = ProjectFiles::new(p.path());
+        // A folder with something in it at the output name: no file can take that name.
+        let file = out.path().join("list.csv");
+        std::fs::create_dir(&file)?;
+        std::fs::write(file.join("keep.txt"), "x")?;
+        let e = g.write(&file, b"list").err().ok_or("a file took a folder's name")?;
+        assert_ne!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+        assert!(e.to_string().contains(&file.display().to_string()), "{e}");
+        assert!(!e.to_string().contains("shared session"), "{e}");
+        let left = std::fs::read_dir(out.path())?
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().ends_with(".wc-tmp"));
+        assert!(!left);
+        Ok(())
+    }
+
     #[test]
     fn without_a_guard_writes_as_usual() -> TestResult {
         let out = tempfile::tempdir()?;
