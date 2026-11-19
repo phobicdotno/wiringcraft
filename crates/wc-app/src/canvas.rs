@@ -744,15 +744,21 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
     }
 
     // Revision clouds and the revision table, drawn from the same shapes as the PDF.
-    let revision_ink = Stroke::new(xf.len(0.25).max(0.8), t.ink);
-    for c in &page.clouds {
+    // A selected one is drawn in the selection colour, as a graphic is.
+    let revision_ink = |s: &Selection| {
+        let c = if ed.is_selected(s) { t.selection } else { t.ink };
+        Stroke::new(xf.len(0.25).max(0.8), c)
+    };
+    for (i, c) in page.clouds.iter().enumerate() {
+        let ink = revision_ink(&Selection::Cloud(i));
         for s in c.shapes() {
-            paint_shape(&painter, &xf, &s, revision_ink);
+            paint_shape(&painter, &xf, &s, ink);
         }
     }
     if let Some(at) = page.revision_table {
+        let ink = revision_ink(&Selection::RevisionTable);
         for s in wc_core::revision::table_shapes(&open.project.meta.revisions, at) {
-            paint_shape(&painter, &xf, &s, revision_ink);
+            paint_shape(&painter, &xf, &s, ink);
         }
     }
 

@@ -2106,6 +2106,24 @@ impl Open {
         Ok(())
     }
 
+    /// Why the revision rows of the properties dialog (`draft`, loaded as `loaded`) cannot be
+    /// applied, if they cannot: also when the project's revisions changed since the dialog
+    /// loaded them (someone else in a shared session), as the rows would put back what they
+    /// had then. Rows left as loaded are not applied, so they are never refused.
+    pub fn revision_draft_problem(&self, loaded: &[RevisionRow], draft: &[RevisionRow]) -> Option<String> {
+        if draft == loaded {
+            return None;
+        }
+        if RevisionRow::of(&self.project.meta.revisions) != loaded {
+            return Some(
+                "The revisions were changed by someone else since this dialog opened. Cancel and \
+                 open it again to edit them as they are now."
+                    .to_owned(),
+            );
+        }
+        self.revised(draft).err()
+    }
+
     /// The project's revisions as the rows of the properties dialog give them: a row with
     /// the letter it was loaded with (`was`) changes that revision, a row without one adds a
     /// revision after the others, and a revision no row has is removed. Refused with the reason

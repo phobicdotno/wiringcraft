@@ -108,23 +108,53 @@ fn ids(sel: &[Selection]) -> (BTreeSet<&str>, BTreeSet<&str>) {
 /// is no longer selected.
 /// Symbols and wires are left as they are.
 pub fn remap_graphics(sel: &mut Vec<Selection>, old: &[Shape], new: &[Shape]) {
+    remap_by_position(sel, old, new, |s| match s {
+        Selection::Graphic(i) => Some(i),
+        _ => None,
+    });
+}
+
+/// [`remap_graphics`] for revision clouds: a selected cloud is followed to where a merge put
+/// it, or let go when which one it is cannot be told.
+pub fn remap_clouds(
+    sel: &mut Vec<Selection>,
+    old: &[wc_core::revision::RevisionCloud],
+    new: &[wc_core::revision::RevisionCloud],
+) {
+    remap_by_position(sel, old, new, |s| match s {
+        Selection::Cloud(i) => Some(i),
+        _ => None,
+    });
+}
+
+/// Follow selections that name an item by its position in a list (`index` gives the position,
+/// or `None` for selections of other kinds) from the list `old` to `new`.
+fn remap_by_position<T: PartialEq>(
+    sel: &mut Vec<Selection>,
+    old: &[T],
+    new: &[T],
+    index: impl Fn(&mut Selection) -> Option<&mut usize>,
+) {
     if old == new {
         return;
     }
     sel.retain_mut(|s| {
-        let Selection::Graphic(i) = s else {
+        let Some(i) = index(s) else {
             return true;
         };
         let Some(item) = old.get(*i) else {
             return false;
         };
-        let copies = |list: &[Shape]| list.iter().filter(|x| *x == item).count();
+        let copies = |list: &[T]| list.iter().filter(|x| *x == item).count();
         if copies(old) != copies(new) {
             // Copies came or went: which one is the selected one is not known.
             return false;
         }
         // The how-many-th copy of this item it is, found again in the new list.
-        let nth = copies(&old[..*i]);
+        let Some(before) = old.get(..*i) else {
+            return false;
+        };
+        let nth = copies(before);
         match new.iter().enumerate().filter(|(_, x)| *x == item).nth(nth) {
             Some((j, _)) => {
                 *i = j;

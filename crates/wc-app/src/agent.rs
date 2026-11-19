@@ -701,8 +701,11 @@ impl Open {
             .or_else(|| self.project.pages.iter().position(|p| p.id == key))
     }
 
-    /// Item ids on a page as selections; unknown ids are an error.
-    fn selections(&self, page: usize, ids: &[String]) -> Result<Vec<Selection>, String> {
+    /// Item ids on a page as selections; unknown ids are an error. A revision cloud is named by
+    /// its position on the page, so only one selected on the user's screen (`selected_clouds`,
+    /// which follow their clouds through a merge) is taken: a position read earlier may name
+    /// another cloud by now.
+    fn selections(&self, page: usize, ids: &[String], selected_clouds: &[usize]) -> Result<Vec<Selection>, String> {
         let p = self.project.pages.get(page).ok_or("No such page.")?;
         if ids.is_empty() {
             return Err("`ids` is empty.".into());
@@ -717,6 +720,20 @@ impl Open {
                     && i < p.graphics.len()
                 {
                     Ok(Selection::Graphic(i))
+                } else if id.trim() == selection_id(&Selection::RevisionTable) && p.revision_table.is_some() {
+                    Ok(Selection::RevisionTable)
+                } else if let Some(i) = wc_report::cloud_index(id.trim())
+                    && i < p.clouds.len()
+                {
+                    if selected_clouds.contains(&i) {
+                        Ok(Selection::Cloud(i))
+                    } else {
+                        Err(format!(
+                            "{id:?} is not selected on the user's screen now: a cloud is named by its \
+                             place on the page, which a change by someone else can move. Ask the user \
+                             to select it."
+                        ))
+                    }
                 } else {
                     Err(format!("No item {id:?} on page {}.", p.number))
                 }
@@ -1142,6 +1159,21 @@ impl App {
         context
     }
 
+    /// The revision clouds selected on `page`, if it is the page shown.
+    fn selected_clouds(&self, page: usize) -> Vec<usize> {
+        if page != self.ed.page || self.ed.panel.is_some() {
+            return Vec::new();
+        }
+        self.ed
+            .selection
+            .iter()
+            .filter_map(|s| match s {
+                Selection::Cloud(i) => Some(*i),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Drop selected items that no longer exist.
     pub(crate) fn prune_selection(&mut self) {
         let Some(open) = &self.open else {
@@ -1396,7 +1428,7 @@ impl App {
                     Ok(format!("Added {}.", selection_id(&sel)))
                 } else {
                     let id = need_s(v, "id")?;
-                    let sel = open.selections(page, &[id.to_owned()])?;
+                    let sel = open.selections(page, &[id.to_owned()], &[])?;
                     let Some(Selection::Graphic(i)) = sel.first() else {
                         return Err(format!("{id} is not a free drawing."));
                     };
@@ -1411,8 +1443,9 @@ impl App {
             "delete_items" | "move_items" | "rotate_items" | "mirror_items" | "select_items" => {
                 let page = self.page_of(v, "page")?;
                 let ids = strings(v, "ids");
+                let clouds = self.selected_clouds(page);
                 let open = need_open(self.open.as_mut())?;
-                let sel = open.selections(page, &ids)?;
+                let sel = open.selections(page, &ids, &clouds)?;
                 match name {
                     "delete_items" => open.delete_many(page, &sel),
                     "move_items" => {
@@ -1441,7 +1474,7 @@ impl App {
                 if let Some(why) = open.held_reason(to) {
                     return Err(why);
                 }
-                let sel = open.selections(page, &strings(v, "ids"))?;
+                let sel = open.selections(page, &strings(v, "ids"), &[])?;
                 let clip = open.copy(page, &sel);
                 let at = match (num(v, "x"), num(v, "y")) {
                     (Some(x), Some(y)) => Point::new(x, y),
@@ -2470,7 +2503,7 @@ impl App {
                 Ok(format!("Inserted {} as {}.", entry.name, ids.join(", ")))
             }
             "save" => {
-                let sel = open.selections(page, &strings(v, "ids"))?;
+                let sel = open.selections(page, &strings(v, "ids"), &[])?;
                 let clip = open.copy(page, &sel);
                 let path = open.save_macro(&clip, need_s(v, "name")?, s(v, "description").unwrap_or_default())?;
                 Ok(format!("Saved the macro to {}.", path.display()))
@@ -4860,6 +4893,86 @@ mod tests {
         a.share = h;
         let out = call(&mut a, "add_page", json!({"title": "Pumps"})).unwrap();
         assert!(!out.contains("Pending"), "{out}");
+    }
+
+    #[test]
+    fn revision_clouds_and_the_table_are_named_cut_and_followed_safely() {
+        use crate::state::RevisionRow;
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        open.project.add_revision("A", "2026-11-19", "First issue", "").unwrap();
+        let p = |x, y| Point::new(x, y);
+        open.add_cloud(1, p(20.0, 20.0), p(60.0, 40.0)).unwrap();
+        open.add_cloud(1, p(100.0, 20.0), p(140.0, 40.0)).unwrap();
+        open.place_revision_table(1, p(200.0, 150.0)).unwrap();
+        let line = Shape::Line {
+            a: p(0.0, 0.0),
+            b: p(5.0, 0.0),
+        };
+        open.project.pages[1].graphics = vec![line.clone()];
+        a.ed.page = 1;
+
+        // The ids the state gives are taken back: the table at once, a cloud while selected.
+        let page = a.open.as_ref().unwrap().project.pages[1].number.clone();
+        call(
+            &mut a,
+            "move_items",
+            json!({"page": page, "ids": ["revision table"], "dx": 10, "dy": 0}),
+        )
+        .unwrap();
+        assert_eq!(
+            a.open.as_ref().unwrap().project.pages[1].revision_table,
+            Some(p(210.0, 150.0))
+        );
+        let err = call(
+            &mut a,
+            "move_items",
+            json!({"page": page, "ids": ["cloud 1"], "dx": 1, "dy": 0}),
+        )
+        .unwrap_err();
+        assert!(err.contains("not selected"), "{err}");
+        a.ed.selection = vec![Selection::Cloud(1)];
+        assert!(a.agent_context().contains("cloud 1"));
+        call(
+            &mut a,
+            "move_items",
+            json!({"page": page, "ids": ["cloud 1"], "dx": 1, "dy": 0}),
+        )
+        .unwrap();
+        assert_eq!(a.open.as_ref().unwrap().project.pages[1].clouds[1].min, p(101.0, 20.0));
+
+        // Cut of a drawing with a cloud and the table: the drawing goes to the clipboard, the
+        // cloud and the table (which Paste cannot bring back) stay, selected.
+        a.ed.selection = vec![Selection::Graphic(0), Selection::Cloud(0), Selection::RevisionTable];
+        a.run(Action::Cut);
+        let pg = &a.open.as_ref().unwrap().project.pages[1];
+        assert!(pg.graphics.is_empty());
+        assert_eq!((pg.clouds.len(), pg.revision_table.is_some()), (2, true));
+        assert_eq!(a.ed.selection, [Selection::Cloud(0), Selection::RevisionTable]);
+
+        // A selected cloud follows its cloud when one before it goes.
+        let old = a.open.as_ref().unwrap().project.pages[1].clouds.clone();
+        let new = vec![old[1].clone()];
+        let mut sel = vec![Selection::Cloud(1), Selection::Cloud(0), Selection::RevisionTable];
+        crate::edit::remap_clouds(&mut sel, &old, &new);
+        assert_eq!(sel, [Selection::Cloud(0), Selection::RevisionTable]);
+
+        // Revision rows edited after someone else changed the revisions are not applied.
+        let open = a.open.as_mut().unwrap();
+        let loaded = RevisionRow::of(&open.project.meta.revisions);
+        let mut draft = loaded.clone();
+        draft[0].text = "First issue, corrected".into();
+        assert_eq!(open.revision_draft_problem(&loaded, &draft), None);
+        open.project
+            .add_revision("B", "2026-11-20", "Added elsewhere", "")
+            .unwrap();
+        let why = open.revision_draft_problem(&loaded, &draft).unwrap();
+        assert!(why.contains("changed by someone else"), "{why}");
+        assert_eq!(
+            open.revision_draft_problem(&loaded, &loaded),
+            None,
+            "rows left alone are not applied"
+        );
     }
 
     #[test]
