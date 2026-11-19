@@ -744,7 +744,7 @@ enum ImportCmd {
     },
     /// Parts from an EDZ file (EPLAN Data Exchange archive, 7-Zip or zip): part number, maker,
     /// description and the EPLAN part properties. Each macro's multi-line representation,
-    /// variant A, becomes a library symbol (`eplan.<macro name>`) with its connection points as
+    /// variant A, becomes a library symbol (`eplan.<maker>.<macro name>`) with its connection points as
     /// pins, and each part gets the symbol made from the macro it names; what the macros leave
     /// out is reported. Pictures are counted.
     PartsEdz {
@@ -7924,13 +7924,13 @@ mod tests {
         std::fs::write(&file, w.finish().unwrap().into_inner()).unwrap();
         let lib = tmp.path().join("lib");
         // A folder where the symbol's file would go makes writing it fail.
-        std::fs::create_dir_all(lib.join("symbols").join("eplan.sie_3rt2015.json")).unwrap();
+        std::fs::create_dir_all(lib.join("symbols").join("eplan.sie.sie_3rt2015.json")).unwrap();
         let (n, report, warnings) = import_edz(&file, &lib, None).unwrap();
         assert_eq!(n, 1);
         assert!(
             warnings
                 .iter()
-                .any(|w| w.starts_with("symbol eplan.sie_3rt2015 not written")),
+                .any(|w| w.starts_with("symbol eplan.sie.sie_3rt2015 not written")),
             "{warnings:?}"
         );
         assert_eq!(report.part_macros[0].symbol, None);
@@ -7939,7 +7939,7 @@ mod tests {
         assert_eq!(p.symbol, None);
 
         // Once the symbol can be written, the part points at it and it loads back.
-        std::fs::remove_dir(lib.join("symbols").join("eplan.sie_3rt2015.json")).unwrap();
+        std::fs::remove_dir(lib.join("symbols").join("eplan.sie.sie_3rt2015.json")).unwrap();
         let (_, _, warnings) = import_edz(&file, &lib, None).unwrap();
         assert!(warnings.iter().all(|w| !w.contains("not written")), "{warnings:?}");
         let json = std::fs::read_to_string(lib.join("parts").join("sie.3rt2015.json")).unwrap();
