@@ -805,3 +805,25 @@ fn geometry_shared_by_parts_placed_only_in_a_loop_is_kept_once() {
     assert!(placed.cut);
     assert_eq!(placed.points.len(), 8);
 }
+
+#[test]
+fn a_loose_point_that_is_also_an_operator_origin_is_still_measured() {
+    // The representation lists both points; an identity operator takes the first as its
+    // origin. It is geometry too, so both are measured.
+    let text = step(
+        MM,
+        "#1=CARTESIAN_POINT('',(0.,0.,0.));\n#2=CARTESIAN_POINT('',(10.,20.,5.));\n\
+         #901=(GEOMETRIC_REPRESENTATION_CONTEXT(3) GLOBAL_UNIT_ASSIGNED_CONTEXT((#900)) REPRESENTATION_CONTEXT('',''));\n\
+         #300=SHAPE_REPRESENTATION('',(#1,#2),#901);\n\
+         #602=CARTESIAN_TRANSFORMATION_OPERATOR_3D('','','',$,$,#1,$,$);\n",
+    );
+    let (s, _) = size(&text);
+    assert_eq!(
+        s,
+        ModelSize {
+            width: 10.0,
+            height: 20.0,
+            depth: 5.0
+        }
+    );
+}

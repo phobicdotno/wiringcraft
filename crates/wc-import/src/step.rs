@@ -76,6 +76,21 @@ enum Value {
 }
 
 impl Value {
+    /// Every instance this value refers to, in lists and typed parameters too.
+    fn collect_refs(&self, out: &mut BTreeSet<u64>) {
+        match self {
+            Value::Ref(id) => {
+                out.insert(*id);
+            }
+            Value::List(items) | Value::Typed(_, items) => {
+                for item in items {
+                    item.collect_refs(out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn as_ref_id(&self) -> Option<u64> {
         match self {
             Value::Ref(id) => Some(*id),
@@ -222,18 +237,27 @@ pub fn model_size(text: &str) -> Result<(ModelSize, Vec<String>)> {
         ));
     }
     if pts.is_empty() {
-        // Else every loose point that is not the origin of a placement or of a transformation
-        // operator (its local origin, third of its last five attributes).
-        let origins: BTreeSet<u64> = instances
-            .values()
-            .flatten()
-            .filter_map(|(name, args)| match name.as_str() {
-                "AXIS2_PLACEMENT_3D" => args.get(1),
-                "CARTESIAN_TRANSFORMATION_OPERATOR_3D" => args.len().checked_sub(3).and_then(|i| args.get(i)),
-                _ => None,
-            })
-            .filter_map(Value::as_ref_id)
-            .collect();
+        // Else every loose point that is not only the origin of a placement or of a
+        // transformation operator (its local origin, third of its last five attributes): a point
+        // something else lists too, such as a representation, is geometry as well.
+        let origin_at = |name: &str, args: &[Value]| match name {
+            "AXIS2_PLACEMENT_3D" => Some(1),
+            "CARTESIAN_TRANSFORMATION_OPERATOR_3D" => args.len().checked_sub(3),
+            _ => None,
+        };
+        let mut origins: BTreeSet<u64> = BTreeSet::new();
+        let mut listed: BTreeSet<u64> = BTreeSet::new();
+        for (name, args) in instances.values().flatten() {
+            let at = origin_at(name, args);
+            for (k, arg) in args.iter().enumerate() {
+                if Some(k) == at {
+                    origins.extend(arg.as_ref_id());
+                } else {
+                    arg.collect_refs(&mut listed);
+                }
+            }
+        }
+        let origins: BTreeSet<u64> = origins.difference(&listed).copied().collect();
         for id in instances.keys().filter(|id| !origins.contains(id)) {
             if let Some(p) = point(*id) {
                 pts.push((*id, Geom::Point(p)));
