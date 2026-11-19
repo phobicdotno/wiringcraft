@@ -420,6 +420,7 @@ mod tests {
 
     /// No look before the write, as if the change came right after the app's look: a guard
     /// that knows nothing of the project's files.
+    #[cfg(unix)]
     fn blind() -> ProjectFiles {
         ProjectFiles {
             roots: vec![],
@@ -428,6 +429,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn no_temp_left(folder: &Path) -> io::Result<bool> {
         Ok(std::fs::read_dir(folder)?
             .filter_map(Result::ok)
