@@ -429,16 +429,15 @@ pub fn link_drawing(topo: &Topology, g: &Grid, net: &Network, w: f64) -> (Vec<Ve
         let (Some((bx, by)), Some((from_port, to_port, cable))) = (at(a), ends(a, k)) else {
             continue;
         };
-        // Loops over the same box nest, one above the other. A label stays inside the loop
-        // around it; the outermost one has the width of the box.
+        // Loops over the same box nest, one above the other, each label on its own line in
+        // the room over the box. A label may run across the legs of the loops around it and
+        // into half of the gaps either side, so even on a narrow box each of its port names
+        // and cable keeps a few letters.
         let nth = topo.own.iter().take(n).filter(|o| o.0 == a).count();
-        let outer = topo.own.iter().skip(n + 1).all(|o| o.0 != a);
         let count = topo.own.iter().filter(|o| o.0 == a).count();
         let (path, label_at) = own_path(bx, by, g.box_w, nth, count);
-        let room = match (outer, path.first(), path.last()) {
-            (false, Some(l), Some(r)) => r.0 - l.0 - 1.0,
-            _ => g.box_w - 2.0,
-        };
+        let c = label_at.0;
+        let room = 2.0 * (g.step_x / 2.0 - 1.0).min(c - left).min(right - c);
         let label = joined(&from_port, &to_port, &cable, room);
         labels.push(Label::new(label_at, 1, &label, room));
         paths.push(path.to_vec());
@@ -844,6 +843,32 @@ mod tests {
         };
         let (size, ..) = fits_its_sheet(&line);
         assert!(size.mm().0 > PageSize::A3.mm().0, "{size:?}");
+
+        // Two loops with long names on a box of that line, its boxes at their narrowest: every
+        // port name and cable keeps its first letters.
+        let mut looped = line.clone();
+        for (a, b) in [("P7", "P8"), ("P9", "P10")] {
+            let mut l = link(
+                &format!("-A15:{a}-A-VERY-LONG-PORT"),
+                &format!("-A15:{b}-A-VERY-LONG-PORT"),
+            );
+            l.cable = "-W123-A-VERY-LONG-CABLE-TAG".into();
+            looped.links.push(l);
+        }
+        let (size, g, topo) = fits_its_sheet(&looped);
+        assert!((g.box_w - MIN_BOX_W).abs() < 1e-9, "{g:?}");
+        let (_, labels) = link_drawing(&topo, &g, &looped, size.mm().0);
+        let joined: Vec<&Label> = labels.iter().filter(|l| l.text.contains(" - ")).collect();
+        assert_eq!(joined.len(), 2, "{labels:?}");
+        for l in joined {
+            let (ports, cable) = l.text.rsplit_once(' ').unwrap();
+            let (from, to) = ports.split_once(" - ").unwrap();
+            for (part, start) in [(from, "P"), (to, "P"), (cable, "-W1")] {
+                let kept = part.trim_end_matches("...");
+                assert!(kept.starts_with(start) && kept.len() >= 2, "{part:?} in {l:?}");
+            }
+        }
+        apart(&labels);
 
         let star = Network {
             nodes: std::iter::once(node("-K1"))
