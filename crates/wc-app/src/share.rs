@@ -2189,10 +2189,13 @@ impl RenameGroup {
 /// rename; the renames of one change are taken together, so `-K1` -> `-K11` and `-K11` ->
 /// `-K111` at once stay two renames. Renames the session has (`base` has the new tag, or no
 /// longer the old one) are dropped first, so a later rename never goes on from one of those.
+/// So are those whose new tag this copy (`local`) no longer has, undone or removed since: a
+/// device that later gets that tag is another device.
 fn note_renames(
     renames: &mut BTreeMap<wc_core::DeviceTag, wc_core::DeviceTag>,
     made: Vec<BTreeMap<wc_core::DeviceTag, wc_core::DeviceTag>>,
     base: &Project,
+    local: &Project,
 ) {
     // The new tag may be in the session still as the old tag of another rename (`-K1` ->
     // `-K11` while `-K11` -> `-K111`): that is no sign the session has this rename.
@@ -2218,6 +2221,7 @@ fn note_renames(
             }
         }
     }
+    renames.retain(|_, new| local.devices.contains_key(new));
 }
 
 impl Held {
@@ -3324,6 +3328,7 @@ impl Share {
             &mut self.device_renames,
             open.take_device_renames(),
             self.base.as_ref()?,
+            &open.project,
         );
         let held = Held::find_renamed(&open.project, self.base.as_ref()?, &waiting, &self.device_renames);
         if undo && !held.is_empty() {

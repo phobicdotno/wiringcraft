@@ -4299,18 +4299,24 @@ fn renames_made_here_are_followed_to_their_last_tag_until_the_session_has_them()
     base.devices.insert(k1.clone(), wc_core::Device::default());
     base.devices.insert(k5.clone(), wc_core::Device::default());
     let mut renames = BTreeMap::new();
-    note_renames(&mut renames, vec![one(&k1, &k2), one(&k2, &k3)], &base);
+    let mut local = base.clone();
+    local.rename_device(&k1, &k3);
+    note_renames(&mut renames, vec![one(&k1, &k2), one(&k2, &k3)], &base, &local);
     assert_eq!(renames, one(&k1, &k3));
     // Renamed back: no rename.
-    note_renames(&mut renames, vec![one(&k3, &k1)], &base);
+    note_renames(&mut renames, vec![one(&k3, &k1)], &base, &base);
     assert!(renames.is_empty());
     // One the session has is dropped.
-    note_renames(&mut renames, vec![one(&k5, &k2)], &base);
+    let mut local = base.clone();
+    local.rename_device(&k5, &k2);
+    note_renames(&mut renames, vec![one(&k5, &k2)], &base, &local);
     assert_eq!(renames.len(), 1);
-    let mut synced = base.clone();
-    synced.devices.remove(&k5);
-    synced.devices.insert(k2.clone(), wc_core::Device::default());
-    note_renames(&mut renames, Vec::new(), &synced);
+    note_renames(&mut renames, Vec::new(), &local, &local);
+    assert!(renames.is_empty());
+    // So is one taken back here (Undo): a device that gets -K2 later is another device.
+    note_renames(&mut renames, vec![one(&k5, &k2)], &base, &local);
+    assert_eq!(renames.len(), 1);
+    note_renames(&mut renames, Vec::new(), &base, &base);
     assert!(renames.is_empty());
     Ok(())
 }
@@ -4326,6 +4332,7 @@ fn a_rename_of_a_rename_the_session_has_is_a_rename_of_its_own() -> TestResult {
         &mut renames,
         vec![[(k1.clone(), k2.clone())].into_iter().collect()],
         &base,
+        &base,
     );
     // The session takes -K1 -> -K2; then -K2 is renamed -K3 here.
     let mut synced = base.clone();
@@ -4335,6 +4342,11 @@ fn a_rename_of_a_rename_the_session_has_is_a_rename_of_its_own() -> TestResult {
         &mut renames,
         vec![[(k2.clone(), k3.clone())].into_iter().collect()],
         &synced,
+        &{
+            let mut l = synced.clone();
+            l.rename_device(&k2, &k3);
+            l
+        },
     );
     assert_eq!(renames, [(k2.clone(), k3.clone())].into_iter().collect());
     // And it waits as a pair while the undrawn -K3 waits for its part.
@@ -4367,7 +4379,7 @@ fn undo_of_a_rename_of_a_waiting_rename_brings_the_device_between_back() -> Test
     let one = |a: &wc_core::DeviceTag, b: &wc_core::DeviceTag| -> BTreeMap<_, _> {
         [(a.clone(), b.clone())].into_iter().collect()
     };
-    note_renames(&mut renames, vec![one(&k1, &k2), one(&k2, &k3)], &base);
+    note_renames(&mut renames, vec![one(&k1, &k2), one(&k2, &k3)], &base, &open.project);
     let parts = waiting(&[item_name(ItemKind::Part, "acme.relay")]);
     let held = Held::find_renamed(&open.project, &base, &parts, &renames);
     assert_eq!(held.renames.len(), 1);
@@ -4410,10 +4422,10 @@ fn devices_renamed_onto_each_other_at_once_wait_together() -> TestResult {
     assert_eq!(made.len(), 2, "{made:?}");
     local.devices.get_mut(&k111).ok_or("no -K111")?.part = Some("acme.relay".into());
     let mut renames = BTreeMap::new();
-    note_renames(&mut renames, vec![made], &base);
+    note_renames(&mut renames, vec![made], &base, &local);
     assert_eq!(renames.len(), 2, "two renames, not one chain: {renames:?}");
     // Still two at the next sync: the session has -K11, but as the old side of the second.
-    note_renames(&mut renames, Vec::new(), &base);
+    note_renames(&mut renames, Vec::new(), &base, &local);
     assert_eq!(renames.len(), 2, "{renames:?}");
     let parts = waiting(&[item_name(ItemKind::Part, "acme.relay")]);
     let held = Held::find_renamed(&local, &base, &parts, &renames);
