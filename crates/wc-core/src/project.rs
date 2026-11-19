@@ -72,6 +72,10 @@ pub struct ProjectMeta {
     /// ([`crate::plc_rack`]).
     #[serde(default, rename = "rack", skip_serializing_if = "Vec::is_empty")]
     pub racks: Vec<crate::plc_rack::PlcRack>,
+    /// Fieldbus networks (PROFINET, EtherCAT, ...): their devices, addresses and cables
+    /// ([`crate::network`]).
+    #[serde(default, rename = "network", skip_serializing_if = "Vec::is_empty")]
+    pub networks: Vec<crate::network::Network>,
 }
 
 /// The project's logo: a JPEG or PNG file in the project folder. The title block shows it in
@@ -748,6 +752,7 @@ impl ProjectMeta {
             reports: Vec::new(),
             rules: Vec::new(),
             racks: Vec::new(),
+            networks: Vec::new(),
         }
     }
 
@@ -1986,6 +1991,9 @@ impl Project {
             if &j.strip == from {
                 j.strip = to.clone();
             }
+        }
+        for net in &mut self.meta.networks {
+            net.rename_device(from, to);
         }
         n
     }

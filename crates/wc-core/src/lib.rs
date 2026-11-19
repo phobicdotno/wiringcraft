@@ -14,6 +14,7 @@ pub mod geom;
 pub mod hash;
 pub mod lock;
 pub mod macros;
+pub mod network;
 pub mod numbering;
 pub mod panel;
 pub mod part;
