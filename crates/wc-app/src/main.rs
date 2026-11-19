@@ -18,6 +18,7 @@ mod live_check;
 mod panel_view;
 mod panels;
 mod prefs;
+mod racks_form;
 mod rules_form;
 mod screenshot;
 mod share;
@@ -81,6 +82,13 @@ enum Dialog {
         since: usize,
         before: wc_core::template::PageTemplate,
         /// The project's history count the draft last matched (see `Cover`).
+        seen: u64,
+    },
+    /// The PLC racks and their cards, shown in the project as they are typed (see `Template`).
+    Racks {
+        draft: Vec<wc_core::plc_rack::PlcRack>,
+        since: usize,
+        before: Vec<wc_core::plc_rack::PlcRack>,
         seen: u64,
     },
     PageProps {
@@ -319,7 +327,10 @@ impl App {
         // While an assistant command runs, its files are its own: nothing is sent, and a joined
         // copy waits, so the dirty project is not saved over the command's changes.
         let busy = ctx.input(|i| i.pointer.any_down())
-            || matches!(self.dialog, Some(Dialog::Cover { .. } | Dialog::Template { .. }))
+            || matches!(
+                self.dialog,
+                Some(Dialog::Cover { .. } | Dialog::Template { .. } | Dialog::Racks { .. })
+            )
             || self.assistant.command_running();
         self.share.set_command_running(self.assistant.command_running());
         self.sync_session_now(busy);
@@ -900,6 +911,15 @@ impl App {
                     seen: open.history_count(),
                 });
             }
+            Action::PlcRacks => {
+                let racks = open.project.meta.racks.clone();
+                self.dialog = Some(Dialog::Racks {
+                    draft: racks.clone(),
+                    since: open.start_live_form(),
+                    before: racks,
+                    seen: open.history_count(),
+                });
+            }
             Action::ExportPdf => self.dialog = Some(Dialog::Message(export_pdf(open))),
             Action::SaveMacro => {
                 let clip = open.copy(page, &self.ed.selection);
@@ -1115,6 +1135,7 @@ impl App {
             Dialog::ProjectProps { .. } => "Project properties",
             Dialog::Cover { .. } => "Cover page",
             Dialog::Template { .. } => "Page template",
+            Dialog::Racks { .. } => "PLC racks",
             Dialog::PageProps { .. } => "Page properties",
             Dialog::DeletePage(_) => "Delete page",
             Dialog::Text(..) => "Text",
@@ -1675,6 +1696,49 @@ impl App {
                         if ui.button("Cancel").clicked() {
                             if let Some(o) = self.open.as_mut() {
                                 o.revert_template(*since, before);
+                            }
+                            keep = false;
+                        }
+                    });
+                }
+                Dialog::Racks {
+                    draft,
+                    since,
+                    before,
+                    seen,
+                } => {
+                    // A change made elsewhere (an undo, the assistant) is shown in the form.
+                    if let Some(o) = self.open.as_ref()
+                        && o.history_count() != *seen
+                    {
+                        draft.clone_from(&o.project.meta.racks);
+                        *seen = o.history_count();
+                    }
+                    if racks_form::show(ui, draft)
+                        && let Some(o) = self.open.as_mut()
+                    {
+                        o.set_racks_live(draft);
+                        *seen = o.history_count();
+                    }
+                    let warnings = self.open.as_ref().map(rack_warnings).unwrap_or_default();
+                    let t = theme::Theme::of(ui.ctx());
+                    for w in &warnings {
+                        ui.label(RichText::new(w).color(t.warning));
+                    }
+                    ui.label(
+                        RichText::new(
+                            "The PLC cards report shows each change at once. The racks are kept \
+                             in project.toml.",
+                        )
+                        .color(t.faint),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("OK").clicked() {
+                            keep = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            if let Some(o) = self.open.as_mut() {
+                                o.revert_racks(*since, before);
                             }
                             keep = false;
                         }
@@ -2910,6 +2974,15 @@ fn form_fields(block: &std::collections::BTreeMap<String, String>) -> Vec<(Strin
         }
     }
     fields
+}
+
+/// What is wrong with the project's PLC racks, as the PLC cards report would say.
+fn rack_warnings(open: &Open) -> Vec<String> {
+    wc_report::plc_rack_warnings(&wc_report::Inputs {
+        project: &open.project,
+        symbols: &open.symbols,
+        parts: &open.parts,
+    })
 }
 
 fn export_pdf(open: &Open) -> String {

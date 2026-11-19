@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use wc_core::geom::{Point, Rotation};
 use wc_core::lock::ItemKind;
+use wc_core::plc_rack::PlcRack;
 use wc_core::project::PageSize;
 use wc_core::route::{self, Axis, Route};
 use wc_core::template::PageTemplate;
@@ -2207,21 +2208,53 @@ impl Open {
     /// cancelled), back to `before`. When the form's own undo step is the last one and holds
     /// nothing else, it is undone; otherwise the template alone is put back as a new step.
     pub fn revert_template(&mut self, since: usize, before: &PageTemplate) {
+        self.revert_meta(since, before, |m| &mut m.template);
+    }
+
+    /// Show `racks` as the project's PLC racks at once, as one undo step with the form's
+    /// other changes (see [`Open::set_template_live`]).
+    pub fn set_racks_live(&mut self, racks: &[PlcRack]) {
+        if self.project.meta.racks == racks {
+            return;
+        }
+        self.live_form_step();
+        self.project.meta.racks = racks.to_vec();
+    }
+
+    /// Take back what [`Open::set_racks_live`] changed since `since` (the form was
+    /// cancelled), back to `before`, as [`Open::revert_template`] does for the template.
+    pub fn revert_racks(&mut self, since: usize, before: &[PlcRack]) {
+        self.revert_meta(since, &before.to_vec(), |m| &mut m.racks);
+    }
+
+    /// Put the part of the project's settings that `field` picks back to `before` after a live
+    /// form was cancelled. When the form's own undo step is the last one and holds nothing
+    /// else, it is undone; otherwise that part alone is put back as a new step.
+    fn revert_meta<T: Clone + PartialEq>(
+        &mut self,
+        since: usize,
+        before: &T,
+        field: impl Fn(&mut wc_core::project::ProjectMeta) -> &mut T,
+    ) {
+        let mut now = self.project.meta.clone();
+        let current = field(&mut now).clone();
         let only_the_form = self.undo_mark() == since + 1
             && self.undo.last().is_some_and(|prev| {
                 let mut p = prev.clone();
-                p.meta.template.clone_from(&self.project.meta.template);
-                p == self.project && prev.meta.template == *before
+                let mut was = p.meta.clone();
+                let ok = *field(&mut was) == *before;
+                *field(&mut p.meta) = current.clone();
+                p == self.project && ok
             });
-        // When the undo cannot be done (the symbol files could not follow it), the template
-        // alone is put back below, so Cancel still leaves the template as it was.
+        // When the undo cannot be done (the symbol files could not follow it), that part alone
+        // is put back below, so Cancel still leaves it as it was.
         if only_the_form && self.undo() {
             self.redo.clear();
             return;
         }
-        if self.project.meta.template != *before {
+        if current != *before {
             self.checkpoint();
-            self.project.meta.template = before.clone();
+            *field(&mut self.project.meta) = before.clone();
         }
     }
 
@@ -4004,6 +4037,58 @@ pub(crate) mod tests {
         o.revert_template(since2, &before);
         assert_eq!(o.project.meta.template, before);
         assert!(!o.can_redo() && !o.can_undo());
+    }
+
+    #[test]
+    fn the_racks_form_saves_a_rack_with_two_cards_and_keeps_unknown_keys() {
+        use wc_core::plc_rack::PlcCard;
+        let (_tmp, mut o) = project();
+        // A rack written by hand, with a key this version does not know.
+        let toml = std::fs::read_to_string(o.dir.join("project.toml")).unwrap();
+        let hand = format!("{toml}\n[[rack]]\nname = \"-A1\"\nlocation = \"cabinet 2\"\n");
+        std::fs::write(o.dir.join("project.toml"), hand).unwrap();
+        o.project = store::load(&o.dir).unwrap();
+        let before = o.project.meta.racks.clone();
+        assert_eq!(before.len(), 1);
+
+        o.start_live_form();
+        let mut draft = before.clone();
+        let card = |slot, kind: &str, start: &str| PlcCard {
+            slot,
+            kind: kind.into(),
+            channels: 16,
+            start: start.into(),
+            ..PlcCard::default()
+        };
+        draft[0].cards.push(card(1, "DI 16x24 V DC", "%IX0.0"));
+        o.set_racks_live(&draft);
+        draft[0].cards.push(card(2, "DO 16x24 V DC", "%QX0.0"));
+        draft[0].description = "Main PLC".into();
+        o.set_racks_live(&draft);
+        assert_eq!(o.project.meta.racks, draft, "shown at once");
+        // The PLC cards report follows.
+        let inputs = wc_report::Inputs {
+            project: &o.project,
+            symbols: &o.symbols,
+            parts: &o.parts,
+        };
+        let cards = wc_report::build(wc_report::Kind::PlcCards, &inputs);
+        assert_eq!(cards.rows.len(), 32, "a row per channel of both cards");
+
+        o.save().unwrap();
+        let text = std::fs::read_to_string(o.dir.join("project.toml")).unwrap();
+        assert!(text.contains("location = \"cabinet 2\""), "{text}");
+        assert!(text.contains("%QX0.0") && text.contains("Main PLC"), "{text}");
+        assert_eq!(store::load(&o.dir).unwrap().meta.racks, draft);
+        assert!(o.undo(), "one step");
+        assert_eq!(o.project.meta.racks, before);
+
+        // Cancel takes the form's changes back.
+        let since2 = o.start_live_form();
+        o.set_racks_live(&draft);
+        o.revert_racks(since2, &before);
+        assert_eq!(o.project.meta.racks, before);
+        assert!(!o.can_redo());
     }
 
     /// The cover form's flow in `main.rs`: it refreshes its buffer when the history count moved

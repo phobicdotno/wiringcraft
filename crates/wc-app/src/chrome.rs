@@ -33,6 +33,7 @@ const MENUS: &[(&str, &[Option<Action>])] = &[
             Some(Action::Check),
             Some(Action::LiveCheck),
             Some(Action::Reports),
+            Some(Action::PlcRacks),
             Some(Action::ExportPdf),
             Some(Action::ExportDrawings),
             Some(Action::ExportAml),
