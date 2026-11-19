@@ -9,6 +9,9 @@
 //!
 //! The length unit is read from the file (millimetre, metre, inch, ...). The model's axes are
 //! taken as they are: x across the plate, y up it and z out of it.
+//!
+//! In an assembly each part is measured where it is placed, nested assemblies included (see
+//! the `assembly` module).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -18,6 +21,45 @@ use crate::{Error, Result, printable};
 
 /// Deepest nesting of brackets read in one entity.
 const MAX_NESTING: usize = 32;
+
+/// A piece of measured geometry: a point, or a whole circle or ellipse, kept as its centre and
+/// its two semi-axis vectors so it can be turned with its part and still be measured exactly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Geom {
+    Point([f64; 3]),
+    Conic { centre: [f64; 3], u: [f64; 3], v: [f64; 3] },
+}
+
+impl Geom {
+    /// The two corners of its box: on each axis k a conic spans its centre plus and minus
+    /// hypot(u_k, v_k).
+    fn bounds(&self) -> [[f64; 3]; 2] {
+        match *self {
+            Geom::Point(p) => [p, p],
+            Geom::Conic { centre, u, v } => {
+                let mut lo = centre;
+                let mut hi = centre;
+                for k in 0..3 {
+                    let e = u[k].hypot(v[k]);
+                    lo[k] -= e;
+                    hi[k] += e;
+                }
+                [lo, hi]
+            }
+        }
+    }
+}
+
+/// `r` made square to the unit axis `n`, of length 1, with how far it was from the axis (the
+/// length of n x r, the sine of the angle between them). (n x r) x n is r's part square to the
+/// axis, with no cancellation of a large along-axis part.
+fn square_to(n: [f64; 3], r: [f64; 3]) -> Option<([f64; 3], f64)> {
+    let side = cross(n, unit(r)?);
+    Some((unit(cross(side, n))?, dot(side, side).sqrt()))
+}
+
+/// Rounding noise, from a direction along an axis that is not tilted exactly the same.
+const NOISE: f64 = 64.0 * f64::EPSILON;
 
 /// One parameter of an entity instance.
 #[derive(Debug, Clone, PartialEq)]
@@ -34,6 +76,21 @@ enum Value {
 }
 
 impl Value {
+    /// Every instance this value refers to, in lists and typed parameters too.
+    fn collect_refs(&self, out: &mut BTreeSet<u64>) {
+        match self {
+            Value::Ref(id) => {
+                out.insert(*id);
+            }
+            Value::List(items) | Value::Typed(_, items) => {
+                for item in items {
+                    item.collect_refs(out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn as_ref_id(&self) -> Option<u64> {
         match self {
             Value::Ref(id) => Some(*id),
@@ -79,6 +136,7 @@ const READ: &[&str] = &[
     "LENGTH_MEASURE_WITH_UNIT",
     "ITEM_DEFINED_TRANSFORMATION",
     "MAPPED_ITEM",
+    "CARTESIAN_TRANSFORMATION_OPERATOR_3D",
     "GLOBAL_UNIT_ASSIGNED_CONTEXT",
 ];
 
@@ -107,7 +165,8 @@ pub fn model_size(text: &str) -> Result<(ModelSize, Vec<String>)> {
         coords(args.get(1)?)
     };
 
-    let mut pts: Vec<[f64; 3]> = Vec::new();
+    // Each point with the instance it was measured from, to place it in its assembly.
+    let mut pts: Vec<(u64, Geom)> = Vec::new();
     // The instances whose points are measured: their representations pick the length unit.
     let mut measured: BTreeSet<u64> = BTreeSet::new();
     let mut vertices = 0usize;
@@ -116,7 +175,7 @@ pub fn model_size(text: &str) -> Result<(ModelSize, Vec<String>)> {
             if name == "VERTEX_POINT"
                 && let Some(p) = args.get(1).and_then(Value::as_ref_id).and_then(point)
             {
-                pts.push(p);
+                pts.push((*id, Geom::Point(p)));
                 vertices += 1;
                 measured.insert(*id);
             }
@@ -124,15 +183,15 @@ pub fn model_size(text: &str) -> Result<(ModelSize, Vec<String>)> {
     }
     // Curves: whole circles and ellipses, and the control points of B-spline curves. They bound
     // a B-rep's round edges, and are the geometry of a wireframe model without vertices.
-    let mut curves: Vec<[f64; 3]> = Vec::new();
+    let mut curves: Vec<(u64, Geom)> = Vec::new();
     let mut doubtful = 0usize;
     for (id, inst) in &instances {
         for (name, args) in inst {
-            let found: Vec<[f64; 3]> = match name.as_str() {
-                "CIRCLE" | "ELLIPSE" => match conic_extent(&instances, name, args, &point) {
-                    Some((extent, unsure)) => {
+            let found: Vec<Geom> = match name.as_str() {
+                "CIRCLE" | "ELLIPSE" => match conic(&instances, name, args, &point) {
+                    Some((g, unsure)) => {
                         doubtful += usize::from(unsure);
-                        extent.to_vec()
+                        vec![g]
                     }
                     None => Vec::new(),
                 },
@@ -141,16 +200,16 @@ pub fn model_size(text: &str) -> Result<(ModelSize, Vec<String>)> {
                 "B_SPLINE_CURVE_WITH_KNOTS" | "BEZIER_CURVE" | "UNIFORM_CURVE" | "QUASI_UNIFORM_CURVE"
                     if inst.len() == 1 =>
                 {
-                    curve_points(args.get(2), &point)
+                    points(curve_points(args.get(2), &point))
                 }
-                "B_SPLINE_CURVE" => curve_points(args.get(1), &point),
+                "B_SPLINE_CURVE" => points(curve_points(args.get(1), &point)),
                 // A wireframe's straight edges: its corner points.
-                "POLYLINE" => curve_points(args.get(1), &point),
+                "POLYLINE" => points(curve_points(args.get(1), &point)),
                 _ => Vec::new(),
             };
             if !found.is_empty() {
                 measured.insert(*id);
-                curves.extend(found);
+                curves.extend(found.into_iter().map(|g| (*id, g)));
             }
         }
     }
@@ -162,7 +221,7 @@ pub fn model_size(text: &str) -> Result<(ModelSize, Vec<String>)> {
                     && let Some(list) = args.get(2).and_then(Value::as_list)
                 {
                     let before = pts.len();
-                    pts.extend(list.iter().filter_map(coords));
+                    pts.extend(list.iter().filter_map(coords).map(|p| (*id, Geom::Point(p))));
                     if pts.len() > before {
                         measured.insert(*id);
                     }
@@ -178,16 +237,30 @@ pub fn model_size(text: &str) -> Result<(ModelSize, Vec<String>)> {
         ));
     }
     if pts.is_empty() {
-        // Else every loose point that is not the origin of a placement.
-        let origins: BTreeSet<u64> = instances
-            .values()
-            .flatten()
-            .filter(|(name, _)| name == "AXIS2_PLACEMENT_3D")
-            .filter_map(|(_, args)| args.get(1).and_then(Value::as_ref_id))
-            .collect();
+        // Else every loose point that is not only the origin of a placement or of a
+        // transformation operator (its local origin, third of its last five attributes): a point
+        // something else lists too, such as a representation, is geometry as well.
+        let origin_at = |name: &str, args: &[Value]| match name {
+            "AXIS2_PLACEMENT_3D" => Some(1),
+            "CARTESIAN_TRANSFORMATION_OPERATOR_3D" => args.len().checked_sub(3),
+            _ => None,
+        };
+        let mut origins: BTreeSet<u64> = BTreeSet::new();
+        let mut listed: BTreeSet<u64> = BTreeSet::new();
+        for (name, args) in instances.values().flatten() {
+            let at = origin_at(name, args);
+            for (k, arg) in args.iter().enumerate() {
+                if Some(k) == at {
+                    origins.extend(arg.as_ref_id());
+                } else {
+                    arg.collect_refs(&mut listed);
+                }
+            }
+        }
+        let origins: BTreeSet<u64> = origins.difference(&listed).copied().collect();
         for id in instances.keys().filter(|id| !origins.contains(id)) {
             if let Some(p) = point(*id) {
-                pts.push(p);
+                pts.push((*id, Geom::Point(p)));
                 measured.insert(*id);
             }
         }
@@ -201,23 +274,30 @@ pub fn model_size(text: &str) -> Result<(ModelSize, Vec<String>)> {
     let (mm, unit_warning) = length_unit(text, &instances, &measured);
     warnings.extend(unit_warning);
 
-    let placed = instances
-        .values()
-        .flatten()
-        .filter(|(name, _)| name == "MAPPED_ITEM" || name == "ITEM_DEFINED_TRANSFORMATION")
-        .count();
-    if placed > 0 {
+    // An assembly's parts, each moved to where it is placed.
+    let placed = assembly::place(text, &instances, pts, &point);
+    if placed.missed > 0 {
         warnings.push(format!(
-            "the model is an assembly ({placed} placed parts); their placements are not applied, so its size may be off"
+            "the model is an assembly ({} placed parts); {} of its placements could not be applied, so its size may be off",
+            placed.placements, placed.missed
         ));
     }
+    if placed.cut {
+        warnings.push(
+            "the assembly nests too deep, places its parts in a loop or uses too many of them; \
+             some parts were measured where they are drawn or by their own box, so its size may be off"
+                .into(),
+        );
+    }
+    let pts = placed.points;
 
     let mut min = [f64::INFINITY; 3];
     let mut max = [f64::NEG_INFINITY; 3];
-    for p in &pts {
+    for g in &pts {
+        let [lo, hi] = g.bounds();
         for k in 0..3 {
-            min[k] = min[k].min(p[k]);
-            max[k] = max[k].max(p[k]);
+            min[k] = min[k].min(lo[k]);
+            max[k] = max[k].max(hi[k]);
         }
     }
     let size = ModelSize {
@@ -253,6 +333,10 @@ fn coords(v: &Value) -> Option<[f64; 3]> {
     }
 }
 
+fn points(list: Vec<[f64; 3]>) -> Vec<Geom> {
+    list.into_iter().map(Geom::Point).collect()
+}
+
 /// The points of a curve's control list.
 fn curve_points(list: Option<&Value>, point: &impl Fn(u64) -> Option<[f64; 3]>) -> Vec<[f64; 3]> {
     list.and_then(Value::as_list)
@@ -260,15 +344,15 @@ fn curve_points(list: Option<&Value>, point: &impl Fn(u64) -> Option<[f64; 3]>) 
         .unwrap_or_default()
 }
 
-/// The two corners of the box around a whole circle or ellipse. Its first semi-axis runs along
-/// the placement's reference direction `u` and its second along `v` = axis x `u`; on each model
-/// axis k the curve spans its centre plus and minus hypot(a u_k, b v_k).
-fn conic_extent(
+/// A whole circle or ellipse as its centre and semi-axis vectors: the first semi-axis runs
+/// along the placement's reference direction `u` and the second along `v` = axis x `u`. With
+/// whether its turn about the axis is in doubt.
+fn conic(
     instances: &BTreeMap<u64, Instance>,
     name: &str,
     args: &[Value],
     point: &impl Fn(u64) -> Option<[f64; 3]>,
-) -> Option<([[f64; 3]; 2], bool)> {
+) -> Option<(Geom, bool)> {
     let (a, b) = match name {
         "CIRCLE" => {
             let r = args.get(2)?.as_num()?;
@@ -296,14 +380,8 @@ fn conic_extent(
     let n = unit(direction(placement.get(2))?.unwrap_or([0.0, 0.0, 1.0]))?;
     // The reference direction made square to the axis; without a usable one, any direction in
     // the curve's plane (the standard's own default).
-    // (n x r) x n is r's part square to the axis, of length sin(angle), with no cancellation
-    // of the large along-axis part; with the length of n x r, to tell how far from the axis.
-    let along = |r: [f64; 3]| -> Option<([f64; 3], f64)> {
-        let side = cross(n, unit(r)?);
-        Some((unit(cross(side, n))?, dot(side, side).sqrt()))
-    };
-    // Rounding noise, from a direction along the axis that is not tilted exactly the same.
-    let noise = 64.0 * f64::EPSILON;
+    let along = |r: [f64; 3]| square_to(n, r);
+    let noise = NOISE;
     // The file's own reference direction is taken however close to the axis it lies, as long
     // as it is not on it; one that close to the axis that rounding could have made it is
     // reported, as the curve's turn about its axis may then be off.
@@ -321,14 +399,14 @@ fn conic_extent(
             .map(|(u, _)| u)?,
     };
     let v = cross(n, u);
-    let mut lo = centre;
-    let mut hi = centre;
-    for k in 0..3 {
-        let e = (a * u[k]).hypot(b * v[k]);
-        lo[k] -= e;
-        hi[k] += e;
-    }
-    Some(([lo, hi], doubtful))
+    Some((
+        Geom::Conic {
+            centre,
+            u: [a * u[0], a * u[1], a * u[2]],
+            v: [b * v[0], b * v[1], b * v[2]],
+        },
+        doubtful,
+    ))
 }
 
 fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
@@ -806,6 +884,8 @@ impl Parser<'_> {
         }
     }
 }
+
+mod assembly;
 
 #[cfg(test)]
 mod tests;

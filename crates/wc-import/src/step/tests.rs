@@ -326,3 +326,567 @@ fn hostile_text_is_refused_without_a_panic() {
         assert!(model_size(&step(MM, &data)).is_err(), "{}", &data[..data.len().min(80)]);
     }
 }
+
+/// One 10 x 20 x 5 mm box drawn as its own part (representation #300, origin #320), and an
+/// assembly (#400) with `placements`, `uses` and further entities in `rest`.
+fn assembly(uses: &[&str], placements: &str, rest: &str) -> String {
+    let part = box_vertices([0.0; 3], [10.0, 20.0, 5.0]);
+    let vertices: Vec<String> = (1..=8).map(|k| format!("#{}", 2 * k)).collect();
+    step(
+        MM,
+        &format!(
+            "{part}#321=CARTESIAN_POINT('',(0.,0.,0.));\n#320=AXIS2_PLACEMENT_3D('',#321,$,$);\n\
+             #901=(GEOMETRIC_REPRESENTATION_CONTEXT(3) GLOBAL_UNIT_ASSIGNED_CONTEXT((#900)) REPRESENTATION_CONTEXT('',''));\n\
+             #300=ADVANCED_BREP_SHAPE_REPRESENTATION('',(#320,{}),#901);\n\
+             #400=SHAPE_REPRESENTATION('',({}),#901);\n{placements}{rest}",
+            vertices.join(","),
+            uses.join(",")
+        ),
+    )
+}
+
+/// An axis placement `id` at `at`, with axis `z` and reference direction `x`.
+fn axis(id: u32, at: [f64; 3], z: [f64; 3], x: [f64; 3]) -> String {
+    format!(
+        "#{id}=AXIS2_PLACEMENT_3D('',#{},#{},#{});\n#{}=CARTESIAN_POINT('',({:?},{:?},{:?}));\n#{}=DIRECTION('',({:?},{:?},{:?}));\n#{}=DIRECTION('',({:?},{:?},{:?}));\n",
+        id + 1,
+        id + 2,
+        id + 3,
+        id + 1,
+        at[0],
+        at[1],
+        at[2],
+        id + 2,
+        z[0],
+        z[1],
+        z[2],
+        id + 3,
+        x[0],
+        x[1],
+        x[2]
+    )
+}
+
+/// The part placed in the assembly at placement `to` by relationship `id`, with the
+/// transformation's two placements in the order given.
+fn placed_by_relationship(id: u32, a: u32, b: u32) -> String {
+    format!(
+        "#{id}=(REPRESENTATION_RELATIONSHIP('','',#300,#400) REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#{}) SHAPE_REPRESENTATION_RELATIONSHIP());\n#{}=ITEM_DEFINED_TRANSFORMATION('','',#{a},#{b});\n",
+        id + 1,
+        id + 1
+    )
+}
+
+const Z: [f64; 3] = [0.0, 0.0, 1.0];
+const X: [f64; 3] = [1.0, 0.0, 0.0];
+
+#[test]
+fn an_assembly_measures_its_parts_where_they_are_placed() {
+    // Two uses of the box, side by side: x 0..10 and 30..40.
+    let text = assembly(
+        &["#410", "#420"],
+        &format!(
+            "{}{}{}{}",
+            axis(410, [0.0; 3], Z, X),
+            axis(420, [30.0, 0.0, 0.0], Z, X),
+            placed_by_relationship(500, 320, 410),
+            placed_by_relationship(510, 320, 420)
+        ),
+        "",
+    );
+    let (s, warnings) = size(&text);
+    assert_eq!(
+        s,
+        ModelSize {
+            width: 40.0,
+            height: 20.0,
+            depth: 5.0
+        }
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn a_part_turned_a_quarter_swaps_its_width_and_height() {
+    // Its x axis along the assembly's y.
+    let turned = axis(420, [100.0, 0.0, 0.0], Z, [0.0, 1.0, 0.0]);
+    let quarter = ModelSize {
+        width: 20.0,
+        height: 10.0,
+        depth: 5.0,
+    };
+    let text = assembly(
+        &["#420"],
+        &format!("{turned}{}", placed_by_relationship(510, 320, 420)),
+        "",
+    );
+    assert_eq!(size(&text).0, quarter);
+    // Writers that list the placements the other way round: told apart by which
+    // representation each placement belongs to.
+    let text = assembly(
+        &["#420"],
+        &format!("{turned}{}", placed_by_relationship(510, 420, 320)),
+        "",
+    );
+    let (s, warnings) = size(&text);
+    assert_eq!(s, quarter);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    // The same with a mapped item.
+    let text = assembly(
+        &["#600"],
+        &turned,
+        "#601=REPRESENTATION_MAP(#320,#300);\n#600=MAPPED_ITEM('',#601,#420);\n",
+    );
+    let (s, warnings) = size(&text);
+    assert_eq!(s, quarter);
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn nested_assemblies_add_up_their_placements() {
+    // The box in a sub-assembly (#700) shifted 50 along x and 7 along y, and the sub-assembly
+    // used twice in the top assembly, the second 100 further along y and lying on its back (z
+    // down, y flipped): the inner shift must turn with it.
+    let text = assembly(
+        &["#410", "#420"],
+        &format!(
+            "{}{}{}{}{}{}",
+            axis(410, [0.0; 3], Z, X),
+            axis(420, [0.0, 100.0, 0.0], [0.0, 0.0, -1.0], X),
+            axis(710, [50.0, 7.0, 0.0], Z, X),
+            axis(720, [0.0; 3], Z, X),
+            "#700=SHAPE_REPRESENTATION('',(#710,#720),#901);\n#750=(REPRESENTATION_RELATIONSHIP('','',#300,#700) REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#751) SHAPE_REPRESENTATION_RELATIONSHIP());\n#751=ITEM_DEFINED_TRANSFORMATION('','',#320,#710);\n",
+            "#760=(REPRESENTATION_RELATIONSHIP('','',#700,#400) REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#761) SHAPE_REPRESENTATION_RELATIONSHIP());\n#761=ITEM_DEFINED_TRANSFORMATION('','',#720,#410);\n#770=(REPRESENTATION_RELATIONSHIP('','',#700,#400) REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#771) SHAPE_REPRESENTATION_RELATIONSHIP());\n#771=ITEM_DEFINED_TRANSFORMATION('','',#720,#420);\n"
+        ),
+        "",
+    );
+    let (s, warnings) = size(&text);
+    // x 50..60; y 7..27 and, flipped about x, 73..93; z 0..5 and -5..0.
+    assert_eq!(
+        s,
+        ModelSize {
+            width: 10.0,
+            height: 86.0,
+            depth: 10.0
+        }
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn placements_in_a_loop_end_with_a_warning() {
+    // The part placed in the assembly and the assembly placed back in the part.
+    let text = assembly(
+        &["#410"],
+        &format!(
+            "{}{}#530=(REPRESENTATION_RELATIONSHIP('','',#400,#300) REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#531) SHAPE_REPRESENTATION_RELATIONSHIP());\n#531=ITEM_DEFINED_TRANSFORMATION('','',#410,#320);\n",
+            axis(410, [5.0, 0.0, 0.0], Z, X),
+            placed_by_relationship(500, 320, 410),
+        ),
+        "",
+    );
+    let (s, warnings) = size(&text);
+    assert!(s.is_usable());
+    assert!(warnings.join("\n").contains("in a loop"), "{warnings:?}");
+}
+
+#[test]
+fn a_circle_turned_by_a_placement_keeps_its_size() {
+    // Two radius-10 circles 5 mm apart along z, in a part stood up (its z along x) and turned
+    // 45 degrees about that: the circles lie in the y-z plane, exactly 20 across both ways.
+    let r = std::f64::consts::FRAC_1_SQRT_2;
+    let text = step(
+        MM,
+        &format!(
+            "#1=CARTESIAN_POINT('',(0.,0.,0.));\n#2=AXIS2_PLACEMENT_3D('',#1,$,$);\n#3=CIRCLE('',#2,10.);\n\
+             #4=CARTESIAN_POINT('',(0.,0.,5.));\n#5=AXIS2_PLACEMENT_3D('',#4,$,$);\n#6=CIRCLE('',#5,10.);\n\
+             #321=CARTESIAN_POINT('',(0.,0.,0.));\n#320=AXIS2_PLACEMENT_3D('',#321,$,$);\n\
+             #901=(GEOMETRIC_REPRESENTATION_CONTEXT(3) GLOBAL_UNIT_ASSIGNED_CONTEXT((#900)) REPRESENTATION_CONTEXT('',''));\n\
+             #300=SHAPE_REPRESENTATION('',(#320,#3,#6),#901);\n#400=SHAPE_REPRESENTATION('',(#420),#901);\n{}{}",
+            axis(420, [50.0, 0.0, 0.0], X, [0.0, r, r]),
+            placed_by_relationship(510, 320, 420)
+        ),
+    );
+    let (s, warnings) = size(&text);
+    assert!(
+        (s.width - 5.0).abs() < 1e-9 && (s.height - 20.0).abs() < 1e-9 && (s.depth - 20.0).abs() < 1e-9,
+        "{s:?}"
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn a_reference_direction_close_to_the_axis_still_gives_the_turn() {
+    // Its part square to the axis points along y: the part's x runs along the assembly's y.
+    let text = assembly(
+        &["#420"],
+        &format!(
+            "{}{}",
+            axis(420, [0.0; 3], Z, [0.0, 0.00001, 1.0]),
+            placed_by_relationship(510, 320, 420)
+        ),
+        "",
+    );
+    assert_eq!(
+        size(&text).0,
+        ModelSize {
+            width: 20.0,
+            height: 10.0,
+            depth: 5.0
+        }
+    );
+}
+
+#[test]
+fn a_relationship_written_as_one_record_is_read() {
+    let single = |id: u32, to: u32| {
+        format!(
+            "#{id}=REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION('','',#300,#400,#{});\n#{}=ITEM_DEFINED_TRANSFORMATION('','',#320,#{to});\n",
+            id + 1,
+            id + 1
+        )
+    };
+    let text = assembly(
+        &["#410", "#420"],
+        &format!(
+            "{}{}{}{}",
+            axis(410, [0.0; 3], Z, X),
+            axis(420, [30.0, 0.0, 0.0], Z, X),
+            single(500, 410),
+            single(510, 420)
+        ),
+        "",
+    );
+    let (s, warnings) = size(&text);
+    assert_eq!(s.width, 40.0);
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn a_placement_used_twice_does_not_hide_one_that_failed() {
+    // #501 places the part twice; #521 names a placement that does not exist.
+    let text = assembly(
+        &["#410"],
+        &format!(
+            "{}{}#510=(REPRESENTATION_RELATIONSHIP('','',#300,#400) REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#501) SHAPE_REPRESENTATION_RELATIONSHIP());\n\
+             #520=(REPRESENTATION_RELATIONSHIP('','',#300,#400) REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#521) SHAPE_REPRESENTATION_RELATIONSHIP());\n\
+             #521=ITEM_DEFINED_TRANSFORMATION('','',#320,#999);\n",
+            axis(410, [0.0; 3], Z, X),
+            placed_by_relationship(500, 320, 410),
+        ),
+        "",
+    );
+    let (_, warnings) = size(&text);
+    assert!(
+        warnings.join("\n").contains("1 of its placements could not be applied"),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn geometry_two_representations_share_is_measured_in_both() {
+    // A second part representation (#310) lists the same box vertices as #300; each is placed
+    // once, at x 0 and 30.
+    let vertices: Vec<String> = (1..=8).map(|k| format!("#{}", 2 * k)).collect();
+    let text = assembly(
+        &["#410", "#420"],
+        &format!(
+            "{}{}#310=ADVANCED_BREP_SHAPE_REPRESENTATION('',(#311,{}),#901);\n#311=AXIS2_PLACEMENT_3D('',#321,$,$);\n{}\
+             #510=(REPRESENTATION_RELATIONSHIP('','',#310,#400) REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#511) SHAPE_REPRESENTATION_RELATIONSHIP());\n\
+             #511=ITEM_DEFINED_TRANSFORMATION('','',#311,#420);\n",
+            axis(410, [0.0; 3], Z, X),
+            axis(420, [30.0, 0.0, 0.0], Z, X),
+            vertices.join(","),
+            placed_by_relationship(500, 320, 410),
+        ),
+        "",
+    );
+    let (s, warnings) = size(&text);
+    assert_eq!(
+        s,
+        ModelSize {
+            width: 40.0,
+            height: 20.0,
+            depth: 5.0
+        }
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn a_mapped_item_can_target_a_transformation_operator() {
+    // Two uses of the box through operators: one at x 0, one at x 30 turned a quarter about z
+    // (axis1 along y) and scaled by 2, so 40 wide and 20 deep from x 30 back to x -10.
+    let text = assembly(
+        &["#600", "#610"],
+        "#601=REPRESENTATION_MAP(#320,#300);\n\
+         #600=MAPPED_ITEM('',#601,#602);\n\
+         #602=CARTESIAN_TRANSFORMATION_OPERATOR_3D('','','',$,$,#603,$,$);\n\
+         #603=CARTESIAN_POINT('',(0.,0.,0.));\n\
+         #610=MAPPED_ITEM('',#601,#612);\n\
+         #612=CARTESIAN_TRANSFORMATION_OPERATOR_3D('','','',#614,$,#613,2.,$);\n\
+         #613=CARTESIAN_POINT('',(30.,0.,0.));\n\
+         #614=DIRECTION('',(0.,1.,0.));\n",
+        "",
+    );
+    let (s, warnings) = size(&text);
+    // x: 0..10 and 30-40..30, so -10..30; y: 0..20 and 0..20; z: 0..5 and 0..10.
+    assert_eq!(
+        s,
+        ModelSize {
+            width: 40.0,
+            height: 20.0,
+            depth: 10.0
+        }
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn an_origin_both_representations_list_does_not_swap_the_placements() {
+    // The parent also lists the part's origin #320; the file keeps the standard order. The
+    // part's x, y and z go to the assembly's y, z and x: swapped, the turn would go the other
+    // way round and give 20 x 5 x 10.
+    let turned = axis(420, [100.0, 0.0, 0.0], X, [0.0, 1.0, 0.0]);
+    let text = assembly(
+        &["#420", "#320"],
+        &format!("{turned}{}", placed_by_relationship(510, 320, 420)),
+        "",
+    );
+    let (s, warnings) = size(&text);
+    assert_eq!(
+        s,
+        ModelSize {
+            width: 5.0,
+            height: 10.0,
+            depth: 20.0
+        }
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn an_operator_without_axis2_takes_the_world_y() {
+    // axis1 along -x and no axis2: y stays the world's y (a mirror), as the standard's default
+    // has it. The box at (0, 30, 0) then spans x -10..0 and y 30..50, next to a copy as drawn.
+    let text = assembly(
+        &["#600", "#610"],
+        "#601=REPRESENTATION_MAP(#320,#300);\n\
+         #600=MAPPED_ITEM('',#601,#602);\n\
+         #602=CARTESIAN_TRANSFORMATION_OPERATOR_3D('','','',$,$,#603,$,$);\n\
+         #603=CARTESIAN_POINT('',(0.,0.,0.));\n\
+         #610=MAPPED_ITEM('',#601,#612);\n\
+         #612=CARTESIAN_TRANSFORMATION_OPERATOR_3D('','','',#614,$,#613,$,$);\n\
+         #613=CARTESIAN_POINT('',(0.,30.,0.));\n\
+         #614=DIRECTION('',(-1.,0.,0.));\n",
+        "",
+    );
+    let (s, warnings) = size(&text);
+    assert_eq!(
+        s,
+        ModelSize {
+            width: 20.0,
+            height: 50.0,
+            depth: 5.0
+        }
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn representations_in_different_contexts_are_not_drawn_together() {
+    // #350 is related to the part without a transformation but drawn in another context: it is
+    // not moved with the part (to x 30), and its point stays at x 500.
+    let text = assembly(
+        &["#410"],
+        &format!(
+            "{}{}",
+            axis(410, [30.0, 0.0, 0.0], Z, X),
+            placed_by_relationship(500, 320, 410)
+        ),
+        "#902=(GEOMETRIC_REPRESENTATION_CONTEXT(3) GLOBAL_UNIT_ASSIGNED_CONTEXT((#900)) REPRESENTATION_CONTEXT('',''));\n\
+         #360=CARTESIAN_POINT('',(500.,0.,0.));\n#361=VERTEX_POINT('',#360);\n\
+         #350=SHAPE_REPRESENTATION('',(#361),#902);\n\
+         #355=SHAPE_REPRESENTATION_RELATIONSHIP('','',#350,#300);\n",
+    );
+    let (s, _) = size(&text);
+    assert_eq!(s.width, 470.0, "{s:?}");
+}
+
+#[test]
+fn a_relationship_whose_transformation_is_missing_warns() {
+    let text = assembly(
+        &["#410"],
+        &format!(
+            "{}#510=(REPRESENTATION_RELATIONSHIP('','',#300,#400) REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#999) SHAPE_REPRESENTATION_RELATIONSHIP());\n",
+            axis(410, [0.0; 3], Z, X),
+        ),
+        "",
+    );
+    let (_, warnings) = size(&text);
+    assert!(
+        warnings.join("\n").contains("1 of its placements could not be applied"),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn a_loose_point_model_does_not_measure_an_operator_origin() {
+    // Loose points 10 x 20 x 5 apart, mapped 100 along each axis by an operator whose origin
+    // is a point of its own.
+    let text = step(
+        MM,
+        "#1=CARTESIAN_POINT('',(100.,100.,100.));\n#2=CARTESIAN_POINT('',(110.,120.,105.));\n\
+         #321=CARTESIAN_POINT('',(0.,0.,0.));\n#320=AXIS2_PLACEMENT_3D('',#321,$,$);\n\
+         #901=(GEOMETRIC_REPRESENTATION_CONTEXT(3) GLOBAL_UNIT_ASSIGNED_CONTEXT((#900)) REPRESENTATION_CONTEXT('',''));\n\
+         #300=SHAPE_REPRESENTATION('',(#320,#1,#2),#901);\n#400=SHAPE_REPRESENTATION('',(#600),#901);\n\
+         #601=REPRESENTATION_MAP(#320,#300);\n#600=MAPPED_ITEM('',#601,#602);\n\
+         #602=CARTESIAN_TRANSFORMATION_OPERATOR_3D('','','',$,$,#603,$,$);\n\
+         #603=CARTESIAN_POINT('',(100.,100.,100.));\n",
+    );
+    let (s, _) = size(&text);
+    assert_eq!(
+        s,
+        ModelSize {
+            width: 10.0,
+            height: 20.0,
+            depth: 5.0
+        }
+    );
+}
+
+#[test]
+fn a_direction_that_is_not_one_fails_its_placement() {
+    let text = assembly(
+        &["#410"],
+        &format!(
+            "#410=AXIS2_PLACEMENT_3D('',#411,'up',$);\n#411=CARTESIAN_POINT('',(0.,0.,0.));\n{}",
+            placed_by_relationship(500, 320, 410)
+        ),
+        "",
+    );
+    let (_, warnings) = size(&text);
+    assert!(
+        warnings.join("\n").contains("1 of its placements could not be applied"),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn geometry_shared_by_parts_placed_only_in_a_loop_is_kept_once() {
+    // The loop of `placements_in_a_loop_end_with_a_warning`, and a second part (#310) listing
+    // the same box vertices placed in the looping assembly too: neither part is reached, so
+    // both are measured as drawn, and the eight vertices they share count once, not twice.
+    let vertices: Vec<String> = (1..=8).map(|k| format!("#{}", 2 * k)).collect();
+    let text = assembly(
+        &["#410", "#430"],
+        &format!(
+            "{}{}{}#530=(REPRESENTATION_RELATIONSHIP('','',#400,#300) REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#531) SHAPE_REPRESENTATION_RELATIONSHIP());\n#531=ITEM_DEFINED_TRANSFORMATION('','',#410,#320);\n\
+             #310=ADVANCED_BREP_SHAPE_REPRESENTATION('',(#311,{}),#901);\n#311=AXIS2_PLACEMENT_3D('',#321,$,$);\n\
+             #540=(REPRESENTATION_RELATIONSHIP('','',#310,#400) REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#541) SHAPE_REPRESENTATION_RELATIONSHIP());\n#541=ITEM_DEFINED_TRANSFORMATION('','',#311,#430);\n",
+            axis(410, [5.0, 0.0, 0.0], Z, X),
+            axis(430, [0.0; 3], Z, X),
+            placed_by_relationship(500, 320, 410),
+            vertices.join(","),
+        ),
+        "",
+    );
+    let (instances, _) = parse(&text);
+    let point = |id: u64| -> Option<[f64; 3]> {
+        let (name, args) = simple(&instances, id)?;
+        (name == "CARTESIAN_POINT").then_some(())?;
+        coords(args.get(1)?)
+    };
+    let pts: Vec<(u64, Geom)> = (1..=8u64)
+        .filter_map(|k| point(2 * k - 1).map(|p| (2 * k, Geom::Point(p))))
+        .collect();
+    assert_eq!(pts.len(), 8);
+    let placed = assembly::place(&text, &instances, pts, &point);
+    assert!(placed.cut);
+    assert_eq!(placed.points.len(), 8);
+}
+
+#[test]
+fn a_loose_point_that_is_also_an_operator_origin_is_still_measured() {
+    // The representation lists both points; an identity operator takes the first as its
+    // origin. It is geometry too, so both are measured.
+    let text = step(
+        MM,
+        "#1=CARTESIAN_POINT('',(0.,0.,0.));\n#2=CARTESIAN_POINT('',(10.,20.,5.));\n\
+         #901=(GEOMETRIC_REPRESENTATION_CONTEXT(3) GLOBAL_UNIT_ASSIGNED_CONTEXT((#900)) REPRESENTATION_CONTEXT('',''));\n\
+         #300=SHAPE_REPRESENTATION('',(#1,#2),#901);\n\
+         #602=CARTESIAN_TRANSFORMATION_OPERATOR_3D('','','',$,$,#1,$,$);\n",
+    );
+    let (s, _) = size(&text);
+    assert_eq!(
+        s,
+        ModelSize {
+            width: 10.0,
+            height: 20.0,
+            depth: 5.0
+        }
+    );
+}
+
+/// The box placed by an axis placement with axis `z` and no reference direction.
+fn placed_on_axis(z: [f64; 3]) -> String {
+    assembly(
+        &["#410"],
+        &format!(
+            "#410=AXIS2_PLACEMENT_3D('',#411,#412,$);\n#411=CARTESIAN_POINT('',(0.,0.,0.));\n#412=DIRECTION('',({:?},{:?},{:?}));\n{}",
+            z[0],
+            z[1],
+            z[2],
+            placed_by_relationship(500, 320, 410)
+        ),
+        "",
+    )
+}
+
+#[test]
+fn an_axis_all_but_along_x_still_takes_the_world_x_as_reference() {
+    // Without a reference direction the world's x, made square to the axis, is the part's x
+    // (here world -z) however little the axis leans off x; its y stays the world's y.
+    for tilt in [1e-15, 1e-200] {
+        let (s, warnings) = size(&placed_on_axis([1.0, 0.0, tilt]));
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        assert!(
+            near(s.width, 5.0) && near(s.height, 20.0) && near(s.depth, 10.0),
+            "tilt {tilt}: {s:?}"
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+    // Exactly along x the world's y is the part's x and z its y.
+    let (s, _) = size(&placed_on_axis([1.0, 0.0, 0.0]));
+    assert_eq!(
+        s,
+        ModelSize {
+            width: 5.0,
+            height: 10.0,
+            depth: 20.0
+        }
+    );
+}
+
+#[test]
+fn an_operator_axis2_all_but_along_its_axes_keeps_y_square() {
+    // axis3 and axis1 lie in the world's xy; axis2 leans 1e-17 off them toward world z, so
+    // y is world z, and the box's 20 mm stand up whole.
+    let text = assembly(
+        &["#600"],
+        "#601=REPRESENTATION_MAP(#320,#300);\n\
+         #600=MAPPED_ITEM('',#601,#602);\n\
+         #602=CARTESIAN_TRANSFORMATION_OPERATOR_3D('','','',#604,#605,#603,$,#606);\n\
+         #603=CARTESIAN_POINT('',(0.,0.,0.));\n\
+         #604=DIRECTION('',(-1.,1.,0.));\n\
+         #605=DIRECTION('',(1.,1.,1.E-17));\n\
+         #606=DIRECTION('',(1.,1.,0.));\n",
+        "",
+    );
+    let (s, warnings) = size(&text);
+    let diagonal = 15.0 / 2f64.sqrt();
+    assert!((s.width - diagonal).abs() < 1e-6, "{s:?}");
+    assert!((s.height - diagonal).abs() < 1e-6, "{s:?}");
+    assert!((s.depth - 20.0).abs() < 1e-6, "{s:?}");
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
