@@ -871,14 +871,15 @@ fn from_archive_with<R: Read + std::io::Seek>(reader: R, draw: bool) -> Result<S
 }
 
 /// The block names (trimmed, lower case, as [`super::drawings::block_key`] keys them) of the
-/// blocks [`read_blocks`] imports: those with connection points. Only their drawings are read.
-fn importable_blocks(app_data: &Connection) -> Result<BTreeSet<String>> {
+/// blocks [`read_blocks`] imports (those with connection points), each with how many share it.
+/// Only their drawings are read.
+fn importable_blocks(app_data: &Connection) -> Result<BTreeMap<String, usize>> {
     let (mut report, mut warnings) = (LibraryReport::default(), Vec::new());
-    let blocks = read_named_blocks(app_data, None, &mut report, &mut warnings)?;
-    Ok(blocks
-        .iter()
-        .map(|(name, _)| super::drawings::block_key(name))
-        .collect())
+    let mut keys: BTreeMap<String, usize> = BTreeMap::new();
+    for (name, _) in read_named_blocks(app_data, None, &mut report, &mut warnings)? {
+        *keys.entry(super::drawings::block_key(&name)).or_default() += 1;
+    }
+    Ok(keys)
 }
 
 /// [`from_archive_with`] with byte limits `lim` on the block drawings read.

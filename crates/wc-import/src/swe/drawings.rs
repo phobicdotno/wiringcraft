@@ -388,11 +388,11 @@ impl Limits {
 }
 
 /// The shared library's block drawings of an archive, only for the blocks named in `blocks`
-/// ([`block_key`]s): drawings of other blocks are never read, so they cannot use up the limits
+/// ([`block_key`]s, each with how many imported blocks share it): drawings of other blocks are never read, so they cannot use up the limits
 /// before a block the library imports (#280).
 pub(crate) fn block_drawings_within<R: Read + std::io::Seek>(
     reader: R,
-    blocks: &BTreeSet<String>,
+    blocks: &BTreeMap<String, usize>,
     lim: Limits,
 ) -> Result<SweDrawings> {
     drawings_within(reader, "", lim, Some(blocks))
@@ -404,7 +404,7 @@ pub(crate) fn drawings_within<R: Read + std::io::Seek>(
     reader: R,
     folder: &str,
     lim: Limits,
-    only: Option<&BTreeSet<String>>,
+    only: Option<&BTreeMap<String, usize>>,
 ) -> Result<SweDrawings> {
     let mut zip =
         zip::ZipArchive::new(reader).map_err(|e| Error::Format(format!("not a SolidWorks Electrical archive: {e}")))?;
@@ -414,7 +414,7 @@ pub(crate) fn drawings_within<R: Read + std::io::Seek>(
             let name = zip.name_for_index(i)?.to_owned();
             let kind = kind_of(&name, folder)?;
             if let (Kind::Block(block, _), Some(only)) = (&kind, only)
-                && !only.contains(&block_key(block))
+                && !only.contains_key(&block_key(block))
             {
                 return None;
             }
@@ -477,8 +477,12 @@ pub(crate) fn drawings_within<R: Read + std::io::Seek>(
         }
         out.warnings.push(w);
     }
-    // Imported blocks a limit left without any drawing.
-    let boxes = left_blocks.iter().filter(|b| !out.blocks.contains_key(*b)).count();
+    // Imported blocks a limit left without any drawing; blocks sharing a name each count.
+    let boxes: usize = left_blocks
+        .iter()
+        .filter(|b| !out.blocks.contains_key(*b))
+        .map(|b| only.and_then(|o| o.get(b)).copied().unwrap_or(1))
+        .sum();
     if left_out > 0 {
         let mut w = format!(
             "{left_out} drawing file(s) were not read: the archive has more than {MAX_DRAWING_FILES} files or {} MB of drawings",
