@@ -323,11 +323,17 @@ pub fn save(dir: &Path, project: &Project) -> Result<Vec<PathBuf>> {
 /// that was undone, or drawn and never saved. Other vendored symbols are left alone.
 fn remove_unused_box_symbols(dir: &Path, project: &Project) -> Result<()> {
     let folder = dir.join(VENDOR_DIR).join(ItemKind::Symbol.dir());
-    let entries = match fs::read_dir(&folder) {
-        Ok(entries) => entries,
+    let resolved = match folder.canonicalize() {
+        Ok(resolved) => resolved,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(Error::io(&folder, e)),
     };
+    // Only inside the project folder: when `vendor` or `vendor/symbols` is a link to somewhere
+    // else, the files there are not this project's to remove.
+    let root = dir.canonicalize().map_err(|e| Error::io(dir, e))?;
+    if !resolved.starts_with(&root) {
+        return Ok(());
+    }
     let used: Vec<String> = project
         .lock
         .symbols
@@ -336,18 +342,27 @@ fn remove_unused_box_symbols(dir: &Path, project: &Project) -> Result<()> {
         .filter(|id| is_box_symbol(id))
         .map(|id| format!("{id}.json"))
         .collect();
-    for entry in entries {
-        let entry = entry.map_err(|e| Error::io(&folder, e))?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        // A folder that ignores case lists a used file under any case of its name.
-        if !is_box_symbol(&name) || !name.ends_with(".json") || used.iter().any(|u| u.eq_ignore_ascii_case(&name)) {
+    let listed = fs::read_dir(&resolved)
+        .map_err(|e| Error::io(&folder, e))?
+        .map(|entry| entry.map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect::<std::io::Result<Vec<String>>>()
+        .map_err(|e| Error::io(&folder, e))?;
+    for name in &listed {
+        if !is_box_symbol(name) || !name.ends_with(".json") || used.contains(name) {
             continue;
         }
-        // Only plain files: never a folder or a link someone put there.
-        let path = entry.path();
-        let plain = fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file());
-        if !plain {
+        // A folder that ignores case lists a used file under another case of its name: kept,
+        // unless the folder lists the used name too, which makes them two files (as `tidy`).
+        if used.iter().any(|u| u.eq_ignore_ascii_case(name) && !listed.contains(u)) {
             continue;
+        }
+        let path = resolved.join(name);
+        // Only plain files: never a folder or a link someone put there.
+        match fs::symlink_metadata(&path) {
+            Ok(m) if m.file_type().is_file() => {}
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(Error::io(&path, e)),
         }
         match fs::remove_file(&path) {
             Ok(()) => {}
@@ -592,6 +607,8 @@ mod tests {
             "box.p0002.s7.json",
             "box.p0002.s2.json",
             "BOX.P0002.S3.json",
+            // Another case of a used name, next to the used name itself: two files.
+            "BOX.P0002.S1.json",
             "box.p0002.s4.txt",
             "wc.coil.json",
         ] {
@@ -603,6 +620,11 @@ mod tests {
             .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
             .collect();
         left.sort();
+        // On a folder that ignores case, the second write above was the used file itself.
+        let case_folding = fs::metadata(folder.join("Box.P0002.S1.json")).is_ok();
+        if case_folding {
+            return Ok(());
+        }
         assert_eq!(
             left,
             [
@@ -614,6 +636,23 @@ mod tests {
             ],
             "placed, pinned, not a symbol file, a folder and other symbols stay"
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_save_never_removes_box_symbols_outside_the_project_folder() -> Result<()> {
+        let tmp = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
+        let other = tmp.path().join("other");
+        let elsewhere = other.join("symbols");
+        fs::create_dir_all(&elsewhere).map_err(|e| Error::io(&elsewhere, e))?;
+        fs::write(elsewhere.join("box.p1.s1.json"), "{}").map_err(|e| Error::io("write", e))?;
+        let dir = tmp.path().join("proj");
+        fs::create_dir_all(&dir).map_err(|e| Error::io(&dir, e))?;
+        // `vendor` itself is a link to another project's folder.
+        std::os::unix::fs::symlink(&other, dir.join(VENDOR_DIR)).map_err(|e| Error::io("link", e))?;
+        save(&dir, &Project::new("Empty"))?;
+        assert!(elsewhere.join("box.p1.s1.json").exists());
         Ok(())
     }
 
