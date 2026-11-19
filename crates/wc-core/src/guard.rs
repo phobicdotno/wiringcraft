@@ -229,6 +229,8 @@ impl ProjectFiles {
         if self.dirs.contains(&dir.id) || inside(&self.roots, &opened) {
             return Err(Fail::Refused("is in the project folder".into()));
         }
+        #[cfg(test)]
+        tests::hook("checked", folder, std::ffi::OsStr::new(""));
         let (staged, mut file) = dir.create_new(&name)?;
         let done = (|| {
             use std::io::Write;
@@ -1025,8 +1027,9 @@ mod tests {
     }
 
     /// Run `swap` when the next write on this thread reaches `step`: `open` (before the output
-    /// folder is opened), `opened` (right after) or `rename` (after every check, before the
-    /// rename; it is given the staging file's name).
+    /// folder is opened), `opened` (right after), `checked` (Windows: after the opened folder was
+    /// checked, before the new file is made) or `rename` (after every check, before the rename;
+    /// it is given the staging file's name).
     #[cfg(any(unix, windows))]
     fn on(step: &'static str, swap: impl FnOnce(&Path, &std::ffi::OsStr) -> io::Result<()> + 'static) {
         SWAPS.with(|s| s.borrow_mut().push((step, Box::new(swap))));
@@ -1178,6 +1181,36 @@ mod tests {
         assert!(no_temp_left(&pages)?);
         // The junction goes before the temporary folder does.
         std::fs::remove_dir(&parent)?;
+        Ok(())
+    }
+
+    /// The output folder swapped for a junction into the project's `pages` folder after it was
+    /// opened and checked, before the new file is made (only the open folder is held then, so
+    /// Windows lets it move): the file is made and renamed in the folder that was checked, and
+    /// the project's page stays as it was (#476).
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_swapped_for_a_junction_after_the_check_gets_nothing() -> TestResult {
+        let p = project()?;
+        let out = tempfile::tempdir()?;
+        let g = ProjectFiles::new(p.path());
+        let sub = out.path().join("exports");
+        std::fs::create_dir(&sub)?;
+        let file = sub.join("p1.page.json");
+        let pages = p.path().join("pages");
+        let moved = out.path().join("exports-old");
+        let (pages2, moved2, sub2) = (pages.clone(), moved.clone(), sub.clone());
+        on("checked", move |_, _| {
+            std::fs::rename(&sub2, &moved2)?;
+            junction(&sub2, &pages2)
+        });
+        g.write(&file, b"exported")?;
+        assert_eq!(std::fs::read_to_string(pages.join("p1.page.json"))?, "page one");
+        assert!(no_temp_left(&pages)?);
+        assert_eq!(std::fs::read_to_string(moved.join("p1.page.json"))?, "exported");
+        assert!(no_temp_left(&moved)?);
+        // The junction goes before the temporary folder does.
+        std::fs::remove_dir(&sub)?;
         Ok(())
     }
 
