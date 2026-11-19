@@ -1174,12 +1174,27 @@ fn card_rows(size: PageSize, band: f64) -> f64 {
     (h - 2.0 * MARGIN - HEADER - band - CARD_TOP - 14.0) / CARD_ROW
 }
 
+/// The narrowest room, in mm, the device, description and connection columns of a drawn PLC
+/// card need beside the card box and its terminal leads.
+const CARD_MIN_ROOM: f64 = 100.0;
+
+/// Where a drawn PLC card's point columns start and end on a sheet `w` mm wide: past the card
+/// box and the lead to its terminal, up to the right margin.
+fn card_point_columns(w: f64) -> (f64, f64) {
+    let x0 = MARGIN + 6.0;
+    (x0 + 58.0 + 18.0, w - MARGIN - 6.0)
+}
+
 /// The sheet size for drawn PLC cards: `wanted` (the first schematic page's) when it has room
-/// for the heading and a card row above the title block, else the smallest named size that has.
+/// for the heading and a card row above the title block and is wide enough for the point
+/// columns, else the smallest named size that is.
 pub fn card_size(wanted: PageSize, band: f64) -> PageSize {
     std::iter::once(wanted)
         .chain(PageSize::NAMED)
-        .find(|s| card_rows(*s, band) >= 1.0)
+        .find(|s| {
+            let (lead, x1) = card_point_columns(s.mm().0);
+            card_rows(*s, band) >= 1.0 && x1 - lead >= CARD_MIN_ROOM
+        })
         .unwrap_or(PageSize::A3)
 }
 
@@ -1243,7 +1258,7 @@ pub fn draw_card_page(
     let shown: Vec<_> = rows.iter().skip(first).take(per).collect();
     // Column positions: the card box, the wire to the terminal, then the point's fields.
     let (bx0, bx1) = (x0 + 8.0, x0 + 58.0);
-    let lead = bx1 + 18.0;
+    let (lead, _) = card_point_columns(w);
     let room = x1 - lead;
     let (dev_x, desc_x, conn_x, page_x) = (lead + 2.0, lead + room * 0.2, lead + room * 0.55, x1 - 2.0);
     let y0 = top + CARD_TOP - CARD_ROW;

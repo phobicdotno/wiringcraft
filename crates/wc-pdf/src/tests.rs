@@ -1754,6 +1754,13 @@ fn plc_card_sheets_move_to_a_larger_sheet_and_fit_their_fields() {
     // A 60 mm title block leaves no card row on the short sheet: a larger one is used.
     assert_eq!(layout::card_size(short, 60.0), PageSize::A4);
     assert_eq!(layout::card_size(PageSize::A3, 60.0), PageSize::A3);
+    assert_eq!(layout::card_size(PageSize::A4Portrait, 60.0), PageSize::A4Portrait);
+    // A tall but narrow sheet has rows to spare and no room for the point columns.
+    let narrow = PageSize::Custom {
+        width: 100,
+        height: 297,
+    };
+    assert_eq!(layout::card_size(narrow, 60.0), PageSize::A4);
     // A field cut for its column is measured at the height it is drawn at.
     let long = "-K100 motor protection relay for the main pump in the north basin";
     for width in [10.0, 25.0, 60.0] {
