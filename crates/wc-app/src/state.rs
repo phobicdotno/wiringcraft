@@ -44,6 +44,7 @@ pub enum Tool {
     Cloud,
     /// The page's revision table: one click for its top-left corner.
     RevisionTable,
+    BlackBox,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -105,8 +106,11 @@ impl SpecPart {
 /// A macro found in the project or a library source.
 #[derive(Debug, Clone)]
 pub struct MacroEntry {
-    /// `project` or the library source's name.
+    /// `project` or the library source's name, as shown.
     pub source: String,
+    /// Whether it is the project's own macro (a library's belongs to the library), whatever
+    /// the library source is called.
+    pub project: bool,
     pub path: PathBuf,
     pub name: String,
     pub description: String,
@@ -1601,6 +1605,84 @@ impl Open {
         Ok(id)
     }
 
+    /// Draw a black box on page `page`: a rectangle with corners `a` and `b` (page mm) and the
+    /// connection points `pins` on its edges (offsets from the box's left or top edge), tagged
+    /// `tag`, as one undo step. Like `wiringcraft box`, the box gets its own project symbol
+    /// `box.<page>.<id>`, pinned with source `project`, and the item and symbol ids are ones no
+    /// earlier box used (a deleted box keeps its symbol file and lock entry). Returns the
+    /// item id; nothing changes when the box is refused or its symbol file cannot be written.
+    pub fn add_black_box(
+        &mut self,
+        page: usize,
+        a: Point,
+        b: Point,
+        pins: &[wc_core::BoxPin],
+        tag: Option<DeviceTag>,
+    ) -> Result<String, String> {
+        let pg = self.project.pages.get(page).ok_or("no page")?;
+        let (min, max) = (
+            Point::new(a.x.min(b.x), a.y.min(b.y)),
+            Point::new(a.x.max(b.x), a.y.max(b.y)),
+        );
+        let (id, symbol_id) = {
+            let mut n = 1usize;
+            loop {
+                let id = format!("s{n}");
+                n += 1;
+                if pg.symbol(&id).is_some() || pg.wires.iter().any(|w| w.id == id) {
+                    continue;
+                }
+                let symbol_id = format!("box.{}.{id}", pg.id);
+                if symbol_id.len() > 128 {
+                    return Err(format!(
+                        "page id {:?} is too long to name a box symbol (box.<page>.<id> must stay within 128 characters)",
+                        pg.id
+                    ));
+                }
+                let path = store::vendor_path(&self.dir, ItemKind::Symbol, &symbol_id).map_err(|e| e.to_string())?;
+                let exists = path
+                    .try_exists()
+                    .map_err(|e| format!("{} cannot be checked: {e}", path.display()))?;
+                if !exists
+                    && !self.project.lock.symbols.contains_key(&symbol_id)
+                    && !self.symbols.contains_key(&symbol_id)
+                {
+                    break (id, symbol_id);
+                }
+            }
+        };
+        let name = tag
+            .as_ref()
+            .map_or_else(|| "Black box".to_owned(), |t| format!("Black box {t}"));
+        let symbol =
+            wc_core::black_box(&symbol_id, &name, max.x - min.x, max.y - min.y, pins).map_err(|e| e.to_string())?;
+        self.write_symbol_file(&symbol)?;
+        self.checkpoint();
+        if let Some(t) = &tag {
+            self.project.devices.entry(t.clone()).or_default();
+        }
+        self.project.lock.symbols.insert(
+            symbol_id.clone(),
+            wc_core::LockEntry {
+                source: "project".into(),
+                hash: symbol.hash(),
+            },
+        );
+        self.symbol_versions.insert(symbol.hash(), symbol.clone());
+        self.symbols.insert(symbol_id.clone(), symbol);
+        if let Some(pg) = self.project.pages.get_mut(page) {
+            pg.symbols.push(PlacedSymbol {
+                id: id.clone(),
+                symbol: symbol_id,
+                at: min,
+                rotation: Rotation::R0,
+                mirror: false,
+                tag,
+            });
+        }
+        Ok(id)
+    }
+
     pub fn add_wire(&mut self, page: usize, from: Endpoint, to: Endpoint, via: Vec<Point>) {
         self.checkpoint();
         if let Some(pg) = self.project.pages.get_mut(page) {
@@ -1870,16 +1952,16 @@ impl Open {
     /// per original device, keeping description and part) and wire numbers are cleared.
     /// Macros of the project (`macros/`) and of its library sources, project first.
     pub fn macros(&self) -> Vec<MacroEntry> {
-        let mut found: Vec<(String, String, PathBuf)> = wc_core::macros::list_macros(&self.dir)
+        let mut found: Vec<(bool, String, String, PathBuf)> = wc_core::macros::list_macros(&self.dir)
             .into_iter()
-            .map(|(id, path)| ("project".to_owned(), id, path))
+            .map(|(id, path)| (true, "project".to_owned(), id, path))
             .collect();
         if let Ok(lib) = wc_library::Library::open(&self.dir, &self.project) {
-            found.extend(lib.macros());
+            found.extend(lib.macros().into_iter().map(|(s, id, path)| (false, s, id, path)));
         }
         found
             .into_iter()
-            .map(|(source, id, path)| {
+            .map(|(project, source, id, path)| {
                 let (name, description, value_sets, error) = match wc_core::macros::read_macro(&path) {
                     Ok(m) => {
                         let error = m.check().err().map(|e| e.to_string());
@@ -1890,6 +1972,7 @@ impl Open {
                 };
                 MacroEntry {
                     source,
+                    project,
                     path,
                     name,
                     description,
@@ -2828,6 +2911,120 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read(&outside).unwrap(), b"keep me");
         assert_eq!(std::fs::read(&path).unwrap(), b"old");
         assert!(std::fs::symlink_metadata(tmp.path().join("part.json.tmp")).is_err());
+    }
+
+    #[test]
+    fn a_black_box_is_drawn_wired_undone_and_kept_by_a_save() {
+        use wc_core::{BoxPin, BoxSide};
+        let (_tmp, mut o) = project();
+        let pins = [
+            BoxPin {
+                name: "IN".into(),
+                side: BoxSide::Left,
+                offset: 5.0,
+            },
+            BoxPin {
+                name: "OUT".into(),
+                side: BoxSide::Right,
+                offset: 5.0,
+            },
+        ];
+        let tag = DeviceTag::parse("-A1").unwrap();
+        // Corners in any order: the box's top-left is its place.
+        let id = o
+            .add_black_box(
+                1,
+                Point::new(60.0, 50.0),
+                Point::new(40.0, 40.0),
+                &pins,
+                Some(tag.clone()),
+            )
+            .unwrap();
+        let page_id = o.project.pages[1].id.clone();
+        let symbol_id = format!("box.{page_id}.{id}");
+        let placed = o.project.pages[1].symbol(&id).unwrap().clone();
+        assert_eq!(
+            (placed.symbol.as_str(), placed.at),
+            (symbol_id.as_str(), Point::new(40.0, 40.0))
+        );
+        assert_eq!(placed.tag.as_ref(), Some(&tag));
+        assert!(o.project.devices.contains_key(&tag));
+        assert_eq!(o.project.lock.symbols[&symbol_id].source, "project");
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(),
+            o.symbols[&symbol_id]
+        );
+        let page = o.project.pages[1].clone();
+        assert_eq!(o.pin_pos(&page, &id, "OUT"), Some(Point::new(60.0, 45.0)));
+
+        // It wires like any symbol.
+        let from = Endpoint::Pin {
+            item: id.clone(),
+            pin: "OUT".into(),
+        };
+        o.add_wire(
+            1,
+            from,
+            Endpoint::Point {
+                at: Point::new(80.0, 45.0),
+            },
+            Vec::new(),
+        );
+        assert_eq!(o.project.pages[1].wires.len(), 1);
+
+        // One undo step for the box: undoing the wire and then the box takes both away.
+        assert!(o.undo() && o.undo());
+        assert!(o.project.pages[1].symbol(&id).is_none());
+        assert!(!o.project.lock.symbols.contains_key(&symbol_id));
+        assert!(!o.symbols.contains_key(&symbol_id));
+        assert!(o.redo());
+        assert_eq!(o.project.pages[1].symbol(&id), Some(&placed));
+        assert_eq!(o.symbols[&symbol_id].pins.len(), 2);
+
+        // A second box after the first was undone does not take over its symbol id.
+        assert!(o.undo());
+        let again = o
+            .add_black_box(1, Point::new(10.0, 10.0), Point::new(20.0, 20.0), &[], None)
+            .unwrap();
+        assert_ne!(format!("box.{page_id}.{again}"), symbol_id);
+        assert!(!o.can_redo());
+        assert!(o.undo());
+        assert!(o.redo());
+
+        o.save().unwrap();
+        let reopened = Open::load(&o.dir).unwrap();
+        let box_id = format!("box.{page_id}.{again}");
+        assert_eq!(reopened.project.pages[1].symbol(&again).unwrap().symbol, box_id);
+        assert_eq!(reopened.symbols[&box_id], o.symbols[&box_id]);
+        assert_eq!(reopened.symbols[&box_id].category, "Black box");
+    }
+
+    #[test]
+    fn a_refused_black_box_leaves_the_project_as_it_was() {
+        use wc_core::{BoxPin, BoxSide};
+        let (_tmp, mut o) = project();
+        let before = o.project.clone();
+        let off_edge = [BoxPin {
+            name: "1".into(),
+            side: BoxSide::Top,
+            offset: 50.0,
+        }];
+        let err = o
+            .add_black_box(1, Point::new(0.0, 0.0), Point::new(10.0, 10.0), &off_edge, None)
+            .unwrap_err();
+        assert!(err.contains("off its edge"), "{err}");
+        let err = o
+            .add_black_box(1, Point::new(5.0, 5.0), Point::new(5.0, 20.0), &[], None)
+            .unwrap_err();
+        assert!(err.contains("width and height above zero"), "{err}");
+        // The symbol file cannot be written: nothing is placed or pinned.
+        o.fail_symbol_writes.push_back(true);
+        assert!(
+            o.add_black_box(1, Point::new(0.0, 0.0), Point::new(10.0, 10.0), &[], None)
+                .is_err()
+        );
+        assert_eq!(o.project, before);
+        assert!(!o.can_undo());
     }
 
     #[test]

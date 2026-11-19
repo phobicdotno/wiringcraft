@@ -26,6 +26,7 @@ pub enum Action {
     DimensionTool,
     CloudTool,
     RevisionTableTool,
+    BlackBoxTool,
     Delete,
     Rotate,
     Mirror,
@@ -108,6 +109,7 @@ impl Action {
                 | Action::DimensionTool
                 | Action::CloudTool
                 | Action::RevisionTableTool
+                | Action::BlackBoxTool
                 | Action::Delete
                 | Action::Rotate
                 | Action::Mirror
@@ -148,6 +150,7 @@ impl Action {
         Action::DimensionTool,
         Action::CloudTool,
         Action::RevisionTableTool,
+        Action::BlackBoxTool,
         Action::Delete,
         Action::Rotate,
         Action::Mirror,
@@ -337,6 +340,12 @@ impl Action {
                 "Revision table",
                 "Place the page's revision table: click its top-left corner (Delete takes it off)",
                 Icon::RevisionTable,
+                "",
+            ),
+            Action::BlackBoxTool => i(
+                "Black box",
+                "Draw a black box for a device without a symbol: drag its rectangle, click its edges to add connection points, then click inside it (or press Enter) to tag it",
+                Icon::BlackBox,
                 "",
             ),
             Action::Delete => i("Delete", "Delete the selection", Icon::Delete, "Del"),
@@ -567,6 +576,7 @@ pub const TOOLBAR: &[&[Action]] = &[
         Action::Select,
         Action::PlaceSymbol,
         Action::DrawWire,
+        Action::BlackBoxTool,
         Action::Rotate,
         Action::Mirror,
         Action::Delete,
@@ -653,6 +663,7 @@ pub const RIBBON: &[(&str, &[RibbonGroup])] = &[
                     Action::Select,
                     Action::PlaceSymbol,
                     Action::DrawWire,
+                    Action::BlackBoxTool,
                     Action::Rotate,
                     Action::Mirror,
                 ],

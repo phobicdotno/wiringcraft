@@ -6,6 +6,7 @@ mod actions;
 mod agent;
 mod agent_panel;
 mod applog;
+mod black_box_tool;
 mod canvas;
 mod chrome;
 mod edit;
@@ -15,6 +16,7 @@ mod icons;
 mod import_symbols;
 mod layers;
 mod live_check;
+mod macro_form;
 mod panel_view;
 mod panels;
 mod prefs;
@@ -150,6 +152,20 @@ enum Dialog {
     Text(wc_core::geom::Point, String, bool),
     /// Pin a review comment at this point on the current page.
     Comment(wc_core::geom::Point, String, bool),
+    /// Name a connection point of the black box being drawn, at this edge and offset.
+    BoxPin {
+        side: wc_core::BoxSide,
+        offset: f64,
+        name: String,
+        focused: bool,
+        error: Option<String>,
+    },
+    /// Tag the black box being drawn and put it on the page.
+    BoxTag {
+        tag: String,
+        focused: bool,
+        error: Option<String>,
+    },
     /// The recorded versions of one page, newest first.
     PageHistory(String, Vec<wc_vcs::PageVersion>),
     Commit(String),
@@ -173,6 +189,11 @@ enum Dialog {
     },
     /// Macros to insert.
     Macros(Vec<state::MacroEntry>),
+    /// A project macro's placeholders and value sets (Insert macro, Placeholders…).
+    MacroEdit {
+        form: Box<macro_form::Form>,
+        error: Option<String>,
+    },
     /// Library, Import symbols: the library folders to import into and the one chosen.
     ImportSymbols {
         targets: Vec<import_symbols::ImportTarget>,
@@ -287,6 +308,7 @@ impl chrome::Status for StatusView<'_> {
             Action::DimensionTool => self.ed.tool == Tool::Dimension,
             Action::CloudTool => self.ed.tool == Tool::Cloud,
             Action::RevisionTableTool => self.ed.tool == Tool::RevisionTable,
+            Action::BlackBoxTool => self.ed.tool == Tool::BlackBox,
             Action::ToggleGrid => self.prefs.show_grid,
             Action::Layers => self.show_layers,
             Action::ToggleAutoWire => self.prefs.auto_wire,
@@ -676,6 +698,13 @@ impl App {
             Action::DrawWire => {
                 self.ed.tool = Tool::Wire;
                 self.ed.shape_points.clear();
+            }
+            Action::BlackBoxTool => {
+                self.ed.tool = Tool::BlackBox;
+                self.ed.wire = None;
+                self.ed.shape_points.clear();
+                self.ed.black_box = None;
+                self.ed.message = black_box_tool::hint(None).into();
             }
             Action::TextTool
             | Action::LineTool
@@ -1168,11 +1197,17 @@ impl App {
                     out.push(a);
                 }
             }
-            if i.key_pressed(Key::Enter) && i.modifiers.is_none() && self.ed.tool == Tool::Polyline {
+            if i.key_pressed(Key::Enter)
+                && i.modifiers.is_none()
+                && matches!(self.ed.tool, Tool::Polyline | Tool::BlackBox)
+            {
                 self.ed.finish_shape = true;
             }
             if i.key_pressed(Key::Escape) {
-                if !self.ed.shape_points.is_empty() {
+                if self.ed.tool == Tool::BlackBox && self.ed.black_box.is_some() {
+                    self.ed.black_box = None;
+                    self.ed.message = black_box_tool::hint(None).into();
+                } else if !self.ed.shape_points.is_empty() {
                     self.ed.shape_points.clear();
                     self.ed.message = canvas::shape_hint(self.ed.tool, 0).into();
                 } else if self.ed.wire.is_some() {
@@ -1200,6 +1235,8 @@ impl App {
             Dialog::DeletePage(_) => "Delete page",
             Dialog::Text(..) => "Text",
             Dialog::Comment(..) => "Comment",
+            Dialog::BoxPin { .. } => "Connection point",
+            Dialog::BoxTag { .. } => "Black box",
             Dialog::PageHistory(..) => "Page history",
             Dialog::Reports(_) => "Reports",
             Dialog::ReportLayout { .. } => "Report layout",
@@ -1215,6 +1252,7 @@ impl App {
             Dialog::Fetching(_) => "New project",
             Dialog::SaveMacro { .. } => "Save as macro",
             Dialog::Macros(_) => "Insert macro",
+            Dialog::MacroEdit { .. } => "Macro placeholders",
             Dialog::ImportSymbols { .. } => "Import symbols",
             Dialog::Report { .. } => "Report a problem",
             Dialog::WagoMarking { .. } => "WAGO marking",
@@ -1300,7 +1338,7 @@ impl App {
                         );
                     }
                     egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
-                        egui::Grid::new("macros").striped(true).num_columns(3).show(ui, |ui| {
+                        egui::Grid::new("macros").striped(true).num_columns(4).show(ui, |ui| {
                             for m in list.iter() {
                                 ui.vertical(|ui| {
                                     ui.set_min_width(320.0);
@@ -1312,6 +1350,21 @@ impl App {
                                     }
                                 });
                                 ui.label(m.source.as_str());
+                                // A project macro's placeholders and variants are edited here; a
+                                // library's macros belong to the library.
+                                if m.project {
+                                    if ui
+                                        .button("Placeholders…")
+                                        .on_hover_text("Declare its placeholders and the value sets of its variants")
+                                        .clicked()
+                                    {
+                                        let path = m.path.clone();
+                                        then = Some(Box::new(move |app: &mut App| app.edit_macro(&path)));
+                                        keep = false;
+                                    }
+                                } else {
+                                    ui.label("");
+                                }
                                 if m.value_sets.is_empty() || m.error.is_some() {
                                     if ui.add_enabled(m.error.is_none(), egui::Button::new("Insert")).clicked() {
                                         let path = m.path.clone();
@@ -1342,6 +1395,40 @@ impl App {
                     if ui.button("Close").clicked() {
                         keep = false;
                     }
+                }
+                Dialog::MacroEdit { form, error } => {
+                    egui::ScrollArea::vertical()
+                        .id_salt("macro-edit-scroll")
+                        .max_height(ui.ctx().screen_rect().height() * 0.6)
+                        .show(ui, |ui| macro_form::show(ui, form));
+                    if let Some(e) = error {
+                        ui.colored_label(theme::Theme::of(ui.ctx()).error, e.as_str());
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            match form.save() {
+                                Ok(path) => {
+                                    then = Some(Box::new(move |app: &mut App| {
+                                        app.ed.message = format!("Saved macro {}", path.display());
+                                        if let Some(open) = &app.open {
+                                            app.dialog = Some(Dialog::Macros(open.macros()));
+                                        }
+                                    }));
+                                    keep = false;
+                                }
+                                Err(e) => *error = Some(e),
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            then = Some(Box::new(|app: &mut App| {
+                                if let Some(open) = &app.open {
+                                    app.dialog = Some(Dialog::Macros(open.macros()));
+                                }
+                            }));
+                            keep = false;
+                        }
+                    });
                 }
                 Dialog::Report { log, include } => {
                     ui.label(
@@ -2274,6 +2361,72 @@ impl App {
                         }
                     });
                 }
+                Dialog::BoxPin {
+                    side,
+                    offset,
+                    name,
+                    focused,
+                    error,
+                } => {
+                    ui.label(format!("On the {} edge, {offset:.1} mm along it.", side_name(*side)));
+                    let r = ui.add(
+                        egui::TextEdit::singleline(name)
+                            .hint_text("Connection point name")
+                            .desired_width(240.0),
+                    );
+                    if !*focused {
+                        r.request_focus();
+                        *focused = true;
+                    }
+                    if let Some(e) = error.as_ref() {
+                        ui.colored_label(theme::Theme::of(ui.ctx()).error, e);
+                    }
+                    ui.horizontal(|ui| {
+                        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                        if ui.button("Add").clicked() || enter {
+                            match self.ed.black_box.as_mut() {
+                                Some(d) => match d.add_pin(*side, *offset, name) {
+                                    Ok(()) => {
+                                        self.ed.message = black_box_tool::hint(Some(d)).into();
+                                        keep = false;
+                                    }
+                                    Err(e) => *error = Some(e),
+                                },
+                                None => keep = false,
+                            }
+                        }
+                        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                            keep = false;
+                        }
+                    });
+                }
+                Dialog::BoxTag { tag, focused, error } => {
+                    let pins = self.ed.black_box.as_ref().map_or(0, |d| d.pins.len());
+                    ui.label(format!(
+                        "{pins} connection point{}. The tag can be left empty.",
+                        if pins == 1 { "" } else { "s" }
+                    ));
+                    let r = ui.add(egui::TextEdit::singleline(tag).hint_text("-A1").desired_width(240.0));
+                    if !*focused {
+                        r.request_focus();
+                        *focused = true;
+                    }
+                    if let Some(e) = error.as_ref() {
+                        ui.colored_label(theme::Theme::of(ui.ctx()).error, e);
+                    }
+                    ui.horizontal(|ui| {
+                        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                        if ui.button("Put on page").clicked() || enter {
+                            match self.add_black_box(tag) {
+                                Ok(()) => keep = false,
+                                Err(e) => *error = Some(e),
+                            }
+                        }
+                        if ui.button("Back").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                            keep = false;
+                        }
+                    });
+                }
                 Dialog::PageHistory(page, versions) => {
                     let t = theme::Theme::of(ui.ctx());
                     if versions.is_empty() {
@@ -2931,6 +3084,17 @@ impl App {
     }
 
     /// Insert a macro on the current page, selected so it can be dragged into place.
+    /// Open the placeholders dialog on the project macro in `path`.
+    fn edit_macro(&mut self, path: &std::path::Path) {
+        self.dialog = Some(match macro_form::Form::open(path) {
+            Ok(form) => Dialog::MacroEdit {
+                form: Box::new(form),
+                error: None,
+            },
+            Err(e) => Dialog::Message(format!("The macro could not be read:\n{e}")),
+        });
+    }
+
     fn insert_macro(&mut self, path: &std::path::Path, name: &str, value_set: Option<&str>) {
         let page = self.ed.page;
         let Some(open) = self.open.as_mut() else { return };
@@ -3342,6 +3506,8 @@ fn export_pdf_in(open: &Open, langs: &[String]) -> String {
         underlays: pictures.files,
         unreadable: pictures.unreadable,
         panels: project.panels.clone(),
+        networks: project.meta.networks.clone(),
+        footprints: wc_pdf::footprints(open.parts.values()),
         ..Default::default()
     };
     let (bytes, report) = wc_pdf::export(project, &open.symbols, &options);
@@ -3705,6 +3871,32 @@ impl eframe::App for App {
         if let Some(at) = self.ed.ask_comment.take() {
             self.dialog = Some(Dialog::Comment(at, String::new(), false));
         }
+        // A click on the box while one of its dialogs is open does not replace that dialog.
+        if let Some((side, offset)) = self.ed.ask_box_pin.take()
+            && self.dialog.is_none()
+            && let Some(d) = self.ed.black_box.as_ref()
+        {
+            self.dialog = Some(Dialog::BoxPin {
+                side,
+                offset,
+                name: d.next_pin_name(),
+                focused: false,
+                error: None,
+            });
+        }
+        if std::mem::take(&mut self.ed.ask_box_tag) && self.dialog.is_none() && self.ed.black_box.is_some() {
+            let tag = self
+                .open
+                .as_ref()
+                .and_then(|o| o.next_tag(self.ed.page, "A"))
+                .map(|t| t.to_string())
+                .unwrap_or_default();
+            self.dialog = Some(Dialog::BoxTag {
+                tag,
+                focused: false,
+                error: None,
+            });
+        }
         self.dialogs(ctx);
         self.share
             .windows(ctx, self.open.as_mut(), self.assistant.command_running());
@@ -3831,6 +4023,40 @@ impl App {
         if let Some(sel) = o.add_graphic(self.ed.page, shape) {
             self.ed.select_only(sel);
         }
+    }
+
+    /// The black box dialog's button: the box drawn with the black box tool goes on its page,
+    /// tagged `tag` (none when empty), and is selected.
+    fn add_black_box(&mut self, tag: &str) -> Result<(), String> {
+        let o = self.open.as_mut().ok_or("no project is open")?;
+        let d = self.ed.black_box.clone().ok_or("no black box is being drawn")?;
+        let (a, b) = d.rect().ok_or("the black box has no rectangle yet")?;
+        let page = o
+            .project
+            .pages
+            .iter()
+            .position(|p| p.id == d.page_id)
+            .ok_or("the page the box was drawn on is gone")?;
+        if let Some(why) = o.held_reason(page) {
+            return Err(why);
+        }
+        let tag = match tag.trim() {
+            "" => None,
+            t => Some(wc_core::DeviceTag::parse(t).map_err(|e| e.to_string())?),
+        };
+        let id = o.add_black_box(page, a, b, &d.pins, tag)?;
+        self.ed.black_box = None;
+        // The page the box went on is shown (the view may have moved meanwhile), so the
+        // selection names the new box and not an item of the same id elsewhere.
+        self.ed.page = page;
+        self.ed.panel = None;
+        self.ed.select_only(Selection::Symbol(id));
+        self.ed.message = format!(
+            "Black box with {} connection point{} put on the page.",
+            d.pins.len(),
+            if d.pins.len() == 1 { "" } else { "s" }
+        );
+        Ok(())
     }
 
     /// The Comment dialog's button: a review comment at `at` on the page shown, unless the
@@ -4847,5 +5073,15 @@ mod page_size_tests {
                 height: 297
             }
         );
+    }
+}
+
+/// How the connection point dialog names an edge of a black box.
+fn side_name(side: wc_core::BoxSide) -> &'static str {
+    match side {
+        wc_core::BoxSide::Top => "top",
+        wc_core::BoxSide::Bottom => "bottom",
+        wc_core::BoxSide::Left => "left",
+        wc_core::BoxSide::Right => "right",
     }
 }

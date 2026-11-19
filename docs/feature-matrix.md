@@ -95,7 +95,7 @@ For the other areas, the chapter to read in each help is:
 | Dimensions in the editor | yes | yes | yes: kept from imports (drawn by their block), and drawn by hand with the Dimension tool (Graphics toolbar: two points, then the dimension line); picked, moved, deleted, saved and exported to PDF, SVG and DXF like other drawings | done (#317) |
 | Find and replace texts, tags and wire numbers across the project | yes | yes | yes: Edit → Find (Ctrl+F), `wiringcraft find` | done (#109) |
 | Macros / window macros (save and insert groups) | yes | yes | yes | done |
-| Macro placeholders and value sets (one macro, several variants) | yes | partly | partly: `{{name}}` placeholders in a macro's device descriptions, parts, accessories and properties, wire cross-section, colour and type, and drawn texts, filled from a named value set chosen at insert (Insert > Macro, the assistant, `wiringcraft macro place --set`); placeholders and value sets are written in the macro file, not yet edited in the app | done (#272) |
+| Macro placeholders and value sets (one macro, several variants) | yes | partly | partly: `{{name}}` placeholders in a macro's device descriptions, parts, accessories and properties, wire cross-section, colour and type, and drawn texts, filled from a named value set chosen at insert (Insert > Macro, the assistant, `wiringcraft macro place --set`); a project macro's placeholders and value sets are edited in the app (Insert > Macro, Placeholders…), a renamed placeholder renamed in its texts | done (#272, #407) |
 | Auto-connect pins that line up | yes | yes | yes | done (#51) |
 | Scanned drawing as underlay to trace over | partly | partly | yes | done |
 | Layers / show-hide groups | yes | yes (DWG layers) | yes: PDF layers, editor layers (View → Layers) | done: show, hide and lock on the canvas, kept per user |
@@ -121,7 +121,7 @@ For the other areas, the chapter to read in each help is:
 | Device properties and description | yes | yes | yes | done |
 | Part (article) database with manufacturer, order number, data | yes | yes (catalog) | yes | done |
 | Several parts on one device (main part plus accessories) | yes | yes | no: one part per device | todo (#106) |
-| Black box / device box for devices without a symbol | yes | yes | partly: imported, and drawn with connection points from the command line (`wiringcraft box`); no drawing tool in the app yet | partly (#266) |
+| Black box / device box for devices without a symbol | yes | yes | yes: imported, drawn with connection points from the command line (`wiringcraft box`) and with the Black box tool in the app (drag the rectangle, click its edges for connection points, then tag it); resizing a drawn box or editing its points comes later | yes (#266, #371) |
 | Part data from the maker's data portal | add-on (Data Portal) | yes (content portal) | EDZ part data, and macros as symbols with their connection points (multi-line, variant A; or a symbol by `--symbol-map`), and BMEcat | done (#144, #311) |
 | Manufacturer symbol and macro sources | yes | yes | listed in docs | done (#46) |
 
@@ -175,7 +175,7 @@ For the other areas, the chapter to read in each help is:
 | PLC addresses from a CSV list | yes | yes | yes | done |
 | PLC variable list export (structured text) | yes | partly | yes | done |
 | PLC card overview pages and rack configuration | yes | yes | partly: `[[rack]]` tables with their `[[rack.card]]`s in `project.toml` (slot, tag, type, channels, start address); the `plc-cards` report lists every card channel by channel with the device, connection and page from the PLC I/O list, as a table in the PDF (`pdf --report plc-cards`) and the app; see `wc_core::plc_rack`. The app edits racks and cards in File > PLC racks (#436), showing the report's rack warnings while typing. No drawn card pictures yet | partly (#275) |
-| Fieldbus (PROFINET, EtherCAT) topology | yes | partly | partly: `[[network]]` tables in `project.toml` (devices, addresses, station names, cabled ports), Networks report (`--report networks`) with checks; no drawn topology page yet | network list done (#278) |
+| Fieldbus (PROFINET, EtherCAT) topology | yes | partly | yes: `[[network]]` tables in `project.toml` (devices, addresses, station names, cabled ports), Networks report (`--report networks`) with checks, and a drawn topology page per network after the list in the PDF (boxes per device linking to its page, ports and cable tags on each link, rings drawn once) | network list (#278), topology pages (#453) |
 | Exchange with PLC engineering tools (AutomationML) | yes | partly | yes (export) | done |
 
 ## 10. Reports
@@ -195,6 +195,7 @@ For the other areas, the chapter to read in each help is:
 |---|---|---|---|---|
 | 2D mounting plate with rails and ducts | add-on (Pro Panel) | yes | yes | done |
 | Place devices onto rails from the schematic | add-on | yes | yes | done |
+| Maker outline drawings as device footprints | yes (2D macros of the part) | yes (2D footprint) | partly: `import footprint-dxf` stores a maker DXF with the part; layout pages in the app and the PDF draw it at real size (shrunk to fit a smaller device box), and a part without a `Width` or `Height` takes it from the drawing. Not yet: attaching it from the app (#484), turning it with a rotated device (#485) | partly (#312) |
 | 3D model export (STEP) | add-on | yes | yes | done |
 | 3D cabinet design with wire routing | add-on (Pro Panel) | yes (Electrical 3D) | no | later: one-way export to SolidCraft (phase 5) |
 | Drilling and NC data for plates | add-on | partly | no | not planned for now: belongs to the 3D side (SolidCraft) |

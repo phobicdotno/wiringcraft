@@ -1718,6 +1718,7 @@ pub fn status_bar(ui: &mut egui::Ui, open: Option<&Open>, ed: &Editor, live: Opt
             Tool::Wire => "Draw wire",
             Tool::Text => "Text",
             Tool::Comment => "Comment",
+            Tool::BlackBox => "Black box",
             Tool::Line => "Line",
             Tool::Rect => "Rectangle",
             Tool::Circle => "Circle",

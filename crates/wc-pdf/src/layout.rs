@@ -10,8 +10,8 @@ use crate::Options;
 use crate::writer::{Drawn, Layer, Link, Pen, text_width_mm};
 
 pub use wc_core::project::FRAME_COLUMNS;
-const MARGIN: f64 = wc_core::project::FRAME_MARGIN;
-const HEADER: f64 = 6.0;
+pub(crate) const MARGIN: f64 = wc_core::project::FRAME_MARGIN;
+pub(crate) const HEADER: f64 = 6.0;
 #[cfg(test)]
 const TITLE_H: f64 = wc_core::template::TITLE_HEIGHT;
 
@@ -723,7 +723,7 @@ fn cover_marks(project: &Project, (x0, y0, x1, y1): (f64, f64, f64, f64), date: 
     }
 }
 
-fn frame(pen: &mut Pen, project: &Project, page: &Page, index: usize, total: usize, date: &str) {
+pub(crate) fn frame(pen: &mut Pen, project: &Project, page: &Page, index: usize, total: usize, date: &str) {
     for m in frame_marks(project, page, index, total, date) {
         match m.ink {
             Ink::Thick => {
@@ -1481,6 +1481,7 @@ pub fn draw_panel_page(
     index: usize,
     total: usize,
     panel: &wc_core::panel::Panel,
+    footprints: &BTreeMap<String, wc_core::Footprint>,
     date: &str,
 ) -> Drawn {
     use wc_core::panel::PanelItem;
@@ -1532,8 +1533,27 @@ pub fn draw_panel_page(
             let (width, height) = (*width, *height);
             pen.colour(1.0, 1.0, 1.0);
             pen.fill_rect(p(at.x, at.y), p(at.x + width, at.y + height));
-            pen.colour(0.0, 0.0, 0.0);
-            pen.rect(p(at.x, at.y), p(at.x + width, at.y + height));
+            let footprint = project
+                .devices
+                .get(tag)
+                .and_then(|d| d.part.as_ref())
+                .and_then(|id| footprints.get(id));
+            if let Some(f) = footprint {
+                // The maker's outline at its real size (shrunk to the box if the box is
+                // smaller), with the box itself as a faint frame.
+                pen.colour(0.7, 0.7, 0.7);
+                pen.width(0.1);
+                pen.rect(p(at.x, at.y), p(at.x + width, at.y + height));
+                pen.colour(0.0, 0.0, 0.0);
+                pen.width(0.18);
+                for s in f.placed(*at, width, height) {
+                    draw_shape(&mut pen, &s.scaled(k).translate(Point::new(ox, oy)));
+                }
+                pen.width(0.35);
+            } else {
+                pen.colour(0.0, 0.0, 0.0);
+                pen.rect(p(at.x, at.y), p(at.x + width, at.y + height));
+            }
             // The product aspect is what fits on a narrow device; the full tag is in the list.
             let label = tag.product.join(".");
             let label = format!("-{label}");

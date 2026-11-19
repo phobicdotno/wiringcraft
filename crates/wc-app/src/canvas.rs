@@ -61,6 +61,13 @@ pub struct Editor {
     pub ask_text: Option<Point>,
     /// The comment tool was clicked here; the app asks for the comment.
     pub ask_comment: Option<Point>,
+    /// A black box being drawn with the black box tool.
+    pub black_box: Option<crate::black_box_tool::BoxDraft>,
+    /// The black box tool was clicked on an edge of its box; the app asks for the connection
+    /// point's name.
+    pub ask_box_pin: Option<(wc_core::BoxSide, f64)>,
+    /// The black box tool is done adding connection points; the app asks for the tag.
+    pub ask_box_tag: bool,
     /// The review comment shown in the properties panel, by id.
     pub comment: Option<String>,
     pub message: String,
@@ -106,6 +113,9 @@ impl Default for Editor {
             last_shape_click: None,
             ask_text: None,
             ask_comment: None,
+            black_box: None,
+            ask_box_pin: None,
+            ask_box_tag: false,
             comment: None,
             message: String::new(),
             marking_strip: None,
@@ -558,6 +568,10 @@ pub(crate) fn value_placeholder(
 /// changed.
 pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool, snap_step: f64) {
     drop_draft_of_other_page(open, ed);
+    // A black box being drawn belongs to its tool: another tool drops it.
+    if ed.tool != Tool::BlackBox {
+        ed.black_box = None;
+    }
     // An item on a layer that was just hidden or locked does not stay selected.
     let layers = ed.layers.clone();
     ed.selection.retain(|s| layers.may_select(s));
@@ -1002,6 +1016,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
         ed.tool = Tool::Select;
         ed.wire = None;
         ed.shape_points.clear();
+        ed.black_box = None;
     }
     leave_unpickable_layer(ed);
 
@@ -1048,6 +1063,134 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
                     paint_shape(&painter, &xf, &s, ghost);
                 }
             }
+        }
+        Tool::BlackBox => black_box_tool(&painter, &resp, ed, &page, &xf, &shown, &t, finish, tol, snap_step),
+    }
+}
+
+/// The black box tool: a drag (or two clicks) draws the rectangle; then a click on an edge
+/// asks for a connection point there, and a click inside the box (or Enter) asks for the tag.
+#[allow(clippy::too_many_arguments)]
+fn black_box_tool(
+    painter: &egui::Painter,
+    resp: &egui::Response,
+    ed: &mut Editor,
+    page: &Page,
+    xf: &Xf,
+    shown: &Xf,
+    t: &theme::Theme,
+    enter: bool,
+    tol: f64,
+    snap_step: f64,
+) {
+    use crate::black_box_tool::{BoxDraft, edge_at, hint, inside};
+    if ed.black_box.as_ref().is_some_and(|d| d.page_id != page.id) {
+        ed.black_box = None;
+        ed.message = hint(None).into();
+    }
+    // A dialog for this box is waiting: the canvas takes no clicks for it meanwhile.
+    let asking = ed.ask_box_pin.is_some() || ed.ask_box_tag;
+    let cur = ed.cursor;
+    // Where a click or a drag ended, unsnapped: the release itself, since a touch screen
+    // clears the hover position (and so `ed.cursor`) in the frame it lets go.
+    // Pointer input is read in the view the user saw (`shown`): a zoom in the same frame must
+    // not move it. `xf` is the view drawn now.
+    let released_at = primary_release_pos(&resp.ctx)
+        .or(resp.interact_pointer_pos())
+        .map(|p| shown.mm(p));
+    // How near an edge a click must land, in that view too; `tol` (the view drawn now) is
+    // for the hover ring.
+    let click_tol = (6.0 / f64::from(shown.zoom)).max(0.8);
+    match ed.black_box.as_mut() {
+        None if !asking => {
+            // A drag is only seen once the pointer has moved: its corner is where the button
+            // went down, not where the pointer is by then.
+            let start = if resp.drag_started_by(egui::PointerButton::Primary) {
+                resp.ctx
+                    .input(|i| i.pointer.press_origin())
+                    .or(resp.interact_pointer_pos())
+                    .map(|p| snap(shown.mm(p), snap_step))
+            } else if resp.clicked_by(egui::PointerButton::Primary) {
+                released_at.map(|p| snap(p, snap_step))
+            } else {
+                None
+            };
+            if let Some(at) = start {
+                ed.black_box = Some(BoxDraft::new(&page.id, at));
+                ed.message = hint(ed.black_box.as_ref()).into();
+            }
+        }
+        Some(d) if d.to.is_none() && !asking => {
+            let released =
+                resp.drag_stopped_by(egui::PointerButton::Primary) || resp.clicked_by(egui::PointerButton::Primary);
+            let at = released_at.map(|p| snap(p, snap_step));
+            if released && let Some(at) = at.filter(|at| at.x != d.from.x && at.y != d.from.y) {
+                d.to = Some(at);
+                ed.message = hint(Some(d)).into();
+            }
+        }
+        Some(d) if !asking => {
+            let Some((min, max)) = d.rect() else { return };
+            if resp.clicked_by(egui::PointerButton::Primary)
+                && let Some(at) = released_at
+            {
+                if let Some(hit) = edge_at(min, max, at, click_tol) {
+                    // Snapped along the edge, like every other point on the page.
+                    let snapped = edge_at(min, max, snap(at, snap_step), f64::INFINITY);
+                    ed.ask_box_pin = Some(match snapped {
+                        Some((side, off)) if side == hit.0 => (side, off),
+                        _ => hit,
+                    });
+                } else if inside(min, max, at, click_tol) {
+                    ed.ask_box_tag = true;
+                }
+            } else if enter {
+                ed.ask_box_tag = true;
+            }
+        }
+        _ => {}
+    }
+
+    // The box so far, its points, and where a click on an edge would put the next one.
+    let ghost = Stroke::new(1.5_f32, t.ghost);
+    let Some(d) = ed.black_box.as_ref() else { return };
+    let (min, max) = match d.rect() {
+        Some(r) => r,
+        None => match cur {
+            Some(c) => crate::black_box_tool::corners(d.from, c),
+            None => return,
+        },
+    };
+    painter.rect_stroke(
+        Rect::from_two_pos(xf.s(min), xf.s(max)),
+        0.0,
+        ghost,
+        egui::StrokeKind::Middle,
+    );
+    for pin in &d.pins {
+        if let Some(at) = d.pin_at(pin) {
+            painter.circle_filled(xf.s(at), 3.0, t.accent);
+            painter.text(
+                xf.s(at) + Vec2::new(4.0, -4.0),
+                Align2::LEFT_BOTTOM,
+                &pin.name,
+                FontId::proportional(11.0),
+                t.ink,
+            );
+        }
+    }
+    if d.to.is_some()
+        && !asking
+        && let Some(c) = cur
+        && let Some((side, off)) = edge_at(min, max, c, tol.max(1.0))
+    {
+        let at = d.pin_at(&wc_core::BoxPin {
+            name: String::new(),
+            side,
+            offset: off,
+        });
+        if let Some(at) = at {
+            painter.circle_stroke(xf.s(at), 4.0, Stroke::new(1.5_f32, t.accent));
         }
     }
 }
@@ -1146,7 +1289,7 @@ fn leave_unpickable_layer(ed: &mut Editor) {
         }
         Tool::Comment => Layer::Comments,
         // Revision clouds and the revision table are on no layer.
-        Tool::Select | Tool::Place | Tool::Wire | Tool::Cloud | Tool::RevisionTable => return,
+        Tool::Select | Tool::Place | Tool::Wire | Tool::Cloud | Tool::RevisionTable | Tool::BlackBox => return,
     };
     let Some(why) = ed.layers.refusal(layer) else {
         return;
@@ -2192,6 +2335,147 @@ mod tests {
             &open.project.pages[0].graphics[..],
             [Shape::Polyline { points, .. }] if points.len() == 2
         ));
+    }
+
+    #[test]
+    fn the_black_box_tool_takes_a_drag_edge_clicks_and_a_click_inside_through_egui_events() {
+        let (_tmp, mut open) = project();
+        let mut ed = Editor {
+            tool: Tool::BlackBox,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let button = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let (a, b) = (egui::pos2(300.0, 200.0), egui::pos2(500.0, 350.0));
+        // A first frame lays the canvas out, so the pointer is over it from then on.
+        painted(&ctx, &mut open, &mut ed, 0.5, vec![]);
+        painted(&ctx, &mut open, &mut ed, 1.0, vec![egui::Event::PointerMoved(a)]);
+        let corner = ed.cursor.unwrap();
+        painted(&ctx, &mut open, &mut ed, 1.01, vec![button(a, true)]);
+        // One move all the way: the drag is seen only now, with the pointer already at `b`.
+        painted(&ctx, &mut open, &mut ed, 1.05, vec![egui::Event::PointerMoved(b)]);
+        let other = ed.cursor.unwrap();
+        painted(&ctx, &mut open, &mut ed, 1.1, vec![button(b, false)]);
+        let d = ed.black_box.clone().unwrap();
+        assert_eq!(d.from, corner, "the drag's corner is where the button went down");
+        assert_eq!(d.to, Some(other));
+        assert!(ed.ask_box_pin.is_none() && !ed.ask_box_tag);
+
+        // A click on the top edge asks for a connection point there.
+        click_at(&ctx, &mut open, &mut ed, egui::pos2(400.0, 200.0), 2.0);
+        let Some((side, offset)) = ed.ask_box_pin.take() else {
+            unreachable!("a click on the edge asks for a point")
+        };
+        assert_eq!(side, wc_core::BoxSide::Top);
+        assert!(offset > 0.0 && offset < other.x - corner.x, "{offset}");
+        ed.black_box.as_mut().unwrap().add_pin(side, offset, "1").unwrap();
+        // A click inside asks for the tag; the page is not changed by any of it.
+        click_at(&ctx, &mut open, &mut ed, egui::pos2(400.0, 280.0), 3.0);
+        assert!(ed.ask_box_tag);
+        assert!(open.project.pages[0].symbols.is_empty());
+
+        // On a touch screen the release comes with PointerGone in the same frame, which clears
+        // the hover position: a tap still starts a box and a second one finishes it.
+        ed.ask_box_tag = false;
+        ed.black_box = None;
+        let tap = |open: &mut Open, ed: &mut Editor, pos: egui::Pos2, t: f64| {
+            painted(
+                &ctx,
+                open,
+                ed,
+                t,
+                vec![egui::Event::PointerMoved(pos), button(pos, true)],
+            );
+            painted(
+                &ctx,
+                open,
+                ed,
+                t + 0.02,
+                vec![button(pos, false), egui::Event::PointerGone],
+            );
+        };
+        tap(&mut open, &mut ed, a, 5.0);
+        assert!(ed.cursor.is_none(), "the hover position is gone after the tap");
+        assert_eq!(ed.black_box.as_ref().map(|d| d.from), Some(corner));
+        tap(&mut open, &mut ed, b, 6.0);
+        assert_eq!(ed.black_box.as_ref().and_then(|d| d.to), Some(other));
+
+        // Released at `b`, then moved and zoomed in the same frame: the corner is where `b` was
+        // in the view the user saw.
+        ed.black_box = None;
+        click_at(&ctx, &mut open, &mut ed, a, 7.0);
+        let zoom = ed.view.zoom;
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            8.0,
+            vec![egui::Event::PointerMoved(b), button(b, true)],
+        );
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            8.01,
+            // Moved on to `a` before the zoom, so the zoom is about `a` and moves `b`.
+            vec![button(b, false), egui::Event::PointerMoved(a), egui::Event::Zoom(2.0)],
+        );
+        assert!(ed.view.zoom > zoom, "the view zoomed");
+        assert_eq!(ed.black_box.as_ref().and_then(|d| d.to), Some(other));
+
+        // A click near an edge, released as the view zooms in: it is judged at the zoom the
+        // user saw, so it still lands on the edge (at the new zoom it would be inside).
+        ed.view = View {
+            zoom: 1.0,
+            offset: Vec2::ZERO,
+            fit: false,
+        };
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            8.5,
+            vec![egui::Event::PointerMoved(egui::pos2(100.0, 100.0))],
+        );
+        let seen = ed.cursor.unwrap();
+        let origin = egui::pos2(100.0 - seen.x as f32, 100.0 - seen.y as f32);
+        let mut d = crate::black_box_tool::BoxDraft::new(&open.project.pages[0].id, Point::new(50.0, 50.0));
+        d.to = Some(Point::new(150.0, 150.0));
+        ed.black_box = Some(d);
+        let near_top = origin + Vec2::new(100.0, 54.0);
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            8.6,
+            vec![egui::Event::PointerMoved(near_top), button(near_top, true)],
+        );
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            8.62,
+            vec![
+                button(near_top, false),
+                egui::Event::PointerMoved(origin + Vec2::new(400.0, 400.0)),
+                egui::Event::Zoom(2.0),
+            ],
+        );
+        assert!(ed.view.zoom > 1.5, "the view zoomed");
+        assert!(!ed.ask_box_tag, "not taken for a click inside");
+        assert_eq!(ed.ask_box_pin.take().map(|(side, _)| side), Some(wc_core::BoxSide::Top));
+
+        // Another tool drops the box being drawn.
+        ed.ask_box_tag = false;
+        ed.tool = Tool::Line;
+        painted(&ctx, &mut open, &mut ed, 9.0, vec![]);
+        assert!(ed.black_box.is_none());
     }
 
     #[test]

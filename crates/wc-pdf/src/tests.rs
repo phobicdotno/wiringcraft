@@ -711,6 +711,65 @@ fn panel_layouts_print_after_the_schematic_pages() {
 }
 
 #[test]
+fn a_device_with_a_footprint_drawing_is_drawn_with_it_on_the_layout() {
+    use wc_core::panel::{Panel, PanelItem};
+    let Ok(tag) = DeviceTag::parse("+CAB1-A1") else {
+        unreachable!("a valid tag")
+    };
+    let mut project = Project::new("x");
+    project.devices.insert(
+        tag.clone(),
+        wc_core::Device {
+            part: Some("maker.io-module".into()),
+            ..Default::default()
+        },
+    );
+    let mut panel = Panel::new("main", "Cabinet", 600.0, 800.0);
+    panel.items.push(PanelItem::Device {
+        tag,
+        at: Point::new(50.0, 100.0),
+        width: 22.5,
+        height: 100.0,
+    });
+    let Some(footprint) = wc_core::Footprint::from_shapes(vec![
+        Shape::Rect {
+            min: Point::new(0.0, 0.0),
+            max: Point::new(22.5, 100.0),
+        },
+        Shape::Text {
+            at: Point::new(2.0, 10.0),
+            text: "MAKER IO".into(),
+            height: 3.0,
+            align: wc_core::geom::Align::Left,
+            angle: 0.0,
+        },
+    ]) else {
+        unreachable!("the outline has a size")
+    };
+    let part = wc_core::Part {
+        id: "maker.io-module".into(),
+        footprint: Some(footprint),
+        ..Default::default()
+    };
+    let page = Page::new("panel-main", "P1", "Cabinet");
+    let draw = |footprints: &BTreeMap<String, wc_core::Footprint>| {
+        layout::draw_panel_page(&project, &page, 0, 1, &panel, footprints, "")
+    };
+    let plain = draw(&BTreeMap::new());
+    let drawn = draw(&footprints([&part]));
+    let label = writer::pdf_text("MAKER IO");
+    assert!(!plain.ops.contains(&label), "without the drawing the device is a box");
+    assert!(drawn.ops.contains(&label), "the maker's drawing is on the layout");
+    assert!(drawn.ops.contains(&writer::pdf_text("-A1")), "the tag is still printed");
+    // A part without a drawing, and a device without a part, stay boxes.
+    let other = wc_core::Part {
+        id: "other".into(),
+        ..Default::default()
+    };
+    assert!(footprints([&other]).is_empty());
+}
+
+#[test]
 fn a_contact_points_to_the_schematic_coil_not_the_overview_repeat() {
     let mut symbols = BTreeMap::new();
     symbols.insert("coil".to_owned(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
@@ -1724,6 +1783,236 @@ fn a_rack_of_three_cards_gives_plc_card_overview_pages() {
 }
 
 #[test]
+fn a_network_gets_a_topology_page_with_its_devices_addresses_and_cables() {
+    use wc_core::network::{Link as NetLink, Network, Node};
+    let mut project = Project::new("x");
+    let mut p1 = Page::new("p1", "1", "PLC");
+    p1.symbols.push(place("s1", "coil", 50.0, "-K10"));
+    project.pages.push(p1);
+    let node = |d: &str, a: &str| Node {
+        device: d.into(),
+        address: a.into(),
+        ..Node::default()
+    };
+    let link = |a: &str, b: &str, w: &str| NetLink {
+        from: a.into(),
+        to: b.into(),
+        cable: w.into(),
+        ..NetLink::default()
+    };
+    // PLC - switch - two drives, and a ring of three devices back to the first one.
+    let line = Network {
+        name: "PN1".into(),
+        kind: "profinet".into(),
+        nodes: vec![
+            node("-A1", "192.168.0.1"),
+            node("-K10", "192.168.0.10"),
+            node("-T1", "192.168.0.21"),
+            node("-T2", "192.168.0.22"),
+        ],
+        links: vec![
+            link("-A1:X1P1", "-K10:P1", "-W1"),
+            link("-K10:P2", "-T1:X1", "-W2"),
+            link("-K10:P3", "-T2:X1", "-W3"),
+        ],
+        ..Network::default()
+    };
+    let ring = Network {
+        name: "RING".into(),
+        nodes: vec![node("-A5", ""), node("-A6", ""), node("-A7", "")],
+        links: vec![
+            link("-A5:P1", "-A6:P1", "-W51"),
+            link("-A6:P2", "-A7:P1", "-W52"),
+            link("-A7:P2", "-A5:P2", "-W53"),
+        ],
+        ..Network::default()
+    };
+    let opts = Options {
+        networks: vec![line, ring],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    assert_eq!(report.pages, 3);
+    assert!(text.contains(&format!("/Title {}", writer::pdf_text("N1 Network PN1"))));
+    assert!(text.contains(&format!("/Title {}", writer::pdf_text("N2 Network RING"))));
+    for t in [
+        "-A1",
+        "-K10",
+        "-T1",
+        "-T2",
+        "192.168.0.1",
+        "192.168.0.10",
+        "192.168.0.21",
+        "192.168.0.22",
+        "-W1",
+        "-W2",
+        "-W3",
+        "X1P1",
+        "P3",
+    ] {
+        assert!(text.contains(&writer::pdf_text(t)), "{t}");
+    }
+    // Every link of the ring is drawn once, each with its cable tag (alone, or after the
+    // port names over a short lane).
+    for w in ["-W51", "-W52", "-W53"] {
+        let hex = writer::pdf_text(w);
+        let hex = hex.trim_start_matches('<').trim_end_matches('>');
+        assert_eq!(text.matches(hex).count(), 1, "{w}");
+    }
+    // The switch's box links to the page it is drawn on; the others are on no page.
+    assert_eq!(text.matches("/Subtype /Link").count(), 1);
+}
+
+#[test]
+fn a_topology_box_links_to_a_page_the_pdf_holds() {
+    use wc_core::network::{Link as NetLink, Network};
+    let mut symbols = BTreeMap::new();
+    symbols.insert("coil".to_owned(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
+    let mut project = Project::new("x");
+    let mut p1 = Page::new("p1", "1", "Power");
+    p1.symbols.push(place("s1", "coil", 50.0, "-K10"));
+    let mut p2 = Page::new("p2", "2", "Control");
+    p2.symbols.push(place("s2", "coil", 50.0, "-K10"));
+    project.pages = vec![p1, p2];
+    let net = Network {
+        name: "PN1".into(),
+        links: vec![NetLink {
+            from: "-K10:P1".into(),
+            to: "-A1:P1".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    // Only the second page is exported: the box links there, not to the first page.
+    let opts = Options {
+        pages: vec!["p2".into()],
+        networks: vec![net],
+        ..Default::default()
+    };
+    let (pdf, _) = export(&project, &symbols, &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    assert_eq!(
+        text.matches("/Subtype /Link").count(),
+        1,
+        "the -K10 box links to page 2"
+    );
+}
+
+#[test]
+fn a_link_between_two_ports_of_one_device_is_drawn_and_a_bad_tag_is_warned_about() {
+    use wc_core::network::{Link as NetLink, Network, Node};
+    let net = Network {
+        name: "PN2".into(),
+        nodes: vec![Node {
+            device: "K 10?".into(),
+            address: "192.168.0.2".into(),
+            station: "drive-07".into(),
+            ..Node::default()
+        }],
+        links: vec![
+            NetLink {
+                from: "-K10:P1".into(),
+                to: "-K10:P2".into(),
+                cable: "-W9".into(),
+                ..NetLink::default()
+            },
+            NetLink {
+                from: "-K10:P3".into(),
+                to: "-K10:P4".into(),
+                cable: "-W8".into(),
+                ..NetLink::default()
+            },
+            NetLink {
+                from: "-K10:P5".into(),
+                to: "secret label!:P1".into(),
+                cable: "-W7".into(),
+                ..NetLink::default()
+            },
+        ],
+        ..Network::default()
+    };
+    let opts = Options {
+        networks: vec![net],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&Project::new("x"), &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    assert!(text.contains(&writer::pdf_text("P1 - P2 -W9")));
+    assert!(text.contains(&writer::pdf_text("P3 - P4 -W8")));
+    // Drawn as written; the warning names the node by number, not by its text.
+    assert!(text.contains(&writer::pdf_text("K 10?")));
+    // Its address and station are still drawn in its box.
+    assert!(text.contains(&writer::pdf_text("192.168.0.2")));
+    assert!(text.contains(&writer::pdf_text("drive-07")));
+    assert!(
+        report.warnings.iter().any(|w| w.starts_with("network PN2: node ")
+            && w.ends_with(" is not a device tag: only letters, digits, '.', '_' allowed")),
+        "{:?}",
+        report.warnings
+    );
+    // A bad link end: the reason, by link number, and never the text written there.
+    assert!(
+        report.warnings.contains(
+            &"network PN2: link 3: its to end is not a device or port: only letters, digits, '.', '_' allowed"
+                .to_owned()
+        ),
+        "{:?}",
+        report.warnings
+    );
+    assert!(
+        !report
+            .warnings
+            .iter()
+            .any(|w| w.contains("secret") || w.contains("K 10?"))
+    );
+}
+
+#[test]
+fn a_link_with_an_empty_end_is_warned_about_and_the_others_are_drawn() {
+    use wc_core::network::{Link as NetLink, Network};
+    let link = |from: &str, to: &str, cable: &str| NetLink {
+        from: from.into(),
+        to: to.into(),
+        cable: cable.into(),
+        ..NetLink::default()
+    };
+    let net = Network {
+        name: "PN3".into(),
+        links: vec![
+            link("-A1:X1", "-K10:P1", "-W1"),
+            link("-K10:P2", "", "-W2"),
+            link("-K10:P3", "-T1:X1", "-W3"),
+        ],
+        ..Network::default()
+    };
+    let opts = Options {
+        networks: vec![net],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&Project::new("x"), &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    // The valid links are drawn with their cables; the one with an empty end is not.
+    for drawn in ["-A1", "-K10", "-T1", "-W1", "-W3"] {
+        assert!(text.contains(&writer::pdf_text(drawn)), "{drawn}");
+    }
+    assert!(!text.contains(&writer::pdf_text("-W2")));
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w == "network PN3: link 2 is not drawn: an end names no device"),
+        "{:?}",
+        report.warnings
+    );
+    assert!(
+        !report.warnings.iter().any(|w| w.contains("-K10:P2")),
+        "{:?}",
+        report.warnings
+    );
+}
+
+#[test]
 fn plc_cards_are_drawn_one_per_sheet_with_their_points_linked() {
     use wc_report::{CardChannel, CardPoint, PlcCardSheet};
     let mut project = Project::new("x");
@@ -1918,4 +2207,77 @@ fn a_long_page_reference_on_a_plc_card_is_cut_to_its_column() {
     );
     assert!(!drawn.ops.contains(&writer::pdf_text(connected)));
     assert!(conn_x + writer::text_width_mm(&shown, 2.5) < page_x - layout::CARD_PAGE);
+}
+
+#[test]
+fn a_declared_node_with_a_blank_tag_keeps_its_box_address_and_station() {
+    use wc_core::network::{Network, Node};
+    let net = Network {
+        name: "PN3".into(),
+        nodes: vec![
+            // Text that reads like the name a blank node is shown under does not take its box.
+            Node {
+                device: "(node 2)".into(),
+                address: "10.0.0.1".into(),
+                ..Node::default()
+            },
+            // Nor does text holding the marker of a blank node's internal name, or text close
+            // to it: each keeps a box of its own.
+            Node {
+                device: "\u{1}4".into(),
+                address: "10.0.0.3".into(),
+                ..Node::default()
+            },
+            Node {
+                device: "\u{FFFD}4".into(),
+                address: "10.0.0.4".into(),
+                ..Node::default()
+            },
+            Node {
+                device: "  ".into(),
+                address: "192.168.0.2".into(),
+                station: "drive-07".into(),
+                ..Node::default()
+            },
+        ],
+        links: vec![
+            wc_core::network::Link {
+                from: "(node 2)".into(),
+                to: "-K1:P1".into(),
+                ..Default::default()
+            },
+            wc_core::network::Link {
+                from: "\u{FFFD}4".into(),
+                to: "-K1:P2".into(),
+                ..Default::default()
+            },
+        ],
+        ..Network::default()
+    };
+    // Four nodes and -K1: five boxes, none merged, and both links drawn.
+    let topo = crate::topology::layout_network(&net);
+    assert_eq!(topo.boxes.len(), 5, "{:?}", topo.boxes);
+    assert!(topo.unplaced.is_empty());
+    let opts = Options {
+        networks: vec![net],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&Project::new("x"), &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    assert_eq!(text.matches(&writer::pdf_text("(node 4)")).count(), 1);
+    assert!(text.contains(&writer::pdf_text("(node 2)")));
+    assert!(text.contains(&writer::pdf_text("10.0.0.1")));
+    assert!(text.contains(&writer::pdf_text("10.0.0.3")));
+    assert!(text.contains(&writer::pdf_text("10.0.0.4")));
+    assert!(text.contains(&writer::pdf_text("192.168.0.2")));
+    assert!(text.contains(&writer::pdf_text("drive-07")));
+    assert!(!text.contains(&writer::pdf_text("No devices on this network.")));
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("network PN3: node 4 is not a device tag")),
+        "{:?}",
+        report.warnings
+    );
 }
