@@ -40,6 +40,10 @@ pub fn create_from_base_until(
     let fetched = tmp.path().join("base");
     let target = fetched.to_string_lossy().into_owned();
     Git::new(tmp.path()).run_until(&["clone", "-q", "--depth", "1", "--", source, &target], cancel)?;
+    #[cfg(test)]
+    if tests::CANCEL_AFTER_CLONE.get() {
+        cancel.store(true, Ordering::Relaxed);
+    }
     // A library folder next to the repository was not fetched with it.
     let outside = wc_core::base::outside_libraries(&wc_core::store::load(&fetched)?);
     if !outside.is_empty() {
@@ -77,6 +81,11 @@ fn private_temp_dir() -> std::io::Result<tempfile::TempDir> {
 mod tests {
     use super::*;
     use wc_core::store;
+
+    thread_local! {
+        /// Set: Cancel is pressed right after the clone, while the fetched project is read.
+        pub(super) static CANCEL_AFTER_CLONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
 
     /// A `file://` URL for a local folder, also with a Windows drive letter.
     fn file_url(p: &std::path::Path) -> String {
@@ -150,6 +159,13 @@ mod tests {
         let new = tmp.path().join("new");
         let cancel = AtomicBool::new(true);
         let e = create_from_base_until(&file_url(&base), &new, "New", "2026-11-19", &cancel).unwrap_err();
+        assert!(matches!(e, crate::Error::Cancelled), "{e}");
+        assert!(!new.exists());
+        // Cancelled once the clone is in, before the project is made: still nothing.
+        CANCEL_AFTER_CLONE.set(true);
+        let cancel = AtomicBool::new(false);
+        let e = create_from_base_until(&file_url(&base), &new, "New", "2026-11-19", &cancel).unwrap_err();
+        CANCEL_AFTER_CLONE.set(false);
         assert!(matches!(e, crate::Error::Cancelled), "{e}");
         assert!(!new.exists());
         // Not cancelled, the same call makes the project.
