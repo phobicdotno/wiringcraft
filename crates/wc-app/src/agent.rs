@@ -2901,7 +2901,8 @@ fn writes_while_held(args: &[String], dir: &Path, held: &BTreeMap<String, String
         _ => 1,
     };
     let more = args.iter().skip(words).any(|a| !a.starts_with('-'));
-    if more && project.holds(cwd) {
+    // When that cannot be told, the command is not run from there either.
+    if more && project.holds(cwd).unwrap_or(true) {
         return Some(format!(
             "`wiringcraft {}` is not run while {who} has a page open in the shared session: this program runs \
              from inside the project folder, so an output file could land on a page. Start it from another folder.",
@@ -2936,6 +2937,9 @@ struct Guarded {
     roots: Vec<PathBuf>,
     /// The identity of each project file ([`file_id`]), so a hard link to one is known too.
     files: std::collections::HashSet<(u64, u64)>,
+    /// Why a project file's identity could not be read, if one could not: a hard link to that
+    /// file would go unseen, so no output file is taken as safe then.
+    unknown: Option<String>,
 }
 
 /// How many files in an output folder are looked at; a bigger folder is not used while a
@@ -2947,6 +2951,7 @@ impl Guarded {
         let roots = project_roots(project);
         let files = {
             let mut files = std::collections::HashSet::new();
+            let mut unknown = None;
             let mut todo = roots.clone();
             while let Some(at) = todo.pop() {
                 let Ok(m) = std::fs::symlink_metadata(&at) else {
@@ -2955,26 +2960,46 @@ impl Guarded {
                 if m.is_dir() {
                     let entries = std::fs::read_dir(&at).into_iter().flatten().flatten();
                     todo.extend(entries.filter(|e| e.file_name() != ".git").map(|e| e.path()));
-                } else if m.is_file()
-                    && let Some(id) = file_id(&at)
-                {
-                    files.insert(id);
+                } else if m.is_file() {
+                    match file_id(&at) {
+                        Ok(Some(id)) => {
+                            files.insert(id);
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            unknown.get_or_insert_with(|| format!("{}: {e}", at.display()));
+                        }
+                    }
                 }
             }
-            files
+            (files, unknown)
         };
-        Self { roots, files }
+        let (files, unknown) = files;
+        Self { roots, files, unknown }
     }
 
     /// Whether `path`, as the file system resolves it, is in the project or is one of its
-    /// files under another name.
-    fn holds(&self, path: &Path) -> bool {
-        inside(&self.roots, path) || self.same_file(path)
+    /// files under another name. An error when that cannot be told.
+    fn holds(&self, path: &Path) -> std::io::Result<bool> {
+        Ok(inside(&self.roots, path) || self.same_file(path)?)
     }
 
-    /// Whether `path` is a project file under another name (a hard link to it).
-    fn same_file(&self, path: &Path) -> bool {
-        std::fs::metadata(path).is_ok_and(|m| m.is_file()) && file_id(path).is_some_and(|id| self.files.contains(&id))
+    /// Whether `path` is a project file under another name (a hard link to it). Nothing there,
+    /// or a folder, is not; a file whose identity, or a project file's, cannot be read is an
+    /// error, with the reason.
+    fn same_file(&self, path: &Path) -> std::io::Result<bool> {
+        match std::fs::metadata(path) {
+            Ok(m) if m.is_file() => {}
+            Ok(_) => return Ok(false),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        }
+        if let Some(why) = &self.unknown {
+            return Err(std::io::Error::other(format!(
+                "the identity of a project file could not be read ({why})"
+            )));
+        }
+        Ok(file_id(path)?.is_some_and(|id| self.files.contains(&id)))
     }
 
     /// Whether writing to `value` could land on a project file: it is a path into the project
@@ -2995,7 +3020,7 @@ impl Guarded {
         } else {
             return Ok(false);
         };
-        if self.holds(&path) {
+        if self.holds(&path)? {
             return Ok(true);
         }
         let mut todo = vec![real(&path)];
@@ -3012,7 +3037,7 @@ impl Guarded {
             for e in entries {
                 let e = e?;
                 seen += 1;
-                if seen > OUTPUT_FOLDER_FILES || self.holds(&e.path()) {
+                if seen > OUTPUT_FOLDER_FILES || self.holds(&e.path())? {
                     return Ok(true);
                 }
                 if e.file_type()?.is_dir() {
@@ -3027,16 +3052,16 @@ impl Guarded {
 /// What names one file on this machine whatever path reaches it, links followed: device and
 /// file number on unix.
 #[cfg(unix)]
-fn file_id(path: &Path) -> Option<(u64, u64)> {
+fn file_id(path: &Path) -> std::io::Result<Option<(u64, u64)>> {
     use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+    std::fs::metadata(path).map(|m| Some((m.dev(), m.ino())))
 }
 
 /// What names one file on this machine whatever path reaches it, links followed: the volume
 /// serial number and the file index on Windows (#459). The file is opened without read or
 /// write access, which only lets its attributes be read.
 #[cfg(windows)]
-fn file_id(path: &Path) -> Option<(u64, u64)> {
+fn file_id(path: &Path) -> std::io::Result<Option<(u64, u64)>> {
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -3045,24 +3070,24 @@ fn file_id(path: &Path) -> Option<(u64, u64)> {
     let file = std::fs::OpenOptions::new()
         .access_mode(0)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .open(path)
-        .ok()?;
+        .open(path)?;
     // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is a valid value (plain integers).
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: the handle is open for the whole call and `info` is a valid place to write to.
     let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
-    (ok != 0).then(|| {
-        (
-            u64::from(info.dwVolumeSerialNumber),
-            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
-        )
-    })
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(Some((
+        u64::from(info.dwVolumeSerialNumber),
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    )))
 }
 
-/// Elsewhere hard links are not told apart.
+/// Elsewhere hard links are not told apart: no identity, which is not an error.
 #[cfg(not(any(unix, windows)))]
-fn file_id(_path: &Path) -> Option<(u64, u64)> {
-    None
+fn file_id(_path: &Path) -> std::io::Result<Option<(u64, u64)>> {
+    Ok(None)
 }
 
 /// Whether `path`, as the file system resolves it, is in one of `roots`.
