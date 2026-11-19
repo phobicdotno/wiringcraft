@@ -2344,10 +2344,13 @@ impl Held {
             .filter(|t| !base.devices.contains_key(*t))
             .cloned()
             .collect();
-        if new_tags.is_empty() {
+        if new_tags.is_empty() && recorded.is_empty() {
             return;
         }
         let named = |t: &wc_core::DeviceTag| new_tags.contains(t);
+        // A recorded rename's tags that wait now: its new tag may be in the session already as
+        // the old tag of another rename made with it, and wait for its own part.
+        let waits_now: BTreeSet<wc_core::DeviceTag> = self.now.devices.keys().cloned().collect();
         let gone: Vec<wc_core::DeviceTag> = base
             .devices
             .keys()
@@ -2451,7 +2454,11 @@ impl Held {
         pairs.extend(
             recorded
                 .iter()
-                .filter(|(old, _)| chained.iter().any(|c| c.contains(*old) && c.iter().any(|t| named(t))))
+                .filter(|(old, _)| {
+                    chained
+                        .iter()
+                        .any(|c| c.contains(*old) && c.iter().any(|t| waits_now.contains(*t)))
+                })
                 .map(|(old, new)| ((*old).clone(), (*new).clone())),
         );
         // Each rename is its own group; renames that share a tag or a target wait as one.
@@ -2486,6 +2493,9 @@ impl Held {
             join(&mut groups, &[old, new]);
         }
         let paired: Vec<wc_core::DeviceTag> = pairs.iter().map(|(_, n)| n.clone()).collect();
+        // What a waiting rename retags waits with it, also under a new tag the session has as
+        // another device's.
+        let named = |t: &wc_core::DeviceTag| named(t) || paired.contains(t);
         // The paired new tags among those a target names.
         let renamed_in = |names: &dyn Fn(&wc_core::DeviceTag) -> bool| -> Vec<&wc_core::DeviceTag> {
             paired.iter().filter(|t| names(t)).collect()
