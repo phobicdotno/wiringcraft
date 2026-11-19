@@ -196,6 +196,10 @@ struct App {
 struct BaseFetch {
     /// Where the new project goes.
     dir: PathBuf,
+    /// The repository it comes from, shown while it is fetched.
+    source: String,
+    /// The project that was open when the fetch started: the new one replaces only that one.
+    was_open: Option<PathBuf>,
     /// Set to stop the fetch: nothing is made then.
     cancel: std::sync::Arc<AtomicBool>,
     /// The outcome: made, why not, or `None` when it was cancelled.
@@ -2195,10 +2199,10 @@ impl App {
             self.new_project(dir, name, base);
             return;
         };
-        if self.fetch.is_some() {
-            self.dialog = Some(Dialog::Message(
-                "A base project is being fetched already; wait for it or cancel it first.".into(),
-            ));
+        if let Some(f) = &self.fetch {
+            // The running fetch keeps its note and Cancel.
+            self.dialog = Some(Dialog::Fetching(f.source.clone()));
+            self.ed.message = "A base project is being fetched already; wait for it or cancel it first.".into();
             return;
         }
         let name = Self::project_name(dir, name);
@@ -2214,6 +2218,8 @@ impl App {
         });
         self.fetch = Some(BaseFetch {
             dir: dir.to_path_buf(),
+            source: source.to_owned(),
+            was_open: self.open.as_ref().map(|o| o.dir.clone()),
             cancel,
             done,
         });
@@ -2245,6 +2251,17 @@ impl App {
             self.dialog = None;
         }
         match outcome {
+            Ok(()) if self.open.as_ref().map(|o| &o.dir) != f.was_open.as_ref() => {
+                // Another project was opened meanwhile: it stays, and the new one waits.
+                let git = wc_vcs::Git::new(&f.dir);
+                let _ = git.init().and_then(|()| git.commit("New project").map(|_| ()));
+                self.prefs.remember(f.dir.clone());
+                self.prefs.save();
+                self.dialog = Some(Dialog::Message(format!(
+                    "The new project is ready in\n{}\nOpen it from File, Open when you want it.",
+                    f.dir.display()
+                )));
+            }
             Ok(()) => self.finish_new_project(&f.dir, false),
             Err(None) => self.ed.message = "Cancelled: the new project was not made.".into(),
             Err(Some(e)) => {
@@ -2294,6 +2311,17 @@ impl App {
         }
         let git = wc_vcs::Git::new(dir);
         let _ = git.init().and_then(|()| git.commit("New project").map(|_| ()));
+        // The new project replaces the open one: keep its unsaved work first.
+        if let Some(o) = self.open.as_mut()
+            && o.dirty
+            && let Err(e) = o.save()
+        {
+            self.dialog = Some(Dialog::Message(format!(
+                "The new project is in\n{}\nbut the open project could not be saved first, so it stays open:\n{e}",
+                dir.display()
+            )));
+            return;
+        }
         let mut prefs = std::mem::take(&mut self.prefs);
         self.open_dir(dir, &mut prefs);
         self.prefs = prefs;

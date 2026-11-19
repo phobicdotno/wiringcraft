@@ -2793,6 +2793,8 @@ mod tests {
         let (tx, done) = std::sync::mpsc::channel();
         a.fetch = Some(crate::BaseFetch {
             dir: tmp.path().join("new"),
+            source: "file:///slow".into(),
+            was_open: Some(before.clone()),
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             done,
         });
@@ -2814,6 +2816,55 @@ mod tests {
         assert!(a.dialog.is_none());
         assert!(a.ed.message.contains("not made"), "{}", a.ed.message);
         assert_eq!(a.open.as_ref().unwrap().dir, before);
+    }
+
+    #[test]
+    fn a_second_fetch_keeps_the_first_ones_cancel() {
+        let (tmp, mut a) = app(vec![]);
+        let (_tx, done) = std::sync::mpsc::channel();
+        a.fetch = Some(crate::BaseFetch {
+            dir: tmp.path().join("new"),
+            source: "file:///slow".into(),
+            was_open: None,
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            done,
+        });
+        a.start_new_project(&tmp.path().join("other"), "X", Some("file:///other"));
+        assert!(matches!(&a.dialog, Some(Dialog::Fetching(s)) if s == "file:///slow"));
+        assert!(a.ed.message.contains("already"), "{}", a.ed.message);
+    }
+
+    #[test]
+    fn a_fetched_project_keeps_the_unsaved_work_of_the_open_one() {
+        let (tmp, mut a) = app(vec![]);
+        let base = tmp.path().join("base");
+        wc_core::store::create(&base, "ACME base").unwrap();
+        wc_vcs::Git::new(&base).init().unwrap();
+        let old = a.open.as_ref().unwrap().dir.clone();
+        let o = a.open.as_mut().unwrap();
+        o.project.meta.name = "Unsaved name".into();
+        o.dirty = true;
+        let dir = tmp.path().join("pump");
+        a.start_new_project(&dir, "Pump station", Some(&file_url(&base)));
+        until_fetched(&mut a);
+        assert_eq!(a.open.as_ref().unwrap().dir, dir);
+        assert_eq!(wc_core::store::load(&old).unwrap().meta.name, "Unsaved name");
+    }
+
+    #[test]
+    fn a_project_opened_while_fetching_stays_open() {
+        let (tmp, mut a) = app(vec![]);
+        let base = tmp.path().join("base");
+        wc_core::store::create(&base, "ACME base").unwrap();
+        wc_vcs::Git::new(&base).init().unwrap();
+        let dir = tmp.path().join("pump");
+        a.start_new_project(&dir, "Pump station", Some(&file_url(&base)));
+        // Another project is opened before the fetch is in.
+        a.fetch.as_mut().unwrap().was_open = Some(tmp.path().join("before"));
+        until_fetched(&mut a);
+        assert_ne!(a.open.as_ref().map(|o| o.dir.clone()), Some(dir.clone()));
+        assert!(matches!(&a.dialog, Some(Dialog::Message(m)) if m.contains("ready")));
+        assert!(dir.join(".git").exists(), "made and recorded all the same");
     }
 
     fn until_fetched_once(a: &mut App) {

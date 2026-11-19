@@ -24,7 +24,7 @@ pub fn create_from_base(source: &str, dir: &Path, name: &str, date: &str) -> Res
 }
 
 /// [`create_from_base`] that stops once `cancel` is set, while the repository is fetched or
-/// before the project is made, and then returns [`Error::Cancelled`](crate::Error::Cancelled)
+/// read, up to the point where the project is made (that then finishes), and then returns [`Error::Cancelled`](crate::Error::Cancelled)
 /// with nothing made in `dir`. Meant to run off the window thread.
 pub fn create_from_base_until(
     source: &str,
@@ -40,9 +40,6 @@ pub fn create_from_base_until(
     let fetched = tmp.path().join("base");
     let target = fetched.to_string_lossy().into_owned();
     Git::new(tmp.path()).run_until(&["clone", "-q", "--depth", "1", "--", source, &target], cancel)?;
-    if cancel.load(Ordering::Relaxed) {
-        return Err(crate::Error::Cancelled);
-    }
     // A library folder next to the repository was not fetched with it.
     let outside = wc_core::base::outside_libraries(&wc_core::store::load(&fetched)?);
     if !outside.is_empty() {
@@ -52,6 +49,10 @@ pub fn create_from_base_until(
             outside.join(", ")
         ))
         .into());
+    }
+    // The last point to stop: once the project is being made, it is made in full.
+    if cancel.load(Ordering::Relaxed) {
+        return Err(crate::Error::Cancelled);
     }
     Ok(wc_core::base::create_from(&fetched, dir, name, date)?)
 }
@@ -177,6 +178,20 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_git_command_says_why_also_in_bytes_that_are_not_utf8() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = Git::new(tmp.path()).run_until(
+            &["-c", "alias.bad=!printf 'no \\377 such server' >&2; exit 1", "bad"],
+            &AtomicBool::new(false),
+        );
+        let Err(crate::Error::Git { message, .. }) = r else {
+            unreachable!("{r:?}")
+        };
+        assert!(message.contains("no \u{fffd} such server"), "{message:?}");
     }
 
     #[cfg(unix)]
