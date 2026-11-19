@@ -2449,6 +2449,9 @@ pub struct Share {
     /// Pages a change of this person's the session refused touched, since the window last
     /// asked ([`Share::take_refused_pages`]).
     refused_pages: BTreeSet<String>,
+    /// Refusals taken from the session after the picks were looked at this frame (by
+    /// [`Share::take_refused_pages`]): the picks look at them next frame, as they would have.
+    refused_later: Refused,
     /// Files the session lacks ([`repairs_due`]) whose copy here was looked for and could not
     /// be sent (missing, unreadable, or another version), with when and [`repair_stamp`] then:
     /// each is read again only after [`ITEM_WAIT`], or at once once this copy pins or loads
@@ -3294,8 +3297,16 @@ impl Share {
                 .is_some_and(|t| t.is_some())
     }
 
-    /// The pages a change of this person's the session refused touched, since the last call.
+    /// The pages a change of this person's the session refused touched, since the last call,
+    /// also those of an answer that came in after the frame looked (the reply to what it sent).
     pub fn take_refused_pages(&mut self) -> BTreeSet<String> {
+        if let Some(role) = self.role.as_mut() {
+            let (pages, meta, edits) = role.refused_targets();
+            self.refused_pages.extend(pages.iter().cloned());
+            self.refused_later.0.extend(pages);
+            self.refused_later.1 |= meta;
+            self.refused_later.2.extend(edits);
+        }
         std::mem::take(&mut self.refused_pages)
     }
 
@@ -3797,8 +3808,12 @@ impl Share {
         }
         // A withdrawn pick stays withdrawn for a refusal of its picture that comes later: that
         // must not rename the references that are not this copy's.
-        let refused = role.refused_targets();
+        let mut refused = role.refused_targets();
         self.refused_pages.extend(refused.0.iter().cloned());
+        let (pages, meta, edits) = std::mem::take(&mut self.refused_later);
+        refused.0.extend(pages);
+        refused.1 |= meta;
+        refused.2.extend(edits);
         let withdrawn = withdraw_picks(
             &mut self.picks,
             &mut self.pick_carriers,
