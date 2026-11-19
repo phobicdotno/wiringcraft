@@ -61,6 +61,16 @@ impl Rotation {
         }
     }
 
+    /// The turn in degrees: 0, 90, 180 or 270.
+    pub fn degrees(self) -> i64 {
+        match self {
+            Self::R0 => 0,
+            Self::R90 => 90,
+            Self::R180 => 180,
+            Self::R270 => 270,
+        }
+    }
+
     pub fn is_default(&self) -> bool {
         *self == Self::R0
     }
