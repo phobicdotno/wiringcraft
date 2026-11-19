@@ -2922,6 +2922,52 @@ mod tests {
     }
 
     #[test]
+    fn a_fetched_project_waits_for_an_assistant_turn_and_the_symbol_editor() {
+        let answers = vec![json!({
+            "model": "claude-opus-5-5", "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "Done."}]
+        })];
+        let (tmp, mut a) = app(answers);
+        let before = a.open.as_ref().unwrap().dir.clone();
+        let dir = tmp.path().join("pump");
+        wc_core::store::create(&dir, "Pump station").unwrap();
+        let (tx, done) = std::sync::mpsc::channel();
+        tx.send(Ok(())).unwrap();
+        a.fetch = Some(crate::BaseFetch {
+            dir: dir.clone(),
+            source: "file:///base".into(),
+            was_open: Some(before.clone()),
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            done,
+        });
+        // A turn asked about the open project: its answer is for that project.
+        let ctx = eframe::egui::Context::default();
+        a.prefs.assistant.backend = wc_agent::Backend::ApiKey;
+        a.assistant.input = "What is on page 2?".into();
+        a.assistant_send(&ctx);
+        assert!(a.assistant.busy());
+        until_fetched_once(&mut a);
+        assert!(a.fetch.is_some());
+        for _ in 0..500 {
+            a.assistant_poll(&ctx);
+            if !a.assistant.busy() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!a.assistant.busy());
+        // A symbol draft open: it is not dropped under the user.
+        a.symbol_editor = Some(crate::symbol_editor::SymbolEditor::new(Vec::new()));
+        until_fetched_once(&mut a);
+        assert!(a.fetch.is_some());
+        assert!(a.symbol_editor.is_some());
+        assert_eq!(a.open.as_ref().unwrap().dir, before);
+        a.symbol_editor = None;
+        until_fetched(&mut a);
+        assert_eq!(a.open.as_ref().unwrap().dir, dir);
+    }
+
+    #[test]
     fn a_project_opened_while_fetching_stays_open() {
         let (tmp, mut a) = app(vec![]);
         let base = tmp.path().join("base");

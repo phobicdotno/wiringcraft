@@ -2245,9 +2245,15 @@ impl App {
     /// or the reason it could not be made shows. Until then the window keeps drawing.
     fn poll_fetch(&mut self, ctx: &egui::Context) {
         let Some(f) = &self.fetch else { return };
-        // The open project is not saved or replaced while an assistant command works on its
-        // files or a dialog is open on it: the outcome waits until they are done.
-        if self.assistant.command_running() || self.dialog.as_ref().is_some_and(|d| !matches!(d, Dialog::Fetching(_))) {
+        // The open project is not saved or replaced while something still works on it: an
+        // assistant turn or command, an open dialog, or the symbol or terminal strip editor.
+        // The outcome waits until they are done.
+        if self.assistant.busy()
+            || self.assistant.command_running()
+            || self.symbol_editor.is_some()
+            || self.strip_editor.is_some()
+            || self.dialog.as_ref().is_some_and(|d| !matches!(d, Dialog::Fetching(_)))
+        {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
             return;
         }
