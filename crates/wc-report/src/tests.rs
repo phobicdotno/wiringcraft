@@ -558,6 +558,133 @@ fn the_location_list_counts_devices_and_names_unlisted_locations() {
 }
 
 #[test]
+fn the_network_list_shows_each_device_with_its_address_ports_and_cables() {
+    let mut p = Project::new("t");
+    let mut page = Page::new("p3", "3", "PLC");
+    page.symbols.push(place("s1", "plc", 20.0, Some("-A1")));
+    p.pages.push(page);
+    for (t, d) in [
+        ("-K10", "Drive pump 1"),
+        ("-K11", "Drive pump 2"),
+        ("-K12", "Spare drive"),
+    ] {
+        p.devices.insert(
+            DeviceTag::parse(t).unwrap(),
+            Device {
+                description: d.into(),
+                ..Default::default()
+            },
+        );
+    }
+    use wc_core::network::{Link, Network, Node};
+    let node = |device: &str, address: &str, station: &str| Node {
+        device: device.into(),
+        address: address.into(),
+        station: station.into(),
+        ..Default::default()
+    };
+    let link = |from: &str, to: &str, cable: &str| Link {
+        from: from.into(),
+        to: to.into(),
+        cable: cable.into(),
+        ..Default::default()
+    };
+    p.meta.networks = vec![Network {
+        name: "PN1".into(),
+        kind: "profinet".into(),
+        nodes: vec![
+            node("-A1", "192.168.0.1", "plc"),
+            node("-K10", "192.168.0.10", ""),
+            node("-K11", "192.168.0.11", ""),
+            node("-K12", "", ""),
+            node("-K99", "192.168.0.11", ""),
+        ],
+        links: vec![link("-A1:X1P1", "-K10:P1", "-W20"), link("-K10:P2", "-K11:P1", "-W21")],
+        ..Default::default()
+    }];
+    let (symbols, parts) = (BTreeMap::new(), BTreeMap::new());
+    let i = Inputs {
+        project: &p,
+        symbols: &symbols,
+        parts: &parts,
+    };
+    let t = build(Kind::Networks, &i);
+    let row = |c: &[&str]| c.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    assert_eq!(
+        t.rows,
+        [
+            row(&[
+                "PN1",
+                "PROFINET",
+                "-A1",
+                "",
+                "192.168.0.1",
+                "plc",
+                "X1P1",
+                "-K10:P1",
+                "-W20",
+                "3"
+            ]),
+            row(&[
+                "PN1",
+                "PROFINET",
+                "-K10",
+                "Drive pump 1",
+                "192.168.0.10",
+                "",
+                "P1",
+                "-A1:X1P1",
+                "-W20",
+                ""
+            ]),
+            row(&[
+                "PN1",
+                "PROFINET",
+                "-K10",
+                "Drive pump 1",
+                "192.168.0.10",
+                "",
+                "P2",
+                "-K11:P1",
+                "-W21",
+                ""
+            ]),
+            row(&[
+                "PN1",
+                "PROFINET",
+                "-K11",
+                "Drive pump 2",
+                "192.168.0.11",
+                "",
+                "P1",
+                "-K10:P2",
+                "-W21",
+                ""
+            ]),
+            row(&["PN1", "PROFINET", "-K12", "Spare drive", "", "", "", "", "", ""]),
+            row(&["PN1", "PROFINET", "-K99", "", "192.168.0.11", "", "", "", "", ""]),
+        ]
+    );
+    // Only the drawn device links to its page.
+    assert_eq!(t.row_pages, ["p3"]);
+    assert_eq!(
+        network_warnings(&i),
+        [
+            "network PN1: -K11 and -K99 have the same address 192.168.0.11",
+            "network PN1: -K99 is not a device of the project",
+        ]
+    );
+    p.meta.networks.clear();
+    let i = Inputs {
+        project: &p,
+        symbols: &symbols,
+        parts: &parts,
+    };
+    assert!(build(Kind::Networks, &i).rows.is_empty());
+    assert!(network_warnings(&i).is_empty());
+}
+
+#[test]
 fn marking_list_has_every_marker_in_natural_order() {
     let (mut p, s, parts) = fixture();
     let w1 = DeviceTag::parse("-W1").unwrap();

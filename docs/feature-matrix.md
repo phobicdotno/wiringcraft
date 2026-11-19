@@ -175,7 +175,7 @@ For the other areas, the chapter to read in each help is:
 | PLC addresses from a CSV list | yes | yes | yes | done |
 | PLC variable list export (structured text) | yes | partly | yes | done |
 | PLC card overview pages and rack configuration | yes | yes | partly: `[[rack]]` tables with their `[[rack.card]]`s in `project.toml` (slot, tag, type, channels, start address); the `plc-cards` report lists every card channel by channel with the device, connection and page from the PLC I/O list, as a table in the PDF (`pdf --report plc-cards`) and the app; see `wc_core::plc_rack`. No drawn card pictures and no rack editor in the app yet | partly (#275) |
-| Fieldbus (PROFINET, EtherCAT) topology | yes | partly | no | later |
+| Fieldbus (PROFINET, EtherCAT) topology | yes | partly | partly: `[[network]]` tables in `project.toml` (devices, addresses, station names, cabled ports), Networks report (`--report networks`) with checks; no drawn topology page yet | network list done (#278) |
 | Exchange with PLC engineering tools (AutomationML) | yes | partly | yes (export) | done |
 
 ## 10. Reports
