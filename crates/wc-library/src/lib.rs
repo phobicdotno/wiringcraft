@@ -28,9 +28,14 @@ pub enum Error {
     Source { name: String, message: String },
     #[error("{kind:?} {id:?} is not in any library source")]
     NotFound { kind: ItemKind, id: String },
-    /// An update failed and could not put back every file it had changed.
+    /// An update failed and could not put back every file it had changed. `written` is how
+    /// many of the items, in the order given, it had started to write.
     #[error("{error}; putting back the files the update changed failed too: {failed}")]
-    NotPutBack { error: Box<Error>, failed: String },
+    NotPutBack {
+        error: Box<Error>,
+        failed: String,
+        written: usize,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -549,6 +554,18 @@ pub fn update_items(
     lib: &Library,
     items: &[(ItemKind, String, String)],
 ) -> Result<Vec<(ItemKind, String)>> {
+    update_items_then(project_dir, project, lib, items, || {})
+}
+
+/// [`update_items`], calling `after_backup` once every file has been read for its backup and
+/// before any is written (where a caller's tests can make a write fail).
+pub fn update_items_then(
+    project_dir: &Path,
+    project: &mut Project,
+    lib: &Library,
+    items: &[(ItemKind, String, String)],
+    after_backup: impl FnOnce(),
+) -> Result<Vec<(ItemKind, String)>> {
     let fetched = items
         .iter()
         .map(|(kind, id, hash)| fetch(lib, *kind, id, Some(hash)))
@@ -565,6 +582,7 @@ pub fn update_items(
         };
         before.push((path, was));
     }
+    after_backup();
     let lock = project.lock.clone();
     for (n, ((_, id, _), item)) in items.iter().zip(fetched).enumerate() {
         if let Err(e) = store_item(project_dir, project, id, item) {
@@ -589,6 +607,7 @@ pub fn update_items(
             return Err(Error::NotPutBack {
                 error: Box::new(e),
                 failed: failed.join("; "),
+                written: n + 1,
             });
         }
     }

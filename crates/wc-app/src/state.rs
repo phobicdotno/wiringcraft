@@ -234,17 +234,18 @@ pub struct Open {
     /// Tests: whether each coming symbol file write fails, in order.
     #[cfg(test)]
     pub(crate) fail_symbol_writes: std::collections::VecDeque<bool>,
-    /// Tests: a file that turns into a folder once the update's backups are taken, so the
-    /// update's write of it fails after other items were already written.
+    /// Tests: a file that turns into a folder once the library update has read its backups,
+    /// so the update's write of it fails after other items were already written, and so does
+    /// putting it back.
     #[cfg(test)]
     block_after_snapshot: Option<PathBuf>,
     /// Tests: a file whose backup read fails, though the file is a plain readable one.
     #[cfg(test)]
     unreadable: Option<PathBuf>,
-    /// Tests: a library file rewritten once the update's backups are taken, as if someone
-    /// saved it in between.
+    /// Tests: files (in a library or the project) rewritten once the update's backups are
+    /// taken, as if someone saved them in between.
     #[cfg(test)]
-    rewrite_after_snapshot: Option<(PathBuf, String)>,
+    rewrite_after_snapshot: Vec<(PathBuf, String)>,
     /// Devices renamed here, old tag to new, one map per change in order (one change may
     /// rename several devices at once); a shared session takes them
     /// ([`Open::take_device_renames`]) to keep a rename that waits together.
@@ -299,7 +300,7 @@ impl Open {
             #[cfg(test)]
             unreadable: None,
             #[cfg(test)]
-            rewrite_after_snapshot: None,
+            rewrite_after_snapshot: Vec::new(),
             device_renames: Vec::new(),
             undo_error: None,
             step_warning: None,
@@ -1121,22 +1122,41 @@ impl Open {
             history: self.history,
         };
         #[cfg(test)]
-        if let Some(path) = self.block_after_snapshot.take() {
-            let _ = std::fs::remove_file(&path);
-            let _ = std::fs::create_dir(&path);
-        }
-        #[cfg(test)]
-        if let Some((path, text)) = self.rewrite_after_snapshot.take() {
+        for (path, text) in std::mem::take(&mut self.rewrite_after_snapshot) {
             std::fs::write(&path, text).map_err(|e| format!("test: {} cannot be rewritten: {e}", path.display()))?;
         }
         self.archive_symbols();
         self.checkpoint();
-        let done = match wc_library::update_items(&self.dir, &mut self.project, lib, &todo) {
+        // Tests: a file turns into a folder once the update read its backups, so writing it,
+        // and putting it back, fails.
+        #[cfg(test)]
+        let block = self.block_after_snapshot.take();
+        let after_backup = move || {
+            #[cfg(test)]
+            if let Some(path) = block {
+                let _ = std::fs::remove_file(&path);
+                let _ = std::fs::create_dir(&path);
+            }
+        };
+        let done = match wc_library::update_items_then(&self.dir, &mut self.project, lib, &todo, after_backup) {
             Ok(done) => done,
             Err(e) => {
-                // `update_items` put back what it could; the files are checked again here, so
-                // one it could not put back is known, and the undo step goes.
-                let unrestored = self.roll_back_update(&files, lock, history);
+                // `update_items` put back what it wrote, and only the undo step goes. When it
+                // could not, the files it wrote (only those: one it never wrote may have been
+                // changed since by someone else) are tried again here, so one that still
+                // cannot be put back is known.
+                let written: &[KeptFile] = match &e {
+                    wc_library::Error::NotPutBack { written, .. } => {
+                        let wrote = &todo[..(*written).min(todo.len())];
+                        let n = files
+                            .iter()
+                            .take_while(|f| wrote.iter().any(|(k, id, _)| *k == f.kind && *id == f.id))
+                            .count();
+                        &files[..n]
+                    }
+                    _ => &[],
+                };
+                let unrestored = self.roll_back_update(written, lock, history);
                 return Err(if unrestored.is_empty() {
                     e.to_string()
                 } else {
@@ -1273,14 +1293,21 @@ impl Open {
         for (path, f) in self.unrestored_files.clone() {
             let pin = self.project.lock.get(f.kind, &f.id).map(|e| e.hash.clone());
             if pin == f.pin {
-                restore_file(&path, f.was.as_deref()).map_err(|e| {
-                    format!(
-                        "not saved: the file of {} {} ({}) still holds another version and cannot be put back: {e}",
-                        kind_name(f.kind),
-                        f.id,
-                        path.display()
-                    )
-                })?;
+                // The folder may have gone with whatever blocked the file.
+                let folder = match (&f.was, path.parent()) {
+                    (Some(_), Some(dir)) => std::fs::create_dir_all(dir),
+                    _ => Ok(()),
+                };
+                folder
+                    .and_then(|()| restore_file(&path, f.was.as_deref()))
+                    .map_err(|e| {
+                        format!(
+                            "not saved: the file of {} {} ({}) still holds another version and cannot be put back: {e}",
+                            kind_name(f.kind),
+                            f.id,
+                            path.display()
+                        )
+                    })?;
             }
             self.unrestored_files.remove(&path);
         }
@@ -3263,7 +3290,7 @@ pub(crate) mod tests {
         // Fixed and changed right after the backups are taken.
         let mut new = old.clone();
         new.name = "Coil, changed".into();
-        o.rewrite_after_snapshot = Some((file, serde_json::to_string(&new).unwrap()));
+        o.rewrite_after_snapshot = vec![(file, serde_json::to_string(&new).unwrap())];
         let done = o.update_library(&lib, None).unwrap();
         assert_eq!(done, vec![(ItemKind::Part, pid.to_owned())]);
         assert_eq!(
@@ -3294,10 +3321,10 @@ pub(crate) mod tests {
         let lib = library_first(&mut o, tmp.path(), &new);
         // The part changes again right after the backups are taken.
         seen.description = "Changed again".into();
-        o.rewrite_after_snapshot = Some((
+        o.rewrite_after_snapshot = vec![(
             tmp.path().join(format!("mine/parts/{pid}.json")),
             serde_json::to_string(&seen).unwrap(),
-        ));
+        )];
         let lock = o.project.lock.clone();
         let err = o.update_library(&lib, None).unwrap_err();
         assert!(
@@ -3321,6 +3348,38 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_update_that_writes_nothing_leaves_a_file_someone_else_changed_since() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let pid = "example.ex-ct-9-24dc";
+        o.ensure_part(pid).unwrap();
+        let mut seen = changed_part_in_mine(&o, tmp.path(), pid);
+        let coil = o.symbols["wc.coil"].clone();
+        let lib = library_first(&mut o, tmp.path(), &coil);
+        // After the backups: the library part changes again, so the update stops before it
+        // writes anything, and someone else saves the project's copy of the part.
+        seen.description = "Changed again".into();
+        let part_file = store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap();
+        let mut theirs = o.parts[pid].clone();
+        theirs.description = "Saved by someone else".into();
+        let theirs = serde_json::to_string(&theirs).unwrap();
+        o.rewrite_after_snapshot = vec![
+            (
+                tmp.path().join(format!("mine/parts/{pid}.json")),
+                serde_json::to_string(&seen).unwrap(),
+            ),
+            (part_file.clone(), theirs.clone()),
+        ];
+        assert!(o.update_library(&lib, None).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&part_file).unwrap(),
+            theirs,
+            "their change stays"
+        );
+        assert!(o.unrestored_files.is_empty());
+    }
+
+    #[test]
     fn a_failed_update_leaves_a_full_undo_history_and_a_saved_project_as_they_were() {
         let (tmp, mut o) = project();
         o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
@@ -3336,10 +3395,10 @@ pub(crate) mod tests {
         o.save().unwrap();
         let (undo, history, dropped) = (o.undo.clone(), o.history, o.undo_dropped);
         seen.description = "Changed again".into();
-        o.rewrite_after_snapshot = Some((
+        o.rewrite_after_snapshot = vec![(
             tmp.path().join(format!("mine/parts/{pid}.json")),
             serde_json::to_string(&seen).unwrap(),
-        ));
+        )];
         assert!(o.update_library(&lib, None).is_err());
         assert_eq!(o.undo, undo, "the oldest Undo step is still there");
         assert_eq!((o.history, o.undo_dropped), (history, dropped));
@@ -3429,7 +3488,9 @@ pub(crate) mod tests {
         assert_eq!(o.parts[pid], old, "the old version stays loaded");
         o.dirty = true;
         assert!(o.save().unwrap_err().contains(pid));
+        // The blocker goes with the parts folder itself: Save makes the folder again.
         std::fs::remove_dir(&part_file).unwrap();
+        std::fs::remove_dir(part_file.parent().unwrap()).unwrap();
         o.save().unwrap();
         assert_eq!(std::fs::read(&part_file).unwrap(), before);
     }
