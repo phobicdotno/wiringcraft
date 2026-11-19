@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
-use wc_core::lock::{ItemKind, LockEntry};
+use wc_core::lock::{ItemKind, LockEntry, Lockfile};
 use wc_core::panel::Panel;
 use wc_core::{Comment, Device, DeviceTag, Page, Project, ProjectMeta};
 
@@ -35,6 +35,17 @@ pub struct Parts {
     pub lock_symbols: BTreeMap<String, Option<LockEntry>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub lock_parts: BTreeMap<String, Option<LockEntry>>,
+}
+
+/// The version (lock hash) of each symbol and part that some [`Parts`] use, by kind and id:
+/// the versions their pages, devices and jumpers were drawn with.
+pub type Uses = BTreeMap<(ItemKind, String), String>;
+
+fn kind_name(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::Symbol => "symbol",
+        ItemKind::Part => "part",
+    }
 }
 
 fn comments_on(project: &Project, page: &str) -> Vec<Comment> {
@@ -239,6 +250,38 @@ impl Parts {
                 }
             }
         }
+    }
+
+    /// The versions in `lock` of the symbols and parts that these parts' pages, devices and
+    /// jumpers use. One `lock` does not lock is left out.
+    pub fn uses(&self, lock: &Lockfile) -> Uses {
+        let mut probe = Project::new("");
+        Parts {
+            meta: self.meta.clone(),
+            pages: self.pages.clone(),
+            devices: self.devices.clone(),
+            ..Parts::default()
+        }
+        .apply(&mut probe);
+        let symbols = probe.used_symbols().into_iter().map(|id| (ItemKind::Symbol, id));
+        let parts = probe.used_parts().into_iter().map(|id| (ItemKind::Part, id));
+        symbols
+            .chain(parts)
+            .filter_map(|(kind, id)| {
+                let hash = lock.map(kind).get(&id)?.hash.clone();
+                Some(((kind, id), hash))
+            })
+            .collect()
+    }
+
+    /// Items of `recorded` that `lock` locks in another version (`symbol id` or `part id`):
+    /// parts drawn with those versions are not to come back against these.
+    pub fn other_versions(recorded: &Uses, lock: &Lockfile) -> Vec<String> {
+        recorded
+            .iter()
+            .filter(|((kind, id), hash)| lock.map(*kind).get(id).is_some_and(|e| e.hash != **hash))
+            .map(|((kind, id), _)| format!("{} {id}", kind_name(*kind)))
+            .collect()
     }
 
     /// Items that putting these parts into `project` would leave used without a lock entry

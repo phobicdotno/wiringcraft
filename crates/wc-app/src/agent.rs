@@ -9,6 +9,7 @@
 //! `run_command` runs any `wiringcraft` command-line command (imports, PLC variable lists,
 //! STEP export, library sources, merges, ...) on the open project.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -99,6 +100,11 @@ pub struct Assistant {
     /// the running command works on, and the held pages as they were: its result reaches the
     /// project folder only if it leaves those pages alone.
     command_staging: Option<Staging>,
+    /// The free drawings of each page as the assistant last read them (project folder and page
+    /// id). Drawings are addressed by position (`g0`, `g1` ...), so a write by position is
+    /// refused once someone else changed the page's drawings (a session sync, the user).
+    /// Shared, so the copy a tool call keeps to put back costs nothing.
+    graphics_read: HashMap<(PathBuf, String), Arc<[Shape]>>,
 }
 
 /// A copy of a project folder (without its `.git`) that a command runs on, removed when
@@ -214,6 +220,7 @@ impl Assistant {
             clipboard: screenshot::Clipboard::default(),
             command_base: None,
             command_staging: None,
+            graphics_read: HashMap::new(),
         }
     }
 
@@ -378,7 +385,7 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "update_graphic",
-            "Replace a free drawing (line, polyline, rect, circle, arc, text) by its id from get_page (g0, g1 ...).",
+            "Replace a free drawing (line, polyline, rect, circle, arc, text) by its id from get_page (g0, g1 ...). Ids are positions: a write is refused when the page's drawings changed since get_page, so read it again then.",
             json!({"id": {"type": "string"}, "shape": shape_arg(), "page": page_arg()}),
             &["id", "shape"],
         ),
@@ -952,6 +959,20 @@ fn edits_page(name: &str, v: &Value) -> bool {
     }
 }
 
+/// Whether a tool names a free drawing by its position (`g0`, `g1` ...) on a page.
+fn names_graphics(name: &str, v: &Value) -> bool {
+    // The same rule as `Open::selections` reads them by.
+    let positional = |id: &str| id.strip_prefix('g').and_then(|n| n.parse::<usize>().ok()).is_some();
+    match name {
+        "update_graphic" => true,
+        "delete_items" | "move_items" | "rotate_items" | "mirror_items" | "copy_items" | "select_items" => {
+            strings(v, "ids").iter().any(|id| positional(id))
+        }
+        "macros" if s(v, "action") == Some("save") => strings(v, "ids").iter().any(|id| positional(id)),
+        _ => false,
+    }
+}
+
 /// What [`AppTools::held_check`] checks a tool's change against, and what it puts back.
 struct HeldGuard {
     dir: PathBuf,
@@ -1043,8 +1064,13 @@ impl wc_agent::Tools for AppTools<'_> {
             o.follow_terminals();
         }
         let guard = self.held_guard(name, input);
+        let read = self.0.assistant.graphics_read.clone();
         let r = self.0.agent_tool(name, input);
         let r = self.held_check(guard, r);
+        // A change taken back is not what the assistant knows of the drawings either.
+        if r.is_err() {
+            self.0.assistant.graphics_read = read;
+        }
         // Items the assistant removed must not stay selected.
         self.0.prune_selection();
         r
@@ -1056,9 +1082,13 @@ impl wc_agent::Tools for AppTools<'_> {
             o.follow_terminals();
         }
         let guard = self.held_guard(name, input);
+        let read = self.0.assistant.graphics_read.clone();
         match self.0.agent_start(name, input) {
             Started::Done(r) => {
                 let r = self.held_check(guard, r);
+                if r.is_err() {
+                    self.0.assistant.graphics_read = read;
+                }
                 self.0.prune_selection();
                 Started::Done(r)
             }
@@ -1230,8 +1260,83 @@ impl App {
         }
     }
 
-    /// Run one assistant tool.
+    /// The project folder and page id a tool's page argument `arg` names, as the key of
+    /// [`Assistant::graphics_read`].
+    fn graphics_key(&self, v: &Value, arg: &str) -> Option<(PathBuf, String)> {
+        let page = self.page_of(v, arg).ok()?;
+        let open = self.open.as_ref()?;
+        Some((open.dir.clone(), open.project.pages.get(page)?.id.clone()))
+    }
+
+    /// The drawings now on the page a [`Assistant::graphics_read`] key names, if it is there.
+    fn graphics_now(&self, key: &(PathBuf, String)) -> Option<&[Shape]> {
+        let open = self.open.as_ref().filter(|o| o.dir == key.0)?;
+        Some(&open.project.pages.iter().find(|p| p.id == key.1)?.graphics)
+    }
+
+    /// Whether the drawings of a page are as the assistant last read them (true when it has not
+    /// read them).
+    fn graphics_as_read(&self, key: &(PathBuf, String)) -> bool {
+        self.assistant
+            .graphics_read
+            .get(key)
+            .is_none_or(|read| self.graphics_now(key).is_some_and(|now| now == &read[..]))
+    }
+
+    /// Run one assistant tool. A free drawing named by position is refused when the page's
+    /// drawings changed since the assistant read them, so a write never lands on another one.
     pub(crate) fn agent_tool(&mut self, name: &str, v: &Value) -> Result<String, String> {
+        // The pages the tool works on, found before it runs (it may show or remove a page):
+        // its page (for a toolbar action always the page shown, whatever else it is given),
+        // and the page a copy goes to.
+        let mut keys = vec![if name == "run_action" {
+            self.graphics_key(&Value::Null, "page")
+        } else {
+            self.graphics_key(v, "page")
+        }];
+        if name == "copy_items" && v.get("to_page").is_some() {
+            keys.push(self.graphics_key(v, "to_page"));
+        }
+        let keys: Vec<((PathBuf, String), bool)> = keys
+            .into_iter()
+            .flatten()
+            .map(|k| {
+                let as_read = self.graphics_as_read(&k);
+                (k, as_read)
+            })
+            .collect();
+        if names_graphics(name, v)
+            && let Some((key, false)) = keys.first()
+        {
+            return Err(format!(
+                "The free drawings on page {} changed since you read it (someone else edited it): \
+                 call get_page again and use the drawing ids it gives.",
+                key.1
+            ));
+        }
+        let out = self.agent_tool_run(name, v)?;
+        // What the assistant read, or changed itself on drawings it had read, is what it knows.
+        // A toolbar action changes the page shown (undo and redo can bring back drawings in an
+        // order the assistant never read, so they do not count).
+        let toolbar = name == "run_action"
+            && !s(v, "action").is_some_and(|a| {
+                [Action::Undo, Action::Redo]
+                    .iter()
+                    .any(|u| u.name().eq_ignore_ascii_case(a))
+            });
+        let edits = edits_page(name, v) || name == "copy_items" || toolbar;
+        for (key, as_read) in keys {
+            if name == "get_page" || (edits && as_read && self.assistant.graphics_read.contains_key(&key)) {
+                match self.graphics_now(&key).map(Arc::<[Shape]>::from) {
+                    Some(now) => self.assistant.graphics_read.insert(key, now),
+                    None => self.assistant.graphics_read.remove(&key),
+                };
+            }
+        }
+        Ok(out)
+    }
+
+    fn agent_tool_run(&mut self, name: &str, v: &Value) -> Result<String, String> {
         // In a shared session a page someone else has open is read-only here: an editing tool
         // aimed at it is refused before it runs (an unknown page gets the tool's own error).
         if edits_page(name, v)
@@ -3190,6 +3295,43 @@ mod tests {
         assert!(dir.join(".git").exists(), "made and recorded all the same");
     }
 
+    #[test]
+    fn an_assistant_edit_is_checked_while_drawing() {
+        let (_tmp, mut a) = app(vec![]);
+        let o = a.open.as_mut().unwrap();
+        let mut ids = Vec::new();
+        for x in [20.0, 60.0] {
+            let id = o.place(1, "wc.coil", Point::new(x, 20.0)).unwrap();
+            let s = o.project.pages[1].symbols.iter_mut().find(|s| s.id == id).unwrap();
+            s.tag = Some(wc_core::DeviceTag::parse("-K1").unwrap());
+            ids.push(id);
+        }
+        o.touch();
+        let ctx = egui::Context::default();
+        let drawn_twice = |a: &App| a.ed.live.iter().filter(|f| f.message.contains("-K1 is drawn")).count();
+        // Well within the sweep: only the edit's own revision can start the check.
+        let until = |a: &mut App, want: usize| {
+            for _ in 0..100 {
+                a.live_check(&ctx);
+                if drawn_twice(a) == want && !a.live.busy() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        until(&mut a, 2);
+        assert_eq!(drawn_twice(&a), 2, "{:?}", a.ed.live);
+        // The assistant renames the second coil: no input in any frame.
+        call(
+            &mut a,
+            "update_symbol",
+            json!({"page": "p0002", "id": ids[1], "tag": "-K2"}),
+        )
+        .unwrap();
+        until(&mut a, 0);
+        assert_eq!(drawn_twice(&a), 0, "{:?}", a.ed.live);
+    }
+
     fn until_fetched_once(a: &mut App) {
         a.poll_fetch(&egui::Context::default());
     }
@@ -4245,6 +4387,201 @@ mod tests {
         assert!(a.ed.message.contains("keeps the copy it has"), "{}", a.ed.message);
         assert!(!a.ed.message.contains("takes the one from"), "{}", a.ed.message);
         assert_eq!(a.open.as_ref().unwrap().symbols["wc.coil"], before);
+    }
+
+    #[test]
+    fn a_graphic_named_by_position_is_refused_after_a_sync_reorders_the_page() {
+        let line = |x: f64| Shape::Line {
+            a: Point::new(x, 0.0),
+            b: Point::new(x, 5.0),
+        };
+        let rect = Shape::Rect {
+            min: Point::new(0.0, 0.0),
+            max: Point::new(5.0, 5.0),
+        };
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        open.project.pages[1].graphics = vec![line(1.0), line(2.0)];
+        a.share.start_host(open, "Hanna", "hanna@example.com").unwrap();
+        let graphics = |a: &App| a.open.as_ref().unwrap().project.pages[1].graphics.clone();
+        // The assistant reads the page, and its own edits keep what it read up to date: after
+        // adding a line, that line is g2.
+        call(&mut a, "get_page", json!({"page": "p0002"})).unwrap();
+        call(&mut a, "add_graphic", json!({"page": "p0002", "shape": line(3.0)})).unwrap();
+        call(
+            &mut a,
+            "move_items",
+            json!({"page": "p0002", "ids": ["g2"], "dx": 1, "dy": 0}),
+        )
+        .unwrap();
+        a.sync_session_now(false);
+        assert_eq!(graphics(&a), vec![line(1.0), line(2.0), line(4.0)]);
+        // The first line goes and is synced; the assistant reads the page: the second is g0.
+        let open = a.open.as_mut().unwrap();
+        open.checkpoint();
+        open.project.pages[1].graphics.remove(0);
+        a.sync_session_now(false);
+        call(&mut a, "get_page", json!({"page": "p0002"})).unwrap();
+        // The session's undo puts the first line back in front: g0 now names another line, so
+        // every write by position is refused.
+        a.share.undo().unwrap();
+        a.sync_session_now(false);
+        assert_eq!(graphics(&a), vec![line(1.0), line(2.0), line(4.0)]);
+        let shape = serde_json::to_value(&rect).unwrap();
+        for (tool, input) in [
+            ("update_graphic", json!({"page": "p0002", "id": "g0", "shape": shape})),
+            ("delete_items", json!({"page": "p0002", "ids": ["g0"]})),
+            ("move_items", json!({"page": "p0002", "ids": ["g0"], "dx": 1, "dy": 0})),
+            ("copy_items", json!({"page": "p0002", "ids": ["g0"], "dx": 1, "dy": 0})),
+        ] {
+            let err = call(&mut a, tool, input).unwrap_err();
+            assert!(err.contains("changed since you read it"), "{tool}: {err}");
+        }
+        assert_eq!(graphics(&a), vec![line(1.0), line(2.0), line(4.0)], "nothing written");
+        // Read again, the same position is the line now there.
+        call(&mut a, "get_page", json!({"page": "p0002"})).unwrap();
+        call(
+            &mut a,
+            "update_graphic",
+            json!({"page": "p0002", "id": "g0", "shape": shape}),
+        )
+        .unwrap();
+        assert_eq!(graphics(&a), vec![rect, line(2.0), line(4.0)]);
+    }
+
+    #[test]
+    fn graphic_ids_are_checked_for_every_tool_and_page_they_name() {
+        let line = |x: f64| Shape::Line {
+            a: Point::new(x, 0.0),
+            b: Point::new(x, 5.0),
+        };
+        let (_tmp, mut a) = app(vec![]);
+        let pages = |a: &App| -> Vec<Vec<Shape>> {
+            a.open
+                .as_ref()
+                .unwrap()
+                .project
+                .pages
+                .iter()
+                .map(|p| p.graphics.clone())
+                .collect()
+        };
+        let open = a.open.as_mut().unwrap();
+        open.project.pages[0].graphics = vec![line(1.0)];
+        open.project.pages[1].graphics = vec![line(2.0), line(3.0)];
+        let (first, second) = (open.project.pages[0].id.clone(), open.project.pages[1].id.clone());
+        call(&mut a, "get_page", json!({"page": first})).unwrap();
+        call(&mut a, "get_page", json!({"page": second})).unwrap();
+        // A copy to another page the assistant read keeps that page known too: the id it
+        // answers can be used at once.
+        let out = call(
+            &mut a,
+            "copy_items",
+            json!({"page": second, "ids": ["g0"], "to_page": first}),
+        )
+        .unwrap();
+        assert!(out.contains("g1"), "{out}");
+        call(
+            &mut a,
+            "update_graphic",
+            json!({"page": first, "id": "g1", "shape": line(4.0)}),
+        )
+        .unwrap();
+        assert_eq!(pages(&a)[0], vec![line(1.0), line(4.0)]);
+        // Someone else reorders the second page.
+        a.open.as_mut().unwrap().project.pages[1].graphics.reverse();
+        // An id with a sign is still a position, and saving a macro by position is refused too.
+        let err = call(&mut a, "delete_items", json!({"page": second, "ids": ["g+0"]})).unwrap_err();
+        assert!(err.contains("changed since you read it"), "{err}");
+        let err = call(
+            &mut a,
+            "macros",
+            json!({"action": "save", "page": second, "ids": ["g0"], "name": "Stale"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("changed since you read it"), "{err}");
+        assert!(
+            !call(&mut a, "macros", json!({"action": "list"}))
+                .unwrap()
+                .contains("Stale")
+        );
+        // Deleting the first page while it is shown shows the second: what the assistant read of
+        // the second stays as it was, so its old g0 is still refused.
+        a.ed.page = 0;
+        call(&mut a, "delete_page", json!({})).unwrap();
+        let err = call(
+            &mut a,
+            "update_graphic",
+            json!({"page": second, "id": "g0", "shape": line(9.0)}),
+        )
+        .unwrap_err();
+        assert!(err.contains("changed since you read it"), "{err}");
+        assert_eq!(pages(&a)[0], vec![line(3.0), line(2.0)]);
+    }
+
+    #[test]
+    fn graphic_ids_follow_toolbar_edits_and_refused_changes() {
+        let line = |x: f64| Shape::Line {
+            a: Point::new(x, 0.0),
+            b: Point::new(x, 5.0),
+        };
+        let (_tmp, mut a) = app(vec![]);
+        a.open.as_mut().unwrap().project.pages[1].graphics = vec![line(1.0), line(2.0)];
+        a.ed.page = 1;
+        // Deleted from the toolbar by the assistant: the line left is g0 to it at once.
+        call(&mut a, "get_page", json!({"page": "p0002"})).unwrap();
+        call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap();
+        call(&mut a, "run_action", json!({"action": Action::Delete.name()})).unwrap();
+        call(
+            &mut a,
+            "update_graphic",
+            json!({"page": "p0002", "id": "g0", "shape": line(3.0)}),
+        )
+        .unwrap();
+        assert_eq!(page2(&a).graphics, vec![line(3.0)]);
+        // A page named with a toolbar action does not count: the action works on the page
+        // shown, and that is the page whose drawings the assistant still knows.
+        a.open.as_mut().unwrap().project.pages[1].graphics = vec![line(1.0), line(3.0)];
+        call(&mut a, "get_page", json!({"page": "p0001"})).unwrap();
+        call(&mut a, "get_page", json!({"page": "p0002"})).unwrap();
+        call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap();
+        call(
+            &mut a,
+            "run_action",
+            json!({"action": Action::Delete.name(), "page": "p0001"}),
+        )
+        .unwrap();
+        assert_eq!(page2(&a).graphics, vec![line(3.0)]);
+        call(
+            &mut a,
+            "update_graphic",
+            json!({"page": "p0002", "id": "g0", "shape": line(3.0)}),
+        )
+        .unwrap();
+        // A page change refused because it takes the cover mark from a held page is taken
+        // back, and so is what the assistant would have known of its drawings.
+        call(&mut a, "update_page", json!({"page": "p0001", "cover": true})).unwrap();
+        a.ed.held_by.insert("p0001".into(), "Ola".into());
+        a.open
+            .as_mut()
+            .unwrap()
+            .held_by_others
+            .insert("p0001".into(), "Ola".into());
+        let mut content: Value =
+            serde_json::from_str(&call(&mut a, "get_page", json!({"page": "p0002"})).unwrap()).unwrap();
+        content["cover"] = json!(true);
+        content["graphics"] = json!([line(4.0), line(3.0)]);
+        assert!(call(&mut a, "edit_page_json", json!({"page": "p0002", "content": content})).is_err());
+        assert_eq!(page2(&a).graphics, vec![line(3.0)], "taken back");
+        a.ed.held_by.clear();
+        a.open.as_mut().unwrap().held_by_others.clear();
+        call(
+            &mut a,
+            "update_graphic",
+            json!({"page": "p0002", "id": "g0", "shape": line(5.0)}),
+        )
+        .unwrap();
+        assert_eq!(page2(&a).graphics, vec![line(5.0)]);
     }
 
     #[test]

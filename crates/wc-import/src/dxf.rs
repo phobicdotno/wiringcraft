@@ -385,19 +385,21 @@ fn shapes(
                 polyline(pts.into_iter().map(|(x, y)| p(x, y)).collect(), closed, false)
             }
             "SPLINE" => {
-                let (pts, closed, curve) = spline_points(e);
+                let (pts, closed, shape) = spline_points(e);
                 // Placed on the page, every sample must still be a number (a huge scale could
                 // overflow a curve that bulges past its points).
                 let placed: Vec<Point> = pts.into_iter().map(|(x, y)| p(x, y)).collect();
                 let numbers = placed.iter().all(|q| q.x.is_finite() && q.y.is_finite());
                 let drawn = if numbers { polyline(placed, closed, false) } else { None };
-                // Knots that make no curve (wrong count or degree, an empty interval): the points
-                // are still joined, and said; a spline with too few points to join is said too.
-                let note = match (&drawn, curve) {
+                // Knots that make no curve (wrong count or degree, an empty interval) or fit points
+                // that could not be interpolated: the points are still joined, and said; a spline
+                // with too few points to join is said too.
+                let note = match (&drawn, shape) {
                     (None, _) if !numbers => Some(SPLINE_NOT_NUMBERS),
                     (None, _) => Some(SPLINE_TOO_FEW),
-                    (Some(_), false) => Some(SPLINE_NOT_CURVE),
-                    (Some(_), true) => None,
+                    (Some(_), SplineShape::KnotsNoCurve) => Some(SPLINE_NOT_CURVE),
+                    (Some(_), SplineShape::FitNotInterpolated) => Some(SPLINE_FIT_FAILED),
+                    (Some(_), SplineShape::Curve) => None,
                 };
                 if let Some(note) = note {
                     *skipped.entry(note.to_owned()).or_default() += 1;
@@ -415,7 +417,8 @@ fn shapes(
                 };
                 let (loops, bad): (Vec<_>, Vec<_>) = hatch_loops(e)
                     .into_iter()
-                    .partition(|lp| lp.iter().all(|pt| placed(*pt)));
+                    .partition(|(lp, _)| lp.iter().all(|pt| placed(*pt)));
+                let (loops, fit_failed): (Vec<_>, Vec<usize>) = loops.into_iter().unzip();
                 if !bad.is_empty() {
                     *skipped.entry(HATCH_NOT_NUMBERS.to_owned()).or_default() += 1;
                     solid = false;
@@ -424,9 +427,15 @@ fn shapes(
                 // Style (75): 0 fills every other level, 1 only the outermost area, 2 ignores
                 // islands.
                 let style = hatch_style(e);
+                // Spline edges joined straight are said only for loops that are drawn: placed,
+                // and kept by the fill style.
+                let mut drawn_failed: usize = fit_failed.iter().sum();
                 let (outlines, filled) = if solid {
-                    match with_holes(&loops, style) {
-                        Some(o) => (o, true),
+                    match with_holes_kept(&loops, style) {
+                        Some((o, kept)) => {
+                            drawn_failed = fit_failed.iter().zip(&kept).filter(|(_, k)| **k).map(|(n, _)| n).sum();
+                            (o, true)
+                        }
                         None => {
                             // Too many holes to cut in: the boundaries, not a wrong fill.
                             *skipped.entry(HATCH_UNFILLED.to_owned()).or_default() += 1;
@@ -436,6 +445,9 @@ fn shapes(
                 } else {
                     (loops, false)
                 };
+                if drawn_failed > 0 {
+                    *skipped.entry(SPLINE_FIT_FAILED.to_owned()).or_default() += drawn_failed;
+                }
                 for lp in outlines {
                     if let Some(s) = polyline(lp.into_iter().map(|(x, y)| q(x, y)).collect(), true, filled) {
                         out.push((layer.clone(), s));
@@ -647,6 +659,10 @@ const HATCH_UNFILLED: &str = "solid HATCH (holes too complex)";
 /// points instead).
 const SPLINE_NOT_CURVE: &str = "SPLINE whose knots make no curve";
 
+/// The key under which splines whose fit points could not be interpolated are counted (drawn
+/// through their points as a polygon instead).
+const SPLINE_FIT_FAILED: &str = "SPLINE whose fit points could not be interpolated";
+
 /// The key under which splines whose points are not numbers once placed are counted.
 const SPLINE_NOT_NUMBERS: &str = "SPLINE whose points are not numbers once placed";
 
@@ -721,12 +737,7 @@ fn through_fit_points(fit: &[(f64, f64)], degree: usize, tangents: Tangents) -> 
     if !fit.iter().all(|pt| pt.0.is_finite() && pt.1.is_finite()) {
         return None;
     }
-    let mut q: Vec<(f64, f64)> = Vec::with_capacity(fit.len());
-    for &pt in fit {
-        if q.last().is_none_or(|l| (l.0 - pt.0).hypot(l.1 - pt.1) > 1e-12) {
-            q.push(pt);
-        }
-    }
+    let mut q = distinct_fit(fit, false);
     // A repeat merge must not lose the curve's end: the last point given is its end.
     if let (Some(last), Some(&end)) = (q.last_mut(), fit.last()) {
         *last = end;
@@ -739,17 +750,7 @@ fn through_fit_points(fit: &[(f64, f64)], degree: usize, tangents: Tangents) -> 
     }
     // Unit start and end directions. When only one is given, the other end follows its last
     // chord, so the given one is not lost.
-    // A direction of any size: scaled by its largest part first, so a tiny or huge given tangent
-    // keeps its direction (only zero and values that are not numbers have none).
-    let unit = |(x, y): (f64, f64)| {
-        let m = x.abs().max(y.abs());
-        if !(m.is_finite() && m > 0.0) {
-            return None;
-        }
-        let (x, y) = (x / m, y / m);
-        let l = x.hypot(y);
-        Some((x / l, y / l))
-    };
+    let unit = unit_direction;
     let chord = |a: usize, b: usize| {
         let (pa, pb) = (q.get(a)?, q.get(b)?);
         unit((pb.0 - pa.0, pb.1 - pa.1))
@@ -863,16 +864,7 @@ fn through_fit_points_closed(fit: &[(f64, f64)], degree: usize) -> Option<Vec<(f
         }
         return Some(out);
     }
-    let near = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).hypot(a.1 - b.1) <= 1e-12;
-    let mut q: Vec<(f64, f64)> = Vec::with_capacity(fit.len());
-    for &pt in fit {
-        if q.last().is_none_or(|&l| !near(l, pt)) {
-            q.push(pt);
-        }
-    }
-    while q.len() > 1 && near(*q.last()?, *q.first()?) {
-        q.pop();
-    }
+    let q = distinct_fit(fit, true);
     let n = q.len();
     if !(3..=MAX_FIT_POINTS).contains(&n) {
         return None;
@@ -1069,19 +1061,99 @@ fn basis(knots: &[f64], span: usize, u: f64, p: usize) -> Option<Vec<f64>> {
     Some(n)
 }
 
+/// How the points of a spline were found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SplineShape {
+    /// A curve (or no curve to make: a spline with no knots and too few fit points for one).
+    Curve,
+    /// Its knots make no curve: its points are joined straight.
+    KnotsNoCurve,
+    /// It has no knots, and its fit points were enough for a curve but could not be
+    /// interpolated (a system that cannot be solved, parameters that round to the same value),
+    /// or some were left out as not numbers: they are joined straight.
+    FitNotInterpolated,
+}
+
+/// Whether fit points `fit` are enough for an interpolated curve, so that no curve through them
+/// is a failure rather than nothing to curve: at least three distinct points (around the loop
+/// when `closed`), or two with a usable tangent on an open spline, and at most
+/// [`MAX_FIT_POINTS`] (beyond, they are joined straight on purpose).
+fn fit_makes_curve(fit: &[(f64, f64)], closed: bool, tangents: Tangents) -> bool {
+    let tangent = tangents.0.and_then(unit_direction).is_some() || tangents.1.and_then(unit_direction).is_some();
+    let least = if !closed && tangent { 2 } else { 3 };
+    fit.len() <= MAX_FIT_POINTS && distinct_fit(fit, closed).len() >= least
+}
+
+/// Fit points without those within 1e-12 of the one before; when `closed`, also without the
+/// last ones that repeat the first. Interpolation counts and uses these.
+fn distinct_fit(fit: &[(f64, f64)], closed: bool) -> Vec<(f64, f64)> {
+    let near = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).hypot(a.1 - b.1) <= 1e-12;
+    let mut q: Vec<(f64, f64)> = Vec::with_capacity(fit.len());
+    for &pt in fit {
+        if q.last().is_none_or(|&l| !near(l, pt)) {
+            q.push(pt);
+        }
+    }
+    while closed && q.len() > 1 && q.first().zip(q.last()).is_some_and(|(&a, &b)| near(a, b)) {
+        q.pop();
+    }
+    q
+}
+
+/// The unit direction of a tangent of any size: scaled by its largest part first, so a tiny or
+/// huge given tangent keeps its direction (only zero and values that are not numbers have none).
+fn unit_direction((x, y): (f64, f64)) -> Option<(f64, f64)> {
+    let m = x.abs().max(y.abs());
+    if !(m.is_finite() && m > 0.0) {
+        return None;
+    }
+    let (x, y) = (x / m, y / m);
+    let l = x.hypot(y);
+    Some((x / l, y / l))
+}
+
+/// The fit points of a SPLINE (codes 11/21, each x followed by its y), and whether any was left
+/// out because a coordinate is missing, not a number or not finite.
+fn fit_pairs(e: &Entity) -> (Vec<(f64, f64)>, bool) {
+    let number = |v: &str| v.trim().parse::<f64>().ok().filter(|v| v.is_finite());
+    let mut fit = Vec::new();
+    let mut invalid = false;
+    // The x of the point being read: `Some(None)` when it is not a number.
+    let mut x: Option<Option<f64>> = None;
+    for (c, v) in &e.codes {
+        match *c {
+            11 => {
+                if x.is_some() {
+                    invalid = true;
+                }
+                x = Some(number(v));
+            }
+            21 => match x.take() {
+                Some(Some(px)) => match number(v) {
+                    Some(py) => fit.push((px, py)),
+                    None => invalid = true,
+                },
+                _ => invalid = true,
+            },
+            _ => {}
+        }
+    }
+    (fit, invalid || x.is_some())
+}
+
 /// Points of a SPLINE entity: the curve through its control points, else through its fit
 /// points (with its end tangents, codes 12/22 and 13/23, when given); whether it is closed; and
-/// whether its knots made a curve (true when it has none to make one from).
-fn spline_points(e: &Entity) -> (Vec<(f64, f64)>, bool, bool) {
+/// how its points were found.
+fn spline_points(e: &Entity) -> (Vec<(f64, f64)>, bool, SplineShape) {
     let closed = (e.f(70) as i64) & 1 == 1;
     // Whole pairs only, both coordinates finite: a NaN would make the project file unreadable.
     let finite = |(x, y): &(f64, f64)| x.is_finite() && y.is_finite();
     let ctrl: Vec<(f64, f64)> = e.all(10).into_iter().zip(e.all(20)).filter(finite).collect();
-    let fit: Vec<(f64, f64)> = e.all(11).into_iter().zip(e.all(21)).filter(finite).collect();
+    let (fit, fit_invalid) = fit_pairs(e);
     let degree = e.f_or(71, 3.0).max(0.0) as usize;
     let knots = e.all(40);
     if let Some(pts) = bspline_points(&ctrl, &knots, &e.all(41), degree) {
-        return (pts, closed, true);
+        return (pts, closed, SplineShape::Curve);
     }
     // A tangent counts only when both its coordinates are numbers in the file.
     let number = |c: i32| {
@@ -1093,19 +1165,30 @@ fn spline_points(e: &Entity) -> (Vec<(f64, f64)>, bool, bool) {
     let tangents = (tangent(12, 22), tangent(13, 23));
     // A closed spline goes round smoothly through its first point; its end tangents, if any,
     // do not apply.
-    let through = if closed {
+    // A fit point that is not a pair of numbers leaves a gap: no curve is made through the rest.
+    let through = if fit_invalid {
+        None
+    } else if closed {
         through_fit_points_closed(&fit, degree)
     } else {
         through_fit_points(&fit, degree, tangents)
     };
     if let Some(pts) = through {
-        return (pts, closed, true);
+        return (pts, closed, SplineShape::Curve);
     }
-    let curve = knots.is_empty() || ctrl.is_empty();
+    let shape = if !(knots.is_empty() || ctrl.is_empty()) {
+        SplineShape::KnotsNoCurve
+    } else if fit_makes_curve(&fit, closed, tangents) || (fit_invalid && fit.len() >= 2) {
+        // Enough points for a curve that could not be made, or points left out as not numbers
+        // (as a hatch spline edge with such a point is said too).
+        SplineShape::FitNotInterpolated
+    } else {
+        SplineShape::Curve
+    };
     if fit.len() >= 2 {
-        return (fit, closed, curve);
+        return (fit, closed, shape);
     }
-    (ctrl, closed, curve)
+    (ctrl, closed, shape)
 }
 
 /// Reads the group codes of an entity in order.
@@ -1180,8 +1263,10 @@ fn bulged(vertices: &[((f64, f64), f64)], closed: bool) -> Option<Vec<(f64, f64)
     Some(out)
 }
 
-/// The boundary loops of a HATCH, as DXF points. Unreadable loops are left out.
-fn hatch_loops(e: &Entity) -> Vec<Vec<(f64, f64)>> {
+/// The boundary loops of a HATCH, as DXF points, each with how many of its spline edges were
+/// joined straight because their fit points could not be interpolated. Unreadable loops are left
+/// out.
+fn hatch_loops(e: &Entity) -> Vec<(Vec<(f64, f64)>, usize)> {
     let mut cur = Cursor { codes: &e.codes, i: 0 };
     // Skip the elevation point, extrusion, pattern name and flags up to the loop count.
     let Some(start) = e.codes.iter().position(|(c, _)| *c == 91) else {
@@ -1193,6 +1278,8 @@ fn hatch_loops(e: &Entity) -> Vec<Vec<(f64, f64)>> {
     for _ in 0..loops {
         let Some(flags) = cur.take(92) else { break };
         let mut pts: Vec<(f64, f64)> = Vec::new();
+        // Spline edges of this loop whose fit points could not be interpolated (joined straight).
+        let mut fit_failed = 0;
         if (flags as i64) & 2 == 2 {
             let has_bulge = cur.take(72).unwrap_or(0.0) != 0.0;
             let _closed = cur.take(73);
@@ -1289,10 +1376,20 @@ fn hatch_loops(e: &Entity) -> Vec<Vec<(f64, f64)>> {
                             cur.point(x, y).filter(|_| valid)
                         };
                         let tangents = (tangent(12, 22), tangent(13, 23));
-                        bspline_points(&ctrl, &knots, &weights, degree)
+                        if let Some(pts) = bspline_points(&ctrl, &knots, &weights, degree)
                             .or_else(|| numbers.then(|| through_fit_points(&fit, degree, tangents)).flatten())
-                            .or((fit.len() >= 2).then_some(fit))
-                            .unwrap_or(ctrl)
+                        {
+                            pts
+                        } else if fit.len() >= 2 {
+                            // A fit point that is not a number, or enough of them for a curve
+                            // that could not be made: joined straight, and said.
+                            if !numbers || fit_makes_curve(&fit, false, tangents) {
+                                fit_failed += 1;
+                            }
+                            fit
+                        } else {
+                            ctrl
+                        }
                     }
                     _ => break,
                 };
@@ -1323,7 +1420,7 @@ fn hatch_loops(e: &Entity) -> Vec<Vec<(f64, f64)>> {
             pts.pop();
         }
         if pts.len() >= 3 {
-            out.push(pts);
+            out.push((pts, fit_failed));
         }
     }
     out
@@ -1372,14 +1469,32 @@ fn crosses(p: (f64, f64), q: (f64, f64), c: (f64, f64), d: (f64, f64)) -> bool {
     ((d1 > eps && d2 < -eps) || (d1 < -eps && d2 > eps)) && ((d3 > eps && d4 < -eps) || (d3 < -eps && d4 > eps))
 }
 
+/// A closed boundary, as DXF points.
+type Loop = Vec<(f64, f64)>;
+
+/// [`with_holes_kept`] without the loops it kept.
+#[cfg(test)]
+fn with_holes(loops: &[Vec<(f64, f64)>], style: i64) -> Option<Vec<Vec<(f64, f64)>>> {
+    with_holes_kept(loops, style).map(|(out, _)| out)
+}
+
 /// The loops of a solid fill as outlines that fill right with the non-zero and even-odd rules
 /// alike: every loop inside an odd number of others is a hole, cut into the loop just around it
 /// along the shortest bridge, so one outline goes round the solid part and back round the hole.
-/// `None` when the loops are too many or too big to work out within the budgets: a fill that
-/// covered the holes would be wrong.
-fn with_holes(loops: &[Vec<(f64, f64)>], style: i64) -> Option<Vec<Vec<(f64, f64)>>> {
-    let mut loops: Vec<Vec<(f64, f64)>> = loops.iter().filter(|l| l.len() >= 3).cloned().collect();
-    loops.sort_by(|a, b| area2(b).abs().total_cmp(&area2(a).abs()));
+/// Also, for each loop given, whether the fill style keeps it (Outer drops islands inside
+/// islands, Ignore every island; a loop of fewer than three points is dropped). `None` when the
+/// loops are too many or too big to work out within the budgets: a fill that covered the holes
+/// would be wrong.
+fn with_holes_kept(loops: &[Vec<(f64, f64)>], style: i64) -> Option<(Vec<Loop>, Vec<bool>)> {
+    let mut kept = vec![false; loops.len()];
+    let mut order: Vec<usize> = (0..loops.len())
+        .filter(|&i| loops.get(i).is_some_and(|l| l.len() >= 3))
+        .collect();
+    order.sort_by(|&a, &b| {
+        let area = |i: usize| loops.get(i).map_or(0.0, |l| area2(l).abs());
+        area(b).total_cmp(&area(a))
+    });
+    let loops: Vec<Vec<(f64, f64)>> = order.iter().filter_map(|&i| loops.get(i).cloned()).collect();
     // For each loop, the smallest loop around it (bigger, so earlier) and its nesting depth.
     let mut parent: Vec<Option<usize>> = Vec::with_capacity(loops.len());
     let mut depth: Vec<usize> = Vec::with_capacity(loops.len());
@@ -1410,6 +1525,9 @@ fn with_holes(loops: &[Vec<(f64, f64)>], style: i64) -> Option<Vec<Vec<(f64, f64
         let level = *depth.get(i)?;
         if (style == 1 && level >= 2) || (style == 2 && level >= 1) {
             continue;
+        }
+        if let Some(k) = order.get(i).and_then(|&o| kept.get_mut(o)) {
+            *k = true;
         }
         let mut lp = lp.clone();
         if level.is_multiple_of(2) {
@@ -1483,7 +1601,7 @@ fn with_holes(loops: &[Vec<(f64, f64)>], style: i64) -> Option<Vec<Vec<(f64, f64
         cut.extend(o.get(a..)?);
         *o = cut;
     }
-    Some(outer.into_iter().flatten().collect())
+    Some((outer.into_iter().flatten().collect(), kept))
 }
 
 /// One warning per entity kind that was not read.
@@ -1504,6 +1622,9 @@ fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
             } else if kind == SPLINE_TOO_FEW {
                 let s = if n == 1 { "" } else { "s" };
                 format!("{n} SPLINE{s} with too few points to draw, left out")
+            } else if kind == SPLINE_FIT_FAILED {
+                let s = if n == 1 { "" } else { "s" };
+                format!("{n} SPLINE{s} whose fit points could not be interpolated, drawn through their points")
             } else if kind == SPLINE_NOT_CURVE {
                 let s = if n == 1 { "" } else { "s" };
                 format!("{n} SPLINE{s} whose knots make no curve, drawn through their points")
@@ -2331,9 +2452,25 @@ mod tests {
     #[test]
     fn spline_points_that_are_not_numbers_are_left_out() -> Result<()> {
         let ents = "0\nSPLINE\n71\n3\n11\n0\n21\n0\n11\nNaN\n21\n1\n11\n5\n21\n1e999\n11\n10\n21\n0\n";
-        let (g, _) = drawn(ents, "")?;
+        let (g, skipped) = drawn(ents, "")?;
         let (s, _, _) = poly(&g[0]);
         assert_eq!(s, [Point::new(0.0, 0.0), Point::new(10.0, 0.0)]);
+        // Joined straight because points were left out: said.
+        assert_eq!(skipped.get(SPLINE_FIT_FAILED), Some(&1), "{skipped:?}");
+        // Also when a coordinate is not read as a number at all.
+        let ents = "0\nSPLINE\n71\n3\n11\n0\n21\n0\n11\nbad\n21\n1\n11\n10\n21\n0\n";
+        let (g, skipped) = drawn(ents, "")?;
+        assert_eq!(g.len(), 1);
+        assert_eq!(skipped.get(SPLINE_FIT_FAILED), Some(&1), "{skipped:?}");
+        // Three points left: still joined straight, and each x keeps its own y.
+        let ents = "0\nSPLINE\n71\n3\n11\n0\n21\n0\n11\nbad\n21\n9\n11\n10\n21\n0\n11\n10\n21\n10\n";
+        let (g, skipped) = drawn(ents, "")?;
+        let (s, _, _) = poly(&g[0]);
+        assert_eq!(
+            s,
+            [Point::new(0.0, 0.0), Point::new(10.0, 0.0), Point::new(10.0, -10.0)]
+        );
+        assert_eq!(skipped.get(SPLINE_FIT_FAILED), Some(&1), "{skipped:?}");
         Ok(())
     }
 
@@ -2656,6 +2793,97 @@ mod tests {
             skipped_warnings(skipped),
             ["1 SPLINE whose knots make no curve, drawn through their points"]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn fit_points_that_cannot_be_interpolated_are_joined_and_said() -> Result<()> {
+        // Chords of 1e16 and 1 round two parameters to the same value: no curve through them,
+        // open or closed.
+        let fit = "11\n0\n21\n0\n11\n1e16\n21\n0\n11\n1e16\n21\n1\n11\n0\n21\n1\n";
+        for flags in ["0", "1"] {
+            let (g, skipped) = drawn(&format!("0\nSPLINE\n70\n{flags}\n71\n3\n{fit}"), "")?;
+            assert_eq!(g.len(), 1, "drawn through its points (flags {flags})");
+            let (s, _, _) = poly(&g[0]);
+            assert!(s.len() <= 5, "a polygon, not a curve: {s:?}");
+            assert_eq!(
+                skipped_warnings(skipped),
+                ["1 SPLINE whose fit points could not be interpolated, drawn through their points"],
+                "flags {flags}"
+            );
+        }
+        // Fit points that interpolate fine, and two that need no curve, are not said.
+        for ents in [
+            "0\nSPLINE\n71\n3\n11\n0\n21\n0\n11\n5\n21\n5\n11\n10\n21\n0\n",
+            "0\nSPLINE\n70\n1\n71\n3\n11\n0\n21\n0\n11\n5\n21\n5\n11\n10\n21\n0\n",
+            "0\nSPLINE\n71\n3\n11\n0\n21\n0\n11\n10\n21\n0\n",
+        ] {
+            let (g, skipped) = drawn(ents, "")?;
+            assert_eq!(g.len(), 1, "{ents:?}");
+            assert!(skipped.is_empty(), "{ents:?}: {skipped:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_hatch_spline_edge_whose_fit_points_cannot_be_interpolated_is_said() -> Result<()> {
+        // One loop: a spline edge by fit points that cannot be interpolated, closed by a line.
+        let hatch = |mid: &str| {
+            format!(
+                "0\nHATCH\n2\nANSI31\n70\n0\n91\n1\n92\n1\n93\n2\n\
+                 72\n4\n94\n3\n73\n0\n74\n0\n95\n0\n96\n0\n97\n4\n\
+                 11\n0\n21\n0\n11\n1e16\n21\n0\n11\n1e16\n21\n{mid}\n11\n0\n21\n1\n\
+                 72\n1\n10\n0\n20\n1\n11\n0\n21\n0\n97\n0\n"
+            )
+        };
+        let (g, skipped) = drawn(&hatch("1"), "")?;
+        assert_eq!(g.len(), 1);
+        assert_eq!(skipped.get(SPLINE_FIT_FAILED), Some(&1), "{skipped:?}");
+        // A fit point that is not a number is joined straight too, and said.
+        let (_, skipped) = drawn(&hatch("NaN"), "")?;
+        assert_eq!(skipped.get(SPLINE_FIT_FAILED), Some(&1), "{skipped:?}");
+        // At a scale where the loop overflows once placed, the loop is left out: only that is
+        // said, not a spline drawn through its points.
+        let d = parse(&dxf(&hatch("1"), ""))?;
+        let (mut raw, mut points, mut skipped, mut budget) = (Vec::new(), Vec::new(), BTreeMap::new(), MAX_DRAWN);
+        shapes(
+            &d,
+            &d.entities,
+            Xf::ID,
+            1e300,
+            0,
+            &|_| false,
+            &mut raw,
+            &mut points,
+            &mut skipped,
+            &mut budget,
+        );
+        assert_eq!(skipped.get(HATCH_NOT_NUMBERS), Some(&1), "{skipped:?}");
+        assert!(!skipped.contains_key(SPLINE_FIT_FAILED), "{skipped:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_spline_edge_on_an_island_the_style_ignores_is_not_said() -> Result<()> {
+        // A solid hatch: a big square, and inside it an island made of a spline edge whose fit
+        // points cannot be interpolated, closed by a line.
+        let hatch = |style: &str| {
+            format!(
+                "0\nHATCH\n2\nSOLID\n70\n1\n75\n{style}\n91\n2\n\
+                 92\n3\n72\n0\n73\n1\n93\n4\n10\n-1e17\n20\n-1e17\n10\n1e17\n20\n-1e17\n\
+                 10\n1e17\n20\n1e17\n10\n-1e17\n20\n1e17\n97\n0\n\
+                 92\n16\n93\n2\n72\n4\n94\n3\n73\n0\n74\n0\n95\n0\n96\n0\n97\n4\n\
+                 11\n1\n21\n1\n11\n1e16\n21\n1\n11\n1e16\n21\n2\n11\n1\n21\n2\n\
+                 72\n1\n10\n1\n20\n2\n11\n1\n21\n1\n97\n0\n"
+            )
+        };
+        // Normal style: the island is a hole in the fill, and its spline is said.
+        let (_, skipped) = drawn(&hatch("0"), "")?;
+        assert_eq!(skipped.get(SPLINE_FIT_FAILED), Some(&1), "{skipped:?}");
+        // Ignore style: the island is not drawn, so neither is its spline.
+        let (g, skipped) = drawn(&hatch("2"), "")?;
+        assert_eq!(g.len(), 1, "only the outer square");
+        assert!(!skipped.contains_key(SPLINE_FIT_FAILED), "{skipped:?}");
         Ok(())
     }
 

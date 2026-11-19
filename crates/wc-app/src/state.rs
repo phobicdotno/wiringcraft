@@ -205,6 +205,11 @@ pub struct Open {
     undo_dropped: usize,
     /// Counts every change to the undo history (checkpoint, undo, redo, squash).
     history: u64,
+    /// Changes with every edit of the project, its symbols or its parts that goes through
+    /// this type (an undo step, a form's typing, a library reload, [`Open::touch`]), and
+    /// differs between any two opened projects: checks while drawing look at this instead of
+    /// comparing the whole project each frame.
+    revision: u64,
     /// The `history` count right after a properties form made its own undo step, so later
     /// typing in the form joins that step only while nothing else has touched the history.
     form_step: Option<u64>,
@@ -278,6 +283,13 @@ pub fn held_change_in(project: &Project, held_by_others: &BTreeMap<String, Strin
     })
 }
 
+/// Hands out [`Open::revision`]s: one counter for every opened project, so a project opened
+/// after another never shows the same revision.
+fn next_revision() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The history as it was before a library update, so a failed one leaves no trace in it.
 struct HistoryState {
     redo: Vec<Project>,
@@ -303,6 +315,7 @@ impl Open {
             redo: Vec::new(),
             undo_dropped: 0,
             history: 0,
+            revision: next_revision(),
             form_step: None,
             branch: wc_vcs::Git::new(dir).current_branch().unwrap_or_default(),
             underlays: BTreeMap::new(),
@@ -402,7 +415,7 @@ impl Open {
     pub fn set_logo_place(&mut self, min: Point, max: Point) {
         if let Some(logo) = self.project.meta.logo.as_mut() {
             logo.cover = Some((min, max));
-            self.dirty = true;
+            self.edited();
         }
     }
 
@@ -419,6 +432,7 @@ impl Open {
             }
         }
         self.library = items.into_iter().collect();
+        self.touch();
 
         self.parts = self
             .project
@@ -707,6 +721,7 @@ impl Open {
         self.history = history;
         self.form_step = form_step;
         self.dirty = dirty;
+        self.touch();
         self.terminals_before = terminals_before;
     }
 
@@ -717,6 +732,23 @@ impl Open {
         let now = std::mem::replace(&mut self.project.lock, lock);
         self.checkpoint();
         self.project.lock = now;
+    }
+
+    /// Which edit of the project is shown: see the `revision` field.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Note an edit of the project, its symbols or its parts made without an undo step (a
+    /// shared session's sync, say), so checks while drawing see it.
+    pub fn touch(&mut self) {
+        self.revision = next_revision();
+    }
+
+    /// Note unsaved work: an edit, as [`Open::touch`].
+    pub fn edited(&mut self) {
+        self.dirty = true;
+        self.touch();
     }
 
     pub fn checkpoint(&mut self) {
@@ -730,7 +762,7 @@ impl Open {
             self.undo_dropped += 1;
         }
         self.redo.clear();
-        self.dirty = true;
+        self.edited();
         self.history += 1;
     }
 
@@ -773,6 +805,7 @@ impl Open {
         if self.undo.pop().is_some() {
             self.redo.clear();
             self.history += 1;
+            self.touch();
         }
     }
 
@@ -832,6 +865,7 @@ impl Open {
         if self.undo.len() > start + 1 {
             self.undo.truncate(start + 1);
             self.history += 1;
+            self.touch();
         }
     }
 
@@ -860,7 +894,7 @@ impl Open {
                 }
                 let sources = self.redo.last().map(|p| &p.meta.libraries) != Some(&self.project.meta.libraries);
                 self.follow_step(sources);
-                self.dirty = true;
+                self.edited();
                 self.history += 1;
                 true
             }
@@ -883,7 +917,7 @@ impl Open {
                 }
                 let sources = self.undo.last().map(|p| &p.meta.libraries) != Some(&self.project.meta.libraries);
                 self.follow_step(sources);
-                self.dirty = true;
+                self.edited();
                 self.history += 1;
                 true
             }
@@ -949,6 +983,7 @@ impl Open {
             }
         }
         self.symbols = syms;
+        self.touch();
     }
 
     /// After Undo or Redo: put back the vendored symbol versions the restored lock names, both
@@ -1301,7 +1336,7 @@ impl Open {
             self.parts.insert(f.id.clone(), old);
         }
         // The file still has to be written: unsaved work, so Save is offered and asked for.
-        self.dirty = true;
+        self.edited();
     }
 
     /// Write again every file a failed library update could not put back. One whose item the
@@ -1374,6 +1409,7 @@ impl Open {
     /// pins and loaded symbols the others added are taken back, and the error names the symbol.
     /// Terminal tracking goes back with them: a copy put back restarted it from that copy.
     pub fn ensure_symbols<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
+        self.touch();
         let (lock, symbols) = (self.project.lock.clone(), self.symbols.clone());
         // Putting a terminal copy back follows terminals: jumpers, rail orders and the device
         // data and panel places of spares a strip took along all go back too.
@@ -1585,7 +1621,7 @@ impl Open {
             });
         }
         if !pairs.is_empty() {
-            self.dirty = true;
+            self.edited();
         }
         pairs.len()
     }
@@ -2162,7 +2198,7 @@ impl Open {
     /// properties edit, an undo) the form starts a new step.
     fn live_form_step(&mut self) {
         if self.form_step == Some(self.history) {
-            self.dirty = true;
+            self.edited();
         } else {
             self.checkpoint();
             self.form_step = Some(self.history);
@@ -3297,8 +3333,10 @@ pub(crate) mod tests {
         let mut new = old.clone();
         new.name = "Coil, changed".into();
         o.rewrite_after_snapshot = vec![(file, serde_json::to_string(&new).unwrap())];
+        let revision = o.revision();
         let done = o.update_library(&lib, None).unwrap();
         assert_eq!(done, vec![(ItemKind::Part, pid.to_owned())]);
+        assert_ne!(o.revision(), revision, "checks while drawing see the update");
         assert_eq!(
             store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(),
             old,

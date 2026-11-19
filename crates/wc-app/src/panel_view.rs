@@ -131,7 +131,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
                     to.x.clamp(0.0, (pw - *width).max(0.0)),
                     to.y.clamp(0.0, (ph - *height).max(0.0)),
                 );
-                open.dirty = true;
+                open.edited();
             }
         }
     }
