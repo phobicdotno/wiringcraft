@@ -37,7 +37,7 @@
 //! is reported by the check itself instead of being skipped quietly; unknown keys are kept when
 //! the project is saved.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -139,27 +139,26 @@ pub fn tag_matches(pattern: &str, tag: &DeviceTag) -> bool {
 /// character, `#` one or more digits; every other character stands for itself.
 pub fn glob(pattern: &str, text: &str) -> bool {
     let t: Vec<char> = text.chars().collect();
-    // The places in `t` where the pattern so far can end.
-    let mut at: BTreeSet<usize> = BTreeSet::from([0]);
+    // at[k]: the pattern so far can end right before the k-th character. Each pattern character
+    // takes one pass over the text, so a match costs pattern length times text length.
+    let mut at: Vec<bool> = std::iter::once(true).chain(t.iter().map(|_| false)).collect();
     for c in pattern.chars() {
-        let mut next = BTreeSet::new();
-        for &j in &at {
-            match c {
-                '*' => next.extend(j..=t.len()),
-                '#' => next.extend((j + 1..=t.len()).take_while(|k| t.get(k - 1).is_some_and(char::is_ascii_digit))),
-                _ => {
-                    if t.get(j).is_some_and(|ch| c == '?' || *ch == c) {
-                        next.insert(j + 1);
-                    }
-                }
-            }
+        let mut next = Vec::with_capacity(at.len());
+        next.push(c == '*' && at.first().copied().unwrap_or(false));
+        for ((ch, &before), &here) in t.iter().zip(&at).zip(at.iter().skip(1)) {
+            let prev = next.last().copied().unwrap_or(false);
+            next.push(match c {
+                '*' => prev || here,
+                '#' => ch.is_ascii_digit() && (before || prev),
+                _ => before && (c == '?' || *ch == c),
+            });
         }
-        if next.is_empty() {
+        if !next.contains(&true) {
             return false;
         }
         at = next;
     }
-    at.contains(&t.len())
+    at.last().copied().unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -186,6 +185,15 @@ mod tests {
         assert!(!glob("-K?", "-K12"));
         assert!(glob("*", ""));
         assert!(glob("=A*-K#", "=A1+L2-K10"));
+        assert!(glob("#*#", "12"));
+        assert!(!glob("#*#", "1"));
+        assert!(glob("-K#?", "-K12a"));
+        assert!(!glob("", "x"));
+        assert!(glob("", ""));
+        // A long numeric tag against stars and numbers stays one pass per pattern character.
+        let long = format!("-M{}", "1".repeat(200_000));
+        assert!(glob("-M*#*#", &long));
+        assert!(!glob("-M*#*#x", &long));
     }
 
     #[test]
