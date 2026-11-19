@@ -2948,10 +2948,10 @@ const OUTPUT_FOLDER_FILES: usize = 10_000;
 
 impl Guarded {
     fn new(project: &Path) -> Self {
-        let roots = project_roots(project);
+        let (roots, unknown) = project_roots(project);
         let files = {
             let mut files = std::collections::HashSet::new();
-            let mut unknown = None;
+            let mut unknown = unknown;
             let mut todo = roots.clone();
             // A folder that cannot be listed, or an entry that cannot be looked at, hides
             // files too, so it is recorded like a file whose identity cannot be read.
@@ -3118,18 +3118,52 @@ fn inside(roots: &[PathBuf], path: &Path) -> bool {
 
 /// Where the project's files really are: the project folder, and where each link in it
 /// points (a `pages` folder linked to elsewhere is the project's too), followed through
-/// further links. `.git` is left out.
-fn project_roots(project: &Path) -> Vec<PathBuf> {
+/// further links. `.git` is left out. With them, why a folder or link could not be looked at,
+/// if one could not: a root behind it would go unseen.
+fn project_roots(project: &Path) -> (Vec<PathBuf>, Option<String>) {
     let mut roots = vec![real(project)];
+    let mut unknown = None;
+    // A folder or link that cannot be looked at may hide a root, so why is kept (a link to
+    // nothing hides nothing).
+    let mut note = |at: &Path, e: std::io::Error| {
+        unknown.get_or_insert_with(|| format!("{}: {e}", at.display()));
+    };
     let mut todo = vec![project.to_path_buf()];
     while let Some(d) = todo.pop() {
-        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
-            let Ok(kind) = e.file_type() else { continue };
+        let entries = match std::fs::read_dir(&d) {
+            Ok(entries) => entries,
+            Err(e) => {
+                note(&d, e);
+                continue;
+            }
+        };
+        for e in entries {
+            let e = match e {
+                Ok(e) => e,
+                Err(err) => {
+                    note(&d, err);
+                    continue;
+                }
+            };
             if e.file_name() == ".git" {
                 continue;
             }
+            let kind = match e.file_type() {
+                Ok(kind) => kind,
+                Err(err) => {
+                    note(&e.path(), err);
+                    continue;
+                }
+            };
             if kind.is_symlink() {
-                let Ok(to) = e.path().canonicalize() else { continue };
+                let to = match e.path().canonicalize() {
+                    Ok(to) => to,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(err) => {
+                        note(&e.path(), err);
+                        continue;
+                    }
+                };
                 if roots.iter().any(|r| to.starts_with(r)) {
                     continue;
                 }
@@ -3142,7 +3176,7 @@ fn project_roots(project: &Path) -> Vec<PathBuf> {
             }
         }
     }
-    roots
+    (roots, unknown)
 }
 
 /// `path` with links and `..` worked out as the file system does, as far as it exists (a link
@@ -6238,6 +6272,30 @@ mod tests {
             let copy = tempfile::tempdir().unwrap();
             std::fs::write(copy.path().join("a.json"), "{}").unwrap();
             let copy_path = copy.path().display().to_string();
+            assert!(!seen.reached_by(copy.path(), &copy_path).unwrap());
+            // The same through a link in the project to a folder elsewhere whose parent cannot
+            // be searched: where it points is not known, so a hard link to a page there is
+            // refused with the reason rather than taken as no match.
+            let ext = tempfile::tempdir().unwrap();
+            let inner = ext.path().join("inner");
+            std::fs::create_dir_all(inner.join("more")).unwrap();
+            std::fs::write(inner.join("more/p0002.page.json"), "{}").unwrap();
+            std::os::unix::fs::symlink(inner.join("more"), project.path().join("more")).unwrap();
+            let far = tempfile::tempdir().unwrap();
+            std::fs::hard_link(inner.join("more/p0002.page.json"), far.path().join("b.json")).unwrap();
+            let far_path = far.path().display().to_string();
+            std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let searched = inner.join("more").canonicalize().is_ok();
+            let blind = Guarded::new(project.path());
+            let r = blind.reached_by(far.path(), &far_path);
+            std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o700)).unwrap();
+            if !searched {
+                let e = r.unwrap_err();
+                assert!(e.to_string().contains("more"), "{e}");
+            }
+            let seen = Guarded::new(project.path());
+            assert!(seen.unknown.is_none());
+            assert!(seen.reached_by(far.path(), &far_path).unwrap());
             assert!(!seen.reached_by(copy.path(), &copy_path).unwrap());
         }
     }
