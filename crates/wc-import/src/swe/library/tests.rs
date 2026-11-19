@@ -215,14 +215,18 @@ fn a_layout_with_mixed_prefixes_gives_the_same_library() {
 }
 
 /// Blocks with GUIDs: `Coil` twice and `COIL` once, all cleaning up to `swe.lib.coil`.
-fn guid_blocks(rows: &str) -> Connection {
+/// Each block's one pin is given by `points` (`(row, 1, 'A1', 0, 1)`, ...).
+fn guid_blocks(rows: &str, points: &str) -> Connection {
     db(&format!(
         "CREATE TABLE tew_block (blk_id INTEGER, blk_name TEXT, blk_description TEXT, blk_guid TEXT);
 CREATE TABLE tew_blockpt (bpt_blk_id INTEGER, bpt_no INTEGER, bpt_txt TEXT, bpt_dx REAL, bpt_dy REAL);
 INSERT INTO tew_block VALUES {rows};
-INSERT INTO tew_blockpt VALUES (1, 1, 'A1', 0, 1), (2, 1, 'B1', 0, 2), (3, 1, 'C1', 0, 3);"
+INSERT INTO tew_blockpt VALUES {points};"
     ))
 }
+
+/// Pins A1, B1 and C1 on rows 1, 2 and 3.
+const POINTS: &str = "(1, 1, 'A1', 0, 1), (2, 1, 'B1', 0, 2), (3, 1, 'C1', 0, 3)";
 
 /// Which block each id names, by the pin it has.
 fn ids_to_pins(conn: &Connection) -> Vec<(String, String, String)> {
@@ -240,8 +244,15 @@ fn ids_to_pins(conn: &Connection) -> Vec<(String, String, String)> {
 fn an_id_stays_on_its_block_when_another_catalog_lists_the_blocks_in_another_order() {
     // #301: the same three blocks, the second catalog with their rows in another order and a
     // GUID spelled in braces and capitals.
-    let first = guid_blocks("(1, 'Coil', '', 'aaa'), (2, 'COIL', '', 'bbb'), (3, 'Coil', '', 'ccc')");
-    let second = guid_blocks("(3, 'Coil', '', 'ccc'), (1, 'Coil', '', '{AAA}'), (2, 'COIL', '', 'bbb')");
+    let first = guid_blocks(
+        "(1, 'Coil', '', 'aaa'), (2, 'COIL', '', 'bbb'), (3, 'Coil', '', 'ccc')",
+        POINTS,
+    );
+    // The same blocks under other row ids (ccc first), each with its own pin.
+    let second = guid_blocks(
+        "(7, 'Coil', '', 'ccc'), (8, 'Coil', '', '{AAA}'), (9, 'COIL', '', 'bbb')",
+        "(7, 1, 'C1', 0, 3), (8, 1, 'A1', 0, 1), (9, 1, 'B1', 0, 2)",
+    );
     let a = ids_to_pins(&first);
     assert_eq!(
         a.iter().map(|x| x.0.as_str()).collect::<Vec<_>>(),
@@ -250,7 +261,10 @@ fn an_id_stays_on_its_block_when_another_catalog_lists_the_blocks_in_another_ord
     assert_eq!(a, ids_to_pins(&second));
     // A block with a GUID that sorts before the others, added in a later catalog, takes the
     // plain id: the source tells the import it is another block (see `replace_refused`).
-    let later = guid_blocks("(1, 'Coil', '', 'aaa'), (2, 'COIL', '', 'bbb'), (3, 'Coil', '', '000')");
+    let later = guid_blocks(
+        "(1, 'Coil', '', 'aaa'), (2, 'COIL', '', 'bbb'), (3, 'Coil', '', '000')",
+        POINTS,
+    );
     let b = ids_to_pins(&later);
     assert_eq!(b[0].0, "swe.lib.coil");
     assert_eq!(b[0].2, "solidworks-electrical:block:guid:000");

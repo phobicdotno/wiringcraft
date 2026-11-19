@@ -4130,7 +4130,7 @@ fn add_built(
         if let Ok(have) = store::read_vendored_symbol(dir, &symbol.id)
             && let Some(why) = wc_core::symbol::replace_refused(&have, symbol)
         {
-            return Err(format!("{why}; import into a fresh project, or remove the copy first"));
+            return Err(format!("{why}; import into a fresh project"));
         }
     }
     // A library item already in the project may come again unchanged (same content hash), or
