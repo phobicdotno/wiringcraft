@@ -4755,6 +4755,45 @@ fn a_new_device_s_footprint_goes_back_with_it_or_not_at_all() -> TestResult {
 }
 
 #[test]
+fn a_new_strip_s_jumpers_go_back_with_it_or_not_at_all() -> TestResult {
+    let x1 = wc_core::DeviceTag::parse("-X1")?;
+    let base = Project::new("Test");
+    // A new terminal strip whose part waits, with jumpers on it; no page names it.
+    let mut local = base.clone();
+    local.devices.insert(
+        x1.clone(),
+        wc_core::Device {
+            part: Some("acme.strip".into()),
+            ..Default::default()
+        },
+    );
+    local.meta.jumpers.push(wc_core::project::Jumper {
+        strip: x1.clone(),
+        terminals: vec!["1".into(), "2".into()],
+        part: None,
+    });
+    let held = Held::find(&local, &base, &waiting(&[item_name(ItemKind::Part, "acme.strip")]));
+    assert!(held.now.devices.contains_key(&x1));
+    assert!(held.now.meta.is_some(), "the jumpers wait with their strip");
+    // The session made a device of its own under the same tag meanwhile: the jumpers must not
+    // come back on it.
+    let theirs = wc_core::Device {
+        description: "Theirs".into(),
+        ..Default::default()
+    };
+    let mut session = base.clone();
+    session.devices.insert(x1.clone(), theirs.clone());
+    assert_eq!(held.put_back(&mut session), ["device -X1", "the project properties"]);
+    assert_eq!(session.devices.get(&x1), Some(&theirs));
+    assert!(session.meta.jumpers.is_empty());
+    // Neither changed: both come back.
+    let mut session = base.clone();
+    assert!(held.put_back(&mut session).is_empty());
+    assert_eq!(session, local);
+    Ok(())
+}
+
+#[test]
 fn a_rename_to_a_device_with_a_waiting_part_waits_whole() -> TestResult {
     let k1 = wc_core::DeviceTag::parse("-K1")?;
     let k2 = wc_core::DeviceTag::parse("-K2")?;
