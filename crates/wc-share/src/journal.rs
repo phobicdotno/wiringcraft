@@ -90,6 +90,20 @@ pub struct GitJournal {
     rollback_left: Vec<(PathBuf, Option<Vec<u8>>)>,
 }
 
+/// What every recorded change commits besides its own vendored files: the files
+/// [`wc_core::store::save`] writes and the picture folders a session adds pictures to
+/// ([`Journal::picture`] never replaces a file there).
+const RECORDED_PATHS: &[&str] = &[
+    wc_core::store::PROJECT_FILE,
+    wc_core::store::DEVICES_FILE,
+    wc_core::store::LOCK_FILE,
+    wc_core::store::PAGES_DIR,
+    wc_core::store::PANELS_DIR,
+    wc_core::store::COMMENTS_DIR,
+    wc_core::Logo::DIR,
+    wc_core::Underlay::DIR,
+];
+
 impl GitJournal {
     /// The folder must hold the project; it is made a repository if it is not one yet.
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self> {
@@ -179,7 +193,17 @@ impl Journal for GitJournal {
     fn record(&mut self, project: &Project, change: &Change) -> Result<()> {
         self.finish_rollback()?;
         wc_core::store::save(&self.dir, project)?;
-        self.git.commit_as(&change.message, &change.author)?;
+        // Only this change's files (#316): a vendored file the host wrote outside the session,
+        // before the save that pins it, stays out of a guest's commit and its lock.
+        let vendored: Vec<String> = self
+            .vendored_before
+            .iter()
+            .filter_map(|(path, _)| path.strip_prefix(&self.dir).ok())
+            .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+            .collect();
+        let mut paths: Vec<&str> = RECORDED_PATHS.to_vec();
+        paths.extend(vendored.iter().map(String::as_str));
+        self.git.commit_paths_as(&change.message, &change.author, &paths)?;
         self.vendored_before.clear();
         Ok(())
     }

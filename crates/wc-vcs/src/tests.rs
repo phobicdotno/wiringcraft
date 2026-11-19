@@ -231,3 +231,55 @@ fn a_failed_commit_without_an_index_copy_says_so() -> Result<()> {
     assert!(e.contains("no copy of the staged files was taken"), "and why: {e}");
     Ok(())
 }
+
+#[test]
+fn a_commit_of_some_paths_leaves_every_other_change() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    let write = |name: &str, text: &str| -> Result<()> {
+        let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| wc_core::Error::io(parent, e))?;
+        }
+        std::fs::write(&path, text).map_err(|e| wc_core::Error::io(&path, e).into())
+    };
+    write("pages/p1.json", "1")?;
+    write("pages/old.json", "old")?;
+    write("vendor/symbols/a.json", "a1")?;
+    let git = Git::new(dir);
+    git.init()?;
+
+    // A page added, one removed, a vendored file changed by someone else, and a staged stray file.
+    write("pages/p2.json", "2")?;
+    std::fs::remove_file(dir.join("pages/old.json")).map_err(|e| wc_core::Error::io("old", e))?;
+    write("vendor/symbols/a.json", "a2")?;
+    write("stray [x].txt", "s")?;
+    git.run(&["add", "--", "stray [x].txt"])?;
+
+    let head = git.commit_paths_as("Pages", "Guest <guest@example.com>", &["pages", "panels", "nothere"])?;
+    assert!(head.is_some());
+    let files = git.run(&["show", "--name-status", "--format=", "HEAD"])?;
+    let mut lines: Vec<&str> = files.lines().collect();
+    lines.sort();
+    assert_eq!(lines, ["A\tpages/p2.json", "D\tpages/old.json"]);
+    assert_eq!(git.author_and_subject("HEAD")?.0, "Guest <guest@example.com>");
+    // The rest is still there to commit, the stray file still staged.
+    let left = git.run(&["status", "--porcelain"])?;
+    assert!(left.contains(" M vendor/symbols/a.json"), "{left}");
+    assert!(
+        left.contains("A  \"stray [x].txt\"") || left.contains("A  stray [x].txt"),
+        "{left}"
+    );
+
+    // Nothing left under the paths: no commit.
+    assert!(
+        git.commit_paths_as("Again", "Guest <guest@example.com>", &["pages"])?
+            .is_none()
+    );
+    // A name with glob characters is taken as it is written.
+    assert!(
+        git.commit_paths_as("Stray", "Guest <guest@example.com>", &["stray [x].txt"])?
+            .is_some()
+    );
+    Ok(())
+}
