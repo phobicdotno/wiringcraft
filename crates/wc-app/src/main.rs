@@ -251,6 +251,7 @@ impl chrome::Status for StatusView<'_> {
             Action::CircleTool => self.ed.tool == Tool::Circle,
             Action::ArcTool => self.ed.tool == Tool::Arc,
             Action::PolylineTool => self.ed.tool == Tool::Polyline,
+            Action::DimensionTool => self.ed.tool == Tool::Dimension,
             Action::ToggleGrid => self.prefs.show_grid,
             Action::Layers => self.show_layers,
             Action::ToggleAutoWire => self.prefs.auto_wire,
@@ -643,6 +644,7 @@ impl App {
             | Action::CircleTool
             | Action::ArcTool
             | Action::PolylineTool
+            | Action::DimensionTool
             | Action::CommentTool => {
                 self.ed.tool = match a {
                     Action::TextTool => Tool::Text,
@@ -651,6 +653,7 @@ impl App {
                     Action::CircleTool => Tool::Circle,
                     Action::ArcTool => Tool::Arc,
                     Action::PolylineTool => Tool::Polyline,
+                    Action::DimensionTool => Tool::Dimension,
                     _ => Tool::Rect,
                 };
                 self.ed.wire = None;
@@ -660,6 +663,7 @@ impl App {
                     Action::CommentTool => "Click where the comment goes.",
                     Action::CircleTool => "Click the centre of the circle.",
                     Action::ArcTool => "Click the centre of the arc.",
+                    Action::DimensionTool => "Click the first point to measure from.",
                     _ => "Click the first point.",
                 }
                 .into();

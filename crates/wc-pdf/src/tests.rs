@@ -1768,3 +1768,28 @@ fn plc_card_sheets_move_to_a_larger_sheet_and_fit_their_fields() {
         assert!(writer::text_width_mm(&cut, 2.5) <= width, "{cut:?} fits {width} mm");
     }
 }
+
+#[test]
+fn a_dimension_drawn_by_hand_shows_in_pdf_svg_and_dxf() {
+    let mut project = Project::new("x");
+    let mut page = Page::new("p1", "1", "Cabinet");
+    page.graphics.push(Shape::Dimension {
+        a: wc_core::Point::new(40.0, 120.0),
+        b: wc_core::Point::new(65.0, 120.0),
+        offset: 10.0,
+        height: 2.5,
+    });
+    project.pages = vec![page];
+    let symbols = BTreeMap::new();
+    let (bytes, _) = export(&project, &symbols, &Options::default());
+    let tj = format!("{} Tj", writer::pdf_text("25"));
+    assert!(
+        String::from_utf8_lossy(&bytes).contains(&tj),
+        "the PDF shows the length"
+    );
+    let (pages, _) = page_drawings(&project, &symbols, &Options::default());
+    let svg = crate::vector::svg(&pages[0]);
+    assert!(svg.contains(">25</text>"), "{svg}");
+    let d = dxf(&pages[0]);
+    assert!(d.contains("\n1\n25\n"), "the DXF has the length as text");
+}

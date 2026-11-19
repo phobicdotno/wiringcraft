@@ -220,6 +220,11 @@ pub(crate) fn draw_shape(pen: &mut Pen, s: &Shape) {
             };
             pen.text_at_angle(tuple(*at), *height, a, *angle, text);
         }
+        Shape::Dimension { .. } => {
+            for part in s.dimension_parts().unwrap_or_default() {
+                draw_shape(pen, &part);
+            }
+        }
     }
 }
 

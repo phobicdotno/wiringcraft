@@ -121,6 +121,17 @@ pub enum Shape {
         #[serde(default, skip_serializing_if = "is_zero")]
         angle: f64,
     },
+    /// A linear dimension between `a` and `b`: extension lines out to a dimension line drawn
+    /// `offset` mm to the left of the direction from `a` to `b` (negative: to the right), with
+    /// arrows at both ends and the distance in mm as text above its middle.
+    Dimension {
+        a: Point,
+        b: Point,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        offset: f64,
+        #[serde(default = "default_text_height")]
+        height: f64,
+    },
 }
 
 fn default_text_height() -> f64 {
@@ -197,6 +208,13 @@ impl Shape {
                 align: *align,
                 angle: *angle,
             },
+            // A mirror turns left of a→b into right of it.
+            Shape::Dimension { a, b, offset, height } => Shape::Dimension {
+                a: t(*a),
+                b: t(*b),
+                offset: if mirror { -offset } else { *offset },
+                height: *height,
+            },
         }
     }
 
@@ -211,12 +229,112 @@ impl Shape {
                 Point::new(center.x + radius, center.y + radius),
             ],
             Shape::Text { at, .. } => vec![*at],
+            Shape::Dimension { .. } => {
+                let parts = self.dimension_parts().unwrap_or_default();
+                parts
+                    .iter()
+                    .flat_map(|s| {
+                        let (a, b) = s.bounds();
+                        [a, b]
+                    })
+                    .collect()
+            }
         };
         bounds_of(&pts)
     }
 
+    /// The drawing of a [`Shape::Dimension`] as plain shapes (extension lines, the dimension
+    /// line, two filled arrow heads and the measured length as text), for painting and export.
+    /// `None` for any other shape; empty for a dimension of no length.
+    pub fn dimension_parts(&self) -> Option<Vec<Shape>> {
+        let Shape::Dimension { a, b, offset, height } = self else {
+            return None;
+        };
+        let (a, b, offset, height) = (*a, *b, *offset, *height);
+        let len = a.distance(b);
+        if len <= 0.0 || !len.is_finite() {
+            return Some(Vec::new());
+        }
+        // Unit direction a→b and its left normal on a y-down page (left as seen on paper).
+        let u = Point::new((b.x - a.x) / len, (b.y - a.y) / len);
+        let n = Point::new(u.y, -u.x);
+        let at = |p: Point, k: f64| Point::new(p.x + n.x * k, p.y + n.y * k);
+        let (da, db) = (at(a, offset), at(b, offset));
+        // Extension lines run from a small gap off the measured point to just past the line.
+        let side = if offset < 0.0 { -1.0 } else { 1.0 };
+        let (gap, over) = (DIM_GAP.min(offset.abs()), DIM_OVERSHOOT);
+        let mut out = Vec::new();
+        if offset != 0.0 {
+            out.push(Shape::Line {
+                a: at(a, gap * side),
+                b: at(a, offset + over * side),
+            });
+            out.push(Shape::Line {
+                a: at(b, gap * side),
+                b: at(b, offset + over * side),
+            });
+        }
+        out.push(Shape::Line { a: da, b: db });
+        // Arrow heads point outwards to the extension lines, shortened on a very short dimension.
+        let arrow = DIM_ARROW.min(len / 3.0);
+        let head = |tip: Point, dir: f64| {
+            let back = Point::new(tip.x + u.x * arrow * dir, tip.y + u.y * arrow * dir);
+            let w = arrow / 3.0;
+            Shape::Polyline {
+                points: vec![
+                    tip,
+                    Point::new(back.x + n.x * w, back.y + n.y * w),
+                    Point::new(back.x - n.x * w, back.y - n.y * w),
+                ],
+                closed: true,
+                filled: true,
+            }
+        };
+        out.push(head(da, 1.0));
+        out.push(head(db, -1.0));
+        // The text sits on the outer side of the line, reading left to right or bottom to top.
+        let mut angle = (-u.y).atan2(u.x).to_degrees();
+        if angle > 90.0 + 1e-9 {
+            angle -= 180.0;
+        } else if angle <= -90.0 + 1e-9 {
+            angle += 180.0;
+        }
+        let mid = Point::new((da.x + db.x) / 2.0, (da.y + db.y) / 2.0);
+        // "Up" for the text is its reading direction turned left on paper.
+        let r = angle.to_radians();
+        let up = Point::new(-r.sin(), -r.cos());
+        let lift = DIM_TEXT_GAP;
+        out.push(Shape::Text {
+            at: Point::new(mid.x + up.x * lift, mid.y + up.y * lift),
+            text: format_length(len),
+            height,
+            align: Align::Center,
+            angle: if angle.abs() < 1e-9 { 0.0 } else { angle },
+        });
+        Some(out)
+    }
+
     pub fn translate(&self, d: Point) -> Shape {
         self.placed(d, Rotation::R0, false)
+    }
+}
+
+/// Gap between a measured point and its extension line, in mm.
+const DIM_GAP: f64 = 1.0;
+/// How far extension lines run past the dimension line, in mm.
+const DIM_OVERSHOOT: f64 = 1.5;
+/// Arrow head length, in mm.
+const DIM_ARROW: f64 = 2.5;
+/// Gap between the dimension line and its text baseline, in mm.
+const DIM_TEXT_GAP: f64 = 1.0;
+
+/// A length in mm as a dimension shows it: one decimal, without a trailing ".0".
+pub fn format_length(mm: f64) -> String {
+    let r = (mm * 10.0).round() / 10.0;
+    if r.fract() == 0.0 {
+        format!("{r:.0}")
+    } else {
+        format!("{r:.1}")
     }
 }
 
@@ -249,6 +367,90 @@ mod tests {
         }
         assert_eq!(p, q);
         assert_eq!(p.transform(Rotation::R90, false), Point::new(2.0, 3.0));
+    }
+
+    fn dim(a: (f64, f64), b: (f64, f64), offset: f64) -> Shape {
+        Shape::Dimension {
+            a: Point::new(a.0, a.1),
+            b: Point::new(b.0, b.1),
+            offset,
+            height: 2.5,
+        }
+    }
+
+    fn dim_text(s: &Shape) -> (Point, String, f64) {
+        s.dimension_parts()
+            .unwrap_or_default()
+            .iter()
+            .find_map(|p| match p {
+                Shape::Text { at, text, angle, .. } => Some((*at, text.clone(), *angle)),
+                _ => None,
+            })
+            .unwrap_or_else(|| unreachable!("a dimension has a text"))
+    }
+
+    #[test]
+    fn a_dimension_draws_its_lines_arrows_and_length() {
+        // Left of a→b going right on a y-down page is up on paper: the line sits 10 mm above.
+        let d = dim((10.0, 50.0), (35.0, 50.0), 10.0);
+        let parts = d.dimension_parts().unwrap_or_default();
+        assert!(parts.contains(&Shape::Line {
+            a: Point::new(10.0, 40.0),
+            b: Point::new(35.0, 40.0)
+        }));
+        assert_eq!(parts.iter().filter(|p| matches!(p, Shape::Line { .. })).count(), 3);
+        assert_eq!(
+            parts
+                .iter()
+                .filter(|p| matches!(p, Shape::Polyline { filled: true, .. }))
+                .count(),
+            2
+        );
+        let (at, text, angle) = dim_text(&d);
+        assert_eq!((text.as_str(), angle), ("25", 0.0));
+        assert!(at.y < 40.0, "the text is above the dimension line: {at:?}");
+        let (min, max) = d.bounds();
+        assert!(min.y <= 40.0 && max.y >= 50.0 - DIM_GAP && min.x <= 10.0 && max.x >= 35.0);
+        // Drawn right to left it reads the same way round.
+        let back = dim((35.0, 50.0), (10.0, 50.0), -10.0);
+        assert_eq!(dim_text(&back).2, 0.0);
+        // Measured upwards on paper it reads bottom to top, left of the line.
+        let up = dim((10.0, 50.0), (10.0, 20.0), 5.0);
+        let (at, text, angle) = dim_text(&up);
+        assert_eq!((text.as_str(), angle), ("30", 90.0));
+        assert!(at.x < 5.0, "{at:?}");
+        assert_eq!(format_length(12.345), "12.3");
+        assert!(
+            dim((1.0, 1.0), (1.0, 1.0), 3.0)
+                .dimension_parts()
+                .is_some_and(|p| p.is_empty())
+        );
+        assert_eq!(
+            Shape::Line {
+                a: Point::default(),
+                b: Point::new(1.0, 0.0)
+            }
+            .dimension_parts(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_dimension_moves_mirrors_and_round_trips() {
+        let d = dim((10.0, 50.0), (35.0, 50.0), 10.0);
+        let moved = d.translate(Point::new(5.0, 5.0));
+        assert_eq!(moved, dim((15.0, 55.0), (40.0, 55.0), 10.0));
+        // Mirrored left to right, the direction from a to b turns round: the offset flips so
+        // the dimension line stays above the points.
+        let mirrored = d.placed(Point::default(), Rotation::R0, true);
+        assert_eq!(mirrored, dim((-10.0, 50.0), (-35.0, 50.0), -10.0));
+        assert!(mirrored.bounds().0.y <= 40.0);
+        let json = serde_json::to_string(&d).unwrap_or_default();
+        assert!(json.contains("\"kind\":\"dimension\""), "{json}");
+        assert_eq!(serde_json::from_str::<Shape>(&json).ok(), Some(d));
+        // Height and offset have defaults.
+        let bare = serde_json::from_str::<Shape>(r#"{"kind":"dimension","a":{"x":0,"y":0},"b":{"x":5,"y":0}}"#).ok();
+        assert_eq!(bare, Some(dim((0.0, 0.0), (5.0, 0.0), 0.0)));
     }
 
     #[test]

@@ -37,6 +37,7 @@ pub enum Tool {
     Circle,
     Arc,
     Polyline,
+    Dimension,
     Comment,
 }
 

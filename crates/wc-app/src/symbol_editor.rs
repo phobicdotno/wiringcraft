@@ -1025,6 +1025,10 @@ fn shape_properties(ui: &mut egui::Ui, shape: &mut Shape) {
             .suffix("°")
     }
     match shape {
+        Shape::Dimension { a, b, .. } => {
+            ui.label(RichText::new("Dimension").strong());
+            ui.label(format!("{} mm", wc_core::geom::format_length(a.distance(*b))));
+        }
         Shape::Line { a, b } => {
             ui.label(RichText::new("Line").strong());
             ui.label(format!("From {:.1}, {:.1} to {:.1}, {:.1}", a.x, a.y, b.x, b.y));
