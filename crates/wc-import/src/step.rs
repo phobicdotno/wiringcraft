@@ -101,7 +101,7 @@ pub fn model_size(text: &str) -> Result<(ModelSize, Vec<String>)> {
     if unread > 0 {
         warnings.push(format!("{unread} entities could not be read and were left out"));
     }
-    let (mm, unit_warning) = length_unit(&instances);
+    let (mm, unit_warning) = length_unit(text, &instances);
     warnings.extend(unit_warning);
 
     let point = |id: u64| -> Option<[f64; 3]> {
@@ -328,20 +328,18 @@ fn unit(v: [f64; 3]) -> Option<[f64; 3]> {
 /// geometry's contexts assign (`GLOBAL_UNIT_ASSIGNED_CONTEXT`) count; only a file without such
 /// a context falls back to every length unit it defines (a conversion-based unit names its base
 /// unit too, so that would find both).
-fn length_unit(instances: &BTreeMap<u64, Instance>) -> (f64, Option<String>) {
-    // The contexts the shape representations (with items) are drawn in; when none is
+fn length_unit(text: &str, instances: &BTreeMap<u64, Instance>) -> (f64, Option<String>) {
+    // The shape representations (with items) and the contexts they are drawn in; when none is
     // named, every context that assigns units.
-    let used_contexts: Vec<u64> = instances
+    let representations: Vec<(Vec<u64>, u64)> = instances
         .values()
         .flatten()
-        .filter(|(name, args)| {
-            name.ends_with("REPRESENTATION")
-                && args
-                    .get(1)
-                    .and_then(Value::as_list)
-                    .is_some_and(|items| !items.is_empty())
+        .filter(|(name, _)| name.ends_with("REPRESENTATION"))
+        .filter_map(|(_, args)| {
+            let items: Vec<u64> = args.get(1)?.as_list()?.iter().filter_map(Value::as_ref_id).collect();
+            let context = args.get(2)?.as_ref_id()?;
+            (!items.is_empty()).then_some((items, context))
         })
-        .filter_map(|(_, args)| args.get(2).and_then(Value::as_ref_id))
         .collect();
     let units_of = |id: &u64| -> Vec<u64> {
         instances
@@ -353,6 +351,33 @@ fn length_unit(instances: &BTreeMap<u64, Instance>) -> (f64, Option<String>) {
             .flat_map(|units| units.iter().filter_map(Value::as_ref_id))
             .collect()
     };
+    let context_mm = |context: u64| -> Vec<f64> {
+        let mut mm: Vec<f64> = Vec::new();
+        for unit in units_of(&context) {
+            if let Some(v) = unit_mm(instances, unit, 0)
+                && !mm.iter().any(|f| (f - v).abs() <= f.abs() * 1e-9)
+            {
+                mm.push(v);
+            }
+        }
+        mm
+    };
+    let mut used_contexts: Vec<u64> = representations.iter().map(|(_, c)| *c).collect();
+    used_contexts.sort_unstable();
+    used_contexts.dedup();
+    let differ = used_contexts
+        .iter()
+        .map(|c| context_mm(*c))
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|w| w[0].len() != w[1].len() || w[0].iter().zip(&w[1]).any(|(a, b)| (a - b).abs() > a.abs() * 1e-9));
+    if differ {
+        // The contexts disagree: keep those whose representation reaches the measured geometry.
+        let reaching = geometry_contexts(text, instances, &representations);
+        if !reaching.is_empty() {
+            used_contexts = reaching;
+        }
+    }
     let mut assigned: Vec<u64> = used_contexts.iter().flat_map(units_of).collect();
     if assigned.is_empty() {
         assigned = instances.keys().flat_map(units_of).collect();
@@ -384,6 +409,99 @@ fn length_unit(instances: &BTreeMap<u64, Instance>) -> (f64, Option<String>) {
             )),
         ),
     }
+}
+
+/// The contexts of the representations whose items lead, by references, to the geometry that
+/// is measured. Only run when contexts disagree, as it scans every instance's references.
+fn geometry_contexts(text: &str, instances: &BTreeMap<u64, Instance>, representations: &[(Vec<u64>, u64)]) -> Vec<u64> {
+    let geometry: BTreeSet<u64> = instances
+        .iter()
+        .filter(|(_, inst)| {
+            inst.iter().any(|(name, _)| {
+                matches!(
+                    name.as_str(),
+                    "VERTEX_POINT"
+                        | "CIRCLE"
+                        | "ELLIPSE"
+                        | "POLYLINE"
+                        | "COORDINATES_LIST"
+                        | "B_SPLINE_CURVE"
+                        | "B_SPLINE_CURVE_WITH_KNOTS"
+                        | "BEZIER_CURVE"
+                        | "UNIFORM_CURVE"
+                        | "QUASI_UNIFORM_CURVE"
+                )
+            })
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    let mut links: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for statement in statements(text) {
+        let Some((id, body)) = statement.trim().strip_prefix('#').and_then(|r| r.split_once('=')) else {
+            continue;
+        };
+        if let Ok(id) = id.trim().parse::<u64>() {
+            links.insert(id, refs_in(body));
+        }
+    }
+    let mut out: Vec<u64> = Vec::new();
+    for (items, context) in representations {
+        if out.contains(context) {
+            continue;
+        }
+        let mut seen: BTreeSet<u64> = BTreeSet::new();
+        let mut todo: Vec<u64> = items.clone();
+        let mut reaches = false;
+        while let Some(id) = todo.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if geometry.contains(&id) {
+                reaches = true;
+                break;
+            }
+            if let Some(next) = links.get(&id) {
+                todo.extend(next.iter().filter(|n| !seen.contains(n)));
+            }
+        }
+        if reaches {
+            out.push(*context);
+        }
+    }
+    out
+}
+
+/// The instance references (`#123`) in an instance's text, outside strings.
+fn refs_in(body: &str) -> Vec<u64> {
+    let mut out = Vec::new();
+    let b = body.as_bytes();
+    let mut i = 0;
+    let mut in_str = false;
+    while i < b.len() {
+        let c = b[i];
+        if in_str {
+            in_str = c != b'\'';
+            i += 1;
+            continue;
+        }
+        if c == b'\'' {
+            in_str = true;
+            i += 1;
+        } else if c == b'#' {
+            let start = i + 1;
+            let mut end = start;
+            while end < b.len() && b[end].is_ascii_digit() {
+                end += 1;
+            }
+            if let Some(id) = body.get(start..end).and_then(|d| d.parse().ok()) {
+                out.push(id);
+            }
+            i = end.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Millimetres per unit for an instance that is a length unit.
