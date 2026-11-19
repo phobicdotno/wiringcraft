@@ -425,6 +425,14 @@ mod tests {
             (over.width - 10.0 * (1.0 - 45f64.to_radians().cos())).abs() < 1e-9,
             "{over:?}"
         );
+        // Angles far out of range (an imported ARC with 50=0, 51=-1e21) do not overflow.
+        let far = Footprint::from_shapes(vec![crate::Shape::Arc {
+            center: Point::new(0.0, 0.0),
+            radius: 10.0,
+            start: 1e21,
+            end: -0.0,
+        }]);
+        assert!(far.is_some_and(|f| f.width <= 20.0 && f.height <= 20.0));
         // In a box of the drawing's size it is drawn as is; in a smaller box it shrinks evenly
         // and is centred; in a larger one it keeps its size and is centred.
         let at = Point::new(10.0, 20.0);

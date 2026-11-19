@@ -2408,6 +2408,10 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 let edited = store::read_vendored_part(dir, &part)
                     .ok()
                     .is_some_and(|copy| p.lock.parts.get(&part).is_some_and(|pin| pin.hash != copy.hash()));
+                // Read first, so a failed refresh puts the copy back as it was: the lock on disk
+                // is only saved after a refresh that worked, and must keep matching the copy.
+                let vendored = store::vendor_path(dir, ItemKind::Part, &part).map_err(e)?;
+                let before = std::fs::read(&vendored).ok();
                 let refreshed = match &winner {
                     _ if edited => Err(format!(
                         "it has local changes since it was pinned; remove or merge them, then take {part} again"
@@ -2434,10 +2438,25 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                         save(dir, p)?;
                         println!("updated the project's copy of {part}");
                     }
-                    Err(why) => eprintln!(
-                        "warning: the project's copy of {part} was not updated: {}",
-                        escape_field(&why)
-                    ),
+                    Err(why) => {
+                        let restored = match &before {
+                            Some(bytes) if std::fs::read(&vendored).ok().as_ref() != Some(bytes) => {
+                                std::fs::write(&vendored, bytes).map_err(|err| err.to_string())
+                            }
+                            Some(_) => Ok(()),
+                            None if vendored.exists() => std::fs::remove_file(&vendored).map_err(|err| err.to_string()),
+                            None => Ok(()),
+                        };
+                        eprintln!(
+                            "warning: the project's copy of {part} was not updated: {}",
+                            escape_field(&why)
+                        );
+                        if let Err(err) = restored {
+                            return Err(format!(
+                                "the project's copy of {part} could not be put back: {err}; run `lib status`"
+                            ));
+                        }
+                    }
                 }
             }
         }

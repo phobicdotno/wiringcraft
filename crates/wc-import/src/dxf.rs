@@ -463,13 +463,21 @@ fn shapes(
                 } else {
                     Some(vs.iter().map(|(p, _)| *p).collect())
                 };
-                let pts: Vec<Point> = raw.unwrap_or_default().into_iter().map(|(x, y)| q(x, y)).collect();
-                let drawable = pts.len() >= 2 && pts.iter().all(|p| p.x.is_finite() && p.y.is_finite());
-                drawable.then_some(Shape::Polyline {
-                    points: pts,
-                    closed,
-                    filled: false,
-                })
+                // A bulge that gives no arc, or points that are not numbers once placed (a huge
+                // INSERT scale), leave the polyline out, and say so.
+                let pts: Option<Vec<Point>> = raw.map(|r| r.into_iter().map(|(x, y)| q(x, y)).collect());
+                match pts {
+                    Some(pts) if pts.len() < 2 => None,
+                    Some(pts) if pts.iter().all(|p| p.x.is_finite() && p.y.is_finite()) => Some(Shape::Polyline {
+                        points: pts,
+                        closed,
+                        filled: false,
+                    }),
+                    _ => {
+                        *skipped.entry(POLYLINE_NOT_NUMBERS.to_owned()).or_default() += 1;
+                        None
+                    }
+                }
             }
             "ELLIPSE" => {
                 // The minor axis is the extrusion turned onto the major one, so a downward
@@ -774,6 +782,9 @@ const SPLINE_TOO_FEW: &str = "SPLINE with too few points";
 const STRETCHED_NOT_NUMBERS: &str = "CIRCLE or ARC of a stretched block whose points are not numbers";
 
 /// The key under which hatches with a boundary that is not all numbers are counted.
+/// The `skipped` key of a polyline whose points, or the arcs of its bulges, are not numbers once
+/// placed.
+const POLYLINE_NOT_NUMBERS: &str = "LWPOLYLINE whose points are not numbers once placed";
 const HATCH_NOT_NUMBERS: &str = "HATCH with a boundary that is not numbers";
 
 /// Points along a B-spline from its control points, knots and weights, sampled evenly over the
@@ -1732,6 +1743,9 @@ fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
             } else if kind == SPLINE_NOT_CURVE {
                 let s = if n == 1 { "" } else { "s" };
                 format!("{n} SPLINE{s} whose knots make no curve, drawn through their points")
+            } else if kind == POLYLINE_NOT_NUMBERS {
+                let s = if n == 1 { "" } else { "s" };
+                format!("{n} polyline{s} whose points are not numbers once placed, left out")
             } else if kind == HATCH_NOT_NUMBERS {
                 let s = if n == 1 { "" } else { "es" };
                 format!("{n} HATCH{s} with a boundary that is not numbers: that boundary left out")
@@ -2064,6 +2078,17 @@ mod tests {
                         0\nVERTEX\n8\n0\n10\n10\n20\n0\n0\nSEQEND\n";
         let (f, _) = footprint(&dxf(old_form, ""))?;
         assert!((f.height - 5.0).abs() < 1e-6, "{}", f.height);
+        // A polyline scaled past the number range is left out and said, the rest still drawn.
+        let huge = "0\nBLOCK\n2\nHUGE\n0\nLWPOLYLINE\n90\n2\n70\n0\n10\n0\n20\n0\n10\n1e308\n20\n0\n0\nENDBLK\n";
+        let ents = format!("{half}0\nINSERT\n2\nHUGE\n10\n0\n20\n0\n41\n10\n42\n10\n");
+        let (f, warnings) = footprint(&dxf(&ents, huge))?;
+        assert!((f.width - 10.0).abs() < 1e-6, "{}", f.width);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("polyline whose points are not numbers")),
+            "{warnings:?}"
+        );
         assert!(footprint("not a dxf").is_err());
         Ok(())
     }

@@ -94,7 +94,8 @@ fn extent_points(s: &crate::Shape) -> Vec<crate::Point> {
     };
     // Angles run as the editor and the PDF draw them: from `start` to `end`, a point at `a`
     // being centre + r (cos a, sin a) on the y-down page.
-    let mut sweep = end - start;
+    // Both into [0, 360), so angles far out of range cannot overflow the quarter count.
+    let mut sweep = (end - start).rem_euclid(360.0);
     if sweep <= 0.0 {
         sweep += 360.0;
     }
@@ -102,6 +103,7 @@ fn extent_points(s: &crate::Shape) -> Vec<crate::Point> {
         let (a, b) = s.bounds();
         return vec![a, b];
     }
+    let start = &start.rem_euclid(360.0);
     let at = |deg: f64| {
         let t = deg.to_radians();
         crate::Point::new(center.x + radius * t.cos(), center.y + radius * t.sin())
