@@ -37,10 +37,6 @@ log = "0.4"
 # The user's real home and Documents folders (moved by OneDrive, localized on Linux).
 dirs = "6"
 
-# File identity (volume serial and file index) for telling a hard link to a project file apart.
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
-
 [dev-dependencies]
 tempfile.workspace = true
 

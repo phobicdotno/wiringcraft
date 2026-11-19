@@ -2721,6 +2721,13 @@ impl App {
             if let Some(why) = writes_while_held(&args, &open.dir, &open.held_by_others, &cwd) {
                 return Err(why);
             }
+            // The look above cannot see a link swapped in after it: the command line opens
+            // each output file so that it cannot land on a project file either (#458).
+            if !open.held_by_others.is_empty() {
+                cmd.env(wc_core::guard::GUARD_ENV, &open.dir);
+            } else {
+                cmd.env_remove(wc_core::guard::GUARD_ENV);
+            }
             if open.dirty {
                 open.save()
                     .map_err(|e| format!("Saving before the command failed: {e}"))?;
@@ -2931,15 +2938,21 @@ fn split_flag(a: &str) -> (&str, &str) {
     }
 }
 
-/// The project's files, to tell whether a command's output could land on one.
-struct Guarded {
-    /// See [`project_roots`].
-    roots: Vec<PathBuf>,
-    /// The identity of each project file ([`file_id`]), so a hard link to one is known too.
-    files: std::collections::HashSet<(u64, u64)>,
-    /// Why a project file's identity could not be read, if one could not: a hard link to that
-    /// file would go unseen, so no output file is taken as safe then.
-    unknown: Option<String>,
+/// The project's files ([`wc_core::guard::ProjectFiles`]), to tell whether a command's output
+/// could land on one.
+struct Guarded(wc_core::guard::ProjectFiles);
+
+impl std::ops::Deref for Guarded {
+    type Target = wc_core::guard::ProjectFiles;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Guarded {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
 }
 
 /// How many files in an output folder are looked at; a bigger folder is not used while a
@@ -2948,78 +2961,7 @@ const OUTPUT_FOLDER_FILES: usize = 10_000;
 
 impl Guarded {
     fn new(project: &Path) -> Self {
-        let (roots, unknown) = project_roots(project);
-        let files = {
-            let mut files = std::collections::HashSet::new();
-            let mut unknown = unknown;
-            let mut todo = roots.clone();
-            // A folder that cannot be listed, or an entry that cannot be looked at, hides
-            // files too, so it is recorded like a file whose identity cannot be read.
-            let mut note = |at: &Path, e: std::io::Error| {
-                unknown.get_or_insert_with(|| format!("{}: {e}", at.display()));
-            };
-            while let Some(at) = todo.pop() {
-                let m = match std::fs::symlink_metadata(&at) {
-                    Ok(m) => m,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(e) => {
-                        note(&at, e);
-                        continue;
-                    }
-                };
-                if m.is_dir() {
-                    let entries = match std::fs::read_dir(&at) {
-                        Ok(entries) => entries,
-                        Err(e) => {
-                            note(&at, e);
-                            continue;
-                        }
-                    };
-                    for entry in entries {
-                        match entry {
-                            Ok(e) if e.file_name() == ".git" => {}
-                            Ok(e) => todo.push(e.path()),
-                            Err(e) => note(&at, e),
-                        }
-                    }
-                } else if m.is_file() {
-                    match file_id(&at) {
-                        Ok(Some(id)) => {
-                            files.insert(id);
-                        }
-                        Ok(None) => {}
-                        Err(e) => note(&at, e),
-                    }
-                }
-            }
-            (files, unknown)
-        };
-        let (files, unknown) = files;
-        Self { roots, files, unknown }
-    }
-
-    /// Whether `path`, as the file system resolves it, is in the project or is one of its
-    /// files under another name. An error when that cannot be told.
-    fn holds(&self, path: &Path) -> std::io::Result<bool> {
-        Ok(inside(&self.roots, path) || self.same_file(path)?)
-    }
-
-    /// Whether `path` is a project file under another name (a hard link to it). Nothing there,
-    /// or a folder, is not; a file whose identity, or a project file's, cannot be read is an
-    /// error, with the reason.
-    fn same_file(&self, path: &Path) -> std::io::Result<bool> {
-        match std::fs::metadata(path) {
-            Ok(m) if m.is_file() => {}
-            Ok(_) => return Ok(false),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(e) => return Err(e),
-        }
-        if let Some(why) = &self.unknown {
-            return Err(std::io::Error::other(format!(
-                "the identity of a project file could not be read ({why})"
-            )));
-        }
-        Ok(file_id(path)?.is_some_and(|id| self.files.contains(&id)))
+        Self(wc_core::guard::ProjectFiles::new(project))
     }
 
     /// Whether writing to `value` could land on a project file: it is a path into the project
@@ -3043,7 +2985,7 @@ impl Guarded {
         if self.holds(&path)? {
             return Ok(true);
         }
-        let mut todo = vec![real(&path)];
+        let mut todo = vec![wc_core::guard::real(&path)];
         let mut seen = 0;
         while let Some(d) = todo.pop() {
             if !d.is_dir() {
@@ -3067,151 +3009,6 @@ impl Guarded {
         }
         Ok(false)
     }
-}
-
-/// What names one file on this machine whatever path reaches it, links followed: device and
-/// file number on unix.
-#[cfg(unix)]
-fn file_id(path: &Path) -> std::io::Result<Option<(u64, u64)>> {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(path).map(|m| Some((m.dev(), m.ino())))
-}
-
-/// What names one file on this machine whatever path reaches it, links followed: the volume
-/// serial number and the file index on Windows (#459). The file is opened without read or
-/// write access, which only lets its attributes be read.
-#[cfg(windows)]
-fn file_id(path: &Path) -> std::io::Result<Option<(u64, u64)>> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
-    };
-    let file = std::fs::OpenOptions::new()
-        .access_mode(0)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .open(path)?;
-    // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is a valid value (plain integers).
-    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: the handle is open for the whole call and `info` is a valid place to write to.
-    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
-    if ok == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(Some((
-        u64::from(info.dwVolumeSerialNumber),
-        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
-    )))
-}
-
-/// Elsewhere hard links are not told apart: no identity, which is not an error.
-#[cfg(not(any(unix, windows)))]
-fn file_id(_path: &Path) -> std::io::Result<Option<(u64, u64)>> {
-    Ok(None)
-}
-
-/// Whether `path`, as the file system resolves it, is in one of `roots`.
-fn inside(roots: &[PathBuf], path: &Path) -> bool {
-    let path = normalize(&real(path));
-    roots.iter().any(|r| path.starts_with(r))
-}
-
-/// Where the project's files really are: the project folder, and where each link in it
-/// points (a `pages` folder linked to elsewhere is the project's too), followed through
-/// further links. `.git` is left out. With them, why a folder or link could not be looked at,
-/// if one could not: a root behind it would go unseen.
-fn project_roots(project: &Path) -> (Vec<PathBuf>, Option<String>) {
-    let mut roots = vec![real(project)];
-    let mut unknown = None;
-    // A folder or link that cannot be looked at may hide a root, so why is kept (a link to
-    // nothing hides nothing).
-    let mut note = |at: &Path, e: std::io::Error| {
-        unknown.get_or_insert_with(|| format!("{}: {e}", at.display()));
-    };
-    let mut todo = vec![project.to_path_buf()];
-    while let Some(d) = todo.pop() {
-        let entries = match std::fs::read_dir(&d) {
-            Ok(entries) => entries,
-            Err(e) => {
-                note(&d, e);
-                continue;
-            }
-        };
-        for e in entries {
-            let e = match e {
-                Ok(e) => e,
-                Err(err) => {
-                    note(&d, err);
-                    continue;
-                }
-            };
-            if e.file_name() == ".git" {
-                continue;
-            }
-            let kind = match e.file_type() {
-                Ok(kind) => kind,
-                Err(err) => {
-                    note(&e.path(), err);
-                    continue;
-                }
-            };
-            if kind.is_symlink() {
-                let to = match e.path().canonicalize() {
-                    Ok(to) => to,
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(err) => {
-                        note(&e.path(), err);
-                        continue;
-                    }
-                };
-                if roots.iter().any(|r| to.starts_with(r)) {
-                    continue;
-                }
-                if to.is_dir() {
-                    todo.push(to.clone());
-                }
-                roots.push(to);
-            } else if kind.is_dir() {
-                todo.push(e.path());
-            }
-        }
-    }
-    (roots, unknown)
-}
-
-/// `path` with links and `..` worked out as the file system does, as far as it exists (a link
-/// to the project folder is the project folder, and `link/..` is the folder above where the
-/// link points); the part that does not exist yet is kept by name.
-fn real(path: &Path) -> PathBuf {
-    let mut rest = Vec::new();
-    let mut at = path;
-    loop {
-        if let Ok(found) = at.canonicalize() {
-            return rest.iter().rev().fold(found, |p, name| p.join(name));
-        }
-        match (at.parent(), at.components().next_back()) {
-            (Some(up), Some(name)) => {
-                rest.push(name.as_os_str().to_owned());
-                at = up;
-            }
-            _ => return path.to_path_buf(),
-        }
-    }
-}
-
-/// `path` with `.` and `..` worked out by name (the folder need not exist).
-fn normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for c in path.components() {
-        match c {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                out.pop();
-            }
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 /// The `wiringcraft` command-line program: `WIRINGCRAFT_CLI`, then next to this program, then
