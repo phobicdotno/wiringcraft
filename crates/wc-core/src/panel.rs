@@ -184,6 +184,66 @@ impl Panel {
         true
     }
 
+    /// Put the device `tag` on the plate, with the top-left corner of its outline turned by
+    /// `rotation` at `at`, or move and turn it there when it is on the plate already. `size` is
+    /// its upright width and height. Nothing changes and an error says why when the size is not
+    /// a positive finite number or the turned outline would not lie on the plate.
+    pub fn place_device(
+        &mut self,
+        tag: DeviceTag,
+        at: Point,
+        size: (f64, f64),
+        rotation: Rotation,
+    ) -> Result<(), String> {
+        let (width, height) = size;
+        if !(width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0) {
+            return Err(format!("{tag}: size must be positive, got {width} x {height} mm"));
+        }
+        if !(at.x.is_finite() && at.y.is_finite()) {
+            return Err(format!("{tag}: position must be finite"));
+        }
+        let (w, h) = turned_size(width, height, rotation);
+        // A small tolerance, so a device typed flush with the plate's edge is accepted.
+        let eps = 1e-9;
+        if at.x < -eps || at.y < -eps || at.x + w > self.width + eps || at.y + h > self.height + eps {
+            return Err(format!(
+                "{tag}: a {w} x {h} mm outline at {},{} is not on the {} x {} mm plate",
+                at.x, at.y, self.width, self.height
+            ));
+        }
+        let placed = PanelItem::Device {
+            tag: tag.clone(),
+            at,
+            width,
+            height,
+            rotation,
+        };
+        match self
+            .items
+            .iter_mut()
+            .find(|i| matches!(i, PanelItem::Device { tag: t, .. } if *t == tag))
+        {
+            Some(item) => *item = placed,
+            None => self.items.push(placed),
+        }
+        Ok(())
+    }
+
+    /// Take the device `tag` off the plate. Returns false when it was not on it.
+    pub fn remove_device(&mut self, tag: &DeviceTag) -> bool {
+        let before = self.items.len();
+        self.items
+            .retain(|i| !matches!(i, PanelItem::Device { tag: t, .. } if t == tag));
+        self.items.len() != before
+    }
+
+    /// The device `tag` on the plate, if it is there.
+    pub fn device(&self, tag: &DeviceTag) -> Option<&PanelItem> {
+        self.items
+            .iter()
+            .find(|i| matches!(i, PanelItem::Device { tag: t, .. } if t == tag))
+    }
+
     /// Tags of the devices on the plate.
     pub fn device_tags(&self) -> BTreeSet<DeviceTag> {
         self.items

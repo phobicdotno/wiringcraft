@@ -357,6 +357,29 @@ enum PanelCmd {
         id: String,
         out: PathBuf,
     },
+    /// Put one device on a plate, or move or turn it when it is there already, or take it off
+    /// with `--remove`. Its size comes from its part as `arrange` sizes it.
+    Device {
+        id: String,
+        /// Device tag, e.g. `-K1` (taken as a value, though it starts with `-`).
+        #[arg(allow_hyphen_values = true)]
+        tag: String,
+        /// Top-left corner of the device's (turned) outline in mm, `x,y`. Needed to put a device
+        /// on the plate; a device already there keeps its place when left out.
+        #[arg(long, value_parser = parse_point, conflicts_with = "remove")]
+        at: Option<Point>,
+        /// Turn clockwise: 0, 90, 180 or 270. A device already there keeps its turn when left
+        /// out.
+        #[arg(long, conflicts_with = "remove")]
+        rotate: Option<i64>,
+        /// Take the device off the plate.
+        #[arg(long)]
+        remove: bool,
+    },
+    /// Print a layout's plate and each device on it with its position, size and turn.
+    Show {
+        id: String,
+    },
     /// List the layouts and what is on them.
     List,
     Remove {
@@ -1162,12 +1185,83 @@ fn run(cli: Cli) -> Res<()> {
                     );
                     return Ok(());
                 }
+                PanelCmd::Device {
+                    id,
+                    tag,
+                    at,
+                    rotate,
+                    remove,
+                } => {
+                    let tag = DeviceTag::parse(&tag).map_err(e)?;
+                    let known = p.devices.contains_key(&tag)
+                        || p.pages
+                            .iter()
+                            .any(|pg| pg.symbols.iter().any(|s| s.tag.as_ref() == Some(&tag)));
+                    let size = match device_part_size(dir, &p, &tag) {
+                        Ok(size) => size,
+                        Err(warning) => {
+                            eprintln!("warning: {warning}");
+                            None
+                        }
+                    };
+                    let Some(panel) = p.panels.iter_mut().find(|x| x.id == id) else {
+                        return Err(format!("no panel {id:?}"));
+                    };
+                    if remove {
+                        if !panel.remove_device(&tag) {
+                            return Err(format!("{tag} is not on panel {id:?}"));
+                        }
+                        println!("removed {tag} from {id}");
+                    } else {
+                        let here = match panel.device(&tag) {
+                            Some(wc_core::panel::PanelItem::Device {
+                                at,
+                                width,
+                                height,
+                                rotation,
+                                ..
+                            }) => Some((*at, (*width, *height), *rotation)),
+                            _ => None,
+                        };
+                        if here.is_none() && !known {
+                            return Err(format!("no device {tag} in the project"));
+                        }
+                        let Some(at) = at.or(here.map(|h| h.0)) else {
+                            return Err(format!("{tag} is not on panel {id:?}: give --at x,y"));
+                        };
+                        let rotation = match rotate {
+                            Some(d) => Rotation::from_degrees(d).ok_or("rotation must be 0, 90, 180 or 270")?,
+                            None => here.map(|h| h.2).unwrap_or_default(),
+                        };
+                        let estimated = size.is_none() && here.is_none();
+                        let size = size.or(here.map(|h| h.1)).unwrap_or(wc_core::panel::DEFAULT_SIZE);
+                        panel.place_device(tag.clone(), at, size, rotation)?;
+                        println!(
+                            "{tag} on {id} at {},{} ({} x {} mm, turned {})",
+                            at.x,
+                            at.y,
+                            size.0,
+                            size.1,
+                            rotation.degrees()
+                        );
+                        if estimated {
+                            eprintln!("warning: no Width/Height on the part, drawn 18 x 90 mm: {tag}");
+                        }
+                    }
+                }
+                PanelCmd::Show { id } => {
+                    let Some(panel) = p.panels.iter().find(|x| x.id == id) else {
+                        return Err(format!("no panel {id:?}"));
+                    };
+                    print!("{}", panel_show(panel));
+                    return Ok(());
+                }
                 PanelCmd::List => {
                     for x in &p.panels {
                         println!(
                             "{:<10} {} ({} x {} mm, {} device(s))",
                             x.id,
-                            x.name,
+                            escape_field(&x.name),
                             x.width,
                             x.height,
                             x.device_tags().len()
@@ -4022,6 +4116,53 @@ fn vendored_parts(dir: &Path, p: &wc_core::Project) -> std::collections::BTreeMa
         .collect()
 }
 
+/// The upright size of the device `tag`'s part, if it has a part with a size. A part that
+/// cannot be read gives an error naming it and the reason, so a damaged or missing copy is not
+/// mistaken for a part without a size.
+fn device_part_size(dir: &Path, p: &wc_core::Project, tag: &DeviceTag) -> Result<Option<(f64, f64)>, String> {
+    let Some(part) = p.devices.get(tag).and_then(|d| d.part.as_ref()) else {
+        return Ok(None);
+    };
+    match store::read_vendored_part(dir, part) {
+        Ok(read) => Ok(wc_core::panel::part_size(&read)),
+        // The part id and the reason come from the project file: escaped, so they cannot steer
+        // the terminal.
+        Err(err) => Err(escape_field(&format!("cannot read part {part} of {tag}: {err}"))),
+    }
+}
+
+/// `panel show`: the plate, then each device with its place, size and turn, one per line.
+fn panel_show(panel: &wc_core::panel::Panel) -> String {
+    let mut out = format!(
+        "{} {} ({} x {} mm)\n",
+        panel.id,
+        escape_field(&panel.name),
+        panel.width,
+        panel.height
+    );
+    for item in &panel.items {
+        if let wc_core::panel::PanelItem::Device {
+            tag,
+            at,
+            width,
+            height,
+            rotation,
+        } = item
+        {
+            out.push_str(&format!(
+                "{:<12} at {},{}  {} x {} mm  turned {}\n",
+                escape_field(&tag.to_string()),
+                at.x,
+                at.y,
+                width,
+                height,
+                rotation.degrees()
+            ));
+        }
+    }
+    out
+}
+
 /// A report as aligned plain text for the terminal.
 fn plain_table(t: &wc_report::Table) -> String {
     let mut w: Vec<usize> = t.columns.iter().map(|c| c.chars().count()).collect();
@@ -4893,6 +5034,99 @@ mod tests {
         let mut all = vec!["wiringcraft", "-C", dir.to_str().unwrap()];
         all.extend_from_slice(args);
         run(Cli::try_parse_from(all).map_err(|e| e.to_string())?)
+    }
+
+    #[test]
+    fn a_device_is_placed_turned_moved_and_taken_off_a_plate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let lib = tmp.path().join("lib");
+        let mut part = wc_core::Part {
+            id: "maker.contactor".into(),
+            ..wc_core::Part::default()
+        };
+        part.properties.insert("Width".into(), "45".into());
+        part.properties.insert("Height".into(), "85".into());
+        wc_library::write_part(&lib, &part).unwrap();
+        cli(&dir, &["lib", "add", "shop", "folder", lib.to_str().unwrap()]).unwrap();
+        cli(&dir, &["device", "--part", "maker.contactor", "--", "+CAB1-K1"]).unwrap();
+        cli(&dir, &["lib", "lock"]).unwrap();
+        cli(&dir, &["panel", "new", "main"]).unwrap();
+
+        let k1 = DeviceTag::parse("+CAB1-K1").unwrap();
+        let on_plate = || -> Option<(Point, f64, f64, Rotation)> {
+            let p = load(&dir).unwrap();
+            match p.panels[0].device(&k1) {
+                Some(wc_core::panel::PanelItem::Device {
+                    at,
+                    width,
+                    height,
+                    rotation,
+                    ..
+                }) => Some((*at, *width, *height, *rotation)),
+                _ => None,
+            }
+        };
+
+        // Not on the plate yet, so a place is needed; an unknown device is refused.
+        assert!(cli(&dir, &["panel", "device", "main", "+CAB1-K1"]).is_err());
+        assert!(cli(&dir, &["panel", "device", "main", "-K9", "--at", "100,100"]).is_err());
+        cli(&dir, &["panel", "device", "main", "+CAB1-K1", "--at", "100,200"]).unwrap();
+        assert_eq!(on_plate(), Some((Point::new(100.0, 200.0), 45.0, 85.0, Rotation::R0)));
+
+        // Turned in place, then moved keeping the turn.
+        cli(&dir, &["panel", "device", "main", "+CAB1-K1", "--rotate", "90"]).unwrap();
+        assert_eq!(on_plate(), Some((Point::new(100.0, 200.0), 45.0, 85.0, Rotation::R90)));
+        cli(&dir, &["panel", "device", "main", "+CAB1-K1", "--at", "300,50"]).unwrap();
+        assert_eq!(on_plate(), Some((Point::new(300.0, 50.0), 45.0, 85.0, Rotation::R90)));
+
+        // Off the plate's edge (turned it is 85 mm wide on a 600 mm plate), or a bad turn:
+        // refused, nothing changes.
+        assert!(cli(&dir, &["panel", "device", "main", "+CAB1-K1", "--at", "520,0"]).is_err());
+        assert!(cli(&dir, &["panel", "device", "main", "+CAB1-K1", "--rotate", "45"]).is_err());
+        assert_eq!(on_plate(), Some((Point::new(300.0, 50.0), 45.0, 85.0, Rotation::R90)));
+        cli(&dir, &["panel", "show", "main"]).unwrap();
+        let mut p = load(&dir).unwrap();
+        p.panels[0].name = "Main\u{1b}]52;c;x\u{7}".into();
+        let shown = panel_show(&p.panels[0]);
+        assert!(shown.starts_with("main Main"), "{shown}");
+        assert!(shown.contains("(600 x 800 mm)"), "{shown}");
+        assert!(!shown.contains('\u{1b}'), "control characters are escaped: {shown}");
+        assert!(
+            shown.contains("+CAB1-K1     at 300,50  45 x 85 mm  turned 90"),
+            "{shown}"
+        );
+
+        cli(&dir, &["panel", "device", "main", "+CAB1-K1", "--remove"]).unwrap();
+        assert_eq!(on_plate(), None);
+        assert!(cli(&dir, &["panel", "device", "main", "+CAB1-K1", "--remove"]).is_err());
+        assert!(
+            cli(
+                &dir,
+                &["panel", "device", "main", "+CAB1-K1", "--remove", "--at", "1,1"]
+            )
+            .is_err()
+        );
+
+        // A damaged pinned copy of the part: the reason is named, and the device is still
+        // placed, with the default size.
+        let copy = store::vendor_path(&dir, ItemKind::Part, "maker.contactor").unwrap();
+        std::fs::write(&copy, "{ not json").unwrap();
+        let p = load(&dir).unwrap();
+        let prefix = "cannot read part maker.contactor of +CAB1-K1: ";
+        let err = device_part_size(&dir, &p, &k1).unwrap_err();
+        assert!(err.starts_with(prefix) && err.len() > prefix.len(), "{err}");
+        cli(&dir, &["panel", "device", "main", "+CAB1-K1", "--at", "100,200"]).unwrap();
+        assert_eq!(on_plate(), Some((Point::new(100.0, 200.0), 18.0, 90.0, Rotation::R0)));
+
+        // A part id with control characters, as a hand-edited project may hold, is escaped.
+        let mut p = load(&dir).unwrap();
+        if let Some(d) = p.devices.get_mut(&k1) {
+            d.part = Some("bad\u{1b}]52;c;x\u{7}".into());
+        }
+        let err = device_part_size(&dir, &p, &k1).unwrap_err();
+        assert!(!err.contains('\u{1b}') && err.contains("\\u{1b}"), "{err}");
     }
 
     #[test]
