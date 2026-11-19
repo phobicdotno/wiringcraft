@@ -5036,6 +5036,40 @@ mod tests {
     }
 
     #[test]
+    fn pdf_report_all_prints_the_plc_card_overview_only_with_racks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        // The report title as the PDF writes text: a hex string.
+        let title: String = std::iter::once("<".to_string())
+            .chain("PLC cards".bytes().map(|b| format!("{b:02X}")))
+            .chain(std::iter::once(">".to_string()))
+            .collect();
+        let has_overview = |report: &str| {
+            let out = dir.join("out.pdf");
+            cli(&dir, &["pdf", out.to_str().unwrap(), "--report", report]).unwrap();
+            String::from_utf8_lossy(&std::fs::read(&out).unwrap()).contains(&title)
+        };
+        // No racks: `all` leaves the empty overview out, naming it prints it.
+        assert!(!has_overview("all"));
+        assert!(has_overview("plc-cards"));
+        let mut p = load(&dir).unwrap();
+        p.meta.racks.push(wc_core::plc_rack::PlcRack {
+            name: "-A1".into(),
+            cards: vec![wc_core::plc_rack::PlcCard {
+                slot: 1,
+                channels: 8,
+                start: "%IX0.0".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        save(&dir, &p).unwrap();
+        assert_eq!(load(&dir).unwrap().meta.racks, p.meta.racks);
+        assert!(has_overview("all"));
+    }
+
+    #[test]
     fn the_logo_is_set_and_removed_from_the_command_line() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("p");

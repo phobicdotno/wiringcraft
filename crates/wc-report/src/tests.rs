@@ -2343,3 +2343,99 @@ fn plc_card_overview_lays_out_three_cards_like_the_io_list() {
     assert!(build(Kind::PlcCards, &i).rows.is_empty());
     assert!(plc_rack_warnings(&i).is_empty());
 }
+
+#[test]
+fn plc_card_overview_links_by_page_id_and_warns_on_points_and_shared_bytes() {
+    use wc_core::plc_rack::{PlcCard, PlcRack};
+    let (mut p, mut s, parts) = fixture();
+    let mut input = sym("wc.plc.input", SymbolRole::Standalone, &["I"]);
+    input.category = "plc".into();
+    input.name = "PLC digital input".into();
+    let mut output = sym("wc.plc.output", SymbolRole::Standalone, &["Q"]);
+    output.category = "plc".into();
+    for y in [input, output] {
+        s.insert(y.id.clone(), y);
+    }
+    // A second page with the same number as the first, as a hand-edited project file may have.
+    let mut twin = Page::new("p9", "2", "Twin");
+    twin.symbols.push(place("t1", "wc.plc.input", 10.0, Some("-T1")));
+    p.pages[0]
+        .symbols
+        .push(place("i1", "wc.plc.input", 300.0, Some("-A1.I1")));
+    p.pages[0]
+        .symbols
+        .push(place("q1", "wc.plc.output", 310.0, Some("-Q9")));
+    p.pages[0].symbols.push(place("i2", "wc.plc.input", 320.0, Some("-I9")));
+    p.pages[0]
+        .symbols
+        .push(place("i3", "wc.plc.input", 330.0, Some("-I10")));
+    p.pages[0]
+        .symbols
+        .push(place("i4", "wc.plc.input", 340.0, Some("-I11")));
+    p.pages.push(twin);
+    for (tag, addr) in [
+        ("-A1.I1", "%IX0.0"),
+        ("-T1", "%IX0.1"),
+        ("-Q9", "%IX0.2"),
+        ("-I9", "Slot 1"),
+        ("-I10", "%I0.10"),
+        ("-I11", ""),
+    ] {
+        p.devices.insert(
+            DeviceTag::parse(tag).unwrap(),
+            Device {
+                properties: [("Address".to_string(), addr.to_string())].into_iter().collect(),
+                ..Default::default()
+            },
+        );
+    }
+    let card = |slot: u32, channels: u32, start: &str| PlcCard {
+        slot,
+        channels,
+        start: start.into(),
+        ..Default::default()
+    };
+    p.meta.racks.push(PlcRack {
+        name: "R".into(),
+        cards: vec![
+            card(1, 8, "%IX0.0"),
+            card(2, 1, "%IW64"),
+            card(3, 1, "%IB65"),
+            card(4, 1, "%IB66"),
+        ],
+        ..Default::default()
+    });
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = build(Kind::PlcCards, &i);
+    // Each point links to the page it is drawn on, though both pages are numbered 2.
+    let link = |dev: &str| {
+        let n = t.rows.iter().position(|r| r[6] == dev).unwrap();
+        t.row_pages.get(n).cloned().unwrap_or_default()
+    };
+    assert_eq!(link("-A1.I1"), "p2");
+    assert_eq!(link("-T1"), "p9");
+    let w = plc_rack_warnings(&i);
+    let has = |s: &str| w.iter().any(|w| w.contains(s));
+    // An output at an input address, an address that is no PLC address and bit 10 are on no
+    // card; a point without an address is left to the I/O list.
+    assert!(has("-Q9 (page 2): address %IX0.2 is an input"), "{w:?}");
+    assert!(has("-I9 (page 2): address \"Slot 1\" is not a PLC address"), "{w:?}");
+    assert!(has("-I10 (page 2): address %IX0.10 names no bit"), "{w:?}");
+    assert!(!has("-I11"), "{w:?}");
+    // %IW64 covers bytes 64 and 65: the byte card at %IB65 shares one, the one at %IB66 none.
+    assert!(has("slot 3: address %IB65 is also on PLC rack \"R\" slot 2"), "{w:?}");
+    assert!(!has("slot 4"), "{w:?}");
+    assert_eq!(w.len(), 4, "{w:?}");
+    // A card with its own step is compared by address only.
+    p.meta.racks[0].cards[2].step = Some(1);
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    assert!(!plc_rack_warnings(&i).iter().any(|w| w.contains("slot 3")));
+}

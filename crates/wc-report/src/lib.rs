@@ -1150,6 +1150,37 @@ fn plc_kind(sym: &Symbol) -> Option<&'static str> {
     }
 }
 
+/// One PLC input or output drawn on a page, as the PLC I/O list shows it.
+#[derive(Debug, Clone)]
+pub(crate) struct PlcPoint {
+    /// The device property `Address` (or `PLC address`), trimmed; empty when there is none.
+    pub address: String,
+    /// `Input` or `Output`.
+    pub kind: &'static str,
+    /// The device tag, or `<item id> (no tag)`.
+    pub device: String,
+    pub description: String,
+    /// What it is wired to.
+    pub connected: String,
+    /// The number and the id of the page it is drawn on.
+    pub page_number: String,
+    pub page_id: String,
+}
+
+impl PlcPoint {
+    /// Its row in the PLC I/O list.
+    fn row(&self) -> Vec<String> {
+        vec![
+            self.address.clone(),
+            self.kind.to_owned(),
+            self.device.clone(),
+            self.description.clone(),
+            self.connected.clone(),
+            self.page_number.clone(),
+        ]
+    }
+}
+
 /// PLC I/O list: every PLC input and output drawn, with its address, the device it belongs to
 /// and what it is wired to. The address is the device property `Address` (or `PLC address`);
 /// points without one sort last so the gaps are visible.
@@ -1158,6 +1189,13 @@ pub fn plc_io_list(i: &Inputs<'_>) -> Table {
         "PLC I/O list",
         &["Address", "Type", "Device", "Description", "Connected to", "Page"],
     );
+    t.rows = plc_points(i).iter().map(PlcPoint::row).collect();
+    t
+}
+
+/// The drawn PLC inputs and outputs in the order of the PLC I/O list: by address, points without
+/// one last.
+pub(crate) fn plc_points(i: &Inputs<'_>) -> Vec<PlcPoint> {
     let (nets, _) = net_names(i);
     let mut net_of: BTreeMap<PinRef, usize> = BTreeMap::new();
     for (n, net) in nets.iter().enumerate() {
@@ -1165,8 +1203,8 @@ pub fn plc_io_list(i: &Inputs<'_>) -> Table {
             net_of.insert(pin.clone(), n);
         }
     }
-    // (no address, address sort key, row)
-    type Row = (bool, Vec<(String, u64)>, Vec<String>);
+    // (no address, address sort key, point)
+    type Row = (bool, Vec<(String, u64)>, PlcPoint);
     let mut rows: Vec<Row> = Vec::new();
     for page in &i.project.pages {
         for s in &page.symbols {
@@ -1194,21 +1232,22 @@ pub fn plc_io_list(i: &Inputs<'_>) -> Table {
             }
             let mut others: Vec<String> = others.into_iter().collect();
             others.sort_by_key(|o| natural_key(o));
-            let row = vec![
-                address.clone(),
-                kind.to_owned(),
-                s.tag
+            let point = PlcPoint {
+                address: address.clone(),
+                kind,
+                device: s
+                    .tag
                     .as_ref()
                     .map(ToString::to_string)
                     .unwrap_or_else(|| format!("{} (no tag)", s.id)),
-                dev.map(|d| d.description.clone()).unwrap_or_default(),
-                others.join(", "),
-                page.number.clone(),
-            ];
-            rows.push((address.is_empty(), natural_key(&address), row));
+                description: dev.map(|d| d.description.clone()).unwrap_or_default(),
+                connected: others.join(", "),
+                page_number: page.number.clone(),
+                page_id: page.id.clone(),
+            };
+            rows.push((address.is_empty(), natural_key(&address), point));
         }
     }
     rows.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
-    t.rows = rows.into_iter().map(|(_, _, r)| r).collect();
-    t
+    rows.into_iter().map(|(_, _, p)| p).collect()
 }

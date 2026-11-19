@@ -93,6 +93,12 @@ impl PlcAddress {
     /// case do not matter). `None` when it is not a PLC address, a bit number is past 7 or a
     /// bit address has no bit (or a word address has one).
     pub fn parse(address: &str) -> Option<Self> {
+        Self::parse_any_bit(address).filter(|a| a.bit.is_none_or(|b| b <= 7))
+    }
+
+    /// As [`PlcAddress::parse`], but any bit number is taken (`%IX0.10`), as some lists number
+    /// bits that way; such an address names no channel of a card.
+    pub fn parse_any_bit(address: &str) -> Option<Self> {
         let a: String = address
             .chars()
             .filter(|c| !c.is_whitespace())
@@ -110,29 +116,56 @@ impl PlcAddress {
             c @ ('X' | 'B' | 'W' | 'D') => (Some(c), rest.get(1..)?),
             _ => (None, rest),
         };
-        let parts: Vec<&str> = number.split('.').collect();
-        if parts.len() > 2
-            || parts
-                .iter()
-                .any(|p| p.is_empty() || p.len() > 18 || !p.bytes().all(|b| b.is_ascii_digit()))
-        {
+        let digits = |p: &str| -> Option<u64> {
+            (!p.is_empty() && p.len() <= 18 && p.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| p.parse().ok())
+                .flatten()
+        };
+        let mut parts = number.split('.');
+        let number = digits(parts.next()?)?;
+        let bit = match parts.next() {
+            Some(b) => Some(digits(b)?),
+            None => None,
+        };
+        if parts.next().is_some() {
             return None;
         }
-        let bit = parts.get(1).map(|b| b.parse::<u64>()).transpose().ok()?;
         let size = match size {
             Some(s) => s,
             None if bit.is_some() => 'X',
             None => return None,
         };
-        if bit.is_some() != (size == 'X') || bit.is_some_and(|b| b > 7) {
+        if bit.is_some() != (size == 'X') {
             return None;
         }
         Some(Self {
             output,
             size,
-            number: parts[0].parse().ok()?,
+            number,
             bit,
         })
+    }
+
+    /// The IEC 61131-3 elementary type of a variable at this address: `BOOL`, `BYTE`, `WORD`
+    /// or `DWORD`.
+    pub fn elementary_type(&self) -> &'static str {
+        match self.size {
+            'X' => "BOOL",
+            'B' => "BYTE",
+            'W' => "WORD",
+            _ => "DWORD",
+        }
+    }
+
+    /// The bits it covers, counted from bit 0 of byte 0 of its area: one bit for a bit
+    /// address, 8, 16 or 32 for a byte, word or double word (byte numbering).
+    pub fn bits(&self) -> std::ops::Range<u64> {
+        let start = self.number.saturating_mul(8).saturating_add(self.bit.unwrap_or(0));
+        let len = match self.bit {
+            Some(_) => 1,
+            None => self.bytes() * 8,
+        };
+        start..start.saturating_add(len)
     }
 
     /// In the IEC 61131-3 spelling: `%IX0.2`, `%QW64`.
@@ -223,9 +256,20 @@ mod tests {
         assert_eq!(iec("A4.1").as_deref(), Some("%QX4.1"));
         assert_eq!(iec("IW064").as_deref(), Some("%IW64"));
         assert_eq!(iec("%qd8").as_deref(), Some("%QD8"));
-        for bad in ["", "I", "IX3", "IW64.1", "%I0.8", "DI1", "%I0..1", "Slot 2"] {
+        for bad in ["", "I", "IX3", "IW64.1", "%I0.8", "DI1", "%I0..1", "%I0.1.2", "Slot 2"] {
             assert_eq!(PlcAddress::parse(bad), None, "{bad}");
         }
+        // Bit 10 is read only when asked for.
+        assert_eq!(
+            PlcAddress::parse_any_bit("%I0.10").map(|a| a.iec()).as_deref(),
+            Some("%IX0.10")
+        );
+        assert_eq!(PlcAddress::parse_any_bit("%I0..1"), None);
+        // The bits an address covers.
+        let bits = |a: &str| PlcAddress::parse(a).map(|a| a.bits());
+        assert_eq!(bits("%IX1.2"), Some(10..11));
+        assert_eq!(bits("%IW64"), Some(512..528));
+        assert_eq!(bits("%QB65"), Some(520..528));
     }
 
     #[test]
