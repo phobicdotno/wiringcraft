@@ -1030,7 +1030,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
         Tool::Line | Tool::Rect | Tool::Circle | Tool::Arc | Tool::Polyline | Tool::Dimension => {
             shape_tool(&painter, &resp, open, ed, &xf, &shown, &t, finish, snap_step)
         }
-        Tool::BlackBox => black_box_tool(&painter, &resp, ed, &page, &xf, &t, finish, tol, snap_step),
+        Tool::BlackBox => black_box_tool(&painter, &resp, ed, &page, &xf, &shown, &t, finish, tol, snap_step),
     }
 }
 
@@ -1043,6 +1043,7 @@ fn black_box_tool(
     ed: &mut Editor,
     page: &Page,
     xf: &Xf,
+    shown: &Xf,
     t: &theme::Theme,
     enter: bool,
     tol: f64,
@@ -1058,9 +1059,11 @@ fn black_box_tool(
     let cur = ed.cursor;
     // Where a click or a drag ended, unsnapped: the release itself, since a touch screen
     // clears the hover position (and so `ed.cursor`) in the frame it lets go.
+    // Pointer input is read in the view the user saw (`shown`): a zoom in the same frame must
+    // not move it. `xf` is the view drawn now.
     let released_at = primary_release_pos(&resp.ctx)
         .or(resp.interact_pointer_pos())
-        .map(|p| xf.mm(p));
+        .map(|p| shown.mm(p));
     match ed.black_box.as_mut() {
         None if !asking => {
             // A drag is only seen once the pointer has moved: its corner is where the button
@@ -1069,7 +1072,7 @@ fn black_box_tool(
                 resp.ctx
                     .input(|i| i.pointer.press_origin())
                     .or(resp.interact_pointer_pos())
-                    .map(|p| snap(xf.mm(p), snap_step))
+                    .map(|p| snap(shown.mm(p), snap_step))
             } else if resp.clicked_by(egui::PointerButton::Primary) {
                 released_at.map(|p| snap(p, snap_step))
             } else {
@@ -2240,10 +2243,33 @@ mod tests {
         tap(&mut open, &mut ed, b, 6.0);
         assert_eq!(ed.black_box.as_ref().and_then(|d| d.to), Some(other));
 
+        // Released at `b`, then moved and zoomed in the same frame: the corner is where `b` was
+        // in the view the user saw.
+        ed.black_box = None;
+        click_at(&ctx, &mut open, &mut ed, a, 7.0);
+        let zoom = ed.view.zoom;
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            8.0,
+            vec![egui::Event::PointerMoved(b), button(b, true)],
+        );
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            8.01,
+            // Moved on to `a` before the zoom, so the zoom is about `a` and moves `b`.
+            vec![button(b, false), egui::Event::PointerMoved(a), egui::Event::Zoom(2.0)],
+        );
+        assert!(ed.view.zoom > zoom, "the view zoomed");
+        assert_eq!(ed.black_box.as_ref().and_then(|d| d.to), Some(other));
+
         // Another tool drops the box being drawn.
         ed.ask_box_tag = false;
         ed.tool = Tool::Line;
-        painted(&ctx, &mut open, &mut ed, 4.0, vec![]);
+        painted(&ctx, &mut open, &mut ed, 9.0, vec![]);
         assert!(ed.black_box.is_none());
     }
 
