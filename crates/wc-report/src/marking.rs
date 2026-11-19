@@ -411,11 +411,15 @@ pub fn marking_list_with(i: &Inputs<'_>, o: &MarkingOptions) -> Table {
     // keeps (a spare that is drawn too is a drawn terminal already). Only the device and cable
     // markers need them.
     let mut terminals: BTreeSet<DeviceTag> = BTreeSet::new();
+    // The terminals on the rail: spares and terminals on schematic pages. An overview draws
+    // terminals again, and one drawn only there is no terminal of the plan.
+    let mut on_rail: BTreeSet<DeviceTag> = BTreeSet::new();
     if wanted(MarkerKind::Devices) || wanted(MarkerKind::Cables) {
         for l in &i.project.meta.strips {
             for n in &l.spares {
                 if let Ok(tag) = DeviceTag::parse(&format!("{}.{n}", l.strip)) {
-                    terminals.insert(tag);
+                    terminals.insert(tag.clone());
+                    on_rail.insert(tag);
                 }
             }
         }
@@ -428,6 +432,9 @@ pub fn marking_list_with(i: &Inputs<'_>, o: &MarkingOptions) -> Table {
                     && crate::counts_as_terminal(role, Some(tag))
                 {
                     terminals.insert(tag.clone());
+                    if !page.overview {
+                        on_rail.insert(tag.clone());
+                    }
                 }
             }
         }
@@ -453,18 +460,18 @@ pub fn marking_list_with(i: &Inputs<'_>, o: &MarkingOptions) -> Table {
 
     if wanted(MarkerKind::Cables) {
         // Cables drawn as cores of wires, and cable devices listed without cores yet; a
-        // terminal named like a cable (-X1.W1) is a terminal.
+        // terminal on the rail named like a cable (-X1.W1) is a terminal.
         let mut list: BTreeSet<DeviceTag> = cables;
         list.extend(
             crate::all_tags(i)
                 .into_iter()
-                .filter(|t| is_cable_tag(t) && !terminals.contains(t)),
+                .filter(|t| is_cable_tag(t) && !on_rail.contains(t)),
         );
         list.extend(
             i.project
                 .devices
                 .keys()
-                .filter(|t| is_cable_tag(t) && !terminals.contains(*t))
+                .filter(|t| is_cable_tag(t) && !on_rail.contains(*t))
                 .cloned(),
         );
         let mut list: Vec<DeviceTag> = list.into_iter().collect();

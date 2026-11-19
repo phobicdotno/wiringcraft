@@ -670,6 +670,32 @@ fn a_cable_drawn_only_as_a_symbol_gets_its_markers() {
 }
 
 #[test]
+fn a_terminal_drawn_only_on_an_overview_does_not_take_a_cables_markers() {
+    let (mut p, s, parts) = fixture();
+    // -X1.W1 is drawn as a terminal on an overview only; -X1.W2 on a schematic page.
+    let mut overview = Page::new("ov", "9", "Overview");
+    overview.overview = true;
+    overview.symbols.push(place("o1", "term", 0.0, Some("-X1.W1")));
+    p.pages.push(overview);
+    p.pages[0].symbols.push(place("t9", "term", 150.0, Some("-X1.W2")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = marking_list(&i, &[MarkerKind::Cables, MarkerKind::Devices]);
+    let cables: Vec<&str> = t
+        .rows
+        .iter()
+        .filter(|r| r[0] == "Cable")
+        .map(|r| r[2].as_str())
+        .collect();
+    assert!(cables.contains(&"-X1.W1"), "{cables:?}");
+    assert!(!cables.contains(&"-X1.W2"), "{cables:?}");
+    assert!(!t.rows.iter().any(|r| r[0] == "Device" && r[2].starts_with("-X1.W")));
+}
+
+#[test]
 fn marking_list_drops_repeated_terminals_even_between_equal_sorting_numbers() {
     let (mut p, s, parts) = fixture();
     // `-X1.1`, `-X1.01`, `-X1.1`: `1` and `01` sort alike, but only the exact repeat goes.
