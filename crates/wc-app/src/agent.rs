@@ -5105,6 +5105,31 @@ mod tests {
         assert_eq!(inputs_table(&a).columns, builtin);
         assert!(a.open.as_mut().unwrap().undo());
         assert_eq!(reports(&a), before);
+
+        // A saved layout listing every built-in column as built in: untouched OK keeps it,
+        // "Built-in layout" then OK drops it, and undo brings it back.
+        let explicit = wc_core::report_layout::ReportLayout {
+            kind: "parts".into(),
+            columns: builtin
+                .iter()
+                .map(|c| wc_core::report_layout::ReportColumn {
+                    from: c.clone(),
+                    heading: None,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        a.open.as_mut().unwrap().project.meta.reports = vec![explicit.clone()];
+        a.edit_report_layout(Kind::Parts);
+        let Some(Dialog::ReportLayout { form, dir }) = a.dialog.take() else {
+            unreachable!("the layout dialog opens");
+        };
+        a.apply_report_layout(&form, &dir).unwrap();
+        assert_eq!(reports(&a), std::slice::from_ref(&explicit));
+        a.apply_report_layout(&form.cleared(), &dir).unwrap();
+        assert!(reports(&a).is_empty());
+        assert!(a.open.as_mut().unwrap().undo());
+        assert_eq!(reports(&a), [explicit]);
     }
 
     #[test]

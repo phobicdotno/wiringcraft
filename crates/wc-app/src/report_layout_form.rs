@@ -44,6 +44,9 @@ pub struct Form {
     /// [`Form::layout`] as the dialog opened: OK changes nothing while the form still gives
     /// it (a loaded layout listing every built-in column gives none, as it shows the same).
     pub initial: Option<ReportLayout>,
+    /// "Built-in layout" was pressed: OK then drops the project's layout for the report even
+    /// when the one it opened on showed the same as the built-in one.
+    pub reset: bool,
 }
 
 impl Form {
@@ -101,6 +104,7 @@ impl Form {
             header: loaded.map(|l| l.header.join(", ")).unwrap_or_default(),
             loaded: loaded.cloned(),
             initial: None,
+            reset: false,
         };
         form.initial = form.layout();
         form
@@ -108,7 +112,7 @@ impl Form {
 
     /// Whether the form gives another layout than it did when the dialog opened.
     pub fn edited(&self) -> bool {
-        self.layout() != self.initial
+        self.reset || self.layout() != self.initial
     }
 
     /// The form cleared to the report's built-in layout, still against the layout it opened on.
@@ -116,6 +120,7 @@ impl Form {
         Form {
             loaded: self.loaded.clone(),
             initial: self.initial.clone(),
+            reset: true,
             ..Form::new(self.kind, self.builtin.clone(), None)
         }
     }
@@ -354,6 +359,8 @@ mod tests {
         let f = Form::new(wc_report::Kind::Parts, builtin(), Some(&all));
         assert_eq!(f.layout(), None);
         assert!(!f.edited());
+        // Pressing "Built-in layout" on it is an edit all the same: OK drops the saved one.
+        assert!(f.cleared().edited());
         assert!(!again.columns[2].shown, "the hidden column is listed, unticked");
     }
 
