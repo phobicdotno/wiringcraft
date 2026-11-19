@@ -177,8 +177,18 @@ impl ProjectFiles {
     #[cfg(unix)]
     fn put(&self, path: &Path, bytes: &[u8]) -> Result<(), Fail> {
         let (folder, name) = folder_and_name(path)?;
+        #[cfg(test)]
+        tests::hook("open", folder, std::ffi::OsStr::new(""));
         let dir = at::Dir::open(folder)?;
-        if self.dirs.contains(&dir.id) || inside(&self.roots, folder) {
+        #[cfg(test)]
+        tests::hook("opened", folder, std::ffi::OsStr::new(""));
+        // The folder that was opened, not whatever its name leads to now: by its identity,
+        // and by where the open folder is (a project folder made after the look has no
+        // identity on record).
+        let opened = dir
+            .path()
+            .map_err(|e| Fail::Refused(format!("could not be told apart from the project's files ({e})")))?;
+        if self.dirs.contains(&dir.id) || inside(&self.roots, &opened) {
             return Err(Fail::Refused("is in the project folder".into()));
         }
         let (staged, mut file) = dir.create_new(&name)?;
@@ -191,7 +201,7 @@ impl ProjectFiles {
             file.write_all(bytes)?;
             file.sync_all()?;
             #[cfg(test)]
-            tests::before_rename(folder, &staged);
+            tests::hook("rename", folder, &staged);
             dir.rename(&staged, &name)?;
             Ok(())
         })();
@@ -368,6 +378,37 @@ mod at {
                 last = Some(e);
             }
             Err(last.unwrap_or_else(|| io::Error::other("no free name for the output file")))
+        }
+
+        /// Where this open folder is now, links worked out, found from the open folder itself
+        /// (not by looking its old name up again).
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        pub(super) fn path(&self) -> io::Result<std::path::PathBuf> {
+            std::fs::read_link(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+        }
+
+        /// Where this open folder is now, links worked out, found from the open folder itself
+        /// (not by looking its old name up again).
+        #[cfg(target_vendor = "apple")]
+        pub(super) fn path(&self) -> io::Result<std::path::PathBuf> {
+            use std::os::unix::ffi::OsStringExt;
+            let mut buf = vec![0u8; libc::PATH_MAX as usize];
+            // SAFETY: the descriptor is open and `buf` holds PATH_MAX bytes, as F_GETPATH needs.
+            if unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) } == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            buf.truncate(len);
+            Ok(std::path::PathBuf::from(OsString::from_vec(buf)))
+        }
+
+        /// Elsewhere an open folder cannot say where it is: the write is refused.
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+        pub(super) fn path(&self) -> io::Result<std::path::PathBuf> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "where an open folder is cannot be read here",
+            ))
         }
 
         /// Give the file named `from` in this folder the name `to` in this folder.
@@ -709,22 +750,75 @@ mod tests {
         Ok(())
     }
 
-    /// What to do in the next write right before its rename, on this thread.
+    /// What to do in the next write at one of its steps, on this thread.
     #[cfg(unix)]
     type Swap = Box<dyn FnOnce(&Path, &std::ffi::OsStr) -> io::Result<()>>;
 
     #[cfg(unix)]
     thread_local! {
-        static SWAP: std::cell::RefCell<Option<Swap>> = std::cell::RefCell::new(None);
+        static SWAPS: std::cell::RefCell<Vec<(&'static str, Swap)>> = const { std::cell::RefCell::new(Vec::new()) };
     }
 
-    /// Called by [`ProjectFiles::put`] after its checks, right before the rename.
+    /// Run `swap` when the next write on this thread reaches `step`: `open` (before the output
+    /// folder is opened), `opened` (right after) or `rename` (after every check, before the
+    /// rename; it is given the staging file's name).
     #[cfg(unix)]
-    pub(super) fn before_rename(folder: &Path, staged: &std::ffi::OsStr) {
-        if let Some(swap) = SWAP.with(|s| s.borrow_mut().take()) {
+    fn on(step: &'static str, swap: impl FnOnce(&Path, &std::ffi::OsStr) -> io::Result<()> + 'static) {
+        SWAPS.with(|s| s.borrow_mut().push((step, Box::new(swap))));
+    }
+
+    /// Called by [`ProjectFiles::put`] at each `step`.
+    #[cfg(unix)]
+    pub(super) fn hook(step: &str, folder: &Path, staged: &std::ffi::OsStr) {
+        let swap = SWAPS.with(|s| {
+            let mut s = s.borrow_mut();
+            let at = s.iter().position(|(k, _)| *k == step)?;
+            Some(s.remove(at).1)
+        });
+        if let Some(swap) = swap {
             let done = swap(folder, staged);
-            assert!(done.is_ok(), "the swap failed: {done:?}");
+            assert!(done.is_ok(), "the swap at {step} failed: {done:?}");
         }
+    }
+
+    /// The output folder's parent pointed into a project folder made after the look while the
+    /// output folder is opened, and put back right after: the write is refused by where the
+    /// opened folder is, and the project's new file is unchanged (#477 review).
+    #[cfg(unix)]
+    #[test]
+    fn a_new_project_folder_opened_through_a_swap_is_refused() -> TestResult {
+        let p = project()?;
+        let out = tempfile::tempdir()?;
+        let g = ProjectFiles::new(p.path());
+        let new = p.path().join("new");
+        std::fs::create_dir(&new)?;
+        std::fs::write(new.join("page.json"), "new page")?;
+        let parent = out.path().join("parent");
+        std::fs::create_dir_all(parent.join("sub"))?;
+        let file = parent.join("sub").join("page.json");
+        assert!(!g.holds(&file)?);
+        let aside = out.path().join("parent-aside");
+        let (parent2, aside2, project2) = (parent.clone(), aside.clone(), p.path().to_path_buf());
+        on("open", move |_, _| {
+            std::fs::rename(&parent2, &aside2)?;
+            std::os::unix::fs::symlink(&project2, &parent2)?;
+            std::fs::rename(project2.join("new"), project2.join("sub"))
+        });
+        let (parent3, aside3, project3) = (parent.clone(), aside.clone(), p.path().to_path_buf());
+        on("opened", move |_, _| {
+            std::fs::remove_file(&parent3)?;
+            std::fs::rename(&aside3, &parent3)?;
+            std::fs::rename(project3.join("sub"), project3.join("new"))
+        });
+        let e = g
+            .write(&file, b"exported")
+            .err()
+            .ok_or("written into a project folder")?;
+        assert!(e.to_string().contains("project folder"), "{e}");
+        assert_eq!(std::fs::read_to_string(new.join("page.json"))?, "new page");
+        assert!(no_temp_left(&new)?);
+        assert!(!file.exists());
+        Ok(())
     }
 
     /// The output folder swapped for a link into the project after every check, with an entry
@@ -742,13 +836,11 @@ mod tests {
         let pages = p.path().join("pages");
         let moved = out.path().join("exports-old");
         let (pages2, moved2, sub2) = (pages.clone(), moved.clone(), sub.clone());
-        SWAP.with(|s| {
-            *s.borrow_mut() = Some(Box::new(move |_folder: &Path, staged: &std::ffi::OsStr| {
-                std::fs::rename(&sub2, &moved2)?;
-                std::os::unix::fs::symlink(&pages2, &sub2)?;
-                std::fs::write(pages2.join(staged), "planted")?;
-                Ok(())
-            }))
+        on("rename", move |_folder: &Path, staged: &std::ffi::OsStr| {
+            std::fs::rename(&sub2, &moved2)?;
+            std::os::unix::fs::symlink(&pages2, &sub2)?;
+            std::fs::write(pages2.join(staged), "planted")?;
+            Ok(())
         });
         g.write(&file, b"exported")?;
         assert_eq!(std::fs::read_to_string(pages.join("p1.page.json"))?, "page one");
