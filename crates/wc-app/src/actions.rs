@@ -8,6 +8,7 @@ pub enum Action {
     NewProject,
     Open,
     ProjectProps,
+    Translations,
     Save,
     Undo,
     Redo,
@@ -125,6 +126,7 @@ impl Action {
         Action::NewProject,
         Action::Open,
         Action::ProjectProps,
+        Action::Translations,
         Action::Save,
         Action::Undo,
         Action::Redo,
@@ -220,6 +222,12 @@ impl Action {
             Action::ProjectProps => i(
                 "Project properties",
                 "Project name and title-block fields",
+                Icon::Properties,
+                "",
+            ),
+            Action::Translations => i(
+                "Translations",
+                "Translate the project's texts into other languages (translations.toml)",
                 Icon::Properties,
                 "",
             ),

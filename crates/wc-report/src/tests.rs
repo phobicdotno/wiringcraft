@@ -2183,6 +2183,26 @@ fn a_sorted_cable_list_keeps_each_core_with_its_cable() {
     let sorted = build(Kind::Cables, &i3);
     let pairs: Vec<(&str, &str)> = sorted.rows.iter().map(|r| (r[0].as_str(), r[3].as_str())).collect();
     assert_eq!(pairs, [("-W2", "1"), ("-W1", "1"), ("-W2", "2"), ("-W1", "2")]);
+    // A draft layout (the layout dialog's preview) gets the same fill-down without being
+    // kept; no layout given is the built-in one, whatever the project keeps.
+    let saved = p.meta.reports.clone();
+    let draft = ReportLayout {
+        kind: "cables".into(),
+        sort: vec!["Core".into()],
+        ..Default::default()
+    };
+    let i4 = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let preview = build_with(Kind::Cables, &i4, Some(&draft));
+    let pairs: Vec<(&str, &str)> = preview.rows.iter().map(|r| (r[0].as_str(), r[3].as_str())).collect();
+    assert_eq!(pairs, [("-W1", "1"), ("-W2", "1"), ("-W1", "2"), ("-W2", "2")]);
+    let builtin = build_with(Kind::Cables, &i4, None);
+    let firsts: Vec<&str> = builtin.rows.iter().map(|r| r[0].as_str()).collect();
+    assert_eq!(firsts, ["-W1", "", "-W2", ""]);
+    assert_eq!(p.meta.reports, saved);
 }
 
 #[test]

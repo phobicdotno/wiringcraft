@@ -2075,6 +2075,26 @@ impl Open {
         self.project.meta.rules = rules;
     }
 
+    /// Keep `layout` as the project's layout for report `kind`, in place of its first one
+    /// (later ones for the kind are left, unused, for [`wc_report::layout_warnings`] to name);
+    /// `None` drops every one of the kind, so the report is built in. One undo step; nothing
+    /// changes when it is the same.
+    pub fn set_report_layout(&mut self, kind: wc_report::Kind, layout: Option<wc_core::report_layout::ReportLayout>) {
+        let mut reports = self.project.meta.reports.clone();
+        match layout {
+            Some(l) => match reports.iter_mut().find(|r| r.kind == kind.name()) {
+                Some(slot) => *slot = l,
+                None => reports.push(l),
+            },
+            None => reports.retain(|r| r.kind != kind.name()),
+        }
+        if reports == self.project.meta.reports {
+            return;
+        }
+        self.checkpoint();
+        self.project.meta.reports = reports;
+    }
+
     /// Whether [`Open::cover_page`] would mark the first page as the cover: no page is marked
     /// yet, and the first one is an empty page titled Cover.
     pub fn cover_marks_first(&self) -> bool {

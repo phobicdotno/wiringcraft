@@ -29,6 +29,7 @@ const MENUS: &[(&str, &[Option<Action>])] = &[
             Some(Action::Save),
             None,
             Some(Action::ProjectProps),
+            Some(Action::Translations),
             None,
             Some(Action::Check),
             Some(Action::LiveCheck),
