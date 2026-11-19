@@ -4919,6 +4919,18 @@ mod tests {
             copy_before
         );
         std::fs::write(&panel_file, &panel_text).unwrap();
+        // And when `take` itself fails (its staged write is blocked): the import still
+        // succeeds with a warning, and the copy and its pin are as they were.
+        let copy_file = store::vendor_path(&dir, ItemKind::Part, "maker.io-8").unwrap();
+        let copy_tmp = copy_file.with_file_name(format!(
+            "{}.tmp",
+            copy_file.file_name().and_then(|n| n.to_str()).unwrap_or_default()
+        ));
+        std::fs::create_dir(&copy_tmp).unwrap();
+        cli(&dir, &["import", "footprint-dxf", wide, "--part", "maker.io-8"]).unwrap();
+        std::fs::remove_dir(&copy_tmp).unwrap();
+        assert_eq!(std::fs::read(&copy_file).unwrap(), copy_before);
+        assert_eq!(load(&dir).unwrap().lock.parts["maker.io-8"].hash, pinned);
 
         // A pinned copy changed in the project is not overwritten by a new footprint.
         let mut edited = store::read_vendored_part(&dir, "maker.io-8").unwrap();
