@@ -214,7 +214,9 @@ impl Table {
         if !prefixes.iter().any(|q| q.eq_ignore_ascii_case(&other.prefix)) {
             prefixes.push(other.prefix.as_str());
         }
-        let own_id = self.own_field("id");
+        // A table's prefix taken from its `<p>_id` column alone (`ele_id, no, txt`) is not its
+        // own: that column is a bare foreign key there, not the table's id.
+        let own_id = self.own_field("id").filter(|c| !self.prefix_only_from(c));
         let maybe_own_id = self.field(&["id"]);
         let mut candidates: Vec<&str> = Vec::new();
         for p in &prefixes {
@@ -233,6 +235,16 @@ impl Table {
             .find(|c| Some(**c) != maybe_own_id)
             .or_else(|| candidates.first())
             .copied()
+    }
+
+    /// Whether `column` is `<prefix>_...` and the only column with the table's prefix, so the
+    /// prefix came from it alone.
+    fn prefix_only_from(&self, column: &str) -> bool {
+        let has_prefix = |c: &str| {
+            c.split_once('_')
+                .is_some_and(|(p, _)| p.eq_ignore_ascii_case(&self.prefix))
+        };
+        has_prefix(column) && self.columns.iter().filter(|c| has_prefix(c)).count() == 1
     }
 
     /// The column for `fields`, or an error naming what is missing and the columns there are,

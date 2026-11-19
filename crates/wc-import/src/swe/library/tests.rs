@@ -255,6 +255,21 @@ INSERT INTO tew_catterminal VALUES (10, 1, 'A1'), (10, 2, 'A2');
     assert_eq!(parts[0].properties[PROP_TERMINALS], "Coil: A1 A2");
     assert!(!warnings.iter().any(|w| w.contains("has no")), "{warnings:?}");
 
+    // The same with no prefix on the terminal table's other columns: `ele_id` is the only
+    // prefixed column, and still the link rather than the terminal table's own id.
+    let c = db("
+CREATE TABLE tew_catreference (ref_id INTEGER, ref_reference TEXT, ref_manufacturer TEXT);
+CREATE TABLE tew_catelement (ele_id INTEGER, ele_ref_id INTEGER, ele_orderno INTEGER, ele_name TEXT);
+CREATE TABLE tew_catterminal (ele_id INTEGER, no INTEGER, txt TEXT);
+INSERT INTO tew_catreference VALUES (1, 'RLY-24', 'Maker A');
+INSERT INTO tew_catelement VALUES (10, 1, 1, 'Coil');
+INSERT INTO tew_catterminal VALUES (10, 1, 'A1'), (10, 2, 'A2');
+");
+    let mut warnings = Vec::new();
+    let parts = read_catalog(&c, &mut report, &mut warnings).unwrap();
+    assert_eq!(parts[0].properties[PROP_TERMINALS], "Coil: A1 A2", "{warnings:?}");
+    assert!(!warnings.iter().any(|w| w.contains("has no")), "{warnings:?}");
+
     // Elements whose own id is the bare `ref_id`: the link is the one other `*_ref_id` column.
     let c = db("
 CREATE TABLE tew_catreference (ref_id INTEGER, ref_reference TEXT, ref_manufacturer TEXT);
