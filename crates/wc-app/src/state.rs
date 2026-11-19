@@ -524,7 +524,7 @@ impl Open {
         if self.project.lock.parts.contains_key(id) {
             let lib = wc_library::Library::open(&self.dir, &self.project).map_err(|e| e.to_string())?;
             let only = [id.to_owned()];
-            let updated = self.update_library(&lib, Some(&only));
+            let updated = self.update_library_of(&lib, Some(&only), Some(ItemKind::Part));
             let follows = self.parts.get(id).is_some_and(|p| p.footprint == part.footprint);
             match updated {
                 Ok(_) if follows => {}
@@ -1191,7 +1191,22 @@ impl Open {
         lib: &wc_library::Library,
         only: Option<&[String]>,
     ) -> Result<Vec<(ItemKind, String)>, String> {
-        let all = wc_library::status(&self.dir, &self.project, lib);
+        self.update_library_of(lib, only, None)
+    }
+
+    /// [`Open::update_library`], limited to items of `kind` when given: a symbol that shares a
+    /// part's id is left alone when only the part is updated. An update that finds nothing to
+    /// take changes nothing, not even the undo history.
+    fn update_library_of(
+        &mut self,
+        lib: &wc_library::Library,
+        only: Option<&[String]>,
+        kind: Option<ItemKind>,
+    ) -> Result<Vec<(ItemKind, String)>, String> {
+        let all: Vec<_> = wc_library::status(&self.dir, &self.project, lib)
+            .into_iter()
+            .filter(|s| kind.is_none_or(|k| s.kind == k))
+            .collect();
         // An item named on purpose whose library file is wrong stops the update.
         if let Some(bad) = wc_library::wrong_named(&all, only) {
             return Err(bad.to_string());
@@ -1200,6 +1215,9 @@ impl Open {
         // after this (from a wrong id to a new version, or to yet another version) is not
         // written without a backup; it waits for the next update.
         let todo = wc_library::changed(&all, only);
+        if todo.is_empty() {
+            return Ok(Vec::new());
+        }
         // Checked before anything is written: a new version that drops a wired pin stops the
         // whole update.
         // The pins are checked on the very version the update will take: one that changed in the
@@ -3510,6 +3528,13 @@ pub(crate) mod tests {
             ..Part::default()
         };
         wc_library::write_part(&mine, &part).unwrap();
+        // A symbol that shares the part's id, pinned, with a newer drawing in the library.
+        let mut sym = o.symbols.get("wc.coil").cloned().unwrap_or_else(|| {
+            o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+            o.symbols["wc.coil"].clone()
+        });
+        sym.id = pid.into();
+        wc_library::write_symbol(&mine, &sym).unwrap();
         o.project.meta.libraries.insert(
             0,
             LibrarySource {
@@ -3519,6 +3544,12 @@ pub(crate) mod tests {
                 reference: None,
             },
         );
+        o.place(1, pid, Point::new(80.0, 20.0)).unwrap();
+        let sym_pin = o.project.lock.symbols[pid].clone();
+        let sym_file = std::fs::read(store::vendor_path(&o.dir, ItemKind::Symbol, pid).unwrap()).unwrap();
+        let mut newer = sym.clone();
+        newer.name = "Newer drawing".into();
+        wc_library::write_symbol(&mine, &newer).unwrap();
         let tag = DeviceTag::parse("-A1").unwrap();
         o.set_device_part(&tag, Some(pid)).unwrap();
         o.refresh_library();
@@ -3548,6 +3579,20 @@ pub(crate) mod tests {
         assert_eq!(store::read_vendored_part(&o.dir, pid).unwrap(), in_lib);
         assert_eq!(o.parts[pid].footprint, in_lib.footprint, "the layout draws it now");
         assert_ne!(o.project.lock.parts[pid].hash, pin);
+        // Only the part is updated: the symbol of the same id keeps its pin and its file.
+        assert_eq!(o.project.lock.symbols[pid], sym_pin);
+        assert_eq!(
+            std::fs::read(store::vendor_path(&o.dir, ItemKind::Symbol, pid).unwrap()).unwrap(),
+            sym_file
+        );
+        // Attaching the same drawing again changes nothing, and keeps Redo.
+        o.checkpoint();
+        o.project.pages[1].title = "Renamed".into();
+        assert!(o.undo());
+        let undo_steps = o.undo.len();
+        o.attach_footprint(pid, &dxf).unwrap();
+        assert!(o.can_redo(), "Redo is kept");
+        assert_eq!(o.undo.len(), undo_steps, "no empty undo step");
         // One undo step takes the project's pin back.
         assert!(o.undo());
         assert_eq!(o.project.lock.parts[pid].hash, pin);
