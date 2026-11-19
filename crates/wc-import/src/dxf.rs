@@ -415,11 +415,15 @@ fn shapes(
                     let pt = q(x, y);
                     x.is_finite() && y.is_finite() && pt.x.is_finite() && pt.y.is_finite()
                 };
-                let (loops, fit_failed) = hatch_loops(e);
+                let (loops, bad): (Vec<_>, Vec<_>) = hatch_loops(e)
+                    .into_iter()
+                    .partition(|(lp, _)| lp.iter().all(|pt| placed(*pt)));
+                // Spline edges joined straight are said only for loops that are drawn.
+                let fit_failed: usize = loops.iter().map(|(_, n)| n).sum();
                 if fit_failed > 0 {
                     *skipped.entry(SPLINE_FIT_FAILED.to_owned()).or_default() += fit_failed;
                 }
-                let (loops, bad): (Vec<_>, Vec<_>) = loops.into_iter().partition(|lp| lp.iter().all(|pt| placed(*pt)));
+                let loops: Vec<_> = loops.into_iter().map(|(lp, _)| lp).collect();
                 if !bad.is_empty() {
                     *skipped.entry(HATCH_NOT_NUMBERS.to_owned()).or_default() += 1;
                     solid = false;
@@ -729,12 +733,7 @@ fn through_fit_points(fit: &[(f64, f64)], degree: usize, tangents: Tangents) -> 
     if !fit.iter().all(|pt| pt.0.is_finite() && pt.1.is_finite()) {
         return None;
     }
-    let mut q: Vec<(f64, f64)> = Vec::with_capacity(fit.len());
-    for &pt in fit {
-        if q.last().is_none_or(|l| (l.0 - pt.0).hypot(l.1 - pt.1) > 1e-12) {
-            q.push(pt);
-        }
-    }
+    let mut q = distinct_fit(fit, false);
     // A repeat merge must not lose the curve's end: the last point given is its end.
     if let (Some(last), Some(&end)) = (q.last_mut(), fit.last()) {
         *last = end;
@@ -747,17 +746,7 @@ fn through_fit_points(fit: &[(f64, f64)], degree: usize, tangents: Tangents) -> 
     }
     // Unit start and end directions. When only one is given, the other end follows its last
     // chord, so the given one is not lost.
-    // A direction of any size: scaled by its largest part first, so a tiny or huge given tangent
-    // keeps its direction (only zero and values that are not numbers have none).
-    let unit = |(x, y): (f64, f64)| {
-        let m = x.abs().max(y.abs());
-        if !(m.is_finite() && m > 0.0) {
-            return None;
-        }
-        let (x, y) = (x / m, y / m);
-        let l = x.hypot(y);
-        Some((x / l, y / l))
-    };
+    let unit = unit_direction;
     let chord = |a: usize, b: usize| {
         let (pa, pb) = (q.get(a)?, q.get(b)?);
         unit((pb.0 - pa.0, pb.1 - pa.1))
@@ -871,16 +860,7 @@ fn through_fit_points_closed(fit: &[(f64, f64)], degree: usize) -> Option<Vec<(f
         }
         return Some(out);
     }
-    let near = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).hypot(a.1 - b.1) <= 1e-12;
-    let mut q: Vec<(f64, f64)> = Vec::with_capacity(fit.len());
-    for &pt in fit {
-        if q.last().is_none_or(|&l| !near(l, pt)) {
-            q.push(pt);
-        }
-    }
-    while q.len() > 1 && near(*q.last()?, *q.first()?) {
-        q.pop();
-    }
+    let q = distinct_fit(fit, true);
     let n = q.len();
     if !(3..=MAX_FIT_POINTS).contains(&n) {
         return None;
@@ -1095,6 +1075,14 @@ enum SplineShape {
 /// when `closed`), or two with a usable tangent on an open spline, and at most
 /// [`MAX_FIT_POINTS`] (beyond, they are joined straight on purpose).
 fn fit_makes_curve(fit: &[(f64, f64)], closed: bool, tangents: Tangents) -> bool {
+    let tangent = tangents.0.and_then(unit_direction).is_some() || tangents.1.and_then(unit_direction).is_some();
+    let least = if !closed && tangent { 2 } else { 3 };
+    fit.len() <= MAX_FIT_POINTS && distinct_fit(fit, closed).len() >= least
+}
+
+/// Fit points without those within 1e-12 of the one before; when `closed`, also without the
+/// last ones that repeat the first. Interpolation counts and uses these.
+fn distinct_fit(fit: &[(f64, f64)], closed: bool) -> Vec<(f64, f64)> {
     let near = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).hypot(a.1 - b.1) <= 1e-12;
     let mut q: Vec<(f64, f64)> = Vec::with_capacity(fit.len());
     for &pt in fit {
@@ -1102,18 +1090,22 @@ fn fit_makes_curve(fit: &[(f64, f64)], closed: bool, tangents: Tangents) -> bool
             q.push(pt);
         }
     }
-    if closed {
-        while q.len() > 1 && q.first().zip(q.last()).is_some_and(|(&a, &b)| near(a, b)) {
-            q.pop();
-        }
+    while closed && q.len() > 1 && q.first().zip(q.last()).is_some_and(|(&a, &b)| near(a, b)) {
+        q.pop();
     }
-    let usable = |t: Option<(f64, f64)>| t.is_some_and(|(x, y)| x.is_finite() && y.is_finite() && (x, y) != (0.0, 0.0));
-    let least = if !closed && (usable(tangents.0) || usable(tangents.1)) {
-        2
-    } else {
-        3
-    };
-    fit.len() <= MAX_FIT_POINTS && q.len() >= least
+    q
+}
+
+/// The unit direction of a tangent of any size: scaled by its largest part first, so a tiny or
+/// huge given tangent keeps its direction (only zero and values that are not numbers have none).
+fn unit_direction((x, y): (f64, f64)) -> Option<(f64, f64)> {
+    let m = x.abs().max(y.abs());
+    if !(m.is_finite() && m > 0.0) {
+        return None;
+    }
+    let (x, y) = (x / m, y / m);
+    let l = x.hypot(y);
+    Some((x / l, y / l))
 }
 
 /// Points of a SPLINE entity: the curve through its control points, else through its fit
@@ -1233,21 +1225,23 @@ fn bulged(vertices: &[((f64, f64), f64)], closed: bool) -> Option<Vec<(f64, f64)
     Some(out)
 }
 
-/// The boundary loops of a HATCH, as DXF points. Unreadable loops are left out.
-fn hatch_loops(e: &Entity) -> (Vec<Vec<(f64, f64)>>, usize) {
+/// The boundary loops of a HATCH, as DXF points, each with how many of its spline edges were
+/// joined straight because their fit points could not be interpolated. Unreadable loops are left
+/// out.
+fn hatch_loops(e: &Entity) -> Vec<(Vec<(f64, f64)>, usize)> {
     let mut cur = Cursor { codes: &e.codes, i: 0 };
     // Skip the elevation point, extrusion, pattern name and flags up to the loop count.
     let Some(start) = e.codes.iter().position(|(c, _)| *c == 91) else {
-        return (Vec::new(), 0);
+        return Vec::new();
     };
-    // Spline edges whose fit points could not be interpolated (joined straight).
-    let mut fit_failed = 0;
     cur.i = start;
     let loops = cur.count(91);
     let mut out = Vec::new();
     for _ in 0..loops {
         let Some(flags) = cur.take(92) else { break };
         let mut pts: Vec<(f64, f64)> = Vec::new();
+        // Spline edges of this loop whose fit points could not be interpolated (joined straight).
+        let mut fit_failed = 0;
         if (flags as i64) & 2 == 2 {
             let has_bulge = cur.take(72).unwrap_or(0.0) != 0.0;
             let _closed = cur.take(73);
@@ -1388,10 +1382,10 @@ fn hatch_loops(e: &Entity) -> (Vec<Vec<(f64, f64)>>, usize) {
             pts.pop();
         }
         if pts.len() >= 3 {
-            out.push(pts);
+            out.push((pts, fit_failed));
         }
     }
-    (out, fit_failed)
+    out
 }
 
 /// The edges of a loop as point pairs, the last one closing it.
@@ -2773,6 +2767,24 @@ mod tests {
         // A fit point that is not a number is joined straight too, and said.
         let (_, skipped) = drawn(&hatch("NaN"), "")?;
         assert_eq!(skipped.get(SPLINE_FIT_FAILED), Some(&1), "{skipped:?}");
+        // At a scale where the loop overflows once placed, the loop is left out: only that is
+        // said, not a spline drawn through its points.
+        let d = parse(&dxf(&hatch("1"), ""))?;
+        let (mut raw, mut points, mut skipped, mut budget) = (Vec::new(), Vec::new(), BTreeMap::new(), MAX_DRAWN);
+        shapes(
+            &d,
+            &d.entities,
+            Xf::ID,
+            1e300,
+            0,
+            &|_| false,
+            &mut raw,
+            &mut points,
+            &mut skipped,
+            &mut budget,
+        );
+        assert_eq!(skipped.get(HATCH_NOT_NUMBERS), Some(&1), "{skipped:?}");
+        assert!(!skipped.contains_key(SPLINE_FIT_FAILED), "{skipped:?}");
         Ok(())
     }
 
