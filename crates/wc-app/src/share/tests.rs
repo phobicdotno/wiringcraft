@@ -2953,6 +2953,89 @@ fn a_picked_picture_whose_change_the_session_refused_is_neither_renamed_nor_shar
 }
 
 #[test]
+fn a_pick_is_withdrawn_by_the_refusal_of_the_edit_that_carried_it_only() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session_sharing(tmp.path(), |_| Ok(()), BTreeMap::new())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    // The guest picks its own a.png as the logo; the change that carries it goes out.
+    let file = "pictures/a.png".to_owned();
+    std::fs::create_dir_all(guest_open.dir.join("pictures"))?;
+    std::fs::write(guest_open.dir.join(&file), PNG)?;
+    guest_open.project.meta.logo = Some(wc_core::Logo {
+        file: file.clone(),
+        cover: None,
+    });
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    let key = (file.clone(), PicRef::Logo);
+    let carrier = *g.pick_carriers.get(&key).ok_or("no carrier recorded")?;
+    let Some(Role::Guest(j)) = g.role.as_ref() else {
+        return Err("not a guest".into());
+    };
+    assert_eq!(carrier, j.guest.last_edit(), "the logo went out last");
+    let refuse = |g: &mut Share, seq: u64| -> TestResult {
+        let Some(Role::Guest(j)) = g.role.as_mut() else {
+            return Err("not a guest".into());
+        };
+        j.guest.refused_meta = true;
+        j.guest.refused_edits.insert(seq);
+        Ok(())
+    };
+    // A refused later change of the project settings (a rename, say) leaves the pick: the
+    // session took the edit that carried it.
+    refuse(&mut g, carrier + 1)?;
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    assert!(
+        g.picks.get(&file).is_some_and(|refs| refs.contains(&PicRef::Logo)),
+        "{:?}",
+        g.notes
+    );
+    // The refusal of the carrying edit withdraws it.
+    refuse(&mut g, carrier)?;
+    g.frame(Some(&mut guest_open), Some("p0003".into()), false);
+    assert!(!g.picks.contains_key(&file), "{:?}", g.notes);
+    assert!(!g.pick_carriers.contains_key(&key));
+    Ok(())
+}
+
+#[test]
+fn a_carried_pick_is_withdrawn_only_with_its_own_edit() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let mut open = project(tmp.path())?;
+    let a = "pictures/a.png".to_owned();
+    open.project.meta.logo = Some(wc_core::Logo {
+        file: a.clone(),
+        cover: None,
+    });
+    let mut picks: BTreeMap<String, BTreeSet<PicRef>> = [(a.clone(), [PicRef::Logo].into())].into();
+    let mut carriers: BTreeMap<(String, PicRef), u64> = [((a.clone(), PicRef::Logo), 5)].into();
+    let mut due = BTreeMap::new();
+    let mut clashes = Vec::new();
+    // A refused edit 7 touched the project settings: the pick edit 5 carried stays.
+    let gone = withdraw_picks(
+        &mut picks,
+        &mut carriers,
+        &mut due,
+        &mut clashes,
+        &open,
+        ((BTreeSet::new(), true, [7].into()), &BTreeSet::new()),
+    );
+    assert!(gone.is_empty());
+    assert_eq!(carriers.len(), 1);
+    // Edit 5 itself refused: the pick goes, and so does its carrier.
+    let gone = withdraw_picks(
+        &mut picks,
+        &mut carriers,
+        &mut due,
+        &mut clashes,
+        &open,
+        ((BTreeSet::new(), false, [5].into()), &BTreeSet::new()),
+    );
+    assert_eq!(gone, [a].into());
+    assert!(picks.is_empty() && carriers.is_empty());
+    Ok(())
+}
+
+#[test]
 fn a_session_picture_replaced_here_after_a_withdrawn_pick_of_its_name_is_renamed_and_shared() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let (mut h, log, mut host_open, mut g, mut guest_open) = session_sharing(
@@ -3341,10 +3424,11 @@ fn a_pick_refused_or_pointed_elsewhere_is_withdrawn_with_its_waiting_rename() ->
     // The logo's change was refused: a.png keeps its underlay pick; b.png's logo names a.png.
     let gone = withdraw_picks(
         &mut picks,
+        &mut BTreeMap::new(),
         &mut due,
         &mut clashes,
         &open,
-        ((BTreeSet::new(), true), &BTreeSet::new()),
+        ((BTreeSet::new(), true, BTreeSet::new()), &BTreeSet::new()),
     );
     assert_eq!(gone, [b.clone()].into());
     assert_eq!(picks, [(a.clone(), [PicRef::Underlay(id.clone())].into())].into());
@@ -3353,10 +3437,11 @@ fn a_pick_refused_or_pointed_elsewhere_is_withdrawn_with_its_waiting_rename() ->
     // Then the underlay's page: nothing is left to rename.
     let gone = withdraw_picks(
         &mut picks,
+        &mut BTreeMap::new(),
         &mut due,
         &mut clashes,
         &open,
-        (([id].into(), false), &BTreeSet::new()),
+        (([id].into(), false, BTreeSet::new()), &BTreeSet::new()),
     );
     assert_eq!(gone, [a].into());
     assert!(picks.is_empty() && clashes.is_empty() && due.is_empty());

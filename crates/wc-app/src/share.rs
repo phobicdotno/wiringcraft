@@ -1319,29 +1319,48 @@ fn pic_refs(project: &Project) -> Vec<(PicRef, String)> {
         .collect()
 }
 
-/// The pages and whether the project settings a refused change touched.
-type Refused = (BTreeSet<String>, bool);
+/// The pages and whether the project settings a refused change touched, and the `seq` of
+/// each refused edit.
+type Refused = (BTreeSet<String>, bool, BTreeSet<u64>);
+
+/// Whether `edit` points reference `r` at picture `file`: the edit that carries a pick there.
+fn carries(edit: &ProjectEdit, r: &PicRef, file: &str) -> bool {
+    let underlay =
+        |page: &wc_core::Page, id: &str| page.id == id && page.underlay.as_ref().is_some_and(|u| u.file == file);
+    match (edit, r) {
+        (ProjectEdit::SetMeta { meta, .. }, PicRef::Logo) => meta.logo.as_ref().is_some_and(|l| l.file == file),
+        (ProjectEdit::AddPage { page }, PicRef::Underlay(id)) => underlay(page, id),
+        (ProjectEdit::SetPages { pages, .. }, PicRef::Underlay(id)) => pages.iter().any(|p| underlay(p, id)),
+        (ProjectEdit::Batch { edits }, _) => edits.iter().any(|e| carries(e, r, file)),
+        _ => false,
+    }
+}
 
 /// Drop the picks (of [`Share::picks`]) the session refused (`refused`: the pages and whether
-/// the project settings a refused change touched, then the picks made since that change was
-/// sent, which it does not touch) and those that name another file now. A picture left with
-/// no pick gets no name of its own: it is taken out of what waits to be renamed
-/// (`renames_due`, `clashes`), and returned.
+/// the project settings a refused change touched, and the refused edits, then the picks made
+/// since that change was sent, which it does not touch) and those that name another file now.
+/// A pick whose carrying edit is known (`carriers`) is dropped only with that edit's refusal:
+/// a later refused change that touches the same target leaves a pick the session took. A
+/// picture left with no pick gets no name of its own: it is taken out of what waits to be
+/// renamed (`renames_due`, `clashes`), and returned.
 fn withdraw_picks(
     picks: &mut BTreeMap<String, BTreeSet<PicRef>>,
+    carriers: &mut BTreeMap<(String, PicRef), u64>,
     renames_due: &mut BTreeMap<String, std::time::Instant>,
     clashes: &mut Vec<String>,
     open: &Open,
     refused: (Refused, &BTreeSet<(String, PicRef)>),
 ) -> BTreeSet<String> {
-    let ((pages, meta), fresh) = refused;
+    let ((pages, meta, edits), fresh) = refused;
     let mut withdrawn = BTreeSet::new();
     for (file, refs) in picks.iter_mut() {
         refs.retain(|r| {
-            let refused = !fresh.contains(&(file.clone(), r.clone()))
-                && match r {
-                    PicRef::Logo => meta,
-                    PicRef::Underlay(id) => pages.contains(id),
+            let key = (file.clone(), r.clone());
+            let refused = !fresh.contains(&key)
+                && match (carriers.get(&key), r) {
+                    (Some(seq), _) => edits.contains(seq),
+                    (None, PicRef::Logo) => meta,
+                    (None, PicRef::Underlay(id)) => pages.contains(id),
                 };
             !refused && pic_ref_file(&open.project, r) == Some(file.as_str())
         });
@@ -1353,6 +1372,7 @@ fn withdraw_picks(
         picks.remove(file);
         renames_due.remove(file);
     }
+    carriers.retain(|(f, r), _| picks.get(f).is_some_and(|refs| refs.contains(r)));
     clashes.retain(|f| !withdrawn.contains(f));
     withdrawn
 }
@@ -1863,12 +1883,13 @@ impl Role {
     /// ([`wc_share::Refusal::PictureNameTaken`]), since the last call.
     /// The pages and whether the project settings a refused change of this person's touched,
     /// since the last call ([`wc_share::Guest::refused_pages`]). The host's own are never refused.
-    fn refused_targets(&mut self) -> (BTreeSet<String>, bool) {
+    fn refused_targets(&mut self) -> Refused {
         match self {
             Role::Host(_) => Default::default(),
             Role::Guest(j) => (
                 std::mem::take(&mut j.guest.refused_pages),
                 std::mem::take(&mut j.guest.refused_meta),
+                std::mem::take(&mut j.guest.refused_edits),
             ),
         }
     }
@@ -2286,6 +2307,10 @@ pub struct Share {
     /// once the session refused the change that made them (the reference is the session's
     /// again) or they name another file.
     picks: BTreeMap<String, BTreeSet<PicRef>>,
+    /// The project edit (`seq`) that carried each pick of [`Share::picks`] to the session, once
+    /// sent: only that edit's refusal withdraws the pick. A pick sent with a page edit, or not
+    /// sent yet, has none, and any refused change of its target withdraws it.
+    pick_carriers: BTreeMap<(String, PicRef), u64>,
     /// Pictures whose last pick was withdrawn ([`withdraw_picks`]), until this copy picks them
     /// again, or that were renamed after a refusal, with the `seq` of the latest edit that had
     /// sent each then: a refusal of such a picture renames nothing, unless it is of a later
@@ -2978,6 +3003,7 @@ impl Share {
         self.renames_due.clear();
         self.clashes.clear();
         self.picks.clear();
+        self.pick_carriers.clear();
         self.withdrawn_picks.clear();
         self.repair_reads.clear();
     }
@@ -3283,6 +3309,7 @@ impl Share {
             if pic_ref_file(base, &r) != Some(file.as_str()) {
                 self.withdrawn_picks.remove(&file);
                 if self.picks.entry(file.clone()).or_default().insert(r.clone()) {
+                    self.pick_carriers.remove(&(file.clone(), r.clone()));
                     fresh.insert((file, r));
                 }
             }
@@ -3291,6 +3318,7 @@ impl Share {
         // must not rename the references that are not this copy's.
         let withdrawn = withdraw_picks(
             &mut self.picks,
+            &mut self.pick_carriers,
             &mut self.renames_due,
             &mut self.clashes,
             open,
@@ -3437,7 +3465,17 @@ impl Share {
         // One action, one change: the edits that can go together are checked and recorded by
         // the host as one batch, all or nothing.
         for edit in ProjectEdit::batched(out.edits) {
+            // The pick this edit carries is answered by its refusal or its taking, nothing else.
+            let carried: Vec<(String, PicRef)> = self
+                .picks
+                .iter()
+                .flat_map(|(file, refs)| refs.iter().map(move |r| (file.clone(), r.clone())))
+                .filter(|key| !self.pick_carriers.contains_key(key) && carries(&edit, &key.1, &key.0))
+                .collect();
             role.edit_project(edit, &mut self.notes);
+            if let Some(seq) = role.last_edit() {
+                self.pick_carriers.extend(carried.into_iter().map(|key| (key, seq)));
+            }
         }
         if let Some(p) = out.page {
             role.edit_page(p, &mut self.notes);
@@ -3502,6 +3540,7 @@ impl Share {
         // next frame is a fresh pick there, which that refusal leaves.
         let gone = withdraw_picks(
             &mut self.picks,
+            &mut self.pick_carriers,
             &mut self.renames_due,
             &mut self.clashes,
             open,
