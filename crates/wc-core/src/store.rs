@@ -314,7 +314,53 @@ pub fn save(dir: &Path, project: &Project) -> Result<Vec<PathBuf>> {
         keep.insert(name);
     }
     clean_up(&comments_dir, &keep, COMMENTS_SUFFIX)?;
+    remove_unused_box_symbols(dir, project)?;
     Ok(written)
+}
+
+/// Remove the files of black box symbols (`box.<page>.<id>`, the project's own symbols for the
+/// boxes drawn on its pages) that no page places and the lock does not pin: left behind by a box
+/// that was undone, or drawn and never saved. Other vendored symbols are left alone.
+fn remove_unused_box_symbols(dir: &Path, project: &Project) -> Result<()> {
+    let folder = dir.join(VENDOR_DIR).join(ItemKind::Symbol.dir());
+    let entries = match fs::read_dir(&folder) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(Error::io(&folder, e)),
+    };
+    let used: Vec<String> = project
+        .lock
+        .symbols
+        .keys()
+        .chain(project.pages.iter().flat_map(|p| p.symbols.iter().map(|s| &s.symbol)))
+        .filter(|id| is_box_symbol(id))
+        .map(|id| format!("{id}.json"))
+        .collect();
+    for entry in entries {
+        let entry = entry.map_err(|e| Error::io(&folder, e))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // A folder that ignores case lists a used file under any case of its name.
+        if !is_box_symbol(&name) || !name.ends_with(".json") || used.iter().any(|u| u.eq_ignore_ascii_case(&name)) {
+            continue;
+        }
+        // Only plain files: never a folder or a link someone put there.
+        let path = entry.path();
+        let plain = fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file());
+        if !plain {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Error::io(&path, e)),
+        }
+    }
+    Ok(())
+}
+
+/// Whether a symbol id (or its file name) is a black box's own symbol, `box.<page>.<id>`.
+fn is_box_symbol(id: &str) -> bool {
+    id.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("box."))
 }
 
 /// Refuse two ids that differ only in case, naming both.
@@ -523,6 +569,51 @@ mod tests {
         assert!(again.is_empty(), "unchanged project rewrote {again:?}");
         let back = load(dir.path())?;
         assert_eq!(back, p);
+        Ok(())
+    }
+
+    #[test]
+    fn a_save_removes_only_box_symbols_no_page_places_and_the_lock_does_not_pin() -> Result<()> {
+        let tmp = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
+        let dir = tmp.path();
+        let mut p = sample()?;
+        p.pages[0].symbols[0].symbol = "box.p0002.s1".into();
+        p.lock.symbols.insert(
+            "box.p0002.s7".into(),
+            crate::LockEntry {
+                source: "project".into(),
+                hash: "h".into(),
+            },
+        );
+        let folder = dir.join(VENDOR_DIR).join(ItemKind::Symbol.dir());
+        fs::create_dir_all(folder.join("box.p0002.s9.json")).map_err(|e| Error::io(&folder, e))?;
+        for name in [
+            "box.p0002.s1.json",
+            "box.p0002.s7.json",
+            "box.p0002.s2.json",
+            "BOX.P0002.S3.json",
+            "box.p0002.s4.txt",
+            "wc.coil.json",
+        ] {
+            fs::write(folder.join(name), "{}").map_err(|e| Error::io(name, e))?;
+        }
+        save(dir, &p)?;
+        let mut left: Vec<String> = fs::read_dir(&folder)
+            .map_err(|e| Error::io(&folder, e))?
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "box.p0002.s1.json",
+                "box.p0002.s4.txt",
+                "box.p0002.s7.json",
+                "box.p0002.s9.json",
+                "wc.coil.json"
+            ],
+            "placed, pinned, not a symbol file, a folder and other symbols stay"
+        );
         Ok(())
     }
 

@@ -7350,14 +7350,23 @@ mod tests {
         assert_eq!(symbol.pins[0].name, "X1:1");
         assert_eq!(symbol.pins[0].at, Point::new(0.0, 15.0));
 
-        // A box deleted from the page keeps its symbol file: its id is not taken over.
+        // A symbol file left by a box that was never saved: its id is not taken over, and the
+        // save removes it, as no page places it and the lock does not pin it (#490). Other
+        // symbols nothing uses stay.
         let stale = wc_core::black_box("box.p1.s3", "old", 5.0, 5.0, &[]).unwrap();
         store::write_vendored_symbol(&dir, &stale).unwrap();
+        let other = wc_core::black_box("maker.thing", "other", 5.0, 5.0, &[]).unwrap();
+        store::write_vendored_symbol(&dir, &other).unwrap();
         boxed(&["--at", "100,100", "--size", "10,10"]).unwrap();
         let p = load(&dir).unwrap();
         let third = &p.page("p1").unwrap().symbols[2];
         assert_eq!((third.id.as_str(), third.symbol.as_str()), ("s4", "box.p1.s4"));
-        assert_eq!(store::read_vendored_symbol(&dir, "box.p1.s3").unwrap(), stale);
+        assert!(
+            store::read_vendored_symbol(&dir, "box.p1.s3").is_err(),
+            "left-over removed"
+        );
+        assert!(store::read_vendored_symbol(&dir, "box.p1.s4").is_ok());
+        assert_eq!(store::read_vendored_symbol(&dir, "maker.thing").unwrap(), other);
 
         cli(&dir, &["wire", "p1", &format!("{a1}:2"), &format!("{a2}:X1:1")]).unwrap();
         let part = wc_core::Part {
