@@ -189,6 +189,36 @@ fn session_sharing(
 }
 
 #[test]
+fn an_edit_from_the_session_is_seen_by_checks_while_drawing() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (mut h, _log, mut host_open, mut g, mut guest_open) = session(tmp.path())?;
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    // The host renames page 2; the guest's copy takes it in without any input there.
+    let (guest_was, host_was) = (guest_open.revision(), host_open.revision());
+    host_open.project.page_mut("p0002").ok_or("no page")?.title = "Renamed".into();
+    host_open.touch();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(
+        guest_open.project.page("p0002").map(|p| p.title.as_str()),
+        Some("Renamed")
+    );
+    assert_ne!(
+        guest_open.revision(),
+        guest_was,
+        "the guest's checks see the host's edit"
+    );
+    // And the other way round.
+    let host_now = host_open.revision();
+    assert_ne!(host_now, host_was);
+    guest_open.project.page_mut("p0003").ok_or("no page")?.title = "Mine".into();
+    guest_open.touch();
+    frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    assert_eq!(host_open.project.page("p0003").map(|p| p.title.as_str()), Some("Mine"));
+    assert_ne!(host_open.revision(), host_now, "the host's checks see the guest's edit");
+    Ok(())
+}
+
+#[test]
 fn a_joined_guest_gets_its_own_copy_on_disk() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let (_h, _log, host_open, _g, guest_open) = session(tmp.path())?;

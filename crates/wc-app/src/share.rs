@@ -255,7 +255,7 @@ fn take_back_pages(
     if let Some(base) = base {
         base.sort_pages();
     }
-    open.dirty = true;
+    open.edited();
     notes.push(format!(
         "Your change to page {} was not kept, nor what you did on it after it.",
         ids.iter().map(|id| number_of(auth, id)).collect::<Vec<_>>().join(", ")
@@ -894,7 +894,7 @@ fn follow_take_backs(
         return;
     }
     // The lock changed, not yet in this copy's files.
-    open.dirty = true;
+    open.edited();
     delist.extend(dropped.iter().cloned());
     unload.extend(dropped);
     unload_taken_back(unload, open);
@@ -1237,11 +1237,14 @@ pub fn take_files(
                     }
                 }
                 open.symbols.insert(id, s.clone());
+                open.touch();
             }
             Err(e) => {
                 // A loaded version the lock no longer names is not drawn as if it were the
                 // session's; the next frame tries the write again.
-                open.symbols.remove(&id);
+                if open.symbols.remove(&id).is_some() {
+                    open.touch();
+                }
                 failed.push((name, e.to_string()));
             }
         }
@@ -1271,9 +1274,12 @@ pub fn take_files(
                     }
                 }
                 open.parts.insert(id, p.clone());
+                open.touch();
             }
             Err(e) => {
-                open.parts.remove(&id);
+                if open.parts.remove(&id).is_some() {
+                    open.touch();
+                }
                 failed.push((name, e.to_string()));
             }
         }
@@ -1657,7 +1663,7 @@ fn rename_picture(open: &mut Open, file: &str, only: Option<&BTreeSet<PicRef>>) 
             u.file = new.clone();
         }
     }
-    open.dirty = true;
+    open.edited();
     Ok((new, picture.data))
 }
 
@@ -3919,7 +3925,7 @@ impl Share {
             }
             if open.project != before {
                 // Also after a save: the copy on disk still has the change.
-                open.dirty = true;
+                open.edited();
             }
             // A rename taken back now ends at the tag it went back to, before anything else
             // can take the tag it left.
@@ -4142,7 +4148,7 @@ impl Share {
         }
         if changed {
             // Others' changes are in the window, not yet in this copy's files.
-            open.dirty = true;
+            open.edited();
         }
         if let Some(synced) = synced {
             if changed || sent || !out.dropped.is_empty() {
