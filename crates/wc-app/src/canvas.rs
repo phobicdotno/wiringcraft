@@ -1021,6 +1021,10 @@ fn live_spot(open: &Open, page: &Page, item: &str) -> Option<(Point, Point)> {
     if let Some(b) = open.symbol_bounds(page, item) {
         return Some(b);
     }
+    // A revision cloud: the area it goes around.
+    if let Some(c) = wc_report::cloud_index(item).and_then(|n| page.clouds.get(n)) {
+        return Some((c.min, c.max));
+    }
     let w = page.wires.iter().find(|w| w.id == item)?;
     let pts = open.wire_points(page, w)?;
     // The middle of the middle segment, or the one point of a wire that has only one.
@@ -1882,6 +1886,24 @@ mod tests {
         for &(x, y) in pts {
             shape_click(open, ed, Point::new(x, y));
         }
+    }
+
+    #[test]
+    fn a_cloud_with_an_unknown_revision_is_marked_around_its_area() {
+        let (_tmp, mut o) = project();
+        let cloud = wc_core::RevisionCloud {
+            min: Point::new(40.0, 30.0),
+            max: Point::new(90.0, 60.0),
+            revision: "Z".into(),
+        };
+        o.project.pages[1].clouds.push(cloud);
+        let found = crate::run_check(&o);
+        let f = found.iter().find(|f| f.message.contains("revision Z")).unwrap();
+        let page = &o.project.pages[1];
+        assert_eq!(f.page_id.as_deref(), Some(page.id.as_str()));
+        let spot = f.item.as_deref().and_then(|item| live_spot(&o, page, item));
+        assert_eq!(spot, Some((Point::new(40.0, 30.0), Point::new(90.0, 60.0))));
+        assert_eq!(live_spot(&o, page, "cloud 7"), None, "no such cloud");
     }
 
     #[test]
