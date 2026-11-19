@@ -355,10 +355,14 @@ fn remove_unused_box_symbols(dir: &Path, project: &Project) -> Result<()> {
         .filter_map(|t| t.file_name().map(ToOwned::to_owned))
         .collect();
     for name in &listed {
-        // Any case of a used name is kept: on a folder that ignores case it is the used file.
+        // A case variant of a used name is kept only when the used name itself is not
+        // listed: then the folder ignores case and the variant is the used file. When both are
+        // listed, the variant is a separate, unused file.
         if !is_box_symbol(name)
             || !name.ends_with(".json")
-            || used.iter().any(|u| u.eq_ignore_ascii_case(name))
+            || used
+                .iter()
+                .any(|u| u.eq_ignore_ascii_case(name) && (u == name || !listed.contains(u)))
             || targets.iter().any(|t| t.as_os_str() == std::ffi::OsStr::new(name))
         {
             continue;
@@ -682,6 +686,44 @@ mod tests {
         assert!(
             fs::read(folder.join("box.p1.s1.json")).is_ok(),
             "the placed symbol reads"
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_save_removes_an_unused_case_duplicate_but_keeps_a_link_target() -> Result<()> {
+        let tmp = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
+        let dir = tmp.path();
+        let mut p = Project::new("Cases");
+        let mut page = Page::new("p1", "1", "One");
+        for (id, symbol) in [("s1", "box.p1.s1"), ("s2", "box.p1.s2")] {
+            page.symbols.push(PlacedSymbol {
+                id: id.into(),
+                symbol: symbol.into(),
+                at: Point::new(0.0, 0.0),
+                rotation: Default::default(),
+                mirror: false,
+                tag: None,
+            });
+        }
+        p.pages.push(page);
+        let folder = dir.join(VENDOR_DIR).join(ItemKind::Symbol.dir());
+        fs::create_dir_all(&folder).map_err(|e| Error::io(&folder, e))?;
+        // A folder that tells case apart: the duplicate is its own, unused file.
+        for name in ["box.p1.s1.json", "BOX.P1.S1.json", "Box.P1.S2.json"] {
+            fs::write(folder.join(name), "{}").map_err(|e| Error::io("write", e))?;
+        }
+        // The used name is a link to a case variant, which must stay.
+        std::os::unix::fs::symlink("Box.P1.S2.json", folder.join("box.p1.s2.json"))
+            .map_err(|e| Error::io("link", e))?;
+        save(dir, &p)?;
+        assert!(folder.join("box.p1.s1.json").exists(), "the used file stays");
+        assert!(!folder.join("BOX.P1.S1.json").exists(), "the unused duplicate goes");
+        assert!(folder.join("Box.P1.S2.json").exists(), "the link's target stays");
+        assert!(
+            fs::read(folder.join("box.p1.s2.json")).is_ok(),
+            "the linked symbol reads"
         );
         Ok(())
     }
