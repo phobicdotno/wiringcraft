@@ -99,7 +99,8 @@ pub struct Assistant {
     /// The free drawings of each page as the assistant last read them (project folder and page
     /// id). Drawings are addressed by position (`g0`, `g1` ...), so a write by position is
     /// refused once someone else changed the page's drawings (a session sync, the user).
-    graphics_read: HashMap<(PathBuf, String), Vec<Shape>>,
+    /// Shared, so the copy a tool call keeps to put back costs nothing.
+    graphics_read: HashMap<(PathBuf, String), Arc<[Shape]>>,
 }
 
 impl Default for Assistant {
@@ -1185,7 +1186,7 @@ impl App {
         self.assistant
             .graphics_read
             .get(key)
-            .is_none_or(|read| self.graphics_now(key).is_some_and(|now| now == read.as_slice()))
+            .is_none_or(|read| self.graphics_now(key).is_some_and(|now| now == &read[..]))
     }
 
     /// Run one assistant tool. A free drawing named by position is refused when the page's
@@ -1232,7 +1233,7 @@ impl App {
         let edits = edits_page(name, v) || name == "copy_items" || toolbar;
         for (key, as_read) in keys {
             if name == "get_page" || (edits && as_read && self.assistant.graphics_read.contains_key(&key)) {
-                match self.graphics_now(&key).map(<[Shape]>::to_vec) {
+                match self.graphics_now(&key).map(Arc::<[Shape]>::from) {
                     Some(now) => self.assistant.graphics_read.insert(key, now),
                     None => self.assistant.graphics_read.remove(&key),
                 };
