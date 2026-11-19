@@ -864,6 +864,7 @@ impl Open {
             "size_mm": [w, h],
             "symbols": symbols, "wires": wires, "graphics": graphics,
             "underlay": p.underlay, "comments": comments,
+            "clouds": p.clouds, "revision_table": p.revision_table,
         })
     }
 
@@ -1628,6 +1629,21 @@ impl App {
                         .map(|p| p.title_block.clone())
                         .unwrap_or_default();
                     content["title_block"] = json!(own);
+                }
+                // Nor does one without `clouds` or `revision_table` remove the page's revision
+                // marks. Given, they are used: `[]` clears the clouds and `null` the table.
+                if content.get("clouds").is_none() {
+                    let own = open
+                        .project
+                        .pages
+                        .get(page)
+                        .map(|p| p.clouds.clone())
+                        .unwrap_or_default();
+                    content["clouds"] = json!(own);
+                }
+                if content.get("revision_table").is_none() {
+                    let own = open.project.pages.get(page).and_then(|p| p.revision_table);
+                    content["revision_table"] = json!(own);
                 }
                 let new: Page = serde_json::from_value(content).map_err(|e| format!("Not a page: {e}"))?;
                 open.ensure_page_symbols(&new)?;
@@ -5958,6 +5974,46 @@ mod tests {
         content["title_block"] = json!({});
         call(&mut a, "edit_page_json", json!({"page": "p0002", "content": content})).unwrap();
         assert!(page2(&a).title_block.is_empty());
+    }
+
+    #[test]
+    fn a_page_edit_without_revision_marks_keeps_them() {
+        let (_tmp, mut a) = app(vec![]);
+        let cloud = wc_core::revision::RevisionCloud {
+            min: wc_core::Point::new(10.0, 10.0),
+            max: wc_core::Point::new(40.0, 30.0),
+            revision: "B".into(),
+        };
+        if let Some(p) = a.open.as_mut().unwrap().project.page_mut("p0002") {
+            p.clouds.push(cloud.clone());
+            p.revision_table = Some(wc_core::Point::new(300.0, 200.0));
+        }
+        let mut content: Value =
+            serde_json::from_str(&call(&mut a, "get_page", json!({"page": "p0002"})).unwrap()).unwrap();
+        assert_eq!(content["clouds"][0]["revision"], json!("B"), "get_page lists them");
+        let obj = content.as_object_mut().unwrap();
+        obj.remove("clouds");
+        obj.remove("revision_table");
+        content["title"] = json!("Changed");
+        call(
+            &mut a,
+            "edit_page_json",
+            json!({"page": "p0002", "content": content.clone()}),
+        )
+        .unwrap();
+        assert_eq!(page2(&a).title, "Changed");
+        assert_eq!(page2(&a).clouds, vec![cloud], "kept");
+        assert_eq!(
+            page2(&a).revision_table,
+            Some(wc_core::Point::new(300.0, 200.0)),
+            "kept"
+        );
+        // Given, they are used: `[]` and `null` clear them.
+        content["clouds"] = json!([]);
+        content["revision_table"] = Value::Null;
+        call(&mut a, "edit_page_json", json!({"page": "p0002", "content": content})).unwrap();
+        assert!(page2(&a).clouds.is_empty());
+        assert_eq!(page2(&a).revision_table, None);
     }
 
     #[test]
