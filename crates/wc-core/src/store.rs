@@ -370,9 +370,19 @@ fn clean_up(dir: &Path, keep: &std::collections::BTreeSet<String>, suffix: &str)
         return Ok(());
     }
     let entries = fs::read_dir(dir).map_err(|e| Error::io(dir, e))?;
+    let names = entries.map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()));
+    clean_up_listed(dir, names, keep, suffix)
+}
+
+/// [`clean_up`] on the names a listing of `dir` gave.
+fn clean_up_listed(
+    dir: &Path,
+    names: impl Iterator<Item = std::io::Result<String>>,
+    keep: &std::collections::BTreeSet<String>,
+    suffix: &str,
+) -> Result<()> {
     // A listing cut short would look like a folder without the file just written: stop instead.
-    let listed = entries
-        .map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()))
+    let listed = names
         .collect::<std::io::Result<Vec<String>>>()
         .map_err(|e| Error::io(dir, e))?;
     for step in tidy(&listed, keep, suffix) {
@@ -541,6 +551,27 @@ mod tests {
             tidy(&listed, &keep, PAGE_SUFFIX),
             vec![Tidy::Remove("dxf-300.page.json".into())]
         );
+    }
+
+    #[test]
+    fn a_listing_cut_short_changes_nothing() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
+        // On a folder that keeps case, both files are there; the listing fails before the new one.
+        for (name, body) in [("dxf-300.page.json", "old"), ("DXF-300.page.json", "new")] {
+            fs::write(dir.path().join(name), body).map_err(|e| Error::io(name, e))?;
+        }
+        let keep = names(&["DXF-300.page.json"]).into_iter().collect();
+        let names = vec![
+            Ok("dxf-300.page.json".to_string()),
+            Err(std::io::Error::other("listing cut short")),
+        ];
+        let out = clean_up_listed(dir.path(), names.into_iter(), &keep, PAGE_SUFFIX);
+        assert!(out.is_err_and(|e| e.to_string().contains("listing cut short")));
+        for (name, body) in [("dxf-300.page.json", "old"), ("DXF-300.page.json", "new")] {
+            let path = dir.path().join(name);
+            assert_eq!(fs::read_to_string(&path).map_err(|e| Error::io(&path, e))?, body);
+        }
+        Ok(())
     }
 
     #[test]
