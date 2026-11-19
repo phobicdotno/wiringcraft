@@ -680,6 +680,8 @@ fn selection_id(sel: &Selection) -> String {
     match sel {
         Selection::Symbol(id) | Selection::Wire(id) => id.clone(),
         Selection::Graphic(i) => format!("g{i}"),
+        Selection::Cloud(i) => wc_report::cloud_item(*i),
+        Selection::RevisionTable => "revision table".to_owned(),
     }
 }
 
@@ -1163,6 +1165,8 @@ impl App {
             Selection::Symbol(id) => p.symbols.iter().any(|x| &x.id == id),
             Selection::Wire(id) => p.wires.iter().any(|x| &x.id == id),
             Selection::Graphic(i) => *i < p.graphics.len(),
+            Selection::Cloud(i) => *i < p.clouds.len(),
+            Selection::RevisionTable => p.revision_table.is_some(),
         });
     }
 
@@ -1639,7 +1643,7 @@ impl App {
                     None => "Project properties set.".to_owned(),
                 };
                 let fields: Vec<(String, String)> = fields.into_iter().collect();
-                open.set_project_props(&name, &fields, None)?;
+                open.set_project_props(&name, &fields, None, None)?;
                 Ok(said)
             }
             "get_template" => {

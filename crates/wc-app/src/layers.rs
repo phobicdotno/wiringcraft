@@ -131,7 +131,8 @@ impl Layers {
     pub fn may_select(&self, s: &Selection) -> bool {
         match s {
             Selection::Graphic(_) => self.pickable(Layer::Drawings),
-            Selection::Symbol(_) | Selection::Wire(_) => true,
+            // Revision clouds and the revision table are on no layer either.
+            Selection::Symbol(_) | Selection::Wire(_) | Selection::Cloud(_) | Selection::RevisionTable => true,
         }
     }
 
@@ -140,7 +141,7 @@ impl Layers {
     pub fn unselectable_note(&self, s: &Selection) -> Option<String> {
         let layer = match s {
             Selection::Graphic(_) => Layer::Drawings,
-            Selection::Symbol(_) | Selection::Wire(_) => return None,
+            Selection::Symbol(_) | Selection::Wire(_) | Selection::Cloud(_) | Selection::RevisionTable => return None,
         };
         let (state, fix) = match (self.shown(layer), self.locked(layer)) {
             (true, false) => return None,

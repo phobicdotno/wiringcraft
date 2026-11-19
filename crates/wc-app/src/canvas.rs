@@ -473,6 +473,18 @@ impl Open {
                 return Some(Selection::Wire(w.id.clone()));
             }
         }
+        // Revision clouds and the table lie over the drawing, so they are found before it.
+        if let Some(i) = page.clouds.iter().rposition(|c| c.hit(at, tol)) {
+            return Some(Selection::Cloud(i));
+        }
+        if let Some((a, b)) = self.revision_table_bounds(page)
+            && at.x >= a.x - tol
+            && at.x <= b.x + tol
+            && at.y >= a.y - tol
+            && at.y <= b.y + tol
+        {
+            return Some(Selection::RevisionTable);
+        }
         page.graphics
             .iter()
             .rposition(|g| crate::edit::graphic_hit(g, at, tol))
@@ -1012,8 +1024,24 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
                 ed.ask_comment = Some(at);
             }
         }
-        Tool::Line | Tool::Rect | Tool::Circle | Tool::Arc | Tool::Polyline | Tool::Dimension => {
+        Tool::Line | Tool::Rect | Tool::Circle | Tool::Arc | Tool::Polyline | Tool::Dimension | Tool::Cloud => {
             shape_tool(&painter, &resp, open, ed, &xf, &shown, &t, finish, snap_step)
+        }
+        Tool::RevisionTable => {
+            if resp.clicked_by(egui::PointerButton::Primary)
+                && let Some(at) = primary_release_pos(&resp.ctx)
+                    .or(resp.interact_pointer_pos())
+                    .map(|p| snap(shown.mm(p), snap_step))
+            {
+                revision_table_click(open, ed, at);
+            }
+            // The table as it would be placed, under the pointer.
+            if let Some(cur) = ed.cursor {
+                let ghost = Stroke::new(1.5_f32, t.ghost);
+                for s in wc_core::revision::table_shapes(&open.project.meta.revisions, cur) {
+                    paint_shape(&painter, &xf, &s, ghost);
+                }
+            }
         }
     }
 }
@@ -1111,7 +1139,8 @@ fn leave_unpickable_layer(ed: &mut Editor) {
             Layer::Drawings
         }
         Tool::Comment => Layer::Comments,
-        Tool::Select | Tool::Place | Tool::Wire => return,
+        // Revision clouds and the revision table are on no layer.
+        Tool::Select | Tool::Place | Tool::Wire | Tool::Cloud | Tool::RevisionTable => return,
     };
     let Some(why) = ed.layers.refusal(layer) else {
         return;
@@ -1497,7 +1526,8 @@ pub(crate) fn clicks_needed(tool: Tool) -> Option<usize> {
 pub(crate) fn drawn_shape(tool: Tool, pts: &[Point]) -> Option<Shape> {
     match (tool, pts) {
         (Tool::Line, &[a, b]) if a != b => Some(Shape::Line { a, b }),
-        (Tool::Rect, &[a, b]) if a != b => Some(Shape::Rect {
+        // A cloud is shown as the rectangle it goes around while it is drawn.
+        (Tool::Rect | Tool::Cloud, &[a, b]) if a != b => Some(Shape::Rect {
             min: Point::new(a.x.min(b.x), a.y.min(b.y)),
             max: Point::new(a.x.max(b.x), a.y.max(b.y)),
         }),
@@ -1573,6 +1603,8 @@ pub(crate) fn shape_hint(tool: Tool, clicks: usize) -> &'static str {
         (Tool::Arc, 0) => "Click the centre of the arc.",
         (Tool::Arc, 1) => "Click where the arc starts (Esc cancels).",
         (Tool::Arc, _) => "Click where the arc ends; it runs clockwise (Esc cancels).",
+        (Tool::Cloud, 0) => "Click one corner of the area the cloud goes around.",
+        (Tool::Cloud, _) => "Click the opposite corner; the cloud gets the latest revision (Esc cancels).",
         (Tool::Dimension, 0) => "Click the first point to measure from.",
         (Tool::Dimension, 1) => "Click the second point to measure to (Esc cancels).",
         (Tool::Dimension, _) => "Click where the dimension line goes (Esc cancels).",
@@ -1585,9 +1617,33 @@ pub(crate) fn shape_hint(tool: Tool, clicks: usize) -> &'static str {
     }
 }
 
+/// A click with the revision table tool: the page's table goes there (moved when it is on
+/// the page already) and is selected.
+pub(crate) fn revision_table_click(open: &mut Open, ed: &mut Editor, at: Point) {
+    match open.place_revision_table(ed.page, at) {
+        Ok(sel) => {
+            ed.select_only(sel);
+            ed.message = "Revision table placed. Drag it to move it; Delete takes it off.".into();
+        }
+        Err(why) => ed.message = why,
+    }
+}
+
 /// Put the shape drawn from `ed.shape_points` on the page and select it.
 pub(crate) fn finish_shape(open: &mut Open, ed: &mut Editor) {
     let pts = std::mem::take(&mut ed.shape_points);
+    if ed.tool == Tool::Cloud {
+        if let &[a, b] = pts.as_slice() {
+            match open.add_cloud(ed.page, a, b) {
+                Ok(sel) => {
+                    ed.select_only(sel);
+                    ed.message = shape_hint(ed.tool, 0).into();
+                }
+                Err(why) => ed.message = why,
+            }
+        }
+        return;
+    }
     if let Some(shape) = drawn_shape(ed.tool, &pts)
         && let Some(sel) = open.add_graphic(ed.page, shape)
     {
@@ -1930,6 +1986,104 @@ mod tests {
         for &(x, y) in pts {
             shape_click(open, ed, Point::new(x, y));
         }
+    }
+
+    #[test]
+    fn a_revision_is_added_a_cloud_drawn_and_the_table_placed_moved_and_taken_off() {
+        use crate::state::RevisionRow;
+        let (_tmp, mut open) = project();
+        let mut ed = Editor {
+            page: 1,
+            ..Editor::default()
+        };
+        // Without a revision the cloud tool says what to do first and draws nothing.
+        draw(&mut open, &mut ed, Tool::Cloud, &[(20.0, 20.0), (60.0, 40.0)]);
+        assert!(open.project.pages[1].clouds.is_empty());
+        assert!(ed.message.contains("Add a revision first"), "{}", ed.message);
+
+        let name = open.project.meta.name.clone();
+        let row = |letter: &str, text: &str| RevisionRow {
+            letter: letter.into(),
+            date: "2026-11-19".into(),
+            text: text.into(),
+            ..RevisionRow::default()
+        };
+        let mark = open.undo_mark();
+        open.set_project_props(
+            &name,
+            &[],
+            None,
+            Some(&[row("A", "First issue"), row("B", "Pumps added")]),
+        )
+        .unwrap();
+        assert_eq!(open.undo_mark(), mark + 1, "one undo step");
+        assert!(
+            open.set_project_props(&name, &[], None, Some(&[row("A", ""), row("A", "")]))
+                .is_err(),
+            "a letter twice is refused"
+        );
+
+        // Two clicks draw a cloud with the latest revision, selected.
+        let mark = open.undo_mark();
+        draw(&mut open, &mut ed, Tool::Cloud, &[(60.0, 40.0), (20.0, 20.0)]);
+        let clouds = &open.project.pages[1].clouds;
+        assert_eq!(clouds.len(), 1);
+        assert_eq!(
+            (clouds[0].min, clouds[0].max, clouds[0].revision.as_str()),
+            (Point::new(20.0, 20.0), Point::new(60.0, 40.0), "B")
+        );
+        assert_eq!(ed.selection, [Selection::Cloud(0)]);
+        assert_eq!(open.undo_mark(), mark + 1);
+        // Picked on its outline, retagged, moved and removed like a drawing.
+        let page = open.project.pages[1].clone();
+        let c = &page.clouds[0];
+        // A point on its revision tag, above the top-right corner.
+        let tag = (0..200)
+            .map(|k| Point::new(c.max.x, c.min.y - f64::from(k) * 0.1))
+            .find(|p| c.hit(*p, 0.2))
+            .unwrap();
+        assert_eq!(open.hit(&page, tag, 0.2), Some(Selection::Cloud(0)));
+        assert_eq!(
+            open.hit(&page, Point::new(40.0, 30.0), 0.2),
+            None,
+            "inside it is not the cloud"
+        );
+        assert!(open.set_cloud_revision(1, 0, "A"));
+        assert!(!open.set_cloud_revision(1, 0, "C"), "no such revision");
+        assert_eq!(open.project.pages[1].clouds[0].revision, "A");
+        // A revision a cloud carries cannot be removed.
+        let rows = RevisionRow::of(&open.project.meta.revisions);
+        let err = open.set_project_props(&name, &[], None, Some(&rows[1..])).unwrap_err();
+        assert!(err.contains("cloud of revision A"), "{err}");
+        open.move_by(1, &[Selection::Cloud(0)], Point::new(5.0, 5.0));
+        assert_eq!(open.project.pages[1].clouds[0].min, Point::new(25.0, 25.0));
+
+        // The table goes where the tool clicks, and a second click moves it.
+        ed.tool = Tool::RevisionTable;
+        revision_table_click(&mut open, &mut ed, Point::new(200.0, 150.0));
+        revision_table_click(&mut open, &mut ed, Point::new(210.0, 160.0));
+        assert_eq!(open.project.pages[1].revision_table, Some(Point::new(210.0, 160.0)));
+        assert_eq!(ed.selection, [Selection::RevisionTable]);
+        let page = open.project.pages[1].clone();
+        assert_eq!(
+            open.hit(&page, Point::new(212.0, 162.0), 1.0),
+            Some(Selection::RevisionTable)
+        );
+        assert!(open.select_all(1).contains(&Selection::RevisionTable));
+
+        // Saved and opened again, both are kept.
+        open.save().unwrap();
+        let mut again = Open::load(&open.dir).unwrap();
+        assert_eq!(again.project.pages[1].clouds, open.project.pages[1].clouds);
+        assert_eq!(again.project.pages[1].revision_table, Some(Point::new(210.0, 160.0)));
+        assert_eq!(again.project.meta.revisions.len(), 2);
+
+        // Delete takes both off; Undo puts them back.
+        again.delete_many(1, &[Selection::Cloud(0), Selection::RevisionTable]);
+        assert!(again.project.pages[1].clouds.is_empty() && again.project.pages[1].revision_table.is_none());
+        assert!(again.undo());
+        assert_eq!(again.project.pages[1].clouds.len(), 1);
+        assert!(again.project.pages[1].revision_table.is_some());
     }
 
     #[test]

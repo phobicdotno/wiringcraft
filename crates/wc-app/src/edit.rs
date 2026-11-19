@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use wc_core::geom::{Align, Point, Rotation, Shape};
-use wc_core::{Device, DeviceTag, Endpoint, Page, PlacedSymbol, Wire};
+use wc_core::{Device, DeviceTag, Endpoint, Page, PlacedSymbol, RevisionCloud, Wire};
 
 use crate::state::{Open, Selection};
 
@@ -94,7 +94,7 @@ fn ids(sel: &[Selection]) -> (BTreeSet<&str>, BTreeSet<&str>) {
         match s {
             Selection::Symbol(id) => syms.insert(id.as_str()),
             Selection::Wire(id) => wires.insert(id.as_str()),
-            Selection::Graphic(_) => false,
+            Selection::Graphic(_) | Selection::Cloud(_) | Selection::RevisionTable => false,
         };
     }
     (syms, wires)
@@ -203,6 +203,15 @@ pub fn restore_graphics(items: &mut Vec<Lost>, sel: &mut Vec<Selection>, now: &[
         }
         false
     });
+}
+
+fn cloud_ids(sel: &[Selection]) -> BTreeSet<usize> {
+    sel.iter()
+        .filter_map(|s| match s {
+            Selection::Cloud(i) => Some(*i),
+            _ => None,
+        })
+        .collect()
 }
 
 fn graphic_ids(sel: &[Selection]) -> BTreeSet<usize> {
@@ -370,6 +379,8 @@ impl Open {
             .map(|s| Selection::Symbol(s.id.clone()))
             .chain(p.wires.iter().map(|w| Selection::Wire(w.id.clone())))
             .chain((0..p.graphics.len()).map(Selection::Graphic))
+            .chain((0..p.clouds.len()).map(Selection::Cloud))
+            .chain(p.revision_table.map(|_| Selection::RevisionTable))
             .collect()
     }
 
@@ -402,7 +413,82 @@ impl Open {
                 out.push(Selection::Graphic(i));
             }
         }
+        for (i, c) in p.clouds.iter().enumerate() {
+            if inside(c.min) && inside(c.max) {
+                out.push(Selection::Cloud(i));
+            }
+        }
+        if let Some((a, b)) = self.revision_table_bounds(p)
+            && inside(a)
+            && inside(b)
+        {
+            out.push(Selection::RevisionTable);
+        }
         out
+    }
+
+    /// The corners of a page's revision table, when it shows one.
+    pub fn revision_table_bounds(&self, page: &Page) -> Option<(Point, Point)> {
+        let at = page.revision_table?;
+        let (w, h) = wc_core::revision::table_size(self.project.meta.revisions.len());
+        Some((at, Point::new(at.x + w, at.y + h)))
+    }
+
+    /// Draw a revision cloud around the rectangle `a`-`b` on a page, tagged with the latest
+    /// revision, as one undo step, and return its selection. Refused with the reason when the
+    /// project has no revision yet, the area is empty or someone else has the page open.
+    pub fn add_cloud(&mut self, page: usize, a: Point, b: Point) -> Result<Selection, String> {
+        let id = self.project.pages.get(page).ok_or("No such page.")?.id.clone();
+        if let Some(why) = self.held_reason(page) {
+            return Err(why);
+        }
+        if self.project.latest_revision().is_none() {
+            return Err("Add a revision first: File → Project properties, Revisions.".into());
+        }
+        if !RevisionCloud::new(a, b, "").is_valid() {
+            return Err("A cloud needs an area: click two different corners.".into());
+        }
+        self.checkpoint();
+        let i = self.project.add_cloud(&id, a, b, None).map_err(|e| e.to_string())?;
+        Ok(Selection::Cloud(i))
+    }
+
+    /// Tag cloud `index` on a page with the revision `letter`, as one undo step. True when it
+    /// changed.
+    pub fn set_cloud_revision(&mut self, page: usize, index: usize, letter: &str) -> bool {
+        let Some(letter) = self.project.revision(letter).map(|r| r.letter.clone()) else {
+            return false;
+        };
+        let same = self
+            .project
+            .pages
+            .get(page)
+            .and_then(|p| p.clouds.get(index))
+            .is_none_or(|c| c.revision == letter);
+        if same || self.held_reason(page).is_some() {
+            return false;
+        }
+        self.checkpoint();
+        if let Some(c) = self.project.pages.get_mut(page).and_then(|p| p.clouds.get_mut(index)) {
+            c.revision = letter;
+        }
+        true
+    }
+
+    /// Show the page's revision table with its top-left corner at `at` (moving it when it is
+    /// there already), as one undo step, and return its selection.
+    pub fn place_revision_table(&mut self, page: usize, at: Point) -> Result<Selection, String> {
+        let id = self.project.pages.get(page).ok_or("No such page.")?.id.clone();
+        if let Some(why) = self.held_reason(page) {
+            return Err(why);
+        }
+        if self.project.pages[page].revision_table != Some(at) {
+            self.checkpoint();
+            self.project
+                .set_revision_table(&id, Some(at))
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(Selection::RevisionTable)
     }
 
     /// Add a free drawing to a page and return its selection. Refused (None) on a page someone else has open in a shared session.
@@ -571,6 +657,17 @@ impl Open {
                 *g = g.translate(d);
             }
         }
+        for i in cloud_ids(sel) {
+            if let Some(c) = p.clouds.get_mut(i) {
+                c.min = c.min + d;
+                c.max = c.max + d;
+            }
+        }
+        if sel.contains(&Selection::RevisionTable)
+            && let Some(at) = &mut p.revision_table
+        {
+            *at = *at + d;
+        }
         self.edited();
     }
 
@@ -597,6 +694,15 @@ impl Open {
             i += 1;
             !gone.contains(&(i - 1))
         });
+        let gone = cloud_ids(sel);
+        let mut i = 0;
+        p.clouds.retain(|_| {
+            i += 1;
+            !gone.contains(&(i - 1))
+        });
+        if sel.contains(&Selection::RevisionTable) {
+            p.revision_table = None;
+        }
     }
 
     /// Rotate the selected symbols 90° each, in one undo step.

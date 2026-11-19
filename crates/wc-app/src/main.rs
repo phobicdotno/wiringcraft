@@ -65,6 +65,10 @@ enum Dialog {
         /// The locations as the dialog opened with them: when they are unchanged, OK leaves the
         /// project's own (an assistant command may have changed them meanwhile).
         loaded_locations: Vec<(String, String)>,
+        /// The project's revisions, edited in place; left alone on OK while unchanged, as
+        /// the locations are.
+        revisions: Vec<state::RevisionRow>,
+        loaded_revisions: Vec<state::RevisionRow>,
     },
     /// The cover page form: changes show on the page as they are typed; `since` is the undo
     /// mark from when it opened, so OK keeps them as one undo step and Cancel takes them back.
@@ -281,6 +285,8 @@ impl chrome::Status for StatusView<'_> {
             Action::ArcTool => self.ed.tool == Tool::Arc,
             Action::PolylineTool => self.ed.tool == Tool::Polyline,
             Action::DimensionTool => self.ed.tool == Tool::Dimension,
+            Action::CloudTool => self.ed.tool == Tool::Cloud,
+            Action::RevisionTableTool => self.ed.tool == Tool::RevisionTable,
             Action::ToggleGrid => self.prefs.show_grid,
             Action::Layers => self.show_layers,
             Action::ToggleAutoWire => self.prefs.auto_wire,
@@ -677,6 +683,8 @@ impl App {
             | Action::ArcTool
             | Action::PolylineTool
             | Action::DimensionTool
+            | Action::CloudTool
+            | Action::RevisionTableTool
             | Action::CommentTool => {
                 self.ed.tool = match a {
                     Action::TextTool => Tool::Text,
@@ -686,6 +694,8 @@ impl App {
                     Action::ArcTool => Tool::Arc,
                     Action::PolylineTool => Tool::Polyline,
                     Action::DimensionTool => Tool::Dimension,
+                    Action::CloudTool => Tool::Cloud,
+                    Action::RevisionTableTool => Tool::RevisionTable,
                     _ => Tool::Rect,
                 };
                 self.ed.wire = None;
@@ -696,6 +706,8 @@ impl App {
                     Action::CircleTool => "Click the centre of the circle.",
                     Action::ArcTool => "Click the centre of the arc.",
                     Action::DimensionTool => "Click the first point to measure from.",
+                    Action::CloudTool => "Click one corner of the area the cloud goes around.",
+                    Action::RevisionTableTool => "Click where the revision table's top-left corner goes.",
                     _ => "Click the first point.",
                 }
                 .into();
@@ -895,6 +907,8 @@ impl App {
                     fields: form_fields(&open.project.meta.title_block),
                     loaded_locations: locations.clone(),
                     locations,
+                    revisions: state::RevisionRow::of(&open.project.meta.revisions),
+                    loaded_revisions: state::RevisionRow::of(&open.project.meta.revisions),
                 });
             }
             Action::CoverPage => {
@@ -1613,6 +1627,8 @@ impl App {
                     fields,
                     locations,
                     loaded_locations,
+                    revisions,
+                    loaded_revisions,
                 } => {
                     egui::Grid::new("projprops")
                         .num_columns(2)
@@ -1664,7 +1680,51 @@ impl App {
                     if ui.button("Add location").clicked() {
                         locations.push((String::new(), String::new()));
                     }
-                    let bad = wc_core::project::location_rows(locations).err();
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Revisions").strong());
+                    let mut drop = None;
+                    egui::ScrollArea::vertical()
+                        .id_salt("projrevisions-scroll")
+                        .max_height(180.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            egui::Grid::new("projrevisions")
+                                .num_columns(5)
+                                .spacing([8.0, 6.0])
+                                .show(ui, |ui| {
+                                    for h in ["Rev.", "Date", "Description", "By", ""] {
+                                        ui.strong(h);
+                                    }
+                                    ui.end_row();
+                                    for (k, r) in revisions.iter_mut().enumerate() {
+                                        // A listed revision keeps its letter: its clouds carry it.
+                                        let new = r.was.trim().is_empty();
+                                        ui.add_enabled(
+                                            new,
+                                            egui::TextEdit::singleline(&mut r.letter).hint_text("A").desired_width(40.0),
+                                        );
+                                        ui.add(egui::TextEdit::singleline(&mut r.date).hint_text("2026-11-19").desired_width(90.0));
+                                        ui.add(egui::TextEdit::singleline(&mut r.text).hint_text("What changed").desired_width(200.0));
+                                        ui.add(egui::TextEdit::singleline(&mut r.author).desired_width(60.0));
+                                        if ui.button("Remove").clicked() {
+                                            drop = Some(k);
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                    if let Some(k) = drop {
+                        revisions.remove(k);
+                    }
+                    if ui.button("Add revision").clicked() {
+                        revisions.push(state::RevisionRow::default());
+                    }
+                    let rev_bad = if revisions == loaded_revisions {
+                        None
+                    } else {
+                        self.open.as_ref().and_then(|o| o.revised(revisions).err())
+                    };
+                    let bad = wc_core::project::location_rows(locations).err().or(rev_bad);
                     if let Some(why) = &bad {
                         ui.colored_label(theme::Theme::of(ui.ctx()).error, why);
                     }
@@ -1677,9 +1737,10 @@ impl App {
                             let f = fields.clone();
                             // Untouched locations are left as the project has them now.
                             let l = (locations != loaded_locations).then(|| locations.clone());
+                            let r = (revisions != loaded_revisions).then(|| revisions.clone());
                             then = Some(Box::new(move |app: &mut App| {
                                 if let Some(o) = app.open.as_mut()
-                                    && let Err(e) = o.set_project_props(&n, &f, l.as_deref())
+                                    && let Err(e) = o.set_project_props(&n, &f, l.as_deref(), r.as_deref())
                                 {
                                     app.ed.message = e;
                                 }

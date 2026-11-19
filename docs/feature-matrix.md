@@ -229,7 +229,7 @@ For the other areas, the chapter to read in each help is:
 | Function | EPLAN | SWE | WiringCraft | Triage |
 |---|---|---|---|---|
 | Revision tracking and compare | yes | yes | yes: git history, subway map, change lists | done |
-| Revision marks (clouds, revision table on pages) | yes | yes | no | later |
+| Revision marks (clouds, revision table on pages) | yes | yes | yes: revisions listed in the project properties, revision clouds tagged with the latest revision and the revision table drawn on pages and in the PDF, made in the app (Cloud and Revision table tools) or with `wiringcraft revision` | done (#265, #377) |
 | Review comments on pages | yes (comments in PDF) | partly | yes | done |
 | Several people on one project at once | yes (multi-user) | yes (server database) | share and join in the app, page locks | todo (#43: #77, #78) |
 | User rights per project | yes | yes | no | not planned: git hosting already controls who can change a project |

@@ -40,6 +40,10 @@ pub enum Tool {
     Polyline,
     Dimension,
     Comment,
+    /// A revision cloud: two corners.
+    Cloud,
+    /// The page's revision table: one click for its top-left corner.
+    RevisionTable,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -48,6 +52,10 @@ pub enum Selection {
     Wire(String),
     /// A free drawing on the page (line, rectangle, circle, text), by its index in `graphics`.
     Graphic(usize),
+    /// A revision cloud, by its index in the page's `clouds`.
+    Cloud(usize),
+    /// The page's revision table.
+    RevisionTable,
 }
 
 /// One part of a wire's spec, edited on its own.
@@ -106,6 +114,34 @@ pub struct MacroEntry {
     pub value_sets: Vec<String>,
     /// Why the file could not be read, if it could not.
     pub error: Option<String>,
+}
+
+/// One revision as the project properties dialog edits it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RevisionRow {
+    /// Its letter when the dialog opened; empty for a revision added in the dialog, whose
+    /// letter is typed. A listed revision keeps its letter: clouds are tagged with it.
+    pub was: String,
+    pub letter: String,
+    pub date: String,
+    pub text: String,
+    pub author: String,
+}
+
+impl RevisionRow {
+    /// The rows for the project's revisions.
+    pub fn of(revisions: &[wc_core::Revision]) -> Vec<RevisionRow> {
+        revisions
+            .iter()
+            .map(|r| RevisionRow {
+                was: r.letter.clone(),
+                letter: r.letter.clone(),
+                date: r.date.clone(),
+                text: r.text.clone(),
+                author: r.author.clone(),
+            })
+            .collect()
+    }
 }
 
 /// What [`Open::number_wires`] did.
@@ -2044,11 +2080,13 @@ impl Open {
         name: &str,
         fields: &[(String, String)],
         locations: Option<&[(String, String)]>,
+        revisions: Option<&[RevisionRow]>,
     ) -> Result<(), String> {
         let name = name.trim();
         if name.is_empty() {
             return Err("The project name cannot be empty.".into());
         }
+        let revisions = revisions.map(|rows| self.revised(rows)).transpose()?;
         // The copy below replaces the meta: jumpers follow the change before it first.
         self.follow_terminals();
         let mut meta = self.project.meta.clone();
@@ -2057,12 +2095,45 @@ impl Open {
         if let Some(locations) = locations {
             meta.locations = wc_core::project::location_rows(locations)?;
         }
+        if let Some(revisions) = revisions {
+            meta.revisions = revisions;
+        }
         if meta == self.project.meta {
             return Ok(());
         }
         self.checkpoint();
         self.project.meta = meta;
         Ok(())
+    }
+
+    /// The project's revisions as the rows of the properties dialog give them: a row with
+    /// the letter it was loaded with (`was`) changes that revision, a row without one adds a
+    /// revision after the others, and a revision no row has is removed. Refused with the reason
+    /// when a letter is empty, taken or unprintable, or a removed revision still has a cloud.
+    pub fn revised(&self, rows: &[RevisionRow]) -> Result<Vec<wc_core::Revision>, String> {
+        let mut p = Project::new("");
+        p.meta = self.project.meta.clone();
+        p.pages = self.project.pages.clone();
+        let kept: Vec<&str> = rows.iter().map(|r| r.was.trim()).filter(|w| !w.is_empty()).collect();
+        let gone: Vec<String> = p
+            .meta
+            .revisions
+            .iter()
+            .map(|r| r.letter.clone())
+            .filter(|l| !kept.contains(&l.as_str()))
+            .collect();
+        let err = |e: wc_core::Error| e.to_string();
+        for l in gone {
+            p.remove_revision(&l).map_err(err)?;
+        }
+        for r in rows {
+            if r.was.trim().is_empty() {
+                p.add_revision(&r.letter, &r.date, &r.text, &r.author).map_err(err)?;
+            } else {
+                p.edit_revision(&r.was, &r.date, &r.text, &r.author).map_err(err)?;
+            }
+        }
+        Ok(p.meta.revisions)
     }
 
     /// Replace the project's check rules ([`wc_core::check_rule`]). One undo step; nothing
@@ -4138,16 +4209,16 @@ pub(crate) mod tests {
     #[test]
     fn cancel_restores_opening_props_after_undo_and_other_property_edits() {
         let (_tmp, mut o) = project();
-        o.set_project_props("Opening", &fields(&[("customer", "Opening")]), None)
+        o.set_project_props("Opening", &fields(&[("customer", "Opening")]), None, None)
             .unwrap();
         let since = o.start_live_form();
         let before = o.props_snapshot();
         o.set_project_props_live("Form", &fields(&[("customer", "Form")]));
         assert!(o.undo());
         assert!(o.undo());
-        o.set_project_props("First", &fields(&[("customer", "First")]), None)
+        o.set_project_props("First", &fields(&[("customer", "First")]), None, None)
             .unwrap();
-        o.set_project_props("Second", &fields(&[("customer", "Second")]), None)
+        o.set_project_props("Second", &fields(&[("customer", "Second")]), None, None)
             .unwrap();
         // The last step looks like a form step but is not the form's: Cancel still restores
         // what the form opened with.
@@ -4189,7 +4260,7 @@ pub(crate) mod tests {
         o.form_step = None;
         o.start_live_form();
         o.set_project_props_live("Test", &fields(&[("customer", "A")]));
-        o.set_project_props("Test", &fields(&[("customer", "X")]), None)
+        o.set_project_props("Test", &fields(&[("customer", "X")]), None, None)
             .unwrap();
         o.set_project_props_live("Test", &fields(&[("customer", "B")]));
         assert!(o.undo());
@@ -4766,10 +4837,11 @@ pub(crate) mod tests {
     #[test]
     fn project_props_drop_empty_title_block_fields() {
         let (_tmp, mut o) = project();
-        assert!(o.set_project_props(" ", &[], None).is_err());
+        assert!(o.set_project_props(" ", &[], None, None).is_err());
         o.set_project_props(
             "Pump station",
             &[("customer".into(), "Acme".into()), ("revision".into(), " ".into())],
+            None,
             None,
         )
         .unwrap();
@@ -5044,26 +5116,34 @@ pub(crate) mod tests {
                 .map(|(a, b)| (a.to_string(), b.to_string()))
                 .collect::<Vec<_>>()
         };
-        o.set_project_props(&name, &[], Some(&rows(&[("+L2", "Room"), ("", ""), ("L1", "Cabinet")])))
-            .unwrap();
+        o.set_project_props(
+            &name,
+            &[],
+            Some(&rows(&[("+L2", "Room"), ("", ""), ("L1", "Cabinet")])),
+            None,
+        )
+        .unwrap();
         assert_eq!(o.undo_mark(), mark + 1);
         let paths: Vec<&str> = o.project.meta.locations.iter().map(|l| l.path.as_str()).collect();
         assert_eq!(paths, ["L1", "L2"]);
-        assert!(o.set_project_props(&name, &[], Some(&rows(&[("+L1-K1", "")]))).is_err());
         assert!(
-            o.set_project_props(&name, &[], Some(&rows(&[("L1", "a"), ("+L1", "b")])))
+            o.set_project_props(&name, &[], Some(&rows(&[("+L1-K1", "")])), None)
+                .is_err()
+        );
+        assert!(
+            o.set_project_props(&name, &[], Some(&rows(&[("L1", "a"), ("+L1", "b")])), None)
                 .is_err(),
             "twice"
         );
         assert!(
-            o.set_project_props(&name, &[], Some(&rows(&[("", "Cabinet")])))
+            o.set_project_props(&name, &[], Some(&rows(&[("", "Cabinet")])), None)
                 .is_err(),
             "no path"
         );
         assert_eq!(o.project.meta.locations.len(), 2, "a bad row changes nothing");
-        o.set_project_props(&name, &[], None).unwrap();
+        o.set_project_props(&name, &[], None, None).unwrap();
         assert_eq!(o.project.meta.locations.len(), 2, "None keeps them");
-        o.set_project_props(&name, &[], Some(&[])).unwrap();
+        o.set_project_props(&name, &[], Some(&[]), None).unwrap();
         assert!(o.project.meta.locations.is_empty());
         assert!(o.undo());
         assert_eq!(o.project.meta.locations.len(), 2);

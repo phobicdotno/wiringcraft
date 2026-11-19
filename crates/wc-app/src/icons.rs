@@ -24,6 +24,8 @@ pub enum Icon {
     Arc,
     Polyline,
     Dimension,
+    Cloud,
+    RevisionTable,
     Copy,
     Cut,
     Paste,
@@ -254,6 +256,40 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32, accent: Color32) {
                     Stroke::NONE,
                 ));
             }
+        }
+        Icon::Cloud => {
+            // Scallops round a rectangle, and the revision triangle on top.
+            for (x, y) in [
+                (6.0, 9.0),
+                (12.0, 9.0),
+                (18.0, 9.0),
+                (6.0, 19.0),
+                (12.0, 19.0),
+                (18.0, 19.0),
+            ] {
+                arc(
+                    x,
+                    y,
+                    3.0,
+                    if y < 12.0 { 180.0 } else { 0.0 },
+                    if y < 12.0 { 360.0 } else { 180.0 },
+                );
+            }
+            arc(3.0, 14.0, 5.0, 90.0, 270.0);
+            arc(21.0, 14.0, 5.0, 270.0, 450.0);
+            poly(&[(12.0, 1.0), (8.5, 6.0), (15.5, 6.0)], true);
+        }
+        Icon::RevisionTable => {
+            p.rect_stroke(
+                Rect::from_min_max(at(3.0, 5.0), at(21.0, 19.0)),
+                0.0,
+                st,
+                eframe::egui::StrokeKind::Inside,
+            );
+            for y in [9.5, 14.0] {
+                p.line_segment([at(3.0, y), at(21.0, y)], thin);
+            }
+            p.line_segment([at(8.0, 5.0), at(8.0, 19.0)], thin);
         }
         Icon::Mirror => {
             p.line_segment([at(12.0, 2.0), at(12.0, 22.0)], thin);

@@ -24,6 +24,8 @@ pub enum Action {
     ArcTool,
     PolylineTool,
     DimensionTool,
+    CloudTool,
+    RevisionTableTool,
     Delete,
     Rotate,
     Mirror,
@@ -104,6 +106,8 @@ impl Action {
                 | Action::ArcTool
                 | Action::PolylineTool
                 | Action::DimensionTool
+                | Action::CloudTool
+                | Action::RevisionTableTool
                 | Action::Delete
                 | Action::Rotate
                 | Action::Mirror
@@ -142,6 +146,8 @@ impl Action {
         Action::ArcTool,
         Action::PolylineTool,
         Action::DimensionTool,
+        Action::CloudTool,
+        Action::RevisionTableTool,
         Action::Delete,
         Action::Rotate,
         Action::Mirror,
@@ -319,6 +325,18 @@ impl Action {
                 "Dimension",
                 "Draw a dimension: click both points to measure, then where the dimension line goes",
                 Icon::Dimension,
+                "",
+            ),
+            Action::CloudTool => i(
+                "Revision cloud",
+                "Draw a revision cloud with the latest revision: click two corners",
+                Icon::Cloud,
+                "",
+            ),
+            Action::RevisionTableTool => i(
+                "Revision table",
+                "Place the page's revision table: click its top-left corner (Delete takes it off)",
+                Icon::RevisionTable,
                 "",
             ),
             Action::Delete => i("Delete", "Delete the selection", Icon::Delete, "Del"),
@@ -561,6 +579,8 @@ pub const TOOLBAR: &[&[Action]] = &[
         Action::ArcTool,
         Action::PolylineTool,
         Action::DimensionTool,
+        Action::CloudTool,
+        Action::RevisionTableTool,
     ],
     &[
         Action::AddPage,
@@ -647,6 +667,8 @@ pub const RIBBON: &[(&str, &[RibbonGroup])] = &[
                     Action::ArcTool,
                     Action::PolylineTool,
                     Action::DimensionTool,
+                    Action::CloudTool,
+                    Action::RevisionTableTool,
                 ],
             ),
         ],
