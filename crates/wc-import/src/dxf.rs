@@ -418,12 +418,7 @@ fn shapes(
                 let (loops, bad): (Vec<_>, Vec<_>) = hatch_loops(e)
                     .into_iter()
                     .partition(|(lp, _)| lp.iter().all(|pt| placed(*pt)));
-                // Spline edges joined straight are said only for loops that are drawn.
-                let fit_failed: usize = loops.iter().map(|(_, n)| n).sum();
-                if fit_failed > 0 {
-                    *skipped.entry(SPLINE_FIT_FAILED.to_owned()).or_default() += fit_failed;
-                }
-                let loops: Vec<_> = loops.into_iter().map(|(lp, _)| lp).collect();
+                let (loops, fit_failed): (Vec<_>, Vec<usize>) = loops.into_iter().unzip();
                 if !bad.is_empty() {
                     *skipped.entry(HATCH_NOT_NUMBERS.to_owned()).or_default() += 1;
                     solid = false;
@@ -432,9 +427,15 @@ fn shapes(
                 // Style (75): 0 fills every other level, 1 only the outermost area, 2 ignores
                 // islands.
                 let style = hatch_style(e);
+                // Spline edges joined straight are said only for loops that are drawn: placed,
+                // and kept by the fill style.
+                let mut drawn_failed: usize = fit_failed.iter().sum();
                 let (outlines, filled) = if solid {
-                    match with_holes(&loops, style) {
-                        Some(o) => (o, true),
+                    match with_holes_kept(&loops, style) {
+                        Some((o, kept)) => {
+                            drawn_failed = fit_failed.iter().zip(&kept).filter(|(_, k)| **k).map(|(n, _)| n).sum();
+                            (o, true)
+                        }
                         None => {
                             // Too many holes to cut in: the boundaries, not a wrong fill.
                             *skipped.entry(HATCH_UNFILLED.to_owned()).or_default() += 1;
@@ -444,6 +445,9 @@ fn shapes(
                 } else {
                     (loops, false)
                 };
+                if drawn_failed > 0 {
+                    *skipped.entry(SPLINE_FIT_FAILED.to_owned()).or_default() += drawn_failed;
+                }
                 for lp in outlines {
                     if let Some(s) = polyline(lp.into_iter().map(|(x, y)| q(x, y)).collect(), true, filled) {
                         out.push((layer.clone(), s));
@@ -1431,14 +1435,32 @@ fn crosses(p: (f64, f64), q: (f64, f64), c: (f64, f64), d: (f64, f64)) -> bool {
     ((d1 > eps && d2 < -eps) || (d1 < -eps && d2 > eps)) && ((d3 > eps && d4 < -eps) || (d3 < -eps && d4 > eps))
 }
 
+/// A closed boundary, as DXF points.
+type Loop = Vec<(f64, f64)>;
+
+/// [`with_holes_kept`] without the loops it kept.
+#[cfg(test)]
+fn with_holes(loops: &[Vec<(f64, f64)>], style: i64) -> Option<Vec<Vec<(f64, f64)>>> {
+    with_holes_kept(loops, style).map(|(out, _)| out)
+}
+
 /// The loops of a solid fill as outlines that fill right with the non-zero and even-odd rules
 /// alike: every loop inside an odd number of others is a hole, cut into the loop just around it
 /// along the shortest bridge, so one outline goes round the solid part and back round the hole.
-/// `None` when the loops are too many or too big to work out within the budgets: a fill that
-/// covered the holes would be wrong.
-fn with_holes(loops: &[Vec<(f64, f64)>], style: i64) -> Option<Vec<Vec<(f64, f64)>>> {
-    let mut loops: Vec<Vec<(f64, f64)>> = loops.iter().filter(|l| l.len() >= 3).cloned().collect();
-    loops.sort_by(|a, b| area2(b).abs().total_cmp(&area2(a).abs()));
+/// Also, for each loop given, whether the fill style keeps it (Outer drops islands inside
+/// islands, Ignore every island; a loop of fewer than three points is dropped). `None` when the
+/// loops are too many or too big to work out within the budgets: a fill that covered the holes
+/// would be wrong.
+fn with_holes_kept(loops: &[Vec<(f64, f64)>], style: i64) -> Option<(Vec<Loop>, Vec<bool>)> {
+    let mut kept = vec![false; loops.len()];
+    let mut order: Vec<usize> = (0..loops.len())
+        .filter(|&i| loops.get(i).is_some_and(|l| l.len() >= 3))
+        .collect();
+    order.sort_by(|&a, &b| {
+        let area = |i: usize| loops.get(i).map_or(0.0, |l| area2(l).abs());
+        area(b).total_cmp(&area(a))
+    });
+    let loops: Vec<Vec<(f64, f64)>> = order.iter().filter_map(|&i| loops.get(i).cloned()).collect();
     // For each loop, the smallest loop around it (bigger, so earlier) and its nesting depth.
     let mut parent: Vec<Option<usize>> = Vec::with_capacity(loops.len());
     let mut depth: Vec<usize> = Vec::with_capacity(loops.len());
@@ -1469,6 +1491,9 @@ fn with_holes(loops: &[Vec<(f64, f64)>], style: i64) -> Option<Vec<Vec<(f64, f64
         let level = *depth.get(i)?;
         if (style == 1 && level >= 2) || (style == 2 && level >= 1) {
             continue;
+        }
+        if let Some(k) = order.get(i).and_then(|&o| kept.get_mut(o)) {
+            *k = true;
         }
         let mut lp = lp.clone();
         if level.is_multiple_of(2) {
@@ -1542,7 +1567,7 @@ fn with_holes(loops: &[Vec<(f64, f64)>], style: i64) -> Option<Vec<Vec<(f64, f64
         cut.extend(o.get(a..)?);
         *o = cut;
     }
-    Some(outer.into_iter().flatten().collect())
+    Some((outer.into_iter().flatten().collect(), kept))
 }
 
 /// One warning per entity kind that was not read.
@@ -2784,6 +2809,30 @@ mod tests {
             &mut budget,
         );
         assert_eq!(skipped.get(HATCH_NOT_NUMBERS), Some(&1), "{skipped:?}");
+        assert!(!skipped.contains_key(SPLINE_FIT_FAILED), "{skipped:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_spline_edge_on_an_island_the_style_ignores_is_not_said() -> Result<()> {
+        // A solid hatch: a big square, and inside it an island made of a spline edge whose fit
+        // points cannot be interpolated, closed by a line.
+        let hatch = |style: &str| {
+            format!(
+                "0\nHATCH\n2\nSOLID\n70\n1\n75\n{style}\n91\n2\n\
+                 92\n3\n72\n0\n73\n1\n93\n4\n10\n-1e17\n20\n-1e17\n10\n1e17\n20\n-1e17\n\
+                 10\n1e17\n20\n1e17\n10\n-1e17\n20\n1e17\n97\n0\n\
+                 92\n16\n93\n2\n72\n4\n94\n3\n73\n0\n74\n0\n95\n0\n96\n0\n97\n4\n\
+                 11\n1\n21\n1\n11\n1e16\n21\n1\n11\n1e16\n21\n2\n11\n1\n21\n2\n\
+                 72\n1\n10\n1\n20\n2\n11\n1\n21\n1\n97\n0\n"
+            )
+        };
+        // Normal style: the island is a hole in the fill, and its spline is said.
+        let (_, skipped) = drawn(&hatch("0"), "")?;
+        assert_eq!(skipped.get(SPLINE_FIT_FAILED), Some(&1), "{skipped:?}");
+        // Ignore style: the island is not drawn, so neither is its spline.
+        let (g, skipped) = drawn(&hatch("2"), "")?;
+        assert_eq!(g.len(), 1, "only the outer square");
         assert!(!skipped.contains_key(SPLINE_FIT_FAILED), "{skipped:?}");
         Ok(())
     }
