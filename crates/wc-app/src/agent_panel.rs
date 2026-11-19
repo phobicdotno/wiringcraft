@@ -35,7 +35,7 @@ impl App {
             }
         };
         let text = std::mem::take(&mut self.assistant.input);
-        let context = self.agent_context();
+        let context = self.agent_context_to_send();
         let ok = if self.uses_login() {
             self.login_send(ctx, &text, &images, &context)
         } else {
