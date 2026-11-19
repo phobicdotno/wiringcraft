@@ -1812,6 +1812,34 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
     Ok((make_symbol(id, name, graphics, pins)?, skipped_warnings(skipped)))
 }
 
+/// Import a maker's outline drawing (usually the front view from its CAE data) as a part's
+/// footprint for cabinet layouts (#312). Units are taken as mm at 1:1; every entity WiringCraft
+/// can read is kept, moved so the drawing's top-left corner is at (0, 0), and the drawing's
+/// extents become the footprint's width and height. Warnings name the kinds of entity not read.
+pub fn footprint(text: &str) -> Result<(wc_core::Footprint, Vec<String>)> {
+    let d = parse(text)?;
+    let mut raw = Vec::new();
+    let mut points = Vec::new();
+    let mut skipped = BTreeMap::new();
+    shapes(
+        &d,
+        &d.entities,
+        Xf::ID,
+        1.0,
+        0,
+        &|_| false,
+        &mut raw,
+        &mut points,
+        &mut skipped,
+        &mut { MAX_DRAWN },
+    );
+    let graphics: Vec<Shape> = raw.into_iter().map(|(_, s)| s).collect();
+    let footprint = wc_core::Footprint::from_shapes(graphics).ok_or_else(|| {
+        Error::Format("the drawing has no outline WiringCraft can read, or it is not a usable size".into())
+    })?;
+    Ok((footprint, skipped_warnings(skipped)))
+}
+
 /// The result of importing a drawing onto a page.
 #[derive(Debug, Default)]
 pub struct ImportedPage {
@@ -1968,6 +1996,30 @@ mod tests {
         assert_eq!(p.symbols.len(), 1);
         assert_eq!(p.symbols[0].tag.as_ref().map(|t| t.to_string()).as_deref(), Some("-K7"));
         assert_eq!(p.graphics.len(), 3, "logo exploded into two lines plus the polyline");
+        Ok(())
+    }
+
+    #[test]
+    fn a_maker_outline_becomes_a_footprint_at_its_real_size() -> Result<()> {
+        // A 22.5 x 100 mm module drawn with its lower-left corner at (500, 300), a screw circle
+        // near the top, and a 3D face that is not read.
+        let ents = "0\nLWPOLYLINE\n8\nOUTLINE\n90\n4\n70\n1\n10\n500\n20\n300\n10\n522.5\n20\n300\n10\n522.5\n20\n400\n10\n500\n20\n400\n\
+                    0\nCIRCLE\n8\n0\n10\n511.25\n20\n395\n40\n2\n\
+                    0\n3DFACE\n8\n0\n10\n0\n20\n0\n30\n0\n";
+        let (f, warnings) = footprint(&dxf(ents, ""))?;
+        assert!((f.width - 22.5).abs() < 1e-9, "{}", f.width);
+        assert!((f.height - 100.0).abs() < 1e-9, "{}", f.height);
+        assert_eq!(f.shapes.len(), 2);
+        let Shape::Circle { center, .. } = &f.shapes[1] else {
+            unreachable!("the screw is a circle")
+        };
+        assert!(
+            (center.x - 11.25).abs() < 1e-9 && (center.y - 5.0).abs() < 1e-9,
+            "{center:?}"
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(footprint(&dxf("", "")).is_err(), "an empty drawing is refused");
+        assert!(footprint("not a dxf").is_err());
         Ok(())
     }
 

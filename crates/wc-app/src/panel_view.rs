@@ -2,29 +2,13 @@
 //! drawn to scale. Devices are picked and dragged with the primary button; the wheel zooms and
 //! the middle or secondary button pans, as on the schematic canvas.
 
-use eframe::egui::{self, Align2, FontId, Pos2, Rect, Sense, Stroke, Vec2};
+use eframe::egui::{self, Align2, FontId, Rect, Sense, Stroke, Vec2};
 use wc_core::Point;
 use wc_core::panel::PanelItem;
 
-use crate::canvas::Editor;
+use crate::canvas::{Editor, Xf};
 use crate::state::Open;
 use crate::theme;
-
-/// Screen mapping: millimetres on the plate to points on screen.
-struct Xf {
-    origin: Pos2,
-    zoom: f32,
-}
-
-impl Xf {
-    fn s(&self, p: Point) -> Pos2 {
-        self.origin + Vec2::new(p.x as f32, p.y as f32) * self.zoom
-    }
-    fn mm(&self, p: Pos2) -> Point {
-        let v = (p - self.origin) / self.zoom;
-        Point::new(f64::from(v.x), f64::from(v.y))
-    }
-}
 
 /// Which device item lies under a plate position, topmost first.
 fn device_at(items: &[PanelItem], at: Point) -> Option<usize> {
@@ -211,12 +195,32 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
             let r = Rect::from_two_pos(xf.s(*at), xf.s(Point::new(at.x + width, at.y + height)));
             let picked = ed.panel_pick == Some(i);
             painter.rect_filled(r, 1.0, if picked { t.accent_soft } else { t.paper });
+            // A part with a maker's outline drawing is drawn with it, inside a faint box (#312).
+            let footprint = open
+                .project
+                .devices
+                .get(tag)
+                .and_then(|d| d.part.as_ref())
+                .and_then(|id| open.parts.get(id))
+                .and_then(|part| part.footprint.as_ref());
+            if let Some(f) = footprint {
+                let st = Stroke::new(1.0_f32, t.ink);
+                for s in f.placed(*at, *width, *height) {
+                    crate::canvas::paint_shape(&painter, &xf, &s, st);
+                }
+            }
             painter.rect_stroke(
                 r,
                 1.0,
                 Stroke::new(
                     if picked { 2.0_f32 } else { 1.2 },
-                    if picked { t.selection } else { t.ink },
+                    if picked {
+                        t.selection
+                    } else if footprint.is_some() {
+                        t.faint
+                    } else {
+                        t.ink
+                    },
                 ),
                 egui::StrokeKind::Inside,
             );

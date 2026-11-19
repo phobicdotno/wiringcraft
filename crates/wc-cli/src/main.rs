@@ -640,6 +640,20 @@ enum ImportCmd {
         #[arg(long, default_value = "")]
         letter_code: String,
     },
+    /// A maker's outline drawing (DXF, the front view, in mm at 1:1) as a part's footprint on
+    /// cabinet layouts: stored in the library with the part, and drawn on layout pages instead
+    /// of a box. A part without `Width` and `Height` takes its size from the drawing. When the
+    /// project uses the part, its copy in the project is updated too.
+    FootprintDxf {
+        file: PathBuf,
+        /// The part's library id.
+        #[arg(long)]
+        part: String,
+        /// The library folder that holds the part (default: the project's library source that
+        /// has it).
+        #[arg(long)]
+        lib: Option<PathBuf>,
+    },
     /// A symbol from an SVG drawing. Pins: elements with `id="pin:NAME"` or `data-pin="NAME"`.
     SymbolSvg {
         file: PathBuf,
@@ -1924,6 +1938,7 @@ fn run(cli: Cli) -> Res<()> {
                     underlays: pictures.files,
                     unreadable: pictures.unreadable,
                     panels: p.panels.clone(),
+                    footprints: wc_pdf::footprints(vendored_parts(dir, &p).values()),
                     plc_cards,
                 },
             );
@@ -2327,6 +2342,62 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
                 s.pins.len(),
                 s.graphics.len()
             );
+        }
+        ImportCmd::FootprintDxf { file, part, lib } => {
+            let text = std::fs::read(&file).map_err(e)?;
+            let (footprint, warnings) = wc_import::dxf::footprint(&String::from_utf8_lossy(&text)).map_err(e)?;
+            for w in &warnings {
+                eprintln!("warning: {}", escape_field(w));
+            }
+            // A library folder can be given outside a project; without one the project is needed.
+            let mut project = load(dir);
+            let path = match &lib {
+                Some(root) => {
+                    store::check_id(&part).map_err(e)?;
+                    root.join("parts").join(format!("{part}.json"))
+                }
+                None => {
+                    let p = project.as_ref().map_err(Clone::clone)?;
+                    let library = wc_library::Library::open(dir, p).map_err(e)?;
+                    library
+                        .locate(ItemKind::Part, &part)
+                        .ok_or_else(|| {
+                            format!("no part {part:?} in the project's libraries; name its folder with --lib")
+                        })?
+                        .path
+                }
+            };
+            let mut item: wc_core::Part =
+                store::read_json(&path).map_err(|err| format!("{}: {err}", path.display()))?;
+            if item.id != part {
+                return Err(format!("{} holds part {:?}, not {part:?}", path.display(), item.id));
+            }
+            let (w, h) = (footprint.width, footprint.height);
+            let shapes = footprint.shapes.len();
+            item.footprint = Some(footprint);
+            store::write_if_changed(&path, &store::to_json(&item).map_err(e)?).map_err(e)?;
+            println!(
+                "wrote the footprint of {part} to {} ({} x {} mm, {shapes} shapes)",
+                path.display(),
+                wc_core::geom::format_length(w),
+                wc_core::geom::format_length(h)
+            );
+            // The project's pinned copy follows, so its layouts draw the new footprint.
+            if let Ok(p) = &mut project
+                && p.lock.parts.contains_key(&part)
+            {
+                let library = wc_library::Library::open(dir, p).map_err(e)?;
+                match wc_library::take(dir, p, &library, ItemKind::Part, &part) {
+                    Ok(_) => {
+                        save(dir, p)?;
+                        println!("updated the project's copy of {part}");
+                    }
+                    Err(err) => eprintln!(
+                        "warning: the project's copy of {part} was not updated ({}); run `wiringcraft lib update {part}`",
+                        escape_field(&err.to_string())
+                    ),
+                }
+            }
         }
         ImportCmd::SymbolSvg {
             file,
@@ -4594,6 +4665,102 @@ mod tests {
         let mut all = vec!["wiringcraft", "-C", dir.to_str().unwrap()];
         all.extend_from_slice(args);
         run(Cli::try_parse_from(all).map_err(|e| e.to_string())?)
+    }
+
+    #[test]
+    fn a_maker_dxf_becomes_the_footprint_of_a_library_part_and_sizes_it_on_the_plate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let lib = tmp.path().join("lib");
+        let part = wc_core::Part {
+            id: "maker.io-8".into(),
+            manufacturer: "Maker".into(),
+            order_number: "IO-8".into(),
+            ..wc_core::Part::default()
+        };
+        wc_library::write_part(&lib, &part).unwrap();
+        cli(&dir, &["lib", "add", "shop", "folder", lib.to_str().unwrap()]).unwrap();
+        cli(&dir, &["device", "--part", "maker.io-8", "--", "+CAB1-A1"]).unwrap();
+        cli(&dir, &["lib", "lock"]).unwrap();
+        let before = load(&dir).unwrap().lock.parts["maker.io-8"].hash.clone();
+
+        // A 22.5 x 100 mm outline drawn away from the origin.
+        let dxf = tmp.path().join("io-8.dxf");
+        std::fs::write(
+            &dxf,
+            "0\nSECTION\n2\nENTITIES\n0\nLWPOLYLINE\n8\n0\n90\n4\n70\n1\n\
+             10\n200\n20\n50\n10\n222.5\n20\n50\n10\n222.5\n20\n150\n10\n200\n20\n150\n\
+             0\nENDSEC\n0\nEOF\n",
+        )
+        .unwrap();
+        let file = dxf.to_str().unwrap();
+        assert!(cli(&dir, &["import", "footprint-dxf", file, "--part", "no.such"]).is_err());
+        cli(&dir, &["import", "footprint-dxf", file, "--part", "maker.io-8"]).unwrap();
+        let in_lib: wc_core::Part = store::read_json(&lib.join("parts").join("maker.io-8.json")).unwrap();
+        let Some(f) = in_lib.footprint.as_ref() else {
+            unreachable!("stored in the library with the part")
+        };
+        assert_eq!((f.width, f.height), (22.5, 100.0));
+        // The project's pinned copy follows.
+        let p = load(&dir).unwrap();
+        assert_ne!(p.lock.parts["maker.io-8"].hash, before);
+        assert_eq!(store::read_vendored_part(&dir, "maker.io-8").unwrap(), in_lib);
+
+        // The part has no Width/Height: arranging the plate sizes the device from the drawing.
+        cli(&dir, &["panel", "new", "main"]).unwrap();
+        cli(&dir, &["panel", "arrange", "main"]).unwrap();
+        let p = load(&dir).unwrap();
+        let sizes: Vec<(f64, f64)> = p.panels[0]
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                wc_core::panel::PanelItem::Device { width, height, .. } => Some((*width, *height)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sizes, [(22.5, 100.0)]);
+
+        // A library folder can be named outside a project; a file holding another part is refused.
+        let outside = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&outside).unwrap();
+        let lib_arg = lib.to_str().unwrap();
+        cli(
+            &outside,
+            &[
+                "import",
+                "footprint-dxf",
+                file,
+                "--part",
+                "maker.io-8",
+                "--lib",
+                lib_arg,
+            ],
+        )
+        .unwrap();
+        let other = wc_core::Part {
+            id: "maker.other".into(),
+            ..wc_core::Part::default()
+        };
+        std::fs::write(
+            lib.join("parts").join("maker.wrong.json"),
+            store::to_json(&other).unwrap(),
+        )
+        .unwrap();
+        let err = cli(
+            &outside,
+            &[
+                "import",
+                "footprint-dxf",
+                file,
+                "--part",
+                "maker.wrong",
+                "--lib",
+                lib_arg,
+            ],
+        )
+        .unwrap_err();
+        assert!(err.contains("holds part"), "{err}");
     }
 
     #[test]

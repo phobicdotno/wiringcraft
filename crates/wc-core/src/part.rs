@@ -26,6 +26,63 @@ pub struct Part {
     /// contacts with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contacts: Option<Contacts>,
+    /// The maker's drawing of the part as seen on the mounting plate (usually the front view of
+    /// its CAE data), drawn on layout pages instead of a plain box (#312).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footprint: Option<Footprint>,
+}
+
+/// A part's outline drawing for cabinet layouts, in millimetres at 1:1 with y pointing down and
+/// the drawing's top-left corner at (0, 0), so it can be placed at a device's `at`.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct Footprint {
+    /// Extents of the drawing: the part's width and height on the plate.
+    pub width: f64,
+    pub height: f64,
+    #[serde(default)]
+    pub shapes: Vec<crate::Shape>,
+}
+
+impl Footprint {
+    /// A footprint from shapes in any position: moved so their extents start at (0, 0).
+    /// `None` when there is nothing to draw or the extents are not a usable size.
+    pub fn from_shapes(shapes: Vec<crate::Shape>) -> Option<Self> {
+        let pts: Vec<crate::Point> = shapes
+            .iter()
+            .flat_map(|s| {
+                let (a, b) = s.bounds();
+                [a, b]
+            })
+            .collect();
+        if pts.is_empty() {
+            return None;
+        }
+        let (min, max) = crate::geom::bounds_of(&pts);
+        let (width, height) = (max.x - min.x, max.y - min.y);
+        let usable = |v: f64| v.is_finite() && v > 0.0 && v <= 5000.0;
+        if !(usable(width) && usable(height)) {
+            return None;
+        }
+        let shift = crate::Point::new(-min.x, -min.y);
+        Some(Self {
+            width,
+            height,
+            shapes: shapes.iter().map(|s| s.translate(shift)).collect(),
+        })
+    }
+
+    /// The shapes for a device box of `width` x `height` with its top-left corner at `at`: at
+    /// real size when the drawing fits the box, else shrunk evenly until it does, and centred
+    /// in the box either way.
+    pub fn placed(&self, at: crate::Point, width: f64, height: f64) -> Vec<crate::Shape> {
+        let k = (width / self.width).min(height / self.height).min(1.0);
+        let k = if k.is_finite() && k > 0.0 { k } else { 1.0 };
+        let shift = crate::Point::new(
+            at.x + (width - self.width * k) / 2.0,
+            at.y + (height - self.height * k) / 2.0,
+        );
+        self.shapes.iter().map(|s| s.scaled(k).translate(shift)).collect()
+    }
 }
 
 /// How many contacts of each kind a part has, or a device draws.
