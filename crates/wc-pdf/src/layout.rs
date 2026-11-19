@@ -1068,14 +1068,22 @@ pub enum TableLine {
     Group { value: String, continued: bool },
 }
 
+/// Whether report pages of `per_page` lines print `table`'s line of header values: only when
+/// a row still fits under it.
+pub fn prints_header(table: &wc_report::Table, per_page: usize) -> bool {
+    !table.header.is_empty() && per_page >= 2
+}
+
 /// The lines of each report page of `table`, with `per_page` lines on a page: its rows, and a
 /// heading above each group when it is grouped (again, marked as continued, at the top of a
-/// page a group runs onto; never alone at the foot of a page). A page fewer for the line of
-/// header values the table prints ([`wc_report::Table::header`]). A page never holds more
+/// page a group runs onto; never alone at the foot of a page). A line fewer for the line of
+/// header values when the table prints it ([`prints_header`]). A page never holds more
 /// than `per_page` lines: when it has no room for a heading and a row, the headings are left
 /// out ([`report_size`] picks a sheet with room for them). An empty table has one empty page.
 pub fn table_pages(table: &wc_report::Table, per_page: usize) -> Vec<Vec<TableLine>> {
-    let cap = per_page.saturating_sub(usize::from(!table.header.is_empty())).max(1);
+    let cap = per_page
+        .saturating_sub(usize::from(prints_header(table, per_page)))
+        .max(1);
     let headings = table.group.is_some() && cap > 1;
     let mut pages: Vec<Vec<TableLine>> = vec![Vec::new()];
     let mut current: Option<&str> = None;

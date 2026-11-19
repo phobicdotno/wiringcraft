@@ -109,12 +109,27 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
         .unwrap_or(1);
     let size = layout::report_size(first_size, project.meta.template.band_height(), lines);
     let per_page = layout::rows_per_page(size, project.meta.template.band_height());
-    // The lines of each report table's pages.
-    let paged: Vec<Vec<Vec<layout::TableLine>>> = options
+    // A sheet too short for a table's header values and a row (none is large enough) leaves
+    // the header values out, so no page holds more lines than it has room for.
+    let reports: Vec<std::borrow::Cow<'_, wc_report::Table>> = options
         .reports
         .iter()
-        .map(|t| layout::table_pages(t, per_page))
+        .map(|t| {
+            if t.header.is_empty() || layout::prints_header(t, per_page) {
+                std::borrow::Cow::Borrowed(t)
+            } else {
+                let mut t = t.clone();
+                t.header.clear();
+                report.warnings.push(format!(
+                    "{}: the sheet has no room for the header values above the table; they are left out",
+                    t.title
+                ));
+                std::borrow::Cow::Owned(t)
+            }
+        })
         .collect();
+    // The lines of each report table's pages.
+    let paged: Vec<Vec<Vec<layout::TableLine>>> = reports.iter().map(|t| layout::table_pages(t, per_page)).collect();
     // Each report page: (table, its page, part, parts). Front tables (the table of contents)
     // come before the schematic pages, the rest after them.
     let split = |front: bool| -> Vec<(usize, usize, usize, usize)> {
@@ -137,7 +152,7 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
     let mut report_no = 0;
     let mut add_reports = |doc: &mut writer::Doc, list: Vec<(usize, usize, usize, usize)>, sheet: &mut usize| {
         for (ti, k, part, parts) in list {
-            let Some(table) = options.reports.get(ti) else { continue };
+            let Some(table) = reports.get(ti) else { continue };
             let lines = paged.get(ti).and_then(|p| p.get(k)).map_or(&[][..], Vec::as_slice);
             report_no += 1;
             let mut page = wc_core::Page::new(

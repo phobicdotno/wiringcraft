@@ -386,11 +386,18 @@ fn grouped_report_pages_print_a_heading_per_group_and_the_header_values() {
     // the headings are left out.
     for per_page in 1..6 {
         let pages = layout::table_pages(&table, per_page);
-        let cap = (per_page - 1).max(1);
-        assert!(pages.iter().all(|p| p.len() <= cap), "{per_page}: {pages:?}");
+        // The whole budget: the header line when it is printed, and the table lines.
+        let header = usize::from(layout::prints_header(&table, per_page));
+        assert!(
+            pages.iter().all(|p| p.len() + header <= per_page),
+            "{per_page}: {pages:?}"
+        );
         assert_eq!(pages.iter().flatten().filter(|l| matches!(l, Row(_))).count(), 4);
     }
     assert_eq!(layout::table_pages(&table, 2)[0], vec![Row(0)]);
+    // One line a page: no room for the header values with a row, so they are not printed.
+    assert!(!layout::prints_header(&table, 1));
+    assert_eq!(layout::table_pages(&table, 1)[0], vec![Row(0)]);
 
     let mut project = Project::new("Plant 7");
     project.pages = vec![Page::new("p1", "1", "Mains")];
