@@ -227,6 +227,10 @@ pub struct Open {
     /// failed Undo or Redo (or a command's result) could not be put back. The next Undo, Redo
     /// or save writes them again.
     stale_symbol_files: std::collections::BTreeSet<String>,
+    /// Vendored files a failed library update could not put back, by path: they may still
+    /// hold the library's new version while the lock pins the old one. The next save writes
+    /// each again first, and does not go ahead while one cannot be.
+    unrestored_files: BTreeMap<PathBuf, UnrestoredFile>,
     /// Tests: whether each coming symbol file write fails, in order.
     #[cfg(test)]
     pub(crate) fail_symbol_writes: std::collections::VecDeque<bool>,
@@ -287,6 +291,7 @@ impl Open {
             held_by_others: BTreeMap::new(),
             symbol_versions: BTreeMap::new(),
             stale_symbol_files: Default::default(),
+            unrestored_files: BTreeMap::new(),
             #[cfg(test)]
             fail_symbol_writes: Default::default(),
             #[cfg(test)]
@@ -1078,15 +1083,21 @@ impl Open {
         }
         // Every file the update may write, and the lock, are kept here: a failure puts them
         // back directly, whatever undo can or cannot restore.
-        let files: Vec<(PathBuf, Option<Vec<u8>>)> = todo
+        let files: Vec<KeptFile> = todo
             .iter()
-            .filter_map(|(kind, id, _)| store::vendor_path(&self.dir, *kind, id).ok())
-            .map(|path| {
+            .filter_map(|(kind, id, _)| Some((*kind, id, store::vendor_path(&self.dir, *kind, id).ok()?)))
+            .map(|(kind, id, path)| {
                 #[cfg(test)]
                 if self.unreadable.as_ref() == Some(&path) {
                     return Err(format!("{} cannot be read: test read failure", path.display()));
                 }
-                Ok((path.clone(), snapshot_file(&path)?))
+                let was = snapshot_file(&path)?;
+                Ok(KeptFile {
+                    kind,
+                    id: id.clone(),
+                    path,
+                    was,
+                })
             })
             .collect::<Result<_, String>>()
             .map_err(|e| format!("nothing was updated: {e}"))?;
@@ -1113,8 +1124,9 @@ impl Open {
         let done = match wc_library::update_items(&self.dir, &mut self.project, lib, &todo) {
             Ok(done) => done,
             Err(e) => {
-                // `update_items` put back what it wrote; only the undo step goes.
-                let unrestored = self.roll_back_update(&[], lock, history);
+                // `update_items` put back what it could; the files are checked again here, so
+                // one it could not put back is known, and the undo step goes.
+                let unrestored = self.roll_back_update(&files, lock, history);
                 return Err(if unrestored.is_empty() {
                     e.to_string()
                 } else {
@@ -1166,21 +1178,20 @@ impl Open {
     /// Take back a library update that failed: the files it wrote and the lock as they were
     /// (`files`, `lock`), its undo step dropped, and the history as it was before it (`was`: the
     /// Redo list, the oldest Undo step its checkpoint pushed out, whether there were unsaved
-    /// changes). Returns what could not be put back.
-    fn roll_back_update(
-        &mut self,
-        files: &[(PathBuf, Option<Vec<u8>>)],
-        lock: wc_core::Lockfile,
-        was: HistoryState,
-    ) -> Vec<String> {
-        let mut unrestored: Vec<String> = files
-            .iter()
-            .filter_map(|(path, was)| {
-                restore_file(path, was.as_deref())
-                    .err()
-                    .map(|err| format!("{} ({err})", path.display()))
-            })
-            .collect();
+    /// changes). Returns what could not be put back. A file that could not be put back keeps its
+    /// old version loaded and is written again before the next save.
+    fn roll_back_update(&mut self, files: &[KeptFile], lock: wc_core::Lockfile, was: HistoryState) -> Vec<String> {
+        let mut failed: Vec<&KeptFile> = Vec::new();
+        let mut unrestored: Vec<String> = Vec::new();
+        for f in files {
+            if let Err(err) = self.restore_kept(f) {
+                unrestored.push(format!(
+                    "{} ({err}); the old version stays loaded and is written before the next save",
+                    f.path.display()
+                ));
+                failed.push(f);
+            }
+        }
         self.reload_symbols();
         if !self.undo()
             && let Some(why) = self.take_undo_error()
@@ -1197,7 +1208,65 @@ impl Open {
         self.dirty = was.dirty;
         self.history = was.history;
         self.reload_symbols();
+        for f in failed {
+            self.keep_unrestored(f);
+        }
         unrestored
+    }
+
+    /// Put a file a library update wrote back as it was.
+    fn restore_kept(&self, f: &KeptFile) -> std::io::Result<()> {
+        restore_file(&f.path, f.was.as_deref())
+    }
+
+    /// After file `f` could not be put back: the version the lock pins stays loaded (the file
+    /// may hold the library's new one), and the file waits to be written before the next save.
+    fn keep_unrestored(&mut self, f: &KeptFile) {
+        let pin = self.project.lock.get(f.kind, &f.id).map(|e| e.hash.clone());
+        match f.kind {
+            ItemKind::Symbol => {
+                if let Some(old) = pin.as_ref().and_then(|h| self.symbol_versions.get(h)).cloned() {
+                    self.symbols.insert(f.id.clone(), old);
+                    self.stale_symbol_files.insert(f.id.clone());
+                }
+            }
+            ItemKind::Part => {
+                if let Some(old) = f.was.as_deref().and_then(|b| serde_json::from_slice::<Part>(b).ok()) {
+                    self.parts.insert(f.id.clone(), old);
+                }
+            }
+        }
+        self.unrestored_files.insert(
+            f.path.clone(),
+            UnrestoredFile {
+                kind: f.kind,
+                id: f.id.clone(),
+                was: f.was.clone(),
+                pin,
+            },
+        );
+    }
+
+    /// Write again every file a failed library update could not put back. One whose item the
+    /// lock no longer pins in that version was written since by what changed the pin, and is
+    /// let go. A save does not go ahead while one cannot be written: the saved lock would name
+    /// a version its file does not hold.
+    fn put_back_unrestored_files(&mut self) -> Result<(), String> {
+        for (path, f) in self.unrestored_files.clone() {
+            let pin = self.project.lock.get(f.kind, &f.id).map(|e| e.hash.clone());
+            if pin == f.pin {
+                restore_file(&path, f.was.as_deref()).map_err(|e| {
+                    format!(
+                        "not saved: the file of {} {} ({}) still holds another version and cannot be put back: {e}",
+                        kind_name(f.kind),
+                        f.id,
+                        path.display()
+                    )
+                })?;
+            }
+            self.unrestored_files.remove(&path);
+        }
+        Ok(())
     }
 
     /// Why the last Undo or Redo failed, once.
@@ -1226,6 +1295,7 @@ impl Open {
 
     pub fn save(&mut self) -> Result<usize, String> {
         self.follow_terminals();
+        self.put_back_unrestored_files()?;
         self.rewrite_stale_symbol_files()?;
         let n = store::save(&self.dir, &self.project).map_err(|e| e.to_string())?.len();
         self.dirty = false;
@@ -2399,6 +2469,32 @@ pub fn dangling_pins(project: &wc_core::Project, id: &str, symbol: &wc_core::Sym
 /// A file's bytes before it is changed, or `None` when there is no such file. Any other
 /// read error is returned: a file that is there but cannot be read must not be taken for absent
 /// (and then removed when putting things back).
+/// A vendored file a library update may write, as it was before: the item it holds and its
+/// bytes (`None` when there was no file).
+struct KeptFile {
+    kind: ItemKind,
+    id: String,
+    path: PathBuf,
+    was: Option<Vec<u8>>,
+}
+
+/// A vendored file a failed library update could not put back ([`Open::unrestored_files`]):
+/// its item, what it held, and the version the lock pinned then.
+#[derive(Clone)]
+struct UnrestoredFile {
+    kind: ItemKind,
+    id: String,
+    was: Option<Vec<u8>>,
+    pin: Option<String>,
+}
+
+fn kind_name(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::Symbol => "symbol",
+        ItemKind::Part => "part",
+    }
+}
+
 fn snapshot_file(path: &Path) -> Result<Option<Vec<u8>>, String> {
     match std::fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
@@ -3261,6 +3357,85 @@ pub(crate) mod tests {
             "and the symbol file"
         );
         assert!(!o.can_redo());
+    }
+
+    #[test]
+    fn a_symbol_file_an_update_could_not_put_back_keeps_its_old_version_until_save_writes_it() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let old = o.symbols["wc.coil"].clone();
+        let mut new = old.clone();
+        new.name = "Coil, changed".into();
+        let lib = library_first(&mut o, tmp.path(), &new);
+        o.save().unwrap();
+        let symbol_file = store::vendor_path(&o.dir, ItemKind::Symbol, "wc.coil").unwrap();
+        let before = std::fs::read(&symbol_file).unwrap();
+        // The symbol's file turns into a folder once the backups are taken: the update cannot
+        // write it, nor put it back.
+        o.block_after_snapshot = Some(symbol_file.clone());
+        let lock = o.project.lock.clone();
+        let err = o.update_library(&lib, None).unwrap_err();
+        assert!(err.contains("written before the next save"), "{err}");
+        assert_eq!(o.project.lock, lock);
+        assert_eq!(o.symbols["wc.coil"], old, "the old version is still drawn");
+        // Save refuses while the file cannot be written, and leaves the saved lock alone.
+        let lock_file = std::fs::read(o.dir.join(store::LOCK_FILE)).unwrap();
+        o.dirty = true;
+        let err = o.save().unwrap_err();
+        assert!(err.starts_with("not saved") && err.contains("wc.coil"), "{err}");
+        assert_eq!(std::fs::read(o.dir.join(store::LOCK_FILE)).unwrap(), lock_file);
+        // Once the folder is gone, Save writes the old file back, then the lock.
+        std::fs::remove_dir(&symbol_file).unwrap();
+        o.save().unwrap();
+        assert_eq!(std::fs::read(&symbol_file).unwrap(), before);
+        assert!(o.unrestored_files.is_empty());
+        assert_eq!(o.symbols["wc.coil"], old);
+    }
+
+    #[test]
+    fn a_part_file_an_update_could_not_put_back_keeps_its_old_version_until_save_writes_it() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let pid = "example.ex-ct-9-24dc";
+        o.ensure_part(pid).unwrap();
+        let old = o.parts[pid].clone();
+        changed_part_in_mine(&o, tmp.path(), pid);
+        let coil = o.symbols["wc.coil"].clone();
+        let lib = library_first(&mut o, tmp.path(), &coil);
+        o.save().unwrap();
+        let part_file = store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap();
+        let before = std::fs::read(&part_file).unwrap();
+        o.block_after_snapshot = Some(part_file.clone());
+        let err = o.update_library(&lib, None).unwrap_err();
+        assert!(err.contains("written before the next save"), "{err}");
+        assert_eq!(o.parts[pid], old, "the old version stays loaded");
+        o.dirty = true;
+        assert!(o.save().unwrap_err().contains(pid));
+        std::fs::remove_dir(&part_file).unwrap();
+        o.save().unwrap();
+        assert_eq!(std::fs::read(&part_file).unwrap(), before);
+    }
+
+    #[test]
+    fn a_file_waiting_to_be_put_back_is_let_go_once_the_lock_pins_another_version() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let pid = "example.ex-ct-9-24dc";
+        o.ensure_part(pid).unwrap();
+        changed_part_in_mine(&o, tmp.path(), pid);
+        let coil = o.symbols["wc.coil"].clone();
+        let lib = library_first(&mut o, tmp.path(), &coil);
+        let part_file = store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap();
+        o.block_after_snapshot = Some(part_file.clone());
+        assert!(o.update_library(&lib, None).is_err());
+        assert_eq!(o.unrestored_files.len(), 1);
+        // The update goes through once the folder is gone: the old file is not written over it.
+        std::fs::remove_dir(&part_file).unwrap();
+        o.update_library(&lib, None).unwrap();
+        let taken = std::fs::read(&part_file).unwrap();
+        o.save().unwrap();
+        assert_eq!(std::fs::read(&part_file).unwrap(), taken);
+        assert!(o.unrestored_files.is_empty());
     }
 
     #[test]
