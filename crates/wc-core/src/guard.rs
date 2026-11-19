@@ -541,6 +541,8 @@ mod tests {
         std::fs::create_dir(&file)?;
         std::fs::write(file.join("keep.txt"), "x")?;
         let e = g.write(&file, b"list").err().ok_or("a file took a folder's name")?;
+        // Windows itself answers "Access is denied" here, so only unix can tell by the kind.
+        #[cfg(unix)]
         assert_ne!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
         assert!(e.to_string().contains(&file.display().to_string()), "{e}");
         assert!(!e.to_string().contains("shared session"), "{e}");
