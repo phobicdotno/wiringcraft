@@ -1816,7 +1816,7 @@ fn a_long_page_reference_on_a_plc_card_is_cut_to_its_column() {
             points: vec![CardPoint {
                 device: "-S1".into(),
                 description: "start".into(),
-                connected: "-X1:3 to the terminal strip in the field box".into(),
+                connected: "-X1:3 to the terminal strip in the field box ".repeat(6),
                 page_number: long_page.into(),
                 page_id: "p1".into(),
             }],
@@ -1833,4 +1833,15 @@ fn a_long_page_reference_on_a_plc_card_is_cut_to_its_column() {
         "the cut page reference is drawn"
     );
     assert!(!drawn.ops.contains(&writer::pdf_text(long_page)));
+    // The connection text is cut too, and ends before the page column starts.
+    let [_, _, conn_x, page_x] = layout::card_field_x(page.size.mm().0);
+    let connected = &card.channels[0].points[0].connected;
+    let shown = layout::fit_at(connected, page_x - layout::CARD_PAGE - 2.0 - conn_x, 2.5);
+    assert_ne!(&shown, connected, "the connection is too long for its column");
+    assert!(
+        drawn.ops.contains(&writer::pdf_text(&shown)),
+        "the cut connection is drawn"
+    );
+    assert!(!drawn.ops.contains(&writer::pdf_text(connected)));
+    assert!(conn_x + writer::text_width_mm(&shown, 2.5) < page_x - layout::CARD_PAGE);
 }

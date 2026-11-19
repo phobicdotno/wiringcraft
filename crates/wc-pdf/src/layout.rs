@@ -1192,6 +1192,14 @@ fn card_point_columns(w: f64) -> (f64, f64) {
     (x0 + 58.0 + 18.0, w - MARGIN - 6.0)
 }
 
+/// Where the device, description, connection and page fields of a drawn PLC card start on a
+/// sheet `w` mm wide; the page field is right-aligned at its position.
+pub fn card_field_x(w: f64) -> [f64; 4] {
+    let (lead, x1) = card_point_columns(w);
+    let room = x1 - lead;
+    [lead + 2.0, lead + room * 0.2, lead + room * 0.55, x1 - 2.0]
+}
+
 /// The sheet size for drawn PLC cards: `wanted` (the first schematic page's) when it has room
 /// for the heading and a card row above the title block and is wide enough for the point
 /// columns, else the smallest named size that is.
@@ -1266,8 +1274,7 @@ pub fn draw_card_page(
     // Column positions: the card box, the wire to the terminal, then the point's fields.
     let (bx0, bx1) = (x0 + 8.0, x0 + 58.0);
     let (lead, _) = card_point_columns(w);
-    let room = x1 - lead;
-    let (dev_x, desc_x, conn_x, page_x) = (lead + 2.0, lead + room * 0.2, lead + room * 0.55, x1 - 2.0);
+    let [dev_x, desc_x, conn_x, page_x] = card_field_x(w);
     let y0 = top + CARD_TOP - CARD_ROW;
     // Column heads.
     pen.colour(0.35, 0.35, 0.35);
