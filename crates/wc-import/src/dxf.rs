@@ -590,7 +590,7 @@ fn shapes(
                 None
             }
             "INSERT" => {
-                if let Some((name, inner)) = e.get(2).and_then(|n| d.blocks.get_key_value(n)) {
+                if let Some((name, inner)) = e.get(2).and_then(|n| d.block(n)) {
                     // The block's base point goes on the insertion point.
                     let (bx, by) = d.bases.get(name).copied().unwrap_or_default();
                     let ixf = Xf::shift((-bx, -by))
@@ -2055,6 +2055,10 @@ mod tests {
             f.width,
             f.height
         );
+        // A block referenced in another case than it is defined in is still drawn.
+        let blocks = "0\nBLOCK\n2\nOUTLINE\n0\nLWPOLYLINE\n90\n4\n70\n1\n10\n0\n20\n0\n10\n20\n20\n0\n10\n20\n20\n40\n10\n0\n20\n40\n0\nENDBLK\n";
+        let (f, _) = footprint(&dxf("0\nINSERT\n2\noutline\n10\n0\n20\n0\n", blocks))?;
+        assert_eq!((f.width, f.height), (20.0, 40.0));
         // The old POLYLINE/VERTEX form keeps its bulges too.
         let old_form = "0\nPOLYLINE\n8\n0\n70\n1\n0\nVERTEX\n8\n0\n10\n0\n20\n0\n42\n1\n\
                         0\nVERTEX\n8\n0\n10\n10\n20\n0\n0\nSEQEND\n";

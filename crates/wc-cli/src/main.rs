@@ -3378,14 +3378,16 @@ fn comment_cmd(dir: &Path, cc: CommentCmd) -> Res<()> {
     Ok(())
 }
 
-/// Stack for the thread the command runs on. The command dispatch keeps large frames in debug
-/// builds, and Windows gives the main thread only 1 MiB, which `place` overflowed there once
-/// one more import command was added (#312).
+/// Stack for the thread the command is parsed and run on. Argument parsing and the command
+/// dispatch keep large frames in debug builds, and Windows gives the main thread only 1 MiB,
+/// which overflowed there once one more import command was added (#312).
 const STACK: usize = 16 * 1024 * 1024;
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-    let worker = std::thread::Builder::new().stack_size(STACK).spawn(move || run(cli));
+    // Parsing runs there too: clap's derived parser builds every subcommand on the stack.
+    let worker = std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(|| run(Cli::parse()));
     let result = match worker {
         Ok(handle) => handle
             .join()
