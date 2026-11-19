@@ -3353,8 +3353,21 @@ fn comment_cmd(dir: &Path, cc: CommentCmd) -> Res<()> {
     Ok(())
 }
 
+/// Stack for the thread the command runs on. The command dispatch keeps large frames in debug
+/// builds, and Windows gives the main thread only 1 MiB, which `place` overflowed there once
+/// one more import command was added (#312).
+const STACK: usize = 16 * 1024 * 1024;
+
 fn main() -> ExitCode {
-    match run(Cli::parse()) {
+    let cli = Cli::parse();
+    let worker = std::thread::Builder::new().stack_size(STACK).spawn(move || run(cli));
+    let result = match worker {
+        Ok(handle) => handle
+            .join()
+            .unwrap_or_else(|_| Err("the command stopped unexpectedly".into())),
+        Err(err) => Err(format!("could not start the command: {err}")),
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
             eprintln!("error: {msg}");
