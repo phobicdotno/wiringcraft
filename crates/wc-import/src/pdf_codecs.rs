@@ -158,7 +158,7 @@ fn jbig2_within(data: &[u8], globals: Option<&[u8]>, limit: usize) -> Result<(u3
     let half = limit / 2;
     // What symbol dictionaries keep of their arithmetic decoder is not counted by the decoder.
     let share = |segments: &[u8]| -> Result<usize, String> {
-        half.checked_sub(jbig2_retained_contexts(segments)?)
+        half.checked_sub(jbig2_dictionary_bytes(segments)?)
             .ok_or_else(|| "the JBIG2 picture needs too much memory to decode".to_string())
     };
     let globals_limit = globals.map_or(Ok(half), share)?;
@@ -214,12 +214,37 @@ const JBIG2_BUDGET: usize = 256 << 20;
 /// generic and 8 192 refinement contexts, in `hayro-jbig2`.
 const JBIG2_CONTEXTS: usize = 65_536 + 8_192;
 
-/// The bytes the JBIG2 decoder keeps for the arithmetic decoder contexts of the symbol
-/// dictionaries (7.4.2) in JBIG2 data in the embedded organization, read from their segment
-/// headers and flags. The decoder keeps them until the picture is done, outside its memory
-/// limit. The walk follows the decoder's own segment parser, including generic regions of
+/// What a symbol dictionary segment whose data starts with `head` keeps outside the decoder's
+/// memory limit (see [`jbig2_dictionary_bytes`]). Its flags (7.4.2.1.1) say whether it keeps
+/// its contexts (bit 9) and how many AT pixel bytes come before the number of exported symbols:
+/// 8 or 2 for arithmetic coding with template 0 or another (bits 0 and 10-11), and 4 more for
+/// refinement with refinement template 0 (bits 1 and 12). A header cut short counts as nothing:
+/// the decoder refuses it.
+fn symbol_dictionary_bytes(head: &[u8]) -> usize {
+    let Some(flags) = head.get(..2).map(|f| u16::from_be_bytes([f[0], f[1]])) else {
+        return 0;
+    };
+    let contexts = if flags & 0x0200 != 0 { JBIG2_CONTEXTS } else { 0 };
+    let huffman = flags & 0x0001 != 0;
+    let refinement = flags & 0x0002 != 0;
+    let at = match (huffman, (flags >> 10) & 3) {
+        (true, _) => 0,
+        (false, 0) => 8,
+        (false, _) => 2,
+    } + if refinement && flags & 0x1000 == 0 { 4 } else { 0 };
+    let exported = head
+        .get(2 + at..6 + at)
+        .map_or(0, |n| u32::from_be_bytes([n[0], n[1], n[2], n[3]]) as usize);
+    contexts.saturating_add(exported.saturating_mul(size_of::<usize>()))
+}
+
+/// The bytes the JBIG2 decoder keeps outside its memory limit for the symbol dictionaries
+/// (7.4.2) in JBIG2 data in the embedded organization, read from their segment headers: the
+/// arithmetic decoder contexts of a dictionary that retains them, and the list of its exported
+/// symbols (one pointer each; re-exporting earlier dictionaries' symbols shares the bitmaps but
+/// not the list). The decoder keeps both until the picture is done. The walk follows the decoder's own segment parser, including generic regions of
 /// unknown length; data it cannot follow is left to the decoder, which cannot follow it either.
-fn jbig2_retained_contexts(data: &[u8]) -> Result<usize, String> {
+fn jbig2_dictionary_bytes(data: &[u8]) -> Result<usize, String> {
     const SYMBOLS: u8 = 0;
     let be32 = |at: usize| -> Option<u32> {
         data.get(at..at.checked_add(4)?)
@@ -253,9 +278,9 @@ fn jbig2_retained_contexts(data: &[u8]) -> Result<usize, String> {
         pos = pos.saturating_add(if flags & 0x40 != 0 { 4 } else { 1 });
         let Some(length) = be32(pos) else { break };
         pos = pos.saturating_add(4);
-        // A symbol dictionary's flags: bit 9 of the first two bytes keeps its contexts.
-        if flags & 0x3F == SYMBOLS && data.get(pos).is_some_and(|f| f & 0x02 != 0) {
-            total = total.saturating_add(JBIG2_CONTEXTS);
+        if flags & 0x3F == SYMBOLS {
+            let end = pos.saturating_add(length as usize).min(data.len());
+            total = total.saturating_add(symbol_dictionary_bytes(data.get(pos..end).unwrap_or_default()));
         }
         if length == u32::MAX {
             // An immediate generic region of unknown length ends with a marker and a 4-byte
@@ -523,7 +548,8 @@ mod tests {
         let mut b = number.to_be_bytes().to_vec();
         // Symbol dictionary (type 0), no referred-to segments, page 1, 10 bytes of data.
         b.extend_from_slice(&[0, 0, 1, 0, 0, 0, 10]);
-        // Flags 0x0200 (contexts kept), then zeros: the walk reads only the flags.
+        // Flags 0x0200 (contexts kept, template 0), then 8 AT bytes; the header is cut short
+        // before the number of exported symbols, which then counts as none.
         b.extend_from_slice(&[0x02, 0x00, 0, 0, 0, 0, 0, 0, 0, 0]);
         b
     }
@@ -531,7 +557,7 @@ mod tests {
     #[test]
     fn jbig2_symbol_dictionaries_that_keep_their_contexts_count_against_the_limit() {
         let many: Vec<u8> = (0..1000).flat_map(kept_contexts).collect();
-        assert_eq!(jbig2_retained_contexts(&many), Ok(1000 * JBIG2_CONTEXTS));
+        assert_eq!(jbig2_dictionary_bytes(&many), Ok(1000 * JBIG2_CONTEXTS));
         // 1000 such dictionaries are about 70 MiB, more than half of a 128 MiB limit.
         let refused = jbig2_within(&many, None, 128 << 20);
         assert!(refused.is_err_and(|e| e.contains("too much memory")));
@@ -541,8 +567,42 @@ mod tests {
         // A dictionary without the flag keeps none, and a cut-off header stops the walk.
         let mut plain = kept_contexts(0);
         plain[11] = 0;
-        assert_eq!(jbig2_retained_contexts(&plain), Ok(0));
-        assert_eq!(jbig2_retained_contexts(&many[..5]), Ok(0));
-        assert!(jbig2_retained_contexts(&[0, 0, 0, 0, 0, 0xA0]).is_err());
+        assert_eq!(jbig2_dictionary_bytes(&plain), Ok(0));
+        assert_eq!(jbig2_dictionary_bytes(&many[..5]), Ok(0));
+        assert!(jbig2_dictionary_bytes(&[0, 0, 0, 0, 0, 0xA0]).is_err());
+    }
+
+    #[test]
+    fn jbig2_symbol_dictionaries_that_export_many_symbols_count_against_the_limit() {
+        let exporting = |number: u32| {
+            let mut b = number.to_be_bytes().to_vec();
+            b.extend_from_slice(&[0, 0, 1, 0, 0, 0, 10]);
+            // Huffman coded (no AT pixels), 2^20 exported symbols, no new ones.
+            b.extend_from_slice(&[0x00, 0x01, 0x00, 0x10, 0x00, 0x00, 0, 0, 0, 0]);
+            b
+        };
+        let one = size_of::<usize>() << 20;
+        assert_eq!(jbig2_dictionary_bytes(&exporting(0)), Ok(one));
+        // Twenty dictionaries that re-export a million symbols each keep 160 MiB of pointers
+        // on a 64-bit target, more than half of a 128 MiB limit.
+        let many: Vec<u8> = (0..20).flat_map(exporting).collect();
+        let refused = jbig2_within(&many, None, 128 << 20);
+        assert!(refused.is_err_and(|e| e.contains("too much memory")));
+
+        // Where the number of exported symbols is, by the coding and templates in the flags.
+        let count_at = |flags: u16, at: usize| {
+            let mut head = flags.to_be_bytes().to_vec();
+            head.resize(2 + at, 0);
+            head.extend_from_slice(&3u32.to_be_bytes());
+            symbol_dictionary_bytes(&head)
+        };
+        let three = 3 * size_of::<usize>();
+        assert_eq!(count_at(0x0000, 8), three); // arithmetic, template 0
+        assert_eq!(count_at(0x0400, 2), three); // arithmetic, template 1
+        assert_eq!(count_at(0x0002, 12), three); // with refinement, refinement template 0
+        assert_eq!(count_at(0x1002, 8), three); // refinement template 1
+        assert_eq!(count_at(0x0003, 4), three); // Huffman with refinement
+        assert_eq!(count_at(0x0201, 0), JBIG2_CONTEXTS + three);
+        assert_eq!(symbol_dictionary_bytes(&[0x00]), 0);
     }
 }
