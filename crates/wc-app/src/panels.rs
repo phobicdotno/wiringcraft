@@ -920,7 +920,13 @@ fn black_box_section(
 /// focus, even untouched, so the range is applied here, to changes only.
 fn box_size_field(ui: &mut egui::Ui, value: &mut f64) {
     let before = *value;
-    let r = ui.add(egui::DragValue::new(value).speed(0.5).suffix(" mm"));
+    // Shown in full, so that leaving the field untouched reads back the very same number.
+    let r = ui.add(
+        egui::DragValue::new(value)
+            .speed(0.5)
+            .suffix(" mm")
+            .custom_formatter(|v, _| format!("{v}")),
+    );
     if r.changed() && *value != before {
         *value = value.clamp(1.0, 5000.0);
     }
@@ -2154,7 +2160,7 @@ mod tests {
         let symbol_id = format!("box.{}.{id}", o.project.pages[1].id);
         // A box narrower than the field's 1 mm minimum, as an older file could hold.
         let narrow = wc_core::black_box(&symbol_id, "Black box", 0.5, 10.0, &pins)?;
-        o.symbols.insert(symbol_id, narrow);
+        o.symbols.insert(symbol_id.clone(), narrow.clone());
         let mut ed = Editor::default();
         let mut ps = PanelState::default();
         let t = Theme::of(&egui::Context::default());
@@ -2185,6 +2191,17 @@ mod tests {
             frame_with(&mut o, &mut ps, Vec::new());
         }
         assert_eq!(form(&ps), Some((0.5, false)), "focus passing through changes nothing");
+        // Nor for a size that the field's usual rounding would show differently.
+        let mut odd = PanelState::default();
+        let odd_box = wc_core::black_box(&symbol_id, "Black box", 0.500001, 10.0, &pins)?;
+        o.symbols.insert(symbol_id.clone(), odd_box);
+        frame_with(&mut o, &mut odd, Vec::new());
+        for _ in 0..3 {
+            frame_with(&mut o, &mut odd, vec![tab()]);
+            frame_with(&mut o, &mut odd, Vec::new());
+        }
+        assert_eq!(form(&odd), Some((0.500001, false)));
+        o.symbols.insert(symbol_id.clone(), narrow.clone());
         let mut frame = |o: &mut Open, ps: &mut PanelState| frame_with(o, ps, Vec::new());
         // Renaming a point leaves the width alone.
         if let Some((_, f)) = ps.black_box.as_mut() {
