@@ -580,12 +580,14 @@ impl Open {
             let before = self.parts.get(id).and_then(wc_core::panel::part_size);
             let lib = wc_library::Library::open(&self.dir, &self.project).map_err(|e| e.to_string())?;
             let only = [id.to_owned()];
-            let steps = self.undo.len();
+            // Whether the update took a new copy (and so an undo step): the pin changes. The
+            // undo history's length cannot tell once it is full.
+            let pin = self.project.lock.parts.get(id).map(|e| e.hash.clone());
             let updated = self.update_library_of(&lib, Some(&only), Some(ItemKind::Part));
             let follows = self.parts.get(id).is_some_and(|p| same(p, &part));
             match updated {
                 // Devices of the part on the plates take its new size, in the same undo step.
-                Ok(_) if follows && self.undo.len() > steps => {
+                Ok(_) if follows && self.project.lock.parts.get(id).map(|e| &e.hash) != pin.as_ref() => {
                     let after = self.parts.get(id).and_then(wc_core::panel::part_size);
                     msg.push_str(&self.resize_panel_devices(id, before, after));
                 }
@@ -635,7 +637,7 @@ impl Open {
             };
             match panel.place_device(tag.clone(), at, after, rotation) {
                 Ok(()) => resized += 1,
-                Err(_) => kept.push(format!("{tag} on {}", panel.name)),
+                Err(why) => kept.push(format!("{tag} on {} ({why})", panel.name)),
             }
         }
         let mut note = String::new();
@@ -650,7 +652,7 @@ impl Open {
         if !kept.is_empty() {
             note.push_str(&format!(
                 ". Kept their size, the new one would not fit on the plate: {}",
-                kept.join(", ")
+                kept.join("; ")
             ));
         }
         note
@@ -4491,11 +4493,16 @@ pub(crate) mod tests {
         .unwrap();
         let err = o.attach_model("no.such", &stp).unwrap_err();
         assert!(err.contains("none of the project's libraries"), "{err}");
+        // A full undo history: the update still counts as one step.
+        for _ in 0..UNDO_STEPS + 5 {
+            o.checkpoint();
+        }
         let undo_steps = o.undo.len();
+        assert_eq!(undo_steps, UNDO_STEPS);
         let msg = o.attach_model(pid, &stp).unwrap();
         assert!(msg.contains("22.5 x 90 x 70 mm"), "{msg}");
         assert!(!msg.contains("not updated"), "{msg}");
-        assert_eq!(o.undo.len(), undo_steps + 1, "one undo step");
+        assert_eq!(o.undo.len(), undo_steps, "one undo step, the oldest dropped");
         // Stored with the part in its library, and the project's copy follows at once.
         let in_lib: Part = store::read_json(&mine.join("parts").join(format!("{pid}.json"))).unwrap();
         assert!(in_lib.model.is_some());
@@ -4512,7 +4519,7 @@ pub(crate) mod tests {
         assert_eq!(size_of(&o, &k2), (30.0, 30.0));
         assert_eq!(size_of(&o, &k3), default);
         assert!(msg.contains("1 device on the panel layouts now 22.5 x 90 mm"), "{msg}");
-        assert!(msg.contains("-K3 on Plate"), "{msg}");
+        assert!(msg.contains("-K3 on Plate (-K3: a 22.5 x 90 mm outline"), "{msg}");
         // Undo puts the part back as it was, and the plate with it.
         assert!(o.undo());
         assert_eq!(o.project.panels[0], plate_before);
