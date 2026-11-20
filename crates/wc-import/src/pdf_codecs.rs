@@ -151,13 +151,23 @@ pub(crate) fn jbig2(data: &[u8], globals: Option<&[u8]>) -> Result<(u32, u32, Ve
     jbig2_within(data, globals, JBIG2_BUDGET)
 }
 
-/// [`jbig2`] with `limit` bytes for the decoder's bitmaps.
+/// [`jbig2`] with `limit` bytes for the decoder's bitmaps and retained contexts. The decoder
+/// counts the shared segments (`JBIG2Globals`) and the page's own separately, and the shared ones
+/// stay in memory while the page decodes, so each gets half.
 fn jbig2_within(data: &[u8], globals: Option<&[u8]>, limit: usize) -> Result<(u32, u32, Vec<u8>), String> {
+    let half = limit / 2;
+    // What symbol dictionaries keep of their arithmetic decoder is not counted by the decoder.
+    let share = |segments: &[u8]| -> Result<usize, String> {
+        half.checked_sub(jbig2_retained_contexts(segments)?)
+            .ok_or_else(|| "the JBIG2 picture needs too much memory to decode".to_string())
+    };
+    let globals_limit = globals.map_or(Ok(half), share)?;
+    let page_limit = share(data)?;
     guarded("JBIG2", || {
         // The decoder counts every bitmap it keeps (regions, pattern and symbol dictionaries
-        // and the page) against this limit and stops once they go over it, so a few bytes
+        // and the page) against its limit and stops once they go over it, so a few bytes
         // that declare huge or many symbols cannot use up the memory.
-        let settings = hayro_jbig2::DecodeSettings {
+        let settings = |limit: usize| hayro_jbig2::DecodeSettings {
             memory_limit: Some(limit),
             ..Default::default()
         };
@@ -169,10 +179,10 @@ fn jbig2_within(data: &[u8], globals: Option<&[u8]>, limit: usize) -> Result<(u3
             }
         };
         let globals = globals
-            .map(|g| hayro_jbig2::Globals::new(g, &settings))
+            .map(|g| hayro_jbig2::Globals::new(g, &settings(globals_limit)))
             .transpose()
             .map_err(|e| too_large(&e, "the shared part of the JBIG2 picture could not be read"))?;
-        let page = hayro_jbig2::Page::new_embedded(data, globals.as_ref(), &settings)
+        let page = hayro_jbig2::Page::new_embedded(data, globals.as_ref(), &settings(page_limit))
             .map_err(|e| too_large(&e, "the JBIG2 picture could not be read"))?;
         let (width, height) = (page.width(), page.height());
         if !fits(width, height) {
@@ -198,6 +208,82 @@ fn jbig2_within(data: &[u8], globals: Option<&[u8]>, limit: usize) -> Result<(u3
 
 /// The most memory the JBIG2 decoder may keep for one picture's bitmaps, in bytes.
 const JBIG2_BUDGET: usize = 256 << 20;
+
+/// What one symbol dictionary that keeps its arithmetic decoder contexts for a later one
+/// (T.88 7.4.2.1.1, "bitmap coding context retained") holds: one byte for each of the 65 536
+/// generic and 8 192 refinement contexts, in `hayro-jbig2`.
+const JBIG2_CONTEXTS: usize = 65_536 + 8_192;
+
+/// The bytes the JBIG2 decoder keeps for the arithmetic decoder contexts of the symbol
+/// dictionaries (7.4.2) in JBIG2 data in the embedded organization, read from their segment
+/// headers and flags. The decoder keeps them until the picture is done, outside its memory
+/// limit. The walk follows the decoder's own segment parser, including generic regions of
+/// unknown length; data it cannot follow is left to the decoder, which cannot follow it either.
+fn jbig2_retained_contexts(data: &[u8]) -> Result<usize, String> {
+    const SYMBOLS: u8 = 0;
+    let be32 = |at: usize| -> Option<u32> {
+        data.get(at..at.checked_add(4)?)
+            .and_then(|b| b.try_into().ok())
+            .map(u32::from_be_bytes)
+    };
+    let mut total: usize = 0;
+    let mut at = 0usize;
+    while at < data.len() {
+        let Some(number) = be32(at) else { break };
+        let Some(&flags) = data.get(at + 4) else { break };
+        let Some(&refs) = data.get(at + 5) else { break };
+        let (count, mut pos) = match refs >> 5 {
+            7 => {
+                let Some(long) = be32(at + 5) else { break };
+                let count = (long & 0x1FFF_FFFF) as usize;
+                // The retain bits: one for this segment and one per referred-to segment.
+                (count, (at + 9).saturating_add((count + 1).div_ceil(8)))
+            }
+            5 | 6 => return Err("the JBIG2 picture has a damaged segment header".into()),
+            short => (usize::from(short), at + 6),
+        };
+        let ref_size = if number <= 256 {
+            1
+        } else if number <= 65536 {
+            2
+        } else {
+            4
+        };
+        pos = pos.saturating_add(count.saturating_mul(ref_size));
+        pos = pos.saturating_add(if flags & 0x40 != 0 { 4 } else { 1 });
+        let Some(length) = be32(pos) else { break };
+        pos = pos.saturating_add(4);
+        // A symbol dictionary's flags: bit 9 of the first two bytes keeps its contexts.
+        if flags & 0x3F == SYMBOLS && data.get(pos).is_some_and(|f| f & 0x02 != 0) {
+            total = total.saturating_add(JBIG2_CONTEXTS);
+        }
+        if length == u32::MAX {
+            // An immediate generic region of unknown length ends with a marker and a 4-byte
+            // row count (7.2.7, 7.4.6.4), searched for after its region info, flags and AT
+            // pixels, as the decoder does.
+            let Some(&region_flags) = data.get(pos + 17) else { break };
+            let mmr = region_flags & 1 != 0;
+            let at_bytes = match (mmr, (region_flags >> 1) & 3, region_flags & 0x10 != 0) {
+                (true, _, _) => 0,
+                (false, 0, false) => 8,
+                (false, 0, true) => 24,
+                (false, _, _) => 2,
+            };
+            let marker: [u8; 2] = if mmr { [0x00, 0x00] } else { [0xFF, 0xAC] };
+            let from = pos + 18 + at_bytes;
+            let Some(end) = data
+                .get(from..)
+                .and_then(|rest| rest.windows(6).position(|w| w[..2] == marker))
+            else {
+                break;
+            };
+            at = from + end + 6;
+            continue;
+        }
+        at = pos.saturating_add(length as usize);
+    }
+    Ok(total)
+}
 
 /// A decoded JPEG 2000 picture: 8-bit samples, one to four channels interleaved.
 pub(crate) struct Jpx {
@@ -425,5 +511,38 @@ mod tests {
         // An ordinary page needs far less than the limit used for PDFs, but not nothing.
         assert!(too_much(jbig2_within(embedded(text), None, 64)));
         assert!(jbig2_within(embedded(text), None, 1 << 20).is_ok());
+        // The page needs about 3 KiB; it gets half the limit, the shared segments the other.
+        assert!(jbig2_within(embedded(text), None, 8 << 10).is_ok());
+        assert!(too_much(jbig2_within(embedded(text), None, 4 << 10)));
+        assert!(too_much(jbig2_within(embedded(text), Some(embedded(large)), 48 << 10)));
+    }
+
+    /// A symbol dictionary segment that keeps its arithmetic decoder contexts and has no
+    /// symbols.
+    fn kept_contexts(number: u32) -> Vec<u8> {
+        let mut b = number.to_be_bytes().to_vec();
+        // Symbol dictionary (type 0), no referred-to segments, page 1, 10 bytes of data.
+        b.extend_from_slice(&[0, 0, 1, 0, 0, 0, 10]);
+        // Flags 0x0200 (contexts kept), then zeros: the walk reads only the flags.
+        b.extend_from_slice(&[0x02, 0x00, 0, 0, 0, 0, 0, 0, 0, 0]);
+        b
+    }
+
+    #[test]
+    fn jbig2_symbol_dictionaries_that_keep_their_contexts_count_against_the_limit() {
+        let many: Vec<u8> = (0..1000).flat_map(kept_contexts).collect();
+        assert_eq!(jbig2_retained_contexts(&many), Ok(1000 * JBIG2_CONTEXTS));
+        // 1000 such dictionaries are about 70 MiB, more than half of a 128 MiB limit.
+        let refused = jbig2_within(&many, None, 128 << 20);
+        assert!(refused.is_err_and(|e| e.contains("too much memory")));
+        // In the shared segments too.
+        let refused = jbig2_within(&[], Some(&many), 128 << 20);
+        assert!(refused.is_err_and(|e| e.contains("too much memory")));
+        // A dictionary without the flag keeps none, and a cut-off header stops the walk.
+        let mut plain = kept_contexts(0);
+        plain[11] = 0;
+        assert_eq!(jbig2_retained_contexts(&plain), Ok(0));
+        assert_eq!(jbig2_retained_contexts(&many[..5]), Ok(0));
+        assert!(jbig2_retained_contexts(&[0, 0, 0, 0, 0, 0xA0]).is_err());
     }
 }
