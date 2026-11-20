@@ -619,5 +619,10 @@ fn a_terminal_gets_a_pin_per_designation_and_a_fuse_is_drawn_as_fuses() -> TestR
         .filter(|g| matches!(g, Shape::Rect { min, max } if (max.x - min.x - 2.0).abs() < 1e-9))
         .count();
     assert_eq!(bodies, 2, "{:?}", s.graphics);
+
+    // A one-pole fuse whose points are named like a coil's is still a fuse.
+    let m = read("fuse1.ema", &fuse.replace("1;2;3;4", "A1;A2"))?;
+    assert_eq!(m.symbol.role, SymbolRole::Standalone, "not a coil");
+    assert!(near(pin(&m.symbol, "A2")?.at, 10.0, 18.0));
     Ok(())
 }
