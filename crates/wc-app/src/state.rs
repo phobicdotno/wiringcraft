@@ -3576,6 +3576,43 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_box_file_changed_outside_the_app_is_not_overwritten_by_an_edit() {
+        use wc_core::{BoxPin, BoxSide};
+        let (_tmp, mut o) = project();
+        let pins = [BoxPin {
+            name: "1".into(),
+            side: BoxSide::Left,
+            offset: 5.0,
+        }];
+        let id = o
+            .add_black_box(1, Point::new(40.0, 40.0), Point::new(60.0, 50.0), &pins, None)
+            .unwrap();
+        let symbol_id = format!("box.{}.{id}", o.project.pages[1].id);
+        o.save().unwrap();
+        // Another program writes another box into the file; the project still pins the first.
+        let outside = wc_core::black_box(&symbol_id, "Black box", 50.0, 50.0, &pins).unwrap();
+        store::write_vendored_symbol(&o.dir, &outside).unwrap();
+        let mut reopened = Open::load(&o.dir).unwrap();
+        let lock = reopened.project.lock.symbols[&symbol_id].clone();
+        let steps = reopened.undo_mark();
+        let result = reopened.edit_black_box(1, &id, (30.0, 20.0), &pins, &BTreeMap::new(), &Default::default());
+        if reopened.symbols.get(&symbol_id).map(Symbol::hash) == Some(lock.hash.clone()) {
+            // The pinned version was loaded instead of the file's: editing it is safe.
+            assert!(result.is_ok(), "{result:?}");
+        } else {
+            let err = result.unwrap_err();
+            assert!(err.contains("not the version the project pins"), "{err}");
+            assert_eq!(
+                store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(),
+                outside,
+                "file kept"
+            );
+            assert_eq!(reopened.project.lock.symbols[&symbol_id], lock, "lock kept");
+            assert_eq!(reopened.undo_mark(), steps, "no undo step");
+        }
+    }
+
+    #[test]
     fn a_removed_point_whose_name_is_reused_lets_go_of_its_wire() {
         use wc_core::{BoxPin, BoxSide};
         let pin = |name: &str, side, offset| BoxPin {
