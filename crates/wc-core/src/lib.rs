@@ -42,5 +42,5 @@ pub use project::{
 };
 pub use review::{Comment, Reply};
 pub use revision::{Revision, RevisionCloud};
-pub use symbol::{BoxPin, BoxSide, Pin, Symbol, black_box};
+pub use symbol::{BoxPin, BoxSide, Pin, Symbol, black_box, black_box_layout};
 pub use tag::DeviceTag;

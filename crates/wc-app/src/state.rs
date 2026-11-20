@@ -1918,6 +1918,167 @@ impl Open {
         Ok(id)
     }
 
+    /// Change black box `item` on page `page` to `width` by `height` mm (`size`) with the connection
+    /// points `pins`, as one undo step. `renamed` maps a point's old name to its new one, and the
+    /// wires on it follow; `removed` names the old points that were taken off (a new point may
+    /// reuse such a name, and is still another point). A wire on a point that is gone keeps its
+    /// end where the point was, as a free end. The box's symbol gets a new version (its file and
+    /// lock entry); Undo puts the earlier one back. Returns warnings: the wires on points that
+    /// are gone or moved, and other boxes that place the same symbol (they change too). Nothing
+    /// changes when the box is refused or its symbol file cannot be written.
+    pub fn edit_black_box(
+        &mut self,
+        page: usize,
+        item: &str,
+        (width, height): (f64, f64),
+        pins: &[wc_core::BoxPin],
+        renamed: &BTreeMap<String, String>,
+        removed: &std::collections::BTreeSet<String>,
+    ) -> Result<Vec<String>, String> {
+        let pg = self.project.pages.get(page).ok_or("no page")?;
+        let placed = pg.symbol(item).ok_or_else(|| format!("no item {item} on this page"))?;
+        let symbol_id = placed.symbol.clone();
+        let old = self
+            .symbols
+            .get(&symbol_id)
+            .cloned()
+            .ok_or_else(|| format!("symbol {symbol_id} is not loaded"))?;
+        if wc_core::black_box_layout(&old).is_none() {
+            return Err(format!("{item} is not a black box"));
+        }
+        // The version Undo goes back to is the one the lock pins: a file changed outside the
+        // app since would be lost.
+        if self.project.lock.symbols.get(&symbol_id).map(|e| e.hash.as_str()) != Some(old.hash().as_str()) {
+            return Err(format!(
+                "the file of symbol {symbol_id} is not the version the project pins (changed outside the app?); reopen the project before editing the box"
+            ));
+        }
+        // Every page that places the box changes with it: none may be held by someone else.
+        if let Some((p, who)) = self.project.pages.iter().find_map(|p| {
+            let who = self.held_by_others.get(&p.id)?;
+            p.symbols.iter().any(|s| s.symbol == symbol_id).then_some((p, who))
+        }) {
+            return Err(format!(
+                "{who} has page {} open, which places this box too; it can be changed once they leave it",
+                p.number
+            ));
+        }
+        let mut new = wc_core::black_box(&symbol_id, &old.name, width, height, pins).map_err(|e| e.to_string())?;
+        new.tag_at = old.tag_at;
+        new.description.clone_from(&old.description);
+        new.source.clone_from(&old.source);
+        new.role = old.role;
+        new.letter_code.clone_from(&old.letter_code);
+        let renamed: BTreeMap<&str, &str> = renamed
+            .iter()
+            .filter(|(from, to)| from != to && old.pin(from).is_some() && !removed.contains(*from))
+            .map(|(from, to)| (from.as_str(), to.as_str()))
+            .collect();
+        if let Some((_, to)) = renamed.iter().find(|(_, to)| new.pin(to).is_none()) {
+            return Err(format!("the box has no connection point {to} to rename a point to"));
+        }
+        let removed: Vec<&str> = removed
+            .iter()
+            .filter(|n| old.pin(n).is_some())
+            .map(String::as_str)
+            .collect();
+        if new == old && renamed.is_empty() && removed.is_empty() {
+            return Ok(Vec::new());
+        }
+        // What an old point is now: its new name, or `None` when it is gone. A name another
+        // point was renamed to, or a new point took, is that point's, not this one's.
+        let taken: Vec<&str> = renamed.values().copied().collect();
+        let now_of = |pin: &str| -> Option<String> {
+            if removed.contains(&pin) {
+                return None;
+            }
+            if let Some(to) = renamed.get(pin) {
+                return Some((*to).to_owned());
+            }
+            (!taken.contains(&pin) && new.pin(pin).is_some()).then(|| pin.to_owned())
+        };
+        // Every placed copy of the symbol changes: name the others, and the wires on points
+        // that are gone or moved. Each wire end that changes: (page, wire, which end, new end).
+        let mut warnings = Vec::new();
+        let mut ends: Vec<(usize, usize, usize, Endpoint)> = Vec::new();
+        let mut others = 0usize;
+        for (pi, p) in self.project.pages.iter().enumerate() {
+            let users: Vec<&str> = p
+                .symbols
+                .iter()
+                .filter(|s| s.symbol == symbol_id)
+                .map(|s| s.id.as_str())
+                .collect();
+            others += users.iter().filter(|u| !(pi == page && **u == item)).count();
+            for (wi, w) in p.wires.iter().enumerate() {
+                for (k, end) in [&w.from, &w.to].into_iter().enumerate() {
+                    let Endpoint::Pin { item: on, pin } = end else {
+                        continue;
+                    };
+                    if !users.contains(&on.as_str()) {
+                        continue;
+                    }
+                    match (old.pin(pin), now_of(pin).and_then(|n| new.pin(&n))) {
+                        (_, None) => {
+                            warnings.push(format!(
+                                "wire {} on page {} ended on connection point {pin} of {on}, which is gone: its end stays where the point was",
+                                w.id, p.number
+                            ));
+                            if let Some(at) = self.pin_pos(p, on, pin) {
+                                ends.push((pi, wi, k, Endpoint::Point { at }));
+                            }
+                        }
+                        (Some(a), Some(b)) => {
+                            if a.at.distance(b.at) > 1e-6 || a.dir != b.dir {
+                                warnings.push(format!(
+                                    "wire {} on page {} ends on connection point {} of {on}, which moved: check its route",
+                                    w.id, p.number, b.name
+                                ));
+                            }
+                            if b.name != *pin {
+                                ends.push((
+                                    pi,
+                                    wi,
+                                    k,
+                                    Endpoint::Pin {
+                                        item: on.clone(),
+                                        pin: b.name.clone(),
+                                    },
+                                ));
+                            }
+                        }
+                        (None, Some(_)) => {}
+                    }
+                }
+            }
+        }
+        if others > 0 {
+            warnings.push(format!(
+                "{others} other placed box{} use{} the same symbol and changed too",
+                if others == 1 { "" } else { "es" },
+                if others == 1 { "s" } else { "" }
+            ));
+        }
+        self.write_symbol_file(&new)?;
+        self.checkpoint();
+        self.project.lock.symbols.insert(
+            symbol_id.clone(),
+            wc_core::LockEntry {
+                source: "project".into(),
+                hash: new.hash(),
+            },
+        );
+        self.symbol_versions.insert(old.hash(), old);
+        self.symbol_versions.insert(new.hash(), new.clone());
+        self.symbols.insert(symbol_id.clone(), new);
+        for (pi, wi, k, to) in ends {
+            if let Some(w) = self.project.pages.get_mut(pi).and_then(|p| p.wires.get_mut(wi)) {
+                *(if k == 0 { &mut w.from } else { &mut w.to }) = to;
+            }
+        }
+        Ok(warnings)
+    }
+
     pub fn add_wire(&mut self, page: usize, from: Endpoint, to: Endpoint, via: Vec<Point>) {
         self.checkpoint();
         if let Some(pg) = self.project.pages.get_mut(page) {
@@ -3254,6 +3415,303 @@ pub(crate) mod tests {
         assert_eq!(reopened.symbols[&box_id].category, "Black box");
         // The first box, undone, left no symbol file behind (#490).
         assert!(store::read_vendored_symbol(&o.dir, &symbol_id).is_err());
+    }
+
+    #[test]
+    fn a_black_box_is_resized_and_its_points_edited_as_one_undo_step() {
+        use wc_core::{BoxPin, BoxSide};
+        let pin = |name: &str, side, offset| BoxPin {
+            name: name.into(),
+            side,
+            offset,
+        };
+        let (_tmp, mut o) = project();
+        let pins = [
+            pin("IN", BoxSide::Left, 5.0),
+            pin("OUT", BoxSide::Right, 5.0),
+            pin("PE", BoxSide::Bottom, 10.0),
+        ];
+        let id = o
+            .add_black_box(1, Point::new(40.0, 40.0), Point::new(60.0, 50.0), &pins, None)
+            .unwrap();
+        let symbol_id = format!("box.{}.{id}", o.project.pages[1].id);
+        for p in ["IN", "OUT", "PE"] {
+            o.add_wire(
+                1,
+                Endpoint::Pin {
+                    item: id.clone(),
+                    pin: p.into(),
+                },
+                Endpoint::Point {
+                    at: Point::new(0.0, 0.0),
+                },
+                Vec::new(),
+            );
+        }
+        let wire_on = |o: &Open, i: usize| match &o.project.pages[1].wires[i].from {
+            Endpoint::Pin { pin, .. } => pin.clone(),
+            Endpoint::Point { .. } => String::new(),
+        };
+        let old = o.symbols[&symbol_id].clone();
+        let old_lock = o.project.lock.symbols[&symbol_id].clone();
+        let steps = o.undo_mark();
+
+        // Wider and taller; OUT renamed to Q and kept, PE removed, a new point A added.
+        let renamed: BTreeMap<String, String> = [("OUT".to_owned(), "Q".to_owned())].into_iter().collect();
+        let removed: std::collections::BTreeSet<String> = ["PE".to_owned()].into_iter().collect();
+        let new_pins = [
+            pin("IN", BoxSide::Left, 5.0),
+            pin("Q", BoxSide::Right, 5.0),
+            pin("A", BoxSide::Top, 10.0),
+        ];
+        let warnings = o
+            .edit_black_box(1, &id, (30.0, 20.0), &new_pins, &renamed, &removed)
+            .unwrap();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[0].contains("connection point Q") && warnings[0].contains("moved"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[1].contains("connection point PE") && warnings[1].contains("gone"),
+            "{warnings:?}"
+        );
+        assert_eq!(o.undo_mark(), steps + 1, "one undo step");
+        let new = o.symbols[&symbol_id].clone();
+        assert_eq!(wc_core::black_box_layout(&new), Some((30.0, 20.0, new_pins.to_vec())));
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), new);
+        assert_eq!(o.project.lock.symbols[&symbol_id].hash, new.hash());
+        assert_eq!(wire_on(&o, 1), "Q", "the wire follows the renamed point");
+        assert_eq!(
+            o.project.pages[1].wires[2].from,
+            Endpoint::Point {
+                at: Point::new(50.0, 50.0)
+            },
+            "the wire on the removed point keeps its end where the point was"
+        );
+        let page = o.project.pages[1].clone();
+        assert_eq!(o.pin_pos(&page, &id, "Q"), Some(Point::new(70.0, 45.0)));
+
+        // Undo puts back the earlier version: symbol, file, lock and the wire's point.
+        assert!(o.undo());
+        assert_eq!(o.symbols[&symbol_id], old);
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), old);
+        assert_eq!(o.project.lock.symbols[&symbol_id], old_lock);
+        assert_eq!(wire_on(&o, 1), "OUT");
+        assert_eq!(wire_on(&o, 2), "PE");
+        assert!(o.redo());
+        assert_eq!(o.symbols[&symbol_id], new);
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), new);
+
+        // Nothing changed: no undo step. A refused box changes nothing either.
+        let steps = o.undo_mark();
+        assert!(
+            o.edit_black_box(1, &id, (30.0, 20.0), &new_pins, &BTreeMap::new(), &Default::default())
+                .unwrap()
+                .is_empty()
+        );
+        let off = [pin("IN", BoxSide::Left, 50.0)];
+        assert!(
+            o.edit_black_box(1, &id, (30.0, 20.0), &off, &BTreeMap::new(), &Default::default())
+                .is_err()
+        );
+        o.fail_symbol_writes.push_back(true);
+        assert!(
+            o.edit_black_box(1, &id, (40.0, 20.0), &new_pins, &BTreeMap::new(), &Default::default())
+                .is_err()
+        );
+        assert_eq!(o.undo_mark(), steps);
+        assert_eq!(o.symbols[&symbol_id], new);
+
+        // Role and letter code are kept.
+        let mut kept = o.symbols[&symbol_id].clone();
+        kept.letter_code = "A".into();
+        kept.role = wc_core::symbol::SymbolRole::Main;
+        o.symbols.insert(symbol_id.clone(), kept.clone());
+        o.project.lock.symbols.get_mut(&symbol_id).unwrap().hash = kept.hash();
+        o.edit_black_box(1, &id, (35.0, 20.0), &new_pins, &BTreeMap::new(), &Default::default())
+            .unwrap();
+        let edited = &o.symbols[&symbol_id];
+        assert_eq!(
+            (edited.letter_code.as_str(), edited.role),
+            ("A", wc_core::symbol::SymbolRole::Main)
+        );
+
+        // A loaded version the lock does not pin (its file changed outside the app) is not
+        // overwritten: Undo could not bring the pinned one back.
+        let mut stray = o.symbols[&symbol_id].clone();
+        stray.name = "changed outside".into();
+        o.symbols.insert(symbol_id.clone(), stray);
+        let steps = o.undo_mark();
+        let err = o
+            .edit_black_box(1, &id, (40.0, 20.0), &new_pins, &BTreeMap::new(), &Default::default())
+            .unwrap_err();
+        assert!(err.contains("not the version the project pins"), "{err}");
+        assert_eq!(o.undo_mark(), steps);
+        o.symbols.insert(
+            symbol_id.clone(),
+            o.symbol_versions[&o.project.lock.symbols[&symbol_id].hash].clone(),
+        );
+
+        // A page someone else holds that places the box refuses the edit.
+        let held = o.project.pages[1].id.clone();
+        o.held_by_others.insert(held.clone(), "Ola".into());
+        let err = o
+            .edit_black_box(1, &id, (40.0, 20.0), &new_pins, &BTreeMap::new(), &Default::default())
+            .unwrap_err();
+        assert!(err.contains("Ola has page"), "{err}");
+        assert_eq!(o.undo_mark(), steps);
+        o.held_by_others.remove(&held);
+
+        // So does another held page that places the same box, though it is not the one edited:
+        // the symbol file, the lock and the undo history stay as they were.
+        o.place(0, &symbol_id, Point::new(20.0, 20.0)).unwrap();
+        let other = o.project.pages[0].id.clone();
+        o.held_by_others.insert(other.clone(), "Kari".into());
+        let before = o.symbols[&symbol_id].clone();
+        let lock_before = o.project.lock.symbols[&symbol_id].clone();
+        let steps = o.undo_mark();
+        let err = o
+            .edit_black_box(1, &id, (40.0, 20.0), &new_pins, &BTreeMap::new(), &Default::default())
+            .unwrap_err();
+        assert!(err.contains("Kari has page 1 open"), "{err}");
+        assert_eq!(o.undo_mark(), steps);
+        assert_eq!(o.symbols[&symbol_id], before);
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), before);
+        assert_eq!(o.project.lock.symbols[&symbol_id], lock_before);
+        o.held_by_others.remove(&other);
+        assert!(
+            o.edit_black_box(1, &id, (40.0, 20.0), &new_pins, &BTreeMap::new(), &Default::default())
+                .is_ok()
+        );
+
+        // Only a black box is edited this way.
+        let coil = o.place(1, "wc.coil", Point::new(120.0, 20.0)).unwrap();
+        let err = o
+            .edit_black_box(1, &coil, (30.0, 20.0), &[], &BTreeMap::new(), &Default::default())
+            .unwrap_err();
+        assert!(err.contains("not a black box"), "{err}");
+    }
+
+    #[test]
+    fn a_box_file_changed_outside_the_app_is_not_overwritten_by_an_edit() {
+        use wc_core::{BoxPin, BoxSide};
+        let (_tmp, mut o) = project();
+        let pins = [BoxPin {
+            name: "1".into(),
+            side: BoxSide::Left,
+            offset: 5.0,
+        }];
+        let id = o
+            .add_black_box(1, Point::new(40.0, 40.0), Point::new(60.0, 50.0), &pins, None)
+            .unwrap();
+        let symbol_id = format!("box.{}.{id}", o.project.pages[1].id);
+        o.save().unwrap();
+        // Another program writes another box into the file; the project still pins the first.
+        let outside = wc_core::black_box(&symbol_id, "Black box", 50.0, 50.0, &pins).unwrap();
+        store::write_vendored_symbol(&o.dir, &outside).unwrap();
+        let mut reopened = Open::load(&o.dir).unwrap();
+        let lock = reopened.project.lock.symbols[&symbol_id].clone();
+        let steps = reopened.undo_mark();
+        let result = reopened.edit_black_box(1, &id, (30.0, 20.0), &pins, &BTreeMap::new(), &Default::default());
+        if reopened.symbols.get(&symbol_id).map(Symbol::hash) == Some(lock.hash.clone()) {
+            // The pinned version was loaded instead of the file's: editing it is safe.
+            assert!(result.is_ok(), "{result:?}");
+        } else {
+            let err = result.unwrap_err();
+            assert!(err.contains("not the version the project pins"), "{err}");
+            assert_eq!(
+                store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(),
+                outside,
+                "file kept"
+            );
+            assert_eq!(reopened.project.lock.symbols[&symbol_id], lock, "lock kept");
+            assert_eq!(reopened.undo_mark(), steps, "no undo step");
+        }
+    }
+
+    #[test]
+    fn a_removed_point_whose_name_is_reused_lets_go_of_its_wire() {
+        use wc_core::{BoxPin, BoxSide};
+        let pin = |name: &str, side, offset| BoxPin {
+            name: name.into(),
+            side,
+            offset,
+        };
+        let (_tmp, mut o) = project();
+        let pins = [pin("1", BoxSide::Left, 5.0), pin("2", BoxSide::Right, 5.0)];
+        let id = o
+            .add_black_box(1, Point::new(40.0, 40.0), Point::new(60.0, 50.0), &pins, None)
+            .unwrap();
+        for p in ["1", "2"] {
+            o.add_wire(
+                1,
+                Endpoint::Pin {
+                    item: id.clone(),
+                    pin: p.into(),
+                },
+                Endpoint::Point {
+                    at: Point::new(0.0, 0.0),
+                },
+                Vec::new(),
+            );
+        }
+        // Point 1 taken off; point 2 renamed 1 and moved where 1 was; a new 2 where 2 was.
+        let renamed: BTreeMap<String, String> = [("2".to_owned(), "1".to_owned())].into_iter().collect();
+        let removed: std::collections::BTreeSet<String> = ["1".to_owned()].into_iter().collect();
+        let warnings = o
+            .edit_black_box(
+                1,
+                &id,
+                (20.0, 10.0),
+                &[pin("1", BoxSide::Left, 5.0), pin("2", BoxSide::Right, 5.0)],
+                &renamed,
+                &removed,
+            )
+            .unwrap();
+        assert!(
+            warnings.iter().any(|w| w.contains("w1") && w.contains("gone")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("w2") && w.contains("moved")),
+            "{warnings:?}"
+        );
+        let wires = &o.project.pages[1].wires;
+        assert_eq!(
+            wires[0].from,
+            Endpoint::Point {
+                at: Point::new(40.0, 45.0)
+            },
+            "not left on the point that took its name"
+        );
+        assert_eq!(
+            wires[1].from,
+            Endpoint::Pin {
+                item: id.clone(),
+                pin: "1".into()
+            }
+        );
+        // A swap keeps both points and both wires.
+        let swap: BTreeMap<String, String> = [("1".to_owned(), "2".to_owned()), ("2".to_owned(), "1".to_owned())]
+            .into_iter()
+            .collect();
+        o.edit_black_box(
+            1,
+            &id,
+            (20.0, 10.0),
+            &[pin("2", BoxSide::Left, 5.0), pin("1", BoxSide::Right, 5.0)],
+            &swap,
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            o.project.pages[1].wires[1].from,
+            Endpoint::Pin {
+                item: id.clone(),
+                pin: "2".into()
+            }
+        );
     }
 
     #[test]

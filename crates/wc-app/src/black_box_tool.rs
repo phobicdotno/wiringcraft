@@ -1,9 +1,12 @@
 //! The black box tool: drag a rectangle on the page, click its edges to add connection points
 //! (a name is asked for each), then click inside it or press Enter to tag it and put it on the
-//! page ([`crate::state::Open::add_black_box`]).
+//! page ([`crate::state::Open::add_black_box`]). A placed box is changed afterwards in the
+//! properties panel with a [`BoxEdit`] ([`crate::state::Open::edit_black_box`]).
+
+use std::collections::BTreeMap;
 
 use wc_core::geom::Point;
-use wc_core::{BoxPin, BoxSide};
+use wc_core::{BoxPin, BoxSide, Symbol};
 
 /// A black box being drawn on one page.
 #[derive(Debug, Clone, PartialEq)]
@@ -66,6 +69,126 @@ impl BoxDraft {
             .map(|n: usize| n.to_string())
             .find(|n| !self.pins.iter().any(|p| p.name == *n))
             .unwrap_or_default()
+    }
+}
+
+/// One connection point in the black box form.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PinRow {
+    /// Its name in the box's symbol, for a point the box had: renaming it moves its wires along.
+    pub was: Option<String>,
+    pub name: String,
+    pub side: BoxSide,
+    pub offset: f64,
+}
+
+/// The properties panel's form for a placed black box: its size and connection points as typed,
+/// applied as one change.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoxEdit {
+    pub width: f64,
+    pub height: f64,
+    pub rows: Vec<PinRow>,
+    /// Why the last Apply was refused.
+    pub error: Option<String>,
+    base: (f64, f64, Vec<BoxPin>),
+}
+
+impl BoxEdit {
+    /// The form for black box symbol `sym`; `None` when it is not one.
+    pub fn load(sym: &Symbol) -> Option<Self> {
+        let (width, height, pins) = wc_core::black_box_layout(sym)?;
+        Some(Self {
+            width,
+            height,
+            rows: pins
+                .iter()
+                .map(|p| PinRow {
+                    was: Some(p.name.clone()),
+                    name: p.name.clone(),
+                    side: p.side,
+                    offset: p.offset,
+                })
+                .collect(),
+            error: None,
+            base: (width, height, pins),
+        })
+    }
+
+    /// The connection points as typed.
+    pub fn pins(&self) -> Vec<BoxPin> {
+        self.rows
+            .iter()
+            .map(|r| BoxPin {
+                name: r.name.trim().to_owned(),
+                side: r.side,
+                offset: r.offset,
+            })
+            .collect()
+    }
+
+    /// The points renamed in the form: old name to new.
+    pub fn renamed(&self) -> BTreeMap<String, String> {
+        self.rows
+            .iter()
+            .filter_map(|r| {
+                let was = r.was.as_ref()?;
+                let now = r.name.trim();
+                (was != now).then(|| (was.clone(), now.to_owned()))
+            })
+            .collect()
+    }
+
+    /// The points the box had that the form no longer has (by identity, not by name: a new
+    /// point may take a removed one's name).
+    pub fn removed(&self) -> std::collections::BTreeSet<String> {
+        self.base
+            .2
+            .iter()
+            .filter(|p| !self.rows.iter().any(|r| r.was.as_deref() == Some(p.name.as_str())))
+            .map(|p| p.name.clone())
+            .collect()
+    }
+
+    /// Whether anything was typed that the box does not have yet: a rename counts even when
+    /// the points end up as they were, since the wires on the renamed point follow it.
+    pub fn changed(&self) -> bool {
+        (self.width, self.height, self.pins()) != self.base || !self.renamed().is_empty() || !self.removed().is_empty()
+    }
+
+    /// Add a point: the lowest number no point has, on the left edge at the first free 5 mm
+    /// step (the middle of the edge when every step is taken).
+    pub fn add_row(&mut self) {
+        let name = (1..)
+            .map(|n: usize| n.to_string())
+            .find(|n| !self.rows.iter().any(|r| r.name.trim() == n))
+            .unwrap_or_default();
+        let taken = |o: f64| {
+            self.rows
+                .iter()
+                .any(|r| r.side == BoxSide::Left && (r.offset - o).abs() < 1e-6)
+        };
+        let offset = (1..)
+            .map(|n| f64::from(n) * 5.0)
+            .take_while(|o| *o < self.height)
+            .find(|o| !taken(*o))
+            .unwrap_or(self.height / 2.0);
+        self.rows.push(PinRow {
+            was: None,
+            name,
+            side: BoxSide::Left,
+            offset,
+        });
+    }
+}
+
+/// The name of a box edge in the form.
+pub fn side_label(side: BoxSide) -> &'static str {
+    match side {
+        BoxSide::Top => "Top",
+        BoxSide::Bottom => "Bottom",
+        BoxSide::Left => "Left",
+        BoxSide::Right => "Right",
     }
 }
 
@@ -139,6 +262,52 @@ mod tests {
         assert_eq!(edge_at(min, max, p(9.5, 19.5), 1.0), Some((BoxSide::Top, 0.0)));
         assert!(inside(min, max, p(25.0, 30.0), 1.0));
         assert!(!inside(min, max, p(10.5, 30.0), 1.0));
+    }
+
+    #[test]
+    fn the_box_form_reads_a_box_and_tells_renames_and_changes() {
+        let pins = [
+            BoxPin {
+                name: "1".into(),
+                side: BoxSide::Left,
+                offset: 5.0,
+            },
+            BoxPin {
+                name: "2".into(),
+                side: BoxSide::Right,
+                offset: 5.0,
+            },
+        ];
+        let sym = wc_core::black_box("box.p1.s1", "Black box", 30.0, 20.0, &pins).unwrap();
+        let mut f = BoxEdit::load(&sym).unwrap();
+        assert_eq!((f.width, f.height, f.pins()), (30.0, 20.0, pins.to_vec()));
+        assert!(!f.changed());
+        f.rows[1].name = " OUT ".into();
+        assert!(f.changed());
+        assert_eq!(f.renamed(), [("2".to_owned(), "OUT".to_owned())].into_iter().collect());
+        f.add_row();
+        assert_eq!(
+            (f.rows[2].name.as_str(), f.rows[2].side, f.rows[2].offset),
+            ("2", BoxSide::Left, 10.0)
+        );
+        assert_eq!(f.rows[2].was, None);
+        assert_eq!(f.renamed().len(), 1, "a new point is no rename");
+        let mut other = sym.clone();
+        other.category = "Relays".into();
+        assert!(BoxEdit::load(&other).is_none());
+
+        // Point 1 removed, 2 renamed to 1 and moved where 1 was, a new 2 where 2 was: the
+        // points are as before, but the wires on the old 2 follow it, so it is a change.
+        let mut f = BoxEdit::load(&sym).unwrap();
+        f.rows.remove(0);
+        f.rows[0].name = "1".into();
+        f.rows[0].side = BoxSide::Left;
+        f.add_row();
+        f.rows[1].side = BoxSide::Right;
+        f.rows[1].offset = 5.0;
+        assert_eq!(f.pins(), pins.to_vec());
+        assert!(f.changed());
+        assert_eq!(f.removed(), ["1".to_owned()].into_iter().collect());
     }
 
     #[test]

@@ -220,6 +220,38 @@ pub fn black_box(id: &str, name: &str, width: f64, height: f64, pins: &[BoxPin])
     })
 }
 
+/// The size (width, height) and connection points of a black box made by [`black_box`], read
+/// back from its symbol so the box can be edited: `None` for any other symbol.
+pub fn black_box_layout(sym: &Symbol) -> Option<(f64, f64, Vec<BoxPin>)> {
+    if sym.category != "Black box" {
+        return None;
+    }
+    let [Shape::Rect { min, max }] = sym.graphics.as_slice() else {
+        return None;
+    };
+    if min.x != 0.0 || min.y != 0.0 {
+        return None;
+    }
+    let pins = sym
+        .pins
+        .iter()
+        .map(|p| {
+            let (side, offset) = match p.dir {
+                PinDir::Up => (BoxSide::Top, p.at.x),
+                PinDir::Down => (BoxSide::Bottom, p.at.x),
+                PinDir::Left => (BoxSide::Left, p.at.y),
+                PinDir::Right => (BoxSide::Right, p.at.y),
+            };
+            BoxPin {
+                name: p.name.clone(),
+                side,
+                offset,
+            }
+        })
+        .collect();
+    Some((max.x, max.y, pins))
+}
+
 #[cfg(test)]
 mod black_box_tests {
     use super::*;
@@ -267,6 +299,25 @@ mod black_box_tests {
         // The top-left corner is on the top and the left edge.
         let corner = [pin("1", BoxSide::Left, 0.0), pin("2", BoxSide::Top, 0.0)];
         assert!(black_box("b", "", 10.0, 10.0, &corner).is_err());
+    }
+
+    #[test]
+    fn a_black_box_reads_back_its_size_and_points() -> crate::Result<()> {
+        let pins = [
+            pin("1", BoxSide::Left, 5.0),
+            pin("2", BoxSide::Right, 15.0),
+            pin("PE", BoxSide::Bottom, 40.0),
+            pin("X", BoxSide::Top, 0.0),
+        ];
+        let s = black_box("box.a1", "-A1", 40.0, 20.0, &pins)?;
+        assert_eq!(black_box_layout(&s), Some((40.0, 20.0, pins.to_vec())));
+        // Built again from what was read, it is the same symbol.
+        let (w, h, read) = black_box_layout(&s).unwrap_or_default();
+        assert_eq!(black_box("box.a1", "-A1", w, h, &read)?, s);
+        let mut other = s.clone();
+        other.category = "Relays".into();
+        assert_eq!(black_box_layout(&other), None);
+        Ok(())
     }
 
     #[test]

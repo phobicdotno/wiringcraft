@@ -65,6 +65,9 @@ pub struct PanelState {
     /// the wires it belongs to.
     spec: [SpecField; 3],
     spec_for: (usize, Vec<String>),
+    /// The form for the selected black box's size and points: the page, item and symbol
+    /// version it was read from (another version, after an Undo say, reads it again).
+    black_box: Option<((usize, String, String), crate::black_box_tool::BoxEdit)>,
 }
 
 impl PanelState {
@@ -873,6 +876,149 @@ fn with_fields(s: &Shape, v: &[f64]) -> Shape {
     out
 }
 
+/// The selected black box's size and connection points, changed together with Apply as one
+/// undo step ([`Open::edit_black_box`]).
+fn black_box_section(
+    ui: &mut egui::Ui,
+    open: &mut Open,
+    ed: &mut Editor,
+    ps: &mut PanelState,
+    page: usize,
+    id: &str,
+    t: &Theme,
+) {
+    use crate::black_box_tool::BoxEdit;
+    let Some(sym) = open
+        .project
+        .pages
+        .get(page)
+        .and_then(|p| p.symbol(id))
+        .and_then(|s| open.symbols.get(&s.symbol))
+    else {
+        return;
+    };
+    let key = (page, id.to_owned(), sym.hash());
+    if ps.black_box.as_ref().map(|(k, _)| k) != Some(&key) {
+        ps.black_box = BoxEdit::load(sym).map(|f| (key.clone(), f));
+    }
+    let Some((_, form)) = ps.black_box.as_mut() else {
+        return;
+    };
+    ui.add_space(6.0);
+    subsection(ui, "Black box");
+    // The fields belong to this box: a value half typed for another box is not carried over.
+    let done = ui
+        .push_id(&key, |ui| black_box_form(ui, open, ed, form, page, id, t))
+        .inner;
+    if done {
+        ps.black_box = None;
+    }
+}
+
+/// A size field of the black box form. A loaded size outside 1-5000 mm is kept until the user
+/// types or drags a new one: egui clamps a field's value to its range whenever the field loses
+/// focus, even untouched, so the range is applied here, to changes only.
+fn box_size_field(ui: &mut egui::Ui, value: &mut f64) {
+    let before = *value;
+    // Shown in full, so that leaving the field untouched reads back the very same number.
+    let r = ui.add(
+        egui::DragValue::new(value)
+            .speed(0.5)
+            .suffix(" mm")
+            .custom_formatter(|v, _| format!("{v}")),
+    );
+    if r.changed() && *value != before {
+        *value = value.clamp(1.0, 5000.0);
+    }
+}
+
+/// The fields of the black box form; `true` when it is done with (applied or reset).
+fn black_box_form(
+    ui: &mut egui::Ui,
+    open: &mut Open,
+    ed: &mut Editor,
+    form: &mut crate::black_box_tool::BoxEdit,
+    page: usize,
+    id: &str,
+    t: &Theme,
+) -> bool {
+    use crate::black_box_tool::side_label;
+    use wc_core::BoxSide;
+    egui::Grid::new("box-size")
+        .num_columns(2)
+        .spacing([8.0, 6.0])
+        .show(ui, |ui| {
+            ui.label("Width");
+            box_size_field(ui, &mut form.width);
+            ui.end_row();
+            ui.label("Height");
+            box_size_field(ui, &mut form.height);
+            ui.end_row();
+        });
+    ui.label(RichText::new("Connection points: name, edge and mm along it").color(t.faint));
+    let mut remove = None;
+    egui::Grid::new("box-pins")
+        .num_columns(4)
+        .spacing([6.0, 4.0])
+        .show(ui, |ui| {
+            for (i, row) in form.rows.iter_mut().enumerate() {
+                ui.add(egui::TextEdit::singleline(&mut row.name).desired_width(48.0));
+                egui::ComboBox::from_id_salt(("box-side", i))
+                    .width(70.0)
+                    .selected_text(side_label(row.side))
+                    .show_ui(ui, |ui| {
+                        for side in [BoxSide::Top, BoxSide::Bottom, BoxSide::Left, BoxSide::Right] {
+                            ui.selectable_value(&mut row.side, side, side_label(side));
+                        }
+                    });
+                ui.add(egui::DragValue::new(&mut row.offset).speed(0.5).suffix(" mm"));
+                if ui.small_button("\u{2715}").on_hover_text("Remove this point").clicked() {
+                    remove = Some(i);
+                }
+                ui.end_row();
+            }
+        });
+    if let Some(i) = remove {
+        form.rows.remove(i);
+    }
+    let (mut apply, mut reset) = (false, false);
+    ui.horizontal(|ui| {
+        if ui.small_button("+ Point").clicked() {
+            form.add_row();
+        }
+        let changed = form.changed();
+        apply = ui.add_enabled(changed, egui::Button::new("Apply")).clicked();
+        reset = ui.add_enabled(changed, egui::Button::new("Reset")).clicked();
+    });
+    if reset {
+        return true;
+    }
+    if apply {
+        match open.edit_black_box(
+            page,
+            id,
+            (form.width, form.height),
+            &form.pins(),
+            &form.renamed(),
+            &form.removed(),
+        ) {
+            Ok(warnings) => {
+                ed.message = if warnings.is_empty() {
+                    "Black box changed.".into()
+                } else {
+                    format!("Black box changed. Check: {}.", warnings.join("; "))
+                };
+                return true;
+            }
+            Err(e) => form.error = Some(e),
+        }
+    }
+    if let Some(err) = &form.error {
+        ui.label(RichText::new(err).color(t.error).small());
+    }
+    false
+}
+
 fn committed(r: &egui::Response) -> bool {
     r.lost_focus() || (r.has_focus() && r.ctx.input(|i| i.key_pressed(egui::Key::Enter)))
 }
@@ -1062,7 +1208,13 @@ fn selection_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps:
             if let Some(tag) = placed.tag.clone() {
                 device_section(ui, open, ps, &tag, t);
             }
-            if let Some(sym) = open.symbols.get(&placed.symbol) {
+            if open
+                .symbols
+                .get(&placed.symbol)
+                .is_some_and(|s| wc_core::black_box_layout(s).is_some())
+            {
+                black_box_section(ui, open, ed, ps, page_idx, &id, t);
+            } else if let Some(sym) = open.symbols.get(&placed.symbol) {
                 ui.add_space(6.0);
                 subsection(ui, "Pins");
                 let names: Vec<&str> = sym.pins.iter().map(|p| p.name.as_str()).collect();
@@ -1986,6 +2138,77 @@ mod tests {
             texts.iter().all(|t| t != "none"),
             "the jumper's part is shown: {texts:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_black_box_size_outside_the_field_range_is_kept_until_it_is_edited() -> Result<(), Box<dyn std::error::Error>> {
+        use wc_core::{BoxPin, BoxSide};
+        let (_tmp, mut o) = crate::state::tests::project();
+        let pins = [BoxPin {
+            name: "1".into(),
+            side: BoxSide::Left,
+            offset: 5.0,
+        }];
+        let id = o.add_black_box(
+            1,
+            wc_core::geom::Point::new(40.0, 40.0),
+            wc_core::geom::Point::new(60.0, 50.0),
+            &pins,
+            None,
+        )?;
+        let symbol_id = format!("box.{}.{id}", o.project.pages[1].id);
+        // A box narrower than the field's 1 mm minimum, as an older file could hold.
+        let narrow = wc_core::black_box(&symbol_id, "Black box", 0.5, 10.0, &pins)?;
+        o.symbols.insert(symbol_id.clone(), narrow.clone());
+        let mut ed = Editor::default();
+        let mut ps = PanelState::default();
+        let t = Theme::of(&egui::Context::default());
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut frame_with = |o: &mut Open, ps: &mut PanelState, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| black_box_section(ui, o, &mut ed, ps, 1, &id, &t));
+            });
+        };
+        let tab = || egui::Event::Key {
+            key: egui::Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame_with(&mut o, &mut ps, Vec::new());
+        let form = |ps: &PanelState| ps.black_box.as_ref().map(|(_, f)| (f.width, f.changed()));
+        assert_eq!(form(&ps), Some((0.5, false)), "showing the form changes nothing");
+        // Tabbing into the Width field and on out of it without typing changes nothing either.
+        for _ in 0..3 {
+            frame_with(&mut o, &mut ps, vec![tab()]);
+            frame_with(&mut o, &mut ps, Vec::new());
+        }
+        assert_eq!(form(&ps), Some((0.5, false)), "focus passing through changes nothing");
+        // Nor for a size that the field's usual rounding would show differently.
+        let mut odd = PanelState::default();
+        let odd_box = wc_core::black_box(&symbol_id, "Black box", 0.500001, 10.0, &pins)?;
+        o.symbols.insert(symbol_id.clone(), odd_box);
+        frame_with(&mut o, &mut odd, Vec::new());
+        for _ in 0..3 {
+            frame_with(&mut o, &mut odd, vec![tab()]);
+            frame_with(&mut o, &mut odd, Vec::new());
+        }
+        assert_eq!(form(&odd), Some((0.500001, false)));
+        o.symbols.insert(symbol_id.clone(), narrow.clone());
+        let mut frame = |o: &mut Open, ps: &mut PanelState| frame_with(o, ps, Vec::new());
+        // Renaming a point leaves the width alone.
+        if let Some((_, f)) = ps.black_box.as_mut() {
+            f.rows[0].name = "A".into();
+        }
+        frame(&mut o, &mut ps);
+        assert_eq!(form(&ps), Some((0.5, true)));
         Ok(())
     }
 
