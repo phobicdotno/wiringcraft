@@ -509,6 +509,60 @@ impl Open {
         let text = std::fs::read(dxf).map_err(|e| format!("{}: {e}", dxf.display()))?;
         let (footprint, warnings) = wc_import::dxf::footprint(&String::from_utf8_lossy(&text))
             .map_err(|e| format!("{}: {e}", dxf.display()))?;
+        let (w, h) = (footprint.width, footprint.height);
+        let msg = self.store_in_library_part(
+            id,
+            |part| part.footprint = Some(footprint),
+            |a, b| a.footprint == b.footprint,
+            |path| {
+                format!(
+                    "Footprint of {id}: {} x {} mm, stored in {}",
+                    wc_core::geom::format_length(w),
+                    wc_core::geom::format_length(h),
+                    path.display()
+                )
+            },
+        )?;
+        Ok(with_warnings(msg, &warnings))
+    }
+
+    /// Store the size of the maker's 3D model in the STEP file `step` with part `id` (#501), as
+    /// `wiringcraft import model-step` does: the part is written with the model size in the
+    /// library source the project takes it from, and the project's pinned copy follows as one
+    /// undo step, so a part without a width and height or footprint gets its size on the plate.
+    /// Returns what was done, with the model's warnings.
+    pub fn attach_model(&mut self, id: &str, step: &Path) -> Result<String, String> {
+        let text = std::fs::read(step).map_err(|e| format!("{}: {e}", step.display()))?;
+        let (size, warnings) = wc_import::step::model_size(&String::from_utf8_lossy(&text))
+            .map_err(|e| format!("{}: {e}", step.display()))?;
+        let msg = self.store_in_library_part(
+            id,
+            |part| part.model = Some(size),
+            |a, b| a.model == b.model,
+            |path| {
+                format!(
+                    "3D model of {id}: {} x {} x {} mm, stored in {}",
+                    wc_core::geom::format_length(size.width),
+                    wc_core::geom::format_length(size.height),
+                    wc_core::geom::format_length(size.depth),
+                    path.display()
+                )
+            },
+        )?;
+        Ok(with_warnings(msg, &warnings))
+    }
+
+    /// Change part `id` with `change` in the library source the project takes it from and write
+    /// it back; then the project's pinned copy follows through the same update as Library →
+    /// Update (one undo step, a copy changed in the project is not overwritten). `same` tells
+    /// whether the project's copy holds the change; `done` says what was stored where.
+    fn store_in_library_part(
+        &mut self,
+        id: &str,
+        change: impl FnOnce(&mut Part),
+        same: impl Fn(&Part, &Part) -> bool,
+        done: impl FnOnce(&Path) -> String,
+    ) -> Result<String, String> {
         let lib = wc_library::Library::open(&self.dir, &self.project).map_err(|e| e.to_string())?;
         let path = lib
             .locate(ItemKind::Part, id)
@@ -518,23 +572,15 @@ impl Open {
         if part.id != id {
             return Err(format!("{} holds part {:?}, not {id:?}", path.display(), part.id));
         }
-        let (w, h) = (footprint.width, footprint.height);
-        part.footprint = Some(footprint);
+        change(&mut part);
         let json = store::to_json(&part).map_err(|e| e.to_string())?;
         store::write_if_changed(&path, &json).map_err(|e| format!("{}: {e}", path.display()))?;
-        let mut msg = format!(
-            "Footprint of {id}: {} x {} mm, stored in {}",
-            wc_core::geom::format_length(w),
-            wc_core::geom::format_length(h),
-            path.display()
-        );
-        // The project's pinned copy follows, through the same update as Library → Update, so
-        // a copy changed in the project is not overwritten and the step can be undone.
+        let mut msg = done(&path);
         if self.project.lock.parts.contains_key(id) {
             let lib = wc_library::Library::open(&self.dir, &self.project).map_err(|e| e.to_string())?;
             let only = [id.to_owned()];
             let updated = self.update_library_of(&lib, Some(&only), Some(ItemKind::Part));
-            let follows = self.parts.get(id).is_some_and(|p| p.footprint == part.footprint);
+            let follows = self.parts.get(id).is_some_and(|p| same(p, &part));
             match updated {
                 Ok(_) if follows => {}
                 Ok(_) => msg.push_str(&format!(
@@ -542,9 +588,6 @@ impl Open {
                 )),
                 Err(e) => msg.push_str(&format!(". The project's copy of {id} was not updated: {e}")),
             }
-        }
-        for w in &warnings {
-            msg.push_str(&format!(". Warning: {w}"));
         }
         Ok(msg)
     }
@@ -3133,6 +3176,14 @@ pub struct PropsSnapshot {
 /// The name review comments are signed with: `WIRINGCRAFT_USER`, then git's `user.name`, then
 /// the login name.
 /// Title-block fields from a form: trimmed, with empty keys and values dropped.
+/// `msg` with each warning appended.
+fn with_warnings(mut msg: String, warnings: &[String]) -> String {
+    for w in warnings {
+        msg.push_str(&format!(". Warning: {w}"));
+    }
+    msg
+}
+
 fn title_block_of(fields: &[(String, String)]) -> BTreeMap<String, String> {
     fields
         .iter()
@@ -4294,6 +4345,95 @@ pub(crate) mod tests {
         let bad = tmp.path().join("bad.dxf");
         std::fs::write(&bad, "0\nSECTION\n2\nENTITIES\n0\nENDSEC\n0\nEOF\n").unwrap();
         assert!(o.attach_footprint(pid, &bad).is_err());
+        let still: Part = store::read_json(&mine.join("parts").join(format!("{pid}.json"))).unwrap();
+        assert_eq!(still, in_lib);
+    }
+
+    #[test]
+    fn a_maker_step_model_sizes_a_part_and_one_undo_takes_it_back() {
+        let (tmp, mut o) = project();
+        let pid = "maker.relay";
+        let mine = tmp.path().join("mine");
+        let part = Part {
+            id: pid.into(),
+            manufacturer: "Maker".into(),
+            order_number: "RL-1".into(),
+            ..Part::default()
+        };
+        wc_library::write_part(&mine, &part).unwrap();
+        o.project.meta.libraries.insert(
+            0,
+            LibrarySource {
+                name: "mine".into(),
+                kind: "folder".into(),
+                location: mine.display().to_string(),
+                reference: None,
+            },
+        );
+        let tag = DeviceTag::parse("-K1").unwrap();
+        o.set_device_part(&tag, Some(pid)).unwrap();
+        o.refresh_library();
+        let pin = o.project.lock.parts[pid].hash.clone();
+        assert_eq!(
+            wc_core::panel::part_size(&o.parts[pid]),
+            None,
+            "no size before the model"
+        );
+
+        // A 22.5 x 90 x 70 mm box in metres, as the maker's model.
+        let mut data = String::new();
+        let mut id = 1;
+        for x in [0.0, 0.0225] {
+            for y in [0.0, 0.09] {
+                for z in [0.0, 0.07] {
+                    data.push_str(&format!(
+                        "#{id}=CARTESIAN_POINT('',({x:?},{y:?},{z:?}));#{}=VERTEX_POINT('',#{id});\n",
+                        id + 1
+                    ));
+                    id += 2;
+                }
+            }
+        }
+        let stp = tmp.path().join("relay.stp");
+        std::fs::write(
+            &stp,
+            format!(
+                "ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\n#900=(LENGTH_UNIT()NAMED_UNIT(*)SI_UNIT($,.METRE.));\n{data}ENDSEC;\nEND-ISO-10303-21;\n"
+            ),
+        )
+        .unwrap();
+        let err = o.attach_model("no.such", &stp).unwrap_err();
+        assert!(err.contains("none of the project's libraries"), "{err}");
+        let undo_steps = o.undo.len();
+        let msg = o.attach_model(pid, &stp).unwrap();
+        assert!(msg.contains("22.5 x 90 x 70 mm"), "{msg}");
+        assert!(!msg.contains("not updated"), "{msg}");
+        assert_eq!(o.undo.len(), undo_steps + 1, "one undo step");
+        // Stored with the part in its library, and the project's copy follows at once.
+        let in_lib: Part = store::read_json(&mine.join("parts").join(format!("{pid}.json"))).unwrap();
+        assert!(in_lib.model.is_some());
+        assert_eq!(store::read_vendored_part(&o.dir, pid).unwrap(), in_lib);
+        assert_eq!(o.parts[pid].model, in_lib.model);
+        assert_eq!(
+            wc_core::panel::part_size(&o.parts[pid]),
+            Some((22.5, 90.0)),
+            "sized by the model"
+        );
+        assert_eq!(wc_core::panel::part_depth(&o.parts[pid]), Some(70.0));
+        // Undo puts the part back as it was.
+        assert!(o.undo());
+        assert_eq!(o.project.lock.parts[pid].hash, pin);
+        assert_eq!(store::read_vendored_part(&o.dir, pid).unwrap().hash(), pin);
+        assert!(o.parts[pid].model.is_none());
+        assert_eq!(wc_core::panel::part_size(&o.parts[pid]), None);
+        assert!(o.redo());
+        assert_eq!(o.parts[pid], in_lib);
+
+        // A file that is not a whole STEP model changes nothing.
+        let bad = tmp.path().join("bad.stp");
+        std::fs::write(&bad, "ISO-10303-21;\nDATA;\n").unwrap();
+        let err = o.attach_model(pid, &bad).unwrap_err();
+        assert!(err.contains("incomplete"), "{err}");
         let still: Part = store::read_json(&mine.join("parts").join(format!("{pid}.json"))).unwrap();
         assert_eq!(still, in_lib);
     }
