@@ -163,6 +163,11 @@ fn jbig2_within(data: &[u8], globals: Option<&[u8]>, limit: usize) -> Result<(u3
     };
     let globals_limit = globals.map_or(Ok(half), share)?;
     let page_limit = share(data)?;
+    if let Some(n) = jbig2_missing_segment(data, globals)? {
+        return Err(format!(
+            "the JBIG2 picture refers to its segment {n}, which neither the picture nor its JBIG2Globals holds"
+        ));
+    }
     guarded("JBIG2", || {
         // The decoder counts every bitmap it keeps (regions, pattern and symbol dictionaries
         // and the page) against its limit and stops once they go over it, so a few bytes
@@ -238,20 +243,42 @@ fn symbol_dictionary_bytes(head: &[u8]) -> usize {
     contexts.saturating_add(exported.saturating_mul(size_of::<usize>()))
 }
 
-/// The bytes the JBIG2 decoder keeps outside its memory limit for the symbol dictionaries
-/// (7.4.2) in JBIG2 data in the embedded organization, read from their segment headers: the
-/// arithmetic decoder contexts of a dictionary that retains them, and the list of its exported
-/// symbols (one pointer each; re-exporting earlier dictionaries' symbols shares the bitmaps but
-/// not the list). The decoder keeps both until the picture is done. The walk follows the decoder's own segment parser, including generic regions of
-/// unknown length; data it cannot follow is left to the decoder, which cannot follow it either.
-fn jbig2_dictionary_bytes(data: &[u8]) -> Result<usize, String> {
-    const SYMBOLS: u8 = 0;
+/// One segment header of JBIG2 data in the embedded organization (7.2): its number, type, the
+/// segments it refers to, its data (cut at the end of the data; empty for a generic region of
+/// unknown length), and whether all of its declared data is there.
+struct Jbig2Segment<'a> {
+    number: u32,
+    kind: u8,
+    /// The referred-to segment numbers, `ref_size` bytes each.
+    refs: &'a [u8],
+    ref_size: usize,
+    data: &'a [u8],
+    complete: bool,
+}
+
+impl Jbig2Segment<'_> {
+    fn refers_to(&self) -> impl Iterator<Item = u32> + '_ {
+        self.refs
+            .chunks_exact(self.ref_size)
+            .map(|c| c.iter().fold(0u32, |n, b| (n << 8) | u32::from(*b)))
+    }
+}
+
+/// The segment type of a symbol dictionary (7.3).
+const JBIG2_SYMBOLS: u8 = 0;
+/// The segment type of the end of the file (7.3): the decoder reads nothing after it.
+const JBIG2_END_OF_FILE: u8 = 51;
+
+/// Walks the segments of JBIG2 data in the embedded organization, read from their headers,
+/// handing each to `visit` without keeping any. The walk follows the decoder's own segment
+/// parser, including generic regions of unknown length, and stops at the end of the file
+/// segment; data it cannot follow ends the walk, as the decoder cannot follow it either.
+fn jbig2_walk<'a>(data: &'a [u8], mut visit: impl FnMut(Jbig2Segment<'a>)) -> Result<(), String> {
     let be32 = |at: usize| -> Option<u32> {
         data.get(at..at.checked_add(4)?)
             .and_then(|b| b.try_into().ok())
             .map(u32::from_be_bytes)
     };
-    let mut total: usize = 0;
     let mut at = 0usize;
     while at < data.len() {
         let Some(number) = be32(at) else { break };
@@ -274,18 +301,18 @@ fn jbig2_dictionary_bytes(data: &[u8]) -> Result<usize, String> {
         } else {
             4
         };
-        pos = pos.saturating_add(count.saturating_mul(ref_size));
-        pos = pos.saturating_add(if flags & 0x40 != 0 { 4 } else { 1 });
+        let refs_end = pos.saturating_add(count.saturating_mul(ref_size));
+        let Some(ref_bytes) = data.get(pos..refs_end) else {
+            break;
+        };
+        pos = refs_end.saturating_add(if flags & 0x40 != 0 { 4 } else { 1 });
         let Some(length) = be32(pos) else { break };
         pos = pos.saturating_add(4);
-        if flags & 0x3F == SYMBOLS {
-            let end = pos.saturating_add(length as usize).min(data.len());
-            total = total.saturating_add(symbol_dictionary_bytes(data.get(pos..end).unwrap_or_default()));
-        }
+        let kind = flags & 0x3F;
         if length == u32::MAX {
             // An immediate generic region of unknown length ends with a marker and a 4-byte
             // row count (7.2.7, 7.4.6.4), searched for after its region info, flags and AT
-            // pixels, as the decoder does.
+            // pixels, as the decoder does. It counts only once its end is found.
             let Some(&region_flags) = data.get(pos + 17) else { break };
             let mmr = region_flags & 1 != 0;
             let at_bytes = match (mmr, (region_flags >> 1) & 3, region_flags & 0x10 != 0) {
@@ -302,12 +329,77 @@ fn jbig2_dictionary_bytes(data: &[u8]) -> Result<usize, String> {
             else {
                 break;
             };
+            visit(Jbig2Segment {
+                number,
+                kind,
+                refs: ref_bytes,
+                ref_size,
+                data: &[],
+                complete: true,
+            });
             at = from + end + 6;
             continue;
         }
-        at = pos.saturating_add(length as usize);
+        let declared_end = pos.saturating_add(length as usize);
+        let end = declared_end.min(data.len());
+        visit(Jbig2Segment {
+            number,
+            kind,
+            refs: ref_bytes,
+            ref_size,
+            data: data.get(pos..end).unwrap_or_default(),
+            complete: declared_end <= data.len(),
+        });
+        if kind == JBIG2_END_OF_FILE {
+            break;
+        }
+        at = declared_end;
     }
+    Ok(())
+}
+
+/// The bytes the JBIG2 decoder keeps outside its memory limit for the symbol dictionaries
+/// (7.4.2) in JBIG2 data in the embedded organization, read from their segment headers: the
+/// arithmetic decoder contexts of a dictionary that retains them, and the list of its exported
+/// symbols (one pointer each; re-exporting earlier dictionaries' symbols shares the bitmaps but
+/// not the list). The decoder keeps both until the picture is done. A dictionary cut short is
+/// counted with what is there. Nothing is kept per segment, so this check costs no memory
+/// before it can refuse a picture.
+fn jbig2_dictionary_bytes(data: &[u8]) -> Result<usize, String> {
+    let mut total = 0usize;
+    jbig2_walk(data, |s| {
+        if s.kind == JBIG2_SYMBOLS {
+            total = total.saturating_add(symbol_dictionary_bytes(s.data));
+        }
+    })?;
     Ok(total)
+}
+
+/// A segment that a segment of the picture (`data`) or of its shared part (`globals`) refers
+/// to, and that neither holds in full. The decoder skips such a reference, so a text region
+/// whose symbol dictionary is missing would come out blank without a word (#523). A segment
+/// cut short is dropped by the decoder: it holds nothing, and what it refers to does not
+/// matter. Keeps only the held segment numbers, four bytes each.
+fn jbig2_missing_segment(data: &[u8], globals: Option<&[u8]>) -> Result<Option<u32>, String> {
+    let streams = [Some(data), globals];
+    let mut held = Vec::new();
+    for stream in streams.into_iter().flatten() {
+        jbig2_walk(stream, |s| {
+            if s.complete {
+                held.push(s.number);
+            }
+        })?;
+    }
+    held.sort_unstable();
+    let mut missing = None;
+    for stream in streams.into_iter().flatten() {
+        jbig2_walk(stream, |s| {
+            if missing.is_none() && s.complete {
+                missing = s.refers_to().find(|r| held.binary_search(r).is_err());
+            }
+        })?;
+    }
+    Ok(missing)
 }
 
 /// A decoded JPEG 2000 picture: 8-bit samples, one to four channels interleaved.
@@ -548,11 +640,79 @@ mod tests {
             Ok(single.clone()),
             "the same pixels from shared segments"
         );
-        // Without its globals the text region's dictionary is not there: no such picture.
-        assert_ne!(jbig2(page, None), Ok(single));
+        // Without its globals the text region's dictionary is not there: said, not drawn
+        // blank (#523).
+        assert_eq!(
+            jbig2(page, None),
+            Err(
+                "the JBIG2 picture refers to its segment 0, which neither the picture nor its JBIG2Globals holds"
+                    .into()
+            )
+        );
+        assert_eq!(jbig2_missing_segment(page, Some(globals)), Ok(None));
+        assert_eq!(jbig2_missing_segment(embedded(text), None), Ok(None));
         // The shared dictionary counts against the shared half of the limit.
         assert!(jbig2_within(page, Some(globals), 64).is_err_and(|e| e.contains("too much memory")));
         assert!(jbig2_within(page, Some(globals), 8 << 10).is_ok());
+    }
+
+    #[test]
+    fn jbig2_references_of_every_size_are_read() {
+        // Segment 300 (2-byte references) refers to 299 and 2; segment 2 (1-byte) to 1.
+        let mut data = vec![0, 0, 0, 2, 0x06, 0x20, 1, 1, 0, 0, 0, 0];
+        data.extend_from_slice(&[0, 0, 1, 0x2C, 0x06, 0x40, 0x01, 0x2B, 0x00, 0x02, 1, 0, 0, 0, 0]);
+        let mut read: Vec<(u32, Vec<u32>)> = Vec::new();
+        assert_eq!(
+            jbig2_walk(&data, |s| read.push((s.number, s.refers_to().collect()))),
+            Ok(())
+        );
+        assert_eq!(read, vec![(2, vec![1]), (300, vec![299, 2])]);
+        assert_eq!(jbig2_missing_segment(&data, None), Ok(Some(1)));
+        let globals = [0, 0, 0, 1, 0x00, 0x00, 0, 0, 0, 0, 0];
+        assert_eq!(jbig2_missing_segment(&data, Some(&globals)), Ok(Some(299)));
+    }
+
+    #[test]
+    fn jbig2_segments_cut_short_hold_nothing() {
+        // A text region (segment 2) that refers to dictionary 0 in the shared segments.
+        let page = [0, 0, 0, 2, 0x06, 0x20, 0, 1, 0, 0, 0, 0];
+        let whole = [0, 0, 0, 0, 0x00, 0x00, 0, 0, 0, 0, 0];
+        assert_eq!(jbig2_missing_segment(&page, Some(&whole)), Ok(None));
+        // The dictionary declares one byte of data the shared segments do not have: the
+        // decoder drops it, so the region's reference is missing.
+        let cut = [0, 0, 0, 0, 0x00, 0x00, 0, 0, 0, 0, 1];
+        assert_eq!(jbig2_missing_segment(&page, Some(&cut)), Ok(Some(0)));
+        let refused = jbig2(&page, Some(&cut));
+        assert!(refused.is_err_and(|e| e.contains("refers to its segment 0")));
+        // A region cut short refers to nothing the decoder will look for.
+        let mut cut_page = page.to_vec();
+        cut_page[11] = 5;
+        assert_eq!(jbig2_missing_segment(&cut_page, None), Ok(None));
+    }
+
+    #[test]
+    fn jbig2_segments_after_the_end_of_the_file_are_not_read() {
+        // Dictionary 0, the end of the file (segment 1, type 51), then a header that refers to
+        // segment 99, which the decoder never reads.
+        let mut data = vec![0, 0, 0, 0, 0x00, 0x00, 0, 0, 0, 0, 0];
+        data.extend_from_slice(&[0, 0, 0, 1, 0x33, 0x00, 0, 0, 0, 0, 0]);
+        data.extend_from_slice(&[0, 0, 0, 100, 6, 32, 99, 1, 0, 0, 0, 0]);
+        assert_eq!(jbig2_missing_segment(&data, None), Ok(None));
+        let mut numbers = Vec::new();
+        assert_eq!(jbig2_walk(&data, |s| numbers.push(s.number)), Ok(()));
+        assert_eq!(numbers, vec![0, 1]);
+    }
+
+    #[test]
+    fn jbig2_dictionary_memory_is_checked_before_references() {
+        // Many small dictionaries past the limit, and a region that refers to a missing
+        // segment: the memory check refuses the picture first, before any segment numbers are
+        // gathered for the reference check.
+        let mut many: Vec<u8> = (0..1000).flat_map(kept_contexts).collect();
+        many.extend_from_slice(&[0, 0, 3, 0xE8, 0x06, 0x20, 0x03, 0xE9, 1, 0, 0, 0, 0]);
+        assert_eq!(jbig2_missing_segment(&many, None), Ok(Some(1001)));
+        let refused = jbig2_within(&many, None, 128 << 20);
+        assert!(refused.is_err_and(|e| e.contains("too much memory")));
     }
 
     #[test]
