@@ -525,6 +525,37 @@ mod tests {
     }
 
     #[test]
+    fn jbig2_symbol_dictionaries_shared_through_globals_are_read() {
+        let text = include_bytes!("../testdata/jbig2/symbol.jbig2");
+        let global = include_bytes!("../testdata/jbig2/symbol_global.jbig2");
+        // Its first segment is the symbol dictionary, for page 0 (shared): an 11-byte header
+        // whose last 4 bytes give the data length. A PDF keeps that segment in the picture's
+        // `JBIG2Globals` stream and the page's segments (text region, end of page) in the
+        // picture itself.
+        let segments = embedded(global);
+        let Some(length) = segments.get(7..11).and_then(|b| <[u8; 4]>::try_from(b).ok()) else {
+            unreachable!("the test stream has a segment header");
+        };
+        let split = 11 + u32::from_be_bytes(length) as usize;
+        let (globals, page) = segments.split_at(split);
+        assert_eq!(globals.get(4).map(|f| f & 0x3F), Some(0), "a symbol dictionary");
+        assert_eq!(globals.get(6), Some(&0), "for page 0");
+        let Ok(single) = jbig2(embedded(text), None) else {
+            unreachable!("the single-stream picture decodes");
+        };
+        assert_eq!(
+            jbig2(page, Some(globals)),
+            Ok(single.clone()),
+            "the same pixels from shared segments"
+        );
+        // Without its globals the text region's dictionary is not there: no such picture.
+        assert_ne!(jbig2(page, None), Ok(single));
+        // The shared dictionary counts against the shared half of the limit.
+        assert!(jbig2_within(page, Some(globals), 64).is_err_and(|e| e.contains("too much memory")));
+        assert!(jbig2_within(page, Some(globals), 8 << 10).is_ok());
+    }
+
+    #[test]
     fn jbig2_symbol_dictionaries_over_the_memory_limit_are_refused() {
         let text = include_bytes!("../testdata/jbig2/symbol.jbig2");
         let large = include_bytes!("../testdata/jbig2/memory_symbol_dictionary_large_symbol.jbig2");
