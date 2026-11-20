@@ -915,6 +915,17 @@ fn black_box_section(
     }
 }
 
+/// A size field of the black box form. A loaded size outside 1-5000 mm is kept until the user
+/// types or drags a new one: egui clamps a field's value to its range whenever the field loses
+/// focus, even untouched, so the range is applied here, to changes only.
+fn box_size_field(ui: &mut egui::Ui, value: &mut f64) {
+    let before = *value;
+    let r = ui.add(egui::DragValue::new(value).speed(0.5).suffix(" mm"));
+    if r.changed() && *value != before {
+        *value = value.clamp(1.0, 5000.0);
+    }
+}
+
 /// The fields of the black box form; `true` when it is done with (applied or reset).
 fn black_box_form(
     ui: &mut egui::Ui,
@@ -932,22 +943,10 @@ fn black_box_form(
         .spacing([8.0, 6.0])
         .show(ui, |ui| {
             ui.label("Width");
-            ui.add(
-                egui::DragValue::new(&mut form.width)
-                    .range(1.0..=5000.0)
-                    .clamp_existing_to_range(false)
-                    .speed(0.5)
-                    .suffix(" mm"),
-            );
+            box_size_field(ui, &mut form.width);
             ui.end_row();
             ui.label("Height");
-            ui.add(
-                egui::DragValue::new(&mut form.height)
-                    .range(1.0..=5000.0)
-                    .clamp_existing_to_range(false)
-                    .speed(0.5)
-                    .suffix(" mm"),
-            );
+            box_size_field(ui, &mut form.height);
             ui.end_row();
         });
     ui.label(RichText::new("Connection points: name, edge and mm along it").color(t.faint));
@@ -2161,14 +2160,32 @@ mod tests {
         let t = Theme::of(&egui::Context::default());
         let ctx = egui::Context::default();
         crate::theme::install_fonts(&ctx);
-        let mut frame = |o: &mut Open, ps: &mut PanelState| {
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        let mut frame_with = |o: &mut Open, ps: &mut PanelState, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| black_box_section(ui, o, &mut ed, ps, 1, &id, &t));
             });
         };
-        frame(&mut o, &mut ps);
+        let tab = || egui::Event::Key {
+            key: egui::Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame_with(&mut o, &mut ps, Vec::new());
         let form = |ps: &PanelState| ps.black_box.as_ref().map(|(_, f)| (f.width, f.changed()));
         assert_eq!(form(&ps), Some((0.5, false)), "showing the form changes nothing");
+        // Tabbing into the Width field and on out of it without typing changes nothing either.
+        for _ in 0..3 {
+            frame_with(&mut o, &mut ps, vec![tab()]);
+            frame_with(&mut o, &mut ps, Vec::new());
+        }
+        assert_eq!(form(&ps), Some((0.5, false)), "focus passing through changes nothing");
+        let mut frame = |o: &mut Open, ps: &mut PanelState| frame_with(o, ps, Vec::new());
         // Renaming a point leaves the width alone.
         if let Some((_, f)) = ps.black_box.as_mut() {
             f.rows[0].name = "A".into();
