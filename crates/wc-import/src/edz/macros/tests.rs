@@ -460,20 +460,20 @@ fn an_overlong_device_tag_is_not_taken_as_one() -> TestResult {
 }
 
 /// A PLC module whose multi-line variant A holds terminals 1 and 2 and variant B terminals 2
-/// to 4, and whose overview lists 1 to 5 on one placement.
+/// to 4 (or only 2), and whose overview lists 1 to 5 on one placement.
 fn split_module(with_b: bool) -> String {
+    split_module_with(if with_b { &["2", "3", "4"] } else { &[] })
+}
+
+fn split_module_with(b_names: &[&str]) -> String {
     let point = |x: u32, name: &str| {
         format!(r#"<O17 A1381="300" A185="{name}"><S40x1201 A762="{x}/0"/><P144 P20013="A" P20014="1"/></O17>"#)
     };
-    let b = if with_b {
-        format!(
-            r#"<MacroVariant MacroFuncType="1" VariantId="1" ReferencePoint="0/0">{}{}{}</MacroVariant>"#,
-            point(0, "2"),
-            point(8, "3"),
-            point(16, "4")
-        )
-    } else {
+    let b = if b_names.is_empty() {
         String::new()
+    } else {
+        let points: String = b_names.iter().zip(0u32..).map(|(n, k)| point(8 * k, n)).collect();
+        format!(r#"<MacroVariant MacroFuncType="1" VariantId="1" ReferencePoint="0/0">{points}</MacroVariant>"#)
     };
     format!(
         r#"<EplanPxfRoot>
@@ -521,6 +521,20 @@ fn without_other_variants_the_overview_completes_the_symbol() -> TestResult {
         .into_iter()
         .collect();
     assert_eq!(m.left_out, want, "the overview is not left out");
+    Ok(())
+}
+
+#[test]
+fn a_variant_with_only_variant_as_points_leaves_the_overview_to_complete_the_symbol() -> TestResult {
+    let m = read("plc.ema", &split_module_with(&["2"]))?;
+    let names: Vec<&str> = m.symbol.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["1", "2", "3", "4", "5"]);
+    // Variant B gave nothing new and is left out; the overview gave pins.
+    assert_eq!(
+        m.left_out.get("other variants of the multi-line representation"),
+        Some(&1)
+    );
+    assert_eq!(m.left_out.get("overview representations"), None);
     Ok(())
 }
 

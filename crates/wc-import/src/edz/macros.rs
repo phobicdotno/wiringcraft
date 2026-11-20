@@ -526,8 +526,15 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
         }));
     };
     let mut left_out = BTreeMap::new();
-    // Connection points of the device that variant A leaves out, from the other variants.
-    let extra = other_points(&all, v);
+    // The named connection points variant A has, and those it leaves out that the other
+    // variants hold.
+    let mut have: BTreeSet<(String, String, String)> = BTreeSet::new();
+    for p in v.placements.iter().filter(|p| p.kind != BLACK_BOX) {
+        for name in p.pins.iter().flatten() {
+            have.insert((p.letter.clone(), p.number.clone(), name.clone()));
+        }
+    }
+    let extra = other_points(&all, v, &have);
     add(
         &mut left_out,
         "objects of other kinds (connections, potentials, references)",
@@ -683,13 +690,7 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
     }
 
     // Connection points only the other variants hold go in a column right of the drawing, a
-    // grid step apart, facing right; those variant A already has are skipped.
-    let mut have: BTreeSet<(String, String, String)> = BTreeSet::new();
-    for p in v.placements.iter().filter(|p| p.kind != BLACK_BOX) {
-        for name in p.pins.iter().flatten() {
-            have.insert((p.letter.clone(), p.number.clone(), name.clone()));
-        }
-    }
+    // grid step apart, facing right.
     let mut column: Vec<Point> = pins.iter().map(|p| p.at).collect();
     for g in &graphics {
         let (a, b) = g.bounds();
@@ -701,13 +702,9 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
         let (min, max) = bounds_of(&column);
         (min.y, max.x + PIN_STEP)
     };
-    let mut row = 0usize;
     // The variants that gave a pin; they are not counted as left out.
     let mut givers: BTreeSet<usize> = BTreeSet::new();
-    for (from, letter, number, name) in extra {
-        if !have.insert((letter.clone(), number.clone(), name.clone())) {
-            continue;
-        }
+    for (row, (from, letter, number, name)) in extra.into_iter().enumerate() {
         givers.insert(from);
         pins.push(Pin {
             name,
@@ -715,7 +712,6 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
             dir: PinDir::Right,
         });
         owners.push((letter, number));
-        row += 1;
         if pins.len() > MAX_PINS {
             return Err(Error::Format(format!("holds more than {MAX_PINS} connection points")));
         }
@@ -803,9 +799,13 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
 /// The named connection points of the macro's other multi-line variants, in variant order, as
 /// (index of the variant in `all`, device tag letter, counting number, designation). A variant
 /// A may hold only some of a device's terminals (a PLC module with 1-10 in A and 11-20 in B).
-/// When no other multi-line variant holds any, the overview representation's are taken, since
-/// it lists all of them. Each point comes once; the caller skips those variant A has.
-fn other_points<'a>(all: &'a [Variant], a: &Variant) -> Vec<(usize, String, String, String)> {
+/// Only points not in `have` (variant A's) are taken, each once. When no other multi-line
+/// variant adds any, the overview representation's are taken, since it lists all of them.
+fn other_points<'a>(
+    all: &'a [Variant],
+    a: &Variant,
+    have: &BTreeSet<(String, String, String)>,
+) -> Vec<(usize, String, String, String)> {
     let named = |k: usize, v: &'a Variant| {
         v.placements
             .iter()
@@ -826,9 +826,9 @@ fn other_points<'a>(all: &'a [Variant], a: &Variant) -> Vec<(usize, String, Stri
     others.sort_by_key(|(_, o)| o.id);
     let overview = all.iter().enumerate().find(|(_, o)| o.doc == Some(OVERVIEW));
     let mut points = Vec::new();
-    // Each point once, and no more than can still be told apart from variant A's own points:
-    // past twice the most a macro may hold, the caller refuses it anyway.
-    let mut seen: BTreeSet<(String, String, String)> = BTreeSet::new();
+    // Each new point once, and no more than one past the most a macro may hold: the caller
+    // refuses it then anyway.
+    let mut seen = have.clone();
     for (k, o) in others.into_iter().chain(overview) {
         if o.doc == Some(OVERVIEW) && !points.is_empty() {
             break;
@@ -836,7 +836,7 @@ fn other_points<'a>(all: &'a [Variant], a: &Variant) -> Vec<(usize, String, Stri
         for (k, letter, number, name) in named(k, o) {
             if seen.insert((letter.clone(), number.clone(), name.clone())) {
                 points.push((k, letter, number, name));
-                if points.len() > 2 * MAX_PINS {
+                if points.len() > MAX_PINS {
                     return points;
                 }
             }
