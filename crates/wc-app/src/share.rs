@@ -549,6 +549,9 @@ pub fn yield_and_check(local: &mut Project, base: &mut Project, auth: &Project) 
         &auth.meta
     };
     let listed: BTreeSet<&str> = merged.revisions.iter().map(|r| r.letter.trim()).collect();
+    // Only a revision the session no longer lists was removed by it; one removed here is this
+    // window's own change, which the project check reports.
+    let in_session: BTreeSet<&str> = auth.meta.revisions.iter().map(|r| r.letter.trim()).collect();
     let mut clashes = Vec::new();
     for page in &local.pages {
         let before = base.page(&page.id);
@@ -557,7 +560,7 @@ pub fn yield_and_check(local: &mut Project, base: &mut Project, auth: &Project) 
             .iter()
             .filter(|c| before.is_none_or(|b| !b.clouds.contains(c)))
             .map(|c| c.revision.trim())
-            .filter(|r| known.contains(*r) && !listed.contains(r))
+            .filter(|r| known.contains(*r) && !listed.contains(r) && !in_session.contains(r))
             .collect();
         gone.sort_unstable();
         gone.dedup();

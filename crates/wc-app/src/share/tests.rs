@@ -1373,6 +1373,20 @@ fn a_cloud_drawn_here_for_a_revision_the_session_removed_is_kept_and_reported() 
     let (lost, clashes) = yield_and_check(&mut local, &mut base, &auth);
     assert!(lost.is_empty() && clashes.is_empty(), "{lost:?} {clashes:?}");
 
+    // This window drew a cloud tagged A and then removed A itself; the session still lists A.
+    let (mut base, mut auth, mut local) = three_copies()?;
+    for p in [&mut base, &mut auth, &mut local] {
+        p.meta.revisions = vec![revision("A")];
+    }
+    local.meta.revisions.clear();
+    local.pages[0].clouds.push(wc_core::RevisionCloud::new(
+        Point::new(10.0, 10.0),
+        Point::new(40.0, 30.0),
+        "A",
+    ));
+    let (_, clashes) = yield_and_check(&mut local, &mut base, &auth);
+    assert!(clashes.is_empty(), "not the session's removal: {clashes:?}");
+
     // This window added revision C and a cloud for it; the session left the properties alone.
     let (mut base, auth, mut local) = three_copies()?;
     local.meta.revisions.push(revision("C"));
