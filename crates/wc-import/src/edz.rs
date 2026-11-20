@@ -23,7 +23,7 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
 use wc_core::Part;
 
-use crate::{Error, Result, printable};
+use crate::{Error, Result, id_segment, printable};
 
 pub mod macros;
 
@@ -79,6 +79,8 @@ pub const PROP_TYPE: &str = "TypeNumber";
 
 const SEVEN_ZIP: &[u8] = b"7z\xBC\xAF\x27\x1C";
 const ZIP: &[u8] = b"PK\x03\x04";
+/// The longest maker name, in characters, put into a macro symbol's id.
+const MAX_MAKER: usize = 40;
 
 /// What was in the archive.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -407,6 +409,54 @@ pub fn read_all_with(bytes: &[u8], limits: Limits) -> Result<Edz> {
     report.parts = parts.len();
     report.macro_files.sort();
 
+    let in_archive: std::collections::BTreeSet<String> =
+        report.macro_files.iter().map(|f| macro_file_name(f)).collect();
+    // A part may name its macro without `.ema`.
+    let file_of = |name: &str| {
+        let file = macro_file_name(name);
+        if in_archive.contains(&file) || file.ends_with(".ema") {
+            file
+        } else {
+            format!("{file}.ema")
+        }
+    };
+    // The maker of each macro's symbol, for its id: the one maker of the parts naming the macro,
+    // else the one maker of all the archive's parts. Generic macro names (`Macro_0001`) from two
+    // makers' archives then get different ids in one library. A part's macro is found as its
+    // symbol is below: by file name, and by path when several archive macros share it.
+    let mut archive_macros: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    for f in &report.macro_files {
+        archive_macros
+            .entry(macro_file_name(f))
+            .or_default()
+            .push((macro_path(f), macro_path(f)));
+    }
+    let mut makers_by_macro: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
+    let mut makers: std::collections::BTreeSet<String> = Default::default();
+    for p in parts.values() {
+        let Some(maker) = maker_segment(&p.manufacturer) else {
+            continue;
+        };
+        for k in MACRO_PROPERTIES {
+            if let Some(name) = p.properties.get(k)
+                && let Some(found) = archive_macros.get(&file_of(name)).and_then(|m| by_path(name, m))
+            {
+                makers_by_macro.entry(found.clone()).or_default().insert(maker.clone());
+            }
+        }
+        makers.insert(maker);
+    }
+    let only = |set: &std::collections::BTreeSet<String>| match set.len() {
+        1 => set.first().cloned(),
+        _ => None,
+    };
+    let macro_maker = |name: &str| {
+        makers_by_macro
+            .get(&macro_path(name))
+            .and_then(only)
+            .or_else(|| only(&makers))
+    };
+
     // Each macro read as a symbol, by its file name in lower case.
     macro_data.sort_by(|a, b| a.0.cmp(&b.0));
     let mut symbols: BTreeMap<String, wc_core::Symbol> = BTreeMap::new();
@@ -416,6 +466,18 @@ pub fn read_all_with(bytes: &[u8], limits: Limits) -> Result<Edz> {
         let text = crate::csv::decode(&data);
         match macros::read(&name, &text) {
             Ok(mut m) => {
+                match macro_maker(&name) {
+                    Some(maker) => {
+                        let stem = m.symbol.id.strip_prefix("eplan.").unwrap_or(&m.symbol.id);
+                        m.symbol.id = format!("eplan.{maker}.{stem}");
+                    }
+                    None => warnings.push(format!(
+                        "macro {}: no maker is known for it, so its symbol {} may be replaced by another \
+                         archive's macro of the same name in one library",
+                        printable(&name),
+                        m.symbol.id
+                    )),
+                }
                 let base = m.symbol.id.clone();
                 let mut n = 1;
                 while symbols.contains_key(&m.symbol.id) {
@@ -450,36 +512,9 @@ pub fn read_all_with(bytes: &[u8], limits: Limits) -> Result<Edz> {
         }
     }
 
-    let in_archive: std::collections::BTreeSet<String> =
-        report.macro_files.iter().map(|f| macro_file_name(f)).collect();
-    // A part may name its macro without `.ema`.
-    let file_of = |name: &str| {
-        let file = macro_file_name(name);
-        if in_archive.contains(&file) || file.ends_with(".ema") {
-            file
-        } else {
-            format!("{file}.ema")
-        }
-    };
     // The symbol of the macro a part names: the only macro of that file name, else the one whose
     // path ends with the path the part gives.
-    let symbol_of = |name: &str, file: &str| -> Option<String> {
-        match by_file.get(file)?.as_slice() {
-            [(_, id)] => Some(id.clone()),
-            several => {
-                let mut want = macro_path(name);
-                if !want.ends_with(".ema") {
-                    want.push_str(".ema");
-                }
-                let want = format!("/{}", want.trim_start_matches('/'));
-                let mut hits = several.iter().filter(|(path, _)| format!("/{path}").ends_with(&want));
-                match (hits.next(), hits.next()) {
-                    (Some((_, id)), None) => Some(id.clone()),
-                    _ => None,
-                }
-            }
-        }
-    };
+    let symbol_of = |name: &str, file: &str| -> Option<String> { by_path(name, by_file.get(file)?).cloned() };
     for p in parts.values_mut() {
         let first = report.part_macros.len();
         for k in MACRO_PROPERTIES {
@@ -518,6 +553,47 @@ pub fn read_all_with(bytes: &[u8], limits: Limits) -> Result<Edz> {
         report,
         warnings,
     })
+}
+
+/// Of the archive macros sharing the file name a part gives (each as its path and a value): the
+/// only one, else the one whose path ends with the path the part gives.
+fn by_path<'a, T>(name: &str, macros: &'a [(String, T)]) -> Option<&'a T> {
+    match macros {
+        [(_, v)] => Some(v),
+        several => {
+            let mut want = macro_path(name);
+            if !want.ends_with(".ema") {
+                want.push_str(".ema");
+            }
+            let want = format!("/{}", want.trim_start_matches('/'));
+            let mut hits = several.iter().filter(|(path, _)| format!("/{path}").ends_with(&want));
+            match (hits.next(), hits.next()) {
+                (Some((_, v)), None) => Some(v),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// A maker's name as a symbol id segment, or `None` for an empty one. A name longer than
+/// [`MAX_MAKER`] is cut and ends with a hash of the whole name, so two makers whose names only
+/// differ past the cut still get different segments.
+fn maker_segment(maker: &str) -> Option<String> {
+    let maker = maker.trim();
+    let seg = id_segment(maker);
+    if seg.trim_matches('_').is_empty() {
+        return None;
+    }
+    if seg.chars().count() <= MAX_MAKER {
+        return Some(seg);
+    }
+    // FNV-1a, 32 bits: stable across runs and platforms.
+    // Of the segment, so names differing only in case are one maker, as short ones are.
+    let hash = seg
+        .bytes()
+        .fold(0x811c_9dc5u32, |h, b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193));
+    let head: String = seg.chars().take(MAX_MAKER - 9).collect();
+    Some(format!("{head}_{hash:08x}"))
 }
 
 /// One part's EPLAN properties, by name, and the first variant's for what the part leaves empty.
