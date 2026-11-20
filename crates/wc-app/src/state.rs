@@ -3562,6 +3562,24 @@ pub(crate) mod tests {
         assert!(err.contains("Ola has page"), "{err}");
         assert_eq!(o.undo_mark(), steps);
         o.held_by_others.remove(&held);
+
+        // So does another held page that places the same box, though it is not the one edited:
+        // the symbol file, the lock and the undo history stay as they were.
+        o.place(0, &symbol_id, Point::new(20.0, 20.0)).unwrap();
+        let other = o.project.pages[0].id.clone();
+        o.held_by_others.insert(other.clone(), "Kari".into());
+        let before = o.symbols[&symbol_id].clone();
+        let lock_before = o.project.lock.symbols[&symbol_id].clone();
+        let steps = o.undo_mark();
+        let err = o
+            .edit_black_box(1, &id, (40.0, 20.0), &new_pins, &BTreeMap::new(), &Default::default())
+            .unwrap_err();
+        assert!(err.contains("Kari has page 1 open"), "{err}");
+        assert_eq!(o.undo_mark(), steps);
+        assert_eq!(o.symbols[&symbol_id], before);
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), before);
+        assert_eq!(o.project.lock.symbols[&symbol_id], lock_before);
+        o.held_by_others.remove(&other);
         assert!(
             o.edit_black_box(1, &id, (40.0, 20.0), &new_pins, &BTreeMap::new(), &Default::default())
                 .is_ok()
