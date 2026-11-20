@@ -132,7 +132,7 @@ impl Default for Editor {
 }
 
 /// What a primary-button drag in the select tool is doing.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum Drag {
     /// Moving the selection: the grab point (snapped, page mm) and whether the undo checkpoint
     /// for this drag was taken.
@@ -147,6 +147,15 @@ enum Drag {
         start: (Point, Point),
         size: bool,
         checkpoint: bool,
+    },
+    /// Sizing the selected black box from its sizing corner (#524): the box's item id on the
+    /// page, the grab point (page mm, unsnapped), its size when the drag started and its size
+    /// now. The box changes once, on release; a box no longer on the page changes nothing.
+    BoxSize {
+        id: String,
+        from: Point,
+        start: (f64, f64),
+        size: (f64, f64),
     },
 }
 
@@ -1341,13 +1350,19 @@ fn select_tool(
     if !held && !selected_wires(ed).is_empty() {
         resp.context_menu(|ui| route_menu(ui, open, ed));
     }
+    // A drag is only seen once the pointer has moved: it starts where the button went down,
+    // so a small target (a sizing corner) is not missed by a quick drag.
     if resp.drag_started_by(egui::PointerButton::Primary)
-        && let Some(at) = resp.interact_pointer_pos().map(|p| xf.mm(p))
+        && let Some(at) = resp
+            .ctx
+            .input(|i| i.pointer.press_origin())
+            .or(resp.interact_pointer_pos())
+            .map(|p| xf.mm(p))
     {
         ed.drag = Some(drag_start(open, ed, page, at, tol, snap_step, shift, held));
     }
     stop_if_held(ed, held);
-    match ed.drag {
+    match ed.drag.clone() {
         Some(Drag::Logo {
             from,
             start,
@@ -1391,6 +1406,27 @@ fn select_tool(
                 }
             }
         }
+        // Also in the frame the button is let go: a last move that comes with the release counts.
+        Some(Drag::BoxSize { id, from, start, size })
+            if resp.dragged_by(egui::PointerButton::Primary) || resp.drag_stopped() =>
+        {
+            if let Some(cur) = primary_release_pos(&resp.ctx)
+                .or(resp.interact_pointer_pos())
+                .map(|p| xf.mm(p))
+                && let Some(s) = page.symbol(&id)
+            {
+                let d = Point::new(cur.x - from.x, cur.y - from.y);
+                let now = crate::black_box_tool::dragged_size(start, d, s.rotation, s.mirror, snap_step);
+                if now != size {
+                    ed.drag = Some(Drag::BoxSize {
+                        id,
+                        from,
+                        start,
+                        size: now,
+                    });
+                }
+            }
+        }
         Some(Drag::Box { from }) => {
             if let Some(cur) = resp.interact_pointer_pos().or(resp.hover_pos()).map(|p| xf.mm(p)) {
                 let r = Rect::from_two_pos(xf.s(from), xf.s(cur));
@@ -1412,9 +1448,57 @@ fn select_tool(
         }
         _ => {}
     }
+    paint_box_sizing(painter, open, ed, page, xf, &t, held);
     if resp.drag_stopped() {
         let alt = resp.ctx.input(|i| i.modifiers.alt);
         drag_released(open, ed, alt);
+    }
+}
+
+/// The black box `id` on `page` that can be sized by its corner: its size, and its sizing
+/// corner (the box's own far corner, where its width and height end) in page mm. `None` for
+/// any other item.
+fn box_corner(open: &Open, page: &Page, id: &str) -> Option<((f64, f64), Point)> {
+    let s = page.symbol(id)?;
+    let (w, h, _) = wc_core::black_box_layout(open.symbols.get(&s.symbol)?)?;
+    Some(((w, h), Point::new(w, h).transform(s.rotation, s.mirror) + s.at))
+}
+
+/// The sizing handle of the one selected black box, and while it is dragged the box's outline
+/// at the size it will get. Not on a page someone else holds.
+fn paint_box_sizing(
+    painter: &egui::Painter,
+    open: &Open,
+    ed: &Editor,
+    page: &Page,
+    xf: &Xf,
+    t: &theme::Theme,
+    held: bool,
+) {
+    if held {
+        return;
+    }
+    if let Some(Drag::BoxSize { id, size, .. }) = &ed.drag
+        && let Some(s) = page.symbol(id)
+    {
+        let (w, h) = *size;
+        let on_page = |x: f64, y: f64| xf.s(Point::new(x, y).transform(s.rotation, s.mirror) + s.at);
+        let pts: Vec<Pos2> = [(0.0, 0.0), (w, 0.0), (w, h), (0.0, h), (0.0, 0.0)]
+            .into_iter()
+            .map(|(x, y)| on_page(x, y))
+            .collect();
+        painter.add(egui::Shape::line(pts, Stroke::new(1.5_f32, t.ghost)));
+        painter.rect_filled(
+            Rect::from_center_size(on_page(w, h), Vec2::splat(7.0)),
+            1.0,
+            t.selection,
+        );
+        return;
+    }
+    if let Some(Selection::Symbol(id)) = ed.one()
+        && let Some((_, corner)) = box_corner(open, page, id)
+    {
+        painter.rect_filled(Rect::from_center_size(xf.s(corner), Vec2::splat(7.0)), 1.0, t.selection);
     }
 }
 
@@ -1435,6 +1519,18 @@ fn drag_start(
 ) -> Drag {
     if held {
         return Drag::Box { from: at };
+    }
+    // The sizing corner of the one selected black box wins over whatever lies under it.
+    if let Some(Selection::Symbol(id)) = ed.one()
+        && let Some((start, corner)) = box_corner(open, page, id)
+        && logo_corner(corner, at, tol)
+    {
+        return Drag::BoxSize {
+            id: id.clone(),
+            from: at,
+            start,
+            size: start,
+        };
     }
     let logo = wc_pdf::cover_logo_box(&open.project, page);
     let hit = pick(open, ed, page, at, tol);
@@ -1542,12 +1638,22 @@ fn paint_logo(
 /// The page became held during a move: the move stops where it is, and its release does
 /// nothing more (no wiring of pins that now line up). A selection box goes on.
 fn stop_if_held(ed: &mut Editor, held: bool) {
-    if held && matches!(ed.drag, Some(Drag::Move { .. } | Drag::Logo { .. })) {
+    if held
+        && matches!(
+            ed.drag,
+            Some(Drag::Move { .. } | Drag::Logo { .. } | Drag::BoxSize { .. })
+        )
+    {
         ed.drag = None;
     }
 }
 
 fn drag_released(open: &mut Open, ed: &mut Editor, alt: bool) {
+    if let Some(Drag::BoxSize { id, start, size, .. }) = ed.drag.clone()
+        && size != start
+    {
+        box_sized(open, ed, &id, size);
+    }
     if let Some(Drag::Move { checkpoint: true, .. }) = ed.drag {
         let moved = ed
             .selection
@@ -1563,6 +1669,30 @@ fn drag_released(open: &mut Open, ed: &mut Editor, alt: bool) {
         }
     }
     ed.drag = None;
+}
+
+/// The end of a drag on a black box's sizing corner: the box gets `size`, its points kept on
+/// their edges, as one undo step with the same warnings as the properties panel's Apply.
+fn box_sized(open: &mut Open, ed: &mut Editor, id: &str, size: (f64, f64)) {
+    let Some(s) = open.project.pages.get(ed.page).and_then(|p| p.symbol(id)) else {
+        ed.message = format!("The box was not sized: {id} is no longer on this page.");
+        return;
+    };
+    let Some((_, _, pins)) = open.symbols.get(&s.symbol).and_then(wc_core::black_box_layout) else {
+        return;
+    };
+    let pins = crate::black_box_tool::resized_pins(&pins, size.0, size.1);
+    let none = std::collections::BTreeSet::new();
+    ed.message = match open.edit_black_box(ed.page, id, size, &pins, &std::collections::BTreeMap::new(), &none) {
+        Ok(warnings) if warnings.is_empty() => format!("Black box {id} sized to {} x {} mm.", size.0, size.1),
+        Ok(warnings) => format!(
+            "Black box {id} sized to {} x {} mm. Check: {}.",
+            size.0,
+            size.1,
+            warnings.join("; ")
+        ),
+        Err(e) => format!("The box was not sized: {e}"),
+    };
 }
 
 /// Wire the pins of `items` that now line up, unless auto-wiring is off or Alt is held.
@@ -2476,6 +2606,187 @@ mod tests {
         ed.tool = Tool::Line;
         painted(&ctx, &mut open, &mut ed, 9.0, vec![]);
         assert!(ed.black_box.is_none());
+    }
+
+    #[test]
+    fn a_selected_black_box_is_sized_by_dragging_its_corner_through_egui_events() {
+        let (_tmp, mut open) = project();
+        let pin = |name: &str, side, offset| wc_core::BoxPin {
+            name: name.into(),
+            side,
+            offset,
+        };
+        let pins = [
+            pin("1", wc_core::BoxSide::Top, 15.0),
+            pin("2", wc_core::BoxSide::Right, 5.0),
+        ];
+        let id = open
+            .add_black_box(0, Point::new(40.0, 40.0), Point::new(60.0, 50.0), &pins, None)
+            .unwrap();
+        let mut ed = Editor {
+            selection: vec![Selection::Symbol(id.clone())],
+            view: View {
+                zoom: 1.0,
+                offset: Vec2::ZERO,
+                fit: false,
+            },
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let button = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        // Where the page origin is on the screen, from the pointer's place on the page.
+        painted(&ctx, &mut open, &mut ed, 0.5, vec![]);
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            1.0,
+            vec![egui::Event::PointerMoved(egui::pos2(300.0, 300.0))],
+        );
+        let seen = ed.cursor.unwrap();
+        let origin = egui::pos2(300.0 - seen.x as f32, 300.0 - seen.y as f32);
+        let at = |x: f32, y: f32| origin + Vec2::new(x, y);
+        let symbol = |o: &Open| o.symbols[&o.project.pages[0].symbol(&id).unwrap().symbol].clone();
+        let undo_steps = open.undo_steps();
+        let wires = open.project.pages[0].wires.clone();
+
+        // Grab the corner, drag in two moves, release: one change, at the size let go at.
+        let drag_to = |o: &mut Open, ed: &mut Editor, from: egui::Pos2, to: egui::Pos2, t: f64| {
+            painted(
+                &ctx,
+                o,
+                ed,
+                t,
+                vec![egui::Event::PointerMoved(from), button(from, true)],
+            );
+            let mid = from + (to - from) / 2.0;
+            painted(&ctx, o, ed, t + 0.02, vec![egui::Event::PointerMoved(mid)]);
+            painted(&ctx, o, ed, t + 0.04, vec![egui::Event::PointerMoved(to)]);
+            painted(&ctx, o, ed, t + 0.06, vec![button(to, false)]);
+        };
+        drag_to(&mut open, &mut ed, at(60.0, 50.0), at(70.0, 58.0), 2.0);
+        let Some((w, h, now)) = wc_core::black_box_layout(&symbol(&open)) else {
+            unreachable!("still a black box")
+        };
+        assert_eq!((w, h), (30.0, 18.0), "{}", ed.message);
+        assert_eq!(now, pins.to_vec(), "the points stay where they were on their edges");
+        assert_eq!(open.undo_steps(), undo_steps + 1, "one undo step");
+        assert_eq!(
+            open.project.pages[0].symbol(&id).unwrap().at,
+            Point::new(40.0, 40.0),
+            "not moved"
+        );
+        assert!(ed.message.contains("30 x 18 mm"), "{}", ed.message);
+
+        // Smaller than its points: they are kept on their edges, at the ends.
+        drag_to(&mut open, &mut ed, at(70.0, 58.0), at(45.0, 45.0), 3.0);
+        let Some((w, h, now)) = wc_core::black_box_layout(&symbol(&open)) else {
+            unreachable!("still a black box")
+        };
+        assert_eq!((w, h), (5.0, 5.0));
+        assert_eq!(
+            now,
+            vec![
+                pin("1", wc_core::BoxSide::Top, 5.0),
+                pin("2", wc_core::BoxSide::Right, 5.0)
+            ]
+        );
+        assert_eq!(open.undo_steps(), undo_steps + 2);
+        assert_eq!(open.project.pages[0].wires, wires);
+        assert!(open.undo());
+        let Some((w, h, _)) = wc_core::black_box_layout(&symbol(&open)) else {
+            unreachable!("still a black box")
+        };
+        assert_eq!((w, h), (30.0, 18.0), "Undo takes the size back");
+
+        // A drag that starts away from the corner moves the box instead of sizing it.
+        drag_to(&mut open, &mut ed, at(50.0, 45.0), at(60.0, 45.0), 4.0);
+        assert_eq!(open.project.pages[0].symbol(&id).unwrap().at, Point::new(50.0, 40.0));
+        let Some((w, h, _)) = wc_core::black_box_layout(&symbol(&open)) else {
+            unreachable!("still a black box")
+        };
+        assert_eq!((w, h), (30.0, 18.0));
+
+        // On a page someone else holds, the corner sizes nothing.
+        let held = open.project.pages[0].id.clone();
+        ed.held_by.insert(held, "Ola".into());
+        let steps = open.undo_steps();
+        drag_to(&mut open, &mut ed, at(80.0, 58.0), at(90.0, 70.0), 5.0);
+        assert_eq!(open.undo_steps(), steps);
+        let Some((w, h, _)) = wc_core::black_box_layout(&symbol(&open)) else {
+            unreachable!("still a black box")
+        };
+        assert_eq!((w, h), (30.0, 18.0));
+        ed.held_by.clear();
+        // The selection box drawn there picked nothing: select the box again.
+        ed.select_only(Selection::Symbol(id.clone()));
+
+        // A last move that comes in the same frame as the release counts.
+        let (corner, end) = (at(80.0, 58.0), at(90.0, 62.0));
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            6.0,
+            vec![egui::Event::PointerMoved(corner), button(corner, true)],
+        );
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            6.02,
+            vec![egui::Event::PointerMoved(at(88.0, 58.0))],
+        );
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            6.04,
+            vec![egui::Event::PointerMoved(end), button(end, false)],
+        );
+        let Some((w, h, _)) = wc_core::black_box_layout(&symbol(&open)) else {
+            unreachable!("still a black box")
+        };
+        assert_eq!((w, h), (40.0, 22.0), "{}", ed.message);
+
+        // The box is deleted while its corner is held: another box that takes its place among
+        // the page's items is not sized on release.
+        let other = open
+            .add_black_box(0, Point::new(120.0, 40.0), Point::new(140.0, 50.0), &pins, None)
+            .unwrap();
+        ed.select_only(Selection::Symbol(id.clone()));
+        let corner = at(90.0, 62.0);
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            7.0,
+            vec![egui::Event::PointerMoved(corner), button(corner, true)],
+        );
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            7.02,
+            vec![egui::Event::PointerMoved(at(95.0, 66.0))],
+        );
+        assert!(matches!(ed.drag, Some(Drag::BoxSize { .. })));
+        open.delete_many(0, &[Selection::Symbol(id.clone())]);
+        let before = open.symbols[&open.project.pages[0].symbol(&other).unwrap().symbol].clone();
+        let steps = open.undo_steps();
+        painted(&ctx, &mut open, &mut ed, 7.04, vec![button(at(95.0, 66.0), false)]);
+        assert_eq!(open.undo_steps(), steps, "nothing changed");
+        assert_eq!(
+            open.symbols[&open.project.pages[0].symbol(&other).unwrap().symbol],
+            before
+        );
+        assert!(ed.message.contains("no longer on this page"), "{}", ed.message);
     }
 
     #[test]

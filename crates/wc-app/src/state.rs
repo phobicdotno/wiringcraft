@@ -959,6 +959,12 @@ impl Open {
         !self.undo.is_empty()
     }
 
+    /// How many steps Undo can take back.
+    #[cfg(test)]
+    pub(crate) fn undo_steps(&self) -> usize {
+        self.undo.len()
+    }
+
     pub fn can_redo(&self) -> bool {
         !self.redo.is_empty()
     }
