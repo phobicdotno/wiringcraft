@@ -326,17 +326,15 @@ pub fn symbol_for(f: &EplanFunction) -> Option<Symbol> {
         ("switch", SymbolRole::Standalone, Point::new(-10.0, 4.5))
     } else if f.kind == KIND_FUSE && n.is_multiple_of(2) {
         // One fuse per pole: a body round the line, a grid step apart.
-        for (k, pole) in names.chunks_exact(2).enumerate() {
+        for (k, [top, bottom]) in names.as_chunks::<2>().0.iter().enumerate() {
             let x = GRID * k as f64;
             g.push(line(x, 0.0, x, LENGTH));
             g.push(Shape::Rect {
                 min: Point::new(x - 1.0, 2.0),
                 max: Point::new(x + 1.0, 6.0),
             });
-            if let [top, bottom] = pole {
-                pins.push(pin(top, x, 0.0, PinDir::Up));
-                pins.push(pin(bottom, x, LENGTH, PinDir::Down));
-            }
+            pins.push(pin(top, x, 0.0, PinDir::Up));
+            pins.push(pin(bottom, x, LENGTH, PinDir::Down));
         }
         ("fuse", SymbolRole::Standalone, Point::new(-10.0, 4.5))
     } else {
