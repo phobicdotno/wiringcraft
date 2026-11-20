@@ -2207,13 +2207,13 @@ mod tests {
         let (picture, problem) = scan(&jbig2, &jbig2_page())?;
         assert!(picture.is_none());
         assert!(problem.is_some_and(|m| m.contains("shared part")));
-        // A region far larger than its page is refused before the decoder sees it: the decoder
-        // keeps every intermediate region of a page in memory.
+        // A region far larger than its page is refused once it goes over the decoder's memory
+        // limit.
         let mut huge = jbig2_page();
         huge[41..49].copy_from_slice(&[0, 0, 0xFF, 0xFF, 0, 0, 0xFF, 0xFF]);
         let (picture, problem) = scan(&format!("{bilevel} /Filter /JBIG2Decode"), &huge)?;
         assert!(picture.is_none());
-        assert!(problem.is_some_and(|m| m.contains("too large")));
+        assert!(problem.is_some_and(|m| m.contains("too much memory")));
         // Damaged data.
         let jbig2 = format!("{bilevel} /Filter /JBIG2Decode");
         let (picture, problem) = scan(&jbig2, &jbig2_page()[..15])?;

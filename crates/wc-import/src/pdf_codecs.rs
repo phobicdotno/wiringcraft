@@ -148,43 +148,47 @@ pub(crate) fn ccitt(data: &[u8], parms: &FaxParms) -> Result<(Vec<u8>, Option<St
 /// Decodes a JBIG2 picture in the embedded organization PDF uses, with the segments of its
 /// `JBIG2Globals` stream if it has one. Returns its width, height and 1-bit samples (0 black).
 pub(crate) fn jbig2(data: &[u8], globals: Option<&[u8]>) -> Result<(u32, u32, Vec<u8>), String> {
-    // The decoder keeps every intermediate region and pattern dictionary of a page until the
-    // page is done and checks each only against its own size limit, so what they take is
-    // added up here before it runs.
-    let kept = jbig2_retained_bytes(data)?.saturating_add(globals.map_or(Ok(0), jbig2_retained_bytes)?);
-    if kept > JBIG2_BUDGET {
-        return Err("the JBIG2 picture's regions are too large".into());
-    }
+    jbig2_within(data, globals, JBIG2_BUDGET)
+}
+
+/// [`jbig2`] with `limit` bytes for the decoder's bitmaps.
+fn jbig2_within(data: &[u8], globals: Option<&[u8]>, limit: usize) -> Result<(u32, u32, Vec<u8>), String> {
     guarded("JBIG2", || {
-        let settings = hayro_jbig2::DecodeSettings::default();
+        // The decoder counts every bitmap it keeps (regions, pattern and symbol dictionaries
+        // and the page) against this limit and stops once they go over it, so a few bytes
+        // that declare huge or many symbols cannot use up the memory.
+        let settings = hayro_jbig2::DecodeSettings {
+            memory_limit: Some(limit),
+            ..Default::default()
+        };
+        let too_large = |e: &hayro_jbig2::DecodeError, what: &str| {
+            if *e == hayro_jbig2::DecodeError::MemoryLimitExceeded {
+                "the JBIG2 picture needs too much memory to decode".to_string()
+            } else {
+                format!("{what} ({e})")
+            }
+        };
         let globals = globals
             .map(|g| hayro_jbig2::Globals::new(g, &settings))
             .transpose()
-            .map_err(|e| format!("the shared part of the JBIG2 picture could not be read ({e})"))?;
+            .map_err(|e| too_large(&e, "the shared part of the JBIG2 picture could not be read"))?;
         let page = hayro_jbig2::Page::new_embedded(data, globals.as_ref(), &settings)
-            .map_err(|e| format!("the JBIG2 picture could not be read ({e})"))?;
+            .map_err(|e| too_large(&e, "the JBIG2 picture could not be read"))?;
         let (width, height) = (page.width(), page.height());
         if !fits(width, height) {
             return Err("the JBIG2 picture has no size or is too large".into());
         }
-        struct Pixels(Packer);
-        impl hayro_jbig2::Decoder for Pixels {
-            fn push_pixel(&mut self, black: bool) {
-                self.0.push(black);
+        let bitmap = page
+            .decode()
+            .map_err(|e| too_large(&e, "the JBIG2 picture could not be decoded"))?;
+        let mut packer = Packer::new(width, false);
+        for row in bitmap.rows().take(height as usize) {
+            for x in 0..width {
+                let word = row.get((x / 32) as usize).copied().unwrap_or(0);
+                packer.push(word & (0x8000_0000 >> (x % 32)) != 0);
             }
-            fn push_pixel_chunk(&mut self, black: bool, chunk_count: u32) {
-                for _ in 0..chunk_count.saturating_mul(8) {
-                    self.0.push(black);
-                }
-            }
-            fn next_line(&mut self) {
-                self.0.end_row();
-            }
+            packer.end_row();
         }
-        let mut pixels = Pixels(Packer::new(width, false));
-        page.decode(&mut pixels)
-            .map_err(|e| format!("the JBIG2 picture could not be decoded ({e})"))?;
-        let mut packer = pixels.0;
         while packer.rows < height {
             packer.end_row();
         }
@@ -192,106 +196,8 @@ pub(crate) fn jbig2(data: &[u8], globals: Option<&[u8]>) -> Result<(u32, u32, Ve
     })
 }
 
-/// The most memory the JBIG2 decoder may keep for one picture's region bitmaps and pattern
-/// dictionaries, in bytes.
-const JBIG2_BUDGET: u64 = 256 << 20;
-
-/// The bytes the JBIG2 decoder keeps for the region bitmaps (T.88 7.4.1: generic, refinement,
-/// text and halftone regions, intermediate or immediate) and pattern dictionaries (7.4.4) of
-/// JBIG2 data in the embedded organization, from their segment headers, the way `hayro-jbig2`
-/// 0.4 stores them: one bit per pixel in rows of whole 32-bit words, and for each pattern of a
-/// dictionary also 64 words per pattern row. The walk follows the decoder's own segment parser,
-/// including regions of unknown length. Data it cannot follow is left to the decoder. Data with
-/// a symbol dictionary (7.4.2) is refused, as what it keeps cannot be read from its header.
-fn jbig2_retained_bytes(data: &[u8]) -> Result<u64, String> {
-    const REGIONS: [u8; 12] = [4, 6, 7, 20, 22, 23, 36, 38, 39, 40, 42, 43];
-    const PATTERNS: u8 = 16;
-    const SYMBOLS: u8 = 0;
-    let be32 = |at: usize| -> Option<u32> {
-        data.get(at..at.checked_add(4)?)
-            .and_then(|b| b.try_into().ok())
-            .map(u32::from_be_bytes)
-    };
-    let bitmap = |w: u64, h: u64| w.div_ceil(32).saturating_mul(4).saturating_mul(h);
-    let mut total: u64 = 0;
-    let mut at = 0usize;
-    while at < data.len() {
-        let Some(number) = be32(at) else { break };
-        let Some(&flags) = data.get(at + 4) else { break };
-        let Some(&refs) = data.get(at + 5) else { break };
-        let (count, mut pos) = match refs >> 5 {
-            7 => {
-                let Some(long) = be32(at + 5) else { break };
-                let count = (long & 0x1FFF_FFFF) as usize;
-                // The retain bits: one for this segment and one per referred-to segment.
-                (count, (at + 9).saturating_add((count + 1).div_ceil(8)))
-            }
-            5 | 6 => return Err("the JBIG2 picture has a damaged segment header".into()),
-            short => (usize::from(short), at + 6),
-        };
-        let ref_size = if number <= 256 {
-            1
-        } else if number <= 65536 {
-            2
-        } else {
-            4
-        };
-        pos = pos.saturating_add(count.saturating_mul(ref_size));
-        pos = pos.saturating_add(if flags & 0x40 != 0 { 4 } else { 1 });
-        let Some(length) = be32(pos) else { break };
-        pos = pos.saturating_add(4);
-        let kind = flags & 0x3F;
-        if kind == SYMBOLS {
-            // What a symbol dictionary keeps depends on its coded data, not its header, so it
-            // cannot be counted here; such pictures wait for a decoder-side limit (#423).
-            return Err("JBIG2 pictures with symbol dictionaries (text-like scans) are not supported yet".into());
-        }
-        if REGIONS.contains(&kind) {
-            let (Some(w), Some(h)) = (be32(pos), be32(pos + 4)) else {
-                break;
-            };
-            total = total.saturating_add(bitmap(u64::from(w), u64::from(h)));
-        } else if kind == PATTERNS {
-            // Flags, pattern width, pattern height, GRAYMAX: GRAYMAX + 1 patterns, each kept
-            // as its own bitmap and, when it is at most 32 x 32, in 32 shifted copies of two
-            // words per row, plus the collective bitmap they are cut from.
-            let (Some(&w), Some(&h), Some(gray_max)) = (data.get(pos + 1), data.get(pos + 2), be32(pos + 3)) else {
-                break;
-            };
-            let (w, h, n) = (u64::from(w), u64::from(h), u64::from(gray_max) + 1);
-            let shifted = if w <= 32 && h <= 32 { h * 64 * 4 } else { 0 };
-            let each = bitmap(w, h).saturating_add(shifted);
-            total = total
-                .saturating_add(n.saturating_mul(each))
-                .saturating_add(bitmap(n.saturating_mul(w), h));
-        }
-        if length == u32::MAX {
-            // An immediate generic region of unknown length ends with a marker and a 4-byte
-            // row count (7.2.7, 7.4.6.4), searched for after its region info, flags and AT
-            // pixels, as the decoder does.
-            let Some(&region_flags) = data.get(pos + 17) else { break };
-            let mmr = region_flags & 1 != 0;
-            let at_bytes = match (mmr, (region_flags >> 1) & 3, region_flags & 0x10 != 0) {
-                (true, _, _) => 0,
-                (false, 0, false) => 8,
-                (false, 0, true) => 24,
-                (false, _, _) => 2,
-            };
-            let marker: [u8; 2] = if mmr { [0x00, 0x00] } else { [0xFF, 0xAC] };
-            let from = pos + 18 + at_bytes;
-            let Some(end) = data
-                .get(from..)
-                .and_then(|rest| rest.windows(6).position(|w| w[..2] == marker))
-            else {
-                break;
-            };
-            at = from + end + 6;
-            continue;
-        }
-        at = pos.saturating_add(length as usize);
-    }
-    Ok(total)
-}
+/// The most memory the JBIG2 decoder may keep for one picture's bitmaps, in bytes.
+const JBIG2_BUDGET: usize = 256 << 20;
 
 /// A decoded JPEG 2000 picture: 8-bit samples, one to four channels interleaved.
 pub(crate) struct Jpx {
@@ -488,62 +394,36 @@ mod tests {
         assert_eq!(jpx_components(b"%PDF"), None);
     }
 
+    /// A JBIG2 test stream in the embedded organization PDF uses: the file without its header
+    /// (ID string, flags and page count).
+    fn embedded(file: &[u8]) -> &[u8] {
+        file.get(13..).unwrap_or_default()
+    }
+
     #[test]
-    fn jbig2_regions_and_pattern_dictionaries_are_added_up_from_their_headers() {
-        let segment = |number: u32, kind: u8, data: &[u8]| {
-            let mut b = number.to_be_bytes().to_vec();
-            b.extend_from_slice(&[kind, 0, 1]);
-            b.extend_from_slice(&(data.len() as u32).to_be_bytes());
-            b.extend_from_slice(data);
-            b
+    fn jbig2_text_like_scans_with_symbol_dictionaries_are_read() {
+        let text = include_bytes!("../testdata/jbig2/symbol.jbig2");
+        let generic = include_bytes!("../testdata/jbig2/generic_trailing_7fff_stripped.jbig2");
+        let Ok((width, height, samples)) = jbig2(embedded(text), None) else {
+            unreachable!("a symbol dictionary page decodes");
         };
-        let region = |w: u32, h: u32| {
-            let mut d = w.to_be_bytes().to_vec();
-            d.extend_from_slice(&h.to_be_bytes());
-            d.extend_from_slice(&[0; 10]);
-            d
-        };
-        let mut data = segment(0, 48, &[0; 19]);
-        // 100 x 200: 4 words a row.
-        data.extend(segment(1, 36, &region(100, 200)));
-        // 10 x 10: 1 word a row.
-        data.extend(segment(2, 38, &region(10, 10)));
-        assert_eq!(jbig2_retained_bytes(&data), Ok(16 * 200 + 4 * 10));
-        // A cut-off header stops the count without an error.
-        assert_eq!(jbig2_retained_bytes(&data[..30]), Ok(0));
+        // The same picture coded as one generic region comes out the same.
+        assert_eq!(jbig2(embedded(generic), None), Ok((width, height, samples.clone())));
+        assert_eq!((width, height), (163, 109));
+        assert!(samples.contains(&0), "the picture has black pixels");
+    }
 
-        // A pattern dictionary of 65 536 patterns of 1 x 32 pixels is far over the budget.
-        let patterns = segment(3, 16, &[0, 1, 32, 0, 0, 0xFF, 0xFF]);
-        assert!(jbig2_retained_bytes(&patterns).is_ok_and(|n| n > JBIG2_BUDGET));
-        // A small one is not.
-        let small = segment(3, 16, &[0, 8, 8, 0, 0, 0, 15]);
-        assert!(jbig2_retained_bytes(&small).is_ok_and(|n| n < 1 << 20));
-        // A symbol dictionary is refused: its symbols' sizes are only in its coded data.
-        let symbols = segment(3, 0, &[0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1]);
-        assert!(jbig2_retained_bytes(&symbols).is_err_and(|e| e.contains("symbol dictionaries")));
-        // Patterns taller than 32 pixels get no shifted copies: 4096 of 8 x 255 take about
-        // 5 MiB.
-        let tall = segment(3, 16, &[0, 8, 255, 0, 0, 0x0F, 0xFF]);
-        assert!(jbig2_retained_bytes(&tall).is_ok_and(|n| n < 8 << 20));
-
-        // Eight referred-to segments take the long form with two retain bytes; the region
-        // after such a segment is still counted.
-        let mut long = 9u32.to_be_bytes().to_vec();
-        long.extend_from_slice(&[62, 0xE0, 0, 0, 8, 0, 0]); // extension, count 8, 2 retain bytes
-        long.extend_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7]); // referred-to segments
-        long.push(1); // page
-        long.extend_from_slice(&4u32.to_be_bytes());
-        long.extend_from_slice(&[0; 4]);
-        long.extend(segment(10, 36, &region(65535, 65535)));
-        assert!(jbig2_retained_bytes(&long).is_ok_and(|n| n > JBIG2_BUDGET));
-
-        // A region of unknown length does not hide the regions after it.
-        let mut unknown = 4u32.to_be_bytes().to_vec();
-        unknown.extend_from_slice(&[38, 0, 1, 0xFF, 0xFF, 0xFF, 0xFF]);
-        unknown.extend_from_slice(&region(8, 2)[..17]);
-        unknown.push(1); // MMR
-        unknown.extend_from_slice(&[0x2F, 0x78, 0x00, 0x00, 0, 0, 0, 2]); // data, end marker, rows
-        unknown.extend(segment(5, 36, &region(65535, 65535)));
-        assert!(jbig2_retained_bytes(&unknown).is_ok_and(|n| n > JBIG2_BUDGET));
+    #[test]
+    fn jbig2_symbol_dictionaries_over_the_memory_limit_are_refused() {
+        let text = include_bytes!("../testdata/jbig2/symbol.jbig2");
+        let large = include_bytes!("../testdata/jbig2/memory_symbol_dictionary_large_symbol.jbig2");
+        let many = include_bytes!("../testdata/jbig2/memory_symbol_dictionary_many_symbols.jbig2");
+        let too_much = |r: Result<(u32, u32, Vec<u8>), String>| r.is_err_and(|e| e.contains("too much memory"));
+        // One symbol larger than the limit, and many small symbols that add up past it.
+        assert!(too_much(jbig2_within(embedded(large), None, 48 << 10)));
+        assert!(too_much(jbig2_within(embedded(many), None, 8 << 10)));
+        // An ordinary page needs far less than the limit used for PDFs, but not nothing.
+        assert!(too_much(jbig2_within(embedded(text), None, 64)));
+        assert!(jbig2_within(embedded(text), None, 1 << 20).is_ok());
     }
 }
