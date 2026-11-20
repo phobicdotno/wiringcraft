@@ -65,6 +65,9 @@ pub struct PanelState {
     /// the wires it belongs to.
     spec: [SpecField; 3],
     spec_for: (usize, Vec<String>),
+    /// The form for the selected black box's size and points: the page, item and symbol
+    /// version it was read from (another version, after an Undo say, reads it again).
+    black_box: Option<((usize, String, String), crate::black_box_tool::BoxEdit)>,
 }
 
 impl PanelState {
@@ -873,6 +876,116 @@ fn with_fields(s: &Shape, v: &[f64]) -> Shape {
     out
 }
 
+/// The selected black box's size and connection points, changed together with Apply as one
+/// undo step ([`Open::edit_black_box`]).
+fn black_box_section(
+    ui: &mut egui::Ui,
+    open: &mut Open,
+    ed: &mut Editor,
+    ps: &mut PanelState,
+    page: usize,
+    id: &str,
+    t: &Theme,
+) {
+    use crate::black_box_tool::{BoxEdit, side_label};
+    use wc_core::BoxSide;
+    let Some(sym) = open
+        .project
+        .pages
+        .get(page)
+        .and_then(|p| p.symbol(id))
+        .and_then(|s| open.symbols.get(&s.symbol))
+    else {
+        return;
+    };
+    let key = (page, id.to_owned(), sym.hash());
+    if ps.black_box.as_ref().map(|(k, _)| k) != Some(&key) {
+        ps.black_box = BoxEdit::load(sym).map(|f| (key, f));
+    }
+    let Some((_, form)) = ps.black_box.as_mut() else {
+        return;
+    };
+    ui.add_space(6.0);
+    subsection(ui, "Black box");
+    egui::Grid::new("box-size")
+        .num_columns(2)
+        .spacing([8.0, 6.0])
+        .show(ui, |ui| {
+            ui.label("Width");
+            ui.add(
+                egui::DragValue::new(&mut form.width)
+                    .range(1.0..=5000.0)
+                    .speed(0.5)
+                    .suffix(" mm"),
+            );
+            ui.end_row();
+            ui.label("Height");
+            ui.add(
+                egui::DragValue::new(&mut form.height)
+                    .range(1.0..=5000.0)
+                    .speed(0.5)
+                    .suffix(" mm"),
+            );
+            ui.end_row();
+        });
+    ui.label(RichText::new("Connection points: name, edge and mm along it").color(t.faint));
+    let mut remove = None;
+    egui::Grid::new("box-pins")
+        .num_columns(4)
+        .spacing([6.0, 4.0])
+        .show(ui, |ui| {
+            for (i, row) in form.rows.iter_mut().enumerate() {
+                ui.add(egui::TextEdit::singleline(&mut row.name).desired_width(48.0));
+                egui::ComboBox::from_id_salt(("box-side", i))
+                    .width(70.0)
+                    .selected_text(side_label(row.side))
+                    .show_ui(ui, |ui| {
+                        for side in [BoxSide::Top, BoxSide::Bottom, BoxSide::Left, BoxSide::Right] {
+                            ui.selectable_value(&mut row.side, side, side_label(side));
+                        }
+                    });
+                ui.add(egui::DragValue::new(&mut row.offset).speed(0.5).suffix(" mm"));
+                if ui.small_button("\u{2715}").on_hover_text("Remove this point").clicked() {
+                    remove = Some(i);
+                }
+                ui.end_row();
+            }
+        });
+    if let Some(i) = remove {
+        form.rows.remove(i);
+    }
+    let (mut apply, mut reset) = (false, false);
+    ui.horizontal(|ui| {
+        if ui.small_button("+ Point").clicked() {
+            form.add_row();
+        }
+        let changed = form.changed();
+        apply = ui.add_enabled(changed, egui::Button::new("Apply")).clicked();
+        reset = ui.add_enabled(changed, egui::Button::new("Reset")).clicked();
+    });
+    if reset {
+        ps.black_box = None;
+        return;
+    }
+    if apply {
+        match open.edit_black_box(page, id, form.width, form.height, &form.pins(), &form.renamed()) {
+            Ok(warnings) => {
+                ed.message = if warnings.is_empty() {
+                    "Black box changed.".into()
+                } else {
+                    format!("Black box changed. Check: {}.", warnings.join("; "))
+                };
+                ps.black_box = None;
+                return;
+            }
+            Err(e) => form.error = Some(e),
+        }
+    }
+    if let Some(err) = &form.error {
+        ui.label(RichText::new(err).color(t.error).small());
+    }
+}
+
 fn committed(r: &egui::Response) -> bool {
     r.lost_focus() || (r.has_focus() && r.ctx.input(|i| i.key_pressed(egui::Key::Enter)))
 }
@@ -1062,7 +1175,13 @@ fn selection_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps:
             if let Some(tag) = placed.tag.clone() {
                 device_section(ui, open, ps, &tag, t);
             }
-            if let Some(sym) = open.symbols.get(&placed.symbol) {
+            if open
+                .symbols
+                .get(&placed.symbol)
+                .is_some_and(|s| wc_core::black_box_layout(s).is_some())
+            {
+                black_box_section(ui, open, ed, ps, page_idx, &id, t);
+            } else if let Some(sym) = open.symbols.get(&placed.symbol) {
                 ui.add_space(6.0);
                 subsection(ui, "Pins");
                 let names: Vec<&str> = sym.pins.iter().map(|p| p.name.as_str()).collect();

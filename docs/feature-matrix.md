@@ -121,7 +121,7 @@ For the other areas, the chapter to read in each help is:
 | Device properties and description | yes | yes | yes | done |
 | Part (article) database with manufacturer, order number, data | yes | yes (catalog) | yes | done |
 | Several parts on one device (main part plus accessories) | yes | yes | no: one part per device | todo (#106) |
-| Black box / device box for devices without a symbol | yes | yes | yes: imported, drawn with connection points from the command line (`wiringcraft box`) and with the Black box tool in the app (drag the rectangle, click its edges for connection points, then tag it); resizing a drawn box or editing its points comes later | yes (#266, #371) |
+| Black box / device box for devices without a symbol | yes | yes | yes: imported, drawn with connection points from the command line (`wiringcraft box`) and with the Black box tool in the app (drag the rectangle, click its edges for connection points, then tag it); a placed box's width, height and connection points (add, rename, move, remove) are changed in the properties panel as one undo step, with a warning naming wires on points that are gone or moved; dragging a corner on the sheet comes later | yes (#266, #371, #489) |
 | Part data from the maker's data portal | add-on (Data Portal) | yes (content portal) | EDZ part data, and macros as symbols with their connection points (multi-line, variant A; or a symbol by `--symbol-map`), and BMEcat | done (#144, #311) |
 | Manufacturer symbol and macro sources | yes | yes | listed in docs | done (#46) |
 
