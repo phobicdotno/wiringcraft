@@ -139,10 +139,21 @@ impl BoxEdit {
             .collect()
     }
 
+    /// The points the box had that the form no longer has (by identity, not by name: a new
+    /// point may take a removed one's name).
+    pub fn removed(&self) -> std::collections::BTreeSet<String> {
+        self.base
+            .2
+            .iter()
+            .filter(|p| !self.rows.iter().any(|r| r.was.as_deref() == Some(p.name.as_str())))
+            .map(|p| p.name.clone())
+            .collect()
+    }
+
     /// Whether anything was typed that the box does not have yet: a rename counts even when
     /// the points end up as they were, since the wires on the renamed point follow it.
     pub fn changed(&self) -> bool {
-        (self.width, self.height, self.pins()) != self.base || !self.renamed().is_empty()
+        (self.width, self.height, self.pins()) != self.base || !self.renamed().is_empty() || !self.removed().is_empty()
     }
 
     /// Add a point: the lowest number no point has, on the left edge at the first free 5 mm
@@ -296,6 +307,7 @@ mod tests {
         f.rows[1].offset = 5.0;
         assert_eq!(f.pins(), pins.to_vec());
         assert!(f.changed());
+        assert_eq!(f.removed(), ["1".to_owned()].into_iter().collect());
     }
 
     #[test]

@@ -968,7 +968,14 @@ fn black_box_section(
         return;
     }
     if apply {
-        match open.edit_black_box(page, id, form.width, form.height, &form.pins(), &form.renamed()) {
+        match open.edit_black_box(
+            page,
+            id,
+            (form.width, form.height),
+            &form.pins(),
+            &form.renamed(),
+            &form.removed(),
+        ) {
             Ok(warnings) => {
                 ed.message = if warnings.is_empty() {
                     "Black box changed.".into()
