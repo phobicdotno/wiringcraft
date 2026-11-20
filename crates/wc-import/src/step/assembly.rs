@@ -363,7 +363,8 @@ pub(super) fn place(
         let Some(t) = transformation else { continue };
         // Each placement's move in its own representation's unit; a frame only joins
         // representations of one context, so the representation's unit is its frame's.
-        let (child_mm, parent_mm) = (unit_of(child), unit_of(parent));
+        // The file's unit standing in counts only once the placement is applied.
+        let (child_mm, parent_mm) = (rep_mm(child), rep_mm(parent));
         let (child, parent) = (frames.find(child), frames.find(parent));
         let Some((kind, args)) = simple(instances, t) else {
             continue;
@@ -387,7 +388,13 @@ pub(super) fn place(
             axis_placement(instances, to, point),
         ) && child != parent
         {
-            let (from, to) = (from.moved_in(child_mm), to.moved_in(parent_mm));
+            if child_mm.is_none() || parent_mm.is_none() {
+                unknown.set(true);
+            }
+            let (from, to) = (
+                from.moved_in(child_mm.unwrap_or(file_mm)),
+                to.moved_in(parent_mm.unwrap_or(file_mm)),
+            );
             children
                 .entry(parent)
                 .or_default()
@@ -407,16 +414,21 @@ pub(super) fn place(
                 (kind == "REPRESENTATION_MAP").then_some(())?;
                 let mapped = map.get(1)?.as_ref_id()?;
                 items.contains_key(&mapped).then_some(())?;
-                let from = axis_placement(instances, map.first()?.as_ref_id()?, point)?.moved_in(unit_of(mapped));
+                let (child_mm, parent_mm) = (rep_mm(mapped), rep_mm(*rep));
+                let from =
+                    axis_placement(instances, map.first()?.as_ref_id()?, point)?.moved_in(child_mm.unwrap_or(file_mm));
                 let target = args.get(2)?.as_ref_id()?;
                 let to = axis_placement(instances, target, point)
                     .or_else(|| operator_placement(instances, target, point))?
-                    .moved_in(unit_of(*rep));
-                Some((mapped, from.inverse().then(&to)))
+                    .moved_in(parent_mm.unwrap_or(file_mm));
+                let guessed = child_mm.is_none() || parent_mm.is_none();
+                Some((mapped, from.inverse().then(&to), guessed))
             })();
-            if let Some((mapped, placement)) = found {
+            if let Some((mapped, placement, guessed)) = found {
                 let (child, parent) = (frames.find(mapped), frames.find(*rep));
                 if child != parent {
+                    // The file's unit standing in counts only once the placement is applied.
+                    unknown.set(unknown.get() || guessed);
                     children.entry(parent).or_default().push((child, placement));
                     applied.insert(item);
                 }

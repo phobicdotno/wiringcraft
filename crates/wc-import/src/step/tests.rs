@@ -983,3 +983,27 @@ fn a_part_or_placement_without_a_unit_of_its_own_is_warned_about() {
         "{warnings:?}"
     );
 }
+
+#[test]
+fn a_placement_that_is_not_applied_does_not_count_as_a_guessed_unit() {
+    // The assembly's context names no unit and its placements name points that are not there:
+    // nothing is placed, so no unit was guessed; only the failed placements are warned about.
+    let text = inch_part_in_millimetre_assembly()
+        .replace(
+            "#400=SHAPE_REPRESENTATION('',(#410,#420),#901);",
+            "#906=(GEOMETRIC_REPRESENTATION_CONTEXT(3) REPRESENTATION_CONTEXT('',''));\n#400=SHAPE_REPRESENTATION('',(#410,#420),#906);",
+        )
+        .replace("#410=AXIS2_PLACEMENT_3D('',#411,", "#410=AXIS2_PLACEMENT_3D('',#999,")
+        .replace("#420=AXIS2_PLACEMENT_3D('',#421,", "#420=AXIS2_PLACEMENT_3D('',#998,");
+    let (_, warnings) = size(&text);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("2 of its placements could not be applied")),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings.iter().all(|w| !w.contains("no length unit of their own")),
+        "{warnings:?}"
+    );
+}
