@@ -260,7 +260,8 @@ pub fn resized_pins(pins: &[BoxPin], width: f64, height: f64) -> Vec<BoxPin> {
 pub fn dragged_size(start: (f64, f64), d: Point, rotation: Rotation, mirror: bool, step: f64) -> (f64, f64) {
     let local = untransform(d, rotation, mirror);
     let step = if step.is_finite() && step > 0.0 { step } else { 1.0 };
-    let least = step.max(1.0);
+    // At least 1 mm, rounded up to whole steps, so the smallest box is on the grid too.
+    let least = (1.0 / step).ceil().max(1.0) * step;
     let whole = |v: f64| ((v / step).round() * step).max(least);
     (whole(start.0 + local.x), whole(start.1 + local.y))
 }
@@ -323,6 +324,11 @@ mod tests {
         assert_eq!(
             dragged_size((40.0, 20.0), p(-100.0, -100.0), Rotation::R0, false, 0.5),
             (1.0, 1.0)
+        );
+        // A step that does not divide 1 mm: the least size is the first step past it.
+        assert_eq!(
+            dragged_size((40.0, 20.0), p(-100.0, -100.0), Rotation::R0, false, 0.75),
+            (1.5, 1.5)
         );
 
         let pin = |name: &str, side, offset| BoxPin {
