@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use wc_core::geom::Point;
+use wc_core::geom::{Point, Rotation};
 use wc_core::{BoxPin, BoxSide, Symbol};
 
 /// A black box being drawn on one page.
@@ -239,6 +239,45 @@ pub fn hint(draft: Option<&BoxDraft>) -> &'static str {
     }
 }
 
+/// The connection points `pins` of a box resized to `width` by `height`: each stays on its
+/// edge, its offset along the edge clamped to the new edge length (#524).
+pub fn resized_pins(pins: &[BoxPin], width: f64, height: f64) -> Vec<BoxPin> {
+    pins.iter()
+        .map(|p| BoxPin {
+            name: p.name.clone(),
+            side: p.side,
+            offset: match p.side {
+                BoxSide::Top | BoxSide::Bottom => p.offset.clamp(0.0, width),
+                BoxSide::Left | BoxSide::Right => p.offset.clamp(0.0, height),
+            },
+        })
+        .collect()
+}
+
+/// The size of a box `start` (width, height) after its sizing corner was dragged by `d` (page
+/// mm) on a box placed turned by `rotation` and maybe mirrored: in whole steps of `step`, and
+/// at least one step (and 1 mm) each way.
+pub fn dragged_size(start: (f64, f64), d: Point, rotation: Rotation, mirror: bool, step: f64) -> (f64, f64) {
+    let local = untransform(d, rotation, mirror);
+    let step = if step.is_finite() && step > 0.0 { step } else { 1.0 };
+    let least = step.max(1.0);
+    let whole = |v: f64| ((v / step).round() * step).max(least);
+    (whole(start.0 + local.x), whole(start.1 + local.y))
+}
+
+/// `p` taken back from the page into a placed symbol's own frame: the inverse of
+/// [`Point::transform`].
+pub fn untransform(p: Point, rotation: Rotation, mirror: bool) -> Point {
+    let back = match rotation {
+        Rotation::R0 => Rotation::R0,
+        Rotation::R90 => Rotation::R270,
+        Rotation::R180 => Rotation::R180,
+        Rotation::R270 => Rotation::R90,
+    };
+    let p = p.transform(back, false);
+    if mirror { Point::new(-p.x, p.y) } else { p }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -246,6 +285,66 @@ mod tests {
 
     fn p(x: f64, y: f64) -> Point {
         Point::new(x, y)
+    }
+
+    #[test]
+    fn a_dragged_corner_sizes_the_box_in_its_own_frame_and_keeps_points_on_their_edges() {
+        // Every placement: taking a point back undoes the transform.
+        for rot in [Rotation::R0, Rotation::R90, Rotation::R180, Rotation::R270] {
+            for mirror in [false, true] {
+                let q = p(3.0, -7.0);
+                assert_eq!(
+                    untransform(q.transform(rot, mirror), rot, mirror),
+                    q,
+                    "{rot:?} {mirror}"
+                );
+            }
+        }
+        // Unturned: the drag adds to the size, in whole grid steps.
+        assert_eq!(
+            dragged_size((40.0, 20.0), p(9.0, -4.0), Rotation::R0, false, 2.5),
+            (50.0, 15.0)
+        );
+        // Turned a quarter clockwise: the box's width runs down the page.
+        assert_eq!(
+            dragged_size((40.0, 20.0), p(0.0, 10.0), Rotation::R90, false, 2.5),
+            (50.0, 20.0)
+        );
+        // Mirrored: the box's width runs to the left.
+        assert_eq!(
+            dragged_size((40.0, 20.0), p(-10.0, 0.0), Rotation::R0, true, 2.5),
+            (50.0, 20.0)
+        );
+        // Never smaller than a step, nor than 1 mm.
+        assert_eq!(
+            dragged_size((40.0, 20.0), p(-100.0, -100.0), Rotation::R0, false, 2.5),
+            (2.5, 2.5)
+        );
+        assert_eq!(
+            dragged_size((40.0, 20.0), p(-100.0, -100.0), Rotation::R0, false, 0.5),
+            (1.0, 1.0)
+        );
+
+        let pin = |name: &str, side, offset| BoxPin {
+            name: name.into(),
+            side,
+            offset,
+        };
+        let pins = [
+            pin("1", BoxSide::Top, 35.0),
+            pin("2", BoxSide::Left, 5.0),
+            pin("3", BoxSide::Right, 15.0),
+            pin("4", BoxSide::Bottom, 10.0),
+        ];
+        assert_eq!(
+            resized_pins(&pins, 20.0, 10.0),
+            vec![
+                pin("1", BoxSide::Top, 20.0),
+                pin("2", BoxSide::Left, 5.0),
+                pin("3", BoxSide::Right, 10.0),
+                pin("4", BoxSide::Bottom, 10.0),
+            ]
+        );
     }
 
     #[test]
