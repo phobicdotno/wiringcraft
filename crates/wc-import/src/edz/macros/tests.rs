@@ -564,3 +564,60 @@ fn a_terminal_designation_without_a_pin_in_variant_a_comes_from_another_variant(
     assert_eq!(names, ["1", "2", "3"]);
     Ok(())
 }
+
+#[test]
+fn a_terminal_gets_a_pin_per_designation_and_a_fuse_is_drawn_as_fuses() -> TestResult {
+    let terminal = r#"<EplanPxfRoot Name="X">
+ <MacroVariant VariantId="0" ReferencePoint="50/100" MacroFuncType="1" DocumentType="1">
+  <ESymLib Name="IEC_symbol" ID="1"/>
+  <O17 A1261="1" A1262="30" A1263="0" A1381="100" A1382="1" A185="1;2;3;4">
+   <S40x1201 A762="60/90"/>
+   <P144 P20013="X" P20014="1"/>
+  </O17>
+ </MacroVariant>
+</EplanPxfRoot>"#;
+    let m = read("terminal4.ema", terminal)?;
+    let s = &m.symbol;
+    assert_eq!(s.pins.len(), 4, "{:?}", s.pins);
+    // In pairs, top and bottom, a grid step apart; the macro's designations kept.
+    for (name, x, y, dir) in [
+        ("1", 10.0, 9.0, PinDir::Up),
+        ("2", 10.0, 11.0, PinDir::Down),
+        ("3", 14.0, 9.0, PinDir::Up),
+        ("4", 14.0, 11.0, PinDir::Down),
+    ] {
+        let p = pin(s, name)?;
+        assert!(near(p.at, x, y) && p.dir == dir, "{name}: {p:?}");
+    }
+    assert_eq!(s.role, SymbolRole::Terminal);
+
+    let fuse = r#"<EplanPxfRoot Name="F">
+ <MacroVariant VariantId="0" ReferencePoint="50/100" MacroFuncType="1" DocumentType="1">
+  <ESymLib Name="IEC_symbol" ID="1"/>
+  <O17 A1261="1" A1262="50" A1263="0" A1381="502" A1382="1" A185="1;2;3;4">
+   <S40x1201 A762="60/90"/>
+   <P144 P20013="F" P20014="1"/>
+  </O17>
+ </MacroVariant>
+</EplanPxfRoot>"#;
+    let m = read("fuse2.ema", fuse)?;
+    let s = &m.symbol;
+    assert_eq!(s.pins.len(), 4);
+    for (name, x, y, dir) in [
+        ("1", 10.0, 10.0, PinDir::Up),
+        ("2", 10.0, 18.0, PinDir::Down),
+        ("3", 14.0, 10.0, PinDir::Up),
+        ("4", 14.0, 18.0, PinDir::Down),
+    ] {
+        let p = pin(s, name)?;
+        assert!(near(p.at, x, y) && p.dir == dir, "{name}: {p:?}");
+    }
+    // One fuse body per pole, not a box round all of them.
+    let bodies = s
+        .graphics
+        .iter()
+        .filter(|g| matches!(g, Shape::Rect { min, max } if (max.x - min.x - 2.0).abs() < 1e-9))
+        .count();
+    assert_eq!(bodies, 2, "{:?}", s.graphics);
+    Ok(())
+}

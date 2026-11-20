@@ -33,7 +33,8 @@
 //! further for each variant. EPLAN keeps the drawing of library symbols in its own libraries,
 //! not in the macro, so a placement with several connection points is drawn with the
 //! WiringCraft symbol of the same kind ([`crate::eplan::drawing::symbol_for`]), first
-//! connection point at its point, as the EPLAN project import does. Variant A may hold only
+//! connection point at its point, as the EPLAN project import does; a terminal gets a pin for
+//! each of its designations (pairs top and bottom), and category 502 is drawn as fuses. Variant A may hold only
 //! some of a device's terminals; named connection points that only the other multi-line
 //! variants hold (or, when none do, the overview) are added as pins in a column to the right of
 //! the drawing, facing right. What is left out is counted.
@@ -653,10 +654,13 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
             pins: names.clone(),
             ..Default::default()
         };
-        let Some(s) = symbol_for(&f) else {
+        let Some(mut s) = symbol_for(&f) else {
             add(&mut left_out, "placed symbols without connection points", 1);
             continue;
         };
+        if p.kind == KIND_TERMINAL {
+            more_terminal_points(&mut s, names.len());
+        }
         let (rotation, mirror) = rotation_of(p.variant);
         for g in &s.graphics {
             graphics.push(g.placed(origin, rotation, mirror));
@@ -667,8 +671,9 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
                 .then(|| names.get(k).filter(|n| !n.is_empty()).cloned())
                 .flatten()
         };
-        // A drawn symbol has a pin for as many designations as it has pins, in order; a
-        // designation past those has no pin (#512) and may still come from another variant.
+        // A drawn symbol has a pin for as many designations as it has pins, in order (a
+        // terminal has one per designation); a designation past those has no pin and may still
+        // come from another variant.
         for name in names.iter().take(s.pins.len()) {
             have.insert((p.letter.clone(), p.number.clone(), name.clone()));
         }
@@ -794,6 +799,37 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
         },
         left_out,
     })
+}
+
+/// Give the terminal symbol `s` (two connection points, top and bottom of one terminal) a
+/// connection point for each of `count` designations: EPLAN's terminals with 4 or more points
+/// have them in pairs, top and bottom, a grid step apart. Each further pair gets its own circle,
+/// joined to the one before (one terminal, bridged inside).
+fn more_terminal_points(s: &mut Symbol, count: usize) {
+    for k in s.pins.len()..count {
+        let x = PIN_STEP * (k / 2) as f64;
+        if k % 2 == 0 {
+            s.graphics.push(Shape::Circle {
+                center: Point::new(x, 0.0),
+                radius: 1.0,
+                filled: false,
+            });
+            s.graphics.push(Shape::Line {
+                a: Point::new(x - PIN_STEP + 1.0, 0.0),
+                b: Point::new(x - 1.0, 0.0),
+            });
+        }
+        let (y, dir) = if k % 2 == 0 {
+            (-1.0, PinDir::Up)
+        } else {
+            (1.0, PinDir::Down)
+        };
+        s.pins.push(Pin {
+            name: (k + 1).to_string(),
+            at: Point::new(x, y),
+            dir,
+        });
+    }
 }
 
 /// The named connection points of the macro's other multi-line variants, in variant order, as

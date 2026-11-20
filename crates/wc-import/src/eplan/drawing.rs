@@ -23,6 +23,9 @@ use super::{EplanConnection, EplanFunction, EplanNode, EplanProject, device_tag,
 /// Function categories (Eplan's function definition numbers) this module draws specially.
 pub const KIND_TERMINAL: u16 = 100;
 pub const KIND_BREAKER: u16 = 501;
+/// Fuses: the protective device category next to the circuit breakers (inferred from real
+/// maker macros, where it held fuse holders with one pair of connection points per pole).
+pub const KIND_FUSE: u16 = 502;
 pub const KIND_BUTTON_CONTACT: u16 = 600;
 pub const KIND_LAMP: u16 = 900;
 /// Relay and contactor contacts.
@@ -320,6 +323,19 @@ pub fn symbol_for(f: &EplanFunction) -> Option<Symbol> {
             pins.push(pin(&names[2 * k + 1], x, LENGTH, PinDir::Down));
         }
         ("switch", SymbolRole::Standalone, Point::new(-10.0, 4.5))
+    } else if f.kind == KIND_FUSE && n.is_multiple_of(2) {
+        // One fuse per pole: a body round the line, a grid step apart.
+        for k in 0..n / 2 {
+            let x = GRID * k as f64;
+            g.push(line(x, 0.0, x, LENGTH));
+            g.push(Shape::Rect {
+                min: Point::new(x - 1.0, 2.0),
+                max: Point::new(x + 1.0, 6.0),
+            });
+            pins.push(pin(&names[2 * k], x, 0.0, PinDir::Up));
+            pins.push(pin(&names[2 * k + 1], x, LENGTH, PinDir::Down));
+        }
+        ("fuse", SymbolRole::Standalone, Point::new(-10.0, 4.5))
     } else {
         let w = GRID * (n as f64 - 1.0);
         g.push(Shape::Rect {
