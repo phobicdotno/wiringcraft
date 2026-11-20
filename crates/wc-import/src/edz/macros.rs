@@ -542,15 +542,6 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
     if pin_count > MAX_PINS {
         return Err(Error::Format(format!("holds more than {MAX_PINS} connection points")));
     }
-    // The named connection points variant A has, and those it leaves out that the other
-    // variants hold.
-    let mut have: BTreeSet<(String, String, String)> = BTreeSet::new();
-    for p in v.placements.iter().filter(|p| p.kind != BLACK_BOX) {
-        for name in p.pins.iter().flatten() {
-            have.insert((p.letter.clone(), p.number.clone(), name.clone()));
-        }
-    }
-    let extra = other_points(&all, v, &have);
 
     // EPLAN's y axis points up; the symbol's down, with the reference point as its origin.
     let r = v.reference;
@@ -612,6 +603,8 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
     let mut pins: Vec<Pin> = Vec::new();
     // The device tag of each pin's placement, by pin.
     let mut owners: Vec<(String, String)> = Vec::new();
+    // The connection point designations variant A gave a pin, by device tag.
+    let mut have: BTreeSet<(String, String, String)> = BTreeSet::new();
     // The device tag letter of the black box, if it has one.
     let mut box_letter = String::new();
     let mut drawn_kinds: Vec<SymbolRole> = Vec::new();
@@ -641,6 +634,7 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
         };
         if names.len() <= 1 {
             let name = names.first().cloned().unwrap_or_default();
+            have.insert((p.letter.clone(), p.number.clone(), name.clone()));
             pins.push(Pin {
                 name,
                 at: origin,
@@ -673,6 +667,11 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
                 .then(|| names.get(k).filter(|n| !n.is_empty()).cloned())
                 .flatten()
         };
+        // A drawn symbol has a pin for as many designations as it has pins, in order; a
+        // designation past those has no pin (#512) and may still come from another variant.
+        for name in names.iter().take(s.pins.len()) {
+            have.insert((p.letter.clone(), p.number.clone(), name.clone()));
+        }
         for (k, pin) in s.pins.iter().enumerate() {
             pins.push(Pin {
                 name: own(k).unwrap_or_else(|| pin.name.clone()),
@@ -691,6 +690,7 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
 
     // Connection points only the other variants hold go in a column right of the drawing, a
     // grid step apart, facing right.
+    let extra = other_points(&all, v, &have);
     let mut column: Vec<Point> = pins.iter().map(|p| p.at).collect();
     for g in &graphics {
         let (a, b) = g.bounds();

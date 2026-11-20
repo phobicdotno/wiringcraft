@@ -547,3 +547,20 @@ fn points_from_other_variants_count_toward_the_most_a_macro_may_hold() {
     let e = read("big.ema", &text).err().map(|e| e.to_string()).unwrap_or_default();
     assert_eq!(e, format!("holds more than {MAX_PINS} connection points"));
 }
+
+#[test]
+fn a_terminal_designation_without_a_pin_in_variant_a_comes_from_another_variant() -> TestResult {
+    // Variant A draws terminal X1 with designations 1;2;3, but the terminal symbol has two
+    // pins; variant B holds 3 as a connection point of its own.
+    let text = r#"<EplanPxfRoot>
+        <MacroVariant MacroFuncType="1" VariantId="0" ReferencePoint="0/0">
+         <O17 A1381="100" A185="1;2;3"><S40x1201 A762="0/0"/><P144 P20013="X" P20014="1"/></O17>
+        </MacroVariant>
+        <MacroVariant MacroFuncType="1" VariantId="1" ReferencePoint="0/0">
+         <O17 A1381="300" A185="3"><S40x1201 A762="0/0"/><P144 P20013="X" P20014="1"/></O17>
+        </MacroVariant></EplanPxfRoot>"#;
+    let s = read("x.ema", text)?.symbol;
+    let names: Vec<&str> = s.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["1", "2", "3"]);
+    Ok(())
+}
