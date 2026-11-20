@@ -509,6 +509,60 @@ impl Open {
         let text = std::fs::read(dxf).map_err(|e| format!("{}: {e}", dxf.display()))?;
         let (footprint, warnings) = wc_import::dxf::footprint(&String::from_utf8_lossy(&text))
             .map_err(|e| format!("{}: {e}", dxf.display()))?;
+        let (w, h) = (footprint.width, footprint.height);
+        let msg = self.store_in_library_part(
+            id,
+            |part| part.footprint = Some(footprint),
+            |a, b| a.footprint == b.footprint,
+            |path| {
+                format!(
+                    "Footprint of {id}: {} x {} mm, stored in {}",
+                    wc_core::geom::format_length(w),
+                    wc_core::geom::format_length(h),
+                    path.display()
+                )
+            },
+        )?;
+        Ok(with_warnings(msg, &warnings))
+    }
+
+    /// Store the size of the maker's 3D model in the STEP file `step` with part `id` (#501), as
+    /// `wiringcraft import model-step` does: the part is written with the model size in the
+    /// library source the project takes it from, and the project's pinned copy follows as one
+    /// undo step, so a part without a width and height or footprint gets its size on the plate.
+    /// Returns what was done, with the model's warnings.
+    pub fn attach_model(&mut self, id: &str, step: &Path) -> Result<String, String> {
+        let text = std::fs::read(step).map_err(|e| format!("{}: {e}", step.display()))?;
+        let (size, warnings) = wc_import::step::model_size(&String::from_utf8_lossy(&text))
+            .map_err(|e| format!("{}: {e}", step.display()))?;
+        let msg = self.store_in_library_part(
+            id,
+            |part| part.model = Some(size),
+            |a, b| a.model == b.model,
+            |path| {
+                format!(
+                    "3D model of {id}: {} x {} x {} mm, stored in {}",
+                    wc_core::geom::format_length(size.width),
+                    wc_core::geom::format_length(size.height),
+                    wc_core::geom::format_length(size.depth),
+                    path.display()
+                )
+            },
+        )?;
+        Ok(with_warnings(msg, &warnings))
+    }
+
+    /// Change part `id` with `change` in the library source the project takes it from and write
+    /// it back; then the project's pinned copy follows through the same update as Library →
+    /// Update (one undo step, a copy changed in the project is not overwritten). `same` tells
+    /// whether the project's copy holds the change; `done` says what was stored where.
+    fn store_in_library_part(
+        &mut self,
+        id: &str,
+        change: impl FnOnce(&mut Part),
+        same: impl Fn(&Part, &Part) -> bool,
+        done: impl FnOnce(&Path) -> String,
+    ) -> Result<String, String> {
         let lib = wc_library::Library::open(&self.dir, &self.project).map_err(|e| e.to_string())?;
         let path = lib
             .locate(ItemKind::Part, id)
@@ -518,24 +572,25 @@ impl Open {
         if part.id != id {
             return Err(format!("{} holds part {:?}, not {id:?}", path.display(), part.id));
         }
-        let (w, h) = (footprint.width, footprint.height);
-        part.footprint = Some(footprint);
+        change(&mut part);
         let json = store::to_json(&part).map_err(|e| e.to_string())?;
         store::write_if_changed(&path, &json).map_err(|e| format!("{}: {e}", path.display()))?;
-        let mut msg = format!(
-            "Footprint of {id}: {} x {} mm, stored in {}",
-            wc_core::geom::format_length(w),
-            wc_core::geom::format_length(h),
-            path.display()
-        );
-        // The project's pinned copy follows, through the same update as Library → Update, so
-        // a copy changed in the project is not overwritten and the step can be undone.
+        let mut msg = done(&path);
         if self.project.lock.parts.contains_key(id) {
+            let before = self.parts.get(id).and_then(wc_core::panel::part_size);
             let lib = wc_library::Library::open(&self.dir, &self.project).map_err(|e| e.to_string())?;
             let only = [id.to_owned()];
+            // Whether the update took a new copy (and so an undo step): the pin changes. The
+            // undo history's length cannot tell once it is full.
+            let pin = self.project.lock.parts.get(id).map(|e| e.hash.clone());
             let updated = self.update_library_of(&lib, Some(&only), Some(ItemKind::Part));
-            let follows = self.parts.get(id).is_some_and(|p| p.footprint == part.footprint);
+            let follows = self.parts.get(id).is_some_and(|p| same(p, &part));
             match updated {
+                // Devices of the part on the plates take its new size, in the same undo step.
+                Ok(_) if follows && self.project.lock.parts.get(id).map(|e| &e.hash) != pin.as_ref() => {
+                    let after = self.parts.get(id).and_then(wc_core::panel::part_size);
+                    msg.push_str(&self.resize_panel_devices(id, before, after));
+                }
                 Ok(_) if follows => {}
                 Ok(_) => msg.push_str(&format!(
                     ". The project's copy of {id} was not updated (it differs from the library's); update it from the library"
@@ -543,10 +598,64 @@ impl Open {
                 Err(e) => msg.push_str(&format!(". The project's copy of {id} was not updated: {e}")),
             }
         }
-        for w in &warnings {
-            msg.push_str(&format!(". Warning: {w}"));
-        }
         Ok(msg)
+    }
+
+    /// Devices of part `id` on the panel layouts, drawn at the size the part had (`before`, or
+    /// [`wc_core::panel::DEFAULT_SIZE`] when it had none), take its new size `after` (#501). A
+    /// device sized by hand keeps its size; one that would no longer fit on its plate keeps its
+    /// size and is named in the returned note. No undo step of its own: this follows a part update.
+    fn resize_panel_devices(&mut self, id: &str, before: Option<(f64, f64)>, after: Option<(f64, f64)>) -> String {
+        use wc_core::panel::PanelItem;
+        let Some(after) = after else { return String::new() };
+        let was = before.unwrap_or(wc_core::panel::DEFAULT_SIZE);
+        if was == after {
+            return String::new();
+        }
+        let of_part = |tag: &DeviceTag| self.project.devices.get(tag).and_then(|d| d.part.as_deref()) == Some(id);
+        let mut todo = Vec::new();
+        for (pi, panel) in self.project.panels.iter().enumerate() {
+            for item in &panel.items {
+                if let PanelItem::Device {
+                    tag,
+                    at,
+                    width,
+                    height,
+                    rotation,
+                } = item
+                    && (*width, *height) == was
+                    && of_part(tag)
+                {
+                    todo.push((pi, tag.clone(), *at, *rotation));
+                }
+            }
+        }
+        let (mut resized, mut kept) = (0usize, Vec::new());
+        for (pi, tag, at, rotation) in todo {
+            let Some(panel) = self.project.panels.get_mut(pi) else {
+                continue;
+            };
+            match panel.place_device(tag.clone(), at, after, rotation) {
+                Ok(()) => resized += 1,
+                Err(why) => kept.push(format!("{tag} on {} ({why})", panel.name)),
+            }
+        }
+        let mut note = String::new();
+        if resized > 0 {
+            note.push_str(&format!(
+                ". {resized} device{} on the panel layouts now {} x {} mm",
+                if resized == 1 { "" } else { "s" },
+                wc_core::geom::format_length(after.0),
+                wc_core::geom::format_length(after.1)
+            ));
+        }
+        if !kept.is_empty() {
+            note.push_str(&format!(
+                ". Kept their size, the new one would not fit on the plate: {}",
+                kept.join("; ")
+            ));
+        }
+        note
     }
 
     /// Give a device a part (taken from the library into the project when needed), or none.
@@ -3139,6 +3248,14 @@ pub struct PropsSnapshot {
 /// The name review comments are signed with: `WIRINGCRAFT_USER`, then git's `user.name`, then
 /// the login name.
 /// Title-block fields from a form: trimmed, with empty keys and values dropped.
+/// `msg` with each warning appended.
+fn with_warnings(mut msg: String, warnings: &[String]) -> String {
+    for w in warnings {
+        msg.push_str(&format!(". Warning: {w}"));
+    }
+    msg
+}
+
 fn title_block_of(fields: &[(String, String)]) -> BTreeMap<String, String> {
     fields
         .iter()
@@ -4300,6 +4417,130 @@ pub(crate) mod tests {
         let bad = tmp.path().join("bad.dxf");
         std::fs::write(&bad, "0\nSECTION\n2\nENTITIES\n0\nENDSEC\n0\nEOF\n").unwrap();
         assert!(o.attach_footprint(pid, &bad).is_err());
+        let still: Part = store::read_json(&mine.join("parts").join(format!("{pid}.json"))).unwrap();
+        assert_eq!(still, in_lib);
+    }
+
+    #[test]
+    fn a_maker_step_model_sizes_a_part_and_one_undo_takes_it_back() {
+        let (tmp, mut o) = project();
+        let pid = "maker.relay";
+        let mine = tmp.path().join("mine");
+        let part = Part {
+            id: pid.into(),
+            manufacturer: "Maker".into(),
+            order_number: "RL-1".into(),
+            ..Part::default()
+        };
+        wc_library::write_part(&mine, &part).unwrap();
+        o.project.meta.libraries.insert(
+            0,
+            LibrarySource {
+                name: "mine".into(),
+                kind: "folder".into(),
+                location: mine.display().to_string(),
+                reference: None,
+            },
+        );
+        let tag = DeviceTag::parse("-K1").unwrap();
+        o.set_device_part(&tag, Some(pid)).unwrap();
+        o.refresh_library();
+        let pin = o.project.lock.parts[pid].hash.clone();
+        assert_eq!(
+            wc_core::panel::part_size(&o.parts[pid]),
+            None,
+            "no size before the model"
+        );
+        // On a plate: -K1 at the size of a part without one, -K2 sized by hand, -K3 at the
+        // plate's right edge, where the wider model would not fit.
+        let (k2, k3) = (DeviceTag::parse("-K2").unwrap(), DeviceTag::parse("-K3").unwrap());
+        o.set_device_part(&k2, Some(pid)).unwrap();
+        o.set_device_part(&k3, Some(pid)).unwrap();
+        let mut plate = wc_core::panel::Panel::new("pnl1", "Plate", 200.0, 300.0);
+        let default = wc_core::panel::DEFAULT_SIZE;
+        let r0 = wc_core::geom::Rotation::R0;
+        plate
+            .place_device(tag.clone(), Point::new(10.0, 10.0), default, r0)
+            .unwrap();
+        plate
+            .place_device(k2.clone(), Point::new(50.0, 10.0), (30.0, 30.0), r0)
+            .unwrap();
+        plate
+            .place_device(k3.clone(), Point::new(200.0 - default.0, 150.0), default, r0)
+            .unwrap();
+        o.project.panels.push(plate);
+        let plate_before = o.project.panels[0].clone();
+        let size_of = |o: &Open, t: &DeviceTag| match o.project.panels[0].device(t) {
+            Some(wc_core::panel::PanelItem::Device { width, height, .. }) => (*width, *height),
+            _ => unreachable!("on the plate"),
+        };
+
+        // A 22.5 x 90 x 70 mm box in metres, as the maker's model.
+        let mut data = String::new();
+        let mut id = 1;
+        for x in [0.0, 0.0225] {
+            for y in [0.0, 0.09] {
+                for z in [0.0, 0.07] {
+                    data.push_str(&format!(
+                        "#{id}=CARTESIAN_POINT('',({x:?},{y:?},{z:?}));#{}=VERTEX_POINT('',#{id});\n",
+                        id + 1
+                    ));
+                    id += 2;
+                }
+            }
+        }
+        let stp = tmp.path().join("relay.stp");
+        std::fs::write(
+            &stp,
+            format!(
+                "ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\n#900=(LENGTH_UNIT()NAMED_UNIT(*)SI_UNIT($,.METRE.));\n{data}ENDSEC;\nEND-ISO-10303-21;\n"
+            ),
+        )
+        .unwrap();
+        let err = o.attach_model("no.such", &stp).unwrap_err();
+        assert!(err.contains("none of the project's libraries"), "{err}");
+        // A full undo history: the update still counts as one step.
+        for _ in 0..UNDO_STEPS + 5 {
+            o.checkpoint();
+        }
+        let undo_steps = o.undo.len();
+        assert_eq!(undo_steps, UNDO_STEPS);
+        let msg = o.attach_model(pid, &stp).unwrap();
+        assert!(msg.contains("22.5 x 90 x 70 mm"), "{msg}");
+        assert!(!msg.contains("not updated"), "{msg}");
+        assert_eq!(o.undo.len(), undo_steps, "one undo step, the oldest dropped");
+        // Stored with the part in its library, and the project's copy follows at once.
+        let in_lib: Part = store::read_json(&mine.join("parts").join(format!("{pid}.json"))).unwrap();
+        assert!(in_lib.model.is_some());
+        assert_eq!(store::read_vendored_part(&o.dir, pid).unwrap(), in_lib);
+        assert_eq!(o.parts[pid].model, in_lib.model);
+        assert_eq!(
+            wc_core::panel::part_size(&o.parts[pid]),
+            Some((22.5, 90.0)),
+            "sized by the model"
+        );
+        assert_eq!(wc_core::panel::part_depth(&o.parts[pid]), Some(70.0));
+        // The device drawn at the default size takes the model's; the others keep theirs.
+        assert_eq!(size_of(&o, &tag), (22.5, 90.0));
+        assert_eq!(size_of(&o, &k2), (30.0, 30.0));
+        assert_eq!(size_of(&o, &k3), default);
+        assert!(msg.contains("1 device on the panel layouts now 22.5 x 90 mm"), "{msg}");
+        assert!(msg.contains("-K3 on Plate (-K3: a 22.5 x 90 mm outline"), "{msg}");
+        // Undo puts the part back as it was, and the plate with it.
+        assert!(o.undo());
+        assert_eq!(o.project.panels[0], plate_before);
+        assert_eq!(o.project.lock.parts[pid].hash, pin);
+        assert_eq!(store::read_vendored_part(&o.dir, pid).unwrap().hash(), pin);
+        assert!(o.parts[pid].model.is_none());
+        assert_eq!(wc_core::panel::part_size(&o.parts[pid]), None);
+        assert!(o.redo());
+        assert_eq!(o.parts[pid], in_lib);
+
+        // A file that is not a whole STEP model changes nothing.
+        let bad = tmp.path().join("bad.stp");
+        std::fs::write(&bad, "ISO-10303-21;\nDATA;\n").unwrap();
+        let err = o.attach_model(pid, &bad).unwrap_err();
+        assert!(err.contains("incomplete"), "{err}");
         let still: Part = store::read_json(&mine.join("parts").join(format!("{pid}.json"))).unwrap();
         assert_eq!(still, in_lib);
     }

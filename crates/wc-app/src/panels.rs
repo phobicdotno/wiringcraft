@@ -1949,6 +1949,8 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, pi: usi
     let t = Theme::of(ui.ctx());
     // The footprint drawing picked below, attached once the panel is drawn.
     let mut attach: Option<(String, std::path::PathBuf)> = None;
+    // The STEP model picked below, its size stored once the panel is drawn.
+    let mut model: Option<(String, std::path::PathBuf)> = None;
     let Some(panel) = open.project.panels.get(pi) else {
         return;
     };
@@ -1982,6 +1984,17 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, pi: usi
                 ui.label(RichText::new("Size").color(t.muted));
                 ui.label(format!("{width} x {height} mm"));
                 ui.end_row();
+                // The maker's 3D model of the part, when one is attached (#501).
+                if let Some(m) = dev
+                    .and_then(|d| d.part.as_ref())
+                    .and_then(|p| open.parts.get(p))
+                    .and_then(|p| p.model)
+                {
+                    use wc_core::geom::format_length as mm;
+                    ui.label(RichText::new("3D model").color(t.muted));
+                    ui.label(format!("{} x {} x {} mm", mm(m.width), mm(m.height), mm(m.depth)));
+                    ui.end_row();
+                }
                 ui.label(RichText::new("Rotation").color(t.muted));
                 ui.horizontal(|ui| {
                     ui.label(match rotation {
@@ -2023,7 +2036,27 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, pi: usi
                     .add_filter("DXF drawings", &["dxf"])
                     .pick_file()
             {
-                attach = Some((part, file));
+                attach = Some((part.clone(), file));
+            }
+            // The size of the maker's 3D model, for a part without a width and height (#501).
+            let has = open.parts.get(&part).is_some_and(|p| p.model.is_some());
+            let label = if has {
+                "Replace 3D model..."
+            } else {
+                "Attach 3D model..."
+            };
+            if ui
+                .button(label)
+                .on_hover_text(
+                    "Pick the maker's STEP model; its size is stored with the part in its library and sizes the device on the plate when the part has no width and height or footprint",
+                )
+                .clicked()
+                && let Some(file) = rfd::FileDialog::new()
+                    .set_title("3D model")
+                    .add_filter("STEP models", &["step", "stp", "STEP", "STP"])
+                    .pick_file()
+            {
+                model = Some((part, file));
             }
         }
         ui.add_space(6.0);
@@ -2057,6 +2090,9 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, pi: usi
     }
     if let Some((part, file)) = attach {
         ed.message = open.attach_footprint(&part, &file).unwrap_or_else(|e| e);
+    }
+    if let Some((part, file)) = model {
+        ed.message = open.attach_model(&part, &file).unwrap_or_else(|e| e);
     }
     if let Some(item) = turn
         && !open.rotate_panel_device(pi, item)
