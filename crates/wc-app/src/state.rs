@@ -1944,10 +1944,29 @@ impl Open {
         if wc_core::black_box_layout(&old).is_none() {
             return Err(format!("{item} is not a black box"));
         }
+        // The version Undo goes back to is the one the lock pins: a file changed outside the
+        // app since would be lost.
+        if self.project.lock.symbols.get(&symbol_id).map(|e| e.hash.as_str()) != Some(old.hash().as_str()) {
+            return Err(format!(
+                "the file of symbol {symbol_id} is not the version the project pins (changed outside the app?); reopen the project before editing the box"
+            ));
+        }
+        // Every page that places the box changes with it: none may be held by someone else.
+        if let Some((p, who)) = self.project.pages.iter().find_map(|p| {
+            let who = self.held_by_others.get(&p.id)?;
+            p.symbols.iter().any(|s| s.symbol == symbol_id).then_some((p, who))
+        }) {
+            return Err(format!(
+                "{who} has page {} open, which places this box too; it can be changed once they leave it",
+                p.number
+            ));
+        }
         let mut new = wc_core::black_box(&symbol_id, &old.name, width, height, pins).map_err(|e| e.to_string())?;
         new.tag_at = old.tag_at;
         new.description.clone_from(&old.description);
         new.source.clone_from(&old.source);
+        new.role = old.role;
+        new.letter_code.clone_from(&old.letter_code);
         let renamed: BTreeMap<&str, &str> = renamed
             .iter()
             .filter(|(from, to)| from != to && old.pin(from).is_some())
@@ -3465,6 +3484,50 @@ pub(crate) mod tests {
         );
         assert_eq!(o.undo_mark(), steps);
         assert_eq!(o.symbols[&symbol_id], new);
+
+        // Role and letter code are kept.
+        let mut kept = o.symbols[&symbol_id].clone();
+        kept.letter_code = "A".into();
+        kept.role = wc_core::symbol::SymbolRole::Main;
+        o.symbols.insert(symbol_id.clone(), kept.clone());
+        o.project.lock.symbols.get_mut(&symbol_id).unwrap().hash = kept.hash();
+        o.edit_black_box(1, &id, 35.0, 20.0, &new_pins, &BTreeMap::new())
+            .unwrap();
+        let edited = &o.symbols[&symbol_id];
+        assert_eq!(
+            (edited.letter_code.as_str(), edited.role),
+            ("A", wc_core::symbol::SymbolRole::Main)
+        );
+
+        // A loaded version the lock does not pin (its file changed outside the app) is not
+        // overwritten: Undo could not bring the pinned one back.
+        let mut stray = o.symbols[&symbol_id].clone();
+        stray.name = "changed outside".into();
+        o.symbols.insert(symbol_id.clone(), stray);
+        let steps = o.undo_mark();
+        let err = o
+            .edit_black_box(1, &id, 40.0, 20.0, &new_pins, &BTreeMap::new())
+            .unwrap_err();
+        assert!(err.contains("not the version the project pins"), "{err}");
+        assert_eq!(o.undo_mark(), steps);
+        o.symbols.insert(
+            symbol_id.clone(),
+            o.symbol_versions[&o.project.lock.symbols[&symbol_id].hash].clone(),
+        );
+
+        // A page someone else holds that places the box refuses the edit.
+        let held = o.project.pages[1].id.clone();
+        o.held_by_others.insert(held.clone(), "Ola".into());
+        let err = o
+            .edit_black_box(1, &id, 40.0, 20.0, &new_pins, &BTreeMap::new())
+            .unwrap_err();
+        assert!(err.contains("Ola has page"), "{err}");
+        assert_eq!(o.undo_mark(), steps);
+        o.held_by_others.remove(&held);
+        assert!(
+            o.edit_black_box(1, &id, 40.0, 20.0, &new_pins, &BTreeMap::new())
+                .is_ok()
+        );
 
         // Only a black box is edited this way.
         let coil = o.place(1, "wc.coil", Point::new(120.0, 20.0)).unwrap();

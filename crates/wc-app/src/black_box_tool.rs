@@ -139,9 +139,10 @@ impl BoxEdit {
             .collect()
     }
 
-    /// Whether anything was typed that the box does not have yet.
+    /// Whether anything was typed that the box does not have yet: a rename counts even when
+    /// the points end up as they were, since the wires on the renamed point follow it.
     pub fn changed(&self) -> bool {
-        (self.width, self.height, self.pins()) != self.base
+        (self.width, self.height, self.pins()) != self.base || !self.renamed().is_empty()
     }
 
     /// Add a point: the lowest number no point has, on the left edge at the first free 5 mm
@@ -283,6 +284,18 @@ mod tests {
         let mut other = sym.clone();
         other.category = "Relays".into();
         assert!(BoxEdit::load(&other).is_none());
+
+        // Point 1 removed, 2 renamed to 1 and moved where 1 was, a new 2 where 2 was: the
+        // points are as before, but the wires on the old 2 follow it, so it is a change.
+        let mut f = BoxEdit::load(&sym).unwrap();
+        f.rows.remove(0);
+        f.rows[0].name = "1".into();
+        f.rows[0].side = BoxSide::Left;
+        f.add_row();
+        f.rows[1].side = BoxSide::Right;
+        f.rows[1].offset = 5.0;
+        assert_eq!(f.pins(), pins.to_vec());
+        assert!(f.changed());
     }
 
     #[test]
