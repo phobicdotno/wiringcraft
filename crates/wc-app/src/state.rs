@@ -577,11 +577,18 @@ impl Open {
         store::write_if_changed(&path, &json).map_err(|e| format!("{}: {e}", path.display()))?;
         let mut msg = done(&path);
         if self.project.lock.parts.contains_key(id) {
+            let before = self.parts.get(id).and_then(wc_core::panel::part_size);
             let lib = wc_library::Library::open(&self.dir, &self.project).map_err(|e| e.to_string())?;
             let only = [id.to_owned()];
+            let steps = self.undo.len();
             let updated = self.update_library_of(&lib, Some(&only), Some(ItemKind::Part));
             let follows = self.parts.get(id).is_some_and(|p| same(p, &part));
             match updated {
+                // Devices of the part on the plates take its new size, in the same undo step.
+                Ok(_) if follows && self.undo.len() > steps => {
+                    let after = self.parts.get(id).and_then(wc_core::panel::part_size);
+                    msg.push_str(&self.resize_panel_devices(id, before, after));
+                }
                 Ok(_) if follows => {}
                 Ok(_) => msg.push_str(&format!(
                     ". The project's copy of {id} was not updated (it differs from the library's); update it from the library"
@@ -590,6 +597,63 @@ impl Open {
             }
         }
         Ok(msg)
+    }
+
+    /// Devices of part `id` on the panel layouts, drawn at the size the part had (`before`, or
+    /// [`wc_core::panel::DEFAULT_SIZE`] when it had none), take its new size `after` (#501). A
+    /// device sized by hand keeps its size; one that would no longer fit on its plate keeps its
+    /// size and is named in the returned note. No undo step of its own: this follows a part update.
+    fn resize_panel_devices(&mut self, id: &str, before: Option<(f64, f64)>, after: Option<(f64, f64)>) -> String {
+        use wc_core::panel::PanelItem;
+        let Some(after) = after else { return String::new() };
+        let was = before.unwrap_or(wc_core::panel::DEFAULT_SIZE);
+        if was == after {
+            return String::new();
+        }
+        let of_part = |tag: &DeviceTag| self.project.devices.get(tag).and_then(|d| d.part.as_deref()) == Some(id);
+        let mut todo = Vec::new();
+        for (pi, panel) in self.project.panels.iter().enumerate() {
+            for item in &panel.items {
+                if let PanelItem::Device {
+                    tag,
+                    at,
+                    width,
+                    height,
+                    rotation,
+                } = item
+                    && (*width, *height) == was
+                    && of_part(tag)
+                {
+                    todo.push((pi, tag.clone(), *at, *rotation));
+                }
+            }
+        }
+        let (mut resized, mut kept) = (0usize, Vec::new());
+        for (pi, tag, at, rotation) in todo {
+            let Some(panel) = self.project.panels.get_mut(pi) else {
+                continue;
+            };
+            match panel.place_device(tag.clone(), at, after, rotation) {
+                Ok(()) => resized += 1,
+                Err(_) => kept.push(format!("{tag} on {}", panel.name)),
+            }
+        }
+        let mut note = String::new();
+        if resized > 0 {
+            note.push_str(&format!(
+                ". {resized} device{} on the panel layouts now {} x {} mm",
+                if resized == 1 { "" } else { "s" },
+                wc_core::geom::format_length(after.0),
+                wc_core::geom::format_length(after.1)
+            ));
+        }
+        if !kept.is_empty() {
+            note.push_str(&format!(
+                ". Kept their size, the new one would not fit on the plate: {}",
+                kept.join(", ")
+            ));
+        }
+        note
     }
 
     /// Give a device a part (taken from the library into the project when needed), or none.
@@ -4379,6 +4443,29 @@ pub(crate) mod tests {
             None,
             "no size before the model"
         );
+        // On a plate: -K1 at the size of a part without one, -K2 sized by hand, -K3 at the
+        // plate's right edge, where the wider model would not fit.
+        let (k2, k3) = (DeviceTag::parse("-K2").unwrap(), DeviceTag::parse("-K3").unwrap());
+        o.set_device_part(&k2, Some(pid)).unwrap();
+        o.set_device_part(&k3, Some(pid)).unwrap();
+        let mut plate = wc_core::panel::Panel::new("pnl1", "Plate", 200.0, 300.0);
+        let default = wc_core::panel::DEFAULT_SIZE;
+        let r0 = wc_core::geom::Rotation::R0;
+        plate
+            .place_device(tag.clone(), Point::new(10.0, 10.0), default, r0)
+            .unwrap();
+        plate
+            .place_device(k2.clone(), Point::new(50.0, 10.0), (30.0, 30.0), r0)
+            .unwrap();
+        plate
+            .place_device(k3.clone(), Point::new(200.0 - default.0, 150.0), default, r0)
+            .unwrap();
+        o.project.panels.push(plate);
+        let plate_before = o.project.panels[0].clone();
+        let size_of = |o: &Open, t: &DeviceTag| match o.project.panels[0].device(t) {
+            Some(wc_core::panel::PanelItem::Device { width, height, .. }) => (*width, *height),
+            _ => unreachable!("on the plate"),
+        };
 
         // A 22.5 x 90 x 70 mm box in metres, as the maker's model.
         let mut data = String::new();
@@ -4420,8 +4507,15 @@ pub(crate) mod tests {
             "sized by the model"
         );
         assert_eq!(wc_core::panel::part_depth(&o.parts[pid]), Some(70.0));
-        // Undo puts the part back as it was.
+        // The device drawn at the default size takes the model's; the others keep theirs.
+        assert_eq!(size_of(&o, &tag), (22.5, 90.0));
+        assert_eq!(size_of(&o, &k2), (30.0, 30.0));
+        assert_eq!(size_of(&o, &k3), default);
+        assert!(msg.contains("1 device on the panel layouts now 22.5 x 90 mm"), "{msg}");
+        assert!(msg.contains("-K3 on Plate"), "{msg}");
+        // Undo puts the part back as it was, and the plate with it.
         assert!(o.undo());
+        assert_eq!(o.project.panels[0], plate_before);
         assert_eq!(o.project.lock.parts[pid].hash, pin);
         assert_eq!(store::read_vendored_part(&o.dir, pid).unwrap().hash(), pin);
         assert!(o.parts[pid].model.is_none());
