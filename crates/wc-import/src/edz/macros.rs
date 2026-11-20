@@ -526,15 +526,6 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
         }));
     };
     let mut left_out = BTreeMap::new();
-    // The named connection points variant A has, and those it leaves out that the other
-    // variants hold.
-    let mut have: BTreeSet<(String, String, String)> = BTreeSet::new();
-    for p in v.placements.iter().filter(|p| p.kind != BLACK_BOX) {
-        for name in p.pins.iter().flatten() {
-            have.insert((p.letter.clone(), p.number.clone(), name.clone()));
-        }
-    }
-    let extra = other_points(&all, v, &have);
     add(
         &mut left_out,
         "objects of other kinds (connections, potentials, references)",
@@ -551,6 +542,15 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
     if pin_count > MAX_PINS {
         return Err(Error::Format(format!("holds more than {MAX_PINS} connection points")));
     }
+    // The named connection points variant A has, and those it leaves out that the other
+    // variants hold.
+    let mut have: BTreeSet<(String, String, String)> = BTreeSet::new();
+    for p in v.placements.iter().filter(|p| p.kind != BLACK_BOX) {
+        for name in p.pins.iter().flatten() {
+            have.insert((p.letter.clone(), p.number.clone(), name.clone()));
+        }
+    }
+    let extra = other_points(&all, v, &have);
 
     // EPLAN's y axis points up; the symbol's down, with the reference point as its origin.
     let r = v.reference;
