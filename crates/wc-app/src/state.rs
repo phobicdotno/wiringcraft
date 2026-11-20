@@ -2045,14 +2045,34 @@ impl Open {
         &mut self,
         page: usize,
         item: &str,
-        (width, height): (f64, f64),
+        size: (f64, f64),
         pins: &[wc_core::BoxPin],
         renamed: &BTreeMap<String, String>,
         removed: &std::collections::BTreeSet<String>,
     ) -> Result<Vec<String>, String> {
+        self.edit_black_box_moved(page, item, size, pins, renamed, removed, Point::new(0.0, 0.0))
+    }
+
+    /// [`Self::edit_black_box`], and box `item` itself also moves by `moved` (page mm) in the
+    /// same undo step: how a box sized from a near corner keeps its opposite corner in place
+    /// (#529). Wires on `item` are checked against where its points end up on the page; other
+    /// boxes that place the same symbol stay where they are.
+    #[allow(clippy::too_many_arguments)]
+    pub fn edit_black_box_moved(
+        &mut self,
+        page: usize,
+        item: &str,
+        (width, height): (f64, f64),
+        pins: &[wc_core::BoxPin],
+        renamed: &BTreeMap<String, String>,
+        removed: &std::collections::BTreeSet<String>,
+        moved: Point,
+    ) -> Result<Vec<String>, String> {
         let pg = self.project.pages.get(page).ok_or("no page")?;
         let placed = pg.symbol(item).ok_or_else(|| format!("no item {item} on this page"))?;
         let symbol_id = placed.symbol.clone();
+        let (rotation, mirror) = (placed.rotation, placed.mirror);
+        let moves = moved.x != 0.0 || moved.y != 0.0;
         let old = self
             .symbols
             .get(&symbol_id)
@@ -2097,7 +2117,7 @@ impl Open {
             .filter(|n| old.pin(n).is_some())
             .map(String::as_str)
             .collect();
-        if new == old && renamed.is_empty() && removed.is_empty() {
+        if new == old && renamed.is_empty() && removed.is_empty() && !moves {
             return Ok(Vec::new());
         }
         // What an old point is now: its new name, or `None` when it is gone. A name another
@@ -2144,7 +2164,16 @@ impl Open {
                             }
                         }
                         (Some(a), Some(b)) => {
-                            if a.at.distance(b.at) > 1e-6 || a.dir != b.dir {
+                            // The moved box's points are compared where they are on the page.
+                            let (was, now) = if moves && pi == page && on == item {
+                                (
+                                    a.at.transform(rotation, mirror),
+                                    b.at.transform(rotation, mirror) + moved,
+                                )
+                            } else {
+                                (a.at, b.at)
+                            };
+                            if was.distance(now) > 1e-6 || a.dir != b.dir {
                                 warnings.push(format!(
                                     "wire {} on page {} ends on connection point {} of {on}, which moved: check its route",
                                     w.id, p.number, b.name
@@ -2190,6 +2219,15 @@ impl Open {
             if let Some(w) = self.project.pages.get_mut(pi).and_then(|p| p.wires.get_mut(wi)) {
                 *(if k == 0 { &mut w.from } else { &mut w.to }) = to;
             }
+        }
+        if moves
+            && let Some(s) = self
+                .project
+                .pages
+                .get_mut(page)
+                .and_then(|p| p.symbols.iter_mut().find(|s| s.id == item))
+        {
+            s.at = s.at + moved;
         }
         Ok(warnings)
     }

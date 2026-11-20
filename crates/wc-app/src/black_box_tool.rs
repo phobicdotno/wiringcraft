@@ -257,13 +257,68 @@ pub fn resized_pins(pins: &[BoxPin], width: f64, height: f64) -> Vec<BoxPin> {
 /// The size of a box `start` (width, height) after its sizing corner was dragged by `d` (page
 /// mm) on a box placed turned by `rotation` and maybe mirrored: in whole steps of `step`, and
 /// at least one step (and 1 mm) each way.
+#[cfg(test)]
 pub fn dragged_size(start: (f64, f64), d: Point, rotation: Rotation, mirror: bool, step: f64) -> (f64, f64) {
+    dragged_box(start, FAR, d, rotation, mirror, step).0
+}
+
+/// A corner of a black box in its own frame: whether it is at the box's far end along x (where
+/// its width ends) and along y (where its height ends). The box's origin is `(false, false)`.
+pub type Corner = (bool, bool);
+
+/// The box's far corner, where its width and height end: sizing from it keeps the placement.
+pub const FAR: Corner = (true, true);
+
+/// The four corners of a box, far corner first.
+pub const CORNERS: [Corner; 4] = [FAR, (false, true), (true, false), (false, false)];
+
+/// Where `corner` of a `w` by `h` box is in the box's own frame.
+pub fn corner_at(corner: Corner, w: f64, h: f64) -> Point {
+    Point::new(if corner.0 { w } else { 0.0 }, if corner.1 { h } else { 0.0 })
+}
+
+/// A box `start` (width, height) after its `corner` was dragged by `d` (page mm), on a box
+/// placed turned by `rotation` and maybe mirrored: its new size, in whole steps of `step` and
+/// at least one step (and 1 mm) each way, and how far its origin moves in its own frame so the
+/// opposite corner stays put. Only a near corner moves the origin.
+pub fn dragged_box(
+    start: (f64, f64),
+    corner: Corner,
+    d: Point,
+    rotation: Rotation,
+    mirror: bool,
+    step: f64,
+) -> ((f64, f64), Point) {
     let local = untransform(d, rotation, mirror);
     let step = if step.is_finite() && step > 0.0 { step } else { 1.0 };
     // At least 1 mm, rounded up to whole steps, so the smallest box is on the grid too.
     let least = (1.0 / step).ceil().max(1.0) * step;
     let whole = |v: f64| ((v / step).round() * step).max(least);
-    (whole(start.0 + local.x), whole(start.1 + local.y))
+    let w = whole(if corner.0 { start.0 + local.x } else { start.0 - local.x });
+    let h = whole(if corner.1 { start.1 + local.y } else { start.1 - local.y });
+    let shift = Point::new(
+        if corner.0 { 0.0 } else { start.0 - w },
+        if corner.1 { 0.0 } else { start.1 - h },
+    );
+    ((w, h), shift)
+}
+
+/// `pins` of a box whose origin moved by `shift` in its own frame to a `width` by `height`
+/// box: each point keeps its place along its edge where it can (its offset less the shift
+/// along that edge), and is kept on the edge, at its end, where it cannot.
+pub fn shifted_pins(pins: &[BoxPin], shift: Point, width: f64, height: f64) -> Vec<BoxPin> {
+    let moved: Vec<BoxPin> = pins
+        .iter()
+        .map(|p| BoxPin {
+            name: p.name.clone(),
+            side: p.side,
+            offset: match p.side {
+                BoxSide::Top | BoxSide::Bottom => p.offset - shift.x,
+                BoxSide::Left | BoxSide::Right => p.offset - shift.y,
+            },
+        })
+        .collect();
+    resized_pins(&moved, width, height)
 }
 
 /// `p` taken back from the page into a placed symbol's own frame: the inverse of
@@ -433,5 +488,73 @@ mod tests {
         assert_eq!(d.pins.len(), 1, "a refused point leaves the draft as it was");
         d.add_pin(BoxSide::Right, 5.0, "2").unwrap();
         assert_eq!(d.pin_at(&d.pins[1]), Some(p(40.0, 25.0)));
+    }
+
+    #[test]
+    fn a_dragged_near_corner_moves_the_origin_so_the_opposite_corner_stays() {
+        assert_eq!(corner_at(FAR, 20.0, 10.0), p(20.0, 10.0));
+        assert_eq!(corner_at((false, true), 20.0, 10.0), p(0.0, 10.0));
+        // The far corner: the origin stays.
+        assert_eq!(
+            dragged_box((20.0, 10.0), FAR, p(5.0, 5.0), Rotation::R0, false, 1.0),
+            ((25.0, 15.0), p(0.0, 0.0))
+        );
+        // The origin corner dragged up and left: bigger, and the origin goes with it.
+        assert_eq!(
+            dragged_box((20.0, 10.0), (false, false), p(-5.0, -4.0), Rotation::R0, false, 1.0),
+            ((25.0, 14.0), p(-5.0, -4.0))
+        );
+        // Dragged past the opposite corner: the least size, the far corner still in place.
+        assert_eq!(
+            dragged_box((20.0, 10.0), (false, false), p(50.0, 50.0), Rotation::R0, false, 2.5),
+            ((2.5, 2.5), p(17.5, 7.5))
+        );
+        // Bottom-left corner of a box turned a quarter: the box's x runs down the page, so a
+        // drag up the page grows its width from the origin side.
+        assert_eq!(
+            dragged_box((20.0, 10.0), (false, true), p(0.0, -5.0), Rotation::R90, false, 1.0),
+            ((25.0, 10.0), p(-5.0, 0.0))
+        );
+        // Every placement: the opposite corner is where it was on the page.
+        for rot in [Rotation::R0, Rotation::R90, Rotation::R180, Rotation::R270] {
+            for mirror in [false, true] {
+                for corner in CORNERS {
+                    let ((w, h), shift) = dragged_box((20.0, 10.0), corner, p(3.0, -2.0), rot, mirror, 1.0);
+                    let opposite = (!corner.0, !corner.1);
+                    let was = corner_at(opposite, 20.0, 10.0).transform(rot, mirror);
+                    let now = (corner_at(opposite, w, h) + shift).transform(rot, mirror);
+                    assert!(was.distance(now) < 1e-9, "{rot:?} {mirror} {corner:?}");
+                }
+            }
+        }
+
+        let pin = |name: &str, side, offset| BoxPin {
+            name: name.into(),
+            side,
+            offset,
+        };
+        let pins = [
+            pin("1", BoxSide::Top, 15.0),
+            pin("2", BoxSide::Left, 5.0),
+            pin("3", BoxSide::Right, 2.0),
+        ];
+        // The origin moved 5 left and 4 up: the points keep their place, their offsets grow.
+        assert_eq!(
+            shifted_pins(&pins, p(-5.0, -4.0), 25.0, 14.0),
+            vec![
+                pin("1", BoxSide::Top, 20.0),
+                pin("2", BoxSide::Left, 9.0),
+                pin("3", BoxSide::Right, 6.0)
+            ]
+        );
+        // The origin moved in past a point: it is kept at the start of its edge.
+        assert_eq!(
+            shifted_pins(&pins, p(10.0, 3.0), 10.0, 7.0),
+            vec![
+                pin("1", BoxSide::Top, 5.0),
+                pin("2", BoxSide::Left, 2.0),
+                pin("3", BoxSide::Right, 0.0)
+            ]
+        );
     }
 }
