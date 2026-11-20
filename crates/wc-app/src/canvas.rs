@@ -1533,6 +1533,14 @@ fn paint_box_sizing(
     }
 }
 
+/// Whether `at` is on a sizing corner `c` of a black box of `size`: within reach of it, but
+/// no further than a quarter of the box's shorter side, so a small box keeps a middle part
+/// that moves it.
+fn box_corner_hit(c: Point, at: Point, tol: f64, size: (f64, f64)) -> bool {
+    let r = tol.max(2.0).min(size.0.min(size.1) / 4.0);
+    (at.x - c.x).abs() <= r && (at.y - c.y).abs() <= r
+}
+
 /// Whether `at` is on the sizing corner of a logo box whose bottom-right corner is `max`.
 /// What a select-tool drag starting at `at` does: size or move the cover logo, move the
 /// items under it (selecting them first), or draw a selection box. On a page someone else
@@ -1557,7 +1565,7 @@ fn drag_start(
         && let Some((start, corners)) = box_corners(open, page, id)
         && let Some((corner, _)) = corners
             .into_iter()
-            .filter(|(_, c)| logo_corner(*c, at, tol))
+            .filter(|(_, c)| box_corner_hit(*c, at, tol, start))
             .min_by(|a, b| a.1.distance(at).total_cmp(&b.1.distance(at)))
     {
         return Drag::BoxSize {
@@ -2652,8 +2660,72 @@ mod tests {
     }
 
     #[test]
-    fn a_selected_black_box_is_sized_from_its_near_corner_through_egui_events() {
+    fn a_small_selected_black_box_keeps_a_middle_part_that_moves_it() {
         let (_tmp, mut open) = project();
+        let id = open
+            .add_black_box(0, Point::new(40.0, 40.0), Point::new(50.0, 50.0), &[], None)
+            .unwrap();
+        let mut ed = Editor {
+            selection: vec![Selection::Symbol(id.clone())],
+            ..Default::default()
+        };
+        let page = open.project.pages[0].clone();
+        // The reach at zoom 1 (6 mm) would cover the whole 10 mm box: a quarter of it is kept.
+        let drag = drag_start(&open, &mut ed, &page, Point::new(42.0, 43.0), 6.0, 1.0, false, false);
+        assert!(matches!(drag, Drag::Move { .. }), "{drag:?}");
+        let drag = drag_start(&open, &mut ed, &page, Point::new(41.0, 41.0), 6.0, 1.0, false, false);
+        assert!(
+            matches!(
+                drag,
+                Drag::BoxSize {
+                    corner: (false, false),
+                    ..
+                }
+            ),
+            "{drag:?}"
+        );
+    }
+
+    /// A black box from (40, 40) to (60, 50) with `pins`, selected, on a canvas at zoom 1
+    /// painted once: the project, the box's id, the editor, the context and where the page
+    /// origin is on the screen.
+    fn selected_box(pins: &[wc_core::BoxPin]) -> (tempfile::TempDir, Open, String, Editor, egui::Context, egui::Pos2) {
+        let (tmp, mut open) = project();
+        let id = open
+            .add_black_box(0, Point::new(40.0, 40.0), Point::new(60.0, 50.0), pins, None)
+            .unwrap();
+        let mut ed = Editor {
+            selection: vec![Selection::Symbol(id.clone())],
+            view: View {
+                zoom: 1.0,
+                offset: Vec2::ZERO,
+                fit: false,
+            },
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        // Where the page origin is on the screen, from the pointer's place on the page.
+        painted(&ctx, &mut open, &mut ed, 0.5, vec![]);
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            1.0,
+            vec![egui::Event::PointerMoved(egui::pos2(300.0, 300.0))],
+        );
+        let seen = ed.cursor.unwrap();
+        let origin = egui::pos2(300.0 - seen.x as f32, 300.0 - seen.y as f32);
+        (tmp, open, id, ed, ctx, origin)
+    }
+
+    /// The symbol that item `id` on the first page places.
+    fn box_symbol(o: &Open, id: &str) -> wc_core::Symbol {
+        o.symbols[&o.project.pages[0].symbol(id).unwrap().symbol].clone()
+    }
+
+    #[test]
+    fn a_selected_black_box_is_sized_from_its_near_corner_through_egui_events() {
         let pin = |name: &str, side, offset| wc_core::BoxPin {
             name: name.into(),
             side,
@@ -2663,9 +2735,7 @@ mod tests {
             pin("1", wc_core::BoxSide::Top, 15.0),
             pin("2", wc_core::BoxSide::Right, 5.0),
         ];
-        let id = open
-            .add_black_box(0, Point::new(40.0, 40.0), Point::new(60.0, 50.0), &pins, None)
-            .unwrap();
+        let (_tmp, mut open, id, mut ed, ctx, origin) = selected_box(&pins);
         // A wire on the right point: that edge does not move, so the point keeps its place on
         // the page and there is no warning.
         open.add_wire(
@@ -2679,35 +2749,14 @@ mod tests {
             },
             vec![],
         );
-        let mut ed = Editor {
-            selection: vec![Selection::Symbol(id.clone())],
-            view: View {
-                zoom: 1.0,
-                offset: Vec2::ZERO,
-                fit: false,
-            },
-            ..Default::default()
-        };
-        let ctx = egui::Context::default();
-        crate::theme::install_fonts(&ctx);
         let button = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
             pos,
             button: egui::PointerButton::Primary,
             pressed,
             modifiers: egui::Modifiers::NONE,
         };
-        painted(&ctx, &mut open, &mut ed, 0.5, vec![]);
-        painted(
-            &ctx,
-            &mut open,
-            &mut ed,
-            1.0,
-            vec![egui::Event::PointerMoved(egui::pos2(300.0, 300.0))],
-        );
-        let seen = ed.cursor.unwrap();
-        let origin = egui::pos2(300.0 - seen.x as f32, 300.0 - seen.y as f32);
         let at = |x: f32, y: f32| origin + Vec2::new(x, y);
-        let symbol = |o: &Open| o.symbols[&o.project.pages[0].symbol(&id).unwrap().symbol].clone();
+        let symbol = |o: &Open| box_symbol(o, &id);
         let undo_steps = open.undo_steps();
 
         // Each of the four corners can be grabbed.
@@ -2779,7 +2828,6 @@ mod tests {
 
     #[test]
     fn a_selected_black_box_is_sized_by_dragging_its_corner_through_egui_events() {
-        let (_tmp, mut open) = project();
         let pin = |name: &str, side, offset| wc_core::BoxPin {
             name: name.into(),
             side,
@@ -2789,39 +2837,15 @@ mod tests {
             pin("1", wc_core::BoxSide::Top, 15.0),
             pin("2", wc_core::BoxSide::Right, 5.0),
         ];
-        let id = open
-            .add_black_box(0, Point::new(40.0, 40.0), Point::new(60.0, 50.0), &pins, None)
-            .unwrap();
-        let mut ed = Editor {
-            selection: vec![Selection::Symbol(id.clone())],
-            view: View {
-                zoom: 1.0,
-                offset: Vec2::ZERO,
-                fit: false,
-            },
-            ..Default::default()
-        };
-        let ctx = egui::Context::default();
-        crate::theme::install_fonts(&ctx);
+        let (_tmp, mut open, id, mut ed, ctx, origin) = selected_box(&pins);
         let button = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
             pos,
             button: egui::PointerButton::Primary,
             pressed,
             modifiers: egui::Modifiers::NONE,
         };
-        // Where the page origin is on the screen, from the pointer's place on the page.
-        painted(&ctx, &mut open, &mut ed, 0.5, vec![]);
-        painted(
-            &ctx,
-            &mut open,
-            &mut ed,
-            1.0,
-            vec![egui::Event::PointerMoved(egui::pos2(300.0, 300.0))],
-        );
-        let seen = ed.cursor.unwrap();
-        let origin = egui::pos2(300.0 - seen.x as f32, 300.0 - seen.y as f32);
         let at = |x: f32, y: f32| origin + Vec2::new(x, y);
-        let symbol = |o: &Open| o.symbols[&o.project.pages[0].symbol(&id).unwrap().symbol].clone();
+        let symbol = |o: &Open| box_symbol(o, &id);
         let undo_steps = open.undo_steps();
         let wires = open.project.pages[0].wires.clone();
 
