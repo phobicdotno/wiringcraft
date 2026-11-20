@@ -654,6 +654,10 @@ fn long_maker_names_that_differ_past_the_cut_get_different_ids() {
     );
     assert_eq!(maker_segment(a), Some(x), "the same name gives the same segment");
     assert_eq!(maker_segment("SIE").as_deref(), Some("sie"));
-    assert_eq!(maker_segment(a), maker_segment(&a.to_uppercase()), "case does not make another maker");
+    assert_eq!(
+        maker_segment(a),
+        maker_segment(&a.to_uppercase()),
+        "case does not make another maker"
+    );
     assert_eq!(maker_segment("  "), None);
 }
