@@ -588,7 +588,8 @@ fn maker_segment(maker: &str) -> Option<String> {
         return Some(seg);
     }
     // FNV-1a, 32 bits: stable across runs and platforms.
-    let hash = maker
+    // Of the segment, so names differing only in case are one maker, as short ones are.
+    let hash = seg
         .bytes()
         .fold(0x811c_9dc5u32, |h, b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193));
     let head: String = seg.chars().take(MAX_MAKER - 9).collect();
