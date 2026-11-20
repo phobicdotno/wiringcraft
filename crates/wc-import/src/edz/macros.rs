@@ -33,11 +33,14 @@
 //! further for each variant. EPLAN keeps the drawing of library symbols in its own libraries,
 //! not in the macro, so a placement with several connection points is drawn with the
 //! WiringCraft symbol of the same kind ([`crate::eplan::drawing::symbol_for`]), first
-//! connection point at its point, as the EPLAN project import does. What is left out is counted.
+//! connection point at its point, as the EPLAN project import does. Variant A may hold only
+//! some of a device's terminals; named connection points that only the other multi-line
+//! variants hold (or, when none do, the overview) are added as pins in a column to the right of
+//! the drawing, facing right. What is left out is counted.
 //!
 //! Input is hostile: a damaged macro is an error, never a panic.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::f64::consts::TAU;
 
 use quick_xml::events::{BytesStart, Event};
@@ -53,6 +56,10 @@ use crate::{Error, Result, id_segment};
 
 /// Representation type of a multi-line schematic.
 pub const MULTI_LINE: u32 = 1;
+/// Representation type of an overview.
+const OVERVIEW: u32 = 4;
+/// Distance between connection points taken from other variants, in millimetres.
+const PIN_STEP: f64 = 4.0;
 /// Function category of a black box.
 const BLACK_BOX: u16 = 301;
 const MAX_DEPTH: usize = 128;
@@ -519,14 +526,6 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
         }));
     };
     let mut left_out = BTreeMap::new();
-    for other in all.iter().filter(|o| !std::ptr::eq(*o, v)) {
-        let what = if other.doc == Some(MULTI_LINE) {
-            "other variants of the multi-line representation".to_owned()
-        } else {
-            format!("{} representations", representation(other.doc))
-        };
-        add(&mut left_out, &what, 1);
-    }
     add(
         &mut left_out,
         "objects of other kinds (connections, potentials, references)",
@@ -604,6 +603,8 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
     let mut pins: Vec<Pin> = Vec::new();
     // The device tag of each pin's placement, by pin.
     let mut owners: Vec<(String, String)> = Vec::new();
+    // The connection point designations variant A gave a pin, by device tag.
+    let mut have: BTreeSet<(String, String, String)> = BTreeSet::new();
     // The device tag letter of the black box, if it has one.
     let mut box_letter = String::new();
     let mut drawn_kinds: Vec<SymbolRole> = Vec::new();
@@ -633,6 +634,7 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
         };
         if names.len() <= 1 {
             let name = names.first().cloned().unwrap_or_default();
+            have.insert((p.letter.clone(), p.number.clone(), name.clone()));
             pins.push(Pin {
                 name,
                 at: origin,
@@ -665,6 +667,11 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
                 .then(|| names.get(k).filter(|n| !n.is_empty()).cloned())
                 .flatten()
         };
+        // A drawn symbol has a pin for as many designations as it has pins, in order; a
+        // designation past those has no pin (#512) and may still come from another variant.
+        for name in names.iter().take(s.pins.len()) {
+            have.insert((p.letter.clone(), p.number.clone(), name.clone()));
+        }
         for (k, pin) in s.pins.iter().enumerate() {
             pins.push(Pin {
                 name: own(k).unwrap_or_else(|| pin.name.clone()),
@@ -679,6 +686,46 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
             "library symbols drawn as the WiringCraft symbol of the same kind",
             1,
         );
+    }
+
+    // Connection points only the other variants hold go in a column right of the drawing, a
+    // grid step apart, facing right.
+    let extra = other_points(&all, v, &have);
+    let mut column: Vec<Point> = pins.iter().map(|p| p.at).collect();
+    for g in &graphics {
+        let (a, b) = g.bounds();
+        column.extend([a, b]);
+    }
+    let (top, right) = if column.is_empty() {
+        (0.0, 0.0)
+    } else {
+        let (min, max) = bounds_of(&column);
+        (min.y, max.x + PIN_STEP)
+    };
+    // The variants that gave a pin; they are not counted as left out.
+    let mut givers: BTreeSet<usize> = BTreeSet::new();
+    for (row, (from, letter, number, name)) in extra.into_iter().enumerate() {
+        givers.insert(from);
+        pins.push(Pin {
+            name,
+            at: Point::new(right, top + PIN_STEP * row as f64),
+            dir: PinDir::Right,
+        });
+        owners.push((letter, number));
+        if pins.len() > MAX_PINS {
+            return Err(Error::Format(format!("holds more than {MAX_PINS} connection points")));
+        }
+    }
+    for (k, other) in all.iter().enumerate() {
+        if std::ptr::eq(other, v) || givers.contains(&k) {
+            continue;
+        }
+        let what = if other.doc == Some(MULTI_LINE) {
+            "other variants of the multi-line representation".to_owned()
+        } else {
+            format!("{} representations", representation(other.doc))
+        };
+        add(&mut left_out, &what, 1);
     }
 
     // Each pin name once: blanks are numbered, and in a macro of several devices (a circuit)
@@ -747,6 +794,55 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
         },
         left_out,
     })
+}
+
+/// The named connection points of the macro's other multi-line variants, in variant order, as
+/// (index of the variant in `all`, device tag letter, counting number, designation). A variant
+/// A may hold only some of a device's terminals (a PLC module with 1-10 in A and 11-20 in B).
+/// Only points not in `have` (variant A's) are taken, each once. When no other multi-line
+/// variant adds any, the overview representation's are taken, since it lists all of them.
+fn other_points<'a>(
+    all: &'a [Variant],
+    a: &Variant,
+    have: &BTreeSet<(String, String, String)>,
+) -> Vec<(usize, String, String, String)> {
+    let named = |k: usize, v: &'a Variant| {
+        v.placements
+            .iter()
+            .filter(|p| p.kind != BLACK_BOX && p.at.is_some())
+            .flat_map(move |p| {
+                p.pins
+                    .iter()
+                    .flatten()
+                    .filter(|n| !n.is_empty())
+                    .map(move |n| (k, p.letter.clone(), p.number.clone(), n.clone()))
+            })
+    };
+    let mut others: Vec<(usize, &Variant)> = all
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| o.doc == Some(MULTI_LINE) && !std::ptr::eq(*o, a))
+        .collect();
+    others.sort_by_key(|(_, o)| o.id);
+    let overview = all.iter().enumerate().find(|(_, o)| o.doc == Some(OVERVIEW));
+    let mut points = Vec::new();
+    // Each new point once, and no more than one past the most a macro may hold: the caller
+    // refuses it then anyway.
+    let mut seen = have.clone();
+    for (k, o) in others.into_iter().chain(overview) {
+        if o.doc == Some(OVERVIEW) && !points.is_empty() {
+            break;
+        }
+        for (k, letter, number, name) in named(k, o) {
+            if seen.insert((letter.clone(), number.clone(), name.clone())) {
+                points.push((k, letter, number, name));
+                if points.len() > MAX_PINS {
+                    return points;
+                }
+            }
+        }
+    }
+    points
 }
 
 /// EPLAN's variant letter: 0 is A.
