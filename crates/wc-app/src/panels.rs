@@ -887,8 +887,7 @@ fn black_box_section(
     id: &str,
     t: &Theme,
 ) {
-    use crate::black_box_tool::{BoxEdit, side_label};
-    use wc_core::BoxSide;
+    use crate::black_box_tool::BoxEdit;
     let Some(sym) = open
         .project
         .pages
@@ -900,13 +899,34 @@ fn black_box_section(
     };
     let key = (page, id.to_owned(), sym.hash());
     if ps.black_box.as_ref().map(|(k, _)| k) != Some(&key) {
-        ps.black_box = BoxEdit::load(sym).map(|f| (key, f));
+        ps.black_box = BoxEdit::load(sym).map(|f| (key.clone(), f));
     }
     let Some((_, form)) = ps.black_box.as_mut() else {
         return;
     };
     ui.add_space(6.0);
     subsection(ui, "Black box");
+    // The fields belong to this box: a value half typed for another box is not carried over.
+    let done = ui
+        .push_id(&key, |ui| black_box_form(ui, open, ed, form, page, id, t))
+        .inner;
+    if done {
+        ps.black_box = None;
+    }
+}
+
+/// The fields of the black box form; `true` when it is done with (applied or reset).
+fn black_box_form(
+    ui: &mut egui::Ui,
+    open: &mut Open,
+    ed: &mut Editor,
+    form: &mut crate::black_box_tool::BoxEdit,
+    page: usize,
+    id: &str,
+    t: &Theme,
+) -> bool {
+    use crate::black_box_tool::side_label;
+    use wc_core::BoxSide;
     egui::Grid::new("box-size")
         .num_columns(2)
         .spacing([8.0, 6.0])
@@ -915,6 +935,7 @@ fn black_box_section(
             ui.add(
                 egui::DragValue::new(&mut form.width)
                     .range(1.0..=5000.0)
+                    .clamp_existing_to_range(false)
                     .speed(0.5)
                     .suffix(" mm"),
             );
@@ -923,6 +944,7 @@ fn black_box_section(
             ui.add(
                 egui::DragValue::new(&mut form.height)
                     .range(1.0..=5000.0)
+                    .clamp_existing_to_range(false)
                     .speed(0.5)
                     .suffix(" mm"),
             );
@@ -964,8 +986,7 @@ fn black_box_section(
         reset = ui.add_enabled(changed, egui::Button::new("Reset")).clicked();
     });
     if reset {
-        ps.black_box = None;
-        return;
+        return true;
     }
     if apply {
         match open.edit_black_box(
@@ -982,8 +1003,7 @@ fn black_box_section(
                 } else {
                     format!("Black box changed. Check: {}.", warnings.join("; "))
                 };
-                ps.black_box = None;
-                return;
+                return true;
             }
             Err(e) => form.error = Some(e),
         }
@@ -991,6 +1011,7 @@ fn black_box_section(
     if let Some(err) = &form.error {
         ui.label(RichText::new(err).color(t.error).small());
     }
+    false
 }
 
 fn committed(r: &egui::Response) -> bool {
@@ -2112,6 +2133,48 @@ mod tests {
             texts.iter().all(|t| t != "none"),
             "the jumper's part is shown: {texts:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_black_box_size_outside_the_field_range_is_kept_until_it_is_edited() -> Result<(), Box<dyn std::error::Error>> {
+        use wc_core::{BoxPin, BoxSide};
+        let (_tmp, mut o) = crate::state::tests::project();
+        let pins = [BoxPin {
+            name: "1".into(),
+            side: BoxSide::Left,
+            offset: 5.0,
+        }];
+        let id = o.add_black_box(
+            1,
+            wc_core::geom::Point::new(40.0, 40.0),
+            wc_core::geom::Point::new(60.0, 50.0),
+            &pins,
+            None,
+        )?;
+        let symbol_id = format!("box.{}.{id}", o.project.pages[1].id);
+        // A box narrower than the field's 1 mm minimum, as an older file could hold.
+        let narrow = wc_core::black_box(&symbol_id, "Black box", 0.5, 10.0, &pins)?;
+        o.symbols.insert(symbol_id, narrow);
+        let mut ed = Editor::default();
+        let mut ps = PanelState::default();
+        let t = Theme::of(&egui::Context::default());
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut frame = |o: &mut Open, ps: &mut PanelState| {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| black_box_section(ui, o, &mut ed, ps, 1, &id, &t));
+            });
+        };
+        frame(&mut o, &mut ps);
+        let form = |ps: &PanelState| ps.black_box.as_ref().map(|(_, f)| (f.width, f.changed()));
+        assert_eq!(form(&ps), Some((0.5, false)), "showing the form changes nothing");
+        // Renaming a point leaves the width alone.
+        if let Some((_, f)) = ps.black_box.as_mut() {
+            f.rows[0].name = "A".into();
+        }
+        frame(&mut o, &mut ps);
+        assert_eq!(form(&ps), Some((0.5, true)));
         Ok(())
     }
 
