@@ -624,3 +624,31 @@ fn a_name_that_starts_with_a_dash_is_never_a_git_option() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn a_page_file_that_cannot_be_read_is_listed_as_a_file() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    store::create(dir, "Demo")?;
+    let git = Git::new(dir);
+    git.init()?;
+    let base = git.head().ok_or_else(|| wc_core::Error::Invalid("no head".into()))?;
+    let path = dir.join("pages/p0001.page.json");
+    let changed = [Change::File {
+        path: "pages/p0001.page.json".into(),
+        status: "changed".into(),
+    }];
+
+    // Readable before, not now (left with merge conflict markers): changed, not removed.
+    std::fs::write(&path, "<<<<<<< ours\n{}\n=======\n{}\n>>>>>>> theirs\n")
+        .map_err(|e| wc_core::Error::io(&path, e))?;
+    assert_eq!(changes(&git, &base, None)?, changed);
+    git.commit("Broken")?;
+    let broken = git.head().ok_or_else(|| wc_core::Error::Invalid("no head".into()))?;
+    assert_eq!(changes(&git, &base, Some(&broken))?, changed);
+
+    // Unreadable on both sides, and changed: still listed.
+    std::fs::write(&path, "not a page").map_err(|e| wc_core::Error::io(&path, e))?;
+    assert_eq!(changes(&git, &broken, None)?, changed);
+    Ok(())
+}

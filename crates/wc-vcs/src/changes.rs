@@ -99,6 +99,15 @@ fn parse_page(text: Option<String>) -> Option<Page> {
     text.and_then(|t| serde_json::from_str(&t).ok())
 }
 
+/// One side of a page file: `Ok(None)` when the file is not there, `Err(())` when it is there
+/// but cannot be read as a page.
+fn read_side(text: Option<String>) -> std::result::Result<Option<Page>, ()> {
+    match text {
+        None => Ok(None),
+        Some(t) => serde_json::from_str(&t).map(Some).map_err(|_| ()),
+    }
+}
+
 fn tag_or_symbol(s: &wc_core::PlacedSymbol) -> String {
     s.tag
         .as_ref()
@@ -252,12 +261,22 @@ pub fn changes(git: &Git, from: &str, to: Option<&str>) -> Result<Vec<Change>> {
     let mut out = Vec::new();
     for (status, path) in &entries {
         let (status, path) = (status.as_str(), path.as_str());
-        if path.starts_with("pages/") && path.ends_with(".page.json") {
-            let old = parse_page(git.show(from, path));
+        let pages = if path.starts_with("pages/") && path.ends_with(".page.json") {
+            let old = git.show(from, path);
             let new = match to {
-                Some(t) => parse_page(git.show(t, path)),
-                None => parse_page(std::fs::read_to_string(git.dir.join(path)).ok()),
+                Some(t) => git.show(t, path),
+                None => std::fs::read_to_string(git.dir.join(path)).ok(),
             };
+            // A side whose file is there but is no page (conflict markers, a hand edit, a
+            // newer format) cannot be compared: the file itself is listed instead.
+            match (read_side(old), read_side(new)) {
+                (Ok(old), Ok(new)) => Some((old, new)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some((old, new)) = pages {
             out.extend(page_changes(old.as_ref(), new.as_ref()));
         } else {
             let status = match status {
