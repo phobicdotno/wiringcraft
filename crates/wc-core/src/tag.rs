@@ -69,7 +69,6 @@ impl DeviceTag {
         Ok(tag)
     }
 
-    /// The letter code of the product aspect, e.g. `K` for `-K12`.
     /// A terminal's strip and number: `-X1.3` is terminal `3` of strip `-X1`. A tag with one
     /// product level (`-X1`) is the strip itself, without a number (one is given in drawing
     /// order). Every place that names a terminal's strip uses this, so they agree.
@@ -83,6 +82,9 @@ impl DeviceTag {
         (strip, number)
     }
 
+    /// The letter code of the product aspect: the leading letters of its last level, e.g. `K`
+    /// for `-K12` and `XD` for `-XD3`. Empty when that level starts with a digit (as the
+    /// terminal number in `-X1.3` does).
     pub fn letter_code(&self) -> String {
         self.product
             .last()
@@ -144,6 +146,14 @@ mod tests {
         assert_eq!(t.product, vec!["K3"]);
         assert_eq!(t.to_string(), "=PUMPS.P1+CAB1-K3");
         assert_eq!(t.letter_code(), "K");
+        Ok(())
+    }
+
+    #[test]
+    fn letter_code_is_the_leading_letters_of_the_last_product_level() -> Result<()> {
+        assert_eq!(DeviceTag::parse("-K12")?.letter_code(), "K");
+        assert_eq!(DeviceTag::parse("=A+C1-XD3")?.letter_code(), "XD");
+        assert_eq!(DeviceTag::parse("-X1.3")?.letter_code(), "");
         Ok(())
     }
 

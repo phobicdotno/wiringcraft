@@ -1,0 +1,90 @@
+{
+  "category": "measuring",
+  "description": "Panel ammeter: measures the current through it, wired in series with the load.",
+  "graphics": [
+    {
+      "a": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 3.5
+      },
+      "kind": "line"
+    },
+    {
+      "center": {
+        "x": 0.0,
+        "y": 7.5
+      },
+      "kind": "circle",
+      "radius": 4.0
+    },
+    {
+      "align": "center",
+      "at": {
+        "x": 0.0,
+        "y": 7.5
+      },
+      "height": 4.0,
+      "kind": "text",
+      "text": "A"
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 11.5
+      },
+      "b": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "kind": "line"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "1"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 14.4
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "2"
+    }
+  ],
+  "id": "wc.meter.ammeter",
+  "letter_code": "P",
+  "name": "Ammeter",
+  "pins": [
+    {
+      "at": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "1"
+    },
+    {
+      "at": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "dir": "down",
+      "name": "2"
+    }
+  ],
+  "role": "standalone",
+  "tag_at": {
+    "x": -12.0,
+    "y": 8.0
+  }
+}
