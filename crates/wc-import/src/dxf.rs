@@ -671,8 +671,9 @@ const TURN_STEPS: f64 = 72.0;
 /// is code 50, or the direction 11/21 when there is no 50. Code 72 is the drawing direction.
 ///
 /// TEXT and ATTRIB: the alignment is code 72 (1 and 4 centre, 2 right). A justified text
-/// (72 = 1, 2 or 4, or a vertical alignment 73) sits on its second point 11/21 when one is
-/// given; 10/20 is the left baseline start, which some writers leave at 0,0.
+/// (72 = 1, 2 or 4, or a vertical alignment: 73 on TEXT, 74 on ATTRIB) sits on its second
+/// point 11/21 when one is given; 10/20 is the left baseline start, which some writers leave
+/// at 0,0.
 fn text_anchor(e: &Entity) -> ((f64, f64), Align, f64) {
     let at = (e.f(10), e.f(20));
     if e.kind == "MTEXT" {
@@ -697,7 +698,9 @@ fn text_anchor(e: &Entity) -> ((f64, f64), Align, f64) {
         2 => Align::Right,
         _ => Align::Left,
     };
-    let justified = matches!(h, 1 | 2 | 4) || e.f(73) as i64 != 0;
+    // Vertical alignment: 73 on TEXT, 74 on ATTRIB (where 73 is the field length).
+    let vertical = if e.kind == "TEXT" { e.f(73) } else { e.f(74) };
+    let justified = matches!(h, 1 | 2 | 4) || vertical as i64 != 0;
     let at = if justified && e.get(11).is_some() {
         (e.f(11), e.f(21))
     } else {
@@ -2411,7 +2414,9 @@ mod tests {
                     0\nMTEXT\n8\n0\n10\n5\n20\n5\n40\n2\n71\n5\n72\n1\n1\nMiddle\n\
                     0\nMTEXT\n8\n0\n10\n5\n20\n5\n40\n2\n71\n9\n11\n0\n21\n1\n1\nTurned\n\
                     0\nTEXT\n8\n0\n10\n0\n20\n0\n11\n50\n21\n20\n40\n2\n72\n2\n1\nRight\n\
-                    0\nTEXT\n8\n0\n10\n3\n20\n4\n11\n50\n21\n20\n40\n2\n1\nPlain\n";
+                    0\nTEXT\n8\n0\n10\n3\n20\n4\n11\n50\n21\n20\n40\n2\n1\nPlain\n\
+                    0\nATTRIB\n8\n0\n10\n0\n20\n0\n11\n50\n21\n20\n40\n2\n72\n0\n74\n2\n1\nMiddle tag\n\
+                    0\nATTRIB\n8\n0\n10\n3\n20\n4\n11\n50\n21\n20\n40\n2\n73\n8\n1\nField\n";
         let (g, _) = drawn(ents, "")?;
         let placed: Vec<(&str, Point, Align, f64)> = g
             .iter()
@@ -2431,6 +2436,10 @@ mod tests {
             ("Right", Point::new(50.0, -20.0), Align::Right, 0.0),
             // Left aligned: on 10/20 even with an 11/21.
             ("Plain", Point::new(3.0, -4.0), Align::Left, 0.0),
+            // ATTRIB: 74 is the vertical alignment, so this one sits on 11/21.
+            ("Middle tag", Point::new(50.0, -20.0), Align::Left, 0.0),
+            // ATTRIB: 73 is the field length, not an alignment; it stays on 10/20.
+            ("Field", Point::new(3.0, -4.0), Align::Left, 0.0),
         ];
         assert_eq!(placed.len(), want.len(), "{placed:?}");
         for (got, want) in placed.iter().zip(&want) {
