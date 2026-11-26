@@ -1866,7 +1866,11 @@ impl App {
             }
             "move_page" => {
                 let page = self.page_of(v, "page")?;
-                let up = need_s(v, "direction")? == "up";
+                let up = match need_s(v, "direction")? {
+                    "up" => true,
+                    "down" => false,
+                    other => return Err(format!("Unknown direction {other:?}: use up or down.")),
+                };
                 let open = need_open(self.open.as_mut())?;
                 let other = if up { page.checked_sub(1) } else { Some(page + 1) };
                 if let Some(why) = open
@@ -5077,6 +5081,31 @@ mod tests {
 
     fn page2(app: &App) -> &Page {
         app.open.as_ref().unwrap().project.page("p0002").unwrap()
+    }
+
+    #[test]
+    fn move_page_refuses_a_direction_other_than_up_or_down() {
+        let (_tmp, mut a) = app(vec![]);
+        call(&mut a, "add_page", json!({"title": "Pumps"})).unwrap();
+        let order = |a: &App| -> Vec<String> {
+            a.open
+                .as_ref()
+                .unwrap()
+                .project
+                .pages
+                .iter()
+                .map(|p| p.id.clone())
+                .collect()
+        };
+        let before = order(&a);
+        let first = before[0].clone();
+        for bad in ["Up", "sideways"] {
+            let err = call(&mut a, "move_page", json!({"page": first, "direction": bad})).unwrap_err();
+            assert!(err.contains("up or down"), "{bad:?}: {err}");
+            assert_eq!(order(&a), before, "{bad:?} moved a page");
+        }
+        call(&mut a, "move_page", json!({"page": first, "direction": "down"})).unwrap();
+        assert_eq!(order(&a)[1], first);
     }
 
     #[test]
