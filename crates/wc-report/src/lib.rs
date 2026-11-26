@@ -518,6 +518,9 @@ pub use wc_core::project::natural_key;
 /// Every device tag in the project: drawn ones and ones only listed in `devices.json`.
 /// Every real device: tags drawn on pages or listed in the devices file. Interruption points
 /// carry tags too, but they only name a connection, so a tag used by nothing else is left out.
+/// A cable is a device as well, also when it is only named as the cable of wire cores and has
+/// no symbol and no entry in the devices file yet. Wires on overview pages (`Page::overview`)
+/// do not count: an overview draws the schematic's connections again.
 fn all_tags(i: &Inputs<'_>) -> BTreeSet<DeviceTag> {
     let p = i.project;
     let index = p.tag_index();
@@ -532,12 +535,20 @@ fn all_tags(i: &Inputs<'_>) -> BTreeSet<DeviceTag> {
                 })
         })
     };
-    index
+    let mut tags: BTreeSet<DeviceTag> = index
         .keys()
         .cloned()
         .chain(p.devices.keys().cloned())
         .filter(|t| !only_links(t))
-        .collect()
+        .collect();
+    tags.extend(
+        p.pages
+            .iter()
+            .filter(|pg| !pg.overview)
+            .flat_map(|pg| pg.wires.iter())
+            .filter_map(|w| w.cable.as_ref().map(|c| c.cable.clone())),
+    );
+    tags
 }
 
 /// Page numbers where a tag is drawn, as `2, 3`.
