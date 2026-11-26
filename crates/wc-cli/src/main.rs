@@ -1002,7 +1002,8 @@ fn cover_moved(ids: Vec<String>) {
 }
 
 fn load(dir: &Path) -> Res<Project> {
-    if let Err(err) = std::fs::metadata(dir.join(store::PROJECT_FILE))
+    // The entry itself, not where a link leads: a broken link is reported as the load fails.
+    if let Err(err) = std::fs::symlink_metadata(dir.join(store::PROJECT_FILE))
         && err.kind() == std::io::ErrorKind::NotFound
     {
         return Err(no_project(dir));
@@ -1014,7 +1015,7 @@ fn load(dir: &Path) -> Res<Project> {
 fn no_project(dir: &Path) -> String {
     format!(
         "no WiringCraft project in {} (no {}): use -C <folder> or create one with wiringcraft new <folder>",
-        dir.display(),
+        escape_field(&dir.display().to_string()),
         store::PROJECT_FILE
     )
 }

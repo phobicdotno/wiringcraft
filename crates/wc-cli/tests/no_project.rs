@@ -43,3 +43,13 @@ fn a_broken_project_file_is_still_reported_as_such() -> TestResult {
     assert!(!err.contains("no WiringCraft project"), "{err}");
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn a_broken_link_as_project_file_is_not_called_a_missing_project() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    std::os::unix::fs::symlink(tmp.path().join("gone.toml"), tmp.path().join("project.toml"))?;
+    let err = stderr_of(Path::new("."), tmp.path(), &["check"])?;
+    assert!(!err.contains("no WiringCraft project"), "{err}");
+    Ok(())
+}
