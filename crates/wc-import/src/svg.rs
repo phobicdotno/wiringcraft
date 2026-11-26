@@ -39,7 +39,9 @@ impl M {
     fn keeps_circles(&self) -> bool {
         let [a, b, c, d, ..] = self.0;
         let (x, y) = (a * a + b * b, c * c + d * d);
-        let tol = 1e-9 * x.max(y).max(1.0);
+        // Relative to the transform's own scale, so a tiny `scale(0.00001 0.00002)` still counts
+        // as stretched. A transform that shrinks to nothing leaves a dot either way.
+        let tol = 1e-9 * x.max(y);
         (x - y).abs() <= tol && (a * c + b * d).abs() <= tol
     }
 }
@@ -530,11 +532,13 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                     let r = num(&e, "r");
                     (r, r)
                 } else {
-                    // One radius left out takes the other's value (SVG 2's `auto`).
-                    match (
-                        attr(&e, "rx").map(|_| num(&e, "rx")),
-                        attr(&e, "ry").map(|_| num(&e, "ry")),
-                    ) {
+                    // A radius left out or written `auto` takes the other's value (SVG 2).
+                    let radius = |name: &str| {
+                        attr(&e, name)
+                            .filter(|v| !v.trim().eq_ignore_ascii_case("auto"))
+                            .map(|_| num(&e, name))
+                    };
+                    match (radius("rx"), radius("ry")) {
                         (Some(rx), Some(ry)) => (rx, ry),
                         (Some(r), None) | (None, Some(r)) => (r, r),
                         (None, None) => (0.0, 0.0),
@@ -782,13 +786,16 @@ mod tests {
             <circle cx="30" cy="0" r="2" transform="scale(2 1)"/>
             <ellipse cx="50" cy="0" rx="4"/>
             <circle cx="0" cy="20" r="2" transform="rotate(30) scale(-3 3)"/>
+            <ellipse cx="0" cy="40" rx="auto" ry="5"/>
+            <ellipse cx="0" cy="60" rx="1.5" ry=" AUTO "/>
+            <circle cx="0" cy="0" r="1000000" transform="translate(0 80) scale(0.00001 0.00002)"/>
         </svg>"#;
         let s = symbol(svg, "svg.flat", "Flat")?;
         let Some(flat) = s.graphics.iter().find_map(outline_size) else {
             unreachable!("no outline in {:?}", s.graphics);
         };
         let outlines: Vec<(f64, f64, bool)> = s.graphics.iter().filter_map(outline_size).collect();
-        assert_eq!(outlines.len(), 2, "{:?}", s.graphics);
+        assert_eq!(outlines.len(), 3, "{:?}", s.graphics);
         let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
         assert!(
             close(flat.0, 12.0) && close(flat.1, 4.0) && flat.2,
@@ -799,6 +806,12 @@ mod tests {
             close(wide.0, 8.0) && close(wide.1, 4.0) && !wide.2,
             "scale(2 1) stretches: {wide:?}"
         );
+        let tiny = outlines[2];
+        let near_eq = |a: f64, b: f64| (a - b).abs() < 1e-6;
+        assert!(
+            near_eq(tiny.0, 20.0) && near_eq(tiny.1, 40.0),
+            "a tiny stretch still stretches: {tiny:?}"
+        );
         let circles: Vec<f64> = s
             .graphics
             .iter()
@@ -807,9 +820,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(circles.len(), 2, "{:?}", s.graphics);
+        assert_eq!(circles.len(), 4, "{:?}", s.graphics);
         assert!(close(circles[0], 4.0), "an ellipse with only rx is a circle");
         assert!(close(circles[1], 6.0), "a turn and a mirror keep a circle round");
+        assert!(close(circles[2], 5.0), "rx=\"auto\" takes ry");
+        assert!(close(circles[3], 1.5), "ry=\"auto\" takes rx");
         Ok(())
     }
 
