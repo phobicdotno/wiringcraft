@@ -293,7 +293,15 @@ mod tests {
         let mut other = None;
         // The command line sets another text while the form holds the lock and has not read
         // the file yet: it has to wait for the form's save, then keep the form's edit.
+        let lock = tmp.path().join(wc_core::translate::TRANSLATIONS_LOCK);
         let saved = f.save_locked(|| {
+            // The lock is held here: another handle on the lock file cannot take it.
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(&lock)
+                .map(|f| matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+            assert!(matches!(held, Ok(true)), "the lock is not held: {held:?}");
             let t = std::thread::spawn(move || wc_core::translate::set_translation(&at, "Pumps", "de", "Pumpen"));
             std::thread::sleep(std::time::Duration::from_millis(300));
             other = Some((t.is_finished(), t));
