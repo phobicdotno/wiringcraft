@@ -107,10 +107,10 @@ pub fn automationml(i: &Inputs<'_>, written: &str, file_name: &str) -> (String, 
     } else {
         i.project.meta.name.trim()
     };
-    let file_name = if file_name.trim().is_empty() {
+    let file_name = if file_name.is_empty() {
         format!("{name}.aml")
     } else {
-        file_name.trim().to_string()
+        file_name.to_string()
     };
     let _ = writeln!(
         out,

@@ -614,6 +614,9 @@ fn automationml_has_devices_pins_and_one_link_per_join() {
     // Without a file name, the project name stands in.
     let fallback = automationml(&i, "2026-11-16T22:00:00Z", "").0;
     assert!(fallback.contains("<CAEXFile FileName=\"Test.aml\""), "{fallback}");
+    // A file name is kept exactly as given, spaces included.
+    let spaced = automationml(&i, "2026-11-16T22:00:00Z", " plant-v2.aml").0;
+    assert!(spaced.contains("<CAEXFile FileName=\" plant-v2.aml\""), "{spaced}");
     // The coil and the contact are one device with all four connection points.
     let k1 = xml.split("<InternalElement Name=\"=A+C1-K1\"").nth(1).unwrap();
     let k1 = k1.split("</InternalElement>").next().unwrap();
