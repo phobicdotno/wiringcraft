@@ -26,6 +26,8 @@ const MAX_TERMINALS: usize = 1000;
 const MAX_REASONS: usize = 20;
 /// Points used for an ellipse that is not a circle, or an elliptic arc.
 const ELLIPSE_STEPS: usize = 48;
+/// Segments in each quarter-ellipse corner of a rounded rectangle.
+const CORNER_STEPS: usize = 6;
 
 /// One imported element.
 #[derive(Debug, Clone)]
@@ -127,6 +129,42 @@ fn ellipse_points(x: f64, y: f64, w: f64, h: f64, start: f64, sweep: f64) -> Vec
             Point::new(cx + rx * a.cos(), cy - ry * a.sin())
         })
         .collect()
+}
+
+/// The outline of the rectangle from (`x0`, `y0`) to (`x1`, `y1`) with quarter-ellipse corners of
+/// radii `rx` and `ry` (both above 0 and at most half the side), clockwise on screen from the
+/// top-left corner. Straight sides join the corners.
+fn rounded_rect_points(x0: f64, y0: f64, x1: f64, y1: f64, rx: f64, ry: f64) -> Vec<Point> {
+    // Corner centres and the screen angle (y down) each quarter starts at.
+    let corners = [
+        (x0 + rx, y0 + ry, 180.0),
+        (x1 - rx, y0 + ry, 270.0),
+        (x1 - rx, y1 - ry, 0.0),
+        (x0 + rx, y1 - ry, 90.0),
+    ];
+    let mut points: Vec<Point> = Vec::with_capacity(4 * (CORNER_STEPS + 1));
+    for (cx, cy, start) in corners {
+        for i in 0..=CORNER_STEPS {
+            let a = (start + 90.0 * i as f64 / CORNER_STEPS as f64).to_radians();
+            let p = Point::new(cx + rx * a.cos(), cy + ry * a.sin());
+            // A radius of half the side makes two corners meet; keep the point once.
+            if points
+                .last()
+                .is_none_or(|q| (q.x - p.x).abs() > 1e-9 || (q.y - p.y).abs() > 1e-9)
+            {
+                points.push(p);
+            }
+        }
+    }
+    if points.len() > 1
+        && points
+            .first()
+            .zip(points.last())
+            .is_some_and(|(a, b)| (a.x - b.x).abs() <= 1e-9 && (a.y - b.y).abs() <= 1e-9)
+    {
+        points.pop();
+    }
+    points
 }
 
 /// Read one `.elmt` element. The id is `<prefix>.<file stem>`-style text given by the caller,
@@ -350,7 +388,21 @@ fn shape(
         },
         "rect" => match (n("x"), n("y"), n("width"), n("height")) {
             (Some(x), Some(y), Some(w), Some(h)) => {
-                let (min, max) = (pt(x.min(x + w), y.min(y + h)), pt(x.max(x + w), y.max(y + h)));
+                let (x0, y0, x1, y1) = (x.min(x + w), y.min(y + h), x.max(x + w), y.max(y + h));
+                // QElectroTech 0.8+ saves corner radii as `rx`/`ry` in absolute element units
+                // (it draws them with Qt's `drawRoundedRect` in absolute size mode), and Qt keeps
+                // each one to at most half the side, so they are clamped the same way here.
+                let rx = n("rx").unwrap_or(0.0).abs().min((x1 - x0) / 2.0);
+                let ry = n("ry").unwrap_or(0.0).abs().min((y1 - y0) / 2.0);
+                if rx > 0.0 && ry > 0.0 {
+                    let points = rounded_rect_points(x0, y0, x1, y1, rx, ry)
+                        .into_iter()
+                        .map(|p| pt(p.x, p.y))
+                        .collect();
+                    push_closed(graphics, points, solid_fill(e));
+                    return;
+                }
+                let (min, max) = (pt(x0, y0), pt(x1, y1));
                 if solid_fill(e) {
                     // WiringCraft's rectangle has no fill, so a solid one also gets a filled
                     // closed polyline under its outline, as `push_closed` does for polygons.
@@ -681,6 +733,76 @@ mod tests {
                 }
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn rounded_rects_come_in_as_closed_polylines_with_round_corners() -> Result<()> {
+        let el = r#"<definition type="element"><description>
+<rect x="0" y="0" width="20" height="10" rx="2" ry="2" style="filling:none"/>
+<rect x="0" y="20" width="20" height="10" style="filling:none"/>
+<rect x="0" y="40" width="20" height="10" rx="0" ry="0" style="filling:none"/>
+<rect x="0" y="60" width="4" height="10" rx="50" ry="3" style="filling:black"/>
+<terminal x="0" y="0" orientation="n"/>
+</description></definition>"#;
+        let (imp, _) = element(el, "qet.rounded", 1.0)?;
+        let g = &imp.symbol.graphics;
+        let Some(Shape::Polyline {
+            points,
+            closed: true,
+            filled: false,
+        }) = g.first()
+        else {
+            unreachable!("expected a closed polyline, got {:?}", g.first())
+        };
+        let (mut lo, mut hi) = (Point::new(f64::MAX, f64::MAX), Point::new(f64::MIN, f64::MIN));
+        for p in points {
+            (lo.x, lo.y, hi.x, hi.y) = (lo.x.min(p.x), lo.y.min(p.y), hi.x.max(p.x), hi.y.max(p.y));
+        }
+        assert!(lo.x.abs() < 1e-9 && lo.y.abs() < 1e-9);
+        assert!((hi.x - 20.0).abs() < 1e-9 && (hi.y - 10.0).abs() < 1e-9);
+        for corner in [(0.0, 0.0), (20.0, 0.0), (20.0, 10.0), (0.0, 10.0)] {
+            assert!(
+                !points
+                    .iter()
+                    .any(|p| (p.x - corner.0).abs() < 1e-6 && (p.y - corner.1).abs() < 1e-6),
+                "a point sits on the square corner {corner:?}"
+            );
+        }
+        // No radii, or radii of 0: still a plain rectangle.
+        assert_eq!(
+            g[1],
+            Shape::Rect {
+                min: Point::new(0.0, 20.0),
+                max: Point::new(20.0, 30.0)
+            }
+        );
+        assert_eq!(
+            g[2],
+            Shape::Rect {
+                min: Point::new(0.0, 40.0),
+                max: Point::new(20.0, 50.0)
+            }
+        );
+        // A radius past half the side is clamped to it, and a filled one gets its fill.
+        let (
+            Shape::Polyline {
+                points: fill,
+                filled: true,
+                ..
+            },
+            Shape::Polyline { points: line, .. },
+        ) = (&g[3], &g[4])
+        else {
+            unreachable!("expected a fill and an outline, got {:?}", &g[3..])
+        };
+        assert_eq!(fill, line);
+        assert!(line.iter().all(|p| (0.0..=4.0 + 1e-9).contains(&p.x)));
+        assert!(
+            line.iter()
+                .any(|p| (p.x - 2.0).abs() < 1e-9 && (p.y - 60.0).abs() < 1e-9)
+        );
+        assert_eq!(g.len(), 5);
         Ok(())
     }
 
