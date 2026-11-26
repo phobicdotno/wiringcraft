@@ -741,8 +741,16 @@ pub(crate) fn value_placeholder(
 }
 
 /// Show the canvas for the current page and handle the tools. Returns true when the project
-/// changed.
-pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool, snap_step: f64) {
+/// changed. `keyboard_edits` is false while an app dialog has the keyboard: the panel view's
+/// arrow keys then do nothing.
+pub fn show(
+    ui: &mut egui::Ui,
+    open: &mut Open,
+    ed: &mut Editor,
+    show_grid: bool,
+    snap_step: f64,
+    keyboard_edits: bool,
+) {
     drop_draft_of_other_page(open, ed);
     // A black box being drawn belongs to its tool: another tool drops it.
     if ed.tool != Tool::BlackBox {
@@ -753,7 +761,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
     ed.selection.retain(|s| layers.may_select(s));
     let finish = std::mem::take(&mut ed.finish_shape);
     if let Some(panel) = ed.panel {
-        crate::panel_view::show(ui, open, ed, panel, snap_step);
+        crate::panel_view::show(ui, open, ed, panel, snap_step, keyboard_edits);
         return;
     }
     let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
@@ -2886,7 +2894,7 @@ mod tests {
                 ..Default::default()
             };
             let _ = ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| show(ui, open, ed, false, 1.0));
+                egui::CentralPanel::default().show(ctx, |ui| show(ui, open, ed, false, 1.0, true));
             });
         };
         frame(&mut open, &mut ed);
@@ -3416,7 +3424,7 @@ mod tests {
                 ..Default::default()
             };
             let _ = ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| show(ui, open, ed, false, 1.0));
+                egui::CentralPanel::default().show(ctx, |ui| show(ui, open, ed, false, 1.0, true));
             });
         };
         let button = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
@@ -4190,7 +4198,7 @@ mod tests {
         let ctx = egui::Context::default();
         crate::theme::install_fonts(&ctx);
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| show(ui, &mut o, &mut ed, false, 1.0));
+            egui::CentralPanel::default().show(ctx, |ui| show(ui, &mut o, &mut ed, false, 1.0, true));
         });
         assert!(ed.selection.is_empty());
         assert_eq!(ed.tool, Tool::Select);
@@ -4218,7 +4226,7 @@ mod tests {
                 ..Default::default()
             };
             let out = ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| show(ui, o, ed, false, 1.0));
+                egui::CentralPanel::default().show(ctx, |ui| show(ui, o, ed, false, 1.0, true));
             });
             out.shapes
                 .iter()
@@ -4255,7 +4263,7 @@ mod tests {
             ..Default::default()
         };
         let out = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| show(ui, o, ed, false, 1.0));
+            egui::CentralPanel::default().show(ctx, |ui| show(ui, o, ed, false, 1.0, true));
         });
         out.shapes
             .iter()
