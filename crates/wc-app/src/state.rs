@@ -2088,8 +2088,9 @@ impl Open {
             .into_iter()
             .filter(|s| kind.is_none_or(|k| s.kind == k))
             .collect();
-        // An item named on purpose whose library file is wrong stops the update.
-        if let Some(bad) = wc_library::wrong_named(&all, only) {
+        // An item named on purpose that the project does not have, or whose library file is
+        // wrong, stops the update.
+        if let Some(bad) = wc_library::unknown_named(&all, only).or_else(|| wc_library::wrong_named(&all, only)) {
             return Err(bad.to_string());
         }
         // Exactly these versions are taken, as seen here: an item whose library file changes
@@ -8206,6 +8207,41 @@ pub(crate) mod tests {
         o.parts.insert(pid.to_owned(), edited.clone());
         assert!(o.undo());
         assert_eq!(o.parts[pid], edited);
+    }
+
+    #[test]
+    fn an_update_naming_an_unknown_id_takes_nothing_and_keeps_the_history() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let pid = "example.ex-ct-9-24dc";
+        o.ensure_part(pid).unwrap();
+        o.place(1, "wc.coil", Point::new(60.0, 20.0)).unwrap();
+        changed_part_in_mine(&o, tmp.path(), pid);
+        let coil = o.symbols["wc.coil"].clone();
+        let lib = library_first(&mut o, tmp.path(), &coil);
+        // Something to undo and something to redo.
+        assert!(o.undo());
+        let (undo, redo, history, dirty) = (o.undo.len(), o.redo.len(), o.history, o.dirty);
+        assert!(undo > 0 && redo > 0);
+        let lock = o.project.lock.clone();
+        assert!(lock.parts.contains_key(pid), "the part is pinned");
+        let file = std::fs::read(store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap()).unwrap();
+        // The known part has a newer version, but the unknown id stops the whole update.
+        let only = [pid.to_owned(), "nosuch.item".to_owned()];
+        let err = o.update_library(&lib, Some(&only)).unwrap_err();
+        assert!(err.contains("nosuch.item"), "{err}");
+        assert_eq!(o.project.lock, lock);
+        assert_eq!(
+            std::fs::read(store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap()).unwrap(),
+            file
+        );
+        assert_eq!(
+            (o.undo.len(), o.redo.len(), o.history, o.dirty),
+            (undo, redo, history, dirty)
+        );
+        // The known id alone is taken.
+        let done = o.update_library(&lib, Some(&only[..1])).unwrap();
+        assert_eq!(done, vec![(ItemKind::Part, pid.to_owned())]);
     }
 
     #[test]
