@@ -286,11 +286,11 @@ fn convert(name: &str, sym: &Sexp, body: &Sexp, base: &str, wanted: u32, prefix:
                 Some("bezier") => {
                     // A cubic curve (start, two control points, end), flattened in 8 steps like
                     // the SVG importer does.
-                    let p: Vec<Point> = g
+                    // Any point that does not parse leaves the whole curve out.
+                    let p: Option<Vec<Point>> = g
                         .first("pts")
-                        .map(|p| p.all("xy").filter_map(|x| Some(pt(x.num(1)?, x.num(2)?))).collect())
-                        .unwrap_or_default();
-                    if let [p0, p1, p2, p3] = p.as_slice() {
+                        .and_then(|p| p.all("xy").map(|x| Some(pt(x.num(1)?, x.num(2)?))).collect());
+                    if let Some([p0, p1, p2, p3]) = p.as_deref() {
                         let points = (0..=8)
                             .map(|k| {
                                 let t = k as f64 / 8.0;
@@ -646,7 +646,8 @@ mod tests {
   (symbol "Curve"
     (symbol "Curve_0_1"
       (bezier (pts (xy 0 0) (xy 0 4) (xy 4 4) (xy 4 0)) (stroke (width 0)) (fill (type none)))
-      (bezier (pts (xy 0 0) (xy 1 1) (xy 2 2))))
+      (bezier (pts (xy 0 0) (xy 1 1) (xy 2 2)))
+      (bezier (pts (xy 0 0) (xy 1 1) (xy 2 x) (xy 3 3) (xy 4 4))))
     (symbol "Curve_1_1" (pin passive line (at 0 0 0) (length 0) (name "~") (number "1")))))"#;
         let (syms, warnings) = symbols(lib, "k", 1.0)?;
         assert_eq!(syms.len(), 1, "{warnings:?}");
@@ -663,7 +664,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // The three-point bezier is left out.
+        // The three-point bezier and the one with a point that does not parse are left out.
         let [points] = curves.as_slice() else {
             unreachable!("one curve expected: {:?}", syms[0].symbol.graphics)
         };
