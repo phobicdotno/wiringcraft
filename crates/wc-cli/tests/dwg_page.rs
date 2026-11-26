@@ -57,3 +57,53 @@ fn a_dwg_page_imports_without_a_converter() -> TestResult {
     );
     Ok(())
 }
+
+/// The reader's refusal can quote the file (here its version tag, with an ESC in it): it is
+/// escaped both when the converter then fails and when it works.
+#[cfg(unix)]
+#[test]
+fn a_refusal_quoting_the_file_is_escaped_in_both_messages() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    store::create(&dir, "Test")?;
+    let page = store::load(&dir)?.pages[0].id.clone();
+    let dwg = tmp.path().join("plan.dwg");
+    std::fs::write(&dwg, b"AC\x1b[31 not a drawing")?;
+    let Some(file) = dwg.to_str() else {
+        unreachable!("the temporary path is not text")
+    };
+    let escaped = "drawing version AC\\u{1b}[31 is not supported";
+
+    // No converter: the error names the refusal, escaped.
+    let out = wiringcraft(&dir, &["import", "page-dwg", file, "--page", &page])?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(!stderr.contains('\u{1b}'), "{stderr:?}");
+    assert!(stderr.contains(escaped), "{stderr}");
+
+    // A converter (shell built-ins only: PATH is empty) that writes a DXF with one line.
+    // Under /tmp: the converter setting is split on spaces.
+    let bin = tempfile::tempdir_in("/tmp")?;
+    let script = bin.path().join("convert.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nprintf '0\\nSECTION\\n2\\nENTITIES\\n0\\nLINE\\n8\\n0\\n10\\n0\\n20\\n0\\n11\\n10\\n21\\n10\\n0\\nENDSEC\\n0\\nEOF\\n' > \"$2\"\n",
+    )?;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))?;
+    let out = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("-C")
+        .arg(&dir)
+        .args(["import", "page-dwg", file, "--page", &page])
+        .env("PATH", "")
+        .env("WIRINGCRAFT_DWG2DXF", format!("{} {{in}} {{out}}", script.display()))
+        .output()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!stdout.contains('\u{1b}'), "{stdout:?}");
+    assert!(
+        stdout.contains("converted to DXF with") && stdout.contains(escaped),
+        "{stdout}"
+    );
+    Ok(())
+}
