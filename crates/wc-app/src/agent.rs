@@ -9149,6 +9149,7 @@ mod tests {
             item: id.clone(),
             pin: "X1".into(),
         };
+        a.ed.page = 1;
         a.ed.wire = Some((start.clone(), Vec::new()));
         a.run(Action::Undo);
         assert!(a.ed.wire.is_none(), "Undo in a session drops the wire being drawn");
@@ -9230,6 +9231,7 @@ mod tests {
         call(&mut a, "undo", json!({})).unwrap();
         a.share.frame(a.open.as_mut(), None, false);
         assert!(page2(&a).symbols.iter().any(|s| s.id == id), "the lamp is back");
+        a.ed.page = 1;
         a.ed.wire = Some((
             wc_core::Endpoint::Pin {
                 item: id.clone(),
@@ -9266,6 +9268,7 @@ mod tests {
         let open = a.open.as_mut().unwrap();
         let id = open.place(1, "wc.lamp", wc_core::Point::new(50.0, 50.0)).unwrap();
         a.share.frame(a.open.as_mut(), None, false);
+        a.ed.page = 1;
         a.ed.wire = Some((
             wc_core::Endpoint::Pin {
                 item: id.clone(),
