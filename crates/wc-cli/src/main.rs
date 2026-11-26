@@ -97,6 +97,7 @@ enum Cmd {
     /// pulled onto the edges of the new size. `--rename OLD=NEW` keeps a point under a new name
     /// and its wires follow. Every box placing the same symbol changes. Prints what to check.
     BoxEdit {
+        /// The page's id.
         page: String,
         /// The box's item id, e.g. `s3`.
         id: String,
