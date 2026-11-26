@@ -208,7 +208,7 @@ pub fn specs() -> Vec<Value> {
     vec![
         tool(
             "get_state",
-            "Overview of the open project: name, folder, branch, unsaved changes, pages (id, number, title, size, overview, cover, counts), panel layouts, devices count, open comments, the page or panel shown, the selection and whether undo is possible.",
+            "Overview of the open project: name, folder, branch, unsaved changes, pages (id, number, title, size, overview, cover, counts), panel layouts, devices count, open comments, the page or panel shown, the selection, whether undo is possible, and the shared session (null outside one; else role host or guest and the participants, each with name, the page number they have open, which is read-only for everyone else, and you: true for this person).",
             json!({}),
             &[],
         ),
@@ -2284,6 +2284,7 @@ impl App {
             return Ok(pretty(&json!({
                 "open": false,
                 "recent_projects": self.prefs.recent,
+                "session": Value::Null,
             })));
         };
         let pages: Vec<Value> = open
@@ -2332,7 +2333,30 @@ impl App {
                 .collect::<Vec<_>>(),
             // In a session, Undo takes back only this person's changes made in it.
             "can_undo": if self.share.active() { self.share.can_undo() } else { open.can_undo() },
+            "session": self.session_state(&open.project),
         })))
+    }
+
+    /// The shared session as `get_state` gives it: `null` outside one, else this window's
+    /// role and who has joined, each with the page they have open (read-only for the others).
+    fn session_state(&self, project: &wc_core::Project) -> Value {
+        if !self.share.active() {
+            return Value::Null;
+        }
+        let participants: Vec<Value> = self
+            .share
+            .participants()
+            .into_iter()
+            .map(|(p, you)| {
+                // A page the session has that this copy does not have yet is named by its id.
+                let page = p.page.map(|id| project.page(&id).map_or(id, |pg| pg.number.clone()));
+                json!({"name": p.name, "page": page, "you": you})
+            })
+            .collect();
+        json!({
+            "role": if self.share.is_host() { "host" } else { "guest" },
+            "participants": participants,
+        })
     }
 
     /// The `layers` tool: list the editor layers, or show, hide, lock or unlock one, as the
@@ -7392,6 +7416,49 @@ mod tests {
         a.share = h;
         let out = call(&mut a, "add_page", json!({"title": "Pumps"})).unwrap();
         assert!(!out.contains("Pending"), "{out}");
+    }
+
+    #[test]
+    fn get_state_without_a_project_gives_the_session_as_null() {
+        let (_tmp, mut a) = app(vec![]);
+        a.open = None;
+        let state: Value = serde_json::from_str(&call(&mut a, "get_state", json!({})).unwrap()).unwrap();
+        assert_eq!(state["open"], json!(false));
+        assert!(state.get("session").is_some_and(Value::is_null), "{state}");
+    }
+
+    #[test]
+    fn get_state_tells_the_session_role_and_who_has_which_page_open() {
+        let (_tmp, mut a) = app(vec![]);
+        let state: Value = serde_json::from_str(&call(&mut a, "get_state", json!({})).unwrap()).unwrap();
+        assert_eq!(state["session"], Value::Null, "no session yet");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (_dir, mut a, mut h, mut host_open) = guest_window(tmp.path());
+        let state: Value = serde_json::from_str(&call(&mut a, "get_state", json!({})).unwrap()).unwrap();
+        let number = |open: &Open, id: &str| open.project.page(id).unwrap().number.clone();
+        assert_eq!(state["session"]["role"], json!("guest"));
+        let participants = state["session"]["participants"].as_array().unwrap();
+        assert_eq!(participants.len(), 2, "{state}");
+        assert_eq!(participants[0]["page"], json!(number(&host_open, "p0002")), "{state}");
+        assert_eq!(participants[0]["you"], json!(false));
+        assert_eq!(participants[1]["name"], json!("Ola"));
+        assert_eq!(
+            participants[1]["page"],
+            Value::Null,
+            "the guest shows a panel and holds no page"
+        );
+        assert_eq!(participants[1]["you"], json!(true));
+
+        // The host's window says it hosts, and marks the host as this person.
+        h.frame(Some(&mut host_open), Some("p0002".into()), false);
+        let (_host_dir, mut b) = app(vec![]);
+        b.open = Some(host_open);
+        b.share = h;
+        let state: Value = serde_json::from_str(&call(&mut b, "get_state", json!({})).unwrap()).unwrap();
+        assert_eq!(state["session"]["role"], json!("host"));
+        assert_eq!(state["session"]["participants"][0]["you"], json!(true), "{state}");
+        assert_eq!(state["session"]["participants"][1]["you"], json!(false), "{state}");
     }
 
     #[test]
