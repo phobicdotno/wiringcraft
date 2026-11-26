@@ -532,7 +532,7 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "report_layouts",
-            "Report layouts (as the report layout dialog edits them): get (each report's layout as JSON, null when built in, with its built-in columns and what in the layout names nothing; one report with kind), set (replace one report's layout) or reset (back to the built-in layout). A layout is {title, column: [{from, heading}], sort, group, header}: column lists the shown columns in order by their built-in heading (empty keeps them all), sort names columns with - in front for descending, group a column to group rows by, header title-block keys printed above the table (project.name, revision ...). Each change is one undo step.",
+            "Report layouts (as the report layout dialog edits them): get (each report's layout as JSON, null when built in, with its built-in columns and what in the layout names nothing, plus any stored layout for a report that does not exist, with null built-in columns; one report with kind), set (replace one report's layout) or reset (back to the built-in layout). A layout is {title, column: [{from, heading}], sort, group, header}: column lists the shown columns in order by their built-in heading (empty keeps them all), sort names columns with - in front for descending, group a column to group rows by, header title-block keys printed above the table (project.name, revision ...). Each change is one undo step.",
             json!({
                 "action": {"type": "string", "enum": ["get", "set", "reset"]},
                 "kind": {"type": "string", "enum": reports, "description": "The report (optional for get)."},
@@ -3086,7 +3086,7 @@ impl App {
             "get" => {
                 let kinds = kind.map_or_else(|| wc_report::Kind::ALL.to_vec(), |k| vec![k]);
                 let all = all_warnings(open);
-                let out: Vec<Value> = kinds
+                let mut out: Vec<Value> = kinds
                     .into_iter()
                     .map(|k| {
                         json!({
@@ -3097,6 +3097,26 @@ impl App {
                         })
                     })
                     .collect();
+                // Without a kind, a stored layout for a report that does not exist is listed
+                // too (with no built-in columns), so its warnings are not lost.
+                if kind.is_none() {
+                    let mut unknown: Vec<&str> = Vec::new();
+                    for l in &open.project.meta.reports {
+                        if wc_report::Kind::parse(&l.kind).is_none() && !unknown.contains(&l.kind.as_str()) {
+                            unknown.push(&l.kind);
+                        }
+                    }
+                    for name in unknown {
+                        let about = format!("report layout for \"{name}\":");
+                        let layout = open.project.meta.reports.iter().find(|l| l.kind == name);
+                        out.push(json!({
+                            "kind": name,
+                            "layout": layout,
+                            "builtin_columns": null,
+                            "warnings": all.iter().filter(|w| w.starts_with(&about)).collect::<Vec<_>>(),
+                        }));
+                    }
+                }
                 Ok(pretty(&json!(out)))
             }
             "set" | "reset" => {
@@ -6684,6 +6704,36 @@ mod tests {
         assert!(reports(&a).is_empty());
         assert!(a.open.as_mut().unwrap().undo());
         assert_eq!(reports(&a), kept);
+    }
+
+    #[test]
+    fn the_assistant_gets_the_warnings_of_a_stored_layout_for_an_unknown_report() {
+        let (_tmp, mut a) = app(vec![]);
+        let get =
+            |a: &mut App, v: Value| -> Value { serde_json::from_str(&call(a, "report_layouts", v).unwrap()).unwrap() };
+        let layout: wc_core::report_layout::ReportLayout =
+            serde_json::from_value(json!({"kind": "parst", "title": "Typo"})).unwrap();
+        a.open.as_mut().unwrap().project.meta.reports.push(layout);
+
+        // Without a kind: the known reports, then the unknown one with its warning.
+        let all = get(&mut a, json!({"action": "get"}));
+        let all = all.as_array().unwrap();
+        assert_eq!(all.len(), wc_report::Kind::ALL.len() + 1);
+        let odd = &all[wc_report::Kind::ALL.len()];
+        assert_eq!(odd["kind"], json!("parst"));
+        assert_eq!(odd["layout"]["title"], json!("Typo"));
+        assert_eq!(odd["builtin_columns"], Value::Null);
+        let warned: Vec<String> = serde_json::from_value(odd["warnings"].clone()).unwrap();
+        assert_eq!(warned.len(), 1);
+        assert!(warned[0].contains("no such report"), "{warned:?}");
+        for known in &all[..wc_report::Kind::ALL.len()] {
+            assert_eq!(known["warnings"], json!([]), "{known}");
+        }
+
+        // With a kind: only that report, still filtered.
+        let parts = get(&mut a, json!({"action": "get", "kind": "parts"}));
+        assert_eq!(parts.as_array().map(Vec::len), Some(1));
+        assert_eq!(parts[0]["warnings"], json!([]));
     }
 
     #[test]
