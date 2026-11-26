@@ -1785,6 +1785,8 @@ fn cancel_drag(open: &mut Open, ed: &mut Editor) {
                 *now = was;
                 open.forget_terminal_change();
                 open.forget_last_change();
+                // A save while the button was held wrote the moved page: this is unsaved again.
+                open.edited();
             }
         }
         Some(Drag::Logo {
@@ -1797,6 +1799,7 @@ fn cancel_drag(open: &mut Open, ed: &mut Editor) {
             if let (Some(was), Some(logo)) = (was, open.project.meta.logo.as_mut()) {
                 logo.cover = was;
                 open.forget_last_change();
+                open.edited();
             }
         }
         _ => {}
@@ -4202,7 +4205,10 @@ mod tests {
         drag(&mut o, &mut ed, Point::new(-40.0, 0.0));
         assert_ne!(o.project.pages, before.pages);
         assert!(ed.dragging());
+        // Saved while the button is held: the file has the moved page.
+        o.dirty = false;
         cancel_drag(&mut o, &mut ed);
+        assert!(o.dirty, "the page put back is unsaved again");
         assert!(!ed.dragging());
         assert_eq!(o.project.pages, before.pages, "the move is taken back");
         assert_eq!(o.undo_steps(), steps, "and leaves no undo step behind");
@@ -4266,8 +4272,10 @@ mod tests {
                 checkpoint: true,
                 step: o.history_count(),
             });
+            o.dirty = false;
             cancel_drag(&mut o, &mut ed);
             assert!(ed.drag.is_none());
+            assert!(o.dirty, "unsaved again");
             assert_eq!(o.project.meta.logo.as_ref().and_then(|l| l.cover), Some(start));
             assert_eq!(o.undo_steps(), steps, "no step left behind");
         }
