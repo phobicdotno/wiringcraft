@@ -39,23 +39,23 @@ deleted. The other four:
 | PDF trace: pictures in other sample layouts than 1-bit gray, 8- or 16-bit gray and RGB and 8-bit CMYK, are refused ("not supported yet"). LZW, CMYK and 16-bit are read since #171; CCITT fax (G3 and G4), JBIG2 and JPEG 2000 since #271, RunLength since #418, checked on small generated samples only (a JPEG 2000 alpha channel is dropped; JBIG2 symbol dictionaries shared through `JBIG2Globals` are tested since #518, and a picture that refers to a segment neither it nor its `JBIG2Globals` holds in full is refused with a message instead of coming out blank since #523; segments after the end of the file segment are not read). The JBIG2 decoder stops once its bitmaps (regions, pattern and symbol dictionaries, page) go over a 256 MiB limit, half for the shared `JBIG2Globals` segments and half for the page, less what symbol dictionaries keep outside it, their decoder contexts and export lists (counted from their headers); text-like scans with symbol dictionaries are read since #423, using an unreleased `hayro-jbig2` commit until a release has the memory limit | `crates/wc-import/src/pdf.rs`, `crates/wc-import/src/pdf_codecs.rs` | #517 (crates.io release) |
 | SolidWorks Electrical cabinet layouts: items are sorted by block name (rail, duct, plate) since the database has no item kind; a footprint without a box size takes the box round its block's DWG drawing, else its catalog part's width and height, else 18 x 90 mm; upright rails are left out (WiringCraft rails run left to right) | `crates/wc-import/src/swe/cabinet.rs` | Known limit: the database has no item kind, so sorting by name stays |
 | Binary DXF | `crates/wc-import/src/dxf.rs` | Not planned: the error tells the user to save as ASCII DXF, which every CAD program can do. |
-| DWG | `crates/wc-import/src/dwg.rs` | Read for AutoCAD 2004 to 2018 drawings only (`AC1018` to `AC1032`; AutoCAD releases after 2018 still save in the 2018 format, so their drawings are read too; 2007 checked against one real file, #215; 2013 and 2018 against 143 real files, #292; the class section is read as the specification gives it: 2007 without the second size field, 2010 and 2013 with it from maintenance release 4, 2018 always with it; the class layout of 2007, 2013 and 2018 has only been checked with drawings the tests write, and a class section that cannot be read gives a warning and the drawing is still read); 2004 texts in a code page the reader has no table for (the multi-byte Chinese, Japanese and Korean pages, the DOS pages, ISO 8859 pages other than 8859-1) are read with the legacy decoder, UTF-8 when the bytes are and else byte for byte as Latin-1 (with the euro sign and the two dashes of Windows-1252), with a warning; a DWG page import (`import page-dwg`) uses this reader and turns to an installed DWG to DXF converter only for a file it refuses (#600). Multi-line attributes of 2018 drawings are counted and skipped: #300. |
+| DWG | `crates/wc-import/src/dwg.rs` | Read for AutoCAD 2004 to 2018 drawings only (`AC1018` to `AC1032`; AutoCAD releases after 2018 still save in the 2018 format, so their drawings are read too; 2007 checked against one real file, #215; 2013 and 2018 against 143 real files, #292; the class section is read as the specification gives it: 2007 without the second size field, 2010 and 2013 with it from maintenance release 4, 2018 always with it; the class layout of 2007, 2013 and 2018 has only been checked with drawings the tests write, and a class section that cannot be read gives a warning and the drawing is still read); 2004 texts in a code page the reader has no table for (the multi-byte Chinese, Japanese and Korean pages, the DOS pages, ISO 8859 pages other than 8859-1) are read with the legacy decoder, UTF-8 when the bytes are and else byte for byte as Latin-1 (with the euro sign and the two dashes of Windows-1252), with a warning; a DWG page import (`import page-dwg`, and the app's File > Import > DWG page, which runs the same code since #600) uses this reader and turns to an installed DWG to DXF converter only for a file it refuses (#600). Multi-line attributes of 2018 drawings are counted and skipped: #300. |
 | STEP (3D) | `docs/manufacturer-data.md` | Later: 3D belongs to the one-way export to SolidCraft (phase 5). |
 
 ## Editing and app
 
 | Gap | Todo |
 |---|---|
-| Imports in the app run on the window thread: a large archive freezes the window with no progress shown | #356 |
-| Open, Save As, exports and imports do not all use the system file pickers | #338 (pull requests #344 and #349 open) |
+| File > Import does not offer every CLI import option (SolidWorks project choice, first page and symbol map, EDZ symbol map, DWG scale, an archive's KiCad libraries and parts lists) | #586 |
 | Assistant: `get_report` cannot read the plc-cards and networks reports | #537 |
 | Assistant: `add_graphic` and `update_graphic` cannot make dimensions or filled polylines | #539 |
 | Assistant: the `run_command` tool description leaves out half the command line | #540 |
 | Starter library: symbols and example parts still missing (timer relays, motor protection, process switches, sensors, drives, special terminals, lamp and button colours) | #531 to #536, #538 |
 
 Fixed since the first audit: wire route styles (#52), Delete in the wire right-click menu (#88),
-row letters and grid coordinates (#54), slow assistant tools off the window thread (#67), and
-editing a page's own title-block fields in the app, CLI and assistant (#169).
+row letters and grid coordinates (#54), slow assistant tools off the window thread (#67),
+editing a page's own title-block fields in the app, CLI and assistant (#169), and File > Import
+off the window thread with its progress shown (#356).
 
 ## Shared sessions
 

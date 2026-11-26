@@ -128,6 +128,37 @@ pub fn turned_off(off: &[String], source: &str, n: usize, rule: &CheckRule) -> b
     })
 }
 
+/// The check rules as `wiringcraft rules list --json` and the assistant's `rules` tool list
+/// them: `rules`, the project's own rules; `library`, each source with its numbered rules
+/// (`source:n`) and whether `meta`'s [`ProjectMeta::rules_off`] turns each off, or why its
+/// rules could not be read; and `rules_off` as the project keeps it.
+///
+/// [`ProjectMeta::rules_off`]: crate::project::ProjectMeta::rules_off
+pub fn rules_listing(meta: &crate::project::ProjectMeta, library: &[RuleSet]) -> serde_json::Value {
+    let off = &meta.rules_off;
+    let sources: Vec<serde_json::Value> = library
+        .iter()
+        .map(|set| match &set.rules {
+            Ok(rules) => {
+                let rules: Vec<serde_json::Value> = rules
+                    .iter()
+                    .enumerate()
+                    .map(|(k, r)| {
+                        serde_json::json!({
+                            "rule": format!("{}:{}", set.source, k + 1),
+                            "off": turned_off(off, &set.source, k + 1, r),
+                            "is": r,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({"source": set.source, "rules": rules})
+            }
+            Err(why) => serde_json::json!({"source": set.source, "error": why}),
+        })
+        .collect();
+    serde_json::json!({"rules": meta.rules, "library": sources, "rules_off": off})
+}
+
 /// The kinds of rule there are, as written in `kind`.
 pub const KINDS: [&str; 3] = ["cable", "tag", "max-wires"];
 
@@ -391,6 +422,44 @@ mod tests {
     }
 
     #[test]
+    fn the_rules_listing_has_project_rules_library_sources_and_what_is_off() {
+        let rule = |name: &str| CheckRule {
+            name: Some(name.into()),
+            kind: "cable".into(),
+            ..CheckRule::default()
+        };
+        let mut meta = ProjectMeta::new("x");
+        meta.rules = vec![rule("own")];
+        meta.rules_off = vec!["house:2".into(), "gone:1".into()];
+        let sets = [
+            RuleSet {
+                source: "house".into(),
+                rules: Ok(vec![rule("motors"), rule("pumps")]),
+            },
+            RuleSet {
+                source: "broken".into(),
+                rules: Err("bad toml".into()),
+            },
+        ];
+        assert_eq!(
+            rules_listing(&meta, &sets),
+            serde_json::json!({
+                "rules": [{"name": "own", "kind": "cable"}],
+                "library": [
+                    {"source": "house", "rules": [
+                        {"rule": "house:1", "off": false, "is": {"name": "motors", "kind": "cable"}},
+                        {"rule": "house:2", "off": true, "is": {"name": "pumps", "kind": "cable"}},
+                    ]},
+                    {"source": "broken", "error": "bad toml"},
+                ],
+                "rules_off": ["house:2", "gone:1"],
+            })
+        );
+        let empty = rules_listing(&ProjectMeta::new("y"), &[]);
+        assert_eq!(empty, serde_json::json!({"rules": [], "library": [], "rules_off": []}));
+    }
+
+    #[test]
     fn globs_match_stars_marks_and_numbers() {
         assert!(glob("-M*", "-M1"));
         assert!(glob("-M*", "-M"));
@@ -615,5 +684,32 @@ severty = "error"
             turn_rule(&off(&["gone:4"]), &sets, "gone:4", false).unwrap(),
             Some(vec![])
         );
+    }
+
+    /// The assistant's `rules` tool and the command line both turn rules through
+    /// [`turn_rule`]: a selector that is one rule's number and another's name is refused
+    /// both ways and changes nothing, and turning either rule on drops an entry that turns
+    /// off both.
+    #[test]
+    fn a_selector_that_is_one_rules_number_and_anothers_name_is_refused() {
+        let named = |name: &str| CheckRule {
+            name: Some(name.into()),
+            kind: "cable".into(),
+            ..CheckRule::default()
+        };
+        let sets = [RuleSet {
+            source: "odd".into(),
+            rules: Ok(vec![named("2"), named("tags")]),
+        }];
+        let off = vec!["odd:tags".to_owned()];
+        for turn_off in [true, false] {
+            let r = turn_rule(&off, &sets, "odd:2", turn_off);
+            assert!(r.as_ref().is_err_and(|e| e.contains("odd:1 or odd:2")), "{r:?}");
+        }
+        // An entry already there that turns off both goes when either is turned on.
+        let both = vec!["odd:2".to_owned()];
+        assert_eq!(turn_rule(&both, &sets, "odd:1", false).unwrap(), Some(vec![]));
+        assert_eq!(turn_rule(&both, &sets, "odd:tags", false).unwrap(), Some(vec![]));
+        assert_eq!(turn_rule(&both, &sets, "odd:tags", true).unwrap(), None, "off already");
     }
 }

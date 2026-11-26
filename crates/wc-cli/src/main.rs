@@ -8,8 +8,82 @@ use wc_core::geom::{Point, Rotation};
 use wc_core::lock::ItemKind;
 use wc_core::project::LibrarySource;
 use wc_core::{DeviceTag, Endpoint, Page, PageSize, PlacedSymbol, Project, Wire, store};
+use wc_import::run::{
+    self, escape_field, kicad_prefix, load, page_mut, put_file_back, put_files_back, read_file, read_kicad, save,
+    snapshot_project, vendored_bytes, write_kicad,
+};
+#[cfg(test)]
+use wc_import::run::{
+    Replace, add_and_save, add_built, add_swe_built, import_bmecat, import_edz, keep_library_sources, keep_one_cover,
+    project_copy, save_imported, sheet_for, swe_symbol_choice,
+};
+// Only the Unix tests run a converter through a shell command.
+#[cfg(all(test, unix))]
+use wc_import::run::{dwg_to_dxf, staging_dir};
 
 type Res<T> = Result<T, String>;
+
+/// Run an import with a [`run::Log`] that prints each line as it is added: result lines on
+/// standard output, warnings on standard error, so what an archive import has done shows while
+/// it goes on to its next entry.
+fn logged(f: impl FnOnce(&mut run::Log) -> Res<()>) -> Res<()> {
+    logged_to(std::io::stdout(), std::io::stderr(), f)
+}
+
+/// [`logged`] onto `out` and `err`. A line that cannot be printed (a closed pipe) does not stop
+/// the import or hide its result: the import goes on, and the failure is reported once on the
+/// other stream, apart from the import's own result.
+fn logged_to<O, E>(out: O, err: E, f: impl FnOnce(&mut run::Log) -> Res<()>) -> Res<()>
+where
+    O: std::io::Write + Send + 'static,
+    E: std::io::Write + Send + 'static,
+{
+    use std::sync::{Arc, Mutex};
+    type Streams<O, E> = (O, E, Option<(bool, std::io::Error)>);
+    let streams: Arc<Mutex<Streams<O, E>>> = Arc::new(Mutex::new((out, err, None)));
+    let shared = Arc::clone(&streams);
+    let mut log = run::Log::echoing(move |m| {
+        let Ok(mut s) = shared.lock() else { return };
+        let (out, err, failed) = &mut *s;
+        let (on_out, r) = match m {
+            run::Msg::Out(line) => (true, writeln!(out, "{line}").and_then(|()| out.flush())),
+            run::Msg::Err(line) => (false, writeln!(err, "{line}").and_then(|()| err.flush())),
+        };
+        if let Err(e) = r
+            && failed.is_none()
+        {
+            *failed = Some((on_out, e));
+        }
+    });
+    let r = f(&mut log);
+    drop(log);
+    if let Ok(mut s) = streams.lock() {
+        let (out, err, failed) = &mut *s;
+        if let Some((on_out, e)) = failed.take() {
+            let (name, other): (&str, &mut dyn std::io::Write) = if on_out {
+                ("standard output", err)
+            } else {
+                ("standard error", out)
+            };
+            let done = if r.is_ok() {
+                "the import was done"
+            } else {
+                "the import failed"
+            };
+            // Nothing is left to report this to when the other stream fails as well.
+            let _ = writeln!(
+                other,
+                "warning: the import's report could not be printed on {name}: {e}; {done}"
+            );
+        }
+    }
+    r
+}
+
+/// `import page-dwg`: [`run::import_page_dwg`], printing what it said.
+fn import_page_dwg(dir: &Path, file: &Path, page: String, scale: f64, template: Option<String>) -> Res<()> {
+    logged(|log| run::import_page_dwg(dir, file, &page, scale, template, log))
+}
 
 // Every `print!` and `println!` below writes through these, not the standard ones: those panic
 // when the reader of a pipe stops early (`wiringcraft ... | more`), which on Windows, with no
@@ -245,6 +319,10 @@ enum Cmd {
     /// The page template: the frame's reference columns and the title block's boxes.
     #[command(subcommand)]
     Template(TemplateCmd),
+    /// The layouts of the reports (`[[report]]` in project.toml): which columns show in what
+    /// order under which headings, sorting, grouping and the title-block values above the table.
+    #[command(subcommand)]
+    ReportLayout(ReportLayoutCmd),
     /// Set a device's part and description.
     Device {
         /// Device tag, e.g. `-K1` (taken as a value, though it starts with `-`).
@@ -284,12 +362,14 @@ enum Cmd {
         lang: Option<String>,
     },
     /// The project's translation dictionary (`translations.toml`): list the texts that have no
-    /// translation into a language. Exits with an error when any is missing, so it can guard a
-    /// release.
+    /// translation into a language (exits with an error when any is missing, so it can guard a
+    /// release), or set or remove one text's translation.
     Translations {
-        /// The language to check, such as `nb`.
-        #[arg(long)]
-        lang: String,
+        /// The language, such as `nb`.
+        #[arg(long, global = true)]
+        lang: Option<String>,
+        #[command(subcommand)]
+        edit: Option<TranslationsCmd>,
     },
     /// Export pages as drawings for other tools: one SVG or DXF file per page in a folder,
     /// drawn like the PDF (frame, title block, symbols, wires, cross-references).
@@ -374,6 +454,23 @@ enum Cmd {
     /// Review comments pinned on pages: add, reply, resolve, list.
     #[command(subcommand)]
     Comment(CommentCmd),
+}
+
+/// `translations set` and `translations remove`: one text of `translations.toml`.
+#[derive(Subcommand)]
+enum TranslationsCmd {
+    /// Set the translation of a project text (as drawn, in the source language) into `--lang`.
+    Set {
+        /// The text as drawn, such as a page title or device description.
+        text: String,
+        /// The text in `--lang`.
+        translation: String,
+    },
+    /// Remove the translation of a project text into `--lang`.
+    Remove {
+        /// The text as drawn.
+        text: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -577,6 +674,41 @@ enum MacroCmd {
         #[arg(long = "value", value_name = "NAME=VALUE")]
         values: Vec<String>,
     },
+    /// Show a macro: its description, placeholders (name, default, description), value sets,
+    /// the placeholders its texts use, and a problem `edit` would refuse to save.
+    Show {
+        /// The macro's name or file name.
+        name: String,
+    },
+    /// Edit a project macro's description, placeholders and value sets (a library's macros
+    /// are not edited here). The changes are made in the order of the options below, and the
+    /// macro is written only when its placeholders and value sets then check out.
+    Edit {
+        /// The macro's name or file name.
+        name: String,
+        /// The macro's new description.
+        #[arg(long)]
+        description: Option<String>,
+        /// Rename a placeholder, `old=new`: in its declaration, its values in the value sets
+        /// and its uses in the macro's texts. Repeatable.
+        #[arg(long, value_name = "OLD=NEW")]
+        rename: Vec<String>,
+        /// Declare a placeholder, or change one's default and description, as
+        /// `name[:default[:description]]`; a part left out stays as it was. Repeatable.
+        #[arg(long, value_name = "NAME[:DEFAULT[:DESCRIPTION]]")]
+        placeholder: Vec<String>,
+        /// Remove a placeholder and its values in the value sets. Its texts must no longer use
+        /// it. Repeatable.
+        #[arg(long, value_name = "NAME")]
+        remove: Vec<String>,
+        /// Give a value set a placeholder's value, `set:name=value`, adding the set if it is
+        /// not there; an empty value is stored empty, not the default. Repeatable.
+        #[arg(long, value_name = "SET:NAME=VALUE")]
+        set: Vec<String>,
+        /// Remove a value set. Repeatable.
+        #[arg(long, value_name = "SET")]
+        remove_set: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -717,6 +849,30 @@ enum TemplateCmd {
     },
     /// Go back to the built-in layout (removes `[template]` from project.toml).
     Reset,
+}
+
+#[derive(Subcommand)]
+enum ReportLayoutCmd {
+    /// Print the layouts as JSON: for each report its kind, its layout (null when it has the
+    /// built-in one), its built-in columns and the warnings about its layout.
+    Show {
+        /// One report (parts, wires, ...); every report when left out.
+        kind: Option<String>,
+    },
+    /// Replace one report's layout with the JSON object in `file` (`-` for standard input),
+    /// with the keys of a `[[report]]` table: title, column (a list of {from, heading}), sort,
+    /// group, header. It is kept as the report layout dialog keeps it.
+    Set {
+        /// The report (parts, wires, ...).
+        kind: String,
+        /// The layout as JSON, or `-` to read it from standard input.
+        file: PathBuf,
+    },
+    /// Go back to the report's built-in layout (removes its `[[report]]` table).
+    Reset {
+        /// The report (parts, wires, ...).
+        kind: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1474,12 +1630,6 @@ fn write_out(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> std::io::Result
     }
 }
 
-/// The bytes of the input file `path`; a failure names the file.
-fn read_file(path: impl AsRef<Path>) -> Res<Vec<u8>> {
-    let path = path.as_ref();
-    std::fs::read(path).map_err(|err| format!("cannot read {}: {err}", escape_field(&path.display().to_string())))
-}
-
 /// The text of the input file `path`; a failure names the file.
 fn read_text(path: impl AsRef<Path>) -> Res<String> {
     let path = path.as_ref();
@@ -1532,25 +1682,6 @@ fn cover_moved(ids: Vec<String>) {
     for id in ids {
         eprintln!("page {id:?} is no longer the cover page");
     }
-}
-
-fn load(dir: &Path) -> Res<Project> {
-    // The entry itself, not where a link leads: a broken link is reported as the load fails.
-    if let Err(err) = std::fs::symlink_metadata(dir.join(store::PROJECT_FILE))
-        && err.kind() == std::io::ErrorKind::NotFound
-    {
-        return Err(no_project(dir));
-    }
-    store::load(dir).map_err(e)
-}
-
-/// What a command says when its folder holds no project: where it looked, and how to get one.
-fn no_project(dir: &Path) -> String {
-    format!(
-        "no WiringCraft project in {} (no {}): use -C <folder> or create one with wiringcraft new <folder>",
-        escape_field(&dir.display().to_string()),
-        store::PROJECT_FILE
-    )
 }
 
 /// The project with its texts in `lang` (one language code, or two joined by `,`) from the
@@ -1609,27 +1740,7 @@ fn rules_list(p: &Project, library: &[wc_core::check_rule::RuleSet], json: bool)
         })
     };
     if json {
-        let sources: Vec<serde_json::Value> = library
-            .iter()
-            .map(|set| match &set.rules {
-                Ok(rules) => {
-                    let rules: Vec<serde_json::Value> = rules
-                        .iter()
-                        .enumerate()
-                        .map(|(k, r)| {
-                            serde_json::json!({
-                                "rule": format!("{}:{}", set.source, k + 1),
-                                "off": turned_off(off, &set.source, k + 1, r),
-                                "is": r,
-                            })
-                        })
-                        .collect();
-                    serde_json::json!({"source": set.source, "rules": rules})
-                }
-                Err(why) => serde_json::json!({"source": set.source, "error": why}),
-            })
-            .collect();
-        let all = serde_json::json!({"rules": p.meta.rules, "library": sources, "rules_off": off});
+        let all = wc_core::check_rule::rules_listing(&p.meta, library);
         return serde_json::to_string_pretty(&all).map(|t| t + "\n").map_err(e);
     }
     let mut out = String::new();
@@ -1668,12 +1779,22 @@ fn rules_list(p: &Project, library: &[wc_core::check_rule::RuleSet], json: bool)
 
 /// The rules in `file` for `rules set`, in order, each as the check runs it: `[[rule]]`
 /// tables, or a JSON list (or `{"rules": [...]}`) for a `.json` name; `-` is TOML on stdin.
-fn rules_from_file(file: &Path) -> Res<Vec<wc_core::check_rule::CheckRule>> {
-    use wc_core::check_rule::{CheckRule, check_rule, parse_rules};
-    let text = if file.as_os_str() == "-" {
-        std::io::read_to_string(std::io::stdin()).map_err(|err| format!("stdin: {err}"))?
+/// `stdin` is what was read from standard input for `-`, when it already was.
+/// The text of an input file named on the command line, `-` meaning stdin.
+fn read_input(file: &Path) -> Res<String> {
+    if file.as_os_str() == "-" {
+        std::io::read_to_string(std::io::stdin()).map_err(|err| format!("stdin: {err}"))
     } else {
-        std::fs::read_to_string(file).map_err(|err| format!("{}: {err}", file.display()))?
+        std::fs::read_to_string(file).map_err(|err| format!("{}: {err}", file.display()))
+    }
+}
+
+/// The rules in `file`, from `input` (its text, read already) when given.
+fn rules_from_file(file: &Path, input: Option<String>) -> Res<Vec<wc_core::check_rule::CheckRule>> {
+    use wc_core::check_rule::{CheckRule, check_rule, parse_rules};
+    let text = match input {
+        Some(text) => text,
+        None => read_input(file)?,
     };
     let json = file.extension().is_some_and(|x| x.eq_ignore_ascii_case("json"));
     let rules: Vec<CheckRule> = if json {
@@ -1735,28 +1856,6 @@ fn turn_library_rule(
     Ok(())
 }
 
-/// Save the project. Jumpers and strip layouts first follow their terminals: what the command
-/// renamed, moved or deleted is found by comparing with the project as it is on disk.
-fn save(dir: &Path, p: &Project) -> Res<()> {
-    let mut p = p.clone();
-    // A new project has nothing on disk to compare with; any other load failure is reported.
-    let on_disk = dir.join(store::PROJECT_FILE).exists();
-    if p.meta.follows_terminals() && on_disk {
-        let old = store::load(dir).map_err(|err| format!("jumpers not updated: {}", e(err)))?;
-        let (old_symbols, _) = store::vendored_symbols(dir, &old);
-        let before = wc_core::project::terminal_numbers(&old, |id| old_symbols.get(id).map(|s| s.role));
-        let (symbols, _) = store::vendored_symbols(dir, &p);
-        wc_core::project::follow_terminals_in(&mut p, &before, |id| symbols.get(id).map(|s| s.role));
-    }
-    store::save(dir, &p).map(|_| ()).map_err(e)
-}
-
-/// Save a project whose jumpers already follow their terminals: after `add_built`, which
-/// moves the project's own jumpers itself and adds the imported ones with their final numbers.
-fn save_imported(dir: &Path, p: &Project) -> Res<()> {
-    store::save(dir, p).map(|_| ()).map_err(e)
-}
-
 /// The `find` output: one hit per line, the page number (`-` for a device not drawn), the
 /// kind and the value, separated by tabs.
 fn find_lines(p: &Project, hits: &[wc_core::find::Hit]) -> String {
@@ -1777,25 +1876,6 @@ fn find_lines(p: &Project, hits: &[wc_core::find::Hit]) -> String {
         .collect()
 }
 
-/// A value as one tab-separated field: backslash, tab and line breaks written as `\\`, `\t`,
-/// `\n` and `\r`, other control characters (such as ESC) as `\u{1b}`, so a multi-line text
-/// stays one hit per line and a found value cannot send the terminal control sequences.
-fn escape_field(v: &str) -> String {
-    let mut out = String::with_capacity(v.len());
-    for c in v.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\t' => out.push_str("\\t"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            // ESC and other control characters could steer the terminal.
-            c if c.is_control() => out.push_str(&format!("\\u{{{:x}}}", u32::from(c))),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
 /// The `location list` output: one location per line, `+path`, then a tab and the description
 /// when it has one.
 fn write_locations(out: &mut impl std::io::Write, locations: &[wc_core::project::Location]) -> std::io::Result<()> {
@@ -1809,12 +1889,214 @@ fn write_locations(out: &mut impl std::io::Write, locations: &[wc_core::project:
     Ok(())
 }
 
-fn page_mut<'a>(p: &'a mut Project, id: &str) -> Res<&'a mut Page> {
-    p.page_mut(id).ok_or_else(|| format!("no page {id:?}"))
+/// A macro `macro` commands can name: from the project's own `macros` folder or a library
+/// source's. Whether it is the project's comes from where it was found, not from the source's
+/// name, which a library source may share.
+struct FoundMacro {
+    source: String,
+    id: String,
+    path: PathBuf,
+    project: bool,
+}
+
+/// The macro named `name` among `found`: a file id match first, then one by its name, both
+/// without regard to case. With no match, files that could not be read are named with why.
+fn find_macro<'a>(found: &'a [FoundMacro], name: &str) -> Res<&'a FoundMacro> {
+    let file = name.trim();
+    let file = file.strip_suffix(".json").unwrap_or(file);
+    if let Some(f) = found.iter().find(|f| f.id.eq_ignore_ascii_case(file)) {
+        return Ok(f);
+    }
+    let mut unread = Vec::new();
+    for f in found {
+        match wc_core::macros::read_macro(&f.path) {
+            Ok(m) if m.name.eq_ignore_ascii_case(name.trim()) => return Ok(f),
+            Ok(_) => {}
+            // Escaped: a folder name or a read error could hold control characters.
+            Err(err) => unread.push(format!(
+                "{}: {}",
+                escape_field(&f.path.display().to_string()),
+                escape_field(&err.to_string())
+            )),
+        }
+    }
+    if unread.is_empty() {
+        Err(format!("no macro {name:?}"))
+    } else {
+        Err(format!(
+            "no macro {name:?}; these macro files could not be read: {}",
+            unread.join("; ")
+        ))
+    }
+}
+
+/// What `macro show` prints for `m` from `source`. Each value from the file is escaped with
+/// [`escape_field`], so it stays on its line and cannot send the terminal control sequences.
+fn macro_text(m: &wc_core::macros::Macro, source: &str) -> String {
+    use std::fmt::Write as _;
+    let x = |v: &str| escape_field(v);
+    let mut out = format!("{} ({})\n", x(&m.name), x(source));
+    if !m.description.is_empty() {
+        let _ = writeln!(out, "description: {}", x(&m.description));
+    }
+    let _ = writeln!(
+        out,
+        "placeholders:{}",
+        if m.placeholders.is_empty() { " none" } else { "" }
+    );
+    for p in &m.placeholders {
+        let default = if p.default.is_empty() {
+            String::new()
+        } else {
+            format!(" = {}", x(&p.default))
+        };
+        let description = if p.description.is_empty() {
+            String::new()
+        } else {
+            format!("  ({})", x(&p.description))
+        };
+        let _ = writeln!(out, "  {}{default}{description}", x(&p.name));
+    }
+    let _ = writeln!(out, "value sets:{}", if m.value_sets.is_empty() { " none" } else { "" });
+    for v in &m.value_sets {
+        let values: Vec<String> = v.values.iter().map(|(k, val)| format!("{}={}", x(k), x(val))).collect();
+        let description = if v.description.is_empty() {
+            String::new()
+        } else {
+            format!("  ({})", x(&v.description))
+        };
+        let _ = writeln!(out, "  {}: {}{description}", x(&v.name), values.join(", "));
+    }
+    let used = m.used_placeholders();
+    let _ = writeln!(
+        out,
+        "used in texts: {}",
+        if used.is_empty() {
+            "none".to_owned()
+        } else {
+            used.iter().map(|u| x(u)).collect::<Vec<_>>().join(", ")
+        }
+    );
+    if let Err(err) = m.check() {
+        let _ = writeln!(out, "problem: {}", x(&err.to_string()));
+    }
+    out
+}
+
+/// Apply `macro edit`'s options to `m`, in the order its help gives. The caller checks and
+/// writes the result.
+fn edit_macro(
+    m: &mut wc_core::macros::Macro,
+    description: Option<String>,
+    rename: &[String],
+    placeholder: &[String],
+    remove: &[String],
+    set: &[String],
+    remove_set: &[String],
+) -> Res<()> {
+    use wc_core::macros::{Placeholder, ValueSet, key};
+    if let Some(d) = description {
+        m.description = d.trim().to_owned();
+    }
+    for r in rename {
+        let (old, new) = r
+            .split_once('=')
+            .ok_or_else(|| format!("--rename {r:?}: write it as old=new"))?;
+        m.rename_declared(old, new).map_err(e)?;
+    }
+    for p in placeholder {
+        let mut parts = p.splitn(3, ':');
+        let name = parts.next().unwrap_or_default().trim();
+        if name.is_empty() {
+            return Err(format!("--placeholder {p:?}: give a name"));
+        }
+        let (default, description) = (parts.next(), parts.next());
+        let i = match m.placeholders.iter().position(|q| key(&q.name) == key(name)) {
+            Some(i) => i,
+            None => {
+                m.placeholders.push(Placeholder {
+                    name: name.to_owned(),
+                    ..Default::default()
+                });
+                m.placeholders.len() - 1
+            }
+        };
+        if let Some(q) = m.placeholders.get_mut(i) {
+            if let Some(d) = default {
+                q.default = d.to_owned();
+            }
+            if let Some(d) = description {
+                q.description = d.trim().to_owned();
+            }
+        }
+    }
+    for name in remove {
+        let before = m.placeholders.len();
+        m.placeholders.retain(|q| key(&q.name) != key(name));
+        if m.placeholders.len() == before {
+            return Err(format!("--remove {name:?}: no such placeholder"));
+        }
+        for v in &mut m.value_sets {
+            v.values.retain(|k, _| key(k) != key(name));
+        }
+    }
+    for s in set {
+        let parsed = s
+            .split_once(':')
+            .and_then(|(set, value)| value.split_once('=').map(|(k, v)| (set.trim(), k.trim(), v)));
+        let Some((set_name, name, value)) = parsed.filter(|(set, k, _)| !set.is_empty() && !k.is_empty()) else {
+            return Err(format!("--set {s:?}: write it as set:name=value"));
+        };
+        let i = match m.value_sets.iter().position(|v| key(&v.name) == key(set_name)) {
+            Some(i) => i,
+            None => {
+                m.value_sets.push(ValueSet {
+                    name: set_name.to_owned(),
+                    ..Default::default()
+                });
+                m.value_sets.len() - 1
+            }
+        };
+        if let Some(v) = m.value_sets.get_mut(i) {
+            // The value replaces one given under the name in another case.
+            v.values.retain(|k, _| key(k) != key(name));
+            v.values.insert(name.to_owned(), value.to_owned());
+        }
+    }
+    for name in remove_set {
+        let before = m.value_sets.len();
+        m.value_sets.retain(|v| key(&v.name) != key(name));
+        if m.value_sets.len() == before {
+            return Err(format!("--remove-set {name:?}: no such value set"));
+        }
+    }
+    Ok(())
 }
 
 fn run(cli: Cli) -> Res<()> {
     let dir = cli.project.as_path();
+    // One command at a time on a project: a second run waits, so it reads what the first one
+    // wrote instead of overwriting it with an edit planned from the old files (#610).
+    // An input file (or stdin) is read before the lock is taken: fed by another command on the
+    // same project, through a pipe or a named FIFO, waiting for the lock before reading would
+    // hold both up for good.
+    let mut input_text = match &cli.cmd {
+        Cmd::Rules(RulesCmd::Set { file }) | Cmd::ReportLayout(ReportLayoutCmd::Set { file, .. }) => {
+            Some(read_input(file)?)
+        }
+        _ => None,
+    };
+    let mut import_bytes = match &cli.cmd {
+        Cmd::Import(ImportCmd::Wago { file }) => {
+            Some(std::fs::read(file).map_err(|x| format!("{}: {x}", file.display()))?)
+        }
+        Cmd::Import(ImportCmd::PlcCsv { file }) => Some(run::read_file(file)?),
+        _ => None,
+    };
+    let _lock = match cli.cmd {
+        Cmd::New { .. } => None,
+        _ => project_lock(dir),
+    };
     match cli.cmd {
         Cmd::New {
             dir: new_dir,
@@ -2344,9 +2626,28 @@ fn run(cli: Cli) -> Res<()> {
             let before = snapshot_project(dir, &[], &[])?;
             let (symbol_path, symbol_before) = vendored_bytes(dir, ItemKind::Symbol, &symbol_id)?;
             // A link would be replaced by a plain file, and a failed save could not put it back.
-            if std::fs::symlink_metadata(&symbol_path).is_ok_and(|m| m.file_type().is_symlink()) {
+            if is_link(&symbol_path)? {
                 return Err(format!(
                     "the file of symbol {symbol_id} is a link; box-edit does not replace it (copy its target over it first)"
+                ));
+            }
+            // The same for the project's own files (pages, panels, lock, ...): both the save and
+            // the rollback would put a plain file where the link was (#614), so refuse before any
+            // write.
+            let mut linked: Vec<String> = Vec::new();
+            for (path, _) in &before {
+                if is_link(path)? {
+                    linked.push(escape_field(&path.display().to_string()));
+                }
+            }
+            if !linked.is_empty() {
+                return Err(format!(
+                    "{} a link; box-edit does not replace project files that are links (copy each target over its link first)",
+                    if linked.len() == 1 {
+                        format!("{} is", linked[0])
+                    } else {
+                        format!("{} are", linked.join(", "))
+                    }
                 ));
             }
             store::write_vendored_symbol(dir, &new).map_err(e)?;
@@ -2442,18 +2743,28 @@ fn run(cli: Cli) -> Res<()> {
         }
         Cmd::Macro(mc) => {
             let mut p = load(dir)?;
-            let mut found: Vec<(String, String, PathBuf)> = wc_core::macros::list_macros(dir)
+            let mut found: Vec<FoundMacro> = wc_core::macros::list_macros(dir)
                 .into_iter()
-                .map(|(id, path)| ("project".to_owned(), id, path))
+                .map(|(id, path)| FoundMacro {
+                    source: "project".to_owned(),
+                    id,
+                    path,
+                    project: true,
+                })
                 .collect();
             // A library that cannot be opened is reported; the project's macros stay usable.
             match wc_library::Library::open(dir, &p) {
-                Ok(lib) => found.extend(lib.macros()),
+                Ok(lib) => found.extend(lib.macros().into_iter().map(|(source, id, path)| FoundMacro {
+                    source,
+                    id,
+                    path,
+                    project: false,
+                })),
                 Err(err) => eprintln!("warning: the library's macros are not listed: {err}"),
             }
             match mc {
                 MacroCmd::List => {
-                    for (source, id, path) in &found {
+                    for FoundMacro { source, id, path, .. } in &found {
                         match wc_core::macros::read_macro(path) {
                             Ok(m) => {
                                 let sets: Vec<&str> = m.value_sets.iter().map(|v| v.name.as_str()).collect();
@@ -2469,6 +2780,32 @@ fn run(cli: Cli) -> Res<()> {
                         }
                     }
                 }
+                MacroCmd::Show { name } => {
+                    let f = find_macro(&found, &name)?;
+                    let m = wc_core::macros::read_macro(&f.path).map_err(e)?;
+                    print!("{}", macro_text(&m, &f.source));
+                }
+                MacroCmd::Edit {
+                    name,
+                    description,
+                    rename,
+                    placeholder,
+                    remove,
+                    set,
+                    remove_set,
+                } => {
+                    let f = find_macro(&found, &name)?;
+                    if !f.project {
+                        return Err(format!(
+                            "macro {name:?} belongs to the {} library; only the project's own macros are edited",
+                            f.source
+                        ));
+                    }
+                    let mut m = wc_core::macros::read_macro(&f.path).map_err(e)?;
+                    edit_macro(&mut m, description, &rename, &placeholder, &remove, &set, &remove_set)?;
+                    wc_core::macros::write_macro_file(&f.path, &m).map_err(e)?;
+                    print!("{}", macro_text(&m, &f.source));
+                }
                 MacroCmd::Place {
                     page,
                     name,
@@ -2476,21 +2813,7 @@ fn run(cli: Cli) -> Res<()> {
                     set,
                     values,
                 } => {
-                    let mut wanted = None;
-                    let file = name.trim();
-                    let file = file.strip_suffix(".json").unwrap_or(file);
-                    for (_, id, path) in &found {
-                        if id.eq_ignore_ascii_case(file) {
-                            wanted = Some(path.clone());
-                            break;
-                        }
-                        if wanted.is_none()
-                            && wc_core::macros::read_macro(path).is_ok_and(|m| m.name.eq_ignore_ascii_case(name.trim()))
-                        {
-                            wanted = Some(path.clone());
-                        }
-                    }
-                    let path = wanted.ok_or_else(|| format!("no macro {name:?}"))?;
+                    let path = find_macro(&found, &name)?.path.clone();
                     let mut typed = std::collections::BTreeMap::new();
                     for v in &values {
                         let (k, val) = v
@@ -2587,7 +2910,7 @@ fn run(cli: Cli) -> Res<()> {
                     print!("{text}");
                 }
                 RulesCmd::Set { file } => {
-                    let rules = rules_from_file(&file)?;
+                    let rules = rules_from_file(&file, input_text.take())?;
                     let n = rules.len();
                     if rules != p.meta.rules {
                         p.meta.rules = rules;
@@ -2720,6 +3043,7 @@ fn run(cli: Cli) -> Res<()> {
                 }
             }
         }
+        Cmd::ReportLayout(rc) => report_layout(dir, rc, input_text.take())?,
         Cmd::Jumper(jc) => {
             let mut p = load(dir)?;
             match jc {
@@ -2914,7 +3238,7 @@ fn run(cli: Cli) -> Res<()> {
             save(dir, &p)?;
         }
         Cmd::Lib(lc) => lib_cmd(dir, lc)?,
-        Cmd::Import(ic) => import_cmd(dir, ic)?,
+        Cmd::Import(ic) => import_cmd(dir, ic, import_bytes.take())?,
         Cmd::Pdf {
             out,
             pages,
@@ -2997,8 +3321,33 @@ fn run(cli: Cli) -> Res<()> {
             }
             println!("wrote {} ({} pages)", out.display(), report.pages);
         }
-        Cmd::Translations { lang } => {
+        Cmd::Translations { lang, edit } => {
+            let lang = lang.ok_or("--lang is needed, such as --lang nb")?;
+            // Only a project folder has a dictionary: a folder without one is refused before
+            // translations.toml is made or changed there.
             let p = load(dir)?;
+            if let Some(edit) = edit {
+                let (text, translation) = match &edit {
+                    TranslationsCmd::Set { text, translation } => {
+                        if translation.trim().is_empty() {
+                            return Err("the translation is empty: use `translations remove` to take one away".into());
+                        }
+                        (text, translation.as_str())
+                    }
+                    TranslationsCmd::Remove { text } => (text, ""),
+                };
+                let changed = wc_core::translate::set_translation(dir, text, &lang, translation).map_err(e)?;
+                let file = wc_core::translate::TRANSLATIONS_FILE;
+                println!(
+                    "{}",
+                    match (&edit, changed) {
+                        (TranslationsCmd::Set { .. }, true) => format!("set the translation in {file}"),
+                        (TranslationsCmd::Remove { .. }, true) => format!("removed the translation from {file}"),
+                        _ => format!("{file} unchanged"),
+                    }
+                );
+                return Ok(());
+            }
             let (_, missing) = translated(dir, &p, &lang)?;
             for m in &missing {
                 println!("{}\t{}", escape_field(&m.text), escape_field(&m.used.join(", ")));
@@ -3371,7 +3720,9 @@ fn lib_cmd(dir: &Path, lc: LibCmd) -> Res<()> {
     Ok(())
 }
 
-fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
+/// `input`: the file of `import wago` or `import plc-csv`, read already (before the project
+/// lock).
+fn import_cmd(dir: &Path, ic: ImportCmd, input: Option<Vec<u8>>) -> Res<()> {
     match ic {
         ImportCmd::SymbolDxf {
             file,
@@ -3492,7 +3843,10 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             }
         }
         ImportCmd::Wago { file } => {
-            let done = import_wago(dir, &file)?;
+            let done = match input {
+                Some(bytes) => import_wago_bytes(dir, &bytes)?,
+                None => import_wago(dir, &file)?,
+            };
             for w in &done.warnings {
                 eprintln!("warning: {}", escape_field(w));
             }
@@ -3507,96 +3861,25 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             }
         }
         ImportCmd::PlcCsv { file } => {
-            let mut p = load(dir)?;
-            let bytes = read_file(&file)?;
-            let (rows, warnings) = wc_import::csv::file_rows(&bytes)
-                .and_then(|rows| wc_import::csv::plc_addresses_from_rows(&rows))
-                .map_err(e)?;
-            for w in warnings {
-                eprintln!("warning: {}", escape_field(&w));
-            }
-            let applied = wc_import::csv::apply_plc_addresses(&mut p, &rows);
-            for t in &applied.unknown {
-                eprintln!("warning: no symbol carries {t}, skipped");
-            }
-            if applied.changed > 0 {
-                save(dir, &p)?;
-            }
-            println!(
-                "PLC addresses: {} device(s) changed, {} already up to date, {} unknown",
-                applied.changed,
-                applied.unchanged,
-                applied.unknown.len()
-            );
+            logged(|log| match &input {
+                Some(bytes) => run::plc_csv_bytes(dir, bytes, log),
+                None => run::plc_csv(dir, &file, log),
+            })?;
         }
         ImportCmd::PartsBmecat { file, lib } => {
-            let (n, warnings) = import_bmecat(&file, &lib)?;
-            for w in warnings {
-                eprintln!("warning: {}", escape_field(&w));
-            }
-            println!("imported {n} part(s) into {}", lib.display());
+            logged(|log| run::parts_bmecat(&file, &lib, log))?;
         }
         ImportCmd::PartsEdz { file, lib, symbol_map } => {
-            let (n, report, warnings) = import_edz(&file, &lib, symbol_map.as_deref())?;
-            for w in warnings {
-                eprintln!("warning: {}", escape_field(&w));
-            }
-            for line in report.lines() {
-                println!("{line}");
-            }
-            println!("imported {n} part(s) into {}", lib.display());
+            logged(|log| run::parts_edz(&file, &lib, symbol_map.as_deref(), log))?;
         }
         ImportCmd::PartsCsv { file, lib } => {
-            let bytes = read_file(&file)?;
-            let (parts, warnings) = wc_import::csv::file_rows(&bytes)
-                .and_then(|rows| wc_import::csv::parts_from_rows(&rows))
-                .map_err(e)?;
-            for p in &parts {
-                wc_library::write_part(&lib, p).map_err(e)?;
-            }
-            for w in warnings {
-                eprintln!("warning: {}", escape_field(&w));
-            }
-            println!("imported {} part(s) into {}", parts.len(), lib.display());
+            logged(|log| run::parts_csv(&file, &lib, log))?;
         }
         ImportCmd::Pdf { file, first_page } => {
-            let source = file
-                .file_name()
-                .map(|n| escape_field(&n.to_string_lossy()))
-                .unwrap_or_default();
-            import_pdf(dir, &file, first_page, &source)?;
+            logged(|log| run::pdf(dir, &file, first_page, log))?;
         }
         ImportCmd::Eplan { path, first_page } => {
-            let mut p = load(dir)?;
-            let tables = eplan_tables(&path)?;
-            let ep = wc_import::eplan::read(&tables).map_err(e)?;
-            let (built, warnings) = wc_import::eplan::build(&ep, first_page);
-            for w in ep.warnings.iter().chain(&warnings) {
-                eprintln!("warning: {}", escape_field(w));
-            }
-            let source = format!(
-                "import:{}",
-                path.file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default()
-            );
-            // Customer and project description fill empty title block fields.
-            for (id, key) in [(10015u32, "customer"), (10011, "description")] {
-                if let Some((_, _, v)) = ep.properties.iter().find(|(i, _, _)| *i == id)
-                    && !v.is_empty()
-                {
-                    p.meta.title_block.entry(key.to_owned()).or_insert_with(|| v.clone());
-                }
-            }
-            let (n_dev, n_pages) = (built.devices.len(), built.pages.len());
-            let n_drawn = built.pages.iter().filter(|pg| pg.id.starts_with("eplan-page-")).count();
-            add_and_save(dir, &mut p, built, &source, Replace::No)?;
-            println!(
-                "imported {} Eplan pages as {n_pages} page(s), {n_drawn} of them as drawn: {n_dev} devices, {} \
-                 connections",
-                ep.pages.len(),
-                ep.connections.len()
-            );
+            logged(|log| run::eplan(dir, &path, first_page, log))?;
         }
         ImportCmd::Swe {
             path,
@@ -3604,355 +3887,22 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             first_page,
             symbol_map,
         } => {
-            let project = pick;
-            let started = std::time::Instant::now();
-            let mut p = load(dir)?;
-            // A database file directly, or an archive read from disk: only the picked project's
-            // database is unpacked, so a large archive costs little memory.
-            let mut head = [0u8; 16];
-            let mut file = std::fs::File::open(&path).map_err(e)?;
-            let is_db = std::io::Read::read_exact(&mut file, &mut head).is_ok() && &head == b"SQLite format 3\0";
-            let db = if is_db {
-                // The same size cap as for a database taken out of an archive.
-                let limit = wc_import::swe::MAX_DATABASE_BYTES;
-                let mut bytes = Vec::new();
-                std::io::Read::read_to_end(
-                    &mut std::io::Read::take(std::fs::File::open(&path).map_err(e)?, limit + 1),
-                    &mut bytes,
-                )
-                .map_err(e)?;
-                if bytes.len() as u64 > limit {
-                    return Err(format!("{} is larger than {} MB", path.display(), limit >> 20));
-                }
-                (bytes, None, None)
-            } else {
-                let file = std::io::BufReader::new(std::fs::File::open(&path).map_err(e)?);
-                let got =
-                    wc_import::swe::database_from_archive(file, project).map_err(|x| format!("{x} (use --pick)"))?;
-                if got.count > 1 {
-                    eprintln!(
-                        "the archive holds {} projects; importing number {project} ({})",
-                        got.count, got.folder
-                    );
-                }
-                let info_warnings = got.info.iter().flat_map(|i| &i.warnings);
-                for w in got.info_warning.iter().chain(info_warnings) {
-                    eprintln!("warning: {}", escape_field(w));
-                }
-                (got.bytes, got.info, Some(got.folder))
-            };
-            let (db, info, folder) = db;
-            let conn = wc_import::swe::open(&db).map_err(e)?;
-            let mut sw = wc_import::swe::read(&conn).map_err(e)?;
-            sw.info = info;
-            let choice = swe_symbol_choice(dir, &p, symbol_map.as_deref())?;
-            for w in &choice.2 {
-                eprintln!("warning: {}", escape_field(w));
-            }
-            // The archive's catalog: devices that name one of its parts are linked to it, the part
-            // comes along, and its size is used for layout footprints the source gives no box.
-            let catalog_read = !is_db;
-            if catalog_read {
-                let file = std::io::BufReader::new(std::fs::File::open(&path).map_err(e)?);
-                match wc_import::swe::library::catalog_from_archive(file) {
-                    Ok(lib) => {
-                        // Why a catalog row was left out, so a device it would have matched is
-                        // not left unlinked without a reason.
-                        for w in &lib.warnings {
-                            eprintln!("warning: catalog: {w}");
-                        }
-                        sw.catalog = lib.parts;
-                    }
-                    Err(x) => eprintln!("warning: devices keep their part numbers as text: {x}"),
-                }
-            }
-            // The symbol and page drawings (DWG): symbols without one stay boxes.
-            if let Some(folder) = &folder {
-                let file = std::io::BufReader::new(std::fs::File::open(&path).map_err(e)?);
-                match wc_import::swe::drawings_from_archive(file, folder) {
-                    Ok(drawings) => {
-                        for w in &drawings.warnings {
-                            eprintln!("warning: drawings: {w}");
-                        }
-                        if !drawings.skipped.is_empty() {
-                            let kinds: Vec<String> = drawings.skipped.iter().map(|(k, n)| format!("{n} {k}")).collect();
-                            eprintln!("warning: drawings: not drawn: {}", kinds.join(", "));
-                        }
-                        sw.drawings = drawings;
-                    }
-                    Err(x) => eprintln!("warning: symbols are drawn as boxes: {x}"),
-                }
-            }
-            let (built, warnings, report) = wc_import::swe::build_with(&sw, first_page, &choice.0);
-            for w in sw.warnings.iter().chain(&warnings) {
-                eprintln!("warning: {}", escape_field(w));
-            }
-            let linked = (catalog_read && !sw.catalog.is_empty())
-                .then(|| built.devices.values().filter(|d| d.part.is_some()).count());
-            let source = format!(
-                "import:{}",
-                path.file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default()
-            );
-            let (n_sym, joined) = add_swe_built(dir, &mut p, built, &source, &choice.1)?;
-            println!(
-                "{:<18} {:>8} {:>9}  why the rest is not imported",
-                "", "source", "imported"
-            );
-            for r in &report {
-                println!("{:<18} {:>8} {:>9}  {}", r.what, r.source, r.imported, r.note);
-            }
-            if joined > 0 {
-                println!("{joined} imported jumper group(s) joined a jumper the project already had");
-            }
-            if let Some(n) = linked {
-                println!("{n} device(s) and cable(s) linked to a part from the archive's catalog");
-            }
-            println!(
-                "{n_sym} symbol shape(s) for the boxes; done in {} ms",
-                started.elapsed().as_millis()
-            );
+            logged(|log| run::swe(dir, &path, pick, first_page, symbol_map.as_deref(), log))?;
         }
         ImportCmd::SweLibrary { path, lib } => {
-            let source = format!(
-                "import:{}",
-                path.file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default()
-            );
-            let (report, warnings) = import_swe_library(dir, &path, lib.as_deref(), &source)?;
-            for w in warnings {
-                eprintln!("warning: {}", escape_field(&w));
-            }
-            for line in report.lines() {
-                println!("{line}");
-            }
-            match lib {
-                Some(lib) => println!("written to {}", lib.display()),
-                None => println!("vendored into the project"),
-            }
+            logged(|log| run::swe_library(dir, &path, lib.as_deref(), log))?;
         }
         ImportCmd::Aml { file, first_page } => {
-            let mut p = load(dir)?;
-            let text = read_file(&file)?;
-            let imp = wc_import::aml::parse(&String::from_utf8_lossy(&text)).map_err(e)?;
-            for w in &imp.warnings {
-                eprintln!("warning: {}", escape_field(w));
-            }
-            let built = wc_import::aml::build(&imp, first_page);
-            let source = format!(
-                "import:{}",
-                file.file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default()
-            );
-            // Through the shared preflight: conflicts are refused before anything is written.
-            let (n_pages, n_dev) = (built.pages.len(), built.devices.len());
-            add_and_save(dir, &mut p, built, &source, Replace::No)?;
-            println!(
-                "imported {n_dev} devices, {} connections on {n_pages} page(s)",
-                imp.links.len()
-            );
+            logged(|log| run::aml(dir, &file, first_page, log))?;
         }
         ImportCmd::Archive { file, first_page, lib } => {
-            use wc_import::archive::Kind;
-            let bytes = read_file(&file)?;
-            let entries = wc_import::archive::open_entries(
-                &bytes,
-                &[
-                    Kind::Pdf,
-                    Kind::Dxf,
-                    Kind::AutomationMl,
-                    Kind::KicadSymbols,
-                    Kind::Csv,
-                    Kind::Spreadsheet,
-                ],
-            )
-            .map_err(e)?;
-            if entries.is_empty() {
-                return Err(
-                    "no importable PDF, DXF, AutomationML, KiCad symbols, CSV lists or Excel lists inside; run `wiringcraft inspect` to see what is there"
-                        .into(),
-                );
-            }
-            // Symbol libraries go into a library folder, not the project's pages.
-            let (symbols, entries): (Vec<_>, Vec<_>) = entries
-                .into_iter()
-                .partition(|(_, kind, _)| *kind == Kind::KicadSymbols);
-            // Entry names are printed: written so a name cannot send the terminal control
-            // sequences. A library's prefix and a page's title are made from the name as it is.
-            let entries: Vec<_> = entries
-                .into_iter()
-                .map(|(raw, kind, data)| ((escape_field(&raw), raw), kind, data))
-                .collect();
-            // CSV and Excel lists come last, so PLC addresses reach devices that pages in the same
-            // archive add.
-            let (csvs, entries): (Vec<_>, Vec<_>) = entries
-                .into_iter()
-                .partition(|(_, kind, _)| matches!(kind, Kind::Csv | Kind::Spreadsheet));
-            // Two entries with the same file name would write the same ids over each other.
-            let mut prefixes = std::collections::BTreeSet::new();
-            for (raw, _, data) in symbols {
-                let name = escape_field(&raw);
-                println!("{name}:");
-                let Some(lib) = &lib else {
-                    eprintln!("warning: {name}: KiCad symbols, not imported: pass --lib <folder>");
-                    continue;
-                };
-                let prefix = kicad_prefix(&raw);
-                if prefixes.contains(&prefix) {
-                    eprintln!("warning: {name}: skipped, an earlier entry already imports as {prefix}");
-                    continue;
-                }
-                // Read first: an entry that cannot be read writes nothing and keeps its prefix free.
-                let read = match read_kicad(&String::from_utf8_lossy(&data), &prefix, 1.0) {
-                    Ok(symbols) if symbols.is_empty() => continue,
-                    Ok(symbols) => symbols,
-                    Err(err) => {
-                        eprintln!("warning: {name}: {err}");
-                        continue;
-                    }
-                };
-                prefixes.insert(prefix);
-                if let Err(err) = write_kicad(read, lib, "") {
-                    eprintln!("warning: {name}: {err}");
-                }
-            }
-            if entries.is_empty() && csvs.is_empty() {
-                return Ok(());
-            }
-            // Removed when it goes out of scope, also on an early return.
-            let staging = staging_dir("wiringcraft-archive-").map_err(e)?;
-            let tmp = staging.path();
-            let mut next = first_page;
-            for (i, ((name, raw), kind, data)) in entries.into_iter().enumerate() {
-                let ext = match kind {
-                    Kind::Pdf => "pdf",
-                    Kind::Dxf => "dxf",
-                    _ => "aml",
-                };
-                let path = tmp.join(format!("{i}.{ext}"));
-                std::fs::write(&path, &data).map_err(e)?;
-                println!("{name}:");
-                let r = match kind {
-                    Kind::Pdf => {
-                        let n = wc_import::pdf::pages(&data).map(|p| p.len()).unwrap_or(0);
-                        let r = import_pdf(dir, &path, next, &name);
-                        next += n.max(1);
-                        r
-                    }
-                    Kind::Dxf => {
-                        let mut p = load(dir)?;
-                        let id = format!("dxf-{next}");
-                        next += 1;
-                        // Page files are named by id, and some folders do not tell `DXF-300`
-                        // from `dxf-300`.
-                        if p.pages.iter().any(|pg| pg.id.eq_ignore_ascii_case(&id)) {
-                            // Never added over an earlier page: removing it again on failure
-                            // would delete that page.
-                            Err(format!(
-                                "page {id} exists; remove it or import with --first-page to number the pages from a free number"
-                            ))
-                        } else {
-                            p.pages.push(Page::new(id.clone(), (next - 1).to_string(), raw.clone()));
-                            p.sort_pages();
-                            // A save that fails part way is cleaned up like a failed import.
-                            let r = save(dir, &p).and_then(|()| {
-                                import_cmd(
-                                    dir,
-                                    ImportCmd::PageDxf {
-                                        file: path.clone(),
-                                        page: id.clone(),
-                                        scale: 1.0,
-                                    },
-                                )
-                            });
-                            // A drawing that could not be imported leaves no blank page behind.
-                            // When that fails too, the entry's own error still counts and the
-                            // other entries still come in.
-                            if r.is_err() {
-                                let remove = || -> Res<()> {
-                                    let mut p = load(dir)?;
-                                    p.pages.retain(|pg| pg.id != id);
-                                    save(dir, &p)
-                                };
-                                if let Err(why) = remove() {
-                                    // The save may fail after the page file is gone already.
-                                    let left = load(dir).map_or(true, |p| p.pages.iter().any(|pg| pg.id == id));
-                                    if left {
-                                        eprintln!("warning: {name}: the empty page {id} could not be removed: {why}");
-                                    } else {
-                                        eprintln!(
-                                            "warning: {name}: the empty page {id} was removed, but the project could not be saved in full: {why}"
-                                        );
-                                    }
-                                }
-                            }
-                            r
-                        }
-                    }
-                    _ => {
-                        let r = import_cmd(
-                            dir,
-                            ImportCmd::Aml {
-                                file: path.clone(),
-                                first_page: next,
-                            },
-                        );
-                        next += 10;
-                        r
-                    }
-                };
-                if let Err(err) = r {
-                    eprintln!("warning: {name}: {err}");
-                }
-            }
-            for (i, ((name, _), _, data)) in csvs.into_iter().enumerate() {
-                println!("{name}:");
-                // Told apart by header, the same column names `plc-csv` and `parts-csv` read.
-                let rows = match wc_import::csv::file_rows(&data) {
-                    Ok(rows) => rows,
-                    Err(err) => {
-                        eprintln!("warning: {name}: {err}");
-                        continue;
-                    }
-                };
-                let ext = if wc_import::xlsx::is_xlsx(&data) { "xlsx" } else { "csv" };
-                let path = tmp.join(format!("list-{i}.{ext}"));
-                let cmd = match wc_import::csv::kind_of_rows(&rows) {
-                    Some(wc_import::csv::CsvKind::PlcAddresses) => ImportCmd::PlcCsv { file: path.clone() },
-                    Some(wc_import::csv::CsvKind::Parts) => match &lib {
-                        Some(lib) => ImportCmd::PartsCsv {
-                            file: path.clone(),
-                            lib: lib.clone(),
-                        },
-                        None => {
-                            eprintln!("warning: {name}: parts list, not imported: pass --lib <folder>");
-                            continue;
-                        }
-                    },
-                    None => {
-                        eprintln!(
-                            "warning: {name}: not a parts list (order number column) or PLC address list (device and address columns), skipped"
-                        );
-                        continue;
-                    }
-                };
-                std::fs::write(&path, &data).map_err(e)?;
-                if let Err(err) = import_cmd(dir, cmd) {
-                    eprintln!("warning: {name}: {err}");
-                }
-            }
+            logged(|log| run::archive(dir, &file, first_page, lib.as_deref(), log))?;
         }
         ImportCmd::PageDwg { file, page, scale } => {
             import_page_dwg(dir, &file, page, scale, std::env::var("WIRINGCRAFT_DWG2DXF").ok())?;
         }
         ImportCmd::PageDxf { file, page, scale } => {
-            let text = read_file(&file)?;
-            import_onto_page(dir, &page, |known| {
-                wc_import::dxf::page(&String::from_utf8_lossy(&text), scale, known).map_err(e)
-            })?;
+            logged(|log| run::page_dxf(dir, &file, &page, scale, log))?;
         }
     }
     Ok(())
@@ -4368,102 +4318,6 @@ fn warn_report_layouts(inputs: &wc_report::Inputs<'_>) {
     }
 }
 
-/// `import pdf`: the pages of `file` as trace pages numbered from `first_page`. `source` names
-/// the PDF in warnings (the file name, or the entry name inside an archive, where `file` is a
-/// staging file), already escaped with [`escape_field`] by the caller.
-fn import_pdf(dir: &Path, file: &Path, first_page: usize, source: &str) -> Result<(), String> {
-    let mut p = load(dir)?;
-    let bytes = read_file(file)?;
-    let traced = wc_import::pdf::pages(&bytes).map_err(e)?;
-    let stem = file
-        .file_stem()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    for (i, t) in traced.into_iter().enumerate() {
-        let id = format!("pdf-{}", first_page + i);
-        if p.page(&id).is_some() {
-            return Err(format!("page {id} exists; pick another --first-page"));
-        }
-        if t.graphics.is_empty() && t.scan.is_none() {
-            // The reason can quote the file: written so it cannot send control sequences.
-            let why = escape_field(t.scan_problem.as_deref().unwrap_or("no picture covers the page"));
-            eprintln!(
-                "warning: {} page {}: no vector content and no usable scan ({why})",
-                source,
-                i + 1,
-            );
-        }
-        let underlay = match &t.scan {
-            Some(scan) => {
-                let file = format!("{}/{id}.{}", wc_core::Underlay::DIR, scan.raster.format.extension());
-                std::fs::create_dir_all(dir.join(wc_core::Underlay::DIR)).map_err(e)?;
-                std::fs::write(dir.join(&file), &scan.raster.bytes).map_err(e)?;
-                println!(
-                    "page {}: scanned sheet saved as {file}, shown under the page",
-                    first_page + i
-                );
-                if let Some(warning) = &t.scan_warning {
-                    // The reason can quote the file: written so it cannot send control sequences.
-                    eprintln!(
-                        "warning: {} page {}: the scanned sheet was read only in part ({})",
-                        source,
-                        i + 1,
-                        escape_field(warning)
-                    );
-                }
-                Some(wc_core::Underlay {
-                    file,
-                    min: scan.min,
-                    max: scan.max,
-                })
-            }
-            None => None,
-        };
-        let mut page = Page::new(id, (first_page + i).to_string(), format!("{stem} p.{}", i + 1));
-        page.underlay = underlay;
-        let (size, why) = sheet_for(t.size_mm);
-        if let Some(why) = why {
-            eprintln!("warning: page {} ({} page {}): {why}", first_page + i, source, i + 1);
-        }
-        page.size = size;
-        println!("page {}: {} shapes", page.number, t.graphics.len());
-        page.graphics = t.graphics;
-        p.pages.push(page);
-    }
-    p.sort_pages();
-    save(dir, &p)?;
-    Ok(())
-}
-
-/// The sheet for a traced drawing of `(width, height)` millimetres: the smallest ISO size
-/// that holds both sides, upright when the drawing is. A drawing larger than A0 gets a sheet
-/// of its own size, each side at least [`PageSize::MIN_MM`]; one beyond the custom range gets
-/// A0, with the reason as a warning.
-fn sheet_for((w, h): (f64, f64)) -> (PageSize, Option<String>) {
-    // PDF sizes are in whole points, so an A3 page reads a fraction of a millimetre off; one
-    // point of slack covers that rounding and no more, so no drawing is cut by the sheet.
-    const SLACK: f64 = 25.4 / 72.0;
-    let portrait = h > w;
-    if let Some(named) = PageSize::NAMED
-        .into_iter()
-        .filter(|s| s.is_portrait() == portrait)
-        .find(|s| {
-            let (sw, sh) = s.mm();
-            w <= sw + SLACK && h <= sh + SLACK
-        })
-    {
-        return (named, None);
-    }
-    let side = |mm: f64| (mm.ceil() as u32).max(PageSize::MIN_MM);
-    match PageSize::custom(side(w), side(h)) {
-        Ok(size) => (size, None),
-        Err(why) => {
-            let a0 = if portrait { PageSize::A0Portrait } else { PageSize::A0 };
-            (a0, Some(format!("{why}, so it is drawn on {}", a0.label())))
-        }
-    }
-}
-
 /// What `lib lock` could not pin, one line each.
 fn lock_warnings(left: &wc_library::Unpinned) -> Vec<String> {
     let kind = |k: &ItemKind| if *k == ItemKind::Symbol { "symbol" } else { "part" };
@@ -4482,198 +4336,6 @@ fn lock_warnings(left: &wc_library::Unpinned) -> Vec<String> {
             )
         }))
         .collect()
-}
-
-/// Read a drawing with `read` (given the ids of the library's symbols) and add it to page
-/// `page`: its graphics, and its symbols with the library symbols they need taken into the
-/// project. Shared by `import page-dxf` and `import page-dwg`.
-fn import_onto_page(
-    dir: &Path,
-    page: &str,
-    read: impl FnOnce(&std::collections::BTreeSet<String>) -> Res<wc_import::dxf::ImportedPage>,
-) -> Res<()> {
-    let mut p = load(dir)?;
-    let lib = wc_library::Library::open(dir, &p).map_err(e)?;
-    let known: std::collections::BTreeSet<String> = lib.index(ItemKind::Symbol).into_keys().collect();
-    let imported = read(&known)?;
-    for w in &imported.warnings {
-        eprintln!("warning: {}", escape_field(w));
-    }
-    // The page must be there before anything is taken (a retry would skip the copies).
-    page_mut(&mut p, page)?;
-    let needed: std::collections::BTreeSet<&str> = imported
-        .symbols
-        .iter()
-        .map(|s| s.symbol.as_str())
-        .filter(|id| store::read_vendored_symbol(dir, id).is_err())
-        .collect();
-    // Check every symbol before taking any, so a refused import leaves no copy behind
-    // without its pin (a retry would take that copy for a pinned one).
-    for id in &needed {
-        let (s, source) = lib.symbol(id).map_err(e)?;
-        if s.id != *id {
-            return Err(format!("{source}: the symbol file for {id:?} declares id {:?}", s.id));
-        }
-    }
-    // What is in the vendor folder now, so a write that fails part way leaves no copy
-    // without its pin (a retry would skip a readable one).
-    let before: Vec<(PathBuf, Option<String>)> = needed
-        .iter()
-        .map(|id| {
-            let path = store::vendor_path(dir, ItemKind::Symbol, id).map_err(e)?;
-            let was = match std::fs::read_to_string(&path) {
-                Ok(text) => Some(text),
-                Err(x) if x.kind() == std::io::ErrorKind::NotFound => None,
-                Err(x) => return Err(format!("{}: {x}", path.display())),
-            };
-            Ok((path, was))
-        })
-        .collect::<Res<_>>()?;
-    let put_back = |why: String| -> String {
-        let failed: Vec<String> = before
-            .iter()
-            .filter_map(|(path, was)| {
-                // Written only when it differs, and whole or not at all.
-                let r = match was {
-                    Some(text) => store::write_if_changed(path, text)
-                        .map(|_| ())
-                        .map_err(|x| x.to_string()),
-                    None => std::fs::remove_file(path).or_else(|x| {
-                        if x.kind() == std::io::ErrorKind::NotFound {
-                            Ok(())
-                        } else {
-                            Err(format!("{}: {x}", path.display()))
-                        }
-                    }),
-                };
-                r.err()
-            })
-            .collect();
-        if failed.is_empty() {
-            why
-        } else {
-            format!("{why}; symbol copies could not be put back: {}", failed.join("; "))
-        }
-    };
-    for id in needed {
-        wc_library::take(dir, &mut p, &lib, ItemKind::Symbol, id).map_err(|x| put_back(x.to_string()))?;
-    }
-    let pg = page_mut(&mut p, page)?;
-    let n_g = imported.graphics.len();
-    let n_s = imported.symbols.len();
-    pg.graphics.extend(imported.graphics);
-    for mut s in imported.symbols {
-        s.id = pg.next_id("s");
-        pg.symbols.push(s);
-    }
-    // The pins of the copies taken are written before the page that uses them: a save that fails
-    // later leaves a pin with its copy (a retry finds both), never a copy without its pin.
-    store::save_lock(dir, &p).map_err(|x| put_back(x.to_string()))?;
-    save(dir, &p)?;
-    println!("imported {n_g} shapes and {n_s} symbols onto page {page}");
-    Ok(())
-}
-
-/// `import page-dwg`: read `file` with WiringCraft's own DWG reader (AutoCAD 2004 to 2018) and
-/// import it onto `page`. Only when that reader refuses the file (another version, or a file
-/// it cannot read) is it converted to DXF with an installed converter (`template`, see
-/// [`dwg_to_dxf`]); the converter writes into a private folder of its own, removed with
-/// everything in it when this ends, also on failure. Says which of the two read the file.
-fn import_page_dwg(dir: &Path, file: &Path, page: String, scale: f64, template: Option<String>) -> Res<()> {
-    let bytes = read_file(file)?;
-    // A scale the import refuses is refused before any converter runs.
-    if !(scale.is_finite() && scale > 0.0) {
-        return Err("scale must be a positive number".into());
-    }
-    // The reader refuses a file of another version, or one whose object structure it cannot
-    // read; a converter may still read those. What it reads but finds nothing to draw in, and
-    // project or library errors, are not the converter's to fix.
-    let read = wc_import::dwg::read_sections(&bytes).and_then(|sections| wc_import::dwg::page_drawing(&sections));
-    let refused = match read {
-        Ok(drawing) => {
-            return import_onto_page(dir, &page, |known| {
-                let imported = drawing.page(scale, known).map_err(e)?;
-                println!("read with WiringCraft's own DWG reader");
-                Ok(imported)
-            });
-        }
-        // Names from the file may hold control characters: escaped for the terminal.
-        Err(why) => escape_field(&why.to_string()),
-    };
-    let tmp = staging_dir("wiringcraft-dwg-").map_err(e)?;
-    let (dxf, converter) = dwg_to_dxf(file, tmp.path(), template)
-        .map_err(|why| format!("WiringCraft's own DWG reader refused the file ({refused}); {why}"))?;
-    println!("converted to DXF with {converter}: WiringCraft's own DWG reader refused the file ({refused})");
-    let text = read_file(&dxf)?;
-    import_onto_page(dir, &page, |known| {
-        // Only a DXF that cannot be read gets both reasons; project errors stay as they are.
-        wc_import::dxf::page(&String::from_utf8_lossy(&text), scale, known).map_err(|why| {
-            format!(
-                "WiringCraft's own DWG reader refused the file ({refused}); the DXF {converter} made from it could not be read either: {}",
-                escape_field(&why.to_string())
-            )
-        })
-    })
-}
-
-/// Convert DWG to a DXF in `tmp` (a private folder, see [`staging_dir`]) with whatever
-/// converter is installed: the command `template` (the WIRINGCRAFT_DWG2DXF setting, with `{in}`
-/// and `{out}`) when given, otherwise `dwg2dxf` or the ODA File Converter. Returns the DXF and
-/// the converter's name. For the DWG files WiringCraft's own reader refuses.
-fn dwg_to_dxf(file: &Path, tmp: &Path, template: Option<String>) -> Res<(PathBuf, &'static str)> {
-    use std::process::Command;
-    let stem = file
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "drawing".into());
-    let out = tmp.join(format!("{stem}.dxf"));
-    let input = file.to_string_lossy().into_owned();
-    let output = out.to_string_lossy().into_owned();
-    let ran = |mut c: Command| c.output().map(|o| o.status.success()).unwrap_or(false);
-    if let Some(template) = template {
-        let parts: Vec<String> = template
-            .split_whitespace()
-            .map(|p| p.replace("{in}", &input).replace("{out}", &output))
-            .collect();
-        if let Some((prog, args)) = parts.split_first() {
-            let mut c = Command::new(prog);
-            c.args(args);
-            if ran(c) && out.exists() {
-                return Ok((out, "the WIRINGCRAFT_DWG2DXF command"));
-            }
-        }
-        return Err("WIRINGCRAFT_DWG2DXF did not produce a DXF".into());
-    }
-    let mut c = Command::new("dwg2dxf");
-    c.args(["-y", "-o", &output, &input]);
-    if ran(c) && out.exists() {
-        return Ok((out, "dwg2dxf"));
-    }
-    // ODA File Converter works on folders: <in dir> <out dir> <version> <type> <recurse> <audit> <filter>.
-    let in_dir = file
-        .parent()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| ".".into());
-    let name = file
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    for prog in ["ODAFileConverter", "ODAFileConverter.exe"] {
-        let mut c = Command::new(prog);
-        c.args([
-            in_dir.as_str(),
-            tmp.to_string_lossy().as_ref(),
-            "ACAD2018",
-            "DXF",
-            "0",
-            "1",
-            name.as_str(),
-        ]);
-        if ran(c) && out.exists() {
-            return Ok((out, "ODA File Converter"));
-        }
-    }
-    Err("no DWG converter found: install ODA File Converter or dwg2dxf, or set WIRINGCRAFT_DWG2DXF".into())
 }
 
 fn vcs_cmd(dir: &Path, vc: VcsCmd) -> Res<()> {
@@ -4852,6 +4514,16 @@ fn comment_cmd(dir: &Path, cc: CommentCmd) -> Res<()> {
 /// which overflowed there once one more import command was added (#312).
 const STACK: usize = 16 * 1024 * 1024;
 
+/// Whether `path` is a symbolic link. A missing file is not one; any other error reading its
+/// metadata is returned with the path, so a check that cannot tell refuses instead of guessing.
+fn is_link(path: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) => Ok(m.file_type().is_symlink()),
+        Err(x) if x.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(x) => Err(format!("{}: {x}", escape_field(&path.display().to_string()))),
+    }
+}
+
 fn main() -> ExitCode {
     // Parsing runs there too: clap's derived parser builds every subcommand on the stack.
     let worker = std::thread::Builder::new()
@@ -4872,6 +4544,98 @@ fn main() -> ExitCode {
     }
 }
 
+/// The lock that keeps two wiringcraft commands from working on the project in `dir` at once,
+/// held until the returned file is dropped (or the process ends, even by a crash). A second
+/// command waits for the first, saying so. The lock file is [`project_lock_path`], inside the
+/// project, so every command on the project finds the same one whatever its environment.
+/// `None`, and the command runs unlocked, when `dir` is not a project; when a git command that
+/// a wiringcraft command runs on this project started this one (a hook), as that command holds
+/// the lock and waits for this one; or, with a warning, when the lock cannot be taken (a
+/// read-only folder): the lock guards against overlapping runs, it is never a reason to refuse
+/// one.
+fn project_lock(dir: &Path) -> Option<std::fs::File> {
+    if !dir.join(store::PROJECT_FILE).is_file() {
+        return None;
+    }
+    if let Some(parent) = std::env::var_os(wc_vcs::PARENT_PROJECT_ENV)
+        && same_folder(Path::new(&parent), dir)
+    {
+        return None;
+    }
+    let path = project_lock_path(dir);
+    let unlocked = |why: String| {
+        eprintln!(
+            "warning: running without the project lock ({}: {}); another wiringcraft command on this project at the same time could undo this one's changes",
+            escape_field(&path.display().to_string()),
+            escape_field(&why)
+        );
+    };
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(err) => {
+            unlocked(err.to_string());
+            return None;
+        }
+    };
+    let file = match file.try_lock() {
+        Ok(()) => file,
+        Err(std::fs::TryLockError::WouldBlock) => {
+            eprintln!("waiting for another wiringcraft command on this project to finish");
+            match file.lock() {
+                Ok(()) => file,
+                Err(err) => {
+                    unlocked(err.to_string());
+                    return None;
+                }
+            }
+        }
+        Err(std::fs::TryLockError::Error(err)) => {
+            unlocked(err.to_string());
+            return None;
+        }
+    };
+    keep_lock_out_of_git(dir);
+    Some(file)
+}
+
+/// Whether `a` and `b` are the same folder (by their canonical paths).
+fn same_folder(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Where [`project_lock`] keeps the lock of the project in `dir`: `.wiringcraft.lock` in the
+/// project folder, always there so a command started before `vcs init` and one started after
+/// it wait on the same file. A new project's `.gitignore` leaves it out.
+fn project_lock_path(dir: &Path) -> PathBuf {
+    dir.join(wc_vcs::LOCK_FILE)
+}
+
+/// Leave the lock file out of the project's git history in a repository whose `.gitignore`
+/// predates it (or a linked worktree of one): listed in the repository's local exclude list.
+/// Best effort, with a warning: a project whose exclude list cannot be written only shows the
+/// file as new.
+fn keep_lock_out_of_git(dir: &Path) {
+    if !dir.join(".git").exists() {
+        return;
+    }
+    if let Err(err) = wc_vcs::Git::new(dir).exclude_locally(wc_vcs::LOCK_FILE) {
+        eprintln!(
+            "warning: could not leave {} out of git: {}",
+            wc_vcs::LOCK_FILE,
+            escape_field(&err.to_string())
+        );
+    }
+}
+
 /// Parse report names; `all` means every report.
 fn report_kinds(names: &[String]) -> Result<Vec<wc_report::Kind>, String> {
     let mut out = Vec::new();
@@ -4888,6 +4652,114 @@ fn report_kinds(names: &[String]) -> Result<Vec<wc_report::Kind>, String> {
         out.push(k);
     }
     Ok(out)
+}
+
+/// `wiringcraft report-layout`: print, replace or reset report layouts, keeping them as the
+/// report layout dialog and the assistant's `report_layouts` tool do. `stdin` is what was read
+/// from standard input for `set <kind> -`, when it already was.
+fn report_layout(dir: &Path, cmd: ReportLayoutCmd, input: Option<String>) -> Res<()> {
+    use wc_core::report_layout::ReportLayout;
+    let one = |name: &str| -> Res<wc_report::Kind> {
+        match report_kinds(&[name.to_owned()])?.as_slice() {
+            [k] => Ok(*k),
+            _ => Err(format!("name one report, not {name:?}")),
+        }
+    };
+    let mut p = load(dir)?;
+    let (symbols, _) = store::vendored_symbols(dir, &p);
+    let parts = vendored_parts(dir, &p);
+    let builtin = |p: &Project, kind| {
+        let inputs = wc_report::Inputs {
+            project: p,
+            symbols: &symbols,
+            parts: &parts,
+        };
+        wc_report::build_builtin(kind, &inputs).columns
+    };
+    let warnings = |p: &Project, about: &str| -> Vec<String> {
+        let inputs = wc_report::Inputs {
+            project: p,
+            symbols: &symbols,
+            parts: &parts,
+        };
+        let about = format!("report layout for \"{about}\":");
+        wc_report::layout_warnings(&inputs)
+            .into_iter()
+            .filter(|w| w.starts_with(&about))
+            .collect()
+    };
+    let (kind, layout) = match cmd {
+        ReportLayoutCmd::Show { kind } => {
+            let kinds = match kind {
+                Some(k) => vec![one(&k)?],
+                None => wc_report::Kind::ALL.to_vec(),
+            };
+            let mut out: Vec<serde_json::Value> = kinds
+                .iter()
+                .map(|k| {
+                    serde_json::json!({
+                        "kind": k.name(),
+                        "layout": wc_report::layout_for(&p, *k),
+                        "builtin_columns": builtin(&p, *k),
+                        "warnings": warnings(&p, k.name()),
+                    })
+                })
+                .collect();
+            // Every report: a stored layout for a report that does not exist is listed too, so
+            // it and its warnings are not hidden.
+            if kinds.len() > 1 {
+                for l in &p.meta.reports {
+                    if wc_report::Kind::parse(&l.kind).is_none() {
+                        out.push(serde_json::json!({
+                            "kind": l.kind,
+                            "layout": l,
+                            "builtin_columns": null,
+                            "warnings": warnings(&p, &l.kind),
+                        }));
+                    }
+                }
+            }
+            let text = serde_json::to_string_pretty(&out).map_err(e)?;
+            println!("{text}");
+            return Ok(());
+        }
+        ReportLayoutCmd::Set { kind, file } => {
+            let kind = one(&kind)?;
+            let text = match input {
+                Some(text) => text,
+                None => read_input(&file)?,
+            };
+            let name = if file.as_os_str() == "-" {
+                "stdin".to_owned()
+            } else {
+                file.display().to_string()
+            };
+            let value: serde_json::Value = serde_json::from_str(&text).map_err(|err| format!("{name}: {err}"))?;
+            let layout = ReportLayout::from_json(kind.name(), value)?;
+            (kind, layout.kept(&builtin(&p, kind))?)
+        }
+        ReportLayoutCmd::Reset { kind } => (one(&kind)?, None),
+    };
+    let mut reports = p.meta.reports.clone();
+    match &layout {
+        Some(l) => match reports.iter_mut().find(|r| r.kind == kind.name()) {
+            Some(slot) => *slot = l.clone(),
+            None => reports.push(l.clone()),
+        },
+        None => reports.retain(|r| r.kind != kind.name()),
+    }
+    if reports != p.meta.reports {
+        p.meta.reports = reports;
+        save(dir, &p)?;
+    }
+    match layout {
+        Some(_) => println!("the {} report's layout is set", kind.name()),
+        None => println!("the {} report has its built-in layout", kind.name()),
+    }
+    for w in warnings(&p, kind.name()) {
+        eprintln!("warning: {}", escape_field(&w));
+    }
+    Ok(())
 }
 
 /// The project's vendored parts by id (parts used by devices, their accessories and jumpers).
@@ -5017,7 +4889,12 @@ struct WagoImported {
 /// left alone. Nothing else is saved when no row changes.
 fn import_wago(dir: &Path, file: &Path) -> Res<WagoImported> {
     let bytes = std::fs::read(file).map_err(|x| format!("{}: {x}", file.display()))?;
-    let (rows, mut warnings) = wc_import::wago::read_configured(&bytes).map_err(e)?;
+    import_wago_bytes(dir, &bytes)
+}
+
+/// [`import_wago`] from the file's bytes, read already (before the project lock).
+fn import_wago_bytes(dir: &Path, bytes: &[u8]) -> Res<WagoImported> {
+    let (rows, mut warnings) = wc_import::wago::read_configured(bytes).map_err(e)?;
     let mut p = load(dir)?;
     let (symbols, missing) = store::vendored_symbols(dir, &p);
     warnings.extend(missing.iter().map(|m| {
@@ -5085,155 +4962,13 @@ fn import_wago(dir: &Path, file: &Path) -> Res<WagoImported> {
     })
 }
 
-/// Import a BMEcat catalogue's parts into a library folder. Files that are not UTF-8 are read
-/// as Latin-1, which BMEcat 1.2 catalogues often declare. Returns the count and warnings.
-fn import_bmecat(file: &Path, lib: &Path) -> Res<(usize, Vec<String>)> {
-    let bytes = read_file(file)?;
-    let (parts, warnings) = wc_import::bmecat::parts(&wc_import::csv::decode(&bytes)).map_err(e)?;
-    for p in &parts {
-        wc_library::write_part(lib, p).map_err(e)?;
-    }
-    Ok((parts.len(), warnings))
-}
-
-/// Import an EDZ archive's parts into a library folder. Returns the count, what the archive
-/// held and warnings.
-fn import_edz(file: &Path, lib: &Path, symbol_map: Option<&Path>) -> Res<(usize, wc_import::edz::Report, Vec<String>)> {
-    // The map is read first, so a bad one stops the import before anything is written.
-    let map = match symbol_map {
-        Some(path) => {
-            let text = std::fs::read_to_string(path).map_err(|x| format!("{}: {x}", path.display()))?;
-            Some(wc_import::swe::parse_symbol_map(&text).map_err(|x| format!("{}: {x}", path.display()))?)
-        }
-        None => None,
-    };
-    let bytes = std::fs::read(file).map_err(|x| format!("{}: {x}", file.display()))?;
-    let wc_import::edz::Edz {
-        mut parts,
-        symbols,
-        mut report,
-        mut warnings,
-    } = wc_import::edz::read_all(&bytes).map_err(|x| format!("{}: {x}", file.display()))?;
-    // The parts whose symbol the map chose.
-    let mut mapped: std::collections::BTreeSet<String> = Default::default();
-    if let Some(map) = &map {
-        let mut probe: Vec<wc_core::Part> = parts
-            .iter()
-            .map(|p| wc_core::Part {
-                symbol: None,
-                ..p.clone()
-            })
-            .collect();
-        wc_import::edz::apply_symbol_map(&mut probe, map, &mut report.clone());
-        mapped = probe.into_iter().filter(|p| p.symbol.is_some()).map(|p| p.id).collect();
-        wc_import::edz::apply_symbol_map(&mut parts, map, &mut report);
-    }
-    // Symbols first, so no part is written pointing at a symbol the library lacks. A symbol that
-    // cannot be written is skipped, and its parts are written without it.
-    let mut unwritten: std::collections::BTreeSet<String> = Default::default();
-    for s in &symbols {
-        if let Err(x) = wc_library::write_symbol(lib, s) {
-            warnings.push(format!("symbol {} not written: {x}", s.id));
-            unwritten.insert(s.id.clone());
-        }
-    }
-    if !unwritten.is_empty() {
-        // A link the symbol map chose is kept while the library still holds a readable symbol of
-        // that id; a link to the macro's own symbol, which was not saved, is dropped.
-        let readable = |id: &str| {
-            std::fs::read_to_string(lib.join("symbols").join(format!("{id}.json")))
-                .ok()
-                .and_then(|t| serde_json::from_str::<wc_core::Symbol>(&t).ok())
-                .is_some()
-        };
-        let keep = |part: &str, id: &str| !unwritten.contains(id) || (mapped.contains(part) && readable(id));
-        for p in &mut parts {
-            if p.symbol.as_deref().is_some_and(|s| !keep(&p.id, s)) {
-                p.symbol = None;
-            }
-        }
-        for m in &mut report.part_macros {
-            if m.symbol.as_deref().is_some_and(|s| !keep(&m.part, s)) {
-                m.symbol = None;
-            }
-        }
-    }
-    for p in &parts {
-        wc_library::write_part(lib, p).map_err(e)?;
-    }
-    Ok((parts.len(), report, warnings))
-}
-
-/// Import a SolidWorks Electrical archive's libraries into a library folder, or vendor them into
-/// the project (pinned to `source`) when no folder is given. Returns the report and warnings.
-fn import_swe_library(
-    dir: &Path,
-    file: &Path,
-    lib: Option<&Path>,
-    source: &str,
-) -> Res<(wc_import::swe::library::LibraryReport, Vec<String>)> {
-    let reader = std::io::BufReader::new(std::fs::File::open(file).map_err(|x| format!("{}: {x}", file.display()))?);
-    let got = wc_import::swe::library::from_archive(reader).map_err(|x| format!("{}: {x}", file.display()))?;
-    match lib {
-        Some(lib) => {
-            for p in &got.parts {
-                wc_library::write_part(lib, p).map_err(e)?;
-            }
-            for s in &got.symbols {
-                wc_library::write_symbol(lib, s).map_err(e)?;
-            }
-        }
-        None => {
-            let mut p = load(dir)?;
-            let built = wc_import::aml::Built {
-                symbols: got.symbols,
-                parts: got.parts,
-                ..Default::default()
-            };
-            add_and_save(dir, &mut p, built, source, Replace::Unchanged)?;
-        }
-    }
-    Ok((got.report, got.warnings))
-}
-
-/// Import QElectroTech elements into a symbol library folder, one symbol per file. A file that
-/// cannot be read is reported and skipped. Returns how many were written and how many failed.
-/// The default id prefix for a KiCad library: `kicad.<file name without extension>`, lower
-/// case, other characters as `_`. `name` may be a path or an archive entry name.
-fn kicad_prefix(name: &str) -> String {
-    let leaf = name.rsplit(['/', '\\']).next().unwrap_or(name);
-    let stem = leaf.rsplit_once('.').map_or(leaf, |(stem, _)| stem);
-    format!("kicad.{}", wc_import::id_segment(stem))
-}
-
 /// Import every symbol (one per unit) of a KiCad library text into `lib`, printing each.
 fn import_kicad(text: &str, lib: &Path, prefix: &str, scale: f64, category: &str) -> Res<usize> {
-    write_kicad(read_kicad(text, prefix, scale)?, lib, category)
-}
-
-/// Read a KiCad library's symbols, printing its warnings; nothing is written yet.
-fn read_kicad(text: &str, prefix: &str, scale: f64) -> Res<Vec<wc_import::kicad::Imported>> {
-    let (symbols, warnings) = wc_import::kicad::symbols(text, prefix, scale).map_err(e)?;
-    for w in warnings {
-        eprintln!("warning: {}", escape_field(&w));
-    }
-    Ok(symbols)
-}
-
-/// Write read KiCad symbols into `lib`, printing each.
-fn write_kicad(symbols: Vec<wc_import::kicad::Imported>, lib: &Path, category: &str) -> Res<usize> {
-    let n = symbols.len();
-    for mut imp in symbols {
-        imp.symbol.category = category.to_owned();
-        let path = wc_library::write_symbol(lib, &imp.symbol).map_err(e)?;
-        println!(
-            "{} -> {} ({} pins, {} shapes)",
-            imp.kicad_name,
-            path.display(),
-            imp.symbol.pins.len(),
-            imp.symbol.graphics.len()
-        );
-    }
+    let mut n = 0;
+    logged(|log| {
+        n = write_kicad(read_kicad(text, prefix, scale, log)?, lib, category, log)?;
+        Ok(())
+    })?;
     Ok(n)
 }
 
@@ -5394,173 +5129,6 @@ fn plain_table(t: &wc_report::Table) -> String {
     out
 }
 
-/// The tables of an Eplan project given as an .elk file, an .edb folder or a zip of the folder.
-fn eplan_tables(path: &Path) -> Result<wc_import::eplan::Tables, String> {
-    let e = |x: std::io::Error| format!("{}: {x}", path.display());
-    let folder = if path.is_dir() {
-        path.to_path_buf()
-    } else {
-        let bytes = std::fs::read(path).map_err(e)?;
-        if bytes.starts_with(b"PK") {
-            return wc_import::eplan::tables_from_zip(&bytes).map_err(|x| x.to_string());
-        }
-        let name = wc_import::eplan::elk_target(&bytes)
-            .ok_or_else(|| format!("{} is not an Eplan .elk file, .edb folder or zip", path.display()))?;
-        path.with_file_name(name)
-    };
-    let mut tables = wc_import::eplan::Tables::new();
-    for entry in std::fs::read_dir(&folder)
-        .map_err(|x| format!("{}: {x}", folder.display()))?
-        .flatten()
-    {
-        let name = entry.file_name().to_string_lossy().to_lowercase();
-        if wc_import::eplan::wanted(&name)
-            && let Ok(bytes) = std::fs::read(entry.path())
-        {
-            tables.insert(name, bytes);
-        }
-    }
-    Ok(tables)
-}
-
-/// Add imported symbols, parts, pages and devices to a project, pinning symbols and parts in
-/// the lockfile under `source`.
-/// The library symbols a SolidWorks import may draw, with the library each comes from: the
-/// project's own copy where it has one (so a repeated import matches it), otherwise the
-/// project's libraries. With `map`, the user's block map from that file. Also returns the
-/// warnings to show: copies or library symbols that cannot be read, mapped symbols no library has.
-fn swe_symbol_choice(
-    dir: &Path,
-    p: &Project,
-    map: Option<&Path>,
-) -> Res<(
-    wc_import::swe::SymbolChoice,
-    std::collections::BTreeMap<String, String>,
-    Vec<String>,
-)> {
-    let mut choice = wc_import::swe::SymbolChoice::default();
-    if let Some(path) = map {
-        let text = std::fs::read_to_string(path).map_err(|x| format!("{}: {x}", path.display()))?;
-        choice.by_block = wc_import::swe::parse_symbol_map(&text).map_err(|x| format!("{}: {x}", path.display()))?;
-    }
-    let mut wanted: std::collections::BTreeSet<String> = choice.by_block.values().cloned().collect();
-    wanted.extend(wc_import::swe::BUILTIN_BY_PINS.iter().map(|(_, id)| (*id).to_owned()));
-    let lib = readable_libraries(dir, p);
-    let mut sources = std::collections::BTreeMap::new();
-    let mut warnings = Vec::new();
-    for id in wanted {
-        // The project's own copy first, used on a page or not.
-        if p.lock.symbols.contains_key(&id) {
-            match project_copy(dir, &id) {
-                Ok(Some(s)) => {
-                    let source = p.lock.symbols.get(&id).map(|l| l.source.clone()).unwrap_or_default();
-                    sources.insert(id.clone(), source);
-                    choice.library.insert(id, s);
-                    continue;
-                }
-                Ok(None) => {}
-                Err(why) => warnings.push(format!("{why}; trying the libraries")),
-            }
-        }
-        match lib.as_ref().map(|l| l.symbol(&id)) {
-            Some(Ok((s, source))) => {
-                sources.insert(id.clone(), source);
-                choice.library.insert(id, s);
-            }
-            // Only a symbol that is really missing is "no library has"; one that cannot be read
-            // was reported with its reason.
-            Some(Err(wc_library::Error::NotFound { .. })) | None => {
-                if choice.by_block.values().any(|v| *v == id) {
-                    warnings.push(format!(
-                        "symbol map names {id}, which no library has; those blocks stay boxes"
-                    ));
-                }
-            }
-            Some(Err(why)) => warnings.push(format!(
-                "library symbol {id} cannot be read, blocks it would match stay boxes: {why}"
-            )),
-        }
-    }
-    Ok((choice, sources, warnings))
-}
-
-/// The project's libraries that can be opened, in their order. A source that cannot be opened (a
-/// git source not synced yet) only means fewer matches, and says so; the others stay usable.
-fn readable_libraries(dir: &Path, p: &Project) -> Option<wc_library::Library> {
-    let mut readable = p.clone();
-    readable.meta.libraries.retain(|source| {
-        let mut one = p.clone();
-        one.meta.libraries = vec![source.clone()];
-        wc_library::Library::open(dir, &one)
-            .inspect_err(|x| eprintln!("warning: library {} not read, blocks may stay boxes: {x}", source.name))
-            .is_ok()
-    });
-    wc_library::Library::open(dir, &readable)
-        .inspect_err(|x| eprintln!("warning: libraries not read, blocks may stay boxes: {x}"))
-        .ok()
-}
-
-/// The project's own copy of symbol `id`: `None` when it has none, the reason when the copy is
-/// there but cannot be read.
-fn project_copy(dir: &Path, id: &str) -> Res<Option<wc_core::Symbol>> {
-    let path = dir
-        .join(store::VENDOR_DIR)
-        .join(ItemKind::Symbol.dir())
-        .join(format!("{id}.json"));
-    match std::fs::metadata(&path) {
-        Ok(m) if m.is_file() => {}
-        Ok(_) => return Err(format!("project copy of symbol {id} is not a file: {}", path.display())),
-        Err(x) if x.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(x) => {
-            return Err(format!(
-                "project copy of symbol {id} cannot be read: {}: {x}",
-                path.display()
-            ));
-        }
-    }
-    store::read_vendored_symbol(dir, id)
-        .map(Some)
-        .map_err(|why| format!("project copy of symbol {id} cannot be read: {why}"))
-}
-
-/// Adds a SolidWorks Electrical import to `p` and saves it ([`add_and_save`]), keeping the
-/// library symbols it used (named in `sources`, new to the project or pinned before) pinned to
-/// their libraries. Returns how many symbol shapes the import made itself, and how many imported
-/// jumper groups joined the project's own.
-fn add_swe_built(
-    dir: &Path,
-    p: &mut Project,
-    built: wc_import::aml::Built,
-    source: &str,
-    sources: &std::collections::BTreeMap<String, String>,
-) -> Res<(usize, usize)> {
-    let n_sym = built.symbols.iter().filter(|s| !sources.contains_key(&s.id)).count();
-    let from_library: Vec<String> = built
-        .symbols
-        .iter()
-        .filter(|s| sources.contains_key(&s.id))
-        .map(|s| s.id.clone())
-        .collect();
-    // Not replacing: a generated symbol may still be placed on pages the project keeps. Saved
-    // like every import: a failed save puts every file back, jumpers and pages together.
-    let joined = add_and_save_with(dir, p, built, source, Replace::No, |p| {
-        keep_library_sources(p, &from_library, sources);
-    })?;
-    Ok((n_sym, joined))
-}
-
-/// Library symbols an import used stay pinned to the library they came from (`add_built` pins
-/// everything it adds to the import), whether they were pinned before or not.
-fn keep_library_sources(p: &mut Project, ids: &[String], sources: &std::collections::BTreeMap<String, String>) {
-    for id in ids {
-        if let (Some(lib), Some(entry)) = (sources.get(id), p.lock.symbols.get_mut(id))
-            && !lib.is_empty()
-        {
-            entry.source.clone_from(lib);
-        }
-    }
-}
-
 /// A page's title-block fields, one per line: key, the value the page shows, and whether it is
 /// the page's own or the project's.
 fn page_fields(p: &Project, page: usize) -> String {
@@ -5590,518 +5158,6 @@ fn page_fields(p: &Project, page: usize) -> String {
         ));
     }
     out
-}
-
-/// A project has one cover page. When the project already has one, imported cover pages are
-/// dropped and their title-block values (the first non-blank one of each field) come back, to
-/// fill the fields the existing cover leaves empty with [`fill_cover`]; otherwise only the first
-/// imported cover is kept. The project itself is not changed, so a refused import leaves it as
-/// it was.
-fn keep_one_cover(p: &Project, pages: &mut Vec<Page>) -> std::collections::BTreeMap<String, String> {
-    let mut kept = p.cover_page().is_some();
-    let mut fields = std::collections::BTreeMap::new();
-    pages.retain(|pg| {
-        if !pg.cover {
-            return true;
-        }
-        if kept {
-            for (k, v) in pg.title_block.iter().filter(|(_, v)| !v.trim().is_empty()) {
-                fields.entry(k.clone()).or_insert_with(|| v.clone());
-            }
-            return false;
-        }
-        kept = true;
-        true
-    });
-    fields
-}
-
-/// Fill the project cover's empty title-block fields from `fields` ([`keep_one_cover`]).
-fn fill_cover(p: &mut Project, fields: std::collections::BTreeMap<String, String>) {
-    let Some(cover) = p.cover_page().and_then(|i| p.pages.get_mut(i)) else {
-        return;
-    };
-    for (k, v) in fields {
-        let slot = cover.title_block.entry(k).or_default();
-        if slot.trim().is_empty() {
-            *slot = v;
-        }
-    }
-}
-
-/// What [`add_built`] wrote: each vendored file with what it held before (none when it had no
-/// such file), for [`put_files_back`] when the save after it fails.
-type Written = Vec<(PathBuf, Option<Vec<u8>>)>;
-
-/// Whether an import may replace a vendored item the project pins in another version.
-#[derive(Clone, Copy, PartialEq)]
-enum Replace {
-    /// Never: an Eplan, AML or SolidWorks Electrical project import makes its own symbols, and a
-    /// page the project kept may still use the old one's pins.
-    No,
-    /// When the project's copy is still the pinned one (a library import, #258).
-    Unchanged,
-}
-
-/// [`add_built`], then save: when the save fails, the vendored files and every project file
-/// the save may have written go back as they were, so the project on disk is the one before.
-fn add_and_save(dir: &Path, p: &mut Project, built: wc_import::aml::Built, source: &str, replace: Replace) -> Res<()> {
-    add_and_save_with(dir, p, built, source, replace, |_| {}).map(|_| ())
-}
-
-/// [`add_and_save`], with `finish` changing the project after the import and before the save,
-/// and giving how many imported jumper groups joined the project's own ([`add_built`]).
-fn add_and_save_with(
-    dir: &Path,
-    p: &mut Project,
-    built: wc_import::aml::Built,
-    source: &str,
-    replace: Replace,
-    finish: impl FnOnce(&mut Project),
-) -> Res<usize> {
-    let pages: Vec<&str> = built.pages.iter().map(|pg| pg.id.as_str()).collect();
-    let panels: Vec<&str> = built.panels.iter().map(|n| n.id.as_str()).collect();
-    let project_files = snapshot_project(dir, &pages, &panels)?;
-    let (written, joined) = add_built(dir, p, built, source, replace)?;
-    finish(p);
-    if let Err(err) = save_imported(dir, p) {
-        let mut failed = put_files_back(&project_files);
-        failed.extend(put_files_back(&written));
-        if failed.is_empty() {
-            return Err(err);
-        }
-        return Err(format!(
-            "{err}; putting back the vendored files failed too: {}",
-            failed.join("; ")
-        ));
-    }
-    Ok(joined)
-}
-
-/// Every file a save of the project may write or remove, with its bytes before (`None` when it
-/// does not exist yet): the project's own files, every file in its page, panel and comment
-/// folders, the black box symbol files its cleanup may remove, and the files of the pages and
-/// panels about to be added. [`put_files_back`] restores
-/// them when a save fails half way.
-fn snapshot_project(dir: &Path, new_pages: &[&str], new_panels: &[&str]) -> Res<Written> {
-    // Every file the save may write or remove, read before anything is written: the project's
-    // own files, every file in its page, panel and comment folders, and the files the new pages
-    // and panels will get.
-    let mut paths: Vec<PathBuf> = [store::PROJECT_FILE, store::DEVICES_FILE, store::LOCK_FILE]
-        .iter()
-        .map(|name| dir.join(name))
-        .collect();
-    // Only the names the store reads and writes: another file there is never changed by the save.
-    for (folder, suffix) in [
-        (store::PAGES_DIR, store::PAGE_SUFFIX),
-        (store::PANELS_DIR, store::PANEL_SUFFIX),
-        (store::COMMENTS_DIR, store::COMMENTS_SUFFIX),
-    ] {
-        let folder = dir.join(folder);
-        // A folder that cannot be listed would leave files the save may change without a copy.
-        let entries = match std::fs::read_dir(&folder) {
-            Ok(entries) => entries,
-            Err(x) if x.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(x) => return Err(format!("{}: {x}", folder.display())),
-        };
-        for entry in entries {
-            let path = entry.map_err(|x| format!("{}: {x}", folder.display()))?.path();
-            let ours = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.ends_with(suffix));
-            if ours && path.is_file() {
-                paths.push(path);
-            }
-        }
-    }
-    // The save ends by removing unused black box symbol files: one that fails half way through
-    // that cleanup must be able to put back the ones already gone (#606).
-    paths.extend(store::removable_box_symbol_files(dir).map_err(e)?);
-    for id in new_pages {
-        paths.push(dir.join(store::PAGES_DIR).join(format!("{id}{}", store::PAGE_SUFFIX)));
-    }
-    for id in new_panels {
-        paths.push(dir.join(store::PANELS_DIR).join(format!("{id}{}", store::PANEL_SUFFIX)));
-    }
-    paths.sort();
-    paths.dedup();
-    let mut project_files: Written = Vec::new();
-    for path in paths {
-        let before = match std::fs::read(&path) {
-            Ok(bytes) => Some(bytes),
-            Err(x) if x.kind() == std::io::ErrorKind::NotFound => None,
-            Err(x) => return Err(format!("{}: {x}", path.display())),
-        };
-        project_files.push((path, before));
-    }
-    Ok(project_files)
-}
-
-/// Wire ends in `p` on pins of the symbol `symbol.id` that `symbol` does not have:
-/// `page 3 -K1:13` each.
-fn wired_pins_lost(p: &Project, symbol: &wc_core::Symbol) -> Vec<String> {
-    let mut out = Vec::new();
-    for page in &p.pages {
-        for w in &page.wires {
-            for end in [&w.from, &w.to] {
-                let wc_core::Endpoint::Pin { item, pin } = end else {
-                    continue;
-                };
-                let Some(placed) = page.symbol(item) else { continue };
-                if placed.symbol == symbol.id && symbol.pin(pin).is_none() {
-                    let name = placed.tag.as_ref().map_or_else(|| item.clone(), ToString::to_string);
-                    out.push(format!("page {} {name}:{pin}", page.number));
-                }
-            }
-        }
-    }
-    out.sort();
-    out.dedup();
-    out
-}
-
-/// Put each file back as it was ([`put_file_back`]), the last written first. Returns why each
-/// one that could not be put back failed.
-fn put_files_back(files: &[(PathBuf, Option<Vec<u8>>)]) -> Vec<String> {
-    files
-        .iter()
-        .rev()
-        .filter_map(|(path, before)| put_file_back(path, before.as_deref()).err())
-        .collect()
-}
-
-/// Add an import to `p` (not saved yet), giving the vendored files it wrote and how many
-/// imported jumper groups joined a jumper the project already had (directly, or through another
-/// imported group that did): the saved project holds those as part of that jumper, not as
-/// jumpers of their own.
-fn add_built(
-    dir: &Path,
-    p: &mut Project,
-    mut built: wc_import::aml::Built,
-    source: &str,
-    replace: Replace,
-) -> Result<(Written, usize), String> {
-    let cover_fields = keep_one_cover(p, &mut built.pages);
-    // Refuse before anything is written: a repeated import must not overwrite the symbol files of
-    // an earlier one and then fail half way.
-    if let Some(page) = built.pages.iter().find(|pg| p.page(&pg.id).is_some()) {
-        return Err(format!(
-            "page {} exists; remove it or import into a fresh project",
-            page.id
-        ));
-    }
-    let mut ids = std::collections::BTreeSet::new();
-    if let Some(page) = built.pages.iter().find(|pg| !ids.insert(pg.id.as_str())) {
-        return Err(format!("the import has page {} twice", page.id));
-    }
-    let numbers: std::collections::BTreeSet<&str> = p.pages.iter().map(|pg| pg.number.as_str()).collect();
-    if let Some(page) = built.pages.iter().find(|pg| numbers.contains(pg.number.as_str())) {
-        return Err(format!(
-            "page number {} is taken; import with --first-page to number the pages from a free number",
-            page.number
-        ));
-    }
-    // A new version of a symbol must keep every pin a wire in the project ends on.
-    for symbol in &built.symbols {
-        if p.lock.symbols.get(&symbol.id).is_some_and(|e| e.hash != symbol.hash()) {
-            let lost = wired_pins_lost(p, symbol);
-            if !lost.is_empty() {
-                return Err(format!(
-                    "symbol {}: wires end on pins the new version no longer has ({}); move those wires first",
-                    symbol.id,
-                    lost.join(", ")
-                ));
-            }
-        }
-    }
-    // A new version replaces the project's copy only when both are the same item of their
-    // library: ids given by name can move to another block in another catalog (#301).
-    for symbol in &built.symbols {
-        if replace == Replace::No || !p.lock.symbols.get(&symbol.id).is_some_and(|e| e.hash != symbol.hash()) {
-            continue;
-        }
-        if let Ok(have) = store::read_vendored_symbol(dir, &symbol.id)
-            && let Some(why) = wc_core::symbol::replace_refused(&have, symbol)
-        {
-            return Err(format!("{why}; import into a fresh project"));
-        }
-    }
-    // A library item already in the project may come again unchanged (same content hash), or
-    // in a new version when the project's copy is still the one its lock pinned: nobody changed
-    // it in the project, so the import replaces it (a block now drawn, a newer catalog). Every
-    // file is read first, so a failed write can put them all back as they were.
-    let mut files: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
-    let items = built
-        .symbols
-        .iter()
-        .map(|s| (ItemKind::Symbol, s.id.as_str(), s.hash()))
-        .chain(built.parts.iter().map(|x| (ItemKind::Part, x.id.as_str(), x.hash())));
-    for (kind, id, hash) in items {
-        let name = match kind {
-            ItemKind::Symbol => format!("symbol {id}"),
-            ItemKind::Part => format!("part {id}"),
-        };
-        let (path, before) = vendored_bytes(dir, kind, id)?;
-        if let Some(entry) = p.lock.map(kind).get(id) {
-            if replace == Replace::No && entry.hash != hash {
-                return Err(format!("{name} exists with other content; import into a fresh project"));
-            }
-            let have = match (&before, kind) {
-                (None, _) => None,
-                (Some(_), ItemKind::Symbol) => Some(store::read_vendored_symbol(dir, id).map(|x| x.hash())),
-                (Some(_), ItemKind::Part) => Some(store::read_vendored_part(dir, id).map(|x| x.hash())),
-            };
-            match have {
-                Some(Ok(h)) if h == entry.hash => {}
-                Some(Ok(_)) => {
-                    return Err(format!("{name} exists with other content; import into a fresh project"));
-                }
-                Some(Err(why)) => {
-                    return Err(format!(
-                        "{name}: its copy {} cannot be read ({why}); repair it and import again",
-                        path.display()
-                    ));
-                }
-                None if entry.hash == hash => {}
-                None => {
-                    return Err(format!(
-                        "{name}: the project pins another version and has no copy of it ({}); restore the pinned copy from the project's history, or import the pinned version itself",
-                        path.display()
-                    ));
-                }
-            }
-        }
-        files.push((path, before));
-    }
-    if let Some(panel) = built
-        .panels
-        .iter()
-        .find(|n| p.panels.iter().any(|have| have.id == n.id))
-    {
-        return Err(format!(
-            "panel {} exists; remove it or import into a fresh project",
-            panel.id
-        ));
-    }
-    // A device the project already has under the same tag may come again only unchanged.
-    if let Some((tag, _)) = built
-        .devices
-        .iter()
-        .find(|(t, d)| p.devices.get(*t).is_some_and(|have| have != *d))
-    {
-        return Err(format!(
-            "device {tag} exists with other data; rename it or import into a fresh project"
-        ));
-    }
-    // Jumpers join the project's own: one that shares a terminal with a jumper of the same
-    // strip becomes one jumper with it. Checked here, before anything is written.
-    let mut jumpers = p.meta.clone();
-    for j in &built.jumpers {
-        jumpers
-            .add_jumper(&j.strip, &j.terminals)
-            .map_err(|why| format!("jumper on {}: {why}", j.strip))?;
-    }
-    // The imported pages can renumber the project's terminals tagged with only their strip, so
-    // the project's own jumpers follow first; the imported ones already have the final numbers.
-    let before = if !p.meta.follows_terminals() {
-        None
-    } else {
-        // A symbol the project has no readable copy of, which the import brings, changes which
-        // placed items are terminals. Whether the jumpers' and rail order's numbers were given
-        // with it or without it cannot be told, so a strip it renumbers is not guessed at.
-        let (own, _) = store::vendored_symbols(dir, p);
-        let mut symbols = own.clone();
-        for s in &built.symbols {
-            symbols.entry(s.id.clone()).or_insert_with(|| s.clone());
-        }
-        let with = wc_core::project::terminal_numbers(p, |id| symbols.get(id).map(|s| s.role));
-        let without = wc_core::project::terminal_numbers(p, |id| own.get(id).map(|s| s.role));
-        let strips: std::collections::BTreeSet<&DeviceTag> = with
-            .iter()
-            .filter(|(k, v)| without.get(*k) != Some(*v))
-            .map(|(_, (strip, _))| strip)
-            .chain(
-                without
-                    .iter()
-                    .filter(|(k, v)| with.get(*k) != Some(*v))
-                    .map(|(_, (strip, _))| strip),
-            )
-            .collect();
-        if let Some(strip) = strips.into_iter().find(|s| {
-            p.meta.jumpers.iter().any(|j| &j.strip == *s) || p.meta.strip_layout(s).is_some_and(|l| !l.is_empty())
-        }) {
-            let missing: Vec<&str> = built
-                .symbols
-                .iter()
-                .filter(|s| !own.contains_key(&s.id))
-                .map(|s| s.id.as_str())
-                .filter(|id| p.pages.iter().any(|pg| pg.symbols.iter().any(|ps| ps.symbol == *id)))
-                .collect();
-            return Err(format!(
-                "the jumpers and rail order of {strip} cannot be kept on their terminals: the project has no readable copy of {} that the import brings, so its terminal numbers are unclear; restore the file (for example from the project's history) and import again",
-                missing.join(", ")
-            ));
-        }
-        Some(with)
-    };
-    // A write that fails puts back the files written before it (and removes the ones it made),
-    // so each copy still matches its pin. Only files this import changed are put back: one it
-    // left as it was keeps whatever it holds now.
-    let writes = built
-        .symbols
-        .iter()
-        .map(|s| store::write_vendored_symbol(dir, s))
-        .chain(built.parts.iter().map(|x| store::write_vendored_part(dir, x)));
-    let mut changed: Written = Vec::new();
-    for (file, written) in files.into_iter().zip(writes) {
-        match written {
-            Ok(true) => changed.push(file),
-            Ok(false) => {}
-            Err(err) => {
-                let failed = put_files_back(&changed);
-                if failed.is_empty() {
-                    return Err(err.to_string());
-                }
-                return Err(format!(
-                    "{err}; putting back the files written before it failed too: {}",
-                    failed.join("; ")
-                ));
-            }
-        }
-    }
-    fill_cover(p, cover_fields);
-    for s in &built.symbols {
-        p.lock.symbols.insert(
-            s.id.clone(),
-            wc_core::LockEntry {
-                source: source.to_owned(),
-                hash: s.hash(),
-            },
-        );
-    }
-    for part in &built.parts {
-        p.lock.parts.insert(
-            part.id.clone(),
-            wc_core::LockEntry {
-                source: source.to_owned(),
-                hash: part.hash(),
-            },
-        );
-    }
-    for page in built.pages {
-        if p.page(&page.id).is_some() {
-            return Err(format!(
-                "page {} exists; remove it or import into a fresh project",
-                page.id
-            ));
-        }
-        p.pages.push(page);
-    }
-    p.sort_pages();
-    for (t, d) in built.devices {
-        p.devices.insert(t, d);
-    }
-    for loc in built.locations {
-        p.meta.merge_location(loc);
-    }
-    if let Some(before) = before {
-        let (symbols, _) = store::vendored_symbols(dir, p);
-        wc_core::project::follow_terminals_in(p, &before, |id| symbols.get(id).map(|s| s.role));
-    }
-    // Terminals held by the project's own jumpers (with their numbers after following), and by
-    // the imported groups that joined one of them.
-    let mut joined_terminals: std::collections::BTreeSet<(DeviceTag, String)> = p
-        .meta
-        .jumpers
-        .iter()
-        .flat_map(|j| j.terminals.iter().map(|t| (j.strip.clone(), t.clone())))
-        .collect();
-    // Until nothing more joins, so a group that reaches the project's jumper only through one
-    // listed after it counts too.
-    let mut joined_groups = vec![false; built.jumpers.len()];
-    loop {
-        let mut more = false;
-        for (j, done) in built.jumpers.iter().zip(joined_groups.iter_mut()) {
-            if !*done
-                && j.terminals
-                    .iter()
-                    .any(|t| joined_terminals.contains(&(j.strip.clone(), t.clone())))
-            {
-                *done = true;
-                more = true;
-                joined_terminals.extend(j.terminals.iter().map(|t| (j.strip.clone(), t.clone())));
-            }
-        }
-        if !more {
-            break;
-        }
-    }
-    let joined = joined_groups.iter().filter(|j| **j).count();
-    for j in &built.jumpers {
-        p.meta
-            .add_jumper(&j.strip, &j.terminals)
-            .map_err(|why| format!("jumper on {}: {why}", j.strip))?;
-    }
-    p.panels.extend(built.panels);
-    p.panels.sort_by(|a, b| a.id.cmp(&b.id));
-    // Title-block fields fill the ones the project has not set; nothing typed in is overwritten.
-    p.meta.fill_title_block(built.title_block);
-    Ok((changed, joined))
-}
-
-/// The path and bytes of a vendored copy, kept before an import replaces it.
-/// The vendored file of an item and its bytes, none when there is no such file.
-fn vendored_bytes(dir: &Path, kind: ItemKind, id: &str) -> Result<(PathBuf, Option<Vec<u8>>), String> {
-    let path = store::vendor_path(dir, kind, id).map_err(|x| x.to_string())?;
-    match std::fs::read(&path) {
-        Ok(bytes) => Ok((path, Some(bytes))),
-        Err(x) if x.kind() == std::io::ErrorKind::NotFound => Ok((path, None)),
-        Err(x) => Err(format!("{}: {x}", path.display())),
-    }
-}
-
-/// Put `path` back to `before` (remove it when it had none). The bytes go to a file beside it
-/// first and then replace it, so a failure never leaves it cut off. Returns why it failed.
-fn put_file_back(path: &Path, before: Option<&[u8]>) -> Result<(), String> {
-    let fail = |x: std::io::Error| format!("{}: {x}", path.display());
-    let Some(bytes) = before else {
-        return match std::fs::remove_file(path) {
-            Err(x) if x.kind() != std::io::ErrorKind::NotFound => Err(fail(x)),
-            _ => Ok(()),
-        };
-    };
-    if std::fs::read(path).is_ok_and(|now| now == bytes) {
-        return Ok(());
-    }
-    // The staging file is made new (never one already there, which could be a link to a file
-    // elsewhere), and only that file is removed when something fails.
-    let mut made = None;
-    for n in 0..100u32 {
-        let mut part = path.as_os_str().to_owned();
-        part.push(format!(".restore-{}-{n}", std::process::id()));
-        let part = PathBuf::from(part);
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&part) {
-            Ok(file) => {
-                made = Some((part, file));
-                break;
-            }
-            Err(x) if x.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(x) => return Err(fail(x)),
-        }
-    }
-    let Some((part, mut file)) = made else {
-        return Err(format!("{}: no free name for the staging file", path.display()));
-    };
-    use std::io::Write as _;
-    let done = file.write_all(bytes).and_then(|()| file.sync_all()).and_then(|()| {
-        drop(file);
-        std::fs::rename(&part, path)
-    });
-    done.map_err(|x| match std::fs::remove_file(&part) {
-        Ok(()) => fail(x),
-        Err(y) => format!("{}; the staging file {} is left: {y}", fail(x), part.display()),
-    })
 }
 
 /// The current time in UTC as `YYYY-MM-DDThh:mm:ssZ`.
@@ -6137,21 +5193,6 @@ fn file_stem(number: &str, id: &str) -> String {
         .collect();
     let stem = stem.trim_start_matches('.').to_owned();
     if stem.is_empty() { "page".into() } else { stem }
-}
-
-/// A fresh folder for files taken out of an archive or written by a converter, its name
-/// starting with `prefix`: unique, and on Unix readable only by this user (mode 0700, set as it
-/// is created), so nobody can plant a file or link there. Removed when the returned value is
-/// dropped.
-fn staging_dir(prefix: &str) -> std::io::Result<tempfile::TempDir> {
-    let mut builder = tempfile::Builder::new();
-    builder.prefix(prefix);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        builder.permissions(std::fs::Permissions::from_mode(0o700));
-    }
-    builder.tempdir()
 }
 
 #[cfg(test)]
@@ -6237,6 +5278,78 @@ mod tests {
         let mut missing = Vec::new();
         commands_and_args_without_help(&Cli::command(), "wiringcraft", &mut missing);
         assert!(missing.is_empty(), "no help text for: {missing:#?}");
+    }
+
+    /// A stream the test reads while the import is still running.
+    #[derive(Clone, Default)]
+    struct Shared(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Shared {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Shared {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    /// A stream whose reader went away (`wiringcraft import ... | head -0`).
+    struct Closed;
+
+    impl std::io::Write for Closed {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_import_line_is_printed_before_the_import_goes_on_to_the_next_entry() {
+        let (out, err) = (Shared::default(), Shared::default());
+        let r = logged_to(out.clone(), err.clone(), |log| {
+            log.out("archive: a.dxf".into());
+            log.err("warning: b".into());
+            // The next entry is still being read here, and the first is already shown.
+            assert_eq!(out.text(), "archive: a.dxf\n");
+            assert_eq!(err.text(), "warning: b\n");
+            log.out("archive: c.pdf".into());
+            Ok(())
+        });
+        assert_eq!(r, Ok(()));
+        assert_eq!(out.text(), "archive: a.dxf\narchive: c.pdf\n");
+    }
+
+    #[test]
+    fn a_report_that_cannot_be_printed_does_not_hide_a_finished_import() {
+        let t = tempfile::tempdir().unwrap();
+        let saved = t.path().join("page.toml");
+        let err = Shared::default();
+        let r = logged_to(Closed, err.clone(), |log| {
+            log.out("archive: a.dxf".into());
+            // The import goes on after the line could not be printed, and saves.
+            std::fs::write(&saved, "page").map_err(|e| e.to_string())?;
+            log.out("imported page 300".into());
+            log.err("warning: kept".into());
+            Ok(())
+        });
+        assert_eq!(r, Ok(()));
+        assert!(saved.is_file());
+        let shown = err.text();
+        assert!(shown.starts_with("warning: kept\n"), "{shown}");
+        assert!(
+            shown.contains("could not be printed on standard output") && shown.contains("the import was done"),
+            "{shown}"
+        );
+        assert_eq!(shown.matches("could not be printed").count(), 1, "{shown}");
     }
 
     #[cfg(unix)]
@@ -6334,6 +5447,79 @@ mod tests {
         let mut all = vec!["wiringcraft", "-C", dir.to_str().unwrap()];
         all.extend_from_slice(args);
         run(Cli::try_parse_from(all).map_err(|e| e.to_string())?)
+    }
+
+    #[test]
+    fn a_command_waits_while_another_holds_the_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        // Not a project yet: nothing to lock.
+        assert!(project_lock(&dir).is_none());
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let held = project_lock(&dir).unwrap();
+        assert_eq!(project_lock_path(&dir), dir.join(".wiringcraft.lock"));
+        // In a repository, git is told to leave it out, once.
+        let other = tmp.path().join("other");
+        store::create(&other, "Other").unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&other)
+            .status()
+            .unwrap();
+        assert!(init.success());
+        drop(project_lock(&other).unwrap());
+        drop(project_lock(&other).unwrap());
+        let exclude = std::fs::read_to_string(other.join(".git/info/exclude")).unwrap();
+        assert_eq!(exclude.matches("/.wiringcraft.lock").count(), 1);
+        assert!(exclude.ends_with("/.wiringcraft.lock\n"));
+        // Another project is not held up.
+        cli(&other, &["template", "columns", "14"]).unwrap();
+        let toml = dir.join(store::PROJECT_FILE);
+        let before = std::fs::read_to_string(&toml).unwrap();
+        let second = {
+            let dir = dir.clone();
+            std::thread::spawn(move || cli(&dir, &["template", "columns", "14"]))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(!second.is_finished(), "the second command waits");
+        assert_eq!(std::fs::read_to_string(&toml).unwrap(), before);
+        drop(held);
+        second.join().unwrap().unwrap();
+        assert_ne!(std::fs::read_to_string(&toml).unwrap(), before);
+    }
+
+    #[test]
+    fn commands_on_either_side_of_vcs_init_wait_on_one_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let spawn = |args: &'static [&'static str]| {
+            let dir = dir.clone();
+            std::thread::spawn(move || cli(&dir, args))
+        };
+        let pause = || std::thread::sleep(std::time::Duration::from_millis(400));
+        // Taken before the project is a repository, as `vcs init` takes it.
+        let held = project_lock(&dir).unwrap();
+        let before = project_lock_path(&dir);
+        // One command starts waiting before .git exists ...
+        let early = spawn(&["page", "add", "p2", "--number", "2"]);
+        pause();
+        wc_vcs::Git::new(&dir).init().unwrap();
+        assert!(dir.join(".git").exists());
+        assert_eq!(project_lock_path(&dir), before, "the same lock file once .git exists");
+        // ... and another after: both wait for the lock taken before init.
+        let late = spawn(&["page", "add", "p3", "--number", "3"]);
+        pause();
+        assert!(!early.is_finished(), "the earlier command waits");
+        assert!(!late.is_finished(), "the later command waits");
+        assert!(load(&dir).unwrap().page("p2").is_none());
+        assert!(load(&dir).unwrap().page("p3").is_none());
+        drop(held);
+        early.join().unwrap().unwrap();
+        late.join().unwrap().unwrap();
+        // One after the other: neither overwrote the other's page.
+        let p = load(&dir).unwrap();
+        assert!(p.page("p2").is_some() && p.page("p3").is_some());
     }
 
     #[test]
@@ -7634,6 +6820,40 @@ mod tests {
         )
         .unwrap();
         assert!(cli(&dir, &["translations", "--lang", "nb"]).is_ok());
+
+        // One text set and removed from the command line.
+        cli(
+            &dir,
+            &["translations", "set", "Main switch", "Hovedbryter 1", "--lang", "nb"],
+        )
+        .unwrap();
+        cli(&dir, &["translations", "--lang", "de", "set", "Pumps", "Pumpen"]).unwrap();
+        let dict = wc_core::translate::Dictionary::load(&dir).unwrap();
+        assert_eq!(dict.lookup("Main switch", "nb").as_deref(), Some("Hovedbryter 1"));
+        assert_eq!(dict.lookup("Pumps", "de").as_deref(), Some("Pumpen"));
+        cli(&dir, &["translations", "remove", "Cover", "--lang", "nb"]).unwrap();
+        let err = cli(&dir, &["translations", "--lang", "nb"]).unwrap_err();
+        assert!(err.contains("1 text(s)"), "{err}");
+        assert!(
+            cli(&dir, &["translations", "set", "Pumps", "x"]).is_err(),
+            "no language"
+        );
+        assert!(cli(&dir, &["translations", "set", "Pumps", "x", "--lang", "en"]).is_err());
+        assert!(cli(&dir, &["translations", "set", "Pumps", " ", "--lang", "nb"]).is_err());
+
+        // A folder that is not a project is refused, and its translations.toml left alone.
+        let other = tmp.path().join("not-a-project");
+        std::fs::create_dir(&other).unwrap();
+        let file = other.join(wc_core::translate::TRANSLATIONS_FILE);
+        let text = "source = \"en\"\n";
+        std::fs::write(&file, text).unwrap();
+        assert!(cli(&other, &["translations", "set", "Pumps", "Pumper", "--lang", "nb"]).is_err());
+        assert!(cli(&other, &["translations", "remove", "Pumps", "--lang", "nb"]).is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        assert!(cli(&empty, &["translations", "set", "Pumps", "Pumper", "--lang", "nb"]).is_err());
+        assert!(!empty.join(wc_core::translate::TRANSLATIONS_FILE).exists());
     }
 
     #[test]
@@ -9654,6 +8874,87 @@ mod tests {
             assert_eq!(std::fs::read_link(&path).unwrap(), target);
             assert_eq!(std::fs::read(&target).unwrap(), before);
         }
+    }
+
+    /// A missing file is not a link; a path whose metadata cannot be read for another reason is
+    /// an error naming it, not "not a link".
+    #[cfg(unix)]
+    #[test]
+    fn is_link_tells_missing_from_unreadable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("plain.json");
+        std::fs::write(&file, "{}").unwrap();
+        let link = tmp.path().join("link.json");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert_eq!(is_link(&file), Ok(false));
+        assert_eq!(is_link(&link), Ok(true));
+        assert_eq!(is_link(&tmp.path().join("missing.json")), Ok(false));
+        // A plain file used as a folder: not a "not found" error.
+        let err = is_link(&file.join("inside.json")).unwrap_err();
+        assert!(err.contains("inside.json"), "{err}");
+    }
+
+    /// A page file that is a link is refused before anything is written, so neither the save
+    /// nor a rollback replaces the link with a plain file (#614).
+    #[cfg(unix)]
+    #[test]
+    fn box_edit_refuses_a_linked_page_file_before_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        cli(
+            &dir,
+            &["box", "p1", "--at", "40,40", "--size", "20,10", "--pin", "1:left:5"],
+        )
+        .unwrap();
+        let page = dir.join(store::PAGES_DIR).join(format!("p1{}", store::PAGE_SUFFIX));
+        let target = tmp.path().join("p1-elsewhere.json");
+        std::fs::rename(&page, &target).unwrap();
+        std::os::unix::fs::symlink(&target, &page).unwrap();
+        let page_before = std::fs::read(&target).unwrap();
+        let symbol_before = store::read_vendored_symbol(&dir, "box.p1.s1").unwrap();
+        let lock_before = std::fs::read(dir.join(store::LOCK_FILE)).unwrap();
+
+        let err = cli(&dir, &["box-edit", "p1", "s1", "--size", "30,10"]).unwrap_err();
+        assert!(err.contains("link"), "{err}");
+        assert!(err.contains(&format!("p1{}", store::PAGE_SUFFIX)), "{err}");
+        assert!(std::fs::symlink_metadata(&page).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_link(&page).unwrap(), target);
+        assert_eq!(std::fs::read(&target).unwrap(), page_before);
+        assert_eq!(store::read_vendored_symbol(&dir, "box.p1.s1").unwrap(), symbol_before);
+        assert_eq!(std::fs::read(dir.join(store::LOCK_FILE)).unwrap(), lock_before);
+
+        // With the link replaced by its target's bytes the same edit goes through.
+        std::fs::remove_file(&page).unwrap();
+        std::fs::copy(&target, &page).unwrap();
+        cli(&dir, &["box-edit", "p1", "s1", "--size", "30,10"]).unwrap();
+        assert_ne!(store::read_vendored_symbol(&dir, "box.p1.s1").unwrap(), symbol_before);
+    }
+
+    #[test]
+    fn box_edit_refuses_to_join_a_removed_points_wire_to_a_free_wire_end_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        cli(
+            &dir,
+            &["box", "p1", "--at", "40,40", "--size", "20,10", "--pin", "IN:left:5"],
+        )
+        .unwrap();
+        cli(&dir, &["wire", "p1", "s1:IN", "0,0"]).unwrap();
+        let p = load(&dir).unwrap();
+        let pg = p.page("p1").unwrap();
+        let sym = store::read_vendored_symbol(&dir, &pg.symbols[0].symbol).unwrap();
+        let at = wc_pdf::pin_position(&pg.symbols[0], &sym, "IN").unwrap();
+        // Another wire ends freely where IN is, not joined to it.
+        cli(&dir, &["wire", "p1", &format!("{},{}", at.x, at.y), "0,90"]).unwrap();
+        let before = load(&dir).unwrap();
+        let err = cli(&dir, &["box-edit", "p1", "s1", "--clear-pins"]).unwrap_err();
+        assert!(err.contains("would be joined"), "{err}");
+        assert_eq!(load(&dir).unwrap(), before, "nothing changes");
+        assert_eq!(store::read_vendored_symbol(&dir, &sym.id).unwrap(), sym);
     }
 
     #[test]

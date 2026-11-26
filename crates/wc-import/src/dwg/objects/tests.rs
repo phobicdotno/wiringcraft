@@ -1437,6 +1437,30 @@ fn a_block_whose_base_point_is_cut_off_is_kept_and_said() -> TestResult {
     Ok(())
 }
 
+/// A drawing with nothing to draw names the block whose base point it could not read; the
+/// name comes from the file, so `import page-dwg` escapes it before it reaches the terminal.
+#[test]
+fn a_block_name_in_a_page_error_is_escaped_for_the_terminal() -> TestResult {
+    let v = Version::R2004;
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        named(v, BLOCK_HEADER, 0x100, "CUT\u{1b}[2J"),
+        line(v, 0x200, head(Some(0x100)), (5.0, 5.0), (10.0, 5.0)),
+    ];
+    let drawing = crate::dwg::page_drawing(&sections(v, &objs, &[]))?;
+    let Err(raw) = drawing.page(1.0, &Default::default()) else {
+        unreachable!("nothing to draw");
+    };
+    assert!(raw.to_string().contains("CUT\u{1b}[2J"), "{raw}");
+    let Err(shown) = crate::run::dwg_page(&drawing, 1.0, &Default::default()) else {
+        unreachable!("nothing to draw");
+    };
+    assert!(!shown.contains('\u{1b}'), "{shown:?}");
+    assert!(shown.contains("CUT\\u{1b}[2J"), "{shown}");
+    Ok(())
+}
+
 #[test]
 fn a_reference_to_a_missing_block_is_counted_and_the_rest_drawn() -> TestResult {
     for v in [Version::R2004, Version::R2010, Version::R2018] {
@@ -1549,7 +1573,7 @@ fn a_bulged_lightweight_polyline_is_drawn_with_its_arc() -> TestResult {
         if ids {
             p.data.bl(2);
         }
-        p.data.rd(0.0).rd(0.0).dd(10.0, 0.0).dd(0.0, 0.0).rd(1.0).rd(0.0);
+        p.data.rd(0.0).rd(0.0).dd(10.0, 0.0).dd(0.0, 0.0).bd(1.0).bd(0.0);
         if ids {
             p.data.bl(1).bl(2);
         }

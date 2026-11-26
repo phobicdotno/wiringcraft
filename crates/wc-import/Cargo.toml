@@ -18,6 +18,8 @@ sevenz-rust2.workspace = true
 # project's and libraries' parts.
 wc-report.workspace = true
 wc-library.workspace = true
+tempfile.workspace = true
+serde_json.workspace = true
 # Scanned PDF pictures: CCITT fax, JBIG2 and JPEG 2000 (pure Rust, MIT OR Apache-2.0).
 hayro-ccitt.workspace = true
 hayro-jbig2.workspace = true

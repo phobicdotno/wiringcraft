@@ -14,6 +14,7 @@ mod feedback;
 mod find_window;
 mod icons;
 mod import_symbols;
+mod imports;
 mod layers;
 mod live_check;
 mod macro_form;
@@ -191,6 +192,30 @@ enum Dialog {
     },
     /// Macros to insert.
     Macros(Vec<state::MacroEntry>),
+    /// File > Import without a file picker: the file (and, for parts with no folder chosen,
+    /// the library folder) typed, and why the picker could not be used.
+    ImportPath {
+        kind: imports::Kind,
+        target: Option<import_symbols::ImportTarget>,
+        file: prefs::FolderField,
+        lib: prefs::FolderField,
+        error: Option<String>,
+    },
+    /// Attach footprint drawing / Attach 3D model without a file picker: the file typed, and
+    /// why the picker could not be used or the typed path was refused.
+    AttachPath {
+        kind: panels::Attach,
+        part: String,
+        file: prefs::FolderField,
+        error: Option<String>,
+    },
+    /// Parts import: the library folder to write into, then the file.
+    ImportParts {
+        kind: imports::Kind,
+        targets: Vec<import_symbols::ImportTarget>,
+        /// An index into `targets`; one past the end is another folder, picked after the file.
+        chosen: usize,
+    },
     /// A project macro's placeholders and value sets (Insert macro, Placeholders…).
     MacroEdit {
         form: Box<macro_form::Form>,
@@ -273,7 +298,52 @@ struct App {
     live: live_check::LiveCheck,
     /// A base project being fetched from a git URL for a new project, off the window thread.
     fetch: Option<BaseFetch>,
+    /// File > Import running on a worker thread ([`App::poll_import`]).
+    importing: Option<Importing>,
 }
+
+/// File > Import running on a worker thread, and what to do with the project when it ends.
+struct Importing {
+    job: imports::Job,
+    kind: imports::Kind,
+    file: PathBuf,
+    /// The library folder parts go into.
+    lib: Option<PathBuf>,
+    /// The library folder chosen in the parts dialog, declared in the project when it is new.
+    target: Option<import_symbols::ImportTarget>,
+}
+
+/// Said when something waits for an import that is running.
+const IMPORT_RUNNING: &str = "An import is running; wait until it is done.";
+
+/// The actions that do not change the project, its folder or which project is open: the only
+/// ones carried out while an import runs.
+fn allowed_while_importing(a: Action) -> bool {
+    matches!(
+        a,
+        Action::ZoomIn
+            | Action::ZoomOut
+            | Action::ZoomFit
+            | Action::ToggleGrid
+            | Action::ToggleTheme
+            | Action::ToggleChrome
+            | Action::Layers
+            | Action::Assistant
+            | Action::RequestFunction
+            | Action::ReportMissing
+    )
+}
+
+/// The view controls shown in the import window: while it is up the window takes every click,
+/// so the toolbar's own are out of reach. All are [`allowed_while_importing`].
+const IMPORT_VIEW_CONTROLS: &[Action] = &[
+    Action::ZoomIn,
+    Action::ZoomOut,
+    Action::ZoomFit,
+    Action::ToggleGrid,
+    Action::ToggleTheme,
+    Action::Layers,
+];
 
 /// Make a new project's folder a repository with its first version.
 fn record_new_project(dir: &std::path::Path) -> Result<(), wc_vcs::Error> {
@@ -308,8 +378,34 @@ enum Pending {
     Export(Export),
     Marking(wc_report::MarkingOptions),
     ReportCsv(wc_report::Kind),
+    /// File > Import; for parts, the library folder picked in the dialog (none: ask with the
+    /// folder picker).
+    Import(imports::Kind, Option<import_symbols::ImportTarget>),
     /// The WAGO configurator's article list to read back.
     WagoList,
+    /// The panel layout's footprint drawing or 3D model for this part.
+    Attach(panels::Attach, String),
+}
+
+/// Queue the picker `p` for the project in `dir` unless another waits: false when one does.
+fn queue_pending(
+    pending: &mut Option<Pending>,
+    pending_for: &mut Option<PathBuf>,
+    p: Pending,
+    dir: Option<PathBuf>,
+) -> bool {
+    if pending.is_some() {
+        return false;
+    }
+    *pending = Some(p);
+    *pending_for = dir;
+    true
+}
+
+/// Whether a picker queued while `asked_for` was open may still be shown with `now` open:
+/// Open project always, the others only for the same project.
+fn pending_applies(p: &Pending, asked_for: Option<&Path>, now: Option<&Path>) -> bool {
+    matches!(p, Pending::Open) || asked_for == now
 }
 
 /// The whole-project exports that ask where to go.
@@ -594,6 +690,7 @@ impl App {
             strip_editor: None,
             live: Default::default(),
             fetch: None,
+            importing: None,
         };
         let dir = dir.or_else(|| prefs.recent.first().cloned());
         if let Some(d) = dir {
@@ -604,6 +701,11 @@ impl App {
     }
 
     fn open_dir(&mut self, dir: &std::path::Path, prefs: &mut Prefs) {
+        // The import writes to the open project's folder and is taken into it when it ends.
+        if self.importing.is_some() {
+            self.dialog = Some(Dialog::Message(format!("The project was not opened: {IMPORT_RUNNING}")));
+            return;
+        }
         let dir = &match prefs::absolute(dir) {
             Ok(d) => d,
             Err(e) => {
@@ -666,7 +768,9 @@ impl App {
     /// Why Save as cannot be done now, checked again when its dialog would open: the assistant
     /// can start a command or a session can start between the action and its dialog.
     fn save_as_refused(&self) -> Option<&'static str> {
-        if self.share.active() {
+        if self.importing.is_some() {
+            Some(IMPORT_RUNNING)
+        } else if self.share.active() {
             Some(
                 "Save as is not available in a shared session: it would end the session. Stop sharing (or leave) first.",
             )
@@ -712,9 +816,18 @@ impl App {
             }
             return;
         }
+        if let Pending::Import(kind, target) = p {
+            self.import(kind, target);
+            return;
+        }
         let Some(open) = self.open.as_mut() else { return };
         match p {
-            Pending::Open => {}
+            Pending::Open | Pending::Import(..) => {}
+            Pending::Attach(kind, part) => match attach_target(kind, &part, &open.dir, &pick_open) {
+                Some(Ok(file)) => self.ed.message = kind.apply(open, &part, &file),
+                Some(Err(form)) => self.dialog = Some(form),
+                None => {}
+            },
             Pending::SaveAs => {
                 let parent = open
                     .dir
@@ -834,6 +947,208 @@ impl App {
         }
     }
 
+    /// File > Import: pick the file (and, for parts, the library folder), then run the import
+    /// the CLI runs and show what it said.
+    fn import(&mut self, kind: imports::Kind, target: Option<import_symbols::ImportTarget>) {
+        if let Some(why) = self.import_refused() {
+            self.dialog = Some(Dialog::Message(why.to_owned()));
+            return;
+        }
+        let Some(open) = self.open.as_ref() else { return };
+        let typed = |file: String, why: String| Dialog::ImportPath {
+            kind,
+            target: target.clone(),
+            file: prefs::FolderField::typed(file),
+            lib: prefs::FolderField::default(),
+            error: Some(why),
+        };
+        let file = match pick_open(kind.title(), &open.dir, kind.filter()) {
+            Picked::Path(f) => f,
+            // Without a picker (or perhaps one that never showed) the path can still be typed.
+            Picked::Failed(e) | Picked::Unsure(e) => {
+                self.dialog = Some(typed(String::new(), e));
+                return;
+            }
+            Picked::Cancelled => return,
+        };
+        let lib = if let Some(t) = target.as_ref().filter(|_| kind.needs_library()) {
+            Some(t.root.clone())
+        } else if kind.needs_library() {
+            let start = open.dir.display().to_string();
+            match pick_folder("Library folder for the imported parts", &start) {
+                Picked::Path(d) => Some(d),
+                Picked::Failed(e) | Picked::Unsure(e) => {
+                    self.dialog = Some(typed(file.display().to_string(), e));
+                    return;
+                }
+                Picked::Cancelled => return,
+            }
+        } else {
+            None
+        };
+        self.import_from(kind, &file, lib.as_deref(), target);
+    }
+
+    /// Why an import cannot run now: it writes to the project folder, which a shared session or
+    /// a running assistant command owns.
+    fn import_refused(&self) -> Option<&'static str> {
+        if self.importing.is_some() {
+            Some(IMPORT_RUNNING)
+        } else if self.assistant.busy() {
+            // Its turn's undo step would take the import's in with it.
+            Some("The assistant is working on the project; import when it is done.")
+        } else if self.share.active() {
+            Some("Imports are not available in a shared session: leave the session, import, and share again.")
+        } else if self.assistant.command_running() {
+            Some("The assistant is running a command on the project; import when it is done.")
+        } else {
+            None
+        }
+    }
+
+    /// Start the import of `file` (parts into `lib`) on a worker thread; [`App::poll_import`]
+    /// shows what it says while it runs and takes the result in when it ends. `target` is the
+    /// library folder chosen in the parts dialog, declared in the project when it is new.
+    fn import_from(
+        &mut self,
+        kind: imports::Kind,
+        file: &Path,
+        lib: Option<&Path>,
+        target: Option<import_symbols::ImportTarget>,
+    ) {
+        // Checked again here: the typed path form stays open while a session or a command starts.
+        if let Some(why) = self.import_refused() {
+            self.dialog = Some(Dialog::Message(why.to_owned()));
+            return;
+        }
+        let Some(open) = self.open.as_mut() else { return };
+        applog::info(&format!("import {kind:?} {}", file.display()));
+        let job = imports::start(open, kind, file, lib, self.ed.page);
+        // Nothing half done is left: a tool's preview, a wire being drawn.
+        self.ed.wire = None;
+        self.ed.shape_points.clear();
+        self.dialog = None;
+        self.importing = Some(Importing {
+            job,
+            kind,
+            file: file.to_path_buf(),
+            lib: lib.map(Path::to_path_buf),
+            target,
+        });
+    }
+
+    /// The import that runs: take its result in once the worker has ended (one Undo step, and
+    /// the message of what it said), else ask for the next frame to look again.
+    fn poll_import(&mut self, ctx: &egui::Context) {
+        let Some(running) = self.importing.as_ref() else { return };
+        let Some((r, log)) = running.job.poll() else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        };
+        let Some(running) = self.importing.take() else { return };
+        self.end_import(running, r, &log);
+    }
+
+    /// Take an ended import's result into the project it was started on.
+    fn end_import(&mut self, running: Importing, r: wc_import::run::Res<()>, log: &wc_import::run::Log) {
+        let Importing {
+            job,
+            kind,
+            file,
+            lib,
+            target,
+        } = running;
+        // Opening another project is refused while it runs; should it be gone all the same, the
+        // result is not taken into another one.
+        let Some(open) = self.open.as_mut().filter(|o| o.dir == job.dir) else {
+            self.dialog = Some(Dialog::Message(format!(
+                "The import of {} ended, but the project it was for ({}) is no longer open: open it again to see what it holds.",
+                job.name,
+                job.dir.display()
+            )));
+            return;
+        };
+        let (done, msg) = job.finish(open, r, log);
+        // The project's own folder is listed first once parts are in it, as for symbols; so is
+        // a new folder chosen outside the library list.
+        let source = match (target, lib.as_deref()) {
+            (Some(t), _) => t.declare,
+            (None, Some(l)) if kind.needs_library() => new_folder_source(&open.dir, l, &open.project.meta.libraries),
+            (None, _) => None,
+        };
+        if done && let Some(source) = source {
+            open.checkpoint();
+            open.project.meta.libraries.insert(0, source);
+            open.dirty = true;
+            open.refresh_library();
+        }
+        applog::info(&format!("import {kind:?} {} ended", file.display()));
+        self.prune_selection();
+        self.dialog = Some(Dialog::Message(msg));
+    }
+
+    /// While an import runs: a window with what it has said so far, over the editor, which
+    /// takes no clicks until the import is done. The window takes the clicks for everything
+    /// under it, so the view controls that still work ([`IMPORT_VIEW_CONTROLS`]) and the layer
+    /// list are shown in it.
+    fn import_window(&mut self, ctx: &egui::Context) {
+        let Some(running) = self.importing.as_ref() else { return };
+        let lines = running.job.lines();
+        let name = running.job.name.clone();
+        let mut actions = Vec::new();
+        let mut layers_changed = false;
+        egui::Modal::new(egui::Id::new("importing")).show(ctx, |ui| {
+            ui.set_width(520.0);
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.strong(format!("Importing {name}…"));
+            });
+            ui.label("The project can be edited again when the import is done.");
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .max_height(260.0)
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    if lines.is_empty() {
+                        ui.weak("Reading the file…");
+                    }
+                    for line in &lines {
+                        ui.label(RichText::new(line).monospace());
+                    }
+                });
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.weak("View:");
+                for a in IMPORT_VIEW_CONTROLS {
+                    let info = a.info();
+                    let on = *a == Action::Layers && self.show_layers;
+                    if ui.selectable_label(on, info.label).on_hover_text(info.tip).clicked() {
+                        actions.push(*a);
+                    }
+                }
+            });
+            if self.show_layers {
+                ui.separator();
+                layers_changed = self.prefs.layers.ui(ui);
+            }
+        });
+        if layers_changed {
+            self.layers_changed();
+        }
+        for a in actions {
+            self.run(a);
+        }
+    }
+
+    /// Closing the window would stop the import half way through writing the project folder:
+    /// while one runs, a close that was asked for is called off.
+    fn hold_close_while_importing(&mut self, ctx: &egui::Context) {
+        if self.importing.is_some() && ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.ed.message = format!("The window was not closed: {IMPORT_RUNNING}");
+        }
+    }
+
     /// Carry out an action. A picker it asks for waits until the frame's actions have run; while
     /// one waits, another is not taken (the first stays and the action says so).
     fn run(&mut self, a: Action) {
@@ -855,19 +1170,37 @@ impl App {
 
     /// Show the picker that waits, if it is still for the project open now.
     fn ask_pending(&mut self) {
+        // A picker asked for before the import started waits until it is done.
+        if self.importing.is_some() {
+            return;
+        }
         let Some(p) = self.pending.take() else { return };
         let asked_for = self.pending_for.take();
         let now = self.open.as_ref().map(|o| o.dir.clone());
-        if !matches!(p, Pending::Open) && asked_for != now {
+        if !pending_applies(&p, asked_for.as_deref(), now.as_deref()) {
             self.ed.message = "The file dialog was not shown: another project was opened before it could.".into();
             return;
         }
         self.ask(p);
     }
 
+    /// Queue the picker `p` from a dialog, for the project open now, as [`App::run`] does for an
+    /// action; a picker already waiting stays and this one is not taken.
+    fn queue(&mut self, p: Pending) {
+        let dir = self.open.as_ref().map(|o| o.dir.clone());
+        if !queue_pending(&mut self.pending, &mut self.pending_for, p, dir) {
+            self.ed.message = "Not done: another file dialog is waiting to open; try again after it.".into();
+        }
+    }
+
     fn carry_out(&mut self, a: Action) {
         let page = self.ed.page;
         applog::info(&format!("command {a:?}"));
+        // The import owns the project folder until its result is taken in.
+        if self.importing.is_some() && !allowed_while_importing(a) {
+            self.ed.message = format!("{} was not done: {IMPORT_RUNNING}", a.info().label);
+            return;
+        }
         if let Some(name) = self.open.as_ref().and_then(|o| held_for(a, &self.ed, &o.project)) {
             self.ed.message = format!("{name} has this page open; it is read-only here until they leave it.");
             return;
@@ -1331,6 +1664,31 @@ impl App {
             }
             Action::InsertMacro => self.dialog = Some(Dialog::Macros(open.macros())),
             Action::ExportDrawings => self.pending = Some(Pending::Export(Export::Drawings)),
+            a if imports::Kind::of(a).is_some() => {
+                if let Some(kind) = imports::Kind::of(a) {
+                    match kind
+                        .needs_library()
+                        .then(|| wc_library::Library::open(&open.dir, &open.project))
+                    {
+                        Some(Ok(lib)) => {
+                            self.dialog = Some(Dialog::ImportParts {
+                                kind,
+                                targets: library_targets(&lib, open),
+                                chosen: 0,
+                            });
+                        }
+                        // Without the project's library list the folder picker asks instead,
+                        // and the status line says why the list is not offered.
+                        Some(Err(e)) => {
+                            self.ed.message = format!(
+                                "The project's libraries could not be read ({e}); pick the library folder for the parts."
+                            );
+                            self.pending = Some(Pending::Import(kind, None));
+                        }
+                        None => self.pending = Some(Pending::Import(kind, None)),
+                    }
+                }
+            }
             Action::ExportAml => self.pending = Some(Pending::Export(Export::Aml)),
             Action::ExportWagoMarking => {
                 let strip = self.ed.marking_strip.take();
@@ -1393,17 +1751,7 @@ impl App {
             Action::ImportSymbols => match wc_library::Library::open(&open.dir, &open.project) {
                 Ok(lib) => {
                     self.dialog = Some(Dialog::ImportSymbols {
-                        targets: import_symbols::targets(
-                            &open.dir,
-                            folder_targets(&lib, open),
-                            &open
-                                .project
-                                .meta
-                                .libraries
-                                .iter()
-                                .map(|l| l.name.clone())
-                                .collect::<Vec<_>>(),
-                        ),
+                        targets: library_targets(&lib, open),
                         chosen: 0,
                         replace: false,
                     });
@@ -1544,6 +1892,9 @@ impl App {
             Dialog::Macros(_) => "Insert macro",
             Dialog::MacroEdit { .. } => "Macro placeholders",
             Dialog::ImportSymbols { .. } => "Import symbols",
+            Dialog::ImportParts { .. } => "Import parts",
+            Dialog::ImportPath { .. } => "Import",
+            Dialog::AttachPath { kind, .. } => kind.title(),
             Dialog::Report { .. } => "Report a problem",
             Dialog::WagoMarking { .. } => "WAGO marking",
         };
@@ -1605,7 +1956,7 @@ impl App {
                         if ui
                             .add_enabled(!name.trim().is_empty(), egui::Button::new("Save"))
                             .clicked()
-                            && let Some(open) = &self.open
+                            && let Some(open) = &mut self.open
                         {
                             match open.save_macro(clip, name, description) {
                                 Ok(path) => {
@@ -1697,18 +2048,28 @@ impl App {
                     ui.separator();
                     ui.horizontal(|ui| {
                         if ui.button("Save").clicked() {
-                            match form.save() {
-                                Ok(path) => {
-                                    then = Some(Box::new(move |app: &mut App| {
+                            // Saved through the project, so the save is one undo step.
+                            let form = form.clone();
+                            then = Some(Box::new(move |app: &mut App| {
+                                let Some(open) = app.open.as_mut() else {
+                                    return;
+                                };
+                                let saved = if app.share.active() {
+                                    Err(Open::MACRO_SAVE_SHARED.to_owned())
+                                } else {
+                                    open.save_macro_form(&form)
+                                };
+                                match saved {
+                                    Ok(path) => {
                                         app.ed.message = format!("Saved macro {}", path.display());
-                                        if let Some(open) = &app.open {
-                                            app.dialog = Some(Dialog::Macros(open.macros()));
-                                        }
-                                    }));
-                                    keep = false;
+                                        app.dialog = Some(Dialog::Macros(open.macros()));
+                                    }
+                                    Err(e) => {
+                                        app.dialog = Some(Dialog::MacroEdit { form, error: Some(e) });
+                                    }
                                 }
-                                Err(e) => *error = Some(e),
-                            }
+                            }));
+                            keep = false;
                         }
                         if ui.button("Cancel").clicked() {
                             then = Some(Box::new(|app: &mut App| {
@@ -2941,6 +3302,106 @@ impl App {
                         }
                     });
                 }
+                Dialog::ImportPath {
+                    kind,
+                    target,
+                    file,
+                    lib,
+                    error,
+                } => {
+                    ui.label(kind.title());
+                    let (label, extensions) = kind.filter();
+                    ui.label(format!("File ({label}: .{}), full path:", extensions.join(", .")));
+                    let r = ui.add(egui::TextEdit::singleline(&mut file.text).desired_width(380.0));
+                    let ask_lib = kind.needs_library() && target.is_none();
+                    if ask_lib {
+                        ui.label("Library folder for the parts:");
+                        ui.add(egui::TextEdit::singleline(&mut lib.text).desired_width(380.0));
+                    }
+                    if let Some(e) = error {
+                        ui.label(RichText::new(e.as_str()).color(theme::Theme::of(ui.ctx()).error));
+                    }
+                    ui.horizontal(|ui| {
+                        let go = ui.button("Import").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)));
+                        if go {
+                            let folder = typed_library(ask_lib, lib);
+                            match file.path().and_then(|f| folder.map(|l| (f, l))) {
+                                Ok((f, _)) if !f.is_file() => *error = Some(format!("{} is not a file.", f.display())),
+                                Ok((f, l)) => {
+                                    let (kind, target) = (*kind, target.clone());
+                                    let l = l.or_else(|| target.as_ref().map(|t| t.root.clone()));
+                                    then = Some(Box::new(move |app: &mut App| {
+                                        app.import_from(kind, &f, l.as_deref(), target);
+                                    }));
+                                    keep = false;
+                                }
+                                Err(e) => *error = Some(e),
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                }
+                Dialog::AttachPath {
+                    kind,
+                    part,
+                    file,
+                    error,
+                } => {
+                    let (label, extensions) = kind.filter();
+                    ui.label(format!("{} for {part}", kind.title()));
+                    ui.label(format!("File ({label}: .{}), full path:", extensions.join(", .")));
+                    let r = ui.add(egui::TextEdit::singleline(&mut file.text).desired_width(380.0));
+                    if let Some(e) = error {
+                        ui.label(RichText::new(e.as_str()).color(theme::Theme::of(ui.ctx()).error));
+                    }
+                    ui.horizontal(|ui| {
+                        let go = ui.button("Attach").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)));
+                        if go {
+                            match typed_file(file) {
+                                Ok(f) => {
+                                    let (kind, part) = (*kind, part.clone());
+                                    then = Some(Box::new(move |app: &mut App| {
+                                        if let Some(open) = app.open.as_mut() {
+                                            app.ed.message = kind.apply(open, &part, &f);
+                                        }
+                                    }));
+                                    keep = false;
+                                }
+                                Err(e) => *error = Some(e),
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                }
+                Dialog::ImportParts { kind, targets, chosen } => {
+                    ui.label(kind.title());
+                    ui.horizontal(|ui| {
+                        ui.label("Library folder");
+                        let other = "Another folder…".to_owned();
+                        let shown = |k: usize| targets.get(k).map_or_else(|| other.clone(), |t| t.label());
+                        egui::ComboBox::from_id_salt("import_parts_lib")
+                            .selected_text(shown(*chosen))
+                            .show_ui(ui, |ui| {
+                                for k in 0..=targets.len() {
+                                    ui.selectable_value(chosen, k, shown(k));
+                                }
+                            });
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Choose the file and import…").clicked() {
+                            let pending = Pending::Import(*kind, targets.get(*chosen).cloned());
+                            then = Some(Box::new(move |app: &mut App| app.queue(pending)));
+                            keep = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                }
                 Dialog::ImportSymbols {
                     targets,
                     chosen,
@@ -3290,6 +3751,7 @@ impl App {
         // The new project waits until they are done, and Cancel is no longer offered.
         if self.assistant.busy()
             || self.assistant.command_running()
+            || self.importing.is_some()
             || self.symbol_editor.is_some()
             || self.strip_editor.is_some()
             || self.dialog.as_ref().is_some_and(|d| !matches!(d, Dialog::Fetching(_)))
@@ -3533,6 +3995,35 @@ fn pick_open(title: &str, dir: &Path, filter: (&str, &[&str])) -> Picked {
     picker_outcome(r, shown.elapsed(), &applog::take_picker_errors())
 }
 
+/// A file picker: [`pick_open`], or a stand-in for it in tests.
+type PickOpen<'a> = &'a dyn Fn(&str, &Path, (&str, &[&str])) -> Picked;
+
+/// The file to attach as `kind` to `part`, asked for with the file picker `pick` opening in
+/// `dir`: the file, or where no picker can open (or one perhaps never showed) the form to type
+/// its path in, with why; `None` when the person cancelled.
+fn attach_target(kind: panels::Attach, part: &str, dir: &Path, pick: PickOpen<'_>) -> Option<Result<PathBuf, Dialog>> {
+    match pick(kind.title(), dir, kind.filter()) {
+        Picked::Path(f) => Some(Ok(f)),
+        Picked::Failed(e) | Picked::Unsure(e) => Some(Err(Dialog::AttachPath {
+            kind,
+            part: part.to_owned(),
+            file: prefs::FolderField::default(),
+            error: Some(format!("{e} Type the file's path instead.")),
+        })),
+        Picked::Cancelled => None,
+    }
+}
+
+/// The file typed in a path form, when it is one.
+fn typed_file(field: &prefs::FolderField) -> Result<PathBuf, String> {
+    let f = field.path()?;
+    match std::fs::metadata(&f) {
+        Ok(m) if m.is_file() => Ok(f),
+        Ok(_) => Err(format!("{} is not a file.", f.display())),
+        Err(e) => Err(format!("{}: {e}", f.display())),
+    }
+}
+
 /// A save dialog: [`pick_save`], or a stand-in for it in tests.
 type PickSave<'a> = &'a dyn Fn(&str, &Path, &str, Option<(&str, &[&str])>) -> Picked;
 
@@ -3705,6 +4196,73 @@ fn main_viewport() -> egui::ViewportBuilder {
         .with_min_inner_size([900.0, 560.0])
         .with_title("WiringCraft")
         .with_icon(window_icon())
+}
+
+/// The library folder typed into the import form, when the form asks for one: a blank field is
+/// refused rather than taken as the projects folder.
+fn typed_library(ask: bool, field: &prefs::FolderField) -> Result<Option<PathBuf>, String> {
+    if !ask {
+        Ok(None)
+    } else if field.is_empty() {
+        Err("Type the library folder for the parts.".to_owned())
+    } else {
+        field.path().map(Some)
+    }
+}
+
+/// The source to add to the project for a parts folder chosen outside its library list (with
+/// "Another folder…" or the folder picker): None when `folder` is already one of `declared`
+/// (compared as given and as canonical paths). Its name is the folder's name, made unique
+/// among `declared`, since library proposals find their destination by name.
+fn new_folder_source(
+    project_dir: &Path,
+    folder: &Path,
+    declared: &[wc_core::project::LibrarySource],
+) -> Option<wc_core::project::LibrarySource> {
+    let same = |a: &Path, b: &Path| {
+        a == b
+            || matches!(
+                (a.canonicalize(), b.canonicalize()),
+                (Ok(x), Ok(y)) if x == y
+            )
+    };
+    let listed = declared.iter().any(|d| {
+        d.kind == "folder" && {
+            let at = Path::new(&d.location);
+            let at = if at.is_absolute() {
+                at.to_path_buf()
+            } else {
+                project_dir.join(at)
+            };
+            same(&at, folder)
+        }
+    });
+    if listed {
+        return None;
+    }
+    let base = folder
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "parts".to_owned());
+    let taken = |n: &str| declared.iter().any(|d| d.name == n);
+    let name = std::iter::once(base.clone())
+        .chain((2..).map(|k| format!("{base}-{k}")))
+        .find(|n| !taken(n))
+        .unwrap_or(base);
+    Some(wc_core::project::LibrarySource {
+        name,
+        kind: "folder".into(),
+        location: folder.display().to_string(),
+        reference: None,
+    })
+}
+
+/// Where imported symbols or parts can go: the project's own library folder first, then its
+/// other library folders ([`import_symbols::targets`]).
+fn library_targets(lib: &wc_library::Library, open: &Open) -> Vec<import_symbols::ImportTarget> {
+    let taken: Vec<String> = open.project.meta.libraries.iter().map(|l| l.name.clone()).collect();
+    import_symbols::targets(&open.dir, folder_targets(lib, open), &taken)
 }
 
 /// The project's library folders that symbols can be written into, in the project's order (the
@@ -4332,6 +4890,7 @@ fn export_drawings_to(open: &Open, dir: &Path) -> String {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.hold_close_while_importing(ctx);
         // The last edit is done: jumpers follow their terminals before anything shows or copies them.
         if let Some(o) = self.open.as_mut() {
             o.follow_terminals();
@@ -4351,7 +4910,13 @@ impl eframe::App for App {
         }
         let mut actions = chrome::show(ctx, self.prefs.chrome, &mut self.chrome, &status);
         let keys = self.shortcuts(ctx);
-        actions.extend(self.route_to_symbol_editor(keys));
+        // While an import runs no key edits the symbol being drawn either: the keys go to the
+        // actions, which wait for the import.
+        if self.importing.is_some() {
+            actions.extend(keys);
+        } else {
+            actions.extend(self.route_to_symbol_editor(keys));
+        }
         for a in actions {
             self.run(a);
         }
@@ -4362,6 +4927,7 @@ impl eframe::App for App {
         }
         self.live_check(ctx);
         self.poll_fetch(ctx);
+        self.poll_import(ctx);
         self.log_messages();
         self.assistant_poll(ctx);
         self.ask_pending();
@@ -4452,6 +5018,11 @@ impl eframe::App for App {
         for a in page_actions {
             self.run(a);
         }
+        // The picker opens on the next frame, outside the panel that asked for it.
+        if let Some((kind, part)) = self.ed.ask_attach.take() {
+            self.queue(Pending::Attach(kind, part));
+            ctx.request_repaint();
+        }
         if let Some(at) = self.ed.ask_text.take() {
             self.dialog = Some(Dialog::Text(at, String::new(), false));
         }
@@ -4485,12 +5056,18 @@ impl eframe::App for App {
             });
         }
         self.dialogs(ctx);
-        self.share
-            .windows(ctx, self.open.as_mut(), self.assistant.command_running());
-        self.symbol_editor_window(ctx);
-        self.find_window(ctx);
-        self.layers_window(ctx);
-        self.strip_editor_window(ctx);
+        // While an import runs, the windows that edit the project, a library or the session
+        // wait (they show again when it is done), not only behind the import window.
+        if self.importing.is_none() {
+            self.share
+                .windows(ctx, self.open.as_mut(), self.assistant.command_running());
+            self.symbol_editor_window(ctx);
+            self.find_window(ctx);
+            self.strip_editor_window(ctx);
+            self.layers_window(ctx);
+        }
+        // The import window shows the layer list itself: it takes the clicks for any other.
+        self.import_window(ctx);
         self.sync_session(ctx);
 
         let title = match &self.open {
@@ -5377,6 +5954,29 @@ mod picker_tests {
     use super::*;
 
     #[test]
+    fn a_queued_parts_picker_is_for_its_project_and_dropped_after_a_switch() {
+        let (mut pending, mut pending_for) = (None, None);
+        let a = PathBuf::from("a");
+        let parts = Pending::Import(imports::Kind::PartsCsv, None);
+        assert!(queue_pending(&mut pending, &mut pending_for, parts, Some(a.clone())));
+        // The first picker stays while it waits.
+        assert!(!queue_pending(
+            &mut pending,
+            &mut pending_for,
+            Pending::Open,
+            Some(a.clone())
+        ));
+        let Some(p) = pending.take() else {
+            unreachable!("the parts picker was not queued");
+        };
+        assert!(matches!(p, Pending::Import(imports::Kind::PartsCsv, None)));
+        assert!(pending_applies(&p, pending_for.as_deref(), Some(a.as_path())));
+        assert!(!pending_applies(&p, pending_for.as_deref(), Some(Path::new("b"))));
+        assert!(!pending_applies(&p, pending_for.as_deref(), None));
+        assert!(pending_applies(&Pending::Open, None, Some(Path::new("b"))));
+    }
+
+    #[test]
     fn a_picker_that_never_showed_says_so_instead_of_doing_nothing() {
         use std::time::Duration;
         let d = PathBuf::from("/x");
@@ -5504,6 +6104,70 @@ mod marking_tests {
         let msg = export_whole(&o, Export::Aml, &failed).unwrap();
         assert!(msg.contains("So it goes to the usual place"), "{msg}");
         assert!(usual.is_file());
+    }
+
+    #[test]
+    fn attaching_a_footprint_or_model_without_a_file_picker_offers_a_typed_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // The picker is asked for the kind of file each button attaches, in the project folder.
+        let seen = std::cell::RefCell::new(Vec::new());
+        let failed = |title: &str, at: &Path, filter: (&str, &[&str])| {
+            seen.borrow_mut()
+                .push((title.to_owned(), at.to_path_buf(), filter.1.to_vec().join(",")));
+            Picked::Failed("The file picker could not open.".into())
+        };
+        for kind in [panels::Attach::Footprint, panels::Attach::Model] {
+            // Without a picker the form to type the path opens, with the reason and for the part.
+            let Some(Err(Dialog::AttachPath {
+                kind: k,
+                part,
+                file,
+                error,
+            })) = attach_target(kind, "io.8", dir, &failed)
+            else {
+                unreachable!("no typed path form");
+            };
+            assert_eq!((k, part.as_str(), file.text.as_str()), (kind, "io.8", ""));
+            let error = error.unwrap_or_default();
+            assert!(
+                error.contains("could not open") && error.contains("Type the file's path"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            *seen.borrow(),
+            [
+                ("Footprint drawing".to_owned(), dir.to_path_buf(), "dxf".to_owned()),
+                ("3D model".to_owned(), dir.to_path_buf(), "step,stp,STEP,STP".to_owned()),
+            ]
+        );
+        // A picker that perhaps never showed offers the form too.
+        let unsure = |_: &str, _: &Path, _: (&str, &[&str])| Picked::Unsure("At once.".into());
+        assert!(matches!(
+            attach_target(panels::Attach::Model, "io.8", dir, &unsure),
+            Some(Err(Dialog::AttachPath { .. }))
+        ));
+        // A picked file is attached; Cancel does nothing.
+        let dxf = dir.join("io-8.dxf");
+        let picked = |_: &str, _: &Path, _: (&str, &[&str])| Picked::Path(dxf.clone());
+        assert!(matches!(
+            attach_target(panels::Attach::Footprint, "io.8", dir, &picked),
+            Some(Ok(f)) if f == dxf
+        ));
+        let cancel = |_: &str, _: &Path, _: (&str, &[&str])| Picked::Cancelled;
+        assert!(attach_target(panels::Attach::Footprint, "io.8", dir, &cancel).is_none());
+
+        // The typed path must name a file.
+        let typed = prefs::FolderField::typed(dxf.display().to_string());
+        // A missing file says why it cannot be read; a folder is not a file.
+        let missing = typed_file(&typed).unwrap_err();
+        assert!(missing.starts_with(&format!("{}: ", dxf.display())), "{missing}");
+        let folder = prefs::FolderField::typed(dir.display().to_string());
+        assert!(typed_file(&folder).unwrap_err().contains("is not a file"));
+        std::fs::write(&dxf, "0\nEOF\n").unwrap();
+        assert_eq!(typed_file(&typed), Ok(dxf.clone()));
+        assert!(typed_file(&prefs::FolderField::default()).is_err());
     }
 
     #[test]
@@ -5884,5 +6548,44 @@ mod held_tests {
         // The panel was removed.
         follow_panel_pick(&mut ed, &project, "gone", k1.as_ref());
         assert_eq!((ed.panel, ed.panel_pick), (None, None));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod import_folder_tests {
+    use super::*;
+
+    #[test]
+    fn a_blank_library_field_is_refused_not_taken_as_the_projects_folder() {
+        let blank = prefs::FolderField::typed("  ".to_owned());
+        assert!(typed_library(true, &blank).is_err());
+        // Not asked: the field is not read at all.
+        assert_eq!(typed_library(false, &blank), Ok(None));
+        let typed = prefs::FolderField::typed("parts".to_owned());
+        assert!(matches!(typed_library(true, &typed), Ok(Some(_))));
+    }
+
+    #[test]
+    fn a_new_folder_chosen_for_parts_is_declared_and_a_listed_one_is_not() {
+        let t = tempfile::tempdir().unwrap();
+        let project = t.path().join("proj");
+        let listed = project.join("library");
+        let other = t.path().join("vendor");
+        std::fs::create_dir_all(&listed).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let declared = vec![wc_core::project::LibrarySource {
+            name: "vendor".into(),
+            kind: "folder".into(),
+            location: "library".into(),
+            reference: None,
+        }];
+        // Listed already (relative to the project): nothing to add.
+        assert_eq!(new_folder_source(&project, &listed, &declared), None);
+        // New: added as a folder source, its name made unique among the declared ones.
+        let got = new_folder_source(&project, &other, &declared).unwrap();
+        assert_eq!(got.kind, "folder");
+        assert_eq!(got.name, "vendor-2");
+        assert_eq!(Path::new(&got.location), other.as_path());
     }
 }

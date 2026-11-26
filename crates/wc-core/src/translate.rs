@@ -156,6 +156,120 @@ impl Dictionary {
     }
 }
 
+/// Set the translation of `text` (in the source language) into `lang` in the project folder's
+/// `translations.toml`, or remove it when `translation` is blank. The other translations in
+/// the file stay as they were. Returns whether the file changed. One language code is
+/// required, and not the source language: its texts are the project's.
+///
+/// Calls made at the same time (the command line and the assistant, say) take turns: each
+/// holds the project folder's [`TRANSLATIONS_LOCK`] from reading the file until its write is
+/// in place, so the next one reads that write and keeps it. A program that writes the file
+/// without that lock (an editor, say) is not kept out: when its change lands after this call
+/// read the file and before this call checks it again just ahead of the write, the call fails
+/// with an error that asks to try again and nothing is written. A change that lands after
+/// that check is written over without notice.
+pub fn set_translation(dir: &Path, text: &str, lang: &str, translation: &str) -> Result<bool> {
+    set_translation_checked(dir, text, lang, translation, || {}, || {})
+}
+
+/// The file next to `translations.toml` that [`set_translation`] holds locked while it reads
+/// and writes the dictionary. Its name ends in `.tmp`, so a project's git repository leaves
+/// it out.
+pub const TRANSLATIONS_LOCK: &str = "translations.toml.lock.tmp";
+
+/// The project folder's [`TRANSLATIONS_LOCK`], held until this is dropped. While one is held,
+/// [`set_translation`] and other holders in any process wait for it, so a read of
+/// `translations.toml`, a change and its save made under it are not interleaved with theirs.
+#[derive(Debug)]
+#[must_use = "the lock is let go as soon as this is dropped"]
+pub struct TranslationsLock {
+    _file: std::fs::File,
+}
+
+/// Take the project folder's [`TRANSLATIONS_LOCK`], waiting while another call or process
+/// holds it. Hold the returned lock from reading `translations.toml` until its new contents
+/// are saved (the translations form does this), so a [`set_translation`] made at the same
+/// moment comes before or after, and neither edit is lost.
+pub fn lock_translations(dir: &Path) -> Result<TranslationsLock> {
+    lock_translations_file(dir).map(|file| TranslationsLock { _file: file })
+}
+
+/// Lock the project folder's [`TRANSLATIONS_LOCK`] for this process alone, waiting while
+/// another holds it. The lock is let go when the returned file is closed.
+fn lock_translations_file(dir: &Path) -> Result<std::fs::File> {
+    std::fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
+    let path = dir.join(TRANSLATIONS_LOCK);
+    // A link left at the lock's name is not followed: whatever it points to stays untouched.
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_symlink()) {
+        return Err(Error::Invalid(format!(
+            "{} is a link; remove it and try again",
+            path.display()
+        )));
+    }
+    let mut open = std::fs::OpenOptions::new();
+    // Windows only locks a file opened for reading or writing, not one opened to append only.
+    open.read(true).append(true).create(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, libc::O_NOFOLLOW);
+    let file = open.open(&path).map_err(|e| Error::io(&path, e))?;
+    file.lock().map_err(|e| Error::io(&path, e))?;
+    Ok(file)
+}
+
+/// [`set_translation`], calling `meanwhile` between reading the file and checking it again,
+/// and `checked` between that check and the write (for a test to change the file there).
+fn set_translation_checked(
+    dir: &Path,
+    text: &str,
+    lang: &str,
+    translation: &str,
+    meanwhile: impl FnOnce(),
+    checked: impl FnOnce(),
+) -> Result<bool> {
+    let lang = match parse_languages(lang).as_deref() {
+        Some([one]) => one.clone(),
+        _ => {
+            return Err(Error::Invalid(format!(
+                "{:?} is not a language code: use one such as nb or de",
+                lang.trim()
+            )));
+        }
+    };
+    if text.trim().is_empty() {
+        return Err(Error::Invalid("no text to translate".into()));
+    }
+    // Held until this call returns, so no other call reads the file before this write is in.
+    let _lock = lock_translations_file(dir)?;
+    let path = dir.join(TRANSLATIONS_FILE);
+    let read = || match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Error::io(&path, e)),
+    };
+    let before = read()?;
+    let mut dict = match &before {
+        Some(t) => Dictionary::parse(t).map_err(|message| Error::Toml {
+            path: path.clone(),
+            message,
+        })?,
+        None => Dictionary::default(),
+    };
+    if lang == dict.source() {
+        return Err(Error::Invalid(format!(
+            "{lang} is the source language: its texts are the project's own"
+        )));
+    }
+    dict.set(text, &lang, translation);
+    meanwhile();
+    if read()? != before {
+        return Err(Error::Invalid(format!(
+            "{TRANSLATIONS_FILE} changed while the translation was being saved; nothing was written, try again"
+        )));
+    }
+    checked();
+    dict.save(dir)
+}
+
 /// A language code as compared: trimmed and lowercased.
 fn normalize(lang: &str) -> String {
     lang.trim().to_ascii_lowercase()
@@ -419,6 +533,141 @@ nb = ""
         assert_eq!(again.lookup("Pumps", "nb"), None);
         assert_eq!(again.lookup("Pumps", "en").as_deref(), Some("Pumps"));
         assert_eq!(again.texts.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn set_translation_writes_and_removes_one_text_in_the_file() -> R {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join(TRANSLATIONS_FILE), DICT)?;
+        assert!(set_translation(dir.path(), "Spare", "NB", "Reserve")?);
+        assert!(!set_translation(dir.path(), "Spare", "nb", "Reserve")?, "unchanged");
+        assert!(set_translation(dir.path(), "Main switch", "nb", "")?);
+        let d = Dictionary::load(dir.path())?;
+        assert_eq!(d.lookup("Spare", "nb").as_deref(), Some("Reserve"));
+        assert_eq!(d.lookup("Main switch", "nb"), None);
+        assert_eq!(d.lookup("Pumps", "nb").as_deref(), Some("Pumper"), "others are kept");
+        for (text, lang) in [("Spare", "en"), ("Spare", "nb,en"), ("Spare", ""), (" ", "nb")] {
+            assert!(
+                matches!(set_translation(dir.path(), text, lang, "x"), Err(Error::Invalid(_))),
+                "{text:?} {lang:?}"
+            );
+        }
+        // A project without a dictionary gets one.
+        let empty = tempfile::tempdir()?;
+        assert!(set_translation(empty.path(), "Pumps", "de", "Pumpen")?);
+        assert_eq!(
+            Dictionary::load(empty.path())?.lookup("Pumps", "de").as_deref(),
+            Some("Pumpen")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn set_translation_writes_nothing_when_the_file_changed_after_it_was_read() -> R {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join(TRANSLATIONS_FILE);
+        std::fs::write(&path, DICT)?;
+        let other = format!("{DICT}\n[[text]]\nen = \"Spare\"\nde = \"Ersatz\"\n");
+        let r = set_translation_checked(
+            dir.path(),
+            "Pumps",
+            "nb",
+            "Pumpene",
+            || {
+                let wrote = std::fs::write(&path, &other);
+                assert!(wrote.is_ok(), "the other writer could not write: {wrote:?}");
+            },
+            || {},
+        );
+        assert!(matches!(r, Err(Error::Invalid(m)) if m.contains("try again")));
+        // The other writer's file is left as it wrote it.
+        assert_eq!(std::fs::read_to_string(&path)?, other);
+        // Tried again, it is saved on top of the other change.
+        assert!(set_translation(dir.path(), "Pumps", "nb", "Pumpene")?);
+        let d = Dictionary::load(dir.path())?;
+        assert_eq!(d.lookup("Pumps", "nb").as_deref(), Some("Pumpene"));
+        assert_eq!(d.lookup("Spare", "de").as_deref(), Some("Ersatz"));
+        // A file made meanwhile where there was none is a change too.
+        let empty = tempfile::tempdir()?;
+        let new = empty.path().join(TRANSLATIONS_FILE);
+        let r = set_translation_checked(
+            empty.path(),
+            "Pumps",
+            "nb",
+            "Pumper",
+            || {
+                let wrote = std::fs::write(&new, "source = \"en\"\n");
+                assert!(wrote.is_ok(), "the other writer could not write: {wrote:?}");
+            },
+            || {},
+        );
+        assert!(r.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_second_set_translation_waits_for_the_first_and_keeps_both_edits() -> R {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join(TRANSLATIONS_FILE), DICT)?;
+        let at = dir.path().to_owned();
+        let mut other = None;
+        // Another set starts after this one checked the file and before it writes: it has to
+        // wait for this write instead of saving in between and being written over.
+        let first = set_translation_checked(
+            dir.path(),
+            "Pumps",
+            "nb",
+            "Pumpene",
+            || {},
+            || {
+                // The lock is held here: another handle on the lock file cannot take it.
+                let held = std::fs::File::open(at.join(TRANSLATIONS_LOCK))
+                    .map(|f| matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+                assert!(matches!(held, Ok(true)), "the lock is not held: {held:?}");
+                let t = std::thread::spawn(move || set_translation(&at, "Spare", "de", "Ersatz"));
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                other = Some((t.is_finished(), t));
+            },
+        );
+        assert!(first?);
+        let Some((finished_early, t)) = other else {
+            unreachable!("the check ran")
+        };
+        assert!(!finished_early, "the second set did not wait for the first");
+        let Ok(second) = t.join() else {
+            unreachable!("the second set panicked")
+        };
+        assert!(second?);
+        let d = Dictionary::load(dir.path())?;
+        assert_eq!(d.lookup("Pumps", "nb").as_deref(), Some("Pumpene"));
+        assert_eq!(d.lookup("Spare", "de").as_deref(), Some("Ersatz"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_change_without_the_lock_after_the_check_is_written_over() -> R {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join(TRANSLATIONS_FILE);
+        std::fs::write(&path, DICT)?;
+        let other = format!("{DICT}\n[[text]]\nen = \"Spare\"\nde = \"Ersatz\"\n");
+        // A writer that does not take the lock (an editor, say) saves after the check: the set
+        // still succeeds and its write replaces that change, as the doc comment says.
+        let r = set_translation_checked(
+            dir.path(),
+            "Pumps",
+            "nb",
+            "Pumpene",
+            || {},
+            || {
+                let wrote = std::fs::write(&path, &other);
+                assert!(wrote.is_ok(), "the other writer could not write: {wrote:?}");
+            },
+        );
+        assert!(r?);
+        let d = Dictionary::load(dir.path())?;
+        assert_eq!(d.lookup("Pumps", "nb").as_deref(), Some("Pumpene"));
+        assert_eq!(d.lookup("Spare", "de"), None, "the unlocked change is gone");
         Ok(())
     }
 

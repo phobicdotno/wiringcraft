@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::geom::Point;
 use crate::project::{Endpoint, Page, Project};
 use crate::symbol::SymbolRole;
 
@@ -18,6 +19,7 @@ pub struct Net {
     pub pins: Vec<PinRef>,
 }
 
+#[derive(Default)]
 struct Dsu {
     parent: Vec<usize>,
 }
@@ -38,6 +40,48 @@ impl Dsu {
     }
 }
 
+/// The connection graph: every node and which ones are joined.
+#[derive(Default)]
+struct Graph {
+    ids: BTreeMap<Node, usize>,
+    dsu: Dsu,
+}
+
+impl Graph {
+    fn id_of(&mut self, n: Node) -> usize {
+        let next = self.ids.len();
+        let dsu = &mut self.dsu;
+        *self.ids.entry(n).or_insert_with(|| {
+            dsu.parent.push(next);
+            next
+        })
+    }
+
+    /// Join each wire of `page` to its two ends and to its potential name. Returns each
+    /// wire's `from` node, in the page's wire order.
+    fn add_wires(&mut self, page: &Page) -> Vec<usize> {
+        let node = |e: &Endpoint| match e {
+            Endpoint::Pin { item, pin } => Node::Pin((page.id.clone(), item.clone(), pin.clone())),
+            Endpoint::Point { at } => {
+                let (x, y) = point_key(*at);
+                Node::Point(page.id.clone(), x, y)
+            }
+        };
+        let mut from = Vec::with_capacity(page.wires.len());
+        for w in &page.wires {
+            let a = self.id_of(node(&w.from));
+            let b = self.id_of(node(&w.to));
+            self.dsu.union(a, b);
+            if let Some(name) = &w.potential {
+                let p = self.id_of(Node::Potential(name.clone()));
+                self.dsu.union(a, p);
+            }
+            from.push(a);
+        }
+        from
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum Node {
     Pin(PinRef),
@@ -46,6 +90,86 @@ enum Node {
     Potential(String),
     /// Interruption points sharing a device tag.
     Link(String),
+}
+
+/// Where a free wire end is, as connectivity tells ends apart: in hundredths of a millimetre.
+/// Two free ends with the same key on one page are joined.
+fn point_key(at: Point) -> (i64, i64) {
+    ((at.x * 100.0).round() as i64, (at.y * 100.0).round() as i64)
+}
+
+/// A free wire end that would join another wire there, which it was not connected to before.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewJoin {
+    /// The index of the page in [`Project::pages`].
+    pub page: usize,
+    /// The wire whose end was on a pin and is now a free end.
+    pub wire: String,
+    /// The other wire with a free end at the same place.
+    pub other: String,
+    pub at: Point,
+}
+
+/// Which wires of `project` are connected, by wire ends that meet (on a pin or at a free point)
+/// and by potential names: (page index, wire index) to a group number. Interruption points and
+/// jumpers are left out, so wires they alone connect are in different groups.
+fn wire_groups(project: &Project) -> BTreeMap<(usize, usize), usize> {
+    let mut g = Graph::default();
+    let mut first = Vec::new();
+    for (pi, page) in project.pages.iter().enumerate() {
+        first.extend(g.add_wires(page).into_iter().enumerate().map(|(wi, a)| ((pi, wi), a)));
+    }
+    first.into_iter().map(|(w, a)| (w, g.dsu.find(a))).collect()
+}
+
+/// The free wire ends of `after` that join another wire's free end at the same place,
+/// although in `before` (the same project before the change, with the same pages and wires in
+/// the same order: a wire is known by its place in its page, as ids need not be unique) that
+/// end was on a pin and the two wires were not connected. This is what turning wire ends on
+/// pins into free ends (a black box point that is removed keeps its wires' ends where it was)
+/// must not do: it would join nets that were separate (#609). Wires that were connected
+/// already, such as two on the same pin, may still meet.
+pub fn new_point_joins(before: &Project, after: &Project) -> Vec<NewJoin> {
+    let mut groups = None;
+    let mut joins = Vec::new();
+    for (pi, (bp, ap)) in before.pages.iter().zip(&after.pages).enumerate() {
+        // Every free end of the page after: (wire index, whether that end was on a pin before,
+        // where it is).
+        type FreeEnd = (usize, bool, Point);
+        let mut at: BTreeMap<(i64, i64), Vec<FreeEnd>> = BTreeMap::new();
+        for (wi, w) in ap.wires.iter().enumerate() {
+            let was = bp.wires.get(wi);
+            for (k, end) in [&w.from, &w.to].into_iter().enumerate() {
+                let Endpoint::Point { at: p } = end else {
+                    continue;
+                };
+                let on_pin = was
+                    .map(|b| if k == 0 { &b.from } else { &b.to })
+                    .is_some_and(|e| matches!(e, Endpoint::Pin { .. }));
+                at.entry(point_key(*p)).or_default().push((wi, on_pin, *p));
+            }
+        }
+        let id = |wi: usize| ap.wires.get(wi).map_or_else(String::new, |w| w.id.clone());
+        for ends in at.values() {
+            for &(wi, on_pin, p) in ends {
+                if !on_pin {
+                    continue;
+                }
+                let groups = groups.get_or_insert_with(|| wire_groups(before));
+                let group = |i: usize| groups.get(&(pi, i)).copied();
+                let connected = |o: usize| group(wi).is_some() && group(wi) == group(o);
+                if let Some(&(other, ..)) = ends.iter().find(|(o, ..)| *o != wi && !connected(*o)) {
+                    joins.push(NewJoin {
+                        page: pi,
+                        wire: id(wi),
+                        other: id(other),
+                        at: p,
+                    });
+                }
+            }
+        }
+    }
+    joins
 }
 
 /// Every wire end on a pin of placed symbol `item` of `page`: the pin's name and its node.
@@ -80,35 +204,16 @@ pub type WireRef = (String, String);
 /// Like [`nets_linked`], and also says which net each wire belongs to (an index into the nets).
 /// A wire that touches no pin, directly or through other wires, belongs to no net.
 pub fn wire_nets(project: &Project, role: impl Fn(&str) -> Option<SymbolRole>) -> (Vec<Net>, BTreeMap<WireRef, usize>) {
-    let mut ids: BTreeMap<Node, usize> = BTreeMap::new();
-    let mut dsu = Dsu { parent: Vec::new() };
+    let mut g = Graph::default();
     let mut wire_nodes: Vec<(WireRef, usize)> = Vec::new();
-    let mut id_of = |n: Node, dsu: &mut Dsu| -> usize {
-        let next = ids.len();
-        *ids.entry(n).or_insert_with(|| {
-            dsu.parent.push(next);
-            next
-        })
-    };
     for page in &project.pages {
-        let node = |e: &Endpoint| match e {
-            Endpoint::Pin { item, pin } => Node::Pin((page.id.clone(), item.clone(), pin.clone())),
-            Endpoint::Point { at } => Node::Point(
-                page.id.clone(),
-                (at.x * 100.0).round() as i64,
-                (at.y * 100.0).round() as i64,
-            ),
-        };
-        for w in &page.wires {
-            let a = id_of(node(&w.from), &mut dsu);
-            wire_nodes.push(((page.id.clone(), w.id.clone()), a));
-            let b = id_of(node(&w.to), &mut dsu);
-            dsu.union(a, b);
-            if let Some(name) = &w.potential {
-                let p = id_of(Node::Potential(name.clone()), &mut dsu);
-                dsu.union(a, p);
-            }
-        }
+        let from = g.add_wires(page);
+        wire_nodes.extend(
+            page.wires
+                .iter()
+                .zip(from)
+                .map(|(w, a)| ((page.id.clone(), w.id.clone()), a)),
+        );
         for s in &page.symbols {
             let Some(tag) = &s.tag else { continue };
             if role(&s.symbol) != Some(SymbolRole::Interruption) {
@@ -116,10 +221,10 @@ pub fn wire_nets(project: &Project, role: impl Fn(&str) -> Option<SymbolRole>) -
             }
             // Only interruption points that are wired take part; their pins join under the tag.
             let link = Node::Link(tag.to_string());
-            let wired: Vec<usize> = wired_pins(page, &s.id).map(|(_, n)| id_of(n, &mut dsu)).collect();
+            let wired: Vec<usize> = wired_pins(page, &s.id).map(|(_, n)| g.id_of(n)).collect();
             for n in wired {
-                let l = id_of(link.clone(), &mut dsu);
-                dsu.union(n, l);
+                let l = g.id_of(link.clone());
+                g.dsu.union(n, l);
             }
         }
     }
@@ -141,18 +246,18 @@ pub fn wire_nets(project: &Project, role: impl Fn(&str) -> Option<SymbolRole>) -
                     continue;
                 }
                 let wired: Vec<(String, usize)> = wired_pins(page, &s.id)
-                    .map(|(pin, n)| (pin.to_owned(), id_of(n, &mut dsu)))
+                    .map(|(pin, n)| (pin.to_owned(), g.id_of(n)))
                     .collect();
                 for (pin, n) in wired {
-                    let l = id_of(Node::Link(format!("\u{0}jumper\u{0}{k}\u{0}{pin}")), &mut dsu);
-                    dsu.union(n, l);
+                    let l = g.id_of(Node::Link(format!("\u{0}jumper\u{0}{k}\u{0}{pin}")));
+                    g.dsu.union(n, l);
                 }
             }
         }
     }
     let mut groups: BTreeMap<usize, Net> = BTreeMap::new();
-    for (node, id) in &ids {
-        let root = dsu.find(*id);
+    for (node, id) in &g.ids {
+        let root = g.dsu.find(*id);
         let net = groups.entry(root).or_default();
         match node {
             Node::Pin(p) => net.pins.push(p.clone()),
@@ -170,7 +275,7 @@ pub fn wire_nets(project: &Project, role: impl Fn(&str) -> Option<SymbolRole>) -
     }
     let wires = wire_nodes
         .into_iter()
-        .filter_map(|(w, node)| index_of_root.get(&dsu.find(node)).map(|n| (w, *n)))
+        .filter_map(|(w, node)| index_of_root.get(&g.dsu.find(node)).map(|n| (w, *n)))
         .collect();
     (nets, wires)
 }
@@ -199,6 +304,84 @@ mod tests {
             item: item.into(),
             pin: pin.into(),
         }
+    }
+
+    #[test]
+    fn a_pin_end_made_free_where_another_free_end_is_is_a_new_join() {
+        let free = |x: f64, y: f64| Endpoint::Point { at: Point::new(x, y) };
+        let mut page = Page::new("a", "1", "");
+        page.wires = vec![
+            wire("w1", pin("b1", "IN"), pin("k1", "A1"), None),
+            wire("w2", pin("b1", "IN"), pin("k2", "A1"), None),
+            wire("w3", free(40.0, 45.0), pin("k3", "A1"), None),
+            wire("w4", pin("b1", "OUT"), pin("k4", "A1"), None),
+        ];
+        let mut before = Project::new("t");
+        before.pages = vec![page];
+        // IN (at 40, 45) and OUT (at 60, 45) are removed: their wires keep free ends there.
+        let mut after = before.clone();
+        after.pages[0].wires[0].from = free(40.0, 45.0);
+        after.pages[0].wires[1].from = free(40.0, 45.0);
+        after.pages[0].wires[3].from = free(60.0, 45.0);
+        let joins = new_point_joins(&before, &after);
+        // w1 and w2 were on the same point and still meet; w3's free end was there already.
+        let join = |wire: &str| NewJoin {
+            page: 0,
+            wire: wire.into(),
+            other: "w3".into(),
+            at: Point::new(40.0, 45.0),
+        };
+        assert_eq!(joins, vec![join("w1"), join("w2")]);
+        // Without w3 nothing new joins.
+        before.pages[0].wires.remove(2);
+        after.pages[0].wires.remove(2);
+        assert_eq!(new_point_joins(&before, &after), vec![]);
+        // Two points removed at one place (boxes on top of each other) join their wires.
+        after.pages[0].wires[2].from = free(40.0, 45.0);
+        assert_eq!(new_point_joins(&before, &after).len(), 3);
+    }
+
+    #[test]
+    fn wires_sharing_an_id_are_told_apart_by_their_place() {
+        let free = |x: f64, y: f64| Endpoint::Point { at: Point::new(x, y) };
+        let mut page = Page::new("a", "1", "");
+        // Two unrelated wires with one id (a replaced page can hold such): the second ends
+        // freely where box point A is.
+        page.wires = vec![
+            wire("w1", pin("b1", "A"), pin("k1", "A1"), None),
+            wire("w1", free(40.0, 45.0), pin("k2", "A1"), None),
+        ];
+        let mut before = Project::new("t");
+        before.pages = vec![page];
+        let mut after = before.clone();
+        after.pages[0].wires[0].from = free(40.0, 45.0);
+        let joins = new_point_joins(&before, &after);
+        assert_eq!(joins.len(), 1, "{joins:?}");
+        assert_eq!(joins[0].at, Point::new(40.0, 45.0));
+    }
+
+    #[test]
+    fn a_free_end_on_a_wire_already_connected_is_no_new_join() {
+        let free = |x: f64, y: f64| Endpoint::Point { at: Point::new(x, y) };
+        let mut page = Page::new("a", "1", "");
+        // w1 runs from box point A to C; w2 from where A is to the same C: one net already.
+        page.wires = vec![
+            wire("w1", pin("b1", "A"), pin("k1", "C"), None),
+            wire("w2", free(40.0, 45.0), pin("k1", "C"), None),
+            wire("w3", pin("b1", "B"), pin("k3", "A1"), Some("L1")),
+            wire("w4", free(60.0, 45.0), pin("k4", "A1"), Some("L1")),
+        ];
+        let mut before = Project::new("t");
+        before.pages = vec![page];
+        let mut after = before.clone();
+        after.pages[0].wires[0].from = free(40.0, 45.0);
+        // w3 and w4 carry the same potential.
+        after.pages[0].wires[2].from = free(60.0, 45.0);
+        assert_eq!(new_point_joins(&before, &after), vec![]);
+        // On another net it is refused.
+        before.pages[0].wires[1].to = pin("k2", "C");
+        after.pages[0].wires[1].to = pin("k2", "C");
+        assert_eq!(new_point_joins(&before, &after).len(), 1);
     }
 
     #[test]

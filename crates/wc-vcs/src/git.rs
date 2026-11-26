@@ -17,7 +17,26 @@ const GITIGNORE: &str = "\
 # WiringCraft temporary and generated files
 *.tmp
 /export/
+/.wiringcraft.lock
 ";
+
+/// The variable every git command this crate runs gets, naming the project folder it runs
+/// for. A wiringcraft command that git starts in turn (from a hook) on the same project sees
+/// that the command which started git already holds the project, and does not wait for it.
+pub const PARENT_PROJECT_ENV: &str = "WIRINGCRAFT_GIT_PARENT_PROJECT";
+
+/// The file in a project folder that wiringcraft commands lock so they take turns on the
+/// project. Never part of the project's history: new projects' `.gitignore` lists it, and
+/// [`Git::exclude_locally`] keeps it out of repositories whose `.gitignore` does not.
+pub const LOCK_FILE: &str = ".wiringcraft.lock";
+
+/// Where [`Git::exclude_locally`] writes the new exclude list before renaming it over `at`:
+/// beside it, named after this process so two processes never write the same file.
+pub(crate) fn exclude_scratch(at: &Path) -> PathBuf {
+    let mut name = at.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(format!(".{}.new", std::process::id()));
+    at.with_file_name(name)
+}
 
 /// A project folder's git repository.
 #[derive(Debug, Clone)]
@@ -53,6 +72,11 @@ impl Git {
             .args(args)
             .current_dir(&self.dir)
             .env("GIT_TERMINAL_PROMPT", "0")
+            .env(PARENT_PROJECT_ENV, self.full_dir())
+            // This project's repository, whatever a caller (a git hook) points git at.
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -108,6 +132,11 @@ impl Git {
             .args(args)
             .current_dir(&self.dir)
             .env("GIT_TERMINAL_PROMPT", "0")
+            .env(PARENT_PROJECT_ENV, self.full_dir())
+            // This project's repository, whatever a caller (a git hook) points git at.
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .map_err(Error::Spawn)?;
         if out.status.success() {
@@ -124,6 +153,54 @@ impl Git {
         }
     }
 
+    /// The project folder as an absolute path, for [`PARENT_PROJECT_ENV`]: git runs hooks from
+    /// the work tree, where a relative path would point somewhere else. As given when it
+    /// cannot be resolved (git then fails on the folder itself and says why).
+    fn full_dir(&self) -> PathBuf {
+        std::fs::canonicalize(&self.dir).unwrap_or_else(|_| self.dir.clone())
+    }
+
+    /// Keep `name` (a file at the top of the work tree) out of this repository's history
+    /// without changing a tracked file: listed in git's own exclude list (`info/exclude`, as
+    /// `git rev-parse --git-path` names it, so a linked work tree uses the shared one). Nothing
+    /// changes when it is listed already; the list's other lines are kept byte for byte.
+    pub fn exclude_locally(&self, name: &str) -> Result<()> {
+        let at = self.run(&["rev-parse", "--git-path", "info/exclude"])?;
+        let at = self.dir.join(at.trim_end_matches(['\r', '\n']));
+        let io = |source: std::io::Error| Error::Io {
+            path: at.display().to_string(),
+            source,
+        };
+        let mut bytes = match std::fs::read(&at) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(io(e)),
+        };
+        let line = format!("/{name}");
+        if bytes.split(|b| *b == b'\n').any(|l| l.trim_ascii() == line.as_bytes()) {
+            return Ok(());
+        }
+        if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+            bytes.push(b'\n');
+        }
+        bytes.extend_from_slice(line.as_bytes());
+        bytes.push(b'\n');
+        if let Some(parent) = at.parent() {
+            std::fs::create_dir_all(parent).map_err(io)?;
+        }
+        // Written whole to a file beside it, then renamed over it: a failed write leaves the
+        // list as it was, and a command reading it meanwhile never sees it cut short.
+        let new = exclude_scratch(&at);
+        if let Err(err) = std::fs::write(&new, bytes) {
+            let _ = std::fs::remove_file(&new);
+            return Err(io(err));
+        }
+        std::fs::rename(&new, &at).map_err(|err| {
+            let _ = std::fs::remove_file(&new);
+            io(err)
+        })
+    }
+
     pub fn is_repo(&self) -> bool {
         self.dir.join(".git").exists()
     }
@@ -133,6 +210,8 @@ impl Git {
         if !self.is_repo() {
             self.run(&["init", "-q", "-b", "main"])?;
         }
+        // Before the first commit, so a lock file there already is not recorded in it.
+        self.exclude_locally(LOCK_FILE)?;
         for (name, content) in [(".gitattributes", GITATTRIBUTES), (".gitignore", GITIGNORE)] {
             let p: &Path = &self.dir.join(name);
             if !p.exists() {

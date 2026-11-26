@@ -313,3 +313,112 @@ fn a_commit_of_some_paths_leaves_every_other_change() -> Result<()> {
     );
     Ok(())
 }
+
+fn git_out(dir: &std::path::Path, args: &[&str]) -> Result<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .map_err(|e| wc_core::Error::io("git", e))?;
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[test]
+fn init_keeps_the_lock_out_of_a_project_whose_gitignore_predates_it() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    store::create(dir, "Demo")?;
+    std::fs::write(dir.join(".gitignore"), "/target\n").map_err(|e| wc_core::Error::io("write", e))?;
+    std::fs::write(dir.join(LOCK_FILE), "").map_err(|e| wc_core::Error::io("write", e))?;
+    let git = Git::new(dir);
+    git.init()?;
+    let files = git_out(dir, &["ls-files"])?;
+    assert!(!files.contains(LOCK_FILE), "{files}");
+    assert!(git_out(dir, &["status", "--porcelain"])?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn the_exclude_list_keeps_bytes_that_are_not_utf8() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    store::create(dir, "Demo")?;
+    let git = Git::new(dir);
+    git.init()?;
+    let exclude = dir.join(".git/info/exclude");
+    let before: &[u8] = b"# mine\n/caf\xe9";
+    std::fs::write(&exclude, before).map_err(|e| wc_core::Error::io("write", e))?;
+    git.exclude_locally(LOCK_FILE)?;
+    git.exclude_locally(LOCK_FILE)?;
+    let after = std::fs::read(&exclude).map_err(|e| wc_core::Error::io("read", e))?;
+    assert_eq!(after, [before, b"\n/.wiringcraft.lock\n"].concat());
+    Ok(())
+}
+
+#[test]
+fn a_linked_worktree_leaves_the_lock_out_too() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path().join("main");
+    std::fs::create_dir(&dir).map_err(|e| wc_core::Error::io("mkdir", e))?;
+    store::create(&dir, "Demo")?;
+    // A .gitignore from before the lock existed.
+    std::fs::write(dir.join(".gitignore"), "/target\n").map_err(|e| wc_core::Error::io("write", e))?;
+    Git::new(&dir).init()?;
+    // As a repository made before the lock existed: the shared exclude list does not name it.
+    let exclude = dir.join(".git/info/exclude");
+    std::fs::write(&exclude, "# mine\n").map_err(|e| wc_core::Error::io("write", e))?;
+    let wt = tmp.path().join("wt");
+    git_out(&dir, &["worktree", "add", "-q", "-b", "side", &wt.to_string_lossy()])?;
+    std::fs::write(wt.join(LOCK_FILE), "").map_err(|e| wc_core::Error::io("write", e))?;
+    let status = git_out(&wt, &["status", "--porcelain"])?;
+    assert!(status.contains(LOCK_FILE), "untracked at first: {status}");
+    let side = Git::new(&wt);
+    side.exclude_locally(LOCK_FILE)?;
+    assert!(git_out(&wt, &["status", "--porcelain"])?.is_empty());
+    let text = std::fs::read_to_string(&exclude).map_err(|e| wc_core::Error::io("read", e))?;
+    assert_eq!(text, "# mine\n/.wiringcraft.lock\n");
+    Ok(())
+}
+
+#[test]
+fn an_exclude_list_that_cannot_be_read_is_reported_and_left_alone() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    store::create(dir, "Demo")?;
+    let git = Git::new(dir);
+    git.init()?;
+    let exclude = dir.join(".git/info/exclude");
+    std::fs::remove_file(&exclude).map_err(|e| wc_core::Error::io("rm", e))?;
+    // A folder where the file belongs: reading it fails with a reason other than "missing".
+    std::fs::create_dir(&exclude).map_err(|e| wc_core::Error::io("mkdir", e))?;
+    let Err(Error::Io { path, .. }) = git.exclude_locally("other.lock") else {
+        unreachable!("an unreadable exclude list is an error");
+    };
+    assert!(path.ends_with("exclude"), "{path}");
+    assert!(exclude.is_dir(), "left as it was");
+    Ok(())
+}
+
+#[test]
+fn a_failed_write_leaves_the_exclude_list_as_it_was() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    store::create(dir, "Demo")?;
+    let git = Git::new(dir);
+    git.init()?;
+    let exclude = dir.join(".git/info/exclude");
+    let before = std::fs::read(&exclude).map_err(|e| wc_core::Error::io("read", e))?;
+    // A folder where the new list would be written: the write fails.
+    let scratch = crate::git::exclude_scratch(&exclude);
+    std::fs::create_dir(&scratch).map_err(|e| wc_core::Error::io("mkdir", e))?;
+    assert!(git.exclude_locally("other.lock").is_err());
+    let after = std::fs::read(&exclude).map_err(|e| wc_core::Error::io("read", e))?;
+    assert_eq!(after, before);
+    Ok(())
+}

@@ -26,6 +26,13 @@ impl App {
 
     /// Send the input box's text, and the screenshots waiting, to the assistant.
     pub(crate) fn assistant_send(&mut self, ctx: &egui::Context) {
+        // A turn started now would fold the import's undo step into its own.
+        if self.importing.is_some() {
+            self.assistant_log(Entry::Error(
+                "Not sent: an import is running; send it again when it is done.".into(),
+            ));
+            return;
+        }
         let shots: Vec<Shot> = self.assistant.waiting.iter().map(|(s, _)| s.clone()).collect();
         let images = match shots.iter().map(Shot::to_agent).collect::<Result<Vec<_>, _>>() {
             Ok(i) => i,
@@ -48,7 +55,7 @@ impl App {
                 .is_ok()
         };
         if ok {
-            self.assistant.turn = self.open.as_ref().map(|o| (o.dir.clone(), o.undo_mark()));
+            self.assistant.turn = self.open.as_mut().map(|o| (o.dir.clone(), o.start_turn()));
             self.assistant.waiting.clear();
             let a = &mut self.assistant;
             a.shared.extend(shots.iter().cloned());
@@ -225,12 +232,7 @@ impl App {
             }
         }
         if finished {
-            // Everything the assistant changed in this turn is one undo step.
-            if let (Some((dir, mark)), Some(open)) = (self.assistant.turn.take(), self.open.as_mut())
-                && open.dir == dir
-            {
-                open.squash_undo(mark);
-            }
+            self.end_turn();
         }
         if self.assistant.busy()
             || self
@@ -243,10 +245,25 @@ impl App {
         }
     }
 
-    fn assistant_stop(&mut self) {
+    pub(crate) fn assistant_stop(&mut self) {
         self.assistant.session.stop();
         if let Some(c) = self.assistant.acp.as_mut() {
             c.cancel();
+        }
+        // Stopped before it began (Claude Code still starting): no finish will end the turn.
+        // A turn still running keeps its mark and ends when it finishes.
+        if !self.assistant.busy() {
+            self.end_turn();
+        }
+    }
+
+    /// The assistant's turn is over: everything it changed is one undo step, and the project
+    /// no longer holds the turn's first step at the front of a full history.
+    fn end_turn(&mut self) {
+        if let (Some((dir, mark)), Some(open)) = (self.assistant.turn.take(), self.open.as_mut())
+            && open.dir == dir
+        {
+            open.squash_undo(mark);
         }
     }
 

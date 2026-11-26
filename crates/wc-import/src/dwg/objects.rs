@@ -1275,7 +1275,7 @@ fn lwpolyline(o: &mut Object, e: &mut Codes) -> Result<()> {
     }
     let mut bulge = Vec::new();
     for _ in 0..bulges {
-        bulge.push(d.rd()?);
+        bulge.push(d.bd()?);
     }
     for (i, (x, y)) in at.into_iter().enumerate() {
         e.f(10, x).f(20, y);

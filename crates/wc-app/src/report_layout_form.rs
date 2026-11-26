@@ -37,7 +37,9 @@ pub struct Form {
     pub sort: Vec<SortRow>,
     /// The column rows are grouped by; empty for none.
     pub group: String,
-    /// Title-block keys printed above the table, comma separated (`project.name, revision`).
+    /// Title-block keys printed above the table, comma separated (`project.name, revision`);
+    /// a key with a comma, a leading quote or spaces around it is in double quotes, a quote in
+    /// it doubled ([`join_keys`], [`split_keys`]).
     pub header: String,
     /// The layout the project had for this report when the dialog opened.
     pub loaded: Option<ReportLayout>,
@@ -85,7 +87,7 @@ impl Form {
                 l.sort
                     .iter()
                     .map(|entry| {
-                        let (column, descending) = ReportLayout::sort_key(entry);
+                        let (column, descending) = ReportLayout::sort_key(entry.trim());
                         SortRow {
                             column: column.to_owned(),
                             descending,
@@ -101,7 +103,7 @@ impl Form {
             columns,
             sort,
             group: loaded.and_then(|l| l.group.clone()).unwrap_or_default(),
-            header: loaded.map(|l| l.header.join(", ")).unwrap_or_default(),
+            header: loaded.map(|l| join_keys(&l.header)).unwrap_or_default(),
             loaded: loaded.cloned(),
             initial: None,
             reset: false,
@@ -139,51 +141,37 @@ impl Form {
     }
 
     /// The layout the form describes, or `None` when it is the built-in one (no layout is kept
-    /// then). Columns are written only when they differ from the built-in ones.
+    /// then): [`Form::draft`] as [`ReportLayout::kept`] keeps it, so columns are written only
+    /// when they differ from the built-in ones.
     pub fn layout(&self) -> Option<ReportLayout> {
-        let set = |v: &str| Some(v.trim().to_owned()).filter(|v| !v.is_empty());
-        let shown: Vec<&ColumnRow> = self.columns.iter().filter(|c| c.shown).collect();
-        let as_builtin = shown.len() == self.builtin.len()
-            && shown
+        self.draft().kept(&self.builtin).ok().flatten()
+    }
+
+    /// The form's fields as a layout, as typed: the shown columns in their order, the sort
+    /// rows, the group column and the header keys of the text field, not yet trimmed or
+    /// compared with the built-in layout ([`ReportLayout::kept`] does that).
+    fn draft(&self) -> ReportLayout {
+        let text = |v: &str| Some(v.to_owned()).filter(|v| !v.is_empty());
+        ReportLayout {
+            kind: self.kind.name().to_owned(),
+            title: text(&self.title),
+            columns: self
+                .columns
                 .iter()
-                .zip(&self.builtin)
-                .all(|(c, b)| &c.from == b && c.heading.trim().is_empty());
-        let columns = if as_builtin {
-            Vec::new()
-        } else {
-            shown
-                .iter()
+                .filter(|c| c.shown)
                 .map(|c| ReportColumn {
                     from: c.from.clone(),
-                    heading: set(&c.heading),
+                    heading: text(&c.heading),
                 })
-                .collect()
-        };
-        let layout = ReportLayout {
-            kind: self.kind.name().to_owned(),
-            title: set(&self.title),
-            columns,
+                .collect(),
             sort: self
                 .sort
                 .iter()
-                .filter(|s| !s.column.trim().is_empty())
-                .map(|s| format!("{}{}", if s.descending { "-" } else { "" }, s.column.trim()))
+                .map(|s| format!("{}{}", if s.descending { "-" } else { "" }, s.column))
                 .collect(),
-            group: set(&self.group),
-            header: self
-                .header
-                .split(',')
-                .map(str::trim)
-                .filter(|k| !k.is_empty())
-                .map(str::to_owned)
-                .collect(),
-        };
-        (layout
-            != ReportLayout {
-                kind: layout.kind.clone(),
-                ..ReportLayout::default()
-            })
-        .then_some(layout)
+            group: text(&self.group),
+            header: split_keys(&self.header),
+        }
     }
 
     /// Why the layout cannot be kept: no column is shown.
@@ -193,11 +181,11 @@ impl Form {
 
     /// The layout OK keeps for the report ([`Form::layout`]), or why it cannot be kept
     /// ([`Form::problem`]). The dialog and the assistant's `report_layouts` tool both keep a
-    /// layout through this.
+    /// layout through this, by [`ReportLayout::kept`] as `wiringcraft report-layout set` does.
     pub fn kept(&self) -> Result<Option<ReportLayout>, String> {
         match self.problem() {
             Some(why) => Err(why),
-            None => Ok(self.layout()),
+            None => self.draft().kept(&self.builtin),
         }
     }
 
@@ -208,6 +196,58 @@ impl Form {
             return;
         };
         self.columns.swap(i, j);
+    }
+}
+
+/// Title-block keys as the form's text field shows them: comma separated, a key with a comma
+/// or starting with a double quote (or with spaces around it) put in double quotes with each
+/// quote in it doubled, so [`split_keys`] gives the same keys back.
+pub fn join_keys(keys: &[String]) -> String {
+    keys.iter()
+        .map(|k| {
+            if k.contains(',') || k.starts_with('"') || k.trim() != k {
+                format!("\"{}\"", k.replace('"', "\"\""))
+            } else {
+                k.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The title-block keys typed in the form's text field ([`join_keys`]): split at commas
+/// outside double quotes, trimmed, empty ones left out. A key in double quotes is kept as
+/// written inside them, with `""` read as one quote.
+pub fn split_keys(text: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut chars = text.chars().peekable();
+    loop {
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        let mut key = String::new();
+        let quoted = chars.next_if_eq(&'"').is_some();
+        if quoted {
+            while let Some(c) = chars.next() {
+                if c == '"' && chars.next_if_eq(&'"').is_none() {
+                    break;
+                }
+                key.push(c);
+            }
+        }
+        let mut rest = String::new();
+        while let Some(c) = chars.next_if(|c| *c != ',') {
+            rest.push(c);
+        }
+        if quoted {
+            key.push_str(rest.trim_end());
+        } else {
+            key = rest.trim().to_owned();
+        }
+        if !key.is_empty() {
+            keys.push(key);
+        }
+        if chars.next().is_none() {
+            return keys;
+        }
     }
 }
 
@@ -303,7 +343,7 @@ pub fn show(ui: &mut egui::Ui, form: &mut Form) {
                 .hint_text("project.name, revision")
                 .desired_width(260.0),
         )
-        .on_hover_text("Title-block values printed above the table on each page, by their keys, comma separated");
+        .on_hover_text("Title-block values printed above the table on each page, by their keys, comma separated; put a key with a comma in double quotes");
     });
 }
 
@@ -357,6 +397,68 @@ mod tests {
         f.group.clone_from(&builtin[0]);
         f.header = "project.name, revision".into();
         assert!(f.problems(&project).is_empty(), "{:?}", f.problems(&project));
+    }
+
+    #[test]
+    fn a_header_key_with_a_comma_or_quote_survives_the_form() {
+        let keys: Vec<String> = ["customer, site", "project.name", "5\" rack, \"A\"", "\"q", " pad "]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let l = ReportLayout {
+            kind: "parts".into(),
+            header: keys.clone(),
+            ..ReportLayout::default()
+        };
+        let f = Form::new(wc_report::Kind::Parts, builtin(), Some(&l));
+        assert_eq!(
+            f.header,
+            r#""customer, site", project.name, "5"" rack, ""A""", """q", " pad ""#
+        );
+        // Kept as `ReportLayout::kept` keeps it: the spaces around a key are trimmed.
+        assert_eq!(
+            f.layout().unwrap().header,
+            ["customer, site", "project.name", "5\" rack, \"A\"", "\"q", "pad"]
+        );
+        assert!(!f.edited());
+        assert_eq!(split_keys(r#" "a,b" , c,, "" , d"#), ["a,b", "c", "d"]);
+        assert_eq!(split_keys(r#""unclosed, x"#), ["unclosed, x"]);
+    }
+
+    #[test]
+    fn the_dialog_the_assistant_and_the_cli_keep_the_same_layout() {
+        use serde_json::json;
+        let given = [
+            json!({}),
+            json!({"title": "  ", "sort": [" ", "-"], "header": [" "]}),
+            json!({"column": [{"from": "Tag", "heading": " "}, {"from": "Part"}, {"from": "Qty"}]}),
+            json!({"sort": [" -Qty", "- Part ", "Tag"]}),
+            json!({"title": " BOM ", "group": " Tag", "header": [" customer, site ", "", "revision"]}),
+            json!({"column": [{"from": "Qty", "heading": " Count "}, {"from": "Colour"}]}),
+        ];
+        for value in given {
+            let layout = ReportLayout::from_json("parts", value.clone()).unwrap();
+            // `wiringcraft report-layout set` keeps `layout.kept`; the assistant reads it into
+            // the dialog's form and keeps what OK would.
+            let cli = layout.kept(&builtin());
+            let form = Form::new(wc_report::Kind::Parts, builtin(), Some(&layout));
+            assert_eq!(form.kept(), cli, "{value}");
+            assert_eq!(form.layout(), cli.clone().unwrap(), "{value}");
+            // Opened again on what was kept, the dialog shows it unchanged.
+            let again = Form::new(wc_report::Kind::Parts, builtin(), cli.unwrap().as_ref());
+            assert_eq!(again.kept(), form.kept(), "{value}");
+        }
+        // A sort entry with a space before its `-` sorts descending, and the dialog shows it so.
+        let l = ReportLayout::from_json("parts", json!({"sort": [" -Qty"]})).unwrap();
+        let f = Form::new(wc_report::Kind::Parts, builtin(), Some(&l));
+        assert_eq!(
+            f.sort,
+            [SortRow {
+                column: "Qty".into(),
+                descending: true
+            }]
+        );
+        assert_eq!(f.kept().unwrap().unwrap().sort, ["-Qty"]);
     }
 
     #[test]
