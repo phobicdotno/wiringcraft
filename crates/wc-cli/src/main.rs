@@ -284,6 +284,16 @@ enum Cmd {
         #[arg(long = "type")]
         kind: Option<String>,
     },
+    /// Delete symbols and wires from a page by their ids (as `place`, `box` and `wire` print
+    /// them). Wires that end on a pin of a deleted symbol go too, as in the app; devices keep
+    /// their data. An id that is not on the page changes nothing. Prints each deleted id.
+    Delete {
+        /// The page's id.
+        page: String,
+        /// The ids of the symbols and wires to delete, e.g. `s1 w3`.
+        #[arg(required = true)]
+        ids: Vec<String>,
+    },
     /// The project's locations (cabinets, rooms, panels): the `+` part of device tags.
     #[command(subcommand)]
     Location(LocationCmd),
@@ -1526,6 +1536,38 @@ fn parse_point(s: &str) -> Result<Point, String> {
 
 /// A wire end from `item:pin` or `x,y`. A pin must be one the placed symbol has (its
 /// definition read from the project's vendored symbols in `dir`).
+/// `delete`: take the symbols and wires named by `ids` off `page`, and the wires ending on a
+/// deleted symbol's pin, as the app's Delete does. An id not on the page is an error and nothing
+/// changes. Returns the deleted ids: symbols first, then wires, each in page order.
+fn delete_items(page: &mut Page, ids: &[String]) -> Res<Vec<String>> {
+    let missing: Vec<String> = ids
+        .iter()
+        .filter(|id| page.symbol(id).is_none() && !page.wires.iter().any(|w| &w.id == *id))
+        .map(|id| format!("{:?}", id))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!("no symbol or wire {} on page {}", missing.join(", "), page.id));
+    }
+    let named = |id: &str| ids.iter().any(|x| x == id);
+    let on_deleted =
+        |end: &Endpoint| matches!(end, Endpoint::Pin { item, .. } if page.symbol(item).is_some() && named(item));
+    let gone_wires: Vec<String> = page
+        .wires
+        .iter()
+        .filter(|w| named(&w.id) || on_deleted(&w.from) || on_deleted(&w.to))
+        .map(|w| w.id.clone())
+        .collect();
+    let gone_symbols: Vec<String> = page
+        .symbols
+        .iter()
+        .filter(|s| named(&s.id))
+        .map(|s| s.id.clone())
+        .collect();
+    page.symbols.retain(|s| !gone_symbols.contains(&s.id));
+    page.wires.retain(|w| !gone_wires.contains(&w.id));
+    Ok(gone_symbols.into_iter().chain(gone_wires).collect())
+}
+
 fn parse_end(dir: &Path, page: &Page, s: &str) -> Res<Endpoint> {
     if let Ok(p) = parse_point(s) {
         return Ok(Endpoint::Point { at: p });
@@ -2962,6 +3004,15 @@ fn run(mut cli: Cli) -> Res<()> {
             });
             save(dir, &p)?;
             println!("{id}");
+        }
+        Cmd::Delete { page, ids } => {
+            let mut p = load(dir)?;
+            let pg = page_mut(&mut p, &page)?;
+            let deleted = delete_items(pg, &ids)?;
+            save(dir, &p)?;
+            for id in deleted {
+                println!("{}", escape_field(&id));
+            }
         }
         Cmd::Location(lc) => {
             let mut p = load(dir)?;
@@ -6294,6 +6345,58 @@ mod tests {
         // One after the other: neither overwrote the other's page.
         let p = load(&dir).unwrap();
         assert!(p.page("p2").is_some() && p.page("p3").is_some());
+    }
+
+    #[test]
+    fn delete_takes_symbols_and_wires_off_a_page_with_the_wires_on_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        for (at, tag) in [("40,40", "-A1"), ("100,40", "-A2")] {
+            let args = ["box", "p1", "--at", at, "--size", "20,20", "--tag", tag];
+            cli(&dir, &[&args[..], &["--pin", "1:top:10"]].concat()).unwrap();
+        }
+        // w1 runs between the boxes, w2 from s2 into the air, w3 from point to point.
+        cli(&dir, &["wire", "p1", "s1:1", "s2:1"]).unwrap();
+        cli(&dir, &["wire", "p1", "s2:1", "150,20"]).unwrap();
+        cli(&dir, &["wire", "p1", "10,10", "20,10"]).unwrap();
+        let ids = |dir: &Path| {
+            let p = load(dir).unwrap();
+            let pg = p.page("p1").unwrap();
+            let mut ids: Vec<String> = pg.symbols.iter().map(|s| s.id.clone()).collect();
+            ids.extend(pg.wires.iter().map(|w| w.id.clone()));
+            ids
+        };
+
+        // An id that is not there changes nothing, though the others are.
+        let err = cli(&dir, &["delete", "p1", "w3", "nope", "s9"]).unwrap_err();
+        assert_eq!(err, "no symbol or wire \"nope\", \"s9\" on page p1");
+        assert_eq!(ids(&dir), ["s1", "s2", "w1", "w2", "w3"]);
+        assert!(
+            cli(&dir, &["delete", "p9", "w3"])
+                .unwrap_err()
+                .contains("no page \"p9\"")
+        );
+
+        // A wire alone.
+        let mut p = load(&dir).unwrap();
+        let deleted = delete_items(p.page_mut("p1").unwrap(), &["w3".into()]).unwrap();
+        assert_eq!(deleted, ["w3"]);
+        cli(&dir, &["delete", "p1", "w3"]).unwrap();
+        assert_eq!(ids(&dir), ["s1", "s2", "w1", "w2"]);
+
+        // A symbol takes the wires on its pins along; the other symbol and its device stay.
+        let mut p = load(&dir).unwrap();
+        let deleted = delete_items(p.page_mut("p1").unwrap(), &["s2".into()]).unwrap();
+        assert_eq!(deleted, ["s2", "w1", "w2"]);
+        cli(&dir, &["delete", "p1", "s2"]).unwrap();
+        assert_eq!(ids(&dir), ["s1"]);
+        let p = load(&dir).unwrap();
+        assert!(
+            p.devices.contains_key(&DeviceTag::parse("-A2").unwrap()),
+            "the device keeps its data"
+        );
     }
 
     #[test]
