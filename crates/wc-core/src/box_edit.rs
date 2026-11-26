@@ -7,7 +7,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{BoxPin, BoxSide, Endpoint, Point, Project, Symbol};
 
 /// The connection points `pins` of a box resized to `width` by `height`: each stays on its
-/// edge, its offset along the edge clamped to the new edge length (#524).
+/// edge, its offset along the edge clamped to the new edge length (#524). The size must be
+/// finite and above zero (as [`crate::black_box`] asks): callers check it first, and a negative
+/// or NaN size panics in the clamp.
 pub fn resized_pins(pins: &[BoxPin], width: f64, height: f64) -> Vec<BoxPin> {
     pins.iter()
         .map(|p| BoxPin {
@@ -22,7 +24,8 @@ pub fn resized_pins(pins: &[BoxPin], width: f64, height: f64) -> Vec<BoxPin> {
 }
 
 /// The points of a box resized to `width` by `height` when no new list of points is given:
-/// the old ones, each kept on its edge ([`resized_pins`]) and renamed as `renamed` asks.
+/// the old ones, each kept on its edge ([`resized_pins`], with the same size precondition) and
+/// renamed as `renamed` asks.
 pub fn kept_pins(pins: &[BoxPin], renamed: &BTreeMap<String, String>, width: f64, height: f64) -> Vec<BoxPin> {
     let mut kept = resized_pins(pins, width, height);
     for p in &mut kept {
@@ -61,7 +64,8 @@ pub struct BoxEditPlan {
 
 impl BoxEditPlan {
     /// Put the wire end changes into `project` (the symbol file and lock entry are the
-    /// caller's to write).
+    /// caller's to write). Wires are found by page and wire index, so this must be the project
+    /// the plan was made from, with no page or wire added, removed or reordered in between.
     pub fn apply_ends(&self, project: &mut Project) {
         for c in &self.ends {
             if let Some(w) = project.pages.get_mut(c.page).and_then(|p| p.wires.get_mut(c.wire)) {
@@ -125,6 +129,11 @@ pub fn plan(project: &Project, old: &Symbol, edit: &BoxEdit<'_>) -> crate::Resul
         .collect();
     if let Some((_, to)) = renamed.iter().find(|(_, to)| new.pin(to).is_none()) {
         return bad(format!("the box has no connection point {to} to rename a point to"));
+    }
+    // Two points renamed to one name would join their wires into one connection.
+    let mut targets = BTreeSet::new();
+    if let Some(to) = renamed.values().find(|to| !targets.insert(**to)) {
+        return bad(format!("two connection points are renamed to {to}"));
     }
     let removed: Vec<&str> = edit
         .removed
@@ -404,6 +413,15 @@ mod tests {
         let pins = [pin("A", BoxSide::Left, 5.0)];
         let err = plan(&p, &sym, &edit((20.0, 10.0), &pins, &bad_rename, &d)).err();
         assert!(err.is_some_and(|e| e.to_string().contains("no connection point Q")));
+        // Two points renamed to one: their wires would join.
+        let both: BTreeMap<String, String> = [("A".into(), "Q".into()), ("B".into(), "Q".into())].into();
+        let pins = [pin("Q", BoxSide::Left, 5.0)];
+        let err = plan(&p, &sym, &edit((20.0, 10.0), &pins, &both, &d)).err();
+        assert!(
+            err.as_ref().is_some_and(|e| e.to_string().contains("renamed to Q")),
+            "{err:?}"
+        );
+        let pins = [pin("A", BoxSide::Left, 5.0)];
         // A valid edit of a box that is not on the page.
         let mut e = edit((30.0, 10.0), &pins, &r, &d);
         e.item = "nope";
