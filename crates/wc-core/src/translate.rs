@@ -164,8 +164,10 @@ impl Dictionary {
 /// Calls made at the same time (the command line and the assistant, say) take turns: each
 /// holds the project folder's [`TRANSLATIONS_LOCK`] from reading the file until its write is
 /// in place, so the next one reads that write and keeps it. A program that writes the file
-/// without that lock (an editor, say) and changes it after this call read it makes the call
-/// fail with an error that asks to try again, and nothing is written then.
+/// without that lock (an editor, say) is not kept out: when its change lands after this call
+/// read the file and before this call checks it again just ahead of the write, the call fails
+/// with an error that asks to try again and nothing is written. A change that lands after
+/// that check is written over without notice.
 pub fn set_translation(dir: &Path, text: &str, lang: &str, translation: &str) -> Result<bool> {
     set_translation_checked(dir, text, lang, translation, || {}, || {})
 }
@@ -188,7 +190,8 @@ fn lock_translations(dir: &Path) -> Result<std::fs::File> {
         )));
     }
     let mut open = std::fs::OpenOptions::new();
-    open.append(true).create(true);
+    // Windows only locks a file opened for reading or writing, not one opened to append only.
+    open.read(true).append(true).create(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, libc::O_NOFOLLOW);
     let file = open.open(&path).map_err(|e| Error::io(&path, e))?;
@@ -599,6 +602,10 @@ nb = ""
             "Pumpene",
             || {},
             || {
+                // The lock is held here: another handle on the lock file cannot take it.
+                let held = std::fs::File::open(at.join(TRANSLATIONS_LOCK))
+                    .map(|f| matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+                assert!(matches!(held, Ok(true)), "the lock is not held: {held:?}");
                 let t = std::thread::spawn(move || set_translation(&at, "Spare", "de", "Ersatz"));
                 std::thread::sleep(std::time::Duration::from_millis(300));
                 other = Some((t.is_finished(), t));
@@ -616,6 +623,31 @@ nb = ""
         let d = Dictionary::load(dir.path())?;
         assert_eq!(d.lookup("Pumps", "nb").as_deref(), Some("Pumpene"));
         assert_eq!(d.lookup("Spare", "de").as_deref(), Some("Ersatz"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_change_without_the_lock_after_the_check_is_written_over() -> R {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join(TRANSLATIONS_FILE);
+        std::fs::write(&path, DICT)?;
+        let other = format!("{DICT}\n[[text]]\nen = \"Spare\"\nde = \"Ersatz\"\n");
+        // A writer that does not take the lock (an editor, say) saves after the check: the set
+        // still succeeds and its write replaces that change, as the doc comment says.
+        let r = set_translation_checked(
+            dir.path(),
+            "Pumps",
+            "nb",
+            "Pumpene",
+            || {},
+            || {
+                let _ = std::fs::write(&path, &other);
+            },
+        );
+        assert!(r?);
+        let d = Dictionary::load(dir.path())?;
+        assert_eq!(d.lookup("Pumps", "nb").as_deref(), Some("Pumpene"));
+        assert_eq!(d.lookup("Spare", "de"), None, "the unlocked change is gone");
         Ok(())
     }
 
