@@ -1769,9 +1769,9 @@ pub fn put_file_back(path: &Path, before: Option<&[u8]>) -> Result<(), String> {
         return Ok(());
     }
     // The file put back keeps the permissions the file there has now (a regular file, not a
-    // link): the staging file is made with the default ones (#664).
-    // A missing file has none to keep; a file whose metadata cannot be read is not put back
-    // with other permissions unsaid.
+    // link): the staging file is made readable by its owner only (#664).
+    // A missing file has none to keep, and is put back owner-only; a file whose metadata cannot
+    // be read is not put back with other permissions unsaid.
     let keep = match std::fs::symlink_metadata(path) {
         Ok(m) => m.is_file().then(|| m.permissions()),
         Err(x) if x.kind() == std::io::ErrorKind::NotFound => None,

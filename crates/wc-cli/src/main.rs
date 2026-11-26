@@ -9490,6 +9490,13 @@ mod tests {
         let stopped = cli(&dir, &["box-edit", "p1", "s1", "--size", "30,10", "--clear-pins"]);
         STOP_BOX_EDIT_AFTER_SYMBOL.set(false);
         assert_eq!(stopped, Err(STOPPED.to_owned()));
+        // Permissions given to the half-edited symbol file are the ones it keeps when put back.
+        #[cfg(unix)]
+        let symbol_mode = {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&symbol_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+            0o640
+        };
         // The journal holds the project files and the symbol, each with its bytes before.
         let left = std::fs::read(dir.join(BOX_EDIT_JOURNAL)).unwrap();
         // Compared by each file's name in the project: the black box symbol files the save may
@@ -9514,12 +9521,12 @@ mod tests {
         cli(&dir, &["location", "list"]).unwrap();
         assert!(!dir.join(BOX_EDIT_JOURNAL).exists());
         assert_eq!(bytes_now(&before), before);
-        // The symbol file put back was staged readable by its owner only.
+        // The symbol file put back keeps the permissions it had.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            let mode = std::fs::metadata(&symbol_path).unwrap().permissions().mode();
-            assert_eq!(mode & 0o077, 0, "{mode:o}");
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&symbol_path), symbol_mode, "{:o}", mode(&symbol_path));
         }
         cli(&dir, &["box-edit", "p1", "s1", "--size", "30,10"]).unwrap();
         assert!(!dir.join(BOX_EDIT_JOURNAL).exists());
@@ -9570,6 +9577,13 @@ mod tests {
         cli(&dir, &["location", "list"]).unwrap();
         assert_eq!(bytes_now(&before), before);
         assert_eq!(std::fs::read(&empty).unwrap(), b"[]");
+        // Made again where none was: its staging file was readable by its owner only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&empty).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "{mode:o}");
+        }
 
         cli(&dir, &["box-edit", "p1", "s1", "--size", "30,10"]).unwrap();
         assert!(!dir.join(BOX_EDIT_JOURNAL).exists());
