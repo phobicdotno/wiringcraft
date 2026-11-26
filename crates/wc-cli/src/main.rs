@@ -1304,6 +1304,17 @@ fn rules_from_file(file: &Path) -> Res<Vec<wc_core::check_rule::CheckRule>> {
             .map(|(k, r)| serde_json::from_value(r).map_err(|err| format!("Rule {}: {err}.", k + 1)))
             .collect::<Res<_>>()?
     } else {
+        // Only `[[rule]]` tables: a misspelt `[[rules]]` would otherwise read as no rules and
+        // remove the project's.
+        let table: toml::Table = text
+            .parse()
+            .map_err(|err: toml::de::Error| format!("{}: {}", file.display(), err.message()))?;
+        if let Some(key) = table.keys().find(|k| *k != "rule") {
+            return Err(format!(
+                "{}: {key:?} is not a rule table: write [[rule]] tables",
+                file.display()
+            ));
+        }
         parse_rules(&text).map_err(|why| format!("{}: {why}", file.display()))?
     };
     rules.iter().enumerate().map(|(k, r)| check_rule(r, k + 1)).collect()

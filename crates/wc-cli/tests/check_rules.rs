@@ -202,6 +202,13 @@ fn rules_lists_sets_and_turns_library_rules_off_and_on() -> TestResult {
         };
         assert!(err.contains(why), "{text}: {err}");
     }
+    // A misspelt table name in TOML is refused too, rather than read as no rules.
+    let misspelt = tmp.path().join("misspelt.toml");
+    std::fs::write(&misspelt, "[[rules]]\nkind = \"cable\"\n")?;
+    let Err(err) = wiringcraft(&dir, &["rules", "set", misspelt.to_str().ok_or("path")?]) else {
+        unreachable!("[[rules]] is refused");
+    };
+    assert!(err.contains("\"rules\" is not a rule table"), "{err}");
     assert_eq!(std::fs::read_to_string(dir.join("project.toml"))?, toml);
 
     // JSON, as `rules list --json` prints them.

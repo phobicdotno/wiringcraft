@@ -198,9 +198,9 @@ pub fn check_rule(rule: &CheckRule, n: usize) -> Result<CheckRule, String> {
 
 /// The one library rule `which` names (`source:number` or `source:name`, as [`turned_off`]
 /// reads it): its source, its number and the rule. `Ok(None)` when it names none (no such
-/// source, number or name, or a source whose rules cannot be read); an error when it could
-/// stand for two rules (a rule named "2" and rule 2, or two rules of one name), since an
-/// entry in `rules_off` would turn off all of them.
+/// source, number or name). An error when the source's rules cannot be read (with why), or
+/// when it could stand for two rules (a rule named "2" and rule 2, or two rules of one name),
+/// since an entry in `rules_off` would turn off all of them.
 pub fn library_rule<'a>(sets: &'a [RuleSet], which: &str) -> Result<Option<(&'a str, usize, &'a CheckRule)>, String> {
     let which = which.trim();
     let Some((src, sel)) = which.split_once(':') else {
@@ -209,13 +209,19 @@ pub fn library_rule<'a>(sets: &'a [RuleSet], which: &str) -> Result<Option<(&'a 
     let Some(set) = sets.iter().find(|set| set.source == src.trim()) else {
         return Ok(None);
     };
-    let Ok(rules) = &set.rules else { return Ok(None) };
+    let rules = set
+        .rules
+        .as_ref()
+        .map_err(|why| format!("The rules of library {} cannot be read: {why}", set.source))?;
     let one = [which.to_owned()];
-    let hits: Vec<usize> = (1..=rules.len())
-        .filter(|&n| turned_off(&one, &set.source, n, &rules[n - 1]))
+    let hits: Vec<(usize, &CheckRule)> = rules
+        .iter()
+        .enumerate()
+        .map(|(k, r)| (k + 1, r))
+        .filter(|&(n, r)| turned_off(&one, &set.source, n, r))
         .collect();
     if let [_, _, ..] = hits.as_slice() {
-        let list: Vec<String> = hits.iter().map(|n| format!("{}:{n}", set.source)).collect();
+        let list: Vec<String> = hits.iter().map(|(n, _)| format!("{}:{n}", set.source)).collect();
         return Err(format!(
             "{which:?} could be rule {} of library {}: {:?} is a number and a rule's name too, or two rules share it. An entry in rules_off turns off all of them; name the rule another way (by its number).",
             list.join(" or "),
@@ -223,7 +229,7 @@ pub fn library_rule<'a>(sets: &'a [RuleSet], which: &str) -> Result<Option<(&'a 
             sel.trim()
         ));
     }
-    Ok(hits.first().map(|&n| (set.source.as_str(), n, &rules[n - 1])))
+    Ok(hits.first().map(|&(n, r)| (set.source.as_str(), n, r)))
 }
 
 /// `off` (a project's [`ProjectMeta::rules_off`]) with the library rule `which` turned off
@@ -234,7 +240,15 @@ pub fn library_rule<'a>(sets: &'a [RuleSet], which: &str) -> Result<Option<(&'a 
 /// [`ProjectMeta::rules_off`]: crate::project::ProjectMeta::rules_off
 pub fn turn_rule(off: &[String], sets: &[RuleSet], which: &str, turn_off: bool) -> Result<Option<Vec<String>>, String> {
     let which = which.trim();
-    let found = library_rule(sets, which)?;
+    // A source whose rules cannot be read: turning one of its rules off is refused with why,
+    // but an entry for it can still be dropped as written.
+    let unreadable = which
+        .split_once(':')
+        .is_some_and(|(src, _)| sets.iter().any(|set| set.source == src.trim() && set.rules.is_err()));
+    let found = match library_rule(sets, which) {
+        Err(_) if !turn_off && unreadable => None,
+        found => found?,
+    };
     let mut now = off.to_vec();
     match (turn_off, found) {
         (true, None) => {
@@ -560,7 +574,16 @@ severty = "error"
             Some(("house", 1))
         );
         assert_eq!(library_rule(&sets, "house:9").unwrap(), None);
-        assert_eq!(library_rule(&sets, "broken:1").unwrap(), None);
+        assert!(library_rule(&sets, "broken:1").unwrap_err().contains("bad toml"));
+        assert!(
+            turn_rule(&[], &sets, "broken:1", true)
+                .unwrap_err()
+                .contains("bad toml")
+        );
+        assert_eq!(
+            turn_rule(&off(&["broken:1"]), &sets, "broken:1", false).unwrap(),
+            Some(vec![])
+        );
         assert_eq!(library_rule(&sets, "motors").unwrap(), None);
         // Rule 2 by number and rule 2 named "2" are one rule; two of one name are not.
         assert!(library_rule(&sets, "house:2").unwrap().is_some());
