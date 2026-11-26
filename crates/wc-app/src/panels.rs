@@ -988,19 +988,32 @@ fn apply_box_form(
     page: usize,
     id: &str,
 ) -> Result<Vec<String>, String> {
-    let warnings = open.edit_black_box(
-        page,
-        id,
-        (form.width, form.height),
-        &form.pins(),
-        &form.renamed(),
-        &form.removed(),
-    )?;
+    let symbol_id = open
+        .project
+        .pages
+        .get(page)
+        .and_then(|p| p.symbol(id))
+        .map(|placed| placed.symbol.clone())
+        .unwrap_or_default();
+    let (pins, renamed) = (form.pins(), form.renamed());
+    let warnings = open.edit_black_box(page, id, (form.width, form.height), &pins, &renamed, &form.removed())?;
+    // A wire being drawn from a point of the box that was renamed, moved or taken off, or
+    // whose name another point took, would be saved on a stale point: it is dropped, as the
+    // assistant's black box edit does. So is one whose start no longer resolves at all.
+    let point_changed = |pin: &str| {
+        renamed.contains_key(pin)
+            || renamed.values().any(|to| to == pin)
+            || form.old_pins().iter().find(|p| p.name == pin) != pins.iter().find(|p| p.name == pin)
+    };
+    let shown = open.project.pages.get(ed.page);
     let lost = ed.wire.as_ref().is_some_and(|(start, _)| {
-        open.project
-            .pages
-            .get(ed.page)
-            .is_some_and(|pg| open.end_pos(pg, start).is_none())
+        let changed = matches!(
+            start,
+            wc_core::Endpoint::Pin { item, pin }
+                if shown.and_then(|p| p.symbol(item)).is_some_and(|s| s.symbol == symbol_id)
+                    && point_changed(pin)
+        );
+        changed || shown.is_some_and(|pg| open.end_pos(pg, start).is_none())
     });
     if lost {
         ed.wire = None;
@@ -2742,6 +2755,50 @@ mod tests {
         assert!(refused.is_some(), "a duplicate point name is refused");
         assert_eq!(o.undo_steps(), steps + 1);
         assert!(ps.black_box.as_ref().is_some_and(|(_, f)| f.error.is_some()));
+        Ok(())
+    }
+
+    /// Two points of the box swap names: a wire being drawn from one of them still finds a
+    /// point with its start's name, but another one, so it is dropped too.
+    #[test]
+    fn a_wire_from_a_point_whose_name_another_point_takes_is_dropped() -> Result<(), Box<dyn std::error::Error>> {
+        use wc_core::{BoxPin, BoxSide};
+        let (_tmp, mut o) = crate::state::tests::project();
+        let pin = |name: &str, offset| BoxPin {
+            name: name.into(),
+            side: BoxSide::Left,
+            offset,
+        };
+        let id = o.add_black_box(
+            1,
+            wc_core::geom::Point::new(40.0, 40.0),
+            wc_core::geom::Point::new(60.0, 60.0),
+            &[pin("1", 5.0), pin("2", 10.0)],
+            None,
+        )?;
+        let mut ed = Editor::default();
+        let mut ps = PanelState::default();
+        let t = Theme::of(&egui::Context::default());
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| black_box_section(ui, &mut o, &mut ed, &mut ps, 1, &id, &t));
+        });
+        if let Some((_, f)) = ps.black_box.as_mut() {
+            f.rows[0].name = "2".into();
+            f.rows[1].name = "1".into();
+        }
+        ed.page = 1;
+        ed.wire = Some((
+            wc_core::Endpoint::Pin {
+                item: id.clone(),
+                pin: "1".into(),
+            },
+            Vec::new(),
+        ));
+        assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), None);
+        assert!(ps.black_box.is_none(), "applied");
+        assert!(ed.wire.is_none(), "the wire from the point now named 2 is dropped");
         Ok(())
     }
 
