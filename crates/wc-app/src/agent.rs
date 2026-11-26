@@ -3959,6 +3959,39 @@ mod tests {
     }
 
     #[test]
+    fn an_archive_whose_project_libraries_cannot_be_opened_says_why_and_still_offers_another_folder() {
+        let (tmp, mut a) = app(vec![]);
+        let Some(open) = a.open.as_mut() else {
+            unreachable!("no project open");
+        };
+        open.project.meta.libraries.push(wc_core::project::LibrarySource {
+            name: "broken".into(),
+            kind: "floppy".into(),
+            location: "a:".into(),
+            reference: None,
+        });
+        let why = match wc_library::Library::open(&open.dir, &open.project) {
+            Ok(_) => unreachable!("the library opened"),
+            Err(e) => e.to_string(),
+        };
+        a.import_picked(crate::imports::Kind::Archive, &tmp.path().join("plant.zip"), None, None);
+        let Some(Dialog::ImportOptions { form, error, .. }) = &a.dialog else {
+            unreachable!("no options dialog");
+        };
+        assert!(
+            matches!(error, Some(shown) if shown.contains(&why)),
+            "{error:?} lacks {why:?}"
+        );
+        // No project library folder is offered; not importing them and another folder are.
+        assert!(form.libraries.is_empty());
+        assert_eq!(form.library_label(0), "Do not import them");
+        assert_eq!(form.library_label(1), "Another folder…");
+        let mut form = form.clone();
+        form.library = 1;
+        assert!(form.other_library());
+    }
+
+    #[test]
     fn an_archives_other_library_folder_is_declared_only_once_something_is_written_there() {
         use crate::imports::{Kind, Options, tests::write_zip};
         let (tmp, mut a) = app(vec![]);

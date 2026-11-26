@@ -71,7 +71,10 @@ is; the empty field names that folder.
 An archive has the library folder for the KiCad symbol libraries and parts lists inside it
 (`--lib`): "Do not import them" by default, which lists them with a warning as the command line
 does without `--lib`, or the project's own `library/`, one of its other library folders, or
-another folder typed or picked with Browse, as for a parts import. A folder that is not among
+another folder typed or picked with Browse, as for a parts import. When the project's library
+folders cannot be listed, the dialog says why and another folder can still be chosen. The
+entries of an archive are numbered on from the first page number, also past the limit on the
+number typed. A folder that is not among
 the project's libraries yet is added to them once something was written there (a symbol
 library or a part), also when the folder was there before. The SolidWorks Electrical libraries
 import vendors into the project, as `import swe-library` does without `--lib`; writing them

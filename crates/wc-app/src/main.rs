@@ -1015,18 +1015,24 @@ impl App {
         let Some(open) = self.open.as_ref() else { return };
         let mut form = imports::Form::new(open, kind, file);
         // The library folders a parts import offers; without the project's library list only
-        // another folder can be chosen.
-        if form.has(imports::Opt::Library)
-            && let Ok(library) = wc_library::Library::open(&open.dir, &open.project)
-        {
-            form.libraries = library_targets(&library, open);
+        // another folder can be chosen, and the dialog says why.
+        let mut error = None;
+        if form.has(imports::Opt::Library) {
+            match wc_library::Library::open(&open.dir, &open.project) {
+                Ok(library) => form.libraries = library_targets(&library, open),
+                Err(e) => {
+                    error = Some(format!(
+                        "The project's library folders could not be listed: {e}. Another folder can still be chosen."
+                    ));
+                }
+            }
         }
         self.dialog = Some(Dialog::ImportOptions {
             file: file.to_path_buf(),
             lib: lib.map(Path::to_path_buf),
             target,
             form: Box::new(form),
-            error: None,
+            error,
         });
     }
 
