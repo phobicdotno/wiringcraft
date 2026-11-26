@@ -2015,6 +2015,14 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
     // Entities farther than FAR_OUT from the middle of the drawing (the median point, which a
     // few stray ones cannot move) are left out and said: moving one onto the page would drag
     // the rest out of range or overflow. A drawing far from its own origin keeps everything.
+    // A symbol placed where its position is not a number (a coordinate near the limit times the
+    // scale) is left out and said first, so it cannot pull the middle away.
+    let placed = out.symbols.len();
+    out.symbols.retain(|s| s.at.x.is_finite() && s.at.y.is_finite());
+    if out.symbols.len() < placed {
+        *skipped.entry(NOT_NUMBERS_PLACED.to_owned()).or_default() += placed - out.symbols.len();
+        out.warnings = skipped_warnings(skipped.clone());
+    }
     let mut xs: Vec<f64> = Vec::new();
     let mut ys: Vec<f64> = Vec::new();
     for p in out
@@ -2174,6 +2182,24 @@ mod tests {
             unreachable!("nothing left to draw");
         };
         assert!(err.to_string().contains("1000 km"), "{err}");
+        Ok(())
+    }
+
+    /// A symbol whose position overflows once scaled is left out and said; the others stay.
+    #[test]
+    fn a_symbol_placed_out_of_range_is_left_out_and_the_rest_kept() -> Result<()> {
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        let ents = "0\nINSERT\n2\nWC.COIL\n10\n0\n20\n0\n0\nINSERT\n2\nWC.COIL\n10\n1e308\n20\n0\n";
+        let p = page(&dxf(ents, ""), 10.0, &known)?;
+        assert_eq!(p.symbols.len(), 1, "{:?}", p.symbols);
+        assert_eq!(p.symbols[0].at, Point::new(20.0, 20.0));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("1 entity whose size is not a number once placed")),
+            "{:?}",
+            p.warnings
+        );
         Ok(())
     }
 
