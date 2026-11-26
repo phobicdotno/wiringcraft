@@ -1273,15 +1273,7 @@ fn lwpolyline(o: &mut Object, e: &mut Codes) -> Result<()> {
         }
         at.push((x, y));
     }
-    // Only a bulge per point is kept: a count beyond that (a damaged or hostile file) is read
-    // past, not stored.
-    let mut bulge = Vec::new();
-    for _ in 0..bulges {
-        let b = d.bd()?;
-        if bulge.len() < at.len() {
-            bulge.push(b);
-        }
-    }
+    let bulge = kept_bulges(d, bulges, at.len())?;
     for (i, (x, y)) in at.into_iter().enumerate() {
         e.f(10, x).f(20, y);
         if let Some(&b) = bulge.get(i)
@@ -1291,6 +1283,19 @@ fn lwpolyline(o: &mut Object, e: &mut Codes) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Read `count` bulges (BD) and keep at most one per point: a count beyond `points` (a damaged
+/// or hostile file) is read past, not stored.
+fn kept_bulges(d: &mut Bits<'_>, count: u32, points: usize) -> Result<Vec<f64>> {
+    let mut kept = Vec::new();
+    for _ in 0..count {
+        let b = d.bd()?;
+        if kept.len() < points {
+            kept.push(b);
+        }
+    }
+    Ok(kept)
 }
 
 impl Decoded {

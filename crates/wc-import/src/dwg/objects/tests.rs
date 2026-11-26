@@ -1587,6 +1587,23 @@ fn extra_bulges_of_a_lightweight_polyline_are_not_kept() -> TestResult {
     Ok(())
 }
 
+/// The bulges kept for a polyline: one per point at most, however many the object declares,
+/// and the reader ends past all of them.
+#[test]
+fn bulges_past_the_points_are_read_but_not_kept() -> TestResult {
+    let mut w = W::default();
+    w.bd(1.0);
+    for _ in 1..10_000 {
+        w.bd(0.0);
+    }
+    w.bs(7);
+    let bytes = w.bytes();
+    let mut r = Bits::new(&bytes, 0, w.0.len());
+    assert_eq!(kept_bulges(&mut r, 10_000, 2)?, [1.0, 0.0]);
+    assert_eq!(r.bs()?, 7, "read past every declared bulge");
+    Ok(())
+}
+
 #[test]
 fn a_bulged_lightweight_polyline_is_drawn_with_its_arc() -> TestResult {
     for v in [Version::R2004, Version::R2010, Version::R2018] {
