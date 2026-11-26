@@ -9928,6 +9928,7 @@ mod tests {
         // Shown and unlocked, the same Paste adds the text.
         a.run(Action::Paste);
         assert_eq!(page2(&a).graphics.len(), 2);
+        assert_eq!(a.ed.message, "Pasted 1 items.", "the layer note is gone");
     }
 
     #[test]
