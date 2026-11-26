@@ -92,8 +92,9 @@ fn filled(e: &BytesStart) -> bool {
     })
 }
 
-/// Whether an ellipse or polygon comes in solid: WiringCraft fills in the line colour, so only
-/// a dark filling is kept. `white`, light grey and the hatch patterns stay hollow, as does `none`.
+/// Whether an ellipse or polygon comes in solid (#875): WiringCraft fills in the line colour, so
+/// only a dark filling is kept. `white`, light grey and the hatch patterns stay hollow, as does
+/// `none`, since drawing them solid in the line colour would hide what the element shows.
 fn solid_fill(e: &BytesStart) -> bool {
     attr(e, "style").is_some_and(|s| {
         s.split(';').any(|kv| {
@@ -106,6 +107,23 @@ fn solid_fill(e: &BytesStart) -> bool {
             })
         })
     })
+}
+
+/// A closed outline, plus a fill under it when `fill` is set. QElectroTech draws a filled shape
+/// with its outline, while WiringCraft draws a filled polyline without one, so both are kept.
+fn push_closed(graphics: &mut Vec<Shape>, points: Vec<Point>, fill: bool) {
+    if fill {
+        graphics.push(Shape::Polyline {
+            points: points.clone(),
+            closed: true,
+            filled: true,
+        });
+    }
+    graphics.push(Shape::Polyline {
+        points,
+        closed: true,
+        filled: false,
+    });
 }
 
 /// Points on the ellipse in the box (`x`, `y`, `w`, `h`), from `start` sweeping `sweep` degrees
@@ -367,11 +385,7 @@ fn shape(
                             .take(ELLIPSE_STEPS)
                             .map(|p| pt(p.x, p.y))
                             .collect();
-                        graphics.push(Shape::Polyline {
-                            points,
-                            closed: true,
-                            filled: solid_fill(e),
-                        });
+                        push_closed(graphics, points, solid_fill(e));
                     }
                 }
                 _ => skip(),
@@ -424,10 +438,11 @@ fn shape(
             let fill = solid_fill(e);
             match points.as_slice() {
                 [a, b] if !closed => graphics.push(Shape::Line { a: *a, b: *b }),
+                [_, _, ..] if closed || fill => push_closed(graphics, points, fill),
                 [_, _, ..] => graphics.push(Shape::Polyline {
                     points,
-                    closed: closed || fill,
-                    filled: fill,
+                    closed: false,
+                    filled: false,
                 }),
                 _ => skip(),
             }
@@ -607,10 +622,13 @@ mod tests {
             .collect();
         assert_eq!(
             polys,
+            // A filled shape comes in as its fill plus its outline.
             vec![
                 (3, true, true),
                 (3, true, false),
+                (3, true, false),
                 (ELLIPSE_STEPS, true, true),
+                (ELLIPSE_STEPS, true, false),
                 (ELLIPSE_STEPS, true, false),
                 (3, true, false),
                 (ELLIPSE_STEPS, true, false)
