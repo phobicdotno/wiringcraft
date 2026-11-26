@@ -2620,7 +2620,9 @@ fn run(mut cli: Cli) -> Res<()> {
             mirror,
         } => {
             let mut p = load(dir)?;
-            // Check the inputs before taking the symbol, so a bad tag or turn leaves no copy behind.
+            // Check the inputs before taking the symbol, so a bad page, tag or turn leaves no copy
+            // behind.
+            page_mut(&mut p, &page)?;
             let tag = tag.map(|t| DeviceTag::parse(&t)).transpose().map_err(e)?;
             let rotation = Rotation::from_degrees(rotate).ok_or("rotation must be 0, 90, 180 or 270")?;
             if store::read_vendored_symbol(dir, &symbol).is_err() {
@@ -9587,7 +9589,7 @@ mod tests {
     }
 
     #[test]
-    fn place_checks_the_turn_and_tag_before_taking_the_symbol() {
+    fn place_checks_the_page_turn_and_tag_before_taking_the_symbol() {
         let Ok(tmp) = tempfile::tempdir() else { unreachable!() };
         let dir = tmp.path().join("proj");
         let Some(path) = dir.to_str() else { unreachable!() };
@@ -9602,9 +9604,11 @@ mod tests {
         assert!(cli(&dir, &["lib", "add", "starter", "folder", starter]).is_ok());
         assert!(cli(&dir, &["page", "add", "p1", "--number", "1"]).is_ok());
 
-        for bad in [["--rotate", "45"], ["--tag", "-K1."]] {
-            let mut args = vec!["place", "p1", "wc.coil", "--at", "50,50"];
-            args.extend(bad);
+        let missing_page = ["place", "nope", "wc.coil", "--at", "50,50"];
+        let bad_turn = ["place", "p1", "wc.coil", "--at", "50,50", "--rotate", "45"];
+        let bad_tag = ["place", "p1", "wc.coil", "--at", "50,50", "--tag", "-K1."];
+        for bad in [&missing_page[..], &bad_turn[..], &bad_tag[..]] {
+            let args = bad.to_vec();
             assert!(cli(&dir, &args).is_err(), "{bad:?}");
             assert!(
                 store::read_vendored_symbol(&dir, "wc.coil").is_err(),
