@@ -340,7 +340,9 @@ pub struct Arranged {
 }
 
 /// Put the project's devices that have a part and are not on the plate yet onto its rails, in
-/// tag order, left to right and then rail by rail. Door-mounted parts ([`on_door`]) are left out. `location` (such as `CAB1`, with or without
+/// tag order, left to right and then rail by rail, each centred on its rail. A device that would
+/// stick out over the plate's top or bottom edge on a rail goes on a later rail where it does not,
+/// or is listed as not fitting. Door-mounted parts ([`on_door`]) are left out. `location` (such as `CAB1`, with or without
 /// the `+`) keeps only devices in that location. Devices already placed stay where they are.
 pub fn arrange(
     panel: &mut Panel,
@@ -402,15 +404,22 @@ pub fn arrange(
         .collect();
     rails.sort_by(|a, b| a.0.y.total_cmp(&b.0.y).then(a.0.x.total_cmp(&b.0.x)));
     let mut out = Arranged::default();
+    let plate_height = panel.height;
     let mut rail = 0;
     for (tag, (w, h), estimated) in todo {
         let name = tag.to_string();
         let mut placed = false;
-        while let Some((at, length, cursor)) = rails.get_mut(rail) {
-            if *cursor + w <= at.x + *length + 1e-9 {
+        // From the first rail with room left; a rail too near the plate's edge for this device's
+        // height is passed over for it alone, keeping its room for the devices after it.
+        let mut r = rail;
+        while let Some((at, length, cursor)) = rails.get_mut(r) {
+            let along = *cursor + w <= at.x + *length + 1e-9;
+            let top = at.y - h / 2.0;
+            let on_plate = top >= -1e-9 && top + h <= plate_height + 1e-9;
+            if along && on_plate {
                 panel.items.push(PanelItem::Device {
                     tag: tag.clone(),
-                    at: Point::new(*cursor, at.y - h / 2.0),
+                    at: Point::new(*cursor, top),
                     width: w,
                     height: h,
                     rotation: Rotation::R0,
@@ -419,7 +428,10 @@ pub fn arrange(
                 placed = true;
                 break;
             }
-            rail += 1;
+            if !along && r == rail {
+                rail += 1;
+            }
+            r += 1;
         }
         if placed {
             if estimated {
@@ -792,6 +804,52 @@ mod tests {
         let (min, max, a, b) = frame_and_edge(Rotation::R270);
         assert!(close(min, 10.0, 30.0) && close(max, 110.0, 50.0));
         assert!(close(a, 10.0, 50.0) && close(b, 10.0, 30.0), "{a:?} {b:?}");
+    }
+
+    #[test]
+    fn a_device_taller_than_its_row_goes_on_a_rail_where_it_stays_on_the_plate() {
+        let mut project = Project::new("x");
+        let mut parts = BTreeMap::new();
+        for (id, h) in [("tall", 250.0), ("huge", 900.0), ("small", 80.0)] {
+            let mut part = Part {
+                id: id.into(),
+                ..Default::default()
+            };
+            part.properties.insert("Width".into(), "45".into());
+            part.properties.insert("Height".into(), format!("{h}"));
+            parts.insert(id.to_string(), part);
+        }
+        for (t, part) in [("-A1", "tall"), ("-A2", "huge"), ("-K1", "small")] {
+            if let Some(t) = tag(t) {
+                project.devices.insert(
+                    t,
+                    Device {
+                        part: Some(part.into()),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        // Four rows of 150 mm; the first rail is at y 115, the second at y 305.
+        let mut panel = Panel::with_rails("main", "Main", 600.0, 800.0);
+        let done = arrange(&mut panel, &project, &parts, None);
+        assert_eq!(done.placed, vec!["-A1", "-K1"]);
+        assert_eq!(done.did_not_fit, vec!["-A2"], "taller than the plate");
+        for item in &panel.items {
+            if let Some((min, max)) = item.device_bounds() {
+                assert!(min.y >= 0.0 && max.y <= panel.height, "{item:?} is off the plate");
+            }
+        }
+        let at = |t: &str| {
+            panel.items.iter().find_map(|i| match i {
+                PanelItem::Device { tag, at, .. } if tag.to_string() == t => Some(*at),
+                _ => None,
+            })
+        };
+        // The tall device goes down to the second rail; the small one after it still uses the
+        // first rail's room.
+        assert_eq!(at("-A1"), Some(Point::new(45.0, 305.0 - 125.0)));
+        assert_eq!(at("-K1"), Some(Point::new(45.0, 115.0 - 40.0)));
     }
 
     #[test]
