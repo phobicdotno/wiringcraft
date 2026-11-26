@@ -228,7 +228,9 @@ pub fn page_changes(old: Option<&Page>, new: Option<&Page>) -> Vec<Change> {
 
 /// Changes from `from` to `to` (a revision, or `None` for the working folder).
 pub fn changes(git: &Git, from: &str, to: Option<&str>) -> Result<Vec<Change>> {
-    let mut args = vec!["diff", "--name-status", "--no-renames", from];
+    // `--end-of-options`: a version that starts with `-` is refused as an unknown version, not
+    // read as an option of git.
+    let mut args = vec!["diff", "--name-status", "--no-renames", "--end-of-options", from];
     if let Some(t) = to {
         args.push(t);
     }
