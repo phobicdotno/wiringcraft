@@ -106,8 +106,9 @@ fn num(e: &BytesStart, name: &str) -> f64 {
 /// The arguments of an arc command: groups of seven, whose fourth and fifth (the large-arc and
 /// sweep flags) are one `0` or `1` each and may run into the next argument without a separator
 /// (`0110 20` is the flags 0 and 1 and the end x 10). Reading stops at the first argument that is
-/// not well formed, as SVG stops drawing a path at an error.
-fn arc_numbers(s: &str) -> Vec<f64> {
+/// not well formed, as SVG stops drawing a path at an error: the arguments read before it come
+/// back with `false`.
+fn arc_numbers(s: &str) -> (Vec<f64>, bool) {
     let b = s.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
@@ -122,7 +123,7 @@ fn arc_numbers(s: &str) -> Vec<f64> {
             match b[i] {
                 b'0' => out.push(0.0),
                 b'1' => out.push(1.0),
-                _ => break,
+                _ => return (out, false),
             }
             i += 1;
             continue;
@@ -144,7 +145,7 @@ fn arc_numbers(s: &str) -> Vec<f64> {
             digits(&mut i)
         };
         if !whole && !fraction {
-            break;
+            return (out, false);
         }
         if i < b.len() && matches!(b[i], b'e' | b'E') {
             let mark = i;
@@ -158,10 +159,10 @@ fn arc_numbers(s: &str) -> Vec<f64> {
         }
         match s[start..i].parse::<f64>() {
             Ok(v) if v.is_finite() => out.push(v),
-            _ => break,
+            _ => return (out, false),
         }
     }
-    out
+    (out, true)
 }
 
 fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
@@ -172,17 +173,24 @@ fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
         if cmd.eq_ignore_ascii_case(&'A') {
             arc_numbers(buf)
         } else {
-            numbers(buf)
+            (numbers(buf), true)
         }
     };
     // Tokenise into (command, numbers).
     let mut cmds: Vec<(char, Vec<f64>)> = Vec::new();
     let mut buf = String::new();
     let mut cmd = ' ';
+    // An argument error ends the path: what came before it is drawn, nothing after it.
+    let mut broken = false;
     for c in d.chars() {
         if c.is_ascii_alphabetic() && c != 'e' && c != 'E' {
             if cmd != ' ' {
-                cmds.push((cmd, args(cmd, &buf)));
+                let (v, ok) = args(cmd, &buf);
+                cmds.push((cmd, v));
+                if !ok {
+                    broken = true;
+                    break;
+                }
             }
             cmd = c;
             buf.clear();
@@ -190,8 +198,8 @@ fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
             buf.push(c);
         }
     }
-    if cmd != ' ' {
-        cmds.push((cmd, args(cmd, &buf)));
+    if cmd != ' ' && !broken {
+        cmds.push((cmd, args(cmd, &buf).0));
     }
     let flush = |cur: &mut Vec<Point>, out: &mut Vec<(Vec<Point>, bool)>, closed: bool| {
         if cur.len() >= 2 {
@@ -677,13 +685,18 @@ mod tests {
         assert!(end > 1, "the arc is flattened");
         assert_eq!(pts[end + 1..], [Point::new(30.0, 20.0)]);
         assert_eq!(
-            arc_numbers("10,10 0 1,0-5.5.5 1 1 0 0 1 1e1 1e+1"),
+            arc_numbers("10,10 0 1,0-5.5.5 1 1 0 0 1 1e1 1e+1").0,
             vec![
                 10.0, 10.0, 0.0, 1.0, 0.0, -5.5, 0.5, 1.0, 1.0, 0.0, 0.0, 1.0, 10.0, 10.0
             ]
         );
-        // A flag that is not 0 or 1 ends the arguments.
-        assert_eq!(arc_numbers("5 5 0 2 1 10 0"), vec![5.0, 5.0, 0.0]);
+        // A flag that is not 0 or 1 ends the arguments, and the path: the line before the arc
+        // stays, nothing after it is drawn.
+        assert_eq!(arc_numbers("5 5 0 2 1 10 0"), (vec![5.0, 5.0, 0.0], false));
+        assert_eq!(
+            one_line("M 0 0 L 1 0 A 5 5 0 2 1 10 0 L 20 0"),
+            [Point::new(0.0, 0.0), Point::new(1.0, 0.0)]
+        );
     }
 
     #[test]
