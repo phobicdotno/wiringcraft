@@ -43,7 +43,9 @@ pub const COMMENTS_SUFFIX: &str = ".comments.json";
 /// `wiringcraft` command in the project puts the files back from it.
 pub const BOX_EDIT_JOURNAL: &str = ".box-edit.journal";
 
-/// Ids become file names, so they are restricted to a portable set.
+/// Ids become file names, so they are restricted to a portable set. A name Windows keeps for a
+/// device (`con`, `nul`, `aux`, `com1`, ...) is refused too, whatever follows it after a dot:
+/// Windows opens the device instead of the file.
 pub fn check_id(id: &str) -> Result<()> {
     let ok = !id.is_empty()
         && id.len() <= 128
@@ -51,12 +53,28 @@ pub fn check_id(id: &str) -> Result<()> {
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-    if ok {
-        Ok(())
-    } else {
-        Err(Error::Invalid(format!(
+    if !ok {
+        return Err(Error::Invalid(format!(
             "id {id:?} must be 1-128 of A-Z a-z 0-9 . _ - and not start with '.'"
-        )))
+        )));
+    }
+    let stem = id.split('.').next().unwrap_or(id);
+    if is_windows_device_name(stem) {
+        return Err(Error::Invalid(format!(
+            "id {id:?} starts with {stem:?}, a name Windows keeps for a device: its file could not be opened there"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `name` is one Windows keeps for a device: `CON`, `PRN`, `AUX`, `NUL`, `COM0`-`COM9`
+/// or `LPT0`-`LPT9`, in any case.
+fn is_windows_device_name(name: &str) -> bool {
+    let n = name.to_ascii_uppercase();
+    match n.as_bytes() {
+        [_, _, _] => matches!(n.as_str(), "CON" | "PRN" | "AUX" | "NUL"),
+        [a, b, c, d] => matches!(&[*a, *b, *c], b"COM" | b"LPT") && d.is_ascii_digit(),
+        _ => false,
     }
 }
 
@@ -972,6 +990,16 @@ mod tests {
             assert!(check_id(bad).is_err(), "{bad}");
         }
         assert!(check_id("wc.contact-no_1").is_ok());
+    }
+
+    #[test]
+    fn windows_device_names_are_refused() {
+        for bad in ["con", "NUL", "Aux.page", "prn", "com1", "COM0", "lpt9.x.y"] {
+            assert!(check_id(bad).is_err(), "{bad}");
+        }
+        for good in ["console", "com10", "aux1", "acme.aux", "nul_", "com", "lptx"] {
+            assert!(check_id(good).is_ok(), "{good}");
+        }
     }
 }
 
