@@ -210,6 +210,20 @@ fn pages_export_as_svg_and_dxf() {
 }
 
 #[test]
+fn dxf_text_keeps_percent_signs_backslashes_and_wide_characters_literal() {
+    // `%%c` would be read as a diameter sign and `\U+0041` as `A` (#832).
+    assert_eq!(vector::dxf_text("50%%c"), "50\\U+0025\\U+0025c");
+    assert_eq!(vector::dxf_text("a%%%b"), "a\\U+0025\\U+0025\\U+0025b");
+    assert_eq!(vector::dxf_text("a\\U+0041"), "a\\U+005CU+0041");
+    // A lone percent sign starts no code and stays readable.
+    assert_eq!(vector::dxf_text("100 % on"), "100 % on");
+    assert_eq!(vector::dxf_text("%\t%d"), "\\U+0025\\U+0025d");
+    // Beyond U+FFFF there is no four-digit code; a five-digit one would be misread.
+    assert_eq!(vector::dxf_text("ok \u{1F600}"), "ok ?");
+    assert_eq!(vector::dxf_text("Ålesund\n"), "\\U+00C5lesund");
+}
+
+#[test]
 fn arcs_keep_their_side_in_svg_and_dxf() {
     // A quarter arc from 0 to 90 degrees clockwise on the page: from the right of the centre to
     // below it. In DXF (y up) that is from 270 to 360 counter-clockwise.

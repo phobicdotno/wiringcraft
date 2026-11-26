@@ -2672,11 +2672,14 @@ fn run(mut cli: Cli) -> Res<()> {
                     return Ok(());
                 }
                 PageCmd::Remove { id } => {
-                    let before = p.pages.len();
-                    p.pages.retain(|pg| pg.id != id);
-                    if p.pages.len() == before {
+                    if !p.pages.iter().any(|pg| pg.id == id) {
                         return Err(format!("no page {id:?}"));
                     }
+                    // Same rule as the app: a project keeps at least one page.
+                    if p.pages.len() <= 1 {
+                        return Err("A project needs at least one page.".into());
+                    }
+                    p.pages.retain(|pg| pg.id != id);
                 }
                 PageCmd::Overview { id, off } => {
                     let page = p
@@ -7348,6 +7351,24 @@ mod tests {
         cli(&dir, &["page", "cover", "c2", "--off"]).unwrap();
         assert!(covers(&dir).is_empty());
         assert!(cli(&dir, &["page", "cover", "nope"]).unwrap_err().contains("no page"));
+    }
+
+    #[test]
+    fn page_remove_keeps_the_last_page_of_a_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let ids = |dir: &Path| -> Vec<String> { load(dir).unwrap().pages.iter().map(|p| p.id.clone()).collect() };
+        let only = ids(&dir);
+        assert_eq!(only.len(), 1);
+        let err = cli(&dir, &["page", "remove", &only[0]]).unwrap_err();
+        assert!(err.contains("at least one page"), "{err}");
+        assert_eq!(ids(&dir), only);
+        // With two pages, removing one works.
+        cli(&dir, &["page", "add", "p0002", "--number", "2"]).unwrap();
+        cli(&dir, &["page", "remove", &only[0]]).unwrap();
+        assert_eq!(ids(&dir), ["p0002"]);
+        assert!(cli(&dir, &["page", "remove", "nope"]).unwrap_err().contains("no page"));
     }
 
     #[test]

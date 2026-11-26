@@ -372,12 +372,21 @@ fn aci(ink: &Stroke) -> u8 {
 }
 
 /// DXF text: ASCII as is, anything else as `\U+XXXX`, which DXF readers turn back into text.
-fn dxf_text(s: &str) -> String {
+/// A backslash, and a `%` next to another `%`, are written as codes too, so readers do not take
+/// them for a `\U+XXXX` or `%%` code; a character beyond U+FFFF, which has no four-digit code,
+/// becomes `?`.
+pub(crate) fn dxf_text(s: &str) -> String {
+    // Control characters are dropped first, so two `%` they stood between are seen as a pair.
+    let chars: Vec<char> = s.chars().filter(|c| !c.is_control()).collect();
     let mut out = String::new();
-    for ch in s.chars() {
+    for (i, &ch) in chars.iter().enumerate() {
+        let percent_pair =
+            ch == '%' && (i.checked_sub(1).and_then(|j| chars.get(j)) == Some(&'%') || chars.get(i + 1) == Some(&'%'));
         match ch {
-            c if c.is_ascii() && !c.is_control() => out.push(c),
-            c if c.is_control() => {}
+            '\\' => out.push_str("\\U+005C"),
+            '%' if percent_pair => out.push_str("\\U+0025"),
+            c if c.is_ascii() => out.push(c),
+            c if u32::from(c) > 0xFFFF => out.push('?'),
             c => {
                 let _ = write!(out, "\\U+{:04X}", c as u32);
             }
