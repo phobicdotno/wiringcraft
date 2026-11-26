@@ -116,6 +116,61 @@ fn push_closed(graphics: &mut Vec<Shape>, points: Vec<Point>, fill: bool) {
     });
 }
 
+/// The end shape QElectroTech draws at `tip` of a line coming from `from` (`end1`/`end2`), sized
+/// as QElectroTech sizes it from `len` (`lengthN`): `simple` is an open arrow and `triangle` a
+/// filled one, both `len` long and `len` to each side; `circle` is a dot of radius `len` touching
+/// the end; `diamond` reaches `2 * len` along the line and `len` to each side. `none` and unknown
+/// values add nothing. Returns how far the line's shaft is cut back from `tip`, so that it stops
+/// at the marker's inner edge, as QElectroTech draws it (0 for `simple`, `none` and unknown).
+fn line_end(graphics: &mut Vec<Shape>, kind: &str, tip: Point, from: Point, len: f64, fill: bool) -> f64 {
+    let (dx, dy) = (tip.x - from.x, tip.y - from.y);
+    let d = dx.hypot(dy);
+    if !(d > 1e-9 && len.is_finite() && len > 0.0) {
+        return 0.0;
+    }
+    // Unit vector out of the line end, and one across it.
+    let (ux, uy) = (dx / d, dy / d);
+    let at = |along: f64, across: f64| Point::new(tip.x - ux * along - uy * across, tip.y - uy * along + ux * across);
+    match kind {
+        "simple" => {
+            graphics.push(Shape::Line {
+                a: at(len, len),
+                b: tip,
+            });
+            graphics.push(Shape::Line {
+                a: at(len, -len),
+                b: tip,
+            });
+            0.0
+        }
+        "triangle" => {
+            graphics.push(Shape::Polyline {
+                points: vec![tip, at(len, len), at(len, -len)],
+                closed: true,
+                filled: true,
+            });
+            len
+        }
+        "circle" => {
+            graphics.push(Shape::Circle {
+                center: at(len, 0.0),
+                radius: len,
+                filled: fill,
+            });
+            2.0 * len
+        }
+        "diamond" => {
+            graphics.push(Shape::Polyline {
+                points: vec![tip, at(len, len), at(2.0 * len, 0.0), at(len, -len)],
+                closed: true,
+                filled: false,
+            });
+            2.0 * len
+        }
+        _ => 0.0,
+    }
+}
+
 /// Points on the ellipse in the box (`x`, `y`, `w`, `h`), from `start` sweeping `sweep` degrees
 /// counter-clockwise on screen (Qt's convention, 0 at three o'clock).
 fn ellipse_points(x: f64, y: f64, w: f64, h: f64, start: f64, sweep: f64) -> Vec<Point> {
@@ -342,10 +397,29 @@ fn shape(
     let mut skip = || *unknown.entry(tag.to_owned()).or_default() += 1;
     match tag {
         "line" => match (n("x1"), n("y1"), n("x2"), n("y2")) {
-            (Some(x1), Some(y1), Some(x2), Some(y2)) => graphics.push(Shape::Line {
-                a: pt(x1, y1),
-                b: pt(x2, y2),
-            }),
+            (Some(x1), Some(y1), Some(x2), Some(y2)) => {
+                let (a, b) = (pt(x1, y1), pt(x2, y2));
+                let (mut cut_a, mut cut_b) = (0.0, 0.0);
+                for (i, tip, from, cut) in [(1, a, b, &mut cut_a), (2, b, a, &mut cut_b)] {
+                    let Some(kind) = attr(e, &format!("end{i}")) else {
+                        continue;
+                    };
+                    let len = n(&format!("length{i}")).unwrap_or(1.5) * scale;
+                    *cut = line_end(graphics, &kind, tip, from, len, solid_fill(e));
+                }
+                // The shaft stops at the inner edge of the end shapes; none is left when they
+                // meet or overlap.
+                let d = (b.x - a.x).hypot(b.y - a.y);
+                if cut_a == 0.0 && cut_b == 0.0 {
+                    graphics.push(Shape::Line { a, b });
+                } else if cut_a + cut_b < d {
+                    let (ux, uy) = ((b.x - a.x) / d, (b.y - a.y) / d);
+                    graphics.push(Shape::Line {
+                        a: Point::new(a.x + ux * cut_a, a.y + uy * cut_a),
+                        b: Point::new(b.x - ux * cut_b, b.y - uy * cut_b),
+                    });
+                }
+            }
             _ => skip(),
         },
         "rect" => match (n("x"), n("y"), n("width"), n("height")) {
@@ -633,6 +707,85 @@ mod tests {
                 (ELLIPSE_STEPS, true, false)
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn line_ends_come_in_as_arrows_dots_and_diamonds() -> Result<()> {
+        let el = r#"<definition type="element"><description>
+<line x1="0" y1="0" x2="10" y2="0" end1="none" end2="triangle" length2="2" style="filling:none"/>
+<line x1="0" y1="10" x2="10" y2="10" end1="simple" end2="none"/>
+<line x1="0" y1="20" x2="0" y2="40" end1="circle" end2="diamond" length1="4" style="filling:black"/>
+<line x1="0" y1="50" x2="10" y2="50" end1="none" end2="wiggle"/>
+<line x1="0" y1="60" x2="3" y2="60" end1="circle" end2="none"/>
+<terminal x="0" y="0" orientation="n"/>
+</description></definition>"#;
+        let (imp, warnings) = element(el, "qet.ends", 1.0)?;
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let g = &imp.symbol.graphics;
+        let close = |a: Point, b: Point| (a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() < 1e-9;
+        // The filled arrow: tip at (x2, y2), 2 long and 2 to each side.
+        let tris: Vec<&Vec<Point>> = g
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Polyline {
+                    points, filled: true, ..
+                } => Some(points),
+                _ => None,
+            })
+            .collect();
+        let [tri] = tris.as_slice() else {
+            unreachable!("one filled arrow: {g:?}")
+        };
+        assert_eq!(tri.len(), 3);
+        assert!(close(tri[0], Point::new(10.0, 0.0)), "{tri:?}");
+        assert!(
+            tri[1..]
+                .iter()
+                .all(|p| (p.x - 8.0).abs() < 1e-9 && (p.y.abs() - 2.0).abs() < 1e-9)
+        );
+        // The open arrow: two short lines meeting at (x1, y1), 1.5 long and 1.5 to each side.
+        let tip = Point::new(0.0, 10.0);
+        let arms: Vec<Point> = g
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Line { a, b } if close(*b, tip) => Some(*a),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            arms.len() == 2
+                && arms
+                    .iter()
+                    .all(|a| close(*a, Point::new(1.5, 8.5)) || close(*a, Point::new(1.5, 11.5))),
+            "{arms:?}"
+        );
+        // A dot of radius 4 touching (x1, y1), filled as the style says, and a hollow diamond
+        // reaching 2 * 1.5 back from (x2, y2).
+        assert!(
+            g.iter()
+                .any(|s| matches!(s, Shape::Circle { center, radius, filled: true }
+            if close(*center, Point::new(0.0, 24.0)) && (*radius - 4.0).abs() < 1e-9))
+        );
+        assert!(g.iter().any(|s| matches!(s, Shape::Polyline { points, closed: true, filled: false }
+            if points.len() == 4 && close(points[0], Point::new(0.0, 40.0)) && close(points[2], Point::new(0.0, 37.0)))));
+        // The shafts stop at the inner edge of the markers; `simple`, `none` and unknown ends
+        // keep theirs.
+        for shaft in [
+            (Point::new(0.0, 0.0), Point::new(8.0, 0.0)),
+            (Point::new(0.0, 10.0), Point::new(10.0, 10.0)),
+            (Point::new(0.0, 28.0), Point::new(0.0, 37.0)),
+            (Point::new(0.0, 50.0), Point::new(10.0, 50.0)),
+        ] {
+            assert!(
+                g.iter()
+                    .any(|s| matches!(s, Shape::Line { a, b } if close(*a, shaft.0) && close(*b, shaft.1))),
+                "{shaft:?} in {g:?}"
+            );
+        }
+        // Four shafts, two arrow arms, one arrow, two dots, one diamond: the dot on the last
+        // line covers all of it, so no shaft is left there.
+        assert_eq!(g.len(), 10, "{g:?}");
         Ok(())
     }
 
