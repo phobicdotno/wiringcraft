@@ -2077,10 +2077,17 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
         )));
     }
     let (min, _) = wc_core::geom::bounds_of(&pts);
-    let shift = Point::new(20.0 - min.x, 20.0 - min.y);
-    out.graphics = out.graphics.iter().map(|s| s.translate(shift)).collect();
+    // Subtract the corner first and add the frame offset after: in one step `20 - min` would
+    // round the 20 away for a drawing far from its origin.
+    let back = Point::new(-min.x, -min.y);
+    let frame = Point::new(20.0, 20.0);
+    out.graphics = out
+        .graphics
+        .iter()
+        .map(|s| s.translate(back).translate(frame))
+        .collect();
     for s in &mut out.symbols {
-        s.at = s.at + shift;
+        s.at = s.at + back + frame;
     }
     Ok(out)
 }
@@ -2201,6 +2208,18 @@ mod tests {
             "{:?}",
             p.warnings
         );
+        Ok(())
+    }
+
+    /// A drawing very far from its own origin still lands at the frame offset, its size kept.
+    #[test]
+    fn a_drawing_very_far_out_keeps_the_frame_offset_and_its_length() -> Result<()> {
+        let ents = "0\nLINE\n10\n1e18\n20\n0\n11\n1000000000000000128\n21\n0\n";
+        let p = page(&dxf(ents, ""), 1.0, &BTreeSet::new())?;
+        let [Shape::Line { a, b }] = p.graphics.as_slice() else {
+            unreachable!("{:?}", p.graphics);
+        };
+        assert_eq!((*a, *b), (Point::new(20.0, 20.0), Point::new(148.0, 20.0)));
         Ok(())
     }
 
