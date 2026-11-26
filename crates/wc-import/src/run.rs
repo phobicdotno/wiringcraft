@@ -175,6 +175,20 @@ pub fn parts_csv(file: &Path, lib: &Path, log: &mut Log) -> Res<()> {
     Ok(())
 }
 
+/// The highest number an import may give its first new page: far above any real page number,
+/// and low enough that numbering the pages after it never runs past the largest number.
+pub const MAX_FIRST_PAGE: usize = 1_000_000_000;
+
+/// Refuse a first page number above [`MAX_FIRST_PAGE`], before anything is read or written.
+fn first_page_in_range(first_page: usize) -> Res<()> {
+    if first_page > MAX_FIRST_PAGE {
+        return Err(format!(
+            "the first page number {first_page} is too large: {MAX_FIRST_PAGE} at most"
+        ));
+    }
+    Ok(())
+}
+
 /// PDF pages as trace pages numbered from `first_page` (`import pdf`).
 pub fn pdf(dir: &Path, file: &Path, first_page: usize, log: &mut Log) -> Res<()> {
     let source = file
@@ -187,6 +201,7 @@ pub fn pdf(dir: &Path, file: &Path, first_page: usize, log: &mut Log) -> Res<()>
 
 /// An Eplan Electric P8 project (.elk, .edb folder or zip) into the project (`import eplan`).
 pub fn eplan(dir: &Path, path: &Path, first_page: usize, log: &mut Log) -> Res<()> {
+    first_page_in_range(first_page)?;
     let mut p = load(dir)?;
     let (tables, read_warnings) = eplan_tables(path)?;
     for w in &read_warnings {
@@ -234,6 +249,9 @@ pub fn swe(
     log: &mut Log,
 ) -> Res<()> {
     let project = pick;
+    if let Some(n) = first_page {
+        first_page_in_range(n)?;
+    }
     let started = std::time::Instant::now();
     let mut p = load(dir)?;
     // A database file directly, or an archive read from disk: only the picked project's
@@ -386,6 +404,7 @@ pub fn swe_library(dir: &Path, path: &Path, lib: Option<&Path>, log: &mut Log) -
 
 /// AutomationML devices and connections as overview pages (`import aml`).
 pub fn aml(dir: &Path, file: &Path, first_page: usize, log: &mut Log) -> Res<()> {
+    first_page_in_range(first_page)?;
     let mut p = load(dir)?;
     let text = read_file(file)?;
     let imp = crate::aml::parse(&String::from_utf8_lossy(&text)).map_err(e)?;
@@ -413,6 +432,7 @@ pub fn aml(dir: &Path, file: &Path, first_page: usize, log: &mut Log) -> Res<()>
 /// The open-format parts of another tool's project archive (`import archive`).
 pub fn archive(dir: &Path, file: &Path, first_page: usize, lib: Option<&Path>, log: &mut Log) -> Res<()> {
     use crate::archive::Kind;
+    first_page_in_range(first_page)?;
     let bytes = read_file(file)?;
     let entries = crate::archive::open_entries(
         &bytes,
@@ -728,6 +748,7 @@ pub fn save_imported(dir: &Path, p: &Project) -> Res<()> {
 /// the PDF in warnings (the file name, or the entry name inside an archive, where `file` is a
 /// staging file), already escaped with [`escape_field`] by the caller.
 pub fn import_pdf(dir: &Path, file: &Path, first_page: usize, source: &str, log: &mut Log) -> Result<(), String> {
+    first_page_in_range(first_page)?;
     let mut p = load(dir)?;
     let bytes = read_file(file)?;
     let traced = crate::pdf::pages(&bytes).map_err(e)?;
@@ -1764,6 +1785,29 @@ mod tests {
             Ok(t) => t,
             Err(x) => unreachable!("no temp folder: {x}"),
         }
+    }
+
+    #[test]
+    fn a_first_page_number_too_large_to_count_on_from_is_refused_before_anything_is_read() {
+        let tmp = tmp();
+        let (dir, file) = (tmp.path().join("p"), tmp.path().join("missing"));
+        for first in [MAX_FIRST_PAGE + 1, usize::MAX] {
+            let mut log = Log::default();
+            let said = [
+                pdf(&dir, &file, first, &mut log),
+                import_pdf(&dir, &file, first, "x", &mut log),
+                eplan(&dir, &file, first, &mut log),
+                swe(&dir, &file, 1, Some(first), None, &mut log),
+                aml(&dir, &file, first, &mut log),
+                archive(&dir, &file, first, None, &mut log),
+            ];
+            for r in said {
+                assert!(matches!(&r, Err(why) if why.contains("is too large")), "{r:?}");
+            }
+        }
+        // The largest allowed gets as far as the project, which is not there.
+        let r = pdf(&dir, &file, MAX_FIRST_PAGE, &mut Log::default());
+        assert!(matches!(&r, Err(why) if !why.contains("is too large")), "{r:?}");
     }
 
     #[test]
