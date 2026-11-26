@@ -1866,6 +1866,12 @@ fn run(cli: Cli) -> Res<()> {
         }
         _ => None,
     };
+    let mut wago_bytes = match &cli.cmd {
+        Cmd::Import(ImportCmd::Wago { file }) => {
+            Some(std::fs::read(file).map_err(|x| format!("{}: {x}", file.display()))?)
+        }
+        _ => None,
+    };
     let _lock = match cli.cmd {
         Cmd::New { .. } => None,
         _ => project_lock(dir),
@@ -2970,7 +2976,7 @@ fn run(cli: Cli) -> Res<()> {
             save(dir, &p)?;
         }
         Cmd::Lib(lc) => lib_cmd(dir, lc)?,
-        Cmd::Import(ic) => import_cmd(dir, ic)?,
+        Cmd::Import(ic) => import_cmd(dir, ic, wago_bytes.take())?,
         Cmd::Pdf {
             out,
             pages,
@@ -3452,7 +3458,8 @@ fn lib_cmd(dir: &Path, lc: LibCmd) -> Res<()> {
     Ok(())
 }
 
-fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
+/// `wago_bytes`: the input of `import wago`, read already (before the project lock).
+fn import_cmd(dir: &Path, ic: ImportCmd, wago_bytes: Option<Vec<u8>>) -> Res<()> {
     match ic {
         ImportCmd::SymbolDxf {
             file,
@@ -3573,7 +3580,10 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             }
         }
         ImportCmd::Wago { file } => {
-            let done = import_wago(dir, &file)?;
+            let done = match wago_bytes {
+                Some(bytes) => import_wago_bytes(dir, &bytes)?,
+                None => import_wago(dir, &file)?,
+            };
             for w in &done.warnings {
                 eprintln!("warning: {}", escape_field(w));
             }
@@ -4603,7 +4613,12 @@ struct WagoImported {
 /// left alone. Nothing else is saved when no row changes.
 fn import_wago(dir: &Path, file: &Path) -> Res<WagoImported> {
     let bytes = std::fs::read(file).map_err(|x| format!("{}: {x}", file.display()))?;
-    let (rows, mut warnings) = wc_import::wago::read_configured(&bytes).map_err(e)?;
+    import_wago_bytes(dir, &bytes)
+}
+
+/// [`import_wago`] from the file's bytes, read already (before the project lock).
+fn import_wago_bytes(dir: &Path, bytes: &[u8]) -> Res<WagoImported> {
+    let (rows, mut warnings) = wc_import::wago::read_configured(bytes).map_err(e)?;
     let mut p = load(dir)?;
     let (symbols, missing) = store::vendored_symbols(dir, &p);
     warnings.extend(missing.iter().map(|m| {

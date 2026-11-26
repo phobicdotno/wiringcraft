@@ -225,3 +225,68 @@ fn a_command_reads_a_named_fifo_before_it_waits_for_the_lock() -> TestResult {
     assert!(toml.contains("max-wires"), "{toml}");
     Ok(())
 }
+
+/// `import wago` reads its file before the lock as well, so a FIFO fed by an export of the same
+/// project cannot hold both up.
+#[cfg(unix)]
+#[test]
+fn a_wago_import_reads_a_named_fifo_before_it_waits_for_the_lock() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    new_project(&dir)?;
+    let exported = tmp.path().join("wago.csv");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("-C")
+        .arg(&dir)
+        .args(["export", "wago-configurator"])
+        .arg(&exported)
+        .stdout(Stdio::null())
+        .status()?;
+    assert!(status.success());
+    let content = std::fs::read(&exported)?;
+    let fifo = tmp.path().join("wago.fifo");
+    assert!(Command::new("mkfifo").arg(&fifo).status()?.success());
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(".wiringcraft.lock"))?;
+    lock.lock()?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("-C")
+        .arg(&dir)
+        .args(["import", "wago"])
+        .arg(&fifo)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let writer = {
+        let fifo = fifo.clone();
+        std::thread::spawn(move || std::fs::OpenOptions::new().write(true).open(&fifo)?.write_all(&content))
+    };
+    let start = Instant::now();
+    while !writer.is_finished() && start.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let read_first = writer.is_finished();
+    let waits = !ends_within(&mut child, Duration::from_millis(300))?;
+    lock.unlock()?;
+    let ended = ends_within(&mut child, Duration::from_secs(20))?;
+    if !ended {
+        child.kill()?;
+    }
+    let out = child.wait_with_output()?;
+    if !writer.is_finished() {
+        drop(std::fs::File::open(&fifo));
+    }
+    let written = writer.join();
+    assert!(read_first, "the FIFO is read before the lock is taken");
+    assert!(waits, "it waits for the lock");
+    assert!(ended, "it runs once the lock is free");
+    let Ok(Ok(())) = written else {
+        unreachable!("the input was written");
+    };
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    Ok(())
+}

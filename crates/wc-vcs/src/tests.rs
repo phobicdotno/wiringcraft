@@ -370,12 +370,19 @@ fn a_linked_worktree_leaves_the_lock_out_too() -> Result<()> {
     // A .gitignore from before the lock existed.
     std::fs::write(dir.join(".gitignore"), "/target\n").map_err(|e| wc_core::Error::io("write", e))?;
     Git::new(&dir).init()?;
+    // As a repository made before the lock existed: the shared exclude list does not name it.
+    let exclude = dir.join(".git/info/exclude");
+    std::fs::write(&exclude, "# mine\n").map_err(|e| wc_core::Error::io("write", e))?;
     let wt = tmp.path().join("wt");
     git_out(&dir, &["worktree", "add", "-q", "-b", "side", &wt.to_string_lossy()])?;
     std::fs::write(wt.join(LOCK_FILE), "").map_err(|e| wc_core::Error::io("write", e))?;
+    let status = git_out(&wt, &["status", "--porcelain"])?;
+    assert!(status.contains(LOCK_FILE), "untracked at first: {status}");
     let side = Git::new(&wt);
     side.exclude_locally(LOCK_FILE)?;
     assert!(git_out(&wt, &["status", "--porcelain"])?.is_empty());
+    let text = std::fs::read_to_string(&exclude).map_err(|e| wc_core::Error::io("read", e))?;
+    assert_eq!(text, "# mine\n/.wiringcraft.lock\n");
     Ok(())
 }
 
@@ -395,5 +402,23 @@ fn an_exclude_list_that_cannot_be_read_is_reported_and_left_alone() -> Result<()
     };
     assert!(path.ends_with("exclude"), "{path}");
     assert!(exclude.is_dir(), "left as it was");
+    Ok(())
+}
+
+#[test]
+fn a_failed_write_leaves_the_exclude_list_as_it_was() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    store::create(dir, "Demo")?;
+    let git = Git::new(dir);
+    git.init()?;
+    let exclude = dir.join(".git/info/exclude");
+    let before = std::fs::read(&exclude).map_err(|e| wc_core::Error::io("read", e))?;
+    // A folder where the new list would be written: the write fails.
+    let scratch = crate::git::exclude_scratch(&exclude);
+    std::fs::create_dir(&scratch).map_err(|e| wc_core::Error::io("mkdir", e))?;
+    assert!(git.exclude_locally("other.lock").is_err());
+    let after = std::fs::read(&exclude).map_err(|e| wc_core::Error::io("read", e))?;
+    assert_eq!(after, before);
     Ok(())
 }

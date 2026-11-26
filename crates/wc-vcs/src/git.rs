@@ -30,6 +30,14 @@ pub const PARENT_PROJECT_ENV: &str = "WIRINGCRAFT_GIT_PARENT_PROJECT";
 /// [`Git::exclude_locally`] keeps it out of repositories whose `.gitignore` does not.
 pub const LOCK_FILE: &str = ".wiringcraft.lock";
 
+/// Where [`Git::exclude_locally`] writes the new exclude list before renaming it over `at`:
+/// beside it, named after this process so two processes never write the same file.
+pub(crate) fn exclude_scratch(at: &Path) -> PathBuf {
+    let mut name = at.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(format!(".{}.new", std::process::id()));
+    at.with_file_name(name)
+}
+
 /// A project folder's git repository.
 #[derive(Debug, Clone)]
 pub struct Git {
@@ -172,7 +180,17 @@ impl Git {
         if let Some(parent) = at.parent() {
             std::fs::create_dir_all(parent).map_err(io)?;
         }
-        std::fs::write(&at, bytes).map_err(io)
+        // Written whole to a file beside it, then renamed over it: a failed write leaves the
+        // list as it was, and a command reading it meanwhile never sees it cut short.
+        let new = exclude_scratch(&at);
+        if let Err(err) = std::fs::write(&new, bytes) {
+            let _ = std::fs::remove_file(&new);
+            return Err(io(err));
+        }
+        std::fs::rename(&new, &at).map_err(|err| {
+            let _ = std::fs::remove_file(&new);
+            io(err)
+        })
     }
 
     pub fn is_repo(&self) -> bool {
