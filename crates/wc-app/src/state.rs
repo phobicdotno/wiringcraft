@@ -4953,6 +4953,28 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), outside);
     }
 
+    /// When the project's version cannot be staged (every staging name taken), the file that
+    /// was moved aside goes back where it was, untouched (#670).
+    #[test]
+    fn a_repair_that_cannot_stage_puts_the_file_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("m.yaml");
+        std::fs::write(&path, "left").unwrap();
+        for n in 0..1000u32 {
+            let name = format!(".m.yaml.wc-new-{}-{n}", std::process::id());
+            std::fs::write(tmp.path().join(name), "").unwrap();
+        }
+        let left = Found::Bytes(Some(b"left".to_vec()));
+        let err = repair_file(&path, Some(b"new"), &left).err().unwrap();
+        assert!(err.to_string().contains("no free name"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"left", "put back");
+        let aside = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains("wc-aside"))
+            .count();
+        assert_eq!(aside, 0, "nothing left aside");
+    }
+
     /// A reserved name is a file made by the reservation itself, so a second reservation (or
     /// another program) never gets the same one (#670).
     #[test]
