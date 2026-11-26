@@ -376,3 +376,25 @@ fn a_project_macro_is_shown_and_edited_and_a_library_one_is_not() -> TestResult 
     assert!(m.value_sets.iter().all(|v| !v.values.contains_key("voltage")));
     Ok(())
 }
+
+#[test]
+fn an_unreadable_macro_file_is_named_escaped() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    // Linux allows control characters in a folder name.
+    let dir = tmp.path().join("p\u{1b}[2J");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    std::fs::create_dir_all(dir.join("macros"))?;
+    std::fs::write(dir.join("macros/broken.json"), "{ not json")?;
+    let Err(err) = wiringcraft(&dir, &["macro", "show", "Nothing"]) else {
+        return Err("showed a macro that is not there".into());
+    };
+    assert!(err.contains("broken.json"), "{err:?}");
+    assert!(!err.contains('\u{1b}'), "{err:?}");
+    assert!(err.contains("p\\u{1b}[2J"), "{err:?}");
+    Ok(())
+}

@@ -1874,7 +1874,12 @@ fn find_macro<'a>(found: &'a [FoundMacro], name: &str) -> Res<&'a FoundMacro> {
         match wc_core::macros::read_macro(&f.path) {
             Ok(m) if m.name.eq_ignore_ascii_case(name.trim()) => return Ok(f),
             Ok(_) => {}
-            Err(err) => unread.push(format!("{}: {err}", f.path.display())),
+            // Escaped: a folder name or a read error could hold control characters.
+            Err(err) => unread.push(format!(
+                "{}: {}",
+                escape_field(&f.path.display().to_string()),
+                escape_field(&err.to_string())
+            )),
         }
     }
     if unread.is_empty() {
