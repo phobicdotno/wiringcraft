@@ -5404,6 +5404,38 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_from_the_menu_or_assistant_does_nothing_while_the_symbol_editor_is_open() {
+        let (_tmp, mut a) = app(vec![]);
+        let o = a.open.as_mut().unwrap();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        o.place(page, "wc.coil", Point::new(50.0, 50.0)).unwrap();
+        a.ed.page = page;
+        a.ed.selection = a.open.as_ref().unwrap().select_all(page);
+        let selection = a.ed.selection.clone();
+        let before = a.open.as_ref().unwrap().project.pages[page].clone();
+        let undo_before = a.open.as_ref().unwrap().undo_mark();
+        a.symbol_editor = Some(crate::symbol_editor::SymbolEditor::new(Vec::new()));
+
+        a.run(Action::Duplicate);
+        assert_eq!(
+            a.open.as_ref().unwrap().project.pages[page],
+            before,
+            "the page is unchanged"
+        );
+        assert_eq!(a.open.as_ref().unwrap().undo_mark(), undo_before);
+        assert_eq!(a.ed.selection, selection);
+        assert!(a.ed.message.contains("symbol editor"), "{}", a.ed.message);
+
+        // With the editor closed, Duplicate works again.
+        a.symbol_editor = None;
+        a.run(Action::Duplicate);
+        assert_eq!(
+            a.open.as_ref().unwrap().project.pages[page].symbols.len(),
+            before.symbols.len() + 1
+        );
+    }
+
+    #[test]
     fn editing_actions_are_off_and_do_nothing_on_a_page_someone_else_holds() {
         use crate::chrome::Status;
         let (_tmp, mut a) = app(vec![]);

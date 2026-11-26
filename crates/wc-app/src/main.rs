@@ -1315,6 +1315,12 @@ impl App {
             self.ed.message = format!("{name} has this page open; it is read-only here until they leave it.");
             return;
         }
+        // The keys are held back while the symbol editor is open; the menu, toolbar and
+        // assistant are too, so the schematic does not change under the editor.
+        if a == Action::Duplicate && self.symbol_editor.is_some() {
+            self.ed.message = "Duplicate was not done: close the symbol editor first.".into();
+            return;
+        }
         if a == Action::ReportProblem {
             self.dialog = Some(Dialog::Report {
                 log: applog::tail(REPORT_LOG_BYTES),
