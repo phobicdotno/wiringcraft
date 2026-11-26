@@ -1407,9 +1407,10 @@ impl App {
                 Ok(n) => self.ed.message = format!("Saved ({n} files changed)."),
                 // A file changed outside that Save would write over asks first (#662).
                 Err(e) => {
+                    // Only when that is what stopped this save: another error is shown as it is.
                     self.dialog = Some(match open.changed_outside() {
-                        Some(path) => Dialog::ChangedOutside(path),
-                        None => Dialog::Message(format!("Saving failed:\n{e}")),
+                        Some(path) if e.contains(state::Open::CHANGED_OUTSIDE) => Dialog::ChangedOutside(path),
+                        _ => Dialog::Message(format!("Saving failed:\n{e}")),
                     });
                 }
             },

@@ -395,8 +395,10 @@ pub struct Open {
     unwritten_files: BTreeMap<PathBuf, Option<Vec<u8>>>,
     /// For each of [`Open::unwritten_files`], what the file held when WiringCraft last wrote
     /// (or failed to write) it, so the next save can tell a change made outside since then
-    /// and does not write over it unasked (#662). Missing when the file could not be read.
-    unwritten_found: BTreeMap<PathBuf, Option<Vec<u8>>>,
+    /// and does not write over it unasked (#662). `Err` (with why) when it could not be read
+    /// then: any file there that is not what the project needs counts as changed outside.
+    /// Missing once the user chose to write over it.
+    unwritten_found: BTreeMap<PathBuf, Result<Option<Vec<u8>>, String>>,
     /// Project files rewritten while a [`Mark`] is open (`marks` counts them), oldest first,
     /// so [`Open::back_to`] puts them back even when their undo steps fell off the history.
     mark_edits: Vec<FileEdit>,
@@ -2027,10 +2029,7 @@ impl Open {
                 .strip_prefix(&self.dir)
                 .map_or_else(|_| path.clone(), Path::to_path_buf);
             // What the file holds now, as WiringCraft left it: a later change is from outside.
-            match snapshot_file(&path) {
-                Ok(found) => self.unwritten_found.insert(rel.clone(), found),
-                Err(_) => self.unwritten_found.remove(&rel),
-            };
+            self.unwritten_found.insert(rel.clone(), snapshot_file(&path));
             if replace {
                 self.unwritten_files.insert(rel, should);
             } else {
@@ -2055,7 +2054,12 @@ impl Open {
             let path = self.dir.join(rel);
             // A file that cannot be read now is the save's to report.
             let now = snapshot_file(&path).ok()?;
-            (now != *found && now != *should).then_some(path)
+            let changed = match found {
+                Ok(found) => now != *found,
+                // Not known what WiringCraft left there: a file there now may be from outside.
+                Err(_) => now.is_some(),
+            };
+            (changed && now != *should).then_some(path)
         })
     }
 
@@ -2122,14 +2126,24 @@ impl Open {
     /// Write again every project file a failed Undo or Redo, or a change taken back, could not
     /// write. A save does not go ahead while one cannot be: the saved project would not match
     /// the file (a macro's undo history would be lost).
+    /// Part of the message of a save refused by [`Open::changed_outside`], for the app to tell it
+    /// from other save errors.
+    pub(crate) const CHANGED_OUTSIDE: &str =
+        "was changed outside WiringCraft after an Undo or Redo could not write it as the project needs it";
+
     fn put_back_unwritten_files(&mut self) -> Result<(), String> {
         // Nothing is written while one of them was changed outside since: that is not lost
         // unasked.
         if let Some(path) = self.changed_outside() {
+            let rel = path.strip_prefix(&self.dir).unwrap_or(&path);
+            let unread = match self.unwritten_found.get(rel) {
+                Some(Err(why)) => format!(" (it could not be read when WiringCraft left it: {why})"),
+                _ => String::new(),
+            };
             return Err(format!(
-                "not saved: {} was changed outside WiringCraft after an Undo or Redo could not write it \
-                 as the project needs it. Keep that version, or write the project's version over it.",
-                path.display()
+                "not saved: {} {}{unread}. Keep that version, or write the project's version over it.",
+                path.display(),
+                Self::CHANGED_OUTSIDE
             ));
         }
         for (rel, should) in self.unwritten_files.clone() {
@@ -4370,6 +4384,33 @@ pub(crate) mod tests {
         o.write_over_outside_version(&path);
         o.save().unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), two, "as the project needs it");
+    }
+
+    /// A repair noted while the file could not be read (a folder in its place): a macro file
+    /// put there later by another program is not written over unasked, and the message says
+    /// why the file was not known (#662).
+    #[test]
+    fn a_save_does_not_write_over_a_file_put_where_an_unreadable_one_was() {
+        let (_tmp, mut o, path, [_, _, two]) = macro_edited_twice();
+        let held = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        o.keep_unwritten(vec![(path.clone(), Some(two.clone().into_bytes()))], true);
+        std::fs::remove_dir(&path).unwrap();
+        let outside = format!("{two}\n# put here by another program\n");
+        std::fs::write(&path, &outside).unwrap();
+        assert_eq!(o.changed_outside(), Some(path.clone()));
+        let err = o.save().unwrap_err();
+        assert!(
+            err.contains(Open::CHANGED_OUTSIDE) && err.contains("could not be read"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), outside);
+        // The project's version is the same as what it held: nothing to ask.
+        std::fs::write(&path, &held).unwrap();
+        assert_eq!(o.changed_outside(), None);
+        o.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), two);
     }
 
     #[test]
