@@ -632,13 +632,31 @@ fn in_work_tree_sees_the_projects_own_and_a_larger_repository() -> Result<()> {
     store::create(dir, "Demo")?;
     let git = Git::new(dir);
     git.init()?;
-    assert!(git.in_work_tree());
+    assert!(git.in_work_tree()?);
     // A project in a subfolder of a larger repository can keep versions there.
     let sub = dir.join("sub");
     std::fs::create_dir(&sub).map_err(|e| wc_core::Error::io("sub", e))?;
-    assert!(Git::new(&sub).in_work_tree());
-    // Git's own folder is no work tree, nor is a folder that does not exist.
-    assert!(!Git::new(dir.join(".git")).in_work_tree());
-    assert!(!Git::new(dir.join("gone")).in_work_tree());
+    assert!(Git::new(&sub).in_work_tree()?);
+    // Git's own folder is no work tree.
+    assert!(!Git::new(dir.join(".git")).in_work_tree()?);
+    // A folder that does not exist is an error naming it, not "no repository".
+    let gone = dir.join("gone");
+    let missing = Git::new(&gone).in_work_tree();
+    assert!(
+        matches!(&missing, Err(Error::Io { path, .. }) if *path == gone.display().to_string()),
+        "expected the missing folder as the error, got {missing:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn in_work_tree_is_false_where_git_finds_no_repository() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    // A `.git` file pointing nowhere: git stops here with "not a git repository" whatever
+    // repository the temporary folder may sit in.
+    let gitdir = format!("gitdir: {}\n", dir.join("none").display());
+    std::fs::write(dir.join(".git"), gitdir).map_err(|e| wc_core::Error::io(".git", e))?;
+    assert!(!Git::new(dir).in_work_tree()?);
     Ok(())
 }

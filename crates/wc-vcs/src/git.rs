@@ -132,8 +132,14 @@ impl Git {
     }
 
     pub(crate) fn run(&self, args: &[&str]) -> Result<String> {
+        self.run_env(args, &[])
+    }
+
+    /// [`Git::run`] with these extra variables set for git.
+    fn run_env(&self, args: &[&str], envs: &[(&str, &str)]) -> Result<String> {
         let out = Command::new("git")
             .args(args)
+            .envs(envs.iter().copied())
             .current_dir(&self.dir)
             .env("GIT_TERMINAL_PROMPT", "0")
             .env(PARENT_PROJECT_ENV, self.full_dir())
@@ -210,10 +216,24 @@ impl Git {
     }
 
     /// Whether git can keep versions here: the project folder is in a work tree, its own
-    /// repository's or that of a larger one it sits in.
-    pub fn in_work_tree(&self) -> bool {
-        self.run(&["rev-parse", "--is-inside-work-tree"])
-            .is_ok_and(|s| s.trim() == "true")
+    /// repository's or that of a larger one it sits in. `false` only when git ran and found
+    /// none; a folder that is not there, git that cannot be started, or any other refusal of
+    /// git's is an error with its reason.
+    pub fn in_work_tree(&self) -> Result<bool> {
+        // Checked first: git started in a missing folder fails like git that is not installed.
+        std::fs::metadata(&self.dir).map_err(|source| Error::Io {
+            path: self.dir.display().to_string(),
+            source,
+        })?;
+        // Git's own words, untranslated, so its "not a git repository" is recognised.
+        match self.run_env(
+            &["rev-parse", "--is-inside-work-tree"],
+            &[("LC_ALL", "C"), ("LANGUAGE", "C")],
+        ) {
+            Ok(s) => Ok(s.trim() == "true"),
+            Err(Error::Git { message, .. }) if message.contains("not a git repository") => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// Make the project folder a repository (no-op when it is one) and record a first version.

@@ -46,3 +46,27 @@ fn vcs_commands_without_a_repository_say_to_run_vcs_init() -> TestResult {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     Ok(())
 }
+
+#[test]
+fn vcs_commands_say_when_git_cannot_be_run() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let Some(dir_arg) = dir.to_str() else {
+        unreachable!("temporary path is not UTF-8")
+    };
+    assert!(run(tmp.path(), &["new", "--no-git", dir_arg])?.status.success());
+    // A search path with nothing on it: git cannot be started, and that is the error, not
+    // "run vcs init" (the project may well have a repository).
+    let empty = tmp.path().join("no-programs");
+    std::fs::create_dir(&empty)?;
+    let out = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .current_dir(&dir)
+        .env("PATH", &empty)
+        .args(["vcs", "log"])
+        .output()?;
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("cannot run git"), "{err}");
+    assert!(!err.contains("vcs init"), "{err}");
+    Ok(())
+}
