@@ -46,7 +46,6 @@ deleted. The other four:
 
 | Gap | Todo |
 |---|---|
-| File > Import does not offer every CLI import option (SolidWorks and EDZ symbol map, an archive's KiCad libraries and parts lists; the DWG and DXF scale, the first page number and the SolidWorks project choice are offered) | #586 |
 | Assistant: `get_report` cannot read the plc-cards and networks reports | #537 |
 | Assistant: `add_graphic` and `update_graphic` cannot make dimensions or filled polylines | #539 |
 | Assistant: the `run_command` tool description leaves out half the command line | #540 |
