@@ -2598,6 +2598,7 @@ impl Open {
     pub fn ensure_symbols<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
         self.touch();
         let (lock, symbols) = (self.project.lock.clone(), self.symbols.clone());
+        let library = self.library.clone();
         // Putting a terminal copy back follows terminals: jumpers, rail orders and the device
         // data and panel places of spares a strip took along all go back too.
         let (meta, terminals) = (self.project.meta.clone(), self.terminals_before.clone());
@@ -2606,6 +2607,7 @@ impl Open {
             if let Err(e) = self.ensure_symbol(id) {
                 self.project.lock = lock;
                 self.symbols = symbols;
+                self.library = library;
                 self.project.meta = meta;
                 self.project.devices = devices;
                 self.project.panels = panels;
@@ -2650,7 +2652,7 @@ impl Open {
             // settled with it, and tracking starts again from the pinned copy, so putting it
             // back does not read as terminals moved.
             self.follow_terminals();
-            self.symbols.insert(id.to_owned(), fixed);
+            self.load_symbol(id, fixed);
             if self.terminals_before.is_some() {
                 self.terminals_before = Some(self.terminal_numbers());
             }
@@ -2665,8 +2667,21 @@ impl Open {
                 store::read_vendored_symbol(&self.dir, id).map_err(|e| e.to_string())?
             }
         };
-        self.symbols.insert(id.to_owned(), s);
+        self.load_symbol(id, s);
         Ok(())
+    }
+
+    /// Load `s` as the project's symbol `id`, and list it with its own name and description.
+    fn load_symbol(&mut self, id: &str, s: Symbol) {
+        let entry = LibraryEntry::of(id, &s);
+        match self.library.iter_mut().find(|e| e.id == id) {
+            Some(row) => *row = entry,
+            None => {
+                let at = self.library.partition_point(|e| e.id.as_str() < id);
+                self.library.insert(at, entry);
+            }
+        }
+        self.symbols.insert(id.to_owned(), s);
     }
 
     /// The version of symbol `id` that `pin` names: its copy in the project, or, when there is
@@ -6086,6 +6101,29 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_pinned_symbol_put_back_is_listed_with_its_own_description() {
+        let (tmp, mut o) = project();
+        o.ensure_symbol("wc.coil").unwrap();
+        let old = o.symbols["wc.coil"].clone();
+        o.save().unwrap();
+        std::fs::remove_file(store::vendor_path(&o.dir, ItemKind::Symbol, "wc.coil").unwrap()).unwrap();
+        let mut o = Open::load(&o.dir).unwrap();
+        // The library that wins for the id has a newer version with another description.
+        let mut new = old.clone();
+        new.description = "Solenoid winding".into();
+        library_first(&mut o, tmp.path(), &new);
+        o.refresh_library();
+        let listed = |o: &Open| o.library.iter().find(|e| e.id == "wc.coil").unwrap().clone();
+        assert_eq!(listed(&o).description, new.description);
+        // Placing puts back the pinned version: the list follows it.
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        assert_eq!(o.symbols["wc.coil"], old);
+        assert_eq!(listed(&o).description, old.description);
+        assert!(!listed(&o).matches("solenoid"));
+        assert_eq!(o.library.iter().filter(|e| e.id == "wc.coil").count(), 1);
+    }
+
+    #[test]
     fn a_pinned_symbol_loaded_in_another_version_is_not_placed() {
         let (_tmp, mut o) = project();
         let id = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
@@ -6396,11 +6434,13 @@ pub(crate) mod tests {
         let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library/symbols/wc.breaker.1p.json");
         std::fs::copy(starter, tmp.path().join("mine/symbols/wc.breaker.1p.json")).unwrap();
         let before = o.project.clone();
+        let listed = o.library.clone();
         let undo = o.can_undo();
         let err = o.paste(1, &clip, Point::new(80.0, 80.0)).unwrap_err();
         assert!(err.contains("wc.coil"), "the symbol is named: {err}");
         assert_eq!(o.project, before, "nothing is added, not even the breaker's pin");
         assert!(!o.symbols.contains_key("wc.breaker.1p"));
+        assert_eq!(o.library, listed, "the symbol list goes back too");
         assert_eq!(o.can_undo(), undo, "no undo step");
         let path = o.save_macro(&clip, "Coil", "").unwrap();
         let err = o.insert_macro(1, &path, None).unwrap_err();
