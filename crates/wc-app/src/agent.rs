@@ -2248,6 +2248,7 @@ impl App {
             return Ok(pretty(&json!({
                 "open": false,
                 "recent_projects": self.prefs.recent,
+                "session": Value::Null,
             })));
         };
         let pages: Vec<Value> = open
@@ -7322,6 +7323,15 @@ mod tests {
         a.share = h;
         let out = call(&mut a, "add_page", json!({"title": "Pumps"})).unwrap();
         assert!(!out.contains("Pending"), "{out}");
+    }
+
+    #[test]
+    fn get_state_without_a_project_gives_the_session_as_null() {
+        let (_tmp, mut a) = app(vec![]);
+        a.open = None;
+        let state: Value = serde_json::from_str(&call(&mut a, "get_state", json!({})).unwrap()).unwrap();
+        assert_eq!(state["open"], json!(false));
+        assert!(state.get("session").is_some_and(Value::is_null), "{state}");
     }
 
     #[test]
