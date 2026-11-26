@@ -4,12 +4,13 @@
 //! custom non-graphic objects, which are not counted.
 //!
 //! Layout as AutoCAD writes it (the Open Design Alliance specification): a 16-byte sentinel, the size of
-//! the class data (RL), for 2010 drawings of maintenance release 4 and later a second size (RL),
+//! the class data (RL), for 2010 and 2013 drawings of maintenance release 4 and later and for
+//! every 2018 drawing a second size (RL),
 //! from 2007 the data's size in bits (RL); then the highest class number (BS), two bytes and a
 //! bit, and for each class its number (BS), proxy flags (BS), application, C++ and DXF names,
 //! whether it was a zombie (B), its item class id (BS: 0x1F2 entity, 0x1F3 object), the number
 //! of instances, two version numbers and two unknown numbers (BL each). Names are TV in the data
-//! (2004) or TU in a string stream at the end of the data (2007 and 2010).
+//! (2004) or TU in a string stream at the end of the data (2007 and later).
 
 use std::collections::HashMap;
 
@@ -62,15 +63,15 @@ pub(crate) fn read_classes(data: &[u8], version: Version, maint: u8) -> Result<H
         return Err(damaged("it does not start with its sentinel"));
     }
     // From 2007 the data has its size in bits and its names in a string stream (TU).
-    let r2007 = matches!(version, Version::R2007 | Version::R2010);
+    let r2007 = version >= Version::R2007;
     let mut head = Bits::new(data, SENTINEL.len() * 8, data.len() * 8);
     let size = head.rl().map_err(|e| damaged(&e.to_string()))? as usize;
     let mut strings = None;
     let data_end;
     if r2007 {
-        // In 2010 drawings from maintenance release 4 a second size follows, and everything
-        // after moves 4 bytes; 2007 drawings never have it.
-        let second = version == Version::R2010 && maint > 3;
+        // In 2010 and 2013 drawings from maintenance release 4, and in all 2018 drawings, a
+        // second size follows, and everything after moves 4 bytes; 2007 drawings never have it.
+        let second = version >= Version::R2018 || (version >= Version::R2010 && maint > 3);
         if second {
             head.rl().map_err(|e| damaged(&e.to_string()))?;
         }

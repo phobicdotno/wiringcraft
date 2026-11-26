@@ -54,6 +54,17 @@ impl W {
             _ => self.bb(0).rs(v),
         }
     }
+    /// A SPLINE's scenario (1 control points, 2 fit points); from 2013 on followed by the
+    /// spline flags (bit 1: fit points) and the knot parameter (15: custom knots) that say
+    /// the same.
+    fn scenario(&mut self, v: Version, scenario: u32) -> &mut Self {
+        self.bl(scenario);
+        if v >= Version::R2013 {
+            let fit = scenario == 2;
+            self.bl(u32::from(fit)).bl(if scenario == 1 { 15 } else { 0 });
+        }
+        self
+    }
     fn bl(&mut self, v: u32) -> &mut Self {
         match v {
             0 => self.bb(2),
@@ -220,14 +231,14 @@ impl Obj {
             Version::R2004 => {
                 self.data.t8(s);
             }
-            Version::R2007 | Version::R2010 => {
+            _ => {
                 self.strings.tu(s);
             }
         }
         self
     }
 
-    /// The texts, their size and a flag, at the end of the data (2007 and 2010).
+    /// The texts, their size and a flag, at the end of the data (2007 on).
     fn string_stream(&self, w: &mut W) {
         if self.strings.0.is_empty() {
             w.b(false);
@@ -264,7 +275,7 @@ impl Obj {
                 out.extend(bytes);
                 out
             }
-            Version::R2010 => {
+            _ => {
                 match self.kind {
                     0..=255 => w.bb(0).rc(self.kind as u8),
                     k if (0x1F0..0x1F0 + 256).contains(&k) => w.bb(1).rc((k - 0x1F0) as u8),
@@ -296,6 +307,10 @@ fn entry(v: Version, kind: u16, handle: u64, name: &str) -> Obj {
 fn named(v: Version, kind: u16, handle: u64, name: &str) -> Obj {
     let mut o = Obj::new(v, kind, handle);
     o.data.bs(0).bl(0).b(true);
+    // Data in the data store, from 2013 on.
+    if v >= Version::R2013 {
+        o.data.b(false);
+    }
     o.text(name);
     o
 }
@@ -336,7 +351,7 @@ fn entity(v: Version, kind: u16, handle: u64, h: Head) -> Obj {
         d.b(true);
         match v {
             Version::R2004 | Version::R2007 => d.rl(2),
-            Version::R2010 => d.bll(2),
+            _ => d.bll(2),
         };
         d.rc(0xAB).rc(0xCD);
     } else {
@@ -344,6 +359,10 @@ fn entity(v: Version, kind: u16, handle: u64, h: Head) -> Obj {
     }
     d.bb(if h.owner.is_some() { 0 } else { 2 });
     d.bl(u32::from(h.extras)).b(!h.extras);
+    // Data in the data store, from 2013 on: set with the extras.
+    if v >= Version::R2013 {
+        d.b(h.extras);
+    }
     if h.extras {
         let book = if h.book { 0x4000 } else { 0 };
         d.bs(0x8000 | book | 0x2000 | 7).bl(0x00FF_0000).bl(0x0200_0080);
@@ -357,7 +376,7 @@ fn entity(v: Version, kind: u16, handle: u64, h: Head) -> Obj {
     if v != Version::R2004 {
         d.bb(if h.extras { 3 } else { 0 }).rc(h.shadow);
     }
-    if v == Version::R2010 {
+    if v >= Version::R2010 {
         d.b(false).b(h.extras).b(false);
     }
     d.bs(u16::from(h.invisible)).rc(0);
@@ -379,7 +398,7 @@ fn entity(v: Version, kind: u16, handle: u64, h: Head) -> Obj {
             hs.h(5, 0x17);
         }
         hs.h(5, 0x15);
-        if v == Version::R2010 {
+        if v >= Version::R2010 {
             hs.h(5, 0x16);
         }
     } else {
@@ -437,8 +456,12 @@ fn attrib(v: Version, kind: u16, handle: u64, h: Head, at: (f64, f64), value: &s
     let mut o = entity(v, kind, handle, h);
     // Attributes carry a vertical alignment, so the field after the text is read too.
     text_data_with(&mut o, at, value, 2.5, 0.0, Some(1));
-    if v == Version::R2010 {
+    if v >= Version::R2010 {
         o.data.rc(0);
+    }
+    // A single-line attribute, from 2018 on.
+    if v >= Version::R2018 {
+        o.data.rc(1);
     }
     o.text(tag);
     o.data.bs(0).rc(flags);
@@ -447,7 +470,7 @@ fn attrib(v: Version, kind: u16, handle: u64, h: Head, at: (f64, f64), value: &s
         o.data.b(false);
     }
     if kind == 3 {
-        if v == Version::R2010 {
+        if v >= Version::R2010 {
             o.data.rc(0);
         }
         o.text("Device tag");
@@ -495,7 +518,7 @@ fn sample(v: Version) -> Vec<Obj> {
     objs.push(a);
     // Closed; from 2010 on with vertex ids too, their count before the points and the ids
     // after them.
-    let ids = v == Version::R2010;
+    let ids = v >= Version::R2010;
     let mut p = entity(v, 77, 0x42, relay);
     p.data.bs(if ids { 512 | 1024 } else { 512 }).bl(3);
     if ids {
@@ -817,8 +840,117 @@ fn a_2004_drawing_gives_its_blocks_and_model_space() -> TestResult {
 }
 
 #[test]
+fn a_2013_drawing_gives_its_blocks_and_model_space() -> TestResult {
+    let v = Version::R2013;
+    check_sample(&drawing(&sections(v, &sample(v), &[]))?);
+    Ok(())
+}
+
+#[test]
+fn a_2018_drawing_gives_its_blocks_and_model_space() -> TestResult {
+    let v = Version::R2018;
+    check_sample(&drawing(&sections(v, &sample(v), &[]))?);
+    Ok(())
+}
+
+#[test]
+fn the_2013_data_store_flag_is_read() -> TestResult {
+    // 2010 objects (without the flag) read as 2013 ones come out wrong: the flag is needed.
+    let s = sections(Version::R2013, &sample(Version::R2010), &[]);
+    let d = drawing(&s)?;
+    assert!(d.skipped.get(DAMAGED).is_some_and(|n| *n > 0), "{:?}", d.skipped);
+    Ok(())
+}
+
+#[test]
+fn a_2018_multi_line_attribute_is_counted_and_skipped() -> TestResult {
+    let v = Version::R2018;
+    let mut objs = sample(v);
+    // A second attribute of the RELAY insert in model space, of type 2 (multi-line): its
+    // embedded MTEXT is not read, so nothing after the type is written.
+    let mut a = entity(v, 2, 0x5D, head(Some(0x50)));
+    text_data_with(&mut a, (100.0, 62.0), "two lines", 2.5, 0.0, Some(1));
+    a.data.rc(0).rc(2);
+    objs.push(a);
+    let d = drawing(&sections(v, &objs, &[]))?;
+    assert_eq!(d.skipped.get("ATTRIB (multi-line)"), Some(&1), "{:?}", d.skipped);
+    // A multi-line ATTDEF (type 4) in the RELAY block likewise.
+    let mut objs = sample(v);
+    let mut a = entity(v, 3, 0x5D, head(Some(RELAY_H)));
+    text_data_with(&mut a, (0.0, 12.0), "?", 2.5, 0.0, Some(1));
+    a.data.rc(0).rc(4);
+    objs.push(a);
+    let d2 = drawing(&sections(v, &objs, &[]))?;
+    assert_eq!(d2.skipped.get("ATTDEF (multi-line)"), Some(&1), "{:?}", d2.skipped);
+    assert!(!d2.skipped.contains_key(DAMAGED), "{:?}", d2.damaged);
+    assert!(!texts(&d.model).contains(&"two lines"));
+    assert!(!d.skipped.contains_key(DAMAGED), "{:?}", d.damaged);
+    assert!(texts(&d.model).contains(&"-K1"), "the single-line one is still drawn");
+    Ok(())
+}
+
+#[test]
+fn a_2018_attribute_of_an_unknown_type_is_damage() -> TestResult {
+    let v = Version::R2018;
+    let mut objs = sample(v);
+    let mut a = entity(v, 2, 0x5D, head(Some(0x50)));
+    text_data_with(&mut a, (100.0, 62.0), "odd", 2.5, 0.0, Some(1));
+    a.data.rc(0).rc(42);
+    objs.push(a);
+    let d = drawing(&sections(v, &objs, &[]))?;
+    assert_eq!(d.skipped.get(DAMAGED), Some(&1), "{:?}", d.skipped);
+    assert!(!d.skipped.contains_key("ATTRIB (multi-line)"), "{:?}", d.skipped);
+    assert!(
+        d.damaged.iter().any(|m| m.contains("unknown type 42")),
+        "{:?}",
+        d.damaged
+    );
+    Ok(())
+}
+
+#[test]
+fn cut_or_flipped_2013_and_2018_files_give_errors_not_panics() -> TestResult {
+    for (tag, v) in [(b"AC1027", Version::R2013), (b"AC1032", Version::R2018)] {
+        let (map, objects) = sections_bytes(&sample(v), &[]);
+        let file = write_dwg(
+            tag,
+            &[
+                TestSection {
+                    name: "AcDb:AcDbObjects",
+                    data: objects,
+                    ..Default::default()
+                },
+                TestSection {
+                    name: "AcDb:Handles",
+                    data: map,
+                    ..Default::default()
+                },
+            ],
+        );
+        check_sample(&read_drawing(&file)?);
+        for len in (0..file.len()).step_by(5) {
+            let _ = read_drawing(&file[..len]);
+        }
+        let mut seed = 9u32;
+        for i in 0..1000 {
+            let mut damaged = file.clone();
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            let at = (seed as usize >> 4) % damaged.len();
+            damaged[at] ^= 1 << (i % 8);
+            let _ = read_drawing(&damaged);
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn a_whole_file_is_read() -> TestResult {
-    for (tag, v) in [(b"AC1024", Version::R2010), (b"AC1018", Version::R2004)] {
+    for (tag, v) in [
+        (b"AC1032", Version::R2018),
+        (b"AC1027", Version::R2013),
+        (b"AC1024", Version::R2010),
+        (b"AC1018", Version::R2004),
+    ] {
         let (map, objects) = sections_bytes(&sample(v), &[]);
         let file = write_dwg(
             tag,
@@ -1003,7 +1135,13 @@ fn a_block_inserting_itself_ends() -> TestResult {
 
 #[test]
 fn flipped_and_cut_objects_give_no_panic() {
-    for v in [Version::R2004, Version::R2007, Version::R2010] {
+    for v in [
+        Version::R2004,
+        Version::R2007,
+        Version::R2010,
+        Version::R2013,
+        Version::R2018,
+    ] {
         let s = sections(v, &sample(v), &[]);
         let objects = s.sections[1].data.clone();
         let map = s.sections[0].data.clone();
@@ -1203,7 +1341,7 @@ fn block_fields(mut o: Obj, base: (f64, f64), xref: bool) -> Obj {
     let v = o.version;
     match v {
         Version::R2004 => o.data.b(true).bs(0).b(false),
-        Version::R2007 | Version::R2010 => o.data.bs(0),
+        _ => o.data.bs(0),
     };
     o.data.b(false).b(false).b(xref).b(false).b(false);
     if !xref {
@@ -1215,7 +1353,13 @@ fn block_fields(mut o: Obj, base: (f64, f64), xref: bool) -> Obj {
 
 #[test]
 fn a_block_is_placed_by_its_base_point() -> TestResult {
-    for v in [Version::R2004, Version::R2007, Version::R2010] {
+    for v in [
+        Version::R2004,
+        Version::R2007,
+        Version::R2010,
+        Version::R2013,
+        Version::R2018,
+    ] {
         let mut objs = vec![
             entry(v, LAYER, LAYER_H, "0"),
             entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
@@ -1284,7 +1428,13 @@ fn a_block_whose_base_point_is_cut_off_is_kept_and_said() -> TestResult {
 
 #[test]
 fn a_dimension_is_drawn_by_its_block() -> TestResult {
-    for v in [Version::R2004, Version::R2007, Version::R2010] {
+    for v in [
+        Version::R2004,
+        Version::R2007,
+        Version::R2010,
+        Version::R2013,
+        Version::R2018,
+    ] {
         let d1 = head(Some(0x100));
         let mut objs = vec![
             entry(v, LAYER, LAYER_H, "0"),
@@ -1329,7 +1479,7 @@ fn a_dimension_is_drawn_by_its_block() -> TestResult {
 fn shadow_flags_have_no_handle() -> TestResult {
     // The specification gives entities shadow flags (an RC, 2007 on) but no shadow handle: with
     // every flag set, the material and plot style handles and an INSERT's block still line up.
-    for v in [Version::R2007, Version::R2010] {
+    for v in [Version::R2007, Version::R2010, Version::R2013, Version::R2018] {
         let mut objs = vec![
             entry(v, LAYER, LAYER_H, "0"),
             entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
@@ -1400,7 +1550,7 @@ fn hatch_with(
 
 #[test]
 fn hatches_become_filled_and_unfilled_outlines() -> TestResult {
-    for v in [Version::R2004, Version::R2010] {
+    for v in [Version::R2004, Version::R2010, Version::R2018] {
         // A solid square: a polyline path without bulges, filled by its solid flag (its name
         // is not SOLID).
         let solid = hatch_obj(v, 0x300, "_USER", true, 1, |d| {
@@ -1449,7 +1599,7 @@ fn hatches_become_filled_and_unfilled_outlines() -> TestResult {
 
 #[test]
 fn a_field_missing_before_the_texts_does_not_read_into_them() -> TestResult {
-    for v in [Version::R2007, Version::R2010] {
+    for v in [Version::R2007, Version::R2010, Version::R2013, Version::R2018] {
         let mut objs = vec![
             entry(v, LAYER, LAYER_H, "0"),
             entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
@@ -1458,8 +1608,11 @@ fn a_field_missing_before_the_texts_does_not_read_into_them() -> TestResult {
         // texts start, so the flag is missing rather than taken from the texts.
         let mut a = entity(v, 2, 0x300, head(None));
         text_data_with(&mut a, (0.0, 0.0), "value", 2.5, 0.0, Some(1));
-        if v == Version::R2010 {
+        if v >= Version::R2010 {
             a.data.rc(0);
+        }
+        if v >= Version::R2018 {
+            a.data.rc(1);
         }
         a.text("TAG");
         a.data.bs(0).rc(0);
@@ -1569,7 +1722,7 @@ fn a_hatch_listing_too_much_is_a_damaged_object() -> TestResult {
 #[test]
 fn hatch_edges_of_every_kind_and_a_mirrored_hatch_are_read() -> TestResult {
     use std::f64::consts::PI;
-    for v in [Version::R2004, Version::R2010] {
+    for v in [Version::R2004, Version::R2010, Version::R2018] {
         // A solid slot: a polyline path with bulges (two half circles joined by lines).
         let slot = hatch_obj(v, 0x300, "SOLID", true, 1, |d| {
             d.bl(2).b(true).b(true).bl(4);
@@ -1595,7 +1748,7 @@ fn hatch_edges_of_every_kind_and_a_mirrored_hatch_are_read() -> TestResult {
             for p in [(40.0, 0.0), (50.0, -10.0), (60.0, 0.0)] {
                 d.rd(p.0).rd(p.1);
             }
-            if v == Version::R2010 {
+            if v >= Version::R2010 {
                 d.bl(2)
                     .rd(40.0)
                     .rd(0.0)
@@ -1761,7 +1914,7 @@ fn far_apart_arc_angles_still_make_an_arc_and_a_lost_hole_unfills() -> TestResul
 #[test]
 fn ellipses_and_splines_are_drawn() -> TestResult {
     use std::f64::consts::PI;
-    for v in [Version::R2004, Version::R2010] {
+    for v in [Version::R2004, Version::R2010, Version::R2018] {
         let model = head(None);
         // Half an ellipse 20 wide and 10 high round (50, 0): from (60, 0) over the top to (40, 0).
         let mut el = entity(v, 35, 0x300, model);
@@ -1775,7 +1928,7 @@ fn ellipses_and_splines_are_drawn() -> TestResult {
         // A quadratic spline by control points: (0, 0), (5, 10), (10, 0).
         let mut sp = entity(v, 36, 0x301, model);
         sp.data
-            .bl(1)
+            .scenario(v, 1)
             .bl(2)
             .b(false)
             .b(false)
@@ -1794,7 +1947,7 @@ fn ellipses_and_splines_are_drawn() -> TestResult {
         // A spline by fit points only.
         let mut fit = entity(v, 36, 0x302, model);
         fit.data
-            .bl(2)
+            .scenario(v, 2)
             .bl(3)
             .bd(1e-7)
             .bd3((1.0, 0.0, 0.0))
@@ -1847,7 +2000,7 @@ fn a_spline_listing_too_much_is_a_damaged_object() -> TestResult {
     let v = Version::R2010;
     let mut sp = entity(v, 36, 0x301, head(None));
     sp.data
-        .bl(1)
+        .scenario(v, 1)
         .bl(3)
         .b(false)
         .b(false)
@@ -1871,7 +2024,7 @@ fn a_spline_listing_too_much_is_a_damaged_object() -> TestResult {
 #[test]
 fn a_weighted_closed_spline_a_flipped_ellipse_and_an_unknown_scenario() -> TestResult {
     use std::f64::consts::PI;
-    for v in [Version::R2004, Version::R2010] {
+    for v in [Version::R2004, Version::R2010, Version::R2018] {
         let model = head(None);
         // A quarter ellipse round (0, 0) with a downward extrusion: its axis is in world
         // coordinates, so it runs the other way, from (10, 0) down to (0, -10).
@@ -1887,7 +2040,7 @@ fn a_weighted_closed_spline_a_flipped_ellipse_and_an_unknown_scenario() -> TestR
         let weighted = |h: u64, w: f64| {
             let mut sp = entity(v, 36, h, model);
             sp.data
-                .bl(1)
+                .scenario(v, 1)
                 .bl(2)
                 .b(true)
                 .b(true)
@@ -1907,7 +2060,7 @@ fn a_weighted_closed_spline_a_flipped_ellipse_and_an_unknown_scenario() -> TestR
         };
         // A spline with scenario 3: damaged.
         let mut odd = entity(v, 36, 0x303, model);
-        odd.data.bl(3).bl(2);
+        odd.data.scenario(v, 3).bl(2);
         let objs = vec![
             entry(v, LAYER, LAYER_H, "0"),
             entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
@@ -1960,7 +2113,7 @@ fn an_ellipse_not_a_number_and_a_spline_short_of_knots_are_damaged() -> TestResu
         .bd(1.0);
     let mut sp = entity(v, 36, 0x301, model);
     sp.data
-        .bl(1)
+        .scenario(v, 1)
         .bl(2)
         .b(false)
         .b(false)
@@ -2049,7 +2202,7 @@ fn a_spline_whose_knots_make_no_curve_is_drawn_through_its_points_and_said() -> 
 fn control_spline(v: Version, handle: u64, degree: u32, knots: &[f64]) -> Obj {
     let mut sp = entity(v, 36, handle, head(None));
     sp.data
-        .bl(1)
+        .scenario(v, 1)
         .bl(degree)
         .b(false)
         .b(false)
@@ -2073,7 +2226,7 @@ fn a_fit_spline_with_one_point_is_counted_and_its_tangents_are_kept() -> TestRes
     let v = Version::R2010;
     let mut one = entity(v, 36, 0x300, head(None));
     one.data
-        .bl(2)
+        .scenario(v, 2)
         .bl(3)
         .bd(0.0)
         .bd3((1.0, 0.0, 0.0))
@@ -2093,11 +2246,11 @@ fn a_fit_spline_with_one_point_is_counted_and_its_tangents_are_kept() -> TestRes
 
 #[test]
 fn a_dwg_spline_by_fit_points_is_a_smooth_curve() -> TestResult {
-    for v in [Version::R2004, Version::R2010] {
+    for v in [Version::R2004, Version::R2010, Version::R2013, Version::R2018] {
         // Scenario 2: fit tolerance, start and end tangents (none given: zero), three fit points.
         let mut fit = entity(v, 36, 0x300, head(None));
         fit.data
-            .bl(2)
+            .scenario(v, 2)
             .bl(3)
             .bd(1e-7)
             .bd3((0.0, 0.0, 0.0))
@@ -2132,6 +2285,68 @@ fn a_dwg_spline_by_fit_points_is_a_smooth_curve() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn from_2013_a_splines_flags_and_knot_parameter_decide_its_scenario() -> TestResult {
+    for v in [Version::R2013, Version::R2018] {
+        // Scenario 2 stored, but knot parameter 15 (custom knots): control points.
+        let mut by_knots = entity(v, 36, 0x300, head(None));
+        by_knots
+            .data
+            .bl(2)
+            .bl(0)
+            .bl(15)
+            .bl(2)
+            .b(false)
+            .b(false)
+            .b(false)
+            .bd(0.0)
+            .bd(0.0)
+            .bl(6)
+            .bl(3)
+            .b(false);
+        for k in [0.0, 0.0, 0.0, 1.0, 1.0, 1.0] {
+            by_knots.data.bd(k);
+        }
+        for p in [(0.0, 0.0, 0.0), (5.0, 10.0, 0.0), (10.0, 0.0, 0.0)] {
+            by_knots.data.bd3(p);
+        }
+        // Scenario 1 stored, but flag bit 1 (by fit points) and knot parameter 0: fit points.
+        let mut by_fit = entity(v, 36, 0x301, head(None));
+        by_fit
+            .data
+            .bl(1)
+            .bl(1)
+            .bl(0)
+            .bl(3)
+            .bd(1e-7)
+            .bd3((0.0, 0.0, 0.0))
+            .bd3((0.0, 0.0, 0.0))
+            .bl(3);
+        for p in [(0.0, 20.0, 0.0), (5.0, 25.0, 0.0), (10.0, 20.0, 0.0)] {
+            by_fit.data.bd3(p);
+        }
+        let objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            by_knots,
+            by_fit,
+        ];
+        let d = drawing(&sections(v, &objs, &[]))?;
+        assert!(d.damaged.is_empty(), "{v:?}: {:?}", d.damaged);
+        assert_eq!(d.model.len(), 2, "{v:?}: {:?}", d.model);
+        let reaches = |x: f64, y: f64| {
+            d.model.iter().any(|s| match s {
+                Shape::Polyline { points, .. } => points.iter().any(|q| (q.x - x).hypot(q.y - y) < 0.05),
+                _ => false,
+            })
+        };
+        // The control-point curve starts at (0, 0); the fit-point curve passes (5, 25).
+        assert!(reaches(0.0, 0.0), "{v:?}: {:?}", d.model);
+        assert!(reaches(5.0, -25.0), "{v:?}: {:?}", d.model);
+    }
+    Ok(())
+}
+
 /// An `AcDb:Classes` section listing `classes` (number, DXF name, entity?) as AutoCAD 2004,
 /// 2007 or 2010 (maintenance release 6) writes it.
 fn classes_section(v: Version, classes: &[(u16, &str, bool)]) -> Vec<u8> {
@@ -2159,11 +2374,11 @@ fn classes_section_ids(v: Version, max: u16, classes: &[(u16, &str, u16)]) -> Ve
     classes_section_layout(v, true, max, classes)
 }
 
-/// [`classes_section_ids`] with or without the second size field a 2010 drawing of
-/// maintenance release 4 and later has (`second`; ignored for 2004 and 2007, which never have
-/// it).
+/// [`classes_section_ids`] with or without the second size field a 2010 or 2013 drawing of
+/// maintenance release 4 and later (and every 2018 drawing) has (`second`; ignored for 2004 and
+/// 2007, which never have it).
 fn classes_section_layout(v: Version, second: bool, max: u16, classes: &[(u16, &str, u16)]) -> Vec<u8> {
-    let second = second && v == Version::R2010;
+    let second = second && v >= Version::R2010;
     classes_section_raw(v, second, max, classes)
 }
 
@@ -2182,7 +2397,7 @@ fn classes_section_raw(v: Version, second: bool, max: u16, classes: &[(u16, &str
             Version::R2004 => {
                 data.t8("ObjectDBX Classes").t8("AcDbThing").t8(name);
             }
-            Version::R2007 | Version::R2010 => {
+            _ => {
                 strings.tu("ObjectDBX Classes").tu("AcDbThing").tu(name);
             }
         }
@@ -2197,7 +2412,7 @@ fn classes_section_raw(v: Version, second: bool, max: u16, classes: &[(u16, &str
         Version::R2004 => {
             out.rl(data.bytes().len() as u32).append(&data);
         }
-        Version::R2007 | Version::R2010 => {
+        _ => {
             // Data, texts, their size and the flag; the flag sits `bitsize` after bit 191, or
             // after bit 159 without the second size.
             let mut body = W::default();
@@ -2297,6 +2512,49 @@ fn a_2010_class_section_of_release_3_has_no_second_size() -> TestResult {
 }
 
 #[test]
+fn a_2013_class_section_follows_the_release_and_2018_always_has_the_second_size() -> TestResult {
+    let ids = [(500, "WIPEOUT", 0x1F2), (501, "ACDBDICTIONARYWDFLT", 0x1F3)];
+    // (version, maintenance release, second size written)
+    for (v, maint, second) in [
+        (Version::R2013, 0, false),
+        (Version::R2013, 3, false),
+        (Version::R2013, 4, true),
+        (Version::R2018, 0, true),
+        (Version::R2018, 6, true),
+    ] {
+        let mut wipeout = entity(v, 500, 0x300, head(None));
+        wipeout.data.bd(0.0);
+        let objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            wipeout,
+            Obj::new(v, 501, 0x301),
+        ];
+        let classes = classes_section_raw(v, second, 501, &ids);
+        let d = drawing(&sections_with_classes_maint(v, &objs, classes, maint))?;
+        assert_eq!(
+            d.skipped.get("WIPEOUT"),
+            Some(&1),
+            "{v:?} {maint}: {:?} {:?}",
+            d.skipped,
+            d.damaged
+        );
+        assert_eq!(d.skipped.len(), 1, "{v:?} {maint}: {:?}", d.skipped);
+        assert!(d.damaged.is_empty(), "{v:?} {maint}: {:?}", d.damaged);
+    }
+    // A 2018 section without the second size is damage, whatever the release.
+    let v = Version::R2018;
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+    ];
+    let classes = classes_section_raw(v, false, 501, &ids);
+    let d = drawing(&sections_with_classes_maint(v, &objs, classes, 0))?;
+    assert_eq!(d.skipped.get(CLASSES_DAMAGED), Some(&1), "{:?}", d.skipped);
+    Ok(())
+}
+
+#[test]
 fn a_2007_class_section_never_has_the_second_size() -> TestResult {
     // 2007 names its classes in a string stream as 2010 does, but whatever its maintenance
     // release, the bit size follows the first size: a second size is read as damage.
@@ -2331,7 +2589,13 @@ fn a_2007_class_section_never_has_the_second_size() -> TestResult {
 
 #[test]
 fn custom_entities_are_counted_by_their_class_name_and_custom_objects_not() -> TestResult {
-    for v in [Version::R2004, Version::R2007, Version::R2010] {
+    for v in [
+        Version::R2004,
+        Version::R2007,
+        Version::R2010,
+        Version::R2013,
+        Version::R2018,
+    ] {
         let classes = classes_section(v, &[(500, "WIPEOUT", true), (501, "ACDBDICTIONARYWDFLT", false)]);
         let mut wipeout = entity(v, 500, 0x300, head(None));
         wipeout.data.bd(0.0);
@@ -2350,7 +2614,13 @@ fn custom_entities_are_counted_by_their_class_name_and_custom_objects_not() -> T
 
 #[test]
 fn a_damaged_class_section_is_named_and_the_rest_read() -> TestResult {
-    for v in [Version::R2004, Version::R2007, Version::R2010] {
+    for v in [
+        Version::R2004,
+        Version::R2007,
+        Version::R2010,
+        Version::R2013,
+        Version::R2018,
+    ] {
         let objs = vec![
             entry(v, LAYER, LAYER_H, "0"),
             entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
@@ -2506,7 +2776,13 @@ fn a_2010_class_record_that_cannot_be_read_and_a_cut_trailer_are_damage() -> Tes
 
 #[test]
 fn a_class_with_an_unknown_item_class_id_is_damage() -> TestResult {
-    for v in [Version::R2004, Version::R2007, Version::R2010] {
+    for v in [
+        Version::R2004,
+        Version::R2007,
+        Version::R2010,
+        Version::R2013,
+        Version::R2018,
+    ] {
         let objs = vec![
             entry(v, LAYER, LAYER_H, "0"),
             entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),

@@ -453,22 +453,79 @@ fn is_wrong_id(e: &Error) -> bool {
     matches!(e, Error::Source { message, .. } if message.contains(DECLARES))
 }
 
-/// What [`lock_missing`] could not pin.
+/// What [`lock_missing`] could not pin, and the pinned items whose vendored copy it repaired.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Unpinned {
     /// Used items that no library source holds.
     pub missing: Vec<(ItemKind, String)>,
     /// Used items whose library file declares another id, with the reason (see [`State::WrongId`]).
     pub wrong_id: Vec<(ItemKind, String, String)>,
+    /// Pinned items whose vendored copy was missing or unreadable, written again at the pinned
+    /// version from the library.
+    pub restored: Vec<(ItemKind, String)>,
+    /// Pinned items whose vendored copy is missing or unreadable and could not be written again
+    /// at the pinned version, with the reason.
+    pub unrestorable: Vec<(ItemKind, String, String)>,
 }
 
 impl Unpinned {
+    /// Nothing left undone: every used item is pinned and has a readable vendored copy.
     pub fn is_empty(&self) -> bool {
-        self.missing.is_empty() && self.wrong_id.is_empty()
+        self.missing.is_empty() && self.wrong_id.is_empty() && self.unrestorable.is_empty()
     }
 }
 
-/// Pin every used item that is not pinned yet. Items it cannot pin are returned.
+/// Why the project's vendored copy of `kind` `id` does not read, if it does not.
+fn vendored_error(project_dir: &Path, kind: ItemKind, id: &str) -> Option<String> {
+    match kind {
+        ItemKind::Symbol => store::read_vendored_symbol(project_dir, id).err(),
+        ItemKind::Part => store::read_vendored_part(project_dir, id).err(),
+    }
+    .map(|e| e.to_string())
+}
+
+/// Write the vendored copy of pinned item `id` again from the library, at the pinned version
+/// (`pin`): the pinned source is searched first, then the others, and only a file that declares
+/// `id` and holds that version is taken. The lock entry is left as it is.
+fn restore_pinned(project_dir: &Path, lib: &Library, kind: ItemKind, id: &str, pin: &LockEntry) -> Result<Restore> {
+    let fits = |declared: &str, hash: String| -> std::result::Result<(), String> {
+        if declared != id {
+            return Err(format!("its file declares id {declared:?}"));
+        }
+        if hash != pin.hash {
+            return Err("it holds another version than the pinned one".into());
+        }
+        Ok(())
+    };
+    // Finding the pinned version and writing it are told apart: a failed write is not fixed by
+    // adding a library source, so it keeps its own error (which names the file).
+    let not_found = |message: String| Error::Source {
+        name: pin.source.clone(),
+        message,
+    };
+    match kind {
+        ItemKind::Symbol => match lib.find_version(kind, id, &pin.source, |s: &Symbol| fits(&s.id, s.hash())) {
+            Ok(s) => store::write_vendored_symbol(project_dir, &s)?,
+            Err(message) => return Ok(Restore::NotFound(not_found(message))),
+        },
+        ItemKind::Part => match lib.find_version(kind, id, &pin.source, |p: &Part| fits(&p.id, p.hash())) {
+            Ok(p) => store::write_vendored_part(project_dir, &p)?,
+            Err(message) => return Ok(Restore::NotFound(not_found(message))),
+        },
+    };
+    Ok(Restore::Done)
+}
+
+/// What [`restore_pinned`] did when it could write (an error is a failed write).
+enum Restore {
+    Done,
+    /// No library source holds the pinned version.
+    NotFound(Error),
+}
+
+/// Pin every used item that is not pinned yet, and write the vendored copy of a pinned item
+/// again when it is missing or unreadable (at the pinned version only: a library holding another
+/// version is left to `update`). Items it cannot pin or repair are returned.
 pub fn lock_missing(project_dir: &Path, project: &mut Project, lib: &Library) -> Result<Unpinned> {
     lock_missing_then(project_dir, project, lib, || {})
 }
@@ -483,15 +540,38 @@ fn lock_missing_then(
 ) -> Result<Unpinned> {
     let mut left = Unpinned::default();
     let mut todo = Vec::new();
+    let mut repair = Vec::new();
     for s in status(project_dir, project, lib) {
-        match s.state {
-            State::NotLocked => todo.push((s.kind, s.id)),
+        match (&s.state, s.locked) {
+            (State::NotLocked, _) => todo.push((s.kind, s.id)),
             // Used but not pinned, and its library file cannot be taken.
-            State::WrongId if s.locked.is_none() => left.wrong_id.push((s.kind, s.id, s.changes.join("; "))),
-            _ => {}
+            (State::WrongId, None) => left.wrong_id.push((s.kind, s.id, s.changes.join("; "))),
+            (_, Some(pin)) => {
+                if let Some(why) = vendored_error(project_dir, s.kind, &s.id) {
+                    repair.push((s.kind, s.id, pin, why));
+                }
+            }
+            (_, None) => {}
         }
     }
     after_scan();
+    for (kind, id, pin, broken) in repair {
+        match restore_pinned(project_dir, lib, kind, &id, &pin) {
+            Ok(Restore::Done) => left.restored.push((kind, id)),
+            Ok(Restore::NotFound(e)) => {
+                let why = format!(
+                    "{broken}; the pinned version is in no library source ({e}); put the file back from the project's history, or add a library source that holds the pinned version, and run `wiringcraft lib lock` again"
+                );
+                left.unrestorable.push((kind, id, why));
+            }
+            Err(e) => {
+                let why = format!(
+                    "{broken}; the pinned version was found but writing it failed ({e}); fix that and run `wiringcraft lib lock` again"
+                );
+                left.unrestorable.push((kind, id, why));
+            }
+        }
+    }
     for (kind, id) in todo {
         match take(project_dir, project, lib, kind, &id) {
             Ok(_) => {}
