@@ -646,6 +646,27 @@ fn the_starter_key_switch_is_a_make_contact_tagged_s() -> Result<()> {
 }
 
 #[test]
+fn the_starter_current_transformer_has_primary_and_secondary_terminals() -> Result<()> {
+    // #769: a current transformer for panel ammeters and energy meters.
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
+    project.meta.libraries = vec![LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: starter.to_string_lossy().into(),
+        reference: None,
+    }];
+    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (ct, _) = lib.symbol("wc.transformer.current")?;
+    assert_eq!(ct.role, SymbolRole::Standalone);
+    assert_eq!(ct.letter_code, "T");
+    let names: Vec<_> = ct.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["P1", "P2", "S1", "S2"]);
+    Ok(())
+}
+
+#[test]
 fn lock_restores_a_deleted_vendored_copy_at_the_pinned_version() -> Result<()> {
     let mut f = fixture()?;
     let lib = Library::open(&f.proj, &f.project)?;
