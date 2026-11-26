@@ -40,7 +40,7 @@ def pin_label(p):
     x, y = p["at"]["x"], p["at"]["y"]
     if p["dir"] == "right": return text((x - 1.4, y - 1.4), p["name"], 2.0)
     if p["dir"] == "left": return text((x + 0.4, y - 1.4), p["name"], 2.0)
-    return text((1.2, y + (2.5 if p["dir"] == "up" else -0.6)), p["name"], 2.0)
+    return text((x + 1.2, y + (2.5 if p["dir"] == "up" else -0.6)), p["name"], 2.0)
 
 def pin_labels(pins):
     return [pin_label(p) for p in pins]
@@ -116,6 +116,27 @@ sym("wc.connector.plug", "Plug (male contact)", "terminals", "X", "standalone",
     [polyline([(-0.8, 0), (0.8, 0), (0.8, 4), (-0.8, 4)], filled=True), line((0, 4), (0, 10))],
     [pin("1", 0, 10, "down")], tag_at=(-6, 5),
     desc="One contact of a plug-in connector, male side; the solid pin end at the top mates with a socket.")
+sym("wc.motor.dc", "DC motor", "drives", "M", "standalone",
+    # Circle with M, the DC mark (a solid line over a dashed one) under it.
+    # Origin at the + pin, - one grid step to the right (as wc.rcd.2p), so both sit on the 5 mm grid.
+    [line((0, 0), (0, 4.67)), line((5, 0), (5, 4.67)), circle((2.5, 9), 5), text((2.5, 10.3), "M", 3.5, "center"),
+     line((1, 11.8), (4, 11.8)), line((1, 12.8), (1.7, 12.8)), line((2.15, 12.8), (2.85, 12.8)),
+     line((3.3, 12.8), (4, 12.8))],
+    [pin("+", 0, 0, "up"), pin("-", 5, 0, "up")], tag_at=(-6.5, 9),
+    desc="DC motor (for example a 24 V DC drive, pump or actuator); + and - are the armature terminals.")
+sym("wc.switch.flow", "Flow switch, make", "sensors", "B", "standalone",
+    # Make contact worked through the dashed link by a box with a flow arrow in it.
+    no_contact() + [line((-1.75, 7.1), (-4.5, 7.1)), rect((-8.5, 5.1), (-4.5, 9.1)),
+     line((-7.9, 7.1), (-5.1, 7.1)), line((-5.1, 7.1), (-6.1, 6.4)), line((-5.1, 7.1), (-6.1, 7.8))],
+    vpins("13", "14"), tag_at=(-14, 8),
+    desc="Flow switch with a make contact, closes when the flow (water, coolant, air) reaches its set point.")
+sym("wc.meter.energy", "Energy meter (kWh)", "measuring", "P", "standalone",
+    # Box with the counter window on top and kWh under it; L goes through on the left, N on the right.
+    [rect((-8, 5), (8, 15)), line((-8, 8), (8, 8)), text((0, 12.4), "kWh", 2.5, "center"),
+     line((-5, 0), (-5, 5)), line((5, 0), (5, 5)), line((-5, 15), (-5, 20)), line((5, 15), (5, 20))],
+    [pin("1", -5, 0, "up"), pin("3", 5, 0, "up"), pin("2", -5, 20, "down"), pin("4", 5, 20, "down")],
+    tag_at=(-16, 10),
+    desc="Single-phase energy meter (kWh meter) for a supply or sub-circuit: 1 is L in, 2 L out, 3 N in, 4 N out.")
 
 os.makedirs(OUT, exist_ok=True)
 for s in S:

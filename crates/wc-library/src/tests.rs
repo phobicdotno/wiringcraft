@@ -842,6 +842,85 @@ fn the_starter_ammeter_and_voltmeter_are_measuring_instruments() -> Result<()> {
 }
 
 #[test]
+fn the_starter_energy_meter_is_a_measuring_instrument_on_the_grid() -> Result<()> {
+    // #930: a single-phase kWh meter, L and N in at the top and out at the bottom.
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
+    project.meta.libraries = vec![LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: starter.to_string_lossy().into(),
+        reference: None,
+    }];
+    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (m, _) = lib.symbol("wc.meter.energy")?;
+    assert_eq!(m.id, "wc.meter.energy");
+    assert_eq!(m.role, SymbolRole::Standalone);
+    assert_eq!(m.letter_code, "P");
+    assert_eq!(m.category, "measuring");
+    let names: Vec<_> = m.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["1", "3", "2", "4"]);
+    for p in &m.pins {
+        assert_eq!(p.at.x % 5.0, 0.0, "pin {} is off the 5 mm grid", p.name);
+        assert_eq!(p.at.y % 5.0, 0.0, "pin {} is off the 5 mm grid", p.name);
+    }
+    Ok(())
+}
+
+#[test]
+fn the_starter_dc_motor_has_plus_and_minus_pins() -> Result<()> {
+    // #882: a DC motor next to the single- and three-phase ones.
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
+    project.meta.libraries = vec![LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: starter.to_string_lossy().into(),
+        reference: None,
+    }];
+    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (m, _) = lib.symbol("wc.motor.dc")?;
+    assert_eq!(m.id, "wc.motor.dc");
+    assert_eq!(m.role, SymbolRole::Standalone);
+    assert_eq!(m.letter_code, "M");
+    assert_eq!(m.category, "drives");
+    let names: Vec<_> = m.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["+", "-"]);
+    // Origin at the + pin, - one 5 mm grid step to its right (as wc.rcd.2p).
+    assert_eq!((m.pins[0].at.x, m.pins[0].at.y), (0.0, 0.0));
+    assert_eq!((m.pins[1].at.x, m.pins[1].at.y), (5.0, 0.0));
+    Ok(())
+}
+
+#[test]
+fn the_starter_flow_switch_is_a_make_contact_tagged_b() -> Result<()> {
+    // #896: a flow switch next to the pressure, float and temperature switches.
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
+    project.meta.libraries = vec![LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: starter.to_string_lossy().into(),
+        reference: None,
+    }];
+    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (s, _) = lib.symbol("wc.switch.flow")?;
+    assert_eq!(s.id, "wc.switch.flow");
+    assert_eq!(s.role, SymbolRole::Standalone);
+    assert_eq!(s.letter_code, "B");
+    assert_eq!(s.category, "sensors");
+    let names: Vec<_> = s.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["13", "14"]);
+    // On the 5 mm grid: 13 at the origin, 14 three grid steps below it.
+    assert_eq!((s.pins[0].at.x, s.pins[0].at.y), (0.0, 0.0));
+    assert_eq!((s.pins[1].at.x, s.pins[1].at.y), (0.0, 15.0));
+    Ok(())
+}
+
+#[test]
 fn the_starter_battery_has_plus_and_minus_pins() -> Result<()> {
     // #764: a battery or cell for backup supplies and buffered 24 V DC circuits.
     let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
