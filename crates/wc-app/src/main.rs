@@ -645,6 +645,8 @@ impl App {
                 return;
             }
             self.ed = Editor::default();
+            // The fresh editor keeps the user's hidden and locked layers.
+            self.apply_layers();
             self.panels.reset();
             self.dialog = None;
             self.prefs.remember(joined.dir.clone());
@@ -719,6 +721,9 @@ impl App {
             && p.id == w.page
         {
             edit::restore_graphics(&mut w.items, &mut self.ed.selection, &p.graphics);
+            // A drawing back on a layer hidden or locked meanwhile is not selected again.
+            let layers = &self.ed.layers;
+            self.ed.selection.retain(|s| layers.may_select(s));
             // Still away with every change answered: the host refused it.
             if !w.items.is_empty() && waiting {
                 w.selection = self.ed.selection.clone();
@@ -792,6 +797,9 @@ impl App {
                     self.dialog = None;
                 }
                 self.ed = Editor::default();
+                // The fresh editor keeps the user's hidden and locked layers (`prefs` is the
+                // user's list here: `self.prefs` may be taken out while this runs).
+                self.ed.layers = prefs.layers.clone();
                 self.panels.reset();
                 self.ed.message = format!("Opened {}", dir.display());
                 self.open = Some(o);
