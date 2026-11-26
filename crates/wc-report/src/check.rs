@@ -398,6 +398,8 @@ pub fn check_with(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet]) -> V
         }
     }
 
+    wire_numbers(i, &mut out);
+
     // Devices without a part.
     for tag in crate::all_tags(i) {
         if p.devices.get(&tag).and_then(|d| d.part.as_ref()).is_none() {
@@ -435,6 +437,62 @@ pub fn check_with(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet]) -> V
     });
     out.dedup();
     out
+}
+
+/// Wire numbers that do not name one connection each: a connection (net) whose wires carry
+/// two different numbers, and one number on wires of two connections. Wire numbering never
+/// makes either; numbers typed or imported can. Wires on overview pages repeat connections on
+/// purpose and do not count; wires that touch no pin are no connection, as for numbering.
+fn wire_numbers(i: &Inputs<'_>, out: &mut Vec<Finding>) {
+    let p = i.project;
+    let (_, wire_net) = wc_core::connectivity::wire_nets(p, |id| i.symbols.get(id).map(|s| s.role));
+    // Per net: its numbers, and its first numbered wire (page, wire id) in drawing order.
+    let mut by_net: BTreeMap<usize, (BTreeSet<&str>, (&Page, &str))> = BTreeMap::new();
+    // Per number: the nets it is on, in drawing order, each with the first wire carrying it.
+    let mut by_number: BTreeMap<&str, Vec<(usize, &Page, &str)>> = BTreeMap::new();
+    for page in p.pages.iter().filter(|pg| !pg.overview) {
+        for w in &page.wires {
+            let Some(number) = w.number.as_deref().map(str::trim).filter(|n| !n.is_empty()) else {
+                continue;
+            };
+            let Some(&net) = wire_net.get(&(page.id.clone(), w.id.clone())) else {
+                continue;
+            };
+            by_net
+                .entry(net)
+                .or_insert_with(|| (BTreeSet::new(), (page, w.id.as_str())))
+                .0
+                .insert(number);
+            let nets = by_number.entry(number).or_default();
+            if !nets.iter().any(|(n, ..)| *n == net) {
+                nets.push((net, page, w.id.as_str()));
+            }
+        }
+    }
+    for (numbers, (page, wire)) in by_net.values().filter(|(n, _)| n.len() > 1) {
+        let mut list: Vec<&str> = numbers.iter().copied().collect();
+        list.sort_by_key(|n| natural_key(n));
+        let list = match list.split_last() {
+            Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+            None => continue,
+        };
+        out.push(at(
+            page,
+            wire,
+            Severity::Warning,
+            format!("one connection has wire numbers {list}"),
+        ));
+    }
+    for (number, nets) in by_number.iter().filter(|(_, n)| n.len() > 1) {
+        // Named on the wire of the second connection: the first may well be the right one.
+        let Some((_, page, wire)) = nets.get(1) else { continue };
+        out.push(at(
+            page,
+            wire,
+            Severity::Warning,
+            format!("wire number {number} is on {} connections", nets.len()),
+        ));
+    }
 }
 
 /// The library sources' check rules, less the ones the project turns off, then the

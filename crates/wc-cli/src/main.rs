@@ -419,11 +419,12 @@ enum Cmd {
         out: PathBuf,
     },
     /// Check the project for mistakes: devices drawn twice, contacts without a coil, shorted
-    /// potentials, open pins, wires ending in the air, devices without a part, plus the
-    /// project's own `[[rule]]` tables in `project.toml` (a cable on every motor, a tag
-    /// pattern, at most N wires on a terminal) and the house rules in each library source's
-    /// `rules.toml`, less the ones `rules_off` turns off. Exits with an error when an error is
-    /// found, so it can guard a commit or a CI job.
+    /// potentials, open pins, wires ending in the air, wire numbers that do not name one
+    /// connection each, devices without a part, plus the project's own `[[rule]]` tables in
+    /// `project.toml` (a cable on every motor, a tag pattern, at most N wires on a terminal)
+    /// and the house rules in each library source's `rules.toml`, less the ones `rules_off`
+    /// turns off. Exits with an error when an error is found, so it can guard a commit or a CI
+    /// job.
     Check {
         /// Also list notes (open pins, devices without a part).
         #[arg(long)]

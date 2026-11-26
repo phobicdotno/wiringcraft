@@ -2869,3 +2869,46 @@ fn plc_card_overview_links_by_page_id_and_warns_on_points_and_shared_bytes() {
     };
     assert!(!plc_rack_warnings(&i).iter().any(|w| w.contains("slot 3")));
 }
+
+#[test]
+fn check_names_a_connection_with_two_wire_numbers_and_a_number_on_two_connections() {
+    let (mut p, s, parts) = fixture();
+    let found = |p: &Project| {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        check(&i)
+            .into_iter()
+            .filter(|f| f.message.contains("wire number"))
+            .map(|f| (f.item.unwrap_or_default(), f.message))
+            .collect::<Vec<_>>()
+    };
+    assert!(found(&p).is_empty(), "the fixture's numbers are fine");
+    // The lamp's X2 joins the connection of wire 3 through a wire numbered 10.
+    p.pages[0]
+        .wires
+        .push(wire("w8", pin("s6", "X1"), pin("s5", "2"), Some(" 10 "), None));
+    assert_eq!(
+        found(&p),
+        [("w3".to_owned(), "one connection has wire numbers 3 and 10".to_owned())]
+    );
+    // Number 2 again on the separate connection of wire 3: on two connections now.
+    p.pages[0].wires[2].number = Some("2".into());
+    p.pages[0].wires.pop();
+    assert_eq!(
+        found(&p),
+        [("w3".to_owned(), "wire number 2 is on 2 connections".to_owned())]
+    );
+    // A copy on an overview page repeats the connection on purpose.
+    p.pages[0].wires[2].number = Some("3".into());
+    let mut overview = Page::new("p9", "9", "Line diagram");
+    overview.overview = true;
+    overview.symbols.push(place("s20", "lamp", 100.0, Some("-P1")));
+    overview
+        .wires
+        .push(wire("w20", pin("s20", "X1"), pin("s20", "X2"), Some("2"), None));
+    p.pages.push(overview);
+    assert!(found(&p).is_empty());
+}
