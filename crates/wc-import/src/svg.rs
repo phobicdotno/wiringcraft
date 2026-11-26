@@ -447,16 +447,27 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
         let (start, empty) = match &ev {
             Event::Start(e) => (Some(e.clone()), false),
             Event::Empty(e) => (Some(e.clone()), true),
-            Event::End(_) => {
+            Event::End(e) => {
+                // A `<text>` with no words in it must not hand its place to later text.
+                if e.local_name().as_ref() == b"text" {
+                    pending_text = None;
+                }
                 if stack.len() > 1 {
                     stack.pop();
                 }
                 (None, false)
             }
             Event::Text(t) => {
-                if let Some((at, h, align)) = pending_text.take() {
-                    let s = t.unescape().map(|s| s.trim().to_owned()).unwrap_or_default();
+                // Only text for a pending label is read; other text is ignored.
+                if let Some((at, h, align)) = pending_text {
+                    let s = t
+                        .unescape()
+                        .map_err(|e| Error::Format(format!("SVG: {e}")))?
+                        .trim()
+                        .to_owned();
+                    // Skip the line breaks and indents between `<text>` and a `<tspan>`.
                     if !s.is_empty() {
+                        pending_text = None;
                         shapes.push(Shape::Text {
                             at,
                             text: s,
@@ -566,7 +577,9 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                     Some("end") => Align::Right,
                     _ => Align::Left,
                 };
-                pending_text = Some((m.p(num(&e, "x"), num(&e, "y")), size * sc * 0.72, align));
+                if !empty {
+                    pending_text = Some((m.p(num(&e, "x"), num(&e, "y")), size * sc * 0.72, align));
+                }
                 None
             }
             _ => None,
@@ -807,6 +820,37 @@ mod tests {
         };
         assert!(near(*center, Point::new(40.0, 0.0)));
         assert!((radius - 3.0).abs() < 1e-9, "scale grows the radius");
+        Ok(())
+    }
+
+    #[test]
+    fn text_in_tspan_after_line_break() -> Result<()> {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 20">
+            <text x="3" y="10" font-size="4">
+              <tspan>K1</tspan>
+            </text>
+            <text x="3" y="14"/>
+            <title>not a label</title>
+            <text x="3" y="16">
+            </text>
+            <desc>also not a label</desc>
+        </svg>"#;
+        let s = symbol(svg, "svg.k1", "K1")?;
+        let texts: Vec<&str> = s
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["K1"]);
+        // Text that cannot be read is an error, not a skipped line break.
+        let bad = r#"<svg><text x="0" y="0">&missing;<tspan>K1</tspan></text></svg>"#;
+        assert!(symbol(bad, "svg.bad", "Bad").is_err());
+        // Unreadable text with no label waiting for it is ignored, as before.
+        let title = r#"<svg><title>&missing;</title><line x1="0" y1="0" x2="1" y2="1"/></svg>"#;
+        assert!(symbol(title, "svg.title", "Title").is_ok());
         Ok(())
     }
 
