@@ -1957,21 +1957,8 @@ impl App {
             {
                 self.ed.finish_shape = true;
             }
-            if i.key_pressed(Key::Escape) {
-                if self.ed.dragging() {
-                    // The canvas takes the drag back (#737).
-                    self.ed.cancel_drag = true;
-                } else if self.ed.tool == Tool::BlackBox && self.ed.black_box.is_some() {
-                    self.ed.black_box = None;
-                    self.ed.message = black_box_tool::hint(None).into();
-                } else if !self.ed.shape_points.is_empty() {
-                    self.ed.shape_points.clear();
-                    self.ed.message = canvas::shape_hint(self.ed.tool, 0).into();
-                } else if self.ed.wire.is_some() {
-                    self.ed.wire = None;
-                } else {
-                    out.push(Action::Select);
-                }
+            if i.key_pressed(Key::Escape) && self.ed.escape() {
+                out.push(Action::Select);
             }
         });
         out

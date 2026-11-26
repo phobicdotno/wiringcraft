@@ -185,6 +185,26 @@ impl Editor {
         self.tool == Tool::Select && self.drag.is_some()
     }
 
+    /// Escape on the canvas: cancel the select-tool drag going on (the canvas takes it back on
+    /// its next frame, #737), else drop the black box, shape or wire being drawn. Returns true
+    /// when there was nothing to drop, and Escape goes back to the Select tool.
+    pub fn escape(&mut self) -> bool {
+        if self.dragging() {
+            self.cancel_drag = true;
+        } else if self.tool == Tool::BlackBox && self.black_box.is_some() {
+            self.black_box = None;
+            self.message = crate::black_box_tool::hint(None).into();
+        } else if !self.shape_points.is_empty() {
+            self.shape_points.clear();
+            self.message = shape_hint(self.tool, 0).into();
+        } else if self.wire.is_some() {
+            self.wire = None;
+        } else {
+            return true;
+        }
+        false
+    }
+
     /// Who holds the page shown, in a shared session: then it is read-only here and only
     /// selecting, panning and zooming work on it. `None` in the panel view and on own pages.
     pub fn held_page<'a>(&'a self, project: &wc_core::Project) -> Option<&'a str> {
@@ -4270,17 +4290,23 @@ mod tests {
         let (_tmp, mut o, mut ed, _) = moving_coil();
         drag(&mut o, &mut ed, Point::new(-40.0, 0.0));
         assert!(ed.dragging());
-        // W during the move.
+        // W during the move, the button let go, a wire started, then Escape twice.
         ed.tool = Tool::Wire;
-        assert!(!ed.dragging(), "Escape now goes to the wire tool, not the old drag");
         end_drag_off_select(&mut ed);
-        assert!(ed.drag.is_none());
-        // Back in the select tool, nothing is left to release or cancel.
-        ed.tool = Tool::Select;
-        assert!(!ed.dragging());
+        assert!(ed.drag.is_none(), "the tool change ends the drag");
         let moved = o.project.pages.clone();
         drag_released(&mut o, &mut ed, false);
-        assert_eq!(o.project.pages, moved);
+        assert_eq!(o.project.pages, moved, "its release does nothing");
+        ed.wire = Some((
+            Endpoint::Point {
+                at: Point::new(0.0, 0.0),
+            },
+            Vec::new(),
+        ));
+        assert!(!ed.escape(), "the first Escape drops the wire being drawn");
+        assert!(ed.wire.is_none());
+        assert!(!ed.cancel_drag, "and leaves no drag to cancel");
+        assert!(ed.escape(), "the next leaves the wire tool");
     }
 
     #[test]
