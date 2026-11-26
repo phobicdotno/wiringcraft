@@ -683,7 +683,8 @@ pub fn wire_list(i: &Inputs<'_>) -> Table {
         ],
     );
     let (_, net_of) = net_names(i);
-    for page in &i.project.pages {
+    // An overview (line diagram) draws connections again; the list shows each wire once.
+    for page in i.project.pages.iter().filter(|pg| !pg.overview) {
         for w in &page.wires {
             let end = |e: &Endpoint| match e {
                 Endpoint::Pin { item, pin } => pin_label(i.project, &page.id, item, pin),
@@ -726,7 +727,8 @@ pub fn cable_list(i: &Inputs<'_>) -> Table {
         &["Cable", "Type", "Description", "Core", "Page", "From", "To"],
     );
     let mut cores: BTreeMap<DeviceTag, Vec<(String, String, String, String)>> = BTreeMap::new();
-    for page in &i.project.pages {
+    // Overview pages repeat the schematic's cables; each core is listed once.
+    for page in i.project.pages.iter().filter(|pg| !pg.overview) {
         for w in &page.wires {
             let Some(c) = &w.cable else { continue };
             let end = |e: &Endpoint| match e {
