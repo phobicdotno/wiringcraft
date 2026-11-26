@@ -326,6 +326,9 @@ fn variants(text: &str) -> Result<Vec<Variant>> {
     let mut current: Option<Variant> = None;
     let mut placement: Option<Placement> = None;
     let mut text_item: Option<Text> = None;
+    // Whether the `S53x5` being read was kept as a property placement; its formatting child
+    // applies only then, never to the one before.
+    let mut prop_kept = false;
     let mut root_seen = false;
     let mut items = 0usize;
     loop {
@@ -441,6 +444,7 @@ fn variants(text: &str) -> Result<Vec<Variant>> {
                         }
                     }
                     "S53x5" if parent == Some("O17") => {
+                        prop_kept = false;
                         items += 1;
                         if items > MAX_ITEMS {
                             return Err(Error::Format(format!("holds more than {MAX_ITEMS} objects")));
@@ -457,6 +461,7 @@ fn variants(text: &str) -> Result<Vec<Variant>> {
                                 let (owner, index) = s.trim().rsplit_once('/')?;
                                 (owner == p.id).then(|| index.to_owned())
                             });
+                            prop_kept = true;
                             p.props.push(Prop {
                                 index: attr(e, "A4")?.unwrap_or_default().trim().to_owned(),
                                 property,
@@ -470,7 +475,7 @@ fn variants(text: &str) -> Result<Vec<Variant>> {
                         }
                     }
                     "S54x505" if parent == Some("S53x5") => {
-                        if let Some(prop) = placement.as_mut().and_then(|p| p.props.last_mut()) {
+                        if prop_kept && let Some(prop) = placement.as_mut().and_then(|p| p.props.last_mut()) {
                             if let Some(h) = attr_number(e, "A961")?.filter(|h| *h > 0.0) {
                                 prop.height = h;
                             }
@@ -670,7 +675,7 @@ fn describe(
         }
         let prop = props
             .get(&(k + 1))
-            .or_else(|| if single { props.get(&0) } else { None });
+            .or_else(|| if single && k == 0 { props.get(&0) } else { None });
         let shown = prop.and_then(|q| prop_at(p, &by_index, q).map(|at| (*q, at)));
         let shape = match (shown, points.get(k).copied().flatten()) {
             (Some((q, at)), _) => Shape::Text {

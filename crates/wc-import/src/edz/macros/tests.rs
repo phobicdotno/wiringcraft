@@ -322,6 +322,12 @@ fn many_descriptions_are_cut_and_too_many_shown_properties_refused() -> TestResu
     let xml = SHOWN_TEXTS.replace(r#"A186="IN1""#, &format!(r#"A186="IN1;{long}""#));
     let m = read("coil.ema", &xml)?;
     assert!(text_at(&m.symbol, "IN1").is_ok());
+    let kept = variants(&xml)?
+        .iter()
+        .flat_map(|v| v.placements.iter())
+        .find(|p| p.id == "17/51")
+        .map(|p| p.descriptions.len());
+    assert_eq!(kept, Some(MAX_DESIGNATIONS));
 
     let many: String = (0..=MAX_PROPS)
         .map(|k| format!(r#"<S53x5 A4="{}" A771="20029" A953="0" A502="17/52/{k}"/>"#, k + 10))
@@ -751,5 +757,30 @@ fn a_terminal_gets_a_pin_per_designation_and_a_fuse_is_drawn_as_fuses() -> TestR
     let m = read("fuse1.ema", &fuse.replace("1;2;3;4", "A1;A2"))?;
     assert_eq!(m.symbol.role, SymbolRole::Standalone, "not a coil");
     assert!(near(pin(&m.symbol, "A2")?.at, 10.0, 18.0));
+    Ok(())
+}
+
+#[test]
+fn a_single_points_shown_description_is_its_first_and_formatting_stays_with_its_own_property() -> TestResult {
+    // A second description of a single point has no point of its own: counted, not drawn over
+    // the first. A property placement that is not read keeps its formatting to itself.
+    let xml = SHOWN_TEXTS.replace(r#"A186="IN1""#, r#"A186="IN1;Spare""#).replace(
+        r#"<S53x5 A4="2" R7="17/51" A771="20010" A953="0" A501="-50/-50"/>"#,
+        r#"<S53x5 A4="2" R7="17/51" A771="x" A953="0"><S54x505 A961="9" A962="1"/></S53x5>"#,
+    );
+    let m = read("coil.ema", &xml)?;
+    let (at, height, angle, _) = text_at(&m.symbol, "IN1")?;
+    assert!(near(at, 32.0, 9.0), "{at:?}");
+    assert!(
+        (height - TEXT_HEIGHT).abs() < 1e-9 && angle.abs() < 1e-9,
+        "{height} {angle}"
+    );
+    assert!(text_at(&m.symbol, "Spare").is_err());
+    assert_eq!(
+        m.left_out.get("connection point descriptions of points without a pin"),
+        Some(&1),
+        "{:?}",
+        m.left_out
+    );
     Ok(())
 }
