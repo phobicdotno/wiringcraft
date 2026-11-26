@@ -1945,9 +1945,13 @@ impl App {
                 (Key::G, Action::ToggleGrid),
                 (Key::F, Action::ZoomFit),
                 (Key::Plus, Action::ZoomIn),
+                // The unshifted key that has + on it on many keyboards (US: = and +).
+                (Key::Equals, Action::ZoomIn),
                 (Key::Minus, Action::ZoomOut),
             ] {
-                if i.key_pressed(k) && i.modifiers.is_none() {
+                // + often needs Shift, so the zoom-in keys also count with Shift held.
+                let shift_ok = matches!(k, Key::Plus | Key::Equals) && i.modifiers.shift_only();
+                if i.key_pressed(k) && (i.modifiers.is_none() || shift_ok) {
                     out.push(a);
                 }
             }
