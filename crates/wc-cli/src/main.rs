@@ -52,7 +52,8 @@ enum Cmd {
         /// Position in mm, `x,y`.
         #[arg(long, value_parser = parse_point)]
         at: Point,
-        #[arg(long)]
+        /// Device tag, e.g. `-K1` (taken as a value, though it starts with `-`).
+        #[arg(long, allow_hyphen_values = true)]
         tag: Option<String>,
         /// 0, 90, 180 or 270.
         #[arg(long, default_value_t = 0)]
@@ -937,15 +938,52 @@ fn parse_point(s: &str) -> Result<Point, String> {
     }
 }
 
-fn parse_end(page: &Page, s: &str) -> Res<Endpoint> {
+/// A wire end from `item:pin` or `x,y`. A pin must be one the placed symbol has (its
+/// definition read from the project's vendored symbols in `dir`).
+fn parse_end(dir: &Path, page: &Page, s: &str) -> Res<Endpoint> {
     if let Ok(p) = parse_point(s) {
         return Ok(Endpoint::Point { at: p });
     }
     let (item, pin) = s
         .split_once(':')
         .ok_or_else(|| format!("{s:?}: expected item:pin or x,y"))?;
-    if page.symbol(item).is_none() {
+    let Some(placed) = page.symbol(item) else {
         return Err(format!("no symbol {item:?} on page {}", page.id));
+    };
+    let name = || {
+        placed
+            .tag
+            .as_ref()
+            .map_or_else(|| item.to_owned(), |t| format!("{item} ({t})"))
+    };
+    let symbol = match store::read_vendored_symbol(dir, &placed.symbol) {
+        Ok(symbol) => Some(symbol),
+        // No copy yet is allowed, as elsewhere (`lib lock` fills it in): the pin goes unchecked.
+        Err(wc_core::Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => None,
+        Err(why) => {
+            return Err(format!(
+                "symbol {} on page {}: its definition {} could not be read ({})",
+                name(),
+                page.id,
+                placed.symbol,
+                escape_field(&why.to_string())
+            ));
+        }
+    };
+    if let Some(symbol) = symbol
+        && symbol.pin(pin).is_none()
+    {
+        let name = name();
+        let pins: Vec<String> = symbol.pins.iter().map(|p| escape_field(&p.name)).collect();
+        return Err(format!(
+            "symbol {name} on page {} has no pin {pin:?}; its pins are {}",
+            page.id,
+            if pins.is_empty() {
+                "none".to_owned()
+            } else {
+                pins.join(", ")
+            }
+        ));
     }
     Ok(Endpoint::Pin {
         item: item.into(),
@@ -1021,7 +1059,22 @@ fn cover_moved(ids: Vec<String>) {
 }
 
 fn load(dir: &Path) -> Res<Project> {
+    // The entry itself, not where a link leads: a broken link is reported as the load fails.
+    if let Err(err) = std::fs::symlink_metadata(dir.join(store::PROJECT_FILE))
+        && err.kind() == std::io::ErrorKind::NotFound
+    {
+        return Err(no_project(dir));
+    }
     store::load(dir).map_err(e)
+}
+
+/// What a command says when its folder holds no project: where it looked, and how to get one.
+fn no_project(dir: &Path) -> String {
+    format!(
+        "no WiringCraft project in {} (no {}): use -C <folder> or create one with wiringcraft new <folder>",
+        escape_field(&dir.display().to_string()),
+        store::PROJECT_FILE
+    )
 }
 
 /// The project with its texts in `lang` (one language code, or two joined by `,`) from the
@@ -1411,12 +1464,13 @@ fn run(cli: Cli) -> Res<()> {
             mirror,
         } => {
             let mut p = load(dir)?;
+            // Check the inputs before taking the symbol, so a bad tag or turn leaves no copy behind.
+            let tag = tag.map(|t| DeviceTag::parse(&t)).transpose().map_err(e)?;
+            let rotation = Rotation::from_degrees(rotate).ok_or("rotation must be 0, 90, 180 or 270")?;
             if store::read_vendored_symbol(dir, &symbol).is_err() {
                 let lib = wc_library::Library::open(dir, &p).map_err(e)?;
                 wc_library::take(dir, &mut p, &lib, ItemKind::Symbol, &symbol).map_err(e)?;
             }
-            let tag = tag.map(|t| DeviceTag::parse(&t)).transpose().map_err(e)?;
-            let rotation = Rotation::from_degrees(rotate).ok_or("rotation must be 0, 90, 180 or 270")?;
             if let Some(t) = &tag {
                 p.devices.entry(t.clone()).or_default();
             }
@@ -1542,8 +1596,8 @@ fn run(cli: Cli) -> Res<()> {
                 None => None,
             };
             let pg = page_mut(&mut p, &page)?;
-            let from = parse_end(pg, &from)?;
-            let to = parse_end(pg, &to)?;
+            let from = parse_end(dir, pg, &from)?;
+            let to = parse_end(dir, pg, &to)?;
             let id = pg.next_id("w");
             pg.wires.push(Wire {
                 id: id.clone(),
@@ -5079,6 +5133,64 @@ mod tests {
     }
 
     #[test]
+    fn a_wire_to_a_pin_the_symbol_does_not_have_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        let args = ["box", "p1", "--at", "50,50", "--size", "20,20", "--tag", "-F1"];
+        cli(
+            &dir,
+            &[&args[..], &["--pin", "1:top:10", "--pin", "2:bottom:10"]].concat(),
+        )
+        .unwrap();
+        let s1 = load(&dir).unwrap().page("p1").unwrap().symbols[0].id.clone();
+
+        let err = cli(&dir, &["wire", "p1", &format!("{s1}:99"), &format!("{s1}:1")]).unwrap_err();
+        assert_eq!(
+            err,
+            format!("symbol {s1} (-F1) on page p1 has no pin \"99\"; its pins are 1, 2")
+        );
+        assert!(
+            load(&dir).unwrap().page("p1").unwrap().wires.is_empty(),
+            "nothing saved"
+        );
+
+        cli(&dir, &["wire", "p1", &format!("{s1}:2"), &format!("{s1}:1")]).unwrap();
+        assert_eq!(load(&dir).unwrap().page("p1").unwrap().wires.len(), 1);
+
+        // The listed pin names are escaped, so a control character cannot reach the terminal.
+        let symbol_id = load(&dir).unwrap().page("p1").unwrap().symbols[0].symbol.clone();
+        let vendored = store::vendor_path(&dir, ItemKind::Symbol, &symbol_id).unwrap();
+        let mut symbol = store::read_vendored_symbol(&dir, &symbol_id).unwrap();
+        symbol.pins[1].name = "x\u{1b}y".into();
+        store::write_vendored_symbol(&dir, &symbol).unwrap();
+        let err = cli(&dir, &["wire", "p1", &format!("{s1}:99"), &format!("{s1}:1")]).unwrap_err();
+        assert!(
+            err.ends_with("its pins are 1, x\\u{1b}y") && !err.contains('\u{1b}'),
+            "{err}"
+        );
+
+        // A definition that cannot be read is an error naming the placed symbol, not a pass;
+        // point ends do not read it.
+        std::fs::write(&vendored, "not json").unwrap();
+        let err = cli(&dir, &["wire", "p1", &format!("{s1}:1"), "0,0"]).unwrap_err();
+        assert!(
+            err.starts_with(&format!(
+                "symbol {s1} (-F1) on page p1: its definition {symbol_id} could not be read"
+            )),
+            "{err}"
+        );
+        cli(&dir, &["wire", "p1", "0,0", "10,0"]).unwrap();
+        assert_eq!(load(&dir).unwrap().page("p1").unwrap().wires.len(), 2);
+
+        // A symbol with no copy yet (as before `lib lock`) leaves the pin unchecked.
+        std::fs::remove_file(&vendored).unwrap();
+        cli(&dir, &["wire", "p1", &format!("{s1}:1"), "0,0"]).unwrap();
+        assert_eq!(load(&dir).unwrap().page("p1").unwrap().wires.len(), 3);
+    }
+
+    #[test]
     fn a_device_is_placed_turned_moved_and_taken_off_a_plate() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("p");
@@ -7792,6 +7904,61 @@ mod tests {
         )
         .unwrap();
         assert_eq!(std::fs::read_dir(lib2.join("parts")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn place_takes_a_tag_that_starts_with_a_dash_as_box_does() {
+        let Ok(tmp) = tempfile::tempdir() else { unreachable!() };
+        let dir = tmp.path().join("proj");
+        let Some(path) = dir.to_str() else { unreachable!() };
+        let Ok(cmd) = Cli::try_parse_from(["wiringcraft", "new", path, "--no-git"]) else {
+            unreachable!()
+        };
+        assert!(run(cmd).is_ok());
+        let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+        let Some(starter) = starter.to_str() else {
+            unreachable!()
+        };
+        assert!(cli(&dir, &["lib", "add", "starter", "folder", starter]).is_ok());
+        assert!(cli(&dir, &["page", "add", "p1", "--number", "1"]).is_ok());
+
+        let placed = cli(&dir, &["place", "p1", "wc.coil", "--at", "50,50", "--tag", "-K1"]);
+        assert!(placed.is_ok(), "{placed:?}");
+        let Ok(p) = load(&dir) else { unreachable!() };
+        let Some(pg) = p.pages.iter().find(|pg| pg.id == "p1") else {
+            unreachable!()
+        };
+        let Some(s) = pg.symbols.first() else { unreachable!() };
+        assert_eq!(s.tag.as_ref().map(ToString::to_string).as_deref(), Some("-K1"));
+    }
+
+    #[test]
+    fn place_checks_the_turn_and_tag_before_taking_the_symbol() {
+        let Ok(tmp) = tempfile::tempdir() else { unreachable!() };
+        let dir = tmp.path().join("proj");
+        let Some(path) = dir.to_str() else { unreachable!() };
+        let Ok(cmd) = Cli::try_parse_from(["wiringcraft", "new", path, "--no-git"]) else {
+            unreachable!()
+        };
+        assert!(run(cmd).is_ok());
+        let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+        let Some(starter) = starter.to_str() else {
+            unreachable!()
+        };
+        assert!(cli(&dir, &["lib", "add", "starter", "folder", starter]).is_ok());
+        assert!(cli(&dir, &["page", "add", "p1", "--number", "1"]).is_ok());
+
+        for bad in [["--rotate", "45"], ["--tag", "-K1."]] {
+            let mut args = vec!["place", "p1", "wc.coil", "--at", "50,50"];
+            args.extend(bad);
+            assert!(cli(&dir, &args).is_err(), "{bad:?}");
+            assert!(
+                store::read_vendored_symbol(&dir, "wc.coil").is_err(),
+                "no copy left by {bad:?}"
+            );
+            let Ok(p) = load(&dir) else { unreachable!() };
+            assert!(!p.lock.symbols.contains_key("wc.coil"), "no lock entry from {bad:?}");
+        }
     }
 
     #[test]

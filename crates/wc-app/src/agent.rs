@@ -204,6 +204,7 @@ fn point_list() -> Value {
 /// Every tool the assistant has.
 pub fn specs() -> Vec<Value> {
     let actions: Vec<String> = Action::ALL.iter().map(|a| a.name()).collect();
+    let reports: Vec<&str> = wc_report::Kind::ALL.iter().map(|k| k.name()).collect();
     vec![
         tool(
             "get_state",
@@ -489,7 +490,7 @@ pub fn specs() -> Vec<Value> {
         tool(
             "get_report",
             "A report as a Markdown table.",
-            json!({"kind": {"type": "string", "enum": ["contents", "parts", "devices", "wires", "nets", "terminals", "cables", "plc", "locations"]}}),
+            json!({"kind": {"type": "string", "enum": reports}}),
             &["kind"],
         ),
         tool(
@@ -6356,6 +6357,21 @@ mod tests {
             if let Err(e) = a.agent_tool(&name, &json!({})) {
                 assert!(!e.starts_with("Unknown tool"), "{name}: {e}");
             }
+        }
+    }
+
+    #[test]
+    fn get_report_offers_and_reads_every_report() {
+        let (_tmp, mut a) = app(vec![]);
+        let spec = specs().into_iter().find(|t| t["name"] == "get_report").unwrap();
+        let offered = &spec["input_schema"]["properties"]["kind"]["enum"];
+        for kind in wc_report::Kind::ALL {
+            assert!(
+                offered.as_array().unwrap().iter().any(|k| k == kind.name()),
+                "{} is not offered",
+                kind.name()
+            );
+            call(&mut a, "get_report", json!({"kind": kind.name()})).unwrap();
         }
     }
 

@@ -1,0 +1,122 @@
+{
+  "category": "terminals",
+  "description": "Disconnect (knife) terminal of a terminal strip: a link that opens to isolate the circuit for testing; the strip is the device tag, the terminal number is its index.",
+  "graphics": [
+    {
+      "a": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 4.0
+      },
+      "kind": "line"
+    },
+    {
+      "center": {
+        "x": 0.0,
+        "y": 5.5
+      },
+      "kind": "circle",
+      "radius": 1.5
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 7.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 8.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 8.0
+      },
+      "b": {
+        "x": 1.5,
+        "y": 8.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 12.5
+      },
+      "b": {
+        "x": 1.5,
+        "y": 8.0
+      },
+      "kind": "line"
+    },
+    {
+      "center": {
+        "x": 0.0,
+        "y": 12.5
+      },
+      "filled": true,
+      "kind": "circle",
+      "radius": 0.6
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 12.5
+      },
+      "b": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "kind": "line"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "1"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 14.4
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "2"
+    }
+  ],
+  "id": "wc.terminal.disconnect",
+  "letter_code": "X",
+  "name": "Disconnect terminal",
+  "pins": [
+    {
+      "at": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "1"
+    },
+    {
+      "at": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "dir": "down",
+      "name": "2"
+    }
+  ],
+  "role": "terminal",
+  "tag_at": {
+    "x": -8.0,
+    "y": 8.0
+  }
+}
