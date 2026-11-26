@@ -1393,12 +1393,13 @@ fn run(cli: Cli) -> Res<()> {
             mirror,
         } => {
             let mut p = load(dir)?;
+            // Check the inputs before taking the symbol, so a bad tag or turn leaves no copy behind.
+            let tag = tag.map(|t| DeviceTag::parse(&t)).transpose().map_err(e)?;
+            let rotation = Rotation::from_degrees(rotate).ok_or("rotation must be 0, 90, 180 or 270")?;
             if store::read_vendored_symbol(dir, &symbol).is_err() {
                 let lib = wc_library::Library::open(dir, &p).map_err(e)?;
                 wc_library::take(dir, &mut p, &lib, ItemKind::Symbol, &symbol).map_err(e)?;
             }
-            let tag = tag.map(|t| DeviceTag::parse(&t)).transpose().map_err(e)?;
-            let rotation = Rotation::from_degrees(rotate).ok_or("rotation must be 0, 90, 180 or 270")?;
             if let Some(t) = &tag {
                 p.devices.entry(t.clone()).or_default();
             }
