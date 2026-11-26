@@ -2967,6 +2967,52 @@ fn a_declared_node_with_a_blank_tag_keeps_its_box_address_and_station() {
 }
 
 #[test]
+fn the_reader_title_bar_shows_the_project_name_not_the_file_name() {
+    // One page, so there is a sheet to print (#833).
+    let mut project = Project::new("Pump station");
+    project.pages.push(Page::new("p1", "1", "Main"));
+    let (pdf, _) = export(&project, &BTreeMap::new(), &Options::default());
+    let text = String::from_utf8_lossy(&pdf);
+    let Some(catalog) = text.split("endobj").find(|o| o.contains("/Type /Catalog")) else {
+        unreachable!("no catalog in {text}");
+    };
+    assert!(
+        catalog.contains("/ViewerPreferences << /DisplayDocTitle true >>"),
+        "{catalog}"
+    );
+    assert!(text.contains(&format!("/Title {}", writer::pdf_text("Pump station"))));
+
+    // The file still opens: the trailer points at the xref table, and every object it lists
+    // starts where the table says, so the added catalog entry did not shift any offset.
+    let find = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).rposition(|w| w == needle);
+    let Some(sx) = find(&pdf, b"startxref\n") else {
+        unreachable!("no startxref");
+    };
+    let start: usize = std::str::from_utf8(&pdf[sx + 10..])
+        .ok()
+        .and_then(|s| s.lines().next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(usize::MAX);
+    assert!(pdf.get(start..).is_some_and(|t| t.starts_with(b"xref")));
+    let table = std::str::from_utf8(&pdf[start..]).unwrap_or("");
+    let mut lines = table.lines().skip(1);
+    let count: usize = lines
+        .next()
+        .and_then(|l| l.split(' ').nth(1))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+    assert!(count > 1, "{table}");
+    for (n, line) in lines.take(count).enumerate().skip(1) {
+        let offset: usize = line.split(' ').next().and_then(|o| o.parse().ok()).unwrap_or(0);
+        let head = format!("{n} 0 obj");
+        assert!(
+            pdf.get(offset..).is_some_and(|o| o.starts_with(head.as_bytes())),
+            "object {n} is not at {offset}"
+        );
+    }
+}
+
+#[test]
 fn a_project_with_nothing_to_print_says_so() {
     // No pages and no report tables: no sheet, so the caller is told instead of being handed a
     // PDF no reader opens (#833).
