@@ -1256,12 +1256,17 @@ fn rules_list(p: &Project, library: &[wc_core::check_rule::RuleSet], json: bool)
                     } else {
                         "on"
                     };
-                    out.push_str(&format!("{}:{}\t{state}\t{}\n", set.source, k + 1, rule_line(r)));
+                    out.push_str(&format!(
+                        "{}:{}\t{state}\t{}\n",
+                        escape_field(&set.source),
+                        k + 1,
+                        rule_line(r)
+                    ));
                 }
             }
             Err(why) => out.push_str(&format!(
                 "{}\terror\t{}\n",
-                set.source,
+                escape_field(&set.source),
                 escape_field(&format!("{}: {why}", wc_core::check_rule::LIBRARY_RULES_FILE))
             )),
         }
