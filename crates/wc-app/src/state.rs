@@ -700,7 +700,9 @@ impl Open {
         }
     }
 
-    pub fn refresh_library(&mut self) {
+    /// Rebuild the symbol list from the loaded vendored symbols and the library sources, so
+    /// each entry carries the name and description of the version in use.
+    fn relist_symbols(&mut self) {
         let mut items: BTreeMap<String, LibraryEntry> = self
             .symbols
             .iter()
@@ -717,6 +719,10 @@ impl Open {
             }
         }
         self.library = items.into_values().collect();
+    }
+
+    pub fn refresh_library(&mut self) {
+        self.relist_symbols();
         self.library_rules = wc_library::library_rules(&self.dir, &self.project);
         self.touch();
 
@@ -1481,13 +1487,18 @@ impl Open {
         }
     }
 
-    /// After an undo or redo: rebuild the library list when the step added or removed a library
+    /// After an undo or redo: rebuild the library lists when the step added or removed a library
     /// source (`sources_changed`), so symbols of a source that is gone are no longer offered and
-    /// those of one that came back are; then load every part a device uses that is not loaded,
+    /// those of one that came back are, and otherwise rebuild the symbol list, so a symbol whose
+    /// version the step changed is listed with its own name and description; then load every part a device uses that is not loaded,
     /// since a redo can bring back an assignment whose part an earlier rebuild dropped.
     fn follow_step(&mut self, sources_changed: bool) {
         if sources_changed {
             self.refresh_library();
+        } else {
+            // The step may have brought back another version of a vendored symbol: list it
+            // with its own name and description.
+            self.relist_symbols();
         }
         let missing: Vec<String> = self
             .project
@@ -6009,6 +6020,29 @@ pub(crate) mod tests {
         assert!(o.redo());
         assert_eq!(o.symbols["wc.coil"], new);
         assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), new);
+    }
+
+    #[test]
+    fn undo_and_redo_list_the_symbol_version_they_bring_back() {
+        let (_tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let old = o.symbols["wc.coil"].clone();
+        let mut new = old.clone();
+        new.description = "Solenoid winding".into();
+        o.checkpoint();
+        store::write_vendored_symbol(&o.dir, &new).unwrap();
+        o.project.lock.symbols.get_mut("wc.coil").unwrap().hash = new.hash();
+        o.reload_symbols();
+        o.refresh_library();
+        let listed = |o: &Open| o.library.iter().find(|e| e.id == "wc.coil").unwrap().clone();
+        assert_eq!(listed(&o).description, new.description);
+
+        assert!(o.undo(), "{:?}", o.take_undo_error());
+        assert_eq!(listed(&o).description, old.description);
+        assert!(!listed(&o).matches("solenoid"));
+        assert!(o.redo(), "{:?}", o.take_undo_error());
+        assert_eq!(listed(&o).description, new.description);
+        assert!(listed(&o).matches("solenoid"));
     }
 
     #[test]
