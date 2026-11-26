@@ -194,6 +194,24 @@ fn drawings(
     (out, report)
 }
 
+/// The file name, without extension, of a panel layout's drawing: `panel-` and the panel's
+/// name (its id when it has none), with every character but letters, digits and `-` written as
+/// `_`, so `Main cabinet/A` becomes `panel-Main_cabinet_A`. The app and the command line both
+/// name panel files this way.
+pub fn panel_file_stem(d: &PageDrawing) -> String {
+    let name = d.title.trim();
+    let base = if name.is_empty() {
+        d.id.strip_prefix("panel-").unwrap_or(&d.id)
+    } else {
+        name
+    };
+    let safe: String = base
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+        .collect();
+    format!("panel-{safe}")
+}
+
 /// Standard base64 with padding.
 pub(crate) fn base64(bytes: &[u8]) -> String {
     const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

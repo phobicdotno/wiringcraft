@@ -5176,19 +5176,18 @@ fn export_drawings_to(open: &Open, dir: &Path) -> String {
         .iter()
         .map(|page| {
             // A panel layout is named after itself (`panel-Main_cabinet`), a page by its number.
-            let (prefix, name) = if page.panel {
-                ("panel-", page.title.trim())
+            let mut stem = if page.panel {
+                wc_pdf::panel_file_stem(page)
             } else {
-                ("", page.number.trim())
+                let base = if page.number.trim().is_empty() {
+                    &page.id
+                } else {
+                    page.number.trim()
+                };
+                base.chars()
+                    .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+                    .collect()
             };
-            let base = if name.is_empty() { &page.id } else { name };
-            let mut stem: String = base
-                .chars()
-                .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
-                .collect();
-            if !(prefix.is_empty() || name.is_empty()) {
-                stem.insert_str(0, prefix);
-            }
             // Compared without case: `A1` and `a1` are one file name on Windows and macOS.
             while !used.insert(stem.to_lowercase()) {
                 stem.push('_');

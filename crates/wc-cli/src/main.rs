@@ -3753,7 +3753,12 @@ fn run(mut cli: Cli) -> Res<()> {
                 pages,
                 date,
                 panels: p.panels.clone(),
-                footprints: wc_pdf::footprints(vendored_parts(dir, &p).values()),
+                // A part that cannot be read is named in a warning; the others still export.
+                footprints: if p.panels.is_empty() {
+                    Default::default()
+                } else {
+                    wc_pdf::footprints(vendored_parts_warning_unreadable(dir, &p).values())
+                },
                 ..Default::default()
             };
             // Only SVG shows pictures; a DXF export neither reads nor checks them.
@@ -3773,11 +3778,12 @@ fn run(mut cli: Cli) -> Res<()> {
             for d in &drawings {
                 // A panel is named after itself: `panel-Cabinet_1`.
                 let mut stem = if d.panel {
-                    format!("panel-{}", file_stem(&d.title, &d.id.replacen("panel-", "", 1)))
+                    wc_pdf::panel_file_stem(d)
                 } else {
                     file_stem(&d.number, &d.id)
                 };
-                while !used.insert(stem.clone()) {
+                // Compared without case: `A1` and `a1` are one file name on Windows and macOS.
+                while !used.insert(stem.to_lowercase()) {
                     stem.push('_');
                 }
                 write_out(out.join(format!("{stem}.{ext}")), render(d)).map_err(e)?;
@@ -7436,6 +7442,19 @@ mod tests {
         }
         let dxf = std::fs::read_to_string(tmp.path().join("dxf").join("panel-Main_cabinet_A.dxf")).unwrap();
         assert!(dxf.contains("POLYLINE") && dxf.contains("Main cabinet/A"), "{dxf}");
+        // Names that differ only in case get files of their own, also on Windows and macOS.
+        cli(&dir, &["panel", "new", "plate2", "--name", "Main"]).unwrap();
+        cli(&dir, &["panel", "new", "plate3", "--name", "main"]).unwrap();
+        let out = tmp.path().join("cased");
+        cli(&dir, &["drawing", out.to_str().unwrap(), "--format", "dxf"]).unwrap();
+        let mut names: Vec<String> = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_lowercase())
+            .collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 4, "{names:?}");
+        assert!(names.contains(&"panel-main.dxf".into()) && names.contains(&"panel-main_.dxf".into()));
     }
 
     #[test]

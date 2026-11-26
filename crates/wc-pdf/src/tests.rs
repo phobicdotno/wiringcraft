@@ -1054,6 +1054,13 @@ fn a_panel_layout_is_drawn_for_svg_and_dxf_with_its_plate_outline() {
     );
     assert!(dxf.contains(&corner), "{corner:?} not in the DXF");
     assert!(crate::svg(panel).contains("<title>P1 Cabinet CAB1</title>"));
+    // Its file is named after the panel, the same in the app and on the command line.
+    assert_eq!(crate::panel_file_stem(panel), "panel-Cabinet_CAB1");
+    let mut named = panel.clone();
+    named.title = "Main.v1".into();
+    assert_eq!(crate::panel_file_stem(&named), "panel-Main_v1");
+    named.title = " ".into();
+    assert_eq!(crate::panel_file_stem(&named), "panel-main");
     // Without panels in the options, only the page is drawn.
     let (pages, _) = crate::page_lines(&project, &BTreeMap::new(), &Options::default());
     assert_eq!(pages.len(), 1);
