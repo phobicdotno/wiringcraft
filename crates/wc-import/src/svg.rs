@@ -406,6 +406,171 @@ mod tests {
         Ok(())
     }
 
+    /// Pin positions by name. Pins are rounded to 0.001 mm, so they compare exactly.
+    fn pin_at(s: &wc_core::Symbol, name: &str) -> Point {
+        let Some(p) = s.pins.iter().find(|p| p.name == name) else {
+            unreachable!("no pin {name}");
+        };
+        p.at
+    }
+
+    fn near(a: Point, b: Point) -> bool {
+        (a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() < 1e-9
+    }
+
+    #[test]
+    fn polylines_and_polygons() -> Result<()> {
+        // The pin at 0,0 keeps the drawing where it is (the first pin becomes the origin).
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg">
+            <circle id="pin:1" cx="0" cy="0" r="0.5"/>
+            <polyline points="0,0 10,0 10,5"/>
+            <polygon points="0 0 4 0 4 4"/>
+            <polyline points="3,3"/>
+            <polygon points=""/>
+        </svg>"#;
+        let s = symbol(svg, "svg.poly", "Poly")?;
+        assert_eq!(
+            s.graphics,
+            vec![
+                Shape::Polyline {
+                    points: vec![Point::new(0.0, 0.0), Point::new(10.0, 0.0), Point::new(10.0, 5.0)],
+                    closed: false,
+                    filled: false,
+                },
+                Shape::Polyline {
+                    points: vec![Point::new(0.0, 0.0), Point::new(4.0, 0.0), Point::new(4.0, 4.0)],
+                    closed: true,
+                    filled: false,
+                },
+            ],
+            "a polyline stays open, a polygon is closed, fewer than 2 points is dropped"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ellipses_and_filled_circles() -> Result<()> {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg">
+            <circle id="pin:1" cx="0" cy="0" r="0.5"/>
+            <ellipse cx="10" cy="0" rx="2" ry="4"/>
+            <circle cx="20" cy="0" r="1" fill="black"/>
+            <circle cx="30" cy="0" r="1" fill="none"/>
+            <circle cx="40" cy="0" r="1" fill="white"/>
+            <circle cx="50" cy="0" r="1" fill="transparent"/>
+            <circle cx="60" cy="0" r="1"/>
+            <ellipse cx="70" cy="0" rx="1" ry="1" fill="red"/>
+        </svg>"#;
+        let s = symbol(svg, "svg.ell", "Ellipse")?;
+        let circles: Vec<(f64, f64, bool)> = s
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Circle { center, radius, filled } => Some((center.x, *radius, *filled)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            circles,
+            vec![
+                (10.0, 3.0, false), // ellipse radius is the mean of rx and ry
+                (20.0, 1.0, true),
+                (30.0, 1.0, false),
+                (40.0, 1.0, false),
+                (50.0, 1.0, false),
+                (60.0, 1.0, false),
+                (70.0, 1.0, true),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pins_by_class_and_on_rect_line_path() -> Result<()> {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg">
+            <circle class="pin" cx="0" cy="0" r="0.5"/>
+            <rect class="big pin" x="10" y="0" width="4" height="2"/>
+            <line data-pin="L" x1="20" y1="1" x2="25" y2="1"/>
+            <path id="pin:P" d="M 30 5 L 40 5 L 40 8"/>
+            <rect class="pins" x="0" y="10" width="40" height="1"/>
+        </svg>"#;
+        let s = symbol(svg, "svg.pins", "Pins")?;
+        let names: Vec<&str> = s.pins.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["1", "2", "L", "P"], "class=\"pin\" pins are named by order");
+        assert_eq!(pin_at(&s, "1"), Point::new(0.0, 0.0));
+        assert_eq!(pin_at(&s, "2"), Point::new(12.0, 1.0), "a rect pin sits at its centre");
+        assert_eq!(
+            pin_at(&s, "L"),
+            Point::new(20.0, 1.0),
+            "a line pin sits at its first point"
+        );
+        assert_eq!(
+            pin_at(&s, "P"),
+            Point::new(30.0, 5.0),
+            "a path pin sits at its first point"
+        );
+        // Pin elements are not drawn; class="pins" is not a pin.
+        assert_eq!(s.graphics.len(), 1);
+        assert!(matches!(&s.graphics[0], Shape::Polyline { points, .. } if points[0] == Point::new(0.0, 10.0)));
+        Ok(())
+    }
+
+    #[test]
+    fn text_anchor_sets_alignment() -> Result<()> {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg">
+            <circle id="pin:1" cx="0" cy="0" r="0.5"/>
+            <text x="0" y="5" font-size="5">L</text>
+            <text x="0" y="10" text-anchor="middle">C</text>
+            <text x="0" y="15" text-anchor="end">R</text>
+        </svg>"#;
+        let s = symbol(svg, "svg.text", "Text")?;
+        let texts: Vec<(&str, Align, Point)> = s
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Text { text, align, at, .. } => Some((text.as_str(), *align, *at)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                ("L", Align::Left, Point::new(0.0, 5.0)),
+                ("C", Align::Center, Point::new(0.0, 10.0)),
+                ("R", Align::Right, Point::new(0.0, 15.0)),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rotate_scale_and_matrix_transforms() -> Result<()> {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg">
+            <circle id="pin:O" cx="0" cy="0" r="0.5"/>
+            <circle id="pin:R" cx="10" cy="0" r="0.5" transform="rotate(90)"/>
+            <circle id="pin:RC" cx="10" cy="5" r="0.5" transform="rotate(90 5 5)"/>
+            <circle id="pin:S" cx="3" cy="4" r="0.5" transform="scale(2)"/>
+            <circle id="pin:S2" cx="3" cy="4" r="0.5" transform="scale(2, 3)"/>
+            <circle id="pin:M" cx="1" cy="1" r="0.5" transform="matrix(1 0 0 1 7 8)"/>
+            <g transform="translate(10,0) rotate(90)">
+              <circle id="pin:TR" cx="5" cy="0" r="0.5"/>
+            </g>
+            <circle cx="20" cy="0" r="1.5" transform="scale(2)"/>
+        </svg>"#;
+        let s = symbol(svg, "svg.tf", "Transforms")?;
+        assert_eq!(pin_at(&s, "R"), Point::new(0.0, 10.0), "rotate(90) turns +x into +y");
+        assert_eq!(pin_at(&s, "RC"), Point::new(5.0, 10.0), "rotate about a centre");
+        assert_eq!(pin_at(&s, "S"), Point::new(6.0, 8.0));
+        assert_eq!(pin_at(&s, "S2"), Point::new(6.0, 12.0));
+        assert_eq!(pin_at(&s, "M"), Point::new(8.0, 9.0));
+        assert_eq!(pin_at(&s, "TR"), Point::new(10.0, 5.0), "rotate first, then translate");
+        let [Shape::Circle { center, radius, .. }] = s.graphics.as_slice() else {
+            unreachable!("one drawn circle, got {:?}", s.graphics);
+        };
+        assert!(near(*center, Point::new(40.0, 0.0)));
+        assert!((radius - 3.0).abs() < 1e-9, "scale grows the radius");
+        Ok(())
+    }
+
     #[test]
     fn hostile_svgs() {
         assert!(symbol("", "x", "x").is_err());
