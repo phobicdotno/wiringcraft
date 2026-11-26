@@ -2005,10 +2005,9 @@ struct PanelField {
 /// Enter `text` in field `field` (of [`PANEL_FIELDS`]) of the panel layout `id`, as one undo
 /// step when it changes the panel; a value that is not taken is refused with the reason.
 fn enter_panel_field(open: &mut Open, id: &str, field: usize, text: &str) -> Result<(), String> {
-    let Some(pi) = open.project.panels.iter().position(|p| p.id == id) else {
+    let Some(mut changed) = open.project.panels.iter().find(|p| p.id == id).cloned() else {
         return Ok(());
     };
-    let mut changed = open.project.panels[pi].clone();
     let text = text.trim();
     if field == 0 {
         if text.is_empty() {
@@ -2030,9 +2029,11 @@ fn enter_panel_field(open: &mut Open, id: &str, field: usize, text: &str) -> Res
             changed.height = v;
         }
     }
-    if changed != open.project.panels[pi] {
+    if open.project.panels.iter().any(|p| p.id == id && *p != changed) {
         open.checkpoint();
-        open.project.panels[pi] = changed;
+        if let Some(p) = open.project.panels.iter_mut().find(|p| p.id == id) {
+            *p = changed;
+        }
     }
     Ok(())
 }
