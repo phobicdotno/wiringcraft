@@ -5362,6 +5362,27 @@ mod tests {
     }
 
     #[test]
+    fn copying_and_cutting_only_a_drawing_counts_it_in_the_message() {
+        let (_tmp, mut a) = app(vec![]);
+        a.open.as_mut().unwrap().project.pages[0]
+            .graphics
+            .push(wc_core::Shape::Line {
+                a: wc_core::geom::Point::new(50.0, 50.0),
+                b: wc_core::geom::Point::new(80.0, 50.0),
+            });
+        a.ed.selection = vec![crate::state::Selection::Graphic(0)];
+        a.run(Action::Copy);
+        assert_eq!(a.ed.message, "Copied 1 item.");
+        a.run(Action::Cut);
+        assert_eq!(a.ed.message, "Cut 1 item.");
+        assert!(
+            a.open.as_ref().unwrap().project.pages[0].graphics.is_empty(),
+            "the cut line is gone"
+        );
+        assert_eq!(a.clipboard.graphics.len(), 1);
+    }
+
+    #[test]
     fn editing_actions_are_off_and_do_nothing_on_a_page_someone_else_holds() {
         use crate::chrome::Status;
         let (_tmp, mut a) = app(vec![]);
