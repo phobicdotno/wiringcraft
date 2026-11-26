@@ -5468,6 +5468,66 @@ mod tests {
         assert!(shortcuts_for(&mut a, egui::Key::Backspace, egui::Modifiers::COMMAND).is_empty());
     }
 
+    /// In the panel view, Ctrl+A then Ctrl+X (and Copy, Paste) leave the hidden schematic page
+    /// as it was, and the four are greyed out (#824).
+    #[test]
+    fn select_all_and_cut_in_the_panel_view_leave_the_schematic_page_alone() {
+        use crate::chrome::Status;
+        let (_tmp, mut a) = app(vec![]);
+        {
+            let o = a.open.as_mut().unwrap();
+            o.project.pages[0].graphics.push(wc_core::Shape::Line {
+                a: wc_core::geom::Point::new(50.0, 50.0),
+                b: wc_core::geom::Point::new(80.0, 50.0),
+            });
+            o.project
+                .panels
+                .push(wc_core::panel::Panel::new("pnl1", "Cabinet", 600.0, 800.0));
+        }
+        // Something on the clipboard, so Paste would have something to put down.
+        a.clipboard = a.open.as_ref().unwrap().copy(0, &[crate::state::Selection::Graphic(0)]);
+        a.ed.page = 0;
+        a.ed.panel = Some(0);
+        let page = a.open.as_ref().unwrap().project.pages[0].clone();
+        let status = |a: &App, act: Action| {
+            crate::StatusView {
+                open: a.open.as_ref(),
+                ed: &a.ed,
+                prefs: &a.prefs,
+                clipboard: &a.clipboard,
+                sharing: false,
+                share_undo: false,
+                share_redo: false,
+                show_layers: false,
+            }
+            .enabled(act)
+        };
+        for act in [Action::SelectAll, Action::Copy, Action::Cut, Action::Paste] {
+            assert!(!status(&a, act), "{act:?} is greyed out in the panel view");
+        }
+        let select_all = shortcuts_for(&mut a, egui::Key::A, egui::Modifiers::COMMAND);
+        assert_eq!(select_all, vec![Action::SelectAll]);
+        for act in select_all {
+            a.run(act);
+        }
+        assert!(a.ed.selection.is_empty(), "nothing on the hidden page is selected");
+        // Ctrl+X, Ctrl+C and Ctrl+V reach the app as these actions.
+        for act in [Action::Cut, Action::Copy, Action::Paste] {
+            a.run(act);
+        }
+        assert_eq!(
+            a.open.as_ref().unwrap().project.pages[0],
+            page,
+            "the schematic page is as it was"
+        );
+        assert!(a.ed.selection.is_empty());
+        assert!(a.ed.message.contains("close the panel layout"), "{}", a.ed.message);
+        // Back on the page, Select all works as before.
+        a.ed.panel = None;
+        a.run(Action::SelectAll);
+        assert_eq!(a.ed.selection, vec![crate::state::Selection::Graphic(0)]);
+    }
+
     /// The plus key zooms in with or without Shift, and so does the unshifted = key it shares
     /// on many keyboards; Alt with them is not a zoom shortcut here (#685).
     #[test]
@@ -6032,7 +6092,7 @@ mod tests {
             Action::PageProps,
             Action::DeletePage,
             Action::PageDown,
-            // These work on the schematic page under the panel.
+            // These would change the schematic page under the panel.
             Action::Paste,
             Action::Cut,
             Action::Rotate,
