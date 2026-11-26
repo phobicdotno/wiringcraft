@@ -2422,6 +2422,7 @@ impl Open {
                 if others == 1 { "s" } else { "" }
             ));
         }
+        self.check_box_file_unchanged(&symbol_id, &old)?;
         self.write_symbol_file(&new)?;
         self.checkpoint();
         self.project.lock.symbols.insert(
@@ -2449,6 +2450,34 @@ impl Open {
             s.at = s.at + moved;
         }
         Ok(warnings)
+    }
+
+    /// Before a black box edit writes its symbol file: the file must still hold `loaded`, the
+    /// version the edit starts from. Another program (`wiringcraft box-edit`) may have changed
+    /// it since the project was loaded, and writing over it would lose that change (#608). A
+    /// file the app itself could not put back ([`Self::mark_symbol_file_stale`]) is the app's
+    /// to write, and a missing file has nothing to lose.
+    fn check_box_file_unchanged(&self, symbol_id: &str, loaded: &Symbol) -> Result<(), String> {
+        if self.stale_symbol_files.contains(symbol_id) {
+            return Ok(());
+        }
+        let path = store::vendor_path(&self.dir, ItemKind::Symbol, symbol_id).map_err(|e| e.to_string())?;
+        let exists = path
+            .try_exists()
+            .map_err(|e| format!("{} cannot be checked: {e}", path.display()))?;
+        if !exists {
+            return Ok(());
+        }
+        let reload = "reopen the project to load it before editing the box";
+        match store::read_vendored_symbol(&self.dir, symbol_id) {
+            Ok(on_disk) if on_disk.hash() == loaded.hash() => Ok(()),
+            Ok(_) => Err(format!(
+                "the file of symbol {symbol_id} changed on disk since it was loaded; {reload}"
+            )),
+            Err(e) => Err(format!(
+                "the file of symbol {symbol_id} cannot be read ({e}), so it may have changed on disk since it was loaded; {reload}"
+            )),
+        }
     }
 
     pub fn add_wire(&mut self, page: usize, from: Endpoint, to: Endpoint, via: Vec<Point>) {
@@ -4442,6 +4471,7 @@ pub(crate) mod tests {
         kept.role = wc_core::symbol::SymbolRole::Main;
         o.symbols.insert(symbol_id.clone(), kept.clone());
         o.project.lock.symbols.get_mut(&symbol_id).unwrap().hash = kept.hash();
+        store::write_vendored_symbol(&o.dir, &kept).unwrap();
         o.edit_black_box(1, &id, (35.0, 20.0), &new_pins, &BTreeMap::new(), &Default::default())
             .unwrap();
         let edited = &o.symbols[&symbol_id];
@@ -4541,6 +4571,83 @@ pub(crate) mod tests {
             assert_eq!(reopened.project.lock.symbols[&symbol_id], lock, "lock kept");
             assert_eq!(reopened.undo_mark(), steps, "no undo step");
         }
+    }
+
+    #[test]
+    fn a_box_file_changed_on_disk_while_open_is_not_overwritten_by_an_edit() {
+        use wc_core::{BoxPin, BoxSide};
+        let (_tmp, mut o) = project();
+        let pins = [BoxPin {
+            name: "1".into(),
+            side: BoxSide::Left,
+            offset: 5.0,
+        }];
+        let none = BTreeMap::new();
+        let id = o
+            .add_black_box(1, Point::new(40.0, 40.0), Point::new(60.0, 50.0), &pins, None)
+            .unwrap();
+        let symbol_id = format!("box.{}.{id}", o.project.pages[1].id);
+        // Edits one after another in the app, and Undo and Redo between them, which write
+        // the file themselves, go ahead.
+        o.edit_black_box(1, &id, (30.0, 20.0), &pins, &none, &Default::default())
+            .unwrap();
+        o.edit_black_box(1, &id, (40.0, 20.0), &pins, &none, &Default::default())
+            .unwrap();
+        assert!(o.undo());
+        o.edit_black_box(1, &id, (35.0, 20.0), &pins, &none, &Default::default())
+            .unwrap();
+        assert!(o.undo());
+        assert!(o.redo());
+        o.edit_black_box(1, &id, (45.0, 25.0), &pins, &none, &Default::default())
+            .unwrap();
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(),
+            o.symbols[&symbol_id],
+            "the file holds the last edit"
+        );
+        // Another program (`wiringcraft box-edit`) resizes the box while the project is open.
+        let outside = wc_core::black_box(&symbol_id, "Black box", 50.0, 50.0, &pins).unwrap();
+        store::write_vendored_symbol(&o.dir, &outside).unwrap();
+        let loaded = o.symbols[&symbol_id].clone();
+        let lock = o.project.lock.symbols[&symbol_id].clone();
+        let at = o.project.pages[1].symbol(&id).unwrap().at;
+        let steps = o.undo_mark();
+        for result in [
+            o.edit_black_box(1, &id, (30.0, 20.0), &pins, &none, &Default::default()),
+            // Sized from a near corner on the canvas, so the box moves too.
+            o.edit_black_box_moved(
+                1,
+                &id,
+                (30.0, 20.0),
+                &pins,
+                &none,
+                &Default::default(),
+                Point::new(5.0, 0.0),
+            ),
+        ] {
+            let err = result.unwrap_err();
+            assert!(
+                err.contains("changed on disk") && err.contains("reopen the project"),
+                "{err}"
+            );
+        }
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(),
+            outside,
+            "file kept"
+        );
+        assert_eq!(o.symbols[&symbol_id], loaded, "loaded version kept");
+        assert_eq!(o.project.lock.symbols[&symbol_id], lock, "lock kept");
+        assert_eq!(o.project.pages[1].symbol(&id).unwrap().at, at, "box not moved");
+        assert_eq!(o.undo_mark(), steps, "no undo step");
+        // A file that cannot be read any more is not written over either.
+        let path = store::vendor_path(&o.dir, ItemKind::Symbol, &symbol_id).unwrap();
+        std::fs::write(&path, "not json").unwrap();
+        let err = o
+            .edit_black_box(1, &id, (30.0, 20.0), &pins, &none, &Default::default())
+            .unwrap_err();
+        assert!(err.contains("cannot be read"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
     }
 
     #[test]
