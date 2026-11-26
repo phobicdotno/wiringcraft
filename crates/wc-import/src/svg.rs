@@ -34,6 +34,14 @@ impl M {
         let [a, b, ..] = self.0;
         (a * a + b * b).sqrt()
     }
+    /// Whether a circle stays a circle: x and y are scaled alike and stay at right angles
+    /// (turns, mirrors and moves are fine; a `scale(2, 1)` or a skew is not).
+    fn keeps_circles(&self) -> bool {
+        let [a, b, c, d, ..] = self.0;
+        let (x, y) = (a * a + b * b, c * c + d * d);
+        let tol = 1e-9 * x.max(y).max(1.0);
+        (x - y).abs() <= tol && (a * c + b * d).abs() <= tol
+    }
 }
 
 fn numbers(s: &str) -> Vec<f64> {
@@ -362,6 +370,8 @@ fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
 
 /// Straight segments per Bezier curve.
 const CURVE_STEPS: u32 = 8;
+/// Points round an ellipse drawn as a closed polyline.
+const ELLIPSE_STEPS: usize = 48;
 
 /// An elliptical arc as SVG path data gives it: from its start to its end point, with its radii,
 /// the ellipse's rotation in degrees and the large-arc and sweep flags.
@@ -516,19 +526,45 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                 })
             }
             "circle" | "ellipse" => {
-                let r = if tag == "circle" {
-                    num(&e, "r")
+                let (rx, ry) = if tag == "circle" {
+                    let r = num(&e, "r");
+                    (r, r)
                 } else {
-                    (num(&e, "rx") + num(&e, "ry")) / 2.0
+                    // One radius left out takes the other's value (SVG 2's `auto`).
+                    match (
+                        attr(&e, "rx").map(|_| num(&e, "rx")),
+                        attr(&e, "ry").map(|_| num(&e, "ry")),
+                    ) {
+                        (Some(rx), Some(ry)) => (rx, ry),
+                        (Some(r), None) | (None, Some(r)) => (r, r),
+                        (None, None) => (0.0, 0.0),
+                    }
                 };
+                let (cx, cy) = (num(&e, "cx"), num(&e, "cy"));
                 let filled = attr(&e, "fill").is_some_and(|f| {
                     f != "none" && f != "transparent" && f != "white" && f != "#fff" && f != "#ffffff"
                 });
-                Some(Shape::Circle {
-                    center: m.p(num(&e, "cx"), num(&e, "cy")),
-                    radius: r * sc,
-                    filled,
-                })
+                if rx == ry && m.keeps_circles() {
+                    Some(Shape::Circle {
+                        center: m.p(cx, cy),
+                        radius: rx * sc,
+                        filled,
+                    })
+                } else {
+                    // An ellipse, or a circle the transform stretches: points round it, placed
+                    // through the transform.
+                    let points = (0..ELLIPSE_STEPS)
+                        .map(|i| {
+                            let a = std::f64::consts::TAU * i as f64 / ELLIPSE_STEPS as f64;
+                            m.p(cx + rx * a.cos(), cy + ry * a.sin())
+                        })
+                        .collect();
+                    Some(Shape::Polyline {
+                        points,
+                        closed: true,
+                        filled,
+                    })
+                }
             }
             "polyline" | "polygon" => {
                 let v = numbers(&attr(&e, "points").unwrap_or_default());
@@ -691,7 +727,7 @@ mod tests {
     fn ellipses_and_filled_circles() -> Result<()> {
         let svg = r#"<svg xmlns="http://www.w3.org/2000/svg">
             <circle id="pin:1" cx="0" cy="0" r="0.5"/>
-            <ellipse cx="10" cy="0" rx="2" ry="4"/>
+            <ellipse cx="10" cy="0" rx="3" ry="3"/>
             <circle cx="20" cy="0" r="1" fill="black"/>
             <circle cx="30" cy="0" r="1" fill="none"/>
             <circle cx="40" cy="0" r="1" fill="white"/>
@@ -711,7 +747,7 @@ mod tests {
         assert_eq!(
             circles,
             vec![
-                (10.0, 3.0, false), // ellipse radius is the mean of rx and ry
+                (10.0, 3.0, false), // an ellipse with equal radii is a circle
                 (20.0, 1.0, true),
                 (30.0, 1.0, false),
                 (40.0, 1.0, false),
@@ -720,6 +756,60 @@ mod tests {
                 (70.0, 1.0, true),
             ]
         );
+        Ok(())
+    }
+
+    /// The bounds of a closed polyline, or `None` for any other shape.
+    fn outline_size(g: &Shape) -> Option<(f64, f64, bool)> {
+        let Shape::Polyline {
+            points,
+            closed: true,
+            filled,
+        } = g
+        else {
+            return None;
+        };
+        let (xs, ys): (Vec<f64>, Vec<f64>) = points.iter().map(|p| (p.x, p.y)).unzip();
+        let span = |v: &[f64]| v.iter().copied().fold(f64::MIN, f64::max) - v.iter().copied().fold(f64::MAX, f64::min);
+        Some((span(&xs), span(&ys), *filled))
+    }
+
+    #[test]
+    fn flat_ellipses_and_stretched_circles_keep_their_shape() -> Result<()> {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg">
+            <circle id="pin:1" cx="0" cy="0" r="0.5"/>
+            <ellipse cx="10" cy="0" rx="6" ry="2" fill="black"/>
+            <circle cx="30" cy="0" r="2" transform="scale(2 1)"/>
+            <ellipse cx="50" cy="0" rx="4"/>
+            <circle cx="0" cy="20" r="2" transform="rotate(30) scale(-3 3)"/>
+        </svg>"#;
+        let s = symbol(svg, "svg.flat", "Flat")?;
+        let Some(flat) = s.graphics.iter().find_map(outline_size) else {
+            unreachable!("no outline in {:?}", s.graphics);
+        };
+        let outlines: Vec<(f64, f64, bool)> = s.graphics.iter().filter_map(outline_size).collect();
+        assert_eq!(outlines.len(), 2, "{:?}", s.graphics);
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        assert!(
+            close(flat.0, 12.0) && close(flat.1, 4.0) && flat.2,
+            "rx 6 ry 2 is 12 x 4, filled: {flat:?}"
+        );
+        let wide = outlines[1];
+        assert!(
+            close(wide.0, 8.0) && close(wide.1, 4.0) && !wide.2,
+            "scale(2 1) stretches: {wide:?}"
+        );
+        let circles: Vec<f64> = s
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Circle { radius, .. } => Some(*radius),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(circles.len(), 2, "{:?}", s.graphics);
+        assert!(close(circles[0], 4.0), "an ellipse with only rx is a circle");
+        assert!(close(circles[1], 6.0), "a turn and a mirror keep a circle round");
         Ok(())
     }
 
