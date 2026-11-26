@@ -1816,19 +1816,21 @@ fn cancel_drag(open: &mut Open, ed: &mut Editor) {
             let Some(at) = open.project.pages.iter().position(|p| p.id == page) else {
                 return;
             };
-            let before = open.before_last_change();
-            let was = before.and_then(|b| b.pages.iter().find(|p| p.id == page)).cloned();
-            // The jumpers, strip layouts and spare device data the moved terminals took along
-            // (follow_terminals runs every frame of the drag) go back with them.
-            let followed = before.map(|b| (b.meta.jumpers.clone(), b.meta.strips.clone(), b.devices.clone()));
+            let was = open
+                .before_last_change()
+                .and_then(|b| b.pages.iter().find(|p| p.id == page))
+                .cloned();
             // Only the page moved on: a sync of other pages since the drag began stays.
-            if let (Some(was), Some(now)) = (was, open.project.pages.get_mut(at)) {
-                *now = was;
-                if let Some((jumpers, strips, devices)) = followed {
-                    open.project.meta.jumpers = jumpers;
-                    open.project.meta.strips = strips;
-                    open.project.devices = devices;
-                }
+            if let Some(was) = was
+                && at < open.project.pages.len()
+            {
+                // The jumpers, strip layouts and spare device data the moved terminals took
+                // along (followed every frame of the drag) follow them back to where they were,
+                // the same way: whatever else changed meanwhile (a sync) stays.
+                open.follow_terminals();
+                let moved = open.terminal_numbers();
+                open.project.pages[at] = was;
+                open.follow_terminals_from(moved);
                 open.forget_terminal_change();
                 open.forget_last_change();
                 // A save while the button was held wrote the moved page: this is unsaved again.
@@ -4415,23 +4417,40 @@ mod tests {
     }
 
     #[test]
-    fn escape_during_a_move_puts_followed_jumpers_back() {
-        let (_tmp, mut o, mut ed, _) = moving_coil();
+    fn escape_during_a_move_puts_followed_jumpers_back_and_keeps_other_changes() {
+        let (_tmp, mut o) = project();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
         let x1 = wc_core::DeviceTag::parse("-X1").unwrap();
-        o.project.meta.add_jumper(&x1, &["1".into(), "2".into()]).unwrap();
+        // Terminals numbered by position: A 1, B 2, C 3; the jumper joins B and C.
+        let mut put = |x: f64| {
+            let id = o.place(page, "wc.terminal", Point::new(x, 20.0)).unwrap();
+            let s = o.project.pages[page].symbols.iter_mut().find(|s| s.id == id).unwrap();
+            s.tag = Some(x1.clone());
+            id
+        };
+        let a = put(20.0);
+        put(40.0);
+        put(60.0);
+        o.project.meta.add_jumper(&x1, &["2".into(), "3".into()]).unwrap();
         let before = o.project.clone();
-        drag(&mut o, &mut ed, Point::new(-40.0, 0.0));
-        // What following the moved terminals does every frame of the drag (#836 review).
-        o.project.meta.jumpers.clear();
-        o.project.meta.add_jumper(&x1, &["1".into(), "3".into()]).unwrap();
+        let mut ed = Editor {
+            page,
+            selection: vec![Selection::Symbol(a)],
+            ..Editor::default()
+        };
+        // A goes past C: B is 1, C 2, A 3, and the jumper follows B and C to 1 and 2.
+        drag(&mut o, &mut ed, Point::new(60.0, 0.0));
+        o.follow_terminals();
+        let jumper = |o: &Open| o.project.meta.jumpers[0].terminals.clone();
+        assert_eq!(jumper(&o), ["1", "2"], "followed during the drag");
+        // A sync brings someone else's device in meanwhile.
+        let other = wc_core::DeviceTag::parse("-K9").unwrap();
+        o.project.devices.insert(other.clone(), Default::default());
         cancel_drag(&mut o, &mut ed);
         assert_eq!(o.project.pages, before.pages);
-        assert_eq!(
-            o.project.meta.jumpers, before.meta.jumpers,
-            "the jumper joins 1 and 2 again"
-        );
+        assert_eq!(jumper(&o), ["2", "3"], "the jumper joins B and C again");
         assert_eq!(o.project.meta.strips, before.meta.strips);
-        assert_eq!(o.project.devices, before.devices);
+        assert!(o.project.devices.contains_key(&other), "the synced device stays");
     }
 
     #[test]
