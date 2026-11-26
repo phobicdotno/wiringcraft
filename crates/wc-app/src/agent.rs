@@ -3963,6 +3963,18 @@ mod tests {
         }
     }
 
+    /// A worker that ends only after far more polls than the old fixed bounds (1000) allowed
+    /// is still waited for (#678).
+    #[test]
+    fn a_slow_worker_is_waited_for_past_the_old_poll_count() {
+        let mut polls = 0;
+        wait_for_worker("the slow worker", 0, || {
+            polls += 1;
+            polls == 5000
+        });
+        assert_eq!(polls, 5000);
+    }
+
     /// Frames until the running import is taken in, however slow the runner.
     fn until_imported(a: &mut App) {
         let ctx = egui::Context::default();
