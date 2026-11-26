@@ -437,13 +437,18 @@ enum Cmd {
         /// The structured text file to write, e.g. `GVL_IO.st`.
         out: PathBuf,
     },
-    /// Check the project for mistakes: devices drawn twice, contacts without a coil, shorted
-    /// potentials, open pins, wires ending in the air, wire numbers that do not name one
-    /// connection each, devices without a part, plus the project's own `[[rule]]` tables in
-    /// `project.toml` (a cable on every motor, a tag pattern, at most N wires on a terminal)
-    /// and the house rules in each library source's `rules.toml`, less the ones `rules_off`
-    /// turns off. Exits with an error when an error is found, so it can guard a commit or a CI
-    /// job.
+    /// Check the project for mistakes: revision clouds whose revision the project does not
+    /// list, revision letters the PDF cannot print, symbols missing from the project's library
+    /// copy and wires on pins that do not exist, devices drawn twice, more contacts than a
+    /// device's parts have, contacts without a coil, interruption points without a partner,
+    /// open pins, wires ending in the air, jumpers naming a terminal drawn nowhere, one cable
+    /// core on two connections, shorted potentials, a wire number used on more than one
+    /// connection or one connection carrying several wire numbers, panel layouts with
+    /// overlapping devices, devices sticking out of the plate or no longer in the project,
+    /// devices without a part, then the house rules in each library source's `rules.toml`, less
+    /// the ones `rules_off` turns off, and last the project's own `[[rule]]` tables in
+    /// `project.toml` (a cable on every motor, a tag pattern, at most N wires on a terminal).
+    /// Exits with an error when an error is found, so it can guard a commit or a CI job.
     Check {
         /// Also list notes (open pins, devices without a part).
         #[arg(long)]
@@ -1620,24 +1625,13 @@ fn delete_items(page: &mut Page, ids: &[String]) -> Res<Vec<String>> {
     if !missing.is_empty() {
         return Err(format!("no symbol or wire {} on page {}", missing.join(", "), page.id));
     }
-    let named = |id: &str| ids.iter().any(|x| x == id);
-    let on_deleted =
-        |end: &Endpoint| matches!(end, Endpoint::Pin { item, .. } if page.symbol(item).is_some() && named(item));
-    let gone_wires: Vec<String> = page
-        .wires
+    let symbols: Vec<&str> = ids
         .iter()
-        .filter(|w| named(&w.id) || on_deleted(&w.from) || on_deleted(&w.to))
-        .map(|w| w.id.clone())
+        .map(String::as_str)
+        .filter(|id| page.symbol(id).is_some())
         .collect();
-    let gone_symbols: Vec<String> = page
-        .symbols
-        .iter()
-        .filter(|s| named(&s.id))
-        .map(|s| s.id.clone())
-        .collect();
-    page.symbols.retain(|s| !gone_symbols.contains(&s.id));
-    page.wires.retain(|w| !gone_wires.contains(&w.id));
-    Ok(gone_symbols.into_iter().chain(gone_wires).collect())
+    let wires: Vec<&str> = ids.iter().map(String::as_str).collect();
+    Ok(page.remove_symbols_and_wires(&symbols, &wires))
 }
 
 /// A wire end from `item:pin` or `x,y`. A pin must be one the placed symbol has (its
@@ -3896,7 +3890,7 @@ fn run(mut cli: Cli) -> Res<()> {
                 let mut stem = if d.panel {
                     wc_pdf::panel_file_stem(d)
                 } else {
-                    file_stem(&d.number, &d.id)
+                    wc_pdf::page_file_stem(d)
                 };
                 // Compared without case: `A1` and `a1` are one file name on Windows and macOS.
                 while !used.insert(stem.to_lowercase()) {
@@ -4072,7 +4066,11 @@ fn run(mut cli: Cli) -> Res<()> {
                 symbols: &symbols,
                 parts: &parts,
             };
-            let (text, counts) = wc_report::automationml(&inputs, &utc_now());
+            let file_name = out
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let (text, counts) = wc_report::automationml(&inputs, &utc_now(), &file_name);
             write_out(&out, text).map_err(e)?;
             if counts.untagged_pins > 0 {
                 eprintln!(
@@ -6358,24 +6356,6 @@ fn utc_date(secs: i64) -> String {
     )
 }
 
-/// A file name for a page: its number, or its id when the number is empty, with anything a file
-/// system might refuse replaced.
-fn file_stem(number: &str, id: &str) -> String {
-    let base = if number.trim().is_empty() { id } else { number.trim() };
-    let stem: String = base
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let stem = stem.trim_start_matches('.').to_owned();
-    if stem.is_empty() { "page".into() } else { stem }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -7761,7 +7741,7 @@ mod tests {
                 .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
                 .collect();
             names.sort();
-            let page = format!("{}.{ext}", file_stem(&number, ""));
+            let page = format!("{number}.{ext}");
             let mut want = [format!("panel-Main_cabinet_A.{ext}"), page];
             want.sort();
             assert_eq!(names, want, "{ext}");
