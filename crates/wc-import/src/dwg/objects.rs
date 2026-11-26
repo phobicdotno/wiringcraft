@@ -132,6 +132,18 @@ pub(crate) struct Read {
     pub(crate) warnings: Vec<String>,
 }
 
+impl Read {
+    /// Why the class section could not be read (empty when it was) and why objects could not
+    /// be decoded: the class section's reason comes first in `damaged`, before those of the
+    /// objects.
+    pub(crate) fn damage_reasons(&self) -> (&str, &[String]) {
+        match self.damaged.split_first() {
+            Some((first, rest)) if self.skipped.contains_key(CLASSES_DAMAGED) => (first.as_str(), rest),
+            _ => ("", self.damaged.as_slice()),
+        }
+    }
+}
+
 /// The entities of a DWG file as the DXF reader's entities, by block and model space, with a
 /// count of what was not read.
 pub(crate) fn dxf_drawing(sections: &Sections) -> Result<Read> {

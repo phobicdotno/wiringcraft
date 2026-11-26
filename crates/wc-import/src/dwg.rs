@@ -58,16 +58,39 @@ pub fn page_of(
     scale: f64,
     known_symbols: &std::collections::BTreeSet<String>,
 ) -> Result<crate::dxf::ImportedPage> {
-    let read = objects::dxf_drawing(sections)?;
+    page_drawing(sections)?.page(scale, known_symbols)
+}
+
+/// The entities of a DWG file's sections, read for [`PageDrawing::page`]. Fails when the file's
+/// object structure cannot be read (no object map, no objects section): a file the reader
+/// cannot read, which a converter may still turn into DXF.
+pub fn page_drawing(sections: &Sections) -> Result<PageDrawing> {
+    Ok(PageDrawing(objects::dxf_drawing(sections)?))
+}
+
+/// A DWG drawing read by [`page_drawing`], to be placed on a page.
+pub struct PageDrawing(objects::Read);
+
+impl PageDrawing {
+    /// The drawing as a page: see [`page`].
+    pub fn page(
+        &self,
+        scale: f64,
+        known_symbols: &std::collections::BTreeSet<String>,
+    ) -> Result<crate::dxf::ImportedPage> {
+        page_from(&self.0, scale, known_symbols)
+    }
+}
+
+fn page_from(
+    read: &objects::Read,
+    scale: f64,
+    known_symbols: &std::collections::BTreeSet<String>,
+) -> Result<crate::dxf::ImportedPage> {
     let mut out = crate::dxf::page_of(&read.drawing, scale, known_symbols)?;
     let mut notes = Vec::new();
-    // As for the drawings of a SolidWorks Electrical archive: the class section's reason comes
-    // first in `damaged`, before those of the objects.
     let classes_damaged = read.skipped.contains_key(objects::CLASSES_DAMAGED);
-    let (classes_why, objects_why) = match read.damaged.split_first() {
-        Some((first, rest)) if classes_damaged => (first.as_str(), rest),
-        _ => ("", read.damaged.as_slice()),
-    };
+    let (classes_why, objects_why) = read.damage_reasons();
     if classes_damaged {
         notes.push(format!("{classes_why}; its custom entities are not counted"));
     }
@@ -767,5 +790,19 @@ mod page_tests {
         assert!(page.graphics.len() >= 2);
         assert!(super::page(&bytes, 0.0, &known).is_err());
         assert!(super::page(b"not a drawing", 1.0, &known).is_err());
+    }
+
+    /// A file whose sections hold no object map is refused by [`super::page_drawing`], before
+    /// anything is placed: the CLI then tries a converter.
+    #[test]
+    fn a_drawing_without_its_object_map_is_refused_when_read() {
+        let bytes = model_space_dwg(&[E::Line((0.0, 0.0), (100.0, 0.0))]);
+        let mut sections = match super::read_sections(&bytes) {
+            Ok(sections) => sections,
+            Err(e) => unreachable!("{e}"),
+        };
+        sections.sections.retain(|s| s.name != "AcDb:Handles");
+        let err = super::page_drawing(&sections).err().map(|e| e.to_string());
+        assert!(err.as_deref().is_some_and(|e| e.contains("object map")), "{err:?}");
     }
 }

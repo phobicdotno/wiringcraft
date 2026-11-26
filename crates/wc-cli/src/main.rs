@@ -4221,6 +4221,9 @@ fn import_onto_page(
         s.id = pg.next_id("s");
         pg.symbols.push(s);
     }
+    // The pins of the copies taken are written before the page that uses them: a save that fails
+    // later leaves a pin with its copy (a retry finds both), never a copy without its pin.
+    store::save_lock(dir, &p).map_err(|x| put_back(x.to_string()))?;
     save(dir, &p)?;
     println!("imported {n_g} shapes and {n_s} symbols onto page {page}");
     Ok(())
@@ -4237,15 +4240,20 @@ fn import_page_dwg(dir: &Path, file: &Path, page: String, scale: f64, template: 
     if !(scale.is_finite() && scale > 0.0) {
         return Err("scale must be a positive number".into());
     }
-    let refused = match wc_import::dwg::read_sections(&bytes) {
-        Ok(sections) => {
+    // The reader refuses a file of another version, or one whose object structure it cannot
+    // read; a converter may still read those. What it reads but finds nothing to draw in, and
+    // project or library errors, are not the converter's to fix.
+    let read = wc_import::dwg::read_sections(&bytes).and_then(|sections| wc_import::dwg::page_drawing(&sections));
+    let refused = match read {
+        Ok(drawing) => {
             return import_onto_page(dir, &page, |known| {
-                let imported = wc_import::dwg::page_of(&sections, scale, known).map_err(e)?;
+                let imported = drawing.page(scale, known).map_err(e)?;
                 println!("read with WiringCraft's own DWG reader");
                 Ok(imported)
             });
         }
-        Err(why) => why.to_string(),
+        // Names from the file may hold control characters: escaped for the terminal.
+        Err(why) => escape_field(&why.to_string()),
     };
     let tmp = staging_dir("wiringcraft-dwg-").map_err(e)?;
     let (dxf, converter) = dwg_to_dxf(file, tmp.path(), template)
