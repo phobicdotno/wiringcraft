@@ -568,7 +568,7 @@ fn shapes(
                 let text = if e.kind == "MTEXT" {
                     mtext_plain(raw)
                 } else {
-                    raw.to_owned()
+                    special_codes(raw)
                 };
                 let ((x, y), align, angle) = text_anchor(e);
                 (!text.trim().is_empty()).then(|| Shape::Text {
@@ -1799,7 +1799,8 @@ fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
         .collect()
 }
 
-/// MTEXT carries inline formatting codes; keep only the text.
+/// MTEXT carries inline formatting codes; keep only the text, with its `\U+XXXX` and `%%`
+/// codes turned into characters.
 fn mtext_plain(s: &str) -> String {
     let mut out = String::new();
     let mut chars = s.chars().peekable();
@@ -1810,6 +1811,28 @@ fn mtext_plain(s: &str) -> String {
                 Some('\\') => out.push('\\'),
                 Some('{') => out.push('{'),
                 Some('}') => out.push('}'),
+                Some('U') => {
+                    // `\U+XXXX`: a character by its code. Decoded here, so an escaped backslash
+                    // before `U+` (`\\U+00C5`) stays as written. Any other `\U` (no `+`, or not
+                    // four hex digits) is not a formatting code and stays as written too.
+                    let hex: String = match chars.peek() {
+                        Some('+') => chars.clone().skip(1).take(4).collect(),
+                        _ => String::new(),
+                    };
+                    let code = (hex.len() == 4 && hex.chars().all(|c| c.is_ascii_hexdigit()))
+                        .then(|| u32::from_str_radix(&hex, 16).ok())
+                        .flatten()
+                        .and_then(char::from_u32);
+                    match code {
+                        Some(c) => {
+                            out.push(c);
+                            for _ in 0..5 {
+                                chars.next();
+                            }
+                        }
+                        None => out.push_str("\\U"),
+                    }
+                }
                 Some(_) => {
                     // Formatting code: skip to ';' if it takes an argument.
                     let rest: String = chars.clone().take_while(|c| *c != ';' && *c != '\\').collect();
@@ -1821,8 +1844,67 @@ fn mtext_plain(s: &str) -> String {
                 }
                 None => {}
             },
+            '%' if chars.peek() == Some(&'%') => {
+                // `%%` codes, read from the text as written: a `%` that `\U+0025` produced
+                // never starts one.
+                match chars.clone().nth(1).and_then(percent_code) {
+                    Some(d) => {
+                        out.push_str(d);
+                        chars.next();
+                        chars.next();
+                    }
+                    None => out.push('%'),
+                }
+            }
             '{' | '}' => {}
             c => out.push(c),
+        }
+    }
+    out
+}
+
+/// `\U+XXXX` (four hex digits) at the start of `s`: the character with that code, as CAD
+/// programs write any character outside ASCII. The code is seven bytes long.
+fn unicode_code(s: &str) -> Option<char> {
+    s.strip_prefix("\\U+")?
+        .get(..4)
+        .filter(|h| h.chars().all(|c| c.is_ascii_hexdigit()))
+        .and_then(|h| u32::from_str_radix(h, 16).ok())
+        .and_then(char::from_u32)
+}
+
+/// The `%%` code whose letter is `c`: `%%c` diameter, `%%d` degree, `%%p` plus/minus, `%%%` a
+/// percent sign; `%%u` and `%%o` (underline and overline on/off) are dropped.
+fn percent_code(c: char) -> Option<&'static str> {
+    match c.to_ascii_lowercase() {
+        'c' => Some("\u{2300}"),
+        'd' => Some("\u{b0}"),
+        'p' => Some("\u{b1}"),
+        '%' => Some("%"),
+        'u' | 'o' => Some(""),
+        _ => None,
+    }
+}
+
+/// The text of a TEXT or ATTRIB: its `\U+XXXX` and `%%` codes turned into characters, in one
+/// pass, so a character a code produces never starts another code. Anything else is kept.
+fn special_codes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(c) = rest.chars().next() {
+        if let Some(u) = unicode_code(rest) {
+            out.push(u);
+            rest = &rest[7..];
+        } else if let Some(d) = rest
+            .strip_prefix("%%")
+            .and_then(|r| r.chars().next())
+            .and_then(percent_code)
+        {
+            out.push_str(d);
+            rest = &rest[3..];
+        } else {
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
         }
     }
     out
@@ -1940,6 +2022,7 @@ pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<
     let d = parse(text)?;
     let known: BTreeMap<String, &String> = known_symbols.iter().map(|s| (normalise_block_name(s), s)).collect();
     let mut out = ImportedPage::default();
+    let mut tag_warnings = Vec::new();
     let mut raw = Vec::new();
     let mut points = Vec::new();
     let mut plain = Vec::new();
@@ -1967,7 +2050,16 @@ pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<
                         )
                     })
                     .and_then(|a| a.get(1))
-                    .and_then(|v| DeviceTag::parse(v).ok());
+                    .map(special_codes)
+                    .filter(|v| !v.trim().is_empty())
+                    .and_then(|v| {
+                        DeviceTag::parse(&v)
+                            .map_err(|why| {
+                                tag_warnings
+                                    .push(format!("{id}: device tag {v:?} not read ({why}), placed without a tag"))
+                            })
+                            .ok()
+                    });
                 let rotation = Rotation::from_degrees(-(e.f(50).round() as i64)).unwrap_or_default();
                 out.symbols.push(PlacedSymbol {
                     id: String::new(),
@@ -2000,6 +2092,7 @@ pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<
     );
     out.graphics = raw.into_iter().map(|(_, s)| s).collect();
     out.warnings = skipped_warnings(skipped);
+    out.warnings.extend(tag_warnings);
     // Move into the frame: top-left at (20, 20) mm.
     let mut pts: Vec<Point> = out
         .graphics
@@ -2375,6 +2468,99 @@ mod tests {
     #[test]
     fn mtext_formatting_is_stripped() {
         assert_eq!(mtext_plain(r"{\fArial|b1;Motor}\PM1"), "Motor M1");
+    }
+
+    #[test]
+    fn text_codes_become_characters() -> Result<()> {
+        assert_eq!(
+            special_codes(r"\U+00C5lesund 3%%c 20%%D %%p1 50%%% %%uline%%u"),
+            "\u{c5}lesund 3\u{2300} 20\u{b0} \u{b1}1 50% line"
+        );
+        // Malformed codes stay as written.
+        assert_eq!(special_codes(r"\U+00G1 \U+12 100%% %%x"), r"\U+00G1 \U+12 100%% %%x");
+        let ents = "0\nTEXT\n8\n0\n10\n5\n20\n5\n40\n2\n1\n\\U+00C5lesund %%c6\n\
+                    0\nMTEXT\n8\n0\n10\n5\n20\n9\n40\n2\n1\n{\\fArial;\\U+00D8st}\\P20%%d\n";
+        let p = page(&dxf(ents, ""), 1.0, &BTreeSet::new())?;
+        let texts: Vec<&str> = p
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["\u{c5}lesund \u{2300}6", "\u{d8}st 20\u{b0}"]);
+        // The form WiringCraft's own DXF export writes reads back as drawn.
+        assert_eq!(special_codes(r"\U+00C5lesund"), "\u{c5}lesund");
+        // In MTEXT an escaped backslash before U+ stays literal; a lone one is a code.
+        assert_eq!(mtext_plain(r"\\U+00C5"), r"\U+00C5");
+        assert_eq!(mtext_plain(r"\U+00C5"), "\u{c5}");
+        assert_eq!(mtext_plain(r"\U+00G1 \U+"), r"\U+00G1 \U+");
+        assert_eq!(mtext_plain(r"\U1234"), r"\U1234");
+        assert_eq!(mtext_plain(r"\U1234;tail"), r"\U1234;tail");
+        // A `%` written as `\U+0025` never starts a `%%` code.
+        assert_eq!(special_codes(r"\U+0025%%c"), "%\u{2300}");
+        assert_eq!(mtext_plain(r"\U+0025%%c"), "%\u{2300}");
+        assert_eq!(mtext_plain(r"{\fArial;50%%%}%%D %%x"), "50%\u{b0} %%x");
+        // A known symbol's TAG attribute is decoded before it is read as a device tag.
+        let blocks = "0\nBLOCK\n2\nWC.COIL\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n0\nENDBLK\n";
+        let ents = "0\nINSERT\n2\nWC.COIL\n10\n50\n20\n100\n66\n1\n0\nATTRIB\n2\nTAG\n1\n-K\\U+00C51\n";
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        let p = page(&dxf(ents, blocks), 1.0, &known)?;
+        assert_eq!(
+            p.symbols
+                .first()
+                .and_then(|s| s.tag.as_ref())
+                .map(|t| t.to_string())
+                .as_deref(),
+            Some("-K\u{c5}1")
+        );
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+        Ok(())
+    }
+
+    #[test]
+    fn a_page_exported_to_dxf_reads_back_its_accents() -> Result<()> {
+        let mut project = wc_core::Project::new("Round trip");
+        let mut drawn = wc_core::Page::new("p1", "1", "Page");
+        drawn.graphics.push(Shape::Text {
+            at: Point::new(120.0, 80.0),
+            text: "\u{c5}lesund".into(),
+            height: 3.0,
+            align: Align::Left,
+            angle: 0.0,
+        });
+        project.pages = vec![drawn];
+        let (pages, _) = wc_pdf::page_lines(&project, &BTreeMap::new(), &wc_pdf::Options::default());
+        let Some(exported) = pages.first().map(wc_pdf::dxf) else {
+            unreachable!("one page is exported");
+        };
+        assert!(exported.contains("\\U+00C5lesund"), "the export writes the code");
+        let p = page(&exported, 1.0, &BTreeSet::new())?;
+        assert!(
+            p.graphics
+                .iter()
+                .any(|g| matches!(g, Shape::Text { text, .. } if text == "\u{c5}lesund")),
+            "the import reads the character back"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_tag_that_is_not_a_device_tag_is_said() -> Result<()> {
+        let blocks = "0\nBLOCK\n2\nWC.COIL\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n0\nENDBLK\n";
+        let ents = "0\nINSERT\n2\nWC.COIL\n10\n50\n20\n100\n66\n1\n0\nATTRIB\n2\nTAG\n1\nK\\U+00C51\n";
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        let p = page(&dxf(ents, blocks), 1.0, &known)?;
+        assert_eq!(p.symbols.len(), 1);
+        assert!(p.symbols[0].tag.is_none());
+        assert_eq!(p.warnings.len(), 1, "{:?}", p.warnings);
+        let w = &p.warnings[0];
+        assert!(
+            w.contains("wc.coil") && w.contains("\"K\u{c5}1\"") && w.contains("must start with"),
+            "{w}"
+        );
+        Ok(())
     }
 
     /// Every graphic of a drawing in DXF coordinates turned to page ones (y down, scale 1).
