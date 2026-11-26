@@ -117,6 +117,34 @@ impl PanelItem {
             PanelItem::Device { .. } => self.device_bounds().unwrap_or_default(),
         }
     }
+
+    /// The point a drag moves the item by: a rail's left end on its centre line, a duct's
+    /// `min` corner, a device's `at`.
+    pub fn anchor(&self) -> Point {
+        match self {
+            PanelItem::Rail { at, .. } | PanelItem::Device { at, .. } => *at,
+            PanelItem::Duct { min, .. } => *min,
+        }
+    }
+
+    /// Moves the item so its anchor goes to `to`, as near as it can while its outline stays on
+    /// a `plate_width` x `plate_height` plate; an item larger than the plate goes to its left or
+    /// top edge. Size, length and rotation stay as they are.
+    pub fn move_on_plate(&mut self, to: Point, plate_width: f64, plate_height: f64) {
+        let (a, b) = self.bounds();
+        let from = self.anchor();
+        let x = (a.x + to.x - from.x).clamp(0.0, (plate_width - (b.x - a.x)).max(0.0));
+        let y = (a.y + to.y - from.y).clamp(0.0, (plate_height - (b.y - a.y)).max(0.0));
+        let (dx, dy) = (x - a.x, y - a.y);
+        let shift = |p: &mut Point| *p = Point::new(p.x + dx, p.y + dy);
+        match self {
+            PanelItem::Rail { at, .. } | PanelItem::Device { at, .. } => shift(at),
+            PanelItem::Duct { min, max } => {
+                shift(min);
+                shift(max);
+            }
+        }
+    }
 }
 
 /// Whether the outline from `min` (top-left) to `max` (bottom-right) lies on a plate of
@@ -1096,5 +1124,37 @@ mod tests {
         p.properties.insert("width".into(), "1e999".into());
         p.properties.insert("height".into(), "-4".into());
         assert_eq!(part_size(&p), None);
+    }
+
+    #[test]
+    fn a_rail_moves_by_its_left_end_and_stays_on_the_plate() {
+        let mut rail = PanelItem::Rail {
+            at: Point::new(10.0, 50.0),
+            length: 200.0,
+        };
+        rail.move_on_plate(Point::new(40.0, 120.0), 600.0, 400.0);
+        assert_eq!(rail.anchor(), Point::new(40.0, 120.0));
+        // Past the right and top edges it stops with its ends and its 35 mm height on the plate.
+        rail.move_on_plate(Point::new(500.0, 0.0), 600.0, 400.0);
+        assert_eq!(rail.anchor(), Point::new(400.0, 17.5));
+        let PanelItem::Rail { length, .. } = rail else {
+            unreachable!()
+        };
+        assert_eq!(length, 200.0);
+    }
+
+    #[test]
+    fn a_duct_moves_whole_and_stays_on_the_plate() {
+        let mut duct = PanelItem::Duct {
+            min: Point::new(0.0, 0.0),
+            max: Point::new(60.0, 300.0),
+        };
+        duct.move_on_plate(Point::new(100.0, 20.0), 600.0, 400.0);
+        assert_eq!(duct.bounds(), (Point::new(100.0, 20.0), Point::new(160.0, 320.0)));
+        duct.move_on_plate(Point::new(-30.0, 250.0), 600.0, 400.0);
+        assert_eq!(duct.bounds(), (Point::new(0.0, 100.0), Point::new(60.0, 400.0)));
+        // Larger than the plate: it goes to the top edge.
+        duct.move_on_plate(Point::new(0.0, 50.0), 600.0, 200.0);
+        assert_eq!(duct.bounds(), (Point::new(0.0, 0.0), Point::new(60.0, 300.0)));
     }
 }

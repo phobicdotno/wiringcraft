@@ -1,0 +1,13 @@
+{
+  "description": "Inductive proximity sensor, 2-wire DC, NO, 10-30 V DC, M12 (example data)",
+  "id": "example.ex-px-m12-2w",
+  "manufacturer": "Example",
+  "order_number": "EX-PX-M12-2W",
+  "properties": {
+    "Housing": "M12",
+    "Output": "2-wire, NO",
+    "Sensing distance": "4 mm",
+    "Supply voltage": "10-30 V DC"
+  },
+  "symbol": "wc.sensor.prox2"
+}

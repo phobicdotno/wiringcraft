@@ -2934,7 +2934,10 @@ fn a_declared_node_with_a_blank_tag_keeps_its_box_address_and_station() {
 
 #[test]
 fn the_reader_title_bar_shows_the_project_name_not_the_file_name() {
-    let (pdf, _) = export(&Project::new("Pump station"), &BTreeMap::new(), &Options::default());
+    // One page, so there is a sheet to print (#833).
+    let mut project = Project::new("Pump station");
+    project.pages.push(Page::new("p1", "1", "Main"));
+    let (pdf, _) = export(&project, &BTreeMap::new(), &Options::default());
     let text = String::from_utf8_lossy(&pdf);
     let Some(catalog) = text.split("endobj").find(|o| o.contains("/Type /Catalog")) else {
         unreachable!("no catalog in {text}");
@@ -2944,6 +2947,26 @@ fn the_reader_title_bar_shows_the_project_name_not_the_file_name() {
         "{catalog}"
     );
     assert!(text.contains(&format!("/Title {}", writer::pdf_text("Pump station"))));
+}
+
+#[test]
+fn a_project_with_nothing_to_print_says_so() {
+    // No pages and no report tables: no sheet, so the caller is told instead of being handed a
+    // PDF no reader opens (#833).
+    let (_, report) = export(&Project::new("x"), &BTreeMap::new(), &Options::default());
+    assert_eq!(report.pages, 0);
+    assert_eq!(report.warnings, vec![NOTHING_TO_EXPORT.to_string()]);
+
+    // One page: no such warning.
+    let mut project = Project::new("x");
+    project.pages.push(Page::new("p1", "1", "Main"));
+    let (_, report) = export(&project, &BTreeMap::new(), &Options::default());
+    assert_eq!(report.pages, 1);
+    assert!(
+        !report.warnings.iter().any(|w| w == NOTHING_TO_EXPORT),
+        "{:?}",
+        report.warnings
+    );
 }
 
 #[test]

@@ -519,6 +519,8 @@ impl chrome::Status for StatusView<'_> {
             Action::Redo if self.sharing => self.share_redo,
             Action::DeletePage => self.open.is_some_and(|o| o.project.pages.len() > 1),
             Action::ArrangePanel | Action::DeletePanel => has && self.ed.panel.is_some(),
+            // The panel view shows no schematic page for these to work on (#824).
+            Action::SelectAll | Action::Copy | Action::Cut | Action::Paste if self.ed.panel.is_some() => false,
             Action::PageUp => has && self.ed.page > 0,
             Action::PageDown => self.open.is_some_and(|o| self.ed.page + 1 < o.project.pages.len()),
             Action::PrevPage => has && self.ed.page > 0,
@@ -539,6 +541,7 @@ impl chrome::Status for StatusView<'_> {
                 })
             }
             Action::Mirror if self.ed.panel.is_some() => false,
+            Action::Rotate | Action::Mirror if self.ed.tool == Tool::Place => has,
             Action::Rotate | Action::Mirror => {
                 has && self.ed.selection.iter().any(|s| matches!(s, Selection::Symbol(_)))
             }
@@ -668,6 +671,13 @@ impl App {
             && self.ed.page >= o.project.pages.len()
         {
             self.ed.page = o.project.pages.len().saturating_sub(1);
+        }
+        // A wire being drawn may start on a pin that the sync removed.
+        if let Some(o) = &self.open
+            && let Some((wc_core::Endpoint::Pin { item, .. }, _)) = &self.ed.wire
+            && o.project.pages.get(self.ed.page).and_then(|p| p.symbol(item)).is_none()
+        {
+            self.ed.wire = None;
         }
         let waiting = self.share.unanswered_edits() > 0;
         // A refused change of the page ends the wait: what comes back there is not the paste
@@ -1301,6 +1311,11 @@ impl App {
     fn run(&mut self, a: Action) {
         let earlier = self.pending.take();
         self.carry_out(a);
+        // The turn for the symbol on the pointer belongs to the place tool: an action that
+        // leaves it sets the turn back, also before the canvas is next drawn.
+        if self.ed.tool != Tool::Place {
+            self.ed.reset_place_turn();
+        }
         match (earlier, self.pending.is_some()) {
             (Some(e), true) => {
                 self.pending = Some(e);
@@ -1470,21 +1485,21 @@ impl App {
                 self.prefs.save();
             }
             Action::Select => {
-                self.ed.tool = Tool::Select;
+                self.ed.set_tool(Tool::Select);
                 self.ed.wire = None;
                 self.ed.shape_points.clear();
             }
             Action::PlaceSymbol => {
-                self.ed.tool = Tool::Place;
+                self.ed.set_tool(Tool::Place);
                 self.ed.wire = None;
                 self.ed.shape_points.clear();
             }
             Action::DrawWire => {
-                self.ed.tool = Tool::Wire;
+                self.ed.set_tool(Tool::Wire);
                 self.ed.shape_points.clear();
             }
             Action::BlackBoxTool => {
-                self.ed.tool = Tool::BlackBox;
+                self.ed.set_tool(Tool::BlackBox);
                 self.ed.wire = None;
                 self.ed.shape_points.clear();
                 self.ed.black_box = None;
@@ -1500,7 +1515,7 @@ impl App {
             | Action::CloudTool
             | Action::RevisionTableTool
             | Action::CommentTool => {
-                self.ed.tool = match a {
+                self.ed.set_tool(match a {
                     Action::TextTool => Tool::Text,
                     Action::CommentTool => Tool::Comment,
                     Action::LineTool => Tool::Line,
@@ -1511,7 +1526,7 @@ impl App {
                     Action::CloudTool => Tool::Cloud,
                     Action::RevisionTableTool => Tool::RevisionTable,
                     _ => Tool::Rect,
-                };
+                });
                 self.ed.wire = None;
                 self.ed.shape_points.clear();
                 self.ed.message = match a {
@@ -1555,6 +1570,8 @@ impl App {
                     self.ed.message = e;
                 }
                 self.ed.selection.clear();
+                // A wire being drawn may start on a pin the undo took away.
+                self.ed.wire = None;
                 return;
             }
             _ => {}
@@ -1591,6 +1608,8 @@ impl App {
                 let done = if a == Action::Undo { open.undo() } else { open.redo() };
                 if done {
                     self.ed.selection.clear();
+                    // A wire being drawn may start on a pin the undo took away.
+                    self.ed.wire = None;
                     // The whole project is swapped: show the same panel and pick the same item.
                     if let Some((id, pick)) = &before {
                         follow_panel_pick(&mut self.ed, &open.project, id, pick.as_ref());
@@ -1601,6 +1620,12 @@ impl App {
                 } else if let Some(e) = open.take_undo_error() {
                     self.dialog = Some(Dialog::Message(format!("Undo or redo was not done:\n{e}")));
                 }
+            }
+            // Before the panel's own Delete: a panel device being dragged stays too.
+            Action::Delete | Action::Cut if self.ed.dragging() => {
+                // A delete would change the drag's history under it, and Escape could no
+                // longer take the move back (#863).
+                self.ed.message = "Let go of the move first, then delete.".into();
             }
             Action::Delete if self.ed.panel.is_some() => {
                 if let (Some(pi), Some(item)) = (self.ed.panel, self.ed.panel_pick.take()) {
@@ -1668,10 +1693,20 @@ impl App {
                     self.ed.message = "Turned, the device would not fit on the plate.".into();
                 }
             }
+            Action::Rotate | Action::Mirror if self.ed.tool == Tool::Place && self.ed.panel.is_none() => {
+                canvas::turn_place(&mut self.ed, a == Action::Mirror);
+            }
             Action::Rotate => open.rotate_many(page, &self.ed.selection),
             Action::Mirror => open.mirror_many(page, &self.ed.selection),
+            // From the keyboard too: the schematic page is hidden behind the panel (#824).
+            Action::SelectAll | Action::Copy | Action::Cut | Action::Paste if self.ed.panel.is_some() => {
+                self.ed.message = format!(
+                    "{} works on schematic pages: close the panel layout first.",
+                    a.info().label
+                );
+            }
             Action::SelectAll => {
-                self.ed.tool = Tool::Select;
+                self.ed.set_tool(Tool::Select);
                 self.ed.selection = self.prefs.layers.keep(open.select_all(page));
             }
             Action::Copy | Action::Cut => {
@@ -1694,6 +1729,14 @@ impl App {
                     }
                 }
             }
+            // Like the drawing tools, a copy with drawings or texts is not pasted while their
+            // layer is hidden or locked: they could not be seen or picked afterwards.
+            Action::Paste
+                if !self.clipboard.graphics.is_empty()
+                    && self.prefs.layers.refusal(layers::Layer::Drawings).is_some() =>
+            {
+                self.ed.message = self.prefs.layers.refusal(layers::Layer::Drawings).unwrap_or_default();
+            }
             Action::Paste => {
                 // At the pointer when it is over the sheet, otherwise a little below the original.
                 let at = self
@@ -1702,7 +1745,12 @@ impl App {
                     .unwrap_or(self.clipboard.anchor + wc_core::geom::Point::new(10.0, 10.0));
                 match open.paste(page, &self.clipboard, at) {
                     Ok(pasted) if !pasted.is_empty() => {
-                        self.ed.tool = Tool::Select;
+                        self.ed.message = format!(
+                            "Pasted {} item{}.",
+                            pasted.len(),
+                            if pasted.len() == 1 { "" } else { "s" }
+                        );
+                        self.ed.set_tool(Tool::Select);
                         self.ed.selection = pasted;
                     }
                     Ok(_) => {}
@@ -2050,6 +2098,50 @@ impl App {
             } else {
                 format!("Connected {wired} wires to pins that line up.")
             };
+        }
+    }
+
+    /// Whether keyboard edits may change the project now: no dialog, import or symbol editor
+    /// has the keyboard.
+    fn keyboard_edits(&self) -> bool {
+        self.dialog.is_none() && self.importing.is_none() && self.symbol_editor.is_none()
+    }
+
+    /// The panel view's arrow presses this frame, with the Undo and Redo shortcuts among them,
+    /// taken out of the input in the order they came; none when the arrows do not move the
+    /// picked device now (as when a dialog has the keyboard). None either when a mouse button
+    /// went down or up this frame: a click can pick another device, which the panel view does
+    /// later in the frame, so the keys are left to it.
+    fn panel_keys(&self, ctx: &egui::Context) -> Vec<panel_view::PanelKey> {
+        if ctx.input(|i| i.pointer.any_pressed() || i.pointer.any_released()) {
+            return Vec::new();
+        }
+        match self.open.as_ref() {
+            Some(open) if panel_view::arrows_move(ctx, open, &self.ed, self.keyboard_edits()) => {
+                ctx.input_mut(|i| panel_view::take_keys(i, true))
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Moves the picked panel device and runs Undo and Redo in the order the keys came. A
+    /// dialog opened meanwhile (by a shortcut in the same frame, or a failed undo) takes the
+    /// keyboard: the keys left over then do nothing.
+    fn run_panel_keys(&mut self, keys: Vec<panel_view::PanelKey>) {
+        for key in keys {
+            if !self.keyboard_edits() {
+                break;
+            }
+            match key {
+                panel_view::PanelKey::Nudge(dx, dy) => {
+                    if let (Some(open), Some(panel), Some(i)) = (self.open.as_mut(), self.ed.panel, self.ed.panel_pick)
+                    {
+                        panel_view::nudge(open, panel, i, self.prefs.snap, dx, dy);
+                    }
+                }
+                panel_view::PanelKey::Undo => self.run(Action::Undo),
+                panel_view::PanelKey::Redo => self.run(Action::Redo),
+            }
         }
     }
 
@@ -3171,7 +3263,7 @@ impl App {
                         && let Some(i) = o.project.pages.iter().position(|p| p.id == pid)
                     {
                         self.ed.page = i;
-                        self.ed.tool = Tool::Select;
+                        self.ed.set_tool(Tool::Select);
                         self.ed.view.fit = true;
                         self.ed.selection = item
                             .and_then(|it| {
@@ -4323,7 +4415,7 @@ impl App {
         let Some(open) = self.open.as_mut() else { return };
         match open.insert_macro(page, path, value_set) {
             Ok(items) if !items.is_empty() => {
-                self.ed.tool = Tool::Select;
+                self.ed.set_tool(Tool::Select);
                 let name = match value_set {
                     Some(set) => format!("{name} ({set})"),
                     None => name.to_owned(),
@@ -5032,6 +5124,9 @@ fn export_pdf_to(open: &Open, langs: &[String], path: &Path) -> String {
         ..Default::default()
     };
     let (bytes, report) = wc_pdf::export(project, &open.symbols, &options);
+    if report.pages == 0 {
+        return format!("Export failed: {}", wc_pdf::NOTHING_TO_EXPORT);
+    }
     let mut warnings = report.warnings;
     // The text itself stays out: this message goes to the diagnostic log, which never holds
     // drawing content. File, Translations, "Only missing" lists the texts.
@@ -5417,6 +5512,9 @@ impl eframe::App for App {
             ctx.open_url(egui::OpenUrl::new_tab(url));
         }
         let mut actions = chrome::show(ctx, self.prefs.chrome, &mut self.chrome, &status);
+        // Before the shortcuts: the panel view's arrow presses take the Undo and Redo among them,
+        // so they apply in the order they came (#975).
+        let panel_keys = self.panel_keys(ctx);
         let keys = self.shortcuts(ctx);
         self.nudge_by_arrows(ctx);
         // While an import runs no key edits the symbol being drawn either: the keys go to the
@@ -5429,6 +5527,7 @@ impl eframe::App for App {
         for a in actions {
             self.run(a);
         }
+        self.run_panel_keys(panel_keys);
         // So did any the actions made (a move by arrow key, say): the panels show jumpers that
         // match the terminals.
         if let Some(o) = self.open.as_mut() {
@@ -5773,7 +5872,7 @@ impl App {
                 self.ed.selection.clear();
                 self.ed.message = format!("Comment {id} added.");
                 self.ed.comment = Some(id);
-                self.ed.tool = Tool::Select;
+                self.ed.set_tool(Tool::Select);
             }
             Err(err) => self.ed.message = err.to_string(),
         }
@@ -5842,7 +5941,7 @@ impl App {
             self.ed.wire = None;
         }
         self.ed.page = i;
-        self.ed.tool = Tool::Select;
+        self.ed.set_tool(Tool::Select);
         self.ed.view.fit = true;
         // A hit on a hidden or locked layer would be dropped from the selection on the next
         // frame without a word: say why instead.
@@ -6099,10 +6198,10 @@ fn follow_panel_pick(
 /// is shown; canvas actions only when the page itself is shown, as in the panel view they work
 /// on the panel.
 fn held_for(a: Action, ed: &Editor, project: &wc_core::Project) -> Option<String> {
-    // With a panel shown these still work on the schematic page under it (Delete and Rotate go
-    // to the panel's picked device instead), so they follow that page's hold.
-    let on_page_under_panel =
-        ed.panel.is_some() && matches!(a, Action::Paste | Action::Duplicate | Action::Cut | Action::Mirror);
+    // With a panel shown Duplicate and Mirror still work on the schematic page under it (Delete
+    // and Rotate go to the panel's picked device instead; Select all, Copy, Cut and Paste are
+    // off), so they follow that page's hold.
+    let on_page_under_panel = ed.panel.is_some() && matches!(a, Action::Duplicate | Action::Mirror);
     let name = if a.edits_page_itself() || on_page_under_panel {
         let page = project.pages.get(ed.page)?;
         // Moving a page up or down renumbers its neighbour too.
@@ -7339,6 +7438,38 @@ mod nudge_tests {
     }
 
     #[test]
+    fn delete_waits_for_a_panel_device_drag_to_end() {
+        use wc_core::panel::{Panel, PanelItem};
+        let (_tmp, mut app, _ctx) = app(Point::new(80.0, 60.0), false);
+        let open = app.open.as_mut().unwrap();
+        open.project.panels.push(Panel {
+            id: "panel1".into(),
+            name: "Panel 1".into(),
+            width: 400.0,
+            height: 300.0,
+            items: vec![PanelItem::Device {
+                tag: wc_core::DeviceTag::parse("-K1").unwrap(),
+                at: Point::new(100.0, 100.0),
+                width: 40.0,
+                height: 60.0,
+                rotation: wc_core::geom::Rotation::R0,
+            }],
+        });
+        let panel = open.project.panels.len() - 1;
+        app.ed.panel = Some(panel);
+        app.ed.panel_pick = Some(0);
+        let items = |app: &App| app.open.as_ref().unwrap().project.panels[panel].items.len();
+        app.ed.panel_drag = Some((Point::new(100.0, 100.0), None, Point::new(0.0, 0.0)));
+        app.carry_out(Action::Delete);
+        assert_eq!(items(&app), 1, "the held device stays");
+        assert_eq!(app.ed.panel_pick, Some(0), "and stays picked");
+        assert!(app.ed.message.contains("Let go"), "{}", app.ed.message);
+        app.ed.panel_drag = None;
+        app.carry_out(Action::Delete);
+        assert_eq!(items(&app), 0, "after letting go, Delete removes it");
+    }
+
+    #[test]
     fn an_arrow_press_through_the_app_frame_leaves_the_panel_device_alone_behind_a_dialog() {
         use wc_core::panel::{Panel, PanelItem};
         let (_tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
@@ -7403,11 +7534,173 @@ mod nudge_tests {
             "the page behind the panel stays put"
         );
     }
+
+    /// An app showing a 400 x 300 panel with a 40 x 60 device at each of `devices`, the first
+    /// picked, after one frame; with what a test needs to run more frames.
+    fn panel_app(devices: &[Point]) -> (tempfile::TempDir, App, egui::Context, usize) {
+        use wc_core::panel::{Panel, PanelItem};
+        let (tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        let open = app.open.as_mut().unwrap();
+        open.project.panels.push(Panel {
+            id: "panel1".into(),
+            name: "Panel 1".into(),
+            width: 400.0,
+            height: 300.0,
+            items: devices
+                .iter()
+                .map(|at| PanelItem::Device {
+                    tag: wc_core::DeviceTag::parse("-K1").unwrap(),
+                    at: *at,
+                    width: 40.0,
+                    height: 60.0,
+                    rotation: wc_core::geom::Rotation::R0,
+                })
+                .collect(),
+        });
+        let panel = open.project.panels.len() - 1;
+        app.ed.panel = Some(panel);
+        app.ed.panel_pick = Some(0);
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        run_frame(&mut app, &ctx, Vec::new());
+        (tmp, app, ctx, panel)
+    }
+
+    fn run_frame(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let mut frame = eframe::Frame::_new_kittest();
+        let raw = egui::RawInput {
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| eframe::App::update(app, ctx, &mut frame));
+    }
+
+    fn panel_device_at(app: &App, panel: usize, i: usize) -> Point {
+        match app.open.as_ref().unwrap().project.panels[panel].items.get(i) {
+            Some(wc_core::panel::PanelItem::Device { at, .. }) => *at,
+            _ => unreachable!("the device is there"),
+        }
+    }
+
+    fn key_event(key: Key, modifiers: Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    /// An arrow press and Ctrl+Z in one frame apply in the order they came, either way (#975).
+    #[test]
+    fn panel_arrow_presses_and_undo_in_one_frame_apply_in_order() {
+        let (_tmp, mut app, ctx, panel) = panel_app(&[Point::new(100.0, 100.0)]);
+        let device_at = |app: &App| panel_device_at(app, panel, 0);
+        let right = key_event(Key::ArrowRight, Modifiers::NONE);
+        let undo = key_event(Key::Z, Modifiers::COMMAND);
+        // An earlier edit: the device one step down.
+        run_frame(&mut app, &ctx, vec![key_event(Key::ArrowDown, Modifiers::NONE)]);
+        assert_eq!(device_at(&app), Point::new(100.0, 105.0));
+        let steps = app.open.as_ref().unwrap().undo_steps();
+
+        // Right, then Ctrl+Z: the move is made and then taken back; the earlier edit stays.
+        run_frame(&mut app, &ctx, vec![right.clone(), undo.clone()]);
+        assert_eq!(device_at(&app), Point::new(100.0, 105.0));
+        assert_eq!(app.open.as_ref().unwrap().undo_steps(), steps);
+        assert!(app.open.as_ref().unwrap().can_redo(), "the move can be redone");
+
+        // Ctrl+Z, then Right: the earlier edit is taken back, then the device moves.
+        run_frame(&mut app, &ctx, vec![undo, right]);
+        assert_eq!(device_at(&app), Point::new(105.0, 100.0));
+        assert_eq!(app.open.as_ref().unwrap().undo_steps(), steps);
+        assert!(app.open.as_mut().unwrap().undo());
+        assert_eq!(device_at(&app), Point::new(100.0, 100.0), "the move is one undo step");
+    }
+
+    /// A shortcut that opens a dialog in the same frame as an arrow press takes the keyboard:
+    /// the device behind the dialog stays where it is.
+    #[test]
+    fn a_panel_arrow_press_with_a_shortcut_that_opens_a_dialog_moves_nothing() {
+        let (_tmp, mut app, ctx, panel) = panel_app(&[Point::new(100.0, 100.0)]);
+        let steps = app.open.as_ref().unwrap().undo_steps();
+        run_frame(
+            &mut app,
+            &ctx,
+            vec![
+                key_event(Key::R, Modifiers::COMMAND),
+                key_event(Key::ArrowRight, Modifiers::NONE),
+            ],
+        );
+        assert!(matches!(app.dialog, Some(Dialog::Reports(_))), "Reports opened");
+        assert_eq!(panel_device_at(&app, panel, 0), Point::new(100.0, 100.0));
+        assert_eq!(app.open.as_ref().unwrap().undo_steps(), steps);
+    }
+
+    /// A click on another device and an arrow press in one frame move the device clicked, not
+    /// the one picked before.
+    #[test]
+    fn a_click_on_another_device_and_an_arrow_press_in_one_frame_move_the_clicked_one() {
+        let (_tmp, mut app, ctx, panel) = panel_app(&[Point::new(100.0, 100.0), Point::new(200.0, 100.0)]);
+        // Where a screen point lands on the plate: the panel view notes the pointer's spot.
+        let probe = egui::pos2(3000.0, 3000.0);
+        run_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(probe)]);
+        let Some(seen) = app.ed.cursor else {
+            unreachable!("the pointer is over the panel view")
+        };
+        let zoom = app.ed.view.zoom;
+        // The middle of the second device.
+        let target = probe + egui::vec2(((220.0 - seen.x) as f32) * zoom, ((130.0 - seen.y) as f32) * zoom);
+        let button = |pressed| egui::Event::PointerButton {
+            pos: target,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        run_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(target)]);
+        run_frame(
+            &mut app,
+            &ctx,
+            vec![button(true), button(false), key_event(Key::ArrowRight, Modifiers::NONE)],
+        );
+        assert_eq!(app.ed.panel_pick, Some(1), "the click picked the second device");
+        assert_eq!(
+            panel_device_at(&app, panel, 0),
+            Point::new(100.0, 100.0),
+            "the first stays"
+        );
+        assert_eq!(
+            panel_device_at(&app, panel, 1),
+            Point::new(205.0, 100.0),
+            "the second moves"
+        );
+    }
 }
 
 #[cfg(test)]
 mod held_tests {
     use super::*;
+
+    #[test]
+    fn escape_cancels_what_is_in_progress_then_clears_the_selection() {
+        let sym = || Selection::Symbol("s1".into());
+        // Another tool: Escape goes back to Select and keeps the selection.
+        let mut ed = Editor::default();
+        ed.tool = Tool::Line;
+        ed.selection = vec![sym()];
+        assert!(ed.escape());
+        assert_eq!(ed.selection, [sym()]);
+        // A shape in progress is cancelled first, nothing else changes.
+        ed.shape_points = vec![wc_core::Point::new(0.0, 0.0)];
+        assert!(!ed.escape());
+        assert!(ed.shape_points.is_empty());
+        assert_eq!(ed.selection, [sym()]);
+        // The Select tool with a selection: Escape clears it; once more, nothing is left to do.
+        ed.tool = Tool::Select;
+        assert!(!ed.escape());
+        assert!(ed.selection.is_empty());
+        assert!(ed.escape());
+    }
 
     #[test]
     fn rotate_on_a_panel_is_not_held_by_the_page_under_it() {
@@ -7418,11 +7711,11 @@ mod held_tests {
         ed.held_by.insert("p1".into(), "Kim".into());
         // On the page itself, Rotate turns its symbols: held.
         assert_eq!(held_for(Action::Rotate, &ed, &project).as_deref(), Some("Kim"));
-        // With a panel shown, Rotate turns the picked panel device: not held; Paste still is.
+        // With a panel shown, Rotate turns the picked panel device: not held; Mirror still is.
         ed.panel = Some(0);
         ed.panel_pick = Some(0);
         assert_eq!(held_for(Action::Rotate, &ed, &project), None);
-        assert_eq!(held_for(Action::Paste, &ed, &project).as_deref(), Some("Kim"));
+        assert_eq!(held_for(Action::Mirror, &ed, &project).as_deref(), Some("Kim"));
     }
 
     #[test]

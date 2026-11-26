@@ -82,6 +82,11 @@ pub struct Report {
     pub warnings: Vec<String>,
 }
 
+/// The warning [`export`] gives when there is no sheet to print ([`Report::pages`] is 0): the
+/// bytes are then a PDF without pages, which most readers refuse to open, so callers show this
+/// instead of saving them.
+pub const NOTHING_TO_EXPORT: &str = "nothing to export: the project has no pages";
+
 /// Render the project to PDF bytes. `symbols` are the project's vendored symbols by id.
 pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &Options) -> (Vec<u8>, Report) {
     let pages: Vec<&wc_core::Page> = if options.pages.is_empty() {
@@ -194,6 +199,11 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
         + back_pages.len()
         + options.networks.len();
     report.pages = total;
+    // A PDF without pages does not open in most readers (#833); callers check `pages` and
+    // show this instead of saving the file.
+    if total == 0 {
+        report.warnings.push(NOTHING_TO_EXPORT.into());
+    }
     let mut doc = writer::Doc::new(&project.meta.name);
     let mut sheet = 0;
     let mut report_no = 0;
