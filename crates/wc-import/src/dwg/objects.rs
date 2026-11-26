@@ -42,6 +42,8 @@ pub const MAX_OBJECTS: usize = 4_000_000;
 
 /// The key under which objects that could not be decoded are counted in [`Drawing::skipped`].
 pub const DAMAGED: &str = "damaged objects";
+/// A polyline left out because one of its vertices could not be read.
+pub const BROKEN_POLYLINE: &str = "POLYLINE (a vertex damaged)";
 
 /// The skipped-count key for a class section that could not be read: custom entities (types 500
 /// and up) are then not named or counted.
@@ -1380,6 +1382,17 @@ impl Decoded {
                         vertices
                     } else {
                         let by_handle: HashMap<u64, &Item> = vertices.iter().map(|v| (v.handle, *v)).collect();
+                        // A listed vertex that could not be read (damaged) would join its
+                        // neighbours with a segment the drawing does not have: the polyline is
+                        // left out and said instead.
+                        if item
+                            .vertices
+                            .iter()
+                            .any(|h| !by_handle.contains_key(h) && !hidden.contains(h))
+                        {
+                            *skipped.entry(BROKEN_POLYLINE.to_owned()).or_default() += 1;
+                            continue;
+                        }
                         item.vertices.iter().filter_map(|h| by_handle.get(h).copied()).collect()
                     };
                     for v in ordered {

@@ -1064,6 +1064,37 @@ fn a_text_placed_where_it_is_not_a_number_is_damage_not_drawn_at_0() -> TestResu
 }
 
 #[test]
+fn a_polyline_with_a_damaged_vertex_is_left_out_not_joined_across_it() -> TestResult {
+    let v = Version::R2010;
+    let mut objs = vec![
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        entry(v, LAYER, LAYER_H, "0"),
+    ];
+    // Two open 3D polylines of three vertices; the first one's middle vertex is not a number.
+    for (base, middle) in [(0x100u64, f64::NAN), (0x200, 5.0)] {
+        let mut p = entity(v, 16, base, head(None));
+        p.data.rc(0).rc(0).bl(3);
+        p.handles.h(4, base + 1).h(4, base + 2).h(4, base + 3).h(3, base + 4);
+        objs.push(p);
+        for (n, (x, y)) in [(0.0, 0.0), (middle, 5.0), (10.0, 0.0)].into_iter().enumerate() {
+            let mut vx = entity(v, 11, base + 1 + n as u64, head(Some(base)));
+            vx.data.rc(0).bd3((x, y, 0.0));
+            objs.push(vx);
+        }
+        objs.push(entity(v, 6, base + 4, head(Some(base))));
+    }
+    let d = drawing(&sections(v, &objs, &[]))?;
+    let [Shape::Polyline { points, .. }] = d.model.as_slice() else {
+        unreachable!("{:?}", d.model);
+    };
+    assert_eq!(points.len(), 3, "{points:?}");
+    assert!(points.iter().any(|p| p.y.abs() == 5.0), "{points:?}");
+    assert_eq!(d.skipped.get(DAMAGED), Some(&1), "{:?}", d.skipped);
+    assert_eq!(d.skipped.get(BROKEN_POLYLINE), Some(&1), "{:?}", d.skipped);
+    Ok(())
+}
+
+#[test]
 fn bit_values_are_read_in_every_form() -> TestResult {
     let mut w = W::default();
     w.bs(0).bs(256).bs(7).bs(4000);
