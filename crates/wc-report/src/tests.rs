@@ -577,6 +577,22 @@ fn a_coil_drawn_only_on_an_overview_page_still_exists_for_its_contacts() {
     assert!(!check(&i).iter().any(|f| f.message.contains("contact -K9 has no coil")));
 }
 
+/// The `FileName` attribute of the `CAEXFile` element in `xml`, as an XML reader sees it.
+fn caex_file_name(xml: &str) -> Option<String> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    loop {
+        match reader.read_event().ok()? {
+            Event::Start(e) | Event::Empty(e) if e.name().as_ref() == b"CAEXFile" => {
+                let attr = e.try_get_attribute("FileName").ok()??;
+                return Some(attr.unescape_value().ok()?.into_owned());
+            }
+            Event::Eof => return None,
+            _ => {}
+        }
+    }
+}
+
 #[test]
 fn automationml_has_devices_pins_and_one_link_per_join() {
     let (mut p, mut s, parts) = fixture();
@@ -624,6 +640,10 @@ fn automationml_has_devices_pins_and_one_link_per_join() {
         odd.contains("<CAEXFile FileName=\"a&#9;b&#10;c&#13;d\u{85}ef.aml\""),
         "{odd}"
     );
+    // An XML reader gets the file name back exactly, tab, line feed and carriage return included.
+    let name = "a\tb\nc\rd.aml";
+    let xml_name = automationml(&i, "2026-11-16T22:00:00Z", name).0;
+    assert_eq!(caex_file_name(&xml_name).as_deref(), Some(name), "{xml_name}");
     // The coil and the contact are one device with all four connection points.
     let k1 = xml.split("<InternalElement Name=\"=A+C1-K1\"").nth(1).unwrap();
     let k1 = k1.split("</InternalElement>").next().unwrap();
