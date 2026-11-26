@@ -1455,8 +1455,9 @@ enum ImportCmd {
         #[arg(long)]
         lib: Option<PathBuf>,
     },
-    /// A DWG drawing onto a page, converted to DXF by an installed converter (ODA File
-    /// Converter, `dwg2dxf`, or the command in WIRINGCRAFT_DWG2DXF with {in} and {out}).
+    /// A DWG drawing onto a page, read by WiringCraft's own DWG reader (AutoCAD 2004 to 2018).
+    /// A file it refuses is converted to DXF by an installed converter (ODA File Converter,
+    /// `dwg2dxf`, or the command in WIRINGCRAFT_DWG2DXF with {in} and {out}).
     PageDwg {
         /// The DWG file.
         file: PathBuf,
@@ -3772,6 +3773,7 @@ fn run(mut cli: Cli) -> Res<()> {
                     _ => true,
                 })
                 .collect();
+            warn_levels(&p, &kinds);
             // The network list is followed by a topology page per network.
             let networks = if kinds.contains(&wc_report::Kind::Networks) {
                 p.meta.networks.clone()
@@ -4003,6 +4005,7 @@ fn run(mut cli: Cli) -> Res<()> {
             };
             warn_report_layouts(&inputs);
             let kinds = report_kinds(std::slice::from_ref(&kind))?;
+            warn_levels(&p, &kinds);
             if format == "xlsx" {
                 let Some(path) = out else {
                     return Err("an Excel workbook is not text: pass --out <file>.xlsx".into());
@@ -4843,6 +4846,21 @@ fn warn_report_layouts(inputs: &wc_report::Inputs<'_>) {
     }
     for w in wc_report::network_warnings(inputs) {
         eprintln!("warning: {}", escape_field(&w));
+    }
+}
+
+/// Warns about each terminal `Level` value that is not a level, when `kinds` has the terminal
+/// plan: such a terminal shows no level there.
+fn warn_levels(project: &wc_core::Project, kinds: &[wc_report::Kind]) {
+    if !kinds.contains(&wc_report::Kind::Terminals) {
+        return;
+    }
+    use std::io::Write as _;
+    let mut err = std::io::stderr().lock();
+    for w in wc_report::level_warnings(project) {
+        // Tags and values come from the project file. A warning that cannot be written (stderr
+        // closed or full) is dropped: it must not stop the export.
+        let _ = writeln!(err, "warning: {}", escape_field(&w));
     }
 }
 
@@ -6543,8 +6561,9 @@ mod tests {
         let folder = tmp.path().to_owned();
         // A stand-in converter, as WIRINGCRAFT_DWG2DXF names one; a path with a space stays
         // one argument.
-        let out = dwg_to_dxf(&dwg, &folder, Some("cp {in} {out}".into())).unwrap();
+        let (out, by) = dwg_to_dxf(&dwg, &folder, Some("cp {in} {out}".into())).unwrap();
         assert_eq!(out, folder.join("Motor plan.dxf"));
+        assert_eq!(by, "the WIRINGCRAFT_DWG2DXF command");
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "0\nEOF\n");
         let err = dwg_to_dxf(&dwg, &folder, Some("false {in} {out}".into()))
             .err()
@@ -6600,8 +6619,16 @@ mod tests {
         assert!(err.as_ref().is_err_and(|e| e.contains("no-such-page")), "{err:?}");
         assert!(!folder().exists(), "removed after a failed import");
 
-        // And when it works.
+        // The converter makes a DXF that cannot be read: both reasons are given.
         let pages = load(&dir).unwrap().pages;
+        let junk = converter("junk.sh", "echo junk > \"$2\"");
+        let err = import_page_dwg(&dir, &dwg, pages[0].id.clone(), 1.0, Some(junk)).unwrap_err();
+        assert!(
+            err.contains("own DWG reader refused") && err.contains("could not be read either"),
+            "{err}"
+        );
+
+        // And when it works.
         import_page_dwg(&dir, &dwg, pages[0].id.clone(), 1.0, Some(copy)).unwrap();
         assert!(!folder().exists(), "removed after the import");
     }
@@ -7974,6 +8001,24 @@ mod tests {
         );
         assert!(!load(&dir).unwrap().lock.symbols.contains_key("aa.good"));
         std::fs::remove_dir(&tmp_path).unwrap();
+
+        // A lock that cannot be written after both copies were taken puts them back, and the
+        // page is not saved.
+        let page_bytes =
+            std::fs::read(dir.join(store::PAGES_DIR).join(format!("{page}{}", store::PAGE_SUFFIX))).unwrap();
+        let lock_blocker = dir.join(format!("{}.tmp", store::LOCK_FILE));
+        std::fs::create_dir(&lock_blocker).unwrap();
+        cli(&dir, &args).unwrap_err();
+        std::fs::remove_dir(&lock_blocker).unwrap();
+        assert!(store::read_vendored_symbol(&dir, "aa.good").is_err(), "copy put back");
+        assert!(store::read_vendored_symbol(&dir, "zz.bad").is_err(), "copy put back");
+        let p = load(&dir).unwrap();
+        assert!(!p.lock.symbols.contains_key("aa.good"));
+        assert!(p.page(&page).is_some_and(|pg| pg.symbols.is_empty()), "page not saved");
+        assert_eq!(
+            std::fs::read(dir.join(store::PAGES_DIR).join(format!("{page}{}", store::PAGE_SUFFIX))).unwrap(),
+            page_bytes
+        );
 
         // And the retry pins both.
         cli(&dir, &args).unwrap();

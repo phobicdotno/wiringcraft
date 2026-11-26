@@ -31,7 +31,7 @@ CREATE TABLE tew_linewirepair (lwp_lin_id INTEGER, lwp_wir_id INTEGER, lwp_wir_o
 /// One book with a folder `Power`: a schematic page 01 with a relay coil K1 (pins A1 above, A2
 /// below) and a fuse F1 rotated by 90 degrees, wired F1 -> K1:A1 with potential 101 through
 /// core 1 (brown) of cable W1; a report page 00; a frame without connection points.
-pub(super) fn sample() -> Connection {
+pub(crate) fn sample() -> Connection {
     let c = Connection::open_in_memory().unwrap();
     c.execute_batch(SCHEMA).unwrap();
     c.execute_batch(
