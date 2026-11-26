@@ -15,6 +15,13 @@ use wc_core::symbol::SymbolRole;
 
 use crate::{Inputs, natural_key, net_names};
 
+/// `s` escaped for XML text and attribute values.
+///
+/// Markup characters become entities. Tab, line feed and carriage return become `&#9;`, `&#10;`
+/// and `&#13;`, so a reader does not turn them into spaces when it normalises an attribute value.
+/// Every other character is kept only when XML 1.0 allows it (the `Char` production:
+/// `#x20-#xD7FF`, `#xE000-#xFFFD` and `#x10000-#x10FFFF`); the rest, such as other C0 control
+/// characters, `U+FFFE` and `U+FFFF`, are dropped.
 fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -24,9 +31,11 @@ fn esc(s: &str) -> String {
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&apos;"),
-            '\t' | '\n' | '\r' => out.push(ch),
-            c if c.is_control() => {}
-            c => out.push(c),
+            '\t' => out.push_str("&#9;"),
+            '\n' => out.push_str("&#10;"),
+            '\r' => out.push_str("&#13;"),
+            '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}' => out.push(ch),
+            _ => {}
         }
     }
     out
