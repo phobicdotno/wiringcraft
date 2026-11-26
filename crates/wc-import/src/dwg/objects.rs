@@ -968,6 +968,9 @@ fn decode(
         77 => lwpolyline(&mut o, &mut e)?,
         _ => {}
     }
+    if e.1 {
+        return Err(bad(format!("a {dxf_kind} has a value that is not a number")));
+    }
     out.items.push(Item {
         handle,
         owner: common.owner,
@@ -996,10 +999,13 @@ fn owned(o: &mut Object) -> Result<Vec<u64>> {
 
 /// Group codes of an entity being built.
 #[derive(Debug, Default)]
-struct Codes(Vec<(i32, String)>);
+struct Codes(Vec<(i32, String)>, bool);
 
 impl Codes {
+    /// A number; one that is not a number (NaN or infinite) marks the entity as damaged, since
+    /// written as text it would read back as 0 and be drawn at an invented place.
     fn f(&mut self, code: i32, v: f64) -> &mut Self {
+        self.1 |= !v.is_finite();
         self.0.push((code, format!("{v}")));
         self
     }

@@ -1037,6 +1037,33 @@ fn a_line_whose_end_is_not_a_number_is_damage_not_drawn_at_0() -> TestResult {
 }
 
 #[test]
+fn a_text_placed_where_it_is_not_a_number_is_damage_not_drawn_at_0() -> TestResult {
+    let v = Version::R2010;
+    let mut bad_text = entity(v, 1, 0x200, head(None));
+    text_data(&mut bad_text, (f64::NAN, 0.0), "LOST", 2.5, 0.0);
+    let mut good_text = entity(v, 1, 0x201, head(None));
+    text_data(&mut good_text, (1.0, 2.0), "A1", 2.5, 0.0);
+    let objs = vec![
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        entry(v, LAYER, LAYER_H, "0"),
+        bad_text,
+        good_text,
+        line(v, 0x202, head(None), (0.0, 0.0), (5.0, 0.0)),
+    ];
+    let d = drawing(&sections(v, &objs, &[]))?;
+    assert_eq!(d.model.len(), 2, "{:?}", d.model);
+    assert!(
+        d.model
+            .iter()
+            .any(|s| matches!(s, Shape::Text { text, .. } if text == "A1")),
+        "{:?}",
+        d.model
+    );
+    assert_eq!(d.skipped.get(DAMAGED), Some(&1), "{:?}", d.skipped);
+    Ok(())
+}
+
+#[test]
 fn bit_values_are_read_in_every_form() -> TestResult {
     let mut w = W::default();
     w.bs(0).bs(256).bs(7).bs(4000);
