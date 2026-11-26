@@ -55,7 +55,7 @@ impl App {
                 .is_ok()
         };
         if ok {
-            self.assistant.turn = self.open.as_ref().map(|o| (o.dir.clone(), o.undo_mark()));
+            self.assistant.turn = self.open.as_mut().map(|o| (o.dir.clone(), o.start_turn()));
             self.assistant.waiting.clear();
             let a = &mut self.assistant;
             a.shared.extend(shots.iter().cloned());
