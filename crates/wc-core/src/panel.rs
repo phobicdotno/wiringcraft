@@ -108,8 +108,13 @@ impl PanelItem {
 
 /// Whether the outline from `min` (top-left) to `max` (bottom-right) lies on a plate of
 /// `width` x `height` millimetres. A small tolerance lets an outline flush with the plate's
-/// edge through, so a size typed exactly or reached by adding up decimals still fits.
+/// edge through, so a size typed exactly or reached by adding up decimals still fits. An
+/// outline or plate size that is not a finite number never fits.
 pub fn outline_on_plate(width: f64, height: f64, min: Point, max: Point) -> bool {
+    let finite = [width, height, min.x, min.y, max.x, max.y];
+    if !finite.iter().all(|v| v.is_finite()) {
+        return false;
+    }
     let eps = 1e-9;
     !(min.x < -eps || min.y < -eps || max.x > width + eps || max.y > height + eps)
 }
@@ -890,6 +895,12 @@ mod tests {
         assert!(outline_on_plate(145.0, 485.0, min, max));
         assert!(!outline_on_plate(144.999, 485.0, min, max));
         assert!(!outline_on_plate(145.0, 484.999, min, max));
+        // Something that is not a number is never on the plate.
+        assert!(!p.outline_fits(Point::new(f64::NAN, 0.0), 45.0, 85.0));
+        assert!(!p.outline_fits(Point::new(0.0, 0.0), f64::NAN, 85.0));
+        assert!(!p.outline_fits(Point::new(0.0, 0.0), f64::INFINITY, 85.0));
+        assert!(!outline_on_plate(f64::NAN, 485.0, min, max));
+        assert!(!outline_on_plate(145.0, 485.0, Point::new(100.0, f64::NAN), max));
     }
 
     #[test]
