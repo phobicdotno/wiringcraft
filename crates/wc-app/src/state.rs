@@ -2285,7 +2285,6 @@ impl Open {
         let pg = self.project.pages.get(page).ok_or("no page")?;
         let placed = pg.symbol(item).ok_or_else(|| format!("no item {item} on this page"))?;
         let symbol_id = placed.symbol.clone();
-        let (rotation, mirror) = (placed.rotation, placed.mirror);
         let moves = moved.x != 0.0 || moved.y != 0.0;
         let old = self
             .symbols
@@ -2312,116 +2311,19 @@ impl Open {
                 p.number
             ));
         }
-        let mut new = wc_core::black_box(&symbol_id, &old.name, width, height, pins).map_err(|e| e.to_string())?;
-        new.tag_at = old.tag_at;
-        new.description.clone_from(&old.description);
-        new.source.clone_from(&old.source);
-        new.role = old.role;
-        new.letter_code.clone_from(&old.letter_code);
-        let renamed: BTreeMap<&str, &str> = renamed
-            .iter()
-            .filter(|(from, to)| from != to && old.pin(from).is_some() && !removed.contains(*from))
-            .map(|(from, to)| (from.as_str(), to.as_str()))
-            .collect();
-        if let Some((_, to)) = renamed.iter().find(|(_, to)| new.pin(to).is_none()) {
-            return Err(format!("the box has no connection point {to} to rename a point to"));
-        }
-        let removed: Vec<&str> = removed
-            .iter()
-            .filter(|n| old.pin(n).is_some())
-            .map(String::as_str)
-            .collect();
-        if new == old && renamed.is_empty() && removed.is_empty() && !moves {
-            return Ok(Vec::new());
-        }
-        // What an old point is now: its new name, or `None` when it is gone. A name another
-        // point was renamed to, or a new point took, is that point's, not this one's.
-        let taken: Vec<&str> = renamed.values().copied().collect();
-        let now_of = |pin: &str| -> Option<String> {
-            if removed.contains(&pin) {
-                return None;
-            }
-            if let Some(to) = renamed.get(pin) {
-                return Some((*to).to_owned());
-            }
-            (!taken.contains(&pin) && new.pin(pin).is_some()).then(|| pin.to_owned())
+        let edit = wc_core::box_edit::BoxEdit {
+            page,
+            item,
+            size: (width, height),
+            pins,
+            renamed,
+            removed,
+            moved,
         };
-        // Every placed copy of the symbol changes: name the others, and the wires on points
-        // that are gone or moved. Each wire end that changes: (page, wire, which end, new end).
-        let mut warnings = Vec::new();
-        let mut ends: Vec<(usize, usize, usize, Endpoint)> = Vec::new();
-        let mut others = 0usize;
-        for (pi, p) in self.project.pages.iter().enumerate() {
-            let users: Vec<&str> = p
-                .symbols
-                .iter()
-                .filter(|s| s.symbol == symbol_id)
-                .map(|s| s.id.as_str())
-                .collect();
-            others += users.iter().filter(|u| !(pi == page && **u == item)).count();
-            for (wi, w) in p.wires.iter().enumerate() {
-                for (k, end) in [&w.from, &w.to].into_iter().enumerate() {
-                    let Endpoint::Pin { item: on, pin } = end else {
-                        continue;
-                    };
-                    if !users.contains(&on.as_str()) {
-                        continue;
-                    }
-                    match (old.pin(pin), now_of(pin).and_then(|n| new.pin(&n))) {
-                        (_, None) => {
-                            warnings.push(format!(
-                                "wire {} on page {} ended on connection point {pin} of {on}, which is gone: its end stays where the point was",
-                                w.id, p.number
-                            ));
-                            if let Some(at) = self.pin_pos(p, on, pin) {
-                                ends.push((pi, wi, k, Endpoint::Point { at }));
-                            }
-                        }
-                        (Some(a), Some(b)) => {
-                            // The moved box's points are compared where they are on the page.
-                            let (was, now) = if moves && pi == page && on == item {
-                                (
-                                    a.at.transform(rotation, mirror),
-                                    b.at.transform(rotation, mirror) + moved,
-                                )
-                            } else {
-                                (a.at, b.at)
-                            };
-                            if was.distance(now) > 1e-6 || a.dir != b.dir {
-                                warnings.push(format!(
-                                    "wire {} on page {} ends on connection point {} of {on}, which moved: check its route",
-                                    w.id, p.number, b.name
-                                ));
-                            }
-                            if b.name != *pin {
-                                ends.push((
-                                    pi,
-                                    wi,
-                                    k,
-                                    Endpoint::Pin {
-                                        item: on.clone(),
-                                        pin: b.name.clone(),
-                                    },
-                                ));
-                            }
-                        }
-                        (None, Some(_)) => {
-                            warnings.push(format!(
-                                "wire {} on page {} ends on connection point {pin} of {on}, which the box did not have before: it now ends on the new point",
-                                w.id, p.number
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-        if others > 0 {
-            warnings.push(format!(
-                "{others} other placed box{} use{} the same symbol and changed too",
-                if others == 1 { "" } else { "es" },
-                if others == 1 { "s" } else { "" }
-            ));
-        }
+        let Some(plan) = wc_core::box_edit::plan(&self.project, &old, &edit).map_err(|e| e.to_string())? else {
+            return Ok(Vec::new());
+        };
+        let new = plan.symbol.clone();
         self.write_symbol_file(&new)?;
         self.checkpoint();
         self.project.lock.symbols.insert(
@@ -2434,11 +2336,7 @@ impl Open {
         self.symbol_versions.insert(old.hash(), old);
         self.symbol_versions.insert(new.hash(), new.clone());
         self.symbols.insert(symbol_id.clone(), new);
-        for (pi, wi, k, to) in ends {
-            if let Some(w) = self.project.pages.get_mut(pi).and_then(|p| p.wires.get_mut(wi)) {
-                *(if k == 0 { &mut w.from } else { &mut w.to }) = to;
-            }
-        }
+        plan.apply_ends(&mut self.project);
         if moves
             && let Some(s) = self
                 .project
@@ -2448,7 +2346,7 @@ impl Open {
         {
             s.at = s.at + moved;
         }
-        Ok(warnings)
+        Ok(plan.warnings)
     }
 
     pub fn add_wire(&mut self, page: usize, from: Endpoint, to: Endpoint, via: Vec<Point>) {

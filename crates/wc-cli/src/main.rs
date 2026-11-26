@@ -2127,86 +2127,33 @@ fn run(cli: Cli) -> Res<()> {
                 pins
             } else {
                 // The points stay (renamed as asked), each kept on its edge of the new size.
-                old_pins
-                    .iter()
-                    .map(|b| wc_core::BoxPin {
-                        name: renamed.get(&b.name).unwrap_or(&b.name).clone(),
-                        side: b.side,
-                        offset: match b.side {
-                            wc_core::BoxSide::Top | wc_core::BoxSide::Bottom => b.offset.clamp(0.0, width),
-                            wc_core::BoxSide::Left | wc_core::BoxSide::Right => b.offset.clamp(0.0, height),
-                        },
-                    })
-                    .collect()
+                wc_core::box_edit::kept_pins(&old_pins, &renamed, width, height)
+            };
+            let page_index = p
+                .pages
+                .iter()
+                .position(|pg| pg.id == page)
+                .ok_or_else(|| format!("no page {page:?}"))?;
+            let removed = std::collections::BTreeSet::new();
+            let edit = wc_core::box_edit::BoxEdit {
+                page: page_index,
+                item: &id,
+                size: (width, height),
+                pins: &pins,
+                renamed: &renamed,
+                removed: &removed,
+                moved: Point::new(0.0, 0.0),
             };
             // The reason may name points from the project file: escaped for the terminal.
-            let mut new = wc_core::black_box(&symbol_id, &old.name, width, height, &pins)
-                .map_err(|err| escape_field(&err.to_string()))?;
-            new.tag_at = old.tag_at;
-            new.description.clone_from(&old.description);
-            new.source.clone_from(&old.source);
-            new.role = old.role;
-            new.letter_code.clone_from(&old.letter_code);
-            if let Some(to) = renamed.values().find(|to| new.pin(to).is_none()) {
-                return Err(format!("the box has no connection point {to} to rename a point to"));
-            }
-            // What an old point is now: its new name, or none when it is gone. A name another
-            // point was renamed to is that point's.
-            let now_of = |pin: &str| -> Option<String> {
-                if let Some(to) = renamed.get(pin) {
-                    return Some(to.clone());
-                }
-                (!renamed.values().any(|to| to == pin) && new.pin(pin).is_some()).then(|| pin.to_owned())
+            let plan = wc_core::box_edit::plan(&p, &old, &edit).map_err(|err| escape_field(&err.to_string()))?;
+            let Some(plan) = plan else {
+                // Nothing changes: the files stay as they are.
+                return Ok(());
             };
-            let mut warnings = Vec::new();
-            let mut others = 0usize;
-            for pg in &mut p.pages {
-                let users: Vec<PlacedSymbol> = pg.symbols.iter().filter(|s| s.symbol == symbol_id).cloned().collect();
-                others += users.iter().filter(|u| !(pg.id == page && u.id == id)).count();
-                for wire in &mut pg.wires {
-                    for end in [&mut wire.from, &mut wire.to] {
-                        let Endpoint::Pin { item, pin } = end else {
-                            continue;
-                        };
-                        let Some(placed) = users.iter().find(|u| u.id == *item) else {
-                            continue;
-                        };
-                        match (old.pin(pin), now_of(pin).and_then(|n| new.pin(&n))) {
-                            (_, None) => {
-                                warnings.push(format!(
-                                    "wire {} on page {} ended on connection point {pin} of {item}, which is gone: its end stays where the point was",
-                                    wire.id, pg.number
-                                ));
-                                if let Some(at) = wc_pdf::pin_position(placed, &old, pin) {
-                                    *end = Endpoint::Point { at };
-                                }
-                            }
-                            (Some(a), Some(b)) => {
-                                if a.at.distance(b.at) > 1e-6 || a.dir != b.dir {
-                                    warnings.push(format!(
-                                        "wire {} on page {} ends on connection point {} of {item}, which moved: check its route",
-                                        wire.id, pg.number, b.name
-                                    ));
-                                }
-                                if b.name != *pin {
-                                    *pin = b.name.clone();
-                                }
-                            }
-                            (None, Some(_)) => {
-                                warnings.push(format!(
-                                    "wire {} on page {} ends on connection point {pin} of {item}, which the box did not have before: it now ends on the new point",
-                                    wire.id, pg.number
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-            if others > 0 {
-                warnings.push(format!(
-                    "{others} other box(es) place the same symbol {symbol_id} and changed too"
-                ));
-            }
+            plan.apply_ends(&mut p);
+            let wc_core::box_edit::BoxEditPlan {
+                symbol: new, warnings, ..
+            } = plan;
             p.lock.symbols.insert(
                 symbol_id.clone(),
                 wc_core::LockEntry {

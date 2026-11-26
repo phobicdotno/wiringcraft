@@ -2396,15 +2396,7 @@ impl App {
                     return Err(format!("Two connection points are renamed to {to}."));
                 }
                 // Left out, the points stay (renamed as asked), kept on their edges.
-                let pins = pins.unwrap_or_else(|| {
-                    let mut kept = crate::black_box_tool::resized_pins(&old, width, height);
-                    for p in &mut kept {
-                        if let Some(to) = renamed.get(&p.name) {
-                            p.name.clone_from(to);
-                        }
-                    }
-                    kept
-                });
+                let pins = pins.unwrap_or_else(|| wc_core::box_edit::kept_pins(&old, &renamed, width, height));
                 // Every rename lands on a point of the new list, a name kept as it is too: else
                 // the point would be taken off and its wires cut loose.
                 if let Some(to) = renamed.values().find(|to| !pins.iter().any(|p| &p.name == *to)) {
