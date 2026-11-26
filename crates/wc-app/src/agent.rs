@@ -2687,7 +2687,18 @@ impl App {
                     let mut sets = Vec::new();
                     for set in list.as_array().ok_or("value_sets is a list.")? {
                         let mut values = std::collections::BTreeMap::new();
-                        for (k, val) in set.get("values").and_then(Value::as_object).into_iter().flatten() {
+                        // Left out, the set uses the defaults; given, it must be an object, or
+                        // the set's values would be cleared by mistake.
+                        let given = match set.get("values") {
+                            None => None,
+                            Some(Value::Object(o)) => Some(o),
+                            Some(other) => {
+                                return Err(format!(
+                                    "The values of a value set are an object of placeholder names to texts, not {other}."
+                                ));
+                            }
+                        };
+                        for (k, val) in given.into_iter().flatten() {
                             let val = match val {
                                 Value::String(t) => t.clone(),
                                 Value::Number(n) => n.to_string(),
@@ -2701,7 +2712,7 @@ impl App {
                             values,
                         });
                     }
-                    form.set_value_sets(sets);
+                    form.set_value_sets(sets)?;
                 }
                 let path = form.save()?;
                 let m = wc_core::macros::read_macro(&path).map_err(|e| e.to_string())?;
@@ -5726,6 +5737,29 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("kW"), "{err}");
+        // `values` given as something other than an object is refused rather than read as
+        // left out (which would clear the set's values), and two values for one placeholder
+        // that differ only in case are refused rather than one of them dropped: the file is kept.
+        let before = std::fs::read(&path).unwrap();
+        for values in [json!([]), json!("3"), json!(null)] {
+            let err = call(
+                &mut a,
+                "macros",
+                json!({"action": "edit", "name": "Starter", "value_sets": [{"name": "Small", "values": values}]}),
+            )
+            .unwrap_err();
+            assert!(err.contains("object"), "{err}");
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+        let err = call(
+            &mut a,
+            "macros",
+            json!({"action": "edit", "name": "Starter",
+                   "value_sets": [{"name": "Small", "values": {"POWER": "0.75", "power": "3"}}]}),
+        )
+        .unwrap_err();
+        assert!(err.contains("POWER") && err.contains("power"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
 
         // A library's macro is not edited.
         let lib = tmp.path().join("lib");
