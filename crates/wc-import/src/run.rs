@@ -1420,6 +1420,19 @@ pub fn wired_pins_lost(p: &Project, symbol: &wc_core::Symbol) -> Vec<String> {
     out
 }
 
+/// Whether importing `symbol` puts another version in place of the project's: the lock pins
+/// another version, or, for a symbol the lock does not pin, the project's vendored copy differs
+/// from it (or is there but cannot be read).
+fn replaces_symbol(dir: &Path, p: &Project, symbol: &wc_core::Symbol) -> bool {
+    if let Some(entry) = p.lock.symbols.get(&symbol.id) {
+        return entry.hash != symbol.hash();
+    }
+    match store::read_vendored_symbol(dir, &symbol.id) {
+        Ok(have) => have.hash() != symbol.hash(),
+        Err(_) => store::vendor_path(dir, ItemKind::Symbol, &symbol.id).is_ok_and(|path| path.exists()),
+    }
+}
+
 /// Put each file back as it was ([`put_file_back`]), the last written first. Returns why each
 /// one that could not be put back failed.
 pub fn put_files_back(files: &[(PathBuf, Option<Vec<u8>>)]) -> Vec<String> {
@@ -1463,7 +1476,7 @@ pub fn add_built(
     }
     // A new version of a symbol must keep every pin a wire in the project ends on.
     for symbol in &built.symbols {
-        if p.lock.symbols.get(&symbol.id).is_some_and(|e| e.hash != symbol.hash()) {
+        if replaces_symbol(dir, p, symbol) {
             let lost = wired_pins_lost(p, symbol);
             if !lost.is_empty() {
                 return Err(format!(
@@ -1925,5 +1938,64 @@ mod tests {
         let r = aml(&dir, &t.path().join("missing.aml"), 100, &mut log);
         assert!(r.is_err());
         assert_eq!(load(&dir), before);
+    }
+
+    /// A vendored symbol the lock does not pin is checked like a pinned one: a new version that
+    /// drops a pin a wire ends on is refused, and the project's copy stays as it was (#623).
+    #[test]
+    fn an_unpinned_vendored_symbol_keeps_the_pins_wires_use() {
+        let t = tmp();
+        let symbol = |pins: &str| -> wc_core::Symbol {
+            match serde_json::from_str(&format!(
+                r#"{{"id":"coil","name":"Coil","graphics":[],"pins":[{pins}]}}"#
+            )) {
+                Ok(s) => s,
+                Err(x) => unreachable!("bad symbol: {x}"),
+            }
+        };
+        let pin = |n: &str| format!(r#"{{"name":"{n}","at":{{"x":0.0,"y":0.0}},"dir":"up"}}"#);
+        let have = symbol(&format!("{},{}", pin("1"), pin("2")));
+        assert!(store::write_vendored_symbol(t.path(), &have).is_ok());
+        let mut p = Project::new("t");
+        let mut page = Page::new("p1", "1", "");
+        page.symbols.push(wc_core::PlacedSymbol {
+            id: "k1".into(),
+            symbol: "coil".into(),
+            at: wc_core::Point::new(0.0, 0.0),
+            rotation: wc_core::geom::Rotation::R0,
+            mirror: false,
+            tag: None,
+        });
+        let wire: wc_core::Wire = match serde_json::from_str(
+            r#"{"id":"w1","from":{"item":"k1","pin":"2"},"to":{"at":{"x":0.0,"y":20.0}}}"#,
+        ) {
+            Ok(w) => w,
+            Err(x) => unreachable!("bad wire: {x}"),
+        };
+        page.wires.push(wire);
+        p.pages.push(page);
+        assert!(!p.lock.symbols.contains_key("coil"));
+
+        let built = crate::aml::Built {
+            symbols: vec![symbol(&pin("1"))],
+            ..Default::default()
+        };
+        match add_built(t.path(), &mut p, built, "test", Replace::Unchanged) {
+            Ok(_) => unreachable!("a new version without the wired pin replaced the copy"),
+            Err(why) => assert!(why.contains("wires end on pins") && why.contains("k1:2"), "{why}"),
+        }
+        match store::read_vendored_symbol(t.path(), "coil") {
+            Ok(kept) => assert_eq!(kept.hash(), have.hash()),
+            Err(x) => unreachable!("the copy is gone: {x}"),
+        }
+
+        // A new version that keeps the wired pin is still taken.
+        let built = crate::aml::Built {
+            symbols: vec![symbol(&pin("2"))],
+            ..Default::default()
+        };
+        if let Err(why) = add_built(t.path(), &mut p, built, "test", Replace::Unchanged) {
+            unreachable!("a version keeping the wired pin was refused: {why}");
+        }
     }
 }
