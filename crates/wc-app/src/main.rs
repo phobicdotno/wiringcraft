@@ -503,15 +503,24 @@ impl chrome::Status for StatusView<'_> {
 }
 
 impl App {
+    /// Why the window does not save while a command of the assistant runs.
+    pub(crate) const SAVE_WAITS: &str = "Saving waits until the assistant's command has finished.";
+
     /// OK in the Translations dialog: save `form`'s dictionary. For the open project the save
     /// is one undo step, however many cells changed (#589). A guest in a shared session is
     /// refused as the assistant's `translations` tool refuses, and nothing is written: the
     /// session does not carry the file. A form that is not for the open project just saves.
+    /// While a command of the assistant runs (`command_running`) nothing is saved, as with
+    /// Save: what changes on disk meanwhile is taken as the command's change.
     pub(crate) fn save_translations(
         open: Option<&mut Open>,
         share: &share::Share,
+        command_running: bool,
         form: &translations_form::Form,
     ) -> Result<String, String> {
+        if command_running {
+            return Err(App::SAVE_WAITS.to_owned());
+        }
         if share.active() && !share.is_host() {
             return Err(Open::TRANSLATIONS_GUEST.to_owned());
         }
@@ -1416,7 +1425,7 @@ impl App {
         let Some(open) = self.open.as_mut() else { return };
         match a {
             Action::Save if self.assistant.command_running() => {
-                self.ed.message = "Saving waits until the assistant's command has finished.".into();
+                self.ed.message = App::SAVE_WAITS.into();
             }
             Action::Save => match open.save() {
                 Ok(n) => self.ed.message = format!("Saved ({n} files changed)."),
@@ -1428,7 +1437,7 @@ impl App {
                     .into();
             }
             Action::SaveAs if self.assistant.command_running() => {
-                self.ed.message = "Saving waits until the assistant's command has finished.".into();
+                self.ed.message = App::SAVE_WAITS.into();
             }
             Action::SaveAs => self.pending = Some(Pending::SaveAs),
             Action::Undo | Action::Redo => {
@@ -2331,12 +2340,15 @@ impl App {
                     ui.separator();
                     ui.horizontal(|ui| {
                         if ui.button("OK").clicked() {
-                            match App::save_translations(self.open.as_mut(), &self.share, form) {
+                            let running = self.assistant.command_running();
+                            match App::save_translations(self.open.as_mut(), &self.share, running, form) {
                                 Ok(m) => {
                                     then = Some(Box::new(move |app: &mut App| app.ed.message = m));
                                     keep = false;
                                 }
-                                Err(e) if e == Open::TRANSLATIONS_GUEST => form.error = Some(e),
+                                Err(e) if e == Open::TRANSLATIONS_GUEST || e == App::SAVE_WAITS => {
+                                    form.error = Some(e);
+                                }
                                 Err(e) => form.error = Some(format!("Saving failed: {e}")),
                             }
                         }

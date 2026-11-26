@@ -7181,7 +7181,7 @@ mod tests {
         let mut form = translations_dialog(&a, "Pumps", "Pumper");
         let row = form.rows.iter_mut().find(|r| r.text == "Motors").unwrap();
         row.cells = vec!["Motorer".into()];
-        let said = App::save_translations(a.open.as_mut(), &a.share, &form).unwrap();
+        let said = App::save_translations(a.open.as_mut(), &a.share, false, &form).unwrap();
         assert!(said.starts_with("Saved 2 translations"), "{said}");
         let open = a.open.as_mut().unwrap();
         assert_eq!(open.undo_mark(), steps + 1, "both cells are one step");
@@ -7197,7 +7197,7 @@ mod tests {
         let mut form = translations_dialog(&a, "Pumps", "Pumpene");
         form.dir = other.path().to_path_buf();
         let steps = a.open.as_ref().unwrap().undo_mark();
-        App::save_translations(a.open.as_mut(), &a.share, &form).unwrap();
+        App::save_translations(a.open.as_mut(), &a.share, false, &form).unwrap();
         assert!(other.path().join(TRANSLATIONS_FILE).exists());
         assert_eq!(a.open.as_ref().unwrap().undo_mark(), steps);
         assert_eq!(
@@ -7220,7 +7220,7 @@ mod tests {
             row.cells = vec!["Oversatt".into()];
         }
         assert!(!form.rows.is_empty());
-        let e = App::save_translations(a.open.as_mut(), &a.share, &form).unwrap_err();
+        let e = App::save_translations(a.open.as_mut(), &a.share, false, &form).unwrap_err();
         assert_eq!(e, Open::TRANSLATIONS_GUEST, "as the assistant's tool refuses");
         assert!(!dir.join(TRANSLATIONS_FILE).exists(), "nothing was written");
         let open = a.open.as_ref().unwrap();
@@ -9451,6 +9451,32 @@ mod tests {
         assert_eq!(customer(&a).as_deref(), Some("Second"));
         assert!(!format!("{r:?}").contains("not loaded"), "{r:?}");
         assert!(!a.assistant.command_running());
+    }
+
+    #[test]
+    fn the_translations_dialog_does_not_save_while_a_command_runs() {
+        use wc_core::translate::TRANSLATIONS_FILE;
+        let (_tmp, mut a) = app(vec![]);
+        call(&mut a, "add_page", json!({"title": "Pumps"})).unwrap();
+        let dir = a.open.as_ref().unwrap().dir.clone();
+        let form = translations_dialog(&a, "Pumps", "Pumper");
+        let steps = a.open.as_ref().unwrap().undo_mark();
+        let _ = command_around(&mut a, |a| {
+            let running = a.assistant.command_running();
+            assert!(running);
+            let e = App::save_translations(a.open.as_mut(), &a.share, running, &form).unwrap_err();
+            assert_eq!(e, App::SAVE_WAITS, "as Save answers");
+            assert!(!dir.join(TRANSLATIONS_FILE).exists(), "nothing was written");
+        });
+        // The command made no step of a change the dialog never wrote.
+        assert!(!dir.join(TRANSLATIONS_FILE).exists());
+        assert_eq!(a.open.as_ref().unwrap().undo_mark(), steps);
+
+        // Once the command is done the same form saves, as one step.
+        let running = a.assistant.command_running();
+        App::save_translations(a.open.as_mut(), &a.share, running, &form).unwrap();
+        assert!(dir.join(TRANSLATIONS_FILE).exists());
+        assert_eq!(a.open.as_ref().unwrap().undo_mark(), steps + 1);
     }
 
     #[test]
