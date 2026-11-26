@@ -1896,14 +1896,20 @@ fn move_drag_to(open: &mut Open, ed: &mut Editor, target: Point) {
         });
         return;
     }
-    let (step, id) = if checkpoint {
-        (step, id)
+    let sel = ed.selection.clone();
+    // An Undo during the drag took its checkpoint away: what moves from here on is a move of
+    // its own, with a checkpoint of its own for Escape to find.
+    let (step, id, items) = if checkpoint && open.has_undo_step(id) {
+        (step, id, items)
     } else {
         open.begin_drag_move();
-        (open.history_count(), open.last_step_id().unwrap_or(0))
+        (
+            open.history_count(),
+            open.last_step_id().unwrap_or(0),
+            Some(sel.clone()),
+        )
     };
     let d = Point::new(target.x - from.x, target.y - from.y);
-    let sel = ed.selection.clone();
     open.drag_move_by(ed.page, &sel, d);
     ed.drag = Some(Drag::Move {
         from: target,
@@ -5159,6 +5165,23 @@ mod tests {
         cancel_drag(&mut o, &mut ed);
         assert_eq!(o.project.pages, before);
         assert_eq!(o.undo_steps(), steps, "an earlier change keeps its undo step");
+    }
+
+    #[test]
+    fn a_move_after_an_undo_during_the_drag_is_taken_back_by_escape() {
+        let (_tmp, mut o, mut ed, coil) = moving_coil();
+        let page = ed.page;
+        let at = |o: &Open| o.project.pages[page].symbol(&coil).map(|s| s.at);
+        let start = at(&o);
+        drag(&mut o, &mut ed, Point::new(-40.0, 0.0));
+        // Undo takes the move back; the same item is selected again and the pointer moves on.
+        assert!(o.undo());
+        assert_eq!(at(&o), start);
+        ed.selection = vec![Selection::Symbol(coil.clone())];
+        move_drag_to(&mut o, &mut ed, Point::new(-60.0, 0.0));
+        assert_ne!(at(&o), start, "the new frame moved the coil");
+        cancel_drag(&mut o, &mut ed);
+        assert_eq!(at(&o), start, "Escape takes the new move back");
     }
 
     #[test]

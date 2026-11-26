@@ -1323,6 +1323,11 @@ impl Open {
         let counts = |p: &Project| p.page(page).map(|p| (p.graphics.len(), p.clouds.len(), p.wires.len()));
         let start = counts(&first.project);
         let later = self.undo.iter().skip(at + 1).chain(&self.redo).map(|s| &s.project);
+        // Dropping the move's step would shift the start of an assistant turn begun after it,
+        // and the turn would no longer fold into one step.
+        if self.turn.is_some_and(|t| t > self.undo_dropped + at) {
+            return Err("an assistant turn started after it is still running");
+        }
         if self.undo.iter().skip(at).chain(&self.redo).any(|s| s.folded) {
             return Err("an assistant turn during it was recorded as one step");
         }
@@ -5064,6 +5069,24 @@ pub(crate) mod tests {
         assert!(o.take_undo_error().is_some());
         pass(&mut o);
         assert!(o.take_back_move(id, &page, std::slice::from_ref(&g)).is_err());
+    }
+
+    #[test]
+    fn a_move_is_not_taken_back_under_an_assistant_turn_begun_after_it() {
+        let (_tmp, mut o) = project();
+        let id = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let sel = [Selection::Symbol(id)];
+        let page = o.project.pages[1].id.clone();
+        o.begin_drag_move();
+        let Some(step) = o.last_step_id() else { unreachable!() };
+        o.drag_move_by(1, &sel, Point::new(-10.0, 0.0));
+        let mark = o.start_turn();
+        o.rotate_many(1, &sel);
+        o.rotate_many(1, &sel);
+        assert!(o.take_back_move(step, &page, &sel).is_err());
+        let steps = o.undo_steps();
+        o.squash_undo(mark);
+        assert_eq!(o.undo_steps(), steps - 1, "the turn's two steps fold into one");
     }
 
     fn macro_edited_twice() -> (tempfile::TempDir, Open, PathBuf, [String; 3]) {
