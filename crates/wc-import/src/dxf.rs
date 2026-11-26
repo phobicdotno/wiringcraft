@@ -78,6 +78,11 @@ pub const TOO_DEEP: &str = "entities in blocks nested too deep (or inserting the
 /// each insert the next many times would otherwise fill the memory.
 pub const MAX_DRAWN: usize = 2_000_000;
 
+/// The most points one polyline or HATCH boundary loop with bulges is sampled into (each bulged
+/// side becomes up to 72 points). Real drawings stay far below it; past it the polyline or loop
+/// is left out before its points are made, and counted.
+pub const MAX_BULGED_POINTS: usize = 200_000;
+
 /// The key under which entities left out over [`MAX_DRAWN`] are counted.
 pub(crate) const OVER_LIMIT: &str = "over the limit";
 
@@ -461,14 +466,19 @@ fn shapes(
                 let raw = if vs.iter().any(|(_, b)| b.abs() >= 1e-9) {
                     bulged(&vs, closed)
                 } else {
-                    Some(vs.iter().map(|(p, _)| *p).collect())
+                    Ok(vs.iter().map(|(p, _)| *p).collect())
                 };
-                // A bulge that gives no arc, or points that are not numbers once placed (a huge
-                // INSERT scale), leave the polyline out, and say so.
-                let pts: Option<Vec<Point>> = raw.map(|r| r.into_iter().map(|(x, y)| q(x, y)).collect());
+                // Bulges that would give too many points, a bulge that gives no arc, or points
+                // that are not numbers once placed (a huge INSERT scale), leave the polyline
+                // out, and say so.
+                let pts = raw.map(|r| r.into_iter().map(|(x, y)| q(x, y)).collect::<Vec<Point>>());
                 match pts {
-                    Some(pts) if pts.len() < 2 => None,
-                    Some(pts) if pts.iter().all(|p| p.x.is_finite() && p.y.is_finite()) => Some(Shape::Polyline {
+                    Err(BulgeError::TooManyPoints) => {
+                        *skipped.entry(POLYLINE_TOO_MANY_POINTS.to_owned()).or_default() += 1;
+                        None
+                    }
+                    Ok(pts) if pts.len() < 2 => None,
+                    Ok(pts) if pts.iter().all(|p| p.x.is_finite() && p.y.is_finite()) => Some(Shape::Polyline {
                         points: pts,
                         closed,
                         filled: false,
@@ -523,7 +533,14 @@ fn shapes(
                     let pt = q(x, y);
                     x.is_finite() && y.is_finite() && pt.x.is_finite() && pt.y.is_finite()
                 };
-                let (loops, bad): (Vec<_>, Vec<_>) = hatch_loops(e)
+                let (all_loops, too_many) = hatch_loops(e);
+                // A loop whose bulges would give too many points is left out before its points
+                // are made, and counted: a solid hatch that lost one is drawn as outlines too.
+                if too_many > 0 {
+                    *skipped.entry(HATCH_TOO_MANY_POINTS.to_owned()).or_default() += 1;
+                    solid = false;
+                }
+                let (loops, bad): (Vec<_>, Vec<_>) = all_loops
                     .into_iter()
                     .partition(|(lp, _)| lp.iter().all(|pt| placed(*pt)));
                 let (loops, fit_failed): (Vec<_>, Vec<usize>) = loops.into_iter().unzip();
@@ -568,7 +585,7 @@ fn shapes(
                 let text = if e.kind == "MTEXT" {
                     mtext_plain(raw)
                 } else {
-                    raw.to_owned()
+                    special_codes(raw)
                 };
                 let ((x, y), align, angle) = text_anchor(e);
                 (!text.trim().is_empty()).then(|| Shape::Text {
@@ -826,6 +843,14 @@ const STRETCHED_NOT_NUMBERS: &str = "CIRCLE or ARC of a stretched block whose po
 /// placed.
 const POLYLINE_NOT_NUMBERS: &str = "LWPOLYLINE whose points are not numbers once placed";
 const HATCH_NOT_NUMBERS: &str = "HATCH with a boundary that is not numbers";
+
+/// The `skipped` key of a polyline left out because its bulges would give more than
+/// [`MAX_BULGED_POINTS`] points.
+const POLYLINE_TOO_MANY_POINTS: &str = "polyline with too many bulged points";
+
+/// The `skipped` key of a HATCH with a boundary loop left out because its bulges would give more
+/// than [`MAX_BULGED_POINTS`] points.
+const HATCH_TOO_MANY_POINTS: &str = "HATCH with too many bulged boundary points";
 
 /// Points along a B-spline from its control points, knots and weights, sampled evenly over the
 /// knot range. `None` when the data do not make a spline.
@@ -1382,24 +1407,36 @@ impl Cursor<'_> {
 
 /// Points of a polyline vertex list with bulges: an arc between two points where the bulge is
 /// not zero (bulge = tan(sweep / 4), positive counter-clockwise).
-/// `None` when a bulged segment cannot be sampled (its numbers overflow), so the caller does not
-/// draw a straight side in place of an arc.
-fn bulged(vertices: &[((f64, f64), f64)], closed: bool) -> Option<Vec<(f64, f64)>> {
-    let mut out = Vec::new();
+/// An error when a bulged segment cannot be sampled (its numbers overflow), so the caller does
+/// not draw a straight side in place of an arc, or when the points would number more than
+/// [`MAX_BULGED_POINTS`] (checked before any is made).
+fn bulged(vertices: &[((f64, f64), f64)], closed: bool) -> std::result::Result<Vec<(f64, f64)>, BulgeError> {
     let n = vertices.len();
-    for i in 0..n {
+    // The side from vertex i: its end, when it is an arc (a bulge and a chord to bend).
+    let arc_side = |i: usize| {
         let (a, bulge) = vertices[i];
+        let &(b, _) = vertices.get(i + 1).or(if closed { vertices.first() } else { None })?;
+        let chord = (b.0 - a.0).hypot(b.1 - a.1);
+        (bulge.abs() >= 1e-9 && chord >= 1e-12).then_some((a, b, bulge, chord))
+    };
+    // Each arc side adds the inner samples of its sweep (4 atan(bulge)) after its start vertex,
+    // as `arc_points` samples it: a quick check before anything is made.
+    let expected = (0..n).fold(n, |sum, i| {
+        let steps = arc_side(i).map_or(0, |(_, _, bulge, _)| {
+            let sweep = (4.0 * bulge.atan()).abs();
+            ((TURN_STEPS * sweep / std::f64::consts::TAU).ceil() as usize).max(2) - 1
+        });
+        sum.saturating_add(steps)
+    });
+    if expected > MAX_BULGED_POINTS {
+        return Err(BulgeError::TooManyPoints);
+    }
+    let mut out = Vec::with_capacity(expected);
+    for (i, &(a, _)) in vertices.iter().enumerate() {
         out.push(a);
-        let Some(&(b, _)) = vertices.get(i + 1).or(if closed { vertices.first() } else { None }) else {
+        let Some((a, b, bulge, chord)) = arc_side(i) else {
             continue;
         };
-        if bulge.abs() < 1e-9 {
-            continue;
-        }
-        let chord = (b.0 - a.0).hypot(b.1 - a.1);
-        if chord < 1e-12 {
-            continue;
-        }
         let sweep = 4.0 * bulge.atan();
         let r = chord / (2.0 * (sweep / 2.0).sin()).abs();
         // Centre: from the chord's midpoint along its normal.
@@ -1411,25 +1448,45 @@ fn bulged(vertices: &[((f64, f64), f64)], closed: bool) -> Option<Vec<(f64, f64)
         let a1 = (b.1 - c.1).atan2(b.0 - c.0).to_degrees();
         let pts = arc_points(c, r, a0, a1, bulge > 0.0);
         if pts.len() < 2 || !pts.iter().all(|p| p.0.is_finite() && p.1.is_finite()) {
-            return None;
+            return Err(BulgeError::NotNumbers);
         }
-        out.extend(pts.iter().skip(1).take(pts.len().saturating_sub(2)));
+        // Rounding can put the centre where the arc comes out a full turn, more points than
+        // the quick check counted: the limit holds for the points actually made.
+        let inner = pts.len().saturating_sub(2);
+        if out.len() + inner + (n - 1 - i) > MAX_BULGED_POINTS {
+            return Err(BulgeError::TooManyPoints);
+        }
+        out.extend(pts.iter().skip(1).take(inner));
     }
-    Some(out)
+    Ok(out)
 }
 
+/// Why a polyline with bulges gives no points.
+#[derive(Debug, PartialEq)]
+enum BulgeError {
+    /// A bulged side's numbers overflow.
+    NotNumbers,
+    /// The points would number more than [`MAX_BULGED_POINTS`].
+    TooManyPoints,
+}
+
+/// A HATCH boundary loop as DXF points, with how many of its spline edges were joined straight.
+type HatchLoop = (Vec<(f64, f64)>, usize);
+
 /// The boundary loops of a HATCH, as DXF points, each with how many of its spline edges were
-/// joined straight because their fit points could not be interpolated. Unreadable loops are left
-/// out.
-fn hatch_loops(e: &Entity) -> Vec<(Vec<(f64, f64)>, usize)> {
+/// joined straight because their fit points could not be interpolated, and how many loops were
+/// left out because their bulges would give more than [`MAX_BULGED_POINTS`] points. Unreadable
+/// loops are left out.
+fn hatch_loops(e: &Entity) -> (Vec<HatchLoop>, usize) {
     let mut cur = Cursor { codes: &e.codes, i: 0 };
     // Skip the elevation point, extrusion, pattern name and flags up to the loop count.
     let Some(start) = e.codes.iter().position(|(c, _)| *c == 91) else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
     cur.i = start;
     let loops = cur.count(91);
     let mut out = Vec::new();
+    let mut too_many = 0;
     for _ in 0..loops {
         let Some(flags) = cur.take(92) else { break };
         let mut pts: Vec<(f64, f64)> = Vec::new();
@@ -1447,9 +1504,20 @@ fn hatch_loops(e: &Entity) -> Vec<(Vec<(f64, f64)>, usize)> {
             }
             // A bulge that cannot be sampled marks the loop as not numbers, so the HATCH arm
             // leaves it out and counts it rather than drawing a straight side.
-            pts = bulged(&vs, true).unwrap_or_else(|| vec![(f64::NAN, f64::NAN); 3]);
+            pts = match bulged(&vs, true) {
+                Ok(pts) => pts,
+                Err(BulgeError::NotNumbers) => vec![(f64::NAN, f64::NAN); 3],
+                // Left out before its points are made: an empty loop is not kept below.
+                Err(BulgeError::TooManyPoints) => {
+                    too_many += 1;
+                    Vec::new()
+                }
+            };
         } else {
             let edges = cur.count(93);
+            // Edges (each a bounded number of points) whose samples together would pass
+            // MAX_BULGED_POINTS: the loop is read to its end but left out.
+            let mut over = false;
             for edge in 0..edges {
                 let Some(kind) = cur.take(72) else { break };
                 let seg: Vec<(f64, f64)> = match kind as i64 {
@@ -1559,7 +1627,14 @@ fn hatch_loops(e: &Entity) -> Vec<(Vec<(f64, f64)>, usize)> {
                     seg.reverse();
                 }
                 let skip = usize::from(pts.last().is_some_and(|end| d(*end, seg.first()) < 1e-9));
-                pts.extend(seg.into_iter().skip(skip));
+                over |= pts.len() + seg.len().saturating_sub(skip) > MAX_BULGED_POINTS;
+                if !over {
+                    pts.extend(seg.into_iter().skip(skip));
+                }
+            }
+            if over {
+                too_many += 1;
+                pts = Vec::new();
             }
         }
         // Source boundary objects: a count and that many handles.
@@ -1578,7 +1653,7 @@ fn hatch_loops(e: &Entity) -> Vec<(Vec<(f64, f64)>, usize)> {
             out.push((pts, fit_failed));
         }
     }
-    out
+    (out, too_many)
 }
 
 /// The edges of a loop as point pairs, the last one closing it.
@@ -1595,8 +1670,25 @@ fn area2(lp: &[(f64, f64)]) -> f64 {
         .sum()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The hole search's work so far on this thread: vertices visited, point pairs and wall edges
+    /// collected, crossing tests. Tests read it to check the budgets bound the work done.
+    static HOLE_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts `n` units of hole search work (in tests only; does nothing otherwise).
+#[inline]
+fn tally_work(n: usize) {
+    #[cfg(test)]
+    HOLE_WORK.with(|w| w.set(w.get().saturating_add(n)));
+    #[cfg(not(test))]
+    let _ = n;
+}
+
 /// Whether `pt` lies inside the loop (even-odd rule).
 fn inside(pt: (f64, f64), lp: &[(f64, f64)]) -> bool {
+    tally_work(lp.len());
     let mut odd = false;
     for (b, a) in loop_edges(lp) {
         if (a.1 > pt.1) != (b.1 > pt.1) && pt.0 < (b.0 - a.0) * (pt.1 - a.1) / (b.1 - a.1) + a.0 {
@@ -1617,6 +1709,7 @@ fn hatch_style(e: &Entity) -> i64 {
 
 /// Whether segments p-q and c-d cross at a point inside both (touching at an end does not count).
 fn crosses(p: (f64, f64), q: (f64, f64), c: (f64, f64), d: (f64, f64)) -> bool {
+    tally_work(1);
     let side = |a: (f64, f64), b: (f64, f64), x: (f64, f64)| (b.0 - a.0) * (x.1 - a.1) - (b.1 - a.1) * (x.0 - a.0);
     let eps = 1e-12;
     let (d1, d2) = (side(p, q, c), side(p, q, d));
@@ -1728,6 +1821,7 @@ fn with_holes_kept(loops: &[Vec<(f64, f64)>], style: i64) -> Option<(Vec<Loop>, 
                 pairs.push(((p.0 - h.0).hypot(p.1 - h.1), a, b));
             }
         }
+        tally_work(pairs.len());
         pairs.sort_by(|x, y| x.0.total_cmp(&y.0));
         let mut walls: Vec<((f64, f64), (f64, f64))> = loop_edges(o).collect();
         walls.extend(loop_edges(&lp));
@@ -1736,6 +1830,7 @@ fn with_holes_kept(loops: &[Vec<(f64, f64)>], style: i64) -> Option<(Vec<Loop>, 
                 walls.extend(loop_edges(other));
             }
         }
+        tally_work(walls.len());
         let tries = (BRIDGE_BUDGET * 4 / walls.len().max(1)).max(1);
         let clear = |p: (f64, f64), h: (f64, f64)| !walls.iter().any(|&(c, d)| crosses(p, h, c, d));
         // No clear bridge within the budget: leave the hatch unfilled rather than fill the hole.
@@ -1789,6 +1884,14 @@ fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
             } else if kind == HATCH_NOT_NUMBERS {
                 let s = if n == 1 { "" } else { "es" };
                 format!("{n} HATCH{s} with a boundary that is not numbers: that boundary left out")
+            } else if kind == POLYLINE_TOO_MANY_POINTS {
+                let s = if n == 1 { "" } else { "s" };
+                format!("{n} polyline{s} whose arcs would need more than {MAX_BULGED_POINTS} points, left out")
+            } else if kind == HATCH_TOO_MANY_POINTS {
+                let s = if n == 1 { "" } else { "es" };
+                format!(
+                    "{n} HATCH{s} with a boundary whose arcs would need more than {MAX_BULGED_POINTS} points: that boundary left out"
+                )
             } else if kind == HATCH_UNFILLED {
                 let s = if n == 1 { "" } else { "es" };
                 format!("{n} solid HATCH{s} with too many or too complex holes drawn as outline only, not filled")
@@ -1799,7 +1902,8 @@ fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
         .collect()
 }
 
-/// MTEXT carries inline formatting codes; keep only the text.
+/// MTEXT carries inline formatting codes; keep only the text, with its `\U+XXXX` and `%%`
+/// codes turned into characters.
 fn mtext_plain(s: &str) -> String {
     let mut out = String::new();
     let mut chars = s.chars().peekable();
@@ -1810,6 +1914,28 @@ fn mtext_plain(s: &str) -> String {
                 Some('\\') => out.push('\\'),
                 Some('{') => out.push('{'),
                 Some('}') => out.push('}'),
+                Some('U') => {
+                    // `\U+XXXX`: a character by its code. Decoded here, so an escaped backslash
+                    // before `U+` (`\\U+00C5`) stays as written. Any other `\U` (no `+`, or not
+                    // four hex digits) is not a formatting code and stays as written too.
+                    let hex: String = match chars.peek() {
+                        Some('+') => chars.clone().skip(1).take(4).collect(),
+                        _ => String::new(),
+                    };
+                    let code = (hex.len() == 4 && hex.chars().all(|c| c.is_ascii_hexdigit()))
+                        .then(|| u32::from_str_radix(&hex, 16).ok())
+                        .flatten()
+                        .and_then(char::from_u32);
+                    match code {
+                        Some(c) => {
+                            out.push(c);
+                            for _ in 0..5 {
+                                chars.next();
+                            }
+                        }
+                        None => out.push_str("\\U"),
+                    }
+                }
                 Some(_) => {
                     // Formatting code: skip to ';' if it takes an argument.
                     let rest: String = chars.clone().take_while(|c| *c != ';' && *c != '\\').collect();
@@ -1821,8 +1947,67 @@ fn mtext_plain(s: &str) -> String {
                 }
                 None => {}
             },
+            '%' if chars.peek() == Some(&'%') => {
+                // `%%` codes, read from the text as written: a `%` that `\U+0025` produced
+                // never starts one.
+                match chars.clone().nth(1).and_then(percent_code) {
+                    Some(d) => {
+                        out.push_str(d);
+                        chars.next();
+                        chars.next();
+                    }
+                    None => out.push('%'),
+                }
+            }
             '{' | '}' => {}
             c => out.push(c),
+        }
+    }
+    out
+}
+
+/// `\U+XXXX` (four hex digits) at the start of `s`: the character with that code, as CAD
+/// programs write any character outside ASCII. The code is seven bytes long.
+fn unicode_code(s: &str) -> Option<char> {
+    s.strip_prefix("\\U+")?
+        .get(..4)
+        .filter(|h| h.chars().all(|c| c.is_ascii_hexdigit()))
+        .and_then(|h| u32::from_str_radix(h, 16).ok())
+        .and_then(char::from_u32)
+}
+
+/// The `%%` code whose letter is `c`: `%%c` diameter, `%%d` degree, `%%p` plus/minus, `%%%` a
+/// percent sign; `%%u` and `%%o` (underline and overline on/off) are dropped.
+fn percent_code(c: char) -> Option<&'static str> {
+    match c.to_ascii_lowercase() {
+        'c' => Some("\u{2300}"),
+        'd' => Some("\u{b0}"),
+        'p' => Some("\u{b1}"),
+        '%' => Some("%"),
+        'u' | 'o' => Some(""),
+        _ => None,
+    }
+}
+
+/// The text of a TEXT or ATTRIB: its `\U+XXXX` and `%%` codes turned into characters, in one
+/// pass, so a character a code produces never starts another code. Anything else is kept.
+fn special_codes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(c) = rest.chars().next() {
+        if let Some(u) = unicode_code(rest) {
+            out.push(u);
+            rest = &rest[7..];
+        } else if let Some(d) = rest
+            .strip_prefix("%%")
+            .and_then(|r| r.chars().next())
+            .and_then(percent_code)
+        {
+            out.push_str(d);
+            rest = &rest[3..];
+        } else {
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
         }
     }
     out
@@ -1940,6 +2125,7 @@ pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<
     let d = parse(text)?;
     let known: BTreeMap<String, &String> = known_symbols.iter().map(|s| (normalise_block_name(s), s)).collect();
     let mut out = ImportedPage::default();
+    let mut tag_warnings = Vec::new();
     let mut raw = Vec::new();
     let mut points = Vec::new();
     let mut plain = Vec::new();
@@ -1967,7 +2153,16 @@ pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<
                         )
                     })
                     .and_then(|a| a.get(1))
-                    .and_then(|v| DeviceTag::parse(v).ok());
+                    .map(special_codes)
+                    .filter(|v| !v.trim().is_empty())
+                    .and_then(|v| {
+                        DeviceTag::parse(&v)
+                            .map_err(|why| {
+                                tag_warnings
+                                    .push(format!("{id}: device tag {v:?} not read ({why}), placed without a tag"))
+                            })
+                            .ok()
+                    });
                 let rotation = Rotation::from_degrees(-(e.f(50).round() as i64)).unwrap_or_default();
                 out.symbols.push(PlacedSymbol {
                     id: String::new(),
@@ -2000,6 +2195,7 @@ pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<
     );
     out.graphics = raw.into_iter().map(|(_, s)| s).collect();
     out.warnings = skipped_warnings(skipped);
+    out.warnings.extend(tag_warnings);
     // Move into the frame: top-left at (20, 20) mm.
     let mut pts: Vec<Point> = out
         .graphics
@@ -2011,7 +2207,12 @@ pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<
         .collect();
     pts.extend(out.symbols.iter().map(|s| s.at));
     if pts.is_empty() {
-        return Err(Error::Format("the drawing has no entities WiringCraft can read".into()));
+        // Say what was left out, which is often why nothing is left to draw.
+        let mut why = "the drawing has no entities WiringCraft can read".to_owned();
+        if !out.warnings.is_empty() {
+            why.push_str(&format!(" ({})", out.warnings.join("; ")));
+        }
+        return Err(Error::Format(why));
     }
     let (min, _) = wc_core::geom::bounds_of(&pts);
     let shift = Point::new(20.0 - min.x, 20.0 - min.y);
@@ -2377,6 +2578,99 @@ mod tests {
         assert_eq!(mtext_plain(r"{\fArial|b1;Motor}\PM1"), "Motor M1");
     }
 
+    #[test]
+    fn text_codes_become_characters() -> Result<()> {
+        assert_eq!(
+            special_codes(r"\U+00C5lesund 3%%c 20%%D %%p1 50%%% %%uline%%u"),
+            "\u{c5}lesund 3\u{2300} 20\u{b0} \u{b1}1 50% line"
+        );
+        // Malformed codes stay as written.
+        assert_eq!(special_codes(r"\U+00G1 \U+12 100%% %%x"), r"\U+00G1 \U+12 100%% %%x");
+        let ents = "0\nTEXT\n8\n0\n10\n5\n20\n5\n40\n2\n1\n\\U+00C5lesund %%c6\n\
+                    0\nMTEXT\n8\n0\n10\n5\n20\n9\n40\n2\n1\n{\\fArial;\\U+00D8st}\\P20%%d\n";
+        let p = page(&dxf(ents, ""), 1.0, &BTreeSet::new())?;
+        let texts: Vec<&str> = p
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["\u{c5}lesund \u{2300}6", "\u{d8}st 20\u{b0}"]);
+        // The form WiringCraft's own DXF export writes reads back as drawn.
+        assert_eq!(special_codes(r"\U+00C5lesund"), "\u{c5}lesund");
+        // In MTEXT an escaped backslash before U+ stays literal; a lone one is a code.
+        assert_eq!(mtext_plain(r"\\U+00C5"), r"\U+00C5");
+        assert_eq!(mtext_plain(r"\U+00C5"), "\u{c5}");
+        assert_eq!(mtext_plain(r"\U+00G1 \U+"), r"\U+00G1 \U+");
+        assert_eq!(mtext_plain(r"\U1234"), r"\U1234");
+        assert_eq!(mtext_plain(r"\U1234;tail"), r"\U1234;tail");
+        // A `%` written as `\U+0025` never starts a `%%` code.
+        assert_eq!(special_codes(r"\U+0025%%c"), "%\u{2300}");
+        assert_eq!(mtext_plain(r"\U+0025%%c"), "%\u{2300}");
+        assert_eq!(mtext_plain(r"{\fArial;50%%%}%%D %%x"), "50%\u{b0} %%x");
+        // A known symbol's TAG attribute is decoded before it is read as a device tag.
+        let blocks = "0\nBLOCK\n2\nWC.COIL\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n0\nENDBLK\n";
+        let ents = "0\nINSERT\n2\nWC.COIL\n10\n50\n20\n100\n66\n1\n0\nATTRIB\n2\nTAG\n1\n-K\\U+00C51\n";
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        let p = page(&dxf(ents, blocks), 1.0, &known)?;
+        assert_eq!(
+            p.symbols
+                .first()
+                .and_then(|s| s.tag.as_ref())
+                .map(|t| t.to_string())
+                .as_deref(),
+            Some("-K\u{c5}1")
+        );
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+        Ok(())
+    }
+
+    #[test]
+    fn a_page_exported_to_dxf_reads_back_its_accents() -> Result<()> {
+        let mut project = wc_core::Project::new("Round trip");
+        let mut drawn = wc_core::Page::new("p1", "1", "Page");
+        drawn.graphics.push(Shape::Text {
+            at: Point::new(120.0, 80.0),
+            text: "\u{c5}lesund".into(),
+            height: 3.0,
+            align: Align::Left,
+            angle: 0.0,
+        });
+        project.pages = vec![drawn];
+        let (pages, _) = wc_pdf::page_lines(&project, &BTreeMap::new(), &wc_pdf::Options::default());
+        let Some(exported) = pages.first().map(wc_pdf::dxf) else {
+            unreachable!("one page is exported");
+        };
+        assert!(exported.contains("\\U+00C5lesund"), "the export writes the code");
+        let p = page(&exported, 1.0, &BTreeSet::new())?;
+        assert!(
+            p.graphics
+                .iter()
+                .any(|g| matches!(g, Shape::Text { text, .. } if text == "\u{c5}lesund")),
+            "the import reads the character back"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_tag_that_is_not_a_device_tag_is_said() -> Result<()> {
+        let blocks = "0\nBLOCK\n2\nWC.COIL\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n0\nENDBLK\n";
+        let ents = "0\nINSERT\n2\nWC.COIL\n10\n50\n20\n100\n66\n1\n0\nATTRIB\n2\nTAG\n1\nK\\U+00C51\n";
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        let p = page(&dxf(ents, blocks), 1.0, &known)?;
+        assert_eq!(p.symbols.len(), 1);
+        assert!(p.symbols[0].tag.is_none());
+        assert_eq!(p.warnings.len(), 1, "{:?}", p.warnings);
+        let w = &p.warnings[0];
+        assert!(
+            w.contains("wc.coil") && w.contains("\"K\u{c5}1\"") && w.contains("must start with"),
+            "{w}"
+        );
+        Ok(())
+    }
+
     /// Every graphic of a drawing in DXF coordinates turned to page ones (y down, scale 1).
     fn drawn(entities: &str, blocks: &str) -> Result<(Vec<Shape>, BTreeMap<String, usize>)> {
         let d = parse(&dxf(entities, blocks))?;
@@ -2682,6 +2976,80 @@ mod tests {
             "{pts:?}"
         );
         assert!(pts.iter().all(|p| ((p.0 - 5.0).hypot(p.1) - 5.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn bulges_that_would_give_too_many_points_are_left_out() -> Result<()> {
+        // 6000 vertices each bulged 1 (a half circle, 36 steps) would give about 222 000 points.
+        let n = 6000;
+        let vertices: String = (0..n).map(|i| format!("10\n{i}\n20\n0\n42\n1\n")).collect();
+        let many = format!("0\nLWPOLYLINE\n8\n0\n90\n{n}\n70\n0\n{vertices}");
+        let loop_vertices: String = (0..n).map(|i| format!("10\n{i}\n20\n0\n42\n1\n")).collect();
+        let hatch = format!(
+            "0\nHATCH\n8\n0\n2\nSOLID\n70\n1\n91\n2\n\
+             92\n2\n72\n1\n73\n1\n93\n{n}\n{loop_vertices}97\n0\n\
+             92\n2\n72\n0\n73\n1\n93\n3\n10\n0\n20\n0\n10\n5\n20\n0\n10\n0\n20\n5\n97\n0\n"
+        );
+        // An ordinary bulged polyline still draws its arc.
+        let half = "0\nLWPOLYLINE\n8\n0\n90\n2\n70\n0\n10\n0\n20\n0\n42\n1\n10\n10\n20\n0\n";
+        let (g, skipped) = drawn(&format!("{many}{hatch}{half}"), "")?;
+        assert_eq!(skipped.get(POLYLINE_TOO_MANY_POINTS), Some(&1), "{skipped:?}");
+        assert_eq!(skipped.get(HATCH_TOO_MANY_POINTS), Some(&1), "{skipped:?}");
+        assert!(!skipped.contains_key(POLYLINE_NOT_NUMBERS), "{skipped:?}");
+        assert!(!skipped.contains_key(HATCH_NOT_NUMBERS), "{skipped:?}");
+        // The hatch keeps its other loop, as an outline (the lost one may have been a hole);
+        // the half circle is drawn.
+        assert_eq!(g.len(), 2, "{g:?}");
+        let (triangle, closed, filled) = poly(&g[0]);
+        assert!(closed && !filled);
+        assert_eq!(triangle.len(), 3);
+        let (arc, _, _) = poly(&g[1]);
+        assert!(arc.iter().any(|q| near(*q, Point::new(5.0, 5.0))), "{arc:?}");
+        // The warnings name the limit.
+        let warnings = skipped_warnings(skipped);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w == "1 polyline whose arcs would need more than 200000 points, left out"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("1 HATCH with a boundary whose arcs")),
+            "{warnings:?}"
+        );
+        // Just under the limit, a polyline is still sampled: 5500 closed half circles make
+        // 5500 * 36 = 198 000 points.
+        let ok: Vec<((f64, f64), f64)> = (0..5500).map(|i| ((f64::from(i), 0.0), 1.0)).collect();
+        assert!(bulged(&ok, true).is_ok_and(|pts| pts.len() == 198_000));
+        // Far from the origin rounding can put an arc's centre on its end, so each side comes
+        // out a full turn: the limit holds for the points actually made, not the bulges' count.
+        let far: Vec<((f64, f64), f64)> = (0..8000)
+            .map(|i| ((1e16 + if i % 2 == 0 { 0.0 } else { 2.0 }, 1e16), 0.5))
+            .collect();
+        assert_eq!(bulged(&far, true), Err(BulgeError::TooManyPoints));
+        // A hatch loop of 6000 half-circle arc edges (37 points each) is left out the same way.
+        let arcs: String = (0..n)
+            .map(|i| {
+                let c = 2 * i + 1;
+                format!("72\n2\n10\n{c}\n20\n0\n40\n1\n50\n180\n51\n0\n73\n0\n")
+            })
+            .collect();
+        let edge_hatch = format!("0\nHATCH\n8\n0\n2\nSOLID\n70\n1\n91\n1\n92\n1\n93\n{n}\n{arcs}97\n0\n");
+        let (g, skipped) = drawn(&format!("{edge_hatch}{half}"), "")?;
+        assert_eq!(skipped.get(HATCH_TOO_MANY_POINTS), Some(&1), "{skipped:?}");
+        assert_eq!(g.len(), 1, "only the half circle is drawn");
+        // A page with nothing else to draw says why in its error.
+        let Err(e) = page(&dxf(&many, ""), 1.0, &BTreeSet::new()) else {
+            unreachable!("a page with nothing drawn is refused")
+        };
+        assert!(e.to_string().contains("more than 200000 points"), "{e}");
+        let Err(e) = page(&dxf("", ""), 1.0, &BTreeSet::new()) else {
+            unreachable!("an empty page is refused")
+        };
+        assert!(e.to_string().ends_with("WiringCraft can read"), "{e}");
+        Ok(())
     }
 
     #[test]
@@ -3038,9 +3406,19 @@ mod tests {
                 vec![(a, a), (b, a), (b, b), (a, b)]
             })
             .collect();
-        let started = std::time::Instant::now();
+        // The work each call really does (vertices visited, pairs and walls collected, crossing
+        // tests), counted rather than timed: a timing bound fails on a busy machine, a count
+        // does not. Each call must stay within the nesting budget plus the bridge budget.
+        let work_of = |loops: &[Vec<(f64, f64)>], style: i64| {
+            HOLE_WORK.with(|w| w.set(0));
+            let out = with_holes(loops, style);
+            (out, HOLE_WORK.with(std::cell::Cell::get))
+        };
+        let limit = NESTING_BUDGET + HATCH_BRIDGE_WORK;
         // Nesting found walking out from the smallest loop around: cheap for proper nesting.
-        assert!(with_holes(&loops[..40], 1).is_some());
+        let (out, work) = work_of(&loops[..40], 1);
+        assert!(out.is_some());
+        assert!(work < 10_000, "{work}");
         // Side by side loops need every pair compared; that many stop at the budget.
         let apart: Vec<Vec<(f64, f64)>> = (0..5000)
             .map(|i| {
@@ -3048,7 +3426,9 @@ mod tests {
                 vec![(a, 0.0), (a + 1.0, 0.0), (a + 1.0, 1.0), (a, 1.0)]
             })
             .collect();
-        assert!(with_holes(&apart, 0).is_none());
+        let (out, work) = work_of(&apart, 0);
+        assert!(out.is_none());
+        assert!(work <= NESTING_BUDGET, "{work}");
         // Deep nesting with normal style: every other loop is a hole to bridge, and all the
         // bridges together stop at the hatch's budget.
         let deep: Vec<Vec<(f64, f64)>> = (0..20_000)
@@ -3057,8 +3437,9 @@ mod tests {
                 vec![(a, a), (b, a), (b, b), (a, b)]
             })
             .collect();
-        assert!(with_holes(&deep, 0).is_none());
-        assert!(started.elapsed().as_secs() < 10);
+        let (out, work) = work_of(&deep, 0);
+        assert!(out.is_none());
+        assert!(work <= limit, "{work}");
     }
 
     #[test]
