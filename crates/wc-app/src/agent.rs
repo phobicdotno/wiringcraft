@@ -639,6 +639,24 @@ fn strings(v: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// A list of strings under `key`: left out (or null) is empty, anything else but strings is an
+/// error that names the value.
+fn string_list(v: &Value, key: &str) -> Result<Vec<String>, String> {
+    let Some(items) = v.get(key).filter(|x| !x.is_null()) else {
+        return Ok(Vec::new());
+    };
+    items
+        .as_array()
+        .ok_or_else(|| format!("`{key}` must be a list of strings, not {items}."))?
+        .iter()
+        .map(|x| {
+            x.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("`{key}` holds {x}, which is not a string in quotes."))
+        })
+        .collect()
+}
+
 fn rotation(v: &Value) -> Result<Option<Rotation>, String> {
     match v.get("rotation").and_then(Value::as_i64) {
         None => Ok(None),
@@ -1846,8 +1864,8 @@ impl App {
                     "wago-marking" => {
                         let lang = s(v, "lang").unwrap_or("en");
                         let options = wc_report::MarkingOptions {
-                            kinds: wc_report::parse_kinds(&strings(v, "kinds"))?,
-                            lines: wc_report::parse_lines(&strings(v, "lines"))?,
+                            kinds: wc_report::parse_kinds(&string_list(v, "kinds")?)?,
+                            lines: wc_report::parse_lines(&string_list(v, "lines")?)?,
                             language: wc_report::Language::parse(lang)
                                 .ok_or_else(|| format!("Unknown language {lang:?} (en, de, nb)."))?,
                             strip: s(v, "strip")
@@ -5269,6 +5287,30 @@ mod tests {
         assert!(dir.join("wago-marking.csv").exists());
         assert!(call(&mut a, "export", json!({"format": "wago-marking", "lang": "fr"})).is_err());
         assert!(call(&mut a, "export", json!({"format": "wago-marking", "kinds": ["lamps"]})).is_err());
+        // A member that is not a string, or a value that is not a list, is refused by name.
+        let err = call(
+            &mut a,
+            "export",
+            json!({"format": "wago-marking", "kinds": ["terminals", 42]}),
+        )
+        .unwrap_err();
+        assert!(err.contains("`kinds` holds 42"), "{err}");
+        let err = call(
+            &mut a,
+            "export",
+            json!({"format": "wago-marking", "lines": ["marker", null]}),
+        )
+        .unwrap_err();
+        assert!(err.contains("`lines` holds null"), "{err}");
+        let err = call(
+            &mut a,
+            "export",
+            json!({"format": "wago-marking", "kinds": "terminals"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("`kinds` must be a list"), "{err}");
+        let err = call(&mut a, "export", json!({"format": "wago-marking", "lines": {"a": 1}})).unwrap_err();
+        assert!(err.contains("`lines` must be a list"), "{err}");
 
         let project_dir = a.open.as_ref().unwrap().dir.clone();
         a.open.as_mut().unwrap().project.pages[1].title = "Pumps".into();
