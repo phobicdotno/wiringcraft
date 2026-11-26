@@ -2593,9 +2593,28 @@ fn run(cli: Cli) -> Res<()> {
             let before = snapshot_project(dir, &[], &[])?;
             let (symbol_path, symbol_before) = vendored_bytes(dir, ItemKind::Symbol, &symbol_id)?;
             // A link would be replaced by a plain file, and a failed save could not put it back.
-            if std::fs::symlink_metadata(&symbol_path).is_ok_and(|m| m.file_type().is_symlink()) {
+            if is_link(&symbol_path)? {
                 return Err(format!(
                     "the file of symbol {symbol_id} is a link; box-edit does not replace it (copy its target over it first)"
+                ));
+            }
+            // The same for the project's own files (pages, panels, lock, ...): both the save and
+            // the rollback would put a plain file where the link was (#614), so refuse before any
+            // write.
+            let mut linked: Vec<String> = Vec::new();
+            for (path, _) in &before {
+                if is_link(path)? {
+                    linked.push(escape_field(&path.display().to_string()));
+                }
+            }
+            if !linked.is_empty() {
+                return Err(format!(
+                    "{} a link; box-edit does not replace project files that are links (copy each target over its link first)",
+                    if linked.len() == 1 {
+                        format!("{} is", linked[0])
+                    } else {
+                        format!("{} are", linked.join(", "))
+                    }
                 ));
             }
             store::write_vendored_symbol(dir, &new).map_err(e)?;
@@ -4453,6 +4472,16 @@ fn comment_cmd(dir: &Path, cc: CommentCmd) -> Res<()> {
 /// dispatch keep large frames in debug builds, and Windows gives the main thread only 1 MiB,
 /// which overflowed there once one more import command was added (#312).
 const STACK: usize = 16 * 1024 * 1024;
+
+/// Whether `path` is a symbolic link. A missing file is not one; any other error reading its
+/// metadata is returned with the path, so a check that cannot tell refuses instead of guessing.
+fn is_link(path: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) => Ok(m.file_type().is_symlink()),
+        Err(x) if x.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(x) => Err(format!("{}: {x}", escape_field(&path.display().to_string()))),
+    }
+}
 
 fn main() -> ExitCode {
     // Parsing runs there too: clap's derived parser builds every subcommand on the stack.
@@ -8607,6 +8636,62 @@ mod tests {
             assert_eq!(std::fs::read_link(&path).unwrap(), target);
             assert_eq!(std::fs::read(&target).unwrap(), before);
         }
+    }
+
+    /// A missing file is not a link; a path whose metadata cannot be read for another reason is
+    /// an error naming it, not "not a link".
+    #[cfg(unix)]
+    #[test]
+    fn is_link_tells_missing_from_unreadable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("plain.json");
+        std::fs::write(&file, "{}").unwrap();
+        let link = tmp.path().join("link.json");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert_eq!(is_link(&file), Ok(false));
+        assert_eq!(is_link(&link), Ok(true));
+        assert_eq!(is_link(&tmp.path().join("missing.json")), Ok(false));
+        // A plain file used as a folder: not a "not found" error.
+        let err = is_link(&file.join("inside.json")).unwrap_err();
+        assert!(err.contains("inside.json"), "{err}");
+    }
+
+    /// A page file that is a link is refused before anything is written, so neither the save
+    /// nor a rollback replaces the link with a plain file (#614).
+    #[cfg(unix)]
+    #[test]
+    fn box_edit_refuses_a_linked_page_file_before_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        cli(
+            &dir,
+            &["box", "p1", "--at", "40,40", "--size", "20,10", "--pin", "1:left:5"],
+        )
+        .unwrap();
+        let page = dir.join(store::PAGES_DIR).join(format!("p1{}", store::PAGE_SUFFIX));
+        let target = tmp.path().join("p1-elsewhere.json");
+        std::fs::rename(&page, &target).unwrap();
+        std::os::unix::fs::symlink(&target, &page).unwrap();
+        let page_before = std::fs::read(&target).unwrap();
+        let symbol_before = store::read_vendored_symbol(&dir, "box.p1.s1").unwrap();
+        let lock_before = std::fs::read(dir.join(store::LOCK_FILE)).unwrap();
+
+        let err = cli(&dir, &["box-edit", "p1", "s1", "--size", "30,10"]).unwrap_err();
+        assert!(err.contains("link"), "{err}");
+        assert!(err.contains(&format!("p1{}", store::PAGE_SUFFIX)), "{err}");
+        assert!(std::fs::symlink_metadata(&page).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_link(&page).unwrap(), target);
+        assert_eq!(std::fs::read(&target).unwrap(), page_before);
+        assert_eq!(store::read_vendored_symbol(&dir, "box.p1.s1").unwrap(), symbol_before);
+        assert_eq!(std::fs::read(dir.join(store::LOCK_FILE)).unwrap(), lock_before);
+
+        // With the link replaced by its target's bytes the same edit goes through.
+        std::fs::remove_file(&page).unwrap();
+        std::fs::copy(&target, &page).unwrap();
+        cli(&dir, &["box-edit", "p1", "s1", "--size", "30,10"]).unwrap();
+        assert_ne!(store::read_vendored_symbol(&dir, "box.p1.s1").unwrap(), symbol_before);
     }
 
     #[test]
