@@ -18,7 +18,9 @@ on:
 permissions:
   contents: read
   issues: write
-  pull-requests: read # to list open pull requests
+  # To list open pull requests and post the bot's notes on them (a comment on a pull request needs
+  # pull-requests: write). Safe with pull_request_target: no pull request code is checked out or run.
+  pull-requests: write
 
 # One queue for every run in the repository: commands, pull requests and the sweep can all change
 # the same issue, so they never run at the same time. GitHub keeps only one waiting run and cancels
