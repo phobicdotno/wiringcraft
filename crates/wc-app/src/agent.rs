@@ -10950,7 +10950,7 @@ mod tests {
         };
         let ed = &mut a.ed;
         let _ = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| crate::panel_view::show(ui, open, ed, 0, 1.0));
+            egui::CentralPanel::default().show(ctx, |ui| crate::panel_view::show(ui, open, ed, 0, 1.0, true));
         });
     }
 
