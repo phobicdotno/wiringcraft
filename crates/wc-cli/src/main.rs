@@ -445,8 +445,9 @@ enum Cmd {
     /// terminal drawn nowhere, one cable core on two connections, shorted potentials, a wire
     /// number used on more than one connection or one connection carrying several wire
     /// numbers, panel layouts with overlapping devices, devices sticking out of the plate or no
-    /// longer in the project, devices without a part, then the house rules in each library
-    /// source's `rules.toml`, less the ones `rules_off` turns off, and last the project's own
+    /// longer in the project, parts missing from the project's library copy, devices without a
+    /// part, then the house rules in each library source's `rules.toml`, less the ones
+    /// `rules_off` turns off, and last the project's own
     /// `[[rule]]` tables in `project.toml` (a cable on every motor, a tag pattern, at most N
     /// wires on a terminal).
     /// Exits with an error when an error is found, so it can guard a commit or a CI job.
@@ -3956,13 +3957,13 @@ fn run(mut cli: Cli) -> Res<()> {
         Cmd::Check { all } => {
             let p = load(dir)?;
             let (symbols, _) = store::vendored_symbols(dir, &p);
-            let parts = vendored_parts(dir, &p);
+            let (parts, unreadable) = vendored_parts_and_unreadable(dir, &p);
             let inputs = wc_report::Inputs {
                 project: &p,
                 symbols: &symbols,
                 parts: &parts,
             };
-            let found = wc_report::check_with(&inputs, &wc_library::library_rules(dir, &p));
+            let found = wc_report::check_with_unreadable(&inputs, &wc_library::library_rules(dir, &p), &unreadable);
             let count = |s: wc_report::Severity| found.iter().filter(|f| f.severity == s).count();
             for f in found.iter().filter(|f| all || f.severity != wc_report::Severity::Note) {
                 let page = f
@@ -6110,6 +6111,33 @@ fn vendored_parts(dir: &Path, p: &wc_core::Project) -> std::collections::BTreeMa
         .into_iter()
         .filter_map(|id| store::read_vendored_part(dir, &id).ok().map(|part| (id, part)))
         .collect()
+}
+
+/// [`vendored_parts`], and the used parts whose copy is there but cannot be read, by id with the
+/// reason: the project check reports those as unreadable, not as missing.
+fn vendored_parts_and_unreadable(
+    dir: &Path,
+    p: &wc_core::Project,
+) -> (
+    std::collections::BTreeMap<String, wc_core::Part>,
+    std::collections::BTreeMap<String, String>,
+) {
+    let mut parts = std::collections::BTreeMap::new();
+    let mut unreadable = std::collections::BTreeMap::new();
+    for id in p.used_parts() {
+        match store::read_vendored_part(dir, &id) {
+            Ok(part) => {
+                parts.insert(id, part);
+            }
+            Err(err) => {
+                let there = store::vendor_path(dir, ItemKind::Part, &id).is_ok_and(|f| f.exists());
+                if there {
+                    unreadable.insert(id, err.to_string());
+                }
+            }
+        }
+    }
+    (parts, unreadable)
 }
 
 /// [`vendored_parts`], with a warning naming each used part that cannot be read and why, so
