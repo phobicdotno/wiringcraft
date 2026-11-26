@@ -622,6 +622,8 @@ impl App {
                 return;
             }
             self.ed = Editor::default();
+            // The fresh editor keeps the user's hidden and locked layers.
+            self.apply_layers();
             self.panels.reset();
             self.dialog = None;
             self.prefs.remember(joined.dir.clone());
@@ -772,6 +774,9 @@ impl App {
                     self.dialog = None;
                 }
                 self.ed = Editor::default();
+                // The fresh editor keeps the user's hidden and locked layers (`prefs` is the
+                // user's list here: `self.prefs` may be taken out while this runs).
+                self.ed.layers = prefs.layers.clone();
                 self.panels.reset();
                 self.ed.message = format!("Opened {}", dir.display());
                 self.open = Some(o);

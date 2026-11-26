@@ -1696,9 +1696,38 @@ impl App {
                     "rotate_items" => open.rotate_many(page, &sel),
                     "mirror_items" => open.mirror_many(page, &sel),
                     _ => {
+                        // What a hidden or locked layer keeps off the canvas is not selected
+                        // (nor said to be): only the rest is.
+                        let layers = &self.ed.layers;
+                        let (kept, refused): (Vec<_>, Vec<_>) =
+                            ids.iter().zip(sel).partition(|(_, s)| layers.may_select(s));
+                        if kept.is_empty() {
+                            let why = refused
+                                .first()
+                                .and_then(|(_, s)| layers.unselectable_note(s))
+                                .unwrap_or_default()
+                                .replacen("The hit is", "They are", 1);
+                            return Err(format!(
+                                "Nothing selected: {} cannot be selected. {why}",
+                                ids.join(", ")
+                            ));
+                        }
+                        let skipped = if refused.is_empty() {
+                            String::new()
+                        } else {
+                            let names: Vec<&str> = refused.iter().map(|(id, _)| id.as_str()).collect();
+                            let why = refused
+                                .first()
+                                .and_then(|(_, s)| layers.unselectable_note(s))
+                                .unwrap_or_default()
+                                .replacen("The hit is", "Those are", 1);
+                            format!(" Not selected: {}. {why}", names.join(", "))
+                        };
+                        let names: Vec<&str> = kept.iter().map(|(id, _)| id.as_str()).collect();
+                        let msg = format!("Selected {} on the user's screen.{skipped}", names.join(", "));
                         self.go_to(page);
-                        self.ed.selection = sel;
-                        return Ok(format!("Selected {} on the user's screen.", ids.join(", ")));
+                        self.ed.selection = kept.into_iter().map(|(_, s)| s).collect();
+                        return Ok(msg);
                     }
                 }
                 Ok(format!("Done: {}.", ids.join(", ")))
@@ -6281,6 +6310,32 @@ mod tests {
     }
 
     #[test]
+    fn a_guests_pasted_drawing_on_a_layer_hidden_or_locked_meanwhile_comes_back_unselected() {
+        use crate::layers::Layer;
+        for hide in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (_dir, mut a, mut h, mut host_open) = guest_window(tmp.path());
+            let line = paste_line(&mut a);
+            a.sync_session_now(false);
+            assert!(a.ed.waiting_graphics.is_some(), "the paste waits for the host");
+            // While it waits, the user hides or locks the drawings.
+            if hide {
+                a.prefs.layers.set_shown(Layer::Drawings, false);
+            } else {
+                a.prefs.layers.set_locked(Layer::Drawings, true);
+            }
+            a.apply_layers();
+            h.frame(Some(&mut host_open), Some("p0002".into()), false);
+            a.sync_session_now(false);
+            assert_eq!(graphics3(&a), vec![line], "hide={hide}");
+            assert!(a.ed.selection.is_empty(), "hide={hide}: {:?}", a.ed.selection);
+            assert!(a.ed.waiting_graphics.is_none(), "hide={hide}");
+        }
+        // Shown and unlocked, the same paste comes back selected
+        // (`a_guests_pasted_drawing_is_selected_again_once_the_host_accepts_it`).
+    }
+
+    #[test]
     fn a_selection_made_while_a_paste_waits_is_kept() {
         let tmp = tempfile::tempdir().unwrap();
         let (_dir, mut a, mut h, mut host_open) = guest_window(tmp.path());
@@ -10128,6 +10183,13 @@ mod tests {
             json!({"page": "p0002", "shape": {"kind": "text", "at": {"x": 30, "y": 30}, "text": "Hello"}}),
         )
         .unwrap();
+        call(
+            &mut a,
+            "place_symbol",
+            json!({"symbol": "wc.coil", "x": 50, "y": 50, "page": "2"}),
+        )
+        .unwrap();
+        let k = page2(&a).symbols[0].id.clone();
         for hide in [true, false] {
             if hide {
                 a.prefs.layers.set_shown(Layer::Drawings, false);
@@ -10135,13 +10197,53 @@ mod tests {
                 a.prefs.layers.set_locked(Layer::Drawings, true);
             }
             a.apply_layers();
-            let _ = call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]}));
+            // Asked for the drawing alone: refused, naming the layer and why.
+            let e = call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap_err();
             assert!(!a.ed.selection.contains(&Selection::Graphic(0)), "hide={hide}");
+            let state = if hide { "hidden" } else { "locked" };
+            assert!(e.contains("g0") && e.contains(state) && e.contains("Drawings"), "{e}");
+            assert!(!e.contains("Selected"), "{e}");
+            // Asked for it with a symbol: the symbol is selected and only it is named so.
+            let r = call(&mut a, "select_items", json!({"page": "p0002", "ids": [k, "g0"]})).unwrap();
+            assert_eq!(a.ed.selection, vec![Selection::Symbol(k.clone())], "hide={hide}");
+            assert!(r.starts_with(&format!("Selected {k} on the user's screen.")), "{r}");
+            assert!(r.contains("Not selected: g0") && r.contains(state), "{r}");
             a.prefs.layers = Default::default();
             a.apply_layers();
         }
-        call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap();
+        let r = call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap();
         assert!(a.ed.selection.contains(&Selection::Graphic(0)));
+        assert_eq!(r, "Selected g0 on the user's screen.");
+    }
+
+    #[test]
+    fn a_project_opened_by_the_assistant_keeps_the_hidden_and_locked_layers() {
+        use crate::layers::Layer;
+        let (_tmp, mut a) = app(vec![]);
+        call(
+            &mut a,
+            "add_graphic",
+            json!({"page": "p0002", "shape": {"kind": "text", "at": {"x": 30, "y": 30}, "text": "Hello"}}),
+        )
+        .unwrap();
+        a.open.as_mut().unwrap().save().unwrap();
+        let dir = a.open.as_ref().unwrap().dir.clone();
+        for hide in [true, false] {
+            if hide {
+                a.prefs.layers.set_shown(Layer::Drawings, false);
+            } else {
+                a.prefs.layers.set_locked(Layer::Drawings, true);
+            }
+            // The open comes before the canvas is drawn again.
+            call(&mut a, "open_project", json!({"path": dir})).unwrap();
+            assert_eq!(a.ed.layers, a.prefs.layers, "hide={hide}");
+            assert!(call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).is_err());
+            assert!(a.ed.selection.is_empty(), "hide={hide}");
+            a.prefs.layers = Default::default();
+        }
+        call(&mut a, "open_project", json!({"path": dir})).unwrap();
+        call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap();
+        assert_eq!(a.ed.selection, vec![Selection::Graphic(0)]);
     }
 
     #[test]
