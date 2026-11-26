@@ -7359,6 +7359,18 @@ mod tests {
     }
 
     #[test]
+    fn the_pdf_export_of_a_project_with_nothing_to_print_saves_no_file() {
+        // No pages and no report rows: no sheet to print, so no PDF without pages (#833).
+        let (_tmp, mut a) = app(vec![]);
+        a.open.as_mut().unwrap().project.pages.clear();
+        let open = a.open.as_ref().unwrap();
+        let m = crate::export_pdf(open);
+        assert!(m.starts_with("Export failed:"), "{m}");
+        assert!(m.contains(wc_pdf::NOTHING_TO_EXPORT), "{m}");
+        assert!(!crate::export_file(open, "pdf").exists());
+    }
+
+    #[test]
     fn the_assistant_exports_the_wago_lists_and_a_pdf_in_another_language() {
         let (_tmp, mut a) = app(vec![]);
         let dir = a.open.as_ref().unwrap().dir.join("export");
