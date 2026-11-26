@@ -487,11 +487,19 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "macros",
-            "Macros (saved groups of symbols, wires and drawings): list them, insert one on a page (its top-left corner at x, y), or save items from a page as a new project macro. A macro with value sets (variants, such as sizes of a motor starter) needs value_set when inserted; list shows them.",
+            "Macros (saved groups of symbols, wires and drawings): list them, get one's placeholders and value sets, insert one on a page (its top-left corner at x, y), save items from a page as a new project macro, or edit a project macro's description, placeholders and value sets. A macro with value sets (variants, such as sizes of a motor starter) needs value_set when inserted; list shows them. Placeholders are written {{name}} in the macro's texts.",
             json!({
-                "action": {"type": "string", "enum": ["list", "insert", "save"]},
+                "action": {"type": "string", "enum": ["list", "get", "insert", "save", "edit"]},
                 "name": {"type": "string"}, "description": {"type": "string"},
                 "value_set": {"type": "string", "description": "insert: which of the macro's value sets fills its placeholders."},
+                "placeholders": {"type": "array", "description": "edit: all the macro's placeholders, in place of the ones it has (left out keeps them). Give was to rename one: its uses in the macro's texts are renamed too.", "items": {"type": "object", "properties": {
+                    "name": {"type": "string"}, "was": {"type": "string"},
+                    "description": {"type": "string"}, "default": {"type": "string"}
+                }, "required": ["name"]}},
+                "value_sets": {"type": "array", "description": "edit: all the macro's value sets, in place of the ones it has (left out keeps them). values maps a placeholder's name to its value; a placeholder left out uses its default.", "items": {"type": "object", "properties": {
+                    "name": {"type": "string"}, "description": {"type": "string"},
+                    "values": {"type": "object", "additionalProperties": {"type": "string"}}
+                }, "required": ["name"]}},
                 "ids": ids_arg(), "page": page_arg(),
                 "x": {"type": "number"}, "y": {"type": "number"}
             }),
@@ -2961,7 +2969,11 @@ impl App {
 
     fn tool_macros(&mut self, v: &Value) -> Result<String, String> {
         let action = need_s(v, "action")?;
-        let page = self.page_of(v, "page")?;
+        // Only inserting and saving work on a page: the others work in a project without pages.
+        let page = match action {
+            "insert" | "save" => self.page_of(v, "page")?,
+            _ => 0,
+        };
         let open = need_open(self.open.as_mut())?;
         match action {
             "list" => {
@@ -2974,13 +2986,100 @@ impl App {
                     .collect();
                 Ok(pretty(&json!(list)))
             }
+            "get" => {
+                let entry = find_macro(open, need_s(v, "name")?)?;
+                let m = wc_core::macros::read_macro(&entry.path).map_err(|e| e.to_string())?;
+                Ok(pretty(&json!({
+                    "name": m.name, "description": m.description, "source": entry.source,
+                    "placeholders": m.placeholders, "value_sets": m.value_sets,
+                    "used_in_texts": m.used_placeholders(), "error": entry.error
+                })))
+            }
+            "edit" => {
+                let entry = find_macro(open, need_s(v, "name")?)?;
+                if !entry.project {
+                    return Err(format!(
+                        "{} belongs to the {} library; only the project's own macros are edited here.",
+                        entry.name, entry.source
+                    ));
+                }
+                let mut form = crate::macro_form::Form::open(&entry.path)?;
+                if let Some(d) = s(v, "description") {
+                    form.description = d.to_owned();
+                }
+                // A field left out is empty; one given as something other than a text is a
+                // mistake, not a request to clear it.
+                let text = |o: &Value, what: &str, field: &str| match o.get(field) {
+                    None => Ok(String::new()),
+                    Some(Value::String(t)) => Ok(t.clone()),
+                    Some(other) => Err(format!("A {what}'s {field} is a text, not {other}.")),
+                };
+                if let Some(list) = v.get("placeholders") {
+                    let rows: Vec<crate::macro_form::PlaceholderRow> = list
+                        .as_array()
+                        .ok_or("placeholders is a list.")?
+                        .iter()
+                        .map(|p| {
+                            Ok(crate::macro_form::PlaceholderRow {
+                                was: text(p, "placeholder", "was")?,
+                                name: text(p, "placeholder", "name")?,
+                                description: text(p, "placeholder", "description")?,
+                                default: text(p, "placeholder", "default")?,
+                            })
+                        })
+                        .collect::<Result<_, String>>()?;
+                    // Two rows renaming one placeholder would both take its values.
+                    let mut renamed = std::collections::BTreeSet::new();
+                    for r in rows.iter().filter(|r| !r.was.trim().is_empty()) {
+                        if !renamed.insert(wc_core::macros::key(&r.was)) {
+                            return Err(format!("Placeholder {} is renamed by two rows.", r.was.trim()));
+                        }
+                    }
+                    form.set_placeholders(rows);
+                }
+                if let Some(list) = v.get("value_sets") {
+                    let mut sets = Vec::new();
+                    for set in list.as_array().ok_or("value_sets is a list.")? {
+                        let mut values = std::collections::BTreeMap::new();
+                        // Left out, the set uses the defaults; given, it must be an object, or
+                        // the set's values would be cleared by mistake.
+                        let given = match set.get("values") {
+                            None => None,
+                            Some(Value::Object(o)) => Some(o),
+                            Some(other) => {
+                                return Err(format!(
+                                    "The values of a value set are an object of placeholder names to texts, not {other}."
+                                ));
+                            }
+                        };
+                        for (k, val) in given.into_iter().flatten() {
+                            let val = match val {
+                                Value::String(t) => t.clone(),
+                                Value::Number(n) => n.to_string(),
+                                other => return Err(format!("The value of {k} is not a text: {other}.")),
+                            };
+                            values.insert(k.clone(), val);
+                        }
+                        sets.push(crate::macro_form::NamedSet {
+                            name: text(set, "value set", "name")?,
+                            description: text(set, "value set", "description")?,
+                            values,
+                        });
+                    }
+                    form.set_value_sets(sets)?;
+                }
+                let path = form.save()?;
+                let m = wc_core::macros::read_macro(&path).map_err(|e| e.to_string())?;
+                let names = |v: Vec<&str>| if v.is_empty() { "none".to_owned() } else { v.join(", ") };
+                Ok(format!(
+                    "Saved {}: placeholders {}; value sets {}.",
+                    m.name,
+                    names(m.placeholders.iter().map(|p| p.name.as_str()).collect()),
+                    names(m.value_sets.iter().map(|v| v.name.as_str()).collect())
+                ))
+            }
             "insert" => {
-                let name = need_s(v, "name")?;
-                let entry = open
-                    .macros()
-                    .into_iter()
-                    .find(|m| m.name.eq_ignore_ascii_case(name) || stem(&m.path).eq_ignore_ascii_case(name))
-                    .ok_or_else(|| format!("No macro {name:?}."))?;
+                let entry = find_macro(open, need_s(v, "name")?)?;
                 let anchor = wc_core::macros::read_macro(&entry.path)
                     .map_err(|e| e.to_string())?
                     .anchor;
@@ -3384,6 +3483,15 @@ fn stem(p: &Path) -> String {
     p.file_stem()
         .map(|s| s.to_string_lossy().trim_end_matches(".macro").to_owned())
         .unwrap_or_default()
+}
+
+/// The macro named `name` (its name or file name, without regard to case), the project's own
+/// before a library's.
+fn find_macro(open: &Open, name: &str) -> Result<crate::state::MacroEntry, String> {
+    open.macros()
+        .into_iter()
+        .find(|m| m.name.eq_ignore_ascii_case(name) || stem(&m.path).eq_ignore_ascii_case(name))
+        .ok_or_else(|| format!("No macro {name:?}."))
 }
 
 /// Why the `wiringcraft` command `args` does not run on the project folder `dir` while others
@@ -5943,6 +6051,186 @@ mod tests {
                 "{set} is inserted with {text}"
             );
         }
+    }
+
+    #[test]
+    fn the_assistant_edits_a_project_macros_placeholders_and_value_sets_as_the_dialog_saves_them() {
+        let (tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        let id = open.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let mut clip = open.copy(1, &[Selection::Symbol(id)]);
+        clip.graphics.push(wc_core::Shape::Text {
+            at: Point::new(20.0, 40.0),
+            text: "{{kW}} kW".into(),
+            height: 2.5,
+            align: Default::default(),
+            angle: 0.0,
+        });
+        let path = open.save_macro(&clip, "Starter", "").unwrap();
+
+        // The dialog's checks apply: a placeholder declared twice is refused, the file kept.
+        let before = std::fs::read(&path).unwrap();
+        let err = call(
+            &mut a,
+            "macros",
+            json!({"action": "edit", "name": "starter", "placeholders": [{"name": "kW"}, {"name": "KW"}]}),
+        )
+        .unwrap_err();
+        assert!(err.contains("declared twice"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let r = call(
+            &mut a,
+            "macros",
+            json!({
+                "action": "edit", "name": "Starter", "description": "Motor starter",
+                "placeholders": [{"name": "kW", "description": "Motor power", "default": "1.5"}],
+                "value_sets": [
+                    {"name": "Small", "values": {"kw": "0.75"}},
+                    {"name": "Large", "description": "Big pump", "values": {"kW": 3}},
+                    {"name": "Default"}
+                ]
+            }),
+        )
+        .unwrap();
+        assert!(r.contains("value sets Small, Large, Default"), "{r}");
+        let got: Value =
+            serde_json::from_str(&call(&mut a, "macros", json!({"action": "get", "name": "Starter"})).unwrap())
+                .unwrap();
+        assert_eq!(got["description"], "Motor starter");
+        assert_eq!(got["placeholders"][0]["default"], "1.5");
+        assert_eq!(got["value_sets"][1]["values"]["kW"], "3");
+        assert_eq!(got["value_sets"][1]["description"], "Big pump");
+        assert_eq!(got["used_in_texts"], json!(["kW"]));
+        assert!(got["error"].is_null());
+
+        // Renamed by `was`, the placeholder is renamed in the text and keeps its values, as in
+        // the dialog; the value sets left out are kept.
+        call(
+            &mut a,
+            "macros",
+            json!({"action": "edit", "name": "Starter", "placeholders": [{"name": "power", "was": "kW"}]}),
+        )
+        .unwrap();
+        let m = wc_core::macros::read_macro(&path).unwrap();
+        assert_eq!(m.used_placeholders(), ["power"]);
+        assert_eq!(m.description, "Motor starter");
+        assert_eq!(m.value_set("small").unwrap().values["power"], "0.75");
+        assert!(m.value_set("default").unwrap().values.is_empty());
+        // A value for a placeholder the macro does not declare is refused.
+        let err = call(
+            &mut a,
+            "macros",
+            json!({"action": "edit", "name": "Starter", "value_sets": [{"name": "X", "values": {"kW": "1"}}]}),
+        )
+        .unwrap_err();
+        assert!(err.contains("kW"), "{err}");
+        // `values` given as something other than an object is refused rather than read as
+        // left out (which would clear the set's values), and two values for one placeholder
+        // that differ only in case are refused rather than one of them dropped: the file is kept.
+        let before = std::fs::read(&path).unwrap();
+        for values in [json!([]), json!("3"), json!(null)] {
+            let err = call(
+                &mut a,
+                "macros",
+                json!({"action": "edit", "name": "Starter", "value_sets": [{"name": "Small", "values": values}]}),
+            )
+            .unwrap_err();
+            assert!(err.contains("object"), "{err}");
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+        let err = call(
+            &mut a,
+            "macros",
+            json!({"action": "edit", "name": "Starter",
+                   "value_sets": [{"name": "Small", "values": {"POWER": "0.75", "power": "3"}}]}),
+        )
+        .unwrap_err();
+        assert!(err.contains("POWER") && err.contains("power"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        // A placeholder field given as something other than a text is refused rather than
+        // cleared: the file is kept.
+        let err = call(
+            &mut a,
+            "macros",
+            json!({"action": "edit", "name": "Starter", "placeholders": [{"name": "power", "was": "power", "default": 42}]}),
+        )
+        .unwrap_err();
+        assert!(err.contains("default"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        // So is a value set's description given as something other than a text, and two rows
+        // renaming one placeholder (which would both take its values).
+        let err = call(
+            &mut a,
+            "macros",
+            json!({"action": "edit", "name": "Starter", "value_sets": [{"name": "Small", "description": 5}]}),
+        )
+        .unwrap_err();
+        assert!(err.contains("description"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let err = call(
+            &mut a,
+            "macros",
+            json!({"action": "edit", "name": "Starter",
+                   "placeholders": [{"name": "a", "was": "power"}, {"name": "b", "was": "POWER"}]}),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_lowercase().contains("placeholder power is renamed by two rows"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        // Renamed, a placeholder keeps its values; a new one with its old name is new, with
+        // its own default and none of the renamed one's values.
+        call(
+            &mut a,
+            "macros",
+            json!({"action": "edit", "name": "Starter",
+                   "placeholders": [{"name": "watts", "was": "power"}, {"name": "power", "default": "9"}]}),
+        )
+        .unwrap();
+        let m = wc_core::macros::read_macro(&path).unwrap();
+        assert_eq!(m.used_placeholders(), ["watts"]);
+        let small = &m.value_set("small").unwrap().values;
+        assert_eq!(small.get("watts").map(String::as_str), Some("0.75"));
+        assert_eq!(small.get("power"), None);
+        assert_eq!(m.placeholders[1].default, "9");
+
+        // Listing, reading and editing macros needs no page.
+        a.open.as_mut().unwrap().project.pages.clear();
+        assert!(
+            call(&mut a, "macros", json!({"action": "list"}))
+                .unwrap()
+                .contains("Starter")
+        );
+        assert!(call(&mut a, "macros", json!({"action": "get", "name": "Starter"})).is_ok());
+        call(
+            &mut a,
+            "macros",
+            json!({"action": "edit", "name": "Starter", "description": "Starter"}),
+        )
+        .unwrap();
+        let err = call(&mut a, "macros", json!({"action": "insert", "name": "Starter"})).unwrap_err();
+        assert!(err.contains("no pages"), "{err}");
+
+        // A library's macro is not edited.
+        let lib = tmp.path().join("lib");
+        wc_core::macros::write_macro(&lib, "lamp", &m).unwrap();
+        let open = a.open.as_mut().unwrap();
+        open.project.meta.libraries.push(wc_core::project::LibrarySource {
+            name: "parts".into(),
+            kind: "folder".into(),
+            location: lib.display().to_string(),
+            reference: None,
+        });
+        let err = call(
+            &mut a,
+            "macros",
+            json!({"action": "edit", "name": "lamp", "description": "x"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("library"), "{err}");
     }
 
     #[test]
