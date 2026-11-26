@@ -392,8 +392,9 @@ fn shape(
                 // QElectroTech 0.8+ saves corner radii as `rx`/`ry` in absolute element units
                 // (it draws them with Qt's `drawRoundedRect` in absolute size mode), and Qt keeps
                 // each one to at most half the side, so they are clamped the same way here.
-                let rx = n("rx").unwrap_or(0.0).abs().min((x1 - x0) / 2.0);
-                let ry = n("ry").unwrap_or(0.0).abs().min((y1 - y0) / 2.0);
+                // A radius of 0 or less means no rounding, as in Qt.
+                let rx = n("rx").unwrap_or(0.0).min((x1 - x0) / 2.0);
+                let ry = n("ry").unwrap_or(0.0).min((y1 - y0) / 2.0);
                 if rx > 0.0 && ry > 0.0 {
                     let points = rounded_rect_points(x0, y0, x1, y1, rx, ry)
                         .into_iter()
@@ -743,6 +744,7 @@ mod tests {
 <rect x="0" y="20" width="20" height="10" style="filling:none"/>
 <rect x="0" y="40" width="20" height="10" rx="0" ry="0" style="filling:none"/>
 <rect x="0" y="60" width="4" height="10" rx="50" ry="3" style="filling:black"/>
+<rect x="0" y="80" width="20" height="10" rx="-2" ry="2" style="filling:none"/>
 <terminal x="0" y="0" orientation="n"/>
 </description></definition>"#;
         let (imp, _) = element(el, "qet.rounded", 1.0)?;
@@ -802,7 +804,15 @@ mod tests {
             line.iter()
                 .any(|p| (p.x - 2.0).abs() < 1e-9 && (p.y - 60.0).abs() < 1e-9)
         );
-        assert_eq!(g.len(), 5);
+        // A negative radius means no rounding, as in Qt.
+        assert_eq!(
+            g[5],
+            Shape::Rect {
+                min: Point::new(0.0, 80.0),
+                max: Point::new(20.0, 90.0)
+            }
+        );
+        assert_eq!(g.len(), 6);
         Ok(())
     }
 
