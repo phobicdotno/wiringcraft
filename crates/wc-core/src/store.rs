@@ -153,11 +153,14 @@ fn folder_of(path: &Path) -> PathBuf {
 fn synced<T>(result: Result<T>, folders: &Folders) -> Result<T> {
     let mut outcome = Ok(());
     for dir in folders {
+        // A debt another thread notes for this folder while it is being synced is from a rename
+        // this sync may not cover: only debts noted before the sync are paid by it.
+        let before = OWED_NOTED.load(std::sync::atomic::Ordering::SeqCst);
         let raw = sync_folder(dir);
         // A folder that is not there has no entries left to keep.
         let gone = raw.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
         let one = folder_synced(dir, raw);
-        settle(dir, one.is_err() && !gone);
+        settle(dir, one.is_err() && !gone, before);
         if outcome.is_ok() {
             outcome = one;
         }
@@ -175,9 +178,18 @@ fn synced<T>(result: Result<T>, folders: &Folders) -> Result<T> {
 /// It is empty unless a folder sync failed, and then a write costs one look at it and no sync.
 /// It lasts as long as the process: a failure the process did not get to try again was reported
 /// as a failed write, and is not known to the next process.
-static OWED: std::sync::Mutex<BTreeMap<PathBuf, PathBuf>> = std::sync::Mutex::new(BTreeMap::new());
+static OWED: std::sync::Mutex<BTreeMap<PathBuf, Debt>> = std::sync::Mutex::new(BTreeMap::new());
 
-fn owed() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, PathBuf>> {
+/// How many debts were noted so far; each debt keeps the count it was noted at.
+static OWED_NOTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A folder owed a sync: the path it was synced under, and when it was noted ([`OWED_NOTED`]).
+struct Debt {
+    spelled: PathBuf,
+    noted: u64,
+}
+
+fn owed() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, Debt>> {
     OWED.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
@@ -191,13 +203,24 @@ fn resolved(dir: &Path) -> PathBuf {
     dir.canonicalize().unwrap_or_else(|_| spelled(dir))
 }
 
-/// Note whether the folder `dir` is owed a sync after an attempt.
-fn settle(dir: &Path, failed: bool) {
+/// Note whether the folder `dir` is owed a sync after an attempt that began when `before` debts
+/// had been noted. A sync that went through pays only a debt noted before it began.
+fn settle(dir: &Path, failed: bool, before: u64) {
     let mut owed = owed();
     if failed {
-        owed.entry(resolved(dir)).or_insert_with(|| spelled(dir));
+        let noted = OWED_NOTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        owed.insert(
+            resolved(dir),
+            Debt {
+                spelled: spelled(dir),
+                noted,
+            },
+        );
     } else if !owed.is_empty() {
-        owed.remove(&resolved(dir));
+        let key = resolved(dir);
+        if owed.get(&key).is_some_and(|d| d.noted <= before) {
+            owed.remove(&key);
+        }
     }
 }
 
@@ -213,8 +236,8 @@ fn add_owed(at: &Path, folders: &mut Folders) {
     let (real, given) = (resolved(at), spelled(at));
     let listed: Vec<PathBuf> = folders.iter().map(|f| resolved(f)).collect();
     let near = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
-    for (dir, as_given) in owed.iter() {
-        if (near(dir, &real) || near(as_given, &given)) && !listed.contains(dir) {
+    for (dir, debt) in owed.iter() {
+        if (near(dir, &real) || near(&debt.spelled, &given)) && !listed.contains(dir) {
             folders.insert(dir.clone());
         }
     }
@@ -1663,5 +1686,21 @@ mod staging_tests {
         taken(&seen);
         assert!(write_if_changed(&root.join("b.json"), "{}\n").unwrap());
         assert_eq!(folders_of(&seen), [root]);
+    }
+
+    #[test]
+    fn a_sync_does_not_pay_a_debt_noted_while_it_ran() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = resolved(dir.path());
+        let is_owed = || owed().contains_key(&root);
+        // A sync begins; while it runs, another write's sync of the folder fails and is noted.
+        let before = OWED_NOTED.load(std::sync::atomic::Ordering::SeqCst);
+        settle(&root, true, before);
+        // The first sync went through, but may not have covered the other write's rename.
+        settle(&root, false, before);
+        assert!(is_owed());
+        // A sync that began after the debt was noted pays it.
+        settle(&root, false, OWED_NOTED.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!is_owed());
     }
 }
