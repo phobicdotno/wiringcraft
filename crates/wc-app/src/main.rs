@@ -7467,6 +7467,51 @@ mod nudge_tests {
         );
     }
 
+    /// A black box form changed and not applied is applied by Ctrl+S: the project read back
+    /// from disk has the new point name (#932).
+    #[test]
+    fn ctrl_s_saves_a_black_box_form_not_applied() {
+        use wc_core::{BoxPin, BoxSide};
+        let (_tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        let page = app.ed.page;
+        let pins = [BoxPin {
+            name: "1".into(),
+            side: BoxSide::Left,
+            offset: 5.0,
+        }];
+        let open = app.open.as_mut().unwrap();
+        let id = open
+            .add_black_box(page, Point::new(120.0, 40.0), Point::new(140.0, 50.0), &pins, None)
+            .unwrap();
+        app.ed.select_only(Selection::Symbol(id.clone()));
+        let mut frame = eframe::Frame::_new_kittest();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame)
+        });
+        let form = panels::black_box_form_mut(&mut app.panels).unwrap();
+        form.rows[0].name = "A".into();
+        let save = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: Key::S,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::COMMAND,
+            }],
+            modifiers: Modifiers::COMMAND,
+            ..Default::default()
+        };
+        let _ = ctx.run(save, |ctx| eframe::App::update(&mut app, ctx, &mut frame));
+        let open = app.open.as_ref().unwrap();
+        assert!(!open.dirty, "saved");
+        let back = state::Open::load(&open.dir).unwrap();
+        let symbol = back.project.pages[page].symbol(&id).unwrap().symbol.clone();
+        let names: Vec<&str> = back.symbols[&symbol].pins.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["A"], "the saved box has the point name typed in the form");
+    }
+
     #[test]
     fn an_arrow_press_through_the_app_frame_leaves_the_panel_device_alone_behind_a_dialog() {
         use wc_core::panel::{Panel, PanelItem};

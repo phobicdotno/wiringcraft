@@ -972,6 +972,12 @@ pub fn apply_black_box_draft(open: &mut Open, ed: &mut Editor, ps: &mut PanelSta
     }
 }
 
+/// The black box form shown, for tests that type in it.
+#[cfg(test)]
+pub(crate) fn black_box_form_mut(ps: &mut PanelState) -> Option<&mut crate::black_box_tool::BoxEdit> {
+    ps.black_box.as_mut().map(|(_, f)| f)
+}
+
 /// Apply the black box form to the box `id` on `page` as one undo step, for its Apply button
 /// and before a save: the warnings, or why it was refused. A wire being drawn from a point the
 /// change removed or renamed is dropped, as it could no longer be drawn.
