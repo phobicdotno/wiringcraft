@@ -276,7 +276,7 @@ fn convert(name: &str, sym: &Sexp, body: &Sexp, base: &str, wanted: u32, prefix:
                         .map(|p| p.all("xy").filter_map(|x| Some(pt(x.num(1)?, x.num(2)?))).collect())
                         .unwrap_or_default();
                     // A polyline that ends where it starts is closed; drop the repeated point.
-                    let ends_at_start = points.len() > 3 && points.first() == points.last();
+                    let ends_at_start = points.len() > 2 && points.first() == points.last();
                     if ends_at_start {
                         points.pop();
                     }
@@ -587,6 +587,8 @@ mod tests {
       (polyline (pts (xy -1 1) (xy -1 -1) (xy 1 0) (xy -1 1)) (stroke (width 0.254)) (fill (type outline)))
       (polyline (pts (xy 1 1) (xy 1 -1)) (stroke (width 0.254)) (fill (type none)))
       (polyline (pts (xy 2 1) (xy 3 1) (xy 3 2) (xy 2 1)) (fill (type background)))
+      (polyline (pts (xy 0 5) (xy 2 5) (xy 1 6)) (fill (type outline)))
+      (polyline (pts (xy 0 8) (xy 2 8) (xy 0 8)) (fill (type none)))
       (rectangle (start 4 1) (end 5 -1) (fill (type outline)))
       (rectangle (start 6 1) (end 7 -1) (fill (type background))))
     (symbol "D_1_1"
@@ -608,6 +610,20 @@ mod tests {
         assert!(g.contains(&Shape::Line {
             a: Point::new(1.0, -1.0),
             b: Point::new(1.0, 1.0)
+        }));
+        // An outline fill closes a triangle that does not repeat its first point.
+        assert!(
+            g.contains(&Shape::Polyline {
+                points: vec![Point::new(0.0, -5.0), Point::new(2.0, -5.0), Point::new(1.0, -6.0)],
+                closed: true,
+                filled: true,
+            }),
+            "{g:?}"
+        );
+        // Three points that end where they start are a line there and back.
+        assert!(g.contains(&Shape::Line {
+            a: Point::new(0.0, -8.0),
+            b: Point::new(2.0, -8.0)
         }));
         // A background fill is closed but hollow.
         assert!(
