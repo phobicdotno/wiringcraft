@@ -156,6 +156,66 @@ impl Dictionary {
     }
 }
 
+/// Set the translation of `text` (in the source language) into `lang` in the project folder's
+/// `translations.toml`, or remove it when `translation` is blank. The other translations in
+/// the file stay as they were. Returns whether the file changed. One language code is
+/// required, and not the source language: its texts are the project's. When the file changes
+/// on disk between this call reading it and writing it (another program writing it at the
+/// same time), nothing is written and the error asks to try again.
+pub fn set_translation(dir: &Path, text: &str, lang: &str, translation: &str) -> Result<bool> {
+    set_translation_checked(dir, text, lang, translation, || {})
+}
+
+/// [`set_translation`], calling `meanwhile` between reading the file and checking it again
+/// before the write (for a test to change the file there).
+fn set_translation_checked(
+    dir: &Path,
+    text: &str,
+    lang: &str,
+    translation: &str,
+    meanwhile: impl FnOnce(),
+) -> Result<bool> {
+    let lang = match parse_languages(lang).as_deref() {
+        Some([one]) => one.clone(),
+        _ => {
+            return Err(Error::Invalid(format!(
+                "{:?} is not a language code: use one such as nb or de",
+                lang.trim()
+            )));
+        }
+    };
+    if text.trim().is_empty() {
+        return Err(Error::Invalid("no text to translate".into()));
+    }
+    let path = dir.join(TRANSLATIONS_FILE);
+    let read = || match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Error::io(&path, e)),
+    };
+    let before = read()?;
+    let mut dict = match &before {
+        Some(t) => Dictionary::parse(t).map_err(|message| Error::Toml {
+            path: path.clone(),
+            message,
+        })?,
+        None => Dictionary::default(),
+    };
+    if lang == dict.source() {
+        return Err(Error::Invalid(format!(
+            "{lang} is the source language: its texts are the project's own"
+        )));
+    }
+    dict.set(text, &lang, translation);
+    meanwhile();
+    if read()? != before {
+        return Err(Error::Invalid(format!(
+            "{TRANSLATIONS_FILE} changed while the translation was being saved; nothing was written, try again"
+        )));
+    }
+    dict.save(dir)
+}
+
 /// A language code as compared: trimmed and lowercased.
 fn normalize(lang: &str) -> String {
     lang.trim().to_ascii_lowercase()
@@ -419,6 +479,60 @@ nb = ""
         assert_eq!(again.lookup("Pumps", "nb"), None);
         assert_eq!(again.lookup("Pumps", "en").as_deref(), Some("Pumps"));
         assert_eq!(again.texts.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn set_translation_writes_and_removes_one_text_in_the_file() -> R {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join(TRANSLATIONS_FILE), DICT)?;
+        assert!(set_translation(dir.path(), "Spare", "NB", "Reserve")?);
+        assert!(!set_translation(dir.path(), "Spare", "nb", "Reserve")?, "unchanged");
+        assert!(set_translation(dir.path(), "Main switch", "nb", "")?);
+        let d = Dictionary::load(dir.path())?;
+        assert_eq!(d.lookup("Spare", "nb").as_deref(), Some("Reserve"));
+        assert_eq!(d.lookup("Main switch", "nb"), None);
+        assert_eq!(d.lookup("Pumps", "nb").as_deref(), Some("Pumper"), "others are kept");
+        for (text, lang) in [("Spare", "en"), ("Spare", "nb,en"), ("Spare", ""), (" ", "nb")] {
+            assert!(
+                matches!(set_translation(dir.path(), text, lang, "x"), Err(Error::Invalid(_))),
+                "{text:?} {lang:?}"
+            );
+        }
+        // A project without a dictionary gets one.
+        let empty = tempfile::tempdir()?;
+        assert!(set_translation(empty.path(), "Pumps", "de", "Pumpen")?);
+        assert_eq!(
+            Dictionary::load(empty.path())?.lookup("Pumps", "de").as_deref(),
+            Some("Pumpen")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn set_translation_writes_nothing_when_the_file_changed_after_it_was_read() -> R {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join(TRANSLATIONS_FILE);
+        std::fs::write(&path, DICT)?;
+        let other = format!("{DICT}\n[[text]]\nen = \"Spare\"\nde = \"Ersatz\"\n");
+        let r = set_translation_checked(dir.path(), "Pumps", "nb", "Pumpene", || {
+            let _ = std::fs::write(&path, &other);
+        });
+        assert!(matches!(r, Err(Error::Invalid(m)) if m.contains("try again")));
+        // The other writer's file is left as it wrote it.
+        assert_eq!(std::fs::read_to_string(&path)?, other);
+        // Tried again, it is saved on top of the other change.
+        assert!(set_translation(dir.path(), "Pumps", "nb", "Pumpene")?);
+        let d = Dictionary::load(dir.path())?;
+        assert_eq!(d.lookup("Pumps", "nb").as_deref(), Some("Pumpene"));
+        assert_eq!(d.lookup("Spare", "de").as_deref(), Some("Ersatz"));
+        // A file made meanwhile where there was none is a change too.
+        let empty = tempfile::tempdir()?;
+        let new = empty.path().join(TRANSLATIONS_FILE);
+        let r = set_translation_checked(empty.path(), "Pumps", "nb", "Pumper", || {
+            let _ = std::fs::write(&new, "source = \"en\"\n");
+        });
+        assert!(r.is_err());
         Ok(())
     }
 

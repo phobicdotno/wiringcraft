@@ -506,6 +506,19 @@ pub fn specs() -> Vec<Value> {
             &["action"],
         ),
         tool(
+            "translations",
+            "The project's translation dictionary (translations.toml, the same file as File, Translations): list the project's texts with their translations (lang: only that language; missing: true with lang: only the texts without a translation into it), set a text's translation into a language, or remove it. text is the project text as drawn, in the source language. It is written to the file at once, like the dialog saves: Undo does not take it back, so set or remove it again to change it. In a shared session only the host can set or remove translations.",
+            json!({
+                "action": {"type": "string", "enum": ["list", "set", "remove"]},
+                "text": {"type": "string", "description": "set, remove: the text as drawn in the project, such as a page title or device description."},
+                "lang": {"type": "string", "description": "A language code, such as nb or de."},
+                "translation": {"type": "string", "description": "set: the text in lang."},
+                "missing": {"type": "boolean", "description": "list with lang: only the texts without a translation."},
+                "skip": {"type": "integer", "description": "list: leave out this many texts from the start; a long list answers with next_skip, the value to pass for the next page."}
+            }),
+            &["action"],
+        ),
+        tool(
             "number_wires",
             "Give every connection without a number one. Existing numbers are kept.",
             json!({"rule": {"type": "string", "enum": ["page_column", "sequential", "potential"], "description": "page_column (3.4: page and column, default), sequential (1, 2, 3) or potential (the potential's name)."}}),
@@ -767,6 +780,45 @@ fn tag(t: &str) -> Result<DeviceTag, String> {
 
 fn pretty(v: &Value) -> String {
     serde_json::to_string(v).unwrap_or_default()
+}
+
+/// How many texts `translations list` returns in one answer, at most, in characters of JSON:
+/// the rest come on later pages (`skip`).
+const TRANSLATION_PAGE_CHARS: usize = 30_000;
+
+/// The `skip` argument of a paged list: how many rows to leave out from the start.
+fn skip(v: &Value) -> Result<usize, String> {
+    match v.get("skip") {
+        None | Some(Value::Null) => Ok(0),
+        Some(n) => n
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| "`skip` must be a whole number of texts, 0 or more.".into()),
+    }
+}
+
+/// One page of a `translations list` answer: whole rows from `skip` on, as many as fit in
+/// [`TRANSLATION_PAGE_CHARS`] (always at least one), with `next_skip` when more follow, so the
+/// answer stays valid JSON however many texts the project has.
+fn translation_page(source: &str, languages: &[String], rows: Vec<Value>, skip: usize) -> String {
+    let total = rows.len();
+    let mut used = 0;
+    let page: Vec<Value> = rows
+        .into_iter()
+        .skip(skip)
+        .take_while(|r| {
+            let len = r.to_string().len();
+            let fits = used == 0 || used + len <= TRANSLATION_PAGE_CHARS;
+            used += len;
+            fits
+        })
+        .collect();
+    let next = skip + page.len();
+    let mut out = json!({"source": source, "languages": languages, "total": total, "texts": page});
+    if next < total {
+        out["next_skip"] = json!(next);
+    }
+    pretty(&out)
 }
 
 fn clip_text(t: String, max: usize) -> String {
@@ -1287,6 +1339,14 @@ impl wc_agent::Tools for AppTools<'_> {
             "mirror_items" => format!("Mirrored {}{page}", strings(input, "ids").join(", ")),
             "copy_items" => format!("Copied {}{page}", strings(input, "ids").join(", ")),
             "select_items" => format!("Selected {}{page}", strings(input, "ids").join(", ")),
+            "translations" => match s(input, "action") {
+                Some(a @ ("set" | "remove")) => format!(
+                    "Translations: {a} {:?} in {}",
+                    s(input, "text").unwrap_or_default(),
+                    s(input, "lang").unwrap_or_default()
+                ),
+                _ => "Read the translations".into(),
+            },
             "set_device" => format!("Set device {}", s(input, "tag").unwrap_or_default()),
             "run_action" => format!("Ran {}", s(input, "action").unwrap_or_default()),
             "run_command" => format!("wiringcraft {}", strings(input, "args").join(" ")),
@@ -1906,6 +1966,7 @@ impl App {
             "jumpers" => self.tool_jumpers(v),
             "strips" => self.tool_strips(v),
             "macros" => self.tool_macros(v),
+            "translations" => self.tool_translations(v),
             "rules" => self.tool_rules(v),
             "number_wires" => {
                 use wc_core::numbering::Rule;
@@ -3061,6 +3122,71 @@ impl App {
         }
     }
 
+    /// The `translations` tool: the project's `translations.toml`, read and written through
+    /// the same dictionary code as the Translations dialog.
+    fn tool_translations(&mut self, v: &Value) -> Result<String, String> {
+        use wc_core::translate::{Dictionary, TRANSLATIONS_FILE, set_translation, texts};
+        let action = need_s(v, "action")?;
+        // The session does not carry translations.toml: a guest's edit would stay in the
+        // guest's own copy, and the host's file (which its PDF export reads) would not change.
+        if matches!(action, "set" | "remove") && self.share.active() && !self.share.is_host() {
+            return Err("Not done: in a shared session only the host can change the translations (the session does not carry translations.toml). Ask the host to make this change.".into());
+        }
+        let open = need_open(self.open.as_mut())?;
+        match action {
+            "list" => {
+                let dict = Dictionary::load(&open.dir).map_err(|e| e.to_string())?;
+                let langs: Vec<String> = match s(v, "lang") {
+                    Some(l) => match wc_core::translate::parse_languages(l).as_deref() {
+                        Some([one]) => vec![one.clone()],
+                        _ => return Err(format!("{l:?} is not a language code: use one such as nb or de.")),
+                    },
+                    None => dict.languages().into_iter().skip(1).collect(),
+                };
+                let only_missing = v.get("missing").and_then(Value::as_bool).unwrap_or(false) && s(v, "lang").is_some();
+                let rows: Vec<Value> = texts(&open.project)
+                    .into_iter()
+                    .filter_map(|t| {
+                        let tr: serde_json::Map<String, Value> = langs
+                            .iter()
+                            .filter_map(|l| dict.lookup(&t.text, l).map(|x| (l.clone(), json!(x))))
+                            .collect();
+                        (!only_missing || tr.is_empty())
+                            .then(|| json!({"text": t.text, "used": t.used, "translations": tr}))
+                    })
+                    .collect();
+                Ok(translation_page(dict.source(), &dict.languages(), rows, skip(v)?))
+            }
+            "set" | "remove" => {
+                let text = need_s(v, "text")?;
+                let lang = need_s(v, "lang")?;
+                let translation = if action == "set" {
+                    let t = need_s(v, "translation")?;
+                    if t.trim().is_empty() {
+                        return Err("The translation is empty: use action remove to take one away.".into());
+                    }
+                    t
+                } else {
+                    ""
+                };
+                let changed = set_translation(&open.dir, text, lang, translation).map_err(|e| e.to_string())?;
+                let mut out = match (action, changed) {
+                    ("set", true) => format!("Saved the translation to {TRANSLATIONS_FILE}."),
+                    ("set", false) => format!("{TRANSLATIONS_FILE} already had that translation."),
+                    (_, true) => format!("Removed the translation from {TRANSLATIONS_FILE}."),
+                    (_, false) => format!("{TRANSLATIONS_FILE} had no translation of that text into that language."),
+                };
+                if !texts(&open.project).iter().any(|t| t.text == text.trim()) {
+                    out.push_str(
+                        " Note: no text in the project reads exactly like that; list shows the texts as drawn.",
+                    );
+                }
+                Ok(out)
+            }
+            other => Err(format!("Unknown translations action {other}.")),
+        }
+    }
+
     /// The `report_layouts` tool: read, replace or reset a report's layout through the report
     /// layout dialog's form, so a layout is checked and kept as OK in the dialog keeps it.
     fn tool_report_layouts(&mut self, v: &Value) -> Result<String, String> {
@@ -3404,6 +3530,11 @@ impl App {
         let bin = cli_path();
         let mut cmd = std::process::Command::new(&bin);
         self.assistant.command_base = None;
+        // As in the `translations` tool: the session does not carry translations.toml, so a
+        // guest's edit would stay in its own copy and never reach the host.
+        if edits_translations(&args) && self.share.active() && !self.share.is_host() {
+            return Err("Not done: in a shared session only the host can change the translations (the session does not carry translations.toml). Ask the host to make this change.".into());
+        }
         if let Some(open) = self.open.as_mut() {
             // In a shared session a page someone else has open is read-only here, and the
             // command line writes the project folder directly: only commands that read it run.
@@ -3565,6 +3696,27 @@ fn find_macro(open: &Open, name: &str) -> Result<crate::state::MacroEntry, Strin
 /// it only reads the project.
 ///
 /// `cwd` is the folder the command runs in, which relative paths are taken from.
+/// Whether `wiringcraft <args>` sets or removes a translation (`translations set`/`remove`,
+/// also with `--lang` before the subcommand).
+fn edits_translations(args: &[String]) -> bool {
+    // The command's own words, without options and the values of the options that take one
+    // (`-C`/`--project` before or after the command, `--lang`), so a search text or a
+    // project folder named `translations` or `set` is not read as the command.
+    let mut words = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if matches!(a.as_str(), "-C" | "--project" | "--lang") {
+            it.next();
+        } else if !a.starts_with('-') {
+            words.push(a.as_str());
+        }
+        if words.len() == 2 {
+            break;
+        }
+    }
+    matches!(words.as_slice(), ["translations", "set" | "remove"])
+}
+
 fn writes_while_held(args: &[String], dir: &Path, held: &BTreeMap<String, String>, cwd: &Path) -> Option<String> {
     if held.is_empty() {
         return None;
@@ -5711,6 +5863,116 @@ mod tests {
     }
 
     #[test]
+    fn a_guest_cannot_set_or_remove_translations_the_session_does_not_carry() {
+        use wc_core::translate::TRANSLATIONS_FILE;
+        let tmp = tempfile::tempdir().unwrap();
+        let (_dir, mut a) = guest_app(tmp.path());
+        let file = a.open.as_ref().unwrap().dir.join(TRANSLATIONS_FILE);
+        for input in [
+            json!({"action": "set", "text": "Pumps", "lang": "nb", "translation": "Pumper"}),
+            json!({"action": "remove", "text": "Pumps", "lang": "nb"}),
+        ] {
+            let e = call(&mut a, "translations", input).unwrap_err();
+            assert!(e.contains("only the host"), "{e}");
+        }
+        assert!(!file.exists(), "nothing is written in the guest's copy");
+        assert!(call(&mut a, "translations", json!({"action": "list"})).is_ok());
+    }
+
+    #[test]
+    fn a_guest_cannot_set_or_remove_translations_through_the_command_line() {
+        use wc_core::translate::TRANSLATIONS_FILE;
+        let tmp = tempfile::tempdir().unwrap();
+        let (_dir, mut a) = guest_app(tmp.path());
+        // With no page held by anyone else the read-only check lets every command through.
+        a.open.as_mut().unwrap().held_by_others.clear();
+        let file = a.open.as_ref().unwrap().dir.join(TRANSLATIONS_FILE);
+        for args in [
+            json!({"args": ["translations", "set", "Pumps", "Pumper", "--lang", "nb"]}),
+            json!({"args": ["translations", "--lang", "nb", "remove", "Pumps"]}),
+        ] {
+            let Started::Done(Err(e)) = wc_agent::Tools::start(&mut AppTools(&mut a), "run_command", &args) else {
+                unreachable!("{args} was not refused");
+            };
+            assert!(e.contains("only the host"), "{e}");
+        }
+        assert!(!file.exists(), "nothing is written in the guest's copy");
+        // Listing what is missing still runs.
+        let args = json!({"args": ["translations", "--lang", "nb"]});
+        let Started::Running(p) = wc_agent::Tools::start(&mut AppTools(&mut a), "run_command", &args) else {
+            unreachable!("listing was refused");
+        };
+        let _ = wc_agent::Tools::finish(&mut AppTools(&mut a), "run_command", &args, p.wait());
+    }
+
+    #[test]
+    fn edits_translations_tells_set_and_remove_from_listing() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(edits_translations(&args(&["translations", "set", "A", "B"])));
+        assert!(edits_translations(&args(&[
+            "translations",
+            "--lang",
+            "de",
+            "remove",
+            "A"
+        ])));
+        assert!(!edits_translations(&args(&["translations", "--lang", "nb"])));
+        assert!(!edits_translations(&args(&["page", "set"])));
+        assert!(edits_translations(&args(&[
+            "-C",
+            "proj",
+            "translations",
+            "set",
+            "A",
+            "B"
+        ])));
+        assert!(!edits_translations(&args(&[
+            "find",
+            "translations",
+            "--replace",
+            "set"
+        ])));
+        assert!(!edits_translations(&args(&["translations", "--lang", "set"])));
+        assert!(!edits_translations(&args(&[
+            "page",
+            "add",
+            "translations",
+            "--title",
+            "set"
+        ])));
+        assert!(!edits_translations(&args(&["-C", "translations", "check", "set"])));
+    }
+
+    #[test]
+    fn a_long_translation_list_comes_in_whole_json_pages() {
+        let rows: Vec<Value> = (0..2000)
+            .map(|i| json!({"text": format!("Text number {i} {}", "x".repeat(40)), "used": 1, "translations": {}}))
+            .collect();
+        let langs = vec!["en".to_string(), "nb".to_string()];
+        let mut seen = Vec::new();
+        let mut from = 0;
+        let mut pages = 0;
+        loop {
+            let page: Value = serde_json::from_str(&translation_page("en", &langs, rows.clone(), from)).unwrap();
+            assert_eq!(page["total"], 2000);
+            let texts = page["texts"].as_array().unwrap();
+            assert!(!texts.is_empty());
+            seen.extend(texts.iter().map(|t| t["text"].as_str().unwrap().to_string()));
+            pages += 1;
+            match page["next_skip"].as_u64() {
+                Some(n) => from = n as usize,
+                None => break,
+            }
+        }
+        assert!(pages > 1, "the list did not need paging");
+        let want: Vec<String> = rows.iter().map(|r| r["text"].as_str().unwrap().to_string()).collect();
+        assert_eq!(seen, want);
+        // Past the end: an empty page, not an error.
+        let past: Value = serde_json::from_str(&translation_page("en", &langs, rows, 5000)).unwrap();
+        assert!(past["texts"].as_array().unwrap().is_empty() && past.get("next_skip").is_none());
+    }
+
+    #[test]
     fn a_guests_tool_call_that_changes_nothing_is_not_pending() {
         let tmp = tempfile::tempdir().unwrap();
         let (_dir, mut a) = guest_app(tmp.path());
@@ -6541,6 +6803,86 @@ mod tests {
         let pdf = String::from_utf8_lossy(&std::fs::read(pdf_path).unwrap()).into_owned();
         assert!(pdf.contains(&hex("Reserve / Spare")), "the texts are in both languages");
         assert!(pdf.contains(&hex("Pumpene / Pumps")));
+    }
+
+    #[test]
+    fn the_assistant_lists_sets_and_removes_translations_as_the_dialog_shows_them() {
+        use wc_core::translate::{Dictionary, TRANSLATIONS_FILE};
+        let (_tmp, mut a) = app(vec![]);
+        let dir = a.open.as_ref().unwrap().dir.clone();
+        a.open.as_mut().unwrap().project.pages[1].title = "Pumps".into();
+        std::fs::write(
+            dir.join(TRANSLATIONS_FILE),
+            "source = \"en\"\n\n[[text]]\nen = \"Main switch\"\nnb = \"Hovedbryter\"\n",
+        )
+        .unwrap();
+        let steps = a.open.as_ref().unwrap().undo_mark();
+
+        let missing = |a: &mut App| -> Vec<String> {
+            let r = call(
+                a,
+                "translations",
+                json!({"action": "list", "lang": "nb", "missing": true}),
+            )
+            .unwrap();
+            let v: Value = serde_json::from_str(&r).unwrap();
+            v["texts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["text"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert!(missing(&mut a).contains(&"Pumps".to_owned()));
+
+        let r = call(
+            &mut a,
+            "translations",
+            json!({"action": "set", "text": "Pumps", "lang": "NB", "translation": "Pumper"}),
+        )
+        .unwrap();
+        assert!(r.starts_with("Saved"), "{r}");
+        assert!(!missing(&mut a).contains(&"Pumps".to_owned()));
+        let d = Dictionary::load(&dir).unwrap();
+        assert_eq!(d.lookup("Pumps", "nb").as_deref(), Some("Pumper"));
+        assert_eq!(d.lookup("Main switch", "nb").as_deref(), Some("Hovedbryter"), "kept");
+
+        // The dialog opened now shows what the assistant saved.
+        a.run(Action::Translations);
+        let Some(Dialog::Translations(form)) = a.dialog.take() else {
+            unreachable!("the translations dialog opens");
+        };
+        let row = form.rows.iter().find(|r| r.text == "Pumps").unwrap();
+        assert_eq!(row.cells, ["Pumper"]);
+
+        let r = call(
+            &mut a,
+            "translations",
+            json!({"action": "remove", "text": "Pumps", "lang": "nb"}),
+        )
+        .unwrap();
+        assert!(r.starts_with("Removed"), "{r}");
+        assert_eq!(Dictionary::load(&dir).unwrap().lookup("Pumps", "nb"), None);
+        assert!(missing(&mut a).contains(&"Pumps".to_owned()));
+
+        // Not in the project: saved, with a note.
+        let r = call(
+            &mut a,
+            "translations",
+            json!({"action": "set", "text": "Nowhere", "lang": "de", "translation": "Nirgends"}),
+        )
+        .unwrap();
+        assert!(r.contains("no text in the project"), "{r}");
+        for bad in [
+            json!({"action": "set", "text": "Pumps", "lang": "en", "translation": "x"}),
+            json!({"action": "set", "text": "Pumps", "lang": "nb", "translation": " "}),
+            json!({"action": "set", "text": "Pumps", "lang": "nb,en", "translation": "x"}),
+            json!({"action": "remove", "text": "Pumps"}),
+        ] {
+            assert!(call(&mut a, "translations", bad.clone()).is_err(), "{bad}");
+        }
+        // The file is not part of the drawing: no undo step yet (todo #589).
+        assert_eq!(a.open.as_ref().unwrap().undo_mark(), steps);
     }
 
     #[test]
