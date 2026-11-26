@@ -537,7 +537,7 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "run_check",
-            "Check the project: revision clouds whose revision the project does not list, revision letters the PDF cannot print, symbols missing from the project's library copy and wires on pins that do not exist, devices drawn twice, more contacts than a device's parts have, contacts without a coil, interruption points without a partner, open pins, wires ending in the air, wires with both ends on one pin, jumpers naming a terminal drawn nowhere, one cable core on two connections, shorted potentials, a connection with two wire numbers or a wire number on two connections, panel layouts with overlapping devices, devices sticking out of the plate or no longer in the project, devices without a part, then the check rules of the project's library sources (less the ones the project turns off) and the project's own check rules (see the rules tool).",
+            "Check the project: revision clouds whose revision the project does not list, revision letters the PDF cannot print, symbols missing from the project's library copy and wires on pins that do not exist, devices drawn twice, more contacts than a device's parts have, contacts without a coil, interruption points without a partner, open pins, wires ending in the air, wires with both ends on one pin, jumpers naming a terminal drawn nowhere, one cable core on two connections, shorted potentials, a connection with two wire numbers or a wire number on two connections, panel layouts with overlapping devices, devices sticking out of the plate or no longer in the project, parts missing from the project's library copy, devices without a part, then the check rules of the project's library sources (less the ones the project turns off) and the project's own check rules (see the rules tool).",
             json!({}),
             &[],
         ),
@@ -4122,6 +4122,7 @@ mod tests {
             live: Default::default(),
             fetch: None,
             importing: None,
+            after_typed: Vec::new(),
         };
         (tmp, app)
     }

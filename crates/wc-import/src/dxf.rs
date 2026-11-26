@@ -728,6 +728,19 @@ fn shapes(
                             break;
                         }
                     }
+                } else {
+                    // A cut-down file or an xref: the block is not here to draw.
+                    // The name goes into a warning a terminal shows: no control characters.
+                    // Cut to a short length first: an array can visit this INSERT many times.
+                    let name: String = e
+                        .get(2)
+                        .unwrap_or_default()
+                        .chars()
+                        .take(MISSING_BLOCK_NAME_LEN)
+                        .map(|c| if c.is_control() { '?' } else { c })
+                        .collect();
+                    let name = name.trim();
+                    *skipped.entry(format!("{MISSING_BLOCK}{name}")).or_default() += 1;
                 }
                 None
             }
@@ -1008,6 +1021,16 @@ const STRETCHED_NOT_NUMBERS: &str = "CIRCLE or ARC of a stretched block whose po
 
 /// The `skipped` key of the vertices left out of a drawn LEADER because they are not numbers.
 const LEADER_BAD_VERTICES: &str = "LEADER vertex that is not numbers";
+
+/// The start of the `skipped` key of an INSERT whose block is not in the file; the block's
+/// name follows (empty when the INSERT names none), so the warning can name a few of them.
+const MISSING_BLOCK: &str = "INSERT of a block not in the file: ";
+
+/// How many missing block names the warning lists.
+const MISSING_BLOCK_NAMES: usize = 3;
+
+/// How many characters of a missing block's name the warning keeps.
+const MISSING_BLOCK_NAME_LEN: usize = 64;
 
 /// The key under which hatches with a boundary that is not all numbers are counted.
 /// The `skipped` key of a polyline whose points, or the arcs of its bulges, are not numbers once
@@ -2037,6 +2060,25 @@ fn with_holes_kept(loops: &[Vec<(f64, f64)>], style: i64) -> Option<(Vec<Loop>, 
 
 /// One warning per entity kind that was not read.
 pub(crate) fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
+    // Inserts of missing blocks make one line together, naming a few of the blocks.
+    let (missing, skipped): (Vec<_>, Vec<_>) = skipped.into_iter().partition(|(k, _)| k.starts_with(MISSING_BLOCK));
+    let missing_line = (!missing.is_empty()).then(|| {
+        let n: usize = missing.iter().map(|(_, n)| n).sum();
+        let mut names: Vec<&str> = missing
+            .iter()
+            .map(|(k, _)| k.get(MISSING_BLOCK.len()..).unwrap_or_default())
+            .map(|name| if name.is_empty() { "(no name)" } else { name })
+            .take(MISSING_BLOCK_NAMES)
+            .collect();
+        if missing.len() > MISSING_BLOCK_NAMES {
+            names.push("...");
+        }
+        let (s, its) = if n == 1 { ("", "its") } else { ("s", "their") };
+        format!(
+            "{n} block insert{s} not drawn: {its} block is not in the file ({})",
+            names.join(", ")
+        )
+    });
     skipped
         .into_iter()
         .map(|(kind, n)| {
@@ -2095,6 +2137,7 @@ pub(crate) fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> 
                 format!("{n} {kind} entit{} not read", if n == 1 { "y" } else { "ies" })
             }
         })
+        .chain(missing_line)
         .collect()
 }
 
@@ -2701,6 +2744,67 @@ mod tests {
             !s.graphics.iter().any(|g| matches!(g, Shape::Text { .. })),
             "{:?}",
             s.graphics
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_insert_of_a_block_not_in_the_file_is_said() -> Result<()> {
+        let line = "0\nLINE\n8\n0\n10\n0\n20\n0\n11\n10\n21\n0\n";
+        let ents = format!("{line}0\nINSERT\n2\nNOPE\n10\n5\n20\n5\n");
+        let (s, warnings) = symbol_with_warnings(&dxf(&ents, ""), "my.part", "Part")?;
+        assert_eq!(s.graphics.len(), 1, "the line comes in: {:?}", s.graphics);
+        assert_eq!(
+            warnings,
+            ["1 block insert not drawn: its block is not in the file (NOPE)"]
+        );
+
+        // The block is there: drawn, and nothing said.
+        let blocks = "0\nBLOCK\n2\nNOPE\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n0\nENDBLK\n";
+        let (s, warnings) = symbol_with_warnings(&dxf(&ents, blocks), "my.part", "Part")?;
+        assert_eq!(s.graphics.len(), 2);
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        // Several missing blocks make one line, naming the first few; one with no name too.
+        let ents: String = ["A", "B", "B", "C", "D"]
+            .iter()
+            .map(|b| format!("0\nINSERT\n2\n{b}\n10\n0\n20\n0\n"))
+            .chain(["0\nINSERT\n10\n0\n20\n0\n".to_owned()])
+            .collect();
+        let (_, warnings) = symbol_with_warnings(&dxf(&format!("{line}{ents}"), ""), "my.part", "Part")?;
+        assert_eq!(
+            warnings,
+            ["6 block inserts not drawn: their block is not in the file ((no name), A, B, ...)"]
+        );
+
+        // A name with control characters is shown without them.
+        let ents = format!("{line}0\nINSERT\n2\nX\u{1b}[2J\n10\n0\n20\n0\n");
+        let (_, warnings) = symbol_with_warnings(&dxf(&ents, ""), "my.part", "Part")?;
+        assert_eq!(
+            warnings,
+            ["1 block insert not drawn: its block is not in the file (X?[2J)"]
+        );
+
+        // A long name inside a block placed as an array: cut short, every copy counted.
+        let long = "L".repeat(10_000);
+        let blocks = format!("0\nBLOCK\n2\nARR\n0\nINSERT\n2\n{long}\n10\n0\n20\n0\n0\nENDBLK\n");
+        let ents = format!("{line}0\nINSERT\n2\nARR\n10\n0\n20\n0\n70\n4\n71\n5\n44\n1\n45\n1\n");
+        let (_, warnings) = symbol_with_warnings(&dxf(&ents, &blocks), "my.part", "Part")?;
+        let short = "L".repeat(MISSING_BLOCK_NAME_LEN);
+        assert_eq!(
+            warnings,
+            [format!(
+                "20 block inserts not drawn: their block is not in the file ({short})"
+            )]
+        );
+
+        // Leading spaces count toward the cut too: a name past them is not looked for.
+        let spaced = format!("{}X", " ".repeat(10_000));
+        let blocks = format!("0\nBLOCK\n2\nARR\n0\nINSERT\n2\n{spaced}\n10\n0\n20\n0\n0\nENDBLK\n");
+        let (_, warnings) = symbol_with_warnings(&dxf(&ents, &blocks), "my.part", "Part")?;
+        assert_eq!(
+            warnings,
+            ["20 block inserts not drawn: their block is not in the file ((no name))"]
         );
         Ok(())
     }
