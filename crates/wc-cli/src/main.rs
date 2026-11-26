@@ -14,7 +14,9 @@ type Res<T> = Result<T, String>;
 #[derive(Parser)]
 #[command(name = "wiringcraft", version, about = "Electrical schematic and wiring design")]
 struct Cli {
-    /// Project folder.
+    /// Project folder. After a subcommand that takes a device tag, write it as `-C <dir>` or
+    /// `--project <dir>`: an attached `-C<dir>` there is read as a tag, since tags such as
+    /// `-C1` start with a dash too.
     #[arg(short = 'C', long = "project", global = true, default_value = ".")]
     project: PathBuf,
     #[command(subcommand)]
@@ -6387,6 +6389,53 @@ mod tests {
         let err = cli(&dir, &["jumper", "remove", "--", "-X1", "9"]).unwrap_err();
         assert!(err.contains("no jumper of -X1 has terminal 9"), "{err}");
         assert!(cli(&dir, &["jumper", "add", "--", "-X1", "1.2", "3.4"]).is_err());
+    }
+
+    #[test]
+    fn the_project_option_is_kept_apart_from_dash_tags() {
+        let parsed = |args: &[&str]| -> (PathBuf, Option<String>) {
+            let Ok(c) = Cli::try_parse_from(args) else {
+                unreachable!("{args:?}")
+            };
+            let Cmd::Strip(StripCmd::List { strip }) = c.cmd else {
+                unreachable!()
+            };
+            (c.project, strip)
+        };
+        let other = || PathBuf::from("other");
+        let x1 = Some("-X1".to_string());
+        // Separated, long or before the subcommand: the project, the tag stays a tag.
+        assert_eq!(
+            parsed(&["wiringcraft", "strip", "list", "-C", "other", "-X1"]),
+            (other(), x1.clone())
+        );
+        assert_eq!(
+            parsed(&["wiringcraft", "strip", "list", "-X1", "-C", "other"]),
+            (other(), x1.clone())
+        );
+        assert_eq!(
+            parsed(&["wiringcraft", "strip", "list", "--project", "other", "-X1"]),
+            (other(), x1.clone())
+        );
+        assert_eq!(
+            parsed(&["wiringcraft", "strip", "list", "--project=other", "-X1"]),
+            (other(), x1.clone())
+        );
+        assert_eq!(
+            parsed(&["wiringcraft", "-Cother", "strip", "list", "-X1"]),
+            (other(), x1.clone())
+        );
+        assert_eq!(parsed(&["wiringcraft", "-Cother", "strip", "list"]), (other(), None));
+        // Attached after the subcommand it is a tag: `-C1` is a capacitor strip as much as a path.
+        assert_eq!(
+            parsed(&["wiringcraft", "strip", "list", "-C1"]),
+            (PathBuf::from("."), Some("-C1".into()))
+        );
+        let Ok(c) = Cli::try_parse_from(["wiringcraft", "device", "-C", "other", "-C1"]) else {
+            unreachable!()
+        };
+        let Cmd::Device { tag, .. } = c.cmd else { unreachable!() };
+        assert_eq!((c.project, tag.as_str()), (other(), "-C1"));
     }
 
     #[test]
