@@ -650,7 +650,12 @@ impl App {
         // A save waiting for a typed value runs on the project it was asked for first: a
         // joined copy waits for it, also when an assistant's Undo syncs before the panels.
         // So does a close waiting a frame for a typed value.
-        let busy = busy || !self.after_typed.is_empty() || self.closing == Closing::WaitsForTyped;
+        // And so does the unsaved-changes question: its answer saves or drops the project
+        // it was asked about.
+        let busy = busy
+            || !self.after_typed.is_empty()
+            || self.closing == Closing::WaitsForTyped
+            || matches!(self.dialog, Some(Dialog::Unsaved(_)));
         let page = self.open.as_ref().and_then(|o| match self.ed.panel {
             Some(_) => None,
             None => o.project.pages.get(self.ed.page).map(|p| p.id.clone()),
@@ -8253,6 +8258,26 @@ mod nudge_tests {
         let (_host, guest) = crate::share::tests::let_in_guest(tmp.path()).unwrap();
         app.share = guest;
         app_frame(&mut app, &ctx, Vec::new(), false);
+        let open = app.open.as_ref().unwrap();
+        assert_eq!(open.dir, first, "not joined while the question is open");
+        assert!(open.dirty, "nothing was saved");
+        assert!(
+            matches!(app.dialog, Some(Dialog::Unsaved(Leave::Close))),
+            "the question stays"
+        );
+    }
+
+    /// An assistant's Undo syncs the session directly; it does not join a guest's copy while
+    /// the unsaved-changes question is open either (#1019).
+    #[test]
+    fn an_assistant_sync_waits_while_the_unsaved_changes_question_is_open() {
+        let (tmp, mut app, ctx) = changed_app();
+        let first = app.open.as_ref().unwrap().dir.clone();
+        app_frame(&mut app, &ctx, Vec::new(), true);
+        assert!(matches!(app.dialog, Some(Dialog::Unsaved(Leave::Close))));
+        let (_host, guest) = crate::share::tests::let_in_guest(tmp.path()).unwrap();
+        app.share = guest;
+        app.sync_session_now(false);
         let open = app.open.as_ref().unwrap();
         assert_eq!(open.dir, first, "not joined while the question is open");
         assert!(open.dirty, "nothing was saved");
