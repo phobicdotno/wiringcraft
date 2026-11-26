@@ -102,10 +102,11 @@ pub struct Editor {
     pub panel: Option<usize>,
     /// The device item picked in the panel view, by index into the panel's items.
     pub panel_pick: Option<usize>,
-    /// A device being dragged in the panel view: the grab offset, the undo history count
-    /// right after the drag's checkpoint (`None` until it is taken), and where the device was
-    /// when the drag started (Escape puts it back there).
-    pub panel_drag: Option<(Point, Option<u64>, Point)>,
+    /// An item being dragged in the panel view: the grab offset, the undo history count
+    /// right after the drag's checkpoint (`None` until it is taken), and the item as it was
+    /// when the drag started (Escape puts it back so). The drag ends when the history count
+    /// moves on without it.
+    pub panel_drag: Option<(Point, Option<u64>, wc_core::panel::PanelItem)>,
     /// Wire pins that line up when a symbol is placed or moved (the app sets it from the
     /// preferences). Holding Alt skips it once.
     pub auto_wire: bool,
