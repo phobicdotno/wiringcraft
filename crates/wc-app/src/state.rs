@@ -1779,6 +1779,207 @@ impl Open {
         Ok(n)
     }
 
+    /// Save the project as a copy in `target`, which must not exist yet or be an empty folder,
+    /// and go on working in the copy. Everything in the project folder is copied (its history
+    /// included), then the changes not saved yet are saved in the copy only, so the original
+    /// stays as it was last saved. Library folders given relative to the project and lying
+    /// outside it are pointed at the same folders from the new place; the project's own library
+    /// (inside it) is copied and stays the copy's own. Returns the folder the copy is in and the
+    /// links in the project folder (relative to it) that were left out of the copy. When saving
+    /// in the copy fails, the project goes on being worked on in its old folder.
+    pub fn save_as(&mut self, target: &Path) -> Result<(PathBuf, Vec<PathBuf>), String> {
+        // Resolved as the file system walks it (a link, then `..`), and that same folder is
+        // checked, copied into and worked in, so the check and the copy cannot part ways.
+        let target = destination(&crate::prefs::absolute(target)?)?;
+        let from = self.dir.clone();
+        // Both walked as the file system walks them, so another letter case on Windows, a link
+        // or `..` (in either, a link followed by `..` too) cannot hide that the target is
+        // inside the project.
+        let from_real = destination(&from)?;
+        if target.starts_with(&from_real) {
+            return Err(format!(
+                "{} is inside the project folder; pick a place outside it.",
+                target.display()
+            ));
+        }
+        // A linked git worktree's `.git` is a file pointing into another repository: a copy of
+        // it would record its versions in the original's history.
+        if from.join(".git").is_file() {
+            return Err(format!(
+                "{} is a linked git worktree; its history belongs to another repository, so it \
+                 cannot be copied as the copy's own. Copy the folder by hand and start a new history.",
+                from.display()
+            ));
+        }
+        // A repository whose git config names its own work tree would go on recording the
+        // original's files from the copy. With `extensions.worktreeConfig` git also reads
+        // `config.worktree`, whose `core.worktree` wins over the common one.
+        let git = from.join(".git");
+        if git_worktree_set(&git.join("config")) || git_worktree_set(&git.join("config.worktree")) {
+            return Err(format!(
+                "{}'s git history names its own work tree (core.worktree), so a copy would record \
+                 the original's files. Copy the folder by hand and start a new history.",
+                from.display()
+            ));
+        }
+        let existed = target.exists();
+        if existed && !target.is_dir() {
+            return Err(format!(
+                "{} already exists; pick a new name or an empty folder.",
+                target.display()
+            ));
+        }
+        if existed {
+            let mut entries =
+                std::fs::read_dir(&target).map_err(|e| format!("{} cannot be read: {e}", target.display()))?;
+            let empty = match entries.next() {
+                None => true,
+                Some(Ok(_)) => false,
+                Some(Err(e)) => return Err(format!("{} cannot be read: {e}", target.display())),
+            };
+            if !empty {
+                return Err(format!(
+                    "{} already exists; pick a new name or an empty folder.",
+                    target.display()
+                ));
+            }
+        }
+        // What a failed copy made is taken away again, so the same place can be tried again;
+        // the folder was new or empty, so all in it is the copy's. Says what is left when that
+        // fails.
+        let discard = || -> String {
+            let r = if existed {
+                std::fs::read_dir(&target).and_then(|d| {
+                    d.into_iter().try_for_each(|e| {
+                        let e = e?;
+                        if e.file_type()?.is_dir() {
+                            std::fs::remove_dir_all(e.path())
+                        } else {
+                            std::fs::remove_file(e.path())
+                        }
+                    })
+                })
+            } else {
+                std::fs::remove_dir_all(&target)
+            };
+            match r {
+                Ok(()) => format!("The copy in {} was taken away again", target.display()),
+                Err(e) => {
+                    crate::applog::warn(&format!("could not clear the failed copy in {}: {e}", target.display()));
+                    format!(
+                        "The copy in {} could not all be taken away again ({e}); remove what is left by hand",
+                        target.display()
+                    )
+                }
+            }
+        };
+        // A new folder is made here, once: another save to the same place that got there first
+        // makes this one fail before anything is copied, and nothing of that one is taken away.
+        if !existed {
+            target
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::create_dir(&target))
+                .map_err(|e| format!("Could not make {}: {e}", target.display()))?;
+        }
+        let mut links = Vec::new();
+        copy_dir(&from, &target, Path::new(""), &mut links)
+            .map_err(|e| format!("Copying to {} failed: {e}\n{}.", target.display(), discard()))?;
+        // A relative library folder outside the project is the same folder seen from the copy;
+        // one inside it was copied along. The file system walks it as far as it exists (a link
+        // followed by `..` goes where the file system says, not where the text does), also when
+        // the library folder itself is missing now; a route it cannot walk (through a file)
+        // stays the original's own, as a full path.
+        // A library inside the project whose route in the copy is not text (its real folder
+        // has a name that is not UTF-8) cannot be saved without changing that route: refused,
+        // naming the library.
+        let repoint = |libs: &mut Vec<wc_core::project::LibrarySource>| -> Result<(), String> {
+            for lib in libs {
+                if lib.kind == "folder" && Path::new(&lib.location).is_relative() {
+                    let Ok(at) = destination(&from.join(&lib.location)) else {
+                        lib.location = from.join(&lib.location).display().to_string();
+                        continue;
+                    };
+                    lib.location = match at.strip_prefix(&from_real) {
+                        // Inside the project (`library`, or `../design/library` from `design`):
+                        // copied along, so the copy's own, written from the copy's root.
+                        Ok(inside) if inside.as_os_str().is_empty() => ".".into(),
+                        Ok(inside) => match inside.to_str() {
+                            Some(t) => t.to_owned(),
+                            None => {
+                                return Err(format!(
+                                    "library {} lies in the project folder at {}, a name that cannot \
+                                     be saved as text; rename that folder and try again.",
+                                    lib.name,
+                                    inside.display()
+                                ));
+                            }
+                        },
+                        // A route the saved text can hold: the relative one when it is valid
+                        // text, otherwise the original's own route (through any link) as a
+                        // full path, which stays text.
+                        Err(_) => match relative_to(&at, &target).as_deref().and_then(Path::to_str) {
+                            Some(t) => t.to_owned(),
+                            None => from.join(&lib.location).display().to_string(),
+                        },
+                    };
+                }
+            }
+            Ok(())
+        };
+        // Undo and Redo must not bring the old folders back into the copy: their libraries are
+        // pointed from the copy too, all worked out before anything changes.
+        let mut libraries = self.project.meta.libraries.clone();
+        let mut steps: Vec<_> = self
+            .undo
+            .iter()
+            .chain(self.redo.iter())
+            .map(|p| p.meta.libraries.clone())
+            .collect();
+        if let Err(e) = repoint(&mut libraries).and_then(|()| steps.iter_mut().try_for_each(&repoint)) {
+            return Err(format!(
+                "{e}\n{}; you are still working in {}.",
+                discard(),
+                from.display()
+            ));
+        }
+        let (old_libraries, old_dirty) = (
+            std::mem::replace(&mut self.project.meta.libraries, libraries),
+            self.dirty,
+        );
+        // The save in the copy repairs stale symbol files there; the original still needs them.
+        let old_stale = self.stale_symbol_files.clone();
+        // Files a failed update could not put back are written again in the copy, under the
+        // copy's folder; the original's records stay as they were when the copy fails.
+        let old_unrestored = self.unrestored_files.clone();
+        self.unrestored_files = old_unrestored
+            .iter()
+            .map(|(path, f)| {
+                let path = path
+                    .strip_prefix(&from)
+                    .map_or_else(|_| path.clone(), |rel| target.join(rel));
+                (path, f.clone())
+            })
+            .collect();
+        self.dir = target.clone();
+        if let Err(e) = self.save() {
+            self.dir = from.clone();
+            self.project.meta.libraries = old_libraries;
+            self.dirty = old_dirty;
+            self.stale_symbol_files = old_stale;
+            self.unrestored_files = old_unrestored;
+            return Err(format!(
+                "{e}\n{}; you are still working in {}.",
+                discard(),
+                from.display()
+            ));
+        }
+        for (p, libs) in self.undo.iter_mut().chain(self.redo.iter_mut()).zip(steps) {
+            p.meta.libraries = libs;
+        }
+        Ok((target, links))
+    }
+
     /// Make sure a library symbol is vendored and pinned before it is placed. A symbol the
     /// project already pins (one no page uses is not loaded at open) is placed in the version
     /// it pins: its copy in the project, or that version put back from the library. Only a
@@ -1969,11 +2170,25 @@ impl Open {
         pins: &[wc_core::BoxPin],
         tag: Option<DeviceTag>,
     ) -> Result<String, String> {
-        let pg = self.project.pages.get(page).ok_or("no page")?;
         let (min, max) = (
             Point::new(a.x.min(b.x), a.y.min(b.y)),
             Point::new(a.x.max(b.x), a.y.max(b.y)),
         );
+        self.add_black_box_sized(page, min, (max.x - min.x, max.y - min.y), pins, tag)
+    }
+
+    /// [`Self::add_black_box`] from the box's top-left corner `at` and its size (width, height
+    /// in mm) as given: no size worked out from two corners, which could fall a hair short of a
+    /// point at the end of an edge.
+    pub fn add_black_box_sized(
+        &mut self,
+        page: usize,
+        at: Point,
+        (width, height): (f64, f64),
+        pins: &[wc_core::BoxPin],
+        tag: Option<DeviceTag>,
+    ) -> Result<String, String> {
+        let pg = self.project.pages.get(page).ok_or("no page")?;
         let (id, symbol_id) = {
             let mut n = 1usize;
             loop {
@@ -2004,8 +2219,7 @@ impl Open {
         let name = tag
             .as_ref()
             .map_or_else(|| "Black box".to_owned(), |t| format!("Black box {t}"));
-        let symbol =
-            wc_core::black_box(&symbol_id, &name, max.x - min.x, max.y - min.y, pins).map_err(|e| e.to_string())?;
+        let symbol = wc_core::black_box(&symbol_id, &name, width, height, pins).map_err(|e| e.to_string())?;
         self.write_symbol_file(&symbol)?;
         self.checkpoint();
         if let Some(t) = &tag {
@@ -2024,7 +2238,7 @@ impl Open {
             pg.symbols.push(PlacedSymbol {
                 id: id.clone(),
                 symbol: symbol_id,
-                at: min,
+                at,
                 rotation: Rotation::R0,
                 mirror: false,
                 tag,
@@ -2191,7 +2405,12 @@ impl Open {
                                 ));
                             }
                         }
-                        (None, Some(_)) => {}
+                        (None, Some(_)) => {
+                            warnings.push(format!(
+                                "wire {} on page {} ends on connection point {pin} of {on}, which the box did not have before: it now ends on the new point",
+                                w.id, p.number
+                            ));
+                        }
                     }
                 }
             }
@@ -2794,6 +3013,16 @@ impl Open {
         }
         self.checkpoint();
         self.project.meta.rules = rules;
+    }
+
+    /// Replace the project's `rules_off` (the library check rules it turns off). One undo
+    /// step; nothing changes when it is the same.
+    pub fn set_rules_off(&mut self, off: Vec<String>) {
+        if off == self.project.meta.rules_off {
+            return;
+        }
+        self.checkpoint();
+        self.project.meta.rules_off = off;
     }
 
     /// Keep `layout` as the project's layout for report `kind`, in place of its first one
@@ -3409,6 +3638,138 @@ fn restore_file(path: &Path, was: Option<&[u8]>) -> std::io::Result<()> {
     }
 }
 
+/// Copy a folder and everything in it. Links are not followed: a link is left out, so a copy
+/// never reaches outside the folder. Each link left out is added to `links`, as its path in
+/// the folder copied (`at` is where `from` is in it).
+fn copy_dir(from: &Path, to: &Path, at: &Path, links: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let dest = to.join(entry.file_name());
+        if kind.is_dir() {
+            copy_dir(&entry.path(), &dest, &at.join(entry.file_name()), links)?;
+        } else if kind.is_file() {
+            std::fs::copy(entry.path(), &dest)?;
+        } else {
+            links.push(at.join(entry.file_name()));
+        }
+    }
+    Ok(())
+}
+
+/// A path's parts with `.` dropped and `..` taken back where it can be (lexically).
+fn lexical_parts(p: &Path) -> Vec<std::path::Component<'_>> {
+    use std::path::Component;
+    let mut out: Vec<Component<'_>> = Vec::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir if matches!(out.last(), Some(Component::Normal(_))) => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Whether a git config file sets `core.worktree` (a work tree elsewhere than its folder).
+fn git_worktree_set(config: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(config) else {
+        return false;
+    };
+    let mut in_core = false;
+    for line in text.lines().map(str::trim) {
+        // A section header: `[core]`, maybe followed by a comment (which may hold quotes) or by
+        // a key on the same line. `[core "x"]` is another section.
+        let key_line = match line.strip_prefix('[') {
+            Some(header) => {
+                let (name, rest) = header.split_once(']').unwrap_or((header, ""));
+                in_core = name.trim().eq_ignore_ascii_case("core");
+                rest.trim()
+            }
+            None => line,
+        };
+        if in_core && !key_line.starts_with(['#', ';']) {
+            let key = key_line.split(['=', '#', ';']).next().unwrap_or_default().trim();
+            if key.eq_ignore_ascii_case("worktree") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// A full path as the file system walks it, one part at a time: each part that exists is
+/// resolved (links and letter case), a `..` goes up from the folder reached so far, and a
+/// part that does not exist yet is taken as written. `/w/link/../copy` with `link` pointing at
+/// `/w/a/b` is `/w/a/copy`; so is `/w/missing/../link/../copy`. A file with more parts after
+/// it (`/w/document/../copy`), or a part that cannot be looked up, is refused with the reason.
+fn destination(p: &Path) -> Result<PathBuf, String> {
+    use std::path::Component;
+    let parts: Vec<Component<'_>> = p.components().collect();
+    let mut out = PathBuf::new();
+    for (k, c) in parts.iter().enumerate() {
+        match c {
+            Component::Prefix(_) | Component::RootDir => out.push(c.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(name) => {
+                let next = out.join(name);
+                match std::fs::canonicalize(&next) {
+                    Ok(real) => {
+                        let more = parts[k + 1..].iter().any(|c| !matches!(c, Component::CurDir));
+                        if more && !real.is_dir() {
+                            return Err(format!("{} is a file, not a folder.", next.display()));
+                        }
+                        out = without_verbatim(real);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => out = next,
+                    Err(e) => return Err(format!("{} cannot be looked up: {e}", next.display())),
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// A resolved Windows path in its usual form (`C:\x`, not `\\?\C:\x`); others as they are.
+fn without_verbatim(p: PathBuf) -> PathBuf {
+    use std::path::{Component, Prefix};
+    let mut parts = p.components();
+    if let Some(Component::Prefix(pre)) = parts.next()
+        && let Prefix::VerbatimDisk(d) = pre.kind()
+    {
+        return PathBuf::from(format!("{}:", char::from(d))).join(parts.as_path());
+    }
+    p
+}
+
+/// `path` as seen from the folder `base`, both full paths: `../library` and the like. `None`
+/// when they share no root (another drive).
+fn relative_to(path: &Path, base: &Path) -> Option<PathBuf> {
+    let (p, b) = (lexical_parts(path), lexical_parts(base));
+    let common = p.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    if common == 0 {
+        return None;
+    }
+    let mut out = PathBuf::new();
+    for _ in common..b.len() {
+        out.push("..");
+    }
+    for c in p.iter().skip(common) {
+        out.push(c.as_os_str());
+    }
+    Some(if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    })
+}
+
 /// Whether a library item read for `id` is the version pinned as `pin` (its hash), or why
 /// not: a file that holds another item than its name says, or another version.
 fn version_fits(item_id: &str, hash: &str, id: &str, pin: &str) -> Result<(), String> {
@@ -3425,6 +3786,397 @@ fn version_fits(item_id: &str, hash: &str, id: &str, pin: &str) -> Result<(), St
 #[allow(clippy::unwrap_used)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn a_path_is_made_relative_to_another_folder() {
+        let r = |a: &str, b: &str| relative_to(Path::new(a), Path::new(b));
+        assert_eq!(r("/w/lib", "/w/copy"), Some(PathBuf::from("../lib")));
+        assert_eq!(r("/w/old/../lib", "/w/x/copy"), Some(PathBuf::from("../../lib")));
+        assert_eq!(r("/w/copy/sub", "/w/copy"), Some(PathBuf::from("sub")));
+    }
+
+    #[test]
+    fn save_as_copies_the_project_keeps_the_original_and_points_libraries_at_the_same_folder() {
+        let (tmp, mut o) = project();
+        let from = o.dir.clone();
+        let before = std::fs::read(from.join(store::PROJECT_FILE)).unwrap();
+        o.project.meta.libraries.push(wc_core::project::LibrarySource {
+            name: "shared".into(),
+            kind: "folder".into(),
+            location: "../library".into(),
+            reference: None,
+        });
+        // The project's own library, inside it, goes along with the copy.
+        o.project.meta.libraries.push(wc_core::project::LibrarySource {
+            name: "own".into(),
+            kind: "folder".into(),
+            location: "library".into(),
+            reference: None,
+        });
+        // The same library written through the folder above: still the project's own.
+        o.project.meta.libraries.push(wc_core::project::LibrarySource {
+            name: "own, the long way".into(),
+            kind: "folder".into(),
+            location: "../p/library".into(),
+            reference: None,
+        });
+        std::fs::create_dir_all(from.join("library").join("symbols")).unwrap();
+        std::fs::write(from.join("library").join("symbols").join("own.json"), "{}").unwrap();
+        o.checkpoint();
+        o.project.meta.name = "Changed".into();
+        o.dirty = true;
+        let to = tmp.path().join("copies").join("plant 2");
+        // The folder as the file system names it (a temp folder can be reached through a link
+        // or a short name).
+        assert_eq!(o.save_as(&to).unwrap(), (destination(&to).unwrap(), Vec::new()));
+        assert_eq!(o.dir, destination(&to).unwrap());
+        assert!(!o.dirty);
+        // The original is as it was last saved; the copy has the change and its library is
+        // the same folder seen from the new place.
+        assert_eq!(std::fs::read(from.join(store::PROJECT_FILE)).unwrap(), before);
+        let copy = Open::load(&to).unwrap();
+        assert_eq!(copy.project.meta.name, "Changed");
+        let lib = copy.project.meta.libraries.iter().find(|l| l.name == "shared").unwrap();
+        assert_eq!(Path::new(&lib.location), Path::new("../../library"));
+        let own = copy.project.meta.libraries.iter().find(|l| l.name == "own").unwrap();
+        assert_eq!(own.location, "library");
+        let long = copy
+            .project
+            .meta
+            .libraries
+            .iter()
+            .find(|l| l.name == "own, the long way")
+            .unwrap();
+        assert_eq!(Path::new(&long.location), Path::new("library"));
+        // The copy holds the library's files itself, where its libraries point.
+        assert!(to.join(&long.location).join("symbols").join("own.json").is_file());
+        assert_eq!(copy.project.pages.len(), o.project.pages.len());
+        // Undo goes back to the name before, not to the library folders seen from the original.
+        assert!(o.undo());
+        let shared = o.project.meta.libraries.iter().find(|l| l.name == "shared").unwrap();
+        assert_eq!(Path::new(&shared.location), Path::new("../../library"));
+        // Not over a folder with something in it, and not inside the project itself.
+        assert!(o.save_as(&from).unwrap_err().contains("already exists"));
+        assert!(o.save_as(&to.join("inner")).unwrap_err().contains("inside the project"));
+    }
+
+    #[test]
+    fn a_destination_is_resolved_as_the_file_system_walks_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = destination(tmp.path()).unwrap();
+        std::fs::create_dir_all(root.join("a").join("b")).unwrap();
+        // `..` in the part that does not exist yet goes up from the folder reached so far.
+        assert_eq!(
+            destination(&root.join("new").join("..").join("copy")).unwrap(),
+            root.join("copy")
+        );
+        assert_eq!(
+            destination(&root.join("a").join("..").join("copy")).unwrap(),
+            root.join("copy")
+        );
+        assert_eq!(
+            destination(&root.join("a").join("b").join("x")).unwrap(),
+            root.join("a").join("b").join("x")
+        );
+        // A file is not a folder to go through, even to come back out of it with `..`.
+        std::fs::write(root.join("document"), "text").unwrap();
+        let err = destination(&root.join("document").join("..").join("copy")).unwrap_err();
+        assert!(err.contains("is a file"), "{err}");
+        assert!(destination(&root.join("document").join("copy")).is_err());
+        // The file itself is a destination (Save as then says it already exists).
+        assert_eq!(destination(&root.join("document")).unwrap(), root.join("document"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_after_a_missing_folder_and_its_dots_is_still_followed() {
+        let (tmp, mut o) = project();
+        // `link` points at a folder inside the project; `missing/..` before it changes nothing.
+        std::fs::create_dir_all(o.dir.join("inner")).unwrap();
+        std::os::unix::fs::symlink(o.dir.join("inner"), tmp.path().join("link")).unwrap();
+        let typed = tmp
+            .path()
+            .join("missing")
+            .join("..")
+            .join("link")
+            .join("..")
+            .join("copy");
+        let err = o.save_as(&typed).unwrap_err();
+        assert!(err.contains("inside the project"), "{err}");
+        assert!(!o.dir.join("copy").exists() && !tmp.path().join("copy").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_project_opened_through_a_link_and_dots_refuses_a_copy_inside_its_real_folder() {
+        let (tmp, mut o) = project();
+        // The project is at `design/p`; it was opened as `link/../p`, `link` pointing at
+        // `design/inner`.
+        let design = tmp.path().join("design");
+        std::fs::create_dir_all(design.join("inner")).unwrap();
+        let name = o.dir.file_name().unwrap().to_owned();
+        std::fs::rename(&o.dir, design.join(&name)).unwrap();
+        std::os::unix::fs::symlink(design.join("inner"), tmp.path().join("link")).unwrap();
+        o.dir = tmp.path().join("link").join("..").join(&name);
+        let err = o.save_as(&design.join(&name).join("copy")).unwrap_err();
+        assert!(err.contains("inside the project"), "{err}");
+        // Beside it is fine.
+        o.save_as(&design.join("copy")).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_library_reached_through_a_link_and_dots_keeps_the_folder_the_link_leads_to() {
+        let (tmp, mut o) = project();
+        let x = tmp.path().join("x");
+        std::fs::create_dir_all(x.join("inner")).unwrap();
+        std::os::unix::fs::symlink(x.join("inner"), tmp.path().join("link")).unwrap();
+        // `../link/../library` is `x/library`, which does not exist yet.
+        o.project.meta.libraries.push(wc_core::project::LibrarySource {
+            name: "later".into(),
+            kind: "folder".into(),
+            location: "../link/../library".into(),
+            reference: None,
+        });
+        let to = tmp.path().join("copies").join("c");
+        o.save_as(&to).unwrap();
+        let lib = o.project.meta.libraries.iter().find(|l| l.name == "later").unwrap();
+        // Made later, it is the folder the copy reaches.
+        std::fs::create_dir_all(x.join("library")).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(to.join(&lib.location)).unwrap(),
+            std::fs::canonicalize(x.join("library")).unwrap()
+        );
+    }
+
+    #[test]
+    // Unix only: Windows takes `..` back by the text of a path (so does `std::path::absolute`
+    // there), so `document\..\copy` is the folder `copy`, as Windows itself reads it.
+    #[cfg(unix)]
+    fn save_as_through_a_file_is_refused_and_writes_nothing() {
+        let (tmp, mut o) = project();
+        std::fs::write(tmp.path().join("document"), "text").unwrap();
+        let typed = tmp.path().join("document").join("..").join("copy");
+        let err = o.save_as(&typed).unwrap_err();
+        assert!(err.contains("is a file"), "{err}");
+        assert!(!tmp.path().join("copy").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_as_through_a_link_and_dots_into_the_project_is_refused() {
+        let (tmp, mut o) = project();
+        // `link` points at a folder inside the project: `link/../copy` is inside it too.
+        std::fs::create_dir_all(o.dir.join("inner")).unwrap();
+        std::os::unix::fs::symlink(o.dir.join("inner"), tmp.path().join("link")).unwrap();
+        let typed = tmp.path().join("link").join("..").join("copy");
+        let err = o.save_as(&typed).unwrap_err();
+        assert!(err.contains("inside the project"), "{err}");
+        assert!(!o.dir.join("copy").exists() && !tmp.path().join("copy").exists());
+    }
+
+    #[test]
+    fn a_failed_save_as_leaves_the_symbol_repairs_for_the_original() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        o.place(1, "wc.lamp", Point::new(60.0, 20.0)).unwrap();
+        o.save().unwrap();
+        // Both files on disk hold another version than the loaded one.
+        let (coil, lamp) = (o.symbols["wc.coil"].clone(), o.symbols["wc.lamp"].clone());
+        for s in [&coil, &lamp] {
+            let mut other = s.clone();
+            other.name = "Other version".into();
+            store::write_vendored_symbol(&o.dir, &other).unwrap();
+            o.mark_symbol_file_stale(&s.id);
+        }
+        // In the copy the coil is repaired, then the lamp cannot be written: Save as fails.
+        o.fail_symbol_writes = [false, true].into();
+        let from = o.dir.clone();
+        assert!(o.save_as(&tmp.path().join("copy")).is_err());
+        assert_eq!(o.dir, from);
+        // Saving the original still repairs both of its files.
+        o.save().unwrap();
+        assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), coil);
+        assert_eq!(store::read_vendored_symbol(&o.dir, "wc.lamp").unwrap(), lamp);
+    }
+
+    #[test]
+    fn save_as_refuses_a_history_that_names_its_own_work_tree() {
+        let (tmp, mut o) = project();
+        std::fs::create_dir_all(o.dir.join(".git")).unwrap();
+        std::fs::write(
+            o.dir.join(".git").join("config"),
+            "[core]\n\tbare = false\n\tworktree = /elsewhere\n",
+        )
+        .unwrap();
+        let to = tmp.path().join("copy");
+        assert!(o.save_as(&to).unwrap_err().contains("core.worktree"));
+        assert!(!to.exists());
+        // A comment after the header, quotes and all, or the key on the header's line.
+        for config in [
+            "[core] # \"project worktree\"\n\tworktree = /elsewhere\n",
+            "[Core] worktree = /elsewhere\n",
+            "[remote \"origin\"]\n\turl = x\n[ core ]\n\tWorkTree=/elsewhere\n",
+        ] {
+            std::fs::write(o.dir.join(".git").join("config"), config).unwrap();
+            assert!(o.save_as(&to).unwrap_err().contains("core.worktree"), "{config}");
+        }
+        // Another section's `worktree`, or a commented one, is not core's.
+        for config in [
+            "[core \"x\"]\n\tworktree = /elsewhere\n",
+            "[core]\n\t# worktree = /elsewhere\n",
+        ] {
+            assert!(!git_worktree_set_in(config), "{config}");
+        }
+        // Without it the history is the copy's own.
+        std::fs::write(o.dir.join(".git").join("config"), "[core]\n\tbare = false\n").unwrap();
+        o.save_as(&to).unwrap();
+    }
+
+    #[test]
+    fn save_as_refuses_a_work_tree_named_in_the_per_worktree_config() {
+        let (tmp, mut o) = project();
+        let git = o.dir.join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        std::fs::write(
+            git.join("config"),
+            "[core]\n\tbare = false\n[extensions]\n\tworktreeConfig = true\n",
+        )
+        .unwrap();
+        std::fs::write(git.join("config.worktree"), "[core]\n\tworktree = /elsewhere\n").unwrap();
+        let to = tmp.path().join("copy");
+        assert!(o.save_as(&to).unwrap_err().contains("core.worktree"));
+        assert!(!to.exists());
+        // Without it the history is the copy's own.
+        std::fs::write(git.join("config.worktree"), "[core]\n\tsparseCheckout = false\n").unwrap();
+        o.save_as(&to).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_library_inside_the_project_whose_real_name_is_not_text_is_refused_and_the_original_stays() {
+        use std::os::unix::ffi::OsStrExt;
+        let (tmp, mut o) = project();
+        let odd = o.dir.join(std::ffi::OsStr::from_bytes(b"lib-\xff"));
+        // macOS file systems refuse a name that is not UTF-8: nothing to test there.
+        if std::fs::create_dir_all(&odd).is_err() {
+            return;
+        }
+        std::os::unix::fs::symlink(&odd, o.dir.join("lib-link")).unwrap();
+        o.project.meta.libraries.push(wc_core::project::LibrarySource {
+            name: "own".into(),
+            kind: "folder".into(),
+            location: "lib-link".into(),
+            reference: None,
+        });
+        let from = o.dir.clone();
+        let libraries = o.project.meta.libraries.clone();
+        let to = tmp.path().join("copy");
+        let err = o.save_as(&to).unwrap_err();
+        assert!(err.contains("library own"), "{err}");
+        assert_eq!(o.dir, from);
+        assert_eq!(o.project.meta.libraries, libraries);
+        assert!(!to.exists());
+    }
+
+    #[test]
+    fn save_as_puts_a_waiting_part_file_back_in_the_copy_and_leaves_the_original_record() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let pid = "example.ex-ct-9-24dc";
+        o.ensure_part(pid).unwrap();
+        changed_part_in_mine(&o, tmp.path(), pid);
+        let coil = o.symbols["wc.coil"].clone();
+        let lib = library_first(&mut o, tmp.path(), &coil);
+        o.save().unwrap();
+        let part_file = store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap();
+        let before = std::fs::read(&part_file).unwrap();
+        o.block_after_snapshot = Some(part_file.clone());
+        assert!(o.update_library(&lib, None).is_err());
+        assert_eq!(o.unrestored_files.len(), 1);
+        // A symbol file waits for its repair too.
+        let mut other = coil.clone();
+        other.name = "Other version".into();
+        store::write_vendored_symbol(&o.dir, &other).unwrap();
+        o.mark_symbol_file_stale("wc.coil");
+        // The blocker is copied along: writing the part in the copy fails, so Save as fails and
+        // the original keeps its record, still under its own folder.
+        let from = o.dir.clone();
+        assert!(o.save_as(&tmp.path().join("copy")).is_err());
+        assert_eq!(o.dir, from);
+        assert_eq!(o.unrestored_files.keys().collect::<Vec<_>>(), [&part_file]);
+        // With the blocker gone the part is written in the copy, not in the original.
+        std::fs::remove_dir(&part_file).unwrap();
+        let to = tmp.path().join("copy2");
+        o.save_as(&to).unwrap();
+        let copied = store::vendor_path(&to, ItemKind::Part, pid).unwrap();
+        assert_eq!(std::fs::read(&copied).unwrap(), before);
+        assert!(!part_file.exists(), "the original's file is not written by the copy");
+        assert!(o.unrestored_files.is_empty());
+        assert_eq!(store::read_vendored_symbol(&to, "wc.coil").unwrap(), coil);
+        assert_eq!(store::read_vendored_symbol(&from, "wc.coil").unwrap(), other);
+    }
+
+    fn git_worktree_set_in(config: &str) -> bool {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config");
+        std::fs::write(&path, config).unwrap();
+        git_worktree_set(&path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_library_reached_through_a_link_to_a_name_that_is_not_text_keeps_a_text_route() {
+        use std::os::unix::ffi::OsStrExt;
+        let (tmp, mut o) = project();
+        let odd = tmp.path().join(std::ffi::OsStr::from_bytes(b"shop-\xff"));
+        // macOS file systems refuse a name that is not UTF-8: nothing to test there.
+        if std::fs::create_dir_all(&odd).is_err() {
+            return;
+        }
+        std::os::unix::fs::symlink(&odd, tmp.path().join("shop-link")).unwrap();
+        o.project.meta.libraries.push(wc_core::project::LibrarySource {
+            name: "shop".into(),
+            kind: "folder".into(),
+            location: "../shop-link".into(),
+            reference: None,
+        });
+        let from = o.dir.clone();
+        o.save_as(&tmp.path().join("copies").join("copy")).unwrap();
+        let lib = o.project.meta.libraries.iter().find(|l| l.name == "shop").unwrap();
+        assert_eq!(Path::new(&lib.location), from.join("../shop-link"));
+        assert!(Path::new(&lib.location).is_dir());
+    }
+
+    #[test]
+    fn save_as_refuses_a_linked_git_worktree_and_leaves_nothing_behind() {
+        let (tmp, mut o) = project();
+        std::fs::write(o.dir.join(".git"), "gitdir: /elsewhere/.git/worktrees/p\n").unwrap();
+        let to = tmp.path().join("copy");
+        assert!(o.save_as(&to).unwrap_err().contains("linked git worktree"));
+        assert!(!to.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_as_follows_a_link_before_the_dots_of_a_library_folder() {
+        let (tmp, mut o) = project();
+        // `link/../library` is where the file system puts it: next to the link's target.
+        let deep = tmp.path().join("srv").join("shared").join("deep");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(tmp.path().join("srv").join("shared").join("library")).unwrap();
+        std::os::unix::fs::symlink(&deep, tmp.path().join("link")).unwrap();
+        o.project.meta.libraries.push(wc_core::project::LibrarySource {
+            name: "shared".into(),
+            kind: "folder".into(),
+            location: "../link/../library".into(),
+            reference: None,
+        });
+        let to = tmp.path().join("copy");
+        o.save_as(&to).unwrap();
+        let lib = o.project.meta.libraries.iter().find(|l| l.name == "shared").unwrap();
+        assert_eq!(Path::new(&lib.location), Path::new("../srv/shared/library"));
+    }
     use wc_core::project::LibrarySource;
 
     pub(crate) fn project() -> (tempfile::TempDir, Open) {

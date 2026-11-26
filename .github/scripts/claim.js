@@ -23,6 +23,30 @@ const MAX_HOURS = 24;
 const AGENT = /^[A-Za-z0-9][A-Za-z0-9._\/-]{0,59}$/;
 const HOUR = 3600 * 1000;
 const BACKLOG_HOURS = 6;
+// Requests that fail without reaching GitHub (no HTTP response, e.g. `fetch failed`) are tried
+// again a few times after a short wait. Exported so tests can make the wait zero.
+const RETRY = { tries: 3, delayMs: 2000 };
+
+/** A failure where no HTTP response came back: the request may never have reached GitHub. */
+function isNetworkError(e) {
+  // Octokit reports a failed fetch as a RequestError without `response` (status missing or 500).
+  return Boolean(e) && !e.response && (e.status === undefined || e.status === 500);
+}
+
+/**
+ * Run a GitHub request, trying again after a network error (2 s, then 4 s). Only for reads and
+ * idempotent writes: a comment whose response was lost could otherwise be posted twice.
+ */
+async function withRetry(fn) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      if (attempt >= RETRY.tries || !isNetworkError(e)) throw e;
+      await new Promise((resolve) => setTimeout(resolve, RETRY.delayMs * 2 ** (attempt - 1)));
+    }
+  }
+}
 
 function parseHours(text) {
   if (text === undefined) return DEFAULT_HOURS;
@@ -72,7 +96,7 @@ async function canWrite(github, owner, repo, login, association) {
   if (!permissions.has(login)) {
     let ok = false;
     try {
-      const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ owner, repo, username: login });
+      const { data } = await withRetry(() => github.rest.repos.getCollaboratorPermissionLevel({ owner, repo, username: login }));
       ok = WRITE.has(data.role_name || data.permission);
     } catch (e) {
       if (e.status !== 404) throw e;
@@ -182,13 +206,13 @@ function parseAgent(body) {
 }
 
 async function comments(github, owner, repo, issue_number) {
-  return github.paginate(github.rest.issues.listComments, { owner, repo, issue_number, per_page: 100 });
+  return withRetry(() => github.paginate(github.rest.issues.listComments, { owner, repo, issue_number, per_page: 100 }));
 }
 
 async function setLabel(github, owner, repo, issue_number, on) {
   try {
-    if (on) await github.rest.issues.addLabels({ owner, repo, issue_number, labels: [LABEL] });
-    else await github.rest.issues.removeLabel({ owner, repo, issue_number, name: LABEL });
+    if (on) await withRetry(() => github.rest.issues.addLabels({ owner, repo, issue_number, labels: [LABEL] }));
+    else await withRetry(() => github.rest.issues.removeLabel({ owner, repo, issue_number, name: LABEL }));
   } catch (e) {
     if (e.status !== 404) throw e;
   }
@@ -220,14 +244,27 @@ async function answer({ github, owner, repo, issue, comment, now }) {
  * Answer every command from the last hours that has no bot reply yet, oldest first. Every run does
  * this first: GitHub keeps only one pending run per concurrency group and cancels the others, so a
  * command whose own run was cancelled is answered by the next run.
+ *
+ * In a run for a pull request event a failure here is logged, not thrown: the pull request's check
+ * reflects only its own claim, and the next run answers the commands.
  */
-async function backlog({ github, context, now = Date.now() }) {
+async function backlog({ github, context, now = Date.now(), log }) {
+  try {
+    return await answerBacklog({ github, context, now });
+  } catch (e) {
+    if (!(context.payload && context.payload.pull_request)) throw e;
+    warn(log, `backlog: ${e.message || e} (left for the next run)`);
+    return [];
+  }
+}
+
+async function answerBacklog({ github, context, now }) {
   const { owner, repo } = context.repo;
   const since = new Date(now - BACKLOG_HOURS * HOUR).toISOString();
   // `since` filters on the last edit; a command counts only when it was also created in the window,
   // so editing an old command never runs it again. Its reply is newer than the command, so it is
   // in the window too.
-  const all = await github.paginate(github.rest.issues.listCommentsForRepo, { owner, repo, since, sort: 'created', direction: 'asc', per_page: 100 });
+  const all = await withRetry(() => github.paginate(github.rest.issues.listCommentsForRepo, { owner, repo, since, sort: 'created', direction: 'asc', per_page: 100 }));
   const answered = new Set();
   for (const c of all) {
     const data = isClaimBot(c) ? readMarker(c.body) : null;
@@ -243,7 +280,7 @@ async function backlog({ github, context, now = Date.now() }) {
     if (!m) continue;
     touched.add(Number(m[1]));
     if (answered.has(comment.id)) continue;
-    const issue = (await github.rest.issues.get({ owner, repo, issue_number: Number(m[1]) })).data;
+    const issue = (await withRetry(() => github.rest.issues.get({ owner, repo, issue_number: Number(m[1]) }))).data;
     if (issue.pull_request) continue;
     out.push(await answer({ github, owner, repo, issue, comment, now }));
   }
@@ -259,11 +296,24 @@ async function handleComment({ github, context, now = Date.now() }) {
   return backlog({ github, context, now });
 }
 
-/** Post a note on a pull request once: skipped when a bot note with the same key is there. */
-async function noteOnce(github, owner, repo, number, key, text) {
+/** A warning in the run log (an annotation in GitHub Actions) that does not fail the run. */
+function warn(log, text) {
+  (log || ((t) => console.log(`::warning::${t}`)))(text);
+}
+
+/**
+ * Post a note on a pull request once: skipped when a bot note with the same key is there. A note is
+ * a courtesy: when GitHub refuses it (permissions, rate limit) the failure is logged, not thrown,
+ * so it never fails the claim itself.
+ */
+async function noteOnce(github, owner, repo, number, key, text, log) {
   const tag = `<!-- ${MARK}-note ${key} -->`;
-  if ((await comments(github, owner, repo, number)).some((c) => isClaimBot(c) && String(c.body).includes(tag))) return;
-  await github.rest.issues.createComment({ owner, repo, issue_number: number, body: `${text}\n\n${tag}` });
+  try {
+    if ((await comments(github, owner, repo, number)).some((c) => isClaimBot(c) && String(c.body).includes(tag))) return;
+    await github.rest.issues.createComment({ owner, repo, issue_number: number, body: `${text}\n\n${tag}` });
+  } catch (e) {
+    warn(log, `PR #${number}: could not post note ${key}: ${e.message || e}`);
+  }
 }
 
 /**
@@ -271,7 +321,7 @@ async function noteOnce(github, owner, repo, number, key, text) {
  * activity (`updated_at`: pushes, edits), so the result does not depend on which event or run
  * computes it, and an event GitHub dropped from the queue loses nothing.
  */
-async function claimForPull({ github, owner, repo, pr, now }) {
+async function claimForPull({ github, owner, repo, pr, now, log }) {
   const refs = parseRefs(pr.title, pr.body);
   if (!refs.length) return [];
   if (!(await canWrite(github, owner, repo, pr.user && pr.user.login, pr.author_association))) {
@@ -280,7 +330,7 @@ async function claimForPull({ github, owner, repo, pr, now }) {
   const agent = parseAgent(pr.body) || (AGENT.test(pr.head.ref) ? pr.head.ref : null);
   if (!agent) {
     await noteOnce(github, owner, repo, pr.number, 'no-agent',
-      `The branch name \`${pr.head.ref}\` cannot be an agent name; add a line \`Agent: <name>\` to the description to claim ${refs.map((n) => `#${n}`).join(', ')}.`);
+      `The branch name \`${pr.head.ref}\` cannot be an agent name; add a line \`Agent: <name>\` to the description to claim ${refs.map((n) => `#${n}`).join(', ')}.`, log);
     return refs.map((n) => `#${n} no agent`);
   }
   const until = (Date.parse(pr.updated_at || '') || now) + DEFAULT_HOURS * HOUR;
@@ -289,7 +339,7 @@ async function claimForPull({ github, owner, repo, pr, now }) {
   for (const n of refs) {
     let issue;
     try {
-      issue = (await github.rest.issues.get({ owner, repo, issue_number: n })).data;
+      issue = (await withRetry(() => github.rest.issues.get({ owner, repo, issue_number: n }))).data;
     } catch (e) {
       if (e.status === 404) continue;
       throw e;
@@ -298,7 +348,7 @@ async function claimForPull({ github, owner, repo, pr, now }) {
     const state = readState(await comments(github, owner, repo, n));
     if (isActive(state, now) && state.agent !== agent) {
       await noteOnce(github, owner, repo, pr.number, `held-${n}-${state.agent}`,
-        `#${n} is locked by \`${state.agent}\` until ${stamp(Date.parse(state.until))}; this pull request does not hold it.`);
+        `#${n} is locked by \`${state.agent}\` until ${stamp(Date.parse(state.until))}; this pull request does not hold it.`, log);
       out.push(`#${n} held by ${state.agent}`);
       continue;
     }
@@ -325,21 +375,38 @@ async function claimForPull({ github, owner, repo, pr, now }) {
   return out;
 }
 
-/** Reconcile the claims of every open pull request (each run does this). */
-async function pulls({ github, context, now = Date.now() }) {
+/**
+ * Reconcile the claims of every open pull request (each run does this). Each pull request is
+ * handled on its own: an error on one is logged and the others still run, so one pull request's
+ * problem never turns another's check red. The run fails only when the pull request the event is
+ * about (pull_request_target) itself failed.
+ */
+async function pulls({ github, context, now = Date.now(), log }) {
   const { owner, repo } = context.repo;
-  const open = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', per_page: 100 });
+  const open = await withRetry(() => github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', per_page: 100 }));
+  const own = context.payload && context.payload.pull_request ? context.payload.pull_request.number : null;
   const out = [];
-  for (const pr of open) out.push(...(await claimForPull({ github, owner, repo, pr, now })).map((s) => `PR #${pr.number}: ${s}`));
+  let ownError = null;
+  for (const pr of open) {
+    try {
+      out.push(...(await claimForPull({ github, owner, repo, pr, now, log })).map((s) => `PR #${pr.number}: ${s}`));
+    } catch (e) {
+      const text = `PR #${pr.number}: error: ${e.message || e}`;
+      warn(log, text);
+      out.push(text);
+      if (pr.number === own) ownError = e;
+    }
+  }
+  if (ownError) throw ownError;
   return out;
 }
 
 /** One pull request, from its event payload (kept for direct use and tests). */
-async function handlePull({ github, context, now = Date.now() }) {
+async function handlePull({ github, context, now = Date.now(), log }) {
   const pr = context.payload.pull_request;
   if (!pr || pr.state !== 'open') return [];
   const { owner, repo } = context.repo;
-  return claimForPull({ github, owner, repo, pr, now });
+  return claimForPull({ github, owner, repo, pr, now, log });
 }
 
 async function sweep({ github, context, now = Date.now() }) {
@@ -371,7 +438,7 @@ async function sweep({ github, context, now = Date.now() }) {
 }
 
 module.exports = {
-  DEFAULT_HOURS, MAX_HOURS, LABEL,
+  DEFAULT_HOURS, MAX_HOURS, LABEL, RETRY,
   parseCommand, readState, isActive, decide, parseRefs, parseAgent, marker, readMarker,
-  handleComment, handlePull, sweep, backlog, pulls,
+  handleComment, handlePull, sweep, backlog, pulls, withRetry,
 };

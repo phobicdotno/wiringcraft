@@ -312,3 +312,95 @@ test('a collaborator with read access only cannot claim', async () => {
   assert.match(out[0], /write access/);
   assert.equal(c.readState(issues[3].comments).agent, null);
 });
+
+// Two open pull requests: #9 (claims #5) and #10 (claims #6).
+function twoPulls(bodyOf9 = 'Agent: a', refOf9 = 'x') {
+  const at = new Date(T0).toISOString();
+  const pr9 = { number: 9, state: 'open', title: 'One (#5)', body: bodyOf9, author_association: 'OWNER', user: { login: 'owner' }, head: { ref: refOf9 }, updated_at: at };
+  const pr10 = { number: 10, state: 'open', title: 'Two (#6)', body: 'Agent: b', author_association: 'OWNER', user: { login: 'owner' }, head: { ref: 'y' }, updated_at: at };
+  return {
+    5: { comments: [], labels: [], state: 'open' }, 6: { comments: [], labels: [], state: 'open' },
+    9: { comments: [], labels: [], state: 'open', pr: true, prData: pr9 }, 10: { comments: [], labels: [], state: 'open', pr: true, prData: pr10 },
+  };
+}
+const forbidden = () => Object.assign(new Error('Resource not accessible by integration'), { status: 403 });
+
+test('a note GitHub refuses is logged and does not fail the run', async () => {
+  const issues = twoPulls('', '_bad');
+  const { github } = fakeGithub(issues);
+  const create = github.rest.issues.createComment;
+  github.rest.issues.createComment = async (p) => { if (p.issue_number === 9) throw forbidden(); return create(p); };
+  const logged = [];
+  const out = await c.pulls({ github, context: { repo, payload: { pull_request: issues[9].prData } }, now: T0, log: (t) => logged.push(t) });
+  assert.deepEqual(out, ['PR #9: #5 no agent', 'PR #10: #6 claimed']);
+  assert.equal(logged.length, 1);
+  assert.match(logged[0], /PR #9: could not post note no-agent: Resource not accessible/);
+  assert.equal(c.readState(issues[6].comments).agent, 'b');
+});
+
+test('an error on one pull request does not stop or fail the others', async () => {
+  const issues = twoPulls();
+  const { github } = fakeGithub(issues);
+  const get = github.rest.issues.get;
+  github.rest.issues.get = async (p) => { if (p.issue_number === 5) throw Object.assign(new Error('API rate limit exceeded'), { status: 403 }); return get(p); };
+  const logged = [];
+  const log = (t) => logged.push(t);
+  // A run for another pull request, or the sweep, succeeds and still handles #10.
+  for (const payload of [{}, { pull_request: issues[10].prData }]) {
+    logged.length = 0;
+    const out = await c.pulls({ github, context: { repo, payload }, now: T0, log });
+    assert.equal(out[0], 'PR #9: error: API rate limit exceeded');
+    assert.match(out[1], /^PR #10: #6 (claimed|held)$/);
+    assert.deepEqual(logged, ['PR #9: error: API rate limit exceeded']);
+  }
+  assert.equal(c.readState(issues[6].comments).agent, 'b');
+  // The run for #9 itself fails, after the other pull requests were handled.
+  issues[6].comments.length = 0;
+  await assert.rejects(c.pulls({ github, context: { repo, payload: { pull_request: issues[9].prData } }, now: T0, log }), /rate limit/);
+  assert.equal(c.readState(issues[6].comments).agent, 'b');
+});
+
+test('a network error is tried again, an HTTP error is not', async () => {
+  const saved = c.RETRY.delayMs;
+  c.RETRY.delayMs = 0;
+  try {
+    const flaky = (fails, err) => { let n = 0; const fn = async () => { n++; if (n <= fails) throw err(); return 'ok'; }; return { fn, count: () => n }; };
+    const net = () => new Error('fetch failed');
+    const once = flaky(1, net);
+    assert.equal(await c.withRetry(once.fn), 'ok');
+    assert.equal(once.count(), 2);
+    const always = flaky(99, net);
+    await assert.rejects(c.withRetry(always.fn), /fetch failed/);
+    assert.equal(always.count(), c.RETRY.tries);
+    const http = flaky(1, () => Object.assign(new Error('Server Error'), { status: 500, response: { status: 500 } }));
+    await assert.rejects(c.withRetry(http.fn), /Server Error/);
+    assert.equal(http.count(), 1);
+  } finally {
+    c.RETRY.delayMs = saved;
+  }
+});
+
+test('backlog retries a dropped request and only warns about a failure in a pull request run', async () => {
+  const saved = c.RETRY.delayMs;
+  c.RETRY.delayMs = 0;
+  try {
+    const issues = { 3: { comments: [human(1, '/claim a')], labels: [], state: 'open' } };
+    const { github } = fakeGithub(issues);
+    const list = github.rest.issues.listCommentsForRepo;
+    let fails = 1;
+    github.rest.issues.listCommentsForRepo = (p) => { if (fails-- > 0) throw new Error('fetch failed'); return list(p); };
+    const out = await c.backlog({ github, context: { repo }, now: T0 });
+    assert.match(out[0], /^#3: Claimed by `a`/);
+
+    fails = 99;
+    const logged = [];
+    const log = (t) => logged.push(t);
+    const prRun = { repo, eventName: 'pull_request_target', payload: { pull_request: { number: 9 } } };
+    assert.deepEqual(await c.backlog({ github, context: prRun, now: T0, log }), []);
+    assert.deepEqual(logged, ['backlog: fetch failed (left for the next run)']);
+    // Any other run still fails, so the error is not hidden.
+    await assert.rejects(c.backlog({ github, context: { repo, payload: {} }, now: T0, log }), /fetch failed/);
+  } finally {
+    c.RETRY.delayMs = saved;
+  }
+});
