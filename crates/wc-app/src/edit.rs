@@ -97,6 +97,50 @@ impl Clipboard {
     }
 }
 
+/// Move the items of `sel` on page `p` by `d`: symbols, the wires they carry along, drawings,
+/// revision clouds and the revision table. Items not on the page are skipped.
+pub(crate) fn move_items(p: &mut Page, sel: &[Selection], d: Point) {
+    let (syms, wires) = ids(sel);
+    let carried: BTreeSet<String> = carried_wires(p, &syms, &wires)
+        .into_iter()
+        .map(|w| w.id.clone())
+        .collect();
+    for s in &mut p.symbols {
+        if syms.contains(s.id.as_str()) {
+            s.at = s.at + d;
+        }
+    }
+    for w in &mut p.wires {
+        if !carried.contains(&w.id) {
+            continue;
+        }
+        for v in &mut w.via {
+            *v = *v + d;
+        }
+        for e in [&mut w.from, &mut w.to] {
+            if let Endpoint::Point { at } = e {
+                *at = *at + d;
+            }
+        }
+    }
+    for i in graphic_ids(sel) {
+        if let Some(g) = p.graphics.get_mut(i) {
+            *g = g.translate(d);
+        }
+    }
+    for i in cloud_ids(sel) {
+        if let Some(c) = p.clouds.get_mut(i) {
+            c.min = c.min + d;
+            c.max = c.max + d;
+        }
+    }
+    if sel.contains(&Selection::RevisionTable)
+        && let Some(at) = &mut p.revision_table
+    {
+        *at = *at + d;
+    }
+}
+
 /// `n` with the word for one or for many.
 fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
@@ -668,51 +712,10 @@ impl Open {
 
     /// Move the selection by `d`. The caller takes the undo checkpoint (once per drag).
     pub fn move_by(&mut self, page: usize, sel: &[Selection], d: Point) {
-        let (syms, wires) = ids(sel);
-        let Some(p) = self.project.pages.get(page) else {
-            return;
-        };
-        let carried: BTreeSet<String> = carried_wires(p, &syms, &wires)
-            .into_iter()
-            .map(|w| w.id.clone())
-            .collect();
         let Some(p) = self.project.pages.get_mut(page) else {
             return;
         };
-        for s in &mut p.symbols {
-            if syms.contains(s.id.as_str()) {
-                s.at = s.at + d;
-            }
-        }
-        for w in &mut p.wires {
-            if !carried.contains(&w.id) {
-                continue;
-            }
-            for v in &mut w.via {
-                *v = *v + d;
-            }
-            for e in [&mut w.from, &mut w.to] {
-                if let Endpoint::Point { at } = e {
-                    *at = *at + d;
-                }
-            }
-        }
-        for i in graphic_ids(sel) {
-            if let Some(g) = p.graphics.get_mut(i) {
-                *g = g.translate(d);
-            }
-        }
-        for i in cloud_ids(sel) {
-            if let Some(c) = p.clouds.get_mut(i) {
-                c.min = c.min + d;
-                c.max = c.max + d;
-            }
-        }
-        if sel.contains(&Selection::RevisionTable)
-            && let Some(at) = &mut p.revision_table
-        {
-            *at = *at + d;
-        }
+        move_items(p, sel, d);
         self.edited();
     }
 
@@ -726,13 +729,9 @@ impl Open {
         let Some(p) = self.project.pages.get_mut(page) else {
             return;
         };
-        p.symbols.retain(|s| !syms.contains(s.id.as_str()));
-        p.wires.retain(|w| {
-            !wires.contains(w.id.as_str())
-                && ![&w.from, &w.to]
-                    .iter()
-                    .any(|e| pin_item(e).is_some_and(|i| syms.contains(i)))
-        });
+        let syms: Vec<&str> = syms.into_iter().collect();
+        let wires: Vec<&str> = wires.into_iter().collect();
+        p.remove_symbols_and_wires(&syms, &wires);
         let gone = graphic_ids(sel);
         let mut i = 0;
         p.graphics.retain(|_| {
@@ -776,6 +775,38 @@ impl Open {
             *p = turned;
         }
         true
+    }
+
+    /// Put device `tag` on panel layout `panel`, in one undo step: on the first DIN rail with
+    /// room, else at the top-left free spot, inside the plate. Returns its index in the panel's
+    /// items, or a plain message, with no undo step, when its part has no size or it does not
+    /// fit anywhere.
+    pub fn place_panel_device(&mut self, panel: usize, tag: &DeviceTag) -> Result<usize, String> {
+        use wc_core::panel::{PanelItem, part_size};
+        let Some(mut placed) = self.project.panels.get(panel).cloned() else {
+            return Err("That panel layout is gone.".into());
+        };
+        let size = self
+            .project
+            .devices
+            .get(tag)
+            .and_then(|d| d.part.as_ref())
+            .and_then(|id| self.parts.get(id))
+            .and_then(part_size)
+            .ok_or_else(|| format!("{tag} has no size: give its part a Width and Height first."))?;
+        let at = free_spot(&placed, size)
+            .ok_or_else(|| format!("{tag} ({} x {} mm) does not fit anywhere on the plate.", size.0, size.1))?;
+        placed.place_device(tag.clone(), at, size, Rotation::R0)?;
+        let index = placed
+            .items
+            .iter()
+            .position(|i| matches!(i, PanelItem::Device { tag: t, .. } if t == tag))
+            .ok_or("The device did not land on the plate.")?;
+        self.checkpoint();
+        if let Some(p) = self.project.panels.get_mut(panel) {
+            *p = placed;
+        }
+        Ok(index)
     }
 
     /// Take item `item` (a device, DIN rail or wire duct) off panel layout `panel`, in one undo
@@ -911,10 +942,193 @@ impl Open {
     }
 }
 
+/// Where an upright `size` device goes on `panel` without covering another device: the first
+/// free place along the DIN rails (top to bottom), centred on the rail, else the top-left free
+/// spot clear of devices and ducts. None when it fits nowhere on the plate.
+fn free_spot(panel: &wc_core::panel::Panel, size: (f64, f64)) -> Option<Point> {
+    use wc_core::panel::{GAP, PanelItem};
+    let (w, h) = size;
+    let eps = 1e-9;
+    let inside = |x: f64, y: f64| x >= -eps && y >= -eps && x + w <= panel.width + eps && y + h <= panel.height + eps;
+    let covering = |blocks: &[(Point, Point)], x: f64, y: f64, gap: f64| {
+        blocks
+            .iter()
+            .filter(|(min, max)| min.x < x + w && max.x > x && min.y < y + h && max.y > y)
+            .map(|(_, max)| max.x + gap)
+            .reduce(f64::max)
+    };
+    // Devices and ducts: nothing is placed over either (#937).
+    let mut blocks: Vec<(Point, Point)> = panel.items.iter().filter_map(PanelItem::device_bounds).collect();
+    blocks.extend(panel.items.iter().filter_map(|i| match i {
+        PanelItem::Duct { min, max } => Some((*min, *max)),
+        _ => None,
+    }));
+    let mut rails: Vec<(Point, f64)> = panel
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            PanelItem::Rail { at, length } => Some((*at, *length)),
+            _ => None,
+        })
+        .collect();
+    rails.sort_by(|a, b| a.0.y.total_cmp(&b.0.y).then(a.0.x.total_cmp(&b.0.x)));
+    // On a rail, a GAP clear of other devices and ducts when there is room, else flush.
+    let on_rail = |gap: f64| {
+        rails.iter().find_map(|(at, length)| {
+            let top = at.y - h / 2.0;
+            let mut x = at.x;
+            // Past every device and duct this outline would cover; each step moves right, so it ends.
+            while let Some(past) = covering(&blocks, x, top, gap) {
+                x = past;
+            }
+            (x + w <= at.x + length + eps && inside(x, top)).then(|| Point::new(x, top))
+        })
+    };
+    if let Some(p) = on_rail(GAP).or_else(|| on_rail(0.0)) {
+        return Some(p);
+    }
+    // Off the rails: the highest, then leftmost, corner next to a device or duct that is free,
+    // a GAP clear of it when there is room, else flush against it.
+    let corner = |gap: f64| {
+        let mut xs: Vec<f64> = std::iter::once(0.0)
+            .chain(blocks.iter().map(|(_, max)| max.x + gap))
+            .collect();
+        let mut ys: Vec<f64> = std::iter::once(0.0)
+            .chain(blocks.iter().map(|(_, max)| max.y + gap))
+            .collect();
+        xs.sort_by(f64::total_cmp);
+        ys.sort_by(f64::total_cmp);
+        ys.iter()
+            .flat_map(|y| xs.iter().map(move |x| Point::new(*x, *y)))
+            .find(|p| inside(p.x, p.y) && covering(&blocks, p.x, p.y, gap).is_none())
+    };
+    corner(GAP).or_else(|| corner(0.0))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rail_spot_under_a_duct_is_passed_over() {
+        use wc_core::panel::{GAP, Panel, PanelItem};
+        let mut p = Panel::new("panel1", "Main", 200.0, 100.0);
+        p.items.push(PanelItem::Rail {
+            at: Point::new(0.0, 50.0),
+            length: 200.0,
+        });
+        // Unobstructed: at the rail's start, centred on it.
+        assert_eq!(free_spot(&p, (45.0, 80.0)), Some(Point::new(0.0, 10.0)));
+        // A duct over the rail's start: the device goes on the rail past it, not into it.
+        p.items.push(PanelItem::Duct {
+            min: Point::new(0.0, 0.0),
+            max: Point::new(60.0, 100.0),
+        });
+        assert_eq!(free_spot(&p, (45.0, 80.0)), Some(Point::new(60.0 + GAP, 10.0)));
+    }
+
+    #[test]
+    fn a_device_that_only_fits_flush_against_a_duct_is_placed_there() {
+        use wc_core::panel::{GAP, Panel, PanelItem};
+        let mut p = Panel::new("panel1", "Main", 100.0, 100.0);
+        p.items.push(PanelItem::Duct {
+            min: Point::new(0.0, 0.0),
+            max: Point::new(55.0, 100.0),
+        });
+        // 45 mm wide fits only flush in the 45 mm left beside the duct, with no gap.
+        assert_eq!(free_spot(&p, (45.0, 80.0)), Some(Point::new(55.0, 0.0)));
+        // With room to spare it still keeps the gap.
+        assert_eq!(free_spot(&p, (40.0, 80.0)), Some(Point::new(55.0 + GAP, 0.0)));
+    }
+
+    #[test]
+    fn a_device_that_only_fits_flush_against_a_duct_stays_on_the_rail() {
+        use wc_core::panel::{GAP, Panel, PanelItem};
+        let mut p = Panel::new("panel1", "Main", 100.0, 100.0);
+        p.items.push(PanelItem::Rail {
+            at: Point::new(0.0, 50.0),
+            length: 100.0,
+        });
+        p.items.push(PanelItem::Duct {
+            min: Point::new(0.0, 0.0),
+            max: Point::new(55.0, 100.0),
+        });
+        // A gap would run it past the rail's end: flush on the rail, not off it.
+        assert_eq!(free_spot(&p, (45.0, 80.0)), Some(Point::new(55.0, 10.0)));
+        // With room to spare it keeps the gap on the rail.
+        assert_eq!(free_spot(&p, (40.0, 80.0)), Some(Point::new(55.0 + GAP, 10.0)));
+    }
+
+    #[test]
+    fn one_device_is_placed_on_the_plate_from_the_list_in_one_undo_step() {
+        use wc_core::panel::{Panel, PanelItem};
+        let (_tmp, mut o) = crate::state::tests::project();
+        let sized = |w: &str, h: &str| wc_core::Part {
+            properties: [("Width".to_owned(), w.to_owned()), ("Height".to_owned(), h.to_owned())].into(),
+            ..Default::default()
+        };
+        o.parts.insert("p.k".into(), sized("45", "80"));
+        o.parts.insert("p.big".into(), sized("900", "80"));
+        o.parts.insert("p.none".into(), wc_core::Part::default());
+        let tag = |s: &str| DeviceTag::parse(s).unwrap();
+        for (t, part) in [("-K1", "p.k"), ("-K2", "p.big"), ("-K3", "p.none")] {
+            let d = Device {
+                part: Some(part.into()),
+                ..Default::default()
+            };
+            o.project.devices.insert(tag(t), d);
+        }
+        o.project.panels.push(Panel::with_rails("panel1", "Main", 600.0, 400.0));
+        o.project.panels.push(Panel::new("panel2", "Bare", 300.0, 200.0));
+        let mark = o.undo_mark();
+
+        let i = o.place_panel_device(0, &tag("-K1")).unwrap();
+        assert_eq!(o.undo_mark(), mark + 1, "one undo step");
+        let p = &o.project.panels[0];
+        let (min, max) = p.items[i].device_bounds().unwrap();
+        assert!(
+            min.x >= 0.0 && min.y >= 0.0 && max.x <= p.width && max.y <= p.height,
+            "on the plate"
+        );
+        let rail = p.items.iter().find_map(|i| match i {
+            PanelItem::Rail { at, .. } => Some(*at),
+            _ => None,
+        });
+        assert_eq!(
+            Some((min.x, (min.y + max.y) / 2.0)),
+            rail.map(|r| (r.x, r.y)),
+            "on the first rail"
+        );
+        // A second one goes beside it, not on top of it.
+        o.project
+            .devices
+            .insert(tag("-K4"), o.project.devices[&tag("-K1")].clone());
+        let j = o.place_panel_device(0, &tag("-K4")).unwrap();
+        let (min2, _) = o.project.panels[0].items[j].device_bounds().unwrap();
+        assert!(min2.x >= max.x, "beside the first");
+        assert!(o.undo());
+        assert!(o.undo());
+        assert!(o.project.panels[0].device_tags().is_empty(), "Undo takes it off again");
+
+        // Without rails: the top-left corner.
+        let i = o.place_panel_device(1, &tag("-K1")).unwrap();
+        assert_eq!(
+            o.project.panels[1].items[i].device_bounds().map(|b| b.0),
+            Some(Point::new(0.0, 0.0))
+        );
+
+        // Too big, or no size: a message and no change.
+        let (before, mark) = (o.project.clone(), o.undo_mark());
+        assert!(
+            o.place_panel_device(0, &tag("-K2"))
+                .unwrap_err()
+                .contains("does not fit")
+        );
+        assert!(o.place_panel_device(0, &tag("-K3")).unwrap_err().contains("no size"));
+        assert_eq!(o.project, before);
+        assert_eq!(o.undo_mark(), mark);
+    }
 
     #[test]
     fn a_drawing_taken_off_is_selected_again_where_it_comes_back() {

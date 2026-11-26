@@ -583,7 +583,7 @@ pub fn library(ui: &mut egui::Ui, open: &Open, ed: &mut Editor, ps: &mut PanelSt
                 let r = row(ui, picked, lead, if vendored { text } else { text.italics() }, false).on_hover_text(hover);
                 if r.clicked() {
                     ed.place_symbol = Some(id.clone());
-                    ed.tool = Tool::Place;
+                    ed.set_tool(Tool::Place);
                     ed.wire = None;
                 }
             }
@@ -952,9 +952,12 @@ pub fn black_box_draft_refused(ps: &PanelState) -> bool {
 /// Apply the black box form shown in the Properties panel when it has changes not applied yet,
 /// as its Apply button does (one undo step): called before the project is saved (#932). A form
 /// read for another version of the box (after an Undo, say) is left alone, as the panel reads
-/// it again. Returns why the changes were refused, which the form also shows.
-pub fn apply_black_box_draft(open: &mut Open, ed: &mut Editor, ps: &mut PanelState) -> Option<String> {
-    let ((page, id, hash), form) = ps.black_box.as_mut()?;
+/// it again. Returns what to check after the change went in (`Ok(Some)`), or why it was refused
+/// (`Err`), which the form also shows.
+pub fn apply_black_box_draft(open: &mut Open, ed: &mut Editor, ps: &mut PanelState) -> Result<Option<String>, String> {
+    let Some(((page, id, hash), form)) = ps.black_box.as_mut() else {
+        return Ok(None);
+    };
     let current = open
         .project
         .pages
@@ -963,19 +966,16 @@ pub fn apply_black_box_draft(open: &mut Open, ed: &mut Editor, ps: &mut PanelSta
         .and_then(|s| open.symbols.get(&s.symbol))
         .map(|sym| sym.hash());
     if current.as_ref() != Some(hash) || !form.changed() {
-        return None;
+        return Ok(None);
     }
     match apply_box_form(open, ed, form, *page, id) {
         Ok(warnings) => {
-            if !warnings.is_empty() {
-                ed.message = format!("Black box changed. Check: {}.", warnings.join("; "));
-            }
             ps.black_box = None;
-            None
+            Ok((!warnings.is_empty()).then(|| format!("Black box changed. Check: {}.", warnings.join("; "))))
         }
         Err(e) => {
             form.error = Some(e.clone());
-            Some(format!("The black box was not changed: {e}"))
+            Err(format!("The black box was not changed: {e}"))
         }
     }
 }
@@ -2316,7 +2316,7 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mu
     }
     // Devices with a part that could go on the plate but are not on it.
     let on_plate = panel.device_tags();
-    let missing: Vec<String> = open
+    let missing: Vec<(wc_core::DeviceTag, String)> = open
         .project
         .devices
         .iter()
@@ -2325,18 +2325,38 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mu
             let part = open.parts.get(d.part.as_ref()?)?;
             (!on_door(part)).then(|| {
                 let size = part_size(part).map_or_else(|| "no size".to_owned(), |(w, h)| format!("{w} x {h}"));
-                format!("{tag}  ({size})")
+                (tag.clone(), format!("{tag}  ({size})"))
             })
         })
         .collect();
+    // Set when a Place button is pressed, applied once the panel is no longer borrowed (#928).
+    let mut place: Option<wc_core::DeviceTag> = None;
     if missing.is_empty() {
         ui.label(RichText::new("Every device with a part is on the plate.").color(t.faint));
     } else {
         ui.label(RichText::new(format!("Not on the plate yet ({})", missing.len())).color(t.muted));
-        for m in missing {
-            ui.label(RichText::new(m).monospace());
+        for (tag, m) in missing {
+            ui.horizontal(|ui| {
+                if ui
+                    .small_button("Place")
+                    .on_hover_text("Put this device on the first DIN rail with room, else in a free spot")
+                    .clicked()
+                {
+                    place = Some(tag);
+                }
+                ui.label(RichText::new(m).monospace());
+            });
         }
         ui.label(RichText::new("Page menu → Arrange devices puts them on the rails.").color(t.faint));
+    }
+    if let Some(tag) = place {
+        match open.place_panel_device(pi, &tag) {
+            Ok(item) => {
+                ed.panel_pick = Some(item);
+                ed.message = format!("Placed {tag} on the plate; drag it to move it.");
+            }
+            Err(e) => ed.message = e,
+        }
     }
     if let Some(item) = turn
         && !open.rotate_panel_device(pi, item)
@@ -2720,7 +2740,11 @@ mod tests {
         )?;
         let mut ed = Editor::default();
         let mut ps = PanelState::default();
-        assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), None, "no form shown");
+        assert_eq!(
+            apply_black_box_draft(&mut o, &mut ed, &mut ps),
+            Ok(None),
+            "no form shown"
+        );
         let t = Theme::of(&egui::Context::default());
         let ctx = egui::Context::default();
         crate::theme::install_fonts(&ctx);
@@ -2728,7 +2752,7 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| black_box_section(ui, &mut o, &mut ed, &mut ps, 1, &id, &t));
         });
         let steps = o.undo_steps();
-        assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), None);
+        assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), Ok(None));
         assert_eq!(o.undo_steps(), steps, "an unchanged form applies nothing");
         if let Some((_, f)) = ps.black_box.as_mut() {
             f.rows[0].name = "A".into();
@@ -2742,7 +2766,7 @@ mod tests {
             },
             Vec::new(),
         ));
-        assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), None);
+        assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), Ok(None));
         assert!(ed.wire.is_none(), "the wire from the renamed point is dropped");
         assert_eq!(o.undo_steps(), steps + 1, "one undo step");
         assert!(ps.black_box.is_none(), "the form is read again");
@@ -2762,7 +2786,7 @@ mod tests {
             f.rows[last].name = "A".into();
         }
         let refused = apply_black_box_draft(&mut o, &mut ed, &mut ps);
-        assert!(refused.is_some(), "a duplicate point name is refused");
+        assert!(refused.is_err(), "a duplicate point name is refused");
         assert_eq!(o.undo_steps(), steps + 1);
         assert!(ps.black_box.as_ref().is_some_and(|(_, f)| f.error.is_some()));
         Ok(())
@@ -2806,7 +2830,7 @@ mod tests {
             },
             Vec::new(),
         ));
-        assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), None);
+        assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), Ok(None));
         assert!(ps.black_box.is_none(), "applied");
         assert!(ed.wire.is_none(), "the wire from the point now named 2 is dropped");
         Ok(())
@@ -2850,7 +2874,7 @@ mod tests {
             },
             Vec::new(),
         ));
-        assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), None);
+        assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), Ok(None));
         assert!(ps.black_box.is_none(), "applied");
         assert!(ed.wire.is_none(), "the wire from the point taken off is dropped");
         Ok(())
