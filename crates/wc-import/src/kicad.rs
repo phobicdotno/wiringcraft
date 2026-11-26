@@ -182,7 +182,12 @@ pub fn symbols(text: &str, prefix: &str, scale: f64) -> Result<(Vec<Imported>, V
                 warnings.push(format!("{unit_name}: its id {id} is another symbol's, skipped"));
                 continue;
             }
-            match convert(&unit_name, sym, body, base, unit, prefix, scale) {
+            let mut skipped = BTreeMap::new();
+            let converted = convert(&unit_name, sym, body, base, unit, prefix, scale, &mut skipped);
+            for (kind, n) in skipped {
+                warnings.push(format!("{unit_name}: {n} {kind} item(s) not read"));
+            }
+            match converted {
                 Ok(symbol) => {
                     // Taken only once there is a symbol: one that draws nothing leaves its id free.
                     used.insert(id);
@@ -248,8 +253,19 @@ fn property<'a>(sym: &'a Sexp, key: &str) -> Option<&'a str> {
         .filter(|v| !v.is_empty() && *v != "~")
 }
 
-/// One unit of a symbol: the common unit's drawing and pins plus those of `wanted`.
-fn convert(name: &str, sym: &Sexp, body: &Sexp, base: &str, wanted: u32, prefix: &str, scale: f64) -> Result<Symbol> {
+/// One unit of a symbol: the common unit's drawing and pins plus those of `wanted`. Graphic
+/// items it cannot read are counted by kind in `skipped`.
+#[allow(clippy::too_many_arguments)]
+fn convert(
+    name: &str,
+    sym: &Sexp,
+    body: &Sexp,
+    base: &str,
+    wanted: u32,
+    prefix: &str,
+    scale: f64,
+    skipped: &mut BTreeMap<String, usize>,
+) -> Result<Symbol> {
     let id = format!("{}.{}", prefix.trim_end_matches('.'), crate::id_segment(name));
     store::check_id(&id)?;
     // KiCad y points up; the page's points down.
@@ -382,7 +398,62 @@ fn convert(name: &str, sym: &Sexp, body: &Sexp, base: &str, wanted: u32, prefix:
                         dir,
                     });
                 }
-                _ => {}
+                // KiCad 7+: a text with an optional border, `at` its top-left corner. Its lines
+                // are joined with a space into one text; margins are not kept.
+                Some("text_box") => {
+                    let (Some(t), Some(at)) = (g.arg(1), g.first("at")) else {
+                        continue;
+                    };
+                    let corner = pt(at.num(1).unwrap_or(0.0), at.num(2).unwrap_or(0.0));
+                    let height = g
+                        .first("effects")
+                        .and_then(|e| e.first("font"))
+                        .and_then(|f| f.first("size"))
+                        .and_then(|s| s.num(1))
+                        .unwrap_or(1.27)
+                        * scale;
+                    let size = g.first("size");
+                    let (w, h) = (
+                        size.and_then(|s| s.num(1)).unwrap_or(0.0) * scale,
+                        size.and_then(|s| s.num(2)).unwrap_or(0.0) * scale,
+                    );
+                    let stroke = g
+                        .first("stroke")
+                        .and_then(|s| s.first("width"))
+                        .and_then(|w| w.num(1))
+                        .unwrap_or(0.0);
+                    let fill = g.first("fill").and_then(|f| f.first("type")).and_then(|t| t.arg(1));
+                    if w > 0.0 && h > 0.0 && (stroke > 0.0 || fill.is_some_and(|f| f != "none")) {
+                        let (min, max) = (corner, Point::new(corner.x + w, corner.y + h));
+                        graphics.push(if filled(g) {
+                            Shape::Polyline {
+                                points: vec![min, Point::new(max.x, min.y), max, Point::new(min.x, max.y)],
+                                closed: true,
+                                filled: true,
+                            }
+                        } else {
+                            Shape::Rect { min, max }
+                        });
+                    }
+                    let text = t
+                        .split('\n')
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if !text.is_empty() {
+                        graphics.push(Shape::Text {
+                            at: Point::new(corner.x, corner.y + height),
+                            text,
+                            height,
+                            align: Align::Left,
+                            angle: at.num(3).map(|a| if a > 360.0 { a / 10.0 } else { a }).unwrap_or(0.0),
+                        });
+                    }
+                }
+                // `unit_name` only names the unit; anything else draws something not read here.
+                Some("unit_name") | None => {}
+                Some(other) => *skipped.entry(other.to_owned()).or_default() += 1,
             }
         }
     }
@@ -662,6 +733,51 @@ mod tests {
             warnings.iter().any(|w| w.starts_with("Relay_A: its id k.relay_a")),
             "{warnings:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_text_box_comes_in_as_text_and_border_and_unknown_items_are_reported() -> Result<()> {
+        let lib = r#"(kicad_symbol_lib
+  (symbol "T" (property "Reference" "T" (at 0 0 0))
+    (symbol "T_0_1"
+      (text_box "24 V\nDC" (at 1 4 0) (size 6 3) (stroke (width 0.254) (type default)) (fill (type none))
+        (effects (font (size 2 2)) (justify left top)))
+      (text_box "bare" (at 10 4 0) (size 6 3) (stroke (width 0) (type default)) (fill (type none))
+        (effects (font (size 1.27 1.27))))
+      (image (at 0 0) (data "AAAA"))
+      (image (at 1 1) (data "AAAA")))
+    (symbol "T_1_1"
+      (unit_name "Coil")
+      (pin passive line (at 0 0 0) (length 1) (name "~") (number "1")))))"#;
+        let (syms, warnings) = symbols(lib, "k", 1.0)?;
+        assert_eq!(syms.len(), 1, "{warnings:?}");
+        let g = &syms[0].symbol.graphics;
+        // The text sits one text height below the box's top-left corner, left-aligned.
+        assert!(
+            g.contains(&Shape::Text {
+                at: Point::new(1.0, -2.0),
+                text: "24 V DC".into(),
+                height: 2.0,
+                align: Align::Left,
+                angle: 0.0,
+            }),
+            "{g:?}"
+        );
+        // A visible border comes in as a rectangle; a box without one draws only its text.
+        assert!(
+            g.contains(&Shape::Rect {
+                min: Point::new(1.0, -4.0),
+                max: Point::new(7.0, -1.0),
+            }),
+            "{g:?}"
+        );
+        assert_eq!(g.iter().filter(|s| matches!(s, Shape::Rect { .. })).count(), 1, "{g:?}");
+        assert!(
+            g.iter()
+                .any(|s| matches!(s, Shape::Text { text, .. } if text == "bare"))
+        );
+        assert_eq!(warnings, ["T: 2 image item(s) not read"]);
         Ok(())
     }
 
