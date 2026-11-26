@@ -795,6 +795,8 @@ const POLYLINE_NOT_NUMBERS: &str = "LWPOLYLINE whose points are not numbers once
 const HATCH_NOT_NUMBERS: &str = "HATCH with a boundary that is not numbers";
 /// The `skipped` key of a line whose ends are not numbers once placed.
 const LINE_NOT_NUMBERS: &str = "LINE whose ends are not numbers once placed";
+/// The `skipped` key of an entity whose points are not numbers once moved into the page frame.
+const NOT_NUMBERS_ON_PAGE: &str = "entity whose points are not numbers once moved onto the page";
 
 /// Points along a B-spline from its control points, knots and weights, sampled evenly over the
 /// knot range. `None` when the data do not make a spline.
@@ -1752,6 +1754,9 @@ pub(crate) fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> 
             } else if kind == SPLINE_NOT_CURVE {
                 let s = if n == 1 { "" } else { "s" };
                 format!("{n} SPLINE{s} whose knots make no curve, drawn through their points")
+            } else if kind == NOT_NUMBERS_ON_PAGE {
+                let s = if n == 1 { "y" } else { "ies" };
+                format!("{n} entit{s} whose points are not numbers once moved onto the page, left out")
             } else if kind == LINE_NOT_NUMBERS {
                 let s = if n == 1 { "" } else { "s" };
                 format!("{n} line{s} whose ends are not numbers once placed, left out")
@@ -1984,7 +1989,7 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
         &mut { MAX_DRAWN },
     );
     out.graphics = raw.into_iter().map(|(_, s)| s).collect();
-    out.warnings = skipped_warnings(skipped);
+    out.warnings = skipped_warnings(skipped.clone());
     // Move into the frame: top-left at (20, 20) mm.
     let mut pts: Vec<Point> = out
         .graphics
@@ -2008,9 +2013,32 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
     }
     let (min, _) = wc_core::geom::bounds_of(&pts);
     let shift = Point::new(20.0 - min.x, 20.0 - min.y);
-    out.graphics = out.graphics.iter().map(|s| s.translate(shift)).collect();
-    for s in &mut out.symbols {
+    // A drawing spanning nearly all of f64 overflows once moved: what does is left out, said.
+    let finite = |p: Point| p.x.is_finite() && p.y.is_finite();
+    let before = out.graphics.len() + out.symbols.len();
+    out.graphics = out
+        .graphics
+        .iter()
+        .map(|s| s.translate(shift))
+        .filter(|s| {
+            let (a, b) = s.bounds();
+            finite(a) && finite(b)
+        })
+        .collect();
+    out.symbols.retain_mut(|s| {
         s.at = s.at + shift;
+        finite(s.at)
+    });
+    let moved_out = before - out.graphics.len() - out.symbols.len();
+    if moved_out > 0 {
+        *skipped.entry(NOT_NUMBERS_ON_PAGE.to_owned()).or_default() += moved_out;
+        out.warnings = skipped_warnings(skipped);
+        if out.graphics.is_empty() && out.symbols.is_empty() {
+            return Err(Error::Format(format!(
+                "the drawing has no entities WiringCraft can read: {}",
+                out.warnings.join("; ")
+            )));
+        }
     }
     Ok(out)
 }
@@ -2087,6 +2115,32 @@ mod tests {
             unreachable!("nothing left to draw");
         };
         assert!(err.to_string().contains("1 line whose ends are not numbers"), "{err}");
+        Ok(())
+    }
+
+    /// A drawing spanning nearly all of f64 overflows once moved into the frame: what does is
+    /// left out and said, never put on the page as not numbers.
+    #[test]
+    fn a_line_that_overflows_once_moved_onto_the_page_is_left_out_and_said() -> Result<()> {
+        let ents = "0\nLINE\n10\n-1e308\n20\n0\n11\n1e308\n21\n0\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n";
+        let p = page(&dxf(ents, ""), 1.0, &BTreeSet::new())?;
+        assert_eq!(p.graphics.len(), 1, "{:?}", p.graphics);
+        for g in &p.graphics {
+            let (a, b) = g.bounds();
+            assert!([a.x, a.y, b.x, b.y].iter().all(|v| v.is_finite()), "{g:?}");
+        }
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("1 entity whose points are not numbers once moved")),
+            "{:?}",
+            p.warnings
+        );
+        let only = "0\nLINE\n10\n-1e308\n20\n0\n11\n1e308\n21\n0\n";
+        let Err(err) = page(&dxf(only, ""), 1.0, &BTreeSet::new()) else {
+            unreachable!("nothing left to draw");
+        };
+        assert!(err.to_string().contains("once moved onto the page"), "{err}");
         Ok(())
     }
 
