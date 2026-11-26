@@ -1920,9 +1920,10 @@ fn stop_if_held(ed: &mut Editor, held: bool) {
 /// checkpoint (a rotate during the move, #863), only the move is taken back: the moved items go
 /// back to where they started and keep what was done to them, and the undo and redo steps
 /// recorded since get the start position too, so Undo then takes back the rotate alone. Once the
-/// move itself was undone during the drag, or the selection changed, the drag is only ended. A black box sizing drag
-/// (which only changes the box on release) and a selection box are just dropped. The drag ends,
-/// so the release that follows does nothing (no wiring of pins that line up).
+/// move itself was undone during the drag, or a frame moved another selection, the drag is only
+/// ended. A black box sizing drag (which only changes the box on release) and a selection box are
+/// just dropped. The drag ends, so the release that follows does nothing (no wiring of pins that
+/// line up).
 fn cancel_drag(open: &mut Open, ed: &mut Editor) {
     let drag = ed.drag.take();
     let moving = matches!(drag, Some(Drag::Move { .. }));
@@ -1961,12 +1962,13 @@ fn cancel_drag(open: &mut Open, ed: &mut Editor) {
             checkpoint: true,
             page,
             id,
-            items,
+            items: Some(items),
             ..
-            // Only a move of the same selection all along: another selection moved part of the
-            // way (or the selection changed since) leaves what each item moved unknown.
-        }) if items.as_ref() == Some(&ed.selection) => {
-            open.take_back_move(id, &page, &ed.selection.clone());
+            // `None` would mean a frame moved another selection, leaving what each item moved
+            // unknown: then nothing is taken back. A selection changed without moving (a right
+            // click on another item) still takes the drag's own items back.
+        }) => {
+            open.take_back_move(id, &page, &items);
         }
         Some(Drag::Logo {
             checkpoint: true, step, ..
@@ -4932,20 +4934,21 @@ mod tests {
     }
 
     #[test]
-    fn escape_after_a_rotate_with_another_selection_only_ends_the_drag() {
+    fn escape_after_a_rotate_takes_back_the_drags_own_items_when_the_selection_changed() {
         let (_tmp, mut o, mut ed, coil) = moving_coil();
         let page = ed.page;
         let at = |o: &Open| o.project.pages[page].symbol(&coil).map(|s| (s.at, s.rotation));
+        let Some((start, _)) = at(&o) else { unreachable!() };
+        let steps = o.undo_steps();
         drag(&mut o, &mut ed, Point::new(-40.0, 0.0));
         o.rotate_many(page, &ed.selection.clone());
-        let now = at(&o);
-        let steps = o.undo_steps();
-        // The selection changed during the drag (deleted, say): what it named is not the same.
+        let Some((_, turned)) = at(&o) else { unreachable!() };
+        // Another item picked (a right click) while the button is held, nothing moved since.
         ed.selection.clear();
         cancel_drag(&mut o, &mut ed);
         assert!(ed.drag.is_none());
-        assert_eq!(at(&o), now);
-        assert_eq!(o.undo_steps(), steps);
+        assert_eq!(at(&o), Some((start, turned)), "the coil goes back, still turned");
+        assert_eq!(o.undo_steps(), steps + 1, "the move's step is gone, the rotate's stays");
     }
 
     #[test]
