@@ -4840,6 +4840,9 @@ fn export_pdf_to(open: &Open, langs: &[String], path: &Path) -> String {
         ..Default::default()
     };
     let (bytes, report) = wc_pdf::export(project, &open.symbols, &options);
+    if report.pages == 0 {
+        return format!("Export failed: {}", wc_pdf::NOTHING_TO_EXPORT);
+    }
     let mut warnings = report.warnings;
     // The text itself stays out: this message goes to the diagnostic log, which never holds
     // drawing content. File, Translations, "Only missing" lists the texts.

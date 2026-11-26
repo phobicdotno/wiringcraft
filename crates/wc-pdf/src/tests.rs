@@ -2434,3 +2434,23 @@ fn a_declared_node_with_a_blank_tag_keeps_its_box_address_and_station() {
         report.warnings
     );
 }
+
+#[test]
+fn a_project_with_nothing_to_print_says_so() {
+    // No pages and no report tables: no sheet, so the caller is told instead of being handed a
+    // PDF no reader opens (#833).
+    let (_, report) = export(&Project::new("x"), &BTreeMap::new(), &Options::default());
+    assert_eq!(report.pages, 0);
+    assert_eq!(report.warnings, vec![NOTHING_TO_EXPORT.to_string()]);
+
+    // One page: no such warning.
+    let mut project = Project::new("x");
+    project.pages.push(Page::new("p1", "1", "Main"));
+    let (_, report) = export(&project, &BTreeMap::new(), &Options::default());
+    assert_eq!(report.pages, 1);
+    assert!(
+        !report.warnings.iter().any(|w| w == NOTHING_TO_EXPORT),
+        "{:?}",
+        report.warnings
+    );
+}

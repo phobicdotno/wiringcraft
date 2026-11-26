@@ -3563,6 +3563,9 @@ fn run(mut cli: Cli) -> Res<()> {
                     plc_cards,
                 },
             );
+            if report.pages == 0 {
+                return Err(wc_pdf::NOTHING_TO_EXPORT.into());
+            }
             write_out(&out, bytes).map_err(e)?;
             for w in &report.warnings {
                 eprintln!("warning: {}", escape_field(w));
