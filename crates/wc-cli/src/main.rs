@@ -323,7 +323,7 @@ enum Cmd {
     /// order under which headings, sorting, grouping and the title-block values above the table.
     #[command(subcommand)]
     ReportLayout(ReportLayoutCmd),
-    /// Set a device's part and description.
+    /// Set a device's part and description, or with neither option print them.
     Device {
         /// Device tag, e.g. `-K1` (taken as a value, though it starts with `-`).
         #[arg(allow_hyphen_values = true)]
@@ -3256,6 +3256,11 @@ fn run(cli: Cli) -> Res<()> {
         Cmd::Device { tag, part, description } => {
             let mut p = load(dir)?;
             let t = DeviceTag::parse(&tag).map_err(e)?;
+            if part.is_none() && description.is_none() {
+                let info = device_info(&p, &t)?;
+                print!("{info}");
+                return Ok(());
+            }
             if let Some(part) = &part
                 && store::read_vendored_part(dir, part).is_err()
             {
@@ -5710,6 +5715,30 @@ fn page_fields(p: &Project, page: usize) -> String {
     out
 }
 
+/// The part and description of device `tag`, one per line (`-` when unset), as
+/// `wiringcraft device <tag>` prints them. An error when no device has that tag, in the devices
+/// table or on a page.
+fn device_info(p: &Project, tag: &DeviceTag) -> Res<String> {
+    let drawn = || {
+        p.pages
+            .iter()
+            .any(|pg| pg.symbols.iter().any(|s| s.tag.as_ref() == Some(tag)))
+    };
+    let (part, description) = match p.devices.get(tag) {
+        Some(d) => (d.part.as_deref().unwrap_or(""), d.description.as_str()),
+        None if drawn() => ("", ""),
+        None => return Err(format!("no device {tag}")),
+    };
+    let show = |v: &str| if v.is_empty() { "-".to_owned() } else { escape_field(v) };
+    Ok(format!(
+        "{:<12} {}\n{:<12} {}\n",
+        "part",
+        show(part),
+        "description",
+        show(description)
+    ))
+}
+
 /// The current time in UTC as `YYYY-MM-DDThh:mm:ssZ`.
 fn utc_now() -> String {
     utc_date(now_secs())
@@ -6128,6 +6157,73 @@ mod tests {
         std::fs::remove_file(&vendored).unwrap();
         cli(&dir, &["wire", "p1", &format!("{s1}:1"), "0,0"]).unwrap();
         assert_eq!(load(&dir).unwrap().page("p1").unwrap().wires.len(), 3);
+    }
+
+    #[test]
+    fn device_with_only_a_tag_shows_it_and_changes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let mut p = load(&dir).unwrap();
+        let k1 = DeviceTag::parse("-K1").unwrap();
+        p.devices.insert(
+            k1.clone(),
+            wc_core::Device {
+                part: Some("maker.contactor".into()),
+                description: "Pump motor".into(),
+                ..Default::default()
+            },
+        );
+        // -K2 is drawn on a page but not in the devices table.
+        p.pages[0].symbols.push(PlacedSymbol {
+            id: "s1".into(),
+            symbol: "wc.coil".into(),
+            at: Point::new(10.0, 10.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: Some(DeviceTag::parse("-K2").unwrap()),
+        });
+        save(&dir, &p).unwrap();
+        let files = |d: &Path| {
+            let mut v: Vec<_> = std::fs::read_dir(d)
+                .unwrap()
+                .map(|f| f.unwrap().path())
+                // The lock file appears with the first command run; it is not project data.
+                .filter(|f| !f.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')))
+                .map(|f| {
+                    let body = if f.is_file() {
+                        std::fs::read(&f).unwrap()
+                    } else {
+                        Vec::new()
+                    };
+                    (f, body)
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        let before = files(&dir);
+
+        let p = load(&dir).unwrap();
+        assert_eq!(
+            device_info(&p, &k1).unwrap(),
+            "part         maker.contactor\ndescription  Pump motor\n"
+        );
+        let k2 = DeviceTag::parse("-K2").unwrap();
+        assert_eq!(device_info(&p, &k2).unwrap(), "part         -\ndescription  -\n");
+        cli(&dir, &["device", "-K1"]).unwrap();
+        cli(&dir, &["device", "-K2"]).unwrap();
+        let err = cli(&dir, &["device", "-K9"]).unwrap_err();
+        assert_eq!(err, "no device -K9");
+        assert_eq!(files(&dir), before, "showing a device saves nothing");
+        let p = load(&dir).unwrap();
+        assert!(!p.devices.contains_key(&DeviceTag::parse("-K9").unwrap()));
+        assert!(!p.devices.contains_key(&k2));
+
+        // An option still edits, and creates a device that was not there.
+        cli(&dir, &["device", "-K9", "--description", "Spare"]).unwrap();
+        let p = load(&dir).unwrap();
+        assert_eq!(p.devices[&DeviceTag::parse("-K9").unwrap()].description, "Spare");
     }
 
     #[test]
