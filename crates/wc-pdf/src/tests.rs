@@ -228,6 +228,74 @@ fn arcs_keep_their_side_in_svg_and_dxf() {
 }
 
 #[test]
+fn dxf_fills_junction_dots_and_filled_shapes() {
+    let wire = |id: &str, a: (f64, f64), b: (f64, f64)| Wire {
+        id: id.into(),
+        from: Endpoint::Point {
+            at: Point::new(a.0, a.1),
+        },
+        to: Endpoint::Point {
+            at: Point::new(b.0, b.1),
+        },
+        via: vec![],
+        number: None,
+        potential: None,
+        cable: None,
+        route: Default::default(),
+        spec: Default::default(),
+    };
+    let mut project = Project::new("Fills");
+    let mut p1 = Page::new("p1", "1", "Control");
+    // A T: the second wire ends in the middle of the first, a junction at (100, 50).
+    p1.wires.push(wire("w1", (50.0, 50.0), (150.0, 50.0)));
+    p1.wires.push(wire("w2", (100.0, 50.0), (100.0, 100.0)));
+    p1.graphics.push(Shape::Polyline {
+        points: vec![
+            Point::new(200.0, 100.0),
+            Point::new(210.0, 100.0),
+            Point::new(205.0, 90.0),
+        ],
+        closed: true,
+        filled: true,
+    });
+    project.pages = vec![p1];
+    let (pages, _) = page_drawings(&project, &BTreeMap::new(), &Options::default());
+    let h = pages[0].size_mm.1;
+    let d = dxf(&pages[0]);
+    assert!(!d.contains("0\nCIRCLE\n"), "no hollow circle for the dot: {d}");
+    // The dot: a closed polyline 0.6 wide of two half circles through 99.7 and 100.3.
+    let dot = format!(
+        "66\n1\n70\n1\n40\n0.6\n41\n0.6\n0\nVERTEX\n8\n0\n10\n99.7\n20\n{y}\n40\n0.6\n41\n0.6\n42\n1\n\
+         0\nVERTEX\n8\n0\n10\n100.3\n20\n{y}\n40\n0.6\n41\n0.6\n42\n1\n0\nSEQEND\n",
+        y = h - 50.0
+    );
+    assert!(d.contains(&dot), "{d}");
+    // The triangle: one SOLID with its last corner repeated.
+    let solid = format!(
+        "0\nSOLID\n8\nDRAWINGS\n62\n7\n10\n200\n20\n{a}\n11\n210\n21\n{a}\n12\n205\n22\n{b}\n13\n205\n23\n{b}\n",
+        a = h - 100.0,
+        b = h - 90.0
+    );
+    assert!(d.contains(&solid), "{d}");
+}
+
+#[test]
+fn filled_outlines_become_dxf_solids_when_convex() {
+    let Some(quad) = crate::vector::solid_triangles(&[(0.0, 0.0), (4.0, 0.0), (4.0, 3.0), (0.0, 3.0), (0.0, 0.0)])
+    else {
+        unreachable!("a rectangle is convex")
+    };
+    assert_eq!(quad, vec![[(0.0, 0.0), (4.0, 0.0), (0.0, 3.0), (4.0, 3.0)]]);
+    let Some(fan) = crate::vector::solid_triangles(&[(0.0, 0.0), (2.0, 0.0), (3.0, 1.0), (2.0, 2.0), (0.0, 2.0)])
+    else {
+        unreachable!("a pentagon is convex")
+    };
+    assert_eq!(fan.len(), 3);
+    // An arrow with a notch is not convex: it stays an outline.
+    assert!(crate::vector::solid_triangles(&[(0.0, 0.0), (4.0, 2.0), (0.0, 4.0), (1.0, 2.0)]).is_none());
+}
+
+#[test]
 fn wire_numbers_cross_references_and_drawings_are_optional_layers() {
     let mut project = Project::new("Layers");
     let mut p1 = Page::new("p1", "1", "Control");
