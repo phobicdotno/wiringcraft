@@ -267,6 +267,16 @@ pub fn permission_answer(params: &Value) -> (Value, bool) {
     (outcome, allow)
 }
 
+/// `session/update` kinds that are Claude saying or doing something in the turn. After one of
+/// these a failed turn is not offered again; status updates do not count.
+const TURN_OUTPUT: &[&str] = &[
+    "agent_message_chunk",
+    "agent_thought_chunk",
+    "tool_call",
+    "tool_call_update",
+    "plan",
+];
+
 /// The text of a content block.
 fn text_of(c: &Value) -> Option<&str> {
     (c["type"] == "text").then(|| c["text"].as_str()).flatten()
@@ -566,8 +576,11 @@ impl Acp {
                 self.send(&json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": format!("{m} is not offered")}}));
             }
             (Some("session/update"), None) => {
-                self.turn_output = true;
                 let u = &msg["params"]["update"];
+                // Status updates (commands, mode, model, usage) are not Claude answering.
+                if u["sessionUpdate"].as_str().is_some_and(|k| TURN_OUTPUT.contains(&k)) {
+                    self.turn_output = true;
+                }
                 match u["sessionUpdate"].as_str() {
                     Some("agent_message_chunk") => {
                         if let Some(t) = text_of(&u["content"]) {
@@ -867,5 +880,56 @@ read l
             .unwrap_or_default();
         assert_eq!(sent["params"]["prompt"][0]["type"], "image");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Run one prompt against a stand-in adapter that sends `update` (a `session/update`
+    /// notification's `update`) and then fails the prompt. Returns the last poll.
+    #[cfg(unix)]
+    fn failed_turn_after(name: &str, update: &str) -> Option<AcpPolled> {
+        let dir = std::env::temp_dir().join(format!("wc-acp-{name}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let script = dir.join("agent.sh");
+        let body = format!(
+            r#"#!/bin/sh
+read l; echo '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1}}}}'
+read l; echo '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"S"}}}}'
+read l; echo '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"S","update":{update}}}}}'
+echo '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32603,"message":"overloaded"}}}}'
+read l
+"#
+        );
+        std::fs::write(&script, body).ok()?;
+        let argv = vec!["sh".to_owned(), script.to_string_lossy().into_owned()];
+        let mut acp = Acp::start(&argv, &dir, json!({}), "note", "", Arc::new(|| {})).ok()?;
+        acp.prompt("hi", &[]);
+        let mut log = Vec::new();
+        let mut polled = AcpPolled::default();
+        for _ in 0..400 {
+            polled = acp.poll(&mut log);
+            if polled.finished {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        drop(acp);
+        let _ = std::fs::remove_dir_all(&dir);
+        Some(polled)
+    }
+
+    /// A status update from the adapter is not Claude answering, so the failed message is
+    /// still offered again; words from Claude are.
+    #[cfg(unix)]
+    #[test]
+    fn only_claudes_own_output_keeps_a_failed_turn_answered() {
+        let status = r#"{"sessionUpdate":"available_commands_update","availableCommands":[]}"#;
+        let Some(p) = failed_turn_after("status", status) else {
+            return;
+        };
+        assert!(p.finished && p.unanswered, "{p:?}");
+        let words = r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"On it"}}"#;
+        let Some(p) = failed_turn_after("words", words) else {
+            return;
+        };
+        assert!(p.finished && !p.unanswered, "{p:?}");
     }
 }
