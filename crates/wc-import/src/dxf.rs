@@ -1412,34 +1412,31 @@ impl Cursor<'_> {
 /// [`MAX_BULGED_POINTS`] (checked before any is made).
 fn bulged(vertices: &[((f64, f64), f64)], closed: bool) -> std::result::Result<Vec<(f64, f64)>, BulgeError> {
     let n = vertices.len();
-    // Each bulged side adds at most the steps of its sweep (4 atan(bulge)) to its start vertex,
-    // as `arc_points` samples it.
-    let total = vertices.iter().fold(n, |sum, (_, bulge)| {
-        let sweep = (4.0 * bulge.atan()).abs();
-        let steps = if bulge.abs() < 1e-9 {
-            0
-        } else {
-            ((TURN_STEPS * sweep / std::f64::consts::TAU).ceil() as usize).max(2)
-        };
+    // The side from vertex i: its end, when it is an arc (a bulge and a chord to bend).
+    let arc_side = |i: usize| {
+        let (a, bulge) = vertices[i];
+        let &(b, _) = vertices.get(i + 1).or(if closed { vertices.first() } else { None })?;
+        let chord = (b.0 - a.0).hypot(b.1 - a.1);
+        (bulge.abs() >= 1e-9 && chord >= 1e-12).then_some((a, b, bulge, chord))
+    };
+    // Each arc side adds the inner samples of its sweep (4 atan(bulge)) after its start vertex,
+    // as `arc_points` samples it: a quick check before anything is made.
+    let expected = (0..n).fold(n, |sum, i| {
+        let steps = arc_side(i).map_or(0, |(_, _, bulge, _)| {
+            let sweep = (4.0 * bulge.atan()).abs();
+            ((TURN_STEPS * sweep / std::f64::consts::TAU).ceil() as usize).max(2) - 1
+        });
         sum.saturating_add(steps)
     });
-    if total > MAX_BULGED_POINTS {
+    if expected > MAX_BULGED_POINTS {
         return Err(BulgeError::TooManyPoints);
     }
-    let mut out = Vec::with_capacity(total);
-    for i in 0..n {
-        let (a, bulge) = vertices[i];
+    let mut out = Vec::with_capacity(expected);
+    for (i, &(a, _)) in vertices.iter().enumerate() {
         out.push(a);
-        let Some(&(b, _)) = vertices.get(i + 1).or(if closed { vertices.first() } else { None }) else {
+        let Some((a, b, bulge, chord)) = arc_side(i) else {
             continue;
         };
-        if bulge.abs() < 1e-9 {
-            continue;
-        }
-        let chord = (b.0 - a.0).hypot(b.1 - a.1);
-        if chord < 1e-12 {
-            continue;
-        }
         let sweep = 4.0 * bulge.atan();
         let r = chord / (2.0 * (sweep / 2.0).sin()).abs();
         // Centre: from the chord's midpoint along its normal.
@@ -1453,7 +1450,13 @@ fn bulged(vertices: &[((f64, f64), f64)], closed: bool) -> std::result::Result<V
         if pts.len() < 2 || !pts.iter().all(|p| p.0.is_finite() && p.1.is_finite()) {
             return Err(BulgeError::NotNumbers);
         }
-        out.extend(pts.iter().skip(1).take(pts.len().saturating_sub(2)));
+        // Rounding can put the centre where the arc comes out a full turn, more points than
+        // the quick check counted: the limit holds for the points actually made.
+        let inner = pts.len().saturating_sub(2);
+        if out.len() + inner + (n - 1 - i) > MAX_BULGED_POINTS {
+            return Err(BulgeError::TooManyPoints);
+        }
+        out.extend(pts.iter().skip(1).take(inner));
     }
     Ok(out)
 }
@@ -3001,9 +3004,16 @@ mod tests {
                 .any(|w| w.starts_with("1 HATCH with a boundary whose arcs")),
             "{warnings:?}"
         );
-        // Just under the limit, a polyline is still sampled.
-        let ok: Vec<((f64, f64), f64)> = (0..5000).map(|i| ((f64::from(i), 0.0), 1.0)).collect();
-        assert!(bulged(&ok, false).is_ok_and(|pts| pts.len() > 100_000));
+        // Just under the limit, a polyline is still sampled: 5500 closed half circles make
+        // 5500 * 36 = 198 000 points.
+        let ok: Vec<((f64, f64), f64)> = (0..5500).map(|i| ((f64::from(i), 0.0), 1.0)).collect();
+        assert!(bulged(&ok, true).is_ok_and(|pts| pts.len() == 198_000));
+        // Far from the origin rounding can put an arc's centre on its end, so each side comes
+        // out a full turn: the limit holds for the points actually made, not the bulges' count.
+        let far: Vec<((f64, f64), f64)> = (0..8000)
+            .map(|i| ((1e16 + if i % 2 == 0 { 0.0 } else { 2.0 }, 1e16), 0.5))
+            .collect();
+        assert_eq!(bulged(&far, true), Err(BulgeError::TooManyPoints));
         Ok(())
     }
 
