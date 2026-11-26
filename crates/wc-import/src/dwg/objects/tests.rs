@@ -1185,6 +1185,20 @@ fn a_classic_polyline_keeps_the_bulges_of_its_vertices() -> TestResult {
         let ys = p.iter().map(|p| p.y);
         ys.clone().fold(f64::MIN, f64::max) - ys.fold(f64::MAX, f64::min)
     };
+    // A start width that is no number leaves the fields after it unknown: the vertex is
+    // damaged, not read with the end width taken for the bulge.
+    for width in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let d = drawing(&polyline(1.0, width))?;
+        // Both vertices carry the width, so both are damaged.
+        assert_eq!(d.skipped.get(DAMAGED), Some(&2), "width {width}: {:?}", d.skipped);
+        assert!(
+            d.model
+                .iter()
+                .all(|s| !matches!(s, Shape::Polyline { points, .. } if points.len() > 2)),
+            "width {width}: {:?}",
+            d.model
+        );
+    }
     for width in [0.0, -0.5] {
         for points in shapes(&polyline(1.0, width))? {
             assert!(

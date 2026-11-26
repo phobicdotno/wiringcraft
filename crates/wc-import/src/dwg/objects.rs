@@ -911,7 +911,13 @@ fn decode(
             // A 2D vertex (a 3D one stops at its point) has its widths and then the bulge of
             // the segment it starts; a negative start width stands for both, with no end width.
             if o.kind == 10 {
-                if o.data.bd()? >= 0.0 {
+                // A start width that is no number says neither layout: the fields after it
+                // cannot be told apart, so the vertex is damaged.
+                let start_width = o.data.bd()?;
+                if !start_width.is_finite() {
+                    return Err(bad("a vertex width is not a number"));
+                }
+                if start_width >= 0.0 {
                     o.data.bd()?;
                 }
                 let bulge = o.data.bd()?;
