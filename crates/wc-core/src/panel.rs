@@ -267,6 +267,47 @@ impl Panel {
             })
             .collect()
     }
+
+    /// Change the plate's size to `width` x `height` millimetres, leaving rails, ducts and
+    /// devices where they are. Nothing changes and an error says why when the size is not a
+    /// positive finite number or something on the plate would stick out of the new size; the
+    /// error names each such thing.
+    pub fn resize(&mut self, width: f64, height: f64) -> Result<(), String> {
+        if !(width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0) {
+            return Err(format!("plate size must be positive, got {width} x {height} mm"));
+        }
+        // A small tolerance, so something flush with the new edge still counts as on the plate.
+        let eps = 1e-9;
+        let outside =
+            |min: Point, max: Point| min.x < -eps || min.y < -eps || max.x > width + eps || max.y > height + eps;
+        let sticking_out: Vec<String> = self
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                PanelItem::Rail { at, length } => {
+                    // A 35 mm rail on its centre line.
+                    let (min, max) = (Point::new(at.x, at.y - 17.5), Point::new(at.x + length, at.y + 17.5));
+                    outside(min, max).then(|| format!("rail at {},{}", at.x, at.y))
+                }
+                PanelItem::Duct { min, max } => {
+                    outside(*min, *max).then(|| format!("duct {},{} to {},{}", min.x, min.y, max.x, max.y))
+                }
+                PanelItem::Device { tag, .. } => {
+                    let (min, max) = item.device_bounds()?;
+                    outside(min, max).then(|| tag.to_string())
+                }
+            })
+            .collect();
+        if !sticking_out.is_empty() {
+            return Err(format!(
+                "a {width} x {height} mm plate would leave these sticking out: {}",
+                sticking_out.join(", ")
+            ));
+        }
+        self.width = width;
+        self.height = height;
+        Ok(())
+    }
 }
 
 /// A part's footprint (width, height) in millimetres, if it has one. Each dimension comes from
@@ -847,6 +888,48 @@ mod tests {
         let (min, max, a, b) = frame_and_edge(Rotation::R270);
         assert!(close(min, 10.0, 30.0) && close(max, 110.0, 50.0));
         assert!(close(a, 10.0, 50.0) && close(b, 10.0, 30.0), "{a:?} {b:?}");
+    }
+
+    #[test]
+    fn resizing_a_plate_keeps_its_layout_and_refuses_a_size_that_leaves_things_out() {
+        let mut p = Panel::with_rails("p", "P", 600.0, 800.0);
+        let Some(t) = tag("-K1") else { unreachable!() };
+        let Ok(()) = p.place_device(t, Point::new(100.0, 400.0), (45.0, 85.0), Rotation::R0) else {
+            unreachable!()
+        };
+        let items = p.items.clone();
+        // Taller: rails, ducts and the device stay as they are.
+        let Ok(()) = p.resize(600.0, 1000.0) else {
+            unreachable!()
+        };
+        assert_eq!((p.width, p.height), (600.0, 1000.0));
+        assert_eq!(p.items, items);
+        // Narrower than the ducts and rails reach, and shorter than the device sits: refused,
+        // naming them, and nothing changes.
+        let before = p.clone();
+        let Err(err) = p.resize(300.0, 450.0) else {
+            unreachable!()
+        };
+        assert!(
+            err.contains("-K1") && err.contains("rail at ") && err.contains("duct "),
+            "{err}"
+        );
+        assert_eq!(p, before);
+        // Only the device sticks out.
+        let mut lone = Panel::new("l", "L", 600.0, 800.0);
+        lone.items = vec![items[items.len() - 1].clone()];
+        let Err(err) = lone.resize(140.0, 800.0) else {
+            unreachable!()
+        };
+        assert_eq!(err, "a 140 x 800 mm plate would leave these sticking out: -K1");
+        // Flush with the new edge is fine.
+        let Ok(()) = lone.resize(145.0, 485.0) else {
+            unreachable!()
+        };
+        for (w, h) in [(0.0, 100.0), (100.0, -1.0), (f64::NAN, 100.0), (100.0, f64::INFINITY)] {
+            assert!(lone.resize(w, h).is_err(), "{w} x {h}");
+        }
+        assert_eq!((lone.width, lone.height), (145.0, 485.0));
     }
 
     #[test]
