@@ -1938,8 +1938,14 @@ fn run(cli: Cli) -> Res<()> {
                     let strip = DeviceTag::parse(&strip).map_err(e)?;
                     let (symbols, unreadable) = store::vendored_symbols(dir, &p);
                     let strips = wc_core::project::strip_terminals(&p, |id| symbols.get(id).map(|s| s.role));
-                    if !strips.contains_key(&strip) {
+                    let Some(rail) = strips.get(&strip) else {
                         return Err(no_strip(&strip, &unreadable));
+                    };
+                    // Every terminal must be on the strip, drawn or spare, as `strip move` checks.
+                    for t in terminals.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
+                        if !rail.iter().any(|(n, _)| n == t) {
+                            return Err(format!("{strip} has no terminal {}", escape_field(t)));
+                        }
                     }
                     p.meta.add_jumper(&strip, &terminals)?;
                     save(dir, &p)?;
@@ -6572,6 +6578,9 @@ mod tests {
         assert_eq!(err, "no terminal strip -X1");
         assert!(load(&dir).unwrap().meta.jumpers.is_empty());
         draw_x1_terminals(&dir);
+        let err = cli(&dir, &["jumper", "add", "--", "-X1", "3", "99"]).unwrap_err();
+        assert_eq!(err, "-X1 has no terminal 99");
+        assert!(load(&dir).unwrap().meta.jumpers.is_empty(), "nothing saved");
         cli(&dir, &["jumper", "add", "--", "-X1", "3", "4"]).unwrap();
         let x1 = DeviceTag::parse("-X1").unwrap();
         let saved = load(&dir).unwrap().meta.jumpers;
