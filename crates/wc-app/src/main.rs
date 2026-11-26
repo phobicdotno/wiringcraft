@@ -2053,6 +2053,50 @@ impl App {
         }
     }
 
+    /// Whether keyboard edits may change the project now: no dialog, import or symbol editor
+    /// has the keyboard.
+    fn keyboard_edits(&self) -> bool {
+        self.dialog.is_none() && self.importing.is_none() && self.symbol_editor.is_none()
+    }
+
+    /// The panel view's arrow presses this frame, with the Undo and Redo shortcuts among them,
+    /// taken out of the input in the order they came; none when the arrows do not move the
+    /// picked device now (as when a dialog has the keyboard). None either when a mouse button
+    /// went down or up this frame: a click can pick another device, which the panel view does
+    /// later in the frame, so the keys are left to it.
+    fn panel_keys(&self, ctx: &egui::Context) -> Vec<panel_view::PanelKey> {
+        if ctx.input(|i| i.pointer.any_pressed() || i.pointer.any_released()) {
+            return Vec::new();
+        }
+        match self.open.as_ref() {
+            Some(open) if panel_view::arrows_move(ctx, open, &self.ed, self.keyboard_edits()) => {
+                ctx.input_mut(|i| panel_view::take_keys(i, true))
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Moves the picked panel device and runs Undo and Redo in the order the keys came. A
+    /// dialog opened meanwhile (by a shortcut in the same frame, or a failed undo) takes the
+    /// keyboard: the keys left over then do nothing.
+    fn run_panel_keys(&mut self, keys: Vec<panel_view::PanelKey>) {
+        for key in keys {
+            if !self.keyboard_edits() {
+                break;
+            }
+            match key {
+                panel_view::PanelKey::Nudge(dx, dy) => {
+                    if let (Some(open), Some(panel), Some(i)) = (self.open.as_mut(), self.ed.panel, self.ed.panel_pick)
+                    {
+                        panel_view::nudge(open, panel, i, self.prefs.snap, dx, dy);
+                    }
+                }
+                panel_view::PanelKey::Undo => self.run(Action::Undo),
+                panel_view::PanelKey::Redo => self.run(Action::Redo),
+            }
+        }
+    }
+
     fn shortcuts(&mut self, ctx: &egui::Context) -> Vec<Action> {
         // An open dialog takes the keyboard: a shortcut would change the project under it (the
         // cover form's Cancel takes back only what the form changed).
@@ -5417,6 +5461,9 @@ impl eframe::App for App {
             ctx.open_url(egui::OpenUrl::new_tab(url));
         }
         let mut actions = chrome::show(ctx, self.prefs.chrome, &mut self.chrome, &status);
+        // Before the shortcuts: the panel view's arrow presses take the Undo and Redo among them,
+        // so they apply in the order they came (#975).
+        let panel_keys = self.panel_keys(ctx);
         let keys = self.shortcuts(ctx);
         self.nudge_by_arrows(ctx);
         // While an import runs no key edits the symbol being drawn either: the keys go to the
@@ -5429,6 +5476,7 @@ impl eframe::App for App {
         for a in actions {
             self.run(a);
         }
+        self.run_panel_keys(panel_keys);
         // So did any the actions made (a move by arrow key, say): the panels show jumpers that
         // match the terminals.
         if let Some(o) = self.open.as_mut() {
@@ -7401,6 +7449,147 @@ mod nudge_tests {
             coil_at(&app),
             Point::new(80.0, 60.0),
             "the page behind the panel stays put"
+        );
+    }
+
+    /// An app showing a 400 x 300 panel with a 40 x 60 device at each of `devices`, the first
+    /// picked, after one frame; with what a test needs to run more frames.
+    fn panel_app(devices: &[Point]) -> (tempfile::TempDir, App, egui::Context, usize) {
+        use wc_core::panel::{Panel, PanelItem};
+        let (tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        let open = app.open.as_mut().unwrap();
+        open.project.panels.push(Panel {
+            id: "panel1".into(),
+            name: "Panel 1".into(),
+            width: 400.0,
+            height: 300.0,
+            items: devices
+                .iter()
+                .map(|at| PanelItem::Device {
+                    tag: wc_core::DeviceTag::parse("-K1").unwrap(),
+                    at: *at,
+                    width: 40.0,
+                    height: 60.0,
+                    rotation: wc_core::geom::Rotation::R0,
+                })
+                .collect(),
+        });
+        let panel = open.project.panels.len() - 1;
+        app.ed.panel = Some(panel);
+        app.ed.panel_pick = Some(0);
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        run_frame(&mut app, &ctx, Vec::new());
+        (tmp, app, ctx, panel)
+    }
+
+    fn run_frame(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let mut frame = eframe::Frame::_new_kittest();
+        let raw = egui::RawInput {
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| eframe::App::update(app, ctx, &mut frame));
+    }
+
+    fn panel_device_at(app: &App, panel: usize, i: usize) -> Point {
+        match app.open.as_ref().unwrap().project.panels[panel].items.get(i) {
+            Some(wc_core::panel::PanelItem::Device { at, .. }) => *at,
+            _ => unreachable!("the device is there"),
+        }
+    }
+
+    fn key_event(key: Key, modifiers: Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    /// An arrow press and Ctrl+Z in one frame apply in the order they came, either way (#975).
+    #[test]
+    fn panel_arrow_presses_and_undo_in_one_frame_apply_in_order() {
+        let (_tmp, mut app, ctx, panel) = panel_app(&[Point::new(100.0, 100.0)]);
+        let device_at = |app: &App| panel_device_at(app, panel, 0);
+        let right = key_event(Key::ArrowRight, Modifiers::NONE);
+        let undo = key_event(Key::Z, Modifiers::COMMAND);
+        // An earlier edit: the device one step down.
+        run_frame(&mut app, &ctx, vec![key_event(Key::ArrowDown, Modifiers::NONE)]);
+        assert_eq!(device_at(&app), Point::new(100.0, 105.0));
+        let steps = app.open.as_ref().unwrap().undo_steps();
+
+        // Right, then Ctrl+Z: the move is made and then taken back; the earlier edit stays.
+        run_frame(&mut app, &ctx, vec![right.clone(), undo.clone()]);
+        assert_eq!(device_at(&app), Point::new(100.0, 105.0));
+        assert_eq!(app.open.as_ref().unwrap().undo_steps(), steps);
+        assert!(app.open.as_ref().unwrap().can_redo(), "the move can be redone");
+
+        // Ctrl+Z, then Right: the earlier edit is taken back, then the device moves.
+        run_frame(&mut app, &ctx, vec![undo, right]);
+        assert_eq!(device_at(&app), Point::new(105.0, 100.0));
+        assert_eq!(app.open.as_ref().unwrap().undo_steps(), steps);
+        assert!(app.open.as_mut().unwrap().undo());
+        assert_eq!(device_at(&app), Point::new(100.0, 100.0), "the move is one undo step");
+    }
+
+    /// A shortcut that opens a dialog in the same frame as an arrow press takes the keyboard:
+    /// the device behind the dialog stays where it is.
+    #[test]
+    fn a_panel_arrow_press_with_a_shortcut_that_opens_a_dialog_moves_nothing() {
+        let (_tmp, mut app, ctx, panel) = panel_app(&[Point::new(100.0, 100.0)]);
+        let steps = app.open.as_ref().unwrap().undo_steps();
+        run_frame(
+            &mut app,
+            &ctx,
+            vec![
+                key_event(Key::R, Modifiers::COMMAND),
+                key_event(Key::ArrowRight, Modifiers::NONE),
+            ],
+        );
+        assert!(matches!(app.dialog, Some(Dialog::Reports(_))), "Reports opened");
+        assert_eq!(panel_device_at(&app, panel, 0), Point::new(100.0, 100.0));
+        assert_eq!(app.open.as_ref().unwrap().undo_steps(), steps);
+    }
+
+    /// A click on another device and an arrow press in one frame move the device clicked, not
+    /// the one picked before.
+    #[test]
+    fn a_click_on_another_device_and_an_arrow_press_in_one_frame_move_the_clicked_one() {
+        let (_tmp, mut app, ctx, panel) = panel_app(&[Point::new(100.0, 100.0), Point::new(200.0, 100.0)]);
+        // Where a screen point lands on the plate: the panel view notes the pointer's spot.
+        let probe = egui::pos2(3000.0, 3000.0);
+        run_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(probe)]);
+        let Some(seen) = app.ed.cursor else {
+            unreachable!("the pointer is over the panel view")
+        };
+        let zoom = app.ed.view.zoom;
+        // The middle of the second device.
+        let target = probe + egui::vec2(((220.0 - seen.x) as f32) * zoom, ((130.0 - seen.y) as f32) * zoom);
+        let button = |pressed| egui::Event::PointerButton {
+            pos: target,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        run_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(target)]);
+        run_frame(
+            &mut app,
+            &ctx,
+            vec![button(true), button(false), key_event(Key::ArrowRight, Modifiers::NONE)],
+        );
+        assert_eq!(app.ed.panel_pick, Some(1), "the click picked the second device");
+        assert_eq!(
+            panel_device_at(&app, panel, 0),
+            Point::new(100.0, 100.0),
+            "the first stays"
+        );
+        assert_eq!(
+            panel_device_at(&app, panel, 1),
+            Point::new(205.0, 100.0),
+            "the second moves"
         );
     }
 }
