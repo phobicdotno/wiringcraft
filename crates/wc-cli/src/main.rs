@@ -6439,13 +6439,60 @@ mod tests {
         let Some(x1) = tag("-X1") else { unreachable!() };
         let rail: Vec<_> = strips.get(&x1).into_iter().flatten().map(|(t, _)| t.as_str()).collect();
         assert_eq!(rail, ["S3", "S1", "S2"]);
-        assert!(cli(&dir, &["jumper", "add", "-X1", "S1", "S2"]).is_ok());
+        let rail = || -> Vec<String> {
+            let Ok(p) = load(&dir) else { unreachable!() };
+            let (symbols, _) = store::vendored_symbols(&dir, &p);
+            let mut strips = wc_core::project::strip_terminals(&p, |id| symbols.get(id).map(|s| s.role));
+            strips
+                .remove(&x1)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(t, _)| t)
+                .collect()
+        };
+        assert!(cli(&dir, &["strip", "order", "-X1", "S2", "S1", "S3"]).is_ok());
+        assert_eq!(rail(), ["S2", "S1", "S3"]);
+        assert!(cli(&dir, &["strip", "unspare", "-X1", "S3"]).is_ok());
+        assert_eq!(rail(), ["S2", "S1"]);
+        assert!(cli(&dir, &["strip", "level", "-X1", "S1", "2"]).is_ok());
+        let level = || {
+            let Ok(p) = load(&dir) else { unreachable!() };
+            tag("-X1.S1")
+                .and_then(|t| p.devices.get(&t))
+                .and_then(|d| d.properties.get(wc_report::LEVEL_PROPERTY).cloned())
+        };
+        assert_eq!(level().as_deref(), Some("2"));
+        assert!(cli(&dir, &["strip", "level", "-X1", "S1"]).is_ok());
+        assert_eq!(level(), None);
+
+        // Jumpers: a jumper left with one terminal is dropped, so this one keeps two.
+        assert!(cli(&dir, &["jumper", "add", "-X1", "S1", "S2", "S4"]).is_ok());
         assert!(cli(&dir, &["jumper", "remove", "-X1", "S2"]).is_ok());
         let Ok(p) = load(&dir) else { unreachable!() };
         let Some(j) = p.meta.jumpers.first() else {
             unreachable!()
         };
-        assert_eq!((&j.strip, j.terminals.as_slice()), (&x1, ["S1".to_string()].as_slice()));
+        let kept = ["S1", "S4"].map(String::from);
+        assert_eq!((&j.strip, j.terminals.as_slice()), (&x1, kept.as_slice()));
+        let Ok(mut p) = load(&dir) else { unreachable!() };
+        p.meta.libraries.push(LibrarySource {
+            name: "starter".into(),
+            kind: "folder".into(),
+            location: Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../library")
+                .to_string_lossy()
+                .into_owned(),
+            reference: None,
+        });
+        assert!(save(&dir, &p).is_ok());
+        let parted = cli(&dir, &["jumper", "part", "-X1", "S4", "example.ex-tb-2-5"]);
+        assert!(parted.is_ok(), "{parted:?}");
+        let Ok(p) = load(&dir) else { unreachable!() };
+        let part = p.meta.jumpers.first().and_then(|j| j.part.as_deref());
+        assert_eq!(part, Some("example.ex-tb-2-5"));
+        assert!(cli(&dir, &["jumper", "part", "-X1", "S1"]).is_ok());
+        let Ok(p) = load(&dir) else { unreachable!() };
+        assert_eq!(p.meta.jumpers.first().and_then(|j| j.part.clone()), None);
     }
 
     #[test]
