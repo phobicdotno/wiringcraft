@@ -39,7 +39,8 @@ folders, or another folder picked with the folder picker. Where the picker canno
 without a desktop portal), the file and folder are typed into a dialog instead. The import runs
 off the window thread: a window shows what it has done so far, and until it ends the project
 cannot be edited, saved, shared or replaced by another one (a running assistant turn may only
-use its reading tools, and no new turn starts). Messages that name a command line option are worded
+use its reading tools, and no new turn starts). The window has the view controls that still work
+(zoom, grid, theme, layers). Messages that name a command line option are worded
 for the app.
 
 Changes not saved yet are saved first, the imported pages and devices come in as one undo step,

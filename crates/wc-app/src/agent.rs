@@ -3906,6 +3906,114 @@ mod tests {
         assert!(!open.can_undo());
     }
 
+    #[test]
+    fn a_message_is_not_sent_while_an_import_runs_and_stays_in_the_box() {
+        let (tmp, mut a) = app(vec![]);
+        let aml = tmp.path().join("plant.aml");
+        std::fs::write(&aml, crate::imports::tests::AML).unwrap();
+        a.import_from(crate::imports::Kind::Aml, &aml, None, None);
+        assert!(a.importing.is_some());
+        a.assistant.input = "add a page".into();
+        let shot = crate::screenshot::Shot::from_rgba(1, 1, vec![0, 0, 0, 255]).unwrap();
+        a.assistant.waiting.push((shot, None));
+
+        a.assistant_send(&egui::Context::default());
+        assert_eq!(a.assistant.input, "add a page");
+        assert_eq!(a.assistant.waiting.len(), 1);
+        assert!(a.assistant.turn.is_none());
+        assert!(!a.assistant.busy());
+        assert!(a.assistant.sent.is_empty() && a.assistant.sent_text.is_empty());
+        // Said in the conversation that is showing, whichever backend it is.
+        let said = [&a.assistant.session.log, &a.assistant.login_log]
+            .into_iter()
+            .flatten()
+            .filter(|e| matches!(e, wc_agent::Entry::Error(e) if e.contains("import is running")))
+            .count();
+        assert_eq!(said, 1);
+        assert_eq!(a.assistant.session.log.len() + a.assistant.login_log.len(), 1);
+        until_imported(&mut a);
+    }
+
+    #[test]
+    fn an_import_that_ends_with_another_project_open_is_not_taken_into_it() {
+        let (tmp, mut a) = app(vec![]);
+        let aml = tmp.path().join("plant.aml");
+        std::fs::write(&aml, crate::imports::tests::AML).unwrap();
+        a.import_from(crate::imports::Kind::Aml, &aml, None, None);
+        // Opening another project is refused while it runs; this one got there all the same.
+        let other = tmp.path().join("other");
+        wc_core::store::create(&other, "Other").unwrap();
+        a.open = Some(crate::state::Open::load(&other).unwrap());
+        let before = a.open.as_ref().unwrap().project.clone();
+
+        until_imported(&mut a);
+        let Some(Dialog::Message(msg)) = &a.dialog else {
+            unreachable!("no message");
+        };
+        assert!(msg.contains("plant.aml") && msg.contains("is no longer open"), "{msg}");
+        let open = a.open.as_ref().unwrap();
+        assert_eq!(open.dir, other);
+        assert_eq!(open.project, before);
+        assert!(!open.dirty && !open.can_undo());
+    }
+
+    #[test]
+    fn closing_the_window_is_called_off_while_an_import_runs() {
+        let close = || {
+            let mut input = egui::RawInput::default();
+            input
+                .viewports
+                .entry(egui::ViewportId::ROOT)
+                .or_default()
+                .events
+                .push(egui::ViewportEvent::Close);
+            input
+        };
+        let cancelled = |a: &mut App| {
+            let out = egui::Context::default().run(close(), |ctx| a.hold_close_while_importing(ctx));
+            out.viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .is_some_and(|v| v.commands.contains(&egui::ViewportCommand::CancelClose))
+        };
+        let (tmp, mut a) = app(vec![]);
+        // Nothing runs: the window closes.
+        assert!(!cancelled(&mut a));
+        assert!(a.ed.message.is_empty(), "{}", a.ed.message);
+
+        let aml = tmp.path().join("plant.aml");
+        std::fs::write(&aml, crate::imports::tests::AML).unwrap();
+        a.import_from(crate::imports::Kind::Aml, &aml, None, None);
+        assert!(cancelled(&mut a));
+        assert!(a.ed.message.contains("not closed"), "{}", a.ed.message);
+        until_imported(&mut a);
+        assert!(!cancelled(&mut a));
+    }
+
+    #[test]
+    fn the_view_controls_in_the_import_window_work_while_an_import_runs() {
+        let (tmp, mut a) = app(vec![]);
+        let aml = tmp.path().join("plant.aml");
+        std::fs::write(&aml, crate::imports::tests::AML).unwrap();
+        a.import_from(crate::imports::Kind::Aml, &aml, None, None);
+        assert!(a.importing.is_some());
+        let zoom = a.ed.view.zoom;
+        a.run(Action::ZoomIn);
+        assert!(a.ed.view.zoom > zoom);
+        for c in crate::IMPORT_VIEW_CONTROLS {
+            assert!(crate::allowed_while_importing(*c), "{c:?}");
+        }
+        // The grid and the theme are left alone here: they save the settings file.
+        for c in [Action::ZoomOut, Action::ZoomFit, Action::Layers] {
+            a.ed.message.clear();
+            a.run(c);
+            assert!(!a.ed.message.contains("import is running"), "{c:?}: {}", a.ed.message);
+        }
+        // Layers shows its list, drawn in the import window with the controls.
+        assert!(a.show_layers);
+        let _ = egui::Context::default().run(egui::RawInput::default(), |ctx| a.import_window(ctx));
+        until_imported(&mut a);
+    }
+
     /// Frames until the base project fetch is over (at most a few seconds).
     fn until_fetched(a: &mut App) {
         let ctx = egui::Context::default();

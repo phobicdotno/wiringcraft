@@ -326,6 +326,17 @@ fn allowed_while_importing(a: Action) -> bool {
     )
 }
 
+/// The view controls shown in the import window: while it is up the window takes every click,
+/// so the toolbar's own are out of reach. All are [`allowed_while_importing`].
+const IMPORT_VIEW_CONTROLS: &[Action] = &[
+    Action::ZoomIn,
+    Action::ZoomOut,
+    Action::ZoomFit,
+    Action::ToggleGrid,
+    Action::ToggleTheme,
+    Action::Layers,
+];
+
 /// Make a new project's folder a repository with its first version.
 fn record_new_project(dir: &std::path::Path) -> Result<(), wc_vcs::Error> {
     let git = wc_vcs::Git::new(dir);
@@ -1062,11 +1073,15 @@ impl App {
     }
 
     /// While an import runs: a window with what it has said so far, over the editor, which
-    /// takes no clicks or keys until the import is done.
+    /// takes no clicks until the import is done. The window takes the clicks for everything
+    /// under it, so the view controls that still work ([`IMPORT_VIEW_CONTROLS`]) and the layer
+    /// list are shown in it.
     fn import_window(&mut self, ctx: &egui::Context) {
         let Some(running) = self.importing.as_ref() else { return };
         let lines = running.job.lines();
         let name = running.job.name.clone();
+        let mut actions = Vec::new();
+        let mut layers_changed = false;
         egui::Modal::new(egui::Id::new("importing")).show(ctx, |ui| {
             ui.set_width(520.0);
             ui.horizontal(|ui| {
@@ -1086,7 +1101,37 @@ impl App {
                         ui.label(RichText::new(line).monospace());
                     }
                 });
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.weak("View:");
+                for a in IMPORT_VIEW_CONTROLS {
+                    let info = a.info();
+                    let on = *a == Action::Layers && self.show_layers;
+                    if ui.selectable_label(on, info.label).on_hover_text(info.tip).clicked() {
+                        actions.push(*a);
+                    }
+                }
+            });
+            if self.show_layers {
+                ui.separator();
+                layers_changed = self.prefs.layers.ui(ui);
+            }
         });
+        if layers_changed {
+            self.layers_changed();
+        }
+        for a in actions {
+            self.run(a);
+        }
+    }
+
+    /// Closing the window would stop the import half way through writing the project folder:
+    /// while one runs, a close that was asked for is called off.
+    fn hold_close_while_importing(&mut self, ctx: &egui::Context) {
+        if self.importing.is_some() && ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.ed.message = format!("The window was not closed: {IMPORT_RUNNING}");
+        }
     }
 
     /// Carry out an action. A picker it asks for waits until the frame's actions have run; while
@@ -4756,11 +4801,7 @@ fn export_drawings_to(open: &Open, dir: &Path) -> String {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Closing the window would stop the import half way through writing the project folder.
-        if self.importing.is_some() && ctx.input(|i| i.viewport().close_requested()) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.ed.message = format!("The window was not closed: {IMPORT_RUNNING}");
-        }
+        self.hold_close_while_importing(ctx);
         // The last edit is done: jumpers follow their terminals before anything shows or copies them.
         if let Some(o) = self.open.as_mut() {
             o.follow_terminals();
@@ -4929,8 +4970,9 @@ impl eframe::App for App {
             self.symbol_editor_window(ctx);
             self.find_window(ctx);
             self.strip_editor_window(ctx);
+            self.layers_window(ctx);
         }
-        self.layers_window(ctx);
+        // The import window shows the layer list itself: it takes the clicks for any other.
         self.import_window(ctx);
         self.sync_session(ctx);
 

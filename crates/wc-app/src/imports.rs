@@ -187,6 +187,25 @@ pub fn start(open: &mut Open, kind: Kind, file: &Path, lib: Option<&Path>, page:
             Ok(()) => (Adopt::Project, project_work(open, kind, f, page)),
         }
     };
+    let (lines, done) = spawn(work);
+    Job {
+        kind,
+        name,
+        dir: open.dir.clone(),
+        lib: lib.map(Path::to_path_buf),
+        note,
+        adopt,
+        lines,
+        done,
+    }
+}
+
+/// What the worker has said so far, and where its result arrives.
+type Running = (Arc<Mutex<Vec<String>>>, mpsc::Receiver<(run::Res<()>, run::Log)>);
+
+/// Run `work` on a thread of its own; a reason it cannot run is the result at once. A worker
+/// that panics sends nothing: the closed channel tells [`Job::poll`] it stopped.
+fn spawn(work: Result<Work, String>) -> Running {
     let lines = Arc::new(Mutex::new(Vec::new()));
     let (tx, done) = mpsc::channel();
     match work {
@@ -208,16 +227,7 @@ pub fn start(open: &mut Open, kind: Kind, file: &Path, lib: Option<&Path>, page:
             });
         }
     }
-    Job {
-        kind,
-        name,
-        dir: open.dir.clone(),
-        lib: lib.map(Path::to_path_buf),
-        note,
-        adopt,
-        lines,
-        done,
-    }
+    (lines, done)
 }
 
 /// The import of `file` into the project folder, ready to run on the worker thread, or why
@@ -498,6 +508,50 @@ pub(crate) mod tests {
         assert!(done, "{msg}");
         let shapes = open.project.pages.get(page).map_or(0, |pg| pg.graphics.len());
         assert_eq!(shapes, 1, "{msg}");
+    }
+
+    #[test]
+    fn a_worker_that_panics_ends_the_import_saying_it_stopped_part_way() {
+        let (_tmp, mut open) = project();
+        let before = open.project.clone();
+        let work: Work = Box::new(|log| {
+            log.out("read 3 pages".to_owned());
+            // Unwinds as a panic does, without the panic message in the test output.
+            std::panic::resume_unwind(Box::new("the importer broke"))
+        });
+        let (lines, done) = spawn(Ok(work));
+        let job = Job {
+            kind: Kind::Aml,
+            name: "plant.aml".to_owned(),
+            dir: open.dir.clone(),
+            lib: None,
+            note: String::new(),
+            adopt: Adopt::Project,
+            lines,
+            done,
+        };
+        // As the app looks: without waiting, until the worker is gone.
+        let mut ended = None;
+        for _ in 0..1000 {
+            ended = job.poll();
+            if ended.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let Some((r, log)) = ended else {
+            unreachable!("the import did not end");
+        };
+        assert!(matches!(&r, Err(e) if e.contains("stopped part way")), "{r:?}");
+        assert!(log.text().contains("read 3 pages"), "{}", log.text());
+        let (done, msg) = job.finish(&mut open, r, &log);
+        assert!(!done, "{msg}");
+        assert!(
+            msg.starts_with("plant.aml was not imported: the import stopped part way"),
+            "{msg}"
+        );
+        assert!(msg.contains("read 3 pages"), "{msg}");
+        assert_eq!(open.project, before);
     }
 
     #[test]
