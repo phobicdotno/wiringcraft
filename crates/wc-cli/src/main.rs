@@ -1778,12 +1778,22 @@ fn rules_list(p: &Project, library: &[wc_core::check_rule::RuleSet], json: bool)
 
 /// The rules in `file` for `rules set`, in order, each as the check runs it: `[[rule]]`
 /// tables, or a JSON list (or `{"rules": [...]}`) for a `.json` name; `-` is TOML on stdin.
-fn rules_from_file(file: &Path) -> Res<Vec<wc_core::check_rule::CheckRule>> {
-    use wc_core::check_rule::{CheckRule, check_rule, parse_rules};
-    let text = if file.as_os_str() == "-" {
-        std::io::read_to_string(std::io::stdin()).map_err(|err| format!("stdin: {err}"))?
+/// `stdin` is what was read from standard input for `-`, when it already was.
+/// The text of an input file named on the command line, `-` meaning stdin.
+fn read_input(file: &Path) -> Res<String> {
+    if file.as_os_str() == "-" {
+        std::io::read_to_string(std::io::stdin()).map_err(|err| format!("stdin: {err}"))
     } else {
-        std::fs::read_to_string(file).map_err(|err| format!("{}: {err}", file.display()))?
+        std::fs::read_to_string(file).map_err(|err| format!("{}: {err}", file.display()))
+    }
+}
+
+/// The rules in `file`, from `input` (its text, read already) when given.
+fn rules_from_file(file: &Path, input: Option<String>) -> Res<Vec<wc_core::check_rule::CheckRule>> {
+    use wc_core::check_rule::{CheckRule, check_rule, parse_rules};
+    let text = match input {
+        Some(text) => text,
+        None => read_input(file)?,
     };
     let json = file.extension().is_some_and(|x| x.eq_ignore_ascii_case("json"));
     let rules: Vec<CheckRule> = if json {
@@ -2064,6 +2074,28 @@ fn edit_macro(
 
 fn run(cli: Cli) -> Res<()> {
     let dir = cli.project.as_path();
+    // One command at a time on a project: a second run waits, so it reads what the first one
+    // wrote instead of overwriting it with an edit planned from the old files (#610).
+    // An input file (or stdin) is read before the lock is taken: fed by another command on the
+    // same project, through a pipe or a named FIFO, waiting for the lock before reading would
+    // hold both up for good.
+    let mut input_text = match &cli.cmd {
+        Cmd::Rules(RulesCmd::Set { file }) | Cmd::ReportLayout(ReportLayoutCmd::Set { file, .. }) => {
+            Some(read_input(file)?)
+        }
+        _ => None,
+    };
+    let mut import_bytes = match &cli.cmd {
+        Cmd::Import(ImportCmd::Wago { file }) => {
+            Some(std::fs::read(file).map_err(|x| format!("{}: {x}", file.display()))?)
+        }
+        Cmd::Import(ImportCmd::PlcCsv { file }) => Some(run::read_file(file)?),
+        _ => None,
+    };
+    let _lock = match cli.cmd {
+        Cmd::New { .. } => None,
+        _ => project_lock(dir),
+    };
     match cli.cmd {
         Cmd::New {
             dir: new_dir,
@@ -2877,7 +2909,7 @@ fn run(cli: Cli) -> Res<()> {
                     print!("{text}");
                 }
                 RulesCmd::Set { file } => {
-                    let rules = rules_from_file(&file)?;
+                    let rules = rules_from_file(&file, input_text.take())?;
                     let n = rules.len();
                     if rules != p.meta.rules {
                         p.meta.rules = rules;
@@ -3010,7 +3042,7 @@ fn run(cli: Cli) -> Res<()> {
                 }
             }
         }
-        Cmd::ReportLayout(rc) => report_layout(dir, rc)?,
+        Cmd::ReportLayout(rc) => report_layout(dir, rc, input_text.take())?,
         Cmd::Jumper(jc) => {
             let mut p = load(dir)?;
             match jc {
@@ -3205,7 +3237,7 @@ fn run(cli: Cli) -> Res<()> {
             save(dir, &p)?;
         }
         Cmd::Lib(lc) => lib_cmd(dir, lc)?,
-        Cmd::Import(ic) => import_cmd(dir, ic)?,
+        Cmd::Import(ic) => import_cmd(dir, ic, import_bytes.take())?,
         Cmd::Pdf {
             out,
             pages,
@@ -3687,7 +3719,9 @@ fn lib_cmd(dir: &Path, lc: LibCmd) -> Res<()> {
     Ok(())
 }
 
-fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
+/// `input`: the file of `import wago` or `import plc-csv`, read already (before the project
+/// lock).
+fn import_cmd(dir: &Path, ic: ImportCmd, input: Option<Vec<u8>>) -> Res<()> {
     match ic {
         ImportCmd::SymbolDxf {
             file,
@@ -3808,7 +3842,10 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             }
         }
         ImportCmd::Wago { file } => {
-            let done = import_wago(dir, &file)?;
+            let done = match input {
+                Some(bytes) => import_wago_bytes(dir, &bytes)?,
+                None => import_wago(dir, &file)?,
+            };
             for w in &done.warnings {
                 eprintln!("warning: {}", escape_field(w));
             }
@@ -3823,7 +3860,10 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             }
         }
         ImportCmd::PlcCsv { file } => {
-            logged(|log| run::plc_csv(dir, &file, log))?;
+            logged(|log| match &input {
+                Some(bytes) => run::plc_csv_bytes(dir, bytes, log),
+                None => run::plc_csv(dir, &file, log),
+            })?;
         }
         ImportCmd::PartsBmecat { file, lib } => {
             logged(|log| run::parts_bmecat(&file, &lib, log))?;
@@ -4503,6 +4543,98 @@ fn main() -> ExitCode {
     }
 }
 
+/// The lock that keeps two wiringcraft commands from working on the project in `dir` at once,
+/// held until the returned file is dropped (or the process ends, even by a crash). A second
+/// command waits for the first, saying so. The lock file is [`project_lock_path`], inside the
+/// project, so every command on the project finds the same one whatever its environment.
+/// `None`, and the command runs unlocked, when `dir` is not a project; when a git command that
+/// a wiringcraft command runs on this project started this one (a hook), as that command holds
+/// the lock and waits for this one; or, with a warning, when the lock cannot be taken (a
+/// read-only folder): the lock guards against overlapping runs, it is never a reason to refuse
+/// one.
+fn project_lock(dir: &Path) -> Option<std::fs::File> {
+    if !dir.join(store::PROJECT_FILE).is_file() {
+        return None;
+    }
+    if let Some(parent) = std::env::var_os(wc_vcs::PARENT_PROJECT_ENV)
+        && same_folder(Path::new(&parent), dir)
+    {
+        return None;
+    }
+    let path = project_lock_path(dir);
+    let unlocked = |why: String| {
+        eprintln!(
+            "warning: running without the project lock ({}: {}); another wiringcraft command on this project at the same time could undo this one's changes",
+            escape_field(&path.display().to_string()),
+            escape_field(&why)
+        );
+    };
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(err) => {
+            unlocked(err.to_string());
+            return None;
+        }
+    };
+    let file = match file.try_lock() {
+        Ok(()) => file,
+        Err(std::fs::TryLockError::WouldBlock) => {
+            eprintln!("waiting for another wiringcraft command on this project to finish");
+            match file.lock() {
+                Ok(()) => file,
+                Err(err) => {
+                    unlocked(err.to_string());
+                    return None;
+                }
+            }
+        }
+        Err(std::fs::TryLockError::Error(err)) => {
+            unlocked(err.to_string());
+            return None;
+        }
+    };
+    keep_lock_out_of_git(dir);
+    Some(file)
+}
+
+/// Whether `a` and `b` are the same folder (by their canonical paths).
+fn same_folder(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Where [`project_lock`] keeps the lock of the project in `dir`: `.wiringcraft.lock` in the
+/// project folder, always there so a command started before `vcs init` and one started after
+/// it wait on the same file. A new project's `.gitignore` leaves it out.
+fn project_lock_path(dir: &Path) -> PathBuf {
+    dir.join(wc_vcs::LOCK_FILE)
+}
+
+/// Leave the lock file out of the project's git history in a repository whose `.gitignore`
+/// predates it (or a linked worktree of one): listed in the repository's local exclude list.
+/// Best effort, with a warning: a project whose exclude list cannot be written only shows the
+/// file as new.
+fn keep_lock_out_of_git(dir: &Path) {
+    if !dir.join(".git").exists() {
+        return;
+    }
+    if let Err(err) = wc_vcs::Git::new(dir).exclude_locally(wc_vcs::LOCK_FILE) {
+        eprintln!(
+            "warning: could not leave {} out of git: {}",
+            wc_vcs::LOCK_FILE,
+            escape_field(&err.to_string())
+        );
+    }
+}
+
 /// Parse report names; `all` means every report.
 fn report_kinds(names: &[String]) -> Result<Vec<wc_report::Kind>, String> {
     let mut out = Vec::new();
@@ -4522,8 +4654,9 @@ fn report_kinds(names: &[String]) -> Result<Vec<wc_report::Kind>, String> {
 }
 
 /// `wiringcraft report-layout`: print, replace or reset report layouts, keeping them as the
-/// report layout dialog and the assistant's `report_layouts` tool do.
-fn report_layout(dir: &Path, cmd: ReportLayoutCmd) -> Res<()> {
+/// report layout dialog and the assistant's `report_layouts` tool do. `stdin` is what was read
+/// from standard input for `set <kind> -`, when it already was.
+fn report_layout(dir: &Path, cmd: ReportLayoutCmd, input: Option<String>) -> Res<()> {
     use wc_core::report_layout::ReportLayout;
     let one = |name: &str| -> Res<wc_report::Kind> {
         match report_kinds(&[name.to_owned()])?.as_slice() {
@@ -4591,10 +4724,9 @@ fn report_layout(dir: &Path, cmd: ReportLayoutCmd) -> Res<()> {
         }
         ReportLayoutCmd::Set { kind, file } => {
             let kind = one(&kind)?;
-            let text = if file.as_os_str() == "-" {
-                std::io::read_to_string(std::io::stdin()).map_err(|err| format!("stdin: {err}"))?
-            } else {
-                std::fs::read_to_string(&file).map_err(|err| format!("{}: {err}", file.display()))?
+            let text = match input {
+                Some(text) => text,
+                None => read_input(&file)?,
             };
             let name = if file.as_os_str() == "-" {
                 "stdin".to_owned()
@@ -4756,7 +4888,12 @@ struct WagoImported {
 /// left alone. Nothing else is saved when no row changes.
 fn import_wago(dir: &Path, file: &Path) -> Res<WagoImported> {
     let bytes = std::fs::read(file).map_err(|x| format!("{}: {x}", file.display()))?;
-    let (rows, mut warnings) = wc_import::wago::read_configured(&bytes).map_err(e)?;
+    import_wago_bytes(dir, &bytes)
+}
+
+/// [`import_wago`] from the file's bytes, read already (before the project lock).
+fn import_wago_bytes(dir: &Path, bytes: &[u8]) -> Res<WagoImported> {
+    let (rows, mut warnings) = wc_import::wago::read_configured(bytes).map_err(e)?;
     let mut p = load(dir)?;
     let (symbols, missing) = store::vendored_symbols(dir, &p);
     warnings.extend(missing.iter().map(|m| {
@@ -5300,6 +5437,79 @@ mod tests {
         let mut all = vec!["wiringcraft", "-C", dir.to_str().unwrap()];
         all.extend_from_slice(args);
         run(Cli::try_parse_from(all).map_err(|e| e.to_string())?)
+    }
+
+    #[test]
+    fn a_command_waits_while_another_holds_the_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        // Not a project yet: nothing to lock.
+        assert!(project_lock(&dir).is_none());
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let held = project_lock(&dir).unwrap();
+        assert_eq!(project_lock_path(&dir), dir.join(".wiringcraft.lock"));
+        // In a repository, git is told to leave it out, once.
+        let other = tmp.path().join("other");
+        store::create(&other, "Other").unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&other)
+            .status()
+            .unwrap();
+        assert!(init.success());
+        drop(project_lock(&other).unwrap());
+        drop(project_lock(&other).unwrap());
+        let exclude = std::fs::read_to_string(other.join(".git/info/exclude")).unwrap();
+        assert_eq!(exclude.matches("/.wiringcraft.lock").count(), 1);
+        assert!(exclude.ends_with("/.wiringcraft.lock\n"));
+        // Another project is not held up.
+        cli(&other, &["template", "columns", "14"]).unwrap();
+        let toml = dir.join(store::PROJECT_FILE);
+        let before = std::fs::read_to_string(&toml).unwrap();
+        let second = {
+            let dir = dir.clone();
+            std::thread::spawn(move || cli(&dir, &["template", "columns", "14"]))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(!second.is_finished(), "the second command waits");
+        assert_eq!(std::fs::read_to_string(&toml).unwrap(), before);
+        drop(held);
+        second.join().unwrap().unwrap();
+        assert_ne!(std::fs::read_to_string(&toml).unwrap(), before);
+    }
+
+    #[test]
+    fn commands_on_either_side_of_vcs_init_wait_on_one_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let spawn = |args: &'static [&'static str]| {
+            let dir = dir.clone();
+            std::thread::spawn(move || cli(&dir, args))
+        };
+        let pause = || std::thread::sleep(std::time::Duration::from_millis(400));
+        // Taken before the project is a repository, as `vcs init` takes it.
+        let held = project_lock(&dir).unwrap();
+        let before = project_lock_path(&dir);
+        // One command starts waiting before .git exists ...
+        let early = spawn(&["page", "add", "p2", "--number", "2"]);
+        pause();
+        wc_vcs::Git::new(&dir).init().unwrap();
+        assert!(dir.join(".git").exists());
+        assert_eq!(project_lock_path(&dir), before, "the same lock file once .git exists");
+        // ... and another after: both wait for the lock taken before init.
+        let late = spawn(&["page", "add", "p3", "--number", "3"]);
+        pause();
+        assert!(!early.is_finished(), "the earlier command waits");
+        assert!(!late.is_finished(), "the later command waits");
+        assert!(load(&dir).unwrap().page("p2").is_none());
+        assert!(load(&dir).unwrap().page("p3").is_none());
+        drop(held);
+        early.join().unwrap().unwrap();
+        late.join().unwrap().unwrap();
+        // One after the other: neither overwrote the other's page.
+        let p = load(&dir).unwrap();
+        assert!(p.page("p2").is_some() && p.page("p3").is_some());
     }
 
     #[test]
