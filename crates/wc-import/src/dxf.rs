@@ -570,18 +570,14 @@ fn shapes(
                 } else {
                     raw.to_owned()
                 };
-                let align = match e.f(72) as i64 {
-                    1 | 4 => Align::Center,
-                    2 => Align::Right,
-                    _ => Align::Left,
-                };
+                let ((x, y), align, angle) = text_anchor(e);
                 (!text.trim().is_empty()).then(|| Shape::Text {
-                    at: p(e.f(10), e.f(20)),
+                    at: p(x, y),
                     text,
                     height: (e.f_or(40, 2.5) * r_scale).max(0.5),
                     align,
-                    // Code 50: rotation in degrees, counter-clockwise; a turned block turns it too.
-                    angle: normal_angle(e.f(50) + xf.rot),
+                    // Rotation in degrees, counter-clockwise; a turned block turns it too.
+                    angle: normal_angle(angle + xf.rot),
                 })
             }
             "SOLID" | "TRACE" => {
@@ -669,6 +665,50 @@ const TURN_STEPS: f64 = 72.0;
 
 /// A sweep brought into (0, `full`]: a whole number of turns is one full turn. `None` when it is
 /// not a number.
+/// Where a TEXT, ATTRIB or MTEXT hangs, how it is aligned there, and its rotation in degrees.
+///
+/// MTEXT: the attachment point (71, 1 to 9) runs left, centre, right on each row; the rotation
+/// is code 50, or the direction 11/21 when there is no 50. Code 72 is the drawing direction.
+///
+/// TEXT and ATTRIB: the alignment is code 72 (1 and 4 centre, 2 right). A justified text
+/// (72 = 1, 2 or 4, or a vertical alignment: 73 on TEXT, 74 on ATTRIB) sits on its second
+/// point 11/21 when one is given; 10/20 is the left baseline start, which some writers leave
+/// at 0,0.
+fn text_anchor(e: &Entity) -> ((f64, f64), Align, f64) {
+    let at = (e.f(10), e.f(20));
+    if e.kind == "MTEXT" {
+        let align = match e.f_or(71, 1.0) as i64 {
+            a @ 1..=9 => match (a - 1) % 3 {
+                1 => Align::Center,
+                2 => Align::Right,
+                _ => Align::Left,
+            },
+            _ => Align::Left,
+        };
+        let angle = match e.get(50) {
+            Some(_) => e.f(50),
+            None if e.get(11).is_some() && (e.f(11) != 0.0 || e.f(21) != 0.0) => e.f(21).atan2(e.f(11)).to_degrees(),
+            None => 0.0,
+        };
+        return (at, align, angle);
+    }
+    let h = e.f(72) as i64;
+    let align = match h {
+        1 | 4 => Align::Center,
+        2 => Align::Right,
+        _ => Align::Left,
+    };
+    // Vertical alignment: 73 on TEXT, 74 on ATTRIB (where 73 is the field length).
+    let vertical = if e.kind == "TEXT" { e.f(73) } else { e.f(74) };
+    let justified = matches!(h, 1 | 2 | 4) || vertical as i64 != 0;
+    let at = if justified && e.get(11).is_some() {
+        (e.f(11), e.f(21))
+    } else {
+        at
+    };
+    (at, align, e.f(50))
+}
+
 fn turn(sweep: f64, full: f64) -> Option<f64> {
     if !sweep.is_finite() {
         return None;
@@ -2365,6 +2405,50 @@ mod tests {
 
     fn near(a: Point, b: Point) -> bool {
         a.distance(b) < 1e-6
+    }
+
+    #[test]
+    fn mtext_and_justified_text_are_placed_by_their_alignment() -> Result<()> {
+        // MTEXT: 71 is the attachment point, 72 = 1 is the drawing direction (left to right).
+        let ents = "0\nMTEXT\n8\n0\n10\n5\n20\n5\n40\n2\n71\n1\n72\n1\n1\nLeft\n\
+                    0\nMTEXT\n8\n0\n10\n5\n20\n5\n40\n2\n71\n5\n72\n1\n1\nMiddle\n\
+                    0\nMTEXT\n8\n0\n10\n5\n20\n5\n40\n2\n71\n9\n11\n0\n21\n1\n1\nTurned\n\
+                    0\nTEXT\n8\n0\n10\n0\n20\n0\n11\n50\n21\n20\n40\n2\n72\n2\n1\nRight\n\
+                    0\nTEXT\n8\n0\n10\n3\n20\n4\n11\n50\n21\n20\n40\n2\n1\nPlain\n\
+                    0\nATTRIB\n8\n0\n10\n0\n20\n0\n11\n50\n21\n20\n40\n2\n72\n0\n74\n2\n1\nMiddle tag\n\
+                    0\nATTRIB\n8\n0\n10\n3\n20\n4\n11\n50\n21\n20\n40\n2\n73\n8\n1\nField\n";
+        let (g, _) = drawn(ents, "")?;
+        let placed: Vec<(&str, Point, Align, f64)> = g
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Text {
+                    text, at, align, angle, ..
+                } => Some((text.as_str(), *at, *align, *angle)),
+                _ => None,
+            })
+            .collect();
+        let want = [
+            ("Left", Point::new(5.0, -5.0), Align::Left, 0.0),
+            ("Middle", Point::new(5.0, -5.0), Align::Center, 0.0),
+            // No code 50: the direction 11/21 turns it a quarter.
+            ("Turned", Point::new(5.0, -5.0), Align::Right, 90.0),
+            // Justified: on its second point, not the 0,0 start.
+            ("Right", Point::new(50.0, -20.0), Align::Right, 0.0),
+            // Left aligned: on 10/20 even with an 11/21.
+            ("Plain", Point::new(3.0, -4.0), Align::Left, 0.0),
+            // ATTRIB: 74 is the vertical alignment, so this one sits on 11/21.
+            ("Middle tag", Point::new(50.0, -20.0), Align::Left, 0.0),
+            // ATTRIB: 73 is the field length, not an alignment; it stays on 10/20.
+            ("Field", Point::new(3.0, -4.0), Align::Left, 0.0),
+        ];
+        assert_eq!(placed.len(), want.len(), "{placed:?}");
+        for (got, want) in placed.iter().zip(&want) {
+            assert!(
+                got.0 == want.0 && near(got.1, want.1) && got.2 == want.2 && (got.3 - want.3).abs() < 1e-9,
+                "{got:?} != {want:?}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
