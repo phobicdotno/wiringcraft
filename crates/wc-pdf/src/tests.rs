@@ -210,6 +210,20 @@ fn pages_export_as_svg_and_dxf() {
 }
 
 #[test]
+fn dxf_text_keeps_percent_signs_backslashes_and_wide_characters_literal() {
+    // `%%c` would be read as a diameter sign and `\U+0041` as `A` (#832).
+    assert_eq!(vector::dxf_text("50%%c"), "50\\U+0025\\U+0025c");
+    assert_eq!(vector::dxf_text("a%%%b"), "a\\U+0025\\U+0025\\U+0025b");
+    assert_eq!(vector::dxf_text("a\\U+0041"), "a\\U+005CU+0041");
+    // A lone percent sign starts no code and stays readable.
+    assert_eq!(vector::dxf_text("100 % on"), "100 % on");
+    assert_eq!(vector::dxf_text("%\t%d"), "\\U+0025\\U+0025d");
+    // Beyond U+FFFF there is no four-digit code; a five-digit one would be misread.
+    assert_eq!(vector::dxf_text("ok \u{1F600}"), "ok ?");
+    assert_eq!(vector::dxf_text("Ålesund\n"), "\\U+00C5lesund");
+}
+
+#[test]
 fn arcs_keep_their_side_in_svg_and_dxf() {
     // A quarter arc from 0 to 90 degrees clockwise on the page: from the right of the centre to
     // below it. In DXF (y up) that is from 270 to 360 counter-clockwise.
@@ -370,6 +384,24 @@ fn wire_numbers_cross_references_and_drawings_are_optional_layers() {
     let d = dxf(&pages[0]);
     assert!(d.contains("0\nTEXT\n8\nWIRE-NUMBERS\n"));
     assert!(d.contains("0\nLINE\n8\nDRAWINGS\n"));
+
+    // In SVG the wire number sits in its own group that Inkscape shows as a layer.
+    let s = svg(&pages[0]);
+    assert!(s.contains("xmlns:inkscape=\"http://www.inkscape.org/namespaces/inkscape\""));
+    let open = "id=\"wire-numbers\" inkscape:groupmode=\"layer\" inkscape:label=\"Wire numbers\">";
+    let Some(at) = s.find(open) else {
+        unreachable!("no wire-numbers group: {s}")
+    };
+    let group = &s[at..at + s[at..].find("</g>").unwrap_or(0)];
+    assert!(group.contains(">101</text>"), "{group}");
+    assert!(s.contains("id=\"drawings\" inkscape:groupmode=\"layer\""));
+    // Symbol labels have no layer and stay outside the layer groups.
+    let Some(k1) = s.find(">-K1</text>") else {
+        unreachable!("no -K1 label")
+    };
+    let last_open = s[..k1].rfind("<g ").unwrap_or(0);
+    assert!(!s[last_open..k1].contains("inkscape:groupmode"));
+    assert_well_formed(&s);
 
     // A page with nothing optional declares no layers.
     project.pages[0].wires.clear();
@@ -1808,6 +1840,23 @@ fn svg_images(s: &str) -> Vec<(f64, f64, f64, f64, String)> {
         .collect()
 }
 
+/// Fails unless `s` parses as XML with every element closed.
+fn assert_well_formed(s: &str) {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(s);
+    let mut depth = 0usize;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(_)) => depth += 1,
+            Ok(Event::End(_)) => depth -= 1,
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(e) => unreachable!("not XML at {}: {e}\n{s}", reader.buffer_position()),
+        }
+    }
+    assert_eq!(depth, 0, "unclosed elements:\n{s}");
+}
+
 #[test]
 fn svg_drawings_show_the_logo_and_the_underlay() {
     let mut png = Vec::new();
@@ -1865,7 +1914,11 @@ fn svg_drawings_show_the_logo_and_the_underlay() {
         (images[0].0, images[0].1, images[0].2, images[0].3),
         (0.0, 0.0, 420.0, 297.0)
     );
-    assert!(page.find("<image").unwrap_or(usize::MAX) < page.find("<g ").unwrap_or(0));
+    // The underlay sits in its own "scans" layer, before the drawing's group.
+    let scans = "<g id=\"scans\" inkscape:groupmode=\"layer\" inkscape:label=\"Scanned sheets\">\n<image";
+    assert!(page.contains(scans), "{page}");
+    assert!(page.find(scans).unwrap_or(usize::MAX) < page.find("<g fill").unwrap_or(0));
+    assert_well_formed(&page);
     assert!(page.rfind("<image").unwrap_or(0) > page.find("</g>").unwrap_or(usize::MAX));
     // DXF has no pictures and stays as it was.
     assert!(!dxf(&pages[1]).contains("base64"));
@@ -2683,6 +2736,15 @@ fn a_declared_node_with_a_blank_tag_keeps_its_box_address_and_station() {
         "{:?}",
         report.warnings
     );
+}
+
+#[test]
+fn page_text_writes_the_rest_of_winansi() {
+    // Euro, curly quotes and ellipsis have WinAnsi codes in the built-in font: no '?'.
+    assert_eq!(writer::pdf_text("€ “x” …"), "<80209378942085>");
+    assert_eq!(writer::pdf_text("„Œœ Šš™’"), "<848C9C208A9A9992>");
+    // An arrow still becomes '>', and a glyph the font lacks '?'.
+    assert_eq!(writer::pdf_text("→Д"), "<3E3F>");
 }
 
 #[test]

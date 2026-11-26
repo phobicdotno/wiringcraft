@@ -4169,3 +4169,104 @@ fn a_refused_edit_is_named_by_its_seq() {
     g.handle(refused(Some(7)));
     assert_eq!(g.refused_edits, [3, 7].into());
 }
+
+/// The display numbers of `project`'s pages, by page id.
+fn numbers(project: Option<&Project>) -> Vec<(String, String)> {
+    project
+        .map(|p| p.pages.iter().map(|pg| (pg.id.clone(), pg.number.clone())).collect())
+        .unwrap_or_default()
+}
+
+#[test]
+fn two_people_numbering_pages_at_once_cannot_give_two_pages_one_number() -> TestResult {
+    let mut s = Session::new();
+    let (_, a_link, mut a) = s.join("Ola")?;
+    let (_, b_link, mut b) = s.join("Kari")?;
+    // Both pick number 5, free in each copy, before either hears of the other.
+    a_link.send(a.edit_project(ProjectEdit::Renumber {
+        numbers: vec![("p0002".into(), "5".into())],
+    }))?;
+    b_link.send(b.edit_project(ProjectEdit::Renumber {
+        numbers: vec![("p0003".into(), "5".into())],
+    }))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert!(a.refusals.is_empty(), "{:?}", a.refusals);
+    assert!(
+        matches!(&b.refusals[..], [Refusal::Invalid { reason }] if reason.contains("already has number 5")),
+        "{:?}",
+        b.refusals
+    );
+    let want = [("p0001", "1"), ("p0003", "3"), ("p0002", "5")].map(|(i, n)| (i.to_owned(), n.to_owned()));
+    assert_eq!(numbers(Some(s.host.project())), want);
+    assert_eq!(a.project.as_ref(), Some(s.host.project()));
+    assert_eq!(b.project.as_ref(), Some(s.host.project()), "Kari's copy is put right");
+
+    // A new page may not take a number either, while a swap in one change is fine.
+    let mut added = Page::new("p0004", "3", "Valves");
+    a_link.send(a.edit_project(ProjectEdit::AddPage { page: added.clone() }))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert_eq!(a.refusals.len(), 1, "{:?}", a.refusals);
+    assert!(s.host.project().page("p0004").is_none());
+    added.number = "4".into();
+    a_link.send(a.edit_project(ProjectEdit::AddPage { page: added }))?;
+    a_link.send(a.edit_project(ProjectEdit::Renumber {
+        numbers: vec![("p0003".into(), "4".into()), ("p0004".into(), "3".into())],
+    }))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert_eq!(a.refusals.len(), 1, "{:?}", a.refusals);
+    let want =
+        [("p0001", "1"), ("p0004", "3"), ("p0003", "4"), ("p0002", "5")].map(|(i, n)| (i.to_owned(), n.to_owned()));
+    assert_eq!(numbers(Some(s.host.project())), want);
+    assert_eq!(numbers(b.project.as_ref()), want);
+    Ok(())
+}
+
+#[test]
+fn an_undo_cannot_give_back_a_number_another_page_took_since() -> TestResult {
+    let mut s = Session::new();
+    let (_, a_link, mut a) = s.join("Ola")?;
+    let (_, b_link, mut b) = s.join("Kari")?;
+    a_link.send(a.edit_project(ProjectEdit::Renumber {
+        numbers: vec![("p0002".into(), "5".into())],
+    }))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    // Number 2 is free now, and Kari takes it.
+    b_link.send(b.edit_project(ProjectEdit::Renumber {
+        numbers: vec![("p0003".into(), "2".into())],
+    }))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert!(b.refusals.is_empty(), "{:?}", b.refusals);
+    a_link.send(a.undo())?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert!(
+        matches!(&a.refusals[..], [Refusal::Invalid { reason }] if reason.contains("another page has number 2")),
+        "{:?}",
+        a.refusals
+    );
+    let want = [("p0001", "1"), ("p0003", "2"), ("p0002", "5")].map(|(i, n)| (i.to_owned(), n.to_owned()));
+    assert_eq!(numbers(Some(s.host.project())), want);
+    assert_eq!(a.project.as_ref(), Some(s.host.project()));
+    Ok(())
+}
+
+#[test]
+fn pages_that_already_share_a_number_stay_editable() -> TestResult {
+    let mut project = demo();
+    project.pages[2].number = "2".into();
+    let mut host = Host::new(project, "Hanna Host", "hanna@example.com", Box::new(Shared::default()));
+    // Renumbering another page, or one of the two to a free number, is fine.
+    host.edit_project(ProjectEdit::Renumber {
+        numbers: vec![("p0001".into(), "0".into())],
+    })?;
+    host.edit_project(ProjectEdit::Renumber {
+        numbers: vec![("p0003".into(), "3".into())],
+    })?;
+    // Giving it back is not.
+    assert!(
+        host.edit_project(ProjectEdit::Renumber {
+            numbers: vec![("p0003".into(), "2".into())],
+        })
+        .is_err()
+    );
+    Ok(())
+}
