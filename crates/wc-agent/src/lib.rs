@@ -1102,7 +1102,7 @@ mod tests {
             .unwrap_or_default()
             .iter()
             .filter(|b| b["type"] == "tool_result")
-            .map(|b| b["content"].to_string())
+            .map(|b| b["content"].as_str().unwrap_or_default().to_owned())
             .collect()
     }
 
@@ -1128,7 +1128,13 @@ mod tests {
 
     #[test]
     fn calls_in_a_cut_off_answer_are_not_run_and_say_why() {
-        for reason in ["max_tokens", "model_context_window_exceeded"] {
+        let cut_off = "Not run: the answer was cut off.";
+        let ended = "Not run: the answer ended without asking for tool results.";
+        for (reason, want) in [
+            ("max_tokens", cut_off),
+            ("model_context_window_exceeded", cut_off),
+            ("end_turn", ended),
+        ] {
             let t = script(vec![Ok(json!({
                 "stop_reason": reason,
                 "content": [{"type": "tool_use", "id": "t1", "name": "add", "input": {}}]
@@ -1140,14 +1146,7 @@ mod tests {
             let p = s.poll(&mut tools, &set, "sys", true);
             assert!(p.finished);
             assert!(tools.calls.is_empty(), "{reason}");
-            let results = last_tool_results(&s);
-            assert_eq!(results.len(), 1, "{reason}");
-            assert!(
-                results[0].contains("Not run: the answer was cut off."),
-                "{reason}: {}",
-                results[0]
-            );
-            assert!(!results[0].contains("stopped"), "{reason}");
+            assert_eq!(last_tool_results(&s), vec![want.to_owned()], "{reason}");
         }
     }
 
