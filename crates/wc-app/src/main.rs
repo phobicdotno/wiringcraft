@@ -1856,7 +1856,7 @@ impl App {
                     ed.message = e;
                 }
                 if a == Action::EditSymbol {
-                    ed.choices = open.library.clone();
+                    ed.choices = open.library.iter().map(|e| (e.id.clone(), e.name.clone())).collect();
                     if ed.opened_as.is_none() && ed.message.is_empty() {
                         ed.message = "Pick the symbol to change under \"Open a library symbol\".".into();
                     }

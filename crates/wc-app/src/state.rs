@@ -419,13 +419,39 @@ fn vendor_names(dir: &Path) -> Result<std::collections::BTreeSet<(ItemKind, Stri
     Ok(out)
 }
 
+/// One symbol in the symbol list: what the list shows, searches and offers to place.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LibraryEntry {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+}
+
+impl LibraryEntry {
+    /// The entry for symbol `s` listed under `id`.
+    pub fn of(id: &str, s: &Symbol) -> Self {
+        Self {
+            id: id.to_owned(),
+            name: s.name.clone(),
+            description: s.description.clone(),
+        }
+    }
+
+    /// Whether every word of `query` appears, ignoring case, in the id, name or description.
+    /// An empty query matches everything.
+    pub fn matches(&self, query: &str) -> bool {
+        let hay = format!("{} {} {}", self.id, self.name, self.description).to_lowercase();
+        query.to_lowercase().split_whitespace().all(|w| hay.contains(w))
+    }
+}
+
 pub struct Open {
     pub dir: PathBuf,
     pub project: Project,
     /// The project's vendored symbols.
     pub symbols: BTreeMap<String, Symbol>,
-    /// Ids of every symbol in the project's library sources (for the picker).
-    pub library: Vec<(String, String)>,
+    /// Every symbol in the project and its library sources (for the picker), by id.
+    pub library: Vec<LibraryEntry>,
     /// The check rules of the project's library sources, read with the library
     /// ([`Open::refresh_library`]) so checks while drawing need not read files.
     pub library_rules: Vec<wc_core::check_rule::RuleSet>,
@@ -675,18 +701,22 @@ impl Open {
     }
 
     pub fn refresh_library(&mut self) {
-        let mut items: BTreeMap<String, String> =
-            self.symbols.iter().map(|(k, s)| (k.clone(), s.name.clone())).collect();
+        let mut items: BTreeMap<String, LibraryEntry> = self
+            .symbols
+            .iter()
+            .map(|(k, s)| (k.clone(), LibraryEntry::of(k, s)))
+            .collect();
         if let Ok(lib) = wc_library::Library::open(&self.dir, &self.project) {
             for id in lib.index(ItemKind::Symbol).into_keys() {
                 if !items.contains_key(&id)
                     && let Ok((s, _)) = lib.symbol(&id)
                 {
-                    items.insert(id, s.name);
+                    let entry = LibraryEntry::of(&id, &s);
+                    items.insert(id, entry);
                 }
             }
         }
-        self.library = items.into_iter().collect();
+        self.library = items.into_values().collect();
         self.library_rules = wc_library::library_rules(&self.dir, &self.project);
         self.touch();
 
@@ -8014,9 +8044,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_symbol_list_keeps_and_searches_descriptions() {
+        let (_tmp, o) = project();
+        let coil = o.library.iter().find(|e| e.id == "wc.coil").unwrap();
+        assert!(coil.description.contains("relay"), "{coil:?}");
+        // Every word must appear, in any order and case, across id, name and description.
+        assert!(coil.matches(""));
+        assert!(coil.matches("CONTACTOR relay"));
+        assert!(coil.matches("coil contactor"));
+        assert!(!coil.matches("contactor timer"));
+        let hits: Vec<&str> = o
+            .library
+            .iter()
+            .filter(|e| e.matches("relay contactor"))
+            .map(|e| e.id.as_str())
+            .collect();
+        assert!(hits.contains(&"wc.coil"), "{hits:?}");
+        // After placing, the vendored copy keeps its description too.
+        let mut o = o;
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        o.place(page, "wc.coil", Point::new(50.0, 50.0)).unwrap();
+        o.refresh_library();
+        let coil = o.library.iter().find(|e| e.id == "wc.coil").unwrap();
+        assert!(coil.matches("relay"));
+    }
+
+    #[test]
     fn placing_vendors_the_symbol_and_tags_the_device() {
         let (_tmp, mut o) = project();
-        assert!(o.library.iter().any(|(id, _)| id == "wc.coil"));
+        assert!(o.library.iter().any(|e| e.id == "wc.coil"));
         let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
         let id = o.place(page, "wc.coil", Point::new(50.0, 50.0)).unwrap();
         assert!(o.symbols.contains_key("wc.coil"));
@@ -8747,7 +8803,7 @@ pub(crate) mod tests {
             description: String::new(),
         };
         wc_library::write_symbol(&root, &sym).unwrap();
-        let listed = |o: &Open| o.library.iter().any(|(id, _)| id == "test.imported");
+        let listed = |o: &Open| o.library.iter().any(|e| e.id == "test.imported");
         o.refresh_library();
         assert!(!listed(&o), "the folder is not a source yet");
 

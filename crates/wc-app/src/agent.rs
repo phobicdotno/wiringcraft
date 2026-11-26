@@ -2233,7 +2233,7 @@ impl App {
         let open = need_open(self.open.as_mut())?;
         let q = s(v, "query").unwrap_or_default().to_lowercase();
         let limit = v.get("limit").and_then(Value::as_u64).unwrap_or(30) as usize;
-        let ids: Vec<String> = open.library.iter().map(|(id, _)| id.clone()).collect();
+        let ids: Vec<String> = open.library.iter().map(|e| e.id.clone()).collect();
         let lib = wc_library::Library::open(&open.dir, &open.project).ok();
         let mut out = Vec::new();
         for id in ids {
