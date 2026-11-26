@@ -1898,7 +1898,7 @@ pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<
     page_of(&parse(text)?, scale, known_symbols)
 }
 
-fn check_scale(scale: f64) -> Result<()> {
+pub(crate) fn check_scale(scale: f64) -> Result<()> {
     if !(scale.is_finite() && scale > 0.0) {
         return Err(Error::Format("scale must be a positive number".into()));
     }

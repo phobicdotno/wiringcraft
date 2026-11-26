@@ -1470,6 +1470,75 @@ fn a_reference_to_a_missing_block_is_counted_and_the_rest_drawn() -> TestResult 
 }
 
 #[test]
+fn the_attributes_of_a_reference_to_a_missing_block_stay_its_own() -> TestResult {
+    for v in [Version::R2004, Version::R2010, Version::R2018] {
+        let insert = |handle: u64, block: u64, attribs: bool| {
+            let mut i = entity(v, 7, handle, head(None));
+            i.data
+                .bd3((0.0, 0.0, 0.0))
+                .bb(3)
+                .bd(0.0)
+                .bd3((0.0, 0.0, 1.0))
+                .b(attribs);
+            if attribs {
+                i.data.bl(1);
+            }
+            i.handles.h(5, block);
+            i
+        };
+        let objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            block_header(v, 0x100, "B", (0.0, 0.0), false),
+            line(v, 0x200, head(Some(0x100)), (0.0, 0.0), (10.0, 0.0)),
+            insert(0x201, 0x100, false),
+            insert(0x202, 0x999, true),
+            attrib(v, 2, 0x203, head(Some(0x202)), (0.0, 20.0), "-K9", "TAG", 0),
+        ];
+        let known: std::collections::BTreeSet<String> = ["b".to_owned()].into();
+        let page = crate::dwg::page_of(&sections(v, &objs, &[]), 1.0, &known)?;
+        assert_eq!(page.symbols.len(), 1, "{v:?}: {page:?}");
+        assert!(
+            page.symbols[0].tag.is_none(),
+            "{v:?}: not the tag of the symbol before it: {:?}",
+            page.symbols[0].tag
+        );
+        assert!(
+            page.graphics
+                .iter()
+                .any(|s| matches!(s, Shape::Text { text, .. } if text == "-K9")),
+            "{v:?}: the text is kept: {:?}",
+            page.graphics
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn an_encrypted_class_section_is_said() -> TestResult {
+    let v = Version::R2010;
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        line(v, 0x200, head(None), (0.0, 0.0), (10.0, 0.0)),
+    ];
+    let mut s = sections(v, &objs, &[]);
+    s.skipped.push("AcDb:Classes".to_owned());
+    let read = dxf_drawing(&s)?;
+    assert_eq!(read.skipped.get(CLASSES_DAMAGED), Some(&1), "{:?}", read.skipped);
+    let page = crate::dwg::page_of(&s, 1.0, &Default::default())?;
+    assert!(!page.graphics.is_empty());
+    assert!(
+        page.warnings
+            .iter()
+            .any(|w| w.contains("the class section is encrypted") && w.contains("custom entities are not counted")),
+        "{:?}",
+        page.warnings
+    );
+    Ok(())
+}
+
+#[test]
 fn a_bulged_lightweight_polyline_is_drawn_with_its_arc() -> TestResult {
     for v in [Version::R2004, Version::R2010, Version::R2018] {
         // Open, two points 10 apart, the segment between them a half circle (bulge 1); from

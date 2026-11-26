@@ -161,6 +161,12 @@ pub(crate) fn dxf_drawing(sections: &Sections) -> Result<Read> {
     let mut damaged = Vec::new();
     // The classes name the custom types (500 and up); without them those are not counted.
     let classes = match sections.get("AcDb:Classes") {
+        // Stored encrypted (a password-protected drawing): as unreadable as a damaged one.
+        None if sections.skipped.iter().any(|name| name == "AcDb:Classes") => {
+            *skipped.entry(CLASSES_DAMAGED.to_owned()).or_default() += 1;
+            damaged.push("the class section is encrypted".to_owned());
+            HashMap::new()
+        }
         None => HashMap::new(),
         Some(data) => read_classes(data, sections.version, sections.maint).unwrap_or_else(|e| {
             // A section, not an object: counted under its own key, its reason with the others.
@@ -1362,17 +1368,26 @@ impl Decoded {
                 },
                 "INSERT" => {
                     // A reference to a block that is not there draws nothing: counted, while
-                    // its attributes are still drawn.
-                    match item.block.and_then(|b| blocks.get(&b)) {
+                    // its attributes are still drawn, as plain texts (as ATTRIBs they would be
+                    // taken for those of the INSERT before it).
+                    let resolved = match item.block.and_then(|b| blocks.get(&b)) {
                         Some(name) => {
                             entity.codes.push((2, name.clone()));
                             list.push(entity);
+                            true
                         }
-                        None => *skipped.entry(UNRESOLVED_INSERT.to_owned()).or_default() += 1,
-                    }
+                        None => {
+                            *skipped.entry(UNRESOLVED_INSERT.to_owned()).or_default() += 1;
+                            false
+                        }
+                    };
                     for a in own.iter().filter(|c| c.entity.kind == "ATTRIB") {
                         if (a.entity.f(70) as i64) & 1 == 0 {
-                            list.push(with_layer(&a.entity, a.layer, &layers));
+                            let mut text = with_layer(&a.entity, a.layer, &layers);
+                            if !resolved {
+                                text.kind = "TEXT".into();
+                            }
+                            list.push(text);
                         }
                     }
                 }

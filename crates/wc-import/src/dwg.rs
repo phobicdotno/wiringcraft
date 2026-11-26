@@ -87,7 +87,8 @@ fn page_from(
     scale: f64,
     known_symbols: &std::collections::BTreeSet<String>,
 ) -> Result<crate::dxf::ImportedPage> {
-    let mut out = crate::dxf::page_of(&read.drawing, scale, known_symbols)?;
+    // Checked first, so an error from the page below is about the drawing.
+    crate::dxf::check_scale(scale)?;
     let mut notes = Vec::new();
     let classes_damaged = read.skipped.contains_key(objects::CLASSES_DAMAGED);
     let (classes_why, objects_why) = read.damage_reasons();
@@ -119,6 +120,11 @@ fn page_from(
         }
     }
     notes.extend(crate::dxf::skipped_warnings(skipped));
+    // A drawing with nothing to draw says what could not be read, if anything.
+    let mut out = crate::dxf::page_of(&read.drawing, scale, known_symbols).map_err(|e| match e {
+        crate::Error::Format(why) if !notes.is_empty() => crate::Error::Format(format!("{why}: {}", notes.join("; "))),
+        e => e,
+    })?;
     notes.append(&mut out.warnings);
     out.warnings = notes;
     Ok(out)
@@ -799,6 +805,15 @@ mod page_tests {
         assert!(page.symbols.is_empty());
         assert!(page.graphics.len() >= 2);
         assert!(super::page(&bytes, 0.0, &known).is_err());
+        // Nothing readable: the error says why the objects could not be read.
+        let err = super::page(&model_space_dwg(&[E::Damaged]), 1.0, &known)
+            .err()
+            .map(|e| e.to_string());
+        assert!(
+            err.as_deref()
+                .is_some_and(|e| e.contains("no entities") && e.contains("1 object(s) could not be read")),
+            "{err:?}"
+        );
         assert!(super::page(b"not a drawing", 1.0, &known).is_err());
     }
 
