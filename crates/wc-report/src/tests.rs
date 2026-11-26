@@ -2869,3 +2869,70 @@ fn plc_card_overview_links_by_page_id_and_warns_on_points_and_shared_bytes() {
     };
     assert!(!plc_rack_warnings(&i).iter().any(|w| w.contains("slot 3")));
 }
+
+#[test]
+fn rows_of_the_wire_cable_terminal_and_plc_lists_link_to_their_page() {
+    let (mut p, mut s, parts) = fixture();
+    let mut input = sym("wc.plc.input", SymbolRole::Standalone, &["I"]);
+    input.category = "plc".into();
+    input.name = "PLC digital input".into();
+    s.insert(input.id.clone(), input);
+    // A second page, numbered 7 with the id p7, with a terminal, a PLC input and a cable core.
+    let mut second = Page::new("p7", "7", "Field");
+    second.symbols = vec![
+        place("t1", "term", 10.0, Some("-X1.3")),
+        place("in1", "wc.plc.input", 40.0, Some("-A1.I1")),
+    ];
+    let mut core = wire("w20", pin("t1", "2"), pin("in1", "I"), Some("20"), None);
+    core.cable = Some(wc_core::CableCore {
+        cable: DeviceTag::parse("-W1").unwrap(),
+        core: "2".into(),
+    });
+    second.wires.push(core);
+    p.pages.push(second);
+    if let Some(w) = p.pages[0].wires.iter_mut().find(|w| w.id == "w2") {
+        w.cable = Some(wc_core::CableCore {
+            cable: DeviceTag::parse("-W1").unwrap(),
+            core: "1".into(),
+        });
+    }
+    p.meta.strips.push(wc_core::project::StripLayout {
+        strip: DeviceTag::parse("-X1").unwrap(),
+        spares: vec!["9".into()],
+        order: vec![],
+    });
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let id_of = |number: &str| p.pages.iter().find(|pg| pg.number == number).map(|pg| pg.id.clone());
+    for (kind, page_column) in [
+        (Kind::Wires, 0),
+        (Kind::Cables, 4),
+        (Kind::Terminals, 5),
+        (Kind::Plc, 5),
+    ] {
+        let t = build(kind, &i);
+        assert!(!t.rows.is_empty(), "{kind:?}");
+        for (n, row) in t.rows.iter().enumerate() {
+            let link = t.row_pages.get(n).cloned().unwrap_or_default();
+            let want = id_of(&row[page_column]).unwrap_or_default();
+            assert_eq!(link, want, "{kind:?} row {row:?}");
+        }
+        assert!(t.row_pages.iter().any(|l| l == "p7"), "{kind:?}");
+    }
+    // The spare terminal is on no page and links nowhere.
+    let t = build(Kind::Terminals, &i);
+    let spare = t.rows.iter().position(|r| r[5] == SPARE_PAGE).unwrap();
+    assert_eq!(t.row_pages.get(spare).map(String::as_str).unwrap_or(""), "");
+    // A sorted layout keeps each row's link with it.
+    let layout = ReportLayout {
+        sort: vec!["-Page".into()],
+        ..Default::default()
+    };
+    let sorted = build_with(Kind::Wires, &i, Some(&layout));
+    assert_eq!(sorted.rows[0][0], "7");
+    assert_eq!(sorted.row_pages[0], "p7");
+    assert_eq!(sorted.row_pages[1], "p2");
+}
