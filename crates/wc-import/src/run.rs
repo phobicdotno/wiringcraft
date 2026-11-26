@@ -1318,13 +1318,15 @@ pub fn fill_cover(p: &mut Project, fields: std::collections::BTreeMap<String, St
 /// such file), for [`put_files_back`] when the save after it fails.
 pub type Written = Vec<(PathBuf, Option<Vec<u8>>)>;
 
-/// Whether an import may replace a vendored item the project pins in another version.
+/// Whether an import may replace a vendored item the project has in another version.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Replace {
     /// Never: an Eplan, AML or SolidWorks Electrical project import makes its own symbols, and a
-    /// page the project kept may still use the old one's pins.
+    /// page the project kept may still use the old one's pins. A copy the lock does not list is
+    /// kept just the same (#649).
     No,
-    /// When the project's copy is still the pinned one (a library import, #258).
+    /// When the project's copy is still the pinned one (a library import, #258). A copy the lock
+    /// does not list has no pin to compare with and is replaced.
     Unchanged,
 }
 
@@ -1488,7 +1490,7 @@ pub fn add_built(
     }
     // A new version of a symbol must keep every pin a wire in the project ends on: one the lock
     // pins in another version, and one the project only has a copy of (no lock entry), which
-    // the import replaces just the same.
+    // an import that may replace (`Replace::Unchanged`) replaces just the same.
     for symbol in &built.symbols {
         let replaced = match p.lock.symbols.get(&symbol.id) {
             Some(entry) => entry.hash != symbol.hash(),
@@ -1537,16 +1539,17 @@ pub fn add_built(
             ItemKind::Part => format!("part {id}"),
         };
         let (path, before) = vendored_bytes(dir, kind, id)?;
+        // The content hash of the project's copy: none when it has no such file.
+        let have = || match (&before, kind) {
+            (None, _) => None,
+            (Some(_), ItemKind::Symbol) => Some(store::read_vendored_symbol(dir, id).map(|x| x.hash())),
+            (Some(_), ItemKind::Part) => Some(store::read_vendored_part(dir, id).map(|x| x.hash())),
+        };
         if let Some(entry) = p.lock.map(kind).get(id) {
             if replace == Replace::No && entry.hash != hash {
                 return Err(format!("{name} exists with other content; import into a fresh project"));
             }
-            let have = match (&before, kind) {
-                (None, _) => None,
-                (Some(_), ItemKind::Symbol) => Some(store::read_vendored_symbol(dir, id).map(|x| x.hash())),
-                (Some(_), ItemKind::Part) => Some(store::read_vendored_part(dir, id).map(|x| x.hash())),
-            };
-            match have {
+            match have() {
                 Some(Ok(h)) if h == entry.hash => {}
                 Some(Ok(_)) => {
                     return Err(format!("{name} exists with other content; import into a fresh project"));
@@ -1561,6 +1564,22 @@ pub fn add_built(
                 None => {
                     return Err(format!(
                         "{name}: the project pins another version and has no copy of it ({}); restore the pinned copy from the project's history, or import the pinned version itself",
+                        path.display()
+                    ));
+                }
+            }
+        } else if replace == Replace::No {
+            // No lock entry (the copy was put there by hand, or its pin was lost): not replacing
+            // keeps that copy too, so only the same content may come again (#649).
+            match have() {
+                None => {}
+                Some(Ok(h)) if h == hash => {}
+                Some(Ok(_)) => {
+                    return Err(format!("{name} exists with other content; import into a fresh project"));
+                }
+                Some(Err(why)) => {
+                    return Err(format!(
+                        "{name}: its copy {} cannot be read ({why}); repair it and import again",
                         path.display()
                     ));
                 }
@@ -2131,15 +2150,97 @@ mod tests {
         assert_eq!(files(&dir), before);
         assert_eq!(q, p, "the project was changed by a refused import");
 
-        // One that keeps A2 (and adds a pin) replaces the copy and pins it.
+        // So is one from an import that may replace.
         let mut q = p.clone();
-        let r = add_built(&dir, &mut q, built(&["A1", "A2", "A3"]), "import:t", Replace::No);
+        let err = match add_built(&dir, &mut q, built(&["A1"]), "import:t", Replace::Unchanged) {
+            Err(why) => why,
+            Ok(_) => String::new(),
+        };
+        assert!(err.contains("symbol imp.coil: wires end on pins"), "{err}");
+        assert_eq!(files(&dir), before);
+        assert_eq!(q, p, "the project was changed by a refused import");
+
+        // One that keeps A2 (and adds a pin) replaces the copy and pins it, when the import may
+        // replace.
+        let mut q = p.clone();
+        let r = add_built(&dir, &mut q, built(&["A1", "A2", "A3"]), "import:t", Replace::Unchanged);
         assert!(r.is_ok(), "{r:?}");
         assert_eq!(
             store::read_vendored_symbol(&dir, "imp.coil").map(|s| s.pins.len()).ok(),
             Some(3)
         );
         assert!(q.lock.symbols.contains_key("imp.coil"));
+    }
+
+    #[test]
+    fn not_replacing_keeps_a_vendored_symbol_and_part_the_lock_does_not_list() {
+        let t = tmp();
+        let dir = t.path().join("p");
+        let p = Project::new("t");
+        assert!(store::save(&dir, &p).is_ok());
+        // The project's copies have no lock entry: put there by hand, or their pins were lost.
+        assert!(store::write_vendored_symbol(&dir, &symbol_with_pins("imp.coil", &["A1", "A2"])).is_ok());
+        let part = |description: &str| wc_core::Part {
+            id: "imp.relay".into(),
+            description: description.into(),
+            ..Default::default()
+        };
+        assert!(store::write_vendored_part(&dir, &part("Relay")).is_ok());
+        assert_eq!(p.lock.symbols.get("imp.coil"), None);
+        assert_eq!(p.lock.parts.get("imp.relay"), None);
+        let before = files(&dir);
+        let refused = |built: crate::aml::Built| {
+            let mut q = p.clone();
+            let err = match add_built(&dir, &mut q, built, "import:t", Replace::No) {
+                Err(why) => why,
+                Ok(_) => String::new(),
+            };
+            assert_eq!(q, p, "the project was changed by a refused import");
+            err
+        };
+        let symbols = |pins: &[&str]| crate::aml::Built {
+            symbols: vec![symbol_with_pins("imp.coil", pins)],
+            ..Default::default()
+        };
+        let parts = |description: &str| crate::aml::Built {
+            parts: vec![part(description)],
+            ..Default::default()
+        };
+
+        // Another version of the symbol is refused, and the file stays as it was.
+        assert_eq!(
+            refused(symbols(&["A1", "A2", "A3"])),
+            "symbol imp.coil exists with other content; import into a fresh project"
+        );
+        assert_eq!(files(&dir), before);
+        // So is another version of the part.
+        assert_eq!(
+            refused(parts("Relay 24 V")),
+            "part imp.relay exists with other content; import into a fresh project"
+        );
+        assert_eq!(files(&dir), before);
+
+        // The same content may come again: the files stay as they were and get their pins.
+        let mut q = p.clone();
+        let mut same = symbols(&["A1", "A2"]);
+        same.parts = parts("Relay").parts;
+        let r = add_built(&dir, &mut q, same, "import:t", Replace::No);
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(files(&dir), before);
+        assert!(q.lock.symbols.contains_key("imp.coil"));
+        assert!(q.lock.parts.contains_key("imp.relay"));
+
+        // A copy that cannot be read is not written over either.
+        let path = dir
+            .join(store::VENDOR_DIR)
+            .join(ItemKind::Symbol.dir())
+            .join("imp.coil.json");
+        assert!(std::fs::write(&path, b"{").is_ok());
+        let broken = files(&dir);
+        let err = refused(symbols(&["A1", "A2"]));
+        assert!(err.starts_with("symbol imp.coil: its copy "), "{err}");
+        assert!(err.ends_with("repair it and import again"), "{err}");
+        assert_eq!(files(&dir), broken);
     }
 
     #[test]
