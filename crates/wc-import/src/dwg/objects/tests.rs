@@ -1022,6 +1022,21 @@ fn a_long_text_and_a_big_object_map_are_read() -> TestResult {
 }
 
 #[test]
+fn a_line_whose_end_is_not_a_number_is_damage_not_drawn_at_0() -> TestResult {
+    let v = Version::R2010;
+    let objs = vec![
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        entry(v, LAYER, LAYER_H, "0"),
+        line(v, 0x200, head(None), (0.0, 0.0), (f64::NAN, 1.0)),
+        line(v, 0x201, head(None), (0.0, 0.0), (5.0, 0.0)),
+    ];
+    let d = drawing(&sections(v, &objs, &[]))?;
+    assert_eq!(d.model.len(), 1, "{:?}", d.model);
+    assert_eq!(d.skipped.get(DAMAGED), Some(&1), "{:?}", d.skipped);
+    Ok(())
+}
+
+#[test]
 fn bit_values_are_read_in_every_form() -> TestResult {
     let mut w = W::default();
     w.bs(0).bs(256).bs(7).bs(4000);

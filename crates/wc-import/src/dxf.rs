@@ -810,11 +810,12 @@ const HATCH_NOT_NUMBERS: &str = "HATCH with a boundary that is not numbers";
 const LINE_NOT_NUMBERS: &str = "LINE whose ends are not numbers once placed";
 /// The `skipped` key of any other entity that is not numbers once placed (e.g. a radius).
 const NOT_NUMBERS_PLACED: &str = "entity whose size is not a number once placed";
-/// How far from the drawing's origin (mm, once scaled) an entity may lie and still be moved
-/// onto the page: 1000 km, far past any real drawing, near enough that moving keeps its shape.
+/// How far from the middle of the drawing (mm, once scaled) an entity may lie and still be
+/// moved onto the page: 1000 km, far past any real drawing, near enough that moving keeps its
+/// shape.
 const FAR_OUT: f64 = 1e9;
 /// The `skipped` key of an entity farther out than [`FAR_OUT`].
-const TOO_FAR_OUT: &str = "entity too far from the drawing's origin";
+const TOO_FAR_OUT: &str = "entity too far from the rest of the drawing";
 
 /// Points along a B-spline from its control points, knots and weights, sampled evenly over the
 /// knot range. `None` when the data do not make a spline.
@@ -1777,7 +1778,7 @@ pub(crate) fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> 
                 format!("{n} entit{s} whose size is not a number once placed, left out")
             } else if kind == TOO_FAR_OUT {
                 let s = if n == 1 { "y" } else { "ies" };
-                format!("{n} entit{s} more than 1000 km from the drawing's origin, left out")
+                format!("{n} entit{s} more than 1000 km from the rest of the drawing, left out")
             } else if kind == LINE_NOT_NUMBERS {
                 let s = if n == 1 { "" } else { "s" };
                 format!("{n} line{s} whose ends are not numbers once placed, left out")
@@ -2011,9 +2012,29 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
     );
     out.graphics = raw.into_iter().map(|(_, s)| s).collect();
     out.warnings = skipped_warnings(skipped.clone());
-    // Entities farther out than FAR_OUT cannot be moved onto the page without losing their
-    // shape (a far-off one would also drag the rest far out): left out and said.
-    let near = |p: Point| p.x.abs() <= FAR_OUT && p.y.abs() <= FAR_OUT;
+    // Entities farther than FAR_OUT from the middle of the drawing (the median point, which a
+    // few stray ones cannot move) are left out and said: moving one onto the page would drag
+    // the rest out of range or overflow. A drawing far from its own origin keeps everything.
+    let mut xs: Vec<f64> = Vec::new();
+    let mut ys: Vec<f64> = Vec::new();
+    for p in out
+        .graphics
+        .iter()
+        .flat_map(|s| {
+            let (a, b) = s.bounds();
+            [a, b]
+        })
+        .chain(out.symbols.iter().map(|s| s.at))
+    {
+        xs.push(p.x);
+        ys.push(p.y);
+    }
+    let middle = |v: &mut Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v.get(v.len() / 2).copied().unwrap_or(0.0)
+    };
+    let mid = Point::new(middle(&mut xs), middle(&mut ys));
+    let near = |p: Point| (p.x - mid.x).abs() <= FAR_OUT && (p.y - mid.y).abs() <= FAR_OUT;
     let before = out.graphics.len() + out.symbols.len();
     out.graphics.retain(|s| {
         let (a, b) = s.bounds();
@@ -2144,7 +2165,7 @@ mod tests {
         assert!(
             p.warnings
                 .iter()
-                .any(|w| w.contains("1 entity more than 1000 km from the drawing's origin")),
+                .any(|w| w.contains("1 entity more than 1000 km from the rest of the drawing")),
             "{:?}",
             p.warnings
         );
@@ -2153,6 +2174,19 @@ mod tests {
             unreachable!("nothing left to draw");
         };
         assert!(err.to_string().contains("1000 km"), "{err}");
+        Ok(())
+    }
+
+    /// A compact drawing far from its own origin (map coordinates) is moved onto the page whole.
+    #[test]
+    fn a_drawing_far_from_its_origin_comes_onto_the_page_whole() -> Result<()> {
+        let ents = "0\nLINE\n10\n2e9\n20\n0\n11\n2000000005\n21\n0\n";
+        let p = page(&dxf(ents, ""), 1.0, &BTreeSet::new())?;
+        let [Shape::Line { a, b }] = p.graphics.as_slice() else {
+            unreachable!("{:?}", p.graphics);
+        };
+        assert_eq!((*a, *b), (Point::new(20.0, 20.0), Point::new(25.0, 20.0)));
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
         Ok(())
     }
 

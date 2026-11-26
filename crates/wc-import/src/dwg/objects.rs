@@ -944,6 +944,10 @@ fn decode(
                 let z1 = o.data.rd()?;
                 o.data.dd(z1)?;
             }
+            // Stored as text, an end that is not a number would read back as 0.
+            if ![x1, x2, y1, y2].iter().all(|v| v.is_finite()) {
+                return Err(bad("a line's end is not a number"));
+            }
             e.f(10, x1).f(20, y1).f(11, x2).f(21, y2);
         }
         27 => {
