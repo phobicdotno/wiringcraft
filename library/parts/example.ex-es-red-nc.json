@@ -1,0 +1,11 @@
+{
+  "description": "Emergency stop mushroom button red, latching, 1 NC (example data)",
+  "id": "example.ex-es-red-nc",
+  "manufacturer": "Example",
+  "order_number": "EX-ES-RED-NC",
+  "properties": {
+    "Colour": "Red",
+    "Mounting": "Door"
+  },
+  "symbol": "wc.button.estop"
+}
