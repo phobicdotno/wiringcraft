@@ -1127,9 +1127,11 @@ impl App {
             (None, _) => None,
         };
         // An archive may hold no symbol library or parts list: its folder is listed only once
-        // something was written there, also when the folder was there before.
+        // something was written there, also when the folder was there before. An archive that
+        // failed on a later entry has still written what came before: the folder is listed then
+        // too, so its parts are not left where the project does not look.
         let written = job.wrote_to_library();
-        if done
+        if (done || kind == imports::Kind::Archive)
             && written
             && let Some(source) = source
         {
