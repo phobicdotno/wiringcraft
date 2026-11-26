@@ -619,6 +619,22 @@ fn a_coil_drawn_only_on_an_overview_page_still_exists_for_its_contacts() {
     assert!(!check(&i).iter().any(|f| f.message.contains("contact -K9 has no coil")));
 }
 
+/// The `FileName` attribute of the `CAEXFile` element in `xml`, as an XML reader sees it.
+fn caex_file_name(xml: &str) -> Option<String> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    loop {
+        match reader.read_event().ok()? {
+            Event::Start(e) | Event::Empty(e) if e.name().as_ref() == b"CAEXFile" => {
+                let attr = e.try_get_attribute("FileName").ok()??;
+                return Some(attr.unescape_value().ok()?.into_owned());
+            }
+            Event::Eof => return None,
+            _ => {}
+        }
+    }
+}
+
 #[test]
 fn automationml_has_devices_pins_and_one_link_per_join() {
     let (mut p, mut s, parts) = fixture();
@@ -640,7 +656,7 @@ fn automationml_has_devices_pins_and_one_link_per_join() {
         symbols: &s,
         parts: &parts,
     };
-    let (xml, counts) = automationml(&i, "2026-11-16T22:00:00Z");
+    let (xml, counts) = automationml(&i, "2026-11-16T22:00:00Z", "plant-v2.aml");
     // K1, -P1, -X1.1, -X1.2, -X2; not the interruption point.
     assert_eq!(counts.devices, 5, "{xml}");
     assert!(!xml.contains("-L1"));
@@ -651,12 +667,31 @@ fn automationml_has_devices_pins_and_one_link_per_join() {
     assert!(xml.contains("<Value>R-24, DC</Value>") && xml.contains("<Value>Acme</Value>"));
     assert!(xml.contains("Name=\"Coil &lt;voltage&gt;\"") && xml.contains("<Value>24 V &amp; more</Value>"));
     assert!(xml.contains("LastWritingDateTime=\"2026-11-16T22:00:00Z\""));
+    // FileName names the file written, not the project.
+    assert!(xml.contains("<CAEXFile FileName=\"plant-v2.aml\""), "{xml}");
+    // Without a file name, the project name stands in.
+    let fallback = automationml(&i, "2026-11-16T22:00:00Z", "").0;
+    assert!(fallback.contains("<CAEXFile FileName=\"Test.aml\""), "{fallback}");
+    // A file name is kept exactly as given, spaces included.
+    let spaced = automationml(&i, "2026-11-16T22:00:00Z", " plant-v2.aml").0;
+    assert!(spaced.contains("<CAEXFile FileName=\" plant-v2.aml\""), "{spaced}");
+    // Tab, line feed and carriage return survive attribute normalisation as character
+    // references; U+0085 is allowed in XML 1.0 and kept, U+FFFE is not and is dropped.
+    let odd = automationml(&i, "2026-11-16T22:00:00Z", "a\tb\nc\rd\u{85}e\u{FFFE}f.aml").0;
+    assert!(
+        odd.contains("<CAEXFile FileName=\"a&#9;b&#10;c&#13;d\u{85}ef.aml\""),
+        "{odd}"
+    );
+    // An XML reader gets the file name back exactly, tab, line feed and carriage return included.
+    let name = "a\tb\nc\rd.aml";
+    let xml_name = automationml(&i, "2026-11-16T22:00:00Z", name).0;
+    assert_eq!(caex_file_name(&xml_name).as_deref(), Some(name), "{xml_name}");
     // The coil and the contact are one device with all four connection points.
     let k1 = xml.split("<InternalElement Name=\"=A+C1-K1\"").nth(1).unwrap();
     let k1 = k1.split("</InternalElement>").next().unwrap();
     assert_eq!(k1.matches("<ExternalInterface").count(), 4);
     // The same project gives the same file.
-    assert_eq!(automationml(&i, "2026-11-16T22:00:00Z").0, xml);
+    assert_eq!(automationml(&i, "2026-11-16T22:00:00Z", "plant-v2.aml").0, xml);
 }
 
 #[test]

@@ -4066,7 +4066,11 @@ fn run(mut cli: Cli) -> Res<()> {
                 symbols: &symbols,
                 parts: &parts,
             };
-            let (text, counts) = wc_report::automationml(&inputs, &utc_now());
+            let file_name = out
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let (text, counts) = wc_report::automationml(&inputs, &utc_now(), &file_name);
             write_out(&out, text).map_err(e)?;
             if counts.untagged_pins > 0 {
                 eprintln!(
