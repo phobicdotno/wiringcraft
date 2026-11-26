@@ -506,6 +506,7 @@ impl chrome::Status for StatusView<'_> {
             Action::Delete | Action::Copy | Action::Cut | Action::SaveMacro => has && !self.ed.selection.is_empty(),
             Action::Rotate if self.ed.panel.is_some() => has && self.ed.panel_pick.is_some(),
             Action::Mirror if self.ed.panel.is_some() => false,
+            Action::Rotate | Action::Mirror if self.ed.tool == Tool::Place => has,
             Action::Rotate | Action::Mirror => {
                 has && self.ed.selection.iter().any(|s| matches!(s, Selection::Symbol(_)))
             }
@@ -1609,6 +1610,9 @@ impl App {
                 {
                     self.ed.message = "Turned, the device would not fit on the plate.".into();
                 }
+            }
+            Action::Rotate | Action::Mirror if self.ed.tool == Tool::Place => {
+                canvas::turn_place(&mut self.ed, a == Action::Mirror);
             }
             Action::Rotate => open.rotate_many(page, &self.ed.selection),
             Action::Mirror => open.mirror_many(page, &self.ed.selection),

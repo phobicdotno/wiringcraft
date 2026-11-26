@@ -4,7 +4,7 @@
 //! Page coordinates are millimetres with y pointing down, like the paper and the PDF export.
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape as EShape, Stroke, Vec2};
-use wc_core::geom::{Align, Point};
+use wc_core::geom::{Align, Point, Rotation};
 use wc_core::route::Route;
 use wc_core::{Endpoint, Page, Shape};
 
@@ -43,6 +43,9 @@ pub struct Editor {
     pub selection: Vec<Selection>,
     /// Library symbol the place tool puts down.
     pub place_symbol: Option<String>,
+    /// The turn and mirror the place tool puts the symbol down with (R and M set them while
+    /// the symbol hangs on the pointer). Set back when another tool is picked.
+    pub place_turn: (Rotation, bool),
     /// A wire being drawn: its start and the bends so far.
     pub wire: Option<(Endpoint, Vec<Point>)>,
     pub view: View,
@@ -106,6 +109,7 @@ impl Default for Editor {
             tool: Tool::Select,
             selection: Vec::new(),
             place_symbol: None,
+            place_turn: (Rotation::R0, false),
             wire: None,
             view: View::default(),
             cursor: None,
@@ -1042,6 +1046,9 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
     ed.cursor = hover.map(|p| snap(p, snap_step));
     let tol = (6.0 / f64::from(xf.zoom)).max(0.8);
 
+    if ed.tool != Tool::Place {
+        ed.place_turn = (Rotation::R0, false);
+    }
     match ed.tool {
         Tool::Select => select_tool(&painter, &resp, open, ed, &page, &xf, tol, snap_step, held),
         Tool::Place => place_tool(&painter, &resp, open, ed, &xf, &t),
@@ -2138,6 +2145,24 @@ fn on_paper(open: &Open, page: usize, at: Point) -> bool {
     })
 }
 
+/// R (`mirror` false) or M (`mirror` true) with the place tool: turn the symbol on the pointer
+/// a quarter clockwise, or mirror it, for this and the next symbols placed.
+pub fn turn_place(ed: &mut Editor, mirror: bool) {
+    let (rotation, mirrored) = &mut ed.place_turn;
+    if mirror {
+        *mirrored = !*mirrored;
+    } else {
+        *rotation = Rotation::from_degrees(rotation.degrees() + 90).unwrap_or_default();
+    }
+    let turn = match (rotation.degrees(), *mirrored) {
+        (0, false) => "Not turned".to_owned(),
+        (0, true) => "Mirrored".to_owned(),
+        (d, false) => format!("Turned {d}°"),
+        (d, true) => format!("Turned {d}° and mirrored"),
+    };
+    ed.message = format!("{turn}, R turns again, M mirrors.");
+}
+
 fn place_tool(
     painter: &egui::Painter,
     resp: &egui::Response,
@@ -2155,7 +2180,7 @@ fn place_tool(
     if let Some(sym) = open.symbols.get(&id) {
         let stroke = Stroke::new(xf.len(0.3).max(1.0), t.ghost);
         for g in &sym.graphics {
-            paint_shape(painter, xf, &g.placed(at, wc_core::geom::Rotation::R0, false), stroke);
+            paint_shape(painter, xf, &g.placed(at, ed.place_turn.0, ed.place_turn.1), stroke);
         }
     } else {
         painter.rect_stroke(
@@ -2170,7 +2195,8 @@ fn place_tool(
             ed.message = "Click on the sheet to place the symbol.".into();
             return;
         }
-        match open.place(ed.page, &id, at) {
+        let (rotation, mirror) = ed.place_turn;
+        match open.place_turned(ed.page, &id, at, rotation, mirror) {
             Ok(sid) => {
                 let wired = auto_wire(
                     open,
@@ -2436,6 +2462,46 @@ mod tests {
         let spot = f.item.as_deref().and_then(|item| live_spot(&o, page, item));
         assert_eq!(spot, Some((Point::new(40.0, 30.0), Point::new(90.0, 60.0))));
         assert_eq!(live_spot(&o, page, "cloud 7"), None, "no such cloud");
+    }
+
+    #[test]
+    fn r_and_m_turn_and_mirror_the_symbol_before_it_is_placed() {
+        let (_tmp, mut open) = project();
+        let mut ed = Editor {
+            tool: Tool::Place,
+            place_symbol: Some("wc.coil".into()),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        painted(&ctx, &mut open, &mut ed, 0.5, vec![]);
+        // R twice and M while the symbol hangs on the pointer.
+        turn_place(&mut ed, false);
+        turn_place(&mut ed, false);
+        turn_place(&mut ed, true);
+        assert_eq!(ed.place_turn, (Rotation::R180, true));
+        assert_eq!(ed.message, "Turned 180° and mirrored, R turns again, M mirrors.");
+        let steps = |o: &Open| {
+            o.project.pages[0]
+                .symbols
+                .iter()
+                .map(|s| (s.rotation, s.mirror))
+                .collect::<Vec<_>>()
+        };
+        click_at(&ctx, &mut open, &mut ed, egui::pos2(400.0, 300.0), 1.0);
+        assert_eq!(steps(&open), [(Rotation::R180, true)]);
+        // One undo step takes the placed symbol back off.
+        assert!(open.undo());
+        assert!(open.project.pages[0].symbols.is_empty());
+        // The turn stays for the next symbols placed with the tool.
+        click_at(&ctx, &mut open, &mut ed, egui::pos2(400.0, 300.0), 2.0);
+        turn_place(&mut ed, false);
+        click_at(&ctx, &mut open, &mut ed, egui::pos2(500.0, 300.0), 3.0);
+        assert_eq!(steps(&open), [(Rotation::R180, true), (Rotation::R270, true)]);
+        // Another tool sets it back.
+        ed.tool = Tool::Select;
+        painted(&ctx, &mut open, &mut ed, 4.0, vec![]);
+        assert_eq!(ed.place_turn, (Rotation::R0, false));
     }
 
     #[test]

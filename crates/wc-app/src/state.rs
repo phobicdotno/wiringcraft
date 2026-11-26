@@ -2699,6 +2699,19 @@ impl Open {
     }
 
     pub fn place(&mut self, page: usize, symbol: &str, at: Point) -> Result<String, String> {
+        self.place_turned(page, symbol, at, Rotation::R0, false)
+    }
+
+    /// Place `symbol` at `at` on page `page`, turned by `rotation` and mirrored when `mirror`
+    /// is set, as one undo step. Returns the new item's id.
+    pub fn place_turned(
+        &mut self,
+        page: usize,
+        symbol: &str,
+        at: Point,
+        rotation: Rotation,
+        mirror: bool,
+    ) -> Result<String, String> {
         self.ensure_symbol(symbol)?;
         let letter = self
             .symbols
@@ -2716,8 +2729,8 @@ impl Open {
             id: id.clone(),
             symbol: symbol.to_owned(),
             at,
-            rotation: Rotation::R0,
-            mirror: false,
+            rotation,
+            mirror,
             tag,
         });
         Ok(id)
