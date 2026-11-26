@@ -1,6 +1,6 @@
 //! The panel layout view: the mounting plate with its ducts, DIN rails and device footprints,
-//! drawn to scale. Devices are picked and dragged with the primary button, and rails and ducts
-//! picked with it, so Delete takes them off; the wheel zooms and the middle or secondary button
+//! drawn to scale. Devices, rails and ducts are picked and dragged with the primary button, and
+//! Delete takes a picked one off; the wheel zooms and the middle or secondary button
 //! pans, as on the schematic canvas.
 
 use eframe::egui::{self, Align2, FontId, Rect, Sense, Stroke, Vec2};
@@ -83,7 +83,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
         zoom: ed.view.zoom,
     };
 
-    // Pick and drag devices.
+    // Pick and drag devices, rails and ducts.
     let pointer = resp.interact_pointer_pos().or(resp.hover_pos()).map(|q| xf.mm(q));
     ed.cursor = pointer;
     // A drag starts where the button went down, which can be some way from where the pointer
@@ -93,9 +93,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
         && let Some(at) = pressed_at.or(pointer)
     {
         ed.panel_pick = item_at(&p.items, at);
-        if let Some(i) = ed.panel_pick
-            && let Some(PanelItem::Device { at: a, .. }) = p.items.get(i)
-        {
+        if let Some(a) = ed.panel_pick.and_then(|i| p.items.get(i)).map(PanelItem::anchor) {
             ed.panel_drag = Some((Point::new(at.x - a.x, at.y - a.y), false));
         }
     }
@@ -123,6 +121,21 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
             });
             if let Some(y) = rail {
                 to.y = y - height / 2.0;
+            }
+        }
+        // A rail or a duct moves whole, kept on the plate.
+        if let Some(item) = p.items.get(i).filter(|it| !matches!(it, PanelItem::Device { .. })) {
+            let mut moved = item.clone();
+            moved.move_on_plate(to, pw, ph);
+            if moved != *item {
+                if !checkpoint {
+                    open.checkpoint();
+                    ed.panel_drag = Some((grab, true));
+                }
+                if let Some(slot) = open.project.panels.get_mut(panel).and_then(|x| x.items.get_mut(i)) {
+                    *slot = moved;
+                    open.edited();
+                }
             }
         }
         let moved = matches!(p.items.get(i), Some(PanelItem::Device { at: a, .. }) if *a != to);
@@ -425,5 +438,95 @@ mod tests {
         assert_eq!(item_at(&items, Point::new(60.0, 66.0)), Some(1));
         assert_eq!(item_at(&items, Point::new(150.0, 30.0)), Some(0));
         assert_eq!(item_at(&items, Point::new(150.0, 90.0)), None);
+    }
+
+    /// Drags from `from` to `to` (plate millimetres) with the primary button, a frame per step.
+    fn drag_on_plate(o: &mut Open, ed: &mut Editor, from: Point, to: Point) {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let frame = |o: &mut Open, ed: &mut Editor, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                events,
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 600.0))),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| show(ui, o, ed, 0, 5.0));
+            });
+        };
+        frame(o, ed, Vec::new());
+        let screen = |ed: &Editor, q: Point| {
+            egui::pos2(
+                ed.view.offset.x + q.x as f32 * ed.view.zoom,
+                ed.view.offset.y + q.y as f32 * ed.view.zoom,
+            )
+        };
+        let button = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        let (a, b) = (screen(ed, from), screen(ed, to));
+        frame(o, ed, vec![egui::Event::PointerMoved(a), button(a, true)]);
+        for k in 1..=4 {
+            let q = a + (b - a) * (k as f32 / 4.0);
+            frame(o, ed, vec![egui::Event::PointerMoved(q)]);
+        }
+        frame(o, ed, vec![button(b, false)]);
+        frame(o, ed, Vec::new());
+    }
+
+    fn plate_with_rail_and_duct() -> (tempfile::TempDir, Open, Editor) {
+        let (tmp, mut o) = crate::state::tests::project();
+        let mut panel = wc_core::panel::Panel::new("pn1", "Main", 600.0, 400.0);
+        panel.items = vec![
+            PanelItem::Duct {
+                min: Point::new(0.0, 300.0),
+                max: Point::new(600.0, 360.0),
+            },
+            PanelItem::Rail {
+                at: Point::new(100.0, 100.0),
+                length: 200.0,
+            },
+        ];
+        o.project.panels.push(panel);
+        let mut ed = Editor::default();
+        ed.panel = Some(0);
+        ed.view.fit = true;
+        (tmp, o, ed)
+    }
+
+    /// A rail dragged moves whole, snapped, as one undo step (#813).
+    #[test]
+    fn dragging_a_rail_moves_it_in_one_undo_step() {
+        let (_tmp, mut o, mut ed) = plate_with_rail_and_duct();
+        let mark = o.undo_mark();
+        drag_on_plate(&mut o, &mut ed, Point::new(150.0, 100.0), Point::new(200.0, 160.0));
+        assert_eq!(ed.panel_pick, Some(1));
+        assert_eq!(
+            o.project.panels[0].items[1],
+            PanelItem::Rail {
+                at: Point::new(150.0, 160.0),
+                length: 200.0,
+            }
+        );
+        assert!(o.undo());
+        assert_eq!(o.undo_mark(), mark);
+        assert_eq!(o.project.panels[0].items[1].anchor(), Point::new(100.0, 100.0));
+    }
+
+    /// A duct dragged past the plate's edge stops on the plate (#813).
+    #[test]
+    fn dragging_a_duct_keeps_it_on_the_plate() {
+        let (_tmp, mut o, mut ed) = plate_with_rail_and_duct();
+        drag_on_plate(&mut o, &mut ed, Point::new(500.0, 330.0), Point::new(450.0, 390.0));
+        assert_eq!(ed.panel_pick, Some(0));
+        assert_eq!(
+            o.project.panels[0].items[0].bounds(),
+            (Point::new(0.0, 340.0), Point::new(600.0, 400.0))
+        );
     }
 }
