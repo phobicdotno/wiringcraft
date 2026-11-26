@@ -17,13 +17,18 @@ pub fn diff_symbols(old: &Symbol, new: &Symbol) -> Vec<String> {
         out.push(format!("role: {:?} -> {:?}", old.role, new.role));
     }
     for p in &old.pins {
-        match new.pin(&p.name) {
-            None => out.push(format!("pin {} removed (wires on it will be left open)", p.name)),
-            Some(n) if n.at != p.at => out.push(format!(
+        let Some(n) = new.pin(&p.name) else {
+            out.push(format!("pin {} removed (wires on it will be left open)", p.name));
+            continue;
+        };
+        if n.at != p.at {
+            out.push(format!(
                 "pin {} moved ({}, {}) -> ({}, {})",
                 p.name, p.at.x, p.at.y, n.at.x, n.at.y
-            )),
-            Some(_) => {}
+            ));
+        }
+        if n.dir != p.dir {
+            out.push(format!("pin {} turned {:?} -> {:?}", p.name, p.dir, n.dir));
         }
     }
     for p in &new.pins {
@@ -192,6 +197,20 @@ mod tests {
         let mut new = coil();
         new.pins[1].at = Point::new(0.0, 15.0);
         assert_eq!(diff_symbols(&coil(), &new), vec!["pin A2 moved (0, 10) -> (0, 15)"]);
+    }
+
+    #[test]
+    fn a_pin_that_only_turned_gets_its_line() {
+        let mut new = coil();
+        new.pins[0].dir = PinDir::Left;
+        let changes = diff_symbols(&coil(), &new);
+        assert!(!changes.is_empty());
+        assert_eq!(changes, vec!["pin A1 turned Up -> Left"]);
+        new.pins[0].at = Point::new(5.0, 0.0);
+        assert_eq!(
+            diff_symbols(&coil(), &new),
+            vec!["pin A1 moved (0, 0) -> (5, 0)", "pin A1 turned Up -> Left"]
+        );
     }
 
     #[test]

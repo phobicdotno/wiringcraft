@@ -19,6 +19,25 @@ fn device_at(items: &[PanelItem], at: Point) -> Option<usize> {
     })
 }
 
+/// Where a dragged device lands when its corner is asked to go to `to`: kept, as turned, on a
+/// `pw` x `ph` plate. `None` for an item that is not a device.
+fn kept_on_plate(item: &PanelItem, to: Point, pw: f64, ph: f64) -> Option<Point> {
+    let PanelItem::Device {
+        width,
+        height,
+        rotation,
+        ..
+    } = item
+    else {
+        return None;
+    };
+    let (w, h) = wc_core::panel::turned_size(*width, *height, *rotation);
+    Some(Point::new(
+        to.x.clamp(0.0, (pw - w).max(0.0)),
+        to.y.clamp(0.0, (ph - h).max(0.0)),
+    ))
+}
+
 /// Where a device at `at`, `size` big as turned, goes when an arrow key moves it `step` mm in
 /// the direction (`dx`, `dy`): kept on a plate `plate` big, as a drag keeps it.
 fn nudged(at: Point, size: (f64, f64), plate: (f64, f64), step: f64, dx: f64, dy: f64) -> Point {
@@ -28,6 +47,99 @@ fn nudged(at: Point, size: (f64, f64), plate: (f64, f64), step: f64, dx: f64, dy
         (at.x + dx * step).clamp(0.0, (pw - w).max(0.0)),
         (at.y + dy * step).clamp(0.0, (ph - h).max(0.0)),
     )
+}
+
+/// A key press in the panel view that moves the picked device or steps through the undo
+/// history, in the order the presses came.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PanelKey {
+    /// An arrow key: move the picked device one step this way.
+    Nudge(f64, f64),
+    Undo,
+    Redo,
+}
+
+/// Takes this frame's arrow presses (without modifiers) out of the input, in the order they
+/// came. With `history`, the Undo and Redo shortcuts (Ctrl+Z, Ctrl+Shift+Z, Ctrl+Y) go with
+/// them, so a press and an Undo in one frame apply in the order they came (#975); when no
+/// arrow was pressed, nothing is taken and the shortcuts go their usual way.
+pub fn take_keys(inp: &mut egui::InputState, history: bool) -> Vec<PanelKey> {
+    let cmd = egui::Modifiers::COMMAND;
+    let key_of = |e: &egui::Event| {
+        let egui::Event::Key {
+            key,
+            pressed: true,
+            modifiers,
+            ..
+        } = e
+        else {
+            return None;
+        };
+        let nudge = |dx, dy| modifiers.is_none().then_some(PanelKey::Nudge(dx, dy));
+        match key {
+            egui::Key::ArrowLeft => nudge(-1.0, 0.0),
+            egui::Key::ArrowRight => nudge(1.0, 0.0),
+            egui::Key::ArrowUp => nudge(0.0, -1.0),
+            egui::Key::ArrowDown => nudge(0.0, 1.0),
+            // As the app's shortcuts read them: Ctrl+Shift+Z redoes, Ctrl+Z undoes.
+            egui::Key::Z if history && modifiers.matches_logically(cmd | egui::Modifiers::SHIFT) => {
+                Some(PanelKey::Redo)
+            }
+            egui::Key::Z if history && modifiers.matches_logically(cmd) => Some(PanelKey::Undo),
+            egui::Key::Y if history && modifiers.matches_logically(cmd) => Some(PanelKey::Redo),
+            _ => None,
+        }
+    };
+    let keys: Vec<PanelKey> = inp.events.iter().filter_map(key_of).collect();
+    if !keys.iter().any(|k| matches!(k, PanelKey::Nudge(..))) {
+        return Vec::new();
+    }
+    inp.events.retain(|e| key_of(e).is_none());
+    keys
+}
+
+/// Whether the arrow keys move the panel view's picked device now: a device is picked, no drag
+/// runs, and nothing else has the keyboard (`keyboard_edits` is false while a dialog has it).
+pub fn arrows_move(ctx: &egui::Context, open: &Open, ed: &Editor, keyboard_edits: bool) -> bool {
+    keyboard_edits
+        && ed.panel_drag.is_none()
+        && !ctx.wants_keyboard_input()
+        && ed
+            .panel
+            .zip(ed.panel_pick)
+            .and_then(|(p, i)| open.project.panels.get(p)?.items.get(i))
+            .is_some_and(|item| matches!(item, PanelItem::Device { .. }))
+}
+
+/// Moves device `i` of panel `panel` one step (the snap, at most 5 mm) the way (`dx`, `dy`)
+/// points, as one undo step, kept on the plate as a drag keeps it. Nothing happens, and no undo
+/// step is made, when it is not a device or cannot move that way.
+pub fn nudge(open: &mut Open, panel: usize, i: usize, snap_step: f64, dx: f64, dy: f64) {
+    let step = if snap_step > 0.0 { snap_step.min(5.0) } else { 1.0 };
+    let Some(p) = open.project.panels.get(panel) else {
+        return;
+    };
+    let plate = (p.width.max(1.0), p.height.max(1.0));
+    let Some(PanelItem::Device {
+        at,
+        width,
+        height,
+        rotation,
+        ..
+    }) = p.items.get(i)
+    else {
+        return;
+    };
+    let size = wc_core::panel::turned_size(*width, *height, *rotation);
+    let to = nudged(*at, size, plate, step, dx, dy);
+    if to == *at {
+        return;
+    }
+    open.checkpoint();
+    if let Some(PanelItem::Device { at, .. }) = open.project.panels.get_mut(panel).and_then(|x| x.items.get_mut(i)) {
+        *at = to;
+    }
+    open.edited();
 }
 
 /// Which item lies under a plate position: a device first, as they are drawn on top, then a
@@ -158,23 +270,19 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
                 to.y = y - height / 2.0;
             }
         }
+        // Keep the device on the plate before comparing, so a drag against an edge that leaves
+        // the device where it is takes no undo step.
+        let to = p.items.get(i).and_then(|d| kept_on_plate(d, to, pw, ph)).unwrap_or(to);
         let moved = matches!(p.items.get(i), Some(PanelItem::Device { at: a, .. }) if *a != to);
         if moved {
             if checkpoint.is_none() {
                 open.checkpoint();
                 ed.panel_drag = Some((grab, Some(open.history_count()), start));
             }
-            if let Some(PanelItem::Device {
-                at: a,
-                width,
-                height,
-                rotation,
-                ..
-            }) = open.project.panels.get_mut(panel).and_then(|x| x.items.get_mut(i))
+            if let Some(PanelItem::Device { at: a, .. }) =
+                open.project.panels.get_mut(panel).and_then(|x| x.items.get_mut(i))
             {
-                // Keep the device, as turned, on the plate.
-                let (w, h) = wc_core::panel::turned_size(*width, *height, *rotation);
-                *a = Point::new(to.x.clamp(0.0, (pw - w).max(0.0)), to.y.clamp(0.0, (ph - h).max(0.0)));
+                *a = to;
                 open.edited();
             }
         }
@@ -191,57 +299,11 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
         && let Some(i) = ed.panel_pick
         && matches!(p.items.get(i), Some(PanelItem::Device { .. }))
     {
-        let step = if snap_step > 0.0 { snap_step.min(5.0) } else { 1.0 };
-        // The presses in the order they came, so Right then Left ends where it started.
-        let mut presses: Vec<(f64, f64)> = Vec::new();
-        ui.input_mut(|inp| {
-            inp.events.retain(|e| {
-                let egui::Event::Key {
-                    key,
-                    pressed: true,
-                    modifiers,
-                    ..
-                } = e
-                else {
-                    return true;
-                };
-                let d = match key {
-                    egui::Key::ArrowLeft => (-1.0, 0.0),
-                    egui::Key::ArrowRight => (1.0, 0.0),
-                    egui::Key::ArrowUp => (0.0, -1.0),
-                    egui::Key::ArrowDown => (0.0, 1.0),
-                    _ => return true,
-                };
-                if !modifiers.is_none() {
-                    return true;
-                }
-                presses.push(d);
-                false
-            });
-        });
-        for (dx, dy) in presses {
-            let Some(PanelItem::Device {
-                at,
-                width,
-                height,
-                rotation,
-                ..
-            }) = open.project.panels.get(panel).and_then(|x| x.items.get(i))
-            else {
-                break;
-            };
-            let size = wc_core::panel::turned_size(*width, *height, *rotation);
-            let to = nudged(*at, size, (pw, ph), step, dx, dy);
-            if to == *at {
-                continue;
+        let presses = ui.input_mut(|inp| take_keys(inp, false));
+        for key in presses {
+            if let PanelKey::Nudge(dx, dy) = key {
+                nudge(open, panel, i, snap_step, dx, dy);
             }
-            open.checkpoint();
-            if let Some(PanelItem::Device { at, .. }) =
-                open.project.panels.get_mut(panel).and_then(|x| x.items.get_mut(i))
-            {
-                *at = to;
-            }
-            open.edited();
         }
     }
     let p = open.project.panels.get(panel).cloned().unwrap_or(p);
@@ -482,6 +544,100 @@ mod tests {
     }
 
     #[test]
+    fn a_device_against_the_plate_edge_stays_put() {
+        let item = PanelItem::Device {
+            tag: wc_core::DeviceTag::parse("-K1").unwrap_or_default(),
+            at: Point::new(0.0, 0.0),
+            width: 10.0,
+            height: 40.0,
+            rotation: wc_core::geom::Rotation::R90,
+        };
+        // Dragged further out past the top-left corner, it stays where it is.
+        assert_eq!(
+            kept_on_plate(&item, Point::new(-15.0, -5.0), 100.0, 100.0),
+            Some(Point::new(0.0, 0.0))
+        );
+        // Turned, it is 40 mm wide: the right edge stops it at x = 60.
+        assert_eq!(
+            kept_on_plate(&item, Point::new(90.0, 95.0), 100.0, 100.0),
+            Some(Point::new(60.0, 90.0))
+        );
+        assert_eq!(
+            kept_on_plate(&item, Point::new(20.0, 30.0), 100.0, 100.0),
+            Some(Point::new(20.0, 30.0))
+        );
+        let rail = PanelItem::Rail {
+            at: Point::new(0.0, 0.0),
+            length: 10.0,
+        };
+        assert_eq!(kept_on_plate(&rail, Point::new(-5.0, 0.0), 100.0, 100.0), None);
+    }
+
+    #[test]
+    fn dragging_an_edge_device_outward_takes_no_undo_step() {
+        let (_tmp, mut o) = crate::state::tests::project();
+        let mut plate = wc_core::panel::Panel::new("pl1", "Plate", 200.0, 100.0);
+        plate.items.push(PanelItem::Device {
+            tag: wc_core::DeviceTag::parse("-K1").unwrap_or_default(),
+            at: Point::new(0.0, 0.0),
+            width: 20.0,
+            height: 20.0,
+            rotation: wc_core::geom::Rotation::R0,
+        });
+        o.project.panels.push(plate);
+        o.dirty = false;
+        let panel = o.project.panels.len() - 1;
+        assert!(!o.can_undo());
+        let mut ed = Editor::default();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let frame = |o: &mut Open, ed: &mut Editor, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 600.0))),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| show(ui, o, ed, panel, 0.0, true));
+            });
+        };
+        // Find where the device's middle (10, 10 mm) is on screen.
+        let probe = egui::pos2(400.0, 300.0);
+        frame(&mut o, &mut ed, vec![egui::Event::PointerMoved(probe)]);
+        frame(&mut o, &mut ed, vec![egui::Event::PointerMoved(probe)]);
+        let Some(c) = ed.cursor else {
+            unreachable!("the pointer is over the plate")
+        };
+        let z = ed.view.zoom;
+        let start = probe + Vec2::new((10.0 - c.x) as f32 * z, (10.0 - c.y) as f32 * z);
+        let button = |at: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        frame(
+            &mut o,
+            &mut ed,
+            vec![egui::Event::PointerMoved(start), button(start, true)],
+        );
+        // Drag left, past the plate's left edge, in 10 px steps.
+        let mut at = start;
+        for _ in 0..4 {
+            at.x -= 10.0;
+            frame(&mut o, &mut ed, vec![egui::Event::PointerMoved(at)]);
+        }
+        frame(&mut o, &mut ed, vec![button(at, false)]);
+        frame(&mut o, &mut ed, Vec::new());
+        assert!(matches!(
+            o.project.panels[panel].items[0],
+            PanelItem::Device { at, .. } if at == Point::new(0.0, 0.0)
+        ));
+        assert!(!o.can_undo(), "no undo step for a drag that moves nothing");
+        assert!(!o.dirty, "the project is not marked as changed");
+    }
+
+    #[test]
     fn arrow_keys_move_a_device_one_step_and_keep_it_on_the_plate() {
         let at = Point::new(100.0, 50.0);
         assert_eq!(
@@ -500,6 +656,62 @@ mod tests {
             nudged(Point::new(358.0, 0.0), (40.0, 60.0), (400.0, 300.0), 5.0, 1.0, 0.0),
             Point::new(360.0, 0.0)
         );
+    }
+
+    /// With the history keys, an arrow press takes the Undo and Redo shortcuts with it, in the
+    /// order they came; with no arrow press, nothing is taken (#975).
+    #[test]
+    fn panel_keys_keep_arrows_and_undo_in_order() {
+        let key = |key, modifiers| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        let cmd = egui::Modifiers::COMMAND;
+        let none = egui::Modifiers::NONE;
+        let take = |events: Vec<egui::Event>, history: bool| {
+            let ctx = egui::Context::default();
+            let mut got = Vec::new();
+            let mut left = 0;
+            let raw = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| {
+                got = ctx.input_mut(|i| take_keys(i, history));
+                left = ctx.input(|i| i.events.len());
+            });
+            (got, left)
+        };
+        let events = vec![
+            key(egui::Key::ArrowRight, none),
+            key(egui::Key::Z, cmd),
+            key(egui::Key::ArrowUp, none),
+            key(egui::Key::Z, cmd | egui::Modifiers::SHIFT),
+            key(egui::Key::Y, cmd),
+            key(egui::Key::S, cmd),
+        ];
+        assert_eq!(
+            take(events.clone(), true),
+            (
+                vec![
+                    PanelKey::Nudge(1.0, 0.0),
+                    PanelKey::Undo,
+                    PanelKey::Nudge(0.0, -1.0),
+                    PanelKey::Redo,
+                    PanelKey::Redo,
+                ],
+                1
+            ),
+            "Ctrl+S is left for the app"
+        );
+        assert_eq!(
+            take(events, false),
+            (vec![PanelKey::Nudge(1.0, 0.0), PanelKey::Nudge(0.0, -1.0)], 4)
+        );
+        assert_eq!(take(vec![key(egui::Key::Z, cmd)], true), (Vec::new(), 1));
     }
 
     #[test]

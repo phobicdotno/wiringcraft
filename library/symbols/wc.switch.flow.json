@@ -1,0 +1,138 @@
+{
+  "category": "sensors",
+  "description": "Flow switch with a make contact, closes when the flow (water, coolant, air) reaches its set point.",
+  "graphics": [
+    {
+      "a": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 5.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 10.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 10.0
+      },
+      "b": {
+        "x": -3.5,
+        "y": 4.2
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": -1.75,
+        "y": 7.1
+      },
+      "b": {
+        "x": -4.5,
+        "y": 7.1
+      },
+      "kind": "line"
+    },
+    {
+      "kind": "rect",
+      "max": {
+        "x": -4.5,
+        "y": 9.1
+      },
+      "min": {
+        "x": -8.5,
+        "y": 5.1
+      }
+    },
+    {
+      "a": {
+        "x": -7.9,
+        "y": 7.1
+      },
+      "b": {
+        "x": -5.1,
+        "y": 7.1
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": -5.1,
+        "y": 7.1
+      },
+      "b": {
+        "x": -6.1,
+        "y": 6.4
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": -5.1,
+        "y": 7.1
+      },
+      "b": {
+        "x": -6.1,
+        "y": 7.8
+      },
+      "kind": "line"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "13"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 14.4
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "14"
+    }
+  ],
+  "id": "wc.switch.flow",
+  "letter_code": "B",
+  "name": "Flow switch, make",
+  "pins": [
+    {
+      "at": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "13"
+    },
+    {
+      "at": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "dir": "down",
+      "name": "14"
+    }
+  ],
+  "role": "standalone",
+  "tag_at": {
+    "x": -14.0,
+    "y": 8.0
+  }
+}
