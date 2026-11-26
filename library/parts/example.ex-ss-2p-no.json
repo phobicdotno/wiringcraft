@@ -1,0 +1,15 @@
+{
+  "contacts": {
+    "no": 1
+  },
+  "description": "Selector switch 2 positions, maintained, 1 NO (example data)",
+  "id": "example.ex-ss-2p-no",
+  "manufacturer": "Example",
+  "order_number": "EX-SS-2P-NO",
+  "properties": {
+    "Colour": "Black",
+    "Mounting": "Door",
+    "Positions": "2"
+  },
+  "symbol": "wc.switch.selector"
+}

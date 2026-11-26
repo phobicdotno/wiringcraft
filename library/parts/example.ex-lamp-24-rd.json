@@ -1,0 +1,12 @@
+{
+  "description": "Indicator lamp red 24 V (example data)",
+  "id": "example.ex-lamp-24-rd",
+  "manufacturer": "Example",
+  "order_number": "EX-LAMP-24-RD",
+  "properties": {
+    "Coil voltage": "24 V",
+    "Colour": "Red",
+    "Mounting": "Door"
+  },
+  "symbol": "wc.lamp"
+}

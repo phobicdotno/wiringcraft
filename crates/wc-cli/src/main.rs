@@ -62,7 +62,9 @@ fn with_stdout_error(result: Res<()>) -> Res<()> {
 #[derive(Parser)]
 #[command(name = "wiringcraft", version, about = "Electrical schematic and wiring design")]
 struct Cli {
-    /// Project folder.
+    /// Project folder. After a subcommand that takes a device tag, write it as `-C <dir>` or
+    /// `--project <dir>`: an attached `-C<dir>` there is read as a tag, since tags such as
+    /// `-C1` start with a dash too.
     #[arg(short = 'C', long = "project", global = true, default_value = ".")]
     project: PathBuf,
     #[command(subcommand)]
@@ -73,7 +75,9 @@ struct Cli {
 enum Cmd {
     /// Create a new project folder (also a git repository).
     New {
+        /// The folder to create the project in; it must not hold a project already.
         dir: PathBuf,
+        /// The project's name (default: the folder's name).
         #[arg(long)]
         name: Option<String>,
         /// Do not make it a git repository.
@@ -95,7 +99,9 @@ enum Cmd {
     Panel(PanelCmd),
     /// Place a library symbol on a page.
     Place {
+        /// The page's id.
         page: String,
+        /// The library symbol's id, e.g. `iec.contactor.coil`.
         symbol: String,
         /// Position in mm, `x,y`.
         #[arg(long, value_parser = parse_point)]
@@ -106,6 +112,7 @@ enum Cmd {
         /// 0, 90, 180 or 270.
         #[arg(long, default_value_t = 0)]
         rotate: i64,
+        /// Mirror the symbol left to right (before turning it).
         #[arg(long)]
         mirror: bool,
     },
@@ -114,6 +121,7 @@ enum Cmd {
     /// symbol pins. It is stored as a symbol of the project (`box.<page>.<id>`), so it carries a
     /// device tag and part and shows in the reports and checks like any symbol. Prints its id.
     Box {
+        /// The page's id.
         page: String,
         /// Top-left corner in mm, `x,y`.
         #[arg(long, value_parser = parse_point)]
@@ -134,6 +142,7 @@ enum Cmd {
     /// Rules: `sequential` (1, 2, 3 in drawing order), `page-column` (`3.4`: page and column
     /// where the connection starts) or `potential` (the potential's name, else sequential).
     NumberWires {
+        /// `sequential`, `page-column` or `potential`.
         #[arg(long, default_value = "page-column")]
         rule: String,
         /// Renumber connections that already have a number too.
@@ -142,19 +151,24 @@ enum Cmd {
     },
     /// Draw a wire. Ends are `item:pin` (e.g. `s1:13`) or a point `x,y`.
     Wire {
+        /// The page's id.
         page: String,
+        /// Start: `item:pin` (e.g. `s1:13`) or a point `x,y` in mm.
         from: String,
+        /// End: `item:pin` or a point `x,y` in mm.
         to: String,
         /// Bend points, `x,y` each.
         #[arg(long = "via", value_parser = parse_point)]
         via: Vec<Point>,
+        /// Wire number, e.g. `101`.
         #[arg(long)]
         number: Option<String>,
+        /// Potential name, e.g. `L1` or `24V`.
         #[arg(long)]
         potential: Option<String>,
-        /// The cable this wire is a core of, e.g. `=PUMP-W1` (use `--cable=-W1` for a tag that
-        /// starts with `-`).
-        #[arg(long)]
+        /// The cable this wire is a core of, e.g. `=PUMP-W1` or `-W1` (taken as a value, though
+        /// it starts with `-`).
+        #[arg(long, allow_hyphen_values = true)]
         cable: Option<String>,
         /// The core's name in the cable, e.g. `1` or `BN`.
         #[arg(long)]
@@ -196,9 +210,13 @@ enum Cmd {
     Template(TemplateCmd),
     /// Set a device's part and description.
     Device {
+        /// Device tag, e.g. `-K1` (taken as a value, though it starts with `-`).
+        #[arg(allow_hyphen_values = true)]
         tag: String,
+        /// The part's library id; it is taken from the libraries when the project lacks it.
         #[arg(long)]
         part: Option<String>,
+        /// What the device does, e.g. `Pump motor`.
         #[arg(long)]
         description: Option<String>,
     },
@@ -210,10 +228,13 @@ enum Cmd {
     Import(ImportCmd),
     /// Export to PDF.
     Pdf {
+        /// The PDF file to write.
         out: PathBuf,
         /// Page ids to export (default: all).
         #[arg(long = "page")]
         pages: Vec<String>,
+        /// Date for the title block where the page and project set none; free text, printed as
+        /// given, e.g. `2026-11-26`.
         #[arg(long, default_value = "")]
         date: String,
         /// Append report pages: contents, parts, devices, wires, nets, terminals, cables, plc, plc-cards, locations, networks, or all.
@@ -244,12 +265,16 @@ enum Cmd {
         /// Page ids to export (default: all).
         #[arg(long = "page")]
         pages: Vec<String>,
+        /// Date for the title block where the page and project set none; free text, printed as
+        /// given, e.g. `2026-11-26`.
         #[arg(long, default_value = "")]
         date: String,
     },
     /// Print a report (contents, parts, devices, wires, nets, terminals, cables, plc, plc-cards, locations, networks) as a table, CSV or Markdown,
     /// or save it as an Excel workbook (`--format xlsx --out <file>`, one sheet per report).
     Report {
+        /// contents, parts, devices, wires, nets, terminals, cables, plc, plc-cards, locations,
+        /// networks, or `all` (every report; one sheet each with `--format xlsx`).
         kind: String,
         /// `text`, `csv`, `md` or `xlsx`.
         #[arg(long, default_value = "text")]
@@ -262,14 +287,20 @@ enum Cmd {
     Nets,
     /// Export devices, their part data and connection points, and the connections between them
     /// as AutomationML (CAEX 3.0), for tools that take engineering data rather than drawings.
-    Aml { out: PathBuf },
+    Aml {
+        /// The AutomationML (`.aml`) file to write.
+        out: PathBuf,
+    },
     /// Export data for other tools: marker lists for printing marking strips.
     #[command(subcommand)]
     Export(ExportCmd),
     /// Write the PLC inputs and outputs as an IEC 61131-3 global variable list (structured
     /// text) for TwinCAT, CODESYS and similar tools: one variable per point, named after its
     /// device tag and located at its address (`%I*`/`%Q*` when it has none).
-    PlcVars { out: PathBuf },
+    PlcVars {
+        /// The structured text file to write, e.g. `GVL_IO.st`.
+        out: PathBuf,
+    },
     /// Check the project for mistakes: devices drawn twice, contacts without a coil, shorted
     /// potentials, open pins, wires ending in the air, devices without a part, plus the
     /// project's own `[[rule]]` tables in `project.toml` (a cable on every motor, a tag
@@ -286,6 +317,7 @@ enum Cmd {
     /// hit (a device tag renames the device everywhere it appears). Status lines go to stderr,
     /// so stdout holds only hits.
     Find {
+        /// The text to find; upper and lower case are alike unless --match-case.
         query: String,
         /// Replace the found text with this, in every hit.
         #[arg(long)]
@@ -295,7 +327,10 @@ enum Cmd {
         match_case: bool,
     },
     /// Show what is inside a project archive from another tool (.tewzip, .zw1, .elk, .zip).
-    Inspect { file: PathBuf },
+    Inspect {
+        /// The archive file.
+        file: PathBuf,
+    },
     /// Version control: commit, branches, merge, history.
     #[command(subcommand)]
     Vcs(VcsCmd),
@@ -311,6 +346,7 @@ enum ExportCmd {
     /// tag order. In smartScript, import it as Excel/CSV data and map the Marker column (or
     /// the Line columns, one per text line of the marker).
     WagoMarking {
+        /// The CSV file to write.
         out: PathBuf,
         #[command(flatten)]
         args: MarkingArgs,
@@ -319,7 +355,10 @@ enum ExportCmd {
     /// (UTF-8) with, for every strip in natural tag order, its plates and DIN rails, its
     /// terminals in strip order (part, level, wire cross-section and colour on each side), its
     /// jumpers and its accessories. Each row has a stable Index for importing the list back.
-    WagoConfigurator { out: PathBuf },
+    WagoConfigurator {
+        /// The CSV file to write.
+        out: PathBuf,
+    },
 }
 
 /// Options of `export wago-marking`.
@@ -348,7 +387,9 @@ struct MarkingArgs {
 enum CommentCmd {
     /// Pin a comment on a page. Prints its id.
     Add {
+        /// The page's id.
         page: String,
+        /// The comment.
         text: String,
         /// Where on the page, in mm, `x,y`; without it the comment is about the whole page.
         #[arg(long, value_parser = parse_point)]
@@ -359,20 +400,34 @@ enum CommentCmd {
     },
     /// Answer a comment; this opens a resolved one again.
     Reply {
+        /// The comment's id, as `comment list` shows it.
         id: String,
+        /// The answer.
         text: String,
+        /// Who is writing (default: WIRINGCRAFT_USER, then git's user.name, then the login).
         #[arg(long)]
         author: Option<String>,
     },
     /// Mark a comment resolved.
-    Resolve { id: String },
+    Resolve {
+        /// The comment's id, as `comment list` shows it.
+        id: String,
+    },
     /// Open a resolved comment again.
-    Reopen { id: String },
+    Reopen {
+        /// The comment's id, as `comment list` shows it.
+        id: String,
+    },
     /// Delete a comment and its replies.
-    Remove { id: String },
+    Remove {
+        /// The comment's id, as `comment list` shows it.
+        id: String,
+    },
     /// List the comments, of one page or all; open ones only unless --all.
     List {
+        /// Only this page's comments (page id).
         page: Option<String>,
+        /// Resolved comments too.
         #[arg(long)]
         all: bool,
     },
@@ -382,7 +437,9 @@ enum CommentCmd {
 enum PanelCmd {
     /// A new mounting plate with ducts around the edge and a DIN rail in every 125 mm row.
     New {
+        /// The new layout's id, e.g. `plate1`.
         id: String,
+        /// The layout's name, shown on its page.
         #[arg(long, default_value = "")]
         name: String,
         /// Plate width in mm.
@@ -395,6 +452,7 @@ enum PanelCmd {
     /// Put devices that have a part and are not on the plate yet onto its rails, sized by the
     /// part's `Width` and `Height` properties.
     Arrange {
+        /// The layout's id.
         id: String,
         /// Only devices in this location, e.g. `+CAB1`.
         #[arg(long)]
@@ -403,12 +461,15 @@ enum PanelCmd {
     /// Write a layout as a 3D STEP model (plate, rails, ducts and devices as solids, depths
     /// from the part's `Depth` property) for SolidCraft or any other CAD program.
     Step {
+        /// The layout's id.
         id: String,
+        /// The STEP file to write.
         out: PathBuf,
     },
     /// Put one device on a plate, or move or turn it when it is there already, or take it off
     /// with `--remove`. Its size comes from its part as `arrange` sizes it.
     Device {
+        /// The layout's id.
         id: String,
         /// Device tag, e.g. `-K1` (taken as a value, though it starts with `-`).
         #[arg(allow_hyphen_values = true)]
@@ -427,11 +488,14 @@ enum PanelCmd {
     },
     /// Print a layout's plate and each device on it with its position, size and turn.
     Show {
+        /// The layout's id.
         id: String,
     },
     /// List the layouts and what is on them.
     List,
+    /// Delete a layout.
     Remove {
+        /// The layout's id.
         id: String,
     },
 }
@@ -448,7 +512,10 @@ enum LocationCmd {
         description: Option<String>,
     },
     /// Remove a location from the list (devices keep their tags).
-    Remove { path: String },
+    Remove {
+        /// The location, with or without its `+`.
+        path: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -459,6 +526,7 @@ enum MacroCmd {
     /// free tags and its devices the macro's data, placeholders filled from `--set`. Prints
     /// the new symbol and wire ids.
     Place {
+        /// The page's id.
         page: String,
         /// The macro's name or file name.
         name: String,
@@ -480,7 +548,10 @@ enum LogoCmd {
     Show,
     /// Make a PNG or JPEG picture the logo: it is copied into the project's `pictures` folder
     /// (a picture already there is used as it is). Its place on the cover page is kept.
-    Set { file: PathBuf },
+    Set {
+        /// The PNG or JPEG file.
+        file: PathBuf,
+    },
     /// Take the logo off the cover page and the title blocks; its file stays in the project.
     Remove,
 }
@@ -491,10 +562,13 @@ enum RevisionCmd {
     List,
     /// Add a revision after the others.
     Add {
+        /// The revision's letter or name, e.g. `A`.
         letter: String,
         /// What changed.
         #[arg(long, default_value = "")]
         text: String,
+        /// Date of the revision, shown in `revision list` and the revision table; free text,
+        /// printed as given, e.g. `2026-11-26`.
         #[arg(long, default_value = "")]
         date: String,
         /// Who made it.
@@ -503,22 +577,34 @@ enum RevisionCmd {
     },
     /// Change a revision's description, date and author.
     Edit {
+        /// The revision's letter, e.g. `A`.
         letter: String,
+        /// New description of what changed.
         #[arg(long)]
         text: Option<String>,
+        /// New date; free text, printed as given.
         #[arg(long)]
         date: Option<String>,
+        /// New author.
         #[arg(long)]
         by: Option<String>,
     },
     /// Remove a revision; refused while a cloud carries it.
-    Remove { letter: String },
+    Remove {
+        /// The revision's letter, e.g. `A`.
+        letter: String,
+    },
     /// Draw a cloud on a page around the rectangle from (x1, y1) to (x2, y2), in mm.
     Cloud {
+        /// The page's id.
         page: String,
+        /// One corner's x in mm.
         x1: f64,
+        /// One corner's y in mm.
         y1: f64,
+        /// The opposite corner's x in mm.
         x2: f64,
+        /// The opposite corner's y in mm.
         y2: f64,
         /// The revision in its tag; the latest when left out.
         #[arg(long)]
@@ -527,17 +613,24 @@ enum RevisionCmd {
     /// Remove a page's clouds: the one at an index `revision list` shows, or with `--rev` every
     /// cloud of that revision.
     Uncloud {
+        /// The page's id.
         page: String,
+        /// The cloud's index on the page, as `revision list` shows it.
         index: Option<usize>,
+        /// Remove every cloud of this revision instead.
         #[arg(long)]
         rev: Option<String>,
     },
     /// Show the revision table on a page with its top-left corner at (x, y) in mm, or take it
     /// off with `--off`.
     Table {
+        /// The page's id.
         page: String,
+        /// Left edge of the table in mm.
         x: Option<f64>,
+        /// Top edge of the table in mm.
         y: Option<f64>,
+        /// Take the table off the page.
         #[arg(long)]
         off: bool,
     },
@@ -548,29 +641,43 @@ enum TemplateCmd {
     /// Print the template as TOML (the built-in one when the project has none).
     Show,
     /// Set the number of reference columns across the frame (1 to 40).
-    Columns { count: usize },
+    Columns {
+        /// How many columns, 1 to 40.
+        count: usize,
+    },
     /// Go back to the built-in layout (removes `[template]` from project.toml).
     Reset,
 }
 
 #[derive(Subcommand)]
 enum JumperCmd {
-    /// Jumper terminals of a strip, e.g. `jumper add -- -X1 3 4 5`. A jumper that shares a
+    /// Jumper terminals of a strip, e.g. `jumper add -X1 3 4 5`. A jumper that shares a
     /// terminal with them becomes one with them.
     Add {
-        /// The strip, e.g. `-X1` (after `--`, as it starts with `-`).
+        /// The strip, e.g. `-X1` (taken as a value, though it starts with `-`).
+        #[arg(allow_hyphen_values = true)]
         strip: String,
         /// Terminal numbers, at least two.
         terminals: Vec<String>,
     },
-    /// Take terminals out of their jumper, e.g. `jumper remove -- -X1 4`.
-    Remove { strip: String, terminals: Vec<String> },
+    /// Take terminals out of their jumper, e.g. `jumper remove -X1 4`.
+    Remove {
+        /// The strip, e.g. `-X1` (taken as a value, though it starts with `-`).
+        #[arg(allow_hyphen_values = true)]
+        strip: String,
+        /// Terminal numbers.
+        terminals: Vec<String>,
+    },
     /// Give the jumper holding a terminal a part (article), e.g.
-    /// `jumper part -- -X1 3 wago.2002-402`; leave the part out to clear it. A part the project
+    /// `jumper part -X1 3 wago.2002-402`; leave the part out to clear it. A part the project
     /// does not have yet is taken from its libraries.
     Part {
+        /// The strip, e.g. `-X1` (taken as a value, though it starts with `-`).
+        #[arg(allow_hyphen_values = true)]
         strip: String,
+        /// A terminal the jumper holds.
         terminal: String,
+        /// The part's library id; left out clears it.
         part: Option<String>,
     },
     /// List the project's jumpers.
@@ -580,42 +687,77 @@ enum JumperCmd {
 #[derive(Subcommand)]
 enum StripCmd {
     /// List terminal strips with their terminals in rail order; spares are marked `(spare)`.
-    /// Give a strip to list only that one, e.g. `strip list -- -X1`.
-    List { strip: Option<String> },
-    /// Put a strip's terminals in this rail order, e.g. `strip order -- -X1 3 1 2`. Terminals
+    /// Give a strip to list only that one, e.g. `strip list -X1`.
+    List {
+        /// Only this strip, e.g. `-X1` (taken as a value, though it starts with `-`).
+        #[arg(allow_hyphen_values = true)]
+        strip: Option<String>,
+    },
+    /// Put a strip's terminals in this rail order, e.g. `strip order -X1 3 1 2`. Terminals
     /// left out follow at the end; no terminals goes back to the order by number.
-    Order { strip: String, terminals: Vec<String> },
-    /// Move a terminal to a place on the rail (1 is first), e.g. `strip move -- -X1 3 1`.
-    Move { strip: String, terminal: String, to: usize },
-    /// Add a spare terminal (on the rail, not drawn), e.g. `strip spare --after 2 -- -X1 S1`;
+    Order {
+        /// The strip, e.g. `-X1` (taken as a value, though it starts with `-`).
+        #[arg(allow_hyphen_values = true)]
+        strip: String,
+        /// Terminal numbers in their new rail order.
+        terminals: Vec<String>,
+    },
+    /// Move a terminal to a place on the rail (1 is first), e.g. `strip move -X1 3 1`.
+    Move {
+        /// The strip, e.g. `-X1` (taken as a value, though it starts with `-`).
+        #[arg(allow_hyphen_values = true)]
+        strip: String,
+        /// The terminal to move.
+        terminal: String,
+        /// Its new place on the rail, 1 being first.
+        to: usize,
+    },
+    /// Add a spare terminal (on the rail, not drawn), e.g. `strip spare -X1 S1 --after 2`;
     /// without `--after` it goes at the end.
     Spare {
+        /// The strip, e.g. `-X1` (taken as a value, though it starts with `-`).
+        #[arg(allow_hyphen_values = true)]
         strip: String,
+        /// The spare terminal's number, e.g. `S1`.
         terminal: String,
         /// The terminal it goes right after.
         #[arg(long)]
         after: Option<String>,
     },
     /// Take a spare terminal off the strip (and out of its jumper), e.g.
-    /// `strip unspare -- -X1 S1`.
-    Unspare { strip: String, terminal: String },
+    /// `strip unspare -X1 S1`.
+    Unspare {
+        /// The strip, e.g. `-X1` (taken as a value, though it starts with `-`).
+        #[arg(allow_hyphen_values = true)]
+        strip: String,
+        /// The spare terminal's number.
+        terminal: String,
+    },
     /// Set a terminal's level on a multi-level terminal (1 is the bottom), e.g.
-    /// `strip level -- -X1 4 2`; leave the level out to clear the terminal's own `Level`
+    /// `strip level -X1 4 2`; leave the level out to clear the terminal's own `Level`
     /// property. Levels are inferred in number order, not rail order: a terminal whose next
     /// number up has level 2 or more is still level 1.
     Level {
+        /// The strip, e.g. `-X1` (taken as a value, though it starts with `-`).
+        #[arg(allow_hyphen_values = true)]
         strip: String,
+        /// The terminal's number.
         terminal: String,
+        /// Its level, 1 being the bottom; left out clears it.
         level: Option<u32>,
     },
 }
 
 #[derive(Subcommand)]
 enum PageCmd {
+    /// Add a page, placed by its `--number` among the existing pages.
     Add {
+        /// The new page's id, e.g. `p1`; other commands name the page by it.
         id: String,
+        /// The page number printed in the title block, e.g. `1` or `=A1/3`.
         #[arg(long)]
         number: String,
+        /// The page's title, shown in the title block.
         #[arg(long, default_value = "")]
         title: String,
         /// A4, A3, A2, A1 or A0, landscape unless followed by `-portrait` (`A4-portrait`), or
@@ -630,26 +772,35 @@ enum PageCmd {
         #[arg(long)]
         cover: bool,
     },
+    /// List the pages: id, number, title, and how many symbols and wires each has.
     List,
+    /// Delete a page and everything drawn on it.
     Remove {
+        /// The page's id.
         id: String,
     },
     /// Mark a page as an overview (line diagram), or with `--off` as a normal page again.
     Overview {
+        /// The page's id.
         id: String,
+        /// Make it a normal page again.
         #[arg(long)]
         off: bool,
     },
     /// Change a page's sheet size (as `page add --size` takes it). What is drawn stays where it
     /// is; a smaller sheet can leave some of it outside the frame.
     Size {
+        /// The page's id.
         id: String,
+        /// The new size, e.g. `A3`, `A4-portrait` or `500x700`.
         size: String,
     },
     /// Make a page the project's cover page (any other page loses the mark), or with `--off` a
     /// normal page again.
     Cover {
+        /// The page's id.
         id: String,
+        /// Make it a normal page again.
         #[arg(long)]
         off: bool,
     },
@@ -657,6 +808,7 @@ enum PageCmd {
     /// date, drawn_by, checked_by, ...). The page's own values win over the project's on that
     /// page; `key=` clears one, so the project's shows again.
     Fields {
+        /// The page's id.
         id: String,
         /// `key=value` pairs to set; none lists the fields.
         set: Vec<String>,
@@ -667,10 +819,13 @@ enum PageCmd {
 enum LibCmd {
     /// Add a source. Earlier sources win over later ones.
     Add {
+        /// The source's name, used in item listings.
         name: String,
         /// `folder` or `git`.
         kind: String,
+        /// The folder's path, or the git repository's URL.
         location: String,
+        /// For git: the branch, tag or commit to use (default: the default branch).
         #[arg(long)]
         reference: Option<String>,
     },
@@ -680,17 +835,24 @@ enum LibCmd {
     Status,
     /// Take newer library versions (all changed items, or the ids given).
     Update {
+        /// Symbol or part ids to update (default: all changed items).
         ids: Vec<String>,
     },
-    /// Pin every used item that is not pinned yet.
+    /// Pin every used item that is not pinned yet, and write a pinned item's vendored copy again
+    /// when it is missing or unreadable.
     Lock,
+    /// Find symbols and parts in the library sources by id, name, category or description.
     Search {
+        /// The text to look for; upper and lower case are alike.
         query: String,
     },
     /// Offer the project's copy of an item back to a source for review.
     Propose {
+        /// The library source's name.
         source: String,
+        /// The symbol's or part's id.
         id: String,
+        /// The id is a part, not a symbol.
         #[arg(long)]
         part: bool,
     },
@@ -700,15 +862,21 @@ enum LibCmd {
 enum ImportCmd {
     /// A symbol from a DXF drawing. Pins: POINT entities, or entities on a layer named PIN.
     SymbolDxf {
+        /// The DXF file.
         file: PathBuf,
+        /// The new symbol's id, e.g. `my.relay.coil`.
         #[arg(long)]
         id: String,
+        /// The symbol's name, shown in the library.
         #[arg(long)]
         name: String,
+        /// The library folder to write into.
         #[arg(long)]
         lib: PathBuf,
+        /// Library category to file it under, e.g. `relays`.
         #[arg(long, default_value = "")]
         category: String,
+        /// Letter code for new devices, e.g. `K`.
         #[arg(long, default_value = "")]
         letter_code: String,
     },
@@ -719,6 +887,7 @@ enum ImportCmd {
     /// or the project takes the part from another source (a warning says so). The project's own
     /// pinned copy cannot be named with --lib.
     FootprintDxf {
+        /// The DXF file.
         file: PathBuf,
         /// The part's library id.
         #[arg(long)]
@@ -736,6 +905,7 @@ enum ImportCmd {
     /// too, unless that copy has local changes or the project takes the part from another
     /// source (a warning says so). The project's own pinned copy cannot be named with --lib.
     ModelStep {
+        /// The STEP file.
         file: PathBuf,
         /// The part's library id.
         #[arg(long)]
@@ -747,32 +917,46 @@ enum ImportCmd {
     },
     /// A symbol from an SVG drawing. Pins: elements with `id="pin:NAME"` or `data-pin="NAME"`.
     SymbolSvg {
+        /// The SVG file.
         file: PathBuf,
+        /// The new symbol's id, e.g. `my.relay.coil`.
         #[arg(long)]
         id: String,
+        /// The symbol's name, shown in the library.
         #[arg(long)]
         name: String,
+        /// The library folder to write into.
         #[arg(long)]
         lib: PathBuf,
+        /// Library category to file it under, e.g. `relays`.
         #[arg(long, default_value = "")]
         category: String,
+        /// Letter code for new devices, e.g. `K`.
         #[arg(long, default_value = "")]
         letter_code: String,
     },
     /// PLC addresses from a CSV list or an Excel workbook (device and address columns,
     /// description optional), as a PLC tool or spreadsheet writes it. `report plc --format csv`
     /// (or `xlsx`) writes one that reads back.
-    PlcCsv { file: PathBuf },
+    PlcCsv {
+        /// The CSV or `.xlsx` file.
+        file: PathBuf,
+    },
     /// The WAGO configurator list back: a list written by `export wago-configurator`, with the
     /// articles and accessories chosen in the configurator. Each row is matched by its Index to
     /// the terminal or strip device it stands for, and its article to a part of the project or
     /// its libraries (by order number, or part id); matched articles become the devices' parts
     /// and accessories. Rows that cannot be matched are listed with the reason.
-    Wago { file: PathBuf },
+    Wago {
+        /// The CSV file from the configurator.
+        file: PathBuf,
+    },
     /// Every symbol of a KiCad symbol library (`.kicad_sym`, KiCad 6 or later). Ids are
     /// `<prefix>.<symbol name>`; the first pin becomes the origin.
     SymbolKicad {
+        /// The `.kicad_sym` file.
         file: PathBuf,
+        /// The library folder to write into.
         #[arg(long)]
         lib: PathBuf,
         /// Id prefix (default: `kicad.<file name>`).
@@ -781,13 +965,16 @@ enum ImportCmd {
         /// Multiply coordinates, e.g. 2 to put KiCad's 2.54 mm pin grid near a 5 mm grid.
         #[arg(long, default_value_t = 1.0)]
         scale: f64,
+        /// Library category to file the symbols under.
         #[arg(long, default_value = "")]
         category: String,
     },
     /// Parts from a BMEcat catalogue (XML, version 1.2 or 2005): order number, maker,
     /// description, the maker's part number, GTIN, and ECLASS class and features as properties.
     PartsBmecat {
+        /// The BMEcat XML file.
         file: PathBuf,
+        /// The library folder to write into.
         #[arg(long)]
         lib: PathBuf,
     },
@@ -797,7 +984,9 @@ enum ImportCmd {
     /// pins, and each part gets the symbol made from the macro it names; what the macros leave
     /// out is reported. Pictures are counted.
     PartsEdz {
+        /// The `.edz` file.
         file: PathBuf,
+        /// The library folder to write into.
         #[arg(long)]
         lib: PathBuf,
         /// Which library symbol to give parts by their macro: a text file with one
@@ -809,8 +998,10 @@ enum ImportCmd {
     /// QElectroTech elements (`.elmt`), one symbol per file. Ids are `<prefix>.<file name>`;
     /// the first terminal becomes the origin.
     SymbolQet {
+        /// The `.elmt` files.
         #[arg(required = true)]
         files: Vec<PathBuf>,
+        /// The library folder to write into.
         #[arg(long)]
         lib: PathBuf,
         /// Id prefix.
@@ -819,6 +1010,7 @@ enum ImportCmd {
         /// Millimetres per QElectroTech pixel; 0.5 puts its 10 px grid on a 5 mm grid.
         #[arg(long, default_value_t = wc_import::qet::DEFAULT_SCALE)]
         scale: f64,
+        /// Library category to file the symbols under.
         #[arg(long, default_value = "")]
         category: String,
         /// Letter code for new devices, e.g. `K`.
@@ -828,7 +1020,9 @@ enum ImportCmd {
     /// Parts from a CSV or semicolon-separated export, or straight from an Excel workbook
     /// (`.xlsx`, its first visible sheet), with the same column names either way.
     PartsCsv {
+        /// The CSV or `.xlsx` file.
         file: PathBuf,
+        /// The library folder to write into.
         #[arg(long)]
         lib: PathBuf,
     },
@@ -836,7 +1030,9 @@ enum ImportCmd {
     /// DXF drawings as pages, AutomationML devices and connections, PLC address lists onto the
     /// project's devices, KiCad symbol libraries and CSV parts lists into `--lib`).
     Archive {
+        /// The archive file.
         file: PathBuf,
+        /// Number of the first new page; the others follow it.
         #[arg(long, default_value_t = 300)]
         first_page: usize,
         /// Library folder for the symbols of `.kicad_sym` entries and the parts of CSV parts
@@ -847,15 +1043,20 @@ enum ImportCmd {
     /// A DWG drawing onto a page, converted to DXF by an installed converter (ODA File
     /// Converter, `dwg2dxf`, or the command in WIRINGCRAFT_DWG2DXF with {in} and {out}).
     PageDwg {
+        /// The DWG file.
         file: PathBuf,
+        /// The id of the page to draw onto; it must exist.
         #[arg(long)]
         page: String,
+        /// Multiply the drawing's coordinates by this to get mm.
         #[arg(long, default_value = "1.0")]
         scale: f64,
     },
     /// PDF pages as trace graphics on new pages (vector content; scanned pages have none).
     Pdf {
+        /// The PDF file.
         file: PathBuf,
+        /// Number of the first new page; the others follow it.
         #[arg(long, default_value_t = 200)]
         first_page: usize,
     },
@@ -863,7 +1064,9 @@ enum ImportCmd {
     /// drawn, with devices at their original positions and wires traced, plus devices, parts and
     /// connections not on a drawn page as overview pages.
     Eplan {
+        /// The `.elk` file, its `.edb` folder, or a zip of the folder.
         path: PathBuf,
+        /// Number of the first new page; the others follow it.
         #[arg(long, default_value_t = 400)]
         first_page: usize,
     },
@@ -874,6 +1077,7 @@ enum ImportCmd {
     /// wires joined to the symbols, and devices with part data, linked to the archive catalog's
     /// part when it has it.
     Swe {
+        /// The `.tewzip` archive or `tew_project_data.sqlite` file.
         path: PathBuf,
         /// Which project of the archive, counted from 1 (archives can hold several).
         #[arg(long, default_value_t = 1)]
@@ -898,6 +1102,7 @@ enum ImportCmd {
     /// source with the same id, and run `lib update <id>`. Into a library folder with --lib,
     /// else vendored into the project.
     SweLibrary {
+        /// The `.tewzip` archive.
         path: PathBuf,
         /// A library folder to write into instead of the project.
         #[arg(long)]
@@ -905,15 +1110,20 @@ enum ImportCmd {
     },
     /// AutomationML (CAEX) devices, properties and connections, laid out as overview pages.
     Aml {
+        /// The AutomationML (`.aml`) file.
         file: PathBuf,
+        /// Number of the first new page; the others follow it.
         #[arg(long, default_value_t = 100)]
         first_page: usize,
     },
     /// A DXF drawing onto a page as graphics; blocks named like library symbols become symbols.
     PageDxf {
+        /// The DXF file.
         file: PathBuf,
+        /// The id of the page to draw onto; it must exist.
         #[arg(long)]
         page: String,
+        /// Multiply the drawing's coordinates by this to get mm.
         #[arg(long, default_value = "1.0")]
         scale: f64,
     },
@@ -921,36 +1131,51 @@ enum ImportCmd {
 
 #[derive(Subcommand)]
 enum VcsCmd {
+    /// Make the project folder a git repository.
     Init,
+    /// Record every change in the project as a new version. Prints its short id.
     Commit {
+        /// What changed and why.
         #[arg(short, long)]
         message: String,
     },
+    /// List the branches (the current one marked `*`), or create one.
     Branch {
+        /// The new branch's name; left out lists the branches.
         name: Option<String>,
     },
+    /// Switch the project to another branch.
     Switch {
+        /// The branch's name.
         name: String,
     },
+    /// Merge another branch into the current one; conflicting files are listed.
     Merge {
+        /// The branch to merge.
         name: String,
     },
     /// History as a subway map (terminal), or as SVG with --svg.
     Log {
+        /// Write the map as SVG to this file.
         #[arg(long)]
         svg: Option<PathBuf>,
+        /// At most this many versions, newest first.
         #[arg(long, default_value_t = 200)]
         limit: usize,
     },
     /// What changed, in schematic terms. Defaults to uncommitted changes.
     Changes {
+        /// The version to compare from: a commit, branch or tag.
         #[arg(default_value = "HEAD")]
         from: String,
+        /// The version to compare to (default: the uncommitted files).
         to: Option<String>,
     },
     /// One page's history: who changed it, when, and what changed, newest first.
     PageLog {
+        /// The page's id or number.
         page: String,
+        /// At most this many versions.
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
@@ -1047,10 +1272,45 @@ fn output_guard() -> Option<&'static wc_core::guard::ProjectFiles> {
     GUARD.get_or_init(wc_core::guard::ProjectFiles::from_env).as_ref()
 }
 
+/// Refuse `--page` ids the project does not have, naming the ids it does, so a typo fails
+/// instead of writing an empty export (#551).
+fn check_pages(p: &Project, pages: &[String]) -> Res<()> {
+    match pages.iter().find(|id| p.page(id).is_none()) {
+        None => Ok(()),
+        Some(id) => {
+            let ids: Vec<String> = p.pages.iter().map(|pg| escape_field(&pg.id)).collect();
+            Err(format!("no page {id:?} (pages: {})", ids.join(", ")))
+        }
+    }
+}
+
 /// Write an output file the user named. Under [`output_guard`] the file is written so that it
 /// cannot land on a project file, a link swapped in after the app's own look included (#458).
+/// A failure names the file: the guarded write does that itself, a plain one is given it here.
 fn write_out(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
-    wc_core::guard::write_output(output_guard(), path.as_ref(), bytes)
+    let path = path.as_ref();
+    match output_guard() {
+        Some(g) => wc_core::guard::write_output(Some(g), path, bytes),
+        None => std::fs::write(path, bytes).map_err(|err| {
+            std::io::Error::new(
+                err.kind(),
+                format!("cannot write {}: {err}", escape_field(&path.display().to_string())),
+            )
+        }),
+    }
+}
+
+/// The bytes of the input file `path`; a failure names the file.
+fn read_file(path: impl AsRef<Path>) -> Res<Vec<u8>> {
+    let path = path.as_ref();
+    std::fs::read(path).map_err(|err| format!("cannot read {}: {err}", escape_field(&path.display().to_string())))
+}
+
+/// The text of the input file `path`; a failure names the file.
+fn read_text(path: impl AsRef<Path>) -> Res<String> {
+    let path = path.as_ref();
+    std::fs::read_to_string(path)
+        .map_err(|err| format!("cannot read {}: {err}", escape_field(&path.display().to_string())))
 }
 
 /// Make the output folder `out`; under [`output_guard`] a folder in the project is refused
@@ -1078,6 +1338,19 @@ fn make_out_dir(out: &Path) -> Res<()> {
 
 fn e<E: std::fmt::Display>(err: E) -> String {
     err.to_string()
+}
+
+/// What a command says for a strip tag that no terminal on any page carries. Symbols without a
+/// readable vendored copy have no role, so a terminal drawn with one may not count: they are
+/// named, as a possible reason.
+fn no_strip(strip: &DeviceTag, unreadable: &[String]) -> String {
+    if unreadable.is_empty() {
+        return format!("no terminal strip {strip}");
+    }
+    format!(
+        "no terminal strip {strip} (these symbols have no readable vendored copy, and a terminal drawn with one may not count: {})",
+        escape_field(&unreadable.join(", "))
+    )
 }
 
 /// Says which pages stopped being the cover page when another one took the mark.
@@ -1936,6 +2209,17 @@ fn run(cli: Cli) -> Res<()> {
             match jc {
                 JumperCmd::Add { strip, terminals } => {
                     let strip = DeviceTag::parse(&strip).map_err(e)?;
+                    let (symbols, unreadable) = store::vendored_symbols(dir, &p);
+                    let strips = wc_core::project::strip_terminals(&p, |id| symbols.get(id).map(|s| s.role));
+                    let Some(rail) = strips.get(&strip) else {
+                        return Err(no_strip(&strip, &unreadable));
+                    };
+                    // Every terminal must be on the strip, drawn or spare, as `strip move` checks.
+                    for t in terminals.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
+                        if !rail.iter().any(|(n, _)| n == t) {
+                            return Err(format!("{strip} has no terminal {}", escape_field(t)));
+                        }
+                    }
                     p.meta.add_jumper(&strip, &terminals)?;
                     save(dir, &p)?;
                 }
@@ -1979,7 +2263,7 @@ fn run(cli: Cli) -> Res<()> {
         }
         Cmd::Strip(sc) => {
             let mut p = load(dir)?;
-            let (symbols, _) = store::vendored_symbols(dir, &p);
+            let (symbols, unreadable) = store::vendored_symbols(dir, &p);
             let rail = |p: &Project, strip: &DeviceTag| -> Vec<(String, bool)> {
                 wc_core::project::strip_terminals(p, |id| symbols.get(id).map(|s| s.role))
                     .remove(strip)
@@ -1989,6 +2273,11 @@ fn run(cli: Cli) -> Res<()> {
                 StripCmd::List { strip } => {
                     let only = strip.map(|s| DeviceTag::parse(&s).map_err(e)).transpose()?;
                     let all = wc_core::project::strip_terminals(&p, |id| symbols.get(id).map(|s| s.role));
+                    if let Some(only) = &only
+                        && !all.contains_key(only)
+                    {
+                        return Err(no_strip(only, &unreadable));
+                    }
                     for (strip, list) in all {
                         if only.as_ref().is_some_and(|o| *o != strip) {
                             continue;
@@ -2111,6 +2400,7 @@ fn run(cli: Cli) -> Res<()> {
                 }
                 None => p,
             };
+            check_pages(&p, &pages)?;
             let (symbols, missing) = store::vendored_symbols(dir, &p);
             for m in missing {
                 eprintln!("warning: symbol {m} has no vendored copy (run `wiringcraft lib lock`)");
@@ -2194,6 +2484,7 @@ fn run(cli: Cli) -> Res<()> {
             };
             let ext = format.to_ascii_lowercase();
             let p = load(dir)?;
+            check_pages(&p, &pages)?;
             let (symbols, missing) = store::vendored_symbols(dir, &p);
             for m in missing {
                 eprintln!("warning: symbol {m} has no vendored copy (run `wiringcraft lib lock`)");
@@ -2427,7 +2718,7 @@ fn run(cli: Cli) -> Res<()> {
         Cmd::Vcs(vc) => vcs_cmd(dir, vc)?,
         Cmd::Comment(cc) => comment_cmd(dir, cc)?,
         Cmd::Inspect { file } => {
-            let bytes = std::fs::read(&file).map_err(e)?;
+            let bytes = read_file(&file)?;
             let r = wc_import::archive::inspect(&bytes).map_err(e)?;
             println!("container: {}", r.container);
             let mut last = None;
@@ -2513,6 +2804,10 @@ fn lib_cmd(dir: &Path, lc: LibCmd) -> Res<()> {
             let lib = wc_library::Library::open(dir, &p).map_err(e)?;
             let left = wc_library::lock_missing(dir, &mut p, &lib).map_err(e)?;
             save(dir, &p)?;
+            for (k, id) in &left.restored {
+                let kind = if *k == ItemKind::Symbol { "symbol" } else { "part" };
+                println!("restored the vendored copy of {kind} {}", escape_field(id));
+            }
             for w in lock_warnings(&left) {
                 eprintln!("warning: {}", escape_field(&w));
             }
@@ -2549,7 +2844,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             category,
             letter_code,
         } => {
-            let text = std::fs::read(&file).map_err(e)?;
+            let text = read_file(&file)?;
             let (mut s, warnings) =
                 wc_import::dxf::symbol_with_warnings(&String::from_utf8_lossy(&text), &id, &name).map_err(e)?;
             for w in &warnings {
@@ -2566,7 +2861,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             );
         }
         ImportCmd::FootprintDxf { file, part, lib } => {
-            let text = std::fs::read(&file).map_err(e)?;
+            let text = read_file(&file)?;
             let (footprint, warnings) = wc_import::dxf::footprint(&String::from_utf8_lossy(&text)).map_err(e)?;
             for w in &warnings {
                 eprintln!("warning: {}", escape_field(w));
@@ -2590,7 +2885,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             )?;
         }
         ImportCmd::ModelStep { file, part, lib } => {
-            let text = std::fs::read(&file).map_err(e)?;
+            let text = read_file(&file)?;
             let (size, warnings) = wc_import::step::model_size(&String::from_utf8_lossy(&text)).map_err(e)?;
             for w in &warnings {
                 eprintln!("warning: {}", escape_field(w));
@@ -2620,7 +2915,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             category,
             letter_code,
         } => {
-            let text = std::fs::read_to_string(&file).map_err(e)?;
+            let text = read_text(&file)?;
             let mut s = wc_import::svg::symbol(&text, &id, &name).map_err(e)?;
             s.category = category;
             s.letter_code = letter_code;
@@ -2639,7 +2934,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             scale,
             category,
         } => {
-            let text = std::fs::read_to_string(&file).map_err(e)?;
+            let text = read_text(&file)?;
             let prefix = prefix.unwrap_or_else(|| kicad_prefix(&file.to_string_lossy()));
             import_kicad(&text, &lib, &prefix, scale, &category)?;
         }
@@ -2676,7 +2971,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
         }
         ImportCmd::PlcCsv { file } => {
             let mut p = load(dir)?;
-            let bytes = std::fs::read(&file).map_err(e)?;
+            let bytes = read_file(&file)?;
             let (rows, warnings) = wc_import::csv::file_rows(&bytes)
                 .and_then(|rows| wc_import::csv::plc_addresses_from_rows(&rows))
                 .map_err(e)?;
@@ -2715,7 +3010,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             println!("imported {n} part(s) into {}", lib.display());
         }
         ImportCmd::PartsCsv { file, lib } => {
-            let bytes = std::fs::read(&file).map_err(e)?;
+            let bytes = read_file(&file)?;
             let (parts, warnings) = wc_import::csv::file_rows(&bytes)
                 .and_then(|rows| wc_import::csv::parts_from_rows(&rows))
                 .map_err(e)?;
@@ -2903,7 +3198,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
         }
         ImportCmd::Aml { file, first_page } => {
             let mut p = load(dir)?;
-            let text = std::fs::read(&file).map_err(e)?;
+            let text = read_file(&file)?;
             let imp = wc_import::aml::parse(&String::from_utf8_lossy(&text)).map_err(e)?;
             for w in &imp.warnings {
                 eprintln!("warning: {}", escape_field(w));
@@ -2925,7 +3220,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
         }
         ImportCmd::Archive { file, first_page, lib } => {
             use wc_import::archive::Kind;
-            let bytes = std::fs::read(&file).map_err(e)?;
+            let bytes = read_file(&file)?;
             let entries = wc_import::archive::open_entries(
                 &bytes,
                 &[
@@ -3120,7 +3415,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             let mut p = load(dir)?;
             let lib = wc_library::Library::open(dir, &p).map_err(e)?;
             let known: std::collections::BTreeSet<String> = lib.index(ItemKind::Symbol).into_keys().collect();
-            let text = std::fs::read(&file).map_err(e)?;
+            let text = read_file(&file)?;
             let imported = wc_import::dxf::page(&String::from_utf8_lossy(&text), scale, &known).map_err(e)?;
             for w in &imported.warnings {
                 eprintln!("warning: {}", escape_field(w));
@@ -3417,7 +3712,7 @@ fn warn_report_layouts(inputs: &wc_report::Inputs<'_>) {
 /// staging file), already escaped with [`escape_field`] by the caller.
 fn import_pdf(dir: &Path, file: &Path, first_page: usize, source: &str) -> Result<(), String> {
     let mut p = load(dir)?;
-    let bytes = std::fs::read(file).map_err(e)?;
+    let bytes = read_file(file)?;
     let traced = wc_import::pdf::pages(&bytes).map_err(e)?;
     let stem = file
         .file_stem()
@@ -3519,6 +3814,12 @@ fn lock_warnings(left: &wc_library::Unpinned) -> Vec<String> {
                 .iter()
                 .map(|(k, id, why)| format!("{} {id} is not pinned: {why}", kind(k))),
         )
+        .chain(left.unrestorable.iter().map(|(k, id, why)| {
+            format!(
+                "{} {id} has no readable vendored copy and was not restored: {why}",
+                kind(k)
+            )
+        }))
         .collect()
 }
 
@@ -4003,7 +4304,7 @@ fn import_wago(dir: &Path, file: &Path) -> Res<WagoImported> {
 /// Import a BMEcat catalogue's parts into a library folder. Files that are not UTF-8 are read
 /// as Latin-1, which BMEcat 1.2 catalogues often declare. Returns the count and warnings.
 fn import_bmecat(file: &Path, lib: &Path) -> Res<(usize, Vec<String>)> {
-    let bytes = std::fs::read(file).map_err(e)?;
+    let bytes = read_file(file)?;
     let (parts, warnings) = wc_import::bmecat::parts(&wc_import::csv::decode(&bytes)).map_err(e)?;
     for p in &parts {
         wc_library::write_part(lib, p).map_err(e)?;
@@ -5101,6 +5402,35 @@ mod tests {
         assert_eq!(result, Err("could not write the output: disk full".into()));
     }
 
+    /// Walks the whole command tree and lists every subcommand and argument
+    /// (positional or option) whose `--help` line would be blank.
+    fn commands_and_args_without_help(cmd: &clap::Command, path: &str, out: &mut Vec<String>) {
+        for arg in cmd.get_arguments() {
+            let id = arg.get_id().as_str();
+            if id == "help" || id == "version" {
+                continue;
+            }
+            if arg.get_help().is_none() && arg.get_long_help().is_none() {
+                out.push(format!("{path} <{id}>"));
+            }
+        }
+        for sub in cmd.get_subcommands() {
+            let sub_path = format!("{path} {}", sub.get_name());
+            if sub.get_about().is_none() && sub.get_long_about().is_none() {
+                out.push(sub_path.clone());
+            }
+            commands_and_args_without_help(sub, &sub_path, out);
+        }
+    }
+
+    #[test]
+    fn every_subcommand_and_argument_has_help_text() {
+        use clap::CommandFactory;
+        let mut missing = Vec::new();
+        commands_and_args_without_help(&Cli::command(), "wiringcraft", &mut missing);
+        assert!(missing.is_empty(), "no help text for: {missing:#?}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_archive_staging_folder_is_readable_only_by_its_owner() {
@@ -5843,6 +6173,41 @@ mod tests {
     }
 
     #[test]
+    fn pdf_and_drawing_refuse_an_unknown_page_and_write_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let first = load(&dir).unwrap().pages[0].id.clone();
+        let pdf = tmp.path().join("out.pdf");
+        let err = cli(&dir, &["pdf", pdf.to_str().unwrap(), "--page", "nope"]).unwrap_err();
+        assert!(err.contains("no page \"nope\"") && err.contains(&first), "{err}");
+        assert!(!pdf.exists());
+        let drawings = tmp.path().join("dr");
+        let err = cli(
+            &dir,
+            &[
+                "drawing",
+                drawings.to_str().unwrap(),
+                "--page",
+                &first,
+                "--page",
+                "nope",
+            ],
+        )
+        .unwrap_err();
+        assert!(err.contains("no page \"nope\""), "{err}");
+        assert!(!drawings.exists());
+        // A page that exists still exports.
+        cli(&dir, &["pdf", pdf.to_str().unwrap(), "--page", &first]).unwrap();
+        assert!(pdf.exists());
+        // The listed ids are escaped, so a control character in one cannot steer the terminal.
+        let mut p = load(&dir).unwrap();
+        p.pages[0].id = "a\u{1b}[2Jb".into();
+        let err = check_pages(&p, &["nope".into()]).unwrap_err();
+        assert!(err.contains("a\\u{1b}[2Jb") && !err.contains('\u{1b}'), "{err}");
+    }
+
+    #[test]
     fn find_lists_hits_and_replace_renames_the_device() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("p");
@@ -5979,7 +6344,7 @@ mod tests {
         assert_eq!(
             lock_warnings(&wc_library::Unpinned {
                 missing: vec![(ItemKind::Part, "gone".into())],
-                wrong_id: Vec::new(),
+                ..Default::default()
             }),
             ["part gone is in no library source"]
         );
@@ -6551,11 +6916,34 @@ mod tests {
         assert!(cli(&dir, &["location", "set", "+L1-K1", "x"]).is_err());
     }
 
+    /// Draws terminals `-X1.1` to `-X1.5` on the first page, so the strip `-X1` exists.
+    fn draw_x1_terminals(dir: &Path) {
+        let mut p = load(dir).unwrap();
+        for k in 1..=5 {
+            p.pages[0].symbols.push(PlacedSymbol {
+                id: format!("x1t{k}"),
+                symbol: "wc.terminal".into(),
+                at: Point::new(10.0 * k as f64, 10.0),
+                rotation: Rotation::default(),
+                mirror: false,
+                tag: DeviceTag::parse(&format!("-X1.{k}")).ok(),
+            });
+        }
+        save(dir, &p).unwrap();
+    }
+
     #[test]
     fn jumpers_are_added_listed_and_removed_from_the_command_line() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("p");
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let err = cli(&dir, &["jumper", "add", "--", "-X1", "3", "4"]).unwrap_err();
+        assert_eq!(err, "no terminal strip -X1");
+        assert!(load(&dir).unwrap().meta.jumpers.is_empty());
+        draw_x1_terminals(&dir);
+        let err = cli(&dir, &["jumper", "add", "--", "-X1", "3", "99"]).unwrap_err();
+        assert_eq!(err, "-X1 has no terminal 99");
+        assert!(load(&dir).unwrap().meta.jumpers.is_empty(), "nothing saved");
         cli(&dir, &["jumper", "add", "--", "-X1", "3", "4"]).unwrap();
         let x1 = DeviceTag::parse("-X1").unwrap();
         let saved = load(&dir).unwrap().meta.jumpers;
@@ -6572,6 +6960,161 @@ mod tests {
         let err = cli(&dir, &["jumper", "remove", "--", "-X1", "9"]).unwrap_err();
         assert!(err.contains("no jumper of -X1 has terminal 9"), "{err}");
         assert!(cli(&dir, &["jumper", "add", "--", "-X1", "1.2", "3.4"]).is_err());
+    }
+
+    #[test]
+    fn the_project_option_is_kept_apart_from_dash_tags() {
+        let parsed = |args: &[&str]| -> (PathBuf, Option<String>) {
+            let Ok(c) = Cli::try_parse_from(args) else {
+                unreachable!("{args:?}")
+            };
+            let Cmd::Strip(StripCmd::List { strip }) = c.cmd else {
+                unreachable!()
+            };
+            (c.project, strip)
+        };
+        let other = || PathBuf::from("other");
+        let x1 = Some("-X1".to_string());
+        // Separated, long or before the subcommand: the project, the tag stays a tag.
+        assert_eq!(
+            parsed(&["wiringcraft", "strip", "list", "-C", "other", "-X1"]),
+            (other(), x1.clone())
+        );
+        assert_eq!(
+            parsed(&["wiringcraft", "strip", "list", "-X1", "-C", "other"]),
+            (other(), x1.clone())
+        );
+        assert_eq!(
+            parsed(&["wiringcraft", "strip", "list", "--project", "other", "-X1"]),
+            (other(), x1.clone())
+        );
+        assert_eq!(
+            parsed(&["wiringcraft", "strip", "list", "--project=other", "-X1"]),
+            (other(), x1.clone())
+        );
+        assert_eq!(
+            parsed(&["wiringcraft", "-Cother", "strip", "list", "-X1"]),
+            (other(), x1.clone())
+        );
+        assert_eq!(parsed(&["wiringcraft", "-Cother", "strip", "list"]), (other(), None));
+        // Attached after the subcommand it is a tag: `-C1` is a capacitor strip as much as a path.
+        assert_eq!(
+            parsed(&["wiringcraft", "strip", "list", "-C1"]),
+            (PathBuf::from("."), Some("-C1".into()))
+        );
+        let Ok(c) = Cli::try_parse_from(["wiringcraft", "device", "-C", "other", "-C1"]) else {
+            unreachable!()
+        };
+        let Cmd::Device { tag, .. } = c.cmd else { unreachable!() };
+        assert_eq!((c.project, tag.as_str()), (other(), "-C1"));
+    }
+
+    #[test]
+    fn cable_device_and_strip_tags_may_start_with_a_dash_without_a_double_dash() {
+        let Ok(tmp) = tempfile::tempdir() else { unreachable!() };
+        let dir = tmp.path().join("p");
+        let Some(path) = dir.to_str() else { unreachable!() };
+        let Ok(cmd) = Cli::try_parse_from(["wiringcraft", "new", path, "--no-git"]) else {
+            unreachable!()
+        };
+        assert!(run(cmd).is_ok());
+        assert!(cli(&dir, &["page", "add", "p1", "--number", "1"]).is_ok());
+        let tag = |t: &str| DeviceTag::parse(t).ok();
+
+        // A cable tag right after `--cable`, before or after other options.
+        let wired = cli(&dir, &["wire", "p1", "1,2", "30,2", "--cable", "-W2", "--core", "1"]);
+        assert!(wired.is_ok(), "{wired:?}");
+        let wired = cli(&dir, &["wire", "p1", "1,5", "30,5", "--core", "2", "--cable", "-W2"]);
+        assert!(wired.is_ok(), "{wired:?}");
+        let Ok(p) = load(&dir) else { unreachable!() };
+        let Some(pg) = p.pages.iter().find(|pg| pg.id == "p1") else {
+            unreachable!()
+        };
+        let cores: Vec<_> = pg
+            .wires
+            .iter()
+            .filter_map(|w| w.cable.as_ref())
+            .map(|c| (Some(c.cable.clone()), c.core.clone()))
+            .collect();
+        assert_eq!(cores, [(tag("-W2"), "1".to_string()), (tag("-W2"), "2".to_string())]);
+
+        // A device tag as typed, with its options on either side; the options stay options.
+        assert!(cli(&dir, &["device", "-K1", "--description", "one"]).is_ok());
+        assert!(cli(&dir, &["device", "--description", "two", "-K2"]).is_ok());
+        assert!(cli(&dir, &["device", "--description", "three"]).is_err(), "no tag");
+        let Ok(p) = load(&dir) else { unreachable!() };
+        let described = |t: &str| tag(t).and_then(|t| p.devices.get(&t)).map(|d| d.description.clone());
+        assert_eq!(described("-K1").as_deref(), Some("one"));
+        assert_eq!(described("-K2").as_deref(), Some("two"));
+
+        // A strip tag in the strip and jumper commands; `--after` stays an option.
+        assert!(cli(&dir, &["strip", "spare", "-X1", "S1"]).is_ok());
+        assert!(cli(&dir, &["strip", "spare", "-X1", "S3", "--after", "S1"]).is_ok());
+        assert!(cli(&dir, &["strip", "spare", "--after", "S1", "-X1", "S2"]).is_ok());
+        assert!(cli(&dir, &["strip", "move", "-X1", "S3", "1"]).is_ok());
+        assert!(cli(&dir, &["strip", "list", "-X1"]).is_ok());
+        let Ok(p) = load(&dir) else { unreachable!() };
+        let (symbols, _) = store::vendored_symbols(&dir, &p);
+        let strips = wc_core::project::strip_terminals(&p, |id| symbols.get(id).map(|s| s.role));
+        let Some(x1) = tag("-X1") else { unreachable!() };
+        let rail: Vec<_> = strips.get(&x1).into_iter().flatten().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(rail, ["S3", "S1", "S2"]);
+        let rail = || -> Vec<String> {
+            let Ok(p) = load(&dir) else { unreachable!() };
+            let (symbols, _) = store::vendored_symbols(&dir, &p);
+            let mut strips = wc_core::project::strip_terminals(&p, |id| symbols.get(id).map(|s| s.role));
+            strips
+                .remove(&x1)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(t, _)| t)
+                .collect()
+        };
+        assert!(cli(&dir, &["strip", "order", "-X1", "S2", "S1", "S3"]).is_ok());
+        assert_eq!(rail(), ["S2", "S1", "S3"]);
+        assert!(cli(&dir, &["strip", "unspare", "-X1", "S3"]).is_ok());
+        assert_eq!(rail(), ["S2", "S1"]);
+        assert!(cli(&dir, &["strip", "level", "-X1", "S1", "2"]).is_ok());
+        let level = || {
+            let Ok(p) = load(&dir) else { unreachable!() };
+            tag("-X1.S1")
+                .and_then(|t| p.devices.get(&t))
+                .and_then(|d| d.properties.get(wc_report::LEVEL_PROPERTY).cloned())
+        };
+        assert_eq!(level().as_deref(), Some("2"));
+        assert!(cli(&dir, &["strip", "level", "-X1", "S1"]).is_ok());
+        assert_eq!(level(), None);
+
+        // Jumpers: a jumper left with one terminal is dropped, so this one keeps two. `jumper add`
+        // takes only terminals the strip has (#572), so S4 is added as a spare first.
+        assert!(cli(&dir, &["strip", "spare", "-X1", "S4"]).is_ok());
+        assert!(cli(&dir, &["jumper", "add", "-X1", "S1", "S2", "S4"]).is_ok());
+        assert!(cli(&dir, &["jumper", "remove", "-X1", "S2"]).is_ok());
+        let Ok(p) = load(&dir) else { unreachable!() };
+        let Some(j) = p.meta.jumpers.first() else {
+            unreachable!()
+        };
+        let kept = ["S1", "S4"].map(String::from);
+        assert_eq!((&j.strip, j.terminals.as_slice()), (&x1, kept.as_slice()));
+        let Ok(mut p) = load(&dir) else { unreachable!() };
+        p.meta.libraries.push(LibrarySource {
+            name: "starter".into(),
+            kind: "folder".into(),
+            location: Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../library")
+                .to_string_lossy()
+                .into_owned(),
+            reference: None,
+        });
+        assert!(save(&dir, &p).is_ok());
+        let parted = cli(&dir, &["jumper", "part", "-X1", "S4", "example.ex-tb-2-5"]);
+        assert!(parted.is_ok(), "{parted:?}");
+        let Ok(p) = load(&dir) else { unreachable!() };
+        let part = p.meta.jumpers.first().and_then(|j| j.part.as_deref());
+        assert_eq!(part, Some("example.ex-tb-2-5"));
+        assert!(cli(&dir, &["jumper", "part", "-X1", "S1"]).is_ok());
+        let Ok(p) = load(&dir) else { unreachable!() };
+        assert_eq!(p.meta.jumpers.first().and_then(|j| j.part.clone()), None);
     }
 
     #[test]
@@ -6614,6 +7157,31 @@ mod tests {
         );
         assert!(cli(&dir, &["strip", "move", "--", "-X1", "3", "0"]).is_err());
         cli(&dir, &["strip", "list"]).unwrap();
+        cli(&dir, &["strip", "list", "--", "-X1"]).unwrap();
+        let err = cli(&dir, &["strip", "list", "--", "-X9"]).unwrap_err();
+        assert!(err.starts_with("no terminal strip -X9"), "{err}");
+        // A terminal whose symbol cannot be read does not count; the error says why.
+        let mut p = load(&dir).unwrap();
+        p.pages[0].symbols.push(PlacedSymbol {
+            id: "t9".into(),
+            symbol: "no.such.terminal".into(),
+            at: Point::new(90.0, 10.0),
+            rotation: Rotation::default(),
+            mirror: false,
+            // Tagged with its strip only: without the symbol's role it is not known as a terminal.
+            tag: DeviceTag::parse("-X9").ok(),
+        });
+        save(&dir, &p).unwrap();
+        let err = cli(&dir, &["strip", "list", "--", "-X9"]).unwrap_err();
+        assert!(
+            err.contains("no readable vendored copy") && err.contains("no.such.terminal"),
+            "{err}"
+        );
+        let err = cli(&dir, &["jumper", "add", "--", "-X9", "1", "2"]).unwrap_err();
+        assert!(err.contains("no.such.terminal"), "{err}");
+        let mut p = load(&dir).unwrap();
+        p.pages[0].symbols.retain(|s| s.id != "t9");
+        save(&dir, &p).unwrap();
         cli(&dir, &["strip", "unspare", "--", "-X1", "S2"]).unwrap();
         assert!(cli(&dir, &["strip", "unspare", "--", "-X1", "S2"]).is_err());
         // A device entry left behind (restored by hand) goes on a second unspare.
@@ -6661,6 +7229,7 @@ mod tests {
             reference: None,
         });
         save(&dir, &p).unwrap();
+        draw_x1_terminals(&dir);
         cli(&dir, &["jumper", "add", "--", "-X1", "3", "4"]).unwrap();
         let err = cli(&dir, &["jumper", "part", "--", "-X1", "9", "example.ex-tb-2-5"]).unwrap_err();
         assert!(err.contains("no jumper of -X1 has terminal 9"), "{err}");
