@@ -274,7 +274,7 @@ fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
                     // `S` takes its first control point mirrored from the last cubic's second.
                     let (c1x, c1y) = match c1 {
                         Some([cx, cy]) => (bx + cx, by + cy),
-                        None => cubic_ctrl.map_or((x, y), |(px, py)| (x + (x - px), y + (y - py))),
+                        None => reflect(cubic_ctrl, (x, y)),
                     };
                     let (c2x, c2y) = (bx + c2x, by + c2y);
                     let (ex, ey) = (bx + ex, by + ey);
@@ -307,7 +307,7 @@ fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
                     // `T` takes its control point mirrored from the last quadratic's.
                     let (cx, cy) = match ctrl {
                         Some([cx, cy]) => (bx + cx, by + cy),
-                        None => quad_ctrl.map_or((x, y), |(px, py)| (x + (x - px), y + (y - py))),
+                        None => reflect(quad_ctrl, (x, y)),
                     };
                     let (ex, ey) = (bx + ex, by + ey);
                     let (x0, y0) = (x, y);
@@ -597,6 +597,25 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
     make_symbol(id, name, shapes, pins)
 }
 
+/// Mirrors the previous control point `prev` through the current point `cur`, the implied
+/// control point of a smooth `S`/`T` segment. Without a previous control point, or when the
+/// mirror is too large for an `f64`, the current point itself is the control point (what SVG
+/// does with no previous control), so the curve samples stay finite.
+fn reflect(prev: Option<(f64, f64)>, cur: (f64, f64)) -> (f64, f64) {
+    let (x, y) = cur;
+    match prev {
+        Some((px, py)) => {
+            let (rx, ry) = (x + (x - px), y + (y - py));
+            if rx.is_finite() && ry.is_finite() {
+                (rx, ry)
+            } else {
+                cur
+            }
+        }
+        None => cur,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -742,6 +761,21 @@ mod tests {
         assert_eq!(one_line("M 0 0 A 0 0 0 0 1 10 0").len(), 2);
         // Radii whose squares overflow are a straight line too, not a guessed arc.
         assert_eq!(one_line("M 0 0 A 1e308 1e308 0 0 1 10 0").len(), 2);
+    }
+
+    #[test]
+    fn unrepresentable_smooth_reflections_fall_back_to_the_current_point() {
+        // The mirrored control point is beyond f64::MAX; the curve must still stay finite.
+        for d in [
+            "M 9e307 0 Q -1e308 0 9e307 0 T 0 0",
+            "M 9e307 0 C -1e308 0 -1e308 0 9e307 0 S 0 0 0 0",
+            "M 0 9e307 Q 0 -1e308 0 9e307 T 0 0",
+            "M 0 9e307 C 0 -1e308 0 -1e308 0 9e307 S 0 0 0 0",
+        ] {
+            let pts = one_line(d);
+            assert!(!pts.is_empty(), "{d}");
+            assert!(pts.iter().all(|p| p.x.is_finite() && p.y.is_finite()), "{d}: {pts:?}");
+        }
     }
 
     #[test]
