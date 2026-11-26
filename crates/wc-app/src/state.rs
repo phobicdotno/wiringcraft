@@ -196,7 +196,8 @@ struct Step {
     project: Project,
     files: Vec<FileEdit>,
     /// Tells this step apart from every other, for finding it again (see
-    /// [`Open::take_back_move`]). A step moved between Undo and Redo gets a new one.
+    /// [`Open::take_back_move`]). A step keeps it when Undo and Redo move it between the two
+    /// histories.
     id: u64,
     /// How far the running move drag had moved its items in `project` (see
     /// [`Open::drag_offset`]); zero outside a drag.
@@ -1305,7 +1306,7 @@ impl Open {
     /// as if the changes after it were made at the start position. Jumpers and strip layouts
     /// follow the terminals back in each. Returns false, changing nothing, when that step is no
     /// longer in the history (the move was undone, or trimmed off the oldest end), carries file
-    /// edits a move never makes, or a drawing or cloud on the page was added or deleted since
+    /// edits a move never makes, or a drawing, cloud or wire on the page was added or deleted since
     /// (`items` names those by place in their list).
     pub fn take_back_move(&mut self, id: u64, page: &str, items: &[Selection]) -> bool {
         let Some(at) = self.undo.iter().position(|s| s.id == id) else {
@@ -1314,7 +1315,7 @@ impl Open {
         let Some(first) = self.undo.get(at) else {
             return false;
         };
-        let counts = |p: &Project| p.page(page).map(|p| (p.graphics.len(), p.clouds.len()));
+        let counts = |p: &Project| p.page(page).map(|p| (p.graphics.len(), p.clouds.len(), p.wires.len()));
         let start = counts(&first.project);
         let later = self.undo.iter().skip(at + 1).chain(&self.redo).map(|s| &s.project);
         if !first.files.is_empty() || later.chain([&self.project]).any(|p| counts(p) != start) {
@@ -1494,11 +1495,20 @@ impl Open {
                 };
                 self.forget_terminal_change();
                 let Step {
-                    project, files, offset, ..
+                    project,
+                    files,
+                    id,
+                    offset,
                 } = prev;
                 let now = std::mem::replace(&mut self.project, project);
-                self.redo
-                    .push(Step::new(now, files, std::mem::replace(&mut self.drag_offset, offset)));
+                // The step keeps its id across Undo and Redo, so a move redone during its drag
+                // is still found by Escape.
+                self.redo.push(Step {
+                    project: now,
+                    files,
+                    id,
+                    offset: std::mem::replace(&mut self.drag_offset, offset),
+                });
                 let left = self
                     .redo
                     .last()
@@ -1550,11 +1560,20 @@ impl Open {
                 };
                 self.forget_terminal_change();
                 let Step {
-                    project, files, offset, ..
+                    project,
+                    files,
+                    id,
+                    offset,
                 } = next;
                 let now = std::mem::replace(&mut self.project, project);
-                self.undo
-                    .push(Step::new(now, files, std::mem::replace(&mut self.drag_offset, offset)));
+                // The step keeps its id across Undo and Redo, so a move redone during its drag
+                // is still found by Escape.
+                self.undo.push(Step {
+                    project: now,
+                    files,
+                    id,
+                    offset: std::mem::replace(&mut self.drag_offset, offset),
+                });
                 let left = self
                     .undo
                     .last()

@@ -1993,7 +1993,7 @@ fn cancel_drag(open: &mut Open, ed: &mut Editor) {
             // Said only when the move is still there to undo: a move already undone has
             // nothing to take back.
             if open.has_undo_step(id) && !open.take_back_move(id, &page, &items) {
-                ed.message = "The move could not be taken back: a drawing or cloud was added or \
+                ed.message = "The move could not be taken back: a drawing, cloud or wire was added or \
                               deleted during it. Undo goes back step by step."
                     .into();
             }
@@ -4992,6 +4992,23 @@ mod tests {
             "both moves are taken back, nothing else changed"
         );
         assert_eq!(o.undo_steps(), steps, "the drag leaves no undo step");
+    }
+
+    #[test]
+    fn escape_after_the_move_was_undone_and_redone_takes_it_back() {
+        let (_tmp, mut o, mut ed, coil) = moving_coil();
+        let page = ed.page;
+        let at = |o: &Open| o.project.pages[page].symbol(&coil).map(|s| s.at);
+        let start = at(&o);
+        let steps = o.undo_steps();
+        drag(&mut o, &mut ed, Point::new(-40.0, 0.0));
+        o.rotate_many(page, &ed.selection.clone());
+        assert!(o.undo() && o.undo(), "the rotate and the move are undone");
+        assert!(o.redo(), "the move is redone");
+        cancel_drag(&mut o, &mut ed);
+        assert_eq!(at(&o), start, "Escape still finds the redone move");
+        assert_eq!(o.undo_steps(), steps);
+        assert!(ed.message.is_empty(), "{}", ed.message);
     }
 
     #[test]
