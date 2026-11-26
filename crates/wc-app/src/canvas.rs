@@ -309,6 +309,43 @@ fn triangulate(pts: &[Pos2]) -> Vec<[u32; 3]> {
     out
 }
 
+/// The outline of a filled polyline in drawing millimetres, as the key of [`TriCache`]: the same
+/// points give the same key, so any edit, replaced shape or reloaded symbol misses the cache.
+#[derive(Clone, Copy)]
+struct FillKey<'a>(&'a [Point]);
+
+impl std::hash::Hash for FillKey<'_> {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        for q in self.0 {
+            q.x.to_bits().hash(h);
+            q.y.to_bits().hash(h);
+        }
+    }
+}
+
+#[derive(Default)]
+struct Triangulator;
+
+impl egui::util::cache::ComputerMut<FillKey<'_>, std::sync::Arc<[[u32; 3]]>> for Triangulator {
+    fn compute(&mut self, key: FillKey<'_>) -> std::sync::Arc<[[u32; 3]]> {
+        #[cfg(test)]
+        TRIANGULATIONS.with(|n| n.set(n.get() + 1));
+        // In millimetres, not screen pixels, so panning and zooming keep the cached triangles.
+        let pts: Vec<Pos2> = key.0.iter().map(|q| Pos2::new(q.x as f32, q.y as f32)).collect();
+        triangulate(&pts).into()
+    }
+}
+
+/// Triangles of the filled polylines painted last frame, so a large fill is not cut up again on
+/// every frame. Shapes not painted in a frame drop out.
+type TriCache = egui::util::cache::FrameCache<std::sync::Arc<[[u32; 3]]>, Triangulator>;
+
+#[cfg(test)]
+thread_local! {
+    /// How many fills this thread has triangulated (the cache's misses), for tests.
+    static TRIANGULATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) fn paint_shape(p: &egui::Painter, xf: &Xf, s: &Shape, stroke: Stroke) {
     match s {
         Shape::Dimension { .. } => {
@@ -331,7 +368,10 @@ pub(crate) fn paint_shape(p: &egui::Painter, xf: &Xf, s: &Shape, stroke: Stroke)
                 for p in &pts {
                     mesh.colored_vertex(*p, stroke.color);
                 }
-                for [a, b, c] in triangulate(&pts) {
+                let tris = p
+                    .ctx()
+                    .memory_mut(|m| m.caches.cache::<TriCache>().get(FillKey(points)));
+                for &[a, b, c] in tris.iter() {
                     mesh.add_triangle(a, b, c);
                 }
                 p.add(EShape::mesh(mesh));
@@ -3584,6 +3624,39 @@ mod tests {
             })
             .sum();
         assert!((area - 3.0).abs() < 1e-5, "covers the L exactly: {area}");
+    }
+
+    #[test]
+    fn a_filled_outline_is_cut_into_triangles_once_until_it_changes() {
+        let ell = |w: f64| Shape::Polyline {
+            points: [(0.0, 0.0), (w, 0.0), (w, 1.0), (1.0, 1.0), (1.0, 2.0), (0.0, 2.0)]
+                .iter()
+                .map(|(x, y)| Point::new(*x, *y))
+                .collect(),
+            closed: true,
+            filled: true,
+        };
+        let ctx = egui::Context::default();
+        let xf = Xf {
+            origin: Pos2::ZERO,
+            zoom: 4.0,
+        };
+        let paint = |s: &Shape| {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                let p = ctx.layer_painter(egui::LayerId::background());
+                paint_shape(&p, &xf, s, Stroke::new(1.0_f32, Color32::BLACK));
+            });
+        };
+        let runs = || TRIANGULATIONS.with(|n| n.get());
+        let start = runs();
+        paint(&ell(2.0));
+        paint(&ell(2.0));
+        paint(&ell(2.0));
+        assert_eq!(runs() - start, 1, "an unchanged fill reuses its triangles");
+        paint(&ell(3.0));
+        assert_eq!(runs() - start, 2, "a changed fill is cut up again");
+        paint(&ell(3.0));
+        assert_eq!(runs() - start, 2);
     }
 
     use wc_core::project::Endpoint;
