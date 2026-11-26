@@ -516,8 +516,8 @@ enum RevisionCmd {
         /// What changed.
         #[arg(long, default_value = "")]
         text: String,
-        /// Date for the title block where the page and project set none; free text, printed as
-        /// given, e.g. `2026-11-26`.
+        /// Date of the revision, shown in `revision list` and the revision table; free text,
+        /// printed as given, e.g. `2026-11-26`.
         #[arg(long, default_value = "")]
         date: String,
         /// Who made it.
