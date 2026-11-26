@@ -1,5 +1,6 @@
 {
   "category": "contacts",
+  "description": "Three-pole main contacts of a contactor, driven by the coil with the same tag.",
   "graphics": [
     {
       "a": {
