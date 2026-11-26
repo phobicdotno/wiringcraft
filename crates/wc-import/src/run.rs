@@ -649,11 +649,26 @@ pub fn archive(dir: &Path, file: &Path, first_page: usize, lib: Option<&Path>, l
 
 /// A DXF drawing onto the page `page` (`import page-dxf`).
 pub fn page_dxf(dir: &Path, file: &Path, page: &str, scale: f64, log: &mut Log) -> Res<()> {
+    let text = read_file(file)?;
+    onto_page(dir, page, log, |known| {
+        // A name from the file in the error cannot steer the terminal.
+        crate::dxf::page(&String::from_utf8_lossy(&text), scale, known).map_err(|why| escape_field(&why.to_string()))
+    })
+}
+
+/// Read a drawing with `read` (given the ids of the library's symbols) and add it to page
+/// `page`: its graphics, and its symbols with the library symbols they need taken into the
+/// project. Shared by `import page-dxf` and `import page-dwg`.
+fn onto_page(
+    dir: &Path,
+    page: &str,
+    log: &mut Log,
+    read: impl FnOnce(&std::collections::BTreeSet<String>) -> Res<crate::dxf::ImportedPage>,
+) -> Res<()> {
     let mut p = load(dir)?;
     let lib = wc_library::Library::open(dir, &p).map_err(e)?;
     let known: std::collections::BTreeSet<String> = lib.index(ItemKind::Symbol).into_keys().collect();
-    let text = read_file(file)?;
-    let imported = crate::dxf::page(&String::from_utf8_lossy(&text), scale, &known).map_err(e)?;
+    let imported = read(&known)?;
     for w in &imported.warnings {
         err!(log, "warning: {}", escape_field(w));
     }
@@ -888,9 +903,33 @@ pub fn sheet_for((w, h): (f64, f64)) -> (PageSize, Option<String>) {
     }
 }
 
-/// `import page-dwg`: convert `file` with the converter (`template`, see [`dwg_to_dxf`]) and
-/// import the DXF onto `page`. The converter writes into a private folder of its own, removed
-/// with everything in it when this ends, also on failure.
+/// The largest DWG WiringCraft's own reader takes into memory, far above real drawings. A larger
+/// file is refused by the reader and goes to the converter, as other refusals do.
+pub const MAX_DWG_BYTES: u64 = 256 << 20;
+
+/// Read `file` for the built-in DWG reader, at most `limit` bytes: its bytes, or (inside `Ok`)
+/// why the reader does not take it. A file that cannot be opened or read is an error.
+fn read_dwg(file: &Path, limit: u64) -> Res<std::result::Result<Vec<u8>, String>> {
+    use std::io::Read;
+    let cannot = |err: std::io::Error| format!("cannot read {}: {err}", escape_field(&file.display().to_string()));
+    let mut bytes = Vec::new();
+    // At most one byte past the limit, however large the file is.
+    std::fs::File::open(file)
+        .map_err(cannot)?
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(cannot)?;
+    if bytes.len() as u64 > limit {
+        return Ok(Err(format!("the file is larger than the {} MB it reads", limit >> 20)));
+    }
+    Ok(Ok(bytes))
+}
+
+/// `import page-dwg`: read `file` with WiringCraft's own DWG reader (AutoCAD 2004 to 2018) and
+/// import it onto `page`. Only when that reader refuses the file (another version, or a file
+/// it cannot read) is it converted to DXF with an installed converter (`template`, see
+/// [`dwg_to_dxf`]); the converter writes into a private folder of its own, removed with
+/// everything in it when this ends, also on failure. Says which of the two read the file.
 pub fn import_page_dwg(
     dir: &Path,
     file: &Path,
@@ -899,16 +938,61 @@ pub fn import_page_dwg(
     template: Option<String>,
     log: &mut Log,
 ) -> Res<()> {
+    let bytes = read_dwg(file, MAX_DWG_BYTES)?;
+    // A scale the import refuses is refused before any converter runs.
+    if !(scale.is_finite() && scale > 0.0) {
+        return Err("scale must be a positive number".into());
+    }
+    // The reader refuses a file of another version, or one whose object structure it cannot
+    // read; a converter may still read those. What it reads but finds nothing to draw in, and
+    // project or library errors, are not the converter's to fix.
+    let read = bytes.and_then(|bytes| {
+        crate::dwg::read_sections(&bytes)
+            .and_then(|sections| crate::dwg::page_drawing(&sections))
+            .map_err(|why| why.to_string())
+    });
+    let refused = match read {
+        Ok(drawing) => {
+            return onto_page(dir, page, log, |known| dwg_page(&drawing, scale, known))
+                .map(|()| out!(log, "read with WiringCraft's own DWG reader"));
+        }
+        // Names from the file may hold control characters: escaped for the terminal.
+        Err(why) => escape_field(&why),
+    };
     let tmp = staging_dir("wiringcraft-dwg-").map_err(e)?;
-    let dxf = dwg_to_dxf(file, tmp.path(), template)?;
-    page_dxf(dir, &dxf, page, scale, log)
+    let (dxf, converter) = dwg_to_dxf(file, tmp.path(), template)
+        .map_err(|why| format!("WiringCraft's own DWG reader refused the file ({refused}); {why}"))?;
+    out!(
+        log,
+        "converted to DXF with {converter}: WiringCraft's own DWG reader refused the file ({refused})"
+    );
+    let text = read_file(&dxf)?;
+    onto_page(dir, page, log, |known| {
+        // Only a DXF that cannot be read gets both reasons; project errors stay as they are.
+        crate::dxf::page(&String::from_utf8_lossy(&text), scale, known).map_err(|why| {
+            format!(
+                "WiringCraft's own DWG reader refused the file ({refused}); the DXF {converter} made from it could not be read either: {}",
+                escape_field(&why.to_string())
+            )
+        })
+    })
+}
+
+/// The drawing as a page, its error escaped for the terminal: names from the file (a block
+/// name in the reasons a drawing with nothing to draw gives) may hold control characters.
+pub(crate) fn dwg_page(
+    drawing: &crate::dwg::PageDrawing,
+    scale: f64,
+    known: &std::collections::BTreeSet<String>,
+) -> Res<crate::dxf::ImportedPage> {
+    drawing.page(scale, known).map_err(|why| escape_field(&why.to_string()))
 }
 
 /// Convert DWG to a DXF in `tmp` (a private folder, see [`staging_dir`]) with whatever
 /// converter is installed: the command `template` (the WIRINGCRAFT_DWG2DXF setting, with `{in}`
-/// and `{out}`) when given, otherwise `dwg2dxf` or the ODA File Converter. DWG is a closed
-/// format; WiringCraft does not read it itself.
-pub fn dwg_to_dxf(file: &Path, tmp: &Path, template: Option<String>) -> Res<PathBuf> {
+/// and `{out}`) when given, otherwise `dwg2dxf` or the ODA File Converter. Returns the DXF and
+/// the converter's name. For the DWG files WiringCraft's own reader refuses.
+pub fn dwg_to_dxf(file: &Path, tmp: &Path, template: Option<String>) -> Res<(PathBuf, &'static str)> {
     use std::process::Command;
     let stem = file
         .file_stem()
@@ -927,7 +1011,7 @@ pub fn dwg_to_dxf(file: &Path, tmp: &Path, template: Option<String>) -> Res<Path
             let mut c = Command::new(prog);
             c.args(args);
             if ran(c) && out.exists() {
-                return Ok(out);
+                return Ok((out, "the WIRINGCRAFT_DWG2DXF command"));
             }
         }
         return Err("WIRINGCRAFT_DWG2DXF did not produce a DXF".into());
@@ -935,7 +1019,7 @@ pub fn dwg_to_dxf(file: &Path, tmp: &Path, template: Option<String>) -> Res<Path
     let mut c = Command::new("dwg2dxf");
     c.args(["-y", "-o", &output, &input]);
     if ran(c) && out.exists() {
-        return Ok(out);
+        return Ok((out, "dwg2dxf"));
     }
     // ODA File Converter works on folders: <in dir> <out dir> <version> <type> <recurse> <audit> <filter>.
     let in_dir = file
@@ -958,7 +1042,7 @@ pub fn dwg_to_dxf(file: &Path, tmp: &Path, template: Option<String>) -> Res<Path
             name.as_str(),
         ]);
         if ran(c) && out.exists() {
-            return Ok(out);
+            return Ok((out, "ODA File Converter"));
         }
     }
     Err("no DWG converter found: install ODA File Converter or dwg2dxf, or set WIRINGCRAFT_DWG2DXF".into())
@@ -1891,6 +1975,24 @@ mod tests {
         }
     }
 
+    /// The built-in DWG reader takes a file up to its limit, and refuses one a byte larger with
+    /// the size in the reason (so the import goes on to the converter, #671).
+    #[test]
+    fn a_dwg_over_the_size_limit_is_refused_by_the_reader_with_its_size() {
+        let t = tmp();
+        let path = t.path().join("big.dwg");
+        let limit = 1 << 20;
+        assert!(std::fs::write(&path, vec![0u8; limit as usize]).is_ok());
+        assert!(matches!(read_dwg(&path, limit), Ok(Ok(b)) if b.len() as u64 == limit));
+        assert!(std::fs::write(&path, vec![0u8; limit as usize + 1]).is_ok());
+        assert_eq!(
+            read_dwg(&path, limit),
+            Ok(Err("the file is larger than the 1 MB it reads".to_owned()))
+        );
+        // A file that is not there is an error of its own, not a refusal.
+        assert!(read_dwg(&t.path().join("missing.dwg"), limit).is_err());
+    }
+
     /// A file put back keeps the permissions it has, not the default ones of a new file (#664).
     #[cfg(unix)]
     #[test]
@@ -2437,6 +2539,23 @@ mod tests {
         assert!(store::read_vendored_symbol(&dir, "imp.lamp").is_ok());
         let pins = load(&dir).map(|p| p.lock.symbols.len());
         assert_eq!(pins, Ok(2));
+    }
+
+    #[test]
+    fn a_dxf_page_error_naming_an_entity_is_escaped_for_the_terminal() {
+        let t = tmp();
+        let dir = t.path().join("p");
+        let mut p = Project::new("t");
+        p.pages.push(wc_core::Page::new("1", "1", "Main"));
+        assert!(store::save(&dir, &p).is_ok());
+        let drawing = t.path().join("page.dxf");
+        let text = "0\nSECTION\n2\nENTITIES\n0\nBAD\u{1b}[2J\n8\n0\n0\nENDSEC\n0\nEOF\n";
+        assert!(std::fs::write(&drawing, text).is_ok());
+        let mut log = Log::default();
+        let Err(err) = page_dxf(&dir, &drawing, "1", 1.0, &mut log) else {
+            unreachable!("nothing on the page");
+        };
+        assert!(err.contains("BAD\\u{1b}[2J") && !err.contains('\u{1b}'), "{err}");
     }
 
     #[test]
