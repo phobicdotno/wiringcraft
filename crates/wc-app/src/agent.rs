@@ -4072,6 +4072,7 @@ mod tests {
             live: Default::default(),
             fetch: None,
             importing: None,
+            after_typed: Vec::new(),
         };
         (tmp, app)
     }

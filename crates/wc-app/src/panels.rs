@@ -941,6 +941,44 @@ fn box_size_field(ui: &mut egui::Ui, value: &mut f64) {
     }
 }
 
+/// Apply the black box form shown in the Properties panel when it has changes not applied yet,
+/// as its Apply button does (one undo step): called before the project is saved (#932). A form
+/// read for another version of the box (after an Undo, say) is left alone, as the panel reads
+/// it again. Returns why the changes were refused, which the form also shows.
+pub fn apply_black_box_draft(open: &mut Open, ed: &mut Editor, ps: &mut PanelState) -> Option<String> {
+    let ((page, id, hash), form) = ps.black_box.as_mut()?;
+    let current = open
+        .project
+        .pages
+        .get(*page)
+        .and_then(|p| p.symbol(id))
+        .and_then(|s| open.symbols.get(&s.symbol))
+        .map(|sym| sym.hash());
+    if current.as_ref() != Some(hash) || !form.changed() {
+        return None;
+    }
+    match open.edit_black_box(
+        *page,
+        id,
+        (form.width, form.height),
+        &form.pins(),
+        &form.renamed(),
+        &form.removed(),
+    ) {
+        Ok(warnings) => {
+            if !warnings.is_empty() {
+                ed.message = format!("Black box changed. Check: {}.", warnings.join("; "));
+            }
+            ps.black_box = None;
+            None
+        }
+        Err(e) => {
+            form.error = Some(e.clone());
+            Some(format!("The black box was not changed: {e}"))
+        }
+    }
+}
+
 /// The fields of the black box form; `true` when it is done with (applied or reset).
 fn black_box_form(
     ui: &mut egui::Ui,
@@ -2614,6 +2652,64 @@ mod tests {
         }
         frame(&mut o, &mut ps);
         assert_eq!(form(&ps), Some((0.5, true)));
+        Ok(())
+    }
+
+    /// A black box form changed and not applied is applied before a save, as one undo step;
+    /// a refused change keeps the form and gives the reason (#932).
+    #[test]
+    fn a_black_box_draft_is_applied_before_saving() -> Result<(), Box<dyn std::error::Error>> {
+        use wc_core::{BoxPin, BoxSide};
+        let (_tmp, mut o) = crate::state::tests::project();
+        let pins = [BoxPin {
+            name: "1".into(),
+            side: BoxSide::Left,
+            offset: 5.0,
+        }];
+        let id = o.add_black_box(
+            1,
+            wc_core::geom::Point::new(40.0, 40.0),
+            wc_core::geom::Point::new(60.0, 50.0),
+            &pins,
+            None,
+        )?;
+        let mut ed = Editor::default();
+        let mut ps = PanelState::default();
+        assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), None, "no form shown");
+        let t = Theme::of(&egui::Context::default());
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| black_box_section(ui, &mut o, &mut ed, &mut ps, 1, &id, &t));
+        });
+        let steps = o.undo_steps();
+        assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), None);
+        assert_eq!(o.undo_steps(), steps, "an unchanged form applies nothing");
+        if let Some((_, f)) = ps.black_box.as_mut() {
+            f.rows[0].name = "A".into();
+        }
+        assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), None);
+        assert_eq!(o.undo_steps(), steps + 1, "one undo step");
+        assert!(ps.black_box.is_none(), "the form is read again");
+        let symbol = o.project.pages[1]
+            .symbol(&id)
+            .map(|s| s.symbol.clone())
+            .unwrap_or_default();
+        let pin_names: Vec<String> = o.symbols[&symbol].pins.iter().map(|p| p.name.clone()).collect();
+        assert_eq!(pin_names, ["A"]);
+        // A refused change (two points with one name) stays in the form, with its reason.
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| black_box_section(ui, &mut o, &mut ed, &mut ps, 1, &id, &t));
+        });
+        if let Some((_, f)) = ps.black_box.as_mut() {
+            f.add_row();
+            let last = f.rows.len() - 1;
+            f.rows[last].name = "A".into();
+        }
+        let refused = apply_black_box_draft(&mut o, &mut ed, &mut ps);
+        assert!(refused.is_some(), "a duplicate point name is refused");
+        assert_eq!(o.undo_steps(), steps + 1);
+        assert!(ps.black_box.as_ref().is_some_and(|(_, f)| f.error.is_some()));
         Ok(())
     }
 

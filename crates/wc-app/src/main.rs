@@ -313,6 +313,9 @@ struct App {
     fetch: Option<BaseFetch>,
     /// File > Import running on a worker thread ([`App::poll_import`]).
     importing: Option<Importing>,
+    /// Actions that save the project, waiting one frame for the field that had the keyboard to
+    /// enter what was typed in it ([`wait_for_typed_value`]).
+    after_typed: Vec<Action>,
 }
 
 /// File > Import running on a worker thread, and what to do with the project when it ends.
@@ -767,6 +770,7 @@ impl App {
             live: Default::default(),
             fetch: None,
             importing: None,
+            after_typed: Vec::new(),
         };
         let dir = dir.or_else(|| prefs.recent.first().cloned());
         if let Some(d) = dir {
@@ -1560,6 +1564,13 @@ impl App {
             _ => {}
         }
         let Some(open) = self.open.as_mut() else { return };
+        // A black box form changed and not applied yet is applied before the project is saved.
+        if saves_project(a)
+            && !self.assistant.command_running()
+            && let Some(refused) = panels::apply_black_box_draft(open, &mut self.ed, &mut self.panels)
+        {
+            self.ed.message = refused;
+        }
         match a {
             Action::Save if self.assistant.command_running() => {
                 self.ed.message = App::SAVE_WAITS.into();
@@ -4916,19 +4927,28 @@ fn saves_project(a: Action) -> bool {
 
 /// A value typed in a field (a Properties field, say) is entered when the field is left or on
 /// Enter. When this frame's actions save the project while a field still has the keyboard
-/// (Ctrl+S typed in it), the field gives it up now, so the panels drawn later in this frame
-/// enter its value as one undo step, as if it had been left; a refused value shows its reason
-/// there. The saving action and those after it are taken out of `actions` and returned, to run
-/// once the panels are drawn (#932).
+/// (Ctrl+S typed in it), the saving action and those after it are taken out of `actions` and
+/// returned, to wait one frame: the field keeps the keyboard for this frame, so text typed in
+/// the same frame as Ctrl+S still reaches it. [`App::update`] takes them up in the next frame
+/// with [`enter_typed_value`] (#932).
 fn wait_for_typed_value(ctx: &egui::Context, actions: &mut Vec<Action>) -> Vec<Action> {
     let Some(at) = actions.iter().position(|a| saves_project(*a)) else {
         return Vec::new();
     };
-    let Some(field) = ctx.memory(|m| m.focused()) else {
+    if ctx.memory(|m| m.focused()).is_none() {
         return Vec::new();
-    };
-    ctx.memory_mut(|m| m.surrender_focus(field));
+    }
+    ctx.request_repaint();
     actions.split_off(at)
+}
+
+/// The frame after [`wait_for_typed_value`]: the field with the keyboard gives it up before
+/// the panels are drawn, so they see it left and enter its value as one undo step; a refused
+/// value shows its reason there. The waiting actions run once the panels are drawn.
+fn enter_typed_value(ctx: &egui::Context) {
+    if let Some(field) = ctx.memory(|m| m.focused()) {
+        ctx.memory_mut(|m| m.surrender_focus(field));
+    }
 }
 
 fn ctrl_shortcuts(ctx: &egui::Context, dialog_open: bool) -> Vec<Action> {
@@ -5440,7 +5460,11 @@ impl eframe::App for App {
         } else {
             actions.extend(self.route_to_symbol_editor(keys));
         }
-        let after_panels = wait_for_typed_value(ctx, &mut actions);
+        let after_panels = std::mem::take(&mut self.after_typed);
+        if !after_panels.is_empty() {
+            enter_typed_value(ctx);
+        }
+        self.after_typed = wait_for_typed_value(ctx, &mut actions);
         for a in actions {
             self.run(a);
         }
@@ -7239,6 +7263,7 @@ mod nudge_tests {
             live: Default::default(),
             fetch: None,
             importing: None,
+            after_typed: Vec::new(),
         };
         (tmp, app, egui::Context::default())
     }
@@ -7358,7 +7383,7 @@ mod nudge_tests {
     }
 
     /// A device tag typed in the Properties panel and not entered yet (the field still has the
-    /// keyboard) is entered before Ctrl+S saves: the saved project has it (#932).
+    /// keyboard) is entered before Ctrl+S saves, one frame later: the saved project has it (#932).
     #[test]
     fn ctrl_s_saves_a_value_typed_but_not_entered_yet() {
         let (_tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
@@ -7389,17 +7414,9 @@ mod nudge_tests {
             "the device tag field has the keyboard"
         );
         let before = tag(&app).unwrap();
-        // The cursor goes to the end of the field: "-K2" becomes "-K27".
-        frame_with(&mut app, vec![egui::Event::Text("7".into())], Modifiers::NONE);
+        // The cursor goes to the end of the field: "-K2" becomes "-K27". The text and Ctrl+S
+        // come in one frame, as with fast typing: the field still takes the text.
         let typed = format!("{before}7");
-        let tag = |app: &App| {
-            let open = app.open.as_ref().unwrap();
-            open.project.pages[app.ed.page].symbols[1]
-                .tag
-                .as_ref()
-                .map(ToString::to_string)
-        };
-        assert_eq!(tag(&app), Some(before), "typed, not entered yet");
         let save = egui::Event::Key {
             key: Key::S,
             physical_key: None,
@@ -7407,7 +7424,10 @@ mod nudge_tests {
             repeat: false,
             modifiers: Modifiers::COMMAND,
         };
-        frame_with(&mut app, vec![save], Modifiers::COMMAND);
+        frame_with(&mut app, vec![egui::Event::Text("7".into()), save], Modifiers::COMMAND);
+        assert_eq!(tag(&app), Some(before), "typed, not entered yet");
+        assert_eq!(app.after_typed, [Action::Save], "the save waits a frame");
+        frame_with(&mut app, Vec::new(), Modifiers::NONE);
         assert_eq!(tag(&app).as_ref(), Some(&typed), "entered before the save");
         let open = app.open.as_ref().unwrap();
         assert!(!open.dirty, "saved after the value was entered");
@@ -7619,6 +7639,7 @@ mod menu_action_tests {
             live: Default::default(),
             fetch: None,
             importing: None,
+            after_typed: Vec::new(),
         };
         (tmp, app, id)
     }
