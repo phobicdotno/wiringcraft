@@ -277,7 +277,7 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "black_box",
-            "Black boxes (device boxes) for devices without a symbol of their own: a rectangle with connection points on its edges that wires attach to like pins. `add` draws one with its top-left corner at x, y; `edit` resizes a placed one (its top-left corner stays) and/or replaces its connection points. On `edit`, `pins` is the whole new list (left out: the points stay, kept on their edges); an old point whose name is not in it is removed, and `rename` maps an old point name to the new name it keeps, so its wires follow. Wires on a removed point keep a free end. Returns the id (add) or warnings to check (edit).",
+            "Black boxes (device boxes) for devices without a symbol of their own: a rectangle with connection points on its edges that wires attach to like pins. `add` draws one with its top-left corner at x, y; `edit` resizes a placed one and/or replaces its connection points. Width, height, sides and offsets are in the box's own frame: the corner that stays put on `edit` is its origin (its own top-left, which is the page top-left only when it is not turned or mirrored). On `edit`, `pins` is the whole new list (left out: the points stay, kept on their edges); an old point whose name is not in it is removed, and `rename` maps an old point name to the new name it keeps, so its wires follow. Wires on a removed point keep a free end. Returns the id (add) or warnings to check (edit).",
             json!({
                 "action": {"type": "string", "enum": ["add", "edit"]},
                 "page": page_arg(),
@@ -2303,7 +2303,12 @@ impl App {
                 let at = Point::new(need_num(v, "x")?, need_num(v, "y")?);
                 let size = Point::new(need_num(v, "width")?, need_num(v, "height")?);
                 box_size_ok(size.x, size.y)?;
-                let device = s(v, "tag").filter(|t| !t.trim().is_empty()).map(tag).transpose()?;
+                let device = match v.get("tag") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(t)) if t.trim().is_empty() => None,
+                    Some(Value::String(t)) => Some(tag(t)?),
+                    Some(other) => return Err(format!("`tag` must be a device tag such as -A1, not {other}.")),
+                };
                 let open = need_open(self.open.as_mut())?;
                 let id = open.add_black_box(page, at, at + size, &pins.unwrap_or_default(), device)?;
                 Ok(format!("Drew black box {id}."))
@@ -6570,6 +6575,8 @@ mod tests {
         let count = page2(&a).symbols.len();
         let flipped = json!({"action": "add", "page": "2", "x": 40, "y": 40, "width": -10, "height": 10});
         assert!(call(&mut a, "black_box", flipped).is_err());
+        let numbered = json!({"action": "add", "page": "2", "x": 40, "y": 40, "width": 10, "height": 10, "tag": 42});
+        assert!(call(&mut a, "black_box", numbered).is_err());
         assert_eq!(page2(&a).symbols.len(), count);
         let layout = |a: &App| {
             let o = a.open.as_ref().unwrap();

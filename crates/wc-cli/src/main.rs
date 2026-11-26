@@ -82,8 +82,9 @@ enum Cmd {
         #[arg(long = "pin")]
         pins: Vec<String>,
     },
-    /// Change a black box drawn with `box`: its size (the top-left corner stays) and its
-    /// connection points. `--pin` given replaces every point (an old point not named again is
+    /// Change a black box drawn with `box`: its size and its connection points. Sizes, sides
+    /// and offsets are in the box's own frame, and the corner that stays put is its origin (its
+    /// own top-left; the page top-left only when the box is not turned or mirrored). `--pin` given replaces every point (an old point not named again is
     /// taken off, and a wire on it keeps a free end where it was); left out, the points stay,
     /// pulled onto the edges of the new size. `--rename OLD=NEW` keeps a point under a new name
     /// and its wires follow. Every box placing the same symbol changes. Prints what to check.
@@ -103,6 +104,9 @@ enum Cmd {
         /// Rename a point, `OLD=NEW`. Repeat for each.
         #[arg(long = "rename")]
         renames: Vec<String>,
+        /// Rename a point given as two values, `OLD NEW`: for a name holding `=`. Repeat for each.
+        #[arg(long = "rename-pair", num_args = 2, value_names = ["OLD", "NEW"])]
+        rename_pairs: Vec<String>,
     },
     /// Number the wires by rule. Every wire of one connection gets the same number.
     /// Rules: `sequential` (1, 2, 3 in drawing order), `page-column` (`3.4`: page and column
@@ -1627,14 +1631,20 @@ fn run(cli: Cli) -> Res<()> {
             pins,
             clear_pins,
             renames,
+            rename_pairs,
         } => {
             let mut p = load(dir)?;
             let pins = pins.iter().map(|s| parse_box_pin(s)).collect::<Res<Vec<_>>>()?;
             let mut renamed = std::collections::BTreeMap::new();
+            let mut pairs = Vec::new();
             for r in &renames {
-                let (from, to) = r
-                    .split_once('=')
-                    .ok_or_else(|| format!("{r:?}: expected OLD=NEW, e.g. OUT=Q"))?;
+                pairs.push(
+                    r.split_once('=')
+                        .ok_or_else(|| format!("{r:?}: expected OLD=NEW, e.g. OUT=Q"))?,
+                );
+            }
+            pairs.extend(rename_pairs.chunks_exact(2).map(|c| (c[0].as_str(), c[1].as_str())));
+            for (from, to) in pairs {
                 if renamed.insert(from.trim().to_owned(), to.trim().to_owned()).is_some() {
                     return Err(format!(
                         "connection point {} is renamed twice",
@@ -1768,6 +1778,12 @@ fn run(cli: Cli) -> Res<()> {
             // box's symbol file.
             let before = snapshot_project(dir, &[], &[])?;
             let (symbol_path, symbol_before) = vendored_bytes(dir, ItemKind::Symbol, &symbol_id)?;
+            // A link would be replaced by a plain file, and a failed save could not put it back.
+            if std::fs::symlink_metadata(&symbol_path).is_ok_and(|m| m.file_type().is_symlink()) {
+                return Err(format!(
+                    "the file of symbol {symbol_id} is a link; box-edit does not replace it (copy its target over it first)"
+                ));
+            }
             store::write_vendored_symbol(dir, &new).map_err(e)?;
             if let Err(err) = save(dir, &p) {
                 let mut failed = put_files_back(&before);
@@ -8336,6 +8352,56 @@ mod tests {
             );
             let Ok(p) = load(&dir) else { unreachable!() };
             assert!(!p.lock.symbols.contains_key("wc.coil"), "no lock entry from {bad:?}");
+        }
+    }
+
+    #[test]
+    fn box_edit_renames_a_name_holding_an_equals_sign_and_refuses_links_and_other_symbols() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+        cli(&dir, &["lib", "add", "starter", "folder", starter.to_str().unwrap()]).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        cli(
+            &dir,
+            &["box", "p1", "--at", "40,40", "--size", "20,10", "--pin", "X=1:left:5"],
+        )
+        .unwrap();
+        cli(&dir, &["wire", "p1", "s1:X=1", "0,0"]).unwrap();
+
+        // `--rename X=1=Q` splits at the first `=`; `--rename-pair` takes the names apart.
+        assert!(cli(&dir, &["box-edit", "p1", "s1", "--rename", "X=1=Q"]).is_err());
+        cli(&dir, &["box-edit", "p1", "s1", "--rename-pair", "X=1", "Q"]).unwrap();
+        let p = load(&dir).unwrap();
+        let wire = &p.page("p1").unwrap().wires[0];
+        assert_eq!(
+            wire.from,
+            Endpoint::Pin {
+                item: "s1".into(),
+                pin: "Q".into()
+            }
+        );
+
+        // A placed symbol that is not a box is refused as one.
+        cli(&dir, &["place", "p1", "wc.coil", "--at", "100,100"]).unwrap();
+        let coil = load(&dir).unwrap().page("p1").unwrap().symbols[1].id.clone();
+        let err = cli(&dir, &["box-edit", "p1", &coil, "--size", "5,5"]).unwrap_err();
+        assert!(err.contains("is not a black box"), "{err}");
+
+        // A symbol file that is a link is not replaced: the link and the project stay.
+        #[cfg(unix)]
+        {
+            let path = store::vendor_path(&dir, ItemKind::Symbol, "box.p1.s1").unwrap();
+            let target = tmp.path().join("elsewhere.toml");
+            std::fs::rename(&path, &target).unwrap();
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            let before = std::fs::read(&target).unwrap();
+            let err = cli(&dir, &["box-edit", "p1", "s1", "--size", "30,10"]).unwrap_err();
+            assert!(err.contains("link"), "{err}");
+            assert!(std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+            assert_eq!(std::fs::read_link(&path).unwrap(), target);
+            assert_eq!(std::fs::read(&target).unwrap(), before);
         }
     }
 
