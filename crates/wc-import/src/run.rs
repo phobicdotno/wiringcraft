@@ -640,7 +640,8 @@ pub fn archive(dir: &Path, file: &Path, first_page: usize, lib: Option<&Path>, l
 pub fn page_dxf(dir: &Path, file: &Path, page: &str, scale: f64, log: &mut Log) -> Res<()> {
     let text = read_file(file)?;
     onto_page(dir, page, log, |known| {
-        crate::dxf::page(&String::from_utf8_lossy(&text), scale, known).map_err(e)
+        // A name from the file in the error cannot steer the terminal.
+        crate::dxf::page(&String::from_utf8_lossy(&text), scale, known).map_err(|why| escape_field(&why.to_string()))
     })
 }
 
@@ -2286,6 +2287,23 @@ mod tests {
         assert!(store::read_vendored_symbol(&dir, "imp.lamp").is_ok());
         let pins = load(&dir).map(|p| p.lock.symbols.len());
         assert_eq!(pins, Ok(2));
+    }
+
+    #[test]
+    fn a_dxf_page_error_naming_an_entity_is_escaped_for_the_terminal() {
+        let t = tmp();
+        let dir = t.path().join("p");
+        let mut p = Project::new("t");
+        p.pages.push(wc_core::Page::new("1", "1", "Main"));
+        assert!(store::save(&dir, &p).is_ok());
+        let drawing = t.path().join("page.dxf");
+        let text = "0\nSECTION\n2\nENTITIES\n0\nBAD\u{1b}[2J\n8\n0\n0\nENDSEC\n0\nEOF\n";
+        assert!(std::fs::write(&drawing, text).is_ok());
+        let mut log = Log::default();
+        let Err(err) = page_dxf(&dir, &drawing, "1", 1.0, &mut log) else {
+            unreachable!("nothing on the page");
+        };
+        assert!(err.contains("BAD\\u{1b}[2J") && !err.contains('\u{1b}'), "{err}");
     }
 
     #[test]

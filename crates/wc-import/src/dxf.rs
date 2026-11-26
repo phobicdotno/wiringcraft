@@ -804,8 +804,11 @@ const HATCH_NOT_NUMBERS: &str = "HATCH with a boundary that is not numbers";
 const LINE_NOT_NUMBERS: &str = "LINE whose ends are not numbers once placed";
 /// The `skipped` key of any other entity that is not numbers once placed (e.g. a radius).
 const NOT_NUMBERS_PLACED: &str = "entity whose size is not a number once placed";
-/// The `skipped` key of an entity whose points are not numbers once moved into the page frame.
-const NOT_NUMBERS_ON_PAGE: &str = "entity whose points are not numbers once moved onto the page";
+/// How far from the drawing's origin (mm, once scaled) an entity may lie and still be moved
+/// onto the page: 1000 km, far past any real drawing, near enough that moving keeps its shape.
+const FAR_OUT: f64 = 1e9;
+/// The `skipped` key of an entity farther out than [`FAR_OUT`].
+const TOO_FAR_OUT: &str = "entity too far from the drawing's origin";
 
 /// Points along a B-spline from its control points, knots and weights, sampled evenly over the
 /// knot range. `None` when the data do not make a spline.
@@ -1766,9 +1769,9 @@ pub(crate) fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> 
             } else if kind == NOT_NUMBERS_PLACED {
                 let s = if n == 1 { "y" } else { "ies" };
                 format!("{n} entit{s} whose size is not a number once placed, left out")
-            } else if kind == NOT_NUMBERS_ON_PAGE {
+            } else if kind == TOO_FAR_OUT {
                 let s = if n == 1 { "y" } else { "ies" };
-                format!("{n} entit{s} whose points are not numbers once moved onto the page, left out")
+                format!("{n} entit{s} more than 1000 km from the drawing's origin, left out")
             } else if kind == LINE_NOT_NUMBERS {
                 let s = if n == 1 { "" } else { "s" };
                 format!("{n} line{s} whose ends are not numbers once placed, left out")
@@ -2002,6 +2005,20 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
     );
     out.graphics = raw.into_iter().map(|(_, s)| s).collect();
     out.warnings = skipped_warnings(skipped.clone());
+    // Entities farther out than FAR_OUT cannot be moved onto the page without losing their
+    // shape (a far-off one would also drag the rest far out): left out and said.
+    let near = |p: Point| p.x.abs() <= FAR_OUT && p.y.abs() <= FAR_OUT;
+    let before = out.graphics.len() + out.symbols.len();
+    out.graphics.retain(|s| {
+        let (a, b) = s.bounds();
+        near(a) && near(b)
+    });
+    out.symbols.retain(|s| near(s.at));
+    let far = before - out.graphics.len() - out.symbols.len();
+    if far > 0 {
+        *skipped.entry(TOO_FAR_OUT.to_owned()).or_default() += far;
+        out.warnings = skipped_warnings(skipped);
+    }
     // Move into the frame: top-left at (20, 20) mm.
     let mut pts: Vec<Point> = out
         .graphics
@@ -2025,32 +2042,9 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
     }
     let (min, _) = wc_core::geom::bounds_of(&pts);
     let shift = Point::new(20.0 - min.x, 20.0 - min.y);
-    // A drawing spanning nearly all of f64 overflows once moved: what does is left out, said.
-    let finite = |p: Point| p.x.is_finite() && p.y.is_finite();
-    let before = out.graphics.len() + out.symbols.len();
-    out.graphics = out
-        .graphics
-        .iter()
-        .map(|s| s.translate(shift))
-        .filter(|s| {
-            let (a, b) = s.bounds();
-            finite(a) && finite(b)
-        })
-        .collect();
-    out.symbols.retain_mut(|s| {
+    out.graphics = out.graphics.iter().map(|s| s.translate(shift)).collect();
+    for s in &mut out.symbols {
         s.at = s.at + shift;
-        finite(s.at)
-    });
-    let moved_out = before - out.graphics.len() - out.symbols.len();
-    if moved_out > 0 {
-        *skipped.entry(NOT_NUMBERS_ON_PAGE.to_owned()).or_default() += moved_out;
-        out.warnings = skipped_warnings(skipped);
-        if out.graphics.is_empty() && out.symbols.is_empty() {
-            return Err(Error::Format(format!(
-                "the drawing has no entities WiringCraft can read: {}",
-                out.warnings.join("; ")
-            )));
-        }
     }
     Ok(out)
 }
@@ -2130,21 +2124,21 @@ mod tests {
         Ok(())
     }
 
-    /// A drawing spanning nearly all of f64 overflows once moved into the frame: what does is
-    /// left out and said, never put on the page as not numbers.
+    /// An entity too far out to move onto the page is left out and said; the rest is moved
+    /// from where it lies, so it keeps its shape (a far-off line would drag it out of range).
     #[test]
-    fn a_line_that_overflows_once_moved_onto_the_page_is_left_out_and_said() -> Result<()> {
+    fn a_line_too_far_out_is_left_out_and_the_rest_keeps_its_shape() -> Result<()> {
         let ents = "0\nLINE\n10\n-1e308\n20\n0\n11\n1e308\n21\n0\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n";
         let p = page(&dxf(ents, ""), 1.0, &BTreeSet::new())?;
-        assert_eq!(p.graphics.len(), 1, "{:?}", p.graphics);
-        for g in &p.graphics {
-            let (a, b) = g.bounds();
-            assert!([a.x, a.y, b.x, b.y].iter().all(|v| v.is_finite()), "{g:?}");
-        }
+        // The ordinary line keeps its ends and length, at the frame's corner.
+        let [Shape::Line { a, b }] = p.graphics.as_slice() else {
+            unreachable!("{:?}", p.graphics);
+        };
+        assert_eq!((*a, *b), (Point::new(20.0, 20.0), Point::new(25.0, 20.0)));
         assert!(
             p.warnings
                 .iter()
-                .any(|w| w.contains("1 entity whose points are not numbers once moved")),
+                .any(|w| w.contains("1 entity more than 1000 km from the drawing's origin")),
             "{:?}",
             p.warnings
         );
@@ -2152,7 +2146,7 @@ mod tests {
         let Err(err) = page(&dxf(only, ""), 1.0, &BTreeSet::new()) else {
             unreachable!("nothing left to draw");
         };
-        assert!(err.to_string().contains("once moved onto the page"), "{err}");
+        assert!(err.to_string().contains("1000 km"), "{err}");
         Ok(())
     }
 

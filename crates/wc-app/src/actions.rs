@@ -540,7 +540,7 @@ impl Action {
             ),
             Action::ImportPageDwg => i(
                 "DWG drawing",
-                "Import a DWG drawing onto the current page (read by WiringCraft's own DWG reader; a DWG to DXF converter is used for what it cannot read)",
+                "Import a DWG drawing onto the current page (read by WiringCraft's own DWG reader; a DWG to DXF converter is used only when the reader refuses the file)",
                 Icon::Open,
                 "",
             ),
