@@ -5330,6 +5330,80 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_d_duplicates_the_selection_one_grid_step_away_as_one_undo_step() {
+        let (_tmp, mut a) = app(vec![]);
+        let ctx = egui::Context::default();
+        let ctrl_d = |a: &mut App| {
+            let raw = egui::RawInput {
+                modifiers: egui::Modifiers::COMMAND,
+                events: vec![egui::Event::Key {
+                    key: egui::Key::D,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                }],
+                ..Default::default()
+            };
+            let mut keys = Vec::new();
+            let _ = ctx.run(raw, |ctx| keys = a.shortcuts(ctx));
+            for k in keys {
+                a.run(k);
+            }
+        };
+        let o = a.open.as_mut().unwrap();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        let s1 = o.place(page, "wc.coil", Point::new(50.0, 50.0)).unwrap();
+        let s2 = o.place(page, "wc.coil", Point::new(90.0, 50.0)).unwrap();
+        let pin = |item: &str| Endpoint::Pin {
+            item: item.into(),
+            pin: "A2".into(),
+        };
+        o.add_wire(
+            page,
+            pin(&s1),
+            pin(&s2),
+            vec![Point::new(50.0, 70.0), Point::new(90.0, 70.0)],
+        );
+        a.ed.page = page;
+        let counts = |a: &App| {
+            let p = &a.open.as_ref().unwrap().project.pages[page];
+            (p.symbols.len(), p.wires.len())
+        };
+        let before = counts(&a);
+
+        // Nothing selected: nothing happens.
+        ctrl_d(&mut a);
+        assert_eq!(counts(&a), before);
+
+        a.ed.selection = a.open.as_ref().unwrap().select_all(page);
+        let undo_before = a.open.as_ref().unwrap().undo_mark();
+        ctrl_d(&mut a);
+        assert_eq!(counts(&a), (before.0 + 2, before.1 + 1), "both symbols and their wire");
+        assert_eq!(a.open.as_ref().unwrap().undo_mark(), undo_before + 1, "one undo step");
+        // The copies are selected, one grid step (2.5 mm) down and right of the originals.
+        let p = &a.open.as_ref().unwrap().project.pages[page];
+        let selected: Vec<&str> =
+            a.ed.selection
+                .iter()
+                .filter_map(|s| match s {
+                    Selection::Symbol(id) => Some(id.as_str()),
+                    _ => None,
+                })
+                .collect();
+        assert_eq!(selected.len(), 2);
+        assert!(!selected.contains(&s1.as_str()) && !selected.contains(&s2.as_str()));
+        let mut at: Vec<Point> = selected.iter().map(|id| p.symbol(id).unwrap().at).collect();
+        at.sort_by(|x, y| x.x.total_cmp(&y.x));
+        assert_eq!(at, [Point::new(52.5, 52.5), Point::new(92.5, 52.5)]);
+        assert!(a.ed.selection.iter().any(|s| matches!(s, Selection::Wire(_))));
+        assert!(a.clipboard.is_empty(), "the clipboard is left alone");
+
+        a.run(Action::Undo);
+        assert_eq!(counts(&a), before, "one Undo takes the copy back");
+    }
+
+    #[test]
     fn editing_actions_are_off_and_do_nothing_on_a_page_someone_else_holds() {
         use crate::chrome::Status;
         let (_tmp, mut a) = app(vec![]);
