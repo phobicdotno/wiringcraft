@@ -4073,6 +4073,7 @@ mod tests {
             fetch: None,
             importing: None,
             after_typed: Vec::new(),
+            closing: crate::Closing::No,
         };
         (tmp, app)
     }
