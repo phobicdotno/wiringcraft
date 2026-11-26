@@ -1910,6 +1910,31 @@ impl App {
         self.ed.view.zoom = (self.ed.view.zoom * f).clamp(0.3, 60.0);
     }
 
+    /// The arrow keys move the selection on the page by one snap step, one undo step a press.
+    fn nudge_by_arrows(&mut self, ctx: &egui::Context) {
+        if self.dialog.is_some()
+            || ctx.wants_keyboard_input()
+            || self.importing.is_some()
+            || self.symbol_editor.is_some()
+            || self.ed.panel.is_some()
+            || self.ed.selection.is_empty()
+        {
+            return;
+        }
+        let Some(d) = ctx.input(|i| arrow_step(i, self.prefs.snap)) else {
+            return;
+        };
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        if let Some(name) = held_for(Action::Rotate, &self.ed, &open.project) {
+            self.ed.message = format!("{name} has this page open; it is read-only here until they leave it.");
+            return;
+        }
+        open.checkpoint();
+        open.move_by(self.ed.page, &self.ed.selection, d);
+    }
+
     fn shortcuts(&mut self, ctx: &egui::Context) -> Vec<Action> {
         // An open dialog takes the keyboard: a shortcut would change the project under it (the
         // cover form's Cancel takes back only what the form changed).
@@ -4720,6 +4745,26 @@ fn report_table(ui: &mut egui::Ui, t: &wc_report::Table) {
 
 /// A project's title-block fields as form rows: the standard fields first (empty when not
 /// set), then any others the project has.
+/// How far the arrow keys pressed this frame (without modifiers) move the selection: `step`
+/// millimetres a key, y pointing down the page.
+fn arrow_step(i: &egui::InputState, step: f64) -> Option<wc_core::geom::Point> {
+    if !i.modifiers.is_none() {
+        return None;
+    }
+    let mut d = wc_core::geom::Point::new(0.0, 0.0);
+    for (k, x, y) in [
+        (Key::ArrowLeft, -1.0, 0.0),
+        (Key::ArrowRight, 1.0, 0.0),
+        (Key::ArrowUp, 0.0, -1.0),
+        (Key::ArrowDown, 0.0, 1.0),
+    ] {
+        if i.key_pressed(k) {
+            d = wc_core::geom::Point::new(d.x + x * step, d.y + y * step);
+        }
+    }
+    (d != wc_core::geom::Point::new(0.0, 0.0)).then_some(d)
+}
+
 /// The Ctrl shortcuts pressed this frame, none while a dialog is open.
 fn ctrl_shortcuts(ctx: &egui::Context, dialog_open: bool) -> Vec<Action> {
     let mut out = Vec::new();
@@ -5207,6 +5252,7 @@ impl eframe::App for App {
         }
         let mut actions = chrome::show(ctx, self.prefs.chrome, &mut self.chrome, &status);
         let keys = self.shortcuts(ctx);
+        self.nudge_by_arrows(ctx);
         // While an import runs no key edits the symbol being drawn either: the keys go to the
         // actions, which wait for the import.
         if self.importing.is_some() {
@@ -6106,6 +6152,48 @@ mod renderer_tests {
         };
         assert!(press(true).is_empty(), "Ctrl+N does nothing under a dialog");
         assert!(matches!(press(false).as_slice(), [Action::AddPage]));
+    }
+
+    #[test]
+    fn arrow_keys_step_the_selection_by_the_snap() {
+        let ctx = egui::Context::default();
+        let press = |modifiers: Modifiers, keys: &[Key]| {
+            let raw = egui::RawInput {
+                modifiers,
+                events: keys
+                    .iter()
+                    .map(|&key| egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            let mut got = None;
+            let _ = ctx.run(raw, |ctx| got = ctx.input(|i| arrow_step(i, 2.5)));
+            got
+        };
+        assert_eq!(
+            press(Modifiers::NONE, &[Key::ArrowLeft]),
+            Some(wc_core::geom::Point::new(-2.5, 0.0))
+        );
+        assert_eq!(
+            press(Modifiers::NONE, &[Key::ArrowDown]),
+            Some(wc_core::geom::Point::new(0.0, 2.5))
+        );
+        assert_eq!(
+            press(Modifiers::NONE, &[Key::ArrowRight, Key::ArrowUp]),
+            Some(wc_core::geom::Point::new(2.5, -2.5))
+        );
+        assert_eq!(press(Modifiers::NONE, &[Key::A]), None);
+        assert_eq!(
+            press(Modifiers::COMMAND, &[Key::ArrowLeft]),
+            None,
+            "Ctrl+arrow is not a nudge"
+        );
     }
 
     #[test]
