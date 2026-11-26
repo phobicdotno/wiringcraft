@@ -724,7 +724,8 @@ mod tests {
   (symbol "Psu"
     (symbol "Psu_0_1"
       (text "A\nB" (at 0 0 0) (effects (font (size 2 2))))
-      (text "C\n\nD" (at 0 0 90) (effects (font (size 2 2)))))
+      (text "C\n\nD" (at 0 0 90) (effects (font (size 2 2))))
+      (text "A	B" (at 9 9 0) (effects (font (size 2 2)))))
     (symbol "Psu_1_1" (pin passive line (at 0 3 270) (length 1) (name "~") (number "1")))))"#;
         let (syms, warnings) = symbols(lib, "k", 1.0)?;
         let texts: Vec<(&str, Point)> = syms[0]
@@ -737,7 +738,8 @@ mod tests {
             })
             .collect();
         let names: Vec<&str> = texts.iter().map(|t| t.0).collect();
-        assert_eq!(names, ["A", "B", "C", "D"], "{warnings:?}");
+        // A real tab inside a string (KiCad does not escape it) is dropped, not printed as `?`.
+        assert_eq!(names, ["A", "B", "C", "D", "AB"], "{warnings:?}");
         assert!(texts.iter().all(|t| !t.0.chars().any(char::is_control)));
         // Horizontal text: the second line sits below the first (y runs down).
         assert!(texts[1].1.y > texts[0].1.y && (texts[1].1.x - texts[0].1.x).abs() < 1e-9);
