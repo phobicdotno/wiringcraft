@@ -332,6 +332,27 @@ enum Pending {
     WagoList,
 }
 
+/// Queue the picker `p` for the project in `dir` unless another waits: false when one does.
+fn queue_pending(
+    pending: &mut Option<Pending>,
+    pending_for: &mut Option<PathBuf>,
+    p: Pending,
+    dir: Option<PathBuf>,
+) -> bool {
+    if pending.is_some() {
+        return false;
+    }
+    *pending = Some(p);
+    *pending_for = dir;
+    true
+}
+
+/// Whether a picker queued while `asked_for` was open may still be shown with `now` open:
+/// Open project always, the others only for the same project.
+fn pending_applies(p: &Pending, asked_for: Option<&Path>, now: Option<&Path>) -> bool {
+    matches!(p, Pending::Open) || asked_for == now
+}
+
 /// The whole-project exports that ask where to go.
 #[derive(Debug, Clone)]
 enum Export {
@@ -964,11 +985,20 @@ impl App {
         let Some(p) = self.pending.take() else { return };
         let asked_for = self.pending_for.take();
         let now = self.open.as_ref().map(|o| o.dir.clone());
-        if !matches!(p, Pending::Open) && asked_for != now {
+        if !pending_applies(&p, asked_for.as_deref(), now.as_deref()) {
             self.ed.message = "The file dialog was not shown: another project was opened before it could.".into();
             return;
         }
         self.ask(p);
+    }
+
+    /// Queue the picker `p` from a dialog, for the project open now, as [`App::run`] does for an
+    /// action; a picker already waiting stays and this one is not taken.
+    fn queue(&mut self, p: Pending) {
+        let dir = self.open.as_ref().map(|o| o.dir.clone());
+        if !queue_pending(&mut self.pending, &mut self.pending_for, p, dir) {
+            self.ed.message = "Not done: another file dialog is waiting to open; try again after it.".into();
+        }
     }
 
     fn carry_out(&mut self, a: Action) {
@@ -3113,7 +3143,7 @@ impl App {
                     ui.horizontal(|ui| {
                         if ui.button("Choose the file and import…").clicked() {
                             let pending = Pending::Import(*kind, targets.get(*chosen).cloned());
-                            then = Some(Box::new(move |app: &mut App| app.pending = Some(pending)));
+                            then = Some(Box::new(move |app: &mut App| app.queue(pending)));
                             keep = false;
                         }
                         if ui.button("Cancel").clicked() {
@@ -5564,6 +5594,29 @@ mod icon_tests {
 #[allow(clippy::unwrap_used)]
 mod picker_tests {
     use super::*;
+
+    #[test]
+    fn a_queued_parts_picker_is_for_its_project_and_dropped_after_a_switch() {
+        let (mut pending, mut pending_for) = (None, None);
+        let a = PathBuf::from("a");
+        let parts = Pending::Import(imports::Kind::PartsCsv, None);
+        assert!(queue_pending(&mut pending, &mut pending_for, parts, Some(a.clone())));
+        // The first picker stays while it waits.
+        assert!(!queue_pending(
+            &mut pending,
+            &mut pending_for,
+            Pending::Open,
+            Some(a.clone())
+        ));
+        let Some(p) = pending.take() else {
+            unreachable!("the parts picker was not queued");
+        };
+        assert!(matches!(p, Pending::Import(imports::Kind::PartsCsv, None)));
+        assert!(pending_applies(&p, pending_for.as_deref(), Some(a.as_path())));
+        assert!(!pending_applies(&p, pending_for.as_deref(), Some(Path::new("b"))));
+        assert!(!pending_applies(&p, pending_for.as_deref(), None));
+        assert!(pending_applies(&Pending::Open, None, Some(Path::new("b"))));
+    }
 
     #[test]
     fn a_picker_that_never_showed_says_so_instead_of_doing_nothing() {
