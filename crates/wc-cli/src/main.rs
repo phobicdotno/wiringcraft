@@ -460,10 +460,13 @@ enum Cmd {
     /// hit (a device tag renames the device everywhere it appears). Status lines go to stderr,
     /// so stdout holds only hits.
     Find {
-        /// The text to find; upper and lower case are alike unless --match-case.
+        /// The text to find; upper and lower case are alike unless --match-case. A device tag
+        /// such as `-K1` is taken as the text, though it starts with `-`.
+        #[arg(allow_hyphen_values = true)]
         query: String,
-        /// Replace the found text with this, in every hit.
-        #[arg(long)]
+        /// Replace the found text with this, in every hit (taken as a value, though it starts
+        /// with `-`, e.g. `-K2`).
+        #[arg(long, allow_hyphen_values = true)]
         replace: Option<String>,
         /// Upper and lower case must match.
         #[arg(long)]
@@ -7790,6 +7793,44 @@ mod tests {
         assert_eq!(p.pages[0].symbols[0].tag.as_ref(), Some(&k2));
         assert!(p.devices.contains_key(&k2));
         assert!(cli(&dir, &["find", "K2", "--replace", "?"]).is_err(), "not a tag");
+    }
+
+    #[test]
+    fn find_takes_a_tag_and_a_replacement_that_start_with_a_dash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let mut p = load(&dir).unwrap();
+        let tag = wc_core::DeviceTag::parse("-K1").unwrap();
+        p.pages[0].symbols.push(wc_core::PlacedSymbol {
+            id: "s1".into(),
+            symbol: "wc.coil".into(),
+            at: wc_core::Point::new(10.0, 10.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: Some(tag.clone()),
+        });
+        p.devices.insert(tag, wc_core::Device::default());
+        save(&dir, &p).unwrap();
+        let parsed = Cli::try_parse_from(["wiringcraft", "find", "-K1", "--replace", "-K2", "--match-case"]).unwrap();
+        let Cmd::Find {
+            query,
+            replace,
+            match_case,
+        } = parsed.cmd
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            (query.as_str(), replace.as_deref(), match_case),
+            ("-K1", Some("-K2"), true)
+        );
+        cli(&dir, &["find", "-K1"]).unwrap();
+        cli(&dir, &["find", "--replace", "-K2", "-K1"]).unwrap();
+        let p = load(&dir).unwrap();
+        let k2 = wc_core::DeviceTag::parse("-K2").unwrap();
+        assert_eq!(p.pages[0].symbols[0].tag.as_ref(), Some(&k2));
+        assert!(p.devices.contains_key(&k2));
     }
 
     #[test]
