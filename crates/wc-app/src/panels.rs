@@ -574,7 +574,7 @@ pub fn library(ui: &mut egui::Ui, open: &Open, ed: &mut Editor, ps: &mut PanelSt
                 );
                 if r.clicked() {
                     ed.place_symbol = Some(id.clone());
-                    ed.tool = Tool::Place;
+                    ed.set_tool(Tool::Place);
                     ed.wire = None;
                 }
             }

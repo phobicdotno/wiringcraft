@@ -4026,6 +4026,24 @@ mod tests {
         assert!(s.mirror, "Mirror went to the selection, as before");
     }
 
+    /// Going to a find hit leaves the place tool, and with it the turn for the symbol on the
+    /// pointer: placing again later starts upright (#738).
+    #[test]
+    fn going_to_a_find_hit_sets_the_place_turn_back() {
+        use crate::state::Tool;
+        use wc_core::geom::Rotation;
+        let (_tmp, mut a) = app(vec![]);
+        let Some(open) = a.open.as_ref() else { unreachable!() };
+        let page = open.project.pages[0].id.clone();
+        a.ed.tool = Tool::Place;
+        a.ed.place_symbol = Some("wc.coil".into());
+        crate::canvas::turn_place(&mut a.ed, true);
+        assert_eq!(a.ed.place_turn, (Rotation::R0, true));
+        a.show_found(&page, None);
+        assert_eq!(a.ed.tool, Tool::Select);
+        assert_eq!(a.ed.place_turn, (Rotation::R0, false));
+    }
+
     /// A worker that ends only after far more polls than the old fixed bounds (1000) allowed
     /// is still waited for (#678).
     #[test]

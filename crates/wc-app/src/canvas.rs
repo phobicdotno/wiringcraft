@@ -172,6 +172,15 @@ enum Drag {
 }
 
 impl Editor {
+    /// Change the tool. The turn for the symbol on the pointer belongs to the place tool:
+    /// any other tool sets it back.
+    pub fn set_tool(&mut self, tool: Tool) {
+        self.tool = tool;
+        if tool != Tool::Place {
+            self.place_turn = (Rotation::R0, false);
+        }
+    }
+
     /// Who holds the page shown, in a shared session: then it is read-only here and only
     /// selecting, panning and zooming work on it. `None` in the panel view and on own pages.
     pub fn held_page<'a>(&'a self, project: &wc_core::Project) -> Option<&'a str> {
@@ -1039,11 +1048,10 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
     // page) work: a tool that draws or places falls back to Select.
     let held = ed.held_page(&open.project).is_some();
     if held && !matches!(ed.tool, Tool::Select | Tool::Comment) {
-        ed.tool = Tool::Select;
+        ed.set_tool(Tool::Select);
         ed.wire = None;
         ed.shape_points.clear();
         ed.black_box = None;
-        ed.place_turn = (Rotation::R0, false);
     }
     leave_unpickable_layer(ed);
 
@@ -1321,7 +1329,7 @@ fn leave_unpickable_layer(ed: &mut Editor) {
     let Some(why) = ed.layers.refusal(layer) else {
         return;
     };
-    ed.tool = Tool::Select;
+    ed.set_tool(Tool::Select);
     ed.shape_points.clear();
     ed.shape_page = None;
     ed.message = why;
