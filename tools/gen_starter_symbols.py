@@ -32,8 +32,14 @@ def no_contact():
 def nc_contact():
     return [line((0, 0), (0, 5)), line((0, 5), (2.5, 5)), line((0, 10), (0, 15)), line((0, 10), (3, 4.2))]
 
+def pin_label(p):
+    x, y = p["at"]["x"], p["at"]["y"]
+    if p["dir"] == "right": return text((x - 1.4, y - 1.4), p["name"], 2.0)
+    if p["dir"] == "left": return text((x + 0.4, y - 1.4), p["name"], 2.0)
+    return text((1.2, y + (2.5 if p["dir"] == "up" else -0.6)), p["name"], 2.0)
+
 def pin_labels(pins):
-    return [text((1.2, p["at"]["y"] + (2.5 if p["dir"] == "up" else -0.6)), p["name"], 2.0) for p in pins]
+    return [pin_label(p) for p in pins]
 
 S = []
 def sym(id, name, cat, code, role, graphics, pins, tag_at=(-6, 8), desc=""):
@@ -86,6 +92,12 @@ sym("wc.plc.output", "PLC digital output", "plc", "A", "standalone",
 sym("wc.pe", "Protective earth", "power", "", "standalone",
     [line((0, 0), (0, 5)), line((-4, 5), (4, 5)), line((-2.6, 6.5), (2.6, 6.5)), line((-1.2, 8), (1.2, 8))],
     [pin("PE", 0, 0, "up")], tag_at=(4, 3))
+sym("wc.potentiometer", "Potentiometer", "passive", "R", "standalone",
+    # Resistor body with the wiper arrow touching its right side.
+    [line((0, 0), (0, 6.5)), rect((-1.8, 6.5), (1.8, 13.5)), line((0, 13.5), (0, 20)),
+     line((1.8, 10), (5, 10)), line((1.8, 10), (3.3, 9.1)), line((1.8, 10), (3.3, 10.9))],
+    [pin("1", 0, 0, "up"), pin("2", 5, 10, "right"), pin("3", 0, 20, "down")], tag_at=(-6, 10),
+    desc="Adjustable resistor (setpoint, speed reference); 1 and 3 are the ends, 2 is the wiper.")
 
 os.makedirs(OUT, exist_ok=True)
 for s in S:
