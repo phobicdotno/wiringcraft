@@ -25,7 +25,7 @@ See the feature list for the full plan.
 | `wc-library` | library sources, lockfile, vendoring, update status |
 | `wc-import` | symbols from DXF, SVG, KiCad symbol libraries and QElectroTech elements; parts from CSV, Excel (.xlsx), BMEcat catalogues and EDZ files (with their macros as symbols); PLC address lists; WAGO configurator lists; maker footprint DXFs and STEP model sizes; pages from DXF, DWG and PDF (trace); AutomationML, Eplan P8 and SolidWorks Electrical projects and libraries (.tewzip); open-format parts of project archives |
 | `wc-report` | parts list, device list, wire list, net list, terminal plan, cable list, PLC I/O list, PLC card overview, table of contents |
-| `wc-pdf` | vector PDF export (schematic pages plus report pages) |
+| `wc-pdf` | vector PDF export: schematic pages, report tables, panel layouts, PLC card sheets and network topology sheets; schematic pages also as SVG and DXF |
 | `wc-vcs` | git versioning, subway-map history, schematic change lists |
 | `wc-agent` | the live AI assistant: Claude Code connection (your login), tool bridge, API client |
 | `wc-share` | shared work sessions: join approval, page locks, one commit per change, TCP transport, network discovery; used by the app's Share session and Join session |

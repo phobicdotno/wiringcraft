@@ -781,10 +781,11 @@ const SPLINE_TOO_FEW: &str = "SPLINE with too few points";
 /// their placed points are not numbers.
 const STRETCHED_NOT_NUMBERS: &str = "CIRCLE or ARC of a stretched block whose points are not numbers";
 
-/// The key under which hatches with a boundary that is not all numbers are counted.
 /// The `skipped` key of a polyline whose points, or the arcs of its bulges, are not numbers once
 /// placed.
 const POLYLINE_NOT_NUMBERS: &str = "LWPOLYLINE whose points are not numbers once placed";
+
+/// The key under which hatches with a boundary that is not all numbers are counted.
 const HATCH_NOT_NUMBERS: &str = "HATCH with a boundary that is not numbers";
 
 /// Points along a B-spline from its control points, knots and weights, sampled evenly over the

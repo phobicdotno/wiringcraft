@@ -497,11 +497,6 @@ impl Guest {
         }
     }
 
-    /// Take the host's version of what a refused project edit touched. A page this guest has
-    /// open keeps its content (page edits of it may still be on their way), and takes only the
-    /// host's display number, unless it is in `whole`: the refused edit added or removed that
-    /// page, or set its content, so the content here is not the host's page, and the host's page
-    /// comes back whole.
     /// Hash the files named in `only` (all of them for `None`) into `file_hashes`.
     fn note_files(&mut self, only: Option<Vec<(ItemKind, String)>>) {
         let only = only.unwrap_or_else(|| {
@@ -531,6 +526,11 @@ impl Guest {
             .unwrap_or_default()
     }
 
+    /// Take the host's version of what a refused project edit touched. A page this guest has
+    /// open keeps its content (page edits of it may still be on their way), and takes only the
+    /// host's display number, unless it is in `whole`: the refused edit added or removed that
+    /// page, or set its content, so the content here is not the host's page, and the host's page
+    /// comes back whole.
     fn put_back(&mut self, mut parts: crate::Parts, whole: &[String]) {
         let me = self.me;
         let Some(project) = self.project.as_mut() else {

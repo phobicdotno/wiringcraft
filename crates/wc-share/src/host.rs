@@ -1001,11 +1001,9 @@ impl Host {
         }
     }
 
-    /// Symbol `id` in the version `hash`: the one guests get, or one an update replaced.
-    /// Wire ends in `project` on pins the locked version of their symbol does not have, for the
-    /// versions the session has.
-    /// The wire ends dangling in `project`, counted (two wires sharing an id count twice), each
-    /// with its label.
+    /// The wire ends dangling in `project` (on pins the locked version of their symbol does not
+    /// have, for the versions the session has), counted (two wires sharing an id count twice),
+    /// each with its label.
     fn dangling_in(&self, project: &Project) -> BTreeMap<wc_core::project::DanglingEnd, (usize, String)> {
         let mut out: BTreeMap<_, (usize, String)> = BTreeMap::new();
         let ends = project
@@ -1036,6 +1034,7 @@ impl Host {
         out
     }
 
+    /// Symbol `id` in the version `hash`: the one guests get, or one an update replaced.
     fn symbol_version(&self, id: &str, hash: &str) -> Option<wc_core::Symbol> {
         match self.symbols.get(id) {
             Some(s) if s.hash() == hash => Some(s.clone()),

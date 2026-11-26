@@ -723,7 +723,6 @@ pub struct Scan {
 /// ones are logos and stamps.
 const SCAN_SHARE: f64 = 0.3;
 
-/// Undo PNG predictors (PDF `/Predictor` 10 to 15) on decoded rows.
 /// Undo the predictor a filter's parameters name: PNG predictors (10 and up) and the TIFF
 /// predictor (2) for 8-bit samples; 1 or none leaves the data as it is.
 fn unpredict(data: Vec<u8>, parms: Option<&BTreeMap<String, Obj>>) -> std::result::Result<Vec<u8>, String> {
@@ -765,6 +764,7 @@ fn tiff_unpredict(mut data: Vec<u8>, colors: usize, columns: usize) -> Vec<u8> {
     data
 }
 
+/// Undo PNG predictors (PDF `/Predictor` 10 to 15) on decoded rows.
 fn png_unpredict(data: &[u8], colors: usize, bits: usize, columns: usize) -> Option<Vec<u8>> {
     let bpp = (colors * bits).div_ceil(8).max(1);
     let row = (colors.checked_mul(bits)?.checked_mul(columns)?).div_ceil(8);
