@@ -368,6 +368,105 @@ fn table_of_contents_lists_the_sheets_after_the_schematic_pages() {
     assert_eq!(text.matches("/Subtype /Link").count(), 4);
 }
 
+/// A contents table as `wc_report::contents` builds it, with `rows` of (page, title).
+fn contents_table(rows: &[(&str, &str)], row_pages: &[&str]) -> wc_report::Table {
+    wc_report::Table {
+        title: "Table of contents".into(),
+        columns: ["Page", "Title", "Devices", "Wires"].map(String::from).to_vec(),
+        rows: rows
+            .iter()
+            .map(|(p, t)| vec![(*p).to_owned(), (*t).to_owned(), String::new(), String::new()])
+            .collect(),
+        row_pages: row_pages.iter().map(|p| (*p).to_owned()).collect(),
+        front: true,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn later_sheets_fill_the_columns_of_a_contents_layout() {
+    use wc_core::report_layout::{ReportColumn, ReportLayout};
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Mains")];
+    // The project's layout shows the title first and the page renamed, without the counts.
+    let layout = ReportLayout {
+        columns: vec![
+            ReportColumn {
+                from: "Title".into(),
+                heading: None,
+            },
+            ReportColumn {
+                from: "Page".into(),
+                heading: Some("Sheet".into()),
+            },
+        ],
+        ..Default::default()
+    };
+    let contents = contents_table(&[("1", "Mains")], &["p1"]).with_layout(&layout);
+    let parts = wc_report::Table {
+        title: "Parts list".into(),
+        columns: vec!["Part".into()],
+        ..Default::default()
+    };
+    let opts = Options {
+        reports: vec![contents, parts],
+        ..Default::default()
+    };
+    let (pdf, _) = export(&project, &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    let at = |s: &str| text.find(&format!("{} Tj", writer::pdf_text(s)));
+    // The row reads "Parts list | R2", like "Mains | 1" above it.
+    let (Some(mains), Some(sheet), Some(title), Some(number)) = (at("Mains"), at("Sheet"), at("Parts list"), at("R2"))
+    else {
+        unreachable!("the contents shows both rows")
+    };
+    assert!(sheet < mains && mains < title && title < number);
+    // Both on the contents page, not "R2" from the parts list's own sheet.
+    assert!(!text[title..number].contains("endstream"));
+    assert_eq!(text.matches("/Subtype /Link").count(), 2);
+}
+
+#[test]
+fn a_contents_grouped_by_page_counts_a_heading_per_later_sheet() {
+    use wc_core::report_layout::ReportLayout;
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Mains")];
+    let band = project.meta.template.band_height();
+    let per_page = layout::rows_per_page(layout::report_size(project.pages[0].size, band, 2), band);
+    // Page 1 as a heading with its rows takes all but three lines. The panel and the parts
+    // list then each take a heading and a row: four lines, so the parts list row runs onto
+    // a second contents page and the parts list itself is R3.
+    let mut rows = vec![("1", "Mains")];
+    rows.resize(per_page - 4, ("1", "Note"));
+    let layout = ReportLayout {
+        group: Some("Page".into()),
+        ..Default::default()
+    };
+    let contents = contents_table(&rows, &["p1"]).with_layout(&layout);
+    let parts = wc_report::Table {
+        title: "Parts list".into(),
+        columns: vec!["Part".into()],
+        ..Default::default()
+    };
+    let opts = Options {
+        reports: vec![contents, parts],
+        panels: vec![wc_core::panel::Panel::with_rails("main", "Cabinet", 600.0, 800.0)],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    assert_eq!(report.pages, 5);
+    let has = |title: &str| text.contains(&format!("/Title {}", writer::pdf_text(title)));
+    assert!(has("R2 Table of contents (2/2)"));
+    assert!(has("R3 Parts list"));
+    // The parts list's row in the contents is headed R3: the last text before its title.
+    let Some(title) = text.find(&format!("{} Tj", writer::pdf_text("Parts list"))) else {
+        unreachable!("the contents lists the parts list")
+    };
+    let row = text[..title].rsplit("Tj").nth(1).unwrap_or_default();
+    assert!(row.contains(&writer::pdf_text("Page: R3")), "{row}");
+}
+
 #[test]
 fn table_of_contents_lists_only_the_exported_pages() {
     let mut project = Project::new("x");

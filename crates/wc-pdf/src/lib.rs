@@ -384,14 +384,26 @@ fn list_extra_sheets<'a>(
         return (reports, Vec::new());
     }
     let ids: Vec<String> = (0..rows.len()).map(extra_sheet_id).collect();
+    // The built-in columns may be reordered, renamed or left out by the project's layout for
+    // the contents: the values go where the "Page" and "Title" columns are, if shown.
+    let mut page_col = None;
     if let Some(t) = reports.get_mut(first) {
         let t = t.to_mut();
-        let width = t.columns.len().max(2);
+        page_col = t.column_of("Page");
+        let title_col = t.column_of("Title");
         // Every earlier row describes a page or none; the new ones each describe a sheet.
         t.row_pages.resize(t.rows.len(), String::new());
-        for (_, title) in &rows {
-            let mut row = vec![String::new(), title.clone()];
-            row.resize(width, String::new());
+        for (k, (number, title)) in rows.iter().enumerate() {
+            let mut row = vec![String::new(); t.columns.len()];
+            // A report page's number is not known yet: a stand-in, different from every
+            // other row's, pages the table as the real number will (a contents grouped by
+            // page prints a heading per number).
+            if let Some(cell) = page_col.and_then(|c| row.get_mut(c)) {
+                *cell = number.clone().unwrap_or_else(|| format!("\u{1}{k}"));
+            }
+            if let Some(cell) = title_col.and_then(|c| row.get_mut(c)) {
+                cell.clone_from(title);
+            }
             t.rows.push(row);
         }
         t.row_pages.extend(ids.iter().cloned());
@@ -402,16 +414,15 @@ fn list_extra_sheets<'a>(
         .map(|t| layout::table_pages(t, per_page).len())
         .sum();
     let mut report_no = front;
-    if let Some(t) = reports.get_mut(first) {
+    if let (Some(t), Some(c)) = (reports.get_mut(first), page_col) {
         let t = t.to_mut();
         let start = t.rows.len() - rows.len();
         for ((number, _), row) in rows.into_iter().zip(t.rows.iter_mut().skip(start)) {
-            let number = number.unwrap_or_else(|| {
+            if number.is_none() {
                 report_no += 1;
-                format!("R{report_no}")
-            });
-            if let Some(cell) = row.first_mut() {
-                *cell = number;
+                if let Some(cell) = row.get_mut(c) {
+                    *cell = format!("R{report_no}");
+                }
             }
         }
     }
