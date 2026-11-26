@@ -306,6 +306,40 @@ fn a_merge_while_another_is_unfinished_is_refused() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn a_merge_with_unrecorded_changes_is_refused() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    let git = Git::new(dir);
+    git.init()?;
+    let write = |name: &str, text: &str| std::fs::write(dir.join(name), text).map_err(|e| wc_core::Error::io(name, e));
+    write("notes.txt", "base\n")?;
+    write("other.txt", "one\n")?;
+    git.commit("base")?;
+    git.create_branch("other")?;
+    write("notes.txt", "other\n")?;
+    git.commit("other")?;
+    git.switch("main")?;
+    write("notes.txt", "main\n")?;
+    git.commit("main")?;
+    // An edit not recorded yet: committing the conflicted merge would take it in too.
+    write("other.txt", "edited\n")?;
+    let head = git.head();
+    let r = git.merge("other");
+    let Err(Error::Git { message, .. }) = &r else {
+        unreachable!("{r:?}")
+    };
+    assert!(message.contains("record or discard your changes first"), "{message}");
+    assert_eq!(git.head(), head, "nothing was merged");
+    assert!(!dir.join(".git").join("MERGE_HEAD").exists(), "no merge was started");
+    let kept = std::fs::read_to_string(dir.join("other.txt")).map_err(|e| wc_core::Error::io("read", e))?;
+    assert_eq!(kept, "edited\n", "the edit stays");
+    // Recorded first, the merge goes ahead.
+    git.commit("Edit other")?;
+    assert_eq!(git.merge("other")?, MergeOutcome::Conflicts(vec!["notes.txt".into()]));
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn a_failed_commit_without_an_index_copy_says_so() -> Result<()> {
