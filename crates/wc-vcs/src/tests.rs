@@ -276,6 +276,36 @@ fn a_resolved_merge_conflict_can_be_committed() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn a_merge_while_another_is_unfinished_is_refused() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    let git = Git::new(dir);
+    git.init()?;
+    let write = |text: &str| std::fs::write(dir.join("notes.txt"), text).map_err(|e| wc_core::Error::io("notes", e));
+    write("base\n")?;
+    git.commit("base")?;
+    git.create_branch("other")?;
+    write("other\n")?;
+    git.commit("other")?;
+    git.switch("main")?;
+    write("main\n")?;
+    git.commit("main")?;
+    assert_eq!(git.merge("other")?, MergeOutcome::Conflicts(vec!["notes.txt".into()]));
+    // Not the first merge's conflicts again, whatever branch is named.
+    for name in ["other", "no-such-branch"] {
+        let r = git.merge(name);
+        let Err(Error::Git { message, .. }) = &r else {
+            unreachable!("{r:?}")
+        };
+        assert!(message.contains("another merge is in progress"), "{message}");
+    }
+    // The first merge is untouched and can still be aborted.
+    git.abort_merge()?;
+    assert!(git.run(&["status", "--porcelain"])?.trim().is_empty());
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn a_failed_commit_without_an_index_copy_says_so() -> Result<()> {
