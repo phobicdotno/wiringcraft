@@ -1589,21 +1589,17 @@ impl App {
         // A black box form changed and not applied yet is applied before the project is saved.
         // Why it was refused, or what to check after it went in, stays in the message the save
         // leaves.
-        let before = self.ed.message.clone();
         let refused = if saves_project(a) && !self.assistant.command_running() {
-            panels::apply_black_box_draft(open, &mut self.ed, &mut self.panels)
+            match panels::apply_black_box_draft(open, &mut self.ed, &mut self.panels) {
+                Ok(note) => note,
+                Err(r) => Some(r),
+            }
         } else {
             None
         };
-        let refused = match refused {
-            Some(r) => {
-                self.ed.message = r.clone();
-                Some(r)
-            }
-            // Applied with warnings: they are in the message.
-            None if self.ed.message != before => Some(self.ed.message.clone()),
-            None => None,
-        };
+        if let Some(r) = &refused {
+            self.ed.message = r.clone();
+        }
         match a {
             Action::Save if self.assistant.command_running() => {
                 self.ed.message = App::SAVE_WAITS.into();
@@ -7828,6 +7824,18 @@ mod nudge_tests {
         assert!(!app.open.as_ref().unwrap().dirty, "saved");
         assert!(app.ed.message.starts_with("Saved ("), "{}", app.ed.message);
         assert!(app.ed.message.contains("which moved"), "{}", app.ed.message);
+        // The point moved again, with the very same words already in the status line (as an
+        // Apply leaves them): the Save still says them.
+        let warning = app.ed.message.split_once(". ").unwrap().1.to_owned();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame)
+        });
+        let form = panels::black_box_form_mut(&mut app.panels).unwrap();
+        form.rows[0].offset = 10.0;
+        app.ed.message = warning.clone();
+        app.carry_out(Action::Save);
+        assert!(app.ed.message.starts_with("Saved ("), "{}", app.ed.message);
+        assert!(app.ed.message.ends_with(&warning), "{}", app.ed.message);
     }
 
     #[test]
@@ -7852,7 +7860,11 @@ mod nudge_tests {
         app.ed.panel = Some(panel);
         app.ed.panel_pick = Some(0);
         let items = |app: &App| app.open.as_ref().unwrap().project.panels[panel].items.len();
-        app.ed.panel_drag = Some((Point::new(100.0, 100.0), None, Point::new(0.0, 0.0)));
+        app.ed.panel_drag = Some((
+            Point::new(100.0, 100.0),
+            None,
+            app.open.as_ref().unwrap().project.panels[panel].items[0].clone(),
+        ));
         app.carry_out(Action::Delete);
         assert_eq!(items(&app), 1, "the held device stays");
         assert_eq!(app.ed.panel_pick, Some(0), "and stays picked");
