@@ -701,7 +701,9 @@ fn shapes(
             // viewports, which draw nothing themselves.
             "ATTDEF" | "VIEWPORT" => None,
             other => {
-                *skipped.entry(other.to_owned()).or_default() += 1;
+                // The kind is the file's own text, so it can name a key already counted in bulk.
+                let left_out = skipped.entry(other.to_owned()).or_default();
+                *left_out = left_out.saturating_add(1);
                 None
             }
         };
@@ -2348,6 +2350,17 @@ mod tests {
             "y flipped: the lower pin is further down"
         );
         assert_eq!(s.graphics.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn an_unread_kind_named_like_a_full_count_stays_full() -> Result<()> {
+        // An entity whose kind is the too-deep key, after that count reached usize::MAX.
+        let d = parse(&dxf(&format!("0\n{TOO_DEEP}\n"), ""))?;
+        let mut skipped = BTreeMap::from([(TOO_DEEP.to_owned(), usize::MAX)]);
+        let (shapes, _) = draw(&d, &d.entities, &mut skipped, &mut { MAX_DRAWN });
+        assert!(shapes.is_empty());
+        assert_eq!(skipped.get(TOO_DEEP), Some(&usize::MAX), "{skipped:?}");
         Ok(())
     }
 
