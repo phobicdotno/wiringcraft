@@ -1067,6 +1067,19 @@ fn e<E: std::fmt::Display>(err: E) -> String {
     err.to_string()
 }
 
+/// What a command says for a strip tag that no terminal on any page carries. Symbols without a
+/// readable vendored copy have no role, so a terminal drawn with one may not count: they are
+/// named, as a possible reason.
+fn no_strip(strip: &DeviceTag, unreadable: &[String]) -> String {
+    if unreadable.is_empty() {
+        return format!("no terminal strip {strip}");
+    }
+    format!(
+        "no terminal strip {strip} (these symbols have no readable vendored copy, and a terminal drawn with one may not count: {})",
+        escape_field(&unreadable.join(", "))
+    )
+}
+
 /// Says which pages stopped being the cover page when another one took the mark.
 fn cover_moved(ids: Vec<String>) {
     for id in ids {
@@ -1923,6 +1936,11 @@ fn run(cli: Cli) -> Res<()> {
             match jc {
                 JumperCmd::Add { strip, terminals } => {
                     let strip = DeviceTag::parse(&strip).map_err(e)?;
+                    let (symbols, unreadable) = store::vendored_symbols(dir, &p);
+                    let strips = wc_core::project::strip_terminals(&p, |id| symbols.get(id).map(|s| s.role));
+                    if !strips.contains_key(&strip) {
+                        return Err(no_strip(&strip, &unreadable));
+                    }
                     p.meta.add_jumper(&strip, &terminals)?;
                     save(dir, &p)?;
                 }
@@ -1966,7 +1984,7 @@ fn run(cli: Cli) -> Res<()> {
         }
         Cmd::Strip(sc) => {
             let mut p = load(dir)?;
-            let (symbols, _) = store::vendored_symbols(dir, &p);
+            let (symbols, unreadable) = store::vendored_symbols(dir, &p);
             let rail = |p: &Project, strip: &DeviceTag| -> Vec<(String, bool)> {
                 wc_core::project::strip_terminals(p, |id| symbols.get(id).map(|s| s.role))
                     .remove(strip)
@@ -1976,6 +1994,11 @@ fn run(cli: Cli) -> Res<()> {
                 StripCmd::List { strip } => {
                     let only = strip.map(|s| DeviceTag::parse(&s).map_err(e)).transpose()?;
                     let all = wc_core::project::strip_terminals(&p, |id| symbols.get(id).map(|s| s.role));
+                    if let Some(only) = &only
+                        && !all.contains_key(only)
+                    {
+                        return Err(no_strip(only, &unreadable));
+                    }
                     for (strip, list) in all {
                         if only.as_ref().is_some_and(|o| *o != strip) {
                             continue;
@@ -6524,11 +6547,31 @@ mod tests {
         assert!(cli(&dir, &["location", "set", "+L1-K1", "x"]).is_err());
     }
 
+    /// Draws terminals `-X1.1` to `-X1.5` on the first page, so the strip `-X1` exists.
+    fn draw_x1_terminals(dir: &Path) {
+        let mut p = load(dir).unwrap();
+        for k in 1..=5 {
+            p.pages[0].symbols.push(PlacedSymbol {
+                id: format!("x1t{k}"),
+                symbol: "wc.terminal".into(),
+                at: Point::new(10.0 * k as f64, 10.0),
+                rotation: Rotation::default(),
+                mirror: false,
+                tag: DeviceTag::parse(&format!("-X1.{k}")).ok(),
+            });
+        }
+        save(dir, &p).unwrap();
+    }
+
     #[test]
     fn jumpers_are_added_listed_and_removed_from_the_command_line() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("p");
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let err = cli(&dir, &["jumper", "add", "--", "-X1", "3", "4"]).unwrap_err();
+        assert_eq!(err, "no terminal strip -X1");
+        assert!(load(&dir).unwrap().meta.jumpers.is_empty());
+        draw_x1_terminals(&dir);
         cli(&dir, &["jumper", "add", "--", "-X1", "3", "4"]).unwrap();
         let x1 = DeviceTag::parse("-X1").unwrap();
         let saved = load(&dir).unwrap().meta.jumpers;
@@ -6587,6 +6630,31 @@ mod tests {
         );
         assert!(cli(&dir, &["strip", "move", "--", "-X1", "3", "0"]).is_err());
         cli(&dir, &["strip", "list"]).unwrap();
+        cli(&dir, &["strip", "list", "--", "-X1"]).unwrap();
+        let err = cli(&dir, &["strip", "list", "--", "-X9"]).unwrap_err();
+        assert!(err.starts_with("no terminal strip -X9"), "{err}");
+        // A terminal whose symbol cannot be read does not count; the error says why.
+        let mut p = load(&dir).unwrap();
+        p.pages[0].symbols.push(PlacedSymbol {
+            id: "t9".into(),
+            symbol: "no.such.terminal".into(),
+            at: Point::new(90.0, 10.0),
+            rotation: Rotation::default(),
+            mirror: false,
+            // Tagged with its strip only: without the symbol's role it is not known as a terminal.
+            tag: DeviceTag::parse("-X9").ok(),
+        });
+        save(&dir, &p).unwrap();
+        let err = cli(&dir, &["strip", "list", "--", "-X9"]).unwrap_err();
+        assert!(
+            err.contains("no readable vendored copy") && err.contains("no.such.terminal"),
+            "{err}"
+        );
+        let err = cli(&dir, &["jumper", "add", "--", "-X9", "1", "2"]).unwrap_err();
+        assert!(err.contains("no.such.terminal"), "{err}");
+        let mut p = load(&dir).unwrap();
+        p.pages[0].symbols.retain(|s| s.id != "t9");
+        save(&dir, &p).unwrap();
         cli(&dir, &["strip", "unspare", "--", "-X1", "S2"]).unwrap();
         assert!(cli(&dir, &["strip", "unspare", "--", "-X1", "S2"]).is_err());
         // A device entry left behind (restored by hand) goes on a second unspare.
@@ -6634,6 +6702,7 @@ mod tests {
             reference: None,
         });
         save(&dir, &p).unwrap();
+        draw_x1_terminals(&dir);
         cli(&dir, &["jumper", "add", "--", "-X1", "3", "4"]).unwrap();
         let err = cli(&dir, &["jumper", "part", "--", "-X1", "9", "example.ex-tb-2-5"]).unwrap_err();
         assert!(err.contains("no jumper of -X1 has terminal 9"), "{err}");
