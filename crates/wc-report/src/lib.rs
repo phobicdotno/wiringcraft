@@ -307,8 +307,12 @@ fn markdown_cell(s: &str) -> String {
                     _ => break,
                 }
             }
-            for c in body.chars() {
-                if matches!(c, '\\' | '|') {
+            // A `\` stays as typed, as a viewer shows it and keeps it in the link, except
+            // before a `|` or at the end of the link, where it is doubled so the table stays whole.
+            let mut chars = body.chars().peekable();
+            while let Some(c) = chars.next() {
+                let next = chars.peek().copied();
+                if c == '|' || (c == '\\' && matches!(next, None | Some('|'))) {
                     out.push('\\');
                 }
                 out.push(c);

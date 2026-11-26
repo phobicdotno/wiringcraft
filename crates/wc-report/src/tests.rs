@@ -3205,3 +3205,17 @@ fn markdown_cells_escape_words_that_only_look_like_links() {
          | https://example.com/a_b. www.a\\_b.no |\n"
     );
 }
+
+#[test]
+fn markdown_cells_keep_backslashes_in_links_as_typed() {
+    let mut t = Table::new("Links", &["Text"]);
+    t.rows.push(vec!["https://example.com/a\\b".into()]);
+    t.rows
+        .push(vec!["https://example.com/a\\|b https://example.com/c\\".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Links\n\n| Text |\n|---|\n\
+         | https://example.com/a\\b |\n\
+         | https://example.com/a\\\\\\|b https://example.com/c\\\\ |\n"
+    );
+}
