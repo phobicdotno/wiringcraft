@@ -3876,6 +3876,9 @@ pub(crate) mod tests {
     }
 
     #[test]
+    // Unix only: Windows takes `..` back by the text of a path (so does `std::path::absolute`
+    // there), so `document\..\copy` is the folder `copy`, as Windows itself reads it.
+    #[cfg(unix)]
     fn save_as_through_a_file_is_refused_and_writes_nothing() {
         let (tmp, mut o) = project();
         std::fs::write(tmp.path().join("document"), "text").unwrap();
