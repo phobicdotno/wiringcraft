@@ -44,6 +44,12 @@ pub const MAX_BEACON: usize = 2048 + 64;
 /// The rest wait for the next poll.
 pub(crate) const MAX_PER_POLL: usize = 256;
 
+/// The most sessions a [`Browser`] lists at once. A beacon from a session not already listed
+/// is ignored while the list is full, until older sessions are forgotten, so a device sending
+/// beacons for many ports or from many addresses cannot grow the list without bound. Sessions
+/// already listed keep being refreshed.
+pub(crate) const MAX_SESSIONS: usize = 256;
+
 /// What a host announces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Beacon {
@@ -230,7 +236,14 @@ impl Browser {
                             addr,
                             protocol: b.protocol,
                         };
-                        self.heard.insert(addr, (s, Instant::now()));
+                        let now = Instant::now();
+                        if !self.heard.contains_key(&addr) && self.heard.len() >= MAX_SESSIONS {
+                            self.forget_silent(now);
+                            if self.heard.len() >= MAX_SESSIONS {
+                                continue;
+                            }
+                        }
+                        self.heard.insert(addr, (s, now));
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -249,11 +262,15 @@ impl Browser {
     pub fn poll(&mut self) -> Result<Vec<Session>> {
         let socket = self.socket.try_clone()?;
         self.receive(|buf| socket.recv_from(buf))?;
-        let now = Instant::now();
-        let keep = self.forget_after;
-        self.heard.retain(|_, (_, at)| now.duration_since(*at) <= keep);
+        self.forget_silent(Instant::now());
         let mut list: Vec<Session> = self.heard.values().map(|(s, _)| s.clone()).collect();
         list.sort_by(|a, b| (&a.project, &a.host, a.addr).cmp(&(&b.project, &b.host, b.addr)));
         Ok(list)
+    }
+
+    /// Drop the sessions not heard from within the timeout.
+    fn forget_silent(&mut self, now: Instant) {
+        let keep = self.forget_after;
+        self.heard.retain(|_, (_, at)| now.duration_since(*at) <= keep);
     }
 }
