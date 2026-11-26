@@ -843,7 +843,8 @@ fn net_names(i: &Inputs) -> (Vec<connectivity::Net>, BTreeMap<PinRef, String>) {
 
 /// Wire list: every drawn wire with both ends, then its cross-section, colour and type. A free
 /// end is reported as a junction point. Each row links to the page the wire is drawn on
-/// ([`Table::row_pages`]).
+/// ([`Table::row_pages`]). Overview pages (`Page::overview`) are skipped, because an overview
+/// draws the schematic's connections again and would list each wire twice.
 pub fn wire_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new(
         "Wire list",
@@ -860,7 +861,8 @@ pub fn wire_list(i: &Inputs<'_>) -> Table {
         ],
     );
     let (_, net_of) = net_names(i);
-    for page in &i.project.pages {
+    // An overview (line diagram) draws connections again; the list shows each wire once.
+    for page in i.project.pages.iter().filter(|pg| !pg.overview) {
         for w in &page.wires {
             let end = |e: &Endpoint| match e {
                 Endpoint::Pin { item, pin } => pin_label(i.project, &page.id, item, pin),
@@ -900,7 +902,9 @@ fn cable_core_label(c: &wc_core::CableCore) -> String {
 }
 
 /// Cable list: every cable with its type, then one row per core with the wire's two ends. Each
-/// row links to the page its core is drawn on ([`Table::row_pages`]).
+/// row links to the page its core is drawn on ([`Table::row_pages`]). Overview pages
+/// (`Page::overview`) are skipped, because an overview draws the schematic's connections again
+/// and would list each core twice.
 pub fn cable_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new(
         "Cable list",
@@ -909,7 +913,8 @@ pub fn cable_list(i: &Inputs<'_>) -> Table {
     /// A core's row: core, page number, from, to, and the page id its row links to.
     type Core = (String, String, String, String, String);
     let mut cores: BTreeMap<DeviceTag, Vec<Core>> = BTreeMap::new();
-    for page in &i.project.pages {
+    // Overview pages repeat the schematic's cables; each core is listed once.
+    for page in i.project.pages.iter().filter(|pg| !pg.overview) {
         for w in &page.wires {
             let Some(c) = &w.cable else { continue };
             let end = |e: &Endpoint| match e {
