@@ -378,3 +378,22 @@ fn a_linked_worktree_leaves_the_lock_out_too() -> Result<()> {
     assert!(git_out(&wt, &["status", "--porcelain"])?.is_empty());
     Ok(())
 }
+
+#[test]
+fn an_exclude_list_that_cannot_be_read_is_reported_and_left_alone() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    store::create(dir, "Demo")?;
+    let git = Git::new(dir);
+    git.init()?;
+    let exclude = dir.join(".git/info/exclude");
+    std::fs::remove_file(&exclude).map_err(|e| wc_core::Error::io("rm", e))?;
+    // A folder where the file belongs: reading it fails with a reason other than "missing".
+    std::fs::create_dir(&exclude).map_err(|e| wc_core::Error::io("mkdir", e))?;
+    let Err(Error::Io { path, .. }) = git.exclude_locally("other.lock") else {
+        unreachable!("an unreadable exclude list is an error");
+    };
+    assert!(path.ends_with("exclude"), "{path}");
+    assert!(exclude.is_dir(), "left as it was");
+    Ok(())
+}

@@ -1744,15 +1744,21 @@ fn rules_list(p: &Project, library: &[wc_core::check_rule::RuleSet], json: bool)
 /// The rules in `file` for `rules set`, in order, each as the check runs it: `[[rule]]`
 /// tables, or a JSON list (or `{"rules": [...]}`) for a `.json` name; `-` is TOML on stdin.
 /// `stdin` is what was read from standard input for `-`, when it already was.
-fn rules_from_file(file: &Path, stdin: Option<String>) -> Res<Vec<wc_core::check_rule::CheckRule>> {
-    use wc_core::check_rule::{CheckRule, check_rule, parse_rules};
-    let text = if file.as_os_str() == "-" {
-        match stdin {
-            Some(text) => text,
-            None => std::io::read_to_string(std::io::stdin()).map_err(|err| format!("stdin: {err}"))?,
-        }
+/// The text of an input file named on the command line, `-` meaning stdin.
+fn read_input(file: &Path) -> Res<String> {
+    if file.as_os_str() == "-" {
+        std::io::read_to_string(std::io::stdin()).map_err(|err| format!("stdin: {err}"))
     } else {
-        std::fs::read_to_string(file).map_err(|err| format!("{}: {err}", file.display()))?
+        std::fs::read_to_string(file).map_err(|err| format!("{}: {err}", file.display()))
+    }
+}
+
+/// The rules in `file`, from `input` (its text, read already) when given.
+fn rules_from_file(file: &Path, input: Option<String>) -> Res<Vec<wc_core::check_rule::CheckRule>> {
+    use wc_core::check_rule::{CheckRule, check_rule, parse_rules};
+    let text = match input {
+        Some(text) => text,
+        None => read_input(file)?,
     };
     let json = file.extension().is_some_and(|x| x.eq_ignore_ascii_case("json"));
     let rules: Vec<CheckRule> = if json {
@@ -1851,13 +1857,12 @@ fn run(cli: Cli) -> Res<()> {
     let dir = cli.project.as_path();
     // One command at a time on a project: a second run waits, so it reads what the first one
     // wrote instead of overwriting it with an edit planned from the old files (#610).
-    // Input on stdin is read before the lock is taken: in a pipe from another command on the
-    // same project, waiting for the lock before reading would hold both up for good.
-    let mut stdin_text = match &cli.cmd {
-        Cmd::Rules(RulesCmd::Set { file }) | Cmd::ReportLayout(ReportLayoutCmd::Set { file, .. })
-            if file.as_os_str() == "-" =>
-        {
-            Some(std::io::read_to_string(std::io::stdin()).map_err(|err| format!("stdin: {err}"))?)
+    // An input file (or stdin) is read before the lock is taken: fed by another command on the
+    // same project, through a pipe or a named FIFO, waiting for the lock before reading would
+    // hold both up for good.
+    let mut input_text = match &cli.cmd {
+        Cmd::Rules(RulesCmd::Set { file }) | Cmd::ReportLayout(ReportLayoutCmd::Set { file, .. }) => {
+            Some(read_input(file)?)
         }
         _ => None,
     };
@@ -2637,7 +2642,7 @@ fn run(cli: Cli) -> Res<()> {
                     print!("{text}");
                 }
                 RulesCmd::Set { file } => {
-                    let rules = rules_from_file(&file, stdin_text.take())?;
+                    let rules = rules_from_file(&file, input_text.take())?;
                     let n = rules.len();
                     if rules != p.meta.rules {
                         p.meta.rules = rules;
@@ -2770,7 +2775,7 @@ fn run(cli: Cli) -> Res<()> {
                 }
             }
         }
-        Cmd::ReportLayout(rc) => report_layout(dir, rc, stdin_text.take())?,
+        Cmd::ReportLayout(rc) => report_layout(dir, rc, input_text.take())?,
         Cmd::Jumper(jc) => {
             let mut p = load(dir)?;
             match jc {
@@ -4366,7 +4371,7 @@ fn report_kinds(names: &[String]) -> Result<Vec<wc_report::Kind>, String> {
 /// `wiringcraft report-layout`: print, replace or reset report layouts, keeping them as the
 /// report layout dialog and the assistant's `report_layouts` tool do. `stdin` is what was read
 /// from standard input for `set <kind> -`, when it already was.
-fn report_layout(dir: &Path, cmd: ReportLayoutCmd, stdin: Option<String>) -> Res<()> {
+fn report_layout(dir: &Path, cmd: ReportLayoutCmd, input: Option<String>) -> Res<()> {
     use wc_core::report_layout::ReportLayout;
     let one = |name: &str| -> Res<wc_report::Kind> {
         match report_kinds(&[name.to_owned()])?.as_slice() {
@@ -4434,12 +4439,9 @@ fn report_layout(dir: &Path, cmd: ReportLayoutCmd, stdin: Option<String>) -> Res
         }
         ReportLayoutCmd::Set { kind, file } => {
             let kind = one(&kind)?;
-            let text = match stdin {
-                Some(text) if file.as_os_str() == "-" => text,
-                _ if file.as_os_str() == "-" => {
-                    std::io::read_to_string(std::io::stdin()).map_err(|err| format!("stdin: {err}"))?
-                }
-                _ => std::fs::read_to_string(&file).map_err(|err| format!("{}: {err}", file.display()))?,
+            let text = match input {
+                Some(text) => text,
+                None => read_input(&file)?,
             };
             let name = if file.as_os_str() == "-" {
                 "stdin".to_owned()

@@ -161,3 +161,67 @@ fn hook_commit_ends(relative: bool) -> TestResult {
     assert!(marker.exists(), "the hook ran wiringcraft");
     Ok(())
 }
+
+/// A named input file is read before the lock too: fed through a FIFO by a writer that cannot
+/// get through until the command opens and reads it.
+#[cfg(unix)]
+#[test]
+fn a_command_reads_a_named_fifo_before_it_waits_for_the_lock() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    new_project(&dir)?;
+    let fifo = tmp.path().join("rules.fifo");
+    assert!(Command::new("mkfifo").arg(&fifo).status()?.success());
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(".wiringcraft.lock"))?;
+    lock.lock()?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("-C")
+        .arg(&dir)
+        .args(["rules", "set"])
+        .arg(&fifo)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let writer = {
+        let fifo = fifo.clone();
+        std::thread::spawn(move || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&fifo)?
+                .write_all(b"[[rule]]\nkind = \"max-wires\"\nmax = 2\n")
+        })
+    };
+    let start = Instant::now();
+    while !writer.is_finished() && start.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let read_first = writer.is_finished();
+    let waits = !ends_within(&mut child, Duration::from_millis(300))?;
+    lock.unlock()?;
+    let ended = ends_within(&mut child, Duration::from_secs(20))?;
+    if !ended {
+        child.kill()?;
+    }
+    let out = child.wait_with_output()?;
+    if !writer.is_finished() {
+        // Unblock a writer still waiting for a reader, so the test ends.
+        drop(std::fs::File::open(&fifo));
+    }
+    let written = writer.join();
+    assert!(read_first, "the FIFO is read before the lock is taken");
+    assert!(waits, "it waits for the lock");
+    assert!(ended, "it runs once the lock is free");
+    let Ok(Ok(())) = written else {
+        unreachable!("the input was written");
+    };
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    let toml = std::fs::read_to_string(dir.join("project.toml"))?;
+    assert!(toml.contains("max-wires"), "{toml}");
+    Ok(())
+}
