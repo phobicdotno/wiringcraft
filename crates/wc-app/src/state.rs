@@ -3064,7 +3064,15 @@ impl Open {
     /// is recorded when the file is the same. Returns the file written.
     pub fn save_macro_form(&mut self, form: &crate::macro_form::Form) -> Result<PathBuf, String> {
         let read = |p: &Path| std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()));
-        let before = read(&form.path)?;
+        // A file waiting to be repaired holds the wrong text: Undo, or a change taken back,
+        // goes back to what the project needs it to hold.
+        let rel = form.path.strip_prefix(&self.dir).unwrap_or(&form.path);
+        let before = match self.unwritten_files.get(rel) {
+            Some(Some(bytes)) => {
+                String::from_utf8(bytes.clone()).map_err(|e| format!("{}: {e}", form.path.display()))?
+            }
+            _ => read(&form.path)?,
+        };
         let path = form.save()?;
         self.written_on_purpose(&path);
         let after = read(&path)?;
@@ -4260,6 +4268,40 @@ pub(crate) mod tests {
         assert_eq!(o.unwritten_files.values().next(), Some(&Some(two.clone().into_bytes())));
         o.stale_symbol_files.clear();
         o.fail_symbol_writes = Default::default();
+        o.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), two);
+    }
+
+    #[test]
+    fn a_macro_saved_while_it_waits_for_a_repair_is_taken_back_to_the_repair() {
+        let (_tmp, mut o, path, [_, one, two]) = macro_edited_twice();
+        let symbol = o.project.lock.symbols.keys().next().unwrap().clone();
+        // A failed Undo leaves the macro as "one" while the project needs "two".
+        o.stale_symbol_files.insert(symbol);
+        o.fail_symbol_writes = [true].into();
+        fail_restores(&path, 1);
+        assert!(!o.undo());
+        assert!(o.take_undo_error().is_some());
+        let_restores_through();
+        o.stale_symbol_files.clear();
+        o.fail_symbol_writes = Default::default();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), one);
+        // A turn saves the macro, then is taken back: the file goes back to "two".
+        let m = o.mark();
+        let mut form = crate::macro_form::Form::open(&path).unwrap();
+        form.description = "Turn".into();
+        o.save_macro_form(&form).unwrap();
+        assert!(o.unwritten_files.is_empty());
+        o.back_to(m).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), two);
+        // The same when the write back fails: "two" waits for the next Save.
+        let m = o.mark();
+        let mut form = crate::macro_form::Form::open(&path).unwrap();
+        form.description = "Turn again".into();
+        o.save_macro_form(&form).unwrap();
+        fail_restores(&path, 0);
+        assert!(o.back_to(m).is_err());
+        let_restores_through();
         o.save().unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), two);
     }
