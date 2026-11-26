@@ -1043,6 +1043,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
         ed.wire = None;
         ed.shape_points.clear();
         ed.black_box = None;
+        ed.place_turn = (Rotation::R0, false);
     }
     leave_unpickable_layer(ed);
 

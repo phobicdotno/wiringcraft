@@ -1263,6 +1263,11 @@ impl App {
     fn run(&mut self, a: Action) {
         let earlier = self.pending.take();
         self.carry_out(a);
+        // The turn for the symbol on the pointer belongs to the place tool: an action that
+        // leaves it sets the turn back, also before the canvas is next drawn.
+        if self.ed.tool != Tool::Place {
+            self.ed.place_turn = (wc_core::geom::Rotation::R0, false);
+        }
         match (earlier, self.pending.is_some()) {
             (Some(e), true) => {
                 self.pending = Some(e);

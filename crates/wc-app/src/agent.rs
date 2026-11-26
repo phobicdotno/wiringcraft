@@ -3989,6 +3989,20 @@ mod tests {
         );
         assert_eq!(open.undo_steps(), steps, "no undo step");
         assert_eq!(a.ed.selection, vec![Selection::Symbol(sid)]);
+        // Choosing Place again keeps the turn.
+        a.run(Action::PlaceSymbol);
+        assert_eq!(a.ed.place_turn, (Rotation::R90, true));
+        // Select then Place in one frame, with no canvas drawn between, starts upright.
+        a.run(Action::Select);
+        a.run(Action::PlaceSymbol);
+        assert_eq!(a.ed.place_turn, (Rotation::R0, false));
+        let (rotation, mirror) = a.ed.place_turn;
+        let Some(open) = a.open.as_mut() else { unreachable!() };
+        let placed = open
+            .place_turned(0, "wc.coil", wc_core::Point::new(150.0, 60.0), rotation, mirror)
+            .unwrap();
+        let s = open.project.pages[0].symbols.iter().find(|s| s.id == placed).unwrap();
+        assert_eq!((s.rotation, s.mirror), (Rotation::R0, false));
     }
 
     /// A worker that ends only after far more polls than the old fixed bounds (1000) allowed
