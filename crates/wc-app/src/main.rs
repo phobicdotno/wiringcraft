@@ -1956,17 +1956,7 @@ impl App {
                 self.ed.finish_shape = true;
             }
             if i.key_pressed(Key::Escape) {
-                if self.ed.tool == Tool::BlackBox && self.ed.black_box.is_some() {
-                    self.ed.black_box = None;
-                    self.ed.message = black_box_tool::hint(None).into();
-                } else if !self.ed.shape_points.is_empty() {
-                    self.ed.shape_points.clear();
-                    self.ed.message = canvas::shape_hint(self.ed.tool, 0).into();
-                } else if self.ed.wire.is_some() {
-                    self.ed.wire = None;
-                } else {
-                    out.push(Action::Select);
-                }
+                out.extend(escape(&mut self.ed));
             }
         });
         out
@@ -4718,6 +4708,25 @@ fn report_table(ui: &mut egui::Ui, t: &wc_report::Table) {
         });
 }
 
+/// Escape in the editor: it cancels a black box, shape or wire in progress first; with nothing
+/// in progress the Select tool clears its selection, and another tool goes back to Select.
+fn escape(ed: &mut Editor) -> Option<Action> {
+    if ed.tool == Tool::BlackBox && ed.black_box.is_some() {
+        ed.black_box = None;
+        ed.message = black_box_tool::hint(None).into();
+    } else if !ed.shape_points.is_empty() {
+        ed.shape_points.clear();
+        ed.message = canvas::shape_hint(ed.tool, 0).into();
+    } else if ed.wire.is_some() {
+        ed.wire = None;
+    } else if ed.tool == Tool::Select && !ed.selection.is_empty() {
+        ed.selection.clear();
+    } else {
+        return Some(Action::Select);
+    }
+    None
+}
+
 /// A project's title-block fields as form rows: the standard fields first (empty when not
 /// set), then any others the project has.
 /// The Ctrl shortcuts pressed this frame, none while a dialog is open.
@@ -6802,6 +6811,27 @@ fn side_name(side: wc_core::BoxSide) -> &'static str {
 #[cfg(test)]
 mod held_tests {
     use super::*;
+
+    #[test]
+    fn escape_cancels_what_is_in_progress_then_clears_the_selection() {
+        let sym = || Selection::Symbol("s1".into());
+        // Another tool: Escape goes back to Select and keeps the selection.
+        let mut ed = Editor::default();
+        ed.tool = Tool::Line;
+        ed.selection = vec![sym()];
+        assert_eq!(escape(&mut ed), Some(Action::Select));
+        assert_eq!(ed.selection, [sym()]);
+        // A shape in progress is cancelled first, nothing else changes.
+        ed.shape_points = vec![wc_core::Point::new(0.0, 0.0)];
+        assert_eq!(escape(&mut ed), None);
+        assert!(ed.shape_points.is_empty());
+        assert_eq!(ed.selection, [sym()]);
+        // The Select tool with a selection: Escape clears it; once more, nothing is left to do.
+        ed.tool = Tool::Select;
+        assert_eq!(escape(&mut ed), None);
+        assert!(ed.selection.is_empty());
+        assert_eq!(escape(&mut ed), Some(Action::Select));
+    }
 
     #[test]
     fn rotate_on_a_panel_is_not_held_by_the_page_under_it() {
