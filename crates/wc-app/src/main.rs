@@ -5315,6 +5315,10 @@ impl eframe::App for App {
         for a in page_actions {
             self.run(a);
         }
+        // A command picked in the canvas right-click menu, run as its toolbar button would be.
+        if let Some(a) = self.ed.menu_action.take() {
+            self.run(a);
+        }
         // The picker opens on the next frame, outside the panel that asked for it.
         if let Some((kind, part)) = self.ed.ask_attach.take() {
             self.queue(Pending::Attach(kind, part));
