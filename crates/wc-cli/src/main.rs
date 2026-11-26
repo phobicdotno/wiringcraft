@@ -8887,7 +8887,12 @@ mod tests {
         assert!(cli(&dir, &["box-edit", "p1", "s1", "--size=10,-1"]).is_err());
         assert!(cli(&dir, &["box-edit", "p1", "s1", "--rename", "IN=Z", "--rename", "Q=Z"]).is_err());
         assert!(cli(&dir, &["box-edit", "p1", "w1", "--size", "5,5"]).is_err());
-        // A point kept under its own name must be in the new list too.
+        assert_eq!(layout(), before);
+        assert_eq!(load(&dir).unwrap().page("p1").unwrap().wires.len(), 3);
+        // A point kept under its own name must be in the new list too: else its wire would be
+        // cut loose. Refused, and not a byte of the project changes.
+        cli(&dir, &["wire", "p1", "s1:A", "0,0"]).unwrap();
+        let files = snapshot_project(&dir, &[], &[]).unwrap();
         let args = [
             "box-edit",
             "p1",
@@ -8900,8 +8905,10 @@ mod tests {
             "Q:right:5",
         ];
         assert!(cli(&dir, &args).is_err());
+        for (path, was) in &files {
+            assert_eq!(std::fs::read(path).ok(), *was, "{} unchanged", path.display());
+        }
         assert_eq!(layout(), before);
-        assert_eq!(load(&dir).unwrap().page("p1").unwrap().wires.len(), 3);
         // A swap of two names is fine: each wire follows its point.
         cli(&dir, &["box-edit", "p1", "s1", "--rename", "IN=Q", "--rename", "Q=IN"]).unwrap();
         let names: Vec<String> = layout().2.into_iter().map(|b| b.name).collect();
