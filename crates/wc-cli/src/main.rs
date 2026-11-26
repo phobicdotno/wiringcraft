@@ -1812,9 +1812,38 @@ impl Cmd {
     }
 }
 
+/// The most [`spool_inputs`] copies of one stream that no importer limit applies to: the
+/// operand is refused when it has more. A stream without an end (`/dev/zero`, a FIFO whose
+/// writer never stops) would otherwise hold the command up until the temporary folder is
+/// full. Above every limit an importer has for what it unpacks, so an archive it would read
+/// from a file is read from a stream too. Regular files are not copied and have no such limit.
+const MAX_SPOOLED_BYTES: u64 = 4 << 30;
+
+/// How much of one stream [`spool_inputs_within`] copies at most.
+#[derive(Clone, Copy)]
+struct SpoolLimits {
+    /// A SolidWorks Electrical database given to `import swe` as it is, not in an archive.
+    database: u64,
+    /// Any other stream, but an `import symbol-qet` element, which has the importer's limit.
+    stream: u64,
+}
+
+/// [`spool_inputs_within`] the limits the commands have: every copy has one.
+fn spool_inputs(cmd: &mut Cmd) -> Res<Option<tempfile::TempDir>> {
+    let limits = SpoolLimits {
+        database: wc_import::swe::MAX_DATABASE_BYTES,
+        stream: MAX_SPOOLED_BYTES,
+    };
+    spool_inputs_within(cmd, limits)
+}
+
 /// Copy every input of `cmd` that is not a regular file (a FIFO, a character device) into a
 /// private temporary folder, under the name it has, and point the command at the copy (no
-/// more of it than the importer reads). An input named again, under the same or another name,
+/// more of it than the importer reads). Every copy is bounded: an `import symbol-qet` element
+/// is cut one byte over the importer's limit, which then refuses that element as too large; a
+/// database for `import swe` (a stream that starts with the SQLite header) larger than
+/// `limits.database`, and any other stream larger than `limits.stream`, is refused here, by
+/// the name the operand has. An input named again, under the same or another name,
 /// is read once: each operand gets the same bytes in a folder of its own, under its own name,
 /// as an importer may take an id from the name. Called
 /// before the project lock is taken: a FIFO that another command on the same project fills
@@ -1825,17 +1854,18 @@ impl Cmd {
 /// earlier element has. On Unix the `.edb` folder an
 /// Eplan `.elk` stream names stays beside its copy, as a link to the one beside the operand.
 /// The copies are removed when the returned folder is dropped; `None` when nothing was copied.
-fn spool_inputs(cmd: &mut Cmd) -> Res<Option<tempfile::TempDir>> {
-    use std::io::Read;
+fn spool_inputs_within(cmd: &mut Cmd, limits: SpoolLimits) -> Res<Option<tempfile::TempDir>> {
+    use std::io::{Read, Write};
+    // A database is told from an archive by its first bytes, as the importer does.
+    const SQLITE: &[u8] = b"SQLite format 3\0";
     #[cfg(unix)]
     let eplan = matches!(cmd, Cmd::Import(ImportCmd::Eplan { .. }));
+    // The first input of `import swe` is a database or an archive; its symbol map is neither.
+    let swe = matches!(cmd, Cmd::Import(ImportCmd::Swe { .. }));
     // An importer that reads no more than so much of its input gets no more than that: a
     // stream without an end (`/dev/zero`) would otherwise be copied until the disk is full.
     // One byte over the limit is kept, which is how the importer sees the input is too large.
-    let limit = match cmd {
-        Cmd::Import(ImportCmd::SymbolQet { .. }) => Some(wc_import::qet::MAX_LEN as u64 + 1),
-        _ => None,
-    };
+    let element = matches!(cmd, Cmd::Import(ImportCmd::SymbolQet { .. })).then_some(wc_import::qet::MAX_LEN as u64);
     let qet = match cmd {
         Cmd::Import(ImportCmd::SymbolQet { prefix, scale, .. }) => Some((prefix.clone(), *scale)),
         _ => None,
@@ -1896,11 +1926,27 @@ fn spool_inputs(cmd: &mut Cmd) -> Res<Option<tempfile::TempDir>> {
                 .map_err(at_copy)?;
         } else if let Some(from) = from {
             let mut to = std::fs::File::create(&copy).map_err(at_copy)?;
-            match limit {
-                Some(limit) => std::io::copy(&mut (&from).take(limit), &mut to),
-                None => std::io::copy(&mut &from, &mut to),
+            let mut head = Vec::new();
+            if swe && n == 0 {
+                (&from).take(SQLITE.len() as u64).read_to_end(&mut head).map_err(fail)?;
+                to.write_all(&head).map_err(at_copy)?;
             }
-            .map_err(fail)?;
+            // The most this copy may hold, and whether one byte more is refused here (with
+            // the importer's own words for a database) or left for the importer to refuse.
+            let (most, refused) = match element {
+                Some(most) => (most, None),
+                None if head == SQLITE => (limits.database, Some("")),
+                None => (limits.stream, Some("the stream ")),
+            };
+            let rest = most.saturating_add(1).saturating_sub(head.len() as u64);
+            let len = std::io::copy(&mut (&from).take(rest), &mut to).map_err(fail)? + head.len() as u64;
+            if let (true, Some(what)) = (len > most, refused) {
+                return Err(format!(
+                    "{}: {what}is larger than {} MB",
+                    escape_field(&path.display().to_string()),
+                    most >> 20
+                ));
+            }
             copied.push((same, copy.clone()));
         }
         #[cfg(unix)]
@@ -10193,15 +10239,167 @@ mod input_tests {
     /// [`spool_inputs`] on another thread, given twenty seconds: a copy that waits for a
     /// writer that never comes, or that has no end, fails the test instead of holding it up.
     #[cfg(unix)]
-    fn spooled(mut cli: Cli) -> (Vec<PathBuf>, Option<tempfile::TempDir>) {
+    fn spooled(cli: Cli) -> (Vec<PathBuf>, Option<tempfile::TempDir>) {
+        let limits = SpoolLimits {
+            database: wc_import::swe::MAX_DATABASE_BYTES,
+            stream: MAX_SPOOLED_BYTES,
+        };
+        let (inputs, spool) = spooled_within(cli, limits);
+        (inputs, spool.unwrap())
+    }
+
+    /// [`spooled`] with `limits` in place of the ones the commands have, and what it said.
+    #[cfg(unix)]
+    fn spooled_within(mut cli: Cli, limits: SpoolLimits) -> (Vec<PathBuf>, Res<Option<tempfile::TempDir>>) {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let spool = spool_inputs(&mut cli.cmd);
+            let spool = spool_inputs_within(&mut cli.cmd, limits);
             let inputs: Vec<PathBuf> = cli.cmd.inputs_mut().into_iter().map(|p| p.clone()).collect();
             let _ = tx.send((inputs, spool));
         });
-        let (inputs, spool) = rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap();
-        (inputs, spool.unwrap())
+        rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap()
+    }
+
+    /// Small limits for a test: a database of 64 KiB, any other stream of 1 MiB.
+    #[cfg(unix)]
+    const SMALL: SpoolLimits = SpoolLimits {
+        database: 1 << 16,
+        stream: 1 << 20,
+    };
+
+    /// One writer on another thread that opens the FIFO at `fifo` once and writes `head`, then
+    /// zeros until the reader is gone or `most` bytes are written. The bytes it wrote.
+    #[cfg(unix)]
+    fn endless_writer(
+        fifo: &Path,
+        head: &'static [u8],
+        most: u64,
+    ) -> std::thread::JoinHandle<(u64, std::io::Result<()>)> {
+        use std::io::Write;
+        let fifo = fifo.to_path_buf();
+        std::thread::spawn(move || {
+            let mut to = match std::fs::OpenOptions::new().write(true).open(&fifo) {
+                Ok(to) => to,
+                Err(x) => return (0, Err(x)),
+            };
+            let mut sent = 0;
+            let mut block: &[u8] = head;
+            while sent < most {
+                if let Err(x) = to.write_all(block) {
+                    return (sent, Err(x));
+                }
+                sent += block.len() as u64;
+                block = &[0; 4096];
+            }
+            (sent, Ok(()))
+        })
+    }
+
+    /// A database for `import swe` on a FIFO whose writer does not stop: the copy ends one
+    /// byte over the database limit, well under the limit of other streams, and the command
+    /// is refused with the importer's words for a database that is too large.
+    #[cfg(unix)]
+    #[test]
+    fn an_endless_swe_database_stream_is_refused_as_too_large() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("plant.db");
+        mkfifo(&fifo);
+        let writer = endless_writer(&fifo, b"SQLite format 3\0", 8 << 20);
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "swe".as_ref(),
+            fifo.as_os_str(),
+        ])
+        .unwrap();
+        let (_, spool) = spooled_within(cli, SMALL);
+        let why = spool.map(|_| ()).unwrap_err();
+        assert_eq!(why, format!("{}: is larger than 0 MB", fifo.display()));
+        // The reader left: the writer was stopped, long before the limit of other streams.
+        let (sent, end) = writer.join().unwrap();
+        assert_eq!(end.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(sent < SMALL.stream, "{sent}");
+    }
+
+    /// The database limit is for a database only: an archive for `import swe` and its symbol
+    /// map, both larger than that on FIFOs that end, are copied whole.
+    #[cfg(unix)]
+    #[test]
+    fn a_finite_swe_archive_stream_and_its_symbol_map_are_copied_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (archive, map) = (tmp.path().join("plant.tewzip"), tmp.path().join("map.toml"));
+        mkfifo(&archive);
+        mkfifo(&map);
+        let len = SMALL.database as usize + 4096;
+        let mut zip = b"PK\x03\x04".to_vec();
+        zip.resize(len, 0);
+        // The header on the symbol map: only the first input is a database.
+        let mut text = b"SQLite format 3\0".to_vec();
+        text.resize(len, b'#');
+        let writers = [writer(&archive, zip.clone()), writer(&map, text.clone())];
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "swe".as_ref(),
+            archive.as_os_str(),
+            "--symbol-map".as_ref(),
+            map.as_os_str(),
+        ])
+        .unwrap();
+        let (inputs, spool) = spooled_within(cli, SMALL);
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+        let spool = spool.unwrap().unwrap();
+        assert_eq!(inputs.len(), 2);
+        assert!(inputs.iter().all(|i| i.starts_with(spool.path())), "{inputs:?}");
+        assert!(std::fs::read(&inputs[0]).unwrap() == zip);
+        assert!(std::fs::read(&inputs[1]).unwrap() == text);
+    }
+
+    /// A stream no importer limit applies to is refused when it has more than the limit for
+    /// every stream, by the name the operand has; a regular file larger than that is not
+    /// copied and not refused.
+    #[cfg(unix)]
+    #[test]
+    fn an_endless_stream_without_an_importer_limit_is_refused_by_its_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cli = Cli::try_parse_from(["wiringcraft", "import", "pdf", "/dev/zero"]).unwrap();
+        let (_, spool) = spooled_within(cli, SMALL);
+        assert_eq!(
+            spool.map(|_| ()).unwrap_err(),
+            "/dev/zero: the stream is larger than 1 MB"
+        );
+        // A database header does not make another command's input a database.
+        let fifo = tmp.path().join("plan.pdf");
+        mkfifo(&fifo);
+        let writer = endless_writer(&fifo, b"SQLite format 3\0", 8 << 20);
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "pdf".as_ref(),
+            fifo.as_os_str(),
+        ])
+        .unwrap();
+        let (_, spool) = spooled_within(cli, SMALL);
+        let why = spool.map(|_| ()).unwrap_err();
+        assert_eq!(why, format!("{}: the stream is larger than 1 MB", fifo.display()));
+        let (sent, end) = writer.join().unwrap();
+        assert_eq!(end.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(sent > SMALL.stream, "{sent}");
+
+        let file = tmp.path().join("large.pdf");
+        std::fs::write(&file, vec![0; SMALL.stream as usize + 4096]).unwrap();
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "pdf".as_ref(),
+            file.as_os_str(),
+        ])
+        .unwrap();
+        let (inputs, spool) = spooled_within(cli, SMALL);
+        assert!(spool.unwrap().is_none());
+        assert_eq!(inputs, [file]);
     }
 
     /// A FIFO made with `mkfifo` at `path`.
@@ -10451,7 +10649,7 @@ mod input_tests {
     }
 
     /// An element stream without an end is copied up to one byte over what the importer
-    /// reads, and refused by it as too large; another command's input has no such limit.
+    /// reads, and refused by it as too large: that element fails, the command does not.
     #[cfg(unix)]
     #[test]
     fn an_endless_element_stream_is_copied_up_to_the_limit() {
