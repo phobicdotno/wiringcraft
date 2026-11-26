@@ -293,15 +293,26 @@ impl Xf {
     /// stays apart; `outer`'s is taken off this one's origin.
     fn then(&self, outer: &Xf) -> Xf {
         let (a, b) = (&outer.m, &self.m);
+        let mut at = outer.apply(self.at.0, self.at.1);
+        let mut base = self.base;
+        if !(at.0.is_finite() && at.1.is_finite()) {
+            // This origin is past the numbers once placed: with this base point taken off it
+            // first, the far base point and origin may cancel and keep it in range.
+            let (bx, by) = base;
+            let folded = outer.apply(self.at.0 - (b[0] * bx + b[1] * by), self.at.1 - (b[2] * bx + b[3] * by));
+            if folded.0.is_finite() && folded.1.is_finite() {
+                (at, base) = (folded, (0.0, 0.0));
+            }
+        }
         Xf {
-            base: self.base,
+            base,
             m: [
                 a[0] * b[0] + a[1] * b[2],
                 a[0] * b[1] + a[1] * b[3],
                 a[2] * b[0] + a[3] * b[2],
                 a[2] * b[1] + a[3] * b[3],
             ],
-            at: outer.apply(self.at.0, self.at.1),
+            at,
             rot: self.rot + outer.rot,
         }
     }
@@ -4437,6 +4448,24 @@ mod tests {
             [Shape::Line {
                 a: Point::new(-1e308, 0.0),
                 b: Point::new(-1e308, -2.0)
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_far_block_inside_a_far_block_is_drawn() -> Result<()> {
+        // OUTER's base point is far out one way, INNER's origin and base point far out the
+        // other: placed one after the other they cancel, and the line lands at x = 0.
+        let blocks = "0\nBLOCK\n2\nINNER\n10\n-1e308\n20\n0\n0\nLINE\n10\n1e308\n20\n0\n11\n1e308\n21\n1\n0\nENDBLK\n\
+                      0\nBLOCK\n2\nOUTER\n10\n1e308\n20\n0\n0\nINSERT\n2\nINNER\n10\n-1e308\n20\n0\n0\nENDBLK\n";
+        let (g, skipped) = drawn("0\nINSERT\n2\nOUTER\n10\n0\n20\n0\n", blocks)?;
+        assert_eq!(skipped.get(LINE_NOT_NUMBERS), None, "{skipped:?}");
+        assert_eq!(
+            g,
+            [Shape::Line {
+                a: Point::new(0.0, 0.0),
+                b: Point::new(0.0, -1.0)
             }]
         );
         Ok(())
