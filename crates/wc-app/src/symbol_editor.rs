@@ -138,24 +138,39 @@ pub struct SymbolEditor {
 struct Drag {
     from: Point,
     item: Item,
-    /// A line end or rectangle corner being dragged (index into [`handles`]) instead of the
-    /// whole item.
+    /// A line end, rectangle corner, circle edge or arc end being dragged (index into
+    /// [`handles`]) instead of the whole item.
     handle: Option<usize>,
     before: Symbol,
 }
 
 /// The points of a shape that can be dragged on their own: a line's two ends, a rectangle's
-/// four corners (top-left, top-right, bottom-right, bottom-left).
+/// four corners (top-left, top-right, bottom-right, bottom-left), a circle's edge at angle 0,
+/// an arc's start and end.
 pub fn handles(shape: &Shape) -> Vec<Point> {
+    let on = |c: Point, r: f64, deg: f64| {
+        let a = deg.to_radians();
+        Point::new(c.x + r * a.cos(), c.y + r * a.sin())
+    };
     match shape {
         Shape::Line { a, b } => vec![*a, *b],
         Shape::Rect { min, max } => vec![*min, Point::new(max.x, min.y), *max, Point::new(min.x, max.y)],
+        Shape::Circle { center, radius, .. } => vec![on(*center, *radius, 0.0)],
+        Shape::Arc {
+            center,
+            radius,
+            start,
+            end,
+        } => vec![on(*center, *radius, *start), on(*center, *radius, *end)],
         _ => Vec::new(),
     }
 }
 
-/// `shape` with handle `k` moved to `to`. A rectangle keeps the opposite corner; nothing
-/// changes when the result would be a line of no length or a rectangle without area.
+/// `shape` with handle `k` moved to `to`. A rectangle keeps the opposite corner; a circle's
+/// radius becomes the distance from its centre to `to`, rounded to the grid; an arc's end
+/// turns to point at `to`, keeping the radius and the other end. Nothing changes when the
+/// result would be a line of no length, a rectangle without area, a circle of radius zero or
+/// an arc whose ends meet.
 fn with_handle(shape: &Shape, k: usize, to: Point) -> Option<Shape> {
     let new = match shape {
         Shape::Line { a, b } => match k {
@@ -172,6 +187,43 @@ fn with_handle(shape: &Shape, k: usize, to: Point) -> Option<Shape> {
             Shape::Rect {
                 min: Point::new(to.x.min(fixed.x), to.y.min(fixed.y)),
                 max: Point::new(to.x.max(fixed.x), to.y.max(fixed.y)),
+            }
+        }
+        Shape::Circle { center, filled, .. } => {
+            let d = ((to.x - center.x).powi(2) + (to.y - center.y).powi(2)).sqrt();
+            let radius = (d / SNAP).round() * SNAP;
+            if k != 0 || radius == 0.0 {
+                return None;
+            }
+            Shape::Circle {
+                center: *center,
+                radius,
+                filled: *filled,
+            }
+        }
+        Shape::Arc {
+            center,
+            radius,
+            start,
+            end,
+        } => {
+            if to == *center {
+                return None;
+            }
+            let a = angle(*center, to);
+            let (start, end) = match k {
+                0 => (a, *end),
+                1 => (*start, a),
+                _ => return None,
+            };
+            if start == end {
+                return None;
+            }
+            Shape::Arc {
+                center: *center,
+                radius: *radius,
+                start,
+                end,
             }
         }
         _ => return None,
@@ -559,7 +611,7 @@ impl SymbolEditor {
             return;
         }
         self.message.clear();
-        // A handle of the selected line or rectangle wins: it reshapes instead of moving.
+        // A handle of the selected shape wins: it reshapes instead of moving.
         if let Some(Item::Shape(i)) = self.selected
             && let Some(k) = self.symbol.graphics.get(i).and_then(|g| {
                 handles(g)
@@ -1582,6 +1634,86 @@ mod tests {
         e.undo();
         e.undo();
         assert_eq!(e.symbol, drawn, "each drag was one step");
+    }
+
+    #[test]
+    fn a_circle_edge_and_arc_ends_reshape_them() {
+        let c = Point::new(0.0, 0.0);
+        let circle = Shape::Circle {
+            center: c,
+            radius: 5.0,
+            filled: true,
+        };
+        assert_eq!(handles(&circle), [Point::new(5.0, 0.0)]);
+        // The radius is the distance to the point, on the grid; the fill stays.
+        assert_eq!(
+            with_handle(&circle, 0, Point::new(0.0, 7.6)),
+            Some(Shape::Circle {
+                center: c,
+                radius: 7.5,
+                filled: true
+            })
+        );
+        assert_eq!(with_handle(&circle, 0, Point::new(1.0, 0.0)), None, "radius zero");
+        assert_eq!(with_handle(&circle, 1, Point::new(5.0, 5.0)), None);
+
+        let arc = Shape::Arc {
+            center: c,
+            radius: 5.0,
+            start: 0.0,
+            end: 90.0,
+        };
+        let [s, e] = handles(&arc)[..] else { unreachable!() };
+        assert_eq!(s, Point::new(5.0, 0.0));
+        assert!((e.x).abs() < 1e-9 && (e.y - 5.0).abs() < 1e-9);
+        // Each end turns to the point; radius and the other end stay.
+        assert_eq!(
+            with_handle(&arc, 0, Point::new(-10.0, 0.0)),
+            Some(Shape::Arc {
+                center: c,
+                radius: 5.0,
+                start: 180.0,
+                end: 90.0
+            })
+        );
+        assert_eq!(
+            with_handle(&arc, 1, Point::new(0.0, -2.5)),
+            Some(Shape::Arc {
+                center: c,
+                radius: 5.0,
+                start: 0.0,
+                end: 270.0
+            })
+        );
+        assert_eq!(with_handle(&arc, 1, Point::new(2.5, 0.0)), None, "ends meet");
+        assert_eq!(with_handle(&arc, 0, c), None, "no direction");
+    }
+
+    #[test]
+    fn dragging_a_circle_edge_is_one_undo_step() {
+        let mut e = SymbolEditor::new(Vec::new());
+        e.set_tool(Tool::Circle);
+        e.click(Point::new(0.0, 0.0));
+        e.click(Point::new(5.0, 0.0));
+        let drawn = e.symbol.clone();
+        let steps = e.undo.len();
+        e.set_tool(Tool::Select);
+        e.selected = Some(Item::Shape(0));
+        e.start_drag(Point::new(5.0, 0.0));
+        e.drag_to(Point::new(10.1, 0.0));
+        e.drag_to(Point::new(0.0, 12.4));
+        e.end_drag();
+        assert_eq!(
+            e.symbol.graphics[0],
+            Shape::Circle {
+                center: Point::new(0.0, 0.0),
+                radius: 12.5,
+                filled: false
+            }
+        );
+        assert_eq!(e.undo.len(), steps + 1, "one drag is one step");
+        e.undo();
+        assert_eq!(e.symbol, drawn, "undo brings the old circle back");
     }
 
     #[test]
