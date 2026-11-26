@@ -2776,7 +2776,7 @@ fn run(cli: Cli) -> Res<()> {
                 save(dir, &p)?;
             }
             let (symbols, _) = store::vendored_symbols(dir, &p);
-            let parts = vendored_parts(dir, &p);
+            let parts = vendored_parts_warning_unreadable(dir, &p);
             let inputs = wc_report::Inputs {
                 project: &p,
                 symbols: &symbols,
@@ -4311,13 +4311,18 @@ fn edit_racks(racks: &mut Vec<wc_core::plc_rack::PlcRack>, cmd: RackCmd) -> Res<
                 if to.is_empty() {
                     return Err("a rack needs a name".into());
                 }
-                if to != new[i].name.trim() {
+                if new.get(i).is_some_and(|r| r.name.trim() != to) {
                     taken(&new, to)?;
                 }
-                new[i].name = to.to_owned();
+            }
+            let Some(r) = new.get_mut(i) else {
+                return Err(format!("there is no rack {}", escape_field(&name)));
+            };
+            if let Some(to) = new_name.as_deref().map(str::trim) {
+                r.name = to.to_owned();
             }
             if let Some(d) = description {
-                new[i].description = d.trim().to_owned();
+                r.description = d.trim().to_owned();
             }
         }
         RackCmd::Card(RackCardCmd::Add {
@@ -4330,8 +4335,11 @@ fn edit_racks(racks: &mut Vec<wc_core::plc_rack::PlcRack>, cmd: RackCmd) -> Res<
             step,
         }) => {
             let i = find(&new, &rack)?;
-            slot_free(&new[i], slot)?;
-            new[i].cards.push(PlcCard {
+            let Some(r) = new.get_mut(i) else {
+                return Err(format!("there is no rack {}", escape_field(&rack)));
+            };
+            slot_free(r, slot)?;
+            r.cards.push(PlcCard {
                 slot,
                 tag: tag.unwrap_or_default().trim().to_owned(),
                 kind: kind.unwrap_or_default().trim().to_owned(),
@@ -4353,12 +4361,20 @@ fn edit_racks(racks: &mut Vec<wc_core::plc_rack::PlcRack>, cmd: RackCmd) -> Res<
             no_step,
         }) => {
             let i = find(&new, &rack)?;
-            let c = card_at(&new[i], slot)?;
-            if let Some(to) = new_slot.filter(|&to| to != slot) {
-                slot_free(&new[i], to)?;
-                new[i].cards[c].slot = to;
+            let Some(r) = new.get_mut(i) else {
+                return Err(format!("there is no rack {}", escape_field(&rack)));
+            };
+            let c = card_at(r, slot)?;
+            let to = new_slot.filter(|&to| to != slot);
+            if let Some(to) = to {
+                slot_free(r, to)?;
             }
-            let card = &mut new[i].cards[c];
+            let Some(card) = r.cards.get_mut(c) else {
+                return Err(format!("rack {} has no card in slot {slot}", escape_field(&r.name)));
+            };
+            if let Some(to) = to {
+                card.slot = to;
+            }
             if let Some(t) = tag {
                 card.tag = t.trim().to_owned();
             }
@@ -4380,8 +4396,11 @@ fn edit_racks(racks: &mut Vec<wc_core::plc_rack::PlcRack>, cmd: RackCmd) -> Res<
         }
         RackCmd::Card(RackCardCmd::Remove { rack, slot }) => {
             let i = find(&new, &rack)?;
-            let c = card_at(&new[i], slot)?;
-            new[i].cards.remove(c);
+            let Some(r) = new.get_mut(i) else {
+                return Err(format!("there is no rack {}", escape_field(&rack)));
+            };
+            let c = card_at(r, slot)?;
+            r.cards.remove(c);
         }
     }
     if let Some(why) = wc_core::plc_rack::problem(&new) {
@@ -5221,6 +5240,26 @@ fn vendored_parts(dir: &Path, p: &wc_core::Project) -> std::collections::BTreeMa
         .into_iter()
         .filter_map(|id| store::read_vendored_part(dir, &id).ok().map(|part| (id, part)))
         .collect()
+}
+
+/// [`vendored_parts`], with a warning naming each used part that cannot be read and why, so
+/// the warnings worked out from the parts do not quietly leave it out.
+fn vendored_parts_warning_unreadable(
+    dir: &Path,
+    p: &wc_core::Project,
+) -> std::collections::BTreeMap<String, wc_core::Part> {
+    let mut parts = std::collections::BTreeMap::new();
+    for id in p.used_parts() {
+        match store::read_vendored_part(dir, &id) {
+            Ok(part) => {
+                parts.insert(id, part);
+            }
+            // The part id and the reason come from the project: escaped, so they cannot steer
+            // the terminal.
+            Err(err) => eprintln!("warning: {}", escape_field(&format!("cannot read part {id}: {err}"))),
+        }
+    }
+    parts
 }
 
 /// The upright size of the device `tag`'s part, if it has a part with a size. A part that
