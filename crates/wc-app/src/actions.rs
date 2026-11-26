@@ -34,6 +34,7 @@ pub enum Action {
     Copy,
     Cut,
     Paste,
+    Duplicate,
     SelectAll,
     Find,
     AddPage,
@@ -130,6 +131,7 @@ impl Action {
                 | Action::Mirror
                 | Action::Cut
                 | Action::Paste
+                | Action::Duplicate
         ) || self.edits_page_itself()
     }
 
@@ -173,6 +175,7 @@ impl Action {
         Action::Copy,
         Action::Cut,
         Action::Paste,
+        Action::Duplicate,
         Action::SelectAll,
         Action::Find,
         Action::AddPage,
@@ -394,6 +397,12 @@ impl Action {
                 "Paste at the pointer; devices get the next free tags",
                 Icon::Paste,
                 "Ctrl+V",
+            ),
+            Action::Duplicate => i(
+                "Duplicate",
+                "Put a copy of the selection one grid step down and right, selected so it can be moved; devices get the next free tags",
+                Icon::Copy,
+                "Ctrl+D",
             ),
             Action::SelectAll => i("Select all", "Select everything on this page", Icon::Select, "Ctrl+A"),
             Action::Find => i(

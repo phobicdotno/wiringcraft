@@ -505,7 +505,9 @@ impl chrome::Status for StatusView<'_> {
             Action::Undo => self.open.is_some_and(Open::can_undo),
             Action::Redo => self.open.is_some_and(Open::can_redo),
             Action::Delete if self.ed.panel.is_some() => has && self.ed.panel_pick.is_some(),
-            Action::Delete | Action::Copy | Action::Cut | Action::SaveMacro => has && !self.ed.selection.is_empty(),
+            Action::Delete | Action::Copy | Action::Cut | Action::Duplicate | Action::SaveMacro => {
+                has && !self.ed.selection.is_empty()
+            }
             Action::Rotate if self.ed.panel.is_some() => has && self.ed.panel_pick.is_some(),
             Action::Mirror if self.ed.panel.is_some() => false,
             Action::Rotate | Action::Mirror => {
@@ -1315,6 +1317,12 @@ impl App {
             self.ed.message = format!("{name} has this page open; it is read-only here until they leave it.");
             return;
         }
+        // The keys are held back while the symbol editor is open; the menu, toolbar and
+        // assistant are too, so the schematic does not change under the editor.
+        if a == Action::Duplicate && self.symbol_editor.is_some() {
+            self.ed.message = "Duplicate was not done: close the symbol editor first.".into();
+            return;
+        }
         if a == Action::ReportProblem {
             self.dialog = Some(Dialog::Report {
                 log: applog::tail(REPORT_LOG_BYTES),
@@ -1653,6 +1661,22 @@ impl App {
                     Err(e) => self.ed.message = format!("Nothing was pasted: {e}"),
                 }
             }
+            Action::Duplicate => {
+                // A copy one grid step down and right, through the paste (one undo step, next
+                // free tags), without touching the clipboard.
+                let clip = open.copy(page, &self.ed.selection);
+                let step = if self.prefs.snap > 0.0 { self.prefs.snap } else { 2.5 };
+                match open.paste(page, &clip, clip.anchor + wc_core::geom::Point::new(step, step)) {
+                    Ok(copies) if !copies.is_empty() => {
+                        let n = copies.len();
+                        self.ed.message = format!("Duplicated {n} {}.", if n == 1 { "item" } else { "items" });
+                        self.ed.tool = Tool::Select;
+                        self.ed.selection = copies;
+                    }
+                    Ok(_) => {}
+                    Err(e) => self.ed.message = format!("Nothing was duplicated: {e}"),
+                }
+            }
             Action::AddPage => {
                 self.ed.page = open.add_page();
                 self.ed.selection.clear();
@@ -1955,6 +1979,8 @@ impl App {
                 (Key::C, Action::CommentTool),
                 (Key::L, Action::LineTool),
                 (Key::Delete, Action::Delete),
+                // Mac laptop keyboards have no Delete key: their "delete" sends Backspace.
+                (Key::Backspace, Action::Delete),
                 (Key::G, Action::ToggleGrid),
                 (Key::F, Action::ZoomFit),
                 (Key::Plus, Action::ZoomIn),
@@ -1962,12 +1988,11 @@ impl App {
                 (Key::PageUp, Action::PrevPage),
                 (Key::PageDown, Action::NextPage),
             ] {
-                if i.key_pressed(k) && i.modifiers.is_none() {
+                if pressed_with(i, k, Modifiers::is_none) {
                     out.push(a);
                 }
             }
-            if i.key_pressed(Key::Enter)
-                && i.modifiers.is_none()
+            if pressed_with(i, Key::Enter, Modifiers::is_none)
                 && matches!(self.ed.tool, Tool::Polyline | Tool::BlackBox)
             {
                 self.ed.finish_shape = true;
@@ -4758,6 +4783,7 @@ fn ctrl_shortcuts(ctx: &egui::Context, dialog_open: bool) -> Vec<Action> {
             (Key::A, Action::SelectAll),
             (Key::F, Action::Find),
             (Key::J, Action::Assistant),
+            (Key::D, Action::Duplicate),
         ] {
             // With Shift first: Ctrl+Shift+N is a new project, Ctrl+Shift+Z redoes (a plain Ctrl
             // shortcut would also take them, as it lets Shift through).
@@ -4777,6 +4803,15 @@ fn ctrl_shortcuts(ctx: &egui::Context, dialog_open: bool) -> Vec<Action> {
         }
     });
     out
+}
+
+/// Whether `key` was pressed this frame with modifiers that `ok` accepts. It looks at the
+/// modifiers held at the press itself: the frame's modifiers can differ, as when Ctrl is let go
+/// before the frame runs, and Ctrl+R must not then rotate.
+fn pressed_with(i: &egui::InputState, key: Key, ok: impl Fn(&Modifiers) -> bool) -> bool {
+    i.events
+        .iter()
+        .any(|e| matches!(e, egui::Event::Key { key: k, pressed: true, modifiers, .. } if *k == key && ok(modifiers)))
 }
 
 fn form_fields(block: &std::collections::BTreeMap<String, String>) -> Vec<(String, String)> {
@@ -5461,6 +5496,7 @@ impl App {
                 Action::Cut
                 | Action::Copy
                 | Action::Paste
+                | Action::Duplicate
                 | Action::Rotate
                 | Action::Mirror
                 | Action::SelectAll
@@ -5838,7 +5874,8 @@ fn follow_panel_pick(ed: &mut Editor, project: &wc_core::Project, id: &str, tag:
 fn held_for(a: Action, ed: &Editor, project: &wc_core::Project) -> Option<String> {
     // With a panel shown these still work on the schematic page under it (Delete and Rotate go
     // to the panel's picked device instead), so they follow that page's hold.
-    let on_page_under_panel = ed.panel.is_some() && matches!(a, Action::Paste | Action::Cut | Action::Mirror);
+    let on_page_under_panel =
+        ed.panel.is_some() && matches!(a, Action::Paste | Action::Duplicate | Action::Cut | Action::Mirror);
     let name = if a.edits_page_itself() || on_page_under_panel {
         let page = project.pages.get(ed.page)?;
         // Moving a page up or down renumbers its neighbour too.

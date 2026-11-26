@@ -1,5 +1,6 @@
 {
   "category": "drives",
+  "description": "Three-phase motor with terminals U, V, W and protective earth.",
   "graphics": [
     {
       "a": {

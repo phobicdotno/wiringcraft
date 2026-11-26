@@ -2869,3 +2869,146 @@ fn plc_card_overview_links_by_page_id_and_warns_on_points_and_shared_bytes() {
     };
     assert!(!plc_rack_warnings(&i).iter().any(|w| w.contains("slot 3")));
 }
+
+#[test]
+fn rows_of_the_wire_cable_terminal_and_plc_lists_link_to_their_page() {
+    let (mut p, mut s, parts) = fixture();
+    let mut input = sym("wc.plc.input", SymbolRole::Standalone, &["I"]);
+    input.category = "plc".into();
+    input.name = "PLC digital input".into();
+    s.insert(input.id.clone(), input);
+    // A second page, numbered 7 with the id p7, with a terminal, a PLC input and a cable core.
+    let mut second = Page::new("p7", "7", "Field");
+    second.symbols = vec![
+        place("t1", "term", 10.0, Some("-X1.3")),
+        place("in1", "wc.plc.input", 40.0, Some("-A1.I1")),
+    ];
+    let mut core = wire("w20", pin("t1", "2"), pin("in1", "I"), Some("20"), None);
+    core.cable = Some(wc_core::CableCore {
+        cable: DeviceTag::parse("-W1").unwrap(),
+        core: "2".into(),
+    });
+    second.wires.push(core);
+    p.pages.push(second);
+    if let Some(w) = p.pages[0].wires.iter_mut().find(|w| w.id == "w2") {
+        w.cable = Some(wc_core::CableCore {
+            cable: DeviceTag::parse("-W1").unwrap(),
+            core: "1".into(),
+        });
+    }
+    p.meta.strips.push(wc_core::project::StripLayout {
+        strip: DeviceTag::parse("-X1").unwrap(),
+        spares: vec!["9".into()],
+        order: vec![],
+    });
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let id_of = |number: &str| p.pages.iter().find(|pg| pg.number == number).map(|pg| pg.id.clone());
+    for (kind, page_column) in [
+        (Kind::Wires, 0),
+        (Kind::Cables, 4),
+        (Kind::Terminals, 5),
+        (Kind::Plc, 5),
+    ] {
+        let t = build(kind, &i);
+        assert!(!t.rows.is_empty(), "{kind:?}");
+        for (n, row) in t.rows.iter().enumerate() {
+            let link = t.row_pages.get(n).cloned().unwrap_or_default();
+            let want = id_of(&row[page_column]).unwrap_or_default();
+            assert_eq!(link, want, "{kind:?} row {row:?}");
+        }
+        assert!(t.row_pages.iter().any(|l| l == "p7"), "{kind:?}");
+    }
+    // The spare terminal is on no page and links nowhere.
+    let t = build(Kind::Terminals, &i);
+    let spare = t.rows.iter().position(|r| r[5] == SPARE_PAGE).unwrap();
+    assert_eq!(t.row_pages.get(spare).map(String::as_str).unwrap_or(""), "");
+    // A sorted layout keeps each row's link with it.
+    let layout = ReportLayout {
+        sort: vec!["-Page".into()],
+        ..Default::default()
+    };
+    let sorted = build_with(Kind::Wires, &i, Some(&layout));
+    assert_eq!(sorted.rows[0][0], "7");
+    assert_eq!(sorted.row_pages[0], "p7");
+    assert_eq!(sorted.row_pages[1], "p2");
+}
+
+#[test]
+fn check_warns_about_panel_devices_that_overlap_stick_out_or_left_the_project() {
+    use wc_core::panel::Panel;
+    let (mut p, s, parts) = fixture();
+    let tag = |t: &str| {
+        let Ok(tag) = DeviceTag::parse(t) else { unreachable!() };
+        tag
+    };
+    let mut plate = Panel::new("p1", "Main", 400.0, 300.0);
+    let place = |plate: &mut Panel, t: &str, x: f64, y: f64, r: Rotation| {
+        let Ok(()) = plate.place_device(tag(t), Point::new(x, y), (40.0, 80.0), r) else {
+            unreachable!()
+        };
+    };
+    place(&mut plate, "=A+C1-K1", 100.0, 0.0, Rotation::R0);
+    // Turned, -X1.1 covers 80 x 40 from (60, 50): it overlaps -K1 (100..140 x 0..80).
+    place(&mut plate, "-X1.1", 60.0, 50.0, Rotation::R90);
+    // -P1 touches -K1's and -X1.1's right edges: a gap of 0 is no overlap.
+    place(&mut plate, "-P1", 140.0, 0.0, Rotation::R0);
+    // -X2 lies partly off the plate (as a hand-edited file can have it).
+    place(&mut plate, "-X2", 300.0, 200.0, Rotation::R0);
+    if let Some(wc_core::panel::PanelItem::Device { at, .. }) = plate.items.last_mut() {
+        *at = Point::new(380.0, 250.0);
+    }
+    // -K9 is drawn nowhere and has no device entry.
+    place(&mut plate, "-K9", 200.0, 100.0, Rotation::R0);
+    p.panels.push(plate);
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found: Vec<String> = check(&i)
+        .into_iter()
+        .filter(|f| f.message.starts_with("panel "))
+        .map(|f| f.message)
+        .collect();
+    let has = |m: &str| found.iter().any(|f| f == m);
+    assert!(has("panel Main: =A+C1-K1 and -X1.1 overlap"), "{found:?}");
+    assert!(has("panel Main: -X2 sticks out of the plate"), "{found:?}");
+    assert!(
+        has("panel Main: -K9 is on the plate but no longer in the project"),
+        "{found:?}"
+    );
+    assert_eq!(found.len(), 3, "{found:?}");
+}
+
+#[test]
+fn check_keeps_panel_devices_whose_tag_is_only_drawn_as_interruption_points() {
+    use wc_core::panel::Panel;
+    let (mut p, mut s, parts) = fixture();
+    let arrow = sym("arrow", SymbolRole::Interruption, &["1"]);
+    s.insert(arrow.id.clone(), arrow);
+    p.pages[0].symbols.push(place("s9", "arrow", 200.0, Some("-L1")));
+    let Ok(l1) = DeviceTag::parse("-L1") else {
+        unreachable!()
+    };
+    p.devices.entry(l1.clone()).or_default();
+    let mut plate = Panel::new("p1", "Main", 400.0, 300.0);
+    let Ok(()) = plate.place_device(l1, Point::new(10.0, 10.0), (40.0, 80.0), Rotation::R0) else {
+        unreachable!()
+    };
+    p.panels.push(plate);
+    let found: Vec<String> = check(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    })
+    .into_iter()
+    .map(|f| f.message)
+    .collect();
+    assert!(!found.iter().any(|m| m.starts_with("panel ")), "{found:?}");
+    // The tag still only names a connection, so it gets no "has no part" note.
+    assert!(!found.iter().any(|m| m == "-L1 has no part"), "{found:?}");
+}

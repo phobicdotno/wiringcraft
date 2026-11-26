@@ -190,15 +190,19 @@ impl Library {
             .collect()
     }
 
-    /// Case-insensitive search over symbol and part ids, names and descriptions, and part
-    /// manufacturer, order number and properties.
+    /// Case-insensitive search over symbol ids, names, categories, letter codes and
+    /// descriptions, and part ids, manufacturer, order number, description and properties.
+    /// An item matches when every whitespace-separated word of the query is found in its
+    /// text, in any order; an empty query matches everything.
     pub fn search(&self, query: &str) -> Vec<SearchHit> {
-        let q = query.to_lowercase();
+        let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+        let matches = |hay: &str| words.iter().all(|w| hay.contains(w.as_str()));
         let mut hits = Vec::new();
         for (id, source) in self.index(ItemKind::Symbol) {
             if let Ok((s, _)) = self.symbol(&id) {
-                let hay = format!("{} {} {} {}", s.id, s.name, s.category, s.description).to_lowercase();
-                if hay.contains(&q) {
+                let hay =
+                    format!("{} {} {} {} {}", s.id, s.name, s.category, s.letter_code, s.description).to_lowercase();
+                if matches(&hay) {
                     hits.push(SearchHit {
                         kind: ItemKind::Symbol,
                         id,
@@ -220,7 +224,7 @@ impl Library {
                     props.join(" ")
                 )
                 .to_lowercase();
-                if hay.contains(&q) {
+                if matches(&hay) {
                     let title = format!("{} {} {}", p.manufacturer, p.order_number, p.description)
                         .trim()
                         .to_owned();
