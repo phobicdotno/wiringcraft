@@ -566,7 +566,7 @@ fn shapes(
             "TEXT" | "MTEXT" | "ATTRIB" => {
                 let raw = e.get(1).unwrap_or("");
                 let text = if e.kind == "MTEXT" {
-                    percent_codes(&mtext_plain(raw))
+                    mtext_plain(raw)
                 } else {
                     special_codes(raw)
                 };
@@ -1759,7 +1759,8 @@ fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
         .collect()
 }
 
-/// MTEXT carries inline formatting codes; keep only the text.
+/// MTEXT carries inline formatting codes; keep only the text, with its `\U+XXXX` and `%%`
+/// codes turned into characters.
 fn mtext_plain(s: &str) -> String {
     let mut out = String::new();
     let mut chars = s.chars().peekable();
@@ -1799,6 +1800,18 @@ fn mtext_plain(s: &str) -> String {
                 }
                 None => {}
             },
+            '%' if chars.peek() == Some(&'%') => {
+                // `%%` codes, read from the text as written: a `%` that `\U+0025` produced
+                // never starts one.
+                match chars.clone().nth(1).and_then(percent_code) {
+                    Some(d) => {
+                        out.push_str(d);
+                        chars.next();
+                        chars.next();
+                    }
+                    None => out.push('%'),
+                }
+            }
             '{' | '}' => {}
             c => out.push(c),
         }
@@ -1806,71 +1819,50 @@ fn mtext_plain(s: &str) -> String {
     out
 }
 
-/// `\U+XXXX` (four hex digits) is the character with that code, as CAD programs write any
-/// character outside ASCII. Anything else is kept as written.
-fn unicode_codes(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(at) = rest.find("\\U+") {
-        out.push_str(&rest[..at]);
-        let code = rest
-            .get(at + 3..at + 7)
-            .filter(|h| h.chars().all(|c| c.is_ascii_hexdigit()));
-        match code
-            .and_then(|h| u32::from_str_radix(h, 16).ok())
-            .and_then(char::from_u32)
-        {
-            Some(c) => {
-                out.push(c);
-                rest = &rest[at + 7..];
-            }
-            None => {
-                out.push_str("\\U+");
-                rest = &rest[at + 3..];
-            }
-        }
-    }
-    out.push_str(rest);
-    out
+/// `\U+XXXX` (four hex digits) at the start of `s`: the character with that code, as CAD
+/// programs write any character outside ASCII. The code is seven bytes long.
+fn unicode_code(s: &str) -> Option<char> {
+    s.strip_prefix("\\U+")?
+        .get(..4)
+        .filter(|h| h.chars().all(|c| c.is_ascii_hexdigit()))
+        .and_then(|h| u32::from_str_radix(h, 16).ok())
+        .and_then(char::from_u32)
 }
 
-/// The text of a TEXT or ATTRIB: its `\U+XXXX` and `%%` codes turned into characters.
+/// The `%%` code whose letter is `c`: `%%c` diameter, `%%d` degree, `%%p` plus/minus, `%%%` a
+/// percent sign; `%%u` and `%%o` (underline and overline on/off) are dropped.
+fn percent_code(c: char) -> Option<&'static str> {
+    match c.to_ascii_lowercase() {
+        'c' => Some("\u{2300}"),
+        'd' => Some("\u{b0}"),
+        'p' => Some("\u{b1}"),
+        '%' => Some("%"),
+        'u' | 'o' => Some(""),
+        _ => None,
+    }
+}
+
+/// The text of a TEXT or ATTRIB: its `\U+XXXX` and `%%` codes turned into characters, in one
+/// pass, so a character a code produces never starts another code. Anything else is kept.
 fn special_codes(s: &str) -> String {
-    percent_codes(&unicode_codes(s))
-}
-
-/// The `%%` codes of DXF texts: `%%c` diameter, `%%d` degree, `%%p` plus/minus, `%%%` a percent
-/// sign; `%%u` and `%%o` (underline and overline on/off) are dropped. Anything else is kept.
-fn percent_codes(s: &str) -> String {
-    if !s.contains("%%") {
-        return s.to_owned();
-    }
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
-    while let Some(at) = rest.find("%%") {
-        out.push_str(&rest[..at]);
-        let after = &rest[at + 2..];
-        let code = after.chars().next().map(|c| c.to_ascii_lowercase());
-        let decoded = match code {
-            Some('c') => Some("\u{2300}"),
-            Some('d') => Some("\u{b0}"),
-            Some('p') => Some("\u{b1}"),
-            Some('%') => Some("%"),
-            Some('u' | 'o') => Some(""),
-            _ => None,
-        };
-        match decoded {
-            Some(d) => {
-                out.push_str(d);
-                rest = &after[1..];
-            }
-            None => {
-                out.push_str("%%");
-                rest = after;
-            }
+    while let Some(c) = rest.chars().next() {
+        if let Some(u) = unicode_code(rest) {
+            out.push(u);
+            rest = &rest[7..];
+        } else if let Some(d) = rest
+            .strip_prefix("%%")
+            .and_then(|r| r.chars().next())
+            .and_then(percent_code)
+        {
+            out.push_str(d);
+            rest = &rest[3..];
+        } else {
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
         }
     }
-    out.push_str(rest);
     out
 }
 
@@ -2457,9 +2449,13 @@ mod tests {
         // The form WiringCraft's own DXF export writes reads back as drawn.
         assert_eq!(special_codes(r"\U+00C5lesund"), "\u{c5}lesund");
         // In MTEXT an escaped backslash before U+ stays literal; a lone one is a code.
-        assert_eq!(percent_codes(&mtext_plain(r"\\U+00C5")), r"\U+00C5");
-        assert_eq!(percent_codes(&mtext_plain(r"\U+00C5")), "\u{c5}");
-        assert_eq!(percent_codes(&mtext_plain(r"\U+00G1 \U+")), r"\U+00G1 \U+");
+        assert_eq!(mtext_plain(r"\\U+00C5"), r"\U+00C5");
+        assert_eq!(mtext_plain(r"\U+00C5"), "\u{c5}");
+        assert_eq!(mtext_plain(r"\U+00G1 \U+"), r"\U+00G1 \U+");
+        // A `%` written as `\U+0025` never starts a `%%` code.
+        assert_eq!(special_codes(r"\U+0025%%c"), "%\u{2300}");
+        assert_eq!(mtext_plain(r"\U+0025%%c"), "%\u{2300}");
+        assert_eq!(mtext_plain(r"{\fArial;50%%%}%%D %%x"), "50%\u{b0} %%x");
         // A known symbol's TAG attribute is decoded before it is read as a device tag.
         let blocks = "0\nBLOCK\n2\nWC.COIL\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n0\nENDBLK\n";
         let ents = "0\nINSERT\n2\nWC.COIL\n10\n50\n20\n100\n66\n1\n0\nATTRIB\n2\nTAG\n1\n-K\\U+00C51\n";
