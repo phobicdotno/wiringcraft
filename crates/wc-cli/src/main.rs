@@ -547,13 +547,13 @@ enum RevisionCmd {
     Cloud {
         /// The page's id.
         page: String,
-        /// Left or right edge in mm.
+        /// One corner's x in mm.
         x1: f64,
-        /// Top or bottom edge in mm.
+        /// One corner's y in mm.
         y1: f64,
-        /// The other x edge in mm.
+        /// The opposite corner's x in mm.
         x2: f64,
-        /// The other y edge in mm.
+        /// The opposite corner's y in mm.
         y2: f64,
         /// The revision in its tag; the latest when left out.
         #[arg(long)]
