@@ -7459,7 +7459,11 @@ mod nudge_tests {
         app.ed.panel = Some(panel);
         app.ed.panel_pick = Some(0);
         let items = |app: &App| app.open.as_ref().unwrap().project.panels[panel].items.len();
-        app.ed.panel_drag = Some((Point::new(100.0, 100.0), None, Point::new(0.0, 0.0)));
+        app.ed.panel_drag = Some((
+            Point::new(100.0, 100.0),
+            None,
+            app.open.as_ref().unwrap().project.panels[panel].items[0].clone(),
+        ));
         app.carry_out(Action::Delete);
         assert_eq!(items(&app), 1, "the held device stays");
         assert_eq!(app.ed.panel_pick, Some(0), "and stays picked");
