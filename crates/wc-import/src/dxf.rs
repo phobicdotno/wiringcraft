@@ -1771,10 +1771,14 @@ fn mtext_plain(s: &str) -> String {
                 Some('\\') => out.push('\\'),
                 Some('{') => out.push('{'),
                 Some('}') => out.push('}'),
-                Some('U') if chars.peek() == Some(&'+') => {
+                Some('U') => {
                     // `\U+XXXX`: a character by its code. Decoded here, so an escaped backslash
-                    // before `U+` (`\\U+00C5`) stays as written.
-                    let hex: String = chars.clone().skip(1).take(4).collect();
+                    // before `U+` (`\\U+00C5`) stays as written. Any other `\U` (no `+`, or not
+                    // four hex digits) is not a formatting code and stays as written too.
+                    let hex: String = match chars.peek() {
+                        Some('+') => chars.clone().skip(1).take(4).collect(),
+                        _ => String::new(),
+                    };
                     let code = (hex.len() == 4 && hex.chars().all(|c| c.is_ascii_hexdigit()))
                         .then(|| u32::from_str_radix(&hex, 16).ok())
                         .flatten()
@@ -2452,6 +2456,8 @@ mod tests {
         assert_eq!(mtext_plain(r"\\U+00C5"), r"\U+00C5");
         assert_eq!(mtext_plain(r"\U+00C5"), "\u{c5}");
         assert_eq!(mtext_plain(r"\U+00G1 \U+"), r"\U+00G1 \U+");
+        assert_eq!(mtext_plain(r"\U1234"), r"\U1234");
+        assert_eq!(mtext_plain(r"\U1234;tail"), r"\U1234;tail");
         // A `%` written as `\U+0025` never starts a `%%` code.
         assert_eq!(special_codes(r"\U+0025%%c"), "%\u{2300}");
         assert_eq!(mtext_plain(r"\U+0025%%c"), "%\u{2300}");
