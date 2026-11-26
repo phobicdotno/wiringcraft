@@ -2,12 +2,8 @@
 //! add, change, reorder and delete, next to the check list.
 
 use eframe::egui;
-use wc_core::check_rule::{CheckRule, KINDS};
-
-/// The roles a rule can name, as written in `role`.
-pub const ROLES: [&str; 5] = ["main", "auxiliary", "standalone", "terminal", "interruption"];
-/// The severities a rule can have, as written in `severity`.
-pub const SEVERITIES: [&str; 3] = ["error", "warning", "note"];
+use wc_core::check_rule::{CheckRule, KINDS, checked};
+pub use wc_core::check_rule::{ROLES, SEVERITIES};
 
 /// One rule as the dialog edits it: each value as text, empty for "not set".
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -54,53 +50,32 @@ impl RuleRow {
     }
 
     /// The rule this row stands for; `n` is its number in the list (from 1), for the error.
+    /// The checks are the ones the command line and the assistant use ([`checked`]).
     pub fn rule(&self, n: usize) -> Result<CheckRule, String> {
         let set = |v: &str| Some(v.trim().to_owned()).filter(|v| !v.is_empty());
-        // Any case, as the check reads it.
-        let kind = self.kind.trim().to_ascii_lowercase();
-        let kind = kind.as_str();
-        if !KINDS.contains(&kind) {
-            return Err(format!("Rule {n}: pick a kind ({}).", KINDS.join(", ")));
-        }
         // Only a max-wires rule uses a maximum: one typed before the kind changed is left.
-        let max = match set(&self.max).filter(|_| kind == "max-wires") {
+        let max_wires = self.kind.trim().eq_ignore_ascii_case("max-wires");
+        let max = match set(&self.max).filter(|_| max_wires) {
             None => None,
             Some(m) => Some(
                 m.parse::<u32>()
                     .map_err(|_| format!("Rule {n}: the most wires must be a whole number, not \"{m}\"."))?,
             ),
         };
-        if kind == "max-wires" && max.is_none() {
-            return Err(format!("Rule {n}: say how many wires a pin may have at most."));
-        }
-        let pattern = set(&self.pattern);
-        if kind == "tag" && pattern.is_none() {
-            return Err(format!("Rule {n}: a tag rule needs the pattern every tag must match."));
-        }
-        // The check runs no rule with another role or severity (it reports it instead).
-        let known = |v: &Option<String>, of: &[&str]| {
-            v.as_deref()
-                .is_none_or(|v| of.contains(&v.to_ascii_lowercase().as_str()))
-        };
-        let (role, severity) = (set(&self.role), set(&self.severity));
-        if !known(&role, &ROLES) {
-            return Err(format!("Rule {n}: pick a role ({}), or none.", ROLES.join(", ")));
-        }
-        if !known(&severity, &SEVERITIES) {
-            return Err(format!("Rule {n}: pick a severity ({}).", SEVERITIES.join(", ")));
-        }
-        Ok(CheckRule {
-            name: self.base.name.clone(),
-            kind: kind.to_owned(),
-            devices: set(&self.devices),
-            role,
-            // Only a tag rule uses a pattern.
-            pattern: if kind == "tag" { pattern } else { None },
-            max,
-            severity,
-            message: set(&self.message),
-            unknown: self.base.unknown.clone(),
-        })
+        checked(
+            &CheckRule {
+                name: self.base.name.clone(),
+                kind: self.kind.clone(),
+                devices: set(&self.devices),
+                role: set(&self.role),
+                pattern: set(&self.pattern),
+                max,
+                severity: set(&self.severity),
+                message: set(&self.message),
+                unknown: self.base.unknown.clone(),
+            },
+            n,
+        )
     }
 }
 
