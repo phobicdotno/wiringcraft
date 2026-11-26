@@ -88,7 +88,7 @@ For the other areas, the chapter to read in each help is:
 | Function | EPLAN | SWE | WiringCraft | Triage |
 |---|---|---|---|---|
 | Place, move, rotate, mirror symbols | yes | yes | yes | done |
-| Select, box select, copy, cut, paste, duplicate (Ctrl+D), delete, undo/redo | yes | yes | yes | done |
+| Select, box select, copy, cut, paste, duplicate (Ctrl+D), delete, undo/redo | yes | yes | yes; `wiringcraft delete <page> <ids>` deletes symbols and wires (and the wires on a deleted symbol) from the command line | done (#845) |
 | Grid, snap, zoom, pan, fit page | yes | yes | yes | done |
 | Free graphics: lines, rectangles, texts | yes | yes | yes | done |
 | Circles, arcs and polylines in the editor | yes | yes | yes: drawn by hand (Graphics toolbar), picked, moved, deleted and exported like other drawings | done |
