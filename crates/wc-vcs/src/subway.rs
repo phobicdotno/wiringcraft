@@ -175,6 +175,17 @@ fn esc(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// Rough rendered width of `text` in a proportional sans-serif font at `size` px. Errs on the
+/// wide side (0.6 em per character) so text fits even in the widest fallback fonts.
+fn text_width(text: &str, size: f64) -> f64 {
+    text.chars().count() as f64 * size * 0.6
+}
+
+/// Width of a bold 12 px branch/tag badge.
+fn badge_width(name: &str) -> f64 {
+    10.0 + name.chars().count() as f64 * 6.6
+}
+
 /// Draw the map as a standalone SVG.
 pub fn subway_svg(rows: &[Row]) -> String {
     const ROW: f64 = 34.0;
@@ -188,7 +199,18 @@ pub fn subway_svg(rows: &[Row]) -> String {
         .unwrap_or(0)
         + 1;
     let text_x = LEFT + lanes as f64 * LANE + 12.0;
-    let width = text_x + 560.0;
+    // Size the canvas from the widest row (badges + subject, or the id/author line) so long
+    // branch names and subjects are never clipped; keep the old 560 px as a minimum.
+    let content = rows
+        .iter()
+        .map(|r| {
+            let badges: f64 = r.commit.refs.iter().map(|n| badge_width(n) + 6.0).sum();
+            let subject = text_width(&r.commit.subject, 12.0);
+            let meta = text_width(&format!("0000000 · {}", r.commit.author), 10.0);
+            badges + subject.max(meta)
+        })
+        .fold(0.0, f64::max);
+    let width = (text_x + content.max(548.0) + 12.0).ceil();
     let height = TOP * 2.0 + rows.len() as f64 * ROW;
     let x = |lane: usize| LEFT + lane as f64 * LANE;
     let y = |row: usize| TOP + row as f64 * ROW;
@@ -226,7 +248,7 @@ pub fn subway_svg(rows: &[Row]) -> String {
         );
         let mut tx = text_x;
         for name in &r.commit.refs {
-            let w = 10.0 + name.chars().count() as f64 * 6.6;
+            let w = badge_width(name);
             let _ = write!(
                 s,
                 r##"<rect x="{tx}" y="{}" width="{w}" height="18" rx="9" fill="{}"/><text x="{}" y="{}" fill="#ffffff" font-weight="bold">{}</text>"##,
@@ -321,6 +343,27 @@ mod tests {
         let svg = subway_svg(&rows);
         assert!(svg.starts_with("<svg") && svg.contains("<circle"));
         assert_eq!(subway_text(&rows).lines().count(), 5);
+    }
+
+    fn svg_width(svg: &str) -> f64 {
+        let rest = &svg[svg.find("width=\"").map_or(0, |i| i + 7)..];
+        rest[..rest.find('"').unwrap_or(0)].parse().unwrap_or(0.0)
+    }
+
+    #[test]
+    fn svg_grows_to_fit_long_subjects_and_badges() {
+        let short = subway_svg(&layout(vec![c("a", &[])]));
+        assert!((svg_width(&short) - 614.0).abs() < 1.0, "short logs keep the old width");
+
+        let mut long = c("b", &[]);
+        long.subject = "x".repeat(200);
+        long.refs = vec!["feature/a-very-long-branch-name".into(), "#v1.2.3".into()];
+        let rows = layout(vec![long]);
+        let svg = subway_svg(&rows);
+        let text_x = 20.0 + 22.0 + 12.0;
+        let badges = badge_width(&rows[0].commit.refs[0]) + badge_width(&rows[0].commit.refs[1]) + 12.0;
+        let need = text_x + badges + 200.0 * 12.0 * 0.6;
+        assert!(svg_width(&svg) >= need, "width {} < needed {need}", svg_width(&svg));
     }
 
     #[test]
