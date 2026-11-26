@@ -1068,10 +1068,11 @@ impl SymbolEditor {
         {
             let at = xf.mm(pos);
             let closed_at = self.closed_at.take();
-            let double = resp.double_clicked() && self.tool == Tool::Polyline;
-            // egui calls two quick clicks a double-click wherever they land: only a second
-            // click on the polyline's last point ends it, and the second click of a
-            // double-click that closed it on its first point does nothing more.
+            // egui calls a quick click a double- or triple-click wherever it lands (A, B, B in
+            // a row makes the last a triple-click): only a quick click on the polyline's last
+            // point ends it, and the quick click after one that closed it on its first point
+            // does nothing more.
+            let double = (resp.double_clicked() || resp.triple_clicked()) && self.tool == Tool::Polyline;
             let paired = double && self.clicks.is_empty() && closed_at == Some(snap(at));
             if double && self.clicks.len() >= 2 && self.clicks.last() == Some(&snap(at)) {
                 self.finish_polyline();
@@ -2061,6 +2062,30 @@ mod tests {
         t.set(t.get() + 1.0);
         click(&mut e, -10.0, 0.0);
         assert_eq!(e.clicks, [Point::new(-10.0, 0.0)]);
+
+        // A, B, then B again with no pause: egui calls the last a triple-click; it still ends it.
+        let drawn = e.symbol.graphics.len();
+        click(&mut e, 0.0, 15.0);
+        click(&mut e, 0.0, 15.0);
+        assert!(e.clicks.is_empty());
+        assert_eq!(e.symbol.graphics.len(), drawn + 1);
+        assert!(matches!(
+            e.symbol.graphics.last(),
+            Some(Shape::Polyline { points, closed: false, .. })
+                if points[..] == [Point::new(-10.0, 0.0), Point::new(0.0, 15.0)]
+        ));
+
+        // A quick last vertex, then a double-click on the first point with no pause: egui calls
+        // the closing click a triple-click, and its pair still starts nothing.
+        t.set(t.get() + 1.0);
+        for (x, y) in [(20.0, 0.0), (25.0, 0.0), (25.0, 5.0), (20.0, 0.0), (20.0, 0.0)] {
+            click(&mut e, x, y);
+        }
+        assert!(e.clicks.is_empty(), "the last click started no new polyline");
+        assert!(matches!(
+            e.symbol.graphics.last(),
+            Some(Shape::Polyline { points, closed: true, .. }) if points.len() == 3 && points[0] == Point::new(20.0, 0.0)
+        ));
     }
 
     #[test]
