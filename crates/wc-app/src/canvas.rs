@@ -262,8 +262,12 @@ fn convex(pts: &[Pos2]) -> bool {
 /// cut in along a bridge (its two sides on top of each other) comes out right too.
 fn triangulate(pts: &[Pos2]) -> Vec<[u32; 3]> {
     let cross = |o: Pos2, a: Pos2, b: Pos2| (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
-    let area: f32 = (0..pts.len())
-        .map(|i| cross(Pos2::ZERO, pts[i], pts[(i + 1) % pts.len()]))
+    // Summed in f64 (each f32 product is exact there), so the winding does not cancel out.
+    let area: f64 = (0..pts.len())
+        .map(|i| {
+            let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
+            f64::from(a.x) * f64::from(b.y) - f64::from(a.y) * f64::from(b.x)
+        })
         .sum();
     let turn = if area >= 0.0 { 1.0 } else { -1.0 };
     let mut idx: Vec<usize> = (0..pts.len()).collect();
@@ -331,7 +335,14 @@ impl egui::util::cache::ComputerMut<FillKey<'_>, std::sync::Arc<[[u32; 3]]>> for
         #[cfg(test)]
         TRIANGULATIONS.with(|n| n.set(n.get() + 1));
         // In millimetres, not screen pixels, so panning and zooming keep the cached triangles.
-        let pts: Vec<Pos2> = key.0.iter().map(|q| Pos2::new(q.x as f32, q.y as f32)).collect();
+        // Taken from the first point (in f64), so an outline far from the sheet origin keeps
+        // its precision in f32.
+        let o = key.0.first().copied().unwrap_or_default();
+        let pts: Vec<Pos2> = key
+            .0
+            .iter()
+            .map(|q| Pos2::new((q.x - o.x) as f32, (q.y - o.y) as f32))
+            .collect();
         triangulate(&pts).into()
     }
 }
@@ -3657,6 +3668,45 @@ mod tests {
         assert_eq!(runs() - start, 2, "a changed fill is cut up again");
         paint(&ell(3.0));
         assert_eq!(runs() - start, 2);
+    }
+
+    #[test]
+    fn a_clockwise_outline_far_from_the_origin_fills_the_outline_not_its_notch() {
+        // A clockwise L near (10000, 10000) mm: the notch is the square 10001..10002 on both axes.
+        let pts: Vec<Point> = [
+            (10000.0, 10002.0),
+            (10001.0, 10002.0),
+            (10001.0, 10001.0),
+            (10002.0, 10001.0),
+            (10002.0, 10000.0),
+            (10000.0, 10000.0),
+        ]
+        .iter()
+        .map(|(x, y)| Point::new(*x, *y))
+        .collect();
+        let tris = egui::util::cache::ComputerMut::compute(&mut Triangulator, FillKey(&pts));
+        let at = |i: u32| {
+            let q = pts[i as usize];
+            (q.x - 10000.0, q.y - 10000.0)
+        };
+        let inside = |(x, y): (f64, f64), &[a, b, c]: &[u32; 3]| {
+            let (a, b, c) = (at(a), at(b), at(c));
+            let s = |p: (f64, f64), r: (f64, f64)| (r.0 - p.0) * (y - p.1) - (r.1 - p.1) * (x - p.0);
+            let (d1, d2, d3) = (s(a, b), s(b, c), s(c, a));
+            (d1 > 0.0 && d2 > 0.0 && d3 > 0.0) || (d1 < 0.0 && d2 < 0.0 && d3 < 0.0)
+        };
+        for q in [(0.37, 0.71), (1.63, 0.29), (0.29, 1.63)] {
+            assert!(tris.iter().any(|t| inside(q, t)), "{q:?} is filled");
+        }
+        assert!(!tris.iter().any(|t| inside((1.43, 1.61), t)), "the notch is not filled");
+        let area: f64 = tris
+            .iter()
+            .map(|&[a, b, c]| {
+                let (a, b, c) = (at(a), at(b), at(c));
+                ((b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)).abs() / 2.0
+            })
+            .sum();
+        assert!((area - 3.0).abs() < 1e-6, "covers the L exactly: {area}");
     }
 
     use wc_core::project::Endpoint;
