@@ -386,6 +386,58 @@ fn dxf_text(s: &str) -> String {
     out
 }
 
+/// A filled outline as DXF SOLID corners (10, 11, 12, 13 in that order; DXF draws them as
+/// 1, 2, 4, 3): one SOLID for 3 or 4 points, a fan of triangles from the first point for more.
+/// `None` when the outline is not convex (a fan would paint outside it): it stays an outline.
+pub(crate) fn solid_triangles(points: &[(f64, f64)]) -> Option<Vec<[(f64, f64); 4]>> {
+    let mut pts: Vec<(f64, f64)> = Vec::with_capacity(points.len());
+    for &p in points {
+        if pts.last() != Some(&p) {
+            pts.push(p);
+        }
+    }
+    if pts.len() > 1 && pts.first() == pts.last() {
+        pts.pop();
+    }
+    let n = pts.len();
+    if n < 3 || pts.iter().any(|(x, y)| !x.is_finite() || !y.is_finite()) {
+        return None;
+    }
+    // Convex: every corner turns the same way, and the turns add up to one full turn. A corner
+    // that doubles straight back (a retraced segment) is a half turn either way: not convex.
+    let (mut sign, mut turn) = (0.0f64, 0.0f64);
+    let corners = pts
+        .iter()
+        .zip(pts.iter().cycle().skip(1))
+        .zip(pts.iter().cycle().skip(2));
+    for ((a, b), c) in corners {
+        let (ux, uy, vx, vy) = (b.0 - a.0, b.1 - a.1, c.0 - b.0, c.1 - b.1);
+        let (cross, dot) = (ux * vy - uy * vx, ux * vx + uy * vy);
+        if cross.abs() > 1e-9 {
+            if sign * cross < 0.0 {
+                return None;
+            }
+            sign = cross.signum();
+        } else if dot < 0.0 {
+            return None;
+        }
+        turn += cross.atan2(dot);
+    }
+    if sign == 0.0 || turn.abs() > std::f64::consts::TAU + 1e-6 {
+        return None;
+    }
+    Some(match pts.as_slice() {
+        &[a, b, c] => vec![[a, b, c, c]],
+        &[a, b, c, d] => vec![[a, b, d, c]],
+        [first, rest @ ..] => rest
+            .iter()
+            .zip(rest.iter().skip(1))
+            .map(|(&b, &c)| [*first, b, c, c])
+            .collect(),
+        [] => return None,
+    })
+}
+
 /// A DXF (R12, ASCII) drawing of one page in millimetres, y up with the origin at the page's
 /// bottom left corner, as CAD tools expect.
 pub fn dxf(page: &PageDrawing) -> String {
@@ -416,10 +468,25 @@ pub fn dxf(page: &PageDrawing) -> String {
         };
         match p {
             Prim::Path {
-                points, closed, ink, ..
+                points,
+                closed,
+                filled,
+                ink,
+                ..
             } => {
                 let colour = aci(ink).to_string();
-                if points.len() == 2 && !closed {
+                let solids = if *filled { solid_triangles(points) } else { None };
+                if let Some(solids) = solids {
+                    for corners in solids {
+                        pair(0, "SOLID");
+                        pair(8, layer);
+                        pair(62, &colour);
+                        for (i, (px, py)) in corners.iter().enumerate() {
+                            pair(10 + i as u16, &num(*px));
+                            pair(20 + i as u16, &num(y(*py)));
+                        }
+                    }
+                } else if points.len() == 2 && !closed {
                     pair(0, "LINE");
                     pair(8, layer);
                     pair(62, &colour);
@@ -432,7 +499,8 @@ pub fn dxf(page: &PageDrawing) -> String {
                     pair(8, layer);
                     pair(62, &colour);
                     pair(66, "1");
-                    pair(70, if *closed { "1" } else { "0" });
+                    // A filled path that is not convex stays an outline, closed as its fill is.
+                    pair(70, if *closed || *filled { "1" } else { "0" });
                     for (px, py) in points {
                         pair(0, "VERTEX");
                         pair(8, layer);
@@ -448,11 +516,36 @@ pub fn dxf(page: &PageDrawing) -> String {
                 radius,
                 start,
                 end,
+                filled,
                 ink,
                 ..
             } => {
                 let colour = aci(ink).to_string();
                 let full = (end - start).abs() >= 359.999;
+                if full && *filled {
+                    // A solid dot: a closed polyline of two half circles (bulge 1) of radius
+                    // r/2, drawn r wide, so it covers the whole disc.
+                    let w = num(*radius);
+                    pair(0, "POLYLINE");
+                    pair(8, layer);
+                    pair(62, &colour);
+                    pair(66, "1");
+                    pair(70, "1");
+                    pair(40, &w);
+                    pair(41, &w);
+                    for dx in [-radius / 2.0, radius / 2.0] {
+                        pair(0, "VERTEX");
+                        pair(8, layer);
+                        pair(10, &num(center.0 + dx));
+                        pair(20, &num(y(center.1)));
+                        pair(40, &w);
+                        pair(41, &w);
+                        pair(42, "1");
+                    }
+                    pair(0, "SEQEND");
+                    pair(8, layer);
+                    continue;
+                }
                 if full {
                     pair(0, "CIRCLE");
                 } else {
