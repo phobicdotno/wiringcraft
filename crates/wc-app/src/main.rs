@@ -5490,7 +5490,13 @@ impl eframe::App for App {
             o.follow_terminals();
         }
         self.live_check(ctx);
-        self.poll_fetch(ctx);
+        // A fetched base project replaces the open one: not while a save waits for a typed
+        // value, which first goes into the project it was asked for.
+        if after_panels.is_empty() && self.after_typed.is_empty() {
+            self.poll_fetch(ctx);
+        } else {
+            ctx.request_repaint();
+        }
         self.poll_import(ctx);
         self.log_messages();
         self.assistant_poll(ctx);
