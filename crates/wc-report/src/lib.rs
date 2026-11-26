@@ -279,8 +279,9 @@ impl Table {
 /// `https://` or `www.`, or an e-mail address) is kept as typed, because a backslash there
 /// would end up in the link. A viewer also takes in the backslashes of a `|` or a last `\` in
 /// the word, or of escaped text right after it (`https://x.no/&copy;`). Such a word is written
-/// as text that is not a link (`https\://`, `www\.`) with everything escaped; an e-mail
-/// address is written as `<a@x.no>`, which ends the link before the text after it.
+/// as text that is not a link (`https\://`, `www\.`, `a\@x_y.no`) with everything escaped;
+/// an e-mail address that CommonMark takes in `<...>` is written as `<a@x.no>`, which ends
+/// the link before the text after it.
 fn markdown_cell(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
@@ -307,24 +308,32 @@ fn markdown_cell(s: &str) -> String {
         }
         if is_autolink(body) && !link.contains(['<', '>']) {
             let mut tail = String::new();
-            markdown_text(&link[body.len()..], &mut tail);
+            markdown_text(link.strip_prefix(body).unwrap_or_default(), &mut tail);
+            let www = body.strip_prefix("www.");
             if !tail.contains('\\') && !body.contains('|') && !body.ends_with('\\') {
                 // A plain link stays as typed, a `\` inside it too.
                 out.push_str(body);
-            } else if body.contains('@') && !body.contains("://") && !body.starts_with("www.") {
-                // An e-mail address before text that needs a backslash: `<...>` ends the link.
-                out.push('<');
-                out.push_str(body);
-                out.push('>');
-            } else {
+            } else if let Some((scheme, rest)) = body.split_once("://") {
                 // A viewer would take backslashes into the link, so the word is written as
-                // text that is not a link: `\:` or `www\.` shows as `:` or `www.`.
-                let cut = body.find("://").map_or(4, |i| i + 1);
-                let (head, rest) = body.split_at(cut);
-                out.push_str(&head[..cut - 1]);
-                out.push('\\');
-                out.push_str(&head[cut - 1..]);
+                // text that is not a link: `\:` shows as `:`.
+                out.push_str(scheme);
+                out.push_str("\\:");
+                markdown_text(&format!("//{rest}"), &mut out);
+            } else if let Some(rest) = www {
+                out.push_str("www\\.");
                 markdown_text(rest, &mut out);
+            } else if let Some((name, domain)) = body.split_once('@') {
+                if angle_email_domain(domain) {
+                    // `<...>` ends the e-mail link before the text after it.
+                    out.push('<');
+                    out.push_str(body);
+                    out.push('>');
+                } else {
+                    // A domain `<...>` does not take: `\@` shows as `@` and is not a link.
+                    markdown_text(name, &mut out);
+                    out.push_str("\\@");
+                    markdown_text(domain, &mut out);
+                }
             }
             out.push_str(&tail);
         } else {
@@ -353,6 +362,18 @@ fn markdown_text(s: &str, out: &mut String) {
             _ => out.push(c),
         }
     }
+}
+
+/// Whether `<name@domain>` is an e-mail link in CommonMark: parts of letters, digits and `-`
+/// between dots, each 1 to 63 long and not starting or ending with `-`. The name part that
+/// `is_autolink` accepts always fits.
+fn angle_email_domain(domain: &str) -> bool {
+    domain.split('.').all(|p| {
+        (1..=63).contains(&p.len())
+            && !p.starts_with('-')
+            && !p.ends_with('-')
+            && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
 }
 
 /// Whether a Markdown viewer turns this word into a link by itself: a web address starting

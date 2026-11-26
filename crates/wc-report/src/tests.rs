@@ -3251,3 +3251,14 @@ fn markdown_links_with_text_that_needs_a_backslash_are_written_as_text() {
          | HTTP\\://example.com/a\\\\\\|b |\n"
     );
 }
+
+#[test]
+fn markdown_email_with_text_after_it_is_bracketed_only_when_commonmark_takes_it() {
+    let mut t = Table::new("Mail", &["Text"]);
+    t.rows.push(vec!["a@x_y.no* a_b@x.no&amp; a@-x.no_ a@x.no".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Mail\n\n| Text |\n|---|\n\
+         | a\\@x\\_y.no\\* <a_b@x.no>\\&amp; a\\@-x.no\\_ a@x.no |\n"
+    );
+}
