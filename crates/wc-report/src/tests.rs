@@ -355,6 +355,76 @@ fn cable_list_groups_cores_by_cable() {
 }
 
 #[test]
+fn check_names_a_cable_core_on_two_connections() {
+    let (mut p, s, parts) = fixture();
+    let found = |p: &Project| {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        check(&i)
+            .into_iter()
+            .filter(|f| f.message.contains("cable core"))
+            .map(|f| (f.page_id, f.item, f.message))
+            .collect::<Vec<_>>()
+    };
+    let set_core = |p: &mut Project, page: usize, id: &str, core: &str| {
+        if let Some(w) = p.pages[page].wires.iter_mut().find(|w| w.id == id) {
+            w.cable = Some(wc_core::CableCore {
+                cable: DeviceTag::parse("-W1").unwrap(),
+                core: core.into(),
+            });
+        }
+    };
+    // w2 (-K1:14 to -X1.1:1) and w4 (-K1:A2 to -X2:1) are two connections.
+    set_core(&mut p, 0, "w2", "1");
+    set_core(&mut p, 0, "w4", "2");
+    assert!(found(&p).is_empty());
+    // A core drawn in two pieces of one connection is one conductor.
+    p.pages[0].wires.push(wire(
+        "w5",
+        pin("s4", "1"),
+        Endpoint::Point {
+            at: Point::new(110.0, 60.0),
+        },
+        None,
+        None,
+    ));
+    set_core(&mut p, 0, "w5", "1");
+    assert!(found(&p).is_empty());
+    // A wire naming only the cable names no core.
+    set_core(&mut p, 0, "w3", "");
+    set_core(&mut p, 0, "w1", " ");
+    assert!(found(&p).is_empty());
+    // A repeat on an overview page does not count.
+    let mut overview = p.pages[0].clone();
+    overview.id = "ov".into();
+    overview.number = "1".into();
+    overview.overview = true;
+    if let Some(c) = overview
+        .wires
+        .iter_mut()
+        .find(|w| w.id == "w4")
+        .and_then(|w| w.cable.as_mut())
+    {
+        c.core = "1".into();
+    }
+    p.pages.insert(0, overview);
+    assert!(found(&p).is_empty());
+    // The same core on a second connection is named on the second one's wire.
+    set_core(&mut p, 1, "w4", "1");
+    assert_eq!(
+        found(&p),
+        [(
+            Some("p2".to_owned()),
+            Some("w4".to_owned()),
+            "cable core -W1:1 is on 2 connections".to_owned()
+        )]
+    );
+}
+
+#[test]
 fn project_check_finds_the_usual_mistakes() {
     let (mut p, s, parts) = fixture();
     {
