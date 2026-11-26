@@ -1,0 +1,13 @@
+{
+  "description": "Main switch 3-pole 40 A, door handle (example data)",
+  "id": "example.ex-ms-3p-40",
+  "manufacturer": "Example",
+  "order_number": "EX-MS-3P-40",
+  "properties": {
+    "Depth": "80 mm",
+    "Height": "90 mm",
+    "Rated current": "40 A",
+    "Width": "54 mm"
+  },
+  "symbol": "wc.switch.disconnector.3p"
+}
