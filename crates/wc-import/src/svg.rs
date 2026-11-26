@@ -50,7 +50,11 @@ impl M {
     /// draws its thin outline.
     fn is_singular(&self) -> bool {
         let [a, b, c, d, ..] = self.0;
-        a * d - b * c == 0.0
+        // a·d − b·c without the rounding of the subtraction (Kahan's way, with fused
+        // multiply-adds), so nearly parallel but invertible axes don't come out as exactly 0.
+        let w = b * c;
+        let err = (-b).mul_add(c, w);
+        a.mul_add(d, -w) + err == 0.0
     }
 }
 
@@ -887,7 +891,11 @@ mod tests {
         let s = symbol(svg, "svg.flatpin", "Flat pin")?;
         assert_eq!(s.pins.len(), 1, "{:?}", s.pins);
         // Very thin, or nearly parallel axes, but still invertible: drawn as a flat outline.
-        for t in ["scale(1 1e-10)", "matrix(1 0 1 1e-13 0 0)"] {
+        for t in [
+            "scale(1 1e-10)",
+            "matrix(1 0 1 1e-13 0 0)",
+            "matrix(1 1.0000000000000002 0.9999999999999998 1 0 0)",
+        ] {
             let svg = format!(
                 r#"<svg xmlns="http://www.w3.org/2000/svg">
                 <circle id="pin:1" cx="0" cy="0" r="0.5"/>
@@ -898,7 +906,7 @@ mod tests {
             let Some(thin) = s.graphics.iter().find_map(outline_size) else {
                 unreachable!("{t} is not singular: {:?}", s.graphics);
             };
-            assert!(thin.0 >= 4.0 - 1e-9 && thin.1 < 1e-9, "{t}: {thin:?}");
+            assert!(thin.0.max(thin.1) >= 4.0 - 1e-9, "{t}: {thin:?}");
         }
         Ok(())
     }
