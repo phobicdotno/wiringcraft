@@ -691,7 +691,8 @@ enum LibCmd {
     Update {
         ids: Vec<String>,
     },
-    /// Pin every used item that is not pinned yet.
+    /// Pin every used item that is not pinned yet, and write a pinned item's vendored copy again
+    /// when it is missing or unreadable.
     Lock,
     Search {
         query: String,
@@ -2773,6 +2774,10 @@ fn lib_cmd(dir: &Path, lc: LibCmd) -> Res<()> {
             let lib = wc_library::Library::open(dir, &p).map_err(e)?;
             let left = wc_library::lock_missing(dir, &mut p, &lib).map_err(e)?;
             save(dir, &p)?;
+            for (k, id) in &left.restored {
+                let kind = if *k == ItemKind::Symbol { "symbol" } else { "part" };
+                println!("restored the vendored copy of {kind} {}", escape_field(id));
+            }
             for w in lock_warnings(&left) {
                 eprintln!("warning: {}", escape_field(&w));
             }
@@ -3779,6 +3784,12 @@ fn lock_warnings(left: &wc_library::Unpinned) -> Vec<String> {
                 .iter()
                 .map(|(k, id, why)| format!("{} {id} is not pinned: {why}", kind(k))),
         )
+        .chain(left.unrestorable.iter().map(|(k, id, why)| {
+            format!(
+                "{} {id} has no readable vendored copy and was not restored: {why}",
+                kind(k)
+            )
+        }))
         .collect()
 }
 
@@ -6223,7 +6234,7 @@ mod tests {
         assert_eq!(
             lock_warnings(&wc_library::Unpinned {
                 missing: vec![(ItemKind::Part, "gone".into())],
-                wrong_id: Vec::new(),
+                ..Default::default()
             }),
             ["part gone is in no library source"]
         );
@@ -6964,8 +6975,8 @@ mod tests {
         assert!(cli(&dir, &["strip", "level", "-X1", "S1"]).is_ok());
         assert_eq!(level(), None);
 
-        // Jumpers: a jumper left with one terminal is dropped, so this one keeps two. `jumper
-        // add` refuses a terminal the strip does not have (#572), so S4 is put on it first.
+        // Jumpers: a jumper left with one terminal is dropped, so this one keeps two. `jumper add`
+        // takes only terminals the strip has (#572), so S4 is added as a spare first.
         assert!(cli(&dir, &["strip", "spare", "-X1", "S4"]).is_ok());
         assert!(cli(&dir, &["jumper", "add", "-X1", "S1", "S2", "S4"]).is_ok());
         assert!(cli(&dir, &["jumper", "remove", "-X1", "S2"]).is_ok());
