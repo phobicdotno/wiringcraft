@@ -3948,17 +3948,40 @@ mod tests {
         }
     }
 
-    /// Frames until the running import is taken in (at most a few seconds).
+    /// How long [`wait_for_worker`] waits for work on a worker thread before it calls it a
+    /// hang. A git clone, an import or an assistant turn can take seconds on a loaded CI runner
+    /// (#672, #678), so only work that never ends reaches this bound.
+    const WORKER_HANG: std::time::Duration = std::time::Duration::from_secs(120);
+
+    /// Call `frame` every `every_ms` milliseconds until it says the worker's work is taken in;
+    /// fail (naming `what`) only when it is still going after [`WORKER_HANG`].
+    fn wait_for_worker(what: &str, every_ms: u64, mut frame: impl FnMut() -> bool) {
+        let start = std::time::Instant::now();
+        while !frame() {
+            assert!(start.elapsed() < WORKER_HANG, "{what} did not end in {WORKER_HANG:?}");
+            std::thread::sleep(std::time::Duration::from_millis(every_ms));
+        }
+    }
+
+    /// A worker that ends only after far more polls than the old fixed bounds (1000) allowed
+    /// is still waited for (#678).
+    #[test]
+    fn a_slow_worker_is_waited_for_past_the_old_poll_count() {
+        let mut polls = 0;
+        wait_for_worker("the slow worker", 0, || {
+            polls += 1;
+            polls == 5000
+        });
+        assert_eq!(polls, 5000);
+    }
+
+    /// Frames until the running import is taken in, however slow the runner.
     fn until_imported(a: &mut App) {
         let ctx = egui::Context::default();
-        for _ in 0..1000 {
+        wait_for_worker("the import", 5, || {
             a.poll_import(&ctx);
-            if a.importing.is_none() {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(a.importing.is_none(), "the import did not end");
+            a.importing.is_none()
+        });
     }
 
     #[test]
@@ -4288,24 +4311,13 @@ mod tests {
         until_imported(&mut a);
     }
 
-    /// How long [`until_fetched`] waits for the base project fetch before it calls it a hang.
-    /// The fetch runs a real git init and clone on a worker thread, which can take seconds on
-    /// a loaded CI runner (#672), so only a fetch that never ends reaches this bound.
-    const FETCH_HANG: std::time::Duration = std::time::Duration::from_secs(120);
-
-    /// Frames until the base project fetch is over, however slow the runner: it fails only
-    /// when the fetch is still going after [`FETCH_HANG`].
+    /// Frames until the base project fetch is over, however slow the runner (#672).
     fn until_fetched(a: &mut App) {
         let ctx = egui::Context::default();
-        let start = std::time::Instant::now();
-        loop {
+        wait_for_worker("the fetch", 10, || {
             a.poll_fetch(&ctx);
-            if a.fetch.is_none() {
-                return;
-            }
-            assert!(start.elapsed() < FETCH_HANG, "the fetch did not end in {FETCH_HANG:?}");
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+            a.fetch.is_none()
+        });
     }
 
     #[test]
@@ -4523,14 +4535,10 @@ mod tests {
         assert!(a.assistant.busy());
         until_fetched_once(&mut a);
         assert!(a.fetch.is_some());
-        for _ in 0..500 {
+        wait_for_worker("the assistant turn", 5, || {
             a.assistant_poll(&ctx);
-            if !a.assistant.busy() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(!a.assistant.busy());
+            !a.assistant.busy()
+        });
         // A symbol draft open: it is not dropped under the user.
         a.symbol_editor = Some(crate::symbol_editor::SymbolEditor::new(Vec::new()));
         until_fetched_once(&mut a);
@@ -4657,13 +4665,10 @@ mod tests {
         }
         let ctx = egui::Context::default();
         let drawn_twice = |a: &App| a.ed.live.iter().filter(|f| f.message.contains("-K1 is drawn")).count();
-        for _ in 0..200 {
+        wait_for_worker("the live check", 10, || {
             a.live_check(&ctx);
-            if drawn_twice(&a) > 0 {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+            drawn_twice(&a) > 0
+        });
         assert_eq!(drawn_twice(&a), 2, "{:?}", a.ed.live);
         // Opening the same unchanged project replaces the editor; the checker keeps its
         // findings for the same inputs, and they show again at once.
@@ -4677,13 +4682,10 @@ mod tests {
         a.prefs.live_check = true;
         // On again: the checker checks project A afresh and shows both findings, so the
         // switch below starts from a checker that holds A's findings.
-        for _ in 0..200 {
+        wait_for_worker("the live check", 10, || {
             a.live_check(&ctx);
-            if drawn_twice(&a) > 0 {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+            drawn_twice(&a) > 0
+        });
         assert_eq!(drawn_twice(&a), 2, "{:?}", a.ed.live);
         // Another project is opened: the first one's findings are not shown on it.
         let (_other, b) = crate::state::tests::project();
@@ -9183,14 +9185,10 @@ mod tests {
         a.prefs.assistant.backend = wc_agent::Backend::ApiKey;
         a.assistant.input = "Put a coil and a lamp on page 2".into();
         a.assistant_send(&ctx);
-        for _ in 0..500 {
+        wait_for_worker("the assistant turn", 5, || {
             a.assistant_poll(&ctx);
-            if !a.assistant.session.busy() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(!a.assistant.session.busy());
+            !a.assistant.session.busy()
+        });
         assert_eq!(page2(&a).symbols.len(), 2);
         assert!(matches!(
             a.assistant.session.log.last(),
