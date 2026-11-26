@@ -2318,6 +2318,43 @@ fn normalise_block_name(n: &str) -> String {
     n.trim().to_lowercase().replace([' ', '/'], "-")
 }
 
+/// The copies of an INSERT placed as an array (MINSERT): column and row counts (codes 70 and
+/// 71) and spacings (44 and 45), the spacings along the block's own axes turned by code 50 and
+/// not scaled, as AutoCAD draws it. A plain INSERT is one copy.
+struct ArrayCells {
+    cols: usize,
+    rows: usize,
+    spacing: (f64, f64),
+    /// Sine and cosine of the turn.
+    turn: (f64, f64),
+}
+
+impl ArrayCells {
+    fn of(e: &Entity) -> Self {
+        let count = |code: i32| e.f_or(code, 1.0).clamp(1.0, f64::from(u32::MAX)) as usize;
+        ArrayCells {
+            cols: count(70),
+            rows: count(71),
+            spacing: (e.f(44), e.f(45)),
+            turn: e.f(50).to_radians().sin_cos(),
+        }
+    }
+
+    /// How many copies, stopping at `usize::MAX`.
+    fn len(&self) -> usize {
+        self.cols.saturating_mul(self.rows)
+    }
+
+    /// How far copy `cell` (counted along the first row, then the next) lies from the
+    /// insertion point, in the drawing's own coordinates.
+    fn offset(&self, cell: usize) -> (f64, f64) {
+        let (s, c) = self.turn;
+        let col = (cell % self.cols) as f64 * self.spacing.0;
+        let row = (cell / self.cols) as f64 * self.spacing.1;
+        (c * col - s * row, s * col + c * row)
+    }
+}
+
 /// Import a whole drawing. Block references whose name matches a library symbol id
 /// (case-insensitive) become placed symbols, with a device tag from an attribute named TAG,
 /// DEVICE, BMK or REF; everything else is kept as graphics. The drawing is moved so its top-left
@@ -2343,6 +2380,9 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
     let mut raw = Vec::new();
     let mut points = Vec::new();
     let mut plain = Vec::new();
+    let mut skipped: BTreeMap<String, usize> = BTreeMap::new();
+    // Placed symbols take from the same budget as the drawn entities.
+    let mut budget = MAX_DRAWN;
     // Attributes follow their INSERT in the entity list.
     let mut i = 0;
     while i < d.entities.len() {
@@ -2381,14 +2421,37 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
                 // and overflow when negated.
                 let turn = e.f(50).round().rem_euclid(360.0);
                 let rotation = Rotation::from_degrees(-(turn as i64)).unwrap_or_default();
-                out.symbols.push(PlacedSymbol {
-                    id: String::new(),
-                    symbol: (*id).clone(),
-                    at: Point::new(e.f(10) * scale, -e.f(20) * scale),
-                    rotation,
-                    mirror: e.f_or(41, 1.0) < 0.0,
-                    tag,
-                });
+                // An array places one symbol per copy. The copies share the attributes, so
+                // only the first keeps the device tag: the rest would repeat it.
+                let cells = ArrayCells::of(e);
+                let copies = cells.len();
+                if copies > 1
+                    && let Some(t) = &tag
+                {
+                    tag_warnings.push(format!(
+                        "{id}: an array of {copies} copies, only the first keeps the device tag {t}, the others are placed without a tag"
+                    ));
+                }
+                let (ix, iy, mirror) = (e.f(10), e.f(20), e.f_or(41, 1.0) < 0.0);
+                let mut tag = tag;
+                for cell in 0..copies {
+                    if budget == 0 {
+                        let over = skipped.entry(OVER_LIMIT.to_owned()).or_default();
+                        *over = over.saturating_add(copies - cell);
+                        break;
+                    }
+                    budget -= 1;
+                    let (ox, oy) = cells.offset(cell);
+                    out.symbols.push(PlacedSymbol {
+                        id: String::new(),
+                        symbol: (*id).clone(),
+                        // Past the range of numbers, it is left out and said below.
+                        at: Point::new((ix + ox) * scale, -(iy + oy) * scale),
+                        rotation,
+                        mirror,
+                        tag: tag.take(),
+                    });
+                }
             }
             None => {
                 plain.push(e.clone());
@@ -2397,7 +2460,6 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
         }
         i = j;
     }
-    let mut skipped = BTreeMap::new();
     shapes(
         d,
         &plain,
@@ -2409,7 +2471,7 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
         &mut raw,
         &mut points,
         &mut skipped,
-        &mut { MAX_DRAWN },
+        &mut budget,
     );
     out.graphics = raw.into_iter().map(|(_, s)| s).collect();
     out.warnings = skipped_warnings(skipped.clone());
@@ -3874,6 +3936,73 @@ mod tests {
             assert_eq!(skipped.get(LINE_NOT_NUMBERS), Some(&1), "{skipped:?}");
             assert_eq!(skipped.get(PLACED_NOT_NUMBERS), Some(&1), "{skipped:?}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn an_arrayed_known_symbol_places_every_copy() -> Result<()> {
+        let blocks = "0\nBLOCK\n2\nWC.COIL\n10\n0\n20\n0\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n0\nENDBLK\n";
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        let at = |p: &ImportedPage| -> Vec<(f64, f64)> { p.symbols.iter().map(|s| (s.at.x, s.at.y)).collect() };
+        // 3 columns 10 apart, 2 rows 5 apart (y flipped on the page), moved so the lowest
+        // left copy sits at the frame corner (20, 20).
+        let ents = "0\nINSERT\n66\n1\n2\nWC.COIL\n10\n1\n20\n2\n70\n3\n71\n2\n44\n10\n45\n5\n0\nATTRIB\n2\nTAG\n1\n-K1\n0\nSEQEND\n";
+        let p = page(&dxf(ents, blocks), 1.0, &known)?;
+        assert_eq!(
+            at(&p),
+            [
+                (20.0, 25.0),
+                (30.0, 25.0),
+                (40.0, 25.0),
+                (20.0, 20.0),
+                (30.0, 20.0),
+                (40.0, 20.0)
+            ]
+        );
+        assert!(p.symbols.iter().all(|s| s.symbol == "wc.coil"));
+        // Only the first copy keeps the tag, and that is said.
+        let tags: Vec<_> = p
+            .symbols
+            .iter()
+            .map(|s| s.tag.as_ref().map(|t| t.to_string()))
+            .collect();
+        assert_eq!(tags[0].as_deref(), Some("-K1"));
+        assert!(tags[1..].iter().all(Option::is_none), "{tags:?}");
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("an array of 6 copies, only the first keeps the device tag -K1")),
+            "{:?}",
+            p.warnings
+        );
+        // Turned by 90 degrees: the columns run up, the rows run left; the spacing is not scaled.
+        let turned = "0\nINSERT\n2\nWC.COIL\n10\n0\n20\n0\n41\n2\n42\n2\n50\n90\n70\n2\n71\n2\n44\n10\n45\n5\n";
+        let p = page(&dxf(turned, blocks), 1.0, &known)?;
+        assert_eq!(at(&p), [(25.0, 30.0), (25.0, 20.0), (20.0, 30.0), (20.0, 20.0)]);
+        assert!(p.symbols.iter().all(|s| s.rotation == p.symbols[0].rotation));
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+        // A copy whose position is not a number once scaled is left out and said.
+        let far = "0\nINSERT\n2\nWC.COIL\n10\n0\n20\n0\n70\n2\n44\n1e308\n";
+        let p = page(&dxf(far, blocks), 10.0, &known)?;
+        assert_eq!(p.symbols.len(), 1);
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("1 entity whose size is not a number once placed")),
+            "{:?}",
+            p.warnings
+        );
+        // A huge array stops at the shared limit and counts the copies left out.
+        let huge = "0\nINSERT\n2\nWC.COIL\n70\n1e12\n71\n1e12\n44\n1e-9\n45\n1e-9\n";
+        let p = page(&dxf(huge, blocks), 1.0, &known)?;
+        assert_eq!(p.symbols.len(), MAX_DRAWN);
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("entities not drawn: the drawing expands")),
+            "{:?}",
+            p.warnings
+        );
         Ok(())
     }
 
