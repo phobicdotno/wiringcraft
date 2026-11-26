@@ -30,6 +30,10 @@ pub const PARENT_PROJECT_ENV: &str = "WIRINGCRAFT_GIT_PARENT_PROJECT";
 /// [`Git::exclude_locally`] keeps it out of repositories whose `.gitignore` does not.
 pub const LOCK_FILE: &str = ".wiringcraft.lock";
 
+/// Put before a branch name or revision the user gave, so git takes one that starts with `-`
+/// (`--detach`, `--output=file`) as a name it then refuses, never as an option.
+const END_OF_OPTIONS: &str = "--end-of-options";
+
 /// Where [`Git::exclude_locally`] writes the new exclude list before renaming it over `at`:
 /// beside it, named after this process so two processes never write the same file.
 pub(crate) fn exclude_scratch(at: &Path) -> PathBuf {
@@ -410,7 +414,24 @@ impl Git {
                 message: format!("another revert, cherry-pick or merge is in progress ({f}); finish or abort it first"),
             });
         }
-        args.extend(["revert", "--no-edit", commit]);
+        // Resolved to one commit first: `git revert` hands what follows `--end-of-options` to
+        // its revision walk, which still reads `--all` there as every branch.
+        let resolved = self.run(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            END_OF_OPTIONS,
+            &format!("{commit}^{{commit}}"),
+        ]);
+        let commit = match resolved {
+            Ok(id) if !id.trim().is_empty() => id.trim().to_owned(),
+            // `--quiet`: an unknown version fails with nothing said. Any other failure (git
+            // could not run, a broken repository) keeps its own reason.
+            Ok(_) => return Err(no_such_version(commit)),
+            Err(Error::Git { message, .. }) if message.is_empty() => return Err(no_such_version(commit)),
+            Err(e) => return Err(e),
+        };
+        args.extend(["revert", "--no-edit", END_OF_OPTIONS, &commit]);
         if let Err(e) = self.run(&args) {
             // Only this call's revert can be in progress here (checked above), so aborting it
             // cannot throw away earlier work.
@@ -454,7 +475,7 @@ impl Git {
 
     /// The author (`Name <email>`) and subject of a commit.
     pub fn author_and_subject(&self, rev: &str) -> Result<(String, String)> {
-        let out = self.run(&["log", "-1", "--format=%an <%ae>%n%s", rev])?;
+        let out = self.run(&["log", "-1", "--format=%an <%ae>%n%s", END_OF_OPTIONS, rev])?;
         let mut lines = out.lines();
         let author = lines.next().unwrap_or_default().to_owned();
         let subject = lines.next().unwrap_or_default().to_owned();
@@ -490,7 +511,7 @@ impl Git {
                 message: "record or discard your changes first (commit)".into(),
             });
         }
-        self.run(&["switch", "-q", name])?;
+        self.run(&["switch", "-q", END_OF_OPTIONS, name])?;
         Ok(())
     }
 
@@ -498,7 +519,7 @@ impl Git {
     pub fn merge(&self, other: &str) -> Result<MergeOutcome> {
         let before = self.head();
         let msg = format!("Merge {other}");
-        let mut args = vec!["merge", "--no-ff", "-m", msg.as_str(), other];
+        let mut args = vec!["merge", "--no-ff", "-m", msg.as_str(), END_OF_OPTIONS, other];
         if self.run(&["config", "user.email"]).is_err() {
             args.splice(
                 0..0,
@@ -534,7 +555,15 @@ impl Git {
 
     /// A file's content at a revision, or `None` when it did not exist there.
     pub fn show(&self, rev: &str, path: &str) -> Option<String> {
-        self.run(&["show", &format!("{rev}:{path}")]).ok()
+        self.run(&["show", END_OF_OPTIONS, &format!("{rev}:{path}")]).ok()
+    }
+}
+
+/// [`Git::revert`]'s refusal of a name that is no version.
+fn no_such_version(commit: &str) -> Error {
+    Error::Git {
+        args: format!("revert {commit}"),
+        message: format!("no such version: {commit}"),
     }
 }
 
