@@ -1,0 +1,112 @@
+{
+  "category": "protection",
+  "description": "Surge arrester (surge protective device) from a line conductor to protective earth.",
+  "graphics": [
+    {
+      "a": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 3.5
+      },
+      "kind": "line"
+    },
+    {
+      "kind": "rect",
+      "max": {
+        "x": 1.8,
+        "y": 11.5
+      },
+      "min": {
+        "x": -1.8,
+        "y": 3.5
+      }
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 11.5
+      },
+      "b": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 3.5
+      },
+      "b": {
+        "x": 0.0,
+        "y": 8.6
+      },
+      "kind": "line"
+    },
+    {
+      "filled": true,
+      "kind": "polyline",
+      "points": [
+        {
+          "x": 0.0,
+          "y": 10.5
+        },
+        {
+          "x": -0.8,
+          "y": 8.4
+        },
+        {
+          "x": 0.8,
+          "y": 8.4
+        }
+      ]
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "L"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 14.4
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "PE"
+    }
+  ],
+  "id": "wc.surge.arrester",
+  "letter_code": "F",
+  "name": "Surge arrester",
+  "pins": [
+    {
+      "at": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "L"
+    },
+    {
+      "at": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "dir": "down",
+      "name": "PE"
+    }
+  ],
+  "role": "standalone",
+  "tag_at": {
+    "x": -6.0,
+    "y": 8.0
+  }
+}
