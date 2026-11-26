@@ -171,14 +171,15 @@ enum Drag {
     /// for this drag was taken. Escape (#737, #863) needs the rest: the id of the page it moves
     /// on, the history count right after its checkpoint (any other count means a change was
     /// recorded during the drag, a rotate say), that checkpoint's undo step, and the selection
-    /// when the drag began (Escape only takes back a move of that same selection).
+    /// when the drag began, or `None` once a frame moved another selection (Escape only takes
+    /// back a move that moved that same selection all along).
     Move {
         from: Point,
         checkpoint: bool,
         page: String,
         step: u64,
         id: u64,
-        items: Vec<Selection>,
+        items: Option<Vec<Selection>>,
     },
     /// Drawing a selection box from this corner.
     Box { from: Point },
@@ -303,7 +304,7 @@ impl Editor {
             page: String::new(),
             step: 0,
             id: 0,
-            items: Vec::new(),
+            items: Some(Vec::new()),
         });
     }
 }
@@ -1521,36 +1522,10 @@ fn select_tool(
                 }
             }
         }
-        Some(Drag::Move {
-            from,
-            checkpoint,
-            page: on,
-            step,
-            id,
-            items,
-        }) if resp.dragged_by(egui::PointerButton::Primary) => {
+        Some(Drag::Move { .. }) if resp.dragged_by(egui::PointerButton::Primary) => {
             if let Some(cur) = ed.cursor {
                 // Move by whole snap steps so pins stay on the grid.
-                let target = snap(cur, snap_step);
-                if target != from {
-                    let (step, id) = if checkpoint {
-                        (step, id)
-                    } else {
-                        open.begin_drag_move();
-                        (open.history_count(), open.last_step_id().unwrap_or(0))
-                    };
-                    let d = Point::new(target.x - from.x, target.y - from.y);
-                    let sel = ed.selection.clone();
-                    open.drag_move_by(ed.page, &sel, d);
-                    ed.drag = Some(Drag::Move {
-                        from: target,
-                        checkpoint: true,
-                        page: on,
-                        step,
-                        id,
-                        items,
-                    });
-                }
+                move_drag_to(open, ed, snap(cur, snap_step));
             }
         }
         // Also in the frame the button is let go: a last move that comes with the release counts.
@@ -1752,7 +1727,7 @@ fn drag_start(
                 page: page.id.clone(),
                 step: 0,
                 id: 0,
-                items: ed.selection.clone(),
+                items: Some(ed.selection.clone()),
             }
         }
         (_, None) => Drag::Box { from: at },
@@ -1827,6 +1802,52 @@ fn paint_logo(
     }
 }
 
+/// A frame of a select-tool move drag with the grab point now at `target`: the selection moves
+/// by whole steps from the last grab point, the drag's checkpoint taken on its first move. When
+/// this moves another selection than the drag began with, the drag forgets its own, so Escape
+/// does not take back from it a part of the move it did not get.
+fn move_drag_to(open: &mut Open, ed: &mut Editor, target: Point) {
+    let Some(Drag::Move {
+        from,
+        checkpoint,
+        page,
+        step,
+        id,
+        items,
+    }) = ed.drag.take()
+    else {
+        return;
+    };
+    if target == from {
+        ed.drag = Some(Drag::Move {
+            from,
+            checkpoint,
+            page,
+            step,
+            id,
+            items,
+        });
+        return;
+    }
+    let (step, id) = if checkpoint {
+        (step, id)
+    } else {
+        open.begin_drag_move();
+        (open.history_count(), open.last_step_id().unwrap_or(0))
+    };
+    let d = Point::new(target.x - from.x, target.y - from.y);
+    let sel = ed.selection.clone();
+    open.drag_move_by(ed.page, &sel, d);
+    ed.drag = Some(Drag::Move {
+        from: target,
+        checkpoint: true,
+        page,
+        step,
+        id,
+        items: items.filter(|i| *i == sel),
+    });
+}
+
 /// The end of a select-tool drag: a finished move wires the moved symbols' pins that now line
 /// up (see [`auto_wire`]).
 /// The page became held during a move: the move stops where it is, and its release does
@@ -1891,8 +1912,10 @@ fn cancel_drag(open: &mut Open, ed: &mut Editor) {
             id,
             items,
             ..
-        }) if items == ed.selection => {
-            open.take_back_move(id, &page, &items);
+            // Only a move of the same selection all along: another selection moved part of the
+            // way (or the selection changed since) leaves what each item moved unknown.
+        }) if items.as_ref() == Some(&ed.selection) => {
+            open.take_back_move(id, &page, &ed.selection.clone());
         }
         Some(Drag::Logo {
             checkpoint: true, step, ..
@@ -4429,7 +4452,7 @@ mod tests {
             page: o.project.pages[ed.page].id.clone(),
             step: o.history_count(),
             id: o.last_step_id().unwrap_or(0),
-            items: ed.selection.clone(),
+            items: Some(ed.selection.clone()),
         });
     }
 
@@ -4764,6 +4787,28 @@ mod tests {
     }
 
     #[test]
+    fn escape_after_moving_another_selection_during_the_drag_only_ends_it() {
+        let (_tmp, mut o, mut ed, coil) = moving_coil();
+        let page = ed.page;
+        let at = |o: &Open| o.project.pages[page].symbol(&coil).map(|s| (s.at, s.rotation));
+        let own = ed.selection.clone();
+        drag(&mut o, &mut ed, Point::new(-40.0, 0.0));
+        // A frame of the drag moves another selection (nothing selected here): the drag forgets
+        // its own selection.
+        ed.selection.clear();
+        move_drag_to(&mut o, &mut ed, Point::new(-60.0, 0.0));
+        // The first selection comes back and is turned.
+        ed.selection = own;
+        o.rotate_many(page, &ed.selection.clone());
+        let now = at(&o);
+        let steps = o.undo_steps();
+        cancel_drag(&mut o, &mut ed);
+        assert!(ed.drag.is_none());
+        assert_eq!(at(&o), now, "nothing is moved back by a part it did not move");
+        assert_eq!(o.undo_steps(), steps);
+    }
+
+    #[test]
     fn escape_after_a_rotate_with_another_selection_only_ends_the_drag() {
         let (_tmp, mut o, mut ed, coil) = moving_coil();
         let page = ed.page;
@@ -4905,7 +4950,7 @@ mod tests {
             page: o.project.pages[ed.page].id.clone(),
             step: 0,
             id: 0,
-            items: ed.selection.clone(),
+            items: Some(ed.selection.clone()),
         });
         cancel_drag(&mut o, &mut ed);
         assert!(ed.drag.is_none());
