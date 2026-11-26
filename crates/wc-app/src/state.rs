@@ -4379,6 +4379,8 @@ fn repair_file(path: &Path, should: Option<&[u8]>, found: &Found) -> std::io::Re
     if let Some(aside) = &moved {
         tests::write_moved_after_check(aside);
     }
+    #[cfg(test)]
+    tests::run_hook("moved aside", path);
     let put_back = |aside: &Path| match place_new(aside, path) {
         Ok(true) => Ok(()),
         Ok(false) => Err(std::io::Error::other(format!(
@@ -4464,6 +4466,8 @@ fn write_staging_beside(path: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
     use std::io::Write;
     for _ in 0..10 {
         let new = unused_beside(path, "new")?;
+        #[cfg(test)]
+        tests::run_hook("staging name chosen", &new);
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&new) {
             Ok(mut file) => {
                 if let Err(e) = file.write_all(bytes).and_then(|()| file.sync_all()) {
@@ -4747,6 +4751,29 @@ pub(crate) mod tests {
         static WRITE_MOVED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
     }
 
+    type Hook = Box<dyn FnOnce(&Path)>;
+
+    thread_local! {
+        /// Steps run once at a named point of a repair (in this test's thread): another
+        /// program acting at that moment.
+        static HOOKS: std::cell::RefCell<Vec<(&'static str, Hook)>> = std::cell::RefCell::new(Vec::new());
+    }
+
+    fn at(point: &'static str, step: impl FnOnce(&Path) + 'static) {
+        HOOKS.with(|h| h.borrow_mut().push((point, Box::new(step))));
+    }
+
+    pub(super) fn run_hook(point: &str, path: &Path) {
+        let step = HOOKS.with(|h| {
+            let mut h = h.borrow_mut();
+            let i = h.iter().position(|(p, _)| *p == point)?;
+            Some(h.remove(i).1)
+        });
+        if let Some(step) = step {
+            step(path);
+        }
+    }
+
     pub(super) fn write_moved_after_check(aside: &Path) {
         if let Some(text) = WRITE_MOVED.with(|w| w.borrow_mut().take()) {
             use std::io::Write;
@@ -4973,6 +5000,44 @@ pub(crate) mod tests {
             .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains("wc-aside"))
             .count();
         assert_eq!(aside, 0, "nothing left aside");
+    }
+
+    /// A link another program puts at the staging name right after it was chosen is not
+    /// written through: the file it points at stays as it was (#670).
+    #[cfg(unix)]
+    #[test]
+    fn a_link_put_at_the_staging_name_is_not_written_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("m.yaml");
+        std::fs::write(&path, "left").unwrap();
+        let target = tmp.path().join("outside.txt");
+        std::fs::write(&target, "theirs").unwrap();
+        let t = target.clone();
+        at("staging name chosen", move |new| {
+            std::os::unix::fs::symlink(&t, new).unwrap()
+        });
+        let left = Found::Bytes(Some(b"left".to_vec()));
+        assert!(matches!(repair_file(&path, Some(b"new"), &left).unwrap(), Repair::Done));
+        assert_eq!(std::fs::read(&target).unwrap(), b"theirs", "not written through");
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    }
+
+    /// A dangling link another program puts where a file is to be deleted, after it was moved
+    /// aside, counts as changed outside: it is left there and the repair keeps waiting (#670).
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_link_put_where_a_deleted_file_was_is_reported() {
+        let (_tmp, mut o, path, _) = macro_edited_twice();
+        let held = std::fs::read(&path).unwrap();
+        let rel = path.strip_prefix(&o.dir).unwrap().to_path_buf();
+        o.unwritten_files.insert(rel.clone(), None);
+        o.unwritten_found.insert(rel.clone(), Found::Bytes(Some(held)));
+        let nowhere = path.with_file_name("nowhere");
+        at("moved aside", move |p| std::os::unix::fs::symlink(&nowhere, p).unwrap());
+        let err = o.save().unwrap_err();
+        assert!(err.contains(Open::CHANGED_OUTSIDE), "{err}");
+        assert!(std::fs::symlink_metadata(&path).unwrap().is_symlink(), "left there");
+        assert!(o.unwritten_files.contains_key(&rel), "still waiting");
     }
 
     /// A reserved name is a file made by the reservation itself, so a second reservation (or
