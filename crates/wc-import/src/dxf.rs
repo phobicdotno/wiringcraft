@@ -735,13 +735,16 @@ fn shapes(
                 } else {
                     // A cut-down file or an xref: the block is not here to draw.
                     // The name goes into a warning a terminal shows: no control characters.
+                    // Cut to a short length first: an array can visit this INSERT many times.
                     let name: String = e
                         .get(2)
                         .unwrap_or_default()
-                        .trim()
+                        .trim_start()
                         .chars()
+                        .take(MISSING_BLOCK_NAME_LEN)
                         .map(|c| if c.is_control() { '?' } else { c })
                         .collect();
+                    let name = name.trim_end();
                     *skipped.entry(format!("{MISSING_BLOCK}{name}")).or_default() += 1;
                 }
                 None
@@ -1030,6 +1033,9 @@ const MISSING_BLOCK: &str = "INSERT of a block not in the file: ";
 
 /// How many missing block names the warning lists.
 const MISSING_BLOCK_NAMES: usize = 3;
+
+/// How many characters of a missing block's name the warning keeps.
+const MISSING_BLOCK_NAME_LEN: usize = 64;
 
 /// The key under which hatches with a boundary that is not all numbers are counted.
 /// The `skipped` key of a polyline whose points, or the arcs of its bulges, are not numbers once
@@ -2718,6 +2724,19 @@ mod tests {
         assert_eq!(
             warnings,
             ["1 block insert not drawn: its block is not in the file (X?[2J)"]
+        );
+
+        // A long name inside a block placed as an array: cut short, every copy counted.
+        let long = "L".repeat(10_000);
+        let blocks = format!("0\nBLOCK\n2\nARR\n0\nINSERT\n2\n{long}\n10\n0\n20\n0\n0\nENDBLK\n");
+        let ents = format!("{line}0\nINSERT\n2\nARR\n10\n0\n20\n0\n70\n4\n71\n5\n44\n1\n45\n1\n");
+        let (_, warnings) = symbol_with_warnings(&dxf(&ents, &blocks), "my.part", "Part")?;
+        let short = "L".repeat(MISSING_BLOCK_NAME_LEN);
+        assert_eq!(
+            warnings,
+            [format!(
+                "20 block inserts not drawn: their block is not in the file ({short})"
+            )]
         );
         Ok(())
     }
