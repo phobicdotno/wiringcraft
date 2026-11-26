@@ -1813,15 +1813,20 @@ impl Cmd {
 }
 
 /// Copy every input of `cmd` that is not a regular file (a FIFO, a character device) into a
-/// private temporary folder, under the name it has, and point the command at the copy (the
-/// same copy for an input named twice, and no more of it than the importer reads). Called
+/// private temporary folder, under the name it has, and point the command at the copy (no
+/// more of it than the importer reads). An input named again, under the same or another name,
+/// is read once: each operand gets the same bytes in a folder of its own, under its own name,
+/// as an importer may take an id from the name. Called
 /// before the project lock is taken: a FIFO that another command on the same project fills
 /// would otherwise never be read, as its writer waits for the lock this command holds while it
 /// waits for the writer (#658). Regular files, folders, `-` and paths that do not exist are
-/// left as they are, for the command to read (or report) itself. The copies are removed when
-/// the returned folder is dropped; `None` when nothing was copied.
+/// left as they are, for the command to read (or report) itself. On Unix the `.edb` folder an
+/// Eplan `.elk` stream names stays beside its copy, as a link to the one beside the operand.
+/// The copies are removed when the returned folder is dropped; `None` when nothing was copied.
 fn spool_inputs(cmd: &mut Cmd) -> Res<Option<tempfile::TempDir>> {
     use std::io::Read;
+    #[cfg(unix)]
+    let eplan = matches!(cmd, Cmd::Import(ImportCmd::Eplan { .. }));
     // An importer that reads no more than so much of its input gets no more than that: a
     // stream without an end (`/dev/zero`) would otherwise be copied until the disk is full.
     // One byte over the limit is kept, which is how the importer sees the input is too large.
@@ -1838,10 +1843,6 @@ fn spool_inputs(cmd: &mut Cmd) -> Res<Option<tempfile::TempDir>> {
             continue;
         }
         let same = std::fs::canonicalize(&*path).unwrap_or_else(|_| path.clone());
-        if let Some((_, copy)) = copied.iter().find(|(from, _)| *from == same) {
-            *path = copy.clone();
-            continue;
-        }
         let fail = |x: std::io::Error| format!("{}: {x}", escape_field(&path.display().to_string()));
         let folder = match &spool {
             Some(folder) => folder,
@@ -1851,17 +1852,57 @@ fn spool_inputs(cmd: &mut Cmd) -> Res<Option<tempfile::TempDir>> {
         let own = folder.path().join(n.to_string());
         std::fs::create_dir(&own).map_err(|x| format!("{}: {x}", own.display()))?;
         let copy = own.join(path.file_name().unwrap_or(std::ffi::OsStr::new("input")));
-        let from = std::fs::File::open(&*path).map_err(fail)?;
-        let mut to = std::fs::File::create(&copy).map_err(|x| format!("{}: {x}", copy.display()))?;
-        match limit {
-            Some(limit) => std::io::copy(&mut (&from).take(limit), &mut to),
-            None => std::io::copy(&mut &from, &mut to),
+        let at_copy = |x: std::io::Error| format!("{}: {x}", copy.display());
+        if let Some((_, first)) = copied.iter().find(|(from, _)| *from == same) {
+            // The bytes read the first time, under the name this operand has.
+            std::fs::hard_link(first, &copy)
+                .or_else(|_| std::fs::copy(first, &copy).map(|_| ()))
+                .map_err(at_copy)?;
+        } else {
+            let from = std::fs::File::open(&*path).map_err(fail)?;
+            let mut to = std::fs::File::create(&copy).map_err(at_copy)?;
+            match limit {
+                Some(limit) => std::io::copy(&mut (&from).take(limit), &mut to),
+                None => std::io::copy(&mut &from, &mut to),
+            }
+            .map_err(fail)?;
+            copied.push((same, copy.clone()));
         }
-        .map_err(fail)?;
-        copied.push((same, copy.clone()));
+        #[cfg(unix)]
+        if eplan {
+            link_elk_folder(path, &copy)?;
+        }
         *path = copy;
     }
     Ok(spool)
+}
+
+/// Beside `copy`, the copy of the Eplan `.elk` stream `operand`, a link to the `.edb` folder
+/// the file names, which the importer looks for beside the file it is given: the folder is
+/// beside the operand, not beside its copy. Nothing when the copy is not an `.elk` file or
+/// names no folder that is there, which the importer then reports itself.
+#[cfg(unix)]
+fn link_elk_folder(operand: &Path, copy: &Path) -> Res<()> {
+    use std::io::Read;
+    // The folder name is the first line; a zip of the folder is not an `.elk` file.
+    let mut head = Vec::new();
+    std::fs::File::open(copy)
+        .and_then(|f| f.take(1 << 16).read_to_end(&mut head))
+        .map_err(|x| format!("{}: {x}", copy.display()))?;
+    if head.starts_with(b"PK") {
+        return Ok(());
+    }
+    let Some(name) = wc_import::eplan::elk_target(&head) else {
+        return Ok(());
+    };
+    let folder = operand.with_file_name(&name);
+    let link = copy.with_file_name(&name);
+    if name == "." || name == ".." || link == copy || !folder.is_dir() {
+        return Ok(());
+    }
+    // An absolute target: a relative one would be looked up from the link's folder.
+    let folder = std::fs::canonicalize(&folder).map_err(|x| format!("{}: {x}", folder.display()))?;
+    std::os::unix::fs::symlink(&folder, &link).map_err(|x| format!("{}: {x}", link.display()))
 }
 
 /// The rules in `file` for `rules set`, in order, each as the check runs it: `[[rule]]`
@@ -10117,8 +10158,121 @@ mod input_tests {
         (inputs, spool.unwrap())
     }
 
+    /// A FIFO made with `mkfifo` at `path`.
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(path)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    /// One writer on another thread that opens the FIFO at `fifo` once and writes `bytes`.
+    #[cfg(unix)]
+    fn writer(fifo: &Path, bytes: Vec<u8>) -> std::thread::JoinHandle<std::io::Result<()>> {
+        use std::io::Write;
+        let fifo = fifo.to_path_buf();
+        std::thread::spawn(move || std::fs::OpenOptions::new().write(true).open(&fifo)?.write_all(&bytes))
+    }
+
+    /// Two differently named operands that are one FIFO: it is read once, each operand keeps
+    /// its own name, so the importer gives each its own id.
+    #[cfg(unix)]
+    #[test]
+    fn two_names_of_one_fifo_keep_their_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("pipe");
+        mkfifo(&fifo);
+        let (first, second) = (tmp.path().join("first.elmt"), tmp.path().join("second.elmt"));
+        std::os::unix::fs::symlink(&fifo, &first).unwrap();
+        std::os::unix::fs::symlink(&fifo, &second).unwrap();
+        let element =
+            "<definition type=\"element\"><description><terminal x=\"0\" y=\"0\"/></description></definition>";
+        let writer = writer(&fifo, element.as_bytes().to_vec());
+        let lib = tmp.path().join("lib");
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "symbol-qet".as_ref(),
+            first.as_os_str(),
+            second.as_os_str(),
+            "--lib".as_ref(),
+            lib.as_os_str(),
+        ])
+        .unwrap();
+        let (inputs, spool) = spooled(cli);
+        writer.join().unwrap().unwrap();
+        let spool = spool.unwrap();
+        assert_eq!(inputs.len(), 2);
+        for (input, operand) in inputs.iter().zip([&first, &second]) {
+            assert!(input.starts_with(spool.path()), "{inputs:?}");
+            assert_eq!(input.file_name(), operand.file_name());
+            assert_eq!(std::fs::read_to_string(input).unwrap(), element);
+        }
+        let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
+        assert_eq!((written, failed), (2, 0));
+        assert!(lib.join("symbols").join("qet.first.json").exists());
+        assert!(lib.join("symbols").join("qet.second.json").exists());
+    }
+
+    /// An Eplan `.elk` FIFO whose `.edb` folder is beside it: the importer, given the copy,
+    /// still finds the folder and reads the project's page from it.
+    #[cfg(unix)]
+    #[test]
+    fn the_folder_of_an_elk_fifo_is_found_from_its_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let edb = tmp.path().join("plant.edb");
+        std::fs::create_dir(&edb).unwrap();
+        // One page record as the importer reads it: padding, the record start, its own
+        // reference (class 4, a page, id 10), the page name and its properties block.
+        let mut page = vec![0u8; 24];
+        page.extend([0x0a, 0, 0, 0, 0x38, 0, 0xff, 0xff]);
+        page.extend(60001u16.to_le_bytes());
+        page.extend(4u16.to_le_bytes());
+        page.extend(10u32.to_le_bytes());
+        page.extend(61101u16.to_le_bytes());
+        page.extend(b"1\0");
+        page.extend(60011u16.to_le_bytes());
+        page.extend(11011u16.to_le_bytes());
+        page.extend(0u16.to_le_bytes());
+        page.extend(b"en_US@MAIN CIRCUIT;\0");
+        page.extend([0xff, 0xff]);
+        std::fs::write(edb.join("page.eod"), &page).unwrap();
+        let fifo = tmp.path().join("plant.elk");
+        mkfifo(&fifo);
+        let writer = writer(&fifo, b"plant.edb\r\n12.0\r\n".to_vec());
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "eplan".as_ref(),
+            fifo.as_os_str(),
+        ])
+        .unwrap();
+        let (inputs, spool) = spooled(cli);
+        writer.join().unwrap().unwrap();
+        let spool = spool.unwrap();
+        assert!(inputs[0].starts_with(spool.path()), "{inputs:?}");
+        let (tables, warnings) = wc_import::run::eplan_tables(&inputs[0]).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(tables.get("page.eod"), Some(&page));
+        let project = wc_import::eplan::read(&tables).unwrap();
+        let pages: Vec<(&str, &str)> = project
+            .pages
+            .iter()
+            .map(|p| (p.name.as_str(), p.description.as_str()))
+            .collect();
+        assert_eq!(pages, [("1", "MAIN CIRCUIT")]);
+        // The original folder is linked, not copied or moved: it is still where it was.
+        drop(spool);
+        assert!(edb.join("page.eod").exists());
+    }
+
     /// A FIFO named twice is read once: its one writer writes one element, both operands get
-    /// the same copy, and the importer refuses the second for its id as it does for a file.
+    /// the same bytes under the same name, and the importer refuses the second for its id as
+    /// it does for a file.
     #[cfg(unix)]
     #[test]
     fn a_fifo_named_twice_is_copied_once() {
@@ -10158,10 +10312,12 @@ mod input_tests {
         writer.join().unwrap().unwrap();
         let spool = spool.unwrap();
         assert_eq!(inputs.len(), 2);
-        assert_eq!(inputs[0], inputs[1]);
-        assert!(inputs[0].starts_with(spool.path()), "{inputs:?}");
-        assert_eq!(inputs[0].file_name(), fifo.file_name());
-        assert_eq!(std::fs::read_to_string(&inputs[0]).unwrap(), element);
+        assert_ne!(inputs[0], inputs[1]);
+        for input in &inputs {
+            assert!(input.starts_with(spool.path()), "{inputs:?}");
+            assert_eq!(input.file_name(), fifo.file_name());
+            assert_eq!(std::fs::read_to_string(input).unwrap(), element);
+        }
         let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
         assert_eq!((written, failed), (1, 1));
         assert!(lib.join("symbols").join("qet.lamp.json").exists());
