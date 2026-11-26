@@ -555,6 +555,8 @@ pub fn archive(dir: &Path, file: &Path, first_page: usize, lib: Option<&Path>, l
                     Err(format!(
                         "page {id} exists; remove it or import with --first-page to number the pages from a free number"
                     ))
+                } else if let Err(why) = number_free(&p, &number.to_string()) {
+                    Err(why)
                 } else {
                     p.pages.push(Page::new(id.clone(), number.to_string(), raw.clone()));
                     p.sort_pages();
@@ -766,6 +768,19 @@ pub fn save_imported(dir: &Path, p: &Project) -> Res<()> {
     store::save(dir, p).map(|_| ()).map_err(e)
 }
 
+/// Refuses a page number that a page of `p` already has, naming that page: two pages with one
+/// number make cross-references to it ambiguous.
+fn number_free(p: &Project, number: &str) -> Res<()> {
+    let number = number.trim();
+    match p.pages.iter().find(|pg| pg.number.trim() == number) {
+        Some(pg) => Err(format!(
+            "page number {number} is taken by page {}; import with --first-page to number the pages from a free number",
+            pg.id
+        )),
+        None => Ok(()),
+    }
+}
+
 /// `import pdf`: the pages of `file` as trace pages numbered from `first_page`. `source` names
 /// the PDF in warnings (the file name, or the entry name inside an archive, where `file` is a
 /// staging file), already escaped with [`escape_field`] by the caller.
@@ -779,6 +794,10 @@ pub fn import_pdf(dir: &Path, file: &Path, first_page: usize, source: &str, log:
     let traced = crate::pdf::pages(&bytes).map_err(e)?;
     // Checked once, before anything is written: every `first_page + i` below is in range.
     page_after(first_page, traced.len())?;
+    // Refused before anything is written, the underlay files of scanned pages too.
+    for i in 0..traced.len() {
+        number_free(&p, &(first_page + i).to_string())?;
+    }
     let stem = file
         .file_stem()
         .map(|n| n.to_string_lossy().into_owned())
@@ -1481,12 +1500,8 @@ pub fn add_built(
     if let Some(page) = built.pages.iter().find(|pg| !ids.insert(pg.id.as_str())) {
         return Err(format!("the import has page {} twice", page.id));
     }
-    let numbers: std::collections::BTreeSet<&str> = p.pages.iter().map(|pg| pg.number.as_str()).collect();
-    if let Some(page) = built.pages.iter().find(|pg| numbers.contains(pg.number.as_str())) {
-        return Err(format!(
-            "page number {} is taken; import with --first-page to number the pages from a free number",
-            page.number
-        ));
+    for page in &built.pages {
+        number_free(p, &page.number)?;
     }
     // A new version of a symbol must keep every pin a wire in the project ends on: one the lock
     // pins in another version, and one the project only has a copy of (no lock entry), which
@@ -2000,6 +2015,52 @@ mod tests {
         assert!(matches!(load(&dir), Ok(p) if p.pages.is_empty()));
         assert_eq!(page_after(MAX_FIRST_PAGE, 10), Ok(MAX_FIRST_PAGE + 10));
         assert!(page_after(usize::MAX - 1, 2).is_err());
+    }
+
+    /// No import gives a new page a number another page has (#869): each route refuses, naming
+    /// the page with that number, and the project folder stays as it was.
+    #[test]
+    fn an_import_onto_a_page_number_in_use_is_refused_and_writes_nothing() {
+        let tmp = tmp();
+        let dir = tmp.path().join("p");
+        let mut p = Project::new("t");
+        p.pages.push(Page::new("p0001", " 1 ", "Cover"));
+        p.pages.push(Page::new("x", "200", "Mine"));
+        assert!(store::save(&dir, &p).is_ok());
+        let before = files(&dir);
+        let pdf_file = tmp.path().join("sheet.pdf");
+        assert!(std::fs::write(&pdf_file, one_page_pdf()).is_ok());
+        let aml_file = tmp.path().join("plant.aml");
+        assert!(std::fs::write(&aml_file, AML).is_ok());
+        let dxf = "0\nSECTION\n2\nENTITIES\n0\nLINE\n8\n0\n10\n0\n20\n0\n11\n10\n21\n0\n0\nENDSEC\n0\nEOF\n";
+        let zip_file = tmp.path().join("plant.zip");
+        assert!(std::fs::write(&zip_file, zip_of(&[("a.dxf", dxf.as_bytes())])).is_ok());
+
+        let taken = |r: Res<()>, number: &str, page: &str| match r {
+            Err(why) => assert!(
+                why.starts_with(&format!("page number {number} is taken by page {page};"))
+                    && why.contains("--first-page"),
+                "{why}"
+            ),
+            Ok(()) => unreachable!("an import onto page number {number} went through"),
+        };
+        taken(pdf(&dir, &pdf_file, 1, &mut Log::default()), "1", "p0001");
+        taken(pdf(&dir, &pdf_file, 200, &mut Log::default()), "200", "x");
+        taken(aml(&dir, &aml_file, 200, &mut Log::default()), "200", "x");
+        // An archive goes on to its other entries: the refused one is a warning.
+        let mut log = Log::default();
+        assert_eq!(archive(&dir, &zip_file, 200, None, &mut log), Ok(()));
+        let warned: Vec<&str> = log.warnings().collect();
+        assert!(
+            matches!(warned.as_slice(), [w] if w.contains("page number 200 is taken by page x;")),
+            "{}",
+            log.text()
+        );
+        assert_eq!(files(&dir), before);
+
+        // A free number goes through.
+        assert_eq!(pdf(&dir, &pdf_file, 2, &mut Log::default()), Ok(()));
+        assert!(matches!(load(&dir), Ok(p) if p.page("pdf-2").is_some_and(|pg| pg.number == "2")));
     }
 
     #[test]
