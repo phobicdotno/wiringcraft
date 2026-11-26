@@ -901,8 +901,10 @@ fn decode(
         10 | 11 => {
             let flags = o.data.rc()?;
             let (x, y, _) = o.data.bd3()?;
-            // Control points of a spline-fitted polyline are not on the curve.
+            // Control points of a spline-fitted polyline are not on the curve: left out on
+            // purpose (as hidden), so the polyline does not take them for damaged vertices.
             if flags & 0x10 != 0 {
+                out.hidden.insert(handle);
                 return Ok(());
             }
             e.f(10, x).f(20, y);

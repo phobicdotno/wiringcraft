@@ -1095,6 +1095,45 @@ fn a_polyline_with_a_damaged_vertex_is_left_out_not_joined_across_it() -> TestRe
 }
 
 #[test]
+fn a_spline_fitted_polyline_keeps_its_fit_vertices_without_its_control_ones() -> TestResult {
+    let v = Version::R2010;
+    let mut objs = vec![
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        entry(v, LAYER, LAYER_H, "0"),
+    ];
+    let mut pl = entity(v, 15, 0x100, head(None));
+    pl.data
+        .bs(0)
+        .bs(0)
+        .bd(0.0)
+        .bd(0.0)
+        .bt(0.0)
+        .bd(0.0)
+        .be((0.0, 0.0, 1.0))
+        .bl(4);
+    pl.handles.h(4, 0x101).h(4, 0x102).h(4, 0x103).h(4, 0x104).h(3, 0x105);
+    objs.push(pl);
+    // A control vertex (flag 0x10) listed first, then three fit vertices on the curve.
+    for (n, (flags, x, y)) in [(0x10u8, 5.0, 50.0), (0, 0.0, 0.0), (0, 5.0, 5.0), (0, 10.0, 0.0)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut vx = entity(v, 10, 0x101 + n as u64, head(Some(0x100)));
+        vx.data.rc(flags).bd3((x, y, 0.0)).bd(0.0).bd(0.0).bd(0.0);
+        objs.push(vx);
+    }
+    objs.push(entity(v, 6, 0x105, head(Some(0x100))));
+    let d = drawing(&sections(v, &objs, &[]))?;
+    let [Shape::Polyline { points, .. }] = d.model.as_slice() else {
+        unreachable!("{:?} {:?}", d.model, d.skipped);
+    };
+    assert_eq!(points.len(), 3, "{points:?}");
+    assert!(points.iter().all(|p| p.y.abs() <= 5.0), "{points:?}");
+    assert!(d.skipped.is_empty(), "{:?}", d.skipped);
+    Ok(())
+}
+
+#[test]
 fn bit_values_are_read_in_every_form() -> TestResult {
     let mut w = W::default();
     w.bs(0).bs(256).bs(7).bs(4000);
