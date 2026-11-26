@@ -4288,17 +4288,24 @@ mod tests {
         until_imported(&mut a);
     }
 
-    /// Frames until the base project fetch is over (at most a few seconds).
+    /// How long [`until_fetched`] waits for the base project fetch before it calls it a hang.
+    /// The fetch runs a real git init and clone on a worker thread, which can take seconds on
+    /// a loaded CI runner (#672), so only a fetch that never ends reaches this bound.
+    const FETCH_HANG: std::time::Duration = std::time::Duration::from_secs(120);
+
+    /// Frames until the base project fetch is over, however slow the runner: it fails only
+    /// when the fetch is still going after [`FETCH_HANG`].
     fn until_fetched(a: &mut App) {
         let ctx = egui::Context::default();
-        for _ in 0..500 {
+        let start = std::time::Instant::now();
+        loop {
             a.poll_fetch(&ctx);
             if a.fetch.is_none() {
                 return;
             }
+            assert!(start.elapsed() < FETCH_HANG, "the fetch did not end in {FETCH_HANG:?}");
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(a.fetch.is_none(), "the fetch did not end");
     }
 
     #[test]
