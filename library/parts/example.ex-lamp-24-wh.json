@@ -1,0 +1,12 @@
+{
+  "description": "Indicator lamp white 24 V (example data)",
+  "id": "example.ex-lamp-24-wh",
+  "manufacturer": "Example",
+  "order_number": "EX-LAMP-24-WH",
+  "properties": {
+    "Coil voltage": "24 V",
+    "Colour": "White",
+    "Mounting": "Door"
+  },
+  "symbol": "wc.lamp"
+}
