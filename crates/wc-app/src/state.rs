@@ -218,7 +218,8 @@ struct FileEdit {
 
 /// Write `edits` (in project folder `dir`) as they were before them (`undo`, newest first) or
 /// after them, each replaced whole ([`restore_file`]), so a failed write leaves the file as it
-/// was; a file there was none of is removed. When one cannot be written, those already written are put back as they were just
+/// was; a file there was none of is removed. Nothing is written when a file was changed outside
+/// since ([`changed_outside`]). When one cannot be written, those already written are put back as they were just
 /// before this call (a change made outside since stays). The error names every file of
 /// `edits` left other than written: the one that failed with its reason, those put back,
 /// those that could not be put back with their reason, and those not reached. Returns the
@@ -229,6 +230,7 @@ fn write_edits(dir: &Path, edits: &[FileEdit], undo: bool) -> Result<Written, St
     } else {
         edits.iter().collect()
     };
+    changed_outside(dir, &order, undo)?;
     let mut written: Written = Vec::new();
     for (i, e) in order.iter().enumerate() {
         let text = if undo { &e.before } else { &e.after };
@@ -261,6 +263,33 @@ fn write_edits(dir: &Path, edits: &[FileEdit], undo: bool) -> Result<Written, St
         }
     }
     Ok(written)
+}
+
+/// Refuse to write `order` (the edits of [`write_edits`], in the order it writes them) when a
+/// file does not hold what its edit left there: the text after the edit for `undo`, the text
+/// before it otherwise (#657). Then another program changed the file since, and writing the
+/// recorded text would lose that change. Only the first edit of each file is compared: the
+/// later ones follow what this call writes.
+fn changed_outside(dir: &Path, order: &[&FileEdit], undo: bool) -> Result<(), String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut changed = Vec::new();
+    for e in order {
+        if !seen.insert(&e.path) {
+            continue;
+        }
+        let expected = if undo { &e.after } else { &e.before };
+        let path = dir.join(&e.path);
+        if snapshot_file(&path)?.as_deref() != expected.as_deref().map(str::as_bytes) {
+            changed.push(path.display().to_string());
+        }
+    }
+    if changed.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "Not done, and nothing was changed: {} was changed outside this window since, and this would write over that change.",
+        changed.join("; ")
+    ))
 }
 
 /// Files [`write_edits`] wrote, each as it was just before, in the order written.
@@ -8049,8 +8078,7 @@ pub(crate) mod tests {
     fn a_failed_replay_puts_files_back_as_they_were_and_names_every_file_left() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        // a was changed outside since its edit was recorded.
-        for (name, text) in [("a.json", "outside"), ("b.json", "B0"), ("c.json", "C0")] {
+        for (name, text) in [("a.json", "A0"), ("b.json", "B0"), ("c.json", "C0")] {
             std::fs::write(dir.join(name), text).unwrap();
         }
         let edit = |name: &str, before: &str, after: &str| FileEdit {
@@ -8066,11 +8094,56 @@ pub(crate) mod tests {
         std::fs::create_dir(dir.join("b.json.tmp")).unwrap();
         let err = write_edits(dir, &edits, false).unwrap_err();
         let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
-        assert_eq!(read("a.json"), "outside", "as it was, not as recorded");
+        assert_eq!(read("a.json"), "A0", "put back");
         assert_eq!((read("b.json"), read("c.json")), ("B0".into(), "C0".into()));
         assert!(err.contains("b.json could not be written"), "{err}");
         assert!(err.contains("put back as it was:") && err.contains("a.json"), "{err}");
         assert!(err.contains("not written:") && err.contains("c.json"), "{err}");
+    }
+
+    #[test]
+    fn a_replay_writes_nothing_when_a_file_was_changed_outside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let edit = |name: &str, before: Option<&str>, after: Option<&str>| FileEdit {
+            path: PathBuf::from(name),
+            before: before.map(str::to_owned),
+            after: after.map(str::to_owned),
+        };
+        // b was written twice in the step: only what the step left last is compared.
+        let edits = [
+            edit("a.json", Some("A0"), Some("A1")),
+            edit("b.json", None, Some("B1")),
+            edit("b.json", Some("other"), Some("B2")),
+            edit("c.json", Some("C0"), None),
+        ];
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).ok();
+        let all = || [read("a.json"), read("b.json"), read("c.json")];
+        let texts = |t: [Option<&str>; 3]| t.map(|t| t.map(str::to_owned));
+        let put = |name: &str, text: &str| std::fs::write(dir.join(name), text).unwrap();
+
+        // Redo: every file as it was before the step, but c, changed outside since.
+        put("a.json", "A0");
+        put("c.json", "outside");
+        let err = write_edits(dir, &edits, false).unwrap_err();
+        assert!(err.contains("c.json") && err.contains("changed outside"), "{err}");
+        assert!(!err.contains("a.json") && !err.contains("b.json"), "{err}");
+        assert_eq!(all(), texts([Some("A0"), None, Some("outside")]), "nothing written");
+        put("c.json", "C0");
+        write_edits(dir, &edits, false).unwrap();
+        assert_eq!(all(), texts([Some("A1"), Some("B2"), None]));
+
+        // Undo: b is gone and c is there again, where the step left neither so.
+        std::fs::remove_file(dir.join("b.json")).unwrap();
+        put("c.json", "new");
+        let err = write_edits(dir, &edits, true).unwrap_err();
+        assert!(err.contains("b.json") && err.contains("c.json"), "{err}");
+        assert!(!err.contains("a.json"), "{err}");
+        assert_eq!(all(), texts([Some("A1"), None, Some("new")]), "nothing written");
+        put("b.json", "B2");
+        std::fs::remove_file(dir.join("c.json")).unwrap();
+        write_edits(dir, &edits, true).unwrap();
+        assert_eq!(all(), texts([Some("A0"), None, Some("C0")]));
     }
 
     #[test]
@@ -8097,30 +8170,74 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn undo_and_redo_that_fail_on_library_files_leave_a_macro_changed_outside_as_it_was() {
+    fn undo_and_redo_that_fail_on_library_files_leave_a_macro_as_it_was() {
         let (_tmp, mut o) = project();
         let id = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
         let clip = o.copy(1, &[Selection::Symbol(id)]);
         let path = o.save_macro(&clip, "Coil", "").unwrap();
+        let first = std::fs::read_to_string(&path).unwrap();
         let mut form = crate::macro_form::Form::open(&path).unwrap();
         form.description = "A coil".into();
         o.save_macro_form(&form).unwrap();
+        let edited = std::fs::read_to_string(&path).unwrap();
         let symbol = o.project.lock.symbols.keys().next().unwrap().clone();
-        // The macro is changed outside, then the step's symbol file cannot be written.
+        // The macro is written, then the step's symbol file cannot be.
         let fail = |o: &mut Open| {
-            std::fs::write(&path, "outside").unwrap();
             o.stale_symbol_files.insert(symbol.clone());
             o.fail_symbol_writes = [true].into();
         };
         fail(&mut o);
         assert!(!o.undo());
         assert!(o.take_undo_error().is_some());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "outside", "Undo");
-        assert!(o.undo());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited, "Undo");
+        assert!(o.undo(), "{:?}", o.take_undo_error());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
         fail(&mut o);
         assert!(!o.redo());
         assert!(o.take_undo_error().is_some());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "outside", "Redo");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), first, "Redo");
+    }
+
+    #[test]
+    fn undo_and_redo_do_not_write_over_a_macro_changed_outside() {
+        let (_tmp, mut o) = project();
+        let id = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let clip = o.copy(1, &[Selection::Symbol(id)]);
+        let path = o.save_macro(&clip, "Coil", "").unwrap();
+        let first = std::fs::read_to_string(&path).unwrap();
+        let mut form = crate::macro_form::Form::open(&path).unwrap();
+        form.description = "A coil".into();
+        o.save_macro_form(&form).unwrap();
+        let edited = std::fs::read_to_string(&path).unwrap();
+        o.project.pages[0].title = "With the macro".into();
+        let (project, steps) = (o.project.clone(), o.undo_steps());
+        let name = path.display().to_string();
+
+        // Another program writes the macro after the edit: Undo leaves it and says why.
+        std::fs::write(&path, "outside").unwrap();
+        assert!(!o.undo());
+        let err = o.take_undo_error().unwrap_or_default();
+        assert!(err.contains(&name) && err.contains("changed outside"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "outside");
+        assert_eq!((&o.project, o.undo_steps()), (&project, steps), "nothing changed");
+        assert!(!o.can_redo());
+        // With the file as the edit left it, Undo goes through.
+        std::fs::write(&path, &edited).unwrap();
+        assert!(o.undo(), "{:?}", o.take_undo_error());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
+
+        // The same for Redo.
+        let undone = o.project.clone();
+        std::fs::write(&path, "outside").unwrap();
+        assert!(!o.redo());
+        let err = o.take_undo_error().unwrap_or_default();
+        assert!(err.contains(&name) && err.contains("changed outside"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "outside");
+        assert_eq!((&o.project, o.undo_steps()), (&undone, steps - 1), "nothing changed");
+        std::fs::write(&path, &first).unwrap();
+        assert!(o.redo(), "{:?}", o.take_undo_error());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+        assert_eq!(o.project, project);
     }
 
     #[test]
@@ -8315,23 +8432,50 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn undo_and_redo_write_translations_as_recorded_like_any_project_file() {
+    fn undo_and_redo_do_not_write_over_translations_changed_outside() {
         let (_tmp, mut o) = project();
+        let path = o.dir.join(wc_core::translate::TRANSLATIONS_FILE);
         assert!(translate(&mut o, "Control", "Styring"));
-        let first = translations_file(&o);
+        let first = translations_file(&o).unwrap_or_default();
         // Changed outside before the next edit: that edit's step starts from it.
         let outside = "source = \"en\"\n\n[[text]]\nen = \"Control\"\nnb = \"Kontroll\"\n";
-        std::fs::write(o.dir.join(wc_core::translate::TRANSLATIONS_FILE), outside).unwrap();
+        std::fs::write(&path, outside).unwrap();
         assert!(translate(&mut o, "Main", "Hoved"));
         let second = translations_file(&o);
         assert!(o.undo());
         assert_eq!(translations_file(&o).as_deref(), Some(outside));
-        // The step before it puts the file back as it recorded it, as a macro's step does.
-        assert!(o.undo());
+
+        // The step before it left another text than the file holds now: Undo of it would
+        // write over the outside change, so it is refused, as a macro's step is.
+        let (project, steps) = (o.project.clone(), o.undo_steps());
+        assert!(!o.undo());
+        let err = o.take_undo_error().unwrap_or_default();
+        assert!(
+            err.contains(wc_core::translate::TRANSLATIONS_FILE) && err.contains("changed outside"),
+            "{err}"
+        );
+        assert_eq!(translations_file(&o).as_deref(), Some(outside), "left as it is");
+        assert_eq!((&o.project, o.undo_steps()), (&project, steps), "nothing changed");
+        // With the file as that step left it, Undo goes through and removes it.
+        std::fs::write(&path, &first).unwrap();
+        assert!(o.undo(), "{:?}", o.take_undo_error());
         assert_eq!(translations_file(&o), None);
-        assert!(o.redo());
-        assert_eq!(translations_file(&o), first);
-        assert!(o.redo());
+
+        // Redo of the first translation expects no file: one written outside meanwhile stays.
+        std::fs::write(&path, outside).unwrap();
+        assert!(!o.redo());
+        let err = o.take_undo_error().unwrap_or_default();
+        assert!(err.contains("changed outside"), "{err}");
+        assert_eq!(translations_file(&o).as_deref(), Some(outside), "left as it is");
+        assert_eq!(o.undo_steps(), steps - 1);
+        std::fs::remove_file(&path).unwrap();
+        assert!(o.redo(), "{:?}", o.take_undo_error());
+        assert_eq!(translations_file(&o).as_deref(), Some(first.as_str()));
+        // The next Redo expects the outside text its edit started from.
+        assert!(!o.redo());
+        assert!(o.take_undo_error().is_some());
+        std::fs::write(&path, outside).unwrap();
+        assert!(o.redo(), "{:?}", o.take_undo_error());
         assert_eq!(translations_file(&o), second);
     }
 

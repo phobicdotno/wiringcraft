@@ -81,7 +81,7 @@ For the other areas, the chapter to read in each help is:
 | Project templates and base projects | yes | yes (project templates) | yes: `wiringcraft new <dir> --template <folder or git URL>` and "Start from" in New project; `{name}` and `{date}` filled in | done (#270) |
 | Project properties (customer, dates, revision ...) | yes | yes | yes | done |
 | Project archive (pack and unpack) | yes | yes (.tewzip) | yes: import of archives, projects are plain folders | done |
-| Multi-language project texts and translation dictionary | yes | yes | yes: `translations.toml` dictionary, `wiringcraft pdf --lang nb` (or `nb,en` for two), `wiringcraft translations --lang nb` lists missing texts; in the app, File, Translations edits the texts with a column per language (missing ones marked) and the PDF export asks for the language; Undo and Redo take back and bring back translation edits made in the app or by its assistant (#589; not in a shared session, whose history does not hold the file) | done: CLI (#276), app (#451) |
+| Multi-language project texts and translation dictionary | yes | yes | yes: `translations.toml` dictionary, `wiringcraft pdf --lang nb` (or `nb,en` for two), `wiringcraft translations --lang nb` lists missing texts; in the app, File, Translations edits the texts with a column per language (missing ones marked) and the PDF export asks for the language; Undo and Redo take back and bring back translation edits made in the app or by its assistant (#589; not in a shared session, whose history does not hold the file), and refuse the step when another program changed the file since, so that change is not written over (#657) | done: CLI (#276), app (#451) |
 
 ## 2. Editing on the sheet
 
