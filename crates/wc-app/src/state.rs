@@ -382,8 +382,6 @@ pub(crate) struct Mark {
     /// The symbols loaded at the mark, so one the change replaced (a pinned version loaded
     /// over another, say) is put back too.
     symbols: BTreeMap<String, Symbol>,
-    /// The symbol list rows at the mark, put back with the symbols.
-    library: Vec<(String, String)>,
     parts: std::collections::BTreeSet<String>,
     /// The symbol list as it was: a symbol the change loaded may have added or changed a row.
     library: Vec<LibraryEntry>,
@@ -3266,7 +3264,6 @@ impl Open {
         Mark {
             kept,
             symbols: self.symbols.clone(),
-            library: self.library.clone(),
             parts: self.parts.keys().cloned().collect(),
             library: self.library.clone(),
             files: vendor_names(&self.dir),
@@ -3360,7 +3357,6 @@ impl Open {
             }
         }
         self.symbols = mark.symbols;
-        self.library = mark.library;
         // A file waiting to be written (from a change taken back inside this one, say) is let
         // go when the loaded symbol is gone or not the version the project pins, so a save
         // never writes a version the lock does not name.
