@@ -34,6 +34,9 @@ jobs:
       # changed by hand in library/symbols must be added to tools/gen_starter_symbols.py too.
       - name: Starter symbols match their generator
         run: |
+          # Start from an empty folder, so a committed symbol with no sym(...) call shows
+          # up as deleted.
+          rm -f library/symbols/*.json
           python3 tools/gen_starter_symbols.py
           git status --porcelain -- library/symbols
           test -z "$(git status --porcelain -- library/symbols)"
