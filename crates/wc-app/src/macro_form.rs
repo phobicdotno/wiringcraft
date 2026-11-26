@@ -34,12 +34,23 @@ pub struct SetRow {
     pub undeclared: BTreeMap<String, String>,
 }
 
+/// A value set given by its values' placeholder names, as the assistant sets it: a placeholder
+/// without a value uses its default, and an empty value is stored empty.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct NamedSet {
+    pub name: String,
+    pub description: String,
+    pub values: BTreeMap<String, String>,
+}
+
 /// A project macro's placeholders and value sets, being edited.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Form {
     pub path: PathBuf,
     /// The macro as read, the rest of which is saved unchanged.
     pub base: Macro,
+    /// The macro's description.
+    pub description: String,
     pub placeholders: Vec<PlaceholderRow>,
     pub sets: Vec<SetRow>,
 }
@@ -58,33 +69,14 @@ impl Form {
                 default: p.default.clone(),
             })
             .collect();
-        let value = |v: &ValueSet, name: &str| {
-            v.values
-                .iter()
-                .find(|(k, _)| key(k) == key(name))
-                .map(|(_, v)| v.clone())
-        };
         let sets = base
             .value_sets
             .iter()
-            .map(|v| {
-                let values: Vec<Option<String>> = placeholders.iter().map(|p| value(v, &p.name)).collect();
-                SetRow {
-                    name: v.name.clone(),
-                    description: v.description.clone(),
-                    stored_empty: values.iter().map(|v| v.as_deref() == Some("")).collect(),
-                    values: values.into_iter().map(Option::unwrap_or_default).collect(),
-                    undeclared: v
-                        .values
-                        .iter()
-                        .filter(|(k, _)| !placeholders.iter().any(|p| key(&p.name) == key(k)))
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect(),
-                }
-            })
-            .collect();
+            .map(|v| set_row(v.name.clone(), v.description.clone(), &v.values, &placeholders))
+            .collect::<Result<_, _>>()?;
         Ok(Form {
             path: path.to_owned(),
+            description: base.description.clone(),
             base,
             placeholders,
             sets,
@@ -124,11 +116,68 @@ impl Form {
         });
     }
 
+    /// Put `rows` in place of the placeholders, keeping each value set's values for the ones
+    /// kept (by [`PlaceholderRow::was`]; a row without one that names a placeholder already
+    /// there keeps it, unless another row renames that placeholder).
+    pub fn set_placeholders(&mut self, mut rows: Vec<PlaceholderRow>) {
+        // A placeholder a row renames is that row's: a new row with its old name is new.
+        let claimed: Vec<String> = rows
+            .iter()
+            .filter(|r| !r.was.trim().is_empty())
+            .map(|r| key(&r.was))
+            .collect();
+        for r in &mut rows {
+            if r.was.trim().is_empty()
+                && let Some(p) = self
+                    .placeholders
+                    .iter()
+                    .find(|p| !p.was.is_empty() && key(&p.was) == key(&r.name) && !claimed.contains(&key(&p.was)))
+            {
+                r.was = p.was.clone();
+            }
+        }
+        for s in &mut self.sets {
+            let old: Vec<(&str, String, bool)> = self
+                .placeholders
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let v = s.values.get(i).cloned().unwrap_or_default();
+                    (p.was.as_str(), v, s.stored_empty.get(i).copied().unwrap_or(false))
+                })
+                .collect();
+            let kept: Vec<(String, bool)> = rows
+                .iter()
+                .map(|r| {
+                    old.iter()
+                        .find(|(was, ..)| !r.was.trim().is_empty() && key(was) == key(&r.was))
+                        .map(|(_, v, e)| (v.clone(), *e))
+                        .unwrap_or_default()
+                })
+                .collect();
+            (s.values, s.stored_empty) = kept.into_iter().unzip();
+        }
+        self.placeholders = rows;
+    }
+
+    /// Put `sets` in place of the value sets, their values matched to the placeholders by
+    /// name. Values for names no placeholder has are kept, so that saving reports them.
+    pub fn set_value_sets(&mut self, sets: Vec<NamedSet>) -> Result<(), String> {
+        self.sets = sets
+            .into_iter()
+            .map(|s| set_row(s.name, s.description, &s.values, &self.placeholders))
+            .collect::<Result<_, _>>()?;
+        Ok(())
+    }
+
     /// The macro the form describes: placeholders renamed in its texts, the value sets filled
     /// from the table (an empty cell keeps the default, unless it was stored empty). Checked
     /// with [`Macro::check`].
     pub fn to_macro(&self) -> Result<Macro, String> {
         let mut m = self.base.clone();
+        if self.description != self.base.description {
+            m.description = self.description.trim().to_owned();
+        }
         let renames: Vec<(&str, &str)> = self
             .placeholders
             .iter()
@@ -196,6 +245,44 @@ impl Form {
             .ok_or_else(|| format!("{} is not in a macros folder", self.path.display()))?;
         wc_core::macros::write_macro(root, id, &m).map_err(|e| e.to_string())
     }
+}
+
+/// The row for value set `name` with `values` by placeholder name (matched without regard to
+/// case): a placeholder without a value uses its default, an empty value is stored empty, and
+/// values for names no placeholder has are kept, so that saving reports them. Two values for one
+/// name (such as `KW` and `kW`) are an error, since saving would keep only one of them.
+fn set_row(
+    name: String,
+    description: String,
+    values: &BTreeMap<String, String>,
+    placeholders: &[PlaceholderRow],
+) -> Result<SetRow, String> {
+    let mut seen = BTreeMap::new();
+    for k in values.keys() {
+        if let Some(other) = seen.insert(key(k), k) {
+            return Err(format!(
+                "Value set {name} gives {other} and {k}, which are one placeholder."
+            ));
+        }
+    }
+    let value = |p: &PlaceholderRow| {
+        values
+            .iter()
+            .find(|(k, _)| key(k) == key(&p.name))
+            .map(|(_, v)| v.clone())
+    };
+    let found: Vec<Option<String>> = placeholders.iter().map(value).collect();
+    Ok(SetRow {
+        stored_empty: found.iter().map(|v| v.as_deref() == Some("")).collect(),
+        values: found.into_iter().map(Option::unwrap_or_default).collect(),
+        undeclared: values
+            .iter()
+            .filter(|(k, _)| !placeholders.iter().any(|p| key(&p.name) == key(k)))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        name,
+        description,
+    })
 }
 
 fn field(ui: &mut egui::Ui, value: &mut String, width: f32, hint: &str) -> bool {
