@@ -1170,9 +1170,11 @@ enum LibCmd {
     /// Pin every used item that is not pinned yet, and write a pinned item's vendored copy again
     /// when it is missing or unreadable.
     Lock,
-    /// Find symbols and parts in the library sources by id, name, category or description.
+    /// Find symbols and parts in the library sources by id, name, category, letter code or
+    /// description.
     Search {
-        /// The text to look for; upper and lower case are alike.
+        /// The words to look for: an item matches when it contains every word, in any order;
+        /// upper and lower case are alike.
         query: String,
     },
     /// Offer the project's copy of an item back to a source for review.

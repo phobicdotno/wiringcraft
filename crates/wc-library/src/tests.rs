@@ -158,6 +158,25 @@ fn search_finds_by_category() -> Result<()> {
 }
 
 #[test]
+fn search_matches_every_word_in_any_order_and_the_letter_code() -> Result<()> {
+    let f = fixture()?;
+    let mut breaker = sym("breaker3", 10.0);
+    breaker.name = "Circuit breaker, 3-pole".into();
+    breaker.category = "protection".into();
+    breaker.letter_code = "Q".into();
+    write_symbol(&f.company, &breaker)?;
+    let lib = Library::open(&f.proj, &f.project)?;
+    let ids = |q: &str| lib.search(q).into_iter().map(|h| h.id).collect::<Vec<_>>();
+    assert_eq!(ids("breaker 3-pole"), ["breaker3"]);
+    assert_eq!(ids("3-POLE   Circuit"), ["breaker3"]);
+    assert!(ids("breaker 4-pole").is_empty());
+    assert_eq!(ids("q protection"), ["breaker3"]);
+    assert_eq!(ids("k relays").len(), 2);
+    assert_eq!(ids("").len(), 3);
+    Ok(())
+}
+
+#[test]
 fn macros_are_listed_per_source_in_order() -> Result<()> {
     let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
     let m = wc_core::macros::Macro {
