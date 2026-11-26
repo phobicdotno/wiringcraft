@@ -662,6 +662,10 @@ impl SymbolEditor {
         match (item, handle) {
             (Item::Shape(i), Some(k)) => {
                 if let Some(g) = self.symbol.graphics.get_mut(i)
+                    // The pointer itself on an arc's centre has no direction, wherever on the
+                    // handle the drag started: test it before the grab offset is added.
+                    && !matches!(g, Shape::Arc { center, .. }
+                        if (p.x - center.x).hypot(p.y - center.y) < 1e-6)
                     && let Some(h) = handles(g).get(k).copied()
                     // A circle or arc rounds its own radius; snapping the point first would
                     // lose radius and angle when dragging off the axes.
@@ -1778,6 +1782,15 @@ mod tests {
         assert_eq!(e.symbol.graphics[0], arc);
         assert!(e.undo.is_empty());
         assert_eq!(with_handle(&arc, 0, Point::new(1e-12, -1e-12)), None);
+        // Grabbed half a millimetre off the handle: the pointer on the centre still changes
+        // nothing (the handle plus the pointer's move would be (0, -0.5), about 270 degrees).
+        e.selected = Some(Item::Shape(0));
+        e.start_drag(Point::new(-5.0, 0.5));
+        assert!(e.drag.as_ref().is_some_and(|d| d.handle == Some(1)));
+        e.drag_to(Point::new(0.0, 0.0));
+        e.end_drag();
+        assert_eq!(e.symbol.graphics[0], arc);
+        assert!(e.undo.is_empty());
     }
 
     #[test]
