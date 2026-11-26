@@ -1515,7 +1515,8 @@ impl PlcPoint {
 /// PLC I/O list: every PLC input and output drawn, with its address, the device it belongs to
 /// and what it is wired to. The address is the device property `Address` (or `PLC address`);
 /// points without one sort last so the gaps are visible. Each row links to its page
-/// ([`Table::row_pages`]).
+/// ([`Table::row_pages`]). Overview pages (`Page::overview`) are skipped, because an overview
+/// draws devices again and would list each point twice.
 pub fn plc_io_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new(
         "PLC I/O list",
@@ -1540,7 +1541,8 @@ pub(crate) fn plc_points(i: &Inputs<'_>) -> Vec<PlcPoint> {
     // (no address, address sort key, point)
     type Row = (bool, Vec<(String, u64)>, PlcPoint);
     let mut rows: Vec<Row> = Vec::new();
-    for page in &i.project.pages {
+    // An overview (line diagram) draws devices again; each point is listed once.
+    for page in i.project.pages.iter().filter(|pg| !pg.overview) {
         for s in &page.symbols {
             let Some(sym) = i.symbols.get(&s.symbol) else { continue };
             let Some(kind) = plc_kind(sym) else { continue };

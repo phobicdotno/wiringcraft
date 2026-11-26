@@ -921,6 +921,44 @@ fn plc_io_list_and_contents() {
 }
 
 #[test]
+fn plc_points_repeated_on_an_overview_page_are_listed_once() {
+    let (mut p, mut s, parts) = fixture();
+    let mut input = sym("wc.plc.input", SymbolRole::Standalone, &["I"]);
+    input.category = "plc".into();
+    s.insert(input.id.clone(), input);
+    p.pages[0]
+        .symbols
+        .push(place("i1", "wc.plc.input", 300.0, Some("-A1.I1")));
+    let mut overview = Page::new("ov", "1", "Overview");
+    overview.overview = true;
+    overview
+        .symbols
+        .push(place("i1", "wc.plc.input", 300.0, Some("-A1.I1")));
+    p.pages.insert(0, overview);
+    p.devices.insert(
+        DeviceTag::parse("-A1.I1").unwrap(),
+        Device {
+            properties: [("Address".to_string(), "%I0.2".to_string())].into_iter().collect(),
+            ..Default::default()
+        },
+    );
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    // Listed once, linked to the schematic page, and declared once.
+    let t = build(Kind::Plc, &i);
+    assert_eq!(t.rows.len(), 1);
+    assert_eq!(t.rows[0][2], "-A1.I1");
+    assert_eq!(t.rows[0][5], "2");
+    assert_eq!(t.row_pages, [p.pages[1].id.clone()]);
+    let v = plc_variables(&i);
+    assert_eq!(v.variables, 1);
+    assert!(!v.text.contains("A1_I1_2"));
+}
+
+#[test]
 fn the_location_list_counts_devices_and_names_unlisted_locations() {
     let mut p = Project::new("t");
     for t in ["+L1-K1", "+L1-K2", "+L2.A-K3", "-K4"] {
