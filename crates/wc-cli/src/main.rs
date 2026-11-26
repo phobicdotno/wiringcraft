@@ -10037,6 +10037,15 @@ mod input_tests {
                 .collect();
             assert_eq!(got, want, "{args:?}");
         }
+        // A library folder is not an input, also where the command can do without one.
+        for args in [
+            &["import", "archive", "in", "--lib", "lib"][..],
+            &["import", "swe-library", "in", "--lib", "lib"],
+        ] {
+            let mut cli = Cli::try_parse_from(["wiringcraft"].iter().chain(args)).unwrap();
+            let got: Vec<PathBuf> = cli.cmd.inputs_mut().into_iter().map(|p| p.clone()).collect();
+            assert_eq!(got, [PathBuf::from("in")], "{args:?}");
+        }
         // A command that takes a path which is not an output or a folder is in the list above,
         // so a new command with an input file fails here until it is covered.
         let mut found = Vec::new();
