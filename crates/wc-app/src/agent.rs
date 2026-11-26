@@ -2995,6 +2995,7 @@ impl App {
                     "used_in_texts": m.used_placeholders(), "error": entry.error
                 })))
             }
+            "edit" if self.share.active() => Err(Open::MACRO_SAVE_SHARED.to_owned()),
             "edit" => {
                 let entry = find_macro(open, need_s(v, "name")?)?;
                 if !entry.project {
@@ -6051,6 +6052,27 @@ mod tests {
                 "{set} is inserted with {text}"
             );
         }
+    }
+
+    #[test]
+    fn the_assistant_does_not_edit_a_macro_in_a_shared_session() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        let id = open.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let clip = open.copy(1, &[Selection::Symbol(id)]);
+        let path = open.save_macro(&clip, "Coil", "").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let open = a.open.as_mut().unwrap();
+        a.share.start_host(open, "Hanna", "hanna@example.com").unwrap();
+        // The session's Undo could not take the file back, so the edit is refused.
+        let err = call(
+            &mut a,
+            "macros",
+            json!({"action": "edit", "name": "Coil", "description": "A coil"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("shared session"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     #[test]

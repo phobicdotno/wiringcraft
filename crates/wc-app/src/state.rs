@@ -209,14 +209,17 @@ impl Step {
 /// A project file a change rewrote: what it held before and after.
 #[derive(Debug, Clone, PartialEq)]
 struct FileEdit {
+    /// Relative to the project folder, so after Save as it names the file in the copy.
     path: PathBuf,
     before: String,
     after: String,
 }
 
-/// Write `edits` as they were before them (`undo`, newest first) or after them. When one cannot
-/// be written, those already written are put back and the error names the file.
-fn write_edits(edits: &[FileEdit], undo: bool) -> Result<(), String> {
+/// Write `edits` (in project folder `dir`) as they were before them (`undo`, newest first) or
+/// after them, each replaced whole ([`restore_file`]), so a failed write leaves the file as it
+/// was. When one cannot be written, those already written are put back; the error names the
+/// file, and each file that could not be put back with its reason.
+fn write_edits(dir: &Path, edits: &[FileEdit], undo: bool) -> Result<(), String> {
     let order: Vec<&FileEdit> = if undo {
         edits.iter().rev().collect()
     } else {
@@ -224,11 +227,24 @@ fn write_edits(edits: &[FileEdit], undo: bool) -> Result<(), String> {
     };
     for (i, e) in order.iter().enumerate() {
         let text = if undo { &e.before } else { &e.after };
-        if let Err(err) = std::fs::write(&e.path, text) {
-            for done in order[..i].iter().rev() {
-                let _ = std::fs::write(&done.path, if undo { &done.after } else { &done.before });
+        let path = dir.join(&e.path);
+        if let Err(err) = restore_file(&path, Some(text.as_bytes())) {
+            let mut msg = format!("{} could not be written: {err}", path.display());
+            let stuck: Vec<String> = order[..i]
+                .iter()
+                .rev()
+                .filter_map(|done| {
+                    let path = dir.join(&done.path);
+                    let was = if undo { &done.after } else { &done.before };
+                    restore_file(&path, Some(was.as_bytes()))
+                        .err()
+                        .map(|e| format!("{}: {e}", path.display()))
+                })
+                .collect();
+            if !stuck.is_empty() {
+                msg.push_str(&format!("; written already and not put back: {}", stuck.join("; ")));
             }
-            return Err(format!("{} could not be written: {err}", e.path.display()));
+            return Err(msg);
         }
     }
     Ok(())
@@ -241,6 +257,8 @@ pub(crate) struct Mark {
     parts: std::collections::BTreeSet<String>,
     /// The vendored symbol and part files there were, or why that is not known.
     files: Result<std::collections::BTreeSet<(ItemKind, String)>, String>,
+    /// Where the change's own project file edits start in [`Open::mark_edits`].
+    edits_from: usize,
 }
 
 /// The vendored symbol and part files by kind and id (plain files only, not links), from folders
@@ -330,6 +348,10 @@ pub struct Open {
     /// hold the library's new version while the lock pins the old one. The next save writes
     /// each again first, and does not go ahead while one cannot be.
     unrestored_files: BTreeMap<PathBuf, UnrestoredFile>,
+    /// Project files rewritten while a [`Mark`] is open (`marks` counts them), oldest first,
+    /// so [`Open::back_to`] puts them back even when their undo steps fell off the history.
+    mark_edits: Vec<FileEdit>,
+    marks: usize,
     /// Tests: whether each coming symbol file write fails, in order.
     #[cfg(test)]
     pub(crate) fail_symbol_writes: std::collections::VecDeque<bool>,
@@ -405,6 +427,8 @@ impl Open {
             part_versions: BTreeMap::new(),
             stale_symbol_files: Default::default(),
             unrestored_files: BTreeMap::new(),
+            mark_edits: Vec::new(),
+            marks: 0,
             #[cfg(test)]
             fail_symbol_writes: Default::default(),
             #[cfg(test)]
@@ -1141,7 +1165,7 @@ impl Open {
         self.follow_terminals();
         match self.undo.pop() {
             Some(prev) => {
-                if let Err(e) = write_edits(&prev.files, true) {
+                if let Err(e) = write_edits(&self.dir, &prev.files, true) {
                     self.undo_error = Some(e);
                     self.undo.push(prev);
                     return false;
@@ -1160,7 +1184,10 @@ impl Open {
                 if let Err(e) = self.sync_vendored(&left) {
                     // The vendored files could not follow: keep the project as it was.
                     if let Some(cur) = self.redo.pop() {
-                        let _ = write_edits(&cur.files, false);
+                        let e = match write_edits(&self.dir, &cur.files, false) {
+                            Ok(()) => e,
+                            Err(files) => format!("{e}\n{files}"),
+                        };
                         let restored = std::mem::replace(&mut self.project, cur.project);
                         self.undo_error = Some(e);
                         self.undo.push(Step {
@@ -1184,7 +1211,7 @@ impl Open {
         self.follow_terminals();
         match self.redo.pop() {
             Some(next) => {
-                if let Err(e) = write_edits(&next.files, false) {
+                if let Err(e) = write_edits(&self.dir, &next.files, false) {
                     self.undo_error = Some(e);
                     self.redo.push(next);
                     return false;
@@ -1202,7 +1229,10 @@ impl Open {
                     .unwrap_or_default();
                 if let Err(e) = self.sync_vendored(&left) {
                     if let Some(cur) = self.undo.pop() {
-                        let _ = write_edits(&cur.files, true);
+                        let e = match write_edits(&self.dir, &cur.files, true) {
+                            Ok(()) => e,
+                            Err(files) => format!("{e}\n{files}"),
+                        };
                         let restored = std::mem::replace(&mut self.project, cur.project);
                         self.undo_error = Some(e);
                         self.redo.push(Step {
@@ -2706,17 +2736,28 @@ impl Open {
     pub(crate) fn mark(&mut self) -> Mark {
         let kept = self.set_aside();
         self.undo_dropped += kept.undo.len();
+        self.marks += 1;
         Mark {
             kept,
             symbols: self.symbols.keys().cloned().collect(),
             parts: self.parts.keys().cloned().collect(),
             files: vendor_names(&self.dir),
+            edits_from: self.mark_edits.len(),
+        }
+    }
+
+    /// A [`Mark`] ends: the file edits kept for it are let go once no mark is open.
+    fn end_mark(&mut self) {
+        self.marks = self.marks.saturating_sub(1);
+        if self.marks == 0 {
+            self.mark_edits.clear();
         }
     }
 
     /// The change since `mark` stays: its undo steps go after the earlier ones (the oldest
     /// dropped beyond the usual limit), and redo is kept only when it made no undo step.
     pub(crate) fn keep(&mut self, mark: Mark) {
+        self.end_mark();
         let mut undo = mark.kept.undo;
         // The set-aside steps counted as dropped while the change ran; they are back now.
         self.undo_dropped -= undo.len();
@@ -2737,9 +2778,11 @@ impl Open {
     /// cannot be removed is reported, and is harmless: an unpinned part copy is pinned again
     /// when it is next used. Project files the change rewrote (a macro saved) are put back.
     pub(crate) fn back_to(&mut self, mark: Mark) -> Result<(), String> {
-        // Project files the change rewrote are put back, newest first.
-        let edits: Vec<FileEdit> = self.undo.iter().flat_map(|s| s.files.iter().cloned()).collect();
-        let files = write_edits(&edits, true);
+        // Project files the change rewrote are put back, newest first; they are kept apart
+        // from the undo history, which may have dropped their steps.
+        let edits = self.mark_edits.split_off(mark.edits_from.min(self.mark_edits.len()));
+        self.end_mark();
+        let files = write_edits(&self.dir, &edits, true);
         self.put_back(mark.kept);
         self.symbols.retain(|id, _| mark.symbols.contains(id));
         self.parts.retain(|id, _| mark.parts.contains(id));
@@ -2856,6 +2899,11 @@ impl Open {
         wc_core::macros::write_macro(&self.dir, &id, &clip.to_macro(name, description)).map_err(|e| e.to_string())
     }
 
+    /// Why a project macro's placeholders and value sets are not saved in a shared session: its
+    /// Undo and Redo go through the session's history, which does not hold project files.
+    pub(crate) const MACRO_SAVE_SHARED: &str = "Macros are not edited in a shared session: the session's Undo \
+         could not take the edit back. Stop sharing (or leave) first.";
+
     /// Save a project macro's placeholders and value sets from `form` ([`crate::macro_form::Form::save`])
     /// as one undo step: Undo puts the file back as it was, Redo writes the edit again. Nothing
     /// is recorded when the file is the same. Returns the file written.
@@ -2865,13 +2913,17 @@ impl Open {
         let path = form.save()?;
         let after = read(&path)?;
         if after != before {
+            let edit = FileEdit {
+                path: path.strip_prefix(&self.dir).unwrap_or(&path).to_path_buf(),
+                before,
+                after,
+            };
+            if self.marks > 0 {
+                self.mark_edits.push(edit.clone());
+            }
             self.checkpoint();
             if let Some(step) = self.undo.last_mut() {
-                step.files.push(FileEdit {
-                    path: path.clone(),
-                    before,
-                    after,
-                });
+                step.files.push(edit);
             }
         }
         Ok(path)
@@ -7666,5 +7718,82 @@ pub(crate) mod tests {
         o.back_to(m).unwrap();
         assert_eq!(read(), "A relay coil");
         assert_eq!(o.undo_steps(), steps + 2);
+    }
+
+    #[test]
+    fn project_file_edits_are_replaced_whole_and_a_failed_one_puts_back_the_others() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("a.json"), "A0").unwrap();
+        std::fs::write(dir.join("b.json"), "B0").unwrap();
+        let edit = |name: &str, before: &str, after: &str| FileEdit {
+            path: PathBuf::from(name),
+            before: before.into(),
+            after: after.into(),
+        };
+        let edits = [edit("a.json", "A0", "A1"), edit("b.json", "B0", "B1")];
+        // A folder where b's staging file goes: its write fails before b is touched.
+        std::fs::create_dir(dir.join("b.json.tmp")).unwrap();
+        let err = write_edits(dir, &edits, false).unwrap_err();
+        assert!(err.contains("b.json"), "{err}");
+        assert_eq!(std::fs::read_to_string(dir.join("a.json")).unwrap(), "A0", "put back");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("b.json")).unwrap(),
+            "B0",
+            "whole, as it was"
+        );
+        std::fs::remove_dir(dir.join("b.json.tmp")).unwrap();
+        write_edits(dir, &edits, false).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("b.json")).unwrap(), "B1");
+    }
+
+    #[test]
+    fn after_save_as_undo_and_redo_of_a_macro_edit_rewrite_the_copy() {
+        let (tmp, mut o) = project();
+        let id = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let clip = o.copy(1, &[Selection::Symbol(id)]);
+        let path = o.save_macro(&clip, "Coil", "").unwrap();
+        let rel = path.strip_prefix(&o.dir).unwrap().to_path_buf();
+        let first = std::fs::read_to_string(&path).unwrap();
+        let mut form = crate::macro_form::Form::open(&path).unwrap();
+        form.description = "A coil".into();
+        o.save_macro_form(&form).unwrap();
+        let edited = std::fs::read_to_string(&path).unwrap();
+        // One step undone before Save as, so the redo history has it too.
+        let mut form = crate::macro_form::Form::open(&path).unwrap();
+        form.description = "A relay coil".into();
+        o.save_macro_form(&form).unwrap();
+        let last = std::fs::read_to_string(&path).unwrap();
+        assert!(o.undo());
+        let to = tmp.path().join("copy");
+        o.save_as(&to).unwrap();
+        let copy = o.dir.join(&rel);
+        assert!(o.redo());
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), last);
+        assert!(o.undo());
+        assert!(o.undo());
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), first);
+        // The original keeps the file as it was when copied.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+    }
+
+    #[test]
+    fn a_change_taken_back_puts_a_macro_back_after_its_step_fell_off_the_history() {
+        let (_tmp, mut o) = project();
+        let id = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let clip = o.copy(1, &[Selection::Symbol(id)]);
+        let path = o.save_macro(&clip, "Coil", "").unwrap();
+        let first = std::fs::read_to_string(&path).unwrap();
+        let m = o.mark();
+        let mut form = crate::macro_form::Form::open(&path).unwrap();
+        form.description = "Gone".into();
+        o.save_macro_form(&form).unwrap();
+        for _ in 0..=UNDO_STEPS {
+            o.checkpoint();
+        }
+        assert!(o.undo.iter().all(|s| s.files.is_empty()), "the step fell off");
+        o.back_to(m).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
+        assert!(o.mark_edits.is_empty());
     }
 }

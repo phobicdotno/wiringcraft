@@ -1703,7 +1703,12 @@ impl App {
                                 let Some(open) = app.open.as_mut() else {
                                     return;
                                 };
-                                match open.save_macro_form(&form) {
+                                let saved = if app.share.active() {
+                                    Err(Open::MACRO_SAVE_SHARED.to_owned())
+                                } else {
+                                    open.save_macro_form(&form)
+                                };
+                                match saved {
                                     Ok(path) => {
                                         app.ed.message = format!("Saved macro {}", path.display());
                                         app.dialog = Some(Dialog::Macros(open.macros()));
