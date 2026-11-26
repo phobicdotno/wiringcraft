@@ -858,7 +858,7 @@ pub fn cable_list(i: &Inputs<'_>) -> Table {
 /// Net list: each electrically connected group of pins, across pages.
 pub fn net_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new("Net list", &["Net", "Pins", "Connections"]);
-    let (nets, _) = net_names(i);
+    let nets = connectivity::nets_linked(i.project, |id| i.symbols.get(id).map(|s| s.role));
     let auto = auto_net_names(i, &nets);
     let mut rows: Vec<(String, Vec<String>)> = nets
         .iter()

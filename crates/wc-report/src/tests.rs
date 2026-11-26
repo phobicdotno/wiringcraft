@@ -536,7 +536,22 @@ fn an_overview_page_keeps_the_net_names_of_schematic_pages() {
         };
         wire_list(&i).rows
     };
+    // The generated name of the net list row with these connections.
+    let net_name = |p: &Project, connections: &str| {
+        let t = net_list(&Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        });
+        let Some(row) = t.rows.iter().find(|r| r[2] == connections) else {
+            unreachable!("no net with {connections}")
+        };
+        row[0].clone()
+    };
+    let schematic_net = "-X1.1:1, =A+C1-K1:14";
     let before = rows(&p);
+    let before_name = net_name(&p, schematic_net);
+    assert!(before_name.starts_with('N'), "{before_name} is a generated name");
     assert!(
         before.iter().any(|r| r[2].starts_with('N')),
         "the fixture has a net with a generated name"
@@ -546,13 +561,19 @@ fn an_overview_page_keeps_the_net_names_of_schematic_pages() {
     overview.id = "p0".into();
     overview.number = "0".into();
     overview.overview = true;
+    // Untagged, so the net list tells the overview's own nets from the schematic's by their pins.
+    for sym in &mut overview.symbols {
+        sym.tag = None;
+    }
     p.pages.insert(0, overview.clone());
     assert_eq!(rows(&p), before, "an overview page before the schematic");
+    assert_eq!(net_name(&p, schematic_net), before_name, "net list, overview before");
     p.pages.remove(0);
     overview.id = "p9".into();
     overview.number = "9".into();
     p.pages.push(overview);
     assert_eq!(rows(&p), before, "an overview page after the schematic");
+    assert_eq!(net_name(&p, schematic_net), before_name, "net list, overview after");
 }
 
 #[test]
