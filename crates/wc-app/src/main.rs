@@ -329,6 +329,21 @@ struct Importing {
 /// Said when something waits for an import that is running.
 const IMPORT_RUNNING: &str = "An import is running; wait until it is done.";
 
+/// The actions that would change or select on the schematic under the symbol editor: held back
+/// while it is open, from the keys, the menu, the toolbar and the assistant alike.
+fn held_by_symbol_editor(a: Action) -> bool {
+    matches!(
+        a,
+        Action::Cut
+            | Action::Copy
+            | Action::Paste
+            | Action::Duplicate
+            | Action::Rotate
+            | Action::Mirror
+            | Action::SelectAll
+    )
+}
+
 /// The actions that do not change the project, its folder or which project is open: the only
 /// ones carried out while an import runs.
 fn allowed_while_importing(a: Action) -> bool {
@@ -1316,9 +1331,9 @@ impl App {
             return;
         }
         // The keys are held back while the symbol editor is open; the menu, toolbar and
-        // assistant are too, so the schematic does not change under the editor.
-        if a == Action::Duplicate && self.symbol_editor.is_some() {
-            self.ed.message = "Duplicate was not done: close the symbol editor first.".into();
+        // assistant are too, so the schematic does not change or get selected under the editor.
+        if held_by_symbol_editor(a) && self.symbol_editor.is_some() {
+            self.ed.message = format!("{} was not done: close the symbol editor first.", a.info().label);
             return;
         }
         if a == Action::ReportProblem {
@@ -5475,14 +5490,7 @@ impl App {
                     ed.delete_selected();
                     false
                 }
-                Action::Cut
-                | Action::Copy
-                | Action::Paste
-                | Action::Duplicate
-                | Action::Rotate
-                | Action::Mirror
-                | Action::SelectAll => false,
-                _ => true,
+                a => !held_by_symbol_editor(*a),
             })
             .collect()
     }

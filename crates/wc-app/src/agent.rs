@@ -5436,6 +5436,52 @@ mod tests {
     }
 
     #[test]
+    fn schematic_edits_from_the_menu_or_assistant_do_nothing_while_the_symbol_editor_is_open() {
+        for action in [
+            Action::Cut,
+            Action::Copy,
+            Action::Paste,
+            Action::Rotate,
+            Action::Mirror,
+            Action::SelectAll,
+        ] {
+            let (_tmp, mut a) = app(vec![]);
+            let o = a.open.as_mut().unwrap();
+            let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+            o.place(page, "wc.coil", Point::new(50.0, 50.0)).unwrap();
+            o.place(page, "wc.coil", Point::new(90.0, 50.0)).unwrap();
+            a.ed.page = page;
+            let all = a.open.as_ref().unwrap().select_all(page);
+            // Something on the clipboard for Paste; one item selected, so Select All would change it.
+            a.ed.selection = all.clone();
+            a.run(Action::Copy);
+            assert!(!a.clipboard.is_empty(), "{action:?}: the copy is made");
+            a.ed.selection = vec![all[0].clone()];
+            let selection = a.ed.selection.clone();
+            let clipboard = format!("{:?}", a.clipboard);
+            let before = a.open.as_ref().unwrap().project.pages.clone();
+            let undo_before = a.open.as_ref().unwrap().undo_mark();
+            a.symbol_editor = Some(crate::symbol_editor::SymbolEditor::new(Vec::new()));
+
+            a.run(action);
+            let o = a.open.as_ref().unwrap();
+            assert_eq!(o.project.pages, before, "{action:?}: the pages are unchanged");
+            assert_eq!(o.undo_mark(), undo_before, "{action:?}: no undo step");
+            assert_eq!(a.ed.selection, selection, "{action:?}: the selection is unchanged");
+            assert_eq!(
+                format!("{:?}", a.clipboard),
+                clipboard,
+                "{action:?}: the clipboard is unchanged"
+            );
+            assert!(
+                a.ed.message.contains("close the symbol editor first"),
+                "{action:?}: {}",
+                a.ed.message
+            );
+        }
+    }
+
+    #[test]
     fn duplicate_from_the_menu_or_assistant_does_nothing_while_the_symbol_editor_is_open() {
         let (_tmp, mut a) = app(vec![]);
         let o = a.open.as_mut().unwrap();
