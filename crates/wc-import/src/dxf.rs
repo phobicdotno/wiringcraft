@@ -683,21 +683,18 @@ fn shapes(
                     let (bx, by) = d.bases.get(name).copied().unwrap_or_default();
                     // An array (MINSERT): one copy per column and row, the spacings along the
                     // block's own turned axes (not scaled), as AutoCAD draws it.
-                    let count = |code: i32| e.f_or(code, 1.0).clamp(1.0, f64::from(u32::MAX)) as usize;
-                    let (cols, rows) = (count(70), count(71));
-                    let (dx, dy) = (e.f(44), e.f(45));
-                    let rot = e.f(50);
-                    let (s, c) = rot.to_radians().sin_cos();
-                    let cells = cols.saturating_mul(rows);
+                    let array = ArrayCells::of(e);
+                    let cells = array.len();
                     // Read once: a group code is found by a scan of the entity.
-                    let (ix, iy, sx, sy) = (e.f(10), e.f(20), e.f_or(41, 1.0), e.f_or(42, 1.0));
-                    // The placement of the copy in a column and row, inside the outer placement.
-                    // A copy placed past the range of numbers is not refused here: its shapes
-                    // are, one by one, and each copy takes from the budget like any other.
-                    let cell_xf = |col: usize, row: usize| {
-                        let (col, row) = (col as f64 * dx, row as f64 * dy);
-                        let at = (ix + c * col - s * row, iy + s * col + c * row);
-                        Xf::shift((-bx, -by)).then(&Xf::insert(at, sx, sy, rot)).then(&xf)
+                    let (ix, iy, sx, sy, rot) = (e.f(10), e.f(20), e.f_or(41, 1.0), e.f_or(42, 1.0), e.f(50));
+                    // The placement of a copy, inside the outer placement. A copy placed past
+                    // the range of numbers is not refused here: its shapes are, one by one, and
+                    // each copy takes from the budget like any other.
+                    let cell_xf = |cell: usize| {
+                        let (ox, oy) = array.offset(cell);
+                        Xf::shift((-bx, -by))
+                            .then(&Xf::insert((ix + ox, iy + oy), sx, sy, rot))
+                            .then(&xf)
                     };
                     // Copies too deep would only be turned away, without taking from the
                     // budget: counted at once instead of one by one.
@@ -713,7 +710,7 @@ fn shapes(
                             *over = over.saturating_add((cells - cell).saturating_mul(inner.len()));
                             break;
                         }
-                        let ixf = cell_xf(cell % cols, cell / cols);
+                        let ixf = cell_xf(cell);
                         shapes(
                             d,
                             inner,
