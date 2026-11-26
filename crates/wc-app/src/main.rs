@@ -204,6 +204,16 @@ enum Dialog {
         lib: prefs::FolderField,
         error: Option<String>,
     },
+    /// File > Import, after the file is picked: the options the command line has for the
+    /// format, with its defaults filled in.
+    ImportOptions {
+        file: PathBuf,
+        /// The library folder for parts, chosen before the file.
+        lib: Option<PathBuf>,
+        target: Option<import_symbols::ImportTarget>,
+        form: Box<imports::Form>,
+        error: Option<String>,
+    },
     /// Attach footprint drawing / Attach 3D model without a file picker: the file typed, and
     /// why the picker could not be used or the typed path was refused.
     AttachPath {
@@ -506,6 +516,38 @@ impl chrome::Status for StatusView<'_> {
 }
 
 impl App {
+    /// Why the window does not save while a command of the assistant runs.
+    pub(crate) const SAVE_WAITS: &str = "Saving waits until the assistant's command has finished.";
+
+    /// Why the Translations dialog does not save into a folder that is not the open project's.
+    pub(crate) const TRANSLATIONS_ELSEWHERE: &str = "Not saved: this dialog was opened for another project folder than the one that is open now. Close it and open Translations again.";
+
+    /// OK in the Translations dialog: save `form`'s dictionary into the open project, as one
+    /// undo step however many cells changed (#589). A guest in a shared session is refused as
+    /// the assistant's `translations` tool refuses, and nothing is written: the session does
+    /// not carry the file. A form that is not for the open project is refused too, and nothing
+    /// is written: its save would be in no undo history (after Save as the form follows the
+    /// project into the copy, [`App::save_copy`]). While a command of the assistant runs
+    /// (`command_running`) nothing is saved, as with Save: what changes on disk meanwhile is
+    /// taken as the command's change.
+    pub(crate) fn save_translations(
+        open: Option<&mut Open>,
+        share: &share::Share,
+        command_running: bool,
+        form: &translations_form::Form,
+    ) -> Result<String, String> {
+        if command_running {
+            return Err(App::SAVE_WAITS.to_owned());
+        }
+        if share.active() && !share.is_host() {
+            return Err(Open::TRANSLATIONS_GUEST.to_owned());
+        }
+        match open {
+            Some(open) if form.is_for(&open.dir) => open.translations_change(|_| form.save()),
+            _ => Err(App::TRANSLATIONS_ELSEWHERE.to_owned()),
+        }
+    }
+
     /// Keep the open project in step with the shared session, at the end of the frame so this
     /// frame's change goes out. Nothing goes out while a button is held or the live cover form
     /// is open, so one action is one change.
@@ -739,13 +781,7 @@ impl App {
 
     /// Save the open project as a copy in `d` and work on in the copy; the error says why not.
     fn save_as_to(&mut self, d: &Path) -> Result<(), String> {
-        if let Some(why) = self.save_as_refused() {
-            return Err(why.into());
-        }
-        let Some(open) = self.open.as_mut() else {
-            return Err("No project is open.".into());
-        };
-        let (d, links) = open.save_as(d).map_err(|e| format!("Save as failed:\n{e}"))?;
+        let (d, links) = self.save_copy(d)?;
         let mut m = format!("Saved as {}; you are working in the copy now.", d.display());
         if !links.is_empty() {
             // Named, so a file the project reaches through a link can be put in the copy by hand.
@@ -766,6 +802,27 @@ impl App {
         self.prefs.remember(d);
         self.prefs.save();
         Ok(())
+    }
+
+    /// The project's part of [`App::save_as_to`]: copy the open project into `d` and work on
+    /// there. Returns the copy's folder and the links left out. A Translations dialog open for
+    /// the project goes on in the copy, which holds the same `translations.toml`: its OK then
+    /// saves there, as an undo step of the project that is open, not into the original.
+    pub(crate) fn save_copy(&mut self, d: &Path) -> Result<(PathBuf, Vec<PathBuf>), String> {
+        if let Some(why) = self.save_as_refused() {
+            return Err(why.into());
+        }
+        let Some(open) = self.open.as_mut() else {
+            return Err("No project is open.".into());
+        };
+        let from = open.dir.clone();
+        let saved = open.save_as(d).map_err(|e| format!("Save as failed:\n{e}"))?;
+        if let Some(Dialog::Translations(form)) = self.dialog.as_mut()
+            && form.is_for(&from)
+        {
+            form.dir = open.dir.clone();
+        }
+        Ok(saved)
     }
 
     /// Why Save as cannot be done now, checked again when its dialog would open: the assistant
@@ -989,7 +1046,44 @@ impl App {
         } else {
             None
         };
-        self.import_from(kind, &file, lib.as_deref(), target);
+        self.import_picked(kind, &file, lib.as_deref(), target);
+    }
+
+    /// The file is chosen: ask for the options the format has ([`imports::Kind::options`]), or
+    /// start at once when it has none.
+    fn import_picked(
+        &mut self,
+        kind: imports::Kind,
+        file: &Path,
+        lib: Option<&Path>,
+        target: Option<import_symbols::ImportTarget>,
+    ) {
+        if kind.options().is_empty() {
+            self.import_from(kind, file, lib, target, &imports::Options::default());
+            return;
+        }
+        let Some(open) = self.open.as_ref() else { return };
+        let mut form = imports::Form::new(open, kind, file);
+        // The library folders a parts import offers; without the project's library list only
+        // another folder can be chosen, and the dialog says why.
+        let mut error = None;
+        if form.has(imports::Opt::Library) {
+            match wc_library::Library::open(&open.dir, &open.project) {
+                Ok(library) => form.libraries = library_targets(&library, open),
+                Err(e) => {
+                    error = Some(format!(
+                        "The project's library folders could not be listed: {e}. Another folder can still be chosen."
+                    ));
+                }
+            }
+        }
+        self.dialog = Some(Dialog::ImportOptions {
+            file: file.to_path_buf(),
+            lib: lib.map(Path::to_path_buf),
+            target,
+            form: Box::new(form),
+            error,
+        });
     }
 
     /// Why an import cannot run now: it writes to the project folder, which a shared session or
@@ -1009,7 +1103,7 @@ impl App {
         }
     }
 
-    /// Start the import of `file` (parts into `lib`) on a worker thread; [`App::poll_import`]
+    /// Start the import of `file` (parts into `lib`) with `options` on a worker thread; [`App::poll_import`]
     /// shows what it says while it runs and takes the result in when it ends. `target` is the
     /// library folder chosen in the parts dialog, declared in the project when it is new.
     fn import_from(
@@ -1018,6 +1112,7 @@ impl App {
         file: &Path,
         lib: Option<&Path>,
         target: Option<import_symbols::ImportTarget>,
+        options: &imports::Options,
     ) {
         // Checked again here: the typed path form stays open while a session or a command starts.
         if let Some(why) = self.import_refused() {
@@ -1026,7 +1121,7 @@ impl App {
         }
         let Some(open) = self.open.as_mut() else { return };
         applog::info(&format!("import {kind:?} {}", file.display()));
-        let job = imports::start(open, kind, file, lib, self.ed.page);
+        let job = imports::start(open, kind, file, lib, self.ed.page, options);
         // Nothing half done is left: a tool's preview, a wire being drawn.
         self.ed.wire = None;
         self.ed.shape_points.clear();
@@ -1076,10 +1171,20 @@ impl App {
         // a new folder chosen outside the library list.
         let source = match (target, lib.as_deref()) {
             (Some(t), _) => t.declare,
-            (None, Some(l)) if kind.needs_library() => new_folder_source(&open.dir, l, &open.project.meta.libraries),
+            (None, Some(l)) if kind.needs_library() || kind == imports::Kind::Archive => {
+                new_folder_source(&open.dir, l, &open.project.meta.libraries)
+            }
             (None, _) => None,
         };
-        if done && let Some(source) = source {
+        // An archive may hold no symbol library or parts list: its folder is listed only once
+        // something was written there, also when the folder was there before. An archive that
+        // failed on a later entry has still written what came before: the folder is listed then
+        // too, so its parts are not left where the project does not look.
+        let written = job.wrote_to_library();
+        if (done || kind == imports::Kind::Archive)
+            && written
+            && let Some(source) = source
+        {
             open.checkpoint();
             open.project.meta.libraries.insert(0, source);
             open.dirty = true;
@@ -1401,7 +1506,7 @@ impl App {
         let Some(open) = self.open.as_mut() else { return };
         match a {
             Action::Save if self.assistant.command_running() => {
-                self.ed.message = "Saving waits until the assistant's command has finished.".into();
+                self.ed.message = App::SAVE_WAITS.into();
             }
             Action::Save => match open.save() {
                 Ok(n) => self.ed.message = format!("Saved ({n} files changed)."),
@@ -1420,7 +1525,7 @@ impl App {
                     .into();
             }
             Action::SaveAs if self.assistant.command_running() => {
-                self.ed.message = "Saving waits until the assistant's command has finished.".into();
+                self.ed.message = App::SAVE_WAITS.into();
             }
             Action::SaveAs => self.pending = Some(Pending::SaveAs),
             Action::Undo | Action::Redo => {
@@ -1905,6 +2010,7 @@ impl App {
             Dialog::ImportSymbols { .. } => "Import symbols",
             Dialog::ImportParts { .. } => "Import parts",
             Dialog::ImportPath { .. } => "Import",
+            Dialog::ImportOptions { .. } => "Import options",
             Dialog::AttachPath { kind, .. } => kind.title(),
             Dialog::Report { .. } => "Report a problem",
             Dialog::WagoMarking { .. } => "WAGO marking",
@@ -2355,10 +2461,18 @@ impl App {
                     ui.separator();
                     ui.horizontal(|ui| {
                         if ui.button("OK").clicked() {
-                            match form.save() {
+                            let running = self.assistant.command_running();
+                            match App::save_translations(self.open.as_mut(), &self.share, running, form) {
                                 Ok(m) => {
                                     then = Some(Box::new(move |app: &mut App| app.ed.message = m));
                                     keep = false;
+                                }
+                                Err(e)
+                                    if e == Open::TRANSLATIONS_GUEST
+                                        || e == App::SAVE_WAITS
+                                        || e == App::TRANSLATIONS_ELSEWHERE =>
+                                {
+                                    form.error = Some(e);
                                 }
                                 Err(e) => form.error = Some(format!("Saving failed: {e}")),
                             }
@@ -3373,7 +3487,7 @@ impl App {
                                     let (kind, target) = (*kind, target.clone());
                                     let l = l.or_else(|| target.as_ref().map(|t| t.root.clone()));
                                     then = Some(Box::new(move |app: &mut App| {
-                                        app.import_from(kind, &f, l.as_deref(), target);
+                                        app.import_picked(kind, &f, l.as_deref(), target);
                                     }));
                                     keep = false;
                                 }
@@ -3381,6 +3495,147 @@ impl App {
                             }
                         }
                         if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                }
+                Dialog::ImportOptions {
+                    file,
+                    lib,
+                    target,
+                    form,
+                    error,
+                } => {
+                    ui.label(form.kind.title());
+                    ui.label(file.display().to_string());
+                    egui::Grid::new("import_options").num_columns(2).show(ui, |ui| {
+                        if form.has(imports::Opt::Scale) {
+                            ui.label("Scale").on_hover_text(
+                                "The drawing's coordinates are multiplied by this to get mm: 1 for a drawing in mm, 10 for one in cm, 25.4 for one in inches",
+                            );
+                            ui.add(egui::TextEdit::singleline(&mut form.scale).desired_width(80.0));
+                            ui.end_row();
+                        }
+                        if form.has(imports::Opt::Project) {
+                            ui.label("Project")
+                                .on_hover_text("The archive holds several projects; one is imported");
+                            let shown = form.projects.get(form.project).cloned().unwrap_or_default();
+                            egui::ComboBox::from_id_salt("import_swe_project")
+                                .selected_text(shown)
+                                .show_ui(ui, |ui| {
+                                    for (k, name) in form.projects.iter().enumerate() {
+                                        ui.selectable_value(&mut form.project, k, name);
+                                    }
+                                });
+                            ui.end_row();
+                            if let Some(note) = &form.projects_note {
+                                ui.label("");
+                                ui.label(RichText::new(note.as_str()).weak());
+                                ui.end_row();
+                            }
+                        }
+                        if form.has(imports::Opt::FirstPage) {
+                            ui.label("First page number")
+                                .on_hover_text("The first new page takes this number; the others follow it");
+                            let numbered = !(form.kind == imports::Kind::Swe && form.keep_numbers);
+                            ui.add_enabled(
+                                numbered,
+                                egui::TextEdit::singleline(&mut form.first_page).desired_width(80.0),
+                            );
+                            ui.end_row();
+                            if form.kind == imports::Kind::Swe {
+                                ui.label("");
+                                ui.checkbox(&mut form.keep_numbers, "Keep the source's page numbers");
+                                ui.end_row();
+                            }
+                        }
+                        if form.has(imports::Opt::Library) {
+                            ui.label("Symbol libraries and parts lists").on_hover_text(
+                                "KiCad symbol libraries and parts lists inside the archive go into a library folder; without one they are listed, not imported",
+                            );
+                            egui::ComboBox::from_id_salt("import_archive_lib")
+                                .selected_text(form.library_label(form.library))
+                                .show_ui(ui, |ui| {
+                                    for k in 0..=form.libraries.len() + 1 {
+                                        let label = form.library_label(k);
+                                        ui.selectable_value(&mut form.library, k, label);
+                                    }
+                                });
+                            ui.end_row();
+                            if form.other_library() {
+                                ui.label("");
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut form.library_folder.text)
+                                            .hint_text("library folder")
+                                            .desired_width(300.0),
+                                    );
+                                    if ui.button("Browse…").clicked() {
+                                        let picked = if form.library_folder.is_empty() {
+                                            pick_folder("Library folder", &file.display().to_string())
+                                        } else {
+                                            pick_folder_for("Library folder", &form.library_folder)
+                                        };
+                                        match picked {
+                                            Picked::Path(d) => *error = form.library_folder.pick(d).err(),
+                                            Picked::Failed(e) | Picked::Unsure(e) => {
+                                                *error = Some(format!("{e} Type the library folder instead."));
+                                            }
+                                            Picked::Cancelled => {}
+                                        }
+                                    }
+                                });
+                                ui.end_row();
+                            }
+                        }
+                        if form.has(imports::Opt::SymbolMap) {
+                            ui.label("Symbol map").on_hover_text(
+                                "Optional: a text file with one `source name = symbol id` per line, which gives a source block or macro a library symbol",
+                            );
+                            ui.horizontal(|ui| {
+                                // The hint is cut short in a narrow field: it is the hover text too.
+                                let hint = imports::symbol_map_hint();
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut form.symbol_map.text)
+                                        .hint_text(hint.as_str())
+                                        .desired_width(300.0),
+                                )
+                                .on_hover_text(hint);
+                                if ui.button("Browse…").clicked() {
+                                    let start = file.parent().unwrap_or(file.as_path());
+                                    match pick_open("Symbol map", start, ("Symbol map (text file)", &["txt", "map", "*"])) {
+                                        Picked::Path(f) => *error = form.symbol_map.pick(f).err(),
+                                        Picked::Failed(e) | Picked::Unsure(e) => {
+                                            *error = Some(format!("{e} Type the symbol map's path instead."));
+                                        }
+                                        Picked::Cancelled => {}
+                                    }
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    });
+                    if let Some(e) = error {
+                        ui.label(RichText::new(e.as_str()).color(theme::Theme::of(ui.ctx()).error));
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Import").clicked() {
+                            match form.options() {
+                                Ok(options) => {
+                                    // An archive's library folder is chosen here, a parts
+                                    // import's before the file.
+                                    let l = options.lib.clone().or_else(|| lib.clone());
+                                    let target = form.library_target().cloned().or_else(|| target.clone());
+                                    let (kind, f) = (form.kind, file.clone());
+                                    then = Some(Box::new(move |app: &mut App| {
+                                        app.import_from(kind, &f, l.as_deref(), target, &options);
+                                    }));
+                                    keep = false;
+                                }
+                                Err(e) => *error = Some(e),
+                            }
+                        }
+                        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
                             keep = false;
                         }
                     });
