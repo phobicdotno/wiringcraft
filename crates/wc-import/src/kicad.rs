@@ -313,16 +313,7 @@ fn convert(
                             Point::new(a.x.min(b.x), a.y.min(b.y)),
                             Point::new(a.x.max(b.x), a.y.max(b.y)),
                         );
-                        // A rectangle has no fill of its own: a filled one becomes a filled polyline.
-                        graphics.push(if filled(g) {
-                            Shape::Polyline {
-                                points: vec![min, Point::new(max.x, min.y), max, Point::new(min.x, max.y)],
-                                closed: true,
-                                filled: true,
-                            }
-                        } else {
-                            Shape::Rect { min, max }
-                        });
+                        graphics.push(rect_shape(min, max, filled(g)));
                     }
                 }
                 Some("circle") => {
@@ -408,10 +399,26 @@ fn convert(
                 // KiCad 7+: a text with an optional border, `at` its top-left corner. Its lines
                 // are joined with a space into one text; margins are not kept.
                 Some("text_box") => {
+                    // `(text_box private "text" ...)`: a private box shows only in KiCad's editor.
+                    if g.arg(1) == Some("private") && g.arg(2).is_some() {
+                        continue;
+                    }
                     let (Some(t), Some(at)) = (g.arg(1), g.first("at")) else {
                         continue;
                     };
-                    let corner = pt(at.num(1).unwrap_or(0.0), at.num(2).unwrap_or(0.0));
+                    let (x, y) = (at.num(1).unwrap_or(0.0), at.num(2).unwrap_or(0.0));
+                    let size = g.first("size");
+                    let (w, h) = (
+                        size.and_then(|s| s.num(1)).unwrap_or(0.0),
+                        size.and_then(|s| s.num(2)).unwrap_or(0.0),
+                    );
+                    // `at` is one corner and `at + size` the other, both in KiCad's y-up
+                    // coordinates, so either size may be negative.
+                    let (a, b) = (pt(x, y), pt(x + w, y + h));
+                    let (min, max) = (
+                        Point::new(a.x.min(b.x), a.y.min(b.y)),
+                        Point::new(a.x.max(b.x), a.y.max(b.y)),
+                    );
                     let height = g
                         .first("effects")
                         .and_then(|e| e.first("font"))
@@ -419,28 +426,15 @@ fn convert(
                         .and_then(|s| s.num(1))
                         .unwrap_or(1.27)
                         * scale;
-                    let size = g.first("size");
-                    let (w, h) = (
-                        size.and_then(|s| s.num(1)).unwrap_or(0.0) * scale,
-                        size.and_then(|s| s.num(2)).unwrap_or(0.0) * scale,
-                    );
+                    // A stroke width of 0 is KiCad's default width; only a negative one hides the border.
                     let stroke = g
                         .first("stroke")
                         .and_then(|s| s.first("width"))
                         .and_then(|w| w.num(1))
                         .unwrap_or(0.0);
                     let fill = g.first("fill").and_then(|f| f.first("type")).and_then(|t| t.arg(1));
-                    if w > 0.0 && h > 0.0 && (stroke > 0.0 || fill.is_some_and(|f| f != "none")) {
-                        let (min, max) = (corner, Point::new(corner.x + w, corner.y + h));
-                        graphics.push(if filled(g) {
-                            Shape::Polyline {
-                                points: vec![min, Point::new(max.x, min.y), max, Point::new(min.x, max.y)],
-                                closed: true,
-                                filled: true,
-                            }
-                        } else {
-                            Shape::Rect { min, max }
-                        });
+                    if max.x > min.x && max.y > min.y && (stroke >= 0.0 || fill.is_some_and(|f| f != "none")) {
+                        graphics.push(rect_shape(min, max, filled(g)));
                     }
                     let text = t
                         .split('\n')
@@ -450,7 +444,7 @@ fn convert(
                         .join(" ");
                     if !text.is_empty() {
                         graphics.push(Shape::Text {
-                            at: Point::new(corner.x, corner.y + height),
+                            at: Point::new(min.x, min.y + height),
                             text,
                             height,
                             align: Align::Left,
@@ -505,6 +499,20 @@ fn convert(
             .unwrap_or("")
             .to_owned(),
     })
+}
+
+/// A rectangle from `min` to `max`. A rectangle has no fill of its own: a filled one becomes a
+/// filled polyline.
+fn rect_shape(min: Point, max: Point, filled: bool) -> Shape {
+    if filled {
+        Shape::Polyline {
+            points: vec![min, Point::new(max.x, min.y), max, Point::new(min.x, max.y)],
+            closed: true,
+            filled: true,
+        }
+    } else {
+        Shape::Rect { min, max }
+    }
 }
 
 fn property_at(sym: &Sexp, key: &str) -> Option<(f64, f64)> {
@@ -781,10 +789,18 @@ mod tests {
         let lib = r#"(kicad_symbol_lib
   (symbol "T" (property "Reference" "T" (at 0 0 0))
     (symbol "T_0_1"
-      (text_box "24 V\nDC" (at 1 4 0) (size 6 3) (stroke (width 0.254) (type default)) (fill (type none))
+      (text_box "24 V\nDC" (at 1 4 0) (size 6 -3) (stroke (width 0.254) (type default)) (fill (type none))
         (effects (font (size 2 2)) (justify left top)))
-      (text_box "bare" (at 10 4 0) (size 6 3) (stroke (width 0) (type default)) (fill (type none))
+      (text_box "bare" (at 10 4 0) (size 6 3) (stroke (width -1) (type default)) (fill (type none))
         (effects (font (size 1.27 1.27))))
+      (text_box "up" (at 20 4 0) (size 6 3) (stroke (width 0) (type default)) (fill (type none))
+        (effects (font (size 1 1))))
+      (text_box "solid" (at 30 4 0) (size 2 2) (stroke (width -1)) (fill (type outline))
+        (effects (font (size 1 1))))
+      (text_box "turned" (at 40 4 90) (size 3 6) (stroke (width -1)) (fill (type none))
+        (effects (font (size 1 1))))
+      (text_box private "hidden" (at 50 4 0) (size 6 3) (stroke (width 0)) (fill (type none))
+        (effects (font (size 1 1))))
       (image (at 0 0) (data "AAAA"))
       (image (at 1 1) (data "AAAA")))
     (symbol "T_1_1"
@@ -793,7 +809,8 @@ mod tests {
         let (syms, warnings) = symbols(lib, "k", 1.0)?;
         assert_eq!(syms.len(), 1, "{warnings:?}");
         let g = &syms[0].symbol.graphics;
-        // The text sits one text height below the box's top-left corner, left-aligned.
+        // KiCad writes a negative height (the box hangs below `at`, y up). The text sits one text
+        // height below the box's top-left corner, left-aligned.
         assert!(
             g.contains(&Shape::Text {
                 at: Point::new(1.0, -2.0),
@@ -812,10 +829,43 @@ mod tests {
             }),
             "{g:?}"
         );
-        assert_eq!(g.iter().filter(|s| matches!(s, Shape::Rect { .. })).count(), 1, "{g:?}");
+        // A positive height puts the box above `at` (KiCad's y points up), and the text one text
+        // height below the box's top edge.
+        assert!(
+            g.contains(&Shape::Rect {
+                min: Point::new(20.0, -7.0),
+                max: Point::new(26.0, -4.0),
+            }),
+            "{g:?}"
+        );
+        assert!(g.iter().any(|s| matches!(s, Shape::Text { text, at, .. }
+            if text == "up" && *at == Point::new(20.0, -6.0))));
+        assert_eq!(g.iter().filter(|s| matches!(s, Shape::Rect { .. })).count(), 2, "{g:?}");
         assert!(
             g.iter()
                 .any(|s| matches!(s, Shape::Text { text, .. } if text == "bare"))
+        );
+        // An outline fill draws a filled box even without a stroke.
+        assert!(
+            g.contains(&Shape::Polyline {
+                points: vec![
+                    Point::new(30.0, -6.0),
+                    Point::new(32.0, -6.0),
+                    Point::new(32.0, -4.0),
+                    Point::new(30.0, -4.0)
+                ],
+                closed: true,
+                filled: true,
+            }),
+            "{g:?}"
+        );
+        // The box's angle goes to its text.
+        assert!(g.iter().any(|s| matches!(s, Shape::Text { text, angle, .. }
+            if text == "turned" && (*angle - 90.0).abs() < 1e-9)));
+        // A private box is left out, text and border.
+        assert!(
+            !g.iter()
+                .any(|s| matches!(s, Shape::Text { text, .. } if text == "hidden" || text == "private"))
         );
         assert_eq!(warnings, ["T: 2 image item(s) not read"]);
         Ok(())
