@@ -2133,7 +2133,10 @@ impl App {
                     }
                     // A panel device drag going on ends, as with Undo in the window.
                     self.ed.panel_drag = None;
-                    if redo { self.share.redo() } else { self.share.undo() }?;
+                    let r = if redo { self.share.redo() } else { self.share.undo() };
+                    // A wire being drawn may start on a pin the undo took away.
+                    self.ed.wire = None;
+                    r?;
                     self.ed.selection.clear();
                     return Ok(if can {
                         "Sent to the session; it shows with the next sync."
@@ -2150,8 +2153,12 @@ impl App {
                     return Err(format!("Not done: {e}"));
                 }
                 self.ed.selection.clear();
-                if done && let Some((id, pick)) = &before {
-                    crate::follow_panel_pick(&mut self.ed, &open.project, id, pick.as_ref());
+                if done {
+                    // A wire being drawn may start on a pin the undo took away.
+                    self.ed.wire = None;
+                    if let Some((id, pick)) = &before {
+                        crate::follow_panel_pick(&mut self.ed, &open.project, id, pick.as_ref());
+                    }
                 }
                 if let Some(w) = open.take_step_warning() {
                     return Ok(format!("Done, but {w}."));
@@ -4106,6 +4113,110 @@ mod tests {
             assert!(start.elapsed() < WORKER_HANG, "{what} did not end in {WORKER_HANG:?}");
             std::thread::sleep(std::time::Duration::from_millis(every_ms));
         }
+    }
+
+    /// With the place tool, Rotate and Mirror turn the symbol on the pointer: the selected
+    /// symbol on the page stays as it is and no undo step is made (#738).
+    #[test]
+    fn rotate_and_mirror_with_the_place_tool_turn_the_symbol_on_the_pointer() {
+        use crate::state::{Selection, Tool};
+        use wc_core::geom::Rotation;
+        let (_tmp, mut a) = app(vec![]);
+        let Some(open) = a.open.as_mut() else { unreachable!() };
+        let sid = open.place(0, "wc.coil", wc_core::Point::new(100.0, 60.0)).unwrap();
+        let steps = open.undo_steps();
+        a.ed.page = 0;
+        a.ed.selection = vec![Selection::Symbol(sid.clone())];
+        a.ed.tool = Tool::Place;
+        a.ed.place_symbol = Some("wc.coil".into());
+        a.run(Action::Rotate);
+        a.run(Action::Mirror);
+        assert_eq!(a.ed.place_turn, (Rotation::R90, true));
+        let Some(open) = a.open.as_ref() else { unreachable!() };
+        let s = open.project.pages[0].symbols.iter().find(|s| s.id == sid).unwrap();
+        assert_eq!(
+            (s.rotation, s.mirror),
+            (Rotation::R0, false),
+            "the placed symbol is untouched"
+        );
+        assert_eq!(open.undo_steps(), steps, "no undo step");
+        assert_eq!(a.ed.selection, vec![Selection::Symbol(sid)]);
+        // Choosing Place again keeps the turn.
+        a.run(Action::PlaceSymbol);
+        assert_eq!(a.ed.place_turn, (Rotation::R90, true));
+        // Select then Place in one frame, with no canvas drawn between, starts upright.
+        a.run(Action::Select);
+        a.run(Action::PlaceSymbol);
+        assert_eq!(a.ed.place_turn, (Rotation::R0, false));
+        let (rotation, mirror) = a.ed.place_turn;
+        let Some(open) = a.open.as_mut() else { unreachable!() };
+        let placed = open
+            .place_turned(0, "wc.coil", wc_core::Point::new(150.0, 60.0), rotation, mirror)
+            .unwrap();
+        let s = open.project.pages[0].symbols.iter().find(|s| s.id == placed).unwrap();
+        assert_eq!((s.rotation, s.mirror), (Rotation::R0, false));
+    }
+
+    /// With a panel shown, Mirror does what it did before the place tool turned symbols: it
+    /// does not turn the symbol on the pointer, which the panel view does not show (#738).
+    #[test]
+    fn mirror_with_a_panel_shown_leaves_the_place_turn_alone() {
+        use crate::state::{Selection, Tool};
+        use wc_core::geom::Rotation;
+        let (_tmp, mut a) = app(vec![]);
+        let Some(open) = a.open.as_mut() else { unreachable!() };
+        let sid = open.place(0, "wc.coil", wc_core::Point::new(100.0, 60.0)).unwrap();
+        a.ed.page = 0;
+        a.ed.selection = vec![Selection::Symbol(sid.clone())];
+        a.ed.tool = Tool::Place;
+        a.ed.place_symbol = Some("wc.coil".into());
+        a.ed.panel = Some(0);
+        a.run(Action::Mirror);
+        assert_eq!(a.ed.place_turn, (Rotation::R0, false));
+        let Some(open) = a.open.as_ref() else { unreachable!() };
+        let s = open.project.pages[0].symbols.iter().find(|s| s.id == sid).unwrap();
+        assert!(s.mirror, "Mirror went to the selection, as before");
+    }
+
+    /// Going to a find hit leaves the place tool, and with it the turn for the symbol on the
+    /// pointer: placing again later starts upright (#738).
+    #[test]
+    fn going_to_a_find_hit_sets_the_place_turn_back() {
+        use crate::state::Tool;
+        use wc_core::geom::Rotation;
+        let (_tmp, mut a) = app(vec![]);
+        let Some(open) = a.open.as_ref() else { unreachable!() };
+        let page = open.project.pages[0].id.clone();
+        a.ed.tool = Tool::Place;
+        a.ed.place_symbol = Some("wc.coil".into());
+        crate::canvas::turn_place(&mut a.ed, true);
+        assert_eq!(a.ed.place_turn, (Rotation::R0, true));
+        a.show_found(&page, None);
+        assert_eq!(a.ed.tool, Tool::Select);
+        assert_eq!(a.ed.place_turn, (Rotation::R0, false));
+    }
+
+    /// R, then Escape (Select), then S: the preview is upright again and the status no longer
+    /// tells of the old turn. A status about something else stays (#738).
+    #[test]
+    fn leaving_the_place_tool_clears_only_the_turn_status() {
+        use crate::state::Tool;
+        use wc_core::geom::Rotation;
+        let (_tmp, mut a) = app(vec![]);
+        a.ed.tool = Tool::Place;
+        a.ed.place_symbol = Some("wc.coil".into());
+        a.run(Action::Rotate);
+        assert_eq!(a.ed.message, "Turned 90°, R turns again, M mirrors.");
+        a.run(Action::Select);
+        a.run(Action::PlaceSymbol);
+        assert_eq!(a.ed.place_turn, (Rotation::R0, false));
+        assert!(a.ed.message.is_empty(), "{}", a.ed.message);
+        // Another status stays when the turn is set back.
+        a.run(Action::Rotate);
+        a.ed.message = "Saved.".into();
+        a.run(Action::Select);
+        assert_eq!(a.ed.place_turn, (Rotation::R0, false));
+        assert_eq!(a.ed.message, "Saved.");
     }
 
     /// A worker that ends only after far more polls than the old fixed bounds (1000) allowed
@@ -9844,6 +9955,186 @@ mod tests {
         a.share.frame(a.open.as_mut(), None, false);
         let devices = &a.open.as_ref().unwrap().project.devices;
         assert!(!devices.contains_key(&k8) && devices.contains_key(&k7));
+        a.share.stop();
+    }
+
+    #[test]
+    fn undo_and_redo_drop_a_wire_being_drawn() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        let id = open.place(1, "wc.lamp", wc_core::Point::new(50.0, 50.0)).unwrap();
+        // A wire started on the lamp's pin, then Undo takes the lamp away.
+        let start = wc_core::Endpoint::Pin {
+            item: id.clone(),
+            pin: "X1".into(),
+        };
+        a.ed.wire = Some((start.clone(), Vec::new()));
+        a.run(Action::Undo);
+        assert!(page2(&a).symbols.iter().all(|s| s.id != id), "the lamp is gone");
+        assert!(a.ed.wire.is_none(), "no wire left starting on the missing pin");
+        a.ed.wire = Some((start, Vec::new()));
+        a.run(Action::Redo);
+        assert!(page2(&a).symbols.iter().any(|s| s.id == id), "the lamp is back");
+        assert!(a.ed.wire.is_none(), "Redo drops the wire being drawn too");
+    }
+
+    #[test]
+    fn undo_and_redo_in_a_session_drop_a_wire_being_drawn() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        a.share.start_host(open, "Hanna", "hanna@example.com").unwrap();
+        let open = a.open.as_mut().unwrap();
+        let id = open.place(1, "wc.lamp", wc_core::Point::new(50.0, 50.0)).unwrap();
+        a.share.frame(a.open.as_mut(), None, false);
+        let start = wc_core::Endpoint::Pin {
+            item: id.clone(),
+            pin: "X1".into(),
+        };
+        a.ed.page = 1;
+        a.ed.wire = Some((start.clone(), Vec::new()));
+        a.run(Action::Undo);
+        assert!(a.ed.wire.is_none(), "Undo in a session drops the wire being drawn");
+        a.share.frame(a.open.as_mut(), None, false);
+        assert!(page2(&a).symbols.iter().all(|s| s.id != id), "the lamp is gone");
+        // Redo: the lamp is deleted, Undo brings it back, a wire is started on it, and Redo
+        // deletes it again.
+        a.run(Action::Redo);
+        a.share.frame(a.open.as_mut(), None, false);
+        let open = a.open.as_mut().unwrap();
+        open.checkpoint();
+        open.project.pages[1].symbols.retain(|s| s.id != id);
+        a.share.frame(a.open.as_mut(), None, false);
+        a.run(Action::Undo);
+        a.share.frame(a.open.as_mut(), None, false);
+        assert!(page2(&a).symbols.iter().any(|s| s.id == id), "the lamp is back");
+        a.ed.wire = Some((start, Vec::new()));
+        a.run(Action::Redo);
+        assert!(a.ed.wire.is_none(), "Redo in a session drops the wire being drawn");
+        a.share.frame(a.open.as_mut(), None, false);
+        assert!(
+            page2(&a).symbols.iter().all(|s| s.id != id),
+            "the lamp is deleted again"
+        );
+        a.share.stop();
+    }
+
+    #[test]
+    fn a_sync_that_removes_the_start_pin_drops_a_wire_being_drawn() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        a.share.start_host(open, "Hanna", "hanna@example.com").unwrap();
+        let open = a.open.as_mut().unwrap();
+        let kept = open.place(1, "wc.lamp", wc_core::Point::new(20.0, 50.0)).unwrap();
+        a.share.frame(a.open.as_mut(), None, false);
+        let open = a.open.as_mut().unwrap();
+        let id = open.place(1, "wc.lamp", wc_core::Point::new(50.0, 50.0)).unwrap();
+        a.share.frame(a.open.as_mut(), None, false);
+        a.ed.page = 1;
+        // The undo is sent first; a wire is started on the lamp before the sync brings it.
+        assert!(a.share.undo().is_ok());
+        let pin = |item: &str| wc_core::Endpoint::Pin {
+            item: item.into(),
+            pin: "X1".into(),
+        };
+        a.ed.wire = Some((pin(&kept), Vec::new()));
+        a.sync_session_now(false);
+        assert!(a.ed.wire.is_some(), "a wire from a pin still there is kept");
+        a.ed.wire = Some((pin(&id), Vec::new()));
+        a.share.redo().unwrap();
+        a.sync_session_now(false);
+        assert!(page2(&a).symbols.iter().any(|s| s.id == id), "the lamp is back");
+        assert!(a.ed.wire.is_some());
+        a.share.undo().unwrap();
+        a.sync_session_now(false);
+        assert!(page2(&a).symbols.iter().all(|s| s.id != id), "the lamp is gone");
+        assert!(a.ed.wire.is_none(), "the sync drops the wire from the missing pin");
+        a.share.stop();
+    }
+
+    #[test]
+    fn the_assistant_redo_tool_drops_a_wire_being_drawn() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        let id = open.place(1, "wc.lamp", wc_core::Point::new(50.0, 50.0)).unwrap();
+        open.checkpoint();
+        open.project.pages[1].symbols.retain(|s| s.id != id);
+        call(&mut a, "undo", json!({})).unwrap();
+        assert!(page2(&a).symbols.iter().any(|s| s.id == id), "the lamp is back");
+        a.ed.wire = Some((
+            wc_core::Endpoint::Pin {
+                item: id.clone(),
+                pin: "X1".into(),
+            },
+            Vec::new(),
+        ));
+        call(&mut a, "undo", json!({"redo": true})).unwrap();
+        assert!(
+            page2(&a).symbols.iter().all(|s| s.id != id),
+            "the lamp is deleted again"
+        );
+        assert!(a.ed.wire.is_none(), "no wire left starting on the missing pin");
+        // The same in a session.
+        let open = a.open.as_mut().unwrap();
+        a.share.start_host(open, "Hanna", "hanna@example.com").unwrap();
+        let open = a.open.as_mut().unwrap();
+        let id = open.place(1, "wc.lamp", wc_core::Point::new(50.0, 50.0)).unwrap();
+        a.share.frame(a.open.as_mut(), None, false);
+        let open = a.open.as_mut().unwrap();
+        open.checkpoint();
+        open.project.pages[1].symbols.retain(|s| s.id != id);
+        a.share.frame(a.open.as_mut(), None, false);
+        call(&mut a, "undo", json!({})).unwrap();
+        a.share.frame(a.open.as_mut(), None, false);
+        assert!(page2(&a).symbols.iter().any(|s| s.id == id), "the lamp is back");
+        a.ed.page = 1;
+        a.ed.wire = Some((
+            wc_core::Endpoint::Pin {
+                item: id.clone(),
+                pin: "X1".into(),
+            },
+            Vec::new(),
+        ));
+        call(&mut a, "undo", json!({"redo": true})).unwrap();
+        assert!(a.ed.wire.is_none(), "the session's redo drops the wire being drawn");
+        a.share.frame(a.open.as_mut(), None, false);
+        assert!(
+            page2(&a).symbols.iter().all(|s| s.id != id),
+            "the lamp is deleted again"
+        );
+        a.share.stop();
+    }
+
+    #[test]
+    fn the_assistant_undo_tool_drops_a_wire_being_drawn() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        let id = open.place(1, "wc.lamp", wc_core::Point::new(50.0, 50.0)).unwrap();
+        let start = wc_core::Endpoint::Pin {
+            item: id.clone(),
+            pin: "X1".into(),
+        };
+        a.ed.wire = Some((start.clone(), Vec::new()));
+        call(&mut a, "undo", json!({})).unwrap();
+        assert!(page2(&a).symbols.iter().all(|s| s.id != id), "the lamp is gone");
+        assert!(a.ed.wire.is_none(), "no wire left starting on the missing pin");
+        // The same in a session: the host takes the lamp back.
+        let open = a.open.as_mut().unwrap();
+        a.share.start_host(open, "Hanna", "hanna@example.com").unwrap();
+        let open = a.open.as_mut().unwrap();
+        let id = open.place(1, "wc.lamp", wc_core::Point::new(50.0, 50.0)).unwrap();
+        a.share.frame(a.open.as_mut(), None, false);
+        a.ed.page = 1;
+        a.ed.wire = Some((
+            wc_core::Endpoint::Pin {
+                item: id.clone(),
+                pin: "X1".into(),
+            },
+            Vec::new(),
+        ));
+        call(&mut a, "undo", json!({})).unwrap();
+        assert!(a.ed.wire.is_none(), "the session's undo drops the wire being drawn");
+        a.share.frame(a.open.as_mut(), None, false);
+        assert!(page2(&a).symbols.iter().all(|s| s.id != id), "the lamp is gone");
         a.share.stop();
     }
 

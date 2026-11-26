@@ -583,7 +583,7 @@ pub fn library(ui: &mut egui::Ui, open: &Open, ed: &mut Editor, ps: &mut PanelSt
                 let r = row(ui, picked, lead, if vendored { text } else { text.italics() }, false).on_hover_text(hover);
                 if r.clicked() {
                     ed.place_symbol = Some(id.clone());
-                    ed.tool = Tool::Place;
+                    ed.set_tool(Tool::Place);
                     ed.wire = None;
                 }
             }
