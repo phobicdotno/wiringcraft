@@ -329,6 +329,27 @@ struct Importing {
 /// Said when something waits for an import that is running.
 const IMPORT_RUNNING: &str = "An import is running; wait until it is done.";
 
+/// The actions that would change or select on the schematic under the symbol editor: held back
+/// while it is open, from the keys, the menu, the toolbar and the assistant alike.
+fn held_by_symbol_editor(a: Action) -> bool {
+    matches!(
+        a,
+        Action::Cut
+            | Action::Copy
+            | Action::Paste
+            | Action::Duplicate
+            | Action::Rotate
+            | Action::Mirror
+            | Action::SelectAll
+    )
+}
+
+/// Why `what` (an action's label, or what an assistant tool does) was refused while the symbol
+/// editor is open.
+fn symbol_editor_refusal(what: &str) -> String {
+    format!("{what} was not done: close the symbol editor first.")
+}
+
 /// The actions that do not change the project, its folder or which project is open: the only
 /// ones carried out while an import runs.
 fn allowed_while_importing(a: Action) -> bool {
@@ -624,6 +645,8 @@ impl App {
                 return;
             }
             self.ed = Editor::default();
+            // The fresh editor keeps the user's hidden and locked layers.
+            self.apply_layers();
             self.panels.reset();
             self.dialog = None;
             self.prefs.remember(joined.dir.clone());
@@ -698,6 +721,9 @@ impl App {
             && p.id == w.page
         {
             edit::restore_graphics(&mut w.items, &mut self.ed.selection, &p.graphics);
+            // A drawing back on a layer hidden or locked meanwhile is not selected again.
+            let layers = &self.ed.layers;
+            self.ed.selection.retain(|s| layers.may_select(s));
             // Still away with every change answered: the host refused it.
             if !w.items.is_empty() && waiting {
                 w.selection = self.ed.selection.clone();
@@ -771,6 +797,9 @@ impl App {
                     self.dialog = None;
                 }
                 self.ed = Editor::default();
+                // The fresh editor keeps the user's hidden and locked layers (`prefs` is the
+                // user's list here: `self.prefs` may be taken out while this runs).
+                self.ed.layers = prefs.layers.clone();
                 self.panels.reset();
                 self.ed.message = format!("Opened {}", dir.display());
                 self.open = Some(o);
@@ -1332,9 +1361,9 @@ impl App {
             return;
         }
         // The keys are held back while the symbol editor is open; the menu, toolbar and
-        // assistant are too, so the schematic does not change under the editor.
-        if a == Action::Duplicate && self.symbol_editor.is_some() {
-            self.ed.message = "Duplicate was not done: close the symbol editor first.".into();
+        // assistant are too, so the schematic does not change or get selected under the editor.
+        if held_by_symbol_editor(a) && self.symbol_editor.is_some() {
+            self.ed.message = symbol_editor_refusal(a.info().label);
             return;
         }
         if a == Action::ReportProblem {
@@ -1512,6 +1541,9 @@ impl App {
                 // Changes not synced yet (an assistant's, made with no frame in between) go into
                 // the session's history first, so Undo takes back the latest one.
                 self.sync_session_now(false);
+                // A panel device drag going on ends here: Escape must not put back a start
+                // position the history no longer has.
+                self.ed.panel_drag = None;
                 let r = if a == Action::Undo {
                     self.share.undo()
                 } else {
@@ -1553,6 +1585,8 @@ impl App {
             }
             Action::SaveAs => self.pending = Some(Pending::SaveAs),
             Action::Undo | Action::Redo => {
+                // As in a shared session: a panel device drag going on ends here.
+                self.ed.panel_drag = None;
                 let done = if a == Action::Undo { open.undo() } else { open.redo() };
                 if done {
                     self.ed.selection.clear();
@@ -1638,7 +1672,7 @@ impl App {
             Action::Copy | Action::Cut => {
                 let clip = open.copy(page, &self.ed.selection);
                 if !clip.is_empty() {
-                    let n = clip.symbols.len() + clip.wires.len();
+                    let n = clip.count();
                     self.copied_text = Some(clip.summary());
                     self.clipboard = clip;
                     if a == Action::Cut {
@@ -1649,9 +1683,9 @@ impl App {
                             .partition(|s| matches!(s, Selection::Cloud(_) | Selection::RevisionTable));
                         open.delete_many(page, &sel);
                         self.ed.selection = kept;
-                        self.ed.message = format!("Cut {n} items.");
+                        self.ed.message = format!("Cut {n}.");
                     } else {
-                        self.ed.message = format!("Copied {n} items.");
+                        self.ed.message = format!("Copied {n}.");
                     }
                 }
             }
@@ -2049,31 +2083,33 @@ impl App {
                 (Key::G, Action::ToggleGrid),
                 (Key::F, Action::ZoomFit),
                 (Key::Plus, Action::ZoomIn),
+                // The unshifted key that has + on it on many keyboards (US: = and +).
+                (Key::Equals, Action::ZoomIn),
                 (Key::Minus, Action::ZoomOut),
                 (Key::PageUp, Action::PrevPage),
                 (Key::PageDown, Action::NextPage),
             ] {
-                if pressed_with(i, k, Modifiers::is_none) {
+                // + often needs Shift, so the zoom-in keys also count with Shift held.
+                // Shift and nothing else: `shift_only` does not look at the Mac's Ctrl key.
+                let zoom_in = matches!(k, Key::Plus | Key::Equals);
+                let ok =
+                    |m: &Modifiers| m.is_none() || (zoom_in && m.shift && !(m.ctrl || m.alt || m.command || m.mac_cmd));
+                if pressed_with(i, k, ok) {
                     out.push(a);
                 }
+            }
+            // A shape half drawn in the symbol editor takes Enter and Escape; the editor
+            // handles them itself, so the schematic's drawing is left alone.
+            if self.symbol_editor.as_ref().is_some_and(|e| e.drawing_shape()) {
+                return;
             }
             if pressed_with(i, Key::Enter, Modifiers::is_none)
                 && matches!(self.ed.tool, Tool::Polyline | Tool::BlackBox)
             {
                 self.ed.finish_shape = true;
             }
-            if i.key_pressed(Key::Escape) {
-                if self.ed.tool == Tool::BlackBox && self.ed.black_box.is_some() {
-                    self.ed.black_box = None;
-                    self.ed.message = black_box_tool::hint(None).into();
-                } else if !self.ed.shape_points.is_empty() {
-                    self.ed.shape_points.clear();
-                    self.ed.message = canvas::shape_hint(self.ed.tool, 0).into();
-                } else if self.ed.wire.is_some() {
-                    self.ed.wire = None;
-                } else {
-                    out.push(Action::Select);
-                }
+            if i.key_pressed(Key::Escape) && self.ed.escape() {
+                out.push(Action::Select);
             }
         });
         out
@@ -5247,7 +5283,8 @@ fn same_dir(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// Every page as SVG and DXF in `export/drawings`, named by page number.
+/// Every page as SVG and DXF in `export/drawings`, named by page number, and every panel
+/// layout, named `panel-<name>`.
 fn export_drawings(open: &Open) -> String {
     export_drawings_to(open, &open.dir.join("export").join("drawings"))
 }
@@ -5258,6 +5295,8 @@ fn export_drawings_to(open: &Open, dir: &Path) -> String {
     let options = wc_pdf::Options {
         underlays: pictures.files,
         unreadable: pictures.unreadable,
+        panels: open.project.panels.clone(),
+        footprints: wc_pdf::footprints(open.parts.values()),
         ..Default::default()
     };
     let (pages, report) = wc_pdf::page_drawings(&open.project, &open.symbols, &options);
@@ -5265,15 +5304,19 @@ fn export_drawings_to(open: &Open, dir: &Path) -> String {
     let files: Vec<(String, &wc_pdf::PageDrawing)> = pages
         .iter()
         .map(|page| {
-            let base = if page.number.trim().is_empty() {
-                &page.id
+            // A panel layout is named after itself (`panel-Main_cabinet`), a page by its number.
+            let mut stem = if page.panel {
+                wc_pdf::panel_file_stem(page)
             } else {
-                page.number.trim()
+                let base = if page.number.trim().is_empty() {
+                    &page.id
+                } else {
+                    page.number.trim()
+                };
+                base.chars()
+                    .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+                    .collect()
             };
-            let mut stem: String = base
-                .chars()
-                .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
-                .collect();
             // Compared without case: `A1` and `a1` are one file name on Windows and macOS.
             while !used.insert(stem.to_lowercase()) {
                 stem.push('_');
@@ -5335,7 +5378,12 @@ fn export_drawings_to(open: &Open, dir: &Path) -> String {
     }
     match written {
         Ok(()) => {
-            let mut m = format!("Exported {} pages as SVG and DXF to\n{}", pages.len(), dir.display());
+            let panels = pages.iter().filter(|p| p.panel).count();
+            let mut m = format!("Exported {} pages", pages.len() - panels);
+            if panels > 0 {
+                m.push_str(&format!(" and {panels} panel layout(s)"));
+            }
+            m.push_str(&format!(" as SVG and DXF to\n{}", dir.display()));
             if !report.warnings.is_empty() {
                 m.push_str("\n\nWarnings:\n");
                 m.push_str(&report.warnings.join("\n"));
@@ -5442,10 +5490,20 @@ impl eframe::App for App {
                         panels::properties(ui, open, &mut self.ed, &mut self.panels);
                     });
                 });
+            // Keyboard edits wait while a dialog, an import or the symbol editor has the keyboard,
+            // as the schematic's arrow keys do.
+            let keyboard_edits = self.dialog.is_none() && self.importing.is_none() && self.symbol_editor.is_none();
             egui::CentralPanel::default().frame(egui::Frame::new()).show(ctx, |ui| {
                 self.ed.auto_wire = self.prefs.auto_wire;
                 self.ed.layers = self.prefs.layers.clone();
-                canvas::show(ui, open, &mut self.ed, self.prefs.show_grid, self.prefs.snap);
+                canvas::show(
+                    ui,
+                    open,
+                    &mut self.ed,
+                    self.prefs.show_grid,
+                    self.prefs.snap,
+                    keyboard_edits,
+                );
                 let held = open
                     .project
                     .pages
@@ -5603,16 +5661,13 @@ impl App {
                     ed.delete_selected();
                     false
                 }
+                a if held_by_symbol_editor(*a) => {
+                    // Held back, and said so, as from the menu.
+                    self.ed.message = symbol_editor_refusal(a.info().label);
+                    false
+                }
                 // The page behind the symbol editor stays as it is.
-                Action::Cut
-                | Action::Copy
-                | Action::Paste
-                | Action::Duplicate
-                | Action::Rotate
-                | Action::Mirror
-                | Action::SelectAll
-                | Action::PrevPage
-                | Action::NextPage => false,
+                Action::PrevPage | Action::NextPage => false,
                 _ => true,
             })
             .collect()
@@ -6797,6 +6852,31 @@ mod marking_tests {
     }
 
     #[test]
+    fn drawings_include_a_file_per_panel_layout() {
+        let (_tmp, mut o) = state::tests::project();
+        o.project.pages.truncate(1);
+        o.project.pages[0].number = "1".into();
+        o.project.panels.push(wc_core::panel::Panel::with_rails(
+            "plate1",
+            "Main cabinet",
+            600.0,
+            800.0,
+        ));
+        let own = o.dir.join("export").join("drawings");
+        let msg = export_drawings_to(&o, &own);
+        assert!(msg.starts_with("Exported 1 pages and 1 panel layout(s)"), "{msg}");
+        let mut names: Vec<String> = std::fs::read_dir(&own)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["1.dxf", "1.svg", "panel-Main_cabinet.dxf", "panel-Main_cabinet.svg"]
+        );
+    }
+
+    #[test]
     fn drawings_replace_their_own_folder_also_when_it_is_picked_by_another_route() {
         let (_tmp, o) = state::tests::project();
         let own = o.dir.join("export").join("drawings");
@@ -7235,6 +7315,72 @@ mod nudge_tests {
             assert!(app.open.as_mut().unwrap().undo());
             assert_eq!((coil_at(&app), wires(&app)), (Point::new(55.0, 60.0), 0));
         }
+    }
+
+    #[test]
+    fn an_arrow_press_through_the_app_frame_leaves_the_panel_device_alone_behind_a_dialog() {
+        use wc_core::panel::{Panel, PanelItem};
+        let (_tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        let open = app.open.as_mut().unwrap();
+        open.project.panels.push(Panel {
+            id: "panel1".into(),
+            name: "Panel 1".into(),
+            width: 400.0,
+            height: 300.0,
+            items: vec![PanelItem::Device {
+                tag: wc_core::DeviceTag::parse("-K1").unwrap(),
+                at: Point::new(100.0, 100.0),
+                width: 40.0,
+                height: 60.0,
+                rotation: wc_core::geom::Rotation::R0,
+            }],
+        });
+        let panel = open.project.panels.len() - 1;
+        app.ed.panel = Some(panel);
+        app.ed.panel_pick = Some(0);
+        let mut frame = eframe::Frame::_new_kittest();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame)
+        });
+        let device_at = |app: &App| {
+            let open = app.open.as_ref().unwrap();
+            match open.project.panels[panel].items.first() {
+                Some(PanelItem::Device { at, .. }) => *at,
+                _ => unreachable!("the device is there"),
+            }
+        };
+        let undo_steps = |app: &App| app.open.as_ref().unwrap().undo_steps();
+        let right = || egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+
+        // A message box is open: the press leaves the device and the undo history alone.
+        app.dialog = Some(Dialog::Message("Something to read.".into()));
+        let steps = undo_steps(&app);
+        let _ = ctx.run(right(), |ctx| eframe::App::update(&mut app, ctx, &mut frame));
+        assert!(app.dialog.is_some(), "the message box is still open");
+        assert_eq!(device_at(&app), Point::new(100.0, 100.0));
+        assert_eq!(undo_steps(&app), steps);
+
+        // With the message box closed, the same press moves the device one step.
+        app.dialog = None;
+        let _ = ctx.run(right(), |ctx| eframe::App::update(&mut app, ctx, &mut frame));
+        assert_eq!(device_at(&app), Point::new(105.0, 100.0));
+        assert_eq!(undo_steps(&app), steps + 1);
+        assert_eq!(
+            coil_at(&app),
+            Point::new(80.0, 60.0),
+            "the page behind the panel stays put"
+        );
     }
 }
 

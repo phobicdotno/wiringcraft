@@ -1022,6 +1022,199 @@ fn a_long_text_and_a_big_object_map_are_read() -> TestResult {
 }
 
 #[test]
+fn a_line_whose_end_is_not_a_number_is_damage_not_drawn_at_0() -> TestResult {
+    let v = Version::R2010;
+    let objs = vec![
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        entry(v, LAYER, LAYER_H, "0"),
+        line(v, 0x200, head(None), (0.0, 0.0), (f64::NAN, 1.0)),
+        line(v, 0x201, head(None), (0.0, 0.0), (5.0, 0.0)),
+    ];
+    let d = drawing(&sections(v, &objs, &[]))?;
+    assert_eq!(d.model.len(), 1, "{:?}", d.model);
+    assert_eq!(d.skipped.get(DAMAGED), Some(&1), "{:?}", d.skipped);
+    Ok(())
+}
+
+#[test]
+fn a_text_placed_where_it_is_not_a_number_is_damage_not_drawn_at_0() -> TestResult {
+    let v = Version::R2010;
+    let mut bad_text = entity(v, 1, 0x200, head(None));
+    text_data(&mut bad_text, (f64::NAN, 0.0), "LOST", 2.5, 0.0);
+    let mut good_text = entity(v, 1, 0x201, head(None));
+    text_data(&mut good_text, (1.0, 2.0), "A1", 2.5, 0.0);
+    let objs = vec![
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        entry(v, LAYER, LAYER_H, "0"),
+        bad_text,
+        good_text,
+        line(v, 0x202, head(None), (0.0, 0.0), (5.0, 0.0)),
+    ];
+    let d = drawing(&sections(v, &objs, &[]))?;
+    assert_eq!(d.model.len(), 2, "{:?}", d.model);
+    assert!(
+        d.model
+            .iter()
+            .any(|s| matches!(s, Shape::Text { text, .. } if text == "A1")),
+        "{:?}",
+        d.model
+    );
+    assert_eq!(d.skipped.get(DAMAGED), Some(&1), "{:?}", d.skipped);
+    Ok(())
+}
+
+#[test]
+fn a_polyline_with_a_damaged_vertex_is_left_out_not_joined_across_it() -> TestResult {
+    let v = Version::R2010;
+    let mut objs = vec![
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        entry(v, LAYER, LAYER_H, "0"),
+    ];
+    // Two open 3D polylines of three vertices; the first one's middle vertex is not a number.
+    for (base, middle) in [(0x100u64, f64::NAN), (0x200, 5.0)] {
+        let mut p = entity(v, 16, base, head(None));
+        p.data.rc(0).rc(0).bl(3);
+        p.handles.h(4, base + 1).h(4, base + 2).h(4, base + 3).h(3, base + 4);
+        objs.push(p);
+        for (n, (x, y)) in [(0.0, 0.0), (middle, 5.0), (10.0, 0.0)].into_iter().enumerate() {
+            let mut vx = entity(v, 11, base + 1 + n as u64, head(Some(base)));
+            vx.data.rc(0).bd3((x, y, 0.0));
+            objs.push(vx);
+        }
+        objs.push(entity(v, 6, base + 4, head(Some(base))));
+    }
+    let d = drawing(&sections(v, &objs, &[]))?;
+    let [Shape::Polyline { points, .. }] = d.model.as_slice() else {
+        unreachable!("{:?}", d.model);
+    };
+    assert_eq!(points.len(), 3, "{points:?}");
+    assert!(points.iter().any(|p| p.y.abs() == 5.0), "{points:?}");
+    assert_eq!(d.skipped.get(DAMAGED), Some(&1), "{:?}", d.skipped);
+    assert_eq!(d.skipped.get(BROKEN_POLYLINE), Some(&1), "{:?}", d.skipped);
+    Ok(())
+}
+
+#[test]
+fn a_spline_fitted_polyline_keeps_its_fit_vertices_without_its_control_ones() -> TestResult {
+    let v = Version::R2010;
+    let mut objs = vec![
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        entry(v, LAYER, LAYER_H, "0"),
+    ];
+    let mut pl = entity(v, 15, 0x100, head(None));
+    pl.data
+        .bs(0)
+        .bs(0)
+        .bd(0.0)
+        .bd(0.0)
+        .bt(0.0)
+        .bd(0.0)
+        .be((0.0, 0.0, 1.0))
+        .bl(4);
+    pl.handles.h(4, 0x101).h(4, 0x102).h(4, 0x103).h(4, 0x104).h(3, 0x105);
+    objs.push(pl);
+    // A control vertex (flag 0x10) listed first, then three fit vertices on the curve.
+    for (n, (flags, x, y)) in [(0x10u8, 5.0, 50.0), (0, 0.0, 0.0), (0, 5.0, 5.0), (0, 10.0, 0.0)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut vx = entity(v, 10, 0x101 + n as u64, head(Some(0x100)));
+        vx.data.rc(flags).bd3((x, y, 0.0)).bd(0.0).bd(0.0).bd(0.0);
+        objs.push(vx);
+    }
+    objs.push(entity(v, 6, 0x105, head(Some(0x100))));
+    let d = drawing(&sections(v, &objs, &[]))?;
+    let [Shape::Polyline { points, .. }] = d.model.as_slice() else {
+        unreachable!("{:?} {:?}", d.model, d.skipped);
+    };
+    assert_eq!(points.len(), 3, "{points:?}");
+    assert!(points.iter().all(|p| p.y.abs() <= 5.0), "{points:?}");
+    assert!(d.skipped.is_empty(), "{:?}", d.skipped);
+    Ok(())
+}
+
+/// A classic 2D polyline keeps the bulge each vertex stores after its widths, in the drawing and
+/// on the page made from it: from (0, 0) to (10, 0) with bulge 1 is a half circle, with bulge 0
+/// a straight line. A negative start width (one width for both ends) has no end width after it,
+/// and the bulge is still found.
+#[test]
+fn a_classic_polyline_keeps_the_bulges_of_its_vertices() -> TestResult {
+    let v = Version::R2010;
+    let polyline = |bulge: f64, start_width: f64| {
+        let mut objs = vec![
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            entry(v, LAYER, LAYER_H, "0"),
+        ];
+        let mut pl = entity(v, 15, 0x100, head(None));
+        pl.data
+            .bs(0)
+            .bs(0)
+            .bd(0.0)
+            .bd(0.0)
+            .bt(0.0)
+            .bd(0.0)
+            .be((0.0, 0.0, 1.0))
+            .bl(2);
+        pl.handles.h(4, 0x101).h(4, 0x102).h(3, 0x103);
+        objs.push(pl);
+        for (n, (x, b)) in [(0.0, bulge), (10.0, 0.0)].into_iter().enumerate() {
+            let mut vx = entity(v, 10, 0x101 + n as u64, head(Some(0x100)));
+            vx.data.rc(0).bd3((x, 0.0, 0.0)).bd(start_width);
+            if start_width >= 0.0 {
+                vx.data.bd(start_width);
+            }
+            vx.data.bd(b).bd(0.0);
+            objs.push(vx);
+        }
+        objs.push(entity(v, 6, 0x103, head(Some(0x100))));
+        sections(v, &objs, &[])
+    };
+    // Both in the drawing read and on the page made from it.
+    let shapes = |s: &Sections| -> std::result::Result<[Vec<Point>; 2], Box<dyn std::error::Error>> {
+        let d = drawing(s)?;
+        let page = crate::dwg::page_of(s, 1.0, &Default::default())?;
+        let [Shape::Polyline { points: a, .. }] = d.model.as_slice() else {
+            unreachable!("{:?} {:?}", d.model, d.skipped);
+        };
+        let [Shape::Polyline { points: b, .. }] = page.graphics.as_slice() else {
+            unreachable!("{:?} {:?}", page.graphics, page.warnings);
+        };
+        Ok([a.clone(), b.clone()])
+    };
+    let height = |p: &[Point]| {
+        let ys = p.iter().map(|p| p.y);
+        ys.clone().fold(f64::MIN, f64::max) - ys.fold(f64::MAX, f64::min)
+    };
+    // A start width that is no number leaves the fields after it unknown: the vertex is
+    // damaged, not read with the end width taken for the bulge.
+    for width in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let d = drawing(&polyline(1.0, width))?;
+        // Both vertices carry the width, so both are damaged.
+        assert_eq!(d.skipped.get(DAMAGED), Some(&2), "width {width}: {:?}", d.skipped);
+        assert!(
+            d.model
+                .iter()
+                .all(|s| !matches!(s, Shape::Polyline { points, .. } if points.len() > 2)),
+            "width {width}: {:?}",
+            d.model
+        );
+    }
+    for width in [0.0, -0.5] {
+        for points in shapes(&polyline(1.0, width))? {
+            assert!(
+                points.len() > 2 && (height(&points) - 5.0).abs() < 0.1,
+                "width {width}: {points:?}"
+            );
+        }
+        for points in shapes(&polyline(0.0, width))? {
+            assert_eq!(points.len(), 2, "width {width}: {points:?}");
+            assert!(height(&points).abs() < 1e-9, "width {width}: {points:?}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn bit_values_are_read_in_every_form() -> TestResult {
     let mut w = W::default();
     w.bs(0).bs(256).bs(7).bs(4000);
@@ -1423,6 +1616,268 @@ fn a_block_whose_base_point_is_cut_off_is_kept_and_said() -> TestResult {
         "{:?}",
         read.damaged
     );
+    // A page says why, not only how many.
+    let mut objs = objs;
+    objs.push(line(v, 0x201, head(None), (0.0, 0.0), (10.0, 0.0)));
+    let page = crate::dwg::page_of(&sections(v, &objs, &[]), 1.0, &Default::default())?;
+    assert!(
+        page.warnings
+            .iter()
+            .any(|w| w.starts_with("1 block base points not read") && w.contains("base point of block CUT")),
+        "{:?}",
+        page.warnings
+    );
+    Ok(())
+}
+
+/// A drawing with nothing to draw names the block whose base point it could not read; the
+/// name comes from the file, so `import page-dwg` escapes it before it reaches the terminal.
+#[test]
+fn a_block_name_in_a_page_error_is_escaped_for_the_terminal() -> TestResult {
+    let v = Version::R2004;
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        named(v, BLOCK_HEADER, 0x100, "CUT\u{1b}[2J"),
+        line(v, 0x200, head(Some(0x100)), (5.0, 5.0), (10.0, 5.0)),
+    ];
+    let drawing = crate::dwg::page_drawing(&sections(v, &objs, &[]))?;
+    let Err(raw) = drawing.page(1.0, &Default::default()) else {
+        unreachable!("nothing to draw");
+    };
+    assert!(raw.to_string().contains("CUT\u{1b}[2J"), "{raw}");
+    let Err(shown) = crate::run::dwg_page(&drawing, 1.0, &Default::default()) else {
+        unreachable!("nothing to draw");
+    };
+    assert!(!shown.contains('\u{1b}'), "{shown:?}");
+    assert!(shown.contains("CUT\\u{1b}[2J"), "{shown}");
+    Ok(())
+}
+
+#[test]
+fn a_reference_to_a_missing_block_is_counted_and_the_rest_drawn() -> TestResult {
+    for v in [Version::R2004, Version::R2010, Version::R2018] {
+        let mut i = entity(v, 7, 0x201, head(None));
+        i.data.bd3((0.0, 0.0, 0.0)).bb(3).bd(0.0).bd3((0.0, 0.0, 1.0)).b(false);
+        i.handles.h(5, 0x999);
+        let objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            line(v, 0x200, head(None), (0.0, 0.0), (10.0, 0.0)),
+            i,
+        ];
+        let read = dxf_drawing(&sections(v, &objs, &[]))?;
+        assert_eq!(
+            read.skipped.get(UNRESOLVED_INSERT),
+            Some(&1),
+            "{v:?}: {:?}",
+            read.skipped
+        );
+        let page = crate::dwg::page_of(&sections(v, &objs, &[]), 1.0, &Default::default())?;
+        assert!(!page.graphics.is_empty(), "{v:?}: the line is drawn");
+        assert!(
+            page.warnings
+                .iter()
+                .any(|w| w.starts_with("1 block references to a block that is not in the drawing")),
+            "{v:?}: {:?}",
+            page.warnings
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn the_attributes_of_a_reference_to_a_missing_block_stay_its_own() -> TestResult {
+    for v in [Version::R2004, Version::R2010, Version::R2018] {
+        let insert = |handle: u64, block: u64, attribs: bool| {
+            let mut i = entity(v, 7, handle, head(None));
+            i.data
+                .bd3((0.0, 0.0, 0.0))
+                .bb(3)
+                .bd(0.0)
+                .bd3((0.0, 0.0, 1.0))
+                .b(attribs);
+            if attribs {
+                i.data.bl(1);
+            }
+            i.handles.h(5, block);
+            i
+        };
+        let objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            block_header(v, 0x100, "B", (0.0, 0.0), false),
+            line(v, 0x200, head(Some(0x100)), (0.0, 0.0), (10.0, 0.0)),
+            insert(0x201, 0x100, false),
+            insert(0x202, 0x999, true),
+            attrib(v, 2, 0x203, head(Some(0x202)), (0.0, 20.0), "-K9", "TAG", 0),
+        ];
+        let known: std::collections::BTreeSet<String> = ["b".to_owned()].into();
+        let page = crate::dwg::page_of(&sections(v, &objs, &[]), 1.0, &known)?;
+        assert_eq!(page.symbols.len(), 1, "{v:?}: {page:?}");
+        assert!(
+            page.symbols[0].tag.is_none(),
+            "{v:?}: not the tag of the symbol before it: {:?}",
+            page.symbols[0].tag
+        );
+        assert!(
+            page.graphics
+                .iter()
+                .any(|s| matches!(s, Shape::Text { text, .. } if text == "-K9")),
+            "{v:?}: the text is kept: {:?}",
+            page.graphics
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn an_encrypted_class_section_is_said() -> TestResult {
+    let v = Version::R2010;
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        line(v, 0x200, head(None), (0.0, 0.0), (10.0, 0.0)),
+    ];
+    let mut s = sections(v, &objs, &[]);
+    s.skipped.push("AcDb:Classes".to_owned());
+    let read = dxf_drawing(&s)?;
+    assert_eq!(read.skipped.get(CLASSES_DAMAGED), Some(&1), "{:?}", read.skipped);
+    let page = crate::dwg::page_of(&s, 1.0, &Default::default())?;
+    assert!(!page.graphics.is_empty());
+    assert!(
+        page.warnings
+            .iter()
+            .any(|w| w.contains("the class section is encrypted") && w.contains("custom entities are not counted")),
+        "{:?}",
+        page.warnings
+    );
+    Ok(())
+}
+
+/// A lightweight polyline declaring far more bulges than points: the extra ones are read past
+/// (not kept), and the polyline is drawn as with one bulge per point.
+#[test]
+fn extra_bulges_of_a_lightweight_polyline_are_not_kept() -> TestResult {
+    let v = Version::R2004;
+    let poly = |bulges: u32| {
+        let mut p = entity(v, 77, 0x200, head(None));
+        p.data.bs(16).bl(2).bl(bulges);
+        p.data.rd(0.0).rd(0.0).dd(10.0, 0.0).dd(0.0, 0.0).bd(1.0);
+        for _ in 1..bulges {
+            p.data.bd(0.0);
+        }
+        let objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            p,
+        ];
+        drawing(&sections(v, &objs, &[]))
+    };
+    let (two, many) = (poly(2)?, poly(10_000)?);
+    assert!(many.skipped.is_empty(), "{:?}", many.skipped);
+    assert_eq!(format!("{:?}", many.model), format!("{:?}", two.model));
+    Ok(())
+}
+
+/// The bulges kept for a polyline: one per point at most, however many the object declares,
+/// and the reader ends past all of them.
+#[test]
+fn bulges_past_the_points_are_read_but_not_kept() -> TestResult {
+    let mut w = W::default();
+    w.bd(1.0);
+    for _ in 1..10_000 {
+        w.bd(0.0);
+    }
+    w.bs(7);
+    let bytes = w.bytes();
+    let mut r = Bits::new(&bytes, 0, w.0.len());
+    assert_eq!(kept_bulges(&mut r, 10_000, 2)?, [1.0, 0.0]);
+    assert_eq!(r.bs()?, 7, "read past every declared bulge");
+    Ok(())
+}
+
+#[test]
+fn a_bulge_that_is_not_a_number_is_damage() -> TestResult {
+    for bad in [f64::NAN, f64::INFINITY] {
+        let mut w = W::default();
+        w.bd(0.0);
+        w.bd(bad);
+        let bytes = w.bytes();
+        let mut r = Bits::new(&bytes, 0, w.0.len());
+        let Err(e) = kept_bulges(&mut r, 2, 2) else {
+            unreachable!("a bulge of {bad} was kept");
+        };
+        assert!(e.to_string().contains("bulge is not a number"), "{e}");
+    }
+    // Past the points it is read but not kept, so it does no harm.
+    let mut w = W::default();
+    w.bd(0.5);
+    w.bd(f64::NAN);
+    let bytes = w.bytes();
+    let mut r = Bits::new(&bytes, 0, w.0.len());
+    assert_eq!(kept_bulges(&mut r, 2, 1)?, [0.5]);
+    Ok(())
+}
+
+#[test]
+fn a_bulged_lightweight_polyline_is_drawn_with_its_arc() -> TestResult {
+    for v in [Version::R2004, Version::R2010, Version::R2018] {
+        // Open, two points 10 apart, the segment between them a half circle (bulge 1); from
+        // 2010 on with vertex ids too, which come after the bulges.
+        let ids = v >= Version::R2010;
+        let mut p = entity(v, 77, 0x200, head(None));
+        p.data.bs(if ids { 16 | 1024 } else { 16 }).bl(2).bl(2);
+        if ids {
+            p.data.bl(2);
+        }
+        p.data.rd(0.0).rd(0.0).dd(10.0, 0.0).dd(0.0, 0.0).bd(1.0).bd(0.0);
+        if ids {
+            p.data.bl(1).bl(2);
+        }
+        let objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            p,
+        ];
+        let d = drawing(&sections(v, &objs, &[]))?;
+        assert!(d.skipped.is_empty(), "{v:?}: {:?}", d.skipped);
+        // Not a straight line: the arc's middle is 5 off the chord.
+        let off_chord = |s: &Shape| match s {
+            Shape::Polyline { points, .. } => points.iter().any(|p| (p.y.abs() - 5.0).abs() < 1e-6),
+            Shape::Arc { radius, .. } => (*radius - 5.0).abs() < 1e-6,
+            _ => false,
+        };
+        assert!(d.model.iter().any(off_chord), "{v:?}: {:?}", d.model);
+    }
+    Ok(())
+}
+
+#[test]
+fn a_polyline_point_that_is_not_a_number_is_damage_and_a_bulged_one_kept() -> TestResult {
+    let v = Version::R2010;
+    // Open, two points, a bulge of 1 on the first segment; the bad one's second point is NaN.
+    let poly = |h: u64, end: f64| {
+        let mut p = entity(v, 77, h, head(None));
+        p.data.bs(16).bl(2).bl(2);
+        p.data.rd(0.0).rd(0.0).dd(end, 0.0).dd(0.0, 0.0).bd(1.0).bd(0.0);
+        p
+    };
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        poly(0x200, f64::NAN),
+        poly(0x201, 10.0),
+    ];
+    let d = drawing(&sections(v, &objs, &[]))?;
+    assert_eq!(d.skipped.get(DAMAGED), Some(&1), "{:?}", d.skipped);
+    assert_eq!(d.model.len(), 1, "{:?}", d.model);
+    let off_chord = |s: &Shape| match s {
+        Shape::Polyline { points, .. } => points.iter().any(|p| (p.y.abs() - 5.0).abs() < 1e-6),
+        Shape::Arc { radius, .. } => (*radius - 5.0).abs() < 1e-6,
+        _ => false,
+    };
+    assert!(d.model.iter().any(off_chord), "{:?}", d.model);
     Ok(())
 }
 
