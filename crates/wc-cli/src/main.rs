@@ -1608,27 +1608,7 @@ fn rules_list(p: &Project, library: &[wc_core::check_rule::RuleSet], json: bool)
         })
     };
     if json {
-        let sources: Vec<serde_json::Value> = library
-            .iter()
-            .map(|set| match &set.rules {
-                Ok(rules) => {
-                    let rules: Vec<serde_json::Value> = rules
-                        .iter()
-                        .enumerate()
-                        .map(|(k, r)| {
-                            serde_json::json!({
-                                "rule": format!("{}:{}", set.source, k + 1),
-                                "off": turned_off(off, &set.source, k + 1, r),
-                                "is": r,
-                            })
-                        })
-                        .collect();
-                    serde_json::json!({"source": set.source, "rules": rules})
-                }
-                Err(why) => serde_json::json!({"source": set.source, "error": why}),
-            })
-            .collect();
-        let all = serde_json::json!({"rules": p.meta.rules, "library": sources, "rules_off": off});
+        let all = wc_core::check_rule::rules_listing(&p.meta, library);
         return serde_json::to_string_pretty(&all).map(|t| t + "\n").map_err(e);
     }
     let mut out = String::new();

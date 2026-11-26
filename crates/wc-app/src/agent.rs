@@ -2890,33 +2890,13 @@ impl App {
     /// The `rules` tool: the project's check rules and the library rules it turns off, kept
     /// as the check rules dialog keeps them (its checks, one undo step).
     fn tool_rules(&mut self, v: &Value) -> Result<String, String> {
-        use wc_core::check_rule::{CheckRule, check_rule, turn_rule, turned_off};
+        use wc_core::check_rule::{CheckRule, check_rule, rules_listing, turn_rule};
         let action = need_s(v, "action")?;
         let open = need_open(self.open.as_mut())?;
         let library = wc_library::library_rules(&open.dir, &open.project);
         let off = &open.project.meta.rules_off;
         match action {
-            "list" => {
-                let sources: Vec<Value> = library
-                    .iter()
-                    .map(|set| match &set.rules {
-                        Ok(rules) => {
-                            let rules: Vec<Value> = rules
-                                .iter()
-                                .enumerate()
-                                .map(|(k, r)| {
-                                    json!({"rule": format!("{}:{}", set.source, k + 1), "off": turned_off(off, &set.source, k + 1, r), "is": r})
-                                })
-                                .collect();
-                            json!({"source": set.source, "rules": rules})
-                        }
-                        Err(e) => json!({"source": set.source, "error": e}),
-                    })
-                    .collect();
-                Ok(pretty(
-                    &json!({"rules": open.project.meta.rules, "library": sources, "rules_off": off}),
-                ))
-            }
+            "list" => Ok(pretty(&rules_listing(&open.project.meta, &library))),
             "set" => {
                 let list = v
                     .get("rules")
