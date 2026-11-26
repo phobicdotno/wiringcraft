@@ -107,9 +107,9 @@ For the other areas, the chapter to read in each help is:
 |---|---|---|---|---|
 | IEC symbol library | yes | yes | yes: own starter library | done |
 | Symbol editor (draw graphics, place and name pins) | yes | yes | yes: draw, move (drag or arrow keys) and change shapes, place pins, save to a library folder | done (#105, #159) |
-| Import symbols from DXF / SVG | DXF/DWG | DWG | yes | done |
-| Import symbols from KiCad libraries | no | no | yes: every unit of a multi-unit symbol becomes a symbol of its own, also from a `.kicad_sym` inside a zip | done (#96) |
-| Import QElectroTech elements | no | no | yes: `.elmt` elements become symbols (`wiringcraft import symbol-qet`, Library → Import symbols) | done (#91) |
+| Import symbols from DXF / SVG | DXF/DWG | DWG | yes (SVG limits: see known-gaps) | done |
+| Import symbols from KiCad libraries | no | no | yes: every unit of a multi-unit symbol becomes a symbol of its own, also from a `.kicad_sym` inside a zip; limits: see known-gaps | done (#96) |
+| Import QElectroTech elements | no | no | yes: `.elmt` elements become symbols (`wiringcraft import symbol-qet`, Library → Import symbols); limits: see known-gaps | done (#91) |
 | Library versioned with lockfile and per-item update | no (master data sync) | no (shared database) | yes | done |
 | Library from git or folders | no | no | yes | done |
 
