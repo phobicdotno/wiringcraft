@@ -1699,15 +1699,23 @@ impl App {
         }
         let Some(open) = self.open.as_mut() else { return };
         // A black box form changed and not applied yet is applied before the project is saved.
-        // Why it was refused stays in the message the save leaves.
+        // Why it was refused, or what to check after it went in, stays in the message the save
+        // leaves.
+        let before = self.ed.message.clone();
         let refused = if saves_project(a) && !self.assistant.command_running() {
             panels::apply_black_box_draft(open, &mut self.ed, &mut self.panels)
         } else {
             None
         };
-        if let Some(r) = &refused {
-            self.ed.message = r.clone();
-        }
+        let refused = match refused {
+            Some(r) => {
+                self.ed.message = r.clone();
+                Some(r)
+            }
+            // Applied with warnings: they are in the message.
+            None if self.ed.message != before => Some(self.ed.message.clone()),
+            None => None,
+        };
         match a {
             Action::Save if self.assistant.command_running() => {
                 self.ed.message = App::SAVE_WAITS.into();
@@ -8167,6 +8175,48 @@ mod nudge_tests {
         // A sync before the panels of the next frame, as an assistant's Undo makes.
         app.sync_session_now(false);
         assert_eq!(app.open.as_ref().unwrap().dir, was_open, "the join waits for the close");
+    }
+
+    /// What to check after a black box form goes in with the save (a wire on a point that
+    /// moved, say) stays in the Save message (#932).
+    #[test]
+    fn ctrl_s_keeps_the_black_box_warnings_in_its_message() {
+        use wc_core::{BoxPin, BoxSide, Endpoint};
+        let (_tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        let page = app.ed.page;
+        let pins = [BoxPin {
+            name: "1".into(),
+            side: BoxSide::Left,
+            offset: 5.0,
+        }];
+        let open = app.open.as_mut().unwrap();
+        let id = open
+            .add_black_box(page, Point::new(120.0, 40.0), Point::new(140.0, 50.0), &pins, None)
+            .unwrap();
+        open.add_wire(
+            page,
+            Endpoint::Pin {
+                item: id.clone(),
+                pin: "1".into(),
+            },
+            Endpoint::Point {
+                at: Point::new(100.0, 45.0),
+            },
+            Vec::new(),
+        );
+        app.ed.select_only(Selection::Symbol(id));
+        let mut frame = eframe::Frame::_new_kittest();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame)
+        });
+        let form = panels::black_box_form_mut(&mut app.panels).unwrap();
+        form.rows[0].offset = 7.5;
+        app.carry_out(Action::Save);
+        assert!(!app.open.as_ref().unwrap().dirty, "saved");
+        assert!(app.ed.message.starts_with("Saved ("), "{}", app.ed.message);
+        assert!(app.ed.message.contains("which moved"), "{}", app.ed.message);
     }
 
     #[test]
