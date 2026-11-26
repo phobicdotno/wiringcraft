@@ -10514,6 +10514,8 @@ mod input_tests {
         assert!(edb.join("page.eod").exists());
     }
 
+    // Used by the stream tests, which run on Unix only.
+    #[cfg(unix)]
     const ELEMENT: &str =
         "<definition type=\"element\"><description><terminal x=\"0\" y=\"0\"/></description></definition>";
 
