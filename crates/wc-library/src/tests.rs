@@ -536,6 +536,12 @@ fn every_starter_symbol_loads_under_its_file_name_with_distinct_pins() -> Result
         let names: std::collections::BTreeSet<_> = s.pins.iter().map(|p| &p.name).collect();
         assert_eq!(names.len(), s.pins.len(), "{id} repeats a pin name");
     }
+    // The capacitor (#723): its own tag, letter code C (IEC 81346-2), pins 1 and 2.
+    let (capacitor, _) = lib.symbol("wc.capacitor")?;
+    assert_eq!(capacitor.role, SymbolRole::Standalone);
+    assert_eq!(capacitor.letter_code, "C");
+    let names: Vec<_> = capacitor.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["1", "2"]);
     // The timer relay set (#531): coils drive, delayed contacts follow them.
     for (id, role) in [
         ("wc.coil.ondelay", SymbolRole::Main),
