@@ -7192,17 +7192,77 @@ mod tests {
         assert_eq!(dict.lookup("Pumps", "nb").as_deref(), Some("Pumper"));
         assert_eq!(dict.lookup("Motors", "nb").as_deref(), Some("Motorer"));
 
-        // A form left from another project saves its own file and makes no step here.
+        // A form left from another project is refused: its save would be in no undo history.
         let other = tempfile::tempdir().unwrap();
         let mut form = translations_dialog(&a, "Pumps", "Pumpene");
         form.dir = other.path().to_path_buf();
         let steps = a.open.as_ref().unwrap().undo_mark();
-        App::save_translations(a.open.as_mut(), &a.share, false, &form).unwrap();
-        assert!(other.path().join(TRANSLATIONS_FILE).exists());
+        let e = App::save_translations(a.open.as_mut(), &a.share, false, &form).unwrap_err();
+        assert_eq!(e, App::TRANSLATIONS_ELSEWHERE);
+        assert!(!other.path().join(TRANSLATIONS_FILE).exists(), "nothing was written");
         assert_eq!(a.open.as_ref().unwrap().undo_mark(), steps);
         assert_eq!(
             Dictionary::load(&dir).unwrap().lookup("Pumps", "nb").as_deref(),
             Some("Pumper")
+        );
+        // The same with no project open.
+        let e = App::save_translations(None, &a.share, false, &form).unwrap_err();
+        assert_eq!(e, App::TRANSLATIONS_ELSEWHERE);
+        assert!(!other.path().join(TRANSLATIONS_FILE).exists(), "nothing was written");
+    }
+
+    #[test]
+    fn after_save_as_the_open_translations_dialog_saves_into_the_copy_as_an_undo_step() {
+        use wc_core::translate::{Dictionary, TRANSLATIONS_FILE};
+        let (tmp, mut a) = app(vec![]);
+        call(&mut a, "add_page", json!({"title": "Pumps"})).unwrap();
+        // The original has a dictionary already, so the copy starts with the same one.
+        let form = translations_dialog(&a, "Pumps", "Pumper");
+        App::save_translations(a.open.as_mut(), &a.share, false, &form).unwrap();
+        let original = a.open.as_ref().unwrap().dir.clone();
+        let was = std::fs::read_to_string(original.join(TRANSLATIONS_FILE)).unwrap();
+
+        // The dialog is open with an edit not saved yet when the project is saved as a copy.
+        a.dialog = Some(Dialog::Translations(translations_dialog(&a, "Pumps", "Pumpene")));
+        a.save_copy(&tmp.path().join("copy")).unwrap();
+        let copy = a.open.as_ref().unwrap().dir.clone();
+        assert_ne!(copy, original);
+        let Some(Dialog::Translations(form)) = a.dialog.take() else {
+            unreachable!("the dialog stays open");
+        };
+        assert!(form.is_for(&copy), "the dialog follows the project into the copy");
+
+        let steps = a.open.as_ref().unwrap().undo_mark();
+        App::save_translations(a.open.as_mut(), &a.share, false, &form).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(original.join(TRANSLATIONS_FILE)).unwrap(),
+            was,
+            "the original is not written"
+        );
+        assert_eq!(
+            Dictionary::load(&copy).unwrap().lookup("Pumps", "nb").as_deref(),
+            Some("Pumpene")
+        );
+        let open = a.open.as_mut().unwrap();
+        assert_eq!(open.undo_mark(), steps + 1, "one undo step of the open project");
+        assert!(open.undo(), "{:?}", open.take_undo_error());
+        assert_eq!(std::fs::read_to_string(copy.join(TRANSLATIONS_FILE)).unwrap(), was);
+
+        // A dialog of some other folder is left as it is by Save as, and then refused.
+        let mut form = translations_dialog(&a, "Pumps", "Pumpa");
+        form.dir = original.clone();
+        a.dialog = Some(Dialog::Translations(form));
+        a.save_copy(&tmp.path().join("second")).unwrap();
+        let Some(Dialog::Translations(form)) = a.dialog.take() else {
+            unreachable!("the dialog stays open");
+        };
+        assert!(form.is_for(&original));
+        let e = App::save_translations(a.open.as_mut(), &a.share, false, &form).unwrap_err();
+        assert_eq!(e, App::TRANSLATIONS_ELSEWHERE);
+        assert_eq!(
+            std::fs::read_to_string(original.join(TRANSLATIONS_FILE)).unwrap(),
+            was,
+            "the original is not written"
         );
     }
 
