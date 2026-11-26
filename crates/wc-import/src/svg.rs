@@ -93,6 +93,8 @@ fn parse_transform(s: &str) -> M {
                     .mul(&M([1.0, 0.0, 0.0, 1.0, -cx, -cy]))
             }
             "matrix" if v.len() == 6 => M([v[0], v[1], v[2], v[3], v[4], v[5]]),
+            "skewX" => M([1.0, 0.0, g(0, 0.0).to_radians().tan(), 1.0, 0.0, 0.0]),
+            "skewY" => M([1.0, g(0, 0.0).to_radians().tan(), 0.0, 1.0, 0.0, 0.0]),
             _ => M::ID,
         };
         m = m.mul(&t);
@@ -838,6 +840,40 @@ mod tests {
         assert!(close(circles[1], 6.0), "a turn and a mirror keep a circle round");
         assert!(close(circles[2], 5.0), "rx=\"auto\" takes ry");
         assert!(close(circles[3], 1.5), "ry=\"auto\" takes rx");
+        Ok(())
+    }
+
+    #[test]
+    fn skewed_circles_come_in_as_outlines() -> Result<()> {
+        // skewX(45) moves each point right by its height: the same as matrix(1 0 1 1 0 0).
+        for skew in ["skewX(45)", "matrix(1 0 1 1 0 0)", "skewY(45)"] {
+            let svg = format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg">
+                <circle id="pin:1" cx="0" cy="0" r="0.5"/>
+                <circle cx="0" cy="0" r="2" transform="{skew}"/>
+            </svg>"#
+            );
+            let s = symbol(&svg, "svg.skew", "Skew")?;
+            let Some(Shape::Polyline {
+                points, closed: true, ..
+            }) = s.graphics.first()
+            else {
+                unreachable!("{skew}: {:?}", s.graphics);
+            };
+            // Every point of the circle of radius 2 round (0, 0), moved by the skew.
+            let t = if skew.starts_with("skewY") {
+                |p: Point| Point::new(p.x, p.y - p.x)
+            } else {
+                |p: Point| Point::new(p.x - p.y, p.y)
+            };
+            for p in points {
+                let q = t(*p);
+                assert!(
+                    (q.x.hypot(q.y) - 2.0).abs() < 1e-9,
+                    "{skew}: {p:?} not on the skewed circle"
+                );
+            }
+        }
         Ok(())
     }
 
