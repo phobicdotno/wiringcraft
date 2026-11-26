@@ -1709,6 +1709,14 @@ impl App {
                     }
                 }
             }
+            // Like the drawing tools, a copy with drawings or texts is not pasted while their
+            // layer is hidden or locked: they could not be seen or picked afterwards.
+            Action::Paste
+                if !self.clipboard.graphics.is_empty()
+                    && self.prefs.layers.refusal(layers::Layer::Drawings).is_some() =>
+            {
+                self.ed.message = self.prefs.layers.refusal(layers::Layer::Drawings).unwrap_or_default();
+            }
             Action::Paste => {
                 // At the pointer when it is over the sheet, otherwise a little below the original.
                 let at = self
@@ -1717,6 +1725,11 @@ impl App {
                     .unwrap_or(self.clipboard.anchor + wc_core::geom::Point::new(10.0, 10.0));
                 match open.paste(page, &self.clipboard, at) {
                     Ok(pasted) if !pasted.is_empty() => {
+                        self.ed.message = format!(
+                            "Pasted {} item{}.",
+                            pasted.len(),
+                            if pasted.len() == 1 { "" } else { "s" }
+                        );
                         self.ed.tool = Tool::Select;
                         self.ed.selection = pasted;
                     }
