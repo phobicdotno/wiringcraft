@@ -561,12 +561,21 @@ enum RulesCmd {
     /// optionally `devices`, `role`, `pattern`, `max`, `severity`, `message` and `name`; a rule
     /// the check could not run is refused and nothing is changed. An empty file removes them
     /// all.
-    Set { file: PathBuf },
+    Set {
+        /// The rules file (`.toml` or `.json`), or `-` for TOML from stdin.
+        file: PathBuf,
+    },
     /// Turn a library rule off for this project, by `source:number` or `source:name`.
-    Off { rule: String },
+    Off {
+        /// The library rule, `source:number` or `source:name`.
+        rule: String,
+    },
     /// Turn a library rule back on, by `source:number` or `source:name`: every `rules_off`
     /// entry that turns it off is removed.
-    On { rule: String },
+    On {
+        /// The library rule, `source:number` or `source:name`.
+        rule: String,
+    },
 }
 
 #[derive(Subcommand)]
