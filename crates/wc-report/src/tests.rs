@@ -2912,3 +2912,28 @@ fn check_names_a_connection_with_two_wire_numbers_and_a_number_on_two_connection
     p.pages.push(overview);
     assert!(found(&p).is_empty());
 }
+
+#[test]
+fn a_repeated_wire_number_is_named_on_the_connection_drawn_second() {
+    let (mut p, s, parts) = fixture();
+    // Connection a is drawn first by an unnumbered wire; b's wire takes 7 before a's second does.
+    p.pages[0].wires = vec![
+        wire("a0", pin("s2", "14"), pin("s4", "1"), None, None),
+        wire("b0", pin("s4", "2"), pin("s6", "X1"), Some("7"), None),
+        wire("a1", pin("s4", "1"), pin("s2", "13"), Some("7"), None),
+    ];
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found: Vec<_> = check(&i)
+        .into_iter()
+        .filter(|f| f.message.contains("wire number"))
+        .map(|f| (f.item.unwrap_or_default(), f.message))
+        .collect();
+    assert_eq!(
+        found,
+        [("b0".to_owned(), "wire number 7 is on 2 connections".to_owned())]
+    );
+}

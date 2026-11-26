@@ -448,8 +448,18 @@ fn wire_numbers(i: &Inputs<'_>, out: &mut Vec<Finding>) {
     let (_, wire_net) = wc_core::connectivity::wire_nets(p, |id| i.symbols.get(id).map(|s| s.role));
     // Per net: its numbers, and its first numbered wire (page, wire id) in drawing order.
     let mut by_net: BTreeMap<usize, (BTreeSet<&str>, (&Page, &str))> = BTreeMap::new();
-    // Per number: the nets it is on, in drawing order, each with the first wire carrying it.
+    // Per number: the nets it is on, each with the first wire carrying it.
     let mut by_number: BTreeMap<&str, Vec<(usize, &Page, &str)>> = BTreeMap::new();
+    // Where each net is first drawn, by any of its wires, numbered or not.
+    let mut first_drawn: BTreeMap<usize, usize> = BTreeMap::new();
+    for page in p.pages.iter().filter(|pg| !pg.overview) {
+        for w in &page.wires {
+            if let Some(&net) = wire_net.get(&(page.id.clone(), w.id.clone())) {
+                let next = first_drawn.len();
+                first_drawn.entry(net).or_insert(next);
+            }
+        }
+    }
     for page in p.pages.iter().filter(|pg| !pg.overview) {
         for w in &page.wires {
             let Some(number) = w.number.as_deref().map(str::trim).filter(|n| !n.is_empty()) else {
@@ -483,8 +493,10 @@ fn wire_numbers(i: &Inputs<'_>, out: &mut Vec<Finding>) {
             format!("one connection has wire numbers {list}"),
         ));
     }
-    for (number, nets) in by_number.iter().filter(|(_, n)| n.len() > 1) {
-        // Named on the wire of the second connection: the first may well be the right one.
+    for (number, nets) in by_number.iter_mut().filter(|(_, n)| n.len() > 1) {
+        nets.sort_by_key(|(net, ..)| first_drawn.get(net).copied().unwrap_or(usize::MAX));
+        // Named on the second connection in drawing order (by any of its wires): the first may
+        // well be the right one.
         let Some((_, page, wire)) = nets.get(1) else { continue };
         out.push(at(
             page,
