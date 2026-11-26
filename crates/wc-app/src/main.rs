@@ -672,6 +672,13 @@ impl App {
         {
             self.ed.page = o.project.pages.len().saturating_sub(1);
         }
+        // A wire being drawn may start on a pin that the sync removed.
+        if let Some(o) = &self.open
+            && let Some((wc_core::Endpoint::Pin { item, .. }, _)) = &self.ed.wire
+            && o.project.pages.get(self.ed.page).and_then(|p| p.symbol(item)).is_none()
+        {
+            self.ed.wire = None;
+        }
         let waiting = self.share.unanswered_edits() > 0;
         // A refused change of the page ends the wait: what comes back there is not the paste
         // (the host may have added an equal drawing in the meantime).
@@ -1563,6 +1570,8 @@ impl App {
                     self.ed.message = e;
                 }
                 self.ed.selection.clear();
+                // A wire being drawn may start on a pin the undo took away.
+                self.ed.wire = None;
                 return;
             }
             _ => {}
@@ -1599,6 +1608,8 @@ impl App {
                 let done = if a == Action::Undo { open.undo() } else { open.redo() };
                 if done {
                     self.ed.selection.clear();
+                    // A wire being drawn may start on a pin the undo took away.
+                    self.ed.wire = None;
                     // The whole project is swapped: show the same panel and pick the same item.
                     if let Some((id, pick)) = &before {
                         follow_panel_pick(&mut self.ed, &open.project, id, pick.as_ref());
