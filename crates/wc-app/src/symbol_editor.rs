@@ -653,6 +653,12 @@ impl SymbolEditor {
                 out.push(format!("Two pins are called {}.", p.name));
             }
         }
+        // Two pins on one point would connect each other's wires.
+        for (i, p) in s.pins.iter().enumerate() {
+            if let Some(q) = s.pins[..i].iter().find(|q| q.at == p.at) {
+                out.push(format!("Pins {} and {} are at the same place.", q.name, p.name));
+            }
+        }
         if self.targets.is_empty() {
             out.push("This project has no library folder to save into; add one in the project properties.".into());
         }
@@ -1460,6 +1466,25 @@ mod tests {
         e.undo();
         e.undo();
         assert_eq!(e.symbol, drawn, "each drag was one step");
+    }
+
+    #[test]
+    fn two_pins_at_the_same_place_cannot_be_saved() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let mut drawn = SymbolEditor::new(Vec::new());
+        draw_coil(&mut drawn);
+        // An opened symbol (from an import, say) with pin A2 on top of pin A1.
+        let mut symbol = drawn.symbol;
+        symbol.pins[1].at = symbol.pins[0].at;
+        let mut e = SymbolEditor::edit(symbol, "mine", vec![("mine".into(), tmp.path().join("lib"))]);
+        assert_eq!(e.problems(), ["Pins A1 and A2 are at the same place."]);
+        assert!(e.save().is_err_and(|m| m.contains("Pins A1 and A2")));
+        // Moving A2 off A1 clears it.
+        e.selected = Some(Item::Pin(1));
+        e.nudge(Point::new(SNAP, 0.0));
+        assert!(e.problems().is_empty(), "{:?}", e.problems());
+        e.save()?;
+        Ok(())
     }
 
     #[test]
