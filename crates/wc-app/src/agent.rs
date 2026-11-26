@@ -814,45 +814,6 @@ fn need_open(open: Option<&mut Open>) -> Result<&mut Open, String> {
     open.ok_or_else(|| "No project is open. Use open_project first.".to_owned())
 }
 
-/// An error naming the first key of a report layout (or of one of its column entries) that
-/// [`wc_core::report_layout::ReportLayout`] does not have, since serde would drop it silently
-/// (`columns` for `column` would then keep the built-in columns). The known keys are the ones
-/// the layout itself serializes, so they follow its fields.
-fn report_layout_unknown_key(layout: &serde_json::Map<String, Value>) -> Result<(), String> {
-    use wc_core::report_layout::{ReportColumn, ReportLayout};
-    let keys = |v: Value| -> Vec<String> { v.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default() };
-    let column = ReportColumn {
-        from: "x".into(),
-        heading: Some("x".into()),
-    };
-    let known = keys(json!(ReportLayout {
-        kind: "x".into(),
-        title: Some("x".into()),
-        columns: vec![column.clone()],
-        sort: vec!["x".into()],
-        group: Some("x".into()),
-        header: vec!["x".into()],
-    }));
-    let known_column = keys(json!(column));
-    let unknown = |fields: &serde_json::Map<String, Value>, known: &[String], what: &str| match fields
-        .keys()
-        .find(|k| !known.contains(k))
-    {
-        Some(k) => Err(format!(
-            "Unknown {what} key {k:?}; known keys are {}.",
-            known.join(", ")
-        )),
-        None => Ok(()),
-    };
-    unknown(layout, &known, "layout")?;
-    if let Some(Value::Array(columns)) = layout.get("column") {
-        for c in columns.iter().filter_map(Value::as_object) {
-            unknown(c, &known_column, "column")?;
-        }
-    }
-    Ok(())
-}
-
 impl Open {
     /// A page by its number or id.
     fn find_page(&self, key: &str) -> Option<usize> {
@@ -3155,14 +3116,8 @@ impl App {
                 let form = if action == "reset" {
                     Form::new(kind, columns, wc_report::layout_for(&open.project, kind)).cleared()
                 } else {
-                    let mut given = v.get("layout").cloned().ok_or("Give the layout.")?;
-                    let Some(fields) = given.as_object_mut() else {
-                        return Err("The layout must be an object.".into());
-                    };
-                    report_layout_unknown_key(fields)?;
-                    fields.insert("kind".into(), json!(kind.name()));
-                    let layout: wc_core::report_layout::ReportLayout =
-                        serde_json::from_value(given).map_err(|e| format!("Bad layout: {e}"))?;
+                    let given = v.get("layout").cloned().ok_or("Give the layout.")?;
+                    let layout = wc_core::report_layout::ReportLayout::from_json(kind.name(), given)?;
                     // Read into the dialog's form as the dialog would show it, so it is kept
                     // as OK keeps it (a layout that shows the built-in one keeps none).
                     Form::new(kind, columns, Some(&layout))

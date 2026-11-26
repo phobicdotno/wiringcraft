@@ -70,6 +70,98 @@ impl ReportLayout {
             None => (entry.trim(), false),
         }
     }
+
+    /// A layout given as JSON (as the assistant and `wiringcraft report-layout set` take it),
+    /// for the report `kind`: the keys are those of a `[[report]]` table, and an unknown key
+    /// (of the layout or of a column) is refused rather than dropped. A `kind` in the JSON is
+    /// replaced by `kind`.
+    pub fn from_json(kind: &str, value: serde_json::Value) -> Result<ReportLayout, String> {
+        use serde_json::{Value, json};
+        let mut value = value;
+        let Some(fields) = value.as_object_mut() else {
+            return Err("The layout must be an object.".into());
+        };
+        let keys = |v: Value| -> Vec<String> { v.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default() };
+        let column = ReportColumn {
+            from: "x".into(),
+            heading: Some("x".into()),
+        };
+        let known = keys(json!(ReportLayout {
+            kind: "x".into(),
+            title: Some("x".into()),
+            columns: vec![column.clone()],
+            sort: vec!["x".into()],
+            group: Some("x".into()),
+            header: vec!["x".into()],
+        }));
+        let known_column = keys(json!(column));
+        let unknown = |fields: &serde_json::Map<String, Value>, known: &[String], what: &str| match fields
+            .keys()
+            .find(|k| !known.contains(k))
+        {
+            Some(k) => Err(format!(
+                "Unknown {what} key {k:?}; known keys are {}.",
+                known.join(", ")
+            )),
+            None => Ok(()),
+        };
+        unknown(fields, &known, "layout")?;
+        if let Some(Value::Array(columns)) = fields.get("column") {
+            for c in columns.iter().filter_map(Value::as_object) {
+                unknown(c, &known_column, "column")?;
+            }
+        }
+        fields.insert("kind".into(), json!(kind));
+        serde_json::from_value(value).map_err(|e| format!("Bad layout: {e}"))
+    }
+
+    /// The layout as it is kept in `project.toml` for a report whose built-in columns are
+    /// `builtin`, as the report layout dialog keeps it: texts trimmed, empty ones dropped, no
+    /// columns when they are the built-in ones unchanged, and `None` when nothing is left but
+    /// the built-in layout. Refused when the report would show no column.
+    pub fn kept(&self, builtin: &[String]) -> Result<Option<ReportLayout>, String> {
+        let set = |v: &str| Some(v.trim().to_owned()).filter(|v| !v.is_empty());
+        if self.columns.is_empty() && builtin.is_empty() {
+            return Err("Show at least one column.".into());
+        }
+        let as_builtin = self.columns.is_empty()
+            || (self.columns.len() == builtin.len()
+                && self
+                    .columns
+                    .iter()
+                    .zip(builtin)
+                    .all(|(c, b)| &c.from == b && c.heading.as_deref().is_none_or(|h| h.trim().is_empty())));
+        let columns = if as_builtin {
+            Vec::new()
+        } else {
+            self.columns
+                .iter()
+                .map(|c| ReportColumn {
+                    from: c.from.clone(),
+                    heading: c.heading.as_deref().and_then(set),
+                })
+                .collect()
+        };
+        let layout = ReportLayout {
+            kind: self.kind.clone(),
+            title: self.title.as_deref().and_then(set),
+            columns,
+            sort: self
+                .sort
+                .iter()
+                .map(|entry| ReportLayout::sort_key(entry.trim()))
+                .filter(|(column, _)| !column.is_empty())
+                .map(|(column, descending)| format!("{}{column}", if descending { "-" } else { "" }))
+                .collect(),
+            group: self.group.as_deref().and_then(set),
+            header: self.header.iter().filter_map(|k| set(k)).collect(),
+        };
+        let builtin_only = ReportLayout {
+            kind: layout.kind.clone(),
+            ..ReportLayout::default()
+        };
+        Ok((layout != builtin_only).then_some(layout))
+    }
 }
 
 #[cfg(test)]
@@ -109,5 +201,69 @@ from = "Qty"
         assert_eq!(again.reports, meta.reports);
         // A project without layouts writes none.
         assert!(!toml::to_string(&ProjectMeta::new("y")).unwrap().contains("report"));
+    }
+
+    #[test]
+    fn a_layout_from_json_refuses_unknown_keys_and_takes_the_kind_given() {
+        use super::ReportLayout;
+        use serde_json::json;
+        let l = ReportLayout::from_json(
+            "parts",
+            json!({"kind": "wires", "title": "BOM", "column": [{"from": "Qty"}]}),
+        )
+        .unwrap();
+        assert_eq!(l.kind, "parts");
+        assert_eq!(l.title.as_deref(), Some("BOM"));
+        let e = ReportLayout::from_json("parts", json!({"titel": "x"})).unwrap_err();
+        assert!(e.contains("Unknown layout key \"titel\""), "{e}");
+        let e = ReportLayout::from_json("parts", json!({"column": [{"form": "Qty"}]})).unwrap_err();
+        assert!(e.contains("Unknown column key \"form\""), "{e}");
+        assert!(ReportLayout::from_json("parts", json!([1])).is_err());
+        assert!(
+            ReportLayout::from_json("parts", json!({"sort": "Qty"}))
+                .unwrap_err()
+                .starts_with("Bad layout")
+        );
+    }
+
+    #[test]
+    fn a_kept_layout_is_trimmed_and_the_built_in_one_keeps_none() {
+        use super::{ReportColumn, ReportLayout};
+        let builtin = ["Tag".to_owned(), "Qty".to_owned()];
+        let col = |from: &str, heading: Option<&str>| ReportColumn {
+            from: from.into(),
+            heading: heading.map(str::to_owned),
+        };
+        // Only blanks, or the built-in columns spelled out: the built-in layout.
+        let blank = ReportLayout {
+            kind: "parts".into(),
+            title: Some("  ".into()),
+            columns: vec![col("Tag", Some(" ")), col("Qty", None)],
+            sort: vec![" ".into(), "-".into()],
+            group: Some(String::new()),
+            header: vec![" ".into()],
+        };
+        assert_eq!(blank.kept(&builtin).unwrap(), None);
+        let given = ReportLayout {
+            kind: "parts".into(),
+            title: Some(" BOM ".into()),
+            columns: vec![col("Qty", Some(" Count ")), col("Tag", Some(""))],
+            sort: vec![" - Qty ".into(), "Tag".into()],
+            group: Some(" Tag".into()),
+            header: vec![" customer, site ".into(), "".into()],
+        };
+        let kept = given.kept(&builtin).unwrap().unwrap();
+        assert_eq!(kept.title.as_deref(), Some("BOM"));
+        assert_eq!(kept.columns, [col("Qty", Some("Count")), col("Tag", None)]);
+        assert_eq!(kept.sort, ["-Qty", "Tag"]);
+        assert_eq!(kept.group.as_deref(), Some("Tag"));
+        // A key with a comma stays one key.
+        assert_eq!(kept.header, ["customer, site"]);
+        // No column to show.
+        let none = ReportLayout {
+            kind: "parts".into(),
+            ..ReportLayout::default()
+        };
+        assert!(none.kept(&[]).is_err());
     }
 }
