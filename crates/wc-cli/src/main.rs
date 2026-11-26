@@ -6761,7 +6761,9 @@ mod tests {
         assert!(cli(&dir, &["strip", "level", "-X1", "S1"]).is_ok());
         assert_eq!(level(), None);
 
-        // Jumpers: a jumper left with one terminal is dropped, so this one keeps two.
+        // Jumpers: a jumper left with one terminal is dropped, so this one keeps two. `jumper add`
+        // takes only terminals the strip has (#572), so S4 is added as a spare first.
+        assert!(cli(&dir, &["strip", "spare", "-X1", "S4"]).is_ok());
         assert!(cli(&dir, &["jumper", "add", "-X1", "S1", "S2", "S4"]).is_ok());
         assert!(cli(&dir, &["jumper", "remove", "-X1", "S2"]).is_ok());
         let Ok(p) = load(&dir) else { unreachable!() };
