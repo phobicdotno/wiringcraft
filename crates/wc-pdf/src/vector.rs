@@ -1,12 +1,13 @@
-//! SVG and DXF export of schematic pages. Both draw exactly what the PDF export draws (frame,
-//! title block, symbols, wires, cross-references), from the primitives the same layout records.
+//! SVG and DXF export of schematic pages and panel layouts. Both draw exactly what the PDF
+//! export draws (frame, title block, symbols, wires, cross-references; plate, rails, ducts and
+//! devices), from the primitives the same layout records.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use wc_core::{Project, Symbol};
 
-use crate::writer::{Prim, Stroke};
+use crate::writer::{Layer, Prim, Stroke};
 use crate::{Options, Report, layout};
 
 /// One page as drawing primitives in page millimetres (y down).
@@ -20,6 +21,9 @@ pub struct PageDrawing {
     /// Pictures on the page: the underlay first (drawn under everything), then the project
     /// logo in each of its boxes (drawn on top). Only SVG shows them; DXF has no pictures.
     pub pictures: Vec<Picture>,
+    /// A panel layout's sheet (from [`Options::panels`]) rather than a schematic page: `id` is
+    /// `panel-<panel id>` and `title` the panel's name.
+    pub panel: bool,
 }
 
 /// A picture file placed on a page, as it is embedded in an SVG.
@@ -58,8 +62,9 @@ fn picture_bytes<'a>(options: &'a Options, file: &str, what: &str) -> Result<&'a
         })
 }
 
-/// The schematic pages chosen by `options.pages` (all when empty), drawn as for the PDF export.
-/// Report tables in `options` are not drawn; they are their own export.
+/// The schematic pages chosen by `options.pages` (all when empty), drawn as for the PDF export,
+/// followed by a sheet per panel layout in `options.panels`, drawn as its PDF sheet. Report
+/// tables in `options` are not drawn; they are their own export.
 pub fn page_drawings(
     project: &Project,
     symbols: &BTreeMap<String, Symbol>,
@@ -90,7 +95,7 @@ fn drawings(
         .filter(|p| options.pages.is_empty() || options.pages.contains(&p.id))
         .collect();
     let mut report = Report {
-        pages: pages.len(),
+        pages: pages.len() + options.panels.len(),
         warnings: Vec::new(),
     };
     // The logo is checked once, however many pages show it.
@@ -106,8 +111,26 @@ fn drawings(
             .map(|((mime, size), b)| (mime, size, std::sync::Arc::new(b.clone())))
     });
     let xref = layout::CrossRefs::build(project, symbols);
-    let total = pages.len();
-    let out = pages
+    let total = pages.len() + options.panels.len();
+    let logo_pictures = |page: &wc_core::Page| -> Vec<Picture> {
+        let Some((mime, size, bytes)) = &logo else {
+            return Vec::new();
+        };
+        layout::logo_boxes(project, page)
+            .into_iter()
+            .map(|b| {
+                let (min, max) = layout::fit_picture(b, *size);
+                Picture {
+                    mime,
+                    bytes: bytes.clone(),
+                    min: (min.x, min.y),
+                    max: (max.x, max.y),
+                    on_top: true,
+                }
+            })
+            .collect()
+    };
+    let mut out: Vec<PageDrawing> = pages
         .iter()
         .enumerate()
         .map(|(i, page)| {
@@ -132,18 +155,7 @@ fn drawings(
                     Err(w) => report.warnings.push(w),
                 }
             }
-            if let Some((mime, size, bytes)) = &logo {
-                for b in layout::logo_boxes(project, page) {
-                    let (min, max) = layout::fit_picture(b, *size);
-                    pictures.push(Picture {
-                        mime,
-                        bytes: bytes.clone(),
-                        min: (min.x, min.y),
-                        max: (max.x, max.y),
-                        on_top: true,
-                    });
-                }
-            }
+            pictures.extend(logo_pictures(page));
             PageDrawing {
                 id: page.id.clone(),
                 number: page.number.clone(),
@@ -151,10 +163,53 @@ fn drawings(
                 size_mm: page.size.mm(),
                 prims: drawn.prims,
                 pictures,
+                panel: false,
             }
         })
         .collect();
+    // Panel layouts follow, on the first chosen page's size, as in the PDF.
+    let size = pages.first().map(|p| p.size).unwrap_or_default();
+    for (k, panel) in options.panels.iter().enumerate() {
+        let mut page = wc_core::Page::new(format!("panel-{}", panel.id), format!("P{}", k + 1), panel.name.clone());
+        page.size = size;
+        let drawn = layout::draw_panel_page(
+            project,
+            &page,
+            pages.len() + k,
+            total,
+            panel,
+            &options.footprints,
+            &options.date,
+        );
+        out.push(PageDrawing {
+            pictures: logo_pictures(&page),
+            id: page.id,
+            number: page.number,
+            title: page.title,
+            size_mm: size.mm(),
+            prims: drawn.prims,
+            panel: true,
+        });
+    }
     (out, report)
+}
+
+/// The file name, without extension, of a panel layout's drawing: `panel-` and the panel's
+/// name (its id when it has none), with every character but letters, digits and `-` written as
+/// `_`, so `Main cabinet/A` becomes `panel-Main_cabinet_A`. The app and the command line both
+/// name panel files this way.
+pub fn panel_file_stem(d: &PageDrawing) -> String {
+    let name = d.title.trim();
+    let base = if name.is_empty() {
+        d.id.strip_prefix("panel-").unwrap_or(&d.id)
+    } else {
+        name
+    };
+    let safe: String = base
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+        .collect();
+    format!("panel-{safe}")
 }
 
 /// Standard base64 with padding.
@@ -191,7 +246,7 @@ fn svg_image(out: &mut String, p: &Picture) {
     );
 }
 
-fn num(v: f64) -> String {
+pub(crate) fn num(v: f64) -> String {
     let v = if v.is_finite() { v } else { 0.0 };
     let s = format!("{v:.3}");
     let s = s.trim_end_matches('0').trim_end_matches('.');
@@ -227,32 +282,69 @@ fn on_circle(c: (f64, f64), r: f64, deg: f64) -> (f64, f64) {
     (c.0 + r * t.cos(), c.1 + r * t.sin())
 }
 
+/// The opening of a drawing group, without its closing `>`: the style every group shares.
+const GROUP: &str = "<g fill=\"none\" stroke-linecap=\"round\" stroke-linejoin=\"round\" \
+                     font-family=\"Helvetica, Arial, sans-serif\"";
+
 /// An SVG document of one page, sized in millimetres with one user unit per millimetre.
 pub fn svg(page: &PageDrawing) -> String {
     let (w, h) = page.size_mm;
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}mm\" \
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<svg xmlns=\"http://www.w3.org/2000/svg\" \
+         xmlns:inkscape=\"http://www.inkscape.org/namespaces/inkscape\" width=\"{w}mm\" \
          height=\"{h}mm\" viewBox=\"0 0 {w} {h}\">\n<title>{} {}</title>\n<rect width=\"{w}\" height=\"{h}\" \
-         fill=\"#ffffff\"/>\n<g fill=\"none\" stroke-linecap=\"round\" stroke-linejoin=\"round\" \
-         font-family=\"Helvetica, Arial, sans-serif\">",
+         fill=\"#ffffff\"/>\n{GROUP}>",
         xml(&page.number),
         xml(&page.title),
         w = num(w),
         h = num(h)
     );
-    // The underlay goes under the drawing: out of the group, before it.
+    // Prims on an optional layer go in a group of their own that Inkscape shows as a layer. A new
+    // group opens whenever the layer changes, so the drawing order stays as it is.
+    let mut current: Option<Layer> = None;
+    let mut opened: BTreeMap<Layer, usize> = BTreeMap::new();
+    // The underlay (the scanned sheet) goes under the drawing, before the group the header
+    // opened, in a layer of its own.
     let mut under = String::new();
     for p in page.pictures.iter().filter(|p| !p.on_top) {
         svg_image(&mut under, p);
     }
     if !under.is_empty() {
-        // Put them just before the group the header opened.
+        opened.insert(Layer::Scans, 1);
         let at = out.rfind("<g ").unwrap_or(out.len());
-        out.insert_str(at, &under);
+        out.insert_str(
+            at,
+            &format!(
+                "<g id=\"{}\" inkscape:groupmode=\"layer\" inkscape:label=\"{}\">\n{under}</g>\n",
+                Layer::Scans.dxf_name().to_ascii_lowercase(),
+                xml(Layer::Scans.title())
+            ),
+        );
     }
     for p in &page.prims {
+        let (Prim::Path { layer, .. } | Prim::Arc { layer, .. } | Prim::Text { layer, .. }) = p;
+        if *layer != current {
+            out.push_str("</g>\n");
+            match layer {
+                Some(l) => {
+                    let n = opened.entry(*l).or_insert(0);
+                    *n += 1;
+                    let name = l.dxf_name().to_ascii_lowercase();
+                    let id = if *n == 1 { name } else { format!("{name}-{n}") };
+                    let _ = writeln!(
+                        out,
+                        "{GROUP} id=\"{id}\" inkscape:groupmode=\"layer\" inkscape:label=\"{}\">",
+                        xml(l.title())
+                    );
+                }
+                None => {
+                    let _ = writeln!(out, "{GROUP}>");
+                }
+            }
+            current = *layer;
+        }
         match p {
             Prim::Path {
                 points,
@@ -329,9 +421,12 @@ pub fn svg(page: &PageDrawing) -> String {
                     // Counter-clockwise on paper is a negative SVG rotation (y runs down).
                     format!(" transform=\"rotate({} {} {})\"", num(-angle), num(at.0), num(at.1))
                 };
+                // `xml:space="preserve"` keeps leading and repeated spaces as the PDF prints them;
+                // browsers, Inkscape and librsvg all honour it, unlike CSS `white-space`.
                 let _ = writeln!(
                     out,
-                    "<text x=\"{}\" y=\"{}\" font-size=\"{}\" fill=\"{}\" stroke=\"none\"{turn}>{}</text>",
+                    "<text xml:space=\"preserve\" x=\"{}\" y=\"{}\" font-size=\"{}\" fill=\"{}\" \
+                     stroke=\"none\"{turn}>{}</text>",
                     num(at.0),
                     num(at.1),
                     num(height / 0.72),
@@ -372,18 +467,79 @@ fn aci(ink: &Stroke) -> u8 {
 }
 
 /// DXF text: ASCII as is, anything else as `\U+XXXX`, which DXF readers turn back into text.
-fn dxf_text(s: &str) -> String {
+/// A backslash, and a `%` next to another `%`, are written as codes too, so readers do not take
+/// them for a `\U+XXXX` or `%%` code; a character beyond U+FFFF, which has no four-digit code,
+/// becomes `?`.
+pub(crate) fn dxf_text(s: &str) -> String {
+    // Control characters are dropped first, so two `%` they stood between are seen as a pair.
+    let chars: Vec<char> = s.chars().filter(|c| !c.is_control()).collect();
     let mut out = String::new();
-    for ch in s.chars() {
+    for (i, &ch) in chars.iter().enumerate() {
+        let percent_pair =
+            ch == '%' && (i.checked_sub(1).and_then(|j| chars.get(j)) == Some(&'%') || chars.get(i + 1) == Some(&'%'));
         match ch {
-            c if c.is_ascii() && !c.is_control() => out.push(c),
-            c if c.is_control() => {}
+            '\\' => out.push_str("\\U+005C"),
+            '%' if percent_pair => out.push_str("\\U+0025"),
+            c if c.is_ascii() => out.push(c),
+            c if u32::from(c) > 0xFFFF => out.push('?'),
             c => {
                 let _ = write!(out, "\\U+{:04X}", c as u32);
             }
         }
     }
     out
+}
+
+/// A filled outline as DXF SOLID corners (10, 11, 12, 13 in that order; DXF draws them as
+/// 1, 2, 4, 3): one SOLID for 3 or 4 points, a fan of triangles from the first point for more.
+/// `None` when the outline is not convex (a fan would paint outside it): it stays an outline.
+pub(crate) fn solid_triangles(points: &[(f64, f64)]) -> Option<Vec<[(f64, f64); 4]>> {
+    let mut pts: Vec<(f64, f64)> = Vec::with_capacity(points.len());
+    for &p in points {
+        if pts.last() != Some(&p) {
+            pts.push(p);
+        }
+    }
+    if pts.len() > 1 && pts.first() == pts.last() {
+        pts.pop();
+    }
+    let n = pts.len();
+    if n < 3 || pts.iter().any(|(x, y)| !x.is_finite() || !y.is_finite()) {
+        return None;
+    }
+    // Convex: every corner turns the same way, and the turns add up to one full turn. A corner
+    // that doubles straight back (a retraced segment) is a half turn either way: not convex.
+    let (mut sign, mut turn) = (0.0f64, 0.0f64);
+    let corners = pts
+        .iter()
+        .zip(pts.iter().cycle().skip(1))
+        .zip(pts.iter().cycle().skip(2));
+    for ((a, b), c) in corners {
+        let (ux, uy, vx, vy) = (b.0 - a.0, b.1 - a.1, c.0 - b.0, c.1 - b.1);
+        let (cross, dot) = (ux * vy - uy * vx, ux * vx + uy * vy);
+        if cross.abs() > 1e-9 {
+            if sign * cross < 0.0 {
+                return None;
+            }
+            sign = cross.signum();
+        } else if dot < 0.0 {
+            return None;
+        }
+        turn += cross.atan2(dot);
+    }
+    if sign == 0.0 || turn.abs() > std::f64::consts::TAU + 1e-6 {
+        return None;
+    }
+    Some(match pts.as_slice() {
+        &[a, b, c] => vec![[a, b, c, c]],
+        &[a, b, c, d] => vec![[a, b, d, c]],
+        [first, rest @ ..] => rest
+            .iter()
+            .zip(rest.iter().skip(1))
+            .map(|(&b, &c)| [*first, b, c, c])
+            .collect(),
+        [] => return None,
+    })
 }
 
 /// A DXF (R12, ASCII) drawing of one page in millimetres, y up with the origin at the page's
@@ -416,10 +572,25 @@ pub fn dxf(page: &PageDrawing) -> String {
         };
         match p {
             Prim::Path {
-                points, closed, ink, ..
+                points,
+                closed,
+                filled,
+                ink,
+                ..
             } => {
                 let colour = aci(ink).to_string();
-                if points.len() == 2 && !closed {
+                let solids = if *filled { solid_triangles(points) } else { None };
+                if let Some(solids) = solids {
+                    for corners in solids {
+                        pair(0, "SOLID");
+                        pair(8, layer);
+                        pair(62, &colour);
+                        for (i, (px, py)) in corners.iter().enumerate() {
+                            pair(10 + i as u16, &num(*px));
+                            pair(20 + i as u16, &num(y(*py)));
+                        }
+                    }
+                } else if points.len() == 2 && !closed {
                     pair(0, "LINE");
                     pair(8, layer);
                     pair(62, &colour);
@@ -432,7 +603,8 @@ pub fn dxf(page: &PageDrawing) -> String {
                     pair(8, layer);
                     pair(62, &colour);
                     pair(66, "1");
-                    pair(70, if *closed { "1" } else { "0" });
+                    // A filled path that is not convex stays an outline, closed as its fill is.
+                    pair(70, if *closed || *filled { "1" } else { "0" });
                     for (px, py) in points {
                         pair(0, "VERTEX");
                         pair(8, layer);
@@ -448,11 +620,36 @@ pub fn dxf(page: &PageDrawing) -> String {
                 radius,
                 start,
                 end,
+                filled,
                 ink,
                 ..
             } => {
                 let colour = aci(ink).to_string();
                 let full = (end - start).abs() >= 359.999;
+                if full && *filled {
+                    // A solid dot: a closed polyline of two half circles (bulge 1) of radius
+                    // r/2, drawn r wide, so it covers the whole disc.
+                    let w = num(*radius);
+                    pair(0, "POLYLINE");
+                    pair(8, layer);
+                    pair(62, &colour);
+                    pair(66, "1");
+                    pair(70, "1");
+                    pair(40, &w);
+                    pair(41, &w);
+                    for dx in [-radius / 2.0, radius / 2.0] {
+                        pair(0, "VERTEX");
+                        pair(8, layer);
+                        pair(10, &num(center.0 + dx));
+                        pair(20, &num(y(center.1)));
+                        pair(40, &w);
+                        pair(41, &w);
+                        pair(42, "1");
+                    }
+                    pair(0, "SEQEND");
+                    pair(8, layer);
+                    continue;
+                }
                 if full {
                     pair(0, "CIRCLE");
                 } else {

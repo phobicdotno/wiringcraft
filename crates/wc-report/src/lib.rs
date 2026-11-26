@@ -53,6 +53,10 @@ pub struct Table {
     pub group: Option<usize>,
     /// Title-block values a PDF prints above the table ([`ReportLayout::header`]).
     pub header: Vec<String>,
+    /// The built-in column each column shows, by its built-in heading, when a layout
+    /// ([`Table::with_layout`]) reordered or renamed them; empty when the columns are the
+    /// built-in ones.
+    pub sources: Vec<String>,
 }
 
 impl Table {
@@ -61,6 +65,15 @@ impl Table {
             title: title.into(),
             columns: columns.iter().map(|c| (*c).to_owned()).collect(),
             ..Self::default()
+        }
+    }
+
+    /// The position of the built-in column `name` among the shown columns, if shown.
+    pub fn column_of(&self, name: &str) -> Option<usize> {
+        if self.sources.is_empty() {
+            self.columns.iter().position(|c| c == name)
+        } else {
+            self.sources.iter().position(|c| c == name)
         }
     }
 
@@ -139,6 +152,14 @@ impl Table {
                 0
             }
         });
+        let source = |i: usize| {
+            self.sources
+                .get(i)
+                .or_else(|| self.columns.get(i))
+                .cloned()
+                .unwrap_or_default()
+        };
+        let sources: Vec<String> = picked.iter().map(|&(i, _)| source(i)).collect();
         let Table {
             title,
             rows,
@@ -197,7 +218,15 @@ impl Table {
             front,
             group: shown_group,
             header: layout.header.clone(),
+            sources,
         }
+    }
+
+    /// Adds `row`, which describes the page with id `page_id`: in a PDF the row jumps to it.
+    fn push_linked(&mut self, row: Vec<String>, page_id: &str) {
+        self.row_pages.resize(self.rows.len(), String::new());
+        self.row_pages.push(page_id.to_owned());
+        self.rows.push(row);
     }
 
     /// Rows whose first column is empty take their first `columns` cells from the row above:
@@ -225,7 +254,9 @@ impl Table {
                 .replace('<', "&lt;")
                 .replace('>', "&gt;")
         };
-        let cell = |s: &str| line(s).replace('|', "\\|");
+        // In a cell a backslash is doubled before `|` is escaped, so a cell ending in `\` does
+        // not escape the column bar after it and each cell shows its text as written.
+        let cell = |s: &str| line(s).replace('\\', "\\\\").replace('|', "\\|");
         let mut out = format!(
             "## {}\n\n| {} |\n|{}\n",
             line(&self.title),
@@ -666,7 +697,8 @@ fn net_names(i: &Inputs) -> (Vec<connectivity::Net>, BTreeMap<PinRef, String>) {
 }
 
 /// Wire list: every drawn wire with both ends, then its cross-section, colour and type. A free
-/// end is reported as a junction point.
+/// end is reported as a junction point. Each row links to the page the wire is drawn on
+/// ([`Table::row_pages`]).
 pub fn wire_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new(
         "Wire list",
@@ -695,17 +727,20 @@ pub fn wire_list(i: &Inputs<'_>) -> Table {
                     Endpoint::Point { .. } => None,
                 })
             });
-            t.rows.push(vec![
-                page.number.clone(),
-                w.number.clone().unwrap_or_default(),
-                potential.unwrap_or_default(),
-                w.cable.as_ref().map(cable_core_label).unwrap_or_default(),
-                end(&w.from),
-                end(&w.to),
-                w.spec.section.clone().unwrap_or_default(),
-                w.spec.colour.clone().unwrap_or_default(),
-                w.spec.kind.clone().unwrap_or_default(),
-            ]);
+            t.push_linked(
+                vec![
+                    page.number.clone(),
+                    w.number.clone().unwrap_or_default(),
+                    potential.unwrap_or_default(),
+                    w.cable.as_ref().map(cable_core_label).unwrap_or_default(),
+                    end(&w.from),
+                    end(&w.to),
+                    w.spec.section.clone().unwrap_or_default(),
+                    w.spec.colour.clone().unwrap_or_default(),
+                    w.spec.kind.clone().unwrap_or_default(),
+                ],
+                &page.id,
+            );
         }
     }
     t
@@ -719,13 +754,16 @@ fn cable_core_label(c: &wc_core::CableCore) -> String {
     }
 }
 
-/// Cable list: every cable with its type, then one row per core with the wire's two ends.
+/// Cable list: every cable with its type, then one row per core with the wire's two ends. Each
+/// row links to the page its core is drawn on ([`Table::row_pages`]).
 pub fn cable_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new(
         "Cable list",
         &["Cable", "Type", "Description", "Core", "Page", "From", "To"],
     );
-    let mut cores: BTreeMap<DeviceTag, Vec<(String, String, String, String)>> = BTreeMap::new();
+    /// A core's row: core, page number, from, to, and the page id its row links to.
+    type Core = (String, String, String, String, String);
+    let mut cores: BTreeMap<DeviceTag, Vec<Core>> = BTreeMap::new();
     for page in &i.project.pages {
         for w in &page.wires {
             let Some(c) = &w.cable else { continue };
@@ -738,6 +776,7 @@ pub fn cable_list(i: &Inputs<'_>) -> Table {
                 page.number.clone(),
                 end(&w.from),
                 end(&w.to),
+                page.id.clone(),
             ));
         }
     }
@@ -758,17 +797,20 @@ pub fn cable_list(i: &Inputs<'_>) -> Table {
             .filter(|d| !d.is_empty())
             .or_else(|| part.map(|p| p.description.clone()))
             .unwrap_or_default();
-        for (n, (core, page, from, to)) in list.into_iter().enumerate() {
+        for (n, (core, page, from, to, page_id)) in list.into_iter().enumerate() {
             let first = n == 0;
-            t.rows.push(vec![
-                if first { cable.to_string() } else { String::new() },
-                if first { kind.clone() } else { String::new() },
-                if first { description.clone() } else { String::new() },
-                core,
-                page,
-                from,
-                to,
-            ]);
+            t.push_linked(
+                vec![
+                    if first { cable.to_string() } else { String::new() },
+                    if first { kind.clone() } else { String::new() },
+                    if first { description.clone() } else { String::new() },
+                    core,
+                    page,
+                    from,
+                    to,
+                ],
+                &page_id,
+            );
         }
     }
     t
@@ -908,6 +950,8 @@ pub const SPARE_PAGE: &str = "spare";
 /// numbered in drawing order (page, then left to right). Terminals come by number, unless the
 /// terminal strip editor put the strip in another order ([`wc_core::project::StripLayout`]);
 /// its spare terminals are listed with [`SPARE_PAGE`] in the Page column.
+///
+/// Each drawn terminal's row links to its page ([`Table::row_pages`]); a spare's links nowhere.
 pub fn terminal_plan(i: &Inputs<'_>) -> Table {
     terminal_plan_with_spares(i).0
 }
@@ -1162,16 +1206,19 @@ pub(crate) fn terminal_plan_with_spares(i: &Inputs<'_>) -> (Table, BTreeSet<usiz
             if let Some(symbol) = &term.missing {
                 upper = format!("(symbol {symbol} missing)");
             }
-            t.rows.push(vec![
-                strip.clone(),
-                number,
-                upper,
-                lower,
-                pa.or(pb).unwrap_or_default(),
-                term.page.clone(),
-                term.jumpered.clone(),
-                level,
-            ]);
+            t.push_linked(
+                vec![
+                    strip.clone(),
+                    number,
+                    upper,
+                    lower,
+                    pa.or(pb).unwrap_or_default(),
+                    term.page.clone(),
+                    term.jumpered.clone(),
+                    level,
+                ],
+                &term.page_id,
+            );
         }
     }
     // A spare has no wiring of its own, but a jumper to a drawn terminal puts it on that
@@ -1282,13 +1329,16 @@ impl PlcPoint {
 
 /// PLC I/O list: every PLC input and output drawn, with its address, the device it belongs to
 /// and what it is wired to. The address is the device property `Address` (or `PLC address`);
-/// points without one sort last so the gaps are visible.
+/// points without one sort last so the gaps are visible. Each row links to its page
+/// ([`Table::row_pages`]).
 pub fn plc_io_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new(
         "PLC I/O list",
         &["Address", "Type", "Device", "Description", "Connected to", "Page"],
     );
-    t.rows = plc_points(i).iter().map(PlcPoint::row).collect();
+    for point in plc_points(i) {
+        t.push_linked(point.row(), &point.page_id);
+    }
     t
 }
 

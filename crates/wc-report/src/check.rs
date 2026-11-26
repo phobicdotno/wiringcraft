@@ -73,6 +73,8 @@ pub fn check_with(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet]) -> V
     let p = i.project;
     let mut out = Vec::new();
     let role = |symbol: &str| i.symbols.get(symbol).map(|s| s.role);
+    // Connections outside overview pages, by wire place; cable cores and wire numbers share them.
+    let wire_net = wire_nets_off_overview(i);
 
     // Revision clouds whose revision the project does not list.
     for page in &p.pages {
@@ -376,6 +378,8 @@ pub fn check_with(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet]) -> V
         }
     }
 
+    cable_cores(i, &wire_net, &mut out);
+
     // Shorts: one net carrying two potential names (for example L1 and L2).
     let nets = wc_core::connectivity::nets_linked(p, |id| i.symbols.get(id).map(|s| s.role));
     for n in nets {
@@ -397,6 +401,8 @@ pub fn check_with(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet]) -> V
             });
         }
     }
+
+    wire_numbers(i, &wire_net, &mut out);
 
     // Panel layouts: devices covering each other, sticking out of the plate, or whose tag is
     // no longer in the project. Outlines that only touch do not overlap. A tag is in the project
@@ -471,6 +477,90 @@ pub fn check_with(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet]) -> V
     });
     out.dedup();
     out
+}
+
+/// Each wire's connection (net), keyed by its place (page index, wire index): ids need not be
+/// unique on a page.
+type WireNets = BTreeMap<(usize, usize), usize>;
+
+/// The connections of the wiring outside overview pages, by wire place. An overview wire can
+/// carry potentials or link interruption points and so join two connections into one net, which
+/// would hide a reused wire number or cable core, or make up two numbers on one connection.
+/// Pages keep their places, so page indices stay the same; overview wires get no entry.
+fn wire_nets_off_overview(i: &Inputs<'_>) -> WireNets {
+    let mut wiring = i.project.clone();
+    for page in wiring.pages.iter_mut().filter(|pg| pg.overview) {
+        page.wires.clear();
+    }
+    wc_core::connectivity::wire_nets_by_place(&wiring, |id| i.symbols.get(id).map(|s| s.role)).1
+}
+
+/// Wire numbers that do not name one connection each: a connection (net) whose wires carry
+/// two different numbers, and one number on wires of two connections. Wire numbering never
+/// makes either; numbers typed or imported can. Wires on overview pages repeat connections on
+/// purpose and do not count; wires that touch no pin are no connection, as for numbering.
+fn wire_numbers(i: &Inputs<'_>, wire_net: &WireNets, out: &mut Vec<Finding>) {
+    let p = i.project;
+    // Per net: its numbers.
+    let mut by_net: BTreeMap<usize, BTreeSet<&str>> = BTreeMap::new();
+    // Per number: the nets it is on, each with the first wire carrying it.
+    let mut by_number: BTreeMap<&str, Vec<(usize, &Page, &str)>> = BTreeMap::new();
+    // Where each net is first drawn, by any of its wires, numbered or not: its place in
+    // drawing order and that first wire (page, wire id).
+    let mut first_drawn: BTreeMap<usize, (usize, &Page, &str)> = BTreeMap::new();
+    for (pi, page) in p.pages.iter().enumerate().filter(|(_, pg)| !pg.overview) {
+        for (wi, w) in page.wires.iter().enumerate() {
+            if let Some(&net) = wire_net.get(&(pi, wi)) {
+                let next = first_drawn.len();
+                first_drawn.entry(net).or_insert((next, page, w.id.as_str()));
+            }
+        }
+    }
+    for (pi, page) in p.pages.iter().enumerate().filter(|(_, pg)| !pg.overview) {
+        for (wi, w) in page.wires.iter().enumerate() {
+            let Some(number) = w.number.as_deref().map(str::trim).filter(|n| !n.is_empty()) else {
+                continue;
+            };
+            let Some(&net) = wire_net.get(&(pi, wi)) else {
+                continue;
+            };
+            by_net.entry(net).or_default().insert(number);
+            let nets = by_number.entry(number).or_default();
+            if !nets.iter().any(|(n, ..)| *n == net) {
+                nets.push((net, page, w.id.as_str()));
+            }
+        }
+    }
+    // Named on the net's first wire, numbered or not.
+    for (net, numbers) in by_net.iter().filter(|(_, n)| n.len() > 1) {
+        let Some(&(_, page, wire)) = first_drawn.get(net) else {
+            continue;
+        };
+        let mut list: Vec<&str> = numbers.iter().copied().collect();
+        list.sort_by_key(|n| natural_key(n));
+        let list = match list.split_last() {
+            Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+            None => continue,
+        };
+        out.push(at(
+            page,
+            wire,
+            Severity::Warning,
+            format!("one connection has wire numbers {list}"),
+        ));
+    }
+    for (number, nets) in by_number.iter_mut().filter(|(_, n)| n.len() > 1) {
+        nets.sort_by_key(|(net, ..)| first_drawn.get(net).map_or(usize::MAX, |&(order, ..)| order));
+        // Named on the second connection in drawing order (by any of its wires): the first may
+        // well be the right one.
+        let Some((_, page, wire)) = nets.get(1) else { continue };
+        out.push(at(
+            page,
+            wire,
+            Severity::Warning,
+            format!("wire number {number} is on {} connections", nets.len()),
+        ));
+    }
 }
 
 /// The library sources' check rules, less the ones the project turns off, then the
@@ -724,6 +814,43 @@ fn on_segment(p: Point, a: Point, b: Point) -> bool {
     }
     let t = (((p.x - a.x) * dx + (p.y - a.y) * dy) / len2).clamp(0.0, 1.0);
     p.distance(Point::new(a.x + t * dx, a.y + t * dy)) < EPS
+}
+
+/// Cable cores on two connections: a core is one conductor, so all wires that name it must be
+/// one connection (net). Wires on overview pages repeat connections on purpose and do not count;
+/// wires that touch no pin are no connection, and a wire naming only its cable (no core) names
+/// no conductor.
+fn cable_cores(i: &Inputs<'_>, wire_net: &WireNets, out: &mut Vec<Finding>) {
+    let p = i.project;
+    // Per core: the nets it is on, in drawing order, each with the first wire naming it there.
+    type Uses<'p> = Vec<(usize, &'p Page, &'p str)>;
+    let mut by_core: BTreeMap<(&DeviceTag, &str), Uses> = BTreeMap::new();
+    for (pi, page) in p.pages.iter().enumerate().filter(|(_, pg)| !pg.overview) {
+        for (wi, w) in page.wires.iter().enumerate() {
+            let Some(c) = &w.cable else { continue };
+            let core = c.core.trim();
+            if core.is_empty() {
+                continue;
+            }
+            let Some(&net) = wire_net.get(&(pi, wi)) else {
+                continue;
+            };
+            let nets = by_core.entry((&c.cable, core)).or_default();
+            if !nets.iter().any(|(n, ..)| *n == net) {
+                nets.push((net, page, w.id.as_str()));
+            }
+        }
+    }
+    for ((cable, core), nets) in by_core.iter().filter(|(_, n)| n.len() > 1) {
+        // Named on the wire of the second connection: the first may well be the right one.
+        let Some((_, page, wire)) = nets.get(1) else { continue };
+        out.push(at(
+            page,
+            wire,
+            Severity::Warning,
+            format!("cable core {cable}:{core} is on {} connections", nets.len()),
+        ));
+    }
 }
 
 /// The findings as a report table.
