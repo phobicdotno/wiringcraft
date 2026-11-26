@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use wc_core::lock::ItemKind;
 use wc_core::{Page, Project};
 
 use crate::{ChangeInfo, note, redo_target, undo_target};
@@ -35,6 +36,10 @@ pub struct Guest {
     pub history: Vec<ChangeInfo>,
     /// Refusals from the host not yet shown to the user.
     pub refusals: Vec<Refusal>,
+    /// The picture names the session refused ([`Refusal::PictureNameTaken`], also in
+    /// `refusals`), each with the `seq` of the project edit that sent the picture: a refusal
+    /// is told from one of a later attempt at that name.
+    pub names_taken: Vec<(String, Option<u64>)>,
     /// A page switch the host has not answered yet: the page asked for.
     switching: Option<Option<String>>,
     /// Page edits sent and not answered yet, by page. The host answers each with the page as
@@ -48,6 +53,10 @@ pub struct Guest {
     /// [`ProjectEdit::AddItems`] and [`ProjectEdit::UpdateItems`], and as [`HostMsg::Items`]), by id: what this guest's copy needs to draw the project.
     pub symbols: BTreeMap<String, wc_core::Symbol>,
     pub parts: BTreeMap<String, wc_core::Part>,
+    /// The hash of each file in `symbols` and `parts`, by kind and id, kept as they come in:
+    /// [`Guest::files_missing`] is asked every frame, and hashing every file each time is not
+    /// cheap.
+    file_hashes: BTreeMap<(ItemKind, String), String>,
     /// Items of this guest's [`ProjectEdit::UpdateItems`] the session took, as (kind, id, hash),
     /// in the order the host recorded them: the answer to each update, even when a later change
     /// (someone's undo) put the item back before this guest looked. Taken by whoever sent them.
@@ -68,14 +77,33 @@ pub struct Guest {
     /// page is written into this copy when the edit is sent, and no further edit of it goes out
     /// until the host answers ([`Guest::own_page_waits`]).
     own_pages: BTreeMap<u64, Vec<String>>,
+    /// The display numbers such an edit (one in `own_pages`) set on other pages, by number, as
+    /// (page id, number sent): a refusal of it takes back only these numbers.
+    own_numbers: BTreeMap<u64, Vec<(String, String)>>,
     /// Pages this guest holds whose change the host refused: this copy took the host's page
     /// back whole. The window takes them too, dropping what was changed meanwhile. Taken by
     /// whoever shows the project.
     pub retaken: Vec<String>,
     /// The project records (devices, panels, pins...) such a refused change touched, as the
     /// host has them: put back in this copy, and to be put back in the window with the pages.
-    /// No pages: those are named in `retaken`.
+    /// No pages: this guest's own are named in `retaken`, and the others it renumbered in
+    /// `retaken_numbers`.
     pub retaken_records: crate::Parts,
+    /// Other pages such a refused change renumbered, by id, with the number it sent: the window
+    /// takes the session's number back only while it still shows the one sent (a newer number
+    /// set there meanwhile is kept and goes out), and drops a page the session no longer has.
+    /// A page the change set without renumbering it (a device rename, say) keeps its number.
+    pub retaken_numbers: BTreeMap<String, String>,
+    /// Pages a refused change of this guest's touched, and whether it touched the project's
+    /// settings (`meta`): the host's version came back for them. The window drops a picture
+    /// pick it made there (a logo or an underlay), as the reference is the host's again. Taken
+    /// by whoever shows the project.
+    pub refused_pages: std::collections::BTreeSet<String>,
+    pub refused_meta: bool,
+    /// The `seq` of each project edit of this guest's the host refused: a picture pick that
+    /// edit carried is dropped, and one an edit the host took carried is kept. Taken with
+    /// `refused_pages`.
+    pub refused_edits: std::collections::BTreeSet<u64>,
 }
 
 impl Default for Guest {
@@ -94,19 +122,26 @@ impl Guest {
             peers: Vec::new(),
             history: Vec::new(),
             refusals: Vec::new(),
+            names_taken: Vec::new(),
             switching: None,
             in_flight: BTreeMap::new(),
             taking_back: 0,
             symbols: BTreeMap::new(),
             parts: BTreeMap::new(),
+            file_hashes: BTreeMap::new(),
             pictures: BTreeMap::new(),
             took_updates: Vec::new(),
             last_edit: 0,
             unanswered: BTreeMap::new(),
             replaced: BTreeMap::new(),
             own_pages: BTreeMap::new(),
+            own_numbers: BTreeMap::new(),
             retaken: Vec::new(),
             retaken_records: crate::Parts::default(),
+            retaken_numbers: BTreeMap::new(),
+            refused_pages: std::collections::BTreeSet::new(),
+            refused_meta: false,
+            refused_edits: std::collections::BTreeSet::new(),
         }
     }
 
@@ -200,6 +235,14 @@ impl Guest {
                 // does not replace it.
                 *self.in_flight.entry(page.id.clone()).or_default() += 1;
             }
+            let numbers: Vec<(String, String)> = edit
+                .renumbers()
+                .filter(|(id, _)| !own.iter().any(|p| &p.id == id))
+                .cloned()
+                .collect();
+            if !numbers.is_empty() {
+                self.own_numbers.insert(self.last_edit, numbers);
+            }
             self.own_pages
                 .insert(self.last_edit, own.into_iter().map(|p| p.id).collect());
         }
@@ -214,6 +257,11 @@ impl Guest {
             edit,
             seq: self.last_edit,
         }
+    }
+
+    /// The `seq` of the latest project edit this guest sent (0 before the first).
+    pub fn last_edit(&self) -> u64 {
+        self.last_edit
     }
 
     /// Whether a change that set a page this guest holds is unanswered: edits of that page wait
@@ -291,6 +339,8 @@ impl Guest {
                 let mut project = *project;
                 self.symbols = std::mem::take(&mut project.symbols);
                 self.parts = std::mem::take(&mut project.parts);
+                self.file_hashes.clear();
+                self.note_files(None);
                 self.project = Some(project.into());
                 self.locks = locks;
                 self.peers = peers;
@@ -304,6 +354,7 @@ impl Guest {
                 self.unanswered.clear();
                 self.replaced.clear();
                 self.own_pages.clear();
+                self.own_numbers.clear();
             }
             HostMsg::PageChanged { page, .. } => {
                 if self.answered(&page.id) {
@@ -326,6 +377,9 @@ impl Guest {
                         self.symbols
                             .extend(symbols.iter().map(|(s, _)| (s.id.clone(), s.clone())));
                         self.parts.extend(parts.iter().map(|(p, _)| (p.id.clone(), p.clone())));
+                        let ids = symbols.iter().map(|(s, _)| (ItemKind::Symbol, s.id.clone()));
+                        let ids = ids.chain(parts.iter().map(|(p, _)| (ItemKind::Part, p.id.clone())));
+                        self.note_files(Some(ids.collect()));
                     }
                     ProjectEdit::UpdateItems { symbols, parts } => {
                         if Some(by) == self.me {
@@ -335,6 +389,9 @@ impl Guest {
                             .extend(symbols.iter().map(|(s, _, _)| (s.id.clone(), s.clone())));
                         self.parts
                             .extend(parts.iter().map(|(p, _, _)| (p.id.clone(), p.clone())));
+                        let ids = symbols.iter().map(|(s, _, _)| (ItemKind::Symbol, s.id.clone()));
+                        let ids = ids.chain(parts.iter().map(|(p, _, _)| (ItemKind::Part, p.id.clone())));
+                        self.note_files(Some(ids.collect()));
                     }
                     _ => {}
                 }
@@ -346,8 +403,13 @@ impl Guest {
                 self.pictures.insert(picture.file, picture.data);
             }
             HostMsg::Items { symbols, parts } => {
+                let ids = symbols.iter().map(|s| (ItemKind::Symbol, s.id.clone()));
+                let ids: Vec<_> = ids
+                    .chain(parts.iter().map(|p| (ItemKind::Part, p.id.clone())))
+                    .collect();
                 self.symbols.extend(symbols.into_iter().map(|s| (s.id.clone(), s)));
                 self.parts.extend(parts.into_iter().map(|p| (p.id.clone(), p)));
+                self.note_files(Some(ids));
             }
             HostMsg::Recorded { change } => note(&mut self.history, change),
             HostMsg::Locks { locks } => {
@@ -381,15 +443,34 @@ impl Guest {
                 // Pages of this guest's own set with the refused change come back whole too:
                 // what was written here was the refused content.
                 let own = edit.and_then(|seq| self.own_pages.remove(&seq)).unwrap_or_default();
+                let numbers = edit.and_then(|seq| self.own_numbers.remove(&seq)).unwrap_or_default();
                 for page in &own {
                     self.answered(page);
                 }
                 whole.extend(own.iter().cloned());
+                self.refused_pages.extend(whole.iter().cloned());
+                self.refused_edits.extend(edit);
+                if let Some(parts) = &put_back {
+                    // A page this guest holds keeps its content (only its number comes back),
+                    // unless it is one of `whole`, recorded above.
+                    let me = self.me;
+                    let restored: Vec<String> = parts
+                        .pages
+                        .keys()
+                        .filter(|id| !(me.is_some() && self.locks.get(*id) == me.as_ref()))
+                        .cloned()
+                        .collect();
+                    self.refused_pages.extend(restored);
+                    self.refused_meta |= parts.meta.is_some();
+                }
                 if let Some(parts) = put_back {
                     if !own.is_empty() {
+                        // The own pages are put back by id (`retaken`), and only the numbers
+                        // the batch set on other pages are taken back (`retaken_numbers`).
                         let mut records = (*parts).clone();
                         records.pages.clear();
                         self.retaken_records.merge(records);
+                        self.retaken_numbers.extend(numbers);
                     }
                     self.put_back(*parts, &whole);
                 }
@@ -408,6 +489,9 @@ impl Guest {
                     }
                     _ => {}
                 }
+                if let Refusal::PictureNameTaken { file } = &refusal {
+                    self.names_taken.push((file.clone(), edit));
+                }
                 self.refusals.push(refusal);
             }
         }
@@ -418,6 +502,35 @@ impl Guest {
     /// host's display number, unless it is in `whole`: the refused edit added or removed that
     /// page, or set its content, so the content here is not the host's page, and the host's page
     /// comes back whole.
+    /// Hash the files named in `only` (all of them for `None`) into `file_hashes`.
+    fn note_files(&mut self, only: Option<Vec<(ItemKind, String)>>) {
+        let only = only.unwrap_or_else(|| {
+            let ids = self.symbols.keys().map(|id| (ItemKind::Symbol, id.clone()));
+            ids.chain(self.parts.keys().map(|id| (ItemKind::Part, id.clone())))
+                .collect()
+        });
+        for (kind, id) in only {
+            let hash = match kind {
+                ItemKind::Symbol => self.symbols.get(&id).filter(|s| s.id == id).map(|s| s.hash()),
+                ItemKind::Part => self.parts.get(&id).filter(|p| p.id == id).map(|p| p.hash()),
+            };
+            match hash {
+                Some(h) => self.file_hashes.insert((kind, id), h),
+                None => self.file_hashes.remove(&(kind, id)),
+            };
+        }
+    }
+
+    /// The items the session locks that it sent this guest no file of in that version (a host
+    /// that shared the project with a copy missing): kind and id. Others in the session cannot
+    /// draw a new use of one until the file comes in.
+    pub fn files_missing(&self) -> Vec<(ItemKind, String)> {
+        self.project
+            .as_ref()
+            .map(|p| crate::files_missing(&p.lock, &self.file_hashes))
+            .unwrap_or_default()
+    }
+
     fn put_back(&mut self, mut parts: crate::Parts, whole: &[String]) {
         let me = self.me;
         let Some(project) = self.project.as_mut() else {
@@ -436,6 +549,7 @@ impl Guest {
 
     /// The host took (or did not need) project edit `seq`.
     fn taken(&mut self, seq: u64) {
+        self.own_numbers.remove(&seq);
         for page in self.own_pages.remove(&seq).unwrap_or_default() {
             self.answered(&page);
         }

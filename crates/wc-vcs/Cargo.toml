@@ -9,6 +9,8 @@ license.workspace = true
 wc-core.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# A private folder for a base project fetched from a git repository.
+tempfile.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

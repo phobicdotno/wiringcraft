@@ -5,6 +5,7 @@ use wc_core::{DeviceTag, Endpoint, Page, PageSize, PlacedSymbol, Shape, Wire};
 
 fn sym(id: &str, role: SymbolRole, pins: [&str; 2]) -> Symbol {
     Symbol {
+        source: String::new(),
         id: id.into(),
         name: id.into(),
         category: String::new(),
@@ -287,6 +288,7 @@ fn table_of_contents_goes_first_and_its_rows_link_to_pages() {
         rows: vec![vec!["1".into(), "Mains".into()], vec!["2".into(), "Control".into()]],
         row_pages: vec!["p1".into(), "p2".into()],
         front: true,
+        ..Default::default()
     };
     let parts = wc_report::Table {
         title: "Parts list".into(),
@@ -313,6 +315,110 @@ fn table_of_contents_goes_first_and_its_rows_link_to_pages() {
     assert!(text.contains("/Dest [9 0 R /Fit]"), "row 1 -> page 1");
     assert!(text.contains("/Dest [12 0 R /Fit]"), "row 2 -> page 2");
     assert_eq!(text.matches("/Subtype /Link").count(), 2);
+}
+
+#[test]
+fn a_report_in_the_project_s_own_layout_prints_that_layout() {
+    use wc_core::report_layout::{ReportColumn, ReportLayout};
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Mains")];
+    project.meta.reports.push(ReportLayout {
+        kind: "parts".into(),
+        title: Some("Bill of materials".into()),
+        columns: vec![ReportColumn {
+            from: "Order number".into(),
+            heading: Some("Art. no.".into()),
+        }],
+        ..Default::default()
+    });
+    let none = BTreeMap::new();
+    let inputs = wc_report::Inputs {
+        project: &project,
+        symbols: &none,
+        parts: &BTreeMap::new(),
+    };
+    let opts = Options {
+        reports: vec![wc_report::build(wc_report::Kind::Parts, &inputs)],
+        ..Default::default()
+    };
+    let (pdf, _) = export(&project, &none, &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    assert!(text.contains(&format!("/Title {}", writer::pdf_text("R1 Bill of materials"))));
+    assert!(text.contains(&writer::pdf_text("Art. no.")));
+    assert!(!text.contains(&writer::pdf_text("Manufacturer")));
+}
+
+#[test]
+fn grouped_report_pages_print_a_heading_per_group_and_the_header_values() {
+    use layout::TableLine::{Group, Row};
+    let row = |loc: &str, wire: &str| vec![loc.to_string(), wire.to_string()];
+    let mut table = wc_report::Table {
+        title: "Wires".into(),
+        columns: vec!["Location".into(), "Wire".into()],
+        rows: vec![row("+A", "W1"), row("+A", "W2"), row("+A", "W3"), row("+B", "W4")],
+        group: Some(0),
+        ..Default::default()
+    };
+    let g = |v: &str, continued: bool| Group {
+        value: v.into(),
+        continued,
+    };
+    // Four lines a page: +A runs onto the second page under a continued heading, and +B's
+    // heading does not end a page alone.
+    assert_eq!(
+        layout::table_pages(&table, 4),
+        vec![
+            vec![g("+A", false), Row(0), Row(1), Row(2)],
+            vec![g("+B", false), Row(3)],
+        ]
+    );
+    assert_eq!(
+        layout::table_pages(&table, 3),
+        vec![
+            vec![g("+A", false), Row(0), Row(1)],
+            vec![g("+A", true), Row(2)],
+            vec![g("+B", false), Row(3)],
+        ]
+    );
+    // The line of header values takes one line of each page.
+    table.header = vec!["project.name".into(), "revision".into()];
+    assert_eq!(layout::table_pages(&table, 4)[0], vec![g("+A", false), Row(0), Row(1)]);
+    // No page holds more lines than it has room for: without room for a heading and a row,
+    // the headings are left out.
+    for per_page in 1..6 {
+        let pages = layout::table_pages(&table, per_page);
+        // The whole budget: the header line when it is printed, and the table lines.
+        let header = usize::from(layout::prints_header(&table, per_page));
+        assert!(
+            pages.iter().all(|p| p.len() + header <= per_page),
+            "{per_page}: {pages:?}"
+        );
+        assert_eq!(pages.iter().flatten().filter(|l| matches!(l, Row(_))).count(), 4);
+    }
+    assert_eq!(layout::table_pages(&table, 2)[0], vec![Row(0)]);
+    // One line a page: no room for the header values with a row, so they are not printed.
+    assert!(!layout::prints_header(&table, 1));
+    assert_eq!(layout::table_pages(&table, 1)[0], vec![Row(0)]);
+
+    let mut project = Project::new("Plant 7");
+    project.pages = vec![Page::new("p1", "1", "Mains")];
+    project.meta.title_block.insert("revision".into(), "C".into());
+    let opts = Options {
+        reports: vec![table],
+        ..Default::default()
+    };
+    let (pdf, _) = export(&project, &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    for shown in [
+        "Location: +A",
+        "Location: +B",
+        "W4",
+        "Project name: Plant 7    Revision: C",
+    ] {
+        assert!(text.contains(&writer::pdf_text(shown)), "{shown}");
+    }
+    // The location is in the headings, not in a column of its own.
+    assert!(!text.contains(&writer::pdf_text("+A")), "no +A cell");
 }
 
 #[test]
@@ -576,6 +682,7 @@ fn panel_layouts_print_after_the_schematic_pages() {
             at: Point::new(50.0, 100.0),
             width: 45.0,
             height: 85.0,
+            rotation: wc_core::geom::Rotation::R0,
         });
     }
     let parts = wc_report::Table {
@@ -602,6 +709,158 @@ fn panel_layouts_print_after_the_schematic_pages() {
     assert!(text.contains(&writer::pdf_text(
         "Cabinet CAB1  ·  plate 600 x 800 mm  ·  scale 1:5  ·  1 device(s)"
     )));
+}
+
+#[test]
+fn a_device_with_a_footprint_drawing_is_drawn_with_it_on_the_layout() {
+    use wc_core::panel::{Panel, PanelItem};
+    let Ok(tag) = DeviceTag::parse("+CAB1-A1") else {
+        unreachable!("a valid tag")
+    };
+    let mut project = Project::new("x");
+    project.devices.insert(
+        tag.clone(),
+        wc_core::Device {
+            part: Some("maker.io-module".into()),
+            ..Default::default()
+        },
+    );
+    let mut panel = Panel::new("main", "Cabinet", 600.0, 800.0);
+    panel.items.push(PanelItem::Device {
+        tag,
+        at: Point::new(50.0, 100.0),
+        width: 22.5,
+        height: 100.0,
+        rotation: wc_core::geom::Rotation::R0,
+    });
+    let Some(footprint) = wc_core::Footprint::from_shapes(vec![
+        Shape::Rect {
+            min: Point::new(0.0, 0.0),
+            max: Point::new(22.5, 100.0),
+        },
+        Shape::Text {
+            at: Point::new(2.0, 10.0),
+            text: "MAKER IO".into(),
+            height: 3.0,
+            align: wc_core::geom::Align::Left,
+            angle: 0.0,
+        },
+    ]) else {
+        unreachable!("the outline has a size")
+    };
+    let part = wc_core::Part {
+        id: "maker.io-module".into(),
+        footprint: Some(footprint),
+        ..Default::default()
+    };
+    let page = Page::new("panel-main", "P1", "Cabinet");
+    let draw = |footprints: &BTreeMap<String, wc_core::Footprint>| {
+        layout::draw_panel_page(&project, &page, 0, 1, &panel, footprints, "")
+    };
+    let plain = draw(&BTreeMap::new());
+    let drawn = draw(&footprints([&part]));
+    let label = writer::pdf_text("MAKER IO");
+    assert!(!plain.ops.contains(&label), "without the drawing the device is a box");
+    assert!(drawn.ops.contains(&label), "the maker's drawing is on the layout");
+    assert!(drawn.ops.contains(&writer::pdf_text("-A1")), "the tag is still printed");
+    // A part without a drawing, and a device without a part, stay boxes.
+    let other = wc_core::Part {
+        id: "other".into(),
+        ..Default::default()
+    };
+    assert!(footprints([&other]).is_empty());
+}
+
+#[test]
+fn a_turned_device_is_drawn_turned_with_its_footprint() {
+    use wc_core::geom::Rotation;
+    use wc_core::panel::{Panel, PanelItem};
+    let Ok(tag) = DeviceTag::parse("+CAB1-G1") else {
+        unreachable!("a valid tag")
+    };
+    let mut project = Project::new("x");
+    project.devices.insert(
+        tag.clone(),
+        wc_core::Device {
+            part: Some("maker.psu".into()),
+            ..Default::default()
+        },
+    );
+    // The maker's outline: the part's frame and a line along its top edge, 22.5 mm long.
+    let Some(footprint) = wc_core::Footprint::from_shapes(vec![
+        Shape::Rect {
+            min: Point::new(0.0, 0.0),
+            max: Point::new(22.5, 100.0),
+        },
+        Shape::Line {
+            a: Point::new(0.0, 0.0),
+            b: Point::new(22.5, 0.0),
+        },
+    ]) else {
+        unreachable!("the outline has a size")
+    };
+    let part = wc_core::Part {
+        id: "maker.psu".into(),
+        footprint: Some(footprint),
+        ..Default::default()
+    };
+    let page = Page::new("panel-main", "P1", "Cabinet");
+    let draw = |rotation: Rotation| {
+        let mut panel = Panel::new("main", "Cabinet", 600.0, 800.0);
+        panel.items.push(PanelItem::Device {
+            tag: tag.clone(),
+            at: Point::new(50.0, 100.0),
+            width: 22.5,
+            height: 100.0,
+            rotation,
+        });
+        layout::draw_panel_page(&project, &page, 0, 1, &panel, &footprints([&part]), "")
+    };
+    // Open 2-point paths (the top-edge line) and closed 4-point ones (boxes), as their size on
+    // the sheet in mm (width, height).
+    let sizes = |d: &writer::Drawn, closed: bool| -> Vec<(f64, f64)> {
+        d.prims
+            .iter()
+            .filter_map(|p| match p {
+                writer::Prim::Path { points, closed: c, .. }
+                    if *c == closed && points.len() == if closed { 4 } else { 2 } =>
+                {
+                    let xs = points.iter().map(|q| q.0);
+                    let ys = points.iter().map(|q| q.1);
+                    let w = xs.clone().fold(f64::MIN, f64::max) - xs.fold(f64::MAX, f64::min);
+                    let h = ys.clone().fold(f64::MIN, f64::max) - ys.fold(f64::MAX, f64::min);
+                    Some((w, h))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let near = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < 0.01 && (a.1 - b.1).abs() < 0.01;
+    // The plate is drawn at 1:5: 22.5 mm is 4.5 mm on the sheet, 100 mm is 20 mm.
+    let upright = draw(Rotation::R0);
+    assert!(
+        sizes(&upright, false).iter().any(|&s| near(s, (4.5, 0.0))),
+        "the top edge runs across"
+    );
+    assert!(
+        sizes(&upright, true).iter().any(|&s| near(s, (4.5, 20.0))),
+        "the box stands upright"
+    );
+    let turned = draw(Rotation::R90);
+    assert!(
+        sizes(&turned, false).iter().any(|&s| near(s, (0.0, 4.5))),
+        "the top edge runs down"
+    );
+    assert!(!sizes(&turned, false).iter().any(|&s| near(s, (4.5, 0.0))));
+    assert!(
+        sizes(&turned, true).iter().any(|&s| near(s, (20.0, 4.5))),
+        "the box lies on its side"
+    );
+    assert!(!sizes(&turned, true).iter().any(|&s| near(s, (4.5, 20.0))));
+    assert!(
+        turned.ops.contains(&writer::pdf_text("-G1")),
+        "the tag is still printed"
+    );
 }
 
 #[test]
@@ -1412,10 +1671,10 @@ fn report_pages_move_to_a_larger_sheet_when_the_first_page_is_too_short() {
         height: 100,
     };
     // Room for a few rows under the usual title block: the report keeps the sheet.
-    assert_eq!(layout::report_size(short, 30.0), short);
+    assert_eq!(layout::report_size(short, 30.0, 1), short);
     // A 60 mm title block leaves no row on it: the smallest ISO sheet with room is used.
-    assert_eq!(layout::report_size(short, 60.0), PageSize::A4);
-    assert_eq!(layout::report_size(PageSize::A3, 60.0), PageSize::A3);
+    assert_eq!(layout::report_size(short, 60.0, 1), PageSize::A4);
+    assert_eq!(layout::report_size(PageSize::A3, 60.0, 1), PageSize::A3);
 }
 
 #[test]
@@ -1458,7 +1717,7 @@ fn a_report_after_a_short_first_page_prints_on_the_larger_sheet() {
     let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
     assert_eq!(report.pages, 3);
     let text = String::from_utf8_lossy(&pdf);
-    let want = layout::report_size(project.pages[0].size, project.meta.template.band_height());
+    let want = layout::report_size(project.pages[0].size, project.meta.template.band_height(), 1);
     assert_eq!(want, PageSize::A4);
     let pt = |mm: f64| mm / 25.4 * 72.0;
     let media = |(w, h): (f64, f64)| format!("[0 0 {:.2} {:.2}]", pt(w), pt(h));
@@ -1473,4 +1732,646 @@ fn a_report_after_a_short_first_page_prints_on_the_larger_sheet() {
         .collect();
     let strip = media(project.pages[0].size.mm());
     assert_eq!(boxes, [strip.as_str(), strip.as_str(), media(want.mm()).as_str()]);
+}
+
+#[test]
+fn revision_clouds_and_the_revision_table_are_drawn() -> Result<(), String> {
+    let mut project = Project::new("Revisions");
+    project.pages = vec![Page::new("p1", "1", "Power")];
+    project
+        .add_revision("A", "2026-11-01", "First issue", "OP")
+        .map_err(|e| e.to_string())?;
+    project
+        .add_revision("B", "2026-11-18", "Motor added", "OP")
+        .map_err(|e| e.to_string())?;
+    let plain = String::from_utf8_lossy(&export(&project, &BTreeMap::new(), &Options::default()).0).into_owned();
+    project
+        .add_cloud("p1", Point::new(50.0, 50.0), Point::new(110.0, 80.0), None)
+        .map_err(|e| e.to_string())?;
+    // Without the table, only the cloud's tag can print its revision letter.
+    let tag = format!("{} Tj", writer::pdf_text("B"));
+    let cloud_only = String::from_utf8_lossy(&export(&project, &BTreeMap::new(), &Options::default()).0).into_owned();
+    assert_eq!(
+        cloud_only.matches(&tag).count(),
+        plain.matches(&tag).count() + 1,
+        "the cloud's tag prints B"
+    );
+    project
+        .set_revision_table("p1", Some(Point::new(200.0, 30.0)))
+        .map_err(|e| e.to_string())?;
+    let (bytes, report) = export(&project, &BTreeMap::new(), &Options::default());
+    let pdf = String::from_utf8_lossy(&bytes);
+    for text in ["Rev", "Description", "First issue", "Motor added", "2026-11-18"] {
+        assert!(
+            pdf.contains(&format!("{} Tj", writer::pdf_text(text))),
+            "{text} is printed"
+        );
+    }
+    // The cloud's scallops add curves.
+    assert!(pdf.matches(" c\n").count() > plain.matches(" c\n").count() + 20);
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+
+    // A letter saved by hand that the PDF cannot print is reported for the cloud and the table.
+    project.meta.revisions[1].letter = "Ж".into();
+    project.pages[0].clouds[0].revision = "Ж".into();
+    let (_, report) = export(&project, &BTreeMap::new(), &Options::default());
+    assert_eq!(
+        report
+            .warnings
+            .iter()
+            .filter(|w| w.contains("cannot print revision Ж"))
+            .count(),
+        2,
+        "{:?}",
+        report.warnings
+    );
+    project.meta.revisions[1].letter = "B".into();
+    project.pages[0].clouds[0].revision = "B".into();
+
+    // A cloud of a revision the project no longer lists is reported.
+    project.meta.revisions.pop();
+    let (_, report) = export(&project, &BTreeMap::new(), &Options::default());
+    assert!(
+        report.warnings.iter().any(|w| w.contains("revision B")),
+        "{:?}",
+        report.warnings
+    );
+    Ok(())
+}
+
+#[test]
+fn an_unlisted_revision_is_reported_only_for_the_page_that_has_the_cloud() -> Result<(), String> {
+    let mut project = Project::new("Revisions");
+    // Two pages that share a display number: only the page id tells them apart.
+    project.pages = vec![Page::new("p1", "1", "Clean"), Page::new("p2", "1", "Orphan")];
+    project.add_revision("A", "", "", "").map_err(|e| e.to_string())?;
+    project
+        .add_cloud("p2", Point::new(50.0, 50.0), Point::new(80.0, 80.0), None)
+        .map_err(|e| e.to_string())?;
+    project.meta.revisions.clear();
+    let only = |id: &str| Options {
+        pages: vec![id.into()],
+        ..Default::default()
+    };
+    let (_, clean) = export(&project, &BTreeMap::new(), &only("p1"));
+    assert!(
+        !clean.warnings.iter().any(|w| w.contains("revision A")),
+        "{:?}",
+        clean.warnings
+    );
+    let (_, orphan) = export(&project, &BTreeMap::new(), &only("p2"));
+    assert!(
+        orphan.warnings.iter().any(|w| w.contains("revision A")),
+        "{:?}",
+        orphan.warnings
+    );
+    Ok(())
+}
+
+#[test]
+fn a_rack_of_three_cards_gives_plc_card_overview_pages() {
+    use wc_core::plc_rack::{PlcCard, PlcRack};
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Mains")];
+    let card = |slot: u32, tag: &str, channels: u32, start: &str| PlcCard {
+        slot,
+        tag: tag.into(),
+        channels,
+        start: start.into(),
+        ..Default::default()
+    };
+    project.meta.racks.push(PlcRack {
+        name: "-A1".into(),
+        cards: vec![
+            card(1, "-A1.DI1", 32, "%IX0.0"),
+            card(2, "-A1.DO1", 32, "%QX4.0"),
+            card(3, "-A1.AI1", 8, "%IW64"),
+        ],
+        ..Default::default()
+    });
+    let none = BTreeMap::new();
+    let inputs = wc_report::Inputs {
+        project: &project,
+        symbols: &none,
+        parts: &BTreeMap::new(),
+    };
+    let table = wc_report::build(wc_report::Kind::PlcCards, &inputs);
+    assert_eq!(table.rows.len(), 72);
+    let opts = Options {
+        reports: vec![table],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&project, &none, &opts);
+    // The overview runs on over as many report sheets as its rows need, after the one
+    // schematic page.
+    let band = project.meta.template.band_height();
+    let per_page = layout::rows_per_page(layout::report_size(project.pages[0].size, band, 1), band);
+    let sheets = 72usize.div_ceil(per_page);
+    assert!(sheets >= 2, "72 rows fit on one sheet of {per_page}");
+    assert_eq!(report.pages, 1 + sheets);
+    let text = String::from_utf8_lossy(&pdf);
+    assert!(text.contains(&writer::pdf_text("PLC cards")));
+    for cell in ["-A1.DI1", "-A1.DO1", "-A1.AI1", "%IX3.7", "%QX7.7", "%IW78"] {
+        assert!(text.contains(&writer::pdf_text(cell)), "{cell}");
+    }
+}
+
+#[test]
+fn a_network_gets_a_topology_page_with_its_devices_addresses_and_cables() {
+    use wc_core::network::{Link as NetLink, Network, Node};
+    let mut project = Project::new("x");
+    let mut p1 = Page::new("p1", "1", "PLC");
+    p1.symbols.push(place("s1", "coil", 50.0, "-K10"));
+    project.pages.push(p1);
+    let node = |d: &str, a: &str| Node {
+        device: d.into(),
+        address: a.into(),
+        ..Node::default()
+    };
+    let link = |a: &str, b: &str, w: &str| NetLink {
+        from: a.into(),
+        to: b.into(),
+        cable: w.into(),
+        ..NetLink::default()
+    };
+    // PLC - switch - two drives, and a ring of three devices back to the first one.
+    let line = Network {
+        name: "PN1".into(),
+        kind: "profinet".into(),
+        nodes: vec![
+            node("-A1", "192.168.0.1"),
+            node("-K10", "192.168.0.10"),
+            node("-T1", "192.168.0.21"),
+            node("-T2", "192.168.0.22"),
+        ],
+        links: vec![
+            link("-A1:X1P1", "-K10:P1", "-W1"),
+            link("-K10:P2", "-T1:X1", "-W2"),
+            link("-K10:P3", "-T2:X1", "-W3"),
+        ],
+        ..Network::default()
+    };
+    let ring = Network {
+        name: "RING".into(),
+        nodes: vec![node("-A5", ""), node("-A6", ""), node("-A7", "")],
+        links: vec![
+            link("-A5:P1", "-A6:P1", "-W51"),
+            link("-A6:P2", "-A7:P1", "-W52"),
+            link("-A7:P2", "-A5:P2", "-W53"),
+        ],
+        ..Network::default()
+    };
+    let opts = Options {
+        networks: vec![line, ring],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    assert_eq!(report.pages, 3);
+    assert!(text.contains(&format!("/Title {}", writer::pdf_text("N1 Network PN1"))));
+    assert!(text.contains(&format!("/Title {}", writer::pdf_text("N2 Network RING"))));
+    for t in [
+        "-A1",
+        "-K10",
+        "-T1",
+        "-T2",
+        "192.168.0.1",
+        "192.168.0.10",
+        "192.168.0.21",
+        "192.168.0.22",
+        "-W1",
+        "-W2",
+        "-W3",
+        "X1P1",
+        "P3",
+    ] {
+        assert!(text.contains(&writer::pdf_text(t)), "{t}");
+    }
+    // Every link of the ring is drawn once, each with its cable tag (alone, or after the
+    // port names over a short lane).
+    for w in ["-W51", "-W52", "-W53"] {
+        let hex = writer::pdf_text(w);
+        let hex = hex.trim_start_matches('<').trim_end_matches('>');
+        assert_eq!(text.matches(hex).count(), 1, "{w}");
+    }
+    // The switch's box links to the page it is drawn on; the others are on no page.
+    assert_eq!(text.matches("/Subtype /Link").count(), 1);
+}
+
+#[test]
+fn a_topology_box_links_to_a_page_the_pdf_holds() {
+    use wc_core::network::{Link as NetLink, Network};
+    let mut symbols = BTreeMap::new();
+    symbols.insert("coil".to_owned(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
+    let mut project = Project::new("x");
+    let mut p1 = Page::new("p1", "1", "Power");
+    p1.symbols.push(place("s1", "coil", 50.0, "-K10"));
+    let mut p2 = Page::new("p2", "2", "Control");
+    p2.symbols.push(place("s2", "coil", 50.0, "-K10"));
+    project.pages = vec![p1, p2];
+    let net = Network {
+        name: "PN1".into(),
+        links: vec![NetLink {
+            from: "-K10:P1".into(),
+            to: "-A1:P1".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    // Only the second page is exported: the box links there, not to the first page.
+    let opts = Options {
+        pages: vec!["p2".into()],
+        networks: vec![net],
+        ..Default::default()
+    };
+    let (pdf, _) = export(&project, &symbols, &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    assert_eq!(
+        text.matches("/Subtype /Link").count(),
+        1,
+        "the -K10 box links to page 2"
+    );
+}
+
+#[test]
+fn a_link_between_two_ports_of_one_device_is_drawn_and_a_bad_tag_is_warned_about() {
+    use wc_core::network::{Link as NetLink, Network, Node};
+    let net = Network {
+        name: "PN2".into(),
+        nodes: vec![Node {
+            device: "K 10?".into(),
+            address: "192.168.0.2".into(),
+            station: "drive-07".into(),
+            ..Node::default()
+        }],
+        links: vec![
+            NetLink {
+                from: "-K10:P1".into(),
+                to: "-K10:P2".into(),
+                cable: "-W9".into(),
+                ..NetLink::default()
+            },
+            NetLink {
+                from: "-K10:P3".into(),
+                to: "-K10:P4".into(),
+                cable: "-W8".into(),
+                ..NetLink::default()
+            },
+            NetLink {
+                from: "-K10:P5".into(),
+                to: "secret label!:P1".into(),
+                cable: "-W7".into(),
+                ..NetLink::default()
+            },
+        ],
+        ..Network::default()
+    };
+    let opts = Options {
+        networks: vec![net],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&Project::new("x"), &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    assert!(text.contains(&writer::pdf_text("P1 - P2 -W9")));
+    assert!(text.contains(&writer::pdf_text("P3 - P4 -W8")));
+    // Drawn as written; the warning names the node by number, not by its text.
+    assert!(text.contains(&writer::pdf_text("K 10?")));
+    // Its address and station are still drawn in its box.
+    assert!(text.contains(&writer::pdf_text("192.168.0.2")));
+    assert!(text.contains(&writer::pdf_text("drive-07")));
+    assert!(
+        report.warnings.iter().any(|w| w.starts_with("network PN2: node ")
+            && w.ends_with(" is not a device tag: only letters, digits, '.', '_' allowed")),
+        "{:?}",
+        report.warnings
+    );
+    // A bad link end: the reason, by link number, and never the text written there.
+    assert!(
+        report.warnings.contains(
+            &"network PN2: link 3: its to end is not a device or port: only letters, digits, '.', '_' allowed"
+                .to_owned()
+        ),
+        "{:?}",
+        report.warnings
+    );
+    assert!(
+        !report
+            .warnings
+            .iter()
+            .any(|w| w.contains("secret") || w.contains("K 10?"))
+    );
+}
+
+#[test]
+fn a_link_with_an_empty_end_is_warned_about_and_the_others_are_drawn() {
+    use wc_core::network::{Link as NetLink, Network};
+    let link = |from: &str, to: &str, cable: &str| NetLink {
+        from: from.into(),
+        to: to.into(),
+        cable: cable.into(),
+        ..NetLink::default()
+    };
+    let net = Network {
+        name: "PN3".into(),
+        links: vec![
+            link("-A1:X1", "-K10:P1", "-W1"),
+            link("-K10:P2", "", "-W2"),
+            link("-K10:P3", "-T1:X1", "-W3"),
+        ],
+        ..Network::default()
+    };
+    let opts = Options {
+        networks: vec![net],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&Project::new("x"), &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    // The valid links are drawn with their cables; the one with an empty end is not.
+    for drawn in ["-A1", "-K10", "-T1", "-W1", "-W3"] {
+        assert!(text.contains(&writer::pdf_text(drawn)), "{drawn}");
+    }
+    assert!(!text.contains(&writer::pdf_text("-W2")));
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w == "network PN3: link 2 is not drawn: an end names no device"),
+        "{:?}",
+        report.warnings
+    );
+    assert!(
+        !report.warnings.iter().any(|w| w.contains("-K10:P2")),
+        "{:?}",
+        report.warnings
+    );
+}
+
+#[test]
+fn plc_cards_are_drawn_one_per_sheet_with_their_points_linked() {
+    use wc_report::{CardChannel, CardPoint, PlcCardSheet};
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Inputs"), Page::new("p2", "2", "Outputs")];
+    let point = |device: &str, page: &str| CardPoint {
+        device: device.into(),
+        description: format!("{device} running"),
+        connected: "-X1:3".into(),
+        page_number: page.trim_start_matches('p').into(),
+        page_id: page.into(),
+    };
+    let card = |slot: u32, name: &str, prefix: &str, points: Vec<(usize, CardPoint)>| PlcCardSheet {
+        rack: "-A1".into(),
+        slot,
+        card: name.into(),
+        kind: "DI 8".into(),
+        channels: (0..8)
+            .map(|c| CardChannel {
+                channel: c,
+                address: format!("{prefix}{}.{c}", slot - 1),
+                points: points
+                    .iter()
+                    .filter(|(at, _)| *at == c)
+                    .map(|(_, p)| p.clone())
+                    .collect(),
+            })
+            .collect(),
+    };
+    // Three cards: a point on the first, two points on one channel of the second, none on the third.
+    let cards = vec![
+        card(1, "-K1", "%IX", vec![(0, point("-S1", "p1"))]),
+        card(2, "-K2", "%QX", vec![(3, point("-M1", "p2")), (3, point("-H1", "p2"))]),
+        card(3, "-K3", "%IX", vec![]),
+    ];
+    let opts = Options {
+        plc_cards: cards.clone(),
+        ..Default::default()
+    };
+    let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    assert_eq!(report.pages, 5, "two schematic pages and a sheet per card");
+    for shown in [
+        "PLC card -K1",
+        "PLC card -K2",
+        "PLC card -K3",
+        "-S1",
+        "-M1 running",
+        "-H1",
+        "%QX1.3",
+        "spare",
+        "-X1:3",
+    ] {
+        assert!(text.contains(&writer::pdf_text(shown)), "{shown} is drawn");
+    }
+    let at = |title: &str| {
+        text.find(&format!("/Title {}", writer::pdf_text(title)))
+            .unwrap_or(usize::MAX)
+    };
+    assert!(at("2 Outputs") < at("C1 PLC card -K1"));
+    assert!(at("C1 PLC card -K1") < at("C2 PLC card -K2"));
+    assert!(at("C2 PLC card -K2") < at("C3 PLC card -K3"));
+    assert!(at("C3 PLC card -K3") < usize::MAX);
+    // Each drawn point links to its page: -S1 to page 1, -M1 and -H1 to page 2.
+    assert_eq!(text.matches("/Subtype /Link").count(), 3);
+    let targets = |c: &PlcCardSheet| -> Vec<String> {
+        let mut page = Page::new("c", "C1", "card");
+        page.size = layout::card_size(project.pages[0].size, project.meta.template.band_height());
+        let drawn = layout::draw_card_page(&project, &page, 0, 1, c, 0, (1, 1), "");
+        drawn.links.into_iter().map(|l| l.target_page_id).collect()
+    };
+    assert_eq!(targets(&cards[0]), ["p1"], "-S1 links to page 1");
+    assert_eq!(targets(&cards[1]), ["p2", "p2"], "-M1 and -H1 link to page 2");
+    assert!(targets(&cards[2]).is_empty());
+    let rows = |c: &PlcCardSheet| layout::card_rows_of(c).len();
+    assert_eq!((rows(&cards[0]), rows(&cards[1]), rows(&cards[2])), (8, 9, 8));
+}
+
+#[test]
+fn a_long_plc_card_goes_on_over_several_sheets() {
+    use wc_report::{CardChannel, PlcCardSheet};
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Inputs")];
+    let per = layout::card_rows_per_page(project.pages[0].size, project.meta.template.band_height());
+    let card = PlcCardSheet {
+        card: "-K9".into(),
+        channels: (0..per + 1)
+            .map(|c| CardChannel {
+                channel: c,
+                address: format!("%IX{}.{}", c / 8, c % 8),
+                points: Vec::new(),
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let opts = Options {
+        plc_cards: vec![card],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+    assert_eq!(report.pages, 3);
+    let text = String::from_utf8_lossy(&pdf);
+    assert!(text.contains(&writer::pdf_text("PLC card -K9 (2 / 2)")));
+}
+
+#[test]
+fn plc_card_sheets_move_to_a_larger_sheet_and_fit_their_fields() {
+    let short = PageSize::Custom {
+        width: 300,
+        height: 100,
+    };
+    // A 60 mm title block leaves no card row on the short sheet: a larger one is used.
+    assert_eq!(layout::card_size(short, 60.0), PageSize::A4);
+    assert_eq!(layout::card_size(PageSize::A3, 60.0), PageSize::A3);
+    assert_eq!(layout::card_size(PageSize::A4Portrait, 60.0), PageSize::A4Portrait);
+    // A tall but narrow sheet has rows to spare and no room for the point columns.
+    let narrow = PageSize::Custom {
+        width: 100,
+        height: 297,
+    };
+    assert_eq!(layout::card_size(narrow, 60.0), PageSize::A4);
+    // A field cut for its column is measured at the height it is drawn at.
+    let long = "-K100 motor protection relay for the main pump in the north basin";
+    for width in [10.0, 25.0, 60.0] {
+        let cut = layout::fit_at(long, width, 2.5);
+        assert!(writer::text_width_mm(&cut, 2.5) <= width, "{cut:?} fits {width} mm");
+    }
+}
+
+#[test]
+fn a_dimension_drawn_by_hand_shows_in_pdf_svg_and_dxf() {
+    let mut project = Project::new("x");
+    let mut page = Page::new("p1", "1", "Cabinet");
+    page.graphics.push(Shape::Dimension {
+        a: wc_core::Point::new(40.0, 120.0),
+        b: wc_core::Point::new(65.0, 120.0),
+        offset: 10.0,
+        height: 2.5,
+    });
+    project.pages = vec![page];
+    let symbols = BTreeMap::new();
+    let (bytes, _) = export(&project, &symbols, &Options::default());
+    let tj = format!("{} Tj", writer::pdf_text("25"));
+    assert!(
+        String::from_utf8_lossy(&bytes).contains(&tj),
+        "the PDF shows the length"
+    );
+    let (pages, _) = page_drawings(&project, &symbols, &Options::default());
+    let svg = crate::vector::svg(&pages[0]);
+    assert!(svg.contains(">25</text>"), "{svg}");
+    let d = dxf(&pages[0]);
+    assert!(d.contains("\n1\n25\n"), "the DXF has the length as text");
+}
+
+#[test]
+fn a_long_page_reference_on_a_plc_card_is_cut_to_its_column() {
+    use wc_report::{CardChannel, CardPoint, PlcCardSheet};
+    let project = Project::new("x");
+    let long_page = "=PLANT+ROOM-17/123456789";
+    let card = PlcCardSheet {
+        card: "-K1".into(),
+        channels: vec![CardChannel {
+            channel: 0,
+            address: "%IX0.0".into(),
+            points: vec![CardPoint {
+                device: "-S1".into(),
+                description: "start".into(),
+                connected: "-X1:3 to the terminal strip in the field box ".repeat(6),
+                page_number: long_page.into(),
+                page_id: "p1".into(),
+            }],
+        }],
+        ..Default::default()
+    };
+    let page = Page::new("c", "C1", "card");
+    let drawn = layout::draw_card_page(&project, &page, 0, 1, &card, 0, (1, 1), "");
+    let cut = layout::fit_at(long_page, layout::CARD_PAGE, 2.5);
+    assert!(writer::text_width_mm(&cut, 2.5) <= layout::CARD_PAGE);
+    assert_ne!(cut, long_page, "the page reference is too long for its column");
+    assert!(
+        drawn.ops.contains(&writer::pdf_text(&cut)),
+        "the cut page reference is drawn"
+    );
+    assert!(!drawn.ops.contains(&writer::pdf_text(long_page)));
+    // The connection text is cut too, and ends before the page column starts.
+    let [_, _, conn_x, page_x] = layout::card_field_x(page.size.mm().0);
+    let connected = &card.channels[0].points[0].connected;
+    let shown = layout::fit_at(connected, page_x - layout::CARD_PAGE - 2.0 - conn_x, 2.5);
+    assert_ne!(&shown, connected, "the connection is too long for its column");
+    assert!(
+        drawn.ops.contains(&writer::pdf_text(&shown)),
+        "the cut connection is drawn"
+    );
+    assert!(!drawn.ops.contains(&writer::pdf_text(connected)));
+    assert!(conn_x + writer::text_width_mm(&shown, 2.5) < page_x - layout::CARD_PAGE);
+}
+
+#[test]
+fn a_declared_node_with_a_blank_tag_keeps_its_box_address_and_station() {
+    use wc_core::network::{Network, Node};
+    let net = Network {
+        name: "PN3".into(),
+        nodes: vec![
+            // Text that reads like the name a blank node is shown under does not take its box.
+            Node {
+                device: "(node 2)".into(),
+                address: "10.0.0.1".into(),
+                ..Node::default()
+            },
+            // Nor does text holding the marker of a blank node's internal name, or text close
+            // to it: each keeps a box of its own.
+            Node {
+                device: "\u{1}4".into(),
+                address: "10.0.0.3".into(),
+                ..Node::default()
+            },
+            Node {
+                device: "\u{FFFD}4".into(),
+                address: "10.0.0.4".into(),
+                ..Node::default()
+            },
+            Node {
+                device: "  ".into(),
+                address: "192.168.0.2".into(),
+                station: "drive-07".into(),
+                ..Node::default()
+            },
+        ],
+        links: vec![
+            wc_core::network::Link {
+                from: "(node 2)".into(),
+                to: "-K1:P1".into(),
+                ..Default::default()
+            },
+            wc_core::network::Link {
+                from: "\u{FFFD}4".into(),
+                to: "-K1:P2".into(),
+                ..Default::default()
+            },
+        ],
+        ..Network::default()
+    };
+    // Four nodes and -K1: five boxes, none merged, and both links drawn.
+    let topo = crate::topology::layout_network(&net);
+    assert_eq!(topo.boxes.len(), 5, "{:?}", topo.boxes);
+    assert!(topo.unplaced.is_empty());
+    let opts = Options {
+        networks: vec![net],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&Project::new("x"), &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    assert_eq!(text.matches(&writer::pdf_text("(node 4)")).count(), 1);
+    assert!(text.contains(&writer::pdf_text("(node 2)")));
+    assert!(text.contains(&writer::pdf_text("10.0.0.1")));
+    assert!(text.contains(&writer::pdf_text("10.0.0.3")));
+    assert!(text.contains(&writer::pdf_text("10.0.0.4")));
+    assert!(text.contains(&writer::pdf_text("192.168.0.2")));
+    assert!(text.contains(&writer::pdf_text("drive-07")));
+    assert!(!text.contains(&writer::pdf_text("No devices on this network.")));
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("network PN3: node 4 is not a device tag")),
+        "{:?}",
+        report.warnings
+    );
 }

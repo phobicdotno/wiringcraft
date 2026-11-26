@@ -7,9 +7,11 @@
 //! `IW64`, `A4.1`); a point without an address, or with one that is not a PLC address, is
 //! declared at `%I*` or `%Q*`, to be linked to the hardware in the PLC tool.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::{Inputs, natural_key, plc_io_list};
+use wc_core::plc_rack::PlcAddress;
+
+use crate::{Inputs, PlcPoint, Table, natural_key, plc_io_list, plc_points};
 
 /// What came out of writing the variable list.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -23,59 +25,12 @@ pub struct PlcVariables {
     pub unlocated: usize,
 }
 
-/// A located address and the elementary type that goes with its size.
+/// A located address and the elementary type that goes with its size, in the reading shared
+/// with the PLC card overview ([`PlcAddress`]); any bit number is taken, as some lists write
+/// `%I0.10`.
 fn location(address: &str, output: bool) -> Option<(String, &'static str)> {
-    let a: String = address
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect::<String>()
-        .to_ascii_uppercase();
-    let a = a.strip_prefix('%').unwrap_or(&a);
-    let mut chars = a.chars();
-    let area = match chars.next()? {
-        'I' | 'E' => 'I',
-        'Q' | 'A' => 'Q',
-        _ => return None,
-    };
-    if (area == 'Q') != output {
-        return None;
-    }
-    let rest = chars.as_str();
-    let (size, number) = match rest.chars().next()? {
-        c @ ('X' | 'B' | 'W' | 'D') => (Some(c), rest.get(1..)?),
-        _ => (None, rest),
-    };
-    let parts: Vec<&str> = number.split('.').collect();
-    if parts.is_empty()
-        || parts.len() > 2
-        || parts
-            .iter()
-            .any(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()))
-    {
-        return None;
-    }
-    let bit = parts.len() == 2;
-    let size = match size {
-        Some(s) => s,
-        None if bit => 'X',
-        None => return None,
-    };
-    // A bit address names a bit, a byte or word address does not.
-    if bit != (size == 'X') {
-        return None;
-    }
-    let ty = match size {
-        'X' => "BOOL",
-        'B' => "BYTE",
-        'W' => "WORD",
-        _ => "DWORD",
-    };
-    let number: Vec<String> = parts.iter().map(|p| p.trim_start_matches('0').to_owned()).collect();
-    let number: Vec<&str> = number
-        .iter()
-        .map(|p| if p.is_empty() { "0" } else { p.as_str() })
-        .collect();
-    Some((format!("%{area}{size}{}", number.join(".")), ty))
+    let a = PlcAddress::parse_any_bit(address).filter(|a| a.output == output)?;
+    Some((a.iec(), a.elementary_type()))
 }
 
 /// Words a variable may not be called.
@@ -209,6 +164,246 @@ pub fn plc_variables(i: &Inputs<'_>) -> PlcVariables {
         lines.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\r\n"),
         if lines.is_empty() { "" } else { "\r\n" },
     );
+    out
+}
+
+/// The drawn PLC inputs and outputs whose address names a channel (a bit no higher than 7) in
+/// their own direction, by that address.
+fn points_by_address(points: &[PlcPoint]) -> BTreeMap<PlcAddress, Vec<&PlcPoint>> {
+    let mut out: BTreeMap<PlcAddress, Vec<&PlcPoint>> = BTreeMap::new();
+    for point in points {
+        if let Some(a) = PlcAddress::parse(&point.address).filter(|a| a.output == (point.kind == "Output")) {
+            out.entry(a).or_default().push(point);
+        }
+    }
+    out
+}
+
+/// One card of a PLC rack with what is drawn at each of its channels, for the drawn card
+/// overview sheets.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PlcCardSheet {
+    pub rack: String,
+    pub slot: u32,
+    /// The card's tag, else its type, else `slot N`.
+    pub card: String,
+    pub kind: String,
+    pub channels: Vec<CardChannel>,
+}
+
+/// One channel of a card: its number from 0, its address and the points drawn there (none for a
+/// spare, two or more when several share the address).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CardChannel {
+    pub channel: usize,
+    pub address: String,
+    pub points: Vec<CardPoint>,
+}
+
+/// A PLC input or output drawn at a card's channel.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CardPoint {
+    pub device: String,
+    pub description: String,
+    /// What it is wired to.
+    pub connected: String,
+    /// The number and the id of the page it is drawn on.
+    pub page_number: String,
+    pub page_id: String,
+}
+
+/// Every card of every rack in the project ([`wc_core::plc_rack`]), rack by rack and slot by
+/// slot, with the PLC input or output drawn at each channel's address. Cards whose channels
+/// cannot be worked out are left out ([`plc_rack_warnings`] says why).
+pub fn plc_card_sheets(i: &Inputs<'_>) -> Vec<PlcCardSheet> {
+    if i.project.meta.racks.is_empty() {
+        return Vec::new();
+    }
+    let all = plc_points(i);
+    let points = points_by_address(&all);
+    let mut out = Vec::new();
+    for rack in &i.project.meta.racks {
+        let mut cards: Vec<_> = rack.cards.iter().collect();
+        cards.sort_by_key(|c| c.slot);
+        for card in cards {
+            let Ok(addresses) = card.addresses() else { continue };
+            let channels = addresses
+                .iter()
+                .enumerate()
+                .map(|(channel, a)| CardChannel {
+                    channel,
+                    address: a.iec(),
+                    points: points
+                        .get(a)
+                        .into_iter()
+                        .flatten()
+                        .map(|p| CardPoint {
+                            device: p.device.clone(),
+                            description: p.description.clone(),
+                            connected: p.connected.clone(),
+                            page_number: p.page_number.clone(),
+                            page_id: p.page_id.clone(),
+                        })
+                        .collect(),
+                })
+                .collect();
+            out.push(PlcCardSheet {
+                rack: rack.name.clone(),
+                slot: card.slot,
+                card: card.label(),
+                kind: card.kind.clone(),
+                channels,
+            });
+        }
+    }
+    out
+}
+
+/// PLC card overview: every card of every rack in the project ([`wc_core::plc_rack`]), slot by
+/// slot and channel by channel, with the PLC input or output drawn at each channel's address:
+/// the same device, description, connection and page as in the PLC I/O list. A channel with
+/// nothing drawn is listed empty (a spare); two points on one address give two rows. Rows with a
+/// drawn point link to its page. Cards whose channels cannot be worked out are left out
+/// ([`plc_rack_warnings`] says why). [`plc_card_sheets`] gives the same as drawn cards.
+pub fn plc_card_overview(i: &Inputs<'_>) -> Table {
+    let mut t = Table::new(
+        "PLC cards",
+        &[
+            "Rack",
+            "Slot",
+            "Card",
+            "Type",
+            "Channel",
+            "Address",
+            "Device",
+            "Description",
+            "Connected to",
+            "Page",
+        ],
+    );
+    for card in plc_card_sheets(i) {
+        for ch in &card.channels {
+            let head = vec![
+                card.rack.clone(),
+                card.slot.to_string(),
+                card.card.clone(),
+                card.kind.clone(),
+                ch.channel.to_string(),
+                ch.address.clone(),
+            ];
+            if ch.points.is_empty() {
+                let mut r = head.clone();
+                r.extend(std::iter::repeat_n(String::new(), 4));
+                t.rows.push(r);
+            }
+            for point in &ch.points {
+                let mut r = head.clone();
+                r.extend([
+                    point.device.clone(),
+                    point.description.clone(),
+                    point.connected.clone(),
+                    point.page_number.clone(),
+                ]);
+                t.row_pages.resize(t.rows.len(), String::new());
+                t.row_pages.push(point.page_id.clone());
+                t.rows.push(r);
+            }
+        }
+    }
+    t
+}
+
+/// What is wrong with the project's PLC racks: a card whose channels cannot be worked out, two
+/// cards in one slot, two cards sharing an address, and drawn PLC inputs and outputs that are on
+/// no card: their address is on none, is not a PLC address, names the other direction, or names
+/// bit 8 or higher. Points without an address are left to the PLC I/O list, which lists them
+/// last. Empty when there are no racks.
+///
+/// Cards are compared by the bits their channels cover (a word covers two bytes, so `%IW64`
+/// and `%IB65` share one). A card with its own `step` numbers its addresses its own way, so it
+/// is compared by channel address only.
+pub fn plc_rack_warnings(i: &Inputs<'_>) -> Vec<String> {
+    let racks = &i.project.meta.racks;
+    let mut out = Vec::new();
+    if racks.is_empty() {
+        return out;
+    }
+    // Channel addresses and covered bits seen so far, with the card that has them.
+    let mut owner: BTreeMap<PlcAddress, String> = BTreeMap::new();
+    let mut covered: Vec<(bool, std::ops::Range<u64>, String)> = Vec::new();
+    for rack in racks {
+        let mut slots = BTreeSet::new();
+        for card in &rack.cards {
+            let here = format!("PLC rack \"{}\" slot {}", rack.name, card.slot);
+            if !slots.insert(card.slot) {
+                out.push(format!("{here}: a second card in this slot"));
+            }
+            let addresses = match card.addresses() {
+                Err(e) => {
+                    out.push(format!("{here}: {e}, left off the PLC card overview"));
+                    continue;
+                }
+                Ok(a) => a,
+            };
+            let mut clash: Option<(PlcAddress, String)> = None;
+            for a in &addresses {
+                let shared = owner.get(a).cloned().or_else(|| {
+                    if card.step.is_some() {
+                        return None;
+                    }
+                    let bits = a.bits();
+                    covered
+                        .iter()
+                        .find(|(o, r, _)| *o == a.output && r.start < bits.end && bits.start < r.end)
+                        .map(|(_, _, c)| c.clone())
+                });
+                if let Some(first) = shared {
+                    clash.get_or_insert((*a, first));
+                }
+            }
+            if let Some((a, first)) = clash {
+                out.push(format!("{here}: address {} is also on {first}", a.iec()));
+            }
+            for a in addresses {
+                owner.entry(a).or_insert_with(|| here.clone());
+                if card.step.is_none() {
+                    covered.push((a.output, a.bits(), here.clone()));
+                }
+            }
+        }
+    }
+    let points = plc_points(i);
+    for point in &points {
+        if point.address.is_empty() {
+            continue;
+        }
+        let what = format!(
+            "PLC {} {} (page {})",
+            point.kind.to_ascii_lowercase(),
+            point.device,
+            point.page_number
+        );
+        let output = point.kind == "Output";
+        match PlcAddress::parse_any_bit(&point.address) {
+            None => out.push(format!(
+                "{what}: address {:?} is not a PLC address, so it is on no card",
+                point.address
+            )),
+            Some(a) if a.output != output => out.push(format!(
+                "{what}: address {} is an {}, so it is on no card",
+                a.iec(),
+                if a.output { "output" } else { "input" }
+            )),
+            Some(a) if a.bit.is_some_and(|b| b > 7) => out.push(format!(
+                "{what}: address {} names no bit of a byte, so it is on no card",
+                a.iec()
+            )),
+            Some(a) if !owner.contains_key(&a) => {
+                out.push(format!("{what} at {} is on no card of the PLC racks", a.iec()))
+            }
+            Some(_) => {}
+        }
+    }
     out
 }
 

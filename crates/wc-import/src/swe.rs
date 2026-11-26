@@ -2052,6 +2052,7 @@ pub fn build_with(
                             }
                         };
                         built.symbols.push(Symbol {
+                            source: String::new(),
                             id: id.clone(),
                             name: if s.block.is_empty() {
                                 "SolidWorks Electrical symbol".to_owned()
@@ -2778,6 +2779,10 @@ pub fn build_with(
                 ),
                 (layouts.no_size, "rail(s) or duct(s) without a length"),
                 (layouts.upright, "upright rail(s): WiringCraft rails run left to right"),
+                (
+                    layouts.far_off,
+                    "item(s) reaching more than 1 km from the page origin",
+                ),
                 (layouts.plates, "plate(s) giving the panel size"),
                 (
                     layouts.other,

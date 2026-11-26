@@ -1,4 +1,4 @@
-//! Importers: symbols from DXF and SVG, parts from CSV, schematic drawings from DXF.
+//! Importers: symbols from DXF and SVG, parts from CSV and Excel workbooks, schematic drawings from DXF.
 //!
 //! Input is treated as hostile: malformed files produce errors or are skipped, never panics.
 
@@ -12,11 +12,14 @@ pub mod edz;
 pub mod eplan;
 pub mod kicad;
 pub mod pdf;
+mod pdf_codecs;
 pub mod qet;
 pub mod raster;
+pub mod step;
 pub mod svg;
 pub mod swe;
 pub mod wago;
+pub mod xlsx;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -133,6 +136,7 @@ pub(crate) fn make_symbol(
         });
     }
     Ok(wc_core::Symbol {
+        source: String::new(),
         id: id.into(),
         name: name.into(),
         category: String::new(),

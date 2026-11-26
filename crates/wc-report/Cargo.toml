@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 wc-core.workspace = true
+# Reports saved as Excel workbooks (.xlsx).
+zip.workspace = true
 
 [lints]
 workspace = true

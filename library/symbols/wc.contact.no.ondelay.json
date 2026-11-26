@@ -1,0 +1,115 @@
+{
+  "category": "contacts",
+  "description": "Time-delayed make contact of an on-delay timer: it closes once the set time has run after the coil is switched on, and opens at once when it is switched off.",
+  "graphics": [
+    {
+      "a": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 5.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 10.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 10.0
+      },
+      "b": {
+        "x": -3.5,
+        "y": 4.2
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": -2.11,
+        "y": 6.5
+      },
+      "b": {
+        "x": -5.38,
+        "y": 6.5
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": -1.39,
+        "y": 7.7
+      },
+      "b": {
+        "x": -5.38,
+        "y": 7.7
+      },
+      "kind": "line"
+    },
+    {
+      "center": {
+        "x": -3.9,
+        "y": 7.1
+      },
+      "end": 270.0,
+      "kind": "arc",
+      "radius": 1.6,
+      "start": 90.0
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "17"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 14.4
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "18"
+    }
+  ],
+  "id": "wc.contact.no.ondelay",
+  "letter_code": "K",
+  "name": "Delayed make contact, on-delay",
+  "pins": [
+    {
+      "at": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "17"
+    },
+    {
+      "at": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "dir": "down",
+      "name": "18"
+    }
+  ],
+  "role": "auxiliary",
+  "tag_at": {
+    "x": -7.0,
+    "y": 8.0
+  }
+}

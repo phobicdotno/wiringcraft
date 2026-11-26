@@ -17,7 +17,7 @@
 //! The archive is treated as hostile: file sizes, the number of files and the bytes read in all
 //! are capped, and a file that cannot be read is reported, never a panic.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 
 use wc_core::geom::{Point, Shape};
@@ -52,7 +52,7 @@ pub struct SweDrawings {
 
 /// The key a block's drawing is kept under: its name without surrounding spaces, in lower case,
 /// so `Coil .dwg` is the drawing of block `Coil` (the database's names are trimmed).
-fn block_key(name: &str) -> String {
+pub(crate) fn block_key(name: &str) -> String {
     name.trim().to_lowercase()
 }
 
@@ -311,6 +311,12 @@ fn rounded(sh: &Shape) -> Option<Shape> {
             align: *align,
             angle: round(*angle),
         },
+        Shape::Dimension { a, b, offset, height } => Shape::Dimension {
+            a: p(a),
+            b: p(b),
+            offset: round(*offset),
+            height: round(*height),
+        },
     };
     let (min, max) = shape.bounds();
     [min.x, min.y, max.x, max.y]
@@ -368,7 +374,7 @@ fn kind_of(name: &str, folder: &str) -> Option<Kind> {
 /// too; the project's own copy of a block wins over the library's. Files that cannot be read are
 /// in [`SweDrawings::warnings`].
 pub fn drawings_from_archive<R: Read + std::io::Seek>(reader: R, folder: &str) -> Result<SweDrawings> {
-    drawings_within(reader, folder, Limits::ARCHIVE)
+    drawings_within(reader, folder, Limits::ARCHIVE, None)
 }
 
 /// Byte limits on the drawing files read out of one archive.
@@ -381,14 +387,31 @@ pub(crate) struct Limits {
 }
 
 impl Limits {
-    const ARCHIVE: Limits = Limits {
+    pub(crate) const ARCHIVE: Limits = Limits {
         file: MAX_DRAWING_BYTES,
         total: MAX_DRAWINGS_TOTAL,
     };
 }
 
-/// [`drawings_from_archive`] with byte limits `lim`.
-pub(crate) fn drawings_within<R: Read + std::io::Seek>(reader: R, folder: &str, lim: Limits) -> Result<SweDrawings> {
+/// The shared library's block drawings of an archive, only for the blocks named in `blocks`
+/// ([`block_key`]s, each with how many imported blocks share it): drawings of other blocks are never read, so they cannot use up the limits
+/// before a block the library imports (#280).
+pub(crate) fn block_drawings_within<R: Read + std::io::Seek>(
+    reader: R,
+    blocks: &BTreeMap<String, usize>,
+    lim: Limits,
+) -> Result<SweDrawings> {
+    drawings_within(reader, "", lim, Some(blocks))
+}
+
+/// [`drawings_from_archive`] with byte limits `lim`; with `only`, block drawings are read only
+/// for the blocks it names ([`block_key`]s).
+pub(crate) fn drawings_within<R: Read + std::io::Seek>(
+    reader: R,
+    folder: &str,
+    lim: Limits,
+    only: Option<&BTreeMap<String, usize>>,
+) -> Result<SweDrawings> {
     let mut zip =
         zip::ZipArchive::new(reader).map_err(|e| Error::Format(format!("not a SolidWorks Electrical archive: {e}")))?;
     let folder = folder.trim_end_matches('/');
@@ -396,6 +419,11 @@ pub(crate) fn drawings_within<R: Read + std::io::Seek>(reader: R, folder: &str, 
         .filter_map(|i| {
             let name = zip.name_for_index(i)?.to_owned();
             let kind = kind_of(&name, folder)?;
+            if let (Kind::Block(block, _), Some(only)) = (&kind, only)
+                && !only.contains_key(&block_key(block))
+            {
+                return None;
+            }
             Some((i, name, kind))
         })
         .collect();
@@ -404,18 +432,32 @@ pub(crate) fn drawings_within<R: Read + std::io::Seek>(reader: R, folder: &str, 
     let mut out = SweDrawings::default();
     let mut failed: Vec<String> = Vec::new();
     let mut left_out = 0usize;
+    // Blocks of the files left out by a limit, which stay boxes unless another file draws them.
+    let mut left_blocks: BTreeSet<String> = BTreeSet::new();
     let mut total = 0u64;
     for (n, (i, name, kind)) in wanted.into_iter().enumerate() {
         if n >= MAX_DRAWING_FILES || total >= lim.total {
             left_out += 1;
+            if let Kind::Block(block, _) = &kind {
+                left_blocks.insert(block_key(block));
+            }
             continue;
         }
         // Every byte read counts against the total, also of a file then refused.
-        let (got, read) = read_entry(&mut zip, i, &name, lim, lim.total - total);
+        let left = lim.total - total;
+        let (got, read) = read_entry(&mut zip, i, &name, lim, left);
         total += read;
         let bytes = match got {
             Ok(b) => b,
             Err(e) => {
+                // Refused for what was left of the total, not for its own size: a limit, like
+                // the files left out above.
+                if left < lim.file
+                    && read > left
+                    && let Kind::Block(block, _) = &kind
+                {
+                    left_blocks.insert(block_key(block));
+                }
                 failed.push(e.to_string());
                 continue;
             }
@@ -441,9 +483,24 @@ pub(crate) fn drawings_within<R: Read + std::io::Seek>(reader: R, folder: &str, 
         }
         out.warnings.push(w);
     }
+    // Imported blocks a limit left without any drawing; blocks sharing a name each count.
+    let boxes: usize = left_blocks
+        .iter()
+        .filter(|b| !out.blocks.contains_key(*b))
+        .map(|b| only.and_then(|o| o.get(b)).copied().unwrap_or(1))
+        .sum();
     if left_out > 0 {
-        out.warnings.push(format!(
+        let mut w = format!(
             "{left_out} drawing file(s) were not read: the archive has more than {MAX_DRAWING_FILES} files or {} MB of drawings",
+            lim.total >> 20
+        );
+        if only.is_some() {
+            w.push_str(&format!("; {boxes} block(s) stay boxes"));
+        }
+        out.warnings.push(w);
+    } else if only.is_some() && boxes > 0 {
+        out.warnings.push(format!(
+            "{boxes} block(s) stay boxes: their drawings would take the archive past {} MB of drawings",
             lim.total >> 20
         ));
     }
@@ -492,7 +549,7 @@ fn read_entry<R: Read + std::io::Seek>(
 /// Points that bound `shape`: for an arc only what it sweeps (its ends and the quarter points
 /// it passes), not its whole circle.
 /// How far from the page origin a footprint drawn from a block may reach, in millimetres.
-const MAX_COORD: f64 = 1e6;
+pub(super) const MAX_COORD: f64 = 1e6;
 
 /// The linear map that places a symbol's block: turned by its angle, then scaled along the
 /// page axes, exactly as [`super::place`] places its points.

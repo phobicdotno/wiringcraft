@@ -78,6 +78,7 @@ fn finite(s: &Shape) -> bool {
             end,
         } => p(center) && radius.is_finite() && start.is_finite() && end.is_finite(),
         Shape::Text { at, height, angle, .. } => p(at) && height.is_finite() && angle.is_finite(),
+        Shape::Dimension { a, b, offset, height } => p(a) && p(b) && offset.is_finite() && height.is_finite(),
     }
 }
 
@@ -284,6 +285,7 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
         _ => SymbolRole::Standalone,
     };
     let symbol = Symbol {
+        source: String::new(),
         id: id.to_owned(),
         name: qet_name.clone(),
         category: String::new(),
