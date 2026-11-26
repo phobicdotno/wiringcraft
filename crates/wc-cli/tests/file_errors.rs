@@ -38,18 +38,15 @@ fn inspecting_a_missing_file_names_it() -> TestResult {
 #[test]
 fn a_pdf_with_nothing_to_print_is_not_written() -> TestResult {
     // A project without pages, exported without reports, has no sheet to print (#833).
+    // `page remove` keeps the last page (#847), so the page file is deleted by hand, as a
+    // project edited outside WiringCraft could be.
     let tmp = tempfile::tempdir()?;
     let made = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
         .current_dir(tmp.path())
         .args(["new", "p", "--no-git"])
         .output()?;
     assert!(made.status.success());
-    let removed = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
-        .current_dir(tmp.path())
-        .env_remove(wc_core::guard::GUARD_ENV)
-        .args(["-C", "p", "page", "remove", "p0001"])
-        .output()?;
-    assert!(removed.status.success(), "{}", String::from_utf8_lossy(&removed.stderr));
+    std::fs::remove_file(tmp.path().join("p").join("pages").join("p0001.page.json"))?;
     let err = wiringcraft(tmp.path(), &["-C", "p", "pdf", "out.pdf"])?;
     assert!(err.contains("nothing to export: the project has no pages"), "{err}");
     assert!(!tmp.path().join("p").join("out.pdf").exists());

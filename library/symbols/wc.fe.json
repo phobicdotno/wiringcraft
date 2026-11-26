@@ -1,0 +1,77 @@
+{
+  "category": "power",
+  "description": "Functional (signal) earth: 0 V references, signal grounds and screen earthing. Not a protective earth; use wc.pe for the protective conductor.",
+  "graphics": [
+    {
+      "a": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 5.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": -4.0,
+        "y": 5.0
+      },
+      "b": {
+        "x": 4.0,
+        "y": 5.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": -2.6,
+        "y": 6.5
+      },
+      "b": {
+        "x": 2.6,
+        "y": 6.5
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": -1.2,
+        "y": 8.0
+      },
+      "b": {
+        "x": 1.2,
+        "y": 8.0
+      },
+      "kind": "line"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "FE"
+    }
+  ],
+  "id": "wc.fe",
+  "letter_code": "",
+  "name": "Functional earth",
+  "pins": [
+    {
+      "at": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "FE"
+    }
+  ],
+  "role": "standalone",
+  "tag_at": {
+    "x": 4.0,
+    "y": 3.0
+  }
+}

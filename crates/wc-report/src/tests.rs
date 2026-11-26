@@ -355,6 +355,189 @@ fn cable_list_groups_cores_by_cable() {
 }
 
 #[test]
+fn check_names_a_cable_core_on_two_connections() {
+    let (mut p, s, parts) = fixture();
+    let found = |p: &Project| {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        check(&i)
+            .into_iter()
+            .filter(|f| f.message.contains("cable core"))
+            .map(|f| (f.page_id, f.item, f.message))
+            .collect::<Vec<_>>()
+    };
+    let set_core = |p: &mut Project, page: usize, id: &str, core: &str| {
+        if let Some(w) = p.pages[page].wires.iter_mut().find(|w| w.id == id) {
+            w.cable = Some(wc_core::CableCore {
+                cable: DeviceTag::parse("-W1").unwrap(),
+                core: core.into(),
+            });
+        }
+    };
+    // w2 (-K1:14 to -X1.1:1) and w4 (-K1:A2 to -X2:1) are two connections.
+    set_core(&mut p, 0, "w2", "1");
+    set_core(&mut p, 0, "w4", "2");
+    assert!(found(&p).is_empty());
+    // A core drawn in two pieces of one connection is one conductor.
+    p.pages[0].wires.push(wire(
+        "w5",
+        pin("s4", "1"),
+        Endpoint::Point {
+            at: Point::new(110.0, 60.0),
+        },
+        None,
+        None,
+    ));
+    set_core(&mut p, 0, "w5", "1");
+    assert!(found(&p).is_empty());
+    // A wire naming only the cable names no core.
+    set_core(&mut p, 0, "w3", "");
+    set_core(&mut p, 0, "w1", " ");
+    assert!(found(&p).is_empty());
+    // A repeat on an overview page does not count.
+    let mut overview = p.pages[0].clone();
+    overview.id = "ov".into();
+    overview.number = "1".into();
+    overview.overview = true;
+    if let Some(c) = overview
+        .wires
+        .iter_mut()
+        .find(|w| w.id == "w4")
+        .and_then(|w| w.cable.as_mut())
+    {
+        c.core = "1".into();
+    }
+    p.pages.insert(0, overview);
+    assert!(found(&p).is_empty());
+    // The same core on a second connection is named on the second one's wire.
+    set_core(&mut p, 1, "w4", "1");
+    assert_eq!(
+        found(&p),
+        [(
+            Some("p2".to_owned()),
+            Some("w4".to_owned()),
+            "cable core -W1:1 is on 2 connections".to_owned()
+        )]
+    );
+    // Wire ids need not be unique on a page (a replaced page can repeat them): the second
+    // connection's wire still counts when it shares the first one's id.
+    let w4 = p.pages[1].wires.iter_mut().find(|w| w.id == "w4");
+    let Some(w4) = w4 else {
+        unreachable!("the fixture has w4")
+    };
+    w4.id = "w2".into();
+    assert_eq!(
+        found(&p),
+        [(
+            Some("p2".to_owned()),
+            Some("w2".to_owned()),
+            "cable core -W1:1 is on 2 connections".to_owned()
+        )]
+    );
+}
+
+#[test]
+fn check_cable_cores_ignore_overview_wiring_that_joins_connections() {
+    let (mut p, s, parts) = fixture();
+    let found = |p: &Project| {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        check(&i)
+            .into_iter()
+            .filter(|f| f.message.contains("cable core"))
+            .map(|f| (f.page_id, f.item, f.message))
+            .collect::<Vec<_>>()
+    };
+    // w1 (24V, at -K1:A1) and w4 (0V, at -K1:A2) are two connections sharing core -W1:1.
+    for w in p.pages[0].wires.iter_mut().filter(|w| w.id == "w1" || w.id == "w4") {
+        w.cable = Some(wc_core::CableCore {
+            cable: DeviceTag::parse("-W1").unwrap(),
+            core: "1".into(),
+        });
+    }
+    let expected = [(
+        Some("p2".to_owned()),
+        Some("w4".to_owned()),
+        "cable core -W1:1 is on 2 connections".to_owned(),
+    )];
+    assert_eq!(found(&p), expected);
+    // An overview page whose wiring joins the 24V and 0V potentials into one net.
+    let mut overview = Page::new("ov", "1", "Overview");
+    overview.overview = true;
+    let mid = Point::new(20.0, 20.0);
+    overview.wires = vec![
+        wire(
+            "o1",
+            Endpoint::Point {
+                at: Point::new(10.0, 20.0),
+            },
+            Endpoint::Point { at: mid },
+            None,
+            Some("24V"),
+        ),
+        wire(
+            "o2",
+            Endpoint::Point { at: mid },
+            Endpoint::Point {
+                at: Point::new(30.0, 20.0),
+            },
+            None,
+            Some("0V"),
+        ),
+    ];
+    p.pages.insert(0, overview);
+    assert_eq!(found(&p), expected);
+}
+
+#[test]
+fn wires_on_an_overview_page_are_not_listed_twice() {
+    let (mut p, s, parts) = fixture();
+    let w1 = DeviceTag::parse("-W1").unwrap();
+    if let Some(w) = p.pages[0].wires.iter_mut().find(|w| w.id == "w2") {
+        w.cable = Some(wc_core::CableCore {
+            cable: w1,
+            core: "1".into(),
+        });
+    }
+    let lists = |p: &Project| {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        (wire_list(&i).rows, cable_list(&i).rows)
+    };
+    let schematic = p.pages[0].number.clone();
+    let (wires, cables) = lists(&p);
+    // The baseline lists the schematic's cable core, so the checks below compare real rows.
+    assert_eq!(cables.len(), 1);
+    assert_eq!(cables[0][0], "-W1");
+    assert_eq!(cables[0][3], "1");
+    assert_eq!(cables[0][4], schematic);
+    // The same schematic again, drawn on a line diagram.
+    let mut overview = p.pages[0].clone();
+    overview.id = "p9".into();
+    overview.number = "9".into();
+    overview.overview = true;
+    p.pages.push(overview);
+    let (same_wires, same_cables) = lists(&p);
+    assert_eq!(same_wires.len(), wires.len(), "an overview page adds no wire rows");
+    assert_eq!(same_cables, cables, "an overview page adds no cable rows");
+    p.pages.last_mut().unwrap().overview = false;
+    let (more_wires, more_cables) = lists(&p);
+    assert!(more_wires.len() > wires.len(), "a normal page does");
+    assert_eq!(more_cables.len(), cables.len() + 1, "one more core row");
+    assert_eq!(more_cables[0], cables[0]);
+    assert_eq!(more_cables[1][..5], ["", "", "", "1", "9"], "the copied page's core");
+}
+
+#[test]
 fn project_check_finds_the_usual_mistakes() {
     let (mut p, s, parts) = fixture();
     {
@@ -436,6 +619,22 @@ fn a_coil_drawn_only_on_an_overview_page_still_exists_for_its_contacts() {
     assert!(!check(&i).iter().any(|f| f.message.contains("contact -K9 has no coil")));
 }
 
+/// The `FileName` attribute of the `CAEXFile` element in `xml`, as an XML reader sees it.
+fn caex_file_name(xml: &str) -> Option<String> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    loop {
+        match reader.read_event().ok()? {
+            Event::Start(e) | Event::Empty(e) if e.name().as_ref() == b"CAEXFile" => {
+                let attr = e.try_get_attribute("FileName").ok()??;
+                return Some(attr.unescape_value().ok()?.into_owned());
+            }
+            Event::Eof => return None,
+            _ => {}
+        }
+    }
+}
+
 #[test]
 fn automationml_has_devices_pins_and_one_link_per_join() {
     let (mut p, mut s, parts) = fixture();
@@ -457,7 +656,7 @@ fn automationml_has_devices_pins_and_one_link_per_join() {
         symbols: &s,
         parts: &parts,
     };
-    let (xml, counts) = automationml(&i, "2026-11-16T22:00:00Z");
+    let (xml, counts) = automationml(&i, "2026-11-16T22:00:00Z", "plant-v2.aml");
     // K1, -P1, -X1.1, -X1.2, -X2; not the interruption point.
     assert_eq!(counts.devices, 5, "{xml}");
     assert!(!xml.contains("-L1"));
@@ -468,12 +667,31 @@ fn automationml_has_devices_pins_and_one_link_per_join() {
     assert!(xml.contains("<Value>R-24, DC</Value>") && xml.contains("<Value>Acme</Value>"));
     assert!(xml.contains("Name=\"Coil &lt;voltage&gt;\"") && xml.contains("<Value>24 V &amp; more</Value>"));
     assert!(xml.contains("LastWritingDateTime=\"2026-11-16T22:00:00Z\""));
+    // FileName names the file written, not the project.
+    assert!(xml.contains("<CAEXFile FileName=\"plant-v2.aml\""), "{xml}");
+    // Without a file name, the project name stands in.
+    let fallback = automationml(&i, "2026-11-16T22:00:00Z", "").0;
+    assert!(fallback.contains("<CAEXFile FileName=\"Test.aml\""), "{fallback}");
+    // A file name is kept exactly as given, spaces included.
+    let spaced = automationml(&i, "2026-11-16T22:00:00Z", " plant-v2.aml").0;
+    assert!(spaced.contains("<CAEXFile FileName=\" plant-v2.aml\""), "{spaced}");
+    // Tab, line feed and carriage return survive attribute normalisation as character
+    // references; U+0085 is allowed in XML 1.0 and kept, U+FFFE is not and is dropped.
+    let odd = automationml(&i, "2026-11-16T22:00:00Z", "a\tb\nc\rd\u{85}e\u{FFFE}f.aml").0;
+    assert!(
+        odd.contains("<CAEXFile FileName=\"a&#9;b&#10;c&#13;d\u{85}ef.aml\""),
+        "{odd}"
+    );
+    // An XML reader gets the file name back exactly, tab, line feed and carriage return included.
+    let name = "a\tb\nc\rd.aml";
+    let xml_name = automationml(&i, "2026-11-16T22:00:00Z", name).0;
+    assert_eq!(caex_file_name(&xml_name).as_deref(), Some(name), "{xml_name}");
     // The coil and the contact are one device with all four connection points.
     let k1 = xml.split("<InternalElement Name=\"=A+C1-K1\"").nth(1).unwrap();
     let k1 = k1.split("</InternalElement>").next().unwrap();
     assert_eq!(k1.matches("<ExternalInterface").count(), 4);
     // The same project gives the same file.
-    assert_eq!(automationml(&i, "2026-11-16T22:00:00Z").0, xml);
+    assert_eq!(automationml(&i, "2026-11-16T22:00:00Z", "plant-v2.aml").0, xml);
 }
 
 #[test]
@@ -2871,6 +3089,176 @@ fn plc_card_overview_links_by_page_id_and_warns_on_points_and_shared_bytes() {
 }
 
 #[test]
+fn check_names_a_connection_with_two_wire_numbers_and_a_number_on_two_connections() {
+    let (mut p, s, parts) = fixture();
+    let found = |p: &Project| {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        check(&i)
+            .into_iter()
+            .filter(|f| f.message.contains("wire number"))
+            .map(|f| (f.item.unwrap_or_default(), f.message))
+            .collect::<Vec<_>>()
+    };
+    assert!(found(&p).is_empty(), "the fixture's numbers are fine");
+    // The lamp's X2 joins the connection of wire 3 through a wire numbered 10.
+    p.pages[0]
+        .wires
+        .push(wire("w8", pin("s6", "X1"), pin("s5", "2"), Some(" 10 "), None));
+    assert_eq!(
+        found(&p),
+        [("w3".to_owned(), "one connection has wire numbers 3 and 10".to_owned())]
+    );
+    // Number 2 again on the separate connection of wire 3: on two connections now.
+    p.pages[0].wires[2].number = Some("2".into());
+    p.pages[0].wires.pop();
+    assert_eq!(
+        found(&p),
+        [("w3".to_owned(), "wire number 2 is on 2 connections".to_owned())]
+    );
+    // A copy on an overview page repeats the connection on purpose.
+    p.pages[0].wires[2].number = Some("3".into());
+    let mut overview = Page::new("p9", "9", "Line diagram");
+    overview.overview = true;
+    overview.symbols.push(place("s20", "lamp", 100.0, Some("-P1")));
+    overview
+        .wires
+        .push(wire("w20", pin("s20", "X1"), pin("s20", "X2"), Some("2"), None));
+    p.pages.push(overview);
+    assert!(found(&p).is_empty());
+}
+
+#[test]
+fn wire_numbers_tell_apart_same_id_wires_of_separate_connections() {
+    let (mut p, s, parts) = fixture();
+    let found = |p: &Project| {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        check(&i)
+            .into_iter()
+            .filter(|f| f.message.contains("wire number"))
+            .map(|f| (f.item.unwrap_or_default(), f.message))
+            .collect::<Vec<_>>()
+    };
+    // Wire ids need not be unique on a page (a replaced page can repeat them): w3 takes w2's id
+    // and stays a separate connection.
+    p.pages[0].wires[2].id = "w2".into();
+    assert!(found(&p).is_empty(), "two connections with numbers 2 and 3");
+    // The same number on both is a number on two connections.
+    p.pages[0].wires[2].number = Some("2".into());
+    assert_eq!(
+        found(&p),
+        [("w2".to_owned(), "wire number 2 is on 2 connections".to_owned())]
+    );
+}
+
+#[test]
+fn wire_numbers_ignore_overview_wiring_that_joins_connections() {
+    let (mut p, s, parts) = fixture();
+    let found = |p: &Project| {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        check(&i)
+            .into_iter()
+            .filter(|f| f.message.contains("wire number"))
+            .map(|f| (f.item.unwrap_or_default(), f.message))
+            .collect::<Vec<_>>()
+    };
+    // w1 (24V, numbered 1) and w4 (0V) are two connections; w4 takes number 1 too.
+    p.pages[0].wires[3].number = Some("1".into());
+    let expected = [("w4".to_owned(), "wire number 1 is on 2 connections".to_owned())];
+    assert_eq!(found(&p), expected);
+    // An overview page whose wiring joins the 24V and 0V potentials into one net.
+    let mut overview = Page::new("ov", "1", "Overview");
+    overview.overview = true;
+    let mid = Point::new(20.0, 20.0);
+    overview.wires = vec![
+        wire(
+            "o1",
+            Endpoint::Point {
+                at: Point::new(10.0, 20.0),
+            },
+            Endpoint::Point { at: mid },
+            None,
+            Some("24V"),
+        ),
+        wire(
+            "o2",
+            Endpoint::Point { at: mid },
+            Endpoint::Point {
+                at: Point::new(30.0, 20.0),
+            },
+            None,
+            Some("0V"),
+        ),
+    ];
+    p.pages.insert(0, overview);
+    assert_eq!(found(&p), expected);
+    // With w4 numbered 4 the two connections do not become one with numbers 1 and 4.
+    p.pages[1].wires[3].number = Some("4".into());
+    assert!(found(&p).is_empty());
+}
+
+#[test]
+fn a_repeated_wire_number_is_named_on_the_connection_drawn_second() {
+    let (mut p, s, parts) = fixture();
+    // Connection a is drawn first by an unnumbered wire; b's wire takes 7 before a's second does.
+    p.pages[0].wires = vec![
+        wire("a0", pin("s2", "14"), pin("s4", "1"), None, None),
+        wire("b0", pin("s4", "2"), pin("s6", "X1"), Some("7"), None),
+        wire("a1", pin("s4", "1"), pin("s2", "13"), Some("7"), None),
+    ];
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found: Vec<_> = check(&i)
+        .into_iter()
+        .filter(|f| f.message.contains("wire number"))
+        .map(|f| (f.item.unwrap_or_default(), f.message))
+        .collect();
+    assert_eq!(
+        found,
+        [("b0".to_owned(), "wire number 7 is on 2 connections".to_owned())]
+    );
+}
+
+#[test]
+fn two_wire_numbers_on_one_connection_are_named_on_its_first_wire_even_unnumbered() {
+    let (mut p, s, parts) = fixture();
+    // One connection drawn first by an unnumbered wire, then by wires numbered 7 and 8.
+    p.pages[0].wires = vec![
+        wire("a0", pin("s2", "14"), pin("s4", "1"), None, None),
+        wire("a1", pin("s4", "1"), pin("s2", "13"), Some("7"), None),
+        wire("a2", pin("s2", "13"), pin("s4", "1"), Some("8"), None),
+    ];
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found: Vec<_> = check(&i)
+        .into_iter()
+        .filter(|f| f.message.contains("wire number"))
+        .map(|f| (f.item.unwrap_or_default(), f.message))
+        .collect();
+    assert_eq!(
+        found,
+        [("a0".to_owned(), "one connection has wire numbers 7 and 8".to_owned())]
+    );
+}
+
+#[test]
 fn rows_of_the_wire_cable_terminal_and_plc_lists_link_to_their_page() {
     let (mut p, mut s, parts) = fixture();
     let mut input = sym("wc.plc.input", SymbolRole::Standalone, &["I"]);
@@ -3011,4 +3399,113 @@ fn check_keeps_panel_devices_whose_tag_is_only_drawn_as_interruption_points() {
     assert!(!found.iter().any(|m| m.starts_with("panel ")), "{found:?}");
     // The tag still only names a connection, so it gets no "has no part" note.
     assert!(!found.iter().any(|m| m == "-L1 has no part"), "{found:?}");
+}
+
+#[test]
+fn markdown_cells_with_a_backslash_keep_their_columns() {
+    let mut t = Table::new("Paths", &["Path", "Text", "Next"]);
+    t.rows.push(vec!["C:\\".into(), "a\\|b".into(), "next".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Paths\n\n| Path | Text | Next |\n|---|---|---|\n| C:\\\\ | a\\\\\\|b | next |\n"
+    );
+}
+
+#[test]
+fn markdown_cells_show_markdown_characters_as_typed() {
+    let mut t = Table::new("Notes", &["*Tag*", "Text"]);
+    t.rows
+        .push(vec!["*a*".into(), "b_c_d `x` <tag> [l](u) ~s~ & ![i](p)".into()]);
+    t.rows.push(vec!["#1".into(), "-K1 2.5 mm² plain".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Notes\n\n| \\*Tag\\* | Text |\n|---|---|\n\
+         | \\*a\\* | b\\_c\\_d \\`x\\` &lt;tag&gt; \\[l\\](u) \\~s\\~ \\& \\!\\[i\\](p) |\n\
+         | \\#1 | -K1 2.5 mm² plain |\n"
+    );
+}
+
+#[test]
+fn markdown_cells_keep_links_as_typed() {
+    let mut t = Table::new("Links", &["Text"]);
+    t.rows.push(vec!["see https://example.com/a_b *x*".into()]);
+    t.rows.push(vec!["(www.x.no/a_b|c), mail a_b@x.no or a_b@c".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Links\n\n| Text |\n|---|\n\
+         | see https://example.com/a_b \\*x\\* |\n\
+         | (www\\.x.no/a\\_b\\|c), mail a_b@x.no or a\\_b@c |\n"
+    );
+}
+
+#[test]
+fn markdown_cells_escape_words_that_only_look_like_links() {
+    let mut t = Table::new("Links", &["Text"]);
+    t.rows.push(vec!["https://*spare*/path".into()]);
+    t.rows.push(vec!["https://example.com/&copy;".into()]);
+    t.rows.push(vec!["https://example.com/a_b. www.a_b.no".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Links\n\n| Text |\n|---|\n\
+         | https://\\*spare\\*/path |\n\
+         | https\\://example.com/\\&copy; |\n\
+         | https://example.com/a_b. www.a\\_b.no |\n"
+    );
+}
+
+#[test]
+fn markdown_cells_keep_backslashes_in_links_as_typed() {
+    let mut t = Table::new("Links", &["Text"]);
+    t.rows.push(vec!["https://example.com/a\\b".into()]);
+    t.rows
+        .push(vec!["https://example.com/a\\|b https://example.com/c\\".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Links\n\n| Text |\n|---|\n\
+         | https://example.com/a\\b |\n\
+         | https\\://example.com/a\\\\\\|b https\\://example.com/c\\\\ |\n"
+    );
+}
+
+#[test]
+fn markdown_cells_escape_an_uppercase_www_word() {
+    let mut t = Table::new("Links", &["Text"]);
+    t.rows
+        .push(vec!["WWW.example.com/*spare*/path HTTPS://example.com/a_b".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Links\n\n| Text |\n|---|\n\
+         | WWW.example.com/\\*spare\\*/path HTTPS://example.com/a_b |\n"
+    );
+}
+
+#[test]
+fn markdown_links_with_text_that_needs_a_backslash_are_written_as_text() {
+    let mut t = Table::new("Links", &["Text"]);
+    t.rows
+        .push(vec!["https://example.com/a_b, https://example.com/a_b*".into()]);
+    t.rows
+        .push(vec!["a_b@x.no&amp; www.x.no/a_b&copy; www.x.no/a_b.".into()]);
+    t.rows
+        .push(vec!["https://example.com/a|b https://example.com/a\\".into()]);
+    t.rows.push(vec!["HTTP://example.com/a\\|b".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Links\n\n| Text |\n|---|\n\
+         | https://example.com/a_b, https\\://example.com/a\\_b\\* |\n\
+         | <a_b@x.no>\\&amp; www\\.x.no/a\\_b\\&copy; www.x.no/a_b. |\n\
+         | https\\://example.com/a\\|b https\\://example.com/a\\\\ |\n\
+         | HTTP\\://example.com/a\\\\\\|b |\n"
+    );
+}
+
+#[test]
+fn markdown_email_with_text_after_it_is_bracketed_only_when_commonmark_takes_it() {
+    let mut t = Table::new("Mail", &["Text"]);
+    t.rows.push(vec!["a@x_y.no* a_b@x.no&amp; a@-x.no_ a@x.no".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Mail\n\n| Text |\n|---|\n\
+         | a\\@x\\_y.no\\* <a_b@x.no>\\&amp; a\\@-x.no\\_ a@x.no |\n"
+    );
 }

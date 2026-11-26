@@ -379,8 +379,12 @@ fn put_back_files(written: &Written) -> (Vec<String>, Vec<String>, Unwritten) {
 /// What [`Open::back_to`] goes back to, or [`Open::keep`] builds on.
 pub(crate) struct Mark {
     kept: Kept,
-    symbols: std::collections::BTreeSet<String>,
+    /// The symbols loaded at the mark, so one the change replaced (a pinned version loaded
+    /// over another, say) is put back too.
+    symbols: BTreeMap<String, Symbol>,
     parts: std::collections::BTreeSet<String>,
+    /// The symbol list as it was: a symbol the change loaded may have added or changed a row.
+    library: Vec<LibraryEntry>,
     /// The vendored symbol and part files there were, or why that is not known.
     files: Result<std::collections::BTreeSet<(ItemKind, String)>, String>,
     /// Where the change's own project file edits start in [`Open::mark_edits`].
@@ -419,13 +423,39 @@ fn vendor_names(dir: &Path) -> Result<std::collections::BTreeSet<(ItemKind, Stri
     Ok(out)
 }
 
+/// One symbol in the symbol list: what the list shows, searches and offers to place.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LibraryEntry {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+}
+
+impl LibraryEntry {
+    /// The entry for symbol `s` listed under `id`.
+    pub fn of(id: &str, s: &Symbol) -> Self {
+        Self {
+            id: id.to_owned(),
+            name: s.name.clone(),
+            description: s.description.clone(),
+        }
+    }
+
+    /// Whether every word of `query` appears, ignoring case, in the id, name or description.
+    /// An empty query matches everything.
+    pub fn matches(&self, query: &str) -> bool {
+        let hay = format!("{} {} {}", self.id, self.name, self.description).to_lowercase();
+        query.to_lowercase().split_whitespace().all(|w| hay.contains(w))
+    }
+}
+
 pub struct Open {
     pub dir: PathBuf,
     pub project: Project,
     /// The project's vendored symbols.
     pub symbols: BTreeMap<String, Symbol>,
-    /// Ids of every symbol in the project's library sources (for the picker).
-    pub library: Vec<(String, String)>,
+    /// Every symbol in the project and its library sources (for the picker), by id.
+    pub library: Vec<LibraryEntry>,
     /// The check rules of the project's library sources, read with the library
     /// ([`Open::refresh_library`]) so checks while drawing need not read files.
     pub library_rules: Vec<wc_core::check_rule::RuleSet>,
@@ -485,6 +515,10 @@ pub struct Open {
     /// and does not write over it unasked (#662). Once the user chose to write over it, what
     /// it held then: a later change is asked about again.
     unwritten_found: BTreeMap<PathBuf, Found>,
+    /// For each of [`Open::unwritten_files`] that is a symbol file [`Open::back_to`] queued to
+    /// be repaired: the symbol id and the version (content hash) it is to hold, so a change
+    /// taken back around it can retarget or let it go when the pin it puts back differs.
+    symbol_repairs: BTreeMap<PathBuf, (String, String)>,
     /// Project files rewritten while a [`Mark`] is open (`marks` counts them), oldest first,
     /// so [`Open::back_to`] puts them back even when their undo steps fell off the history.
     mark_edits: Vec<FileEdit>,
@@ -574,6 +608,7 @@ impl Open {
             unrestored_files: BTreeMap::new(),
             unwritten_files: BTreeMap::new(),
             unwritten_found: BTreeMap::new(),
+            symbol_repairs: BTreeMap::new(),
             mark_edits: Vec::new(),
             command_translations: None,
             marks: 0,
@@ -674,19 +709,29 @@ impl Open {
         }
     }
 
-    pub fn refresh_library(&mut self) {
-        let mut items: BTreeMap<String, String> =
-            self.symbols.iter().map(|(k, s)| (k.clone(), s.name.clone())).collect();
+    /// Rebuild the symbol list from the loaded vendored symbols and the library sources, so
+    /// each entry carries the name and description of the version in use.
+    fn relist_symbols(&mut self) {
+        let mut items: BTreeMap<String, LibraryEntry> = self
+            .symbols
+            .iter()
+            .map(|(k, s)| (k.clone(), LibraryEntry::of(k, s)))
+            .collect();
         if let Ok(lib) = wc_library::Library::open(&self.dir, &self.project) {
             for id in lib.index(ItemKind::Symbol).into_keys() {
                 if !items.contains_key(&id)
                     && let Ok((s, _)) = lib.symbol(&id)
                 {
-                    items.insert(id, s.name);
+                    let entry = LibraryEntry::of(&id, &s);
+                    items.insert(id, entry);
                 }
             }
         }
-        self.library = items.into_iter().collect();
+        self.library = items.into_values().collect();
+    }
+
+    pub fn refresh_library(&mut self) {
+        self.relist_symbols();
         self.library_rules = wc_library::library_rules(&self.dir, &self.project);
         self.touch();
 
@@ -1199,6 +1244,13 @@ impl Open {
         changed
     }
 
+    /// Follow the terminals from `before` (numbers taken earlier) to now: for taking a change
+    /// back, the jumpers go back with their terminals the way they followed them there.
+    pub fn follow_terminals_from(&mut self, before: wc_core::project::TerminalNumbers) -> bool {
+        self.terminals_before = Some(before);
+        self.follow_terminals()
+    }
+
     /// Forget the change in progress without following it: the project was replaced as a whole
     /// (undo, redo, a command's result), and its jumpers already belong to its drawing.
     pub fn forget_terminal_change(&mut self) {
@@ -1451,13 +1503,18 @@ impl Open {
         }
     }
 
-    /// After an undo or redo: rebuild the library list when the step added or removed a library
+    /// After an undo or redo: rebuild the library lists when the step added or removed a library
     /// source (`sources_changed`), so symbols of a source that is gone are no longer offered and
-    /// those of one that came back are; then load every part a device uses that is not loaded,
+    /// those of one that came back are, and otherwise rebuild the symbol list, so a symbol whose
+    /// version the step changed is listed with its own name and description; then load every part a device uses that is not loaded,
     /// since a redo can bring back an assignment whose part an earlier rebuild dropped.
     fn follow_step(&mut self, sources_changed: bool) {
         if sources_changed {
             self.refresh_library();
+        } else {
+            // The step may have brought back another version of a vendored symbol: list it
+            // with its own name and description.
+            self.relist_symbols();
         }
         let missing: Vec<String> = self
             .project
@@ -1704,6 +1761,7 @@ impl Open {
         }
         for (id, _) in &wanted {
             self.stale_symbol_files.remove(id);
+            self.symbol_file_written(id);
         }
         for (id, want) in wanted {
             if let Some(old) = self.symbols.insert(id, want) {
@@ -2121,6 +2179,7 @@ impl Open {
             // What the file holds now, as WiringCraft left it: a later change is from outside.
             self.unwritten_found
                 .insert(rel.clone(), Found::of(snapshot_file(&path)));
+            self.symbol_repairs.remove(&rel);
             if replace {
                 self.unwritten_files.insert(rel, should);
             } else {
@@ -2134,6 +2193,7 @@ impl Open {
     fn drop_unwritten(&mut self, rel: &Path) {
         self.unwritten_files.remove(rel);
         self.unwritten_found.remove(rel);
+        self.symbol_repairs.remove(rel);
     }
 
     /// The first project file waiting to be written again ([`Open::keep_unwritten`]) that was
@@ -2159,6 +2219,10 @@ impl Open {
     /// to it is dropped, and the next save leaves the file as it is.
     pub fn keep_outside_version(&mut self, path: &Path) {
         let rel = path.strip_prefix(&self.dir).unwrap_or(path).to_path_buf();
+        // A symbol file kept that way is not written with the loaded version either.
+        if let Some((id, _)) = self.symbol_repairs.get(&rel) {
+            self.stale_symbol_files.remove(id);
+        }
         self.drop_unwritten(&rel);
     }
 
@@ -2298,6 +2362,12 @@ impl Open {
                 },
                 // Nothing known about what was there: written as before.
                 None => restore_file(&path, should.as_deref()).map_err(cannot)?,
+            }
+            // A symbol file repaired with the loaded version is not written again unchecked.
+            if let Some((id, hash)) = self.symbol_repairs.get(&rel)
+                && self.symbols.get(id).is_some_and(|s| s.hash() == *hash)
+            {
+                self.stale_symbol_files.remove(id);
             }
             self.drop_unwritten(&rel);
         }
@@ -2521,6 +2591,7 @@ impl Open {
         // Project files waiting to be written are named relative to the folder: the copy's.
         let old_unwritten = self.unwritten_files.clone();
         let old_found = self.unwritten_found.clone();
+        let old_repairs = self.symbol_repairs.clone();
         self.unrestored_files = old_unrestored
             .iter()
             .map(|(path, f)| {
@@ -2539,6 +2610,7 @@ impl Open {
             self.unrestored_files = old_unrestored;
             self.unwritten_files = old_unwritten;
             self.unwritten_found = old_found;
+            self.symbol_repairs = old_repairs;
             return Err(format!(
                 "{e}\n{}; you are still working in {}.",
                 discard(),
@@ -2561,6 +2633,7 @@ impl Open {
     pub fn ensure_symbols<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
         self.touch();
         let (lock, symbols) = (self.project.lock.clone(), self.symbols.clone());
+        let library = self.library.clone();
         // Putting a terminal copy back follows terminals: jumpers, rail orders and the device
         // data and panel places of spares a strip took along all go back too.
         let (meta, terminals) = (self.project.meta.clone(), self.terminals_before.clone());
@@ -2569,6 +2642,7 @@ impl Open {
             if let Err(e) = self.ensure_symbol(id) {
                 self.project.lock = lock;
                 self.symbols = symbols;
+                self.library = library;
                 self.project.meta = meta;
                 self.project.devices = devices;
                 self.project.panels = panels;
@@ -2613,7 +2687,7 @@ impl Open {
             // settled with it, and tracking starts again from the pinned copy, so putting it
             // back does not read as terminals moved.
             self.follow_terminals();
-            self.symbols.insert(id.to_owned(), fixed);
+            self.load_symbol(id, fixed);
             if self.terminals_before.is_some() {
                 self.terminals_before = Some(self.terminal_numbers());
             }
@@ -2628,8 +2702,21 @@ impl Open {
                 store::read_vendored_symbol(&self.dir, id).map_err(|e| e.to_string())?
             }
         };
-        self.symbols.insert(id.to_owned(), s);
+        self.load_symbol(id, s);
         Ok(())
+    }
+
+    /// Load `s` as the project's symbol `id`, and list it with its own name and description.
+    fn load_symbol(&mut self, id: &str, s: Symbol) {
+        let entry = LibraryEntry::of(id, &s);
+        match self.library.iter_mut().find(|e| e.id == id) {
+            Some(row) => *row = entry,
+            None => {
+                let at = self.library.partition_point(|e| e.id.as_str() < id);
+                self.library.insert(at, entry);
+            }
+        }
+        self.symbols.insert(id.to_owned(), s);
     }
 
     /// The version of symbol `id` that `pin` names: its copy in the project, or, when there is
@@ -2897,9 +2984,12 @@ impl Open {
         };
         let new = plan.symbol.clone();
         self.check_box_file_unchanged(&symbol_id, &old)?;
+        self.check_symbol_repair_baseline(&symbol_id)?;
         self.write_symbol_file(&new)?;
-        // The file holds the loaded version again: a later change on disk is checked for.
+        // The file holds the loaded version again: a later change on disk is checked for, and a
+        // repair a refused change queued for it would write an older version over this one.
         self.stale_symbol_files.remove(&symbol_id);
+        self.symbol_file_written(&symbol_id);
         self.checkpoint();
         self.project.lock.symbols.insert(
             symbol_id.clone(),
@@ -2922,6 +3012,34 @@ impl Open {
             s.at = s.at + moved;
         }
         Ok(plan.warnings)
+    }
+
+    /// Before the app writes the file of symbol `id` while a repair waits for it: refused when
+    /// another program changed the file since the app last wrote it, so that change is not
+    /// lost unasked; Save asks which version to keep.
+    fn check_symbol_repair_baseline(&self, id: &str) -> Result<(), String> {
+        let Ok(path) = store::vendor_path(&self.dir, ItemKind::Symbol, id) else {
+            return Ok(());
+        };
+        let rel = path.strip_prefix(&self.dir).unwrap_or(&path);
+        let (Some(should), Some(found)) = (self.unwritten_files.get(rel), self.unwritten_found.get(rel)) else {
+            return Ok(());
+        };
+        match found.change(snapshot_file(&path), should, &path) {
+            Some(note) => Err(format!(
+                "the file of symbol {id} was changed outside WiringCraft{note}; save the project and choose which version to keep before editing the box"
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// The file of symbol `id` was written as the project needs it: a repair waiting for it
+    /// would write another version over it, so it is let go.
+    fn symbol_file_written(&mut self, id: &str) {
+        if let Ok(path) = store::vendor_path(&self.dir, ItemKind::Symbol, id) {
+            let rel = path.strip_prefix(&self.dir).unwrap_or(&path).to_path_buf();
+            self.drop_unwritten(&rel);
+        }
     }
 
     /// Before a black box edit writes its symbol file: the file must still hold `loaded`, the
@@ -3106,6 +3224,33 @@ impl Open {
         })
     }
 
+    /// Queue the file of symbol `id` to be written with `sym` by the next save, as a repair
+    /// [`Open::back_to`] tracks. A file already waiting keeps what it held when first queued,
+    /// so a change made outside since is still asked about; otherwise what the app `wrote` to
+    /// it (what it holds now when not known). The error says why it could not be queued.
+    fn queue_symbol_repair(&mut self, id: &str, sym: &Symbol, wrote: Option<&Symbol>) -> Result<(), String> {
+        let why = |e: wc_core::Error| format!("The file of symbol {id} is not written back: {e}");
+        let path = store::vendor_path(&self.dir, ItemKind::Symbol, id).map_err(why)?;
+        let bytes = Some(store::to_json(sym).map_err(why)?.into_bytes());
+        let wrote = wrote.map(store::to_json).transpose().map_err(why)?;
+        let rel = path
+            .strip_prefix(&self.dir)
+            .map_or_else(|_| path.clone(), Path::to_path_buf);
+        if self.unwritten_found.contains_key(&rel) {
+            self.unwritten_files.insert(rel.clone(), bytes);
+            self.edited();
+        } else {
+            self.keep_unwritten(vec![(path, bytes)], true);
+            // A change another program made after the app wrote the file is asked about too.
+            if let Some(json) = wrote {
+                self.unwritten_found
+                    .insert(rel.clone(), Found::Bytes(Some(json.into_bytes())));
+            }
+        }
+        self.symbol_repairs.insert(rel, (id.to_owned(), sym.hash()));
+        Ok(())
+    }
+
     /// Start a change that may be refused as a whole: the project and the symbols and parts
     /// loaded now are kept, and the undo history is set aside, so the change's own undo steps
     /// collect apart from it. [`Open::keep`] or [`Open::back_to`] ends it. Undo and redo
@@ -3118,8 +3263,9 @@ impl Open {
         self.marks += 1;
         Mark {
             kept,
-            symbols: self.symbols.keys().cloned().collect(),
+            symbols: self.symbols.clone(),
             parts: self.parts.keys().cloned().collect(),
+            library: self.library.clone(),
             files: vendor_names(&self.dir),
             edits_from: self.mark_edits.len(),
         }
@@ -3165,13 +3311,98 @@ impl Open {
         // changed since is left as it is and named; the others are put back all the same, so
         // no file of the change stays behind unnamed.
         let mut errors: Vec<String> = self.write_back(&edits).err().into_iter().collect();
+        // The symbol versions the change pinned: the files it wrote hold those.
+        let pinned_by_change = self.project.lock.symbols.clone();
         self.put_back(mark.kept);
         if !self.unwritten_files.is_empty() {
             // A file still to be written is unsaved work, whatever the history put back says.
             self.edited();
         }
-        self.symbols.retain(|id, _| mark.symbols.contains(id));
+        // Symbols the change loaded are let go and those it replaced are put back, with the
+        // symbol list as it was. One put back that is the version the project pins again (a
+        // box edit taken back, say) is written to its file by the next save, as its file may
+        // hold the replaced version: that is unsaved work. Only a version the change pinned
+        // is taken for one it wrote: one another program wrote and that was read in meanwhile
+        // is left in its file.
+        let pin = |o: &Self, id: &str| o.project.lock.symbols.get(id).map(|e| e.hash.clone());
+        for (id, was) in &mark.symbols {
+            let replaced = self.symbols.get(id).filter(|now| now.hash() != was.hash());
+            let written = replaced
+                .filter(|now| pinned_by_change.get(id).is_some_and(|e| e.hash == now.hash()))
+                .cloned();
+            if let Some(wrote) = written
+                && pin(self, id) == Some(was.hash())
+            {
+                self.stale_symbol_files.insert(id.clone());
+                // Queued with what the app wrote there, so the next save does not write over a
+                // change another program made to it since.
+                if let Err(e) = self.queue_symbol_repair(id, was, Some(&wrote)) {
+                    errors.push(e);
+                }
+                self.edited();
+            }
+        }
+        // A file waiting for the pinned version that is now loaded, where the symbol put back
+        // is another version (a box edit taken back inside a change that is taken back too):
+        // the next save writes that pinned version to the file all the same.
+        for id in self.stale_symbol_files.clone() {
+            let (Some(now), Some(was)) = (self.symbols.get(&id), mark.symbols.get(&id)) else {
+                continue;
+            };
+            if now.hash() != was.hash() && pin(self, &id) == Some(now.hash()) {
+                let now = now.clone();
+                if let Err(e) = self.queue_symbol_repair(&id, &now, None) {
+                    errors.push(e);
+                }
+            }
+        }
+        self.symbols = mark.symbols;
+        // A file waiting to be written (from a change taken back inside this one, say) is let
+        // go when the loaded symbol is gone or not the version the project pins, so a save
+        // never writes a version the lock does not name.
+        let stale = std::mem::take(&mut self.stale_symbol_files);
+        self.stale_symbol_files = stale
+            .into_iter()
+            .filter(|id| {
+                self.symbols
+                    .get(id)
+                    .is_some_and(|s| pin(self, id).is_none_or(|h| h == s.hash()))
+            })
+            .collect();
+        // A repair queued by a change taken back inside this one is for the version that change
+        // pinned. When the pin put back now is another one, the repair is retargeted to the
+        // loaded symbol if that is the pinned version (its baseline kept, so a change made
+        // outside since is still asked about), or let go otherwise.
+        for (rel, (id, hash)) in self.symbol_repairs.clone() {
+            let wanted = pin(self, &id);
+            if wanted.as_deref() == Some(hash.as_str()) {
+                continue;
+            }
+            match self.symbols.get(&id).filter(|s| wanted == Some(s.hash())).cloned() {
+                Some(sym) => match store::to_json(&sym) {
+                    Ok(json) => {
+                        self.unwritten_files.insert(rel.clone(), Some(json.into_bytes()));
+                        self.symbol_repairs.insert(rel, (id.clone(), sym.hash()));
+                        self.stale_symbol_files.insert(id);
+                    }
+                    // The queued version is not the pinned one: let go, and the next save writes
+                    // the pinned one as the loaded symbol.
+                    Err(e) => {
+                        errors.push(format!("The file of symbol {id} is not written back as queued: {e}"));
+                        self.drop_unwritten(&rel);
+                        self.stale_symbol_files.insert(id);
+                    }
+                },
+                None => self.drop_unwritten(&rel),
+            }
+        }
+        if !self.stale_symbol_files.is_empty() || !self.symbol_repairs.is_empty() {
+            // A file still to be written back is unsaved work, also after a change taken back
+            // inside this one queued it.
+            self.edited();
+        }
         self.parts.retain(|id, _| mark.parts.contains(id));
+        self.library = mark.library;
         let (before, now) = match (mark.files, vendor_names(&self.dir)) {
             (Ok(before), Ok(now)) => (before, now),
             (Err(e), _) | (_, Err(e)) => {
@@ -6414,6 +6645,29 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn undo_and_redo_list_the_symbol_version_they_bring_back() {
+        let (_tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let old = o.symbols["wc.coil"].clone();
+        let mut new = old.clone();
+        new.description = "Solenoid winding".into();
+        o.checkpoint();
+        store::write_vendored_symbol(&o.dir, &new).unwrap();
+        o.project.lock.symbols.get_mut("wc.coil").unwrap().hash = new.hash();
+        o.reload_symbols();
+        o.refresh_library();
+        let listed = |o: &Open| o.library.iter().find(|e| e.id == "wc.coil").unwrap().clone();
+        assert_eq!(listed(&o).description, new.description);
+
+        assert!(o.undo(), "{:?}", o.take_undo_error());
+        assert_eq!(listed(&o).description, old.description);
+        assert!(!listed(&o).matches("solenoid"));
+        assert!(o.redo(), "{:?}", o.take_undo_error());
+        assert_eq!(listed(&o).description, new.description);
+        assert!(listed(&o).matches("solenoid"));
+    }
+
+    #[test]
     fn redo_puts_back_a_new_version_of_a_symbol_no_page_uses() {
         let (_tmp, mut o) = project();
         o.ensure_symbol("wc.coil").unwrap();
@@ -6451,6 +6705,54 @@ pub(crate) mod tests {
         assert_eq!(o.symbols["wc.coil"], old, "placed in the version pinned");
         assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), old);
         assert_eq!(o.project.lock.symbols["wc.coil"].hash, old.hash());
+    }
+
+    #[test]
+    fn a_pinned_symbol_put_back_is_listed_with_its_own_description() {
+        let (tmp, mut o) = project();
+        o.ensure_symbol("wc.coil").unwrap();
+        let old = o.symbols["wc.coil"].clone();
+        o.save().unwrap();
+        std::fs::remove_file(store::vendor_path(&o.dir, ItemKind::Symbol, "wc.coil").unwrap()).unwrap();
+        let mut o = Open::load(&o.dir).unwrap();
+        // The library that wins for the id has a newer version with another description.
+        let mut new = old.clone();
+        new.description = "Solenoid winding".into();
+        library_first(&mut o, tmp.path(), &new);
+        o.refresh_library();
+        let listed = |o: &Open| o.library.iter().find(|e| e.id == "wc.coil").unwrap().clone();
+        assert_eq!(listed(&o).description, new.description);
+        // Placing puts back the pinned version: the list follows it.
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        assert_eq!(o.symbols["wc.coil"], old);
+        assert_eq!(listed(&o).description, old.description);
+        assert!(!listed(&o).matches("solenoid"));
+        assert_eq!(o.library.iter().filter(|e| e.id == "wc.coil").count(), 1);
+    }
+
+    #[test]
+    fn a_refused_change_that_loaded_a_symbol_puts_the_symbol_list_back() {
+        let (tmp, mut o) = project();
+        o.ensure_symbol("wc.coil").unwrap();
+        let old = o.symbols["wc.coil"].clone();
+        o.save().unwrap();
+        std::fs::remove_file(store::vendor_path(&o.dir, ItemKind::Symbol, "wc.coil").unwrap()).unwrap();
+        let mut o = Open::load(&o.dir).unwrap();
+        let mut new = old.clone();
+        new.description = "Solenoid winding".into();
+        library_first(&mut o, tmp.path(), &new);
+        o.refresh_library();
+        let m = o.mark();
+        let listed = o.library.clone();
+        // The change loads the pinned version, which changes its row, and is then refused.
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        assert_ne!(o.library, listed);
+        // A symbol only this project has gets a row of its own.
+        let mut own = old.clone();
+        own.id = "test.own".into();
+        o.load_symbol("test.own", own);
+        o.back_to(m).unwrap();
+        assert_eq!(o.library, listed, "the symbol list is as it was at the mark");
     }
 
     #[test]
@@ -6495,6 +6797,299 @@ pub(crate) mod tests {
         o.place(1, "wc.coil", Point::new(40.0, 20.0)).unwrap();
         assert_eq!(o.symbols["wc.coil"], old);
         assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), old);
+    }
+
+    #[test]
+    fn a_refused_change_puts_back_a_symbol_it_replaced_with_the_pinned_version() {
+        let (_tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let old = o.symbols["wc.coil"].clone();
+        o.save().unwrap();
+        let mut new = old.clone();
+        new.name = "Coil, changed".into();
+        store::write_vendored_symbol(&o.dir, &new).unwrap();
+        let mut o = Open::load(&o.dir).unwrap();
+        assert_eq!(o.symbols["wc.coil"], new, "loaded as the file has it");
+        // The pinned copy put back, then a change places with it and is refused.
+        store::write_vendored_symbol(&o.dir, &old).unwrap();
+        let m = o.mark();
+        o.place(1, "wc.coil", Point::new(40.0, 20.0)).unwrap();
+        assert_eq!(o.symbols["wc.coil"], old, "the change loaded the pinned version");
+        o.back_to(m).unwrap();
+        assert_eq!(o.symbols["wc.coil"], new, "the symbol loaded at the mark is back");
+        // It is not the pinned version, so its file is left as it is.
+        assert!(!o.stale_symbol_files.contains("wc.coil"));
+        assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), old);
+    }
+
+    /// A saved project with one black box on page 1: its item and symbol ids.
+    fn saved_box() -> (tempfile::TempDir, Open, String, String) {
+        let (tmp, mut o) = project();
+        let id = o
+            .add_black_box(1, Point::new(40.0, 40.0), Point::new(60.0, 50.0), &box_pin(), None)
+            .unwrap();
+        let symbol_id = format!("box.{}.{id}", o.project.pages[1].id);
+        o.save().unwrap();
+        (tmp, o, id, symbol_id)
+    }
+
+    /// The one point of the box [`saved_box`] places.
+    fn box_pin() -> [wc_core::BoxPin; 1] {
+        [wc_core::BoxPin {
+            name: "IN".into(),
+            side: wc_core::BoxSide::Left,
+            offset: 5.0,
+        }]
+    }
+
+    /// Black box `id` on page 1 made 30 mm wide, its point kept.
+    fn widen_box(o: &mut Open, id: &str) {
+        o.edit_black_box(1, id, (30.0, 10.0), &box_pin(), &BTreeMap::new(), &Default::default())
+            .unwrap();
+    }
+
+    #[test]
+    fn a_refused_box_edit_is_unsaved_work_until_its_file_is_written_back() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let old = o.symbols[&symbol_id].clone();
+        let m = o.mark();
+        widen_box(&mut o, &id);
+        assert_ne!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), old);
+        o.back_to(m).unwrap();
+        assert_eq!(o.symbols[&symbol_id], old);
+        assert!(o.dirty, "the box file still holds the refused edit");
+        o.save().unwrap();
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), old);
+    }
+
+    #[test]
+    fn a_box_edit_repeated_after_a_refusal_is_not_saved_over_by_the_repair() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let m = o.mark();
+        widen_box(&mut o, &id);
+        o.back_to(m).unwrap();
+        // The same edit again, kept: its file holds the version the project now pins.
+        widen_box(&mut o, &id);
+        let accepted = o.symbols[&symbol_id].clone();
+        assert_eq!(o.project.lock.symbols[&symbol_id].hash, accepted.hash());
+        o.save().unwrap();
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(),
+            accepted,
+            "the repair queued by the refusal does not write the old version over it"
+        );
+    }
+
+    #[test]
+    fn a_box_edit_repeated_over_a_file_changed_outside_while_its_repair_waits_is_refused() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let old = o.symbols[&symbol_id].clone();
+        let m = o.mark();
+        widen_box(&mut o, &id);
+        o.back_to(m).unwrap();
+        let mut other = old.clone();
+        other.name = "Box, changed".into();
+        store::write_vendored_symbol(&o.dir, &other).unwrap();
+        let err = o
+            .edit_black_box(1, &id, (30.0, 10.0), &box_pin(), &BTreeMap::new(), &Default::default())
+            .unwrap_err();
+        assert!(err.contains("changed outside"), "{err}");
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), other);
+        // The repair still waits, so Save still asks about that version.
+        let err = o.save().unwrap_err();
+        assert!(err.contains(Open::CHANGED_OUTSIDE), "{err}");
+    }
+
+    #[test]
+    fn an_undo_that_writes_a_symbol_file_lets_its_pending_repair_go() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let first = o.symbols[&symbol_id].clone();
+        widen_box(&mut o, &id);
+        // A further edit is refused: its repair waits to write the widened version.
+        let m = o.mark();
+        o.edit_black_box(1, &id, (40.0, 10.0), &box_pin(), &BTreeMap::new(), &Default::default())
+            .unwrap();
+        o.back_to(m).unwrap();
+        // Undo takes the widening back and writes the first version to the file.
+        assert!(o.undo());
+        assert_eq!(o.project.lock.symbols[&symbol_id].hash, first.hash());
+        o.save().unwrap();
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(),
+            first,
+            "the repair does not write the widened version over what Undo wrote"
+        );
+    }
+
+    #[test]
+    fn a_symbol_file_changed_outside_before_a_box_edit_is_refused_is_not_written_over_unasked() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let old = o.symbols[&symbol_id].clone();
+        let m = o.mark();
+        widen_box(&mut o, &id);
+        // Another program changes the box file before the edit is refused.
+        let mut other = old.clone();
+        other.name = "Box, changed".into();
+        store::write_vendored_symbol(&o.dir, &other).unwrap();
+        o.back_to(m).unwrap();
+        let err = o.save().unwrap_err();
+        assert!(err.contains(Open::CHANGED_OUTSIDE), "{err}");
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), other);
+    }
+
+    #[test]
+    fn a_symbol_file_repaired_on_save_is_not_written_again_unchecked() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let old = o.symbols[&symbol_id].clone();
+        let m = o.mark();
+        widen_box(&mut o, &id);
+        o.back_to(m).unwrap();
+        // The checked repair writes the file; a second, unchecked write would fail here.
+        o.fail_symbol_writes = [true].into();
+        o.save().unwrap();
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), old);
+    }
+
+    #[test]
+    fn nested_refused_changes_never_save_a_symbol_version_the_project_does_not_pin() {
+        let (_tmp, o, id, symbol_id) = saved_box();
+        let pinned = o.symbols[&symbol_id].clone();
+        // The box file is changed outside the app: loaded as the file has it.
+        let mut other = pinned.clone();
+        other.name = "Box, changed".into();
+        store::write_vendored_symbol(&o.dir, &other).unwrap();
+        let mut o = Open::load(&o.dir).unwrap();
+        assert_eq!(o.symbols[&symbol_id], other);
+        let listed = o.library.clone();
+        // The pinned copy put back; a change loads it and edits the box in an inner change.
+        store::write_vendored_symbol(&o.dir, &pinned).unwrap();
+        let outer = o.mark();
+        o.ensure_symbol(&symbol_id).unwrap();
+        o.refresh_library();
+        let inner = o.mark();
+        widen_box(&mut o, &id);
+        o.back_to(inner).unwrap();
+        assert!(o.stale_symbol_files.contains(&symbol_id));
+        o.back_to(outer).unwrap();
+        assert_eq!(o.symbols[&symbol_id], other, "the symbol loaded at the mark is back");
+        assert_eq!(o.library, listed, "and so is its list row");
+        assert!(o.dirty, "the box file still holds the refused edit");
+        o.save().unwrap();
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(),
+            pinned,
+            "the file holds the version the project pins, not the refused edit or the loaded one"
+        );
+    }
+
+    #[test]
+    fn a_repair_queued_by_a_refused_change_follows_the_pin_an_enclosing_refusal_puts_back() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let first = o.symbols[&symbol_id].clone();
+        // The outer change edits the box: the project pins that version.
+        let outer = o.mark();
+        widen_box(&mut o, &id);
+        let pinned = o.symbols[&symbol_id].clone();
+        assert_ne!(pinned, first);
+        // Another program changes the box file and it is read in; then the pinned copy is put
+        // back, and a middle change loads it and edits the box in an inner change.
+        let mut other = pinned.clone();
+        other.name = "Box, changed".into();
+        store::write_vendored_symbol(&o.dir, &other).unwrap();
+        o.reload_symbols();
+        assert_eq!(o.symbols[&symbol_id], other);
+        store::write_vendored_symbol(&o.dir, &pinned).unwrap();
+        let middle = o.mark();
+        o.ensure_symbol(&symbol_id).unwrap();
+        let inner = o.mark();
+        o.edit_black_box(1, &id, (40.0, 10.0), &box_pin(), &BTreeMap::new(), &Default::default())
+            .unwrap();
+        o.back_to(inner).unwrap();
+        o.back_to(middle).unwrap();
+        // The middle refusal queued the middle pin for the box file; the outer refusal pins the
+        // first version again.
+        o.back_to(outer).unwrap();
+        assert_eq!(o.project.lock.symbols[&symbol_id].hash, first.hash());
+        assert_eq!(o.symbols[&symbol_id], first);
+        assert!(o.dirty, "the box file still holds the refused edit");
+        o.save().unwrap();
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(),
+            first,
+            "the file holds the version the project pins again, not one a refused change pinned"
+        );
+    }
+
+    #[test]
+    fn a_symbol_file_changed_outside_while_its_repair_waits_is_not_written_over_unasked() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let old = o.symbols[&symbol_id].clone();
+        let m = o.mark();
+        widen_box(&mut o, &id);
+        o.back_to(m).unwrap();
+        // Another program changes the box file before the repair is saved.
+        let mut other = old.clone();
+        other.name = "Box, changed".into();
+        store::write_vendored_symbol(&o.dir, &other).unwrap();
+        let err = o.save().unwrap_err();
+        assert!(err.contains(Open::CHANGED_OUTSIDE), "{err}");
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), other);
+        // Keeping that version leaves it in its file.
+        let path = o.changed_outside().unwrap();
+        o.keep_outside_version(&path);
+        o.save().unwrap();
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), other);
+    }
+
+    #[test]
+    fn a_symbol_repair_written_over_an_outside_change_on_request_holds_the_pinned_version() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let old = o.symbols[&symbol_id].clone();
+        let m = o.mark();
+        widen_box(&mut o, &id);
+        o.back_to(m).unwrap();
+        let mut other = old.clone();
+        other.name = "Box, changed".into();
+        store::write_vendored_symbol(&o.dir, &other).unwrap();
+        assert!(o.save().is_err());
+        let path = o.changed_outside().unwrap();
+        o.write_over_outside_version(&path);
+        o.save().unwrap();
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), old);
+    }
+
+    #[test]
+    fn a_box_edit_refused_inside_a_refused_change_is_unsaved_work() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let old = o.symbols[&symbol_id].clone();
+        let outer = o.mark();
+        let inner = o.mark();
+        widen_box(&mut o, &id);
+        o.back_to(inner).unwrap();
+        o.back_to(outer).unwrap();
+        assert!(o.dirty, "the box file still holds the refused edit");
+        o.save().unwrap();
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), old);
+    }
+
+    #[test]
+    fn a_symbol_file_another_program_wrote_during_a_refused_change_is_left_as_it_is() {
+        let (_tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let old = o.symbols["wc.coil"].clone();
+        o.save().unwrap();
+        let m = o.mark();
+        // Another program writes another version, which the change reads in.
+        let mut other = old.clone();
+        other.name = "Coil, changed".into();
+        store::write_vendored_symbol(&o.dir, &other).unwrap();
+        o.reload_symbols();
+        assert_eq!(o.symbols["wc.coil"], other);
+        o.back_to(m).unwrap();
+        assert_eq!(o.symbols["wc.coil"], old);
+        assert!(!o.stale_symbol_files.contains("wc.coil"));
+        o.save().unwrap();
+        assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), other);
     }
 
     #[test]
@@ -6764,11 +7359,13 @@ pub(crate) mod tests {
         let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library/symbols/wc.breaker.1p.json");
         std::fs::copy(starter, tmp.path().join("mine/symbols/wc.breaker.1p.json")).unwrap();
         let before = o.project.clone();
+        let listed = o.library.clone();
         let undo = o.can_undo();
         let err = o.paste(1, &clip, Point::new(80.0, 80.0)).unwrap_err();
         assert!(err.contains("wc.coil"), "the symbol is named: {err}");
         assert_eq!(o.project, before, "nothing is added, not even the breaker's pin");
         assert!(!o.symbols.contains_key("wc.breaker.1p"));
+        assert_eq!(o.library, listed, "the symbol list goes back too");
         assert_eq!(o.can_undo(), undo, "no undo step");
         let path = o.save_macro(&clip, "Coil", "").unwrap();
         let err = o.insert_macro(1, &path, None).unwrap_err();
@@ -6777,7 +7374,7 @@ pub(crate) mod tests {
     }
 
     /// A library folder named "mine", put ahead of the others, holding `sym`.
-    fn library_first(o: &mut Open, root: &Path, sym: &Symbol) -> wc_library::Library {
+    pub(crate) fn library_first(o: &mut Open, root: &Path, sym: &Symbol) -> wc_library::Library {
         let mine = root.join("mine");
         std::fs::create_dir_all(mine.join("symbols")).unwrap();
         std::fs::write(
@@ -8446,9 +9043,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_symbol_list_keeps_and_searches_descriptions() {
+        let (_tmp, o) = project();
+        let coil = o.library.iter().find(|e| e.id == "wc.coil").unwrap();
+        assert!(coil.description.contains("relay"), "{coil:?}");
+        // Every word must appear, in any order and case, across id, name and description.
+        assert!(coil.matches(""));
+        assert!(coil.matches("CONTACTOR relay"));
+        assert!(coil.matches("coil contactor"));
+        assert!(!coil.matches("contactor timer"));
+        let hits: Vec<&str> = o
+            .library
+            .iter()
+            .filter(|e| e.matches("relay contactor"))
+            .map(|e| e.id.as_str())
+            .collect();
+        assert!(hits.contains(&"wc.coil"), "{hits:?}");
+        // After placing, the vendored copy keeps its description too.
+        let mut o = o;
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        o.place(page, "wc.coil", Point::new(50.0, 50.0)).unwrap();
+        o.refresh_library();
+        let coil = o.library.iter().find(|e| e.id == "wc.coil").unwrap();
+        assert!(coil.matches("relay"));
+    }
+
+    #[test]
     fn placing_vendors_the_symbol_and_tags_the_device() {
         let (_tmp, mut o) = project();
-        assert!(o.library.iter().any(|(id, _)| id == "wc.coil"));
+        assert!(o.library.iter().any(|e| e.id == "wc.coil"));
         let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
         let id = o.place(page, "wc.coil", Point::new(50.0, 50.0)).unwrap();
         assert!(o.symbols.contains_key("wc.coil"));
@@ -9179,7 +9802,7 @@ pub(crate) mod tests {
             description: String::new(),
         };
         wc_library::write_symbol(&root, &sym).unwrap();
-        let listed = |o: &Open| o.library.iter().any(|(id, _)| id == "test.imported");
+        let listed = |o: &Open| o.library.iter().any(|e| e.id == "test.imported");
         o.refresh_library();
         assert!(!listed(&o), "the folder is not a source yet");
 
