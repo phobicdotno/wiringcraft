@@ -106,21 +106,27 @@ fn num(e: &BytesStart, name: &str) -> f64 {
 /// The arguments of an arc command: groups of seven, whose fourth and fifth (the large-arc and
 /// sweep flags) are one `0` or `1` each and may run into the next argument without a separator
 /// (`0110 20` is the flags 0 and 1 and the end x 10). Reading stops at the first argument that is
-/// not well formed, as SVG stops drawing a path at an error: the arguments read before it come
-/// back with `false`.
+/// not well formed, or at an arc with no arguments or a group cut short, as SVG stops drawing a
+/// path at an error: the arguments read before it come back with `false`.
 fn arc_numbers(s: &str) -> (Vec<f64>, bool) {
     let b = s.as_bytes();
+    let at = |i: usize| b.get(i).copied();
+    let digits = |i: &mut usize| {
+        let from = *i;
+        while at(*i).is_some_and(|c| c.is_ascii_digit()) {
+            *i += 1;
+        }
+        *i > from
+    };
     let mut out = Vec::new();
     let mut i = 0;
     loop {
-        while i < b.len() && (b[i].is_ascii_whitespace() || b[i] == b',') {
+        while at(i).is_some_and(|c| c.is_ascii_whitespace() || c == b',') {
             i += 1;
         }
-        if i >= b.len() {
-            break;
-        }
+        let Some(first) = at(i) else { break };
         if matches!(out.len() % 7, 3 | 4) {
-            match b[i] {
+            match first {
                 b'0' => out.push(0.0),
                 b'1' => out.push(1.0),
                 _ => return (out, false),
@@ -129,41 +135,39 @@ fn arc_numbers(s: &str) -> (Vec<f64>, bool) {
             continue;
         }
         let start = i;
-        if matches!(b[i], b'+' | b'-') {
+        if matches!(first, b'+' | b'-') {
             i += 1;
         }
-        let digits = |i: &mut usize| {
-            let from = *i;
-            while *i < b.len() && b[*i].is_ascii_digit() {
-                *i += 1;
-            }
-            *i > from
-        };
         let whole = digits(&mut i);
-        let fraction = i < b.len() && b[i] == b'.' && {
+        let fraction = at(i) == Some(b'.') && {
             i += 1;
             digits(&mut i)
         };
         if !whole && !fraction {
             return (out, false);
         }
-        if i < b.len() && matches!(b[i], b'e' | b'E') {
+        if matches!(at(i), Some(b'e' | b'E')) {
             let mark = i;
             i += 1;
-            if i < b.len() && matches!(b[i], b'+' | b'-') {
+            if matches!(at(i), Some(b'+' | b'-')) {
                 i += 1;
             }
             if !digits(&mut i) {
                 i = mark;
             }
         }
-        match s[start..i].parse::<f64>() {
-            Ok(v) if v.is_finite() => out.push(v),
+        match s.get(start..i).and_then(|t| t.parse::<f64>().ok()) {
+            Some(v) if v.is_finite() => out.push(v),
             _ => return (out, false),
         }
     }
-    (out, true)
+    // An arc without arguments, or with a group of seven cut short, is an error too.
+    let complete = !out.is_empty() && out.len() % 7 == 0;
+    (out, complete)
 }
+
+/// A point of path data, before its transform.
+type Xy = [f64; 2];
 
 fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
     let mut out: Vec<(Vec<Point>, bool)> = Vec::new();
@@ -254,17 +258,26 @@ fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
                 }
             }
             'C' | 'S' => {
-                let n = if c.eq_ignore_ascii_case(&'C') { 6 } else { 4 };
-                for seg in v.chunks_exact(n) {
+                // (first control point, `None` for `S`; second control point; end point)
+                let groups: Vec<(Option<Xy>, Xy, Xy)> = if c.eq_ignore_ascii_case(&'C') {
+                    let (groups, _) = v.as_chunks::<6>();
+                    groups
+                        .iter()
+                        .map(|&[a, b, c, d, e, f]| (Some([a, b]), [c, d], [e, f]))
+                        .collect()
+                } else {
+                    let (groups, _) = v.as_chunks::<4>();
+                    groups.iter().map(|&[c, d, e, f]| (None, [c, d], [e, f])).collect()
+                };
+                for (c1, [c2x, c2y], [ex, ey]) in groups {
                     let (bx, by) = if rel { (x, y) } else { (0.0, 0.0) };
                     // `S` takes its first control point mirrored from the last cubic's second.
-                    let (c1x, c1y) = if n == 6 {
-                        (bx + seg[0], by + seg[1])
-                    } else {
-                        cubic_ctrl.map_or((x, y), |(px, py)| (2.0 * x - px, 2.0 * y - py))
+                    let (c1x, c1y) = match c1 {
+                        Some([cx, cy]) => (bx + cx, by + cy),
+                        None => cubic_ctrl.map_or((x, y), |(px, py)| (2.0 * x - px, 2.0 * y - py)),
                     };
-                    let (c2x, c2y) = (bx + seg[n - 4], by + seg[n - 3]);
-                    let (ex, ey) = (bx + seg[n - 2], by + seg[n - 1]);
+                    let (c2x, c2y) = (bx + c2x, by + c2y);
+                    let (ex, ey) = (bx + ex, by + ey);
                     let (x0, y0) = (x, y);
                     for k in 1..=CURVE_STEPS {
                         let t = f64::from(k) / f64::from(CURVE_STEPS);
@@ -281,16 +294,22 @@ fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
                 }
             }
             'Q' | 'T' => {
-                let n = if c.eq_ignore_ascii_case(&'Q') { 4 } else { 2 };
-                for seg in v.chunks_exact(n) {
+                // (control point, `None` for `T`; end point)
+                let groups: Vec<(Option<Xy>, Xy)> = if c.eq_ignore_ascii_case(&'Q') {
+                    let (groups, _) = v.as_chunks::<4>();
+                    groups.iter().map(|&[a, b, e, f]| (Some([a, b]), [e, f])).collect()
+                } else {
+                    let (groups, _) = v.as_chunks::<2>();
+                    groups.iter().map(|&[e, f]| (None, [e, f])).collect()
+                };
+                for (ctrl, [ex, ey]) in groups {
                     let (bx, by) = if rel { (x, y) } else { (0.0, 0.0) };
                     // `T` takes its control point mirrored from the last quadratic's.
-                    let (cx, cy) = if n == 4 {
-                        (bx + seg[0], by + seg[1])
-                    } else {
-                        quad_ctrl.map_or((x, y), |(px, py)| (2.0 * x - px, 2.0 * y - py))
+                    let (cx, cy) = match ctrl {
+                        Some([cx, cy]) => (bx + cx, by + cy),
+                        None => quad_ctrl.map_or((x, y), |(px, py)| (2.0 * x - px, 2.0 * y - py)),
                     };
-                    let (ex, ey) = (bx + seg[n - 2], by + seg[n - 1]);
+                    let (ex, ey) = (bx + ex, by + ey);
                     let (x0, y0) = (x, y);
                     for k in 1..=CURVE_STEPS {
                         let t = f64::from(k) / f64::from(CURVE_STEPS);
@@ -308,16 +327,16 @@ fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
                 }
             }
             'A' => {
-                for seg in v.as_chunks::<7>().0 {
+                for &[rx, ry, rotation, large, sweep, ex, ey] in v.as_chunks::<7>().0 {
                     let (bx, by) = if rel { (x, y) } else { (0.0, 0.0) };
-                    let (ex, ey) = (bx + seg[5], by + seg[6]);
+                    let (ex, ey) = (bx + ex, by + ey);
                     let arc = Arc {
                         from: (x, y),
                         to: (ex, ey),
-                        radii: (seg[0], seg[1]),
-                        rotation: seg[2],
-                        large: seg[3] != 0.0,
-                        sweep: seg[4] != 0.0,
+                        radii: (rx, ry),
+                        rotation,
+                        large: large != 0.0,
+                        sweep: sweep != 0.0,
                     };
                     for (px, py) in arc.points() {
                         cur.push(m.p(px, py));
@@ -697,6 +716,13 @@ mod tests {
             one_line("M 0 0 L 1 0 A 5 5 0 2 1 10 0 L 20 0"),
             [Point::new(0.0, 0.0), Point::new(1.0, 0.0)]
         );
+        // So does an arc cut short or without arguments; whole arcs, also several in a row, go on.
+        for d in ["M 0 0 L 1 0 A 5 5 0 0 1 10 L 20 0", "M 0 0 L 1 0 A L 20 0"] {
+            assert_eq!(one_line(d), [Point::new(0.0, 0.0), Point::new(1.0, 0.0)], "{d}");
+        }
+        let pts = one_line("M 0 0 A 5 5 0 0 1 10 0 5 5 0 0 1 20 0 L 30 0");
+        assert!(near(pts[pts.len() - 2], Point::new(20.0, 0.0)));
+        assert!(near(pts[pts.len() - 1], Point::new(30.0, 0.0)));
     }
 
     #[test]
