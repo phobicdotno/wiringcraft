@@ -1909,7 +1909,7 @@ impl App {
                     ed.message = e;
                 }
                 if a == Action::EditSymbol {
-                    ed.choices = open.library.clone();
+                    ed.choices = open.library.iter().map(|e| (e.id.clone(), e.name.clone())).collect();
                     if ed.opened_as.is_none() && ed.message.is_empty() {
                         ed.message = "Pick the symbol to change under \"Open a library symbol\".".into();
                     }
@@ -1931,7 +1931,12 @@ impl App {
                     Ok(lib) => {
                         if a == Action::LibraryUpdate {
                             match open.update_library(&lib, None) {
-                                Ok(done) => self.ed.message = format!("Updated {} library items.", done.len()),
+                                Ok(done) => {
+                                    // The symbol list, editor choices and search show the new
+                                    // names and descriptions.
+                                    open.refresh_library();
+                                    self.ed.message = format!("Updated {} library items.", done.len());
+                                }
                                 Err(e) => self.ed.message = format!("Update failed: {e}"),
                             }
                         }
