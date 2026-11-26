@@ -62,7 +62,7 @@ use wc_core::symbol::{Pin, PinDir, SymbolRole};
 
 use super::pick_language;
 use crate::eplan::EplanFunction;
-use crate::eplan::drawing::{KIND_TERMINAL, UniqueNames, dir_index, rotation_of, symbol_for, vector};
+use crate::eplan::drawing::{KIND_TERMINAL, UniqueNames, dir_index, pin_names, rotation_of, symbol_for, vector};
 use crate::{Error, Result, id_segment};
 
 /// Representation type of a multi-line schematic.
@@ -904,19 +904,12 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
         let by_designation: Vec<Option<Point>> = if p.kind == KIND_TERMINAL {
             names.iter().enumerate().map(|(k, _)| points.get(k).copied()).collect()
         } else {
-            let mut unique = UniqueNames::default();
-            names
+            pin_names(&f)
                 .iter()
-                .enumerate()
-                .map(|(k, n)| {
-                    let want = unique.unique(if n.trim().is_empty() {
-                        (k + 1).to_string()
-                    } else {
-                        n.trim().to_owned()
-                    });
+                .map(|want| {
                     s.pins
                         .iter()
-                        .position(|pin| pin.name == want)
+                        .position(|pin| pin.name == *want)
                         .and_then(|i| points.get(i).copied())
                 })
                 .collect()

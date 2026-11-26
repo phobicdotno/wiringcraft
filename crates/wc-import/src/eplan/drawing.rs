@@ -183,7 +183,7 @@ impl UniqueNames {
 }
 
 /// Pin names: Eplan's, with blanks numbered and repeats marked so each is unique.
-fn pin_names(f: &EplanFunction) -> Vec<String> {
+pub(crate) fn pin_names(f: &EplanFunction) -> Vec<String> {
     let mut names = UniqueNames::default();
     f.pins
         .iter()
