@@ -2385,7 +2385,7 @@ impl Form {
                 Ok(()) => {}
                 Err(e) => self.fail(ErrorAbout::Folder, e),
             },
-            crate::Picked::Failed(e) => self.fail(ErrorAbout::Folder, e),
+            crate::Picked::Failed(e) | crate::Picked::Unsure(e) => self.fail(ErrorAbout::Folder, e),
             crate::Picked::Cancelled => {}
         }
     }

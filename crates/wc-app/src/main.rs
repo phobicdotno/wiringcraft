@@ -219,6 +219,20 @@ enum Dialog {
     },
 }
 
+/// Whether a dialog belongs to the open project, so it is closed when another project is
+/// opened. Only the dialogs that do not refer to it stay: opening or making a project, a
+/// message, a fetch in progress and the problem report.
+fn bound_to_project(d: &Dialog) -> bool {
+    !matches!(
+        d,
+        Dialog::OpenPath(..)
+            | Dialog::NewProject { .. }
+            | Dialog::Message(_)
+            | Dialog::Fetching(_)
+            | Dialog::Report { .. }
+    )
+}
+
 /// Work a dialog asks for after it closes.
 type Then = Box<dyn FnOnce(&mut App)>;
 
@@ -599,6 +613,11 @@ impl App {
         };
         match Open::load(dir) {
             Ok(o) => {
+                // A form of the old project (Delete page, Save as, properties...) must not act
+                // on the new one.
+                if self.dialog.as_ref().is_some_and(bound_to_project) {
+                    self.dialog = None;
+                }
                 self.ed = Editor::default();
                 self.panels.reset();
                 self.ed.message = format!("Opened {}", dir.display());
@@ -686,7 +705,7 @@ impl App {
                     self.dialog = Some(Dialog::OpenPath(field, Some(why)));
                 }
                 // Without a picker the folder can still be typed, or picked from the recent ones.
-                Picked::Failed(e) => {
+                Picked::Failed(e) | Picked::Unsure(e) => {
                     self.dialog = Some(Dialog::OpenPath(prefs::FolderField::typed(start), Some(e)));
                 }
                 Picked::Cancelled => {}
@@ -719,7 +738,7 @@ impl App {
                         }
                     }
                     // Without a save dialog the folder can be typed.
-                    Picked::Failed(e) => {
+                    Picked::Failed(e) | Picked::Unsure(e) => {
                         let field = prefs::FolderField::typed(parent.join(&name).display().to_string());
                         self.dialog = Some(Dialog::SaveAsPath(
                             field,
@@ -739,6 +758,12 @@ impl App {
                         let e = e.strip_suffix(TYPE_INSTEAD).unwrap_or(&e);
                         let note = format!("{e} So they go to the usual place, {}.\n\n", default.display());
                         (default, note)
+                    }
+                    // Perhaps a quick Cancel: nothing is written.
+                    Picked::Unsure(e) => {
+                        let e = e.strip_suffix(TYPE_INSTEAD).unwrap_or(&e);
+                        self.dialog = Some(Dialog::Message(format!("{e} Nothing was exported.")));
+                        return;
                     }
                     Picked::Cancelled => return,
                 };
@@ -770,7 +795,7 @@ impl App {
                     ("CSV list", &["csv", "txt"]),
                 ) {
                     Picked::Path(f) => f,
-                    Picked::Failed(e) => {
+                    Picked::Failed(e) | Picked::Unsure(e) => {
                         self.dialog = Some(Dialog::Message(e));
                         return;
                     }
@@ -786,9 +811,14 @@ impl App {
             }
             Pending::ReportCsv(kind) => {
                 let default = open.dir.join("export").join(format!("{}.csv", kind.name()));
-                let Some((path, note)) = export_target("Save report as CSV", &default, ("CSV", &["csv"]), &pick_save)
-                else {
-                    return;
+                let (path, note) = match export_target("Save report as CSV", &default, ("CSV", &["csv"]), &pick_save) {
+                    Ok(target) => target,
+                    Err(why) => {
+                        if let Some(why) = why {
+                            self.dialog = Some(Dialog::Message(why));
+                        }
+                        return;
+                    }
                 };
                 let inputs = wc_report::Inputs {
                     project: &open.project,
@@ -1767,7 +1797,7 @@ impl App {
                             if ui.button("Browse…").clicked() {
                                 match pick_folder_for("Open project", path) {
                                     Picked::Path(d) => *error = path.pick(d).err(),
-                                    Picked::Failed(e) => *error = Some(e),
+                                    Picked::Failed(e) | Picked::Unsure(e) => *error = Some(e),
                                     Picked::Cancelled => {}
                                 }
                             }
@@ -1855,7 +1885,7 @@ impl App {
                                 if ui.button("Browse…").clicked() {
                                     match pick_folder_for("Where to create the project", location) {
                                         Picked::Path(d) => *error = location.pick(d).err(),
-                                        Picked::Failed(e) => *error = Some(e),
+                                        Picked::Failed(e) | Picked::Unsure(e) => *error = Some(e),
                                         Picked::Cancelled => {}
                                     }
                                 }
@@ -1874,7 +1904,7 @@ impl App {
                                             Some(t) => *base = t.to_owned(),
                                             None => *error = Some("That folder's name is not text.".into()),
                                         },
-                                        Picked::Failed(e) => *error = Some(e),
+                                        Picked::Failed(e) | Picked::Unsure(e) => *error = Some(e),
                                         Picked::Cancelled => {}
                                     }
                                 }
@@ -3433,6 +3463,10 @@ enum Picked {
     Cancelled,
     /// The picker could not open; the reason is for the dialog.
     Failed(String),
+    /// No path, at once, and no error logged: the picker may never have shown, or the person
+    /// cancelled very quickly. A fallback that only asks (a folder field) is fine; nothing is
+    /// written on it.
+    Unsure(String),
 }
 
 /// The system's folder picker, starting in `start` (or its nearest existing parent). Blocks the
@@ -3444,11 +3478,15 @@ fn pick_folder(title: &str, start: &str) -> Picked {
 /// [`pick_folder`] for a folder field: a folder picked into it earlier starts the picker
 /// exactly as picked (a name ending in a space included), typed text as [`pick_folder`] reads it.
 fn pick_folder_for(title: &str, field: &prefs::FolderField) -> Picked {
-    let start = match field.path() {
+    pick_folder_in(title, field_picker_start(field))
+}
+
+/// Where [`pick_folder_for`] opens for `field`.
+fn field_picker_start(field: &prefs::FolderField) -> Option<PathBuf> {
+    match field.path() {
         Ok(p) if !field.is_empty() => nearest_dir(&p),
         _ => picker_start(&field.text),
-    };
-    pick_folder_in(title, start)
+    }
 }
 
 /// The system's folder picker, opening in `start` when given.
@@ -3463,6 +3501,7 @@ fn pick_folder_in(title: &str, start: Option<PathBuf>) -> Picked {
     let r = dialog.pick_folder();
     match picker_outcome(r, shown.elapsed(), &applog::take_picker_errors()) {
         Picked::Failed(e) => Picked::Failed(format!("{e}{TYPE_INSTEAD}")),
+        Picked::Unsure(e) => Picked::Unsure(format!("{e}{TYPE_INSTEAD}")),
         p => p,
     }
 }
@@ -3500,25 +3539,28 @@ fn pick_open(title: &str, dir: &Path, filter: (&str, &[&str])) -> Picked {
 type PickSave<'a> = &'a dyn Fn(&str, &Path, &str, Option<(&str, &[&str])>) -> Picked;
 
 /// Where an export goes: the file picked in the save dialog `pick`, or `default` with a note
-/// when the dialog could not open; `None` when the person cancelled.
+/// when the dialog could not open; `Err(None)` when the person cancelled, and `Err` with what
+/// to say when the dialog closed at once without a file (perhaps a quick Cancel, so nothing is
+/// written).
 fn export_target(
     title: &str,
     default: &Path,
     filter: (&str, &[&str]),
     pick: PickSave<'_>,
-) -> Option<(PathBuf, String)> {
+) -> Result<(PathBuf, String), Option<String>> {
     let dir = default.parent().unwrap_or(default);
     let name = default
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     match pick(title, dir, &name, Some(filter)) {
-        Picked::Path(p) => Some((p, String::new())),
-        Picked::Failed(e) => Some((
+        Picked::Path(p) => Ok((p, String::new())),
+        Picked::Failed(e) => Ok((
             default.to_path_buf(),
             format!("{e} So it goes to the usual place, {}.\n\n", default.display()),
         )),
-        Picked::Cancelled => None,
+        Picked::Unsure(e) => Err(Some(format!("{e} Nothing was written."))),
+        Picked::Cancelled => Err(None),
     }
 }
 
@@ -3527,13 +3569,15 @@ fn export_target(
 fn export_markers(open: &Open, options: &wc_report::MarkingOptions, pick: PickSave<'_>) -> Dialog {
     let default = wago_marking_file(open, options);
     match export_target("Export WAGO markers", &default, ("CSV list", &["csv"]), pick) {
-        Some((path, note)) => Dialog::Message(note + &export_wago_marking_to(open, options, &path)),
-        None => wago_marking_dialog_with(open, options),
+        Ok((path, note)) => Dialog::Message(note + &export_wago_marking_to(open, options, &path)),
+        Err(Some(why)) => Dialog::Message(why),
+        Err(None) => wago_marking_dialog_with(open, options),
     }
 }
 
 /// A whole-project export to the file asked for with the save dialog `pick`: what it says, or
-/// `None` when the person cancelled (nothing is written then).
+/// `None` when the person cancelled (nothing is written then, nor when the dialog closed at
+/// once without a file).
 fn export_whole(open: &Open, kind: Export, pick: PickSave<'_>) -> Option<String> {
     let (title, default, filter): (&str, PathBuf, (&str, &[&str])) = match &kind {
         Export::Pdf(_) => ("Export PDF", export_file(open, "pdf"), ("PDF", &["pdf"])),
@@ -3548,7 +3592,10 @@ fn export_whole(open: &Open, kind: Export, pick: PickSave<'_>) -> Option<String>
             ("CSV list", &["csv"]),
         ),
     };
-    let (path, note) = export_target(title, &default, filter, pick)?;
+    let (path, note) = match export_target(title, &default, filter, pick) {
+        Ok(target) => target,
+        Err(why) => return why,
+    };
     let msg = match kind {
         Export::Pdf(langs) => export_pdf_to(open, &langs, &path),
         Export::Aml => export_aml_to(open, &path),
@@ -3598,11 +3645,16 @@ fn picker_outcome(r: Option<PathBuf>, open_for: std::time::Duration, errors: &[S
             Picked::Failed(NO_PORTAL.to_owned())
         }
         // Only when rfd logged nothing: a portal failure alone means zenity showed instead.
+        // A very quick Cancel looks the same, so this is not taken for a failure to write on.
         None if errors.is_empty() && open_for < std::time::Duration::from_millis(150) => {
             applog::warn(&format!(
-                "folder picker: no answer after {open_for:?}; taken as not opened"
+                "folder picker: no answer after {open_for:?}; maybe not opened"
             ));
-            Picked::Failed(NO_PORTAL.to_owned())
+            Picked::Unsure(
+                "The file picker closed at once without a choice. If it did not show, it could not open: \
+                 on Linux it needs a desktop portal (xdg-desktop-portal) or zenity in a desktop session."
+                    .to_owned(),
+            )
         }
         None => Picked::Cancelled,
     }
@@ -4174,6 +4226,15 @@ fn file_stem(s: &str) -> String {
         .collect()
 }
 
+/// Whether two paths name the same folder: compared as the file system resolves them (links,
+/// `..`, letter case), or as written when either cannot be resolved (not there yet).
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
 /// Every page as SVG and DXF in `export/drawings`, named by page number.
 fn export_drawings(open: &Open) -> String {
     export_drawings_to(open, &open.dir.join("export").join("drawings"))
@@ -4210,7 +4271,7 @@ fn export_drawings_to(open: &Open, dir: &Path) -> String {
         .collect();
     // The project's own drawings folder is the export's: a new export replaces the last one.
     // Another folder may hold other files with the same names, which are never replaced.
-    let own = dir == open.dir.join("export").join("drawings");
+    let own = same_dir(dir, &open.dir.join("export").join("drawings"));
     if !own {
         let taken: Vec<String> = files
             .iter()
@@ -5325,9 +5386,11 @@ mod picker_tests {
         let d = PathBuf::from("/x");
         assert_eq!(picker_outcome(Some(d.clone()), Duration::ZERO, &[]), Picked::Path(d));
         assert_eq!(picker_outcome(None, Duration::from_secs(2), &[]), Picked::Cancelled);
+        // An answer at once with nothing logged is said, but it may be a quick Cancel: it is
+        // not a failure an export writes to its usual place on.
         assert!(matches!(
             picker_outcome(None, Duration::from_millis(5), &[]),
-            Picked::Failed(e) if e.contains("desktop portal")
+            Picked::Unsure(e) if e.contains("desktop portal")
         ));
         // Typed text the dialogs refuse opens the picker in the projects folder.
         if cfg!(windows) {
@@ -5365,6 +5428,28 @@ mod picker_tests {
             picker_outcome(Some(d.clone()), Duration::from_secs(3), &errors),
             Picked::Path(d)
         );
+    }
+
+    #[test]
+    fn browse_starts_in_the_folder_picked_even_when_its_name_ends_in_a_space() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spaced = tmp.path().join("Shared copy ");
+        // Windows drops a trailing space from a folder name: nothing to test there.
+        if std::fs::create_dir(&spaced).is_err()
+            || !std::fs::read_dir(tmp.path())
+                .unwrap()
+                .any(|e| e.is_ok_and(|e| e.file_name() == "Shared copy "))
+        {
+            return;
+        }
+        let trimmed = tmp.path().join("Shared copy");
+        std::fs::create_dir(&trimmed).unwrap();
+        let mut field = prefs::FolderField::default();
+        field.pick(spaced.clone()).unwrap();
+        assert_eq!(field_picker_start(&field), Some(spaced));
+        // Typed text is read as the dialogs read it (trimmed).
+        let typed = prefs::FolderField::typed(format!("{} ", trimmed.display()));
+        assert_eq!(field_picker_start(&typed), Some(trimmed));
     }
 
     #[test]
@@ -5408,6 +5493,13 @@ mod marking_tests {
         let msg = export_whole(&o, Export::Aml, &pick).unwrap();
         assert!(msg.contains("Exported"), "{msg}");
         assert!(picked.is_file());
+        assert!(!usual.exists());
+
+        // A dialog that closed at once without a file may have been cancelled: it says so and
+        // writes nothing.
+        let unsure = |_: &str, _: &Path, _: &str, _: Option<(&str, &[&str])>| Picked::Unsure("At once.".into());
+        let msg = export_whole(&o, Export::Aml, &unsure).unwrap();
+        assert!(msg.contains("Nothing was written"), "{msg}");
         assert!(!usual.exists());
 
         // Without a dialog it goes to the usual place, and the note names it without claiming
@@ -5469,6 +5561,21 @@ mod marking_tests {
             .collect();
         names.sort();
         assert_eq!(names, ["a1.dxf", "a1.svg", "a1_.dxf", "a1_.svg"]);
+    }
+
+    #[test]
+    fn drawings_replace_their_own_folder_also_when_it_is_picked_by_another_route() {
+        let (_tmp, o) = state::tests::project();
+        let own = o.dir.join("export").join("drawings");
+        assert!(export_drawings_to(&o, &own).starts_with("Exported"));
+        std::fs::create_dir_all(o.dir.join("export").join("other")).unwrap();
+        let around = o.dir.join("export").join("other").join("..").join("drawings");
+        let msg = export_drawings_to(&o, &around);
+        assert!(msg.starts_with("Exported"), "{msg}");
+        assert!(same_dir(&around, &own));
+        assert!(!same_dir(&o.dir.join("export").join("other"), &own));
+        // Not there yet: compared as written.
+        assert!(same_dir(&o.dir.join("missing"), &o.dir.join("missing")));
     }
 
     #[test]

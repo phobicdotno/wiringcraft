@@ -7573,6 +7573,37 @@ mod tests {
     }
 
     #[test]
+    fn opening_another_project_closes_the_forms_of_the_old_one() {
+        let (tmp, mut a) = app(vec![]);
+        let other = tmp.path().join("other");
+        let mut p = wc_core::store::create(&other, "Other").unwrap();
+        p.pages.push(wc_core::Page::new("p0002", "2", "Control"));
+        wc_core::store::save(&other, &p).unwrap();
+        // Delete page of the old project: through the assistant, the new one must not get it.
+        a.dialog = Some(crate::Dialog::DeletePage(1));
+        let r = call(&mut a, "open_project", json!({"path": other.to_string_lossy()}));
+        assert!(r.is_ok(), "{r:?}");
+        assert!(a.dialog.is_none());
+        assert_eq!(a.open.as_ref().unwrap().project.pages.len(), 2);
+        // The typed Save as form names a copy of the old one: closed too, from File > Open.
+        let first = tmp.path().join("p");
+        a.dialog = Some(crate::Dialog::SaveAsPath(
+            crate::prefs::FolderField::typed("old copy"),
+            None,
+        ));
+        let mut prefs = std::mem::take(&mut a.prefs);
+        a.open_dir(&first, &mut prefs);
+        a.prefs = prefs;
+        assert!(a.dialog.is_none());
+        // A form that is not about the project stays.
+        a.dialog = Some(crate::Dialog::OpenPath(crate::prefs::FolderField::typed("x"), None));
+        let mut prefs = std::mem::take(&mut a.prefs);
+        a.open_dir(&other, &mut prefs);
+        a.prefs = prefs;
+        assert!(matches!(a.dialog, Some(crate::Dialog::OpenPath(..))));
+    }
+
+    #[test]
     fn a_new_project_can_start_from_a_base_project() {
         let (tmp, mut a) = app(vec![]);
         let base = a.open.as_ref().unwrap().dir.clone();
