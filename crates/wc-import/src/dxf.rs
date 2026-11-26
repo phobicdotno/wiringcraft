@@ -2025,12 +2025,13 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
     }
     let mut xs: Vec<f64> = Vec::new();
     let mut ys: Vec<f64> = Vec::new();
+    // One position per entity (the middle of its bounds), so a long line does not count twice.
     for p in out
         .graphics
         .iter()
-        .flat_map(|s| {
+        .map(|s| {
             let (a, b) = s.bounds();
-            [a, b]
+            Point::new(a.x / 2.0 + b.x / 2.0, a.y / 2.0 + b.y / 2.0)
         })
         .chain(out.symbols.iter().map(|s| s.at))
     {
@@ -2197,6 +2198,26 @@ mod tests {
             p.warnings
                 .iter()
                 .any(|w| w.contains("1 entity whose size is not a number once placed")),
+            "{:?}",
+            p.warnings
+        );
+        Ok(())
+    }
+
+    /// One stray line far away counts once in finding the middle, not once per end, so it
+    /// cannot outvote two symbols and drag the page to itself.
+    #[test]
+    fn a_stray_line_counts_once_and_cannot_outvote_the_symbols() -> Result<()> {
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        let ents = "0\nINSERT\n2\nWC.COIL\n10\n0\n20\n0\n0\nINSERT\n2\nWC.COIL\n10\n5\n20\n0\n\
+                    0\nLINE\n10\n1e12\n20\n0\n11\n1000000000005\n21\n0\n";
+        let p = page(&dxf(ents, ""), 1.0, &known)?;
+        assert_eq!(p.symbols.len(), 2, "{:?}", p.symbols);
+        assert!(p.graphics.is_empty(), "{:?}", p.graphics);
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("1 entity more than 1000 km from the rest")),
             "{:?}",
             p.warnings
         );

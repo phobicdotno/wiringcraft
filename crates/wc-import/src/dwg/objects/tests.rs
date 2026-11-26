@@ -1676,6 +1676,34 @@ fn a_bulged_lightweight_polyline_is_drawn_with_its_arc() -> TestResult {
 }
 
 #[test]
+fn a_polyline_point_that_is_not_a_number_is_damage_and_a_bulged_one_kept() -> TestResult {
+    let v = Version::R2010;
+    // Open, two points, a bulge of 1 on the first segment; the bad one's second point is NaN.
+    let poly = |h: u64, end: f64| {
+        let mut p = entity(v, 77, h, head(None));
+        p.data.bs(16).bl(2).bl(2);
+        p.data.rd(0.0).rd(0.0).dd(end, 0.0).dd(0.0, 0.0).bd(1.0).bd(0.0);
+        p
+    };
+    let objs = vec![
+        entry(v, LAYER, LAYER_H, "0"),
+        entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+        poly(0x200, f64::NAN),
+        poly(0x201, 10.0),
+    ];
+    let d = drawing(&sections(v, &objs, &[]))?;
+    assert_eq!(d.skipped.get(DAMAGED), Some(&1), "{:?}", d.skipped);
+    assert_eq!(d.model.len(), 1, "{:?}", d.model);
+    let off_chord = |s: &Shape| match s {
+        Shape::Polyline { points, .. } => points.iter().any(|p| (p.y.abs() - 5.0).abs() < 1e-6),
+        Shape::Arc { radius, .. } => (*radius - 5.0).abs() < 1e-6,
+        _ => false,
+    };
+    assert!(d.model.iter().any(off_chord), "{:?}", d.model);
+    Ok(())
+}
+
+#[test]
 fn a_dimension_is_drawn_by_its_block() -> TestResult {
     for v in [
         Version::R2004,

@@ -1275,6 +1275,10 @@ fn lwpolyline(o: &mut Object, e: &mut Codes) -> Result<()> {
             x = d.dd(x)?;
             y = d.dd(y)?;
         }
+        // A point that is not a number would be written as text and read back as 0.
+        if !x.is_finite() || !y.is_finite() {
+            return Err(bad("a polyline point is not a number"));
+        }
         at.push((x, y));
     }
     let bulge = kept_bulges(d, bulges, at.len())?;
