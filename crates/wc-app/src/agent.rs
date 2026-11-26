@@ -291,13 +291,13 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "update_graphic",
-            "Replace a free drawing (line, polyline, rect, circle, arc, text) by its id from get_page (g0, g1 ...). Ids are positions: a write is refused when the page's drawings changed since get_page, so read it again then.",
+            "Replace a free drawing (line, polyline, rect, circle, arc, text, dimension) by its id from get_page (g0, g1 ...). Ids are positions: a write is refused when the page's drawings changed since get_page, so read it again then.",
             json!({"id": {"type": "string"}, "shape": shape_arg(), "page": page_arg()}),
             &["id", "shape"],
         ),
         tool(
             "add_graphic",
-            "Add a free drawing to a page: a line, polyline, rectangle, circle, arc or text (labels, notes, frames, boxes around a group).",
+            "Add a free drawing to a page: a line, polyline (closed or filled), rectangle, circle, arc, text (labels, notes, frames, boxes around a group) or dimension (a measured distance in mm with arrows and extension lines).",
             json!({"shape": shape_arg(), "page": page_arg()}),
             &["shape"],
         ),
@@ -533,7 +533,17 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "run_command",
-            "Run a wiringcraft command-line command on the open project (unsaved changes are saved first, and the project is reloaded after). Covers everything: page, place, wire, device, number-wires, library (add, sync, status, update, lock, search, propose), import (DXF/SVG/KiCad/QElectroTech symbols, parts CSV and BMEcat, PLC address CSV, archives, DWG, PDF, Eplan and SolidWorks Electrical projects), pdf, drawing, report, nets, aml, plc-vars, check, inspect, vcs (commit, branch, switch, merge, history, page-log), comment, panel (new, arrange, step, list, remove). Use [\"--help\"] to list commands.",
+            "Run a wiringcraft command-line command on the open project (unsaved changes are saved first, and the project is reloaded after). Covers everything. \
+             Project and pages: new (a project folder, --template), page (add, list, remove, overview, size, cover, fields), template (show, columns, reset: frame columns and title block), logo (show, set, remove), location (list, set, remove). \
+             Drawing: place, box (a black box with connection points, --pin name:side:offset), wire, device (part, description), number-wires, macro (list, place), find (text in pages, --replace, --match-case). \
+             Terminals: strip (list, order, move, spare, unspare, level), jumper (add, remove, part, list). \
+             Revisions: revision (list, add, edit, remove, cloud, uncloud, table). \
+             Panels: panel (new, arrange, step, device, show, list, remove). \
+             Libraries: lib (add, sync, status, update, lock, search, propose). \
+             Import: import (symbol-dxf, symbol-svg, symbol-kicad, symbol-qet, footprint-dxf, model-step, parts-csv, parts-bmecat, parts-edz, plc-csv, wago, archive, page-dxf, page-dwg, pdf, eplan, swe, swe-library, aml). \
+             Output: pdf (--page, --report, --lang for a translated print), drawing (SVG/DXF per page), report, nets, aml, plc-vars, export (wago-marking, wago-configurator), translations (texts missing a translation, --lang). \
+             Checks and history: check, inspect (another tool's archive), vcs (init, commit, branch, switch, merge, log, changes, page-log), comment (add, reply, resolve, reopen, remove, list). \
+             Use [\"--help\"] or [\"<command>\", \"--help\"] for the arguments.",
             json!({"args": {"type": "array", "items": {"type": "string"}, "description": "Arguments, e.g. [\"plc-vars\", \"export/io.st\"]. The project folder is passed for you."}}),
             &["args"],
         ),
@@ -558,8 +568,8 @@ pub fn specs() -> Vec<Value> {
 fn shape_arg() -> Value {
     json!({
         "type": "object",
-        "description": "{\"kind\": \"line\", \"a\": {x,y}, \"b\": {x,y}} | {\"kind\": \"polyline\", \"points\": [...], \"closed\": bool} | {\"kind\": \"rect\", \"min\": {x,y}, \"max\": {x,y}} | {\"kind\": \"circle\", \"center\": {x,y}, \"radius\": r, \"filled\": bool} | {\"kind\": \"arc\", \"center\": {x,y}, \"radius\": r, \"start\": deg, \"end\": deg} | {\"kind\": \"text\", \"at\": {x,y}, \"text\": \"...\", \"height\": 2.5, \"align\": \"left|center|right\", \"angle\": deg}",
-        "properties": {"kind": {"type": "string", "enum": ["line", "polyline", "rect", "circle", "arc", "text"]}},
+        "description": "{\"kind\": \"line\", \"a\": {x,y}, \"b\": {x,y}} | {\"kind\": \"polyline\", \"points\": [...], \"closed\": bool, \"filled\": bool (solid, implies closed)} | {\"kind\": \"rect\", \"min\": {x,y}, \"max\": {x,y}} | {\"kind\": \"circle\", \"center\": {x,y}, \"radius\": r, \"filled\": bool} | {\"kind\": \"arc\", \"center\": {x,y}, \"radius\": r, \"start\": deg, \"end\": deg} | {\"kind\": \"text\", \"at\": {x,y}, \"text\": \"...\", \"height\": 2.5, \"align\": \"left|center|right\", \"angle\": deg} | {\"kind\": \"dimension\", \"a\": {x,y}, \"b\": {x,y}, \"offset\": mm (dimension line to the left of a to b, negative: right), \"height\": 2.5}",
+        "properties": {"kind": {"type": "string", "enum": ["line", "polyline", "rect", "circle", "arc", "text", "dimension"]}},
         "required": ["kind"]
     })
 }
@@ -4667,6 +4677,70 @@ mod tests {
         assert!(a.ed.message.contains("keeps the copy it has"), "{}", a.ed.message);
         assert!(!a.ed.message.contains("takes the one from"), "{}", a.ed.message);
         assert_eq!(a.open.as_ref().unwrap().symbols["wc.coil"], before);
+    }
+
+    #[test]
+    fn add_graphic_draws_a_dimension_and_a_filled_polyline() {
+        let (_tmp, mut a) = app(vec![]);
+        let spec = specs().into_iter().find(|t| t["name"] == "add_graphic").unwrap();
+        let kinds = &spec["input_schema"]["properties"]["shape"]["properties"]["kind"]["enum"];
+        assert!(kinds.as_array().unwrap().iter().any(|k| k == "dimension"));
+        let dimension = json!({"kind": "dimension", "a": {"x": 10, "y": 20}, "b": {"x": 50, "y": 20}, "offset": 8});
+        call(&mut a, "add_graphic", json!({"page": "p0002", "shape": dimension})).unwrap();
+        let arrow = json!({"kind": "polyline", "points": [{"x": 0, "y": 0}, {"x": 4, "y": 1}, {"x": 0, "y": 2}], "filled": true});
+        call(&mut a, "add_graphic", json!({"page": "p0002", "shape": arrow})).unwrap();
+        let graphics = &a.open.as_ref().unwrap().project.pages[1].graphics;
+        assert_eq!(
+            graphics[graphics.len() - 2],
+            Shape::Dimension {
+                a: Point::new(10.0, 20.0),
+                b: Point::new(50.0, 20.0),
+                offset: 8.0,
+                height: 2.5,
+            }
+        );
+        assert!(matches!(
+            graphics[graphics.len() - 1],
+            Shape::Polyline { filled: true, .. }
+        ));
+    }
+
+    /// `run_command`'s description names every top-level command of the command line, so the
+    /// assistant knows each one exists (the names come from `enum Cmd` in wc-cli's main.rs).
+    #[test]
+    fn run_command_names_every_command_line_command() {
+        let cli = include_str!("../../wc-cli/src/main.rs");
+        let body = cli.split("\nenum Cmd {\n").nth(1).unwrap();
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let commands: Vec<String> = body
+            .lines()
+            .filter_map(|l| l.strip_prefix("    "))
+            .filter(|l| l.starts_with(|c: char| c.is_ascii_uppercase()))
+            .map(|l| {
+                let name = l.split(|c: char| !c.is_ascii_alphanumeric()).next().unwrap();
+                let mut kebab = String::new();
+                for (i, c) in name.chars().enumerate() {
+                    if c.is_ascii_uppercase() && i > 0 {
+                        kebab.push('-');
+                    }
+                    kebab.push(c.to_ascii_lowercase());
+                }
+                kebab
+            })
+            .collect();
+        assert!(commands.len() >= 30, "only found {commands:?}");
+        let spec = specs().into_iter().find(|t| t["name"] == "run_command").unwrap();
+        let text = spec["description"].as_str().unwrap();
+        let named = |w: &str| {
+            text.match_indices(w).any(|(i, _)| {
+                let before = text[..i].chars().next_back();
+                let after = text[i + w.len()..].chars().next();
+                let edge = |c: Option<char>| c.is_none_or(|c| !c.is_ascii_alphanumeric() && c != '-');
+                edge(before) && edge(after)
+            })
+        };
+        let missing: Vec<&String> = commands.iter().filter(|c| !named(c)).collect();
+        assert!(missing.is_empty(), "run_command does not name {missing:?}");
     }
 
     #[test]
