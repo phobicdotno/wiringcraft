@@ -84,72 +84,60 @@ fn git_source_with_an_invalid_name_is_rejected() {
     }
 }
 
-/// Environment variables are process-wide, so everything that sets them lives in this one test.
 #[test]
-fn cache_root_order_and_git_sync() -> Result<()> {
-    let saved: Vec<_> = ["WIRINGCRAFT_CACHE", "XDG_CACHE_HOME", "HOME"]
-        .into_iter()
-        .map(|k| (k, std::env::var_os(k)))
-        .collect();
-    let result = cache_root_order().and_then(|()| git_clone_and_update());
-    for (k, v) in saved {
-        // SAFETY: no other test in this crate reads or writes these variables.
-        unsafe {
-            match v {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
-    }
-    result
+fn cache_root_order() {
+    let os = |s: &str| Some(OsString::from(s));
+    assert_eq!(
+        cache_root_from(os("/c/wc"), os("/c/xdg"), os("/c/home")),
+        Some(PathBuf::from("/c/wc"))
+    );
+    assert_eq!(
+        cache_root_from(None, os("/c/xdg"), os("/c/home")),
+        Some(PathBuf::from("/c/xdg/wiringcraft"))
+    );
+    assert_eq!(
+        cache_root_from(None, None, os("/c/home")),
+        Some(PathBuf::from("/c/home/.cache/wiringcraft"))
+    );
+    assert_eq!(cache_root_from(None, None, None), None);
 }
 
-fn cache_root_order() -> Result<()> {
-    // SAFETY: see `cache_root_order_and_git_sync`.
-    unsafe {
-        std::env::set_var("WIRINGCRAFT_CACHE", "/c/wc");
-        std::env::set_var("XDG_CACHE_HOME", "/c/xdg");
-        std::env::set_var("HOME", "/c/home");
-    }
-    assert_eq!(cache_root(), Some(PathBuf::from("/c/wc")));
-    unsafe { std::env::remove_var("WIRINGCRAFT_CACHE") };
-    assert_eq!(cache_root(), Some(PathBuf::from("/c/xdg/wiringcraft")));
-    unsafe { std::env::remove_var("XDG_CACHE_HOME") };
-    assert_eq!(cache_root(), Some(PathBuf::from("/c/home/.cache/wiringcraft")));
-    Ok(())
-}
-
-fn git_clone_and_update() -> Result<()> {
+#[test]
+fn git_source_clones_then_updates() -> Result<()> {
     let tmp = tempfile::tempdir().map_err(io)?;
     let upstream = tmp.path().join("upstream");
     let cache = tmp.path().join("cache");
     std::fs::create_dir(&upstream).map_err(io)?;
-    // SAFETY: see `cache_root_order_and_git_sync`.
-    unsafe { std::env::set_var("WIRINGCRAFT_CACHE", &cache) };
 
+    // main is one commit ahead of the v1 tag, so a pinned clone differs from a default one.
     run_git(&upstream, &["init", "-q", "-b", "main"])?;
     commit_file(&upstream, "v1")?;
     run_git(&upstream, &["tag", "v1"])?;
+    commit_file(&upstream, "v2")?;
 
     let loc = upstream.to_string_lossy().into_owned();
     let latest = src("latest", "git", &loc, None);
     let pinned = src("pinned", "git", &loc, Some("v1"));
     let proj = tmp.path();
+    let sync = |s: &LibrarySource| sync_one_in(proj, s, Some(&cache));
 
     // Resolving a git source points at its folder in the cache.
-    assert_eq!(Source::resolve(proj, &latest)?.root, cache.join("git").join("latest"));
+    assert_eq!(
+        Source::resolve_in(proj, &latest, Some(&cache))?.root,
+        cache.join("git").join("latest")
+    );
 
     // First sync clones: without a reference it takes the default branch, with one that tag.
-    assert_eq!(sync_one(proj, &latest)?, format!("latest: cloned {loc}"));
-    assert_eq!(sync_one(proj, &pinned)?, format!("pinned: cloned {loc}"));
-    assert_eq!(read(&cache.join("git/latest/lib.txt"))?, "v1");
+    assert_eq!(sync(&latest)?, format!("latest: cloned {loc}"));
+    assert_eq!(sync(&pinned)?, format!("pinned: cloned {loc}"));
+    assert_eq!(read(&cache.join("git/latest/lib.txt"))?, "v2");
     assert_eq!(read(&cache.join("git/pinned/lib.txt"))?, "v1");
 
     // A new upstream commit: the next sync fetches and resets; the pinned source stays on v1.
-    commit_file(&upstream, "v2")?;
-    assert_eq!(sync_one(proj, &latest)?, format!("latest: updated from {loc}"));
-    assert_eq!(sync_one(proj, &pinned)?, format!("pinned: updated from {loc}"));
-    assert_eq!(read(&cache.join("git/latest/lib.txt"))?, "v2");
+    commit_file(&upstream, "v3")?;
+    assert_eq!(sync(&latest)?, format!("latest: updated from {loc}"));
+    assert_eq!(sync(&pinned)?, format!("pinned: updated from {loc}"));
+    assert_eq!(read(&cache.join("git/latest/lib.txt"))?, "v3");
     assert_eq!(read(&cache.join("git/pinned/lib.txt"))?, "v1");
     Ok(())
 }

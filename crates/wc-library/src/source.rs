@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -15,12 +16,17 @@ pub struct Source {
 
 impl Source {
     pub fn resolve(project_dir: &Path, s: &LibrarySource) -> Result<Self> {
+        Self::resolve_in(project_dir, s, cache_root().as_deref())
+    }
+
+    /// [`Source::resolve`] with the git cache folder given instead of read from the environment.
+    fn resolve_in(project_dir: &Path, s: &LibrarySource, cache: Option<&Path>) -> Result<Self> {
         let root = match s.kind.as_str() {
             "folder" => {
                 let p = PathBuf::from(&s.location);
                 if p.is_absolute() { p } else { project_dir.join(p) }
             }
-            "git" => git_cache_dir(&s.name)?,
+            "git" => git_cache_dir(&s.name, cache)?,
             other => {
                 return Err(Error::Source {
                     name: s.name.clone(),
@@ -55,22 +61,30 @@ impl Source {
 /// Per-user cache for git sources: `$WIRINGCRAFT_CACHE`, else `$XDG_CACHE_HOME/wiringcraft`,
 /// else `~/.cache/wiringcraft`.
 pub fn cache_root() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("WIRINGCRAFT_CACHE") {
-        return Some(PathBuf::from(p));
-    }
-    if let Some(p) = std::env::var_os("XDG_CACHE_HOME") {
-        return Some(PathBuf::from(p).join("wiringcraft"));
-    }
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    Some(PathBuf::from(home).join(".cache").join("wiringcraft"))
+    cache_root_from(
+        std::env::var_os("WIRINGCRAFT_CACHE"),
+        std::env::var_os("XDG_CACHE_HOME"),
+        std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")),
+    )
 }
 
-fn git_cache_dir(name: &str) -> Result<PathBuf> {
+/// [`cache_root`] from the given variable values (`home` is `HOME`, else `USERPROFILE`).
+fn cache_root_from(wc_cache: Option<OsString>, xdg_cache: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+    if let Some(p) = wc_cache {
+        return Some(PathBuf::from(p));
+    }
+    if let Some(p) = xdg_cache {
+        return Some(PathBuf::from(p).join("wiringcraft"));
+    }
+    Some(PathBuf::from(home?).join(".cache").join("wiringcraft"))
+}
+
+fn git_cache_dir(name: &str, cache: Option<&Path>) -> Result<PathBuf> {
     wc_core::store::check_id(name).map_err(|e| Error::Source {
         name: name.into(),
         message: e.to_string(),
     })?;
-    let root = cache_root().ok_or_else(|| Error::Source {
+    let root = cache.ok_or_else(|| Error::Source {
         name: name.into(),
         message: "no cache folder (set WIRINGCRAFT_CACHE)".into(),
     })?;
@@ -98,9 +112,14 @@ fn git(args: &[&str], cwd: Option<&Path>, name: &str) -> Result<()> {
 }
 
 pub(crate) fn sync_one(project_dir: &Path, s: &LibrarySource) -> Result<String> {
+    sync_one_in(project_dir, s, cache_root().as_deref())
+}
+
+/// [`sync_one`] with the git cache folder given instead of read from the environment.
+fn sync_one_in(project_dir: &Path, s: &LibrarySource, cache: Option<&Path>) -> Result<String> {
     match s.kind.as_str() {
         "folder" => {
-            let src = Source::resolve(project_dir, s)?;
+            let src = Source::resolve_in(project_dir, s, cache)?;
             Ok(if src.root.is_dir() {
                 format!("{}: folder {}", s.name, src.root.display())
             } else {
@@ -108,7 +127,7 @@ pub(crate) fn sync_one(project_dir: &Path, s: &LibrarySource) -> Result<String> 
             })
         }
         "git" => {
-            let dir = git_cache_dir(&s.name)?;
+            let dir = git_cache_dir(&s.name, cache)?;
             let reference = s.reference.as_deref().unwrap_or("HEAD");
             if dir.join(".git").is_dir() {
                 git(&["fetch", "--depth", "1", "origin", reference], Some(&dir), &s.name)?;
