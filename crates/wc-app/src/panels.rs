@@ -945,6 +945,14 @@ fn box_size_field(ui: &mut egui::Ui, value: &mut f64) {
 /// as its Apply button does (one undo step): called before the project is saved (#932). A form
 /// read for another version of the box (after an Undo, say) is left alone, as the panel reads
 /// it again. Returns why the changes were refused, which the form also shows.
+/// Whether the black box form holds a change that [`apply_black_box_draft`] refused: it stays
+/// in the form, with its reason, for the person to correct.
+pub fn black_box_draft_refused(ps: &PanelState) -> bool {
+    ps.black_box
+        .as_ref()
+        .is_some_and(|(_, form)| form.error.is_some() && form.changed())
+}
+
 pub fn apply_black_box_draft(open: &mut Open, ed: &mut Editor, ps: &mut PanelState) -> Option<String> {
     let ((page, id, hash), form) = ps.black_box.as_mut()?;
     let current = open

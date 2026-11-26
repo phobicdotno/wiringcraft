@@ -1420,11 +1420,12 @@ impl App {
         }
     }
 
-    /// Save, then carry out what was asked. When the save does not go through (its reason
-    /// shows), the project stays open as it is.
+    /// Save, then carry out what was asked. When the save does not go through, or a black box
+    /// form's change it applies first is refused (its reason shows, and the form keeps the
+    /// change), the project stays open as it is.
     fn save_and_leave(&mut self, leave: Leave) {
         self.carry_out(Action::Save);
-        if self.open.as_ref().is_some_and(|o| o.dirty) {
+        if self.open.as_ref().is_some_and(|o| o.dirty) || panels::black_box_draft_refused(&self.panels) {
             return;
         }
         self.leave(leave);
@@ -8064,6 +8065,50 @@ mod nudge_tests {
         let symbol = back.project.pages[page].symbol(&id).unwrap().symbol.clone();
         let names: Vec<&str> = back.symbols[&symbol].pins.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["A"], "the saved box has the point name typed in the form");
+    }
+
+    /// Save in the unsaved-changes question with a black box form whose change is refused
+    /// (two points with one name): the project is saved, but the window stays open and the
+    /// form keeps the change and its reason (#1019).
+    #[test]
+    fn save_and_close_stays_open_when_the_black_box_form_is_refused() {
+        use wc_core::{BoxPin, BoxSide};
+        let (_tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        let page = app.ed.page;
+        let pin = |name: &str, offset| BoxPin {
+            name: name.into(),
+            side: BoxSide::Left,
+            offset,
+        };
+        let open = app.open.as_mut().unwrap();
+        let id = open
+            .add_black_box(
+                page,
+                Point::new(120.0, 40.0),
+                Point::new(140.0, 60.0),
+                &[pin("1", 5.0), pin("2", 10.0)],
+                None,
+            )
+            .unwrap();
+        app.ed.select_only(Selection::Symbol(id));
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        let form = panels::black_box_form_mut(&mut app.panels).unwrap();
+        form.rows[1].name = "1".into();
+        let sent = app_frame(&mut app, &ctx, Vec::new(), true);
+        assert!(sent.contains(&egui::ViewportCommand::CancelClose));
+        assert!(matches!(app.dialog, Some(Dialog::Unsaved(Leave::Close))));
+        app.dialog = None;
+        app.save_and_leave(Leave::Close);
+        assert!(!app.open.as_ref().unwrap().dirty, "the project itself was saved");
+        assert!(
+            panels::black_box_draft_refused(&app.panels),
+            "the form keeps the change"
+        );
+        assert!(app.ed.message.contains("not changed"), "{}", app.ed.message);
+        let sent = app_frame(&mut app, &ctx, Vec::new(), false);
+        assert!(!sent.contains(&egui::ViewportCommand::Close), "the window stays open");
     }
 
     #[test]
