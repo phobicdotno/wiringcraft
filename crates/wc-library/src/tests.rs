@@ -524,6 +524,16 @@ fn every_starter_symbol_loads_under_its_file_name_with_distinct_pins() -> Result
     ] {
         assert_eq!(lib.symbol(id)?.0.role, role, "{id}");
     }
+    // The main switch (#680): a 3-pole switch with its own tag, and an example part using it.
+    let (main_switch, _) = lib.symbol("wc.switch.disconnector.3p")?;
+    assert_eq!(main_switch.role, SymbolRole::Standalone);
+    assert_eq!(main_switch.letter_code, "Q");
+    let names: Vec<_> = main_switch.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["1", "2", "3", "4", "5", "6"]);
+    assert_eq!(
+        lib.part("example.ex-ms-3p-40")?.0.symbol.as_deref(),
+        Some("wc.switch.disconnector.3p")
+    );
     Ok(())
 }
 
