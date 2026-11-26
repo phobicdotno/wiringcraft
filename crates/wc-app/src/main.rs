@@ -949,8 +949,14 @@ impl App {
         }
         let Some(open) = self.open.as_mut() else { return };
         let (done, msg) = imports::import(open, kind, file, lib, self.ed.page);
-        // The project's own folder is listed first once parts are in it, as for symbols.
-        if done && let Some(source) = target.and_then(|t| t.declare) {
+        // The project's own folder is listed first once parts are in it, as for symbols; so is
+        // a new folder chosen outside the library list.
+        let source = match (target, lib) {
+            (Some(t), _) => t.declare,
+            (None, Some(l)) if kind.needs_library() => new_folder_source(&open.dir, l, &open.project.meta.libraries),
+            (None, _) => None,
+        };
+        if done && let Some(source) = source {
             open.checkpoint();
             open.project.meta.libraries.insert(0, source);
             open.dirty = true;
@@ -1469,17 +1475,26 @@ impl App {
             Action::ExportDrawings => self.pending = Some(Pending::Export(Export::Drawings)),
             a if imports::Kind::of(a).is_some() => {
                 if let Some(kind) = imports::Kind::of(a) {
-                    if kind.needs_library()
-                        && let Ok(lib) = wc_library::Library::open(&open.dir, &open.project)
+                    match kind
+                        .needs_library()
+                        .then(|| wc_library::Library::open(&open.dir, &open.project))
                     {
-                        self.dialog = Some(Dialog::ImportParts {
-                            kind,
-                            targets: library_targets(&lib, open),
-                            chosen: 0,
-                        });
-                    } else {
-                        // Without the project's library list the folder picker asks instead.
-                        self.pending = Some(Pending::Import(kind, None));
+                        Some(Ok(lib)) => {
+                            self.dialog = Some(Dialog::ImportParts {
+                                kind,
+                                targets: library_targets(&lib, open),
+                                chosen: 0,
+                            });
+                        }
+                        // Without the project's library list the folder picker asks instead,
+                        // and the status line says why the list is not offered.
+                        Some(Err(e)) => {
+                            self.ed.message = format!(
+                                "The project's libraries could not be read ({e}); pick the library folder for the parts."
+                            );
+                            self.pending = Some(Pending::Import(kind, None));
+                        }
+                        None => self.pending = Some(Pending::Import(kind, None)),
                     }
                 }
             }
@@ -3107,7 +3122,7 @@ impl App {
                     ui.horizontal(|ui| {
                         let go = ui.button("Import").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)));
                         if go {
-                            let folder = if ask_lib { lib.path().map(Some) } else { Ok(None) };
+                            let folder = typed_library(ask_lib, lib);
                             match file.path().and_then(|f| folder.map(|l| (f, l))) {
                                 Ok((f, _)) if !f.is_file() => *error = Some(format!("{} is not a file.", f.display())),
                                 Ok((f, l)) => {
@@ -3917,6 +3932,66 @@ fn main_viewport() -> egui::ViewportBuilder {
         .with_min_inner_size([900.0, 560.0])
         .with_title("WiringCraft")
         .with_icon(window_icon())
+}
+
+/// The library folder typed into the import form, when the form asks for one: a blank field is
+/// refused rather than taken as the projects folder.
+fn typed_library(ask: bool, field: &prefs::FolderField) -> Result<Option<PathBuf>, String> {
+    if !ask {
+        Ok(None)
+    } else if field.is_empty() {
+        Err("Type the library folder for the parts.".to_owned())
+    } else {
+        field.path().map(Some)
+    }
+}
+
+/// The source to add to the project for a parts folder chosen outside its library list (with
+/// "Another folder…" or the folder picker): None when `folder` is already one of `declared`
+/// (compared as given and as canonical paths). Its name is the folder's name, made unique
+/// among `declared`, since library proposals find their destination by name.
+fn new_folder_source(
+    project_dir: &Path,
+    folder: &Path,
+    declared: &[wc_core::project::LibrarySource],
+) -> Option<wc_core::project::LibrarySource> {
+    let same = |a: &Path, b: &Path| {
+        a == b
+            || matches!(
+                (a.canonicalize(), b.canonicalize()),
+                (Ok(x), Ok(y)) if x == y
+            )
+    };
+    let listed = declared.iter().any(|d| {
+        d.kind == "folder" && {
+            let at = Path::new(&d.location);
+            let at = if at.is_absolute() {
+                at.to_path_buf()
+            } else {
+                project_dir.join(at)
+            };
+            same(&at, folder)
+        }
+    });
+    if listed {
+        return None;
+    }
+    let base = folder
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "parts".to_owned());
+    let taken = |n: &str| declared.iter().any(|d| d.name == n);
+    let name = std::iter::once(base.clone())
+        .chain((2..).map(|k| format!("{base}-{k}")))
+        .find(|n| !taken(n))
+        .unwrap_or(base);
+    Some(wc_core::project::LibrarySource {
+        name,
+        kind: "folder".into(),
+        location: folder.display().to_string(),
+        reference: None,
+    })
 }
 
 /// Where imported symbols or parts can go: the project's own library folder first, then its
@@ -6126,5 +6201,44 @@ mod held_tests {
         // The panel was removed.
         follow_panel_pick(&mut ed, &project, "gone", k1.as_ref());
         assert_eq!((ed.panel, ed.panel_pick), (None, None));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod import_folder_tests {
+    use super::*;
+
+    #[test]
+    fn a_blank_library_field_is_refused_not_taken_as_the_projects_folder() {
+        let blank = prefs::FolderField::typed("  ".to_owned());
+        assert!(typed_library(true, &blank).is_err());
+        // Not asked: the field is not read at all.
+        assert_eq!(typed_library(false, &blank), Ok(None));
+        let typed = prefs::FolderField::typed("parts".to_owned());
+        assert!(matches!(typed_library(true, &typed), Ok(Some(_))));
+    }
+
+    #[test]
+    fn a_new_folder_chosen_for_parts_is_declared_and_a_listed_one_is_not() {
+        let t = tempfile::tempdir().unwrap();
+        let project = t.path().join("proj");
+        let listed = project.join("library");
+        let other = t.path().join("vendor");
+        std::fs::create_dir_all(&listed).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let declared = vec![wc_core::project::LibrarySource {
+            name: "vendor".into(),
+            kind: "folder".into(),
+            location: "library".into(),
+            reference: None,
+        }];
+        // Listed already (relative to the project): nothing to add.
+        assert_eq!(new_folder_source(&project, &listed, &declared), None);
+        // New: added as a folder source, its name made unique among the declared ones.
+        let got = new_folder_source(&project, &other, &declared).unwrap();
+        assert_eq!(got.kind, "folder");
+        assert_eq!(got.name, "vendor-2");
+        assert_eq!(Path::new(&got.location), other.as_path());
     }
 }

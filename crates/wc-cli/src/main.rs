@@ -20,15 +20,58 @@ use wc_import::run::{
 
 type Res<T> = Result<T, String>;
 
-/// Run an import with a fresh [`run::Log`], then print what it said in order: result lines on
-/// standard output, warnings on standard error. The log is printed also when the import fails.
+/// Run an import with a [`run::Log`] that prints each line as it is added: result lines on
+/// standard output, warnings on standard error, so what an archive import has done shows while
+/// it goes on to its next entry.
 fn logged(f: impl FnOnce(&mut run::Log) -> Res<()>) -> Res<()> {
-    let mut log = run::Log::default();
+    logged_to(std::io::stdout(), std::io::stderr(), f)
+}
+
+/// [`logged`] onto `out` and `err`. A line that cannot be printed (a closed pipe) does not stop
+/// the import or hide its result: the import goes on, and the failure is reported once on the
+/// other stream, apart from the import's own result.
+fn logged_to<O, E>(out: O, err: E, f: impl FnOnce(&mut run::Log) -> Res<()>) -> Res<()>
+where
+    O: std::io::Write + Send + 'static,
+    E: std::io::Write + Send + 'static,
+{
+    use std::sync::{Arc, Mutex};
+    type Streams<O, E> = (O, E, Option<(bool, std::io::Error)>);
+    let streams: Arc<Mutex<Streams<O, E>>> = Arc::new(Mutex::new((out, err, None)));
+    let shared = Arc::clone(&streams);
+    let mut log = run::Log::echoing(move |m| {
+        let Ok(mut s) = shared.lock() else { return };
+        let (out, err, failed) = &mut *s;
+        let (on_out, r) = match m {
+            run::Msg::Out(line) => (true, writeln!(out, "{line}").and_then(|()| out.flush())),
+            run::Msg::Err(line) => (false, writeln!(err, "{line}").and_then(|()| err.flush())),
+        };
+        if let Err(e) = r
+            && failed.is_none()
+        {
+            *failed = Some((on_out, e));
+        }
+    });
     let r = f(&mut log);
-    for m in log.0 {
-        match m {
-            run::Msg::Out(line) => println!("{line}"),
-            run::Msg::Err(line) => eprintln!("{line}"),
+    drop(log);
+    if let Ok(mut s) = streams.lock() {
+        let (out, err, failed) = &mut *s;
+        if let Some((on_out, e)) = failed.take() {
+            let (name, other): (&str, &mut dyn std::io::Write) = if on_out {
+                ("standard output", err)
+            } else {
+                ("standard error", out)
+            };
+            let done = if r.is_ok() {
+                "the import was done"
+            } else {
+                "the import failed"
+            };
+            // Nothing is left to report this to when the other stream fails as well.
+            let _ = writeln!(
+                other,
+                "warning: the import's report could not be printed on {name}: {e}; {done}"
+            );
         }
     }
     r
@@ -4256,6 +4299,78 @@ mod tests {
         let mut missing = Vec::new();
         commands_and_args_without_help(&Cli::command(), "wiringcraft", &mut missing);
         assert!(missing.is_empty(), "no help text for: {missing:#?}");
+    }
+
+    /// A stream the test reads while the import is still running.
+    #[derive(Clone, Default)]
+    struct Shared(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Shared {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Shared {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    /// A stream whose reader went away (`wiringcraft import ... | head -0`).
+    struct Closed;
+
+    impl std::io::Write for Closed {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_import_line_is_printed_before_the_import_goes_on_to_the_next_entry() {
+        let (out, err) = (Shared::default(), Shared::default());
+        let r = logged_to(out.clone(), err.clone(), |log| {
+            log.out("archive: a.dxf".into());
+            log.err("warning: b".into());
+            // The next entry is still being read here, and the first is already shown.
+            assert_eq!(out.text(), "archive: a.dxf\n");
+            assert_eq!(err.text(), "warning: b\n");
+            log.out("archive: c.pdf".into());
+            Ok(())
+        });
+        assert_eq!(r, Ok(()));
+        assert_eq!(out.text(), "archive: a.dxf\narchive: c.pdf\n");
+    }
+
+    #[test]
+    fn a_report_that_cannot_be_printed_does_not_hide_a_finished_import() {
+        let t = tempfile::tempdir().unwrap();
+        let saved = t.path().join("page.toml");
+        let err = Shared::default();
+        let r = logged_to(Closed, err.clone(), |log| {
+            log.out("archive: a.dxf".into());
+            // The import goes on after the line could not be printed, and saves.
+            std::fs::write(&saved, "page").map_err(|e| e.to_string())?;
+            log.out("imported page 300".into());
+            log.err("warning: kept".into());
+            Ok(())
+        });
+        assert_eq!(r, Ok(()));
+        assert!(saved.is_file());
+        let shown = err.text();
+        assert!(shown.starts_with("warning: kept\n"), "{shown}");
+        assert!(
+            shown.contains("could not be printed on standard output") && shown.contains("the import was done"),
+            "{shown}"
+        );
+        assert_eq!(shown.matches("could not be printed").count(), 1, "{shown}");
     }
 
     #[cfg(unix)]

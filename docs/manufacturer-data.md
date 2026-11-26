@@ -42,8 +42,10 @@ name a command line option are worded for the app.
 Changes not saved yet are saved first, the imported pages and devices come in as one undo step,
 and the import's report and warnings are shown when it is done. New pages are numbered from the
 CLI's default first page, or after the project's highest page number when that is higher. The
-app imports the first project of a SolidWorks archive with its pages numbered from 100 (or after
-the project's highest page when that is higher) instead of its own page numbers, and with no symbol map, and an archive's KiCad libraries and parts lists are listed, not imported; use the CLI for
+app imports the first project of a SolidWorks archive with its pages numbered from 100, or from
+one above the project's highest numeric page number when that is higher (with page 101 in use,
+from 102 even when 100 is free, since the imported pages follow on from one number), instead of
+its own page numbers, and with no symbol map, and an archive's KiCad libraries and parts lists are listed, not imported; use the CLI for
 `--pick`, `--symbol-map`, `--first-page` and `--lib` there.
 
 In the app, **Library → Import symbols…** takes DXF, SVG, `.kicad_sym` and `.elmt` files together,

@@ -24,19 +24,60 @@ pub enum Msg {
     Err(String),
 }
 
-/// What an import had to say, in order.
+/// What an import had to say, in order. A log made with [`Log::echoing`] also hands each line
+/// on as it is added, so a long import shows what it has done so far (the CLI prints it).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct Log(pub Vec<Msg>);
+pub struct Log(pub Vec<Msg>, Echo);
+
+/// Where a log's lines go as they are added. Not part of what a log holds: a clone has none,
+/// and logs compare by their lines only.
+#[derive(Default)]
+pub struct Echo(Option<EchoFn>);
+
+/// What an [`Echo`] hands each line to.
+type EchoFn = Box<dyn FnMut(&Msg) + Send>;
+
+impl std::fmt::Debug for Echo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "Echo(on)" } else { "Echo(off)" })
+    }
+}
+
+impl Clone for Echo {
+    fn clone(&self) -> Self {
+        Echo(None)
+    }
+}
+
+impl PartialEq for Echo {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Echo {}
 
 impl Log {
+    /// A log that also gives each line to `echo` as it is added.
+    pub fn echoing(echo: impl FnMut(&Msg) + Send + 'static) -> Self {
+        Log(Vec::new(), Echo(Some(Box::new(echo))))
+    }
+
+    fn push(&mut self, m: Msg) {
+        if let Some(echo) = self.1.0.as_mut() {
+            echo(&m);
+        }
+        self.0.push(m);
+    }
+
     /// Add a result line.
     pub fn out(&mut self, line: String) {
-        self.0.push(Msg::Out(line));
+        self.push(Msg::Out(line));
     }
 
     /// Add a warning or note line.
     pub fn err(&mut self, line: String) {
-        self.0.push(Msg::Err(line));
+        self.push(Msg::Err(line));
     }
 
     /// Every line, in order, as one text.
@@ -147,7 +188,10 @@ pub fn pdf(dir: &Path, file: &Path, first_page: usize, log: &mut Log) -> Res<()>
 /// An Eplan Electric P8 project (.elk, .edb folder or zip) into the project (`import eplan`).
 pub fn eplan(dir: &Path, path: &Path, first_page: usize, log: &mut Log) -> Res<()> {
     let mut p = load(dir)?;
-    let tables = eplan_tables(path)?;
+    let (tables, read_warnings) = eplan_tables(path)?;
+    for w in &read_warnings {
+        err!(log, "warning: {}", escape_field(w));
+    }
     let ep = crate::eplan::read(&tables).map_err(e)?;
     let (built, warnings) = crate::eplan::build(&ep, first_page);
     for w in ep.warnings.iter().chain(&warnings) {
@@ -211,7 +255,10 @@ pub fn swe(
         }
         (bytes, None, None)
     } else {
-        let file = std::io::BufReader::new(std::fs::File::open(path).map_err(e)?);
+        // One open file for the database, the catalog and the drawings, so they all come from
+        // the same export even when the archive is replaced during the import.
+        std::io::Seek::rewind(&mut file).map_err(e)?;
+        let file = std::io::BufReader::new(&mut file);
         let got = crate::swe::database_from_archive(file, project).map_err(|x| format!("{x} (use --pick)"))?;
         if got.count > 1 {
             err!(
@@ -239,7 +286,8 @@ pub fn swe(
     // comes along, and its size is used for layout footprints the source gives no box.
     let catalog_read = !is_db;
     if catalog_read {
-        let file = std::io::BufReader::new(std::fs::File::open(path).map_err(e)?);
+        std::io::Seek::rewind(&mut file).map_err(e)?;
+        let file = std::io::BufReader::new(&mut file);
         match crate::swe::library::catalog_from_archive(file) {
             Ok(lib) => {
                 // Why a catalog row was left out, so a device it would have matched is
@@ -254,7 +302,8 @@ pub fn swe(
     }
     // The symbol and page drawings (DWG): symbols without one stay boxes.
     if let Some(folder) = &folder {
-        let file = std::io::BufReader::new(std::fs::File::open(path).map_err(e)?);
+        std::io::Seek::rewind(&mut file).map_err(e)?;
+        let file = std::io::BufReader::new(&mut file);
         match crate::swe::drawings_from_archive(file, folder) {
             Ok(drawings) => {
                 for w in &drawings.warnings {
@@ -1018,7 +1067,7 @@ pub fn write_kicad(symbols: Vec<crate::kicad::Imported>, lib: &Path, category: &
         out!(
             log,
             "{} -> {} ({} pins, {} shapes)",
-            imp.kicad_name,
+            escape_field(&imp.kicad_name),
             path.display(),
             imp.symbol.pins.len(),
             imp.symbol.graphics.len()
@@ -1027,8 +1076,10 @@ pub fn write_kicad(symbols: Vec<crate::kicad::Imported>, lib: &Path, category: &
     Ok(n)
 }
 
-/// The tables of an Eplan project given as an .elk file, an .edb folder or a zip of the folder.
-pub fn eplan_tables(path: &Path) -> Result<crate::eplan::Tables, String> {
+/// The tables of an Eplan project given as an .elk file, an .edb folder or a zip of the folder,
+/// with warnings. A table that is there but cannot be read is an error naming it; an unreadable
+/// `ProjectInfo.xml` is a warning, and the project is read without its title block data.
+pub fn eplan_tables(path: &Path) -> Result<(crate::eplan::Tables, Vec<String>), String> {
     let e = |x: std::io::Error| format!("{}: {x}", path.display());
     let folder = if path.is_dir() {
         path.to_path_buf()
@@ -1042,17 +1093,25 @@ pub fn eplan_tables(path: &Path) -> Result<crate::eplan::Tables, String> {
         path.with_file_name(name)
     };
     let mut tables = crate::eplan::Tables::new();
+    let mut warnings = Vec::new();
     for entry in std::fs::read_dir(&folder).map_err(|x| format!("{}: {x}", folder.display()))? {
         let entry = entry.map_err(|x| format!("{}: {x}", folder.display()))?;
         let name = entry.file_name().to_string_lossy().to_lowercase();
         if crate::eplan::wanted(&name) {
             // A table that is there but cannot be read is not taken for an empty one.
             let path = entry.path();
-            let bytes = std::fs::read(&path).map_err(|x| format!("{}: {x}", path.display()))?;
-            tables.insert(name, bytes);
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    tables.insert(name, bytes);
+                }
+                Err(x) if crate::eplan::optional(&name) => {
+                    warnings.push(format!("{}: {x}; read without it", path.display()));
+                }
+                Err(x) => return Err(format!("{}: {x}", path.display())),
+            }
         }
     }
-    Ok(tables)
+    Ok((tables, warnings))
 }
 
 /// Add imported symbols, parts, pages and devices to a project, pinning symbols and parts in
@@ -1750,6 +1809,37 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_project_info_is_a_warning_and_the_tables_are_still_read() {
+        let t = tmp();
+        let edb = t.path().join("plant.edb");
+        // A folder in its place cannot be read as a file.
+        assert!(std::fs::create_dir_all(edb.join("ProjectInfo.xml")).is_ok());
+        assert!(std::fs::write(edb.join("page.eod"), b"x").is_ok());
+        match eplan_tables(&edb) {
+            Ok((tables, warnings)) => {
+                assert!(tables.contains_key("page.eod"));
+                assert!(!tables.contains_key("projectinfo.xml"));
+                assert_eq!(warnings.len(), 1);
+                assert!(warnings[0].contains("ProjectInfo.xml"), "{warnings:?}");
+            }
+            Err(why) => unreachable!("optional metadata stopped the import: {why}"),
+        }
+    }
+
+    #[test]
+    fn a_kicad_symbol_name_is_escaped_before_it_is_reported() {
+        let t = tmp();
+        let text = "(kicad_symbol_lib (symbol \"R\u{1b}[2J\" (symbol \"R_0_1\" (rectangle (start -1 -1) (end 1 1)))))";
+        let mut log = Log::default();
+        let symbols = read_kicad(text, "kicad.t", 1.0, &mut log).unwrap_or_default();
+        assert_eq!(symbols.len(), 1, "{log:?}");
+        assert!(write_kicad(symbols, &t.path().join("lib"), "kicad", &mut log).is_ok());
+        let shown = log.text();
+        assert!(!shown.contains('\u{1b}'), "{shown:?}");
+        assert!(shown.contains("\\u{1b}"), "{shown:?}");
+    }
+
+    #[test]
     fn parts_csv_writes_each_part_into_the_library_folder_and_says_how_many() {
         let t = tmp();
         let csv = t.path().join("parts.csv");
@@ -1764,6 +1854,62 @@ mod tests {
                 .ends_with(&format!("imported 2 part(s) into {}", lib.display())),
             "{log:?}"
         );
+    }
+
+    /// Every file under `dir` with its bytes.
+    fn files(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        let mut out = std::collections::BTreeMap::new();
+        let mut todo = vec![dir.to_path_buf()];
+        while let Some(d) = todo.pop() {
+            for entry in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    todo.push(path);
+                } else if let Ok(bytes) = std::fs::read(&path) {
+                    out.insert(path, bytes);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_save_that_fails_after_writing_puts_the_project_and_vendored_files_back() {
+        let t = tmp();
+        let dir = t.path().join("p");
+        assert!(store::save(&dir, &Project::new("t")).is_ok());
+        let before = files(&dir);
+        let mut p = match load(&dir) {
+            Ok(p) => p,
+            Err(why) => unreachable!("{why}"),
+        };
+        let built = crate::aml::Built {
+            symbols: vec![wc_core::Symbol {
+                source: String::new(),
+                id: "imp.coil".into(),
+                name: "Coil".into(),
+                category: String::new(),
+                letter_code: "K".into(),
+                role: Default::default(),
+                graphics: vec![],
+                pins: vec![],
+                tag_at: Default::default(),
+                description: String::new(),
+            }],
+            ..Default::default()
+        };
+        // The save writes the project's own files and the lockfile, then stops at a page id it
+        // cannot write; the vendored symbol is already on disk by then.
+        let r = add_and_save_with(&dir, &mut p, built, "import:t", Replace::No, |p| {
+            p.pages.push(wc_core::Page::new("bad/id", "1", "Bad"));
+        });
+        assert!(r.is_err());
+        assert_ne!(
+            p.lock.symbols.get("imp.coil"),
+            None,
+            "the import was not added before the save"
+        );
+        assert_eq!(files(&dir), before);
     }
 
     #[test]
