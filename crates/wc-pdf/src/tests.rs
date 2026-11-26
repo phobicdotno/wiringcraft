@@ -2407,3 +2407,24 @@ fn a_declared_node_with_a_blank_tag_keeps_its_box_address_and_station() {
         report.warnings
     );
 }
+
+#[test]
+fn bookmarks_and_the_document_title_are_text_strings_not_font_codes() {
+    // A reader decodes bookmark titles as PDFDocEncoding or UTF-16: the page font's WinAnsi
+    // en dash (0x96) would show as "Œ" there, and Ω could not be written at all (#726).
+    let mut project = Project::new("Pumpe – Ålesund");
+    project.pages = vec![Page::new("p1", "1", "Motor – pump Ω"), Page::new("p2", "2", "Control")];
+    let (pdf, _) = export(&project, &BTreeMap::new(), &Options::default());
+    let text = String::from_utf8_lossy(&pdf);
+    let utf16 = |s: &str| -> String {
+        let units: String = s.encode_utf16().map(|u| format!("{u:04X}")).collect();
+        format!("<FEFF{units}>")
+    };
+    assert_eq!(writer::pdf_text_string("1 Motor – pump Ω"), utf16("1 Motor – pump Ω"));
+    assert!(text.contains(&format!("/Title {}", utf16("1 Motor – pump Ω"))));
+    assert!(text.contains(&format!("/Title {} /Producer", utf16("Pumpe – Ålesund"))));
+    // Plain ASCII titles stay as they were, the same bytes in every encoding.
+    assert!(text.contains(&format!("/Title {}", writer::pdf_text("2 Control"))));
+    // The page itself still draws the title with the font's own codes.
+    assert!(text.contains(&format!("{} Tj", writer::pdf_text("Motor – pump Ω"))));
+}
