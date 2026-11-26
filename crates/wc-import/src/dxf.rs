@@ -691,9 +691,8 @@ fn shapes(
                     // the range of numbers is not refused here: its shapes are, one by one, and
                     // each copy takes from the budget like any other.
                     let cell_xf = |cell: usize| {
-                        let (ox, oy) = array.offset(cell);
                         Xf::shift((-bx, -by))
-                            .then(&Xf::insert((ix + ox, iy + oy), sx, sy, rot))
+                            .then(&Xf::insert(array.at(cell, (ix, iy)), sx, sy, rot))
                             .then(&xf)
                     };
                     // Copies too deep would only be turned away, without taking from the
@@ -2342,13 +2341,15 @@ impl ArrayCells {
         self.cols.saturating_mul(self.rows)
     }
 
-    /// How far copy `cell` (counted along the first row, then the next) lies from the
-    /// insertion point, in the drawing's own coordinates.
-    fn offset(&self, cell: usize) -> (f64, f64) {
+    /// Where copy `cell` (counted along the first row, then the next) lies for an insertion
+    /// point `(ix, iy)`, in the drawing's own coordinates. The column step is added to the
+    /// insertion point before the row step: summed on their own first, two steps near the
+    /// limit could overflow where the copy itself is in range.
+    fn at(&self, cell: usize, (ix, iy): (f64, f64)) -> (f64, f64) {
         let (s, c) = self.turn;
         let col = (cell % self.cols) as f64 * self.spacing.0;
         let row = (cell / self.cols) as f64 * self.spacing.1;
-        (c * col - s * row, s * col + c * row)
+        (ix + c * col - s * row, iy + s * col + c * row)
     }
 }
 
@@ -2438,12 +2439,12 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
                         break;
                     }
                     budget -= 1;
-                    let (ox, oy) = cells.offset(cell);
+                    let (x, y) = cells.at(cell, (ix, iy));
                     out.symbols.push(PlacedSymbol {
                         id: String::new(),
                         symbol: (*id).clone(),
                         // Past the range of numbers, it is left out and said below.
-                        at: Point::new((ix + ox) * scale, -(iy + oy) * scale),
+                        at: Point::new(x * scale, -y * scale),
                         rotation,
                         mirror,
                         tag: tag.take(),
@@ -4003,6 +4004,27 @@ mod tests {
                 .any(|w| w.starts_with("2001 entities not drawn: the drawing expands")),
             "{:?}",
             p.warnings
+        );
+        Ok(())
+    }
+
+    /// A copy in range whose column and row steps would overflow summed on their own is kept:
+    /// the steps are added to the insertion point one at a time.
+    #[test]
+    fn an_array_copy_in_range_past_two_large_steps_is_kept() -> Result<()> {
+        let ins = "0\nINSERT\n2\nB\n10\n-1e308\n20\n0\n50\n45\n70\n2\n71\n2\n44\n1.5e308\n45\n-1.5e308\n";
+        let d = parse(&dxf(ins, ""))?;
+        let cells = ArrayCells::of(&d.entities[0]);
+        let (x, y) = cells.at(3, (-1e308, 0.0));
+        assert!(x.is_finite() && y.is_finite() && x > 1e308, "{x} {y}");
+        // Drawn: all four copies of the line are kept, the last one included.
+        let blocks = "0\nBLOCK\n2\nB\n10\n0\n20\n0\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n0\nENDBLK\n";
+        let (g, skipped) = drawn(ins, blocks)?;
+        assert_eq!(g.len(), 4, "{g:?} {skipped:?}");
+        assert!(g.iter().all(finite_shape), "{g:?}");
+        assert!(
+            g.iter().any(|s| matches!(s, Shape::Line { a, .. } if a.x > 1e308)),
+            "{g:?}"
         );
         Ok(())
     }
