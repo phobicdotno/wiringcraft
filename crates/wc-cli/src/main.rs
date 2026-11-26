@@ -584,6 +584,21 @@ enum PanelCmd {
         #[arg(long, default_value_t = 800.0)]
         height: f64,
     },
+    /// Change a layout's name or plate size. Rails, ducts and devices stay where they are; a
+    /// size that would leave any of them sticking out of the plate is refused.
+    Edit {
+        /// The layout's id.
+        id: String,
+        /// The new name, shown on its page; `""` uses the id.
+        #[arg(long)]
+        name: Option<String>,
+        /// New plate width in mm.
+        #[arg(long)]
+        width: Option<f64>,
+        /// New plate height in mm.
+        #[arg(long)]
+        height: Option<f64>,
+    },
     /// Put devices that have a part and are not on the plate yet onto its rails, sized by the
     /// part's `Width` and `Height` properties.
     Arrange {
@@ -2163,6 +2178,38 @@ fn run(cli: Cli) -> Res<()> {
                     println!("panel {}: {width} x {height} mm, {rails} rail(s)", panel.id);
                     p.panels.push(panel);
                     p.panels.sort_by(|a, b| a.id.cmp(&b.id));
+                }
+                PanelCmd::Edit {
+                    id,
+                    name,
+                    width,
+                    height,
+                } => {
+                    if name.is_none() && width.is_none() && height.is_none() {
+                        return Err("nothing to change: give --name, --width or --height".into());
+                    }
+                    let Some(panel) = p.panels.iter_mut().find(|x| x.id == id) else {
+                        return Err(format!("no panel {id:?}"));
+                    };
+                    let (w, h) = (width.unwrap_or(panel.width), height.unwrap_or(panel.height));
+                    if (width.is_some() || height.is_some())
+                        && !(w.is_finite()
+                            && h.is_finite()
+                            && (200.0..=5000.0).contains(&w)
+                            && (200.0..=5000.0).contains(&h))
+                    {
+                        return Err("plate width and height must be 200 to 5000 mm".into());
+                    }
+                    panel.resize(w, h)?;
+                    if let Some(name) = name {
+                        panel.name = if name.is_empty() { id.clone() } else { name };
+                    }
+                    println!(
+                        "panel {id}: {} ({} x {} mm)",
+                        escape_field(&panel.name),
+                        panel.width,
+                        panel.height
+                    );
                 }
                 PanelCmd::Arrange { id, location } => {
                     let parts = vendored_parts(dir, &p);
@@ -6126,6 +6173,42 @@ mod tests {
         std::fs::remove_file(&vendored).unwrap();
         cli(&dir, &["wire", "p1", &format!("{s1}:1"), "0,0"]).unwrap();
         assert_eq!(load(&dir).unwrap().page("p1").unwrap().wires.len(), 3);
+    }
+
+    #[test]
+    fn a_panel_is_renamed_and_resized_keeping_its_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["device", "--", "-K1"]).unwrap();
+        cli(&dir, &["panel", "new", "main"]).unwrap();
+        cli(&dir, &["panel", "device", "main", "-K1", "--at", "100,600"]).unwrap();
+        let before = load(&dir).unwrap().panels[0].clone();
+
+        cli(
+            &dir,
+            &["panel", "edit", "main", "--name", "Main plate", "--height", "1000"],
+        )
+        .unwrap();
+        let after = load(&dir).unwrap().panels[0].clone();
+        assert_eq!(after.name, "Main plate");
+        assert_eq!((after.width, after.height), (600.0, 1000.0));
+        assert_eq!(after.items, before.items, "rails, ducts and devices are not rebuilt");
+
+        // Too small for the rails, or for the device at y 600..690; out of range; nothing to do;
+        // no such panel: refused, nothing changes.
+        let err = cli(&dir, &["panel", "edit", "main", "--height", "650"]).unwrap_err();
+        assert!(err.contains("sticking out") && err.contains("-K1"), "{err}");
+        assert!(cli(&dir, &["panel", "edit", "main", "--width", "300"]).is_err());
+        assert!(cli(&dir, &["panel", "edit", "main", "--width", "100"]).is_err());
+        assert!(cli(&dir, &["panel", "edit", "main", "--width", "NaN"]).is_err());
+        assert!(cli(&dir, &["panel", "edit", "main"]).is_err());
+        assert!(cli(&dir, &["panel", "edit", "nope", "--name", "x"]).is_err());
+        assert_eq!(load(&dir).unwrap().panels[0], after);
+
+        // An empty name falls back to the id, as `panel new` does.
+        cli(&dir, &["panel", "edit", "main", "--name", ""]).unwrap();
+        assert_eq!(load(&dir).unwrap().panels[0].name, "main");
     }
 
     #[test]
