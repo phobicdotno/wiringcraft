@@ -16,7 +16,7 @@ mod git;
 pub mod subway;
 
 pub use changes::{Change, PageVersion, changes, page_history};
-pub use git::{Git, MergeOutcome, PARENT_PROJECT_ENV};
+pub use git::{Git, LOCK_FILE, MergeOutcome, PARENT_PROJECT_ENV};
 pub use subway::{Commit, Edge, Row, history, subway_svg, subway_text};
 
 #[derive(Debug, thiserror::Error)]
@@ -30,6 +30,9 @@ pub enum Error {
     /// Stopped on request (see [`base::create_from_base_until`]).
     #[error("cancelled")]
     Cancelled,
+    /// A file next to git's own that could not be read or written.
+    #[error("{path}: {source}")]
+    Io { path: String, source: std::io::Error },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

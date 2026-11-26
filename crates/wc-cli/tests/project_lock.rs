@@ -99,6 +99,18 @@ fn a_command_waits_for_the_lock_another_process_holds() -> TestResult {
 #[cfg(unix)]
 #[test]
 fn a_git_hook_running_wiringcraft_on_the_project_does_not_hang_a_commit() -> TestResult {
+    hook_commit_ends(false)
+}
+
+/// The same with the project named by a relative `-C`, from its parent folder.
+#[cfg(unix)]
+#[test]
+fn a_hook_does_not_hang_a_commit_started_with_a_relative_project_folder() -> TestResult {
+    hook_commit_ends(true)
+}
+
+#[cfg(unix)]
+fn hook_commit_ends(relative: bool) -> TestResult {
     use std::os::unix::fs::PermissionsExt;
     let tmp = tempfile::tempdir()?;
     let dir = tmp.path().join("p");
@@ -125,9 +137,13 @@ fn a_git_hook_running_wiringcraft_on_the_project_does_not_hang_a_commit() -> Tes
         .args(["page", "add", "p2", "--number", "2"])
         .status()?;
     assert!(added.success());
-    let mut commit = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
-        .arg("-C")
-        .arg(&dir)
+    let mut commit = Command::new(env!("CARGO_BIN_EXE_wiringcraft"));
+    if relative {
+        commit.current_dir(tmp.path()).args(["-C", "p"]);
+    } else {
+        commit.arg("-C").arg(&dir);
+    }
+    let mut commit = commit
         .args(["vcs", "commit", "-m", "A page"])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

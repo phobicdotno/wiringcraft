@@ -4325,33 +4325,24 @@ fn same_folder(a: &Path, b: &Path) -> bool {
 /// project folder, always there so a command started before `vcs init` and one started after
 /// it wait on the same file. A new project's `.gitignore` leaves it out.
 fn project_lock_path(dir: &Path) -> PathBuf {
-    dir.join(LOCK_NAME)
+    dir.join(wc_vcs::LOCK_FILE)
 }
 
-/// The name of [`project_lock_path`] in the project folder.
-const LOCK_NAME: &str = ".wiringcraft.lock";
-
 /// Leave the lock file out of the project's git history in a repository whose `.gitignore`
-/// predates it: listed in `.git/info/exclude`, which stays local. Best effort: a project whose
-/// exclude list cannot be written only shows the file as new.
+/// predates it (or a linked worktree of one): listed in the repository's local exclude list.
+/// Best effort, with a warning: a project whose exclude list cannot be written only shows the
+/// file as new.
 fn keep_lock_out_of_git(dir: &Path) {
-    let info = dir.join(".git").join("info");
-    if !dir.join(".git").is_dir() {
+    if !dir.join(".git").exists() {
         return;
     }
-    let exclude = info.join("exclude");
-    let line = format!("/{LOCK_NAME}");
-    let text = std::fs::read_to_string(&exclude).unwrap_or_default();
-    if text.lines().any(|l| l.trim() == line) {
-        return;
+    if let Err(err) = wc_vcs::Git::new(dir).exclude_locally(wc_vcs::LOCK_FILE) {
+        eprintln!(
+            "warning: could not leave {} out of git: {}",
+            wc_vcs::LOCK_FILE,
+            escape_field(&err.to_string())
+        );
     }
-    let mut text = text;
-    if !text.is_empty() && !text.ends_with('\n') {
-        text.push('\n');
-    }
-    text.push_str(&line);
-    text.push('\n');
-    let _ = std::fs::create_dir_all(&info).and_then(|()| std::fs::write(&exclude, text));
 }
 
 /// Parse report names; `all` means every report.
@@ -5168,11 +5159,17 @@ mod tests {
         // In a repository, git is told to leave it out, once.
         let other = tmp.path().join("other");
         store::create(&other, "Other").unwrap();
-        std::fs::create_dir(other.join(".git")).unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&other)
+            .status()
+            .unwrap();
+        assert!(init.success());
         drop(project_lock(&other).unwrap());
         drop(project_lock(&other).unwrap());
         let exclude = std::fs::read_to_string(other.join(".git/info/exclude")).unwrap();
-        assert_eq!(exclude, "/.wiringcraft.lock\n");
+        assert_eq!(exclude.matches("/.wiringcraft.lock").count(), 1);
+        assert!(exclude.ends_with("/.wiringcraft.lock\n"));
         // Another project is not held up.
         cli(&other, &["template", "columns", "14"]).unwrap();
         let toml = dir.join(store::PROJECT_FILE);
