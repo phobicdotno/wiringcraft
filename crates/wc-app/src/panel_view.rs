@@ -34,7 +34,9 @@ fn nudged(at: Point, size: (f64, f64), plate: (f64, f64), step: f64, dx: f64, dy
 /// so a large plate fits.
 pub const ZOOM_LIMITS: (f32, f32) = (0.05, 20.0);
 
-pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, snap_step: f64) {
+/// `keyboard_edits` is false while something else has the keyboard, such as an app dialog: the
+/// arrow keys then leave the picked device where it is.
+pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, snap_step: f64, keyboard_edits: bool) {
     let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
     ed.view.size = rect.size();
     let painter = ui.painter_at(rect);
@@ -140,8 +142,9 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
     }
     // The arrow keys move the picked device by one step each press, one undo step a press, kept
     // on the plate as a drag keeps it. The keys are used up here, so nothing else (such as the
-    // schematic page behind this view) acts on them too.
-    if ed.panel_drag.is_none()
+    // schematic page behind this view) acts on them too. Not while a dialog is open.
+    if keyboard_edits
+        && ed.panel_drag.is_none()
         && !ui.ctx().wants_keyboard_input()
         && let Some(i) = ed.panel_pick
         && matches!(p.items.get(i), Some(PanelItem::Device { .. }))
@@ -470,7 +473,7 @@ mod tests {
         let steps = open.undo_steps();
         let mut left = 0;
         let _ = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| show(ui, &mut open, &mut ed, 0, 2.5));
+            egui::CentralPanel::default().show(ctx, |ui| show(ui, &mut open, &mut ed, 0, 2.5, true));
             // The keys are used up: nothing after the panel view sees them.
             left = ctx.input(|i| i.events.len());
         });
@@ -524,7 +527,7 @@ mod tests {
         };
         let steps = open.undo_steps();
         let _ = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| show(ui, &mut open, &mut ed, 0, 5.0));
+            egui::CentralPanel::default().show(ctx, |ui| show(ui, &mut open, &mut ed, 0, 5.0, true));
         });
         // Right moves it off the edge, then Left brings it back: two undo steps.
         let Some(PanelItem::Device { at, .. }) = open.project.panels[0].items.first() else {
@@ -532,6 +535,53 @@ mod tests {
         };
         assert_eq!(*at, Point::new(0.0, 0.0));
         assert_eq!(open.undo_steps(), steps + 2);
+    }
+
+    #[test]
+    fn arrow_keys_leave_the_picked_device_alone_while_a_dialog_is_open() {
+        let (_tmp, mut open) = crate::state::tests::project();
+        open.project.panels.push(wc_core::panel::Panel {
+            id: "panel1".into(),
+            name: "Panel 1".into(),
+            width: 400.0,
+            height: 300.0,
+            items: vec![PanelItem::Device {
+                tag: wc_core::DeviceTag::parse("-K1").unwrap_or_default(),
+                at: Point::new(100.0, 100.0),
+                width: 40.0,
+                height: 60.0,
+                rotation: wc_core::geom::Rotation::R0,
+            }],
+        });
+        let mut ed = Editor::default();
+        ed.panel = Some(0);
+        ed.panel_pick = Some(0);
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let steps = open.undo_steps();
+        let mut left = 0;
+        let _ = ctx.run(input, |ctx| {
+            // A dialog is open: keyboard edits are not allowed.
+            egui::CentralPanel::default().show(ctx, |ui| show(ui, &mut open, &mut ed, 0, 5.0, false));
+            left = ctx.input(|i| i.events.len());
+        });
+        // The key is not used up, and the device and the undo history stay as they were.
+        assert_eq!(left, 1);
+        let Some(PanelItem::Device { at, .. }) = open.project.panels[0].items.first() else {
+            unreachable!("the device is there")
+        };
+        assert_eq!(*at, Point::new(100.0, 100.0));
+        assert_eq!(open.undo_steps(), steps);
     }
 
     #[test]

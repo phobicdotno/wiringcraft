@@ -5425,10 +5425,20 @@ impl eframe::App for App {
                         panels::properties(ui, open, &mut self.ed, &mut self.panels);
                     });
                 });
+            // Keyboard edits wait while a dialog, an import or the symbol editor has the keyboard,
+            // as the schematic's arrow keys do.
+            let keyboard_edits = self.dialog.is_none() && self.importing.is_none() && self.symbol_editor.is_none();
             egui::CentralPanel::default().frame(egui::Frame::new()).show(ctx, |ui| {
                 self.ed.auto_wire = self.prefs.auto_wire;
                 self.ed.layers = self.prefs.layers.clone();
-                canvas::show(ui, open, &mut self.ed, self.prefs.show_grid, self.prefs.snap);
+                canvas::show(
+                    ui,
+                    open,
+                    &mut self.ed,
+                    self.prefs.show_grid,
+                    self.prefs.snap,
+                    keyboard_edits,
+                );
                 let held = open
                     .project
                     .pages
