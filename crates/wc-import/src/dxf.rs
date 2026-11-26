@@ -345,7 +345,8 @@ fn shapes(
     if depth > MAX_NESTING {
         // Block nesting this deep is either a cycle or not worth drawing; say what is left out.
         if !ents.is_empty() {
-            *skipped.entry(TOO_DEEP.to_owned()).or_default() += ents.len();
+            let deep = skipped.entry(TOO_DEEP.to_owned()).or_default();
+            *deep = deep.saturating_add(ents.len());
         }
         return;
     }
@@ -385,7 +386,8 @@ fn shapes(
     for (i, e) in ents.iter().enumerate() {
         if *budget == 0 {
             // This entity and every one after it at this level are left out.
-            *skipped.entry(OVER_LIMIT.to_owned()).or_default() += ents.len() - i;
+            let over = skipped.entry(OVER_LIMIT.to_owned()).or_default();
+            *over = over.saturating_add(ents.len() - i);
             return;
         }
         *budget -= 1;
@@ -605,15 +607,38 @@ fn shapes(
                     let rot = e.f(50);
                     let (s, c) = rot.to_radians().sin_cos();
                     let cells = cols.saturating_mul(rows);
-                    for cell in 0..cells {
+                    let cell_at = |col: usize, row: usize| {
+                        let (col, row) = (col as f64 * dx, row as f64 * dy);
+                        (e.f(10) + c * col - s * row, e.f(20) + s * col + c * row)
+                    };
+                    // Each placement is linear in the column and row, so when the four corners
+                    // are numbers every copy between them is too.
+                    let corners = [(0, 0), (cols - 1, 0), (0, rows - 1), (cols - 1, rows - 1)];
+                    let finite = corners.iter().all(|&(cl, rw)| {
+                        let (x, y) = cell_at(cl, rw);
+                        x.is_finite() && y.is_finite()
+                    });
+                    // Copies that would only be turned away (too deep, or placed past the
+                    // numbers) are counted at once instead of one by one.
+                    let refused = if depth + 1 > MAX_NESTING {
+                        Some((TOO_DEEP, cells.saturating_mul(inner.len())))
+                    } else if !finite {
+                        Some((ARRAY_NOT_NUMBERS, cells))
+                    } else {
+                        None
+                    };
+                    if let Some((why, n)) = refused.filter(|&(_, n)| n > 0) {
+                        let left_out = skipped.entry(why.to_owned()).or_default();
+                        *left_out = left_out.saturating_add(n);
+                    }
+                    for cell in 0..if refused.is_some() { 0 } else { cells } {
                         if *budget == 0 {
                             // The copies not drawn are counted like the entities in them.
-                            *skipped.entry(OVER_LIMIT.to_owned()).or_default() +=
-                                (cells - cell).saturating_mul(inner.len());
+                            let over = skipped.entry(OVER_LIMIT.to_owned()).or_default();
+                            *over = over.saturating_add((cells - cell).saturating_mul(inner.len()));
                             break;
                         }
-                        let (col, row) = ((cell % cols) as f64 * dx, (cell / cols) as f64 * dy);
-                        let at = (e.f(10) + c * col - s * row, e.f(20) + s * col + c * row);
+                        let at = cell_at(cell % cols, cell / cols);
                         let ixf = Xf::shift((-bx, -by))
                             .then(&Xf::insert(at, e.f_or(41, 1.0), e.f_or(42, 1.0), rot))
                             .then(&xf);
@@ -836,6 +861,9 @@ const SPLINE_TOO_FEW: &str = "SPLINE with too few points";
 
 /// The key under which circles and arcs of a stretched block are counted when their angles or
 /// their placed points are not numbers.
+/// The skipped-count key for copies of a block array (MINSERT) whose places are not numbers.
+const ARRAY_NOT_NUMBERS: &str = "copies of a block array placed outside the number range";
+
 const STRETCHED_NOT_NUMBERS: &str = "CIRCLE or ARC of a stretched block whose points are not numbers";
 
 /// The key under which hatches with a boundary that is not all numbers are counted.
@@ -1808,6 +1836,9 @@ fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
                 format!(
                     "{n} entit{s} not drawn: in blocks nested more than {MAX_NESTING} deep (or inserting themselves)"
                 )
+            } else if kind == ARRAY_NOT_NUMBERS {
+                let s = if n == 1 { "y" } else { "ies" };
+                format!("{n} cop{s} of a block array placed outside the number range, left out")
             } else if kind == SPLINE_NOT_NUMBERS {
                 let s = if n == 1 { "" } else { "s" };
                 format!("{n} SPLINE{s} whose points are not numbers once placed, left out")
@@ -2971,6 +3002,45 @@ mod tests {
         let (shapes, _) = draw(&d, &d.entities, &mut skipped, &mut budget);
         assert_eq!(shapes.len(), 9);
         assert_eq!(skipped.get(OVER_LIMIT), Some(&(30_000 * 30_000 - 9)), "{skipped:?}");
+        // A count already there and a bulk count past usize::MAX stop at usize::MAX.
+        let two = "0\nBLOCK\n2\nB\n10\n0\n20\n0\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n0\nLINE\n10\n0\n20\n0\n11\n0\n21\n1\n0\nENDBLK\n";
+        let d = parse(&dxf("0\nINSERT\n2\nB\n70\n1e12\n71\n1e12\n", two))?;
+        let mut skipped = BTreeMap::from([(OVER_LIMIT.to_owned(), 5)]);
+        let (shapes, _) = draw(&d, &d.entities, &mut skipped, &mut 1);
+        assert!(shapes.is_empty());
+        assert_eq!(skipped.get(OVER_LIMIT), Some(&usize::MAX), "{skipped:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_array_too_deep_or_past_the_numbers_is_counted_at_once() -> Result<()> {
+        let blocks = "0\nBLOCK\n2\nB\n10\n0\n20\n0\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n0\nENDBLK\n";
+        let big = "0\nINSERT\n2\nB\n70\n30000\n71\n30000\n44\n1\n45\n1\n";
+        // At the nesting limit every copy would be turned away: counted without visiting them.
+        let d = parse(&dxf(big, blocks))?;
+        let mut skipped = BTreeMap::new();
+        let mut budget = MAX_DRAWN;
+        let mut out = Vec::new();
+        shapes(
+            &d,
+            &d.entities,
+            Xf::ID,
+            1.0,
+            MAX_NESTING,
+            &|_| false,
+            &mut out,
+            &mut Vec::new(),
+            &mut skipped,
+            &mut budget,
+        );
+        assert!(out.is_empty());
+        assert_eq!(skipped.get(TOO_DEEP), Some(&(30_000 * 30_000)), "{skipped:?}");
+        assert_eq!(budget, MAX_DRAWN - 1);
+        // Spacing so large the far copies overflow: the array is left out with a warning.
+        let (g, skipped) = drawn("0\nINSERT\n2\nB\n70\n3\n71\n1\n44\n1e308\n", blocks)?;
+        assert!(g.is_empty(), "{g:?}");
+        assert_eq!(skipped.get(ARRAY_NOT_NUMBERS), Some(&3), "{skipped:?}");
+        assert!(skipped_warnings(skipped)[0].starts_with("3 copies of a block array"));
         Ok(())
     }
 
