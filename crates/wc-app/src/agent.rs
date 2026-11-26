@@ -5294,6 +5294,38 @@ mod tests {
         assert!(o.project.pages[0].symbols.is_empty());
     }
 
+    /// The actions a single key press (with `modifiers` held) asks for in the editor.
+    fn shortcuts_for(a: &mut App, key: egui::Key, modifiers: egui::Modifiers) -> Vec<Action> {
+        let raw = egui::RawInput {
+            modifiers,
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..Default::default()
+        };
+        let mut got = Vec::new();
+        let _ = egui::Context::default().run(raw, |ctx| got = a.shortcuts(ctx));
+        got
+    }
+
+    /// Backspace deletes the selection like Delete, for keyboards without a Delete key (#686).
+    #[test]
+    fn backspace_deletes_the_selection_like_delete() {
+        let (_tmp, mut a) = app(vec![]);
+        for key in [egui::Key::Delete, egui::Key::Backspace] {
+            assert_eq!(
+                shortcuts_for(&mut a, key, egui::Modifiers::NONE),
+                vec![Action::Delete],
+                "{key:?}"
+            );
+        }
+        assert!(shortcuts_for(&mut a, egui::Key::Backspace, egui::Modifiers::COMMAND).is_empty());
+    }
+
     #[test]
     fn escape_after_leaving_the_black_box_tool_cancels_the_new_tool_s_drawing() {
         use wc_core::geom::Point;
