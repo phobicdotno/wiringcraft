@@ -1042,14 +1042,13 @@ pub fn eplan_tables(path: &Path) -> Result<crate::eplan::Tables, String> {
         path.with_file_name(name)
     };
     let mut tables = crate::eplan::Tables::new();
-    for entry in std::fs::read_dir(&folder)
-        .map_err(|x| format!("{}: {x}", folder.display()))?
-        .flatten()
-    {
+    for entry in std::fs::read_dir(&folder).map_err(|x| format!("{}: {x}", folder.display()))? {
+        let entry = entry.map_err(|x| format!("{}: {x}", folder.display()))?;
         let name = entry.file_name().to_string_lossy().to_lowercase();
-        if crate::eplan::wanted(&name)
-            && let Ok(bytes) = std::fs::read(entry.path())
-        {
+        if crate::eplan::wanted(&name) {
+            // A table that is there but cannot be read is not taken for an empty one.
+            let path = entry.path();
+            let bytes = std::fs::read(&path).map_err(|x| format!("{}: {x}", path.display()))?;
             tables.insert(name, bytes);
         }
     }
@@ -1736,6 +1735,18 @@ mod tests {
         out!(log, "c");
         assert_eq!(log.text(), "a 1\nwarning: b\nc");
         assert_eq!(log.warnings().collect::<Vec<_>>(), vec!["warning: b"]);
+    }
+
+    #[test]
+    fn an_eplan_table_that_cannot_be_read_is_reported_not_left_out() {
+        let t = tmp();
+        let edb = t.path().join("plant.edb");
+        assert!(std::fs::create_dir_all(edb.join("connection.eod")).is_ok());
+        assert!(std::fs::write(edb.join("page.eod"), b"x").is_ok());
+        match eplan_tables(&edb) {
+            Ok(_) => unreachable!("an unreadable table was left out"),
+            Err(why) => assert!(why.contains("connection.eod"), "{why}"),
+        }
     }
 
     #[test]

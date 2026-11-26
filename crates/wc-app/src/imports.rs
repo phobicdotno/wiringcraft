@@ -99,14 +99,14 @@ impl Kind {
 }
 
 /// The first page number for an import: `default`, or the number after the project's highest
-/// numeric page when that is higher, so the new pages never take a number in use.
-pub fn first_free_page(open: &Open, default: usize) -> usize {
+/// numeric page when that is higher, so the new pages never take a number in use. None when
+/// the highest page number has no number after it.
+pub fn first_free_page(open: &Open, default: usize) -> Option<usize> {
     open.project
         .pages
         .iter()
         .filter_map(|pg| pg.number.trim().parse::<usize>().ok())
-        .map(|n| n + 1)
-        .fold(default, usize::max)
+        .try_fold(default, |first, n| n.checked_add(1).map(|next| first.max(next)))
 }
 
 /// Import `file` as `kind`: parts into the library folder `lib`, everything else into the open
@@ -121,6 +121,8 @@ pub fn import(open: &mut Open, kind: Kind, file: &Path, lib: Option<&Path>, page
         .unwrap_or_default();
     let mut log = run::Log::default();
     let mut note = String::new();
+    // Why the project could not be read back after the import wrote to its folder.
+    let mut unread: Option<String> = None;
     let r = if kind.needs_library() {
         match lib {
             Some(lib) => {
@@ -145,14 +147,19 @@ pub fn import(open: &mut Open, kind: Kind, file: &Path, lib: Option<&Path>, page
             Err(e) => Err(format!("the project could not be saved first: {e}")),
             Ok(()) => {
                 let dir = open.dir.clone();
-                let first = first_free_page(open, kind.first_page());
+                // Only for the imports that add pages, numbered from a free number.
+                let first = || {
+                    first_free_page(open, kind.first_page()).ok_or_else(|| {
+                        "no page number is free after the project's highest one; renumber that page first".to_owned()
+                    })
+                };
                 let r = match kind {
-                    Kind::Eplan => run::eplan(&dir, file, first, &mut log),
-                    Kind::Swe => run::swe(&dir, file, 1, None, None, &mut log),
+                    Kind::Eplan => first().and_then(|n| run::eplan(&dir, file, n, &mut log)),
+                    Kind::Swe => first().and_then(|n| run::swe(&dir, file, 1, Some(n), None, &mut log)),
                     Kind::SweLibrary => run::swe_library(&dir, file, None, &mut log),
-                    Kind::Aml => run::aml(&dir, file, first, &mut log),
-                    Kind::Pdf => run::pdf(&dir, file, first, &mut log),
-                    Kind::Archive => run::archive(&dir, file, first, None, &mut log),
+                    Kind::Aml => first().and_then(|n| run::aml(&dir, file, n, &mut log)),
+                    Kind::Pdf => first().and_then(|n| run::pdf(&dir, file, n, &mut log)),
+                    Kind::Archive => first().and_then(|n| run::archive(&dir, file, n, None, &mut log)),
                     Kind::PlcCsv => run::plc_csv(&dir, file, &mut log),
                     _ => match open.project.pages.get(page) {
                         Some(pg) if kind == Kind::PageDxf => run::page_dxf(&dir, file, &pg.id.clone(), 1.0, &mut log),
@@ -165,18 +172,25 @@ pub fn import(open: &mut Open, kind: Kind, file: &Path, lib: Option<&Path>, page
                     },
                 };
                 // What was written comes in also when a part of an archive failed.
-                match open.adopt_saved() {
-                    Ok(_) => r,
-                    Err(e) => r.and(Err(format!("imported, but the project could not be read back: {e}"))),
+                if let Err(e) = open.adopt_saved() {
+                    unread = Some(e);
                 }
+                r
             }
         }
     };
     let said = log.text();
-    let done = r.is_ok();
-    let head = match r {
-        Ok(()) => format!("Imported {name}."),
-        Err(e) => format!("{name} was not imported: {e}"),
+    let done = r.is_ok() && unread.is_none();
+    let head = match (r, unread) {
+        (Ok(()), None) => format!("Imported {name}."),
+        (Err(e), None) => format!("{name} was not imported: {e}"),
+        // The import may have written to the project folder: what the editor shows is older.
+        (r, Some(why)) => {
+            let failed = r.err().map(|e| format!(" Part of it failed: {e}.")).unwrap_or_default();
+            format!(
+                "{name} was imported into the project folder, but the project could not be read back: {why}.{failed}                  Open the project again before you edit or import anything else."
+            )
+        }
     };
     let mut msg = format!("{note}{head}");
     if let Some(lib) = lib.filter(|_| kind.needs_library()) {
@@ -299,13 +313,28 @@ mod tests {
     #[test]
     fn new_pages_are_numbered_after_the_highest_page() {
         let (_tmp, mut open) = project();
-        assert_eq!(first_free_page(&open, 100), 100);
+        assert_eq!(first_free_page(&open, 100), Some(100));
         let i = open.add_page();
         if let Some(pg) = open.project.pages.get_mut(i) {
             pg.number = "250".into();
         }
-        assert_eq!(first_free_page(&open, 100), 251);
-        assert_eq!(first_free_page(&open, 400), 400);
+        assert_eq!(first_free_page(&open, 100), Some(251));
+        assert_eq!(first_free_page(&open, 400), Some(400));
+    }
+
+    #[test]
+    fn no_free_page_number_after_the_largest_is_refused_not_wrapped() {
+        let (tmp, mut open) = project();
+        let i = open.add_page();
+        if let Some(pg) = open.project.pages.get_mut(i) {
+            pg.number = usize::MAX.to_string();
+        }
+        assert_eq!(first_free_page(&open, 100), None);
+        let aml = tmp.path().join("plant.aml");
+        assert!(std::fs::write(&aml, AML).is_ok());
+        let (done, msg) = import(&mut open, Kind::Aml, &aml, None, 0);
+        assert!(!done, "{msg}");
+        assert!(msg.contains("no page number is free"), "{msg}");
     }
 
     #[test]
