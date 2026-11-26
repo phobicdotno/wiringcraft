@@ -276,6 +276,31 @@ pub fn specs() -> Vec<Value> {
             &["id"],
         ),
         tool(
+            "black_box",
+            "Black boxes (device boxes) for devices without a symbol of their own: a rectangle with connection points on its edges that wires attach to like pins. `add` draws one with its top-left corner at x, y; `edit` resizes a placed one (its top-left corner stays) and/or replaces its connection points. On `edit`, `pins` is the whole new list (left out: the points stay, kept on their edges); an old point whose name is not in it is removed, and `rename` maps an old point name to the new name it keeps, so its wires follow. Wires on a removed point keep a free end. Returns the id (add) or warnings to check (edit).",
+            json!({
+                "action": {"type": "string", "enum": ["add", "edit"]},
+                "page": page_arg(),
+                "id": {"type": "string", "description": "edit: the box's item id, e.g. s3."},
+                "x": {"type": "number", "description": "add: left edge in mm."},
+                "y": {"type": "number", "description": "add: top edge in mm."},
+                "width": {"type": "number", "description": "mm; on edit default the current width."},
+                "height": {"type": "number", "description": "mm; on edit default the current height."},
+                "tag": {"type": "string", "description": "add: device tag, e.g. -A1."},
+                "pins": {
+                    "type": "array",
+                    "description": "Connection points: name, the edge it sits on and its offset in mm along that edge from the edge's left or top end.",
+                    "items": {"type": "object", "properties": {
+                        "name": {"type": "string"},
+                        "side": {"type": "string", "enum": ["left", "right", "top", "bottom"]},
+                        "offset": {"type": "number"}
+                    }, "required": ["name", "side", "offset"]}
+                },
+                "rename": {"type": "object", "additionalProperties": {"type": "string"}, "description": "edit: old point name -> new point name, e.g. {\"OUT\": \"Q\"}."}
+            }),
+            &["action"],
+        ),
+        tool(
             "update_wire",
             "Change a wire: its ends, bends, number, potential, the cable it is a core of, or its cross-section, colour and type. Empty strings clear number, potential, cable, section, colour or type.",
             json!({
@@ -906,7 +931,8 @@ pub struct AppTools<'a>(pub &'a mut App);
 fn edits_page(name: &str, v: &Value) -> bool {
     match name {
         "place_symbol" | "add_wire" | "update_symbol" | "update_wire" | "add_graphic" | "update_graphic"
-        | "delete_items" | "move_items" | "rotate_items" | "mirror_items" | "delete_page" | "edit_page_json" => true,
+        | "black_box" | "delete_items" | "move_items" | "rotate_items" | "mirror_items" | "delete_page"
+        | "edit_page_json" => true,
         "macros" => s(v, "action") == Some("insert"),
         _ => false,
     }
@@ -1120,6 +1146,10 @@ impl wc_agent::Tools for AppTools<'_> {
                 s(input, "tag").map(|t| format!(" as {t}")).unwrap_or_default()
             ),
             "add_wire" => format!("Drew a wire{page}"),
+            "black_box" => match s(input, "action") {
+                Some("add") => format!("Drew a black box{page}"),
+                _ => format!("Changed black box {}{page}", s(input, "id").unwrap_or_default()),
+            },
             "update_symbol" | "update_wire" | "update_graphic" => {
                 format!("Changed {}{page}", s(input, "id").unwrap_or("an item"))
             }
@@ -1435,6 +1465,7 @@ impl App {
             "place_symbol" => self.tool_place(v),
             "add_wire" => self.tool_wire(v),
             "update_symbol" => self.tool_update_symbol(v),
+            "black_box" => self.tool_black_box(v),
             "update_wire" => self.tool_update_wire(v),
             "add_graphic" | "update_graphic" => {
                 let page = self.page_of(v, "page")?;
@@ -2172,6 +2203,95 @@ impl App {
             placed.symbol = sym.to_owned();
         }
         Ok(format!("Changed {id}."))
+    }
+
+    /// `black_box`: draw a black box, or resize one and edit its connection points, through
+    /// the same [`crate::state::Open::add_black_box`] and [`crate::state::Open::edit_black_box`]
+    /// the black box tool and the properties panel use (#542).
+    fn tool_black_box(&mut self, v: &Value) -> Result<String, String> {
+        let page = self.page_of(v, "page")?;
+        let pins = match v.get("pins") {
+            None | Some(Value::Null) => None,
+            Some(Value::Array(list)) => Some(
+                list.iter()
+                    .map(|p| {
+                        let name = need_s(p, "name")?;
+                        let side = need_s(p, "side")?;
+                        Ok(wc_core::BoxPin {
+                            name: name.trim().to_owned(),
+                            side: wc_core::BoxSide::parse(side)
+                                .ok_or_else(|| format!("Point {name}: side must be left, right, top or bottom."))?,
+                            offset: need_num(p, "offset")?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+            ),
+            Some(_) => return Err("`pins` must be a list of {name, side, offset}.".into()),
+        };
+        match need_s(v, "action")? {
+            "add" => {
+                let at = Point::new(need_num(v, "x")?, need_num(v, "y")?);
+                let size = Point::new(need_num(v, "width")?, need_num(v, "height")?);
+                let device = s(v, "tag").filter(|t| !t.trim().is_empty()).map(tag).transpose()?;
+                let open = need_open(self.open.as_mut())?;
+                let id = open.add_black_box(page, at, at + size, &pins.unwrap_or_default(), device)?;
+                Ok(format!("Drew black box {id}."))
+            }
+            "edit" => {
+                let id = need_s(v, "id")?;
+                let open = need_open(self.open.as_mut())?;
+                let layout = open
+                    .project
+                    .pages
+                    .get(page)
+                    .and_then(|p| p.symbol(id))
+                    .and_then(|placed| open.symbols.get(&placed.symbol))
+                    .ok_or_else(|| format!("No symbol {id:?} on that page."))
+                    .map(wc_core::black_box_layout)?;
+                let Some((w, h, old)) = layout else {
+                    return Err(format!("{id} is not a black box."));
+                };
+                let width = num(v, "width").unwrap_or(w);
+                let height = num(v, "height").unwrap_or(h);
+                let renamed: BTreeMap<String, String> = match v.get("rename") {
+                    None | Some(Value::Null) => BTreeMap::new(),
+                    Some(Value::Object(m)) => m
+                        .iter()
+                        .map(|(from, to)| {
+                            let to = to.as_str().ok_or("`rename` maps point names to point names.")?;
+                            Ok((from.clone(), to.trim().to_owned()))
+                        })
+                        .collect::<Result<_, String>>()?,
+                    Some(_) => return Err("`rename` must map old point names to new ones.".into()),
+                };
+                if let Some(from) = renamed.keys().find(|f| !old.iter().any(|p| &p.name == *f)) {
+                    return Err(format!("The box has no connection point {from} to rename."));
+                }
+                // Left out, the points stay (renamed as asked), kept on their edges.
+                let pins = pins.unwrap_or_else(|| {
+                    let mut kept = crate::black_box_tool::resized_pins(&old, width, height);
+                    for p in &mut kept {
+                        if let Some(to) = renamed.get(&p.name) {
+                            p.name.clone_from(to);
+                        }
+                    }
+                    kept
+                });
+                // An old point that is neither renamed nor in the new list is taken off.
+                let removed: std::collections::BTreeSet<String> = old
+                    .iter()
+                    .map(|p| p.name.clone())
+                    .filter(|n| !renamed.contains_key(n) && !pins.iter().any(|p| &p.name == n))
+                    .collect();
+                let warnings = open.edit_black_box(page, id, (width, height), &pins, &renamed, &removed)?;
+                Ok(if warnings.is_empty() {
+                    format!("Changed black box {id}.")
+                } else {
+                    format!("Changed black box {id}. Check: {}.", warnings.join("; "))
+                })
+            }
+            other => Err(format!("Unknown action {other:?}: use add or edit.")),
+        }
     }
 
     fn tool_update_wire(&mut self, v: &Value) -> Result<String, String> {
@@ -6194,6 +6314,99 @@ mod tests {
                 assert!(!e.starts_with("Unknown tool"), "{name}: {e}");
             }
         }
+    }
+
+    #[test]
+    fn the_assistant_draws_resizes_and_edits_a_black_box() {
+        let (_tmp, mut a) = app(vec![]);
+        let out = call(
+            &mut a,
+            "black_box",
+            json!({"action": "add", "page": "2", "x": 40, "y": 40, "width": 20, "height": 10, "tag": "-A1",
+                   "pins": [{"name": "IN", "side": "left", "offset": 5}, {"name": "OUT", "side": "right", "offset": 5},
+                            {"name": "PE", "side": "bottom", "offset": 18}]}),
+        )
+        .unwrap();
+        let id = out
+            .trim_start_matches("Drew black box ")
+            .trim_end_matches('.')
+            .to_owned();
+        let layout = |a: &App| {
+            let o = a.open.as_ref().unwrap();
+            let placed = page2(a).symbol(&id).unwrap();
+            wc_core::black_box_layout(&o.symbols[&placed.symbol]).unwrap()
+        };
+        assert_eq!(layout(&a).0, 20.0);
+        assert_eq!(page2(&a).symbol(&id).unwrap().tag.as_ref().unwrap().to_string(), "-A1");
+        for p in ["IN", "OUT", "PE"] {
+            call(
+                &mut a,
+                "add_wire",
+                json!({"page": "2", "from": {"item": id, "pin": p}, "to": {"x": 0, "y": 0}}),
+            )
+            .unwrap();
+        }
+
+        // Narrower: the points stay on their edges, PE pulled in to the new width.
+        call(
+            &mut a,
+            "black_box",
+            json!({"action": "edit", "page": "2", "id": id, "width": 10}),
+        )
+        .unwrap();
+        let (w, h, pins) = layout(&a);
+        assert_eq!((w, h), (10.0, 10.0));
+        assert_eq!(pins.iter().find(|p| p.name == "PE").unwrap().offset, 10.0);
+
+        // A new list: OUT renamed to Q (its wire follows), PE taken off, A added.
+        let out = call(
+            &mut a,
+            "black_box",
+            json!({"action": "edit", "page": "2", "id": id, "height": 20, "rename": {"OUT": "Q"},
+                   "pins": [{"name": "IN", "side": "left", "offset": 5}, {"name": "Q", "side": "right", "offset": 5},
+                            {"name": "A", "side": "top", "offset": 2}]}),
+        )
+        .unwrap();
+        assert!(out.contains("PE") && out.contains("gone"), "{out}");
+        let names: Vec<String> = layout(&a).2.into_iter().map(|p| p.name).collect();
+        assert_eq!(names, ["IN", "Q", "A"]);
+        let ends: Vec<String> = page2(&a)
+            .wires
+            .iter()
+            .map(|w| match &w.from {
+                Endpoint::Pin { pin, .. } => pin.clone(),
+                Endpoint::Point { .. } => String::new(),
+            })
+            .collect();
+        assert_eq!(ends, ["IN", "Q", ""]);
+
+        // A rename of a point the box does not have, a point off its edge and a symbol that is
+        // not a box are refused, and nothing changes.
+        assert!(
+            call(
+                &mut a,
+                "black_box",
+                json!({"action": "edit", "page": "2", "id": id, "rename": {"X": "Y"}})
+            )
+            .is_err()
+        );
+        let off =
+            json!({"action": "edit", "page": "2", "id": id, "pins": [{"name": "IN", "side": "top", "offset": 99}]});
+        assert!(call(&mut a, "black_box", off).is_err());
+        assert_eq!(layout(&a).2.len(), 3);
+        let coil = a
+            .open
+            .as_mut()
+            .unwrap()
+            .place(1, "wc.coil", Point::new(100.0, 100.0))
+            .unwrap();
+        let err = call(
+            &mut a,
+            "black_box",
+            json!({"action": "edit", "page": "2", "id": coil, "width": 5}),
+        )
+        .unwrap_err();
+        assert!(err.contains("not a black box"), "{err}");
     }
 
     #[test]
