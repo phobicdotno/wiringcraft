@@ -354,7 +354,7 @@ fn shape(
                         graphics.push(Shape::Polyline {
                             points,
                             closed: true,
-                            filled: false,
+                            filled: filled(e),
                         });
                     }
                 }
@@ -404,12 +404,14 @@ fn shape(
                 }
             }
             let closed = attr(e, "closed").is_none_or(|c| c != "false");
+            // A filled shape has no open side, so it is drawn closed whatever `closed` says.
+            let fill = filled(e);
             match points.as_slice() {
                 [a, b] if !closed => graphics.push(Shape::Line { a: *a, b: *b }),
                 [_, _, ..] => graphics.push(Shape::Polyline {
                     points,
-                    closed,
-                    filled: false,
+                    closed: closed || fill,
+                    filled: fill,
                 }),
                 _ => skip(),
             }
@@ -563,6 +565,37 @@ mod tests {
         );
         // The label's dynamic text gives the tag place.
         assert_eq!(s.tag_at, Point::new(-12.5, 7.5));
+        Ok(())
+    }
+
+    #[test]
+    fn filled_polygons_and_ellipses_come_in_filled() -> Result<()> {
+        let el = r#"<definition type="element"><description>
+<polygon x1="0" y1="0" x2="4" y2="0" x3="2" y3="4" closed="false" style="filling:black"/>
+<polygon x1="10" y1="0" x2="14" y2="0" x3="12" y3="4" style="filling:none"/>
+<ellipse x="-6" y="-3" width="12" height="6" style="filling:black"/>
+<ellipse x="-6" y="7" width="12" height="6" style="filling:none"/>
+<terminal x="0" y="0" orientation="n"/>
+</description></definition>"#;
+        let (imp, _) = element(el, "qet.filled", 1.0)?;
+        let polys: Vec<(usize, bool, bool)> = imp
+            .symbol
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Polyline { points, closed, filled } => Some((points.len(), *closed, *filled)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            polys,
+            vec![
+                (3, true, true),
+                (3, true, false),
+                (ELLIPSE_STEPS, true, true),
+                (ELLIPSE_STEPS, true, false)
+            ]
+        );
         Ok(())
     }
 
