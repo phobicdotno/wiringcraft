@@ -1819,7 +1819,16 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
         &mut { MAX_DRAWN },
     );
     let mut pins: Vec<(Option<String>, Point)> = points.into_iter().map(|(_, p)| (None, p)).collect();
-    let mut labels = Vec::new();
+    // An invisible attribute is not drawn, but on a pin layer it still names a pin.
+    let mut labels: Vec<(Point, String)> = d
+        .entities
+        .iter()
+        .filter(|e| e.kind == "ATTRIB" && (e.f(70) as i64) & 1 != 0 && is_pin_layer(&e.layer()))
+        .filter_map(|e| {
+            let text = e.get(1)?;
+            (!text.trim().is_empty()).then(|| (Point::new(e.f(10), -e.f(20)), text.to_owned()))
+        })
+        .collect();
     let mut graphics = Vec::new();
     for (layer, s) in raw {
         match (is_pin_layer(&layer), &s) {
@@ -2019,6 +2028,22 @@ mod tests {
             "y flipped: the lower pin is further down"
         );
         assert_eq!(s.graphics.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn an_invisible_attribute_on_the_pin_layer_still_names_a_pin() -> Result<()> {
+        let ents = "0\nLINE\n8\n0\n10\n0\n20\n20\n11\n0\n21\n0\n\
+                    0\nPOINT\n8\nPIN\n10\n0\n20\n20\n\
+                    0\nATTRIB\n8\nPIN\n10\n1\n20\n19\n40\n2\n2\nPIN1\n1\nA1\n70\n1\n";
+        let s = symbol(&dxf(ents, ""), "my.coil", "Coil")?;
+        assert_eq!(s.pins.len(), 1);
+        assert_eq!(s.pins[0].name, "A1");
+        assert!(
+            !s.graphics.iter().any(|g| matches!(g, Shape::Text { .. })),
+            "{:?}",
+            s.graphics
+        );
         Ok(())
     }
 
