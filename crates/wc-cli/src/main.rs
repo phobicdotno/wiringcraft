@@ -1021,7 +1021,22 @@ fn cover_moved(ids: Vec<String>) {
 }
 
 fn load(dir: &Path) -> Res<Project> {
+    // The entry itself, not where a link leads: a broken link is reported as the load fails.
+    if let Err(err) = std::fs::symlink_metadata(dir.join(store::PROJECT_FILE))
+        && err.kind() == std::io::ErrorKind::NotFound
+    {
+        return Err(no_project(dir));
+    }
     store::load(dir).map_err(e)
+}
+
+/// What a command says when its folder holds no project: where it looked, and how to get one.
+fn no_project(dir: &Path) -> String {
+    format!(
+        "no WiringCraft project in {} (no {}): use -C <folder> or create one with wiringcraft new <folder>",
+        escape_field(&dir.display().to_string()),
+        store::PROJECT_FILE
+    )
 }
 
 /// The project with its texts in `lang` (one language code, or two joined by `,`) from the
