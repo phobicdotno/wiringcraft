@@ -3061,3 +3061,19 @@ fn layer_names_are_text_strings() {
     };
     assert_eq!(name, "Leitungen → Ω 日本");
 }
+
+#[test]
+fn text_the_pdf_cannot_print_is_warned_about_once_per_sheet() {
+    // Helvetica's WinAnsi has no Ω or Cyrillic: they print as '?', so say so (Latin-1, the
+    // euro and dashes print, and an arrow prints as '>' on purpose).
+    let mut project = Project::new("Demo");
+    project.pages = vec![
+        Page::new("p1", "1", "Motor 10 kΩ Ω Жар"),
+        Page::new("p2", "2", "Pumpe – Ålesund 200 € → B"),
+    ];
+    let (_, report) = export(&project, &BTreeMap::new(), &Options::default());
+    assert_eq!(
+        report.warnings,
+        vec!["page 1: the PDF cannot print Ω Ж а р in its text; they show as ?".to_string()]
+    );
+}
