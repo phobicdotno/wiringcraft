@@ -2063,11 +2063,14 @@ impl Open {
                 // Not known what WiringCraft left there: a file there now may be from outside.
                 (Found::Unread(why), Ok(now)) => (now.is_some() && now != *should)
                     .then(|| format!(" (it could not be read when WiringCraft left it: {why})")),
-                (Found::WriteOverUnread, Ok(now)) => (now.is_some() && now != *should).then(String::new),
+                (Found::WriteOverUnread(_), Ok(now)) => (now.is_some() && now != *should).then(String::new),
                 // Not readable now: what it holds is not known, so it is not written over
                 // unless the user chose to.
                 (Found::Bytes(_) | Found::Unread(_), Err(why)) => Some(format!(" (it cannot be read now: {why})")),
-                (Found::WriteOverUnread, Err(_)) => None,
+                // Consent covers the unreadable entry the user saw only, told by its metadata.
+                (Found::WriteOverUnread(seen), Err(why)) => {
+                    (stamp_of(&path) != *seen).then(|| format!(" (it cannot be read now, and changed since: {why})"))
+                }
             };
             changed.map(|note| (path, note))
         })
@@ -2087,7 +2090,7 @@ impl Open {
         // Consent covers the version there now only: a later change is asked about again.
         let now = match snapshot_file(path) {
             Ok(bytes) => Found::Bytes(bytes),
-            Err(_) => Found::WriteOverUnread,
+            Err(_) => Found::WriteOverUnread(stamp_of(path)),
         };
         if let Some(found) = self.unwritten_found.get_mut(&rel) {
             *found = now;
@@ -4063,9 +4066,18 @@ enum Found {
     /// It could not be read (why): any file there that is not what the project needs counts
     /// as changed outside.
     Unread(String),
-    /// It could not be read when the user chose to write over it: the save may write over
-    /// it while it stays unreadable.
-    WriteOverUnread,
+    /// It could not be read when the user chose to write over it (its [`Stamp`] then): the
+    /// save may write over it while it stays that entry; one changed since is asked about
+    /// again.
+    WriteOverUnread(Option<Stamp>),
+}
+
+/// What tells one version of an unreadable entry from another: its kind, size and times.
+type Stamp = (bool, u64, Option<std::time::SystemTime>, Option<std::time::SystemTime>);
+
+fn stamp_of(path: &Path) -> Option<Stamp> {
+    let m = std::fs::symlink_metadata(path).ok()?;
+    Some((m.is_dir(), m.len(), m.modified().ok(), m.created().ok()))
 }
 
 impl Found {
@@ -4514,6 +4526,13 @@ pub(crate) mod tests {
             "{err}"
         );
         assert_eq!(std::fs::read_to_string(a.join("inside")).unwrap(), "kept");
+        // Consent covers that unreadable entry only: one changed since is asked about again.
+        o.write_over_outside_version(&a);
+        assert_eq!(o.changed_outside(), None);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(a.join("more"), "added").unwrap();
+        assert_eq!(o.changed_outside(), Some(a.clone()));
+        assert!(o.save().unwrap_err().contains("changed since"));
         // Once the user chose to write over it, the save goes on and says why it fails.
         o.write_over_outside_version(&a);
         assert_eq!(o.changed_outside(), None);
