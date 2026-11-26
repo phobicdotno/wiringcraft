@@ -942,10 +942,11 @@ fn parse_end(dir: &Path, page: &Page, s: &str) -> Res<Endpoint> {
         Err(wc_core::Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => None,
         Err(why) => {
             return Err(format!(
-                "symbol {} on page {}: its definition {} could not be read ({why})",
+                "symbol {} on page {}: its definition {} could not be read ({})",
                 name(),
                 page.id,
-                placed.symbol
+                placed.symbol,
+                escape_field(&why.to_string())
             ));
         }
     };
