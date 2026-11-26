@@ -989,4 +989,4 @@ pub fn build(p: &EplanProject, first_page_number: usize) -> (aml::Built, Vec<Str
 pub mod drawing;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

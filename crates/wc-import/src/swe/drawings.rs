@@ -113,10 +113,7 @@ impl SweDrawings {
         // A class section that could not be read: its custom entities are not counted. Its
         // reason comes first in `damaged`, before those of the objects.
         let classes_damaged = read.skipped.contains_key(dwg::objects::CLASSES_DAMAGED);
-        let (classes_why, objects_why) = match read.damaged.split_first() {
-            Some((first, rest)) if classes_damaged => (first.as_str(), rest),
-            _ => ("", read.damaged.as_slice()),
-        };
+        let (classes_why, objects_why) = read.damage_reasons();
         if classes_damaged {
             self.warnings
                 .push(format!("{what}: {classes_why}; its custom entities are not counted"));
