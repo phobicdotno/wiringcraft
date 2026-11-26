@@ -455,6 +455,17 @@ pub fn archive(dir: &Path, file: &Path, first_page: usize, lib: Option<&Path>, l
     use crate::archive::Kind;
     first_page_in_range(first_page)?;
     let bytes = read_file(file)?;
+    // Old binary `.xls` workbooks are not read: named, so the user knows to save them as `.xlsx`.
+    // Taken from the listing, which has no size limit, so a large one is named too.
+    if let Ok(report) = crate::archive::inspect(&bytes) {
+        for en in report.entries.iter().filter(|en| en.kind == Kind::OldSpreadsheet) {
+            err!(
+                log,
+                "warning: {}: skipped, an old Excel workbook (.xls) is not read; save it as .xlsx",
+                escape_field(&en.name)
+            );
+        }
+    }
     let entries = crate::archive::open_entries(
         &bytes,
         &[
@@ -464,21 +475,9 @@ pub fn archive(dir: &Path, file: &Path, first_page: usize, lib: Option<&Path>, l
             Kind::KicadSymbols,
             Kind::Csv,
             Kind::Spreadsheet,
-            Kind::OldSpreadsheet,
         ],
     )
     .map_err(e)?;
-    // Old binary `.xls` workbooks are not read: named, so the user knows to save them as `.xlsx`.
-    let (old, entries): (Vec<_>, Vec<_>) = entries
-        .into_iter()
-        .partition(|(_, kind, _)| *kind == Kind::OldSpreadsheet);
-    for (raw, _, _) in &old {
-        err!(
-            log,
-            "warning: {}: skipped, an old Excel workbook (.xls) is not read; save it as .xlsx",
-            escape_field(raw)
-        );
-    }
     if entries.is_empty() {
         return Err(
             "no importable PDF, DXF, AutomationML, KiCad symbols, CSV lists or Excel lists inside; run `wiringcraft inspect` to see what is there"
@@ -2025,6 +2024,26 @@ mod tests {
         let r = archive(&dir, &file, 1, None, &mut log);
         assert!(matches!(&r, Err(why) if why.contains("no importable")), "{r:?}");
         assert_eq!(log.warnings().count(), 1, "{}", log.text());
+
+        // One too large to extract is still named.
+        let mut bytes = zip_of(&[("big.xls", xls)]);
+        let Some(cd) = bytes.windows(4).position(|w| w == b"PK\x01\x02") else {
+            unreachable!("no central directory")
+        };
+        // The uncompressed size in the central directory header: 512 MiB.
+        bytes[cd + 24..cd + 28].copy_from_slice(&(512u32 << 20).to_le_bytes());
+        assert!(matches!(crate::archive::inspect(&bytes), Ok(r) if r.entries.iter().any(|en| en.size > 256 << 20)));
+        let file = tmp.path().join("big.zip");
+        assert!(std::fs::write(&file, bytes).is_ok());
+        let mut log = Log::default();
+        let r = archive(&dir, &file, 1, None, &mut log);
+        assert!(matches!(&r, Err(why) if why.contains("no importable")), "{r:?}");
+        assert_eq!(
+            log.warnings().collect::<Vec<_>>(),
+            vec!["warning: big.xls: skipped, an old Excel workbook (.xls) is not read; save it as .xlsx"],
+            "{}",
+            log.text()
+        );
     }
 
     #[test]
