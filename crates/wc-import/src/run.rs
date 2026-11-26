@@ -464,9 +464,21 @@ pub fn archive(dir: &Path, file: &Path, first_page: usize, lib: Option<&Path>, l
             Kind::KicadSymbols,
             Kind::Csv,
             Kind::Spreadsheet,
+            Kind::OldSpreadsheet,
         ],
     )
     .map_err(e)?;
+    // Old binary `.xls` workbooks are not read: named, so the user knows to save them as `.xlsx`.
+    let (old, entries): (Vec<_>, Vec<_>) = entries
+        .into_iter()
+        .partition(|(_, kind, _)| *kind == Kind::OldSpreadsheet);
+    for (raw, _, _) in &old {
+        err!(
+            log,
+            "warning: {}: skipped, an old Excel workbook (.xls) is not read; save it as .xlsx",
+            escape_field(raw)
+        );
+    }
     if entries.is_empty() {
         return Err(
             "no importable PDF, DXF, AutomationML, KiCad symbols, CSV lists or Excel lists inside; run `wiringcraft inspect` to see what is there"
@@ -1983,6 +1995,36 @@ mod tests {
         let want: Vec<String> = (0..3).map(|i| (MAX_FIRST_PAGE + i).to_string()).collect();
         assert_eq!(numbers, want, "{}", log.text());
         assert!(p.page(&format!("pdf-{}", MAX_FIRST_PAGE + 1)).is_some());
+    }
+
+    #[test]
+    fn an_old_xls_workbook_in_an_archive_is_skipped_with_a_reason() {
+        let tmp = tmp();
+        let dir = tmp.path().join("p");
+        assert!(store::save(&dir, &Project::new("t")).is_ok());
+        let xls: &[u8] = b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1rest";
+        let file = tmp.path().join("plant.zip");
+        let bytes = zip_of(&[("a.pdf", &one_page_pdf()), ("lists/old.xls", xls)]);
+        assert!(std::fs::write(&file, bytes).is_ok());
+        let mut log = Log::default();
+        let r = archive(&dir, &file, 1, None, &mut log);
+        assert!(r.is_ok(), "{r:?}");
+        let warnings: Vec<_> = log.warnings().collect();
+        assert_eq!(
+            warnings,
+            vec!["warning: lists/old.xls: skipped, an old Excel workbook (.xls) is not read; save it as .xlsx"],
+            "{}",
+            log.text()
+        );
+        assert!(matches!(load(&dir), Ok(p) if p.pages.len() == 1));
+
+        // With nothing else inside, the import still says there was nothing to import.
+        let file = tmp.path().join("only.zip");
+        assert!(std::fs::write(&file, zip_of(&[("old.xls", xls)])).is_ok());
+        let mut log = Log::default();
+        let r = archive(&dir, &file, 1, None, &mut log);
+        assert!(matches!(&r, Err(why) if why.contains("no importable")), "{r:?}");
+        assert_eq!(log.warnings().count(), 1, "{}", log.text());
     }
 
     #[test]
