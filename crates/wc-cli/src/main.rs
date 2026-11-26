@@ -400,6 +400,11 @@ enum Cmd {
         /// a folder, which gets one `<report>.csv` per report.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// CSV field separator: `,` (the default) or `;`. With `;` a file written with `--out`
+        /// also starts with a UTF-8 byte order mark, so Excel in a comma-decimal locale opens
+        /// it in columns with letters like æ ø å intact.
+        #[arg(long, default_value = ",")]
+        sep: char,
     },
     /// List the potentials (connected pins) across all pages.
     Nets,
@@ -3513,7 +3518,19 @@ fn run(cli: Cli) -> Res<()> {
                 return Err(format!("the project check found {errors} errors"));
             }
         }
-        Cmd::Report { kind, format, out } => {
+        Cmd::Report { kind, format, out, sep } => {
+            if !matches!(sep, ',' | ';') {
+                return Err(format!("unknown separator {sep:?} (, or ;)"));
+            }
+            if sep != ',' && format != "csv" {
+                return Err("--sep is for --format csv".into());
+            }
+            // Excel reads a `;` file as the comma-decimal locales write it, and needs the byte
+            // order mark to take it as UTF-8; standard output stays without one.
+            let csv_file = |t: &wc_report::Table| {
+                let bom = if sep == ';' { "\u{feff}" } else { "" };
+                format!("{bom}{}", t.to_csv_with(sep))
+            };
             let p = load(dir)?;
             let (symbols, _) = store::vendored_symbols(dir, &p);
             let parts = vendored_parts(dir, &p);
@@ -3543,16 +3560,19 @@ fn run(cli: Cli) -> Res<()> {
                 make_out_dir(folder)?;
                 for k in &kinds {
                     let t = wc_report::build(*k, &inputs);
-                    write_out(folder.join(format!("{}.csv", k.name())), t.to_csv()).map_err(e)?;
+                    write_out(folder.join(format!("{}.csv", k.name())), csv_file(&t)).map_err(e)?;
                 }
                 println!("wrote {} csv file(s) to {}", kinds.len(), folder.display());
                 return Ok(());
             }
             let mut text = String::new();
+            if format == "csv" && sep == ';' && out.is_some() {
+                text.push('\u{feff}');
+            }
             for k in kinds {
                 let t = wc_report::build(k, &inputs);
                 text.push_str(&match format.as_str() {
-                    "csv" => t.to_csv(),
+                    "csv" => t.to_csv_with(sep),
                     "md" | "markdown" => t.to_markdown(),
                     "text" => plain_table(&t),
                     other => return Err(format!("unknown format {other:?} (text, csv, md, xlsx)")),
@@ -9128,6 +9148,68 @@ mod tests {
         .unwrap();
         let wires = std::fs::read_to_string(out.join("wires.csv")).unwrap();
         assert_eq!(format!("{wires}\n"), std::fs::read_to_string(&one).unwrap());
+    }
+
+    #[test]
+    fn report_csv_for_excel_is_semicolon_separated_with_a_bom() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        // One report to a file: `;` between fields and a byte order mark first.
+        let one = tmp.path().join("wires.csv");
+        cli(
+            &dir,
+            &[
+                "report",
+                "wires",
+                "--format",
+                "csv",
+                "--sep",
+                ";",
+                "--out",
+                one.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        let semi = std::fs::read_to_string(&one).unwrap();
+        let plain = tmp.path().join("plain.csv");
+        cli(
+            &dir,
+            &["report", "wires", "--format", "csv", "--out", plain.to_str().unwrap()],
+        )
+        .unwrap();
+        let plain = std::fs::read_to_string(&plain).unwrap();
+        // The default stays comma-separated without a byte order mark (a new project's wires
+        // report is its header row alone, with no comma inside a field).
+        assert!(!plain.starts_with('\u{feff}'), "{plain}");
+        let first = plain.lines().next().unwrap();
+        assert!(first.contains(','), "{first}");
+        assert_eq!(semi, format!("\u{feff}{}", plain.replace(',', ";")));
+        // `report all` writes every file of the folder the same way.
+        let out = tmp.path().join("reports");
+        cli(
+            &dir,
+            &[
+                "report",
+                "all",
+                "--format",
+                "csv",
+                "--sep",
+                ";",
+                "--out",
+                out.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        for k in wc_report::Kind::ALL {
+            let csv = std::fs::read_to_string(out.join(format!("{}.csv", k.name()))).unwrap();
+            assert!(csv.starts_with('\u{feff}'), "{}: {csv}", k.name());
+        }
+        let wires = std::fs::read_to_string(out.join("wires.csv")).unwrap();
+        assert_eq!(format!("{wires}\n"), semi);
+        // Only `,` and `;`, and only for CSV.
+        assert!(cli(&dir, &["report", "wires", "--format", "csv", "--sep", "|"]).is_err());
+        assert!(cli(&dir, &["report", "wires", "--format", "md", "--sep", ";"]).is_err());
     }
 
     #[test]
