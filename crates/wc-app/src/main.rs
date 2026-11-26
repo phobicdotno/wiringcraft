@@ -4635,6 +4635,15 @@ impl App {
         }
     }
 
+    /// Whether a fetched base project may replace the open one now: not while a save waits for
+    /// a typed value, which first goes into the project it was asked for, nor while a close is
+    /// under way, which asks about the project open now. Nor while an Open waits for its file
+    /// dialog: it asks about the project open now too, and once the dialog has run (or was
+    /// cancelled) the fetch is taken up again.
+    fn fetch_may_open(&self) -> bool {
+        self.after_typed.is_empty() && self.closing == Closing::No && !matches!(self.pending, Some(Pending::Open))
+    }
+
     /// Insert a macro on the current page, selected so it can be dragged into place.
     /// Open the placeholders dialog on the project macro in `path`.
     fn edit_macro(&mut self, path: &std::path::Path) {
@@ -5823,11 +5832,7 @@ impl eframe::App for App {
             o.follow_terminals();
         }
         self.live_check(ctx);
-        // A fetched base project replaces the open one: not while a save waits for a typed
-        // value, which first goes into the project it was asked for, nor while a close waits
-        // for one, which asks about the project the value was typed in.
-        // Nor while an Open waits for its file dialog: it asks about the project open now.
-        if self.after_typed.is_empty() && self.closing == Closing::No && !matches!(self.pending, Some(Pending::Open)) {
+        if self.fetch_may_open() {
             self.poll_fetch(ctx);
         } else {
             ctx.request_repaint();
@@ -8437,6 +8442,20 @@ mod nudge_tests {
             panels::black_box_form_mut(&mut app.panels).is_some_and(|f| f.changed()),
             "the form keeps the change"
         );
+    }
+
+    /// A fetched base project does not replace the open one while an Open waits for its file
+    /// dialog, and is taken up again once that dialog has run or was cancelled (#1019).
+    #[test]
+    fn a_fetch_waits_while_an_open_waits_for_its_file_dialog() {
+        let (_tmp, mut app, _ctx) = changed_app();
+        assert!(app.fetch_may_open());
+        app.run(Action::Open);
+        assert!(matches!(app.pending, Some(Pending::Open)));
+        assert!(!app.fetch_may_open(), "the Open asks first");
+        // The file dialog ran, or was cancelled: the pending Open is gone.
+        app.pending = None;
+        assert!(app.fetch_may_open(), "the fetch is taken up again");
     }
 
     /// A close asked for while a field has the keyboard waits a frame for the typed value; a
