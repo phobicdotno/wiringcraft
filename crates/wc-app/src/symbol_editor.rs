@@ -207,7 +207,8 @@ fn with_handle(shape: &Shape, k: usize, to: Point) -> Option<Shape> {
             start,
             end,
         } => {
-            if to == *center {
+            // On the centre (give or take rounding from the handle's sin/cos) has no direction.
+            if (to.x - center.x).hypot(to.y - center.y) < 1e-6 {
                 return None;
             }
             let a = angle(*center, to);
@@ -686,6 +687,14 @@ impl SymbolEditor {
         }
     }
 
+    /// Escape during a drag: everything goes back to where it was before the drag, with no
+    /// undo step, and the mouse moving on changes nothing.
+    pub fn cancel_drag(&mut self) {
+        if let Some(drag) = self.drag.take() {
+            self.symbol = drag.before;
+        }
+    }
+
     /// True while a drag is under way.
     pub fn dragging(&self) -> bool {
         self.drag.is_some()
@@ -866,11 +875,13 @@ impl SymbolEditor {
                         self.nudge(d);
                     }
                 }
-                // Enter ends a polyline, Escape drops the shape being drawn.
-                if !self.clicks.is_empty() && ctx.memory(|m| m.focused().is_none()) {
+                // Enter ends a polyline, Escape drops the shape being drawn or cancels a drag.
+                if (!self.clicks.is_empty() || self.dragging()) && ctx.memory(|m| m.focused().is_none()) {
                     let (enter, escape) =
                         ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
-                    if escape {
+                    if escape && self.dragging() {
+                        self.cancel_drag();
+                    } else if escape {
                         self.cancel_shape();
                     } else if enter {
                         self.finish_polyline();
@@ -1746,6 +1757,50 @@ mod tests {
         e.drag_to(Point::new(6.2, 2.4));
         e.end_drag();
         assert!(matches!(e.symbol.graphics[0], Shape::Circle { radius, .. } if radius == 7.5));
+    }
+
+    #[test]
+    fn dragging_an_arc_end_onto_its_centre_changes_nothing() {
+        let mut e = SymbolEditor::new(Vec::new());
+        let arc = Shape::Arc {
+            center: Point::new(0.0, 0.0),
+            radius: 5.0,
+            start: 0.0,
+            end: 180.0,
+        };
+        e.symbol.graphics.push(arc.clone());
+        e.set_tool(Tool::Select);
+        e.selected = Some(Item::Shape(0));
+        // The end at 180 degrees sits at y = 6e-16, not 0, so the drag lands just off the centre.
+        e.start_drag(Point::new(-5.0, 0.0));
+        e.drag_to(Point::new(0.0, 0.0));
+        e.end_drag();
+        assert_eq!(e.symbol.graphics[0], arc);
+        assert!(e.undo.is_empty());
+        assert_eq!(with_handle(&arc, 0, Point::new(1e-12, -1e-12)), None);
+    }
+
+    #[test]
+    fn escape_cancels_a_handle_drag() {
+        let mut e = SymbolEditor::new(Vec::new());
+        e.set_tool(Tool::Circle);
+        e.click(Point::new(0.0, 0.0));
+        e.click(Point::new(5.0, 0.0));
+        let drawn = e.symbol.clone();
+        let steps = e.undo.len();
+        e.set_tool(Tool::Select);
+        e.selected = Some(Item::Shape(0));
+        e.start_drag(Point::new(5.0, 0.0));
+        e.drag_to(Point::new(10.0, 0.0));
+        assert_ne!(e.symbol, drawn);
+        e.cancel_drag();
+        assert!(!e.dragging());
+        assert_eq!(e.symbol, drawn, "the circle is back as it was");
+        // The mouse moving on and being let go changes nothing and leaves no undo step.
+        e.drag_to(Point::new(15.0, 0.0));
+        e.end_drag();
+        assert_eq!(e.symbol, drawn);
+        assert_eq!(e.undo.len(), steps);
     }
 
     #[test]
