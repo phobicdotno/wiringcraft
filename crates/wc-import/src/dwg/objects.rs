@@ -42,6 +42,8 @@ pub const MAX_OBJECTS: usize = 4_000_000;
 
 /// The key under which objects that could not be decoded are counted in [`Drawing::skipped`].
 pub const DAMAGED: &str = "damaged objects";
+/// A polyline left out because one of its vertices could not be read.
+pub const BROKEN_POLYLINE: &str = "POLYLINE (a vertex damaged)";
 
 /// The skipped-count key for a class section that could not be read: custom entities (types 500
 /// and up) are then not named or counted.
@@ -50,6 +52,8 @@ pub const CLASSES_DAMAGED: &str = "class section damaged (custom entities not co
 /// The skipped-count key for blocks whose base point could not be read: they are kept, placed
 /// as if their base point were (0, 0).
 pub const BASE_UNREAD: &str = "block base points not read (placed from 0, 0)";
+/// The skipped-count key for INSERTs whose block is not in the drawing (or could not be read).
+pub const UNRESOLVED_INSERT: &str = "block references to a block that is not in the drawing (not drawn)";
 /// The key under which entities whose owner is not in the drawing are counted.
 pub const ORPHANS: &str = "entities without an owner";
 
@@ -132,6 +136,18 @@ pub(crate) struct Read {
     pub(crate) warnings: Vec<String>,
 }
 
+impl Read {
+    /// Why the class section could not be read (empty when it was) and why objects could not
+    /// be decoded: the class section's reason comes first in `damaged`, before those of the
+    /// objects.
+    pub(crate) fn damage_reasons(&self) -> (&str, &[String]) {
+        match self.damaged.split_first() {
+            Some((first, rest)) if self.skipped.contains_key(CLASSES_DAMAGED) => (first.as_str(), rest),
+            _ => ("", self.damaged.as_slice()),
+        }
+    }
+}
+
 /// The entities of a DWG file as the DXF reader's entities, by block and model space, with a
 /// count of what was not read.
 pub(crate) fn dxf_drawing(sections: &Sections) -> Result<Read> {
@@ -147,6 +163,12 @@ pub(crate) fn dxf_drawing(sections: &Sections) -> Result<Read> {
     let mut damaged = Vec::new();
     // The classes name the custom types (500 and up); without them those are not counted.
     let classes = match sections.get("AcDb:Classes") {
+        // Stored encrypted (a password-protected drawing): as unreadable as a damaged one.
+        None if sections.skipped.iter().any(|name| name == "AcDb:Classes") => {
+            *skipped.entry(CLASSES_DAMAGED.to_owned()).or_default() += 1;
+            damaged.push("the class section is encrypted".to_owned());
+            HashMap::new()
+        }
         None => HashMap::new(),
         Some(data) => read_classes(data, sections.version, sections.maint).unwrap_or_else(|e| {
             // A section, not an object: counted under its own key, its reason with the others.
@@ -879,11 +901,30 @@ fn decode(
         10 | 11 => {
             let flags = o.data.rc()?;
             let (x, y, _) = o.data.bd3()?;
-            // Control points of a spline-fitted polyline are not on the curve.
+            // Control points of a spline-fitted polyline are not on the curve: left out on
+            // purpose (as hidden), so the polyline does not take them for damaged vertices.
             if flags & 0x10 != 0 {
+                out.hidden.insert(handle);
                 return Ok(());
             }
             e.f(10, x).f(20, y);
+            // A 2D vertex (a 3D one stops at its point) has its widths and then the bulge of
+            // the segment it starts; a negative start width stands for both, with no end width.
+            if o.kind == 10 {
+                // A start width that is no number says neither layout: the fields after it
+                // cannot be told apart, so the vertex is damaged.
+                let start_width = o.data.bd()?;
+                if !start_width.is_finite() {
+                    return Err(bad("a vertex width is not a number"));
+                }
+                if start_width >= 0.0 {
+                    o.data.bd()?;
+                }
+                let bulge = o.data.bd()?;
+                if bulge != 0.0 {
+                    e.f(42, bulge);
+                }
+            }
         }
         15 => {
             let flags = o.data.bs()?;
@@ -924,6 +965,10 @@ fn decode(
                 let z1 = o.data.rd()?;
                 o.data.dd(z1)?;
             }
+            // Stored as text, an end that is not a number would read back as 0.
+            if ![x1, x2, y1, y2].iter().all(|v| v.is_finite()) {
+                return Err(bad("a line's end is not a number"));
+            }
             e.f(10, x1).f(20, y1).f(11, x2).f(21, y2);
         }
         27 => {
@@ -943,6 +988,9 @@ fn decode(
         44 => mtext(&mut o, &mut e)?,
         77 => lwpolyline(&mut o, &mut e)?,
         _ => {}
+    }
+    if e.1 {
+        return Err(bad(format!("a {dxf_kind} has a value that is not a number")));
     }
     out.items.push(Item {
         handle,
@@ -972,10 +1020,13 @@ fn owned(o: &mut Object) -> Result<Vec<u64>> {
 
 /// Group codes of an entity being built.
 #[derive(Debug, Default)]
-struct Codes(Vec<(i32, String)>);
+struct Codes(Vec<(i32, String)>, bool);
 
 impl Codes {
+    /// A number; one that is not a number (NaN or infinite) marks the entity as damaged, since
+    /// written as text it would read back as 0 and be drawn at an invented place.
     fn f(&mut self, code: i32, v: f64) -> &mut Self {
+        self.1 |= !v.is_finite();
         self.0.push((code, format!("{v}")));
         self
     }
@@ -1229,9 +1280,7 @@ fn lwpolyline(o: &mut Object, e: &mut Codes) -> Result<()> {
     }
     let z = if flags & 1 != 0 { d.bd3()?.2 } else { 1.0 };
     let points = d.bl()?;
-    if flags & 16 != 0 {
-        d.bl()?;
-    }
+    let bulges = if flags & 16 != 0 { d.bl()? } else { 0 };
     if o.version >= Version::R2010 && flags & 1024 != 0 {
         d.bl()?;
     }
@@ -1239,6 +1288,9 @@ fn lwpolyline(o: &mut Object, e: &mut Codes) -> Result<()> {
         d.bl()?;
     }
     e.i(70, i64::from(flags & 512 != 0)).f(230, z);
+    // The points come first and their bulges after them; each bulge goes (as code 42) after
+    // the point that starts its segment.
+    let mut at = Vec::new();
     let (mut x, mut y) = (0.0, 0.0);
     for i in 0..points {
         if i == 0 {
@@ -1247,9 +1299,39 @@ fn lwpolyline(o: &mut Object, e: &mut Codes) -> Result<()> {
             x = d.dd(x)?;
             y = d.dd(y)?;
         }
+        // A point that is not a number would be written as text and read back as 0.
+        if !x.is_finite() || !y.is_finite() {
+            return Err(bad("a polyline point is not a number"));
+        }
+        at.push((x, y));
+    }
+    let bulge = kept_bulges(d, bulges, at.len())?;
+    for (i, (x, y)) in at.into_iter().enumerate() {
         e.f(10, x).f(20, y);
+        if let Some(&b) = bulge.get(i)
+            && b != 0.0
+        {
+            e.f(42, b);
+        }
     }
     Ok(())
+}
+
+/// Read `count` bulges (BD) and keep at most one per point: a count beyond `points` (a damaged
+/// or hostile file) is read past, not stored.
+fn kept_bulges(d: &mut Bits<'_>, count: u32, points: usize) -> Result<Vec<f64>> {
+    let mut kept = Vec::new();
+    for _ in 0..count {
+        let b = d.bd()?;
+        if kept.len() < points {
+            // A bulge that is not a number would silently draw its arc as a straight line.
+            if !b.is_finite() {
+                return Err(bad("a polyline bulge is not a number"));
+            }
+            kept.push(b);
+        }
+    }
+    Ok(kept)
 }
 
 impl Decoded {
@@ -1316,6 +1398,17 @@ impl Decoded {
                         vertices
                     } else {
                         let by_handle: HashMap<u64, &Item> = vertices.iter().map(|v| (v.handle, *v)).collect();
+                        // A listed vertex that could not be read (damaged) would join its
+                        // neighbours with a segment the drawing does not have: the polyline is
+                        // left out and said instead.
+                        if item
+                            .vertices
+                            .iter()
+                            .any(|h| !by_handle.contains_key(h) && !hidden.contains(h))
+                        {
+                            *skipped.entry(BROKEN_POLYLINE.to_owned()).or_default() += 1;
+                            continue;
+                        }
                         item.vertices.iter().filter_map(|h| by_handle.get(h).copied()).collect()
                     };
                     for v in ordered {
@@ -1331,13 +1424,27 @@ impl Decoded {
                     None => *skipped.entry("DIMENSION".to_owned()).or_default() += 1,
                 },
                 "INSERT" => {
-                    if let Some(name) = item.block.and_then(|b| blocks.get(&b)) {
-                        entity.codes.push((2, name.clone()));
-                    }
-                    list.push(entity);
+                    // A reference to a block that is not there draws nothing: counted, while
+                    // its attributes are still drawn, as plain texts (as ATTRIBs they would be
+                    // taken for those of the INSERT before it).
+                    let resolved = match item.block.and_then(|b| blocks.get(&b)) {
+                        Some(name) => {
+                            entity.codes.push((2, name.clone()));
+                            list.push(entity);
+                            true
+                        }
+                        None => {
+                            *skipped.entry(UNRESOLVED_INSERT.to_owned()).or_default() += 1;
+                            false
+                        }
+                    };
                     for a in own.iter().filter(|c| c.entity.kind == "ATTRIB") {
                         if (a.entity.f(70) as i64) & 1 == 0 {
-                            list.push(with_layer(&a.entity, a.layer, &layers));
+                            let mut text = with_layer(&a.entity, a.layer, &layers);
+                            if !resolved {
+                                text.kind = "TEXT".into();
+                            }
+                            list.push(text);
                         }
                     }
                 }

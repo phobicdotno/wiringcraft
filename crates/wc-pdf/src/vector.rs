@@ -421,9 +421,12 @@ pub fn svg(page: &PageDrawing) -> String {
                     // Counter-clockwise on paper is a negative SVG rotation (y runs down).
                     format!(" transform=\"rotate({} {} {})\"", num(-angle), num(at.0), num(at.1))
                 };
+                // `xml:space="preserve"` keeps leading and repeated spaces as the PDF prints them;
+                // browsers, Inkscape and librsvg all honour it, unlike CSS `white-space`.
                 let _ = writeln!(
                     out,
-                    "<text x=\"{}\" y=\"{}\" font-size=\"{}\" fill=\"{}\" stroke=\"none\"{turn}>{}</text>",
+                    "<text xml:space=\"preserve\" x=\"{}\" y=\"{}\" font-size=\"{}\" fill=\"{}\" \
+                     stroke=\"none\"{turn}>{}</text>",
                     num(at.0),
                     num(at.1),
                     num(height / 0.72),
