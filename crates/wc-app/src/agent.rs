@@ -4044,6 +4044,29 @@ mod tests {
         assert_eq!(a.ed.place_turn, (Rotation::R0, false));
     }
 
+    /// R, then Escape (Select), then S: the preview is upright again and the status no longer
+    /// tells of the old turn. A status about something else stays (#738).
+    #[test]
+    fn leaving_the_place_tool_clears_only_the_turn_status() {
+        use crate::state::Tool;
+        use wc_core::geom::Rotation;
+        let (_tmp, mut a) = app(vec![]);
+        a.ed.tool = Tool::Place;
+        a.ed.place_symbol = Some("wc.coil".into());
+        a.run(Action::Rotate);
+        assert_eq!(a.ed.message, "Turned 90°, R turns again, M mirrors.");
+        a.run(Action::Select);
+        a.run(Action::PlaceSymbol);
+        assert_eq!(a.ed.place_turn, (Rotation::R0, false));
+        assert!(a.ed.message.is_empty(), "{}", a.ed.message);
+        // Another status stays when the turn is set back.
+        a.run(Action::Rotate);
+        a.ed.message = "Saved.".into();
+        a.run(Action::Select);
+        assert_eq!(a.ed.place_turn, (Rotation::R0, false));
+        assert_eq!(a.ed.message, "Saved.");
+    }
+
     /// A worker that ends only after far more polls than the old fixed bounds (1000) allowed
     /// is still waited for (#678).
     #[test]

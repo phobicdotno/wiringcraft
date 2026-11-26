@@ -177,7 +177,19 @@ impl Editor {
     pub fn set_tool(&mut self, tool: Tool) {
         self.tool = tool;
         if tool != Tool::Place {
-            self.place_turn = (Rotation::R0, false);
+            self.reset_place_turn();
+        }
+    }
+
+    /// Set the turn for the symbol on the pointer back to upright. A status that still tells
+    /// of the old turn goes with it; any other status stays.
+    pub fn reset_place_turn(&mut self) {
+        if self.place_turn == (Rotation::R0, false) {
+            return;
+        }
+        self.place_turn = (Rotation::R0, false);
+        if self.message.ends_with(TURN_STATUS_END) || self.message.contains(TURN_KEPT_STATUS) {
+            self.message.clear();
         }
     }
 
@@ -609,7 +621,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
     // The turn for the symbol on the pointer belongs to the place tool: another tool sets it
     // back, also while a panel is shown.
     if ed.tool != Tool::Place {
-        ed.place_turn = (Rotation::R0, false);
+        ed.reset_place_turn();
     }
     if let Some(panel) = ed.panel {
         crate::panel_view::show(ui, open, ed, panel, snap_step);
@@ -2156,6 +2168,11 @@ fn on_paper(open: &Open, page: usize, at: Point) -> bool {
     })
 }
 
+/// How the status after R or M ends.
+const TURN_STATUS_END: &str = ", R turns again, M mirrors.";
+/// What the status after placing a turned symbol says about the turn staying on.
+const TURN_KEPT_STATUS: &str = "The next ones are too until you change it with R or M";
+
 /// R (`mirror` false) or M (`mirror` true) with the place tool: turn the symbol on the pointer
 /// a quarter clockwise, or mirror it, for this and the next symbols placed.
 pub fn turn_place(ed: &mut Editor, mirror: bool) {
@@ -2173,7 +2190,7 @@ pub fn turn_place(ed: &mut Editor, mirror: bool) {
         .into_iter()
         .chain(first)
         .collect();
-    ed.message = format!("{turn}, R turns again, M mirrors.");
+    ed.message = format!("{turn}{TURN_STATUS_END}");
 }
 
 /// How a turn reads in a status message ("turned 90° and mirrored"); `None` when not turned.
@@ -2229,7 +2246,7 @@ fn place_tool(
                 );
                 ed.select_only(Selection::Symbol(sid));
                 let turn = turn_words(rotation, mirror)
-                    .map(|w| format!(", {w}. The next ones are too until you change it with R or M"))
+                    .map(|w| format!(", {w}. {TURN_KEPT_STATUS}"))
                     .unwrap_or_default();
                 ed.message = format!("Placed {id}{turn}.{}", wired_note(wired));
             }
