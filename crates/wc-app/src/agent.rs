@@ -628,7 +628,7 @@ pub fn specs() -> Vec<Value> {
              Panels: panel (new, arrange, step, device, show, list, remove). PLC: rack (list, add, set, remove, card add/set/remove: PLC racks and their cards by slot). \
              Libraries: lib (add, sync, status, update, lock, search, propose). \
              Import: import (symbol-dxf, symbol-svg, symbol-kicad, symbol-qet, footprint-dxf, model-step, parts-csv, parts-bmecat, parts-edz, plc-csv, wago, archive, page-dxf, page-dwg, pdf, eplan, swe, swe-library, aml). \
-             Output: pdf (--page, --report, --lang for a translated print), drawing (SVG/DXF per page), report, nets, aml, plc-vars, export (wago-marking, wago-configurator), translations (texts missing a translation, --lang). \
+             Output: pdf (--page, --report, --lang for a translated print), drawing (SVG/DXF per page), report, report-layout (show, set, reset: a report's columns, sorting, grouping and title-block values), nets, aml, plc-vars, export (wago-marking, wago-configurator), translations (texts missing a translation, --lang). \
              Checks and history: check, rules (list, set, off, on: the check rules and library rules the project turns off), inspect (another tool's archive), vcs (init, commit, branch, switch, merge, log, changes, page-log), comment (add, reply, resolve, reopen, remove, list). \
              Use [\"--help\"] or [\"<command>\", \"--help\"] for the arguments.",
             json!({"args": {"type": "array", "items": {"type": "string"}, "description": "Arguments, e.g. [\"plc-vars\", \"export/io.st\"]. The project folder is passed for you."}}),
@@ -866,45 +866,6 @@ fn need_open(open: Option<&mut Open>) -> Result<&mut Open, String> {
     open.ok_or_else(|| "No project is open. Use open_project first.".to_owned())
 }
 
-/// An error naming the first key of a report layout (or of one of its column entries) that
-/// [`wc_core::report_layout::ReportLayout`] does not have, since serde would drop it silently
-/// (`columns` for `column` would then keep the built-in columns). The known keys are the ones
-/// the layout itself serializes, so they follow its fields.
-fn report_layout_unknown_key(layout: &serde_json::Map<String, Value>) -> Result<(), String> {
-    use wc_core::report_layout::{ReportColumn, ReportLayout};
-    let keys = |v: Value| -> Vec<String> { v.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default() };
-    let column = ReportColumn {
-        from: "x".into(),
-        heading: Some("x".into()),
-    };
-    let known = keys(json!(ReportLayout {
-        kind: "x".into(),
-        title: Some("x".into()),
-        columns: vec![column.clone()],
-        sort: vec!["x".into()],
-        group: Some("x".into()),
-        header: vec!["x".into()],
-    }));
-    let known_column = keys(json!(column));
-    let unknown = |fields: &serde_json::Map<String, Value>, known: &[String], what: &str| match fields
-        .keys()
-        .find(|k| !known.contains(k))
-    {
-        Some(k) => Err(format!(
-            "Unknown {what} key {k:?}; known keys are {}.",
-            known.join(", ")
-        )),
-        None => Ok(()),
-    };
-    unknown(layout, &known, "layout")?;
-    if let Some(Value::Array(columns)) = layout.get("column") {
-        for c in columns.iter().filter_map(Value::as_object) {
-            unknown(c, &known_column, "column")?;
-        }
-    }
-    Ok(())
-}
-
 impl Open {
     /// A page by its number or id.
     fn find_page(&self, key: &str) -> Option<usize> {
@@ -1104,6 +1065,22 @@ fn box_size_ok(width: f64, height: f64) -> Result<(), String> {
 
 /// The app as the assistant's toolbox.
 pub struct AppTools<'a>(pub &'a mut App);
+
+/// The tools that change neither the project, its folder nor which project is open: the only
+/// ones run while an import runs.
+const READ_TOOLS: &[&str] = &[
+    "get_state",
+    "get_page",
+    "find_symbols",
+    "find_parts",
+    "get_devices",
+    "select_items",
+    "show",
+    "get_template",
+    "run_check",
+    "get_report",
+    "todo",
+];
 
 /// Whether tool `name` with input `v` changes the page its `page` field names (the shown page
 /// without one). Tools that only read, select, show or comment do not.
@@ -3017,6 +2994,7 @@ impl App {
                     "used_in_texts": m.used_placeholders(), "error": entry.error
                 })))
             }
+            "edit" if self.share.active() => Err(Open::MACRO_SAVE_SHARED.to_owned()),
             "edit" => {
                 let entry = find_macro(open, need_s(v, "name")?)?;
                 if !entry.project {
@@ -3090,7 +3068,7 @@ impl App {
                     }
                     form.set_value_sets(sets)?;
                 }
-                let path = form.save()?;
+                let path = open.save_macro_form(&form)?;
                 let m = wc_core::macros::read_macro(&path).map_err(|e| e.to_string())?;
                 let names = |v: Vec<&str>| if v.is_empty() { "none".to_owned() } else { v.join(", ") };
                 Ok(format!(
@@ -3261,14 +3239,8 @@ impl App {
                 let form = if action == "reset" {
                     Form::new(kind, columns, wc_report::layout_for(&open.project, kind)).cleared()
                 } else {
-                    let mut given = v.get("layout").cloned().ok_or("Give the layout.")?;
-                    let Some(fields) = given.as_object_mut() else {
-                        return Err("The layout must be an object.".into());
-                    };
-                    report_layout_unknown_key(fields)?;
-                    fields.insert("kind".into(), json!(kind.name()));
-                    let layout: wc_core::report_layout::ReportLayout =
-                        serde_json::from_value(given).map_err(|e| format!("Bad layout: {e}"))?;
+                    let given = v.get("layout").cloned().ok_or("Give the layout.")?;
+                    let layout = wc_core::report_layout::ReportLayout::from_json(kind.name(), given)?;
                     // Read into the dialog's form as the dialog would show it, so it is kept
                     // as OK keeps it (a layout that shows the built-in one keeps none).
                     Form::new(kind, columns, Some(&layout))
@@ -3429,6 +3401,13 @@ impl App {
     /// `gh` calls) run on a worker thread, so the window keeps drawing; [`App::agent_finish`]
     /// applies their result on the window thread. Every other tool runs here and now.
     pub(crate) fn agent_start(&mut self, name: &str, v: &Value) -> Started {
+        // While File > Import runs the project folder is the import's: only the tools that
+        // read (or show a page, or file a todo) run.
+        if self.importing.is_some() && !READ_TOOLS.contains(&name) {
+            return Started::Done(Err(format!(
+                "{name} was not run: an import is running in the app; wait until it is done."
+            )));
+        }
         match name {
             "run_command" => match self.command_start(v) {
                 Ok(p) => Started::Running(p),
@@ -3738,7 +3717,7 @@ fn writes_while_held(args: &[String], dir: &Path, held: &BTreeMap<String, String
         (
             Some(
                 "page" | "panel" | "location" | "jumper" | "strip" | "macro" | "revision" | "template" | "lib"
-                | "comment",
+                | "comment" | "report-layout",
             ),
             Some("list" | "show"),
         ) => true,
@@ -3755,8 +3734,13 @@ fn writes_while_held(args: &[String], dir: &Path, held: &BTreeMap<String, String
     let project = Guarded::new(dir);
     // Run from inside the project folder, even a bare file name could land on a held page: only
     // a command with nothing after its own words (`check`, `page list`) runs there.
+    // `report-layout show <kind>` names a report, not a file: a word of the command too.
+    let layout_kind = arg(0) == Some("report-layout")
+        && arg(1) == Some("show")
+        && arg(2).is_some_and(|k| wc_report::Kind::parse(k).is_some());
     let words = match arg(0) {
         Some("vcs") => 2,
+        _ if layout_kind => 3,
         _ if matches!(arg(1), Some("list" | "show")) => 2,
         _ => 1,
     };
@@ -3769,7 +3753,7 @@ fn writes_while_held(args: &[String], dir: &Path, held: &BTreeMap<String, String
             args.join(" ")
         ));
     }
-    for a in args {
+    for a in args.iter().skip(if layout_kind { 3 } else { 0 }) {
         let why = match project.reached_by(cwd, split_flag(a).1) {
             Ok(false) => continue,
             Ok(true) => "is in the project folder or links to a file in it".to_owned(),
@@ -3923,6 +3907,7 @@ mod tests {
             show_layers: false,
             live: Default::default(),
             fetch: None,
+            importing: None,
         };
         (tmp, app)
     }
@@ -3935,6 +3920,191 @@ mod tests {
         } else {
             format!("file:///{path}")
         }
+    }
+
+    /// Frames until the running import is taken in (at most a few seconds).
+    fn until_imported(a: &mut App) {
+        let ctx = egui::Context::default();
+        for _ in 0..1000 {
+            a.poll_import(&ctx);
+            if a.importing.is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(a.importing.is_none(), "the import did not end");
+    }
+
+    #[test]
+    fn an_import_runs_off_the_window_thread_with_edits_held_until_it_is_taken_in() {
+        let (tmp, mut a) = app(vec![]);
+        let aml = tmp.path().join("plant.aml");
+        std::fs::write(&aml, crate::imports::tests::AML).unwrap();
+        let pages = a.open.as_ref().unwrap().project.pages.len();
+        a.import_from(crate::imports::Kind::Aml, &aml, None, None);
+        assert!(a.importing.is_some());
+        assert!(a.dialog.is_none());
+
+        // Until the result is taken in, nothing edits, saves or replaces the project.
+        a.run(Action::AddPage);
+        assert!(a.ed.message.contains("import is running"), "{}", a.ed.message);
+        a.run(Action::SaveAs);
+        assert!(a.pending.is_none());
+        let refused = a.agent_start("add_page", &json!({}));
+        assert!(matches!(&refused, Started::Done(Err(e)) if e.contains("import is running")));
+        assert!(matches!(a.agent_start("get_state", &json!({})), Started::Done(Ok(_))));
+        let other = tmp.path().join("other");
+        wc_core::store::create(&other, "Other").unwrap();
+        let mut prefs = crate::prefs::Prefs::default();
+        let dir = a.open.as_ref().unwrap().dir.clone();
+        a.open_dir(&other, &mut prefs);
+        assert_eq!(a.open.as_ref().unwrap().dir, dir);
+        assert!(matches!(&a.dialog, Some(Dialog::Message(m)) if m.contains("import is running")));
+        a.dialog = None;
+        a.import_from(crate::imports::Kind::Aml, &aml, None, None);
+        assert!(matches!(&a.dialog, Some(Dialog::Message(m)) if m.contains("import is running")));
+        a.dialog = None;
+        assert_eq!(a.open.as_ref().unwrap().project.pages.len(), pages);
+
+        // Taken in as one undo step, with the message the import gave.
+        until_imported(&mut a);
+        let Some(Dialog::Message(msg)) = &a.dialog else {
+            unreachable!("no message: {:?}", a.dialog.is_some());
+        };
+        assert!(msg.starts_with("Imported plant.aml."), "{msg}");
+        let open = a.open.as_mut().unwrap();
+        assert!(open.project.pages.len() > pages, "{msg}");
+        assert!(!open.dirty);
+        assert!(open.undo());
+        assert_eq!(open.project.pages.len(), pages);
+        assert!(!open.can_undo());
+
+        // Edits work again.
+        a.run(Action::AddPage);
+        assert_eq!(a.open.as_ref().unwrap().project.pages.len(), pages + 1);
+    }
+
+    #[test]
+    fn a_failing_import_shows_why_once_it_ends() {
+        let (tmp, mut a) = app(vec![]);
+        let before = a.open.as_ref().unwrap().project.clone();
+        a.import_from(crate::imports::Kind::Aml, &tmp.path().join("missing.aml"), None, None);
+        until_imported(&mut a);
+        let Some(Dialog::Message(msg)) = &a.dialog else {
+            unreachable!("no message");
+        };
+        assert!(msg.starts_with("missing.aml was not imported"), "{msg}");
+        let open = a.open.as_ref().unwrap();
+        assert_eq!(open.project, before);
+        assert!(!open.can_undo());
+    }
+
+    #[test]
+    fn a_message_is_not_sent_while_an_import_runs_and_stays_in_the_box() {
+        let (tmp, mut a) = app(vec![]);
+        let aml = tmp.path().join("plant.aml");
+        std::fs::write(&aml, crate::imports::tests::AML).unwrap();
+        a.import_from(crate::imports::Kind::Aml, &aml, None, None);
+        assert!(a.importing.is_some());
+        a.assistant.input = "add a page".into();
+        let shot = crate::screenshot::Shot::from_rgba(1, 1, vec![0, 0, 0, 255]).unwrap();
+        a.assistant.waiting.push((shot, None));
+
+        a.assistant_send(&egui::Context::default());
+        assert_eq!(a.assistant.input, "add a page");
+        assert_eq!(a.assistant.waiting.len(), 1);
+        assert!(a.assistant.turn.is_none());
+        assert!(!a.assistant.busy());
+        assert!(a.assistant.sent.is_empty() && a.assistant.sent_text.is_empty());
+        // Said in the conversation that is showing, whichever backend it is.
+        let said = [&a.assistant.session.log, &a.assistant.login_log]
+            .into_iter()
+            .flatten()
+            .filter(|e| matches!(e, wc_agent::Entry::Error(e) if e.contains("import is running")))
+            .count();
+        assert_eq!(said, 1);
+        assert_eq!(a.assistant.session.log.len() + a.assistant.login_log.len(), 1);
+        until_imported(&mut a);
+    }
+
+    #[test]
+    fn an_import_that_ends_with_another_project_open_is_not_taken_into_it() {
+        let (tmp, mut a) = app(vec![]);
+        let aml = tmp.path().join("plant.aml");
+        std::fs::write(&aml, crate::imports::tests::AML).unwrap();
+        a.import_from(crate::imports::Kind::Aml, &aml, None, None);
+        // Opening another project is refused while it runs; this one got there all the same.
+        let other = tmp.path().join("other");
+        wc_core::store::create(&other, "Other").unwrap();
+        a.open = Some(crate::state::Open::load(&other).unwrap());
+        let before = a.open.as_ref().unwrap().project.clone();
+
+        until_imported(&mut a);
+        let Some(Dialog::Message(msg)) = &a.dialog else {
+            unreachable!("no message");
+        };
+        assert!(msg.contains("plant.aml") && msg.contains("is no longer open"), "{msg}");
+        let open = a.open.as_ref().unwrap();
+        assert_eq!(open.dir, other);
+        assert_eq!(open.project, before);
+        assert!(!open.dirty && !open.can_undo());
+    }
+
+    #[test]
+    fn closing_the_window_is_called_off_while_an_import_runs() {
+        let close = || {
+            let mut input = egui::RawInput::default();
+            input
+                .viewports
+                .entry(egui::ViewportId::ROOT)
+                .or_default()
+                .events
+                .push(egui::ViewportEvent::Close);
+            input
+        };
+        let cancelled = |a: &mut App| {
+            let out = egui::Context::default().run(close(), |ctx| a.hold_close_while_importing(ctx));
+            out.viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .is_some_and(|v| v.commands.contains(&egui::ViewportCommand::CancelClose))
+        };
+        let (tmp, mut a) = app(vec![]);
+        // Nothing runs: the window closes.
+        assert!(!cancelled(&mut a));
+        assert!(a.ed.message.is_empty(), "{}", a.ed.message);
+
+        let aml = tmp.path().join("plant.aml");
+        std::fs::write(&aml, crate::imports::tests::AML).unwrap();
+        a.import_from(crate::imports::Kind::Aml, &aml, None, None);
+        assert!(cancelled(&mut a));
+        assert!(a.ed.message.contains("not closed"), "{}", a.ed.message);
+        until_imported(&mut a);
+        assert!(!cancelled(&mut a));
+    }
+
+    #[test]
+    fn the_view_controls_in_the_import_window_work_while_an_import_runs() {
+        let (tmp, mut a) = app(vec![]);
+        let aml = tmp.path().join("plant.aml");
+        std::fs::write(&aml, crate::imports::tests::AML).unwrap();
+        a.import_from(crate::imports::Kind::Aml, &aml, None, None);
+        assert!(a.importing.is_some());
+        let zoom = a.ed.view.zoom;
+        a.run(Action::ZoomIn);
+        assert!(a.ed.view.zoom > zoom);
+        for c in crate::IMPORT_VIEW_CONTROLS {
+            assert!(crate::allowed_while_importing(*c), "{c:?}");
+        }
+        // The grid and the theme are left alone here: they save the settings file.
+        for c in [Action::ZoomOut, Action::ZoomFit, Action::Layers] {
+            a.ed.message.clear();
+            a.run(c);
+            assert!(!a.ed.message.contains("import is running"), "{c:?}: {}", a.ed.message);
+        }
+        // Layers shows its list, drawn in the import window with the controls.
+        assert!(a.show_layers);
+        let _ = egui::Context::default().run(egui::RawInput::default(), |ctx| a.import_window(ctx));
+        until_imported(&mut a);
     }
 
     /// Frames until the base project fetch is over (at most a few seconds).
@@ -6383,6 +6553,27 @@ mod tests {
     }
 
     #[test]
+    fn the_assistant_does_not_edit_a_macro_in_a_shared_session() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        let id = open.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let clip = open.copy(1, &[Selection::Symbol(id)]);
+        let path = open.save_macro(&clip, "Coil", "").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let open = a.open.as_mut().unwrap();
+        a.share.start_host(open, "Hanna", "hanna@example.com").unwrap();
+        // The session's Undo could not take the file back, so the edit is refused.
+        let err = call(
+            &mut a,
+            "macros",
+            json!({"action": "edit", "name": "Coil", "description": "A coil"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("shared session"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
     fn the_assistant_edits_a_project_macros_placeholders_and_value_sets_as_the_dialog_saves_them() {
         let (tmp, mut a) = app(vec![]);
         let open = a.open.as_mut().unwrap();
@@ -6441,6 +6632,11 @@ mod tests {
             json!({"action": "edit", "name": "Starter", "placeholders": [{"name": "power", "was": "kW"}]}),
         )
         .unwrap();
+        // The edit is one undo step: Undo puts the file back, Redo writes the edit again.
+        let open = a.open.as_mut().unwrap();
+        assert!(open.undo());
+        assert_eq!(wc_core::macros::read_macro(&path).unwrap().used_placeholders(), ["kW"]);
+        assert!(open.redo());
         let m = wc_core::macros::read_macro(&path).unwrap();
         assert_eq!(m.used_placeholders(), ["power"]);
         assert_eq!(m.description, "Motor starter");
@@ -8946,6 +9142,8 @@ mod tests {
             vec!["page", "list"],
             vec!["vcs", "log"],
             vec!["find", "-K1"],
+            vec!["report-layout", "show"],
+            vec!["report-layout", "show", "devices"],
         ] {
             let args: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
             assert!(
@@ -8953,6 +9151,9 @@ mod tests {
                 "{args:?}"
             );
         }
+        // A word that is not a report could be a file.
+        let unknown: Vec<String> = ["report-layout", "show", "out.json"].map(String::from).to_vec();
+        assert!(writes_while_held(&unknown, &dir, &held, &dir.join("pages")).is_some());
         assert!(writes_while_held(&args, &dir, &held, out.path()).is_none());
         // An export writes its own file names into the folder it is given: a file there that
         // links to a held page, by name or as the same file, is a way onto the page.

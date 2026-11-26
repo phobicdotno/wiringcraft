@@ -594,22 +594,8 @@ pub fn archive(dir: &Path, file: &Path, first_page: usize, lib: Option<&Path>, l
     Ok(())
 }
 
-/// A DXF drawing onto the page `page` (`import page-dxf`). When a symbol copy or the save
-/// fails, the symbol copies taken and every project file the save may have written go back as
-/// they were, so the project on disk is the one before.
+/// A DXF drawing onto the page `page` (`import page-dxf`).
 pub fn page_dxf(dir: &Path, file: &Path, page: &str, scale: f64, log: &mut Log) -> Res<()> {
-    page_dxf_with(dir, file, page, scale, log, save)
-}
-
-/// [`page_dxf`], saving the project with `save`.
-fn page_dxf_with(
-    dir: &Path,
-    file: &Path,
-    page: &str,
-    scale: f64,
-    log: &mut Log,
-    save: impl FnOnce(&Path, &Project) -> Res<()>,
-) -> Res<()> {
     let mut p = load(dir)?;
     let lib = wc_library::Library::open(dir, &p).map_err(e)?;
     let known: std::collections::BTreeSet<String> = lib.index(ItemKind::Symbol).into_keys().collect();
@@ -634,24 +620,25 @@ fn page_dxf_with(
             return Err(format!("{source}: the symbol file for {id:?} declares id {:?}", s.id));
         }
     }
-    // What is in the vendor folder now, and every file the save may write, read before anything
-    // is written: a copy or a save that fails part way leaves no copy without its pin (a retry
-    // would skip a readable one) and no half-written project.
-    let copies: Written = needed
+    // What is in the vendor folder and the project files now, so a copy or a save that fails
+    // part way leaves the project folder as it was (a retry would skip a readable copy without
+    // its pin).
+    let project_files = snapshot_project(dir, &[], &[])?;
+    let before: Written = needed
         .iter()
         .map(|id| vendored_bytes(dir, ItemKind::Symbol, id))
         .collect::<Res<_>>()?;
-    let project_files = snapshot_project(dir, &[], &[])?;
-    let put_back = |why: String, files: &[&Written]| -> String {
-        let failed: Vec<String> = files.iter().flat_map(|f| put_files_back(f)).collect();
+    let put_back = |why: String| -> String {
+        let mut failed = put_files_back(&project_files);
+        failed.extend(put_files_back(&before));
         if failed.is_empty() {
             why
         } else {
-            format!("{why}; putting the files back failed too: {}", failed.join("; "))
+            format!("{why}; symbol copies could not be put back: {}", failed.join("; "))
         }
     };
     for id in needed {
-        wc_library::take(dir, &mut p, &lib, ItemKind::Symbol, id).map_err(|x| put_back(x.to_string(), &[&copies]))?;
+        wc_library::take(dir, &mut p, &lib, ItemKind::Symbol, id).map_err(|x| put_back(x.to_string()))?;
     }
     let pg = page_mut(&mut p, page)?;
     let n_g = imported.graphics.len();
@@ -661,7 +648,7 @@ fn page_dxf_with(
         s.id = pg.next_id("s");
         pg.symbols.push(s);
     }
-    save(dir, &p).map_err(|why| put_back(why, &[&project_files, &copies]))?;
+    save(dir, &p).map_err(put_back)?;
     out!(log, "imported {n_g} shapes and {n_s} symbols onto page {page}");
     Ok(())
 }
@@ -1940,47 +1927,6 @@ mod tests {
     }
 
     #[test]
-    fn a_page_dxf_whose_save_fails_leaves_the_project_folder_as_it_was() {
-        let t = tmp();
-        let dir = t.path().join("p");
-        let lib = t.path().join("lib");
-        assert!(wc_library::write_symbol(&lib, &symbol_with_pins("aa.coil", &["A1", "A2"])).is_ok());
-        let mut p = Project::new("t");
-        p.pages.push(wc_core::Page::new("p0001", "1", "Plan"));
-        p.meta.libraries = vec![wc_core::project::LibrarySource {
-            name: "lib".into(),
-            kind: "folder".into(),
-            location: lib.to_string_lossy().into_owned(),
-            reference: None,
-        }];
-        assert!(store::save(&dir, &p).is_ok());
-        let drawing = t.path().join("plan.dxf");
-        let text = "0\nSECTION\n2\nENTITIES\n0\nINSERT\n2\nAA.COIL\n10\n0\n20\n0\n0\nENDSEC\n0\nEOF\n";
-        assert!(std::fs::write(&drawing, text).is_ok());
-        let before = files(&dir);
-
-        // The save writes the project's own files and the lockfile, then stops at a page id it
-        // cannot write; the symbol copy is already in the project folder by then.
-        let copied = std::cell::Cell::new(false);
-        let mut log = Log::default();
-        let r = page_dxf_with(&dir, &drawing, "p0001", 1.0, &mut log, |dir, p| {
-            copied.set(store::read_vendored_symbol(dir, "aa.coil").is_ok());
-            let mut p = p.clone();
-            p.pages.push(wc_core::Page::new("bad/id", "2", "Bad"));
-            save(dir, &p)
-        });
-        assert!(r.is_err(), "{log:?}");
-        assert!(copied.get(), "the symbol was not copied before the save");
-        assert_eq!(files(&dir), before);
-
-        // The same import with a save that works takes the symbol and places it.
-        let mut log = Log::default();
-        assert_eq!(page_dxf(&dir, &drawing, "p0001", 1.0, &mut log), Ok(()), "{log:?}");
-        assert!(store::read_vendored_symbol(&dir, "aa.coil").is_ok());
-        assert_eq!(load(&dir).map(|p| p.pages[0].symbols.len()), Ok(1));
-    }
-
-    #[test]
     fn a_vendored_symbol_without_a_lock_entry_keeps_the_pins_wires_use() {
         let t = tmp();
         let dir = t.path().join("p");
@@ -2041,6 +1987,65 @@ mod tests {
             Some(3)
         );
         assert!(q.lock.symbols.contains_key("imp.coil"));
+    }
+
+    #[test]
+    fn a_dxf_page_whose_save_fails_leaves_the_project_folder_as_it_was() {
+        let t = tmp();
+        let dir = t.path().join("p");
+        let lib = t.path().join("lib");
+        let symbol = |id: &str| wc_core::Symbol {
+            source: String::new(),
+            id: id.into(),
+            name: "Coil".into(),
+            category: String::new(),
+            letter_code: "K".into(),
+            role: Default::default(),
+            graphics: vec![],
+            pins: vec![],
+            tag_at: Default::default(),
+            description: String::new(),
+        };
+        for id in ["imp.coil", "imp.lamp"] {
+            assert!(wc_library::write_symbol(&lib, &symbol(id)).is_ok());
+        }
+        let mut p = Project::new("t");
+        p.meta.libraries.push(wc_core::project::LibrarySource {
+            name: "lib".into(),
+            kind: "folder".into(),
+            location: lib.to_string_lossy().into_owned(),
+            reference: None,
+        });
+        p.pages.push(wc_core::Page::new("1", "1", "Main"));
+        assert!(store::save(&dir, &p).is_ok());
+        // A copy that cannot be read is taken again, so the import overwrites it.
+        let broken = match store::vendor_path(&dir, ItemKind::Symbol, "imp.lamp") {
+            Ok(path) => path,
+            Err(why) => unreachable!("{why}"),
+        };
+        assert!(std::fs::create_dir_all(broken.parent().unwrap_or(&dir)).is_ok());
+        assert!(std::fs::write(&broken, "not a symbol").is_ok());
+        // A folder where the page's staging file goes: the save writes the lockfile with the new
+        // pins, then cannot write the page.
+        let page_file = dir.join(store::PAGES_DIR).join(format!("1{}", store::PAGE_SUFFIX));
+        let mut staging = page_file.into_os_string();
+        staging.push(".tmp");
+        assert!(std::fs::create_dir_all(&staging).is_ok());
+        let before = files(&dir);
+        let drawing = t.path().join("page.dxf");
+        let ents = "0\nINSERT\n2\nIMP.COIL\n10\n50\n20\n100\n0\nINSERT\n2\nIMP.LAMP\n10\n80\n20\n100\n";
+        let text = format!("0\nSECTION\n2\nHEADER\n0\nENDSEC\n0\nSECTION\n2\nENTITIES\n{ents}0\nENDSEC\n0\nEOF\n");
+        assert!(std::fs::write(&drawing, text).is_ok());
+        let mut log = Log::default();
+        let r = page_dxf(&dir, &drawing, "1", 1.0, &mut log);
+        assert!(r.is_err(), "{log:?}");
+        assert_eq!(files(&dir), before);
+        // With the page writable again the same import goes through.
+        assert!(std::fs::remove_dir(&staging).is_ok());
+        assert_eq!(page_dxf(&dir, &drawing, "1", 1.0, &mut log), Ok(()), "{log:?}");
+        assert!(store::read_vendored_symbol(&dir, "imp.lamp").is_ok());
+        let pins = load(&dir).map(|p| p.lock.symbols.len());
+        assert_eq!(pins, Ok(2));
     }
 
     #[test]

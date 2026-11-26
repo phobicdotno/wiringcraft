@@ -319,6 +319,10 @@ enum Cmd {
     /// The page template: the frame's reference columns and the title block's boxes.
     #[command(subcommand)]
     Template(TemplateCmd),
+    /// The layouts of the reports (`[[report]]` in project.toml): which columns show in what
+    /// order under which headings, sorting, grouping and the title-block values above the table.
+    #[command(subcommand)]
+    ReportLayout(ReportLayoutCmd),
     /// Set a device's part and description.
     Device {
         /// Device tag, e.g. `-K1` (taken as a value, though it starts with `-`).
@@ -810,6 +814,30 @@ enum TemplateCmd {
     },
     /// Go back to the built-in layout (removes `[template]` from project.toml).
     Reset,
+}
+
+#[derive(Subcommand)]
+enum ReportLayoutCmd {
+    /// Print the layouts as JSON: for each report its kind, its layout (null when it has the
+    /// built-in one), its built-in columns and the warnings about its layout.
+    Show {
+        /// One report (parts, wires, ...); every report when left out.
+        kind: Option<String>,
+    },
+    /// Replace one report's layout with the JSON object in `file` (`-` for standard input),
+    /// with the keys of a `[[report]]` table: title, column (a list of {from, heading}), sort,
+    /// group, header. It is kept as the report layout dialog keeps it.
+    Set {
+        /// The report (parts, wires, ...).
+        kind: String,
+        /// The layout as JSON, or `-` to read it from standard input.
+        file: PathBuf,
+    },
+    /// Go back to the report's built-in layout (removes its `[[report]]` table).
+    Reset {
+        /// The report (parts, wires, ...).
+        kind: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2722,6 +2750,7 @@ fn run(cli: Cli) -> Res<()> {
                 }
             }
         }
+        Cmd::ReportLayout(rc) => report_layout(dir, rc)?,
         Cmd::Jumper(jc) => {
             let mut p = load(dir)?;
             match jc {
@@ -4220,6 +4249,114 @@ fn report_kinds(names: &[String]) -> Result<Vec<wc_report::Kind>, String> {
         out.push(k);
     }
     Ok(out)
+}
+
+/// `wiringcraft report-layout`: print, replace or reset report layouts, keeping them as the
+/// report layout dialog and the assistant's `report_layouts` tool do.
+fn report_layout(dir: &Path, cmd: ReportLayoutCmd) -> Res<()> {
+    use wc_core::report_layout::ReportLayout;
+    let one = |name: &str| -> Res<wc_report::Kind> {
+        match report_kinds(&[name.to_owned()])?.as_slice() {
+            [k] => Ok(*k),
+            _ => Err(format!("name one report, not {name:?}")),
+        }
+    };
+    let mut p = load(dir)?;
+    let (symbols, _) = store::vendored_symbols(dir, &p);
+    let parts = vendored_parts(dir, &p);
+    let builtin = |p: &Project, kind| {
+        let inputs = wc_report::Inputs {
+            project: p,
+            symbols: &symbols,
+            parts: &parts,
+        };
+        wc_report::build_builtin(kind, &inputs).columns
+    };
+    let warnings = |p: &Project, about: &str| -> Vec<String> {
+        let inputs = wc_report::Inputs {
+            project: p,
+            symbols: &symbols,
+            parts: &parts,
+        };
+        let about = format!("report layout for \"{about}\":");
+        wc_report::layout_warnings(&inputs)
+            .into_iter()
+            .filter(|w| w.starts_with(&about))
+            .collect()
+    };
+    let (kind, layout) = match cmd {
+        ReportLayoutCmd::Show { kind } => {
+            let kinds = match kind {
+                Some(k) => vec![one(&k)?],
+                None => wc_report::Kind::ALL.to_vec(),
+            };
+            let mut out: Vec<serde_json::Value> = kinds
+                .iter()
+                .map(|k| {
+                    serde_json::json!({
+                        "kind": k.name(),
+                        "layout": wc_report::layout_for(&p, *k),
+                        "builtin_columns": builtin(&p, *k),
+                        "warnings": warnings(&p, k.name()),
+                    })
+                })
+                .collect();
+            // Every report: a stored layout for a report that does not exist is listed too, so
+            // it and its warnings are not hidden.
+            if kinds.len() > 1 {
+                for l in &p.meta.reports {
+                    if wc_report::Kind::parse(&l.kind).is_none() {
+                        out.push(serde_json::json!({
+                            "kind": l.kind,
+                            "layout": l,
+                            "builtin_columns": null,
+                            "warnings": warnings(&p, &l.kind),
+                        }));
+                    }
+                }
+            }
+            let text = serde_json::to_string_pretty(&out).map_err(e)?;
+            println!("{text}");
+            return Ok(());
+        }
+        ReportLayoutCmd::Set { kind, file } => {
+            let kind = one(&kind)?;
+            let text = if file.as_os_str() == "-" {
+                std::io::read_to_string(std::io::stdin()).map_err(|err| format!("stdin: {err}"))?
+            } else {
+                std::fs::read_to_string(&file).map_err(|err| format!("{}: {err}", file.display()))?
+            };
+            let name = if file.as_os_str() == "-" {
+                "stdin".to_owned()
+            } else {
+                file.display().to_string()
+            };
+            let value: serde_json::Value = serde_json::from_str(&text).map_err(|err| format!("{name}: {err}"))?;
+            let layout = ReportLayout::from_json(kind.name(), value)?;
+            (kind, layout.kept(&builtin(&p, kind))?)
+        }
+        ReportLayoutCmd::Reset { kind } => (one(&kind)?, None),
+    };
+    let mut reports = p.meta.reports.clone();
+    match &layout {
+        Some(l) => match reports.iter_mut().find(|r| r.kind == kind.name()) {
+            Some(slot) => *slot = l.clone(),
+            None => reports.push(l.clone()),
+        },
+        None => reports.retain(|r| r.kind != kind.name()),
+    }
+    if reports != p.meta.reports {
+        p.meta.reports = reports;
+        save(dir, &p)?;
+    }
+    match layout {
+        Some(_) => println!("the {} report's layout is set", kind.name()),
+        None => println!("the {} report has its built-in layout", kind.name()),
+    }
+    for w in warnings(&p, kind.name()) {
+        eprintln!("warning: {}", escape_field(&w));
+    }
+    Ok(())
 }
 
 /// The project's vendored parts by id (parts used by devices, their accessories and jumpers).

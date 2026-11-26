@@ -179,13 +179,104 @@ impl WireNumbering {
 /// (`roll_back_update`) keeps its own copy and needs the field added there too.
 struct Kept {
     project: Project,
-    undo: Vec<Project>,
-    redo: Vec<Project>,
+    undo: Vec<Step>,
+    redo: Vec<Step>,
     undo_dropped: usize,
     history: u64,
     form_step: Option<u64>,
     dirty: bool,
     terminals_before: Option<wc_core::project::TerminalNumbers>,
+}
+
+/// One undo or redo step: the project as it is on the other side of the change, and the
+/// project files the change rewrote (a macro's placeholders saved, say), which Undo puts back
+/// and Redo writes again.
+#[derive(Debug, Clone, PartialEq)]
+struct Step {
+    project: Project,
+    files: Vec<FileEdit>,
+}
+
+impl Step {
+    fn of(project: Project) -> Step {
+        Step {
+            project,
+            files: Vec::new(),
+        }
+    }
+}
+
+/// A project file a change rewrote: what it held before and after.
+#[derive(Debug, Clone, PartialEq)]
+struct FileEdit {
+    /// Relative to the project folder, so after Save as it names the file in the copy.
+    path: PathBuf,
+    before: String,
+    after: String,
+}
+
+/// Write `edits` (in project folder `dir`) as they were before them (`undo`, newest first) or
+/// after them, each replaced whole ([`restore_file`]), so a failed write leaves the file as it
+/// was. When one cannot be written, those already written are put back as they were just
+/// before this call (a change made outside since stays). The error names every file of
+/// `edits` left other than written: the one that failed with its reason, those put back,
+/// those that could not be put back with their reason, and those not reached. Returns the
+/// files written as they were just before, for [`put_back_files`] when what follows fails.
+fn write_edits(dir: &Path, edits: &[FileEdit], undo: bool) -> Result<Written, String> {
+    let order: Vec<&FileEdit> = if undo {
+        edits.iter().rev().collect()
+    } else {
+        edits.iter().collect()
+    };
+    let mut written: Written = Vec::new();
+    for (i, e) in order.iter().enumerate() {
+        let text = if undo { &e.before } else { &e.after };
+        let path = dir.join(&e.path);
+        let done = snapshot_file(&path).and_then(|was| {
+            restore_file(&path, Some(text.as_bytes()))
+                .map(|()| was)
+                .map_err(|err| format!("{} could not be written: {err}", path.display()))
+        });
+        match done {
+            Ok(was) => written.push((path, was)),
+            Err(mut msg) => {
+                let (back, stuck) = put_back_files(&written);
+                let left: Vec<String> = order
+                    .iter()
+                    .skip(i + 1)
+                    .map(|e| dir.join(&e.path).display().to_string())
+                    .collect();
+                for (what, files) in [
+                    ("put back as it was", back),
+                    ("written already and not put back", stuck),
+                    ("not written", left),
+                ] {
+                    if !files.is_empty() {
+                        msg.push_str(&format!("; {what}: {}", files.join("; ")));
+                    }
+                }
+                return Err(msg);
+            }
+        }
+    }
+    Ok(written)
+}
+
+/// Files [`write_edits`] wrote, each as it was just before, in the order written.
+type Written = Vec<(PathBuf, Option<Vec<u8>>)>;
+
+/// Put the files of `written` back as they were before [`write_edits`] wrote them, newest
+/// first (a change made outside before that stays). Returns those put back, and those that
+/// could not be with their reason.
+fn put_back_files(written: &Written) -> (Vec<String>, Vec<String>) {
+    let (mut back, mut stuck) = (Vec::new(), Vec::new());
+    for (path, was) in written.iter().rev() {
+        match restore_file(path, was.as_deref()) {
+            Ok(()) => back.push(path.display().to_string()),
+            Err(e) => stuck.push(format!("{}: {e}", path.display())),
+        }
+    }
+    (back, stuck)
 }
 
 /// What [`Open::back_to`] goes back to, or [`Open::keep`] builds on.
@@ -195,6 +286,8 @@ pub(crate) struct Mark {
     parts: std::collections::BTreeSet<String>,
     /// The vendored symbol and part files there were, or why that is not known.
     files: Result<std::collections::BTreeSet<(ItemKind, String)>, String>,
+    /// Where the change's own project file edits start in [`Open::mark_edits`].
+    edits_from: usize,
 }
 
 /// The vendored symbol and part files by kind and id (plain files only, not links), from folders
@@ -244,8 +337,8 @@ pub struct Open {
     /// Every part in the project and its library sources, as (id, label), for the part picker.
     pub part_library: Vec<(String, String)>,
     pub dirty: bool,
-    undo: Vec<Project>,
-    redo: Vec<Project>,
+    undo: Vec<Step>,
+    redo: Vec<Step>,
     /// Snapshots dropped from the front of `undo` because it was full, so marks stay valid.
     undo_dropped: usize,
     /// Counts every change to the undo history (checkpoint, undo, redo, squash).
@@ -284,6 +377,10 @@ pub struct Open {
     /// hold the library's new version while the lock pins the old one. The next save writes
     /// each again first, and does not go ahead while one cannot be.
     unrestored_files: BTreeMap<PathBuf, UnrestoredFile>,
+    /// Project files rewritten while a [`Mark`] is open (`marks` counts them), oldest first,
+    /// so [`Open::back_to`] puts them back even when their undo steps fell off the history.
+    mark_edits: Vec<FileEdit>,
+    marks: usize,
     /// Tests: whether each coming symbol file write fails, in order.
     #[cfg(test)]
     pub(crate) fail_symbol_writes: std::collections::VecDeque<bool>,
@@ -324,9 +421,9 @@ fn next_revision() -> u64 {
 
 /// The history as it was before a library update, so a failed one leaves no trace in it.
 struct HistoryState {
-    redo: Vec<Project>,
+    redo: Vec<Step>,
     /// The oldest Undo step, when the update's checkpoint pushes it out.
-    evicted: Option<Project>,
+    evicted: Option<Step>,
     dirty: bool,
     history: u64,
 }
@@ -359,6 +456,8 @@ impl Open {
             part_versions: BTreeMap::new(),
             stale_symbol_files: Default::default(),
             unrestored_files: BTreeMap::new(),
+            mark_edits: Vec::new(),
+            marks: 0,
             #[cfg(test)]
             fail_symbol_writes: Default::default(),
             #[cfg(test)]
@@ -951,7 +1050,7 @@ impl Open {
         // snapshot and this change start from that.
         self.follow_terminals();
         self.terminals_before = Some(self.terminal_numbers());
-        self.undo.push(self.project.clone());
+        self.undo.push(Step::of(self.project.clone()));
         if self.undo.len() > UNDO_STEPS {
             self.undo.remove(0);
             self.undo_dropped += 1;
@@ -992,7 +1091,7 @@ impl Open {
     /// The project as it was before the latest change, from the undo history: for taking back
     /// only part of that change (in a shared session, the part that waits here).
     pub fn before_last_change(&self) -> Option<&Project> {
-        self.undo.last()
+        self.undo.last().map(|s| &s.project)
     }
 
     /// Forget the latest undo step, once its change was taken back another way.
@@ -1012,24 +1111,34 @@ impl Open {
     /// session's number too, [`Open::forget_steps_like_now`] drops the ones next to it.
     pub fn renumber_in_history(&mut self, id: &str, from: &str, to: &str) {
         for step in self.undo.iter_mut().chain(self.redo.iter_mut()) {
-            if let Some(page) = step.page_mut(id)
+            if let Some(page) = step.project.page_mut(id)
                 && page.number == from
             {
                 page.number = to.to_owned();
-                step.sort_pages();
+                step.project.sort_pages();
             }
         }
-        self.undo.dedup();
-        self.redo.dedup();
+        // A step that rewrote project files still changes something.
+        let same = |a: &mut Step, b: &mut Step| a.project == b.project && a.files.is_empty();
+        self.undo.dedup_by(same);
+        self.redo.dedup_by(same);
     }
 
     /// Drop the latest undo and redo steps that `like_now` finds the same as the project now
     /// (an Undo or Redo of them would change nothing), down to the first that is not.
     pub fn forget_steps_like_now(&mut self, like_now: impl Fn(&Project, &Project) -> bool) {
-        while self.undo.last().is_some_and(|s| like_now(s, &self.project)) {
+        while self
+            .undo
+            .last()
+            .is_some_and(|s| s.files.is_empty() && like_now(&s.project, &self.project))
+        {
             self.undo.pop();
         }
-        while self.redo.last().is_some_and(|s| like_now(s, &self.project)) {
+        while self
+            .redo
+            .last()
+            .is_some_and(|s| s.files.is_empty() && like_now(&s.project, &self.project))
+        {
             self.redo.pop();
         }
     }
@@ -1058,7 +1167,11 @@ impl Open {
             return;
         };
         if self.undo.len() > start + 1 {
-            self.undo.truncate(start + 1);
+            // The files the later steps rewrote are taken back and written with the first.
+            let later: Vec<FileEdit> = self.undo.drain(start + 1..).flat_map(|s| s.files).collect();
+            if let Some(first) = self.undo.get_mut(start) {
+                first.files.extend(later);
+            }
             self.history += 1;
             self.touch();
         }
@@ -1083,19 +1196,46 @@ impl Open {
         self.follow_terminals();
         match self.undo.pop() {
             Some(prev) => {
+                let written = match write_edits(&self.dir, &prev.files, true) {
+                    Ok(written) => written,
+                    Err(e) => {
+                        self.undo_error = Some(e);
+                        self.undo.push(prev);
+                        return false;
+                    }
+                };
                 self.forget_terminal_change();
-                self.redo.push(std::mem::replace(&mut self.project, prev));
-                let left = self.redo.last().map(|p| p.lock.parts.clone()).unwrap_or_default();
+                let Step { project, files } = prev;
+                self.redo.push(Step {
+                    project: std::mem::replace(&mut self.project, project),
+                    files,
+                });
+                let left = self
+                    .redo
+                    .last()
+                    .map(|s| s.project.lock.parts.clone())
+                    .unwrap_or_default();
                 if let Err(e) = self.sync_vendored(&left) {
                     // The vendored files could not follow: keep the project as it was.
                     if let Some(cur) = self.redo.pop() {
-                        let restored = std::mem::replace(&mut self.project, cur);
+                        // The files go back as they were before this step, not as recorded:
+                        // a change made to one outside since stays.
+                        let (_, stuck) = put_back_files(&written);
+                        let e = if stuck.is_empty() {
+                            e
+                        } else {
+                            format!("{e}\nProject files not put back: {}", stuck.join("; "))
+                        };
+                        let restored = std::mem::replace(&mut self.project, cur.project);
                         self.undo_error = Some(e);
-                        self.undo.push(restored);
+                        self.undo.push(Step {
+                            project: restored,
+                            files: cur.files,
+                        });
                     }
                     return false;
                 }
-                let sources = self.redo.last().map(|p| &p.meta.libraries) != Some(&self.project.meta.libraries);
+                let sources = self.redo.last().map(|s| &s.project.meta.libraries) != Some(&self.project.meta.libraries);
                 self.follow_step(sources);
                 self.edited();
                 self.history += 1;
@@ -1109,18 +1249,45 @@ impl Open {
         self.follow_terminals();
         match self.redo.pop() {
             Some(next) => {
+                let written = match write_edits(&self.dir, &next.files, false) {
+                    Ok(written) => written,
+                    Err(e) => {
+                        self.undo_error = Some(e);
+                        self.redo.push(next);
+                        return false;
+                    }
+                };
                 self.forget_terminal_change();
-                self.undo.push(std::mem::replace(&mut self.project, next));
-                let left = self.undo.last().map(|p| p.lock.parts.clone()).unwrap_or_default();
+                let Step { project, files } = next;
+                self.undo.push(Step {
+                    project: std::mem::replace(&mut self.project, project),
+                    files,
+                });
+                let left = self
+                    .undo
+                    .last()
+                    .map(|s| s.project.lock.parts.clone())
+                    .unwrap_or_default();
                 if let Err(e) = self.sync_vendored(&left) {
                     if let Some(cur) = self.undo.pop() {
-                        let restored = std::mem::replace(&mut self.project, cur);
+                        // The files go back as they were before this step, not as recorded:
+                        // a change made to one outside since stays.
+                        let (_, stuck) = put_back_files(&written);
+                        let e = if stuck.is_empty() {
+                            e
+                        } else {
+                            format!("{e}\nProject files not put back: {}", stuck.join("; "))
+                        };
+                        let restored = std::mem::replace(&mut self.project, cur.project);
                         self.undo_error = Some(e);
-                        self.redo.push(restored);
+                        self.redo.push(Step {
+                            project: restored,
+                            files: cur.files,
+                        });
                     }
                     return false;
                 }
-                let sources = self.undo.last().map(|p| &p.meta.libraries) != Some(&self.project.meta.libraries);
+                let sources = self.undo.last().map(|s| &s.project.meta.libraries) != Some(&self.project.meta.libraries);
                 self.follow_step(sources);
                 self.edited();
                 self.history += 1;
@@ -1971,7 +2138,7 @@ impl Open {
             .undo
             .iter()
             .chain(self.redo.iter())
-            .map(|p| p.meta.libraries.clone())
+            .map(|s| s.project.meta.libraries.clone())
             .collect();
         if let Err(e) = repoint(&mut libraries).and_then(|()| steps.iter_mut().try_for_each(&repoint)) {
             return Err(format!(
@@ -2011,8 +2178,8 @@ impl Open {
                 from.display()
             ));
         }
-        for (p, libs) in self.undo.iter_mut().chain(self.redo.iter_mut()).zip(steps) {
-            p.meta.libraries = libs;
+        for (s, libs) in self.undo.iter_mut().chain(self.redo.iter_mut()).zip(steps) {
+            s.project.meta.libraries = libs;
         }
         Ok((target, links))
     }
@@ -2580,17 +2747,28 @@ impl Open {
     pub(crate) fn mark(&mut self) -> Mark {
         let kept = self.set_aside();
         self.undo_dropped += kept.undo.len();
+        self.marks += 1;
         Mark {
             kept,
             symbols: self.symbols.keys().cloned().collect(),
             parts: self.parts.keys().cloned().collect(),
             files: vendor_names(&self.dir),
+            edits_from: self.mark_edits.len(),
+        }
+    }
+
+    /// A [`Mark`] ends: the file edits kept for it are let go once no mark is open.
+    fn end_mark(&mut self) {
+        self.marks = self.marks.saturating_sub(1);
+        if self.marks == 0 {
+            self.mark_edits.clear();
         }
     }
 
     /// The change since `mark` stays: its undo steps go after the earlier ones (the oldest
     /// dropped beyond the usual limit), and redo is kept only when it made no undo step.
     pub(crate) fn keep(&mut self, mark: Mark) {
+        self.end_mark();
         let mut undo = mark.kept.undo;
         // The set-aside steps counted as dropped while the change ran; they are back now.
         self.undo_dropped -= undo.len();
@@ -2609,15 +2787,22 @@ impl Open {
     /// A symbol or part file the change added (there was none, and the project as it was does
     /// not pin it) is removed; files that were there are never touched, nor rewritten. One that
     /// cannot be removed is reported, and is harmless: an unpinned part copy is pinned again
-    /// when it is next used.
+    /// when it is next used. Project files the change rewrote (a macro saved) are put back.
     pub(crate) fn back_to(&mut self, mark: Mark) -> Result<(), String> {
+        // Project files the change rewrote are put back, newest first; they are kept apart
+        // from the undo history, which may have dropped their steps.
+        let edits = self.mark_edits.split_off(mark.edits_from.min(self.mark_edits.len()));
+        self.end_mark();
+        // Every problem is reported, the files not put back first.
+        let mut errors: Vec<String> = write_edits(&self.dir, &edits, true).err().into_iter().collect();
         self.put_back(mark.kept);
         self.symbols.retain(|id, _| mark.symbols.contains(id));
         self.parts.retain(|id, _| mark.parts.contains(id));
         let (before, now) = match (mark.files, vendor_names(&self.dir)) {
             (Ok(before), Ok(now)) => (before, now),
             (Err(e), _) | (_, Err(e)) => {
-                return Err(format!("Library files it may have added were not checked: {e}"));
+                errors.push(format!("Library files it may have added were not checked: {e}"));
+                return Err(errors.join("\n"));
             }
         };
         let lock = &self.project.lock;
@@ -2636,13 +2821,16 @@ impl Open {
                 failed.push(format!("{}: {e}", path.display()));
             }
         }
-        if failed.is_empty() {
-            Ok(())
-        } else {
-            Err(format!(
+        if !failed.is_empty() {
+            errors.push(format!(
                 "Library files it added could not be removed: {}",
                 failed.join("; ")
-            ))
+            ));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("\n"))
         }
     }
 
@@ -2724,6 +2912,36 @@ impl Open {
         }
         let id = wc_core::macros::macro_id(name);
         wc_core::macros::write_macro(&self.dir, &id, &clip.to_macro(name, description)).map_err(|e| e.to_string())
+    }
+
+    /// Why a project macro's placeholders and value sets are not saved in a shared session: its
+    /// Undo and Redo go through the session's history, which does not hold project files.
+    pub(crate) const MACRO_SAVE_SHARED: &str = "Macros are not edited in a shared session: the session's Undo \
+         could not take the edit back. Stop sharing (or leave) first.";
+
+    /// Save a project macro's placeholders and value sets from `form` ([`crate::macro_form::Form::save`])
+    /// as one undo step: Undo puts the file back as it was, Redo writes the edit again. Nothing
+    /// is recorded when the file is the same. Returns the file written.
+    pub fn save_macro_form(&mut self, form: &crate::macro_form::Form) -> Result<PathBuf, String> {
+        let read = |p: &Path| std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()));
+        let before = read(&form.path)?;
+        let path = form.save()?;
+        let after = read(&path)?;
+        if after != before {
+            let edit = FileEdit {
+                path: path.strip_prefix(&self.dir).unwrap_or(&path).to_path_buf(),
+                before,
+                after,
+            };
+            if self.marks > 0 {
+                self.mark_edits.push(edit.clone());
+            }
+            self.checkpoint();
+            if let Some(step) = self.undo.last_mut() {
+                step.files.push(edit);
+            }
+        }
+        Ok(path)
     }
 
     /// Insert a macro on a page where it was drawn (its anchor), like a paste, with its
@@ -3176,11 +3394,11 @@ impl Open {
         let current = field(&mut now).clone();
         let only_the_form = self.undo_mark() == since + 1
             && self.undo.last().is_some_and(|prev| {
-                let mut p = prev.clone();
+                let mut p = prev.project.clone();
                 let mut was = p.meta.clone();
                 let ok = *field(&mut was) == *before;
                 *field(&mut p.meta) = current.clone();
-                p == self.project && ok
+                p == self.project && ok && prev.files.is_empty()
             });
         // When the undo cannot be done (the symbol files could not follow it), that part alone
         // is put back below, so Cancel still leaves it as it was.
@@ -3198,10 +3416,10 @@ impl Open {
     /// fields (it is a properties form's step, with nothing else in it).
     fn last_step_changed_only_props(&self) -> bool {
         self.undo.last().is_some_and(|prev| {
-            let mut p = prev.clone();
+            let mut p = prev.project.clone();
             p.meta.name.clone_from(&self.project.meta.name);
             p.meta.title_block.clone_from(&self.project.meta.title_block);
-            p == self.project
+            p == self.project && prev.files.is_empty()
         })
     }
 
@@ -3221,10 +3439,9 @@ impl Open {
     pub fn revert_live(&mut self, since: usize, before: &PropsSnapshot) {
         let only_the_form = self.undo_mark() == since + 1
             && self.last_step_changed_only_props()
-            && self
-                .undo
-                .last()
-                .is_some_and(|prev| prev.meta.name == before.name && prev.meta.title_block == before.title_block);
+            && self.undo.last().is_some_and(|prev| {
+                prev.project.meta.name == before.name && prev.project.meta.title_block == before.title_block
+            });
         if only_the_form {
             if self.undo() {
                 self.redo.clear();
@@ -7600,5 +7817,210 @@ pub(crate) mod tests {
         assert!(o.redo());
         let warning = o.take_step_warning().unwrap_or_default();
         assert!(warning.contains("acme.relay"), "{warning}");
+    }
+
+    #[test]
+    fn a_macro_saved_from_its_form_is_undone_and_redone_with_the_change_around_it() {
+        let (_tmp, mut o) = project();
+        let id = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let clip = o.copy(1, &[Selection::Symbol(id)]);
+        let path = o.save_macro(&clip, "Coil", "").unwrap();
+        let first = std::fs::read_to_string(&path).unwrap();
+        let read = || wc_core::macros::read_macro(&path).unwrap().description;
+
+        // Saved alone, it is one undo step; saved the same, it is none.
+        let mut form = crate::macro_form::Form::open(&path).unwrap();
+        form.description = "A coil".into();
+        let steps = o.undo_steps();
+        o.save_macro_form(&form).unwrap();
+        assert_eq!(o.undo_steps(), steps + 1);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(o.undo());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), first, "the file as it was");
+        assert!(o.redo());
+        assert_eq!(read(), "A coil");
+        let form = crate::macro_form::Form::open(&path).unwrap();
+        o.save_macro_form(&form).unwrap();
+        assert_eq!(o.undo_steps(), steps + 1, "nothing changed, no step");
+
+        // With a page edit in one squashed step (an assistant's turn), one Undo takes back both.
+        let mark = o.undo_mark();
+        let pages = o.project.pages.clone();
+        let mut form = crate::macro_form::Form::open(&path).unwrap();
+        form.description = "A relay coil".into();
+        o.save_macro_form(&form).unwrap();
+        o.place(1, "wc.coil", Point::new(60.0, 20.0)).unwrap();
+        o.squash_undo(mark);
+        assert_eq!(o.undo_steps(), steps + 2);
+        assert!(o.undo());
+        assert_eq!(o.project.pages, pages);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+        assert!(o.redo());
+        assert_eq!(read(), "A relay coil");
+        assert_ne!(o.project.pages, pages);
+
+        // A change taken back whole (a failed turn) puts the file back too.
+        let m = o.mark();
+        let mut form = crate::macro_form::Form::open(&path).unwrap();
+        form.description = "Gone".into();
+        o.save_macro_form(&form).unwrap();
+        o.back_to(m).unwrap();
+        assert_eq!(read(), "A relay coil");
+        assert_eq!(o.undo_steps(), steps + 2);
+    }
+
+    #[test]
+    fn project_file_edits_are_replaced_whole_and_a_failed_one_puts_back_the_others() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("a.json"), "A0").unwrap();
+        std::fs::write(dir.join("b.json"), "B0").unwrap();
+        let edit = |name: &str, before: &str, after: &str| FileEdit {
+            path: PathBuf::from(name),
+            before: before.into(),
+            after: after.into(),
+        };
+        let edits = [edit("a.json", "A0", "A1"), edit("b.json", "B0", "B1")];
+        // A folder where b's staging file goes: its write fails before b is touched.
+        std::fs::create_dir(dir.join("b.json.tmp")).unwrap();
+        let err = write_edits(dir, &edits, false).unwrap_err();
+        assert!(err.contains("b.json"), "{err}");
+        assert_eq!(std::fs::read_to_string(dir.join("a.json")).unwrap(), "A0", "put back");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("b.json")).unwrap(),
+            "B0",
+            "whole, as it was"
+        );
+        std::fs::remove_dir(dir.join("b.json.tmp")).unwrap();
+        write_edits(dir, &edits, false).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("b.json")).unwrap(), "B1");
+    }
+
+    #[test]
+    fn a_failed_replay_puts_files_back_as_they_were_and_names_every_file_left() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // a was changed outside since its edit was recorded.
+        for (name, text) in [("a.json", "outside"), ("b.json", "B0"), ("c.json", "C0")] {
+            std::fs::write(dir.join(name), text).unwrap();
+        }
+        let edit = |name: &str, before: &str, after: &str| FileEdit {
+            path: PathBuf::from(name),
+            before: before.into(),
+            after: after.into(),
+        };
+        let edits = [
+            edit("a.json", "A0", "A1"),
+            edit("b.json", "B0", "B1"),
+            edit("c.json", "C0", "C1"),
+        ];
+        std::fs::create_dir(dir.join("b.json.tmp")).unwrap();
+        let err = write_edits(dir, &edits, false).unwrap_err();
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
+        assert_eq!(read("a.json"), "outside", "as it was, not as recorded");
+        assert_eq!((read("b.json"), read("c.json")), ("B0".into(), "C0".into()));
+        assert!(err.contains("b.json could not be written"), "{err}");
+        assert!(err.contains("put back as it was:") && err.contains("a.json"), "{err}");
+        assert!(err.contains("not written:") && err.contains("c.json"), "{err}");
+    }
+
+    #[test]
+    fn a_change_taken_back_reports_a_file_not_put_back_and_the_library_check_together() {
+        let (_tmp, mut o) = project();
+        let id = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let clip = o.copy(1, &[Selection::Symbol(id)]);
+        let path = o.save_macro(&clip, "Coil", "").unwrap();
+        let mut m = o.mark();
+        let mut form = crate::macro_form::Form::open(&path).unwrap();
+        form.description = "Gone".into();
+        o.save_macro_form(&form).unwrap();
+        // The macro cannot be put back, and the library files were not known.
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        m.files = Err("not listed".into());
+        let err = o.back_to(m).unwrap_err();
+        assert!(
+            err.contains(&format!("{} could not be written", path.display())),
+            "{err}"
+        );
+        assert!(err.contains("not checked: not listed"), "{err}");
+    }
+
+    #[test]
+    fn undo_and_redo_that_fail_on_library_files_leave_a_macro_changed_outside_as_it_was() {
+        let (_tmp, mut o) = project();
+        let id = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let clip = o.copy(1, &[Selection::Symbol(id)]);
+        let path = o.save_macro(&clip, "Coil", "").unwrap();
+        let mut form = crate::macro_form::Form::open(&path).unwrap();
+        form.description = "A coil".into();
+        o.save_macro_form(&form).unwrap();
+        let symbol = o.project.lock.symbols.keys().next().unwrap().clone();
+        // The macro is changed outside, then the step's symbol file cannot be written.
+        let fail = |o: &mut Open| {
+            std::fs::write(&path, "outside").unwrap();
+            o.stale_symbol_files.insert(symbol.clone());
+            o.fail_symbol_writes = [true].into();
+        };
+        fail(&mut o);
+        assert!(!o.undo());
+        assert!(o.take_undo_error().is_some());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "outside", "Undo");
+        assert!(o.undo());
+        fail(&mut o);
+        assert!(!o.redo());
+        assert!(o.take_undo_error().is_some());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "outside", "Redo");
+    }
+
+    #[test]
+    fn after_save_as_undo_and_redo_of_a_macro_edit_rewrite_the_copy() {
+        let (tmp, mut o) = project();
+        let id = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let clip = o.copy(1, &[Selection::Symbol(id)]);
+        let path = o.save_macro(&clip, "Coil", "").unwrap();
+        let rel = path.strip_prefix(&o.dir).unwrap().to_path_buf();
+        let first = std::fs::read_to_string(&path).unwrap();
+        let mut form = crate::macro_form::Form::open(&path).unwrap();
+        form.description = "A coil".into();
+        o.save_macro_form(&form).unwrap();
+        let edited = std::fs::read_to_string(&path).unwrap();
+        // One step undone before Save as, so the redo history has it too.
+        let mut form = crate::macro_form::Form::open(&path).unwrap();
+        form.description = "A relay coil".into();
+        o.save_macro_form(&form).unwrap();
+        let last = std::fs::read_to_string(&path).unwrap();
+        assert!(o.undo());
+        let to = tmp.path().join("copy");
+        o.save_as(&to).unwrap();
+        let copy = o.dir.join(&rel);
+        assert!(o.redo());
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), last);
+        assert!(o.undo());
+        assert!(o.undo());
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), first);
+        // The original keeps the file as it was when copied.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+    }
+
+    #[test]
+    fn a_change_taken_back_puts_a_macro_back_after_its_step_fell_off_the_history() {
+        let (_tmp, mut o) = project();
+        let id = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let clip = o.copy(1, &[Selection::Symbol(id)]);
+        let path = o.save_macro(&clip, "Coil", "").unwrap();
+        let first = std::fs::read_to_string(&path).unwrap();
+        let m = o.mark();
+        let mut form = crate::macro_form::Form::open(&path).unwrap();
+        form.description = "Gone".into();
+        o.save_macro_form(&form).unwrap();
+        for _ in 0..=UNDO_STEPS {
+            o.checkpoint();
+        }
+        assert!(o.undo.iter().all(|s| s.files.is_empty()), "the step fell off");
+        o.back_to(m).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
+        assert!(o.mark_edits.is_empty());
     }
 }

@@ -36,8 +36,12 @@ from EDZ, BMEcat and CSV. Each opens the system file picker filtered to the form
 Parts imports first ask for the library folder, like Import symbols: the project's own
 `library/` (added to the project's libraries once parts are in it), one of its other library
 folders, or another folder picked with the folder picker. Where the picker cannot open (Linux
-without a desktop portal), the file and folder are typed into a dialog instead. Messages that
-name a command line option are worded for the app.
+without a desktop portal), the file and folder are typed into a dialog instead. The import runs
+off the window thread: a window shows what it has done so far, and until it ends the project
+cannot be edited, saved, shared or replaced by another one (a running assistant turn may only
+use its reading tools, and no new turn starts). The window has the view controls that still work
+(zoom, grid, theme, layers). Messages that name a command line option are worded
+for the app.
 
 Changes not saved yet are saved first, the imported pages and devices come in as one undo step,
 and the import's report and warnings are shown when it is done. New pages are numbered from the
