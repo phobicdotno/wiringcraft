@@ -183,12 +183,32 @@ pub fn symbols(text: &str, prefix: &str, scale: f64) -> Result<(Vec<Imported>, V
                 continue;
             }
             let mut skipped = BTreeMap::new();
-            let converted = convert(&unit_name, sym, body, base, unit, prefix, scale, &mut skipped);
+            let mut hidden = Vec::new();
+            let converted = convert(
+                &unit_name,
+                sym,
+                body,
+                base,
+                unit,
+                prefix,
+                scale,
+                &mut skipped,
+                &mut hidden,
+            );
             for (kind, n) in skipped {
                 warnings.push(format!("{unit_name}: {n} {kind} item(s) not read"));
             }
             match converted {
                 Ok(symbol) => {
+                    // Usually power pins that connect without a wire in KiCad.
+                    if !hidden.is_empty() {
+                        let n = hidden.len();
+                        let pins = if n == 1 { "pin" } else { "pins" };
+                        warnings.push(format!(
+                            "{unit_name}: {n} hidden {pins} left out ({})",
+                            hidden.join(", ")
+                        ));
+                    }
                     // Taken only once there is a symbol: one that draws nothing leaves its id free.
                     used.insert(id);
                     out.push(Imported {
@@ -254,7 +274,8 @@ fn property<'a>(sym: &'a Sexp, key: &str) -> Option<&'a str> {
 }
 
 /// One unit of a symbol: the common unit's drawing and pins plus those of `wanted`. Graphic
-/// items it cannot read are counted by kind in `skipped`.
+/// items it cannot read are counted by kind in `skipped`; hidden pins are left out and named
+/// (by number, else name) in `hidden`.
 #[allow(clippy::too_many_arguments)]
 fn convert(
     name: &str,
@@ -265,6 +286,7 @@ fn convert(
     prefix: &str,
     scale: f64,
     skipped: &mut BTreeMap<String, usize>,
+    hidden: &mut Vec<String>,
 ) -> Result<Symbol> {
     let id = format!("{}.{}", prefix.trim_end_matches('.'), crate::id_segment(name));
     store::check_id(&id)?;
@@ -399,9 +421,16 @@ fn convert(
                         270 => (PinDir::Up, Point::new(0.0, length)),
                         _ => (PinDir::Left, Point::new(length, 0.0)),
                     };
-                    let hidden = g.items().iter().any(|i| i.atom() == Some("hide"))
-                        || g.first("hide").and_then(|h| h.arg(1)) == Some("yes");
-                    if hidden {
+                    let text = |head: &str| {
+                        g.first(head)
+                            .and_then(|n| n.arg(1))
+                            .filter(|v| !v.is_empty() && *v != "~")
+                    };
+                    let pin_name = text("number").or_else(|| text("name")).unwrap_or("").to_owned();
+                    if g.items().iter().any(|i| i.atom() == Some("hide"))
+                        || g.first("hide").and_then(|h| h.arg(1)) == Some("yes")
+                    {
+                        hidden.push(if pin_name.is_empty() { "?".to_owned() } else { pin_name });
                         continue;
                     }
                     if length > 0.0 {
@@ -410,12 +439,6 @@ fn convert(
                             b: Point::new(tip.x + inward.x, tip.y + inward.y),
                         });
                     }
-                    let text = |head: &str| {
-                        g.first(head)
-                            .and_then(|n| n.arg(1))
-                            .filter(|v| !v.is_empty() && *v != "~")
-                    };
-                    let pin_name = text("number").or_else(|| text("name")).unwrap_or("").to_owned();
                     pins.push(Pin {
                         name: pin_name,
                         at: tip,
@@ -609,6 +632,10 @@ mod tests {
         // Two units each for the relay and the derived 24 V relay.
         assert_eq!(syms.len(), 4, "{warnings:?}");
         assert!(warnings.iter().any(|w| w.contains("Orphan")), "{warnings:?}");
+        assert!(
+            warnings.iter().any(|w| w == "Relay_Coil_A: 1 hidden pin left out (3)"),
+            "{warnings:?}"
+        );
         assert!(
             !warnings.iter().any(|w| w.contains("only the first unit")),
             "{warnings:?}"
@@ -925,6 +952,26 @@ mod tests {
             [1, 2, 26, 27, 28, 52, 53].map(unit_letter),
             ["A", "B", "Z", "AA", "AB", "AZ", "BA"]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn hidden_pins_are_left_out_with_one_warning_naming_them() -> Result<()> {
+        let lib = r#"(kicad_symbol_lib
+  (symbol "U" (property "Reference" "U" (at 0 0 0))
+    (symbol "U_1_1"
+      (pin passive line (at 0 0 0) (length 1) (name "IN") (number "1"))
+      (pin power_in line (at 0 5 270) (length 1) hide (name "VCC") (number "14"))
+      (pin power_in line (at 0 -5 90) (length 1) (hide yes) (name "GND") (number "~"))))
+  (symbol "V" (symbol "V_1_1" (pin passive line (at 0 0 0) (length 1) (name "~") (number "1")))))"#;
+        let (syms, warnings) = symbols(lib, "k", 1.0)?;
+        assert_eq!(syms.len(), 2, "{warnings:?}");
+        let names: Vec<&str> = syms[0].symbol.pins.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["1"]);
+        // Only the pin line of the visible pin is drawn.
+        assert_eq!(syms[0].symbol.graphics.len(), 1, "{:?}", syms[0].symbol.graphics);
+        // The pin without a number is named by its name; symbol V has no hidden pins.
+        assert_eq!(warnings, ["U: 2 hidden pins left out (14, GND)"]);
         Ok(())
     }
 
