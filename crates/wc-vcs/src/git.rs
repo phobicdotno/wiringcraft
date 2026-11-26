@@ -73,6 +73,10 @@ impl Git {
             .current_dir(&self.dir)
             .env("GIT_TERMINAL_PROMPT", "0")
             .env(PARENT_PROJECT_ENV, self.full_dir())
+            // This project's repository, whatever a caller (a git hook) points git at.
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -129,6 +133,10 @@ impl Git {
             .current_dir(&self.dir)
             .env("GIT_TERMINAL_PROMPT", "0")
             .env(PARENT_PROJECT_ENV, self.full_dir())
+            // This project's repository, whatever a caller (a git hook) points git at.
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .map_err(Error::Spawn)?;
         if out.status.success() {

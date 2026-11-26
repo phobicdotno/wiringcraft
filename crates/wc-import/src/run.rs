@@ -111,9 +111,15 @@ macro_rules! err {
 
 /// PLC addresses from a CSV list onto the project's devices (`import plc-csv`).
 pub fn plc_csv(dir: &Path, file: &Path, log: &mut Log) -> Res<()> {
-    let mut p = load(dir)?;
     let bytes = read_file(file)?;
-    let (rows, warnings) = crate::csv::file_rows(&bytes)
+    plc_csv_bytes(dir, &bytes, log)
+}
+
+/// [`plc_csv`] from the file's bytes, read already (a command line reads them before it takes
+/// the project's lock).
+pub fn plc_csv_bytes(dir: &Path, bytes: &[u8], log: &mut Log) -> Res<()> {
+    let mut p = load(dir)?;
+    let (rows, warnings) = crate::csv::file_rows(bytes)
         .and_then(|rows| crate::csv::plc_addresses_from_rows(&rows))
         .map_err(e)?;
     for w in warnings {

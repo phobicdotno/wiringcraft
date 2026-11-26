@@ -1866,10 +1866,11 @@ fn run(cli: Cli) -> Res<()> {
         }
         _ => None,
     };
-    let mut wago_bytes = match &cli.cmd {
+    let mut import_bytes = match &cli.cmd {
         Cmd::Import(ImportCmd::Wago { file }) => {
             Some(std::fs::read(file).map_err(|x| format!("{}: {x}", file.display()))?)
         }
+        Cmd::Import(ImportCmd::PlcCsv { file }) => Some(run::read_file(file)?),
         _ => None,
     };
     let _lock = match cli.cmd {
@@ -2976,7 +2977,7 @@ fn run(cli: Cli) -> Res<()> {
             save(dir, &p)?;
         }
         Cmd::Lib(lc) => lib_cmd(dir, lc)?,
-        Cmd::Import(ic) => import_cmd(dir, ic, wago_bytes.take())?,
+        Cmd::Import(ic) => import_cmd(dir, ic, import_bytes.take())?,
         Cmd::Pdf {
             out,
             pages,
@@ -3458,8 +3459,9 @@ fn lib_cmd(dir: &Path, lc: LibCmd) -> Res<()> {
     Ok(())
 }
 
-/// `wago_bytes`: the input of `import wago`, read already (before the project lock).
-fn import_cmd(dir: &Path, ic: ImportCmd, wago_bytes: Option<Vec<u8>>) -> Res<()> {
+/// `input`: the file of `import wago` or `import plc-csv`, read already (before the project
+/// lock).
+fn import_cmd(dir: &Path, ic: ImportCmd, input: Option<Vec<u8>>) -> Res<()> {
     match ic {
         ImportCmd::SymbolDxf {
             file,
@@ -3580,7 +3582,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd, wago_bytes: Option<Vec<u8>>) -> Res<()>
             }
         }
         ImportCmd::Wago { file } => {
-            let done = match wago_bytes {
+            let done = match input {
                 Some(bytes) => import_wago_bytes(dir, &bytes)?,
                 None => import_wago(dir, &file)?,
             };
@@ -3598,7 +3600,10 @@ fn import_cmd(dir: &Path, ic: ImportCmd, wago_bytes: Option<Vec<u8>>) -> Res<()>
             }
         }
         ImportCmd::PlcCsv { file } => {
-            logged(|log| run::plc_csv(dir, &file, log))?;
+            logged(|log| match &input {
+                Some(bytes) => run::plc_csv_bytes(dir, bytes, log),
+                None => run::plc_csv(dir, &file, log),
+            })?;
         }
         ImportCmd::PartsBmecat { file, lib } => {
             logged(|log| run::parts_bmecat(&file, &lib, log))?;

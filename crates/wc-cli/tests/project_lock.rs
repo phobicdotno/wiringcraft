@@ -320,3 +320,97 @@ fn an_exclude_list_that_cannot_be_updated_is_reported() -> TestResult {
     assert!(exclude.is_dir(), "left as it was");
     Ok(())
 }
+
+/// Git variables a caller (a git hook) exports for another repository do not send the lock's
+/// exclude entry there: the project's own repository gets it.
+#[test]
+fn the_lock_is_excluded_in_the_projects_repository_whatever_git_is_pointed_at() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let new_repo = |name: &str| -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+        let dir = tmp.path().join(name);
+        let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+            .arg("new")
+            .arg(&dir)
+            .status()?;
+        assert!(status.success());
+        // As a repository made before the lock existed.
+        std::fs::write(dir.join(".git").join("info").join("exclude"), "# mine\n")?;
+        Ok(dir)
+    };
+    let project = new_repo("p")?;
+    let other = new_repo("other")?;
+    let out = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("-C")
+        .arg(&project)
+        .args(["page", "list"])
+        .env("GIT_DIR", other.join(".git"))
+        .env("GIT_WORK_TREE", &other)
+        .env("GIT_INDEX_FILE", other.join(".git").join("index"))
+        .output()?;
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let mine = std::fs::read_to_string(project.join(".git").join("info").join("exclude"))?;
+    let theirs = std::fs::read_to_string(other.join(".git").join("info").join("exclude"))?;
+    assert_eq!(mine, "# mine\n/.wiringcraft.lock\n");
+    assert_eq!(theirs, "# mine\n");
+    Ok(())
+}
+
+/// `import plc-csv` reads its file before the lock too.
+#[cfg(unix)]
+#[test]
+fn a_plc_csv_import_reads_a_named_fifo_before_it_waits_for_the_lock() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    new_project(&dir)?;
+    let fifo = tmp.path().join("plc.fifo");
+    assert!(Command::new("mkfifo").arg(&fifo).status()?.success());
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(".wiringcraft.lock"))?;
+    lock.lock()?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("-C")
+        .arg(&dir)
+        .args(["import", "plc-csv"])
+        .arg(&fifo)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let writer = {
+        let fifo = fifo.clone();
+        std::thread::spawn(move || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&fifo)?
+                .write_all(b"tag;address\n-K1;%I0.0\n")
+        })
+    };
+    let start = Instant::now();
+    while !writer.is_finished() && start.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let read_first = writer.is_finished();
+    let waits = !ends_within(&mut child, Duration::from_millis(300))?;
+    lock.unlock()?;
+    let ended = ends_within(&mut child, Duration::from_secs(20))?;
+    if !ended {
+        child.kill()?;
+    }
+    let out = child.wait_with_output()?;
+    if !writer.is_finished() {
+        drop(std::fs::File::open(&fifo));
+    }
+    let written = writer.join();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(read_first, "the FIFO is read before the lock is taken: {err}");
+    assert!(waits, "it waits for the lock: {err}");
+    assert!(ended, "it runs once the lock is free");
+    let Ok(Ok(())) = written else {
+        unreachable!("the input was written");
+    };
+    assert!(!err.contains("cannot read"), "{err}");
+    Ok(())
+}
