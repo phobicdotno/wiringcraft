@@ -4,12 +4,13 @@
 //! custom non-graphic objects, which are not counted.
 //!
 //! Layout as AutoCAD writes it (the Open Design Alliance specification): a 16-byte sentinel, the size of
-//! the class data (RL), for 2010 drawings of maintenance release 4 and later a second size (RL),
+//! the class data (RL), for 2010 and 2013 drawings of maintenance release 4 and later and for
+//! every 2018 drawing a second size (RL),
 //! from 2007 the data's size in bits (RL); then the highest class number (BS), two bytes and a
 //! bit, and for each class its number (BS), proxy flags (BS), application, C++ and DXF names,
 //! whether it was a zombie (B), its item class id (BS: 0x1F2 entity, 0x1F3 object), the number
 //! of instances, two version numbers and two unknown numbers (BL each). Names are TV in the data
-//! (2004) or TU in a string stream at the end of the data (2007 and 2010).
+//! (2004) or TU in a string stream at the end of the data (2007 and later).
 
 use std::collections::HashMap;
 
