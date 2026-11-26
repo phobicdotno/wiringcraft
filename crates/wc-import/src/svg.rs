@@ -274,7 +274,7 @@ fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
                     // `S` takes its first control point mirrored from the last cubic's second.
                     let (c1x, c1y) = match c1 {
                         Some([cx, cy]) => (bx + cx, by + cy),
-                        None => cubic_ctrl.map_or((x, y), |(px, py)| (2.0 * x - px, 2.0 * y - py)),
+                        None => cubic_ctrl.map_or((x, y), |(px, py)| (x + (x - px), y + (y - py))),
                     };
                     let (c2x, c2y) = (bx + c2x, by + c2y);
                     let (ex, ey) = (bx + ex, by + ey);
@@ -307,7 +307,7 @@ fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
                     // `T` takes its control point mirrored from the last quadratic's.
                     let (cx, cy) = match ctrl {
                         Some([cx, cy]) => (bx + cx, by + cy),
-                        None => quad_ctrl.map_or((x, y), |(px, py)| (2.0 * x - px, 2.0 * y - py)),
+                        None => quad_ctrl.map_or((x, y), |(px, py)| (x + (x - px), y + (y - py))),
                     };
                     let (ex, ey) = (bx + ex, by + ey);
                     let (x0, y0) = (x, y);
@@ -747,5 +747,24 @@ mod tests {
     #[test]
     fn number_lists() {
         assert_eq!(numbers("1-2.5.5e1,3"), vec![1.0, -2.5, 0.5e1, 3.0]);
+    }
+
+    #[test]
+    fn smooth_reflections_near_the_largest_numbers_stay_finite() {
+        // Reflecting the control point as 2x - px would overflow here; x + (x - px) does not.
+        for (d, ctrl) in [
+            ("M 1e308 0 Q 1e308 1 1e308 2 T 1e308 4", Point::new(1e308, 3.0)),
+            (
+                "M 1e308 0 C 1e308 1 1e308 1 1e308 2 S 1e308 4 1e308 4",
+                Point::new(1e308, 3.0),
+            ),
+        ] {
+            let pts = one_line(d);
+            assert!(pts.iter().all(|p| p.x.is_finite() && p.y.is_finite()), "{d}: {pts:?}");
+            assert!(
+                pts.iter().any(|p| p.y > 2.0 && p.y <= 4.0),
+                "{d}: reaches {ctrl:?} side"
+            );
+        }
     }
 }
