@@ -1438,6 +1438,43 @@ impl Open {
         Ok(())
     }
 
+    /// Take in what an import wrote to the project folder, as one Undo step. Call it with no
+    /// changes left unsaved (they would be replaced). Returns whether the project changed.
+    pub fn adopt_saved(&mut self) -> Result<bool, String> {
+        let fresh = Open::load(&self.dir)?;
+        self.branch = fresh.branch;
+        let changed = fresh.project != self.project;
+        // The versions the import replaced are kept, so its undo step can put them back: the
+        // loaded parts too, whose files and pins an import can replace the same way.
+        self.archive_symbols();
+        for p in self.parts.values() {
+            self.part_versions.insert(p.hash(), p.clone());
+        }
+        // And the versions the import pinned: a part no device uses is not loaded below, and
+        // Redo needs its version once Undo has put the old file back.
+        for (id, entry) in &fresh.project.lock.parts {
+            if self.project.lock.parts.get(id) != Some(entry)
+                && let Ok(part) = store::read_vendored_part(&self.dir, id)
+                && part.hash() == entry.hash
+            {
+                self.part_versions.insert(entry.hash.clone(), part);
+            }
+        }
+        self.symbols.extend(fresh.symbols);
+        // An import can write a picture over a file shown before (a PDF scan at the same page).
+        self.underlays.clear();
+        self.picture_problems.clear();
+        if changed {
+            self.forget_terminal_change();
+            self.checkpoint();
+            self.project = fresh.project;
+            self.forget_terminal_change();
+            self.dirty = false;
+        }
+        self.refresh_library();
+        Ok(changed)
+    }
+
     /// Keep the loaded symbol versions, so a step that replaces them can be undone.
     pub fn archive_symbols(&mut self) {
         for sym in self.symbols.values() {
@@ -5472,6 +5509,33 @@ pub(crate) mod tests {
         o.parts.insert(pid.to_owned(), edited.clone());
         assert!(o.undo());
         assert_eq!(o.parts[pid], edited);
+    }
+
+    #[test]
+    fn undo_puts_back_a_loaded_part_an_import_replaced() {
+        let (_tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let pid = "example.ex-ct-9-24dc";
+        o.ensure_part(pid).unwrap();
+        o.save().unwrap();
+        o.part_versions.clear();
+        let old = o.parts[pid].clone();
+        // As a second import does: the part's file and its pin replaced on disk.
+        let mut new = old.clone();
+        new.description = "From the second import".into();
+        store::write_vendored_part(&o.dir, &new).unwrap();
+        let mut p = store::load(&o.dir).unwrap();
+        p.lock.parts.get_mut(pid).unwrap().hash = new.hash();
+        store::save(&o.dir, &p).unwrap();
+        assert!(o.adopt_saved().unwrap());
+        assert!(o.undo(), "{:?}", o.take_undo_error());
+        assert_eq!(store::read_vendored_part(&o.dir, pid).unwrap(), old);
+        // Redo puts the imported version back, also when no device uses the part, so it was
+        // never loaded.
+        assert!(!o.project.used_parts().contains(pid));
+        assert!(o.redo(), "{:?}", o.take_undo_error());
+        assert_eq!(o.project.lock.parts[pid].hash, new.hash());
+        assert_eq!(store::read_vendored_part(&o.dir, pid).unwrap(), new);
     }
 
     #[test]
