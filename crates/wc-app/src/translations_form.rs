@@ -102,6 +102,11 @@ impl Form {
         Ok(())
     }
 
+    /// Whether the form edits the dictionary of the project in `dir`.
+    pub fn is_for(&self, dir: &Path) -> bool {
+        self.dir == dir
+    }
+
     /// How many texts have no translation into the language of column `col`.
     pub fn missing(&self, col: usize) -> usize {
         self.rows

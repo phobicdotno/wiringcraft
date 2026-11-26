@@ -635,7 +635,11 @@ pub fn database_from_archive<R: Read + std::io::Seek>(reader: R, pick: usize) ->
     let folder = name.rsplitn(3, '/').nth(2).unwrap_or_default().to_owned();
     // The project's own fields live in the archive's project list, keyed by folder number.
     let directory = folder.rsplit('/').next().unwrap_or_default().to_owned();
-    let (info, info_warning) = match read_project_list(&mut zip, &directory) {
+    let read = open_project_list(&mut zip).and_then(|list| match list {
+        Some(list) => project_info(&list, &directory),
+        None => Ok(None),
+    });
+    let (info, info_warning) = match read {
         Ok(info) => (info, None),
         Err(e) => (
             None,
@@ -651,11 +655,63 @@ pub fn database_from_archive<R: Read + std::io::Seek>(reader: R, pick: usize) ->
     })
 }
 
-/// The archive's project list (`Database/tew_app_project.sqlite`), row for `directory`.
-fn read_project_list<R: Read + std::io::Seek>(
-    zip: &mut zip::ZipArchive<R>,
-    directory: &str,
-) -> Result<Option<SweProjectInfo>> {
+/// A project an archive holds, for choosing one by its number ([`database_from_archive`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveProject {
+    /// The project's folder in the archive, e.g. `Projects/4`.
+    pub folder: String,
+    /// Its name from the archive's project list; empty when the list has none for it.
+    pub name: String,
+}
+
+/// The projects of an archive ([`archive_projects`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveListing {
+    /// In the order [`database_from_archive`] counts them: the first is number 1.
+    pub projects: Vec<ArchiveProject>,
+    /// Why the project names could not be read, when the archive has a project list that could
+    /// not be. The folders are listed all the same.
+    pub names_warning: Option<String>,
+}
+
+/// The projects an archive holds, in the order [`database_from_archive`] counts them (the
+/// first is number 1). No project database is unpacked, only the archive's project list, and
+/// that once for all the projects.
+pub fn archive_projects<R: Read + std::io::Seek>(reader: R) -> Result<ArchiveListing> {
+    let mut zip =
+        zip::ZipArchive::new(reader).map_err(|e| Error::Format(format!("not a SolidWorks Electrical archive: {e}")))?;
+    let unread = |e: Error| format!("the project names were not read: {e}");
+    // A list that cannot be read leaves the folders to choose by, and says why.
+    let (list, mut names_warning) = match open_project_list(&mut zip) {
+        Ok(list) => (list, None),
+        Err(e) => (None, Some(unread(e))),
+    };
+    let projects = project_databases(&zip)
+        .iter()
+        .map(|name| {
+            let folder = name.rsplitn(3, '/').nth(2).unwrap_or_default().to_owned();
+            let directory = folder.rsplit('/').next().unwrap_or_default();
+            let name = match list.as_ref().map(|list| project_info(list, directory)) {
+                Some(Ok(info)) => info.map(|info| info.name).unwrap_or_default(),
+                Some(Err(e)) => {
+                    // The same reason for every folder: said once.
+                    names_warning.get_or_insert_with(|| unread(e));
+                    String::new()
+                }
+                None => String::new(),
+            };
+            ArchiveProject { folder, name }
+        })
+        .collect();
+    Ok(ArchiveListing {
+        projects,
+        names_warning,
+    })
+}
+
+/// The archive's project list (`Database/tew_app_project.sqlite`), opened; None when the
+/// archive has none. [`project_info`] reads a project's row from it.
+fn open_project_list<R: Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>) -> Result<Option<Connection>> {
     const LIST: &str = "Database/tew_app_project.sqlite";
     let f = match zip.by_name(LIST) {
         Ok(f) => f,
@@ -669,7 +725,7 @@ fn read_project_list<R: Read + std::io::Seek>(
     if bytes.len() as u64 > MAX_DATABASE_BYTES {
         return Err(Error::Format(format!("{LIST} is too large")));
     }
-    project_info(&open(&bytes)?, directory)
+    open(&bytes).map(Some)
 }
 
 /// The project database paths in an archive, in project folder order.
