@@ -319,6 +319,10 @@ enum Cmd {
     /// The page template: the frame's reference columns and the title block's boxes.
     #[command(subcommand)]
     Template(TemplateCmd),
+    /// The layouts of the reports (`[[report]]` in project.toml): which columns show in what
+    /// order under which headings, sorting, grouping and the title-block values above the table.
+    #[command(subcommand)]
+    ReportLayout(ReportLayoutCmd),
     /// Set a device's part and description.
     Device {
         /// Device tag, e.g. `-K1` (taken as a value, though it starts with `-`).
@@ -358,12 +362,14 @@ enum Cmd {
         lang: Option<String>,
     },
     /// The project's translation dictionary (`translations.toml`): list the texts that have no
-    /// translation into a language. Exits with an error when any is missing, so it can guard a
-    /// release.
+    /// translation into a language (exits with an error when any is missing, so it can guard a
+    /// release), or set or remove one text's translation.
     Translations {
-        /// The language to check, such as `nb`.
-        #[arg(long)]
-        lang: String,
+        /// The language, such as `nb`.
+        #[arg(long, global = true)]
+        lang: Option<String>,
+        #[command(subcommand)]
+        edit: Option<TranslationsCmd>,
     },
     /// Export pages as drawings for other tools: one SVG or DXF file per page in a folder,
     /// drawn like the PDF (frame, title block, symbols, wires, cross-references).
@@ -448,6 +454,23 @@ enum Cmd {
     /// Review comments pinned on pages: add, reply, resolve, list.
     #[command(subcommand)]
     Comment(CommentCmd),
+}
+
+/// `translations set` and `translations remove`: one text of `translations.toml`.
+#[derive(Subcommand)]
+enum TranslationsCmd {
+    /// Set the translation of a project text (as drawn, in the source language) into `--lang`.
+    Set {
+        /// The text as drawn, such as a page title or device description.
+        text: String,
+        /// The text in `--lang`.
+        translation: String,
+    },
+    /// Remove the translation of a project text into `--lang`.
+    Remove {
+        /// The text as drawn.
+        text: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -791,6 +814,30 @@ enum TemplateCmd {
     },
     /// Go back to the built-in layout (removes `[template]` from project.toml).
     Reset,
+}
+
+#[derive(Subcommand)]
+enum ReportLayoutCmd {
+    /// Print the layouts as JSON: for each report its kind, its layout (null when it has the
+    /// built-in one), its built-in columns and the warnings about its layout.
+    Show {
+        /// One report (parts, wires, ...); every report when left out.
+        kind: Option<String>,
+    },
+    /// Replace one report's layout with the JSON object in `file` (`-` for standard input),
+    /// with the keys of a `[[report]]` table: title, column (a list of {from, heading}), sort,
+    /// group, header. It is kept as the report layout dialog keeps it.
+    Set {
+        /// The report (parts, wires, ...).
+        kind: String,
+        /// The layout as JSON, or `-` to read it from standard input.
+        file: PathBuf,
+    },
+    /// Go back to the report's built-in layout (removes its `[[report]]` table).
+    Reset {
+        /// The report (parts, wires, ...).
+        kind: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1657,27 +1704,7 @@ fn rules_list(p: &Project, library: &[wc_core::check_rule::RuleSet], json: bool)
         })
     };
     if json {
-        let sources: Vec<serde_json::Value> = library
-            .iter()
-            .map(|set| match &set.rules {
-                Ok(rules) => {
-                    let rules: Vec<serde_json::Value> = rules
-                        .iter()
-                        .enumerate()
-                        .map(|(k, r)| {
-                            serde_json::json!({
-                                "rule": format!("{}:{}", set.source, k + 1),
-                                "off": turned_off(off, &set.source, k + 1, r),
-                                "is": r,
-                            })
-                        })
-                        .collect();
-                    serde_json::json!({"source": set.source, "rules": rules})
-                }
-                Err(why) => serde_json::json!({"source": set.source, "error": why}),
-            })
-            .collect();
-        let all = serde_json::json!({"rules": p.meta.rules, "library": sources, "rules_off": off});
+        let all = wc_core::check_rule::rules_listing(&p.meta, library);
         return serde_json::to_string_pretty(&all).map(|t| t + "\n").map_err(e);
     }
     let mut out = String::new();
@@ -2741,6 +2768,7 @@ fn run(cli: Cli) -> Res<()> {
                 }
             }
         }
+        Cmd::ReportLayout(rc) => report_layout(dir, rc)?,
         Cmd::Jumper(jc) => {
             let mut p = load(dir)?;
             match jc {
@@ -3018,8 +3046,33 @@ fn run(cli: Cli) -> Res<()> {
             }
             println!("wrote {} ({} pages)", out.display(), report.pages);
         }
-        Cmd::Translations { lang } => {
+        Cmd::Translations { lang, edit } => {
+            let lang = lang.ok_or("--lang is needed, such as --lang nb")?;
+            // Only a project folder has a dictionary: a folder without one is refused before
+            // translations.toml is made or changed there.
             let p = load(dir)?;
+            if let Some(edit) = edit {
+                let (text, translation) = match &edit {
+                    TranslationsCmd::Set { text, translation } => {
+                        if translation.trim().is_empty() {
+                            return Err("the translation is empty: use `translations remove` to take one away".into());
+                        }
+                        (text, translation.as_str())
+                    }
+                    TranslationsCmd::Remove { text } => (text, ""),
+                };
+                let changed = wc_core::translate::set_translation(dir, text, &lang, translation).map_err(e)?;
+                let file = wc_core::translate::TRANSLATIONS_FILE;
+                println!(
+                    "{}",
+                    match (&edit, changed) {
+                        (TranslationsCmd::Set { .. }, true) => format!("set the translation in {file}"),
+                        (TranslationsCmd::Remove { .. }, true) => format!("removed the translation from {file}"),
+                        _ => format!("{file} unchanged"),
+                    }
+                );
+                return Ok(());
+            }
             let (_, missing) = translated(dir, &p, &lang)?;
             for m in &missing {
                 println!("{}\t{}", escape_field(&m.text), escape_field(&m.used.join(", ")));
@@ -4315,6 +4368,114 @@ fn report_kinds(names: &[String]) -> Result<Vec<wc_report::Kind>, String> {
         out.push(k);
     }
     Ok(out)
+}
+
+/// `wiringcraft report-layout`: print, replace or reset report layouts, keeping them as the
+/// report layout dialog and the assistant's `report_layouts` tool do.
+fn report_layout(dir: &Path, cmd: ReportLayoutCmd) -> Res<()> {
+    use wc_core::report_layout::ReportLayout;
+    let one = |name: &str| -> Res<wc_report::Kind> {
+        match report_kinds(&[name.to_owned()])?.as_slice() {
+            [k] => Ok(*k),
+            _ => Err(format!("name one report, not {name:?}")),
+        }
+    };
+    let mut p = load(dir)?;
+    let (symbols, _) = store::vendored_symbols(dir, &p);
+    let parts = vendored_parts(dir, &p);
+    let builtin = |p: &Project, kind| {
+        let inputs = wc_report::Inputs {
+            project: p,
+            symbols: &symbols,
+            parts: &parts,
+        };
+        wc_report::build_builtin(kind, &inputs).columns
+    };
+    let warnings = |p: &Project, about: &str| -> Vec<String> {
+        let inputs = wc_report::Inputs {
+            project: p,
+            symbols: &symbols,
+            parts: &parts,
+        };
+        let about = format!("report layout for \"{about}\":");
+        wc_report::layout_warnings(&inputs)
+            .into_iter()
+            .filter(|w| w.starts_with(&about))
+            .collect()
+    };
+    let (kind, layout) = match cmd {
+        ReportLayoutCmd::Show { kind } => {
+            let kinds = match kind {
+                Some(k) => vec![one(&k)?],
+                None => wc_report::Kind::ALL.to_vec(),
+            };
+            let mut out: Vec<serde_json::Value> = kinds
+                .iter()
+                .map(|k| {
+                    serde_json::json!({
+                        "kind": k.name(),
+                        "layout": wc_report::layout_for(&p, *k),
+                        "builtin_columns": builtin(&p, *k),
+                        "warnings": warnings(&p, k.name()),
+                    })
+                })
+                .collect();
+            // Every report: a stored layout for a report that does not exist is listed too, so
+            // it and its warnings are not hidden.
+            if kinds.len() > 1 {
+                for l in &p.meta.reports {
+                    if wc_report::Kind::parse(&l.kind).is_none() {
+                        out.push(serde_json::json!({
+                            "kind": l.kind,
+                            "layout": l,
+                            "builtin_columns": null,
+                            "warnings": warnings(&p, &l.kind),
+                        }));
+                    }
+                }
+            }
+            let text = serde_json::to_string_pretty(&out).map_err(e)?;
+            println!("{text}");
+            return Ok(());
+        }
+        ReportLayoutCmd::Set { kind, file } => {
+            let kind = one(&kind)?;
+            let text = if file.as_os_str() == "-" {
+                std::io::read_to_string(std::io::stdin()).map_err(|err| format!("stdin: {err}"))?
+            } else {
+                std::fs::read_to_string(&file).map_err(|err| format!("{}: {err}", file.display()))?
+            };
+            let name = if file.as_os_str() == "-" {
+                "stdin".to_owned()
+            } else {
+                file.display().to_string()
+            };
+            let value: serde_json::Value = serde_json::from_str(&text).map_err(|err| format!("{name}: {err}"))?;
+            let layout = ReportLayout::from_json(kind.name(), value)?;
+            (kind, layout.kept(&builtin(&p, kind))?)
+        }
+        ReportLayoutCmd::Reset { kind } => (one(&kind)?, None),
+    };
+    let mut reports = p.meta.reports.clone();
+    match &layout {
+        Some(l) => match reports.iter_mut().find(|r| r.kind == kind.name()) {
+            Some(slot) => *slot = l.clone(),
+            None => reports.push(l.clone()),
+        },
+        None => reports.retain(|r| r.kind != kind.name()),
+    }
+    if reports != p.meta.reports {
+        p.meta.reports = reports;
+        save(dir, &p)?;
+    }
+    match layout {
+        Some(_) => println!("the {} report's layout is set", kind.name()),
+        None => println!("the {} report has its built-in layout", kind.name()),
+    }
+    for w in warnings(&p, kind.name()) {
+        eprintln!("warning: {}", escape_field(&w));
+    }
+    Ok(())
 }
 
 /// The project's vendored parts by id (parts used by devices, their accessories and jumpers).
@@ -6303,6 +6464,40 @@ mod tests {
         )
         .unwrap();
         assert!(cli(&dir, &["translations", "--lang", "nb"]).is_ok());
+
+        // One text set and removed from the command line.
+        cli(
+            &dir,
+            &["translations", "set", "Main switch", "Hovedbryter 1", "--lang", "nb"],
+        )
+        .unwrap();
+        cli(&dir, &["translations", "--lang", "de", "set", "Pumps", "Pumpen"]).unwrap();
+        let dict = wc_core::translate::Dictionary::load(&dir).unwrap();
+        assert_eq!(dict.lookup("Main switch", "nb").as_deref(), Some("Hovedbryter 1"));
+        assert_eq!(dict.lookup("Pumps", "de").as_deref(), Some("Pumpen"));
+        cli(&dir, &["translations", "remove", "Cover", "--lang", "nb"]).unwrap();
+        let err = cli(&dir, &["translations", "--lang", "nb"]).unwrap_err();
+        assert!(err.contains("1 text(s)"), "{err}");
+        assert!(
+            cli(&dir, &["translations", "set", "Pumps", "x"]).is_err(),
+            "no language"
+        );
+        assert!(cli(&dir, &["translations", "set", "Pumps", "x", "--lang", "en"]).is_err());
+        assert!(cli(&dir, &["translations", "set", "Pumps", " ", "--lang", "nb"]).is_err());
+
+        // A folder that is not a project is refused, and its translations.toml left alone.
+        let other = tmp.path().join("not-a-project");
+        std::fs::create_dir(&other).unwrap();
+        let file = other.join(wc_core::translate::TRANSLATIONS_FILE);
+        let text = "source = \"en\"\n";
+        std::fs::write(&file, text).unwrap();
+        assert!(cli(&other, &["translations", "set", "Pumps", "Pumper", "--lang", "nb"]).is_err());
+        assert!(cli(&other, &["translations", "remove", "Pumps", "--lang", "nb"]).is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        assert!(cli(&empty, &["translations", "set", "Pumps", "Pumper", "--lang", "nb"]).is_err());
+        assert!(!empty.join(wc_core::translate::TRANSLATIONS_FILE).exists());
     }
 
     #[test]

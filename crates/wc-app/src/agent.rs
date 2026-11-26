@@ -506,6 +506,19 @@ pub fn specs() -> Vec<Value> {
             &["action"],
         ),
         tool(
+            "translations",
+            "The project's translation dictionary (translations.toml, the same file as File, Translations): list the project's texts with their translations (lang: only that language; missing: true with lang: only the texts without a translation into it), set a text's translation into a language, or remove it. text is the project text as drawn, in the source language. It is written to the file at once, like the dialog saves: Undo does not take it back, so set or remove it again to change it. In a shared session only the host can set or remove translations.",
+            json!({
+                "action": {"type": "string", "enum": ["list", "set", "remove"]},
+                "text": {"type": "string", "description": "set, remove: the text as drawn in the project, such as a page title or device description."},
+                "lang": {"type": "string", "description": "A language code, such as nb or de."},
+                "translation": {"type": "string", "description": "set: the text in lang."},
+                "missing": {"type": "boolean", "description": "list with lang: only the texts without a translation."},
+                "skip": {"type": "integer", "description": "list: leave out this many texts from the start; a long list answers with next_skip, the value to pass for the next page."}
+            }),
+            &["action"],
+        ),
+        tool(
             "number_wires",
             "Give every connection without a number one. Existing numbers are kept.",
             json!({"rule": {"type": "string", "enum": ["page_column", "sequential", "potential"], "description": "page_column (3.4: page and column, default), sequential (1, 2, 3) or potential (the potential's name)."}}),
@@ -615,7 +628,7 @@ pub fn specs() -> Vec<Value> {
              Panels: panel (new, arrange, step, device, show, list, remove). PLC: rack (list, add, set, remove, card add/set/remove: PLC racks and their cards by slot). \
              Libraries: lib (add, sync, status, update, lock, search, propose). \
              Import: import (symbol-dxf, symbol-svg, symbol-kicad, symbol-qet, footprint-dxf, model-step, parts-csv, parts-bmecat, parts-edz, plc-csv, wago, archive, page-dxf, page-dwg, pdf, eplan, swe, swe-library, aml). \
-             Output: pdf (--page, --report, --lang for a translated print), drawing (SVG/DXF per page), report, nets, aml, plc-vars, export (wago-marking, wago-configurator), translations (texts missing a translation, --lang). \
+             Output: pdf (--page, --report, --lang for a translated print), drawing (SVG/DXF per page), report, report-layout (show, set, reset: a report's columns, sorting, grouping and title-block values), nets, aml, plc-vars, export (wago-marking, wago-configurator), translations (texts missing a translation, --lang). \
              Checks and history: check, rules (list, set, off, on: the check rules and library rules the project turns off), inspect (another tool's archive), vcs (init, commit, branch, switch, merge, log, changes, page-log), comment (add, reply, resolve, reopen, remove, list). \
              Use [\"--help\"] or [\"<command>\", \"--help\"] for the arguments.",
             json!({"args": {"type": "array", "items": {"type": "string"}, "description": "Arguments, e.g. [\"plc-vars\", \"export/io.st\"]. The project folder is passed for you."}}),
@@ -769,6 +782,45 @@ fn pretty(v: &Value) -> String {
     serde_json::to_string(v).unwrap_or_default()
 }
 
+/// How many texts `translations list` returns in one answer, at most, in characters of JSON:
+/// the rest come on later pages (`skip`).
+const TRANSLATION_PAGE_CHARS: usize = 30_000;
+
+/// The `skip` argument of a paged list: how many rows to leave out from the start.
+fn skip(v: &Value) -> Result<usize, String> {
+    match v.get("skip") {
+        None | Some(Value::Null) => Ok(0),
+        Some(n) => n
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| "`skip` must be a whole number of texts, 0 or more.".into()),
+    }
+}
+
+/// One page of a `translations list` answer: whole rows from `skip` on, as many as fit in
+/// [`TRANSLATION_PAGE_CHARS`] (always at least one), with `next_skip` when more follow, so the
+/// answer stays valid JSON however many texts the project has.
+fn translation_page(source: &str, languages: &[String], rows: Vec<Value>, skip: usize) -> String {
+    let total = rows.len();
+    let mut used = 0;
+    let page: Vec<Value> = rows
+        .into_iter()
+        .skip(skip)
+        .take_while(|r| {
+            let len = r.to_string().len();
+            let fits = used == 0 || used + len <= TRANSLATION_PAGE_CHARS;
+            used += len;
+            fits
+        })
+        .collect();
+    let next = skip + page.len();
+    let mut out = json!({"source": source, "languages": languages, "total": total, "texts": page});
+    if next < total {
+        out["next_skip"] = json!(next);
+    }
+    pretty(&out)
+}
+
 fn clip_text(t: String, max: usize) -> String {
     if t.chars().count() <= max {
         return t;
@@ -812,45 +864,6 @@ fn selection_id(sel: &Selection) -> String {
 /// The open project, or the error the model sees when there is none.
 fn need_open(open: Option<&mut Open>) -> Result<&mut Open, String> {
     open.ok_or_else(|| "No project is open. Use open_project first.".to_owned())
-}
-
-/// An error naming the first key of a report layout (or of one of its column entries) that
-/// [`wc_core::report_layout::ReportLayout`] does not have, since serde would drop it silently
-/// (`columns` for `column` would then keep the built-in columns). The known keys are the ones
-/// the layout itself serializes, so they follow its fields.
-fn report_layout_unknown_key(layout: &serde_json::Map<String, Value>) -> Result<(), String> {
-    use wc_core::report_layout::{ReportColumn, ReportLayout};
-    let keys = |v: Value| -> Vec<String> { v.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default() };
-    let column = ReportColumn {
-        from: "x".into(),
-        heading: Some("x".into()),
-    };
-    let known = keys(json!(ReportLayout {
-        kind: "x".into(),
-        title: Some("x".into()),
-        columns: vec![column.clone()],
-        sort: vec!["x".into()],
-        group: Some("x".into()),
-        header: vec!["x".into()],
-    }));
-    let known_column = keys(json!(column));
-    let unknown = |fields: &serde_json::Map<String, Value>, known: &[String], what: &str| match fields
-        .keys()
-        .find(|k| !known.contains(k))
-    {
-        Some(k) => Err(format!(
-            "Unknown {what} key {k:?}; known keys are {}.",
-            known.join(", ")
-        )),
-        None => Ok(()),
-    };
-    unknown(layout, &known, "layout")?;
-    if let Some(Value::Array(columns)) = layout.get("column") {
-        for c in columns.iter().filter_map(Value::as_object) {
-            unknown(c, &known_column, "column")?;
-        }
-    }
-    Ok(())
 }
 
 impl Open {
@@ -1287,6 +1300,14 @@ impl wc_agent::Tools for AppTools<'_> {
             "mirror_items" => format!("Mirrored {}{page}", strings(input, "ids").join(", ")),
             "copy_items" => format!("Copied {}{page}", strings(input, "ids").join(", ")),
             "select_items" => format!("Selected {}{page}", strings(input, "ids").join(", ")),
+            "translations" => match s(input, "action") {
+                Some(a @ ("set" | "remove")) => format!(
+                    "Translations: {a} {:?} in {}",
+                    s(input, "text").unwrap_or_default(),
+                    s(input, "lang").unwrap_or_default()
+                ),
+                _ => "Read the translations".into(),
+            },
             "set_device" => format!("Set device {}", s(input, "tag").unwrap_or_default()),
             "run_action" => format!("Ran {}", s(input, "action").unwrap_or_default()),
             "run_command" => format!("wiringcraft {}", strings(input, "args").join(" ")),
@@ -1906,6 +1927,7 @@ impl App {
             "jumpers" => self.tool_jumpers(v),
             "strips" => self.tool_strips(v),
             "macros" => self.tool_macros(v),
+            "translations" => self.tool_translations(v),
             "rules" => self.tool_rules(v),
             "number_wires" => {
                 use wc_core::numbering::Rule;
@@ -2890,33 +2912,13 @@ impl App {
     /// The `rules` tool: the project's check rules and the library rules it turns off, kept
     /// as the check rules dialog keeps them (its checks, one undo step).
     fn tool_rules(&mut self, v: &Value) -> Result<String, String> {
-        use wc_core::check_rule::{CheckRule, check_rule, turn_rule, turned_off};
+        use wc_core::check_rule::{CheckRule, check_rule, rules_listing, turn_rule};
         let action = need_s(v, "action")?;
         let open = need_open(self.open.as_mut())?;
         let library = wc_library::library_rules(&open.dir, &open.project);
         let off = &open.project.meta.rules_off;
         match action {
-            "list" => {
-                let sources: Vec<Value> = library
-                    .iter()
-                    .map(|set| match &set.rules {
-                        Ok(rules) => {
-                            let rules: Vec<Value> = rules
-                                .iter()
-                                .enumerate()
-                                .map(|(k, r)| {
-                                    json!({"rule": format!("{}:{}", set.source, k + 1), "off": turned_off(off, &set.source, k + 1, r), "is": r})
-                                })
-                                .collect();
-                            json!({"source": set.source, "rules": rules})
-                        }
-                        Err(e) => json!({"source": set.source, "error": e}),
-                    })
-                    .collect();
-                Ok(pretty(
-                    &json!({"rules": open.project.meta.rules, "library": sources, "rules_off": off}),
-                ))
-            }
+            "list" => Ok(pretty(&rules_listing(&open.project.meta, &library))),
             "set" => {
                 let list = v
                     .get("rules")
@@ -3081,6 +3083,71 @@ impl App {
         }
     }
 
+    /// The `translations` tool: the project's `translations.toml`, read and written through
+    /// the same dictionary code as the Translations dialog.
+    fn tool_translations(&mut self, v: &Value) -> Result<String, String> {
+        use wc_core::translate::{Dictionary, TRANSLATIONS_FILE, set_translation, texts};
+        let action = need_s(v, "action")?;
+        // The session does not carry translations.toml: a guest's edit would stay in the
+        // guest's own copy, and the host's file (which its PDF export reads) would not change.
+        if matches!(action, "set" | "remove") && self.share.active() && !self.share.is_host() {
+            return Err("Not done: in a shared session only the host can change the translations (the session does not carry translations.toml). Ask the host to make this change.".into());
+        }
+        let open = need_open(self.open.as_mut())?;
+        match action {
+            "list" => {
+                let dict = Dictionary::load(&open.dir).map_err(|e| e.to_string())?;
+                let langs: Vec<String> = match s(v, "lang") {
+                    Some(l) => match wc_core::translate::parse_languages(l).as_deref() {
+                        Some([one]) => vec![one.clone()],
+                        _ => return Err(format!("{l:?} is not a language code: use one such as nb or de.")),
+                    },
+                    None => dict.languages().into_iter().skip(1).collect(),
+                };
+                let only_missing = v.get("missing").and_then(Value::as_bool).unwrap_or(false) && s(v, "lang").is_some();
+                let rows: Vec<Value> = texts(&open.project)
+                    .into_iter()
+                    .filter_map(|t| {
+                        let tr: serde_json::Map<String, Value> = langs
+                            .iter()
+                            .filter_map(|l| dict.lookup(&t.text, l).map(|x| (l.clone(), json!(x))))
+                            .collect();
+                        (!only_missing || tr.is_empty())
+                            .then(|| json!({"text": t.text, "used": t.used, "translations": tr}))
+                    })
+                    .collect();
+                Ok(translation_page(dict.source(), &dict.languages(), rows, skip(v)?))
+            }
+            "set" | "remove" => {
+                let text = need_s(v, "text")?;
+                let lang = need_s(v, "lang")?;
+                let translation = if action == "set" {
+                    let t = need_s(v, "translation")?;
+                    if t.trim().is_empty() {
+                        return Err("The translation is empty: use action remove to take one away.".into());
+                    }
+                    t
+                } else {
+                    ""
+                };
+                let changed = set_translation(&open.dir, text, lang, translation).map_err(|e| e.to_string())?;
+                let mut out = match (action, changed) {
+                    ("set", true) => format!("Saved the translation to {TRANSLATIONS_FILE}."),
+                    ("set", false) => format!("{TRANSLATIONS_FILE} already had that translation."),
+                    (_, true) => format!("Removed the translation from {TRANSLATIONS_FILE}."),
+                    (_, false) => format!("{TRANSLATIONS_FILE} had no translation of that text into that language."),
+                };
+                if !texts(&open.project).iter().any(|t| t.text == text.trim()) {
+                    out.push_str(
+                        " Note: no text in the project reads exactly like that; list shows the texts as drawn.",
+                    );
+                }
+                Ok(out)
+            }
+            other => Err(format!("Unknown translations action {other}.")),
+        }
+    }
+
     /// The `report_layouts` tool: read, replace or reset a report's layout through the report
     /// layout dialog's form, so a layout is checked and kept as OK in the dialog keeps it.
     fn tool_report_layouts(&mut self, v: &Value) -> Result<String, String> {
@@ -3155,14 +3222,8 @@ impl App {
                 let form = if action == "reset" {
                     Form::new(kind, columns, wc_report::layout_for(&open.project, kind)).cleared()
                 } else {
-                    let mut given = v.get("layout").cloned().ok_or("Give the layout.")?;
-                    let Some(fields) = given.as_object_mut() else {
-                        return Err("The layout must be an object.".into());
-                    };
-                    report_layout_unknown_key(fields)?;
-                    fields.insert("kind".into(), json!(kind.name()));
-                    let layout: wc_core::report_layout::ReportLayout =
-                        serde_json::from_value(given).map_err(|e| format!("Bad layout: {e}"))?;
+                    let given = v.get("layout").cloned().ok_or("Give the layout.")?;
+                    let layout = wc_core::report_layout::ReportLayout::from_json(kind.name(), given)?;
                     // Read into the dialog's form as the dialog would show it, so it is kept
                     // as OK keeps it (a layout that shows the built-in one keeps none).
                     Form::new(kind, columns, Some(&layout))
@@ -3424,6 +3485,11 @@ impl App {
         let bin = cli_path();
         let mut cmd = std::process::Command::new(&bin);
         self.assistant.command_base = None;
+        // As in the `translations` tool: the session does not carry translations.toml, so a
+        // guest's edit would stay in its own copy and never reach the host.
+        if edits_translations(&args) && self.share.active() && !self.share.is_host() {
+            return Err("Not done: in a shared session only the host can change the translations (the session does not carry translations.toml). Ask the host to make this change.".into());
+        }
         if let Some(open) = self.open.as_mut() {
             // In a shared session a page someone else has open is read-only here, and the
             // command line writes the project folder directly: only commands that read it run.
@@ -3585,6 +3651,27 @@ fn find_macro(open: &Open, name: &str) -> Result<crate::state::MacroEntry, Strin
 /// it only reads the project.
 ///
 /// `cwd` is the folder the command runs in, which relative paths are taken from.
+/// Whether `wiringcraft <args>` sets or removes a translation (`translations set`/`remove`,
+/// also with `--lang` before the subcommand).
+fn edits_translations(args: &[String]) -> bool {
+    // The command's own words, without options and the values of the options that take one
+    // (`-C`/`--project` before or after the command, `--lang`), so a search text or a
+    // project folder named `translations` or `set` is not read as the command.
+    let mut words = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if matches!(a.as_str(), "-C" | "--project" | "--lang") {
+            it.next();
+        } else if !a.starts_with('-') {
+            words.push(a.as_str());
+        }
+        if words.len() == 2 {
+            break;
+        }
+    }
+    matches!(words.as_slice(), ["translations", "set" | "remove"])
+}
+
 fn writes_while_held(args: &[String], dir: &Path, held: &BTreeMap<String, String>, cwd: &Path) -> Option<String> {
     if held.is_empty() {
         return None;
@@ -3606,7 +3693,7 @@ fn writes_while_held(args: &[String], dir: &Path, held: &BTreeMap<String, String
         (
             Some(
                 "page" | "panel" | "location" | "jumper" | "strip" | "macro" | "revision" | "template" | "lib"
-                | "comment",
+                | "comment" | "report-layout",
             ),
             Some("list" | "show"),
         ) => true,
@@ -3623,8 +3710,13 @@ fn writes_while_held(args: &[String], dir: &Path, held: &BTreeMap<String, String
     let project = Guarded::new(dir);
     // Run from inside the project folder, even a bare file name could land on a held page: only
     // a command with nothing after its own words (`check`, `page list`) runs there.
+    // `report-layout show <kind>` names a report, not a file: a word of the command too.
+    let layout_kind = arg(0) == Some("report-layout")
+        && arg(1) == Some("show")
+        && arg(2).is_some_and(|k| wc_report::Kind::parse(k).is_some());
     let words = match arg(0) {
         Some("vcs") => 2,
+        _ if layout_kind => 3,
         _ if matches!(arg(1), Some("list" | "show")) => 2,
         _ => 1,
     };
@@ -3637,7 +3729,7 @@ fn writes_while_held(args: &[String], dir: &Path, held: &BTreeMap<String, String
             args.join(" ")
         ));
     }
-    for a in args {
+    for a in args.iter().skip(if layout_kind { 3 } else { 0 }) {
         let why = match project.reached_by(cwd, split_flag(a).1) {
             Ok(false) => continue,
             Ok(true) => "is in the project folder or links to a file in it".to_owned(),
@@ -5731,6 +5823,116 @@ mod tests {
     }
 
     #[test]
+    fn a_guest_cannot_set_or_remove_translations_the_session_does_not_carry() {
+        use wc_core::translate::TRANSLATIONS_FILE;
+        let tmp = tempfile::tempdir().unwrap();
+        let (_dir, mut a) = guest_app(tmp.path());
+        let file = a.open.as_ref().unwrap().dir.join(TRANSLATIONS_FILE);
+        for input in [
+            json!({"action": "set", "text": "Pumps", "lang": "nb", "translation": "Pumper"}),
+            json!({"action": "remove", "text": "Pumps", "lang": "nb"}),
+        ] {
+            let e = call(&mut a, "translations", input).unwrap_err();
+            assert!(e.contains("only the host"), "{e}");
+        }
+        assert!(!file.exists(), "nothing is written in the guest's copy");
+        assert!(call(&mut a, "translations", json!({"action": "list"})).is_ok());
+    }
+
+    #[test]
+    fn a_guest_cannot_set_or_remove_translations_through_the_command_line() {
+        use wc_core::translate::TRANSLATIONS_FILE;
+        let tmp = tempfile::tempdir().unwrap();
+        let (_dir, mut a) = guest_app(tmp.path());
+        // With no page held by anyone else the read-only check lets every command through.
+        a.open.as_mut().unwrap().held_by_others.clear();
+        let file = a.open.as_ref().unwrap().dir.join(TRANSLATIONS_FILE);
+        for args in [
+            json!({"args": ["translations", "set", "Pumps", "Pumper", "--lang", "nb"]}),
+            json!({"args": ["translations", "--lang", "nb", "remove", "Pumps"]}),
+        ] {
+            let Started::Done(Err(e)) = wc_agent::Tools::start(&mut AppTools(&mut a), "run_command", &args) else {
+                unreachable!("{args} was not refused");
+            };
+            assert!(e.contains("only the host"), "{e}");
+        }
+        assert!(!file.exists(), "nothing is written in the guest's copy");
+        // Listing what is missing still runs.
+        let args = json!({"args": ["translations", "--lang", "nb"]});
+        let Started::Running(p) = wc_agent::Tools::start(&mut AppTools(&mut a), "run_command", &args) else {
+            unreachable!("listing was refused");
+        };
+        let _ = wc_agent::Tools::finish(&mut AppTools(&mut a), "run_command", &args, p.wait());
+    }
+
+    #[test]
+    fn edits_translations_tells_set_and_remove_from_listing() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(edits_translations(&args(&["translations", "set", "A", "B"])));
+        assert!(edits_translations(&args(&[
+            "translations",
+            "--lang",
+            "de",
+            "remove",
+            "A"
+        ])));
+        assert!(!edits_translations(&args(&["translations", "--lang", "nb"])));
+        assert!(!edits_translations(&args(&["page", "set"])));
+        assert!(edits_translations(&args(&[
+            "-C",
+            "proj",
+            "translations",
+            "set",
+            "A",
+            "B"
+        ])));
+        assert!(!edits_translations(&args(&[
+            "find",
+            "translations",
+            "--replace",
+            "set"
+        ])));
+        assert!(!edits_translations(&args(&["translations", "--lang", "set"])));
+        assert!(!edits_translations(&args(&[
+            "page",
+            "add",
+            "translations",
+            "--title",
+            "set"
+        ])));
+        assert!(!edits_translations(&args(&["-C", "translations", "check", "set"])));
+    }
+
+    #[test]
+    fn a_long_translation_list_comes_in_whole_json_pages() {
+        let rows: Vec<Value> = (0..2000)
+            .map(|i| json!({"text": format!("Text number {i} {}", "x".repeat(40)), "used": 1, "translations": {}}))
+            .collect();
+        let langs = vec!["en".to_string(), "nb".to_string()];
+        let mut seen = Vec::new();
+        let mut from = 0;
+        let mut pages = 0;
+        loop {
+            let page: Value = serde_json::from_str(&translation_page("en", &langs, rows.clone(), from)).unwrap();
+            assert_eq!(page["total"], 2000);
+            let texts = page["texts"].as_array().unwrap();
+            assert!(!texts.is_empty());
+            seen.extend(texts.iter().map(|t| t["text"].as_str().unwrap().to_string()));
+            pages += 1;
+            match page["next_skip"].as_u64() {
+                Some(n) => from = n as usize,
+                None => break,
+            }
+        }
+        assert!(pages > 1, "the list did not need paging");
+        let want: Vec<String> = rows.iter().map(|r| r["text"].as_str().unwrap().to_string()).collect();
+        assert_eq!(seen, want);
+        // Past the end: an empty page, not an error.
+        let past: Value = serde_json::from_str(&translation_page("en", &langs, rows, 5000)).unwrap();
+        assert!(past["texts"].as_array().unwrap().is_empty() && past.get("next_skip").is_none());
+    }
+
+    #[test]
     fn a_guests_tool_call_that_changes_nothing_is_not_pending() {
         let tmp = tempfile::tempdir().unwrap();
         let (_dir, mut a) = guest_app(tmp.path());
@@ -6561,6 +6763,86 @@ mod tests {
         let pdf = String::from_utf8_lossy(&std::fs::read(pdf_path).unwrap()).into_owned();
         assert!(pdf.contains(&hex("Reserve / Spare")), "the texts are in both languages");
         assert!(pdf.contains(&hex("Pumpene / Pumps")));
+    }
+
+    #[test]
+    fn the_assistant_lists_sets_and_removes_translations_as_the_dialog_shows_them() {
+        use wc_core::translate::{Dictionary, TRANSLATIONS_FILE};
+        let (_tmp, mut a) = app(vec![]);
+        let dir = a.open.as_ref().unwrap().dir.clone();
+        a.open.as_mut().unwrap().project.pages[1].title = "Pumps".into();
+        std::fs::write(
+            dir.join(TRANSLATIONS_FILE),
+            "source = \"en\"\n\n[[text]]\nen = \"Main switch\"\nnb = \"Hovedbryter\"\n",
+        )
+        .unwrap();
+        let steps = a.open.as_ref().unwrap().undo_mark();
+
+        let missing = |a: &mut App| -> Vec<String> {
+            let r = call(
+                a,
+                "translations",
+                json!({"action": "list", "lang": "nb", "missing": true}),
+            )
+            .unwrap();
+            let v: Value = serde_json::from_str(&r).unwrap();
+            v["texts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["text"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert!(missing(&mut a).contains(&"Pumps".to_owned()));
+
+        let r = call(
+            &mut a,
+            "translations",
+            json!({"action": "set", "text": "Pumps", "lang": "NB", "translation": "Pumper"}),
+        )
+        .unwrap();
+        assert!(r.starts_with("Saved"), "{r}");
+        assert!(!missing(&mut a).contains(&"Pumps".to_owned()));
+        let d = Dictionary::load(&dir).unwrap();
+        assert_eq!(d.lookup("Pumps", "nb").as_deref(), Some("Pumper"));
+        assert_eq!(d.lookup("Main switch", "nb").as_deref(), Some("Hovedbryter"), "kept");
+
+        // The dialog opened now shows what the assistant saved.
+        a.run(Action::Translations);
+        let Some(Dialog::Translations(form)) = a.dialog.take() else {
+            unreachable!("the translations dialog opens");
+        };
+        let row = form.rows.iter().find(|r| r.text == "Pumps").unwrap();
+        assert_eq!(row.cells, ["Pumper"]);
+
+        let r = call(
+            &mut a,
+            "translations",
+            json!({"action": "remove", "text": "Pumps", "lang": "nb"}),
+        )
+        .unwrap();
+        assert!(r.starts_with("Removed"), "{r}");
+        assert_eq!(Dictionary::load(&dir).unwrap().lookup("Pumps", "nb"), None);
+        assert!(missing(&mut a).contains(&"Pumps".to_owned()));
+
+        // Not in the project: saved, with a note.
+        let r = call(
+            &mut a,
+            "translations",
+            json!({"action": "set", "text": "Nowhere", "lang": "de", "translation": "Nirgends"}),
+        )
+        .unwrap();
+        assert!(r.contains("no text in the project"), "{r}");
+        for bad in [
+            json!({"action": "set", "text": "Pumps", "lang": "en", "translation": "x"}),
+            json!({"action": "set", "text": "Pumps", "lang": "nb", "translation": " "}),
+            json!({"action": "set", "text": "Pumps", "lang": "nb,en", "translation": "x"}),
+            json!({"action": "remove", "text": "Pumps"}),
+        ] {
+            assert!(call(&mut a, "translations", bad.clone()).is_err(), "{bad}");
+        }
+        // The file is not part of the drawing: no undo step yet (todo #589).
+        assert_eq!(a.open.as_ref().unwrap().undo_mark(), steps);
     }
 
     #[test]
@@ -7661,6 +7943,43 @@ mod tests {
     }
 
     #[test]
+    fn the_assistant_does_not_edit_a_black_box_whose_file_changed_on_disk() {
+        let (_tmp, mut a) = app(vec![]);
+        let out = call(
+            &mut a,
+            "black_box",
+            json!({"action": "add", "page": "2", "x": 40, "y": 40, "width": 20, "height": 10,
+                   "pins": [{"name": "IN", "side": "left", "offset": 5}]}),
+        )
+        .unwrap();
+        let id = out
+            .trim_start_matches("Drew black box ")
+            .trim_end_matches('.')
+            .to_owned();
+        let symbol_id = page2(&a).symbol(&id).unwrap().symbol.clone();
+        let dir = a.open.as_ref().unwrap().dir.clone();
+        // `wiringcraft box-edit` resizes the box while the project is open.
+        let pins = [wc_core::BoxPin {
+            name: "IN".into(),
+            side: wc_core::BoxSide::Left,
+            offset: 5.0,
+        }];
+        let outside = wc_core::black_box(&symbol_id, "Black box", 50.0, 50.0, &pins).unwrap();
+        wc_core::store::write_vendored_symbol(&dir, &outside).unwrap();
+        let err = call(
+            &mut a,
+            "black_box",
+            json!({"action": "edit", "page": "2", "id": id, "width": 10}),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("changed on disk") && err.contains("reopen the project"),
+            "{err}"
+        );
+        assert_eq!(wc_core::store::read_vendored_symbol(&dir, &symbol_id).unwrap(), outside);
+    }
+
+    #[test]
     fn get_report_offers_and_reads_every_report() {
         let (_tmp, mut a) = app(vec![]);
         let spec = specs().into_iter().find(|t| t["name"] == "get_report").unwrap();
@@ -8587,6 +8906,8 @@ mod tests {
             vec!["page", "list"],
             vec!["vcs", "log"],
             vec!["find", "-K1"],
+            vec!["report-layout", "show"],
+            vec!["report-layout", "show", "devices"],
         ] {
             let args: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
             assert!(
@@ -8594,6 +8915,9 @@ mod tests {
                 "{args:?}"
             );
         }
+        // A word that is not a report could be a file.
+        let unknown: Vec<String> = ["report-layout", "show", "out.json"].map(String::from).to_vec();
+        assert!(writes_while_held(&unknown, &dir, &held, &dir.join("pages")).is_some());
         assert!(writes_while_held(&args, &dir, &held, out.path()).is_none());
         // An export writes its own file names into the folder it is given: a file there that
         // links to a held page, by name or as the same file, is a way onto the page.
