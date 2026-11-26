@@ -801,6 +801,8 @@ impl App {
                     self.dialog = None;
                 }
                 self.ed = Editor::default();
+                // A save waiting for a typed value was for the project left behind.
+                self.after_typed.clear();
                 // The fresh editor keeps the user's hidden and locked layers (`prefs` is the
                 // user's list here: `self.prefs` may be taken out while this runs).
                 self.ed.layers = prefs.layers.clone();
@@ -4929,7 +4931,7 @@ fn saves_project(a: Action) -> bool {
 /// Enter. When this frame's actions save the project while a field still has the keyboard
 /// (Ctrl+S typed in it), the saving action and those after it are taken out of `actions` and
 /// returned, to wait one frame: the field keeps the keyboard for this frame, so text typed in
-/// the same frame as Ctrl+S still reaches it. [`App::update`] takes them up in the next frame
+/// the same frame as Ctrl+S still reaches it. `App::update` takes them up in the next frame
 /// with [`enter_typed_value`] (#932).
 fn wait_for_typed_value(ctx: &egui::Context, actions: &mut Vec<Action>) -> Vec<Action> {
     let Some(at) = actions.iter().position(|a| saves_project(*a)) else {
