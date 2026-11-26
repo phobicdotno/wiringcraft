@@ -46,7 +46,9 @@ pub const COMMENTS_SUFFIX: &str = ".comments.json";
 /// `wiringcraft` command in the project puts the files back from it.
 pub const BOX_EDIT_JOURNAL: &str = ".box-edit.journal";
 
-/// Ids become file names, so they are restricted to a portable set.
+/// Ids become file names, so they are restricted to a portable set. A name Windows keeps for a
+/// device (`con`, `nul`, `aux`, `com1`, ...) is refused too, whatever follows it after a dot:
+/// Windows opens the device instead of the file.
 pub fn check_id(id: &str) -> Result<()> {
     let ok = !id.is_empty()
         && id.len() <= 128
@@ -54,12 +56,28 @@ pub fn check_id(id: &str) -> Result<()> {
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-    if ok {
-        Ok(())
-    } else {
-        Err(Error::Invalid(format!(
+    if !ok {
+        return Err(Error::Invalid(format!(
             "id {id:?} must be 1-128 of A-Z a-z 0-9 . _ - and not start with '.'"
-        )))
+        )));
+    }
+    let stem = id.split('.').next().unwrap_or(id);
+    if is_windows_device_name(stem) {
+        return Err(Error::Invalid(format!(
+            "id {id:?} starts with {stem:?}, a name Windows keeps for a device: its file could not be opened there"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `name` is one Windows keeps for a device: `CON`, `PRN`, `AUX`, `NUL`, `COM0`-`COM9`
+/// or `LPT0`-`LPT9`, in any case.
+fn is_windows_device_name(name: &str) -> bool {
+    let n = name.to_ascii_uppercase();
+    match n.as_bytes() {
+        [_, _, _] => matches!(n.as_str(), "CON" | "PRN" | "AUX" | "NUL"),
+        [a, b, c, d] => matches!(&[*a, *b, *c], b"COM" | b"LPT") && d.is_ascii_digit(),
+        _ => false,
     }
 }
 
@@ -486,13 +504,22 @@ pub fn save_lock(dir: &Path, project: &Project) -> Result<bool> {
 /// Save a project folder. Page files of deleted pages are removed. Returns the files written.
 ///
 /// Ids that differ only in case are refused before anything is written: on a folder that ignores
-/// case (macOS and Windows by default) they would be one file.
+/// case (macOS and Windows by default) they would be one file. A page or panel id that cannot be
+/// a file name ([`check_id`]) is refused before anything is written too.
 ///
 /// Every file written is synced, and each folder the save changed (a file written or removed
 /// in it) is synced once at the end, so the whole save is on disk when this returns. Files that
 /// did not change cost no sync. A folder sync that failed in an earlier save of this folder is
 /// tried again here, also when no file changed: `Ok` means nothing is owed any more.
 pub fn save(dir: &Path, project: &Project) -> Result<Vec<PathBuf>> {
+    for id in project
+        .pages
+        .iter()
+        .map(|p| &p.id)
+        .chain(project.panels.iter().map(|p| &p.id))
+    {
+        check_id(id)?;
+    }
     unique_ignoring_case("page", project.pages.iter().map(|p| p.id.as_str()))?;
     unique_ignoring_case("panel", project.panels.iter().map(|p| p.id.as_str()))?;
     let mut folders = Folders::new();
@@ -1165,6 +1192,23 @@ mod tests {
     }
 
     #[test]
+    fn a_bad_page_or_panel_id_is_refused_before_anything_is_written() -> Result<()> {
+        for bad_page in [true, false] {
+            let dir = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
+            let mut p = sample()?;
+            if bad_page {
+                p.pages[0].id = "nul".into();
+            } else {
+                p.panels[0].id = "../x".into();
+            }
+            refused(save(dir.path(), &p))?;
+            let left = fs::read_dir(dir.path()).map_err(|e| Error::io(dir.path(), e))?.count();
+            assert_eq!(left, 0, "the folder stays empty (bad page id: {bad_page})");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn deleted_pages_lose_their_file() -> Result<()> {
         let dir = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
         let mut p = sample()?;
@@ -1213,6 +1257,16 @@ mod tests {
             assert!(check_id(bad).is_err(), "{bad}");
         }
         assert!(check_id("wc.contact-no_1").is_ok());
+    }
+
+    #[test]
+    fn windows_device_names_are_refused() {
+        for bad in ["con", "NUL", "Aux.page", "prn", "com1", "COM0", "lpt9.x.y"] {
+            assert!(check_id(bad).is_err(), "{bad}");
+        }
+        for good in ["console", "com10", "aux1", "acme.aux", "nul_", "com", "lptx"] {
+            assert!(check_id(good).is_ok(), "{good}");
+        }
     }
 }
 
@@ -1580,14 +1634,18 @@ mod staging_tests {
         let dir = tempfile::tempdir().unwrap();
         let root = resolved(dir.path());
         let pages = root.join(PAGES_DIR);
-        let mut p = three_pages();
-        // The second page cannot be written, after the first is in place.
-        p.pages[1].id = "not a file name".into();
+        let p = three_pages();
+        // The second page cannot be written, after the first is in place: a folder that is not
+        // empty stands where its file goes. (An id that is no file name is refused before any
+        // write, so it cannot make a write fail half way.)
+        let blocker = pages.join(format!("p0001{PAGE_SUFFIX}"));
+        fs::create_dir_all(blocker.join("in-the-way")).unwrap();
         let (_watch, seen) = watch(|what, _| what == Synced::Folder);
 
         let failed = save(&root, &p);
+        // The page write failure is the one reported, not the folder sync failure after it.
         assert!(
-            matches!(&failed, Err(Error::Invalid(m)) if m.contains("not a file name")),
+            matches!(&failed, Err(Error::Io { path, .. }) if *path == blocker),
             "{failed:?}"
         );
         // Both folders with a file in place were still synced, failing or not.
@@ -1595,7 +1653,7 @@ mod staging_tests {
         assert!(pages.join(format!("p0000{PAGE_SUFFIX}")).exists());
 
         // With no write failure, the folder sync failure is the one reported.
-        p.pages[1].id = "p0001".into();
+        fs::remove_dir_all(&blocker).unwrap();
         let failed = save(&root, &p).unwrap_err().to_string();
         assert!(failed.contains("the disk went away"), "{failed}");
     }

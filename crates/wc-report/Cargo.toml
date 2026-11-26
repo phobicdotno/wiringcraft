@@ -10,5 +10,9 @@ wc-core.workspace = true
 # Reports saved as Excel workbooks (.xlsx).
 zip.workspace = true
 
+[dev-dependencies]
+# Tests read exported XML back.
+quick-xml.workspace = true
+
 [lints]
 workspace = true
