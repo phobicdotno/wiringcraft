@@ -176,6 +176,9 @@ enum Dialog {
     History(Vec<wc_vcs::subway::Row>),
     Library(Vec<wc_library::ItemStatus>),
     Message(String),
+    /// Save refused: this project file waits to be written again after a failed Undo or Redo,
+    /// but was changed outside WiringCraft since (#662). Asks which version to keep.
+    ChangedOutside(PathBuf),
     /// A base project being fetched from this git URL for a new project ([`App::fetch`]).
     Fetching(String),
     /// Help, Report a problem: the masked log to look at before anything is sent.
@@ -1402,7 +1405,13 @@ impl App {
             }
             Action::Save => match open.save() {
                 Ok(n) => self.ed.message = format!("Saved ({n} files changed)."),
-                Err(e) => self.dialog = Some(Dialog::Message(format!("Saving failed:\n{e}"))),
+                // A file changed outside that Save would write over asks first (#662).
+                Err(e) => {
+                    self.dialog = Some(match open.changed_outside() {
+                        Some(path) => Dialog::ChangedOutside(path),
+                        None => Dialog::Message(format!("Saving failed:\n{e}")),
+                    });
+                }
             },
             Action::SaveAs if self.share.active() => {
                 self.ed.message = "Save as is not available in a shared session: it would end the session. \
@@ -1887,6 +1896,7 @@ impl App {
             Dialog::History(_) => "History",
             Dialog::Library(_) => "Library status",
             Dialog::Message(_) => "WiringCraft",
+            Dialog::ChangedOutside(_) => "Save",
             Dialog::Fetching(_) => "New project",
             Dialog::SaveMacro { .. } => "Save as macro",
             Dialog::Macros(_) => "Insert macro",
@@ -2140,6 +2150,37 @@ impl App {
                         then = Some(Box::new(|app: &mut App| app.cancel_fetch()));
                         keep = false;
                     }
+                }
+                Dialog::ChangedOutside(path) => {
+                    ui.label(format!(
+                        "Not saved: {} was changed outside WiringCraft after an Undo or Redo could not \
+                         write it as the project needs it.\n\nKeep the version changed outside, or write \
+                         the project's version over it?",
+                        path.display()
+                    ));
+                    ui.horizontal(|ui| {
+                        for (label, keep_outside) in
+                            [("Keep the outside version", true), ("Write the project's version", false)]
+                        {
+                            if ui.button(label).clicked() {
+                                let path = path.clone();
+                                then = Some(Box::new(move |app: &mut App| {
+                                    if let Some(open) = app.open.as_mut() {
+                                        if keep_outside {
+                                            open.keep_outside_version(&path);
+                                        } else {
+                                            open.write_over_outside_version(&path);
+                                        }
+                                    }
+                                    app.carry_out(Action::Save);
+                                }));
+                                keep = false;
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
                 }
                 Dialog::Message(m) => {
                     // A long message (an import listing every symbol) scrolls; OK stays in view.

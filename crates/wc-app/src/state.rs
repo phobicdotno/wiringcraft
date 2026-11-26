@@ -393,6 +393,10 @@ pub struct Open {
     /// each again first, and does not go ahead while one cannot be. Saving that macro on
     /// purpose lets its entry go.
     unwritten_files: BTreeMap<PathBuf, Option<Vec<u8>>>,
+    /// For each of [`Open::unwritten_files`], what the file held when WiringCraft last wrote
+    /// (or failed to write) it, so the next save can tell a change made outside since then
+    /// and does not write over it unasked (#662). Missing when the file could not be read.
+    unwritten_found: BTreeMap<PathBuf, Option<Vec<u8>>>,
     /// Project files rewritten while a [`Mark`] is open (`marks` counts them), oldest first,
     /// so [`Open::back_to`] puts them back even when their undo steps fell off the history.
     mark_edits: Vec<FileEdit>,
@@ -478,6 +482,7 @@ impl Open {
             stale_symbol_files: Default::default(),
             unrestored_files: BTreeMap::new(),
             unwritten_files: BTreeMap::new(),
+            unwritten_found: BTreeMap::new(),
             mark_edits: Vec::new(),
             marks: 0,
             turn: None,
@@ -2021,6 +2026,11 @@ impl Open {
             let rel = path
                 .strip_prefix(&self.dir)
                 .map_or_else(|_| path.clone(), Path::to_path_buf);
+            // What the file holds now, as WiringCraft left it: a later change is from outside.
+            match snapshot_file(&path) {
+                Ok(found) => self.unwritten_found.insert(rel.clone(), found),
+                Err(_) => self.unwritten_found.remove(&rel),
+            };
             if replace {
                 self.unwritten_files.insert(rel, should);
             } else {
@@ -2030,12 +2040,45 @@ impl Open {
         self.edited();
     }
 
+    /// A file no longer waits to be written again.
+    fn drop_unwritten(&mut self, rel: &Path) {
+        self.unwritten_files.remove(rel);
+        self.unwritten_found.remove(rel);
+    }
+
+    /// The first project file waiting to be written again ([`Open::keep_unwritten`]) that was
+    /// changed outside WiringCraft since: Save does not write over it until
+    /// [`Open::keep_outside_version`] or [`Open::write_over_outside_version`] says what to do.
+    pub fn changed_outside(&self) -> Option<PathBuf> {
+        self.unwritten_files.iter().find_map(|(rel, should)| {
+            let found = self.unwritten_found.get(rel)?;
+            let path = self.dir.join(rel);
+            // A file that cannot be read now is the save's to report.
+            let now = snapshot_file(&path).ok()?;
+            (now != *found && now != *should).then_some(path)
+        })
+    }
+
+    /// Keep the version of `path` changed outside WiringCraft: what was waiting to be written
+    /// to it is dropped, and the next save leaves the file as it is.
+    pub fn keep_outside_version(&mut self, path: &Path) {
+        let rel = path.strip_prefix(&self.dir).unwrap_or(path).to_path_buf();
+        self.drop_unwritten(&rel);
+    }
+
+    /// Write what the project needs over the version of `path` changed outside WiringCraft on
+    /// the next save.
+    pub fn write_over_outside_version(&mut self, path: &Path) {
+        let rel = path.strip_prefix(&self.dir).unwrap_or(path).to_path_buf();
+        self.unwritten_found.remove(&rel);
+    }
+
     /// Files an Undo or Redo wrote as the project now needs them: none of them waits to be
     /// written again.
     fn written_as_needed(&mut self, written: &Written) {
         for (path, _) in written {
-            let rel = path.strip_prefix(&self.dir).unwrap_or(path);
-            self.unwritten_files.remove(rel);
+            let rel = path.strip_prefix(&self.dir).unwrap_or(path).to_path_buf();
+            self.drop_unwritten(&rel);
         }
     }
 
@@ -2057,7 +2100,7 @@ impl Open {
             let path = self.dir.join(rel);
             match restore_file(&path, Some(text.as_bytes())) {
                 Ok(()) => {
-                    self.unwritten_files.remove(rel);
+                    self.drop_unwritten(rel);
                 }
                 Err(e) => {
                     failed.push(format!(
@@ -2080,6 +2123,15 @@ impl Open {
     /// write. A save does not go ahead while one cannot be: the saved project would not match
     /// the file (a macro's undo history would be lost).
     fn put_back_unwritten_files(&mut self) -> Result<(), String> {
+        // Nothing is written while one of them was changed outside since: that is not lost
+        // unasked.
+        if let Some(path) = self.changed_outside() {
+            return Err(format!(
+                "not saved: {} was changed outside WiringCraft after an Undo or Redo could not write it \
+                 as the project needs it. Keep that version, or write the project's version over it.",
+                path.display()
+            ));
+        }
         for (rel, should) in self.unwritten_files.clone() {
             let path = self.dir.join(&rel);
             let folder = match (&should, path.parent()) {
@@ -2094,7 +2146,7 @@ impl Open {
                         path.display()
                     )
                 })?;
-            self.unwritten_files.remove(&rel);
+            self.drop_unwritten(&rel);
         }
         Ok(())
     }
@@ -2102,8 +2154,8 @@ impl Open {
     /// A project file written on purpose (a macro saved): what was waiting to be written to
     /// it is let go.
     fn written_on_purpose(&mut self, path: &Path) {
-        let rel = path.strip_prefix(&self.dir).unwrap_or(path);
-        self.unwritten_files.remove(rel);
+        let rel = path.strip_prefix(&self.dir).unwrap_or(path).to_path_buf();
+        self.drop_unwritten(&rel);
     }
 
     /// Why the last Undo or Redo failed, once.
@@ -2315,6 +2367,7 @@ impl Open {
         let old_unrestored = self.unrestored_files.clone();
         // Project files waiting to be written are named relative to the folder: the copy's.
         let old_unwritten = self.unwritten_files.clone();
+        let old_found = self.unwritten_found.clone();
         self.unrestored_files = old_unrestored
             .iter()
             .map(|(path, f)| {
@@ -2332,6 +2385,7 @@ impl Open {
             self.stale_symbol_files = old_stale;
             self.unrestored_files = old_unrestored;
             self.unwritten_files = old_unwritten;
+            self.unwritten_found = old_found;
             return Err(format!(
                 "{e}\n{}; you are still working in {}.",
                 discard(),
@@ -4269,6 +4323,53 @@ pub(crate) mod tests {
         let mine = std::fs::read_to_string(&path).unwrap();
         o.save().unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), mine);
+    }
+
+    /// A macro waiting to be written again after a failed Undo, then changed outside the app:
+    /// Save does not write over it and names it; keeping the outside version lets the save go
+    /// through with that version, and writing the project's version over it is a choice too
+    /// (#662).
+    #[test]
+    fn a_save_does_not_write_over_a_waiting_macro_changed_outside() {
+        let (_tmp, mut o, path, [_, one, two]) = macro_edited_twice();
+        let symbol = o.project.lock.symbols.keys().next().unwrap().clone();
+        let fail_undo = |o: &mut Open| {
+            o.stale_symbol_files.insert(symbol.clone());
+            o.fail_symbol_writes = [true].into();
+            fail_restores(&path, 1);
+            assert!(!o.undo());
+            assert!(o.take_undo_error().is_some());
+            let_restores_through();
+            o.stale_symbol_files.clear();
+            o.fail_symbol_writes = Default::default();
+        };
+        fail_undo(&mut o);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), one, "left as Undo wrote it");
+        assert_eq!(o.changed_outside(), None, "as WiringCraft left it");
+
+        // Changed outside: not written over, and the message names the file.
+        let outside = format!("{two}\n# edited outside\n");
+        std::fs::write(&path, &outside).unwrap();
+        assert_eq!(o.changed_outside(), Some(path.clone()));
+        let err = o.save().unwrap_err();
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains("changed outside"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), outside);
+
+        // Keep the outside version: the save goes through and leaves it.
+        o.keep_outside_version(&path);
+        assert_eq!(o.changed_outside(), None);
+        o.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), outside);
+
+        // Or write the project's version over it.
+        std::fs::write(&path, &two).unwrap();
+        fail_undo(&mut o);
+        std::fs::write(&path, &outside).unwrap();
+        assert!(o.save().is_err());
+        o.write_over_outside_version(&path);
+        o.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), two, "as the project needs it");
     }
 
     #[test]
