@@ -561,6 +561,27 @@ fn every_starter_symbol_loads_under_its_file_name_with_distinct_pins() -> Result
 }
 
 #[test]
+fn the_starter_three_phase_transformer_has_primary_and_secondary_terminals() -> Result<()> {
+    // #763: a 3-phase transformer next to the 1-phase control transformer.
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
+    project.meta.libraries = vec![LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: starter.to_string_lossy().into(),
+        reference: None,
+    }];
+    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (t, _) = lib.symbol("wc.transformer.3ph")?;
+    assert_eq!(t.role, SymbolRole::Standalone);
+    assert_eq!(t.letter_code, "T");
+    let names: Vec<_> = t.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["1U", "1V", "1W", "2U", "2V", "2W"]);
+    Ok(())
+}
+
+#[test]
 fn lock_restores_a_deleted_vendored_copy_at_the_pinned_version() -> Result<()> {
     let mut f = fixture()?;
     let lib = Library::open(&f.proj, &f.project)?;
