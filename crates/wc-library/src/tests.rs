@@ -512,6 +512,8 @@ fn every_starter_symbol_loads_under_its_file_name_with_distinct_pins() -> Result
         let (s, _) = lib.symbol(id)?;
         assert_eq!(&s.id, id, "file name and id differ");
         assert!(!s.pins.is_empty(), "{id} has no pins");
+        // Shown when browsing and matched by library search (#684).
+        assert!(!s.description.trim().is_empty(), "{id} has no description");
         let names: std::collections::BTreeSet<_> = s.pins.iter().map(|p| &p.name).collect();
         assert_eq!(names.len(), s.pins.len(), "{id} repeats a pin name");
     }

@@ -1,5 +1,6 @@
 {
   "category": "operators",
+  "description": "Push button with a break contact that opens while it is pressed.",
   "graphics": [
     {
       "a": {

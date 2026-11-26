@@ -1,5 +1,6 @@
 {
   "category": "power",
+  "description": "DC power supply: L and N in, + and - out.",
   "graphics": [
     {
       "kind": "rect",
