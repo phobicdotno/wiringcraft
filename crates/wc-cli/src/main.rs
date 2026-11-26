@@ -11,6 +11,53 @@ use wc_core::{DeviceTag, Endpoint, Page, PageSize, PlacedSymbol, Project, Wire, 
 
 type Res<T> = Result<T, String>;
 
+// Every `print!` and `println!` below writes through these, not the standard ones: those panic
+// when the reader of a pipe stops early (`wiringcraft ... | more`), which on Windows, with no
+// SIGPIPE to end the program, reported a crash. These end the command quietly instead (#567).
+macro_rules! print {
+    ($($arg:tt)*) => {
+        $crate::print_out(format_args!($($arg)*))
+    };
+}
+macro_rules! println {
+    () => {
+        $crate::print_out(format_args!("\n"))
+    };
+    ($($arg:tt)*) => {
+        $crate::print_out(format_args!("{}\n", format_args!($($arg)*)))
+    };
+}
+
+/// Why writing to stdout stopped the command. It unwinds the command's thread without a panic
+/// message, and [`finish`] turns it into the program's end: quiet when the reader has gone away.
+struct StdoutError(std::io::Error);
+
+/// What `print!` and `println!` do.
+fn print_out(args: std::fmt::Arguments) {
+    stdout_result(std::io::Write::write_fmt(&mut std::io::stdout().lock(), args));
+}
+
+/// The value of `r`, the result of a write to stdout, when it worked; stop the command with
+/// [`StdoutError`] when it did not, such as when the reader of a pipe has closed it.
+fn stdout_result<T>(r: std::io::Result<T>) -> T {
+    match r {
+        Ok(v) => v,
+        Err(err) => std::panic::resume_unwind(Box::new(StdoutError(err))),
+    }
+}
+
+/// The result of the command from its thread's end: a closed stdout ends it quietly.
+fn finish(joined: std::thread::Result<Res<()>>) -> Res<()> {
+    match joined {
+        Ok(result) => result,
+        Err(payload) => match payload.downcast::<StdoutError>() {
+            Ok(err) if err.0.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            Ok(err) => Err(format!("could not write the output: {}", err.0)),
+            Err(_) => Err("the command stopped unexpectedly".into()),
+        },
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "wiringcraft", version, about = "Electrical schematic and wiring design")]
 struct Cli {
@@ -1563,7 +1610,7 @@ fn run(cli: Cli) -> Res<()> {
             let mut p = load(dir)?;
             match lc {
                 LocationCmd::List => {
-                    write_locations(&mut std::io::stdout(), &p.meta.locations).map_err(e)?;
+                    stdout_result(write_locations(&mut std::io::stdout(), &p.meta.locations));
                 }
                 LocationCmd::Set { path, description } => {
                     let description = description.unwrap_or_else(|| {
@@ -3686,9 +3733,7 @@ fn main() -> ExitCode {
         .stack_size(STACK)
         .spawn(|| run(Cli::parse()));
     let result = match worker {
-        Ok(handle) => handle
-            .join()
-            .unwrap_or_else(|_| Err("the command stopped unexpectedly".into())),
+        Ok(handle) => finish(handle.join()),
         Err(err) => Err(format!("could not start the command: {err}")),
     };
     match result {
@@ -4962,6 +5007,56 @@ fn staging_dir(prefix: &str) -> std::io::Result<tempfile::TempDir> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// A stdout whose reader has gone away, as Windows reports it for `| more` that stopped.
+    struct ClosedPipe;
+
+    impl std::io::Write for ClosedPipe {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    /// Run `f` on a thread as `main` runs a command, and end it as `main` does.
+    fn run_like_main(f: impl FnOnce() -> Res<()> + Send + 'static) -> Res<()> {
+        finish(std::thread::spawn(f).join())
+    }
+
+    #[test]
+    fn a_closed_stdout_ends_the_command_quietly() {
+        let after = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = after.clone();
+        let result = run_like_main(move || {
+            let locations = [wc_core::project::Location {
+                path: "A1".into(),
+                description: String::new(),
+            }];
+            stdout_result(write_locations(&mut ClosedPipe, &locations));
+            seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err("went on writing".into())
+        });
+        assert_eq!(result, Ok(()));
+        assert!(!after.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn other_stdout_errors_are_reported() {
+        let result = run_like_main(|| {
+            stdout_result::<()>(Err(std::io::Error::other("disk full")));
+            Ok(())
+        });
+        assert_eq!(result, Err("could not write the output: disk full".into()));
+    }
+
+    #[test]
+    fn a_panic_is_still_reported_as_one() {
+        #[allow(clippy::panic)]
+        let result = run_like_main(|| panic!("boom"));
+        assert_eq!(result, Err("the command stopped unexpectedly".into()));
+    }
 
     #[cfg(unix)]
     #[test]
