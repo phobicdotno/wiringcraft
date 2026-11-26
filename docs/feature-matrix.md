@@ -99,14 +99,14 @@ For the other areas, the chapter to read in each help is:
 | Macro placeholders and value sets (one macro, several variants) | yes | partly | partly: `{{name}}` placeholders in a macro's device descriptions, parts, accessories and properties, wire cross-section, colour and type, and drawn texts, filled from a named value set chosen at insert (Insert > Macro, the assistant, `wiringcraft macro place --set`); a project macro's placeholders and value sets are edited in the app (Insert > Macro, Placeholders…), a renamed placeholder renamed in its texts | done (#272, #407) |
 | Auto-connect pins that line up | yes | yes | yes | done (#51) |
 | Scanned drawing as underlay to trace over | partly | partly | yes | done |
-| Layers / show-hide groups | yes | yes (DWG layers) | yes: PDF, DXF and SVG layers, editor layers (View → Layers) | done: show, hide and lock on the canvas, kept per user |
+| Layers / show-hide groups | yes | yes (DWG layers) | yes: PDF, DXF and SVG layers, editor layers (View → Layers) | done: show, hide and lock on the canvas (also by the assistant), kept per user |
 
 ## 3. Symbols and library
 
 | Function | EPLAN | SWE | WiringCraft | Triage |
 |---|---|---|---|---|
 | IEC symbol library | yes | yes | yes: own starter library | done |
-| Symbol editor (draw graphics, place and name pins) | yes | yes | yes: draw, move (drag or arrow keys) and change shapes, place pins, save to a library folder | done (#105, #159) |
+| Symbol editor (draw graphics, place and name pins) | yes | yes | yes: draw (lines, rectangles, circles, arcs, polylines that can be closed and filled, text), move (drag or arrow keys) and change shapes, place pins, save to a library folder | done (#105, #159) |
 | Import symbols from DXF / SVG | DXF/DWG | DWG | yes | done |
 | Import symbols from KiCad libraries | no | no | yes: every unit of a multi-unit symbol becomes a symbol of its own, also from a `.kicad_sym` inside a zip | done (#96) |
 | Import QElectroTech elements | no | no | yes: `.elmt` elements become symbols (`wiringcraft import symbol-qet`, Library → Import symbols) | done (#91) |
@@ -194,7 +194,7 @@ For the other areas, the chapter to read in each help is:
 
 | Function | EPLAN | SWE | WiringCraft | Triage |
 |---|---|---|---|---|
-| 2D mounting plate with rails and ducts | add-on (Pro Panel) | yes | yes: `panel rail <panel> --at x,y --length L` and `panel duct <panel> --at x,y --length L [--width W] [--vertical]` add one, `--remove N` takes one off, numbered as `panel show` lists them (#817) | done |
+| 2D mounting plate with rails and ducts | add-on (Pro Panel) | yes | yes: `panel rail <panel> --at x,y --length L` and `panel duct <panel> --at x,y --length L [--width W] [--vertical]` add one, `--remove N` takes one off, numbered as `panel show` lists them (#817); a panel layout's name and plate width and height are changed in its properties in the app (#894) | done |
 | Place devices onto rails from the schematic | add-on | yes | yes: `panel arrange`, or one device at a time with `panel device <panel> <tag> --at x,y [--rotate 90]` (or `--remove`); `panel show` lists each device with its place, size and turn (#507); `panel edit <panel> [--name ...] [--width W] [--height H]` renames a layout or changes its plate size, keeping rails, ducts and devices where they are and refusing a size that would leave any of them sticking out (#734) | done |
 | Maker outline drawings as device footprints | yes (2D macros of the part) | yes (2D footprint) | yes: `import footprint-dxf`, or Attach footprint drawing in the app's panel layout properties, stores a maker DXF with the part; layout pages in the app and the PDF draw it at real size (shrunk to fit a smaller device box), and a part without a `Width` or `Height` takes it from the drawing. A device can be turned in quarter steps (Rotate 90° in its properties, or R on the layout); its box, its drawing and its STEP block turn with it (#485) | done (#312, #485) |
 | 3D model export (STEP) | add-on | yes | yes | done |
