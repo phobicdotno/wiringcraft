@@ -420,7 +420,8 @@ enum Cmd {
         out: PathBuf,
     },
     /// Check the project for mistakes: devices drawn twice, contacts without a coil, shorted
-    /// potentials, open pins, wires ending in the air, devices without a part, plus the
+    /// potentials, open pins, wires ending in the air, wires with both ends on one pin,
+    /// devices without a part, plus the
     /// project's own `[[rule]]` tables in `project.toml` (a cable on every motor, a tag
     /// pattern, at most N wires on a terminal) and the house rules in each library source's
     /// `rules.toml`, less the ones `rules_off` turns off. Exits with an error when an error is

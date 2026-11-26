@@ -2869,3 +2869,27 @@ fn plc_card_overview_links_by_page_id_and_warns_on_points_and_shared_bytes() {
     };
     assert!(!plc_rack_warnings(&i).iter().any(|w| w.contains("slot 3")));
 }
+
+#[test]
+fn project_check_flags_a_wire_on_one_pin_at_both_ends() {
+    let (mut p, s, parts) = fixture();
+    p.pages[0]
+        .wires
+        .push(wire("w5", pin("s2", "13"), pin("s2", "13"), Some("7"), None));
+    p.pages[0]
+        .wires
+        .push(wire("w6", pin("s2", "13"), pin("s2", "14"), Some("8"), None));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found: Vec<_> = check(&i)
+        .into_iter()
+        .filter(|f| f.message.contains("starts and ends on"))
+        .collect();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].severity, Severity::Warning);
+    assert_eq!(found[0].message, "wire 7 starts and ends on =A+C1-K1:13");
+    assert_eq!(found[0].item.as_deref(), Some("w5"));
+}

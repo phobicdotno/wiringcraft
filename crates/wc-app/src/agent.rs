@@ -526,7 +526,7 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "run_check",
-            "Check the project: devices drawn twice, contacts without a coil, shorted potentials, open pins, wires ending in the air, devices without a part, then the check rules of the project's library sources (less the ones the project turns off) and the project's own check rules (see the rules tool).",
+            "Check the project: devices drawn twice, contacts without a coil, shorted potentials, open pins, wires ending in the air, wires with both ends on one pin, devices without a part, then the check rules of the project's library sources (less the ones the project turns off) and the project's own check rules (see the rules tool).",
             json!({}),
             &[],
         ),
