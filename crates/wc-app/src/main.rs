@@ -1499,6 +1499,8 @@ impl App {
                     self.ed.message = e;
                 }
                 self.ed.selection.clear();
+                // A wire being drawn may start on a pin the undo took away.
+                self.ed.wire = None;
                 return;
             }
             _ => {}
@@ -1532,6 +1534,8 @@ impl App {
                 let done = if a == Action::Undo { open.undo() } else { open.redo() };
                 if done {
                     self.ed.selection.clear();
+                    // A wire being drawn may start on a pin the undo took away.
+                    self.ed.wire = None;
                     if let Some(w) = open.take_step_warning() {
                         self.ed.message = format!("Done, but {w}.");
                     }

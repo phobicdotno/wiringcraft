@@ -9111,6 +9111,26 @@ mod tests {
     }
 
     #[test]
+    fn undo_and_redo_drop_a_wire_being_drawn() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        let id = open.place(1, "wc.lamp", wc_core::Point::new(50.0, 50.0)).unwrap();
+        // A wire started on the lamp's pin, then Undo takes the lamp away.
+        let start = wc_core::Endpoint::Pin {
+            item: id.clone(),
+            pin: "X1".into(),
+        };
+        a.ed.wire = Some((start.clone(), Vec::new()));
+        a.run(Action::Undo);
+        assert!(page2(&a).symbols.iter().all(|s| s.id != id), "the lamp is gone");
+        assert!(a.ed.wire.is_none(), "no wire left starting on the missing pin");
+        a.ed.wire = Some((start, Vec::new()));
+        a.run(Action::Redo);
+        assert!(page2(&a).symbols.iter().any(|s| s.id == id), "the lamp is back");
+        assert!(a.ed.wire.is_none(), "Redo drops the wire being drawn too");
+    }
+
+    #[test]
     fn undo_in_a_session_waits_while_an_assistant_command_owns_the_files() {
         let (_tmp, mut a) = app(vec![]);
         let open = a.open.as_mut().unwrap();
