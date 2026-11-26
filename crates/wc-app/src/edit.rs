@@ -930,7 +930,12 @@ fn free_spot(panel: &wc_core::panel::Panel, size: (f64, f64)) -> Option<Point> {
             .map(|(_, max)| max.x + GAP)
             .reduce(f64::max)
     };
-    let devices: Vec<(Point, Point)> = panel.items.iter().filter_map(PanelItem::device_bounds).collect();
+    // Devices and ducts: nothing is placed over either (#937).
+    let mut blocks: Vec<(Point, Point)> = panel.items.iter().filter_map(PanelItem::device_bounds).collect();
+    blocks.extend(panel.items.iter().filter_map(|i| match i {
+        PanelItem::Duct { min, max } => Some((*min, *max)),
+        _ => None,
+    }));
     let mut rails: Vec<(Point, f64)> = panel
         .items
         .iter()
@@ -943,8 +948,8 @@ fn free_spot(panel: &wc_core::panel::Panel, size: (f64, f64)) -> Option<Point> {
     for (at, length) in rails {
         let top = at.y - h / 2.0;
         let mut x = at.x;
-        // Past every device this outline would cover; each step moves right, so it ends.
-        while let Some(past) = covering(&devices, x, top) {
+        // Past every device and duct this outline would cover; each step moves right, so it ends.
+        while let Some(past) = covering(&blocks, x, top) {
             x = past;
         }
         if x + w <= at.x + length + eps && inside(x, top) {
@@ -952,11 +957,6 @@ fn free_spot(panel: &wc_core::panel::Panel, size: (f64, f64)) -> Option<Point> {
         }
     }
     // Off the rails: the highest, then leftmost, corner next to a device or duct that is free.
-    let mut blocks = devices;
-    blocks.extend(panel.items.iter().filter_map(|i| match i {
-        PanelItem::Duct { min, max } => Some((*min, *max)),
-        _ => None,
-    }));
     let mut xs: Vec<f64> = std::iter::once(0.0)
         .chain(blocks.iter().map(|(_, max)| max.x + GAP))
         .collect();
@@ -974,6 +974,24 @@ fn free_spot(panel: &wc_core::panel::Panel, size: (f64, f64)) -> Option<Point> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rail_spot_under_a_duct_is_passed_over() {
+        use wc_core::panel::{GAP, Panel, PanelItem};
+        let mut p = Panel::new("panel1", "Main", 200.0, 100.0);
+        p.items.push(PanelItem::Rail {
+            at: Point::new(0.0, 50.0),
+            length: 200.0,
+        });
+        // Unobstructed: at the rail's start, centred on it.
+        assert_eq!(free_spot(&p, (45.0, 80.0)), Some(Point::new(0.0, 10.0)));
+        // A duct over the rail's start: the device goes on the rail past it, not into it.
+        p.items.push(PanelItem::Duct {
+            min: Point::new(0.0, 0.0),
+            max: Point::new(60.0, 100.0),
+        });
+        assert_eq!(free_spot(&p, (45.0, 80.0)), Some(Point::new(60.0 + GAP, 10.0)));
+    }
 
     #[test]
     fn one_device_is_placed_on_the_plate_from_the_list_in_one_undo_step() {
