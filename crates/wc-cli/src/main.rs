@@ -437,13 +437,18 @@ enum Cmd {
         /// The structured text file to write, e.g. `GVL_IO.st`.
         out: PathBuf,
     },
-    /// Check the project for mistakes: devices drawn twice, contacts without a coil, shorted
-    /// potentials, open pins, wires ending in the air, wire numbers that do not name one
-    /// connection each, devices without a part, plus the project's own `[[rule]]` tables in
-    /// `project.toml` (a cable on every motor, a tag pattern, at most N wires on a terminal)
-    /// and the house rules in each library source's `rules.toml`, less the ones `rules_off`
-    /// turns off. Exits with an error when an error is found, so it can guard a commit or a CI
-    /// job.
+    /// Check the project for mistakes: revision clouds whose revision the project does not
+    /// list, revision letters the PDF cannot print, symbols missing from the project's library
+    /// copy and wires on pins that do not exist, devices drawn twice, more contacts than a
+    /// device's parts have, contacts without a coil, interruption points without a partner,
+    /// open pins, wires ending in the air, jumpers naming a terminal drawn nowhere, one cable
+    /// core on two connections, shorted potentials, wire numbers that do not name one
+    /// connection each, panel layouts with overlapping devices, devices sticking out of the
+    /// plate or no longer in the project, devices without a part, plus the project's own
+    /// `[[rule]]` tables in `project.toml` (a cable on every motor, a tag pattern, at most N
+    /// wires on a terminal) and the house rules in each library source's `rules.toml`, less the
+    /// ones `rules_off` turns off. Exits with an error when an error is found, so it can guard a
+    /// commit or a CI job.
     Check {
         /// Also list notes (open pins, devices without a part).
         #[arg(long)]
