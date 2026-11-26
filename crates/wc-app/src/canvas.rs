@@ -4102,6 +4102,7 @@ mod tests {
             zoom: 3.0,
             offset: Vec2::new(300.0, 300.0),
             fit: false,
+            ..View::default()
         };
         let (off, on) = (egui::pos2(40.0, 40.0), egui::pos2(500.0, 450.0));
         let wires = |o: &Open| o.project.pages[0].wires.len();
