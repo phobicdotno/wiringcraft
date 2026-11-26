@@ -6939,6 +6939,24 @@ mod tests {
         assert!(!load(&dir).unwrap().lock.symbols.contains_key("aa.good"));
         std::fs::remove_dir(&tmp_path).unwrap();
 
+        // A lock that cannot be written after both copies were taken puts them back, and the
+        // page is not saved.
+        let page_bytes =
+            std::fs::read(dir.join(store::PAGES_DIR).join(format!("{page}{}", store::PAGE_SUFFIX))).unwrap();
+        let lock_blocker = dir.join(format!("{}.tmp", store::LOCK_FILE));
+        std::fs::create_dir(&lock_blocker).unwrap();
+        cli(&dir, &args).unwrap_err();
+        std::fs::remove_dir(&lock_blocker).unwrap();
+        assert!(store::read_vendored_symbol(&dir, "aa.good").is_err(), "copy put back");
+        assert!(store::read_vendored_symbol(&dir, "zz.bad").is_err(), "copy put back");
+        let p = load(&dir).unwrap();
+        assert!(!p.lock.symbols.contains_key("aa.good"));
+        assert!(p.page(&page).is_some_and(|pg| pg.symbols.is_empty()), "page not saved");
+        assert_eq!(
+            std::fs::read(dir.join(store::PAGES_DIR).join(format!("{page}{}", store::PAGE_SUFFIX))).unwrap(),
+            page_bytes
+        );
+
         // And the retry pins both.
         cli(&dir, &args).unwrap();
         let p = load(&dir).unwrap();
