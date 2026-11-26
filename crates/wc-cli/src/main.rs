@@ -963,8 +963,26 @@ fn output_guard() -> Option<&'static wc_core::guard::ProjectFiles> {
 
 /// Write an output file the user named. Under [`output_guard`] the file is written so that it
 /// cannot land on a project file, a link swapped in after the app's own look included (#458).
+/// A failure names the file: the guarded write does that itself, a plain one is given it here.
 fn write_out(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
-    wc_core::guard::write_output(output_guard(), path.as_ref(), bytes)
+    let path = path.as_ref();
+    match output_guard() {
+        Some(g) => wc_core::guard::write_output(Some(g), path, bytes),
+        None => std::fs::write(path, bytes)
+            .map_err(|err| std::io::Error::new(err.kind(), format!("cannot write {}: {err}", path.display()))),
+    }
+}
+
+/// The bytes of the input file `path`; a failure names the file.
+fn read_file(path: impl AsRef<Path>) -> Res<Vec<u8>> {
+    let path = path.as_ref();
+    std::fs::read(path).map_err(|err| format!("cannot read {}: {err}", path.display()))
+}
+
+/// The text of the input file `path`; a failure names the file.
+fn read_text(path: impl AsRef<Path>) -> Res<String> {
+    let path = path.as_ref();
+    std::fs::read_to_string(path).map_err(|err| format!("cannot read {}: {err}", path.display()))
 }
 
 /// Make the output folder `out`; under [`output_guard`] a folder in the project is refused
@@ -2325,7 +2343,7 @@ fn run(cli: Cli) -> Res<()> {
         Cmd::Vcs(vc) => vcs_cmd(dir, vc)?,
         Cmd::Comment(cc) => comment_cmd(dir, cc)?,
         Cmd::Inspect { file } => {
-            let bytes = std::fs::read(&file).map_err(e)?;
+            let bytes = read_file(&file)?;
             let r = wc_import::archive::inspect(&bytes).map_err(e)?;
             println!("container: {}", r.container);
             let mut last = None;
@@ -2447,7 +2465,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             category,
             letter_code,
         } => {
-            let text = std::fs::read(&file).map_err(e)?;
+            let text = read_file(&file)?;
             let (mut s, warnings) =
                 wc_import::dxf::symbol_with_warnings(&String::from_utf8_lossy(&text), &id, &name).map_err(e)?;
             for w in &warnings {
@@ -2464,7 +2482,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             );
         }
         ImportCmd::FootprintDxf { file, part, lib } => {
-            let text = std::fs::read(&file).map_err(e)?;
+            let text = read_file(&file)?;
             let (footprint, warnings) = wc_import::dxf::footprint(&String::from_utf8_lossy(&text)).map_err(e)?;
             for w in &warnings {
                 eprintln!("warning: {}", escape_field(w));
@@ -2488,7 +2506,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             )?;
         }
         ImportCmd::ModelStep { file, part, lib } => {
-            let text = std::fs::read(&file).map_err(e)?;
+            let text = read_file(&file)?;
             let (size, warnings) = wc_import::step::model_size(&String::from_utf8_lossy(&text)).map_err(e)?;
             for w in &warnings {
                 eprintln!("warning: {}", escape_field(w));
@@ -2518,7 +2536,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             category,
             letter_code,
         } => {
-            let text = std::fs::read_to_string(&file).map_err(e)?;
+            let text = read_text(&file)?;
             let mut s = wc_import::svg::symbol(&text, &id, &name).map_err(e)?;
             s.category = category;
             s.letter_code = letter_code;
@@ -2537,7 +2555,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             scale,
             category,
         } => {
-            let text = std::fs::read_to_string(&file).map_err(e)?;
+            let text = read_text(&file)?;
             let prefix = prefix.unwrap_or_else(|| kicad_prefix(&file.to_string_lossy()));
             import_kicad(&text, &lib, &prefix, scale, &category)?;
         }
@@ -2574,7 +2592,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
         }
         ImportCmd::PlcCsv { file } => {
             let mut p = load(dir)?;
-            let bytes = std::fs::read(&file).map_err(e)?;
+            let bytes = read_file(&file)?;
             let (rows, warnings) = wc_import::csv::file_rows(&bytes)
                 .and_then(|rows| wc_import::csv::plc_addresses_from_rows(&rows))
                 .map_err(e)?;
@@ -2613,7 +2631,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             println!("imported {n} part(s) into {}", lib.display());
         }
         ImportCmd::PartsCsv { file, lib } => {
-            let bytes = std::fs::read(&file).map_err(e)?;
+            let bytes = read_file(&file)?;
             let (parts, warnings) = wc_import::csv::file_rows(&bytes)
                 .and_then(|rows| wc_import::csv::parts_from_rows(&rows))
                 .map_err(e)?;
@@ -2801,7 +2819,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
         }
         ImportCmd::Aml { file, first_page } => {
             let mut p = load(dir)?;
-            let text = std::fs::read(&file).map_err(e)?;
+            let text = read_file(&file)?;
             let imp = wc_import::aml::parse(&String::from_utf8_lossy(&text)).map_err(e)?;
             for w in &imp.warnings {
                 eprintln!("warning: {}", escape_field(w));
@@ -2823,7 +2841,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
         }
         ImportCmd::Archive { file, first_page, lib } => {
             use wc_import::archive::Kind;
-            let bytes = std::fs::read(&file).map_err(e)?;
+            let bytes = read_file(&file)?;
             let entries = wc_import::archive::open_entries(
                 &bytes,
                 &[
@@ -3018,7 +3036,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             let mut p = load(dir)?;
             let lib = wc_library::Library::open(dir, &p).map_err(e)?;
             let known: std::collections::BTreeSet<String> = lib.index(ItemKind::Symbol).into_keys().collect();
-            let text = std::fs::read(&file).map_err(e)?;
+            let text = read_file(&file)?;
             let imported = wc_import::dxf::page(&String::from_utf8_lossy(&text), scale, &known).map_err(e)?;
             for w in &imported.warnings {
                 eprintln!("warning: {}", escape_field(w));
@@ -3315,7 +3333,7 @@ fn warn_report_layouts(inputs: &wc_report::Inputs<'_>) {
 /// staging file), already escaped with [`escape_field`] by the caller.
 fn import_pdf(dir: &Path, file: &Path, first_page: usize, source: &str) -> Result<(), String> {
     let mut p = load(dir)?;
-    let bytes = std::fs::read(file).map_err(e)?;
+    let bytes = read_file(file)?;
     let traced = wc_import::pdf::pages(&bytes).map_err(e)?;
     let stem = file
         .file_stem()
@@ -3901,7 +3919,7 @@ fn import_wago(dir: &Path, file: &Path) -> Res<WagoImported> {
 /// Import a BMEcat catalogue's parts into a library folder. Files that are not UTF-8 are read
 /// as Latin-1, which BMEcat 1.2 catalogues often declare. Returns the count and warnings.
 fn import_bmecat(file: &Path, lib: &Path) -> Res<(usize, Vec<String>)> {
-    let bytes = std::fs::read(file).map_err(e)?;
+    let bytes = read_file(file)?;
     let (parts, warnings) = wc_import::bmecat::parts(&wc_import::csv::decode(&bytes)).map_err(e)?;
     for p in &parts {
         wc_library::write_part(lib, p).map_err(e)?;
