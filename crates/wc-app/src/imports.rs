@@ -810,6 +810,23 @@ pub(crate) mod tests {
         assert_eq!(shapes, 1, "{msg}");
     }
 
+    /// File > Import > DWG drawing reads the page with WiringCraft's own DWG reader, so no
+    /// converter is needed (#629).
+    #[test]
+    fn a_dwg_drawing_goes_onto_the_current_page_without_a_converter() {
+        // An AutoCAD 2010 drawing with a line, a circle and a text (see wc-cli's DWG page test).
+        const PAGE_DWG: &[u8] = include_bytes!("../../wc-cli/tests/data/page.dwg");
+        let (tmp, mut open) = project();
+        let page = open.add_page();
+        let dwg = tmp.path().join("plan.dwg");
+        assert!(std::fs::write(&dwg, PAGE_DWG).is_ok());
+        let (done, msg) = import(&mut open, Kind::PageDwg, &dwg, None, page);
+        assert!(done, "{msg}");
+        assert!(msg.contains("read with WiringCraft's own DWG reader"), "{msg}");
+        let shapes = open.project.pages.get(page).map_or(0, |pg| pg.graphics.len());
+        assert!(shapes >= 3, "{msg}");
+    }
+
     /// A DXF drawing with one line from the origin to x = 10.
     const DXF_LINE: &str = "0\nSECTION\n2\nENTITIES\n0\nLINE\n8\n0\n10\n0\n20\n0\n11\n10\n21\n0\n0\nENDSEC\n0\nEOF\n";
 

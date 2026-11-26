@@ -40,7 +40,8 @@ fn devices_without_a_depth_are_named_in_a_warning() -> TestResult {
     wc_library::write_part(&lib, &part)?;
     run(&dir, &["lib", "add", "shop", "folder", lib.to_str().ok_or("path")?])?;
     run(&dir, &["device", "--part", "maker.contactor", "--", "-K1"])?;
-    run(&dir, &["device", "--", "-K2"])?;
+    // `device <tag>` alone prints the device, so give -K2 a description to add it without a part.
+    run(&dir, &["device", "--description", "Spare relay", "--", "-K2"])?;
     run(&dir, &["panel", "new", "main"])?;
     run(&dir, &["panel", "device", "main", "-K1", "--at", "50,50"])?;
     run(&dir, &["panel", "device", "main", "-K2", "--at", "150,50"])?;

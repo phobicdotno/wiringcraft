@@ -102,9 +102,10 @@ pub struct Editor {
     pub panel: Option<usize>,
     /// The device item picked in the panel view, by index into the panel's items.
     pub panel_pick: Option<usize>,
-    /// A device being dragged in the panel view: the grab offset and whether the undo
-    /// checkpoint was taken.
-    pub panel_drag: Option<(Point, bool)>,
+    /// A device being dragged in the panel view: the grab offset, the undo history count
+    /// right after the drag's checkpoint (`None` until it is taken), and where the device was
+    /// when the drag started (Escape puts it back there).
+    pub panel_drag: Option<(Point, Option<u64>, Point)>,
     /// Wire pins that line up when a symbol is placed or moved (the app sets it from the
     /// preferences). Holding Alt skips it once.
     pub auto_wire: bool,
@@ -376,8 +377,11 @@ fn convex(pts: &[Pos2]) -> bool {
 /// cut in along a bridge (its two sides on top of each other) comes out right too.
 fn triangulate(pts: &[Pos2]) -> Vec<[u32; 3]> {
     let cross = |o: Pos2, a: Pos2, b: Pos2| (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
-    let area: f32 = (0..pts.len())
-        .map(|i| cross(Pos2::ZERO, pts[i], pts[(i + 1) % pts.len()]))
+    // Summed in f64 (each f32 product is exact there), so the winding does not cancel out.
+    let area: f64 = pts
+        .iter()
+        .zip(pts.iter().cycle().skip(1))
+        .map(|(a, b)| f64::from(a.x) * f64::from(b.y) - f64::from(a.y) * f64::from(b.x))
         .sum();
     let turn = if area >= 0.0 { 1.0 } else { -1.0 };
     let mut idx: Vec<usize> = (0..pts.len()).collect();
@@ -423,6 +427,50 @@ fn triangulate(pts: &[Pos2]) -> Vec<[u32; 3]> {
     out
 }
 
+/// The outline of a filled polyline in drawing millimetres, as the key of [`TriCache`]: the same
+/// points give the same key, so any edit, replaced shape or reloaded symbol misses the cache.
+#[derive(Clone, Copy)]
+struct FillKey<'a>(&'a [Point]);
+
+impl std::hash::Hash for FillKey<'_> {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        for q in self.0 {
+            q.x.to_bits().hash(h);
+            q.y.to_bits().hash(h);
+        }
+    }
+}
+
+#[derive(Default)]
+struct Triangulator;
+
+impl egui::util::cache::ComputerMut<FillKey<'_>, std::sync::Arc<[[u32; 3]]>> for Triangulator {
+    fn compute(&mut self, key: FillKey<'_>) -> std::sync::Arc<[[u32; 3]]> {
+        #[cfg(test)]
+        TRIANGULATIONS.with(|n| n.set(n.get() + 1));
+        // In millimetres, not screen pixels, so panning and zooming keep the cached triangles.
+        // Taken from the first point (in f64), so an outline far from the sheet origin keeps
+        // its precision in f32.
+        let o = key.0.first().copied().unwrap_or_default();
+        let pts: Vec<Pos2> = key
+            .0
+            .iter()
+            .map(|q| Pos2::new((q.x - o.x) as f32, (q.y - o.y) as f32))
+            .collect();
+        triangulate(&pts).into()
+    }
+}
+
+/// Triangles of the filled polylines painted last frame, so a large fill is not cut up again on
+/// every frame. Shapes not painted in a frame drop out.
+type TriCache = egui::util::cache::FrameCache<std::sync::Arc<[[u32; 3]]>, Triangulator>;
+
+#[cfg(test)]
+thread_local! {
+    /// How many fills this thread has triangulated (the cache's misses), for tests.
+    static TRIANGULATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) fn paint_shape(p: &egui::Painter, xf: &Xf, s: &Shape, stroke: Stroke) {
     match s {
         Shape::Dimension { .. } => {
@@ -445,7 +493,10 @@ pub(crate) fn paint_shape(p: &egui::Painter, xf: &Xf, s: &Shape, stroke: Stroke)
                 for p in &pts {
                     mesh.colored_vertex(*p, stroke.color);
                 }
-                for [a, b, c] in triangulate(&pts) {
+                let tris = p
+                    .ctx()
+                    .memory_mut(|m| m.caches.cache::<TriCache>().get(FillKey(points)));
+                for &[a, b, c] in tris.iter() {
                     mesh.add_triangle(a, b, c);
                 }
                 p.add(EShape::mesh(mesh));
@@ -3997,6 +4048,78 @@ mod tests {
             })
             .sum();
         assert!((area - 3.0).abs() < 1e-5, "covers the L exactly: {area}");
+    }
+
+    #[test]
+    fn a_filled_outline_is_cut_into_triangles_once_until_it_changes() {
+        let ell = |w: f64| Shape::Polyline {
+            points: [(0.0, 0.0), (w, 0.0), (w, 1.0), (1.0, 1.0), (1.0, 2.0), (0.0, 2.0)]
+                .iter()
+                .map(|(x, y)| Point::new(*x, *y))
+                .collect(),
+            closed: true,
+            filled: true,
+        };
+        let ctx = egui::Context::default();
+        let xf = Xf {
+            origin: Pos2::ZERO,
+            zoom: 4.0,
+        };
+        let paint = |s: &Shape| {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                let p = ctx.layer_painter(egui::LayerId::background());
+                paint_shape(&p, &xf, s, Stroke::new(1.0_f32, Color32::BLACK));
+            });
+        };
+        let runs = || TRIANGULATIONS.with(|n| n.get());
+        let start = runs();
+        paint(&ell(2.0));
+        paint(&ell(2.0));
+        paint(&ell(2.0));
+        assert_eq!(runs() - start, 1, "an unchanged fill reuses its triangles");
+        paint(&ell(3.0));
+        assert_eq!(runs() - start, 2, "a changed fill is cut up again");
+        paint(&ell(3.0));
+        assert_eq!(runs() - start, 2);
+    }
+
+    #[test]
+    fn a_clockwise_outline_far_from_the_origin_fills_the_outline_not_its_notch() {
+        // A clockwise L near (10000, 10000) mm: the notch is the square 10001..10002 on both axes.
+        let pts: Vec<Point> = [
+            (10000.0, 10002.0),
+            (10001.0, 10002.0),
+            (10001.0, 10001.0),
+            (10002.0, 10001.0),
+            (10002.0, 10000.0),
+            (10000.0, 10000.0),
+        ]
+        .iter()
+        .map(|(x, y)| Point::new(*x, *y))
+        .collect();
+        let tris = egui::util::cache::ComputerMut::compute(&mut Triangulator, FillKey(&pts));
+        let at = |i: u32| {
+            let q = pts[i as usize];
+            (q.x - 10000.0, q.y - 10000.0)
+        };
+        let inside = |(x, y): (f64, f64), &[a, b, c]: &[u32; 3]| {
+            let (a, b, c) = (at(a), at(b), at(c));
+            let s = |p: (f64, f64), r: (f64, f64)| (r.0 - p.0) * (y - p.1) - (r.1 - p.1) * (x - p.0);
+            let (d1, d2, d3) = (s(a, b), s(b, c), s(c, a));
+            (d1 > 0.0 && d2 > 0.0 && d3 > 0.0) || (d1 < 0.0 && d2 < 0.0 && d3 < 0.0)
+        };
+        for q in [(0.37, 0.71), (1.63, 0.29), (0.29, 1.63)] {
+            assert!(tris.iter().any(|t| inside(q, t)), "{q:?} is filled");
+        }
+        assert!(!tris.iter().any(|t| inside((1.43, 1.61), t)), "the notch is not filled");
+        let area: f64 = tris
+            .iter()
+            .map(|&[a, b, c]| {
+                let (a, b, c) = (at(a), at(b), at(c));
+                ((b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)).abs() / 2.0
+            })
+            .sum();
+        assert!((area - 3.0).abs() < 1e-6, "covers the L exactly: {area}");
     }
 
     use wc_core::project::Endpoint;

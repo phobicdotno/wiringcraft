@@ -254,6 +254,7 @@ fn svg_texts_keep_their_spaces() {
         size_mm: (100.0, 100.0),
         prims: pen.prims,
         pictures: Vec::new(),
+        panel: false,
     };
     let s = svg(&page);
     let Some(text) = s.lines().find(|l| l.starts_with("<text")) else {
