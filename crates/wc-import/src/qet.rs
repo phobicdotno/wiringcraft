@@ -92,6 +92,22 @@ fn filled(e: &BytesStart) -> bool {
     })
 }
 
+/// Whether an ellipse or polygon comes in solid: WiringCraft fills in the line colour, so only
+/// a dark filling is kept. `white`, light grey and the hatch patterns stay hollow, as does `none`.
+fn solid_fill(e: &BytesStart) -> bool {
+    attr(e, "style").is_some_and(|s| {
+        s.split(';').any(|kv| {
+            kv.split_once(':').is_some_and(|(k, v)| {
+                k.trim() == "filling"
+                    && !matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "" | "none" | "white" | "lightgray" | "hor" | "ver" | "bdiag" | "fdiag"
+                    )
+            })
+        })
+    })
+}
+
 /// Points on the ellipse in the box (`x`, `y`, `w`, `h`), from `start` sweeping `sweep` degrees
 /// counter-clockwise on screen (Qt's convention, 0 at three o'clock).
 fn ellipse_points(x: f64, y: f64, w: f64, h: f64, start: f64, sweep: f64) -> Vec<Point> {
@@ -354,7 +370,7 @@ fn shape(
                         graphics.push(Shape::Polyline {
                             points,
                             closed: true,
-                            filled: filled(e),
+                            filled: solid_fill(e),
                         });
                     }
                 }
@@ -405,7 +421,7 @@ fn shape(
             }
             let closed = attr(e, "closed").is_none_or(|c| c != "false");
             // A filled shape has no open side, so it is drawn closed whatever `closed` says.
-            let fill = filled(e);
+            let fill = solid_fill(e);
             match points.as_slice() {
                 [a, b] if !closed => graphics.push(Shape::Line { a: *a, b: *b }),
                 [_, _, ..] => graphics.push(Shape::Polyline {
@@ -575,6 +591,8 @@ mod tests {
 <polygon x1="10" y1="0" x2="14" y2="0" x3="12" y3="4" style="filling:none"/>
 <ellipse x="-6" y="-3" width="12" height="6" style="filling:black"/>
 <ellipse x="-6" y="7" width="12" height="6" style="filling:none"/>
+<polygon x1="20" y1="0" x2="24" y2="0" x3="22" y3="4" style="filling:white"/>
+<ellipse x="-6" y="17" width="12" height="6" style="filling:white"/>
 <terminal x="0" y="0" orientation="n"/>
 </description></definition>"#;
         let (imp, _) = element(el, "qet.filled", 1.0)?;
@@ -593,6 +611,8 @@ mod tests {
                 (3, true, true),
                 (3, true, false),
                 (ELLIPSE_STEPS, true, true),
+                (ELLIPSE_STEPS, true, false),
+                (3, true, false),
                 (ELLIPSE_STEPS, true, false)
             ]
         );
