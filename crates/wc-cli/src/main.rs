@@ -1854,7 +1854,9 @@ fn run(cli: Cli) -> Res<()> {
     // Input on stdin is read before the lock is taken: in a pipe from another command on the
     // same project, waiting for the lock before reading would hold both up for good.
     let mut stdin_text = match &cli.cmd {
-        Cmd::Rules(RulesCmd::Set { file }) if file.as_os_str() == "-" => {
+        Cmd::Rules(RulesCmd::Set { file }) | Cmd::ReportLayout(ReportLayoutCmd::Set { file, .. })
+            if file.as_os_str() == "-" =>
+        {
             Some(std::io::read_to_string(std::io::stdin()).map_err(|err| format!("stdin: {err}"))?)
         }
         _ => None,
@@ -2768,7 +2770,7 @@ fn run(cli: Cli) -> Res<()> {
                 }
             }
         }
-        Cmd::ReportLayout(rc) => report_layout(dir, rc)?,
+        Cmd::ReportLayout(rc) => report_layout(dir, rc, stdin_text.take())?,
         Cmd::Jumper(jc) => {
             let mut p = load(dir)?;
             match jc {
@@ -4371,8 +4373,9 @@ fn report_kinds(names: &[String]) -> Result<Vec<wc_report::Kind>, String> {
 }
 
 /// `wiringcraft report-layout`: print, replace or reset report layouts, keeping them as the
-/// report layout dialog and the assistant's `report_layouts` tool do.
-fn report_layout(dir: &Path, cmd: ReportLayoutCmd) -> Res<()> {
+/// report layout dialog and the assistant's `report_layouts` tool do. `stdin` is what was read
+/// from standard input for `set <kind> -`, when it already was.
+fn report_layout(dir: &Path, cmd: ReportLayoutCmd, stdin: Option<String>) -> Res<()> {
     use wc_core::report_layout::ReportLayout;
     let one = |name: &str| -> Res<wc_report::Kind> {
         match report_kinds(&[name.to_owned()])?.as_slice() {
@@ -4440,10 +4443,12 @@ fn report_layout(dir: &Path, cmd: ReportLayoutCmd) -> Res<()> {
         }
         ReportLayoutCmd::Set { kind, file } => {
             let kind = one(&kind)?;
-            let text = if file.as_os_str() == "-" {
-                std::io::read_to_string(std::io::stdin()).map_err(|err| format!("stdin: {err}"))?
-            } else {
-                std::fs::read_to_string(&file).map_err(|err| format!("{}: {err}", file.display()))?
+            let text = match stdin {
+                Some(text) if file.as_os_str() == "-" => text,
+                _ if file.as_os_str() == "-" => {
+                    std::io::read_to_string(std::io::stdin()).map_err(|err| format!("stdin: {err}"))?
+                }
+                _ => std::fs::read_to_string(&file).map_err(|err| format!("{}: {err}", file.display()))?,
             };
             let name = if file.as_os_str() == "-" {
                 "stdin".to_owned()
