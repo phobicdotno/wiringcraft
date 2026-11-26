@@ -2129,6 +2129,17 @@ fn run(cli: Cli) -> Res<()> {
                 // The points stay (renamed as asked), each kept on its edge of the new size.
                 wc_core::box_edit::kept_pins(&old_pins, &renamed, width, height)
             };
+            // Every rename lands on a point of the new list, a name kept as it is (`A=A`) too: else
+            // the point would be taken off and its wires cut loose.
+            if let Some(to) = renamed
+                .values()
+                .find(|to| !pins.iter().any(|b| b.name.trim() == to.as_str()))
+            {
+                return Err(format!(
+                    "the box has no connection point {} to rename a point to",
+                    escape_field(to)
+                ));
+            }
             let page_index = p
                 .pages
                 .iter()
@@ -8876,6 +8887,19 @@ mod tests {
         assert!(cli(&dir, &["box-edit", "p1", "s1", "--size=10,-1"]).is_err());
         assert!(cli(&dir, &["box-edit", "p1", "s1", "--rename", "IN=Z", "--rename", "Q=Z"]).is_err());
         assert!(cli(&dir, &["box-edit", "p1", "w1", "--size", "5,5"]).is_err());
+        // A point kept under its own name must be in the new list too.
+        let args = [
+            "box-edit",
+            "p1",
+            "s1",
+            "--rename",
+            "A=A",
+            "--pin",
+            "IN:left:5",
+            "--pin",
+            "Q:right:5",
+        ];
+        assert!(cli(&dir, &args).is_err());
         assert_eq!(layout(), before);
         assert_eq!(load(&dir).unwrap().page("p1").unwrap().wires.len(), 3);
         // A swap of two names is fine: each wire follows its point.
@@ -8885,6 +8909,18 @@ mod tests {
         let p = load(&dir).unwrap();
         let ends: Vec<Endpoint> = p.page("p1").unwrap().wires.iter().map(|w| w.from.clone()).collect();
         assert_eq!(ends[..2], [pin("Q"), pin("IN")]);
+
+        // An edit that changes nothing writes nothing: a page file laid out by hand keeps its bytes.
+        let page_file = dir.join(store::PAGES_DIR).join(format!("p1{}", store::PAGE_SUFFIX));
+        let by_hand = format!("{}\n\n", std::fs::read_to_string(&page_file).unwrap());
+        std::fs::write(&page_file, &by_hand).unwrap();
+        let files = snapshot_project(&dir, &[], &[]).unwrap();
+        cli(&dir, &["box-edit", "p1", "s1"]).unwrap();
+        cli(&dir, &["box-edit", "p1", "s1", "--rename", "A=A"]).unwrap();
+        for (path, was) in &files {
+            assert_eq!(std::fs::read(path).ok(), *was, "{} unchanged", path.display());
+        }
+        assert_eq!(std::fs::read_to_string(&page_file).unwrap(), by_hand);
 
         // One point renamed twice is refused; `--clear-pins` cannot go with `--pin`.
         assert!(cli(&dir, &["box-edit", "p1", "s1", "--rename", "Q=Z", "--rename", "Q=Y"]).is_err());

@@ -400,11 +400,17 @@ mod tests {
         let pins = [pin("A", BoxSide::Top, 20.0), pin("B", BoxSide::Right, 0.0)];
         assert!(plan(&p, &sym, &edit((20.0, 10.0), &pins, &r, &d)).is_err());
         assert!(plan(&p, &sym, &edit((0.0, 10.0), &[], &r, &d)).is_err());
-        let r: BTreeMap<String, String> = [("A".into(), "Q".into())].into();
+        let bad_rename: BTreeMap<String, String> = [("A".into(), "Q".into())].into();
         let pins = [pin("A", BoxSide::Left, 5.0)];
-        assert!(plan(&p, &sym, &edit((20.0, 10.0), &pins, &r, &d)).is_err());
-        let mut e = edit((20.0, 10.0), &pins, &r, &d);
+        let err = plan(&p, &sym, &edit((20.0, 10.0), &pins, &bad_rename, &d)).err();
+        assert!(err.is_some_and(|e| e.to_string().contains("no connection point Q")));
+        // A valid edit of a box that is not on the page.
+        let mut e = edit((30.0, 10.0), &pins, &r, &d);
         e.item = "nope";
-        assert!(plan(&p, &sym, &e).is_err());
+        let err = plan(&p, &sym, &e).err();
+        assert!(
+            err.as_ref().is_some_and(|e| e.to_string().contains("no box nope")),
+            "{err:?}"
+        );
     }
 }
