@@ -422,3 +422,31 @@ fn a_failed_write_leaves_the_exclude_list_as_it_was() -> Result<()> {
     assert_eq!(after, before);
     Ok(())
 }
+
+#[test]
+fn a_name_that_starts_with_a_dash_is_never_a_git_option() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    store::create(dir, "Demo")?;
+    let git = Git::new(dir);
+    git.init()?;
+    let head = git.head();
+    assert!(git.switch("--detach").is_err(), "no such branch");
+    assert_eq!(git.current_branch().as_deref(), Some("main"), "HEAD is not detached");
+    assert!(git.merge("--abort").is_err(), "no such branch");
+    assert!(git.revert("--abort").is_err(), "no such version");
+    assert!(git.author_and_subject("--output=log").is_err(), "no such version");
+    assert!(git.create_branch("-x").is_err(), "not a branch name");
+    assert_eq!(git.show("--output=shown", "project.json"), None, "no such version");
+    assert_eq!(git.head(), head, "nothing was recorded");
+    let names: Vec<String> = std::fs::read_dir(dir)
+        .map_err(|e| wc_core::Error::io("read", e))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !names.iter().any(|n| n.starts_with("shown") || n.starts_with("log")),
+        "git wrote no file: {names:?}"
+    );
+    Ok(())
+}
