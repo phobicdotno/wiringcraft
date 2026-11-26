@@ -998,11 +998,19 @@ impl App {
             return;
         }
         let Some(open) = self.open.as_ref() else { return };
+        let mut form = imports::Form::new(open, kind, file);
+        // The library folders a parts import offers; without the project's library list only
+        // another folder can be chosen.
+        if form.has(imports::Opt::Library)
+            && let Ok(library) = wc_library::Library::open(&open.dir, &open.project)
+        {
+            form.libraries = library_targets(&library, open);
+        }
         self.dialog = Some(Dialog::ImportOptions {
             file: file.to_path_buf(),
             lib: lib.map(Path::to_path_buf),
             target,
-            form: Box::new(imports::Form::new(open, kind, file)),
+            form: Box::new(form),
             error: None,
         });
     }
@@ -1092,10 +1100,18 @@ impl App {
         // a new folder chosen outside the library list.
         let source = match (target, lib.as_deref()) {
             (Some(t), _) => t.declare,
-            (None, Some(l)) if kind.needs_library() => new_folder_source(&open.dir, l, &open.project.meta.libraries),
+            (None, Some(l)) if kind.needs_library() || kind == imports::Kind::Archive => {
+                new_folder_source(&open.dir, l, &open.project.meta.libraries)
+            }
             (None, _) => None,
         };
-        if done && let Some(source) = source {
+        // An archive may hold no symbol library or parts list: its folder is listed only once
+        // something was written there.
+        let written = kind.needs_library() || lib.as_deref().is_some_and(Path::is_dir);
+        if done
+            && written
+            && let Some(source) = source
+        {
             open.checkpoint();
             open.project.meta.libraries.insert(0, source);
             open.dirty = true;
@@ -3407,6 +3423,45 @@ impl App {
                                 ui.end_row();
                             }
                         }
+                        if form.has(imports::Opt::Library) {
+                            ui.label("Symbol libraries and parts lists").on_hover_text(
+                                "KiCad symbol libraries and parts lists inside the archive go into a library folder; without one they are listed, not imported",
+                            );
+                            egui::ComboBox::from_id_salt("import_archive_lib")
+                                .selected_text(form.library_label(form.library))
+                                .show_ui(ui, |ui| {
+                                    for k in 0..=form.libraries.len() + 1 {
+                                        let label = form.library_label(k);
+                                        ui.selectable_value(&mut form.library, k, label);
+                                    }
+                                });
+                            ui.end_row();
+                            if form.other_library() {
+                                ui.label("");
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut form.library_folder.text)
+                                            .hint_text("library folder")
+                                            .desired_width(300.0),
+                                    );
+                                    if ui.button("Browse…").clicked() {
+                                        let picked = if form.library_folder.is_empty() {
+                                            pick_folder("Library folder", &file.display().to_string())
+                                        } else {
+                                            pick_folder_for("Library folder", &form.library_folder)
+                                        };
+                                        match picked {
+                                            Picked::Path(d) => *error = form.library_folder.pick(d).err(),
+                                            Picked::Failed(e) | Picked::Unsure(e) => {
+                                                *error = Some(format!("{e} Type the library folder instead."));
+                                            }
+                                            Picked::Cancelled => {}
+                                        }
+                                    }
+                                });
+                                ui.end_row();
+                            }
+                        }
                         if form.has(imports::Opt::SymbolMap) {
                             ui.label("Symbol map").on_hover_text(
                                 "Optional: a text file with one `source name = symbol id` per line, which gives a source block or macro a library symbol",
@@ -3438,7 +3493,11 @@ impl App {
                         if ui.button("Import").clicked() {
                             match form.options() {
                                 Ok(options) => {
-                                    let (kind, f, l, target) = (form.kind, file.clone(), lib.clone(), target.clone());
+                                    // An archive's library folder is chosen here, a parts
+                                    // import's before the file.
+                                    let l = options.lib.clone().or_else(|| lib.clone());
+                                    let target = form.library_target().cloned().or_else(|| target.clone());
+                                    let (kind, f) = (form.kind, file.clone());
                                     then = Some(Box::new(move |app: &mut App| {
                                         app.import_from(kind, &f, l.as_deref(), target, &options);
                                     }));

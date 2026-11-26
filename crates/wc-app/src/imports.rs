@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use wc_import::run;
 
 use crate::actions::Action;
+use crate::import_symbols::ImportTarget;
 use crate::state::Open;
 
 /// The formats File > Import offers.
@@ -114,6 +115,9 @@ pub enum Opt {
     /// A text file that says which library symbol to draw for which source block or macro
     /// (`--symbol-map`).
     SymbolMap,
+    /// The library folder an archive's KiCad symbol libraries and parts lists go into
+    /// (`--lib`).
+    Library,
 }
 
 impl Kind {
@@ -123,7 +127,8 @@ impl Kind {
             Kind::PageDwg | Kind::PageDxf => &[Opt::Scale],
             Kind::Swe => &[Opt::Project, Opt::FirstPage, Opt::SymbolMap],
             Kind::PartsEdz => &[Opt::SymbolMap],
-            Kind::Eplan | Kind::Aml | Kind::Pdf | Kind::Archive => &[Opt::FirstPage],
+            Kind::Archive => &[Opt::FirstPage, Opt::Library],
+            Kind::Eplan | Kind::Aml | Kind::Pdf => &[Opt::FirstPage],
             _ => &[],
         }
     }
@@ -144,6 +149,9 @@ pub struct Options {
     pub pick: usize,
     /// The symbol map file of a SolidWorks Electrical or EDZ import; none by default.
     pub symbol_map: Option<PathBuf>,
+    /// The library folder an archive's KiCad symbol libraries and parts lists are imported
+    /// into. None, the default: they are listed with a warning, not imported.
+    pub lib: Option<PathBuf>,
 }
 
 impl Default for Options {
@@ -154,6 +162,7 @@ impl Default for Options {
             keep_numbers: false,
             pick: 1,
             symbol_map: None,
+            lib: None,
         }
     }
 }
@@ -174,6 +183,14 @@ pub struct Form {
     pub project: usize,
     /// The symbol map file, typed or picked with Browse; empty: none.
     pub symbol_map: crate::prefs::FolderField,
+    /// Archive: the project's library folders its KiCad symbol libraries and parts lists can go
+    /// into, as a parts import offers them; filled in by the app.
+    pub libraries: Vec<ImportTarget>,
+    /// Archive: 0 for not importing them (the command line without `--lib`), then the folders
+    /// of `libraries` counted from 1, then one more for another folder.
+    pub library: usize,
+    /// Archive: the other folder, typed or picked with Browse.
+    pub library_folder: crate::prefs::FolderField,
 }
 
 /// The projects of the SolidWorks Electrical archive `file` as the options dialog lists them.
@@ -209,12 +226,36 @@ impl Form {
             },
             project: 0,
             symbol_map: crate::prefs::FolderField::default(),
+            libraries: Vec::new(),
+            library: 0,
+            library_folder: crate::prefs::FolderField::default(),
         }
     }
 
     /// Whether the form shows `opt`. An archive with one project has no project to choose.
     pub fn has(&self, opt: Opt) -> bool {
         self.kind.options().contains(&opt) && (opt != Opt::Project || self.projects.len() > 1)
+    }
+
+    /// What the library choice `k` is called in the dialog.
+    pub fn library_label(&self, k: usize) -> String {
+        match k.checked_sub(1) {
+            None => "Do not import them".to_owned(),
+            Some(i) => self
+                .libraries
+                .get(i)
+                .map_or_else(|| "Another folder…".to_owned(), ImportTarget::label),
+        }
+    }
+
+    /// The project library folder chosen for an archive, if one is.
+    pub fn library_target(&self) -> Option<&ImportTarget> {
+        self.library.checked_sub(1).and_then(|i| self.libraries.get(i))
+    }
+
+    /// Another folder than the project's library folders is chosen for an archive.
+    pub fn other_library(&self) -> bool {
+        self.has(Opt::Library) && self.library > self.libraries.len()
     }
 
     /// What was typed, as the import's options, or what to correct.
@@ -244,6 +285,18 @@ impl Form {
                     .map_err(|_| "The first page number must be a whole number, for example 100.".to_owned())?;
                 o.first_page = Some(n);
             }
+        }
+        if self.has(Opt::Library) && self.library > 0 {
+            o.lib = Some(match self.library_target() {
+                Some(t) => t.root.clone(),
+                None if self.library_folder.is_empty() => {
+                    return Err(
+                        "Type or pick the library folder for the symbol libraries and parts lists, or choose not to import them."
+                            .to_owned(),
+                    );
+                }
+                None => self.library_folder.path()?,
+            });
         }
         if self.has(Opt::SymbolMap) && !self.symbol_map.is_empty() {
             let map = self.symbol_map.path()?;
@@ -349,7 +402,7 @@ pub fn start(open: &mut Open, kind: Kind, file: &Path, lib: Option<&Path>, page:
         kind,
         name,
         dir: open.dir.clone(),
-        lib: lib.map(Path::to_path_buf),
+        lib: lib.map(Path::to_path_buf).or_else(|| options.lib.clone()),
         note,
         adopt,
         lines,
@@ -420,7 +473,8 @@ fn project_work(open: &Open, kind: Kind, f: PathBuf, page: usize, options: &Opti
         }
         Kind::Archive => {
             let n = first()?;
-            Box::new(move |log| run::archive(&dir, &f, n, None, log))
+            let lib = options.lib.clone();
+            Box::new(move |log| run::archive(&dir, &f, n, lib.as_deref(), log))
         }
         Kind::PlcCsv => Box::new(move |log| run::plc_csv(&dir, &f, log)),
         _ => {
@@ -485,6 +539,10 @@ impl Job {
             Adopt::Project => {
                 if let Err(e) = open.adopt_saved() {
                     unread = Some(e);
+                }
+                // An archive's symbol libraries and parts lists went into a library folder.
+                if self.lib.is_some() {
+                    open.refresh_library();
                 }
             }
         }
@@ -555,7 +613,7 @@ fn app_wording(text: &str) -> String {
         (" (use --pick)", ""),
         (
             "pass --lib <folder>",
-            "the app does not import these from an archive yet",
+            "choose a library folder for them in the import options",
         ),
         ("; run `wiringcraft inspect` to see what is there", ""),
         (
@@ -772,6 +830,13 @@ pub(crate) mod tests {
         assert!(keep(Kind::Eplan).options().is_err());
         for kind in [Kind::PlcCsv, Kind::PartsBmecat, Kind::PartsCsv, Kind::SweLibrary] {
             assert!(kind.options().is_empty(), "{kind:?}");
+        }
+        // An archive's library folder: none by default, as the command line without `--lib`.
+        let form = Form::new(&open, Kind::Archive, &file);
+        assert!(form.has(Opt::Library));
+        assert_eq!(form.options().map(|o| o.lib), Ok(None));
+        for kind in [Kind::Eplan, Kind::Swe, Kind::Aml, Kind::Pdf, Kind::PartsEdz] {
+            assert!(!Form::new(&open, kind, &file).has(Opt::Library), "{kind:?}");
         }
         // The symbol map is the SolidWorks project's and the EDZ parts' alone.
         for kind in [Kind::Eplan, Kind::Aml, Kind::Pdf, Kind::Archive, Kind::PageDxf] {
@@ -998,6 +1063,71 @@ INSERT INTO tew_componentterminal VALUES (50, 0, 'A1'), (50, 1, 'A2');
         assert!(std::fs::write(&map, "no equals sign\n").is_ok());
         let (done, msg) = import_with(&mut open, Kind::Swe, &db, None, 0, &options);
         assert!(!done && msg.contains("line 1"), "{msg}");
+    }
+
+    #[test]
+    fn an_archives_kicad_library_and_parts_list_go_into_the_library_folder_chosen() {
+        let (tmp, mut open) = project();
+        let archive = tmp.path().join("vendor.zip");
+        let kicad = br#"(kicad_symbol_lib
+  (symbol "K" (property "Reference" "K" (at 0 0 0))
+    (symbol "K_1_1" (pin passive line (at 0 3 270) (length 1) (name "~") (number "A1")))))"#;
+        let parts = b"order number;manufacturer;description\nX-1;Acme;Relay\n";
+        assert!(write_zip(
+            &archive,
+            &[("symbols/My Relays.kicad_sym", kicad), ("lists/parts.csv", parts)]
+        ));
+        let files = |dir: PathBuf| std::fs::read_dir(dir).map_or(0, |d| d.flatten().count());
+
+        // By default they are listed, not imported, and the advice names the dialog's option.
+        let own = open.dir.join(crate::import_symbols::PROJECT_LIBRARY);
+        let (done, msg) = import(&mut open, Kind::Archive, &archive, None, 0);
+        assert!(done, "{msg}");
+        assert!(
+            msg.contains("KiCad symbols, not imported: choose a library folder"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("parts list, not imported: choose a library folder"),
+            "{msg}"
+        );
+        assert!(!msg.contains("--"), "{msg}");
+        assert!(!own.exists(), "{msg}");
+
+        // The project's own library folder, offered first as for a parts import.
+        let mut form = Form::new(&open, Kind::Archive, &archive);
+        form.libraries = crate::import_symbols::targets(&open.dir, Vec::new(), &[]);
+        assert_eq!(form.library_label(0), "Do not import them");
+        assert_eq!(form.library_label(form.libraries.len() + 1), "Another folder…");
+        form.library = 1;
+        assert_eq!(form.library_target().map(|t| t.root.clone()), Some(own.clone()));
+        let options = form.options();
+        let Ok(options) = options else {
+            unreachable!("{options:?}");
+        };
+        assert_eq!(options.lib.as_deref(), Some(own.as_path()));
+        let (done, msg) = import_with(&mut open, Kind::Archive, &archive, None, 0, &options);
+        assert!(done, "{msg}");
+        assert!(!msg.contains("not imported"), "{msg}");
+        assert!(msg.contains("imported 1 part(s)"), "{msg}");
+        assert!(own.join("symbols").join("kicad.my_relays.k.json").exists(), "{msg}");
+        assert_eq!(files(own.join("parts")), 1, "{msg}");
+
+        // Another folder: it must be given, and is the one written to.
+        form.library = form.libraries.len() + 1;
+        assert!(form.other_library() && form.library_target().is_none());
+        assert!(form.options().is_err_and(|e| e.contains("library folder")));
+        let other = tmp.path().join("shared lib");
+        form.library_folder.text = other.display().to_string();
+        let options = form.options();
+        let Ok(options) = options else {
+            unreachable!("{options:?}");
+        };
+        assert_eq!(options.lib.as_deref(), Some(other.as_path()));
+        let (done, msg) = import_with(&mut open, Kind::Archive, &archive, None, 0, &options);
+        assert!(done, "{msg}");
+        assert!(other.join("symbols").join("kicad.my_relays.k.json").exists(), "{msg}");
+        assert_eq!(files(other.join("parts")), 1, "{msg}");
     }
 
     #[test]
