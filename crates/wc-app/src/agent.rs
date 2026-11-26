@@ -500,8 +500,14 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "export",
-            "Export into the project's export folder: pdf (all pages and reports), drawings (SVG and DXF per page) or aml (AutomationML).",
-            json!({"format": {"type": "string", "enum": ["pdf", "drawings", "aml"]}}),
+            "Export into the project's export folder: pdf (all pages and reports), drawings (SVG and DXF per page), aml (AutomationML), wago-marking (WAGO smartScript marker list CSV) or wago-configurator (terminal strips as a WAGO configurator article list CSV).",
+            json!({
+                "format": {"type": "string", "enum": ["pdf", "drawings", "aml", "wago-marking", "wago-configurator"]},
+                "lang": {"type": "string", "description": "pdf: print the texts in this language from translations.toml, e.g. \"nb\", or two as \"nb,en\" (default: as drawn). wago-marking: language of the header row and type column: en (default), de or nb."},
+                "kinds": {"type": "array", "items": {"type": "string", "enum": ["terminals", "wires", "devices", "cables"]}, "description": "wago-marking: only these marker kinds (default: all)."},
+                "lines": {"type": "array", "items": {"type": "string", "enum": ["marker", "tag", "description", "location"]}, "description": "wago-marking: the text lines of each marker, one column each (default: marker)."},
+                "strip": {"type": "string", "description": "wago-marking: only this terminal strip's terminals, e.g. \"-X1\"."}
+            }),
             &["format"],
         ),
         tool(
@@ -1825,9 +1831,33 @@ impl App {
             "export" => {
                 let open = need_open(self.open.as_mut())?;
                 Ok(match need_s(v, "format")? {
-                    "pdf" => crate::export_pdf(open),
+                    "pdf" => match s(v, "lang").map(str::trim).filter(|l| !l.is_empty()) {
+                        None => crate::export_pdf(open),
+                        Some(l) => crate::export_pdf_in(
+                            open,
+                            &wc_core::translate::parse_languages(l).ok_or_else(|| {
+                                format!("Bad language {l:?}: use a code such as nb, or two as nb,en.")
+                            })?,
+                        ),
+                    },
                     "drawings" => crate::export_drawings(open),
                     "aml" => crate::export_aml(open),
+                    "wago-marking" => {
+                        let lang = s(v, "lang").unwrap_or("en");
+                        let options = wc_report::MarkingOptions {
+                            kinds: wc_report::parse_kinds(&strings(v, "kinds"))?,
+                            lines: wc_report::parse_lines(&strings(v, "lines"))?,
+                            language: wc_report::Language::parse(lang)
+                                .ok_or_else(|| format!("Unknown language {lang:?} (en, de, nb)."))?,
+                            strip: s(v, "strip")
+                                .map(str::trim)
+                                .filter(|x| !x.is_empty())
+                                .map(str::to_owned),
+                            ..Default::default()
+                        };
+                        crate::export_wago_marking(open, &options)
+                    }
+                    "wago-configurator" => crate::export_wago_configurator(open),
                     f => return Err(format!("Unknown format {f}.")),
                 })
             }
@@ -5206,6 +5236,61 @@ mod tests {
         let text = String::from_utf8_lossy(&std::fs::read(pdf).unwrap()).into_owned();
         let title: String = "N1 Network PN1".bytes().map(|b| format!("{b:02X}")).collect();
         assert!(text.contains(&format!("/Title <{title}>")));
+    }
+
+    #[test]
+    fn the_assistant_exports_the_wago_lists_and_a_pdf_in_another_language() {
+        let (_tmp, mut a) = app(vec![]);
+        let dir = a.open.as_ref().unwrap().dir.join("export");
+        let m = call(&mut a, "export", json!({"format": "wago-configurator"})).unwrap();
+        assert!(m.starts_with("Nothing exported"), "{m}");
+        let open = a.open.as_mut().unwrap();
+        for (x, tag) in [(20.0, "-X1.2"), (40.0, "-X1.1"), (60.0, "-X2.1")] {
+            let id = open.place(1, "wc.terminal", Point::new(x, 20.0)).unwrap();
+            let s = open.project.pages[1].symbols.iter_mut().find(|s| s.id == id).unwrap();
+            s.tag = Some(wc_core::DeviceTag::parse(tag).unwrap());
+        }
+        let m = call(&mut a, "export", json!({"format": "wago-configurator"})).unwrap();
+        assert!(m.contains("Exported 2 terminal strips (3 rows)"), "{m}");
+        assert!(dir.join("wago-configurator.csv").exists());
+
+        let m = call(
+            &mut a,
+            "export",
+            json!({"format": "wago-marking", "strip": "-X1", "lang": "de", "kinds": ["terminals"], "lines": ["marker", "tag"]}),
+        )
+        .unwrap();
+        assert!(m.starts_with("Exported 2 markers"), "{m}");
+        let csv = std::fs::read_to_string(dir.join("wago-marking--X1.csv")).unwrap();
+        assert!(csv.starts_with("\u{feff}Typ;Gruppe;Zeile 1;Zeile 2;"), "{csv}");
+        let m = call(&mut a, "export", json!({"format": "wago-marking"})).unwrap();
+        assert!(m.starts_with("Exported "), "{m}");
+        assert!(dir.join("wago-marking.csv").exists());
+        assert!(call(&mut a, "export", json!({"format": "wago-marking", "lang": "fr"})).is_err());
+        assert!(call(&mut a, "export", json!({"format": "wago-marking", "kinds": ["lamps"]})).is_err());
+
+        let project_dir = a.open.as_ref().unwrap().dir.clone();
+        a.open.as_mut().unwrap().project.pages[1].title = "Pumps".into();
+        std::fs::write(
+            project_dir.join(wc_core::translate::TRANSLATIONS_FILE),
+            "source = \"en\"\n\n[[text]]\nen = \"Pumps\"\nnb = \"Pumper\"\n",
+        )
+        .unwrap();
+        assert!(call(&mut a, "export", json!({"format": "pdf", "lang": "nb,en,de"})).is_err());
+        let m = call(&mut a, "export", json!({"format": "pdf", "lang": "nb"})).unwrap();
+        assert!(m.starts_with("Exported"), "{m}");
+        let pdf = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "pdf"))
+            .unwrap();
+        let text = String::from_utf8_lossy(&std::fs::read(pdf).unwrap()).into_owned();
+        let pumper: String = "Pumper".bytes().map(|b| format!("{b:02X}")).collect();
+        assert!(
+            text.contains(&format!("<{pumper}>")),
+            "the page title is printed in Norwegian"
+        );
     }
 
     #[test]
