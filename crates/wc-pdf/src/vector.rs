@@ -403,27 +403,38 @@ pub(crate) fn solid_triangles(points: &[(f64, f64)]) -> Option<Vec<[(f64, f64); 
     if n < 3 || pts.iter().any(|(x, y)| !x.is_finite() || !y.is_finite()) {
         return None;
     }
-    // Convex: every corner turns the same way, and the turns add up to one full turn.
+    // Convex: every corner turns the same way, and the turns add up to one full turn. A corner
+    // that doubles straight back (a retraced segment) is a half turn either way: not convex.
     let (mut sign, mut turn) = (0.0f64, 0.0f64);
-    for i in 0..n {
-        let (a, b, c) = (pts[i], pts[(i + 1) % n], pts[(i + 2) % n]);
+    let corners = pts
+        .iter()
+        .zip(pts.iter().cycle().skip(1))
+        .zip(pts.iter().cycle().skip(2));
+    for ((a, b), c) in corners {
         let (ux, uy, vx, vy) = (b.0 - a.0, b.1 - a.1, c.0 - b.0, c.1 - b.1);
-        let cross = ux * vy - uy * vx;
+        let (cross, dot) = (ux * vy - uy * vx, ux * vx + uy * vy);
         if cross.abs() > 1e-9 {
             if sign * cross < 0.0 {
                 return None;
             }
             sign = cross.signum();
+        } else if dot < 0.0 {
+            return None;
         }
-        turn += cross.atan2(ux * vx + uy * vy);
+        turn += cross.atan2(dot);
     }
     if sign == 0.0 || turn.abs() > std::f64::consts::TAU + 1e-6 {
         return None;
     }
-    Some(match n {
-        3 => vec![[pts[0], pts[1], pts[2], pts[2]]],
-        4 => vec![[pts[0], pts[1], pts[3], pts[2]]],
-        _ => (1..n - 1).map(|i| [pts[0], pts[i], pts[i + 1], pts[i + 1]]).collect(),
+    Some(match pts.as_slice() {
+        &[a, b, c] => vec![[a, b, c, c]],
+        &[a, b, c, d] => vec![[a, b, d, c]],
+        [first, rest @ ..] => rest
+            .iter()
+            .zip(rest.iter().skip(1))
+            .map(|(&b, &c)| [*first, b, c, c])
+            .collect(),
+        [] => return None,
     })
 }
 
@@ -488,7 +499,7 @@ pub fn dxf(page: &PageDrawing) -> String {
                     pair(8, layer);
                     pair(62, &colour);
                     pair(66, "1");
-                    // A filled path that is not convex stays a closed outline.
+                    // A filled path that is not convex stays an outline, closed as its fill is.
                     pair(70, if *closed || *filled { "1" } else { "0" });
                     for (px, py) in points {
                         pair(0, "VERTEX");

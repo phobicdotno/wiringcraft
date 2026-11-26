@@ -293,6 +293,38 @@ fn filled_outlines_become_dxf_solids_when_convex() {
     assert_eq!(fan.len(), 3);
     // An arrow with a notch is not convex: it stays an outline.
     assert!(crate::vector::solid_triangles(&[(0.0, 0.0), (4.0, 2.0), (0.0, 4.0), (1.0, 2.0)]).is_none());
+    // A rectangle with a segment drawn back over itself turns half a turn each way at the
+    // reversals: a fan would paint outside it, so it stays an outline.
+    assert!(
+        crate::vector::solid_triangles(&[(4.0, 4.0), (0.0, 4.0), (0.0, 0.0), (8.0, 0.0), (0.0, 0.0), (4.0, 0.0)])
+            .is_none()
+    );
+}
+
+#[test]
+fn dxf_keeps_a_filled_path_that_is_not_convex_as_a_closed_outline() {
+    // An open, filled notched arrow: PDF and SVG fill it as if closed, so the DXF outline is
+    // closed too (group 70 is 1), and there is no SOLID.
+    let page = PageDrawing {
+        id: "a".into(),
+        number: "1".into(),
+        title: String::new(),
+        size_mm: (100.0, 100.0),
+        prims: vec![crate::writer::Prim::Path {
+            points: vec![(0.0, 0.0), (4.0, 2.0), (0.0, 4.0), (1.0, 2.0)],
+            closed: false,
+            filled: true,
+            ink: crate::writer::Stroke {
+                rgb: (0.0, 0.0, 0.0),
+                width: 0.25,
+            },
+            layer: None,
+        }],
+        pictures: Vec::new(),
+    };
+    let d = dxf(&page);
+    assert!(!d.contains("0\nSOLID\n"), "{d}");
+    assert!(d.contains("0\nPOLYLINE\n8\n0\n62\n7\n66\n1\n70\n1\n"), "{d}");
 }
 
 #[test]
