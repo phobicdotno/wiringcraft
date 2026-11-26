@@ -936,11 +936,11 @@ fn free_spot(panel: &wc_core::panel::Panel, size: (f64, f64)) -> Option<Point> {
     let (w, h) = size;
     let eps = 1e-9;
     let inside = |x: f64, y: f64| x >= -eps && y >= -eps && x + w <= panel.width + eps && y + h <= panel.height + eps;
-    let covering = |blocks: &[(Point, Point)], x: f64, y: f64| {
+    let covering = |blocks: &[(Point, Point)], x: f64, y: f64, gap: f64| {
         blocks
             .iter()
             .filter(|(min, max)| min.x < x + w && max.x > x && min.y < y + h && max.y > y)
-            .map(|(_, max)| max.x + GAP)
+            .map(|(_, max)| max.x + gap)
             .reduce(f64::max)
     };
     // Devices and ducts: nothing is placed over either (#937).
@@ -958,16 +958,20 @@ fn free_spot(panel: &wc_core::panel::Panel, size: (f64, f64)) -> Option<Point> {
         })
         .collect();
     rails.sort_by(|a, b| a.0.y.total_cmp(&b.0.y).then(a.0.x.total_cmp(&b.0.x)));
-    for (at, length) in rails {
-        let top = at.y - h / 2.0;
-        let mut x = at.x;
-        // Past every device and duct this outline would cover; each step moves right, so it ends.
-        while let Some(past) = covering(&blocks, x, top) {
-            x = past;
-        }
-        if x + w <= at.x + length + eps && inside(x, top) {
-            return Some(Point::new(x, top));
-        }
+    // On a rail, a GAP clear of other devices and ducts when there is room, else flush.
+    let on_rail = |gap: f64| {
+        rails.iter().find_map(|(at, length)| {
+            let top = at.y - h / 2.0;
+            let mut x = at.x;
+            // Past every device and duct this outline would cover; each step moves right, so it ends.
+            while let Some(past) = covering(&blocks, x, top, gap) {
+                x = past;
+            }
+            (x + w <= at.x + length + eps && inside(x, top)).then(|| Point::new(x, top))
+        })
+    };
+    if let Some(p) = on_rail(GAP).or_else(|| on_rail(0.0)) {
+        return Some(p);
     }
     // Off the rails: the highest, then leftmost, corner next to a device or duct that is free,
     // a GAP clear of it when there is room, else flush against it.
@@ -982,7 +986,7 @@ fn free_spot(panel: &wc_core::panel::Panel, size: (f64, f64)) -> Option<Point> {
         ys.sort_by(f64::total_cmp);
         ys.iter()
             .flat_map(|y| xs.iter().map(move |x| Point::new(*x, *y)))
-            .find(|p| inside(p.x, p.y) && covering(&blocks, p.x, p.y).is_none())
+            .find(|p| inside(p.x, p.y) && covering(&blocks, p.x, p.y, gap).is_none())
     };
     corner(GAP).or_else(|| corner(0.0))
 }
@@ -1022,6 +1026,24 @@ mod tests {
         assert_eq!(free_spot(&p, (45.0, 80.0)), Some(Point::new(55.0, 0.0)));
         // With room to spare it still keeps the gap.
         assert_eq!(free_spot(&p, (40.0, 80.0)), Some(Point::new(55.0 + GAP, 0.0)));
+    }
+
+    #[test]
+    fn a_device_that_only_fits_flush_against_a_duct_stays_on_the_rail() {
+        use wc_core::panel::{GAP, Panel, PanelItem};
+        let mut p = Panel::new("panel1", "Main", 100.0, 100.0);
+        p.items.push(PanelItem::Rail {
+            at: Point::new(0.0, 50.0),
+            length: 100.0,
+        });
+        p.items.push(PanelItem::Duct {
+            min: Point::new(0.0, 0.0),
+            max: Point::new(55.0, 100.0),
+        });
+        // A gap would run it past the rail's end: flush on the rail, not off it.
+        assert_eq!(free_spot(&p, (45.0, 80.0)), Some(Point::new(55.0, 10.0)));
+        // With room to spare it keeps the gap on the rail.
+        assert_eq!(free_spot(&p, (40.0, 80.0)), Some(Point::new(55.0 + GAP, 10.0)));
     }
 
     #[test]
