@@ -425,12 +425,11 @@ impl Git {
         ]);
         let commit = match resolved {
             Ok(id) if !id.trim().is_empty() => id.trim().to_owned(),
-            _ => {
-                return Err(Error::Git {
-                    args: format!("revert {commit}"),
-                    message: format!("no such version: {commit}"),
-                });
-            }
+            // `--quiet`: an unknown version fails with nothing said. Any other failure (git
+            // could not run, a broken repository) keeps its own reason.
+            Ok(_) => return Err(no_such_version(commit)),
+            Err(Error::Git { message, .. }) if message.is_empty() => return Err(no_such_version(commit)),
+            Err(e) => return Err(e),
         };
         args.extend(["revert", "--no-edit", END_OF_OPTIONS, &commit]);
         if let Err(e) = self.run(&args) {
@@ -557,6 +556,14 @@ impl Git {
     /// A file's content at a revision, or `None` when it did not exist there.
     pub fn show(&self, rev: &str, path: &str) -> Option<String> {
         self.run(&["show", END_OF_OPTIONS, &format!("{rev}:{path}")]).ok()
+    }
+}
+
+/// [`Git::revert`]'s refusal of a name that is no version.
+fn no_such_version(commit: &str) -> Error {
+    Error::Git {
+        args: format!("revert {commit}"),
+        message: format!("no such version: {commit}"),
     }
 }
 
