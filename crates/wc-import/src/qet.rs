@@ -126,6 +126,49 @@ fn push_closed(graphics: &mut Vec<Shape>, points: Vec<Point>, fill: bool) {
     });
 }
 
+/// The end shape QElectroTech draws at `tip` of a line coming from `from` (`end1`/`end2`):
+/// `simple` is an open arrow, `triangle` a filled one, `circle` a dot and `diamond` a diamond,
+/// each `len` long along the line. `none` and unknown values add nothing.
+fn line_end(graphics: &mut Vec<Shape>, kind: &str, tip: Point, from: Point, len: f64, fill: bool) {
+    let (dx, dy) = (tip.x - from.x, tip.y - from.y);
+    let d = dx.hypot(dy);
+    if !(d > 1e-9 && len.is_finite() && len > 0.0) {
+        return;
+    }
+    // Unit vector out of the line end, and one across it.
+    let (ux, uy) = (dx / d, dy / d);
+    let at = |along: f64, across: f64| Point::new(tip.x - ux * along - uy * across, tip.y - uy * along + ux * across);
+    let half = len / 2.0;
+    match kind {
+        "simple" => {
+            graphics.push(Shape::Line {
+                a: at(len, half),
+                b: tip,
+            });
+            graphics.push(Shape::Line {
+                a: at(len, -half),
+                b: tip,
+            });
+        }
+        "triangle" => graphics.push(Shape::Polyline {
+            points: vec![tip, at(len, half), at(len, -half)],
+            closed: true,
+            filled: true,
+        }),
+        "circle" => graphics.push(Shape::Circle {
+            center: at(half, 0.0),
+            radius: half,
+            filled: fill,
+        }),
+        "diamond" => graphics.push(Shape::Polyline {
+            points: vec![tip, at(half, half), at(len, 0.0), at(half, -half)],
+            closed: true,
+            filled: false,
+        }),
+        _ => {}
+    }
+}
+
 /// Points on the ellipse in the box (`x`, `y`, `w`, `h`), from `start` sweeping `sweep` degrees
 /// counter-clockwise on screen (Qt's convention, 0 at three o'clock).
 fn ellipse_points(x: f64, y: f64, w: f64, h: f64, start: f64, sweep: f64) -> Vec<Point> {
@@ -352,10 +395,17 @@ fn shape(
     let mut skip = || *unknown.entry(tag.to_owned()).or_default() += 1;
     match tag {
         "line" => match (n("x1"), n("y1"), n("x2"), n("y2")) {
-            (Some(x1), Some(y1), Some(x2), Some(y2)) => graphics.push(Shape::Line {
-                a: pt(x1, y1),
-                b: pt(x2, y2),
-            }),
+            (Some(x1), Some(y1), Some(x2), Some(y2)) => {
+                let (a, b) = (pt(x1, y1), pt(x2, y2));
+                graphics.push(Shape::Line { a, b });
+                for (i, tip, from) in [(1, a, b), (2, b, a)] {
+                    let Some(kind) = attr(e, &format!("end{i}")) else {
+                        continue;
+                    };
+                    let len = n(&format!("length{i}")).unwrap_or(1.5) * scale;
+                    line_end(graphics, &kind, tip, from, len, filled(e));
+                }
+            }
             _ => skip(),
         },
         "rect" => match (n("x"), n("y"), n("width"), n("height")) {
@@ -634,6 +684,59 @@ mod tests {
                 (ELLIPSE_STEPS, true, false)
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn line_ends_come_in_as_arrows_dots_and_diamonds() -> Result<()> {
+        let el = r#"<definition type="element"><description>
+<line x1="0" y1="0" x2="10" y2="0" end1="none" end2="triangle" length2="2" style="filling:none"/>
+<line x1="0" y1="10" x2="10" y2="10" end1="simple" end2="none"/>
+<line x1="0" y1="20" x2="0" y2="30" end1="circle" end2="diamond" length1="4" style="filling:black"/>
+<line x1="0" y1="40" x2="10" y2="40" end1="none" end2="wiggle"/>
+<terminal x="0" y="0" orientation="n"/>
+</description></definition>"#;
+        let (imp, warnings) = element(el, "qet.ends", 1.0)?;
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let g = &imp.symbol.graphics;
+        let close = |a: Point, b: Point| (a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() < 1e-9;
+        // The filled arrow: tip at (x2, y2), base 2 back along the line.
+        let tris: Vec<&Vec<Point>> = g
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Polyline {
+                    points, filled: true, ..
+                } => Some(points),
+                _ => None,
+            })
+            .collect();
+        let [tri] = tris.as_slice() else {
+            unreachable!("one filled arrow: {g:?}")
+        };
+        assert_eq!(tri.len(), 3);
+        assert!(close(tri[0], Point::new(10.0, 0.0)), "{tri:?}");
+        assert!(
+            tri[1..]
+                .iter()
+                .all(|p| (p.x - 8.0).abs() < 1e-9 && (p.y.abs() - 1.0).abs() < 1e-9)
+        );
+        // The open arrow: two short lines meeting at (x1, y1).
+        let tip = Point::new(0.0, 10.0);
+        let arms = g
+            .iter()
+            .filter(|s| matches!(s, Shape::Line { a, b } if close(*b, tip) && !close(*a, Point::new(10.0, 10.0))))
+            .count();
+        assert_eq!(arms, 2);
+        // A dot touching (x1, y1), filled as the style says, and a hollow diamond at (x2, y2).
+        assert!(
+            g.iter()
+                .any(|s| matches!(s, Shape::Circle { center, radius, filled: true }
+            if close(*center, Point::new(0.0, 22.0)) && (*radius - 2.0).abs() < 1e-9))
+        );
+        assert!(g.iter().any(|s| matches!(s, Shape::Polyline { points, closed: true, filled: false }
+            if points.len() == 4 && close(points[0], Point::new(0.0, 30.0)) && close(points[2], Point::new(0.0, 28.5)))));
+        // Four lines, two arrow arms, one arrow, one dot, one diamond; `none` and unknown add nothing.
+        assert_eq!(g.len(), 9, "{g:?}");
         Ok(())
     }
 
