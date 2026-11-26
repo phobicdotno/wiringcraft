@@ -243,6 +243,27 @@ fn arcs_keep_their_side_in_svg_and_dxf() {
 }
 
 #[test]
+fn svg_texts_keep_their_spaces() {
+    // Viewers squeeze leading and repeated spaces unless the text says to keep them.
+    let mut pen = crate::writer::Pen::new(100.0);
+    pen.text((10.0, 10.0), 3.0, 0, "  L1  L2");
+    let page = PageDrawing {
+        id: "a".into(),
+        number: "1".into(),
+        title: String::new(),
+        size_mm: (100.0, 100.0),
+        prims: pen.prims,
+        pictures: Vec::new(),
+    };
+    let s = svg(&page);
+    let Some(text) = s.lines().find(|l| l.starts_with("<text")) else {
+        unreachable!("no text in {s}");
+    };
+    assert!(text.starts_with("<text xml:space=\"preserve\" "), "{text}");
+    assert!(text.ends_with(">  L1  L2</text>"), "{text}");
+}
+
+#[test]
 fn dxf_fills_junction_dots_and_filled_shapes() {
     let wire = |id: &str, a: (f64, f64), b: (f64, f64)| Wire {
         id: id.into(),
