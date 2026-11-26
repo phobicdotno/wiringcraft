@@ -156,6 +156,33 @@ impl Dictionary {
     }
 }
 
+/// Set the translation of `text` (in the source language) into `lang` in the project folder's
+/// `translations.toml`, or remove it when `translation` is blank. The file is read again
+/// first, so translations changed there meanwhile are kept. Returns whether the file changed.
+/// One language code is required, and not the source language: its texts are the project's.
+pub fn set_translation(dir: &Path, text: &str, lang: &str, translation: &str) -> Result<bool> {
+    let lang = match parse_languages(lang).as_deref() {
+        Some([one]) => one.clone(),
+        _ => {
+            return Err(Error::Invalid(format!(
+                "{:?} is not a language code: use one such as nb or de",
+                lang.trim()
+            )));
+        }
+    };
+    if text.trim().is_empty() {
+        return Err(Error::Invalid("no text to translate".into()));
+    }
+    let mut dict = Dictionary::load(dir)?;
+    if lang == dict.source() {
+        return Err(Error::Invalid(format!(
+            "{lang} is the source language: its texts are the project's own"
+        )));
+    }
+    dict.set(text, &lang, translation);
+    dict.save(dir)
+}
+
 /// A language code as compared: trimmed and lowercased.
 fn normalize(lang: &str) -> String {
     lang.trim().to_ascii_lowercase()
@@ -419,6 +446,33 @@ nb = ""
         assert_eq!(again.lookup("Pumps", "nb"), None);
         assert_eq!(again.lookup("Pumps", "en").as_deref(), Some("Pumps"));
         assert_eq!(again.texts.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn set_translation_writes_and_removes_one_text_in_the_file() -> R {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join(TRANSLATIONS_FILE), DICT)?;
+        assert!(set_translation(dir.path(), "Spare", "NB", "Reserve")?);
+        assert!(!set_translation(dir.path(), "Spare", "nb", "Reserve")?, "unchanged");
+        assert!(set_translation(dir.path(), "Main switch", "nb", "")?);
+        let d = Dictionary::load(dir.path())?;
+        assert_eq!(d.lookup("Spare", "nb").as_deref(), Some("Reserve"));
+        assert_eq!(d.lookup("Main switch", "nb"), None);
+        assert_eq!(d.lookup("Pumps", "nb").as_deref(), Some("Pumper"), "others are kept");
+        for (text, lang) in [("Spare", "en"), ("Spare", "nb,en"), ("Spare", ""), (" ", "nb")] {
+            assert!(
+                matches!(set_translation(dir.path(), text, lang, "x"), Err(Error::Invalid(_))),
+                "{text:?} {lang:?}"
+            );
+        }
+        // A project without a dictionary gets one.
+        let empty = tempfile::tempdir()?;
+        assert!(set_translation(empty.path(), "Pumps", "de", "Pumpen")?);
+        assert_eq!(
+            Dictionary::load(empty.path())?.lookup("Pumps", "de").as_deref(),
+            Some("Pumpen")
+        );
         Ok(())
     }
 

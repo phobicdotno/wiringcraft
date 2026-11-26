@@ -177,12 +177,14 @@ enum Cmd {
         lang: Option<String>,
     },
     /// The project's translation dictionary (`translations.toml`): list the texts that have no
-    /// translation into a language. Exits with an error when any is missing, so it can guard a
-    /// release.
+    /// translation into a language (exits with an error when any is missing, so it can guard a
+    /// release), or set or remove one text's translation.
     Translations {
-        /// The language to check, such as `nb`.
-        #[arg(long)]
-        lang: String,
+        /// The language, such as `nb`.
+        #[arg(long, global = true)]
+        lang: Option<String>,
+        #[command(subcommand)]
+        edit: Option<TranslationsCmd>,
     },
     /// Export pages as drawings for other tools: one SVG or DXF file per page in a folder,
     /// drawn like the PDF (frame, title block, symbols, wires, cross-references).
@@ -253,6 +255,23 @@ enum Cmd {
     /// Review comments pinned on pages: add, reply, resolve, list.
     #[command(subcommand)]
     Comment(CommentCmd),
+}
+
+/// `translations set` and `translations remove`: one text of `translations.toml`.
+#[derive(Subcommand)]
+enum TranslationsCmd {
+    /// Set the translation of a project text (as drawn, in the source language) into `--lang`.
+    Set {
+        /// The text as drawn, such as a page title or device description.
+        text: String,
+        /// The text in `--lang`.
+        translation: String,
+    },
+    /// Remove the translation of a project text into `--lang`.
+    Remove {
+        /// The text as drawn.
+        text: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2068,7 +2087,30 @@ fn run(cli: Cli) -> Res<()> {
             }
             println!("wrote {} ({} pages)", out.display(), report.pages);
         }
-        Cmd::Translations { lang } => {
+        Cmd::Translations { lang, edit } => {
+            let lang = lang.ok_or("--lang is needed, such as --lang nb")?;
+            if let Some(edit) = edit {
+                let (text, translation) = match &edit {
+                    TranslationsCmd::Set { text, translation } => {
+                        if translation.trim().is_empty() {
+                            return Err("the translation is empty: use `translations remove` to take one away".into());
+                        }
+                        (text, translation.as_str())
+                    }
+                    TranslationsCmd::Remove { text } => (text, ""),
+                };
+                let changed = wc_core::translate::set_translation(dir, text, &lang, translation).map_err(e)?;
+                let file = wc_core::translate::TRANSLATIONS_FILE;
+                println!(
+                    "{}",
+                    match (&edit, changed) {
+                        (TranslationsCmd::Set { .. }, true) => format!("set the translation in {file}"),
+                        (TranslationsCmd::Remove { .. }, true) => format!("removed the translation from {file}"),
+                        _ => format!("{file} unchanged"),
+                    }
+                );
+                return Ok(());
+            }
             let p = load(dir)?;
             let (_, missing) = translated(dir, &p, &lang)?;
             for m in &missing {
@@ -6223,6 +6265,26 @@ mod tests {
         )
         .unwrap();
         assert!(cli(&dir, &["translations", "--lang", "nb"]).is_ok());
+
+        // One text set and removed from the command line.
+        cli(
+            &dir,
+            &["translations", "set", "Main switch", "Hovedbryter 1", "--lang", "nb"],
+        )
+        .unwrap();
+        cli(&dir, &["translations", "--lang", "de", "set", "Pumps", "Pumpen"]).unwrap();
+        let dict = wc_core::translate::Dictionary::load(&dir).unwrap();
+        assert_eq!(dict.lookup("Main switch", "nb").as_deref(), Some("Hovedbryter 1"));
+        assert_eq!(dict.lookup("Pumps", "de").as_deref(), Some("Pumpen"));
+        cli(&dir, &["translations", "remove", "Cover", "--lang", "nb"]).unwrap();
+        let err = cli(&dir, &["translations", "--lang", "nb"]).unwrap_err();
+        assert!(err.contains("1 text(s)"), "{err}");
+        assert!(
+            cli(&dir, &["translations", "set", "Pumps", "x"]).is_err(),
+            "no language"
+        );
+        assert!(cli(&dir, &["translations", "set", "Pumps", "x", "--lang", "en"]).is_err());
+        assert!(cli(&dir, &["translations", "set", "Pumps", " ", "--lang", "nb"]).is_err());
     }
 
     #[test]

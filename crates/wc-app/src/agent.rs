@@ -463,6 +463,18 @@ pub fn specs() -> Vec<Value> {
             &["action"],
         ),
         tool(
+            "translations",
+            "The project's translation dictionary (translations.toml, the same file as File, Translations): list the project's texts with their translations (lang: only that language; missing: true with lang: only the texts without a translation into it), set a text's translation into a language, or remove it. text is the project text as drawn, in the source language. It is written to the file at once, like the dialog saves: Undo does not take it back, so set or remove it again to change it.",
+            json!({
+                "action": {"type": "string", "enum": ["list", "set", "remove"]},
+                "text": {"type": "string", "description": "set, remove: the text as drawn in the project, such as a page title or device description."},
+                "lang": {"type": "string", "description": "A language code, such as nb or de."},
+                "translation": {"type": "string", "description": "set: the text in lang."},
+                "missing": {"type": "boolean", "description": "list with lang: only the texts without a translation."}
+            }),
+            &["action"],
+        ),
+        tool(
             "number_wires",
             "Give every connection without a number one. Existing numbers are kept.",
             json!({"rule": {"type": "string", "enum": ["page_column", "sequential", "potential"], "description": "page_column (3.4: page and column, default), sequential (1, 2, 3) or potential (the potential's name)."}}),
@@ -1129,6 +1141,14 @@ impl wc_agent::Tools for AppTools<'_> {
             "mirror_items" => format!("Mirrored {}{page}", strings(input, "ids").join(", ")),
             "copy_items" => format!("Copied {}{page}", strings(input, "ids").join(", ")),
             "select_items" => format!("Selected {}{page}", strings(input, "ids").join(", ")),
+            "translations" => match s(input, "action") {
+                Some(a @ ("set" | "remove")) => format!(
+                    "Translations: {a} {:?} in {}",
+                    s(input, "text").unwrap_or_default(),
+                    s(input, "lang").unwrap_or_default()
+                ),
+                _ => "Read the translations".into(),
+            },
             "set_device" => format!("Set device {}", s(input, "tag").unwrap_or_default()),
             "run_action" => format!("Ran {}", s(input, "action").unwrap_or_default()),
             "run_command" => format!("wiringcraft {}", strings(input, "args").join(" ")),
@@ -1745,6 +1765,7 @@ impl App {
             "jumpers" => self.tool_jumpers(v),
             "strips" => self.tool_strips(v),
             "macros" => self.tool_macros(v),
+            "translations" => self.tool_translations(v),
             "number_wires" => {
                 use wc_core::numbering::Rule;
                 let rule = match s(v, "rule").unwrap_or("page_column") {
@@ -2565,6 +2586,69 @@ impl App {
                 Ok(format!("Saved the macro to {}.", path.display()))
             }
             other => Err(format!("Unknown macros action {other}.")),
+        }
+    }
+
+    /// The `translations` tool: the project's `translations.toml`, read and written through
+    /// the same dictionary code as the Translations dialog.
+    fn tool_translations(&mut self, v: &Value) -> Result<String, String> {
+        use wc_core::translate::{Dictionary, TRANSLATIONS_FILE, set_translation, texts};
+        let action = need_s(v, "action")?;
+        let open = need_open(self.open.as_mut())?;
+        match action {
+            "list" => {
+                let dict = Dictionary::load(&open.dir).map_err(|e| e.to_string())?;
+                let langs: Vec<String> = match s(v, "lang") {
+                    Some(l) => match wc_core::translate::parse_languages(l).as_deref() {
+                        Some([one]) => vec![one.clone()],
+                        _ => return Err(format!("{l:?} is not a language code: use one such as nb or de.")),
+                    },
+                    None => dict.languages().into_iter().skip(1).collect(),
+                };
+                let only_missing = v.get("missing").and_then(Value::as_bool).unwrap_or(false) && s(v, "lang").is_some();
+                let rows: Vec<Value> = texts(&open.project)
+                    .into_iter()
+                    .filter_map(|t| {
+                        let tr: serde_json::Map<String, Value> = langs
+                            .iter()
+                            .filter_map(|l| dict.lookup(&t.text, l).map(|x| (l.clone(), json!(x))))
+                            .collect();
+                        (!only_missing || tr.is_empty())
+                            .then(|| json!({"text": t.text, "used": t.used, "translations": tr}))
+                    })
+                    .collect();
+                Ok(clip_text(
+                    pretty(&json!({"source": dict.source(), "languages": dict.languages(), "texts": rows})),
+                    40_000,
+                ))
+            }
+            "set" | "remove" => {
+                let text = need_s(v, "text")?;
+                let lang = need_s(v, "lang")?;
+                let translation = if action == "set" {
+                    let t = need_s(v, "translation")?;
+                    if t.trim().is_empty() {
+                        return Err("The translation is empty: use action remove to take one away.".into());
+                    }
+                    t
+                } else {
+                    ""
+                };
+                let changed = set_translation(&open.dir, text, lang, translation).map_err(|e| e.to_string())?;
+                let mut out = match (action, changed) {
+                    ("set", true) => format!("Saved the translation to {TRANSLATIONS_FILE}."),
+                    ("set", false) => format!("{TRANSLATIONS_FILE} already had that translation."),
+                    (_, true) => format!("Removed the translation from {TRANSLATIONS_FILE}."),
+                    (_, false) => format!("{TRANSLATIONS_FILE} had no translation of that text into that language."),
+                };
+                if !texts(&open.project).iter().any(|t| t.text == text.trim()) {
+                    out.push_str(
+                        " Note: no text in the project reads exactly like that; list shows the texts as drawn.",
+                    );
+                }
+                Ok(out)
+            }
+            other => Err(format!("Unknown translations action {other}.")),
         }
     }
 
@@ -5520,6 +5604,86 @@ mod tests {
         let pdf = String::from_utf8_lossy(&std::fs::read(pdf_path).unwrap()).into_owned();
         assert!(pdf.contains(&hex("Reserve / Spare")), "the texts are in both languages");
         assert!(pdf.contains(&hex("Pumpene / Pumps")));
+    }
+
+    #[test]
+    fn the_assistant_lists_sets_and_removes_translations_as_the_dialog_shows_them() {
+        use wc_core::translate::{Dictionary, TRANSLATIONS_FILE};
+        let (_tmp, mut a) = app(vec![]);
+        let dir = a.open.as_ref().unwrap().dir.clone();
+        a.open.as_mut().unwrap().project.pages[1].title = "Pumps".into();
+        std::fs::write(
+            dir.join(TRANSLATIONS_FILE),
+            "source = \"en\"\n\n[[text]]\nen = \"Main switch\"\nnb = \"Hovedbryter\"\n",
+        )
+        .unwrap();
+        let steps = a.open.as_ref().unwrap().undo_mark();
+
+        let missing = |a: &mut App| -> Vec<String> {
+            let r = call(
+                a,
+                "translations",
+                json!({"action": "list", "lang": "nb", "missing": true}),
+            )
+            .unwrap();
+            let v: Value = serde_json::from_str(&r).unwrap();
+            v["texts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["text"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert!(missing(&mut a).contains(&"Pumps".to_owned()));
+
+        let r = call(
+            &mut a,
+            "translations",
+            json!({"action": "set", "text": "Pumps", "lang": "NB", "translation": "Pumper"}),
+        )
+        .unwrap();
+        assert!(r.starts_with("Saved"), "{r}");
+        assert!(!missing(&mut a).contains(&"Pumps".to_owned()));
+        let d = Dictionary::load(&dir).unwrap();
+        assert_eq!(d.lookup("Pumps", "nb").as_deref(), Some("Pumper"));
+        assert_eq!(d.lookup("Main switch", "nb").as_deref(), Some("Hovedbryter"), "kept");
+
+        // The dialog opened now shows what the assistant saved.
+        a.run(Action::Translations);
+        let Some(Dialog::Translations(form)) = a.dialog.take() else {
+            unreachable!("the translations dialog opens");
+        };
+        let row = form.rows.iter().find(|r| r.text == "Pumps").unwrap();
+        assert_eq!(row.cells, ["Pumper"]);
+
+        let r = call(
+            &mut a,
+            "translations",
+            json!({"action": "remove", "text": "Pumps", "lang": "nb"}),
+        )
+        .unwrap();
+        assert!(r.starts_with("Removed"), "{r}");
+        assert_eq!(Dictionary::load(&dir).unwrap().lookup("Pumps", "nb"), None);
+        assert!(missing(&mut a).contains(&"Pumps".to_owned()));
+
+        // Not in the project: saved, with a note.
+        let r = call(
+            &mut a,
+            "translations",
+            json!({"action": "set", "text": "Nowhere", "lang": "de", "translation": "Nirgends"}),
+        )
+        .unwrap();
+        assert!(r.contains("no text in the project"), "{r}");
+        for bad in [
+            json!({"action": "set", "text": "Pumps", "lang": "en", "translation": "x"}),
+            json!({"action": "set", "text": "Pumps", "lang": "nb", "translation": " "}),
+            json!({"action": "set", "text": "Pumps", "lang": "nb,en", "translation": "x"}),
+            json!({"action": "remove", "text": "Pumps"}),
+        ] {
+            assert!(call(&mut a, "translations", bad.clone()).is_err(), "{bad}");
+        }
+        // The file is not part of the drawing: no undo step.
+        assert_eq!(a.open.as_ref().unwrap().undo_mark(), steps);
     }
 
     #[test]
