@@ -119,7 +119,7 @@ sym("wc.connector.plug", "Plug (male contact)", "terminals", "X", "standalone",
 sym("wc.motor.dc", "DC motor", "drives", "M", "standalone",
     # Circle with M, the DC mark (a solid line over a dashed one) under it.
     # Origin at the + pin, - one grid step to the right (as wc.rcd.2p), so both sit on the 5 mm grid.
-    [line((0, 0), (0, 4.3)), line((5, 0), (5, 4.3)), circle((2.5, 9), 5), text((2.5, 10.3), "M", 3.5, "center"),
+    [line((0, 0), (0, 4.67)), line((5, 0), (5, 4.67)), circle((2.5, 9), 5), text((2.5, 10.3), "M", 3.5, "center"),
      line((1, 11.8), (4, 11.8)), line((1, 12.8), (1.7, 12.8)), line((2.15, 12.8), (2.85, 12.8)),
      line((3.3, 12.8), (4, 12.8))],
     [pin("+", 0, 0, "up"), pin("-", 5, 0, "up")], tag_at=(-6.5, 9),
