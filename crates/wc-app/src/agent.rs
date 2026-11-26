@@ -507,7 +507,7 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "translations",
-            "The project's translation dictionary (translations.toml, the same file as File, Translations): list the project's texts with their translations (lang: only that language; missing: true with lang: only the texts without a translation into it), set a text's translation into a language, or remove it. text is the project text as drawn, in the source language. It is written to the file at once, like the dialog saves: Undo does not take it back, so set or remove it again to change it. In a shared session only the host can set or remove translations.",
+            "The project's translation dictionary (translations.toml, the same file as File, Translations): list the project's texts with their translations (lang: only that language; missing: true with lang: only the texts without a translation into it), set a text's translation into a language, or remove it. text is the project text as drawn, in the source language. It is written to the file at once, like the dialog saves, and Undo takes it back with the turn's other changes. In a shared session only the host can set or remove translations, and Undo there does not take a translation back (the session's history does not hold the file).",
             json!({
                 "action": {"type": "string", "enum": ["list", "set", "remove"]},
                 "text": {"type": "string", "description": "set, remove: the text as drawn in the project, such as a page title or device description."},
@@ -3108,7 +3108,7 @@ impl App {
         // The session does not carry translations.toml: a guest's edit would stay in the
         // guest's own copy, and the host's file (which its PDF export reads) would not change.
         if matches!(action, "set" | "remove") && self.share.active() && !self.share.is_host() {
-            return Err("Not done: in a shared session only the host can change the translations (the session does not carry translations.toml). Ask the host to make this change.".into());
+            return Err(Open::TRANSLATIONS_GUEST.to_owned());
         }
         let open = need_open(self.open.as_mut())?;
         match action {
@@ -3147,7 +3147,8 @@ impl App {
                 } else {
                     ""
                 };
-                let changed = set_translation(&open.dir, text, lang, translation).map_err(|e| e.to_string())?;
+                // One undo step, which the turn's squash joins with its other changes (#589).
+                let changed = open.translations_change(|dir| set_translation(dir, text, lang, translation))?;
                 let mut out = match (action, changed) {
                     ("set", true) => format!("Saved the translation to {TRANSLATIONS_FILE}."),
                     ("set", false) => format!("{TRANSLATIONS_FILE} already had that translation."),
@@ -3512,7 +3513,7 @@ impl App {
         // As in the `translations` tool: the session does not carry translations.toml, so a
         // guest's edit would stay in its own copy and never reach the host.
         if edits_translations(&args) && self.share.active() && !self.share.is_host() {
-            return Err("Not done: in a shared session only the host can change the translations (the session does not carry translations.toml). Ask the host to make this change.".into());
+            return Err(Open::TRANSLATIONS_GUEST.to_owned());
         }
         if let Some(open) = self.open.as_mut() {
             // In a shared session a page someone else has open is read-only here, and the
@@ -3532,6 +3533,8 @@ impl App {
                 open.save()
                     .map_err(|e| format!("Saving before the command failed: {e}"))?;
             }
+            // What the command writes to translations.toml becomes part of its undo step.
+            open.before_translations_command();
             cmd.arg("-C").arg(&open.dir);
             self.assistant.command_base = Some((open.dir.clone(), open.project.clone()));
         }
@@ -3559,6 +3562,29 @@ impl App {
     /// always win: if both changed the project, the command's changes are not loaded and the
     /// answer says so, so the assistant can ask before running it again.
     fn command_finish(&mut self, r: Result<String, String>) -> Result<String, String> {
+        let ran_in = self.assistant.command_base.as_ref().map(|(dir, _)| dir.clone());
+        let mark = self.open.as_ref().map(Open::undo_mark);
+        let r = self.command_finish_project(r);
+        // What the command wrote to translations.toml (`translations set`, say) is taken back
+        // by the same Undo as its change of the project, or by one of its own (#589).
+        if let (Some(dir), Some(mark), Some(open)) = (ran_in, mark, self.open.as_mut())
+            && open.dir == dir
+        {
+            let noted = open.note_translations();
+            open.squash_undo(mark);
+            // A file that could not be read makes no step: the answer says so, with why.
+            if let Err(why) = noted {
+                return match r {
+                    Ok(text) => Ok(format!("{text}\n{why}")),
+                    Err(e) => Err(format!("{e}\n{why}")),
+                };
+            }
+        }
+        r
+    }
+
+    /// [`App::command_finish`] for the project itself.
+    fn command_finish_project(&mut self, r: Result<String, String>) -> Result<String, String> {
         let base = self.assistant.command_base.take();
         let Some(open) = self.open.as_mut() else {
             return r;
@@ -7247,8 +7273,235 @@ mod tests {
         ] {
             assert!(call(&mut a, "translations", bad.clone()).is_err(), "{bad}");
         }
-        // The file is not part of the drawing: no undo step yet (todo #589).
+        // Each change of the file is one undo step (#589); a refused one is none.
+        assert_eq!(a.open.as_ref().unwrap().undo_mark(), steps + 3);
+    }
+
+    #[test]
+    fn one_undo_takes_back_a_turn_that_set_a_translation_and_changed_a_page() {
+        use wc_core::translate::{Dictionary, TRANSLATIONS_FILE};
+        let (_tmp, mut a) = app(vec![]);
+        let dir = a.open.as_ref().unwrap().dir.clone();
+        let file = dir.join(TRANSLATIONS_FILE);
+        let before = a.open.as_ref().unwrap().project.clone();
+        // One turn, as the assistant panel runs it: a mark, the tools, then one squash.
+        let mark = a.open.as_ref().unwrap().undo_mark();
+        call(&mut a, "add_page", json!({"title": "Pumps"})).unwrap();
+        let r = call(
+            &mut a,
+            "translations",
+            json!({"action": "set", "text": "Pumps", "lang": "nb", "translation": "Pumper"}),
+        )
+        .unwrap();
+        assert!(r.starts_with("Saved"), "{r}");
+        call(&mut a, "add_page", json!({"title": "Motors"})).unwrap();
+        let open = a.open.as_mut().unwrap();
+        open.squash_undo(mark);
+        assert_eq!(open.undo_mark(), mark + 1, "the turn is one undo step");
+        let after = open.project.clone();
+        assert_eq!(after.pages.len(), before.pages.len() + 2);
+        let translated = std::fs::read_to_string(&file).unwrap();
+
+        assert!(open.undo(), "{:?}", open.take_undo_error());
+        assert_eq!(open.project, before, "the pages are gone");
+        assert!(
+            !file.exists(),
+            "and so is the translation: there was no file before the turn"
+        );
+        assert_eq!(Dictionary::load(&dir).unwrap().lookup("Pumps", "nb"), None);
+
+        assert!(open.redo(), "{:?}", open.take_undo_error());
+        assert_eq!(open.project, after);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), translated);
+        assert_eq!(
+            Dictionary::load(&dir).unwrap().lookup("Pumps", "nb").as_deref(),
+            Some("Pumper")
+        );
+    }
+
+    /// The Translations dialog for the open project, with `text` translated into `nb`.
+    fn translations_dialog(a: &App, text: &str, to: &str) -> crate::translations_form::Form {
+        let open = a.open.as_ref().unwrap();
+        let mut form = crate::translations_form::Form::open(&open.dir, &open.project).unwrap();
+        if form.langs.is_empty() {
+            form.new_lang = "nb".into();
+            form.add_language().unwrap();
+        }
+        let row = form.rows.iter_mut().find(|r| r.text == text).unwrap();
+        row.cells = vec![to.into()];
+        form
+    }
+
+    #[test]
+    fn ok_in_the_translations_dialog_is_one_undo_step_of_the_open_project() {
+        use wc_core::translate::{Dictionary, TRANSLATIONS_FILE};
+        let (_tmp, mut a) = app(vec![]);
+        call(&mut a, "add_page", json!({"title": "Pumps"})).unwrap();
+        call(&mut a, "add_page", json!({"title": "Motors"})).unwrap();
+        let dir = a.open.as_ref().unwrap().dir.clone();
+        let steps = a.open.as_ref().unwrap().undo_mark();
+        let mut form = translations_dialog(&a, "Pumps", "Pumper");
+        let row = form.rows.iter_mut().find(|r| r.text == "Motors").unwrap();
+        row.cells = vec!["Motorer".into()];
+        let said = App::save_translations(a.open.as_mut(), &a.share, false, &form).unwrap();
+        assert!(said.starts_with("Saved 2 translations"), "{said}");
+        let open = a.open.as_mut().unwrap();
+        assert_eq!(open.undo_mark(), steps + 1, "both cells are one step");
+        assert!(open.undo(), "{:?}", open.take_undo_error());
+        assert!(!dir.join(TRANSLATIONS_FILE).exists());
+        assert!(open.redo());
+        let dict = Dictionary::load(&dir).unwrap();
+        assert_eq!(dict.lookup("Pumps", "nb").as_deref(), Some("Pumper"));
+        assert_eq!(dict.lookup("Motors", "nb").as_deref(), Some("Motorer"));
+
+        // A form left from another project is refused: its save would be in no undo history.
+        let other = tempfile::tempdir().unwrap();
+        let mut form = translations_dialog(&a, "Pumps", "Pumpene");
+        form.dir = other.path().to_path_buf();
+        let steps = a.open.as_ref().unwrap().undo_mark();
+        let e = App::save_translations(a.open.as_mut(), &a.share, false, &form).unwrap_err();
+        assert_eq!(e, App::TRANSLATIONS_ELSEWHERE);
+        assert!(!other.path().join(TRANSLATIONS_FILE).exists(), "nothing was written");
         assert_eq!(a.open.as_ref().unwrap().undo_mark(), steps);
+        assert_eq!(
+            Dictionary::load(&dir).unwrap().lookup("Pumps", "nb").as_deref(),
+            Some("Pumper")
+        );
+        // The same with no project open.
+        let e = App::save_translations(None, &a.share, false, &form).unwrap_err();
+        assert_eq!(e, App::TRANSLATIONS_ELSEWHERE);
+        assert!(!other.path().join(TRANSLATIONS_FILE).exists(), "nothing was written");
+    }
+
+    #[test]
+    fn after_save_as_the_open_translations_dialog_saves_into_the_copy_as_an_undo_step() {
+        use wc_core::translate::{Dictionary, TRANSLATIONS_FILE};
+        let (tmp, mut a) = app(vec![]);
+        call(&mut a, "add_page", json!({"title": "Pumps"})).unwrap();
+        // The original has a dictionary already, so the copy starts with the same one.
+        let form = translations_dialog(&a, "Pumps", "Pumper");
+        App::save_translations(a.open.as_mut(), &a.share, false, &form).unwrap();
+        let original = a.open.as_ref().unwrap().dir.clone();
+        let was = std::fs::read_to_string(original.join(TRANSLATIONS_FILE)).unwrap();
+
+        // The dialog is open with an edit not saved yet when the project is saved as a copy.
+        a.dialog = Some(Dialog::Translations(translations_dialog(&a, "Pumps", "Pumpene")));
+        a.save_copy(&tmp.path().join("copy")).unwrap();
+        let copy = a.open.as_ref().unwrap().dir.clone();
+        assert_ne!(copy, original);
+        let Some(Dialog::Translations(form)) = a.dialog.take() else {
+            unreachable!("the dialog stays open");
+        };
+        assert!(form.is_for(&copy), "the dialog follows the project into the copy");
+
+        let steps = a.open.as_ref().unwrap().undo_mark();
+        App::save_translations(a.open.as_mut(), &a.share, false, &form).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(original.join(TRANSLATIONS_FILE)).unwrap(),
+            was,
+            "the original is not written"
+        );
+        assert_eq!(
+            Dictionary::load(&copy).unwrap().lookup("Pumps", "nb").as_deref(),
+            Some("Pumpene")
+        );
+        let open = a.open.as_mut().unwrap();
+        assert_eq!(open.undo_mark(), steps + 1, "one undo step of the open project");
+        assert!(open.undo(), "{:?}", open.take_undo_error());
+        assert_eq!(std::fs::read_to_string(copy.join(TRANSLATIONS_FILE)).unwrap(), was);
+
+        // A dialog of some other folder is left as it is by Save as, and then refused.
+        let mut form = translations_dialog(&a, "Pumps", "Pumpa");
+        form.dir = original.clone();
+        a.dialog = Some(Dialog::Translations(form));
+        a.save_copy(&tmp.path().join("second")).unwrap();
+        let Some(Dialog::Translations(form)) = a.dialog.take() else {
+            unreachable!("the dialog stays open");
+        };
+        assert!(form.is_for(&original));
+        let e = App::save_translations(a.open.as_mut(), &a.share, false, &form).unwrap_err();
+        assert_eq!(e, App::TRANSLATIONS_ELSEWHERE);
+        assert_eq!(
+            std::fs::read_to_string(original.join(TRANSLATIONS_FILE)).unwrap(),
+            was,
+            "the original is not written"
+        );
+    }
+
+    #[test]
+    fn a_guests_translations_dialog_does_not_save_and_makes_no_undo_step() {
+        use wc_core::translate::TRANSLATIONS_FILE;
+        let tmp = tempfile::tempdir().unwrap();
+        let (_dir, mut a) = guest_app(tmp.path());
+        let open = a.open.as_ref().unwrap();
+        let (dir, steps) = (open.dir.clone(), open.undo_mark());
+        let mut form = crate::translations_form::Form::open(&open.dir, &open.project).unwrap();
+        form.new_lang = "nb".into();
+        form.add_language().unwrap();
+        for row in &mut form.rows {
+            row.cells = vec!["Oversatt".into()];
+        }
+        assert!(!form.rows.is_empty());
+        let e = App::save_translations(a.open.as_mut(), &a.share, false, &form).unwrap_err();
+        assert_eq!(e, Open::TRANSLATIONS_GUEST, "as the assistant's tool refuses");
+        assert!(!dir.join(TRANSLATIONS_FILE).exists(), "nothing was written");
+        let open = a.open.as_ref().unwrap();
+        assert_eq!(open.undo_mark(), steps);
+        assert!(!open.can_redo());
+    }
+
+    #[test]
+    fn a_command_that_leaves_the_translations_unreadable_says_there_is_no_undo_step() {
+        use wc_core::translate::TRANSLATIONS_FILE;
+        for failed in [false, true] {
+            let (_tmp, mut a) = app(vec![]);
+            let open = a.open.as_mut().unwrap();
+            open.save().unwrap();
+            let (dir, mark) = (open.dir.clone(), open.undo_mark());
+            open.before_translations_command();
+            a.assistant.command_base = Some((open.dir.clone(), open.project.clone()));
+            // Not UTF-8.
+            std::fs::write(dir.join(TRANSLATIONS_FILE), [0xff_u8, 0xfe, 0x00, 0x41]).unwrap();
+            let r = if failed {
+                Err("The command failed.".to_owned())
+            } else {
+                Ok("Done.".to_owned())
+            };
+            let answer = a.command_finish(r);
+            assert_eq!(answer.is_err(), failed, "{answer:?}");
+            let text = answer.unwrap_or_else(|e| e);
+            assert!(
+                text.contains(Open::TRANSLATIONS_NO_STEP) && text.contains("cannot be read"),
+                "{text}"
+            );
+            assert!(
+                text.starts_with(if failed { "The command failed." } else { "Done." }),
+                "{text}"
+            );
+            assert_eq!(a.open.as_ref().map(Open::undo_mark), Some(mark), "no undo step");
+        }
+    }
+
+    #[test]
+    fn undo_takes_back_a_translation_a_command_set() {
+        use wc_core::translate::{TRANSLATIONS_FILE, set_translation};
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        open.save().unwrap();
+        let (dir, mark) = (open.dir.clone(), open.undo_mark());
+        let file = dir.join(TRANSLATIONS_FILE);
+        // As `command_start` leaves it when the command starts.
+        open.before_translations_command();
+        a.assistant.command_base = Some((open.dir.clone(), open.project.clone()));
+        // What `wiringcraft translations set` does on disk.
+        assert!(set_translation(&dir, "Pumps", "nb", "Pumper").unwrap());
+        a.command_finish(Ok("Done.".into())).unwrap();
+        let open = a.open.as_mut().unwrap();
+        assert_eq!(open.undo_mark(), mark + 1, "one undo step");
+        assert!(open.undo());
+        assert!(!file.exists());
+        assert!(open.redo());
+        assert!(file.exists());
     }
 
     #[test]
@@ -9452,6 +9705,32 @@ mod tests {
         assert_eq!(customer(&a).as_deref(), Some("Second"));
         assert!(!format!("{r:?}").contains("not loaded"), "{r:?}");
         assert!(!a.assistant.command_running());
+    }
+
+    #[test]
+    fn the_translations_dialog_does_not_save_while_a_command_runs() {
+        use wc_core::translate::TRANSLATIONS_FILE;
+        let (_tmp, mut a) = app(vec![]);
+        call(&mut a, "add_page", json!({"title": "Pumps"})).unwrap();
+        let dir = a.open.as_ref().unwrap().dir.clone();
+        let form = translations_dialog(&a, "Pumps", "Pumper");
+        let steps = a.open.as_ref().unwrap().undo_mark();
+        let _ = command_around(&mut a, |a| {
+            let running = a.assistant.command_running();
+            assert!(running);
+            let e = App::save_translations(a.open.as_mut(), &a.share, running, &form).unwrap_err();
+            assert_eq!(e, App::SAVE_WAITS, "as Save answers");
+            assert!(!dir.join(TRANSLATIONS_FILE).exists(), "nothing was written");
+        });
+        // The command made no step of a change the dialog never wrote.
+        assert!(!dir.join(TRANSLATIONS_FILE).exists());
+        assert_eq!(a.open.as_ref().unwrap().undo_mark(), steps);
+
+        // Once the command is done the same form saves, as one step.
+        let running = a.assistant.command_running();
+        App::save_translations(a.open.as_mut(), &a.share, running, &form).unwrap();
+        assert!(dir.join(TRANSLATIONS_FILE).exists());
+        assert_eq!(a.open.as_ref().unwrap().undo_mark(), steps + 1);
     }
 
     #[test]

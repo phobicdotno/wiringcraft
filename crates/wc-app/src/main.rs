@@ -513,6 +513,38 @@ impl chrome::Status for StatusView<'_> {
 }
 
 impl App {
+    /// Why the window does not save while a command of the assistant runs.
+    pub(crate) const SAVE_WAITS: &str = "Saving waits until the assistant's command has finished.";
+
+    /// Why the Translations dialog does not save into a folder that is not the open project's.
+    pub(crate) const TRANSLATIONS_ELSEWHERE: &str = "Not saved: this dialog was opened for another project folder than the one that is open now. Close it and open Translations again.";
+
+    /// OK in the Translations dialog: save `form`'s dictionary into the open project, as one
+    /// undo step however many cells changed (#589). A guest in a shared session is refused as
+    /// the assistant's `translations` tool refuses, and nothing is written: the session does
+    /// not carry the file. A form that is not for the open project is refused too, and nothing
+    /// is written: its save would be in no undo history (after Save as the form follows the
+    /// project into the copy, [`App::save_copy`]). While a command of the assistant runs
+    /// (`command_running`) nothing is saved, as with Save: what changes on disk meanwhile is
+    /// taken as the command's change.
+    pub(crate) fn save_translations(
+        open: Option<&mut Open>,
+        share: &share::Share,
+        command_running: bool,
+        form: &translations_form::Form,
+    ) -> Result<String, String> {
+        if command_running {
+            return Err(App::SAVE_WAITS.to_owned());
+        }
+        if share.active() && !share.is_host() {
+            return Err(Open::TRANSLATIONS_GUEST.to_owned());
+        }
+        match open {
+            Some(open) if form.is_for(&open.dir) => open.translations_change(|_| form.save()),
+            _ => Err(App::TRANSLATIONS_ELSEWHERE.to_owned()),
+        }
+    }
+
     /// Keep the open project in step with the shared session, at the end of the frame so this
     /// frame's change goes out. Nothing goes out while a button is held or the live cover form
     /// is open, so one action is one change.
@@ -746,13 +778,7 @@ impl App {
 
     /// Save the open project as a copy in `d` and work on in the copy; the error says why not.
     fn save_as_to(&mut self, d: &Path) -> Result<(), String> {
-        if let Some(why) = self.save_as_refused() {
-            return Err(why.into());
-        }
-        let Some(open) = self.open.as_mut() else {
-            return Err("No project is open.".into());
-        };
-        let (d, links) = open.save_as(d).map_err(|e| format!("Save as failed:\n{e}"))?;
+        let (d, links) = self.save_copy(d)?;
         let mut m = format!("Saved as {}; you are working in the copy now.", d.display());
         if !links.is_empty() {
             // Named, so a file the project reaches through a link can be put in the copy by hand.
@@ -773,6 +799,27 @@ impl App {
         self.prefs.remember(d);
         self.prefs.save();
         Ok(())
+    }
+
+    /// The project's part of [`App::save_as_to`]: copy the open project into `d` and work on
+    /// there. Returns the copy's folder and the links left out. A Translations dialog open for
+    /// the project goes on in the copy, which holds the same `translations.toml`: its OK then
+    /// saves there, as an undo step of the project that is open, not into the original.
+    pub(crate) fn save_copy(&mut self, d: &Path) -> Result<(PathBuf, Vec<PathBuf>), String> {
+        if let Some(why) = self.save_as_refused() {
+            return Err(why.into());
+        }
+        let Some(open) = self.open.as_mut() else {
+            return Err("No project is open.".into());
+        };
+        let from = open.dir.clone();
+        let saved = open.save_as(d).map_err(|e| format!("Save as failed:\n{e}"))?;
+        if let Some(Dialog::Translations(form)) = self.dialog.as_mut()
+            && form.is_for(&from)
+        {
+            form.dir = open.dir.clone();
+        }
+        Ok(saved)
     }
 
     /// Why Save as cannot be done now, checked again when its dialog would open: the assistant
@@ -1456,7 +1503,7 @@ impl App {
         let Some(open) = self.open.as_mut() else { return };
         match a {
             Action::Save if self.assistant.command_running() => {
-                self.ed.message = "Saving waits until the assistant's command has finished.".into();
+                self.ed.message = App::SAVE_WAITS.into();
             }
             Action::Save => match open.save() {
                 Ok(n) => self.ed.message = format!("Saved ({n} files changed)."),
@@ -1468,7 +1515,7 @@ impl App {
                     .into();
             }
             Action::SaveAs if self.assistant.command_running() => {
-                self.ed.message = "Saving waits until the assistant's command has finished.".into();
+                self.ed.message = App::SAVE_WAITS.into();
             }
             Action::SaveAs => self.pending = Some(Pending::SaveAs),
             Action::Undo | Action::Redo => {
@@ -2372,10 +2419,18 @@ impl App {
                     ui.separator();
                     ui.horizontal(|ui| {
                         if ui.button("OK").clicked() {
-                            match form.save() {
+                            let running = self.assistant.command_running();
+                            match App::save_translations(self.open.as_mut(), &self.share, running, form) {
                                 Ok(m) => {
                                     then = Some(Box::new(move |app: &mut App| app.ed.message = m));
                                     keep = false;
+                                }
+                                Err(e)
+                                    if e == Open::TRANSLATIONS_GUEST
+                                        || e == App::SAVE_WAITS
+                                        || e == App::TRANSLATIONS_ELSEWHERE =>
+                                {
+                                    form.error = Some(e);
                                 }
                                 Err(e) => form.error = Some(format!("Saving failed: {e}")),
                             }
