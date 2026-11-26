@@ -313,6 +313,9 @@ struct App {
     fetch: Option<BaseFetch>,
     /// File > Import running on a worker thread ([`App::poll_import`]).
     importing: Option<Importing>,
+    /// Actions that save the project, waiting one frame for the field that had the keyboard to
+    /// enter what was typed in it ([`wait_for_typed_value`]).
+    after_typed: Vec<Action>,
 }
 
 /// File > Import running on a worker thread, and what to do with the project when it ends.
@@ -615,6 +618,9 @@ impl App {
         if !self.share.active() {
             return;
         }
+        // A save waiting for a typed value runs on the project it was asked for first: a
+        // joined copy waits for it, also when an assistant's Undo syncs before the panels.
+        let busy = busy || !self.after_typed.is_empty();
         let page = self.open.as_ref().and_then(|o| match self.ed.panel {
             Some(_) => None,
             None => o.project.pages.get(self.ed.page).map(|p| p.id.clone()),
@@ -777,6 +783,7 @@ impl App {
             live: Default::default(),
             fetch: None,
             importing: None,
+            after_typed: Vec::new(),
         };
         let dir = dir.or_else(|| prefs.recent.first().cloned());
         if let Some(d) = dir {
@@ -807,6 +814,8 @@ impl App {
                     self.dialog = None;
                 }
                 self.ed = Editor::default();
+                // A save waiting for a typed value was for the project left behind.
+                self.after_typed.clear();
                 // The fresh editor keeps the user's hidden and locked layers (`prefs` is the
                 // user's list here: `self.prefs` may be taken out while this runs).
                 self.ed.layers = prefs.layers.clone();
@@ -1577,12 +1586,31 @@ impl App {
             _ => {}
         }
         let Some(open) = self.open.as_mut() else { return };
+        // A black box form changed and not applied yet is applied before the project is saved.
+        // Why it was refused, or what to check after it went in, stays in the message the save
+        // leaves.
+        let refused = if saves_project(a) && !self.assistant.command_running() {
+            match panels::apply_black_box_draft(open, &mut self.ed, &mut self.panels) {
+                Ok(note) => note,
+                Err(r) => Some(r),
+            }
+        } else {
+            None
+        };
+        if let Some(r) = &refused {
+            self.ed.message = r.clone();
+        }
         match a {
             Action::Save if self.assistant.command_running() => {
                 self.ed.message = App::SAVE_WAITS.into();
             }
             Action::Save => match open.save() {
-                Ok(n) => self.ed.message = format!("Saved ({n} files changed)."),
+                Ok(n) => {
+                    self.ed.message = match &refused {
+                        Some(r) => format!("Saved ({n} files changed). {r}"),
+                        None => format!("Saved ({n} files changed)."),
+                    }
+                }
                 // A file changed outside that Save would write over asks first (#662).
                 Err(e) => {
                     // Only when that is what stopped this save: another error is shown as it is.
@@ -5004,6 +5032,38 @@ fn arrow_steps(i: &egui::InputState, step: f64) -> Vec<wc_core::geom::Point> {
 
 /// A project's title-block fields as form rows: the standard fields first (empty when not
 /// set), then any others the project has.
+/// Whether `a` saves the open project: what was typed in a field and not entered yet is
+/// entered first.
+fn saves_project(a: Action) -> bool {
+    matches!(a, Action::Save | Action::SaveAs | Action::NewProject)
+}
+
+/// A value typed in a field (a Properties field, say) is entered when the field is left or on
+/// Enter. When this frame's actions save the project while a field still has the keyboard
+/// (Ctrl+S typed in it), the saving action and those after it are taken out of `actions` and
+/// returned, to wait one frame: the field keeps the keyboard for this frame, so text typed in
+/// the same frame as Ctrl+S still reaches it. `App::update` takes them up in the next frame
+/// with [`enter_typed_value`] (#932).
+fn wait_for_typed_value(ctx: &egui::Context, actions: &mut Vec<Action>) -> Vec<Action> {
+    let Some(at) = actions.iter().position(|a| saves_project(*a)) else {
+        return Vec::new();
+    };
+    if ctx.memory(|m| m.focused()).is_none() {
+        return Vec::new();
+    }
+    ctx.request_repaint();
+    actions.split_off(at)
+}
+
+/// The frame after [`wait_for_typed_value`]: the field with the keyboard gives it up before
+/// the panels are drawn, so they see it left and enter its value as one undo step; a refused
+/// value shows its reason there. The waiting actions run once the panels are drawn.
+fn enter_typed_value(ctx: &egui::Context) {
+    if let Some(field) = ctx.memory(|m| m.focused()) {
+        ctx.memory_mut(|m| m.surrender_focus(field));
+    }
+}
+
 /// The Ctrl shortcuts pressed this frame, none while a dialog is open.
 fn ctrl_shortcuts(ctx: &egui::Context, dialog_open: bool) -> Vec<Action> {
     let mut out = Vec::new();
@@ -5524,6 +5584,18 @@ impl eframe::App for App {
         } else {
             actions.extend(self.route_to_symbol_editor(keys));
         }
+        // The waiting actions stay in `after_typed` until they run after the panels, so
+        // whatever checks it meanwhile (a session join, say, also one an assistant's Undo
+        // brings about) still sees the save waiting.
+        let typed_waits = !self.after_typed.is_empty();
+        if typed_waits {
+            // A save waiting for a typed value runs first: this frame's actions (an Open that
+            // would replace the project, say) wait behind it.
+            enter_typed_value(ctx);
+            self.after_typed.append(&mut actions);
+        } else {
+            self.after_typed = wait_for_typed_value(ctx, &mut actions);
+        }
         for a in actions {
             self.run(a);
         }
@@ -5534,7 +5606,13 @@ impl eframe::App for App {
             o.follow_terminals();
         }
         self.live_check(ctx);
-        self.poll_fetch(ctx);
+        // A fetched base project replaces the open one: not while a save waits for a typed
+        // value, which first goes into the project it was asked for.
+        if self.after_typed.is_empty() {
+            self.poll_fetch(ctx);
+        } else {
+            ctx.request_repaint();
+        }
         self.poll_import(ctx);
         self.log_messages();
         self.assistant_poll(ctx);
@@ -5634,6 +5712,15 @@ impl eframe::App for App {
             }
         }
         for a in page_actions {
+            self.run(a);
+        }
+        // The panels have entered the value typed in the field that gave up the keyboard.
+        let after_panels = if typed_waits {
+            std::mem::take(&mut self.after_typed)
+        } else {
+            Vec::new()
+        };
+        for a in after_panels {
             self.run(a);
         }
         self.run_menu_action();
@@ -7319,6 +7406,7 @@ mod nudge_tests {
             live: Default::default(),
             fetch: None,
             importing: None,
+            after_typed: Vec::new(),
         };
         (tmp, app, egui::Context::default())
     }
@@ -7435,6 +7523,319 @@ mod nudge_tests {
             assert!(app.open.as_mut().unwrap().undo());
             assert_eq!((coil_at(&app), wires(&app)), (Point::new(55.0, 60.0), 0));
         }
+    }
+
+    /// A device tag typed in the Properties panel and not entered yet (the field still has the
+    /// keyboard) is entered before Ctrl+S saves, one frame later: the saved project has it (#932).
+    #[test]
+    fn ctrl_s_saves_a_value_typed_but_not_entered_yet() {
+        let (_tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        let mut frame = eframe::Frame::_new_kittest();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        let field = egui::Id::new(panels::TAG_FIELD);
+        let mut frame_with = |app: &mut App, events: Vec<egui::Event>, modifiers: Modifiers| {
+            let raw = egui::RawInput {
+                events,
+                modifiers,
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| eframe::App::update(app, ctx, &mut frame));
+        };
+        let tag = |app: &App| {
+            let open = app.open.as_ref().unwrap();
+            open.project.pages[app.ed.page].symbols[1]
+                .tag
+                .as_ref()
+                .map(ToString::to_string)
+        };
+        frame_with(&mut app, Vec::new(), Modifiers::NONE);
+        ctx.memory_mut(|m| m.request_focus(field));
+        frame_with(&mut app, Vec::new(), Modifiers::NONE);
+        assert!(
+            ctx.memory(|m| m.has_focus(field)),
+            "the device tag field has the keyboard"
+        );
+        let before = tag(&app).unwrap();
+        // The cursor goes to the end of the field: "-K2" becomes "-K27". The text and Ctrl+S
+        // come in one frame, as with fast typing: the field still takes the text.
+        let typed = format!("{before}7");
+        let save = egui::Event::Key {
+            key: Key::S,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        };
+        frame_with(&mut app, vec![egui::Event::Text("7".into()), save], Modifiers::COMMAND);
+        assert_eq!(tag(&app), Some(before), "typed, not entered yet");
+        assert_eq!(app.after_typed, [Action::Save], "the save waits a frame");
+        // Ctrl+O in the frame the save waits for runs after the save, on the project saved.
+        let open_key = egui::Event::Key {
+            key: Key::O,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        };
+        frame_with(&mut app, vec![open_key], Modifiers::COMMAND);
+        assert!(
+            matches!(app.pending, Some(Pending::Open)),
+            "the Open waited behind the save"
+        );
+        assert_eq!(tag(&app).as_ref(), Some(&typed), "entered before the save");
+        let open = app.open.as_ref().unwrap();
+        assert!(!open.dirty, "saved after the value was entered");
+        let saved = wc_core::store::load(&open.dir).unwrap();
+        let page = &saved.pages[app.ed.page];
+        assert!(
+            page.symbols
+                .iter()
+                .any(|s| s.tag.as_ref().is_some_and(|t| t.to_string() == typed)),
+            "the saved project has the typed tag"
+        );
+    }
+
+    /// A base project fetched for a new project while Ctrl+S waits a frame for a typed value
+    /// does not replace the open project first: the open project is saved with the typed value,
+    /// and the new one still waits (#932).
+    #[test]
+    fn a_fetched_project_waits_while_a_save_waits_for_a_typed_value() {
+        let (tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        let mut frame = eframe::Frame::_new_kittest();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        let field = egui::Id::new(panels::TAG_FIELD);
+        let mut frame_with = |app: &mut App, events: Vec<egui::Event>, modifiers: Modifiers| {
+            let raw = egui::RawInput {
+                events,
+                modifiers,
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| eframe::App::update(app, ctx, &mut frame));
+        };
+        let tag = |app: &App| {
+            let open = app.open.as_ref().unwrap();
+            open.project.pages[app.ed.page].symbols[1]
+                .tag
+                .as_ref()
+                .map(ToString::to_string)
+        };
+        frame_with(&mut app, Vec::new(), Modifiers::NONE);
+        ctx.memory_mut(|m| m.request_focus(field));
+        frame_with(&mut app, Vec::new(), Modifiers::NONE);
+        assert!(
+            ctx.memory(|m| m.has_focus(field)),
+            "the device tag field has the keyboard"
+        );
+        let typed = format!("{}7", tag(&app).unwrap());
+        let was_open = app.open.as_ref().unwrap().dir.clone();
+        // A new project's base project is fetched, and its outcome is already in.
+        let new_dir = tmp.path().join("fetched");
+        wc_core::store::create(&new_dir, "Fetched").unwrap();
+        let (tx, done) = std::sync::mpsc::channel();
+        tx.send(Ok(())).unwrap();
+        app.fetch = Some(BaseFetch {
+            dir: new_dir,
+            source: "https://example.invalid/base.git".into(),
+            was_open: Some(was_open.clone()),
+            made: false,
+            cancel: std::sync::Arc::default(),
+            done,
+        });
+        let save = egui::Event::Key {
+            key: Key::S,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        };
+        frame_with(&mut app, vec![egui::Event::Text("7".into()), save], Modifiers::COMMAND);
+        assert_eq!(app.after_typed, [Action::Save], "the save waits a frame");
+        assert_eq!(
+            app.open.as_ref().map(|o| &o.dir),
+            Some(&was_open),
+            "the fetched project does not replace the open one while the save waits"
+        );
+        frame_with(&mut app, Vec::new(), Modifiers::NONE);
+        assert!(app.after_typed.is_empty(), "the save ran");
+        let open = app.open.as_ref().unwrap();
+        assert_eq!(open.dir, was_open, "the open project was saved before any replacement");
+        assert!(!open.dirty, "saved after the value was entered");
+        assert_eq!(tag(&app).as_ref(), Some(&typed), "entered before the save");
+        let saved = wc_core::store::load(&was_open).unwrap();
+        assert!(
+            saved.pages[app.ed.page]
+                .symbols
+                .iter()
+                .any(|s| s.tag.as_ref().is_some_and(|t| t.to_string() == typed)),
+            "the saved project has the typed tag"
+        );
+        assert!(app.fetch.is_some(), "the fetched project still waits to be opened");
+        // Not opened here: opening it would remember it in the user's own settings.
+        app.fetch = None;
+    }
+
+    /// A session join that would replace the open project waits while a save waits for a
+    /// typed value, also when something syncs the session before the panels have entered it
+    /// (an assistant's Undo does): the typed value is saved in the project it was typed in,
+    /// then the joined copy opens (#932).
+    #[test]
+    fn a_session_join_waits_while_a_save_waits_for_a_typed_value() {
+        let (tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        let mut frame = eframe::Frame::_new_kittest();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        let field = egui::Id::new(panels::TAG_FIELD);
+        let mut frame_with = |app: &mut App, events: Vec<egui::Event>, modifiers: Modifiers| {
+            let raw = egui::RawInput {
+                events,
+                modifiers,
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| eframe::App::update(app, ctx, &mut frame));
+        };
+        frame_with(&mut app, Vec::new(), Modifiers::NONE);
+        ctx.memory_mut(|m| m.request_focus(field));
+        frame_with(&mut app, Vec::new(), Modifiers::NONE);
+        assert!(
+            ctx.memory(|m| m.has_focus(field)),
+            "the device tag field has the keyboard"
+        );
+        let first = app.open.as_ref().unwrap().dir.clone();
+        let page = app.ed.page;
+        let before = app.open.as_ref().unwrap().project.pages[page].symbols[1]
+            .tag
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap();
+        let typed = format!("{before}7");
+        // A host has let this window in: the joined copy opens at the next sync that may.
+        let (_host, guest) = crate::share::tests::let_in_guest(tmp.path()).unwrap();
+        app.share = guest;
+        let save = egui::Event::Key {
+            key: Key::S,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        };
+        frame_with(&mut app, vec![egui::Event::Text("7".into()), save], Modifiers::COMMAND);
+        assert_eq!(app.after_typed, [Action::Save], "the save waits a frame");
+        assert_eq!(app.open.as_ref().unwrap().dir, first, "not joined in the Ctrl+S frame");
+        // A sync before the panels of the next frame, as an assistant's Undo makes.
+        app.sync_session_now(false);
+        assert_eq!(app.open.as_ref().unwrap().dir, first, "the join waits for the save");
+        frame_with(&mut app, Vec::new(), Modifiers::NONE);
+        assert!(app.after_typed.is_empty(), "the save ran");
+        let saved = wc_core::store::load(&first).unwrap();
+        assert!(
+            saved.pages[page]
+                .symbols
+                .iter()
+                .any(|s| s.tag.as_ref().is_some_and(|t| t.to_string() == typed)),
+            "the typed tag is saved in the project it was typed in"
+        );
+        assert_ne!(app.open.as_ref().unwrap().dir, first, "then the joined copy opened");
+    }
+
+    /// A black box form changed and not applied is applied by Ctrl+S: the project read back
+    /// from disk has the new point name (#932).
+    #[test]
+    fn ctrl_s_saves_a_black_box_form_not_applied() {
+        use wc_core::{BoxPin, BoxSide};
+        let (_tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        let page = app.ed.page;
+        let pins = [BoxPin {
+            name: "1".into(),
+            side: BoxSide::Left,
+            offset: 5.0,
+        }];
+        let open = app.open.as_mut().unwrap();
+        let id = open
+            .add_black_box(page, Point::new(120.0, 40.0), Point::new(140.0, 50.0), &pins, None)
+            .unwrap();
+        app.ed.select_only(Selection::Symbol(id.clone()));
+        let mut frame = eframe::Frame::_new_kittest();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame)
+        });
+        let form = panels::black_box_form_mut(&mut app.panels).unwrap();
+        form.rows[0].name = "A".into();
+        let save = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: Key::S,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::COMMAND,
+            }],
+            modifiers: Modifiers::COMMAND,
+            ..Default::default()
+        };
+        let _ = ctx.run(save, |ctx| eframe::App::update(&mut app, ctx, &mut frame));
+        let open = app.open.as_ref().unwrap();
+        assert!(!open.dirty, "saved");
+        let back = state::Open::load(&open.dir).unwrap();
+        let symbol = back.project.pages[page].symbol(&id).unwrap().symbol.clone();
+        let names: Vec<&str> = back.symbols[&symbol].pins.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["A"], "the saved box has the point name typed in the form");
+    }
+
+    /// What to check after a black box form goes in with the save (a wire on a point that
+    /// moved, say) stays in the Save message (#932).
+    #[test]
+    fn ctrl_s_keeps_the_black_box_warnings_in_its_message() {
+        use wc_core::{BoxPin, BoxSide, Endpoint};
+        let (_tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        let page = app.ed.page;
+        let pins = [BoxPin {
+            name: "1".into(),
+            side: BoxSide::Left,
+            offset: 5.0,
+        }];
+        let open = app.open.as_mut().unwrap();
+        let id = open
+            .add_black_box(page, Point::new(120.0, 40.0), Point::new(140.0, 50.0), &pins, None)
+            .unwrap();
+        open.add_wire(
+            page,
+            Endpoint::Pin {
+                item: id.clone(),
+                pin: "1".into(),
+            },
+            Endpoint::Point {
+                at: Point::new(100.0, 45.0),
+            },
+            Vec::new(),
+        );
+        app.ed.select_only(Selection::Symbol(id));
+        let mut frame = eframe::Frame::_new_kittest();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame)
+        });
+        let form = panels::black_box_form_mut(&mut app.panels).unwrap();
+        form.rows[0].offset = 7.5;
+        app.carry_out(Action::Save);
+        assert!(!app.open.as_ref().unwrap().dirty, "saved");
+        assert!(app.ed.message.starts_with("Saved ("), "{}", app.ed.message);
+        assert!(app.ed.message.contains("which moved"), "{}", app.ed.message);
+        // The point moved again, with the very same words already in the status line (as an
+        // Apply leaves them): the Save still says them.
+        let warning = app.ed.message.split_once(". ").unwrap().1.to_owned();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame)
+        });
+        let form = panels::black_box_form_mut(&mut app.panels).unwrap();
+        form.rows[0].offset = 10.0;
+        app.ed.message = warning.clone();
+        app.carry_out(Action::Save);
+        assert!(app.ed.message.starts_with("Saved ("), "{}", app.ed.message);
+        assert!(app.ed.message.ends_with(&warning), "{}", app.ed.message);
     }
 
     #[test]
@@ -7833,6 +8234,7 @@ mod menu_action_tests {
             live: Default::default(),
             fetch: None,
             importing: None,
+            after_typed: Vec::new(),
         };
         (tmp, app, id)
     }
