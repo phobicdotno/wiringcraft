@@ -482,6 +482,16 @@ pub fn specs() -> Vec<Value> {
             &["kind"],
         ),
         tool(
+            "report_layouts",
+            "Report layouts (as the report layout dialog edits them): get (each report's layout as JSON, null when built in, with its built-in columns and what in the layout names nothing; one report with kind), set (replace one report's layout) or reset (back to the built-in layout). A layout is {title, column: [{from, heading}], sort, group, header}: column lists the shown columns in order by their built-in heading (empty keeps them all), sort names columns with - in front for descending, group a column to group rows by, header title-block keys printed above the table (project.name, revision ...). Each change is one undo step.",
+            json!({
+                "action": {"type": "string", "enum": ["get", "set", "reset"]},
+                "kind": {"type": "string", "enum": reports, "description": "The report (optional for get)."},
+                "layout": {"type": "object", "description": "set: the report's whole layout, in get's format."}
+            }),
+            &["action"],
+        ),
+        tool(
             "panels",
             "Cabinet panel layouts: get (items as JSON), new (mounting plate with ducts and DIN rails), arrange (put devices with parts onto the rails, optionally one location like +CAB1), delete, or replace (set the layout's items, name and size from JSON).",
             json!({
@@ -1167,7 +1177,7 @@ impl wc_agent::Tools for AppTools<'_> {
             "set_device" => format!("Set device {}", s(input, "tag").unwrap_or_default()),
             "run_action" => format!("Ran {}", s(input, "action").unwrap_or_default()),
             "run_command" => format!("wiringcraft {}", strings(input, "args").join(" ")),
-            "comments" | "macros" | "panels" | "library" | "versions" | "jumpers" | "strips" => {
+            "comments" | "macros" | "panels" | "library" | "versions" | "jumpers" | "strips" | "report_layouts" => {
                 format!("{name}: {}", s(input, "action").unwrap_or_default())
             }
             "export" => format!("Exported {}", s(input, "format").unwrap_or_default()),
@@ -1827,6 +1837,7 @@ impl App {
                 Ok(clip_text(wc_report::build(kind, &inputs).to_markdown(), 60_000))
             }
             "panels" => self.tool_panels(v),
+            "report_layouts" => self.tool_report_layouts(v),
             "library" => {
                 let open = need_open(self.open.as_mut())?;
                 let lib = wc_library::Library::open(&open.dir, &open.project).map_err(|e| e.to_string())?;
@@ -2624,6 +2635,88 @@ impl App {
                 Ok(format!("Saved the macro to {}.", path.display()))
             }
             other => Err(format!("Unknown macros action {other}.")),
+        }
+    }
+
+    /// The `report_layouts` tool: read, replace or reset a report's layout through the report
+    /// layout dialog's form, so a layout is checked and kept as OK in the dialog keeps it.
+    fn tool_report_layouts(&mut self, v: &Value) -> Result<String, String> {
+        use crate::report_layout_form::Form;
+        let action = need_s(v, "action")?;
+        let kind = s(v, "kind")
+            .map(|k| wc_report::Kind::parse(k.trim()).ok_or_else(|| format!("Unknown report {k:?}.")))
+            .transpose()?;
+        let open = need_open(self.open.as_mut())?;
+        let builtin = |open: &crate::state::Open, kind| {
+            let inputs = wc_report::Inputs {
+                project: &open.project,
+                symbols: &open.symbols,
+                parts: &open.parts,
+            };
+            wc_report::build_builtin(kind, &inputs).columns
+        };
+        // What wc_report warns about the project's layout for `kind` (as `wc_report` and
+        // `wiringcraft report` name it).
+        let warnings = |open: &crate::state::Open, kind: wc_report::Kind| -> Vec<String> {
+            let inputs = wc_report::Inputs {
+                project: &open.project,
+                symbols: &open.symbols,
+                parts: &open.parts,
+            };
+            let about = format!("report layout for \"{}\":", kind.name());
+            wc_report::layout_warnings(&inputs)
+                .into_iter()
+                .filter(|w| w.starts_with(&about))
+                .collect()
+        };
+        match action {
+            "get" => {
+                let kinds = kind.map_or_else(|| wc_report::Kind::ALL.to_vec(), |k| vec![k]);
+                let out: Vec<Value> = kinds
+                    .into_iter()
+                    .map(|k| {
+                        json!({
+                            "kind": k.name(),
+                            "layout": wc_report::layout_for(&open.project, k),
+                            "builtin_columns": builtin(open, k),
+                            "warnings": warnings(open, k),
+                        })
+                    })
+                    .collect();
+                Ok(pretty(&json!(out)))
+            }
+            "set" | "reset" => {
+                let kind = kind.ok_or("Give the report's kind.")?;
+                let columns = builtin(open, kind);
+                let form = if action == "reset" {
+                    Form::new(kind, columns, wc_report::layout_for(&open.project, kind)).cleared()
+                } else {
+                    let mut given = v.get("layout").cloned().ok_or("Give the layout.")?;
+                    let Some(fields) = given.as_object_mut() else {
+                        return Err("The layout must be an object.".into());
+                    };
+                    fields.insert("kind".into(), json!(kind.name()));
+                    let layout: wc_core::report_layout::ReportLayout =
+                        serde_json::from_value(given).map_err(|e| format!("Bad layout: {e}"))?;
+                    // Read into the dialog's form as the dialog would show it, so it is kept
+                    // as OK keeps it (a layout that shows the built-in one keeps none).
+                    Form::new(kind, columns, Some(&layout))
+                };
+                let layout = form.kept()?;
+                let built_in = layout.is_none();
+                open.set_report_layout(kind, layout);
+                let mut said = if built_in {
+                    format!("The {} report has its built-in layout.", kind.name())
+                } else {
+                    format!("The {} report's layout is set.", kind.name())
+                };
+                let warned = warnings(open, kind);
+                if !warned.is_empty() {
+                    said.push_str(&format!(" Warnings:\n{}", warned.join("\n")));
+                }
+                Ok(said)
+            }
+            a => Err(format!("Unknown report_layouts action {a}.")),
         }
     }
 
@@ -5846,6 +5939,83 @@ mod tests {
         let err = a.apply_rules(&[], &odd, Path::new("elsewhere")).err().unwrap();
         assert!(err.contains("another project"), "{err}");
         assert_eq!(rules(&a).len(), 2);
+    }
+
+    #[test]
+    fn the_assistant_reads_sets_and_resets_a_report_layout_as_one_undo_step_each() {
+        let (_tmp, mut a) = app(vec![]);
+        let get =
+            |a: &mut App, v: Value| -> Value { serde_json::from_str(&call(a, "report_layouts", v).unwrap()).unwrap() };
+        let reports = |a: &App| a.open.as_ref().unwrap().project.meta.reports.clone();
+        let all = get(&mut a, json!({"action": "get"}));
+        assert_eq!(all.as_array().map(Vec::len), Some(wc_report::Kind::ALL.len()));
+        let parts = get(&mut a, json!({"action": "get", "kind": "parts"}));
+        assert_eq!(parts[0]["layout"], Value::Null);
+        let builtin: Vec<String> = serde_json::from_value(parts[0]["builtin_columns"].clone()).unwrap();
+        assert!(builtin.len() >= 2, "{builtin:?}");
+
+        // Bad input changes nothing.
+        for bad in [
+            json!({"action": "set", "kind": "parts"}),
+            json!({"action": "set", "layout": {}}),
+            json!({"action": "set", "kind": "nope", "layout": {}}),
+            json!({"action": "set", "kind": "parts", "layout": {"column": "Tag"}}),
+            json!({"action": "shuffle", "kind": "parts"}),
+        ] {
+            assert!(call(&mut a, "report_layouts", bad.clone()).is_err(), "{bad}");
+        }
+        assert!(reports(&a).is_empty());
+        let mark = a.open.as_ref().unwrap().undo_mark();
+
+        // Set: kept as the dialog keeps it (trimmed), with wc_report's warnings in the answer.
+        let said = call(
+            &mut a,
+            "report_layouts",
+            json!({"action": "set", "kind": "parts", "layout": {
+                "title": " Bill of materials ",
+                "column": [{"from": builtin[1], "heading": "Second"}, {"from": builtin[0]}],
+                "sort": [format!("-{}", builtin[0])],
+                "group": "Maker",
+                "header": ["project.name", "revison"]
+            }}),
+        )
+        .unwrap();
+        assert!(said.contains("cannot group by \"Maker\""), "{said}");
+        assert!(said.contains("header \"revison\""), "{said}");
+        let kept = reports(&a);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].kind, "parts");
+        assert_eq!(kept[0].title.as_deref(), Some("Bill of materials"));
+        assert_eq!(kept[0].columns.len(), 2);
+        assert_eq!(kept[0].columns[0].heading.as_deref(), Some("Second"));
+        assert_eq!(kept[0].sort, [format!("-{}", builtin[0])]);
+        let read = get(&mut a, json!({"action": "get", "kind": "parts"}));
+        assert_eq!(read[0]["layout"]["title"], json!("Bill of materials"));
+        assert_eq!(read[0]["warnings"].as_array().map(Vec::len), Some(2));
+        assert!(a.open.as_mut().unwrap().undo());
+        assert!(reports(&a).is_empty(), "one undo step");
+        assert_eq!(a.open.as_ref().unwrap().undo_mark(), mark);
+        assert!(a.open.as_mut().unwrap().redo());
+        assert_eq!(reports(&a), kept);
+
+        // A layout that shows the built-in one keeps none, as in the dialog.
+        let every: Vec<Value> = builtin.iter().map(|c| json!({"from": c})).collect();
+        call(
+            &mut a,
+            "report_layouts",
+            json!({"action": "set", "kind": "parts", "layout": {"column": every}}),
+        )
+        .unwrap();
+        assert!(reports(&a).is_empty());
+        assert!(a.open.as_mut().unwrap().undo());
+        assert_eq!(reports(&a), kept);
+
+        // Reset: back to the built-in layout, one undo step.
+        let said = call(&mut a, "report_layouts", json!({"action": "reset", "kind": "parts"})).unwrap();
+        assert!(said.contains("built-in"), "{said}");
+        assert!(reports(&a).is_empty());
+        assert!(a.open.as_mut().unwrap().undo());
+        assert_eq!(reports(&a), kept);
     }
 
     #[test]
