@@ -341,13 +341,13 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "rotate_items",
-            "Rotate symbols 90 degrees each (repeat for more).",
+            "Rotate symbols 90 degrees each (repeat for more). Wires and free drawings are left as they are; ids that are all of those are refused.",
             json!({"ids": ids_arg(), "page": page_arg()}),
             &["ids"],
         ),
         tool(
             "mirror_items",
-            "Mirror symbols left to right.",
+            "Mirror symbols left to right. Wires and free drawings are left as they are; ids that are all of those are refused.",
             json!({"ids": ids_arg(), "page": page_arg()}),
             &["ids"],
         ),
@@ -1702,8 +1702,40 @@ impl App {
                         open.checkpoint();
                         open.move_by(page, &sel, d);
                     }
-                    "rotate_items" => open.rotate_many(page, &sel),
-                    "mirror_items" => open.mirror_many(page, &sel),
+                    "rotate_items" | "mirror_items" => {
+                        // Only symbols turn or mirror, as Rotate and Mirror in the menu: the
+                        // other ids are named, so the answer does not claim they changed.
+                        let (turned, left): (Vec<_>, Vec<_>) = ids
+                            .iter()
+                            .zip(&sel)
+                            .partition(|(_, s)| matches!(s, Selection::Symbol(_)));
+                        let names = |l: &[(&String, &Selection)]| {
+                            l.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>().join(", ")
+                        };
+                        let (done, verb) = if name == "rotate_items" {
+                            ("Rotated", "rotate")
+                        } else {
+                            ("Mirrored", "mirror")
+                        };
+                        if turned.is_empty() {
+                            return Err(format!(
+                                "Nothing changed: {} {} no symbol, and only symbols {verb}.",
+                                names(&left),
+                                if left.len() == 1 { "is" } else { "are" }
+                            ));
+                        }
+                        if name == "rotate_items" {
+                            open.rotate_many(page, &sel);
+                        } else {
+                            open.mirror_many(page, &sel);
+                        }
+                        let skipped = if left.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" Left as they were: {} (only symbols {verb}).", names(&left))
+                        };
+                        return Ok(format!("{done} {}.{skipped}", names(&turned)));
+                    }
                     _ => {
                         // What a hidden or locked layer keeps off the canvas is not selected
                         // (nor said to be): only the rest is.
@@ -5875,6 +5907,59 @@ mod tests {
 
         a.run(Action::Undo);
         assert_eq!(counts(&a), before, "one Undo takes the copy back");
+    }
+
+    #[test]
+    fn rotate_and_mirror_name_the_wires_and_drawings_they_leave_alone() {
+        let (_tmp, mut a) = app(vec![]);
+        let s = call(
+            &mut a,
+            "place_symbol",
+            json!({"page": "p0002", "symbol": "wc.coil", "x": 50, "y": 50}),
+        )
+        .unwrap();
+        let sym = serde_json::from_str::<Value>(&s).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let w = call(
+            &mut a,
+            "add_wire",
+            json!({"page": "p0002", "from": {"x": 10, "y": 10}, "to": {"x": 30, "y": 10}}),
+        )
+        .unwrap();
+        let wire = w.trim_start_matches("Added wire ").trim_end_matches('.').to_owned();
+        let line = json!({"kind": "line", "a": {"x": 0, "y": 0}, "b": {"x": 5, "y": 0}});
+        call(&mut a, "add_graphic", json!({"page": "p0002", "shape": line})).unwrap();
+
+        // Only a wire and a drawing: refused, with nothing changed and no undo step.
+        for tool in ["rotate_items", "mirror_items"] {
+            let before = page2(&a).clone();
+            let undo = a.open.as_ref().unwrap().undo_mark();
+            let e = call(&mut a, tool, json!({"page": "p0002", "ids": [wire, "g0"]})).unwrap_err();
+            assert!(
+                e.starts_with("Nothing changed") && e.contains(&wire) && e.contains("g0"),
+                "{tool}: {e}"
+            );
+            assert_eq!(page2(&a), &before, "{tool}");
+            assert_eq!(a.open.as_ref().unwrap().undo_mark(), undo, "{tool}: no undo step");
+        }
+
+        // With a symbol among them: the symbol changes and the rest is named.
+        let r = call(
+            &mut a,
+            "rotate_items",
+            json!({"page": "p0002", "ids": [sym, wire, "g0"]}),
+        )
+        .unwrap();
+        assert_eq!(
+            r,
+            format!("Rotated {sym}. Left as they were: {wire}, g0 (only symbols rotate).")
+        );
+        assert_eq!(page2(&a).symbol(&sym).unwrap().rotation, Rotation::R90);
+        let r = call(&mut a, "mirror_items", json!({"page": "p0002", "ids": [sym]})).unwrap();
+        assert_eq!(r, format!("Mirrored {sym}."));
+        assert!(page2(&a).symbol(&sym).unwrap().mirror);
     }
 
     #[test]
