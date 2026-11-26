@@ -54,6 +54,8 @@ pub struct Editor {
     pub shape_page: Option<String>,
     /// Enter was pressed (and no dialog or text field took it): finish the polyline being drawn.
     pub finish_shape: bool,
+    /// Escape was pressed during a select-tool drag (see [`Editor::dragging`]): cancel it.
+    pub cancel_drag: bool,
     /// Where and when (egui time, seconds) the last drawing click landed, to tell a quick
     /// repeat on a polyline's last point (which ends it) from a slow one.
     pub last_shape_click: Option<(Point, f64)>,
@@ -113,6 +115,7 @@ impl Default for Editor {
             shape_points: Vec::new(),
             shape_page: None,
             finish_shape: false,
+            cancel_drag: false,
             last_shape_click: None,
             ask_text: None,
             ask_comment: None,
@@ -168,6 +171,12 @@ enum Drag {
 }
 
 impl Editor {
+    /// Whether a select-tool drag (a move, a selection box, a logo or black box sizing drag)
+    /// is going on, so Escape cancels it instead of doing what it does otherwise.
+    pub fn dragging(&self) -> bool {
+        self.drag.is_some()
+    }
+
     /// Who holds the page shown, in a shared session: then it is read-only here and only
     /// selecting, panning and zooming work on it. `None` in the panel view and on own pages.
     pub fn held_page<'a>(&'a self, project: &wc_core::Project) -> Option<&'a str> {
@@ -1370,6 +1379,9 @@ fn select_tool(
         ed.drag = Some(drag_start(open, ed, page, at, tol, snap_step, shift, held));
     }
     stop_if_held(ed, held);
+    if std::mem::take(&mut ed.cancel_drag) {
+        cancel_drag(open, ed);
+    }
     match ed.drag.clone() {
         Some(Drag::Logo {
             from,
@@ -1695,6 +1707,38 @@ fn stop_if_held(ed: &mut Editor, held: bool) {
     {
         ed.drag = None;
     }
+}
+
+/// Escape during a select-tool drag (#737): a move or a logo drag puts back what it moved and
+/// drops its undo step, so it is as if it never happened; a black box sizing drag (which only
+/// changes the box on release) and a selection box are just dropped. The drag ends, so the
+/// release that follows does nothing (no wiring of pins that line up).
+fn cancel_drag(open: &mut Open, ed: &mut Editor) {
+    let drag = ed.drag.take();
+    let Some(before) = open.before_last_change() else {
+        return;
+    };
+    match drag {
+        Some(Drag::Move { checkpoint: true, .. }) => {
+            // Only the page moved on: a sync of other pages since the drag began stays.
+            let id = open.project.pages.get(ed.page).map(|p| p.id.clone());
+            let was = id.and_then(|id| before.pages.iter().find(|p| p.id == id)).cloned();
+            let (Some(was), Some(now)) = (was, open.project.pages.get_mut(ed.page)) else {
+                return;
+            };
+            *now = was;
+        }
+        Some(Drag::Logo { checkpoint: true, .. }) => {
+            let was = before.meta.logo.as_ref().and_then(|l| l.cover);
+            let Some(logo) = open.project.meta.logo.as_mut() else {
+                return;
+            };
+            logo.cover = was;
+        }
+        _ => return,
+    }
+    open.forget_terminal_change();
+    open.forget_last_change();
 }
 
 fn drag_released(open: &mut Open, ed: &mut Editor, alt: bool) {
@@ -4042,6 +4086,44 @@ mod tests {
         });
         stop_if_held(&mut ed, true);
         assert!(matches!(ed.drag, Some(Drag::Box { .. })));
+    }
+
+    #[test]
+    fn escape_during_a_move_puts_it_back_and_wires_nothing() {
+        let (_tmp, mut o, mut ed, _) = moving_coil();
+        let before = o.project.clone();
+        let steps = o.undo_steps();
+        drag(&mut o, &mut ed, Point::new(-40.0, 0.0));
+        assert_ne!(o.project.pages, before.pages);
+        assert!(ed.dragging());
+        cancel_drag(&mut o, &mut ed);
+        assert!(!ed.dragging());
+        assert_eq!(o.project.pages, before.pages, "the move is taken back");
+        assert_eq!(o.undo_steps(), steps, "and leaves no undo step behind");
+        // The release that follows adds no wires.
+        drag_released(&mut o, &mut ed, false);
+        assert!(o.project.pages[ed.page].wires.is_empty());
+        assert!(ed.message.is_empty());
+    }
+
+    #[test]
+    fn escape_before_a_move_has_moved_or_during_a_selection_box_just_ends_the_drag() {
+        let (_tmp, mut o, mut ed, _) = moving_coil();
+        let before = o.project.clone();
+        let steps = o.undo_steps();
+        ed.drag = Some(Drag::Move {
+            from: Point::new(0.0, 0.0),
+            checkpoint: false,
+        });
+        cancel_drag(&mut o, &mut ed);
+        assert!(ed.drag.is_none());
+        ed.drag = Some(Drag::Box {
+            from: Point::new(0.0, 0.0),
+        });
+        cancel_drag(&mut o, &mut ed);
+        assert!(ed.drag.is_none());
+        assert_eq!(o.project, before);
+        assert_eq!(o.undo_steps(), steps);
     }
 
     #[test]

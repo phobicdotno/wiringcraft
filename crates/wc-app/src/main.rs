@@ -1958,7 +1958,10 @@ impl App {
                 self.ed.finish_shape = true;
             }
             if i.key_pressed(Key::Escape) {
-                if self.ed.tool == Tool::BlackBox && self.ed.black_box.is_some() {
+                if self.ed.dragging() {
+                    // The canvas takes the drag back (#737).
+                    self.ed.cancel_drag = true;
+                } else if self.ed.tool == Tool::BlackBox && self.ed.black_box.is_some() {
                     self.ed.black_box = None;
                     self.ed.message = black_box_tool::hint(None).into();
                 } else if !self.ed.shape_points.is_empty() {
