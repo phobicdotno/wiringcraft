@@ -44,6 +44,13 @@ impl M {
         let tol = 1e-9 * x.max(y);
         (x - y).abs() <= tol && (a * c + b * d).abs() <= tol
     }
+    /// Whether the transform flattens everything onto a line or a point (it can't be undone).
+    /// SVG doesn't draw an element with such a transform.
+    fn is_singular(&self) -> bool {
+        let [a, b, c, d, ..] = self.0;
+        let x = (a * a + b * b).max(c * c + d * d);
+        (a * d - b * c).abs() <= 1e-9 * x
+    }
 }
 
 fn numbers(s: &str) -> Vec<f64> {
@@ -561,7 +568,11 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                 let filled = attr(&e, "fill").is_some_and(|f| {
                     f != "none" && f != "transparent" && f != "white" && f != "#fff" && f != "#ffffff"
                 });
-                if rx == ry && m.keeps_circles() {
+                if m.is_singular() && !(rx == ry && m.keeps_circles()) {
+                    // Squashed flat: SVG draws nothing, and an outline would only stretch
+                    // the symbol's bounds. (`scale(0)` still keeps the radius-0 dot it had.)
+                    None
+                } else if rx == ry && m.keeps_circles() {
                     Some(Shape::Circle {
                         center: m.p(cx, cy),
                         radius: rx * sc,
@@ -844,9 +855,41 @@ mod tests {
     }
 
     #[test]
+    fn circles_squashed_flat_are_left_out() -> Result<()> {
+        let plain = r#"<svg xmlns="http://www.w3.org/2000/svg">
+            <circle id="pin:1" cx="0" cy="0" r="0.5"/>
+            <line x1="0" y1="0" x2="4" y2="0"/>
+        </svg>"#;
+        let want = symbol(plain, "svg.flat", "Flat")?;
+        for t in ["scale(0 1)", "scale(1 0)", "matrix(1 2 2 4 0 0)"] {
+            let svg = format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg">
+                <circle id="pin:1" cx="0" cy="0" r="0.5"/>
+                <line x1="0" y1="0" x2="4" y2="0"/>
+                <circle cx="0" cy="20" r="2" transform="{t}"/>
+                <ellipse cx="0" cy="20" rx="2" ry="5" transform="{t}"/>
+            </svg>"#
+            );
+            let s = symbol(&svg, "svg.flat", "Flat")?;
+            assert_eq!(
+                format!("{s:?}"),
+                format!("{want:?}"),
+                "{t}: no outline, and the same bounds"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn skewed_circles_come_in_as_outlines() -> Result<()> {
         // skewX(45) moves each point right by its height: the same as matrix(1 0 1 1 0 0).
-        for skew in ["skewX(45)", "matrix(1 0 1 1 0 0)", "skewY(45)"] {
+        // matrix(1 0 0.6 0.8 0 0) keeps both axes 1 long but no longer at right angles.
+        for (skew, [a, b, c, d]) in [
+            ("skewX(45)", [1.0, 0.0, 1.0, 1.0]),
+            ("matrix(1 0 1 1 0 0)", [1.0, 0.0, 1.0, 1.0]),
+            ("skewY(45)", [1.0, 1.0, 0.0, 1.0]),
+            ("matrix(1 0 0.6 0.8 0 0)", [1.0, 0.0, 0.6, 0.8]),
+        ] {
             let svg = format!(
                 r#"<svg xmlns="http://www.w3.org/2000/svg">
                 <circle id="pin:1" cx="0" cy="0" r="0.5"/>
@@ -860,14 +903,11 @@ mod tests {
             else {
                 unreachable!("{skew}: {:?}", s.graphics);
             };
-            // Every point of the circle of radius 2 round (0, 0), moved by the skew.
-            let t = if skew.starts_with("skewY") {
-                |p: Point| Point::new(p.x, p.y - p.x)
-            } else {
-                |p: Point| Point::new(p.x - p.y, p.y)
-            };
+            // Every point of the circle of radius 2 round (0, 0), moved by the skew: undoing
+            // the skew puts it back on the circle.
+            let det = a * d - b * c;
             for p in points {
-                let q = t(*p);
+                let q = Point::new((d * p.x - c * p.y) / det, (a * p.y - b * p.x) / det);
                 assert!(
                     (q.x.hypot(q.y) - 2.0).abs() < 1e-9,
                     "{skew}: {p:?} not on the skewed circle"
