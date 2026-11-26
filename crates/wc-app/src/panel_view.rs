@@ -1,6 +1,7 @@
 //! The panel layout view: the mounting plate with its ducts, DIN rails and device footprints,
 //! drawn to scale. Devices, rails and ducts are picked and dragged with the primary button, and
-//! Escape during a drag puts the item back; the arrow keys move the picked device by one step,
+//! Escape during a drag puts the item back; a rail's right end or a duct's bottom-right corner
+//! is dragged to change its length or size; the arrow keys move the picked device by one step,
 //! and Delete takes a picked item off; the wheel zooms and the middle or secondary button pans,
 //! as on the schematic canvas.
 
@@ -165,6 +166,33 @@ fn item_at(items: &[PanelItem], at: Point) -> Option<usize> {
         })
 }
 
+/// A rail's or duct's resize handle: the middle of a rail's right end, a duct's bottom-right
+/// corner. Devices have none.
+fn handle(item: &PanelItem) -> Option<Point> {
+    match item {
+        PanelItem::Rail { at, length } => Some(Point::new(at.x + length, at.y)),
+        PanelItem::Duct { .. } => Some(item.bounds().1),
+        PanelItem::Device { .. } => None,
+    }
+}
+
+/// The rail or duct whose resize handle is within `reach` millimetres of `at`, with the
+/// handle: the picked item's first, then the item under `at`. A rail's handle covers its full
+/// 35 mm height.
+fn handle_at(items: &[PanelItem], pick: Option<usize>, at: Point, reach: f64) -> Option<(usize, Point)> {
+    let near = |i: usize| {
+        let item = items.get(i)?;
+        let h = handle(item)?;
+        let tall = if matches!(item, PanelItem::Rail { .. }) {
+            17.5
+        } else {
+            reach
+        };
+        ((at.x - h.x).abs() <= reach && (at.y - h.y).abs() <= tall).then_some((i, h))
+    };
+    pick.and_then(near).or_else(|| item_at(items, at).and_then(near))
+}
+
 /// The panel view's zoom limits, in screen points per millimetre: lower than the schematic's,
 /// so a large plate fits.
 pub const ZOOM_LIMITS: (f32, f32) = (0.05, 20.0);
@@ -218,9 +246,13 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
     if resp.drag_started_by(egui::PointerButton::Primary)
         && let Some(at) = pressed_at.or(pointer)
     {
-        ed.panel_pick = item_at(&p.items, at);
+        // A rail's right end or a duct's bottom-right corner, 8 points around, resizes it.
+        let reach = 8.0 / f64::from(ed.view.zoom.max(0.01));
+        let resize = handle_at(&p.items, ed.panel_pick, at, reach);
+        ed.panel_resize = resize.is_some();
+        ed.panel_pick = resize.map(|(i, _)| i).or_else(|| item_at(&p.items, at));
         if let Some(item) = ed.panel_pick.and_then(|i| p.items.get(i)) {
-            let a = item.anchor();
+            let a = resize.map_or_else(|| item.anchor(), |(_, h)| h);
             ed.panel_drag = Some((Point::new(at.x - a.x, at.y - a.y), None, item.clone()));
         }
     }
@@ -279,8 +311,26 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
                 to.y = y - height / 2.0;
             }
         }
+        // A rail's length or a duct's size changes by its handle, kept on the plate, a rail
+        // never shorter than the devices on it.
+        if ed.panel_resize {
+            let mut resized = p.clone();
+            if resized.resize_item(i, to) {
+                if checkpoint.is_none() {
+                    open.checkpoint();
+                    ed.panel_drag = Some((grab, Some(open.history_count()), start.clone()));
+                }
+                if let (Some(slot), Some(item)) = (
+                    open.project.panels.get_mut(panel).and_then(|x| x.items.get_mut(i)),
+                    resized.items.get(i),
+                ) {
+                    *slot = item.clone();
+                    open.edited();
+                }
+            }
+        }
         // A rail or a duct moves whole, kept on the plate.
-        if let Some(item) = p.items.get(i).filter(|it| !matches!(it, PanelItem::Device { .. })) {
+        else if let Some(item) = p.items.get(i).filter(|it| !matches!(it, PanelItem::Device { .. })) {
             let mut moved = item.clone();
             moved.move_on_plate(to, pw, ph);
             if moved != *item {
@@ -411,6 +461,10 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
             PanelItem::Device { .. } => {}
         }
     }
+    // The picked rail's or duct's resize handle.
+    if let Some(h) = ed.panel_pick.and_then(|i| p.items.get(i)).and_then(handle) {
+        painter.rect_filled(Rect::from_center_size(xf.s(h), Vec2::splat(8.0)), 1.0, t.selection);
+    }
     for (i, item) in p.items.iter().enumerate() {
         if let PanelItem::Device {
             tag,
@@ -481,13 +535,13 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
             at.y
         ),
         PanelItem::Rail { at, length } => format!(
-            "DIN rail  ·  {length:.0} mm long at x {:.0}, y {:.0}  ·  Delete to take it off the plate",
+            "DIN rail  ·  {length:.0} mm long at x {:.0}, y {:.0}  ·  drag to move, drag its right end to change its length (not shorter than the devices on it), Delete to take it off the plate",
             at.x, at.y
         ),
         PanelItem::Duct { .. } => {
             let (a, b) = item.bounds();
             format!(
-                "Wire duct  ·  {:.0} x {:.0} mm at x {:.0}, y {:.0}  ·  Delete to take it off the plate",
+                "Wire duct  ·  {:.0} x {:.0} mm at x {:.0}, y {:.0}  ·  drag to move, drag its bottom-right corner to resize, Delete to take it off the plate",
                 b.x - a.x,
                 b.y - a.y,
                 a.x,
@@ -1191,6 +1245,58 @@ mod tests {
         assert_eq!(
             o.project.panels[0].items[0].bounds(),
             (Point::new(0.0, 340.0), Point::new(600.0, 400.0))
+        );
+    }
+
+    /// A rail's right end dragged changes its length, snapped, as one undo step, and stops
+    /// at the plate's edge (#983).
+    #[test]
+    fn dragging_a_rails_right_end_changes_its_length_in_one_undo_step() {
+        let (_tmp, mut o, mut ed) = plate_with_rail_and_duct();
+        let mark = o.undo_mark();
+        drag_on_plate(&mut o, &mut ed, Point::new(300.0, 110.0), Point::new(452.0, 140.0));
+        assert_eq!(ed.panel_pick, Some(1));
+        let rail = |o: &Open| o.project.panels[0].items[1].clone();
+        assert_eq!(
+            rail(&o),
+            PanelItem::Rail {
+                at: Point::new(100.0, 100.0),
+                length: 350.0,
+            }
+        );
+        drag_on_plate(&mut o, &mut ed, Point::new(450.0, 100.0), Point::new(700.0, 100.0));
+        assert_eq!(rail(&o).bounds().1.x, 600.0, "kept on the plate");
+        assert!(o.undo());
+        assert!(o.undo());
+        assert_eq!(o.undo_mark(), mark);
+        assert_eq!(rail(&o).bounds().1.x, 300.0);
+    }
+
+    /// A rail's right end dragged in past a device on it stops at the device (#983).
+    #[test]
+    fn a_rail_is_not_shortened_past_the_device_on_it() {
+        let (_tmp, mut o, mut ed) = plate_with_rail_and_duct();
+        o.project.panels[0].items.push(PanelItem::Device {
+            tag: wc_core::DeviceTag::parse("-K1").unwrap_or_default(),
+            at: Point::new(160.0, 55.0),
+            width: 50.0,
+            height: 90.0,
+            rotation: wc_core::geom::Rotation::R0,
+        });
+        drag_on_plate(&mut o, &mut ed, Point::new(300.0, 100.0), Point::new(120.0, 100.0));
+        assert_eq!(o.project.panels[0].items[1].bounds().1.x, 210.0);
+        assert_eq!(o.project.panels[0].items[2].anchor(), Point::new(160.0, 55.0));
+    }
+
+    /// A duct's bottom-right corner dragged resizes it, its top-left corner staying (#983).
+    #[test]
+    fn dragging_a_ducts_corner_resizes_it() {
+        let (_tmp, mut o, mut ed) = plate_with_rail_and_duct();
+        drag_on_plate(&mut o, &mut ed, Point::new(598.0, 358.0), Point::new(500.0, 380.0));
+        assert_eq!(ed.panel_pick, Some(0));
+        assert_eq!(
+            o.project.panels[0].items[0].bounds(),
+            (Point::new(0.0, 300.0), Point::new(500.0, 380.0))
         );
     }
 
