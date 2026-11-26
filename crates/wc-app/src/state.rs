@@ -2170,11 +2170,25 @@ impl Open {
         pins: &[wc_core::BoxPin],
         tag: Option<DeviceTag>,
     ) -> Result<String, String> {
-        let pg = self.project.pages.get(page).ok_or("no page")?;
         let (min, max) = (
             Point::new(a.x.min(b.x), a.y.min(b.y)),
             Point::new(a.x.max(b.x), a.y.max(b.y)),
         );
+        self.add_black_box_sized(page, min, (max.x - min.x, max.y - min.y), pins, tag)
+    }
+
+    /// [`Self::add_black_box`] from the box's top-left corner `at` and its size (width, height
+    /// in mm) as given: no size worked out from two corners, which could fall a hair short of a
+    /// point at the end of an edge.
+    pub fn add_black_box_sized(
+        &mut self,
+        page: usize,
+        at: Point,
+        (width, height): (f64, f64),
+        pins: &[wc_core::BoxPin],
+        tag: Option<DeviceTag>,
+    ) -> Result<String, String> {
+        let pg = self.project.pages.get(page).ok_or("no page")?;
         let (id, symbol_id) = {
             let mut n = 1usize;
             loop {
@@ -2205,8 +2219,7 @@ impl Open {
         let name = tag
             .as_ref()
             .map_or_else(|| "Black box".to_owned(), |t| format!("Black box {t}"));
-        let symbol =
-            wc_core::black_box(&symbol_id, &name, max.x - min.x, max.y - min.y, pins).map_err(|e| e.to_string())?;
+        let symbol = wc_core::black_box(&symbol_id, &name, width, height, pins).map_err(|e| e.to_string())?;
         self.write_symbol_file(&symbol)?;
         self.checkpoint();
         if let Some(t) = &tag {
@@ -2225,7 +2238,7 @@ impl Open {
             pg.symbols.push(PlacedSymbol {
                 id: id.clone(),
                 symbol: symbol_id,
-                at: min,
+                at,
                 rotation: Rotation::R0,
                 mirror: false,
                 tag,
@@ -2392,7 +2405,12 @@ impl Open {
                                 ));
                             }
                         }
-                        (None, Some(_)) => {}
+                        (None, Some(_)) => {
+                            warnings.push(format!(
+                                "wire {} on page {} ends on connection point {pin} of {on}, which the box did not have before: it now ends on the new point",
+                                w.id, p.number
+                            ));
+                        }
                     }
                 }
             }
