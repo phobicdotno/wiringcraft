@@ -2043,10 +2043,17 @@ impl App {
             "rules" => self.tool_rules(v),
             "number_wires" => {
                 use wc_core::numbering::Rule;
-                let rule = match s(v, "rule").unwrap_or("page_column") {
+                // The CLI writes page-column; accept both spellings, and refuse anything else
+                // rather than numbering the whole project by a rule nobody asked for.
+                let rule = match s(v, "rule").map(str::trim).unwrap_or("page_column") {
                     "sequential" => Rule::Sequential,
                     "potential" => Rule::Potential,
-                    _ => Rule::PageColumn,
+                    "page_column" | "page-column" => Rule::PageColumn,
+                    other => {
+                        return Err(format!(
+                            "Unknown rule {other:?}: use page_column, sequential or potential."
+                        ));
+                    }
                 };
                 let open = need_open(self.open.as_mut())?;
                 Ok(open.number_wires(rule).report())
@@ -5101,6 +5108,38 @@ mod tests {
 
     fn call(app: &mut App, name: &str, input: Value) -> Result<String, String> {
         wc_agent::Tools::run(&mut AppTools(app), name, &input)
+    }
+
+    #[test]
+    fn number_wires_refuses_an_unknown_rule() {
+        let (_tmp, mut a) = app(vec![]);
+        let place = |a: &mut App, symbol: &str, x: i32| -> String {
+            let placed = call(
+                a,
+                "place_symbol",
+                json!({"symbol": symbol, "x": x, "y": 60, "page": "2"}),
+            )
+            .unwrap();
+            serde_json::from_str::<Value>(&placed).unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let (c, k) = (place(&mut a, "wc.coil", 50), place(&mut a, "wc.contact.no", 120));
+        call(
+            &mut a,
+            "add_wire",
+            json!({"page": "2", "from": {"item": c, "pin": "A1"}, "to": {"item": k, "pin": "13"}}),
+        )
+        .unwrap();
+        let numbered = |a: &App| page2(a).wires.iter().filter(|w| w.number.is_some()).count();
+        assert_eq!(numbered(&a), 0);
+        let err = call(&mut a, "number_wires", json!({"rule": "potentials"})).unwrap_err();
+        assert!(err.contains("page_column, sequential or potential"), "{err}");
+        assert_eq!(numbered(&a), 0, "a refused rule numbers nothing");
+        // The CLI's spelling works too.
+        call(&mut a, "number_wires", json!({"rule": "page-column"})).unwrap();
+        assert_eq!(numbered(&a), 1);
     }
 
     fn page2(app: &App) -> &Page {
