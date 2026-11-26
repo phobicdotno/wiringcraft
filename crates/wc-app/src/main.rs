@@ -4088,7 +4088,6 @@ fn wago_marking_dialog(open: &Open, strip: Option<String>) -> Dialog {
 
 /// The project's terminal strips for the WAGO configurator, written to
 /// `export/wago-configurator.csv`.
-#[cfg(test)]
 fn export_wago_configurator(open: &Open) -> String {
     export_wago_configurator_to(open, &open.dir.join("export").join("wago-configurator.csv"))
 }
@@ -4153,7 +4152,6 @@ fn export_wago_configurator_to(open: &Open, path: &Path) -> String {
 
 /// The markers `options` asks for as a smartScript CSV in `export`: `wago-marking.csv`, or
 /// `wago-marking-<strip>.csv` for one strip.
-#[cfg(test)]
 fn export_wago_marking(open: &Open, options: &wc_report::MarkingOptions) -> String {
     export_wago_marking_to(open, options, &wago_marking_file(open, options))
 }
