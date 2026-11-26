@@ -24,6 +24,10 @@ toml.workspace = true
 # A private, unique folder for archive entries on their way to the single-file importers.
 tempfile.workspace = true
 
+# Box-edit recovery opens each folder relative to the one before without following a link (#666).
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
+
 [dev-dependencies]
 # Tests write an EDZ archive.
 sevenz-rust2 = { workspace = true, features = ["compress"] }

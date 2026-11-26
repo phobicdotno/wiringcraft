@@ -4837,8 +4837,11 @@ fn undo_stopped_box_edit(dir: &Path) -> Res<Option<String>> {
         )
     };
     let files = parse_journal(dir, &bytes).ok_or_else(unreadable)?;
+    let mut names = Vec::with_capacity(files.len());
     for (target, _) in &files {
-        journal_target_ok(dir, &journal_name(dir, target).ok_or_else(unreadable)?)?;
+        let name = journal_name(dir, target).ok_or_else(unreadable)?;
+        journal_target_ok(dir, &name)?;
+        names.push(name);
         // Each file is put back over a plain file or where none is: a link would be replaced by
         // a plain file, and opening a FIFO to compare its bytes could wait for ever.
         let target_shown = || escape_field(&target.display().to_string());
@@ -4854,7 +4857,12 @@ fn undo_stopped_box_edit(dir: &Path) -> Res<Option<String>> {
             Err(x) => return Err(format!("{}: {x}", target_shown())),
         }
     }
-    let failed = put_files_back(&files);
+    // Tests swap a folder for a link here, as someone could after the check above.
+    #[cfg(test)]
+    if let Some(between) = tests::BETWEEN_JOURNAL_CHECK_AND_REPLAY.take() {
+        between();
+    }
+    let failed = put_journal_back(dir, &names, &files);
     if !failed.is_empty() {
         return Err(format!(
             "a box-edit run stopped half way, and putting back the files it changed failed: {}",
@@ -4869,6 +4877,125 @@ fn undo_stopped_box_edit(dir: &Path) -> Res<Option<String>> {
     Ok(Some(
         "a box-edit run stopped before it had written every file; the project files are put back as they were before it".into(),
     ))
+}
+
+/// Put each journaled file back as it was, the last written first; `names` are their names in
+/// the project ([`journal_name`]). Returns why each one that could not be put back failed.
+///
+/// On Unix each folder on the way is opened relative to the one before it, never following a
+/// link, and the file is written, renamed and removed relative to its folder held open: a folder
+/// swapped for a link after [`journal_target_ok`] checked it is refused, not written through
+/// (#666). Elsewhere the files are put back by path, after that check alone.
+fn put_journal_back(dir: &Path, names: &[String], files: &run::Written) -> Vec<String> {
+    #[cfg(unix)]
+    {
+        names
+            .iter()
+            .zip(files)
+            .rev()
+            .filter_map(|(name, (_, before))| put_back_at(dir, name, before.as_deref()).err())
+            .collect()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (dir, names);
+        put_files_back(files)
+    }
+}
+
+/// [`put_file_back`] for the file `rel` names in the project `dir`, each folder on the way
+/// opened without following a link and the file reached only through its folder held open.
+#[cfg(unix)]
+fn put_back_at(dir: &Path, rel: &str, before: Option<&[u8]>) -> Result<(), String> {
+    use rustix::fs::{AtFlags, Mode, OFlags};
+    use rustix::io::Errno;
+    use std::io::{Read as _, Write as _};
+    let shown = |rel: &str| escape_field(&dir.join(rel).display().to_string());
+    let fail = |x: std::io::Error| format!("{}: {x}", shown(rel));
+    let (folders, name) = rel.rsplit_once('/').unwrap_or(("", rel));
+    let folder_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    // The project folder itself may be reached through a link: the one the run was given.
+    let mut at = rustix::fs::open(dir, folder_flags, Mode::empty())
+        .map_err(|x| format!("{}: {}", shown(""), std::io::Error::from(x)))?;
+    let mut walked = String::new();
+    for part in folders.split('/').filter(|p| !p.is_empty()) {
+        if !walked.is_empty() {
+            walked.push('/');
+        }
+        walked.push_str(part);
+        at = match rustix::fs::openat(&at, part, folder_flags | OFlags::NOFOLLOW, Mode::empty()) {
+            Ok(fd) => fd,
+            // A link (or no longer a folder): what it leads to is not written.
+            Err(Errno::LOOP | Errno::NOTDIR) => {
+                return Err(format!(
+                    "{} is a link; box-edit does not write through a linked folder",
+                    shown(&walked)
+                ));
+            }
+            // No folder, so no file there to remove.
+            Err(Errno::NOENT) if before.is_none() => return Ok(()),
+            Err(x) => return Err(fail(x.into())),
+        };
+    }
+    let Some(bytes) = before else {
+        // A link there is removed itself, never what it leads to.
+        return match rustix::fs::unlinkat(&at, name, AtFlags::empty()) {
+            Ok(()) | Err(Errno::NOENT) => Ok(()),
+            Err(x) => Err(fail(x.into())),
+        };
+    };
+    // A plain file there keeps its permissions, and is left as it is when it holds the bytes
+    // already; anything else is replaced, never opened to read (a FIFO would never end).
+    let now = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let keep = match rustix::fs::openat(&at, name, now, Mode::empty()) {
+        Ok(fd) => {
+            let mut file = std::fs::File::from(fd);
+            let m = file.metadata().map_err(fail)?;
+            if m.is_file() {
+                let mut held = Vec::new();
+                if file.read_to_end(&mut held).is_ok() && held == bytes {
+                    return Ok(());
+                }
+            }
+            m.is_file().then(|| m.permissions())
+        }
+        Err(Errno::NOENT | Errno::LOOP) => None,
+        Err(x) => return Err(fail(x.into())),
+    };
+    // The staging file is made new beside it, readable by its owner only before any bytes go in.
+    let mut made = None;
+    for n in 0..100u32 {
+        let part = format!("{name}.restore-{}-{n}", std::process::id());
+        let new = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        match rustix::fs::openat(&at, part.as_str(), new, Mode::RUSR | Mode::WUSR) {
+            Ok(fd) => {
+                made = Some((part, std::fs::File::from(fd)));
+                break;
+            }
+            Err(Errno::EXIST) => continue,
+            Err(x) => return Err(fail(x.into())),
+        }
+    }
+    let Some((part, mut file)) = made else {
+        return Err(format!("{}: no free name for the staging file", shown(rel)));
+    };
+    let done = file
+        .write_all(bytes)
+        .and_then(|()| keep.map_or(Ok(()), |perm| file.set_permissions(perm)))
+        .and_then(|()| file.sync_all())
+        .and_then(|()| {
+            drop(file);
+            rustix::fs::renameat(&at, part.as_str(), &at, name).map_err(Into::into)
+        });
+    done.map_err(|x| match rustix::fs::unlinkat(&at, part.as_str(), AtFlags::empty()) {
+        Ok(()) => fail(x),
+        Err(y) => format!(
+            "{}; the staging file {} is left: {}",
+            fail(x),
+            shown(&format!("{}{part}", &rel[..rel.len() - name.len()])),
+            std::io::Error::from(y)
+        ),
+    })
 }
 
 /// Make the files put back last on disk: sync the folder of each (Unix). Says which folder
@@ -5595,6 +5722,8 @@ mod tests {
         pub(super) static STOP_BOX_EDIT_AFTER_SYMBOL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Run by recovery between opening a journal and locking it.
         pub(super) static BETWEEN_JOURNAL_OPEN_AND_LOCK: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const { std::cell::Cell::new(None) };
+        /// Run by recovery between checking the files a journal names and putting them back.
+        pub(super) static BETWEEN_JOURNAL_CHECK_AND_REPLAY: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const { std::cell::Cell::new(None) };
     }
 
     /// A stdout whose reader has gone away, as Windows reports it for `| more` that stopped.
@@ -9718,6 +9847,60 @@ mod tests {
         let err = cli(&dir, &["location", "list"]).unwrap_err();
         assert!(err.contains("not a plain file"), "{err}");
         assert_ne!(std::fs::read(&lock).unwrap(), b"hi");
+        assert!(journal.exists());
+    }
+
+    /// Folders swapped for links after recovery checked them, before it puts the files back
+    /// (#666): nothing is written or removed through them, and the journal stays.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_swapped_for_a_link_after_the_check_is_not_written_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, _, _) = box_edit_project(tmp.path());
+        let comments = dir.join(store::COMMENTS_DIR);
+        let vendor = dir.join(store::VENDOR_DIR);
+        std::fs::create_dir_all(&comments).unwrap();
+        let kind = ItemKind::Symbol.dir();
+        // Outside the project: a comments file to be removed, and a folder for symbols.
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(outside.join(kind)).unwrap();
+        std::fs::write(outside.join("a.comments.json"), b"outside").unwrap();
+        let records = [
+            (format!("{}/a.comments.json", store::COMMENTS_DIR), None),
+            (format!("{}/b.comments.json", store::COMMENTS_DIR), Some(&b"hi"[..])),
+            (format!("{}/{kind}/x.json", store::VENDOR_DIR), Some(&b"hi"[..])),
+        ];
+        let mut bytes = JOURNAL_HEADER.to_vec();
+        for (name, before) in &records {
+            let len = before.map_or_else(|| "-".to_owned(), |b| b.len().to_string());
+            bytes.extend_from_slice(format!("{} {len}\n{name}", name.len()).as_bytes());
+            bytes.extend_from_slice(before.unwrap_or_default());
+        }
+        bytes.extend_from_slice(format!("end {}\n", records.len()).as_bytes());
+        let journal = dir.join(BOX_EDIT_JOURNAL);
+        std::fs::write(&journal, &bytes).unwrap();
+
+        let (swap_comments, swap_vendor, to) = (comments.clone(), vendor.clone(), outside.clone());
+        BETWEEN_JOURNAL_CHECK_AND_REPLAY.set(Some(Box::new(move || {
+            for folder in [&swap_comments, &swap_vendor] {
+                let mut away = folder.as_os_str().to_owned();
+                away.push("-real");
+                std::fs::rename(folder, away).unwrap();
+                std::os::unix::fs::symlink(&to, folder).unwrap();
+            }
+        })));
+        let Err(err) = undo_stopped_box_edit(&dir) else {
+            unreachable!("a replay through a linked folder is refused")
+        };
+        assert!(err.contains("linked folder"), "{err}");
+        let mut left: Vec<_> = std::fs::read_dir(&outside)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["a.comments.json", kind]);
+        assert_eq!(std::fs::read(outside.join("a.comments.json")).unwrap(), b"outside");
+        assert!(std::fs::read_dir(outside.join(kind)).unwrap().next().is_none());
         assert!(journal.exists());
     }
 
