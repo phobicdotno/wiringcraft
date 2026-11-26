@@ -283,6 +283,32 @@ fn convert(name: &str, sym: &Sexp, body: &Sexp, base: &str, wanted: u32, prefix:
                         _ => {}
                     }
                 }
+                Some("bezier") => {
+                    // A cubic curve (start, two control points, end), flattened in 8 steps like
+                    // the SVG importer does.
+                    let p: Vec<Point> = g
+                        .first("pts")
+                        .map(|p| p.all("xy").filter_map(|x| Some(pt(x.num(1)?, x.num(2)?))).collect())
+                        .unwrap_or_default();
+                    if let [p0, p1, p2, p3] = p.as_slice() {
+                        let points = (0..=8)
+                            .map(|k| {
+                                let t = k as f64 / 8.0;
+                                let u = 1.0 - t;
+                                let (a, b, c, d) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
+                                Point::new(
+                                    a * p0.x + b * p1.x + c * p2.x + d * p3.x,
+                                    a * p0.y + b * p1.y + c * p2.y + d * p3.y,
+                                )
+                            })
+                            .collect();
+                        graphics.push(Shape::Polyline {
+                            points,
+                            closed: false,
+                            filled: false,
+                        });
+                    }
+                }
                 Some("rectangle") => {
                     if let (Some(a), Some(b)) = (xy(g, "start"), xy(g, "end")) {
                         graphics.push(Shape::Rect {
@@ -610,6 +636,42 @@ mod tests {
             [1, 2, 26, 27, 28, 52, 53].map(unit_letter),
             ["A", "B", "Z", "AA", "AB", "AZ", "BA"]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_bezier_comes_in_as_a_flattened_polyline() -> Result<()> {
+        // The pin sits at 0,0 so page coordinates are KiCad's with y flipped.
+        let lib = r#"(kicad_symbol_lib
+  (symbol "Curve"
+    (symbol "Curve_0_1"
+      (bezier (pts (xy 0 0) (xy 0 4) (xy 4 4) (xy 4 0)) (stroke (width 0)) (fill (type none)))
+      (bezier (pts (xy 0 0) (xy 1 1) (xy 2 2))))
+    (symbol "Curve_1_1" (pin passive line (at 0 0 0) (length 0) (name "~") (number "1")))))"#;
+        let (syms, warnings) = symbols(lib, "k", 1.0)?;
+        assert_eq!(syms.len(), 1, "{warnings:?}");
+        let curves: Vec<&Vec<Point>> = syms[0]
+            .symbol
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Polyline {
+                    points,
+                    closed: false,
+                    filled: false,
+                } => Some(points),
+                _ => None,
+            })
+            .collect();
+        // The three-point bezier is left out.
+        let [points] = curves.as_slice() else {
+            unreachable!("one curve expected: {:?}", syms[0].symbol.graphics)
+        };
+        let near = |p: Point, x: f64, y: f64| (p.x - x).abs() < 1e-9 && (p.y - y).abs() < 1e-9;
+        assert!(near(points[0], 0.0, 0.0), "{points:?}");
+        assert!(near(points[points.len() - 1], 4.0, 0.0), "{points:?}");
+        // At t = 0.5 the curve is at (2, 3) in KiCad, (2, -3) on the page.
+        assert!(points.iter().any(|p| near(*p, 2.0, -3.0)), "{points:?}");
         Ok(())
     }
 
