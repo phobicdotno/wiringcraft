@@ -930,14 +930,30 @@ fn parse_end(dir: &Path, page: &Page, s: &str) -> Res<Endpoint> {
     let Some(placed) = page.symbol(item) else {
         return Err(format!("no symbol {item:?} on page {}", page.id));
     };
-    if let Ok(symbol) = store::read_vendored_symbol(dir, &placed.symbol)
-        && symbol.pin(pin).is_none()
-    {
-        let name = placed
+    let name = || {
+        placed
             .tag
             .as_ref()
-            .map_or_else(|| item.to_owned(), |t| format!("{item} ({t})"));
-        let pins: Vec<&str> = symbol.pins.iter().map(|p| p.name.as_str()).collect();
+            .map_or_else(|| item.to_owned(), |t| format!("{item} ({t})"))
+    };
+    let symbol = match store::read_vendored_symbol(dir, &placed.symbol) {
+        Ok(symbol) => Some(symbol),
+        // No copy yet is allowed, as elsewhere (`lib lock` fills it in): the pin goes unchecked.
+        Err(wc_core::Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => None,
+        Err(why) => {
+            return Err(format!(
+                "symbol {} on page {}: its definition {} could not be read ({why})",
+                name(),
+                page.id,
+                placed.symbol
+            ));
+        }
+    };
+    if let Some(symbol) = symbol
+        && symbol.pin(pin).is_none()
+    {
+        let name = name();
+        let pins: Vec<String> = symbol.pins.iter().map(|p| escape_field(&p.name)).collect();
         return Err(format!(
             "symbol {name} on page {} has no pin {pin:?}; its pins are {}",
             page.id,
@@ -5082,6 +5098,36 @@ mod tests {
 
         cli(&dir, &["wire", "p1", &format!("{s1}:2"), &format!("{s1}:1")]).unwrap();
         assert_eq!(load(&dir).unwrap().page("p1").unwrap().wires.len(), 1);
+
+        // The listed pin names are escaped, so a control character cannot reach the terminal.
+        let symbol_id = load(&dir).unwrap().page("p1").unwrap().symbols[0].symbol.clone();
+        let vendored = store::vendor_path(&dir, ItemKind::Symbol, &symbol_id).unwrap();
+        let mut symbol = store::read_vendored_symbol(&dir, &symbol_id).unwrap();
+        symbol.pins[1].name = "x\u{1b}y".into();
+        store::write_vendored_symbol(&dir, &symbol).unwrap();
+        let err = cli(&dir, &["wire", "p1", &format!("{s1}:99"), &format!("{s1}:1")]).unwrap_err();
+        assert!(
+            err.ends_with("its pins are 1, x\\u{1b}y") && !err.contains('\u{1b}'),
+            "{err}"
+        );
+
+        // A definition that cannot be read is an error naming the placed symbol, not a pass;
+        // point ends do not read it.
+        std::fs::write(&vendored, "not json").unwrap();
+        let err = cli(&dir, &["wire", "p1", &format!("{s1}:1"), "0,0"]).unwrap_err();
+        assert!(
+            err.starts_with(&format!(
+                "symbol {s1} (-F1) on page p1: its definition {symbol_id} could not be read"
+            )),
+            "{err}"
+        );
+        cli(&dir, &["wire", "p1", "0,0", "10,0"]).unwrap();
+        assert_eq!(load(&dir).unwrap().page("p1").unwrap().wires.len(), 2);
+
+        // A symbol with no copy yet (as before `lib lock`) leaves the pin unchecked.
+        std::fs::remove_file(&vendored).unwrap();
+        cli(&dir, &["wire", "p1", &format!("{s1}:1"), "0,0"]).unwrap();
+        assert_eq!(load(&dir).unwrap().page("p1").unwrap().wires.len(), 3);
     }
 
     #[test]
