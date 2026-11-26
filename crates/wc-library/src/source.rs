@@ -134,3 +134,6 @@ pub(crate) fn sync_one(project_dir: &Path, s: &LibrarySource) -> Result<String> 
         }),
     }
 }
+
+#[cfg(test)]
+mod tests;
