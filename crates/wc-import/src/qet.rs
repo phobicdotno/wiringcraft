@@ -409,24 +409,24 @@ fn shape(
         "line" => match (n("x1"), n("y1"), n("x2"), n("y2")) {
             (Some(x1), Some(y1), Some(x2), Some(y2)) => {
                 let (a, b) = (pt(x1, y1), pt(x2, y2));
-                let mut cut = [0.0; 2];
-                for (i, tip, from) in [(1, a, b), (2, b, a)] {
+                let (mut cut_a, mut cut_b) = (0.0, 0.0);
+                for (i, tip, from, cut) in [(1, a, b, &mut cut_a), (2, b, a, &mut cut_b)] {
                     let Some(kind) = attr(e, &format!("end{i}")) else {
                         continue;
                     };
                     let len = n(&format!("length{i}")).unwrap_or(1.5) * scale;
-                    cut[i - 1] = line_end(graphics, &kind, tip, from, len, filled(e));
+                    *cut = line_end(graphics, &kind, tip, from, len, filled(e));
                 }
                 // The shaft stops at the inner edge of the end shapes; none is left when they
                 // meet or overlap.
                 let d = (b.x - a.x).hypot(b.y - a.y);
-                if cut == [0.0; 2] {
+                if cut_a == 0.0 && cut_b == 0.0 {
                     graphics.push(Shape::Line { a, b });
-                } else if cut[0] + cut[1] < d {
+                } else if cut_a + cut_b < d {
                     let (ux, uy) = ((b.x - a.x) / d, (b.y - a.y) / d);
                     graphics.push(Shape::Line {
-                        a: Point::new(a.x + ux * cut[0], a.y + uy * cut[0]),
-                        b: Point::new(b.x - ux * cut[1], b.y - uy * cut[1]),
+                        a: Point::new(a.x + ux * cut_a, a.y + uy * cut_a),
+                        b: Point::new(b.x - ux * cut_b, b.y - uy * cut_b),
                     });
                 }
             }
