@@ -442,7 +442,36 @@ pub fn check_with(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet]) -> V
         }
     }
 
-    // Devices without a part.
+    // Devices without a part, and parts (main, accessory or a jumper's) that the project's
+    // library copy does not have: the parts list shows those without a maker, and their
+    // contacts cannot be checked.
+    let missing = |part: &str| {
+        (!i.parts.contains_key(part)).then(|| format!("part {part} is missing from the project's library copy"))
+    };
+    for tag in crate::all_tags(i) {
+        let parts = p.devices.get(&tag).map(|d| d.all_parts()).unwrap_or_default();
+        // A part named twice gives one warning: equal findings are merged below.
+        for (part, _) in parts {
+            if let Some(what) = missing(part) {
+                out.push(Finding {
+                    severity: Severity::Warning,
+                    page_id: None,
+                    item: None,
+                    message: format!("{tag}: {what}"),
+                });
+            }
+        }
+    }
+    for j in &p.meta.jumpers {
+        if let Some(what) = j.part.as_deref().and_then(missing) {
+            out.push(Finding {
+                severity: Severity::Warning,
+                page_id: None,
+                item: None,
+                message: format!("jumper of {}: {what}", j.strip),
+            });
+        }
+    }
     for tag in crate::all_tags(i) {
         if p.devices.get(&tag).and_then(|d| d.part.as_ref()).is_none() {
             out.push(Finding {

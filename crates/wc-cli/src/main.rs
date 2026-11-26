@@ -445,8 +445,9 @@ enum Cmd {
     /// terminal drawn nowhere, one cable core on two connections, shorted potentials, a wire
     /// number used on more than one connection or one connection carrying several wire
     /// numbers, panel layouts with overlapping devices, devices sticking out of the plate or no
-    /// longer in the project, devices without a part, then the house rules in each library
-    /// source's `rules.toml`, less the ones `rules_off` turns off, and last the project's own
+    /// longer in the project, parts missing from the project's library copy, devices without a
+    /// part, then the house rules in each library source's `rules.toml`, less the ones
+    /// `rules_off` turns off, and last the project's own
     /// `[[rule]]` tables in `project.toml` (a cable on every motor, a tag pattern, at most N
     /// wires on a terminal).
     /// Exits with an error when an error is found, so it can guard a commit or a CI job.

@@ -633,6 +633,54 @@ fn project_check_finds_the_usual_mistakes() {
 }
 
 #[test]
+fn project_check_warns_about_parts_missing_from_the_library_copy() {
+    let (mut p, s, parts) = fixture();
+    // -P1 names a part the library copy lacks, as its main part and twice as an accessory;
+    // -K1's part is there, its accessory is not.
+    p.devices.insert(
+        DeviceTag::parse("-P1").unwrap(),
+        Device {
+            part: Some("acme.gone".into()),
+            accessories: vec![wc_core::DevicePart {
+                part: "acme.gone".into(),
+                qty: 2,
+            }],
+            ..Default::default()
+        },
+    );
+    let k1 = DeviceTag::parse("=A+C1-K1").unwrap();
+    p.devices.get_mut(&k1).unwrap().accessories.push(wc_core::DevicePart {
+        part: "acme.socket".into(),
+        qty: 1,
+    });
+    // A jumper whose part is missing.
+    let x1 = DeviceTag::parse("-X1").unwrap();
+    p.meta.add_jumper(&x1, &["1".to_owned(), "2".to_owned()]).unwrap();
+    p.meta.jumpers[0].part = Some("acme.bridge".into());
+    let found = check(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    let missing: Vec<&str> = found
+        .iter()
+        .filter(|f| f.message.contains("missing from the project's library copy"))
+        .inspect(|f| assert_eq!(f.severity, Severity::Warning))
+        .map(|f| f.message.as_str())
+        .collect();
+    assert_eq!(
+        missing,
+        [
+            "-P1: part acme.gone is missing from the project's library copy",
+            "=A+C1-K1: part acme.socket is missing from the project's library copy",
+            "jumper of -X1: part acme.bridge is missing from the project's library copy",
+        ]
+    );
+    // -P1 has a part now, even if it is missing, so no "has no part" note.
+    assert!(!found.iter().any(|f| f.message == "-P1 has no part"), "{found:?}");
+}
+
+#[test]
 fn a_device_repeated_on_an_overview_page_is_not_drawn_twice() {
     let (mut p, s, parts) = fixture();
     // The coil -K1 again, on a line diagram.
