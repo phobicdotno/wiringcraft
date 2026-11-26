@@ -579,6 +579,26 @@ fn lock_restores_the_pinned_version_from_another_source_and_keeps_the_pin() -> R
 }
 
 #[test]
+fn lock_reports_a_failed_write_of_the_pinned_version_as_a_write_failure() -> Result<()> {
+    let mut f = fixture()?;
+    let lib = Library::open(&f.proj, &f.project)?;
+    lock_missing(&f.proj, &mut f.project, &lib)?;
+    let path = wc_core::store::vendor_path(&f.proj, ItemKind::Symbol, "coil")?;
+    // A folder where the vendored file belongs: unreadable, and not replaced by a write.
+    std::fs::remove_file(&path).map_err(|e| wc_core::Error::io("rm", e))?;
+    std::fs::create_dir_all(path.join("x")).map_err(|e| wc_core::Error::io("mkdir", e))?;
+
+    let left = lock_missing(&f.proj, &mut f.project, &lib)?;
+    assert!(left.restored.is_empty(), "{left:?}");
+    assert_eq!(left.unrestorable.len(), 1, "{left:?}");
+    let why = &left.unrestorable[0].2;
+    assert!(why.contains("writing it failed"), "{why}");
+    assert!(why.contains("coil.json"), "the failed file is named: {why}");
+    assert!(!why.contains("no library source"), "{why}");
+    Ok(())
+}
+
+#[test]
 fn lock_does_not_restore_another_version_or_an_item_gone_from_the_library() -> Result<()> {
     let mut f = fixture()?;
     let lib = Library::open(&f.proj, &f.project)?;

@@ -487,7 +487,7 @@ fn vendored_error(project_dir: &Path, kind: ItemKind, id: &str) -> Option<String
 /// Write the vendored copy of pinned item `id` again from the library, at the pinned version
 /// (`pin`): the pinned source is searched first, then the others, and only a file that declares
 /// `id` and holds that version is taken. The lock entry is left as it is.
-fn restore_pinned(project_dir: &Path, lib: &Library, kind: ItemKind, id: &str, pin: &LockEntry) -> Result<()> {
+fn restore_pinned(project_dir: &Path, lib: &Library, kind: ItemKind, id: &str, pin: &LockEntry) -> Result<Restore> {
     let fits = |declared: &str, hash: String| -> std::result::Result<(), String> {
         if declared != id {
             return Err(format!("its file declares id {declared:?}"));
@@ -497,25 +497,30 @@ fn restore_pinned(project_dir: &Path, lib: &Library, kind: ItemKind, id: &str, p
         }
         Ok(())
     };
+    // Finding the pinned version and writing it are told apart: a failed write is not fixed by
+    // adding a library source, so it keeps its own error (which names the file).
     let not_found = |message: String| Error::Source {
         name: pin.source.clone(),
         message,
     };
     match kind {
-        ItemKind::Symbol => {
-            let s: Symbol = lib
-                .find_version(kind, id, &pin.source, |s: &Symbol| fits(&s.id, s.hash()))
-                .map_err(not_found)?;
-            store::write_vendored_symbol(project_dir, &s)?;
-        }
-        ItemKind::Part => {
-            let p: Part = lib
-                .find_version(kind, id, &pin.source, |p: &Part| fits(&p.id, p.hash()))
-                .map_err(not_found)?;
-            store::write_vendored_part(project_dir, &p)?;
-        }
-    }
-    Ok(())
+        ItemKind::Symbol => match lib.find_version(kind, id, &pin.source, |s: &Symbol| fits(&s.id, s.hash())) {
+            Ok(s) => store::write_vendored_symbol(project_dir, &s)?,
+            Err(message) => return Ok(Restore::NotFound(not_found(message))),
+        },
+        ItemKind::Part => match lib.find_version(kind, id, &pin.source, |p: &Part| fits(&p.id, p.hash())) {
+            Ok(p) => store::write_vendored_part(project_dir, &p)?,
+            Err(message) => return Ok(Restore::NotFound(not_found(message))),
+        },
+    };
+    Ok(Restore::Done)
+}
+
+/// What [`restore_pinned`] did when it could write (an error is a failed write).
+enum Restore {
+    Done,
+    /// No library source holds the pinned version.
+    NotFound(Error),
 }
 
 /// Pin every used item that is not pinned yet, and write the vendored copy of a pinned item
@@ -552,10 +557,16 @@ fn lock_missing_then(
     after_scan();
     for (kind, id, pin, broken) in repair {
         match restore_pinned(project_dir, lib, kind, &id, &pin) {
-            Ok(()) => left.restored.push((kind, id)),
-            Err(e) => {
+            Ok(Restore::Done) => left.restored.push((kind, id)),
+            Ok(Restore::NotFound(e)) => {
                 let why = format!(
                     "{broken}; the pinned version is in no library source ({e}); put the file back from the project's history, or add a library source that holds the pinned version, and run `wiringcraft lib lock` again"
+                );
+                left.unrestorable.push((kind, id, why));
+            }
+            Err(e) => {
+                let why = format!(
+                    "{broken}; the pinned version was found but writing it failed ({e}); fix that and run `wiringcraft lib lock` again"
                 );
                 left.unrestorable.push((kind, id, why));
             }
