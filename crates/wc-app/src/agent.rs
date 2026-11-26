@@ -1569,6 +1569,21 @@ impl App {
         {
             return Err(why);
         }
+        // The tools that do what a held action does (rotate, mirror, copy and paste, select)
+        // are refused while the symbol editor is open, as from the menu: the schematic under
+        // the editor does not change or get selected.
+        if self.symbol_editor.is_some() {
+            let held = match name {
+                "rotate_items" => Some(Action::Rotate.info().label),
+                "mirror_items" => Some(Action::Mirror.info().label),
+                "copy_items" => Some(Action::Paste.info().label),
+                "select_items" => Some("Selecting"),
+                _ => None,
+            };
+            if let Some(what) = held {
+                return Err(crate::symbol_editor_refusal(what));
+            }
+        }
         match name {
             "get_state" => self.tool_state(),
             "get_page" => {
@@ -5599,6 +5614,92 @@ mod tests {
     }
 
     #[test]
+    fn schematic_edits_from_the_menu_or_assistant_do_nothing_while_the_symbol_editor_is_open() {
+        for action in [
+            Action::Cut,
+            Action::Copy,
+            Action::Paste,
+            Action::Rotate,
+            Action::Mirror,
+            Action::SelectAll,
+        ] {
+            let (_tmp, mut a) = app(vec![]);
+            let o = a.open.as_mut().unwrap();
+            let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+            o.place(page, "wc.coil", Point::new(50.0, 50.0)).unwrap();
+            o.place(page, "wc.coil", Point::new(90.0, 50.0)).unwrap();
+            a.ed.page = page;
+            let all = a.open.as_ref().unwrap().select_all(page);
+            // Something on the clipboard for Paste; one item selected, so Select All would change it.
+            a.ed.selection = all.clone();
+            a.run(Action::Copy);
+            assert!(!a.clipboard.is_empty(), "{action:?}: the copy is made");
+            a.ed.selection = vec![all[0].clone()];
+            let selection = a.ed.selection.clone();
+            let clipboard = format!("{:?}", a.clipboard);
+            let before = a.open.as_ref().unwrap().project.pages.clone();
+            let undo_before = a.open.as_ref().unwrap().undo_mark();
+            a.symbol_editor = Some(crate::symbol_editor::SymbolEditor::new(Vec::new()));
+
+            a.run(action);
+            let o = a.open.as_ref().unwrap();
+            assert_eq!(o.project.pages, before, "{action:?}: the pages are unchanged");
+            assert_eq!(o.undo_mark(), undo_before, "{action:?}: no undo step");
+            assert_eq!(a.ed.selection, selection, "{action:?}: the selection is unchanged");
+            assert_eq!(
+                format!("{:?}", a.clipboard),
+                clipboard,
+                "{action:?}: the clipboard is unchanged"
+            );
+            assert!(
+                a.ed.message.contains("close the symbol editor first"),
+                "{action:?}: {}",
+                a.ed.message
+            );
+        }
+
+        // The assistant's tools that do the same are refused too.
+        let (_tmp, mut a) = app(vec![]);
+        let o = a.open.as_mut().unwrap();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        o.place(page, "wc.coil", Point::new(50.0, 50.0)).unwrap();
+        a.ed.page = page;
+        let ids: Vec<String> = a
+            .open
+            .as_ref()
+            .unwrap()
+            .select_all(page)
+            .iter()
+            .map(selection_id)
+            .collect();
+        let selection = a.ed.selection.clone();
+        let before = a.open.as_ref().unwrap().project.pages.clone();
+        let undo_before = a.open.as_ref().unwrap().undo_mark();
+        a.symbol_editor = Some(crate::symbol_editor::SymbolEditor::new(Vec::new()));
+        for (tool, what) in [
+            ("rotate_items", "Rotate"),
+            ("mirror_items", "Mirror"),
+            ("copy_items", "Paste"),
+            ("select_items", "Selecting"),
+        ] {
+            let e = a.agent_tool(tool, &json!({"page": "p0002", "ids": ids})).unwrap_err();
+            assert!(
+                e.starts_with(what) && e.contains("close the symbol editor first"),
+                "{tool}: {e}"
+            );
+            let o = a.open.as_ref().unwrap();
+            assert_eq!(o.project.pages, before, "{tool}: the pages are unchanged");
+            assert_eq!(o.undo_mark(), undo_before, "{tool}: no undo step");
+            assert_eq!(a.ed.selection, selection, "{tool}: the selection is unchanged");
+        }
+        // Closed, the assistant rotates again.
+        a.symbol_editor = None;
+        a.agent_tool("rotate_items", &json!({"page": "p0002", "ids": ids}))
+            .unwrap();
+        assert_ne!(a.open.as_ref().unwrap().project.pages, before);
+    }
+
+    #[test]
     fn duplicate_from_the_menu_or_assistant_does_nothing_while_the_symbol_editor_is_open() {
         let (_tmp, mut a) = app(vec![]);
         let o = a.open.as_mut().unwrap();
@@ -5830,9 +5931,14 @@ mod tests {
             a.symbol_editor.as_ref().unwrap().symbol.graphics.is_empty(),
             "the editor deleted"
         );
+        a.ed.message.clear();
         assert_eq!(
             a.route_to_symbol_editor(vec![Action::Undo, Action::Copy]),
             Vec::<Action>::new()
+        );
+        assert_eq!(
+            a.ed.message, "Copy was not done: close the symbol editor first.",
+            "a held key says why, as from the menu"
         );
         assert_eq!(
             a.symbol_editor.as_ref().unwrap().symbol.graphics.len(),
