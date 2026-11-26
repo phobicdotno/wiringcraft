@@ -607,16 +607,21 @@ fn shapes(
                     let rot = e.f(50);
                     let (s, c) = rot.to_radians().sin_cos();
                     let cells = cols.saturating_mul(rows);
-                    let cell_at = |col: usize, row: usize| {
+                    // The placement of the copy in a column and row, inside the outer placement.
+                    let cell_xf = |col: usize, row: usize| {
                         let (col, row) = (col as f64 * dx, row as f64 * dy);
-                        (e.f(10) + c * col - s * row, e.f(20) + s * col + c * row)
+                        let at = (e.f(10) + c * col - s * row, e.f(20) + s * col + c * row);
+                        Xf::shift((-bx, -by))
+                            .then(&Xf::insert(at, e.f_or(41, 1.0), e.f_or(42, 1.0), rot))
+                            .then(&xf)
                     };
-                    // Each placement is linear in the column and row, so when the four corners
-                    // are numbers every copy between them is too.
+                    // Each placement, once inside the outer one and scaled, is linear in the
+                    // column and row, so when the four corners are numbers every copy between
+                    // them is too.
                     let corners = [(0, 0), (cols - 1, 0), (0, rows - 1), (cols - 1, rows - 1)];
                     let finite = corners.iter().all(|&(cl, rw)| {
-                        let (x, y) = cell_at(cl, rw);
-                        x.is_finite() && y.is_finite()
+                        let (x, y) = cell_xf(cl, rw).at;
+                        (x * scale).is_finite() && (y * scale).is_finite()
                     });
                     // Copies that would only be turned away (too deep, or placed past the
                     // numbers) are counted at once instead of one by one.
@@ -638,10 +643,7 @@ fn shapes(
                             *over = over.saturating_add((cells - cell).saturating_mul(inner.len()));
                             break;
                         }
-                        let at = cell_at(cell % cols, cell / cols);
-                        let ixf = Xf::shift((-bx, -by))
-                            .then(&Xf::insert(at, e.f_or(41, 1.0), e.f_or(42, 1.0), rot))
-                            .then(&xf);
+                        let ixf = cell_xf(cell % cols, cell / cols);
                         shapes(
                             d,
                             inner,
@@ -3041,6 +3043,12 @@ mod tests {
         assert!(g.is_empty(), "{g:?}");
         assert_eq!(skipped.get(ARRAY_NOT_NUMBERS), Some(&3), "{skipped:?}");
         assert!(skipped_warnings(skipped)[0].starts_with("3 copies of a block array"));
+        // Finite on its own, but past the numbers once inside a block scaled by 2.
+        let nested =
+            format!("{blocks}0\nBLOCK\n2\nOUTER\n10\n0\n20\n0\n0\nINSERT\n2\nB\n70\n2\n44\n1e308\n0\nENDBLK\n");
+        let (g, skipped) = drawn("0\nINSERT\n2\nOUTER\n41\n2\n42\n2\n", &nested)?;
+        assert!(g.is_empty(), "{g:?}");
+        assert_eq!(skipped.get(ARRAY_NOT_NUMBERS), Some(&2), "{skipped:?}");
         Ok(())
     }
 
