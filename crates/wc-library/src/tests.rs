@@ -897,6 +897,33 @@ fn the_starter_ammeter_and_voltmeter_are_measuring_instruments() -> Result<()> {
 }
 
 #[test]
+fn starter_two_wire_proximity_sensor_and_its_example_part_load() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
+    project.meta.libraries = vec![LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: starter.to_string_lossy().into(),
+        reference: None,
+    }];
+    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    // The 2-wire proximity sensor (#757): letter code B for a sensor in IEC 81346-2, one wire
+    // in and one out, so it sits in series with the load like a switch.
+    let (prox, _) = lib.symbol("wc.sensor.prox2")?;
+    assert_eq!(prox.role, SymbolRole::Standalone);
+    assert_eq!(prox.letter_code, "B");
+    assert_eq!(prox.category, "sensors");
+    let names: Vec<_> = prox.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["BN", "BU"]);
+    assert_eq!(
+        lib.part("example.ex-px-m12-2w")?.0.symbol.as_deref(),
+        Some("wc.sensor.prox2")
+    );
+    Ok(())
+}
+
+#[test]
 fn the_starter_energy_meter_is_a_measuring_instrument_on_the_grid() -> Result<()> {
     // #930: a single-phase kWh meter, L and N in at the top and out at the bottom.
     let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;

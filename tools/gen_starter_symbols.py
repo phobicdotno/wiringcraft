@@ -658,6 +658,14 @@ sym("wc.sensor.prox3", "Inductive proximity sensor, 3-wire", "sensors", "B", "st
     [pin("BN", -5, 0, "up"), pin("BK", 0, 15, "down"), pin("BU", 5, 0, "up")],
     tag_at=(-10, 8), labels=False,
     desc="Inductive proximity sensor, 3-wire, for metal targets: supply on BN and BU, output on BK. For the capacitive kind use wc.sensor.prox3.capacitive.")
+sym("wc.sensor.prox2", "Inductive proximity sensor, 2-wire", "sensors", "B", "standalone",
+    [rect((-7, 4), (7, 11)),
+     line((0, 0), (0, 4)),
+     line((0, 11), (0, 15)),
+     polyline([(-2.5, 9), (0, 6), (2.5, 9)], closed=True)],
+    vpins("BN", "BU"),
+    tag_at=(-10, 8),
+    desc="Inductive proximity sensor, 2-wire, for metal targets: wired in series with the load like a switch, between BN and BU. For three wires use wc.sensor.prox3.")
 sym("wc.shield", "Cable shield", "connections", "", "standalone",
     [line((0, 0), (0, 9)),
      arc((-3, 9), 3, 0, 30),
