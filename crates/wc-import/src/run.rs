@@ -455,6 +455,17 @@ pub fn archive(dir: &Path, file: &Path, first_page: usize, lib: Option<&Path>, l
     use crate::archive::Kind;
     first_page_in_range(first_page)?;
     let bytes = read_file(file)?;
+    // Old binary `.xls` workbooks are not read: named, so the user knows to save them as `.xlsx`.
+    // Taken from the listing, which has no size limit, so a large one is named too.
+    if let Ok(report) = crate::archive::inspect(&bytes) {
+        for en in report.entries.iter().filter(|en| en.kind == Kind::OldSpreadsheet) {
+            err!(
+                log,
+                "warning: {}: skipped, an old Excel workbook (.xls) is not read; save it as .xlsx",
+                escape_field(&en.name)
+            );
+        }
+    }
     let entries = crate::archive::open_entries(
         &bytes,
         &[
@@ -547,9 +558,12 @@ pub fn archive(dir: &Path, file: &Path, first_page: usize, lib: Option<&Path>, l
                 let number = next;
                 let id = format!("dxf-{number}");
                 next = page_after(next, 1)?;
+                // The number first: the refusal then names the page that holds it.
+                if let Err(why) = number_free(&p, &number.to_string()) {
+                    Err(why)
                 // Page files are named by id, and some folders do not tell `DXF-300`
                 // from `dxf-300`.
-                if p.pages.iter().any(|pg| pg.id.eq_ignore_ascii_case(&id)) {
+                } else if p.pages.iter().any(|pg| pg.id.eq_ignore_ascii_case(&id)) {
                     // Never added over an earlier page: removing it again on failure
                     // would delete that page.
                     Err(format!(
@@ -638,11 +652,26 @@ pub fn archive(dir: &Path, file: &Path, first_page: usize, lib: Option<&Path>, l
 
 /// A DXF drawing onto the page `page` (`import page-dxf`).
 pub fn page_dxf(dir: &Path, file: &Path, page: &str, scale: f64, log: &mut Log) -> Res<()> {
+    let text = read_file(file)?;
+    onto_page(dir, page, log, |known| {
+        // A name from the file in the error cannot steer the terminal.
+        crate::dxf::page(&String::from_utf8_lossy(&text), scale, known).map_err(|why| escape_field(&why.to_string()))
+    })
+}
+
+/// Read a drawing with `read` (given the ids of the library's symbols) and add it to page
+/// `page`: its graphics, and its symbols with the library symbols they need taken into the
+/// project. Shared by `import page-dxf` and `import page-dwg`.
+fn onto_page(
+    dir: &Path,
+    page: &str,
+    log: &mut Log,
+    read: impl FnOnce(&std::collections::BTreeSet<String>) -> Res<crate::dxf::ImportedPage>,
+) -> Res<()> {
     let mut p = load(dir)?;
     let lib = wc_library::Library::open(dir, &p).map_err(e)?;
     let known: std::collections::BTreeSet<String> = lib.index(ItemKind::Symbol).into_keys().collect();
-    let text = read_file(file)?;
-    let imported = crate::dxf::page(&String::from_utf8_lossy(&text), scale, &known).map_err(e)?;
+    let imported = read(&known)?;
     for w in &imported.warnings {
         err!(log, "warning: {}", escape_field(w));
     }
@@ -766,6 +795,20 @@ pub fn save_imported(dir: &Path, p: &Project) -> Res<()> {
     store::save(dir, p).map(|_| ()).map_err(e)
 }
 
+/// Refuses a page number that a page of `p` already has, naming that page: two pages with one
+/// number make cross-references to it ambiguous.
+fn number_free(p: &Project, number: &str) -> Res<()> {
+    let number = number.trim();
+    match p.pages.iter().find(|pg| pg.number.trim() == number) {
+        Some(pg) => Err(format!(
+            "page number {} is taken by page {}; import with --first-page to number the pages from a free number",
+            escape_field(number),
+            escape_field(&pg.id)
+        )),
+        None => Ok(()),
+    }
+}
+
 /// `import pdf`: the pages of `file` as trace pages numbered from `first_page`. `source` names
 /// the PDF in warnings (the file name, or the entry name inside an archive, where `file` is a
 /// staging file), already escaped with [`escape_field`] by the caller.
@@ -779,6 +822,10 @@ pub fn import_pdf(dir: &Path, file: &Path, first_page: usize, source: &str, log:
     let traced = crate::pdf::pages(&bytes).map_err(e)?;
     // Checked once, before anything is written: every `first_page + i` below is in range.
     page_after(first_page, traced.len())?;
+    // Refused before anything is written, the underlay files of scanned pages too.
+    for i in 0..traced.len() {
+        number_free(&p, &(first_page + i).to_string())?;
+    }
     let stem = file
         .file_stem()
         .map(|n| n.to_string_lossy().into_owned())
@@ -877,9 +924,33 @@ pub fn sheet_for((w, h): (f64, f64)) -> (PageSize, Option<String>) {
     }
 }
 
-/// `import page-dwg`: convert `file` with the converter (`template`, see [`dwg_to_dxf`]) and
-/// import the DXF onto `page`. The converter writes into a private folder of its own, removed
-/// with everything in it when this ends, also on failure.
+/// The largest DWG WiringCraft's own reader takes into memory, far above real drawings. A larger
+/// file is refused by the reader and goes to the converter, as other refusals do.
+pub const MAX_DWG_BYTES: u64 = 256 << 20;
+
+/// Read `file` for the built-in DWG reader, at most `limit` bytes: its bytes, or (inside `Ok`)
+/// why the reader does not take it. A file that cannot be opened or read is an error.
+fn read_dwg(file: &Path, limit: u64) -> Res<std::result::Result<Vec<u8>, String>> {
+    use std::io::Read;
+    let cannot = |err: std::io::Error| format!("cannot read {}: {err}", escape_field(&file.display().to_string()));
+    let mut bytes = Vec::new();
+    // At most one byte past the limit, however large the file is.
+    std::fs::File::open(file)
+        .map_err(cannot)?
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(cannot)?;
+    if bytes.len() as u64 > limit {
+        return Ok(Err(format!("the file is larger than the {} MB it reads", limit >> 20)));
+    }
+    Ok(Ok(bytes))
+}
+
+/// `import page-dwg`: read `file` with WiringCraft's own DWG reader (AutoCAD 2004 to 2018) and
+/// import it onto `page`. Only when that reader refuses the file (another version, or a file
+/// it cannot read) is it converted to DXF with an installed converter (`template`, see
+/// [`dwg_to_dxf`]); the converter writes into a private folder of its own, removed with
+/// everything in it when this ends, also on failure. Says which of the two read the file.
 pub fn import_page_dwg(
     dir: &Path,
     file: &Path,
@@ -888,16 +959,61 @@ pub fn import_page_dwg(
     template: Option<String>,
     log: &mut Log,
 ) -> Res<()> {
+    let bytes = read_dwg(file, MAX_DWG_BYTES)?;
+    // A scale the import refuses is refused before any converter runs.
+    if !(scale.is_finite() && scale > 0.0) {
+        return Err("scale must be a positive number".into());
+    }
+    // The reader refuses a file of another version, or one whose object structure it cannot
+    // read; a converter may still read those. What it reads but finds nothing to draw in, and
+    // project or library errors, are not the converter's to fix.
+    let read = bytes.and_then(|bytes| {
+        crate::dwg::read_sections(&bytes)
+            .and_then(|sections| crate::dwg::page_drawing(&sections))
+            .map_err(|why| why.to_string())
+    });
+    let refused = match read {
+        Ok(drawing) => {
+            return onto_page(dir, page, log, |known| dwg_page(&drawing, scale, known))
+                .map(|()| out!(log, "read with WiringCraft's own DWG reader"));
+        }
+        // Names from the file may hold control characters: escaped for the terminal.
+        Err(why) => escape_field(&why),
+    };
     let tmp = staging_dir("wiringcraft-dwg-").map_err(e)?;
-    let dxf = dwg_to_dxf(file, tmp.path(), template)?;
-    page_dxf(dir, &dxf, page, scale, log)
+    let (dxf, converter) = dwg_to_dxf(file, tmp.path(), template)
+        .map_err(|why| format!("WiringCraft's own DWG reader refused the file ({refused}); {why}"))?;
+    out!(
+        log,
+        "converted to DXF with {converter}: WiringCraft's own DWG reader refused the file ({refused})"
+    );
+    let text = read_file(&dxf)?;
+    onto_page(dir, page, log, |known| {
+        // Only a DXF that cannot be read gets both reasons; project errors stay as they are.
+        crate::dxf::page(&String::from_utf8_lossy(&text), scale, known).map_err(|why| {
+            format!(
+                "WiringCraft's own DWG reader refused the file ({refused}); the DXF {converter} made from it could not be read either: {}",
+                escape_field(&why.to_string())
+            )
+        })
+    })
+}
+
+/// The drawing as a page, its error escaped for the terminal: names from the file (a block
+/// name in the reasons a drawing with nothing to draw gives) may hold control characters.
+pub(crate) fn dwg_page(
+    drawing: &crate::dwg::PageDrawing,
+    scale: f64,
+    known: &std::collections::BTreeSet<String>,
+) -> Res<crate::dxf::ImportedPage> {
+    drawing.page(scale, known).map_err(|why| escape_field(&why.to_string()))
 }
 
 /// Convert DWG to a DXF in `tmp` (a private folder, see [`staging_dir`]) with whatever
 /// converter is installed: the command `template` (the WIRINGCRAFT_DWG2DXF setting, with `{in}`
-/// and `{out}`) when given, otherwise `dwg2dxf` or the ODA File Converter. DWG is a closed
-/// format; WiringCraft does not read it itself.
-pub fn dwg_to_dxf(file: &Path, tmp: &Path, template: Option<String>) -> Res<PathBuf> {
+/// and `{out}`) when given, otherwise `dwg2dxf` or the ODA File Converter. Returns the DXF and
+/// the converter's name. For the DWG files WiringCraft's own reader refuses.
+pub fn dwg_to_dxf(file: &Path, tmp: &Path, template: Option<String>) -> Res<(PathBuf, &'static str)> {
     use std::process::Command;
     let stem = file
         .file_stem()
@@ -916,7 +1032,7 @@ pub fn dwg_to_dxf(file: &Path, tmp: &Path, template: Option<String>) -> Res<Path
             let mut c = Command::new(prog);
             c.args(args);
             if ran(c) && out.exists() {
-                return Ok(out);
+                return Ok((out, "the WIRINGCRAFT_DWG2DXF command"));
             }
         }
         return Err("WIRINGCRAFT_DWG2DXF did not produce a DXF".into());
@@ -924,7 +1040,7 @@ pub fn dwg_to_dxf(file: &Path, tmp: &Path, template: Option<String>) -> Res<Path
     let mut c = Command::new("dwg2dxf");
     c.args(["-y", "-o", &output, &input]);
     if ran(c) && out.exists() {
-        return Ok(out);
+        return Ok((out, "dwg2dxf"));
     }
     // ODA File Converter works on folders: <in dir> <out dir> <version> <type> <recurse> <audit> <filter>.
     let in_dir = file
@@ -947,7 +1063,7 @@ pub fn dwg_to_dxf(file: &Path, tmp: &Path, template: Option<String>) -> Res<Path
             name.as_str(),
         ]);
         if ran(c) && out.exists() {
-            return Ok(out);
+            return Ok((out, "ODA File Converter"));
         }
     }
     Err("no DWG converter found: install ODA File Converter or dwg2dxf, or set WIRINGCRAFT_DWG2DXF".into())
@@ -1470,7 +1586,11 @@ pub fn add_built(
 ) -> Result<(Written, usize), String> {
     let cover_fields = keep_one_cover(p, &mut built.pages);
     // Refuse before anything is written: a repeated import must not overwrite the symbol files of
-    // an earlier one and then fail half way.
+    // an earlier one and then fail half way. Numbers first, so the refusal names the page that
+    // holds a number taken.
+    for page in &built.pages {
+        number_free(p, &page.number)?;
+    }
     if let Some(page) = built.pages.iter().find(|pg| p.page(&pg.id).is_some()) {
         return Err(format!(
             "page {} exists; remove it or import into a fresh project",
@@ -1480,13 +1600,6 @@ pub fn add_built(
     let mut ids = std::collections::BTreeSet::new();
     if let Some(page) = built.pages.iter().find(|pg| !ids.insert(pg.id.as_str())) {
         return Err(format!("the import has page {} twice", page.id));
-    }
-    let numbers: std::collections::BTreeSet<&str> = p.pages.iter().map(|pg| pg.number.as_str()).collect();
-    if let Some(page) = built.pages.iter().find(|pg| numbers.contains(pg.number.as_str())) {
-        return Err(format!(
-            "page number {} is taken; import with --first-page to number the pages from a free number",
-            page.number
-        ));
     }
     // A new version of a symbol must keep every pin a wire in the project ends on: one the lock
     // pins in another version, and one the project only has a copy of (no lock entry), which
@@ -1880,6 +1993,24 @@ mod tests {
         }
     }
 
+    /// The built-in DWG reader takes a file up to its limit, and refuses one a byte larger with
+    /// the size in the reason (so the import goes on to the converter, #671).
+    #[test]
+    fn a_dwg_over_the_size_limit_is_refused_by_the_reader_with_its_size() {
+        let t = tmp();
+        let path = t.path().join("big.dwg");
+        let limit = 1 << 20;
+        assert!(std::fs::write(&path, vec![0u8; limit as usize]).is_ok());
+        assert!(matches!(read_dwg(&path, limit), Ok(Ok(b)) if b.len() as u64 == limit));
+        assert!(std::fs::write(&path, vec![0u8; limit as usize + 1]).is_ok());
+        assert_eq!(
+            read_dwg(&path, limit),
+            Ok(Err("the file is larger than the 1 MB it reads".to_owned()))
+        );
+        // A file that is not there is an error of its own, not a refusal.
+        assert!(read_dwg(&t.path().join("missing.dwg"), limit).is_err());
+    }
+
     /// A file put back keeps the permissions it has, not the default ones of a new file (#664).
     #[cfg(unix)]
     #[test]
@@ -1986,6 +2117,56 @@ mod tests {
     }
 
     #[test]
+    fn an_old_xls_workbook_in_an_archive_is_skipped_with_a_reason() {
+        let tmp = tmp();
+        let dir = tmp.path().join("p");
+        assert!(store::save(&dir, &Project::new("t")).is_ok());
+        let xls: &[u8] = b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1rest";
+        let file = tmp.path().join("plant.zip");
+        let bytes = zip_of(&[("a.pdf", &one_page_pdf()), ("lists/old.xls", xls)]);
+        assert!(std::fs::write(&file, bytes).is_ok());
+        let mut log = Log::default();
+        let r = archive(&dir, &file, 1, None, &mut log);
+        assert!(r.is_ok(), "{r:?}");
+        let warnings: Vec<_> = log.warnings().collect();
+        assert_eq!(
+            warnings,
+            vec!["warning: lists/old.xls: skipped, an old Excel workbook (.xls) is not read; save it as .xlsx"],
+            "{}",
+            log.text()
+        );
+        assert!(matches!(load(&dir), Ok(p) if p.pages.len() == 1));
+
+        // With nothing else inside, the import still says there was nothing to import.
+        let file = tmp.path().join("only.zip");
+        assert!(std::fs::write(&file, zip_of(&[("old.xls", xls)])).is_ok());
+        let mut log = Log::default();
+        let r = archive(&dir, &file, 1, None, &mut log);
+        assert!(matches!(&r, Err(why) if why.contains("no importable")), "{r:?}");
+        assert_eq!(log.warnings().count(), 1, "{}", log.text());
+
+        // One too large to extract is still named.
+        let mut bytes = zip_of(&[("big.xls", xls)]);
+        let Some(cd) = bytes.windows(4).position(|w| w == b"PK\x01\x02") else {
+            unreachable!("no central directory")
+        };
+        // The uncompressed size in the central directory header: 512 MiB.
+        bytes[cd + 24..cd + 28].copy_from_slice(&(512u32 << 20).to_le_bytes());
+        assert!(matches!(crate::archive::inspect(&bytes), Ok(r) if r.entries.iter().any(|en| en.size > 256 << 20)));
+        let file = tmp.path().join("big.zip");
+        assert!(std::fs::write(&file, bytes).is_ok());
+        let mut log = Log::default();
+        let r = archive(&dir, &file, 1, None, &mut log);
+        assert!(matches!(&r, Err(why) if why.contains("no importable")), "{r:?}");
+        assert_eq!(
+            log.warnings().collect::<Vec<_>>(),
+            vec!["warning: big.xls: skipped, an old Excel workbook (.xls) is not read; save it as .xlsx"],
+            "{}",
+            log.text()
+        );
+    }
+
+    #[test]
     fn a_pdf_whose_pages_cannot_be_counted_on_from_the_first_is_refused_before_it_is_written() {
         let tmp = tmp();
         let dir = tmp.path().join("p");
@@ -2000,6 +2181,118 @@ mod tests {
         assert!(matches!(load(&dir), Ok(p) if p.pages.is_empty()));
         assert_eq!(page_after(MAX_FIRST_PAGE, 10), Ok(MAX_FIRST_PAGE + 10));
         assert!(page_after(usize::MAX - 1, 2).is_err());
+    }
+
+    /// No import gives a new page a number another page has (#869): each route refuses, naming
+    /// the page with that number, and the project folder stays as it was.
+    #[test]
+    fn an_import_onto_a_page_number_in_use_is_refused_and_writes_nothing() {
+        let tmp = tmp();
+        let dir = tmp.path().join("p");
+        let mut p = Project::new("t");
+        p.pages.push(Page::new("p0001", " 1 ", "Cover"));
+        p.pages.push(Page::new("x", "200", "Mine"));
+        // Holds the id the archive's drawing would get, not its number: the number is named.
+        p.pages.push(Page::new("DXF-200", "5", "Mine too"));
+        assert!(store::save(&dir, &p).is_ok());
+        let before = files(&dir);
+        let pdf_file = tmp.path().join("sheet.pdf");
+        assert!(std::fs::write(&pdf_file, one_page_pdf()).is_ok());
+        let aml_file = tmp.path().join("plant.aml");
+        assert!(std::fs::write(&aml_file, AML).is_ok());
+        let dxf = "0\nSECTION\n2\nENTITIES\n0\nLINE\n8\n0\n10\n0\n20\n0\n11\n10\n21\n0\n0\nENDSEC\n0\nEOF\n";
+        let zip_file = tmp.path().join("plant.zip");
+        assert!(std::fs::write(&zip_file, zip_of(&[("a.dxf", dxf.as_bytes())])).is_ok());
+
+        let taken = |r: Res<()>, number: &str, page: &str| match r {
+            Err(why) => assert!(
+                why.starts_with(&format!("page number {number} is taken by page {page};"))
+                    && why.contains("--first-page"),
+                "{why}"
+            ),
+            Ok(()) => unreachable!("an import onto page number {number} went through"),
+        };
+        taken(pdf(&dir, &pdf_file, 1, &mut Log::default()), "1", "p0001");
+        taken(pdf(&dir, &pdf_file, 200, &mut Log::default()), "200", "x");
+        taken(aml(&dir, &aml_file, 200, &mut Log::default()), "200", "x");
+        // An archive goes on to its other entries: the refused one is a warning.
+        let mut log = Log::default();
+        assert_eq!(archive(&dir, &zip_file, 200, None, &mut log), Ok(()));
+        let warned: Vec<&str> = log.warnings().collect();
+        assert!(
+            matches!(warned.as_slice(), [w] if w.contains("page number 200 is taken by page x;")),
+            "{}",
+            log.text()
+        );
+        assert_eq!(files(&dir), before);
+
+        // A free number goes through.
+        assert_eq!(pdf(&dir, &pdf_file, 2, &mut Log::default()), Ok(()));
+        assert!(matches!(load(&dir), Ok(p) if p.page("pdf-2").is_some_and(|pg| pg.number == "2")));
+    }
+
+    /// EPLAN and SolidWorks Electrical imports refuse a page number in use the same way, naming
+    /// the page with that number before a page id the import shares with the project.
+    #[test]
+    fn an_eplan_or_swe_import_onto_a_page_number_in_use_is_refused_and_writes_nothing() {
+        let tmp = tmp();
+        let edb = tmp.path().join("plant.edb");
+        assert!(std::fs::create_dir(&edb).is_ok());
+        for (name, bytes) in crate::eplan::tests::sample() {
+            assert!(std::fs::write(edb.join(name), bytes).is_ok());
+        }
+        let db = tmp.path().join("plant.db");
+        let Some(db_path) = db.to_str() else {
+            unreachable!("temp path is not UTF-8")
+        };
+        let conn = crate::swe::tests::sample();
+        assert!(conn.execute("VACUUM INTO ?1", [db_path]).is_ok());
+        type Route<'a> = &'a dyn Fn(&Path) -> Res<()>;
+        let eplan_route = |dir: &Path| eplan(dir, &edb, 200, &mut Log::default());
+        let swe_route = |dir: &Path| swe(dir, &db, 1, Some(200), None, &mut Log::default());
+        let routes: [(&str, Route); 2] = [("eplan", &eplan_route), ("swe", &swe_route)];
+        for (name, import) in routes {
+            // The ids the import gives its pages, from a fresh project.
+            let fresh = tmp.path().join(format!("{name}-fresh"));
+            assert!(store::save(&fresh, &Project::new("t")).is_ok());
+            assert_eq!(import(&fresh), Ok(()), "{name}");
+            let Ok(imported) = load(&fresh) else {
+                unreachable!("{name}: not saved")
+            };
+            let Some(first) = imported.pages.iter().find(|pg| pg.number == "200") else {
+                unreachable!("{name}: no page 200 in {:?}", imported.pages)
+            };
+
+            let dir = tmp.path().join(name);
+            let mut p = Project::new("t");
+            p.pages.push(Page::new("x", "200", "Mine"));
+            p.pages.push(Page::new(first.id.clone(), "999", "Same id"));
+            assert!(store::save(&dir, &p).is_ok());
+            let before = files(&dir);
+            match import(&dir) {
+                Err(why) => assert!(
+                    why.starts_with("page number 200 is taken by page x;") && why.contains("--first-page"),
+                    "{name}: {why}"
+                ),
+                Ok(()) => unreachable!("{name}: an import onto page number 200 went through"),
+            }
+            assert_eq!(files(&dir), before, "{name}");
+        }
+    }
+
+    /// The refusal escapes the page id and number it names: an id from a file stem may hold ESC.
+    #[test]
+    fn a_taken_page_number_is_named_without_control_characters() {
+        let mut p = Project::new("t");
+        p.pages.push(Page::new("a\u{1b}[31m", "7\u{1b}", "Mine"));
+        let Err(why) = number_free(&p, "7\u{1b}") else {
+            unreachable!("a taken page number went through");
+        };
+        assert!(!why.contains('\u{1b}'), "{why:?}");
+        assert!(
+            why.starts_with("page number 7\\u{1b} is taken by page a\\u{1b}[31m;"),
+            "{why:?}"
+        );
     }
 
     #[test]
@@ -2376,6 +2669,23 @@ mod tests {
         assert!(store::read_vendored_symbol(&dir, "imp.lamp").is_ok());
         let pins = load(&dir).map(|p| p.lock.symbols.len());
         assert_eq!(pins, Ok(2));
+    }
+
+    #[test]
+    fn a_dxf_page_error_naming_an_entity_is_escaped_for_the_terminal() {
+        let t = tmp();
+        let dir = t.path().join("p");
+        let mut p = Project::new("t");
+        p.pages.push(wc_core::Page::new("1", "1", "Main"));
+        assert!(store::save(&dir, &p).is_ok());
+        let drawing = t.path().join("page.dxf");
+        let text = "0\nSECTION\n2\nENTITIES\n0\nBAD\u{1b}[2J\n8\n0\n0\nENDSEC\n0\nEOF\n";
+        assert!(std::fs::write(&drawing, text).is_ok());
+        let mut log = Log::default();
+        let Err(err) = page_dxf(&dir, &drawing, "1", 1.0, &mut log) else {
+            unreachable!("nothing on the page");
+        };
+        assert!(err.contains("BAD\\u{1b}[2J") && !err.contains('\u{1b}'), "{err}");
     }
 
     #[test]

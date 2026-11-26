@@ -284,6 +284,17 @@ enum Cmd {
         #[arg(long = "type")]
         kind: Option<String>,
     },
+    /// Delete symbols and wires from a page by their ids (as `place`, `box` and `wire` print
+    /// them). Wires that end on a pin of a deleted symbol go too, as in the app; devices keep
+    /// their data. An id that is not on the page is an error and nothing changes. Prints each
+    /// deleted id.
+    Delete {
+        /// The page's id.
+        page: String,
+        /// The ids of the symbols and wires to delete, e.g. `s1 w3`.
+        #[arg(required = true)]
+        ids: Vec<String>,
+    },
     /// The project's locations (cabinets, rooms, panels): the `+` part of device tags.
     #[command(subcommand)]
     Location(LocationCmd),
@@ -323,7 +334,7 @@ enum Cmd {
     /// order under which headings, sorting, grouping and the title-block values above the table.
     #[command(subcommand)]
     ReportLayout(ReportLayoutCmd),
-    /// Set a device's part and description.
+    /// Set a device's part and description, or with neither option print them.
     Device {
         /// Device tag, e.g. `-K1` (taken as a value, though it starts with `-`).
         #[arg(allow_hyphen_values = true)]
@@ -372,9 +383,11 @@ enum Cmd {
         edit: Option<TranslationsCmd>,
     },
     /// Export pages as drawings for other tools: one SVG or DXF file per page in a folder,
-    /// drawn like the PDF (frame, title block, symbols, wires, cross-references).
+    /// drawn like the PDF (frame, title block, symbols, wires, cross-references), and one per
+    /// panel layout (plate, rails, ducts, devices).
     Drawing {
-        /// Output folder; files are named `<page number>.<format>`.
+        /// Output folder; files are named `<page number>.<format>`, and `panel-<name>.<format>`
+        /// for panel layouts.
         out: PathBuf,
         /// `svg` or `dxf`.
         #[arg(long, default_value = "svg")]
@@ -400,6 +413,11 @@ enum Cmd {
         /// a folder, which gets one `<report>.csv` per report.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// CSV field separator: `,` (the default) or `;`. With `;` a file written with `--out`
+        /// also starts with a UTF-8 byte order mark, so Excel in a comma-decimal locale opens
+        /// it in columns with letters like æ ø å intact.
+        #[arg(long, default_value = ",")]
+        sep: char,
     },
     /// List the potentials (connected pins) across all pages.
     Nets,
@@ -420,11 +438,12 @@ enum Cmd {
         out: PathBuf,
     },
     /// Check the project for mistakes: devices drawn twice, contacts without a coil, shorted
-    /// potentials, open pins, wires ending in the air, devices without a part, plus the
-    /// project's own `[[rule]]` tables in `project.toml` (a cable on every motor, a tag
-    /// pattern, at most N wires on a terminal) and the house rules in each library source's
-    /// `rules.toml`, less the ones `rules_off` turns off. Exits with an error when an error is
-    /// found, so it can guard a commit or a CI job.
+    /// potentials, open pins, wires ending in the air, wire numbers that do not name one
+    /// connection each, devices without a part, plus the project's own `[[rule]]` tables in
+    /// `project.toml` (a cable on every motor, a tag pattern, at most N wires on a terminal)
+    /// and the house rules in each library source's `rules.toml`, less the ones `rules_off`
+    /// turns off. Exits with an error when an error is found, so it can guard a commit or a CI
+    /// job.
     Check {
         /// Also list notes (open pins, devices without a part).
         #[arg(long)]
@@ -584,6 +603,21 @@ enum PanelCmd {
         #[arg(long, default_value_t = 800.0)]
         height: f64,
     },
+    /// Change a layout's name or plate size. Rails, ducts and devices stay where they are; a
+    /// size that would leave any of them sticking out of the plate is refused.
+    Edit {
+        /// The layout's id.
+        id: String,
+        /// The new name, shown on its page; `""` uses the id.
+        #[arg(long)]
+        name: Option<String>,
+        /// New plate width in mm.
+        #[arg(long)]
+        width: Option<f64>,
+        /// New plate height in mm.
+        #[arg(long)]
+        height: Option<f64>,
+    },
     /// Put devices that have a part and are not on the plate yet onto its rails, sized by the
     /// part's `Width` and `Height` properties.
     Arrange {
@@ -621,7 +655,44 @@ enum PanelCmd {
         #[arg(long)]
         remove: bool,
     },
-    /// Print a layout's plate and each device on it with its position, size and turn.
+    /// Add a 35 mm DIN rail to a plate, or take one off with `--remove N` (rails numbered as
+    /// `panel show` lists them).
+    Rail {
+        /// The layout's id.
+        id: String,
+        /// Left end of the rail on its centre line in mm, `x,y`.
+        #[arg(long, value_parser = parse_point, required_unless_present = "remove", conflicts_with = "remove")]
+        at: Option<Point>,
+        /// Length in mm, to the right of `--at`.
+        #[arg(long, required_unless_present = "remove", conflicts_with = "remove")]
+        length: Option<f64>,
+        /// Take off the rail with this number.
+        #[arg(long, value_name = "N")]
+        remove: Option<usize>,
+    },
+    /// Add a wire duct to a plate, or take one off with `--remove N` (ducts numbered as
+    /// `panel show` lists them).
+    Duct {
+        /// The layout's id.
+        id: String,
+        /// Top-left corner of the duct in mm, `x,y`.
+        #[arg(long, value_parser = parse_point, required_unless_present = "remove", conflicts_with = "remove")]
+        at: Option<Point>,
+        /// Length in mm: to the right, or down with `--vertical`.
+        #[arg(long, required_unless_present = "remove", conflicts_with = "remove")]
+        length: Option<f64>,
+        /// Width in mm, across the length.
+        #[arg(long, default_value_t = wc_core::panel::DUCT, conflicts_with = "remove")]
+        width: f64,
+        /// Run the duct down the plate instead of across.
+        #[arg(long, conflicts_with = "remove")]
+        vertical: bool,
+        /// Take off the duct with this number.
+        #[arg(long, value_name = "N")]
+        remove: Option<usize>,
+    },
+    /// Print a layout's plate, its numbered rails and ducts, and each device on it with its
+    /// position, size and turn.
     Show {
         /// The layout's id.
         id: String,
@@ -1117,6 +1188,18 @@ enum PageCmd {
         #[arg(long)]
         off: bool,
     },
+    /// Change a page's number or title. A number another page already uses is refused; the
+    /// pages are sorted by number again afterwards.
+    Edit {
+        /// The page's id.
+        id: String,
+        /// The new page number, e.g. `3` or `3.1`.
+        #[arg(long)]
+        number: Option<String>,
+        /// The new page title.
+        #[arg(long)]
+        title: Option<String>,
+    },
     /// Change a page's sheet size (as `page add --size` takes it). What is drawn stays where it
     /// is; a smaller sheet can leave some of it outside the frame.
     Size {
@@ -1372,8 +1455,9 @@ enum ImportCmd {
         #[arg(long)]
         lib: Option<PathBuf>,
     },
-    /// A DWG drawing onto a page, converted to DXF by an installed converter (ODA File
-    /// Converter, `dwg2dxf`, or the command in WIRINGCRAFT_DWG2DXF with {in} and {out}).
+    /// A DWG drawing onto a page, read by WiringCraft's own DWG reader (AutoCAD 2004 to 2018).
+    /// A file it refuses is converted to DXF by an installed converter (ODA File Converter,
+    /// `dwg2dxf`, or the command in WIRINGCRAFT_DWG2DXF with {in} and {out}).
     PageDwg {
         /// The DWG file.
         file: PathBuf,
@@ -1522,6 +1606,38 @@ fn parse_point(s: &str) -> Result<Point, String> {
     } else {
         Err("coordinates must be finite".into())
     }
+}
+
+/// `delete`: take the symbols and wires named by `ids` off `page`, and the wires ending on a
+/// deleted symbol's pin, as the app's Delete does. An id not on the page is an error and nothing
+/// changes. Returns the deleted ids: symbols first, then wires, each in page order.
+fn delete_items(page: &mut Page, ids: &[String]) -> Res<Vec<String>> {
+    let missing: Vec<String> = ids
+        .iter()
+        .filter(|id| page.symbol(id).is_none() && !page.wires.iter().any(|w| &w.id == *id))
+        .map(|id| format!("{:?}", id))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!("no symbol or wire {} on page {}", missing.join(", "), page.id));
+    }
+    let named = |id: &str| ids.iter().any(|x| x == id);
+    let on_deleted =
+        |end: &Endpoint| matches!(end, Endpoint::Pin { item, .. } if page.symbol(item).is_some() && named(item));
+    let gone_wires: Vec<String> = page
+        .wires
+        .iter()
+        .filter(|w| named(&w.id) || on_deleted(&w.from) || on_deleted(&w.to))
+        .map(|w| w.id.clone())
+        .collect();
+    let gone_symbols: Vec<String> = page
+        .symbols
+        .iter()
+        .filter(|s| named(&s.id))
+        .map(|s| s.id.clone())
+        .collect();
+    page.symbols.retain(|s| !gone_symbols.contains(&s.id));
+    page.wires.retain(|w| !gone_wires.contains(&w.id));
+    Ok(gone_symbols.into_iter().chain(gone_wires).collect())
 }
 
 /// A wire end from `item:pin` or `x,y`. A pin must be one the placed symbol has (its
@@ -1777,6 +1893,217 @@ fn rules_list(p: &Project, library: &[wc_core::check_rule::RuleSet], json: bool)
         out.push_str(&format!("{}\toff\tnames no library rule\n", escape_field(o)));
     }
     Ok(out)
+}
+
+impl Cmd {
+    /// Every path this command reads as an input file, as named on the command line (so `-`
+    /// for stdin, and a folder where an importer takes one). Output paths and library folders
+    /// are not inputs. [`spool_inputs`] goes through them before the project lock is taken.
+    fn inputs_mut(&mut self) -> Vec<&mut PathBuf> {
+        match self {
+            Cmd::Inspect { file }
+            | Cmd::Logo(LogoCmd::Set { file })
+            | Cmd::Rules(RulesCmd::Set { file })
+            | Cmd::ReportLayout(ReportLayoutCmd::Set { file, .. }) => vec![file],
+            // Every import is listed, so a new one has to say what it reads.
+            Cmd::Import(import) => match import {
+                ImportCmd::SymbolDxf { file, .. }
+                | ImportCmd::FootprintDxf { file, .. }
+                | ImportCmd::ModelStep { file, .. }
+                | ImportCmd::SymbolSvg { file, .. }
+                | ImportCmd::PlcCsv { file }
+                | ImportCmd::Wago { file }
+                | ImportCmd::SymbolKicad { file, .. }
+                | ImportCmd::PartsBmecat { file, .. }
+                | ImportCmd::PartsCsv { file, .. }
+                | ImportCmd::Archive { file, .. }
+                | ImportCmd::PageDwg { file, .. }
+                | ImportCmd::Pdf { file, .. }
+                | ImportCmd::Aml { file, .. }
+                | ImportCmd::PageDxf { file, .. } => vec![file],
+                ImportCmd::Eplan { path, .. } | ImportCmd::SweLibrary { path, .. } => vec![path],
+                ImportCmd::PartsEdz { file, symbol_map, .. } => std::iter::once(file).chain(symbol_map).collect(),
+                ImportCmd::Swe { path, symbol_map, .. } => std::iter::once(path).chain(symbol_map).collect(),
+                ImportCmd::SymbolQet { files, .. } => files.iter_mut().collect(),
+            },
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// The most [`spool_inputs`] copies of one stream that no importer limit applies to: the
+/// operand is refused when it has more. A stream without an end (`/dev/zero`, a FIFO whose
+/// writer never stops) would otherwise hold the command up until the temporary folder is
+/// full. Above every limit an importer has for what it unpacks, so an archive it would read
+/// from a file is read from a stream too. Regular files are not copied and have no such limit.
+const MAX_SPOOLED_BYTES: u64 = 4 << 30;
+
+/// How much of one stream [`spool_inputs_within`] copies at most.
+#[derive(Clone, Copy)]
+struct SpoolLimits {
+    /// A SolidWorks Electrical database given to `import swe` as it is, not in an archive.
+    database: u64,
+    /// Any other stream, but an `import symbol-qet` element, which has the importer's limit.
+    stream: u64,
+}
+
+/// [`spool_inputs_within`] the limits the commands have: every copy has one.
+fn spool_inputs(cmd: &mut Cmd) -> Res<Option<tempfile::TempDir>> {
+    let limits = SpoolLimits {
+        database: wc_import::swe::MAX_DATABASE_BYTES,
+        stream: MAX_SPOOLED_BYTES,
+    };
+    spool_inputs_within(cmd, limits)
+}
+
+/// Copy every input of `cmd` that is not a regular file (a FIFO, a character device) into a
+/// private temporary folder, under the name it has, and point the command at the copy (no
+/// more of it than the importer reads). Every copy is bounded: an `import symbol-qet` element
+/// is cut one byte over the importer's limit, which then refuses that element as too large; a
+/// database for `import swe` (a stream that starts with the SQLite header) larger than
+/// `limits.database`, and any other stream larger than `limits.stream`, is refused here, by
+/// the name the operand has. An input named again, under the same or another name,
+/// is read once: each operand gets the same bytes in a folder of its own, under its own name,
+/// as an importer may take an id from the name. Called
+/// before the project lock is taken: a FIFO that another command on the same project fills
+/// would otherwise never be read, as its writer waits for the lock this command holds while it
+/// waits for the writer (#658). Regular files, folders, `-` and paths that do not exist are
+/// left as they are, for the command to read (or report) itself, and so is a stream that cannot
+/// be opened, and an element stream `import symbol-qet` refuses unread for its id, which an
+/// earlier element has. On Unix the `.edb` folder an
+/// Eplan `.elk` stream names stays beside its copy, as a link to the one beside the operand.
+/// The copies are removed when the returned folder is dropped; `None` when nothing was copied.
+fn spool_inputs_within(cmd: &mut Cmd, limits: SpoolLimits) -> Res<Option<tempfile::TempDir>> {
+    use std::io::{Read, Write};
+    // A database is told from an archive by its first bytes, as the importer does.
+    const SQLITE: &[u8] = b"SQLite format 3\0";
+    #[cfg(unix)]
+    let eplan = matches!(cmd, Cmd::Import(ImportCmd::Eplan { .. }));
+    // The first input of `import swe` is a database or an archive; its symbol map is neither.
+    let swe = matches!(cmd, Cmd::Import(ImportCmd::Swe { .. }));
+    // An importer that reads no more than so much of its input gets no more than that: a
+    // stream without an end (`/dev/zero`) would otherwise be copied until the disk is full.
+    // One byte over the limit is kept, which is how the importer sees the input is too large.
+    let element = matches!(cmd, Cmd::Import(ImportCmd::SymbolQet { .. })).then_some(wc_import::qet::MAX_LEN as u64);
+    let qet = match cmd {
+        Cmd::Import(ImportCmd::SymbolQet { prefix, scale, .. }) => Some((prefix.clone(), *scale)),
+        _ => None,
+    };
+    // The elements before this one, as `import symbol-qet` will read them, each with its id.
+    let mut earlier: Vec<(String, PathBuf)> = Vec::new();
+    let mut spool = None;
+    // A stream can be read once: an input named again gets the copy made the first time.
+    let mut copied: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for (n, path) in cmd.inputs_mut().into_iter().enumerate() {
+        let id = qet.as_ref().map(|(prefix, _)| qet_id(path, prefix));
+        let stream = path.as_os_str() != "-" && std::fs::metadata(&*path).is_ok_and(|m| !m.is_file() && !m.is_dir());
+        if !stream {
+            earlier.extend(id.map(|id| (id, path.clone())));
+            continue;
+        }
+        // An element whose id an earlier one has is refused without being opened: it is not
+        // opened here either, where a FIFO without a writer would hold the command up. The
+        // earlier one has the id when it can be read as an element, as the import decides.
+        if let (Some(id), Some((_, scale))) = (&id, &qet)
+            && earlier
+                .iter()
+                .any(|(other, file)| other == id && qet_element(file, id, *scale).is_ok())
+        {
+            continue;
+        }
+        let same = std::fs::canonicalize(&*path).unwrap_or_else(|_| path.clone());
+        let first = copied
+            .iter()
+            .find(|(from, _)| *from == same)
+            .map(|(_, copy)| copy.clone());
+        // A stream that cannot be opened is left for the command to report, as a path that
+        // does not exist is: nothing of it was read.
+        let from = match &first {
+            Some(_) => None,
+            None => match std::fs::File::open(&*path) {
+                Ok(from) => Some(from),
+                Err(_) => {
+                    earlier.extend(id.map(|id| (id, path.clone())));
+                    continue;
+                }
+            },
+        };
+        let fail = |x: std::io::Error| format!("{}: {x}", escape_field(&path.display().to_string()));
+        let folder = match &spool {
+            Some(folder) => folder,
+            None => spool.insert(run::staging_dir("wc-input-").map_err(|x| format!("temporary folder: {x}"))?),
+        };
+        // One folder per input: two inputs may share a file name.
+        let own = folder.path().join(n.to_string());
+        std::fs::create_dir(&own).map_err(|x| format!("{}: {x}", own.display()))?;
+        let copy = own.join(path.file_name().unwrap_or(std::ffi::OsStr::new("input")));
+        let at_copy = |x: std::io::Error| format!("{}: {x}", copy.display());
+        if let Some(first) = &first {
+            // The bytes read the first time, under the name this operand has.
+            std::fs::hard_link(first, &copy)
+                .or_else(|_| std::fs::copy(first, &copy).map(|_| ()))
+                .map_err(at_copy)?;
+        } else if let Some(from) = from {
+            let mut to = std::fs::File::create(&copy).map_err(at_copy)?;
+            let mut head = Vec::new();
+            if swe && n == 0 {
+                (&from).take(SQLITE.len() as u64).read_to_end(&mut head).map_err(fail)?;
+                to.write_all(&head).map_err(at_copy)?;
+            }
+            // The most this copy may hold, and whether one byte more is refused here (with
+            // the importer's own words for a database) or left for the importer to refuse.
+            let (most, refused) = match element {
+                Some(most) => (most, None),
+                None if head == SQLITE => (limits.database, Some("")),
+                None => (limits.stream, Some("the stream ")),
+            };
+            let rest = most.saturating_add(1).saturating_sub(head.len() as u64);
+            let len = std::io::copy(&mut (&from).take(rest), &mut to).map_err(fail)? + head.len() as u64;
+            if let (true, Some(what)) = (len > most, refused) {
+                return Err(format!(
+                    "{}: {what}is larger than {} MB",
+                    escape_field(&path.display().to_string()),
+                    most >> 20
+                ));
+            }
+            copied.push((same, copy.clone()));
+        }
+        #[cfg(unix)]
+        if eplan {
+            link_elk_folder(path, &copy)?;
+        }
+        earlier.extend(id.map(|id| (id, copy.clone())));
+        *path = copy;
+    }
+    Ok(spool)
+}
+
+/// Beside `copy`, the copy of the Eplan `.elk` stream `operand`, a link to the `.edb` folder
+/// the file names, which the importer looks for beside the file it is given: the folder is
+/// beside the operand, not beside its copy. Nothing when the copy is not an `.elk` file or
+/// names no folder that is there, which the importer then reports itself.
+#[cfg(unix)]
+fn link_elk_folder(operand: &Path, copy: &Path) -> Res<()> {
+    use std::io::Read;
+    // The folder name is the first line; a zip of the folder is not an `.elk` file.
+    let mut head = Vec::new();
+    std::fs::File::open(copy)
+        .and_then(|f| f.take(1 << 16).read_to_end(&mut head))
+        .map_err(|x| format!("{}: {x}", copy.display()))?;
+    if head.starts_with(b"PK") {
+        return Ok(());
+    }
+    let Some(name) = wc_import::eplan::elk_target(&head) else {
+        return Ok(());
+    };
+    let folder = operand.with_file_name(&name);
+    let link = copy.with_file_name(&name);
+    if name == "." || name == ".." || link == copy || !folder.is_dir() {
+        return Ok(());
+    }
+    // An absolute target: a relative one would be looked up from the link's folder.
+    let folder = std::fs::canonicalize(&folder).map_err(|x| format!("{}: {x}", folder.display()))?;
+    std::os::unix::fs::symlink(&folder, &link).map_err(|x| format!("{}: {x}", link.display()))
 }
 
 /// The rules in `file` for `rules set`, in order, each as the check runs it: `[[rule]]`
@@ -2075,13 +2402,16 @@ fn edit_macro(
     Ok(())
 }
 
-fn run(cli: Cli) -> Res<()> {
-    let dir = cli.project.as_path();
+fn run(mut cli: Cli) -> Res<()> {
     // One command at a time on a project: a second run waits, so it reads what the first one
     // wrote instead of overwriting it with an edit planned from the old files (#610).
     // An input file (or stdin) is read before the lock is taken: fed by another command on the
     // same project, through a pipe or a named FIFO, waiting for the lock before reading would
-    // hold both up for good.
+    // hold both up for good. Any command's input that is such a stream is copied to a
+    // temporary file first (#658); the commands below also read theirs here when it is a
+    // regular file.
+    let _spooled = spool_inputs(&mut cli.cmd)?;
+    let dir = cli.project.as_path();
     let mut input_text = match &cli.cmd {
         Cmd::Rules(RulesCmd::Set { file }) | Cmd::ReportLayout(ReportLayoutCmd::Set { file, .. }) => {
             Some(read_input(file)?)
@@ -2148,13 +2478,7 @@ fn run(cli: Cli) -> Res<()> {
                     if p.panels.iter().any(|x| x.id == id) {
                         return Err(format!("panel {id:?} exists"));
                     }
-                    if !(width.is_finite()
-                        && height.is_finite()
-                        && (200.0..=5000.0).contains(&width)
-                        && (200.0..=5000.0).contains(&height))
-                    {
-                        return Err("plate width and height must be 200 to 5000 mm".into());
-                    }
+                    check_plate_size(width, height)?;
                     let name = if name.is_empty() { id.clone() } else { name };
                     let panel = wc_core::panel::Panel::with_rails(id, name, width, height);
                     let rails = panel
@@ -2165,6 +2489,35 @@ fn run(cli: Cli) -> Res<()> {
                     println!("panel {}: {width} x {height} mm, {rails} rail(s)", panel.id);
                     p.panels.push(panel);
                     p.panels.sort_by(|a, b| a.id.cmp(&b.id));
+                }
+                PanelCmd::Edit {
+                    id,
+                    name,
+                    width,
+                    height,
+                } => {
+                    if name.is_none() && width.is_none() && height.is_none() {
+                        return Err("nothing to change: give --name, --width or --height".into());
+                    }
+                    let Some(panel) = p.panels.iter_mut().find(|x| x.id == id) else {
+                        return Err(format!("no panel {id:?}"));
+                    };
+                    let (w, h) = (width.unwrap_or(panel.width), height.unwrap_or(panel.height));
+                    // A name-only edit leaves the plate alone, so it still works when something
+                    // already sticks out past an edge (as `panel arrange` can leave it).
+                    if width.is_some() || height.is_some() {
+                        check_plate_size(w, h)?;
+                        panel.resize(w, h)?;
+                    }
+                    if let Some(name) = name {
+                        panel.name = if name.is_empty() { id.clone() } else { name };
+                    }
+                    println!(
+                        "panel {id}: {} ({} x {} mm)",
+                        escape_field(&panel.name),
+                        panel.width,
+                        panel.height
+                    );
                 }
                 PanelCmd::Arrange { id, location } => {
                     let parts = vendored_parts(dir, &p);
@@ -2191,12 +2544,26 @@ fn run(cli: Cli) -> Res<()> {
                     };
                     let parts = vendored_parts(dir, &p);
                     let step = wc_report::step::panel_step(&p, panel, &parts, &utc_now());
-                    write_out(&out, &step).map_err(e)?;
+                    write_out(&out, &step.text).map_err(e)?;
                     println!(
                         "wrote {} ({} solids)",
                         out.display(),
-                        step.matches("MANIFOLD_SOLID_BREP(").count()
+                        step.text.matches("MANIFOLD_SOLID_BREP(").count()
                     );
+                    if !step.default_depth.is_empty() {
+                        let line = format!(
+                            "warning: no Depth on the part, drawn {} mm deep: {}\n",
+                            wc_report::step::DEFAULT_DEPTH,
+                            step.default_depth.join(", ")
+                        );
+                        // A warning that cannot be shown does not stop the export: it goes to
+                        // standard output instead, with the reason, as `logged_to` does.
+                        if let Err(why) = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes()) {
+                            // Nothing is left to report this to when standard output fails as well.
+                            let note = format!("warning: could not print on standard error: {why}\n{line}");
+                            let _ = std::io::Write::write_all(&mut std::io::stdout(), note.as_bytes());
+                        }
+                    }
                     return Ok(());
                 }
                 PanelCmd::Device {
@@ -2261,6 +2628,46 @@ fn run(cli: Cli) -> Res<()> {
                         if estimated {
                             eprintln!("warning: no Width/Height on the part, drawn 18 x 90 mm: {tag}");
                         }
+                    }
+                }
+                PanelCmd::Rail { id, at, length, remove } => {
+                    let Some(panel) = p.panels.iter_mut().find(|x| x.id == id) else {
+                        return Err(format!("no panel {id:?}"));
+                    };
+                    if let Some(n) = remove {
+                        remove_rail_or_duct(panel, true, n)?;
+                        println!("removed rail {n} from {id}");
+                    } else {
+                        let (Some(at), Some(length)) = (at, length) else {
+                            return Err("give --at x,y and --length".into());
+                        };
+                        let rail = panel_rail(panel, at, length)?;
+                        panel.items.push(rail);
+                        println!("rail on {id} at {},{}, {length} mm long", at.x, at.y);
+                    }
+                }
+                PanelCmd::Duct {
+                    id,
+                    at,
+                    length,
+                    width,
+                    vertical,
+                    remove,
+                } => {
+                    let Some(panel) = p.panels.iter_mut().find(|x| x.id == id) else {
+                        return Err(format!("no panel {id:?}"));
+                    };
+                    if let Some(n) = remove {
+                        remove_rail_or_duct(panel, false, n)?;
+                        println!("removed duct {n} from {id}");
+                    } else {
+                        let (Some(at), Some(length)) = (at, length) else {
+                            return Err("give --at x,y and --length".into());
+                        };
+                        let (w, h) = if vertical { (width, length) } else { (length, width) };
+                        let duct = panel_duct(panel, at, w, h)?;
+                        panel.items.push(duct);
+                        println!("duct on {id} at {},{}, {w} x {h} mm", at.x, at.y);
                     }
                 }
                 PanelCmd::Show { id } => {
@@ -2338,11 +2745,14 @@ fn run(cli: Cli) -> Res<()> {
                     return Ok(());
                 }
                 PageCmd::Remove { id } => {
-                    let before = p.pages.len();
-                    p.pages.retain(|pg| pg.id != id);
-                    if p.pages.len() == before {
+                    if !p.pages.iter().any(|pg| pg.id == id) {
                         return Err(format!("no page {id:?}"));
                     }
+                    // Same rule as the app: a project keeps at least one page.
+                    if p.pages.len() <= 1 {
+                        return Err("A project needs at least one page.".into());
+                    }
+                    p.pages.retain(|pg| pg.id != id);
                 }
                 PageCmd::Overview { id, off } => {
                     let page = p
@@ -2351,6 +2761,34 @@ fn run(cli: Cli) -> Res<()> {
                         .find(|pg| pg.id == id)
                         .ok_or_else(|| format!("no page {id:?}"))?;
                     page.overview = !off;
+                }
+                PageCmd::Edit { id, number, title } => {
+                    if number.is_none() && title.is_none() {
+                        return Err("give --number, --title or both".into());
+                    }
+                    let i = p
+                        .pages
+                        .iter()
+                        .position(|pg| pg.id == id)
+                        .ok_or_else(|| format!("no page {id:?}"))?;
+                    let number = number.map(|n| n.trim().to_owned());
+                    if let Some(n) = &number {
+                        if n.is_empty() {
+                            return Err("the page number cannot be empty".into());
+                        }
+                        if let Some(other) = p.pages.iter().find(|pg| pg.number == *n && pg.id != id) {
+                            return Err(format!("page {:?} already has number {n:?}", other.id));
+                        }
+                    }
+                    if let Some(page) = p.pages.get_mut(i) {
+                        if let Some(n) = number {
+                            page.number = n;
+                        }
+                        if let Some(t) = title {
+                            page.title = t.trim().to_owned();
+                        }
+                    }
+                    p.sort_pages();
                 }
                 PageCmd::Size { id, size } => {
                     let size = PageSize::parse(&size)?;
@@ -2406,7 +2844,9 @@ fn run(cli: Cli) -> Res<()> {
             mirror,
         } => {
             let mut p = load(dir)?;
-            // Check the inputs before taking the symbol, so a bad tag or turn leaves no copy behind.
+            // Check the inputs before taking the symbol, so a bad page, tag or turn leaves no copy
+            // behind.
+            page_mut(&mut p, &page)?;
             let tag = tag.map(|t| DeviceTag::parse(&t)).transpose().map_err(e)?;
             let rotation = Rotation::from_degrees(rotate).ok_or("rotation must be 0, 90, 180 or 270")?;
             if store::read_vendored_symbol(dir, &symbol).is_err() {
@@ -2748,6 +3188,15 @@ fn run(cli: Cli) -> Res<()> {
             });
             save(dir, &p)?;
             println!("{id}");
+        }
+        Cmd::Delete { page, ids } => {
+            let mut p = load(dir)?;
+            let pg = page_mut(&mut p, &page)?;
+            let deleted = delete_items(pg, &ids)?;
+            save(dir, &p)?;
+            for id in deleted {
+                println!("{}", escape_field(&id));
+            }
         }
         Cmd::Location(lc) => {
             let mut p = load(dir)?;
@@ -3256,6 +3705,11 @@ fn run(cli: Cli) -> Res<()> {
         Cmd::Device { tag, part, description } => {
             let mut p = load(dir)?;
             let t = DeviceTag::parse(&tag).map_err(e)?;
+            if part.is_none() && description.is_none() {
+                let info = device_info(&p, &t)?;
+                print!("{info}");
+                return Ok(());
+            }
             if let Some(part) = &part
                 && store::read_vendored_part(dir, part).is_err()
             {
@@ -3319,6 +3773,7 @@ fn run(cli: Cli) -> Res<()> {
                     _ => true,
                 })
                 .collect();
+            warn_levels(&p, &kinds);
             // The network list is followed by a topology page per network.
             let networks = if kinds.contains(&wc_report::Kind::Networks) {
                 p.meta.networks.clone()
@@ -3409,30 +3864,42 @@ fn run(cli: Cli) -> Res<()> {
             for m in missing {
                 eprintln!("warning: symbol {m} has no vendored copy (run `wiringcraft lib lock`)");
             }
+            // Panel layouts follow the pages, one file each, as their PDF sheets.
+            let options = wc_pdf::Options {
+                pages,
+                date,
+                panels: p.panels.clone(),
+                // A part that cannot be read is named in a warning; the others still export.
+                footprints: if p.panels.is_empty() {
+                    Default::default()
+                } else {
+                    wc_pdf::footprints(vendored_parts_warning_unreadable(dir, &p).values())
+                },
+                ..Default::default()
+            };
             // Only SVG shows pictures; a DXF export neither reads nor checks them.
             let (drawings, report) = if ext == "svg" {
                 let pictures = wc_pdf::read_pictures(dir, &p);
                 let options = wc_pdf::Options {
-                    pages,
-                    date,
                     underlays: pictures.files,
                     unreadable: pictures.unreadable,
-                    ..Default::default()
+                    ..options
                 };
                 wc_pdf::page_drawings(&p, &symbols, &options)
             } else {
-                let options = wc_pdf::Options {
-                    pages,
-                    date,
-                    ..Default::default()
-                };
                 wc_pdf::page_lines(&p, &symbols, &options)
             };
             make_out_dir(&out)?;
             let mut used = std::collections::BTreeSet::new();
             for d in &drawings {
-                let mut stem = file_stem(&d.number, &d.id);
-                while !used.insert(stem.clone()) {
+                // A panel is named after itself: `panel-Cabinet_1`.
+                let mut stem = if d.panel {
+                    wc_pdf::panel_file_stem(d)
+                } else {
+                    file_stem(&d.number, &d.id)
+                };
+                // Compared without case: `A1` and `a1` are one file name on Windows and macOS.
+                while !used.insert(stem.to_lowercase()) {
                     stem.push('_');
                 }
                 write_out(out.join(format!("{stem}.{ext}")), render(d)).map_err(e)?;
@@ -3515,7 +3982,19 @@ fn run(cli: Cli) -> Res<()> {
                 return Err(format!("the project check found {errors} errors"));
             }
         }
-        Cmd::Report { kind, format, out } => {
+        Cmd::Report { kind, format, out, sep } => {
+            if !matches!(sep, ',' | ';') {
+                return Err(format!("unknown separator {sep:?} (, or ;)"));
+            }
+            if sep != ',' && format != "csv" {
+                return Err("--sep is for --format csv".into());
+            }
+            // Excel reads a `;` file as the comma-decimal locales write it, and needs the byte
+            // order mark to take it as UTF-8; standard output stays without one.
+            let csv_file = |t: &wc_report::Table| {
+                let bom = if sep == ';' { "\u{feff}" } else { "" };
+                format!("{bom}{}", t.to_csv_with(sep))
+            };
             let p = load(dir)?;
             let (symbols, _) = store::vendored_symbols(dir, &p);
             let parts = vendored_parts(dir, &p);
@@ -3526,6 +4005,7 @@ fn run(cli: Cli) -> Res<()> {
             };
             warn_report_layouts(&inputs);
             let kinds = report_kinds(std::slice::from_ref(&kind))?;
+            warn_levels(&p, &kinds);
             if format == "xlsx" {
                 let Some(path) = out else {
                     return Err("an Excel workbook is not text: pass --out <file>.xlsx".into());
@@ -3545,16 +4025,19 @@ fn run(cli: Cli) -> Res<()> {
                 make_out_dir(folder)?;
                 for k in &kinds {
                     let t = wc_report::build(*k, &inputs);
-                    write_out(folder.join(format!("{}.csv", k.name())), t.to_csv()).map_err(e)?;
+                    write_out(folder.join(format!("{}.csv", k.name())), csv_file(&t)).map_err(e)?;
                 }
                 println!("wrote {} csv file(s) to {}", kinds.len(), folder.display());
                 return Ok(());
             }
             let mut text = String::new();
+            if format == "csv" && sep == ';' && out.is_some() {
+                text.push('\u{feff}');
+            }
             for k in kinds {
                 let t = wc_report::build(k, &inputs);
                 text.push_str(&match format.as_str() {
-                    "csv" => t.to_csv(),
+                    "csv" => t.to_csv_with(sep),
                     "md" | "markdown" => t.to_markdown(),
                     "text" => plain_table(&t),
                     other => return Err(format!("unknown format {other:?} (text, csv, md, xlsx)")),
@@ -4366,6 +4849,21 @@ fn warn_report_layouts(inputs: &wc_report::Inputs<'_>) {
     }
 }
 
+/// Warns about each terminal `Level` value that is not a level, when `kinds` has the terminal
+/// plan: such a terminal shows no level there.
+fn warn_levels(project: &wc_core::Project, kinds: &[wc_report::Kind]) {
+    if !kinds.contains(&wc_report::Kind::Terminals) {
+        return;
+    }
+    use std::io::Write as _;
+    let mut err = std::io::stderr().lock();
+    for w in wc_report::level_warnings(project) {
+        // Tags and values come from the project file. A warning that cannot be written (stderr
+        // closed or full) is dropped: it must not stop the export.
+        let _ = writeln!(err, "warning: {}", escape_field(&w));
+    }
+}
+
 /// What `lib lock` could not pin, one line each.
 fn lock_warnings(left: &wc_library::Unpinned) -> Vec<String> {
     let kind = |k: &ItemKind| if *k == ItemKind::Symbol { "symbol" } else { "part" };
@@ -4637,7 +5135,7 @@ impl Journal {
         }
         // Without its folder entry on disk a power loss could lose the journal after the first
         // write: stop before writing anything.
-        if let Err(x) = sync_dir(dir) {
+        if let Err(x) = store::sync_dir(dir) {
             let removed = std::fs::remove_file(&path);
             drop(file);
             return Err(match removed {
@@ -4659,7 +5157,7 @@ impl Journal {
             Err(x) => Err(format!(
                 "removing {shown} failed: {x}; remove that file, or the next run puts the project back as it was before the edit"
             )),
-            Ok(()) => sync_dir(dir).map_err(|x| {
+            Ok(()) => store::sync_dir(dir).map_err(|x| {
                 format!(
                     "{shown} is removed, but making that last on disk failed ({x}); after a power loss the next run may put the project back as it was before the edit"
                 )
@@ -4668,16 +5166,6 @@ impl Journal {
         drop(self.file);
         removed
     }
-}
-
-/// Make the renames and removals in `dir` last on disk where the system allows it (Unix);
-/// elsewhere the rename itself is what the system keeps.
-fn sync_dir(dir: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    std::fs::File::open(dir)?.sync_all()?;
-    #[cfg(not(unix))]
-    let _ = dir;
-    Ok(())
 }
 
 /// The name a journal keeps for `file`: its path inside `dir` with `/` between the parts.
@@ -4889,7 +5377,7 @@ fn undo_stopped_box_edit(dir: &Path) -> Res<Option<String>> {
     // The files put back are on disk before the journal goes, or it stays for the next run.
     sync_folders(&files).map_err(|x| format!("a box-edit run stopped half way; its files are put back, but {x}"))?;
     std::fs::remove_file(&path).map_err(|x| format!("{shown}: {x}"))?;
-    sync_dir(dir).map_err(|x| format!("{}: {x}", escape_field(&dir.display().to_string())))?;
+    store::sync_dir(dir).map_err(|x| format!("{}: {x}", escape_field(&dir.display().to_string())))?;
     drop(file);
     Ok(Some(
         "a box-edit run stopped before it had written every file; the project files are put back as they were before it".into(),
@@ -5038,7 +5526,7 @@ fn sync_folders(files: &[(PathBuf, Option<Vec<u8>>)]) -> Res<()> {
     folders.sort();
     folders.dedup();
     for folder in folders {
-        match sync_dir(folder) {
+        match store::sync_dir(folder) {
             Err(x) if x.kind() != std::io::ErrorKind::NotFound => {
                 return Err(format!("{}: {x}", escape_field(&folder.display().to_string())));
             }
@@ -5522,6 +6010,31 @@ fn import_kicad(text: &str, lib: &Path, prefix: &str, scale: f64, category: &str
     Ok(n)
 }
 
+/// The symbol id `import symbol-qet` gives the element in `file`: the prefix and the file stem.
+fn qet_id(file: &Path, prefix: &str) -> String {
+    let stem = wc_import::id_segment(
+        &file
+            .file_stem()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    );
+    format!("{}.{stem}", prefix.trim_end_matches('.'))
+}
+
+/// The element in `file` as the symbol `id`, with warnings.
+fn qet_element(file: &Path, id: &str, scale: f64) -> Res<(wc_import::qet::Imported, Vec<String>)> {
+    use std::io::Read;
+    std::fs::File::open(file)
+        .and_then(|f| {
+            // Read at most one byte past the limit, so a huge file is refused cheaply.
+            let mut text = String::new();
+            f.take(wc_import::qet::MAX_LEN as u64 + 1).read_to_string(&mut text)?;
+            Ok(text)
+        })
+        .map_err(e)
+        .and_then(|text| wc_import::qet::element(&text, id, scale).map_err(e))
+}
+
 fn import_qet(
     files: &[PathBuf],
     lib: &Path,
@@ -5530,29 +6043,14 @@ fn import_qet(
     category: &str,
     letter_code: &str,
 ) -> Res<(usize, usize)> {
-    use std::io::Read;
     let (mut written, mut failed) = (0, 0);
     // Two files whose names give the same id would overwrite each other: the later one fails.
     let mut ids: std::collections::BTreeMap<String, PathBuf> = Default::default();
     for file in files {
-        let stem = wc_import::id_segment(
-            &file
-                .file_stem()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-        );
-        let id = format!("{}.{stem}", prefix.trim_end_matches('.'));
+        let id = qet_id(file, prefix);
         let read = match ids.get(&id) {
             Some(first) => Err(format!("gives the same id {id} as {}, skipped", first.display())),
-            None => std::fs::File::open(file)
-                .and_then(|f| {
-                    // Read at most one byte past the limit, so a huge file is refused cheaply.
-                    let mut text = String::new();
-                    f.take(wc_import::qet::MAX_LEN as u64 + 1).read_to_string(&mut text)?;
-                    Ok(text)
-                })
-                .map_err(e)
-                .and_then(|text| wc_import::qet::element(&text, &id, scale).map_err(e)),
+            None => qet_element(file, &id, scale),
         };
         let (mut imp, warnings) = match read {
             Ok(r) => r,
@@ -5579,6 +6077,19 @@ fn import_qet(
         written += 1;
     }
     Ok((written, failed))
+}
+
+/// Refuses a plate size outside the 200 to 5000 mm range `panel new` and `panel edit` accept.
+fn check_plate_size(width: f64, height: f64) -> Result<(), String> {
+    if width.is_finite()
+        && height.is_finite()
+        && (200.0..=5000.0).contains(&width)
+        && (200.0..=5000.0).contains(&height)
+    {
+        Ok(())
+    } else {
+        Err("plate width and height must be 200 to 5000 mm".into())
+    }
 }
 
 fn vendored_parts(dir: &Path, p: &wc_core::Project) -> std::collections::BTreeMap<String, wc_core::Part> {
@@ -5623,7 +6134,81 @@ fn device_part_size(dir: &Path, p: &wc_core::Project, tag: &DeviceTag) -> Result
     }
 }
 
-/// `panel show`: the plate, then each device with its place, size and turn, one per line.
+/// Height of a DIN rail on the plate, centred on its line.
+const RAIL_HEIGHT: f64 = 35.0;
+
+/// A rail for `panel rail`, or an error when its length is not positive or the rail is not
+/// wholly on the plate.
+fn panel_rail(panel: &wc_core::panel::Panel, at: Point, length: f64) -> Result<wc_core::panel::PanelItem, String> {
+    if !(length.is_finite() && length > 0.0) {
+        return Err(format!("rail length must be more than 0 mm, got {length}"));
+    }
+    let half = RAIL_HEIGHT / 2.0;
+    check_on_plate(panel, "rail", Point::new(at.x, at.y - half), length, RAIL_HEIGHT)?;
+    Ok(wc_core::panel::PanelItem::Rail { at, length })
+}
+
+/// A `width` x `height` duct with its top-left corner at `at` for `panel duct`, or an error
+/// when a size is not positive or the duct is not wholly on the plate.
+fn panel_duct(
+    panel: &wc_core::panel::Panel,
+    at: Point,
+    width: f64,
+    height: f64,
+) -> Result<wc_core::panel::PanelItem, String> {
+    if !(width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0) {
+        return Err(format!(
+            "duct length and width must be more than 0 mm, got {width} x {height}"
+        ));
+    }
+    check_on_plate(panel, "duct", at, width, height)?;
+    Ok(wc_core::panel::PanelItem::Duct {
+        min: at,
+        max: Point::new(at.x + width, at.y + height),
+    })
+}
+
+/// An error naming `what` when a `w` x `h` box with its top-left corner at `at` is not on the
+/// plate (see [`wc_core::panel::Panel::outline_fits`]).
+fn check_on_plate(panel: &wc_core::panel::Panel, what: &str, at: Point, w: f64, h: f64) -> Result<(), String> {
+    if !(at.x.is_finite() && at.y.is_finite()) {
+        return Err(format!("{what}: position must be finite"));
+    }
+    if !panel.outline_fits(at, w, h) {
+        return Err(format!(
+            "{what}: a {w} x {h} mm outline at {},{} is not on the {} x {} mm plate",
+            at.x, at.y, panel.width, panel.height
+        ));
+    }
+    Ok(())
+}
+
+/// Take rail (or duct) number `n`, counted from 1 as `panel show` lists them, off the plate.
+fn remove_rail_or_duct(panel: &mut wc_core::panel::Panel, rail: bool, n: usize) -> Result<(), String> {
+    let what = if rail { "rail" } else { "duct" };
+    let index = panel
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| match i {
+            wc_core::panel::PanelItem::Rail { .. } => rail,
+            wc_core::panel::PanelItem::Duct { .. } => !rail,
+            wc_core::panel::PanelItem::Device { .. } => false,
+        })
+        .nth(n.wrapping_sub(1))
+        .map(|(i, _)| i);
+    let Some(index) = index else {
+        return Err(format!(
+            "no {what} {n} on panel {:?}: `panel show` numbers them",
+            panel.id
+        ));
+    };
+    panel.items.remove(index);
+    Ok(())
+}
+
+/// `panel show`: the plate, its numbered rails and ducts, then each device with its place,
+/// size and turn, one per line.
 fn panel_show(panel: &wc_core::panel::Panel) -> String {
     let mut out = format!(
         "{} {} ({} x {} mm)\n",
@@ -5632,6 +6217,28 @@ fn panel_show(panel: &wc_core::panel::Panel) -> String {
         panel.width,
         panel.height
     );
+    let (mut rails, mut ducts) = (0, 0);
+    for item in &panel.items {
+        match item {
+            wc_core::panel::PanelItem::Rail { at, length } => {
+                rails += 1;
+                let name = format!("rail {rails}");
+                out.push_str(&format!("{name:<12} at {},{}  {length} mm long\n", at.x, at.y));
+            }
+            wc_core::panel::PanelItem::Duct { min, max } => {
+                ducts += 1;
+                let name = format!("duct {ducts}");
+                out.push_str(&format!(
+                    "{name:<12} at {},{}  {} x {} mm\n",
+                    min.x,
+                    min.y,
+                    max.x - min.x,
+                    max.y - min.y
+                ));
+            }
+            wc_core::panel::PanelItem::Device { .. } => {}
+        }
+    }
     for item in &panel.items {
         if let wc_core::panel::PanelItem::Device {
             tag,
@@ -5708,6 +6315,30 @@ fn page_fields(p: &Project, page: usize) -> String {
         ));
     }
     out
+}
+
+/// The part and description of device `tag`, one per line (`-` when unset), as
+/// `wiringcraft device <tag>` prints them. An error when no device has that tag, in the devices
+/// table or on a page.
+fn device_info(p: &Project, tag: &DeviceTag) -> Res<String> {
+    let drawn = || {
+        p.pages
+            .iter()
+            .any(|pg| pg.symbols.iter().any(|s| s.tag.as_ref() == Some(tag)))
+    };
+    let (part, description) = match p.devices.get(tag) {
+        Some(d) => (d.part.as_deref().unwrap_or(""), d.description.as_str()),
+        None if drawn() => ("", ""),
+        None => return Err(format!("no device {tag}")),
+    };
+    let show = |v: &str| if v.is_empty() { "-".to_owned() } else { escape_field(v) };
+    Ok(format!(
+        "{:<12} {}\n{:<12} {}\n",
+        "part",
+        show(part),
+        "description",
+        show(description)
+    ))
 }
 
 /// The current time in UTC as `YYYY-MM-DDThh:mm:ssZ`.
@@ -5930,8 +6561,9 @@ mod tests {
         let folder = tmp.path().to_owned();
         // A stand-in converter, as WIRINGCRAFT_DWG2DXF names one; a path with a space stays
         // one argument.
-        let out = dwg_to_dxf(&dwg, &folder, Some("cp {in} {out}".into())).unwrap();
+        let (out, by) = dwg_to_dxf(&dwg, &folder, Some("cp {in} {out}".into())).unwrap();
         assert_eq!(out, folder.join("Motor plan.dxf"));
+        assert_eq!(by, "the WIRINGCRAFT_DWG2DXF command");
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "0\nEOF\n");
         let err = dwg_to_dxf(&dwg, &folder, Some("false {in} {out}".into()))
             .err()
@@ -5987,8 +6619,16 @@ mod tests {
         assert!(err.as_ref().is_err_and(|e| e.contains("no-such-page")), "{err:?}");
         assert!(!folder().exists(), "removed after a failed import");
 
-        // And when it works.
+        // The converter makes a DXF that cannot be read: both reasons are given.
         let pages = load(&dir).unwrap().pages;
+        let junk = converter("junk.sh", "echo junk > \"$2\"");
+        let err = import_page_dwg(&dir, &dwg, pages[0].id.clone(), 1.0, Some(junk)).unwrap_err();
+        assert!(
+            err.contains("own DWG reader refused") && err.contains("could not be read either"),
+            "{err}"
+        );
+
+        // And when it works.
         import_page_dwg(&dir, &dwg, pages[0].id.clone(), 1.0, Some(copy)).unwrap();
         assert!(!folder().exists(), "removed after the import");
     }
@@ -5997,6 +6637,119 @@ mod tests {
         let mut all = vec!["wiringcraft", "-C", dir.to_str().unwrap()];
         all.extend_from_slice(args);
         run(Cli::try_parse_from(all).map_err(|e| e.to_string())?)
+    }
+
+    #[test]
+    fn panel_rail_and_duct_add_list_and_remove() {
+        use wc_core::panel::PanelItem;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        store::create(&dir, "Test").unwrap();
+        cli(&dir, &["panel", "new", "main"]).unwrap();
+        let items = || load(&dir).unwrap().panels[0].items.clone();
+        let count = |rail: bool| {
+            items()
+                .iter()
+                .filter(|i| matches!(i, PanelItem::Rail { .. }) == rail && !matches!(i, PanelItem::Device { .. }))
+                .count()
+        };
+        let (rails, ducts) = (count(true), count(false));
+
+        // Added at the end, and listed with the next number.
+        cli(&dir, &["panel", "rail", "main", "--at", "50,700", "--length", "300"]).unwrap();
+        assert_eq!(
+            items().last(),
+            Some(&PanelItem::Rail {
+                at: Point::new(50.0, 700.0),
+                length: 300.0
+            })
+        );
+        cli(
+            &dir,
+            &[
+                "panel",
+                "duct",
+                "main",
+                "--at",
+                "300,100",
+                "--length",
+                "500",
+                "--vertical",
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            items().last(),
+            Some(&PanelItem::Duct {
+                min: Point::new(300.0, 100.0),
+                max: Point::new(340.0, 600.0)
+            })
+        );
+        cli(
+            &dir,
+            &[
+                "panel", "duct", "main", "--at", "0,760", "--length", "600", "--width", "40",
+            ],
+        )
+        .unwrap();
+        assert_eq!(count(true), rails + 1);
+        assert_eq!(count(false), ducts + 2);
+        let shown = panel_show(&load(&dir).unwrap().panels[0]);
+        let rail_line = format!("{:<12} at 50,700  300 mm long", format!("rail {}", rails + 1));
+        assert!(shown.contains(&rail_line), "{shown}");
+        let duct_line = format!("{:<12} at 300,100  40 x 500 mm", format!("duct {}", ducts + 1));
+        assert!(shown.contains(&duct_line), "{shown}");
+
+        // Bad sizes, places off the plate and missing values are refused; nothing changes.
+        let before = items();
+        for args in [
+            &["panel", "rail", "main", "--at", "50,700", "--length", "0"][..],
+            &["panel", "rail", "main", "--at", "50,700", "--length", "NaN"],
+            &["panel", "rail", "main", "--at", "400,700", "--length", "300"],
+            &["panel", "rail", "main", "--at", "50,790", "--length", "100"],
+            &["panel", "rail", "main", "--at", "50,700"],
+            &["panel", "rail", "nope", "--at", "50,700", "--length", "100"],
+            &[
+                "panel", "duct", "main", "--at", "0,0", "--length", "100", "--width", "-5",
+            ],
+            &["panel", "duct", "main", "--at", "-1,0", "--length", "100"],
+            &[
+                "panel",
+                "duct",
+                "main",
+                "--at",
+                "0,500",
+                "--length",
+                "400",
+                "--vertical",
+            ],
+            &[
+                "panel", "duct", "main", "--at", "0,0", "--length", "100", "--remove", "1",
+            ],
+            &["panel", "rail", "main", "--remove", "0"],
+            &["panel", "rail", "main", "--remove", "99"],
+            &["panel", "duct", "main", "--remove", "99"],
+        ] {
+            assert!(cli(&dir, args).is_err(), "{args:?}");
+        }
+        assert_eq!(items(), before);
+
+        // Removed by the number `panel show` gives; the others keep their order.
+        let n = (rails + 1).to_string();
+        cli(&dir, &["panel", "rail", "main", "--remove", &n]).unwrap();
+        assert_eq!(count(true), rails);
+        let n = (ducts + 1).to_string();
+        cli(&dir, &["panel", "duct", "main", "--remove", &n]).unwrap();
+        assert_eq!(count(false), ducts + 1);
+        assert_eq!(
+            items().last(),
+            Some(&PanelItem::Duct {
+                min: Point::new(0.0, 760.0),
+                max: Point::new(600.0, 800.0)
+            })
+        );
+        cli(&dir, &["panel", "rail", "main", "--remove", "1"]).unwrap();
+        assert_eq!(count(true), rails - 1);
     }
 
     #[test]
@@ -6073,6 +6826,58 @@ mod tests {
     }
 
     #[test]
+    fn delete_takes_symbols_and_wires_off_a_page_with_the_wires_on_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        for (at, tag) in [("40,40", "-A1"), ("100,40", "-A2")] {
+            let args = ["box", "p1", "--at", at, "--size", "20,20", "--tag", tag];
+            cli(&dir, &[&args[..], &["--pin", "1:top:10"]].concat()).unwrap();
+        }
+        // w1 runs between the boxes, w2 from s2 into the air, w3 from point to point.
+        cli(&dir, &["wire", "p1", "s1:1", "s2:1"]).unwrap();
+        cli(&dir, &["wire", "p1", "s2:1", "150,20"]).unwrap();
+        cli(&dir, &["wire", "p1", "10,10", "20,10"]).unwrap();
+        let ids = |dir: &Path| {
+            let p = load(dir).unwrap();
+            let pg = p.page("p1").unwrap();
+            let mut ids: Vec<String> = pg.symbols.iter().map(|s| s.id.clone()).collect();
+            ids.extend(pg.wires.iter().map(|w| w.id.clone()));
+            ids
+        };
+
+        // An id that is not there changes nothing, though the others are.
+        let err = cli(&dir, &["delete", "p1", "w3", "nope", "s9"]).unwrap_err();
+        assert_eq!(err, "no symbol or wire \"nope\", \"s9\" on page p1");
+        assert_eq!(ids(&dir), ["s1", "s2", "w1", "w2", "w3"]);
+        assert!(
+            cli(&dir, &["delete", "p9", "w3"])
+                .unwrap_err()
+                .contains("no page \"p9\"")
+        );
+
+        // A wire alone.
+        let mut p = load(&dir).unwrap();
+        let deleted = delete_items(p.page_mut("p1").unwrap(), &["w3".into()]).unwrap();
+        assert_eq!(deleted, ["w3"]);
+        cli(&dir, &["delete", "p1", "w3"]).unwrap();
+        assert_eq!(ids(&dir), ["s1", "s2", "w1", "w2"]);
+
+        // A symbol takes the wires on its pins along; the other symbol and its device stay.
+        let mut p = load(&dir).unwrap();
+        let deleted = delete_items(p.page_mut("p1").unwrap(), &["s2".into()]).unwrap();
+        assert_eq!(deleted, ["s2", "w1", "w2"]);
+        cli(&dir, &["delete", "p1", "s2"]).unwrap();
+        assert_eq!(ids(&dir), ["s1"]);
+        let p = load(&dir).unwrap();
+        assert!(
+            p.devices.contains_key(&DeviceTag::parse("-A2").unwrap()),
+            "the device keeps its data"
+        );
+    }
+
+    #[test]
     fn a_wire_to_a_pin_the_symbol_does_not_have_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
@@ -6128,6 +6933,126 @@ mod tests {
         std::fs::remove_file(&vendored).unwrap();
         cli(&dir, &["wire", "p1", &format!("{s1}:1"), "0,0"]).unwrap();
         assert_eq!(load(&dir).unwrap().page("p1").unwrap().wires.len(), 3);
+    }
+
+    #[test]
+    fn device_with_only_a_tag_shows_it_and_changes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let mut p = load(&dir).unwrap();
+        let k1 = DeviceTag::parse("-K1").unwrap();
+        p.devices.insert(
+            k1.clone(),
+            wc_core::Device {
+                part: Some("maker.contactor".into()),
+                description: "Pump motor".into(),
+                ..Default::default()
+            },
+        );
+        // -K2 is drawn on a page but not in the devices table.
+        p.pages[0].symbols.push(PlacedSymbol {
+            id: "s1".into(),
+            symbol: "wc.coil".into(),
+            at: Point::new(10.0, 10.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: Some(DeviceTag::parse("-K2").unwrap()),
+        });
+        save(&dir, &p).unwrap();
+        let files = |d: &Path| {
+            let mut v: Vec<_> = std::fs::read_dir(d)
+                .unwrap()
+                .map(|f| f.unwrap().path())
+                // The lock file appears with the first command run; it is not project data.
+                .filter(|f| !f.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')))
+                .map(|f| {
+                    let body = if f.is_file() {
+                        std::fs::read(&f).unwrap()
+                    } else {
+                        Vec::new()
+                    };
+                    (f, body)
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        let before = files(&dir);
+
+        let p = load(&dir).unwrap();
+        assert_eq!(
+            device_info(&p, &k1).unwrap(),
+            "part         maker.contactor\ndescription  Pump motor\n"
+        );
+        let k2 = DeviceTag::parse("-K2").unwrap();
+        assert_eq!(device_info(&p, &k2).unwrap(), "part         -\ndescription  -\n");
+        cli(&dir, &["device", "-K1"]).unwrap();
+        cli(&dir, &["device", "-K2"]).unwrap();
+        let err = cli(&dir, &["device", "-K9"]).unwrap_err();
+        assert_eq!(err, "no device -K9");
+        assert_eq!(files(&dir), before, "showing a device saves nothing");
+        let p = load(&dir).unwrap();
+        assert!(!p.devices.contains_key(&DeviceTag::parse("-K9").unwrap()));
+        assert!(!p.devices.contains_key(&k2));
+
+        // An option still edits, and creates a device that was not there.
+        cli(&dir, &["device", "-K9", "--description", "Spare"]).unwrap();
+        let p = load(&dir).unwrap();
+        assert_eq!(p.devices[&DeviceTag::parse("-K9").unwrap()].description, "Spare");
+    }
+
+    #[test]
+    fn a_panel_is_renamed_and_resized_keeping_its_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["device", "-K1", "--description", "Pump"]).unwrap();
+        cli(&dir, &["panel", "new", "main"]).unwrap();
+        cli(&dir, &["panel", "device", "main", "-K1", "--at", "100,600"]).unwrap();
+        let before = load(&dir).unwrap().panels[0].clone();
+
+        cli(
+            &dir,
+            &["panel", "edit", "main", "--name", "Main plate", "--height", "1000"],
+        )
+        .unwrap();
+        let after = load(&dir).unwrap().panels[0].clone();
+        assert_eq!(after.name, "Main plate");
+        assert_eq!((after.width, after.height), (600.0, 1000.0));
+        assert_eq!(after.items, before.items, "rails, ducts and devices are not rebuilt");
+
+        // Too small for the rails, or for the device at y 600..690; out of range; nothing to do;
+        // no such panel: refused, nothing changes.
+        let err = cli(&dir, &["panel", "edit", "main", "--height", "650"]).unwrap_err();
+        assert!(err.contains("sticking out") && err.contains("-K1"), "{err}");
+        assert!(cli(&dir, &["panel", "edit", "main", "--width", "300"]).is_err());
+        assert!(cli(&dir, &["panel", "edit", "main", "--width", "100"]).is_err());
+        assert!(cli(&dir, &["panel", "edit", "main", "--width", "NaN"]).is_err());
+        assert!(cli(&dir, &["panel", "edit", "main"]).is_err());
+        assert!(cli(&dir, &["panel", "edit", "nope", "--name", "x"]).is_err());
+        assert_eq!(load(&dir).unwrap().panels[0], after);
+
+        // An empty name falls back to the id, as `panel new` does.
+        cli(&dir, &["panel", "edit", "main", "--name", ""]).unwrap();
+        assert_eq!(load(&dir).unwrap().panels[0].name, "main");
+
+        // A device taller than the plate (as `panel arrange` can leave it) does not block a
+        // name-only edit, which keeps the plate size; resizing is still refused.
+        let mut p = load(&dir).unwrap();
+        for item in &mut p.panels[0].items {
+            if let wc_core::panel::PanelItem::Device { at, height, .. } = item {
+                *at = Point::new(100.0, 0.0);
+                *height = 1200.0;
+            }
+        }
+        store::save(&dir, &p).unwrap();
+        cli(&dir, &["panel", "edit", "main", "--name", "Tall"]).unwrap();
+        let after = load(&dir).unwrap().panels[0].clone();
+        assert_eq!(after.name, "Tall");
+        assert_eq!((after.width, after.height), (600.0, 1000.0));
+        assert!(cli(&dir, &["panel", "edit", "main", "--name", "x", "--width", "700"]).is_err());
+        assert_eq!(load(&dir).unwrap().panels[0].name, "Tall");
     }
 
     #[test]
@@ -6694,6 +7619,49 @@ mod tests {
     }
 
     #[test]
+    fn a_page_is_renumbered_and_retitled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["page", "add", "a", "--number", "2", "--title", "Power"]).unwrap();
+        cli(&dir, &["page", "add", "b", "--number", "3", "--title", "Control"]).unwrap();
+        let pages = |dir: &Path| -> Vec<(String, String, String)> {
+            load(dir)
+                .unwrap()
+                .pages
+                .iter()
+                .map(|p| (p.id.clone(), p.number.clone(), p.title.clone()))
+                .collect()
+        };
+        cli(&dir, &["page", "edit", "b", "--number", " 1.5 "]).unwrap();
+        cli(&dir, &["page", "edit", "a", "--title", "Main power"]).unwrap();
+        let got = pages(&dir);
+        let ids: Vec<&str> = got.iter().map(|x| x.0.as_str()).collect();
+        assert_eq!(ids, ["p0001", "b", "a"], "sorted by the new number");
+        assert_eq!(got[1], ("b".into(), "1.5".into(), "Control".into()));
+        assert_eq!(got[2], ("a".into(), "2".into(), "Main power".into()));
+        // Refused, and nothing changes.
+        let before = pages(&dir);
+        let err = cli(&dir, &["page", "edit", "a", "--number", "1"]).unwrap_err();
+        assert!(err.contains("already has number"), "{err}");
+        assert!(
+            cli(&dir, &["page", "edit", "a", "--number", "  "])
+                .unwrap_err()
+                .contains("empty")
+        );
+        assert!(
+            cli(&dir, &["page", "edit", "nope", "--title", "X"])
+                .unwrap_err()
+                .contains("no page")
+        );
+        assert!(cli(&dir, &["page", "edit", "a"]).is_err());
+        assert_eq!(pages(&dir), before);
+        // Its own number again is fine.
+        cli(&dir, &["page", "edit", "a", "--number", "2", "--title", "Power"]).unwrap();
+        assert_eq!(pages(&dir)[2], ("a".into(), "2".into(), "Power".into()));
+    }
+
+    #[test]
     fn a_page_is_added_as_or_made_the_one_cover_page() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("p");
@@ -6723,6 +7691,24 @@ mod tests {
         cli(&dir, &["page", "cover", "c2", "--off"]).unwrap();
         assert!(covers(&dir).is_empty());
         assert!(cli(&dir, &["page", "cover", "nope"]).unwrap_err().contains("no page"));
+    }
+
+    #[test]
+    fn page_remove_keeps_the_last_page_of_a_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let ids = |dir: &Path| -> Vec<String> { load(dir).unwrap().pages.iter().map(|p| p.id.clone()).collect() };
+        let only = ids(&dir);
+        assert_eq!(only.len(), 1);
+        let err = cli(&dir, &["page", "remove", &only[0]]).unwrap_err();
+        assert!(err.contains("at least one page"), "{err}");
+        assert_eq!(ids(&dir), only);
+        // With two pages, removing one works.
+        cli(&dir, &["page", "add", "p0002", "--number", "2"]).unwrap();
+        cli(&dir, &["page", "remove", &only[0]]).unwrap();
+        assert_eq!(ids(&dir), ["p0002"]);
+        assert!(cli(&dir, &["page", "remove", "nope"]).unwrap_err().contains("no page"));
     }
 
     #[test]
@@ -6758,6 +7744,43 @@ mod tests {
         p.pages[0].id = "a\u{1b}[2Jb".into();
         let err = check_pages(&p, &["nope".into()]).unwrap_err();
         assert!(err.contains("a\\u{1b}[2Jb") && !err.contains('\u{1b}'), "{err}");
+    }
+
+    #[test]
+    fn drawing_writes_a_file_per_panel_layout_next_to_the_pages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["panel", "new", "plate1", "--name", "Main cabinet/A"]).unwrap();
+        let number = load(&dir).unwrap().pages[0].number.clone();
+        for ext in ["dxf", "svg"] {
+            let out = tmp.path().join(ext);
+            cli(&dir, &["drawing", out.to_str().unwrap(), "--format", ext]).unwrap();
+            let mut names: Vec<String> = std::fs::read_dir(&out)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            let page = format!("{}.{ext}", file_stem(&number, ""));
+            let mut want = [format!("panel-Main_cabinet_A.{ext}"), page];
+            want.sort();
+            assert_eq!(names, want, "{ext}");
+        }
+        let dxf = std::fs::read_to_string(tmp.path().join("dxf").join("panel-Main_cabinet_A.dxf")).unwrap();
+        assert!(dxf.contains("POLYLINE") && dxf.contains("Main cabinet/A"), "{dxf}");
+        // Names that differ only in case get files of their own, also on Windows and macOS.
+        cli(&dir, &["panel", "new", "plate2", "--name", "Main"]).unwrap();
+        cli(&dir, &["panel", "new", "plate3", "--name", "main"]).unwrap();
+        let out = tmp.path().join("cased");
+        cli(&dir, &["drawing", out.to_str().unwrap(), "--format", "dxf"]).unwrap();
+        let mut names: Vec<String> = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_lowercase())
+            .collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 4, "{names:?}");
+        assert!(names.contains(&"panel-main.dxf".into()) && names.contains(&"panel-main_.dxf".into()));
     }
 
     #[test]
@@ -6978,6 +8001,24 @@ mod tests {
         );
         assert!(!load(&dir).unwrap().lock.symbols.contains_key("aa.good"));
         std::fs::remove_dir(&tmp_path).unwrap();
+
+        // A lock that cannot be written after both copies were taken puts them back, and the
+        // page is not saved.
+        let page_bytes =
+            std::fs::read(dir.join(store::PAGES_DIR).join(format!("{page}{}", store::PAGE_SUFFIX))).unwrap();
+        let lock_blocker = dir.join(format!("{}.tmp", store::LOCK_FILE));
+        std::fs::create_dir(&lock_blocker).unwrap();
+        cli(&dir, &args).unwrap_err();
+        std::fs::remove_dir(&lock_blocker).unwrap();
+        assert!(store::read_vendored_symbol(&dir, "aa.good").is_err(), "copy put back");
+        assert!(store::read_vendored_symbol(&dir, "zz.bad").is_err(), "copy put back");
+        let p = load(&dir).unwrap();
+        assert!(!p.lock.symbols.contains_key("aa.good"));
+        assert!(p.page(&page).is_some_and(|pg| pg.symbols.is_empty()), "page not saved");
+        assert_eq!(
+            std::fs::read(dir.join(store::PAGES_DIR).join(format!("{page}{}", store::PAGE_SUFFIX))).unwrap(),
+            page_bytes
+        );
 
         // And the retry pins both.
         cli(&dir, &args).unwrap();
@@ -9133,6 +10174,68 @@ mod tests {
     }
 
     #[test]
+    fn report_csv_for_excel_is_semicolon_separated_with_a_bom() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        // One report to a file: `;` between fields and a byte order mark first.
+        let one = tmp.path().join("wires.csv");
+        cli(
+            &dir,
+            &[
+                "report",
+                "wires",
+                "--format",
+                "csv",
+                "--sep",
+                ";",
+                "--out",
+                one.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        let semi = std::fs::read_to_string(&one).unwrap();
+        let plain = tmp.path().join("plain.csv");
+        cli(
+            &dir,
+            &["report", "wires", "--format", "csv", "--out", plain.to_str().unwrap()],
+        )
+        .unwrap();
+        let plain = std::fs::read_to_string(&plain).unwrap();
+        // The default stays comma-separated without a byte order mark (a new project's wires
+        // report is its header row alone, with no comma inside a field).
+        assert!(!plain.starts_with('\u{feff}'), "{plain}");
+        let first = plain.lines().next().unwrap();
+        assert!(first.contains(','), "{first}");
+        assert_eq!(semi, format!("\u{feff}{}", plain.replace(',', ";")));
+        // `report all` writes every file of the folder the same way.
+        let out = tmp.path().join("reports");
+        cli(
+            &dir,
+            &[
+                "report",
+                "all",
+                "--format",
+                "csv",
+                "--sep",
+                ";",
+                "--out",
+                out.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        for k in wc_report::Kind::ALL {
+            let csv = std::fs::read_to_string(out.join(format!("{}.csv", k.name()))).unwrap();
+            assert!(csv.starts_with('\u{feff}'), "{}: {csv}", k.name());
+        }
+        let wires = std::fs::read_to_string(out.join("wires.csv")).unwrap();
+        assert_eq!(format!("{wires}\n"), semi);
+        // Only `,` and `;`, and only for CSV.
+        assert!(cli(&dir, &["report", "wires", "--format", "csv", "--sep", "|"]).is_err());
+        assert!(cli(&dir, &["report", "wires", "--format", "md", "--sep", ";"]).is_err());
+    }
+
+    #[test]
     fn excel_workbooks_import_parts_and_reports_save_as_xlsx() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
@@ -9363,7 +10466,7 @@ mod tests {
     }
 
     #[test]
-    fn place_checks_the_turn_and_tag_before_taking_the_symbol() {
+    fn place_checks_the_page_turn_and_tag_before_taking_the_symbol() {
         let Ok(tmp) = tempfile::tempdir() else { unreachable!() };
         let dir = tmp.path().join("proj");
         let Some(path) = dir.to_str() else { unreachable!() };
@@ -9378,9 +10481,11 @@ mod tests {
         assert!(cli(&dir, &["lib", "add", "starter", "folder", starter]).is_ok());
         assert!(cli(&dir, &["page", "add", "p1", "--number", "1"]).is_ok());
 
-        for bad in [["--rotate", "45"], ["--tag", "-K1."]] {
-            let mut args = vec!["place", "p1", "wc.coil", "--at", "50,50"];
-            args.extend(bad);
+        let missing_page = ["place", "nope", "wc.coil", "--at", "50,50"];
+        let bad_turn = ["place", "p1", "wc.coil", "--at", "50,50", "--rotate", "45"];
+        let bad_tag = ["place", "p1", "wc.coil", "--at", "50,50", "--tag", "-K1."];
+        for bad in [&missing_page[..], &bad_turn[..], &bad_tag[..]] {
+            let args = bad.to_vec();
             assert!(cli(&dir, &args).is_err(), "{bad:?}");
             assert!(
                 store::read_vendored_symbol(&dir, "wc.coil").is_err(),
@@ -10995,5 +12100,551 @@ mod box_cleanup_rollback_tests {
         );
         #[cfg(unix)]
         assert!(std::fs::symlink_metadata(folder.join("box.p1.s3.json")).is_ok_and(|m| m.file_type().is_symlink()));
+    }
+}
+
+/// Inputs are found for every command that names one, and only streams are copied (#658).
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod input_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    include!("input_commands.rs");
+
+    /// Path arguments that are not input files: where output goes, library and project folders.
+    const NOT_INPUTS: &[&str] = &["project", "dir", "out", "lib", "svg"];
+
+    /// The commands under `command` that take a path argument which is not in [`NOT_INPUTS`],
+    /// each as the words that name it.
+    fn commands_with_a_path(command: &clap::Command, words: &mut Vec<String>, found: &mut Vec<Vec<String>>) {
+        let path = clap::builder::ValueParser::path_buf().type_id();
+        let takes_one = command
+            .get_arguments()
+            .any(|a| a.get_value_parser().type_id() == path && !NOT_INPUTS.contains(&a.get_id().as_str()));
+        if takes_one && !words.is_empty() {
+            found.push(words.clone());
+        }
+        for sub in command.get_subcommands() {
+            words.push(sub.get_name().to_owned());
+            commands_with_a_path(sub, words, found);
+            words.pop();
+        }
+    }
+
+    #[test]
+    fn every_command_with_an_input_file_lists_it() {
+        for args in INPUT_COMMANDS {
+            let mut cli = Cli::try_parse_from(["wiringcraft"].iter().chain(*args)).unwrap();
+            let got: Vec<PathBuf> = cli.cmd.inputs_mut().into_iter().map(|p| p.clone()).collect();
+            let want: Vec<PathBuf> = args
+                .iter()
+                .filter(|a| ["FIFO", "FILE"].contains(a))
+                .map(PathBuf::from)
+                .collect();
+            assert_eq!(got, want, "{args:?}");
+        }
+        // A library folder is not an input, also where the command can do without one.
+        for args in [
+            &["import", "archive", "in", "--lib", "lib"][..],
+            &["import", "swe-library", "in", "--lib", "lib"],
+        ] {
+            let mut cli = Cli::try_parse_from(["wiringcraft"].iter().chain(args)).unwrap();
+            let got: Vec<PathBuf> = cli.cmd.inputs_mut().into_iter().map(|p| p.clone()).collect();
+            assert_eq!(got, [PathBuf::from("in")], "{args:?}");
+        }
+        // A command that takes a path which is not an output or a folder is in the list above,
+        // so a new command with an input file fails here until it is covered.
+        let mut found = Vec::new();
+        commands_with_a_path(&Cli::command(), &mut Vec::new(), &mut found);
+        assert!(found.len() >= 23, "{found:?}");
+        for words in found {
+            assert!(
+                INPUT_COMMANDS
+                    .iter()
+                    .any(|args| args.iter().zip(&words).filter(|(a, w)| a == w).count() == words.len()),
+                "`{}` takes a path that Cmd::inputs_mut and this test do not know",
+                words.join(" ")
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_without_an_input_file_has_none() {
+        for args in [
+            &["check"][..],
+            &["pdf", "out.pdf"],
+            &["export", "wago-marking", "out.csv"],
+        ] {
+            let mut cli = Cli::try_parse_from(["wiringcraft"].iter().chain(args)).unwrap();
+            assert!(cli.cmd.inputs_mut().is_empty(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn regular_files_folders_and_stdin_are_not_copied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("a.elmt");
+        std::fs::write(&file, "<definition/>").unwrap();
+        let folder = tmp.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        let missing = tmp.path().join("missing.elmt");
+        let lib = tmp.path().join("lib");
+        let mut cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "symbol-qet".as_ref(),
+            file.as_os_str(),
+            folder.as_os_str(),
+            missing.as_os_str(),
+            "--lib".as_ref(),
+            lib.as_os_str(),
+        ])
+        .unwrap();
+        assert!(spool_inputs(&mut cli.cmd).unwrap().is_none());
+        let after: Vec<PathBuf> = cli.cmd.inputs_mut().into_iter().map(|p| p.clone()).collect();
+        assert_eq!(after, [file, folder, missing]);
+
+        let mut cli = Cli::try_parse_from(["wiringcraft", "rules", "set", "-"]).unwrap();
+        assert!(spool_inputs(&mut cli.cmd).unwrap().is_none());
+        assert!(matches!(cli.cmd, Cmd::Rules(RulesCmd::Set { ref file }) if file.as_os_str() == "-"));
+    }
+
+    /// [`spool_inputs`] on another thread, given twenty seconds: a copy that waits for a
+    /// writer that never comes, or that has no end, fails the test instead of holding it up.
+    #[cfg(unix)]
+    fn spooled(cli: Cli) -> (Vec<PathBuf>, Option<tempfile::TempDir>) {
+        let limits = SpoolLimits {
+            database: wc_import::swe::MAX_DATABASE_BYTES,
+            stream: MAX_SPOOLED_BYTES,
+        };
+        let (inputs, spool) = spooled_within(cli, limits);
+        (inputs, spool.unwrap())
+    }
+
+    /// [`spooled`] with `limits` in place of the ones the commands have, and what it said.
+    #[cfg(unix)]
+    fn spooled_within(mut cli: Cli, limits: SpoolLimits) -> (Vec<PathBuf>, Res<Option<tempfile::TempDir>>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let spool = spool_inputs_within(&mut cli.cmd, limits);
+            let inputs: Vec<PathBuf> = cli.cmd.inputs_mut().into_iter().map(|p| p.clone()).collect();
+            let _ = tx.send((inputs, spool));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap()
+    }
+
+    /// Small limits for a test: a database of 64 KiB, any other stream of 1 MiB.
+    #[cfg(unix)]
+    const SMALL: SpoolLimits = SpoolLimits {
+        database: 1 << 16,
+        stream: 1 << 20,
+    };
+
+    /// One writer on another thread that opens the FIFO at `fifo` once and writes `head`, then
+    /// zeros until the reader is gone or `most` bytes are written. The bytes it wrote.
+    #[cfg(unix)]
+    fn endless_writer(
+        fifo: &Path,
+        head: &'static [u8],
+        most: u64,
+    ) -> std::thread::JoinHandle<(u64, std::io::Result<()>)> {
+        use std::io::Write;
+        let fifo = fifo.to_path_buf();
+        std::thread::spawn(move || {
+            let mut to = match std::fs::OpenOptions::new().write(true).open(&fifo) {
+                Ok(to) => to,
+                Err(x) => return (0, Err(x)),
+            };
+            let mut sent = 0;
+            let mut block: &[u8] = head;
+            while sent < most {
+                if let Err(x) = to.write_all(block) {
+                    return (sent, Err(x));
+                }
+                sent += block.len() as u64;
+                block = &[0; 4096];
+            }
+            (sent, Ok(()))
+        })
+    }
+
+    /// A database for `import swe` on a FIFO whose writer does not stop: the copy ends one
+    /// byte over the database limit, well under the limit of other streams, and the command
+    /// is refused with the importer's words for a database that is too large.
+    #[cfg(unix)]
+    #[test]
+    fn an_endless_swe_database_stream_is_refused_as_too_large() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("plant.db");
+        mkfifo(&fifo);
+        let writer = endless_writer(&fifo, b"SQLite format 3\0", 8 << 20);
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "swe".as_ref(),
+            fifo.as_os_str(),
+        ])
+        .unwrap();
+        let (_, spool) = spooled_within(cli, SMALL);
+        let why = spool.map(|_| ()).unwrap_err();
+        assert_eq!(why, format!("{}: is larger than 0 MB", fifo.display()));
+        // The reader left: the writer was stopped, long before the limit of other streams.
+        let (sent, end) = writer.join().unwrap();
+        assert_eq!(end.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(sent < SMALL.stream, "{sent}");
+    }
+
+    /// The database limit is for a database only: an archive for `import swe` and its symbol
+    /// map, both larger than that on FIFOs that end, are copied whole.
+    #[cfg(unix)]
+    #[test]
+    fn a_finite_swe_archive_stream_and_its_symbol_map_are_copied_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (archive, map) = (tmp.path().join("plant.tewzip"), tmp.path().join("map.toml"));
+        mkfifo(&archive);
+        mkfifo(&map);
+        let len = SMALL.database as usize + 4096;
+        let mut zip = b"PK\x03\x04".to_vec();
+        zip.resize(len, 0);
+        // The header on the symbol map: only the first input is a database.
+        let mut text = b"SQLite format 3\0".to_vec();
+        text.resize(len, b'#');
+        let writers = [writer(&archive, zip.clone()), writer(&map, text.clone())];
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "swe".as_ref(),
+            archive.as_os_str(),
+            "--symbol-map".as_ref(),
+            map.as_os_str(),
+        ])
+        .unwrap();
+        let (inputs, spool) = spooled_within(cli, SMALL);
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+        let spool = spool.unwrap().unwrap();
+        assert_eq!(inputs.len(), 2);
+        assert!(inputs.iter().all(|i| i.starts_with(spool.path())), "{inputs:?}");
+        assert!(std::fs::read(&inputs[0]).unwrap() == zip);
+        assert!(std::fs::read(&inputs[1]).unwrap() == text);
+    }
+
+    /// A stream no importer limit applies to is refused when it has more than the limit for
+    /// every stream, by the name the operand has; a regular file larger than that is not
+    /// copied and not refused.
+    #[cfg(unix)]
+    #[test]
+    fn an_endless_stream_without_an_importer_limit_is_refused_by_its_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cli = Cli::try_parse_from(["wiringcraft", "import", "pdf", "/dev/zero"]).unwrap();
+        let (_, spool) = spooled_within(cli, SMALL);
+        assert_eq!(
+            spool.map(|_| ()).unwrap_err(),
+            "/dev/zero: the stream is larger than 1 MB"
+        );
+        // A database header does not make another command's input a database.
+        let fifo = tmp.path().join("plan.pdf");
+        mkfifo(&fifo);
+        let writer = endless_writer(&fifo, b"SQLite format 3\0", 8 << 20);
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "pdf".as_ref(),
+            fifo.as_os_str(),
+        ])
+        .unwrap();
+        let (_, spool) = spooled_within(cli, SMALL);
+        let why = spool.map(|_| ()).unwrap_err();
+        assert_eq!(why, format!("{}: the stream is larger than 1 MB", fifo.display()));
+        let (sent, end) = writer.join().unwrap();
+        assert_eq!(end.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(sent > SMALL.stream, "{sent}");
+
+        let file = tmp.path().join("large.pdf");
+        std::fs::write(&file, vec![0; SMALL.stream as usize + 4096]).unwrap();
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "pdf".as_ref(),
+            file.as_os_str(),
+        ])
+        .unwrap();
+        let (inputs, spool) = spooled_within(cli, SMALL);
+        assert!(spool.unwrap().is_none());
+        assert_eq!(inputs, [file]);
+    }
+
+    /// A FIFO made with `mkfifo` at `path`.
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(path)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    /// One writer on another thread that opens the FIFO at `fifo` once and writes `bytes`.
+    #[cfg(unix)]
+    fn writer(fifo: &Path, bytes: Vec<u8>) -> std::thread::JoinHandle<std::io::Result<()>> {
+        use std::io::Write;
+        let fifo = fifo.to_path_buf();
+        std::thread::spawn(move || std::fs::OpenOptions::new().write(true).open(&fifo)?.write_all(&bytes))
+    }
+
+    /// Two differently named operands that are one FIFO: it is read once, each operand keeps
+    /// its own name, so the importer gives each its own id.
+    #[cfg(unix)]
+    #[test]
+    fn two_names_of_one_fifo_keep_their_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("pipe");
+        mkfifo(&fifo);
+        let (first, second) = (tmp.path().join("first.elmt"), tmp.path().join("second.elmt"));
+        std::os::unix::fs::symlink(&fifo, &first).unwrap();
+        std::os::unix::fs::symlink(&fifo, &second).unwrap();
+        let element =
+            "<definition type=\"element\"><description><terminal x=\"0\" y=\"0\"/></description></definition>";
+        let writer = writer(&fifo, element.as_bytes().to_vec());
+        let lib = tmp.path().join("lib");
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "symbol-qet".as_ref(),
+            first.as_os_str(),
+            second.as_os_str(),
+            "--lib".as_ref(),
+            lib.as_os_str(),
+        ])
+        .unwrap();
+        let (inputs, spool) = spooled(cli);
+        writer.join().unwrap().unwrap();
+        let spool = spool.unwrap();
+        assert_eq!(inputs.len(), 2);
+        for (input, operand) in inputs.iter().zip([&first, &second]) {
+            assert!(input.starts_with(spool.path()), "{inputs:?}");
+            assert_eq!(input.file_name(), operand.file_name());
+            assert_eq!(std::fs::read_to_string(input).unwrap(), element);
+        }
+        let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
+        assert_eq!((written, failed), (2, 0));
+        assert!(lib.join("symbols").join("qet.first.json").exists());
+        assert!(lib.join("symbols").join("qet.second.json").exists());
+    }
+
+    /// An Eplan `.elk` FIFO whose `.edb` folder is beside it: the importer, given the copy,
+    /// still finds the folder and reads the project's page from it.
+    #[cfg(unix)]
+    #[test]
+    fn the_folder_of_an_elk_fifo_is_found_from_its_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let edb = tmp.path().join("plant.edb");
+        std::fs::create_dir(&edb).unwrap();
+        // One page record as the importer reads it: padding, the record start, its own
+        // reference (class 4, a page, id 10), the page name and its properties block.
+        let mut page = vec![0u8; 24];
+        page.extend([0x0a, 0, 0, 0, 0x38, 0, 0xff, 0xff]);
+        page.extend(60001u16.to_le_bytes());
+        page.extend(4u16.to_le_bytes());
+        page.extend(10u32.to_le_bytes());
+        page.extend(61101u16.to_le_bytes());
+        page.extend(b"1\0");
+        page.extend(60011u16.to_le_bytes());
+        page.extend(11011u16.to_le_bytes());
+        page.extend(0u16.to_le_bytes());
+        page.extend(b"en_US@MAIN CIRCUIT;\0");
+        page.extend([0xff, 0xff]);
+        std::fs::write(edb.join("page.eod"), &page).unwrap();
+        let fifo = tmp.path().join("plant.elk");
+        mkfifo(&fifo);
+        let writer = writer(&fifo, b"plant.edb\r\n12.0\r\n".to_vec());
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "eplan".as_ref(),
+            fifo.as_os_str(),
+        ])
+        .unwrap();
+        let (inputs, spool) = spooled(cli);
+        writer.join().unwrap().unwrap();
+        let spool = spool.unwrap();
+        assert!(inputs[0].starts_with(spool.path()), "{inputs:?}");
+        let (tables, warnings) = wc_import::run::eplan_tables(&inputs[0]).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(tables.get("page.eod"), Some(&page));
+        let project = wc_import::eplan::read(&tables).unwrap();
+        let pages: Vec<(&str, &str)> = project
+            .pages
+            .iter()
+            .map(|p| (p.name.as_str(), p.description.as_str()))
+            .collect();
+        assert_eq!(pages, [("1", "MAIN CIRCUIT")]);
+        // The original folder is linked, not copied or moved: it is still where it was.
+        drop(spool);
+        assert!(edb.join("page.eod").exists());
+    }
+
+    // Used by the stream tests, which run on Unix only.
+    #[cfg(unix)]
+    const ELEMENT: &str =
+        "<definition type=\"element\"><description><terminal x=\"0\" y=\"0\"/></description></definition>";
+
+    /// A FIFO whose id an earlier element has is not opened: the import refuses it for its
+    /// id, so a FIFO without a writer does not hold the command up. When the earlier file is
+    /// no element, the FIFO is read and imported.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_with_the_id_of_an_earlier_element_is_not_opened() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let (file, fifo) = (a.join("lamp.elmt"), b.join("lamp.elmt"));
+        mkfifo(&fifo);
+        let parse = |lib: &Path| {
+            Cli::try_parse_from([
+                "wiringcraft".as_ref(),
+                "import".as_ref(),
+                "symbol-qet".as_ref(),
+                file.as_os_str(),
+                fifo.as_os_str(),
+                "--lib".as_ref(),
+                lib.as_os_str(),
+            ])
+            .unwrap()
+        };
+        // No writer: a copy of the FIFO would never end.
+        std::fs::write(&file, ELEMENT).unwrap();
+        let lib = tmp.path().join("lib");
+        let (inputs, spool) = spooled(parse(&lib));
+        assert!(spool.is_none());
+        assert_eq!(inputs, [file.clone(), fifo.clone()]);
+        let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
+        assert_eq!((written, failed), (1, 1));
+
+        std::fs::write(&file, "no element").unwrap();
+        let lib = tmp.path().join("lib2");
+        let writer = writer(&fifo, ELEMENT.as_bytes().to_vec());
+        let (inputs, spool) = spooled(parse(&lib));
+        writer.join().unwrap().unwrap();
+        let spool = spool.unwrap();
+        assert!(inputs[1].starts_with(spool.path()), "{inputs:?}");
+        let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
+        assert_eq!((written, failed), (1, 1));
+        assert!(lib.join("symbols").join("qet.lamp.json").exists());
+    }
+
+    /// A stream that cannot be opened (a socket) is left to the import, which counts it as
+    /// failed and imports the elements before and after it.
+    #[cfg(unix)]
+    #[test]
+    fn a_stream_that_cannot_be_opened_fails_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (before, socket, after) = (
+            tmp.path().join("before.elmt"),
+            tmp.path().join("socket.elmt"),
+            tmp.path().join("after.elmt"),
+        );
+        std::fs::write(&before, ELEMENT).unwrap();
+        std::fs::write(&after, ELEMENT).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let lib = tmp.path().join("lib");
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "symbol-qet".as_ref(),
+            before.as_os_str(),
+            socket.as_os_str(),
+            after.as_os_str(),
+            "--lib".as_ref(),
+            lib.as_os_str(),
+        ])
+        .unwrap();
+        let (inputs, spool) = spooled(cli);
+        assert!(spool.is_none());
+        assert_eq!(inputs, [before, socket, after]);
+        let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
+        assert_eq!((written, failed), (2, 1));
+        assert!(lib.join("symbols").join("qet.before.json").exists());
+        assert!(lib.join("symbols").join("qet.after.json").exists());
+    }
+
+    /// A FIFO named twice is read once: its one writer writes one element, the first operand
+    /// gets the copy, and the second is left unread, as the importer refuses it for its id as
+    /// it does for a file.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_named_twice_is_copied_once() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("lamp.elmt");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let element =
+            "<definition type=\"element\"><description><terminal x=\"0\" y=\"0\"/></description></definition>";
+        let writer = {
+            let fifo = fifo.clone();
+            std::thread::spawn(move || {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&fifo)?
+                    .write_all(element.as_bytes())
+            })
+        };
+        let lib = tmp.path().join("lib");
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "symbol-qet".as_ref(),
+            fifo.as_os_str(),
+            fifo.as_os_str(),
+            "--lib".as_ref(),
+            lib.as_os_str(),
+        ])
+        .unwrap();
+        let (inputs, spool) = spooled(cli);
+        writer.join().unwrap().unwrap();
+        let spool = spool.unwrap();
+        assert_eq!(inputs.len(), 2);
+        assert!(inputs[0].starts_with(spool.path()), "{inputs:?}");
+        assert_eq!(inputs[0].file_name(), fifo.file_name());
+        assert_eq!(std::fs::read_to_string(&inputs[0]).unwrap(), element);
+        assert_eq!(inputs[1], fifo);
+        let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
+        assert_eq!((written, failed), (1, 1));
+        assert!(lib.join("symbols").join("qet.lamp.json").exists());
+    }
+
+    /// An element stream without an end is copied up to one byte over what the importer
+    /// reads, and refused by it as too large: that element fails, the command does not.
+    #[cfg(unix)]
+    #[test]
+    fn an_endless_element_stream_is_copied_up_to_the_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("lib");
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "symbol-qet".as_ref(),
+            "/dev/zero".as_ref(),
+            "--lib".as_ref(),
+            lib.as_os_str(),
+        ])
+        .unwrap();
+        let (inputs, spool) = spooled(cli);
+        assert!(spool.is_some());
+        let len = std::fs::metadata(&inputs[0]).unwrap().len();
+        assert_eq!(len, wc_import::qet::MAX_LEN as u64 + 1);
+        let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
+        assert_eq!((written, failed), (0, 1));
     }
 }

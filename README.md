@@ -23,7 +23,7 @@ See the feature list for the full plan.
 |---|---|
 | `wc-core` | data model, device tags (IEC 81346 style), project folder format, connectivity |
 | `wc-library` | library sources, lockfile, vendoring, update status |
-| `wc-import` | DXF, SVG, CSV, AutomationML, PDF trace, Eplan P8 projects, SolidWorks Electrical projects (.tewzip) and project archive import |
+| `wc-import` | symbols from DXF, SVG, KiCad symbol libraries and QElectroTech elements; parts from CSV, Excel (.xlsx), BMEcat catalogues and EDZ files (with their macros as symbols); PLC address lists; WAGO configurator lists; maker footprint DXFs and STEP model sizes; pages from DXF, DWG and PDF (trace); AutomationML, Eplan P8 and SolidWorks Electrical projects and libraries (.tewzip); open-format parts of project archives |
 | `wc-report` | parts list, device list, wire list, net list, terminal plan, cable list, PLC I/O list, PLC card overview, table of contents |
 | `wc-pdf` | vector PDF export (schematic pages plus report pages) |
 | `wc-vcs` | git versioning, subway-map history, schematic change lists |
@@ -51,9 +51,10 @@ in `crates/wc-app/assets/fonts`).
 
 ![dark mode](docs/screenshots/app-dark.png)
 
-Tools: select and drag (Esc), place symbol (S, pick one in the library; R and M turn and mirror
-it before the click), draw wire (W: click a pin, click bends, click a pin to finish or
-double-click a free point), rotate (R), mirror (M), delete (Del).
+Tools: select and drag (Esc; Esc during a drag puts it back), place symbol (S, pick one in the
+library; R and M turn and mirror it before the click), draw wire (W: click a pin, click bends,
+click a pin to finish or double-click a free point), rotate (R), mirror (M), delete (Del),
+duplicate the selection one grid step down and right (Ctrl+D).
 Wheel zooms around the pointer, right or middle drag pans, F fits the page, G toggles the grid.
 New devices get the next free tag, with the function and location used on that page.
 Versions → Commit / Branch / History records versions and shows the subway map.
@@ -118,6 +119,34 @@ to use wgpu from the start, or `glow` to use OpenGL only.
 cargo test --workspace
 cargo run -p wc-cli -- --help
 ```
+
+### Command line imports
+
+`wiringcraft import <command>` reads into the project (`-C <dir>`, default the current folder),
+or into a library folder with `--lib` where the command takes one. `wiringcraft import <command> --help`
+gives the details.
+
+| Command | Imports |
+|---|---|
+| `symbol-dxf` | a symbol from a DXF drawing (pins: POINT entities, or entities on a layer named PIN) |
+| `symbol-svg` | a symbol from an SVG drawing (pins: elements with `id="pin:NAME"` or `data-pin="NAME"`) |
+| `symbol-kicad` | every symbol of a KiCad symbol library (`.kicad_sym`, KiCad 6 or later) |
+| `symbol-qet` | QElectroTech elements (`.elmt`), one symbol per file |
+| `footprint-dxf` | a maker's outline drawing (DXF, front view, mm at 1:1) as a part's footprint on cabinet layouts |
+| `model-step` | a maker's 3D model (STEP) of a part: its bounding box gives the part's size for layouts and 3D export |
+| `parts-csv` | parts from a CSV or semicolon-separated export, or an Excel workbook (`.xlsx`) |
+| `parts-bmecat` | parts from a BMEcat catalogue (XML, version 1.2 or 2005), with ECLASS class and features |
+| `parts-edz` | parts from an EDZ file (EPLAN Data Exchange archive); each macro becomes a library symbol |
+| `plc-csv` | PLC addresses from a CSV list or an Excel workbook onto the project's devices |
+| `wago` | the WAGO configurator list back (written by `export wago-configurator`): articles and accessories onto terminals and strips |
+| `archive` | the open-format parts of another tool's project archive (PDF, DXF, AutomationML, PLC lists, KiCad, CSV) |
+| `page-dxf` | a DXF drawing onto a page as graphics; blocks named like library symbols become symbols |
+| `page-dwg` | a DWG drawing onto a page, converted to DXF by an installed converter (ODA File Converter, `dwg2dxf`, or `WIRINGCRAFT_DWG2DXF`) |
+| `pdf` | PDF pages as trace graphics on new pages (vector content; scanned pages have none) |
+| `aml` | AutomationML (CAEX) devices, properties and connections, laid out as overview pages |
+| `eplan` | an Eplan Electric P8 project (.elk, its .edb folder, or a zip of it): pages as drawn, plus overview pages |
+| `swe` | a SolidWorks Electrical project (.tewzip or `tew_project_data.sqlite`): pages, symbols, wires and devices |
+| `swe-library` | the libraries of a SolidWorks Electrical archive (.tewzip): catalog parts, cable types and symbol blocks |
 
 ## Rules
 

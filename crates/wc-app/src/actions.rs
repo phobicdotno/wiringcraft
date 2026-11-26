@@ -34,6 +34,7 @@ pub enum Action {
     Copy,
     Cut,
     Paste,
+    Duplicate,
     SelectAll,
     Find,
     AddPage,
@@ -43,6 +44,8 @@ pub enum Action {
     PageProps,
     PageUp,
     PageDown,
+    PrevPage,
+    NextPage,
     DeletePage,
     NewPanel,
     ArrangePanel,
@@ -128,6 +131,7 @@ impl Action {
                 | Action::Mirror
                 | Action::Cut
                 | Action::Paste
+                | Action::Duplicate
         ) || self.edits_page_itself()
     }
 
@@ -171,6 +175,7 @@ impl Action {
         Action::Copy,
         Action::Cut,
         Action::Paste,
+        Action::Duplicate,
         Action::SelectAll,
         Action::Find,
         Action::AddPage,
@@ -180,6 +185,8 @@ impl Action {
         Action::PageProps,
         Action::PageUp,
         Action::PageDown,
+        Action::PrevPage,
+        Action::NextPage,
         Action::DeletePage,
         Action::NewPanel,
         Action::ArrangePanel,
@@ -401,6 +408,12 @@ impl Action {
                 Icon::Paste,
                 "Ctrl+V",
             ),
+            Action::Duplicate => i(
+                "Duplicate",
+                "Put a copy of the selection one grid step down and right, selected so it can be moved; devices get the next free tags",
+                Icon::Copy,
+                "Ctrl+D",
+            ),
             Action::SelectAll => i("Select all", "Select everything on this page", Icon::Select, "Ctrl+A"),
             Action::Find => i(
                 "Find",
@@ -445,6 +458,8 @@ impl Action {
                 Icon::PageDown,
                 "",
             ),
+            Action::PrevPage => i("Previous page", "Open the page before this one", Icon::PagePrev, "PgUp"),
+            Action::NextPage => i("Next page", "Open the page after this one", Icon::PageNext, "PgDn"),
             Action::DeletePage => i("Delete page", "Delete this page", Icon::PageDelete, ""),
             Action::NewPanel => i(
                 "Panel layout",
@@ -550,7 +565,7 @@ impl Action {
             ),
             Action::ImportPageDwg => i(
                 "DWG drawing",
-                "Import a DWG drawing onto the current page (needs a DWG to DXF converter)",
+                "Import a DWG drawing onto the current page (read by WiringCraft's own DWG reader; a DWG to DXF converter is used only when the reader refuses the file)",
                 Icon::Open,
                 "",
             ),
@@ -807,6 +822,8 @@ pub const RIBBON: &[(&str, &[RibbonGroup])] = &[
                     Action::PageProps,
                     Action::PageUp,
                     Action::PageDown,
+                    Action::PrevPage,
+                    Action::NextPage,
                     Action::DeletePage,
                 ],
             ),
