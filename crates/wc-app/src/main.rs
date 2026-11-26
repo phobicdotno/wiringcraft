@@ -5063,7 +5063,11 @@ fn export_aml_to(open: &Open, path: &Path) -> String {
     };
     // A fixed time stamp keeps repeated exports of the same project identical, so they diff
     // cleanly in git.
-    let (text, counts) = wc_report::automationml(&inputs, "");
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let (text, counts) = wc_report::automationml(&inputs, "", &file_name);
     match write_creating(path, text) {
         Ok(()) => {
             let mut m = format!(

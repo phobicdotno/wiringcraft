@@ -598,7 +598,7 @@ fn automationml_has_devices_pins_and_one_link_per_join() {
         symbols: &s,
         parts: &parts,
     };
-    let (xml, counts) = automationml(&i, "2026-11-16T22:00:00Z");
+    let (xml, counts) = automationml(&i, "2026-11-16T22:00:00Z", "plant-v2.aml");
     // K1, -P1, -X1.1, -X1.2, -X2; not the interruption point.
     assert_eq!(counts.devices, 5, "{xml}");
     assert!(!xml.contains("-L1"));
@@ -609,12 +609,17 @@ fn automationml_has_devices_pins_and_one_link_per_join() {
     assert!(xml.contains("<Value>R-24, DC</Value>") && xml.contains("<Value>Acme</Value>"));
     assert!(xml.contains("Name=\"Coil &lt;voltage&gt;\"") && xml.contains("<Value>24 V &amp; more</Value>"));
     assert!(xml.contains("LastWritingDateTime=\"2026-11-16T22:00:00Z\""));
+    // FileName names the file written, not the project.
+    assert!(xml.contains("<CAEXFile FileName=\"plant-v2.aml\""), "{xml}");
+    // Without a file name, the project name stands in.
+    let fallback = automationml(&i, "2026-11-16T22:00:00Z", "").0;
+    assert!(fallback.contains("<CAEXFile FileName=\"Test.aml\""), "{fallback}");
     // The coil and the contact are one device with all four connection points.
     let k1 = xml.split("<InternalElement Name=\"=A+C1-K1\"").nth(1).unwrap();
     let k1 = k1.split("</InternalElement>").next().unwrap();
     assert_eq!(k1.matches("<ExternalInterface").count(), 4);
     // The same project gives the same file.
-    assert_eq!(automationml(&i, "2026-11-16T22:00:00Z").0, xml);
+    assert_eq!(automationml(&i, "2026-11-16T22:00:00Z", "plant-v2.aml").0, xml);
 }
 
 #[test]

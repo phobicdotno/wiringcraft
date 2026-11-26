@@ -52,7 +52,9 @@ pub struct AmlCounts {
 
 /// The project as an AutomationML document. `written` is the time stamp CAEX asks for
 /// (`2026-11-16T22:00:00Z`); the caller passes it so the same project always gives the same file.
-pub fn automationml(i: &Inputs<'_>, written: &str) -> (String, AmlCounts) {
+/// `file_name` is the name of the file being written (`plant-v2.aml`), which goes in the CAEX
+/// `FileName` attribute; when it is empty, the project name plus `.aml` is used instead.
+pub fn automationml(i: &Inputs<'_>, written: &str, file_name: &str) -> (String, AmlCounts) {
     let mut counts = AmlCounts::default();
     let is_device = |page: &str, item: &str| -> Option<DeviceTag> {
         let s = i.project.page(page)?.symbol(item)?;
@@ -105,14 +107,19 @@ pub fn automationml(i: &Inputs<'_>, written: &str) -> (String, AmlCounts) {
     } else {
         i.project.meta.name.trim()
     };
+    let file_name = if file_name.trim().is_empty() {
+        format!("{name}.aml")
+    } else {
+        file_name.trim().to_string()
+    };
     let _ = writeln!(
         out,
-        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<CAEXFile FileName=\"{}.aml\" SchemaVersion=\"3.0\" \
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<CAEXFile FileName=\"{}\" SchemaVersion=\"3.0\" \
          xmlns=\"http://www.dke.de/CAEX\" xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">\n  \
          <SourceDocumentInformation OriginName=\"WiringCraft\" OriginID=\"wiringcraft\" OriginVersion=\"{}\" \
          LastWritingDateTime=\"{}\"/>\n  <InstanceHierarchy Name=\"{}\" Version=\"1\">\n    \
          <InternalElement Name=\"{}\" ID=\"project\">",
-        esc(name),
+        esc(&file_name),
         env!("CARGO_PKG_VERSION"),
         esc(if written.is_empty() {
             "1970-01-01T00:00:00Z"
