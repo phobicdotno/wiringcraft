@@ -1720,7 +1720,7 @@ fn with_holes_kept(loops: &[Vec<(f64, f64)>], style: i64) -> Option<(Vec<Loop>, 
 }
 
 /// One warning per entity kind that was not read.
-fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
+pub(crate) fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
     skipped
         .into_iter()
         .map(|(kind, n)| {
@@ -1894,10 +1894,20 @@ fn normalise_block_name(n: &str) -> String {
 /// DEVICE, BMK or REF; everything else is kept as graphics. The drawing is moved so its top-left
 /// corner sits inside the page frame.
 pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<ImportedPage> {
+    check_scale(scale)?;
+    page_of(&parse(text)?, scale, known_symbols)
+}
+
+fn check_scale(scale: f64) -> Result<()> {
     if !(scale.is_finite() && scale > 0.0) {
         return Err(Error::Format("scale must be a positive number".into()));
     }
-    let d = parse(text)?;
+    Ok(())
+}
+
+/// [`page`] for a drawing already read, from a DXF or a DWG file ([`crate::dwg::page`]).
+pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>) -> Result<ImportedPage> {
+    check_scale(scale)?;
     let known: BTreeMap<String, &String> = known_symbols.iter().map(|s| (normalise_block_name(s), s)).collect();
     let mut out = ImportedPage::default();
     let mut raw = Vec::new();
@@ -1947,7 +1957,7 @@ pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<
     }
     let mut skipped = BTreeMap::new();
     shapes(
-        &d,
+        d,
         &plain,
         Xf::ID,
         scale,

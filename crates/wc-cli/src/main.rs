@@ -1048,8 +1048,9 @@ enum ImportCmd {
         #[arg(long)]
         lib: Option<PathBuf>,
     },
-    /// A DWG drawing onto a page, converted to DXF by an installed converter (ODA File
-    /// Converter, `dwg2dxf`, or the command in WIRINGCRAFT_DWG2DXF with {in} and {out}).
+    /// A DWG drawing onto a page, read by WiringCraft's own DWG reader (AutoCAD 2004 to 2018).
+    /// A file it refuses is converted to DXF by an installed converter (ODA File Converter,
+    /// `dwg2dxf`, or the command in WIRINGCRAFT_DWG2DXF with {in} and {out}).
     PageDwg {
         /// The DWG file.
         file: PathBuf,
@@ -3800,83 +3801,10 @@ fn import_cmd(dir: &Path, ic: ImportCmd) -> Res<()> {
             import_page_dwg(dir, &file, page, scale, std::env::var("WIRINGCRAFT_DWG2DXF").ok())?;
         }
         ImportCmd::PageDxf { file, page, scale } => {
-            let mut p = load(dir)?;
-            let lib = wc_library::Library::open(dir, &p).map_err(e)?;
-            let known: std::collections::BTreeSet<String> = lib.index(ItemKind::Symbol).into_keys().collect();
             let text = read_file(&file)?;
-            let imported = wc_import::dxf::page(&String::from_utf8_lossy(&text), scale, &known).map_err(e)?;
-            for w in &imported.warnings {
-                eprintln!("warning: {}", escape_field(w));
-            }
-            // The page must be there before anything is taken (a retry would skip the copies).
-            page_mut(&mut p, &page)?;
-            let needed: std::collections::BTreeSet<&str> = imported
-                .symbols
-                .iter()
-                .map(|s| s.symbol.as_str())
-                .filter(|id| store::read_vendored_symbol(dir, id).is_err())
-                .collect();
-            // Check every symbol before taking any, so a refused import leaves no copy behind
-            // without its pin (a retry would take that copy for a pinned one).
-            for id in &needed {
-                let (s, source) = lib.symbol(id).map_err(e)?;
-                if s.id != *id {
-                    return Err(format!("{source}: the symbol file for {id:?} declares id {:?}", s.id));
-                }
-            }
-            // What is in the vendor folder now, so a write that fails part way leaves no copy
-            // without its pin (a retry would skip a readable one).
-            let before: Vec<(PathBuf, Option<String>)> = needed
-                .iter()
-                .map(|id| {
-                    let path = store::vendor_path(dir, ItemKind::Symbol, id).map_err(e)?;
-                    let was = match std::fs::read_to_string(&path) {
-                        Ok(text) => Some(text),
-                        Err(x) if x.kind() == std::io::ErrorKind::NotFound => None,
-                        Err(x) => return Err(format!("{}: {x}", path.display())),
-                    };
-                    Ok((path, was))
-                })
-                .collect::<Res<_>>()?;
-            let put_back = |why: String| -> String {
-                let failed: Vec<String> = before
-                    .iter()
-                    .filter_map(|(path, was)| {
-                        // Written only when it differs, and whole or not at all.
-                        let r = match was {
-                            Some(text) => store::write_if_changed(path, text)
-                                .map(|_| ())
-                                .map_err(|x| x.to_string()),
-                            None => std::fs::remove_file(path).or_else(|x| {
-                                if x.kind() == std::io::ErrorKind::NotFound {
-                                    Ok(())
-                                } else {
-                                    Err(format!("{}: {x}", path.display()))
-                                }
-                            }),
-                        };
-                        r.err()
-                    })
-                    .collect();
-                if failed.is_empty() {
-                    why
-                } else {
-                    format!("{why}; symbol copies could not be put back: {}", failed.join("; "))
-                }
-            };
-            for id in needed {
-                wc_library::take(dir, &mut p, &lib, ItemKind::Symbol, id).map_err(|x| put_back(x.to_string()))?;
-            }
-            let pg = page_mut(&mut p, &page)?;
-            let n_g = imported.graphics.len();
-            let n_s = imported.symbols.len();
-            pg.graphics.extend(imported.graphics);
-            for mut s in imported.symbols {
-                s.id = pg.next_id("s");
-                pg.symbols.push(s);
-            }
-            save(dir, &p)?;
-            println!("imported {n_g} shapes and {n_s} symbols onto page {page}");
+            import_onto_page(dir, &page, |known| {
+                wc_import::dxf::page(&String::from_utf8_lossy(&text), scale, known).map_err(e)
+            })?;
         }
     }
     Ok(())
@@ -4211,20 +4139,126 @@ fn lock_warnings(left: &wc_library::Unpinned) -> Vec<String> {
         .collect()
 }
 
-/// `import page-dwg`: convert `file` with the converter (`template`, see [`dwg_to_dxf`]) and
-/// import the DXF onto `page`. The converter writes into a private folder of its own, removed
-/// with everything in it when this ends, also on failure.
+/// Read a drawing with `read` (given the ids of the library's symbols) and add it to page
+/// `page`: its graphics, and its symbols with the library symbols they need taken into the
+/// project. Shared by `import page-dxf` and `import page-dwg`.
+fn import_onto_page(
+    dir: &Path,
+    page: &str,
+    read: impl FnOnce(&std::collections::BTreeSet<String>) -> Res<wc_import::dxf::ImportedPage>,
+) -> Res<()> {
+    let mut p = load(dir)?;
+    let lib = wc_library::Library::open(dir, &p).map_err(e)?;
+    let known: std::collections::BTreeSet<String> = lib.index(ItemKind::Symbol).into_keys().collect();
+    let imported = read(&known)?;
+    for w in &imported.warnings {
+        eprintln!("warning: {}", escape_field(w));
+    }
+    // The page must be there before anything is taken (a retry would skip the copies).
+    page_mut(&mut p, page)?;
+    let needed: std::collections::BTreeSet<&str> = imported
+        .symbols
+        .iter()
+        .map(|s| s.symbol.as_str())
+        .filter(|id| store::read_vendored_symbol(dir, id).is_err())
+        .collect();
+    // Check every symbol before taking any, so a refused import leaves no copy behind
+    // without its pin (a retry would take that copy for a pinned one).
+    for id in &needed {
+        let (s, source) = lib.symbol(id).map_err(e)?;
+        if s.id != *id {
+            return Err(format!("{source}: the symbol file for {id:?} declares id {:?}", s.id));
+        }
+    }
+    // What is in the vendor folder now, so a write that fails part way leaves no copy
+    // without its pin (a retry would skip a readable one).
+    let before: Vec<(PathBuf, Option<String>)> = needed
+        .iter()
+        .map(|id| {
+            let path = store::vendor_path(dir, ItemKind::Symbol, id).map_err(e)?;
+            let was = match std::fs::read_to_string(&path) {
+                Ok(text) => Some(text),
+                Err(x) if x.kind() == std::io::ErrorKind::NotFound => None,
+                Err(x) => return Err(format!("{}: {x}", path.display())),
+            };
+            Ok((path, was))
+        })
+        .collect::<Res<_>>()?;
+    let put_back = |why: String| -> String {
+        let failed: Vec<String> = before
+            .iter()
+            .filter_map(|(path, was)| {
+                // Written only when it differs, and whole or not at all.
+                let r = match was {
+                    Some(text) => store::write_if_changed(path, text)
+                        .map(|_| ())
+                        .map_err(|x| x.to_string()),
+                    None => std::fs::remove_file(path).or_else(|x| {
+                        if x.kind() == std::io::ErrorKind::NotFound {
+                            Ok(())
+                        } else {
+                            Err(format!("{}: {x}", path.display()))
+                        }
+                    }),
+                };
+                r.err()
+            })
+            .collect();
+        if failed.is_empty() {
+            why
+        } else {
+            format!("{why}; symbol copies could not be put back: {}", failed.join("; "))
+        }
+    };
+    for id in needed {
+        wc_library::take(dir, &mut p, &lib, ItemKind::Symbol, id).map_err(|x| put_back(x.to_string()))?;
+    }
+    let pg = page_mut(&mut p, page)?;
+    let n_g = imported.graphics.len();
+    let n_s = imported.symbols.len();
+    pg.graphics.extend(imported.graphics);
+    for mut s in imported.symbols {
+        s.id = pg.next_id("s");
+        pg.symbols.push(s);
+    }
+    save(dir, &p)?;
+    println!("imported {n_g} shapes and {n_s} symbols onto page {page}");
+    Ok(())
+}
+
+/// `import page-dwg`: read `file` with WiringCraft's own DWG reader (AutoCAD 2004 to 2018) and
+/// import it onto `page`. Only when that reader refuses the file (another version, or a file
+/// it cannot read) is it converted to DXF with an installed converter (`template`, see
+/// [`dwg_to_dxf`]); the converter writes into a private folder of its own, removed with
+/// everything in it when this ends, also on failure. Says which of the two read the file.
 fn import_page_dwg(dir: &Path, file: &Path, page: String, scale: f64, template: Option<String>) -> Res<()> {
+    let bytes = read_file(file)?;
+    // A scale the import refuses is refused before any converter runs.
+    if !(scale.is_finite() && scale > 0.0) {
+        return Err("scale must be a positive number".into());
+    }
+    let refused = match wc_import::dwg::read_sections(&bytes) {
+        Ok(sections) => {
+            return import_onto_page(dir, &page, |known| {
+                let imported = wc_import::dwg::page_of(&sections, scale, known).map_err(e)?;
+                println!("read with WiringCraft's own DWG reader");
+                Ok(imported)
+            });
+        }
+        Err(why) => why.to_string(),
+    };
     let tmp = staging_dir("wiringcraft-dwg-").map_err(e)?;
-    let dxf = dwg_to_dxf(file, tmp.path(), template)?;
+    let (dxf, converter) = dwg_to_dxf(file, tmp.path(), template)
+        .map_err(|why| format!("WiringCraft's own DWG reader refused the file ({refused}); {why}"))?;
+    println!("converted to DXF with {converter}: WiringCraft's own DWG reader refused the file ({refused})");
     import_cmd(dir, ImportCmd::PageDxf { file: dxf, page, scale })
 }
 
 /// Convert DWG to a DXF in `tmp` (a private folder, see [`staging_dir`]) with whatever
 /// converter is installed: the command `template` (the WIRINGCRAFT_DWG2DXF setting, with `{in}`
-/// and `{out}`) when given, otherwise `dwg2dxf` or the ODA File Converter. DWG is a closed
-/// format; WiringCraft does not read it itself.
-fn dwg_to_dxf(file: &Path, tmp: &Path, template: Option<String>) -> Res<PathBuf> {
+/// and `{out}`) when given, otherwise `dwg2dxf` or the ODA File Converter. Returns the DXF and
+/// the converter's name. For the DWG files WiringCraft's own reader refuses.
+fn dwg_to_dxf(file: &Path, tmp: &Path, template: Option<String>) -> Res<(PathBuf, &'static str)> {
     use std::process::Command;
     let stem = file
         .file_stem()
@@ -4243,7 +4277,7 @@ fn dwg_to_dxf(file: &Path, tmp: &Path, template: Option<String>) -> Res<PathBuf>
             let mut c = Command::new(prog);
             c.args(args);
             if ran(c) && out.exists() {
-                return Ok(out);
+                return Ok((out, "the WIRINGCRAFT_DWG2DXF command"));
             }
         }
         return Err("WIRINGCRAFT_DWG2DXF did not produce a DXF".into());
@@ -4251,7 +4285,7 @@ fn dwg_to_dxf(file: &Path, tmp: &Path, template: Option<String>) -> Res<PathBuf>
     let mut c = Command::new("dwg2dxf");
     c.args(["-y", "-o", &output, &input]);
     if ran(c) && out.exists() {
-        return Ok(out);
+        return Ok((out, "dwg2dxf"));
     }
     // ODA File Converter works on folders: <in dir> <out dir> <version> <type> <recurse> <audit> <filter>.
     let in_dir = file
@@ -4274,7 +4308,7 @@ fn dwg_to_dxf(file: &Path, tmp: &Path, template: Option<String>) -> Res<PathBuf>
             name.as_str(),
         ]);
         if ran(c) && out.exists() {
-            return Ok(out);
+            return Ok((out, "ODA File Converter"));
         }
     }
     Err("no DWG converter found: install ODA File Converter or dwg2dxf, or set WIRINGCRAFT_DWG2DXF".into())
@@ -5787,8 +5821,9 @@ mod tests {
         let folder = tmp.path().to_owned();
         // A stand-in converter, as WIRINGCRAFT_DWG2DXF names one; a path with a space stays
         // one argument.
-        let out = dwg_to_dxf(&dwg, &folder, Some("cp {in} {out}".into())).unwrap();
+        let (out, by) = dwg_to_dxf(&dwg, &folder, Some("cp {in} {out}".into())).unwrap();
         assert_eq!(out, folder.join("Motor plan.dxf"));
+        assert_eq!(by, "the WIRINGCRAFT_DWG2DXF command");
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "0\nEOF\n");
         let err = dwg_to_dxf(&dwg, &folder, Some("false {in} {out}".into()))
             .err()

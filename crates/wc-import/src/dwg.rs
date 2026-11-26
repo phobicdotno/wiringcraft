@@ -40,6 +40,57 @@ pub mod r2007;
 
 pub use objects::{Drawing, read_drawing};
 
+/// A DWG drawing as a page, as [`crate::dxf::page`] reads a DXF one: block references whose
+/// name matches a library symbol become placed symbols, the rest is drawn as graphics. The
+/// warnings also say what the DWG reader could not read (entities of kinds it does not decode,
+/// such as multi-line attributes, and damaged objects), so the page is never silently short.
+pub fn page(
+    bytes: &[u8],
+    scale: f64,
+    known_symbols: &std::collections::BTreeSet<String>,
+) -> Result<crate::dxf::ImportedPage> {
+    page_of(&read_sections(bytes)?, scale, known_symbols)
+}
+
+/// [`page`] for the sections [`read_sections`] read from a file.
+pub fn page_of(
+    sections: &Sections,
+    scale: f64,
+    known_symbols: &std::collections::BTreeSet<String>,
+) -> Result<crate::dxf::ImportedPage> {
+    let read = objects::dxf_drawing(sections)?;
+    let mut out = crate::dxf::page_of(&read.drawing, scale, known_symbols)?;
+    let mut notes = Vec::new();
+    // As for the drawings of a SolidWorks Electrical archive: the class section's reason comes
+    // first in `damaged`, before those of the objects.
+    let classes_damaged = read.skipped.contains_key(objects::CLASSES_DAMAGED);
+    let (classes_why, objects_why) = match read.damaged.split_first() {
+        Some((first, rest)) if classes_damaged => (first.as_str(), rest),
+        _ => ("", read.damaged.as_slice()),
+    };
+    if classes_damaged {
+        notes.push(format!("{classes_why}; its custom entities are not counted"));
+    }
+    notes.extend(read.warnings.iter().cloned());
+    let mut skipped = read.skipped.clone();
+    skipped.remove(objects::CLASSES_DAMAGED);
+    if let Some(n) = skipped.remove(objects::DAMAGED) {
+        let first = objects_why.first().map(String::as_str).unwrap_or("");
+        notes.push(format!(
+            "{n} object(s) could not be read and are not drawn, the first because of: {first}"
+        ));
+    }
+    for kind in [objects::BASE_UNREAD, objects::ORPHANS] {
+        if let Some(n) = skipped.remove(kind) {
+            notes.push(format!("{n} {kind}"));
+        }
+    }
+    notes.extend(crate::dxf::skipped_warnings(skipped));
+    notes.append(&mut out.warnings);
+    out.warnings = notes;
+    Ok(out)
+}
+
 /// The most a single page may decompress to, in bytes.
 pub const MAX_PAGE: usize = 64 * 1024 * 1024;
 /// The most all sections of a file may hold in all, in bytes, so a small hostile file cannot
@@ -681,3 +732,40 @@ impl<T: AsRef<[u8]>> Reader<T> {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod page_tests {
+    use super::objects::tests::{TestEntity as E, model_space_dwg};
+
+    /// A DWG page is read by the built-in reader, no converter needed (#600): its lines are
+    /// drawn, a block named like a library symbol is placed as that symbol, and what could
+    /// not be read is in the warnings.
+    #[test]
+    fn a_dwg_page_imports_with_the_built_in_reader() {
+        let bytes = model_space_dwg(&[E::Line((0.0, 0.0), (100.0, 0.0)), E::Insert((50.0, 20.0)), E::Damaged]);
+        let known: std::collections::BTreeSet<String> = ["frame".to_owned()].into();
+        let page = match super::page(&bytes, 1.0, &known) {
+            Ok(page) => page,
+            Err(e) => unreachable!("{e}"),
+        };
+        assert_eq!(page.symbols.len(), 1, "{page:?}");
+        assert_eq!(page.symbols[0].symbol, "frame");
+        assert!(!page.graphics.is_empty());
+        assert!(
+            page.warnings
+                .iter()
+                .any(|w| w.starts_with("1 object(s) could not be read")),
+            "{:?}",
+            page.warnings
+        );
+        // Not a symbol of the library: the block is drawn instead.
+        let page = match super::page(&bytes, 2.0, &Default::default()) {
+            Ok(page) => page,
+            Err(e) => unreachable!("{e}"),
+        };
+        assert!(page.symbols.is_empty());
+        assert!(page.graphics.len() >= 2);
+        assert!(super::page(&bytes, 0.0, &known).is_err());
+        assert!(super::page(b"not a drawing", 1.0, &known).is_err());
+    }
+}
