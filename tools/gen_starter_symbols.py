@@ -121,6 +121,16 @@ sym("wc.potentiometer", "Potentiometer", "passive", "R", "standalone",
      line((1.8, 10), (5, 10)), line((1.8, 10), (3.3, 9.1)), line((1.8, 10), (3.3, 10.9))],
     [pin("1", 0, 0, "up"), pin("2", 5, 10, "right"), pin("3", 0, 20, "down")], tag_at=(-6, 10),
     desc="Adjustable resistor (setpoint, speed reference); 1 and 3 are the ends, 2 is the wiper.")
+sym("wc.connector.socket", "Socket (female contact)", "terminals", "X", "standalone",
+    # Lead into a half-circle cup that opens downwards, towards the mating plug.
+    [line((0, 0), (0, 5)), arc((0, 7.5), 2.5, 180, 360)],
+    [pin("1", 0, 0, "up")], tag_at=(-6, 5),
+    desc="One contact of a plug-in connector, female side; the mating side is open at the bottom.")
+sym("wc.connector.plug", "Plug (male contact)", "terminals", "X", "standalone",
+    # Solid pin end at the top, pointing at the socket it mates with, lead down to pin 1.
+    [polyline([(-0.8, 0), (0.8, 0), (0.8, 4), (-0.8, 4)], closed=True, filled=True), line((0, 4), (0, 10))],
+    [pin("1", 0, 10, "down")], tag_at=(-6, 5),
+    desc="One contact of a plug-in connector, male side; the solid pin end at the top mates with a socket.")
 
 # Symbols first drawn as JSON by hand (#819), kept here so the script recreates the whole
 # starter library.
