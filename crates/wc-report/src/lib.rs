@@ -246,17 +246,13 @@ impl Table {
 
     /// A Markdown table under a level-2 heading.
     pub fn to_markdown(&self) -> String {
-        // One line of text: line ends (LF, CR or CRLF) become spaces, and `<` and `>` are
-        // written as entities so a value is never read as HTML.
-        let line = |s: &str| {
-            s.replace("\r\n", " ")
-                .replace(['\r', '\n'], " ")
-                .replace('<', "&lt;")
-                .replace('>', "&gt;")
-        };
-        // In a cell a backslash is doubled before `|` is escaped, so a cell ending in `\` does
-        // not escape the column bar after it and each cell shows its text as written.
-        let cell = |s: &str| line(s).replace('\\', "\\\\").replace('|', "\\|");
+        // One line of text: line ends (LF, CR or CRLF) become spaces.
+        let one_line = |s: &str| s.replace("\r\n", " ").replace(['\r', '\n'], " ");
+        // `<` and `>` are written as entities so a value is never read as HTML.
+        let line = |s: &str| one_line(s).replace('<', "&lt;").replace('>', "&gt;");
+        // In a cell, Markdown punctuation gets a backslash so the table shows the text as typed
+        // (see `markdown_cell`).
+        let cell = |s: &str| markdown_cell(&one_line(s));
         let mut out = format!(
             "## {}\n\n| {} |\n|{}\n",
             line(&self.title),
@@ -271,6 +267,155 @@ impl Table {
         }
         out
     }
+}
+
+/// One line of cell text for a Markdown table.
+///
+/// Markdown punctuation gets a backslash so the table shows the text as typed: `*spare*` is
+/// not italic, `motor_1_ready` keeps its underscores, `` `X1` `` is not code. A backslash is
+/// doubled, so a cell ending in `\` does not escape the column bar after it.
+///
+/// A word that a Markdown viewer turns into a link by itself (one starting with `http://`,
+/// `https://` or `www.`, or an e-mail address) is kept as typed, because a backslash there
+/// would end up in the link. A viewer also takes in the backslashes of a `|` or a last `\` in
+/// the word, or of escaped text right after it (`https://x.no/&copy;`). Such a word is written
+/// as text that is not a link (`https\://`, `www\.`, `a\@x_y.no`) with everything escaped;
+/// an e-mail address that CommonMark takes in `<...>` is written as `<a@x.no>`, which ends
+/// the link before the text after it.
+fn markdown_cell(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while !rest.is_empty() {
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let word = &rest[..end];
+        // Characters before the link that Markdown still lets a link start after.
+        let lead = word.len() - word.trim_start_matches(['*', '_', '~', '(']).len();
+        let (before, link) = word.split_at(lead);
+        markdown_text(before, &mut out);
+        // Markdown leaves trailing punctuation and a trailing entity such as `&copy;` out of
+        // a link: that part is plain text.
+        let mut body = link;
+        loop {
+            body = body.trim_end_matches(['?', '!', '.', ',', ':', '*', '_', '~']);
+            let Some(head) = body.strip_suffix(';') else {
+                break;
+            };
+            let name = head.trim_end_matches(|c: char| c.is_ascii_alphanumeric());
+            match name.strip_suffix('&') {
+                Some(kept) if name.len() < head.len() => body = kept,
+                _ => break,
+            }
+        }
+        if is_autolink(body) && !link.contains(['<', '>']) {
+            let mut tail = String::new();
+            markdown_text(link.strip_prefix(body).unwrap_or_default(), &mut tail);
+            let www = body.strip_prefix("www.");
+            if !tail.contains('\\') && !body.contains('|') && !body.ends_with('\\') {
+                // A plain link stays as typed, a `\` inside it too.
+                out.push_str(body);
+            } else if let Some((scheme, rest)) = body.split_once("://") {
+                // A viewer would take backslashes into the link, so the word is written as
+                // text that is not a link: `\:` shows as `:`.
+                out.push_str(scheme);
+                out.push_str("\\:");
+                markdown_text(&format!("//{rest}"), &mut out);
+            } else if let Some(rest) = www {
+                out.push_str("www\\.");
+                markdown_text(rest, &mut out);
+            } else if let Some((name, domain)) = body.split_once('@') {
+                if angle_email_domain(domain) {
+                    // `<...>` ends the e-mail link before the text after it.
+                    out.push('<');
+                    out.push_str(body);
+                    out.push('>');
+                } else {
+                    // A domain `<...>` does not take: `\@` shows as `@` and is not a link.
+                    markdown_text(name, &mut out);
+                    out.push_str("\\@");
+                    markdown_text(domain, &mut out);
+                }
+            }
+            out.push_str(&tail);
+        } else {
+            markdown_text(link, &mut out);
+        }
+        let space = rest[end..].len() - rest[end..].trim_start().len();
+        out.push_str(&rest[end..end + space]);
+        rest = &rest[end + space..];
+    }
+    out
+}
+
+/// Escapes the Markdown punctuation in plain cell text (see `markdown_cell`).
+fn markdown_text(s: &str, out: &mut String) {
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' | '|' | '`' | '*' | '_' | '[' | ']' | '~' | '&' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '!' if chars.peek() == Some(&'[') => out.push_str("\\!"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '#' if out.is_empty() => out.push_str("\\#"),
+            _ => out.push(c),
+        }
+    }
+}
+
+/// Whether `<name@domain>` is an e-mail link in CommonMark: parts of letters, digits and `-`
+/// between dots, each 1 to 63 long and not starting or ending with `-`. The name part that
+/// `is_autolink` accepts always fits.
+fn angle_email_domain(domain: &str) -> bool {
+    domain.split('.').all(|p| {
+        (1..=63).contains(&p.len())
+            && !p.starts_with('-')
+            && !p.ends_with('-')
+            && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
+}
+
+/// Whether a Markdown viewer turns this word into a link by itself: a web address starting
+/// with `http://`, `https://` or `www.`, or an e-mail address such as `a_b@example.com`.
+fn is_autolink(word: &str) -> bool {
+    let lower = word.to_ascii_lowercase();
+    let web = ["http://", "https://", "www."]
+        .iter()
+        // The scheme may be in any case, but only a lowercase `www.` is a link.
+        .find(|p| {
+            if **p == "www." {
+                word.starts_with("www.")
+            } else {
+                lower.starts_with(**p)
+            }
+        })
+        .map(|p| (&word[p.len()..], *p == "www."));
+    if let Some((after, www)) = web {
+        // The host must be a domain Markdown accepts: parts of letters, digits, `-` and `_`
+        // between dots, with no `_` in the last two parts.
+        let host_len = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+            .unwrap_or(after.len());
+        let host = if www { &word[..4 + host_len] } else { &after[..host_len] };
+        let host = host.trim_end_matches('.');
+        let parts: Vec<&str> = host.split('.').collect();
+        return parts.iter().all(|p| !p.is_empty())
+            && (!www || parts.len() > 1)
+            && parts.iter().rev().take(2).all(|p| !p.contains('_'));
+    }
+    let Some((name, domain)) = word.split_once('@') else {
+        return false;
+    };
+    let domain = domain.trim_end_matches(['.', ',', ':', '!', '?']);
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-' | '_'))
+        && domain.contains('.')
+        && domain
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
 }
 
 /// A cell as a spreadsheet should show it: text that Excel or LibreOffice would run as a formula
@@ -686,14 +831,48 @@ fn pin_label(p: &Project, page_id: &str, item: &str, pin: &str) -> String {
 /// The net each pin belongs to, with its potential name (or a generated one).
 fn net_names(i: &Inputs) -> (Vec<connectivity::Net>, BTreeMap<PinRef, String>) {
     let nets = connectivity::nets_linked(i.project, |id| i.symbols.get(id).map(|s| s.role));
+    let auto = auto_net_names(i, &nets);
     let mut by_pin = BTreeMap::new();
-    for (n, net) in nets.iter().enumerate() {
-        let name = net.names.first().cloned().unwrap_or_else(|| format!("N{}", n + 1));
+    for (net, auto) in nets.iter().zip(auto) {
+        let name = net.names.first().cloned().unwrap_or(auto);
         for pin in &net.pins {
             by_pin.insert(pin.clone(), name.clone());
         }
     }
     (nets, by_pin)
+}
+
+/// The generated name of each net (`N1`, `N2`, ...), in the order of `nets`. The numbers are
+/// those the project has without its overview pages (`Page::overview`): an overview draws the
+/// schematic's connections again, so adding one does not change the names on schematic pages.
+/// Nets drawn only on overview pages are numbered after all the others.
+fn auto_net_names(i: &Inputs, nets: &[connectivity::Net]) -> Vec<String> {
+    if !i.project.pages.iter().any(|pg| pg.overview) {
+        return (1..=nets.len()).map(|n| format!("N{n}")).collect();
+    }
+    let mut schematic = i.project.clone();
+    schematic.pages.retain(|pg| !pg.overview);
+    let base = connectivity::nets_linked(&schematic, |id| i.symbols.get(id).map(|s| s.role));
+    let mut by_pin: BTreeMap<&PinRef, usize> = BTreeMap::new();
+    for (n, net) in base.iter().enumerate() {
+        for pin in &net.pins {
+            by_pin.insert(pin, n + 1);
+        }
+    }
+    let mut next = base.len();
+    nets.iter()
+        .map(|net| {
+            let n = net
+                .pins
+                .iter()
+                .find_map(|pin| by_pin.get(pin).copied())
+                .unwrap_or_else(|| {
+                    next += 1;
+                    next
+                });
+            format!("N{n}")
+        })
+        .collect()
 }
 
 /// Wire list: every drawn wire with both ends, then its cross-section, colour and type. A free
@@ -824,13 +1003,14 @@ pub fn cable_list(i: &Inputs<'_>) -> Table {
 /// Net list: each electrically connected group of pins, across pages.
 pub fn net_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new("Net list", &["Net", "Pins", "Connections"]);
-    let (nets, _) = net_names(i);
+    let nets = connectivity::nets_linked(i.project, |id| i.symbols.get(id).map(|s| s.role));
+    let auto = auto_net_names(i, &nets);
     let mut rows: Vec<(String, Vec<String>)> = nets
         .iter()
-        .enumerate()
-        .map(|(n, net)| {
+        .zip(auto)
+        .map(|(net, auto)| {
             let name = if net.names.is_empty() {
-                format!("N{}", n + 1)
+                auto
             } else {
                 net.names.join(" / ")
             };

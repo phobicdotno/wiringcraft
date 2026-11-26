@@ -505,24 +505,87 @@ fn wires_on_an_overview_page_are_not_listed_twice() {
             core: "1".into(),
         });
     }
-    let counts = |p: &Project| {
+    let lists = |p: &Project| {
         let i = Inputs {
             project: p,
             symbols: &s,
             parts: &parts,
         };
-        (wire_list(&i).rows.len(), cable_list(&i).rows.len())
+        (wire_list(&i).rows, cable_list(&i).rows)
     };
-    let before = counts(&p);
+    let schematic = p.pages[0].number.clone();
+    let (wires, cables) = lists(&p);
+    // The baseline lists the schematic's cable core, so the checks below compare real rows.
+    assert_eq!(cables.len(), 1);
+    assert_eq!(cables[0][0], "-W1");
+    assert_eq!(cables[0][3], "1");
+    assert_eq!(cables[0][4], schematic);
     // The same schematic again, drawn on a line diagram.
     let mut overview = p.pages[0].clone();
     overview.id = "p9".into();
     overview.number = "9".into();
     overview.overview = true;
     p.pages.push(overview);
-    assert_eq!(counts(&p), before, "an overview page adds no rows");
+    let (same_wires, same_cables) = lists(&p);
+    assert_eq!(same_wires.len(), wires.len(), "an overview page adds no wire rows");
+    assert_eq!(same_cables, cables, "an overview page adds no cable rows");
     p.pages.last_mut().unwrap().overview = false;
-    assert!(counts(&p).0 > before.0, "a normal page does");
+    let (more_wires, more_cables) = lists(&p);
+    assert!(more_wires.len() > wires.len(), "a normal page does");
+    assert_eq!(more_cables.len(), cables.len() + 1, "one more core row");
+    assert_eq!(more_cables[0], cables[0]);
+    assert_eq!(more_cables[1][..5], ["", "", "", "1", "9"], "the copied page's core");
+}
+
+#[test]
+fn an_overview_page_keeps_the_net_names_of_schematic_pages() {
+    let (mut p, s, parts) = fixture();
+    let rows = |p: &Project| {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        wire_list(&i).rows
+    };
+    // The generated name of the net list row with these connections.
+    let net_name = |p: &Project, connections: &str| {
+        let t = net_list(&Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        });
+        let Some(row) = t.rows.iter().find(|r| r[2] == connections) else {
+            unreachable!("no net with {connections}")
+        };
+        row[0].clone()
+    };
+    let schematic_net = "-X1.1:1, =A+C1-K1:14";
+    let before = rows(&p);
+    let before_name = net_name(&p, schematic_net);
+    assert!(before_name.starts_with('N'), "{before_name} is a generated name");
+    assert!(
+        before.iter().any(|r| r[2].starts_with('N')),
+        "the fixture has a net with a generated name"
+    );
+    // The same schematic again, drawn on a line diagram placed before it.
+    let mut overview = p.pages[0].clone();
+    overview.id = "p0".into();
+    overview.number = "0".into();
+    overview.overview = true;
+    // Untagged, so the net list tells the overview's own nets from the schematic's by their pins.
+    for sym in &mut overview.symbols {
+        sym.tag = None;
+    }
+    p.pages.insert(0, overview.clone());
+    assert_eq!(rows(&p), before, "an overview page before the schematic");
+    assert_eq!(net_name(&p, schematic_net), before_name, "net list, overview before");
+    p.pages.remove(0);
+    overview.id = "p9".into();
+    overview.number = "9".into();
+    p.pages.push(overview);
+    assert_eq!(rows(&p), before, "an overview page after the schematic");
+    assert_eq!(net_name(&p, schematic_net), before_name, "net list, overview after");
 }
 
 #[test]
@@ -607,6 +670,22 @@ fn a_coil_drawn_only_on_an_overview_page_still_exists_for_its_contacts() {
     assert!(!check(&i).iter().any(|f| f.message.contains("contact -K9 has no coil")));
 }
 
+/// The `FileName` attribute of the `CAEXFile` element in `xml`, as an XML reader sees it.
+fn caex_file_name(xml: &str) -> Option<String> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    loop {
+        match reader.read_event().ok()? {
+            Event::Start(e) | Event::Empty(e) if e.name().as_ref() == b"CAEXFile" => {
+                let attr = e.try_get_attribute("FileName").ok()??;
+                return Some(attr.unescape_value().ok()?.into_owned());
+            }
+            Event::Eof => return None,
+            _ => {}
+        }
+    }
+}
+
 #[test]
 fn automationml_has_devices_pins_and_one_link_per_join() {
     let (mut p, mut s, parts) = fixture();
@@ -628,7 +707,7 @@ fn automationml_has_devices_pins_and_one_link_per_join() {
         symbols: &s,
         parts: &parts,
     };
-    let (xml, counts) = automationml(&i, "2026-11-16T22:00:00Z");
+    let (xml, counts) = automationml(&i, "2026-11-16T22:00:00Z", "plant-v2.aml");
     // K1, -P1, -X1.1, -X1.2, -X2; not the interruption point.
     assert_eq!(counts.devices, 5, "{xml}");
     assert!(!xml.contains("-L1"));
@@ -639,12 +718,31 @@ fn automationml_has_devices_pins_and_one_link_per_join() {
     assert!(xml.contains("<Value>R-24, DC</Value>") && xml.contains("<Value>Acme</Value>"));
     assert!(xml.contains("Name=\"Coil &lt;voltage&gt;\"") && xml.contains("<Value>24 V &amp; more</Value>"));
     assert!(xml.contains("LastWritingDateTime=\"2026-11-16T22:00:00Z\""));
+    // FileName names the file written, not the project.
+    assert!(xml.contains("<CAEXFile FileName=\"plant-v2.aml\""), "{xml}");
+    // Without a file name, the project name stands in.
+    let fallback = automationml(&i, "2026-11-16T22:00:00Z", "").0;
+    assert!(fallback.contains("<CAEXFile FileName=\"Test.aml\""), "{fallback}");
+    // A file name is kept exactly as given, spaces included.
+    let spaced = automationml(&i, "2026-11-16T22:00:00Z", " plant-v2.aml").0;
+    assert!(spaced.contains("<CAEXFile FileName=\" plant-v2.aml\""), "{spaced}");
+    // Tab, line feed and carriage return survive attribute normalisation as character
+    // references; U+0085 is allowed in XML 1.0 and kept, U+FFFE is not and is dropped.
+    let odd = automationml(&i, "2026-11-16T22:00:00Z", "a\tb\nc\rd\u{85}e\u{FFFE}f.aml").0;
+    assert!(
+        odd.contains("<CAEXFile FileName=\"a&#9;b&#10;c&#13;d\u{85}ef.aml\""),
+        "{odd}"
+    );
+    // An XML reader gets the file name back exactly, tab, line feed and carriage return included.
+    let name = "a\tb\nc\rd.aml";
+    let xml_name = automationml(&i, "2026-11-16T22:00:00Z", name).0;
+    assert_eq!(caex_file_name(&xml_name).as_deref(), Some(name), "{xml_name}");
     // The coil and the contact are one device with all four connection points.
     let k1 = xml.split("<InternalElement Name=\"=A+C1-K1\"").nth(1).unwrap();
     let k1 = k1.split("</InternalElement>").next().unwrap();
     assert_eq!(k1.matches("<ExternalInterface").count(), 4);
     // The same project gives the same file.
-    assert_eq!(automationml(&i, "2026-11-16T22:00:00Z").0, xml);
+    assert_eq!(automationml(&i, "2026-11-16T22:00:00Z", "plant-v2.aml").0, xml);
 }
 
 #[test]
@@ -3042,6 +3140,30 @@ fn plc_card_overview_links_by_page_id_and_warns_on_points_and_shared_bytes() {
 }
 
 #[test]
+fn project_check_flags_a_wire_on_one_pin_at_both_ends() {
+    let (mut p, s, parts) = fixture();
+    p.pages[0]
+        .wires
+        .push(wire("w5", pin("s2", "13"), pin("s2", "13"), Some("7"), None));
+    p.pages[0]
+        .wires
+        .push(wire("w6", pin("s2", "13"), pin("s2", "14"), Some("8"), None));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found: Vec<_> = check(&i)
+        .into_iter()
+        .filter(|f| f.message.contains("starts and ends on"))
+        .collect();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].severity, Severity::Warning);
+    assert_eq!(found[0].message, "wire 7 starts and ends on =A+C1-K1:13");
+    assert_eq!(found[0].item.as_deref(), Some("w5"));
+}
+
+#[test]
 fn check_names_a_connection_with_two_wire_numbers_and_a_number_on_two_connections() {
     let (mut p, s, parts) = fixture();
     let found = |p: &Project| {
@@ -3361,5 +3483,104 @@ fn markdown_cells_with_a_backslash_keep_their_columns() {
     assert_eq!(
         t.to_markdown(),
         "## Paths\n\n| Path | Text | Next |\n|---|---|---|\n| C:\\\\ | a\\\\\\|b | next |\n"
+    );
+}
+
+#[test]
+fn markdown_cells_show_markdown_characters_as_typed() {
+    let mut t = Table::new("Notes", &["*Tag*", "Text"]);
+    t.rows
+        .push(vec!["*a*".into(), "b_c_d `x` <tag> [l](u) ~s~ & ![i](p)".into()]);
+    t.rows.push(vec!["#1".into(), "-K1 2.5 mm² plain".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Notes\n\n| \\*Tag\\* | Text |\n|---|---|\n\
+         | \\*a\\* | b\\_c\\_d \\`x\\` &lt;tag&gt; \\[l\\](u) \\~s\\~ \\& \\!\\[i\\](p) |\n\
+         | \\#1 | -K1 2.5 mm² plain |\n"
+    );
+}
+
+#[test]
+fn markdown_cells_keep_links_as_typed() {
+    let mut t = Table::new("Links", &["Text"]);
+    t.rows.push(vec!["see https://example.com/a_b *x*".into()]);
+    t.rows.push(vec!["(www.x.no/a_b|c), mail a_b@x.no or a_b@c".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Links\n\n| Text |\n|---|\n\
+         | see https://example.com/a_b \\*x\\* |\n\
+         | (www\\.x.no/a\\_b\\|c), mail a_b@x.no or a\\_b@c |\n"
+    );
+}
+
+#[test]
+fn markdown_cells_escape_words_that_only_look_like_links() {
+    let mut t = Table::new("Links", &["Text"]);
+    t.rows.push(vec!["https://*spare*/path".into()]);
+    t.rows.push(vec!["https://example.com/&copy;".into()]);
+    t.rows.push(vec!["https://example.com/a_b. www.a_b.no".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Links\n\n| Text |\n|---|\n\
+         | https://\\*spare\\*/path |\n\
+         | https\\://example.com/\\&copy; |\n\
+         | https://example.com/a_b. www.a\\_b.no |\n"
+    );
+}
+
+#[test]
+fn markdown_cells_keep_backslashes_in_links_as_typed() {
+    let mut t = Table::new("Links", &["Text"]);
+    t.rows.push(vec!["https://example.com/a\\b".into()]);
+    t.rows
+        .push(vec!["https://example.com/a\\|b https://example.com/c\\".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Links\n\n| Text |\n|---|\n\
+         | https://example.com/a\\b |\n\
+         | https\\://example.com/a\\\\\\|b https\\://example.com/c\\\\ |\n"
+    );
+}
+
+#[test]
+fn markdown_cells_escape_an_uppercase_www_word() {
+    let mut t = Table::new("Links", &["Text"]);
+    t.rows
+        .push(vec!["WWW.example.com/*spare*/path HTTPS://example.com/a_b".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Links\n\n| Text |\n|---|\n\
+         | WWW.example.com/\\*spare\\*/path HTTPS://example.com/a_b |\n"
+    );
+}
+
+#[test]
+fn markdown_links_with_text_that_needs_a_backslash_are_written_as_text() {
+    let mut t = Table::new("Links", &["Text"]);
+    t.rows
+        .push(vec!["https://example.com/a_b, https://example.com/a_b*".into()]);
+    t.rows
+        .push(vec!["a_b@x.no&amp; www.x.no/a_b&copy; www.x.no/a_b.".into()]);
+    t.rows
+        .push(vec!["https://example.com/a|b https://example.com/a\\".into()]);
+    t.rows.push(vec!["HTTP://example.com/a\\|b".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Links\n\n| Text |\n|---|\n\
+         | https://example.com/a_b, https\\://example.com/a\\_b\\* |\n\
+         | <a_b@x.no>\\&amp; www\\.x.no/a\\_b\\&copy; www.x.no/a_b. |\n\
+         | https\\://example.com/a\\|b https\\://example.com/a\\\\ |\n\
+         | HTTP\\://example.com/a\\\\\\|b |\n"
+    );
+}
+
+#[test]
+fn markdown_email_with_text_after_it_is_bracketed_only_when_commonmark_takes_it() {
+    let mut t = Table::new("Mail", &["Text"]);
+    t.rows.push(vec!["a@x_y.no* a_b@x.no&amp; a@-x.no_ a@x.no".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Mail\n\n| Text |\n|---|\n\
+         | a\\@x\\_y.no\\* <a_b@x.no>\\&amp; a\\@-x.no\\_ a@x.no |\n"
     );
 }

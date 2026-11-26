@@ -34,6 +34,28 @@ impl M {
         let [a, b, ..] = self.0;
         (a * a + b * b).sqrt()
     }
+    /// Whether a circle stays a circle: x and y are scaled alike and stay at right angles
+    /// (turns, mirrors and moves are fine; a `scale(2, 1)` or a skew is not).
+    fn keeps_circles(&self) -> bool {
+        let [a, b, c, d, ..] = self.0;
+        let (x, y) = (a * a + b * b, c * c + d * d);
+        // Relative to the transform's own scale, so a tiny `scale(0.00001 0.00002)` still counts
+        // as stretched. A transform that shrinks to nothing leaves a dot either way.
+        let tol = 1e-9 * x.max(y);
+        (x - y).abs() <= tol && (a * c + b * d).abs() <= tol
+    }
+    /// Whether the transform flattens everything onto a line or a point: it can't be undone,
+    /// and SVG doesn't draw an element with it. Only a determinant of exactly 0 counts; a very
+    /// thin but invertible transform (`scale(1 1e-10)`, `matrix(1 0 1 1e-13 0 0)`) still
+    /// draws its thin outline.
+    fn is_singular(&self) -> bool {
+        let [a, b, c, d, ..] = self.0;
+        // a·d − b·c without the rounding of the subtraction (Kahan's way, with fused
+        // multiply-adds), so nearly parallel but invertible axes don't come out as exactly 0.
+        let w = b * c;
+        let err = (-b).mul_add(c, w);
+        a.mul_add(d, -w) + err == 0.0
+    }
 }
 
 fn numbers(s: &str) -> Vec<f64> {
@@ -83,6 +105,8 @@ fn parse_transform(s: &str) -> M {
                     .mul(&M([1.0, 0.0, 0.0, 1.0, -cx, -cy]))
             }
             "matrix" if v.len() == 6 => M([v[0], v[1], v[2], v[3], v[4], v[5]]),
+            "skewX" => M([1.0, 0.0, g(0, 0.0).to_radians().tan(), 1.0, 0.0, 0.0]),
+            "skewY" => M([1.0, g(0, 0.0).to_radians().tan(), 0.0, 1.0, 0.0, 0.0]),
             _ => M::ID,
         };
         m = m.mul(&t);
@@ -96,6 +120,71 @@ fn attr(e: &BytesStart, name: &str) -> Option<String> {
         .find(|a| a.key.as_ref() == name.as_bytes())
         .and_then(|a| a.unescape_value().ok())
         .map(|v| v.into_owned())
+}
+
+/// A presentation value such as `fill`: a property of the same name in `style` wins over the
+/// attribute (`style="fill:#000"` over `fill="none"`). Within `style`, an `!important`
+/// declaration wins over a normal one, and the last one wins between equals.
+fn presentation(e: &BytesStart, name: &str) -> Option<String> {
+    attr(e, "style")
+        .and_then(|st| {
+            let decls: Vec<String> = st
+                .split(';')
+                .filter_map(|decl| {
+                    let (k, v) = decl.split_once(':')?;
+                    k.trim().eq_ignore_ascii_case(name).then(|| v.trim().to_owned())
+                })
+                .collect();
+            decls
+                .iter()
+                .rev()
+                .find(|v| split_important(v).1)
+                .or_else(|| decls.last())
+                .cloned()
+        })
+        .or_else(|| attr(e, name))
+}
+
+/// Splits a trailing `!important` (any case, with or without spaces around the `!`) off a
+/// declaration value: the trimmed value, and whether it was important.
+fn split_important(v: &str) -> (&str, bool) {
+    let v = v.trim();
+    let word = "important";
+    let Some(i) = v.len().checked_sub(word.len()) else {
+        return (v, false);
+    };
+    if !v.is_char_boundary(i) || !v[i..].eq_ignore_ascii_case(word) {
+        return (v, false);
+    }
+    match v[..i].trim_end().strip_suffix('!') {
+        Some(rest) => (rest.trim_end(), true),
+        None => (v, false),
+    }
+}
+
+/// Whether a fill paints the shape: not `none`, `transparent` or white (`#fff`, `white`,
+/// `rgb(255,255,255)`, `rgb(100%,100%,100%)`). No fill, or `inherit`, takes the parent's answer.
+/// A trailing `!important` is ignored.
+fn paints(fill: Option<&str>, parent: bool) -> bool {
+    let Some(f) = fill else { return parent };
+    let f = split_important(f).0.to_ascii_lowercase();
+    match f.as_str() {
+        "inherit" => parent,
+        "" | "none" | "transparent" | "white" | "#fff" | "#ffffff" => false,
+        _ => !is_white_rgb(&f),
+    }
+}
+
+/// `rgb(255,255,255)` or `rgb(100%,100%,100%)`, any spacing, already lower case.
+fn is_white_rgb(f: &str) -> bool {
+    let Some(inner) = f.strip_prefix("rgb").map(str::trim_start) else {
+        return false;
+    };
+    let Some(inner) = inner.strip_prefix('(').and_then(|r| r.strip_suffix(')')) else {
+        return false;
+    };
+    let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+    parts.len() == 3 && parts.iter().all(|p| matches!(*p, "255" | "100%"))
 }
 
 fn num(e: &BytesStart, name: &str) -> f64 {
@@ -362,6 +451,8 @@ fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
 
 /// Straight segments per Bezier curve.
 const CURVE_STEPS: u32 = 8;
+/// Points round an ellipse drawn as a closed polyline.
+const ELLIPSE_STEPS: usize = 48;
 
 /// An elliptical arc as SVG path data gives it: from its start to its end point, with its radii,
 /// the ellipse's rotation in degrees and the large-arc and sweep flags.
@@ -437,6 +528,9 @@ impl Arc {
 pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
     let mut reader = Reader::from_str(text);
     let mut stack: Vec<M> = vec![M::ID];
+    // Whether each open element's fill paints, passed to its children; kept in step with `stack`.
+    // A bool, not the fill text, so deep nesting under a long fill value keeps no copies of it.
+    let mut fills: Vec<bool> = vec![false];
     let mut shapes = Vec::new();
     let mut pins: Vec<(Option<String>, Point)> = Vec::new();
     let mut pending_text: Option<(Point, f64, Align)> = None;
@@ -454,6 +548,7 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                 }
                 if stack.len() > 1 {
                     stack.pop();
+                    fills.pop();
                 }
                 (None, false)
             }
@@ -491,6 +586,10 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
         let mut m = attr(&e, "transform")
             .map(|t| parent.mul(&parse_transform(&t)))
             .unwrap_or(parent);
+        let filled = paints(
+            presentation(&e, "fill").as_deref(),
+            fills.last().copied().unwrap_or(false),
+        );
         let tag = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
         if tag == "svg" && !seen_root {
             seen_root = true;
@@ -523,43 +622,80 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                 Some(Shape::Polyline {
                     points: vec![m.p(x, y), m.p(x + w, y), m.p(x + w, y + h), m.p(x, y + h)],
                     closed: true,
-                    filled: false,
+                    filled,
                 })
             }
             "circle" | "ellipse" => {
-                let r = if tag == "circle" {
-                    num(&e, "r")
+                let (rx, ry) = if tag == "circle" {
+                    let r = num(&e, "r");
+                    (r, r)
                 } else {
-                    (num(&e, "rx") + num(&e, "ry")) / 2.0
+                    // A radius left out or written `auto` takes the other's value (SVG 2).
+                    let radius = |name: &str| {
+                        attr(&e, name)
+                            .filter(|v| !v.trim().eq_ignore_ascii_case("auto"))
+                            .map(|_| num(&e, name))
+                    };
+                    match (radius("rx"), radius("ry")) {
+                        (Some(rx), Some(ry)) => (rx, ry),
+                        (Some(r), None) | (None, Some(r)) => (r, r),
+                        (None, None) => (0.0, 0.0),
+                    }
                 };
-                let filled = attr(&e, "fill").is_some_and(|f| {
-                    f != "none" && f != "transparent" && f != "white" && f != "#fff" && f != "#ffffff"
-                });
-                Some(Shape::Circle {
-                    center: m.p(num(&e, "cx"), num(&e, "cy")),
-                    radius: r * sc,
-                    filled,
-                })
+                let (cx, cy) = (num(&e, "cx"), num(&e, "cy"));
+                if m.is_singular() && pin_name.is_none() && !(rx == ry && m.keeps_circles()) {
+                    // Squashed flat: SVG draws nothing, and an outline would only stretch
+                    // the symbol's bounds. (`scale(0)` still keeps the radius-0 dot it had,
+                    // and a pin keeps its place.)
+                    None
+                } else if rx == ry && m.keeps_circles() {
+                    Some(Shape::Circle {
+                        center: m.p(cx, cy),
+                        radius: rx * sc,
+                        filled,
+                    })
+                } else {
+                    // An ellipse, or a circle the transform stretches: points round it, placed
+                    // through the transform.
+                    let points = (0..ELLIPSE_STEPS)
+                        .map(|i| {
+                            let a = std::f64::consts::TAU * i as f64 / ELLIPSE_STEPS as f64;
+                            m.p(cx + rx * a.cos(), cy + ry * a.sin())
+                        })
+                        .collect();
+                    Some(Shape::Polyline {
+                        points,
+                        closed: true,
+                        filled,
+                    })
+                }
             }
             "polyline" | "polygon" => {
                 let v = numbers(&attr(&e, "points").unwrap_or_default());
                 let pts: Vec<Point> = v.as_chunks::<2>().0.iter().map(|p| m.p(p[0], p[1])).collect();
+                // A filled polyline is closed, as SVG fills it; two points stay a plain line.
+                let filled = filled && pts.len() >= 3;
                 (pts.len() >= 2).then(|| Shape::Polyline {
                     points: pts,
-                    closed: tag == "polygon",
-                    filled: false,
+                    closed: tag == "polygon" || filled,
+                    filled,
                 })
             }
             "path" => {
                 let parts = path(&attr(&e, "d").unwrap_or_default(), &m);
+                // Shapes have no holes or fill rule, so a `d` with several closed sub-paths
+                // (a ring, a letter O) would have its holes painted over. Such paths stay
+                // outlines; a single closed sub-path is filled.
+                let filled = filled && parts.iter().filter(|(_, closed)| *closed).count() <= 1;
                 let mut first = None;
                 for (pts, closed) in parts {
                     first.get_or_insert(pts[0]);
                     if pin_name.is_none() {
+                        // Only a closed sub-path is filled; an open one stays a line.
                         shapes.push(Shape::Polyline {
                             points: pts,
                             closed,
-                            filled: false,
+                            filled: filled && closed,
                         });
                     }
                 }
@@ -602,6 +738,7 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
         }
         if !empty {
             stack.push(m);
+            fills.push(filled);
         }
     }
     if !seen_root {
@@ -704,7 +841,7 @@ mod tests {
     fn ellipses_and_filled_circles() -> Result<()> {
         let svg = r#"<svg xmlns="http://www.w3.org/2000/svg">
             <circle id="pin:1" cx="0" cy="0" r="0.5"/>
-            <ellipse cx="10" cy="0" rx="2" ry="4"/>
+            <ellipse cx="10" cy="0" rx="3" ry="3"/>
             <circle cx="20" cy="0" r="1" fill="black"/>
             <circle cx="30" cy="0" r="1" fill="none"/>
             <circle cx="40" cy="0" r="1" fill="white"/>
@@ -724,7 +861,7 @@ mod tests {
         assert_eq!(
             circles,
             vec![
-                (10.0, 3.0, false), // ellipse radius is the mean of rx and ry
+                (10.0, 3.0, false), // an ellipse with equal radii is a circle
                 (20.0, 1.0, true),
                 (30.0, 1.0, false),
                 (40.0, 1.0, false),
@@ -733,6 +870,288 @@ mod tests {
                 (70.0, 1.0, true),
             ]
         );
+        Ok(())
+    }
+
+    /// The bounds of a closed polyline, or `None` for any other shape.
+    fn outline_size(g: &Shape) -> Option<(f64, f64, bool)> {
+        let Shape::Polyline {
+            points,
+            closed: true,
+            filled,
+        } = g
+        else {
+            return None;
+        };
+        let (xs, ys): (Vec<f64>, Vec<f64>) = points.iter().map(|p| (p.x, p.y)).unzip();
+        let span = |v: &[f64]| v.iter().copied().fold(f64::MIN, f64::max) - v.iter().copied().fold(f64::MAX, f64::min);
+        Some((span(&xs), span(&ys), *filled))
+    }
+
+    #[test]
+    fn flat_ellipses_and_stretched_circles_keep_their_shape() -> Result<()> {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg">
+            <circle id="pin:1" cx="0" cy="0" r="0.5"/>
+            <ellipse cx="10" cy="0" rx="6" ry="2" fill="black"/>
+            <circle cx="30" cy="0" r="2" transform="scale(2 1)"/>
+            <ellipse cx="50" cy="0" rx="4"/>
+            <circle cx="0" cy="20" r="2" transform="rotate(30) scale(-3 3)"/>
+            <ellipse cx="0" cy="40" rx="auto" ry="5"/>
+            <ellipse cx="0" cy="60" rx="1.5" ry=" AUTO "/>
+            <circle cx="0" cy="0" r="1000000" transform="translate(0 80) scale(0.00001 0.00002)"/>
+        </svg>"#;
+        let s = symbol(svg, "svg.flat", "Flat")?;
+        let Some(flat) = s.graphics.iter().find_map(outline_size) else {
+            unreachable!("no outline in {:?}", s.graphics);
+        };
+        let outlines: Vec<(f64, f64, bool)> = s.graphics.iter().filter_map(outline_size).collect();
+        assert_eq!(outlines.len(), 3, "{:?}", s.graphics);
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        assert!(
+            close(flat.0, 12.0) && close(flat.1, 4.0) && flat.2,
+            "rx 6 ry 2 is 12 x 4, filled: {flat:?}"
+        );
+        let wide = outlines[1];
+        assert!(
+            close(wide.0, 8.0) && close(wide.1, 4.0) && !wide.2,
+            "scale(2 1) stretches: {wide:?}"
+        );
+        let tiny = outlines[2];
+        let near_eq = |a: f64, b: f64| (a - b).abs() < 1e-6;
+        assert!(
+            near_eq(tiny.0, 20.0) && near_eq(tiny.1, 40.0),
+            "a tiny stretch still stretches: {tiny:?}"
+        );
+        let circles: Vec<f64> = s
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Circle { radius, .. } => Some(*radius),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(circles.len(), 4, "{:?}", s.graphics);
+        assert!(close(circles[0], 4.0), "an ellipse with only rx is a circle");
+        assert!(close(circles[1], 6.0), "a turn and a mirror keep a circle round");
+        assert!(close(circles[2], 5.0), "rx=\"auto\" takes ry");
+        assert!(close(circles[3], 1.5), "ry=\"auto\" takes rx");
+        Ok(())
+    }
+
+    #[test]
+    fn circles_squashed_flat_are_left_out() -> Result<()> {
+        let plain = r#"<svg xmlns="http://www.w3.org/2000/svg">
+            <circle id="pin:1" cx="0" cy="0" r="0.5"/>
+            <line x1="0" y1="0" x2="4" y2="0"/>
+        </svg>"#;
+        let want = symbol(plain, "svg.flat", "Flat")?;
+        for t in ["scale(0 1)", "scale(1 0)", "matrix(1 2 2 4 0 0)"] {
+            let svg = format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg">
+                <circle id="pin:1" cx="0" cy="0" r="0.5"/>
+                <line x1="0" y1="0" x2="4" y2="0"/>
+                <circle cx="0" cy="20" r="2" transform="{t}"/>
+                <ellipse cx="0" cy="20" rx="2" ry="5" transform="{t}"/>
+            </svg>"#
+            );
+            let s = symbol(&svg, "svg.flat", "Flat")?;
+            assert_eq!(
+                format!("{s:?}"),
+                format!("{want:?}"),
+                "{t}: no outline, and the same bounds"
+            );
+        }
+        // A pin squashed flat still marks where the pin is.
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg">
+            <circle id="pin:1" cx="0" cy="0" r="0.5" transform="translate(3 4) scale(0 1)"/>
+            <line x1="0" y1="0" x2="4" y2="0"/>
+        </svg>"#;
+        let s = symbol(svg, "svg.flatpin", "Flat pin")?;
+        assert_eq!(s.pins.len(), 1, "{:?}", s.pins);
+        // Very thin, or nearly parallel axes, but still invertible: drawn as a flat outline.
+        for t in [
+            "scale(1 1e-10)",
+            "matrix(1 0 1 1e-13 0 0)",
+            "matrix(1 1.0000000000000002 0.9999999999999998 1 0 0)",
+        ] {
+            let svg = format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg">
+                <circle id="pin:1" cx="0" cy="0" r="0.5"/>
+                <circle cx="0" cy="0" r="2" transform="translate(0 20) {t}"/>
+            </svg>"#
+            );
+            let s = symbol(&svg, "svg.thin", "Thin")?;
+            let Some(thin) = s.graphics.iter().find_map(outline_size) else {
+                unreachable!("{t} is not singular: {:?}", s.graphics);
+            };
+            assert!(thin.0.max(thin.1) >= 4.0 - 1e-9, "{t}: {thin:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn skewed_circles_come_in_as_outlines() -> Result<()> {
+        // skewX(45) moves each point right by its height: the same as matrix(1 0 1 1 0 0).
+        // matrix(1 0 0.6 0.8 0 0) keeps both axes 1 long but no longer at right angles.
+        for (skew, [a, b, c, d]) in [
+            ("skewX(45)", [1.0, 0.0, 1.0, 1.0]),
+            ("matrix(1 0 1 1 0 0)", [1.0, 0.0, 1.0, 1.0]),
+            ("skewY(45)", [1.0, 1.0, 0.0, 1.0]),
+            ("matrix(1 0 0.6 0.8 0 0)", [1.0, 0.0, 0.6, 0.8]),
+        ] {
+            let svg = format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg">
+                <circle id="pin:1" cx="0" cy="0" r="0.5"/>
+                <circle cx="0" cy="0" r="2" transform="{skew}"/>
+            </svg>"#
+            );
+            let s = symbol(&svg, "svg.skew", "Skew")?;
+            let Some(Shape::Polyline {
+                points, closed: true, ..
+            }) = s.graphics.first()
+            else {
+                unreachable!("{skew}: {:?}", s.graphics);
+            };
+            // Every point of the circle of radius 2 round (0, 0), moved by the skew: undoing
+            // the skew puts it back on the circle.
+            let det = a * d - b * c;
+            for p in points {
+                let q = Point::new((d * p.x - c * p.y) / det, (a * p.y - b * p.x) / det);
+                assert!(
+                    (q.x.hypot(q.y) - 2.0).abs() < 1e-9,
+                    "{skew}: {p:?} not on the skewed circle"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fills_from_attribute_style_and_group() -> Result<()> {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg">
+            <circle id="pin:1" cx="0" cy="0" r="0.5"/>
+            <polygon points="0 0 4 0 2 3" fill="black"/>
+            <path style="fill:#000" d="M0 0 L4 0 L2 3 Z"/>
+            <rect x="0" y="0" width="4" height="2" fill="none"/>
+            <rect x="0" y="0" width="4" height="2" style="stroke:red; fill:none" fill="black"/>
+            <polygon points="0 0 4 0 2 3" fill="#FFFFFF"/>
+            <circle cx="10" cy="0" r="1" style="fill:black"/>
+            <polyline points="0,0 4,0 2,3" fill="red"/>
+            <polyline points="0,0 4,0" fill="red"/>
+            <path fill="black" d="M0 0 L4 0 L2 3"/>
+            <g style="fill:#000000"><rect x="0" y="0" width="1" height="1"/></g>
+            <g fill="black"><rect x="0" y="0" width="1" height="1" fill="none"/></g>
+            <rect x="0" y="0" width="1" height="1"/>
+        </svg>"##;
+        let s = symbol(svg, "svg.fill", "Fill")?;
+        let got: Vec<(bool, bool)> = s
+            .graphics
+            .iter()
+            .map(|g| match g {
+                Shape::Polyline { closed, filled, .. } => (*closed, *filled),
+                Shape::Circle { filled, .. } => (true, *filled),
+                _ => (false, false),
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (true, true),   // polygon fill="black"
+                (true, true),   // closed path, fill in style
+                (true, false),  // rect fill="none"
+                (true, false),  // style fill:none wins over fill="black"
+                (true, false),  // white polygon, any case
+                (true, true),   // circle, fill in style
+                (true, true),   // filled 3-point polyline is closed
+                (false, false), // 2-point polyline stays a line
+                (false, false), // open path stays a line
+                (true, true),   // fill from the parent group
+                (true, false),  // own fill="none" wins over the group
+                (true, false),  // no fill after the groups close
+            ]
+        );
+        Ok(())
+    }
+
+    /// `filled` of each imported shape, in order.
+    fn fills_of(svg: &str) -> Result<Vec<bool>> {
+        let s = symbol(svg, "svg.fill", "Fill")?;
+        Ok(s.graphics
+            .iter()
+            .map(|g| match g {
+                Shape::Polyline { filled, .. } | Shape::Circle { filled, .. } => *filled,
+                _ => false,
+            })
+            .collect())
+    }
+
+    #[test]
+    fn fill_ignores_important_and_reads_white_rgb() -> Result<()> {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg">
+            <rect width="1" height="1" style="fill:none!important" fill="black"/>
+            <rect width="1" height="1" style="fill: none !IMPORTANT"/>
+            <rect width="1" height="1" style="fill:#000 !important"/>
+            <rect width="1" height="1" fill="rgb(255,255,255)"/>
+            <rect width="1" height="1" fill="RGB( 255 , 255 , 255 )"/>
+            <rect width="1" height="1" style="fill:rgb(100%, 100%, 100%)"/>
+            <rect width="1" height="1" fill="rgb(255,0,0)"/>
+            <rect width="1" height="1" fill="rgb(0%,0%,0%)"/>
+            <rect width="1" height="1" style="fill:none!important;fill:black"/>
+            <rect width="1" height="1" style="fill:black !important;fill:none"/>
+            <rect width="1" height="1" style="fill:black;fill:none"/>
+            <rect width="1" height="1" style="fill:none;fill:black"/>
+            <rect width="1" height="1" style="fill:none ! important"/>
+            <rect width="1" height="1" style="fill:none ! IMPORTANT;fill:black"/>
+        </svg>"##;
+        assert_eq!(
+            fills_of(svg)?,
+            vec![
+                false, false, true, false, false, false, true, true, false, true, false, true, false, false,
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fill_inherit_takes_the_parent_fill() -> Result<()> {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg">
+            <g fill="none"><rect width="1" height="1" fill="inherit"/></g>
+            <g fill="black"><rect width="1" height="1" fill="inherit"/></g>
+            <g fill="none"><g fill="inherit"><rect width="1" height="1" fill="inherit"/></g></g>
+            <g fill="none"><rect width="1" height="1" fill="black"/></g>
+            <rect width="1" height="1" fill="inherit"/>
+        </svg>"##;
+        assert_eq!(fills_of(svg)?, vec![false, true, false, true, false]);
+        Ok(())
+    }
+
+    #[test]
+    fn long_fill_under_deep_nesting_is_not_copied_per_level() -> Result<()> {
+        // A 1 MB fill value with 5,000 nested `inherit` groups under it. Copying the fill
+        // text per level would need about 5 GB; the per-level state is a bool, so this stays
+        // small and quick.
+        let long = format!("url(#{})", "a".repeat(1 << 20));
+        let depth = 5_000;
+        let mut svg = format!(r#"<svg xmlns="http://www.w3.org/2000/svg"><g fill="{long}">"#);
+        svg.push_str(&r#"<g fill="inherit">"#.repeat(depth));
+        svg.push_str(r#"<rect width="1" height="1" fill="inherit"/>"#);
+        svg.push_str(r#"<rect width="1" height="1" fill="none"/>"#);
+        svg.push_str(&"</g>".repeat(depth));
+        svg.push_str("</g></svg>");
+        // A `url(...)` paint fills; `inherit` carries it all the way down.
+        assert_eq!(fills_of(&svg)?, vec![true, false]);
+        Ok(())
+    }
+
+    #[test]
+    fn path_with_several_closed_subpaths_stays_outlines() -> Result<()> {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg">
+            <path fill="black" d="M0 0H10V10H0Z M3 3V7H7V3Z"/>
+            <path fill="black" d="M0 0H10V10H0Z M20 0 L30 0"/>
+        </svg>"##;
+        // The square with a hole: both outlines, unfilled. One closed sub-path plus an open
+        // line: the closed one is filled.
+        assert_eq!(fills_of(svg)?, vec![false, false, true, false]);
         Ok(())
     }
 

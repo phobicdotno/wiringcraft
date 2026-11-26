@@ -537,7 +537,7 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "run_check",
-            "Check the project: devices drawn twice, contacts without a coil, shorted potentials, open pins, wires ending in the air, a connection with two wire numbers or a wire number on two connections, devices without a part, then the check rules of the project's library sources (less the ones the project turns off) and the project's own check rules (see the rules tool).",
+            "Check the project: revision clouds whose revision the project does not list, revision letters the PDF cannot print, symbols missing from the project's library copy and wires on pins that do not exist, devices drawn twice, more contacts than a device's parts have, contacts without a coil, interruption points without a partner, open pins, wires ending in the air, wires with both ends on one pin, jumpers naming a terminal drawn nowhere, one cable core on two connections, shorted potentials, a connection with two wire numbers or a wire number on two connections, panel layouts with overlapping devices, devices sticking out of the plate or no longer in the project, devices without a part, then the check rules of the project's library sources (less the ones the project turns off) and the project's own check rules (see the rules tool).",
             json!({}),
             &[],
         ),
@@ -2143,12 +2143,16 @@ impl App {
                     .into());
                 }
                 let open = need_open(self.open.as_mut())?;
+                let before = crate::panel_pick_before(&self.ed, &open.project);
                 self.ed.panel_drag = None;
                 let done = if redo { open.redo() } else { open.undo() };
                 if let Some(e) = open.take_undo_error() {
                     return Err(format!("Not done: {e}"));
                 }
                 self.ed.selection.clear();
+                if done && let Some((id, pick)) = &before {
+                    crate::follow_panel_pick(&mut self.ed, &open.project, id, pick.as_ref());
+                }
                 if let Some(w) = open.take_step_warning() {
                     return Ok(format!("Done, but {w}."));
                 }
@@ -5568,6 +5572,66 @@ mod tests {
         assert!(shortcuts_for(&mut a, egui::Key::Backspace, egui::Modifiers::COMMAND).is_empty());
     }
 
+    /// In the panel view, Ctrl+A then Ctrl+X (and Copy, Paste) leave the hidden schematic page
+    /// as it was, and the four are greyed out (#824).
+    #[test]
+    fn select_all_and_cut_in_the_panel_view_leave_the_schematic_page_alone() {
+        use crate::chrome::Status;
+        let (_tmp, mut a) = app(vec![]);
+        {
+            let o = a.open.as_mut().unwrap();
+            o.project.pages[0].graphics.push(wc_core::Shape::Line {
+                a: wc_core::geom::Point::new(50.0, 50.0),
+                b: wc_core::geom::Point::new(80.0, 50.0),
+            });
+            o.project
+                .panels
+                .push(wc_core::panel::Panel::new("pnl1", "Cabinet", 600.0, 800.0));
+        }
+        // Something on the clipboard, so Paste would have something to put down.
+        a.clipboard = a.open.as_ref().unwrap().copy(0, &[crate::state::Selection::Graphic(0)]);
+        a.ed.page = 0;
+        a.ed.panel = Some(0);
+        let page = a.open.as_ref().unwrap().project.pages[0].clone();
+        let status = |a: &App, act: Action| {
+            crate::StatusView {
+                open: a.open.as_ref(),
+                ed: &a.ed,
+                prefs: &a.prefs,
+                clipboard: &a.clipboard,
+                sharing: false,
+                share_undo: false,
+                share_redo: false,
+                show_layers: false,
+            }
+            .enabled(act)
+        };
+        for act in [Action::SelectAll, Action::Copy, Action::Cut, Action::Paste] {
+            assert!(!status(&a, act), "{act:?} is greyed out in the panel view");
+        }
+        let select_all = shortcuts_for(&mut a, egui::Key::A, egui::Modifiers::COMMAND);
+        assert_eq!(select_all, vec![Action::SelectAll]);
+        for act in select_all {
+            a.run(act);
+        }
+        assert!(a.ed.selection.is_empty(), "nothing on the hidden page is selected");
+        // Ctrl+X, Ctrl+C and Ctrl+V reach the app as these actions.
+        for act in [Action::Cut, Action::Copy, Action::Paste] {
+            a.run(act);
+        }
+        assert_eq!(
+            a.open.as_ref().unwrap().project.pages[0],
+            page,
+            "the schematic page is as it was"
+        );
+        assert!(a.ed.selection.is_empty());
+        assert!(a.ed.message.contains("close the panel layout"), "{}", a.ed.message);
+        // Back on the page, Select all works as before.
+        a.ed.panel = None;
+        a.run(Action::SelectAll);
+        assert_eq!(a.ed.selection, vec![crate::state::Selection::Graphic(0)]);
+    }
+
     /// The plus key zooms in with or without Shift, and so does the unshifted = key it shares
     /// on many keyboards; Alt with them is not a zoom shortcut here (#685).
     #[test]
@@ -5625,12 +5689,77 @@ mod tests {
         press(&mut a, egui::Key::Escape);
         assert_eq!(a.ed.shape_points.len(), 2, "nor dropped");
         assert_eq!(a.ed.tool, crate::state::Tool::Polyline);
-        // Nothing drawn in the editor: the schematic gets the keys again.
+        // Nothing drawn in the editor: the keys still leave the schematic alone.
         a.symbol_editor = Some(crate::symbol_editor::SymbolEditor::new(Vec::new()));
+        press(&mut a, egui::Key::Enter);
+        assert!(!a.ed.finish_shape);
+        press(&mut a, egui::Key::Escape);
+        assert_eq!(a.ed.shape_points.len(), 2);
+        assert_eq!(a.ed.tool, crate::state::Tool::Polyline);
+        // Editor closed: the schematic gets them again.
+        a.symbol_editor = None;
         press(&mut a, egui::Key::Enter);
         assert!(a.ed.finish_shape);
         press(&mut a, egui::Key::Escape);
         assert!(a.ed.shape_points.is_empty());
+    }
+
+    #[test]
+    fn escape_and_tool_keys_leave_the_schematic_behind_the_symbol_editor_alone() {
+        use wc_core::geom::Point;
+        let (_tmp, mut a) = app(vec![]);
+        let ctx = egui::Context::default();
+        // A wire half drawn on the schematic, one click of a line in the symbol editor.
+        a.run(Action::DrawWire);
+        let wire = Some((
+            wc_core::Endpoint::Point {
+                at: Point::new(10.0, 10.0),
+            },
+            Vec::new(),
+        ));
+        a.ed.wire = wire.clone();
+        let mut sym = crate::symbol_editor::SymbolEditor::new(Vec::new());
+        sym.set_tool(crate::symbol_editor::Tool::Line);
+        sym.click(Point::new(0.0, 0.0));
+        sym.owner = a.open.as_ref().map(|o| o.dir.clone());
+        a.symbol_editor = Some(sym);
+        let raw = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| {
+            let keys = a.shortcuts(ctx);
+            assert!(keys.is_empty(), "{keys:?}");
+            a.symbol_editor_window(ctx);
+        });
+        assert!(
+            !a.symbol_editor.as_ref().unwrap().drawing_shape(),
+            "the editor's click is dropped"
+        );
+        assert_eq!(a.ed.wire, wire, "the schematic wire stays");
+        assert_eq!(a.ed.tool, crate::state::Tool::Wire);
+        // The tool keys do not switch the schematic's tool out of sight.
+        let tools = vec![
+            Action::PlaceSymbol,
+            Action::DrawWire,
+            Action::TextTool,
+            Action::CommentTool,
+            Action::LineTool,
+        ];
+        for act in a.route_to_symbol_editor(tools.clone()) {
+            a.run(act);
+        }
+        assert_eq!(a.ed.tool, crate::state::Tool::Wire);
+        assert_eq!(a.ed.wire, wire);
+        // Closed: they switch it again.
+        a.symbol_editor = None;
+        assert_eq!(a.route_to_symbol_editor(tools.clone()), tools);
     }
 
     #[test]
@@ -6067,7 +6196,7 @@ mod tests {
             Action::PageProps,
             Action::DeletePage,
             Action::PageDown,
-            // These work on the schematic page under the panel.
+            // These would change the schematic page under the panel.
             Action::Paste,
             Action::Cut,
             Action::Rotate,
@@ -10728,6 +10857,41 @@ mod tests {
         call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap();
         a.run(Action::Delete);
         assert!(page2(&a).graphics.is_empty());
+    }
+
+    #[test]
+    fn paste_of_a_copied_text_is_refused_while_the_drawings_layer_is_hidden_or_locked() {
+        use crate::layers::Layer;
+        let (_tmp, mut a) = app(vec![]);
+        call(
+            &mut a,
+            "add_graphic",
+            json!({"page": "p0002", "shape": {"kind": "text", "at": {"x": 30, "y": 30}, "text": "Hello"}}),
+        )
+        .unwrap();
+        a.ed.page = 1;
+        call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap();
+        a.run(Action::Copy);
+        for hide in [true, false] {
+            if hide {
+                a.prefs.layers.set_shown(Layer::Drawings, false);
+            } else {
+                a.prefs.layers.set_locked(Layer::Drawings, true);
+            }
+            a.run(Action::Paste);
+            assert_eq!(page2(&a).graphics.len(), 1, "nothing pasted out of sight");
+            assert!(a.ed.message.contains("Drawings and notes"), "{}", a.ed.message);
+            a.prefs.layers = Default::default();
+        }
+        // Shown and unlocked, the same Paste adds the text.
+        a.run(Action::Paste);
+        assert_eq!(page2(&a).graphics.len(), 2);
+        assert_eq!(a.ed.message, "Pasted 1 item.", "the layer note is gone");
+        a.ed.selection = vec![Selection::Graphic(0), Selection::Graphic(1)];
+        a.run(Action::Copy);
+        a.run(Action::Paste);
+        assert_eq!(page2(&a).graphics.len(), 4);
+        assert_eq!(a.ed.message, "Pasted 2 items.");
     }
 
     #[test]

@@ -183,12 +183,32 @@ pub fn symbols(text: &str, prefix: &str, scale: f64) -> Result<(Vec<Imported>, V
                 continue;
             }
             let mut skipped = BTreeMap::new();
-            let converted = convert(&unit_name, sym, body, base, unit, prefix, scale, &mut skipped);
+            let mut hidden = Vec::new();
+            let converted = convert(
+                &unit_name,
+                sym,
+                body,
+                base,
+                unit,
+                prefix,
+                scale,
+                &mut skipped,
+                &mut hidden,
+            );
             for (kind, n) in skipped {
                 warnings.push(format!("{unit_name}: {n} {kind} item(s) not read"));
             }
             match converted {
                 Ok(symbol) => {
+                    // Usually power pins that connect without a wire in KiCad.
+                    if !hidden.is_empty() {
+                        let n = hidden.len();
+                        let pins = if n == 1 { "pin" } else { "pins" };
+                        warnings.push(format!(
+                            "{unit_name}: {n} hidden {pins} left out ({})",
+                            hidden.join(", ")
+                        ));
+                    }
                     // Taken only once there is a symbol: one that draws nothing leaves its id free.
                     used.insert(id);
                     out.push(Imported {
@@ -254,7 +274,8 @@ fn property<'a>(sym: &'a Sexp, key: &str) -> Option<&'a str> {
 }
 
 /// One unit of a symbol: the common unit's drawing and pins plus those of `wanted`. Graphic
-/// items it cannot read are counted by kind in `skipped`.
+/// items it cannot read are counted by kind in `skipped`; hidden pins are left out and named
+/// (by number, else name) in `hidden`.
 #[allow(clippy::too_many_arguments)]
 fn convert(
     name: &str,
@@ -265,6 +286,7 @@ fn convert(
     prefix: &str,
     scale: f64,
     skipped: &mut BTreeMap<String, usize>,
+    hidden: &mut Vec<String>,
 ) -> Result<Symbol> {
     let id = format!("{}.{}", prefix.trim_end_matches('.'), crate::id_segment(name));
     store::check_id(&id)?;
@@ -373,14 +395,27 @@ fn convert(
                             .and_then(|f| f.first("size"))
                             .and_then(|s| s.num(1))
                             .unwrap_or(1.27);
-                        graphics.push(Shape::Text {
-                            at: pt(at.num(1).unwrap_or(0.0), at.num(2).unwrap_or(0.0)),
-                            text: t.to_owned(),
-                            height: height * scale,
-                            align,
-                            // KiCad stores tenths of a degree in old files and degrees now.
-                            angle: at.num(3).map(|a| if a > 360.0 { a / 10.0 } else { a }).unwrap_or(0.0),
-                        });
+                        let height = height * scale;
+                        // KiCad stores tenths of a degree in old files and degrees now.
+                        let angle = at.num(3).map(|a| if a > 360.0 { a / 10.0 } else { a }).unwrap_or(0.0);
+                        let first = pt(at.num(1).unwrap_or(0.0), at.num(2).unwrap_or(0.0));
+                        let (sin, cos) = angle.to_radians().sin_cos();
+                        // A text with line breaks becomes one text per line, each one line pitch
+                        // further down, square to the reading direction (y runs down here).
+                        for (k, line) in t.lines().enumerate() {
+                            let line: String = line.chars().filter(|c| !c.is_control()).collect();
+                            if line.trim().is_empty() {
+                                continue;
+                            }
+                            let step = 1.5 * height * k as f64;
+                            graphics.push(Shape::Text {
+                                at: Point::new(first.x + step * sin, first.y + step * cos),
+                                text: line,
+                                height,
+                                align,
+                                angle,
+                            });
+                        }
                     }
                 }
                 Some("pin") => {
@@ -399,9 +434,16 @@ fn convert(
                         270 => (PinDir::Up, Point::new(0.0, length)),
                         _ => (PinDir::Left, Point::new(length, 0.0)),
                     };
-                    let hidden = g.items().iter().any(|i| i.atom() == Some("hide"))
-                        || g.first("hide").and_then(|h| h.arg(1)) == Some("yes");
-                    if hidden {
+                    let text = |head: &str| {
+                        g.first(head)
+                            .and_then(|n| n.arg(1))
+                            .filter(|v| !v.is_empty() && *v != "~")
+                    };
+                    let pin_name = text("number").or_else(|| text("name")).unwrap_or("").to_owned();
+                    if g.items().iter().any(|i| i.atom() == Some("hide"))
+                        || g.first("hide").and_then(|h| h.arg(1)) == Some("yes")
+                    {
+                        hidden.push(if pin_name.is_empty() { "?".to_owned() } else { pin_name });
                         continue;
                     }
                     if length > 0.0 {
@@ -410,12 +452,6 @@ fn convert(
                             b: Point::new(tip.x + inward.x, tip.y + inward.y),
                         });
                     }
-                    let text = |head: &str| {
-                        g.first(head)
-                            .and_then(|n| n.arg(1))
-                            .filter(|v| !v.is_empty() && *v != "~")
-                    };
-                    let pin_name = text("number").or_else(|| text("name")).unwrap_or("").to_owned();
                     pins.push(Pin {
                         name: pin_name,
                         at: tip,
@@ -609,6 +645,10 @@ mod tests {
         // Two units each for the relay and the derived 24 V relay.
         assert_eq!(syms.len(), 4, "{warnings:?}");
         assert!(warnings.iter().any(|w| w.contains("Orphan")), "{warnings:?}");
+        assert!(
+            warnings.iter().any(|w| w == "Relay_Coil_A: 1 hidden pin left out (3)"),
+            "{warnings:?}"
+        );
         assert!(
             !warnings.iter().any(|w| w.contains("only the first unit")),
             "{warnings:?}"
@@ -811,6 +851,37 @@ mod tests {
     }
 
     #[test]
+    fn a_text_with_line_breaks_becomes_one_text_per_line() -> Result<()> {
+        let lib = r#"(kicad_symbol_lib
+  (symbol "Psu"
+    (symbol "Psu_0_1"
+      (text "A\nB" (at 0 0 0) (effects (font (size 2 2))))
+      (text "C\n\nD" (at 0 0 90) (effects (font (size 2 2))))
+      (text "A	B" (at 9 9 0) (effects (font (size 2 2)))))
+    (symbol "Psu_1_1" (pin passive line (at 0 3 270) (length 1) (name "~") (number "1")))))"#;
+        let (syms, warnings) = symbols(lib, "k", 1.0)?;
+        let texts: Vec<(&str, Point)> = syms[0]
+            .symbol
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Text { text, at, .. } => Some((text.as_str(), *at)),
+                _ => None,
+            })
+            .collect();
+        let names: Vec<&str> = texts.iter().map(|t| t.0).collect();
+        // A real tab inside a string (KiCad does not escape it) is dropped, not printed as `?`.
+        assert_eq!(names, ["A", "B", "C", "D", "AB"], "{warnings:?}");
+        assert!(texts.iter().all(|t| !t.0.chars().any(char::is_control)));
+        // Horizontal text: the second line sits below the first (y runs down).
+        assert!(texts[1].1.y > texts[0].1.y && (texts[1].1.x - texts[0].1.x).abs() < 1e-9);
+        // Text reading bottom to top: its next line is to the right; the empty line keeps its gap.
+        assert!((texts[3].1.x - texts[2].1.x - 6.0).abs() < 1e-9, "{texts:?}");
+        assert!((texts[3].1.y - texts[2].1.y).abs() < 1e-9);
+        Ok(())
+    }
+
+    #[test]
     fn a_text_box_comes_in_as_text_and_border_and_unknown_items_are_reported() -> Result<()> {
         let lib = r#"(kicad_symbol_lib
   (symbol "T" (property "Reference" "T" (at 0 0 0))
@@ -925,6 +996,26 @@ mod tests {
             [1, 2, 26, 27, 28, 52, 53].map(unit_letter),
             ["A", "B", "Z", "AA", "AB", "AZ", "BA"]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn hidden_pins_are_left_out_with_one_warning_naming_them() -> Result<()> {
+        let lib = r#"(kicad_symbol_lib
+  (symbol "U" (property "Reference" "U" (at 0 0 0))
+    (symbol "U_1_1"
+      (pin passive line (at 0 0 0) (length 1) (name "IN") (number "1"))
+      (pin power_in line (at 0 5 270) (length 1) hide (name "VCC") (number "14"))
+      (pin power_in line (at 0 -5 90) (length 1) (hide yes) (name "GND") (number "~"))))
+  (symbol "V" (symbol "V_1_1" (pin passive line (at 0 0 0) (length 1) (name "~") (number "1")))))"#;
+        let (syms, warnings) = symbols(lib, "k", 1.0)?;
+        assert_eq!(syms.len(), 2, "{warnings:?}");
+        let names: Vec<&str> = syms[0].symbol.pins.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["1"]);
+        // Only the pin line of the visible pin is drawn.
+        assert_eq!(syms[0].symbol.graphics.len(), 1, "{:?}", syms[0].symbol.graphics);
+        // The pin without a number is named by its name; symbol V has no hidden pins.
+        assert_eq!(warnings, ["U: 2 hidden pins left out (14, GND)"]);
         Ok(())
     }
 

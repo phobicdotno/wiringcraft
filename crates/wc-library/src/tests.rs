@@ -596,6 +596,35 @@ fn every_starter_symbol_loads_under_its_file_name_with_distinct_pins() -> Result
 }
 
 #[test]
+fn every_starter_part_loads_under_its_file_name_and_names_a_starter_symbol() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
+    project.meta.libraries = vec![LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: starter.to_string_lossy().into(),
+        reference: None,
+    }];
+    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let symbols = lib.index(ItemKind::Symbol);
+    let parts = lib.index(ItemKind::Part);
+    assert!(!parts.is_empty(), "the starter library has no parts");
+    for id in parts.keys() {
+        let (p, _) = lib.part(id)?;
+        assert_eq!(&p.id, id, "file name and id differ");
+        assert!(!p.description.trim().is_empty(), "{id} has no description");
+        if let Some(symbol) = &p.symbol {
+            assert!(
+                symbols.contains_key(symbol),
+                "{id} names symbol {symbol}, which is not in the starter library"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn starter_solenoid_valve_coil_and_its_example_part_load() -> Result<()> {
     let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
     let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
@@ -711,6 +740,32 @@ fn the_starter_functional_earth_is_not_the_protective_earth() -> Result<()> {
     assert_eq!(names, ["FE"]);
     assert!(!fe.description.is_empty());
     assert_ne!(fe.description, pe.description);
+    Ok(())
+}
+
+#[test]
+fn the_starter_fuse_switch_disconnector_has_three_poles_and_its_own_tag() -> Result<()> {
+    // The 3-pole fuse switch disconnector (#725): Q in IEC 81346-2 (it switches and isolates;
+    // the fuses ride on the switch), pins 1 to 6 like the 3-pole breaker, and an example part.
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
+    project.meta.libraries = vec![LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: starter.to_string_lossy().into(),
+        reference: None,
+    }];
+    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (fsd, _) = lib.symbol("wc.fuse.3p")?;
+    assert_eq!(fsd.role, SymbolRole::Standalone);
+    assert_eq!(fsd.letter_code, "Q");
+    let names: Vec<_> = fsd.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["1", "2", "3", "4", "5", "6"]);
+    assert_eq!(
+        lib.part("example.ex-fsd-3p-32")?.0.symbol.as_deref(),
+        Some("wc.fuse.3p")
+    );
     Ok(())
 }
 
@@ -838,6 +893,85 @@ fn the_starter_ammeter_and_voltmeter_are_measuring_instruments() -> Result<()> {
         let names: Vec<_> = m.pins.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["1", "2"], "{id}");
     }
+    Ok(())
+}
+
+#[test]
+fn the_starter_energy_meter_is_a_measuring_instrument_on_the_grid() -> Result<()> {
+    // #930: a single-phase kWh meter, L and N in at the top and out at the bottom.
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
+    project.meta.libraries = vec![LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: starter.to_string_lossy().into(),
+        reference: None,
+    }];
+    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (m, _) = lib.symbol("wc.meter.energy")?;
+    assert_eq!(m.id, "wc.meter.energy");
+    assert_eq!(m.role, SymbolRole::Standalone);
+    assert_eq!(m.letter_code, "P");
+    assert_eq!(m.category, "measuring");
+    let names: Vec<_> = m.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["1", "3", "2", "4"]);
+    for p in &m.pins {
+        assert_eq!(p.at.x % 5.0, 0.0, "pin {} is off the 5 mm grid", p.name);
+        assert_eq!(p.at.y % 5.0, 0.0, "pin {} is off the 5 mm grid", p.name);
+    }
+    Ok(())
+}
+
+#[test]
+fn the_starter_dc_motor_has_plus_and_minus_pins() -> Result<()> {
+    // #882: a DC motor next to the single- and three-phase ones.
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
+    project.meta.libraries = vec![LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: starter.to_string_lossy().into(),
+        reference: None,
+    }];
+    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (m, _) = lib.symbol("wc.motor.dc")?;
+    assert_eq!(m.id, "wc.motor.dc");
+    assert_eq!(m.role, SymbolRole::Standalone);
+    assert_eq!(m.letter_code, "M");
+    assert_eq!(m.category, "drives");
+    let names: Vec<_> = m.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["+", "-"]);
+    // Origin at the + pin, - one 5 mm grid step to its right (as wc.rcd.2p).
+    assert_eq!((m.pins[0].at.x, m.pins[0].at.y), (0.0, 0.0));
+    assert_eq!((m.pins[1].at.x, m.pins[1].at.y), (5.0, 0.0));
+    Ok(())
+}
+
+#[test]
+fn the_starter_flow_switch_is_a_make_contact_tagged_b() -> Result<()> {
+    // #896: a flow switch next to the pressure, float and temperature switches.
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
+    project.meta.libraries = vec![LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: starter.to_string_lossy().into(),
+        reference: None,
+    }];
+    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (s, _) = lib.symbol("wc.switch.flow")?;
+    assert_eq!(s.id, "wc.switch.flow");
+    assert_eq!(s.role, SymbolRole::Standalone);
+    assert_eq!(s.letter_code, "B");
+    assert_eq!(s.category, "sensors");
+    let names: Vec<_> = s.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["13", "14"]);
+    // On the 5 mm grid: 13 at the origin, 14 three grid steps below it.
+    assert_eq!((s.pins[0].at.x, s.pins[0].at.y), (0.0, 0.0));
+    assert_eq!((s.pins[1].at.x, s.pins[1].at.y), (0.0, 15.0));
     Ok(())
 }
 

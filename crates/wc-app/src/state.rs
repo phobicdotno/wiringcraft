@@ -195,13 +195,26 @@ struct Kept {
 struct Step {
     project: Project,
     files: Vec<FileEdit>,
+    /// Tells this step apart from every other, for finding it again (see
+    /// [`Open::take_back_move`]). A step keeps it when Undo and Redo move it between the two
+    /// histories.
+    id: u64,
+    /// How far the running move drag had moved its items in `project` (see
+    /// [`Open::drag_offset`]); zero outside a drag.
+    offset: Point,
+    /// Later steps were folded into this one (an assistant turn, a command): what happened in
+    /// between is no longer in the history, so [`Open::take_back_move`] cannot check it.
+    folded: bool,
 }
 
 impl Step {
-    fn of(project: Project) -> Step {
+    fn new(project: Project, files: Vec<FileEdit>, offset: Point) -> Step {
         Step {
             project,
-            files: Vec::new(),
+            files,
+            id: next_revision(),
+            offset,
+            folded: false,
         }
     }
 }
@@ -379,7 +392,9 @@ fn put_back_files(written: &Written) -> (Vec<String>, Vec<String>, Unwritten) {
 /// What [`Open::back_to`] goes back to, or [`Open::keep`] builds on.
 pub(crate) struct Mark {
     kept: Kept,
-    symbols: std::collections::BTreeSet<String>,
+    /// The symbols loaded at the mark, so one the change replaced (a pinned version loaded
+    /// over another, say) is put back too.
+    symbols: BTreeMap<String, Symbol>,
     parts: std::collections::BTreeSet<String>,
     /// The symbol list as it was: a symbol the change loaded may have added or changed a row.
     library: Vec<LibraryEntry>,
@@ -485,6 +500,10 @@ pub struct Open {
     /// The terminal numbering before the change in progress (taken at its checkpoint), so
     /// jumpers can follow their terminals once it is done.
     terminals_before: Option<wc_core::project::TerminalNumbers>,
+    /// How far the running select-tool move drag has moved its items in `project`: kept with
+    /// every undo and redo step taken during the drag, so Escape can take back from each just
+    /// the part of the move it holds (#863). Zero outside a drag.
+    drag_offset: Point,
     /// In a shared session, the pages someone else has open (page id to their name). Tools that
     /// work on every page leave these alone; the session would refuse the change otherwise.
     pub held_by_others: BTreeMap<String, String>,
@@ -513,6 +532,10 @@ pub struct Open {
     /// and does not write over it unasked (#662). Once the user chose to write over it, what
     /// it held then: a later change is asked about again.
     unwritten_found: BTreeMap<PathBuf, Found>,
+    /// For each of [`Open::unwritten_files`] that is a symbol file [`Open::back_to`] queued to
+    /// be repaired: the symbol id and the version (content hash) it is to hold, so a change
+    /// taken back around it can retarget or let it go when the pin it puts back differs.
+    symbol_repairs: BTreeMap<PathBuf, (String, String)>,
     /// Project files rewritten while a [`Mark`] is open (`marks` counts them), oldest first,
     /// so [`Open::back_to`] puts them back even when their undo steps fell off the history.
     mark_edits: Vec<FileEdit>,
@@ -595,6 +618,7 @@ impl Open {
             underlays: BTreeMap::new(),
             picture_problems: BTreeMap::new(),
             terminals_before: None,
+            drag_offset: Point::new(0.0, 0.0),
             held_by_others: BTreeMap::new(),
             symbol_versions: BTreeMap::new(),
             part_versions: BTreeMap::new(),
@@ -602,6 +626,7 @@ impl Open {
             unrestored_files: BTreeMap::new(),
             unwritten_files: BTreeMap::new(),
             unwritten_found: BTreeMap::new(),
+            symbol_repairs: BTreeMap::new(),
             mark_edits: Vec::new(),
             command_translations: None,
             marks: 0,
@@ -1208,7 +1233,8 @@ impl Open {
         // snapshot and this change start from that.
         self.follow_terminals();
         self.terminals_before = Some(self.terminal_numbers());
-        self.undo.push(Step::of(self.project.clone()));
+        self.undo
+            .push(Step::new(self.project.clone(), Vec::new(), self.drag_offset));
         self.trim_undo();
         self.redo.clear();
         self.edited();
@@ -1254,6 +1280,99 @@ impl Open {
     /// only part of that change (in a shared session, the part that waits here).
     pub fn before_last_change(&self) -> Option<&Project> {
         self.undo.last().map(|s| &s.project)
+    }
+
+    /// The id of the latest undo step: right after a [`Open::checkpoint`], the step it took.
+    pub fn last_step_id(&self) -> Option<u64> {
+        self.undo.last().map(|s| s.id)
+    }
+
+    /// A select-tool move drag begins: its checkpoint, from which [`Open::drag_move_by`]
+    /// counts how far the items moved.
+    pub fn begin_drag_move(&mut self) {
+        self.drag_offset = Point::new(0.0, 0.0);
+        self.checkpoint();
+    }
+
+    /// One frame of a move drag: [`Open::move_by`], counted in the drag's offset.
+    pub fn drag_move_by(&mut self, page: usize, sel: &[Selection], d: Point) {
+        self.move_by(page, sel, d);
+        self.drag_offset = self.drag_offset + d;
+    }
+
+    /// A move drag ended: later steps are no part of it.
+    pub fn end_drag_move(&mut self) {
+        self.drag_offset = Point::new(0.0, 0.0);
+    }
+
+    /// Whether the undo step `id` is still in the undo history.
+    pub fn has_undo_step(&self, id: u64) -> bool {
+        self.undo.iter().any(|s| s.id == id)
+    }
+
+    /// Take back a move of `items` on page `page` whose checkpoint is the undo step `id`,
+    /// keeping the changes recorded after it (a rotate during the move, #863): the items go back
+    /// by as far as the drag had moved them, now and in every later undo and redo step (each by
+    /// its own part of the move), and the move's own step is dropped, so Undo and Redo then work
+    /// as if the changes after it were made at the start position. Jumpers and strip layouts
+    /// follow the terminals back in each. Refuses with the reason, changing nothing, when that
+    /// step is no longer in the history (the move was undone, or trimmed off the oldest end),
+    /// carries file edits a move never makes, has later steps folded into it or after it (an
+    /// assistant turn, whose steps in between can no longer be checked), or a drawing, cloud or
+    /// wire on the page was added or deleted since (`items` names those by place in their list).
+    pub fn take_back_move(&mut self, id: u64, page: &str, items: &[Selection]) -> Result<(), &'static str> {
+        let Some(at) = self.undo.iter().position(|s| s.id == id) else {
+            return Err("the move is no longer in the undo history");
+        };
+        let Some(first) = self.undo.get(at) else {
+            return Err("the move is no longer in the undo history");
+        };
+        let counts = |p: &Project| p.page(page).map(|p| (p.graphics.len(), p.clouds.len(), p.wires.len()));
+        let start = counts(&first.project);
+        let later = self.undo.iter().skip(at + 1).chain(&self.redo).map(|s| &s.project);
+        // Dropping the move's step would shift the start of an assistant turn begun after it,
+        // and the turn would no longer fold into one step.
+        if self.turn.is_some_and(|t| t > self.undo_dropped + at) {
+            return Err("an assistant turn started after it is still running");
+        }
+        if self.undo.iter().skip(at).chain(&self.redo).any(|s| s.folded) {
+            return Err("an assistant turn during it was recorded as one step");
+        }
+        if !first.files.is_empty() {
+            return Err("project files were changed with it");
+        }
+        if later.chain([&self.project]).any(|p| counts(p) != start) {
+            return Err("items were added or deleted during it");
+        }
+        // The change in progress (the move's frames since the last checkpoint) is followed first.
+        self.follow_terminals();
+        let symbols = &self.symbols;
+        let role = |id: &str| symbols.get(id).map(|s| s.role);
+        let back = |p: &mut Project, d: Point| {
+            let before = p
+                .meta
+                .follows_terminals()
+                .then(|| wc_core::project::terminal_numbers(p, role));
+            if let Some(pg) = p.page_mut(page) {
+                crate::edit::move_items(pg, items, Point::new(-d.x, -d.y));
+            }
+            if let Some(before) = before {
+                wc_core::project::follow_terminals_in(p, &before, role);
+            }
+        };
+        for s in self.undo.iter_mut().skip(at + 1).chain(self.redo.iter_mut()) {
+            back(&mut s.project, s.offset);
+            s.offset = Point::new(0.0, 0.0);
+        }
+        back(&mut self.project, self.drag_offset);
+        self.drag_offset = Point::new(0.0, 0.0);
+        if self.terminals_before.is_some() {
+            self.terminals_before = Some(self.terminal_numbers());
+        }
+        self.undo.remove(at);
+        self.history += 1;
+        self.edited();
+        Ok(())
     }
 
     /// Forget the latest undo step, once its change was taken back another way.
@@ -1327,7 +1446,11 @@ impl Open {
             let held = self.marks == 0 && self.turn.is_some_and(|t| t <= self.undo_dropped);
             if held {
                 let next = self.undo.remove(1);
-                self.undo[0].files.extend(next.files);
+                if let Some(first) = self.undo.first_mut() {
+                    first.files.extend(next.files);
+                    // What the folded step did is no longer checkable on its own.
+                    first.folded = true;
+                }
             } else {
                 self.undo.remove(0);
             }
@@ -1363,6 +1486,7 @@ impl Open {
             let later: Vec<FileEdit> = self.undo.drain(start + 1..).flat_map(|s| s.files).collect();
             if let Some(first) = self.undo.get_mut(start) {
                 first.files.extend(later);
+                first.folded = true;
             }
             self.history += 1;
             self.touch();
@@ -1398,10 +1522,22 @@ impl Open {
                     }
                 };
                 self.forget_terminal_change();
-                let Step { project, files } = prev;
-                self.redo.push(Step {
-                    project: std::mem::replace(&mut self.project, project),
+                let Step {
+                    project,
                     files,
+                    id,
+                    offset,
+                    folded,
+                } = prev;
+                let now = std::mem::replace(&mut self.project, project);
+                // The step keeps its id across Undo and Redo, so a move redone during its drag
+                // is still found by Escape.
+                self.redo.push(Step {
+                    project: now,
+                    files,
+                    id,
+                    offset: std::mem::replace(&mut self.drag_offset, offset),
+                    folded,
                 });
                 let left = self
                     .redo
@@ -1422,9 +1558,12 @@ impl Open {
                         };
                         let restored = std::mem::replace(&mut self.project, cur.project);
                         self.undo_error = Some(e);
+                        let offset = std::mem::replace(&mut self.drag_offset, cur.offset);
+                        // The step goes back whole: its id and folded mark too.
                         self.undo.push(Step {
                             project: restored,
-                            files: cur.files,
+                            offset,
+                            ..cur
                         });
                     }
                     return false;
@@ -1455,10 +1594,22 @@ impl Open {
                     }
                 };
                 self.forget_terminal_change();
-                let Step { project, files } = next;
-                self.undo.push(Step {
-                    project: std::mem::replace(&mut self.project, project),
+                let Step {
+                    project,
                     files,
+                    id,
+                    offset,
+                    folded,
+                } = next;
+                let now = std::mem::replace(&mut self.project, project);
+                // The step keeps its id across Undo and Redo, so a move redone during its drag
+                // is still found by Escape.
+                self.undo.push(Step {
+                    project: now,
+                    files,
+                    id,
+                    offset: std::mem::replace(&mut self.drag_offset, offset),
+                    folded,
                 });
                 let left = self
                     .undo
@@ -1478,9 +1629,12 @@ impl Open {
                         };
                         let restored = std::mem::replace(&mut self.project, cur.project);
                         self.undo_error = Some(e);
+                        let offset = std::mem::replace(&mut self.drag_offset, cur.offset);
+                        // The step goes back whole: its id and folded mark too.
                         self.redo.push(Step {
                             project: restored,
-                            files: cur.files,
+                            offset,
+                            ..cur
                         });
                     }
                     return false;
@@ -1754,6 +1908,7 @@ impl Open {
         }
         for (id, _) in &wanted {
             self.stale_symbol_files.remove(id);
+            self.symbol_file_written(id);
         }
         for (id, want) in wanted {
             if let Some(old) = self.symbols.insert(id, want) {
@@ -2171,6 +2326,7 @@ impl Open {
             // What the file holds now, as WiringCraft left it: a later change is from outside.
             self.unwritten_found
                 .insert(rel.clone(), Found::of(snapshot_file(&path)));
+            self.symbol_repairs.remove(&rel);
             if replace {
                 self.unwritten_files.insert(rel, should);
             } else {
@@ -2184,6 +2340,7 @@ impl Open {
     fn drop_unwritten(&mut self, rel: &Path) {
         self.unwritten_files.remove(rel);
         self.unwritten_found.remove(rel);
+        self.symbol_repairs.remove(rel);
     }
 
     /// The first project file waiting to be written again ([`Open::keep_unwritten`]) that was
@@ -2209,6 +2366,10 @@ impl Open {
     /// to it is dropped, and the next save leaves the file as it is.
     pub fn keep_outside_version(&mut self, path: &Path) {
         let rel = path.strip_prefix(&self.dir).unwrap_or(path).to_path_buf();
+        // A symbol file kept that way is not written with the loaded version either.
+        if let Some((id, _)) = self.symbol_repairs.get(&rel) {
+            self.stale_symbol_files.remove(id);
+        }
         self.drop_unwritten(&rel);
     }
 
@@ -2348,6 +2509,12 @@ impl Open {
                 },
                 // Nothing known about what was there: written as before.
                 None => restore_file(&path, should.as_deref()).map_err(cannot)?,
+            }
+            // A symbol file repaired with the loaded version is not written again unchecked.
+            if let Some((id, hash)) = self.symbol_repairs.get(&rel)
+                && self.symbols.get(id).is_some_and(|s| s.hash() == *hash)
+            {
+                self.stale_symbol_files.remove(id);
             }
             self.drop_unwritten(&rel);
         }
@@ -2571,6 +2738,7 @@ impl Open {
         // Project files waiting to be written are named relative to the folder: the copy's.
         let old_unwritten = self.unwritten_files.clone();
         let old_found = self.unwritten_found.clone();
+        let old_repairs = self.symbol_repairs.clone();
         self.unrestored_files = old_unrestored
             .iter()
             .map(|(path, f)| {
@@ -2589,6 +2757,7 @@ impl Open {
             self.unrestored_files = old_unrestored;
             self.unwritten_files = old_unwritten;
             self.unwritten_found = old_found;
+            self.symbol_repairs = old_repairs;
             return Err(format!(
                 "{e}\n{}; you are still working in {}.",
                 discard(),
@@ -2975,9 +3144,12 @@ impl Open {
         };
         let new = plan.symbol.clone();
         self.check_box_file_unchanged(&symbol_id, &old)?;
+        self.check_symbol_repair_baseline(&symbol_id)?;
         self.write_symbol_file(&new)?;
-        // The file holds the loaded version again: a later change on disk is checked for.
+        // The file holds the loaded version again: a later change on disk is checked for, and a
+        // repair a refused change queued for it would write an older version over this one.
         self.stale_symbol_files.remove(&symbol_id);
+        self.symbol_file_written(&symbol_id);
         self.checkpoint();
         self.project.lock.symbols.insert(
             symbol_id.clone(),
@@ -3000,6 +3172,34 @@ impl Open {
             s.at = s.at + moved;
         }
         Ok(plan.warnings)
+    }
+
+    /// Before the app writes the file of symbol `id` while a repair waits for it: refused when
+    /// another program changed the file since the app last wrote it, so that change is not
+    /// lost unasked; Save asks which version to keep.
+    fn check_symbol_repair_baseline(&self, id: &str) -> Result<(), String> {
+        let Ok(path) = store::vendor_path(&self.dir, ItemKind::Symbol, id) else {
+            return Ok(());
+        };
+        let rel = path.strip_prefix(&self.dir).unwrap_or(&path);
+        let (Some(should), Some(found)) = (self.unwritten_files.get(rel), self.unwritten_found.get(rel)) else {
+            return Ok(());
+        };
+        match found.change(snapshot_file(&path), should, &path) {
+            Some(note) => Err(format!(
+                "the file of symbol {id} was changed outside WiringCraft{note}; save the project and choose which version to keep before editing the box"
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// The file of symbol `id` was written as the project needs it: a repair waiting for it
+    /// would write another version over it, so it is let go.
+    fn symbol_file_written(&mut self, id: &str) {
+        if let Ok(path) = store::vendor_path(&self.dir, ItemKind::Symbol, id) {
+            let rel = path.strip_prefix(&self.dir).unwrap_or(&path).to_path_buf();
+            self.drop_unwritten(&rel);
+        }
     }
 
     /// Before a black box edit writes its symbol file: the file must still hold `loaded`, the
@@ -3184,6 +3384,33 @@ impl Open {
         })
     }
 
+    /// Queue the file of symbol `id` to be written with `sym` by the next save, as a repair
+    /// [`Open::back_to`] tracks. A file already waiting keeps what it held when first queued,
+    /// so a change made outside since is still asked about; otherwise what the app `wrote` to
+    /// it (what it holds now when not known). The error says why it could not be queued.
+    fn queue_symbol_repair(&mut self, id: &str, sym: &Symbol, wrote: Option<&Symbol>) -> Result<(), String> {
+        let why = |e: wc_core::Error| format!("The file of symbol {id} is not written back: {e}");
+        let path = store::vendor_path(&self.dir, ItemKind::Symbol, id).map_err(why)?;
+        let bytes = Some(store::to_json(sym).map_err(why)?.into_bytes());
+        let wrote = wrote.map(store::to_json).transpose().map_err(why)?;
+        let rel = path
+            .strip_prefix(&self.dir)
+            .map_or_else(|_| path.clone(), Path::to_path_buf);
+        if self.unwritten_found.contains_key(&rel) {
+            self.unwritten_files.insert(rel.clone(), bytes);
+            self.edited();
+        } else {
+            self.keep_unwritten(vec![(path, bytes)], true);
+            // A change another program made after the app wrote the file is asked about too.
+            if let Some(json) = wrote {
+                self.unwritten_found
+                    .insert(rel.clone(), Found::Bytes(Some(json.into_bytes())));
+            }
+        }
+        self.symbol_repairs.insert(rel, (id.to_owned(), sym.hash()));
+        Ok(())
+    }
+
     /// Start a change that may be refused as a whole: the project and the symbols and parts
     /// loaded now are kept, and the undo history is set aside, so the change's own undo steps
     /// collect apart from it. [`Open::keep`] or [`Open::back_to`] ends it. Undo and redo
@@ -3196,7 +3423,7 @@ impl Open {
         self.marks += 1;
         Mark {
             kept,
-            symbols: self.symbols.keys().cloned().collect(),
+            symbols: self.symbols.clone(),
             parts: self.parts.keys().cloned().collect(),
             library: self.library.clone(),
             files: vendor_names(&self.dir),
@@ -3244,12 +3471,96 @@ impl Open {
         // changed since is left as it is and named; the others are put back all the same, so
         // no file of the change stays behind unnamed.
         let mut errors: Vec<String> = self.write_back(&edits).err().into_iter().collect();
+        // The symbol versions the change pinned: the files it wrote hold those.
+        let pinned_by_change = self.project.lock.symbols.clone();
         self.put_back(mark.kept);
         if !self.unwritten_files.is_empty() {
             // A file still to be written is unsaved work, whatever the history put back says.
             self.edited();
         }
-        self.symbols.retain(|id, _| mark.symbols.contains(id));
+        // Symbols the change loaded are let go and those it replaced are put back, with the
+        // symbol list as it was. One put back that is the version the project pins again (a
+        // box edit taken back, say) is written to its file by the next save, as its file may
+        // hold the replaced version: that is unsaved work. Only a version the change pinned
+        // is taken for one it wrote: one another program wrote and that was read in meanwhile
+        // is left in its file.
+        let pin = |o: &Self, id: &str| o.project.lock.symbols.get(id).map(|e| e.hash.clone());
+        for (id, was) in &mark.symbols {
+            let replaced = self.symbols.get(id).filter(|now| now.hash() != was.hash());
+            let written = replaced
+                .filter(|now| pinned_by_change.get(id).is_some_and(|e| e.hash == now.hash()))
+                .cloned();
+            if let Some(wrote) = written
+                && pin(self, id) == Some(was.hash())
+            {
+                self.stale_symbol_files.insert(id.clone());
+                // Queued with what the app wrote there, so the next save does not write over a
+                // change another program made to it since.
+                if let Err(e) = self.queue_symbol_repair(id, was, Some(&wrote)) {
+                    errors.push(e);
+                }
+                self.edited();
+            }
+        }
+        // A file waiting for the pinned version that is now loaded, where the symbol put back
+        // is another version (a box edit taken back inside a change that is taken back too):
+        // the next save writes that pinned version to the file all the same.
+        for id in self.stale_symbol_files.clone() {
+            let (Some(now), Some(was)) = (self.symbols.get(&id), mark.symbols.get(&id)) else {
+                continue;
+            };
+            if now.hash() != was.hash() && pin(self, &id) == Some(now.hash()) {
+                let now = now.clone();
+                if let Err(e) = self.queue_symbol_repair(&id, &now, None) {
+                    errors.push(e);
+                }
+            }
+        }
+        self.symbols = mark.symbols;
+        // A file waiting to be written (from a change taken back inside this one, say) is let
+        // go when the loaded symbol is gone or not the version the project pins, so a save
+        // never writes a version the lock does not name.
+        let stale = std::mem::take(&mut self.stale_symbol_files);
+        self.stale_symbol_files = stale
+            .into_iter()
+            .filter(|id| {
+                self.symbols
+                    .get(id)
+                    .is_some_and(|s| pin(self, id).is_none_or(|h| h == s.hash()))
+            })
+            .collect();
+        // A repair queued by a change taken back inside this one is for the version that change
+        // pinned. When the pin put back now is another one, the repair is retargeted to the
+        // loaded symbol if that is the pinned version (its baseline kept, so a change made
+        // outside since is still asked about), or let go otherwise.
+        for (rel, (id, hash)) in self.symbol_repairs.clone() {
+            let wanted = pin(self, &id);
+            if wanted.as_deref() == Some(hash.as_str()) {
+                continue;
+            }
+            match self.symbols.get(&id).filter(|s| wanted == Some(s.hash())).cloned() {
+                Some(sym) => match store::to_json(&sym) {
+                    Ok(json) => {
+                        self.unwritten_files.insert(rel.clone(), Some(json.into_bytes()));
+                        self.symbol_repairs.insert(rel, (id.clone(), sym.hash()));
+                        self.stale_symbol_files.insert(id);
+                    }
+                    // The queued version is not the pinned one: let go, and the next save writes
+                    // the pinned one as the loaded symbol.
+                    Err(e) => {
+                        errors.push(format!("The file of symbol {id} is not written back as queued: {e}"));
+                        self.drop_unwritten(&rel);
+                        self.stale_symbol_files.insert(id);
+                    }
+                },
+                None => self.drop_unwritten(&rel),
+            }
+        }
+        if !self.stale_symbol_files.is_empty() || !self.symbol_repairs.is_empty() {
+            // A file still to be written back is unsaved work, also after a change taken back
+            // inside this one queued it.
+            self.edited();
+        }
         self.parts.retain(|id, _| mark.parts.contains(id));
         self.library = mark.library;
         let (before, now) = match (mark.files, vendor_names(&self.dir)) {
@@ -4891,6 +5202,70 @@ pub(crate) mod tests {
 
     /// A project with a macro saved twice from its form (descriptions "A coil", then "Two"),
     /// and the file's text after each save.
+    #[test]
+    fn a_failed_undo_or_redo_keeps_the_steps_mark_for_taking_a_move_back() {
+        use wc_core::geom::Shape;
+        let line = |x: f64| Shape::Line {
+            a: Point::new(x, 100.0),
+            b: Point::new(x + 10.0, 100.0),
+        };
+        let (_tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let Some(g) = o.add_graphic(1, line(10.0)) else {
+            unreachable!()
+        };
+        let page = o.project.pages[1].id.clone();
+        // A move's checkpoint, then an assistant turn that deletes the line and draws another:
+        // the same count of drawings, folded into one step.
+        o.begin_drag_move();
+        let Some(id) = o.last_step_id() else { unreachable!() };
+        o.drag_move_by(1, std::slice::from_ref(&g), Point::new(-40.0, 0.0));
+        let mark = o.start_turn();
+        o.delete_many(1, std::slice::from_ref(&g));
+        o.add_graphic(1, line(200.0));
+        o.squash_undo(mark);
+        let symbol = o.project.lock.symbols.keys().next().unwrap().clone();
+        let fail = |o: &mut Open| {
+            o.stale_symbol_files.insert(symbol.clone());
+            o.fail_symbol_writes = [true].into();
+        };
+        let pass = |o: &mut Open| {
+            o.stale_symbol_files.clear();
+            o.fail_symbol_writes = Default::default();
+        };
+        // A failed Undo puts the folded step back as it was.
+        fail(&mut o);
+        assert!(!o.undo());
+        assert!(o.take_undo_error().is_some());
+        pass(&mut o);
+        assert!(o.take_back_move(id, &page, std::slice::from_ref(&g)).is_err());
+        // The same for a failed Redo, with the folded step waiting in the redo history.
+        assert!(o.undo(), "{:?}", o.take_undo_error());
+        fail(&mut o);
+        assert!(!o.redo());
+        assert!(o.take_undo_error().is_some());
+        pass(&mut o);
+        assert!(o.take_back_move(id, &page, std::slice::from_ref(&g)).is_err());
+    }
+
+    #[test]
+    fn a_move_is_not_taken_back_under_an_assistant_turn_begun_after_it() {
+        let (_tmp, mut o) = project();
+        let id = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let sel = [Selection::Symbol(id)];
+        let page = o.project.pages[1].id.clone();
+        o.begin_drag_move();
+        let Some(step) = o.last_step_id() else { unreachable!() };
+        o.drag_move_by(1, &sel, Point::new(-10.0, 0.0));
+        let mark = o.start_turn();
+        o.rotate_many(1, &sel);
+        o.rotate_many(1, &sel);
+        assert!(o.take_back_move(step, &page, &sel).is_err());
+        let steps = o.undo_steps();
+        o.squash_undo(mark);
+        assert_eq!(o.undo_steps(), steps - 1, "the turn's two steps fold into one");
+    }
+
     fn macro_edited_twice() -> (tempfile::TempDir, Open, PathBuf, [String; 3]) {
         let (tmp, mut o) = project();
         let id = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
@@ -6646,6 +7021,299 @@ pub(crate) mod tests {
         o.place(1, "wc.coil", Point::new(40.0, 20.0)).unwrap();
         assert_eq!(o.symbols["wc.coil"], old);
         assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), old);
+    }
+
+    #[test]
+    fn a_refused_change_puts_back_a_symbol_it_replaced_with_the_pinned_version() {
+        let (_tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let old = o.symbols["wc.coil"].clone();
+        o.save().unwrap();
+        let mut new = old.clone();
+        new.name = "Coil, changed".into();
+        store::write_vendored_symbol(&o.dir, &new).unwrap();
+        let mut o = Open::load(&o.dir).unwrap();
+        assert_eq!(o.symbols["wc.coil"], new, "loaded as the file has it");
+        // The pinned copy put back, then a change places with it and is refused.
+        store::write_vendored_symbol(&o.dir, &old).unwrap();
+        let m = o.mark();
+        o.place(1, "wc.coil", Point::new(40.0, 20.0)).unwrap();
+        assert_eq!(o.symbols["wc.coil"], old, "the change loaded the pinned version");
+        o.back_to(m).unwrap();
+        assert_eq!(o.symbols["wc.coil"], new, "the symbol loaded at the mark is back");
+        // It is not the pinned version, so its file is left as it is.
+        assert!(!o.stale_symbol_files.contains("wc.coil"));
+        assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), old);
+    }
+
+    /// A saved project with one black box on page 1: its item and symbol ids.
+    fn saved_box() -> (tempfile::TempDir, Open, String, String) {
+        let (tmp, mut o) = project();
+        let id = o
+            .add_black_box(1, Point::new(40.0, 40.0), Point::new(60.0, 50.0), &box_pin(), None)
+            .unwrap();
+        let symbol_id = format!("box.{}.{id}", o.project.pages[1].id);
+        o.save().unwrap();
+        (tmp, o, id, symbol_id)
+    }
+
+    /// The one point of the box [`saved_box`] places.
+    fn box_pin() -> [wc_core::BoxPin; 1] {
+        [wc_core::BoxPin {
+            name: "IN".into(),
+            side: wc_core::BoxSide::Left,
+            offset: 5.0,
+        }]
+    }
+
+    /// Black box `id` on page 1 made 30 mm wide, its point kept.
+    fn widen_box(o: &mut Open, id: &str) {
+        o.edit_black_box(1, id, (30.0, 10.0), &box_pin(), &BTreeMap::new(), &Default::default())
+            .unwrap();
+    }
+
+    #[test]
+    fn a_refused_box_edit_is_unsaved_work_until_its_file_is_written_back() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let old = o.symbols[&symbol_id].clone();
+        let m = o.mark();
+        widen_box(&mut o, &id);
+        assert_ne!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), old);
+        o.back_to(m).unwrap();
+        assert_eq!(o.symbols[&symbol_id], old);
+        assert!(o.dirty, "the box file still holds the refused edit");
+        o.save().unwrap();
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), old);
+    }
+
+    #[test]
+    fn a_box_edit_repeated_after_a_refusal_is_not_saved_over_by_the_repair() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let m = o.mark();
+        widen_box(&mut o, &id);
+        o.back_to(m).unwrap();
+        // The same edit again, kept: its file holds the version the project now pins.
+        widen_box(&mut o, &id);
+        let accepted = o.symbols[&symbol_id].clone();
+        assert_eq!(o.project.lock.symbols[&symbol_id].hash, accepted.hash());
+        o.save().unwrap();
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(),
+            accepted,
+            "the repair queued by the refusal does not write the old version over it"
+        );
+    }
+
+    #[test]
+    fn a_box_edit_repeated_over_a_file_changed_outside_while_its_repair_waits_is_refused() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let old = o.symbols[&symbol_id].clone();
+        let m = o.mark();
+        widen_box(&mut o, &id);
+        o.back_to(m).unwrap();
+        let mut other = old.clone();
+        other.name = "Box, changed".into();
+        store::write_vendored_symbol(&o.dir, &other).unwrap();
+        let err = o
+            .edit_black_box(1, &id, (30.0, 10.0), &box_pin(), &BTreeMap::new(), &Default::default())
+            .unwrap_err();
+        assert!(err.contains("changed outside"), "{err}");
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), other);
+        // The repair still waits, so Save still asks about that version.
+        let err = o.save().unwrap_err();
+        assert!(err.contains(Open::CHANGED_OUTSIDE), "{err}");
+    }
+
+    #[test]
+    fn an_undo_that_writes_a_symbol_file_lets_its_pending_repair_go() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let first = o.symbols[&symbol_id].clone();
+        widen_box(&mut o, &id);
+        // A further edit is refused: its repair waits to write the widened version.
+        let m = o.mark();
+        o.edit_black_box(1, &id, (40.0, 10.0), &box_pin(), &BTreeMap::new(), &Default::default())
+            .unwrap();
+        o.back_to(m).unwrap();
+        // Undo takes the widening back and writes the first version to the file.
+        assert!(o.undo());
+        assert_eq!(o.project.lock.symbols[&symbol_id].hash, first.hash());
+        o.save().unwrap();
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(),
+            first,
+            "the repair does not write the widened version over what Undo wrote"
+        );
+    }
+
+    #[test]
+    fn a_symbol_file_changed_outside_before_a_box_edit_is_refused_is_not_written_over_unasked() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let old = o.symbols[&symbol_id].clone();
+        let m = o.mark();
+        widen_box(&mut o, &id);
+        // Another program changes the box file before the edit is refused.
+        let mut other = old.clone();
+        other.name = "Box, changed".into();
+        store::write_vendored_symbol(&o.dir, &other).unwrap();
+        o.back_to(m).unwrap();
+        let err = o.save().unwrap_err();
+        assert!(err.contains(Open::CHANGED_OUTSIDE), "{err}");
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), other);
+    }
+
+    #[test]
+    fn a_symbol_file_repaired_on_save_is_not_written_again_unchecked() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let old = o.symbols[&symbol_id].clone();
+        let m = o.mark();
+        widen_box(&mut o, &id);
+        o.back_to(m).unwrap();
+        // The checked repair writes the file; a second, unchecked write would fail here.
+        o.fail_symbol_writes = [true].into();
+        o.save().unwrap();
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), old);
+    }
+
+    #[test]
+    fn nested_refused_changes_never_save_a_symbol_version_the_project_does_not_pin() {
+        let (_tmp, o, id, symbol_id) = saved_box();
+        let pinned = o.symbols[&symbol_id].clone();
+        // The box file is changed outside the app: loaded as the file has it.
+        let mut other = pinned.clone();
+        other.name = "Box, changed".into();
+        store::write_vendored_symbol(&o.dir, &other).unwrap();
+        let mut o = Open::load(&o.dir).unwrap();
+        assert_eq!(o.symbols[&symbol_id], other);
+        let listed = o.library.clone();
+        // The pinned copy put back; a change loads it and edits the box in an inner change.
+        store::write_vendored_symbol(&o.dir, &pinned).unwrap();
+        let outer = o.mark();
+        o.ensure_symbol(&symbol_id).unwrap();
+        o.refresh_library();
+        let inner = o.mark();
+        widen_box(&mut o, &id);
+        o.back_to(inner).unwrap();
+        assert!(o.stale_symbol_files.contains(&symbol_id));
+        o.back_to(outer).unwrap();
+        assert_eq!(o.symbols[&symbol_id], other, "the symbol loaded at the mark is back");
+        assert_eq!(o.library, listed, "and so is its list row");
+        assert!(o.dirty, "the box file still holds the refused edit");
+        o.save().unwrap();
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(),
+            pinned,
+            "the file holds the version the project pins, not the refused edit or the loaded one"
+        );
+    }
+
+    #[test]
+    fn a_repair_queued_by_a_refused_change_follows_the_pin_an_enclosing_refusal_puts_back() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let first = o.symbols[&symbol_id].clone();
+        // The outer change edits the box: the project pins that version.
+        let outer = o.mark();
+        widen_box(&mut o, &id);
+        let pinned = o.symbols[&symbol_id].clone();
+        assert_ne!(pinned, first);
+        // Another program changes the box file and it is read in; then the pinned copy is put
+        // back, and a middle change loads it and edits the box in an inner change.
+        let mut other = pinned.clone();
+        other.name = "Box, changed".into();
+        store::write_vendored_symbol(&o.dir, &other).unwrap();
+        o.reload_symbols();
+        assert_eq!(o.symbols[&symbol_id], other);
+        store::write_vendored_symbol(&o.dir, &pinned).unwrap();
+        let middle = o.mark();
+        o.ensure_symbol(&symbol_id).unwrap();
+        let inner = o.mark();
+        o.edit_black_box(1, &id, (40.0, 10.0), &box_pin(), &BTreeMap::new(), &Default::default())
+            .unwrap();
+        o.back_to(inner).unwrap();
+        o.back_to(middle).unwrap();
+        // The middle refusal queued the middle pin for the box file; the outer refusal pins the
+        // first version again.
+        o.back_to(outer).unwrap();
+        assert_eq!(o.project.lock.symbols[&symbol_id].hash, first.hash());
+        assert_eq!(o.symbols[&symbol_id], first);
+        assert!(o.dirty, "the box file still holds the refused edit");
+        o.save().unwrap();
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(),
+            first,
+            "the file holds the version the project pins again, not one a refused change pinned"
+        );
+    }
+
+    #[test]
+    fn a_symbol_file_changed_outside_while_its_repair_waits_is_not_written_over_unasked() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let old = o.symbols[&symbol_id].clone();
+        let m = o.mark();
+        widen_box(&mut o, &id);
+        o.back_to(m).unwrap();
+        // Another program changes the box file before the repair is saved.
+        let mut other = old.clone();
+        other.name = "Box, changed".into();
+        store::write_vendored_symbol(&o.dir, &other).unwrap();
+        let err = o.save().unwrap_err();
+        assert!(err.contains(Open::CHANGED_OUTSIDE), "{err}");
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), other);
+        // Keeping that version leaves it in its file.
+        let path = o.changed_outside().unwrap();
+        o.keep_outside_version(&path);
+        o.save().unwrap();
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), other);
+    }
+
+    #[test]
+    fn a_symbol_repair_written_over_an_outside_change_on_request_holds_the_pinned_version() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let old = o.symbols[&symbol_id].clone();
+        let m = o.mark();
+        widen_box(&mut o, &id);
+        o.back_to(m).unwrap();
+        let mut other = old.clone();
+        other.name = "Box, changed".into();
+        store::write_vendored_symbol(&o.dir, &other).unwrap();
+        assert!(o.save().is_err());
+        let path = o.changed_outside().unwrap();
+        o.write_over_outside_version(&path);
+        o.save().unwrap();
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), old);
+    }
+
+    #[test]
+    fn a_box_edit_refused_inside_a_refused_change_is_unsaved_work() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let old = o.symbols[&symbol_id].clone();
+        let outer = o.mark();
+        let inner = o.mark();
+        widen_box(&mut o, &id);
+        o.back_to(inner).unwrap();
+        o.back_to(outer).unwrap();
+        assert!(o.dirty, "the box file still holds the refused edit");
+        o.save().unwrap();
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), old);
+    }
+
+    #[test]
+    fn a_symbol_file_another_program_wrote_during_a_refused_change_is_left_as_it_is() {
+        let (_tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let old = o.symbols["wc.coil"].clone();
+        o.save().unwrap();
+        let m = o.mark();
+        // Another program writes another version, which the change reads in.
+        let mut other = old.clone();
+        other.name = "Coil, changed".into();
+        store::write_vendored_symbol(&o.dir, &other).unwrap();
+        o.reload_symbols();
+        assert_eq!(o.symbols["wc.coil"], other);
+        o.back_to(m).unwrap();
+        assert_eq!(o.symbols["wc.coil"], old);
+        assert!(!o.stale_symbol_files.contains("wc.coil"));
+        o.save().unwrap();
+        assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), other);
     }
 
     #[test]
