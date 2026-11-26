@@ -695,7 +695,14 @@ fn shapes(
                     );
                 } else {
                     // A cut-down file or an xref: the block is not here to draw.
-                    let name = e.get(2).unwrap_or_default().trim();
+                    // The name goes into a warning a terminal shows: no control characters.
+                    let name: String = e
+                        .get(2)
+                        .unwrap_or_default()
+                        .trim()
+                        .chars()
+                        .map(|c| if c.is_control() { '?' } else { c })
+                        .collect();
                     *skipped.entry(format!("{MISSING_BLOCK}{name}")).or_default() += 1;
                 }
                 None
@@ -2556,6 +2563,14 @@ mod tests {
         assert_eq!(
             warnings,
             ["6 block inserts not drawn: their block is not in the file ((no name), A, B, ...)"]
+        );
+
+        // A name with control characters is shown without them.
+        let ents = format!("{line}0\nINSERT\n2\nX\u{1b}[2J\n10\n0\n20\n0\n");
+        let (_, warnings) = symbol_with_warnings(&dxf(&ents, ""), "my.part", "Part")?;
+        assert_eq!(
+            warnings,
+            ["1 block insert not drawn: its block is not in the file (X?[2J)"]
         );
         Ok(())
     }
