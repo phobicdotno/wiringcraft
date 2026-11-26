@@ -566,9 +566,9 @@ fn shapes(
             "TEXT" | "MTEXT" | "ATTRIB" => {
                 let raw = e.get(1).unwrap_or("");
                 let text = if e.kind == "MTEXT" {
-                    mtext_plain(raw)
+                    special_codes(&mtext_plain(raw))
                 } else {
-                    raw.to_owned()
+                    special_codes(raw)
                 };
                 let align = match e.f(72) as i64 {
                     1 | 4 => Align::Center,
@@ -1770,6 +1770,10 @@ fn mtext_plain(s: &str) -> String {
                 Some('\\') => out.push('\\'),
                 Some('{') => out.push('{'),
                 Some('}') => out.push('}'),
+                Some('U') if chars.peek() == Some(&'+') => {
+                    // `\U+XXXX`: a character by its code; decoded with the rest of the text.
+                    out.push_str("\\U");
+                }
                 Some(_) => {
                     // Formatting code: skip to ';' if it takes an argument.
                     let rest: String = chars.clone().take_while(|c| *c != ';' && *c != '\\').collect();
@@ -1785,6 +1789,70 @@ fn mtext_plain(s: &str) -> String {
             c => out.push(c),
         }
     }
+    out
+}
+
+/// `\U+XXXX` (four hex digits) is the character with that code, as CAD programs write any
+/// character outside ASCII. Anything else is kept as written.
+fn unicode_codes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(at) = rest.find("\\U+") {
+        out.push_str(&rest[..at]);
+        let code = rest
+            .get(at + 3..at + 7)
+            .filter(|h| h.chars().all(|c| c.is_ascii_hexdigit()));
+        match code
+            .and_then(|h| u32::from_str_radix(h, 16).ok())
+            .and_then(char::from_u32)
+        {
+            Some(c) => {
+                out.push(c);
+                rest = &rest[at + 7..];
+            }
+            None => {
+                out.push_str("\\U+");
+                rest = &rest[at + 3..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The `%%` codes of DXF texts: `%%c` diameter, `%%d` degree, `%%p` plus/minus, `%%%` a percent
+/// sign; `%%u` and `%%o` (underline and overline on/off) are dropped. Anything else is kept.
+fn special_codes(s: &str) -> String {
+    let s = unicode_codes(s);
+    if !s.contains("%%") {
+        return s;
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s.as_str();
+    while let Some(at) = rest.find("%%") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 2..];
+        let code = after.chars().next().map(|c| c.to_ascii_lowercase());
+        let decoded = match code {
+            Some('c') => Some("\u{2300}"),
+            Some('d') => Some("\u{b0}"),
+            Some('p') => Some("\u{b1}"),
+            Some('%') => Some("%"),
+            Some('u' | 'o') => Some(""),
+            _ => None,
+        };
+        match decoded {
+            Some(d) => {
+                out.push_str(d);
+                rest = &after[1..];
+            }
+            None => {
+                out.push_str("%%");
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
     out
 }
 
@@ -2335,6 +2403,29 @@ mod tests {
     #[test]
     fn mtext_formatting_is_stripped() {
         assert_eq!(mtext_plain(r"{\fArial|b1;Motor}\PM1"), "Motor M1");
+    }
+
+    #[test]
+    fn text_codes_become_characters() -> Result<()> {
+        assert_eq!(
+            special_codes(r"\U+00C5lesund 3%%c 20%%D %%p1 50%%% %%uline%%u"),
+            "\u{c5}lesund 3\u{2300} 20\u{b0} \u{b1}1 50% line"
+        );
+        // Malformed codes stay as written.
+        assert_eq!(special_codes(r"\U+00G1 \U+12 100%% %%x"), r"\U+00G1 \U+12 100%% %%x");
+        let ents = "0\nTEXT\n8\n0\n10\n5\n20\n5\n40\n2\n1\n\\U+00C5lesund %%c6\n\
+                    0\nMTEXT\n8\n0\n10\n5\n20\n9\n40\n2\n1\n{\\fArial;\\U+00D8st}\\P20%%d\n";
+        let p = page(&dxf(ents, ""), 1.0, &BTreeSet::new())?;
+        let texts: Vec<&str> = p
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["\u{c5}lesund \u{2300}6", "\u{d8}st 20\u{b0}"]);
+        Ok(())
     }
 
     /// Every graphic of a drawing in DXF coordinates turned to page ones (y down, scale 1).
