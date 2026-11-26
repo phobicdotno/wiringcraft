@@ -98,26 +98,59 @@ impl Attach {
             Attach::Model => ("STEP models", &["step", "stp", "STEP", "STP"]),
         }
     }
+
+    /// The extensions to name in a text, each once whatever its case: `.step, .stp`.
+    fn extensions(self) -> String {
+        let mut shown: Vec<String> = Vec::new();
+        for x in self.filter().1 {
+            let x = format!(".{}", x.to_lowercase());
+            if !shown.contains(&x) {
+                shown.push(x);
+            }
+        }
+        shown.join(", ")
+    }
 }
 
+/// The system's file picker for one file ([`crate::pick_open`]), or a stand-in for it in tests.
+type PickOpen<'a> = &'a dyn Fn(&str, &std::path::Path, (&str, &[&str])) -> crate::Picked;
+
 /// Attach footprint drawing or Attach 3D model without a file picker: the file typed, for
-/// which part, and why the picker could not be used (or why the typed path cannot).
+/// which device's part, and why the picker could not be used (or why the typed path cannot).
 #[derive(Debug, Clone, PartialEq)]
 struct AttachPath {
     what: Attach,
+    /// The panel layout and the device on it the form was opened for.
+    panel: usize,
+    item: usize,
     part: String,
     file: crate::prefs::FolderField,
     error: Option<String>,
 }
 
+/// A typed path without the spaces around it and the double quotes Windows' "Copy as path"
+/// puts around it.
+fn unquoted(typed: &str) -> &str {
+    let t = typed.trim();
+    t.strip_prefix('"')
+        .and_then(|t| t.strip_suffix('"'))
+        .map_or(t, str::trim)
+}
+
 impl AttachPath {
+    /// The form is the one for device `item` of panel layout `panel` with part `part`.
+    fn is_for(&self, panel: usize, item: usize, part: &str) -> bool {
+        (self.panel, self.item, self.part.as_str()) == (panel, item, part)
+    }
+
     /// The typed file when it is one; otherwise the reason is kept to show and nothing is given.
     fn typed_file(&mut self) -> Option<std::path::PathBuf> {
-        if self.file.is_empty() {
+        let typed = unquoted(&self.file.text);
+        if typed.is_empty() {
             self.error = Some("Type the full path of the file.".into());
             return None;
         }
-        match self.file.path() {
+        match crate::prefs::project_path(typed) {
             Ok(f) if f.is_file() => Some(f),
             Ok(f) => {
                 self.error = Some(format!("{} is not a file.", f.display()));
@@ -131,22 +164,47 @@ impl AttachPath {
     }
 }
 
-/// What the file picker's answer means for attaching `what` to `part`: the file to attach, or
-/// the form to type its path in when the picker could not open (or perhaps never showed), with
-/// the reason. Neither on Cancel.
-fn attach_picked(what: Attach, part: &str, picked: crate::Picked) -> (Option<std::path::PathBuf>, Option<AttachPath>) {
+/// What the file picker's answer means for attaching `what` to `part`, the part of device
+/// `item` on panel layout `panel`: the file to attach, or the form to type its path in when the
+/// picker could not open (or perhaps never showed), with the reason. Neither on Cancel.
+fn attach_picked(
+    what: Attach,
+    (panel, item): (usize, usize),
+    part: &str,
+    picked: crate::Picked,
+) -> (Option<std::path::PathBuf>, Option<AttachPath>) {
     match picked {
         crate::Picked::Path(f) => (Some(f), None),
         crate::Picked::Failed(e) | crate::Picked::Unsure(e) => (
             None,
             Some(AttachPath {
                 what,
+                panel,
+                item,
                 part: part.to_owned(),
                 file: crate::prefs::FolderField::default(),
                 error: Some(format!("{e} Type the file's full path instead.")),
             }),
         ),
         crate::Picked::Cancelled => (None, None),
+    }
+}
+
+/// What the answer to an attach means for the typed-path form, and the message to show: the
+/// form closes once the file is attached, and stays open with its path and the reason when the
+/// file could not be attached, so the path can be corrected.
+fn attach_answered(form: &mut Option<AttachPath>, answer: Result<String, String>) -> String {
+    match answer {
+        Ok(done) => {
+            *form = None;
+            done
+        }
+        Err(why) => {
+            if let Some(form) = form {
+                form.error = Some(why.clone());
+            }
+            why
+        }
     }
 }
 
@@ -1108,9 +1166,11 @@ pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut 
     section(ui, "Properties", None);
     forget_spec_unless_wires(ed, ps);
     if let Some(pi) = ed.panel {
-        panel_properties(ui, open, ed, ps, pi);
+        panel_properties(ui, open, ed, ps, pi, &crate::pick_open);
         return;
     }
+    // The panel layout was left: a path being typed there is dropped.
+    ps.attach_path = None;
     if ed.selection.is_empty()
         && let Some(id) = ed.comment.clone()
     {
@@ -2024,15 +2084,23 @@ pub fn status_bar(ui: &mut egui::Ui, open: Option<&Open>, ed: &Editor, live: Opt
 
 /// The properties of the panel layout shown: plate size, the picked device, and the devices
 /// with a part that are not on the plate yet.
-fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut PanelState, pi: usize) {
+fn panel_properties(
+    ui: &mut egui::Ui,
+    open: &mut Open,
+    ed: &mut Editor,
+    ps: &mut PanelState,
+    pi: usize,
+    pick: PickOpen<'_>,
+) {
     use wc_core::panel::{PanelItem, on_door, part_size};
     let t = Theme::of(ui.ctx());
     // The footprint drawing or STEP model picked (or typed) below, attached once the panel is
     // drawn.
     let mut attach: Option<(Attach, String, std::path::PathBuf)> = None;
-    // The part of the device shown: a path being typed for another part is dropped.
-    let mut shown_part: Option<String> = None;
+    // The device shown and its part: a path being typed for another device is dropped.
+    let mut shown: Option<(usize, String)> = None;
     let Some(panel) = open.project.panels.get(pi) else {
+        ps.attach_path = None;
         return;
     };
     ui.label(RichText::new(&panel.name).strong());
@@ -2098,8 +2166,8 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mu
                 ui.end_row();
             });
         // A maker's outline drawing for the device's part (#484).
-        let part = dev.and_then(|d| d.part.clone());
-        if let Some(part) = part {
+        let part = dev.and_then(|d| d.part.clone()).zip(ed.panel_pick);
+        if let Some((part, item)) = part {
             let has = open.parts.get(&part).is_some_and(|p| p.footprint.is_some());
             let label = if has {
                 "Replace footprint drawing..."
@@ -2108,8 +2176,8 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mu
             };
             // The picker File > Import uses: where none can open, the path is typed below.
             let ask = |ps: &mut PanelState, what: Attach| {
-                let picked = crate::pick_open(what.title(), &open.dir, what.filter());
-                let (file, typed) = attach_picked(what, &part, picked);
+                let picked = pick(what.title(), &open.dir, what.filter());
+                let (file, typed) = attach_picked(what, (pi, item), &part, picked);
                 ps.attach_path = typed;
                 file.map(|f| (what, part.clone(), f))
             };
@@ -2138,16 +2206,17 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mu
             {
                 attach = ask(ps, Attach::Model);
             }
-            if let Some(form) = ps.attach_path.as_mut().filter(|f| f.part == part) {
-                let (done, typed) = attach_path_form(ui, form, &t);
+            if let Some(form) = ps.attach_path.as_mut().filter(|f| f.is_for(pi, item, &part)) {
+                // The form stays until the file is attached (below) or Cancel is pressed.
+                let (cancelled, typed) = attach_path_form(ui, form, &t);
                 if let Some(file) = typed {
                     attach = Some((form.what, part.clone(), file));
                 }
-                if done {
+                if cancelled {
                     ps.attach_path = None;
                 }
             }
-            shown_part = Some(part);
+            shown = Some((item, part));
         }
         ui.add_space(6.0);
     } else {
@@ -2178,19 +2247,20 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mu
         }
         ui.label(RichText::new("Page menu → Arrange devices puts them on the rails.").color(t.faint));
     }
+    // Another device, or none, is shown: the path typed for the one before is not for it.
     if ps
         .attach_path
         .as_ref()
-        .is_some_and(|f| shown_part.as_deref() != Some(f.part.as_str()))
+        .is_some_and(|f| !shown.as_ref().is_some_and(|(item, part)| f.is_for(pi, *item, part)))
     {
         ps.attach_path = None;
     }
     if let Some((what, part, file)) = attach {
-        ed.message = match what {
+        let answer = match what {
             Attach::Footprint => open.attach_footprint(&part, &file),
             Attach::Model => open.attach_model(&part, &file),
-        }
-        .unwrap_or_else(|e| e);
+        };
+        ed.message = attach_answered(&mut ps.attach_path, answer);
     }
     if let Some(item) = turn
         && !open.rotate_panel_device(pi, item)
@@ -2200,15 +2270,15 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mu
 }
 
 /// The form to type the file of an attachment in, shown under the buttons when no file picker
-/// could open: whether it is done with (attached or cancelled), and the file to attach.
+/// could open: whether Cancel was pressed, and the file to attach.
 fn attach_path_form(ui: &mut egui::Ui, form: &mut AttachPath, t: &Theme) -> (bool, Option<std::path::PathBuf>) {
-    let (label, extensions) = form.what.filter();
+    let (label, _) = form.what.filter();
     ui.add_space(4.0);
     ui.label(format!(
-        "{} for {} ({label}: .{}), full path:",
+        "{} for {} ({label}: {}), full path:",
         form.what.title(),
         form.part,
-        extensions.join(", .")
+        form.what.extensions()
     ));
     let r = ui.add(egui::TextEdit::singleline(&mut form.file.text).desired_width(f32::INFINITY));
     if let Some(e) = &form.error {
@@ -2218,7 +2288,7 @@ fn attach_path_form(ui: &mut egui::Ui, form: &mut AttachPath, t: &Theme) -> (boo
     ui.horizontal(|ui| {
         let go = ui.button("Attach").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
         if go && let Some(file) = form.typed_file() {
-            out = (true, Some(file));
+            out = (false, Some(file));
         }
         if ui.button("Cancel").clicked() {
             out = (true, None);
@@ -2255,7 +2325,7 @@ mod tests {
             (Attach::Footprint, crate::Picked::Failed(why.clone())),
             (Attach::Model, crate::Picked::Unsure(why.clone())),
         ] {
-            let (file, form) = attach_picked(what, "acme.relay", picked);
+            let (file, form) = attach_picked(what, (0, 1), "acme.relay", picked);
             assert_eq!(file, None);
             let form = form.ok_or("no form to type the path in")?;
             assert_eq!((form.what, form.part.as_str()), (what, "acme.relay"));
@@ -2269,17 +2339,22 @@ mod tests {
         // A picked file is attached as before, and Cancel does nothing.
         let picked = std::path::PathBuf::from("outline.dxf");
         assert_eq!(
-            attach_picked(Attach::Footprint, "acme.relay", crate::Picked::Path(picked.clone())),
+            attach_picked(
+                Attach::Footprint,
+                (0, 1),
+                "acme.relay",
+                crate::Picked::Path(picked.clone())
+            ),
             (Some(picked), None)
         );
         assert_eq!(
-            attach_picked(Attach::Model, "acme.relay", crate::Picked::Cancelled),
+            attach_picked(Attach::Model, (0, 1), "acme.relay", crate::Picked::Cancelled),
             (None, None)
         );
 
         // The typed path is taken when it is a file; anything else says why and stays open.
         let tmp = tempfile::tempdir()?;
-        let (_, form) = attach_picked(Attach::Footprint, "acme.relay", crate::Picked::Failed(why));
+        let (_, form) = attach_picked(Attach::Footprint, (0, 1), "acme.relay", crate::Picked::Failed(why));
         let mut form = form.ok_or("no form")?;
         assert_eq!(form.typed_file(), None);
         assert_eq!(form.error.as_deref(), Some("Type the full path of the file."));
@@ -2292,7 +2367,221 @@ mod tests {
         let file = tmp.path().join("outline.dxf");
         std::fs::write(&file, "0\nEOF\n")?;
         form.file.text = file.display().to_string();
+        assert_eq!(form.typed_file(), Some(file.clone()));
+        // Windows' "Copy as path" puts double quotes around the path: they are not part of it.
+        form.file.text = format!(" \"{}\" ", file.display());
         assert_eq!(form.typed_file(), Some(file));
+        assert_eq!(unquoted("\"C:\\parts\\a b.dxf\""), "C:\\parts\\a b.dxf");
+        assert_eq!(unquoted("\"half"), "\"half", "one quote alone is left as typed");
+        form.file.text = "\"\"".into();
+        assert_eq!(form.typed_file(), None);
+        assert_eq!(form.error.as_deref(), Some("Type the full path of the file."));
+        Ok(())
+    }
+
+    #[test]
+    fn a_typed_path_that_cannot_be_attached_keeps_its_form_open() -> Result<(), Box<dyn std::error::Error>> {
+        let (_, form) = attach_picked(
+            Attach::Footprint,
+            (0, 1),
+            "acme.relay",
+            crate::Picked::Failed("No picker.".into()),
+        );
+        let mut form = form.ok_or("no form")?;
+        form.file.text = "outline.dxf".into();
+        let mut state = Some(form);
+        let said = attach_answered(&mut state, Err("outline.dxf: not a DXF drawing".into()));
+        assert_eq!(said, "outline.dxf: not a DXF drawing");
+        let form = state.as_ref().ok_or("the form was closed")?;
+        assert_eq!(form.file.text, "outline.dxf");
+        assert_eq!(form.error.as_deref(), Some("outline.dxf: not a DXF drawing"));
+        // Attached: the form closes and the message says what was done.
+        assert_eq!(
+            attach_answered(&mut state, Ok("Footprint stored".into())),
+            "Footprint stored"
+        );
+        assert_eq!(state, None);
+        // A file from the picker has no form: the reason is the message alone.
+        assert_eq!(attach_answered(&mut state, Err("no".into())), "no");
+        assert_eq!(state, None);
+        Ok(())
+    }
+
+    /// The panel layout properties of a plate with two devices of one part, the first picked,
+    /// on a system where no file picker opens.
+    struct PlatePanel {
+        _tmp: tempfile::TempDir,
+        o: Open,
+        ed: Editor,
+        ps: PanelState,
+        ctx: egui::Context,
+    }
+
+    impl PlatePanel {
+        fn new() -> Self {
+            use wc_core::panel::{Panel, PanelItem};
+            let (_tmp, mut o) = crate::state::tests::project();
+            let mut plate = Panel::new("panel1", "Plate", 400.0, 400.0);
+            for (tag, x) in [("-K1", 50.0), ("-K2", 150.0)] {
+                let tag = wc_core::DeviceTag::parse(tag).unwrap_or_default();
+                o.project.devices.insert(
+                    tag.clone(),
+                    wc_core::project::Device {
+                        part: Some("acme.relay".into()),
+                        ..Default::default()
+                    },
+                );
+                plate.items.push(PanelItem::Device {
+                    tag,
+                    at: wc_core::Point::new(x, 50.0),
+                    width: 20.0,
+                    height: 80.0,
+                    rotation: wc_core::geom::Rotation::R0,
+                });
+            }
+            o.project.panels = vec![plate];
+            let mut ed = Editor::default();
+            ed.panel = Some(0);
+            ed.panel_pick = Some(0);
+            let ctx = egui::Context::default();
+            crate::theme::install_fonts(&ctx);
+            let mut me = Self {
+                _tmp,
+                o,
+                ed,
+                ps: PanelState::default(),
+                ctx,
+            };
+            // Grids lay out over a frame before they show.
+            me.frame(Vec::new());
+            me.frame(Vec::new());
+            me
+        }
+
+        /// One frame of the panel layout properties: the texts drawn and where.
+        fn frame(&mut self, events: Vec<egui::Event>) -> Vec<(String, egui::Pos2)> {
+            let input = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let (o, ed, ps) = (&mut self.o, &mut self.ed, &mut self.ps);
+            let no_picker: PickOpen<'_> = &|_, _, _| crate::Picked::Failed("No file picker could open.".into());
+            let out = self.ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if let Some(pi) = ed.panel {
+                        panel_properties(ui, o, ed, ps, pi, no_picker);
+                    }
+                });
+            });
+            let mut texts = Vec::new();
+            for clipped in out.shapes {
+                if let egui::Shape::Text(t) = clipped.shape {
+                    let middle = t.pos + t.galley.rect.center().to_vec2();
+                    texts.push((t.galley.text().to_owned(), middle));
+                }
+            }
+            texts
+        }
+
+        /// Click the button labelled `label`; the texts drawn once it is released.
+        fn click(&mut self, label: &str) -> Result<Vec<String>, String> {
+            let at = self
+                .frame(Vec::new())
+                .into_iter()
+                .find_map(|(text, at)| (text == label).then_some(at))
+                .ok_or(format!("no {label:?} button"))?;
+            let button = |pressed: bool| egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            self.frame(vec![egui::Event::PointerMoved(at)]);
+            self.frame(vec![button(true)]);
+            self.frame(vec![button(false)]);
+            Ok(self.frame(Vec::new()).into_iter().map(|(text, _)| text).collect())
+        }
+    }
+
+    #[test]
+    fn an_attach_button_without_a_file_picker_shows_the_typed_path_form() -> Result<(), Box<dyn std::error::Error>> {
+        for (label, what) in [
+            ("Attach footprint drawing...", Attach::Footprint),
+            ("Attach 3D model...", Attach::Model),
+        ] {
+            let mut p = PlatePanel::new();
+            assert_eq!(p.ps.attach_path, None);
+            let texts = p.click(label)?;
+            let form = p.ps.attach_path.as_ref().ok_or("no form to type the path in")?;
+            assert!(form.what == what && form.is_for(0, 0, "acme.relay"), "{form:?}");
+            assert!(
+                texts
+                    .iter()
+                    .any(|t| t == "No file picker could open. Type the file's full path instead."),
+                "{texts:?}"
+            );
+            assert!(texts.iter().any(|t| t == "Cancel"), "{texts:?}");
+            assert_eq!(p.ed.message, "", "nothing was attached");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_typed_file_that_is_refused_stays_in_the_form_with_the_reason() -> Result<(), Box<dyn std::error::Error>> {
+        let mut p = PlatePanel::new();
+        p.click("Attach footprint drawing...")?;
+        // A file that is there, for a part none of the project's libraries has.
+        let file = p.o.dir.join("outline.dxf");
+        std::fs::write(&file, "0\nEOF\n")?;
+        let typed = format!("\"{}\"", file.display());
+        p.ps.attach_path.as_mut().ok_or("no form")?.file.text = typed.clone();
+        let texts = p.click("Attach")?;
+        let form = p.ps.attach_path.as_ref().ok_or("the form was closed")?;
+        assert_eq!(form.file.text, typed);
+        let why = form.error.clone().ok_or("no reason in the form")?;
+        assert!(
+            !why.contains("could not open"),
+            "the picker's reason is replaced: {why}"
+        );
+        assert_eq!(p.ed.message, why);
+        assert!(texts.contains(&why), "{texts:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn the_typed_path_form_does_not_follow_to_another_device() -> Result<(), Box<dyn std::error::Error>> {
+        // Another device of the same part is picked.
+        let mut p = PlatePanel::new();
+        p.click("Attach footprint drawing...")?;
+        assert!(p.ps.attach_path.is_some());
+        p.ed.panel_pick = Some(1);
+        let texts = p.frame(Vec::new());
+        assert_eq!(p.ps.attach_path, None);
+        assert!(!texts.iter().any(|(t, _)| t == "Cancel"), "{texts:?}");
+
+        // Nothing is picked.
+        let mut p = PlatePanel::new();
+        p.click("Attach 3D model...")?;
+        p.ed.panel_pick = None;
+        p.frame(Vec::new());
+        assert_eq!(p.ps.attach_path, None);
+
+        // The panel layout shown is gone (the early way out).
+        let mut p = PlatePanel::new();
+        p.click("Attach footprint drawing...")?;
+        p.ed.panel = Some(7);
+        p.frame(Vec::new());
+        assert_eq!(p.ps.attach_path, None);
+
+        // The panel layout is left for a page.
+        let mut p = PlatePanel::new();
+        p.click("Attach footprint drawing...")?;
+        p.ed.panel = None;
+        let (o, ed, ps) = (&mut p.o, &mut p.ed, &mut p.ps);
+        let _ = p.ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| properties(ui, o, ed, ps));
+        });
+        assert_eq!(p.ps.attach_path, None);
         Ok(())
     }
 
@@ -2300,6 +2589,7 @@ mod tests {
     fn the_typed_path_form_shows_why_the_picker_could_not_open() -> Result<(), Box<dyn std::error::Error>> {
         let (_, form) = attach_picked(
             Attach::Model,
+            (0, 1),
             "acme.relay",
             crate::Picked::Failed("The file picker could not open.".into()),
         );
@@ -2320,7 +2610,14 @@ mod tests {
             }
         }
         assert_eq!(answer, (false, None), "nothing was clicked");
-        assert!(texts.iter().any(|t| t.contains("3D model for acme.relay")), "{texts:?}");
+        // Each extension is named once, whatever case the picker's filter lists it in.
+        assert!(
+            texts
+                .iter()
+                .any(|t| t == "3D model for acme.relay (STEP models: .step, .stp), full path:"),
+            "{texts:?}"
+        );
+        assert_eq!(Attach::Footprint.extensions(), ".dxf");
         assert!(
             texts.iter().any(|t| t.contains("The file picker could not open.")),
             "{texts:?}"
