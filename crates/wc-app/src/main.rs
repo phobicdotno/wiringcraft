@@ -499,6 +499,8 @@ impl chrome::Status for StatusView<'_> {
             Action::ArrangePanel | Action::DeletePanel => has && self.ed.panel.is_some(),
             Action::PageUp => has && self.ed.page > 0,
             Action::PageDown => self.open.is_some_and(|o| self.ed.page + 1 < o.project.pages.len()),
+            Action::PrevPage => has && self.ed.page > 0,
+            Action::NextPage => self.open.is_some_and(|o| self.ed.page + 1 < o.project.pages.len()),
             Action::Save => self.open.is_some_and(|o| o.dirty),
             Action::Undo => self.open.is_some_and(Open::can_undo),
             Action::Redo => self.open.is_some_and(Open::can_redo),
@@ -1668,6 +1670,20 @@ impl App {
                     self.ed.page = i;
                 }
             }
+            // Only the page shown changes, as a click in the page tree: no page is renumbered.
+            Action::PrevPage | Action::NextPage => {
+                let to = match a {
+                    Action::PrevPage => page.checked_sub(1),
+                    _ => Some(page + 1),
+                };
+                if let Some(i) = to.filter(|&i| i < open.project.pages.len()) {
+                    self.ed.panel = None;
+                    self.ed.page = i;
+                    self.ed.selection.clear();
+                    self.ed.wire = None;
+                    self.ed.view.fit = true;
+                }
+            }
             Action::PageProps => {
                 if let Some(p) = open.project.pages.get(page) {
                     self.dialog = Some(Dialog::PageProps {
@@ -1944,6 +1960,8 @@ impl App {
                 (Key::F, Action::ZoomFit),
                 (Key::Plus, Action::ZoomIn),
                 (Key::Minus, Action::ZoomOut),
+                (Key::PageUp, Action::PrevPage),
+                (Key::PageDown, Action::NextPage),
             ] {
                 if i.key_pressed(k) && i.modifiers.is_none() {
                     out.push(a);

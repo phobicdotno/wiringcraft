@@ -5330,6 +5330,95 @@ mod tests {
     }
 
     #[test]
+    fn page_up_and_page_down_open_the_previous_and_next_page() {
+        use crate::chrome::Status;
+        let (_tmp, mut a) = app(vec![]);
+        let ctx = egui::Context::default();
+        let field = egui::Id::new("field");
+        // One frame with `key` pressed, a text field having the keys first when asked.
+        let press = |a: &mut App, key: egui::Key, typing: bool| {
+            for events in [vec![], vec![key]] {
+                let pressed = !events.is_empty();
+                let raw = egui::RawInput {
+                    events: events
+                        .into_iter()
+                        .map(|key| egui::Event::Key {
+                            key,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        })
+                        .collect(),
+                    ..Default::default()
+                };
+                let _ = ctx.run(raw, |ctx| {
+                    if typing {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            let mut s = String::new();
+                            ui.add(egui::TextEdit::singleline(&mut s).id(field));
+                        });
+                        ctx.memory_mut(|m| m.request_focus(field));
+                    }
+                    if pressed {
+                        for act in a.shortcuts(ctx) {
+                            a.run(act);
+                        }
+                    }
+                });
+            }
+        };
+        let numbers = |a: &App| -> Vec<String> {
+            let o = a.open.as_ref().unwrap();
+            o.project.pages.iter().map(|p| p.number.clone()).collect()
+        };
+        let status = |a: &App, act: Action| {
+            crate::StatusView {
+                open: a.open.as_ref(),
+                ed: &a.ed,
+                prefs: &a.prefs,
+                clipboard: &a.clipboard,
+                sharing: false,
+                share_undo: false,
+                share_redo: false,
+                show_layers: false,
+            }
+            .enabled(act)
+        };
+        let before = numbers(&a);
+        let last = before.len() - 1;
+        assert!(last >= 1, "the test project has two pages or more");
+
+        a.ed.page = 0;
+        assert!(!status(&a, Action::PrevPage), "nothing before the first page");
+        press(&mut a, egui::Key::PageUp, false);
+        assert_eq!(a.ed.page, 0, "the first page stays");
+        press(&mut a, egui::Key::PageDown, false);
+        assert_eq!(a.ed.page, 1, "Page Down opens the next page");
+        assert_eq!(numbers(&a), before, "no page is renumbered");
+        press(&mut a, egui::Key::PageUp, false);
+        assert_eq!(a.ed.page, 0, "Page Up opens the previous page");
+
+        a.ed.page = last;
+        assert!(!status(&a, Action::NextPage), "nothing after the last page");
+        press(&mut a, egui::Key::PageDown, false);
+        assert_eq!(a.ed.page, last, "the last page stays");
+
+        // A text field with the keys, or a dialog, keeps the page.
+        press(&mut a, egui::Key::PageUp, true);
+        assert_eq!(a.ed.page, last, "not while typing");
+        a.dialog = Some(crate::Dialog::Message("Busy".into()));
+        press(&mut a, egui::Key::PageUp, false);
+        assert_eq!(a.ed.page, last, "not under a dialog");
+        a.dialog = None;
+
+        // The assistant can do the same.
+        call(&mut a, "run_action", json!({"action": "PrevPage"})).unwrap();
+        assert_eq!(a.ed.page, last - 1);
+        assert_eq!(numbers(&a), before);
+    }
+
+    #[test]
     fn editing_actions_are_off_and_do_nothing_on_a_page_someone_else_holds() {
         use crate::chrome::Status;
         let (_tmp, mut a) = app(vec![]);
