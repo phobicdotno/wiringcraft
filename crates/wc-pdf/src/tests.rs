@@ -1422,6 +1422,40 @@ fn a_contact_points_to_the_schematic_coil_not_the_overview_repeat() {
 }
 
 #[test]
+fn a_coil_does_not_list_a_contact_repeated_on_an_overview_page() {
+    let mut symbols = BTreeMap::new();
+    symbols.insert("coil".to_owned(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
+    symbols.insert("no".to_owned(), sym("no", SymbolRole::Auxiliary, ["13", "14"]));
+    let mut project = wc_core::Project::new("x");
+    let mut overview = Page::new("p1", "1", "Line diagram");
+    overview.overview = true;
+    overview.symbols.push(place("s1", "no", 50.0, "-K1"));
+    let mut schematic = Page::new("p2", "2", "Control");
+    schematic.symbols.push(place("s2", "coil", 50.0, "-K1"));
+    schematic.symbols.push(place("s3", "no", 150.0, "-K1"));
+    project.pages = vec![overview, schematic];
+    let x = layout::CrossRefs::build(&project, &symbols);
+    let Some(page) = project.pages.get(1) else {
+        unreachable!("two pages")
+    };
+    let mut warnings = Vec::new();
+    let marks = layout::xref_marks(page, &symbols, &x, &mut warnings);
+    let listed: Vec<&str> = marks
+        .iter()
+        .filter(|m| m.text.starts_with("13-14"))
+        .map(|m| m.target_page_id.as_str())
+        .collect();
+    assert_eq!(listed, ["p2"], "the contact is listed once, on its schematic page");
+    // The repeat on the overview still points back to its coil.
+    let Some(overview) = project.pages.first() else {
+        unreachable!("two pages")
+    };
+    let back = layout::xref_marks(overview, &symbols, &x, &mut warnings);
+    assert!(back.iter().any(|m| m.target_page_id == "p2"), "{back:?}");
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
 fn cross_references_give_page_column_and_row() {
     let mut symbols = BTreeMap::new();
     symbols.insert("coil".to_owned(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
