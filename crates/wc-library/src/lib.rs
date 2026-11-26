@@ -453,22 +453,39 @@ fn is_wrong_id(e: &Error) -> bool {
     matches!(e, Error::Source { message, .. } if message.contains(DECLARES))
 }
 
-/// What [`lock_missing`] could not pin.
+/// What [`lock_missing`] could not pin, and the pinned items whose vendored copy it repaired.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Unpinned {
     /// Used items that no library source holds.
     pub missing: Vec<(ItemKind, String)>,
     /// Used items whose library file declares another id, with the reason (see [`State::WrongId`]).
     pub wrong_id: Vec<(ItemKind, String, String)>,
+    /// Pinned items whose vendored copy was missing or unreadable, written again at the pinned
+    /// version from the library.
+    pub restored: Vec<(ItemKind, String)>,
+    /// Pinned items whose vendored copy is missing or unreadable and could not be written again
+    /// at the pinned version, with the reason.
+    pub unrestorable: Vec<(ItemKind, String, String)>,
 }
 
 impl Unpinned {
+    /// Nothing left undone: every used item is pinned and has a readable vendored copy.
     pub fn is_empty(&self) -> bool {
-        self.missing.is_empty() && self.wrong_id.is_empty()
+        self.missing.is_empty() && self.wrong_id.is_empty() && self.unrestorable.is_empty()
     }
 }
 
-/// Pin every used item that is not pinned yet. Items it cannot pin are returned.
+/// Whether the project's vendored copy of `kind` `id` reads.
+fn vendored_reads(project_dir: &Path, kind: ItemKind, id: &str) -> bool {
+    match kind {
+        ItemKind::Symbol => store::read_vendored_symbol(project_dir, id).is_ok(),
+        ItemKind::Part => store::read_vendored_part(project_dir, id).is_ok(),
+    }
+}
+
+/// Pin every used item that is not pinned yet, and write the vendored copy of a pinned item
+/// again when it is missing or unreadable (at the pinned version only: a library holding another
+/// version is left to `update`). Items it cannot pin or repair are returned.
 pub fn lock_missing(project_dir: &Path, project: &mut Project, lib: &Library) -> Result<Unpinned> {
     lock_missing_then(project_dir, project, lib, || {})
 }
@@ -483,15 +500,44 @@ fn lock_missing_then(
 ) -> Result<Unpinned> {
     let mut left = Unpinned::default();
     let mut todo = Vec::new();
+    let mut repair = Vec::new();
     for s in status(project_dir, project, lib) {
+        let broken = s.locked.is_some() && !vendored_reads(project_dir, s.kind, &s.id);
         match s.state {
             State::NotLocked => todo.push((s.kind, s.id)),
             // Used but not pinned, and its library file cannot be taken.
             State::WrongId if s.locked.is_none() => left.wrong_id.push((s.kind, s.id, s.changes.join("; "))),
-            _ => {}
+            _ if !broken => {}
+            State::UpToDate => {
+                if let Some(l) = s.locked {
+                    repair.push((s.kind, s.id, l.hash));
+                }
+            }
+            State::Changed => {
+                let why = format!(
+                    "the library holds another version than the pinned one; take it with `wiringcraft lib update {}`",
+                    s.id
+                );
+                left.unrestorable.push((s.kind, s.id, why));
+            }
+            State::GoneFromLibrary => {
+                left.unrestorable
+                    .push((s.kind, s.id, "no library source holds it any more".into()));
+            }
+            State::WrongId => left.unrestorable.push((s.kind, s.id, s.changes.join("; "))),
         }
     }
     after_scan();
+    for (kind, id, hash) in repair {
+        // Only the pinned version: the lock entry is written back as it was.
+        match fetch(lib, kind, &id, Some(&hash)) {
+            Ok(item) => {
+                store_item(project_dir, project, &id, item)?;
+                left.restored.push((kind, id));
+            }
+            Err(e) => left.unrestorable.push((kind, id, e.to_string())),
+        }
+    }
     for (kind, id) in todo {
         match take(project_dir, project, lib, kind, &id) {
             Ok(_) => {}

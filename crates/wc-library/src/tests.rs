@@ -526,3 +526,53 @@ fn every_starter_symbol_loads_under_its_file_name_with_distinct_pins() -> Result
     }
     Ok(())
 }
+
+#[test]
+fn lock_restores_a_deleted_vendored_copy_at_the_pinned_version() -> Result<()> {
+    let mut f = fixture()?;
+    let lib = Library::open(&f.proj, &f.project)?;
+    lock_missing(&f.proj, &mut f.project, &lib)?;
+    let pinned = f.project.lock.get(ItemKind::Symbol, "coil").cloned();
+    let path = wc_core::store::vendor_path(&f.proj, ItemKind::Symbol, "coil")?;
+    std::fs::remove_file(&path).map_err(|e| wc_core::Error::io("rm", e))?;
+
+    let left = lock_missing(&f.proj, &mut f.project, &lib)?;
+    assert!(left.is_empty(), "{left:?}");
+    assert_eq!(left.restored, vec![(ItemKind::Symbol, "coil".to_string())]);
+    assert_eq!(
+        wc_core::store::read_vendored_symbol(&f.proj, "coil")?.pins[1].at.y,
+        10.0
+    );
+    assert_eq!(f.project.lock.get(ItemKind::Symbol, "coil").cloned(), pinned);
+
+    // A readable copy is left alone.
+    assert!(lock_missing(&f.proj, &mut f.project, &lib)?.restored.is_empty());
+    Ok(())
+}
+
+#[test]
+fn lock_does_not_restore_another_version_or_an_item_gone_from_the_library() -> Result<()> {
+    let mut f = fixture()?;
+    let lib = Library::open(&f.proj, &f.project)?;
+    lock_missing(&f.proj, &mut f.project, &lib)?;
+    let path = wc_core::store::vendor_path(&f.proj, ItemKind::Symbol, "coil")?;
+    std::fs::write(&path, "not json").map_err(|e| wc_core::Error::io("write", e))?;
+
+    // The library moved on: the pinned version cannot be written again from it.
+    write_symbol(&f.company, &sym("coil", 12.5))?;
+    let left = lock_missing(&f.proj, &mut f.project, &lib)?;
+    assert!(left.restored.is_empty());
+    assert_eq!(left.unrestorable.len(), 1, "{left:?}");
+    assert!(left.unrestorable[0].2.contains("lib update coil"), "{left:?}");
+    assert!(
+        wc_core::store::read_vendored_symbol(&f.proj, "coil").is_err(),
+        "nothing taken"
+    );
+
+    f.project.meta.libraries.clear();
+    let lib = Library::open(&f.proj, &f.project)?;
+    let left = lock_missing(&f.proj, &mut f.project, &lib)?;
+    assert_eq!(left.unrestorable.len(), 1, "{left:?}");
+    assert!(left.unrestorable[0].2.contains("no library source"), "{left:?}");
+    Ok(())
+}
