@@ -416,6 +416,15 @@ pub fn specs() -> Vec<Value> {
             &[],
         ),
         tool(
+            "plc_racks",
+            "PLC racks and the I/O cards in their slots, as the PLC racks form edits them (kept in project.toml, laid out on the PLC cards report). get returns them as JSON: a list of racks, each with name, description and card (its cards: slot, tag, type, channels, start address such as %IX0.0 or %IW64, and step when the channels are numbered with a step of their own). replace sets the whole list (in get's format; an empty list removes every rack) as one undo step, and answers with the PLC cards report's warnings about the result.",
+            json!({
+                "action": {"type": "string", "enum": ["get", "replace"]},
+                "racks": {"type": "array", "items": {"type": "object"}, "description": "replace: every rack, as get returns them."}
+            }),
+            &["action"],
+        ),
+        tool(
             "jumpers",
             "Jumpers bridging terminals of one strip: list them (strip, terminals in strip order, part), add (jumper the terminals of a strip together; a jumper that shares a terminal is merged), remove (take the terminals out of their jumpers; one left with fewer than two terminals goes), or part (give the jumper holding a terminal a part id from the project or its libraries; an empty part clears it).",
             json!({
@@ -1178,6 +1187,7 @@ impl wc_agent::Tools for AppTools<'_> {
             "get_report" => format!("Read the {} report", s(input, "kind").unwrap_or_default()),
             "get_page" => format!("Looked at page {}", s(input, "page").unwrap_or("shown")),
             "find_symbols" | "find_parts" => format!("Searched {:?}", s(input, "query").unwrap_or_default()),
+            "plc_racks" => format!("PLC racks: {}", s(input, "action").unwrap_or_default()),
             _ => name.replace('_', " "),
         }
     }
@@ -1776,6 +1786,7 @@ impl App {
                 })))
             }
             "set_template" => self.tool_set_template(v),
+            "plc_racks" => self.tool_plc_racks(v),
             "comments" => self.tool_comments(v),
             "jumpers" => self.tool_jumpers(v),
             "strips" => self.tool_strips(v),
@@ -2381,6 +2392,35 @@ impl App {
         open.checkpoint();
         open.project.meta.template = t;
         Ok("Template set.".into())
+    }
+
+    /// The PLC racks form for the assistant: the same range checks, and the same warnings
+    /// the form shows under it.
+    fn tool_plc_racks(&mut self, v: &Value) -> Result<String, String> {
+        let open = need_open(self.open.as_mut())?;
+        match need_s(v, "action")? {
+            "get" => serde_json::to_string_pretty(&open.project.meta.racks).map_err(|e| e.to_string()),
+            "replace" => {
+                let racks: Vec<wc_core::plc_rack::PlcRack> =
+                    serde_json::from_value(v.get("racks").cloned().ok_or("replace needs racks")?)
+                        .map_err(|e| format!("racks: {e}"))?;
+                if let Some(why) = crate::racks_form::problem(&racks) {
+                    return Err(format!("The racks were not changed: {why}."));
+                }
+                if racks == open.project.meta.racks {
+                    return Ok("The racks are already like that.".into());
+                }
+                open.checkpoint();
+                open.project.meta.racks = racks;
+                let warnings = crate::rack_warnings(open);
+                Ok(if warnings.is_empty() {
+                    "Racks set.".into()
+                } else {
+                    format!("Racks set. Warnings:\n{}", warnings.join("\n"))
+                })
+            }
+            other => Err(format!("Unknown action {other:?}: use get or replace.")),
+        }
     }
 
     fn tool_comments(&mut self, v: &Value) -> Result<String, String> {
@@ -3735,6 +3775,55 @@ mod tests {
         let t = read(&mut a);
         assert_eq!(t["is_default"], json!(true));
         assert_eq!(t["boxes"], boxes);
+    }
+
+    #[test]
+    fn the_assistant_reads_and_replaces_the_plc_racks_as_one_undo_step() {
+        let (_tmp, mut a) = app(vec![]);
+        let read = |a: &mut App| -> Value {
+            serde_json::from_str(&call(a, "plc_racks", json!({"action": "get"})).unwrap()).unwrap()
+        };
+        assert_eq!(read(&mut a), json!([]));
+        let mark = a.open.as_ref().unwrap().undo_mark();
+
+        // Numbers the form would not take, and racks that are not racks, change nothing.
+        for bad in [
+            json!({"action": "replace"}),
+            json!({"action": "replace", "racks": "none"}),
+            json!({"action": "replace", "racks": [{"name": "-A1", "card": [{"slot": 1000, "start": "%IX0.0"}]}]}),
+            json!({"action": "replace", "racks": [{"name": "-A1", "card": [{"slot": 1, "channels": 257}]}]}),
+            json!({"action": "replace", "racks": [{"name": "-A1", "card": [{"slot": 1, "step": 0}]}]}),
+            json!({"action": "rename"}),
+        ] {
+            assert!(call(&mut a, "plc_racks", bad.clone()).is_err(), "{bad}");
+        }
+        assert_eq!(read(&mut a), json!([]));
+        assert_eq!(a.open.as_ref().unwrap().undo_mark(), mark);
+
+        // A rack with two cards, one without its start address: set, with the form's warning.
+        let racks = json!([{"name": "-A1", "description": "Main PLC", "card": [
+            {"slot": 1, "tag": "-A1.DI1", "type": "DI 16x24 V DC", "channels": 16, "start": "%IX0.0"},
+            {"slot": 2, "type": "AI 4x 4-20 mA", "channels": 4, "start": ""}
+        ]}]);
+        let said = call(&mut a, "plc_racks", json!({"action": "replace", "racks": racks})).unwrap();
+        assert!(said.contains("Warnings"), "{said}");
+        let got = read(&mut a);
+        assert_eq!(got[0]["name"], json!("-A1"));
+        assert_eq!(got[0]["card"][0]["type"], json!("DI 16x24 V DC"));
+        assert_eq!(got[0]["card"].as_array().map(Vec::len), Some(2));
+        assert_eq!(a.open.as_ref().unwrap().undo_mark(), mark + 1);
+        // The same racks again is no new step.
+        call(&mut a, "plc_racks", json!({"action": "replace", "racks": got.clone()})).unwrap();
+        assert_eq!(a.open.as_ref().unwrap().undo_mark(), mark + 1);
+
+        assert!(a.open.as_mut().unwrap().undo());
+        assert_eq!(read(&mut a), json!([]));
+        assert!(a.open.as_mut().unwrap().redo());
+        assert_eq!(read(&mut a), got);
+
+        // An empty list removes every rack.
+        call(&mut a, "plc_racks", json!({"action": "replace", "racks": []})).unwrap();
+        assert_eq!(read(&mut a), json!([]));
     }
 
     #[test]

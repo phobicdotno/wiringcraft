@@ -4,10 +4,13 @@
 //! `AcDb:Handles` is the object map: each object's handle and where it starts in
 //! `AcDb:AcDbObjects`. Each object there is a size, then bit-packed data:
 //! its type, its own handle and fields, and at the end a stream of references to other objects
-//! by handle (its owner, its layer, the block an INSERT shows). In AutoCAD 2007 and 2010
-//! drawings the texts of an object are in a third stream at the end of its data. 2007 objects
-//! are otherwise written like 2004 ones (type as a bit short, data size in bits), with the
-//! entity fields added in 2007 (material, shadow, attribute lock, MTEXT rectangle height).
+//! by handle (its owner, its layer, the block an INSERT shows). From AutoCAD 2007 on the texts
+//! of an object are in a third stream at the end of its data. 2007 objects are otherwise written
+//! like 2004 ones (type as a bit short, data size in bits), with the entity fields added in 2007
+//! (material, shadow, attribute lock, MTEXT rectangle height). 2013 and 2018 objects are written
+//! like 2010 ones, with a flag for data in the data store after the extension dictionary flag
+//! (2013, #292) and an attribute type in ATTRIB and ATTDEF (2018). Multi-line attributes (2018)
+//! are counted and skipped.
 //!
 //! The entities read are LINE, ARC, CIRCLE, LWPOLYLINE, POLYLINE (2D and 3D) with their
 //! VERTEXes, TEXT, MTEXT, ATTDEF, ATTRIB, INSERT, DIMENSION (drawn by its anonymous block), HATCH,
@@ -255,11 +258,11 @@ struct Object<'a> {
 }
 
 impl Object<'_> {
-    /// TV: a text, from the data stream (2004) or the string stream (2007 and 2010).
+    /// TV: a text, from the data stream (2004) or the string stream (2007 on).
     fn text(&mut self) -> Result<String> {
         match self.version {
             Version::R2004 => Ok(self.decoding.decode(&self.data.t8_bytes()?)),
-            Version::R2007 | Version::R2010 => self
+            _ => self
                 .strings
                 .as_mut()
                 .ok_or_else(|| bad("an object's text is missing"))?
@@ -291,7 +294,7 @@ fn object(objects: &[u8], at: usize, version: Version, decoding: Decoding) -> Re
     let mut start = at + n;
     let handle_bits = match version {
         Version::R2004 | Version::R2007 => 0,
-        Version::R2010 => {
+        _ => {
             let (h, m) = modular_char(objects.get(start..).unwrap_or_default(), false)?;
             start += m;
             usize::try_from(h).map_err(|_| bad("an object's handle stream is out of range"))?
@@ -306,7 +309,7 @@ fn object(objects: &[u8], at: usize, version: Version, decoding: Decoding) -> Re
     // A bit short up to 2007, a bit pair and one or two bytes from 2010 on.
     let kind = match version {
         Version::R2004 | Version::R2007 => head.bs()?,
-        Version::R2010 => match head.bb()? {
+        _ => match head.bb()? {
             0 => u16::from(head.rc()?),
             1 => u16::from(head.rc()?) + 0x1F0,
             _ => head.rs()?,
@@ -316,7 +319,7 @@ fn object(objects: &[u8], at: usize, version: Version, decoding: Decoding) -> Re
     // the handle stream's size before the type.
     let end = match version {
         Version::R2004 | Version::R2007 => head.rl()? as usize,
-        Version::R2010 => total
+        _ => total
             .checked_sub(handle_bits)
             .ok_or_else(|| bad("an object's handle stream is larger than the object"))?,
     };
@@ -327,7 +330,7 @@ fn object(objects: &[u8], at: usize, version: Version, decoding: Decoding) -> Re
     // where they start.
     let (data_end, strings) = match version {
         Version::R2004 => (end, None),
-        Version::R2007 | Version::R2010 => string_stream(bytes, end)?,
+        _ => string_stream(bytes, end)?,
     };
     if data_end < head.pos() {
         return Err(bad("an object's texts overlap its type"));
@@ -632,7 +635,7 @@ fn hatch(o: &mut Object, e: &mut Codes) -> Result<()> {
                             }
                         }
                         // Fit points and their end tangents, from 2010.
-                        if o.version == Version::R2010 {
+                        if o.version >= Version::R2010 {
                             let fit = hatch_count(o, "fit points")?;
                             e.i(97, i64::from(fit));
                             for _ in 0..fit {
@@ -705,10 +708,21 @@ fn spline_count(o: &mut Object, what: &str) -> Result<u32> {
 }
 
 /// SPLINE, as DXF codes: 70 (closed), 71 degree, and either knots (40), control points (10/20)
-/// and weights (41), or fit points (11/21). Before 2013 a scenario says which: 1 control
-/// points, 2 fit points.
+/// and weights (41), or fit points (11/21). A scenario says which: 1 control points, 2 fit
+/// points. From 2013 on, spline flags and a knot parameter follow it and decide instead: flag
+/// bit 1 means fit points, knot parameter 15 (custom knots) means control points.
 fn spline(o: &mut Object, e: &mut Codes) -> Result<()> {
-    let scenario = o.data.bl()?;
+    let mut scenario = o.data.bl()?;
+    if o.version >= Version::R2013 {
+        let flags = o.data.bl()?;
+        let knot_parameter = o.data.bl()?;
+        if flags & 1 != 0 {
+            scenario = 2;
+        }
+        if knot_parameter == 15 {
+            scenario = 1;
+        }
+    }
     if scenario != 1 && scenario != 2 {
         return Err(bad(format!("a spline has unknown scenario {scenario}")));
     }
@@ -782,10 +796,14 @@ fn decode(
         return Err(bad("an object's handle differs from the object map"));
     }
     if o.kind == BLOCK_HEADER || o.kind == LAYER {
-        // A table entry: common object data, then its name.
+        // A table entry: common object data (reactors, no extension dictionary, from 2013 on
+        // has data in the data store), then its name.
         o.skip_eed()?;
         o.data.bl()?;
         o.data.b()?;
+        if o.version >= Version::R2013 {
+            o.data.b()?;
+        }
         let name = o.text()?;
         if o.kind == LAYER {
             out.layers.insert(handle, name);
@@ -843,7 +861,12 @@ fn decode(
     let mut block = None;
     let mut vertices = Vec::new();
     match o.kind {
-        1..=3 => text(&mut o, &mut e)?,
+        1..=3 => {
+            if !text(&mut o, &mut e)? {
+                *skipped.entry(format!("{dxf_kind} (multi-line)")).or_default() += 1;
+                return Ok(());
+            }
+        }
         7 => block = Some(insert(&mut o, &mut e)?),
         78 => hatch(&mut o, &mut e)?,
         35 => ellipse(&mut o, &mut e)?,
@@ -975,7 +998,7 @@ struct Common {
 
 /// Read the data every entity has, from both the data and the handle streams.
 fn entity_common(o: &mut Object) -> Result<Common> {
-    let r2010 = o.version == Version::R2010;
+    let r2010 = o.version >= Version::R2010;
     // Material and shadow flags are there from 2007 on, visual styles from 2010 on.
     let r2007 = o.version != Version::R2004;
     o.skip_eed()?;
@@ -987,6 +1010,10 @@ fn entity_common(o: &mut Object) -> Result<Common> {
     let mode = o.data.bb()?;
     let reactors = o.data.bl()?;
     let no_xdict = o.data.b()?;
+    // Whether the entity has data in the data store, from 2013 on.
+    if o.version >= Version::R2013 {
+        o.data.b()?;
+    }
     let color = o.data.bs()?;
     if color & 0x8000 != 0 {
         o.data.bl()?;
@@ -1048,8 +1075,9 @@ fn entity_common(o: &mut Object) -> Result<Common> {
     })
 }
 
-/// TEXT, and the text part of ATTRIB and ATTDEF.
-fn text(o: &mut Object, e: &mut Codes) -> Result<()> {
+/// TEXT, and the text part of ATTRIB and ATTDEF. False for a multi-line attribute (2018 on),
+/// which is not read.
+fn text(o: &mut Object, e: &mut Codes) -> Result<bool> {
     let d = &mut o.data;
     let flags = d.rc()?;
     if flags & 0x01 == 0 {
@@ -1086,12 +1114,23 @@ fn text(o: &mut Object, e: &mut Codes) -> Result<()> {
     e.f(50, rotation.to_degrees()).i(72, i64::from(align)).f(230, z);
     if o.kind == 1 {
         e.s(1, value);
-        return Ok(());
+        return Ok(true);
     }
     // ATTRIB and ATTDEF: the tag and flags, and for ATTDEF the prompt. A version byte from
     // 2010 on, a lock position flag from 2007 on.
-    if o.version == Version::R2010 {
+    if o.version >= Version::R2010 {
         o.data.rc()?;
+    }
+    // From 2018 on, the attribute type: 1 a single line, 2 and 4 multi-line. A multi-line one
+    // holds a whole MTEXT before its tag and flags, which the specification does not lay out
+    // clearly enough to read; without its flags it could be a hidden one, so it is left out.
+    // Any other type is damage.
+    if o.version >= Version::R2018 {
+        match o.data.rc()? {
+            1 => {}
+            2 | 4 => return Ok(false),
+            other => return Err(bad(format!("an attribute has an unknown type {other}"))),
+        }
     }
     let tag = o.text()?;
     o.data.bs()?;
@@ -1101,13 +1140,13 @@ fn text(o: &mut Object, e: &mut Codes) -> Result<()> {
     }
     e.s(1, value).s(2, tag).i(70, i64::from(attr_flags));
     if o.kind == 3 {
-        if o.version == Version::R2010 {
+        if o.version >= Version::R2010 {
             o.data.rc()?;
         }
         let prompt = o.text()?;
         e.s(3, prompt);
     }
-    Ok(())
+    Ok(true)
 }
 
 /// INSERT; returns the handle of the block it shows.
@@ -1196,7 +1235,7 @@ fn lwpolyline(o: &mut Object, e: &mut Codes) -> Result<()> {
     if flags & 16 != 0 {
         d.bl()?;
     }
-    if o.version == Version::R2010 && flags & 1024 != 0 {
+    if o.version >= Version::R2010 && flags & 1024 != 0 {
         d.bl()?;
     }
     if flags & 32 != 0 {
