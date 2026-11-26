@@ -79,13 +79,16 @@ fn a_command_waits_for_the_lock_another_process_holds() -> TestResult {
     if !ended {
         child.kill()?;
     }
+    // Reaped before any assertion, so a failure leaves no process behind; a killed child also
+    // closes its input, which ends the writer.
+    let out = child.wait_with_output()?;
+    let written = writer.join();
     assert!(read_first, "the input is read before the lock is taken");
     assert!(waits, "it waits for the lock");
     assert!(ended, "it runs once the lock is free");
-    let Ok(Ok(())) = writer.join() else {
+    let Ok(Ok(())) = written else {
         unreachable!("the input was written");
     };
-    let out = child.wait_with_output()?;
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{err}");
     assert!(err.contains("waiting for another wiringcraft command"), "{err}");

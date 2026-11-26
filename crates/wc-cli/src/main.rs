@@ -5187,6 +5187,32 @@ mod tests {
     }
 
     #[test]
+    fn commands_on_either_side_of_vcs_init_wait_on_one_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        // Taken before the project is a repository, as `vcs init` takes it.
+        let held = project_lock(&dir).unwrap();
+        let before = project_lock_path(&dir);
+        wc_vcs::Git::new(&dir).init().unwrap();
+        assert!(dir.join(".git").exists());
+        assert_eq!(project_lock_path(&dir), before, "the same lock file once .git exists");
+        // A command started after .git exists waits for the lock taken before it did.
+        let toml = dir.join(store::PROJECT_FILE);
+        let saved = std::fs::read_to_string(&toml).unwrap();
+        let after = {
+            let dir = dir.clone();
+            std::thread::spawn(move || cli(&dir, &["template", "columns", "14"]))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(!after.is_finished(), "the later command waits");
+        assert_eq!(std::fs::read_to_string(&toml).unwrap(), saved);
+        drop(held);
+        after.join().unwrap().unwrap();
+        assert_ne!(std::fs::read_to_string(&toml).unwrap(), saved);
+    }
+
+    #[test]
     fn a_wire_to_a_pin_the_symbol_does_not_have_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
