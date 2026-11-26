@@ -1716,10 +1716,14 @@ fn rules_list(p: &Project, library: &[wc_core::check_rule::RuleSet], json: bool)
 
 /// The rules in `file` for `rules set`, in order, each as the check runs it: `[[rule]]`
 /// tables, or a JSON list (or `{"rules": [...]}`) for a `.json` name; `-` is TOML on stdin.
-fn rules_from_file(file: &Path) -> Res<Vec<wc_core::check_rule::CheckRule>> {
+/// `stdin` is what was read from standard input for `-`, when it already was.
+fn rules_from_file(file: &Path, stdin: Option<String>) -> Res<Vec<wc_core::check_rule::CheckRule>> {
     use wc_core::check_rule::{CheckRule, check_rule, parse_rules};
     let text = if file.as_os_str() == "-" {
-        std::io::read_to_string(std::io::stdin()).map_err(|err| format!("stdin: {err}"))?
+        match stdin {
+            Some(text) => text,
+            None => std::io::read_to_string(std::io::stdin()).map_err(|err| format!("stdin: {err}"))?,
+        }
     } else {
         std::fs::read_to_string(file).map_err(|err| format!("{}: {err}", file.display()))?
     };
@@ -1820,6 +1824,14 @@ fn run(cli: Cli) -> Res<()> {
     let dir = cli.project.as_path();
     // One command at a time on a project: a second run waits, so it reads what the first one
     // wrote instead of overwriting it with an edit planned from the old files (#610).
+    // Input on stdin is read before the lock is taken: in a pipe from another command on the
+    // same project, waiting for the lock before reading would hold both up for good.
+    let mut stdin_text = match &cli.cmd {
+        Cmd::Rules(RulesCmd::Set { file }) if file.as_os_str() == "-" => {
+            Some(std::io::read_to_string(std::io::stdin()).map_err(|err| format!("stdin: {err}"))?)
+        }
+        _ => None,
+    };
     let _lock = match cli.cmd {
         Cmd::New { .. } => None,
         _ => project_lock(dir),
@@ -2596,7 +2608,7 @@ fn run(cli: Cli) -> Res<()> {
                     print!("{text}");
                 }
                 RulesCmd::Set { file } => {
-                    let rules = rules_from_file(&file)?;
+                    let rules = rules_from_file(&file, stdin_text.take())?;
                     let n = rules.len();
                     if rules != p.meta.rules {
                         p.meta.rules = rules;
@@ -4187,46 +4199,66 @@ fn main() -> ExitCode {
 }
 
 /// The lock that keeps two wiringcraft commands from working on the project in `dir` at once,
-/// held until the returned file is dropped (or the process ends). A second command waits for
-/// the first, saying so. The lock file lives in the system's temporary folder, named after the
-/// project folder's full path, so the project folder (and its git history) gets no extra
-/// file. `None`, and the command runs unlocked, when `dir` is not a project or the lock file
-/// cannot be made (a read-only temporary folder): the lock guards against overlapping runs,
-/// it is never a reason to refuse one.
+/// held until the returned file is dropped (or the process ends, even by a crash). A second
+/// command waits for the first, saying so. The lock file is [`project_lock_path`], inside the
+/// project, so every command on the project finds the same one whatever its environment.
+/// `None`, and the command runs unlocked, when `dir` is not a project, or with a warning when
+/// the lock cannot be taken (a read-only folder): the lock guards against overlapping runs, it
+/// is never a reason to refuse one.
 fn project_lock(dir: &Path) -> Option<std::fs::File> {
     if !dir.join(store::PROJECT_FILE).is_file() {
         return None;
     }
-    let path = project_lock_path(dir)?;
-    let file = std::fs::OpenOptions::new()
+    let path = project_lock_path(dir);
+    let unlocked = |why: String| {
+        eprintln!(
+            "warning: running without the project lock ({}: {}); another wiringcraft command on this project at the same time could undo this one's changes",
+            escape_field(&path.display().to_string()),
+            escape_field(&why)
+        );
+    };
+    let file = match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(&path)
-        // Made by another user: a read-only handle locks as well.
-        .or_else(|_| std::fs::File::open(&path))
-        .ok()?;
+    {
+        Ok(file) => file,
+        Err(err) => {
+            unlocked(err.to_string());
+            return None;
+        }
+    };
     match file.try_lock() {
         Ok(()) => Some(file),
         Err(std::fs::TryLockError::WouldBlock) => {
             eprintln!("waiting for another wiringcraft command on this project to finish");
-            file.lock().ok().map(|()| file)
+            match file.lock() {
+                Ok(()) => Some(file),
+                Err(err) => {
+                    unlocked(err.to_string());
+                    None
+                }
+            }
         }
-        Err(std::fs::TryLockError::Error(_)) => None,
+        Err(std::fs::TryLockError::Error(err)) => {
+            unlocked(err.to_string());
+            None
+        }
     }
 }
 
-/// Where [`project_lock`] keeps the lock of the project in `dir`: one file per project folder,
-/// by a hash of its canonical path (FNV-1a, so every build names it alike).
-fn project_lock_path(dir: &Path) -> Option<PathBuf> {
-    let full = std::fs::canonicalize(dir).ok()?;
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in full.as_os_str().as_encoded_bytes() {
-        hash ^= u64::from(*b);
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
+/// Where [`project_lock`] keeps the lock of the project in `dir`: in its git folder when it has
+/// one, so the project's own files and history get nothing extra, else `.wiringcraft.lock` in
+/// the project folder (which a project's `.gitignore` leaves out).
+fn project_lock_path(dir: &Path) -> PathBuf {
+    let git = dir.join(".git");
+    if git.is_dir() {
+        git.join("wiringcraft.lock")
+    } else {
+        dir.join(".wiringcraft.lock")
     }
-    Some(std::env::temp_dir().join(format!("wiringcraft-{hash:016x}.lock")))
 }
 
 /// Parse report names; `all` means every report.
@@ -4928,11 +4960,12 @@ mod tests {
         assert!(project_lock(&dir).is_none());
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
         let held = project_lock(&dir).unwrap();
-        // The same folder by another spelling is the same lock.
-        assert_eq!(project_lock_path(&dir), project_lock_path(&dir.join("..").join("proj")));
+        // Outside the project's files: in the git folder when there is one.
+        assert_eq!(project_lock_path(&dir), dir.join(".wiringcraft.lock"));
         let other = tmp.path().join("other");
         store::create(&other, "Other").unwrap();
-        assert_ne!(project_lock_path(&dir), project_lock_path(&other));
+        std::fs::create_dir(other.join(".git")).unwrap();
+        assert_eq!(project_lock_path(&other), other.join(".git").join("wiringcraft.lock"));
         // Another project is not held up.
         cli(&other, &["template", "columns", "14"]).unwrap();
         let toml = dir.join(store::PROJECT_FILE);

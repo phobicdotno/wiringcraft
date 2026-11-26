@@ -17,6 +17,7 @@ const GITIGNORE: &str = "\
 # WiringCraft temporary and generated files
 *.tmp
 /export/
+/.wiringcraft.lock
 ";
 
 /// A project folder's git repository.
