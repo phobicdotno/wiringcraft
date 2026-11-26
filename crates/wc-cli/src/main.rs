@@ -1818,6 +1818,12 @@ fn write_locations(out: &mut impl std::io::Write, locations: &[wc_core::project:
 
 fn run(cli: Cli) -> Res<()> {
     let dir = cli.project.as_path();
+    // One command at a time on a project: a second run waits, so it reads what the first one
+    // wrote instead of overwriting it with an edit planned from the old files (#610).
+    let _lock = match cli.cmd {
+        Cmd::New { .. } => None,
+        _ => project_lock(dir),
+    };
     match cli.cmd {
         Cmd::New {
             dir: new_dir,
@@ -4180,6 +4186,49 @@ fn main() -> ExitCode {
     }
 }
 
+/// The lock that keeps two wiringcraft commands from working on the project in `dir` at once,
+/// held until the returned file is dropped (or the process ends). A second command waits for
+/// the first, saying so. The lock file lives in the system's temporary folder, named after the
+/// project folder's full path, so the project folder (and its git history) gets no extra
+/// file. `None`, and the command runs unlocked, when `dir` is not a project or the lock file
+/// cannot be made (a read-only temporary folder): the lock guards against overlapping runs,
+/// it is never a reason to refuse one.
+fn project_lock(dir: &Path) -> Option<std::fs::File> {
+    if !dir.join(store::PROJECT_FILE).is_file() {
+        return None;
+    }
+    let path = project_lock_path(dir)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        // Made by another user: a read-only handle locks as well.
+        .or_else(|_| std::fs::File::open(&path))
+        .ok()?;
+    match file.try_lock() {
+        Ok(()) => Some(file),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            eprintln!("waiting for another wiringcraft command on this project to finish");
+            file.lock().ok().map(|()| file)
+        }
+        Err(std::fs::TryLockError::Error(_)) => None,
+    }
+}
+
+/// Where [`project_lock`] keeps the lock of the project in `dir`: one file per project folder,
+/// by a hash of its canonical path (FNV-1a, so every build names it alike).
+fn project_lock_path(dir: &Path) -> Option<PathBuf> {
+    let full = std::fs::canonicalize(dir).ok()?;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in full.as_os_str().as_encoded_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    Some(std::env::temp_dir().join(format!("wiringcraft-{hash:016x}.lock")))
+}
+
 /// Parse report names; `all` means every report.
 fn report_kinds(names: &[String]) -> Result<Vec<wc_report::Kind>, String> {
     let mut out = Vec::new();
@@ -4869,6 +4918,35 @@ mod tests {
         let mut all = vec!["wiringcraft", "-C", dir.to_str().unwrap()];
         all.extend_from_slice(args);
         run(Cli::try_parse_from(all).map_err(|e| e.to_string())?)
+    }
+
+    #[test]
+    fn a_command_waits_while_another_holds_the_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        // Not a project yet: nothing to lock.
+        assert!(project_lock(&dir).is_none());
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let held = project_lock(&dir).unwrap();
+        // The same folder by another spelling is the same lock.
+        assert_eq!(project_lock_path(&dir), project_lock_path(&dir.join("..").join("proj")));
+        let other = tmp.path().join("other");
+        store::create(&other, "Other").unwrap();
+        assert_ne!(project_lock_path(&dir), project_lock_path(&other));
+        // Another project is not held up.
+        cli(&other, &["template", "columns", "14"]).unwrap();
+        let toml = dir.join(store::PROJECT_FILE);
+        let before = std::fs::read_to_string(&toml).unwrap();
+        let second = {
+            let dir = dir.clone();
+            std::thread::spawn(move || cli(&dir, &["template", "columns", "14"]))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(!second.is_finished(), "the second command waits");
+        assert_eq!(std::fs::read_to_string(&toml).unwrap(), before);
+        drop(held);
+        second.join().unwrap().unwrap();
+        assert_ne!(std::fs::read_to_string(&toml).unwrap(), before);
     }
 
     #[test]
