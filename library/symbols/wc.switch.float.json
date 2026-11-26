@@ -1,0 +1,113 @@
+{
+  "category": "sensors",
+  "description": "Float (level) switch with a make contact, closes when the liquid lifts the float to its set level.",
+  "graphics": [
+    {
+      "a": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 5.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 10.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 10.0
+      },
+      "b": {
+        "x": -3.5,
+        "y": 4.2
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": -1.75,
+        "y": 7.1
+      },
+      "b": {
+        "x": -5.0,
+        "y": 7.1
+      },
+      "kind": "line"
+    },
+    {
+      "center": {
+        "x": -6.5,
+        "y": 7.1
+      },
+      "kind": "circle",
+      "radius": 1.5
+    },
+    {
+      "a": {
+        "x": -8.6,
+        "y": 8.1
+      },
+      "b": {
+        "x": -4.4,
+        "y": 8.1
+      },
+      "kind": "line"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "13"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 14.4
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "14"
+    }
+  ],
+  "id": "wc.switch.float",
+  "letter_code": "B",
+  "name": "Float switch, make",
+  "pins": [
+    {
+      "at": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "13"
+    },
+    {
+      "at": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "dir": "down",
+      "name": "14"
+    }
+  ],
+  "role": "standalone",
+  "tag_at": {
+    "x": -14.0,
+    "y": 8.0
+  }
+}
