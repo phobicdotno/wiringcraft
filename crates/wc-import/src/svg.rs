@@ -44,14 +44,13 @@ impl M {
         let tol = 1e-9 * x.max(y);
         (x - y).abs() <= tol && (a * c + b * d).abs() <= tol
     }
-    /// Whether the transform flattens everything onto a line or a point (it can't be undone).
-    /// SVG doesn't draw an element with such a transform. The determinant is |x| |y| sin of
-    /// the angle between the axes, so this asks for an axis of length 0 or two parallel
-    /// axes; a very thin but real stretch such as `scale(1 1e-10)` is not singular.
+    /// Whether the transform flattens everything onto a line or a point: it can't be undone,
+    /// and SVG doesn't draw an element with it. Only a determinant of exactly 0 counts; a very
+    /// thin but invertible transform (`scale(1 1e-10)`, `matrix(1 0 1 1e-13 0 0)`) still
+    /// draws its thin outline.
     fn is_singular(&self) -> bool {
         let [a, b, c, d, ..] = self.0;
-        let axes = (a * a + b * b).sqrt() * (c * c + d * d).sqrt();
-        (a * d - b * c).abs() <= 1e-12 * axes
+        a * d - b * c == 0.0
     }
 }
 
@@ -887,16 +886,20 @@ mod tests {
         </svg>"#;
         let s = symbol(svg, "svg.flatpin", "Flat pin")?;
         assert_eq!(s.pins.len(), 1, "{:?}", s.pins);
-        // Very thin, but still invertible: drawn as a flat outline.
-        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg">
-            <circle id="pin:1" cx="0" cy="0" r="0.5"/>
-            <circle cx="0" cy="0" r="2" transform="translate(0 20) scale(1 1e-10)"/>
-        </svg>"#;
-        let s = symbol(svg, "svg.thin", "Thin")?;
-        let Some(thin) = s.graphics.iter().find_map(outline_size) else {
-            unreachable!("scale(1 1e-10) is not singular: {:?}", s.graphics);
-        };
-        assert!((thin.0 - 4.0).abs() < 1e-9 && thin.1 < 1e-9, "{thin:?}");
+        // Very thin, or nearly parallel axes, but still invertible: drawn as a flat outline.
+        for t in ["scale(1 1e-10)", "matrix(1 0 1 1e-13 0 0)"] {
+            let svg = format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg">
+                <circle id="pin:1" cx="0" cy="0" r="0.5"/>
+                <circle cx="0" cy="0" r="2" transform="translate(0 20) {t}"/>
+            </svg>"#
+            );
+            let s = symbol(&svg, "svg.thin", "Thin")?;
+            let Some(thin) = s.graphics.iter().find_map(outline_size) else {
+                unreachable!("{t} is not singular: {:?}", s.graphics);
+            };
+            assert!(thin.0 >= 4.0 - 1e-9 && thin.1 < 1e-9, "{t}: {thin:?}");
+        }
         Ok(())
     }
 
