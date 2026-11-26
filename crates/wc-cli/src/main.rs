@@ -1776,6 +1776,73 @@ fn rules_list(p: &Project, library: &[wc_core::check_rule::RuleSet], json: bool)
     Ok(out)
 }
 
+impl Cmd {
+    /// Every path this command reads as an input file, as named on the command line (so `-`
+    /// for stdin, and a folder where an importer takes one). Output paths and library folders
+    /// are not inputs. [`spool_inputs`] goes through them before the project lock is taken.
+    fn inputs_mut(&mut self) -> Vec<&mut PathBuf> {
+        match self {
+            Cmd::Inspect { file }
+            | Cmd::Logo(LogoCmd::Set { file })
+            | Cmd::Rules(RulesCmd::Set { file })
+            | Cmd::ReportLayout(ReportLayoutCmd::Set { file, .. }) => vec![file],
+            // Every import is listed, so a new one has to say what it reads.
+            Cmd::Import(import) => match import {
+                ImportCmd::SymbolDxf { file, .. }
+                | ImportCmd::FootprintDxf { file, .. }
+                | ImportCmd::ModelStep { file, .. }
+                | ImportCmd::SymbolSvg { file, .. }
+                | ImportCmd::PlcCsv { file }
+                | ImportCmd::Wago { file }
+                | ImportCmd::SymbolKicad { file, .. }
+                | ImportCmd::PartsBmecat { file, .. }
+                | ImportCmd::PartsCsv { file, .. }
+                | ImportCmd::Archive { file, .. }
+                | ImportCmd::PageDwg { file, .. }
+                | ImportCmd::Pdf { file, .. }
+                | ImportCmd::Aml { file, .. }
+                | ImportCmd::PageDxf { file, .. } => vec![file],
+                ImportCmd::Eplan { path, .. } | ImportCmd::SweLibrary { path, .. } => vec![path],
+                ImportCmd::PartsEdz { file, symbol_map, .. } => std::iter::once(file).chain(symbol_map).collect(),
+                ImportCmd::Swe { path, symbol_map, .. } => std::iter::once(path).chain(symbol_map).collect(),
+                ImportCmd::SymbolQet { files, .. } => files.iter_mut().collect(),
+            },
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// Copy every input of `cmd` that is not a regular file (a FIFO, a character device) into a
+/// private temporary folder, under the name it has, and point the command at the copy. Called
+/// before the project lock is taken: a FIFO that another command on the same project fills
+/// would otherwise never be read, as its writer waits for the lock this command holds while it
+/// waits for the writer (#658). Regular files, folders, `-` and paths that do not exist are
+/// left as they are, for the command to read (or report) itself. The copies are removed when
+/// the returned folder is dropped; `None` when nothing was copied.
+fn spool_inputs(cmd: &mut Cmd) -> Res<Option<tempfile::TempDir>> {
+    let mut spool = None;
+    for (n, path) in cmd.inputs_mut().into_iter().enumerate() {
+        let stream = path.as_os_str() != "-" && std::fs::metadata(&*path).is_ok_and(|m| !m.is_file() && !m.is_dir());
+        if !stream {
+            continue;
+        }
+        let fail = |x: std::io::Error| format!("{}: {x}", escape_field(&path.display().to_string()));
+        let folder = match &spool {
+            Some(folder) => folder,
+            None => spool.insert(run::staging_dir("wc-input-").map_err(|x| format!("temporary folder: {x}"))?),
+        };
+        // One folder per input: two inputs may share a file name.
+        let own = folder.path().join(n.to_string());
+        std::fs::create_dir(&own).map_err(|x| format!("{}: {x}", own.display()))?;
+        let copy = own.join(path.file_name().unwrap_or(std::ffi::OsStr::new("input")));
+        let mut from = std::fs::File::open(&*path).map_err(fail)?;
+        let mut to = std::fs::File::create(&copy).map_err(|x| format!("{}: {x}", copy.display()))?;
+        std::io::copy(&mut from, &mut to).map_err(fail)?;
+        *path = copy;
+    }
+    Ok(spool)
+}
+
 /// The rules in `file` for `rules set`, in order, each as the check runs it: `[[rule]]`
 /// tables, or a JSON list (or `{"rules": [...]}`) for a `.json` name; `-` is TOML on stdin.
 /// `stdin` is what was read from standard input for `-`, when it already was.
@@ -2072,13 +2139,16 @@ fn edit_macro(
     Ok(())
 }
 
-fn run(cli: Cli) -> Res<()> {
-    let dir = cli.project.as_path();
+fn run(mut cli: Cli) -> Res<()> {
     // One command at a time on a project: a second run waits, so it reads what the first one
     // wrote instead of overwriting it with an edit planned from the old files (#610).
     // An input file (or stdin) is read before the lock is taken: fed by another command on the
     // same project, through a pipe or a named FIFO, waiting for the lock before reading would
-    // hold both up for good.
+    // hold both up for good. Any command's input that is such a stream is copied to a
+    // temporary file first (#658); the commands below also read theirs here when it is a
+    // regular file.
+    let _spooled = spool_inputs(&mut cli.cmd)?;
+    let dir = cli.project.as_path();
     let mut input_text = match &cli.cmd {
         Cmd::Rules(RulesCmd::Set { file }) | Cmd::ReportLayout(ReportLayoutCmd::Set { file, .. }) => {
             Some(read_input(file)?)
@@ -9902,5 +9972,162 @@ mod box_cleanup_rollback_tests {
         );
         #[cfg(unix)]
         assert!(std::fs::symlink_metadata(folder.join("box.p1.s3.json")).is_ok_and(|m| m.file_type().is_symlink()));
+    }
+}
+
+/// Inputs are found for every command that names one, and only streams are copied (#658).
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod input_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// A command line for every command that reads a named file, and the inputs it names.
+    const WITH_INPUTS: &[(&[&str], &[&str])] = &[
+        (&["inspect", "in"], &["in"]),
+        (&["logo", "set", "in"], &["in"]),
+        (&["rules", "set", "in"], &["in"]),
+        (&["report-layout", "set", "terminals", "in"], &["in"]),
+        (
+            &[
+                "import",
+                "symbol-dxf",
+                "in",
+                "--id",
+                "a.b",
+                "--name",
+                "B",
+                "--lib",
+                "lib",
+            ],
+            &["in"],
+        ),
+        (
+            &["import", "footprint-dxf", "in", "--part", "a.b", "--lib", "lib"],
+            &["in"],
+        ),
+        (
+            &["import", "model-step", "in", "--part", "a.b", "--lib", "lib"],
+            &["in"],
+        ),
+        (
+            &[
+                "import",
+                "symbol-svg",
+                "in",
+                "--id",
+                "a.b",
+                "--name",
+                "B",
+                "--lib",
+                "lib",
+            ],
+            &["in"],
+        ),
+        (&["import", "plc-csv", "in"], &["in"]),
+        (&["import", "wago", "in"], &["in"]),
+        (&["import", "symbol-kicad", "in", "--lib", "lib"], &["in"]),
+        (&["import", "parts-bmecat", "in", "--lib", "lib"], &["in"]),
+        (&["import", "parts-edz", "in", "--lib", "lib"], &["in"]),
+        (
+            &["import", "parts-edz", "in", "--lib", "lib", "--symbol-map", "map"],
+            &["in", "map"],
+        ),
+        (&["import", "symbol-qet", "in", "two", "--lib", "lib"], &["in", "two"]),
+        (&["import", "parts-csv", "in", "--lib", "lib"], &["in"]),
+        (&["import", "archive", "in", "--lib", "lib"], &["in"]),
+        (&["import", "page-dwg", "in", "--page", "p1"], &["in"]),
+        (&["import", "pdf", "in"], &["in"]),
+        (&["import", "eplan", "in"], &["in"]),
+        (&["import", "swe", "in"], &["in"]),
+        (&["import", "swe", "in", "--symbol-map", "map"], &["in", "map"]),
+        (&["import", "swe-library", "in", "--lib", "lib"], &["in"]),
+        (&["import", "aml", "in"], &["in"]),
+        (&["import", "page-dxf", "in", "--page", "p1"], &["in"]),
+    ];
+
+    /// Path arguments that are not input files: where output goes, library and project folders.
+    const NOT_INPUTS: &[&str] = &["project", "dir", "out", "lib", "svg"];
+
+    /// The commands under `command` that take a path argument which is not in [`NOT_INPUTS`],
+    /// each as the words that name it.
+    fn commands_with_a_path(command: &clap::Command, words: &mut Vec<String>, found: &mut Vec<Vec<String>>) {
+        let path = clap::builder::ValueParser::path_buf().type_id();
+        let takes_one = command
+            .get_arguments()
+            .any(|a| a.get_value_parser().type_id() == path && !NOT_INPUTS.contains(&a.get_id().as_str()));
+        if takes_one && !words.is_empty() {
+            found.push(words.clone());
+        }
+        for sub in command.get_subcommands() {
+            words.push(sub.get_name().to_owned());
+            commands_with_a_path(sub, words, found);
+            words.pop();
+        }
+    }
+
+    #[test]
+    fn every_command_with_an_input_file_lists_it() {
+        for (args, want) in WITH_INPUTS {
+            let mut cli = Cli::try_parse_from(["wiringcraft"].iter().chain(*args)).unwrap();
+            let got: Vec<PathBuf> = cli.cmd.inputs_mut().into_iter().map(|p| p.clone()).collect();
+            let want: Vec<PathBuf> = want.iter().map(PathBuf::from).collect();
+            assert_eq!(got, want, "{args:?}");
+        }
+        // A command that takes a path which is not an output or a folder is in the list above,
+        // so a new command with an input file fails here until it is covered.
+        let mut found = Vec::new();
+        commands_with_a_path(&Cli::command(), &mut Vec::new(), &mut found);
+        assert!(found.len() >= 23, "{found:?}");
+        for words in found {
+            assert!(
+                WITH_INPUTS
+                    .iter()
+                    .any(|(args, _)| args.iter().zip(&words).filter(|(a, w)| a == w).count() == words.len()),
+                "`{}` takes a path that Cmd::inputs_mut and this test do not know",
+                words.join(" ")
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_without_an_input_file_has_none() {
+        for args in [
+            &["check"][..],
+            &["pdf", "out.pdf"],
+            &["export", "wago-marking", "out.csv"],
+        ] {
+            let mut cli = Cli::try_parse_from(["wiringcraft"].iter().chain(args)).unwrap();
+            assert!(cli.cmd.inputs_mut().is_empty(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn regular_files_folders_and_stdin_are_not_copied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("a.elmt");
+        std::fs::write(&file, "<definition/>").unwrap();
+        let folder = tmp.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        let missing = tmp.path().join("missing.elmt");
+        let lib = tmp.path().join("lib");
+        let mut cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "symbol-qet".as_ref(),
+            file.as_os_str(),
+            folder.as_os_str(),
+            missing.as_os_str(),
+            "--lib".as_ref(),
+            lib.as_os_str(),
+        ])
+        .unwrap();
+        assert!(spool_inputs(&mut cli.cmd).unwrap().is_none());
+        let after: Vec<PathBuf> = cli.cmd.inputs_mut().into_iter().map(|p| p.clone()).collect();
+        assert_eq!(after, [file, folder, missing]);
+
+        let mut cli = Cli::try_parse_from(["wiringcraft", "rules", "set", "-"]).unwrap();
+        assert!(spool_inputs(&mut cli.cmd).unwrap().is_none());
+        assert!(matches!(cli.cmd, Cmd::Rules(RulesCmd::Set { ref file }) if file.as_os_str() == "-"));
     }
 }
