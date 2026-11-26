@@ -153,17 +153,14 @@ pub struct Doc {
 }
 
 /// Encode text for the WinAnsi Helvetica font as a hex string. Latin-1 characters map directly
-/// (covers æ ø å ä ö ü é ...); anything else becomes '?'.
+/// (covers æ ø å ä ö ü é ...), the euro, curly quotes, ellipsis, dashes and the rest of WinAnsi
+/// to their codes; an arrow becomes '>' and anything else '?'.
 pub fn pdf_text(s: &str) -> String {
     let mut out = String::from("<");
     for c in s.chars() {
-        let b = match c as u32 {
-            0x20..=0x7e | 0xa0..=0xff => c as u32 as u8,
-            0x2013 => 0x96,
-            0x2014 => 0x97,
-            0x2022 => 0x95,
-            0x2192 => b'>',
-            _ => b'?',
+        let b = match c {
+            '\u{2192}' => b'>',
+            _ => wc_core::font::winansi_code(c).unwrap_or(b'?'),
         };
         let _ = write!(out, "{b:02X}");
     }
