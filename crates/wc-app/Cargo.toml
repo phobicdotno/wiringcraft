@@ -39,6 +39,7 @@ dirs = "6"
 
 [dev-dependencies]
 tempfile.workspace = true
+zip.workspace = true
 
 [lints]
 workspace = true

@@ -3784,6 +3784,7 @@ dependencies = [
  "wc-vcs",
  "wgpu",
  "winresource",
+ "zip",
 ]
 
 [[package]]

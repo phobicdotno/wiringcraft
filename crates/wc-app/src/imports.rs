@@ -109,6 +109,8 @@ pub enum Opt {
     Scale,
     /// The number of the first new page (`--first-page`).
     FirstPage,
+    /// Which project of a SolidWorks Electrical archive that holds several (`--pick`).
+    Project,
 }
 
 impl Kind {
@@ -116,7 +118,8 @@ impl Kind {
     pub fn options(self) -> &'static [Opt] {
         match self {
             Kind::PageDwg | Kind::PageDxf => &[Opt::Scale],
-            Kind::Eplan | Kind::Swe | Kind::Aml | Kind::Pdf | Kind::Archive => &[Opt::FirstPage],
+            Kind::Swe => &[Opt::Project, Opt::FirstPage],
+            Kind::Eplan | Kind::Aml | Kind::Pdf | Kind::Archive => &[Opt::FirstPage],
             _ => &[],
         }
     }
@@ -133,6 +136,8 @@ pub struct Options {
     /// SolidWorks Electrical: keep the source's page numbers (the command line without
     /// `--first-page`) instead of numbering from `first_page`.
     pub keep_numbers: bool,
+    /// Which project of a SolidWorks Electrical archive, counted from 1.
+    pub pick: usize,
 }
 
 impl Default for Options {
@@ -141,6 +146,7 @@ impl Default for Options {
             scale: 1.0,
             first_page: None,
             keep_numbers: false,
+            pick: 1,
         }
     }
 }
@@ -154,11 +160,32 @@ pub struct Form {
     pub first_page: String,
     /// SolidWorks Electrical: the source's page numbers are kept and `first_page` is not used.
     pub keep_numbers: bool,
+    /// The projects of a SolidWorks Electrical archive, as shown (number, folder, name); the
+    /// choice is offered when there are several.
+    pub projects: Vec<String>,
+    /// The project chosen, an index into `projects`.
+    pub project: usize,
+}
+
+/// The projects of the SolidWorks Electrical archive `file` as the options dialog lists them.
+/// None for a file that is no archive (a bare database, or a file the import will refuse).
+fn swe_projects(file: &Path) -> Vec<String> {
+    std::fs::File::open(file)
+        .ok()
+        .and_then(|f| wc_import::swe::archive_projects(std::io::BufReader::new(f)).ok())
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .map(|(i, p)| match p.name.is_empty() {
+            true => format!("{}: {}", i + 1, p.folder),
+            false => format!("{}: {} ({})", i + 1, p.folder, p.name),
+        })
+        .collect()
 }
 
 impl Form {
     /// The form for importing `file` as `kind` into `open`, with the defaults filled in.
-    pub fn new(open: &Open, kind: Kind, _file: &Path) -> Self {
+    pub fn new(open: &Open, kind: Kind, file: &Path) -> Self {
         Self {
             kind,
             scale: "1".to_owned(),
@@ -166,12 +193,18 @@ impl Form {
                 .map(|n| n.to_string())
                 .unwrap_or_default(),
             keep_numbers: false,
+            projects: if kind == Kind::Swe {
+                swe_projects(file)
+            } else {
+                Vec::new()
+            },
+            project: 0,
         }
     }
 
-    /// Whether the form shows `opt`.
+    /// Whether the form shows `opt`. An archive with one project has no project to choose.
     pub fn has(&self, opt: Opt) -> bool {
-        self.kind.options().contains(&opt)
+        self.kind.options().contains(&opt) && (opt != Opt::Project || self.projects.len() > 1)
     }
 
     /// What was typed, as the import's options, or what to correct.
@@ -187,6 +220,9 @@ impl Form {
                 .ok()
                 .filter(|s| s.is_finite() && *s > 0.0)
                 .ok_or_else(|| "The scale must be a number above 0, for example 1 or 0.1.".to_owned())?;
+        }
+        if self.has(Opt::Project) {
+            o.pick = self.project.min(self.projects.len() - 1) + 1;
         }
         if self.has(Opt::FirstPage) {
             o.keep_numbers = self.kind == Kind::Swe && self.keep_numbers;
@@ -352,7 +388,8 @@ fn project_work(open: &Open, kind: Kind, f: PathBuf, page: usize, options: &Opti
         }
         Kind::Swe => {
             let n = if options.keep_numbers { None } else { Some(first()?) };
-            Box::new(move |log| run::swe(&dir, &f, 1, n, None, log))
+            let pick = options.pick;
+            Box::new(move |log| run::swe(&dir, &f, pick, n, None, log))
         }
         Kind::SweLibrary => Box::new(move |log| run::swe_library(&dir, &f, None, log)),
         Kind::Aml => {
@@ -758,6 +795,60 @@ pub(crate) mod tests {
                 .parse::<usize>()
                 .is_ok_and(|n| n > 730)
         );
+    }
+
+    /// Write a zip at `path` with `entries` (name, bytes).
+    fn write_zip(path: &Path, entries: &[(&str, &[u8])]) -> bool {
+        use std::io::Write;
+        let Ok(file) = std::fs::File::create(path) else {
+            return false;
+        };
+        let mut z = zip::ZipWriter::new(file);
+        let opt = zip::write::SimpleFileOptions::default();
+        let written = entries
+            .iter()
+            .all(|(name, bytes)| z.start_file(*name, opt).is_ok() && z.write_all(bytes).is_ok());
+        written && z.finish().is_ok()
+    }
+
+    #[test]
+    fn the_project_chosen_from_a_solidworks_archive_is_the_one_imported() {
+        let (tmp, mut open) = project();
+        let archive = tmp.path().join("plant.tewzip");
+        // The databases are not real: the import gets as far as taking the chosen one out.
+        assert!(write_zip(
+            &archive,
+            &[
+                ("Projects/12/Database/tew_project_data.sqlite", b"twelve"),
+                ("Projects/3/Database/tew_project_data.sqlite", b"three"),
+            ]
+        ));
+        let mut form = Form::new(&open, Kind::Swe, &archive);
+        assert!(form.has(Opt::Project));
+        assert_eq!(form.projects, ["1: Projects/3", "2: Projects/12"]);
+        // The first is chosen, as the command line picks 1.
+        assert_eq!(form.options().map(|o| o.pick), Ok(1));
+        form.project = 1;
+        let options = form.options();
+        let Ok(options) = options else {
+            unreachable!("{options:?}");
+        };
+        assert_eq!(options.pick, 2);
+        let (_, msg) = import_with(&mut open, Kind::Swe, &archive, None, 0, &options);
+        assert!(msg.contains("importing number 2 (Projects/12)"), "{msg}");
+        let (_, msg) = import(&mut open, Kind::Swe, &archive, None, 0);
+        assert!(msg.contains("importing number 1 (Projects/3)"), "{msg}");
+
+        // One project, or a file that is no archive: nothing to choose.
+        let single = tmp.path().join("one.tewzip");
+        assert!(write_zip(
+            &single,
+            &[("Projects/3/Database/tew_project_data.sqlite", b"three")]
+        ));
+        assert!(!Form::new(&open, Kind::Swe, &single).has(Opt::Project));
+        let form = Form::new(&open, Kind::Swe, &tmp.path().join("missing.tewzip"));
+        assert!(!form.has(Opt::Project) && form.has(Opt::FirstPage));
+        assert_eq!(form.options().map(|o| o.pick), Ok(1));
     }
 
     #[test]

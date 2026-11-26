@@ -1187,6 +1187,33 @@ fn an_archive_import_carries_the_project_fields_into_the_title_block() {
 }
 
 #[test]
+fn the_projects_of_an_archive_are_listed_in_the_order_they_are_picked() {
+    let db = sample().serialize(rusqlite::MAIN_DB).unwrap().to_vec();
+    let list = project_list();
+    let buf = archive(&[
+        ("Projects/12/Database/tew_project_data.sqlite", &db),
+        ("Projects/3/Database/tew_project_data.sqlite", &db),
+        ("Projects/3/Snapshots/9/Database/tew_project_data.sqlite", &db),
+        ("Database/tew_app_project.sqlite", &list),
+    ]);
+    let got = archive_projects(buf.clone()).unwrap();
+    let shown: Vec<(&str, &str)> = got.iter().map(|p| (p.folder.as_str(), p.name.as_str())).collect();
+    assert_eq!(shown, [("Projects/3", "Pump station"), ("Projects/12", "Other")]);
+    // The same order as the pick.
+    assert_eq!(database_from_archive(buf, 2).unwrap().folder, "Projects/12");
+    // Without the project list the folders are still listed.
+    let bare = archive(&[("Projects/3/Database/tew_project_data.sqlite", &db)]);
+    assert_eq!(
+        archive_projects(bare).unwrap(),
+        [ArchiveProject {
+            folder: "Projects/3".into(),
+            name: String::new()
+        }]
+    );
+    assert!(archive_projects(std::io::Cursor::new(b"not a zip".to_vec())).is_err());
+}
+
+#[test]
 fn the_project_fields_come_across_without_a_description_table_and_with_numbers() {
     let c = Connection::open_in_memory().unwrap();
     c.execute_batch(

@@ -57,9 +57,10 @@ and the import's report and warnings are shown when it is done. The first page n
 is the CLI's default, or one above the project's highest numeric page number when that is higher
 (with page 101 in use, 102 even when 100 is free, since the imported pages follow on from one
 number); for a SolidWorks archive it is offered from 100 in the same way, with its own page
-numbers as the other choice. The app imports the first project of a SolidWorks archive, with no
-symbol map, and an archive's KiCad libraries and parts lists are listed, not imported; use the
-CLI for `--pick`, `--symbol-map` and `--lib` there.
+numbers as the other choice. A SolidWorks archive that holds several projects lists them (number,
+folder and name) and the first is chosen, as `--pick 1`. The app imports with no symbol map, and
+an archive's KiCad libraries and parts lists are listed, not imported; use the CLI for
+`--symbol-map` and `--lib` there.
 
 In the app, **Library → Import symbols…** takes DXF, SVG, `.kicad_sym` and `.elmt` files together,
 each read by its extension, and writes them into one of the project's library folders. The

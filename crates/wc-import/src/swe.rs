@@ -651,6 +651,37 @@ pub fn database_from_archive<R: Read + std::io::Seek>(reader: R, pick: usize) ->
     })
 }
 
+/// A project an archive holds, for choosing one by its number ([`database_from_archive`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveProject {
+    /// The project's folder in the archive, e.g. `Projects/4`.
+    pub folder: String,
+    /// Its name from the archive's project list; empty when the list has none for it.
+    pub name: String,
+}
+
+/// The projects an archive holds, in the order [`database_from_archive`] counts them (the
+/// first is number 1). No project database is unpacked, only the archive's project list.
+pub fn archive_projects<R: Read + std::io::Seek>(reader: R) -> Result<Vec<ArchiveProject>> {
+    let mut zip =
+        zip::ZipArchive::new(reader).map_err(|e| Error::Format(format!("not a SolidWorks Electrical archive: {e}")))?;
+    let projects = project_databases(&zip)
+        .iter()
+        .map(|name| {
+            let folder = name.rsplitn(3, '/').nth(2).unwrap_or_default().to_owned();
+            let directory = folder.rsplit('/').next().unwrap_or_default();
+            // A list that cannot be read leaves the folder to choose by.
+            let name = read_project_list(&mut zip, directory)
+                .ok()
+                .flatten()
+                .map(|info| info.name)
+                .unwrap_or_default();
+            ArchiveProject { folder, name }
+        })
+        .collect();
+    Ok(projects)
+}
+
 /// The archive's project list (`Database/tew_app_project.sqlite`), row for `directory`.
 fn read_project_list<R: Read + std::io::Seek>(
     zip: &mut zip::ZipArchive<R>,

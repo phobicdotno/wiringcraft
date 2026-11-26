@@ -3379,6 +3379,19 @@ impl App {
                             ui.add(egui::TextEdit::singleline(&mut form.scale).desired_width(80.0));
                             ui.end_row();
                         }
+                        if form.has(imports::Opt::Project) {
+                            ui.label("Project")
+                                .on_hover_text("The archive holds several projects; one is imported");
+                            let shown = form.projects.get(form.project).cloned().unwrap_or_default();
+                            egui::ComboBox::from_id_salt("import_swe_project")
+                                .selected_text(shown)
+                                .show_ui(ui, |ui| {
+                                    for (k, name) in form.projects.iter().enumerate() {
+                                        ui.selectable_value(&mut form.project, k, name);
+                                    }
+                                });
+                            ui.end_row();
+                        }
                         if form.has(imports::Opt::FirstPage) {
                             ui.label("First page number")
                                 .on_hover_text("The first new page takes this number; the others follow it");
