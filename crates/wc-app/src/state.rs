@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use wc_core::geom::{Point, Rotation};
 use wc_core::lock::ItemKind;
 use wc_core::plc_rack::PlcRack;
-use wc_core::project::PageSize;
+use wc_core::project::{PageNumberError, PageSize};
 use wc_core::route::{self, Axis, Route};
 use wc_core::template::PageTemplate;
 use wc_core::{DevicePart, DeviceTag, Endpoint, Page, Part, PlacedSymbol, Project, Symbol, Wire, store};
@@ -3034,17 +3034,16 @@ impl Open {
         overview: bool,
         fields: Option<&BTreeMap<String, String>>,
     ) -> Result<usize, String> {
-        let number = number.trim();
-        if number.is_empty() {
-            return Err("The page number cannot be empty.".into());
-        }
         let Some(current) = self.project.pages.get(page) else {
             return Err("No such page.".into());
         };
         let id = current.id.clone();
-        if self.project.pages.iter().any(|p| p.number == number && p.id != id) {
-            return Err(format!("Page {number} already exists."));
-        }
+        let number = match self.project.free_page_number(number, Some(&id)) {
+            Ok(number) => number,
+            Err(PageNumberError::Empty) => return Err("The page number cannot be empty.".into()),
+            Err(PageNumberError::Taken { number, .. }) => return Err(format!("Page {number} already exists.")),
+        };
+        let number = number.as_str();
         let mut own = current.clone();
         for (k, v) in fields.into_iter().flatten() {
             own.set_title_field(k, v);
