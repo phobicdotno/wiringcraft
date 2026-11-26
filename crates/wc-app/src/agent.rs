@@ -513,7 +513,8 @@ pub fn specs() -> Vec<Value> {
                 "text": {"type": "string", "description": "set, remove: the text as drawn in the project, such as a page title or device description."},
                 "lang": {"type": "string", "description": "A language code, such as nb or de."},
                 "translation": {"type": "string", "description": "set: the text in lang."},
-                "missing": {"type": "boolean", "description": "list with lang: only the texts without a translation."}
+                "missing": {"type": "boolean", "description": "list with lang: only the texts without a translation."},
+                "skip": {"type": "integer", "description": "list: leave out this many texts from the start; a long list answers with next_skip, the value to pass for the next page."}
             }),
             &["action"],
         ),
@@ -769,6 +770,45 @@ fn tag(t: &str) -> Result<DeviceTag, String> {
 
 fn pretty(v: &Value) -> String {
     serde_json::to_string(v).unwrap_or_default()
+}
+
+/// How many texts `translations list` returns in one answer, at most, in characters of JSON:
+/// the rest come on later pages (`skip`).
+const TRANSLATION_PAGE_CHARS: usize = 30_000;
+
+/// The `skip` argument of a paged list: how many rows to leave out from the start.
+fn skip(v: &Value) -> Result<usize, String> {
+    match v.get("skip") {
+        None | Some(Value::Null) => Ok(0),
+        Some(n) => n
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| "`skip` must be a whole number of texts, 0 or more.".into()),
+    }
+}
+
+/// One page of a `translations list` answer: whole rows from `skip` on, as many as fit in
+/// [`TRANSLATION_PAGE_CHARS`] (always at least one), with `next_skip` when more follow, so the
+/// answer stays valid JSON however many texts the project has.
+fn translation_page(source: &str, languages: &[String], rows: Vec<Value>, skip: usize) -> String {
+    let total = rows.len();
+    let mut used = 0;
+    let page: Vec<Value> = rows
+        .into_iter()
+        .skip(skip)
+        .take_while(|r| {
+            let len = r.to_string().len();
+            let fits = used == 0 || used + len <= TRANSLATION_PAGE_CHARS;
+            used += len;
+            fits
+        })
+        .collect();
+    let next = skip + page.len();
+    let mut out = json!({"source": source, "languages": languages, "total": total, "texts": page});
+    if next < total {
+        out["next_skip"] = json!(next);
+    }
+    pretty(&out)
 }
 
 fn clip_text(t: String, max: usize) -> String {
@@ -3154,10 +3194,7 @@ impl App {
                             .then(|| json!({"text": t.text, "used": t.used, "translations": tr}))
                     })
                     .collect();
-                Ok(clip_text(
-                    pretty(&json!({"source": dict.source(), "languages": dict.languages(), "texts": rows})),
-                    40_000,
-                ))
+                Ok(translation_page(dict.source(), &dict.languages(), rows, skip(v)?))
             }
             "set" | "remove" => {
                 let text = need_s(v, "text")?;
@@ -3597,9 +3634,22 @@ fn find_macro(open: &Open, name: &str) -> Result<crate::state::MacroEntry, Strin
 /// Whether `wiringcraft <args>` sets or removes a translation (`translations set`/`remove`,
 /// also with `--lang` before the subcommand).
 fn edits_translations(args: &[String]) -> bool {
-    args.iter()
-        .position(|a| a == "translations")
-        .is_some_and(|i| args[i + 1..].iter().any(|a| a == "set" || a == "remove"))
+    // The command's own words, without options and the values of the options that take one
+    // (`-C`/`--project` before or after the command, `--lang`), so a search text or a
+    // project folder named `translations` or `set` is not read as the command.
+    let mut words = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if matches!(a.as_str(), "-C" | "--project" | "--lang") {
+            it.next();
+        } else if !a.starts_with('-') {
+            words.push(a.as_str());
+        }
+        if words.len() == 2 {
+            break;
+        }
+    }
+    matches!(words.as_slice(), ["translations", "set" | "remove"])
 }
 
 fn writes_while_held(args: &[String], dir: &Path, held: &BTreeMap<String, String>, cwd: &Path) -> Option<String> {
@@ -5801,6 +5851,50 @@ mod tests {
         ])));
         assert!(!edits_translations(&args(&["translations", "--lang", "nb"])));
         assert!(!edits_translations(&args(&["page", "set"])));
+        assert!(edits_translations(&args(&[
+            "-C",
+            "proj",
+            "translations",
+            "set",
+            "A",
+            "B"
+        ])));
+        assert!(!edits_translations(&args(&[
+            "find",
+            "translations",
+            "--replace",
+            "set"
+        ])));
+        assert!(!edits_translations(&args(&["-C", "translations", "check", "set"])));
+    }
+
+    #[test]
+    fn a_long_translation_list_comes_in_whole_json_pages() {
+        let rows: Vec<Value> = (0..2000)
+            .map(|i| json!({"text": format!("Text number {i} {}", "x".repeat(40)), "used": 1, "translations": {}}))
+            .collect();
+        let langs = vec!["en".to_string(), "nb".to_string()];
+        let mut seen = Vec::new();
+        let mut from = 0;
+        let mut pages = 0;
+        loop {
+            let page: Value = serde_json::from_str(&translation_page("en", &langs, rows.clone(), from)).unwrap();
+            assert_eq!(page["total"], 2000);
+            let texts = page["texts"].as_array().unwrap();
+            assert!(!texts.is_empty());
+            seen.extend(texts.iter().map(|t| t["text"].as_str().unwrap().to_string()));
+            pages += 1;
+            match page["next_skip"].as_u64() {
+                Some(n) => from = n as usize,
+                None => break,
+            }
+        }
+        assert!(pages > 1, "the list did not need paging");
+        let want: Vec<String> = rows.iter().map(|r| r["text"].as_str().unwrap().to_string()).collect();
+        assert_eq!(seen, want);
+        // Past the end: an empty page, not an error.
+        let past: Value = serde_json::from_str(&translation_page("en", &langs, rows, 5000)).unwrap();
+        assert!(past["texts"].as_array().unwrap().is_empty() && past.get("next_skip").is_none());
     }
 
     #[test]
