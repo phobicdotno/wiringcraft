@@ -26,6 +26,52 @@ pub fn part_label(p: &Part) -> String {
     }
 }
 
+/// The parts the project uses that `parts` does not hold but whose copy in the project's
+/// library (`vendor/parts/`) is there and cannot be read, by id with the reason: the project
+/// check reports those as unreadable, not as missing
+/// ([`wc_report::check_with_unreadable`]). An id that cannot name a file there at all is
+/// unreadable too, with the reason the id is refused.
+pub fn unreadable_parts(dir: &Path, project: &Project, parts: &BTreeMap<String, Part>) -> BTreeMap<String, String> {
+    unreadable_parts_looked_up(dir, project, parts, Path::try_exists)
+}
+
+/// [`unreadable_parts`], with `exists` telling whether a copy's file is there: tests give a
+/// lookup that fails, which permission bits cannot do when they run as root.
+fn unreadable_parts_looked_up(
+    dir: &Path,
+    project: &Project,
+    parts: &BTreeMap<String, Part>,
+    exists: impl Fn(&Path) -> std::io::Result<bool>,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for id in project.used_parts() {
+        if parts.contains_key(&id) {
+            continue;
+        }
+        let path = match store::vendor_path(dir, ItemKind::Part, &id) {
+            Ok(path) => path,
+            Err(e) => {
+                out.insert(id, e.to_string());
+                continue;
+            }
+        };
+        // Only a copy known to be absent is missing: one that cannot even be looked for (a
+        // folder that may not be entered) is unreadable, with that reason.
+        match exists(&path) {
+            Ok(false) => {}
+            Ok(true) => {
+                if let Err(e) = store::read_vendored_part(dir, &id) {
+                    out.insert(id, e.to_string());
+                }
+            }
+            Err(e) => {
+                out.insert(id, format!("{}: {e}", path.display()));
+            }
+        }
+    }
+    out
+}
+
 /// What a click on the canvas does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
@@ -488,6 +534,9 @@ pub struct Open {
     /// differs between any two opened projects: checks while drawing look at this instead of
     /// comparing the whole project each frame.
     revision: u64,
+    /// Changes with every library reload ([`Open::refresh_library`]), which may find the
+    /// files of the project's library copy changed while the loaded project stays the same.
+    library_load: u64,
     /// The `history` count right after a properties form made its own undo step, so later
     /// typing in the form joins that step only while nothing else has touched the history.
     form_step: Option<u64>,
@@ -613,6 +662,7 @@ impl Open {
             undo_dropped: 0,
             history: 0,
             revision: next_revision(),
+            library_load: next_revision(),
             form_step: None,
             branch: wc_vcs::Git::new(dir).current_branch().unwrap_or_default(),
             underlays: BTreeMap::new(),
@@ -751,6 +801,7 @@ impl Open {
     pub fn refresh_library(&mut self) {
         self.relist_symbols();
         self.library_rules = wc_library::library_rules(&self.dir, &self.project);
+        self.library_load = next_revision();
         self.touch();
 
         self.parts = self
@@ -1214,6 +1265,11 @@ impl Open {
     /// Which edit of the project is shown: see the `revision` field.
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Which library reload is shown: see the `library_load` field.
+    pub fn library_load(&self) -> u64 {
+        self.library_load
     }
 
     /// Note an edit of the project, its symbols or its parts made without an undo step (a
@@ -5106,6 +5162,53 @@ fn version_fits(item_id: &str, hash: &str, id: &str, pin: &str) -> Result<(), St
 #[allow(clippy::unwrap_used)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A part copy that cannot be looked for (say, in a folder that may not be entered) is
+    /// reported as unreadable with the reason, not as missing (#1035). The failing lookup is
+    /// injected, so this holds when the tests run as root too.
+    #[test]
+    fn a_part_copy_that_cannot_be_looked_for_is_unreadable_with_the_reason() {
+        let (_tmp, mut o) = project();
+        o.project.devices.insert(
+            DeviceTag::parse("-K1").unwrap(),
+            wc_core::project::Device {
+                part: Some("maker.contactor".into()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            unreadable_parts(&o.dir, &o.project, &BTreeMap::new()).is_empty(),
+            "absent is missing"
+        );
+        let found = unreadable_parts_looked_up(&o.dir, &o.project, &BTreeMap::new(), |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        });
+        let why = found.get("maker.contactor").map(String::as_str).unwrap_or_default();
+        assert!(why.contains("maker.contactor.json"), "names the file: {found:?}");
+        assert!(why.to_lowercase().contains("permission denied"), "and why: {found:?}");
+    }
+
+    /// A used part id that cannot name a file in the project's library is reported as
+    /// unreadable with the reason the id is refused, not skipped; a valid id whose copy is
+    /// absent stays missing (not listed here).
+    #[test]
+    fn a_used_part_id_that_cannot_name_a_file_is_unreadable_with_the_reason() {
+        let (_tmp, mut o) = project();
+        for (tag, part) in [("-K1", "../escape"), ("-K2", "maker.absent")] {
+            o.project.devices.insert(
+                DeviceTag::parse(tag).unwrap(),
+                wc_core::project::Device {
+                    part: Some(part.into()),
+                    ..Default::default()
+                },
+            );
+        }
+        let found = unreadable_parts(&o.dir, &o.project, &BTreeMap::new());
+        let why = found.get("../escape").map(String::as_str).unwrap_or_default();
+        assert!(why.contains("must be 1-128"), "keeps the reason: {found:?}");
+        assert!(!found.contains_key("maker.absent"), "absent is missing: {found:?}");
+        assert_eq!(found.len(), 1, "{found:?}");
+    }
 
     thread_local! {
         /// A file whose writes by `restore_file` fail, after letting this many through.
