@@ -230,6 +230,21 @@ impl Editor {
     pub fn is_selected(&self, s: &Selection) -> bool {
         self.selection.contains(s)
     }
+
+    /// Whether a select-tool drag (a move, a logo or box sizing, a selection box) or a panel
+    /// device drag is under way: keys that edit the selection wait until it ends.
+    pub fn dragging(&self) -> bool {
+        self.drag.is_some() || self.panel_drag.is_some()
+    }
+
+    /// Start a move drag as a press on a selected item does (for tests of what waits for it).
+    #[cfg(test)]
+    pub(crate) fn start_move_drag(&mut self) {
+        self.drag = Some(Drag::Move {
+            from: Point::new(0.0, 0.0),
+            checkpoint: false,
+        });
+    }
 }
 
 pub(crate) struct Xf {
