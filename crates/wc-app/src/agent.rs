@@ -7661,6 +7661,43 @@ mod tests {
     }
 
     #[test]
+    fn the_assistant_does_not_edit_a_black_box_whose_file_changed_on_disk() {
+        let (_tmp, mut a) = app(vec![]);
+        let out = call(
+            &mut a,
+            "black_box",
+            json!({"action": "add", "page": "2", "x": 40, "y": 40, "width": 20, "height": 10,
+                   "pins": [{"name": "IN", "side": "left", "offset": 5}]}),
+        )
+        .unwrap();
+        let id = out
+            .trim_start_matches("Drew black box ")
+            .trim_end_matches('.')
+            .to_owned();
+        let symbol_id = page2(&a).symbol(&id).unwrap().symbol.clone();
+        let dir = a.open.as_ref().unwrap().dir.clone();
+        // `wiringcraft box-edit` resizes the box while the project is open.
+        let pins = [wc_core::BoxPin {
+            name: "IN".into(),
+            side: wc_core::BoxSide::Left,
+            offset: 5.0,
+        }];
+        let outside = wc_core::black_box(&symbol_id, "Black box", 50.0, 50.0, &pins).unwrap();
+        wc_core::store::write_vendored_symbol(&dir, &outside).unwrap();
+        let err = call(
+            &mut a,
+            "black_box",
+            json!({"action": "edit", "page": "2", "id": id, "width": 10}),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("changed on disk") && err.contains("reopen the project"),
+            "{err}"
+        );
+        assert_eq!(wc_core::store::read_vendored_symbol(&dir, &symbol_id).unwrap(), outside);
+    }
+
+    #[test]
     fn get_report_offers_and_reads_every_report() {
         let (_tmp, mut a) = app(vec![]);
         let spec = specs().into_iter().find(|t| t["name"] == "get_report").unwrap();
