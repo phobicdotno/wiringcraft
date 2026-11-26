@@ -227,24 +227,29 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
         let (start, empty) = match &ev {
             Event::Start(e) => (Some(e.clone()), false),
             Event::Empty(e) => (Some(e.clone()), true),
-            Event::End(_) => {
+            Event::End(e) => {
+                // A `<text>` with no words in it must not hand its place to later text.
+                if e.local_name().as_ref() == b"text" {
+                    pending_text = None;
+                }
                 if stack.len() > 1 {
                     stack.pop();
                 }
                 (None, false)
             }
             Event::Text(t) => {
-                if let Some((at, h, align)) = pending_text.take() {
-                    let s = t.unescape().map(|s| s.trim().to_owned()).unwrap_or_default();
-                    if !s.is_empty() {
-                        shapes.push(Shape::Text {
-                            at,
-                            text: s,
-                            height: h,
-                            align,
-                            angle: 0.0,
-                        });
-                    }
+                // Skip the line breaks and indents between `<text>` and a `<tspan>`.
+                let s = t.unescape().map(|s| s.trim().to_owned()).unwrap_or_default();
+                if !s.is_empty()
+                    && let Some((at, h, align)) = pending_text.take()
+                {
+                    shapes.push(Shape::Text {
+                        at,
+                        text: s,
+                        height: h,
+                        align,
+                        angle: 0.0,
+                    });
                 }
                 (None, false)
             }
@@ -346,7 +351,9 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                     Some("end") => Align::Right,
                     _ => Align::Left,
                 };
-                pending_text = Some((m.p(num(&e, "x"), num(&e, "y")), size * sc * 0.72, align));
+                if !empty {
+                    pending_text = Some((m.p(num(&e, "x"), num(&e, "y")), size * sc * 0.72, align));
+                }
                 None
             }
             _ => None,
@@ -403,6 +410,31 @@ mod tests {
                 .any(|g| matches!(g, Shape::Text { text, .. } if text == "K"))
         );
         assert!(s.graphics.len() >= 4);
+        Ok(())
+    }
+
+    #[test]
+    fn text_in_tspan_after_line_break() -> Result<()> {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 20">
+            <text x="3" y="10" font-size="4">
+              <tspan>K1</tspan>
+            </text>
+            <text x="3" y="14"/>
+            <title>not a label</title>
+            <text x="3" y="16">
+            </text>
+            <desc>also not a label</desc>
+        </svg>"#;
+        let s = symbol(svg, "svg.k1", "K1")?;
+        let texts: Vec<&str> = s
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["K1"]);
         Ok(())
     }
 
