@@ -721,9 +721,16 @@ impl ProjectMeta {
     }
 
     /// Add a location, or fill in the description of one the project already has. A description
-    /// already there is kept. Returns whether anything changed.
-    pub fn merge_location(&mut self, loc: Location) -> bool {
-        match self.locations.iter_mut().find(|l| l.path == loc.path) {
+    /// already there is kept. Paths match by their normal form, so a location stored as typed
+    /// (`+L1`) is found by `L1`. Returns whether anything changed.
+    pub fn merge_location(&mut self, mut loc: Location) -> bool {
+        let key = location_path(&loc.path).unwrap_or_else(|_| loc.path.clone());
+        let found = self
+            .locations
+            .iter_mut()
+            .find(|l| l.path == loc.path || location_path(&l.path).is_ok_and(|p| p == key));
+        loc.path = key;
+        match found {
             Some(have) if have.description.is_empty() && !loc.description.is_empty() => {
                 have.description = loc.description;
                 true
@@ -2337,6 +2344,15 @@ mod tests {
         );
         let paths: Vec<&str> = m.locations.iter().map(|l| l.path.as_str()).collect();
         assert_eq!(paths, ["L1.L3", "L2"]);
+        // A location stored as typed is found by its normal form, and the other way round.
+        m.locations.push(loc("+L4", ""));
+        assert!(m.merge_location(loc("L4", "Deck")), "the stored +L4 is filled in");
+        assert!(!m.merge_location(loc("+L2", "Other")));
+        assert!(m.merge_location(loc("+L5", "")));
+        let paths: Vec<&str> = m.locations.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(paths, ["+L4", "L1.L3", "L2", "L5"]);
+        assert_eq!(m.locations[0].description, "Deck");
+        m.locations.retain(|l| l.path != "+L4" && l.path != "L5");
         let text = toml::to_string(&m).unwrap_or_default();
         assert!(text.contains("[[location]]"), "{text}");
         let back: ProjectMeta = toml::from_str(&text)?;
