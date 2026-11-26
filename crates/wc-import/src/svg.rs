@@ -30,6 +30,14 @@ impl M {
         let [a, b, c, d, e, f] = self.0;
         Point::new(a * x + c * y + e, b * x + d * y + f)
     }
+    /// The turn of a text drawn with this transform, in whole degrees from 0 to 360: the
+    /// direction of its x axis. Negated, since SVG's y runs down and a text angle turns
+    /// counter-clockwise on the page.
+    fn text_angle(&self) -> f64 {
+        let [a, b, ..] = self.0;
+        // `+ 0.0` turns a -0 from an unturned text into 0.
+        (-b.atan2(a).to_degrees()).round().rem_euclid(360.0) + 0.0
+    }
     fn scale(&self) -> f64 {
         let [a, b, ..] = self.0;
         (a * a + b * b).sqrt()
@@ -553,7 +561,7 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
     let mut shows: Vec<(bool, bool)> = vec![(true, true)];
     let mut shapes = Vec::new();
     let mut pins: Vec<(Option<String>, Point)> = Vec::new();
-    let mut pending_text: Option<(Point, f64, Align)> = None;
+    let mut pending_text: Option<(Point, f64, Align, f64)> = None;
     let mut seen_root = false;
     let mut depth_guard = 0usize;
     loop {
@@ -578,7 +586,7 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                 // (a `<tspan>` with `display="none"` or `visibility="hidden"`) is skipped and
                 // leaves the label waiting for a visible one.
                 let shown_run = shows.last().copied().unwrap_or((true, true)) == (true, true);
-                if let (Some((at, h, align)), true) = (pending_text, shown_run) {
+                if let (Some((at, h, align, angle)), true) = (pending_text, shown_run) {
                     let s = t
                         .unescape()
                         .map_err(|e| Error::Format(format!("SVG: {e}")))?
@@ -592,7 +600,7 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                             text: s,
                             height: h,
                             align,
-                            angle: 0.0,
+                            angle,
                         });
                     }
                 }
@@ -750,7 +758,8 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                     _ => Align::Left,
                 };
                 if !empty {
-                    pending_text = Some((m.p(num(&e, "x"), num(&e, "y")), size * sc * 0.72, align));
+                    let at = m.p(num(&e, "x"), num(&e, "y"));
+                    pending_text = Some((at, size * sc * 0.72, align, m.text_angle()));
                 }
                 None
             }
@@ -1303,6 +1312,36 @@ mod tests {
                 ("R", Align::Right, Point::new(0.0, 15.0)),
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn turned_text_keeps_its_angle() -> Result<()> {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg">
+            <circle id="pin:1" cx="0" cy="0" r="0.5"/>
+            <text transform="rotate(-90 5 5)" x="5" y="5">K1</text>
+            <g transform="rotate(-90 5 5)"><text x="5" y="5">K2</text></g>
+            <text x="5" y="5">K3</text>
+            <text transform="rotate(90)" x="0" y="0">K4</text>
+        </svg>"#;
+        let s = symbol(svg, "svg.turn", "Turn")?;
+        let texts: Vec<(&str, f64, Point)> = s
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Text { text, angle, at, .. } => Some((text.as_str(), *angle, *at)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts.len(), 4);
+        let want = [("K1", 90.0), ("K2", 90.0), ("K3", 0.0), ("K4", 270.0)];
+        for ((text, angle, _), (w_text, w_angle)) in texts.iter().zip(want) {
+            assert_eq!((*text, *angle), (w_text, w_angle));
+        }
+        // Turned round its own anchor, the text stays where it was.
+        for (_, _, at) in &texts[..3] {
+            assert!((at.x - 5.0).abs() < 1e-9 && (at.y - 5.0).abs() < 1e-9, "{at:?}");
+        }
         Ok(())
     }
 
