@@ -381,6 +381,8 @@ pub(crate) struct Mark {
     kept: Kept,
     symbols: std::collections::BTreeSet<String>,
     parts: std::collections::BTreeSet<String>,
+    /// The symbol list as it was: a symbol the change loaded may have added or changed a row.
+    library: Vec<LibraryEntry>,
     /// The vendored symbol and part files there were, or why that is not known.
     files: Result<std::collections::BTreeSet<(ItemKind, String)>, String>,
     /// Where the change's own project file edits start in [`Open::mark_edits`].
@@ -3172,6 +3174,7 @@ impl Open {
             kept,
             symbols: self.symbols.keys().cloned().collect(),
             parts: self.parts.keys().cloned().collect(),
+            library: self.library.clone(),
             files: vendor_names(&self.dir),
             edits_from: self.mark_edits.len(),
         }
@@ -3224,6 +3227,7 @@ impl Open {
         }
         self.symbols.retain(|id, _| mark.symbols.contains(id));
         self.parts.retain(|id, _| mark.parts.contains(id));
+        self.library = mark.library;
         let (before, now) = match (mark.files, vendor_names(&self.dir)) {
             (Ok(before), Ok(now)) => (before, now),
             (Err(e), _) | (_, Err(e)) => {
@@ -6124,6 +6128,31 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_refused_change_that_loaded_a_symbol_puts_the_symbol_list_back() {
+        let (tmp, mut o) = project();
+        o.ensure_symbol("wc.coil").unwrap();
+        let old = o.symbols["wc.coil"].clone();
+        o.save().unwrap();
+        std::fs::remove_file(store::vendor_path(&o.dir, ItemKind::Symbol, "wc.coil").unwrap()).unwrap();
+        let mut o = Open::load(&o.dir).unwrap();
+        let mut new = old.clone();
+        new.description = "Solenoid winding".into();
+        library_first(&mut o, tmp.path(), &new);
+        o.refresh_library();
+        let m = o.mark();
+        let listed = o.library.clone();
+        // The change loads the pinned version, which changes its row, and is then refused.
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        assert_ne!(o.library, listed);
+        // A symbol only this project has gets a row of its own.
+        let mut own = old.clone();
+        own.id = "test.own".into();
+        o.load_symbol("test.own", own);
+        o.back_to(m).unwrap();
+        assert_eq!(o.library, listed, "the symbol list is as it was at the mark");
+    }
+
+    #[test]
     fn a_pinned_symbol_loaded_in_another_version_is_not_placed() {
         let (_tmp, mut o) = project();
         let id = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
@@ -6449,7 +6478,7 @@ pub(crate) mod tests {
     }
 
     /// A library folder named "mine", put ahead of the others, holding `sym`.
-    fn library_first(o: &mut Open, root: &Path, sym: &Symbol) -> wc_library::Library {
+    pub(crate) fn library_first(o: &mut Open, root: &Path, sym: &Symbol) -> wc_library::Library {
         let mine = root.join("mine");
         std::fs::create_dir_all(mine.join("symbols")).unwrap();
         std::fs::write(

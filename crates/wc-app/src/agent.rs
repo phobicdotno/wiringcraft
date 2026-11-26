@@ -3907,6 +3907,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn library_update_from_the_menu_lists_the_new_descriptions() {
+        let (tmp, mut a) = app(vec![]);
+        let o = a.open.as_mut().unwrap();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let mut new = o.symbols["wc.coil"].clone();
+        new.description = "Solenoid winding".into();
+        crate::state::tests::library_first(o, tmp.path(), &new);
+        a.run(Action::LibraryUpdate);
+        let o = a.open.as_ref().unwrap();
+        assert_eq!(o.symbols["wc.coil"], new, "{}", a.ed.message);
+        let row = o.library.iter().find(|e| e.id == "wc.coil").unwrap();
+        assert_eq!(row.description, new.description);
+    }
+
     fn app(answers: Vec<Value>) -> (tempfile::TempDir, App) {
         let (tmp, open) = crate::state::tests::project();
         let mut prefs = crate::prefs::Prefs::default();

@@ -1878,7 +1878,12 @@ impl App {
                     Ok(lib) => {
                         if a == Action::LibraryUpdate {
                             match open.update_library(&lib, None) {
-                                Ok(done) => self.ed.message = format!("Updated {} library items.", done.len()),
+                                Ok(done) => {
+                                    // The symbol list, editor choices and search show the new
+                                    // names and descriptions.
+                                    open.refresh_library();
+                                    self.ed.message = format!("Updated {} library items.", done.len());
+                                }
                                 Err(e) => self.ed.message = format!("Update failed: {e}"),
                             }
                         }
