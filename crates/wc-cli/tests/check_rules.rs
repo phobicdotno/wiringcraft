@@ -253,6 +253,13 @@ fn rules_lists_sets_and_turns_library_rules_off_and_on() -> TestResult {
     let list = wiringcraft(&dir, &["rules", "list"])?;
     assert!(list.contains("mine:1\ton\t"), "{list}");
     assert_eq!(wiringcraft(&dir, &["rules", "on", "mine:1"])?, "mine:1 is on already\n");
+    // A misspelt rule is refused rather than reported on already (#1041).
+    let toml = std::fs::read_to_string(dir.join("project.toml"))?;
+    let Err(err) = wiringcraft(&dir, &["rules", "on", "mine:short-tag"]) else {
+        unreachable!("a selector naming no rule is refused");
+    };
+    assert!(err.contains("No library check rule \"mine:short-tag\""), "{err}");
+    assert_eq!(std::fs::read_to_string(dir.join("project.toml"))?, toml);
 
     // An entry naming no rule is listed and can be dropped.
     let text = std::fs::read_to_string(dir.join("project.toml"))?;
