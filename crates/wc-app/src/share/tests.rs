@@ -6410,6 +6410,73 @@ fn a_folder_picked_with_browse_is_kept_exactly_and_a_failure_is_about_the_folder
 }
 
 #[test]
+fn a_browse_failure_in_the_frame_the_folder_was_edited_stays_shown() {
+    let mut form = Form {
+        folder: crate::prefs::FolderField::typed("/old"),
+        ..Form::default()
+    };
+    form.fail(ErrorAbout::Folder, "Old folder error.".into());
+    let mut typed = (form.addr.clone(), form.folder.text.clone());
+    // In one frame: the folder is edited, then Browse cannot open.
+    form.folder.text = "/new".into();
+    form.browse_in_frame(&mut typed, crate::Picked::Failed("No picker.".into()));
+    // The frame's own check afterwards.
+    form.forget_error_unless(&typed.0, &typed.1);
+    assert_eq!(form.error.as_deref(), Some("No picker."));
+}
+
+#[test]
+fn browse_that_picks_the_folder_already_shown_clears_the_folder_error() -> TestResult {
+    let mut form = Form::default();
+    let picked = std::env::temp_dir().join("Shared copy");
+    form.browsed(crate::Picked::Path(picked.clone()));
+    form.browsed(crate::Picked::Failed("No picker.".into()));
+    assert!(form.error.is_some());
+    // The same folder again: the text does not change, the error goes all the same.
+    form.browsed(crate::Picked::Path(picked.clone()));
+    assert!(form.error.is_none());
+    assert_eq!(form.folder.path()?, picked);
+    // An error about the address stays.
+    form.fail(ErrorAbout::Address, "The host refused.".into());
+    form.browsed(crate::Picked::Path(picked));
+    assert_eq!(form.error.as_deref(), Some("The host refused."));
+    Ok(())
+}
+
+#[test]
+fn a_browsed_folder_ending_in_a_space_is_the_one_the_guest_copy_goes_in() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let mut host_open = project(&tmp.path().join("host"))?;
+    let mut h = Share::default();
+    h.start_host(&mut host_open, "Hanna", "hanna@example.com")?;
+    let port = match &h.role {
+        Some(Role::Host(x)) => x.port,
+        _ => 0,
+    };
+    let picked = tmp.path().join("Shared copy ");
+    let mut form = Form {
+        addr: format!("127.0.0.1:{port}"),
+        name: "Ola".into(),
+        email: "ola@example.com".into(),
+        ..Form::default()
+    };
+    form.browsed(crate::Picked::Path(picked.clone()));
+    let mut g = Share {
+        form: Some(form),
+        view: View::Join,
+        ..Default::default()
+    };
+    // As the Join button sends it.
+    g.ask_to_join(crate::prefs::FolderField::path);
+    let Some(Role::Guest(j)) = g.role.as_ref() else {
+        return Err(format!("not joined: {:?}", g.form.and_then(|f| f.error)).into());
+    };
+    assert_eq!(j.folder, picked);
+    h.stop();
+    Ok(())
+}
+
+#[test]
 fn a_picture_whose_write_time_is_unknown_is_read_again_even_at_the_same_size() {
     let at = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
     // Without a write time a same-size replacement looks the same: it must be read.

@@ -1911,16 +1911,17 @@ impl App {
                 let before = self.dialog.is_some();
                 let waiting = self.pending.is_some();
                 self.run(a);
-                if let Some(m) = self.take_message() {
-                    return Ok(m);
-                }
                 // Only a picker this action asked for: one already waiting is another action's
-                // (and makes this one's refused, which its message says).
+                // (and makes this one's refused, which its message says). Told before any
+                // message, which may be an earlier one still showing.
                 if !waiting && self.pending.is_some() {
                     return Ok(format!(
                         "{} queued a file dialog on the user's screen for them to pick in; it has not been answered yet.",
                         a.info().label
                     ));
+                }
+                if let Some(m) = self.take_message() {
+                    return Ok(m);
                 }
                 if !before && self.dialog.is_some() {
                     return Ok(format!(
@@ -3587,6 +3588,15 @@ mod tests {
             "Check: checking",
             "no counts of the first project"
         );
+    }
+
+    #[test]
+    fn a_queued_picker_is_told_even_with_an_earlier_message_showing() {
+        let (_tmp, mut a) = app(vec![]);
+        a.dialog = Some(Dialog::Message("Exported 3 pages".into()));
+        let r = call(&mut a, "run_action", json!({"action": Action::ExportAml.name()})).unwrap();
+        assert!(r.contains("queued a file dialog"), "{r}");
+        assert!(matches!(a.pending, Some(crate::Pending::Export(crate::Export::Aml))));
     }
 
     #[test]
@@ -5486,19 +5496,15 @@ mod tests {
                 align: Default::default(),
                 angle: 0.0,
             });
-        // Without a dictionary no language is asked: the save dialog comes next, as drawn.
+        // Without a dictionary no language is asked for: only where to save, and the PDF is
+        // printed as drawn.
         a.run(Action::ExportPdf);
         assert!(a.dialog.is_none());
-        let Some(crate::Pending::Export(kind)) = a.pending.take() else {
-            unreachable!("the save dialog waits");
-        };
-        assert!(matches!(&kind, crate::Export::Pdf(l) if l.is_empty()));
-        let to = dir.join("export").join("as-drawn.pdf");
-        let m = crate::export_whole(a.open.as_ref().unwrap(), kind, &|_, _, _, _| {
-            crate::Picked::Path(to.clone())
-        })
-        .unwrap_or_default();
-        assert!(m.starts_with("Exported") && to.is_file(), "{m}");
+        assert!(matches!(
+            &a.pending,
+            Some(crate::Pending::Export(crate::Export::Pdf(langs))) if langs.is_empty()
+        ));
+        a.pending = None;
         std::fs::write(
             dir.join(TRANSLATIONS_FILE),
             "source = \"en\"\n\n[[text]]\nen = \"Pumps\"\nnb = \"Pumper\"\n",
@@ -5541,7 +5547,7 @@ mod tests {
         };
         assert_eq!(langs, &["en", "nb", "de"]);
         let open = a.open.as_ref().unwrap();
-        let m = crate::export_pdf_in(open, &["nb".into(), "en".into()], &crate::export_file(open, "pdf"));
+        let m = crate::export_pdf_in(open, &["nb".into(), "en".into()]);
         assert!(m.starts_with("Exported"), "{m}");
         assert!(m.contains("no translation for"), "missing texts are warned about: {m}");
         assert!(!m.contains("\"Spare\""), "{m}");
@@ -5555,7 +5561,12 @@ mod tests {
                 "drawing text stays out of the logged message: {m}"
             );
         }
-        let pdf_path = crate::export_file(open, "pdf");
+        let pdf_path = std::fs::read_dir(dir.join("export"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "pdf"))
+            .unwrap();
         let pdf = String::from_utf8_lossy(&std::fs::read(pdf_path).unwrap()).into_owned();
         assert!(pdf.contains(&hex("Reserve / Spare")), "the texts are in both languages");
         assert!(pdf.contains(&hex("Pumpene / Pumps")));

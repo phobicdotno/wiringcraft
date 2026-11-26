@@ -1784,17 +1784,19 @@ impl Open {
     /// included), then the changes not saved yet are saved in the copy only, so the original
     /// stays as it was last saved. Library folders given relative to the project and lying
     /// outside it are pointed at the same folders from the new place; the project's own library
-    /// (inside it) is copied and stays the copy's own. Returns the folder the copy is in and how
-    /// many links in the project folder were left out of the copy. When saving in the copy
-    /// fails, the project goes on being worked on in its old folder.
-    pub fn save_as(&mut self, target: &Path) -> Result<(PathBuf, usize), String> {
+    /// (inside it) is copied and stays the copy's own. Returns the folder the copy is in and the
+    /// links in the project folder (relative to it) that were left out of the copy. When saving
+    /// in the copy fails, the project goes on being worked on in its old folder.
+    pub fn save_as(&mut self, target: &Path) -> Result<(PathBuf, Vec<PathBuf>), String> {
         // Resolved as the file system walks it (a link, then `..`), and that same folder is
         // checked, copied into and worked in, so the check and the copy cannot part ways.
-        let target = destination(&crate::prefs::absolute(target)?);
+        let target = destination(&crate::prefs::absolute(target)?)?;
         let from = self.dir.clone();
-        // Compared as the file system resolves them, so another letter case on Windows, a link
-        // or `..` cannot hide that the target is inside the project.
-        if resolved(&target).starts_with(resolved(&from)) {
+        // Both walked as the file system walks them, so another letter case on Windows, a link
+        // or `..` (in either, a link followed by `..` too) cannot hide that the target is
+        // inside the project.
+        let from_real = destination(&from)?;
+        if target.starts_with(&from_real) {
             return Err(format!(
                 "{} is inside the project folder; pick a place outside it.",
                 target.display()
@@ -1841,8 +1843,9 @@ impl Open {
             }
         }
         // What a failed copy made is taken away again, so the same place can be tried again;
-        // the folder was new or empty, so all in it is the copy's.
-        let discard = || {
+        // the folder was new or empty, so all in it is the copy's. Says what is left when that
+        // fails.
+        let discard = || -> String {
             let r = if existed {
                 std::fs::read_dir(&target).and_then(|d| {
                     d.into_iter().try_for_each(|e| {
@@ -1857,8 +1860,15 @@ impl Open {
             } else {
                 std::fs::remove_dir_all(&target)
             };
-            if let Err(e) = r {
-                crate::applog::warn(&format!("could not clear the failed copy in {}: {e}", target.display()));
+            match r {
+                Ok(()) => format!("The copy in {} was taken away again", target.display()),
+                Err(e) => {
+                    crate::applog::warn(&format!("could not clear the failed copy in {}: {e}", target.display()));
+                    format!(
+                        "The copy in {} could not all be taken away again ({e}); remove what is left by hand",
+                        target.display()
+                    )
+                }
             }
         };
         // A new folder is made here, once: another save to the same place that got there first
@@ -1870,25 +1880,22 @@ impl Open {
                 .and_then(|()| std::fs::create_dir(&target))
                 .map_err(|e| format!("Could not make {}: {e}", target.display()))?;
         }
-        let links = copy_dir(&from, &target).map_err(|e| {
-            discard();
-            format!("Copying to {} failed: {e}", target.display())
-        })?;
+        let mut links = Vec::new();
+        copy_dir(&from, &target, Path::new(""), &mut links)
+            .map_err(|e| format!("Copying to {} failed: {e}\n{}.", target.display(), discard()))?;
         // A relative library folder outside the project is the same folder seen from the copy;
-        // one inside it was copied along. Where the library is there, the file system resolves
-        // it (a link followed by `..` goes where the file system says, not where the text does).
+        // one inside it was copied along. The file system walks it as far as it exists (a link
+        // followed by `..` goes where the file system says, not where the text does), also when
+        // the library folder itself is missing now; a route it cannot walk (through a file)
+        // stays the original's own, as a full path.
         let repoint = |libs: &mut Vec<wc_core::project::LibrarySource>| {
             for lib in libs {
                 if lib.kind == "folder" && Path::new(&lib.location).is_relative() {
-                    // All three as the file system resolves them (a missing library folder by
-                    // its longest existing part), so `/var` and `/private/var` on macOS, or a
-                    // short and a long name on Windows, never make a route through the root.
-                    // An existing folder is followed link by link (a link before `..` counts);
-                    // a missing one by its longest existing part.
-                    let at = std::fs::canonicalize(from.join(&lib.location))
-                        .unwrap_or_else(|_| resolved(&from.join(&lib.location)));
-                    let (project, base) = (resolved(&from), resolved(&target));
-                    lib.location = match at.strip_prefix(&project) {
+                    let Ok(at) = destination(&from.join(&lib.location)) else {
+                        lib.location = from.join(&lib.location).display().to_string();
+                        continue;
+                    };
+                    lib.location = match at.strip_prefix(&from_real) {
                         // Inside the project (`library`, or `../design/library` from `design`):
                         // copied along, so the copy's own, written from the copy's root.
                         Ok(inside) if inside.as_os_str().is_empty() => ".".into(),
@@ -1896,7 +1903,7 @@ impl Open {
                         // A route the saved text can hold: the relative one when it is valid
                         // text, otherwise the original's own route (through any link) as a
                         // full path, which stays text.
-                        Err(_) => match relative_to(&at, &base).as_deref().and_then(Path::to_str) {
+                        Err(_) => match relative_to(&at, &target).as_deref().and_then(Path::to_str) {
                             Some(t) => t.to_owned(),
                             None => from.join(&lib.location).display().to_string(),
                         },
@@ -1914,10 +1921,9 @@ impl Open {
             self.project.meta.libraries = old_libraries;
             self.dirty = old_dirty;
             self.stale_symbol_files = old_stale;
-            discard();
             return Err(format!(
-                "{e}\nThe copy in {} was taken away again; you are still working in {}.",
-                target.display(),
+                "{e}\n{}; you are still working in {}.",
+                discard(),
                 from.display()
             ));
         }
@@ -3559,23 +3565,23 @@ fn restore_file(path: &Path, was: Option<&[u8]>) -> std::io::Result<()> {
 }
 
 /// Copy a folder and everything in it. Links are not followed: a link is left out, so a copy
-/// never reaches outside the folder. Returns how many links were left out.
-fn copy_dir(from: &Path, to: &Path) -> std::io::Result<usize> {
+/// never reaches outside the folder. Each link left out is added to `links`, as its path in
+/// the folder copied (`at` is where `from` is in it).
+fn copy_dir(from: &Path, to: &Path, at: &Path, links: &mut Vec<PathBuf>) -> std::io::Result<()> {
     std::fs::create_dir_all(to)?;
-    let mut links = 0;
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
         let kind = entry.file_type()?;
         let dest = to.join(entry.file_name());
         if kind.is_dir() {
-            links += copy_dir(&entry.path(), &dest)?;
+            copy_dir(&entry.path(), &dest, &at.join(entry.file_name()), links)?;
         } else if kind.is_file() {
             std::fs::copy(entry.path(), &dest)?;
         } else {
-            links += 1;
+            links.push(at.join(entry.file_name()));
         }
     }
-    Ok(links)
+    Ok(())
 }
 
 /// A path's parts with `.` dropped and `..` taken back where it can be (lexically).
@@ -3601,15 +3607,18 @@ fn git_worktree_set(config: &Path) -> bool {
     };
     let mut in_core = false;
     for line in text.lines().map(str::trim) {
-        if line.starts_with('[') {
-            in_core = line
-                .trim_start_matches('[')
-                .trim_start()
-                .to_ascii_lowercase()
-                .starts_with("core")
-                && !line.contains('"');
-        } else if in_core {
-            let key = line.split('=').next().unwrap_or_default().trim();
+        // A section header: `[core]`, maybe followed by a comment (which may hold quotes) or by
+        // a key on the same line. `[core "x"]` is another section.
+        let key_line = match line.strip_prefix('[') {
+            Some(header) => {
+                let (name, rest) = header.split_once(']').unwrap_or((header, ""));
+                in_core = name.trim().eq_ignore_ascii_case("core");
+                rest.trim()
+            }
+            None => line,
+        };
+        if in_core && !key_line.starts_with(['#', ';']) {
+            let key = key_line.split(['=', '#', ';']).next().unwrap_or_default().trim();
             if key.eq_ignore_ascii_case("worktree") {
                 return true;
             }
@@ -3618,28 +3627,39 @@ fn git_worktree_set(config: &Path) -> bool {
     false
 }
 
-/// A full path as the file system walks it: its longest existing part (with any `..` in it)
-/// resolved, links and all, then the rest added, a `..` in the rest going up from the folder
-/// reached so far. `/w/link/../copy` with `link` pointing at `/w/a/b` is `/w/a/copy`.
-fn destination(p: &Path) -> PathBuf {
+/// A full path as the file system walks it, one part at a time: each part that exists is
+/// resolved (links and letter case), a `..` goes up from the folder reached so far, and a
+/// part that does not exist yet is taken as written. `/w/link/../copy` with `link` pointing at
+/// `/w/a/b` is `/w/a/copy`; so is `/w/missing/../link/../copy`. A file with more parts after
+/// it (`/w/document/../copy`), or a part that cannot be looked up, is refused with the reason.
+fn destination(p: &Path) -> Result<PathBuf, String> {
     use std::path::Component;
-    for at in p.ancestors() {
-        let Ok(real) = std::fs::canonicalize(at) else { continue };
-        let mut out = without_verbatim(real);
-        // Components after the existing part, none of which exists: no link among them, so a
-        // `..` there goes up from the folder reached so far.
-        for c in p.strip_prefix(at).map(Path::components).into_iter().flatten() {
-            match c {
-                Component::CurDir => {}
-                Component::ParentDir => {
-                    out.pop();
+    let parts: Vec<Component<'_>> = p.components().collect();
+    let mut out = PathBuf::new();
+    for (k, c) in parts.iter().enumerate() {
+        match c {
+            Component::Prefix(_) | Component::RootDir => out.push(c.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(name) => {
+                let next = out.join(name);
+                match std::fs::canonicalize(&next) {
+                    Ok(real) => {
+                        let more = parts[k + 1..].iter().any(|c| !matches!(c, Component::CurDir));
+                        if more && !real.is_dir() {
+                            return Err(format!("{} is a file, not a folder.", next.display()));
+                        }
+                        out = without_verbatim(real);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => out = next,
+                    Err(e) => return Err(format!("{} cannot be looked up: {e}", next.display())),
                 }
-                c => out.push(c.as_os_str()),
             }
         }
-        return out;
     }
-    lexical(p)
+    Ok(out)
 }
 
 /// A resolved Windows path in its usual form (`C:\x`, not `\\?\C:\x`); others as they are.
@@ -3650,26 +3670,6 @@ fn without_verbatim(p: PathBuf) -> PathBuf {
         && let Prefix::VerbatimDisk(d) = pre.kind()
     {
         return PathBuf::from(format!("{}:", char::from(d))).join(parts.as_path());
-    }
-    p
-}
-
-/// [`lexical_parts`] as a path: `/w/old/../lib` is `/w/lib`.
-fn lexical(p: &Path) -> PathBuf {
-    lexical_parts(p).iter().map(|c| c.as_os_str()).collect()
-}
-
-/// A path as the file system resolves it: its longest existing part resolved (letter case,
-/// links), the rest added as written.
-fn resolved(p: &Path) -> PathBuf {
-    let p = lexical(p);
-    for at in p.ancestors() {
-        if let Ok(real) = std::fs::canonicalize(at) {
-            return match p.strip_prefix(at) {
-                Ok(rest) if !rest.as_os_str().is_empty() => real.join(rest),
-                _ => real,
-            };
-        }
     }
     p
 }
@@ -3754,8 +3754,8 @@ pub(crate) mod tests {
         let to = tmp.path().join("copies").join("plant 2");
         // The folder as the file system names it (a temp folder can be reached through a link
         // or a short name).
-        assert_eq!(o.save_as(&to).unwrap(), (destination(&to), 0));
-        assert_eq!(o.dir, destination(&to));
+        assert_eq!(o.save_as(&to).unwrap(), (destination(&to).unwrap(), Vec::new()));
+        assert_eq!(o.dir, destination(&to).unwrap());
         assert!(!o.dirty);
         // The original is as it was last saved; the copy has the change and its library is
         // the same folder seen from the new place.
@@ -3789,18 +3789,100 @@ pub(crate) mod tests {
     #[test]
     fn a_destination_is_resolved_as_the_file_system_walks_it() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = destination(tmp.path());
+        let root = destination(tmp.path()).unwrap();
         std::fs::create_dir_all(root.join("a").join("b")).unwrap();
         // `..` in the part that does not exist yet goes up from the folder reached so far.
         assert_eq!(
-            destination(&root.join("new").join("..").join("copy")),
+            destination(&root.join("new").join("..").join("copy")).unwrap(),
             root.join("copy")
         );
-        assert_eq!(destination(&root.join("a").join("..").join("copy")), root.join("copy"));
         assert_eq!(
-            destination(&root.join("a").join("b").join("x")),
+            destination(&root.join("a").join("..").join("copy")).unwrap(),
+            root.join("copy")
+        );
+        assert_eq!(
+            destination(&root.join("a").join("b").join("x")).unwrap(),
             root.join("a").join("b").join("x")
         );
+        // A file is not a folder to go through, even to come back out of it with `..`.
+        std::fs::write(root.join("document"), "text").unwrap();
+        let err = destination(&root.join("document").join("..").join("copy")).unwrap_err();
+        assert!(err.contains("is a file"), "{err}");
+        assert!(destination(&root.join("document").join("copy")).is_err());
+        // The file itself is a destination (Save as then says it already exists).
+        assert_eq!(destination(&root.join("document")).unwrap(), root.join("document"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_after_a_missing_folder_and_its_dots_is_still_followed() {
+        let (tmp, mut o) = project();
+        // `link` points at a folder inside the project; `missing/..` before it changes nothing.
+        std::fs::create_dir_all(o.dir.join("inner")).unwrap();
+        std::os::unix::fs::symlink(o.dir.join("inner"), tmp.path().join("link")).unwrap();
+        let typed = tmp
+            .path()
+            .join("missing")
+            .join("..")
+            .join("link")
+            .join("..")
+            .join("copy");
+        let err = o.save_as(&typed).unwrap_err();
+        assert!(err.contains("inside the project"), "{err}");
+        assert!(!o.dir.join("copy").exists() && !tmp.path().join("copy").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_project_opened_through_a_link_and_dots_refuses_a_copy_inside_its_real_folder() {
+        let (tmp, mut o) = project();
+        // The project is at `design/p`; it was opened as `link/../p`, `link` pointing at
+        // `design/inner`.
+        let design = tmp.path().join("design");
+        std::fs::create_dir_all(design.join("inner")).unwrap();
+        let name = o.dir.file_name().unwrap().to_owned();
+        std::fs::rename(&o.dir, design.join(&name)).unwrap();
+        std::os::unix::fs::symlink(design.join("inner"), tmp.path().join("link")).unwrap();
+        o.dir = tmp.path().join("link").join("..").join(&name);
+        let err = o.save_as(&design.join(&name).join("copy")).unwrap_err();
+        assert!(err.contains("inside the project"), "{err}");
+        // Beside it is fine.
+        o.save_as(&design.join("copy")).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_library_reached_through_a_link_and_dots_keeps_the_folder_the_link_leads_to() {
+        let (tmp, mut o) = project();
+        let x = tmp.path().join("x");
+        std::fs::create_dir_all(x.join("inner")).unwrap();
+        std::os::unix::fs::symlink(x.join("inner"), tmp.path().join("link")).unwrap();
+        // `../link/../library` is `x/library`, which does not exist yet.
+        o.project.meta.libraries.push(wc_core::project::LibrarySource {
+            name: "later".into(),
+            kind: "folder".into(),
+            location: "../link/../library".into(),
+            reference: None,
+        });
+        let to = tmp.path().join("copies").join("c");
+        o.save_as(&to).unwrap();
+        let lib = o.project.meta.libraries.iter().find(|l| l.name == "later").unwrap();
+        // Made later, it is the folder the copy reaches.
+        std::fs::create_dir_all(x.join("library")).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(to.join(&lib.location)).unwrap(),
+            std::fs::canonicalize(x.join("library")).unwrap()
+        );
+    }
+
+    #[test]
+    fn save_as_through_a_file_is_refused_and_writes_nothing() {
+        let (tmp, mut o) = project();
+        std::fs::write(tmp.path().join("document"), "text").unwrap();
+        let typed = tmp.path().join("document").join("..").join("copy");
+        let err = o.save_as(&typed).unwrap_err();
+        assert!(err.contains("is a file"), "{err}");
+        assert!(!tmp.path().join("copy").exists());
     }
 
     #[cfg(unix)]
@@ -3853,9 +3935,32 @@ pub(crate) mod tests {
         let to = tmp.path().join("copy");
         assert!(o.save_as(&to).unwrap_err().contains("core.worktree"));
         assert!(!to.exists());
+        // A comment after the header, quotes and all, or the key on the header's line.
+        for config in [
+            "[core] # \"project worktree\"\n\tworktree = /elsewhere\n",
+            "[Core] worktree = /elsewhere\n",
+            "[remote \"origin\"]\n\turl = x\n[ core ]\n\tWorkTree=/elsewhere\n",
+        ] {
+            std::fs::write(o.dir.join(".git").join("config"), config).unwrap();
+            assert!(o.save_as(&to).unwrap_err().contains("core.worktree"), "{config}");
+        }
+        // Another section's `worktree`, or a commented one, is not core's.
+        for config in [
+            "[core \"x\"]\n\tworktree = /elsewhere\n",
+            "[core]\n\t# worktree = /elsewhere\n",
+        ] {
+            assert!(!git_worktree_set_in(config), "{config}");
+        }
         // Without it the history is the copy's own.
         std::fs::write(o.dir.join(".git").join("config"), "[core]\n\tbare = false\n").unwrap();
         o.save_as(&to).unwrap();
+    }
+
+    fn git_worktree_set_in(config: &str) -> bool {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config");
+        std::fs::write(&path, config).unwrap();
+        git_worktree_set(&path)
     }
 
     #[cfg(unix)]

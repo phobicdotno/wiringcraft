@@ -301,7 +301,7 @@ enum Pending {
 /// The whole-project exports that ask where to go.
 #[derive(Debug, Clone)]
 enum Export {
-    /// The PDF, in the languages given (none: as drawn).
+    /// The PDF, with its texts in these languages (none: as drawn).
     Pdf(Vec<String>),
     Drawings,
     Aml,
@@ -623,8 +623,20 @@ impl App {
         };
         let (d, links) = open.save_as(d).map_err(|e| format!("Save as failed:\n{e}"))?;
         let mut m = format!("Saved as {}; you are working in the copy now.", d.display());
-        if links > 0 {
-            m.push_str(&format!(" {links} link(s) in the project folder were not copied."));
+        if !links.is_empty() {
+            // Named, so a file the project reaches through a link can be put in the copy by hand.
+            let shown: Vec<String> = links.iter().take(5).map(|l| l.display().to_string()).collect();
+            let more = links.len().saturating_sub(shown.len());
+            m.push_str(&format!(
+                " {} link(s) in the project folder were not copied: {}{}.",
+                links.len(),
+                shown.join(", "),
+                if more > 0 {
+                    format!(" and {more} more")
+                } else {
+                    String::new()
+                }
+            ));
         }
         self.ed.message = m;
         self.prefs.remember(d);
@@ -1255,19 +1267,21 @@ impl App {
                     warnings: None,
                 });
             }
-            // A project with translations is asked which language to print, then where to save;
-            // one without is asked where to save at once, in the language it is drawn in.
-            Action::ExportPdf => match wc_core::translate::Dictionary::load(&open.dir) {
-                Ok(d) if d.languages().len() > 1 => {
-                    self.dialog = Some(Dialog::PdfLanguage {
-                        langs: d.languages(),
-                        first: 0,
-                        second: 0,
-                    });
+            Action::ExportPdf => {
+                // A project with translations is asked which language to print, then where to save;
+                // one without is asked only where, and printed in the language it is drawn in.
+                match wc_core::translate::Dictionary::load(&open.dir) {
+                    Ok(d) if d.languages().len() > 1 => {
+                        self.dialog = Some(Dialog::PdfLanguage {
+                            langs: d.languages(),
+                            first: 0,
+                            second: 0,
+                        });
+                    }
+                    Ok(_) => self.pending = Some(Pending::Export(Export::Pdf(Vec::new()))),
+                    Err(e) => self.dialog = Some(Dialog::Message(format!("Export failed: {e}"))),
                 }
-                Ok(_) => self.pending = Some(Pending::Export(Export::Pdf(Vec::new()))),
-                Err(e) => self.dialog = Some(Dialog::Message(format!("Export failed: {e}"))),
-            },
+            }
             Action::Translations => {
                 self.dialog = Some(match translations_form::Form::open(&open.dir, &open.project) {
                     Ok(f) => Dialog::Translations(f),
@@ -1751,7 +1765,7 @@ impl App {
                         .horizontal(|ui| {
                             let r = ui.add(egui::TextEdit::singleline(&mut path.text).desired_width(340.0));
                             if ui.button("Browse…").clicked() {
-                                match pick_folder("Open project", &path.text) {
+                                match pick_folder_for("Open project", path) {
                                     Picked::Path(d) => *error = path.pick(d).err(),
                                     Picked::Failed(e) => *error = Some(e),
                                     Picked::Cancelled => {}
@@ -1839,7 +1853,7 @@ impl App {
                             ui.horizontal(|ui| {
                                 ui.add(egui::TextEdit::singleline(&mut location.text).desired_width(300.0));
                                 if ui.button("Browse…").clicked() {
-                                    match pick_folder("Where to create the project", &location.text) {
+                                    match pick_folder_for("Where to create the project", location) {
                                         Picked::Path(d) => *error = location.pick(d).err(),
                                         Picked::Failed(e) => *error = Some(e),
                                         Picked::Cancelled => {}
@@ -1957,12 +1971,8 @@ impl App {
                             {
                                 chosen.push(l.clone());
                             }
-                            // Then where to save, as for a PDF in one language.
                             then = Some(Box::new(move |app: &mut App| {
-                                if app.pending.is_none() {
-                                    app.pending = Some(Pending::Export(Export::Pdf(chosen)));
-                                    app.pending_for = app.open.as_ref().map(|o| o.dir.clone());
-                                }
+                                app.ask(Pending::Export(Export::Pdf(chosen)));
                             }));
                             keep = false;
                         }
@@ -3428,9 +3438,24 @@ enum Picked {
 /// The system's folder picker, starting in `start` (or its nearest existing parent). Blocks the
 /// window while open, like any modal dialog.
 fn pick_folder(title: &str, start: &str) -> Picked {
+    pick_folder_in(title, picker_start(start))
+}
+
+/// [`pick_folder`] for a folder field: a folder picked into it earlier starts the picker
+/// exactly as picked (a name ending in a space included), typed text as [`pick_folder`] reads it.
+fn pick_folder_for(title: &str, field: &prefs::FolderField) -> Picked {
+    let start = match field.path() {
+        Ok(p) if !field.is_empty() => nearest_dir(&p),
+        _ => picker_start(&field.text),
+    };
+    pick_folder_in(title, start)
+}
+
+/// The system's folder picker, opening in `start` when given.
+fn pick_folder_in(title: &str, start: Option<PathBuf>) -> Picked {
     // On Linux rfd tries the desktop portal, then zenity; both are given their chance.
     let mut dialog = rfd::FileDialog::new().set_title(title);
-    if let Some(d) = picker_start(start) {
+    if let Some(d) = start {
         dialog = dialog.set_directory(d);
     }
     applog::take_picker_errors();
@@ -3524,8 +3549,8 @@ fn export_whole(open: &Open, kind: Export, pick: PickSave<'_>) -> Option<String>
         ),
     };
     let (path, note) = export_target(title, &default, filter, pick)?;
-    let msg = match &kind {
-        Export::Pdf(langs) => export_pdf_in(open, langs, &path),
+    let msg = match kind {
+        Export::Pdf(langs) => export_pdf_to(open, &langs, &path),
         Export::Aml => export_aml_to(open, &path),
         _ => export_wago_configurator_to(open, &path),
     };
@@ -3855,13 +3880,18 @@ fn rack_warnings(open: &Open) -> Vec<String> {
 }
 
 fn export_pdf(open: &Open) -> String {
-    export_pdf_in(open, &[], &export_file(open, "pdf"))
+    export_pdf_in(open, &[])
 }
 
 /// [`export_pdf`] with the project's texts in `langs` (one language, or two shown together)
 /// from its `translations.toml`; empty prints them as drawn. Texts without a translation are
 /// listed as warnings.
-fn export_pdf_in(open: &Open, langs: &[String], path: &Path) -> String {
+fn export_pdf_in(open: &Open, langs: &[String]) -> String {
+    export_pdf_to(open, langs, &export_file(open, "pdf"))
+}
+
+/// [`export_pdf_in`] to the file `path`.
+fn export_pdf_to(open: &Open, langs: &[String], path: &Path) -> String {
     let (translated, missing) = if langs.is_empty() {
         (std::borrow::Cow::Borrowed(&open.project), Vec::new())
     } else {
@@ -4196,36 +4226,26 @@ fn export_drawings_to(open: &Open, dir: &Path) -> String {
             );
         }
     }
-    let write = |path: PathBuf, bytes: String| {
-        if own {
-            std::fs::write(path, bytes)
-        } else {
-            use std::io::Write as _;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-                .and_then(|mut f| f.write_all(bytes.as_bytes()))
-        }
-    };
     // In another folder, what a failed export made is taken away again, so it can be retried;
     // a file that was there before is never touched (it was refused above or by create_new).
+    // A file counts as made the moment create_new made it, before anything is written to it.
     let mut made: Vec<PathBuf> = Vec::new();
+    let mut write = |path: PathBuf, bytes: String| {
+        if own {
+            return std::fs::write(path, bytes);
+        }
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
+        made.push(path);
+        f.write_all(bytes.as_bytes())
+    };
     let written = std::fs::create_dir_all(dir).and_then(|()| {
         for (stem, page) in &files {
             for (path, bytes) in [
                 (dir.join(format!("{stem}.svg")), wc_pdf::svg(page)),
                 (dir.join(format!("{stem}.dxf")), wc_pdf::dxf(page)),
             ] {
-                let r = write(path.clone(), bytes);
-                // create_new made the file even when writing it then failed.
-                if !own
-                    && (r.is_ok() || path.exists())
-                    && !matches!(&r, Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists)
-                {
-                    made.push(path);
-                }
-                r?;
+                write(path, bytes)?;
             }
         }
         Ok(())
