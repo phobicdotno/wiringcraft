@@ -3896,7 +3896,7 @@ fn run(mut cli: Cli) -> Res<()> {
                 let mut stem = if d.panel {
                     wc_pdf::panel_file_stem(d)
                 } else {
-                    file_stem(&d.number, &d.id)
+                    wc_pdf::page_file_stem(d)
                 };
                 // Compared without case: `A1` and `a1` are one file name on Windows and macOS.
                 while !used.insert(stem.to_lowercase()) {
@@ -6358,24 +6358,6 @@ fn utc_date(secs: i64) -> String {
     )
 }
 
-/// A file name for a page: its number, or its id when the number is empty, with anything a file
-/// system might refuse replaced.
-fn file_stem(number: &str, id: &str) -> String {
-    let base = if number.trim().is_empty() { id } else { number.trim() };
-    let stem: String = base
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let stem = stem.trim_start_matches('.').to_owned();
-    if stem.is_empty() { "page".into() } else { stem }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -7761,7 +7743,7 @@ mod tests {
                 .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
                 .collect();
             names.sort();
-            let page = format!("{}.{ext}", file_stem(&number, ""));
+            let page = format!("{number}.{ext}");
             let mut want = [format!("panel-Main_cabinet_A.{ext}"), page];
             want.sort();
             assert_eq!(names, want, "{ext}");

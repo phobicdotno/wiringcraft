@@ -5308,14 +5308,7 @@ fn export_drawings_to(open: &Open, dir: &Path) -> String {
             let mut stem = if page.panel {
                 wc_pdf::panel_file_stem(page)
             } else {
-                let base = if page.number.trim().is_empty() {
-                    &page.id
-                } else {
-                    page.number.trim()
-                };
-                base.chars()
-                    .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
-                    .collect()
+                wc_pdf::page_file_stem(page)
             };
             // Compared without case: `A1` and `a1` are one file name on Windows and macOS.
             while !used.insert(stem.to_lowercase()) {
@@ -6849,6 +6842,18 @@ mod marking_tests {
             .collect();
         names.sort();
         assert_eq!(names, ["a1.dxf", "a1.svg", "a1_.dxf", "a1_.svg"]);
+    }
+
+    #[test]
+    fn a_page_number_with_a_dot_keeps_its_dot_in_the_drawing_file_names() {
+        let (_tmp, mut o) = state::tests::project();
+        o.project.pages.truncate(1);
+        o.project.pages[0].number = "1.2".into();
+        let own = o.dir.join("export").join("drawings");
+        let msg = export_drawings_to(&o, &own);
+        assert!(msg.starts_with("Exported 1 pages"), "{msg}");
+        assert!(own.join("1.2.svg").is_file());
+        assert!(own.join("1.2.dxf").is_file());
     }
 
     #[test]
