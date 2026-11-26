@@ -602,7 +602,9 @@ impl App {
                 self.dialog,
                 Some(Dialog::Cover { .. } | Dialog::Template { .. } | Dialog::Racks { .. })
             )
-            || self.assistant.command_running();
+            || self.assistant.command_running()
+            // A save waiting for a typed value runs on the project it was asked for first.
+            || !self.after_typed.is_empty();
         self.share.set_command_running(self.assistant.command_running());
         self.sync_session_now(busy);
         // Others' changes arrive without any input here.
