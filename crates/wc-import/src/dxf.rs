@@ -563,6 +563,8 @@ fn shapes(
                 }
                 None
             }
+            // Code 70 bit 1 on an attribute: invisible, so not drawn (and not a skipped entity).
+            "ATTRIB" if (e.f(70) as i64) & 1 != 0 => None,
             "TEXT" | "MTEXT" | "ATTRIB" => {
                 let raw = e.get(1).unwrap_or("");
                 let text = if e.kind == "MTEXT" {
@@ -2032,6 +2034,37 @@ mod tests {
         assert_eq!(p.symbols.len(), 1);
         assert_eq!(p.symbols[0].tag.as_ref().map(|t| t.to_string()).as_deref(), Some("-K7"));
         assert_eq!(p.graphics.len(), 3, "logo exploded into two lines plus the polyline");
+        Ok(())
+    }
+
+    #[test]
+    fn invisible_attributes_are_not_drawn() -> Result<()> {
+        let blocks = "0\nBLOCK\n2\nWC.COIL\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n0\nENDBLK\n\
+                      0\nBLOCK\n2\nBOX\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n0\nENDBLK\n";
+        // A plain block with a visible and an invisible (70 bit 1) attribute, and a known
+        // symbol whose tag is invisible.
+        let ents = "0\nINSERT\n2\nBOX\n10\n0\n20\n0\n66\n1\n\
+                    0\nATTRIB\n2\nNOTE\n1\nShown\n10\n0\n20\n5\n70\n0\n\
+                    0\nATTRIB\n2\nPART\n1\nHidden 123\n10\n0\n20\n10\n70\n9\n\
+                    0\nINSERT\n2\nWC.COIL\n10\n50\n20\n100\n66\n1\n0\nATTRIB\n2\nTAG\n1\n-K7\n70\n1\n";
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        let p = page(&dxf(ents, blocks), 1.0, &known)?;
+        let texts: Vec<&str> = p
+            .graphics
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["Shown"], "{:?}", p.graphics);
+        assert!(
+            p.warnings.is_empty(),
+            "an invisible attribute is not a skipped entity: {:?}",
+            p.warnings
+        );
+        assert_eq!(p.symbols.len(), 1);
+        assert_eq!(p.symbols[0].tag.as_ref().map(|t| t.to_string()).as_deref(), Some("-K7"));
         Ok(())
     }
 
