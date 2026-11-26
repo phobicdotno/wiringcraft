@@ -159,21 +159,52 @@ impl Dictionary {
 /// Set the translation of `text` (in the source language) into `lang` in the project folder's
 /// `translations.toml`, or remove it when `translation` is blank. The other translations in
 /// the file stay as they were. Returns whether the file changed. One language code is
-/// required, and not the source language: its texts are the project's. When the file changes
-/// on disk between this call reading it and writing it (another program writing it at the
-/// same time), nothing is written and the error asks to try again.
+/// required, and not the source language: its texts are the project's.
+///
+/// Calls made at the same time (the command line and the assistant, say) take turns: each
+/// holds the project folder's [`TRANSLATIONS_LOCK`] from reading the file until its write is
+/// in place, so the next one reads that write and keeps it. A program that writes the file
+/// without that lock (an editor, say) and changes it after this call read it makes the call
+/// fail with an error that asks to try again, and nothing is written then.
 pub fn set_translation(dir: &Path, text: &str, lang: &str, translation: &str) -> Result<bool> {
-    set_translation_checked(dir, text, lang, translation, || {})
+    set_translation_checked(dir, text, lang, translation, || {}, || {})
 }
 
-/// [`set_translation`], calling `meanwhile` between reading the file and checking it again
-/// before the write (for a test to change the file there).
+/// The file next to `translations.toml` that [`set_translation`] holds locked while it reads
+/// and writes the dictionary. Its name ends in `.tmp`, so a project's git repository leaves
+/// it out.
+pub const TRANSLATIONS_LOCK: &str = "translations.toml.lock.tmp";
+
+/// Lock the project folder's [`TRANSLATIONS_LOCK`] for this process alone, waiting while
+/// another holds it. The lock is let go when the returned file is closed.
+fn lock_translations(dir: &Path) -> Result<std::fs::File> {
+    std::fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
+    let path = dir.join(TRANSLATIONS_LOCK);
+    // A link left at the lock's name is not followed: whatever it points to stays untouched.
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_symlink()) {
+        return Err(Error::Invalid(format!(
+            "{} is a link; remove it and try again",
+            path.display()
+        )));
+    }
+    let mut open = std::fs::OpenOptions::new();
+    open.append(true).create(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, libc::O_NOFOLLOW);
+    let file = open.open(&path).map_err(|e| Error::io(&path, e))?;
+    file.lock().map_err(|e| Error::io(&path, e))?;
+    Ok(file)
+}
+
+/// [`set_translation`], calling `meanwhile` between reading the file and checking it again,
+/// and `checked` between that check and the write (for a test to change the file there).
 fn set_translation_checked(
     dir: &Path,
     text: &str,
     lang: &str,
     translation: &str,
     meanwhile: impl FnOnce(),
+    checked: impl FnOnce(),
 ) -> Result<bool> {
     let lang = match parse_languages(lang).as_deref() {
         Some([one]) => one.clone(),
@@ -187,6 +218,8 @@ fn set_translation_checked(
     if text.trim().is_empty() {
         return Err(Error::Invalid("no text to translate".into()));
     }
+    // Held until this call returns, so no other call reads the file before this write is in.
+    let _lock = lock_translations(dir)?;
     let path = dir.join(TRANSLATIONS_FILE);
     let read = || match std::fs::read_to_string(&path) {
         Ok(text) => Ok(Some(text)),
@@ -213,6 +246,7 @@ fn set_translation_checked(
             "{TRANSLATIONS_FILE} changed while the translation was being saved; nothing was written, try again"
         )));
     }
+    checked();
     dict.save(dir)
 }
 
@@ -515,9 +549,16 @@ nb = ""
         let path = dir.path().join(TRANSLATIONS_FILE);
         std::fs::write(&path, DICT)?;
         let other = format!("{DICT}\n[[text]]\nen = \"Spare\"\nde = \"Ersatz\"\n");
-        let r = set_translation_checked(dir.path(), "Pumps", "nb", "Pumpene", || {
-            let _ = std::fs::write(&path, &other);
-        });
+        let r = set_translation_checked(
+            dir.path(),
+            "Pumps",
+            "nb",
+            "Pumpene",
+            || {
+                let _ = std::fs::write(&path, &other);
+            },
+            || {},
+        );
         assert!(matches!(r, Err(Error::Invalid(m)) if m.contains("try again")));
         // The other writer's file is left as it wrote it.
         assert_eq!(std::fs::read_to_string(&path)?, other);
@@ -529,10 +570,52 @@ nb = ""
         // A file made meanwhile where there was none is a change too.
         let empty = tempfile::tempdir()?;
         let new = empty.path().join(TRANSLATIONS_FILE);
-        let r = set_translation_checked(empty.path(), "Pumps", "nb", "Pumper", || {
-            let _ = std::fs::write(&new, "source = \"en\"\n");
-        });
+        let r = set_translation_checked(
+            empty.path(),
+            "Pumps",
+            "nb",
+            "Pumper",
+            || {
+                let _ = std::fs::write(&new, "source = \"en\"\n");
+            },
+            || {},
+        );
         assert!(r.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_second_set_translation_waits_for_the_first_and_keeps_both_edits() -> R {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join(TRANSLATIONS_FILE), DICT)?;
+        let at = dir.path().to_owned();
+        let mut other = None;
+        // Another set starts after this one checked the file and before it writes: it has to
+        // wait for this write instead of saving in between and being written over.
+        let first = set_translation_checked(
+            dir.path(),
+            "Pumps",
+            "nb",
+            "Pumpene",
+            || {},
+            || {
+                let t = std::thread::spawn(move || set_translation(&at, "Spare", "de", "Ersatz"));
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                other = Some((t.is_finished(), t));
+            },
+        );
+        assert!(first?);
+        let Some((finished_early, t)) = other else {
+            unreachable!("the check ran")
+        };
+        assert!(!finished_early, "the second set did not wait for the first");
+        let Ok(second) = t.join() else {
+            unreachable!("the second set panicked")
+        };
+        assert!(second?);
+        let d = Dictionary::load(dir.path())?;
+        assert_eq!(d.lookup("Pumps", "nb").as_deref(), Some("Pumpene"));
+        assert_eq!(d.lookup("Spare", "de").as_deref(), Some("Ersatz"));
         Ok(())
     }
 
