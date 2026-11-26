@@ -2032,8 +2032,9 @@ impl Open {
             .into_iter()
             .filter(|s| kind.is_none_or(|k| s.kind == k))
             .collect();
-        // An item named on purpose whose library file is wrong stops the update.
-        if let Some(bad) = wc_library::wrong_named(&all, only) {
+        // An item named on purpose that the project does not have, or whose library file is
+        // wrong, stops the update.
+        if let Some(bad) = wc_library::unknown_named(&all, only).or_else(|| wc_library::wrong_named(&all, only)) {
             return Err(bad.to_string());
         }
         // Exactly these versions are taken, as seen here: an item whose library file changes
