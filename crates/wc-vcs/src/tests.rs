@@ -136,6 +136,31 @@ fn page_setting_changes_are_reported() -> std::result::Result<(), wc_core::Error
         shown(&b),
         ["page 3: revision table changed", "page 3: cover setting changed"]
     );
+
+    let mut b = a.clone();
+    b.clouds.push(wc_core::revision::RevisionCloud {
+        min: Point::new(0.0, 0.0),
+        max: Point::new(20.0, 20.0),
+        revision: "B".into(),
+    });
+    assert_eq!(shown(&b), ["page 3: revision clouds changed"]);
+
+    let mut b = a.clone();
+    b.underlay = Some(wc_core::project::Underlay {
+        file: "underlays/p.jpg".into(),
+        min: Point::new(0.0, 0.0),
+        max: Point::new(420.0, 297.0),
+    });
+    assert_eq!(shown(&b), ["page 3: underlay changed"]);
+
+    let mut b = a.clone();
+    b.overview = true;
+    assert_eq!(shown(&b), ["page 3: overview setting changed"]);
+
+    // A difference no check names (here the stored id) is still reported.
+    let mut b = a.clone();
+    b.id = "q".into();
+    assert_eq!(shown(&b), ["page 3: page changed"]);
     Ok(())
 }
 
