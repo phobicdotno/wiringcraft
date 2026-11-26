@@ -9928,7 +9928,12 @@ mod tests {
         // Shown and unlocked, the same Paste adds the text.
         a.run(Action::Paste);
         assert_eq!(page2(&a).graphics.len(), 2);
-        assert_eq!(a.ed.message, "Pasted 1 items.", "the layer note is gone");
+        assert_eq!(a.ed.message, "Pasted 1 item.", "the layer note is gone");
+        a.ed.selection = vec![Selection::Graphic(0), Selection::Graphic(1)];
+        a.run(Action::Copy);
+        a.run(Action::Paste);
+        assert_eq!(page2(&a).graphics.len(), 4);
+        assert_eq!(a.ed.message, "Pasted 2 items.");
     }
 
     #[test]

@@ -1652,7 +1652,11 @@ impl App {
                     .unwrap_or(self.clipboard.anchor + wc_core::geom::Point::new(10.0, 10.0));
                 match open.paste(page, &self.clipboard, at) {
                     Ok(pasted) if !pasted.is_empty() => {
-                        self.ed.message = format!("Pasted {} items.", pasted.len());
+                        self.ed.message = format!(
+                            "Pasted {} item{}.",
+                            pasted.len(),
+                            if pasted.len() == 1 { "" } else { "s" }
+                        );
                         self.ed.tool = Tool::Select;
                         self.ed.selection = pasted;
                     }
