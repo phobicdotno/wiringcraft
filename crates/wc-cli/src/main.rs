@@ -11,6 +11,54 @@ use wc_core::{DeviceTag, Endpoint, Page, PageSize, PlacedSymbol, Project, Wire, 
 
 type Res<T> = Result<T, String>;
 
+// Every `print!` and `println!` below writes through these, not the standard ones: those panic
+// when the reader of a pipe stops early (`wiringcraft ... | more`), which on Windows, with no
+// SIGPIPE to end the program, reported a crash (#567). These keep the first error, drop later
+// output, and let the command run to its end, so its changes are still saved (#550).
+macro_rules! print {
+    ($($arg:tt)*) => {
+        $crate::write_stdout(|out| std::io::Write::write_fmt(out, format_args!($($arg)*)))
+    };
+}
+macro_rules! println {
+    () => {
+        $crate::write_stdout(|out| std::io::Write::write_all(out, b"\n"))
+    };
+    ($($arg:tt)*) => {
+        $crate::write_stdout(|out| {
+            std::io::Write::write_fmt(out, format_args!("{}\n", format_args!($($arg)*)))
+        })
+    };
+}
+
+thread_local! {
+    /// The first error writing to stdout on this thread, the command's; output after it is
+    /// dropped, and [`with_stdout_error`] reports it once the command has ended.
+    static STDOUT_ERROR: std::cell::RefCell<Option<std::io::Error>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Write to stdout with `write`, unless an earlier write failed.
+fn write_stdout(write: impl FnOnce(&mut std::io::StdoutLock<'static>) -> std::io::Result<()>) {
+    if STDOUT_ERROR.with_borrow(Option::is_some) {
+        return;
+    }
+    if let Err(err) = write(&mut std::io::stdout().lock()) {
+        STDOUT_ERROR.set(Some(err));
+    }
+}
+
+/// The command's `result`, with what went wrong writing its output: nothing when the reader of
+/// a pipe went away early (`| more`, `| head -1`), as other command-line tools do.
+fn with_stdout_error(result: Res<()>) -> Res<()> {
+    let failed = STDOUT_ERROR.take();
+    result?;
+    match failed {
+        Some(err) if err.kind() != std::io::ErrorKind::BrokenPipe => Err(format!("could not write the output: {err}")),
+        _ => Ok(()),
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "wiringcraft", version, about = "Electrical schematic and wiring design")]
 struct Cli {
@@ -556,12 +604,21 @@ enum RulesCmd {
     /// optionally `devices`, `role`, `pattern`, `max`, `severity`, `message` and `name`; a rule
     /// the check could not run is refused and nothing is changed. An empty file removes them
     /// all.
-    Set { file: PathBuf },
+    Set {
+        /// The rules file (`.toml` or `.json`), or `-` for TOML from stdin.
+        file: PathBuf,
+    },
     /// Turn a library rule off for this project, by `source:number` or `source:name`.
-    Off { rule: String },
+    Off {
+        /// The library rule, `source:number` or `source:name`.
+        rule: String,
+    },
     /// Turn a library rule back on, by `source:number` or `source:name`: every `rules_off`
     /// entry that turns it off is removed.
-    On { rule: String },
+    On {
+        /// The library rule, `source:number` or `source:name`.
+        rule: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2099,7 +2156,8 @@ fn run(cli: Cli) -> Res<()> {
             match p.lock.symbols.get(&symbol_id) {
                 None => {
                     return Err(format!(
-                        "the project does not pin symbol {symbol_id}; run `wiringcraft lib lock` first"
+                        "the project does not pin symbol {symbol_id}; put its entry in {} back from the project's history (e.g. `git checkout`), or run `wiringcraft lib lock` when a configured library has the symbol",
+                        store::LOCK_FILE
                     ));
                 }
                 Some(l) if l.hash != old.hash() => {
@@ -2294,7 +2352,7 @@ fn run(cli: Cli) -> Res<()> {
             let mut p = load(dir)?;
             match lc {
                 LocationCmd::List => {
-                    write_locations(&mut std::io::stdout(), &p.meta.locations).map_err(e)?;
+                    write_stdout(|out| write_locations(out, &p.meta.locations));
                 }
                 LocationCmd::Set { path, description } => {
                     let description = description.unwrap_or_else(|| {
@@ -2458,7 +2516,10 @@ fn run(cli: Cli) -> Res<()> {
             let mut p = load(dir)?;
             let library = wc_library::library_rules(dir, &p);
             match rc {
-                RulesCmd::List { json } => print!("{}", rules_list(&p, &library, json)?),
+                RulesCmd::List { json } => {
+                    let text = rules_list(&p, &library, json)?;
+                    print!("{text}");
+                }
                 RulesCmd::Set { file } => {
                     let rules = rules_from_file(&file)?;
                     let n = rules.len();
@@ -4511,7 +4572,7 @@ fn main() -> ExitCode {
     // Parsing runs there too: clap's derived parser builds every subcommand on the stack.
     let worker = std::thread::Builder::new()
         .stack_size(STACK)
-        .spawn(|| run(Cli::parse()));
+        .spawn(|| with_stdout_error(run(Cli::parse())));
     let result = match worker {
         Ok(handle) => handle
             .join()
@@ -5315,7 +5376,8 @@ fn add_and_save_with(
 
 /// Every file a save of the project may write or remove, with its bytes before (`None` when it
 /// does not exist yet): the project's own files, every file in its page, panel and comment
-/// folders, and the files of the pages and panels about to be added. [`put_files_back`] restores
+/// folders, the black box symbol files its cleanup may remove, and the files of the pages and
+/// panels about to be added. [`put_files_back`] restores
 /// them when a save fails half way.
 fn snapshot_project(dir: &Path, new_pages: &[&str], new_panels: &[&str]) -> Res<Written> {
     // Every file the save may write or remove, read before anything is written: the project's
@@ -5349,6 +5411,9 @@ fn snapshot_project(dir: &Path, new_pages: &[&str], new_panels: &[&str]) -> Res<
             }
         }
     }
+    // The save ends by removing unused black box symbol files: one that fails half way through
+    // that cleanup must be able to put back the ones already gone (#606).
+    paths.extend(store::removable_box_symbol_files(dir).map_err(e)?);
     for id in new_pages {
         paths.push(dir.join(store::PAGES_DIR).join(format!("{id}{}", store::PAGE_SUFFIX)));
     }
@@ -5789,6 +5854,57 @@ fn staging_dir(prefix: &str) -> std::io::Result<tempfile::TempDir> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// A stdout whose reader has gone away, as Windows reports it for `| more` that stopped.
+    struct ClosedPipe;
+
+    impl std::io::Write for ClosedPipe {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    /// Run `f` on its own thread, as `main` runs a command, with its stdout errors.
+    fn run_like_main(f: impl FnOnce() -> Res<()> + Send + 'static) -> Res<()> {
+        std::thread::spawn(move || with_stdout_error(f())).join().unwrap()
+    }
+
+    #[test]
+    fn a_closed_stdout_lets_the_command_finish_quietly() {
+        let result = run_like_main(|| {
+            let locations = [wc_core::project::Location {
+                path: "A1".into(),
+                description: String::new(),
+            }];
+            write_stdout(|_| write_locations(&mut ClosedPipe, &locations));
+            // Later output is dropped, not written to the real stdout or failed on.
+            println!("after the reader went away");
+            Ok(())
+        });
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn the_command_error_wins_over_a_closed_stdout() {
+        let result = run_like_main(|| {
+            write_stdout(|_| Err(std::io::ErrorKind::BrokenPipe.into()));
+            Err("no such page".into())
+        });
+        assert_eq!(result, Err("no such page".into()));
+    }
+
+    #[test]
+    fn other_stdout_errors_are_reported() {
+        let result = run_like_main(|| {
+            write_stdout(|_| Err(std::io::Error::other("disk full")));
+            write_stdout(|_| Err(std::io::Error::other("a second error")));
+            Ok(())
+        });
+        assert_eq!(result, Err("could not write the output: disk full".into()));
+    }
 
     /// Walks the whole command tree and lists every subcommand and argument
     /// (positional or option) whose `--help` line would be blank.
@@ -10032,5 +10148,63 @@ mod tests {
             assert!(err.contains(word), "{err}");
             assert!(!bad.exists());
         }
+    }
+}
+
+#[cfg(test)]
+mod box_cleanup_rollback_tests {
+    use super::*;
+
+    /// A save that removes some unused black box symbol files and then fails: the rollback puts
+    /// the removed ones back (#606), and leaves links and other symbols alone.
+    #[test]
+    fn a_failed_save_puts_back_box_symbol_files_its_cleanup_removed() {
+        let Ok(tmp) = tempfile::tempdir() else {
+            unreachable!("no temporary folder")
+        };
+        let dir = tmp.path();
+        let p = Project::new("Cleanup");
+        if let Err(err) = store::save(dir, &p) {
+            unreachable!("{err}");
+        }
+        let folder = dir.join("vendor").join("symbols");
+        let Ok(()) = std::fs::create_dir_all(&folder) else {
+            unreachable!("no symbol folder")
+        };
+        for (name, body) in [
+            ("box.p1.s1.json", "one"),
+            ("box.p1.s2.json", "two"),
+            ("relay.json", "relay"),
+        ] {
+            let Ok(()) = std::fs::write(folder.join(name), body) else {
+                unreachable!("cannot write {name}")
+            };
+        }
+        #[cfg(unix)]
+        let Ok(()) = std::os::unix::fs::symlink("relay.json", folder.join("box.p1.s3.json")) else {
+            unreachable!("cannot make a link")
+        };
+        let Ok(before) = snapshot_project(dir, &[], &[]) else {
+            unreachable!("no snapshot")
+        };
+        let saved: Vec<&Path> = before.iter().map(|(path, _)| path.as_path()).collect();
+        let named = |name: &str| saved.iter().any(|p| p.file_name().is_some_and(|n| n == name));
+        assert!(named("box.p1.s1.json") && named("box.p1.s2.json"));
+        assert!(!named("relay.json") && !named("box.p1.s3.json"), "{saved:?}");
+        // The cleanup removed one file before it failed on the next.
+        let Ok(()) = std::fs::remove_file(folder.join("box.p1.s1.json")) else {
+            unreachable!("cannot remove")
+        };
+        assert_eq!(put_files_back(&before), Vec::<String>::new());
+        assert_eq!(
+            std::fs::read_to_string(folder.join("box.p1.s1.json")).ok().as_deref(),
+            Some("one")
+        );
+        assert_eq!(
+            std::fs::read_to_string(folder.join("box.p1.s2.json")).ok().as_deref(),
+            Some("two")
+        );
+        #[cfg(unix)]
+        assert!(std::fs::symlink_metadata(folder.join("box.p1.s3.json")).is_ok_and(|m| m.file_type().is_symlink()));
     }
 }
