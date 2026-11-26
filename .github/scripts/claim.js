@@ -23,6 +23,30 @@ const MAX_HOURS = 24;
 const AGENT = /^[A-Za-z0-9][A-Za-z0-9._\/-]{0,59}$/;
 const HOUR = 3600 * 1000;
 const BACKLOG_HOURS = 6;
+// Requests that fail without reaching GitHub (no HTTP response, e.g. `fetch failed`) are tried
+// again a few times after a short wait. Exported so tests can make the wait zero.
+const RETRY = { tries: 3, delayMs: 2000 };
+
+/** A failure where no HTTP response came back: the request may never have reached GitHub. */
+function isNetworkError(e) {
+  // Octokit reports a failed fetch as a RequestError without `response` (status missing or 500).
+  return Boolean(e) && !e.response && (e.status === undefined || e.status === 500);
+}
+
+/**
+ * Run a GitHub request, trying again after a network error (2 s, then 4 s). Only for reads and
+ * idempotent writes: a comment whose response was lost could otherwise be posted twice.
+ */
+async function withRetry(fn) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      if (attempt >= RETRY.tries || !isNetworkError(e)) throw e;
+      await new Promise((resolve) => setTimeout(resolve, RETRY.delayMs * 2 ** (attempt - 1)));
+    }
+  }
+}
 
 function parseHours(text) {
   if (text === undefined) return DEFAULT_HOURS;
@@ -182,13 +206,13 @@ function parseAgent(body) {
 }
 
 async function comments(github, owner, repo, issue_number) {
-  return github.paginate(github.rest.issues.listComments, { owner, repo, issue_number, per_page: 100 });
+  return withRetry(() => github.paginate(github.rest.issues.listComments, { owner, repo, issue_number, per_page: 100 }));
 }
 
 async function setLabel(github, owner, repo, issue_number, on) {
   try {
-    if (on) await github.rest.issues.addLabels({ owner, repo, issue_number, labels: [LABEL] });
-    else await github.rest.issues.removeLabel({ owner, repo, issue_number, name: LABEL });
+    if (on) await withRetry(() => github.rest.issues.addLabels({ owner, repo, issue_number, labels: [LABEL] }));
+    else await withRetry(() => github.rest.issues.removeLabel({ owner, repo, issue_number, name: LABEL }));
   } catch (e) {
     if (e.status !== 404) throw e;
   }
@@ -220,14 +244,27 @@ async function answer({ github, owner, repo, issue, comment, now }) {
  * Answer every command from the last hours that has no bot reply yet, oldest first. Every run does
  * this first: GitHub keeps only one pending run per concurrency group and cancels the others, so a
  * command whose own run was cancelled is answered by the next run.
+ *
+ * In a run for a pull request event a failure here is logged, not thrown: the pull request's check
+ * reflects only its own claim, and the next run answers the commands.
  */
-async function backlog({ github, context, now = Date.now() }) {
+async function backlog({ github, context, now = Date.now(), log }) {
+  try {
+    return await answerBacklog({ github, context, now });
+  } catch (e) {
+    if (!(context.payload && context.payload.pull_request)) throw e;
+    warn(log, `backlog: ${e.message || e} (left for the next run)`);
+    return [];
+  }
+}
+
+async function answerBacklog({ github, context, now }) {
   const { owner, repo } = context.repo;
   const since = new Date(now - BACKLOG_HOURS * HOUR).toISOString();
   // `since` filters on the last edit; a command counts only when it was also created in the window,
   // so editing an old command never runs it again. Its reply is newer than the command, so it is
   // in the window too.
-  const all = await github.paginate(github.rest.issues.listCommentsForRepo, { owner, repo, since, sort: 'created', direction: 'asc', per_page: 100 });
+  const all = await withRetry(() => github.paginate(github.rest.issues.listCommentsForRepo, { owner, repo, since, sort: 'created', direction: 'asc', per_page: 100 }));
   const answered = new Set();
   for (const c of all) {
     const data = isClaimBot(c) ? readMarker(c.body) : null;
@@ -243,7 +280,7 @@ async function backlog({ github, context, now = Date.now() }) {
     if (!m) continue;
     touched.add(Number(m[1]));
     if (answered.has(comment.id)) continue;
-    const issue = (await github.rest.issues.get({ owner, repo, issue_number: Number(m[1]) })).data;
+    const issue = (await withRetry(() => github.rest.issues.get({ owner, repo, issue_number: Number(m[1]) }))).data;
     if (issue.pull_request) continue;
     out.push(await answer({ github, owner, repo, issue, comment, now }));
   }
@@ -302,7 +339,7 @@ async function claimForPull({ github, owner, repo, pr, now, log }) {
   for (const n of refs) {
     let issue;
     try {
-      issue = (await github.rest.issues.get({ owner, repo, issue_number: n })).data;
+      issue = (await withRetry(() => github.rest.issues.get({ owner, repo, issue_number: n }))).data;
     } catch (e) {
       if (e.status === 404) continue;
       throw e;
@@ -346,7 +383,7 @@ async function claimForPull({ github, owner, repo, pr, now, log }) {
  */
 async function pulls({ github, context, now = Date.now(), log }) {
   const { owner, repo } = context.repo;
-  const open = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', per_page: 100 });
+  const open = await withRetry(() => github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', per_page: 100 }));
   const own = context.payload && context.payload.pull_request ? context.payload.pull_request.number : null;
   const out = [];
   let ownError = null;
@@ -401,7 +438,7 @@ async function sweep({ github, context, now = Date.now() }) {
 }
 
 module.exports = {
-  DEFAULT_HOURS, MAX_HOURS, LABEL,
+  DEFAULT_HOURS, MAX_HOURS, LABEL, RETRY,
   parseCommand, readState, isActive, decide, parseRefs, parseAgent, marker, readMarker,
-  handleComment, handlePull, sweep, backlog, pulls,
+  handleComment, handlePull, sweep, backlog, pulls, withRetry,
 };
