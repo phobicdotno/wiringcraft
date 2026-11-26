@@ -914,6 +914,24 @@ mod tests {
     }
 
     #[test]
+    fn long_fill_under_deep_nesting_is_not_copied_per_level() -> Result<()> {
+        // A 1 MB fill value with 5,000 nested `inherit` groups under it. Copying the fill
+        // text per level would need about 5 GB; the per-level state is a bool, so this stays
+        // small and quick.
+        let long = format!("url(#{})", "a".repeat(1 << 20));
+        let depth = 5_000;
+        let mut svg = format!(r#"<svg xmlns="http://www.w3.org/2000/svg"><g fill="{long}">"#);
+        svg.push_str(&r#"<g fill="inherit">"#.repeat(depth));
+        svg.push_str(r#"<rect width="1" height="1" fill="inherit"/>"#);
+        svg.push_str(r#"<rect width="1" height="1" fill="none"/>"#);
+        svg.push_str(&"</g>".repeat(depth));
+        svg.push_str("</g></svg>");
+        // A `url(...)` paint fills; `inherit` carries it all the way down.
+        assert_eq!(fills_of(&svg)?, vec![true, false]);
+        Ok(())
+    }
+
+    #[test]
     fn path_with_several_closed_subpaths_stays_outlines() -> Result<()> {
         let svg = r##"<svg xmlns="http://www.w3.org/2000/svg">
             <path fill="black" d="M0 0H10V10H0Z M3 3V7H7V3Z"/>
