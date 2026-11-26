@@ -4,31 +4,8 @@
 use eframe::egui;
 use wc_core::plc_rack::{MAX_CHANNELS, PlcCard, PlcRack};
 
-/// The highest slot number the form offers, both when adding a card and when editing one.
-pub const MAX_SLOT: u32 = 999;
-
-/// The largest channel step the form offers.
-pub const MAX_STEP: u32 = 64;
-
-/// Why `racks` holds a number the form would not let the user type (a slot past
-/// [`MAX_SLOT`], more than [`MAX_CHANNELS`] channels, a step outside 1 to [`MAX_STEP`]);
-/// `None` when every number is in range. The assistant checks racks it is given by this.
-pub fn problem(racks: &[PlcRack]) -> Option<String> {
-    racks.iter().find_map(|rack| {
-        rack.cards.iter().find_map(|c| {
-            let at = || format!("rack {:?}, card in slot {}", rack.name, c.slot);
-            if c.slot > MAX_SLOT {
-                Some(format!("{}: the slot must be from 0 to {MAX_SLOT}", at()))
-            } else if c.channels > MAX_CHANNELS {
-                Some(format!("{}: a card has at most {MAX_CHANNELS} channels", at()))
-            } else if c.step.is_some_and(|s| !(1..=MAX_STEP).contains(&s)) {
-                Some(format!("{}: the step must be from 1 to {MAX_STEP}", at()))
-            } else {
-                None
-            }
-        })
-    })
-}
+// The form's ranges and their check live in wc-core, so the command line checks the same.
+pub use wc_core::plc_rack::{MAX_SLOT, MAX_STEP, problem};
 
 /// A new, empty rack named after the first PLC tag (`-A1`, `-A2`, ...) no rack has yet.
 pub fn new_rack(racks: &[PlcRack]) -> PlcRack {
