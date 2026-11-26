@@ -892,6 +892,28 @@ pub fn sheet_for((w, h): (f64, f64)) -> (PageSize, Option<String>) {
     }
 }
 
+/// The largest DWG WiringCraft's own reader takes into memory, far above real drawings. A larger
+/// file is refused by the reader and goes to the converter, as other refusals do.
+pub const MAX_DWG_BYTES: u64 = 256 << 20;
+
+/// Read `file` for the built-in DWG reader, at most `limit` bytes: its bytes, or (inside `Ok`)
+/// why the reader does not take it. A file that cannot be opened or read is an error.
+fn read_dwg(file: &Path, limit: u64) -> Res<std::result::Result<Vec<u8>, String>> {
+    use std::io::Read;
+    let cannot = |err: std::io::Error| format!("cannot read {}: {err}", escape_field(&file.display().to_string()));
+    let mut bytes = Vec::new();
+    // At most one byte past the limit, however large the file is.
+    std::fs::File::open(file)
+        .map_err(cannot)?
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(cannot)?;
+    if bytes.len() as u64 > limit {
+        return Ok(Err(format!("the file is larger than the {} MB it reads", limit >> 20)));
+    }
+    Ok(Ok(bytes))
+}
+
 /// `import page-dwg`: read `file` with WiringCraft's own DWG reader (AutoCAD 2004 to 2018) and
 /// import it onto `page`. Only when that reader refuses the file (another version, or a file
 /// it cannot read) is it converted to DXF with an installed converter (`template`, see
@@ -905,7 +927,7 @@ pub fn import_page_dwg(
     template: Option<String>,
     log: &mut Log,
 ) -> Res<()> {
-    let bytes = read_file(file)?;
+    let bytes = read_dwg(file, MAX_DWG_BYTES)?;
     // A scale the import refuses is refused before any converter runs.
     if !(scale.is_finite() && scale > 0.0) {
         return Err("scale must be a positive number".into());
@@ -913,14 +935,18 @@ pub fn import_page_dwg(
     // The reader refuses a file of another version, or one whose object structure it cannot
     // read; a converter may still read those. What it reads but finds nothing to draw in, and
     // project or library errors, are not the converter's to fix.
-    let read = crate::dwg::read_sections(&bytes).and_then(|sections| crate::dwg::page_drawing(&sections));
+    let read = bytes.and_then(|bytes| {
+        crate::dwg::read_sections(&bytes)
+            .and_then(|sections| crate::dwg::page_drawing(&sections))
+            .map_err(|why| why.to_string())
+    });
     let refused = match read {
         Ok(drawing) => {
             return onto_page(dir, page, log, |known| dwg_page(&drawing, scale, known))
                 .map(|()| out!(log, "read with WiringCraft's own DWG reader"));
         }
         // Names from the file may hold control characters: escaped for the terminal.
-        Err(why) => escape_field(&why.to_string()),
+        Err(why) => escape_field(&why),
     };
     let tmp = staging_dir("wiringcraft-dwg-").map_err(e)?;
     let (dxf, converter) = dwg_to_dxf(file, tmp.path(), template)
@@ -1893,6 +1919,24 @@ mod tests {
             Ok(t) => t,
             Err(x) => unreachable!("no temp folder: {x}"),
         }
+    }
+
+    /// The built-in DWG reader takes a file up to its limit, and refuses one a byte larger with
+    /// the size in the reason (so the import goes on to the converter, #671).
+    #[test]
+    fn a_dwg_over_the_size_limit_is_refused_by_the_reader_with_its_size() {
+        let t = tmp();
+        let path = t.path().join("big.dwg");
+        let limit = 1 << 20;
+        assert!(std::fs::write(&path, vec![0u8; limit as usize]).is_ok());
+        assert!(matches!(read_dwg(&path, limit), Ok(Ok(b)) if b.len() as u64 == limit));
+        assert!(std::fs::write(&path, vec![0u8; limit as usize + 1]).is_ok());
+        assert_eq!(
+            read_dwg(&path, limit),
+            Ok(Err("the file is larger than the 1 MB it reads".to_owned()))
+        );
+        // A file that is not there is an error of its own, not a refusal.
+        assert!(read_dwg(&t.path().join("missing.dwg"), limit).is_err());
     }
 
     /// A file put back keeps the permissions it has, not the default ones of a new file (#664).
