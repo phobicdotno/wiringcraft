@@ -172,8 +172,10 @@ enum Drag {
     /// for this drag was taken. Escape (#737, #863) needs the rest: the id of the page it moves
     /// on, the history count right after its checkpoint (any other count means a change was
     /// recorded during the drag, a rotate say), that checkpoint's undo step, and the selection
-    /// when the drag began, or `None` once a frame moved another selection (Escape only takes
-    /// back a move that moved that same selection all along).
+    /// when the drag began, or `None` once a frame moved another selection. With no change
+    /// recorded during the drag, Escape puts the whole page back as it was, whatever moved;
+    /// after one (a rotate), it only takes back a move that moved that same selection all
+    /// along, by [`Open::take_back_move`].
     Move {
         from: Point,
         checkpoint: bool,
@@ -4964,6 +4966,32 @@ mod tests {
         assert!(ed.drag.is_none());
         assert_eq!(at(&o), now, "nothing is moved back by a part it did not move");
         assert_eq!(o.undo_steps(), steps);
+    }
+
+    #[test]
+    fn escape_after_moving_another_selection_with_nothing_recorded_puts_the_page_back() {
+        let (_tmp, mut o, mut ed, coil) = moving_coil();
+        let page = ed.page;
+        let before = o.project.pages[page].clone();
+        let steps = o.undo_steps();
+        drag(&mut o, &mut ed, Point::new(-40.0, 0.0));
+        let contact = o.project.pages[page]
+            .symbols
+            .iter()
+            .find(|s| s.id != coil)
+            .map(|s| s.id.clone());
+        let Some(contact) = contact else {
+            unreachable!("the contact is on the page")
+        };
+        ed.selection = vec![Selection::Symbol(contact)];
+        move_drag_to(&mut o, &mut ed, Point::new(-60.0, 0.0));
+        cancel_drag(&mut o, &mut ed);
+        assert!(ed.drag.is_none());
+        assert_eq!(
+            o.project.pages[page], before,
+            "both moves are taken back, nothing else changed"
+        );
+        assert_eq!(o.undo_steps(), steps, "the drag leaves no undo step");
     }
 
     #[test]
