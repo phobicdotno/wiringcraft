@@ -30,6 +30,13 @@ jobs:
           node-version: 22
       - run: node --test .github/scripts/claim.test.js
       - run: python3 -m py_compile tools/todo.py
+      # The generator recreates every starter symbol exactly (#819, #945): a symbol added or
+      # changed by hand in library/symbols must be added to tools/gen_starter_symbols.py too.
+      - name: Starter symbols match their generator
+        run: |
+          python3 tools/gen_starter_symbols.py
+          git status --porcelain -- library/symbols
+          test -z "$(git status --porcelain -- library/symbols)"
 
   check:
     name: Build and test (${{ matrix.os }})
