@@ -968,21 +968,26 @@ fn write_out(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> std::io::Result
     let path = path.as_ref();
     match output_guard() {
         Some(g) => wc_core::guard::write_output(Some(g), path, bytes),
-        None => std::fs::write(path, bytes)
-            .map_err(|err| std::io::Error::new(err.kind(), format!("cannot write {}: {err}", path.display()))),
+        None => std::fs::write(path, bytes).map_err(|err| {
+            std::io::Error::new(
+                err.kind(),
+                format!("cannot write {}: {err}", escape_field(&path.display().to_string())),
+            )
+        }),
     }
 }
 
 /// The bytes of the input file `path`; a failure names the file.
 fn read_file(path: impl AsRef<Path>) -> Res<Vec<u8>> {
     let path = path.as_ref();
-    std::fs::read(path).map_err(|err| format!("cannot read {}: {err}", path.display()))
+    std::fs::read(path).map_err(|err| format!("cannot read {}: {err}", escape_field(&path.display().to_string())))
 }
 
 /// The text of the input file `path`; a failure names the file.
 fn read_text(path: impl AsRef<Path>) -> Res<String> {
     let path = path.as_ref();
-    std::fs::read_to_string(path).map_err(|err| format!("cannot read {}: {err}", path.display()))
+    std::fs::read_to_string(path)
+        .map_err(|err| format!("cannot read {}: {err}", escape_field(&path.display().to_string())))
 }
 
 /// Make the output folder `out`; under [`output_guard`] a folder in the project is refused
