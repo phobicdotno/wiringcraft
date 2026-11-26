@@ -2321,7 +2321,7 @@ impl App {
                     Some(other) => return Err(format!("`tag` must be a device tag such as -A1, not {other}.")),
                 };
                 let open = need_open(self.open.as_mut())?;
-                let id = open.add_black_box(page, at, at + size, &pins.unwrap_or_default(), device)?;
+                let id = open.add_black_box_sized(page, at, (size.x, size.y), &pins.unwrap_or_default(), device)?;
                 Ok(format!("Drew black box {id}."))
             }
             "edit" => {
@@ -2390,12 +2390,40 @@ impl App {
                     .map(|p| p.name.clone())
                     .filter(|n| !renamed.contains_key(n) && !pins.iter().any(|p| &p.name == n))
                     .collect();
+                let symbol_id = open
+                    .project
+                    .pages
+                    .get(page)
+                    .and_then(|p| p.symbol(id))
+                    .map(|placed| placed.symbol.clone())
+                    .unwrap_or_default();
                 let warnings = open.edit_black_box(page, id, (width, height), &pins, &renamed, &removed)?;
-                Ok(if warnings.is_empty() {
+                // A wire being drawn from a point of the box that was renamed, moved or taken off
+                // would be saved on a stale point: it is dropped, to be started again.
+                let point_changed = |pin: &str| {
+                    renamed.contains_key(pin)
+                        || renamed.values().any(|to| to == pin)
+                        || old.iter().find(|p| p.name == pin) != pins.iter().find(|p| p.name == pin)
+                };
+                let shown = open.project.pages.get(self.ed.page);
+                let dropped = matches!(
+                    &self.ed.wire,
+                    Some((Endpoint::Pin { item, pin }, _))
+                        if shown.and_then(|p| p.symbol(item)).is_some_and(|s| s.symbol == symbol_id)
+                            && point_changed(pin)
+                );
+                if dropped {
+                    self.ed.wire = None;
+                }
+                let mut out = if warnings.is_empty() {
                     format!("Changed black box {id}.")
                 } else {
                     format!("Changed black box {id}. Check: {}.", warnings.join("; "))
-                })
+                };
+                if dropped {
+                    out.push_str(" The wire being drawn from one of its changed points was dropped; start it again.");
+                }
+                Ok(out)
             }
             other => Err(format!("Unknown action {other:?}: use add or edit.")),
         }
@@ -6667,6 +6695,11 @@ mod tests {
         let numbered = json!({"action": "add", "page": "2", "x": 40, "y": 40, "width": 10, "height": 10, "tag": 42});
         assert!(call(&mut a, "black_box", numbered).is_err());
         assert_eq!(page2(&a).symbols.len(), count);
+        // A fractional width takes a point at the very end of its edge.
+        let fraction = json!({"action": "add", "page": "2", "x": 40, "y": 70, "width": 20.3, "height": 10,
+                              "pins": [{"name": "E", "side": "bottom", "offset": 20.3}]});
+        call(&mut a, "black_box", fraction).unwrap();
+        assert_eq!(page2(&a).symbols.len(), count + 1);
         let layout = |a: &App| {
             let o = a.open.as_ref().unwrap();
             let placed = page2(a).symbol(&id).unwrap();
@@ -6749,15 +6782,35 @@ mod tests {
         assert_eq!(layout(&a).0, 10.0);
         let names: Vec<String> = layout(&a).2.into_iter().map(|p| p.name).collect();
         assert_eq!(names, ["IN", "Q", "A"]);
-        // A swap is still fine.
-        call(
-            &mut a,
-            "black_box",
-            json!({"action": "edit", "page": "2", "id": id, "rename": {"IN": "Q", "Q": "IN"}}),
-        )
-        .unwrap();
+        // A swap is still fine, and each wire follows its point. A wire being drawn from a
+        // point the edit leaves alone is kept.
+        let draft = |pin: &str| {
+            Some((
+                Endpoint::Pin {
+                    item: id.clone(),
+                    pin: pin.into(),
+                },
+                Vec::new(),
+            ))
+        };
+        a.ed.page = 1;
+        a.ed.wire = draft("A");
+        let swap = json!({"action": "edit", "page": "2", "id": id, "rename": {"IN": "Q", "Q": "IN"}});
+        call(&mut a, "black_box", swap.clone()).unwrap();
         let names: Vec<String> = layout(&a).2.into_iter().map(|p| p.name).collect();
         assert_eq!(names, ["Q", "IN", "A"]);
+        let ends: Vec<Endpoint> = page2(&a).wires.iter().map(|w| w.from.clone()).collect();
+        let on = |pin: &str| Endpoint::Pin {
+            item: id.clone(),
+            pin: pin.into(),
+        };
+        assert_eq!(ends[..2], [on("Q"), on("IN")]);
+        assert_eq!(a.ed.wire, draft("A"));
+        // One drawn from a point that is renamed is dropped, not saved on a stale point.
+        a.ed.wire = draft("Q");
+        let out = call(&mut a, "black_box", swap).unwrap();
+        assert!(out.contains("dropped"), "{out}");
+        assert_eq!(a.ed.wire, None);
         let coil = a
             .open
             .as_mut()

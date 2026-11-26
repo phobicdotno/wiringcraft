@@ -1735,7 +1735,9 @@ fn run(cli: Cli) -> Res<()> {
                     })
                     .collect()
             };
-            let mut new = wc_core::black_box(&symbol_id, &old.name, width, height, &pins).map_err(e)?;
+            // The reason may name points from the project file: escaped for the terminal.
+            let mut new = wc_core::black_box(&symbol_id, &old.name, width, height, &pins)
+                .map_err(|err| escape_field(&err.to_string()))?;
             new.tag_at = old.tag_at;
             new.description.clone_from(&old.description);
             new.source.clone_from(&old.source);
