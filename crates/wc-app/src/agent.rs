@@ -208,7 +208,7 @@ pub fn specs() -> Vec<Value> {
     vec![
         tool(
             "get_state",
-            "Overview of the open project: name, folder, branch, unsaved changes, pages (id, number, title, size, overview, cover, counts), panel layouts, devices count, open comments, the page or panel shown, the selection and whether undo is possible. Also `view`, the drawing aids as they are set now (given with or without a project open): grid (shown), auto_wire (pins that line up get a wire), live_check (checking while drawing), theme (light or dark) and chrome (classic or ribbon). Read it before run_action ToggleGrid, ToggleAutoWire, LiveCheck, ToggleTheme or ToggleChrome: those flip the setting.",
+            "Overview of the open project: name, folder, branch, unsaved changes, pages (id, number, title, size, overview, cover, counts), panel layouts, devices count, open comments, the page or panel shown, the selection and whether undo is possible. Also `view`, the drawing aids as they are set now (given with or without a project open): grid (shown), auto_wire (pins that line up get a wire when the user places or moves a symbol on the canvas; symbols you place with the tools get no wire from it), live_check (checking while drawing), theme (light or dark) and chrome (classic or ribbon). Read it before run_action ToggleGrid, ToggleAutoWire, LiveCheck, ToggleTheme or ToggleChrome: those flip the setting.",
             json!({}),
             &[],
         ),
