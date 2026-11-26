@@ -1595,8 +1595,25 @@ fn area2(lp: &[(f64, f64)]) -> f64 {
         .sum()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The hole search's work so far on this thread: vertices visited, point pairs and wall edges
+    /// collected, crossing tests. Tests read it to check the budgets bound the work done.
+    static HOLE_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts `n` units of hole search work (in tests only; does nothing otherwise).
+#[inline]
+fn tally_work(n: usize) {
+    #[cfg(test)]
+    HOLE_WORK.with(|w| w.set(w.get().saturating_add(n)));
+    #[cfg(not(test))]
+    let _ = n;
+}
+
 /// Whether `pt` lies inside the loop (even-odd rule).
 fn inside(pt: (f64, f64), lp: &[(f64, f64)]) -> bool {
+    tally_work(lp.len());
     let mut odd = false;
     for (b, a) in loop_edges(lp) {
         if (a.1 > pt.1) != (b.1 > pt.1) && pt.0 < (b.0 - a.0) * (pt.1 - a.1) / (b.1 - a.1) + a.0 {
@@ -1617,6 +1634,7 @@ fn hatch_style(e: &Entity) -> i64 {
 
 /// Whether segments p-q and c-d cross at a point inside both (touching at an end does not count).
 fn crosses(p: (f64, f64), q: (f64, f64), c: (f64, f64), d: (f64, f64)) -> bool {
+    tally_work(1);
     let side = |a: (f64, f64), b: (f64, f64), x: (f64, f64)| (b.0 - a.0) * (x.1 - a.1) - (b.1 - a.1) * (x.0 - a.0);
     let eps = 1e-12;
     let (d1, d2) = (side(p, q, c), side(p, q, d));
@@ -1728,6 +1746,7 @@ fn with_holes_kept(loops: &[Vec<(f64, f64)>], style: i64) -> Option<(Vec<Loop>, 
                 pairs.push(((p.0 - h.0).hypot(p.1 - h.1), a, b));
             }
         }
+        tally_work(pairs.len());
         pairs.sort_by(|x, y| x.0.total_cmp(&y.0));
         let mut walls: Vec<((f64, f64), (f64, f64))> = loop_edges(o).collect();
         walls.extend(loop_edges(&lp));
@@ -1736,6 +1755,7 @@ fn with_holes_kept(loops: &[Vec<(f64, f64)>], style: i64) -> Option<(Vec<Loop>, 
                 walls.extend(loop_edges(other));
             }
         }
+        tally_work(walls.len());
         let tries = (BRIDGE_BUDGET * 4 / walls.len().max(1)).max(1);
         let clear = |p: (f64, f64), h: (f64, f64)| !walls.iter().any(|&(c, d)| crosses(p, h, c, d));
         // No clear bridge within the budget: leave the hatch unfilled rather than fill the hole.
@@ -3224,9 +3244,19 @@ mod tests {
                 vec![(a, a), (b, a), (b, b), (a, b)]
             })
             .collect();
-        let started = std::time::Instant::now();
+        // The work each call really does (vertices visited, pairs and walls collected, crossing
+        // tests), counted rather than timed: a timing bound fails on a busy machine, a count
+        // does not. Each call must stay within the nesting budget plus the bridge budget.
+        let work_of = |loops: &[Vec<(f64, f64)>], style: i64| {
+            HOLE_WORK.with(|w| w.set(0));
+            let out = with_holes(loops, style);
+            (out, HOLE_WORK.with(std::cell::Cell::get))
+        };
+        let limit = NESTING_BUDGET + HATCH_BRIDGE_WORK;
         // Nesting found walking out from the smallest loop around: cheap for proper nesting.
-        assert!(with_holes(&loops[..40], 1).is_some());
+        let (out, work) = work_of(&loops[..40], 1);
+        assert!(out.is_some());
+        assert!(work < 10_000, "{work}");
         // Side by side loops need every pair compared; that many stop at the budget.
         let apart: Vec<Vec<(f64, f64)>> = (0..5000)
             .map(|i| {
@@ -3234,7 +3264,9 @@ mod tests {
                 vec![(a, 0.0), (a + 1.0, 0.0), (a + 1.0, 1.0), (a, 1.0)]
             })
             .collect();
-        assert!(with_holes(&apart, 0).is_none());
+        let (out, work) = work_of(&apart, 0);
+        assert!(out.is_none());
+        assert!(work <= NESTING_BUDGET, "{work}");
         // Deep nesting with normal style: every other loop is a hole to bridge, and all the
         // bridges together stop at the hatch's budget.
         let deep: Vec<Vec<(f64, f64)>> = (0..20_000)
@@ -3243,8 +3275,9 @@ mod tests {
                 vec![(a, a), (b, a), (b, b), (a, b)]
             })
             .collect();
-        assert!(with_holes(&deep, 0).is_none());
-        assert!(started.elapsed().as_secs() < 10);
+        let (out, work) = work_of(&deep, 0);
+        assert!(out.is_none());
+        assert!(work <= limit, "{work}");
     }
 
     #[test]
