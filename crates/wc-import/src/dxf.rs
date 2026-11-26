@@ -2023,6 +2023,15 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
         *skipped.entry(NOT_NUMBERS_PLACED.to_owned()).or_default() += placed - out.symbols.len();
         out.warnings = skipped_warnings(skipped.clone());
     }
+    // An entity wider or taller than the window around the middle can never stay; leave it out
+    // before the middle is found, so its centre cannot pull the middle away from the rest.
+    let fits = |s: &Shape| {
+        let (a, b) = s.bounds();
+        b.x - a.x <= 2.0 * FAR_OUT && b.y - a.y <= 2.0 * FAR_OUT
+    };
+    let drawn = out.graphics.len();
+    out.graphics.retain(fits);
+    let oversized = drawn - out.graphics.len();
     let mut xs: Vec<f64> = Vec::new();
     let mut ys: Vec<f64> = Vec::new();
     // One position per entity (the middle of its bounds), so a long line does not count twice.
@@ -2050,7 +2059,7 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
         near(a) && near(b)
     });
     out.symbols.retain(|s| near(s.at));
-    let far = before - out.graphics.len() - out.symbols.len();
+    let far = oversized + before - out.graphics.len() - out.symbols.len();
     if far > 0 {
         *skipped.entry(TOO_FAR_OUT.to_owned()).or_default() += far;
         out.warnings = skipped_warnings(skipped);
@@ -2205,6 +2214,27 @@ mod tests {
             p.warnings
                 .iter()
                 .any(|w| w.contains("1 entity whose size is not a number once placed")),
+            "{:?}",
+            p.warnings
+        );
+        Ok(())
+    }
+
+    /// Lines too long for any window are left out before the middle is found, so they cannot
+    /// pull it away from a compact drawing far out.
+    #[test]
+    fn lines_too_long_to_place_do_not_move_the_middle() -> Result<()> {
+        let long = "0\nLINE\n10\n-1e12\n20\n0\n11\n1e12\n21\n0\n";
+        let ents = format!("{long}{long}0\nLINE\n10\n2e9\n20\n0\n11\n2000000005\n21\n0\n");
+        let p = page(&dxf(&ents, ""), 1.0, &BTreeSet::new())?;
+        let [Shape::Line { a, b }] = p.graphics.as_slice() else {
+            unreachable!("{:?}", p.graphics);
+        };
+        assert_eq!((*a, *b), (Point::new(20.0, 20.0), Point::new(25.0, 20.0)));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("2 entities more than 1000 km from the rest")),
             "{:?}",
             p.warnings
         );
