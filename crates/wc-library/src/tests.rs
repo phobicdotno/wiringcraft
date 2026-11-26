@@ -950,6 +950,28 @@ fn the_starter_ammeter_and_voltmeter_are_measuring_instruments() -> Result<()> {
 }
 
 #[test]
+fn the_starter_inductor_has_two_pins() -> Result<()> {
+    // #770: an inductor for line and DC chokes on drives and in filters.
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
+    project.meta.libraries = vec![LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: starter.to_string_lossy().into(),
+        reference: None,
+    }];
+    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (l, _) = lib.symbol("wc.inductor")?;
+    assert_eq!(l.role, SymbolRole::Standalone);
+    assert_eq!(l.letter_code, "R");
+    assert_eq!(l.category, "passive");
+    let names: Vec<_> = l.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["1", "2"]);
+    Ok(())
+}
+
+#[test]
 fn starter_two_wire_proximity_sensor_and_its_example_part_load() -> Result<()> {
     let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
     let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
