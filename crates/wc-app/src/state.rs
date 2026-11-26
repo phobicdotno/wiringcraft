@@ -1283,10 +1283,14 @@ impl Open {
         let repoint = |libs: &mut Vec<wc_core::project::LibrarySource>| {
             for lib in libs {
                 if lib.kind == "folder" && Path::new(&lib.location).is_relative() {
-                    let (at, project, base) = match std::fs::canonicalize(from.join(&lib.location)) {
-                        Ok(real) => (real, resolved(&from), resolved(&target)),
-                        Err(_) => (lexical(&from.join(&lib.location)), lexical(&from), target.clone()),
-                    };
+                    // All three as the file system resolves them (a missing library folder by
+                    // its longest existing part), so `/var` and `/private/var` on macOS, or a
+                    // short and a long name on Windows, never make a route through the root.
+                    // An existing folder is followed link by link (a link before `..` counts);
+                    // a missing one by its longest existing part.
+                    let at = std::fs::canonicalize(from.join(&lib.location))
+                        .unwrap_or_else(|_| resolved(&from.join(&lib.location)));
+                    let (project, base) = (resolved(&from), resolved(&target));
                     lib.location = match at.strip_prefix(&project) {
                         // Inside the project (`library`, or `../design/library` from `design`):
                         // copied along, so the copy's own, written from the copy's root.
@@ -2702,7 +2706,10 @@ pub(crate) mod tests {
         use std::os::unix::ffi::OsStrExt;
         let (tmp, mut o) = project();
         let odd = tmp.path().join(std::ffi::OsStr::from_bytes(b"shop-\xff"));
-        std::fs::create_dir_all(&odd).unwrap();
+        // macOS file systems refuse a name that is not UTF-8: nothing to test there.
+        if std::fs::create_dir_all(&odd).is_err() {
+            return;
+        }
         std::os::unix::fs::symlink(&odd, tmp.path().join("shop-link")).unwrap();
         o.project.meta.libraries.push(wc_core::project::LibrarySource {
             name: "shop".into(),
