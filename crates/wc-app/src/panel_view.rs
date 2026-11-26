@@ -176,19 +176,16 @@ fn handle(item: &PanelItem) -> Option<Point> {
     }
 }
 
-/// The rail or duct whose resize handle is within `reach` millimetres of `at`, with the
-/// handle: the picked item's first, then the item under `at`. A rail's handle covers its full
-/// 35 mm height.
+/// Side of the square drawn on a picked rail's or duct's resize handle, in screen points; a
+/// press inside that square, and only there, resizes.
+const HANDLE: f32 = 8.0;
+
+/// The rail or duct whose resize handle's square, `reach` millimetres either way of the
+/// handle, holds `at`, with the handle: the picked item's first, then the item under `at`.
 fn handle_at(items: &[PanelItem], pick: Option<usize>, at: Point, reach: f64) -> Option<(usize, Point)> {
     let near = |i: usize| {
-        let item = items.get(i)?;
-        let h = handle(item)?;
-        let tall = if matches!(item, PanelItem::Rail { .. }) {
-            17.5
-        } else {
-            reach
-        };
-        ((at.x - h.x).abs() <= reach && (at.y - h.y).abs() <= tall).then_some((i, h))
+        let h = handle(items.get(i)?)?;
+        ((at.x - h.x).abs() <= reach && (at.y - h.y).abs() <= reach).then_some((i, h))
     };
     pick.and_then(near).or_else(|| item_at(items, at).and_then(near))
 }
@@ -246,8 +243,9 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
     if resp.drag_started_by(egui::PointerButton::Primary)
         && let Some(at) = pressed_at.or(pointer)
     {
-        // A rail's right end or a duct's bottom-right corner, 8 points around, resizes it.
-        let reach = 8.0 / f64::from(ed.view.zoom.max(0.01));
+        // A press inside the square drawn on a rail's right end or a duct's bottom-right
+        // corner resizes it.
+        let reach = f64::from(HANDLE / 2.0) / f64::from(ed.view.zoom.max(0.01));
         let resize = handle_at(&p.items, ed.panel_pick, at, reach);
         ed.panel_resize = resize.is_some();
         ed.panel_pick = resize.map(|(i, _)| i).or_else(|| item_at(&p.items, at));
@@ -463,7 +461,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
     }
     // The picked rail's or duct's resize handle.
     if let Some(h) = ed.panel_pick.and_then(|i| p.items.get(i)).and_then(handle) {
-        painter.rect_filled(Rect::from_center_size(xf.s(h), Vec2::splat(8.0)), 1.0, t.selection);
+        painter.rect_filled(Rect::from_center_size(xf.s(h), Vec2::splat(HANDLE)), 1.0, t.selection);
     }
     for (i, item) in p.items.iter().enumerate() {
         if let PanelItem::Device {
@@ -1254,7 +1252,7 @@ mod tests {
     fn dragging_a_rails_right_end_changes_its_length_in_one_undo_step() {
         let (_tmp, mut o, mut ed) = plate_with_rail_and_duct();
         let mark = o.undo_mark();
-        drag_on_plate(&mut o, &mut ed, Point::new(300.0, 110.0), Point::new(452.0, 140.0));
+        drag_on_plate(&mut o, &mut ed, Point::new(300.0, 101.0), Point::new(452.0, 131.0));
         assert_eq!(ed.panel_pick, Some(1));
         let rail = |o: &Open| o.project.panels[0].items[1].clone();
         assert_eq!(
@@ -1286,6 +1284,54 @@ mod tests {
         drag_on_plate(&mut o, &mut ed, Point::new(300.0, 100.0), Point::new(120.0, 100.0));
         assert_eq!(o.project.panels[0].items[1].bounds().1.x, 210.0);
         assert_eq!(o.project.panels[0].items[2].anchor(), Point::new(160.0, 55.0));
+    }
+
+    /// A rail with a device at its right end, picked: `(tmp, open, editor)`.
+    fn rail_with_device_at_its_end() -> (tempfile::TempDir, Open, Editor) {
+        let (tmp, mut o, mut ed) = plate_with_rail_and_duct();
+        o.project.panels[0].items.push(PanelItem::Device {
+            tag: wc_core::DeviceTag::parse("-K1").unwrap_or_default(),
+            at: Point::new(270.0, 55.0),
+            width: 30.0,
+            height: 90.0,
+            rotation: wc_core::geom::Rotation::R0,
+        });
+        ed.panel_pick = Some(1);
+        (tmp, o, ed)
+    }
+
+    /// With the rail picked, a press on a device at its right end but outside the drawn
+    /// handle moves the device, not the rail's end (#983).
+    #[test]
+    fn a_press_on_a_device_beside_the_handle_moves_the_device() {
+        let (_tmp, mut o, mut ed) = rail_with_device_at_its_end();
+        drag_on_plate(&mut o, &mut ed, Point::new(295.0, 80.0), Point::new(255.0, 30.0));
+        assert_eq!(ed.panel_pick, Some(2));
+        assert_ne!(
+            o.project.panels[0].items[2].anchor(),
+            Point::new(270.0, 55.0),
+            "the device moved"
+        );
+        assert_eq!(
+            o.project.panels[0].items[1].bounds().1.x,
+            300.0,
+            "the rail's length is unchanged"
+        );
+    }
+
+    /// With the rail picked, a press inside the drawn handle resizes the rail even with a
+    /// device over its end; it stops no shorter than the device (#983).
+    #[test]
+    fn a_press_inside_the_handle_resizes_the_rail() {
+        let (_tmp, mut o, mut ed) = rail_with_device_at_its_end();
+        drag_on_plate(&mut o, &mut ed, Point::new(299.0, 101.0), Point::new(400.0, 101.0));
+        assert_eq!(ed.panel_pick, Some(1));
+        assert_eq!(o.project.panels[0].items[1].bounds().1.x, 400.0);
+        assert_eq!(
+            o.project.panels[0].items[2].anchor(),
+            Point::new(270.0, 55.0),
+            "the device stays"
+        );
     }
 
     /// A duct's bottom-right corner dragged resizes it, its top-left corner staying (#983).

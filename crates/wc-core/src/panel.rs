@@ -235,7 +235,9 @@ impl Panel {
     /// end or top-left corner stays put, the item stays on the plate and at least
     /// [`MIN_RESIZE`] millimetres long or wide, and a rail is never shortened past the
     /// devices on it (see [`Panel::rail_devices_end`]); they stay where they are. Returns
-    /// whether anything changed; a device or an index past the end changes nothing.
+    /// whether anything changed; a device, an index past the end, or an item whose left end
+    /// or top-left corner is less than [`MIN_RESIZE`] from the plate's right or bottom edge
+    /// changes nothing.
     pub fn resize_item(&mut self, index: usize, to: Point) -> bool {
         let (pw, ph) = (self.width, self.height);
         let devices_end = self.rail_devices_end(index);
@@ -246,21 +248,26 @@ impl Panel {
             return false;
         }
         let before = item.clone();
+        // The new length from `from`, or `None` when even the shortest one would stick out
+        // past the plate's edge.
         let reach = |from: f64, to: f64, floor: f64, plate: f64| {
             let lo = (from + MIN_RESIZE).max(floor);
-            to.clamp(lo, plate.max(lo)) - from
+            (lo <= plate).then(|| to.clamp(lo, plate) - from)
         };
         match item {
             PanelItem::Rail { at, length } => {
-                *length = reach(at.x, to.x, devices_end.unwrap_or(f64::MIN), pw);
+                let Some(l) = reach(at.x, to.x, devices_end.unwrap_or(f64::MIN), pw) else {
+                    return false;
+                };
+                *length = l;
             }
             PanelItem::Duct { min, max } => {
                 let (a, _) = before.bounds();
+                let (Some(w), Some(h)) = (reach(a.x, to.x, f64::MIN, pw), reach(a.y, to.y, f64::MIN, ph)) else {
+                    return false;
+                };
                 *min = a;
-                *max = Point::new(
-                    a.x + reach(a.x, to.x, f64::MIN, pw),
-                    a.y + reach(a.y, to.y, f64::MIN, ph),
-                );
+                *max = Point::new(a.x + w, a.y + h);
             }
             PanelItem::Device { .. } => return false,
         }
@@ -1284,5 +1291,27 @@ mod tests {
             (Point::new(0.0, 300.0), Point::new(MIN_RESIZE, 400.0))
         );
         assert!(!p.resize_item(0, Point::new(f64::NAN, 10.0)));
+    }
+
+    #[test]
+    fn an_item_too_near_the_plates_far_edge_is_not_resized_off_it() {
+        let mut p = Panel::new("p", "p", 600.0, 400.0);
+        p.items.push(PanelItem::Rail {
+            at: Point::new(595.0, 100.0),
+            length: 5.0,
+        });
+        p.items.push(PanelItem::Duct {
+            min: Point::new(595.0, 100.0),
+            max: Point::new(600.0, 120.0),
+        });
+        p.items.push(PanelItem::Duct {
+            min: Point::new(100.0, 395.0),
+            max: Point::new(200.0, 400.0),
+        });
+        let before = p.items.clone();
+        assert!(!p.resize_item(0, Point::new(700.0, 100.0)));
+        assert!(!p.resize_item(1, Point::new(700.0, 300.0)));
+        assert!(!p.resize_item(2, Point::new(300.0, 500.0)));
+        assert_eq!(p.items, before, "nothing changes");
     }
 }
