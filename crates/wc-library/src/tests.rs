@@ -765,6 +765,32 @@ fn the_starter_three_phase_transformer_has_primary_and_secondary_terminals() -> 
 }
 
 #[test]
+fn the_starter_fuse_switch_disconnector_has_three_poles_and_its_own_tag() -> Result<()> {
+    // The 3-pole fuse switch disconnector (#725): Q in IEC 81346-2 (it switches and isolates;
+    // the fuses ride on the switch), pins 1 to 6 like the 3-pole breaker, and an example part.
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
+    project.meta.libraries = vec![LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: starter.to_string_lossy().into(),
+        reference: None,
+    }];
+    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (fsd, _) = lib.symbol("wc.fuse.3p")?;
+    assert_eq!(fsd.role, SymbolRole::Standalone);
+    assert_eq!(fsd.letter_code, "Q");
+    let names: Vec<_> = fsd.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["1", "2", "3", "4", "5", "6"]);
+    assert_eq!(
+        lib.part("example.ex-fsd-3p-32")?.0.symbol.as_deref(),
+        Some("wc.fuse.3p")
+    );
+    Ok(())
+}
+
+#[test]
 fn lock_restores_a_deleted_vendored_copy_at_the_pinned_version() -> Result<()> {
     let mut f = fixture()?;
     let lib = Library::open(&f.proj, &f.project)?;

@@ -97,6 +97,50 @@ impl Clipboard {
     }
 }
 
+/// Move the items of `sel` on page `p` by `d`: symbols, the wires they carry along, drawings,
+/// revision clouds and the revision table. Items not on the page are skipped.
+pub(crate) fn move_items(p: &mut Page, sel: &[Selection], d: Point) {
+    let (syms, wires) = ids(sel);
+    let carried: BTreeSet<String> = carried_wires(p, &syms, &wires)
+        .into_iter()
+        .map(|w| w.id.clone())
+        .collect();
+    for s in &mut p.symbols {
+        if syms.contains(s.id.as_str()) {
+            s.at = s.at + d;
+        }
+    }
+    for w in &mut p.wires {
+        if !carried.contains(&w.id) {
+            continue;
+        }
+        for v in &mut w.via {
+            *v = *v + d;
+        }
+        for e in [&mut w.from, &mut w.to] {
+            if let Endpoint::Point { at } = e {
+                *at = *at + d;
+            }
+        }
+    }
+    for i in graphic_ids(sel) {
+        if let Some(g) = p.graphics.get_mut(i) {
+            *g = g.translate(d);
+        }
+    }
+    for i in cloud_ids(sel) {
+        if let Some(c) = p.clouds.get_mut(i) {
+            c.min = c.min + d;
+            c.max = c.max + d;
+        }
+    }
+    if sel.contains(&Selection::RevisionTable)
+        && let Some(at) = &mut p.revision_table
+    {
+        *at = *at + d;
+    }
+}
+
 /// `n` with the word for one or for many.
 fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
@@ -668,51 +712,10 @@ impl Open {
 
     /// Move the selection by `d`. The caller takes the undo checkpoint (once per drag).
     pub fn move_by(&mut self, page: usize, sel: &[Selection], d: Point) {
-        let (syms, wires) = ids(sel);
-        let Some(p) = self.project.pages.get(page) else {
-            return;
-        };
-        let carried: BTreeSet<String> = carried_wires(p, &syms, &wires)
-            .into_iter()
-            .map(|w| w.id.clone())
-            .collect();
         let Some(p) = self.project.pages.get_mut(page) else {
             return;
         };
-        for s in &mut p.symbols {
-            if syms.contains(s.id.as_str()) {
-                s.at = s.at + d;
-            }
-        }
-        for w in &mut p.wires {
-            if !carried.contains(&w.id) {
-                continue;
-            }
-            for v in &mut w.via {
-                *v = *v + d;
-            }
-            for e in [&mut w.from, &mut w.to] {
-                if let Endpoint::Point { at } = e {
-                    *at = *at + d;
-                }
-            }
-        }
-        for i in graphic_ids(sel) {
-            if let Some(g) = p.graphics.get_mut(i) {
-                *g = g.translate(d);
-            }
-        }
-        for i in cloud_ids(sel) {
-            if let Some(c) = p.clouds.get_mut(i) {
-                c.min = c.min + d;
-                c.max = c.max + d;
-            }
-        }
-        if sel.contains(&Selection::RevisionTable)
-            && let Some(at) = &mut p.revision_table
-        {
-            *at = *at + d;
-        }
+        move_items(p, sel, d);
         self.edited();
     }
 

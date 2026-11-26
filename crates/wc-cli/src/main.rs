@@ -441,13 +441,14 @@ enum Cmd {
     /// list, revision letters the PDF cannot print, symbols missing from the project's library
     /// copy and wires on pins that do not exist, devices drawn twice, more contacts than a
     /// device's parts have, contacts without a coil, interruption points without a partner,
-    /// open pins, wires ending in the air, jumpers naming a terminal drawn nowhere, one cable
-    /// core on two connections, shorted potentials, a wire number used on more than one
-    /// connection or one connection carrying several wire numbers, panel layouts with
-    /// overlapping devices, devices sticking out of the plate or no longer in the project,
-    /// devices without a part, then the house rules in each library source's `rules.toml`, less
-    /// the ones `rules_off` turns off, and last the project's own `[[rule]]` tables in
-    /// `project.toml` (a cable on every motor, a tag pattern, at most N wires on a terminal).
+    /// open pins, wires ending in the air, wires with both ends on one pin, jumpers naming a
+    /// terminal drawn nowhere, one cable core on two connections, shorted potentials, a wire
+    /// number used on more than one connection or one connection carrying several wire
+    /// numbers, panel layouts with overlapping devices, devices sticking out of the plate or no
+    /// longer in the project, devices without a part, then the house rules in each library
+    /// source's `rules.toml`, less the ones `rules_off` turns off, and last the project's own
+    /// `[[rule]]` tables in `project.toml` (a cable on every motor, a tag pattern, at most N
+    /// wires on a terminal).
     /// Exits with an error when an error is found, so it can guard a commit or a CI job.
     Check {
         /// Also list notes (open pins, devices without a part).
@@ -6044,12 +6045,20 @@ fn import_qet(
     let (mut written, mut failed) = (0, 0);
     // Two files whose names give the same id would overwrite each other: the later one fails.
     let mut ids: std::collections::BTreeMap<String, PathBuf> = Default::default();
+    // The first operand with each id, whether it was imported or not.
+    let mut named: std::collections::BTreeMap<String, PathBuf> = Default::default();
     for file in files {
         let id = qet_id(file, prefix);
-        let read = match ids.get(&id) {
+        // A stream left as it is (not a copy) whose id an earlier operand has is one
+        // `spool_inputs` left unread for that id. It is refused for it here too, without being
+        // opened, whatever the earlier operand reads as now: a FIFO without a writer would
+        // otherwise hold the command, and the project lock, up (#700).
+        let unread = std::fs::metadata(file).is_ok_and(|m| !m.is_file() && !m.is_dir());
+        let read = match ids.get(&id).or(named.get(&id).filter(|_| unread)) {
             Some(first) => Err(format!("gives the same id {id} as {}, skipped", first.display())),
             None => qet_element(file, &id, scale),
         };
+        named.entry(id.clone()).or_insert_with(|| file.clone());
         let (mut imp, warnings) = match read {
             Ok(r) => r,
             Err(err) => {
@@ -12516,6 +12525,48 @@ mod input_tests {
         let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
         assert_eq!((written, failed), (1, 1));
         assert!(lib.join("symbols").join("qet.lamp.json").exists());
+    }
+
+    /// The earlier element is changed between `spool_inputs` and the import so that it no
+    /// longer reads as one: the FIFO `spool_inputs` left unread for its id is still refused
+    /// without being opened, and the command ends (#700).
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_left_unread_stays_unread_when_the_earlier_element_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let (file, fifo) = (a.join("lamp.elmt"), b.join("lamp.elmt"));
+        mkfifo(&fifo);
+        std::fs::write(&file, ELEMENT).unwrap();
+        let lib = tmp.path().join("lib");
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "symbol-qet".as_ref(),
+            file.as_os_str(),
+            fifo.as_os_str(),
+            "--lib".as_ref(),
+            lib.as_os_str(),
+        ])
+        .unwrap();
+        let (inputs, spool) = spooled(cli);
+        assert!(spool.is_none());
+        assert_eq!(inputs, [file.clone(), fifo.clone()]);
+        // Between preparation and import, the earlier file stops being an element.
+        std::fs::write(&file, "no element").unwrap();
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(import_qet(&inputs, &lib, "qet.", 0.5, "", ""));
+        });
+        // The FIFO has no writer: opening it would never return.
+        let imported = result.recv_timeout(std::time::Duration::from_secs(20)).ok();
+        assert_eq!(
+            imported.map(|r| r.unwrap()),
+            Some((0, 2)),
+            "the import opened the FIFO left unread"
+        );
     }
 
     /// A stream that cannot be opened (a socket) is left to the import, which counts it as

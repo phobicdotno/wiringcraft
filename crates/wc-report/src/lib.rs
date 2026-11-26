@@ -831,14 +831,48 @@ fn pin_label(p: &Project, page_id: &str, item: &str, pin: &str) -> String {
 /// The net each pin belongs to, with its potential name (or a generated one).
 fn net_names(i: &Inputs) -> (Vec<connectivity::Net>, BTreeMap<PinRef, String>) {
     let nets = connectivity::nets_linked(i.project, |id| i.symbols.get(id).map(|s| s.role));
+    let auto = auto_net_names(i, &nets);
     let mut by_pin = BTreeMap::new();
-    for (n, net) in nets.iter().enumerate() {
-        let name = net.names.first().cloned().unwrap_or_else(|| format!("N{}", n + 1));
+    for (net, auto) in nets.iter().zip(auto) {
+        let name = net.names.first().cloned().unwrap_or(auto);
         for pin in &net.pins {
             by_pin.insert(pin.clone(), name.clone());
         }
     }
     (nets, by_pin)
+}
+
+/// The generated name of each net (`N1`, `N2`, ...), in the order of `nets`. The numbers are
+/// those the project has without its overview pages (`Page::overview`): an overview draws the
+/// schematic's connections again, so adding one does not change the names on schematic pages.
+/// Nets drawn only on overview pages are numbered after all the others.
+fn auto_net_names(i: &Inputs, nets: &[connectivity::Net]) -> Vec<String> {
+    if !i.project.pages.iter().any(|pg| pg.overview) {
+        return (1..=nets.len()).map(|n| format!("N{n}")).collect();
+    }
+    let mut schematic = i.project.clone();
+    schematic.pages.retain(|pg| !pg.overview);
+    let base = connectivity::nets_linked(&schematic, |id| i.symbols.get(id).map(|s| s.role));
+    let mut by_pin: BTreeMap<&PinRef, usize> = BTreeMap::new();
+    for (n, net) in base.iter().enumerate() {
+        for pin in &net.pins {
+            by_pin.insert(pin, n + 1);
+        }
+    }
+    let mut next = base.len();
+    nets.iter()
+        .map(|net| {
+            let n = net
+                .pins
+                .iter()
+                .find_map(|pin| by_pin.get(pin).copied())
+                .unwrap_or_else(|| {
+                    next += 1;
+                    next
+                });
+            format!("N{n}")
+        })
+        .collect()
 }
 
 /// Wire list: every drawn wire with both ends, then its cross-section, colour and type. A free
@@ -969,13 +1003,14 @@ pub fn cable_list(i: &Inputs<'_>) -> Table {
 /// Net list: each electrically connected group of pins, across pages.
 pub fn net_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new("Net list", &["Net", "Pins", "Connections"]);
-    let (nets, _) = net_names(i);
+    let nets = connectivity::nets_linked(i.project, |id| i.symbols.get(id).map(|s| s.role));
+    let auto = auto_net_names(i, &nets);
     let mut rows: Vec<(String, Vec<String>)> = nets
         .iter()
-        .enumerate()
-        .map(|(n, net)| {
+        .zip(auto)
+        .map(|(net, auto)| {
             let name = if net.names.is_empty() {
-                format!("N{}", n + 1)
+                auto
             } else {
                 net.names.join(" / ")
             };
