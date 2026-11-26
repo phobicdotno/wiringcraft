@@ -4768,9 +4768,12 @@ fn warn_levels(project: &wc_core::Project, kinds: &[wc_report::Kind]) {
     if !kinds.contains(&wc_report::Kind::Terminals) {
         return;
     }
+    use std::io::Write as _;
+    let mut err = std::io::stderr().lock();
     for w in wc_report::level_warnings(project) {
-        // Tags and values come from the project file.
-        eprintln!("warning: {}", escape_field(&w));
+        // Tags and values come from the project file. A warning that cannot be written (stderr
+        // closed or full) is dropped: it must not stop the export.
+        let _ = writeln!(err, "warning: {}", escape_field(&w));
     }
 }
 
