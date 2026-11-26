@@ -1989,6 +1989,11 @@ impl App {
                     out.push(a);
                 }
             }
+            // A shape half drawn in the symbol editor takes Enter and Escape; the editor
+            // handles them itself, so the schematic's drawing is left alone.
+            if self.symbol_editor.as_ref().is_some_and(|e| e.drawing_shape()) {
+                return;
+            }
             if pressed_with(i, Key::Enter, Modifiers::is_none)
                 && matches!(self.ed.tool, Tool::Polyline | Tool::BlackBox)
             {

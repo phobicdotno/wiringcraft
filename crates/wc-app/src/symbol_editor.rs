@@ -492,6 +492,11 @@ impl SymbolEditor {
         }
     }
 
+    /// True while a shape is half drawn: Enter and Escape are then the editor's.
+    pub fn drawing_shape(&self) -> bool {
+        !self.clicks.is_empty()
+    }
+
     /// Drop the shape being drawn (Escape or a right-click).
     pub fn cancel_shape(&mut self) {
         self.clicks.clear();
@@ -1054,10 +1059,18 @@ impl SymbolEditor {
         if resp.clicked()
             && let Some(pos) = resp.interact_pointer_pos()
         {
-            self.click(xf.mm(pos));
-        }
-        if resp.double_clicked() {
-            self.finish_polyline();
+            let at = xf.mm(pos);
+            // egui calls two quick clicks a double-click wherever they land: only a second
+            // click on the polyline's last point ends it.
+            if resp.double_clicked()
+                && self.tool == Tool::Polyline
+                && self.clicks.len() >= 2
+                && self.clicks.last() == Some(&snap(at))
+            {
+                self.finish_polyline();
+            } else {
+                self.click(at);
+            }
         }
         if resp.secondary_clicked() {
             self.cancel_shape();
@@ -1104,20 +1117,7 @@ fn shape_properties(ui: &mut egui::Ui, shape: &mut Shape) {
             ui.label(format!("From {:.1}, {:.1} to {:.1}, {:.1}", a.x, a.y, b.x, b.y));
         }
         Shape::Polyline { points, closed, filled } => {
-            ui.label(RichText::new("Polyline").strong());
-            ui.label(format!("{} points", points.len()));
-            egui::Grid::new("symbol_editor_shape").num_columns(2).show(ui, |ui| {
-                ui.label("Closed");
-                let can = *closed || points.len() >= 3;
-                ui.add_enabled(can, egui::Checkbox::without_text(closed))
-                    .on_disabled_hover_text("A polyline needs three points or more to close.");
-                ui.end_row();
-                // Only a closed outline has an inside to fill.
-                ui.label("Filled");
-                ui.add_enabled(*closed || *filled, egui::Checkbox::without_text(filled))
-                    .on_disabled_hover_text("Close the polyline to fill it.");
-                ui.end_row();
-            });
+            polyline_properties(ui, points.len(), closed, filled);
         }
         Shape::Rect { min, max } => {
             ui.label(RichText::new("Rectangle").strong());
@@ -1192,6 +1192,32 @@ fn shape_properties(ui: &mut egui::Ui, shape: &mut Shape) {
             });
         }
     }
+}
+
+/// A polyline's Closed and Filled boxes. Opening a polyline also clears Filled, in the same
+/// edit: only a closed outline has an inside to fill. Returns the Closed box.
+fn polyline_properties(ui: &mut egui::Ui, points: usize, closed: &mut bool, filled: &mut bool) -> egui::Response {
+    ui.label(RichText::new("Polyline").strong());
+    ui.label(format!("{points} points"));
+    egui::Grid::new("symbol_editor_shape")
+        .num_columns(2)
+        .show(ui, |ui| {
+            ui.label("Closed");
+            let can = *closed || points >= 3;
+            let r = ui
+                .add_enabled(can, egui::Checkbox::without_text(closed))
+                .on_disabled_hover_text("A polyline needs three points or more to close.");
+            if r.changed() && !*closed {
+                *filled = false;
+            }
+            ui.end_row();
+            ui.label("Filled");
+            ui.add_enabled(*closed || *filled, egui::Checkbox::without_text(filled))
+                .on_disabled_hover_text("Close the polyline to fill it.");
+            ui.end_row();
+            r
+        })
+        .inner
 }
 
 fn role_label(r: SymbolRole) -> &'static str {
@@ -1917,6 +1943,99 @@ mod tests {
             })
         );
         Ok(())
+    }
+
+    fn press(pos: Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn opening_a_filled_polyline_clears_filled_too() {
+        let ctx = egui::Context::default();
+        let (mut closed, mut filled) = (true, true);
+        let mut boxed = egui::Rect::NOTHING;
+        let mut t = 0.0;
+        let mut frame = |events: Vec<egui::Event>, closed: &mut bool, filled: &mut bool| {
+            t += 0.05;
+            let raw = egui::RawInput {
+                events,
+                time: Some(t),
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    boxed = polyline_properties(ui, 3, closed, filled).rect;
+                });
+            });
+            boxed.center()
+        };
+        let at = frame(vec![], &mut closed, &mut filled);
+        frame(vec![egui::Event::PointerMoved(at)], &mut closed, &mut filled);
+        frame(vec![press(at, true)], &mut closed, &mut filled);
+        frame(vec![press(at, false)], &mut closed, &mut filled);
+        assert!(!closed, "the Closed box was unticked");
+        assert!(!filled, "an open polyline is not filled");
+    }
+
+    #[test]
+    fn two_quick_clicks_on_different_points_do_not_end_a_polyline() {
+        let ctx = egui::Context::default();
+        let mut e = SymbolEditor::new(Vec::new());
+        e.set_tool(Tool::Polyline);
+        let t = std::cell::Cell::new(0.0);
+        let frame = |e: &mut SymbolEditor, events: Vec<egui::Event>| {
+            t.set(t.get() + 0.02);
+            let mut xf = Xf {
+                origin: Pos2::ZERO,
+                zoom: 1.0,
+            };
+            let raw = egui::RawInput {
+                events,
+                time: Some(t.get()),
+                screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    // Where the drawing puts the symbol origin, and its zoom.
+                    let r = ui.available_rect_before_wrap();
+                    let size = r.size().max(Vec2::new(320.0, 320.0)) - Vec2::new(0.0, 24.0);
+                    let rect = egui::Rect::from_min_size(r.min, size);
+                    xf = Xf {
+                        origin: rect.center(),
+                        zoom: (rect.width().min(rect.height()) / 40.0).max(2.0),
+                    };
+                    e.drawing(ui);
+                });
+            });
+            xf
+        };
+        let click = |e: &mut SymbolEditor, x: f64, y: f64| {
+            let pos = frame(e, vec![]).s(Point::new(x, y));
+            frame(e, vec![egui::Event::PointerMoved(pos), press(pos, true)]);
+            frame(e, vec![press(pos, false)]);
+        };
+        // Three corners in quick succession, each within egui's double-click time.
+        click(&mut e, 0.0, 0.0);
+        click(&mut e, 10.0, 0.0);
+        click(&mut e, 10.0, 10.0);
+        assert!(e.symbol.graphics.is_empty(), "quick clicks on new points add points");
+        assert_eq!(e.clicks.len(), 3);
+        // A pause, then a double-click on a new point adds it and ends the polyline there.
+        t.set(t.get() + 1.0);
+        click(&mut e, 15.0, 10.0);
+        assert_eq!(e.clicks.len(), 4);
+        click(&mut e, 15.0, 10.0);
+        assert!(e.clicks.is_empty());
+        assert!(matches!(
+            &e.symbol.graphics[..],
+            [Shape::Polyline { points, closed: false, .. }] if points.len() == 4
+        ));
     }
 
     #[test]
