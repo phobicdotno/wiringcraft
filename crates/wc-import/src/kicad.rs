@@ -383,12 +383,15 @@ fn convert(
                 Some("text") => {
                     if let (Some(t), Some(at)) = (g.arg(1), g.first("at")) {
                         let effects = g.first("effects");
-                        // Only the horizontal words matter; `top` and `bottom` are ignored.
                         let justify = effects.and_then(|e| e.first("justify"));
-                        let align = match justify.map(|j| j.items()) {
-                            Some(words) if words.iter().any(|w| w.atom() == Some("left")) => Align::Left,
-                            Some(words) if words.iter().any(|w| w.atom() == Some("right")) => Align::Right,
-                            _ => Align::Center,
+                        let has =
+                            |word: &str| justify.is_some_and(|j| j.items().iter().any(|w| w.atom() == Some(word)));
+                        let align = if has("left") {
+                            Align::Left
+                        } else if has("right") {
+                            Align::Right
+                        } else {
+                            Align::Center
                         };
                         let height = effects
                             .and_then(|e| e.first("font"))
@@ -400,6 +403,19 @@ fn convert(
                         let angle = at.num(3).map(|a| if a > 360.0 { a / 10.0 } else { a }).unwrap_or(0.0);
                         let first = pt(at.num(1).unwrap_or(0.0), at.num(2).unwrap_or(0.0));
                         let (sin, cos) = angle.to_radians().sin_cos();
+                        // KiCad puts `at` at the middle of the text block unless `justify` says
+                        // `top` or `bottom`; WiringCraft's `at` is the baseline of the first line.
+                        // So move the first baseline down: by the text height from the top edge,
+                        // and up by the other lines from the bottom edge.
+                        let pitch = 1.5 * height;
+                        let below = pitch * t.lines().count().saturating_sub(1) as f64;
+                        let drop = if has("top") {
+                            height
+                        } else if has("bottom") {
+                            -below
+                        } else {
+                            (height - below) / 2.0
+                        };
                         // A text with line breaks becomes one text per line, each one line pitch
                         // further down, square to the reading direction (y runs down here).
                         for (k, line) in t.lines().enumerate() {
@@ -407,7 +423,7 @@ fn convert(
                             if line.trim().is_empty() {
                                 continue;
                             }
-                            let step = 1.5 * height * k as f64;
+                            let step = drop + pitch * k as f64;
                             graphics.push(Shape::Text {
                                 at: Point::new(first.x + step * sin, first.y + step * cos),
                                 text: line,
@@ -847,6 +863,41 @@ mod tests {
             warnings.iter().any(|w| w.starts_with("Relay_A: its id k.relay_a")),
             "{warnings:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn texts_move_from_kicads_vertical_centre_to_their_baseline() -> Result<()> {
+        let lib = r#"(kicad_symbol_lib
+  (symbol "V" (property "Reference" "V" (at 0 0 0))
+    (symbol "V_0_1"
+      (text "mid" (at 0 -4 0) (effects (font (size 2 2))))
+      (text "top" (at 0 -4 0) (effects (font (size 2 2)) (justify left top)))
+      (text "bottom" (at 0 -4 0) (effects (font (size 2 2)) (justify bottom)))
+      (text "turned" (at 0 -4 90) (effects (font (size 2 2))))
+      (text "two\nlines" (at 0 -4 0) (effects (font (size 2 2)))))
+    (symbol "V_1_1" (pin passive line (at 0 0 0) (length 1) (name "~") (number "1")))))"#;
+        let (syms, warnings) = symbols(lib, "k", 1.0)?;
+        assert_eq!(syms.len(), 1, "{warnings:?}");
+        let at = |name: &str| {
+            syms[0].symbol.graphics.iter().find_map(|g| match g {
+                Shape::Text { text, at, .. } if text == name => Some(*at),
+                _ => None,
+            })
+        };
+        // KiCad's (0, -4) is (0, 4) here, y down. No vertical word: half the height down.
+        assert_eq!(at("mid"), Some(Point::new(0.0, 5.0)));
+        assert_eq!(at("top"), Some(Point::new(0.0, 6.0)));
+        assert_eq!(at("bottom"), Some(Point::new(0.0, 4.0)));
+        // A text reading bottom to top has its "down" to the right.
+        let turned = at("turned").unwrap_or(Point::new(f64::NAN, f64::NAN));
+        assert!(
+            (turned.x - 1.0).abs() < 1e-9 && (turned.y - 4.0).abs() < 1e-9,
+            "{turned:?}"
+        );
+        // Two lines are centred as a block: the first baseline sits above the middle.
+        assert_eq!(at("two"), Some(Point::new(0.0, 3.5)));
+        assert_eq!(at("lines"), Some(Point::new(0.0, 6.5)));
         Ok(())
     }
 
