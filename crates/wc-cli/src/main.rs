@@ -4933,13 +4933,13 @@ fn vcs_cmd(dir: &Path, vc: VcsCmd) -> Res<()> {
         }
         VcsCmd::PageLog { page, limit } => {
             let p = load(dir)?;
-            let page_id = p
-                .pages
-                .iter()
-                .find(|pg| pg.id == page || pg.number == page)
-                .map(|pg| pg.id.clone())
-                .unwrap_or(page);
+            let known = p.pages.iter().find(|pg| pg.id == page || pg.number == page);
+            let page_id = known.map(|pg| pg.id.clone()).unwrap_or(page);
             let versions = wc_vcs::page_history(&git, &page_id, limit).map_err(e)?;
+            // A removed page keeps its recorded history; a page neither here nor recorded is a typo.
+            if known.is_none() && versions.is_empty() {
+                check_pages(&p, std::slice::from_ref(&page_id))?;
+            }
             if versions.is_empty() {
                 println!("no recorded versions of page {page_id}");
             }
