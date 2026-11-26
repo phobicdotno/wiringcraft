@@ -172,7 +172,10 @@ fn font_size(v: &str) -> Option<f64> {
         (v.strip_suffix("px").unwrap_or(v), 1.0)
     };
     let n: f64 = n.trim().parse().ok()?;
-    (n.is_finite() && n > 0.0).then_some(n * scale)
+    // Zero is a size that was set (a browser draws nothing), so it is kept; a size that is not a
+    // number, below zero or too big to scale is not read.
+    let px = n * scale;
+    (n >= 0.0 && px.is_finite()).then_some(px)
 }
 
 /// Elements whose content a browser never draws in place: definitions, markers, clip paths,
@@ -1354,6 +1357,18 @@ mod tests {
         assert_eq!(e.1, Align::Center);
         assert_eq!(f.0, d.0, "em is not read: the fallback");
         Ok(())
+    }
+
+    #[test]
+    fn font_size_zero_is_kept_and_an_overflow_is_not_read() {
+        assert_eq!(font_size("0"), Some(0.0));
+        assert_eq!(font_size("0px"), Some(0.0));
+        assert_eq!(font_size("0pt"), Some(0.0));
+        assert_eq!(font_size("6pt"), Some(8.0));
+        assert_eq!(font_size("1.5e308pt"), None, "pt to px overflows");
+        assert_eq!(font_size("-1px"), None);
+        assert_eq!(font_size("NaN"), None);
+        assert_eq!(font_size("inf"), None);
     }
 
     #[test]
