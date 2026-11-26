@@ -465,7 +465,7 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "translations",
-            "The project's translation dictionary (translations.toml, the same file as File, Translations): list the project's texts with their translations (lang: only that language; missing: true with lang: only the texts without a translation into it), set a text's translation into a language, or remove it. text is the project text as drawn, in the source language. It is written to the file at once, like the dialog saves: Undo does not take it back, so set or remove it again to change it.",
+            "The project's translation dictionary (translations.toml, the same file as File, Translations): list the project's texts with their translations (lang: only that language; missing: true with lang: only the texts without a translation into it), set a text's translation into a language, or remove it. text is the project text as drawn, in the source language. It is written to the file at once, like the dialog saves: Undo does not take it back, so set or remove it again to change it. In a shared session only the host can set or remove translations.",
             json!({
                 "action": {"type": "string", "enum": ["list", "set", "remove"]},
                 "text": {"type": "string", "description": "set, remove: the text as drawn in the project, such as a page title or device description."},
@@ -2595,6 +2595,11 @@ impl App {
     fn tool_translations(&mut self, v: &Value) -> Result<String, String> {
         use wc_core::translate::{Dictionary, TRANSLATIONS_FILE, set_translation, texts};
         let action = need_s(v, "action")?;
+        // The session does not carry translations.toml: a guest's edit would stay in the
+        // guest's own copy, and the host's file (which its PDF export reads) would not change.
+        if matches!(action, "set" | "remove") && self.share.active() && !self.share.is_host() {
+            return Err("Not done: in a shared session only the host can change the translations (the session does not carry translations.toml). Ask the host to make this change.".into());
+        }
         let open = need_open(self.open.as_mut())?;
         match action {
             "list" => {
@@ -5040,6 +5045,23 @@ mod tests {
     }
 
     #[test]
+    fn a_guest_cannot_set_or_remove_translations_the_session_does_not_carry() {
+        use wc_core::translate::TRANSLATIONS_FILE;
+        let tmp = tempfile::tempdir().unwrap();
+        let (_dir, mut a) = guest_app(tmp.path());
+        let file = a.open.as_ref().unwrap().dir.join(TRANSLATIONS_FILE);
+        for input in [
+            json!({"action": "set", "text": "Pumps", "lang": "nb", "translation": "Pumper"}),
+            json!({"action": "remove", "text": "Pumps", "lang": "nb"}),
+        ] {
+            let e = call(&mut a, "translations", input).unwrap_err();
+            assert!(e.contains("only the host"), "{e}");
+        }
+        assert!(!file.exists(), "nothing is written in the guest's copy");
+        assert!(call(&mut a, "translations", json!({"action": "list"})).is_ok());
+    }
+
+    #[test]
     fn a_guests_tool_call_that_changes_nothing_is_not_pending() {
         let tmp = tempfile::tempdir().unwrap();
         let (_dir, mut a) = guest_app(tmp.path());
@@ -5683,7 +5705,7 @@ mod tests {
         ] {
             assert!(call(&mut a, "translations", bad.clone()).is_err(), "{bad}");
         }
-        // The file is not part of the drawing: no undo step.
+        // The file is not part of the drawing: no undo step yet (todo #589).
         assert_eq!(a.open.as_ref().unwrap().undo_mark(), steps);
     }
 
