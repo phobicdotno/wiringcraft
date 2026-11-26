@@ -1655,21 +1655,25 @@ impl Page {
     /// with them every wire that ends on a pin of one of those symbols. Returns the removed ids:
     /// symbols first, then wires, each in page order. Ids not on the page are skipped.
     pub fn remove_symbols_and_wires(&mut self, symbols: &[&str], wires: &[&str]) -> Vec<String> {
-        let on_removed = |end: &Endpoint| matches!(end, Endpoint::Pin { item, .. } if symbols.contains(&item.as_str()));
-        let gone_wires: Vec<String> = self
-            .wires
-            .iter()
-            .filter(|w| wires.contains(&w.id.as_str()) || on_removed(&w.from) || on_removed(&w.to))
-            .map(|w| w.id.clone())
-            .collect();
         let gone_symbols: Vec<String> = self
             .symbols
             .iter()
             .filter(|s| symbols.contains(&s.id.as_str()))
             .map(|s| s.id.clone())
             .collect();
+        // Only symbols that are on the page take their wires along: a wire that ends on a
+        // missing id stays.
+        let on_removed = |end: &Endpoint| matches!(end, Endpoint::Pin { item, .. } if gone_symbols.contains(item));
+        // Each wire is judged on its own ends, so a second wire that only shares an id stays.
+        let mut gone_wires = Vec::new();
+        self.wires.retain(|w| {
+            let gone = wires.contains(&w.id.as_str()) || on_removed(&w.from) || on_removed(&w.to);
+            if gone {
+                gone_wires.push(w.id.clone());
+            }
+            !gone
+        });
         self.symbols.retain(|s| !gone_symbols.contains(&s.id));
-        self.wires.retain(|w| !gone_wires.contains(&w.id));
         gone_symbols.into_iter().chain(gone_wires).collect()
     }
 
@@ -2095,6 +2099,34 @@ mod tests {
         assert_eq!(removed, ["s2", "w2", "w3", "w4"]);
         assert_eq!(page.symbols.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["s1"]);
         assert_eq!(page.wires.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), ["w1"]);
+        Ok(())
+    }
+
+    #[test]
+    fn removing_symbols_judges_each_wire_by_its_own_ends() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut page = Page::new("p1", "1", "P");
+        page.symbols.push(PlacedSymbol {
+            id: "s1".into(),
+            symbol: "k".into(),
+            at: Point::default(),
+            rotation: Rotation::default(),
+            mirror: false,
+            tag: None,
+        });
+        // Two wires share the id w1 (a replaced page can hold that); only the first is on s1.
+        // w2 ends on `gone`, which is not on the page.
+        page.wires = serde_json::from_str(
+            r#"[{"id":"w1","from":{"item":"s1","pin":"1"},"to":{"at":{"x":0.0,"y":0.0}}},
+                {"id":"w1","from":{"at":{"x":0.0,"y":0.0}},"to":{"at":{"x":5.0,"y":0.0}}},
+                {"id":"w2","from":{"item":"gone","pin":"1"},"to":{"at":{"x":5.0,"y":0.0}}}]"#,
+        )?;
+        let removed = page.remove_symbols_and_wires(&["s1", "gone"], &[]);
+        assert_eq!(removed, ["s1", "w1"]);
+        assert_eq!(
+            page.wires.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(),
+            ["w1", "w2"]
+        );
+        assert!(matches!(page.wires[0].from, Endpoint::Point { .. }));
         Ok(())
     }
 
