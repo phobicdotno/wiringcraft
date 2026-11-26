@@ -293,8 +293,20 @@ fn markdown_cell(s: &str) -> String {
         let (before, link) = word.split_at(lead);
         markdown_text(before, &mut out);
         if is_autolink(link) {
-            // Markdown leaves trailing punctuation out of the link: that part is plain text.
-            let body = link.trim_end_matches(['?', '!', '.', ',', ':', '*', '_', '~']);
+            // Markdown leaves trailing punctuation and a trailing entity such as `&copy;` out
+            // of the link: that part is plain text.
+            let mut body = link;
+            loop {
+                body = body.trim_end_matches(['?', '!', '.', ',', ':', '*', '_', '~']);
+                let Some(head) = body.strip_suffix(';') else {
+                    break;
+                };
+                let name = head.trim_end_matches(|c: char| c.is_ascii_alphanumeric());
+                match name.strip_suffix('&') {
+                    Some(kept) if name.len() < head.len() => body = kept,
+                    _ => break,
+                }
+            }
             for c in body.chars() {
                 if matches!(c, '\\' | '|') {
                     out.push('\\');
@@ -332,8 +344,22 @@ fn markdown_text(s: &str, out: &mut String) {
 /// with `http://`, `https://` or `www.`, or an e-mail address such as `a_b@example.com`.
 fn is_autolink(word: &str) -> bool {
     let lower = word.to_ascii_lowercase();
-    if lower.starts_with("http://") || lower.starts_with("https://") || word.starts_with("www.") {
-        return true;
+    let web = ["http://", "https://", "www."]
+        .iter()
+        .find(|p| lower.starts_with(**p))
+        .map(|p| (&word[p.len()..], *p == "www."));
+    if let Some((after, www)) = web {
+        // The host must be a domain Markdown accepts: parts of letters, digits, `-` and `_`
+        // between dots, with no `_` in the last two parts.
+        let host_len = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+            .unwrap_or(after.len());
+        let host = if www { &word[..4 + host_len] } else { &after[..host_len] };
+        let host = host.trim_end_matches('.');
+        let parts: Vec<&str> = host.split('.').collect();
+        return parts.iter().all(|p| !p.is_empty())
+            && (!www || parts.len() > 1)
+            && parts.iter().rev().take(2).all(|p| !p.contains('_'));
     }
     let Some((name, domain)) = word.split_once('@') else {
         return false;

@@ -3190,3 +3190,18 @@ fn markdown_cells_keep_links_as_typed() {
          | (www.x.no/a_b\\|c), mail a_b@x.no or a\\_b@c |\n"
     );
 }
+
+#[test]
+fn markdown_cells_escape_words_that_only_look_like_links() {
+    let mut t = Table::new("Links", &["Text"]);
+    t.rows.push(vec!["https://*spare*/path".into()]);
+    t.rows.push(vec!["https://example.com/&copy;".into()]);
+    t.rows.push(vec!["https://example.com/a_b. www.a_b.no".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Links\n\n| Text |\n|---|\n\
+         | https://\\*spare\\*/path |\n\
+         | https://example.com/\\&copy; |\n\
+         | https://example.com/a_b. www.a\\_b.no |\n"
+    );
+}
