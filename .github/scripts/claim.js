@@ -96,7 +96,7 @@ async function canWrite(github, owner, repo, login, association) {
   if (!permissions.has(login)) {
     let ok = false;
     try {
-      const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ owner, repo, username: login });
+      const { data } = await withRetry(() => github.rest.repos.getCollaboratorPermissionLevel({ owner, repo, username: login }));
       ok = WRITE.has(data.role_name || data.permission);
     } catch (e) {
       if (e.status !== 404) throw e;
