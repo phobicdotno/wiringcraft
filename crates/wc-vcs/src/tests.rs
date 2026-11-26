@@ -103,6 +103,68 @@ fn symbol_level_changes() -> std::result::Result<(), wc_core::Error> {
 }
 
 #[test]
+fn page_setting_changes_are_reported() -> std::result::Result<(), wc_core::Error> {
+    let mut a = Page::new("p", "3", "X");
+    place(&mut a, "s1", "-K1", 10.0)?;
+    assert!(
+        changes::page_changes(Some(&a), Some(&a.clone())).is_empty(),
+        "same page, no change"
+    );
+    let shown = |b: &Page| -> Vec<String> {
+        changes::page_changes(Some(&a), Some(b))
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    };
+
+    let mut b = a.clone();
+    b.number = "4".into();
+    assert_eq!(shown(&b), ["page 3 renumbered -> 4"]);
+
+    let mut b = a.clone();
+    b.title_block.insert("revision".into(), "B".into());
+    assert_eq!(shown(&b), ["page 3: title block changed"]);
+
+    let mut b = a.clone();
+    b.size = wc_core::project::PageSize::A4;
+    assert_eq!(shown(&b), ["page 3: sheet size changed"]);
+
+    let mut b = a.clone();
+    b.cover = true;
+    b.revision_table = Some(Point::new(10.0, 10.0));
+    assert_eq!(
+        shown(&b),
+        ["page 3: revision table changed", "page 3: cover setting changed"]
+    );
+
+    let mut b = a.clone();
+    b.clouds.push(wc_core::revision::RevisionCloud {
+        min: Point::new(0.0, 0.0),
+        max: Point::new(20.0, 20.0),
+        revision: "B".into(),
+    });
+    assert_eq!(shown(&b), ["page 3: revision clouds changed"]);
+
+    let mut b = a.clone();
+    b.underlay = Some(wc_core::project::Underlay {
+        file: "underlays/p.jpg".into(),
+        min: Point::new(0.0, 0.0),
+        max: Point::new(420.0, 297.0),
+    });
+    assert_eq!(shown(&b), ["page 3: underlay changed"]);
+
+    let mut b = a.clone();
+    b.overview = true;
+    assert_eq!(shown(&b), ["page 3: overview setting changed"]);
+
+    // A difference no check names (here the stored id) is still reported.
+    let mut b = a.clone();
+    b.id = "q".into();
+    assert_eq!(shown(&b), ["page 3: page changed"]);
+    Ok(())
+}
+
+#[test]
 fn revert_refuses_while_another_operation_is_in_progress() -> Result<()> {
     let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
     let dir = tmp.path();
@@ -420,5 +482,48 @@ fn a_failed_write_leaves_the_exclude_list_as_it_was() -> Result<()> {
     assert!(git.exclude_locally("other.lock").is_err());
     let after = std::fs::read(&exclude).map_err(|e| wc_core::Error::io("read", e))?;
     assert_eq!(after, before);
+    Ok(())
+}
+
+#[test]
+fn changes_name_a_file_with_an_accent_as_it_is() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    store::create(dir, "Demo")?;
+    let git = Git::new(dir);
+    git.init()?;
+    let base = git.head().ok_or_else(|| wc_core::Error::Invalid("no head".into()))?;
+    let path = dir.join("café.png");
+    std::fs::write(&path, "1").map_err(|e| wc_core::Error::io(&path, e))?;
+
+    // Not recorded yet.
+    let found = changes(&git, &base, None)?;
+    assert!(
+        found.contains(&Change::File {
+            path: "café.png".into(),
+            status: "added".into()
+        }),
+        "{found:?}"
+    );
+    // Recorded, then changed again in the folder.
+    git.commit("Picture")?;
+    let first = git.head().ok_or_else(|| wc_core::Error::Invalid("no head".into()))?;
+    let found = changes(&git, &base, Some(&first))?;
+    assert!(
+        found.contains(&Change::File {
+            path: "café.png".into(),
+            status: "added".into()
+        }),
+        "{found:?}"
+    );
+    std::fs::write(&path, "2").map_err(|e| wc_core::Error::io(&path, e))?;
+    let found = changes(&git, &first, None)?;
+    assert_eq!(
+        found,
+        [Change::File {
+            path: "café.png".into(),
+            status: "changed".into()
+        }]
+    );
     Ok(())
 }
