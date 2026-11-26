@@ -999,6 +999,18 @@ fn output_guard() -> Option<&'static wc_core::guard::ProjectFiles> {
     GUARD.get_or_init(wc_core::guard::ProjectFiles::from_env).as_ref()
 }
 
+/// Refuse `--page` ids the project does not have, naming the ids it does, so a typo fails
+/// instead of writing an empty export (#551).
+fn check_pages(p: &Project, pages: &[String]) -> Res<()> {
+    match pages.iter().find(|id| p.page(id).is_none()) {
+        None => Ok(()),
+        Some(id) => {
+            let ids: Vec<String> = p.pages.iter().map(|pg| escape_field(&pg.id)).collect();
+            Err(format!("no page {id:?} (pages: {})", ids.join(", ")))
+        }
+    }
+}
+
 /// Write an output file the user named. Under [`output_guard`] the file is written so that it
 /// cannot land on a project file, a link swapped in after the app's own look included (#458).
 /// A failure names the file: the guarded write does that itself, a plain one is given it here.
@@ -2086,6 +2098,7 @@ fn run(cli: Cli) -> Res<()> {
                 }
                 None => p,
             };
+            check_pages(&p, &pages)?;
             let (symbols, missing) = store::vendored_symbols(dir, &p);
             for m in missing {
                 eprintln!("warning: symbol {m} has no vendored copy (run `wiringcraft lib lock`)");
@@ -2169,6 +2182,7 @@ fn run(cli: Cli) -> Res<()> {
             };
             let ext = format.to_ascii_lowercase();
             let p = load(dir)?;
+            check_pages(&p, &pages)?;
             let (symbols, missing) = store::vendored_symbols(dir, &p);
             for m in missing {
                 eprintln!("warning: symbol {m} has no vendored copy (run `wiringcraft lib lock`)");
@@ -5764,6 +5778,41 @@ mod tests {
         cli(&dir, &["page", "cover", "c2", "--off"]).unwrap();
         assert!(covers(&dir).is_empty());
         assert!(cli(&dir, &["page", "cover", "nope"]).unwrap_err().contains("no page"));
+    }
+
+    #[test]
+    fn pdf_and_drawing_refuse_an_unknown_page_and_write_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let first = load(&dir).unwrap().pages[0].id.clone();
+        let pdf = tmp.path().join("out.pdf");
+        let err = cli(&dir, &["pdf", pdf.to_str().unwrap(), "--page", "nope"]).unwrap_err();
+        assert!(err.contains("no page \"nope\"") && err.contains(&first), "{err}");
+        assert!(!pdf.exists());
+        let drawings = tmp.path().join("dr");
+        let err = cli(
+            &dir,
+            &[
+                "drawing",
+                drawings.to_str().unwrap(),
+                "--page",
+                &first,
+                "--page",
+                "nope",
+            ],
+        )
+        .unwrap_err();
+        assert!(err.contains("no page \"nope\""), "{err}");
+        assert!(!drawings.exists());
+        // A page that exists still exports.
+        cli(&dir, &["pdf", pdf.to_str().unwrap(), "--page", &first]).unwrap();
+        assert!(pdf.exists());
+        // The listed ids are escaped, so a control character in one cannot steer the terminal.
+        let mut p = load(&dir).unwrap();
+        p.pages[0].id = "a\u{1b}[2Jb".into();
+        let err = check_pages(&p, &["nope".into()]).unwrap_err();
+        assert!(err.contains("a\\u{1b}[2Jb") && !err.contains('\u{1b}'), "{err}");
     }
 
     #[test]
