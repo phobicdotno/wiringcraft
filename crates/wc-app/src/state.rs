@@ -2424,6 +2424,8 @@ impl Open {
         }
         self.check_box_file_unchanged(&symbol_id, &old)?;
         self.write_symbol_file(&new)?;
+        // The file holds the loaded version again: a later change on disk is checked for.
+        self.stale_symbol_files.remove(&symbol_id);
         self.checkpoint();
         self.project.lock.symbols.insert(
             symbol_id.clone(),
@@ -4648,6 +4650,35 @@ pub(crate) mod tests {
             .unwrap_err();
         assert!(err.contains("cannot be read"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
+        // A file the app could not put back is the app's to write: an edit that cannot be
+        // written keeps it so, and one that is written ends that, so a change on disk after it
+        // is refused again.
+        o.mark_symbol_file_stale(&symbol_id);
+        o.fail_symbol_writes.push_back(true);
+        assert!(
+            o.edit_black_box(1, &id, (30.0, 20.0), &pins, &none, &Default::default())
+                .is_err()
+        );
+        assert!(o.stale_symbol_files.contains(&symbol_id), "still to be written");
+        o.edit_black_box(1, &id, (30.0, 20.0), &pins, &none, &Default::default())
+            .unwrap();
+        assert!(!o.stale_symbol_files.contains(&symbol_id), "written");
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(),
+            o.symbols[&symbol_id]
+        );
+        store::write_vendored_symbol(&o.dir, &outside).unwrap();
+        let steps = o.undo_mark();
+        let err = o
+            .edit_black_box(1, &id, (40.0, 20.0), &pins, &none, &Default::default())
+            .unwrap_err();
+        assert!(err.contains("changed on disk"), "{err}");
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(),
+            outside,
+            "file kept"
+        );
+        assert_eq!(o.undo_mark(), steps, "no undo step");
     }
 
     #[test]
