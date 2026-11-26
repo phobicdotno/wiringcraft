@@ -507,7 +507,7 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "translations",
-            "The project's translation dictionary (translations.toml, the same file as File, Translations): list the project's texts with their translations (lang: only that language; missing: true with lang: only the texts without a translation into it), set a text's translation into a language, or remove it. text is the project text as drawn, in the source language. It is written to the file at once, like the dialog saves: Undo does not take it back, so set or remove it again to change it. In a shared session only the host can set or remove translations.",
+            "The project's translation dictionary (translations.toml, the same file as File, Translations): list the project's texts with their translations (lang: only that language; missing: true with lang: only the texts without a translation into it), set a text's translation into a language, or remove it. text is the project text as drawn, in the source language. It is written to the file at once, like the dialog saves, and Undo takes it back with the turn's other changes. In a shared session only the host can set or remove translations.",
             json!({
                 "action": {"type": "string", "enum": ["list", "set", "remove"]},
                 "text": {"type": "string", "description": "set, remove: the text as drawn in the project, such as a page title or device description."},
@@ -3169,7 +3169,10 @@ impl App {
                 } else {
                     ""
                 };
-                let changed = set_translation(&open.dir, text, lang, translation).map_err(|e| e.to_string())?;
+                // One undo step, which the turn's squash joins with its other changes (#589).
+                let changed = open
+                    .translations_change(|dir| set_translation(dir, text, lang, translation))
+                    .map_err(|e| e.to_string())?;
                 let mut out = match (action, changed) {
                     ("set", true) => format!("Saved the translation to {TRANSLATIONS_FILE}."),
                     ("set", false) => format!("{TRANSLATIONS_FILE} already had that translation."),
@@ -3553,6 +3556,8 @@ impl App {
                 open.save()
                     .map_err(|e| format!("Saving before the command failed: {e}"))?;
             }
+            // What the command writes to translations.toml becomes part of its undo step.
+            open.before_translations_command();
             cmd.arg("-C").arg(&open.dir);
             self.assistant.command_base = Some((open.dir.clone(), open.project.clone()));
         }
@@ -3580,6 +3585,22 @@ impl App {
     /// always win: if both changed the project, the command's changes are not loaded and the
     /// answer says so, so the assistant can ask before running it again.
     fn command_finish(&mut self, r: Result<String, String>) -> Result<String, String> {
+        let ran_in = self.assistant.command_base.as_ref().map(|(dir, _)| dir.clone());
+        let mark = self.open.as_ref().map(Open::undo_mark);
+        let r = self.command_finish_project(r);
+        // What the command wrote to translations.toml (`translations set`, say) is taken back
+        // by the same Undo as its change of the project, or by one of its own (#589).
+        if let (Some(dir), Some(mark), Some(open)) = (ran_in, mark, self.open.as_mut())
+            && open.dir == dir
+        {
+            open.note_translations();
+            open.squash_undo(mark);
+        }
+        r
+    }
+
+    /// [`App::command_finish`] for the project itself.
+    fn command_finish_project(&mut self, r: Result<String, String>) -> Result<String, String> {
         let base = self.assistant.command_base.take();
         let Some(open) = self.open.as_mut() else {
             return r;
@@ -6881,8 +6902,70 @@ mod tests {
         ] {
             assert!(call(&mut a, "translations", bad.clone()).is_err(), "{bad}");
         }
-        // The file is not part of the drawing: no undo step yet (todo #589).
-        assert_eq!(a.open.as_ref().unwrap().undo_mark(), steps);
+        // Each change of the file is one undo step (#589); a refused one is none.
+        assert_eq!(a.open.as_ref().unwrap().undo_mark(), steps + 3);
+    }
+
+    #[test]
+    fn one_undo_takes_back_a_turn_that_set_a_translation_and_changed_a_page() {
+        use wc_core::translate::{Dictionary, TRANSLATIONS_FILE};
+        let (_tmp, mut a) = app(vec![]);
+        let dir = a.open.as_ref().unwrap().dir.clone();
+        let file = dir.join(TRANSLATIONS_FILE);
+        let before = a.open.as_ref().unwrap().project.clone();
+        // One turn, as the assistant panel runs it: a mark, the tools, then one squash.
+        let mark = a.open.as_ref().unwrap().undo_mark();
+        call(&mut a, "add_page", json!({"title": "Pumps"})).unwrap();
+        let r = call(
+            &mut a,
+            "translations",
+            json!({"action": "set", "text": "Pumps", "lang": "nb", "translation": "Pumper"}),
+        )
+        .unwrap();
+        assert!(r.starts_with("Saved"), "{r}");
+        call(&mut a, "add_page", json!({"title": "Motors"})).unwrap();
+        let open = a.open.as_mut().unwrap();
+        open.squash_undo(mark);
+        assert_eq!(open.undo_mark(), mark + 1, "the turn is one undo step");
+        let after = open.project.clone();
+        assert_eq!(after.pages.len(), before.pages.len() + 2);
+        let translated = std::fs::read_to_string(&file).unwrap();
+
+        assert!(open.undo(), "{:?}", open.take_undo_error());
+        assert_eq!(open.project, before, "the pages are gone");
+        assert!(
+            !file.exists(),
+            "and so is the translation: there was no file before the turn"
+        );
+        assert_eq!(Dictionary::load(&dir).unwrap().lookup("Pumps", "nb"), None);
+
+        assert!(open.redo(), "{:?}", open.take_undo_error());
+        assert_eq!(open.project, after);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), translated);
+        assert_eq!(
+            Dictionary::load(&dir).unwrap().lookup("Pumps", "nb").as_deref(),
+            Some("Pumper")
+        );
+    }
+
+    #[test]
+    fn undo_takes_back_a_translation_a_command_set() {
+        use wc_core::translate::{TRANSLATIONS_FILE, set_translation};
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        open.save().unwrap();
+        let (dir, mark) = (open.dir.clone(), open.undo_mark());
+        let file = dir.join(TRANSLATIONS_FILE);
+        a.assistant.command_base = Some((open.dir.clone(), open.project.clone()));
+        // What `wiringcraft translations set` does on disk.
+        assert!(set_translation(&dir, "Pumps", "nb", "Pumper").unwrap());
+        a.command_finish(Ok("Done.".into())).unwrap();
+        let open = a.open.as_mut().unwrap();
+        assert_eq!(open.undo_mark(), mark + 1, "one undo step");
+        assert!(open.undo());
+        assert!(!file.exists());
+        assert!(open.redo());
+        assert!(file.exists());
     }
 
     #[test]

@@ -173,14 +173,51 @@ impl WireNumbering {
     }
 }
 
+/// The text of the project's `translations.toml`, or `None` when it has none. Shared between
+/// the undo steps that hold the same text.
+type Translations = Option<std::sync::Arc<str>>;
+
+/// Read `translations.toml` from the project folder as it is.
+fn read_translations(dir: &Path) -> Result<Translations, String> {
+    let path = dir.join(wc_core::translate::TRANSLATIONS_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(Some(text.into())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// One Undo or Redo step: the project as it was, with its `translations.toml` as it was then
+/// (the file is not part of [`Project`], #589). It reads as the project it holds.
+#[derive(Debug, Clone, PartialEq)]
+struct Step {
+    project: Project,
+    translations: Translations,
+}
+
+impl std::ops::Deref for Step {
+    type Target = Project;
+    fn deref(&self) -> &Project {
+        &self.project
+    }
+}
+
+impl std::ops::DerefMut for Step {
+    fn deref_mut(&mut self) -> &mut Project {
+        &mut self.project
+    }
+}
+
 /// The project and its undo history, set aside by [`Open::set_aside`] and put back whole by
 /// [`Open::put_back`]: a field added to the history belongs here, so that `without_changes` and
 /// `back_to`, which take a change back through it, restore it. The library-update rollback
 /// (`roll_back_update`) keeps its own copy and needs the field added there too.
 struct Kept {
     project: Project,
-    undo: Vec<Project>,
-    redo: Vec<Project>,
+    /// `translations.toml` as it was, put back with the project.
+    translations: Translations,
+    undo: Vec<Step>,
+    redo: Vec<Step>,
     undo_dropped: usize,
     history: u64,
     form_step: Option<u64>,
@@ -244,8 +281,11 @@ pub struct Open {
     /// Every part in the project and its library sources, as (id, label), for the part picker.
     pub part_library: Vec<(String, String)>,
     pub dirty: bool,
-    undo: Vec<Project>,
-    redo: Vec<Project>,
+    /// The project's `translations.toml` as this window last read or wrote it: what an undo
+    /// step made now keeps, and what Undo and Redo compare the file with before writing it.
+    translations: Translations,
+    undo: Vec<Step>,
+    redo: Vec<Step>,
     /// Snapshots dropped from the front of `undo` because it was full, so marks stay valid.
     undo_dropped: usize,
     /// Counts every change to the undo history (checkpoint, undo, redo, squash).
@@ -324,9 +364,9 @@ fn next_revision() -> u64 {
 
 /// The history as it was before a library update, so a failed one leaves no trace in it.
 struct HistoryState {
-    redo: Vec<Project>,
+    redo: Vec<Step>,
     /// The oldest Undo step, when the update's checkpoint pushes it out.
-    evicted: Option<Project>,
+    evicted: Option<Step>,
     dirty: bool,
     history: u64,
 }
@@ -344,6 +384,7 @@ impl Open {
             parts: BTreeMap::new(),
             part_library: Vec::new(),
             dirty: false,
+            translations: read_translations(dir).unwrap_or_default(),
             undo: Vec::new(),
             redo: Vec::new(),
             undo_dropped: 0,
@@ -878,7 +919,8 @@ impl Open {
     pub(crate) fn without_changes<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         let kept = self.set_aside();
         let r = f(self);
-        self.put_back(kept);
+        // A form's fields do not write translations.toml: there is nothing to put back there.
+        let _ = self.put_back(kept);
         r
     }
 
@@ -887,6 +929,7 @@ impl Open {
     fn set_aside(&mut self) -> Kept {
         Kept {
             project: self.project.clone(),
+            translations: self.translations.clone(),
             undo: std::mem::take(&mut self.undo),
             redo: std::mem::take(&mut self.redo),
             undo_dropped: self.undo_dropped,
@@ -897,10 +940,12 @@ impl Open {
         }
     }
 
-    /// Back to the project and undo history set aside in `kept`.
-    fn put_back(&mut self, kept: Kept) {
+    /// Back to the project and undo history set aside in `kept`. An error when
+    /// `translations.toml` could not be put back as it was; the rest is put back all the same.
+    fn put_back(&mut self, kept: Kept) -> Result<(), String> {
         let Kept {
             project,
+            translations,
             undo,
             redo,
             undo_dropped,
@@ -918,6 +963,82 @@ impl Open {
         self.dirty = dirty;
         self.touch();
         self.terminals_before = terminals_before;
+        self.restore_translations(&translations)
+    }
+
+    /// Write `translations.toml` as it was in an undo step (`to`), when it is not what this
+    /// window last read or wrote: the whole file, as the Translations dialog saves it, or
+    /// removed when there was none.
+    fn restore_translations(&mut self, to: &Translations) -> Result<(), String> {
+        if *to == self.translations {
+            return Ok(());
+        }
+        let path = self.dir.join(wc_core::translate::TRANSLATIONS_FILE);
+        match to {
+            Some(text) => {
+                store::write_if_changed(&path, text).map_err(|e| e.to_string())?;
+            }
+            None => match std::fs::remove_file(&path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(format!("{}: {e}", path.display()));
+                }
+                _ => {}
+            },
+        }
+        self.translations.clone_from(to);
+        Ok(())
+    }
+
+    /// Take in a change of `translations.toml` made outside this window (an editor, the
+    /// command line): the file as it is now is what every undo and redo step keeps from here
+    /// on, so no Undo or Redo writes over that change. Translation edits made before it are no
+    /// longer taken back. Returns whether the file had changed.
+    fn adopt_outside_translations(&mut self) -> bool {
+        let Ok(disk) = read_translations(&self.dir) else {
+            return false;
+        };
+        if disk == self.translations {
+            return false;
+        }
+        for step in self.undo.iter_mut().chain(self.redo.iter_mut()) {
+            step.translations.clone_from(&disk);
+        }
+        self.translations = disk;
+        true
+    }
+
+    /// Make a change of `translations.toml` this window made (it is on disk already) one undo
+    /// step: Undo writes the file back as it was before, Redo as it is now. The project is not
+    /// marked as changed by it, since the file is saved. Returns whether the file had changed.
+    pub fn note_translations(&mut self) -> bool {
+        let Ok(disk) = read_translations(&self.dir) else {
+            return false;
+        };
+        if disk == self.translations {
+            return false;
+        }
+        let dirty = self.dirty;
+        self.checkpoint();
+        self.dirty = dirty;
+        self.translations = disk;
+        true
+    }
+
+    /// Run `f`, which may write `translations.toml` in the project folder it is given, and make
+    /// what it changed there one undo step ([`Open::note_translations`]). A change made to the
+    /// file outside this window before `f` is not part of the step.
+    pub fn translations_change<R>(&mut self, f: impl FnOnce(&Path) -> R) -> R {
+        self.adopt_outside_translations();
+        let r = f(&self.dir);
+        self.note_translations();
+        r
+    }
+
+    /// Before a command that may write `translations.toml` runs: a change made to the file
+    /// outside this window is taken in, so [`Open::note_translations`] after the command
+    /// makes an undo step of the command's change alone.
+    pub fn before_translations_command(&mut self) {
+        self.adopt_outside_translations();
     }
 
     /// Take a snapshot before a change, so it can be undone.
@@ -951,7 +1072,10 @@ impl Open {
         // snapshot and this change start from that.
         self.follow_terminals();
         self.terminals_before = Some(self.terminal_numbers());
-        self.undo.push(self.project.clone());
+        self.undo.push(Step {
+            project: self.project.clone(),
+            translations: self.translations.clone(),
+        });
         if self.undo.len() > UNDO_STEPS {
             self.undo.remove(0);
             self.undo_dropped += 1;
@@ -992,7 +1116,7 @@ impl Open {
     /// The project as it was before the latest change, from the undo history: for taking back
     /// only part of that change (in a shared session, the part that waits here).
     pub fn before_last_change(&self) -> Option<&Project> {
-        self.undo.last()
+        self.undo.last().map(|s| &s.project)
     }
 
     /// Forget the latest undo step, once its change was taken back another way.
@@ -1024,12 +1148,14 @@ impl Open {
     }
 
     /// Drop the latest undo and redo steps that `like_now` finds the same as the project now
-    /// (an Undo or Redo of them would change nothing), down to the first that is not.
+    /// (an Undo or Redo of them would change nothing), down to the first that is not. A step
+    /// with other translations than now is never like now.
     pub fn forget_steps_like_now(&mut self, like_now: impl Fn(&Project, &Project) -> bool) {
-        while self.undo.last().is_some_and(|s| like_now(s, &self.project)) {
+        let same = |s: &Step, me: &Self| s.translations == me.translations && like_now(s, &me.project);
+        while self.undo.last().is_some_and(|s| same(s, self)) {
             self.undo.pop();
         }
-        while self.redo.last().is_some_and(|s| like_now(s, &self.project)) {
+        while self.redo.last().is_some_and(|s| same(s, self)) {
             self.redo.pop();
         }
     }
@@ -1081,53 +1207,82 @@ impl Open {
     pub fn undo(&mut self) -> bool {
         // The change being undone is followed first, so redo brings it back whole.
         self.follow_terminals();
-        match self.undo.pop() {
-            Some(prev) => {
-                self.forget_terminal_change();
-                self.redo.push(std::mem::replace(&mut self.project, prev));
-                let left = self.redo.last().map(|p| p.lock.parts.clone()).unwrap_or_default();
-                if let Err(e) = self.sync_vendored(&left) {
-                    // The vendored files could not follow: keep the project as it was.
-                    if let Some(cur) = self.redo.pop() {
-                        let restored = std::mem::replace(&mut self.project, cur);
-                        self.undo_error = Some(e);
-                        self.undo.push(restored);
-                    }
-                    return false;
-                }
-                let sources = self.redo.last().map(|p| &p.meta.libraries) != Some(&self.project.meta.libraries);
-                self.follow_step(sources);
-                self.edited();
-                self.history += 1;
-                true
-            }
-            None => false,
-        }
+        self.step(false)
     }
 
     pub fn redo(&mut self) -> bool {
         self.follow_terminals();
-        match self.redo.pop() {
-            Some(next) => {
-                self.forget_terminal_change();
-                self.undo.push(std::mem::replace(&mut self.project, next));
-                let left = self.undo.last().map(|p| p.lock.parts.clone()).unwrap_or_default();
-                if let Err(e) = self.sync_vendored(&left) {
-                    if let Some(cur) = self.undo.pop() {
-                        let restored = std::mem::replace(&mut self.project, cur);
-                        self.undo_error = Some(e);
-                        self.redo.push(restored);
-                    }
-                    return false;
-                }
-                let sources = self.undo.last().map(|p| &p.meta.libraries) != Some(&self.project.meta.libraries);
-                self.follow_step(sources);
-                self.edited();
-                self.history += 1;
-                true
+        self.step(true)
+    }
+
+    /// One Undo (`redo` false) or Redo step: the project and `translations.toml` change places
+    /// with the latest step of the one list, which goes onto the other.
+    fn step(&mut self, redo: bool) -> bool {
+        // A change made to translations.toml outside this window is never written over: the
+        // step then leaves the translations as they are, and says so.
+        let from = if redo { &self.redo } else { &self.undo };
+        let wanted = from.last().is_some_and(|s| s.translations != self.translations);
+        let left_alone = self.adopt_outside_translations() && wanted;
+        let Some(to) = (if redo { self.redo.pop() } else { self.undo.pop() }) else {
+            return false;
+        };
+        self.forget_terminal_change();
+        let translations = self.translations.clone();
+        // The translations first: when they cannot be written, nothing has changed yet.
+        if let Err(e) = self.restore_translations(&to.translations) {
+            self.undo_error = Some(e);
+            if redo {
+                self.redo.push(to)
+            } else {
+                self.undo.push(to)
             }
-            None => false,
+            return false;
         }
+        let Step {
+            project,
+            translations: to_translations,
+        } = to;
+        let now = Step {
+            project: std::mem::replace(&mut self.project, project),
+            translations,
+        };
+        let left = now.lock.parts.clone();
+        if let Err(e) = self.sync_vendored(&left) {
+            // The vendored files could not follow: keep the project as it was, and its
+            // translations with it.
+            let _ = self.restore_translations(&now.translations);
+            let back = Step {
+                project: std::mem::replace(&mut self.project, now.project),
+                translations: to_translations,
+            };
+            self.undo_error = Some(e);
+            if redo {
+                self.redo.push(back)
+            } else {
+                self.undo.push(back)
+            }
+            return false;
+        }
+        let sources = now.meta.libraries != self.project.meta.libraries;
+        if redo {
+            self.undo.push(now)
+        } else {
+            self.redo.push(now)
+        }
+        self.follow_step(sources);
+        if left_alone {
+            let note = format!(
+                "{} was changed outside this window, so its translations were left as they are",
+                wc_core::translate::TRANSLATIONS_FILE
+            );
+            self.step_warning = Some(match self.step_warning.take() {
+                Some(w) => format!("{w}; {note}"),
+                None => note,
+            });
+        }
+        self.edited();
+        self.history += 1;
+        true
     }
 
     /// After an undo or redo: rebuild the library list when the step added or removed a library
@@ -2611,7 +2766,7 @@ impl Open {
     /// cannot be removed is reported, and is harmless: an unpinned part copy is pinned again
     /// when it is next used.
     pub(crate) fn back_to(&mut self, mark: Mark) -> Result<(), String> {
-        self.put_back(mark.kept);
+        let translations = self.put_back(mark.kept).err();
         self.symbols.retain(|id, _| mark.symbols.contains(id));
         self.parts.retain(|id, _| mark.parts.contains(id));
         let (before, now) = match (mark.files, vendor_names(&self.dir)) {
@@ -2636,13 +2791,15 @@ impl Open {
                 failed.push(format!("{}: {e}", path.display()));
             }
         }
-        if failed.is_empty() {
-            Ok(())
-        } else {
-            Err(format!(
+        if !failed.is_empty() {
+            return Err(format!(
                 "Library files it added could not be removed: {}",
                 failed.join("; ")
-            ))
+            ));
+        }
+        match translations {
+            Some(e) => Err(format!("The translations it changed could not be put back: {e}")),
+            None => Ok(()),
         }
     }
 
@@ -3176,7 +3333,10 @@ impl Open {
         let current = field(&mut now).clone();
         let only_the_form = self.undo_mark() == since + 1
             && self.undo.last().is_some_and(|prev| {
-                let mut p = prev.clone();
+                if prev.translations != self.translations {
+                    return false;
+                }
+                let mut p = prev.project.clone();
                 let mut was = p.meta.clone();
                 let ok = *field(&mut was) == *before;
                 *field(&mut p.meta) = current.clone();
@@ -3198,7 +3358,10 @@ impl Open {
     /// fields (it is a properties form's step, with nothing else in it).
     fn last_step_changed_only_props(&self) -> bool {
         self.undo.last().is_some_and(|prev| {
-            let mut p = prev.clone();
+            if prev.translations != self.translations {
+                return false;
+            }
+            let mut p = prev.project.clone();
             p.meta.name.clone_from(&self.project.meta.name);
             p.meta.title_block.clone_from(&self.project.meta.title_block);
             p == self.project
@@ -6422,6 +6585,196 @@ pub(crate) mod tests {
         let before = o.project.meta.logo.clone();
         assert!(o.set_logo_from(&txt).unwrap_err().contains("PNG or JPEG"));
         assert_eq!(o.project.meta.logo, before);
+    }
+
+    /// The project's `translations.toml` as it is on disk, if there is one.
+    fn translations_file(o: &Open) -> Option<String> {
+        std::fs::read_to_string(o.dir.join(wc_core::translate::TRANSLATIONS_FILE)).ok()
+    }
+
+    /// Set a translation into `nb` the way the assistant's tool does. Returns whether the file
+    /// changed.
+    fn translate(o: &mut Open, text: &str, to: &str) -> bool {
+        o.translations_change(|dir| wc_core::translate::set_translation(dir, text, "nb", to))
+            .unwrap()
+    }
+
+    #[test]
+    fn undo_and_redo_write_translations_toml_back_with_the_project() {
+        let (_tmp, mut o) = project();
+        assert_eq!(translations_file(&o), None);
+        assert!(translate(&mut o, "Control", "Styring"));
+        assert!(!o.dirty, "the file is saved: the project has no unsaved change");
+        let first = translations_file(&o);
+        o.checkpoint();
+        o.project.pages[0].title = "Main".into();
+        assert!(translate(&mut o, "Main", "Hoved"));
+        let second = translations_file(&o);
+        assert_ne!(first, second);
+        assert_eq!(o.undo_steps(), 3);
+        // Setting what is there already is no step.
+        assert!(!translate(&mut o, "Main", "Hoved"));
+        assert_eq!(o.undo_steps(), 3);
+
+        assert!(o.undo(), "{:?}", o.take_undo_error());
+        assert_eq!(translations_file(&o), first);
+        assert_eq!(o.project.pages[0].title, "Main", "the page was not part of that step");
+        assert!(o.undo());
+        assert_ne!(o.project.pages[0].title, "Main");
+        assert_eq!(translations_file(&o), first);
+        assert!(o.undo());
+        assert_eq!(
+            translations_file(&o),
+            None,
+            "there was no file before the first translation"
+        );
+        assert!(!o.can_undo());
+
+        assert!(o.redo() && o.redo() && o.redo());
+        assert_eq!(translations_file(&o), second);
+        assert_eq!(o.project.pages[0].title, "Main");
+        assert_eq!(o.take_step_warning(), None);
+    }
+
+    #[test]
+    fn changes_squashed_into_one_step_take_their_translation_with_them() {
+        let (_tmp, mut o) = project();
+        let mark = o.undo_mark();
+        o.checkpoint();
+        o.project.pages[0].title = "Main".into();
+        assert!(translate(&mut o, "Main", "Hoved"));
+        o.checkpoint();
+        o.project.pages[1].title = "Pumps".into();
+        o.squash_undo(mark);
+        let (after, translated) = (o.project.clone(), translations_file(&o));
+        assert_eq!(o.undo_steps(), 1);
+        assert!(o.undo());
+        assert_eq!(translations_file(&o), None);
+        assert_eq!(o.project.pages[1].title, "Control");
+        assert!(o.redo());
+        assert_eq!(o.project, after);
+        assert_eq!(translations_file(&o), translated);
+    }
+
+    #[test]
+    fn what_the_translations_dialog_saves_is_one_undo_step() {
+        let (_tmp, mut o) = project();
+        // Written by another program while the project is open: not part of any step.
+        let was = "source = \"en\"\n\n[[text]]\nen = \"Control\"\nnb = \"Styring\"\n";
+        std::fs::write(o.dir.join(wc_core::translate::TRANSLATIONS_FILE), was).unwrap();
+        let mut form = crate::translations_form::Form::open(&o.dir, &o.project).unwrap();
+        form.new_lang = "de".into();
+        form.add_language().unwrap();
+        for row in &mut form.rows {
+            if row.text == "Control" {
+                row.cells = vec!["Kontroll".into(), "Steuerung".into()];
+            }
+        }
+        let said = o.translations_change(|_| form.save()).unwrap();
+        assert!(said.starts_with("Saved 2 translations"), "{said}");
+        assert_eq!(o.undo_steps(), 1, "both cells are one step");
+        let saved = translations_file(&o);
+        assert!(o.undo());
+        assert_eq!(translations_file(&o).as_deref(), Some(was));
+        assert!(!o.can_undo());
+        assert!(o.redo());
+        assert_eq!(translations_file(&o), saved);
+        // A dialog closed with nothing changed makes no step.
+        let form = crate::translations_form::Form::open(&o.dir, &o.project).unwrap();
+        o.translations_change(|_| form.save()).unwrap();
+        assert_eq!(o.undo_steps(), 1);
+    }
+
+    #[test]
+    fn undo_never_writes_over_translations_changed_outside_the_window() {
+        let (_tmp, mut o) = project();
+        assert!(translate(&mut o, "Control", "Styring"));
+        o.checkpoint();
+        o.project.pages[0].title = "Main".into();
+        let outside = "source = \"en\"\n\n[[text]]\nen = \"Control\"\nnb = \"Kontroll\"\n";
+        std::fs::write(o.dir.join(wc_core::translate::TRANSLATIONS_FILE), outside).unwrap();
+        // The page change had no translation in it: nothing to say.
+        assert!(o.undo());
+        assert_ne!(o.project.pages[0].title, "Main");
+        assert_eq!(translations_file(&o).as_deref(), Some(outside));
+        assert_eq!(o.take_step_warning(), None);
+        // The step that set the translation would have removed the file.
+        assert!(o.redo() && o.undo() && o.undo());
+        assert_eq!(translations_file(&o).as_deref(), Some(outside));
+        assert!(o.redo() && o.redo());
+        assert_eq!(translations_file(&o).as_deref(), Some(outside));
+        assert_eq!(o.project.pages[0].title, "Main");
+    }
+
+    #[test]
+    fn undo_says_when_it_left_translations_changed_outside_alone() {
+        let (_tmp, mut o) = project();
+        assert!(translate(&mut o, "Control", "Styring"));
+        let outside = "source = \"en\"\n";
+        std::fs::write(o.dir.join(wc_core::translate::TRANSLATIONS_FILE), outside).unwrap();
+        assert!(o.undo());
+        assert_eq!(translations_file(&o).as_deref(), Some(outside));
+        let warning = o.take_step_warning().unwrap_or_default();
+        assert!(warning.contains("changed outside this window"), "{warning}");
+    }
+
+    #[test]
+    fn a_change_taken_back_as_a_whole_puts_the_translations_back() {
+        let (_tmp, mut o) = project();
+        assert!(translate(&mut o, "Control", "Styring"));
+        let was = translations_file(&o);
+        let mark = o.mark();
+        o.checkpoint();
+        o.project.pages[0].title = "Main".into();
+        assert!(translate(&mut o, "Main", "Hoved"));
+        o.back_to(mark).unwrap();
+        assert_eq!(translations_file(&o), was);
+        assert_eq!(o.undo_steps(), 1);
+        // A change that stays keeps its translation step after the earlier ones.
+        let mark = o.mark();
+        assert!(translate(&mut o, "Control", "Kontroll"));
+        o.keep(mark);
+        assert_eq!(o.undo_steps(), 2);
+        assert!(o.undo());
+        assert_eq!(translations_file(&o), was);
+        assert!(o.undo());
+        assert_eq!(translations_file(&o), None);
+    }
+
+    #[test]
+    fn a_step_that_only_changed_a_translation_is_not_dropped_as_one_that_changes_nothing() {
+        let (_tmp, mut o) = project();
+        assert!(translate(&mut o, "Control", "Styring"));
+        o.forget_steps_like_now(|a, b| a == b);
+        o.renumber_in_history("p0002", "7", "8");
+        assert_eq!(o.undo_steps(), 1);
+        assert!(o.undo());
+        o.forget_steps_like_now(|a, b| a == b);
+        o.renumber_in_history("p0002", "7", "8");
+        assert!(o.can_redo());
+        assert!(o.redo());
+        assert!(translations_file(&o).is_some());
+    }
+
+    #[test]
+    fn an_undo_that_cannot_write_the_translations_changes_nothing() {
+        let (_tmp, mut o) = project();
+        assert!(translate(&mut o, "Control", "Styring"));
+        o.checkpoint();
+        o.project.pages[0].title = "Main".into();
+        assert!(translate(&mut o, "Main", "Hoved"));
+        let (project, translated) = (o.project.clone(), translations_file(&o));
+        // A folder where the staging file goes: the write fails.
+        let staging = o.dir.join(format!("{}.tmp", wc_core::translate::TRANSLATIONS_FILE));
+        std::fs::create_dir(&staging).unwrap();
+        assert!(!o.undo());
+        assert!(o.take_undo_error().is_some());
+        assert_eq!(o.project, project);
+        assert_eq!(translations_file(&o), translated);
+        assert_eq!(o.undo_steps(), 3);
+        std::fs::remove_dir(&staging).unwrap();
+        assert!(o.undo(), "{:?}", o.take_undo_error());
+        assert_ne!(translations_file(&o), translated);
     }
 
     #[test]

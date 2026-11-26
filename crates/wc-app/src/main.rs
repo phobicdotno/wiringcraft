@@ -2111,7 +2111,12 @@ impl App {
                     ui.separator();
                     ui.horizontal(|ui| {
                         if ui.button("OK").clicked() {
-                            match form.save() {
+                            // What the dialog saves is one undo step (#589).
+                            let saved = match self.open.as_mut() {
+                                Some(open) if form.is_for(&open.dir) => open.translations_change(|_| form.save()),
+                                _ => form.save(),
+                            };
+                            match saved {
                                 Ok(m) => {
                                     then = Some(Box::new(move |app: &mut App| app.ed.message = m));
                                     keep = false;
