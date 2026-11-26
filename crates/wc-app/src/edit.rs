@@ -795,6 +795,19 @@ impl Open {
         Ok(index)
     }
 
+    /// Take item `item` (a device, DIN rail or wire duct) off panel layout `panel`, in one undo
+    /// step. Returns false, with no undo step, when there is no such item.
+    pub fn delete_panel_item(&mut self, panel: usize, item: usize) -> bool {
+        if self.project.panels.get(panel).is_none_or(|p| item >= p.items.len()) {
+            return false;
+        }
+        self.checkpoint();
+        if let Some(p) = self.project.panels.get_mut(panel) {
+            p.items.remove(item);
+        }
+        true
+    }
+
     /// Mirror the selected symbols left to right, in one undo step.
     pub fn mirror_many(&mut self, page: usize, sel: &[Selection]) {
         self.change_symbols(page, sel, |s| s.mirror = !s.mirror);
@@ -1755,5 +1768,35 @@ mod tests {
         assert!(o.project.pages[page].symbols.is_empty() && o.project.pages[page].wires.is_empty());
         assert!(o.undo());
         assert_eq!(o.project.pages[page].symbols.len(), 2);
+    }
+
+    #[test]
+    fn a_rail_or_duct_is_taken_off_a_panel_in_one_undo_step() {
+        use wc_core::panel::{Panel, PanelItem};
+        let (_tmp, mut o) = project();
+        let mut panel = Panel::new("panel1", "Panel 1", 600.0, 800.0);
+        panel.items = vec![
+            PanelItem::Duct {
+                min: Point::new(0.0, 0.0),
+                max: Point::new(600.0, 60.0),
+            },
+            PanelItem::Rail {
+                at: Point::new(20.0, 150.0),
+                length: 560.0,
+            },
+        ];
+        o.project.panels.push(panel);
+        let steps = o.undo_steps();
+        assert!(o.delete_panel_item(0, 1));
+        assert_eq!(o.undo_steps(), steps + 1);
+        assert!(matches!(o.project.panels[0].items[..], [PanelItem::Duct { .. }]));
+        assert!(o.delete_panel_item(0, 0));
+        assert!(o.project.panels[0].items.is_empty());
+        // Nothing left to take: no undo step.
+        assert!(!o.delete_panel_item(0, 0));
+        assert_eq!(o.undo_steps(), steps + 2);
+        assert!(o.undo());
+        assert!(o.undo());
+        assert_eq!(o.project.panels[0].items.len(), 2);
     }
 }

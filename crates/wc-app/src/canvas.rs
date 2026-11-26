@@ -223,6 +223,23 @@ impl Editor {
         }
     }
 
+    /// Show page `page` instead of the page or panel shown now: the panel view closes, and
+    /// the selection is cleared and the view fitted. Nothing changes when `page` is shown
+    /// already; returns whether something did.
+    pub fn show_page(&mut self, page: usize) -> bool {
+        if self.page == page && self.panel.is_none() {
+            return false;
+        }
+        self.page = page;
+        self.panel = None;
+        self.panel_pick = None;
+        self.selection.clear();
+        // A drag still held belonged to the page left behind (as `stop_if_held` drops it).
+        self.drag = None;
+        self.view.fit = true;
+        true
+    }
+
     pub fn select_only(&mut self, s: Selection) {
         self.selection = vec![s];
     }
@@ -2424,6 +2441,24 @@ fn jumper_points(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    #[test]
+    fn showing_another_page_drops_a_drag_still_held() {
+        let from = Point::new(0.0, 0.0);
+        let mut ed = Editor {
+            drag: Some(Drag::Logo {
+                from,
+                start: (from, from),
+                size: false,
+                checkpoint: true,
+            }),
+            ..Editor::default()
+        };
+        assert!(!ed.show_page(0), "the page shown: nothing changes");
+        assert!(ed.drag.is_some());
+        assert!(ed.show_page(1));
+        assert!(ed.drag.is_none(), "the logo drag stays on the page it started on");
+    }
+
     use super::*;
     use crate::state::tests::project;
 
