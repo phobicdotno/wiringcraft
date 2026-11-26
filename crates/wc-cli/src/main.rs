@@ -1002,7 +1002,7 @@ fn no_strip(strip: &DeviceTag, unreadable: &[String]) -> String {
         return format!("no terminal strip {strip}");
     }
     format!(
-        "no terminal strip {strip} (these symbols have no readable vendored copy, and a terminal drawn with one may not count: {}; run `wiringcraft lib lock`)",
+        "no terminal strip {strip} (these symbols have no readable vendored copy, and a terminal drawn with one may not count: {})",
         escape_field(&unreadable.join(", "))
     )
 }
