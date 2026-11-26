@@ -526,6 +526,36 @@ fn wires_on_an_overview_page_are_not_listed_twice() {
 }
 
 #[test]
+fn an_overview_page_keeps_the_net_names_of_schematic_pages() {
+    let (mut p, s, parts) = fixture();
+    let rows = |p: &Project| {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        wire_list(&i).rows
+    };
+    let before = rows(&p);
+    assert!(
+        before.iter().any(|r| r[2].starts_with('N')),
+        "the fixture has a net with a generated name"
+    );
+    // The same schematic again, drawn on a line diagram placed before it.
+    let mut overview = p.pages[0].clone();
+    overview.id = "p0".into();
+    overview.number = "0".into();
+    overview.overview = true;
+    p.pages.insert(0, overview.clone());
+    assert_eq!(rows(&p), before, "an overview page before the schematic");
+    p.pages.remove(0);
+    overview.id = "p9".into();
+    overview.number = "9".into();
+    p.pages.push(overview);
+    assert_eq!(rows(&p), before, "an overview page after the schematic");
+}
+
+#[test]
 fn project_check_finds_the_usual_mistakes() {
     let (mut p, s, parts) = fixture();
     {
