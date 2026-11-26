@@ -26,6 +26,16 @@
 //!   A black box (category 301) has its outline in the child `S89x5`: corners `A1651` and
 //!   `A1652` relative to its point. The symbol's device tag letter is the black box's, else that
 //!   of the device with the most connection points.
+//! - The connection point descriptions of an `O17` are `A186`, separated by `;` in the order of
+//!   its designations. Where it shows a property is a child `S53x5`: the property `A771` (EPLAN's
+//!   property number: 20010 the displayed device tag, 20028 a connection point designation,
+//!   20029 a connection point description, 20011 the function text), its connection point
+//!   `A953` (1 for the first, 0 for none), an offset `A501` in page directions (not turned with
+//!   the symbol's variant), and `A502`, the placement of the same symbol (`<its A1>/<A4>`) the
+//!   offset is from, else the symbol's point. Its child `S54x505` has the text height `A961`,
+//!   the angle `A962` (radians) and the alignment `A966`, as for a text. The symbol's device tag
+//!   goes where the black box, else the device the letter comes from, shows its displayed device
+//!   tag; descriptions are drawn as texts where they are shown, else beside their pin.
 //!
 //! The multi-line representation, variant A, becomes the symbol: its graphics, black box
 //! outlines, and a pin for each connection point. A placement with one connection point is a
@@ -101,7 +111,37 @@ struct Placement {
     number: String,
     /// Black box outline, relative to `at`.
     outline: Option<(Point, Point)>,
+    /// The placement's own id (`A1`), which its property placements' anchors name.
+    id: String,
+    /// Connection point descriptions `A186`, in the order of the designations.
+    descriptions: Vec<String>,
+    /// Where the placement shows its properties (`S53x5`), in the order given.
+    props: Vec<Prop>,
 }
+
+/// Where a placed symbol shows one of its properties (`S53x5`): the property `A771` (EPLAN's
+/// property number), its connection point `A953` (1 for the first; 0 for the symbol or the
+/// point of the property it is anchored to), an offset `A501`, and the property placement of the
+/// same symbol it is relative to (`A502`, `<symbol id>/<index A4>`), else the symbol's point.
+#[derive(Debug, Clone)]
+struct Prop {
+    index: String,
+    property: u32,
+    point: usize,
+    offset: Option<Point>,
+    anchor: Option<String>,
+    height: f64,
+    align: Align,
+    /// Reading direction, degrees counter-clockwise.
+    angle: f64,
+}
+
+/// EPLAN property numbers of the texts a placed symbol shows.
+const DISPLAYED_DEVICE_TAG: u32 = 20010;
+const CONNECTION_POINT_DESIGNATION: u32 = 20028;
+const CONNECTION_POINT_DESCRIPTION: u32 = 20029;
+/// Most property placements followed from one to the next.
+const MAX_ANCHORS: usize = 16;
 
 /// A text being read, in EPLAN coordinates.
 #[derive(Debug, Clone)]
@@ -372,6 +412,11 @@ fn variants(text: &str) -> Result<Vec<Variant>> {
                                 Some(s) => Some(designations(&s)?),
                                 None => None,
                             },
+                            id: attr(e, "A1")?.unwrap_or_default().trim().to_owned(),
+                            descriptions: match attr(e, "A186")? {
+                                Some(s) => designations(&s)?,
+                                None => Vec::new(),
+                            },
                             ..Default::default()
                         };
                         if empty {
@@ -384,6 +429,43 @@ fn variants(text: &str) -> Result<Vec<Variant>> {
                     "S40x1201" if parent == Some("O17") => {
                         if let Some(p) = placement.as_mut() {
                             p.at = attr_point(e, "A762")?;
+                        }
+                    }
+                    "S53x5" if parent == Some("O17") => {
+                        items += 1;
+                        if items > MAX_ITEMS {
+                            return Err(Error::Format(format!("holds more than {MAX_ITEMS} objects")));
+                        }
+                        if let Some(p) = placement.as_mut()
+                            && let Some(property) = attr(e, "A771")?.and_then(|s| s.trim().parse().ok())
+                        {
+                            let anchor = attr(e, "A502")?.and_then(|s| {
+                                let (owner, index) = s.trim().rsplit_once('/')?;
+                                (owner == p.id).then(|| index.to_owned())
+                            });
+                            p.props.push(Prop {
+                                index: attr(e, "A4")?.unwrap_or_default().trim().to_owned(),
+                                property,
+                                point: attr(e, "A953")?.and_then(|s| s.trim().parse().ok()).unwrap_or(0),
+                                offset: attr_point(e, "A501")?,
+                                anchor,
+                                height: TEXT_HEIGHT,
+                                align: Align::Left,
+                                angle: 0.0,
+                            });
+                        }
+                    }
+                    "S54x505" if parent == Some("S53x5") => {
+                        if let Some(prop) = placement.as_mut().and_then(|p| p.props.last_mut()) {
+                            if let Some(h) = attr_number(e, "A961")?.filter(|h| *h > 0.0) {
+                                prop.height = h;
+                            }
+                            if let Some(a) = attr(e, "A966")?.and_then(|s| s.trim().parse::<u32>().ok()) {
+                                prop.align = alignment(a);
+                            }
+                            if let Some(a) = attr_number(e, "A962")?.filter(|a| a.is_finite()) {
+                                prop.angle = a.to_degrees().rem_euclid(360.0);
+                            }
                         }
                     }
                     "S89x5" if parent == Some("O17") => {
@@ -488,6 +570,88 @@ fn turned(d: PinDir, variant: u8) -> PinDir {
         1 => PinDir::Right,
         2 => PinDir::Down,
         _ => PinDir::Left,
+    }
+}
+
+/// Where the property placement `q` of `p` is, in EPLAN coordinates: its offset from the
+/// placement it is anchored to, followed to the symbol's point. `None` when an anchor is missing
+/// or the anchors run on too long (a loop).
+fn prop_at(p: &Placement, q: &Prop) -> Option<Point> {
+    let mut at = Point::default();
+    let mut q = q;
+    for _ in 0..MAX_ANCHORS {
+        at = at + q.offset.unwrap_or_default();
+        match &q.anchor {
+            None => return p.at.map(|base| base + at),
+            Some(index) => q = p.props.iter().find(|r| r.index == *index)?,
+        }
+    }
+    None
+}
+
+/// The property placement showing the description of `p`'s connection point `k` (0 for the
+/// first): one for that point, or one anchored to that point's designation, or for a symbol of
+/// one connection point one for the symbol.
+fn description_prop(p: &Placement, k: usize) -> Option<&Prop> {
+    let single = p.pins.as_ref().is_none_or(|n| n.len() <= 1);
+    let descriptions = || p.props.iter().filter(|q| q.property == CONNECTION_POINT_DESCRIPTION);
+    descriptions()
+        .find(|q| q.point == k + 1)
+        .or_else(|| {
+            descriptions().find(|q| {
+                q.point == 0
+                    && q.anchor.as_ref().is_some_and(|i| {
+                        p.props
+                            .iter()
+                            .any(|r| r.index == *i && r.property == CONNECTION_POINT_DESIGNATION && r.point == k + 1)
+                    })
+            })
+        })
+        .or_else(|| {
+            if single {
+                descriptions().find(|q| q.point <= 1)
+            } else {
+                None
+            }
+        })
+}
+
+/// Draw the connection point descriptions of `p` (`A186`) where the macro shows them, else
+/// beside their pin (`points`, on the page, in the order of the designations). A description of
+/// a point that has neither is counted.
+fn describe(
+    p: &Placement,
+    points: &[Point],
+    page: &dyn Fn(Point) -> Point,
+    graphics: &mut Vec<Shape>,
+    left_out: &mut BTreeMap<String, usize>,
+) {
+    for (k, text) in p.descriptions.iter().enumerate() {
+        if text.is_empty() {
+            continue;
+        }
+        let shown = description_prop(p, k).and_then(|q| prop_at(p, q).map(|at| (q, at)));
+        let shape = match (shown, points.get(k)) {
+            (Some((q, at)), _) => Shape::Text {
+                at: page(at),
+                text: text.clone(),
+                height: q.height,
+                align: q.align,
+                angle: q.angle,
+            },
+            (None, Some(pin)) => Shape::Text {
+                at: *pin + Point::new(1.0, -1.0),
+                text: text.clone(),
+                height: TEXT_HEIGHT,
+                align: Align::Left,
+                angle: 0.0,
+            },
+            (None, None) => {
+                add(left_out, "connection point descriptions of points without a pin", 1);
+                continue;
+            }
+        };
+        graphics.push(shape);
     }
 }
 
@@ -642,6 +806,7 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
                 dir: turned(PinDir::Up, p.variant),
             });
             owners.push((p.letter.clone(), p.number.clone()));
+            describe(p, &[origin], &page, &mut graphics, &mut left_out);
             if p.library != "SPECIAL" {
                 add(&mut left_out, "library graphics of connection points (pins kept)", 1);
             }
@@ -677,14 +842,18 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
         for name in names.iter().take(s.pins.len()) {
             have.insert((p.letter.clone(), p.number.clone(), name.clone()));
         }
+        let mut points = Vec::with_capacity(s.pins.len());
         for (k, pin) in s.pins.iter().enumerate() {
+            let at = origin + pin.at.transform(rotation, mirror);
+            points.push(at);
             pins.push(Pin {
                 name: own(k).unwrap_or_else(|| pin.name.clone()),
-                at: origin + pin.at.transform(rotation, mirror),
+                at,
                 dir: turned(pin.dir, p.variant),
             });
             owners.push((p.letter.clone(), p.number.clone()));
         }
+        describe(p, &points, &page, &mut graphics, &mut left_out);
         drawn_kinds.push(s.role);
         add(
             &mut left_out,
@@ -755,13 +924,32 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
     }
     // The symbol's letter: the black box's, else that of the device owning the most pins (the
     // first seen of equals).
+    let main_device = per_device
+        .values()
+        .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)))
+        .and_then(|(_, k)| owners.get(*k));
+    // The device tag is printed where the macro shows it: at the black box's displayed device
+    // tag, else at that of the device the letter comes from, else at the first one shown.
+    let shown_tag = |p: &Placement| {
+        p.props
+            .iter()
+            .filter(|q| q.property == DISPLAYED_DEVICE_TAG)
+            .find_map(|q| prop_at(p, q))
+    };
+    let main_placements = v.placements.iter().filter(|p| {
+        if box_letter.is_empty() {
+            main_device.is_some_and(|(l, n)| *l == p.letter && *n == p.number)
+        } else {
+            p.kind == BLACK_BOX
+        }
+    });
+    let tag_point = main_placements
+        .filter_map(shown_tag)
+        .chain(v.placements.iter().filter_map(shown_tag))
+        .map(page)
+        .find(|t| t.x.is_finite() && t.y.is_finite());
     let letter = if box_letter.is_empty() {
-        per_device
-            .values()
-            .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)))
-            .and_then(|(_, k)| owners.get(*k))
-            .map(|(l, _)| l.clone())
-            .unwrap_or_default()
+        main_device.map(|(l, _)| l.clone()).unwrap_or_default()
     } else {
         box_letter
     };
@@ -794,7 +982,7 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
             role,
             graphics,
             pins,
-            tag_at: Point::new(min.x, min.y - 2.0),
+            tag_at: tag_point.unwrap_or(Point::new(min.x, min.y - 2.0)),
             description: format!("EPLAN macro {leaf}, multi-line, variant {}", variant_letter(v.id)),
         },
         left_out,
