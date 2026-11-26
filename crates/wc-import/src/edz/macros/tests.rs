@@ -784,3 +784,23 @@ fn a_single_points_shown_description_is_its_first_and_formatting_stays_with_its_
     );
     Ok(())
 }
+
+#[test]
+fn repeated_designations_put_each_description_beside_its_own_pin() -> TestResult {
+    // A coil with its designation repeated gets pins A1 and A1'; neither description is shown
+    // by the macro, so each goes beside its own pin.
+    let xml = SHOWN_TEXTS
+        .replace(
+            r#"A185="A1;A2" A186="Coil;Return""#,
+            r#"A185="A1;A1" A186="First;Second""#,
+        )
+        .replace(
+            r#"A771="20029" A953="0" A502="17/50/2""#,
+            r#"A771="20011" A953="0" A502="17/50/2""#,
+        );
+    let s = read("coil.ema", &xml)?.symbol;
+    let (first, ..) = text_at(&s, "First")?;
+    let (second, ..) = text_at(&s, "Second")?;
+    assert!(first.distance(second) > 1.0, "{first:?} {second:?}");
+    Ok(())
+}

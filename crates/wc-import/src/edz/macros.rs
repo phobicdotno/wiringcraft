@@ -900,15 +900,20 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
             owners.push((p.letter.clone(), p.number.clone()));
         }
         // Each designation's pin: a terminal's in order, another symbol's by name, as the
-        // symbol names its pins from the designations.
+        // symbol names its pins from the designations (blanks numbered, repeats made unique).
         let by_designation: Vec<Option<Point>> = if p.kind == KIND_TERMINAL {
             names.iter().enumerate().map(|(k, _)| points.get(k).copied()).collect()
         } else {
+            let mut unique = UniqueNames::default();
             names
                 .iter()
                 .enumerate()
                 .map(|(k, n)| {
-                    let want = if n.is_empty() { (k + 1).to_string() } else { n.clone() };
+                    let want = unique.unique(if n.trim().is_empty() {
+                        (k + 1).to_string()
+                    } else {
+                        n.trim().to_owned()
+                    });
                     s.pins
                         .iter()
                         .position(|pin| pin.name == want)
