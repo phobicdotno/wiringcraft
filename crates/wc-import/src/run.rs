@@ -111,9 +111,15 @@ macro_rules! err {
 
 /// PLC addresses from a CSV list onto the project's devices (`import plc-csv`).
 pub fn plc_csv(dir: &Path, file: &Path, log: &mut Log) -> Res<()> {
-    let mut p = load(dir)?;
     let bytes = read_file(file)?;
-    let (rows, warnings) = crate::csv::file_rows(&bytes)
+    plc_csv_bytes(dir, &bytes, log)
+}
+
+/// [`plc_csv`] from the file's bytes, read already (a command line reads them before it takes
+/// the project's lock).
+pub fn plc_csv_bytes(dir: &Path, bytes: &[u8], log: &mut Log) -> Res<()> {
+    let mut p = load(dir)?;
+    let (rows, warnings) = crate::csv::file_rows(bytes)
         .and_then(|rows| crate::csv::plc_addresses_from_rows(&rows))
         .map_err(e)?;
     for w in warnings {
@@ -175,8 +181,31 @@ pub fn parts_csv(file: &Path, lib: &Path, log: &mut Log) -> Res<()> {
     Ok(())
 }
 
+/// The highest number an import may give its first new page: far above any real page number,
+/// and low enough that numbering the pages after it never runs past the largest number.
+pub const MAX_FIRST_PAGE: usize = 1_000_000_000;
+
+/// Refuse a first page number above [`MAX_FIRST_PAGE`], before anything is read or written.
+fn first_page_in_range(first_page: usize) -> Res<()> {
+    if first_page > MAX_FIRST_PAGE {
+        return Err(format!(
+            "the first page number {first_page} is too large: {MAX_FIRST_PAGE} at most"
+        ));
+    }
+    Ok(())
+}
+
+/// The page number `by` after `number`, or why there is none: an archive counts its entries'
+/// pages on from the first page number, past [`MAX_FIRST_PAGE`] when it starts near it.
+fn page_after(number: usize, by: usize) -> Res<usize> {
+    number
+        .checked_add(by)
+        .ok_or_else(|| format!("the page numbers after {number} run past the largest number"))
+}
+
 /// PDF pages as trace pages numbered from `first_page` (`import pdf`).
 pub fn pdf(dir: &Path, file: &Path, first_page: usize, log: &mut Log) -> Res<()> {
+    first_page_in_range(first_page)?;
     let source = file
         .file_name()
         .map(|n| escape_field(&n.to_string_lossy()))
@@ -187,6 +216,7 @@ pub fn pdf(dir: &Path, file: &Path, first_page: usize, log: &mut Log) -> Res<()>
 
 /// An Eplan Electric P8 project (.elk, .edb folder or zip) into the project (`import eplan`).
 pub fn eplan(dir: &Path, path: &Path, first_page: usize, log: &mut Log) -> Res<()> {
+    first_page_in_range(first_page)?;
     let mut p = load(dir)?;
     let (tables, read_warnings) = eplan_tables(path)?;
     for w in &read_warnings {
@@ -234,6 +264,9 @@ pub fn swe(
     log: &mut Log,
 ) -> Res<()> {
     let project = pick;
+    if let Some(n) = first_page {
+        first_page_in_range(n)?;
+    }
     let started = std::time::Instant::now();
     let mut p = load(dir)?;
     // A database file directly, or an archive read from disk: only the picked project's
@@ -386,6 +419,13 @@ pub fn swe_library(dir: &Path, path: &Path, lib: Option<&Path>, log: &mut Log) -
 
 /// AutomationML devices and connections as overview pages (`import aml`).
 pub fn aml(dir: &Path, file: &Path, first_page: usize, log: &mut Log) -> Res<()> {
+    first_page_in_range(first_page)?;
+    import_aml(dir, file, first_page, log)
+}
+
+/// [`aml`] without the limit on the first page number: an archive's later entries are
+/// numbered on from the earlier ones, which may be past it.
+fn import_aml(dir: &Path, file: &Path, first_page: usize, log: &mut Log) -> Res<()> {
     let mut p = load(dir)?;
     let text = read_file(file)?;
     let imp = crate::aml::parse(&String::from_utf8_lossy(&text)).map_err(e)?;
@@ -413,6 +453,7 @@ pub fn aml(dir: &Path, file: &Path, first_page: usize, log: &mut Log) -> Res<()>
 /// The open-format parts of another tool's project archive (`import archive`).
 pub fn archive(dir: &Path, file: &Path, first_page: usize, lib: Option<&Path>, log: &mut Log) -> Res<()> {
     use crate::archive::Kind;
+    first_page_in_range(first_page)?;
     let bytes = read_file(file)?;
     let entries = crate::archive::open_entries(
         &bytes,
@@ -498,13 +539,14 @@ pub fn archive(dir: &Path, file: &Path, first_page: usize, lib: Option<&Path>, l
             Kind::Pdf => {
                 let n = crate::pdf::pages(&data).map(|p| p.len()).unwrap_or(0);
                 let r = import_pdf(dir, &path, next, &name, log);
-                next += n.max(1);
+                next = page_after(next, n.max(1))?;
                 r
             }
             Kind::Dxf => {
                 let mut p = load(dir)?;
-                let id = format!("dxf-{next}");
-                next += 1;
+                let number = next;
+                let id = format!("dxf-{number}");
+                next = page_after(next, 1)?;
                 // Page files are named by id, and some folders do not tell `DXF-300`
                 // from `dxf-300`.
                 if p.pages.iter().any(|pg| pg.id.eq_ignore_ascii_case(&id)) {
@@ -514,7 +556,7 @@ pub fn archive(dir: &Path, file: &Path, first_page: usize, lib: Option<&Path>, l
                         "page {id} exists; remove it or import with --first-page to number the pages from a free number"
                     ))
                 } else {
-                    p.pages.push(Page::new(id.clone(), (next - 1).to_string(), raw.clone()));
+                    p.pages.push(Page::new(id.clone(), number.to_string(), raw.clone()));
                     p.sort_pages();
                     // A save that fails part way is cleaned up like a failed import.
                     let r = save(dir, &p).and_then(|()| page_dxf(dir, &path, &id, 1.0, log));
@@ -544,8 +586,8 @@ pub fn archive(dir: &Path, file: &Path, first_page: usize, lib: Option<&Path>, l
                 }
             }
             _ => {
-                let r = aml(dir, &path, next, log);
-                next += 10;
+                let r = import_aml(dir, &path, next, log);
+                next = page_after(next, 10)?;
                 r
             }
         };
@@ -727,10 +769,16 @@ pub fn save_imported(dir: &Path, p: &Project) -> Res<()> {
 /// `import pdf`: the pages of `file` as trace pages numbered from `first_page`. `source` names
 /// the PDF in warnings (the file name, or the entry name inside an archive, where `file` is a
 /// staging file), already escaped with [`escape_field`] by the caller.
+///
+/// The limit on a first page number ([`MAX_FIRST_PAGE`]) is the caller's to check, on the
+/// number the user gave: an archive numbers a later entry on from the earlier ones, which may
+/// be past it. Here only a number the pages cannot be counted on from is refused.
 pub fn import_pdf(dir: &Path, file: &Path, first_page: usize, source: &str, log: &mut Log) -> Result<(), String> {
     let mut p = load(dir)?;
     let bytes = read_file(file)?;
     let traced = crate::pdf::pages(&bytes).map_err(e)?;
+    // Checked once, before anything is written: every `first_page + i` below is in range.
+    page_after(first_page, traced.len())?;
     let stem = file
         .file_stem()
         .map(|n| n.to_string_lossy().into_owned())
@@ -1438,9 +1486,19 @@ pub fn add_built(
             page.number
         ));
     }
-    // A new version of a symbol must keep every pin a wire in the project ends on.
+    // A new version of a symbol must keep every pin a wire in the project ends on: one the lock
+    // pins in another version, and one the project only has a copy of (no lock entry), which
+    // the import replaces just the same.
     for symbol in &built.symbols {
-        if p.lock.symbols.get(&symbol.id).is_some_and(|e| e.hash != symbol.hash()) {
+        let replaced = match p.lock.symbols.get(&symbol.id) {
+            Some(entry) => entry.hash != symbol.hash(),
+            None => match store::read_vendored_symbol(dir, &symbol.id) {
+                Ok(have) => have.hash() != symbol.hash(),
+                // A copy that cannot be read is replaced too; no copy at all is nothing replaced.
+                Err(_) => vendored_bytes(dir, ItemKind::Symbol, &symbol.id)?.1.is_some(),
+            },
+        };
+        if replaced {
             let lost = wired_pins_lost(p, symbol);
             if !lost.is_empty() {
                 return Err(format!(
@@ -1767,6 +1825,111 @@ mod tests {
     }
 
     #[test]
+    fn a_first_page_number_too_large_to_count_on_from_is_refused_before_anything_is_read() {
+        let tmp = tmp();
+        let (dir, file) = (tmp.path().join("p"), tmp.path().join("missing"));
+        for first in [MAX_FIRST_PAGE + 1, usize::MAX] {
+            let mut log = Log::default();
+            let said = [
+                pdf(&dir, &file, first, &mut log),
+                eplan(&dir, &file, first, &mut log),
+                swe(&dir, &file, 1, Some(first), None, &mut log),
+                aml(&dir, &file, first, &mut log),
+                archive(&dir, &file, first, None, &mut log),
+            ];
+            for r in said {
+                assert!(matches!(&r, Err(why) if why.contains("is too large")), "{r:?}");
+            }
+        }
+        // The largest allowed gets as far as the project, which is not there.
+        let r = pdf(&dir, &file, MAX_FIRST_PAGE, &mut Log::default());
+        assert!(matches!(&r, Err(why) if !why.contains("is too large")), "{r:?}");
+    }
+
+    /// Two connected devices.
+    const AML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<CAEXFile FileName="t.aml" SchemaVersion="3.0" xmlns="http://www.dke.de/CAEX">
+  <InstanceHierarchy Name="Plant">
+    <InternalElement Name="=PUMP" ID="f1">
+      <InternalElement Name="K1" ID="{e1}">
+        <Attribute Name="ReferenceDesignation"><Value>=PUMP+CAB1-K1</Value></Attribute>
+        <ExternalInterface Name="A1" ID="i1"/>
+      </InternalElement>
+      <InternalElement Name="X1" ID="{e2}">
+        <ExternalInterface Name="1" ID="i3"/>
+      </InternalElement>
+      <InternalLink Name="101" RefPartnerSideA="i1" RefPartnerSideB="i3"/>
+    </InternalElement>
+  </InstanceHierarchy>
+</CAEXFile>"#;
+
+    /// A one-page PDF with one line on it.
+    fn one_page_pdf() -> Vec<u8> {
+        let content = "10 10 m 110 10 l S";
+        let mut b = b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 1190.55 841.89] >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>\nendobj\n".to_vec();
+        b.extend_from_slice(format!("4 0 obj\n<< /Length {} >>\nstream\n{content}", content.len()).as_bytes());
+        b.extend_from_slice(b"\nendstream\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n");
+        b
+    }
+
+    fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut w = zip::ZipWriter::new(&mut buf);
+            for (name, data) in files {
+                let opts = zip::write::SimpleFileOptions::default();
+                assert!(w.start_file(*name, opts).is_ok());
+                assert!(std::io::Write::write_all(&mut w, data).is_ok());
+            }
+            assert!(w.finish().is_ok());
+        }
+        buf.into_inner()
+    }
+
+    #[test]
+    fn an_archive_at_the_largest_first_page_number_imports_every_entry() {
+        let tmp = tmp();
+        let dir = tmp.path().join("p");
+        assert!(store::save(&dir, &Project::new("t")).is_ok());
+        let pdf = one_page_pdf();
+        let file = tmp.path().join("plant.zip");
+        let bytes = zip_of(&[("a.pdf", &pdf), ("b.pdf", &pdf), ("c.aml", AML.as_bytes())]);
+        assert!(std::fs::write(&file, bytes).is_ok());
+        let mut log = Log::default();
+        let r = archive(&dir, &file, MAX_FIRST_PAGE, None, &mut log);
+        assert!(r.is_ok(), "{r:?}");
+        // The entries after the first are numbered past the limit on the first page number.
+        assert_eq!(log.warnings().collect::<Vec<_>>(), Vec::<&str>::new(), "{}", log.text());
+        let p = match load(&dir) {
+            Ok(p) => p,
+            Err(why) => unreachable!("{why}"),
+        };
+        // The AutomationML page takes the number after the two PDF pages.
+        let mut numbers: Vec<&str> = p.pages.iter().map(|pg| pg.number.as_str()).collect();
+        numbers.sort_unstable();
+        let want: Vec<String> = (0..3).map(|i| (MAX_FIRST_PAGE + i).to_string()).collect();
+        assert_eq!(numbers, want, "{}", log.text());
+        assert!(p.page(&format!("pdf-{}", MAX_FIRST_PAGE + 1)).is_some());
+    }
+
+    #[test]
+    fn a_pdf_whose_pages_cannot_be_counted_on_from_the_first_is_refused_before_it_is_written() {
+        let tmp = tmp();
+        let dir = tmp.path().join("p");
+        assert!(store::save(&dir, &Project::new("t")).is_ok());
+        let file = tmp.path().join("a.pdf");
+        assert!(std::fs::write(&file, one_page_pdf()).is_ok());
+        let r = import_pdf(&dir, &file, usize::MAX, "a.pdf", &mut Log::default());
+        assert!(
+            matches!(&r, Err(why) if why.contains("run past the largest number")),
+            "{r:?}"
+        );
+        assert!(matches!(load(&dir), Ok(p) if p.pages.is_empty()));
+        assert_eq!(page_after(MAX_FIRST_PAGE, 10), Ok(MAX_FIRST_PAGE + 10));
+        assert!(page_after(usize::MAX - 1, 2).is_err());
+    }
+
+    #[test]
     fn the_log_keeps_the_order_and_tells_warnings_apart() {
         let mut log = Log::default();
         out!(log, "a {}", 1);
@@ -1890,6 +2053,93 @@ mod tests {
             "the import was not added before the save"
         );
         assert_eq!(files(&dir), before);
+    }
+
+    /// A symbol `id` with the pins `pins`.
+    fn symbol_with_pins(id: &str, pins: &[&str]) -> wc_core::Symbol {
+        wc_core::Symbol {
+            source: String::new(),
+            id: id.into(),
+            name: "Coil".into(),
+            category: String::new(),
+            letter_code: "K".into(),
+            role: Default::default(),
+            graphics: vec![],
+            pins: pins
+                .iter()
+                .zip(0u8..)
+                .map(|(name, k)| wc_core::symbol::Pin {
+                    name: (*name).into(),
+                    at: wc_core::geom::Point::new(0.0, f64::from(k) * 10.0),
+                    dir: Default::default(),
+                })
+                .collect(),
+            tag_at: Default::default(),
+            description: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_vendored_symbol_without_a_lock_entry_keeps_the_pins_wires_use() {
+        let t = tmp();
+        let dir = t.path().join("p");
+        let mut p = Project::new("t");
+        let mut page = wc_core::Page::new("p0001", "1", "Plan");
+        page.symbols.push(wc_core::PlacedSymbol {
+            id: "s1".into(),
+            symbol: "imp.coil".into(),
+            at: wc_core::geom::Point::new(50.0, 50.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: None,
+        });
+        page.wires.push(wc_core::Wire {
+            id: "w1".into(),
+            from: wc_core::Endpoint::Pin {
+                item: "s1".into(),
+                pin: "A2".into(),
+            },
+            to: wc_core::Endpoint::Point {
+                at: wc_core::geom::Point::new(50.0, 90.0),
+            },
+            via: vec![],
+            number: None,
+            potential: None,
+            cable: None,
+            route: Default::default(),
+            spec: Default::default(),
+        });
+        p.pages.push(page);
+        assert!(store::save(&dir, &p).is_ok());
+        // The project's copy has no lock entry: put there by hand, or its pin was lost.
+        assert!(store::write_vendored_symbol(&dir, &symbol_with_pins("imp.coil", &["A1", "A2"])).is_ok());
+        assert_eq!(p.lock.symbols.get("imp.coil"), None);
+        let before = files(&dir);
+
+        // A new version without the wired pin A2 is refused, and nothing is written.
+        let built = |pins: &[&str]| crate::aml::Built {
+            symbols: vec![symbol_with_pins("imp.coil", pins)],
+            ..Default::default()
+        };
+        let mut q = p.clone();
+        let err = match add_built(&dir, &mut q, built(&["A1"]), "import:t", Replace::No) {
+            Err(why) => why,
+            Ok(_) => String::new(),
+        };
+        assert!(err.contains("symbol imp.coil: wires end on pins"), "{err}");
+        assert!(err.contains("page 1 s1:A2"), "{err}");
+        assert_eq!(files(&dir), before);
+        assert_eq!(q, p, "the project was changed by a refused import");
+
+        // One that keeps A2 (and adds a pin) replaces the copy and pins it.
+        let mut q = p.clone();
+        let r = add_built(&dir, &mut q, built(&["A1", "A2", "A3"]), "import:t", Replace::No);
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(
+            store::read_vendored_symbol(&dir, "imp.coil").map(|s| s.pins.len()).ok(),
+            Some(3)
+        );
+        assert!(q.lock.symbols.contains_key("imp.coil"));
     }
 
     #[test]
