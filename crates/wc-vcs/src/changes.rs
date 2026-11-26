@@ -99,12 +99,27 @@ fn parse_page(text: Option<String>) -> Option<Page> {
     text.and_then(|t| serde_json::from_str(&t).ok())
 }
 
-/// One side of a page file: `Ok(None)` when the file is not there, `Err(())` when it is there
-/// but cannot be read as a page.
-fn read_side(text: Option<String>) -> std::result::Result<Option<Page>, ()> {
+/// One side of a page file: `Ok(None)` when the file is not there, `Err` (saying why) when it
+/// is there but cannot be read as a page.
+fn read_side(path: &str, text: Option<String>) -> wc_core::Result<Option<Page>> {
     match text {
         None => Ok(None),
-        Some(t) => serde_json::from_str(&t).map(Some).map_err(|_| ()),
+        Some(t) => serde_json::from_str(&t)
+            .map(Some)
+            .map_err(|source| wc_core::Error::Json {
+                path: path.into(),
+                source,
+            }),
+    }
+}
+
+/// A file in the working folder: `Ok(None)` only when it is not there; any other failure to
+/// read it (no permission, not UTF-8) is an error, since the file still exists.
+fn read_working(path: &std::path::Path) -> wc_core::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(wc_core::Error::io(path, e)),
     }
 }
 
@@ -262,14 +277,15 @@ pub fn changes(git: &Git, from: &str, to: Option<&str>) -> Result<Vec<Change>> {
     for (status, path) in &entries {
         let (status, path) = (status.as_str(), path.as_str());
         let pages = if path.starts_with("pages/") && path.ends_with(".page.json") {
-            let old = git.show(from, path);
+            let old = read_side(path, git.show(from, path));
             let new = match to {
-                Some(t) => git.show(t, path),
-                None => std::fs::read_to_string(git.dir.join(path)).ok(),
+                Some(t) => read_side(path, git.show(t, path)),
+                None => read_working(&git.dir.join(path)).and_then(|text| read_side(path, text)),
             };
             // A side whose file is there but is no page (conflict markers, a hand edit, a
-            // newer format) cannot be compared: the file itself is listed instead.
-            match (read_side(old), read_side(new)) {
+            // newer format, bytes that are not text) cannot be compared: the file itself is
+            // listed instead.
+            match (old, new) {
                 (Ok(old), Ok(new)) => Some((old, new)),
                 _ => None,
             }

@@ -652,3 +652,33 @@ fn a_page_file_that_cannot_be_read_is_listed_as_a_file() -> Result<()> {
     assert_eq!(changes(&git, &broken, None)?, changed);
     Ok(())
 }
+
+#[test]
+fn a_page_file_that_is_not_text_is_changed_not_removed() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    store::create(dir, "Demo")?;
+    let git = Git::new(dir);
+    git.init()?;
+    let base = git.head().ok_or_else(|| wc_core::Error::Invalid("no head".into()))?;
+    let path = dir.join("pages/p0001.page.json");
+
+    // Bytes that are not UTF-8: the file is still there, so it is listed, not removed.
+    std::fs::write(&path, [0xff, 0xfe, b'{', 0x80, b'}']).map_err(|e| wc_core::Error::io(&path, e))?;
+    assert_eq!(
+        changes(&git, &base, None)?,
+        [Change::File {
+            path: "pages/p0001.page.json".into(),
+            status: "changed".into(),
+        }]
+    );
+
+    // Really gone: still reported as a removed page.
+    std::fs::remove_file(&path).map_err(|e| wc_core::Error::io(&path, e))?;
+    let ch = changes(&git, &base, None)?;
+    assert!(
+        matches!(ch.as_slice(), [Change::PageRemoved { page, .. }] if page == "1"),
+        "{ch:?}"
+    );
+    Ok(())
+}
