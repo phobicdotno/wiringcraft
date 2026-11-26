@@ -6410,6 +6410,22 @@ fn a_folder_picked_with_browse_is_kept_exactly_and_a_failure_is_about_the_folder
 }
 
 #[test]
+fn a_browse_failure_in_the_frame_the_folder_was_edited_stays_shown() {
+    let mut form = Form {
+        folder: crate::prefs::FolderField::typed("/old"),
+        ..Form::default()
+    };
+    form.fail(ErrorAbout::Folder, "Old folder error.".into());
+    let mut typed = (form.addr.clone(), form.folder.text.clone());
+    // In one frame: the folder is edited, then Browse cannot open.
+    form.folder.text = "/new".into();
+    form.browse_in_frame(&mut typed, crate::Picked::Failed("No picker.".into()));
+    // The frame's own check afterwards.
+    form.forget_error_unless(&typed.0, &typed.1);
+    assert_eq!(form.error.as_deref(), Some("No picker."));
+}
+
+#[test]
 fn browse_that_picks_the_folder_already_shown_clears_the_folder_error() -> TestResult {
     let mut form = Form::default();
     let picked = std::env::temp_dir().join("Shared copy");

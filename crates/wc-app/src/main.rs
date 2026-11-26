@@ -623,8 +623,20 @@ impl App {
         };
         let (d, links) = open.save_as(d).map_err(|e| format!("Save as failed:\n{e}"))?;
         let mut m = format!("Saved as {}; you are working in the copy now.", d.display());
-        if links > 0 {
-            m.push_str(&format!(" {links} link(s) in the project folder were not copied."));
+        if !links.is_empty() {
+            // Named, so a file the project reaches through a link can be put in the copy by hand.
+            let shown: Vec<String> = links.iter().take(5).map(|l| l.display().to_string()).collect();
+            let more = links.len().saturating_sub(shown.len());
+            m.push_str(&format!(
+                " {} link(s) in the project folder were not copied: {}{}.",
+                links.len(),
+                shown.join(", "),
+                if more > 0 {
+                    format!(" and {more} more")
+                } else {
+                    String::new()
+                }
+            ));
         }
         self.ed.message = m;
         self.prefs.remember(d);
@@ -4214,36 +4226,26 @@ fn export_drawings_to(open: &Open, dir: &Path) -> String {
             );
         }
     }
-    let write = |path: PathBuf, bytes: String| {
-        if own {
-            std::fs::write(path, bytes)
-        } else {
-            use std::io::Write as _;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-                .and_then(|mut f| f.write_all(bytes.as_bytes()))
-        }
-    };
     // In another folder, what a failed export made is taken away again, so it can be retried;
     // a file that was there before is never touched (it was refused above or by create_new).
+    // A file counts as made the moment create_new made it, before anything is written to it.
     let mut made: Vec<PathBuf> = Vec::new();
+    let mut write = |path: PathBuf, bytes: String| {
+        if own {
+            return std::fs::write(path, bytes);
+        }
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
+        made.push(path);
+        f.write_all(bytes.as_bytes())
+    };
     let written = std::fs::create_dir_all(dir).and_then(|()| {
         for (stem, page) in &files {
             for (path, bytes) in [
                 (dir.join(format!("{stem}.svg")), wc_pdf::svg(page)),
                 (dir.join(format!("{stem}.dxf")), wc_pdf::dxf(page)),
             ] {
-                let r = write(path.clone(), bytes);
-                // create_new made the file even when writing it then failed.
-                if !own
-                    && (r.is_ok() || path.exists())
-                    && !matches!(&r, Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists)
-                {
-                    made.push(path);
-                }
-                r?;
+                write(path, bytes)?;
             }
         }
         Ok(())

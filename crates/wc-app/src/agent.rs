@@ -1911,16 +1911,17 @@ impl App {
                 let before = self.dialog.is_some();
                 let waiting = self.pending.is_some();
                 self.run(a);
-                if let Some(m) = self.take_message() {
-                    return Ok(m);
-                }
                 // Only a picker this action asked for: one already waiting is another action's
-                // (and makes this one's refused, which its message says).
+                // (and makes this one's refused, which its message says). Told before any
+                // message, which may be an earlier one still showing.
                 if !waiting && self.pending.is_some() {
                     return Ok(format!(
                         "{} queued a file dialog on the user's screen for them to pick in; it has not been answered yet.",
                         a.info().label
                     ));
+                }
+                if let Some(m) = self.take_message() {
+                    return Ok(m);
                 }
                 if !before && self.dialog.is_some() {
                     return Ok(format!(
@@ -3587,6 +3588,15 @@ mod tests {
             "Check: checking",
             "no counts of the first project"
         );
+    }
+
+    #[test]
+    fn a_queued_picker_is_told_even_with_an_earlier_message_showing() {
+        let (_tmp, mut a) = app(vec![]);
+        a.dialog = Some(Dialog::Message("Exported 3 pages".into()));
+        let r = call(&mut a, "run_action", json!({"action": Action::ExportAml.name()})).unwrap();
+        assert!(r.contains("queued a file dialog"), "{r}");
+        assert!(matches!(a.pending, Some(crate::Pending::Export(crate::Export::Aml))));
     }
 
     #[test]

@@ -2390,6 +2390,16 @@ impl Form {
         }
     }
 
+    /// Browse pressed in a frame whose edits so far are not yet weighed: `before` holds the
+    /// fields as they were at the frame's start. Those edits clear a stale error first, then the
+    /// Browse result is taken, and `before` moves on to the fields as they are now, so a
+    /// failure Browse just reported is not taken for stale by the frame's later check.
+    fn browse_in_frame(&mut self, before: &mut (String, String), picked: crate::Picked) {
+        self.forget_error_unless(&before.0, &before.1);
+        self.browsed(picked);
+        *before = (self.addr.clone(), self.folder.text.clone());
+    }
+
     /// Show an error about one field.
     fn fail(&mut self, about: ErrorAbout, error: String) {
         self.error = Some(error);
@@ -4411,7 +4421,7 @@ impl Share {
                         None => "None found yet. Over a VPN, type the host's address below.".into(),
                     });
                 }
-                let typed = (form.addr.clone(), form.folder.text.clone());
+                let mut typed = (form.addr.clone(), form.folder.text.clone());
                 for s in &form.sessions {
                     let (label, joinable) = session_row(s);
                     // A session on another version cannot be joined, so it cannot be picked either.
@@ -4435,7 +4445,8 @@ impl Share {
                     ui.horizontal(|ui| {
                         ui.text_edit_singleline(&mut form.folder.text);
                         if ui.button("Browse…").clicked() {
-                            form.browsed(crate::pick_folder_for("Keep my copy in", &form.folder));
+                            let picked = crate::pick_folder_for("Keep my copy in", &form.folder);
+                            form.browse_in_frame(&mut typed, picked);
                         }
                     });
                     ui.end_row();
