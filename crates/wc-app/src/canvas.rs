@@ -315,11 +315,10 @@ fn convex(pts: &[Pos2]) -> bool {
 fn triangulate(pts: &[Pos2]) -> Vec<[u32; 3]> {
     let cross = |o: Pos2, a: Pos2, b: Pos2| (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
     // Summed in f64 (each f32 product is exact there), so the winding does not cancel out.
-    let area: f64 = (0..pts.len())
-        .map(|i| {
-            let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
-            f64::from(a.x) * f64::from(b.y) - f64::from(a.y) * f64::from(b.x)
-        })
+    let area: f64 = pts
+        .iter()
+        .zip(pts.iter().cycle().skip(1))
+        .map(|(a, b)| f64::from(a.x) * f64::from(b.y) - f64::from(a.y) * f64::from(b.x))
         .sum();
     let turn = if area >= 0.0 { 1.0 } else { -1.0 };
     let mut idx: Vec<usize> = (0..pts.len()).collect();
