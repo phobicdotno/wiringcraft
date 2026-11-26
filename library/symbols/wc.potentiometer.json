@@ -1,0 +1,133 @@
+{
+  "category": "passive",
+  "description": "Adjustable resistor (setpoint, speed reference); 1 and 3 are the ends, 2 is the wiper.",
+  "graphics": [
+    {
+      "a": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 6.5
+      },
+      "kind": "line"
+    },
+    {
+      "kind": "rect",
+      "max": {
+        "x": 1.8,
+        "y": 13.5
+      },
+      "min": {
+        "x": -1.8,
+        "y": 6.5
+      }
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 13.5
+      },
+      "b": {
+        "x": 0.0,
+        "y": 20.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 1.8,
+        "y": 10.0
+      },
+      "b": {
+        "x": 5.0,
+        "y": 10.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 1.8,
+        "y": 10.0
+      },
+      "b": {
+        "x": 3.3,
+        "y": 9.1
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 1.8,
+        "y": 10.0
+      },
+      "b": {
+        "x": 3.3,
+        "y": 10.9
+      },
+      "kind": "line"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "1"
+    },
+    {
+      "at": {
+        "x": 3.6,
+        "y": 8.6
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "2"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 19.4
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "3"
+    }
+  ],
+  "id": "wc.potentiometer",
+  "letter_code": "R",
+  "name": "Potentiometer",
+  "pins": [
+    {
+      "at": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "1"
+    },
+    {
+      "at": {
+        "x": 5.0,
+        "y": 10.0
+      },
+      "dir": "right",
+      "name": "2"
+    },
+    {
+      "at": {
+        "x": 0.0,
+        "y": 20.0
+      },
+      "dir": "down",
+      "name": "3"
+    }
+  ],
+  "role": "standalone",
+  "tag_at": {
+    "x": -6.0,
+    "y": 10.0
+  }
+}

@@ -2,8 +2,8 @@
 //!
 //! These archives are closed formats. What WiringCraft can do without vendor documentation is
 //! open the container, recognise the open formats inside it (PDF, DXF, AutomationML/XML, CSV,
-//! images) and import those, and identify the closed parts (databases, binary drawings) so the
-//! user knows what is and is not carried over. [`inspect`] gives that report; [`open_entries`]
+//! Excel `.xlsx`, images) and import those, and identify the closed parts (databases, binary
+//! drawings, old `.xls` workbooks) so the user knows what is and is not carried over. [`inspect`] gives that report; [`open_entries`]
 //! extracts the importable entries.
 
 use std::io::{Cursor, Read};
@@ -20,7 +20,10 @@ pub enum Kind {
     KicadSymbols,
     Xml,
     Csv,
+    /// An Excel workbook (`.xlsx`, `.xlsm`).
     Spreadsheet,
+    /// An old binary Excel workbook (`.xls`), which is not read.
+    OldSpreadsheet,
     SqliteDb,
     AccessDb,
     SqlServerData,
@@ -33,7 +36,7 @@ impl Kind {
     pub fn importable(self) -> bool {
         matches!(
             self,
-            Kind::Pdf | Kind::Dxf | Kind::AutomationMl | Kind::Csv | Kind::KicadSymbols
+            Kind::Pdf | Kind::Dxf | Kind::AutomationMl | Kind::Csv | Kind::Spreadsheet | Kind::KicadSymbols
         )
     }
 
@@ -46,7 +49,8 @@ impl Kind {
             Kind::KicadSymbols => "KiCad symbol library (importable into a library)",
             Kind::Xml => "XML (vendor data)",
             Kind::Csv => "CSV list (importable: parts list into a library, or PLC addresses)",
-            Kind::Spreadsheet => "spreadsheet",
+            Kind::Spreadsheet => "Excel list (importable: parts list into a library, or PLC addresses)",
+            Kind::OldSpreadsheet => "old Excel workbook .xls (not read; save it as .xlsx)",
             Kind::SqliteDb => "SQLite database (vendor project data)",
             Kind::AccessDb => "Access database (vendor project data)",
             Kind::SqlServerData => "SQL Server data/backup (vendor project data)",
@@ -100,7 +104,7 @@ pub fn classify(name: &str, head: &[u8]) -> Kind {
     match ext {
         "xml" => Kind::Xml,
         "csv" | "txt" if text.contains(';') || text.contains(',') => Kind::Csv,
-        "xls" => Kind::Spreadsheet,
+        "xls" => Kind::OldSpreadsheet,
         "zip" | "7z" | "rar" => Kind::Archive,
         _ if text.trim_start().starts_with("<?xml") => Kind::Xml,
         _ => Kind::Other,
@@ -228,6 +232,8 @@ mod tests {
                 "lib/quoting",
                 b"(kicad_symbol_lib (symbol \"x\" (property \"Description\" \"reads <CAEXFile>\")))",
             ),
+            ("lists/parts.xlsx", b"PK\x03\x04rest"),
+            ("lists/old.xls", b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"),
         ]);
         let r = inspect(&z)?;
         assert_eq!(r.container, "zip");
@@ -241,6 +247,11 @@ mod tests {
         assert_eq!(kind("unnamed"), Some(Kind::KicadSymbols));
         assert_eq!(kind("quoting"), Some(Kind::KicadSymbols));
         assert!(Kind::KicadSymbols.importable());
+        assert_eq!(kind("parts.xlsx"), Some(Kind::Spreadsheet));
+        assert!(Kind::Spreadsheet.importable());
+        assert_eq!(kind("old.xls"), Some(Kind::OldSpreadsheet));
+        assert!(!Kind::OldSpreadsheet.importable());
+        assert!(Kind::OldSpreadsheet.label().contains(".xlsx"));
         let got = open_entries(&z, &[Kind::Pdf, Kind::Dxf])?;
         assert_eq!(got.len(), 2);
         Ok(())
