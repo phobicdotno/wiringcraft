@@ -2760,6 +2760,15 @@ fn a_declared_node_with_a_blank_tag_keeps_its_box_address_and_station() {
 }
 
 #[test]
+fn page_text_writes_the_rest_of_winansi() {
+    // Euro, curly quotes and ellipsis have WinAnsi codes in the built-in font: no '?'.
+    assert_eq!(writer::pdf_text("€ “x” …"), "<80209378942085>");
+    assert_eq!(writer::pdf_text("„Œœ Šš™’"), "<848C9C208A9A9992>");
+    // An arrow still becomes '>', and a glyph the font lacks '?'.
+    assert_eq!(writer::pdf_text("→Д"), "<3E3F>");
+}
+
+#[test]
 fn bookmarks_and_the_document_title_are_text_strings_not_font_codes() {
     // A reader decodes bookmark titles as PDFDocEncoding or UTF-16: the page font's WinAnsi
     // en dash (0x96) would show as "Œ" there, and Ω could not be written at all (#726).
