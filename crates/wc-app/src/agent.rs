@@ -2663,14 +2663,27 @@ impl App {
                 let mut found = None;
                 if let Some((src, sel)) = which.split_once(':')
                     && let Some(set) = library.iter().find(|set| set.source == src.trim())
-                    && let Ok(rules) = &set.rules
                 {
+                    let rules = match &set.rules {
+                        Ok(rules) => rules,
+                        // `on` can still drop the entry as written, below.
+                        Err(e) if action == "off" => {
+                            return Err(format!(
+                                "The check rules of library {} cannot be read, so {which:?} cannot be turned off: {e}",
+                                set.source
+                            ));
+                        }
+                        Err(_) => &Vec::new(),
+                    };
                     let one = [which.to_owned()];
-                    let hits: Vec<usize> = (1..=rules.len())
-                        .filter(|&n| turned_off(&one, &set.source, n, &rules[n - 1]))
+                    let hits: Vec<(usize, &CheckRule)> = rules
+                        .iter()
+                        .enumerate()
+                        .map(|(k, r)| (k + 1, r))
+                        .filter(|&(n, r)| turned_off(&one, &set.source, n, r))
                         .collect();
                     if hits.len() > 1 {
-                        let list: Vec<String> = hits.iter().map(|n| format!("{}:{n}", set.source)).collect();
+                        let list: Vec<String> = hits.iter().map(|(n, _)| format!("{}:{n}", set.source)).collect();
                         return Err(format!(
                             "{which:?} could be rule {} of library {}: {:?} is a number and a rule's name too, or two rules share it. An entry in rules_off turns off all of them; name the rule another way (list shows each rule's number and name).",
                             list.join(" or "),
@@ -2678,7 +2691,7 @@ impl App {
                             sel.trim()
                         ));
                     }
-                    found = hits.first().map(|&n| (set.source.clone(), n, rules[n - 1].clone()));
+                    found = hits.first().map(|&(n, r)| (set.source.clone(), n, r.clone()));
                 }
                 let mut now = off.clone();
                 match (action, found) {
@@ -5895,6 +5908,15 @@ mod tests {
         assert_eq!(is_off(&mut a), [true, true, false, false]);
         rules(&mut a, "on", "odd:1").unwrap();
         assert_eq!(is_off(&mut a), [false; 4]);
+
+        // A rules file that cannot be read: off says why; on still drops the entry as written.
+        std::fs::write(odd.join("rules.toml"), "[[rule]\n").unwrap();
+        let r = rules(&mut a, "off", "odd:1");
+        assert!(r.as_ref().is_err_and(|e| e.contains("cannot be read")), "{r:?}");
+        assert!(off(&a).is_empty());
+        a.open.as_mut().unwrap().project.meta.rules_off = vec!["odd:1".into()];
+        rules(&mut a, "on", "odd:1").unwrap();
+        assert!(off(&a).is_empty());
     }
 
     #[test]
