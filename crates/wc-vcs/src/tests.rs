@@ -103,6 +103,68 @@ fn symbol_level_changes() -> std::result::Result<(), wc_core::Error> {
 }
 
 #[test]
+fn page_setting_changes_are_reported() -> std::result::Result<(), wc_core::Error> {
+    let mut a = Page::new("p", "3", "X");
+    place(&mut a, "s1", "-K1", 10.0)?;
+    assert!(
+        changes::page_changes(Some(&a), Some(&a.clone())).is_empty(),
+        "same page, no change"
+    );
+    let shown = |b: &Page| -> Vec<String> {
+        changes::page_changes(Some(&a), Some(b))
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    };
+
+    let mut b = a.clone();
+    b.number = "4".into();
+    assert_eq!(shown(&b), ["page 3 renumbered -> 4"]);
+
+    let mut b = a.clone();
+    b.title_block.insert("revision".into(), "B".into());
+    assert_eq!(shown(&b), ["page 3: title block changed"]);
+
+    let mut b = a.clone();
+    b.size = wc_core::project::PageSize::A4;
+    assert_eq!(shown(&b), ["page 3: sheet size changed"]);
+
+    let mut b = a.clone();
+    b.cover = true;
+    b.revision_table = Some(Point::new(10.0, 10.0));
+    assert_eq!(
+        shown(&b),
+        ["page 3: revision table changed", "page 3: cover setting changed"]
+    );
+
+    let mut b = a.clone();
+    b.clouds.push(wc_core::revision::RevisionCloud {
+        min: Point::new(0.0, 0.0),
+        max: Point::new(20.0, 20.0),
+        revision: "B".into(),
+    });
+    assert_eq!(shown(&b), ["page 3: revision clouds changed"]);
+
+    let mut b = a.clone();
+    b.underlay = Some(wc_core::project::Underlay {
+        file: "underlays/p.jpg".into(),
+        min: Point::new(0.0, 0.0),
+        max: Point::new(420.0, 297.0),
+    });
+    assert_eq!(shown(&b), ["page 3: underlay changed"]);
+
+    let mut b = a.clone();
+    b.overview = true;
+    assert_eq!(shown(&b), ["page 3: overview setting changed"]);
+
+    // A difference no check names (here the stored id) is still reported.
+    let mut b = a.clone();
+    b.id = "q".into();
+    assert_eq!(shown(&b), ["page 3: page changed"]);
+    Ok(())
+}
+
+#[test]
 fn revert_refuses_while_another_operation_is_in_progress() -> Result<()> {
     let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
     let dir = tmp.path();

@@ -21,6 +21,16 @@ pub enum Change {
         from: String,
         to: String,
     },
+    /// The page's display number changed (`page` is the new one).
+    PageRenumbered {
+        page: String,
+        from: String,
+    },
+    /// A setting of the page itself changed: `what` names it (sheet size, title block, ...).
+    PageSettingChanged {
+        page: String,
+        what: String,
+    },
     SymbolAdded {
         page: String,
         item: String,
@@ -70,6 +80,8 @@ impl std::fmt::Display for Change {
             Change::PageAdded { page, title } => write!(f, "page {page} added ({title})"),
             Change::PageRemoved { page, title } => write!(f, "page {page} removed ({title})"),
             Change::PageRenamed { page, from, to } => write!(f, "page {page} renamed {from:?} -> {to:?}"),
+            Change::PageRenumbered { page, from } => write!(f, "page {from} renumbered -> {page}"),
+            Change::PageSettingChanged { page, what } => write!(f, "page {page}: {what} changed"),
             Change::SymbolAdded { page, item, what } => write!(f, "page {page}: {what} {item} added"),
             Change::SymbolRemoved { page, item, what } => write!(f, "page {page}: {what} {item} removed"),
             Change::SymbolMoved { page, item, what } => write!(f, "page {page}: {what} {item} moved"),
@@ -108,6 +120,12 @@ pub fn page_changes(old: Option<&Page>, new: Option<&Page>) -> Vec<Change> {
         }),
         (Some(o), Some(n)) => {
             let page = n.number.clone();
+            if o.number != n.number {
+                out.push(Change::PageRenumbered {
+                    page: page.clone(),
+                    from: o.number.clone(),
+                });
+            }
             if o.title != n.title {
                 out.push(Change::PageRenamed {
                     page: page.clone(),
@@ -176,7 +194,31 @@ pub fn page_changes(old: Option<&Page>, new: Option<&Page>) -> Vec<Change> {
                 }
             }
             if o.graphics != n.graphics {
-                out.push(Change::GraphicsChanged { page });
+                out.push(Change::GraphicsChanged { page: page.clone() });
+            }
+            let settings = [
+                ("sheet size", o.size != n.size),
+                ("title block", o.title_block != n.title_block),
+                ("revision clouds", o.clouds != n.clouds),
+                ("revision table", o.revision_table != n.revision_table),
+                ("underlay", o.underlay != n.underlay),
+                ("overview setting", o.overview != n.overview),
+                ("cover setting", o.cover != n.cover),
+            ];
+            for (what, changed) in settings {
+                if changed {
+                    out.push(Change::PageSettingChanged {
+                        page: page.clone(),
+                        what: what.into(),
+                    });
+                }
+            }
+            // Anything else that differs (a part of the page added later) is still a change.
+            if out.is_empty() && o != n {
+                out.push(Change::PageSettingChanged {
+                    page,
+                    what: "page".into(),
+                });
             }
         }
         (None, None) => {}
