@@ -2204,7 +2204,12 @@ impl Open {
                                 ));
                             }
                         }
-                        (None, Some(_)) => {}
+                        (None, Some(_)) => {
+                            warnings.push(format!(
+                                "wire {} on page {} ends on connection point {pin} of {on}, which the box did not have before: it now ends on the new point",
+                                w.id, p.number
+                            ));
+                        }
                     }
                 }
             }

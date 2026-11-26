@@ -1794,7 +1794,12 @@ fn run(cli: Cli) -> Res<()> {
                                     *pin = b.name.clone();
                                 }
                             }
-                            (None, Some(_)) => {}
+                            (None, Some(_)) => {
+                                warnings.push(format!(
+                                    "wire {} on page {} ends on connection point {pin} of {item}, which the box did not have before: it now ends on the new point",
+                                    wire.id, pg.number
+                                ));
+                            }
                         }
                     }
                 }
