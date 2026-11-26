@@ -2893,3 +2893,79 @@ fn project_check_flags_a_wire_on_one_pin_at_both_ends() {
     assert_eq!(found[0].message, "wire 7 starts and ends on =A+C1-K1:13");
     assert_eq!(found[0].item.as_deref(), Some("w5"));
 }
+
+#[test]
+fn check_warns_about_panel_devices_that_overlap_stick_out_or_left_the_project() {
+    use wc_core::panel::Panel;
+    let (mut p, s, parts) = fixture();
+    let tag = |t: &str| {
+        let Ok(tag) = DeviceTag::parse(t) else { unreachable!() };
+        tag
+    };
+    let mut plate = Panel::new("p1", "Main", 400.0, 300.0);
+    let place = |plate: &mut Panel, t: &str, x: f64, y: f64, r: Rotation| {
+        let Ok(()) = plate.place_device(tag(t), Point::new(x, y), (40.0, 80.0), r) else {
+            unreachable!()
+        };
+    };
+    place(&mut plate, "=A+C1-K1", 100.0, 0.0, Rotation::R0);
+    // Turned, -X1.1 covers 80 x 40 from (60, 50): it overlaps -K1 (100..140 x 0..80).
+    place(&mut plate, "-X1.1", 60.0, 50.0, Rotation::R90);
+    // -P1 touches -K1's and -X1.1's right edges: a gap of 0 is no overlap.
+    place(&mut plate, "-P1", 140.0, 0.0, Rotation::R0);
+    // -X2 lies partly off the plate (as a hand-edited file can have it).
+    place(&mut plate, "-X2", 300.0, 200.0, Rotation::R0);
+    if let Some(wc_core::panel::PanelItem::Device { at, .. }) = plate.items.last_mut() {
+        *at = Point::new(380.0, 250.0);
+    }
+    // -K9 is drawn nowhere and has no device entry.
+    place(&mut plate, "-K9", 200.0, 100.0, Rotation::R0);
+    p.panels.push(plate);
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found: Vec<String> = check(&i)
+        .into_iter()
+        .filter(|f| f.message.starts_with("panel "))
+        .map(|f| f.message)
+        .collect();
+    let has = |m: &str| found.iter().any(|f| f == m);
+    assert!(has("panel Main: =A+C1-K1 and -X1.1 overlap"), "{found:?}");
+    assert!(has("panel Main: -X2 sticks out of the plate"), "{found:?}");
+    assert!(
+        has("panel Main: -K9 is on the plate but no longer in the project"),
+        "{found:?}"
+    );
+    assert_eq!(found.len(), 3, "{found:?}");
+}
+
+#[test]
+fn check_keeps_panel_devices_whose_tag_is_only_drawn_as_interruption_points() {
+    use wc_core::panel::Panel;
+    let (mut p, mut s, parts) = fixture();
+    let arrow = sym("arrow", SymbolRole::Interruption, &["1"]);
+    s.insert(arrow.id.clone(), arrow);
+    p.pages[0].symbols.push(place("s9", "arrow", 200.0, Some("-L1")));
+    let Ok(l1) = DeviceTag::parse("-L1") else {
+        unreachable!()
+    };
+    p.devices.entry(l1.clone()).or_default();
+    let mut plate = Panel::new("p1", "Main", 400.0, 300.0);
+    let Ok(()) = plate.place_device(l1, Point::new(10.0, 10.0), (40.0, 80.0), Rotation::R0) else {
+        unreachable!()
+    };
+    p.panels.push(plate);
+    let found: Vec<String> = check(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    })
+    .into_iter()
+    .map(|f| f.message)
+    .collect();
+    assert!(!found.iter().any(|m| m.starts_with("panel ")), "{found:?}");
+    // The tag still only names a connection, so it gets no "has no part" note.
+    assert!(!found.iter().any(|m| m == "-L1 has no part"), "{found:?}");
+}

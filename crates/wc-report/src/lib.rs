@@ -53,6 +53,10 @@ pub struct Table {
     pub group: Option<usize>,
     /// Title-block values a PDF prints above the table ([`ReportLayout::header`]).
     pub header: Vec<String>,
+    /// The built-in column each column shows, by its built-in heading, when a layout
+    /// ([`Table::with_layout`]) reordered or renamed them; empty when the columns are the
+    /// built-in ones.
+    pub sources: Vec<String>,
 }
 
 impl Table {
@@ -61,6 +65,15 @@ impl Table {
             title: title.into(),
             columns: columns.iter().map(|c| (*c).to_owned()).collect(),
             ..Self::default()
+        }
+    }
+
+    /// The position of the built-in column `name` among the shown columns, if shown.
+    pub fn column_of(&self, name: &str) -> Option<usize> {
+        if self.sources.is_empty() {
+            self.columns.iter().position(|c| c == name)
+        } else {
+            self.sources.iter().position(|c| c == name)
         }
     }
 
@@ -139,6 +152,14 @@ impl Table {
                 0
             }
         });
+        let source = |i: usize| {
+            self.sources
+                .get(i)
+                .or_else(|| self.columns.get(i))
+                .cloned()
+                .unwrap_or_default()
+        };
+        let sources: Vec<String> = picked.iter().map(|&(i, _)| source(i)).collect();
         let Table {
             title,
             rows,
@@ -197,6 +218,7 @@ impl Table {
             front,
             group: shown_group,
             header: layout.header.clone(),
+            sources,
         }
     }
 

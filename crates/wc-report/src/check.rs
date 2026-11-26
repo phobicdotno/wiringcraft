@@ -400,6 +400,42 @@ pub fn check_with(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet]) -> V
         }
     }
 
+    // Panel layouts: devices covering each other, sticking out of the plate, or whose tag is
+    // no longer in the project. Outlines that only touch do not overlap. A tag is in the project
+    // when it is drawn on a page or listed in the devices file; unlike `all_tags`, a tag drawn
+    // only as interruption points still counts, so its plate entry is not called stale.
+    let index = p.tag_index();
+    for panel in &p.panels {
+        let warn = |message: String| Finding {
+            severity: Severity::Warning,
+            page_id: None,
+            item: None,
+            message: format!("panel {}: {message}", panel.name),
+        };
+        let eps = 1e-6;
+        let devices: Vec<(&DeviceTag, Point, Point)> = panel
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                wc_core::panel::PanelItem::Device { tag, .. } => it.device_bounds().map(|(min, max)| (tag, min, max)),
+                _ => None,
+            })
+            .collect();
+        for (n, (tag, min, max)) in devices.iter().enumerate() {
+            if !index.contains_key(*tag) && !p.devices.contains_key(*tag) {
+                out.push(warn(format!("{tag} is on the plate but no longer in the project")));
+            }
+            if min.x < -eps || min.y < -eps || max.x > panel.width + eps || max.y > panel.height + eps {
+                out.push(warn(format!("{tag} sticks out of the plate")));
+            }
+            for (other, omin, omax) in &devices[n + 1..] {
+                if min.x < omax.x - eps && omin.x < max.x - eps && min.y < omax.y - eps && omin.y < max.y - eps {
+                    out.push(warn(format!("{tag} and {other} overlap")));
+                }
+            }
+        }
+    }
+
     // Devices without a part.
     for tag in crate::all_tags(i) {
         if p.devices.get(&tag).and_then(|d| d.part.as_ref()).is_none() {
