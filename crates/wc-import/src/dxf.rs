@@ -566,7 +566,7 @@ fn shapes(
             "TEXT" | "MTEXT" | "ATTRIB" => {
                 let raw = e.get(1).unwrap_or("");
                 let text = if e.kind == "MTEXT" {
-                    special_codes(&mtext_plain(raw))
+                    percent_codes(&mtext_plain(raw))
                 } else {
                     special_codes(raw)
                 };
@@ -1771,8 +1771,22 @@ fn mtext_plain(s: &str) -> String {
                 Some('{') => out.push('{'),
                 Some('}') => out.push('}'),
                 Some('U') if chars.peek() == Some(&'+') => {
-                    // `\U+XXXX`: a character by its code; decoded with the rest of the text.
-                    out.push_str("\\U");
+                    // `\U+XXXX`: a character by its code. Decoded here, so an escaped backslash
+                    // before `U+` (`\\U+00C5`) stays as written.
+                    let hex: String = chars.clone().skip(1).take(4).collect();
+                    let code = (hex.len() == 4 && hex.chars().all(|c| c.is_ascii_hexdigit()))
+                        .then(|| u32::from_str_radix(&hex, 16).ok())
+                        .flatten()
+                        .and_then(char::from_u32);
+                    match code {
+                        Some(c) => {
+                            out.push(c);
+                            for _ in 0..5 {
+                                chars.next();
+                            }
+                        }
+                        None => out.push_str("\\U"),
+                    }
                 }
                 Some(_) => {
                     // Formatting code: skip to ';' if it takes an argument.
@@ -1820,15 +1834,19 @@ fn unicode_codes(s: &str) -> String {
     out
 }
 
+/// The text of a TEXT or ATTRIB: its `\U+XXXX` and `%%` codes turned into characters.
+fn special_codes(s: &str) -> String {
+    percent_codes(&unicode_codes(s))
+}
+
 /// The `%%` codes of DXF texts: `%%c` diameter, `%%d` degree, `%%p` plus/minus, `%%%` a percent
 /// sign; `%%u` and `%%o` (underline and overline on/off) are dropped. Anything else is kept.
-fn special_codes(s: &str) -> String {
-    let s = unicode_codes(s);
+fn percent_codes(s: &str) -> String {
     if !s.contains("%%") {
-        return s;
+        return s.to_owned();
     }
     let mut out = String::with_capacity(s.len());
-    let mut rest = s.as_str();
+    let mut rest = s;
     while let Some(at) = rest.find("%%") {
         out.push_str(&rest[..at]);
         let after = &rest[at + 2..];
@@ -1995,7 +2013,7 @@ pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<
                         )
                     })
                     .and_then(|a| a.get(1))
-                    .and_then(|v| DeviceTag::parse(v).ok());
+                    .and_then(|v| DeviceTag::parse(&special_codes(v)).ok());
                 let rotation = Rotation::from_degrees(-(e.f(50).round() as i64)).unwrap_or_default();
                 out.symbols.push(PlacedSymbol {
                     id: String::new(),
@@ -2425,6 +2443,25 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, ["\u{c5}lesund \u{2300}6", "\u{d8}st 20\u{b0}"]);
+        // The form WiringCraft's own DXF export writes reads back as drawn.
+        assert_eq!(special_codes(r"\U+00C5lesund"), "\u{c5}lesund");
+        // In MTEXT an escaped backslash before U+ stays literal; a lone one is a code.
+        assert_eq!(percent_codes(&mtext_plain(r"\\U+00C5")), r"\U+00C5");
+        assert_eq!(percent_codes(&mtext_plain(r"\U+00C5")), "\u{c5}");
+        assert_eq!(percent_codes(&mtext_plain(r"\U+00G1 \U+")), r"\U+00G1 \U+");
+        // A known symbol's TAG attribute is decoded before it is read as a device tag.
+        let blocks = "0\nBLOCK\n2\nWC.COIL\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n0\nENDBLK\n";
+        let ents = "0\nINSERT\n2\nWC.COIL\n10\n50\n20\n100\n66\n1\n0\nATTRIB\n2\nTAG\n1\n-K\\U+00C51\n";
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        let p = page(&dxf(ents, blocks), 1.0, &known)?;
+        assert_eq!(
+            p.symbols
+                .first()
+                .and_then(|s| s.tag.as_ref())
+                .map(|t| t.to_string())
+                .as_deref(),
+            Some("-K\u{c5}1")
+        );
         Ok(())
     }
 
