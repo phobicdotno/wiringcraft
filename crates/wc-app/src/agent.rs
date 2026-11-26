@@ -400,6 +400,17 @@ pub fn specs() -> Vec<Value> {
             &[],
         ),
         tool(
+            "layers",
+            "The editor layers of View > Layers (what the canvas shows: drawings, wire numbers, cross-references, comments, underlay), a setting of this user, not of the project: list them (key, title, shown, locked, lockable), or set one layer shown or hidden and locked or unlocked. A hidden or locked layer's items cannot be picked on the canvas.",
+            json!({
+                "action": {"type": "string", "enum": ["list", "set"]},
+                "layer": {"type": "string", "enum": crate::layers::Layer::ALL.map(crate::layers::Layer::key), "description": "set: the layer's key."},
+                "shown": {"type": "boolean", "description": "set: show (true) or hide (false) the layer."},
+                "locked": {"type": "boolean", "description": "set: lock or unlock the layer (only drawings, cross-references and comments can be locked)."}
+            }),
+            &["action"],
+        ),
+        tool(
             "edit_page_json",
             "Replace a whole page with new content in the page file format (as get_page returns it, without the extra pin and point fields). For bulk edits the other tools cannot do. The page id stays.",
             json!({"page": page_arg(), "content": {"type": "object", "description": "The page: number, title, size, overview (true for a line diagram; leaving it out makes a normal page), cover (true for the cover page; leaving it out keeps the page's current value), title_block (the page's own title-block fields such as revision and date, which win over the project's; leaving it out keeps the page's current ones), symbols, wires, graphics, underlay."}}),
@@ -1076,6 +1087,7 @@ const READ_TOOLS: &[&str] = &[
     "get_devices",
     "select_items",
     "show",
+    "layers",
     "get_template",
     "run_check",
     "get_report",
@@ -1800,6 +1812,7 @@ impl App {
                 self.go_to(page);
                 Ok("Showing the page.".into())
             }
+            "layers" => self.tool_layers(v),
             "edit_page_json" => {
                 let page = self.page_of(v, "page")?;
                 let open = need_open(self.open.as_mut())?;
@@ -2227,6 +2240,55 @@ impl App {
             // In a session, Undo takes back only this person's changes made in it.
             "can_undo": if self.share.active() { self.share.can_undo() } else { open.can_undo() },
         })))
+    }
+
+    /// The `layers` tool: list the editor layers, or show, hide, lock or unlock one, as the
+    /// Layers window does (saved with the user's settings and applied to the canvas at once).
+    fn tool_layers(&mut self, v: &Value) -> Result<String, String> {
+        use crate::layers::Layer;
+        let list = |l: &crate::layers::Layers| -> Value {
+            Layer::ALL
+                .iter()
+                .map(|&x| {
+                    json!({"key": x.key(), "title": x.title(), "shown": l.shown(x), "locked": l.locked(x), "lockable": x.lockable()})
+                })
+                .collect()
+        };
+        match need_s(v, "action")? {
+            "list" => Ok(pretty(&list(&self.prefs.layers))),
+            "set" => {
+                let key = need_s(v, "layer")?;
+                let layer = Layer::ALL
+                    .into_iter()
+                    .find(|l| l.key() == key)
+                    .ok_or_else(|| format!("No layer {key:?}; get the keys with action list."))?;
+                let shown = v.get("shown").and_then(Value::as_bool);
+                let locked = v.get("locked").and_then(Value::as_bool);
+                if shown.is_none() && locked.is_none() {
+                    return Err("Give `shown`, `locked` or both.".into());
+                }
+                if locked == Some(true) && !layer.lockable() {
+                    return Err(format!(
+                        "{} cannot be locked: nothing on it can be picked.",
+                        layer.title()
+                    ));
+                }
+                if let Some(x) = shown {
+                    self.prefs.layers.set_shown(layer, x);
+                }
+                if let Some(x) = locked {
+                    self.prefs.layers.set_locked(layer, x);
+                }
+                // Tests do not write the settings file of whoever runs them.
+                if cfg!(test) {
+                    self.apply_layers();
+                } else {
+                    self.layers_changed();
+                }
+                Ok(pretty(&list(&self.prefs.layers)))
+            }
+            other => Err(format!("No layers action {other:?}.")),
+        }
     }
 
     fn tool_find_symbols(&mut self, v: &Value) -> Result<String, String> {
@@ -9836,6 +9898,59 @@ mod tests {
         let r = call(&mut a, "run_action", json!({"action": Action::Delete.name()}));
         assert!(r.as_ref().is_err_and(|e| e.contains("Ola has this page open")), "{r:?}");
         assert_eq!(page2(&a).graphics.len(), 1, "nothing deleted");
+    }
+
+    #[test]
+    fn the_layers_tool_shows_hides_and_locks_layers_like_the_layers_window() {
+        use crate::layers::Layer;
+        let (_tmp, mut a) = app(vec![]);
+        let listed: Value = serde_json::from_str(&call(&mut a, "layers", json!({"action": "list"})).unwrap()).unwrap();
+        assert_eq!(listed.as_array().map(Vec::len), Some(Layer::ALL.len()));
+        assert!(
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|l| l["shown"] == true && l["locked"] == false)
+        );
+        call(
+            &mut a,
+            "add_graphic",
+            json!({"page": "p0002", "shape": {"kind": "text", "at": {"x": 30, "y": 30}, "text": "Hello"}}),
+        )
+        .unwrap();
+        call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap();
+        // Hiding the drawings drops the selected drawing at once, as the window does.
+        let out = call(
+            &mut a,
+            "layers",
+            json!({"action": "set", "layer": "drawings", "shown": false}),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(out[0]["key"], "drawings");
+        assert_eq!(out[0]["shown"], false);
+        assert!(!a.prefs.layers.shown(Layer::Drawings));
+        assert!(a.ed.selection.is_empty());
+        assert!(!a.ed.layers.shown(Layer::Drawings));
+        call(
+            &mut a,
+            "layers",
+            json!({"action": "set", "layer": "drawings", "shown": true, "locked": true}),
+        )
+        .unwrap();
+        assert!(a.prefs.layers.shown(Layer::Drawings) && a.prefs.layers.locked(Layer::Drawings));
+        // Refused: a layer with nothing to pick, an unknown layer, nothing to change.
+        let before = a.prefs.layers.clone();
+        for bad in [
+            json!({"action": "set", "layer": "underlay", "locked": true}),
+            json!({"action": "set", "layer": "nope", "shown": true}),
+            json!({"action": "set", "layer": "comments"}),
+            json!({"action": "toggle"}),
+        ] {
+            assert!(call(&mut a, "layers", bad.clone()).is_err(), "{bad}");
+        }
+        assert_eq!(a.prefs.layers, before);
     }
 
     #[test]

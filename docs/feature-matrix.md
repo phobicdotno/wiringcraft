@@ -99,7 +99,7 @@ For the other areas, the chapter to read in each help is:
 | Macro placeholders and value sets (one macro, several variants) | yes | partly | partly: `{{name}}` placeholders in a macro's device descriptions, parts, accessories and properties, wire cross-section, colour and type, and drawn texts, filled from a named value set chosen at insert (Insert > Macro, the assistant, `wiringcraft macro place --set`); a project macro's placeholders and value sets are edited in the app (Insert > Macro, Placeholders…), a renamed placeholder renamed in its texts | done (#272, #407) |
 | Auto-connect pins that line up | yes | yes | yes | done (#51) |
 | Scanned drawing as underlay to trace over | partly | partly | yes | done |
-| Layers / show-hide groups | yes | yes (DWG layers) | yes: PDF layers, editor layers (View → Layers) | done: show, hide and lock on the canvas, kept per user |
+| Layers / show-hide groups | yes | yes (DWG layers) | yes: PDF layers, editor layers (View → Layers) | done: show, hide and lock on the canvas (also by the assistant), kept per user |
 
 ## 3. Symbols and library
 
