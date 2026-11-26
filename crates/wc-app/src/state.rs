@@ -4759,6 +4759,7 @@ pub(crate) mod tests {
         static HOOKS: std::cell::RefCell<Vec<(&'static str, Hook)>> = std::cell::RefCell::new(Vec::new());
     }
 
+    #[cfg(unix)]
     fn at(point: &'static str, step: impl FnOnce(&Path) + 'static) {
         HOOKS.with(|h| h.borrow_mut().push((point, Box::new(step))));
     }
