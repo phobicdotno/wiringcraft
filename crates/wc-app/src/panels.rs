@@ -68,6 +68,86 @@ pub struct PanelState {
     /// The form for the selected black box's size and points: the page, item and symbol
     /// version it was read from (another version, after an Undo say, reads it again).
     black_box: Option<((usize, String, String), crate::black_box_tool::BoxEdit)>,
+    /// The file to attach to a part, typed in the panel layout properties because no file
+    /// picker could open.
+    attach_path: Option<AttachPath>,
+}
+
+/// A file attached to a part from the panel layout properties.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Attach {
+    /// The maker's outline drawing (#484).
+    Footprint,
+    /// The maker's 3D model, for its size (#501).
+    Model,
+}
+
+impl Attach {
+    /// The file picker's title.
+    fn title(self) -> &'static str {
+        match self {
+            Attach::Footprint => "Footprint drawing",
+            Attach::Model => "3D model",
+        }
+    }
+
+    /// The files the picker shows: a label and the extensions.
+    fn filter(self) -> (&'static str, &'static [&'static str]) {
+        match self {
+            Attach::Footprint => ("DXF drawings", &["dxf"]),
+            Attach::Model => ("STEP models", &["step", "stp", "STEP", "STP"]),
+        }
+    }
+}
+
+/// Attach footprint drawing or Attach 3D model without a file picker: the file typed, for
+/// which part, and why the picker could not be used (or why the typed path cannot).
+#[derive(Debug, Clone, PartialEq)]
+struct AttachPath {
+    what: Attach,
+    part: String,
+    file: crate::prefs::FolderField,
+    error: Option<String>,
+}
+
+impl AttachPath {
+    /// The typed file when it is one; otherwise the reason is kept to show and nothing is given.
+    fn typed_file(&mut self) -> Option<std::path::PathBuf> {
+        if self.file.is_empty() {
+            self.error = Some("Type the full path of the file.".into());
+            return None;
+        }
+        match self.file.path() {
+            Ok(f) if f.is_file() => Some(f),
+            Ok(f) => {
+                self.error = Some(format!("{} is not a file.", f.display()));
+                None
+            }
+            Err(e) => {
+                self.error = Some(e);
+                None
+            }
+        }
+    }
+}
+
+/// What the file picker's answer means for attaching `what` to `part`: the file to attach, or
+/// the form to type its path in when the picker could not open (or perhaps never showed), with
+/// the reason. Neither on Cancel.
+fn attach_picked(what: Attach, part: &str, picked: crate::Picked) -> (Option<std::path::PathBuf>, Option<AttachPath>) {
+    match picked {
+        crate::Picked::Path(f) => (Some(f), None),
+        crate::Picked::Failed(e) | crate::Picked::Unsure(e) => (
+            None,
+            Some(AttachPath {
+                what,
+                part: part.to_owned(),
+                file: crate::prefs::FolderField::default(),
+                error: Some(format!("{e} Type the file's full path instead.")),
+            }),
+        ),
+        crate::Picked::Cancelled => (None, None),
+    }
 }
 
 impl PanelState {
@@ -1028,7 +1108,7 @@ pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut 
     section(ui, "Properties", None);
     forget_spec_unless_wires(ed, ps);
     if let Some(pi) = ed.panel {
-        panel_properties(ui, open, ed, pi);
+        panel_properties(ui, open, ed, ps, pi);
         return;
     }
     if ed.selection.is_empty()
@@ -1944,13 +2024,14 @@ pub fn status_bar(ui: &mut egui::Ui, open: Option<&Open>, ed: &Editor, live: Opt
 
 /// The properties of the panel layout shown: plate size, the picked device, and the devices
 /// with a part that are not on the plate yet.
-fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, pi: usize) {
+fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut PanelState, pi: usize) {
     use wc_core::panel::{PanelItem, on_door, part_size};
     let t = Theme::of(ui.ctx());
-    // The footprint drawing picked below, attached once the panel is drawn.
-    let mut attach: Option<(String, std::path::PathBuf)> = None;
-    // The STEP model picked below, its size stored once the panel is drawn.
-    let mut model: Option<(String, std::path::PathBuf)> = None;
+    // The footprint drawing or STEP model picked (or typed) below, attached once the panel is
+    // drawn.
+    let mut attach: Option<(Attach, String, std::path::PathBuf)> = None;
+    // The part of the device shown: a path being typed for another part is dropped.
+    let mut shown_part: Option<String> = None;
     let Some(panel) = open.project.panels.get(pi) else {
         return;
     };
@@ -2025,18 +2106,21 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, pi: usi
             } else {
                 "Attach footprint drawing..."
             };
+            // The picker File > Import uses: where none can open, the path is typed below.
+            let ask = |ps: &mut PanelState, what: Attach| {
+                let picked = crate::pick_open(what.title(), &open.dir, what.filter());
+                let (file, typed) = attach_picked(what, &part, picked);
+                ps.attach_path = typed;
+                file.map(|f| (what, part.clone(), f))
+            };
             if ui
                 .button(label)
                 .on_hover_text(
                     "Pick the maker's DXF outline (front view, mm at 1:1); it is stored with the part in its library",
                 )
                 .clicked()
-                && let Some(file) = rfd::FileDialog::new()
-                    .set_title("Footprint drawing")
-                    .add_filter("DXF drawings", &["dxf"])
-                    .pick_file()
             {
-                attach = Some((part.clone(), file));
+                attach = ask(ps, Attach::Footprint);
             }
             // The size of the maker's 3D model, for a part without a width and height (#501).
             let has = open.parts.get(&part).is_some_and(|p| p.model.is_some());
@@ -2051,13 +2135,19 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, pi: usi
                     "Pick the maker's STEP model; its size is stored with the part in its library and sizes the device on the plate when the part has no width and height or footprint",
                 )
                 .clicked()
-                && let Some(file) = rfd::FileDialog::new()
-                    .set_title("3D model")
-                    .add_filter("STEP models", &["step", "stp", "STEP", "STP"])
-                    .pick_file()
             {
-                model = Some((part, file));
+                attach = ask(ps, Attach::Model);
             }
+            if let Some(form) = ps.attach_path.as_mut().filter(|f| f.part == part) {
+                let (done, typed) = attach_path_form(ui, form, &t);
+                if let Some(file) = typed {
+                    attach = Some((form.what, part.clone(), file));
+                }
+                if done {
+                    ps.attach_path = None;
+                }
+            }
+            shown_part = Some(part);
         }
         ui.add_space(6.0);
     } else {
@@ -2088,17 +2178,53 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, pi: usi
         }
         ui.label(RichText::new("Page menu → Arrange devices puts them on the rails.").color(t.faint));
     }
-    if let Some((part, file)) = attach {
-        ed.message = open.attach_footprint(&part, &file).unwrap_or_else(|e| e);
+    if ps
+        .attach_path
+        .as_ref()
+        .is_some_and(|f| shown_part.as_deref() != Some(f.part.as_str()))
+    {
+        ps.attach_path = None;
     }
-    if let Some((part, file)) = model {
-        ed.message = open.attach_model(&part, &file).unwrap_or_else(|e| e);
+    if let Some((what, part, file)) = attach {
+        ed.message = match what {
+            Attach::Footprint => open.attach_footprint(&part, &file),
+            Attach::Model => open.attach_model(&part, &file),
+        }
+        .unwrap_or_else(|e| e);
     }
     if let Some(item) = turn
         && !open.rotate_panel_device(pi, item)
     {
         ed.message = "Turned, the device would not fit on the plate.".into();
     }
+}
+
+/// The form to type the file of an attachment in, shown under the buttons when no file picker
+/// could open: whether it is done with (attached or cancelled), and the file to attach.
+fn attach_path_form(ui: &mut egui::Ui, form: &mut AttachPath, t: &Theme) -> (bool, Option<std::path::PathBuf>) {
+    let (label, extensions) = form.what.filter();
+    ui.add_space(4.0);
+    ui.label(format!(
+        "{} for {} ({label}: .{}), full path:",
+        form.what.title(),
+        form.part,
+        extensions.join(", .")
+    ));
+    let r = ui.add(egui::TextEdit::singleline(&mut form.file.text).desired_width(f32::INFINITY));
+    if let Some(e) = &form.error {
+        ui.label(RichText::new(e.as_str()).color(t.error));
+    }
+    let mut out = (false, None);
+    ui.horizontal(|ui| {
+        let go = ui.button("Attach").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+        if go && let Some(file) = form.typed_file() {
+            out = (true, Some(file));
+        }
+        if ui.button("Cancel").clicked() {
+            out = (true, None);
+        }
+    });
+    out
 }
 
 /// The Properties rows of a drawing without fields of its own: a dimension shows its length
@@ -2121,6 +2247,90 @@ fn drawing_rows(g: &Shape) -> Vec<(&'static str, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_attach_without_a_file_picker_asks_for_a_typed_path() -> Result<(), Box<dyn std::error::Error>> {
+        let why = "The file picker could not open.".to_owned();
+        for (what, picked) in [
+            (Attach::Footprint, crate::Picked::Failed(why.clone())),
+            (Attach::Model, crate::Picked::Unsure(why.clone())),
+        ] {
+            let (file, form) = attach_picked(what, "acme.relay", picked);
+            assert_eq!(file, None);
+            let form = form.ok_or("no form to type the path in")?;
+            assert_eq!((form.what, form.part.as_str()), (what, "acme.relay"));
+            assert!(form.file.is_empty());
+            let said = form.error.as_deref().unwrap_or_default();
+            assert!(
+                said.starts_with(&why) && said.contains("Type the file's full path"),
+                "{said}"
+            );
+        }
+        // A picked file is attached as before, and Cancel does nothing.
+        let picked = std::path::PathBuf::from("outline.dxf");
+        assert_eq!(
+            attach_picked(Attach::Footprint, "acme.relay", crate::Picked::Path(picked.clone())),
+            (Some(picked), None)
+        );
+        assert_eq!(
+            attach_picked(Attach::Model, "acme.relay", crate::Picked::Cancelled),
+            (None, None)
+        );
+
+        // The typed path is taken when it is a file; anything else says why and stays open.
+        let tmp = tempfile::tempdir()?;
+        let (_, form) = attach_picked(Attach::Footprint, "acme.relay", crate::Picked::Failed(why));
+        let mut form = form.ok_or("no form")?;
+        assert_eq!(form.typed_file(), None);
+        assert_eq!(form.error.as_deref(), Some("Type the full path of the file."));
+        form.file.text = tmp.path().join("missing.dxf").display().to_string();
+        assert_eq!(form.typed_file(), None);
+        assert!(
+            form.error.as_deref().is_some_and(|e| e.ends_with("is not a file.")),
+            "{form:?}"
+        );
+        let file = tmp.path().join("outline.dxf");
+        std::fs::write(&file, "0\nEOF\n")?;
+        form.file.text = file.display().to_string();
+        assert_eq!(form.typed_file(), Some(file));
+        Ok(())
+    }
+
+    #[test]
+    fn the_typed_path_form_shows_why_the_picker_could_not_open() -> Result<(), Box<dyn std::error::Error>> {
+        let (_, form) = attach_picked(
+            Attach::Model,
+            "acme.relay",
+            crate::Picked::Failed("The file picker could not open.".into()),
+        );
+        let mut form = form.ok_or("no form")?;
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut answer = (true, None);
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let t = Theme::of(ui.ctx());
+                answer = attach_path_form(ui, &mut form, &t);
+            });
+        });
+        let mut texts = Vec::new();
+        for clipped in out.shapes {
+            if let egui::Shape::Text(t) = clipped.shape {
+                texts.push(t.galley.text().to_owned());
+            }
+        }
+        assert_eq!(answer, (false, None), "nothing was clicked");
+        assert!(texts.iter().any(|t| t.contains("3D model for acme.relay")), "{texts:?}");
+        assert!(
+            texts.iter().any(|t| t.contains("The file picker could not open.")),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "Attach") && texts.iter().any(|t| t == "Cancel"),
+            "{texts:?}"
+        );
+        Ok(())
+    }
 
     /// The texts drawn by one frame of `jumper_controls` for `ids` on page `page`.
     fn jumper_texts(o: &mut Open, page: usize, ids: &[String]) -> Vec<String> {
