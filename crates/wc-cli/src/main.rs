@@ -2143,6 +2143,9 @@ fn run(cli: Cli) -> Res<()> {
         }
         Cmd::Translations { lang, edit } => {
             let lang = lang.ok_or("--lang is needed, such as --lang nb")?;
+            // Only a project folder has a dictionary: a folder without one is refused before
+            // translations.toml is made or changed there.
+            let p = load(dir)?;
             if let Some(edit) = edit {
                 let (text, translation) = match &edit {
                     TranslationsCmd::Set { text, translation } => {
@@ -2165,7 +2168,6 @@ fn run(cli: Cli) -> Res<()> {
                 );
                 return Ok(());
             }
-            let p = load(dir)?;
             let (_, missing) = translated(dir, &p, &lang)?;
             for m in &missing {
                 println!("{}\t{}", escape_field(&m.text), escape_field(&m.used.join(", ")));
@@ -6397,6 +6399,20 @@ mod tests {
         );
         assert!(cli(&dir, &["translations", "set", "Pumps", "x", "--lang", "en"]).is_err());
         assert!(cli(&dir, &["translations", "set", "Pumps", " ", "--lang", "nb"]).is_err());
+
+        // A folder that is not a project is refused, and its translations.toml left alone.
+        let other = tmp.path().join("not-a-project");
+        std::fs::create_dir(&other).unwrap();
+        let file = other.join(wc_core::translate::TRANSLATIONS_FILE);
+        let text = "source = \"en\"\n";
+        std::fs::write(&file, text).unwrap();
+        assert!(cli(&other, &["translations", "set", "Pumps", "Pumper", "--lang", "nb"]).is_err());
+        assert!(cli(&other, &["translations", "remove", "Pumps", "--lang", "nb"]).is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        assert!(cli(&empty, &["translations", "set", "Pumps", "Pumper", "--lang", "nb"]).is_err());
+        assert!(!empty.join(wc_core::translate::TRANSLATIONS_FILE).exists());
     }
 
     #[test]
