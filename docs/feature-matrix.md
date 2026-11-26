@@ -107,9 +107,9 @@ For the other areas, the chapter to read in each help is:
 |---|---|---|---|---|
 | IEC symbol library | yes | yes | yes: own starter library | done |
 | Symbol editor (draw graphics, place and name pins) | yes | yes | yes: draw (lines, rectangles, circles, arcs, polylines that can be closed and filled, text), move (drag or arrow keys) and change shapes, place pins, save to a library folder | done (#105, #159) |
-| Import symbols from DXF / SVG | DXF/DWG | DWG | yes | done |
-| Import symbols from KiCad libraries | no | no | yes: every unit of a multi-unit symbol becomes a symbol of its own, also from a `.kicad_sym` inside a zip | done (#96) |
-| Import QElectroTech elements | no | no | yes: `.elmt` elements become symbols (`wiringcraft import symbol-qet`, Library → Import symbols) | done (#91) |
+| Import symbols from DXF / SVG | DXF/DWG | DWG | yes (SVG limits: see known-gaps) | done |
+| Import symbols from KiCad libraries | no | no | yes: every unit of a multi-unit symbol becomes a symbol of its own, also from a `.kicad_sym` inside a zip; limits: see known-gaps | done (#96) |
+| Import QElectroTech elements | no | no | yes: `.elmt` elements become symbols (`wiringcraft import symbol-qet`, Library → Import symbols); limits: see known-gaps | done (#91) |
 | Library versioned with lockfile and per-item update | no (master data sync) | no (shared database) | yes | done |
 | Library from git or folders | no | no | yes | done |
 
@@ -194,7 +194,7 @@ For the other areas, the chapter to read in each help is:
 
 | Function | EPLAN | SWE | WiringCraft | Triage |
 |---|---|---|---|---|
-| 2D mounting plate with rails and ducts | add-on (Pro Panel) | yes | yes: `panel rail <panel> --at x,y --length L` and `panel duct <panel> --at x,y --length L [--width W] [--vertical]` add one, `--remove N` takes one off, numbered as `panel show` lists them (#817); a panel layout's name and plate width and height are changed in its properties in the app (#894) | done |
+| 2D mounting plate with rails and ducts | add-on (Pro Panel) | yes | yes: `panel rail <panel> --at x,y --length L` and `panel duct <panel> --at x,y --length L [--width W] [--vertical]` add one, `--remove N` takes one off, numbered as `panel show` lists them (#817); in the app's panel view a rail or duct is dragged to move it, kept on the plate, one undo step per drag; changing its length or size is still a CLI or file edit (#813); a panel layout's name and plate width and height are changed in its properties in the app (#894) | done |
 | Place devices onto rails from the schematic | add-on | yes | yes: `panel arrange` (Page menu → Arrange devices in the app), or one device at a time with Place in the panel layout's "Not on the plate yet" list in the app (first DIN rail with room, else a free spot; #928) or with `panel device <panel> <tag> --at x,y [--rotate 90]` (or `--remove`); `panel show` lists each device with its place, size and turn (#507); `panel edit <panel> [--name ...] [--width W] [--height H]` renames a layout or changes its plate size, keeping rails, ducts and devices where they are and refusing a size that would leave any of them sticking out (#734) | done |
 | Maker outline drawings as device footprints | yes (2D macros of the part) | yes (2D footprint) | yes: `import footprint-dxf`, or Attach footprint drawing in the app's panel layout properties, stores a maker DXF with the part; layout pages in the app and the PDF draw it at real size (shrunk to fit a smaller device box), and a part without a `Width` or `Height` takes it from the drawing. A device can be turned in quarter steps (Rotate 90° in its properties, or R on the layout); its box, its drawing and its STEP block turn with it (#485) | done (#312, #485) |
 | 3D model export (STEP) | add-on | yes | yes | done |
