@@ -20,25 +20,21 @@ fn a_closed_stdout_reader_does_not_make_the_program_panic() -> TestResult {
         .status()?;
     assert!(status.success());
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+    // The pipe's reading end is closed before the program starts, like `head` after its
+    // lines, so its first write always finds no reader.
+    let (reader, writer) = std::io::pipe()?;
+    drop(reader);
+    let out = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
         .arg("-C")
         .arg(&dir)
         .args(["translations", "--lang", "nb"])
-        .stdout(Stdio::piped())
+        .stdout(writer)
         .stderr(Stdio::piped())
-        .spawn()?;
-    // Close the reading end before the program prints anything, like `head` after its lines.
-    drop(child.stdout.take());
-    let out = child.wait_with_output()?;
+        .output()?;
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!stderr.contains("panicked"), "{stderr}");
     assert!(!stderr.contains("stopped unexpectedly"), "{stderr}");
-    assert_ne!(out.status.code(), Some(101), "{stderr}");
-    // Ended by the signal, as `cat` would be, or done before the pipe closed.
-    assert!(
-        out.status.signal() == Some(libc::SIGPIPE) || out.status.success(),
-        "{:?}",
-        out.status
-    );
+    // Ended by the signal, as `cat` would be.
+    assert_eq!(out.status.signal(), Some(libc::SIGPIPE), "{:?}: {stderr}", out.status);
     Ok(())
 }
