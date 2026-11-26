@@ -4765,6 +4765,11 @@ fn undo_stopped_box_edit(dir: &Path) -> Res<Option<String>> {
     if !file.metadata().map_err(|x| format!("{shown}: {x}"))?.is_file() {
         return Err(not_a_file());
     }
+    // Tests swap the journal here, as another run finishing and starting could.
+    #[cfg(test)]
+    if let Some(between) = tests::BETWEEN_JOURNAL_OPEN_AND_LOCK.take() {
+        between();
+    }
     match file.try_lock() {
         Ok(()) => {}
         // A run is writing now: its journal is not one left behind.
@@ -5445,6 +5450,8 @@ mod tests {
     thread_local! {
         /// Set by a test to stop `box-edit` after its symbol write, as a kill would.
         pub(super) static STOP_BOX_EDIT_AFTER_SYMBOL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Run by recovery between opening a journal and locking it.
+        pub(super) static BETWEEN_JOURNAL_OPEN_AND_LOCK: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const { std::cell::Cell::new(None) };
     }
 
     /// A stdout whose reader has gone away, as Windows reports it for `| more` that stopped.
@@ -9166,6 +9173,37 @@ mod tests {
         journal.finish(&dir).unwrap();
         assert!(!dir.join(BOX_EDIT_JOURNAL).exists());
         assert_eq!(undo_stopped_box_edit(&dir), Ok(None));
+    }
+
+    /// A journal left behind that is replaced, between recovery opening it and locking it, by
+    /// the journal of a run now writing: the old one, locked but no longer at the path, is not
+    /// replayed, and the new one is left alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_journal_swapped_between_open_and_lock_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, _, before) = box_edit_project(tmp.path());
+        let lock = dir.join(store::LOCK_FILE);
+        // The stopped run's journal would put `library.lock` back to other bytes.
+        let mut stale = before.clone();
+        for (path, bytes) in &mut stale {
+            if *path == lock {
+                *bytes = Some(b"stale".to_vec());
+            }
+        }
+        drop(Journal::begin(&dir, &stale).unwrap());
+        let live: std::rc::Rc<std::cell::RefCell<Option<Journal>>> = std::rc::Rc::default();
+        let (into, journal_dir, now) = (live.clone(), dir.clone(), before.clone());
+        BETWEEN_JOURNAL_OPEN_AND_LOCK.set(Some(Box::new(move || {
+            std::fs::remove_file(journal_dir.join(BOX_EDIT_JOURNAL)).unwrap();
+            *into.borrow_mut() = Some(Journal::begin(&journal_dir, &now).unwrap());
+        })));
+
+        assert_eq!(undo_stopped_box_edit(&dir), Ok(None));
+        assert_eq!(bytes_now(&before), before);
+        assert!(dir.join(BOX_EDIT_JOURNAL).exists());
+        live.take().unwrap().finish(&dir).unwrap();
+        assert!(!dir.join(BOX_EDIT_JOURNAL).exists());
     }
 
     /// A journal that is not whole, or names a file box-edit does not change, is refused, and
