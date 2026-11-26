@@ -382,6 +382,8 @@ pub(crate) struct Mark {
     /// The symbols loaded at the mark, so one the change replaced (a pinned version loaded
     /// over another, say) is put back too.
     symbols: BTreeMap<String, Symbol>,
+    /// The symbol list rows at the mark, put back with the symbols.
+    library: Vec<(String, String)>,
     parts: std::collections::BTreeSet<String>,
     /// The vendored symbol and part files there were, or why that is not known.
     files: Result<std::collections::BTreeSet<(ItemKind, String)>, String>,
@@ -3121,6 +3123,7 @@ impl Open {
         Mark {
             kept,
             symbols: self.symbols.clone(),
+            library: self.library.clone(),
             parts: self.parts.keys().cloned().collect(),
             files: vendor_names(&self.dir),
             edits_from: self.mark_edits.len(),
@@ -3172,22 +3175,32 @@ impl Open {
             // A file still to be written is unsaved work, whatever the history put back says.
             self.edited();
         }
-        // Symbols the change loaded are let go and those it replaced are put back. One put
-        // back that is the version the project pins again (a box edit taken back, say) is
-        // written to its file by the next save, as its file may hold the replaced version.
+        // Symbols the change loaded are let go and those it replaced are put back, with the
+        // symbol list as it was. One put back that is the version the project pins again (a
+        // box edit taken back, say) is written to its file by the next save, as its file may
+        // hold the replaced version: that is unsaved work.
+        let pin = |o: &Self, id: &str| o.project.lock.symbols.get(id).map(|e| e.hash.clone());
         for (id, was) in &mark.symbols {
             let replaced = self.symbols.get(id).is_some_and(|now| now.hash() != was.hash());
-            let pinned = self
-                .project
-                .lock
-                .symbols
-                .get(id)
-                .is_some_and(|pin| pin.hash == was.hash());
-            if replaced && pinned {
+            if replaced && pin(self, id) == Some(was.hash()) {
                 self.stale_symbol_files.insert(id.clone());
+                self.edited();
             }
         }
         self.symbols = mark.symbols;
+        self.library = mark.library;
+        // A file waiting to be written (from a change taken back inside this one, say) is let
+        // go when the loaded symbol is gone or not the version the project pins, so a save
+        // never writes a version the lock does not name.
+        let stale = std::mem::take(&mut self.stale_symbol_files);
+        self.stale_symbol_files = stale
+            .into_iter()
+            .filter(|id| {
+                self.symbols
+                    .get(id)
+                    .is_some_and(|s| pin(self, id).is_none_or(|h| h == s.hash()))
+            })
+            .collect();
         self.parts.retain(|id, _| mark.parts.contains(id));
         let (before, now) = match (mark.files, vendor_names(&self.dir)) {
             (Ok(before), Ok(now)) => (before, now),
@@ -6535,6 +6548,77 @@ pub(crate) mod tests {
         // It is not the pinned version, so its file is left as it is.
         assert!(!o.stale_symbol_files.contains("wc.coil"));
         assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), old);
+    }
+
+    /// A saved project with one black box on page 1: its item and symbol ids.
+    fn saved_box() -> (tempfile::TempDir, Open, String, String) {
+        let (tmp, mut o) = project();
+        let id = o
+            .add_black_box(1, Point::new(40.0, 40.0), Point::new(60.0, 50.0), &box_pin(), None)
+            .unwrap();
+        let symbol_id = format!("box.{}.{id}", o.project.pages[1].id);
+        o.save().unwrap();
+        (tmp, o, id, symbol_id)
+    }
+
+    /// The one point of the box [`saved_box`] places.
+    fn box_pin() -> [wc_core::BoxPin; 1] {
+        [wc_core::BoxPin {
+            name: "IN".into(),
+            side: wc_core::BoxSide::Left,
+            offset: 5.0,
+        }]
+    }
+
+    /// Black box `id` on page 1 made 30 mm wide, its point kept.
+    fn widen_box(o: &mut Open, id: &str) {
+        o.edit_black_box(1, id, (30.0, 10.0), &box_pin(), &BTreeMap::new(), &Default::default())
+            .unwrap();
+    }
+
+    #[test]
+    fn a_refused_box_edit_is_unsaved_work_until_its_file_is_written_back() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let old = o.symbols[&symbol_id].clone();
+        let m = o.mark();
+        widen_box(&mut o, &id);
+        assert_ne!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), old);
+        o.back_to(m).unwrap();
+        assert_eq!(o.symbols[&symbol_id], old);
+        assert!(o.dirty, "the box file still holds the refused edit");
+        o.save().unwrap();
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), old);
+    }
+
+    #[test]
+    fn nested_refused_changes_never_save_a_symbol_version_the_project_does_not_pin() {
+        let (_tmp, o, id, symbol_id) = saved_box();
+        let pinned = o.symbols[&symbol_id].clone();
+        // The box file is changed outside the app: loaded as the file has it.
+        let mut other = pinned.clone();
+        other.name = "Box, changed".into();
+        store::write_vendored_symbol(&o.dir, &other).unwrap();
+        let mut o = Open::load(&o.dir).unwrap();
+        assert_eq!(o.symbols[&symbol_id], other);
+        let listed = o.library.clone();
+        // The pinned copy put back; a change loads it and edits the box in an inner change.
+        store::write_vendored_symbol(&o.dir, &pinned).unwrap();
+        let outer = o.mark();
+        o.ensure_symbol(&symbol_id).unwrap();
+        o.refresh_library();
+        let inner = o.mark();
+        widen_box(&mut o, &id);
+        o.back_to(inner).unwrap();
+        assert!(o.stale_symbol_files.contains(&symbol_id));
+        o.back_to(outer).unwrap();
+        assert_eq!(o.symbols[&symbol_id], other, "the symbol loaded at the mark is back");
+        assert_eq!(o.library, listed, "and so is its list row");
+        o.save().unwrap();
+        assert_ne!(
+            store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(),
+            other,
+            "a version the project does not pin is not written"
+        );
     }
 
     #[test]
