@@ -5208,25 +5208,33 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let spawn = |args: &'static [&'static str]| {
+            let dir = dir.clone();
+            std::thread::spawn(move || cli(&dir, args))
+        };
+        let pause = || std::thread::sleep(std::time::Duration::from_millis(400));
         // Taken before the project is a repository, as `vcs init` takes it.
         let held = project_lock(&dir).unwrap();
         let before = project_lock_path(&dir);
+        // One command starts waiting before .git exists ...
+        let early = spawn(&["page", "add", "p2", "--number", "2"]);
+        pause();
         wc_vcs::Git::new(&dir).init().unwrap();
         assert!(dir.join(".git").exists());
         assert_eq!(project_lock_path(&dir), before, "the same lock file once .git exists");
-        // A command started after .git exists waits for the lock taken before it did.
-        let toml = dir.join(store::PROJECT_FILE);
-        let saved = std::fs::read_to_string(&toml).unwrap();
-        let after = {
-            let dir = dir.clone();
-            std::thread::spawn(move || cli(&dir, &["template", "columns", "14"]))
-        };
-        std::thread::sleep(std::time::Duration::from_millis(400));
-        assert!(!after.is_finished(), "the later command waits");
-        assert_eq!(std::fs::read_to_string(&toml).unwrap(), saved);
+        // ... and another after: both wait for the lock taken before init.
+        let late = spawn(&["page", "add", "p3", "--number", "3"]);
+        pause();
+        assert!(!early.is_finished(), "the earlier command waits");
+        assert!(!late.is_finished(), "the later command waits");
+        assert!(load(&dir).unwrap().page("p2").is_none());
+        assert!(load(&dir).unwrap().page("p3").is_none());
         drop(held);
-        after.join().unwrap().unwrap();
-        assert_ne!(std::fs::read_to_string(&toml).unwrap(), saved);
+        early.join().unwrap().unwrap();
+        late.join().unwrap().unwrap();
+        // One after the other: neither overwrote the other's page.
+        let p = load(&dir).unwrap();
+        assert!(p.page("p2").is_some() && p.page("p3").is_some());
     }
 
     #[test]

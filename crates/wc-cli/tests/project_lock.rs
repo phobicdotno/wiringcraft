@@ -290,3 +290,33 @@ fn a_wago_import_reads_a_named_fifo_before_it_waits_for_the_lock() -> TestResult
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     Ok(())
 }
+
+/// When the lock cannot be listed in git's exclude list the command still runs, under the
+/// lock, and says why the list was left alone.
+#[test]
+fn an_exclude_list_that_cannot_be_updated_is_reported() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .status()?;
+    assert!(status.success());
+    let exclude = dir.join(".git").join("info").join("exclude");
+    if exclude.exists() {
+        std::fs::remove_file(&exclude)?;
+    }
+    // A folder where the list belongs: it can be neither read nor replaced.
+    std::fs::create_dir_all(&exclude)?;
+    let out = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("-C")
+        .arg(&dir)
+        .args(["page", "list"])
+        .output()?;
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("could not leave .wiringcraft.lock out of git"), "{err}");
+    assert!(err.contains("exclude"), "names the list: {err}");
+    assert!(exclude.is_dir(), "left as it was");
+    Ok(())
+}
