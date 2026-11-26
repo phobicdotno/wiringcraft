@@ -967,7 +967,7 @@ fn check_pages(p: &Project, pages: &[String]) -> Res<()> {
     match pages.iter().find(|id| p.page(id).is_none()) {
         None => Ok(()),
         Some(id) => {
-            let ids: Vec<&str> = p.pages.iter().map(|pg| pg.id.as_str()).collect();
+            let ids: Vec<String> = p.pages.iter().map(|pg| escape_field(&pg.id)).collect();
             Err(format!("no page {id:?} (pages: {})", ids.join(", ")))
         }
     }
@@ -5673,6 +5673,11 @@ mod tests {
         // A page that exists still exports.
         cli(&dir, &["pdf", pdf.to_str().unwrap(), "--page", &first]).unwrap();
         assert!(pdf.exists());
+        // The listed ids are escaped, so a control character in one cannot steer the terminal.
+        let mut p = load(&dir).unwrap();
+        p.pages[0].id = "a\u{1b}[2Jb".into();
+        let err = check_pages(&p, &["nope".into()]).unwrap_err();
+        assert!(err.contains("a\\u{1b}[2Jb") && !err.contains('\u{1b}'), "{err}");
     }
 
     #[test]
