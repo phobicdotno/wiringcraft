@@ -2434,3 +2434,17 @@ fn a_declared_node_with_a_blank_tag_keeps_its_box_address_and_station() {
         report.warnings
     );
 }
+
+#[test]
+fn the_reader_title_bar_shows_the_project_name_not_the_file_name() {
+    let (pdf, _) = export(&Project::new("Pump station"), &BTreeMap::new(), &Options::default());
+    let text = String::from_utf8_lossy(&pdf);
+    let Some(catalog) = text.split("endobj").find(|o| o.contains("/Type /Catalog")) else {
+        unreachable!("no catalog in {text}");
+    };
+    assert!(
+        catalog.contains("/ViewerPreferences << /DisplayDocTitle true >>"),
+        "{catalog}"
+    );
+    assert!(text.contains(&format!("/Title {}", writer::pdf_text("Pump station"))));
+}

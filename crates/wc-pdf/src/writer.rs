@@ -244,7 +244,12 @@ impl Doc {
         };
         objs.push((
             1,
-            format!("<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /PageMode /UseOutlines{oc} >>").into_bytes(),
+            // DisplayDocTitle: readers show the project name (the Info /Title), not the file name.
+            format!(
+                "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /PageMode /UseOutlines \
+                 /ViewerPreferences << /DisplayDocTitle true >>{oc} >>"
+            )
+            .into_bytes(),
         ));
         for (k, l) in used.iter().enumerate() {
             objs.push((
