@@ -1940,7 +1940,7 @@ impl App {
                         if ui
                             .add_enabled(!name.trim().is_empty(), egui::Button::new("Save"))
                             .clicked()
-                            && let Some(open) = &self.open
+                            && let Some(open) = &mut self.open
                         {
                             match open.save_macro(clip, name, description) {
                                 Ok(path) => {
