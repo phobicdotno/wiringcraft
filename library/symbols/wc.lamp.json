@@ -1,5 +1,6 @@
 {
   "category": "signalling",
+  "description": "Indicator lamp for visual signals.",
   "graphics": [
     {
       "a": {
