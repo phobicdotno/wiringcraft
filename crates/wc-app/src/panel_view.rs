@@ -459,10 +459,6 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
             PanelItem::Device { .. } => {}
         }
     }
-    // The picked rail's or duct's resize handle.
-    if let Some(h) = ed.panel_pick.and_then(|i| p.items.get(i)).and_then(handle) {
-        painter.rect_filled(Rect::from_center_size(xf.s(h), Vec2::splat(HANDLE)), 1.0, t.selection);
-    }
     for (i, item) in p.items.iter().enumerate() {
         if let PanelItem::Device {
             tag,
@@ -517,6 +513,11 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
                 );
             }
         }
+    }
+    // The picked rail's or duct's resize handle, over the devices: a press
+    // inside it resizes even where a device covers the rail's end.
+    if let Some(h) = ed.panel_pick.and_then(|i| p.items.get(i)).and_then(handle) {
+        painter.rect_filled(Rect::from_center_size(xf.s(h), Vec2::splat(HANDLE)), 1.0, t.selection);
     }
     // The picked item's full tag or kind, size and place, at the bottom of the view.
     let info = ed.panel_pick.and_then(|i| p.items.get(i)).map(|item| match item {
@@ -1343,6 +1344,51 @@ mod tests {
         assert_eq!(
             o.project.panels[0].items[0].bounds(),
             (Point::new(0.0, 300.0), Point::new(500.0, 380.0))
+        );
+    }
+
+    /// The picked rail's handle is painted after the devices, so a device over the rail's
+    /// right end does not hide it (#983).
+    #[test]
+    fn the_resize_handle_is_painted_over_a_device_at_the_rails_end() {
+        let (_tmp, mut o, mut ed) = plate_with_rail_and_duct();
+        o.project.panels[0].items.push(PanelItem::Device {
+            tag: wc_core::DeviceTag::parse("-K1").unwrap_or_default(),
+            at: Point::new(280.0, 55.0),
+            width: 50.0,
+            height: 90.0,
+            rotation: wc_core::geom::Rotation::R0,
+        });
+        ed.panel_pick = Some(1);
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        plate_frame(&ctx, &mut o, &mut ed, Vec::new());
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 600.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| show(ui, &mut o, &mut ed, 0, 5.0, true));
+        });
+        let at = |want: Rect| {
+            out.shapes.iter().position(|c| {
+                matches!(&c.shape, egui::Shape::Rect(r) if (r.rect.min - want.min).length() < 0.01
+                    && (r.rect.max - want.max).length() < 0.01)
+            })
+        };
+        let handle = Rect::from_center_size(on_plate_screen(&ed, Point::new(300.0, 100.0)), Vec2::splat(HANDLE));
+        let device = Rect::from_two_pos(
+            on_plate_screen(&ed, Point::new(280.0, 55.0)),
+            on_plate_screen(&ed, Point::new(330.0, 145.0)),
+        );
+        let (Some(handle), Some(device)) = (at(handle), at(device)) else {
+            unreachable!("the handle and the device are painted")
+        };
+        assert!(
+            handle > device,
+            "the handle ({handle}) comes after the device ({device})"
         );
     }
 
