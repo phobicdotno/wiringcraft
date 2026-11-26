@@ -214,10 +214,13 @@ pub struct EplanProject {
 /// The table files of an `.edb` folder, keyed by lower-case file name (`page.eod`).
 pub type Tables = BTreeMap<String, Vec<u8>>;
 
-/// Read the tables from a zip of an `.edb` folder (any folder depth).
-pub fn tables_from_zip(bytes: &[u8]) -> Result<Tables> {
+/// Read the tables from a zip of an `.edb` folder (any folder depth), with warnings. A table
+/// that is in the zip but cannot be read is an error naming it, not an empty table; an
+/// unreadable `ProjectInfo.xml` (optional title block data) is a warning and left out.
+pub fn tables_from_zip(bytes: &[u8]) -> Result<(Tables, Vec<String>)> {
     let mut z = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| Error::Format(format!("zip: {e}")))?;
     let mut out = Tables::new();
+    let mut warnings = Vec::new();
     for i in 0..z.len() {
         let Ok(mut f) = z.by_index(i) else { continue };
         let name = f.name().rsplit(['/', '\\']).next().unwrap_or("").to_lowercase();
@@ -225,14 +228,24 @@ pub fn tables_from_zip(bytes: &[u8]) -> Result<Tables> {
             continue;
         }
         let mut data = Vec::new();
-        if f.by_ref().take(MAX_TABLE as u64).read_to_end(&mut data).is_ok() {
-            out.insert(name, data);
+        match f.by_ref().take(MAX_TABLE as u64).read_to_end(&mut data) {
+            Ok(_) => {
+                out.insert(name, data);
+            }
+            Err(e) if optional(&name) => warnings.push(format!("{}: {e}; read without it", f.name())),
+            Err(e) => return Err(Error::Format(format!("{}: {e}", f.name()))),
         }
     }
     if out.is_empty() {
         return Err(Error::Format("the zip holds no Eplan project tables (*.eod)".into()));
     }
-    Ok(out)
+    Ok((out, warnings))
+}
+
+/// Whether a wanted file of an `.edb` folder may be left out when it cannot be read: the project
+/// properties only fill title block fields, the tables carry the project itself.
+pub fn optional(lower_name: &str) -> bool {
+    lower_name == "projectinfo.xml"
 }
 
 /// Whether a file of an `.edb` folder is one this importer reads.

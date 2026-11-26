@@ -47,7 +47,7 @@ deleted. The other four:
 | Gap | Todo |
 |---|---|
 | Imports in the app run on the window thread: a large archive freezes the window with no progress shown | #356 |
-| Open, Save As, exports and imports do not all use the system file pickers | #338 (pull requests #344 and #349 open) |
+| File > Import does not offer every CLI import option (SolidWorks project choice, first page and symbol map, EDZ symbol map, DWG scale, an archive's KiCad libraries and parts lists) | #586 |
 | Assistant: `get_report` cannot read the plc-cards and networks reports | #537 |
 | Assistant: `add_graphic` and `update_graphic` cannot make dimensions or filled polylines | #539 |
 | Assistant: the `run_command` tool description leaves out half the command line | #540 |

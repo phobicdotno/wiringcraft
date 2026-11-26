@@ -294,10 +294,16 @@ impl Macro {
         if let Some(p) = self.placeholders.get_mut(i) {
             p.name = new.to_owned();
         }
+        // A set may give the placeholder under several spellings (`KW` and `kw`): all are
+        // renamed into one, keeping the value placing uses, the first in key order.
         for v in &mut self.value_sets {
-            if let Some(k) = v.values.keys().find(|k| key(k) == key(old)).cloned()
-                && let Some(value) = v.values.remove(&k)
-            {
+            let spellings: Vec<String> = v.values.keys().filter(|k| key(k) == key(old)).cloned().collect();
+            let mut kept = None;
+            for k in spellings {
+                let value = v.values.remove(&k);
+                kept = kept.or(value);
+            }
+            if let Some(value) = kept {
                 v.values.insert(new.to_owned(), value);
             }
         }
@@ -777,6 +783,20 @@ mod tests {
         m.check()?;
         assert!(err_of(m.rename_declared("power", "Part")).contains("there already"));
         assert!(err_of(m.rename_declared("volts", "v")).contains("no placeholder volts"));
+
+        // A set giving the placeholder under two spellings keeps the value placing used.
+        let mut twice = starter()?;
+        if let Some(v) = twice.value_sets.get_mut(1) {
+            v.values.insert("kw".into(), "4".into());
+        }
+        twice.check()?;
+        let before = twice.apply(Some("3 kW"), &BTreeMap::new())?;
+        twice.rename_declared("kW", "power")?;
+        twice.check()?;
+        let values = &twice.value_sets[1].values;
+        assert_eq!(values.get("power").map(String::as_str), Some("3"));
+        assert!(!values.keys().any(|k| key(k) == "kw"), "{values:?}");
+        assert_eq!(twice.apply(Some("3 kW"), &BTreeMap::new())?, before);
 
         let tmp = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
         let path = write_macro(tmp.path(), "starter", &m)?;

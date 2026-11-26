@@ -334,6 +334,41 @@ fn a_project_macro_is_shown_and_edited_and_a_library_one_is_not() -> TestResult 
     let big = m.value_set("5.5 kW").ok_or("5.5 kW")?;
     assert_eq!(big.values.len(), 2);
 
+    // A library source named "project" is still a library.
+    let other = tmp.path().join("other");
+    std::fs::create_dir_all(other.join("macros"))?;
+    std::fs::write(other.join("macros/twin.json"), STARTER.replace("Motor starter", "Twin"))?;
+    wiringcraft(
+        &dir,
+        &["lib", "add", "project", "folder", other.to_str().ok_or("path")?],
+    )?;
+    assert!(wiringcraft(&dir, &["macro", "show", "twin"])?.starts_with("Twin (project)\n"));
+    let Err(err) = wiringcraft(&dir, &["macro", "edit", "Twin", "--description", "x"]) else {
+        return Err("a library macro under a source named project was edited".into());
+    };
+    assert!(err.contains("library"), "{err}");
+
+    // A file that cannot be read is named when no macro matches, and does not stop a match.
+    std::fs::write(dir.join("macros/broken.json"), "{ not json")?;
+    let Err(err) = wiringcraft(&dir, &["macro", "show", "Nothing"]) else {
+        return Err("showed a macro that is not there".into());
+    };
+    assert!(err.contains("broken.json"), "{err}");
+    assert!(wiringcraft(&dir, &["macro", "show", "Motor starter"]).is_ok());
+    std::fs::remove_file(dir.join("macros/broken.json"))?;
+
+    // Control characters from the file are shown escaped, one field per line.
+    std::fs::write(
+        dir.join("macros/odd.json"),
+        STARTER
+            .replace("Motor starter", r"Odd\u001b[2J")
+            .replace(r#""name": "0.75 kW""#, r#""name": "0.75\nkW""#),
+    )?;
+    let shown = wiringcraft(&dir, &["macro", "show", "odd"])?;
+    assert!(!shown.contains('\u{1b}'), "{shown:?}");
+    assert!(shown.starts_with("Odd\\u{1b}[2J (project)\n"), "{shown:?}");
+    assert!(shown.contains("  0.75\\nkW: "), "{shown:?}");
+
     // A placeholder no text uses can be removed, with its values.
     wiringcraft(&dir, &["macro", "edit", "starter", "--remove", "voltage"])?;
     let m: wc_core::macros::Macro = serde_json::from_str(&std::fs::read_to_string(&file)?)?;
