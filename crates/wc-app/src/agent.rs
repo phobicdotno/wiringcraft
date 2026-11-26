@@ -9,6 +9,7 @@
 //! `run_command` runs any `wiringcraft` command-line command (imports, PLC variable lists,
 //! STEP export, library sources, merges, ...) on the open project.
 
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -95,6 +96,11 @@ pub struct Assistant {
     /// The project folder and project when a `run_command` started on its worker thread, so
     /// its end can tell the command's changes from the user's edits made meanwhile.
     command_base: Option<(PathBuf, wc_core::Project)>,
+    /// The free drawings of each page as the assistant last read them (project folder and page
+    /// id). Drawings are addressed by position (`g0`, `g1` ...), so a write by position is
+    /// refused once someone else changed the page's drawings (a session sync, the user).
+    /// Shared, so the copy a tool call keeps to put back costs nothing.
+    graphics_read: HashMap<(PathBuf, String), Arc<[Shape]>>,
 }
 
 impl Default for Assistant {
@@ -120,6 +126,7 @@ impl Assistant {
             shared: Vec::new(),
             clipboard: screenshot::Clipboard::default(),
             command_base: None,
+            graphics_read: HashMap::new(),
         }
     }
 
@@ -284,7 +291,7 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "update_graphic",
-            "Replace a free drawing (line, polyline, rect, circle, arc, text) by its id from get_page (g0, g1 ...).",
+            "Replace a free drawing (line, polyline, rect, circle, arc, text) by its id from get_page (g0, g1 ...). Ids are positions: a write is refused when the page's drawings changed since get_page, so read it again then.",
             json!({"id": {"type": "string"}, "shape": shape_arg(), "page": page_arg()}),
             &["id", "shape"],
         ),
@@ -420,6 +427,19 @@ pub fn specs() -> Vec<Value> {
             &["action"],
         ),
         tool(
+            "strips",
+            "Terminal strips as the terminal strip editor arranges them: list them (each strip's terminals in rail order, with spares and levels marked), move a terminal to another place on the rail (1 is first), add a spare terminal (after a terminal, or at the end), remove a spare, set a terminal's level (1 is the bottom level of a multi-level terminal; null clears it), or reset a strip to the order by number. Each change is one undo step.",
+            json!({
+                "action": {"type": "string", "enum": ["list", "move", "spare", "unspare", "level", "reset"]},
+                "strip": {"type": "string", "description": "The strip's tag, e.g. -X1 (optional for list)."},
+                "terminal": {"type": "string", "description": "A terminal number on the strip, e.g. 3 or S1 (move, spare, unspare, level)."},
+                "to": {"type": "integer", "minimum": 1, "description": "The place on the rail to move the terminal to, 1 is first (move)."},
+                "after": {"type": "string", "description": "The terminal the new spare goes right after; at the end when left out (spare)."},
+                "level": {"type": ["integer", "null"], "minimum": 1, "maximum": u32::MAX, "description": "The terminal's level, or null to clear it (level)."}
+            }),
+            &["action"],
+        ),
+        tool(
             "comments",
             "Review comments: list (open ones, or all), add (pinned at x, y on a page, or about the whole page), reply, resolve, reopen or delete.",
             json!({
@@ -432,10 +452,11 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "macros",
-            "Macros (saved groups of symbols, wires and drawings): list them, insert one on a page (its top-left corner at x, y), or save items from a page as a new project macro.",
+            "Macros (saved groups of symbols, wires and drawings): list them, insert one on a page (its top-left corner at x, y), or save items from a page as a new project macro. A macro with value sets (variants, such as sizes of a motor starter) needs value_set when inserted; list shows them.",
             json!({
                 "action": {"type": "string", "enum": ["list", "insert", "save"]},
                 "name": {"type": "string"}, "description": {"type": "string"},
+                "value_set": {"type": "string", "description": "insert: which of the macro's value sets fills its placeholders."},
                 "ids": ids_arg(), "page": page_arg(),
                 "x": {"type": "number"}, "y": {"type": "number"}
             }),
@@ -500,8 +521,8 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "open_project",
-            "Open a project folder, or create a new one (a git repository with the starter library).",
-            json!({"path": {"type": "string"}, "create": {"type": "boolean"}, "name": {"type": "string"}}),
+            "Open a project folder, or create a new one (a git repository with the starter library, or a copy of a base project when base is given).",
+            json!({"path": {"type": "string"}, "create": {"type": "boolean"}, "name": {"type": "string"}, "base": {"type": "string", "description": "create: a base project folder or git URL to start from (its pages, settings, title block and libraries)."}}),
             &["path"],
         ),
         tool(
@@ -558,6 +579,23 @@ fn jumper_list(jumpers: &[wc_core::project::Jumper]) -> Vec<Value> {
     jumpers
         .iter()
         .map(|j| json!({"strip": j.strip.to_string(), "terminals": j.terminals, "part": j.part}))
+        .collect()
+}
+
+/// Terminal strips as the assistant sees them: each strip (only `only`, when given) with its
+/// terminals in rail order, a spare marked, and the level the terminal plan shows if any.
+fn strip_list(open: &Open, only: Option<&DeviceTag>) -> Vec<Value> {
+    open.strip_terminals()
+        .into_iter()
+        .filter(|(strip, _)| only.is_none_or(|o| o == strip))
+        .map(|(strip, rail)| {
+            let levels = crate::strip_editor::rail_levels(open, &strip, &rail);
+            let terminals: Vec<Value> = rail
+                .iter()
+                .map(|(n, spare)| json!({"terminal": n, "spare": spare, "level": levels.get(n)}))
+                .collect();
+            json!({"strip": strip.to_string(), "terminals": terminals})
+        })
         .collect()
 }
 
@@ -638,10 +676,34 @@ fn clip_text(t: String, max: usize) -> String {
     out
 }
 
+/// The id the assistant is given for a revision cloud: what it is (its revision and corners),
+/// not where it is in the page's list, so an id read before someone else removed a cloud
+/// cannot name another one.
+fn cloud_id(c: &wc_core::revision::RevisionCloud) -> String {
+    format!(
+        "cloud {} at {},{} to {},{}",
+        c.revision.trim(),
+        c.min.x,
+        c.min.y,
+        c.max.x,
+        c.max.y
+    )
+}
+
+/// [`selection_id`] for an item on `page`, a revision cloud by [`cloud_id`].
+fn item_id(page: Option<&Page>, sel: &Selection) -> String {
+    match (sel, page) {
+        (Selection::Cloud(i), Some(p)) => p.clouds.get(*i).map(cloud_id).unwrap_or_else(|| selection_id(sel)),
+        _ => selection_id(sel),
+    }
+}
+
 fn selection_id(sel: &Selection) -> String {
     match sel {
         Selection::Symbol(id) | Selection::Wire(id) => id.clone(),
         Selection::Graphic(i) => format!("g{i}"),
+        Selection::Cloud(i) => wc_report::cloud_item(*i),
+        Selection::RevisionTable => "revision table".to_owned(),
     }
 }
 
@@ -661,7 +723,8 @@ impl Open {
             .or_else(|| self.project.pages.iter().position(|p| p.id == key))
     }
 
-    /// Item ids on a page as selections; unknown ids are an error.
+    /// Item ids on a page as selections; unknown ids are an error. A revision cloud is named by
+    /// what it is ([`cloud_id`]); two clouds alike cannot be told apart, so neither is taken.
     fn selections(&self, page: usize, ids: &[String]) -> Result<Vec<Selection>, String> {
         let p = self.project.pages.get(page).ok_or("No such page.")?;
         if ids.is_empty() {
@@ -677,6 +740,26 @@ impl Open {
                     && i < p.graphics.len()
                 {
                     Ok(Selection::Graphic(i))
+                } else if id.trim() == selection_id(&Selection::RevisionTable) && p.revision_table.is_some() {
+                    Ok(Selection::RevisionTable)
+                } else if id.trim().starts_with("cloud ")
+                    && let matching = p
+                        .clouds
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| cloud_id(c) == id.trim())
+                        .map(|(i, _)| i)
+                        .collect::<Vec<_>>()
+                    && let Some(&i) = matching.first()
+                {
+                    if matching.len() == 1 {
+                        Ok(Selection::Cloud(i))
+                    } else {
+                        Err(format!(
+                            "{id:?}: {} clouds are alike, so which one is not known.",
+                            matching.len()
+                        ))
+                    }
                 } else {
                     Err(format!("No item {id:?} on page {}.", p.number))
                 }
@@ -781,6 +864,7 @@ impl Open {
             "size_mm": [w, h],
             "symbols": symbols, "wires": wires, "graphics": graphics,
             "underlay": p.underlay, "comments": comments,
+            "clouds": p.clouds, "revision_table": p.revision_table,
         })
     }
 
@@ -803,16 +887,13 @@ impl Open {
             return Err(format!("{to} is already used."));
         }
         self.checkpoint();
+        self.note_device_rename(from, to);
         Ok(self.project.rename_device(from, to))
     }
 
-    /// Make every symbol a page uses available in the project.
+    /// Make every symbol a page uses available in the project, or none of them.
     fn ensure_page_symbols(&mut self, page: &Page) -> Result<(), String> {
-        let ids: Vec<String> = page.symbols.iter().map(|s| s.symbol.clone()).collect();
-        for id in ids {
-            self.ensure_symbol(&id).map_err(|e| format!("symbol {id}: {e}"))?;
-        }
-        Ok(())
+        self.ensure_symbols(page.symbols.iter().map(|s| s.symbol.as_str()))
     }
 }
 
@@ -826,6 +907,20 @@ fn edits_page(name: &str, v: &Value) -> bool {
         "place_symbol" | "add_wire" | "update_symbol" | "update_wire" | "add_graphic" | "update_graphic"
         | "delete_items" | "move_items" | "rotate_items" | "mirror_items" | "delete_page" | "edit_page_json" => true,
         "macros" => s(v, "action") == Some("insert"),
+        _ => false,
+    }
+}
+
+/// Whether a tool names a free drawing by its position (`g0`, `g1` ...) on a page.
+fn names_graphics(name: &str, v: &Value) -> bool {
+    // The same rule as `Open::selections` reads them by.
+    let positional = |id: &str| id.strip_prefix('g').and_then(|n| n.parse::<usize>().ok()).is_some();
+    match name {
+        "update_graphic" => true,
+        "delete_items" | "move_items" | "rotate_items" | "mirror_items" | "copy_items" | "select_items" => {
+            strings(v, "ids").iter().any(|id| positional(id))
+        }
+        "macros" if s(v, "action") == Some("save") => strings(v, "ids").iter().any(|id| positional(id)),
         _ => false,
     }
 }
@@ -847,6 +942,44 @@ impl AppTools<'_> {
     /// holds, and the state to go back to. `None` when nobody holds a page; for undo and redo
     /// (the tool, or the action), which the session's host carries out and checks itself; and
     /// for `open_project`, which replaces the project instead of changing it.
+    /// In a guest's window, the open project's folder and project, to tell after a tool
+    /// whether it changed the project (a tool can take an undo step and change nothing).
+    fn guest_snapshot(&self) -> Option<(PathBuf, wc_core::Project)> {
+        if !self.0.share.active() || self.0.share.is_host() {
+            return None;
+        }
+        self.0.open.as_ref().map(|o| (o.dir.clone(), o.project.clone()))
+    }
+
+    /// A guest's change is only kept once the host accepts it: the host refuses it when
+    /// someone else has its page open by then, which the guest may not know of yet. A tool
+    /// that changed the project (since the [`AppTools::guest_snapshot`] `before`) says so in
+    /// its answer.
+    fn pending_note(
+        &self,
+        before: Option<(PathBuf, wc_core::Project)>,
+        r: Result<String, String>,
+    ) -> Result<String, String> {
+        let changed = before.is_some_and(|(dir, project)| {
+            self.0
+                .open
+                .as_ref()
+                .is_some_and(|o| o.dir == dir && o.project != project)
+        });
+        if !changed {
+            return r;
+        }
+        // Also on an error that left a change behind (a command that failed partway).
+        let note = |t: String| {
+            format!(
+                "{t}\n\nPending: in this shared session the change is kept only once the host accepts it. \
+                 If someone else opened the page meanwhile, the host refuses it and it is taken back here; \
+                 read the page again before building on it."
+            )
+        };
+        r.map(note).map_err(note)
+    }
+
     fn held_guard(&mut self, name: &str, input: &Value) -> Option<HeldGuard> {
         let undoes = match name {
             "undo" | "open_project" => true,
@@ -920,12 +1053,18 @@ impl wc_agent::Tools for AppTools<'_> {
         if let Some(o) = self.0.open.as_mut() {
             o.follow_terminals();
         }
+        let mark = self.guest_snapshot();
         let guard = self.held_guard(name, input);
+        let read = self.0.assistant.graphics_read.clone();
         let r = self.0.agent_tool(name, input);
         let r = self.held_check(guard, r);
+        // A change taken back is not what the assistant knows of the drawings either.
+        if r.is_err() {
+            self.0.assistant.graphics_read = read;
+        }
         // Items the assistant removed must not stay selected.
         self.0.prune_selection();
-        r
+        self.pending_note(mark, r)
     }
 
     fn start(&mut self, name: &str, input: &Value) -> Started {
@@ -933,12 +1072,17 @@ impl wc_agent::Tools for AppTools<'_> {
         if let Some(o) = self.0.open.as_mut() {
             o.follow_terminals();
         }
+        let mark = self.guest_snapshot();
         let guard = self.held_guard(name, input);
+        let read = self.0.assistant.graphics_read.clone();
         match self.0.agent_start(name, input) {
             Started::Done(r) => {
                 let r = self.held_check(guard, r);
+                if r.is_err() {
+                    self.0.assistant.graphics_read = read;
+                }
                 self.0.prune_selection();
-                Started::Done(r)
+                Started::Done(self.pending_note(mark, r))
             }
             running => {
                 // A tool that runs on in the background is not checked here (its result is
@@ -954,9 +1098,16 @@ impl wc_agent::Tools for AppTools<'_> {
     }
 
     fn finish(&mut self, name: &str, input: &Value, result: Result<String, String>) -> Result<String, String> {
+        // As in `run`: the window's pending change is followed first, so the jumpers it moves
+        // are not taken for the finish's own change.
+        if let Some(o) = self.0.open.as_mut() {
+            o.follow_terminals();
+        }
+        // Only what the finish itself changes: what the tool did when it started was told then.
+        let mark = self.guest_snapshot();
         let r = self.0.agent_finish(name, input, result);
         self.0.prune_selection();
-        r
+        self.pending_note(mark, r)
     }
 
     fn describe(&self, name: &str, input: &Value) -> String {
@@ -981,7 +1132,7 @@ impl wc_agent::Tools for AppTools<'_> {
             "set_device" => format!("Set device {}", s(input, "tag").unwrap_or_default()),
             "run_action" => format!("Ran {}", s(input, "action").unwrap_or_default()),
             "run_command" => format!("wiringcraft {}", strings(input, "args").join(" ")),
-            "comments" | "macros" | "panels" | "library" | "versions" | "jumpers" => {
+            "comments" | "macros" | "panels" | "library" | "versions" | "jumpers" | "strips" => {
                 format!("{name}: {}", s(input, "action").unwrap_or_default())
             }
             "export" => format!("Exported {}", s(input, "format").unwrap_or_default()),
@@ -1012,11 +1163,32 @@ impl App {
             out.push_str(&format!(". Showing page {} ({}, id {})", p.number, p.title, p.id));
         }
         if !self.ed.selection.is_empty() {
-            let ids: Vec<String> = self.ed.selection.iter().map(selection_id).collect();
+            let page = if self.ed.panel.is_none() {
+                open.project.pages.get(self.ed.page)
+            } else {
+                None
+            };
+            let ids: Vec<String> = self.ed.selection.iter().map(|s| item_id(page, s)).collect();
             out.push_str(&format!(". Selected: {}", ids.join(", ")));
         }
         out.push('.');
         out
+    }
+
+    /// [`App::agent_context`] for a message on its way: a selected free drawing is named by
+    /// position there, so the drawings of the page shown count as read from then on, unless
+    /// they changed since the assistant last read them.
+    pub(crate) fn agent_context_to_send(&mut self) -> String {
+        let context = self.agent_context();
+        if self.ed.panel.is_none()
+            && self.ed.selection.iter().any(|s| matches!(s, Selection::Graphic(_)))
+            && let Some(key) = self.graphics_key(&Value::Null, "page")
+            && self.graphics_as_read(&key)
+            && let Some(now) = self.graphics_now(&key).map(Arc::<[Shape]>::from)
+        {
+            self.assistant.graphics_read.insert(key, now);
+        }
+        context
     }
 
     /// Drop selected items that no longer exist.
@@ -1042,6 +1214,8 @@ impl App {
             Selection::Symbol(id) => p.symbols.iter().any(|x| &x.id == id),
             Selection::Wire(id) => p.wires.iter().any(|x| &x.id == id),
             Selection::Graphic(i) => *i < p.graphics.len(),
+            Selection::Cloud(i) => *i < p.clouds.len(),
+            Selection::RevisionTable => p.revision_table.is_some(),
         });
     }
 
@@ -1108,8 +1282,85 @@ impl App {
         }
     }
 
-    /// Run one assistant tool.
+    /// The project folder and page id a tool's page argument `arg` names, as the key of
+    /// [`Assistant::graphics_read`].
+    fn graphics_key(&self, v: &Value, arg: &str) -> Option<(PathBuf, String)> {
+        let page = self.page_of(v, arg).ok()?;
+        let open = self.open.as_ref()?;
+        Some((open.dir.clone(), open.project.pages.get(page)?.id.clone()))
+    }
+
+    /// The drawings now on the page a [`Assistant::graphics_read`] key names, if it is there.
+    fn graphics_now(&self, key: &(PathBuf, String)) -> Option<&[Shape]> {
+        let open = self.open.as_ref().filter(|o| o.dir == key.0)?;
+        Some(&open.project.pages.iter().find(|p| p.id == key.1)?.graphics)
+    }
+
+    /// Whether the drawings of a page are as the assistant last read them (true when it has not
+    /// read them).
+    fn graphics_as_read(&self, key: &(PathBuf, String)) -> bool {
+        self.assistant
+            .graphics_read
+            .get(key)
+            .is_none_or(|read| self.graphics_now(key).is_some_and(|now| now == &read[..]))
+    }
+
+    /// Run one assistant tool. A free drawing named by position is refused when the page's
+    /// drawings changed since the assistant read them, so a write never lands on another one.
     pub(crate) fn agent_tool(&mut self, name: &str, v: &Value) -> Result<String, String> {
+        // The pages the tool works on, found before it runs (it may show or remove a page):
+        // its page (for a toolbar action always the page shown, whatever else it is given),
+        // and the page a copy goes to.
+        let mut keys = vec![if name == "run_action" {
+            self.graphics_key(&Value::Null, "page")
+        } else {
+            self.graphics_key(v, "page")
+        }];
+        if name == "copy_items" && v.get("to_page").is_some() {
+            keys.push(self.graphics_key(v, "to_page"));
+        }
+        let keys: Vec<((PathBuf, String), bool)> = keys
+            .into_iter()
+            .flatten()
+            .map(|k| {
+                let as_read = self.graphics_as_read(&k);
+                (k, as_read)
+            })
+            .collect();
+        if names_graphics(name, v)
+            && let Some((key, false)) = keys.first()
+        {
+            return Err(format!(
+                "The free drawings on page {} changed since you read it (someone else edited it): \
+                 call get_page again and use the drawing ids it gives.",
+                key.1
+            ));
+        }
+        let out = self.agent_tool_run(name, v)?;
+        // What the assistant read, or changed itself on drawings it had read, is what it knows.
+        // A toolbar action changes the page shown (undo and redo can bring back drawings in an
+        // order the assistant never read, so they do not count).
+        let toolbar = name == "run_action"
+            && !s(v, "action").is_some_and(|a| {
+                [Action::Undo, Action::Redo]
+                    .iter()
+                    .any(|u| u.name().eq_ignore_ascii_case(a))
+            });
+        let edits = edits_page(name, v) || name == "copy_items" || toolbar;
+        for (key, as_read) in keys {
+            // The id `add_graphic` answers with counts as read too.
+            let known = name == "add_graphic" || self.assistant.graphics_read.contains_key(&key);
+            if name == "get_page" || (edits && as_read && known) {
+                match self.graphics_now(&key).map(Arc::<[Shape]>::from) {
+                    Some(now) => self.assistant.graphics_read.insert(key, now),
+                    None => self.assistant.graphics_read.remove(&key),
+                };
+            }
+        }
+        Ok(out)
+    }
+
+    fn agent_tool_run(&mut self, name: &str, v: &Value) -> Result<String, String> {
         // In a shared session a page someone else has open is read-only here: an editing tool
         // aimed at it is refused before it runs (an unknown page gets the tool's own error).
         if edits_page(name, v)
@@ -1212,7 +1463,17 @@ impl App {
                 let open = need_open(self.open.as_mut())?;
                 let sel = open.selections(page, &ids)?;
                 match name {
-                    "delete_items" => open.delete_many(page, &sel),
+                    "delete_items" => {
+                        let before = open.project.pages.get(page).map(|p| p.clouds.clone());
+                        open.delete_many(page, &sel);
+                        // The clouds after one deleted move up: what the user had selected
+                        // follows its cloud, and a deleted one is let go.
+                        if page == self.ed.page
+                            && let (Some(old), Some(p)) = (before, open.project.pages.get(page))
+                        {
+                            crate::edit::remap_clouds(&mut self.ed.selection, &old, &p.clouds);
+                        }
+                    }
                     "move_items" => {
                         let d = Point::new(need_num(v, "dx")?, need_num(v, "dy")?);
                         open.checkpoint();
@@ -1245,7 +1506,7 @@ impl App {
                     (Some(x), Some(y)) => Point::new(x, y),
                     _ => clip.anchor + Point::new(10.0, 10.0),
                 };
-                let new = open.paste(to, &clip, at);
+                let new = open.paste(to, &clip, at)?;
                 let ids: Vec<String> = new.iter().map(selection_id).collect();
                 Ok(format!("Pasted as {}.", ids.join(", ")))
             }
@@ -1369,6 +1630,21 @@ impl App {
                         .unwrap_or_default();
                     content["title_block"] = json!(own);
                 }
+                // Nor does one without `clouds` or `revision_table` remove the page's revision
+                // marks. Given, they are used: `[]` clears the clouds and `null` the table.
+                if content.get("clouds").is_none() {
+                    let own = open
+                        .project
+                        .pages
+                        .get(page)
+                        .map(|p| p.clouds.clone())
+                        .unwrap_or_default();
+                    content["clouds"] = json!(own);
+                }
+                if content.get("revision_table").is_none() {
+                    let own = open.project.pages.get(page).and_then(|p| p.revision_table);
+                    content["revision_table"] = json!(own);
+                }
                 let new: Page = serde_json::from_value(content).map_err(|e| format!("Not a page: {e}"))?;
                 open.ensure_page_symbols(&new)?;
                 open.checkpoint();
@@ -1378,8 +1654,18 @@ impl App {
                     }
                 }
                 let cover = new.cover;
+                let shown = page == self.ed.page;
                 if let Some(p) = open.project.pages.get_mut(page) {
-                    *p = new;
+                    let old = std::mem::replace(p, new);
+                    // On the shown page, what the user had selected follows its graphic or
+                    // cloud, and one no longer there is let go. Another page is shown after
+                    // this one: its selection does not carry over.
+                    if shown {
+                        crate::edit::remap_graphics(&mut self.ed.selection, &old.graphics, &p.graphics);
+                        crate::edit::remap_clouds(&mut self.ed.selection, &old.clouds, &p.clouds);
+                    } else {
+                        self.ed.selection.clear();
+                    }
                 }
                 // One cover page per project: a new cover takes the mark from any other page.
                 if cover {
@@ -1441,7 +1727,7 @@ impl App {
                     None => "Project properties set.".to_owned(),
                 };
                 let fields: Vec<(String, String)> = fields.into_iter().collect();
-                open.set_project_props(&name, &fields, None)?;
+                open.set_project_props(&name, &fields, None, None)?;
                 Ok(said)
             }
             "get_template" => {
@@ -1457,6 +1743,7 @@ impl App {
             "set_template" => self.tool_set_template(v),
             "comments" => self.tool_comments(v),
             "jumpers" => self.tool_jumpers(v),
+            "strips" => self.tool_strips(v),
             "macros" => self.tool_macros(v),
             "number_wires" => {
                 use wc_core::numbering::Rule;
@@ -1586,7 +1873,7 @@ impl App {
             "open_project" => {
                 let path = PathBuf::from(need_s(v, "path")?);
                 if v.get("create").and_then(Value::as_bool).unwrap_or(false) {
-                    self.new_project(&path, s(v, "name").unwrap_or_default());
+                    self.new_project(&path, s(v, "name").unwrap_or_default(), s(v, "base"));
                 } else {
                     let mut prefs = std::mem::take(&mut self.prefs);
                     self.open_dir(&path, &mut prefs);
@@ -1702,9 +1989,15 @@ impl App {
             "panels": panels,
             "devices": open.project.devices.len(),
             "jumpers": jumper_list(&open.project.meta.jumpers),
+            "strips": strip_list(open, None),
             "open_comments": open.project.comments.iter().filter(|c| !c.resolved).count(),
             "shown": shown,
-            "selection": self.ed.selection.iter().map(selection_id).collect::<Vec<_>>(),
+            "selection": self
+                .ed
+                .selection
+                .iter()
+                .map(|s| item_id(self.ed.panel.is_none().then(|| open.project.pages.get(self.ed.page)).flatten(), s))
+                .collect::<Vec<_>>(),
             // In a session, Undo takes back only this person's changes made in it.
             "can_undo": if self.share.active() { self.share.can_undo() } else { open.can_undo() },
         })))
@@ -2159,6 +2452,89 @@ impl App {
         }
     }
 
+    fn tool_strips(&mut self, v: &Value) -> Result<String, String> {
+        let action = need_s(v, "action")?;
+        let open = need_open(self.open.as_mut())?;
+        if action == "list" {
+            let only = s(v, "strip").map(tag).transpose()?;
+            return Ok(pretty(&json!(strip_list(open, only.as_ref()))));
+        }
+        if !["move", "spare", "unspare", "level", "reset"].contains(&action) {
+            return Err(format!("Unknown strips action {action}."));
+        }
+        let strip = tag(need_s(v, "strip")?)?;
+        if action == "reset" {
+            open.reset_terminal_order(&strip);
+            return Ok(format!("{strip} is in the order by terminal number now."));
+        }
+        let terminal = need_s(v, "terminal")?.trim().to_owned();
+        let rail = open.strip_terminals().remove(&strip).unwrap_or_default();
+        let on_rail = |t: &str| rail.iter().find(|(n, _)| n == t).map(|(_, spare)| *spare);
+        match action {
+            "move" => {
+                let to = v
+                    .get("to")
+                    .and_then(Value::as_u64)
+                    .filter(|t| *t >= 1)
+                    .ok_or("`to` must be a place on the rail, 1 or more.")?;
+                let to = usize::try_from(to - 1).map_err(|e| e.to_string())?;
+                if to >= rail.len() {
+                    return Err(format!("{strip} has {} places on the rail.", rail.len()));
+                }
+                open.move_terminal(&strip, &terminal, to)?;
+                Ok(format!("Moved {strip} {terminal} to place {} on the rail.", to + 1))
+            }
+            "spare" => {
+                let after = s(v, "after").map(str::trim);
+                if let Some(a) = after
+                    && on_rail(a).is_none()
+                {
+                    return Err(format!("{strip} has no terminal {a}."));
+                }
+                open.add_spare(&strip, &terminal, after)?;
+                Ok(match after {
+                    Some(a) => format!("Added spare {strip} {terminal} after {a}."),
+                    None => format!("Added spare {strip} {terminal} at the end."),
+                })
+            }
+            "unspare" => {
+                if on_rail(&terminal) != Some(true) {
+                    return Err(format!("{strip} has no spare terminal {terminal}."));
+                }
+                open.remove_spare(&strip, &terminal);
+                Ok(format!("Took spare {strip} {terminal} off the rail."))
+            }
+            "level" => {
+                // A number, or null to clear it: a missing or other value is a mistake, not a
+                // request to clear the level.
+                let level = match v.get("level") {
+                    Some(Value::Null) => None,
+                    Some(l) => Some(
+                        // The terminal plan's range: a level it cannot read would be stored
+                        // and then shown as none.
+                        wc_report::parse_level(
+                            &l.as_u64()
+                                .ok_or("`level` must be a whole number, or null to clear it.")?
+                                .to_string(),
+                        )
+                        .map_err(|e| format!("`level` cannot be {l}: {e}."))?,
+                    ),
+                    None => return Err("`level` is missing: give 1 or more, or null to clear it.".into()),
+                };
+                if on_rail(&terminal).is_none() {
+                    return Err(format!("{strip} has no terminal {terminal}."));
+                }
+                let text = level.map(|l| l.to_string()).unwrap_or_default();
+                crate::strip_editor::set_level(open, &strip, &terminal, &text)?;
+                Ok(match level {
+                    Some(l) => format!("{strip} {terminal} is on level {l}."),
+                    None => format!("{strip} {terminal} has no level of its own now."),
+                })
+            }
+            other => Err(format!("Unknown strips action {other}.")),
+        }
+    }
+
     fn tool_macros(&mut self, v: &Value) -> Result<String, String> {
         let action = need_s(v, "action")?;
         let page = self.page_of(v, "page")?;
@@ -2169,7 +2545,7 @@ impl App {
                     .macros()
                     .into_iter()
                     .map(
-                        |m| json!({"name": m.name, "description": m.description, "source": m.source, "error": m.error}),
+                        |m| json!({"name": m.name, "description": m.description, "value_sets": m.value_sets, "source": m.source, "error": m.error}),
                     )
                     .collect();
                 Ok(pretty(&json!(list)))
@@ -2184,7 +2560,7 @@ impl App {
                 let anchor = wc_core::macros::read_macro(&entry.path)
                     .map_err(|e| e.to_string())?
                     .anchor;
-                let items = open.insert_macro(page, &entry.path)?;
+                let items = open.insert_macro(page, &entry.path, s(v, "value_set"))?;
                 if let (Some(x), Some(y)) = (num(v, "x"), num(v, "y")) {
                     open.move_by(page, &items, Point::new(x - anchor.x, y - anchor.y));
                 }
@@ -2441,6 +2817,19 @@ impl App {
         let mut cmd = std::process::Command::new(&bin);
         self.assistant.command_base = None;
         if let Some(open) = self.open.as_mut() {
+            // In a shared session a page someone else has open is read-only here, and the
+            // command line writes the project folder directly: only commands that read it run.
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            if let Some(why) = writes_while_held(&args, &open.dir, &open.held_by_others, &cwd) {
+                return Err(why);
+            }
+            // The look above cannot see a link swapped in after it: the command line opens
+            // each output file so that it cannot land on a project file either (#458).
+            if !open.held_by_others.is_empty() {
+                cmd.env(wc_core::guard::GUARD_ENV, &open.dir);
+            } else {
+                cmd.env_remove(wc_core::guard::GUARD_ENV);
+            }
             if open.dirty {
                 open.save()
                     .map_err(|e| format!("Saving before the command failed: {e}"))?;
@@ -2573,6 +2962,157 @@ fn stem(p: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Why the `wiringcraft` command `args` does not run on the project folder `dir` while others
+/// hold pages (`held`, page id to name): it may change the project, or it names a path into the
+/// project folder (an export written over a page). `None` when it runs: nobody holds a page, or
+/// it only reads the project.
+///
+/// `cwd` is the folder the command runs in, which relative paths are taken from.
+fn writes_while_held(args: &[String], dir: &Path, held: &BTreeMap<String, String>, cwd: &Path) -> Option<String> {
+    if held.is_empty() {
+        return None;
+    }
+    let mut who: Vec<&str> = held.values().map(String::as_str).collect();
+    who.sort_unstable();
+    who.dedup();
+    let who = who.join(", ");
+    let arg = |i: usize| args.get(i).map(String::as_str);
+    let has = |flag: &str| args.iter().any(|a| a == flag || a.starts_with(&format!("{flag}=")));
+    // Commands that only read the project; their output goes to the screen or to a file.
+    let reads = match (arg(0), arg(1)) {
+        (Some("--help" | "-h" | "help" | "--version" | "nets" | "check" | "report" | "pdf" | "drawing" | "aml"), _)
+        | (Some("export" | "plc-vars" | "inspect"), _) => true,
+        (Some("find"), _) => !has("--replace"),
+        (Some("vcs"), Some("log" | "changes" | "page-log")) => true,
+        (
+            Some(
+                "page" | "panel" | "location" | "jumper" | "strip" | "macro" | "revision" | "template" | "lib"
+                | "comment",
+            ),
+            Some("list" | "show"),
+        ) => true,
+        _ => false,
+    };
+    if !reads || has("-C") || has("--project") {
+        return Some(format!(
+            "`wiringcraft {}` is not run while {who} has a page open in the shared session: the command line \
+             writes the project folder directly, also pages that are read-only here. Make the change with the \
+             drawing tools, or run it once they have left the page.",
+            args.join(" ")
+        ));
+    }
+    let project = Guarded::new(dir);
+    // Run from inside the project folder, even a bare file name could land on a held page: only
+    // a command with nothing after its own words (`check`, `page list`) runs there.
+    let words = match arg(0) {
+        Some("vcs") => 2,
+        _ if matches!(arg(1), Some("list" | "show")) => 2,
+        _ => 1,
+    };
+    let more = args.iter().skip(words).any(|a| !a.starts_with('-'));
+    // When that cannot be told, the command is not run from there either.
+    if more && project.holds(cwd).unwrap_or(true) {
+        return Some(format!(
+            "`wiringcraft {}` is not run while {who} has a page open in the shared session: this program runs \
+             from inside the project folder, so an output file could land on a page. Start it from another folder.",
+            args.join(" ")
+        ));
+    }
+    for a in args {
+        let why = match project.reached_by(cwd, split_flag(a).1) {
+            Ok(false) => continue,
+            Ok(true) => "is in the project folder or links to a file in it".to_owned(),
+            Err(e) => format!("could not be looked through ({e})"),
+        };
+        return Some(format!(
+            "`{a}` {why}, and {who} has a page open in the shared session: write the output to a folder of \
+             its own outside the project folder."
+        ));
+    }
+    None
+}
+
+/// `--name=value` split after its `=`; anything else is all value.
+fn split_flag(a: &str) -> (&str, &str) {
+    match a.find('=') {
+        Some(i) if a.starts_with("--") => a.split_at(i + 1),
+        _ => ("", a),
+    }
+}
+
+/// The project's files ([`wc_core::guard::ProjectFiles`]), to tell whether a command's output
+/// could land on one.
+struct Guarded(wc_core::guard::ProjectFiles);
+
+impl std::ops::Deref for Guarded {
+    type Target = wc_core::guard::ProjectFiles;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Guarded {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+/// How many files in an output folder are looked at; a bigger folder is not used while a
+/// page is held.
+const OUTPUT_FOLDER_FILES: usize = 10_000;
+
+impl Guarded {
+    fn new(project: &Path) -> Self {
+        Self(wc_core::guard::ProjectFiles::new(project))
+    }
+
+    /// Whether writing to `value` could land on a project file: it is a path into the project
+    /// or a link to a file in it, or it is a folder with such a link in it (an export writes
+    /// its own file names there). `value` counts as a path when it is absolute, clearly a
+    /// path (it has a separator or starts with a dot), or names something in `cwd`. A folder
+    /// that cannot be listed is an error: what is in it is not known.
+    fn reached_by(&self, cwd: &Path, value: &str) -> std::io::Result<bool> {
+        let p = Path::new(value);
+        let path = if p.is_absolute() {
+            p.to_path_buf()
+        } else if value.contains('/')
+            || value.contains('\\')
+            || value.starts_with('.')
+            || (!value.is_empty() && std::fs::symlink_metadata(cwd.join(p)).is_ok())
+        {
+            cwd.join(p)
+        } else {
+            return Ok(false);
+        };
+        if self.holds(&path)? {
+            return Ok(true);
+        }
+        let mut todo = vec![wc_core::guard::real(&path)];
+        let mut seen = 0;
+        while let Some(d) = todo.pop() {
+            if !d.is_dir() {
+                continue;
+            }
+            let entries = match std::fs::read_dir(&d) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            for e in entries {
+                let e = e?;
+                seen += 1;
+                if seen > OUTPUT_FOLDER_FILES || self.holds(&e.path())? {
+                    return Ok(true);
+                }
+                if e.file_type()?.is_dir() {
+                    todo.push(e.path());
+                }
+            }
+        }
+        Ok(false)
+    }
+}
+
 /// The `wiringcraft` command-line program: `WIRINGCRAFT_CLI`, then next to this program, then
 /// on the PATH.
 fn cli_path() -> PathBuf {
@@ -2629,8 +3169,424 @@ mod tests {
             pending: None,
             pending_for: None,
             strip_editor: None,
+            show_layers: false,
+            live: Default::default(),
+            fetch: None,
         };
         (tmp, app)
+    }
+
+    /// A `file://` URL for a local folder, also with a Windows drive letter.
+    fn file_url(p: &std::path::Path) -> String {
+        let path = p.to_string_lossy().replace('\\', "/");
+        if path.starts_with('/') {
+            format!("file://{path}")
+        } else {
+            format!("file:///{path}")
+        }
+    }
+
+    /// Frames until the base project fetch is over (at most a few seconds).
+    fn until_fetched(a: &mut App) {
+        let ctx = egui::Context::default();
+        for _ in 0..500 {
+            a.poll_fetch(&ctx);
+            if a.fetch.is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(a.fetch.is_none(), "the fetch did not end");
+    }
+
+    #[test]
+    fn a_base_project_from_a_repository_is_fetched_off_the_window_thread() {
+        let (tmp, mut a) = app(vec![]);
+        let base = tmp.path().join("base");
+        wc_core::store::create(&base, "ACME base").unwrap();
+        wc_vcs::Git::new(&base).init().unwrap();
+        let dir = tmp.path().join("pump");
+        a.start_new_project(&dir, "Pump station", Some(&file_url(&base)));
+        // The window goes on while it runs: a note with Cancel, and the old project still open.
+        assert!(matches!(a.dialog, Some(Dialog::Fetching(_))));
+        assert!(a.fetch.is_some());
+        until_fetched(&mut a);
+        assert!(a.dialog.is_none(), "{:?}", a.dialog.as_ref().map(|_| ()));
+        let open = a.open.as_ref().unwrap();
+        assert_eq!(open.dir, dir);
+        assert_eq!(open.project.meta.name, "Pump station");
+        assert!(dir.join(".git").exists(), "recorded as a first version");
+        // A repository that cannot be fetched says why, and makes nothing.
+        let missing = tmp.path().join("missing");
+        a.start_new_project(&missing, "X", Some(&file_url(&tmp.path().join("nowhere"))));
+        until_fetched(&mut a);
+        assert!(matches!(&a.dialog, Some(Dialog::Message(m)) if m.contains("Could not create")));
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn a_cancelled_fetch_opens_nothing() {
+        let (tmp, mut a) = app(vec![]);
+        let before = a.open.as_ref().unwrap().dir.clone();
+        let (tx, done) = std::sync::mpsc::channel();
+        a.fetch = Some(crate::BaseFetch {
+            dir: tmp.path().join("new"),
+            source: "file:///slow".into(),
+            was_open: Some(before.clone()),
+            made: false,
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            done,
+        });
+        a.dialog = Some(Dialog::Fetching("file:///slow".into()));
+        // Cancel sets the flag the fetch stops on.
+        a.cancel_fetch();
+        assert!(
+            a.fetch
+                .as_ref()
+                .unwrap()
+                .cancel
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        // Still running: nothing changes.
+        until_fetched_once(&mut a);
+        assert!(a.fetch.is_some());
+        tx.send(Err(None)).unwrap();
+        until_fetched(&mut a);
+        assert!(a.dialog.is_none());
+        assert!(a.ed.message.contains("not made"), "{}", a.ed.message);
+        assert_eq!(a.open.as_ref().unwrap().dir, before);
+    }
+
+    #[test]
+    fn a_second_fetch_keeps_the_first_ones_cancel() {
+        let (tmp, mut a) = app(vec![]);
+        let (_tx, done) = std::sync::mpsc::channel();
+        a.fetch = Some(crate::BaseFetch {
+            dir: tmp.path().join("new"),
+            source: "file:///slow".into(),
+            was_open: None,
+            made: false,
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            done,
+        });
+        a.start_new_project(&tmp.path().join("other"), "X", Some("file:///other"));
+        assert!(matches!(&a.dialog, Some(Dialog::Fetching(s)) if s == "file:///slow"));
+        assert!(a.ed.message.contains("already"), "{}", a.ed.message);
+    }
+
+    #[test]
+    fn a_fetched_project_keeps_the_unsaved_work_of_the_open_one() {
+        let (tmp, mut a) = app(vec![]);
+        let base = tmp.path().join("base");
+        wc_core::store::create(&base, "ACME base").unwrap();
+        wc_vcs::Git::new(&base).init().unwrap();
+        let old = a.open.as_ref().unwrap().dir.clone();
+        let o = a.open.as_mut().unwrap();
+        o.project.meta.name = "Unsaved name".into();
+        o.dirty = true;
+        let dir = tmp.path().join("pump");
+        a.start_new_project(&dir, "Pump station", Some(&file_url(&base)));
+        until_fetched(&mut a);
+        assert_eq!(a.open.as_ref().unwrap().dir, dir);
+        assert_eq!(wc_core::store::load(&old).unwrap().meta.name, "Unsaved name");
+    }
+
+    #[test]
+    fn a_fetched_project_waits_for_a_running_command_and_an_open_dialog() {
+        let (tmp, mut a) = app(vec![]);
+        let before = a.open.as_ref().unwrap().dir.clone();
+        // The fetch is in and the project made.
+        let dir = tmp.path().join("pump");
+        wc_core::store::create(&dir, "Pump station").unwrap();
+        let (tx, done) = std::sync::mpsc::channel();
+        tx.send(Ok(())).unwrap();
+        a.fetch = Some(crate::BaseFetch {
+            dir: dir.clone(),
+            source: "file:///base".into(),
+            was_open: Some(before.clone()),
+            made: false,
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            done,
+        });
+        // A command works on the open project's files while the window edits it too: neither
+        // is saved over nor replaced until the command is done and reconciled.
+        let open = a.open.as_mut().unwrap();
+        a.assistant.command_base = Some((open.dir.clone(), open.project.clone()));
+        let mut by_command = open.project.clone();
+        by_command.meta.name = "Named by the command".into();
+        wc_core::store::save(&before, &by_command).unwrap();
+        open.project.meta.name = "Named in the window".into();
+        open.dirty = true;
+        until_fetched_once(&mut a);
+        assert!(a.fetch.is_some());
+        assert_eq!(a.open.as_ref().unwrap().dir, before);
+        assert_eq!(
+            wc_core::store::load(&before).unwrap().meta.name,
+            "Named by the command",
+            "not saved over the command"
+        );
+        let _ = a.command_finish(Ok("done".into()));
+        assert!(!a.assistant.command_running());
+        // Reconciled: the window's edit is kept, still unsaved.
+        assert_eq!(a.open.as_ref().unwrap().project.meta.name, "Named in the window");
+        assert!(a.open.as_ref().unwrap().dirty);
+        // A dialog open on the project: the same, until it is closed.
+        a.dialog = Some(Dialog::Message("about the open project".into()));
+        until_fetched_once(&mut a);
+        assert!(a.fetch.is_some());
+        assert_eq!(a.open.as_ref().unwrap().dir, before);
+        a.dialog = None;
+        until_fetched(&mut a);
+        assert_eq!(a.open.as_ref().unwrap().dir, dir);
+        // The handoff saved the reconciled project: the window's edit is on disk.
+        assert_eq!(wc_core::store::load(&before).unwrap().meta.name, "Named in the window");
+    }
+
+    #[test]
+    fn a_new_project_that_cannot_be_recorded_or_opened_says_both() {
+        let (tmp, mut a) = app(vec![]);
+        // Not a project, and a `.git` git cannot use.
+        let dir = tmp.path().join("broken");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".git"), "not a repository").unwrap();
+        let opening = crate::state::Open::load(&dir).err().map(|e| e.to_string());
+        a.finish_new_project(&dir, false);
+        let Some(Dialog::Message(m)) = &a.dialog else {
+            unreachable!("no message")
+        };
+        assert!(m.contains("Could not open"), "{m}");
+        let opening = opening.unwrap_or_default();
+        assert!(
+            !opening.is_empty() && m.contains(&opening),
+            "the reason it did not open, {opening:?}: {m}"
+        );
+        assert!(m.contains("could not be recorded"), "{m}");
+        assert!(m.contains("invalid gitfile format"), "git's reason: {m}");
+    }
+
+    #[test]
+    fn a_new_project_that_cannot_be_recorded_while_the_open_one_cannot_be_saved_says_both() {
+        let (tmp, mut a) = app(vec![]);
+        let before = a.open.as_ref().unwrap().dir.clone();
+        // The open project has unsaved work and its folder is gone: a file stands in its place.
+        a.open.as_mut().unwrap().dirty = true;
+        std::fs::remove_dir_all(&before).unwrap();
+        std::fs::write(&before, "not a folder").unwrap();
+        let dir = tmp.path().join("broken");
+        wc_core::store::create(&dir, "New").unwrap();
+        std::fs::write(dir.join(".git"), "not a repository").unwrap();
+        a.finish_new_project(&dir, false);
+        let Some(Dialog::Message(m)) = &a.dialog else {
+            unreachable!("no message")
+        };
+        assert!(m.contains("could not be saved first"), "{m}");
+        assert!(m.contains("i/o error"), "the save's reason: {m}");
+        assert!(m.contains("could not be recorded either"), "{m}");
+        assert!(m.contains("invalid gitfile format"), "git's reason: {m}");
+        assert_eq!(a.open.as_ref().unwrap().dir, before, "the open project stays open");
+    }
+
+    #[test]
+    fn a_fetched_project_waits_for_an_assistant_turn_and_the_symbol_editor() {
+        let answers = vec![json!({
+            "model": "claude-opus-5-5", "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "Done."}]
+        })];
+        let (tmp, mut a) = app(answers);
+        let before = a.open.as_ref().unwrap().dir.clone();
+        let dir = tmp.path().join("pump");
+        wc_core::store::create(&dir, "Pump station").unwrap();
+        let (tx, done) = std::sync::mpsc::channel();
+        tx.send(Ok(())).unwrap();
+        a.fetch = Some(crate::BaseFetch {
+            dir: dir.clone(),
+            source: "file:///base".into(),
+            was_open: Some(before.clone()),
+            made: false,
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            done,
+        });
+        // A turn asked about the open project: its answer is for that project.
+        let ctx = eframe::egui::Context::default();
+        a.prefs.assistant.backend = wc_agent::Backend::ApiKey;
+        a.assistant.input = "What is on page 2?".into();
+        a.assistant_send(&ctx);
+        assert!(a.assistant.busy());
+        until_fetched_once(&mut a);
+        assert!(a.fetch.is_some());
+        for _ in 0..500 {
+            a.assistant_poll(&ctx);
+            if !a.assistant.busy() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!a.assistant.busy());
+        // A symbol draft open: it is not dropped under the user.
+        a.symbol_editor = Some(crate::symbol_editor::SymbolEditor::new(Vec::new()));
+        until_fetched_once(&mut a);
+        assert!(a.fetch.is_some());
+        assert!(a.symbol_editor.is_some());
+        assert_eq!(a.open.as_ref().unwrap().dir, before);
+        a.symbol_editor = None;
+        until_fetched(&mut a);
+        assert_eq!(a.open.as_ref().unwrap().dir, dir);
+    }
+
+    #[test]
+    fn a_fetch_outcome_is_taken_in_while_the_symbol_editor_is_open() {
+        let (tmp, mut a) = app(vec![]);
+        let before = a.open.as_ref().unwrap().dir.clone();
+        let fetch = |a: &mut App, outcome: Result<(), Option<String>>| {
+            let (tx, done) = std::sync::mpsc::channel();
+            tx.send(outcome).unwrap();
+            a.fetch = Some(crate::BaseFetch {
+                dir: tmp.path().join("pump"),
+                source: "file:///base".into(),
+                was_open: Some(before.clone()),
+                made: false,
+                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                done,
+            });
+            a.dialog = Some(Dialog::Fetching("file:///base".into()));
+        };
+        a.symbol_editor = Some(crate::symbol_editor::SymbolEditor::new(Vec::new()));
+        // Cancelled and failed fetches are said at once, and a new one can start.
+        fetch(&mut a, Err(None));
+        until_fetched_once(&mut a);
+        assert!(a.fetch.is_none());
+        assert!(a.ed.message.contains("not made"), "{}", a.ed.message);
+        fetch(&mut a, Err(Some("no such server".into())));
+        until_fetched_once(&mut a);
+        assert!(a.fetch.is_none());
+        assert!(matches!(&a.dialog, Some(Dialog::Message(m)) if m.contains("no such server")));
+        // A made project waits for the editor, without a Cancel that would do nothing.
+        wc_core::store::create(&tmp.path().join("pump"), "Pump station").unwrap();
+        fetch(&mut a, Ok(()));
+        until_fetched_once(&mut a);
+        assert!(a.fetch.as_ref().unwrap().made);
+        assert!(a.dialog.is_none(), "the Fetching note with Cancel is gone");
+        a.cancel_fetch();
+        assert!(
+            !a.fetch
+                .as_ref()
+                .unwrap()
+                .cancel
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        assert!(a.ed.message.contains("made already"), "{}", a.ed.message);
+        a.symbol_editor = None;
+        until_fetched(&mut a);
+        assert_eq!(a.open.as_ref().unwrap().dir, tmp.path().join("pump"));
+    }
+
+    #[test]
+    fn a_project_opened_while_fetching_stays_open() {
+        let (tmp, mut a) = app(vec![]);
+        let base = tmp.path().join("base");
+        wc_core::store::create(&base, "ACME base").unwrap();
+        wc_vcs::Git::new(&base).init().unwrap();
+        let dir = tmp.path().join("pump");
+        a.start_new_project(&dir, "Pump station", Some(&file_url(&base)));
+        // Another project is opened before the fetch is in.
+        a.fetch.as_mut().unwrap().was_open = Some(tmp.path().join("before"));
+        until_fetched(&mut a);
+        assert_ne!(a.open.as_ref().map(|o| o.dir.clone()), Some(dir.clone()));
+        assert!(matches!(&a.dialog, Some(Dialog::Message(m)) if m.contains("ready")));
+        assert!(dir.join(".git").exists(), "made and recorded all the same");
+    }
+
+    #[test]
+    fn an_assistant_edit_is_checked_while_drawing() {
+        let (_tmp, mut a) = app(vec![]);
+        let o = a.open.as_mut().unwrap();
+        let mut ids = Vec::new();
+        for x in [20.0, 60.0] {
+            let id = o.place(1, "wc.coil", Point::new(x, 20.0)).unwrap();
+            let s = o.project.pages[1].symbols.iter_mut().find(|s| s.id == id).unwrap();
+            s.tag = Some(wc_core::DeviceTag::parse("-K1").unwrap());
+            ids.push(id);
+        }
+        o.touch();
+        let ctx = egui::Context::default();
+        let drawn_twice = |a: &App| a.ed.live.iter().filter(|f| f.message.contains("-K1 is drawn")).count();
+        // Well within the sweep: only the edit's own revision can start the check.
+        let until = |a: &mut App, want: usize| {
+            for _ in 0..100 {
+                a.live_check(&ctx);
+                if drawn_twice(a) == want && !a.live.busy() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        until(&mut a, 2);
+        assert_eq!(drawn_twice(&a), 2, "{:?}", a.ed.live);
+        // The assistant renames the second coil: no input in any frame.
+        call(
+            &mut a,
+            "update_symbol",
+            json!({"page": "p0002", "id": ids[1], "tag": "-K2"}),
+        )
+        .unwrap();
+        until(&mut a, 0);
+        assert_eq!(drawn_twice(&a), 0, "{:?}", a.ed.live);
+    }
+
+    fn until_fetched_once(a: &mut App) {
+        a.poll_fetch(&egui::Context::default());
+    }
+
+    #[test]
+    fn checks_while_drawing_are_shown_again_after_the_editor_is_replaced() {
+        let (_tmp, mut a) = app(vec![]);
+        let o = a.open.as_mut().unwrap();
+        for x in [20.0, 60.0] {
+            let id = o.place(1, "wc.coil", Point::new(x, 20.0)).unwrap();
+            let s = o.project.pages[1].symbols.iter_mut().find(|s| s.id == id).unwrap();
+            s.tag = Some(wc_core::DeviceTag::parse("-K1").unwrap());
+        }
+        let ctx = egui::Context::default();
+        let drawn_twice = |a: &App| a.ed.live.iter().filter(|f| f.message.contains("-K1 is drawn")).count();
+        for _ in 0..200 {
+            a.live_check(&ctx);
+            if drawn_twice(&a) > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(drawn_twice(&a), 2, "{:?}", a.ed.live);
+        // Opening the same unchanged project replaces the editor; the checker keeps its
+        // findings for the same inputs, and they show again at once.
+        a.ed = crate::canvas::Editor::default();
+        a.live_check(&ctx);
+        assert_eq!(drawn_twice(&a), 2, "{:?}", a.ed.live);
+        // Turned off while markers are shown: they go.
+        a.prefs.live_check = false;
+        a.live_check(&ctx);
+        assert!(a.ed.live.is_empty(), "{:?}", a.ed.live);
+        a.prefs.live_check = true;
+        // On again: the checker checks project A afresh and shows both findings, so the
+        // switch below starts from a checker that holds A's findings.
+        for _ in 0..200 {
+            a.live_check(&ctx);
+            if drawn_twice(&a) > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(drawn_twice(&a), 2, "{:?}", a.ed.live);
+        // Another project is opened: the first one's findings are not shown on it.
+        let (_other, b) = crate::state::tests::project();
+        a.open = Some(b);
+        a.ed = crate::canvas::Editor::default();
+        a.live_check(&ctx);
+        assert!(a.ed.live.is_empty(), "{:?}", a.ed.live);
+        assert_eq!(
+            a.live.status(&a.ed.live),
+            "Check: checking",
+            "no counts of the first project"
+        );
     }
 
     #[test]
@@ -2641,7 +3597,7 @@ mod tests {
         // A second picker in the same reply does not replace the first, and says so.
         let r = call(&mut a, "run_action", json!({"action": Action::ExportAml.name()})).unwrap();
         assert!(r.contains("was not done"), "{r}");
-        assert!(matches!(a.pending, Some(crate::Pending::Export(crate::Export::Pdf))));
+        assert!(matches!(a.pending, Some(crate::Pending::Export(crate::Export::Pdf(_)))));
         // An action without a picker is not taken for one while a picker waits (the status
         // line still holds the refusal, as the frame would show it, so it is cleared first).
         a.ed.message.clear();
@@ -2859,6 +3815,137 @@ mod tests {
     }
 
     #[test]
+    fn the_assistant_lists_moves_spares_and_levels_terminal_strips() {
+        let (_tmp, mut a) = app(vec![]);
+        {
+            let o = a.open.as_mut().unwrap();
+            for (k, t) in ["-X1.1", "-X1.2", "-X1.3"].into_iter().enumerate() {
+                let id = o
+                    .place(
+                        1,
+                        "wc.terminal",
+                        wc_core::geom::Point::new(20.0 + 20.0 * k as f64, 20.0),
+                    )
+                    .unwrap();
+                let s = o.project.pages[1].symbols.iter_mut().find(|s| s.id == id).unwrap();
+                s.tag = Some(DeviceTag::parse(t).unwrap());
+            }
+        }
+        // The rail as "number" with "*" for a spare and "@level" for a level.
+        let rail = |a: &mut App| -> Vec<String> {
+            let v: Value =
+                serde_json::from_str(&call(a, "strips", json!({"action": "list", "strip": "-X1"})).unwrap()).unwrap();
+            assert_eq!(v.as_array().map(Vec::len), Some(1), "{v}");
+            v[0]["terminals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| {
+                    let mut out = t["terminal"].as_str().unwrap().to_owned();
+                    if t["spare"] == json!(true) {
+                        out.push('*');
+                    }
+                    if let Some(l) = t["level"].as_u64() {
+                        out.push_str(&format!("@{l}"));
+                    }
+                    out
+                })
+                .collect()
+        };
+        let undo_mark = |a: &App| a.open.as_ref().unwrap().undo_mark();
+        assert_eq!(rail(&mut a), ["1", "2", "3"]);
+        let before = undo_mark(&a);
+
+        // Refusals change nothing and take no undo step.
+        for bad in [
+            json!({"action": "move", "strip": "-X1", "terminal": "3", "to": 0}),
+            json!({"action": "move", "strip": "-X1", "terminal": "3", "to": 4}),
+            json!({"action": "move", "strip": "-X1", "terminal": "9", "to": 1}),
+            json!({"action": "move", "strip": "-X1", "terminal": "3"}),
+            json!({"action": "spare", "strip": "-X1", "terminal": "2"}),
+            json!({"action": "spare", "strip": "-X1", "terminal": "S1", "after": "9"}),
+            json!({"action": "unspare", "strip": "-X1", "terminal": "2"}),
+            json!({"action": "level", "strip": "-X1", "terminal": "2", "level": 0}),
+            json!({"action": "level", "strip": "-X1", "terminal": "2", "level": 4_294_967_296_u64}),
+            json!({"action": "level", "strip": "-X1", "terminal": "2", "level": 1.5}),
+            json!({"action": "level", "strip": "-X1", "terminal": "2", "level": "2"}),
+            json!({"action": "level", "strip": "-X1", "terminal": "2"}),
+            json!({"action": "level", "strip": "-X1", "terminal": "9", "level": 2}),
+            json!({"action": "move", "terminal": "3", "to": 1}),
+            json!({"action": "explode", "strip": "-X1"}),
+        ] {
+            assert!(call(&mut a, "strips", bad.clone()).is_err(), "{bad}");
+        }
+        assert_eq!(rail(&mut a), ["1", "2", "3"]);
+        assert_eq!(undo_mark(&a), before);
+        let zero = json!({"action": "level", "strip": "-X1", "terminal": "2", "level": 0});
+        let why = call(&mut a, "strips", zero).unwrap_err();
+        assert!(why.contains("levels start at 1"), "{why}");
+
+        // Move: one undo step, and the state shows the rail.
+        call(
+            &mut a,
+            "strips",
+            json!({"action": "move", "strip": "-X1", "terminal": "3", "to": 1}),
+        )
+        .unwrap();
+        assert_eq!(undo_mark(&a), before + 1);
+        assert_eq!(rail(&mut a), ["3", "1", "2"]);
+        let state: Value = serde_json::from_str(&call(&mut a, "get_state", json!({})).unwrap()).unwrap();
+        assert_eq!(state["strips"][0]["strip"], json!("-X1"));
+        assert_eq!(state["strips"][0]["terminals"][0]["terminal"], json!("3"));
+
+        // A spare after a terminal, and one at the end.
+        call(
+            &mut a,
+            "strips",
+            json!({"action": "spare", "strip": "-X1", "terminal": "S1", "after": "3"}),
+        )
+        .unwrap();
+        call(
+            &mut a,
+            "strips",
+            json!({"action": "spare", "strip": "-X1", "terminal": "S2"}),
+        )
+        .unwrap();
+        assert_eq!(undo_mark(&a), before + 3);
+        assert_eq!(rail(&mut a), ["3", "S1*", "1", "2", "S2*"]);
+
+        // A level, shown on the terminal; the one above is taken as its upper level.
+        call(
+            &mut a,
+            "strips",
+            json!({"action": "level", "strip": "-X1", "terminal": "2", "level": 2}),
+        )
+        .unwrap();
+        assert_eq!(undo_mark(&a), before + 4);
+        assert_eq!(rail(&mut a), ["3", "S1*", "1@1", "2@2", "S2*"]);
+        call(
+            &mut a,
+            "strips",
+            json!({"action": "level", "strip": "-X1", "terminal": "2", "level": null}),
+        )
+        .unwrap();
+        assert_eq!(undo_mark(&a), before + 5);
+        assert_eq!(rail(&mut a), ["3", "S1*", "1", "2", "S2*"]);
+
+        // Unspare, then reset: each one undo step.
+        call(
+            &mut a,
+            "strips",
+            json!({"action": "unspare", "strip": "-X1", "terminal": "S1"}),
+        )
+        .unwrap();
+        assert_eq!(undo_mark(&a), before + 6);
+        assert_eq!(rail(&mut a), ["3", "1", "2", "S2*"]);
+        call(&mut a, "strips", json!({"action": "reset", "strip": "-X1"})).unwrap();
+        assert_eq!(undo_mark(&a), before + 7);
+        assert_eq!(rail(&mut a), ["1", "2", "3", "S2*"]);
+        assert!(a.open.as_mut().unwrap().undo());
+        assert_eq!(rail(&mut a), ["3", "1", "2", "S2*"]);
+    }
+
+    #[test]
     fn the_assistant_reads_sets_and_removes_the_logo() {
         let (_tmp, mut a) = app(vec![]);
         let dir = a.open.as_ref().unwrap().dir.clone();
@@ -2971,6 +4058,94 @@ mod tests {
     }
 
     #[test]
+    fn the_black_box_tool_puts_a_tagged_box_with_its_points_on_the_page() {
+        use crate::black_box_tool::BoxDraft;
+        use wc_core::BoxSide;
+        use wc_core::geom::Point;
+        let (_tmp, mut a) = app(vec![]);
+        a.ed.page = 1;
+        a.run(Action::BlackBoxTool);
+        assert_eq!(a.ed.tool, crate::state::Tool::BlackBox);
+        assert!(a.add_black_box("-A7").is_err(), "nothing drawn yet");
+
+        let page_id = a.open.as_ref().unwrap().project.pages[1].id.clone();
+        let mut d = BoxDraft::new(&page_id, Point::new(30.0, 30.0));
+        d.to = Some(Point::new(50.0, 40.0));
+        d.add_pin(BoxSide::Left, 5.0, "1").unwrap();
+        d.add_pin(BoxSide::Right, 5.0, "2").unwrap();
+        a.ed.black_box = Some(d);
+        let err = a.add_black_box("not a tag").unwrap_err();
+        assert!(!err.is_empty());
+        assert!(a.ed.black_box.is_some(), "a refused tag keeps the box being drawn");
+
+        a.add_black_box("-A7").unwrap();
+        assert!(a.ed.black_box.is_none());
+        let o = a.open.as_ref().unwrap();
+        let [crate::state::Selection::Symbol(id)] = a.ed.selection.as_slice() else {
+            unreachable!("the new box is selected: {:?}", a.ed.selection)
+        };
+        let placed = o.project.pages[1].symbol(id).unwrap();
+        assert_eq!(placed.tag.as_ref().map(|t| t.to_string()).as_deref(), Some("-A7"));
+        let pins: Vec<&str> = o.symbols[&placed.symbol].pins.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(pins, ["1", "2"]);
+
+        // Undo takes the whole box away in one step.
+        a.run(Action::Undo);
+        let o = a.open.as_ref().unwrap();
+        assert!(o.project.pages[1].symbols.is_empty());
+
+        // The view moved to another page while the tag dialog was open: the box goes on the
+        // page it was drawn on, and that page is shown with the box selected.
+        let mut d = BoxDraft::new(&page_id, Point::new(30.0, 30.0));
+        d.to = Some(Point::new(50.0, 40.0));
+        a.ed.black_box = Some(d);
+        a.ed.page = 0;
+        a.add_black_box("").unwrap();
+        assert_eq!(a.ed.page, 1);
+        let o = a.open.as_ref().unwrap();
+        let [crate::state::Selection::Symbol(id)] = a.ed.selection.as_slice() else {
+            unreachable!("the new box is selected: {:?}", a.ed.selection)
+        };
+        assert!(o.project.pages[1].symbol(id).is_some());
+        assert!(o.project.pages[0].symbols.is_empty());
+    }
+
+    #[test]
+    fn escape_after_leaving_the_black_box_tool_cancels_the_new_tool_s_drawing() {
+        use wc_core::geom::Point;
+        let (_tmp, mut a) = app(vec![]);
+        let ctx = egui::Context::default();
+        let escape = |a: &mut App| {
+            let raw = egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| {
+                let _ = a.shortcuts(ctx);
+            });
+        };
+        let page_id = a.open.as_ref().unwrap().project.pages[0].id.clone();
+        a.run(Action::BlackBoxTool);
+        a.ed.black_box = Some(crate::black_box_tool::BoxDraft::new(&page_id, Point::new(10.0, 10.0)));
+        escape(&mut a);
+        assert!(a.ed.black_box.is_none(), "Esc drops the box being drawn");
+        assert_eq!(a.ed.tool, crate::state::Tool::BlackBox, "and keeps the tool");
+
+        // Started a box, switched to Line and clicked its first point: Esc cancels the line.
+        a.ed.black_box = Some(crate::black_box_tool::BoxDraft::new(&page_id, Point::new(10.0, 10.0)));
+        a.run(Action::LineTool);
+        a.ed.shape_points = vec![Point::new(20.0, 20.0)];
+        escape(&mut a);
+        assert!(a.ed.shape_points.is_empty(), "the line's first point is dropped");
+    }
+
+    #[test]
     fn editing_actions_are_off_and_do_nothing_on_a_page_someone_else_holds() {
         use crate::chrome::Status;
         let (_tmp, mut a) = app(vec![]);
@@ -2992,6 +4167,7 @@ mod tests {
                 sharing: true,
                 share_undo: false,
                 share_redo: false,
+                show_layers: false,
             }
             .enabled(act)
         };
@@ -3007,6 +4183,8 @@ mod tests {
             Action::CircleTool,
             Action::ArcTool,
             Action::PolylineTool,
+            Action::DimensionTool,
+            Action::BlackBoxTool,
             Action::PageProps,
         ];
         for act in editing {
@@ -3256,6 +4434,50 @@ mod tests {
     }
 
     #[test]
+    fn find_says_why_a_hit_on_a_hidden_layer_is_not_selected() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        let id = open.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let page = open.project.pages[1].id.clone();
+        open.project.pages[1].graphics.push(wc_core::Shape::Text {
+            at: Point::new(60.0, 60.0),
+            text: "Pump 7 supply".into(),
+            height: 3.5,
+            align: Default::default(),
+            angle: 0.0,
+        });
+        // The hit comes from a real search for the free text, as the Find window makes it.
+        let mut find = crate::find_window::FindState::default();
+        find.query = "Pump 7".into();
+        find.refresh(&open.project);
+        let hit = Selection::Graphic(0);
+        assert_eq!(
+            find.hits.first().and_then(crate::find_window::go_to),
+            Some(crate::find_window::FindOutcome::Go {
+                page: page.clone(),
+                select: Some(hit.clone()),
+            }),
+            "{:?}",
+            find.hits
+        );
+        a.find = Some(find);
+        a.prefs.layers.set_shown(crate::layers::Layer::Drawings, false);
+        a.show_found(&page, Some(hit));
+        assert!(a.ed.selection.is_empty());
+        assert!(
+            a.ed.message.contains("hidden layer Drawings and notes"),
+            "{}",
+            a.ed.message
+        );
+        assert_eq!(a.find.as_ref().unwrap().message, a.ed.message);
+        // The next hit, which can be selected, clears the note in both places.
+        a.show_found(&page, Some(Selection::Symbol(id.clone())));
+        assert_eq!(a.ed.selection, vec![Selection::Symbol(id)]);
+        assert!(a.ed.message.is_empty(), "{}", a.ed.message);
+        assert!(a.find.as_ref().unwrap().message.is_empty());
+    }
+
+    #[test]
     fn undo_puts_back_a_symbol_a_command_replaced() {
         let (_tmp, mut a) = app(vec![]);
         let open = a.open.as_mut().unwrap();
@@ -3479,6 +4701,1346 @@ mod tests {
         assert!(a.ed.message.contains("keeps the copy it has"), "{}", a.ed.message);
         assert!(!a.ed.message.contains("takes the one from"), "{}", a.ed.message);
         assert_eq!(a.open.as_ref().unwrap().symbols["wc.coil"], before);
+    }
+
+    #[test]
+    fn a_graphic_named_by_position_is_refused_after_a_sync_reorders_the_page() {
+        let line = |x: f64| Shape::Line {
+            a: Point::new(x, 0.0),
+            b: Point::new(x, 5.0),
+        };
+        let rect = Shape::Rect {
+            min: Point::new(0.0, 0.0),
+            max: Point::new(5.0, 5.0),
+        };
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        open.project.pages[1].graphics = vec![line(1.0), line(2.0)];
+        a.share.start_host(open, "Hanna", "hanna@example.com").unwrap();
+        let graphics = |a: &App| a.open.as_ref().unwrap().project.pages[1].graphics.clone();
+        // The assistant reads the page, and its own edits keep what it read up to date: after
+        // adding a line, that line is g2.
+        call(&mut a, "get_page", json!({"page": "p0002"})).unwrap();
+        call(&mut a, "add_graphic", json!({"page": "p0002", "shape": line(3.0)})).unwrap();
+        call(
+            &mut a,
+            "move_items",
+            json!({"page": "p0002", "ids": ["g2"], "dx": 1, "dy": 0}),
+        )
+        .unwrap();
+        a.sync_session_now(false);
+        assert_eq!(graphics(&a), vec![line(1.0), line(2.0), line(4.0)]);
+        // The first line goes and is synced; the assistant reads the page: the second is g0.
+        let open = a.open.as_mut().unwrap();
+        open.checkpoint();
+        open.project.pages[1].graphics.remove(0);
+        a.sync_session_now(false);
+        call(&mut a, "get_page", json!({"page": "p0002"})).unwrap();
+        // The session's undo puts the first line back in front: g0 now names another line, so
+        // every write by position is refused.
+        a.share.undo().unwrap();
+        a.sync_session_now(false);
+        assert_eq!(graphics(&a), vec![line(1.0), line(2.0), line(4.0)]);
+        let shape = serde_json::to_value(&rect).unwrap();
+        for (tool, input) in [
+            ("update_graphic", json!({"page": "p0002", "id": "g0", "shape": shape})),
+            ("delete_items", json!({"page": "p0002", "ids": ["g0"]})),
+            ("move_items", json!({"page": "p0002", "ids": ["g0"], "dx": 1, "dy": 0})),
+            ("copy_items", json!({"page": "p0002", "ids": ["g0"], "dx": 1, "dy": 0})),
+        ] {
+            let err = call(&mut a, tool, input).unwrap_err();
+            assert!(err.contains("changed since you read it"), "{tool}: {err}");
+        }
+        assert_eq!(graphics(&a), vec![line(1.0), line(2.0), line(4.0)], "nothing written");
+        // Read again, the same position is the line now there.
+        call(&mut a, "get_page", json!({"page": "p0002"})).unwrap();
+        call(
+            &mut a,
+            "update_graphic",
+            json!({"page": "p0002", "id": "g0", "shape": shape}),
+        )
+        .unwrap();
+        assert_eq!(graphics(&a), vec![rect, line(2.0), line(4.0)]);
+    }
+
+    /// A guest window over the session of `crate::share::tests::session`, showing a panel
+    /// over page 3: it holds no page, so a change of page 3 waits for the host.
+    fn guest_window(tmp: &std::path::Path) -> (tempfile::TempDir, App, crate::share::Share, Open) {
+        let (mut h, _log, mut host_open, mut g, mut guest_open) = crate::share::tests::session(tmp).unwrap();
+        crate::share::tests::frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+        let (dir, mut a) = app(vec![]);
+        a.open = Some(guest_open);
+        a.share = g;
+        a.ed.page = 2;
+        a.ed.panel = Some(0);
+        a.sync_session_now(false);
+        (dir, a, h, host_open)
+    }
+
+    /// The guest pastes a line on page 3 and selects it.
+    fn paste_line(a: &mut App) -> Shape {
+        let line = Shape::Line {
+            a: Point::new(7.0, 0.0),
+            b: Point::new(7.0, 5.0),
+        };
+        let page = a.open.as_mut().unwrap().project.page_mut("p0003").unwrap();
+        page.graphics.push(line.clone());
+        a.ed.selection = vec![Selection::Graphic(page.graphics.len() - 1)];
+        line
+    }
+
+    fn graphics3(a: &App) -> Vec<Shape> {
+        a.open.as_ref().unwrap().project.page("p0003").unwrap().graphics.clone()
+    }
+
+    #[test]
+    fn a_guests_pasted_drawing_is_selected_again_once_the_host_accepts_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_dir, mut a, mut h, mut host_open) = guest_window(tmp.path());
+        let line = paste_line(&mut a);
+        // Sent: until the host answers, the page shows the session's copy without it.
+        a.sync_session_now(false);
+        a.sync_session_now(false);
+        assert!(graphics3(&a).is_empty());
+        assert!(a.ed.selection.is_empty(), "no stale index stays selected");
+        h.frame(Some(&mut host_open), Some("p0002".into()), false);
+        a.sync_session_now(false);
+        assert_eq!(graphics3(&a), vec![line]);
+        assert_eq!(a.ed.selection, vec![Selection::Graphic(0)]);
+        assert!(a.ed.waiting_graphics.is_none());
+    }
+
+    #[test]
+    fn a_selection_made_while_a_paste_waits_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_dir, mut a, mut h, mut host_open) = guest_window(tmp.path());
+        paste_line(&mut a);
+        a.sync_session_now(false);
+        a.ed.selection = vec![Selection::Symbol("other".into())];
+        h.frame(Some(&mut host_open), Some("p0002".into()), false);
+        a.sync_session_now(false);
+        assert_eq!(graphics3(&a).len(), 1);
+        assert_eq!(a.ed.selection, vec![Selection::Symbol("other".into())]);
+    }
+
+    #[test]
+    fn a_later_paste_ends_the_wait_for_an_earlier_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_dir, mut a, mut h, mut host_open) = guest_window(tmp.path());
+        let first = paste_line(&mut a);
+        a.sync_session_now(false);
+        // A second paste, selected on its own, also waits for the host.
+        let page = a.open.as_mut().unwrap().project.page_mut("p0003").unwrap();
+        page.graphics.push(Shape::Line {
+            a: Point::new(8.0, 0.0),
+            b: Point::new(8.0, 5.0),
+        });
+        a.ed.selection = vec![Selection::Graphic(page.graphics.len() - 1)];
+        a.sync_session_now(false);
+        for _ in 0..3 {
+            h.frame(Some(&mut host_open), Some("p0002".into()), false);
+            a.sync_session_now(false);
+        }
+        // The first paste is back, but the user had moved on from it: it is not selected.
+        assert!(graphics3(&a).contains(&first));
+        let at = graphics3(&a).iter().position(|g| *g == first).unwrap();
+        assert!(
+            !a.ed.selection.contains(&Selection::Graphic(at)),
+            "{:?}",
+            a.ed.selection
+        );
+    }
+
+    #[test]
+    fn a_selected_drawing_that_moves_does_not_end_the_wait() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_dir, mut a, mut h, mut host_open) = guest_window(tmp.path());
+        let line = |x: f64| Shape::Line {
+            a: Point::new(x, 0.0),
+            b: Point::new(x, 5.0),
+        };
+        // A drawing already on the page, then a paste; both are selected.
+        let page = host_open.project.page_mut("p0003").unwrap();
+        page.graphics.push(line(1.0));
+        h.frame(Some(&mut host_open), Some("p0002".into()), false);
+        a.sync_session_now(false);
+        assert_eq!(graphics3(&a), vec![line(1.0)]);
+        let pasted = paste_line(&mut a);
+        a.ed.selection = vec![Selection::Graphic(0), Selection::Graphic(1)];
+        a.sync_session_now(false);
+        assert_eq!(a.ed.selection, vec![Selection::Graphic(0)]);
+        // The host takes the paste and puts another drawing in front before the guest looks.
+        h.frame(Some(&mut host_open), Some("p0002".into()), false);
+        let page = host_open.project.page_mut("p0003").unwrap();
+        page.graphics.insert(0, line(2.0));
+        h.frame(Some(&mut host_open), Some("p0002".into()), false);
+        a.sync_session_now(false);
+        let now = graphics3(&a);
+        let at = |g: &Shape| Selection::Graphic(now.iter().position(|x| x == g).unwrap());
+        let mut sel = a.ed.selection.clone();
+        sel.sort_by_key(|s| format!("{s:?}"));
+        let mut want = vec![at(&line(1.0)), at(&pasted)];
+        want.sort_by_key(|s| format!("{s:?}"));
+        assert_eq!(sel, want, "{now:?}");
+    }
+
+    #[test]
+    fn an_equal_drawing_the_host_adds_is_not_taken_for_a_refused_paste() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_dir, mut a, mut h, mut host_open) = guest_window(tmp.path());
+        h.frame(Some(&mut host_open), Some("p0003".into()), false);
+        let line = paste_line(&mut a);
+        a.sync_session_now(false);
+        assert!(a.ed.waiting_graphics.is_some(), "the paste waits for the host");
+        // The host refuses it and draws the same line itself; the guest sees both at once.
+        h.frame(Some(&mut host_open), Some("p0003".into()), false);
+        host_open.project.page_mut("p0003").unwrap().graphics.push(line.clone());
+        h.frame(Some(&mut host_open), Some("p0003".into()), false);
+        a.sync_session_now(false);
+        assert_eq!(graphics3(&a), vec![line]);
+        assert!(a.ed.selection.is_empty(), "the host's line is not the guest's paste");
+        assert!(a.ed.waiting_graphics.is_none());
+    }
+
+    #[test]
+    fn an_equal_drawing_that_comes_with_a_late_refusal_is_not_taken_for_the_paste() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_dir, mut a, mut h, mut host_open) = guest_window(tmp.path());
+        h.frame(Some(&mut host_open), Some("p0003".into()), false);
+        let line = paste_line(&mut a);
+        a.sync_session_now(false);
+        assert!(a.ed.waiting_graphics.is_some(), "the paste waits for the host");
+        // The host refuses the paste and draws the same line itself; the refusal reaches the
+        // guest only after its frame looked at the picks (in the frame's late pump).
+        h.frame(Some(&mut host_open), Some("p0003".into()), false);
+        host_open.project.page_mut("p0003").unwrap().graphics.push(line.clone());
+        h.frame(Some(&mut host_open), Some("p0003".into()), false);
+        a.share.refusals_come_late = true;
+        a.sync_session_now(false);
+        assert_eq!(graphics3(&a), vec![line]);
+        assert!(a.ed.selection.is_empty(), "the host's line is not the guest's paste");
+        assert!(a.ed.waiting_graphics.is_none());
+    }
+
+    #[test]
+    fn a_guests_paste_the_host_refuses_leaves_nothing_selected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_dir, mut a, mut h, mut host_open) = guest_window(tmp.path());
+        // The host opens page 3 before the guest's paste reaches it.
+        h.frame(Some(&mut host_open), Some("p0003".into()), false);
+        paste_line(&mut a);
+        a.sync_session_now(false);
+        assert!(a.ed.waiting_graphics.is_some(), "the paste waits for the host");
+        for _ in 0..3 {
+            h.frame(Some(&mut host_open), Some("p0003".into()), false);
+            a.sync_session_now(false);
+        }
+        assert!(graphics3(&a).is_empty());
+        assert!(a.ed.selection.is_empty());
+        assert!(a.ed.waiting_graphics.is_none(), "nothing waits once the host refused");
+    }
+
+    #[test]
+    fn a_guests_tool_edit_says_it_waits_for_the_host_and_is_taken_back_when_refused() {
+        let line = Shape::Line {
+            a: Point::new(1.0, 0.0),
+            b: Point::new(1.0, 5.0),
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut h, _log, mut host_open, mut g, mut guest_open) = crate::share::tests::session(tmp.path()).unwrap();
+        crate::share::tests::frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0001"));
+        let (_tmp, mut a) = app(vec![]);
+        a.open = Some(guest_open);
+        a.share = g;
+        a.ed.page = 0;
+        a.sync_session_now(false);
+        // Reading changes nothing, so nothing waits on the host.
+        let out = call(&mut a, "get_page", json!({"page": "p0003"})).unwrap();
+        assert!(!out.contains("Pending"), "{out}");
+        // The host opens page 3; before that reaches the guest, its assistant draws there.
+        h.frame(Some(&mut host_open), Some("p0003".into()), false);
+        let out = call(&mut a, "add_graphic", json!({"page": "p0003", "shape": line})).unwrap();
+        assert!(out.contains("Pending") && out.contains("host accepts"), "{out}");
+        for _ in 0..4 {
+            a.sync_session_now(false);
+            h.frame(Some(&mut host_open), Some("p0003".into()), false);
+        }
+        let graphics = |o: &Open| o.project.page("p0003").unwrap().graphics.clone();
+        assert!(graphics(&host_open).is_empty(), "the host refused the edit");
+        assert!(
+            graphics(a.open.as_ref().unwrap()).is_empty(),
+            "and it is taken back here"
+        );
+        // Refused outright when the hold is known.
+        let err = call(&mut a, "add_graphic", json!({"page": "p0003", "shape": line})).unwrap_err();
+        assert!(err.contains("Hanna"), "{err}");
+    }
+
+    /// A guest's window in a session with the host showing page 2 and the guest page 1.
+    fn guest_app(tmp: &std::path::Path) -> (tempfile::TempDir, App) {
+        let (mut h, _log, mut host_open, mut g, mut guest_open) = crate::share::tests::session(tmp).unwrap();
+        crate::share::tests::frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0001"));
+        let (dir, mut a) = app(vec![]);
+        a.open = Some(guest_open);
+        a.share = g;
+        a.ed.page = 0;
+        a.sync_session_now(false);
+        (dir, a)
+    }
+
+    #[test]
+    fn a_guests_tool_call_that_changes_nothing_is_not_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_dir, mut a) = guest_app(tmp.path());
+        let out = call(
+            &mut a,
+            "place_symbol",
+            json!({"symbol": "wc.coil", "x": 50, "y": 50, "page": "3"}),
+        )
+        .unwrap();
+        assert!(out.contains("Pending"), "{out}");
+        let id = a.open.as_ref().unwrap().project.page("p0003").unwrap().symbols[0]
+            .id
+            .clone();
+        // An update that names only the symbol takes an undo step but changes nothing.
+        let out = call(&mut a, "update_symbol", json!({"page": "3", "id": id})).unwrap();
+        assert!(!out.contains("Pending"), "{out}");
+    }
+
+    #[test]
+    fn a_guests_command_that_changes_the_project_is_pending_when_it_ends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_dir, mut a) = guest_app(tmp.path());
+        // As the assistant runs it: started, then finished through the tools.
+        let through_tools = |a: &mut App, meanwhile: &dyn Fn(&mut App)| {
+            let args = json!({"args": ["--help"]});
+            let Started::Running(p) = wc_agent::Tools::start(&mut AppTools(a), "run_command", &args) else {
+                return "not started".to_owned();
+            };
+            meanwhile(a);
+            let r = p.wait();
+            wc_agent::Tools::finish(&mut AppTools(a), "run_command", &args, r).unwrap_or_else(|e| e)
+        };
+        let r = through_tools(&mut a, &|a| command_writes_customer(a, "Disk"));
+        assert_eq!(customer(&a).as_deref(), Some("Disk"));
+        assert!(r.contains("Pending"), "{r}");
+        // A command that leaves the project alone is not.
+        let r = through_tools(&mut a, &|_| {});
+        assert!(!r.contains("Pending"), "{r}");
+        // Nor is one during which the user moved a jumpered terminal in the window: its jumper
+        // follows when the command ends, but that is the window's change, not the command's.
+        let o = a.open.as_mut().unwrap();
+        let page = o.project.pages.iter().position(|p| p.id == "p0003").unwrap();
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        let mut ids = Vec::new();
+        for at in [10.0, 20.0, 30.0] {
+            let id = o.place(page, "wc.terminal", Point::new(at, 20.0)).unwrap();
+            o.project.pages[page]
+                .symbols
+                .iter_mut()
+                .find(|s| s.id == id)
+                .unwrap()
+                .tag = Some(x1.clone());
+            ids.push(id);
+        }
+        o.add_jumper(&x1, &["1".into(), "2".into()]).unwrap();
+        let moved = ids[0].clone();
+        let r = through_tools(&mut a, &|a| {
+            let o = a.open.as_mut().unwrap();
+            o.checkpoint();
+            o.project.pages[page]
+                .symbols
+                .iter_mut()
+                .find(|s| s.id == moved)
+                .unwrap()
+                .at = Point::new(40.0, 20.0);
+        });
+        assert_eq!(
+            a.open.as_ref().unwrap().project.meta.jumpers[0].terminals,
+            ["1", "3"],
+            "the jumper followed"
+        );
+        assert!(!r.contains("Pending"), "{r}");
+    }
+
+    #[test]
+    fn a_hosts_tool_edit_is_not_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (h, _log, host_open, ..) = crate::share::tests::session(tmp.path()).unwrap();
+        let (_tmp, mut a) = app(vec![]);
+        a.open = Some(host_open);
+        a.share = h;
+        let out = call(&mut a, "add_page", json!({"title": "Pumps"})).unwrap();
+        assert!(!out.contains("Pending"), "{out}");
+    }
+
+    #[test]
+    fn revision_clouds_and_the_table_are_named_cut_and_followed_safely() {
+        use crate::state::RevisionRow;
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        open.project.add_revision("A", "2026-11-19", "First issue", "").unwrap();
+        let p = |x, y| Point::new(x, y);
+        open.add_cloud(1, p(20.0, 20.0), p(60.0, 40.0)).unwrap();
+        open.add_cloud(1, p(100.0, 20.0), p(140.0, 40.0)).unwrap();
+        open.place_revision_table(1, p(200.0, 150.0)).unwrap();
+        let line = Shape::Line {
+            a: p(0.0, 0.0),
+            b: p(5.0, 0.0),
+        };
+        open.project.pages[1].graphics = vec![line.clone()];
+        a.ed.page = 1;
+
+        // The ids the state gives are taken back.
+        let page = a.open.as_ref().unwrap().project.pages[1].number.clone();
+        call(
+            &mut a,
+            "move_items",
+            json!({"page": page, "ids": ["revision table"], "dx": 10, "dy": 0}),
+        )
+        .unwrap();
+        assert_eq!(
+            a.open.as_ref().unwrap().project.pages[1].revision_table,
+            Some(p(210.0, 150.0))
+        );
+        // A cloud is named by what it is, as the state shows it when selected.
+        a.ed.selection = vec![Selection::Cloud(1)];
+        let second = cloud_id(&a.open.as_ref().unwrap().project.pages[1].clouds[1]);
+        assert_eq!(second, "cloud A at 100,20 to 140,40");
+        assert!(a.agent_context().contains(&second), "{}", a.agent_context());
+        // get_state gives the same id.
+        let state: Value = serde_json::from_str(&call(&mut a, "get_state", json!({})).unwrap()).unwrap();
+        assert_eq!(state["selection"], json!([second]));
+        call(
+            &mut a,
+            "move_items",
+            json!({"page": page, "ids": [second], "dx": 1, "dy": 0}),
+        )
+        .unwrap();
+        assert_eq!(a.open.as_ref().unwrap().project.pages[1].clouds[1].min, p(101.0, 20.0));
+        // An id read before the cloud changed names nothing now, rather than another cloud.
+        let err = call(
+            &mut a,
+            "move_items",
+            json!({"page": page, "ids": [second], "dx": 1, "dy": 0}),
+        )
+        .unwrap_err();
+        assert!(err.contains("No item"), "{err}");
+
+        // Cut of a drawing with a cloud and the table: the drawing goes to the clipboard, the
+        // cloud and the table (which Paste cannot bring back) stay, selected.
+        a.ed.selection = vec![Selection::Graphic(0), Selection::Cloud(0), Selection::RevisionTable];
+        a.run(Action::Cut);
+        let pg = &a.open.as_ref().unwrap().project.pages[1];
+        assert!(pg.graphics.is_empty());
+        assert_eq!((pg.clouds.len(), pg.revision_table.is_some()), (2, true));
+        assert_eq!(a.ed.selection, [Selection::Cloud(0), Selection::RevisionTable]);
+        // Paste brings the drawing back; the cloud and the table were never gone.
+        a.run(Action::Paste);
+        let pg = &a.open.as_ref().unwrap().project.pages[1];
+        assert_eq!(pg.graphics.len(), 1, "the drawing is pasted back");
+        assert_eq!((pg.clouds.len(), pg.revision_table.is_some()), (2, true));
+
+        // The assistant deletes the first cloud while it is selected on screen: the other, now
+        // in the first place, does not become selected.
+        let page = a.open.as_ref().unwrap().project.pages[1].number.clone();
+        let second = a.open.as_ref().unwrap().project.pages[1].clouds[1].clone();
+        a.ed.selection = vec![Selection::Cloud(0)];
+        let pg = &a.open.as_ref().unwrap().project.pages[1];
+        let first = cloud_id(&pg.clouds[0]);
+        call(&mut a, "delete_items", json!({"page": page, "ids": [first]})).unwrap();
+        assert!(
+            a.ed.selection.is_empty(),
+            "the other cloud is not selected: {:?}",
+            a.ed.selection
+        );
+        // The deleted cloud's id, used again, does not name the cloud now in its place.
+        let err = call(&mut a, "delete_items", json!({"page": page, "ids": [first]})).unwrap_err();
+        assert!(err.contains("No item"), "{err}");
+        a.ed.selection.clear();
+        assert_eq!(
+            a.open.as_ref().unwrap().project.pages[1].clouds,
+            std::slice::from_ref(&second)
+        );
+        a.open.as_mut().unwrap().undo();
+
+        // A selected cloud follows its cloud when one before it goes.
+        let old = a.open.as_ref().unwrap().project.pages[1].clouds.clone();
+        let new = vec![old[1].clone()];
+        let mut sel = vec![Selection::Cloud(1), Selection::Cloud(0), Selection::RevisionTable];
+        crate::edit::remap_clouds(&mut sel, &old, &new);
+        assert_eq!(sel, [Selection::Cloud(0), Selection::RevisionTable]);
+
+        // Revision rows edited after someone else changed the revisions are not applied.
+        let open = a.open.as_mut().unwrap();
+        let loaded = RevisionRow::of(&open.project.meta.revisions);
+        let mut draft = loaded.clone();
+        draft[0].text = "First issue, corrected".into();
+        assert_eq!(open.revision_draft_problem(&loaded, &draft), None);
+        open.project
+            .add_revision("B", "2026-11-20", "Added elsewhere", "")
+            .unwrap();
+        let why = open.revision_draft_problem(&loaded, &draft).unwrap();
+        assert!(why.contains("changed by someone else"), "{why}");
+        assert_eq!(
+            open.revision_draft_problem(&loaded, &loaded),
+            None,
+            "rows left alone are not applied"
+        );
+    }
+
+    #[test]
+    fn a_selected_cloud_follows_its_cloud_when_the_session_puts_one_back_before_it() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        open.project.add_revision("A", "2026-11-19", "First issue", "").unwrap();
+        for x in [20.0, 100.0, 180.0] {
+            open.add_cloud(1, Point::new(x, 20.0), Point::new(x + 40.0, 40.0))
+                .unwrap();
+        }
+        let clouds = open.project.pages[1].clouds.clone();
+        a.share.start_host(open, "Hanna", "hanna@example.com").unwrap();
+        a.ed.page = 1;
+        // Take the first cloud off; the second is then cloud 0, and selected.
+        let open = a.open.as_mut().unwrap();
+        open.checkpoint();
+        open.project.pages[1].clouds.remove(0);
+        a.sync_session_now(false);
+        a.ed.selection = vec![Selection::Cloud(0)];
+        // The session's undo puts the first cloud back in front: the selection follows the
+        // second cloud rather than staying on the place it had.
+        a.share.undo().unwrap();
+        a.sync_session_now(false);
+        assert_eq!(a.open.as_ref().unwrap().project.pages[1].clouds, clouds);
+        assert_eq!(a.ed.selection, vec![Selection::Cloud(1)]);
+    }
+
+    #[test]
+    fn the_pdf_export_draws_a_topology_page_per_network() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        open.project.meta.networks.push(wc_core::network::Network {
+            name: "PN1".into(),
+            links: vec![wc_core::network::Link {
+                from: "-A1:X1".into(),
+                to: "-K10:P1".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let m = crate::export_pdf(a.open.as_ref().unwrap());
+        assert!(m.starts_with("Exported"), "{m}");
+        let dir = a.open.as_ref().unwrap().dir.join("export");
+        let pdf = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "pdf"))
+            .unwrap();
+        let text = String::from_utf8_lossy(&std::fs::read(pdf).unwrap()).into_owned();
+        let title: String = "N1 Network PN1".bytes().map(|b| format!("{b:02X}")).collect();
+        assert!(text.contains(&format!("/Title <{title}>")));
+    }
+
+    #[test]
+    fn a_macros_placeholders_and_value_sets_are_edited_in_the_dialog_and_each_variant_inserted() {
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        let id = open.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let mut clip = open.copy(1, &[Selection::Symbol(id)]);
+        clip.graphics.push(wc_core::Shape::Text {
+            at: Point::new(20.0, 40.0),
+            text: "{{kW}} kW".into(),
+            height: 2.5,
+            align: Default::default(),
+            angle: 0.0,
+        });
+        // Saved with an undeclared placeholder, it cannot be inserted yet.
+        let path = open.save_macro(&clip, "Starter", "").unwrap();
+        assert!(open.insert_macro(1, &path, None).is_err());
+
+        a.run(Action::InsertMacro);
+        let Some(Dialog::Macros(list)) = &a.dialog else {
+            unreachable!("the macros are listed");
+        };
+        assert!(list[0].error.is_some(), "the undeclared placeholder is shown");
+        a.edit_macro(&path);
+        let Some(Dialog::MacroEdit { mut form, .. }) = a.dialog.take() else {
+            unreachable!("the placeholders dialog opens");
+        };
+        form.add_placeholder();
+        form.placeholders[0].name = "kW".into();
+        form.placeholders[0].description = "Motor power".into();
+        // A second placeholder of the same name is refused.
+        form.add_placeholder();
+        form.placeholders[1].name = "KW".into();
+        let err = form.save().unwrap_err();
+        assert!(err.contains("declared twice"), "{err}");
+        form.remove_placeholder(1);
+        form.add_set();
+        form.sets[0].name = "Small".into();
+        form.sets[0].values[0] = "0.75".into();
+        form.add_set();
+        form.sets[1].name = "Large".into();
+        // A value for a placeholder without a name is refused.
+        form.add_placeholder();
+        form.sets[1].values[1] = "x".into();
+        let err = form.save().unwrap_err();
+        assert!(err.contains("without a name"), "{err}");
+        form.remove_placeholder(1);
+        form.sets[1].values[0] = "3".into();
+        form.save().unwrap();
+
+        // Renamed in the dialog, the placeholder is renamed in the macro's text.
+        let mut form = crate::macro_form::Form::open(&path).unwrap();
+        assert_eq!(form.sets.len(), 2);
+        assert_eq!(form.sets[1].values, ["3"]);
+        form.placeholders[0].name = "power".into();
+        form.save().unwrap();
+        let m = wc_core::macros::read_macro(&path).unwrap();
+        assert_eq!(m.used_placeholders(), ["power"]);
+        assert_eq!(m.value_set("small").unwrap().values["power"], "0.75");
+
+        let open = a.open.as_mut().unwrap();
+        let entry = open.macros().into_iter().find(|e| e.path == path).unwrap();
+        assert_eq!(
+            (entry.error, entry.value_sets),
+            (None, vec!["Small".to_owned(), "Large".to_owned()])
+        );
+        for (set, text) in [("Small", "0.75 kW"), ("Large", "3 kW")] {
+            open.insert_macro(1, &path, Some(set)).unwrap();
+            assert!(
+                open.project.pages[1]
+                    .graphics
+                    .iter()
+                    .any(|g| matches!(g, wc_core::Shape::Text { text: t, .. } if t == text)),
+                "{set} is inserted with {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_placeholders_dialog_keeps_what_it_does_not_edit_and_renames_together() {
+        use wc_core::macros::{Macro, Placeholder, ValueSet};
+        let (tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        let text = |t: &str| wc_core::Shape::Text {
+            at: Point::new(0.0, 0.0),
+            text: t.into(),
+            height: 2.5,
+            align: Default::default(),
+            angle: 0.0,
+        };
+        let declare = |name: &str, default: &str| Placeholder {
+            name: name.into(),
+            description: String::new(),
+            default: default.into(),
+        };
+        let m = Macro {
+            name: "Swap".into(),
+            graphics: vec![text("{{a}}"), text("{{b}}"), text("{{Ø}}")],
+            placeholders: vec![declare("a", "1"), declare("b", "2"), declare("Ø", "fallback")],
+            value_sets: vec![ValueSet {
+                name: "One".into(),
+                description: String::new(),
+                // Stored under a name that differs only in case (not ASCII), and empty.
+                values: [("ø", ""), ("a", "x")]
+                    .into_iter()
+                    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                    .collect(),
+            }],
+            ..Default::default()
+        };
+        let path = wc_core::macros::write_macro(&open.dir, "swap", &m).unwrap();
+
+        // Opened and saved untouched, the empty value stays a value, not the default.
+        let form = crate::macro_form::Form::open(&path).unwrap();
+        assert_eq!(form.sets[0].values, ["x", "", ""]);
+        form.save().unwrap();
+        let saved = wc_core::macros::read_macro(&path).unwrap();
+        assert_eq!(
+            saved.value_set("one").unwrap().values.get("Ø").map(String::as_str),
+            Some("")
+        );
+        let placed = saved.apply(Some("One"), &Default::default()).unwrap();
+        assert!(
+            placed
+                .graphics
+                .iter()
+                .all(|g| !matches!(g, wc_core::Shape::Text { text, .. } if text == "fallback"))
+        );
+        // Typed in and cleared in the dialog, a cell uses the default again.
+        let mut form = crate::macro_form::Form::open(&path).unwrap();
+        let ctx = egui::Context::default();
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let cell = crate::macro_form::cell_id(0, 2);
+        for events in [
+            vec![],
+            vec![egui::Event::Text("7".into())],
+            vec![key(egui::Key::Backspace)],
+            vec![],
+        ] {
+            let raw = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| crate::macro_form::show(ui, &mut form));
+                ctx.memory_mut(|m| m.request_focus(cell));
+            });
+        }
+        assert_eq!(form.sets[0].values[2], "");
+        assert!(
+            !form.sets[0].stored_empty[2],
+            "edited, it is no longer the stored empty value"
+        );
+        form.save().unwrap();
+        let saved = wc_core::macros::read_macro(&path).unwrap();
+        assert_eq!(saved.value_set("one").unwrap().values.get("Ø"), None);
+
+        // Two placeholders swapped: each use takes the other's name, once.
+        let mut form = crate::macro_form::Form::open(&path).unwrap();
+        form.placeholders[0].name = "b".into();
+        form.placeholders[1].name = "a".into();
+        form.save().unwrap();
+        let saved = wc_core::macros::read_macro(&path).unwrap();
+        assert_eq!(saved.used_placeholders(), ["b", "a", "Ø"]);
+        assert_eq!(
+            saved.value_set("one").unwrap().values.get("b").map(String::as_str),
+            Some("x")
+        );
+
+        // A value for a name no placeholder declares is reported, not dropped.
+        let mut m = saved.clone();
+        m.value_sets[0].values.insert("voltage".into(), "400".into());
+        wc_core::macros::write_macro(&open.dir, "swap", &m).unwrap();
+        let form = crate::macro_form::Form::open(&path).unwrap();
+        let err = form.save().unwrap_err();
+        assert!(err.contains("voltage"), "the undeclared value is reported: {err}");
+        assert_eq!(
+            wc_core::macros::read_macro(&path).unwrap(),
+            m,
+            "and the file is left as it was"
+        );
+
+        // A file changed outside the dialog after it opened is not written over.
+        wc_core::macros::write_macro(&open.dir, "swap", &saved).unwrap();
+        let form = crate::macro_form::Form::open(&path).unwrap();
+        let mut changed = saved.clone();
+        changed.description = "Edited elsewhere".into();
+        wc_core::macros::write_macro(&open.dir, "swap", &changed).unwrap();
+        let err = form.save().unwrap_err();
+        assert!(err.contains("changed outside"), "{err}");
+        assert_eq!(wc_core::macros::read_macro(&path).unwrap(), changed);
+        // A file that cannot be read again says why, not that it changed.
+        let form = crate::macro_form::Form::open(&path).unwrap();
+        std::fs::write(&path, "{ not json").unwrap();
+        let err = form.save().unwrap_err();
+        assert!(err.contains("could not be read again"), "{err}");
+        wc_core::macros::write_macro(&open.dir, "swap", &changed).unwrap();
+
+        // A library source named "project" is still a library: its macros are not the project's.
+        let lib = tmp.path().join("lib");
+        wc_core::macros::write_macro(&lib, "lamp", &saved).unwrap();
+        open.project.meta.libraries.push(wc_core::project::LibrarySource {
+            name: "project".into(),
+            kind: "folder".into(),
+            location: lib.display().to_string(),
+            reference: None,
+        });
+        let list = open.macros();
+        let of = |p: &std::path::Path| {
+            list.iter()
+                .find(|e| e.path.starts_with(p))
+                .map(|e| (e.source.as_str(), e.project))
+        };
+        assert_eq!(of(&path), Some(("project", true)));
+        assert_eq!(of(&lib), Some(("project", false)));
+    }
+
+    #[test]
+    fn translations_edited_in_the_dialog_are_saved_and_the_pdf_is_exported_in_the_language_chosen() {
+        use wc_core::translate::{Dictionary, TRANSLATIONS_FILE};
+        let hex = |s: &str| {
+            let mut out = String::from("<");
+            for b in s.bytes() {
+                out.push_str(&format!("{b:02X}"));
+            }
+            out + ">"
+        };
+        let (_tmp, mut a) = app(vec![]);
+        let dir = a.open.as_ref().unwrap().dir.clone();
+        a.open.as_mut().unwrap().project.pages[1].title = "Pumps".into();
+        a.open.as_mut().unwrap().project.pages[1]
+            .graphics
+            .push(wc_core::Shape::Text {
+                at: Point::new(20.0, 20.0),
+                text: "Spare".into(),
+                height: 2.5,
+                align: Default::default(),
+                angle: 0.0,
+            });
+        // Without a dictionary no language is asked for: only where to save, and the PDF is
+        // printed as drawn.
+        a.run(Action::ExportPdf);
+        assert!(a.dialog.is_none());
+        assert!(matches!(
+            &a.pending,
+            Some(crate::Pending::Export(crate::Export::Pdf(langs))) if langs.is_empty()
+        ));
+        a.pending = None;
+        std::fs::write(
+            dir.join(TRANSLATIONS_FILE),
+            "source = \"en\"\n\n[[text]]\nen = \"Pumps\"\nnb = \"Pumper\"\n",
+        )
+        .unwrap();
+
+        a.dialog = None;
+        a.run(Action::Translations);
+        let Some(Dialog::Translations(mut form)) = a.dialog.take() else {
+            unreachable!("the translations dialog opens");
+        };
+        assert_eq!(form.langs, ["nb"]);
+        let row = |f: &crate::translations_form::Form, t: &str| f.rows.iter().position(|r| r.text == t).unwrap();
+        assert_eq!(form.rows[row(&form, "Pumps")].cells, ["Pumper"]);
+        assert_eq!(form.missing(0), form.rows.len() - 1, "every text but Pumps is missing");
+        let spare = row(&form, "Spare");
+        form.rows[spare].cells[0] = "Reserve".into();
+        form.new_lang = "DE".into();
+        form.add_language().unwrap();
+        assert!(form.add_language().is_err(), "an empty code is refused");
+        form.new_lang = "nb".into();
+        assert!(form.add_language().is_err(), "a language already shown is refused");
+        form.rows[spare].cells[1] = "Ersatz".into();
+        // Edited in the file meanwhile: kept, as the dialog did not change it.
+        std::fs::write(
+            dir.join(TRANSLATIONS_FILE),
+            "source = \"en\"\n\n[[text]]\nen = \"Pumps\"\nnb = \"Pumpene\"\n",
+        )
+        .unwrap();
+        assert_eq!(form.save().unwrap(), "Saved 2 translations to translations.toml.");
+        let d = Dictionary::load(&dir).unwrap();
+        assert_eq!(d.lookup("Spare", "nb").as_deref(), Some("Reserve"));
+        assert_eq!(d.lookup("Spare", "de").as_deref(), Some("Ersatz"));
+        assert_eq!(d.lookup("Pumps", "nb").as_deref(), Some("Pumpene"));
+
+        // With translations, the export asks for the language.
+        a.run(Action::ExportPdf);
+        let Some(Dialog::PdfLanguage { langs, .. }) = &a.dialog else {
+            unreachable!("the language is asked for");
+        };
+        assert_eq!(langs, &["en", "nb", "de"]);
+        let open = a.open.as_ref().unwrap();
+        let m = crate::export_pdf_in(open, &["nb".into(), "en".into()]);
+        assert!(m.starts_with("Exported"), "{m}");
+        assert!(m.contains("no translation for"), "missing texts are warned about: {m}");
+        assert!(!m.contains("\"Spare\""), "{m}");
+        // The message is logged, so it names where the text is used but not the text itself.
+        let dict = Dictionary::load(&dir).unwrap();
+        let (_, missing) = wc_core::translate::translate(&open.project, &dict, &["nb".into(), "en".into()]);
+        assert!(!missing.is_empty());
+        for t in &missing {
+            assert!(
+                !m.contains(&format!("{:?}", t.text)),
+                "drawing text stays out of the logged message: {m}"
+            );
+        }
+        let pdf_path = std::fs::read_dir(dir.join("export"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "pdf"))
+            .unwrap();
+        let pdf = String::from_utf8_lossy(&std::fs::read(pdf_path).unwrap()).into_owned();
+        assert!(pdf.contains(&hex("Reserve / Spare")), "the texts are in both languages");
+        assert!(pdf.contains(&hex("Pumpene / Pumps")));
+    }
+
+    #[test]
+    fn check_rules_added_changed_and_deleted_in_the_dialog_are_kept_checked_and_undone() {
+        use crate::rules_form::{Change, RuleRow, change, rows_of};
+        use wc_core::check_rule::CheckRule;
+        let (_tmp, mut a) = app(vec![]);
+        let rules = |a: &App| a.open.as_ref().unwrap().project.meta.rules.clone();
+        let broken = |a: &App| match &a.dialog {
+            Some(Dialog::Check(found)) => Some(found.iter().filter(|f| f.message.contains("house rule")).count()),
+            _ => None,
+        };
+        a.open.as_mut().unwrap().project.pages[1]
+            .symbols
+            .push(wc_core::project::PlacedSymbol {
+                id: "s1".into(),
+                symbol: "wc.coil".into(),
+                at: Point::new(50.0, 50.0),
+                rotation: Default::default(),
+                mirror: false,
+                tag: DeviceTag::parse("-K1").ok(),
+            });
+        assert!(rules(&a).is_empty());
+        // Add: every tag must match a pattern none does.
+        a.edit_rules();
+        let Some(Dialog::Rules { mut rows, loaded, dir }) = a.dialog.take() else {
+            unreachable!("the rules dialog opens");
+        };
+        let mut row = RuleRow::new("tag");
+        row.pattern = "-ZZ#".into();
+        row.severity = "error".into();
+        row.message = "{tag} breaks the house rule".into();
+        rows.push(row);
+        a.apply_rules(&rows, &loaded, &dir).unwrap();
+        assert_eq!(rules(&a).len(), 1);
+        assert!(
+            broken(&a).unwrap() > 0,
+            "the check list has the rule's findings at once"
+        );
+        a.open.as_mut().unwrap().save().unwrap();
+        let toml = std::fs::read_to_string(a.open.as_ref().unwrap().dir.join("project.toml")).unwrap();
+        assert!(toml.contains("[[rule]]") && toml.contains("-ZZ#"), "{toml}");
+
+        // Change: a pattern every tag matches leaves no finding.
+        let loaded = rules(&a);
+        let mut rows = rows_of(&loaded);
+        rows[0].pattern = "*".into();
+        a.apply_rules(&rows, &loaded, &dir).unwrap();
+        assert_eq!(rules(&a)[0].pattern.as_deref(), Some("*"));
+        assert_eq!(broken(&a), Some(0));
+
+        // Delete, then undo back to each earlier list.
+        let loaded = rules(&a);
+        a.apply_rules(&[], &loaded, &dir).unwrap();
+        assert!(rules(&a).is_empty());
+        let o = a.open.as_mut().unwrap();
+        assert!(o.undo());
+        assert_eq!(o.project.meta.rules[0].pattern.as_deref(), Some("*"));
+        assert!(o.undo());
+        assert_eq!(o.project.meta.rules[0].pattern.as_deref(), Some("-ZZ#"));
+        assert!(o.undo());
+        assert!(o.project.meta.rules.is_empty());
+
+        // Reorder two rules: kept in the new order, and undo brings back the old one.
+        let two = vec![
+            CheckRule {
+                kind: "cable".into(),
+                ..CheckRule::default()
+            },
+            CheckRule {
+                kind: "tag".into(),
+                pattern: Some("*".into()),
+                ..CheckRule::default()
+            },
+        ];
+        a.open.as_mut().unwrap().set_check_rules(two.clone());
+        let mut rows = rows_of(&two);
+        change(&mut rows, Change::Up(1));
+        a.apply_rules(&rows, &two, &dir).unwrap();
+        let kinds = |a: &App| rules(a).iter().map(|r| r.kind.clone()).collect::<Vec<_>>();
+        assert_eq!(kinds(&a), ["tag", "cable"]);
+        assert!(a.open.as_mut().unwrap().undo());
+        assert_eq!(rules(&a), two);
+
+        // Rows left as loaded keep a change made meanwhile, and are no undo step: also when a
+        // loaded rule has a value the dialog would not write (a cable rule's max).
+        let odd = vec![CheckRule {
+            kind: "cable".into(),
+            max: Some(2),
+            ..CheckRule::default()
+        }];
+        let o = a.open.as_mut().unwrap();
+        o.project.meta.rules = [odd.clone(), two.clone()].concat();
+        let mark = o.undo_mark();
+        a.apply_rules(&rows_of(&odd), &odd, &dir).unwrap();
+        assert_eq!(rules(&a), [odd.clone(), two.clone()].concat());
+        assert_eq!(a.open.as_ref().unwrap().undo_mark(), mark);
+
+        // A row edited while another rule changed in the project: nothing is written, and
+        // the dialog stays open with the edit, now against the project's rules.
+        let mut rows = rows_of(&two);
+        rows[0].devices = "-M*".into();
+        let now = rules(&a);
+        let err = a.apply_rules(&rows, &two, &dir).err().unwrap();
+        assert!(err.contains("changed while you edited"), "{err}");
+        assert_eq!(rules(&a), now);
+        let Some(Dialog::Rules {
+            rows: kept,
+            loaded: against,
+            ..
+        }) = a.dialog.take()
+        else {
+            unreachable!("the draft stays open");
+        };
+        assert_eq!((kept.clone(), against.clone()), (rows, now));
+        // OK again keeps the draft.
+        a.apply_rules(&kept, &against, &dir).unwrap();
+        assert_eq!(rules(&a)[0].devices.as_deref(), Some("-M*"));
+
+        // Another project open now does not get the rules.
+        let err = a.apply_rules(&[], &odd, Path::new("elsewhere")).err().unwrap();
+        assert!(err.contains("another project"), "{err}");
+        assert_eq!(rules(&a).len(), 2);
+    }
+
+    #[test]
+    fn a_report_layout_made_in_the_dialog_is_kept_previewed_saved_and_undone() {
+        use wc_report::Kind;
+        let (_tmp, mut a) = app(vec![]);
+        let reports = |a: &App| a.open.as_ref().unwrap().project.meta.reports.clone();
+        let inputs_table = |a: &App| {
+            let o = a.open.as_ref().unwrap();
+            wc_report::build(
+                Kind::Parts,
+                &wc_report::Inputs {
+                    project: &o.project,
+                    symbols: &o.symbols,
+                    parts: &o.parts,
+                },
+            )
+        };
+        let builtin = inputs_table(&a).columns;
+        assert!(builtin.len() >= 2, "{builtin:?}");
+        let mark = a.open.as_ref().unwrap().undo_mark();
+
+        a.edit_report_layout(Kind::Parts);
+        let Some(Dialog::ReportLayout { mut form, dir }) = a.dialog.take() else {
+            unreachable!("the layout dialog opens");
+        };
+        assert_eq!(form.builtin, builtin);
+        // OK on the untouched form keeps no layout and changes nothing.
+        a.apply_report_layout(&form, &dir).unwrap();
+        assert!(reports(&a).is_empty());
+        assert_eq!(a.open.as_ref().unwrap().undo_mark(), mark);
+        assert!(
+            matches!(a.dialog, Some(Dialog::Reports(Kind::Parts))),
+            "back to the report"
+        );
+
+        form.title = "Bill of materials".into();
+        form.move_column(1, -1);
+        form.columns[0].heading = "First".into();
+        let last = form.columns.len() - 1;
+        form.columns[last].shown = false;
+        form.sort.push(crate::report_layout_form::SortRow {
+            column: builtin[0].clone(),
+            descending: true,
+        });
+        a.apply_report_layout(&form, &dir).unwrap();
+        let kept = reports(&a);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].kind, "parts");
+        assert_eq!(kept[0].sort, [format!("-{}", builtin[0])]);
+        // The report shows in it.
+        let t = inputs_table(&a);
+        assert_eq!(t.title, "Bill of materials");
+        assert_eq!(t.columns[0], "First");
+        assert_eq!(t.columns.len(), builtin.len() - 1);
+        a.open.as_mut().unwrap().save().unwrap();
+        let toml = std::fs::read_to_string(a.open.as_ref().unwrap().dir.join("project.toml")).unwrap();
+        assert!(
+            toml.contains("[[report]]") && toml.contains("Bill of materials"),
+            "{toml}"
+        );
+
+        // One undo step takes it back.
+        assert!(a.open.as_mut().unwrap().undo());
+        assert!(reports(&a).is_empty());
+        assert!(a.open.as_mut().unwrap().redo());
+        assert_eq!(reports(&a), kept);
+
+        // Edited while the project's layout changed: nothing is written and the draft stays open.
+        a.edit_report_layout(Kind::Parts);
+        let Some(Dialog::ReportLayout { mut form, dir }) = a.dialog.take() else {
+            unreachable!("the layout dialog opens");
+        };
+        a.open.as_mut().unwrap().project.meta.reports[0].title = Some("Theirs".into());
+        form.title = "Mine".into();
+        let err = a.apply_report_layout(&form, &dir).err().unwrap();
+        assert!(err.contains("changed while you edited"), "{err}");
+        assert_eq!(reports(&a)[0].title.as_deref(), Some("Theirs"));
+        let Some(Dialog::ReportLayout { form: again, .. }) = a.dialog.take() else {
+            unreachable!("the draft stays open");
+        };
+        assert_eq!(again.title, "Mine");
+        a.apply_report_layout(&again, &dir).unwrap();
+        assert_eq!(reports(&a)[0].title.as_deref(), Some("Mine"));
+
+        // Saved "Mine", draft "B", someone saves "Theirs", the draft goes back to "Mine": OK
+        // keeps "Mine", the layout shown, in place of "Theirs".
+        a.edit_report_layout(Kind::Parts);
+        let Some(Dialog::ReportLayout { mut form, dir }) = a.dialog.take() else {
+            unreachable!("the layout dialog opens");
+        };
+        form.title = "B".into();
+        a.open.as_mut().unwrap().project.meta.reports[0].title = Some("Theirs".into());
+        assert!(a.apply_report_layout(&form, &dir).is_err());
+        let Some(Dialog::ReportLayout { form: mut again, .. }) = a.dialog.take() else {
+            unreachable!("the draft stays open");
+        };
+        again.title = "Mine".into();
+        a.apply_report_layout(&again, &dir).unwrap();
+        assert_eq!(reports(&a)[0].title.as_deref(), Some("Mine"));
+
+        // Back to the built-in layout drops it; another project gets nothing.
+        let cleared = crate::report_layout_form::Form::new(Kind::Parts, builtin.clone(), reports(&a).first()).cleared();
+        let err = a.apply_report_layout(&cleared, Path::new("elsewhere")).err().unwrap();
+        assert!(err.contains("another project"), "{err}");
+        // A second layout for the kind (unused) and one of another kind: back to the built-in
+        // layout drops both of the kind, keeps the other, and one undo brings them back.
+        let mut second = reports(&a)[0].clone();
+        second.title = Some("Second".into());
+        let other = wc_core::report_layout::ReportLayout {
+            kind: "wires".into(),
+            title: Some("Wires".into()),
+            ..Default::default()
+        };
+        a.open
+            .as_mut()
+            .unwrap()
+            .project
+            .meta
+            .reports
+            .extend([second, other.clone()]);
+        let before = reports(&a);
+        // The preview shows a draft without keeping it.
+        let o = a.open.as_ref().unwrap();
+        let mut draft = before[0].clone();
+        draft.title = Some("Draft".into());
+        let preview = wc_report::build_with(
+            Kind::Parts,
+            &wc_report::Inputs {
+                project: &o.project,
+                symbols: &o.symbols,
+                parts: &o.parts,
+            },
+            Some(&draft),
+        );
+        assert_eq!(preview.title, "Draft");
+        assert_eq!(reports(&a), before);
+        a.apply_report_layout(&cleared, &dir).unwrap();
+        assert_eq!(reports(&a), [other]);
+        assert_eq!(inputs_table(&a).columns, builtin);
+        assert!(a.open.as_mut().unwrap().undo());
+        assert_eq!(reports(&a), before);
+
+        // A saved layout listing every built-in column as built in: untouched OK keeps it,
+        // "Built-in layout" then OK drops it, and undo brings it back.
+        let explicit = wc_core::report_layout::ReportLayout {
+            kind: "parts".into(),
+            columns: builtin
+                .iter()
+                .map(|c| wc_core::report_layout::ReportColumn {
+                    from: c.clone(),
+                    heading: None,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        a.open.as_mut().unwrap().project.meta.reports = vec![explicit.clone()];
+        a.edit_report_layout(Kind::Parts);
+        let Some(Dialog::ReportLayout { form, dir }) = a.dialog.take() else {
+            unreachable!("the layout dialog opens");
+        };
+        a.apply_report_layout(&form, &dir).unwrap();
+        assert_eq!(reports(&a), std::slice::from_ref(&explicit));
+        a.apply_report_layout(&form.cleared(), &dir).unwrap();
+        assert!(reports(&a).is_empty());
+        assert!(a.open.as_mut().unwrap().undo());
+        assert_eq!(reports(&a), [explicit]);
+    }
+
+    #[test]
+    fn graphic_ids_from_the_screen_context_and_from_add_graphic_are_guarded() {
+        let line = |x: f64| Shape::Line {
+            a: Point::new(x, 0.0),
+            b: Point::new(x, 5.0),
+        };
+        let (_tmp, mut a) = app(vec![]);
+        let graphics = |a: &App| a.open.as_ref().unwrap().project.pages[1].graphics.clone();
+        a.open.as_mut().unwrap().project.pages[1].graphics = vec![line(1.0), line(2.0)];
+        // The user selects the second line on the page shown and sends a message naming it.
+        a.ed.page = 1;
+        a.ed.selection = vec![Selection::Graphic(1)];
+        assert!(a.agent_context().contains("Selected: g1"));
+        a.prefs.assistant.backend = wc_agent::Backend::ApiKey;
+        a.assistant.input = "Make this line longer".into();
+        a.assistant_send(&eframe::egui::Context::default());
+        assert!(a.assistant.busy(), "the message is on its way");
+        // A sync puts another line in front before the assistant writes to g1.
+        a.open.as_mut().unwrap().project.pages[1].graphics.insert(0, line(0.0));
+        let err = call(
+            &mut a,
+            "update_graphic",
+            json!({"page": "p0002", "id": "g1", "shape": line(9.0)}),
+        )
+        .unwrap_err();
+        assert!(err.contains("changed since you read it"), "{err}");
+        assert_eq!(graphics(&a), vec![line(0.0), line(1.0), line(2.0)], "nothing written");
+
+        // add_graphic on a page the assistant never read: the id it answers is guarded too.
+        let first = a.open.as_ref().unwrap().project.pages[0].id.clone();
+        a.open.as_mut().unwrap().project.pages[0].graphics = vec![line(1.0)];
+        let out = call(&mut a, "add_graphic", json!({"page": first, "shape": line(2.0)})).unwrap();
+        assert!(out.contains("g1"), "{out}");
+        a.open.as_mut().unwrap().project.pages[0].graphics.insert(0, line(0.0));
+        let err = call(
+            &mut a,
+            "update_graphic",
+            json!({"page": first, "id": "g1", "shape": line(9.0)}),
+        )
+        .unwrap_err();
+        assert!(err.contains("changed since you read it"), "{err}");
+        // Unchanged since, the answered id can be used.
+        call(&mut a, "get_page", json!({"page": first})).unwrap();
+        call(&mut a, "add_graphic", json!({"page": first, "shape": line(3.0)})).unwrap();
+        call(
+            &mut a,
+            "update_graphic",
+            json!({"page": first, "id": "g3", "shape": line(9.0)}),
+        )
+        .unwrap();
+        assert_eq!(
+            a.open.as_ref().unwrap().project.pages[0].graphics,
+            vec![line(0.0), line(1.0), line(2.0), line(9.0)]
+        );
+    }
+
+    #[test]
+    fn graphic_ids_are_checked_for_every_tool_and_page_they_name() {
+        let line = |x: f64| Shape::Line {
+            a: Point::new(x, 0.0),
+            b: Point::new(x, 5.0),
+        };
+        let (_tmp, mut a) = app(vec![]);
+        let pages = |a: &App| -> Vec<Vec<Shape>> {
+            a.open
+                .as_ref()
+                .unwrap()
+                .project
+                .pages
+                .iter()
+                .map(|p| p.graphics.clone())
+                .collect()
+        };
+        let open = a.open.as_mut().unwrap();
+        open.project.pages[0].graphics = vec![line(1.0)];
+        open.project.pages[1].graphics = vec![line(2.0), line(3.0)];
+        let (first, second) = (open.project.pages[0].id.clone(), open.project.pages[1].id.clone());
+        call(&mut a, "get_page", json!({"page": first})).unwrap();
+        call(&mut a, "get_page", json!({"page": second})).unwrap();
+        // A copy to another page the assistant read keeps that page known too: the id it
+        // answers can be used at once.
+        let out = call(
+            &mut a,
+            "copy_items",
+            json!({"page": second, "ids": ["g0"], "to_page": first}),
+        )
+        .unwrap();
+        assert!(out.contains("g1"), "{out}");
+        call(
+            &mut a,
+            "update_graphic",
+            json!({"page": first, "id": "g1", "shape": line(4.0)}),
+        )
+        .unwrap();
+        assert_eq!(pages(&a)[0], vec![line(1.0), line(4.0)]);
+        // Someone else reorders the second page.
+        a.open.as_mut().unwrap().project.pages[1].graphics.reverse();
+        // An id with a sign is still a position, and saving a macro by position is refused too.
+        let err = call(&mut a, "delete_items", json!({"page": second, "ids": ["g+0"]})).unwrap_err();
+        assert!(err.contains("changed since you read it"), "{err}");
+        let err = call(
+            &mut a,
+            "macros",
+            json!({"action": "save", "page": second, "ids": ["g0"], "name": "Stale"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("changed since you read it"), "{err}");
+        assert!(
+            !call(&mut a, "macros", json!({"action": "list"}))
+                .unwrap()
+                .contains("Stale")
+        );
+        // Deleting the first page while it is shown shows the second: what the assistant read of
+        // the second stays as it was, so its old g0 is still refused.
+        a.ed.page = 0;
+        call(&mut a, "delete_page", json!({})).unwrap();
+        let err = call(
+            &mut a,
+            "update_graphic",
+            json!({"page": second, "id": "g0", "shape": line(9.0)}),
+        )
+        .unwrap_err();
+        assert!(err.contains("changed since you read it"), "{err}");
+        assert_eq!(pages(&a)[0], vec![line(3.0), line(2.0)]);
+    }
+
+    #[test]
+    fn graphic_ids_follow_toolbar_edits_and_refused_changes() {
+        let line = |x: f64| Shape::Line {
+            a: Point::new(x, 0.0),
+            b: Point::new(x, 5.0),
+        };
+        let (_tmp, mut a) = app(vec![]);
+        a.open.as_mut().unwrap().project.pages[1].graphics = vec![line(1.0), line(2.0)];
+        a.ed.page = 1;
+        // Deleted from the toolbar by the assistant: the line left is g0 to it at once.
+        call(&mut a, "get_page", json!({"page": "p0002"})).unwrap();
+        call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap();
+        call(&mut a, "run_action", json!({"action": Action::Delete.name()})).unwrap();
+        call(
+            &mut a,
+            "update_graphic",
+            json!({"page": "p0002", "id": "g0", "shape": line(3.0)}),
+        )
+        .unwrap();
+        assert_eq!(page2(&a).graphics, vec![line(3.0)]);
+        // A page named with a toolbar action does not count: the action works on the page
+        // shown, and that is the page whose drawings the assistant still knows.
+        a.open.as_mut().unwrap().project.pages[1].graphics = vec![line(1.0), line(3.0)];
+        call(&mut a, "get_page", json!({"page": "p0001"})).unwrap();
+        call(&mut a, "get_page", json!({"page": "p0002"})).unwrap();
+        call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap();
+        call(
+            &mut a,
+            "run_action",
+            json!({"action": Action::Delete.name(), "page": "p0001"}),
+        )
+        .unwrap();
+        assert_eq!(page2(&a).graphics, vec![line(3.0)]);
+        call(
+            &mut a,
+            "update_graphic",
+            json!({"page": "p0002", "id": "g0", "shape": line(3.0)}),
+        )
+        .unwrap();
+        // A page change refused because it takes the cover mark from a held page is taken
+        // back, and so is what the assistant would have known of its drawings.
+        call(&mut a, "update_page", json!({"page": "p0001", "cover": true})).unwrap();
+        a.ed.held_by.insert("p0001".into(), "Ola".into());
+        a.open
+            .as_mut()
+            .unwrap()
+            .held_by_others
+            .insert("p0001".into(), "Ola".into());
+        let mut content: Value =
+            serde_json::from_str(&call(&mut a, "get_page", json!({"page": "p0002"})).unwrap()).unwrap();
+        content["cover"] = json!(true);
+        content["graphics"] = json!([line(4.0), line(3.0)]);
+        assert!(call(&mut a, "edit_page_json", json!({"page": "p0002", "content": content})).is_err());
+        assert_eq!(page2(&a).graphics, vec![line(3.0)], "taken back");
+        a.ed.held_by.clear();
+        a.open.as_mut().unwrap().held_by_others.clear();
+        call(
+            &mut a,
+            "update_graphic",
+            json!({"page": "p0002", "id": "g0", "shape": line(5.0)}),
+        )
+        .unwrap();
+        assert_eq!(page2(&a).graphics, vec![line(5.0)]);
     }
 
     #[test]
@@ -3764,6 +6326,17 @@ mod tests {
                 .iter()
                 .all(|s| s.tag.as_ref().unwrap().to_string() == "=PUMP-K7")
         );
+        // Noted for a shared session, which keeps a rename that waits together.
+        let noted: Vec<(String, String)> = a
+            .open
+            .as_mut()
+            .unwrap()
+            .take_device_renames()
+            .into_iter()
+            .flatten()
+            .map(|(f, t)| (f.to_string(), t.to_string()))
+            .collect();
+        assert_eq!(noted, [("=PUMP-K1".to_owned(), "=PUMP-K7".to_owned())]);
     }
 
     #[test]
@@ -3789,6 +6362,90 @@ mod tests {
         content["title_block"] = json!({});
         call(&mut a, "edit_page_json", json!({"page": "p0002", "content": content})).unwrap();
         assert!(page2(&a).title_block.is_empty());
+    }
+
+    #[test]
+    fn a_page_edit_without_revision_marks_keeps_them() {
+        let (_tmp, mut a) = app(vec![]);
+        let cloud = wc_core::revision::RevisionCloud {
+            min: wc_core::Point::new(10.0, 10.0),
+            max: wc_core::Point::new(40.0, 30.0),
+            revision: "B".into(),
+        };
+        if let Some(p) = a.open.as_mut().unwrap().project.page_mut("p0002") {
+            p.clouds.push(cloud.clone());
+            p.revision_table = Some(wc_core::Point::new(300.0, 200.0));
+        }
+        let mut content: Value =
+            serde_json::from_str(&call(&mut a, "get_page", json!({"page": "p0002"})).unwrap()).unwrap();
+        assert_eq!(content["clouds"][0]["revision"], json!("B"), "get_page lists them");
+        let obj = content.as_object_mut().unwrap();
+        obj.remove("clouds");
+        obj.remove("revision_table");
+        content["title"] = json!("Changed");
+        call(
+            &mut a,
+            "edit_page_json",
+            json!({"page": "p0002", "content": content.clone()}),
+        )
+        .unwrap();
+        assert_eq!(page2(&a).title, "Changed");
+        assert_eq!(page2(&a).clouds, vec![cloud], "kept");
+        assert_eq!(
+            page2(&a).revision_table,
+            Some(wc_core::Point::new(300.0, 200.0)),
+            "kept"
+        );
+        // Given, they are used: `[]` and `null` clear them.
+        content["clouds"] = json!([]);
+        content["revision_table"] = Value::Null;
+        call(&mut a, "edit_page_json", json!({"page": "p0002", "content": content})).unwrap();
+        assert!(page2(&a).clouds.is_empty());
+        assert_eq!(page2(&a).revision_table, None);
+    }
+
+    #[test]
+    fn a_page_edit_lets_go_of_a_selected_cloud_it_removes() {
+        let (_tmp, mut a) = app(vec![]);
+        let cloud = |x: f64| wc_core::revision::RevisionCloud {
+            min: wc_core::Point::new(x, 10.0),
+            max: wc_core::Point::new(x + 20.0, 30.0),
+            revision: "B".into(),
+        };
+        if let Some(p) = a.open.as_mut().unwrap().project.page_mut("p0002") {
+            p.clouds = vec![cloud(10.0), cloud(50.0)];
+        }
+        let i = a.open.as_ref().unwrap().find_page("p0002").unwrap();
+        a.ed.page = i;
+        a.ed.selection = vec![Selection::Cloud(0)];
+        let mut content: Value =
+            serde_json::from_str(&call(&mut a, "get_page", json!({"page": "p0002"})).unwrap()).unwrap();
+        content["clouds"] = json!([cloud(50.0)]);
+        call(
+            &mut a,
+            "edit_page_json",
+            json!({"page": "p0002", "content": content.clone()}),
+        )
+        .unwrap();
+        assert!(
+            a.ed.selection.is_empty(),
+            "the remaining cloud is not taken for the removed one"
+        );
+        // The one that stays stays selected.
+        a.ed.selection = vec![Selection::Cloud(0)];
+        content["clouds"] = json!([cloud(90.0), cloud(50.0)]);
+        call(
+            &mut a,
+            "edit_page_json",
+            json!({"page": "p0002", "content": content.clone()}),
+        )
+        .unwrap();
+        assert_eq!(a.ed.selection, vec![Selection::Cloud(1)]);
+        // Editing another page than the shown one lets go of the shown page's selection.
+        a.ed.page = a.open.as_ref().unwrap().find_page("p0001").unwrap();
+        a.ed.selection = vec![Selection::Cloud(0)];
+        call(&mut a, "edit_page_json", json!({"page": "p0002", "content": content})).unwrap();
+        assert!(a.ed.selection.is_empty());
     }
 
     #[test]
@@ -4246,6 +6903,295 @@ mod tests {
         a.agent_finish("run_command", &args, r)
     }
 
+    /// Start `run_command` with `args` through the tools, as the assistant does: whether it runs,
+    /// or the answer it is refused with straight away. A started command is waited for.
+    fn command_runs(a: &mut App, args: &[&str]) -> Result<(), String> {
+        let v = json!({ "args": args });
+        match wc_agent::Tools::start(&mut AppTools(a), "run_command", &v) {
+            Started::Running(p) => {
+                let r = p.wait();
+                let _ = wc_agent::Tools::finish(&mut AppTools(a), "run_command", &v, r);
+                Ok(())
+            }
+            Started::Done(r) => Err(r.err().unwrap_or_else(|| "answered at once".into())),
+        }
+    }
+
+    /// Every file under `dir` but `.git`, with its bytes.
+    fn folder_bytes(dir: &std::path::Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut out = BTreeMap::new();
+        let mut todo = vec![dir.to_path_buf()];
+        while let Some(d) = todo.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                if e.file_name() == ".git" {
+                    continue;
+                }
+                if e.path().is_dir() {
+                    todo.push(e.path());
+                } else {
+                    out.insert(e.path(), std::fs::read(e.path()).unwrap());
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_writing_command_is_refused_while_someone_else_holds_a_page() {
+        let (_tmp, mut a) = app(vec![]);
+        let dir = a.open.as_ref().unwrap().dir.clone();
+        a.open
+            .as_mut()
+            .unwrap()
+            .held_by_others
+            .insert("p0002".into(), "Ola".into());
+        let before = folder_bytes(&dir);
+        for args in [
+            vec!["place", "p0002", "wc.lamp", "--at", "100,50"],
+            vec!["page", "add", "Motors"],
+            vec!["find", "-K1", "--replace", "-K2"],
+            vec!["vcs", "commit", "-m", "x"],
+            vec!["check", "-C", "/elsewhere"],
+            vec!["check", "--project=/elsewhere"],
+        ] {
+            let e = command_runs(&mut a, &args).unwrap_err();
+            assert!(e.contains("Ola") && e.contains("shared session"), "{args:?}: {e}");
+        }
+        assert_eq!(folder_bytes(&dir), before, "nothing was written");
+        // Without a held page the same command runs.
+        a.open.as_mut().unwrap().held_by_others.clear();
+        assert!(command_runs(&mut a, &["place", "p0002", "wc.lamp", "--at", "100,50"]).is_ok());
+    }
+
+    #[test]
+    fn a_file_whose_identity_cannot_be_read_is_refused_with_the_reason() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("project.toml"), "x").unwrap();
+        let out = tempfile::tempdir().unwrap();
+        std::fs::write(out.path().join("a.svg"), "y").unwrap();
+        let out_path = out.path().display().to_string();
+        // A project file whose identity could not be read: a hard link to it would go unseen,
+        // so an output folder with a file in it is refused, with the reason.
+        let mut guarded = Guarded::new(project.path());
+        assert!(guarded.unknown.is_none());
+        assert!(!guarded.reached_by(out.path(), &out_path).unwrap());
+        guarded.unknown = Some("project.toml: access denied".into());
+        let e = guarded.reached_by(out.path(), &out_path).unwrap_err();
+        assert!(e.to_string().contains("project.toml: access denied"), "{e}");
+        // A folder with nothing in it, or a path not there yet, is still fine.
+        let empty = tempfile::tempdir().unwrap();
+        let empty_path = empty.path().display().to_string();
+        assert!(!guarded.reached_by(empty.path(), &empty_path).unwrap());
+        let new_file = empty.path().join("new.svg").display().to_string();
+        assert!(!guarded.reached_by(empty.path(), &new_file).unwrap());
+        // An output file that cannot be looked at (its folder can be listed but not entered)
+        // is an error with the system's reason, not "no match". Run as root it can be.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let guarded = Guarded::new(project.path());
+            let shut = out.path().join("shut");
+            std::fs::create_dir(&shut).unwrap();
+            std::fs::write(shut.join("b.svg"), "z").unwrap();
+            std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let looked = std::fs::metadata(shut.join("b.svg")).is_ok();
+            let r = guarded.reached_by(out.path(), &out_path);
+            std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o700)).unwrap();
+            if !looked {
+                let e = r.unwrap_err();
+                assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
+            }
+            // A project folder that cannot be listed hides its files, so a hard link to one of
+            // them is refused with the reason rather than taken as no match.
+            let pages = project.path().join("pages");
+            std::fs::create_dir(&pages).unwrap();
+            std::fs::write(pages.join("p0001.page.json"), "{}").unwrap();
+            let linked = tempfile::tempdir().unwrap();
+            std::fs::hard_link(pages.join("p0001.page.json"), linked.path().join("a.json")).unwrap();
+            let linked_path = linked.path().display().to_string();
+            std::fs::set_permissions(&pages, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let listed = std::fs::read_dir(&pages).is_ok();
+            let blind = Guarded::new(project.path());
+            let r = blind.reached_by(linked.path(), &linked_path);
+            std::fs::set_permissions(&pages, std::fs::Permissions::from_mode(0o700)).unwrap();
+            if !listed {
+                let e = r.unwrap_err();
+                assert!(e.to_string().contains("pages"), "{e}");
+            }
+            // Listed, the link is found and an unrelated copy is still fine.
+            let seen = Guarded::new(project.path());
+            assert!(seen.unknown.is_none());
+            assert!(seen.reached_by(linked.path(), &linked_path).unwrap());
+            let copy = tempfile::tempdir().unwrap();
+            std::fs::write(copy.path().join("a.json"), "{}").unwrap();
+            let copy_path = copy.path().display().to_string();
+            assert!(!seen.reached_by(copy.path(), &copy_path).unwrap());
+            // The same through a link in the project to a folder elsewhere whose parent cannot
+            // be searched: where it points is not known, so a hard link to a page there is
+            // refused with the reason rather than taken as no match.
+            let ext = tempfile::tempdir().unwrap();
+            let inner = ext.path().join("inner");
+            std::fs::create_dir_all(inner.join("more")).unwrap();
+            std::fs::write(inner.join("more/p0002.page.json"), "{}").unwrap();
+            std::os::unix::fs::symlink(inner.join("more"), project.path().join("more")).unwrap();
+            let far = tempfile::tempdir().unwrap();
+            std::fs::hard_link(inner.join("more/p0002.page.json"), far.path().join("b.json")).unwrap();
+            let far_path = far.path().display().to_string();
+            std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let searched = inner.join("more").canonicalize().is_ok();
+            let blind = Guarded::new(project.path());
+            let r = blind.reached_by(far.path(), &far_path);
+            std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o700)).unwrap();
+            if !searched {
+                let e = r.unwrap_err();
+                assert!(e.to_string().contains("more"), "{e}");
+            }
+            let seen = Guarded::new(project.path());
+            assert!(seen.unknown.is_none());
+            assert!(seen.reached_by(far.path(), &far_path).unwrap());
+            assert!(!seen.reached_by(copy.path(), &copy_path).unwrap());
+        }
+    }
+
+    #[test]
+    fn commands_that_read_the_project_still_run_while_a_page_is_held() {
+        let (_tmp, mut a) = app(vec![]);
+        let dir = a.open.as_ref().unwrap().dir.clone();
+        a.open
+            .as_mut()
+            .unwrap()
+            .held_by_others
+            .insert("p0002".into(), "Ola".into());
+        let out = tempfile::tempdir().unwrap();
+        let elsewhere = out.path().join("out.pdf").display().to_string();
+        for args in [
+            vec!["check"],
+            vec!["report", "parts"],
+            vec!["nets"],
+            vec!["page", "list"],
+            vec!["find", "-K1"],
+            vec!["vcs", "log"],
+            vec!["pdf", elsewhere.as_str()],
+        ] {
+            assert!(command_runs(&mut a, &args).is_ok(), "{args:?}");
+        }
+        // An output written into the project folder could land on a held page, also through
+        // a link to it.
+        #[cfg(unix)]
+        {
+            let link = dir.parent().unwrap().join("link-to-project");
+            std::os::unix::fs::symlink(&dir, &link).unwrap();
+            let through = link.join("pages").join("p0002.page.json").display().to_string();
+            let e = command_runs(&mut a, &["plc-vars", through.as_str()]).unwrap_err();
+            assert!(e.contains("project folder"), "{e}");
+            // `..` after a link goes up from where the link points, not from the link.
+            let to_pages = dir.parent().unwrap().join("link-to-pages");
+            std::os::unix::fs::symlink(dir.join("pages"), &to_pages).unwrap();
+            for name in ["p0002.page.json", "new.svg"] {
+                let up = to_pages.join("..").join("pages").join(name).display().to_string();
+                let e = command_runs(&mut a, &["vcs", "log", "--svg", up.as_str()]).unwrap_err();
+                assert!(e.contains("project folder"), "{up}: {e}");
+            }
+            // A folder of the project linked to elsewhere is still the project's: both the
+            // path through the project and the path where it really is are refused.
+            let shared = tempfile::tempdir().unwrap();
+            std::fs::write(shared.path().join("p0009.page.json"), "{}").unwrap();
+            std::os::unix::fs::symlink(shared.path(), dir.join("linked")).unwrap();
+            let deeper = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(deeper.path(), shared.path().join("deeper")).unwrap();
+            for to in [
+                dir.join("linked").join("p0009.page.json"),
+                shared.path().join("new.st"),
+                deeper.path().join("new.st"),
+            ] {
+                let to = to.display().to_string();
+                let e = command_runs(&mut a, &["plc-vars", to.as_str()]).unwrap_err();
+                assert!(e.contains("project folder"), "{to}: {e}");
+            }
+            std::fs::remove_file(dir.join("linked")).unwrap();
+        }
+        // Run from inside the project folder, a bare file name is in it too.
+        let held = a.open.as_ref().unwrap().held_by_others.clone();
+        let args: Vec<String> = ["plc-vars", "new.st"].map(String::from).to_vec();
+        let e = writes_while_held(&args, &dir, &held, &dir.join("pages")).unwrap();
+        assert!(e.contains("inside the project folder"), "{e}");
+        // Commands with nothing after their own words still run there.
+        for words in [
+            vec!["check"],
+            vec!["nets"],
+            vec!["page", "list"],
+            vec!["vcs", "log"],
+            vec!["find", "-K1"],
+        ] {
+            let args: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
+            assert!(
+                writes_while_held(&args, &dir, &held, &dir.join("pages")).is_none(),
+                "{args:?}"
+            );
+        }
+        assert!(writes_while_held(&args, &dir, &held, out.path()).is_none());
+        // An export writes its own file names into the folder it is given: a file there that
+        // links to a held page, by name or as the same file, is a way onto the page.
+        // A hard link is the same file under another name, on unix and on Windows alike (#459).
+        {
+            let page = dir.join("pages").join("p0002.page.json");
+            let before = std::fs::read(&page).unwrap();
+            let hard = tempfile::tempdir().unwrap();
+            std::fs::create_dir(hard.path().join("deep")).unwrap();
+            std::fs::hard_link(&page, hard.path().join("deep").join("2.svg")).unwrap();
+            for to in [hard.path(), &hard.path().join("deep").join("2.svg")] {
+                let to = to.display().to_string();
+                let e = command_runs(&mut a, &["drawing", to.as_str()]).unwrap_err();
+                assert!(e.contains("links to a file in it"), "{to}: {e}");
+            }
+            assert_eq!(std::fs::read(&page).unwrap(), before);
+            // Named bare, from the folder it is in.
+            let args: Vec<String> = ["drawing", "deep"].map(String::from).to_vec();
+            assert!(writes_while_held(&args, &dir, &held, hard.path()).is_some());
+            // A copy of the page is another file.
+            let copied = tempfile::tempdir().unwrap();
+            std::fs::copy(&page, copied.path().join("2.svg")).unwrap();
+            let args = vec!["drawing".to_owned(), copied.path().display().to_string()];
+            assert!(writes_while_held(&args, &dir, &held, out.path()).is_none());
+        }
+        #[cfg(unix)]
+        {
+            let page = dir.join("pages").join("p0002.page.json");
+            let before = std::fs::read(&page).unwrap();
+            let linked = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(&page, linked.path().join("2.svg")).unwrap();
+            let to = linked.path().display().to_string();
+            let e = command_runs(&mut a, &["drawing", to.as_str()]).unwrap_err();
+            assert!(e.contains("links to a file in it"), "{to}: {e}");
+            assert_eq!(std::fs::read(&page).unwrap(), before);
+            // A folder that cannot be listed could hide such a link.
+            let shut = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(shut.path(), std::os::unix::fs::PermissionsExt::from_mode(0o300)).unwrap();
+            let args = vec!["drawing".to_owned(), shut.path().display().to_string()];
+            let listed = std::fs::read_dir(shut.path()).is_ok();
+            let refused = writes_while_held(&args, &dir, &held, out.path());
+            std::fs::set_permissions(shut.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+            // Run as root the folder can still be listed, and then it is fine.
+            if !listed {
+                let e = refused.unwrap();
+                assert!(e.contains("could not be looked through"), "{e}");
+            }
+            // A folder of its own is fine.
+            let args = vec!["drawing".to_owned(), out.path().display().to_string()];
+            assert!(writes_while_held(&args, &dir, &held, out.path()).is_none());
+        }
+        let page = dir.join("pages").join("p0002.page.json").display().to_string();
+        for args in [
+            vec!["vcs".to_owned(), "log".into(), "--svg".into(), page.clone()],
+            vec!["vcs".to_owned(), "log".into(), format!("--svg={page}")],
+            vec!["pdf".to_owned(), dir.join("out.pdf").display().to_string()],
+        ] {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let e = command_runs(&mut a, &args).unwrap_err();
+            assert!(e.contains("project folder") && e.contains("Ola"), "{args:?}: {e}");
+        }
+    }
+
     fn customer(a: &App) -> Option<String> {
         a.open.as_ref()?.project.meta.title_block.get("customer").cloned()
     }
@@ -4414,6 +7360,66 @@ mod tests {
     }
 
     #[test]
+    fn a_drawing_hidden_or_locked_in_the_layer_list_is_not_deleted_before_the_canvas_redraws() {
+        use crate::layers::Layer;
+        let (_tmp, mut a) = app(vec![]);
+        call(
+            &mut a,
+            "add_graphic",
+            json!({"page": "p0002", "shape": {"kind": "text", "at": {"x": 30, "y": 30}, "text": "Hello"}}),
+        )
+        .unwrap();
+        for hide in [true, false] {
+            call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap();
+            if hide {
+                a.prefs.layers.set_shown(Layer::Drawings, false);
+            } else {
+                a.prefs.layers.set_locked(Layer::Drawings, true);
+            }
+            // The layer list changed; Delete runs before the canvas is drawn again.
+            a.apply_layers();
+            assert!(a.ed.selection.is_empty());
+            a.run(Action::Delete);
+            assert_eq!(page2(&a).graphics.len(), 1, "the drawing stays");
+            a.prefs.layers = Default::default();
+            a.apply_layers();
+        }
+        // Shown and unlocked, the same Delete removes it.
+        call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap();
+        a.run(Action::Delete);
+        assert!(page2(&a).graphics.is_empty());
+    }
+
+    #[test]
+    fn the_text_and_comment_dialogs_add_nothing_to_a_layer_hidden_while_they_were_open() {
+        use crate::layers::Layer;
+        let (_tmp, mut a) = app(vec![]);
+        a.ed.page = 1;
+        let at = wc_core::geom::Point::new(40.0, 40.0);
+        for hide in [true, false] {
+            for l in [Layer::Drawings, Layer::Comments] {
+                if hide {
+                    a.prefs.layers.set_shown(l, false);
+                } else {
+                    a.prefs.layers.set_locked(l, true);
+                }
+            }
+            a.add_text(at, "Note");
+            assert!(page2(&a).graphics.is_empty());
+            assert!(a.ed.message.contains("Drawings and notes"), "{}", a.ed.message);
+            a.add_comment_at(at, "Check");
+            assert!(a.open.as_ref().unwrap().project.comments.is_empty());
+            assert!(a.ed.message.contains("Review comments"), "{}", a.ed.message);
+            a.prefs.layers = Default::default();
+        }
+        // Shown and unlocked, both are added.
+        a.add_text(at, "Note");
+        assert_eq!(page2(&a).graphics.len(), 1);
+        a.add_comment_at(at, "Check");
+        assert_eq!(a.open.as_ref().unwrap().project.comments.len(), 1);
+    }
+
+    #[test]
     fn the_assistant_cannot_change_a_page_someone_else_holds_but_can_read_and_comment_there() {
         let (_tmp, mut a) = app(vec![]);
         call(
@@ -4553,6 +7559,31 @@ mod tests {
             open.project,
             wc_core::store::load(&other).unwrap(),
             "nothing of the old project in it"
+        );
+    }
+
+    #[test]
+    fn a_new_project_can_start_from_a_base_project() {
+        let (tmp, mut a) = app(vec![]);
+        let base = a.open.as_ref().unwrap().dir.clone();
+        let mut p = wc_core::store::load(&base).unwrap();
+        p.meta.title_block.insert("customer".into(), "ACME".into());
+        wc_core::store::save(&base, &p).unwrap();
+        let new = tmp.path().join("from-base");
+        let r = call(
+            &mut a,
+            "open_project",
+            json!({"path": new.to_string_lossy(), "create": true, "name": "From base", "base": base.to_string_lossy()}),
+        );
+        assert!(r.is_ok(), "{r:?}");
+        let open = a.open.as_ref().unwrap();
+        assert_eq!(open.dir, new);
+        assert_eq!(open.project.meta.name, "From base");
+        assert_eq!(open.project.meta.title_block["customer"], "ACME");
+        assert_eq!(open.project.pages.len(), p.pages.len());
+        assert_eq!(
+            open.project.meta.libraries, p.meta.libraries,
+            "the base project's library sources, no starter library added"
         );
     }
 }

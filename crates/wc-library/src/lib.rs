@@ -28,9 +28,14 @@ pub enum Error {
     Source { name: String, message: String },
     #[error("{kind:?} {id:?} is not in any library source")]
     NotFound { kind: ItemKind, id: String },
-    /// An update failed and could not put back every file it had changed.
+    /// An update failed and could not put back every file it had changed. `written` is how
+    /// many of the items, in the order given, it had started to write.
     #[error("{error}; putting back the files the update changed failed too: {failed}")]
-    NotPutBack { error: Box<Error>, failed: String },
+    NotPutBack {
+        error: Box<Error>,
+        failed: String,
+        written: usize,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -92,13 +97,60 @@ impl Library {
 
     /// Part `id` as source `source` has it (not necessarily the source that wins for it).
     pub fn part_in(&self, source: &str, id: &str) -> Result<Part> {
+        self.item_in(ItemKind::Part, source, id)
+    }
+
+    /// Symbol `id` as source `source` has it (not necessarily the source that wins for it).
+    pub fn symbol_in(&self, source: &str, id: &str) -> Result<Symbol> {
+        self.item_in(ItemKind::Symbol, source, id)
+    }
+
+    /// Item `id` of `kind` in a version `fits` accepts (or says why not): the source named
+    /// `first` is tried first, then every other source in order. The reason it is not found
+    /// names what each source had (why `fits` refused it, or why it could not be read).
+    pub fn find_version<T: serde::de::DeserializeOwned>(
+        &self,
+        kind: ItemKind,
+        id: &str,
+        first: &str,
+        fits: impl Fn(&T) -> std::result::Result<(), String>,
+    ) -> std::result::Result<T, String> {
+        let order = self
+            .sources
+            .iter()
+            .filter(|s| s.name == first)
+            .chain(self.sources.iter().filter(|s| s.name != first));
+        let mut seen = Vec::new();
+        for s in order {
+            // Each source read from its own folder: two may share a name.
+            match Self::item_at::<T>(kind, s, id) {
+                Ok(item) => match fits(&item) {
+                    Ok(()) => return Ok(item),
+                    Err(why) => seen.push(format!("{}: {why}", s.name)),
+                },
+                Err(Error::NotFound { .. }) => {}
+                Err(e) => seen.push(format!("{}: {e}", s.name)),
+            }
+        }
+        Err(if seen.is_empty() {
+            "no library has it".to_owned()
+        } else {
+            seen.join("; ")
+        })
+    }
+
+    fn item_in<T: serde::de::DeserializeOwned>(&self, kind: ItemKind, source: &str, id: &str) -> Result<T> {
         store::check_id(id)?;
-        let not_found = || Error::NotFound {
-            kind: ItemKind::Part,
-            id: id.into(),
-        };
+        let not_found = || Error::NotFound { kind, id: id.into() };
         let s = self.sources.iter().find(|s| s.name == source).ok_or_else(not_found)?;
-        let path = s.root.join(ItemKind::Part.dir()).join(format!("{id}.json"));
+        Self::item_at(kind, s, id)
+    }
+
+    /// Item `id` read from source `s`'s folder.
+    fn item_at<T: serde::de::DeserializeOwned>(kind: ItemKind, s: &Source, id: &str) -> Result<T> {
+        store::check_id(id)?;
+        let not_found = || Error::NotFound { kind, id: id.into() };
+        let path = s.root.join(kind.dir()).join(format!("{id}.json"));
         // An entry that is there but cannot be followed (a link to nothing) says so.
         match std::fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(not_found()),
@@ -502,6 +554,18 @@ pub fn update_items(
     lib: &Library,
     items: &[(ItemKind, String, String)],
 ) -> Result<Vec<(ItemKind, String)>> {
+    update_items_then(project_dir, project, lib, items, || {})
+}
+
+/// [`update_items`], calling `after_backup` once every file has been read for its backup and
+/// before any is written (where a caller's tests can make a write fail).
+pub fn update_items_then(
+    project_dir: &Path,
+    project: &mut Project,
+    lib: &Library,
+    items: &[(ItemKind, String, String)],
+    after_backup: impl FnOnce(),
+) -> Result<Vec<(ItemKind, String)>> {
     let fetched = items
         .iter()
         .map(|(kind, id, hash)| fetch(lib, *kind, id, Some(hash)))
@@ -518,6 +582,7 @@ pub fn update_items(
         };
         before.push((path, was));
     }
+    after_backup();
     let lock = project.lock.clone();
     for (n, ((_, id, _), item)) in items.iter().zip(fetched).enumerate() {
         if let Err(e) = store_item(project_dir, project, id, item) {
@@ -542,6 +607,7 @@ pub fn update_items(
             return Err(Error::NotPutBack {
                 error: Box::new(e),
                 failed: failed.join("; "),
+                written: n + 1,
             });
         }
     }
@@ -582,6 +648,41 @@ pub fn write_part(root: &Path, p: &Part) -> Result<PathBuf> {
     let path = root.join("parts").join(format!("{}.json", p.id));
     store::write_if_changed(&path, &store::to_json(p)?)?;
     Ok(path)
+}
+
+/// The check rules of the project's library sources ([`wc_core::check_rule`]), in the order
+/// the project lists the sources: each source with a `rules.toml` in its folder, read now. A
+/// source whose folder is not there (a git source never synced) or has no rules file adds
+/// nothing; one that cannot be resolved (an unknown kind, say), or whose file cannot be read
+/// or parsed, says why.
+pub fn library_rules(project_dir: &Path, project: &Project) -> Vec<wc_core::check_rule::RuleSet> {
+    use wc_core::check_rule::{LIBRARY_RULES_FILE, RuleSet, parse_rules};
+    project
+        .meta
+        .libraries
+        .iter()
+        .filter_map(|s| {
+            let root = match Source::resolve(project_dir, s) {
+                Ok(source) => source.root,
+                Err(e) => {
+                    return Some(RuleSet {
+                        source: s.name.clone(),
+                        rules: Err(e.to_string()),
+                    });
+                }
+            };
+            let path = root.join(LIBRARY_RULES_FILE);
+            let rules = match std::fs::read_to_string(&path) {
+                Ok(text) => parse_rules(&text),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+                Err(e) => Err(e.to_string()),
+            };
+            Some(RuleSet {
+                source: s.name.clone(),
+                rules,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

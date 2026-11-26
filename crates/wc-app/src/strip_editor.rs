@@ -407,7 +407,11 @@ const NEW_STRIP: &str = "New strip…";
 /// The level of each terminal on `rail` as the terminal plan shows it, inferred levels included
 /// ([`wc_report::strip_levels`]): over the drawn terminals in number order, whatever the rail
 /// order.
-fn rail_levels(open: &Open, strip: &DeviceTag, rail: &[(String, bool)]) -> std::collections::BTreeMap<String, u32> {
+pub(crate) fn rail_levels(
+    open: &Open,
+    strip: &DeviceTag,
+    rail: &[(String, bool)],
+) -> std::collections::BTreeMap<String, u32> {
     let mut drawn: Vec<String> = rail
         .iter()
         .filter(|(_, spare)| !spare)

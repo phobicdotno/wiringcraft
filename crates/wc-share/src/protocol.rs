@@ -428,6 +428,20 @@ impl ProjectEdit {
         )
     }
 
+    /// The display numbers this change sets ([`ProjectEdit::Renumber`], also inside a batch the
+    /// host can accept; a malformed batch sets none), as (page id, number).
+    pub fn renumbers(&self) -> impl Iterator<Item = &(String, String)> {
+        let edits = match self {
+            Self::Batch { edits } if Self::well_formed(edits) => edits.as_slice(),
+            Self::Batch { .. } => &[],
+            e => std::slice::from_ref(e),
+        };
+        edits.iter().flat_map(|e| match e {
+            Self::Renumber { numbers } => numbers.as_slice(),
+            _ => &[],
+        })
+    }
+
     /// The pages this change sets whole ([`ProjectEdit::SetPages`], also inside a batch the host
     /// can accept; a malformed batch sets none).
     pub fn set_pages(&self) -> impl Iterator<Item = &Page> {
@@ -833,6 +847,11 @@ pub(crate) fn check_edit(
                 known(id)?;
             }
             Ok(())
+        }
+        // The host opens the library locations whenever it looks something up, so only the host
+        // chooses them: a guest could otherwise make the host's machine reach a folder or share.
+        ProjectEdit::SetMeta { meta, .. } if by != crate::host::HOST && meta.libraries != project.meta.libraries => {
+            invalid("only the host can change the project's library locations".into())
         }
         ProjectEdit::SetMeta { .. } => Ok(()),
         ProjectEdit::AddPicture { picture } => match picture.problem() {

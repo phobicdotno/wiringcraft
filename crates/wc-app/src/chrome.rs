@@ -30,9 +30,12 @@ const MENUS: &[(&str, &[Option<Action>])] = &[
             Some(Action::SaveAs),
             None,
             Some(Action::ProjectProps),
+            Some(Action::Translations),
             None,
             Some(Action::Check),
+            Some(Action::LiveCheck),
             Some(Action::Reports),
+            Some(Action::PlcRacks),
             Some(Action::ExportPdf),
             Some(Action::ExportDrawings),
             Some(Action::ExportAml),
@@ -100,6 +103,7 @@ const MENUS: &[(&str, &[Option<Action>])] = &[
             Some(Action::ZoomFit),
             None,
             Some(Action::ToggleGrid),
+            Some(Action::Layers),
             Some(Action::ToggleChrome),
             Some(Action::ToggleTheme),
             None,
@@ -572,8 +576,6 @@ mod tests {
         (rects, out)
     }
 
-    /// One frame of the ribbon in a window `width` points wide, as the app lays it out; returns
-    /// the icon rectangles and adds the commands clicked to `out`.
     /// The Start tab's buttons, in the order the ribbon lays them out.
     fn start_order() -> Vec<Action> {
         RIBBON[0].1.iter().flat_map(|(_, a)| a.iter().copied()).collect()
@@ -586,6 +588,8 @@ mod tests {
         at.unwrap_or_default()
     }
 
+    /// One frame of the ribbon in a window `width` points wide, as the app lays it out; returns
+    /// the icon rectangles and adds the commands clicked to `out`.
     fn ribbon_frame(
         ctx: &egui::Context,
         state: &mut ChromeState,
@@ -614,77 +618,84 @@ mod tests {
         ribbon_frames(tab, &[(width, Vec::new())]).0
     }
 
-    /// Two window widths 10 points apart where the Start tab's groups wrap differently, so
-    /// Undo sits elsewhere in the wider one. Found rather than fixed, so a new button on the
-    /// tab does not break the tests that need such a pair.
+    /// The button at the other width where Undo is at `from`, if another one is there.
+    fn other_where_undo_was(from: f32, to: f32) -> Option<Action> {
+        let at = ribbon_icons(0, from).get(undo_index())?.center();
+        let there = ribbon_icons(0, to).iter().position(|r| r.contains(at))?;
+        start_order().get(there).copied().filter(|a| *a != Action::Undo)
+    }
+
+    /// The first window width in `widths` (stepped by 10 points) where widening by 10 points
+    /// puts another button where Undo was. Found rather than fixed, so a new button on the
+    /// Start tab does not break the tests that need such a pair.
+    fn undo_moving_width(widths: std::ops::Range<u32>) -> Option<f32> {
+        widths
+            .step_by(10)
+            .map(|w| w as f32)
+            .find(|w| other_where_undo_was(*w, w + 10.0).is_some())
+    }
+
+    /// Two window widths 10 points apart, the window's usual size or wider, where Undo sits
+    /// elsewhere in the wider one.
     fn undo_moving_widths() -> (f32, f32) {
-        let start = RIBBON[0].1;
-        let order: Vec<Action> = start.iter().flat_map(|(_, a)| a.iter().copied()).collect();
-        let undo = order.iter().position(|a| *a == Action::Undo).unwrap_or(usize::MAX);
-        (100..250)
-            .map(|k| k as f32 * 10.0)
-            .find(|w| {
-                let before = ribbon_icons(0, *w).get(undo).map(|r| r.center());
-                let after = ribbon_icons(0, w + 10.0).get(undo).copied();
-                matches!((before, after), (Some(a), Some(b)) if !b.contains(a))
-            })
-            .map_or((1210.0, 1220.0), |w| (w, w + 10.0))
+        let w = undo_moving_width(1000..2500);
+        assert!(w.is_some(), "no window width moves the Undo button");
+        let w = w.unwrap_or(1210.0);
+        (w, w + 10.0)
     }
 
     #[test]
     fn a_ribbon_press_stays_with_its_button_when_the_groups_move() {
-        let start = RIBBON[0].1;
-        let order: Vec<Action> = start.iter().flat_map(|(_, a)| a.iter().copied()).collect();
-        let undo = order.iter().position(|a| *a == Action::Undo).unwrap_or(usize::MAX);
-        // Two window widths 10 points apart where the groups wrap differently, so that in the
-        // wider window another button sits where Undo was (found, so new buttons do not break
-        // the test).
-        let other_at = |narrow: f32| {
-            let at = ribbon_icons(0, narrow).get(undo)?.center();
-            let moved = ribbon_icons(0, narrow + 10.0);
-            let there = moved.iter().position(|r| r.contains(at)).map(|i| order[i])?;
-            (there != Action::Undo).then_some((narrow, at, there))
-        };
-        let found = (100..250).map(|k| k as f32 * 10.0).find_map(other_at);
-        assert!(found.is_some(), "no width moves the Undo button");
-        let Some((narrow, at, there)) = found else { return };
-        let wide = narrow + 10.0;
-        let there = Some(there);
-        assert!(there.is_some_and(|a| a != Action::Undo), "{there:?} at {at:?}");
-        let button = |pressed| egui::Event::PointerButton {
-            pos: at,
-            button: egui::PointerButton::Primary,
-            pressed,
-            modifiers: egui::Modifiers::NONE,
-        };
-        let (_, out) = ribbon_frames(
-            0,
-            &[
-                (narrow, Vec::new()),
-                (narrow, vec![egui::Event::PointerMoved(at)]),
-                (narrow, vec![button(true)]),
-                (wide, vec![button(false)]),
-            ],
+        let undo = undo_index();
+        let (narrow, wide) = undo_moving_widths();
+        // Below the window's minimum of 900 points the groups wrap onto more rows (#351).
+        let small = (600..890)
+            .step_by(10)
+            .map(|w| w as f32)
+            .find(|w| other_where_undo_was(*w, w + 10.0).is_some() && other_where_undo_was(w + 10.0, *w).is_some());
+        assert!(
+            small.is_some(),
+            "no width below the minimum moves the Undo button both ways"
         );
-        assert!(out.is_empty(), "{out:?}");
-        // Released where it was pressed, the press is a click on Undo.
-        let (_, out) = ribbon_frames(
-            0,
-            &[
-                (narrow, Vec::new()),
-                (narrow, vec![egui::Event::PointerMoved(at)]),
-                (narrow, vec![button(true)]),
-                (narrow, vec![button(false)]),
-            ],
-        );
-        assert_eq!(out, [Action::Undo]);
+        let small = small.unwrap_or(740.0);
+        // Widened and narrowed.
+        for (from, to) in [(narrow, wide), (small, small + 10.0), (small + 10.0, small)] {
+            let at = ribbon_icons(0, from)[undo].center();
+            // At the other width another button sits where Undo was.
+            let there = other_where_undo_was(from, to);
+            assert!(
+                there.is_some_and(|a| a != Action::Undo),
+                "{from} to {to}: {there:?} at {at:?}"
+            );
+            let button = |pressed| egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let press_then_release_at = |width| {
+                ribbon_frames(
+                    0,
+                    &[
+                        (from, Vec::new()),
+                        (from, vec![egui::Event::PointerMoved(at)]),
+                        (from, vec![button(true)]),
+                        (width, vec![button(false)]),
+                    ],
+                )
+                .1
+            };
+            // Released over the button that took its place: a click on neither.
+            let out = press_then_release_at(to);
+            assert!(out.is_empty(), "{from} to {to}: {out:?}");
+            // Released where it was pressed, the press is a click on Undo.
+            assert_eq!(press_then_release_at(from), [Action::Undo], "{from}");
+        }
     }
 
     #[test]
     fn a_ribbon_release_counts_where_it_happened_not_where_the_pointer_went_after() {
-        let start = RIBBON[0].1;
-        let order: Vec<Action> = start.iter().flat_map(|(_, a)| a.iter().copied()).collect();
-        let undo = order.iter().position(|a| *a == Action::Undo).unwrap_or(usize::MAX);
+        let undo = undo_index();
         let (narrow, wide) = undo_moving_widths();
         let at = ribbon_icons(0, narrow)[undo].center();
         let now = ribbon_icons(0, wide)[undo].center();
@@ -810,9 +821,7 @@ mod tests {
 
     #[test]
     fn a_ribbon_click_is_judged_by_the_release_that_made_it() {
-        let start = RIBBON[0].1;
-        let order: Vec<Action> = start.iter().flat_map(|(_, a)| a.iter().copied()).collect();
-        let undo = order.iter().position(|a| *a == Action::Undo).unwrap_or(usize::MAX);
+        let undo = undo_index();
         let (narrow, wide) = undo_moving_widths();
         let at = ribbon_icons(0, narrow)[undo].center();
         let now = ribbon_icons(0, wide)[undo].center();

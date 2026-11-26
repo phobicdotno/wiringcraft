@@ -78,10 +78,10 @@ For the other areas, the chapter to read in each help is:
 | Frame with column and row references (e.g. 3.C) | yes | yes | yes | done (#54) |
 | Title block shared by all pages | yes | yes | yes | done |
 | Cover page and page template editing | yes | yes | yes: cover page form, Page template form (columns and title-block boxes, kept in `project.toml`) | done (#53, #119) |
-| Project templates and base projects | yes | yes (project templates) | no | later |
+| Project templates and base projects | yes | yes (project templates) | yes: `wiringcraft new <dir> --template <folder or git URL>` and "Start from" in New project; `{name}` and `{date}` filled in | done (#270) |
 | Project properties (customer, dates, revision ...) | yes | yes | yes | done |
 | Project archive (pack and unpack) | yes | yes (.tewzip) | yes: import of archives, projects are plain folders | done |
-| Multi-language project texts and translation dictionary | yes | yes | no | later |
+| Multi-language project texts and translation dictionary | yes | yes | yes: `translations.toml` dictionary, `wiringcraft pdf --lang nb` (or `nb,en` for two), `wiringcraft translations --lang nb` lists missing texts; in the app, File, Translations edits the texts with a column per language (missing ones marked) and the PDF export asks for the language | CLI (#276), app (#451) |
 
 ## 2. Editing on the sheet
 
@@ -92,14 +92,14 @@ For the other areas, the chapter to read in each help is:
 | Grid, snap, zoom, pan, fit page | yes | yes | yes | done |
 | Free graphics: lines, rectangles, texts | yes | yes | yes | done |
 | Circles, arcs and polylines in the editor | yes | yes | yes: drawn by hand (Graphics toolbar), picked, moved, deleted and exported like other drawings | done |
-| Dimensions in the editor | yes | yes | partly: kept from imports (drawn by their block), not drawn by hand | later |
+| Dimensions in the editor | yes | yes | yes: kept from imports (drawn by their block), and drawn by hand with the Dimension tool (Graphics toolbar: two points, then the dimension line); picked, moved, deleted, saved and exported to PDF, SVG and DXF like other drawings | done (#317) |
 | Find and replace texts, tags and wire numbers across the project | yes | yes | yes: Edit → Find (Ctrl+F), `wiringcraft find` | done (#109) |
 | Macros / window macros (save and insert groups) | yes | yes | yes | done |
 | Open, Save as and export with the system file dialogs | yes | yes | yes: Open (Ctrl+O) and Save as (Ctrl+Shift+S, a copy in a new folder, history included) use the system pickers, and every export from the menus asks where to save, starting in `export/` (or the nearest folder of it that exists). The assistant's export tool writes to `export/` without asking, and when no file dialog can open an export goes there too and says so | done (#338) |
-| Macro placeholders and value sets (one macro, several variants) | yes | partly | no | later |
+| Macro placeholders and value sets (one macro, several variants) | yes | partly | partly: `{{name}}` placeholders in a macro's device descriptions, parts, accessories and properties, wire cross-section, colour and type, and drawn texts, filled from a named value set chosen at insert (Insert > Macro, the assistant, `wiringcraft macro place --set`); a project macro's placeholders and value sets are edited in the app (Insert > Macro, Placeholders…), a renamed placeholder renamed in its texts | done (#272, #407) |
 | Auto-connect pins that line up | yes | yes | yes | done (#51) |
 | Scanned drawing as underlay to trace over | partly | partly | yes | done |
-| Layers / show-hide groups | yes | yes (DWG layers) | partly: PDF layers | done for export; editor layers later |
+| Layers / show-hide groups | yes | yes (DWG layers) | yes: PDF layers, editor layers (View → Layers) | done: show, hide and lock on the canvas, kept per user |
 
 ## 3. Symbols and library
 
@@ -122,7 +122,7 @@ For the other areas, the chapter to read in each help is:
 | Device properties and description | yes | yes | yes | done |
 | Part (article) database with manufacturer, order number, data | yes | yes (catalog) | yes | done |
 | Several parts on one device (main part plus accessories) | yes | yes | no: one part per device | todo (#106) |
-| Black box / device box for devices without a symbol | yes | yes | partly: imported, not drawable | later |
+| Black box / device box for devices without a symbol | yes | yes | yes: imported, drawn with connection points from the command line (`wiringcraft box`) and with the Black box tool in the app (drag the rectangle, click its edges for connection points, then tag it); a placed box's width, height and connection points (add, rename, move, remove) are changed in the properties panel as one undo step, with a warning naming wires on points that are gone or moved; with the select tool a selected box also shows a sizing handle at each corner: dragging one resizes the box on release so the opposite corner stays put, moving the box when a near corner is dragged (one undo step, points kept where they were on the page where they can, else on their edges) | yes (#266, #371, #489, #524, #529) |
 | Part data from the maker's data portal | add-on (Data Portal) | yes (content portal) | EDZ part data, and macros as symbols with their connection points (multi-line, variant A; or a symbol by `--symbol-map`), and BMEcat | done (#144, #311) |
 | Manufacturer symbol and macro sources | yes | yes | listed in docs | done (#46) |
 
@@ -145,7 +145,7 @@ For the other areas, the chapter to read in each help is:
 |---|---|---|---|---|
 | Coil to contact cross-references with page/column | yes | yes | yes, clickable | done |
 | Contact image under the coil (list of contacts and pins) | yes | yes | yes (texts with pins and locations) | done |
-| Contact overflow check (more contacts drawn than the part has) | yes | yes | no: parts do not list their contacts yet | later (after #106) |
+| Contact overflow check (more contacts drawn than the part has) | yes | yes | yes: parts list their contacts (`contacts` in the part file), `check` warns | done |
 
 ## 7. Terminals
 
@@ -175,8 +175,8 @@ For the other areas, the chapter to read in each help is:
 | PLC I/O list report | yes | yes | yes | done |
 | PLC addresses from a CSV list | yes | yes | yes | done |
 | PLC variable list export (structured text) | yes | partly | yes | done |
-| PLC card overview pages and rack configuration | yes | yes | no | later |
-| Fieldbus (PROFINET, EtherCAT) topology | yes | partly | no | later |
+| PLC card overview pages and rack configuration | yes | yes | partly: `[[rack]]` tables with their `[[rack.card]]`s in `project.toml` (slot, tag, type, channels, start address); the `plc-cards` report lists every card channel by channel with the device, connection and page from the PLC I/O list, as a table in the PDF (`pdf --report plc-cards`) and the app; see `wc_core::plc_rack`. The app edits racks and cards in File > PLC racks (#436), showing the report's rack warnings while typing. No drawn card pictures yet | partly (#275) |
+| Fieldbus (PROFINET, EtherCAT) topology | yes | partly | yes: `[[network]]` tables in `project.toml` (devices, addresses, station names, cabled ports), Networks report (`--report networks`) with checks, and a drawn topology page per network after the list in the PDF (boxes per device linking to its page, ports and cable tags on each link, rings drawn once, cables from different devices each on a track of their own so they do not look joined, cables fanning out of one device sharing one run; tags, port names and cables never cut: smaller type, then a numbered key with a legend under the drawing) | network list (#278), topology pages (#453), separate tracks (#486), whole names (#493) |
 | Exchange with PLC engineering tools (AutomationML) | yes | partly | yes (export) | done |
 
 ## 10. Reports
@@ -187,16 +187,18 @@ For the other areas, the chapter to read in each help is:
 | Device, wire, net, terminal, cable, PLC lists | yes | yes | yes | done |
 | Table of contents | yes | yes | yes, linked in the PDF | done |
 | Report pages in the drawing set | yes | yes | yes | done |
-| Report templates the user designs | yes | yes | no | later |
-| Reports as CSV / Markdown | yes (Excel) | yes (Excel) | yes | done |
+| Report templates the user designs | yes | yes | partly: `[[report]]` layouts in `project.toml` pick, order, rename and sort the columns of any report, in the PDF, CSV, Markdown and Excel output; `group = "<column>"` prints a heading per group in the PDF (one row per record in the CSV), and `header = [...]` prints title-block values above the table | columns and sort done (#273), grouping and page header fields done (#421), an unknown group column or header key warned about (#481); an editor in the app later |
+| Reports as CSV / Markdown / Excel | yes (Excel) | yes (Excel) | yes: `report --format xlsx`, Reports → Save as Excel | done (#264) |
 
 ## 11. Panel layout and 3D
 
 | Function | EPLAN | SWE | WiringCraft | Triage |
 |---|---|---|---|---|
 | 2D mounting plate with rails and ducts | add-on (Pro Panel) | yes | yes | done |
-| Place devices onto rails from the schematic | add-on | yes | yes | done |
+| Place devices onto rails from the schematic | add-on | yes | yes: `panel arrange`, or one device at a time with `panel device <panel> <tag> --at x,y [--rotate 90]` (or `--remove`); `panel show` lists each device with its place, size and turn (#507) | done |
+| Maker outline drawings as device footprints | yes (2D macros of the part) | yes (2D footprint) | partly: `import footprint-dxf`, or Attach footprint drawing in the app's panel layout properties, stores a maker DXF with the part; layout pages in the app and the PDF draw it at real size (shrunk to fit a smaller device box), and a part without a `Width` or `Height` takes it from the drawing. A device can be turned in quarter steps (Rotate 90° in its properties, or R on the layout); its box, its drawing and its STEP block turn with it (#485) | partly (#312) |
 | 3D model export (STEP) | add-on | yes | yes | done |
+| Maker 3D models (STEP) give a part's size | yes (Pro Panel) | yes | partly: `import model-step` reads a maker's STEP model (mm, m or inch) and stores its bounding box with the part, as does Attach 3D model in the app's panel layout properties (#501); a part without `Width`, `Height` or `Depth` takes them from it for layouts and the STEP export. An assembly model is measured with its parts where they are placed, nested assemblies included (#500), each part in its own length unit (#510). Not yet: the model's shape in 3D | partly (#313) |
 | 3D cabinet design with wire routing | add-on (Pro Panel) | yes (Electrical 3D) | no | later: one-way export to SolidCraft (phase 5) |
 | Drilling and NC data for plates | add-on | partly | no | not planned for now: belongs to the 3D side (SolidCraft) |
 | SolidWorks cabinet layouts on import | - | - | yes: each 2D cabinet layout page becomes a panel with its plate, rails, ducts and device footprints | done (#60) |
@@ -206,8 +208,8 @@ For the other areas, the chapter to read in each help is:
 | Function | EPLAN | SWE | WiringCraft | Triage |
 |---|---|---|---|---|
 | Project check with errors and warnings | yes | yes | yes, in the app and the CLI | done |
-| Online check while drawing | yes | partly | no: run on demand | later |
-| User-defined check rules | yes | no | no | later |
+| Online check while drawing | yes | partly | yes: the check runs again shortly after each edit, off the window thread; problems are ringed on the canvas and counted in the status bar (File → Check while drawing turns it off) | done (#269) |
+| User-defined check rules | yes | no | yes: `[[rule]]` tables in `project.toml` (a cable on matching devices, a tag pattern, at most N wires per pin), run with the built-in check in the app and `wiringcraft check`; added, changed, reordered and deleted in the Rules dialog next to the check list (one undo step); house rules in a library source's `rules.toml` run for every project using it, named by source, and a project turns one off with `rules_off = ["source:2"]` or by name; see `wc_core::check_rule` | done (#274, #429, #430) |
 
 ## 13. Data exchange
 
@@ -222,7 +224,7 @@ For the other areas, the chapter to read in each help is:
 | PDF trace import (turn a PDF drawing into a page) | partly | no | yes | done |
 | AutomationML export | yes | partly | yes | done |
 | List exchange as CSV (import and export) | yes | yes | yes | done |
-| Excel workbook (.xlsx) import and export | yes | yes | no: CSV only | later |
+| Excel workbook (.xlsx) import and export | yes | yes | yes: parts and PLC address lists read from the first visible sheet with the CSV column names (`import parts-csv`, `import plc-csv`, `.xlsx` entries in archives); reports written one sheet per report, every cell as text; the old binary `.xls` is not read | done (#264) |
 | WAGO and other maker configurator links | add-on | partly | partly: terminal strips with rails, jumpers and accessories as a CSV for the WAGO configurator ([docs](wago-configurator.md)), and the chosen articles back onto the devices and jumpers (`import wago`, File → WAGO articles back) | partly (#122) |
 
 ## 14. Revisions and collaboration
@@ -230,7 +232,7 @@ For the other areas, the chapter to read in each help is:
 | Function | EPLAN | SWE | WiringCraft | Triage |
 |---|---|---|---|---|
 | Revision tracking and compare | yes | yes | yes: git history, subway map, change lists | done |
-| Revision marks (clouds, revision table on pages) | yes | yes | no | later |
+| Revision marks (clouds, revision table on pages) | yes | yes | yes: revisions listed in the project properties, revision clouds tagged with the latest revision and the revision table drawn on pages and in the PDF, made in the app (Cloud and Revision table tools) or with `wiringcraft revision` | done (#265, #377) |
 | Review comments on pages | yes (comments in PDF) | partly | yes | done |
 | Several people on one project at once | yes (multi-user) | yes (server database) | share and join in the app, page locks | todo (#43: #77, #78) |
 | User rights per project | yes | yes | no | not planned: git hosting already controls who can change a project |

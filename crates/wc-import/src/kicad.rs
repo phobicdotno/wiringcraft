@@ -397,6 +397,7 @@ fn convert(name: &str, sym: &Sexp, body: &Sexp, base: &str, wanted: u32, prefix:
         .map(|(x, y)| fix(pt(x, y)))
         .unwrap_or(Point::new(-5.0, 0.0));
     Ok(Symbol {
+        source: String::new(),
         id,
         name: name.replace('_', " "),
         category: String::new(),

@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use wc_core::geom::{Align, Point, Rotation, Shape};
-use wc_core::{Device, DeviceTag, Endpoint, Page, PlacedSymbol, Wire};
+use wc_core::{Device, DeviceTag, Endpoint, Page, PlacedSymbol, RevisionCloud, Wire};
 
 use crate::state::{Open, Selection};
 
@@ -18,6 +18,12 @@ pub struct Clipboard {
     pub graphics: Vec<Shape>,
     /// Top-left corner of what was copied; a paste puts this corner at the pointer.
     pub anchor: Point,
+    /// The device data above wins over the project's for the same tag: set for a macro, whose
+    /// values were chosen when it was inserted. A copy within a project keeps the project's.
+    pub own_devices: bool,
+    /// The folder of the project it was copied in; a paste into another project takes the
+    /// copied device data first.
+    pub from: Option<std::path::PathBuf>,
 }
 
 impl From<wc_core::macros::Macro> for Clipboard {
@@ -28,6 +34,8 @@ impl From<wc_core::macros::Macro> for Clipboard {
             devices: m.devices,
             graphics: m.graphics,
             anchor: m.anchor,
+            own_devices: true,
+            from: None,
         }
     }
 }
@@ -52,6 +60,8 @@ impl Clipboard {
             graphics: self.graphics.clone(),
             devices: self.devices.clone(),
             anchor: self.anchor,
+            placeholders: Vec::new(),
+            value_sets: Vec::new(),
         }
     }
 
@@ -84,7 +94,7 @@ fn ids(sel: &[Selection]) -> (BTreeSet<&str>, BTreeSet<&str>) {
         match s {
             Selection::Symbol(id) => syms.insert(id.as_str()),
             Selection::Wire(id) => wires.insert(id.as_str()),
-            Selection::Graphic(_) => false,
+            Selection::Graphic(_) | Selection::Cloud(_) | Selection::RevisionTable => false,
         };
     }
     (syms, wires)
@@ -98,23 +108,53 @@ fn ids(sel: &[Selection]) -> (BTreeSet<&str>, BTreeSet<&str>) {
 /// is no longer selected.
 /// Symbols and wires are left as they are.
 pub fn remap_graphics(sel: &mut Vec<Selection>, old: &[Shape], new: &[Shape]) {
+    remap_by_position(sel, old, new, |s| match s {
+        Selection::Graphic(i) => Some(i),
+        _ => None,
+    });
+}
+
+/// [`remap_graphics`] for revision clouds: a selected cloud is followed to where a merge put
+/// it, or let go when which one it is cannot be told.
+pub fn remap_clouds(
+    sel: &mut Vec<Selection>,
+    old: &[wc_core::revision::RevisionCloud],
+    new: &[wc_core::revision::RevisionCloud],
+) {
+    remap_by_position(sel, old, new, |s| match s {
+        Selection::Cloud(i) => Some(i),
+        _ => None,
+    });
+}
+
+/// Follow selections that name an item by its position in a list (`index` gives the position,
+/// or `None` for selections of other kinds) from the list `old` to `new`.
+fn remap_by_position<T: PartialEq>(
+    sel: &mut Vec<Selection>,
+    old: &[T],
+    new: &[T],
+    index: impl Fn(&mut Selection) -> Option<&mut usize>,
+) {
     if old == new {
         return;
     }
     sel.retain_mut(|s| {
-        let Selection::Graphic(i) = s else {
+        let Some(i) = index(s) else {
             return true;
         };
         let Some(item) = old.get(*i) else {
             return false;
         };
-        let copies = |list: &[Shape]| list.iter().filter(|x| *x == item).count();
+        let copies = |list: &[T]| list.iter().filter(|x| *x == item).count();
         if copies(old) != copies(new) {
             // Copies came or went: which one is the selected one is not known.
             return false;
         }
         // The how-many-th copy of this item it is, found again in the new list.
-        let nth = copies(&old[..*i]);
+        let Some(before) = old.get(..*i) else {
+            return false;
+        };
+        let nth = copies(before);
         match new.iter().enumerate().filter(|(_, x)| *x == item).nth(nth) {
             Some((j, _)) => {
                 *i = j;
@@ -123,6 +163,85 @@ pub fn remap_graphics(sel: &mut Vec<Selection>, old: &[Shape], new: &[Shape]) {
             None => false,
         }
     });
+}
+
+/// Selected free drawings a sync took off a page, to be selected again once they are back.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WaitingGraphics {
+    /// The page's id.
+    pub page: String,
+    /// The drawings waited for.
+    pub items: Vec<Lost>,
+    /// The selection after the last sync: one made since is the user's, and ends the wait.
+    pub selection: Vec<Selection>,
+}
+
+/// A selected drawing a sync took off a page.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Lost {
+    /// The drawing.
+    pub shape: Shape,
+    /// How many copies of it the page had without it.
+    pub had: usize,
+    /// How many of its copies were selected and taken off (a paste of two equal lines is two).
+    pub selected: usize,
+}
+
+/// The drawings selected in `before` (positions in `old`) of which `new` has fewer copies.
+pub fn lost_graphics(before: &[Selection], old: &[Shape], new: &[Shape]) -> Vec<Lost> {
+    let copies = |list: &[Shape], item: &Shape| list.iter().filter(|x| *x == item).count();
+    let mut lost: Vec<Lost> = Vec::new();
+    for s in before {
+        let Selection::Graphic(i) = s else { continue };
+        let Some(item) = old.get(*i) else { continue };
+        let (had, was) = (copies(new, item), copies(old, item));
+        if had >= was {
+            continue;
+        }
+        match lost.iter_mut().find(|l| l.shape == *item) {
+            // No more of them than went.
+            Some(l) => l.selected = (l.selected + 1).min(was - had),
+            None => lost.push(Lost {
+                shape: item.clone(),
+                had,
+                selected: 1,
+            }),
+        }
+    }
+    lost
+}
+
+/// Select again the drawings of `items` that are back on the page (`now` has more copies of one
+/// than it had without it): the last copies, where a merged change puts them. They leave `items`.
+pub fn restore_graphics(items: &mut Vec<Lost>, sel: &mut Vec<Selection>, now: &[Shape]) {
+    items.retain(|l| {
+        let at: Vec<usize> = now
+            .iter()
+            .enumerate()
+            .filter(|(_, x)| **x == l.shape)
+            .map(|(j, _)| j)
+            .collect();
+        let back = at.len().saturating_sub(l.had);
+        if back == 0 {
+            return true;
+        }
+        for &j in at.iter().rev().take(back.min(l.selected)) {
+            let s = Selection::Graphic(j);
+            if !sel.contains(&s) {
+                sel.push(s);
+            }
+        }
+        false
+    });
+}
+
+fn cloud_ids(sel: &[Selection]) -> BTreeSet<usize> {
+    sel.iter()
+        .filter_map(|s| match s {
+            Selection::Cloud(i) => Some(*i),
+            _ => None,
+        })
+        .collect()
 }
 
 fn graphic_ids(sel: &[Selection]) -> BTreeSet<usize> {
@@ -167,6 +286,19 @@ pub fn graphic_bounds(g: &Shape) -> (Point, Point) {
             });
             wc_core::geom::bounds_of(&corners)
         }
+        // Its lines, arrows and the real extent of its text.
+        Shape::Dimension { .. } => {
+            let corners: Vec<Point> = g
+                .dimension_parts()
+                .unwrap_or_default()
+                .iter()
+                .flat_map(|part| {
+                    let (a, b) = graphic_bounds(part);
+                    [a, b]
+                })
+                .collect();
+            wc_core::geom::bounds_of(&corners)
+        }
         // The drawn part of an arc, so a selection box around a quarter arc takes it.
         Shape::Arc {
             center,
@@ -206,6 +338,11 @@ fn inside_outline(at: Point, pts: &[Point]) -> bool {
 pub fn graphic_hit(g: &Shape, at: Point, tol: f64) -> bool {
     let near_path = |pts: &[Point]| pts.windows(2).any(|ab| seg_dist(at, ab[0], ab[1]) <= tol);
     match g {
+        Shape::Dimension { .. } => g
+            .dimension_parts()
+            .unwrap_or_default()
+            .iter()
+            .any(|part| graphic_hit(part, at, tol)),
         Shape::Line { a, b } => seg_dist(at, *a, *b) <= tol,
         Shape::Polyline { points, closed, filled } => {
             let mut pts = points.clone();
@@ -272,6 +409,8 @@ impl Open {
             .map(|s| Selection::Symbol(s.id.clone()))
             .chain(p.wires.iter().map(|w| Selection::Wire(w.id.clone())))
             .chain((0..p.graphics.len()).map(Selection::Graphic))
+            .chain((0..p.clouds.len()).map(Selection::Cloud))
+            .chain(p.revision_table.map(|_| Selection::RevisionTable))
             .collect()
     }
 
@@ -304,7 +443,82 @@ impl Open {
                 out.push(Selection::Graphic(i));
             }
         }
+        for (i, c) in p.clouds.iter().enumerate() {
+            if inside(c.min) && inside(c.max) {
+                out.push(Selection::Cloud(i));
+            }
+        }
+        if let Some((a, b)) = self.revision_table_bounds(p)
+            && inside(a)
+            && inside(b)
+        {
+            out.push(Selection::RevisionTable);
+        }
         out
+    }
+
+    /// The corners of a page's revision table, when it shows one.
+    pub fn revision_table_bounds(&self, page: &Page) -> Option<(Point, Point)> {
+        let at = page.revision_table?;
+        let (w, h) = wc_core::revision::table_size(self.project.meta.revisions.len());
+        Some((at, Point::new(at.x + w, at.y + h)))
+    }
+
+    /// Draw a revision cloud around the rectangle `a`-`b` on a page, tagged with the latest
+    /// revision, as one undo step, and return its selection. Refused with the reason when the
+    /// project has no revision yet, the area is empty or someone else has the page open.
+    pub fn add_cloud(&mut self, page: usize, a: Point, b: Point) -> Result<Selection, String> {
+        let id = self.project.pages.get(page).ok_or("No such page.")?.id.clone();
+        if let Some(why) = self.held_reason(page) {
+            return Err(why);
+        }
+        if self.project.latest_revision().is_none() {
+            return Err("Add a revision first: File → Project properties, Revisions.".into());
+        }
+        if !RevisionCloud::new(a, b, "").is_valid() {
+            return Err("A cloud needs an area: click two different corners.".into());
+        }
+        self.checkpoint();
+        let i = self.project.add_cloud(&id, a, b, None).map_err(|e| e.to_string())?;
+        Ok(Selection::Cloud(i))
+    }
+
+    /// Tag cloud `index` on a page with the revision `letter`, as one undo step. True when it
+    /// changed.
+    pub fn set_cloud_revision(&mut self, page: usize, index: usize, letter: &str) -> bool {
+        let Some(letter) = self.project.revision(letter).map(|r| r.letter.clone()) else {
+            return false;
+        };
+        let same = self
+            .project
+            .pages
+            .get(page)
+            .and_then(|p| p.clouds.get(index))
+            .is_none_or(|c| c.revision == letter);
+        if same || self.held_reason(page).is_some() {
+            return false;
+        }
+        self.checkpoint();
+        if let Some(c) = self.project.pages.get_mut(page).and_then(|p| p.clouds.get_mut(index)) {
+            c.revision = letter;
+        }
+        true
+    }
+
+    /// Show the page's revision table with its top-left corner at `at` (moving it when it is
+    /// there already), as one undo step, and return its selection.
+    pub fn place_revision_table(&mut self, page: usize, at: Point) -> Result<Selection, String> {
+        let id = self.project.pages.get(page).ok_or("No such page.")?.id.clone();
+        if let Some(why) = self.held_reason(page) {
+            return Err(why);
+        }
+        if self.project.pages[page].revision_table != Some(at) {
+            self.checkpoint();
+            self.project
+                .set_revision_table(&id, Some(at))
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(Selection::RevisionTable)
     }
 
     /// Add a free drawing to a page and return its selection. Refused (None) on a page someone else has open in a shared session.
@@ -347,6 +561,21 @@ impl Open {
     /// that is changed is kept between 0 and 360 degrees (one left as it was is kept as stored);
     /// an opened polyline is no longer filled (only a closed one can be).
     pub fn set_shape(&mut self, page: usize, index: usize, new: Shape) -> Result<bool, &'static str> {
+        let new = self.shape_checked(page, index, new)?;
+        if self.project.pages.get(page).and_then(|p| p.graphics.get(index)) == Some(&new) {
+            return Ok(false);
+        }
+        self.checkpoint();
+        if let Some(g) = self.project.pages.get_mut(page).and_then(|p| p.graphics.get_mut(index)) {
+            *g = new;
+        }
+        Ok(true)
+    }
+
+    /// `new` as [`Self::set_shape`] would store it in place of free drawing `index` on `page`
+    /// (arc angles that changed kept within a turn, an opened polyline unfilled), or the reason
+    /// it would refuse it. Nothing is changed.
+    pub fn shape_checked(&self, page: usize, index: usize, new: Shape) -> Result<Shape, &'static str> {
         let Some(old) = self.project.pages.get(page).and_then(|p| p.graphics.get(index)) else {
             return Err("The drawing is no longer there.");
         };
@@ -401,13 +630,11 @@ impl Open {
                 if moved.1 {
                     *end = turn(*end);
                 }
-                // The sweep as the canvas draws it (`canvas::arc_points`): one that rounds to
-                // nothing (370.1° to 10.1°) leaves no arc either.
-                let drawn = {
-                    let sweep = *end - *start;
-                    if sweep <= 0.0 { sweep + 360.0 } else { sweep }
-                };
-                if (moved.0 || moved.1) && (turn(*start) == turn(*end) || drawn <= 1e-9) {
+                // Equal angles are refused, and so is a sweep as the canvas draws it that
+                // rounds to nothing (360° to 0°, 370.1° to 10.1°). Angles a whole turn apart
+                // are not alike for that: 720° to 0° draws a full turn, as 720° to 100° draws.
+                let drawn = crate::canvas::arc_sweep(*start, *end);
+                if (moved.0 || moved.1) && (*start == *end || drawn.abs() <= 1e-9) {
                     return Err("The start and end angles must differ.");
                 }
             }
@@ -421,14 +648,7 @@ impl Open {
             }
             _ => {}
         }
-        if *old == new {
-            return Ok(false);
-        }
-        self.checkpoint();
-        if let Some(g) = self.project.pages.get_mut(page).and_then(|p| p.graphics.get_mut(index)) {
-            *g = new;
-        }
-        Ok(true)
+        Ok(new)
     }
 
     /// Move the selection by `d`. The caller takes the undo checkpoint (once per drag).
@@ -467,7 +687,18 @@ impl Open {
                 *g = g.translate(d);
             }
         }
-        self.dirty = true;
+        for i in cloud_ids(sel) {
+            if let Some(c) = p.clouds.get_mut(i) {
+                c.min = c.min + d;
+                c.max = c.max + d;
+            }
+        }
+        if sel.contains(&Selection::RevisionTable)
+            && let Some(at) = &mut p.revision_table
+        {
+            *at = *at + d;
+        }
+        self.edited();
     }
 
     /// Delete several items in one undo step. Wires on deleted symbols go too.
@@ -493,6 +724,15 @@ impl Open {
             i += 1;
             !gone.contains(&(i - 1))
         });
+        let gone = cloud_ids(sel);
+        let mut i = 0;
+        p.clouds.retain(|_| {
+            i += 1;
+            !gone.contains(&(i - 1))
+        });
+        if sel.contains(&Selection::RevisionTable) {
+            p.revision_table = None;
+        }
     }
 
     /// Rotate the selected symbols 90° each, in one undo step.
@@ -505,6 +745,22 @@ impl Open {
                 Rotation::R270 => Rotation::R0,
             };
         });
+    }
+
+    /// Turn device `item` of panel layout `panel` a quarter clockwise, in one undo step.
+    /// Returns false, with no undo step, when it is not a device or would not fit turned.
+    pub fn rotate_panel_device(&mut self, panel: usize, item: usize) -> bool {
+        let Some(mut turned) = self.project.panels.get(panel).cloned() else {
+            return false;
+        };
+        if !turned.rotate_device(item) {
+            return false;
+        }
+        self.checkpoint();
+        if let Some(p) = self.project.panels.get_mut(panel) {
+            *p = turned;
+        }
+        true
     }
 
     /// Mirror the selected symbols left to right, in one undo step.
@@ -584,82 +840,46 @@ impl Open {
             devices,
             graphics,
             anchor,
+            own_devices: false,
+            from: Some(self.dir.clone()),
         }
     }
 
     /// Paste so the clipboard's anchor lands on `at`. Pasted symbols get fresh ids and the next
-    /// free device tags (one new device per copied device). Returns the pasted items.
-    pub fn paste(&mut self, page: usize, clip: &Clipboard, at: Point) -> Vec<Selection> {
+    /// free device tags (one new device per copied device). Returns the pasted items, or why
+    /// nothing was pasted when a symbol it needs can't be loaded (nothing is added then).
+    pub fn paste(&mut self, page: usize, clip: &Clipboard, at: Point) -> Result<Vec<Selection>, String> {
         if clip.is_empty() || self.project.pages.get(page).is_none() || self.held_reason(page).is_some() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        for s in &clip.symbols {
-            // Symbols copied from another project are taken from the library when possible.
-            if !self.symbols.contains_key(&s.symbol) {
-                let _ = self.ensure_symbol(&s.symbol);
-            }
-        }
-        self.checkpoint();
-        let d = Point::new(at.x - clip.anchor.x, at.y - clip.anchor.y);
-        let mut renamed: BTreeMap<DeviceTag, DeviceTag> = BTreeMap::new();
-        let mut ids: BTreeMap<String, String> = BTreeMap::new();
-        let mut out = Vec::new();
-        for s in &clip.symbols {
-            let mut s = s.clone();
-            s.tag = s.tag.and_then(|old| {
-                if let Some(t) = renamed.get(&old) {
-                    return Some(t.clone());
-                }
-                let t = self.free_tag_like(&old)?;
-                let device = self
-                    .project
-                    .devices
-                    .get(&old)
-                    .or_else(|| clip.devices.get(&old))
-                    .cloned()
-                    .unwrap_or_default();
-                self.project.devices.insert(t.clone(), device);
-                renamed.insert(old, t.clone());
-                Some(t)
-            });
-            let Some(p) = self.project.pages.get_mut(page) else {
-                break;
-            };
-            let id = p.next_id("s");
-            ids.insert(s.id.clone(), id.clone());
-            s.id = id.clone();
-            s.at = s.at + d;
-            p.symbols.push(s);
-            out.push(Selection::Symbol(id));
-        }
-        let Some(p) = self.project.pages.get_mut(page) else {
-            return out;
+        // Every symbol it uses, checked against its pin (a loaded copy may be another version);
+        // those copied from another project are taken from the library when possible.
+        let ids: std::collections::BTreeSet<&str> = clip.symbols.iter().map(|s| s.symbol.as_str()).collect();
+        self.ensure_symbols(ids)?;
+        let group = wc_core::placement::Group {
+            symbols: &clip.symbols,
+            wires: &clip.wires,
+            graphics: &clip.graphics,
+            devices: &clip.devices,
+            anchor: clip.anchor,
         };
-        for w in &clip.wires {
-            let mut w = w.clone();
-            w.id = p.next_id("w");
-            w.number = None;
-            for v in &mut w.via {
-                *v = *v + d;
-            }
-            for e in [&mut w.from, &mut w.to] {
-                match e {
-                    Endpoint::Point { at } => *at = *at + d,
-                    Endpoint::Pin { item, .. } => {
-                        if let Some(n) = ids.get(item.as_str()) {
-                            *item = n.clone();
-                        }
-                    }
-                }
-            }
-            out.push(Selection::Wire(w.id.clone()));
-            p.wires.push(w);
-        }
-        for g in &clip.graphics {
-            p.graphics.push(g.translate(d));
-            out.push(Selection::Graphic(p.graphics.len() - 1));
-        }
-        out
+        use wc_core::placement::{DeviceData, OutOfTags};
+        // The copied data first for a macro or a copy from another project; within one project
+        // the project's own, which may have changed since the copy.
+        let data = if clip.own_devices || clip.from.as_deref() != Some(self.dir.as_path()) {
+            DeviceData::GroupFirst
+        } else {
+            DeviceData::ProjectFirst
+        };
+        self.checkpoint();
+        // A device for which no tag is left is pasted without one.
+        let placed = wc_core::placement::place(&mut self.project, page, group, at, data, OutOfTags::Untagged)
+            .map_err(|e| e.to_string())?;
+        let out = (placed.symbols.into_iter().map(Selection::Symbol))
+            .chain(placed.wires.into_iter().map(Selection::Wire))
+            .chain(placed.graphics.into_iter().map(Selection::Graphic))
+            .collect();
+        Ok(out)
     }
 }
 
@@ -667,6 +887,57 @@ impl Open {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_drawing_taken_off_is_selected_again_where_it_comes_back() {
+        let l = |x: f64| Shape::Line {
+            a: Point::new(x, 0.0),
+            b: Point::new(x, 5.0),
+        };
+        // Two copies of a line; the pasted second one is selected, and a sync takes it off.
+        let old = vec![l(1.0), l(2.0), l(1.0)];
+        let new = vec![l(1.0), l(2.0)];
+        let mut items = lost_graphics(&[Selection::Graphic(2), Selection::Graphic(1)], &old, &new);
+        let one = Lost {
+            shape: l(1.0),
+            had: 1,
+            selected: 1,
+        };
+        assert_eq!(items, vec![one], "only what went is waited for");
+        // Not back yet: nothing is selected for it.
+        let mut sel = Vec::new();
+        restore_graphics(&mut items, &mut sel, &new);
+        assert!(sel.is_empty());
+        assert_eq!(items.len(), 1);
+        // Back, after a line someone else added: the last copy is the pasted one.
+        let now = vec![l(1.0), l(2.0), l(3.0), l(1.0)];
+        restore_graphics(&mut items, &mut sel, &now);
+        assert_eq!(sel, vec![Selection::Graphic(3)]);
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn two_equal_drawings_taken_off_are_both_selected_again() {
+        let l = |x: f64| Shape::Line {
+            a: Point::new(x, 0.0),
+            b: Point::new(x, 5.0),
+        };
+        // A copy was there before; a paste of two more, both selected, goes.
+        let old = vec![l(1.0), l(2.0), l(1.0), l(1.0)];
+        let new = vec![l(1.0), l(2.0)];
+        let mut items = lost_graphics(&[Selection::Graphic(2), Selection::Graphic(3)], &old, &new);
+        assert_eq!(items.len(), 1);
+        assert_eq!((items[0].had, items[0].selected), (1, 2));
+        let mut sel = Vec::new();
+        let now = vec![l(1.0), l(2.0), l(1.0), l(1.0)];
+        restore_graphics(&mut items, &mut sel, &now);
+        assert_eq!(
+            sel,
+            vec![Selection::Graphic(3), Selection::Graphic(2)],
+            "not the copy that stayed"
+        );
+        assert!(items.is_empty());
+    }
 
     #[test]
     fn a_graphic_selection_follows_its_item_when_the_list_is_merged() {
@@ -785,12 +1056,49 @@ mod tests {
     }
 
     #[test]
+    fn a_pasted_cable_core_runs_in_the_pasted_cable() {
+        let (_tmp, mut o, page, a, _b) = setup();
+        // The first symbol stands for the cable; the wire is one of its cores.
+        let cable = o.project.pages[page].symbol(&a).unwrap().tag.clone().unwrap();
+        o.project.pages[page].wires[0].cable = Some(wc_core::project::CableCore {
+            cable: cable.clone(),
+            core: "BN".into(),
+        });
+        let sel = o.select_all(page);
+        let clip = o.copy(page, &sel);
+        // The original keeps its tag, so the copy's cable gets a new one.
+        let items = o.paste(page, &clip, Point::new(150.0, 50.0)).unwrap();
+        let p = &o.project.pages[page];
+        let new_cable = items
+            .iter()
+            .find_map(|i| match i {
+                Selection::Symbol(id) if p.symbol(id).unwrap().symbol == "wc.coil" => p.symbol(id)?.tag.clone(),
+                _ => None,
+            })
+            .unwrap();
+        assert_ne!(new_cable, cable);
+        let wire = items
+            .iter()
+            .find_map(|i| match i {
+                Selection::Wire(id) => p.wires.iter().find(|w| &w.id == id),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(wire.cable.as_ref().map(|c| &c.cable), Some(&new_cable));
+        assert_eq!(
+            p.wires[0].cable.as_ref().map(|c| &c.cable),
+            Some(&cable),
+            "the original is unchanged"
+        );
+    }
+
+    #[test]
     fn copy_paste_gets_new_ids_and_tags_and_keeps_the_wire() {
         let (_tmp, mut o, page, a, b) = setup();
         let sel = o.select_all(page);
         let clip = o.copy(page, &sel);
         assert_eq!((clip.symbols.len(), clip.wires.len()), (2, 1));
-        let pasted = o.paste(page, &clip, Point::new(150.0, 100.0));
+        let pasted = o.paste(page, &clip, Point::new(150.0, 100.0)).unwrap();
         assert_eq!(pasted.len(), 3);
         let p = &o.project.pages[page];
         assert_eq!(p.symbols.len(), 4);
@@ -805,6 +1113,49 @@ mod tests {
         // Undo removes the whole paste.
         assert!(o.undo());
         assert_eq!(o.project.pages[page].symbols.len(), 2);
+    }
+
+    #[test]
+    fn a_paste_into_another_project_keeps_the_copied_device_data() {
+        let (_tmp, mut o, page, a, _b) = setup();
+        let k = o.project.pages[page].symbol(&a).unwrap().tag.clone().unwrap();
+        o.project.devices.entry(k.clone()).or_default().part = Some("part-a".into());
+        let clip = o.copy(page, &[Selection::Symbol(a)]);
+        let part_of_new = |o: &Open| {
+            let s = o.project.pages[page].symbols.last().unwrap();
+            o.project.devices[s.tag.as_ref().unwrap()].part.clone()
+        };
+
+        // Within the project, the project's data as it is now.
+        o.project.devices.entry(k.clone()).or_default().part = Some("part-b".into());
+        o.paste(page, &clip, Point::new(150.0, 100.0)).unwrap();
+        assert_eq!(part_of_new(&o).as_deref(), Some("part-b"));
+
+        // In another project whose device of that tag has another part, the copied one.
+        let (_tmp2, mut other, _, _, _) = setup();
+        other.project.devices.entry(k).or_default().part = Some("part-c".into());
+        other.paste(page, &clip, Point::new(150.0, 100.0)).unwrap();
+        assert_eq!(part_of_new(&other).as_deref(), Some("part-a"));
+    }
+
+    #[test]
+    fn a_device_no_tag_is_left_for_is_pasted_without_one() {
+        let (_tmp, mut o, page, _a, _b) = setup();
+        let sel = o.select_all(page);
+        let clip = o.copy(page, &sel);
+        // Every tag like the copied ones is taken.
+        let like = clip.symbols[0].tag.clone().unwrap();
+        let letter = like.letter_code();
+        for n in 1..10_000 {
+            let mut t = like.clone();
+            *t.product.last_mut().unwrap() = format!("{letter}{n}");
+            o.project.devices.entry(t).or_default();
+        }
+        let pasted = o.paste(page, &clip, Point::new(150.0, 100.0)).unwrap();
+        assert_eq!(pasted.len(), 3, "the symbols and the wire are pasted all the same");
+        let p = &o.project.pages[page];
+        assert_eq!(p.symbols.len(), 4);
+        assert!(p.symbols[2..].iter().all(|s| s.tag.is_none()), "{:?}", &p.symbols[2..]);
     }
 
     #[test]
@@ -827,7 +1178,7 @@ mod tests {
             ("project", "Two coils", "Coils sharing A2")
         );
         // Inserting lands where the group was drawn, with new tags, and the wire loses its number.
-        let inserted = o.insert_macro(page, &path).unwrap();
+        let inserted = o.insert_macro(page, &path, None).unwrap();
         assert_eq!(inserted.len(), 3);
         let p = &o.project.pages[page];
         let tags: BTreeSet<_> = p.symbols.iter().map(|s| s.tag.clone().unwrap()).collect();
@@ -839,6 +1190,66 @@ mod tests {
         let found = o.macros();
         assert_eq!(found.len(), 2);
         assert!(found.iter().any(|m| m.error.is_some()));
+    }
+
+    #[test]
+    fn a_macro_with_value_sets_inserts_the_chosen_variant() {
+        let (_tmp, mut o, page, _a, _b) = setup();
+        let sel = o.select_all(page);
+        let clip = o.copy(page, &sel);
+        let path = o.save_macro(&clip, "Starter", "").unwrap();
+        // Give the first symbol's device placeholders and two value sets, as a user would in
+        // the file.
+        let mut m = wc_core::macros::read_macro(&path).unwrap();
+        let tag = m.symbols[0].tag.clone().unwrap();
+        let d = m.devices.entry(tag.clone()).or_default();
+        d.description = "Starter {{kW}} kW".into();
+        d.part = Some("{{part}}".into());
+        m.placeholders = ["kW", "part"]
+            .into_iter()
+            .map(|n| wc_core::macros::Placeholder {
+                name: n.into(),
+                ..Default::default()
+            })
+            .collect();
+        m.value_sets = [("0.75 kW", "0.75", "P-075"), ("3 kW", "3", "P-3")]
+            .into_iter()
+            .map(|(name, kw, part)| wc_core::macros::ValueSet {
+                name: name.into(),
+                values: [("kW".to_owned(), kw.to_owned()), ("part".to_owned(), part.to_owned())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            })
+            .collect();
+        wc_core::macros::write_macro(&o.dir, "starter", &m).unwrap();
+        let found = o.macros();
+        assert_eq!(found[0].value_sets, ["0.75 kW", "3 kW"]);
+        assert_eq!(found[0].error, None);
+
+        let before = o.project.clone();
+        let err = o.insert_macro(page, &path, None).unwrap_err();
+        assert!(err.contains("choose a value set"), "{err}");
+        assert_eq!(o.project, before, "nothing is inserted without a variant");
+
+        for (set, description, part) in [("3 kW", "Starter 3 kW", "P-3"), ("0.75 kW", "Starter 0.75 kW", "P-075")] {
+            let items = o.insert_macro(page, &path, Some(set)).unwrap();
+            let id = match items.first() {
+                Some(Selection::Symbol(id)) => id,
+                other => unreachable!("a symbol first, not {other:?}"),
+            };
+            let new = o.project.pages[page].symbol(id).unwrap().tag.clone().unwrap();
+            assert_ne!(new, tag);
+            let device = &o.project.devices[&new];
+            assert_eq!(device.description, description);
+            assert_eq!(device.part.as_deref(), Some(part));
+        }
+        // The project's own device keeps its data.
+        assert_eq!(o.project.devices.get(&tag), before.devices.get(&tag));
+        // A file whose value set fills an undeclared placeholder is listed with its error.
+        m.value_sets[0].values.insert("voltage".into(), "400".into());
+        wc_core::macros::write_macro(&o.dir, "starter", &m).unwrap();
+        assert!(o.macros()[0].error.as_deref().is_some_and(|e| e.contains("voltage")));
     }
 
     #[test]
@@ -1057,6 +1468,52 @@ mod tests {
             )
             .is_err()
         );
+        // Stored from a file past a full turn: the canvas draws 720° to 100° as -260°.
+        o.project.pages[page].graphics[n] = Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 9.0,
+            start: 720.0,
+            end: 90.0,
+        };
+        let wide = Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 9.0,
+            start: 720.0,
+            end: 100.0,
+        };
+        assert_eq!(o.set_shape(page, n, wide.clone()), Ok(true));
+        assert_eq!(o.project.pages[page].graphics[n], wide);
+        // 720° to 0° is a full turn as drawn, though the angles match within one turn.
+        o.project.pages[page].graphics[n] = Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 9.0,
+            start: 720.0,
+            end: 90.0,
+        };
+        let full = Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 9.0,
+            start: 720.0,
+            end: 0.0,
+        };
+        assert_eq!(o.set_shape(page, n, full.clone()), Ok(true));
+        assert_eq!(o.project.pages[page].graphics[n], full);
+        // 360° to 0° draws nothing.
+        let before = Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 9.0,
+            start: 360.0,
+            end: 90.0,
+        };
+        o.project.pages[page].graphics[n] = before.clone();
+        let none = Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 9.0,
+            start: 360.0,
+            end: 0.0,
+        };
+        assert!(o.set_shape(page, n, none).is_err());
+        assert_eq!(o.project.pages[page].graphics[n], before);
     }
 
     #[test]
@@ -1101,7 +1558,7 @@ mod tests {
         );
         let clip = o.copy(page, &boxed);
         assert_eq!(clip.graphics.len(), 2);
-        let pasted = o.paste(page, &clip, Point::new(10.0, 10.0));
+        let pasted = o.paste(page, &clip, Point::new(10.0, 10.0)).unwrap();
         assert_eq!(pasted, vec![Selection::Graphic(2), Selection::Graphic(3)]);
         o.delete_many(page, &[line]);
         let left = &o.project.pages[page].graphics;

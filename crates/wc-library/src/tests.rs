@@ -5,6 +5,7 @@ use wc_core::symbol::{Pin, PinDir, SymbolRole};
 
 fn sym(id: &str, pin_y: f64) -> Symbol {
     Symbol {
+        source: String::new(),
         id: id.into(),
         name: "Coil".into(),
         category: "relays".into(),
@@ -454,5 +455,42 @@ fn an_update_checks_every_item_before_it_writes_any() -> Result<()> {
         wc_core::store::read_vendored_symbol(&f.proj, "other")?.pins[1].at.y,
         7.0
     );
+    Ok(())
+}
+
+#[test]
+fn a_folder_source_with_a_rules_file_gives_its_rules_in_source_order() -> Result<()> {
+    let f = fixture()?;
+    let io = |e: std::io::Error| wc_core::Error::io("rules", e);
+    // No rules files: nothing.
+    assert!(library_rules(&f.proj, &f.project).is_empty());
+    std::fs::write(
+        f.company.join("rules.toml"),
+        "[[rule]]\nname = \"motor-cable\"\nkind = \"cable\"\ndevices = \"-M*\"\n",
+    )
+    .map_err(io)?;
+    let personal = f.proj.join("../personal");
+    std::fs::write(personal.join("rules.toml"), "[[rule]\n").map_err(io)?;
+    let sets = library_rules(&f.proj, &f.project);
+    assert_eq!(sets.len(), 2);
+    assert_eq!(sets[0].source, "company");
+    let rules = sets[0].rules.as_ref().map_err(|e| wc_core::Error::Invalid(e.clone()))?;
+    assert_eq!(rules[0].name.as_deref(), Some("motor-cable"));
+    assert_eq!(sets[1].source, "personal");
+    assert!(sets[1].rules.is_err(), "a file that does not parse says so");
+
+    // A source that cannot be resolved says why, under its name, rather than vanishing.
+    let mut project = f.project.clone();
+    project.meta.libraries.push(wc_core::project::LibrarySource {
+        name: "odd".into(),
+        kind: "zip".into(),
+        location: "x".into(),
+        reference: None,
+    });
+    let sets = library_rules(&f.proj, &project);
+    assert_eq!(sets.len(), 3);
+    assert_eq!(sets[2].source, "odd");
+    let why = sets[2].rules.as_ref().err().cloned().unwrap_or_default();
+    assert!(why.contains("unknown kind"), "{why}");
     Ok(())
 }

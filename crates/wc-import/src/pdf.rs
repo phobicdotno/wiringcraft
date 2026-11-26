@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 
 use wc_core::geom::{Align, Point, Shape};
 
+use crate::pdf_codecs;
 use crate::raster::{Orientation, Raster, RasterFormat, samples_to_png, upright};
 use crate::{Error, Result};
 
@@ -330,6 +331,41 @@ struct Doc {
 }
 
 const MAX_INFLATE: usize = 64 * 1024 * 1024;
+
+/// Undo PDF's run-length compression (`RunLengthDecode`): a length byte `n` below 128 is
+/// followed by `n + 1` bytes to copy, one above 128 by a byte to repeat `257 - n` times, and 128
+/// ends the data. Fails with the reason for a run that goes past the end of the data, data
+/// without its end mark, or output over [`MAX_INFLATE`].
+fn run_length_decode(data: &[u8]) -> std::result::Result<Vec<u8>, String> {
+    let past_end = || "the RunLength data is damaged (a run goes past the end of the data)".to_owned();
+    let mut out = Vec::new();
+    let mut i = 0;
+    loop {
+        let Some(&n) = data.get(i) else {
+            return Err("the RunLength data is damaged (it has no end mark)".into());
+        };
+        i += 1;
+        let more = match n {
+            128 => return Ok(out),
+            ..128 => usize::from(n) + 1,
+            _ => 257 - usize::from(n),
+        };
+        if out.len() + more > MAX_INFLATE {
+            return Err(format!(
+                "the RunLength data unpacks to more than {} MiB",
+                MAX_INFLATE / (1024 * 1024)
+            ));
+        }
+        if n < 128 {
+            out.extend_from_slice(data.get(i..i + more).ok_or_else(past_end)?);
+            i += more;
+        } else {
+            let &b = data.get(i).ok_or_else(past_end)?;
+            out.resize(out.len() + more, b);
+            i += 1;
+        }
+    }
+}
 
 /// Undo PDF's LZW compression (`LZWDecode`): codes of 9 to 12 bits, most significant bit
 /// first, 256 clears the table and 257 ends the data. With `early_change` (the default) the
@@ -670,6 +706,9 @@ pub struct TracePage {
     pub scan: Option<Scan>,
     /// Why a large picture could not be read, such as a compression this reader lacks.
     pub scan_problem: Option<String>,
+    /// What is wrong with `scan` where it was read only in part, such as a damaged fax picture
+    /// whose rows after the damage are left white.
+    pub scan_warning: Option<String>,
 }
 
 /// A picture taken from a PDF page.
@@ -843,7 +882,7 @@ impl Interp<'_> {
         {
             return;
         }
-        let raster = match self.image_raster(d, data) {
+        let (raster, warning) = match self.image_raster(d, data) {
             Ok(r) => r,
             Err(problem) => {
                 self.out.scan_problem = Some(problem);
@@ -864,10 +903,16 @@ impl Interp<'_> {
             max: Point::new(hi(xs), hi(ys)),
         });
         self.out.scan_problem = None;
+        self.out.scan_warning = warning;
     }
 
-    /// An image XObject as JPEG (kept as stored) or PNG (from raw samples).
-    fn image_raster(&self, d: &BTreeMap<String, Obj>, data: &[u8]) -> std::result::Result<Raster, String> {
+    /// An image XObject as JPEG (kept as stored) or PNG (from raw samples), with a warning when
+    /// only part of it could be read.
+    fn image_raster(
+        &self,
+        d: &BTreeMap<String, Obj>,
+        data: &[u8],
+    ) -> std::result::Result<(Raster, Option<String>), String> {
         let get = |k: &str| d.get(k).map(|o| self.doc.get(o));
         let filters: Vec<String> = match get("Filter") {
             None => vec![],
@@ -888,6 +933,7 @@ impl Interp<'_> {
             }
         };
         let mut bytes = data.to_vec();
+        let mut warning = None;
         for (i, f) in filters.iter().enumerate() {
             let parms = parms_for(i);
             match f.as_str() {
@@ -903,11 +949,76 @@ impl Interp<'_> {
                         != 0.0;
                     bytes = unpredict(lzw_decode(&bytes, early)?, parms)?;
                 }
+                "RunLengthDecode" | "RL" => bytes = run_length_decode(&bytes)?,
                 "DCTDecode" | "DCT" if i + 1 == filters.len() => {
-                    return Ok(Raster {
-                        format: RasterFormat::Jpeg,
-                        bytes,
-                    });
+                    return Ok((
+                        Raster {
+                            format: RasterFormat::Jpeg,
+                            bytes,
+                        },
+                        warning,
+                    ));
+                }
+                "CCITTFaxDecode" | "CCF" => {
+                    let pnum = |k: &str| parms.and_then(|p| p.get(k)).and_then(|o| self.doc.get(o).num());
+                    let pbool = |k: &str, default: bool| match parms.and_then(|p| p.get(k)).map(|o| self.doc.get(o)) {
+                        Some(Obj::Bool(b)) => *b,
+                        _ => default,
+                    };
+                    let width = get("Width").and_then(Obj::num);
+                    let columns = pnum("Columns").or(width).unwrap_or(1728.0);
+                    if width.is_some_and(|w| w != columns) {
+                        return Err("the fax picture's columns do not match its width".into());
+                    }
+                    let rows = pnum("Rows")
+                        .filter(|r| *r >= 1.0)
+                        .or_else(|| get("Height").and_then(Obj::num))
+                        .unwrap_or(0.0);
+                    let in_range = |v: f64| (1.0..=1e6).contains(&v);
+                    if !in_range(columns) || !in_range(rows) {
+                        return Err("the fax picture has no size or is too large".into());
+                    }
+                    (bytes, warning) = pdf_codecs::ccitt(
+                        &bytes,
+                        &pdf_codecs::FaxParms {
+                            k: pnum("K").unwrap_or(0.0) as i64,
+                            columns: columns as u32,
+                            rows: rows as u32,
+                            end_of_line: pbool("EndOfLine", false),
+                            encoded_byte_align: pbool("EncodedByteAlign", false),
+                            end_of_block: pbool("EndOfBlock", true),
+                            black_is_1: pbool("BlackIs1", false),
+                        },
+                    )?;
+                }
+                "JBIG2Decode" => {
+                    let globals = parms
+                        .and_then(|p| p.get("JBIG2Globals"))
+                        .map(|o| match self.doc.get(o) {
+                            Obj::Stream(gd, gdata) => {
+                                decode_stream(gd, gdata).ok_or("the shared part of the JBIG2 picture is damaged")
+                            }
+                            _ => Err("the shared part of the JBIG2 picture is missing"),
+                        })
+                        .transpose()?;
+                    let (w, h, samples) = pdf_codecs::jbig2(&bytes, globals.as_deref())?;
+                    let num = |k: &str| get(k).and_then(Obj::num);
+                    if num("Width") != Some(f64::from(w)) || num("Height") != Some(f64::from(h)) {
+                        return Err("the JBIG2 picture's size does not match the picture's".into());
+                    }
+                    bytes = samples;
+                }
+                "JPXDecode" if i + 1 == filters.len() => {
+                    let declared = match get("ColorSpace") {
+                        Some(Obj::Name(n)) if n == "DeviceCMYK" || n == "CMYK" => Some(4),
+                        Some(Obj::Name(n)) if n == "DeviceRGB" || n == "RGB" => Some(3),
+                        Some(Obj::Name(n)) if n == "DeviceGray" || n == "G" => Some(1),
+                        _ => None,
+                    };
+                    let jpx = pdf_codecs::jpx(&bytes, declared)?;
+                    return samples_to_png(jpx.width, jpx.height, jpx.channels, 8, false, &jpx.samples)
+                        .map(|r| (r, warning))
+                        .ok_or_else(|| "the JPEG 2000 picture could not be converted".to_owned());
                 }
                 other => return Err(format!("pictures compressed as {other} are not supported yet")),
             }
@@ -980,6 +1091,7 @@ impl Interp<'_> {
             _ => false,
         };
         samples_to_png(width, height, channels, bits, decode_inverted, &bytes)
+            .map(|r| (r, warning))
             .ok_or_else(|| "the picture data is too short or too large".to_owned())
     }
 
@@ -1737,6 +1849,59 @@ mod tests {
         assert_eq!(lzw_decode(&clears, true), Ok(vec![]));
     }
 
+    /// Run-length compress `data` as PDF's `RunLengthDecode` reads it: runs of three or more
+    /// equal bytes repeated, the rest copied, with the end mark.
+    fn run_length_encode(data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < data.len() {
+            let run = data[i..].iter().take(128).take_while(|b| **b == data[i]).count();
+            if run >= 3 {
+                out.extend([(257 - run) as u8, data[i]]);
+                i += run;
+            } else {
+                let start = i;
+                while i < data.len()
+                    && i - start < 128
+                    && data[i..].iter().take(3).filter(|b| **b == data[i]).count() < 3
+                {
+                    i += 1;
+                }
+                out.push((i - start - 1) as u8);
+                out.extend_from_slice(&data[start..i]);
+            }
+        }
+        out.push(128);
+        out
+    }
+
+    #[test]
+    fn run_length_data_is_read() {
+        // A copy of three bytes, a run of four, the end mark; what follows it is not read.
+        assert_eq!(
+            run_length_decode(&[2, b'a', b'b', b'c', 253, b'x', 128, 9, 9]).as_deref(),
+            Ok(&b"abcxxxx"[..])
+        );
+        // The longest copy and the longest run.
+        let mut long: Vec<u8> = (0..128u8).collect();
+        long.extend([7u8; 128]);
+        long.extend((0..1000u32).map(|i| (i * 31 % 7) as u8));
+        assert_eq!(run_length_decode(&run_length_encode(&long)), Ok(long));
+        assert_eq!(run_length_decode(&[128]), Ok(vec![]));
+        // Damaged data gives a reason: a copy or a run past the end, or no end mark.
+        for (damaged, why) in [
+            (&[5u8, b'a', b'b'][..], "goes past the end"),
+            (&[250], "goes past the end"),
+            (&[1, b'a', b'b'], "no end mark"),
+            (&[], "no end mark"),
+        ] {
+            assert!(
+                run_length_decode(damaged).is_err_and(|e| e.contains("RunLength data is damaged") && e.contains(why)),
+                "{damaged:?}"
+            );
+        }
+    }
+
     #[test]
     fn lzw_cmyk_and_16_bit_pictures_are_read() -> Result<()> {
         let full = "q 595 0 0 842 0 0 cm /Im Do Q";
@@ -1769,6 +1934,29 @@ mod tests {
                 &lzw_encode(&predicted, true)
             )?,
             want
+        );
+
+        // RunLength alone, and before Flate (the run-length stage gives the Flate data).
+        assert_eq!(
+            scan(&format!("{gray} /Filter /RunLengthDecode"), &run_length_encode(&grey))?,
+            want
+        );
+        let rl_of_flate = run_length_encode(&miniz_oxide::deflate::compress_to_vec_zlib(&grey, 6));
+        assert_eq!(scan(&format!("{gray} /Filter [/RL /FlateDecode]"), &rl_of_flate)?, want);
+        // Damaged run data is reported with its reason.
+        let p = pages(&picture_pdf(
+            0,
+            &format!("{gray} /Filter /RunLengthDecode"),
+            &[5, 10, 20],
+            full,
+        ))?;
+        assert!(p[0].scan.is_none());
+        assert!(
+            p[0].scan_problem
+                .as_deref()
+                .is_some_and(|m| m.contains("RunLength data is damaged")),
+            "{:?}",
+            p[0].scan_problem
         );
 
         // Two filters, the predictor in the second one's parameters (a null placeholder first).
@@ -1868,6 +2056,198 @@ mod tests {
         Some((img.width(), img.height(), img.into_raw()))
     }
 
+    /// Group 4 (T.6) data for two 8-pixel rows, each black from pixel 2 to 4: the first row in
+    /// horizontal mode (white 2, black 3) and V0 to its end, the second in three V0 codes.
+    const G4_ROWS: [u8; 2] = [0b0010_1111, 0b0111_1000];
+    /// What those rows look like once decoded, as grey levels.
+    const G4_LUMA: [u8; 16] = [255, 255, 0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 255, 255];
+
+    /// A JBIG2 page in the embedded organization: page information (8 x 2) and one immediate
+    /// lossless generic region coded with MMR, holding [`G4_ROWS`].
+    fn jbig2_page() -> Vec<u8> {
+        let mut b = Vec::new();
+        // Segment 0, page information (type 48), page 1, 19 bytes.
+        b.extend_from_slice(&[0, 0, 0, 0, 48, 0, 1, 0, 0, 0, 19]);
+        b.extend_from_slice(&[0, 0, 0, 8, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        // Segment 1, immediate lossless generic region (type 38), page 1, 20 bytes.
+        b.extend_from_slice(&[0, 0, 0, 1, 38, 0, 1, 0, 0, 0, 20]);
+        b.extend_from_slice(&[0, 0, 0, 8, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        b.push(1); // MMR
+        b.extend_from_slice(&G4_ROWS);
+        b
+    }
+
+    /// A 3 x 2 grey JPEG 2000 codestream, lossless: 10 20 30 / 40 50 60 (written by OpenJPEG).
+    const JPX_GREY: [u8; 136] = [
+        0xFF, 0x4F, 0xFF, 0x51, 0x00, 0x29, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x07, 0x01, 0x01, 0xFF, 0x52, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x01, 0x00,
+        0x01, 0x04, 0x04, 0x00, 0x01, 0xFF, 0x5C, 0x00, 0x07, 0x40, 0x40, 0x48, 0x48, 0x50, 0xFF, 0x64, 0x00, 0x25,
+        0x00, 0x01, 0x43, 0x72, 0x65, 0x61, 0x74, 0x65, 0x64, 0x20, 0x62, 0x79, 0x20, 0x4F, 0x70, 0x65, 0x6E, 0x4A,
+        0x50, 0x45, 0x47, 0x20, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6F, 0x6E, 0x20, 0x32, 0x2E, 0x35, 0x2E, 0x34, 0xFF,
+        0x90, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1B, 0x00, 0x01, 0xFF, 0x93, 0xCF, 0xB4, 0x0C, 0x08, 0x2B,
+        0x1F, 0xA0, 0xF9, 0xC1, 0x80, 0x01, 0x9F, 0x7F, 0xFF, 0xD9,
+    ];
+
+    /// A 2 x 1 CMYK JPEG 2000 codestream, lossless: no ink, then full black (K 255).
+    const JPX_CMYK: [u8; 150] = [
+        0xFF, 0x4F, 0xFF, 0x51, 0x00, 0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x07, 0x01, 0x01, 0x07, 0x01, 0x01, 0x07, 0x01, 0x01, 0x07, 0x01, 0x01,
+        0xFF, 0x52, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x04, 0x04, 0x00, 0x01, 0xFF, 0x5C, 0x00, 0x04,
+        0x40, 0x40, 0xFF, 0x64, 0x00, 0x25, 0x00, 0x01, 0x43, 0x72, 0x65, 0x61, 0x74, 0x65, 0x64, 0x20, 0x62, 0x79,
+        0x20, 0x4F, 0x70, 0x65, 0x6E, 0x4A, 0x50, 0x45, 0x47, 0x20, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6F, 0x6E, 0x20,
+        0x32, 0x2E, 0x35, 0x2E, 0x34, 0xFF, 0x90, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x23, 0x00, 0x01, 0xFF,
+        0x93, 0xDF, 0x80, 0x10, 0x09, 0x3F, 0xDF, 0x80, 0x10, 0x09, 0x3F, 0xDF, 0x80, 0x10, 0x09, 0x3F, 0xDF, 0x80,
+        0x18, 0x05, 0xA2, 0xDD, 0xFF, 0xD9,
+    ];
+
+    /// `codestream` in a JP2 file: signature, file type, a header (image header, grey colour,
+    /// then `extra` boxes) and the codestream box, its length raised by `overrun`.
+    fn jp2(codestream: &[u8], extra: &[u8], overrun: u32) -> Vec<u8> {
+        let boxed = |kind: &[u8], body: &[u8]| {
+            let mut b = (8 + body.len() as u32).to_be_bytes().to_vec();
+            b.extend_from_slice(kind);
+            b.extend_from_slice(body);
+            b
+        };
+        let mut header = boxed(b"ihdr", &[0, 0, 0, 2, 0, 0, 0, 3, 0, 1, 7, 7, 0, 0]);
+        header.extend(boxed(b"colr", &[1, 0, 0, 0, 0, 0, 17]));
+        header.extend_from_slice(extra);
+        let mut out = vec![0, 0, 0, 12, b'j', b'P', b' ', b' ', 0x0D, 0x0A, 0x87, 0x0A];
+        out.extend(boxed(b"ftyp", b"jp2 \0\0\0\0jp2 "));
+        out.extend(boxed(b"jp2h", &header));
+        out.extend_from_slice(&(8 + codestream.len() as u32 + overrun).to_be_bytes());
+        out.extend_from_slice(b"jp2c");
+        out.extend_from_slice(codestream);
+        out
+    }
+
+    #[test]
+    fn jp2_files_with_ambiguous_boxes_are_refused_before_decoding() {
+        use crate::pdf_codecs::jpx;
+        // A plain JP2 file decodes.
+        let plain = jpx(&jp2(&JPX_GREY, &[], 0), Some(1)).map(|p| (p.width, p.height, p.channels, p.samples));
+        assert_eq!(plain, Ok((3, 2, 1, vec![10, 20, 30, 40, 50, 60])));
+        // A codestream box longer than the file (the decoder would read what is there).
+        let over = jpx(&jp2(&JPX_GREY, &[], 100), Some(1));
+        assert!(
+            over.as_ref().is_err_and(|e| e.contains("cut short")),
+            "{:?}",
+            over.err()
+        );
+        // A valid nine-column palette, then an invalid one the decoder skips: the nine count.
+        let mut pclr = vec![0, 0, 0, 38];
+        pclr.extend_from_slice(b"pclr");
+        pclr.extend_from_slice(&[0, 2, 9]);
+        pclr.extend_from_slice(&[7; 9]);
+        pclr.extend_from_slice(&[0; 18]);
+        pclr.extend_from_slice(&[0, 0, 0, 10]);
+        pclr.extend_from_slice(b"pclr");
+        pclr.extend_from_slice(&[0, 0]);
+        let wide = jpx(&jp2(&JPX_GREY, &pclr, 0), Some(1));
+        assert!(
+            wide.as_ref().is_err_and(|e| e.contains("too many channels")),
+            "{:?}",
+            wide.err()
+        );
+    }
+
+    #[test]
+    fn scanner_pictures_in_fax_jbig2_and_jpeg_2000_are_read() -> Result<()> {
+        let full = "q 595 0 0 842 0 0 cm /Im Do Q";
+        type Seen = (Option<(u32, u32, Vec<u8>)>, Option<String>);
+        let scan = |dict: &str, data: &[u8]| -> Result<Seen> {
+            let p = pages(&picture_pdf(0, dict, data, full))?;
+            Ok((p[0].scan.as_ref().and_then(luma), p[0].scan_problem.clone()))
+        };
+        let bilevel = "/Width 8 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 1";
+
+        // Group 4 fax, as office scanners write it: 0 samples are black.
+        let g4 = format!("{bilevel} /Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 8 /Rows 2 >>");
+        assert_eq!(scan(&g4, &G4_ROWS)?.0, Some((8, 2, G4_LUMA.to_vec())));
+        // Without Rows the picture's height is used.
+        let g4 = format!("{bilevel} /Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 8 >>");
+        assert_eq!(scan(&g4, &G4_ROWS)?.0, Some((8, 2, G4_LUMA.to_vec())));
+        // BlackIs1 turns the samples round.
+        let g4 = format!("{bilevel} /Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 8 /BlackIs1 true >>");
+        let inverted: Vec<u8> = G4_LUMA.iter().map(|v| 255 - v).collect();
+        assert_eq!(scan(&g4, &G4_ROWS)?.0, Some((8, 2, inverted)));
+        // Columns that disagree with the width are refused with the reason.
+        let g4 = format!("{bilevel} /Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 16 >>");
+        let (picture, problem) = scan(&g4, &G4_ROWS)?;
+        assert!(picture.is_none());
+        assert!(problem.is_some_and(|m| m.contains("columns")));
+        // A picture damaged part way keeps its rows before the damage, and says so.
+        let three = "/Width 8 /Height 3 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 8 >>";
+        let p = pages(&picture_pdf(0, three, &G4_ROWS, full))?;
+        let mut rows = G4_LUMA.to_vec();
+        rows.extend([255; 8]);
+        assert_eq!(p[0].scan.as_ref().and_then(luma), Some((8, 3, rows)));
+        let warning = p[0].scan_warning.clone().unwrap_or_default();
+        assert!(warning.contains("row 2 of 3"), "{warning}");
+        // A whole picture comes with no warning.
+        let g4 = format!("{bilevel} /Filter /CCITTFaxDecode /DecodeParms << /K -1 /Columns 8 >>");
+        assert!(pages(&picture_pdf(0, &g4, &G4_ROWS, full))?[0].scan_warning.is_none());
+        // Data that is not fax at all is refused, never a panic.
+        let g4 = format!("{bilevel} /Filter /CCITTFaxDecode /DecodeParms << /K -1 >>");
+        let (picture, problem) = scan(&g4, &[0, 0, 0, 0])?;
+        assert!(picture.is_none() && problem.is_some(), "{problem:?}");
+
+        // JBIG2, embedded: black pixels come out as 0 samples, like the fax.
+        let jbig2 = format!("{bilevel} /Filter /JBIG2Decode");
+        assert_eq!(scan(&jbig2, &jbig2_page())?.0, Some((8, 2, G4_LUMA.to_vec())));
+        // A size that disagrees with the page is refused.
+        let wrong = "/Width 9 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /JBIG2Decode";
+        let (picture, problem) = scan(wrong, &jbig2_page())?;
+        assert!(picture.is_none());
+        assert!(problem.is_some_and(|m| m.contains("JBIG2")));
+        // Shared segments that are not a stream: refused with the reason.
+        let jbig2 = format!("{bilevel} /Filter /JBIG2Decode /DecodeParms << /JBIG2Globals 3 0 R >>");
+        let (picture, problem) = scan(&jbig2, &jbig2_page())?;
+        assert!(picture.is_none());
+        assert!(problem.is_some_and(|m| m.contains("shared part")));
+        // A region far larger than its page is refused once it goes over the decoder's memory
+        // limit.
+        let mut huge = jbig2_page();
+        huge[41..49].copy_from_slice(&[0, 0, 0xFF, 0xFF, 0, 0, 0xFF, 0xFF]);
+        let (picture, problem) = scan(&format!("{bilevel} /Filter /JBIG2Decode"), &huge)?;
+        assert!(picture.is_none());
+        assert!(problem.is_some_and(|m| m.contains("too much memory")));
+        // Damaged data.
+        let jbig2 = format!("{bilevel} /Filter /JBIG2Decode");
+        let (picture, problem) = scan(&jbig2, &jbig2_page()[..15])?;
+        assert!(picture.is_none());
+        assert!(problem.is_some_and(|m| m.contains("JBIG2")));
+
+        // JPEG 2000: the codestream says its own size and channels.
+        let jpx = "/Width 3 /Height 2 /Filter /JPXDecode";
+        assert_eq!(scan(jpx, &JPX_GREY)?.0, Some((3, 2, vec![10, 20, 30, 40, 50, 60])));
+        // A bare CMYK codestream names no colour space; the PDF's /DeviceCMYK keeps its fourth
+        // channel as K (no ink stays white, full K is black) rather than alpha.
+        let cmyk = "/Width 2 /Height 1 /ColorSpace /DeviceCMYK /Filter /JPXDecode";
+        assert_eq!(scan(cmyk, &JPX_CMYK)?.0, Some((2, 1, vec![255, 0])));
+        // More components than a picture can use are refused before any is decoded: the decoder
+        // gives each a buffer of the whole picture.
+        let mut six = JPX_GREY[..41].to_vec();
+        six[5] = 38 + 3 * 6; // Lsiz
+        six.push(6); // Csiz
+        for _ in 0..6 {
+            six.extend_from_slice(&[0x07, 0x01, 0x01]);
+        }
+        six.extend_from_slice(&JPX_GREY[45..]);
+        let (picture, problem) = scan(jpx, &six)?;
+        assert!(picture.is_none());
+        assert!(
+            problem.as_deref().is_some_and(|m| m.contains("too many channels")),
+            "{problem:?}"
+        );
+        let (picture, problem) = scan(jpx, &JPX_GREY[..40])?;
+        assert!(picture.is_none());
+        assert!(problem.is_some_and(|m| m.contains("JPEG 2000")));
+        Ok(())
+    }
+
     #[test]
     fn scanned_sheets_become_upright_pictures() -> Result<()> {
         // 3 x 2 grey picture: 10 20 30 / 40 50 60, filling the whole page; a small logo too.
@@ -1896,21 +2276,17 @@ mod tests {
         let p = pages(&picture_pdf(0, grey, &samples, "q 50 0 0 50 10 10 cm /Logo Do Q"))?;
         assert!(p[0].scan.is_none());
 
-        // A JPEG is kept byte for byte; a fax-compressed one is reported, not guessed at.
+        // A JPEG is kept byte for byte.
         let jpeg = [0xFFu8, 0xD8, 0xFF, 0xD9];
         let p = pages(&picture_pdf(0, "/Width 3 /Height 2 /Filter /DCTDecode", &jpeg, full))?;
         assert_eq!(p[0].scan.as_ref().map(|s| s.raster.bytes.clone()), Some(jpeg.to_vec()));
-        let p = pages(&picture_pdf(
-            0,
-            "/Width 3 /Height 2 /Filter /CCITTFaxDecode",
-            &jpeg,
-            full,
-        ))?;
+        // A filter the reader does not know is reported, not guessed at.
+        let p = pages(&picture_pdf(0, "/Width 3 /Height 2 /Filter /AHx", &jpeg, full))?;
         assert!(p[0].scan.is_none());
         assert!(
             p[0].scan_problem
                 .as_deref()
-                .is_some_and(|m| m.contains("CCITTFaxDecode"))
+                .is_some_and(|m| m.contains("compressed as AHx"))
         );
 
         // Short sample data never panics.

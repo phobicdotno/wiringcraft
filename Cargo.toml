@@ -31,6 +31,10 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 arboard = { version = "3", default-features = false, features = ["image-data"] }
 base64 = "0.22"
 rusqlite = { version = "0.37", features = ["bundled", "serialize"] }
+hayro-ccitt = { version = "0.5", default-features = false }
+# Pinned to an unreleased commit: 0.4.0 has no memory limit, which symbol dictionaries need (#423).
+hayro-jbig2 = { git = "https://github.com/LaurenzV/hayro", rev = "e7ada1354dff4041cdeed3d8ba56fe01b6186132", default-features = false }
+hayro-jpeg2000 = { version = "0.5", default-features = false }
 
 [workspace.lints.clippy]
 unwrap_used = "deny"
