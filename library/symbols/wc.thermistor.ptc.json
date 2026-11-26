@@ -1,0 +1,122 @@
+{
+  "category": "sensors",
+  "description": "PTC thermistor, such as the temperature sensor in a motor winding; wire T1 and T2 to a thermistor protection relay.",
+  "graphics": [
+    {
+      "a": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 4.0
+      },
+      "kind": "line"
+    },
+    {
+      "kind": "rect",
+      "max": {
+        "x": 1.8,
+        "y": 11.0
+      },
+      "min": {
+        "x": -1.8,
+        "y": 4.0
+      }
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 11.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": -3.0,
+        "y": 11.5
+      },
+      "b": {
+        "x": 3.0,
+        "y": 3.5
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": -4.5,
+        "y": 11.5
+      },
+      "b": {
+        "x": -3.0,
+        "y": 11.5
+      },
+      "kind": "line"
+    },
+    {
+      "at": {
+        "x": -7.2,
+        "y": 14.4
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "+t"
+    },
+    {
+      "center": {
+        "x": -4.95,
+        "y": 12.85
+      },
+      "kind": "circle",
+      "radius": 0.35
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "T1"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 14.4
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "T2"
+    }
+  ],
+  "id": "wc.thermistor.ptc",
+  "letter_code": "B",
+  "name": "PTC thermistor",
+  "pins": [
+    {
+      "at": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "T1"
+    },
+    {
+      "at": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "dir": "down",
+      "name": "T2"
+    }
+  ],
+  "role": "standalone",
+  "tag_at": {
+    "x": -10.0,
+    "y": 8.0
+  }
+}
