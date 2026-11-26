@@ -54,7 +54,8 @@ enum Cmd {
         /// Position in mm, `x,y`.
         #[arg(long, value_parser = parse_point)]
         at: Point,
-        #[arg(long)]
+        /// Device tag, e.g. `-K1` (taken as a value, though it starts with `-`).
+        #[arg(long, allow_hyphen_values = true)]
         tag: Option<String>,
         /// 0, 90, 180 or 270.
         #[arg(long, default_value_t = 0)]
@@ -1030,7 +1031,22 @@ fn cover_moved(ids: Vec<String>) {
 }
 
 fn load(dir: &Path) -> Res<Project> {
+    // The entry itself, not where a link leads: a broken link is reported as the load fails.
+    if let Err(err) = std::fs::symlink_metadata(dir.join(store::PROJECT_FILE))
+        && err.kind() == std::io::ErrorKind::NotFound
+    {
+        return Err(no_project(dir));
+    }
     store::load(dir).map_err(e)
+}
+
+/// What a command says when its folder holds no project: where it looked, and how to get one.
+fn no_project(dir: &Path) -> String {
+    format!(
+        "no WiringCraft project in {} (no {}): use -C <folder> or create one with wiringcraft new <folder>",
+        escape_field(&dir.display().to_string()),
+        store::PROJECT_FILE
+    )
 }
 
 /// The project with its texts in `lang` (one language code, or two joined by `,`) from the
@@ -1420,12 +1436,13 @@ fn run(cli: Cli) -> Res<()> {
             mirror,
         } => {
             let mut p = load(dir)?;
+            // Check the inputs before taking the symbol, so a bad tag or turn leaves no copy behind.
+            let tag = tag.map(|t| DeviceTag::parse(&t)).transpose().map_err(e)?;
+            let rotation = Rotation::from_degrees(rotate).ok_or("rotation must be 0, 90, 180 or 270")?;
             if store::read_vendored_symbol(dir, &symbol).is_err() {
                 let lib = wc_library::Library::open(dir, &p).map_err(e)?;
                 wc_library::take(dir, &mut p, &lib, ItemKind::Symbol, &symbol).map_err(e)?;
             }
-            let tag = tag.map(|t| DeviceTag::parse(&t)).transpose().map_err(e)?;
-            let rotation = Rotation::from_degrees(rotate).ok_or("rotation must be 0, 90, 180 or 270")?;
             if let Some(t) = &tag {
                 p.devices.entry(t.clone()).or_default();
             }
@@ -7911,6 +7928,61 @@ mod tests {
         )
         .unwrap();
         assert_eq!(std::fs::read_dir(lib2.join("parts")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn place_takes_a_tag_that_starts_with_a_dash_as_box_does() {
+        let Ok(tmp) = tempfile::tempdir() else { unreachable!() };
+        let dir = tmp.path().join("proj");
+        let Some(path) = dir.to_str() else { unreachable!() };
+        let Ok(cmd) = Cli::try_parse_from(["wiringcraft", "new", path, "--no-git"]) else {
+            unreachable!()
+        };
+        assert!(run(cmd).is_ok());
+        let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+        let Some(starter) = starter.to_str() else {
+            unreachable!()
+        };
+        assert!(cli(&dir, &["lib", "add", "starter", "folder", starter]).is_ok());
+        assert!(cli(&dir, &["page", "add", "p1", "--number", "1"]).is_ok());
+
+        let placed = cli(&dir, &["place", "p1", "wc.coil", "--at", "50,50", "--tag", "-K1"]);
+        assert!(placed.is_ok(), "{placed:?}");
+        let Ok(p) = load(&dir) else { unreachable!() };
+        let Some(pg) = p.pages.iter().find(|pg| pg.id == "p1") else {
+            unreachable!()
+        };
+        let Some(s) = pg.symbols.first() else { unreachable!() };
+        assert_eq!(s.tag.as_ref().map(ToString::to_string).as_deref(), Some("-K1"));
+    }
+
+    #[test]
+    fn place_checks_the_turn_and_tag_before_taking_the_symbol() {
+        let Ok(tmp) = tempfile::tempdir() else { unreachable!() };
+        let dir = tmp.path().join("proj");
+        let Some(path) = dir.to_str() else { unreachable!() };
+        let Ok(cmd) = Cli::try_parse_from(["wiringcraft", "new", path, "--no-git"]) else {
+            unreachable!()
+        };
+        assert!(run(cmd).is_ok());
+        let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+        let Some(starter) = starter.to_str() else {
+            unreachable!()
+        };
+        assert!(cli(&dir, &["lib", "add", "starter", "folder", starter]).is_ok());
+        assert!(cli(&dir, &["page", "add", "p1", "--number", "1"]).is_ok());
+
+        for bad in [["--rotate", "45"], ["--tag", "-K1."]] {
+            let mut args = vec!["place", "p1", "wc.coil", "--at", "50,50"];
+            args.extend(bad);
+            assert!(cli(&dir, &args).is_err(), "{bad:?}");
+            assert!(
+                store::read_vendored_symbol(&dir, "wc.coil").is_err(),
+                "no copy left by {bad:?}"
+            );
+            let Ok(p) = load(&dir) else { unreachable!() };
+            assert!(!p.lock.symbols.contains_key("wc.coil"), "no lock entry from {bad:?}");
+        }
     }
 
     #[test]
