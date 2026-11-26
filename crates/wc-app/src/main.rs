@@ -1486,6 +1486,15 @@ impl App {
     /// Carry out an action. A picker it asks for waits until the frame's actions have run; while
     /// one waits, another is not taken (the first stays and the action says so).
     fn run(&mut self, a: Action) {
+        // Save as would apply the black box form before its picker is refused: refused here
+        // first, so a refused Save as changes nothing (#1019).
+        if a == Action::SaveAs && self.pending.is_some() {
+            self.ed.message = format!(
+                "{} was not done: another file dialog is waiting to open; try again after it.",
+                a.info().label
+            );
+            return;
+        }
         let earlier = self.pending.take();
         self.carry_out(a);
         // The turn for the symbol on the pointer belongs to the place tool: an action that
@@ -8382,6 +8391,45 @@ mod nudge_tests {
         app.dialog = Some(Dialog::Message("Note".into()));
         let sent = app_frame(&mut app, &ctx, Vec::new(), true);
         assert!(!sent.contains(&CancelClose));
+    }
+
+    /// Save as while another file dialog waits to open is refused before it applies the black
+    /// box form: a refused Save as changes nothing (#1019).
+    #[test]
+    fn save_as_refused_for_a_waiting_picker_leaves_the_black_box_form() {
+        use wc_core::{BoxPin, BoxSide};
+        let (_tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        let page = app.ed.page;
+        let pins = [BoxPin {
+            name: "1".into(),
+            side: BoxSide::Left,
+            offset: 5.0,
+        }];
+        let id = app
+            .open
+            .as_mut()
+            .unwrap()
+            .add_black_box(page, Point::new(120.0, 40.0), Point::new(140.0, 60.0), &pins, None)
+            .unwrap();
+        app.ed.select_only(Selection::Symbol(id));
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        panels::black_box_form_mut(&mut app.panels).unwrap().rows[0].name = "A".into();
+        app.pending = Some(Pending::Open);
+        let steps = app.open.as_ref().unwrap().undo_steps();
+        app.run(Action::SaveAs);
+        assert!(matches!(app.pending, Some(Pending::Open)), "the waiting picker stays");
+        assert!(app.ed.message.contains("was not done"), "{}", app.ed.message);
+        assert_eq!(
+            app.open.as_ref().unwrap().undo_steps(),
+            steps,
+            "the project is not changed"
+        );
+        assert!(
+            panels::black_box_form_mut(&mut app.panels).is_some_and(|f| f.changed()),
+            "the form keeps the change"
+        );
     }
 
     /// A close asked for while a field has the keyboard waits a frame for the typed value; a
