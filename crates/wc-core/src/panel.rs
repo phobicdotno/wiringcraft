@@ -254,6 +254,47 @@ impl Panel {
             })
             .collect()
     }
+
+    /// Change the plate's size to `width` x `height` millimetres, leaving rails, ducts and
+    /// devices where they are. Nothing changes and an error says why when the size is not a
+    /// positive finite number or something on the plate would stick out of the new size; the
+    /// error names each such thing.
+    pub fn resize(&mut self, width: f64, height: f64) -> Result<(), String> {
+        if !(width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0) {
+            return Err(format!("plate size must be positive, got {width} x {height} mm"));
+        }
+        // A small tolerance, so something flush with the new edge still counts as on the plate.
+        let eps = 1e-9;
+        let outside =
+            |min: Point, max: Point| min.x < -eps || min.y < -eps || max.x > width + eps || max.y > height + eps;
+        let sticking_out: Vec<String> = self
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                PanelItem::Rail { at, length } => {
+                    // A 35 mm rail on its centre line.
+                    let (min, max) = (Point::new(at.x, at.y - 17.5), Point::new(at.x + length, at.y + 17.5));
+                    outside(min, max).then(|| format!("rail at {},{}", at.x, at.y))
+                }
+                PanelItem::Duct { min, max } => {
+                    outside(*min, *max).then(|| format!("duct {},{} to {},{}", min.x, min.y, max.x, max.y))
+                }
+                PanelItem::Device { tag, .. } => {
+                    let (min, max) = item.device_bounds()?;
+                    outside(min, max).then(|| tag.to_string())
+                }
+            })
+            .collect();
+        if !sticking_out.is_empty() {
+            return Err(format!(
+                "a {width} x {height} mm plate would leave these sticking out: {}",
+                sticking_out.join(", ")
+            ));
+        }
+        self.width = width;
+        self.height = height;
+        Ok(())
+    }
 }
 
 /// A part's footprint (width, height) in millimetres, if it has one. Each dimension comes from
@@ -340,7 +381,9 @@ pub struct Arranged {
 }
 
 /// Put the project's devices that have a part and are not on the plate yet onto its rails, in
-/// tag order, left to right and then rail by rail. Door-mounted parts ([`on_door`]) are left out. `location` (such as `CAB1`, with or without
+/// tag order, left to right and then rail by rail, each centred on its rail. A device that would
+/// stick out over the plate's top or bottom edge on a rail goes on a later rail where it does not,
+/// or is listed as not fitting. Door-mounted parts ([`on_door`]) are left out. `location` (such as `CAB1`, with or without
 /// the `+`) keeps only devices in that location. Devices already placed stay where they are.
 pub fn arrange(
     panel: &mut Panel,
@@ -402,24 +445,49 @@ pub fn arrange(
         .collect();
     rails.sort_by(|a, b| a.0.y.total_cmp(&b.0.y).then(a.0.x.total_cmp(&b.0.x)));
     let mut out = Arranged::default();
+    let plate_height = panel.height;
     let mut rail = 0;
     for (tag, (w, h), estimated) in todo {
         let name = tag.to_string();
         let mut placed = false;
-        while let Some((at, length, cursor)) = rails.get_mut(rail) {
-            if *cursor + w <= at.x + *length + 1e-9 {
+        // From the first rail with room left; a rail too near the plate's edge for this device's
+        // height is passed over for it alone, keeping its room for the devices after it.
+        let mut r = rail;
+        while let Some((at, length, cursor)) = rails.get_mut(r) {
+            let top = at.y - h / 2.0;
+            let on_plate = top >= -1e-9 && top + h <= plate_height + 1e-9;
+            // Past any device already on the plate that this outline would cover, such as a
+            // tall one from a lower rail reaching up over this one.
+            let mut x = *cursor;
+            while let Some(past) = panel
+                .items
+                .iter()
+                .filter_map(PanelItem::device_bounds)
+                .filter(|(min, max)| min.x < x + w && max.x > x && min.y < top + h && max.y > top)
+                .map(|(_, max)| max.x + GAP)
+                .reduce(f64::max)
+            {
+                x = past;
+            }
+            let along = x + w <= at.x + *length + 1e-9;
+            if along && on_plate {
                 panel.items.push(PanelItem::Device {
                     tag: tag.clone(),
-                    at: Point::new(*cursor, at.y - h / 2.0),
+                    at: Point::new(x, top),
                     width: w,
                     height: h,
                     rotation: Rotation::R0,
                 });
-                *cursor += w + GAP;
+                *cursor = x + w + GAP;
                 placed = true;
                 break;
             }
-            rail += 1;
+            // Only a device that could stand on this rail but finds it full uses it up; one
+            // too tall for it leaves it to the devices after it.
+            if !along && on_plate && r == rail {
+                rail += 1;
+            }
+            r += 1;
         }
         if placed {
             if estimated {
@@ -792,6 +860,163 @@ mod tests {
         let (min, max, a, b) = frame_and_edge(Rotation::R270);
         assert!(close(min, 10.0, 30.0) && close(max, 110.0, 50.0));
         assert!(close(a, 10.0, 50.0) && close(b, 10.0, 30.0), "{a:?} {b:?}");
+    }
+
+    #[test]
+    fn resizing_a_plate_keeps_its_layout_and_refuses_a_size_that_leaves_things_out() {
+        let mut p = Panel::with_rails("p", "P", 600.0, 800.0);
+        let Some(t) = tag("-K1") else { unreachable!() };
+        let Ok(()) = p.place_device(t, Point::new(100.0, 400.0), (45.0, 85.0), Rotation::R0) else {
+            unreachable!()
+        };
+        let items = p.items.clone();
+        // Taller: rails, ducts and the device stay as they are.
+        let Ok(()) = p.resize(600.0, 1000.0) else {
+            unreachable!()
+        };
+        assert_eq!((p.width, p.height), (600.0, 1000.0));
+        assert_eq!(p.items, items);
+        // Narrower than the ducts and rails reach, and shorter than the device sits: refused,
+        // naming them, and nothing changes.
+        let before = p.clone();
+        let Err(err) = p.resize(300.0, 450.0) else {
+            unreachable!()
+        };
+        assert!(
+            err.contains("-K1") && err.contains("rail at ") && err.contains("duct "),
+            "{err}"
+        );
+        assert_eq!(p, before);
+        // Only the device sticks out.
+        let mut lone = Panel::new("l", "L", 600.0, 800.0);
+        lone.items = vec![items[items.len() - 1].clone()];
+        let Err(err) = lone.resize(140.0, 800.0) else {
+            unreachable!()
+        };
+        assert_eq!(err, "a 140 x 800 mm plate would leave these sticking out: -K1");
+        // Flush with the new edge is fine.
+        let Ok(()) = lone.resize(145.0, 485.0) else {
+            unreachable!()
+        };
+        for (w, h) in [(0.0, 100.0), (100.0, -1.0), (f64::NAN, 100.0), (100.0, f64::INFINITY)] {
+            assert!(lone.resize(w, h).is_err(), "{w} x {h}");
+        }
+        assert_eq!((lone.width, lone.height), (145.0, 485.0));
+    }
+
+    #[test]
+    fn a_device_taller_than_its_row_goes_on_a_rail_where_it_stays_on_the_plate() {
+        let mut project = Project::new("x");
+        let mut parts = BTreeMap::new();
+        for (id, h) in [("tall", 250.0), ("huge", 900.0), ("small", 80.0)] {
+            let mut part = Part {
+                id: id.into(),
+                ..Default::default()
+            };
+            part.properties.insert("Width".into(), "45".into());
+            part.properties.insert("Height".into(), format!("{h}"));
+            parts.insert(id.to_string(), part);
+        }
+        for (t, part) in [("-A1", "tall"), ("-A2", "huge"), ("-K1", "small")] {
+            if let Some(t) = tag(t) {
+                project.devices.insert(
+                    t,
+                    Device {
+                        part: Some(part.into()),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        // Four rows of 150 mm; the first rail is at y 115, the second at y 305.
+        let mut panel = Panel::with_rails("main", "Main", 600.0, 800.0);
+        let done = arrange(&mut panel, &project, &parts, None);
+        assert_eq!(done.placed, vec!["-A1", "-K1"]);
+        assert_eq!(done.did_not_fit, vec!["-A2"], "taller than the plate");
+        for item in &panel.items {
+            if let Some((min, max)) = item.device_bounds() {
+                assert!(min.y >= 0.0 && max.y <= panel.height, "{item:?} is off the plate");
+            }
+        }
+        let at = |t: &str| {
+            panel.items.iter().find_map(|i| match i {
+                PanelItem::Device { tag, at, .. } if tag.to_string() == t => Some(*at),
+                _ => None,
+            })
+        };
+        // The tall device goes down to the second rail; the small one after it still uses the
+        // first rail's room.
+        assert_eq!(at("-A1"), Some(Point::new(45.0, 305.0 - 125.0)));
+        assert_eq!(at("-K1"), Some(Point::new(45.0, 115.0 - 40.0)));
+    }
+
+    #[test]
+    fn a_device_is_not_put_over_a_tall_one_from_a_lower_rail() {
+        let mut project = Project::new("x");
+        let mut parts = BTreeMap::new();
+        for (id, h) in [("tall", 500.0), ("small", 80.0)] {
+            let mut part = Part {
+                id: id.into(),
+                ..Default::default()
+            };
+            part.properties.insert("Width".into(), "45".into());
+            part.properties.insert("Height".into(), format!("{h}"));
+            parts.insert(id.to_string(), part);
+        }
+        for (t, part) in [("-A1", "tall"), ("-K1", "small")] {
+            if let Some(t) = tag(t) {
+                project.devices.insert(
+                    t,
+                    Device {
+                        part: Some(part.into()),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        // -A1 goes on the second rail (y 305) and reaches up over the first (y 115).
+        let mut panel = Panel::with_rails("main", "Main", 600.0, 800.0);
+        let done = arrange(&mut panel, &project, &parts, None);
+        assert_eq!(done.placed, vec!["-A1", "-K1"]);
+        let outlines: Vec<(Point, Point)> = panel.items.iter().filter_map(PanelItem::device_bounds).collect();
+        assert_eq!(outlines[0], (Point::new(45.0, 55.0), Point::new(90.0, 555.0)));
+        // -K1 stays on the first rail, beside -A1 rather than inside it.
+        assert_eq!(outlines[1], (Point::new(91.0, 75.0), Point::new(136.0, 155.0)));
+    }
+
+    #[test]
+    fn a_device_too_tall_for_every_rail_leaves_the_rails_to_the_rest() {
+        let mut project = Project::new("x");
+        let mut parts = BTreeMap::new();
+        for (id, w, h) in [("tall", 80.0, 500.0), ("huge", 45.0, 900.0), ("small", 18.0, 80.0)] {
+            let mut part = Part {
+                id: id.into(),
+                ..Default::default()
+            };
+            part.properties.insert("Width".into(), format!("{w}"));
+            part.properties.insert("Height".into(), format!("{h}"));
+            parts.insert(id.to_string(), part);
+        }
+        for (t, part) in [("-A1", "tall"), ("-A2", "huge"), ("-K1", "small")] {
+            if let Some(t) = tag(t) {
+                project.devices.insert(
+                    t,
+                    Device {
+                        part: Some(part.into()),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        // Rails from x 45 to 155 at y 115, 305, 495 and 685.
+        let mut panel = Panel::with_rails("main", "Main", 200.0, 800.0);
+        let done = arrange(&mut panel, &project, &parts, None);
+        assert_eq!(done.placed, vec!["-A1", "-K1"]);
+        assert_eq!(done.did_not_fit, vec!["-A2"]);
+        let outlines: Vec<(Point, Point)> = panel.items.iter().filter_map(PanelItem::device_bounds).collect();
+        assert_eq!(outlines[0], (Point::new(45.0, 55.0), Point::new(125.0, 555.0)));
+        // -K1 still gets the first rail, beside -A1.
+        assert_eq!(outlines[1], (Point::new(126.0, 75.0), Point::new(144.0, 155.0)));
     }
 
     #[test]

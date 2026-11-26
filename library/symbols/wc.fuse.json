@@ -1,5 +1,6 @@
 {
   "category": "protection",
+  "description": "Fuse that protects a circuit by melting when the current is too high.",
   "graphics": [
     {
       "a": {

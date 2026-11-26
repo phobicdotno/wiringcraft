@@ -396,9 +396,15 @@ enum Cmd {
         /// `text`, `csv`, `md` or `xlsx`.
         #[arg(long, default_value = "text")]
         format: String,
-        /// Write to a file instead of standard output.
+        /// Write to a file instead of standard output. With `all` and `--format csv` this is
+        /// a folder, which gets one `<report>.csv` per report.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// CSV field separator: `,` (the default) or `;`. With `;` a file written with `--out`
+        /// also starts with a UTF-8 byte order mark, so Excel in a comma-decimal locale opens
+        /// it in columns with letters like æ ø å intact.
+        #[arg(long, default_value = ",")]
+        sep: char,
     },
     /// List the potentials (connected pins) across all pages.
     Nets,
@@ -583,6 +589,21 @@ enum PanelCmd {
         #[arg(long, default_value_t = 800.0)]
         height: f64,
     },
+    /// Change a layout's name or plate size. Rails, ducts and devices stay where they are; a
+    /// size that would leave any of them sticking out of the plate is refused.
+    Edit {
+        /// The layout's id.
+        id: String,
+        /// The new name, shown on its page; `""` uses the id.
+        #[arg(long)]
+        name: Option<String>,
+        /// New plate width in mm.
+        #[arg(long)]
+        width: Option<f64>,
+        /// New plate height in mm.
+        #[arg(long)]
+        height: Option<f64>,
+    },
     /// Put devices that have a part and are not on the plate yet onto its rails, sized by the
     /// part's `Width` and `Height` properties.
     Arrange {
@@ -620,7 +641,44 @@ enum PanelCmd {
         #[arg(long)]
         remove: bool,
     },
-    /// Print a layout's plate and each device on it with its position, size and turn.
+    /// Add a 35 mm DIN rail to a plate, or take one off with `--remove N` (rails numbered as
+    /// `panel show` lists them).
+    Rail {
+        /// The layout's id.
+        id: String,
+        /// Left end of the rail on its centre line in mm, `x,y`.
+        #[arg(long, value_parser = parse_point, required_unless_present = "remove", conflicts_with = "remove")]
+        at: Option<Point>,
+        /// Length in mm, to the right of `--at`.
+        #[arg(long, required_unless_present = "remove", conflicts_with = "remove")]
+        length: Option<f64>,
+        /// Take off the rail with this number.
+        #[arg(long, value_name = "N")]
+        remove: Option<usize>,
+    },
+    /// Add a wire duct to a plate, or take one off with `--remove N` (ducts numbered as
+    /// `panel show` lists them).
+    Duct {
+        /// The layout's id.
+        id: String,
+        /// Top-left corner of the duct in mm, `x,y`.
+        #[arg(long, value_parser = parse_point, required_unless_present = "remove", conflicts_with = "remove")]
+        at: Option<Point>,
+        /// Length in mm: to the right, or down with `--vertical`.
+        #[arg(long, required_unless_present = "remove", conflicts_with = "remove")]
+        length: Option<f64>,
+        /// Width in mm, across the length.
+        #[arg(long, default_value_t = wc_core::panel::DUCT, conflicts_with = "remove")]
+        width: f64,
+        /// Run the duct down the plate instead of across.
+        #[arg(long, conflicts_with = "remove")]
+        vertical: bool,
+        /// Take off the duct with this number.
+        #[arg(long, value_name = "N")]
+        remove: Option<usize>,
+    },
+    /// Print a layout's plate, its numbered rails and ducts, and each device on it with its
+    /// position, size and turn.
     Show {
         /// The layout's id.
         id: String,
@@ -1170,9 +1228,11 @@ enum LibCmd {
     /// Pin every used item that is not pinned yet, and write a pinned item's vendored copy again
     /// when it is missing or unreadable.
     Lock,
-    /// Find symbols and parts in the library sources by id, name, category or description.
+    /// Find symbols and parts in the library sources by id, name, category, letter code or
+    /// description.
     Search {
-        /// The text to look for; upper and lower case are alike.
+        /// The words to look for: an item matches when it contains every word, in any order;
+        /// upper and lower case are alike.
         query: String,
     },
     /// Offer the project's copy of an item back to a source for review.
@@ -1777,6 +1837,217 @@ fn rules_list(p: &Project, library: &[wc_core::check_rule::RuleSet], json: bool)
     Ok(out)
 }
 
+impl Cmd {
+    /// Every path this command reads as an input file, as named on the command line (so `-`
+    /// for stdin, and a folder where an importer takes one). Output paths and library folders
+    /// are not inputs. [`spool_inputs`] goes through them before the project lock is taken.
+    fn inputs_mut(&mut self) -> Vec<&mut PathBuf> {
+        match self {
+            Cmd::Inspect { file }
+            | Cmd::Logo(LogoCmd::Set { file })
+            | Cmd::Rules(RulesCmd::Set { file })
+            | Cmd::ReportLayout(ReportLayoutCmd::Set { file, .. }) => vec![file],
+            // Every import is listed, so a new one has to say what it reads.
+            Cmd::Import(import) => match import {
+                ImportCmd::SymbolDxf { file, .. }
+                | ImportCmd::FootprintDxf { file, .. }
+                | ImportCmd::ModelStep { file, .. }
+                | ImportCmd::SymbolSvg { file, .. }
+                | ImportCmd::PlcCsv { file }
+                | ImportCmd::Wago { file }
+                | ImportCmd::SymbolKicad { file, .. }
+                | ImportCmd::PartsBmecat { file, .. }
+                | ImportCmd::PartsCsv { file, .. }
+                | ImportCmd::Archive { file, .. }
+                | ImportCmd::PageDwg { file, .. }
+                | ImportCmd::Pdf { file, .. }
+                | ImportCmd::Aml { file, .. }
+                | ImportCmd::PageDxf { file, .. } => vec![file],
+                ImportCmd::Eplan { path, .. } | ImportCmd::SweLibrary { path, .. } => vec![path],
+                ImportCmd::PartsEdz { file, symbol_map, .. } => std::iter::once(file).chain(symbol_map).collect(),
+                ImportCmd::Swe { path, symbol_map, .. } => std::iter::once(path).chain(symbol_map).collect(),
+                ImportCmd::SymbolQet { files, .. } => files.iter_mut().collect(),
+            },
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// The most [`spool_inputs`] copies of one stream that no importer limit applies to: the
+/// operand is refused when it has more. A stream without an end (`/dev/zero`, a FIFO whose
+/// writer never stops) would otherwise hold the command up until the temporary folder is
+/// full. Above every limit an importer has for what it unpacks, so an archive it would read
+/// from a file is read from a stream too. Regular files are not copied and have no such limit.
+const MAX_SPOOLED_BYTES: u64 = 4 << 30;
+
+/// How much of one stream [`spool_inputs_within`] copies at most.
+#[derive(Clone, Copy)]
+struct SpoolLimits {
+    /// A SolidWorks Electrical database given to `import swe` as it is, not in an archive.
+    database: u64,
+    /// Any other stream, but an `import symbol-qet` element, which has the importer's limit.
+    stream: u64,
+}
+
+/// [`spool_inputs_within`] the limits the commands have: every copy has one.
+fn spool_inputs(cmd: &mut Cmd) -> Res<Option<tempfile::TempDir>> {
+    let limits = SpoolLimits {
+        database: wc_import::swe::MAX_DATABASE_BYTES,
+        stream: MAX_SPOOLED_BYTES,
+    };
+    spool_inputs_within(cmd, limits)
+}
+
+/// Copy every input of `cmd` that is not a regular file (a FIFO, a character device) into a
+/// private temporary folder, under the name it has, and point the command at the copy (no
+/// more of it than the importer reads). Every copy is bounded: an `import symbol-qet` element
+/// is cut one byte over the importer's limit, which then refuses that element as too large; a
+/// database for `import swe` (a stream that starts with the SQLite header) larger than
+/// `limits.database`, and any other stream larger than `limits.stream`, is refused here, by
+/// the name the operand has. An input named again, under the same or another name,
+/// is read once: each operand gets the same bytes in a folder of its own, under its own name,
+/// as an importer may take an id from the name. Called
+/// before the project lock is taken: a FIFO that another command on the same project fills
+/// would otherwise never be read, as its writer waits for the lock this command holds while it
+/// waits for the writer (#658). Regular files, folders, `-` and paths that do not exist are
+/// left as they are, for the command to read (or report) itself, and so is a stream that cannot
+/// be opened, and an element stream `import symbol-qet` refuses unread for its id, which an
+/// earlier element has. On Unix the `.edb` folder an
+/// Eplan `.elk` stream names stays beside its copy, as a link to the one beside the operand.
+/// The copies are removed when the returned folder is dropped; `None` when nothing was copied.
+fn spool_inputs_within(cmd: &mut Cmd, limits: SpoolLimits) -> Res<Option<tempfile::TempDir>> {
+    use std::io::{Read, Write};
+    // A database is told from an archive by its first bytes, as the importer does.
+    const SQLITE: &[u8] = b"SQLite format 3\0";
+    #[cfg(unix)]
+    let eplan = matches!(cmd, Cmd::Import(ImportCmd::Eplan { .. }));
+    // The first input of `import swe` is a database or an archive; its symbol map is neither.
+    let swe = matches!(cmd, Cmd::Import(ImportCmd::Swe { .. }));
+    // An importer that reads no more than so much of its input gets no more than that: a
+    // stream without an end (`/dev/zero`) would otherwise be copied until the disk is full.
+    // One byte over the limit is kept, which is how the importer sees the input is too large.
+    let element = matches!(cmd, Cmd::Import(ImportCmd::SymbolQet { .. })).then_some(wc_import::qet::MAX_LEN as u64);
+    let qet = match cmd {
+        Cmd::Import(ImportCmd::SymbolQet { prefix, scale, .. }) => Some((prefix.clone(), *scale)),
+        _ => None,
+    };
+    // The elements before this one, as `import symbol-qet` will read them, each with its id.
+    let mut earlier: Vec<(String, PathBuf)> = Vec::new();
+    let mut spool = None;
+    // A stream can be read once: an input named again gets the copy made the first time.
+    let mut copied: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for (n, path) in cmd.inputs_mut().into_iter().enumerate() {
+        let id = qet.as_ref().map(|(prefix, _)| qet_id(path, prefix));
+        let stream = path.as_os_str() != "-" && std::fs::metadata(&*path).is_ok_and(|m| !m.is_file() && !m.is_dir());
+        if !stream {
+            earlier.extend(id.map(|id| (id, path.clone())));
+            continue;
+        }
+        // An element whose id an earlier one has is refused without being opened: it is not
+        // opened here either, where a FIFO without a writer would hold the command up. The
+        // earlier one has the id when it can be read as an element, as the import decides.
+        if let (Some(id), Some((_, scale))) = (&id, &qet)
+            && earlier
+                .iter()
+                .any(|(other, file)| other == id && qet_element(file, id, *scale).is_ok())
+        {
+            continue;
+        }
+        let same = std::fs::canonicalize(&*path).unwrap_or_else(|_| path.clone());
+        let first = copied
+            .iter()
+            .find(|(from, _)| *from == same)
+            .map(|(_, copy)| copy.clone());
+        // A stream that cannot be opened is left for the command to report, as a path that
+        // does not exist is: nothing of it was read.
+        let from = match &first {
+            Some(_) => None,
+            None => match std::fs::File::open(&*path) {
+                Ok(from) => Some(from),
+                Err(_) => {
+                    earlier.extend(id.map(|id| (id, path.clone())));
+                    continue;
+                }
+            },
+        };
+        let fail = |x: std::io::Error| format!("{}: {x}", escape_field(&path.display().to_string()));
+        let folder = match &spool {
+            Some(folder) => folder,
+            None => spool.insert(run::staging_dir("wc-input-").map_err(|x| format!("temporary folder: {x}"))?),
+        };
+        // One folder per input: two inputs may share a file name.
+        let own = folder.path().join(n.to_string());
+        std::fs::create_dir(&own).map_err(|x| format!("{}: {x}", own.display()))?;
+        let copy = own.join(path.file_name().unwrap_or(std::ffi::OsStr::new("input")));
+        let at_copy = |x: std::io::Error| format!("{}: {x}", copy.display());
+        if let Some(first) = &first {
+            // The bytes read the first time, under the name this operand has.
+            std::fs::hard_link(first, &copy)
+                .or_else(|_| std::fs::copy(first, &copy).map(|_| ()))
+                .map_err(at_copy)?;
+        } else if let Some(from) = from {
+            let mut to = std::fs::File::create(&copy).map_err(at_copy)?;
+            let mut head = Vec::new();
+            if swe && n == 0 {
+                (&from).take(SQLITE.len() as u64).read_to_end(&mut head).map_err(fail)?;
+                to.write_all(&head).map_err(at_copy)?;
+            }
+            // The most this copy may hold, and whether one byte more is refused here (with
+            // the importer's own words for a database) or left for the importer to refuse.
+            let (most, refused) = match element {
+                Some(most) => (most, None),
+                None if head == SQLITE => (limits.database, Some("")),
+                None => (limits.stream, Some("the stream ")),
+            };
+            let rest = most.saturating_add(1).saturating_sub(head.len() as u64);
+            let len = std::io::copy(&mut (&from).take(rest), &mut to).map_err(fail)? + head.len() as u64;
+            if let (true, Some(what)) = (len > most, refused) {
+                return Err(format!(
+                    "{}: {what}is larger than {} MB",
+                    escape_field(&path.display().to_string()),
+                    most >> 20
+                ));
+            }
+            copied.push((same, copy.clone()));
+        }
+        #[cfg(unix)]
+        if eplan {
+            link_elk_folder(path, &copy)?;
+        }
+        earlier.extend(id.map(|id| (id, copy.clone())));
+        *path = copy;
+    }
+    Ok(spool)
+}
+
+/// Beside `copy`, the copy of the Eplan `.elk` stream `operand`, a link to the `.edb` folder
+/// the file names, which the importer looks for beside the file it is given: the folder is
+/// beside the operand, not beside its copy. Nothing when the copy is not an `.elk` file or
+/// names no folder that is there, which the importer then reports itself.
+#[cfg(unix)]
+fn link_elk_folder(operand: &Path, copy: &Path) -> Res<()> {
+    use std::io::Read;
+    // The folder name is the first line; a zip of the folder is not an `.elk` file.
+    let mut head = Vec::new();
+    std::fs::File::open(copy)
+        .and_then(|f| f.take(1 << 16).read_to_end(&mut head))
+        .map_err(|x| format!("{}: {x}", copy.display()))?;
+    if head.starts_with(b"PK") {
+        return Ok(());
+    }
+    let Some(name) = wc_import::eplan::elk_target(&head) else {
+        return Ok(());
+    };
+    let folder = operand.with_file_name(&name);
+    let link = copy.with_file_name(&name);
+    if name == "." || name == ".." || link == copy || !folder.is_dir() {
+        return Ok(());
+    }
+    // An absolute target: a relative one would be looked up from the link's folder.
+    let folder = std::fs::canonicalize(&folder).map_err(|x| format!("{}: {x}", folder.display()))?;
+    std::os::unix::fs::symlink(&folder, &link).map_err(|x| format!("{}: {x}", link.display()))
+}
+
 /// The rules in `file` for `rules set`, in order, each as the check runs it: `[[rule]]`
 /// tables, or a JSON list (or `{"rules": [...]}`) for a `.json` name; `-` is TOML on stdin.
 /// `stdin` is what was read from standard input for `-`, when it already was.
@@ -2073,13 +2344,16 @@ fn edit_macro(
     Ok(())
 }
 
-fn run(cli: Cli) -> Res<()> {
-    let dir = cli.project.as_path();
+fn run(mut cli: Cli) -> Res<()> {
     // One command at a time on a project: a second run waits, so it reads what the first one
     // wrote instead of overwriting it with an edit planned from the old files (#610).
     // An input file (or stdin) is read before the lock is taken: fed by another command on the
     // same project, through a pipe or a named FIFO, waiting for the lock before reading would
-    // hold both up for good.
+    // hold both up for good. Any command's input that is such a stream is copied to a
+    // temporary file first (#658); the commands below also read theirs here when it is a
+    // regular file.
+    let _spooled = spool_inputs(&mut cli.cmd)?;
+    let dir = cli.project.as_path();
     let mut input_text = match &cli.cmd {
         Cmd::Rules(RulesCmd::Set { file }) | Cmd::ReportLayout(ReportLayoutCmd::Set { file, .. }) => {
             Some(read_input(file)?)
@@ -2097,6 +2371,14 @@ fn run(cli: Cli) -> Res<()> {
         Cmd::New { .. } => None,
         _ => project_lock(dir),
     };
+    // Under the project lock, so a run still writing is never undone. `new` makes a project
+    // elsewhere and `inspect` reads only an archive: the folder `-C` names is not their project.
+    if !matches!(cli.cmd, Cmd::New { .. } | Cmd::Inspect { .. })
+        && let Some(note) = undo_stopped_box_edit(dir)?
+    {
+        // A warning that cannot be shown does not stop the command.
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), format!("warning: {note}\n").as_bytes());
+    }
     match cli.cmd {
         Cmd::New {
             dir: new_dir,
@@ -2112,6 +2394,8 @@ fn run(cli: Cli) -> Res<()> {
             });
             match template {
                 Some(t) => {
+                    // A template a box-edit run stopped half way in, local or cloned, is refused
+                    // by `create_from` (#653).
                     wc_vcs::base::create_from_base(&t, &new_dir, &name, &wc_core::base::today()).map_err(e)?;
                 }
                 None => {
@@ -2136,13 +2420,7 @@ fn run(cli: Cli) -> Res<()> {
                     if p.panels.iter().any(|x| x.id == id) {
                         return Err(format!("panel {id:?} exists"));
                     }
-                    if !(width.is_finite()
-                        && height.is_finite()
-                        && (200.0..=5000.0).contains(&width)
-                        && (200.0..=5000.0).contains(&height))
-                    {
-                        return Err("plate width and height must be 200 to 5000 mm".into());
-                    }
+                    check_plate_size(width, height)?;
                     let name = if name.is_empty() { id.clone() } else { name };
                     let panel = wc_core::panel::Panel::with_rails(id, name, width, height);
                     let rails = panel
@@ -2153,6 +2431,35 @@ fn run(cli: Cli) -> Res<()> {
                     println!("panel {}: {width} x {height} mm, {rails} rail(s)", panel.id);
                     p.panels.push(panel);
                     p.panels.sort_by(|a, b| a.id.cmp(&b.id));
+                }
+                PanelCmd::Edit {
+                    id,
+                    name,
+                    width,
+                    height,
+                } => {
+                    if name.is_none() && width.is_none() && height.is_none() {
+                        return Err("nothing to change: give --name, --width or --height".into());
+                    }
+                    let Some(panel) = p.panels.iter_mut().find(|x| x.id == id) else {
+                        return Err(format!("no panel {id:?}"));
+                    };
+                    let (w, h) = (width.unwrap_or(panel.width), height.unwrap_or(panel.height));
+                    // A name-only edit leaves the plate alone, so it still works when something
+                    // already sticks out past an edge (as `panel arrange` can leave it).
+                    if width.is_some() || height.is_some() {
+                        check_plate_size(w, h)?;
+                        panel.resize(w, h)?;
+                    }
+                    if let Some(name) = name {
+                        panel.name = if name.is_empty() { id.clone() } else { name };
+                    }
+                    println!(
+                        "panel {id}: {} ({} x {} mm)",
+                        escape_field(&panel.name),
+                        panel.width,
+                        panel.height
+                    );
                 }
                 PanelCmd::Arrange { id, location } => {
                     let parts = vendored_parts(dir, &p);
@@ -2251,6 +2558,46 @@ fn run(cli: Cli) -> Res<()> {
                         }
                     }
                 }
+                PanelCmd::Rail { id, at, length, remove } => {
+                    let Some(panel) = p.panels.iter_mut().find(|x| x.id == id) else {
+                        return Err(format!("no panel {id:?}"));
+                    };
+                    if let Some(n) = remove {
+                        remove_rail_or_duct(panel, true, n)?;
+                        println!("removed rail {n} from {id}");
+                    } else {
+                        let (Some(at), Some(length)) = (at, length) else {
+                            return Err("give --at x,y and --length".into());
+                        };
+                        let rail = panel_rail(panel, at, length)?;
+                        panel.items.push(rail);
+                        println!("rail on {id} at {},{}, {length} mm long", at.x, at.y);
+                    }
+                }
+                PanelCmd::Duct {
+                    id,
+                    at,
+                    length,
+                    width,
+                    vertical,
+                    remove,
+                } => {
+                    let Some(panel) = p.panels.iter_mut().find(|x| x.id == id) else {
+                        return Err(format!("no panel {id:?}"));
+                    };
+                    if let Some(n) = remove {
+                        remove_rail_or_duct(panel, false, n)?;
+                        println!("removed duct {n} from {id}");
+                    } else {
+                        let (Some(at), Some(length)) = (at, length) else {
+                            return Err("give --at x,y and --length".into());
+                        };
+                        let (w, h) = if vertical { (width, length) } else { (length, width) };
+                        let duct = panel_duct(panel, at, w, h)?;
+                        panel.items.push(duct);
+                        println!("duct on {id} at {},{}, {w} x {h} mm", at.x, at.y);
+                    }
+                }
                 PanelCmd::Show { id } => {
                     let Some(panel) = p.panels.iter().find(|x| x.id == id) else {
                         return Err(format!("no panel {id:?}"));
@@ -2326,11 +2673,14 @@ fn run(cli: Cli) -> Res<()> {
                     return Ok(());
                 }
                 PageCmd::Remove { id } => {
-                    let before = p.pages.len();
-                    p.pages.retain(|pg| pg.id != id);
-                    if p.pages.len() == before {
+                    if !p.pages.iter().any(|pg| pg.id == id) {
                         return Err(format!("no page {id:?}"));
                     }
+                    // Same rule as the app: a project keeps at least one page.
+                    if p.pages.len() <= 1 {
+                        return Err("A project needs at least one page.".into());
+                    }
+                    p.pages.retain(|pg| pg.id != id);
                 }
                 PageCmd::Overview { id, off } => {
                     let page = p
@@ -2650,19 +3000,41 @@ fn run(cli: Cli) -> Res<()> {
                     }
                 ));
             }
-            store::write_vendored_symbol(dir, &new).map_err(e)?;
-            if let Err(err) = save(dir, &p) {
+            // A run that stops between these writes leaves the journal: the next run puts the
+            // files back from it (#653).
+            let mut journaled = before.clone();
+            journaled.push((symbol_path.clone(), symbol_before.clone()));
+            let journal = Journal::begin(dir, &journaled)?;
+            let written = store::write_vendored_symbol(dir, &new).map_err(e).and_then(|_| {
+                // Tests stop the run here, as a kill between the writes would.
+                #[cfg(test)]
+                if tests::STOP_BOX_EDIT_AFTER_SYMBOL.get() {
+                    return Err(STOPPED.to_owned());
+                }
+                save(dir, &p)
+            });
+            #[cfg(test)]
+            if written.as_ref().is_err_and(|err| err == STOPPED) {
+                // The journal stays behind, no longer locked, as after a kill.
+                drop(journal);
+                return written;
+            }
+            if let Err(err) = written {
                 let mut failed = put_files_back(&before);
                 failed.extend(put_file_back(&symbol_path, symbol_before.as_deref()).err());
-                return Err(if failed.is_empty() {
-                    err
-                } else {
-                    format!(
-                        "{err}; putting back the project files failed too: {}",
-                        failed.join("; ")
-                    )
-                });
+                // The files put back are on disk before the journal goes, or it stays.
+                if failed.is_empty() {
+                    sync_folders(&journaled).map_err(|x| format!("{err}; the project files are put back, but {x}"))?;
+                    journal.finish(dir).map_err(|x| format!("{err}; {x}"))?;
+                    return Err(err);
+                }
+                // The journal stays, so the next run tries again.
+                return Err(format!(
+                    "{err}; putting back the project files failed too: {}",
+                    failed.join("; ")
+                ));
             }
+            journal.finish(dir).map_err(|x| format!("the edit is saved, but {x}"))?;
             for w in warnings {
                 eprintln!("warning: {}", escape_field(&w));
             }
@@ -3481,7 +3853,19 @@ fn run(cli: Cli) -> Res<()> {
                 return Err(format!("the project check found {errors} errors"));
             }
         }
-        Cmd::Report { kind, format, out } => {
+        Cmd::Report { kind, format, out, sep } => {
+            if !matches!(sep, ',' | ';') {
+                return Err(format!("unknown separator {sep:?} (, or ;)"));
+            }
+            if sep != ',' && format != "csv" {
+                return Err("--sep is for --format csv".into());
+            }
+            // Excel reads a `;` file as the comma-decimal locales write it, and needs the byte
+            // order mark to take it as UTF-8; standard output stays without one.
+            let csv_file = |t: &wc_report::Table| {
+                let bom = if sep == ';' { "\u{feff}" } else { "" };
+                format!("{bom}{}", t.to_csv_with(sep))
+            };
             let p = load(dir)?;
             let (symbols, _) = store::vendored_symbols(dir, &p);
             let parts = vendored_parts(dir, &p);
@@ -3502,11 +3886,28 @@ fn run(cli: Cli) -> Res<()> {
                 write_out(&path, bytes).map_err(e)?;
                 return Ok(());
             }
+            // Several tables in one CSV file is not a CSV any reader takes: `--out` names a
+            // folder then, with one `<report>.csv` in it per report, as `drawing` does per page.
+            if format == "csv"
+                && kinds.len() > 1
+                && let Some(folder) = &out
+            {
+                make_out_dir(folder)?;
+                for k in &kinds {
+                    let t = wc_report::build(*k, &inputs);
+                    write_out(folder.join(format!("{}.csv", k.name())), csv_file(&t)).map_err(e)?;
+                }
+                println!("wrote {} csv file(s) to {}", kinds.len(), folder.display());
+                return Ok(());
+            }
             let mut text = String::new();
+            if format == "csv" && sep == ';' && out.is_some() {
+                text.push('\u{feff}');
+            }
             for k in kinds {
                 let t = wc_report::build(k, &inputs);
                 text.push_str(&match format.as_str() {
-                    "csv" => t.to_csv(),
+                    "csv" => t.to_csv_with(sep),
                     "md" | "markdown" => t.to_markdown(),
                     "text" => plain_table(&t),
                     other => return Err(format!("unknown format {other:?} (text, csv, md, xlsx)")),
@@ -4514,6 +4915,498 @@ fn comment_cmd(dir: &Path, cc: CommentCmd) -> Res<()> {
 /// which overflowed there once one more import command was added (#312).
 const STACK: usize = 16 * 1024 * 1024;
 
+/// What a box-edit run a test stops between its writes returns.
+#[cfg(test)]
+const STOPPED: &str = "stopped between the writes";
+
+/// The file `box-edit` keeps in the project folder while it writes: the bytes every file it may
+/// change had before (#653). It is removed once the last file is written; one left behind means
+/// a run stopped half way, and the next run puts the files back from it
+/// ([`undo_stopped_box_edit`]).
+use store::BOX_EDIT_JOURNAL;
+const JOURNAL_HEADER: &[u8] = b"wiringcraft box-edit journal 2\n";
+
+/// A journal written and held by this run. The file stays locked while the run writes, so
+/// another run never takes it for one a stopped run left behind.
+struct Journal {
+    path: PathBuf,
+    file: std::fs::File,
+}
+
+impl Journal {
+    /// Write the journal of `files` (each a project file box-edit may change, with its bytes
+    /// before, `None` when it does not exist yet), durably, before the first file is changed.
+    fn begin(dir: &Path, files: &[(PathBuf, Option<Vec<u8>>)]) -> Res<Self> {
+        use std::io::Write as _;
+        let path = dir.join(BOX_EDIT_JOURNAL);
+        let shown = |p: &Path| escape_field(&p.display().to_string());
+        if std::fs::symlink_metadata(&path).is_ok() {
+            return Err(format!(
+                "{} is there: another box-edit run on this project has not finished; run again when it has",
+                shown(&path)
+            ));
+        }
+        let mut bytes = JOURNAL_HEADER.to_vec();
+        for (file, before) in files {
+            let rel = journal_name(dir, file)
+                .ok_or_else(|| format!("{} is not a file box-edit keeps a copy of", shown(file)))?;
+            journal_target_ok(dir, &rel)?;
+            match before {
+                Some(b) => bytes.extend_from_slice(format!("{} {}\n", rel.len(), b.len()).as_bytes()),
+                None => bytes.extend_from_slice(format!("{} -\n", rel.len()).as_bytes()),
+            }
+            bytes.extend_from_slice(rel.as_bytes());
+            bytes.extend_from_slice(before.as_deref().unwrap_or_default());
+        }
+        // The end, with the count: a journal cut short anywhere is refused, never half applied.
+        bytes.extend_from_slice(format!("end {}\n", files.len()).as_bytes());
+        // Written beside it under a name of its own, locked, then moved into place: the journal
+        // is either whole or not there.
+        let mut part = path.as_os_str().to_owned();
+        // Ending in `.tmp`, so a project's git ignore rule keeps one a stop left behind out.
+        part.push(format!(".{}.tmp", std::process::id()));
+        let part = PathBuf::from(part);
+        let fail = |x: std::io::Error| format!("{}: {x}", shown(&part));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // It holds the bytes of the project's files: only their owner reads it.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&part).map_err(fail)?;
+        let written = file
+            .try_lock()
+            .map_err(|x| fail(std::io::Error::other(x.to_string())))
+            .and_then(|()| file.write_all(&bytes).map_err(fail))
+            .and_then(|()| file.sync_all().map_err(fail))
+            .and_then(|()| std::fs::rename(&part, &path).map_err(fail));
+        if let Err(err) = written {
+            drop(file);
+            return Err(match std::fs::remove_file(&part) {
+                Err(x) if x.kind() != std::io::ErrorKind::NotFound => {
+                    format!("{err}; removing {} failed too: {x}", shown(&part))
+                }
+                _ => err,
+            });
+        }
+        // Without its folder entry on disk a power loss could lose the journal after the first
+        // write: stop before writing anything.
+        if let Err(x) = store::sync_dir(dir) {
+            let removed = std::fs::remove_file(&path);
+            drop(file);
+            return Err(match removed {
+                Ok(()) => format!("{}: {x}; nothing was changed", shown(dir)),
+                Err(r) => format!(
+                    "{}: {x}; nothing was changed, but removing {} failed too ({r}), so it may still be there: remove it before the next run, or that run puts back the files it holds (as they are now)",
+                    shown(dir),
+                    shown(&path)
+                ),
+            });
+        }
+        Ok(Self { path, file })
+    }
+
+    /// Every file is written (or put back): the journal goes, removed while still locked.
+    fn finish(self, dir: &Path) -> Res<()> {
+        let shown = escape_field(&self.path.display().to_string());
+        let removed = match std::fs::remove_file(&self.path) {
+            Err(x) => Err(format!(
+                "removing {shown} failed: {x}; remove that file, or the next run puts the project back as it was before the edit"
+            )),
+            Ok(()) => store::sync_dir(dir).map_err(|x| {
+                format!(
+                    "{shown} is removed, but making that last on disk failed ({x}); after a power loss the next run may put the project back as it was before the edit"
+                )
+            }),
+        };
+        drop(self.file);
+        removed
+    }
+}
+
+/// The name a journal keeps for `file`: its path inside `dir` with `/` between the parts.
+/// The black box symbol files the save may remove come with the vendored symbol folder
+/// resolved, so they are named by that folder as the project sees it.
+fn journal_name(dir: &Path, file: &Path) -> Option<String> {
+    let rel = match file.strip_prefix(dir) {
+        Ok(rel) => rel.to_path_buf(),
+        Err(_) => {
+            let symbols = dir.join(store::VENDOR_DIR).join(ItemKind::Symbol.dir());
+            let resolved = symbols.canonicalize().ok()?;
+            if file.parent()? != resolved {
+                return None;
+            }
+            Path::new(store::VENDOR_DIR)
+                .join(ItemKind::Symbol.dir())
+                .join(file.file_name()?)
+        }
+    };
+    let parts = rel
+        .components()
+        .map(|c| match c {
+            std::path::Component::Normal(n) => n.to_str(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    journal_name_allowed(&parts).then(|| parts.join("/"))
+}
+
+/// Whether a journal may name the file with these path parts: only the files box-edit may
+/// change (the project's own files, its pages, panels and comments, and vendored symbols).
+fn journal_name_allowed(parts: &[&str]) -> bool {
+    match parts {
+        [name] => [store::PROJECT_FILE, store::DEVICES_FILE, store::LOCK_FILE].contains(name),
+        [folder, name] => [
+            (store::PAGES_DIR, store::PAGE_SUFFIX),
+            (store::PANELS_DIR, store::PANEL_SUFFIX),
+            (store::COMMENTS_DIR, store::COMMENTS_SUFFIX),
+        ]
+        .iter()
+        // As the store and the snapshot take them: any name ending in the suffix, the suffix alone
+        // too (`comments/.comments.json`).
+        .any(|(f, suffix)| folder == f && name.ends_with(suffix)),
+        [vendor, kind, name] => {
+            *vendor == store::VENDOR_DIR && *kind == ItemKind::Symbol.dir() && name.ends_with(".json")
+        }
+        _ => false,
+    }
+}
+
+/// A folder on the way to a journaled file that is a link could lead out of the project, and
+/// a write or removal there would land elsewhere: refused.
+fn journal_target_ok(dir: &Path, rel: &str) -> Res<()> {
+    let mut at = dir.to_path_buf();
+    let parts: Vec<&str> = rel.split('/').collect();
+    for part in &parts[..parts.len().saturating_sub(1)] {
+        at.push(part);
+        if is_link(&at)? {
+            return Err(format!(
+                "{} is a link; box-edit does not write through a linked folder",
+                escape_field(&at.display().to_string())
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The files and their bytes before, as [`Journal::begin`] wrote them; `None` when the bytes
+/// are not a whole journal or name a file box-edit does not change.
+fn parse_journal(dir: &Path, bytes: &[u8]) -> Option<run::Written> {
+    let mut rest = bytes.strip_prefix(JOURNAL_HEADER)?;
+    let mut files = Vec::new();
+    loop {
+        let end = rest.iter().position(|&b| b == b'\n')?;
+        let line = std::str::from_utf8(&rest[..end]).ok()?;
+        rest = &rest[end + 1..];
+        let (first, len) = line.split_once(' ')?;
+        if first == "end" {
+            // The count the run wrote, and nothing after it.
+            return (len.parse::<usize>().ok()? == files.len() && rest.is_empty()).then_some(files);
+        }
+        let rel_len: usize = first.parse().ok()?;
+        let len: Option<usize> = if len == "-" { None } else { Some(len.parse().ok()?) };
+        let rel = std::str::from_utf8(rest.get(..rel_len)?).ok()?;
+        rest = &rest[rel_len..];
+        let parts: Vec<&str> = rel.split('/').collect();
+        if !journal_name_allowed(&parts) || parts.iter().any(|p| matches!(*p, "" | "." | "..")) {
+            return None;
+        }
+        let before = match len {
+            Some(n) => {
+                let b = rest.get(..n)?.to_vec();
+                rest = &rest[n..];
+                Some(b)
+            }
+            None => None,
+        };
+        files.push((parts.iter().fold(dir.to_path_buf(), |p, part| p.join(part)), before));
+    }
+}
+
+/// When a `box-edit` run stopped before it had written every file (killed, power lost), put
+/// the files it may have changed back as they were before it, so the symbol, `library.lock`
+/// and pages agree again (#653). A journal another run still holds is left alone. Says what
+/// it did, `None` when there was nothing to do.
+fn undo_stopped_box_edit(dir: &Path) -> Res<Option<String>> {
+    let path = dir.join(BOX_EDIT_JOURNAL);
+    let shown = escape_field(&path.display().to_string());
+    let not_a_file = || format!("{shown} is not a plain file; remove it");
+    // Only a plain file: a link could lead anywhere, and reading a FIFO would never end.
+    match std::fs::symlink_metadata(&path) {
+        Ok(m) if m.file_type().is_file() => {}
+        Ok(_) => return Err(not_a_file()),
+        Err(x) if x.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(x) => return Err(format!("{shown}: {x}")),
+    }
+    let mut file = None;
+    let mut denied = None;
+    for _ in 0..10 {
+        match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(f) => {
+                file = Some(f);
+                break;
+            }
+            Err(x) if x.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            // Windows: the run holding it may be removing it; it is gone a moment later.
+            Err(x) if x.kind() == std::io::ErrorKind::PermissionDenied && cfg!(windows) => {
+                denied = Some(x);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                if std::fs::symlink_metadata(&path).is_err_and(|m| m.kind() == std::io::ErrorKind::NotFound) {
+                    return Ok(None);
+                }
+            }
+            Err(x) => return Err(format!("{shown}: {x}")),
+        }
+    }
+    let Some(mut file) = file else {
+        return Err(format!(
+            "{shown}: {}",
+            denied.map_or_else(|| "access denied".to_owned(), |x| x.to_string())
+        ));
+    };
+    if !file.metadata().map_err(|x| format!("{shown}: {x}"))?.is_file() {
+        return Err(not_a_file());
+    }
+    // Tests swap the journal here, as another run finishing and starting could.
+    #[cfg(test)]
+    if let Some(between) = tests::BETWEEN_JOURNAL_OPEN_AND_LOCK.take() {
+        between();
+    }
+    match file.try_lock() {
+        Ok(()) => {}
+        // A run is writing now: its journal is not one left behind.
+        Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+        Err(std::fs::TryLockError::Error(x)) => return Err(format!("{shown}: {x}")),
+    }
+    // The run that held it may have finished and removed it just before the lock was taken,
+    // and another run may have put a journal of its own there since: only the file locked
+    // here is one left behind.
+    match std::fs::symlink_metadata(&path) {
+        Ok(now) => {
+            if !same_file(&now, &file).map_err(|x| format!("{shown}: {x}"))? {
+                return Ok(None);
+            }
+        }
+        Err(x) if x.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(x) => return Err(format!("{shown}: {x}")),
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|x| format!("{shown}: {x}"))?;
+    let unreadable = || {
+        format!(
+            "{shown} is left from a box-edit run that stopped, but it cannot be read; put the project files back from the project's history (e.g. `git checkout`) and remove it"
+        )
+    };
+    let files = parse_journal(dir, &bytes).ok_or_else(unreadable)?;
+    let mut names = Vec::with_capacity(files.len());
+    for (target, _) in &files {
+        let name = journal_name(dir, target).ok_or_else(unreadable)?;
+        journal_target_ok(dir, &name)?;
+        names.push(name);
+        // Each file is put back over a plain file or where none is: a link would be replaced by
+        // a plain file, and opening a FIFO to compare its bytes could wait for ever.
+        let target_shown = || escape_field(&target.display().to_string());
+        match std::fs::symlink_metadata(target) {
+            Ok(m) if m.file_type().is_file() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "{} is not a plain file, so the box-edit run that stopped half way cannot be undone; put it back from the project's history (e.g. `git checkout`) and run again",
+                    target_shown()
+                ));
+            }
+            Err(x) if x.kind() == std::io::ErrorKind::NotFound => {}
+            Err(x) => return Err(format!("{}: {x}", target_shown())),
+        }
+    }
+    // Tests swap a folder for a link here, as someone could after the check above.
+    #[cfg(test)]
+    if let Some(between) = tests::BETWEEN_JOURNAL_CHECK_AND_REPLAY.take() {
+        between();
+    }
+    let failed = put_journal_back(dir, &names, &files);
+    if !failed.is_empty() {
+        return Err(format!(
+            "a box-edit run stopped half way, and putting back the files it changed failed: {}",
+            failed.join("; ")
+        ));
+    }
+    // The files put back are on disk before the journal goes, or it stays for the next run.
+    sync_folders(&files).map_err(|x| format!("a box-edit run stopped half way; its files are put back, but {x}"))?;
+    std::fs::remove_file(&path).map_err(|x| format!("{shown}: {x}"))?;
+    store::sync_dir(dir).map_err(|x| format!("{}: {x}", escape_field(&dir.display().to_string())))?;
+    drop(file);
+    Ok(Some(
+        "a box-edit run stopped before it had written every file; the project files are put back as they were before it".into(),
+    ))
+}
+
+/// Put each journaled file back as it was, the last written first; `names` are their names in
+/// the project ([`journal_name`]). Returns why each one that could not be put back failed.
+///
+/// On Unix each folder on the way is opened relative to the one before it, never following a
+/// link, and the file is written, renamed and removed relative to its folder held open: a folder
+/// swapped for a link after [`journal_target_ok`] checked it is refused, not written through
+/// (#666). Elsewhere the files are put back by path, after that check alone.
+fn put_journal_back(dir: &Path, names: &[String], files: &run::Written) -> Vec<String> {
+    #[cfg(unix)]
+    {
+        names
+            .iter()
+            .zip(files)
+            .rev()
+            .filter_map(|(name, (_, before))| put_back_at(dir, name, before.as_deref()).err())
+            .collect()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (dir, names);
+        put_files_back(files)
+    }
+}
+
+/// [`put_file_back`] for the file `rel` names in the project `dir`, each folder on the way
+/// opened without following a link and the file reached only through its folder held open.
+#[cfg(unix)]
+fn put_back_at(dir: &Path, rel: &str, before: Option<&[u8]>) -> Result<(), String> {
+    use rustix::fs::{AtFlags, Mode, OFlags};
+    use rustix::io::Errno;
+    use std::io::{Read as _, Write as _};
+    let shown = |rel: &str| escape_field(&dir.join(rel).display().to_string());
+    let fail = |x: std::io::Error| format!("{}: {x}", shown(rel));
+    let (folders, name) = rel.rsplit_once('/').unwrap_or(("", rel));
+    let folder_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    // The project folder itself may be reached through a link: the one the run was given.
+    let mut at = rustix::fs::open(dir, folder_flags, Mode::empty())
+        .map_err(|x| format!("{}: {}", shown(""), std::io::Error::from(x)))?;
+    let mut walked = String::new();
+    for part in folders.split('/').filter(|p| !p.is_empty()) {
+        if !walked.is_empty() {
+            walked.push('/');
+        }
+        walked.push_str(part);
+        at = match rustix::fs::openat(&at, part, folder_flags | OFlags::NOFOLLOW, Mode::empty()) {
+            Ok(fd) => fd,
+            // A link (or no longer a folder): what it leads to is not written.
+            Err(Errno::LOOP | Errno::NOTDIR) => {
+                return Err(format!(
+                    "{} is a link; box-edit does not write through a linked folder",
+                    shown(&walked)
+                ));
+            }
+            // No folder, so no file there to remove.
+            Err(Errno::NOENT) if before.is_none() => return Ok(()),
+            Err(x) => return Err(fail(x.into())),
+        };
+    }
+    let Some(bytes) = before else {
+        // A link there is removed itself, never what it leads to.
+        return match rustix::fs::unlinkat(&at, name, AtFlags::empty()) {
+            Ok(()) | Err(Errno::NOENT) => Ok(()),
+            Err(x) => Err(fail(x.into())),
+        };
+    };
+    // A plain file there keeps its permissions, and is left as it is when it holds the bytes
+    // already; anything else is replaced, never opened to read (a FIFO would never end).
+    let now = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let keep = match rustix::fs::openat(&at, name, now, Mode::empty()) {
+        Ok(fd) => {
+            let mut file = std::fs::File::from(fd);
+            let m = file.metadata().map_err(fail)?;
+            if m.is_file() {
+                let mut held = Vec::new();
+                if file.read_to_end(&mut held).is_ok() && held == bytes {
+                    return Ok(());
+                }
+            }
+            m.is_file().then(|| m.permissions())
+        }
+        Err(Errno::NOENT | Errno::LOOP) => None,
+        // A file this user may write but not read (mode 0200) is still put back, keeping its
+        // permissions, as `put_file_back` does.
+        Err(Errno::ACCESS) => {
+            let m = rustix::fs::statat(&at, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|x| fail(x.into()))?;
+            (rustix::fs::FileType::from_raw_mode(m.st_mode) == rustix::fs::FileType::RegularFile).then(|| {
+                use std::os::unix::fs::PermissionsExt as _;
+                // `st_mode` is a u16 on some systems (macOS).
+                #[allow(clippy::useless_conversion)]
+                let mode = u32::from(m.st_mode) & 0o7777;
+                std::fs::Permissions::from_mode(mode)
+            })
+        }
+        Err(x) => return Err(fail(x.into())),
+    };
+    // The staging file is made new beside it, readable by its owner only before any bytes go in.
+    let mut made = None;
+    for n in 0..100u32 {
+        let part = format!("{name}.restore-{}-{n}", std::process::id());
+        let new = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        match rustix::fs::openat(&at, part.as_str(), new, Mode::RUSR | Mode::WUSR) {
+            Ok(fd) => {
+                made = Some((part, std::fs::File::from(fd)));
+                break;
+            }
+            Err(Errno::EXIST) => continue,
+            Err(x) => return Err(fail(x.into())),
+        }
+    }
+    let Some((part, mut file)) = made else {
+        return Err(format!("{}: no free name for the staging file", shown(rel)));
+    };
+    let done = file
+        .write_all(bytes)
+        .and_then(|()| keep.map_or(Ok(()), |perm| file.set_permissions(perm)))
+        .and_then(|()| file.sync_all())
+        .and_then(|()| {
+            drop(file);
+            rustix::fs::renameat(&at, part.as_str(), &at, name).map_err(Into::into)
+        });
+    done.map_err(|x| match rustix::fs::unlinkat(&at, part.as_str(), AtFlags::empty()) {
+        Ok(()) => fail(x),
+        Err(y) => format!(
+            "{}; the staging file {} is left: {}",
+            fail(x),
+            shown(&if folders.is_empty() {
+                part
+            } else {
+                format!("{folders}/{part}")
+            }),
+            std::io::Error::from(y)
+        ),
+    })
+}
+
+/// Make the files put back last on disk: sync the folder of each (Unix). Says which folder
+/// failed.
+fn sync_folders(files: &[(PathBuf, Option<Vec<u8>>)]) -> Res<()> {
+    let mut folders: Vec<&Path> = files.iter().filter_map(|(f, _)| f.parent()).collect();
+    folders.sort();
+    folders.dedup();
+    for folder in folders {
+        match store::sync_dir(folder) {
+            Err(x) if x.kind() != std::io::ErrorKind::NotFound => {
+                return Err(format!("{}: {x}", escape_field(&folder.display().to_string())));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Whether the entry `at` names is the file `file` has open. Only Unix tells it (device and
+/// inode); elsewhere the entry being there has to do.
+fn same_file(at: &std::fs::Metadata, file: &std::fs::File) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let m = file.metadata()?;
+        Ok(m.dev() == at.dev() && m.ino() == at.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (at, file);
+        Ok(true)
+    }
+}
+
 /// Whether `path` is a symbolic link. A missing file is not one; any other error reading its
 /// metadata is returned with the path, so a check that cannot tell refuses instead of guessing.
 fn is_link(path: &Path) -> Result<bool, String> {
@@ -4972,6 +5865,31 @@ fn import_kicad(text: &str, lib: &Path, prefix: &str, scale: f64, category: &str
     Ok(n)
 }
 
+/// The symbol id `import symbol-qet` gives the element in `file`: the prefix and the file stem.
+fn qet_id(file: &Path, prefix: &str) -> String {
+    let stem = wc_import::id_segment(
+        &file
+            .file_stem()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    );
+    format!("{}.{stem}", prefix.trim_end_matches('.'))
+}
+
+/// The element in `file` as the symbol `id`, with warnings.
+fn qet_element(file: &Path, id: &str, scale: f64) -> Res<(wc_import::qet::Imported, Vec<String>)> {
+    use std::io::Read;
+    std::fs::File::open(file)
+        .and_then(|f| {
+            // Read at most one byte past the limit, so a huge file is refused cheaply.
+            let mut text = String::new();
+            f.take(wc_import::qet::MAX_LEN as u64 + 1).read_to_string(&mut text)?;
+            Ok(text)
+        })
+        .map_err(e)
+        .and_then(|text| wc_import::qet::element(&text, id, scale).map_err(e))
+}
+
 fn import_qet(
     files: &[PathBuf],
     lib: &Path,
@@ -4980,29 +5898,14 @@ fn import_qet(
     category: &str,
     letter_code: &str,
 ) -> Res<(usize, usize)> {
-    use std::io::Read;
     let (mut written, mut failed) = (0, 0);
     // Two files whose names give the same id would overwrite each other: the later one fails.
     let mut ids: std::collections::BTreeMap<String, PathBuf> = Default::default();
     for file in files {
-        let stem = wc_import::id_segment(
-            &file
-                .file_stem()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-        );
-        let id = format!("{}.{stem}", prefix.trim_end_matches('.'));
+        let id = qet_id(file, prefix);
         let read = match ids.get(&id) {
             Some(first) => Err(format!("gives the same id {id} as {}, skipped", first.display())),
-            None => std::fs::File::open(file)
-                .and_then(|f| {
-                    // Read at most one byte past the limit, so a huge file is refused cheaply.
-                    let mut text = String::new();
-                    f.take(wc_import::qet::MAX_LEN as u64 + 1).read_to_string(&mut text)?;
-                    Ok(text)
-                })
-                .map_err(e)
-                .and_then(|text| wc_import::qet::element(&text, &id, scale).map_err(e)),
+            None => qet_element(file, &id, scale),
         };
         let (mut imp, warnings) = match read {
             Ok(r) => r,
@@ -5029,6 +5932,19 @@ fn import_qet(
         written += 1;
     }
     Ok((written, failed))
+}
+
+/// Refuses a plate size outside the 200 to 5000 mm range `panel new` and `panel edit` accept.
+fn check_plate_size(width: f64, height: f64) -> Result<(), String> {
+    if width.is_finite()
+        && height.is_finite()
+        && (200.0..=5000.0).contains(&width)
+        && (200.0..=5000.0).contains(&height)
+    {
+        Ok(())
+    } else {
+        Err("plate width and height must be 200 to 5000 mm".into())
+    }
 }
 
 fn vendored_parts(dir: &Path, p: &wc_core::Project) -> std::collections::BTreeMap<String, wc_core::Part> {
@@ -5073,7 +5989,82 @@ fn device_part_size(dir: &Path, p: &wc_core::Project, tag: &DeviceTag) -> Result
     }
 }
 
-/// `panel show`: the plate, then each device with its place, size and turn, one per line.
+/// Height of a DIN rail on the plate, centred on its line.
+const RAIL_HEIGHT: f64 = 35.0;
+
+/// A rail for `panel rail`, or an error when its length is not positive or the rail is not
+/// wholly on the plate.
+fn panel_rail(panel: &wc_core::panel::Panel, at: Point, length: f64) -> Result<wc_core::panel::PanelItem, String> {
+    if !(length.is_finite() && length > 0.0) {
+        return Err(format!("rail length must be more than 0 mm, got {length}"));
+    }
+    let half = RAIL_HEIGHT / 2.0;
+    check_on_plate(panel, "rail", Point::new(at.x, at.y - half), length, RAIL_HEIGHT)?;
+    Ok(wc_core::panel::PanelItem::Rail { at, length })
+}
+
+/// A `width` x `height` duct with its top-left corner at `at` for `panel duct`, or an error
+/// when a size is not positive or the duct is not wholly on the plate.
+fn panel_duct(
+    panel: &wc_core::panel::Panel,
+    at: Point,
+    width: f64,
+    height: f64,
+) -> Result<wc_core::panel::PanelItem, String> {
+    if !(width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0) {
+        return Err(format!(
+            "duct length and width must be more than 0 mm, got {width} x {height}"
+        ));
+    }
+    check_on_plate(panel, "duct", at, width, height)?;
+    Ok(wc_core::panel::PanelItem::Duct {
+        min: at,
+        max: Point::new(at.x + width, at.y + height),
+    })
+}
+
+/// An error naming `what` when a `w` x `h` box with its top-left corner at `at` is not on the
+/// plate. A small tolerance lets a box typed flush with the plate's edge through.
+fn check_on_plate(panel: &wc_core::panel::Panel, what: &str, at: Point, w: f64, h: f64) -> Result<(), String> {
+    if !(at.x.is_finite() && at.y.is_finite()) {
+        return Err(format!("{what}: position must be finite"));
+    }
+    let eps = 1e-9;
+    if at.x < -eps || at.y < -eps || at.x + w > panel.width + eps || at.y + h > panel.height + eps {
+        return Err(format!(
+            "{what}: a {w} x {h} mm outline at {},{} is not on the {} x {} mm plate",
+            at.x, at.y, panel.width, panel.height
+        ));
+    }
+    Ok(())
+}
+
+/// Take rail (or duct) number `n`, counted from 1 as `panel show` lists them, off the plate.
+fn remove_rail_or_duct(panel: &mut wc_core::panel::Panel, rail: bool, n: usize) -> Result<(), String> {
+    let what = if rail { "rail" } else { "duct" };
+    let index = panel
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| match i {
+            wc_core::panel::PanelItem::Rail { .. } => rail,
+            wc_core::panel::PanelItem::Duct { .. } => !rail,
+            wc_core::panel::PanelItem::Device { .. } => false,
+        })
+        .nth(n.wrapping_sub(1))
+        .map(|(i, _)| i);
+    let Some(index) = index else {
+        return Err(format!(
+            "no {what} {n} on panel {:?}: `panel show` numbers them",
+            panel.id
+        ));
+    };
+    panel.items.remove(index);
+    Ok(())
+}
+
+/// `panel show`: the plate, its numbered rails and ducts, then each device with its place,
+/// size and turn, one per line.
 fn panel_show(panel: &wc_core::panel::Panel) -> String {
     let mut out = format!(
         "{} {} ({} x {} mm)\n",
@@ -5082,6 +6073,28 @@ fn panel_show(panel: &wc_core::panel::Panel) -> String {
         panel.width,
         panel.height
     );
+    let (mut rails, mut ducts) = (0, 0);
+    for item in &panel.items {
+        match item {
+            wc_core::panel::PanelItem::Rail { at, length } => {
+                rails += 1;
+                let name = format!("rail {rails}");
+                out.push_str(&format!("{name:<12} at {},{}  {length} mm long\n", at.x, at.y));
+            }
+            wc_core::panel::PanelItem::Duct { min, max } => {
+                ducts += 1;
+                let name = format!("duct {ducts}");
+                out.push_str(&format!(
+                    "{name:<12} at {},{}  {} x {} mm\n",
+                    min.x,
+                    min.y,
+                    max.x - min.x,
+                    max.y - min.y
+                ));
+            }
+            wc_core::panel::PanelItem::Device { .. } => {}
+        }
+    }
     for item in &panel.items {
         if let wc_core::panel::PanelItem::Device {
             tag,
@@ -5199,6 +6212,15 @@ fn file_stem(number: &str, id: &str) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// Set by a test to stop `box-edit` after its symbol write, as a kill would.
+        pub(super) static STOP_BOX_EDIT_AFTER_SYMBOL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Run by recovery between opening a journal and locking it.
+        pub(super) static BETWEEN_JOURNAL_OPEN_AND_LOCK: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const { std::cell::Cell::new(None) };
+        /// Run by recovery between checking the files a journal names and putting them back.
+        pub(super) static BETWEEN_JOURNAL_CHECK_AND_REPLAY: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const { std::cell::Cell::new(None) };
+    }
 
     /// A stdout whose reader has gone away, as Windows reports it for `| more` that stopped.
     struct ClosedPipe;
@@ -5450,6 +6472,119 @@ mod tests {
     }
 
     #[test]
+    fn panel_rail_and_duct_add_list_and_remove() {
+        use wc_core::panel::PanelItem;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        store::create(&dir, "Test").unwrap();
+        cli(&dir, &["panel", "new", "main"]).unwrap();
+        let items = || load(&dir).unwrap().panels[0].items.clone();
+        let count = |rail: bool| {
+            items()
+                .iter()
+                .filter(|i| matches!(i, PanelItem::Rail { .. }) == rail && !matches!(i, PanelItem::Device { .. }))
+                .count()
+        };
+        let (rails, ducts) = (count(true), count(false));
+
+        // Added at the end, and listed with the next number.
+        cli(&dir, &["panel", "rail", "main", "--at", "50,700", "--length", "300"]).unwrap();
+        assert_eq!(
+            items().last(),
+            Some(&PanelItem::Rail {
+                at: Point::new(50.0, 700.0),
+                length: 300.0
+            })
+        );
+        cli(
+            &dir,
+            &[
+                "panel",
+                "duct",
+                "main",
+                "--at",
+                "300,100",
+                "--length",
+                "500",
+                "--vertical",
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            items().last(),
+            Some(&PanelItem::Duct {
+                min: Point::new(300.0, 100.0),
+                max: Point::new(340.0, 600.0)
+            })
+        );
+        cli(
+            &dir,
+            &[
+                "panel", "duct", "main", "--at", "0,760", "--length", "600", "--width", "40",
+            ],
+        )
+        .unwrap();
+        assert_eq!(count(true), rails + 1);
+        assert_eq!(count(false), ducts + 2);
+        let shown = panel_show(&load(&dir).unwrap().panels[0]);
+        let rail_line = format!("{:<12} at 50,700  300 mm long", format!("rail {}", rails + 1));
+        assert!(shown.contains(&rail_line), "{shown}");
+        let duct_line = format!("{:<12} at 300,100  40 x 500 mm", format!("duct {}", ducts + 1));
+        assert!(shown.contains(&duct_line), "{shown}");
+
+        // Bad sizes, places off the plate and missing values are refused; nothing changes.
+        let before = items();
+        for args in [
+            &["panel", "rail", "main", "--at", "50,700", "--length", "0"][..],
+            &["panel", "rail", "main", "--at", "50,700", "--length", "NaN"],
+            &["panel", "rail", "main", "--at", "400,700", "--length", "300"],
+            &["panel", "rail", "main", "--at", "50,790", "--length", "100"],
+            &["panel", "rail", "main", "--at", "50,700"],
+            &["panel", "rail", "nope", "--at", "50,700", "--length", "100"],
+            &[
+                "panel", "duct", "main", "--at", "0,0", "--length", "100", "--width", "-5",
+            ],
+            &["panel", "duct", "main", "--at", "-1,0", "--length", "100"],
+            &[
+                "panel",
+                "duct",
+                "main",
+                "--at",
+                "0,500",
+                "--length",
+                "400",
+                "--vertical",
+            ],
+            &[
+                "panel", "duct", "main", "--at", "0,0", "--length", "100", "--remove", "1",
+            ],
+            &["panel", "rail", "main", "--remove", "0"],
+            &["panel", "rail", "main", "--remove", "99"],
+            &["panel", "duct", "main", "--remove", "99"],
+        ] {
+            assert!(cli(&dir, args).is_err(), "{args:?}");
+        }
+        assert_eq!(items(), before);
+
+        // Removed by the number `panel show` gives; the others keep their order.
+        let n = (rails + 1).to_string();
+        cli(&dir, &["panel", "rail", "main", "--remove", &n]).unwrap();
+        assert_eq!(count(true), rails);
+        let n = (ducts + 1).to_string();
+        cli(&dir, &["panel", "duct", "main", "--remove", &n]).unwrap();
+        assert_eq!(count(false), ducts + 1);
+        assert_eq!(
+            items().last(),
+            Some(&PanelItem::Duct {
+                min: Point::new(0.0, 760.0),
+                max: Point::new(600.0, 800.0)
+            })
+        );
+        cli(&dir, &["panel", "rail", "main", "--remove", "1"]).unwrap();
+        assert_eq!(count(true), rails - 1);
+    }
+
+    #[test]
     fn a_command_waits_while_another_holds_the_project() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
@@ -5578,6 +6713,59 @@ mod tests {
         std::fs::remove_file(&vendored).unwrap();
         cli(&dir, &["wire", "p1", &format!("{s1}:1"), "0,0"]).unwrap();
         assert_eq!(load(&dir).unwrap().page("p1").unwrap().wires.len(), 3);
+    }
+
+    #[test]
+    fn a_panel_is_renamed_and_resized_keeping_its_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["device", "--", "-K1"]).unwrap();
+        cli(&dir, &["panel", "new", "main"]).unwrap();
+        cli(&dir, &["panel", "device", "main", "-K1", "--at", "100,600"]).unwrap();
+        let before = load(&dir).unwrap().panels[0].clone();
+
+        cli(
+            &dir,
+            &["panel", "edit", "main", "--name", "Main plate", "--height", "1000"],
+        )
+        .unwrap();
+        let after = load(&dir).unwrap().panels[0].clone();
+        assert_eq!(after.name, "Main plate");
+        assert_eq!((after.width, after.height), (600.0, 1000.0));
+        assert_eq!(after.items, before.items, "rails, ducts and devices are not rebuilt");
+
+        // Too small for the rails, or for the device at y 600..690; out of range; nothing to do;
+        // no such panel: refused, nothing changes.
+        let err = cli(&dir, &["panel", "edit", "main", "--height", "650"]).unwrap_err();
+        assert!(err.contains("sticking out") && err.contains("-K1"), "{err}");
+        assert!(cli(&dir, &["panel", "edit", "main", "--width", "300"]).is_err());
+        assert!(cli(&dir, &["panel", "edit", "main", "--width", "100"]).is_err());
+        assert!(cli(&dir, &["panel", "edit", "main", "--width", "NaN"]).is_err());
+        assert!(cli(&dir, &["panel", "edit", "main"]).is_err());
+        assert!(cli(&dir, &["panel", "edit", "nope", "--name", "x"]).is_err());
+        assert_eq!(load(&dir).unwrap().panels[0], after);
+
+        // An empty name falls back to the id, as `panel new` does.
+        cli(&dir, &["panel", "edit", "main", "--name", ""]).unwrap();
+        assert_eq!(load(&dir).unwrap().panels[0].name, "main");
+
+        // A device taller than the plate (as `panel arrange` can leave it) does not block a
+        // name-only edit, which keeps the plate size; resizing is still refused.
+        let mut p = load(&dir).unwrap();
+        for item in &mut p.panels[0].items {
+            if let wc_core::panel::PanelItem::Device { at, height, .. } = item {
+                *at = Point::new(100.0, 0.0);
+                *height = 1200.0;
+            }
+        }
+        store::save(&dir, &p).unwrap();
+        cli(&dir, &["panel", "edit", "main", "--name", "Tall"]).unwrap();
+        let after = load(&dir).unwrap().panels[0].clone();
+        assert_eq!(after.name, "Tall");
+        assert_eq!((after.width, after.height), (600.0, 1000.0));
+        assert!(cli(&dir, &["panel", "edit", "main", "--name", "x", "--width", "700"]).is_err());
+        assert_eq!(load(&dir).unwrap().panels[0].name, "Tall");
     }
 
     #[test]
@@ -6173,6 +7361,24 @@ mod tests {
         cli(&dir, &["page", "cover", "c2", "--off"]).unwrap();
         assert!(covers(&dir).is_empty());
         assert!(cli(&dir, &["page", "cover", "nope"]).unwrap_err().contains("no page"));
+    }
+
+    #[test]
+    fn page_remove_keeps_the_last_page_of_a_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let ids = |dir: &Path| -> Vec<String> { load(dir).unwrap().pages.iter().map(|p| p.id.clone()).collect() };
+        let only = ids(&dir);
+        assert_eq!(only.len(), 1);
+        let err = cli(&dir, &["page", "remove", &only[0]]).unwrap_err();
+        assert!(err.contains("at least one page"), "{err}");
+        assert_eq!(ids(&dir), only);
+        // With two pages, removing one works.
+        cli(&dir, &["page", "add", "p0002", "--number", "2"]).unwrap();
+        cli(&dir, &["page", "remove", &only[0]]).unwrap();
+        assert_eq!(ids(&dir), ["p0002"]);
+        assert!(cli(&dir, &["page", "remove", "nope"]).unwrap_err().contains("no page"));
     }
 
     #[test]
@@ -8568,6 +9774,101 @@ mod tests {
     }
 
     #[test]
+    fn all_reports_as_csv_go_to_one_file_each() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let out = tmp.path().join("reports");
+        cli(
+            &dir,
+            &["report", "all", "--format", "csv", "--out", out.to_str().unwrap()],
+        )
+        .unwrap();
+        let mut names: Vec<String> = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|f| f.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        let mut want: Vec<String> = wc_report::Kind::ALL
+            .iter()
+            .map(|k| format!("{}.csv", k.name()))
+            .collect();
+        want.sort();
+        assert_eq!(names, want);
+        // Each file is that one report's table alone, the same as asking for it by name.
+        let one = tmp.path().join("wires.csv");
+        cli(
+            &dir,
+            &["report", "wires", "--format", "csv", "--out", one.to_str().unwrap()],
+        )
+        .unwrap();
+        let wires = std::fs::read_to_string(out.join("wires.csv")).unwrap();
+        assert_eq!(format!("{wires}\n"), std::fs::read_to_string(&one).unwrap());
+    }
+
+    #[test]
+    fn report_csv_for_excel_is_semicolon_separated_with_a_bom() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        // One report to a file: `;` between fields and a byte order mark first.
+        let one = tmp.path().join("wires.csv");
+        cli(
+            &dir,
+            &[
+                "report",
+                "wires",
+                "--format",
+                "csv",
+                "--sep",
+                ";",
+                "--out",
+                one.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        let semi = std::fs::read_to_string(&one).unwrap();
+        let plain = tmp.path().join("plain.csv");
+        cli(
+            &dir,
+            &["report", "wires", "--format", "csv", "--out", plain.to_str().unwrap()],
+        )
+        .unwrap();
+        let plain = std::fs::read_to_string(&plain).unwrap();
+        // The default stays comma-separated without a byte order mark (a new project's wires
+        // report is its header row alone, with no comma inside a field).
+        assert!(!plain.starts_with('\u{feff}'), "{plain}");
+        let first = plain.lines().next().unwrap();
+        assert!(first.contains(','), "{first}");
+        assert_eq!(semi, format!("\u{feff}{}", plain.replace(',', ";")));
+        // `report all` writes every file of the folder the same way.
+        let out = tmp.path().join("reports");
+        cli(
+            &dir,
+            &[
+                "report",
+                "all",
+                "--format",
+                "csv",
+                "--sep",
+                ";",
+                "--out",
+                out.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        for k in wc_report::Kind::ALL {
+            let csv = std::fs::read_to_string(out.join(format!("{}.csv", k.name()))).unwrap();
+            assert!(csv.starts_with('\u{feff}'), "{}: {csv}", k.name());
+        }
+        let wires = std::fs::read_to_string(out.join("wires.csv")).unwrap();
+        assert_eq!(format!("{wires}\n"), semi);
+        // Only `,` and `;`, and only for CSV.
+        assert!(cli(&dir, &["report", "wires", "--format", "csv", "--sep", "|"]).is_err());
+        assert!(cli(&dir, &["report", "wires", "--format", "md", "--sep", ";"]).is_err());
+    }
+
+    #[test]
     fn excel_workbooks_import_parts_and_reports_save_as_xlsx() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
@@ -8930,6 +10231,506 @@ mod tests {
         std::fs::copy(&target, &page).unwrap();
         cli(&dir, &["box-edit", "p1", "s1", "--size", "30,10"]).unwrap();
         assert_ne!(store::read_vendored_symbol(&dir, "box.p1.s1").unwrap(), symbol_before);
+    }
+
+    /// A box-edit project: a box `s1` on page p1 with point 1 wired. Returns the project folder,
+    /// the box's symbol file, and the files a box-edit may change with their bytes now.
+    fn box_edit_project(tmp: &Path) -> (PathBuf, PathBuf, run::Written) {
+        let dir = tmp.join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        cli(
+            &dir,
+            &["box", "p1", "--at", "40,40", "--size", "20,10", "--pin", "1:left:5"],
+        )
+        .unwrap();
+        cli(&dir, &["wire", "p1", "s1:1", "0,0"]).unwrap();
+        let (symbol, symbol_bytes) = vendored_bytes(&dir, ItemKind::Symbol, "box.p1.s1").unwrap();
+        let mut files = snapshot_project(&dir, &[], &[]).unwrap();
+        files.push((symbol.clone(), symbol_bytes));
+        (dir, symbol, files)
+    }
+
+    fn bytes_now(files: &run::Written) -> run::Written {
+        files
+            .iter()
+            .map(|(path, _)| (path.clone(), std::fs::read(path).ok()))
+            .collect()
+    }
+
+    /// A box-edit run that stops between its writes (here: the symbol and `library.lock` are
+    /// new, the page is not) leaves its journal, and the next run puts every file back as it
+    /// was before, so symbol, lock and page agree again (#653).
+    #[test]
+    fn box_edit_stopped_between_writes_is_put_back_by_the_next_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, symbol_path, before) = box_edit_project(tmp.path());
+
+        // A page file the run adds is in its journal as not there before.
+        let extra = dir.join(store::PAGES_DIR).join(format!("zz{}", store::PAGE_SUFFIX));
+        let mut journaled = before.clone();
+        journaled.push((extra.clone(), None));
+        let journal = Journal::begin(&dir, &journaled).unwrap();
+        let mut sym = store::read_vendored_symbol(&dir, "box.p1.s1").unwrap();
+        sym.pins.clear();
+        store::write_vendored_symbol(&dir, &sym).unwrap();
+        let mut p = load(&dir).unwrap();
+        p.lock.symbols.get_mut("box.p1.s1").unwrap().hash = sym.hash();
+        store::save_lock(&dir, &p).unwrap();
+        std::fs::write(&extra, b"{}").unwrap();
+        // The run stops here: the journal stays, no longer locked.
+        drop(journal);
+        assert_ne!(bytes_now(&before), before);
+
+        // Any next run puts the files back first.
+        cli(&dir, &["location", "list"]).unwrap();
+        assert_eq!(bytes_now(&before), before);
+        assert!(!extra.exists());
+        assert!(!dir.join(BOX_EDIT_JOURNAL).exists());
+        assert!(std::fs::read(&symbol_path).is_ok());
+
+        // And the edit then goes through, leaving no journal.
+        cli(&dir, &["box-edit", "p1", "s1", "--size", "30,10"]).unwrap();
+        assert!(!dir.join(BOX_EDIT_JOURNAL).exists());
+        assert_ne!(
+            std::fs::read(&symbol_path).unwrap(),
+            before.last().unwrap().1.clone().unwrap()
+        );
+    }
+
+    /// The journal of a run still writing is locked: another run leaves it and the files alone,
+    /// and a second box-edit refuses instead of writing over it.
+    #[test]
+    fn a_journal_another_run_holds_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, _, before) = box_edit_project(tmp.path());
+        let journal = Journal::begin(&dir, &before).unwrap();
+        // What the other run has written so far stays as it is.
+        let page = dir.join(store::PAGES_DIR).join(format!("p1{}", store::PAGE_SUFFIX));
+        let page_before = std::fs::read(&page).unwrap();
+        std::fs::write(&page, b"half written by the other run").unwrap();
+        assert_eq!(undo_stopped_box_edit(&dir), Ok(None));
+        assert_eq!(std::fs::read(&page).unwrap(), b"half written by the other run");
+        std::fs::write(&page, &page_before).unwrap();
+
+        let err = cli(&dir, &["box-edit", "p1", "s1", "--size", "30,10"]).unwrap_err();
+        assert!(err.contains("has not finished"), "{err}");
+        assert_eq!(bytes_now(&before), before);
+
+        journal.finish(&dir).unwrap();
+        assert!(!dir.join(BOX_EDIT_JOURNAL).exists());
+        assert_eq!(undo_stopped_box_edit(&dir), Ok(None));
+    }
+
+    /// A journal left behind that is replaced, between recovery opening it and locking it, by
+    /// the journal of a run now writing: the old one, locked but no longer at the path, is not
+    /// replayed, and the new one is left alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_journal_swapped_between_open_and_lock_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, _, before) = box_edit_project(tmp.path());
+        let lock = dir.join(store::LOCK_FILE);
+        // The stopped run's journal would put `library.lock` back to other bytes.
+        let mut stale = before.clone();
+        for (path, bytes) in &mut stale {
+            if *path == lock {
+                *bytes = Some(b"stale".to_vec());
+            }
+        }
+        drop(Journal::begin(&dir, &stale).unwrap());
+        let live: std::rc::Rc<std::cell::RefCell<Option<Journal>>> = std::rc::Rc::default();
+        let (into, journal_dir, now) = (live.clone(), dir.clone(), before.clone());
+        BETWEEN_JOURNAL_OPEN_AND_LOCK.set(Some(Box::new(move || {
+            std::fs::remove_file(journal_dir.join(BOX_EDIT_JOURNAL)).unwrap();
+            *into.borrow_mut() = Some(Journal::begin(&journal_dir, &now).unwrap());
+        })));
+
+        assert_eq!(undo_stopped_box_edit(&dir), Ok(None));
+        assert_eq!(bytes_now(&before), before);
+        assert!(dir.join(BOX_EDIT_JOURNAL).exists());
+        live.take().unwrap().finish(&dir).unwrap();
+        assert!(!dir.join(BOX_EDIT_JOURNAL).exists());
+    }
+
+    /// A journal that is not whole, or names a file box-edit does not change, is refused, and
+    /// no file is changed from it.
+    #[test]
+    fn a_broken_journal_is_refused_and_changes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, _, before) = box_edit_project(tmp.path());
+        let journal = dir.join(BOX_EDIT_JOURNAL);
+        let with = |records: &[u8]| {
+            let mut b = JOURNAL_HEADER.to_vec();
+            b.extend_from_slice(records);
+            b
+        };
+        // A whole record, its lengths counted from the name and bytes, and the end line.
+        let one = |name: &str, tail: &[u8]| {
+            let mut b = JOURNAL_HEADER.to_vec();
+            b.extend_from_slice(format!("{} -\n{name}", name.len()).as_bytes());
+            b.extend_from_slice(tail);
+            b
+        };
+        let bad = [
+            b"not a journal".to_vec(),
+            // Cut inside a record, and cut at a record's end (no end line).
+            with(b"12 5\nlibrary.lock"),
+            one("library.lock", b""),
+            // A count that does not match, and bytes after the end.
+            one("library.lock", b"end 2\n"),
+            one("library.lock", b"end 1\nmore"),
+            // Outside the project, or a file box-edit does not change.
+            one("../x.json", b"end 1\n"),
+            one("/x.json", b"end 1\n"),
+            one("notes.txt", b"end 1\n"),
+            one("pages/../x.page.json", b"end 1\n"),
+            one("pages/./x.page.json", b"end 1\n"),
+        ];
+        // The same record with a name box-edit changes is whole: only the name is refused.
+        assert!(parse_journal(&dir, &one("pages/x.page.json", b"end 1\n")).is_some());
+        for bad in bad {
+            std::fs::write(&journal, &bad).unwrap();
+            let err = cli(&dir, &["location", "list"]).unwrap_err();
+            assert!(err.contains("cannot be read"), "{err}");
+            assert_eq!(bytes_now(&before), before);
+            assert_eq!(std::fs::read(&journal).unwrap(), bad);
+        }
+        assert!(!tmp.path().join("x.json").exists());
+
+        // Each file and its bytes come back as written.
+        let good = with(b"12 2\nlibrary.lockhi18 -\npages/p2.page.jsonend 2\n");
+        assert_eq!(
+            parse_journal(&dir, &good),
+            Some(vec![
+                (dir.join(store::LOCK_FILE), Some(b"hi".to_vec())),
+                (dir.join("pages").join("p2.page.json"), None)
+            ])
+        );
+    }
+
+    /// A box-edit run stopped right after its symbol write, in the command's own save path,
+    /// leaves a journal holding the symbol and the project files; the next run puts the symbol
+    /// back so it matches `library.lock` and the pages again. A `new` run elsewhere leaves the
+    /// journal alone.
+    #[test]
+    fn box_edit_killed_after_its_symbol_write_is_put_back_by_the_next_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, symbol_path, before) = box_edit_project(tmp.path());
+        STOP_BOX_EDIT_AFTER_SYMBOL.set(true);
+        let stopped = cli(&dir, &["box-edit", "p1", "s1", "--size", "30,10", "--clear-pins"]);
+        STOP_BOX_EDIT_AFTER_SYMBOL.set(false);
+        assert_eq!(stopped, Err(STOPPED.to_owned()));
+        // Permissions given to the half-edited symbol file are the ones it keeps when put back.
+        #[cfg(unix)]
+        let symbol_mode = {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&symbol_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+            0o640
+        };
+        // The journal holds the project files and the symbol, each with its bytes before.
+        let left = std::fs::read(dir.join(BOX_EDIT_JOURNAL)).unwrap();
+        // Compared by each file's name in the project: the black box symbol files the save may
+        // remove come with their folder resolved (on Windows a `\\?\` path, long names).
+        let named = |files: &run::Written| {
+            files
+                .iter()
+                .map(|(path, bytes)| (journal_name(&dir, path), bytes.clone()))
+                .collect::<Vec<_>>()
+        };
+        let Some(left) = parse_journal(&dir, &left) else {
+            unreachable!("the journal left behind reads")
+        };
+        assert_eq!(named(&left), named(&before));
+        assert!(named(&left).iter().all(|(name, _)| name.is_some()));
+        assert_ne!(std::fs::read(&symbol_path).ok(), before.last().unwrap().1);
+
+        let other = tmp.path().join("other");
+        cli(&dir, &["new", other.to_str().unwrap(), "--no-git"]).unwrap();
+        assert!(dir.join(BOX_EDIT_JOURNAL).exists());
+
+        cli(&dir, &["location", "list"]).unwrap();
+        assert!(!dir.join(BOX_EDIT_JOURNAL).exists());
+        assert_eq!(bytes_now(&before), before);
+        // The symbol file put back keeps the permissions it had.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&symbol_path), symbol_mode, "{:o}", mode(&symbol_path));
+        }
+        cli(&dir, &["box-edit", "p1", "s1", "--size", "30,10"]).unwrap();
+        assert!(!dir.join(BOX_EDIT_JOURNAL).exists());
+    }
+
+    /// On Unix a backslash is part of a file name: `pages/a\b.page.json` is journaled and put
+    /// back as that file, and `pages/a/b.page.json` is left as it is.
+    #[cfg(unix)]
+    #[test]
+    fn a_backslash_in_a_journaled_name_stays_part_of_the_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, _, _) = box_edit_project(tmp.path());
+        let pages = dir.join(store::PAGES_DIR);
+        let slashed = pages.join("a\\b.page.json");
+        let nested = pages.join("a").join("b.page.json");
+        std::fs::create_dir(pages.join("a")).unwrap();
+        std::fs::write(&slashed, b"old").unwrap();
+        std::fs::write(&nested, b"nested").unwrap();
+        let journal = Journal::begin(&dir, &[(slashed.clone(), Some(b"old".to_vec()))]).unwrap();
+        std::fs::write(&slashed, b"new").unwrap();
+        drop(journal);
+
+        assert!(undo_stopped_box_edit(&dir).unwrap().is_some());
+        assert_eq!(std::fs::read(&slashed).unwrap(), b"old");
+        assert_eq!(std::fs::read(&nested).unwrap(), b"nested");
+    }
+
+    /// A comment file named by the suffix alone (an empty list) is one the store reads and a
+    /// save removes: box-edit journals it, and a stopped run's journal puts it back.
+    #[test]
+    fn a_comment_file_named_by_the_suffix_alone_is_journaled_and_put_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, _, _) = box_edit_project(tmp.path());
+        let comments = dir.join(store::COMMENTS_DIR);
+        std::fs::create_dir_all(&comments).unwrap();
+        let empty = comments.join(store::COMMENTS_SUFFIX);
+        std::fs::write(&empty, b"[]").unwrap();
+        let mut before = snapshot_project(&dir, &[], &[]).unwrap();
+        assert!(before.iter().any(|(path, _)| *path == empty));
+        let (symbol, symbol_bytes) = vendored_bytes(&dir, ItemKind::Symbol, "box.p1.s1").unwrap();
+        before.push((symbol, symbol_bytes));
+
+        STOP_BOX_EDIT_AFTER_SYMBOL.set(true);
+        let stopped = cli(&dir, &["box-edit", "p1", "s1", "--size", "30,10"]);
+        STOP_BOX_EDIT_AFTER_SYMBOL.set(false);
+        assert_eq!(stopped, Err(STOPPED.to_owned()));
+        std::fs::remove_file(&empty).unwrap();
+        cli(&dir, &["location", "list"]).unwrap();
+        assert_eq!(bytes_now(&before), before);
+        assert_eq!(std::fs::read(&empty).unwrap(), b"[]");
+        // Made again where none was: its staging file was readable by its owner only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&empty).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "{mode:o}");
+        }
+
+        cli(&dir, &["box-edit", "p1", "s1", "--size", "30,10"]).unwrap();
+        assert!(!dir.join(BOX_EDIT_JOURNAL).exists());
+    }
+
+    /// A command that does not use the `-C` project (`inspect`) leaves a journal there alone,
+    /// and `new --template` refuses a template a box-edit run stopped half way in.
+    #[test]
+    fn commands_that_do_not_use_the_project_leave_its_journal_alone() {
+        use std::io::Write as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, symbol_path, before) = box_edit_project(tmp.path());
+        STOP_BOX_EDIT_AFTER_SYMBOL.set(true);
+        let stopped = cli(&dir, &["box-edit", "p1", "s1", "--size", "30,10", "--clear-pins"]);
+        STOP_BOX_EDIT_AFTER_SYMBOL.set(false);
+        assert_eq!(stopped, Err(STOPPED.to_owned()));
+        let journal = std::fs::read(dir.join(BOX_EDIT_JOURNAL)).unwrap();
+        let now = bytes_now(&before);
+
+        let archive = tmp.path().join("a.zip");
+        let mut z = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        z.start_file("readme.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        z.write_all(b"hi").unwrap();
+        z.finish().unwrap();
+        cli(&dir, &["inspect", archive.to_str().unwrap()]).unwrap();
+        assert_eq!(std::fs::read(dir.join(BOX_EDIT_JOURNAL)).unwrap(), journal);
+        assert_eq!(bytes_now(&before), now);
+
+        let made = tmp.path().join("made");
+        let err = run(Cli::try_parse_from([
+            "wiringcraft",
+            "new",
+            made.to_str().unwrap(),
+            "--no-git",
+            "--template",
+            dir.to_str().unwrap(),
+        ])
+        .unwrap())
+        .unwrap_err();
+        assert!(err.contains("stopped half way"), "{err}");
+        assert!(!made.exists());
+        assert_eq!(bytes_now(&before), now);
+
+        // Once the template is put back it serves again.
+        cli(&dir, &["check"]).ok();
+        assert!(!dir.join(BOX_EDIT_JOURNAL).exists());
+        assert_eq!(bytes_now(&before), before);
+        assert!(symbol_path.exists());
+        run(Cli::try_parse_from([
+            "wiringcraft",
+            "new",
+            made.to_str().unwrap(),
+            "--no-git",
+            "--template",
+            dir.to_str().unwrap(),
+        ])
+        .unwrap())
+        .unwrap();
+    }
+
+    /// The project reached through a linked folder: the box symbol files the save may remove
+    /// come resolved, and are journaled by their name in the project.
+    #[cfg(unix)]
+    #[test]
+    fn box_edit_through_a_linked_project_folder_journals_its_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, symbol_path, _) = box_edit_project(tmp.path());
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        let symbol_before = std::fs::read(&symbol_path).unwrap();
+        cli(&link, &["box-edit", "p1", "s1", "--size", "30,10"]).unwrap();
+        assert_ne!(std::fs::read(&symbol_path).unwrap(), symbol_before);
+        assert!(!dir.join(BOX_EDIT_JOURNAL).exists());
+    }
+
+    /// A journal that is not a plain file (a FIFO, whose reading would never end), or whose
+    /// records lead through a linked folder, is refused and nothing is written through it.
+    #[cfg(unix)]
+    #[test]
+    fn a_journal_that_is_no_plain_file_or_leads_through_a_link_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, _, before) = box_edit_project(tmp.path());
+        let journal = dir.join(BOX_EDIT_JOURNAL);
+        let made = std::process::Command::new("mkfifo").arg(&journal).status().unwrap();
+        assert!(made.success());
+        let err = cli(&dir, &["location", "list"]).unwrap_err();
+        assert!(err.contains("not a plain file"), "{err}");
+        std::fs::remove_file(&journal).unwrap();
+
+        // `comments` is a link to a folder outside the project.
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join(store::COMMENTS_DIR)).unwrap();
+        let mut bytes = JOURNAL_HEADER.to_vec();
+        bytes.extend_from_slice(b"25 2\ncomments/p1.comments.jsonhiend 1\n");
+        std::fs::write(&journal, &bytes).unwrap();
+        let err = cli(&dir, &["location", "list"]).unwrap_err();
+        assert!(err.contains("linked folder"), "{err}");
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+        assert_eq!(bytes_now(&before), before);
+        assert!(journal.exists());
+        std::fs::remove_file(dir.join(store::COMMENTS_DIR)).unwrap();
+
+        // A file to put back that is now a link or a FIFO: refused before anything is put back.
+        let lock = dir.join(store::LOCK_FILE);
+        let page = dir.join(store::PAGES_DIR).join(format!("p1{}", store::PAGE_SUFFIX));
+        let journal_of = |name: &str| {
+            // The unsafe file first: put back last of all, so a replay begun before every
+            // target is checked would already have changed `library.lock`.
+            let mut b = JOURNAL_HEADER.to_vec();
+            b.extend_from_slice(format!("{} 2\n{name}hi", name.len()).as_bytes());
+            b.extend_from_slice(b"12 2\nlibrary.lockhiend 2\n");
+            b
+        };
+        let page_name = format!("{}/p1{}", store::PAGES_DIR, store::PAGE_SUFFIX);
+        let page_bytes = std::fs::read(&page).unwrap();
+        let target = tmp.path().join("page-elsewhere.json");
+        std::fs::write(&target, &page_bytes).unwrap();
+        std::fs::remove_file(&page).unwrap();
+        std::os::unix::fs::symlink(&target, &page).unwrap();
+        std::fs::write(&journal, journal_of(&page_name)).unwrap();
+        let err = cli(&dir, &["location", "list"]).unwrap_err();
+        assert!(err.contains("not a plain file"), "{err}");
+        assert!(std::fs::symlink_metadata(&page).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&target).unwrap(), page_bytes);
+        assert_ne!(std::fs::read(&lock).unwrap(), b"hi");
+
+        std::fs::remove_file(&page).unwrap();
+        let made = std::process::Command::new("mkfifo").arg(&page).status().unwrap();
+        assert!(made.success());
+        let err = cli(&dir, &["location", "list"]).unwrap_err();
+        assert!(err.contains("not a plain file"), "{err}");
+        assert_ne!(std::fs::read(&lock).unwrap(), b"hi");
+        assert!(journal.exists());
+    }
+
+    /// Folders swapped for links after recovery checked them, before it puts the files back
+    /// (#666): nothing is written or removed through them, and the journal stays.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_swapped_for_a_link_after_the_check_is_not_written_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, _, _) = box_edit_project(tmp.path());
+        let comments = dir.join(store::COMMENTS_DIR);
+        let vendor = dir.join(store::VENDOR_DIR);
+        std::fs::create_dir_all(&comments).unwrap();
+        let kind = ItemKind::Symbol.dir();
+        // Outside the project: a comments file to be removed, and a folder for symbols.
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(outside.join(kind)).unwrap();
+        std::fs::write(outside.join("a.comments.json"), b"outside").unwrap();
+        let records = [
+            (format!("{}/a.comments.json", store::COMMENTS_DIR), None),
+            (format!("{}/b.comments.json", store::COMMENTS_DIR), Some(&b"hi"[..])),
+            (format!("{}/{kind}/x.json", store::VENDOR_DIR), Some(&b"hi"[..])),
+        ];
+        let mut bytes = JOURNAL_HEADER.to_vec();
+        for (name, before) in &records {
+            let len = before.map_or_else(|| "-".to_owned(), |b| b.len().to_string());
+            bytes.extend_from_slice(format!("{} {len}\n{name}", name.len()).as_bytes());
+            bytes.extend_from_slice(before.unwrap_or_default());
+        }
+        bytes.extend_from_slice(format!("end {}\n", records.len()).as_bytes());
+        let journal = dir.join(BOX_EDIT_JOURNAL);
+        std::fs::write(&journal, &bytes).unwrap();
+
+        let (swap_comments, swap_vendor, to) = (comments.clone(), vendor.clone(), outside.clone());
+        BETWEEN_JOURNAL_CHECK_AND_REPLAY.set(Some(Box::new(move || {
+            for folder in [&swap_comments, &swap_vendor] {
+                let mut away = folder.as_os_str().to_owned();
+                away.push("-real");
+                std::fs::rename(folder, away).unwrap();
+                std::os::unix::fs::symlink(&to, folder).unwrap();
+            }
+        })));
+        let Err(err) = undo_stopped_box_edit(&dir) else {
+            unreachable!("a replay through a linked folder is refused")
+        };
+        assert!(err.contains("linked folder"), "{err}");
+        let mut left: Vec<_> = std::fs::read_dir(&outside)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["a.comments.json", kind]);
+        assert_eq!(std::fs::read(outside.join("a.comments.json")).unwrap(), b"outside");
+        assert!(std::fs::read_dir(outside.join(kind)).unwrap().next().is_none());
+        assert!(journal.exists());
+    }
+
+    /// A journaled file its owner may write but not read (mode 0200) is put back all the same,
+    /// keeping its mode. Only a user other than root is refused the read: run as one, e.g.
+    /// `setpriv --reuid=65534 --regid=65534 --clear-groups`, to take that path.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_only_file_is_put_back_keeping_its_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, _, _) = box_edit_project(tmp.path());
+        let comments = dir.join(store::COMMENTS_DIR);
+        std::fs::create_dir_all(&comments).unwrap();
+        let target = comments.join("w.comments.json");
+        std::fs::write(&target, b"half written").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o200)).unwrap();
+        let name = format!("{}/w.comments.json", store::COMMENTS_DIR);
+        let mut bytes = JOURNAL_HEADER.to_vec();
+        bytes.extend_from_slice(format!("{} 2\n{name}hiend 1\n", name.len()).as_bytes());
+        std::fs::write(dir.join(BOX_EDIT_JOURNAL), &bytes).unwrap();
+
+        assert!(undo_stopped_box_edit(&dir).unwrap().is_some());
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o200);
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"hi");
+        assert!(!dir.join(BOX_EDIT_JOURNAL).exists());
     }
 
     #[test]
@@ -9930,5 +11731,551 @@ mod box_cleanup_rollback_tests {
         );
         #[cfg(unix)]
         assert!(std::fs::symlink_metadata(folder.join("box.p1.s3.json")).is_ok_and(|m| m.file_type().is_symlink()));
+    }
+}
+
+/// Inputs are found for every command that names one, and only streams are copied (#658).
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod input_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    include!("input_commands.rs");
+
+    /// Path arguments that are not input files: where output goes, library and project folders.
+    const NOT_INPUTS: &[&str] = &["project", "dir", "out", "lib", "svg"];
+
+    /// The commands under `command` that take a path argument which is not in [`NOT_INPUTS`],
+    /// each as the words that name it.
+    fn commands_with_a_path(command: &clap::Command, words: &mut Vec<String>, found: &mut Vec<Vec<String>>) {
+        let path = clap::builder::ValueParser::path_buf().type_id();
+        let takes_one = command
+            .get_arguments()
+            .any(|a| a.get_value_parser().type_id() == path && !NOT_INPUTS.contains(&a.get_id().as_str()));
+        if takes_one && !words.is_empty() {
+            found.push(words.clone());
+        }
+        for sub in command.get_subcommands() {
+            words.push(sub.get_name().to_owned());
+            commands_with_a_path(sub, words, found);
+            words.pop();
+        }
+    }
+
+    #[test]
+    fn every_command_with_an_input_file_lists_it() {
+        for args in INPUT_COMMANDS {
+            let mut cli = Cli::try_parse_from(["wiringcraft"].iter().chain(*args)).unwrap();
+            let got: Vec<PathBuf> = cli.cmd.inputs_mut().into_iter().map(|p| p.clone()).collect();
+            let want: Vec<PathBuf> = args
+                .iter()
+                .filter(|a| ["FIFO", "FILE"].contains(a))
+                .map(PathBuf::from)
+                .collect();
+            assert_eq!(got, want, "{args:?}");
+        }
+        // A library folder is not an input, also where the command can do without one.
+        for args in [
+            &["import", "archive", "in", "--lib", "lib"][..],
+            &["import", "swe-library", "in", "--lib", "lib"],
+        ] {
+            let mut cli = Cli::try_parse_from(["wiringcraft"].iter().chain(args)).unwrap();
+            let got: Vec<PathBuf> = cli.cmd.inputs_mut().into_iter().map(|p| p.clone()).collect();
+            assert_eq!(got, [PathBuf::from("in")], "{args:?}");
+        }
+        // A command that takes a path which is not an output or a folder is in the list above,
+        // so a new command with an input file fails here until it is covered.
+        let mut found = Vec::new();
+        commands_with_a_path(&Cli::command(), &mut Vec::new(), &mut found);
+        assert!(found.len() >= 23, "{found:?}");
+        for words in found {
+            assert!(
+                INPUT_COMMANDS
+                    .iter()
+                    .any(|args| args.iter().zip(&words).filter(|(a, w)| a == w).count() == words.len()),
+                "`{}` takes a path that Cmd::inputs_mut and this test do not know",
+                words.join(" ")
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_without_an_input_file_has_none() {
+        for args in [
+            &["check"][..],
+            &["pdf", "out.pdf"],
+            &["export", "wago-marking", "out.csv"],
+        ] {
+            let mut cli = Cli::try_parse_from(["wiringcraft"].iter().chain(args)).unwrap();
+            assert!(cli.cmd.inputs_mut().is_empty(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn regular_files_folders_and_stdin_are_not_copied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("a.elmt");
+        std::fs::write(&file, "<definition/>").unwrap();
+        let folder = tmp.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        let missing = tmp.path().join("missing.elmt");
+        let lib = tmp.path().join("lib");
+        let mut cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "symbol-qet".as_ref(),
+            file.as_os_str(),
+            folder.as_os_str(),
+            missing.as_os_str(),
+            "--lib".as_ref(),
+            lib.as_os_str(),
+        ])
+        .unwrap();
+        assert!(spool_inputs(&mut cli.cmd).unwrap().is_none());
+        let after: Vec<PathBuf> = cli.cmd.inputs_mut().into_iter().map(|p| p.clone()).collect();
+        assert_eq!(after, [file, folder, missing]);
+
+        let mut cli = Cli::try_parse_from(["wiringcraft", "rules", "set", "-"]).unwrap();
+        assert!(spool_inputs(&mut cli.cmd).unwrap().is_none());
+        assert!(matches!(cli.cmd, Cmd::Rules(RulesCmd::Set { ref file }) if file.as_os_str() == "-"));
+    }
+
+    /// [`spool_inputs`] on another thread, given twenty seconds: a copy that waits for a
+    /// writer that never comes, or that has no end, fails the test instead of holding it up.
+    #[cfg(unix)]
+    fn spooled(cli: Cli) -> (Vec<PathBuf>, Option<tempfile::TempDir>) {
+        let limits = SpoolLimits {
+            database: wc_import::swe::MAX_DATABASE_BYTES,
+            stream: MAX_SPOOLED_BYTES,
+        };
+        let (inputs, spool) = spooled_within(cli, limits);
+        (inputs, spool.unwrap())
+    }
+
+    /// [`spooled`] with `limits` in place of the ones the commands have, and what it said.
+    #[cfg(unix)]
+    fn spooled_within(mut cli: Cli, limits: SpoolLimits) -> (Vec<PathBuf>, Res<Option<tempfile::TempDir>>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let spool = spool_inputs_within(&mut cli.cmd, limits);
+            let inputs: Vec<PathBuf> = cli.cmd.inputs_mut().into_iter().map(|p| p.clone()).collect();
+            let _ = tx.send((inputs, spool));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap()
+    }
+
+    /// Small limits for a test: a database of 64 KiB, any other stream of 1 MiB.
+    #[cfg(unix)]
+    const SMALL: SpoolLimits = SpoolLimits {
+        database: 1 << 16,
+        stream: 1 << 20,
+    };
+
+    /// One writer on another thread that opens the FIFO at `fifo` once and writes `head`, then
+    /// zeros until the reader is gone or `most` bytes are written. The bytes it wrote.
+    #[cfg(unix)]
+    fn endless_writer(
+        fifo: &Path,
+        head: &'static [u8],
+        most: u64,
+    ) -> std::thread::JoinHandle<(u64, std::io::Result<()>)> {
+        use std::io::Write;
+        let fifo = fifo.to_path_buf();
+        std::thread::spawn(move || {
+            let mut to = match std::fs::OpenOptions::new().write(true).open(&fifo) {
+                Ok(to) => to,
+                Err(x) => return (0, Err(x)),
+            };
+            let mut sent = 0;
+            let mut block: &[u8] = head;
+            while sent < most {
+                if let Err(x) = to.write_all(block) {
+                    return (sent, Err(x));
+                }
+                sent += block.len() as u64;
+                block = &[0; 4096];
+            }
+            (sent, Ok(()))
+        })
+    }
+
+    /// A database for `import swe` on a FIFO whose writer does not stop: the copy ends one
+    /// byte over the database limit, well under the limit of other streams, and the command
+    /// is refused with the importer's words for a database that is too large.
+    #[cfg(unix)]
+    #[test]
+    fn an_endless_swe_database_stream_is_refused_as_too_large() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("plant.db");
+        mkfifo(&fifo);
+        let writer = endless_writer(&fifo, b"SQLite format 3\0", 8 << 20);
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "swe".as_ref(),
+            fifo.as_os_str(),
+        ])
+        .unwrap();
+        let (_, spool) = spooled_within(cli, SMALL);
+        let why = spool.map(|_| ()).unwrap_err();
+        assert_eq!(why, format!("{}: is larger than 0 MB", fifo.display()));
+        // The reader left: the writer was stopped, long before the limit of other streams.
+        let (sent, end) = writer.join().unwrap();
+        assert_eq!(end.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(sent < SMALL.stream, "{sent}");
+    }
+
+    /// The database limit is for a database only: an archive for `import swe` and its symbol
+    /// map, both larger than that on FIFOs that end, are copied whole.
+    #[cfg(unix)]
+    #[test]
+    fn a_finite_swe_archive_stream_and_its_symbol_map_are_copied_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (archive, map) = (tmp.path().join("plant.tewzip"), tmp.path().join("map.toml"));
+        mkfifo(&archive);
+        mkfifo(&map);
+        let len = SMALL.database as usize + 4096;
+        let mut zip = b"PK\x03\x04".to_vec();
+        zip.resize(len, 0);
+        // The header on the symbol map: only the first input is a database.
+        let mut text = b"SQLite format 3\0".to_vec();
+        text.resize(len, b'#');
+        let writers = [writer(&archive, zip.clone()), writer(&map, text.clone())];
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "swe".as_ref(),
+            archive.as_os_str(),
+            "--symbol-map".as_ref(),
+            map.as_os_str(),
+        ])
+        .unwrap();
+        let (inputs, spool) = spooled_within(cli, SMALL);
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+        let spool = spool.unwrap().unwrap();
+        assert_eq!(inputs.len(), 2);
+        assert!(inputs.iter().all(|i| i.starts_with(spool.path())), "{inputs:?}");
+        assert!(std::fs::read(&inputs[0]).unwrap() == zip);
+        assert!(std::fs::read(&inputs[1]).unwrap() == text);
+    }
+
+    /// A stream no importer limit applies to is refused when it has more than the limit for
+    /// every stream, by the name the operand has; a regular file larger than that is not
+    /// copied and not refused.
+    #[cfg(unix)]
+    #[test]
+    fn an_endless_stream_without_an_importer_limit_is_refused_by_its_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cli = Cli::try_parse_from(["wiringcraft", "import", "pdf", "/dev/zero"]).unwrap();
+        let (_, spool) = spooled_within(cli, SMALL);
+        assert_eq!(
+            spool.map(|_| ()).unwrap_err(),
+            "/dev/zero: the stream is larger than 1 MB"
+        );
+        // A database header does not make another command's input a database.
+        let fifo = tmp.path().join("plan.pdf");
+        mkfifo(&fifo);
+        let writer = endless_writer(&fifo, b"SQLite format 3\0", 8 << 20);
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "pdf".as_ref(),
+            fifo.as_os_str(),
+        ])
+        .unwrap();
+        let (_, spool) = spooled_within(cli, SMALL);
+        let why = spool.map(|_| ()).unwrap_err();
+        assert_eq!(why, format!("{}: the stream is larger than 1 MB", fifo.display()));
+        let (sent, end) = writer.join().unwrap();
+        assert_eq!(end.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(sent > SMALL.stream, "{sent}");
+
+        let file = tmp.path().join("large.pdf");
+        std::fs::write(&file, vec![0; SMALL.stream as usize + 4096]).unwrap();
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "pdf".as_ref(),
+            file.as_os_str(),
+        ])
+        .unwrap();
+        let (inputs, spool) = spooled_within(cli, SMALL);
+        assert!(spool.unwrap().is_none());
+        assert_eq!(inputs, [file]);
+    }
+
+    /// A FIFO made with `mkfifo` at `path`.
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(path)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    /// One writer on another thread that opens the FIFO at `fifo` once and writes `bytes`.
+    #[cfg(unix)]
+    fn writer(fifo: &Path, bytes: Vec<u8>) -> std::thread::JoinHandle<std::io::Result<()>> {
+        use std::io::Write;
+        let fifo = fifo.to_path_buf();
+        std::thread::spawn(move || std::fs::OpenOptions::new().write(true).open(&fifo)?.write_all(&bytes))
+    }
+
+    /// Two differently named operands that are one FIFO: it is read once, each operand keeps
+    /// its own name, so the importer gives each its own id.
+    #[cfg(unix)]
+    #[test]
+    fn two_names_of_one_fifo_keep_their_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("pipe");
+        mkfifo(&fifo);
+        let (first, second) = (tmp.path().join("first.elmt"), tmp.path().join("second.elmt"));
+        std::os::unix::fs::symlink(&fifo, &first).unwrap();
+        std::os::unix::fs::symlink(&fifo, &second).unwrap();
+        let element =
+            "<definition type=\"element\"><description><terminal x=\"0\" y=\"0\"/></description></definition>";
+        let writer = writer(&fifo, element.as_bytes().to_vec());
+        let lib = tmp.path().join("lib");
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "symbol-qet".as_ref(),
+            first.as_os_str(),
+            second.as_os_str(),
+            "--lib".as_ref(),
+            lib.as_os_str(),
+        ])
+        .unwrap();
+        let (inputs, spool) = spooled(cli);
+        writer.join().unwrap().unwrap();
+        let spool = spool.unwrap();
+        assert_eq!(inputs.len(), 2);
+        for (input, operand) in inputs.iter().zip([&first, &second]) {
+            assert!(input.starts_with(spool.path()), "{inputs:?}");
+            assert_eq!(input.file_name(), operand.file_name());
+            assert_eq!(std::fs::read_to_string(input).unwrap(), element);
+        }
+        let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
+        assert_eq!((written, failed), (2, 0));
+        assert!(lib.join("symbols").join("qet.first.json").exists());
+        assert!(lib.join("symbols").join("qet.second.json").exists());
+    }
+
+    /// An Eplan `.elk` FIFO whose `.edb` folder is beside it: the importer, given the copy,
+    /// still finds the folder and reads the project's page from it.
+    #[cfg(unix)]
+    #[test]
+    fn the_folder_of_an_elk_fifo_is_found_from_its_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let edb = tmp.path().join("plant.edb");
+        std::fs::create_dir(&edb).unwrap();
+        // One page record as the importer reads it: padding, the record start, its own
+        // reference (class 4, a page, id 10), the page name and its properties block.
+        let mut page = vec![0u8; 24];
+        page.extend([0x0a, 0, 0, 0, 0x38, 0, 0xff, 0xff]);
+        page.extend(60001u16.to_le_bytes());
+        page.extend(4u16.to_le_bytes());
+        page.extend(10u32.to_le_bytes());
+        page.extend(61101u16.to_le_bytes());
+        page.extend(b"1\0");
+        page.extend(60011u16.to_le_bytes());
+        page.extend(11011u16.to_le_bytes());
+        page.extend(0u16.to_le_bytes());
+        page.extend(b"en_US@MAIN CIRCUIT;\0");
+        page.extend([0xff, 0xff]);
+        std::fs::write(edb.join("page.eod"), &page).unwrap();
+        let fifo = tmp.path().join("plant.elk");
+        mkfifo(&fifo);
+        let writer = writer(&fifo, b"plant.edb\r\n12.0\r\n".to_vec());
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "eplan".as_ref(),
+            fifo.as_os_str(),
+        ])
+        .unwrap();
+        let (inputs, spool) = spooled(cli);
+        writer.join().unwrap().unwrap();
+        let spool = spool.unwrap();
+        assert!(inputs[0].starts_with(spool.path()), "{inputs:?}");
+        let (tables, warnings) = wc_import::run::eplan_tables(&inputs[0]).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(tables.get("page.eod"), Some(&page));
+        let project = wc_import::eplan::read(&tables).unwrap();
+        let pages: Vec<(&str, &str)> = project
+            .pages
+            .iter()
+            .map(|p| (p.name.as_str(), p.description.as_str()))
+            .collect();
+        assert_eq!(pages, [("1", "MAIN CIRCUIT")]);
+        // The original folder is linked, not copied or moved: it is still where it was.
+        drop(spool);
+        assert!(edb.join("page.eod").exists());
+    }
+
+    // Used by the stream tests, which run on Unix only.
+    #[cfg(unix)]
+    const ELEMENT: &str =
+        "<definition type=\"element\"><description><terminal x=\"0\" y=\"0\"/></description></definition>";
+
+    /// A FIFO whose id an earlier element has is not opened: the import refuses it for its
+    /// id, so a FIFO without a writer does not hold the command up. When the earlier file is
+    /// no element, the FIFO is read and imported.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_with_the_id_of_an_earlier_element_is_not_opened() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let (file, fifo) = (a.join("lamp.elmt"), b.join("lamp.elmt"));
+        mkfifo(&fifo);
+        let parse = |lib: &Path| {
+            Cli::try_parse_from([
+                "wiringcraft".as_ref(),
+                "import".as_ref(),
+                "symbol-qet".as_ref(),
+                file.as_os_str(),
+                fifo.as_os_str(),
+                "--lib".as_ref(),
+                lib.as_os_str(),
+            ])
+            .unwrap()
+        };
+        // No writer: a copy of the FIFO would never end.
+        std::fs::write(&file, ELEMENT).unwrap();
+        let lib = tmp.path().join("lib");
+        let (inputs, spool) = spooled(parse(&lib));
+        assert!(spool.is_none());
+        assert_eq!(inputs, [file.clone(), fifo.clone()]);
+        let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
+        assert_eq!((written, failed), (1, 1));
+
+        std::fs::write(&file, "no element").unwrap();
+        let lib = tmp.path().join("lib2");
+        let writer = writer(&fifo, ELEMENT.as_bytes().to_vec());
+        let (inputs, spool) = spooled(parse(&lib));
+        writer.join().unwrap().unwrap();
+        let spool = spool.unwrap();
+        assert!(inputs[1].starts_with(spool.path()), "{inputs:?}");
+        let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
+        assert_eq!((written, failed), (1, 1));
+        assert!(lib.join("symbols").join("qet.lamp.json").exists());
+    }
+
+    /// A stream that cannot be opened (a socket) is left to the import, which counts it as
+    /// failed and imports the elements before and after it.
+    #[cfg(unix)]
+    #[test]
+    fn a_stream_that_cannot_be_opened_fails_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (before, socket, after) = (
+            tmp.path().join("before.elmt"),
+            tmp.path().join("socket.elmt"),
+            tmp.path().join("after.elmt"),
+        );
+        std::fs::write(&before, ELEMENT).unwrap();
+        std::fs::write(&after, ELEMENT).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let lib = tmp.path().join("lib");
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "symbol-qet".as_ref(),
+            before.as_os_str(),
+            socket.as_os_str(),
+            after.as_os_str(),
+            "--lib".as_ref(),
+            lib.as_os_str(),
+        ])
+        .unwrap();
+        let (inputs, spool) = spooled(cli);
+        assert!(spool.is_none());
+        assert_eq!(inputs, [before, socket, after]);
+        let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
+        assert_eq!((written, failed), (2, 1));
+        assert!(lib.join("symbols").join("qet.before.json").exists());
+        assert!(lib.join("symbols").join("qet.after.json").exists());
+    }
+
+    /// A FIFO named twice is read once: its one writer writes one element, the first operand
+    /// gets the copy, and the second is left unread, as the importer refuses it for its id as
+    /// it does for a file.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_named_twice_is_copied_once() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("lamp.elmt");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let element =
+            "<definition type=\"element\"><description><terminal x=\"0\" y=\"0\"/></description></definition>";
+        let writer = {
+            let fifo = fifo.clone();
+            std::thread::spawn(move || {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&fifo)?
+                    .write_all(element.as_bytes())
+            })
+        };
+        let lib = tmp.path().join("lib");
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "symbol-qet".as_ref(),
+            fifo.as_os_str(),
+            fifo.as_os_str(),
+            "--lib".as_ref(),
+            lib.as_os_str(),
+        ])
+        .unwrap();
+        let (inputs, spool) = spooled(cli);
+        writer.join().unwrap().unwrap();
+        let spool = spool.unwrap();
+        assert_eq!(inputs.len(), 2);
+        assert!(inputs[0].starts_with(spool.path()), "{inputs:?}");
+        assert_eq!(inputs[0].file_name(), fifo.file_name());
+        assert_eq!(std::fs::read_to_string(&inputs[0]).unwrap(), element);
+        assert_eq!(inputs[1], fifo);
+        let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
+        assert_eq!((written, failed), (1, 1));
+        assert!(lib.join("symbols").join("qet.lamp.json").exists());
+    }
+
+    /// An element stream without an end is copied up to one byte over what the importer
+    /// reads, and refused by it as too large: that element fails, the command does not.
+    #[cfg(unix)]
+    #[test]
+    fn an_endless_element_stream_is_copied_up_to_the_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("lib");
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "symbol-qet".as_ref(),
+            "/dev/zero".as_ref(),
+            "--lib".as_ref(),
+            lib.as_os_str(),
+        ])
+        .unwrap();
+        let (inputs, spool) = spooled(cli);
+        assert!(spool.is_some());
+        let len = std::fs::metadata(&inputs[0]).unwrap().len();
+        assert_eq!(len, wc_import::qet::MAX_LEN as u64 + 1);
+        let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
+        assert_eq!((written, failed), (0, 1));
     }
 }

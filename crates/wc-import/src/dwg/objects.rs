@@ -1243,11 +1243,8 @@ fn mtext(o: &mut Object, e: &mut Codes) -> Result<()> {
     d.bd()?;
     d.bd()?;
     let value = o.text()?;
-    // Attachment 1..9 runs left, centre, right on each row.
-    let align = match attachment {
-        1..=9 => (attachment - 1) % 3,
-        _ => 0,
-    };
+    // Attachment 1..9 runs left, centre, right on each row; written as DXF code 71.
+    let attachment = if (1..=9).contains(&attachment) { attachment } else { 1 };
     let angle = if dx == 0.0 && dy == 0.0 {
         0.0
     } else {
@@ -1257,7 +1254,7 @@ fn mtext(o: &mut Object, e: &mut Codes) -> Result<()> {
         .f(20, y)
         .f(40, height)
         .f(50, angle)
-        .i(72, i64::from(align))
+        .i(71, i64::from(attachment))
         .f(230, z);
     e.s(1, value);
     Ok(())

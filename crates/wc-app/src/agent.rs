@@ -3948,17 +3948,40 @@ mod tests {
         }
     }
 
-    /// Frames until the running import is taken in (at most a few seconds).
+    /// How long [`wait_for_worker`] waits for work on a worker thread before it calls it a
+    /// hang. A git clone, an import or an assistant turn can take seconds on a loaded CI runner
+    /// (#672, #678), so only work that never ends reaches this bound.
+    const WORKER_HANG: std::time::Duration = std::time::Duration::from_secs(120);
+
+    /// Call `frame` every `every_ms` milliseconds until it says the worker's work is taken in;
+    /// fail (naming `what`) only when it is still going after [`WORKER_HANG`].
+    fn wait_for_worker(what: &str, every_ms: u64, mut frame: impl FnMut() -> bool) {
+        let start = std::time::Instant::now();
+        while !frame() {
+            assert!(start.elapsed() < WORKER_HANG, "{what} did not end in {WORKER_HANG:?}");
+            std::thread::sleep(std::time::Duration::from_millis(every_ms));
+        }
+    }
+
+    /// A worker that ends only after far more polls than the old fixed bounds (1000) allowed
+    /// is still waited for (#678).
+    #[test]
+    fn a_slow_worker_is_waited_for_past_the_old_poll_count() {
+        let mut polls = 0;
+        wait_for_worker("the slow worker", 0, || {
+            polls += 1;
+            polls == 5000
+        });
+        assert_eq!(polls, 5000);
+    }
+
+    /// Frames until the running import is taken in, however slow the runner.
     fn until_imported(a: &mut App) {
         let ctx = egui::Context::default();
-        for _ in 0..1000 {
+        wait_for_worker("the import", 5, || {
             a.poll_import(&ctx);
-            if a.importing.is_none() {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(a.importing.is_none(), "the import did not end");
+            a.importing.is_none()
+        });
     }
 
     #[test]
@@ -4288,17 +4311,13 @@ mod tests {
         until_imported(&mut a);
     }
 
-    /// Frames until the base project fetch is over (at most a few seconds).
+    /// Frames until the base project fetch is over, however slow the runner (#672).
     fn until_fetched(a: &mut App) {
         let ctx = egui::Context::default();
-        for _ in 0..500 {
+        wait_for_worker("the fetch", 10, || {
             a.poll_fetch(&ctx);
-            if a.fetch.is_none() {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(a.fetch.is_none(), "the fetch did not end");
+            a.fetch.is_none()
+        });
     }
 
     #[test]
@@ -4516,14 +4535,10 @@ mod tests {
         assert!(a.assistant.busy());
         until_fetched_once(&mut a);
         assert!(a.fetch.is_some());
-        for _ in 0..500 {
+        wait_for_worker("the assistant turn", 5, || {
             a.assistant_poll(&ctx);
-            if !a.assistant.busy() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(!a.assistant.busy());
+            !a.assistant.busy()
+        });
         // A symbol draft open: it is not dropped under the user.
         a.symbol_editor = Some(crate::symbol_editor::SymbolEditor::new(Vec::new()));
         until_fetched_once(&mut a);
@@ -4650,13 +4665,10 @@ mod tests {
         }
         let ctx = egui::Context::default();
         let drawn_twice = |a: &App| a.ed.live.iter().filter(|f| f.message.contains("-K1 is drawn")).count();
-        for _ in 0..200 {
+        wait_for_worker("the live check", 10, || {
             a.live_check(&ctx);
-            if drawn_twice(&a) > 0 {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+            drawn_twice(&a) > 0
+        });
         assert_eq!(drawn_twice(&a), 2, "{:?}", a.ed.live);
         // Opening the same unchanged project replaces the editor; the checker keeps its
         // findings for the same inputs, and they show again at once.
@@ -4670,13 +4682,10 @@ mod tests {
         a.prefs.live_check = true;
         // On again: the checker checks project A afresh and shows both findings, so the
         // switch below starts from a checker that holds A's findings.
-        for _ in 0..200 {
+        wait_for_worker("the live check", 10, || {
             a.live_check(&ctx);
-            if drawn_twice(&a) > 0 {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+            drawn_twice(&a) > 0
+        });
         assert_eq!(drawn_twice(&a), 2, "{:?}", a.ed.live);
         // Another project is opened: the first one's findings are not shown on it.
         let (_other, b) = crate::state::tests::project();
@@ -5285,6 +5294,38 @@ mod tests {
         assert!(o.project.pages[0].symbols.is_empty());
     }
 
+    /// The actions a single key press (with `modifiers` held) asks for in the editor.
+    fn shortcuts_for(a: &mut App, key: egui::Key, modifiers: egui::Modifiers) -> Vec<Action> {
+        let raw = egui::RawInput {
+            modifiers,
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..Default::default()
+        };
+        let mut got = Vec::new();
+        let _ = egui::Context::default().run(raw, |ctx| got = a.shortcuts(ctx));
+        got
+    }
+
+    /// Backspace deletes the selection like Delete, for keyboards without a Delete key (#686).
+    #[test]
+    fn backspace_deletes_the_selection_like_delete() {
+        let (_tmp, mut a) = app(vec![]);
+        for key in [egui::Key::Delete, egui::Key::Backspace] {
+            assert_eq!(
+                shortcuts_for(&mut a, key, egui::Modifiers::NONE),
+                vec![Action::Delete],
+                "{key:?}"
+            );
+        }
+        assert!(shortcuts_for(&mut a, egui::Key::Backspace, egui::Modifiers::COMMAND).is_empty());
+    }
+
     #[test]
     fn escape_after_leaving_the_black_box_tool_cancels_the_new_tool_s_drawing() {
         use wc_core::geom::Point;
@@ -5318,6 +5359,113 @@ mod tests {
         a.ed.shape_points = vec![Point::new(20.0, 20.0)];
         escape(&mut a);
         assert!(a.ed.shape_points.is_empty(), "the line's first point is dropped");
+    }
+
+    #[test]
+    fn ctrl_d_duplicates_the_selection_one_grid_step_away_as_one_undo_step() {
+        let (_tmp, mut a) = app(vec![]);
+        let ctx = egui::Context::default();
+        let ctrl_d = |a: &mut App| {
+            let raw = egui::RawInput {
+                modifiers: egui::Modifiers::COMMAND,
+                events: vec![egui::Event::Key {
+                    key: egui::Key::D,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                }],
+                ..Default::default()
+            };
+            let mut keys = Vec::new();
+            let _ = ctx.run(raw, |ctx| keys = a.shortcuts(ctx));
+            for k in keys {
+                a.run(k);
+            }
+        };
+        let o = a.open.as_mut().unwrap();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        let s1 = o.place(page, "wc.coil", Point::new(50.0, 50.0)).unwrap();
+        let s2 = o.place(page, "wc.coil", Point::new(90.0, 50.0)).unwrap();
+        let pin = |item: &str| Endpoint::Pin {
+            item: item.into(),
+            pin: "A2".into(),
+        };
+        o.add_wire(
+            page,
+            pin(&s1),
+            pin(&s2),
+            vec![Point::new(50.0, 70.0), Point::new(90.0, 70.0)],
+        );
+        a.ed.page = page;
+        let counts = |a: &App| {
+            let p = &a.open.as_ref().unwrap().project.pages[page];
+            (p.symbols.len(), p.wires.len())
+        };
+        let before = counts(&a);
+
+        // Nothing selected: nothing happens.
+        ctrl_d(&mut a);
+        assert_eq!(counts(&a), before);
+
+        a.ed.selection = a.open.as_ref().unwrap().select_all(page);
+        let undo_before = a.open.as_ref().unwrap().undo_mark();
+        ctrl_d(&mut a);
+        assert_eq!(counts(&a), (before.0 + 2, before.1 + 1), "both symbols and their wire");
+        assert_eq!(a.open.as_ref().unwrap().undo_mark(), undo_before + 1, "one undo step");
+        // The copies are selected, one grid step (2.5 mm) down and right of the originals.
+        let p = &a.open.as_ref().unwrap().project.pages[page];
+        let selected: Vec<&str> =
+            a.ed.selection
+                .iter()
+                .filter_map(|s| match s {
+                    Selection::Symbol(id) => Some(id.as_str()),
+                    _ => None,
+                })
+                .collect();
+        assert_eq!(selected.len(), 2);
+        assert!(!selected.contains(&s1.as_str()) && !selected.contains(&s2.as_str()));
+        let mut at: Vec<Point> = selected.iter().map(|id| p.symbol(id).unwrap().at).collect();
+        at.sort_by(|x, y| x.x.total_cmp(&y.x));
+        assert_eq!(at, [Point::new(52.5, 52.5), Point::new(92.5, 52.5)]);
+        assert!(a.ed.selection.iter().any(|s| matches!(s, Selection::Wire(_))));
+        assert!(a.clipboard.is_empty(), "the clipboard is left alone");
+
+        a.run(Action::Undo);
+        assert_eq!(counts(&a), before, "one Undo takes the copy back");
+    }
+
+    #[test]
+    fn duplicate_from_the_menu_or_assistant_does_nothing_while_the_symbol_editor_is_open() {
+        let (_tmp, mut a) = app(vec![]);
+        let o = a.open.as_mut().unwrap();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        o.place(page, "wc.coil", Point::new(50.0, 50.0)).unwrap();
+        a.ed.page = page;
+        a.ed.selection = a.open.as_ref().unwrap().select_all(page);
+        let selection = a.ed.selection.clone();
+        let before = a.open.as_ref().unwrap().project.pages[page].clone();
+        let undo_before = a.open.as_ref().unwrap().undo_mark();
+        a.symbol_editor = Some(crate::symbol_editor::SymbolEditor::new(Vec::new()));
+
+        a.run(Action::Duplicate);
+        assert_eq!(
+            a.open.as_ref().unwrap().project.pages[page],
+            before,
+            "the page is unchanged"
+        );
+        assert_eq!(a.open.as_ref().unwrap().undo_mark(), undo_before);
+        assert_eq!(a.ed.selection, selection);
+        assert!(a.ed.message.contains("symbol editor"), "{}", a.ed.message);
+
+        // With the editor closed, Duplicate works again.
+        a.symbol_editor = None;
+        a.run(Action::Duplicate);
+        assert_eq!(a.ed.message, "Duplicated 1 item.", "the refusal is not left behind");
+        assert_eq!(
+            a.open.as_ref().unwrap().project.pages[page].symbols.len(),
+            before.symbols.len() + 1
+        );
     }
 
     #[test]
@@ -9176,14 +9324,10 @@ mod tests {
         a.prefs.assistant.backend = wc_agent::Backend::ApiKey;
         a.assistant.input = "Put a coil and a lamp on page 2".into();
         a.assistant_send(&ctx);
-        for _ in 0..500 {
+        wait_for_worker("the assistant turn", 5, || {
             a.assistant_poll(&ctx);
-            if !a.assistant.session.busy() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(!a.assistant.session.busy());
+            !a.assistant.session.busy()
+        });
         assert_eq!(page2(&a).symbols.len(), 2);
         assert!(matches!(
             a.assistant.session.log.last(),
@@ -10090,5 +10234,39 @@ mod tests {
             open.project.meta.libraries, p.meta.libraries,
             "the base project's library sources, no starter library added"
         );
+    }
+
+    /// A single-key shortcut goes by the modifiers held at the key press, not those of the frame:
+    /// Ctrl+R with Ctrl let go before the frame runs is not R (#709).
+    #[test]
+    fn single_key_shortcuts_check_the_modifiers_of_the_press() {
+        let (_tmp, mut a) = app(vec![]);
+        a.ed.tool = crate::state::Tool::Polyline;
+        let mut press = |key, at_press: egui::Modifiers, in_frame: egui::Modifiers| {
+            let raw = egui::RawInput {
+                modifiers: in_frame,
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: at_press,
+                }],
+                ..Default::default()
+            };
+            a.ed.finish_shape = false;
+            let mut got = Vec::new();
+            let _ = egui::Context::default().run(raw, |ctx| got = a.shortcuts(ctx));
+            (got, a.ed.finish_shape)
+        };
+        let (none, ctrl) = (egui::Modifiers::NONE, egui::Modifiers::COMMAND);
+        // Ctrl+R still opens the reports (a Ctrl shortcut), but does not also rotate.
+        assert_eq!(press(egui::Key::R, ctrl, none), (vec![Action::Reports], false));
+        assert_eq!(press(egui::Key::Delete, ctrl, none), (vec![], false));
+        assert_eq!(press(egui::Key::Enter, ctrl, none), (vec![], false));
+        assert_eq!(press(egui::Key::R, none, none), (vec![Action::Rotate], false));
+        assert_eq!(press(egui::Key::Enter, none, none), (vec![], true));
+        // Ctrl pressed after the key, before the frame: the bare press still counts.
+        assert_eq!(press(egui::Key::R, none, ctrl).0, vec![Action::Rotate]);
     }
 }

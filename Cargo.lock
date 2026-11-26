@@ -3795,6 +3795,7 @@ dependencies = [
  "clap",
  "image",
  "rusqlite",
+ "rustix 1.1.6",
  "serde_json",
  "sevenz-rust2",
  "tempfile",
@@ -3840,6 +3841,7 @@ dependencies = [
  "thiserror 2.0.21",
  "wc-core",
  "wc-library",
+ "wc-pdf",
  "wc-report",
  "zip",
 ]

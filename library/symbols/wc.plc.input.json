@@ -1,5 +1,6 @@
 {
   "category": "plc",
+  "description": "Digital input channel of a PLC.",
   "graphics": [
     {
       "a": {
