@@ -550,28 +550,31 @@ pub fn library(ui: &mut egui::Ui, open: &Open, ed: &mut Editor, ps: &mut PanelSt
             .margin(egui::Margin::symmetric(8, 5)),
     );
     ui.add_space(2.0);
-    let q = ps.search.to_lowercase();
     egui::ScrollArea::vertical()
         .id_salt("library")
         .max_height(ui.available_height() * 0.45)
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
             let t = Theme::of(ui.ctx());
-            for (id, name) in &open.library {
-                if !q.is_empty() && !id.to_lowercase().contains(&q) && !name.to_lowercase().contains(&q) {
+            for entry in &open.library {
+                if !entry.matches(&ps.search) {
                     continue;
                 }
+                let (id, name) = (&entry.id, &entry.name);
                 let picked = ed.place_symbol.as_deref() == Some(id.as_str()) && ed.tool == Tool::Place;
                 let vendored = open.symbols.contains_key(id);
                 let text = RichText::new(name);
                 let lead = Lead::Dot(if vendored { t.accent } else { t.border });
-                let r = row(ui, picked, lead, if vendored { text } else { text.italics() }, false).on_hover_text(
-                    if vendored {
-                        format!("{id}\nIn this project")
-                    } else {
-                        format!("{id}\nFrom the library; copied into the project when placed")
-                    },
-                );
+                let whence = if vendored {
+                    "In this project"
+                } else {
+                    "From the library; copied into the project when placed"
+                };
+                let hover = match entry.description.trim() {
+                    "" => format!("{id}\n{whence}"),
+                    d => format!("{id}\n{d}\n{whence}"),
+                };
+                let r = row(ui, picked, lead, if vendored { text } else { text.italics() }, false).on_hover_text(hover);
                 if r.clicked() {
                     ed.place_symbol = Some(id.clone());
                     ed.tool = Tool::Place;
