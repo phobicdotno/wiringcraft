@@ -475,12 +475,47 @@ impl Unpinned {
     }
 }
 
-/// Whether the project's vendored copy of `kind` `id` reads.
-fn vendored_reads(project_dir: &Path, kind: ItemKind, id: &str) -> bool {
+/// Why the project's vendored copy of `kind` `id` does not read, if it does not.
+fn vendored_error(project_dir: &Path, kind: ItemKind, id: &str) -> Option<String> {
     match kind {
-        ItemKind::Symbol => store::read_vendored_symbol(project_dir, id).is_ok(),
-        ItemKind::Part => store::read_vendored_part(project_dir, id).is_ok(),
+        ItemKind::Symbol => store::read_vendored_symbol(project_dir, id).err(),
+        ItemKind::Part => store::read_vendored_part(project_dir, id).err(),
     }
+    .map(|e| e.to_string())
+}
+
+/// Write the vendored copy of pinned item `id` again from the library, at the pinned version
+/// (`pin`): the pinned source is searched first, then the others, and only a file that declares
+/// `id` and holds that version is taken. The lock entry is left as it is.
+fn restore_pinned(project_dir: &Path, lib: &Library, kind: ItemKind, id: &str, pin: &LockEntry) -> Result<()> {
+    let fits = |declared: &str, hash: String| -> std::result::Result<(), String> {
+        if declared != id {
+            return Err(format!("its file declares id {declared:?}"));
+        }
+        if hash != pin.hash {
+            return Err("it holds another version than the pinned one".into());
+        }
+        Ok(())
+    };
+    let not_found = |message: String| Error::Source {
+        name: pin.source.clone(),
+        message,
+    };
+    match kind {
+        ItemKind::Symbol => {
+            let s: Symbol = lib
+                .find_version(kind, id, &pin.source, |s: &Symbol| fits(&s.id, s.hash()))
+                .map_err(not_found)?;
+            store::write_vendored_symbol(project_dir, &s)?;
+        }
+        ItemKind::Part => {
+            let p: Part = lib
+                .find_version(kind, id, &pin.source, |p: &Part| fits(&p.id, p.hash()))
+                .map_err(not_found)?;
+            store::write_vendored_part(project_dir, &p)?;
+        }
+    }
+    Ok(())
 }
 
 /// Pin every used item that is not pinned yet, and write the vendored copy of a pinned item
@@ -502,40 +537,28 @@ fn lock_missing_then(
     let mut todo = Vec::new();
     let mut repair = Vec::new();
     for s in status(project_dir, project, lib) {
-        let broken = s.locked.is_some() && !vendored_reads(project_dir, s.kind, &s.id);
-        match s.state {
-            State::NotLocked => todo.push((s.kind, s.id)),
+        match (&s.state, s.locked) {
+            (State::NotLocked, _) => todo.push((s.kind, s.id)),
             // Used but not pinned, and its library file cannot be taken.
-            State::WrongId if s.locked.is_none() => left.wrong_id.push((s.kind, s.id, s.changes.join("; "))),
-            _ if !broken => {}
-            State::UpToDate => {
-                if let Some(l) = s.locked {
-                    repair.push((s.kind, s.id, l.hash));
+            (State::WrongId, None) => left.wrong_id.push((s.kind, s.id, s.changes.join("; "))),
+            (_, Some(pin)) => {
+                if let Some(why) = vendored_error(project_dir, s.kind, &s.id) {
+                    repair.push((s.kind, s.id, pin, why));
                 }
             }
-            State::Changed => {
-                let why = format!(
-                    "the library holds another version than the pinned one; take it with `wiringcraft lib update {}`",
-                    s.id
-                );
-                left.unrestorable.push((s.kind, s.id, why));
-            }
-            State::GoneFromLibrary => {
-                left.unrestorable
-                    .push((s.kind, s.id, "no library source holds it any more".into()));
-            }
-            State::WrongId => left.unrestorable.push((s.kind, s.id, s.changes.join("; "))),
+            (_, None) => {}
         }
     }
     after_scan();
-    for (kind, id, hash) in repair {
-        // Only the pinned version: the lock entry is written back as it was.
-        match fetch(lib, kind, &id, Some(&hash)) {
-            Ok(item) => {
-                store_item(project_dir, project, &id, item)?;
-                left.restored.push((kind, id));
+    for (kind, id, pin, broken) in repair {
+        match restore_pinned(project_dir, lib, kind, &id, &pin) {
+            Ok(()) => left.restored.push((kind, id)),
+            Err(e) => {
+                let why = format!(
+                    "{broken}; the pinned version is in no library source ({e}); put the file back from the project's history, or add a library source that holds the pinned version, and run `wiringcraft lib lock` again"
+                );
+                left.unrestorable.push((kind, id, why));
             }
-            Err(e) => left.unrestorable.push((kind, id, e.to_string())),
         }
     }
     for (kind, id) in todo {

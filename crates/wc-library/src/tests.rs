@@ -551,28 +551,61 @@ fn lock_restores_a_deleted_vendored_copy_at_the_pinned_version() -> Result<()> {
 }
 
 #[test]
+fn lock_restores_the_pinned_version_from_another_source_and_keeps_the_pin() -> Result<()> {
+    let mut f = fixture()?;
+    let lib = Library::open(&f.proj, &f.project)?;
+    lock_missing(&f.proj, &mut f.project, &lib)?;
+    let pinned = f.project.lock.get(ItemKind::Symbol, "coil").cloned();
+    let path = wc_core::store::vendor_path(&f.proj, ItemKind::Symbol, "coil")?;
+    std::fs::write(&path, "not json").map_err(|e| wc_core::Error::io("write", e))?;
+
+    // The pinned source moved on; another source holds the pinned version.
+    write_symbol(&f.company, &sym("coil", 12.5))?;
+    let personal = f.proj.join("../personal");
+    write_symbol(&personal, &sym("coil", 10.0))?;
+    let left = lock_missing(&f.proj, &mut f.project, &lib)?;
+    assert!(left.is_empty(), "{left:?}");
+    assert_eq!(left.restored, vec![(ItemKind::Symbol, "coil".to_string())]);
+    assert_eq!(
+        wc_core::store::read_vendored_symbol(&f.proj, "coil")?.pins[1].at.y,
+        10.0
+    );
+    assert_eq!(
+        f.project.lock.get(ItemKind::Symbol, "coil").cloned(),
+        pinned,
+        "the pin is unchanged"
+    );
+    Ok(())
+}
+
+#[test]
 fn lock_does_not_restore_another_version_or_an_item_gone_from_the_library() -> Result<()> {
     let mut f = fixture()?;
     let lib = Library::open(&f.proj, &f.project)?;
     lock_missing(&f.proj, &mut f.project, &lib)?;
+    let pinned = f.project.lock.get(ItemKind::Symbol, "coil").cloned();
     let path = wc_core::store::vendor_path(&f.proj, ItemKind::Symbol, "coil")?;
     std::fs::write(&path, "not json").map_err(|e| wc_core::Error::io("write", e))?;
 
-    // The library moved on: the pinned version cannot be written again from it.
+    // No source holds the pinned version any more: nothing is taken, and the reason and the
+    // way out are given.
     write_symbol(&f.company, &sym("coil", 12.5))?;
     let left = lock_missing(&f.proj, &mut f.project, &lib)?;
     assert!(left.restored.is_empty());
     assert_eq!(left.unrestorable.len(), 1, "{left:?}");
-    assert!(left.unrestorable[0].2.contains("lib update coil"), "{left:?}");
+    let why = &left.unrestorable[0].2;
+    assert!(why.contains("another version"), "{why}");
+    assert!(why.contains("project's history"), "{why}");
     assert!(
         wc_core::store::read_vendored_symbol(&f.proj, "coil").is_err(),
         "nothing taken"
     );
+    assert_eq!(f.project.lock.get(ItemKind::Symbol, "coil").cloned(), pinned);
 
     f.project.meta.libraries.clear();
     let lib = Library::open(&f.proj, &f.project)?;
     let left = lock_missing(&f.proj, &mut f.project, &lib)?;
     assert_eq!(left.unrestorable.len(), 1, "{left:?}");
-    assert!(left.unrestorable[0].2.contains("no library source"), "{left:?}");
+    assert!(left.unrestorable[0].2.contains("no library has it"), "{left:?}");
     Ok(())
 }
