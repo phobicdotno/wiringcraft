@@ -861,16 +861,8 @@ impl App {
     /// File > Import: pick the file (and, for parts, the library folder), then run the import
     /// the CLI runs and show what it said.
     fn import(&mut self, kind: imports::Kind, target: Option<import_symbols::ImportTarget>) {
-        if self.share.active() {
-            self.dialog = Some(Dialog::Message(
-                "Imports are not available in a shared session: leave the session, import, and share again.".to_owned(),
-            ));
-            return;
-        }
-        if self.assistant.command_running() {
-            self.dialog = Some(Dialog::Message(
-                "The assistant is running a command on the project; import when it is done.".to_owned(),
-            ));
+        if let Some(why) = self.import_refused() {
+            self.dialog = Some(Dialog::Message(why.to_owned()));
             return;
         }
         let Some(open) = self.open.as_ref() else { return };
@@ -908,6 +900,18 @@ impl App {
         self.import_from(kind, &file, lib.as_deref(), target);
     }
 
+    /// Why an import cannot run now: it writes to the project folder, which a shared session or
+    /// a running assistant command owns.
+    fn import_refused(&self) -> Option<&'static str> {
+        if self.share.active() {
+            Some("Imports are not available in a shared session: leave the session, import, and share again.")
+        } else if self.assistant.command_running() {
+            Some("The assistant is running a command on the project; import when it is done.")
+        } else {
+            None
+        }
+    }
+
     /// Run the import of `file` (parts into `lib`) and show what it said; `target` is the
     /// library folder chosen in the parts dialog, declared in the project when it is new.
     fn import_from(
@@ -917,6 +921,11 @@ impl App {
         lib: Option<&Path>,
         target: Option<import_symbols::ImportTarget>,
     ) {
+        // Checked again here: the typed path form stays open while a session or a command starts.
+        if let Some(why) = self.import_refused() {
+            self.dialog = Some(Dialog::Message(why.to_owned()));
+            return;
+        }
         let Some(open) = self.open.as_mut() else { return };
         let (done, msg) = imports::import(open, kind, file, lib, self.ed.page);
         // The project's own folder is listed first once parts are in it, as for symbols.
