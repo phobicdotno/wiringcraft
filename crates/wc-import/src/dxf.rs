@@ -460,16 +460,7 @@ fn shapes(
             "LWPOLYLINE" => {
                 // Vertices in order, each with the bulge (code 42) of the segment it starts: a
                 // bulged segment is an arc, sampled in the entity's own coordinates.
-                let mut vs: Vec<((f64, f64), f64)> = Vec::new();
-                for (code, v) in &e.codes {
-                    let n = v.trim().parse::<f64>().unwrap_or(f64::NAN);
-                    match (*code, vs.last_mut()) {
-                        (10, _) => vs.push(((n, f64::NAN), 0.0)),
-                        (20, Some(last)) => last.0.1 = n,
-                        (42, Some(last)) if n.is_finite() => last.1 = n,
-                        _ => {}
-                    }
-                }
+                let mut vs = vertices(e);
                 vs.retain(|((x, y), _)| x.is_finite() && y.is_finite());
                 let closed = (e.f(70) as i64) & 1 == 1;
                 let raw = if vs.iter().any(|(_, b)| b.abs() >= 1e-9) {
@@ -495,6 +486,54 @@ fn shapes(
                     _ => {
                         *skipped.entry(POLYLINE_NOT_NUMBERS.to_owned()).or_default() += 1;
                         None
+                    }
+                }
+            }
+            "LEADER" => {
+                // Vertices from the repeated 10/20 codes. A spline path (72 = 1) is drawn
+                // straight through the same vertices.
+                let all = vertices(e);
+                let vs: Vec<(f64, f64)> = all
+                    .iter()
+                    .map(|(p, _)| *p)
+                    .filter(|(x, y)| x.is_finite() && y.is_finite())
+                    .collect();
+                let pts: Vec<Point> = vs.iter().map(|&(x, y)| q(x, y)).collect();
+                if pts.len() < 2 || !pts.iter().all(|p| p.x.is_finite() && p.y.is_finite()) {
+                    *skipped.entry("LEADER".to_owned()).or_default() += 1;
+                    None
+                } else {
+                    // Drawn without its vertices that are not numbers: say how many.
+                    if all.len() > vs.len() {
+                        *skipped.entry(LEADER_BAD_VERTICES.to_owned()).or_default() += all.len() - vs.len();
+                    }
+                    out.push((
+                        layer.clone(),
+                        Shape::Polyline {
+                            points: pts,
+                            closed: false,
+                            filled: false,
+                        },
+                    ));
+                    // 71 = 1: a filled arrow head with its tip on the first vertex, pointing
+                    // along the first segment, AutoCAD's metric default size (2.5 long, 0.83
+                    // wide), made in the entity's own coordinates so a placement scales it.
+                    let (x0, y0) = vs[0];
+                    let next = vs.iter().find(|&&(x, y)| (x - x0).hypot(y - y0) > 1e-9);
+                    match next {
+                        Some(&(x1, y1)) if e.f(71) as i64 == 1 => {
+                            let len = (x1 - x0).hypot(y1 - y0);
+                            let (dx, dy) = ((x1 - x0) / len, (y1 - y0) / len);
+                            let (bx, by) = (x0 + 2.5 * dx, y0 + 2.5 * dy);
+                            let (hx, hy) = (-dy * 0.415, dx * 0.415);
+                            let head = vec![q(x0, y0), q(bx + hx, by + hy), q(bx - hx, by - hy)];
+                            if head.iter().all(|p| p.x.is_finite() && p.y.is_finite()) {
+                                polyline(head, true, true)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
                     }
                 }
             }
@@ -706,6 +745,22 @@ fn shapes(
     }
 }
 
+/// The vertices of an LWPOLYLINE or LEADER in order, from the repeated 10/20 codes, each with
+/// the bulge (code 42) of the segment it starts. A coordinate that is not a number is NaN.
+fn vertices(e: &Entity) -> Vec<((f64, f64), f64)> {
+    let mut vs: Vec<((f64, f64), f64)> = Vec::new();
+    for (code, v) in &e.codes {
+        let n = v.trim().parse::<f64>().unwrap_or(f64::NAN);
+        match (*code, vs.last_mut()) {
+            (10, _) => vs.push(((n, f64::NAN), 0.0)),
+            (20, Some(last)) => last.0.1 = n,
+            (42, Some(last)) if n.is_finite() => last.1 = n,
+            _ => {}
+        }
+    }
+    vs
+}
+
 /// A polyline of at least two points, or nothing.
 fn polyline(points: Vec<Point>, closed: bool, filled: bool) -> Option<Shape> {
     (points.len() >= 2).then_some(Shape::Polyline { points, closed, filled })
@@ -871,6 +926,9 @@ const SPLINE_TOO_FEW: &str = "SPLINE with too few points";
 /// The key under which circles and arcs of a stretched block are counted when their angles or
 /// their placed points are not numbers.
 const STRETCHED_NOT_NUMBERS: &str = "CIRCLE or ARC of a stretched block whose points are not numbers";
+
+/// The `skipped` key of the vertices left out of a drawn LEADER because they are not numbers.
+const LEADER_BAD_VERTICES: &str = "LEADER vertex that is not numbers";
 
 /// The key under which hatches with a boundary that is not all numbers are counted.
 /// The `skipped` key of a polyline whose points, or the arcs of its bulges, are not numbers once
@@ -1934,6 +1992,9 @@ pub(crate) fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> 
             } else if kind == POLYLINE_NOT_NUMBERS {
                 let s = if n == 1 { "" } else { "s" };
                 format!("{n} polyline{s} whose points are not numbers once placed, left out")
+            } else if kind == LEADER_BAD_VERTICES {
+                let (s, are) = if n == 1 { ("vertex", "is") } else { ("vertices", "are") };
+                format!("{n} LEADER {s} that {are} not numbers, left out of the line")
             } else if kind == HATCH_NOT_NUMBERS {
                 let s = if n == 1 { "" } else { "es" };
                 format!("{n} HATCH{s} with a boundary that is not numbers: that boundary left out")
@@ -2745,6 +2806,63 @@ mod tests {
         assert!(r.is_ok());
         // Truncated pair list and garbage numbers.
         let _ = symbol("0\nSECTION\n2\nENTITIES\n0\nLINE\n10\nNaN\n20", "x", "x");
+    }
+
+    #[test]
+    fn a_leader_is_drawn_with_its_arrow_head() -> Result<()> {
+        let leader = |arrow: u8| {
+            format!("0\nLEADER\n8\n0\n71\n{arrow}\n72\n0\n76\n3\n10\n0\n20\n0\n10\n10\n20\n0\n10\n10\n20\n10\n")
+        };
+        let near = |a: Point, x: f64, y: f64| (a.x - x).abs() < 1e-9 && (a.y - y).abs() < 1e-9;
+        for arrow in [0, 1] {
+            let d = parse(&dxf(&leader(arrow), ""))?;
+            let mut skipped = BTreeMap::new();
+            let mut budget = MAX_DRAWN;
+            let (shapes, _) = draw_mapped(&d, &d.entities, [1.0, 0.0, 0.0, 1.0], 0.0, &mut skipped, &mut budget);
+            assert!(skipped.is_empty(), "{skipped:?}");
+            assert_eq!(shapes.len(), 1 + arrow as usize, "{shapes:?}");
+            // The line through the vertices, y down on the page.
+            let Shape::Polyline { points, closed, filled } = &shapes[0].1 else {
+                unreachable!("the leader line is a polyline: {shapes:?}")
+            };
+            assert!(!*closed && !*filled);
+            assert_eq!(points.len(), 3);
+            assert!(near(points[0], 0.0, 0.0) && near(points[1], 10.0, 0.0) && near(points[2], 10.0, -10.0));
+            if arrow == 1 {
+                let Shape::Polyline { points, closed, filled } = &shapes[1].1 else {
+                    unreachable!("the arrow head is a polyline: {shapes:?}")
+                };
+                assert!(*closed && *filled);
+                // Tip on the first vertex, base 2.5 along the first segment, 0.83 wide.
+                assert!(near(points[0], 0.0, 0.0), "{points:?}");
+                assert!(
+                    near(points[1], 2.5, -0.415) && near(points[2], 2.5, 0.415),
+                    "{points:?}"
+                );
+            }
+            let (_, warnings) = footprint(&dxf(&leader(arrow), ""))?;
+            assert!(!warnings.iter().any(|w| w.contains("LEADER")), "{warnings:?}");
+        }
+        // A vertex that is not numbers is left out, the rest drawn, and the leader says so.
+        let (f, warnings) = footprint(&dxf(
+            "0\nLEADER\n71\n0\n76\n3\n10\n0\n20\n0\n10\nbad\n20\n5\n10\n10\n20\n10\n",
+            "",
+        ))?;
+        assert_eq!(f.shapes.len(), 1, "{:?}", f.shapes);
+        assert!((f.width - 10.0).abs() < 1e-9 && (f.height - 10.0).abs() < 1e-9);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("1 LEADER vertex that is not numbers")),
+            "{warnings:?}"
+        );
+        // One vertex draws nothing and is still said.
+        let (_, warnings) = footprint(&dxf(
+            "0\nLINE\n10\n0\n20\n0\n11\n5\n21\n5\n0\nLEADER\n71\n1\n76\n1\n10\n0\n20\n0\n",
+            "",
+        ))?;
+        assert!(warnings.iter().any(|w| w.contains("LEADER")), "{warnings:?}");
+        Ok(())
     }
 
     #[test]
