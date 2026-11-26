@@ -570,9 +570,10 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                 let filled = attr(&e, "fill").is_some_and(|f| {
                     f != "none" && f != "transparent" && f != "white" && f != "#fff" && f != "#ffffff"
                 });
-                if m.is_singular() && !(rx == ry && m.keeps_circles()) {
+                if m.is_singular() && pin_name.is_none() && !(rx == ry && m.keeps_circles()) {
                     // Squashed flat: SVG draws nothing, and an outline would only stretch
-                    // the symbol's bounds. (`scale(0)` still keeps the radius-0 dot it had.)
+                    // the symbol's bounds. (`scale(0)` still keeps the radius-0 dot it had,
+                    // and a pin keeps its place.)
                     None
                 } else if rx == ry && m.keeps_circles() {
                     Some(Shape::Circle {
@@ -879,6 +880,13 @@ mod tests {
                 "{t}: no outline, and the same bounds"
             );
         }
+        // A pin squashed flat still marks where the pin is.
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg">
+            <circle id="pin:1" cx="0" cy="0" r="0.5" transform="translate(3 4) scale(0 1)"/>
+            <line x1="0" y1="0" x2="4" y2="0"/>
+        </svg>"#;
+        let s = symbol(svg, "svg.flatpin", "Flat pin")?;
+        assert_eq!(s.pins.len(), 1, "{:?}", s.pins);
         // Very thin, but still invertible: drawn as a flat outline.
         let svg = r#"<svg xmlns="http://www.w3.org/2000/svg">
             <circle id="pin:1" cx="0" cy="0" r="0.5"/>
