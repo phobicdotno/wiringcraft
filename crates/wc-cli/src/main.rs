@@ -5264,7 +5264,8 @@ fn add_and_save_with(
 
 /// Every file a save of the project may write or remove, with its bytes before (`None` when it
 /// does not exist yet): the project's own files, every file in its page, panel and comment
-/// folders, and the files of the pages and panels about to be added. [`put_files_back`] restores
+/// folders, the black box symbol files its cleanup may remove, and the files of the pages and
+/// panels about to be added. [`put_files_back`] restores
 /// them when a save fails half way.
 fn snapshot_project(dir: &Path, new_pages: &[&str], new_panels: &[&str]) -> Res<Written> {
     // Every file the save may write or remove, read before anything is written: the project's
@@ -5298,6 +5299,9 @@ fn snapshot_project(dir: &Path, new_pages: &[&str], new_panels: &[&str]) -> Res<
             }
         }
     }
+    // The save ends by removing unused black box symbol files: one that fails half way through
+    // that cleanup must be able to put back the ones already gone (#606).
+    paths.extend(store::removable_box_symbol_files(dir).map_err(e)?);
     for id in new_pages {
         paths.push(dir.join(store::PAGES_DIR).join(format!("{id}{}", store::PAGE_SUFFIX)));
     }
@@ -9972,5 +9976,63 @@ mod tests {
             assert!(err.contains(word), "{err}");
             assert!(!bad.exists());
         }
+    }
+}
+
+#[cfg(test)]
+mod box_cleanup_rollback_tests {
+    use super::*;
+
+    /// A save that removes some unused black box symbol files and then fails: the rollback puts
+    /// the removed ones back (#606), and leaves links and other symbols alone.
+    #[test]
+    fn a_failed_save_puts_back_box_symbol_files_its_cleanup_removed() {
+        let Ok(tmp) = tempfile::tempdir() else {
+            unreachable!("no temporary folder")
+        };
+        let dir = tmp.path();
+        let p = Project::new("Cleanup");
+        if let Err(err) = store::save(dir, &p) {
+            unreachable!("{err}");
+        }
+        let folder = dir.join("vendor").join("symbols");
+        let Ok(()) = std::fs::create_dir_all(&folder) else {
+            unreachable!("no symbol folder")
+        };
+        for (name, body) in [
+            ("box.p1.s1.json", "one"),
+            ("box.p1.s2.json", "two"),
+            ("relay.json", "relay"),
+        ] {
+            let Ok(()) = std::fs::write(folder.join(name), body) else {
+                unreachable!("cannot write {name}")
+            };
+        }
+        #[cfg(unix)]
+        let Ok(()) = std::os::unix::fs::symlink("relay.json", folder.join("box.p1.s3.json")) else {
+            unreachable!("cannot make a link")
+        };
+        let Ok(before) = snapshot_project(dir, &[], &[]) else {
+            unreachable!("no snapshot")
+        };
+        let saved: Vec<&Path> = before.iter().map(|(path, _)| path.as_path()).collect();
+        let named = |name: &str| saved.iter().any(|p| p.file_name().is_some_and(|n| n == name));
+        assert!(named("box.p1.s1.json") && named("box.p1.s2.json"));
+        assert!(!named("relay.json") && !named("box.p1.s3.json"), "{saved:?}");
+        // The cleanup removed one file before it failed on the next.
+        let Ok(()) = std::fs::remove_file(folder.join("box.p1.s1.json")) else {
+            unreachable!("cannot remove")
+        };
+        assert_eq!(put_files_back(&before), Vec::<String>::new());
+        assert_eq!(
+            std::fs::read_to_string(folder.join("box.p1.s1.json")).ok().as_deref(),
+            Some("one")
+        );
+        assert_eq!(
+            std::fs::read_to_string(folder.join("box.p1.s2.json")).ok().as_deref(),
+            Some("two")
+        );
+        #[cfg(unix)]
+        assert!(std::fs::symlink_metadata(folder.join("box.p1.s3.json")).is_ok_and(|m| m.file_type().is_symlink()));
     }
 }
