@@ -373,14 +373,27 @@ fn convert(
                             .and_then(|f| f.first("size"))
                             .and_then(|s| s.num(1))
                             .unwrap_or(1.27);
-                        graphics.push(Shape::Text {
-                            at: pt(at.num(1).unwrap_or(0.0), at.num(2).unwrap_or(0.0)),
-                            text: t.to_owned(),
-                            height: height * scale,
-                            align,
-                            // KiCad stores tenths of a degree in old files and degrees now.
-                            angle: at.num(3).map(|a| if a > 360.0 { a / 10.0 } else { a }).unwrap_or(0.0),
-                        });
+                        let height = height * scale;
+                        // KiCad stores tenths of a degree in old files and degrees now.
+                        let angle = at.num(3).map(|a| if a > 360.0 { a / 10.0 } else { a }).unwrap_or(0.0);
+                        let first = pt(at.num(1).unwrap_or(0.0), at.num(2).unwrap_or(0.0));
+                        let (sin, cos) = angle.to_radians().sin_cos();
+                        // A text with line breaks becomes one text per line, each one line pitch
+                        // further down, square to the reading direction (y runs down here).
+                        for (k, line) in t.lines().enumerate() {
+                            let line: String = line.chars().filter(|c| !c.is_control()).collect();
+                            if line.trim().is_empty() {
+                                continue;
+                            }
+                            let step = 1.5 * height * k as f64;
+                            graphics.push(Shape::Text {
+                                at: Point::new(first.x + step * sin, first.y + step * cos),
+                                text: line,
+                                height,
+                                align,
+                                angle,
+                            });
+                        }
                     }
                 }
                 Some("pin") => {
@@ -807,6 +820,37 @@ mod tests {
             warnings.iter().any(|w| w.starts_with("Relay_A: its id k.relay_a")),
             "{warnings:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_text_with_line_breaks_becomes_one_text_per_line() -> Result<()> {
+        let lib = r#"(kicad_symbol_lib
+  (symbol "Psu"
+    (symbol "Psu_0_1"
+      (text "A\nB" (at 0 0 0) (effects (font (size 2 2))))
+      (text "C\n\nD" (at 0 0 90) (effects (font (size 2 2))))
+      (text "A	B" (at 9 9 0) (effects (font (size 2 2)))))
+    (symbol "Psu_1_1" (pin passive line (at 0 3 270) (length 1) (name "~") (number "1")))))"#;
+        let (syms, warnings) = symbols(lib, "k", 1.0)?;
+        let texts: Vec<(&str, Point)> = syms[0]
+            .symbol
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Text { text, at, .. } => Some((text.as_str(), *at)),
+                _ => None,
+            })
+            .collect();
+        let names: Vec<&str> = texts.iter().map(|t| t.0).collect();
+        // A real tab inside a string (KiCad does not escape it) is dropped, not printed as `?`.
+        assert_eq!(names, ["A", "B", "C", "D", "AB"], "{warnings:?}");
+        assert!(texts.iter().all(|t| !t.0.chars().any(char::is_control)));
+        // Horizontal text: the second line sits below the first (y runs down).
+        assert!(texts[1].1.y > texts[0].1.y && (texts[1].1.x - texts[0].1.x).abs() < 1e-9);
+        // Text reading bottom to top: its next line is to the right; the empty line keeps its gap.
+        assert!((texts[3].1.x - texts[2].1.x - 6.0).abs() < 1e-9, "{texts:?}");
+        assert!((texts[3].1.y - texts[2].1.y).abs() < 1e-9);
         Ok(())
     }
 
