@@ -497,6 +497,8 @@ impl chrome::Status for StatusView<'_> {
             Action::Redo if self.sharing => self.share_redo,
             Action::DeletePage => self.open.is_some_and(|o| o.project.pages.len() > 1),
             Action::ArrangePanel | Action::DeletePanel => has && self.ed.panel.is_some(),
+            // The panel view shows no schematic page for these to work on (#824).
+            Action::SelectAll | Action::Copy | Action::Cut | Action::Paste if self.ed.panel.is_some() => false,
             Action::PageUp => has && self.ed.page > 0,
             Action::PageDown => self.open.is_some_and(|o| self.ed.page + 1 < o.project.pages.len()),
             Action::Save => self.open.is_some_and(|o| o.dirty),
@@ -1612,6 +1614,13 @@ impl App {
             }
             Action::Rotate => open.rotate_many(page, &self.ed.selection),
             Action::Mirror => open.mirror_many(page, &self.ed.selection),
+            // From the keyboard too: the schematic page is hidden behind the panel (#824).
+            Action::SelectAll | Action::Copy | Action::Cut | Action::Paste if self.ed.panel.is_some() => {
+                self.ed.message = format!(
+                    "{} works on schematic pages: close the panel layout first.",
+                    a.info().label
+                );
+            }
             Action::SelectAll => {
                 self.ed.tool = Tool::Select;
                 self.ed.selection = self.prefs.layers.keep(open.select_all(page));
@@ -5815,9 +5824,10 @@ fn follow_panel_pick(ed: &mut Editor, project: &wc_core::Project, id: &str, tag:
 /// is shown; canvas actions only when the page itself is shown, as in the panel view they work
 /// on the panel.
 fn held_for(a: Action, ed: &Editor, project: &wc_core::Project) -> Option<String> {
-    // With a panel shown these still work on the schematic page under it (Delete and Rotate go
-    // to the panel's picked device instead), so they follow that page's hold.
-    let on_page_under_panel = ed.panel.is_some() && matches!(a, Action::Paste | Action::Cut | Action::Mirror);
+    // With a panel shown Mirror still works on the schematic page under it (Delete and Rotate go
+    // to the panel's picked device instead; Select all, Copy, Cut and Paste are off), so it
+    // follows that page's hold.
+    let on_page_under_panel = ed.panel.is_some() && matches!(a, Action::Mirror);
     let name = if a.edits_page_itself() || on_page_under_panel {
         let page = project.pages.get(ed.page)?;
         // Moving a page up or down renumbers its neighbour too.
@@ -6814,11 +6824,11 @@ mod held_tests {
         ed.held_by.insert("p1".into(), "Kim".into());
         // On the page itself, Rotate turns its symbols: held.
         assert_eq!(held_for(Action::Rotate, &ed, &project).as_deref(), Some("Kim"));
-        // With a panel shown, Rotate turns the picked panel device: not held; Paste still is.
+        // With a panel shown, Rotate turns the picked panel device: not held; Mirror still is.
         ed.panel = Some(0);
         ed.panel_pick = Some(0);
         assert_eq!(held_for(Action::Rotate, &ed, &project), None);
-        assert_eq!(held_for(Action::Paste, &ed, &project).as_deref(), Some("Kim"));
+        assert_eq!(held_for(Action::Mirror, &ed, &project).as_deref(), Some("Kim"));
     }
 
     #[test]
