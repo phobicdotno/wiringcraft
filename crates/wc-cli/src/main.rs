@@ -1105,7 +1105,8 @@ enum StripCmd {
         strip: Option<String>,
     },
     /// Put a strip's terminals in this rail order, e.g. `strip order -X1 3 1 2`. Terminals
-    /// left out follow at the end; no terminals goes back to the order by number.
+    /// left out follow at the end; no terminals goes back to the order by number. Every
+    /// terminal given must be on the strip, drawn or spare.
     Order {
         /// The strip, e.g. `-X1` (taken as a value, though it starts with `-`).
         #[arg(allow_hyphen_values = true)]
@@ -3637,6 +3638,19 @@ fn run(mut cli: Cli) -> Res<()> {
                 }
                 StripCmd::Order { strip, terminals } => {
                     let strip = DeviceTag::parse(&strip).map_err(e)?;
+                    // A strip or terminal the project does not have is refused, as `jumper add`
+                    // does; no terminals (back to the order by number) needs no check.
+                    if !terminals.is_empty() {
+                        let current = rail(&p, &strip);
+                        if current.is_empty() {
+                            return Err(no_strip(&strip, &unreadable));
+                        }
+                        for t in terminals.iter().map(|t| t.trim()) {
+                            if !current.iter().any(|(n, _)| n == t) {
+                                return Err(format!("{strip} has no terminal {}", escape_field(t)));
+                            }
+                        }
+                    }
                     if p.meta.set_terminal_order(&strip, &terminals)? {
                         save(dir, &p)?;
                     }
@@ -8649,6 +8663,25 @@ mod tests {
         let err = cli(&dir, &["jumper", "remove", "--", "-X1", "9"]).unwrap_err();
         assert!(err.contains("no jumper of -X1 has terminal 9"), "{err}");
         assert!(cli(&dir, &["jumper", "add", "--", "-X1", "1.2", "3.4"]).is_err());
+    }
+
+    #[test]
+    fn strip_order_refuses_a_strip_or_terminal_the_project_does_not_have() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let err = cli(&dir, &["strip", "order", "--", "-X1", "3", "1"]).unwrap_err();
+        assert_eq!(err, "no terminal strip -X1");
+        assert!(load(&dir).unwrap().meta.strips.is_empty(), "nothing saved");
+        draw_x1_terminals(&dir);
+        let err = cli(&dir, &["strip", "order", "--", "-X1", "3", "99"]).unwrap_err();
+        assert_eq!(err, "-X1 has no terminal 99");
+        assert!(load(&dir).unwrap().meta.strips.is_empty(), "nothing saved");
+        cli(&dir, &["strip", "order", "--", "-X1", "3", "1"]).unwrap();
+        assert_eq!(load(&dir).unwrap().meta.strips.len(), 1);
+        // No terminals still goes back to the order by number.
+        cli(&dir, &["strip", "order", "--", "-X1"]).unwrap();
+        assert!(load(&dir).unwrap().meta.strips.is_empty());
     }
 
     #[test]
