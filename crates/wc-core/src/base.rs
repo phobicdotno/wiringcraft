@@ -34,6 +34,15 @@ pub fn create_from(base: &Path, dir: &Path, name: &str, date: &str) -> Result<Pr
             base.display()
         )));
     }
+    // Its files may be half way through a box-edit: copied as they are, the new project would
+    // start with them mismatched and with the journal, which would put the base's values back.
+    if fs::symlink_metadata(base.join(store::BOX_EDIT_JOURNAL)).is_ok() {
+        return Err(Error::Invalid(format!(
+            "a box-edit run on the base project {} stopped half way ({} is there); run any wiringcraft command in that project to put it back first (and commit the result, for a repository)",
+            base.display(),
+            store::BOX_EDIT_JOURNAL
+        )));
+    }
     let base_full = fs::canonicalize(base).map_err(|e| Error::io(base, e))?;
     let target = resolved(dir)?;
     if target.starts_with(&base_full) {
@@ -352,6 +361,22 @@ mod tests {
         fs::write(dir.join("pictures/logo.png"), b"\x89PNG\r\n\x1a\nlogo").unwrap();
         fs::create_dir_all(dir.join(".git")).unwrap();
         fs::write(dir.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    }
+
+    /// A base project a box-edit run stopped half way in is refused: nothing is made.
+    #[test]
+    fn a_base_project_with_a_pending_box_edit_journal_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (b, new) = (tmp.path().join("base"), tmp.path().join("new"));
+        base(&b);
+        fs::write(b.join(store::BOX_EDIT_JOURNAL), b"journal").unwrap();
+        let Err(err) = create_from(&b, &new, "New", "2024-05-06") else {
+            unreachable!("a base with a pending journal is refused")
+        };
+        assert!(err.to_string().contains("stopped half way"), "{err}");
+        assert!(!new.exists());
+        fs::remove_file(b.join(store::BOX_EDIT_JOURNAL)).unwrap();
+        create_from(&b, &new, "New", "2024-05-06").unwrap();
     }
 
     #[test]

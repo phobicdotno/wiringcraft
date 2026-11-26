@@ -2101,7 +2101,8 @@ fn run(cli: Cli) -> Res<()> {
     if !matches!(cli.cmd, Cmd::New { .. } | Cmd::Inspect { .. })
         && let Some(note) = undo_stopped_box_edit(dir)?
     {
-        eprintln!("warning: {note}");
+        // A warning that cannot be shown does not stop the command.
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), format!("warning: {note}\n").as_bytes());
     }
     match cli.cmd {
         Cmd::New {
@@ -2118,15 +2119,8 @@ fn run(cli: Cli) -> Res<()> {
             });
             match template {
                 Some(t) => {
-                    // The template's files may be half way through a box-edit: copied as they
-                    // are, the new project would start with them mismatched (#653).
-                    let journal = Path::new(&t).join(BOX_EDIT_JOURNAL);
-                    if !wc_vcs::base::is_url(&t) && std::fs::symlink_metadata(&journal).is_ok() {
-                        return Err(format!(
-                            "{} is there: a box-edit run on the template stopped half way; run any wiringcraft command in the template (e.g. `wiringcraft -C <template> check`) to put it back first",
-                            escape_field(&journal.display().to_string())
-                        ));
-                    }
+                    // A template a box-edit run stopped half way in, local or cloned, is refused
+                    // by `create_from` (#653).
                     wc_vcs::base::create_from_base(&t, &new_dir, &name, &wc_core::base::today()).map_err(e)?;
                 }
                 None => {
@@ -4559,7 +4553,7 @@ const STOPPED: &str = "stopped between the writes";
 /// change had before (#653). It is removed once the last file is written; one left behind means
 /// a run stopped half way, and the next run puts the files back from it
 /// ([`undo_stopped_box_edit`]).
-const BOX_EDIT_JOURNAL: &str = ".box-edit.journal";
+use store::BOX_EDIT_JOURNAL;
 const JOURNAL_HEADER: &[u8] = b"wiringcraft box-edit journal 2\n";
 
 /// A journal written and held by this run. The file stays locked while the run writes, so
@@ -4599,7 +4593,8 @@ impl Journal {
         // Written beside it under a name of its own, locked, then moved into place: the journal
         // is either whole or not there.
         let mut part = path.as_os_str().to_owned();
-        part.push(format!(".{}", std::process::id()));
+        // Ending in `.tmp`, so a project's git ignore rule keeps one a stop left behind out.
+        part.push(format!(".{}.tmp", std::process::id()));
         let part = PathBuf::from(part);
         let fail = |x: std::io::Error| format!("{}: {x}", shown(&part));
         let mut options = std::fs::OpenOptions::new();
@@ -4616,8 +4611,12 @@ impl Journal {
             .and_then(|()| std::fs::rename(&part, &path).map_err(fail));
         if let Err(err) = written {
             drop(file);
-            let _ = std::fs::remove_file(&part);
-            return Err(err);
+            return Err(match std::fs::remove_file(&part) {
+                Err(x) if x.kind() != std::io::ErrorKind::NotFound => {
+                    format!("{err}; removing {} failed too: {x}", shown(&part))
+                }
+                _ => err,
+            });
         }
         // Without its folder entry on disk a power loss could lose the journal after the first
         // write: stop before writing anything.
@@ -4702,9 +4701,11 @@ fn journal_name_allowed(parts: &[&str]) -> bool {
             (store::COMMENTS_DIR, store::COMMENTS_SUFFIX),
         ]
         .iter()
-        .any(|(f, suffix)| folder == f && name.len() > suffix.len() && name.ends_with(suffix)),
+        // As the store and the snapshot take them: any name ending in the suffix, the suffix alone
+        // too (`comments/.comments.json`).
+        .any(|(f, suffix)| folder == f && name.ends_with(suffix)),
         [vendor, kind, name] => {
-            *vendor == store::VENDOR_DIR && *kind == ItemKind::Symbol.dir() && name.len() > 5 && name.ends_with(".json")
+            *vendor == store::VENDOR_DIR && *kind == ItemKind::Symbol.dir() && name.ends_with(".json")
         }
         _ => false,
     }
@@ -4820,8 +4821,13 @@ fn undo_stopped_box_edit(dir: &Path) -> Res<Option<String>> {
     // and another run may have put a journal of its own there since: only the file locked
     // here is one left behind.
     match std::fs::symlink_metadata(&path) {
-        Ok(now) if same_file(&now, &file) => {}
-        _ => return Ok(None),
+        Ok(now) => {
+            if !same_file(&now, &file).map_err(|x| format!("{shown}: {x}"))? {
+                return Ok(None);
+            }
+        }
+        Err(x) if x.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(x) => return Err(format!("{shown}: {x}")),
     }
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|x| format!("{shown}: {x}"))?;
@@ -4884,17 +4890,17 @@ fn sync_folders(files: &[(PathBuf, Option<Vec<u8>>)]) -> Res<()> {
 
 /// Whether the entry `at` names is the file `file` has open. Only Unix tells it (device and
 /// inode); elsewhere the entry being there has to do.
-fn same_file(at: &std::fs::Metadata, file: &std::fs::File) -> bool {
+fn same_file(at: &std::fs::Metadata, file: &std::fs::File) -> std::io::Result<bool> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        file.metadata()
-            .is_ok_and(|m| m.dev() == at.dev() && m.ino() == at.ino())
+        let m = file.metadata()?;
+        Ok(m.dev() == at.dev() && m.ino() == at.ino())
     }
     #[cfg(not(unix))]
     {
         let _ = (at, file);
-        true
+        Ok(true)
     }
 }
 
@@ -9534,6 +9540,34 @@ mod tests {
         assert_eq!(std::fs::read(&nested).unwrap(), b"nested");
     }
 
+    /// A comment file named by the suffix alone (an empty list) is one the store reads and a
+    /// save removes: box-edit journals it, and a stopped run's journal puts it back.
+    #[test]
+    fn a_comment_file_named_by_the_suffix_alone_is_journaled_and_put_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, _, _) = box_edit_project(tmp.path());
+        let comments = dir.join(store::COMMENTS_DIR);
+        std::fs::create_dir_all(&comments).unwrap();
+        let empty = comments.join(store::COMMENTS_SUFFIX);
+        std::fs::write(&empty, b"[]").unwrap();
+        let mut before = snapshot_project(&dir, &[], &[]).unwrap();
+        assert!(before.iter().any(|(path, _)| *path == empty));
+        let (symbol, symbol_bytes) = vendored_bytes(&dir, ItemKind::Symbol, "box.p1.s1").unwrap();
+        before.push((symbol, symbol_bytes));
+
+        STOP_BOX_EDIT_AFTER_SYMBOL.set(true);
+        let stopped = cli(&dir, &["box-edit", "p1", "s1", "--size", "30,10"]);
+        STOP_BOX_EDIT_AFTER_SYMBOL.set(false);
+        assert_eq!(stopped, Err(STOPPED.to_owned()));
+        std::fs::remove_file(&empty).unwrap();
+        cli(&dir, &["location", "list"]).unwrap();
+        assert_eq!(bytes_now(&before), before);
+        assert_eq!(std::fs::read(&empty).unwrap(), b"[]");
+
+        cli(&dir, &["box-edit", "p1", "s1", "--size", "30,10"]).unwrap();
+        assert!(!dir.join(BOX_EDIT_JOURNAL).exists());
+    }
+
     /// A command that does not use the `-C` project (`inspect`) leaves a journal there alone,
     /// and `new --template` refuses a template a box-edit run stopped half way in.
     #[test]
@@ -9637,9 +9671,11 @@ mod tests {
         let lock = dir.join(store::LOCK_FILE);
         let page = dir.join(store::PAGES_DIR).join(format!("p1{}", store::PAGE_SUFFIX));
         let journal_of = |name: &str| {
+            // The unsafe file first: put back last of all, so a replay begun before every
+            // target is checked would already have changed `library.lock`.
             let mut b = JOURNAL_HEADER.to_vec();
-            b.extend_from_slice(b"12 2\nlibrary.lockhi");
-            b.extend_from_slice(format!("{} 2\n{name}hiend 2\n", name.len()).as_bytes());
+            b.extend_from_slice(format!("{} 2\n{name}hi", name.len()).as_bytes());
+            b.extend_from_slice(b"12 2\nlibrary.lockhiend 2\n");
             b
         };
         let page_name = format!("{}/p1{}", store::PAGES_DIR, store::PAGE_SUFFIX);
