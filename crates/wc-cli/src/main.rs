@@ -1345,6 +1345,12 @@ enum ImportCmd {
         /// Letter code for new devices, e.g. `K`.
         #[arg(long, default_value = "")]
         letter_code: String,
+        /// The operands (by index in `files`) that [`spool_inputs`] left unopened because an
+        /// earlier element has their id, each with that earlier file. Not an option: the
+        /// import refuses these without a second look, so a FIFO it skipped is never opened
+        /// while the project lock is held (#700).
+        #[arg(skip)]
+        duplicates: Vec<(usize, PathBuf)>,
     },
     /// Parts from a CSV or semicolon-separated export, or straight from an Excel workbook
     /// (`.xlsx`, its first visible sheet), with the same column names either way.
@@ -1872,6 +1878,8 @@ fn spool_inputs_within(cmd: &mut Cmd, limits: SpoolLimits) -> Res<Option<tempfil
     };
     // The elements before this one, as `import symbol-qet` will read them, each with its id.
     let mut earlier: Vec<(String, PathBuf)> = Vec::new();
+    // The element streams left unopened for their id, each with the earlier file that has it.
+    let mut duplicates: Vec<(usize, PathBuf)> = Vec::new();
     let mut spool = None;
     // A stream can be read once: an input named again gets the copy made the first time.
     let mut copied: Vec<(PathBuf, PathBuf)> = Vec::new();
@@ -1885,11 +1893,13 @@ fn spool_inputs_within(cmd: &mut Cmd, limits: SpoolLimits) -> Res<Option<tempfil
         // An element whose id an earlier one has is refused without being opened: it is not
         // opened here either, where a FIFO without a writer would hold the command up. The
         // earlier one has the id when it can be read as an element, as the import decides.
+        // The import is told, so it does not decide again from a second read (#700).
         if let (Some(id), Some((_, scale))) = (&id, &qet)
-            && earlier
+            && let Some((_, file)) = earlier
                 .iter()
-                .any(|(other, file)| other == id && qet_element(file, id, *scale).is_ok())
+                .find(|(other, file)| other == id && qet_element(file, id, *scale).is_ok())
         {
+            duplicates.push((n, file.clone()));
             continue;
         }
         let same = std::fs::canonicalize(&*path).unwrap_or_else(|_| path.clone());
@@ -1955,6 +1965,12 @@ fn spool_inputs_within(cmd: &mut Cmd, limits: SpoolLimits) -> Res<Option<tempfil
         }
         earlier.extend(id.map(|id| (id, copy.clone())));
         *path = copy;
+    }
+    if let Cmd::Import(ImportCmd::SymbolQet {
+        duplicates: skipped, ..
+    }) = cmd
+    {
+        *skipped = duplicates;
     }
     Ok(spool)
 }
@@ -4046,8 +4062,9 @@ fn import_cmd(dir: &Path, ic: ImportCmd, input: Option<Vec<u8>>) -> Res<()> {
             scale,
             category,
             letter_code,
+            duplicates,
         } => {
-            let (written, failed) = import_qet(&files, &lib, &prefix, scale, &category, &letter_code)?;
+            let (written, failed) = import_qet(&files, &duplicates, &lib, &prefix, scale, &category, &letter_code)?;
             if failed > 0 {
                 return Err(format!(
                     "{failed} of {} element(s) could not be imported",
@@ -5210,8 +5227,12 @@ fn qet_element(file: &Path, id: &str, scale: f64) -> Res<(wc_import::qet::Import
         .and_then(|text| wc_import::qet::element(&text, id, scale).map_err(e))
 }
 
+/// Import every element in `files` into `lib`. The operands in `duplicates` (by index, each
+/// with the earlier file that has its id) were found to be duplicates before the project lock:
+/// they are refused for their id without being opened, whatever the earlier file reads as now.
 fn import_qet(
     files: &[PathBuf],
+    duplicates: &[(usize, PathBuf)],
     lib: &Path,
     prefix: &str,
     scale: f64,
@@ -5221,9 +5242,14 @@ fn import_qet(
     let (mut written, mut failed) = (0, 0);
     // Two files whose names give the same id would overwrite each other: the later one fails.
     let mut ids: std::collections::BTreeMap<String, PathBuf> = Default::default();
-    for file in files {
+    for (n, file) in files.iter().enumerate() {
         let id = qet_id(file, prefix);
-        let read = match ids.get(&id) {
+        let first = duplicates
+            .iter()
+            .find(|(at, _)| *at == n)
+            .map(|(_, first)| first)
+            .or_else(|| ids.get(&id));
+        let read = match first {
             Some(first) => Err(format!("gives the same id {id} as {}, skipped", first.display())),
             None => qet_element(file, &id, scale),
         };
@@ -9484,7 +9510,7 @@ mod tests {
         let huge = tmp.path().join("huge.elmt");
         std::fs::write(&huge, vec![b' '; wc_import::qet::MAX_LEN + 10]).unwrap();
         let lib = tmp.path().join("lib");
-        let (written, failed) = import_qet(&[good, bad, same, huge], &lib, "qet.", 0.5, "Lamps", "P").unwrap();
+        let (written, failed) = import_qet(&[good, bad, same, huge], &[], &lib, "qet.", 0.5, "Lamps", "P").unwrap();
         assert_eq!((written, failed), (1, 3));
         let json = std::fs::read_to_string(lib.join("symbols").join("qet.lamp_red.json")).unwrap();
         let s: wc_core::Symbol = serde_json::from_str(&json).unwrap();
@@ -10456,7 +10482,7 @@ mod input_tests {
             assert_eq!(input.file_name(), operand.file_name());
             assert_eq!(std::fs::read_to_string(input).unwrap(), element);
         }
-        let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
+        let (written, failed) = import_qet(&inputs, &[], &lib, "qet.", 0.5, "", "").unwrap();
         assert_eq!((written, failed), (2, 0));
         assert!(lib.join("symbols").join("qet.first.json").exists());
         assert!(lib.join("symbols").join("qet.second.json").exists());
@@ -10549,7 +10575,7 @@ mod input_tests {
         let (inputs, spool) = spooled(parse(&lib));
         assert!(spool.is_none());
         assert_eq!(inputs, [file.clone(), fifo.clone()]);
-        let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
+        let (written, failed) = import_qet(&inputs, &[], &lib, "qet.", 0.5, "", "").unwrap();
         assert_eq!((written, failed), (1, 1));
 
         std::fs::write(&file, "no element").unwrap();
@@ -10559,9 +10585,52 @@ mod input_tests {
         writer.join().unwrap().unwrap();
         let spool = spool.unwrap();
         assert!(inputs[1].starts_with(spool.path()), "{inputs:?}");
-        let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
+        let (written, failed) = import_qet(&inputs, &[], &lib, "qet.", 0.5, "", "").unwrap();
         assert_eq!((written, failed), (1, 1));
         assert!(lib.join("symbols").join("qet.lamp.json").exists());
+    }
+
+    /// A FIFO left unopened as a duplicate before the lock stays unopened in the import, even
+    /// when the earlier file no longer reads as an element by then: both fail, and the import
+    /// ends although the FIFO has no writer (#700).
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_skipped_as_a_duplicate_is_not_opened_when_the_earlier_file_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let (file, fifo) = (a.join("lamp.elmt"), b.join("lamp.elmt"));
+        mkfifo(&fifo);
+        std::fs::write(&file, ELEMENT).unwrap();
+        let lib = tmp.path().join("lib");
+        let mut cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "symbol-qet".as_ref(),
+            file.as_os_str(),
+            fifo.as_os_str(),
+            "--lib".as_ref(),
+            lib.as_os_str(),
+        ])
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let changed = file.clone();
+        std::thread::spawn(move || {
+            let spool = spool_inputs(&mut cli.cmd);
+            // Another process changes the earlier file between preparation and import.
+            std::fs::write(&changed, "no element").unwrap();
+            let Cmd::Import(ImportCmd::SymbolQet { files, duplicates, .. }) = cli.cmd else {
+                unreachable!()
+            };
+            let done = import_qet(&files, &duplicates, &lib, "qet.", 0.5, "", "");
+            let _ = tx.send((spool.map(|s| s.is_none()), files, duplicates, done));
+        });
+        let (nothing_copied, files, duplicates, done) = rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap();
+        assert_eq!(nothing_copied, Ok(true));
+        assert_eq!(files, [file.clone(), fifo]);
+        assert_eq!(duplicates, [(1, file)]);
+        assert_eq!(done, Ok((0, 2)));
     }
 
     /// A stream that cannot be opened (a socket) is left to the import, which counts it as
@@ -10593,7 +10662,7 @@ mod input_tests {
         let (inputs, spool) = spooled(cli);
         assert!(spool.is_none());
         assert_eq!(inputs, [before, socket, after]);
-        let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
+        let (written, failed) = import_qet(&inputs, &[], &lib, "qet.", 0.5, "", "").unwrap();
         assert_eq!((written, failed), (2, 1));
         assert!(lib.join("symbols").join("qet.before.json").exists());
         assert!(lib.join("symbols").join("qet.after.json").exists());
@@ -10645,7 +10714,7 @@ mod input_tests {
         assert_eq!(inputs[0].file_name(), fifo.file_name());
         assert_eq!(std::fs::read_to_string(&inputs[0]).unwrap(), element);
         assert_eq!(inputs[1], fifo);
-        let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
+        let (written, failed) = import_qet(&inputs, &[], &lib, "qet.", 0.5, "", "").unwrap();
         assert_eq!((written, failed), (1, 1));
         assert!(lib.join("symbols").join("qet.lamp.json").exists());
     }
@@ -10670,7 +10739,7 @@ mod input_tests {
         assert!(spool.is_some());
         let len = std::fs::metadata(&inputs[0]).unwrap().len();
         assert_eq!(len, wc_import::qet::MAX_LEN as u64 + 1);
-        let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
+        let (written, failed) = import_qet(&inputs, &[], &lib, "qet.", 0.5, "", "").unwrap();
         assert_eq!((written, failed), (0, 1));
     }
 }
