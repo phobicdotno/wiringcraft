@@ -131,6 +131,143 @@ pub fn turned_off(off: &[String], source: &str, n: usize, rule: &CheckRule) -> b
 /// The kinds of rule there are, as written in `kind`.
 pub const KINDS: [&str; 3] = ["cable", "tag", "max-wires"];
 
+/// The roles a rule can name, as written in `role`.
+pub const ROLES: [&str; 5] = ["main", "auxiliary", "standalone", "terminal", "interruption"];
+/// The severities a rule can have, as written in `severity`.
+pub const SEVERITIES: [&str; 3] = ["error", "warning", "note"];
+
+/// Rule `n` (from 1, for the error) as the check runs it, or why the check would report it
+/// instead of running it: a kind it knows (any case, kept lower case), a pattern for a `tag`
+/// rule, a maximum for a `max-wires` rule, a known role and severity (any case). Values only
+/// another kind uses are dropped and empty values are left out. Keys the rule does not know
+/// are kept; [`check_rule`] refuses them.
+pub fn checked(rule: &CheckRule, n: usize) -> Result<CheckRule, String> {
+    let set = |v: &Option<String>| v.as_deref().map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned);
+    let kind = rule.kind.trim().to_ascii_lowercase();
+    let kind = kind.as_str();
+    if !KINDS.contains(&kind) {
+        return Err(format!("Rule {n}: pick a kind ({}).", KINDS.join(", ")));
+    }
+    // Only a max-wires rule uses a maximum.
+    let max = rule.max.filter(|_| kind == "max-wires");
+    if kind == "max-wires" && max.is_none() {
+        return Err(format!("Rule {n}: say how many wires a pin may have at most."));
+    }
+    let pattern = set(&rule.pattern);
+    if kind == "tag" && pattern.is_none() {
+        return Err(format!("Rule {n}: a tag rule needs the pattern every tag must match."));
+    }
+    // The check runs no rule with another role or severity (it reports it instead).
+    let known = |v: &Option<String>, of: &[&str]| {
+        v.as_deref()
+            .is_none_or(|v| of.contains(&v.to_ascii_lowercase().as_str()))
+    };
+    let (role, severity) = (set(&rule.role), set(&rule.severity));
+    if !known(&role, &ROLES) {
+        return Err(format!("Rule {n}: pick a role ({}), or none.", ROLES.join(", ")));
+    }
+    if !known(&severity, &SEVERITIES) {
+        return Err(format!("Rule {n}: pick a severity ({}).", SEVERITIES.join(", ")));
+    }
+    Ok(CheckRule {
+        name: rule.name.clone(),
+        kind: kind.to_owned(),
+        devices: set(&rule.devices),
+        role,
+        // Only a tag rule uses a pattern.
+        pattern: if kind == "tag" { pattern } else { None },
+        max,
+        severity,
+        message: set(&rule.message),
+        unknown: rule.unknown.clone(),
+    })
+}
+
+/// A rule written new (from a file or a tool) as [`checked`] keeps it, refusing keys a rule
+/// does not know: the check would only report them.
+pub fn check_rule(rule: &CheckRule, n: usize) -> Result<CheckRule, String> {
+    if !rule.unknown.is_empty() {
+        let keys: Vec<&str> = rule.unknown.keys().map(String::as_str).collect();
+        return Err(format!(
+            "Rule {n}: no such key {} (a rule has kind, devices, role, pattern, max, severity, message and name).",
+            keys.join(", ")
+        ));
+    }
+    checked(rule, n)
+}
+
+/// The one library rule `which` names (`source:number` or `source:name`, as [`turned_off`]
+/// reads it): its source, its number and the rule. `Ok(None)` when it names none (no such
+/// source, number or name). An error when the source's rules cannot be read (with why), or
+/// when it could stand for two rules (a rule named "2" and rule 2, or two rules of one name),
+/// since an entry in `rules_off` would turn off all of them.
+pub fn library_rule<'a>(sets: &'a [RuleSet], which: &str) -> Result<Option<(&'a str, usize, &'a CheckRule)>, String> {
+    let which = which.trim();
+    let Some((src, sel)) = which.split_once(':') else {
+        return Ok(None);
+    };
+    let Some(set) = sets.iter().find(|set| set.source == src.trim()) else {
+        return Ok(None);
+    };
+    let rules = set
+        .rules
+        .as_ref()
+        .map_err(|why| format!("The rules of library {} cannot be read: {why}", set.source))?;
+    let one = [which.to_owned()];
+    let hits: Vec<(usize, &CheckRule)> = rules
+        .iter()
+        .enumerate()
+        .map(|(k, r)| (k + 1, r))
+        .filter(|&(n, r)| turned_off(&one, &set.source, n, r))
+        .collect();
+    if let [_, _, ..] = hits.as_slice() {
+        let list: Vec<String> = hits.iter().map(|(n, _)| format!("{}:{n}", set.source)).collect();
+        return Err(format!(
+            "{which:?} could be rule {} of library {}: {:?} is a number and a rule's name too, or two rules share it. An entry in rules_off turns off all of them; name the rule another way (by its number).",
+            list.join(" or "),
+            set.source,
+            sel.trim()
+        ));
+    }
+    Ok(hits.first().map(|&(n, r)| (set.source.as_str(), n, r)))
+}
+
+/// `off` (a project's [`ProjectMeta::rules_off`]) with the library rule `which` turned off
+/// (`turn_off`) or back on: `Ok(None)` when it is that way already. Turning a rule off adds
+/// `which` as written; turning it on drops every entry that turns it off, by number or by
+/// name. An entry naming no rule (a source since removed) can still be dropped.
+///
+/// [`ProjectMeta::rules_off`]: crate::project::ProjectMeta::rules_off
+pub fn turn_rule(off: &[String], sets: &[RuleSet], which: &str, turn_off: bool) -> Result<Option<Vec<String>>, String> {
+    let which = which.trim();
+    // A source whose rules cannot be read: turning one of its rules off is refused with why,
+    // but an entry for it can still be dropped as written.
+    let unreadable = which
+        .split_once(':')
+        .is_some_and(|(src, _)| sets.iter().any(|set| set.source == src.trim() && set.rules.is_err()));
+    let found = match library_rule(sets, which) {
+        Err(_) if !turn_off && unreadable => None,
+        found => found?,
+    };
+    let mut now = off.to_vec();
+    match (turn_off, found) {
+        (true, None) => {
+            return Err(format!(
+                "No library check rule {which:?}: write source:number or source:name."
+            ));
+        }
+        (true, Some((src, n, r))) => {
+            if turned_off(&now, src, n, r) {
+                return Ok(None);
+            }
+            now.push(which.to_owned());
+        }
+        (false, Some((src, n, r))) => now.retain(|o| !turned_off(std::slice::from_ref(o), src, n, r)),
+        (false, None) => now.retain(|o| o.trim() != which),
+    }
+    Ok(Some(now).filter(|now| now != off))
+}
+
 impl CheckRule {
     /// The role named in `role`: `Ok(None)` when none is named, `Err` with the text when it is
     /// not a role.
@@ -362,5 +499,121 @@ severty = "error"
         assert!(saved.contains("severty = \"error\""), "{saved}");
         let again: ProjectMeta = toml::from_str(&saved).unwrap();
         assert_eq!(again.rules, meta.rules);
+    }
+
+    #[test]
+    fn a_rule_is_kept_as_the_check_runs_it_or_refused_with_why() {
+        let rule = |kind: &str| CheckRule {
+            kind: kind.into(),
+            ..CheckRule::default()
+        };
+        let cable = checked(
+            &CheckRule {
+                role: Some(" Terminal ".into()),
+                pattern: Some("-X#".into()),
+                max: Some(3),
+                message: Some("  ".into()),
+                ..rule(" CABLE ")
+            },
+            1,
+        )
+        .unwrap();
+        // Lower case kind, trimmed values, and values only another kind uses dropped.
+        assert_eq!(cable.kind, "cable");
+        assert_eq!(cable.role.as_deref(), Some("Terminal"));
+        assert_eq!((cable.pattern, cable.max, cable.message), (None, None, None));
+        assert!(
+            checked(&rule("wires"), 4)
+                .unwrap_err()
+                .starts_with("Rule 4: pick a kind")
+        );
+        assert!(checked(&rule("tag"), 1).unwrap_err().contains("needs the pattern"));
+        assert!(checked(&rule("max-wires"), 1).unwrap_err().contains("at most"));
+        let bad_severity = CheckRule {
+            severity: Some("fatal".into()),
+            ..rule("cable")
+        };
+        assert!(
+            checked(&bad_severity, 2)
+                .unwrap_err()
+                .starts_with("Rule 2: pick a severity")
+        );
+        // Unknown keys: kept by `checked` (a loaded rule saves them back), refused for a new one.
+        let mut misspelt = rule("cable");
+        misspelt
+            .unknown
+            .insert("severty".into(), toml::Value::String("error".into()));
+        assert_eq!(checked(&misspelt, 1).unwrap().unknown.len(), 1);
+        assert!(
+            check_rule(&misspelt, 3)
+                .unwrap_err()
+                .starts_with("Rule 3: no such key severty")
+        );
+    }
+
+    #[test]
+    fn a_library_rule_is_turned_off_and_on_by_number_or_name() {
+        let named = |name: &str| CheckRule {
+            name: Some(name.into()),
+            kind: "cable".into(),
+            ..CheckRule::default()
+        };
+        let sets = [
+            RuleSet {
+                source: "house".into(),
+                rules: Ok(vec![named("motors"), named("2"), named("dup"), named("dup")]),
+            },
+            RuleSet {
+                source: "broken".into(),
+                rules: Err("bad toml".into()),
+            },
+        ];
+        let off = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            library_rule(&sets, " house:motors ").unwrap().map(|(s, n, _)| (s, n)),
+            Some(("house", 1))
+        );
+        assert_eq!(library_rule(&sets, "house:9").unwrap(), None);
+        assert!(library_rule(&sets, "broken:1").unwrap_err().contains("bad toml"));
+        assert!(
+            turn_rule(&[], &sets, "broken:1", true)
+                .unwrap_err()
+                .contains("bad toml")
+        );
+        assert_eq!(
+            turn_rule(&off(&["broken:1"]), &sets, "broken:1", false).unwrap(),
+            Some(vec![])
+        );
+        assert_eq!(library_rule(&sets, "motors").unwrap(), None);
+        // Rule 2 by number and rule 2 named "2" are one rule; two of one name are not.
+        assert!(library_rule(&sets, "house:2").unwrap().is_some());
+        assert!(
+            library_rule(&sets, "house:dup")
+                .unwrap_err()
+                .contains("house:3 or house:4")
+        );
+
+        assert_eq!(turn_rule(&[], &sets, "house:1", true).unwrap(), Some(off(&["house:1"])));
+        assert_eq!(
+            turn_rule(&off(&["house:motors"]), &sets, "house:1", true).unwrap(),
+            None
+        );
+        assert!(turn_rule(&[], &sets, "house:9", true).is_err());
+        // On again drops every entry that turns it off, by number or name.
+        assert_eq!(
+            turn_rule(
+                &off(&["house:1", "house:motors", "house:2"]),
+                &sets,
+                "house:motors",
+                false
+            )
+            .unwrap(),
+            Some(off(&["house:2"]))
+        );
+        assert_eq!(turn_rule(&off(&["house:2"]), &sets, "house:1", false).unwrap(), None);
+        assert_eq!(
+            turn_rule(&off(&["gone:4"]), &sets, "gone:4", false).unwrap(),
+            Some(vec![])
+        );
     }
 }

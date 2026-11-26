@@ -176,6 +176,11 @@ enum Cmd {
     /// The project logo, shown on the cover page and in every title block.
     #[command(subcommand)]
     Logo(LogoCmd),
+    /// The check rules `check` runs: the project's own `[[rule]]` tables in `project.toml`,
+    /// and the house rules in each library source's `rules.toml`, which the project can turn
+    /// off one by one (`rules_off`).
+    #[command(subcommand)]
+    Rules(RulesCmd),
     /// Macros: saved groups of symbols, wires and drawings in the project's `macros` folder or a
     /// library source's. A macro can hold placeholders (`{{name}}` in its device texts, wire
     /// values and drawn texts) and named value sets that fill them, one per variant.
@@ -534,6 +539,39 @@ enum LogoCmd {
     },
     /// Take the logo off the cover page and the title blocks; its file stays in the project.
     Remove,
+}
+
+#[derive(Subcommand)]
+enum RulesCmd {
+    /// List the project's own rules (by number), then each library source's rules
+    /// (`source:number`, on or off), one per line: the rule, whether it runs, and its kind and
+    /// values. Entries of `rules_off` that name no rule are listed last.
+    List {
+        /// Print everything as JSON instead: `rules`, `library` and `rules_off`.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Replace the project's own rules with the ones in a file, in order: `[[rule]]` tables
+    /// (TOML, as in `project.toml`), or with a `.json` name a list of rules (or `{"rules":
+    /// [...]}`). `-` reads TOML from stdin. A rule has `kind` (cable, tag, max-wires) and
+    /// optionally `devices`, `role`, `pattern`, `max`, `severity`, `message` and `name`; a rule
+    /// the check could not run is refused and nothing is changed. An empty file removes them
+    /// all.
+    Set {
+        /// The rules file: TOML, or JSON with a `.json` name; `-` reads TOML from stdin.
+        file: PathBuf,
+    },
+    /// Turn a library rule off for this project, by `source:number` or `source:name`.
+    Off {
+        /// The library rule, as `source:number` or `source:name`.
+        rule: String,
+    },
+    /// Turn a library rule back on, by `source:number` or `source:name`: every `rules_off`
+    /// entry that turns it off is removed.
+    On {
+        /// The library rule, as `source:number` or `source:name`.
+        rule: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1344,6 +1382,178 @@ fn translated(dir: &Path, p: &Project, lang: &str) -> Res<(Project, Vec<wc_core:
     Ok(translate(p, &dict, &langs))
 }
 
+/// One check rule on a line: its kind, then each value it sets as `key=value` (keys it does
+/// not know too, so a misspelt one shows).
+fn rule_line(r: &wc_core::check_rule::CheckRule) -> String {
+    let mut line = if r.kind.trim().is_empty() {
+        "(no kind)".to_owned()
+    } else {
+        r.kind.clone()
+    };
+    let max = r.max.map(|m| m.to_string());
+    let values = [
+        ("name", r.name.as_ref()),
+        ("devices", r.devices.as_ref()),
+        ("role", r.role.as_ref()),
+        ("pattern", r.pattern.as_ref()),
+        ("max", max.as_ref()),
+        ("severity", r.severity.as_ref()),
+        ("message", r.message.as_ref()),
+    ];
+    for (key, v) in values {
+        if let Some(v) = v {
+            line.push_str(&format!(" {key}={v}"));
+        }
+    }
+    for (key, v) in &r.unknown {
+        line.push_str(&format!(" {key}={v}"));
+    }
+    escape_field(&line)
+}
+
+/// The `rules list` output: the project's rules, each library source's rules with whether the
+/// project turns them off, and `rules_off` entries that name no rule; or all of it as JSON.
+fn rules_list(p: &Project, library: &[wc_core::check_rule::RuleSet], json: bool) -> Res<String> {
+    use wc_core::check_rule::turned_off;
+    let off = &p.meta.rules_off;
+    // An entry turns something off when it names a rule of a source that can be read.
+    let names_a_rule = |o: &String| {
+        library.iter().any(|set| {
+            set.rules.as_ref().is_ok_and(|rules| {
+                rules
+                    .iter()
+                    .enumerate()
+                    .any(|(k, r)| turned_off(std::slice::from_ref(o), &set.source, k + 1, r))
+            })
+        })
+    };
+    if json {
+        let sources: Vec<serde_json::Value> = library
+            .iter()
+            .map(|set| match &set.rules {
+                Ok(rules) => {
+                    let rules: Vec<serde_json::Value> = rules
+                        .iter()
+                        .enumerate()
+                        .map(|(k, r)| {
+                            serde_json::json!({
+                                "rule": format!("{}:{}", set.source, k + 1),
+                                "off": turned_off(off, &set.source, k + 1, r),
+                                "is": r,
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({"source": set.source, "rules": rules})
+                }
+                Err(why) => serde_json::json!({"source": set.source, "error": why}),
+            })
+            .collect();
+        let all = serde_json::json!({"rules": p.meta.rules, "library": sources, "rules_off": off});
+        return serde_json::to_string_pretty(&all).map(|t| t + "\n").map_err(e);
+    }
+    let mut out = String::new();
+    for (k, r) in p.meta.rules.iter().enumerate() {
+        out.push_str(&format!("{}\ton\t{}\n", k + 1, rule_line(r)));
+    }
+    for set in library {
+        match &set.rules {
+            Ok(rules) => {
+                for (k, r) in rules.iter().enumerate() {
+                    let state = if turned_off(off, &set.source, k + 1, r) {
+                        "off"
+                    } else {
+                        "on"
+                    };
+                    out.push_str(&format!(
+                        "{}:{}\t{state}\t{}\n",
+                        escape_field(&set.source),
+                        k + 1,
+                        rule_line(r)
+                    ));
+                }
+            }
+            Err(why) => out.push_str(&format!(
+                "{}\terror\t{}\n",
+                escape_field(&set.source),
+                escape_field(&format!("{}: {why}", wc_core::check_rule::LIBRARY_RULES_FILE))
+            )),
+        }
+    }
+    for o in off.iter().filter(|o| !names_a_rule(o)) {
+        out.push_str(&format!("{}\toff\tnames no library rule\n", escape_field(o)));
+    }
+    Ok(out)
+}
+
+/// The rules in `file` for `rules set`, in order, each as the check runs it: `[[rule]]`
+/// tables, or a JSON list (or `{"rules": [...]}`) for a `.json` name; `-` is TOML on stdin.
+fn rules_from_file(file: &Path) -> Res<Vec<wc_core::check_rule::CheckRule>> {
+    use wc_core::check_rule::{CheckRule, check_rule, parse_rules};
+    let text = if file.as_os_str() == "-" {
+        std::io::read_to_string(std::io::stdin()).map_err(|err| format!("stdin: {err}"))?
+    } else {
+        std::fs::read_to_string(file).map_err(|err| format!("{}: {err}", file.display()))?
+    };
+    let json = file.extension().is_some_and(|x| x.eq_ignore_ascii_case("json"));
+    let rules: Vec<CheckRule> = if json {
+        let value: serde_json::Value =
+            serde_json::from_str(&text).map_err(|err| format!("{}: {err}", file.display()))?;
+        let list = match value {
+            serde_json::Value::Array(l) => l,
+            serde_json::Value::Object(mut o) if o.len() == 1 && o.get("rules").is_some_and(|r| r.is_array()) => {
+                match o.remove("rules") {
+                    Some(serde_json::Value::Array(l)) => l,
+                    _ => Vec::new(),
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "{}: not a list of rules or {{\"rules\": [...]}}",
+                    file.display()
+                ));
+            }
+        };
+        list.into_iter()
+            .enumerate()
+            .map(|(k, r)| serde_json::from_value(r).map_err(|err| format!("Rule {}: {err}.", k + 1)))
+            .collect::<Res<_>>()?
+    } else {
+        // Only `[[rule]]` tables: a misspelt `[[rules]]` would otherwise read as no rules and
+        // remove the project's.
+        let table: toml::Table = text
+            .parse()
+            .map_err(|err: toml::de::Error| format!("{}: {}", file.display(), err.message()))?;
+        if let Some(key) = table.keys().find(|k| *k != "rule") {
+            return Err(format!(
+                "{}: {key:?} is not a rule table: write [[rule]] tables",
+                file.display()
+            ));
+        }
+        parse_rules(&text).map_err(|why| format!("{}: {why}", file.display()))?
+    };
+    rules.iter().enumerate().map(|(k, r)| check_rule(r, k + 1)).collect()
+}
+
+/// `rules off` / `rules on`: turn the library rule `which` off or back on in `rules_off`.
+fn turn_library_rule(
+    dir: &Path,
+    p: &mut Project,
+    library: &[wc_core::check_rule::RuleSet],
+    which: &str,
+    off: bool,
+) -> Res<()> {
+    let state = if off { "off" } else { "on" };
+    match wc_core::check_rule::turn_rule(&p.meta.rules_off, library, which, off)? {
+        None => println!("{} is {state} already", which.trim()),
+        Some(now) => {
+            p.meta.rules_off = now;
+            save(dir, p)?;
+            println!("{} is {state}", which.trim());
+        }
+    }
+    Ok(())
+}
+
 /// The `find` output: one hit per line, the page number (`-` for a device not drawn), the
 /// kind and the value, separated by tabs.
 fn find_lines(p: &Project, hits: &[wc_core::find::Hit]) -> String {
@@ -1991,6 +2201,24 @@ fn run(cli: Cli) -> Res<()> {
                         save(dir, &p)?;
                     }
                 }
+            }
+        }
+        Cmd::Rules(rc) => {
+            let mut p = load(dir)?;
+            let library = wc_library::library_rules(dir, &p);
+            match rc {
+                RulesCmd::List { json } => print!("{}", rules_list(&p, &library, json)?),
+                RulesCmd::Set { file } => {
+                    let rules = rules_from_file(&file)?;
+                    let n = rules.len();
+                    if rules != p.meta.rules {
+                        p.meta.rules = rules;
+                        save(dir, &p)?;
+                    }
+                    println!("{n} check rules");
+                }
+                RulesCmd::Off { rule } => turn_library_rule(dir, &mut p, &library, &rule, true)?,
+                RulesCmd::On { rule } => turn_library_rule(dir, &mut p, &library, &rule, false)?,
             }
         }
         Cmd::Revision(rc) => {
