@@ -676,6 +676,31 @@ fn the_starter_current_transformer_has_primary_and_secondary_terminals() -> Resu
 }
 
 #[test]
+fn the_starter_functional_earth_is_not_the_protective_earth() -> Result<()> {
+    // #897: a plain (functional) earth for signal grounds, 0 V and screens.
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
+    project.meta.libraries = vec![LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: starter.to_string_lossy().into(),
+        reference: None,
+    }];
+    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (fe, _) = lib.symbol("wc.fe")?;
+    let (pe, _) = lib.symbol("wc.pe")?;
+    assert_eq!(fe.id, "wc.fe");
+    assert_eq!(fe.category, "power");
+    assert_eq!(fe.role, SymbolRole::Standalone);
+    let names: Vec<_> = fe.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["FE"]);
+    assert!(!fe.description.is_empty());
+    assert_ne!(fe.description, pe.description);
+    Ok(())
+}
+
+#[test]
 fn lock_restores_a_deleted_vendored_copy_at_the_pinned_version() -> Result<()> {
     let mut f = fixture()?;
     let lib = Library::open(&f.proj, &f.project)?;
@@ -799,5 +824,27 @@ fn the_starter_ammeter_and_voltmeter_are_measuring_instruments() -> Result<()> {
         let names: Vec<_> = m.pins.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["1", "2"], "{id}");
     }
+    Ok(())
+}
+
+#[test]
+fn the_starter_battery_has_plus_and_minus_pins() -> Result<()> {
+    // #764: a battery or cell for backup supplies and buffered 24 V DC circuits.
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
+    project.meta.libraries = vec![LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: starter.to_string_lossy().into(),
+        reference: None,
+    }];
+    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (b, _) = lib.symbol("wc.battery")?;
+    assert_eq!(b.role, SymbolRole::Standalone);
+    assert_eq!(b.letter_code, "G");
+    assert_eq!(b.category, "power");
+    let names: Vec<_> = b.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["+", "-"]);
     Ok(())
 }

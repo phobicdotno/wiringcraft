@@ -932,6 +932,58 @@ fn a_jpeg_cut_short_after_its_header_is_a_warning_for_the_logo_and_an_underlay()
     assert!(report.warnings.iter().all(|w| w.contains("damaged")));
 }
 
+/// A minimal JPEG: SOI, an optional APP14 `Adobe` segment, a baseline frame header 300 wide
+/// and 200 high with `channels` components, a scan header, one scan byte and EOI.
+fn tiny_jpeg(channels: u8, adobe: bool) -> Vec<u8> {
+    let mut b = vec![0xFF, 0xD8];
+    if adobe {
+        // APP14: "Adobe", version 100, flags0, flags1, transform 0 (no colour transform).
+        b.extend([0xFF, 0xEE, 0x00, 0x0E]);
+        b.extend(b"Adobe");
+        b.extend([0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    }
+    // SOF0: precision 8, height 200, width 300, then one 3-byte entry per component.
+    let sof_len = 8 + 3 * u16::from(channels);
+    b.extend([0xFF, 0xC0]);
+    b.extend(sof_len.to_be_bytes());
+    b.extend([0x08, 0x00, 0xC8, 0x01, 0x2C, channels]);
+    for c in 1..=channels {
+        b.extend([c, 0x11, 0x00]);
+    }
+    // SOS with one component, then a scan byte and EOI.
+    b.extend([
+        0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00, 0x00, 0xFF, 0xD9,
+    ]);
+    b
+}
+
+#[test]
+fn jpeg_pictures_get_the_colour_space_of_their_channel_count() {
+    for (channels, adobe, space, extra) in [
+        (1, false, "DeviceGray", ""),
+        (3, false, "DeviceRGB", ""),
+        (4, false, "DeviceCMYK", ""),
+        (4, true, "DeviceCMYK", " /Decode [1 0 1 0 1 0 1 0]"),
+        // The Adobe segment only inverts CMYK.
+        (3, true, "DeviceRGB", ""),
+    ] {
+        let bytes = tiny_jpeg(channels, adobe);
+        let Ok(img) = picture::decode(&bytes) else {
+            unreachable!("{channels} channels, adobe {adobe}: not decoded");
+        };
+        assert_eq!((img.width, img.height), (300, 200), "{channels} channels");
+        assert_eq!(img.colour_space, space, "{channels} channels, adobe {adobe}");
+        assert_eq!(img.extra, extra, "{channels} channels, adobe {adobe}");
+        assert_eq!(img.filter, "DCTDecode");
+        assert_eq!(img.data, bytes, "a JPEG is embedded as it is");
+        assert!(img.alpha.is_none());
+    }
+    let Err(why) = picture::decode(&tiny_jpeg(2, false)) else {
+        unreachable!("a 2-channel JPEG was accepted");
+    };
+    assert!(why.contains("2 colour channels"), "{why}");
+}
+
 #[test]
 #[allow(clippy::unwrap_used)]
 fn pictures_that_cannot_be_read_say_why_and_links_out_of_the_project_are_refused() {
