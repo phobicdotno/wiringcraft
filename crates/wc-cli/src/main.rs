@@ -1672,7 +1672,13 @@ fn run(cli: Cli) -> Res<()> {
                         .ok_or_else(|| format!("{r:?}: expected OLD=NEW, e.g. OUT=Q"))?,
                 );
             }
-            pairs.extend(rename_pairs.chunks_exact(2).map(|c| (c[0].as_str(), c[1].as_str())));
+            pairs.extend(
+                rename_pairs
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|[a, b]| (a.as_str(), b.as_str())),
+            );
             for (from, to) in pairs {
                 if renamed.insert(from.trim().to_owned(), to.trim().to_owned()).is_some() {
                     return Err(format!(
