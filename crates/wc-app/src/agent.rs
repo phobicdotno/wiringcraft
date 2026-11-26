@@ -2253,6 +2253,11 @@ impl App {
                 };
                 let width = num(v, "width").unwrap_or(w);
                 let height = num(v, "height").unwrap_or(h);
+                if !(width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0) {
+                    return Err(format!(
+                        "A black box needs a width and height above zero, not {width} by {height}."
+                    ));
+                }
                 let renamed: BTreeMap<String, String> = match v.get("rename") {
                     None | Some(Value::Null) => BTreeMap::new(),
                     Some(Value::Object(m)) => m
@@ -2266,6 +2271,11 @@ impl App {
                 };
                 if let Some(from) = renamed.keys().find(|f| !old.iter().any(|p| &p.name == *f)) {
                     return Err(format!("The box has no connection point {from} to rename."));
+                }
+                // Two points renamed to one name would join their wires into one connection.
+                let mut targets = std::collections::BTreeSet::new();
+                if let Some(to) = renamed.values().find(|to| !targets.insert(to.as_str())) {
+                    return Err(format!("Two connection points are renamed to {to}."));
                 }
                 // Left out, the points stay (renamed as asked), kept on their edges.
                 let pins = pins.unwrap_or_else(|| {
@@ -6394,6 +6404,27 @@ mod tests {
             json!({"action": "edit", "page": "2", "id": id, "pins": [{"name": "IN", "side": "top", "offset": 99}]});
         assert!(call(&mut a, "black_box", off).is_err());
         assert_eq!(layout(&a).2.len(), 3);
+        // A size without area is refused before the points are fitted to it (#581), and two
+        // points renamed to one name would join their wires: refused too.
+        for size in [json!({"width": -1}), json!({"height": -5}), json!({"width": 0})] {
+            let mut args = json!({"action": "edit", "page": "2", "id": id});
+            args.as_object_mut().unwrap().extend(size.as_object().unwrap().clone());
+            assert!(call(&mut a, "black_box", args).is_err());
+        }
+        let merge = json!({"action": "edit", "page": "2", "id": id, "rename": {"IN": "Z", "Q": "Z"}});
+        assert!(call(&mut a, "black_box", merge).unwrap_err().contains("renamed to Z"));
+        assert_eq!(layout(&a).0, 10.0);
+        let names: Vec<String> = layout(&a).2.into_iter().map(|p| p.name).collect();
+        assert_eq!(names, ["IN", "Q", "A"]);
+        // A swap is still fine.
+        call(
+            &mut a,
+            "black_box",
+            json!({"action": "edit", "page": "2", "id": id, "rename": {"IN": "Q", "Q": "IN"}}),
+        )
+        .unwrap();
+        let names: Vec<String> = layout(&a).2.into_iter().map(|p| p.name).collect();
+        assert_eq!(names, ["Q", "IN", "A"]);
         let coil = a
             .open
             .as_mut()
