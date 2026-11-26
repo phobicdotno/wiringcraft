@@ -107,6 +107,8 @@ impl Kind {
 pub enum Opt {
     /// Millimetres per drawing unit (`--scale`).
     Scale,
+    /// The number of the first new page (`--first-page`).
+    FirstPage,
 }
 
 impl Kind {
@@ -114,6 +116,7 @@ impl Kind {
     pub fn options(self) -> &'static [Opt] {
         match self {
             Kind::PageDwg | Kind::PageDxf => &[Opt::Scale],
+            Kind::Eplan | Kind::Swe | Kind::Aml | Kind::Pdf | Kind::Archive => &[Opt::FirstPage],
             _ => &[],
         }
     }
@@ -124,11 +127,21 @@ impl Kind {
 pub struct Options {
     /// A drawing's coordinates are multiplied by this to get mm.
     pub scale: f64,
+    /// The number of the first new page. None: the command line's default for the format, or
+    /// the number after the project's highest page when that is higher ([`first_free_page`]).
+    pub first_page: Option<usize>,
+    /// SolidWorks Electrical: keep the source's page numbers (the command line without
+    /// `--first-page`) instead of numbering from `first_page`.
+    pub keep_numbers: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { scale: 1.0 }
+        Self {
+            scale: 1.0,
+            first_page: None,
+            keep_numbers: false,
+        }
     }
 }
 
@@ -137,14 +150,22 @@ impl Default for Options {
 pub struct Form {
     pub kind: Kind,
     pub scale: String,
+    /// The first page number: the command line's default, or the next free one after it.
+    pub first_page: String,
+    /// SolidWorks Electrical: the source's page numbers are kept and `first_page` is not used.
+    pub keep_numbers: bool,
 }
 
 impl Form {
     /// The form for importing `file` as `kind` into `open`, with the defaults filled in.
-    pub fn new(_open: &Open, kind: Kind, _file: &Path) -> Self {
+    pub fn new(open: &Open, kind: Kind, _file: &Path) -> Self {
         Self {
             kind,
             scale: "1".to_owned(),
+            first_page: first_free_page(open, kind.first_page())
+                .map(|n| n.to_string())
+                .unwrap_or_default(),
+            keep_numbers: false,
         }
     }
 
@@ -166,6 +187,17 @@ impl Form {
                 .ok()
                 .filter(|s| s.is_finite() && *s > 0.0)
                 .ok_or_else(|| "The scale must be a number above 0, for example 1 or 0.1.".to_owned())?;
+        }
+        if self.has(Opt::FirstPage) {
+            o.keep_numbers = self.kind == Kind::Swe && self.keep_numbers;
+            if !o.keep_numbers {
+                let n = self
+                    .first_page
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| "The first page number must be a whole number, for example 100.".to_owned())?;
+                o.first_page = Some(n);
+            }
         }
         Ok(o)
     }
@@ -307,10 +339,11 @@ fn project_work(open: &Open, kind: Kind, f: PathBuf, page: usize, options: &Opti
     let dir = open.dir.clone();
     let scale = options.scale;
     // Only for the imports that add pages, numbered from a free number.
-    let first = || {
-        first_free_page(open, kind.first_page()).ok_or_else(|| {
+    let first = || match options.first_page {
+        Some(n) => Ok(n),
+        None => first_free_page(open, kind.first_page()).ok_or_else(|| {
             "no page number is free after the project's highest one; renumber that page first".to_owned()
-        })
+        }),
     };
     Ok(match kind {
         Kind::Eplan => {
@@ -318,8 +351,8 @@ fn project_work(open: &Open, kind: Kind, f: PathBuf, page: usize, options: &Opti
             Box::new(move |log| run::eplan(&dir, &f, n, log))
         }
         Kind::Swe => {
-            let n = first()?;
-            Box::new(move |log| run::swe(&dir, &f, 1, Some(n), None, log))
+            let n = if options.keep_numbers { None } else { Some(first()?) };
+            Box::new(move |log| run::swe(&dir, &f, 1, n, None, log))
         }
         Kind::SweLibrary => Box::new(move |log| run::swe_library(&dir, &f, None, log)),
         Kind::Aml => {
@@ -651,6 +684,37 @@ pub(crate) mod tests {
             assert!(form.has(Opt::Scale), "{kind:?}");
             assert_eq!(form.options(), Ok(Options::default()), "{kind:?}");
         }
+        // The command line's default first page, or the next free number after it.
+        for (kind, default) in [
+            (Kind::Eplan, 400),
+            (Kind::Swe, 100),
+            (Kind::Aml, 100),
+            (Kind::Pdf, 200),
+            (Kind::Archive, 300),
+        ] {
+            let form = Form::new(&open, kind, &file);
+            assert!(form.has(Opt::FirstPage) && !form.has(Opt::Scale), "{kind:?}");
+            assert_eq!(form.first_page, default.to_string(), "{kind:?}");
+            assert_eq!(form.options().map(|o| o.first_page), Ok(Some(default)), "{kind:?}");
+        }
+        for bad in ["", "abc", "-3", "1.5"] {
+            let form = Form {
+                first_page: bad.to_owned(),
+                ..Form::new(&open, Kind::Pdf, &file)
+            };
+            assert!(form.options().is_err(), "{bad:?}");
+        }
+        // Keeping the source's numbers is the SolidWorks import's alone, and needs no number.
+        let keep = |kind| Form {
+            first_page: String::new(),
+            keep_numbers: true,
+            ..Form::new(&open, kind, &file)
+        };
+        assert_eq!(
+            keep(Kind::Swe).options().map(|o| (o.keep_numbers, o.first_page)),
+            Ok((true, None))
+        );
+        assert!(keep(Kind::Eplan).options().is_err());
         for kind in [Kind::PlcCsv, Kind::PartsBmecat, Kind::PartsCsv, Kind::SweLibrary] {
             assert!(kind.options().is_empty(), "{kind:?}");
         }
@@ -661,6 +725,39 @@ pub(crate) mod tests {
             };
             assert!(form.options().is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn new_pages_are_numbered_from_the_first_page_given() {
+        let (tmp, mut open) = project();
+        let aml = tmp.path().join("plant.aml");
+        assert!(std::fs::write(&aml, AML).is_ok());
+        let form = Form {
+            first_page: "730".to_owned(),
+            ..Form::new(&open, Kind::Aml, &aml)
+        };
+        let options = form.options();
+        let Ok(options) = options else {
+            unreachable!("{options:?}");
+        };
+        let before: Vec<String> = open.project.pages.iter().map(|pg| pg.number.clone()).collect();
+        let (done, msg) = import_with(&mut open, Kind::Aml, &aml, None, 0, &options);
+        assert!(done, "{msg}");
+        let new: Vec<String> = open
+            .project
+            .pages
+            .iter()
+            .map(|pg| pg.number.clone())
+            .filter(|n| !before.contains(n))
+            .collect();
+        assert_eq!(new.first().map(String::as_str), Some("730"), "{new:?}");
+        // The form offers the number after it for the next import.
+        assert!(
+            Form::new(&open, Kind::Aml, &aml)
+                .first_page
+                .parse::<usize>()
+                .is_ok_and(|n| n > 730)
+        );
     }
 
     #[test]

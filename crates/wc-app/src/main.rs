@@ -3379,6 +3379,21 @@ impl App {
                             ui.add(egui::TextEdit::singleline(&mut form.scale).desired_width(80.0));
                             ui.end_row();
                         }
+                        if form.has(imports::Opt::FirstPage) {
+                            ui.label("First page number")
+                                .on_hover_text("The first new page takes this number; the others follow it");
+                            let numbered = !(form.kind == imports::Kind::Swe && form.keep_numbers);
+                            ui.add_enabled(
+                                numbered,
+                                egui::TextEdit::singleline(&mut form.first_page).desired_width(80.0),
+                            );
+                            ui.end_row();
+                            if form.kind == imports::Kind::Swe {
+                                ui.label("");
+                                ui.checkbox(&mut form.keep_numbers, "Keep the source's page numbers");
+                                ui.end_row();
+                            }
+                        }
                     });
                     if let Some(e) = error {
                         ui.label(RichText::new(e.as_str()).color(theme::Theme::of(ui.ctx()).error));

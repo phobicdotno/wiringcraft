@@ -46,16 +46,20 @@ for the app.
 Where the format has options on the command line, a small dialog asks for them after the file
 is picked, with the command line's defaults filled in; a format without options starts at once.
 A DWG or DXF drawing has its scale (`--scale`, 1 by default: the drawing's coordinates are
-multiplied by it to get mm).
+multiplied by it to get mm). The imports that add pages (EPLAN, SolidWorks Electrical,
+AutomationML, PDF, archive) have the first page number (`--first-page`), filled in with the
+command line's default, or with the number after the project's highest page number when that is
+higher; a SolidWorks Electrical import can keep the source's own page numbers instead, as the
+command line does without `--first-page`.
 
 Changes not saved yet are saved first, the imported pages and devices come in as one undo step,
-and the import's report and warnings are shown when it is done. New pages are numbered from the
-CLI's default first page, or after the project's highest page number when that is higher. The
-app imports the first project of a SolidWorks archive with its pages numbered from 100, or from
-one above the project's highest numeric page number when that is higher (with page 101 in use,
-from 102 even when 100 is free, since the imported pages follow on from one number), instead of
-its own page numbers, and with no symbol map, and an archive's KiCad libraries and parts lists are listed, not imported; use the CLI for
-`--pick`, `--symbol-map`, `--first-page` and `--lib` there.
+and the import's report and warnings are shown when it is done. The first page number offered
+is the CLI's default, or one above the project's highest numeric page number when that is higher
+(with page 101 in use, 102 even when 100 is free, since the imported pages follow on from one
+number); for a SolidWorks archive it is offered from 100 in the same way, with its own page
+numbers as the other choice. The app imports the first project of a SolidWorks archive, with no
+symbol map, and an archive's KiCad libraries and parts lists are listed, not imported; use the
+CLI for `--pick`, `--symbol-map` and `--lib` there.
 
 In the app, **Library → Import symbols…** takes DXF, SVG, `.kicad_sym` and `.elmt` files together,
 each read by its extension, and writes them into one of the project's library folders. The
