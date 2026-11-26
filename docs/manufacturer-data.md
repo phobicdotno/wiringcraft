@@ -15,7 +15,7 @@ From `crates/wc-import`:
 | Format | Module | Notes |
 |---|---|---|
 | ASCII DXF | `dxf` | Symbols and whole drawings, from the entities LINE, CIRCLE, ARC, ELLIPSE, SPLINE, HATCH, SOLID, TRACE, LWPOLYLINE, POLYLINE, TEXT, MTEXT, POINT, INSERT and DIMENSION (drawn by its block). Ellipses and splines become polylines through sampled points; a solid hatch and a SOLID become filled outlines, a patterned hatch its outline. Other entities (for example 3DFACE, IMAGE) are skipped, with one warning per kind. Binary DXF is **not** read. |
-| DWG (AutoCAD 2004, 2007 and 2010) | `dwg` | Read for the SolidWorks Electrical import (symbol blocks and page drawings): custom entities (WIPEOUT, IMAGE and others numbered from 500) are counted under the name their class in `AcDb:Classes` gives, generic proxy entities as ACAD_PROXY_ENTITY; otherwise the same entities as DXF. |
+| DWG (formats 2004, 2007, 2010, 2013 and 2018; later AutoCAD releases save in the 2018 format) | `dwg` | Read for the SolidWorks Electrical import (symbol blocks and page drawings): custom entities (WIPEOUT, IMAGE and others numbered from 500) are counted under the name their class in `AcDb:Classes` gives, generic proxy entities as ACAD_PROXY_ENTITY; otherwise the same entities as DXF, except multi-line attributes of 2018 drawings, which are counted and skipped. |
 | KiCad symbol libraries (`.kicad_sym`, KiCad 6+) | `kicad` | Graphics and visible pins of the common unit plus each unit (body style 1) become one WiringCraft symbol per unit: a single-unit symbol keeps its name, a multi-unit one becomes `<name>_A`, `<name>_B`, ... (a relay's coil and contacts), each with the common unit's graphics and pins. Alternate body styles are skipped with a warning; hidden pins are left out. |
 | QElectroTech elements (`.elmt`) | `qet` | `wiringcraft import symbol-qet <files> --lib <folder>`: lines, rectangles, circles, ellipses, arcs, polygons and static texts become graphics (ellipses and elliptic arcs as polylines); terminals become pins with their direction; the label's place becomes the tag place; `link_type` sets the role (master, slave, terminal, report). 10 px of QElectroTech is 5 mm by default (`--scale`). Unknown items are counted in a warning. |
 | SVG | `svg` | Graphics. |
@@ -36,7 +36,7 @@ libraries (ahead of the others) the first time symbols are written there. Ids ar
 symbol written, every warning and every file that failed; a failing file does not stop the others.
 A symbol already in the folder is kept unless "Replace symbols already in the library" is ticked.
 
-Not read today: the panel layout, overview, single-line and 3D representations of EPLAN macros (counted only, #343), **DWG** older than AutoCAD 2004 or from AutoCAD 2013 on, **STEP** (3D), ECLASS data
+Not read today: the panel layout, overview, single-line and 3D representations of EPLAN macros (counted only, #343), **DWG** older than AutoCAD 2004, **STEP** (3D), ECLASS data
 outside a BMEcat catalogue.
 
 ## Portals that serve many manufacturers
