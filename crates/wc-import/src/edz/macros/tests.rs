@@ -317,6 +317,27 @@ fn a_description_of_a_point_without_a_pin_is_counted() -> TestResult {
 }
 
 #[test]
+fn many_descriptions_are_cut_and_too_many_shown_properties_refused() -> TestResult {
+    let long = vec!["x"; 2 * MAX_DESIGNATIONS].join(";");
+    let xml = SHOWN_TEXTS.replace(r#"A186="IN1""#, &format!(r#"A186="IN1;{long}""#));
+    let m = read("coil.ema", &xml)?;
+    assert!(text_at(&m.symbol, "IN1").is_ok());
+
+    let many: String = (0..=MAX_PROPS)
+        .map(|k| format!(r#"<S53x5 A4="{}" A771="20029" A953="0" A502="17/52/{k}"/>"#, k + 10))
+        .collect();
+    let xml = SHOWN_TEXTS.replace(
+        r#"<S40x1201 A762="90/90"/>"#,
+        &format!(r#"{many}<S40x1201 A762="90/90"/>"#),
+    );
+    let Err(e) = read("coil.ema", &xml) else {
+        unreachable!("too many shown properties are refused")
+    };
+    assert!(e.to_string().contains("properties"), "{e}");
+    Ok(())
+}
+
+#[test]
 fn a_macro_without_a_multi_line_representation_says_what_it_has() {
     let layout = r#"<EplanPxfRoot><MacroVariant MacroFuncType="6" DocumentType="7" ReferencePoint="0/0"/>
         <MacroVariant MacroFuncType="10"/></EplanPxfRoot>"#;

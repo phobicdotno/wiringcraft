@@ -51,7 +51,7 @@
 //!
 //! Input is hostile: a damaged macro is an error, never a panic.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::f64::consts::TAU;
 
 use quick_xml::events::{BytesStart, Event};
@@ -142,6 +142,9 @@ const CONNECTION_POINT_DESIGNATION: u32 = 20028;
 const CONNECTION_POINT_DESCRIPTION: u32 = 20029;
 /// Most property placements followed from one to the next.
 const MAX_ANCHORS: usize = 16;
+/// Most property placements of one placed symbol; real ones have about ten. Finding a
+/// placement's anchor is a search through them, so this bounds that work.
+const MAX_PROPS: usize = 256;
 
 /// A text being read, in EPLAN coordinates.
 #[derive(Debug, Clone)]
@@ -413,10 +416,16 @@ fn variants(text: &str) -> Result<Vec<Variant>> {
                                 None => None,
                             },
                             id: attr(e, "A1")?.unwrap_or_default().trim().to_owned(),
-                            descriptions: match attr(e, "A186")? {
-                                Some(s) => designations(&s)?,
-                                None => Vec::new(),
-                            },
+                            // Descriptions past the most designations a symbol may have belong to
+                            // no connection point; they are dropped, not an error.
+                            descriptions: attr(e, "A186")?
+                                .map(|s| {
+                                    s.split(';')
+                                        .take(MAX_DESIGNATIONS)
+                                        .map(|d| d.trim().to_owned())
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
                             ..Default::default()
                         };
                         if empty {
@@ -439,6 +448,11 @@ fn variants(text: &str) -> Result<Vec<Variant>> {
                         if let Some(p) = placement.as_mut()
                             && let Some(property) = attr(e, "A771")?.and_then(|s| s.trim().parse().ok())
                         {
+                            if p.props.len() >= MAX_PROPS {
+                                return Err(Error::Format(format!(
+                                    "places a symbol showing more than {MAX_PROPS} properties"
+                                )));
+                            }
                             let anchor = attr(e, "A502")?.and_then(|s| {
                                 let (owner, index) = s.trim().rsplit_once('/')?;
                                 (owner == p.id).then(|| index.to_owned())
@@ -576,62 +590,89 @@ fn turned(d: PinDir, variant: u8) -> PinDir {
 /// Where the property placement `q` of `p` is, in EPLAN coordinates: its offset from the
 /// placement it is anchored to, followed to the symbol's point. `None` when an anchor is missing
 /// or the anchors run on too long (a loop).
-fn prop_at(p: &Placement, q: &Prop) -> Option<Point> {
+fn prop_at(p: &Placement, by_index: &HashMap<&str, &Prop>, q: &Prop) -> Option<Point> {
     let mut at = Point::default();
     let mut q = q;
     for _ in 0..MAX_ANCHORS {
         at = at + q.offset.unwrap_or_default();
         match &q.anchor {
             None => return p.at.map(|base| base + at),
-            Some(index) => q = p.props.iter().find(|r| r.index == *index)?,
+            Some(index) => q = by_index.get(index.as_str())?,
         }
     }
     None
 }
 
-/// The property placement showing the description of `p`'s connection point `k` (0 for the
-/// first): one for that point, or one anchored to that point's designation, or for a symbol of
-/// one connection point one for the symbol.
-fn description_prop(p: &Placement, k: usize) -> Option<&Prop> {
-    let single = p.pins.as_ref().is_none_or(|n| n.len() <= 1);
-    let descriptions = || p.props.iter().filter(|q| q.property == CONNECTION_POINT_DESCRIPTION);
-    descriptions()
-        .find(|q| q.point == k + 1)
-        .or_else(|| {
-            descriptions().find(|q| {
-                q.point == 0
-                    && q.anchor.as_ref().is_some_and(|i| {
-                        p.props
-                            .iter()
-                            .any(|r| r.index == *i && r.property == CONNECTION_POINT_DESIGNATION && r.point == k + 1)
-                    })
-            })
-        })
-        .or_else(|| {
-            if single {
-                descriptions().find(|q| q.point <= 1)
-            } else {
-                None
-            }
-        })
+/// `p`'s property placements by their index `A4` (the first of repeats).
+fn by_index(p: &Placement) -> HashMap<&str, &Prop> {
+    let mut m = HashMap::new();
+    for q in &p.props {
+        m.entry(q.index.as_str()).or_insert(q);
+    }
+    m
+}
+
+/// Where the macro shows the displayed device tag of `p`, in EPLAN coordinates.
+fn shown_tag(p: &Placement) -> Option<Point> {
+    let by_index = by_index(p);
+    p.props
+        .iter()
+        .filter(|q| q.property == DISPLAYED_DEVICE_TAG)
+        .find_map(|q| prop_at(p, &by_index, q))
+}
+
+/// The property placements showing descriptions of `p`'s connection points, by point (1 for the
+/// first): one for that point, else one anchored to that point's designation. Under 0 is the
+/// first for no point, which a symbol of one connection point uses.
+fn description_props<'a>(p: &'a Placement, by_index: &HashMap<&str, &'a Prop>) -> HashMap<usize, &'a Prop> {
+    let mut direct: HashMap<usize, &Prop> = HashMap::new();
+    let mut anchored: HashMap<usize, &Prop> = HashMap::new();
+    for q in p.props.iter().filter(|q| q.property == CONNECTION_POINT_DESCRIPTION) {
+        if q.point > 0 {
+            direct.entry(q.point).or_insert(q);
+            continue;
+        }
+        let designated = q
+            .anchor
+            .as_ref()
+            .and_then(|i| by_index.get(i.as_str()))
+            .filter(|r| r.property == CONNECTION_POINT_DESIGNATION && r.point > 0);
+        match designated {
+            Some(r) => anchored.entry(r.point).or_insert(q),
+            None => direct.entry(0).or_insert(q),
+        };
+    }
+    for (point, q) in anchored {
+        direct.entry(point).or_insert(q);
+    }
+    direct
 }
 
 /// Draw the connection point descriptions of `p` (`A186`) where the macro shows them, else
-/// beside their pin (`points`, on the page, in the order of the designations). A description of
-/// a point that has neither is counted.
+/// beside their pin (`points`, on the page, by designation; `None` for one without a pin). A
+/// description of a point that has neither is counted.
 fn describe(
     p: &Placement,
-    points: &[Point],
+    points: &[Option<Point>],
     page: &dyn Fn(Point) -> Point,
     graphics: &mut Vec<Shape>,
     left_out: &mut BTreeMap<String, usize>,
 ) {
+    if p.descriptions.iter().all(String::is_empty) {
+        return;
+    }
+    let single = p.pins.as_ref().is_none_or(|n| n.len() <= 1);
+    let by_index = by_index(p);
+    let props = description_props(p, &by_index);
     for (k, text) in p.descriptions.iter().enumerate() {
         if text.is_empty() {
             continue;
         }
-        let shown = description_prop(p, k).and_then(|q| prop_at(p, q).map(|at| (q, at)));
-        let shape = match (shown, points.get(k)) {
+        let prop = props
+            .get(&(k + 1))
+            .or_else(|| if single { props.get(&0) } else { None });
+        let shown = prop.and_then(|q| prop_at(p, &by_index, q).map(|at| (*q, at)));
+        let shape = match (shown, points.get(k).copied().flatten()) {
             (Some((q, at)), _) => Shape::Text {
                 at: page(at),
                 text: text.clone(),
@@ -640,7 +681,7 @@ fn describe(
                 angle: q.angle,
             },
             (None, Some(pin)) => Shape::Text {
-                at: *pin + Point::new(1.0, -1.0),
+                at: pin + Point::new(1.0, -1.0),
                 text: text.clone(),
                 height: TEXT_HEIGHT,
                 align: Align::Left,
@@ -806,7 +847,7 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
                 dir: turned(PinDir::Up, p.variant),
             });
             owners.push((p.letter.clone(), p.number.clone()));
-            describe(p, &[origin], &page, &mut graphics, &mut left_out);
+            describe(p, &[Some(origin)], &page, &mut graphics, &mut left_out);
             if p.library != "SPECIAL" {
                 add(&mut left_out, "library graphics of connection points (pins kept)", 1);
             }
@@ -853,7 +894,24 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
             });
             owners.push((p.letter.clone(), p.number.clone()));
         }
-        describe(p, &points, &page, &mut graphics, &mut left_out);
+        // Each designation's pin: a terminal's in order, another symbol's by name, as the
+        // symbol names its pins from the designations.
+        let by_designation: Vec<Option<Point>> = if p.kind == KIND_TERMINAL {
+            names.iter().enumerate().map(|(k, _)| points.get(k).copied()).collect()
+        } else {
+            names
+                .iter()
+                .enumerate()
+                .map(|(k, n)| {
+                    let want = if n.is_empty() { (k + 1).to_string() } else { n.clone() };
+                    s.pins
+                        .iter()
+                        .position(|pin| pin.name == want)
+                        .and_then(|i| points.get(i).copied())
+                })
+                .collect()
+        };
+        describe(p, &by_designation, &page, &mut graphics, &mut left_out);
         drawn_kinds.push(s.role);
         add(
             &mut left_out,
@@ -930,12 +988,6 @@ pub fn read(name: &str, text: &str) -> Result<MacroSymbol> {
         .and_then(|(_, k)| owners.get(*k));
     // The device tag is printed where the macro shows it: at the black box's displayed device
     // tag, else at that of the device the letter comes from, else at the first one shown.
-    let shown_tag = |p: &Placement| {
-        p.props
-            .iter()
-            .filter(|q| q.property == DISPLAYED_DEVICE_TAG)
-            .find_map(|q| prop_at(p, q))
-    };
     let main_placements = v.placements.iter().filter(|p| {
         if box_letter.is_empty() {
             main_device.is_some_and(|(l, n)| *l == p.letter && *n == p.number)
