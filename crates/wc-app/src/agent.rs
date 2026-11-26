@@ -10919,7 +10919,14 @@ mod tests {
         let step = open.history_count();
         a.ed.panel = Some(0);
         a.ed.panel_pick = Some(0);
-        a.ed.panel_drag = Some((Point::new(20.0, 30.0), Some(step), from));
+        let start = PanelItem::Device {
+            tag: wc_core::DeviceTag::parse("-K1").unwrap_or_default(),
+            at: from,
+            width: 40.0,
+            height: 60.0,
+            rotation: wc_core::geom::Rotation::R0,
+        };
+        a.ed.panel_drag = Some((Point::new(20.0, 30.0), Some(step), start));
         (first, from)
     }
 

@@ -107,27 +107,31 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
         && let Some(at) = pressed_at.or(pointer)
     {
         ed.panel_pick = item_at(&p.items, at);
-        if let Some(a) = ed.panel_pick.and_then(|i| p.items.get(i)).map(PanelItem::anchor) {
-            ed.panel_drag = Some((Point::new(at.x - a.x, at.y - a.y), None, a));
+        if let Some(item) = ed.panel_pick.and_then(|i| p.items.get(i)) {
+            let a = item.anchor();
+            ed.panel_drag = Some((Point::new(at.x - a.x, at.y - a.y), None, item.clone()));
         }
     }
-    // Escape puts the item back where the drag started and drops the drag's undo step; the
-    // release afterwards changes nothing.
-    if let (Some((_, checkpoint, start)), Some(i)) = (ed.panel_drag, ed.panel_pick)
+    // Something else made an undo step since the drag's own (the assistant, say): the drag
+    // ends where the item is, so its later moves never land in that other step, and Escape no
+    // longer puts the item back.
+    if let Some((_, Some(step), _)) = &ed.panel_drag
+        && open.history_count() != *step
+    {
+        ed.panel_drag = None;
+    }
+    // Escape puts the item back as it was when the drag started and drops the drag's undo
+    // step; the release afterwards changes nothing.
+    if let (Some((_, checkpoint, start)), Some(i)) = (ed.panel_drag.clone(), ed.panel_pick)
         && ui.input(|inp| inp.key_pressed(egui::Key::Escape))
     {
         ed.panel_drag = None;
         if let Some(step) = checkpoint
             && let Some(item) = open.project.panels.get_mut(panel).and_then(|x| x.items.get_mut(i))
         {
-            match item {
-                PanelItem::Device { at, .. } | PanelItem::Rail { at, .. } => *at = start,
-                PanelItem::Duct { min, max } => {
-                    let (dx, dy) = (start.x - min.x, start.y - min.y);
-                    *min = start;
-                    *max = Point::new(max.x + dx, max.y + dy);
-                }
-            }
+            // The item as it was, exactly: moving it back by the offset can leave a duct's
+            // far corner off by a rounding error.
+            *item = start;
             open.edited();
             // Only when the latest step is still this drag's (nothing has touched the history
             // since its checkpoint): then it changes nothing any more.
@@ -140,7 +144,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
     if resp.clicked_by(egui::PointerButton::Primary) {
         ed.panel_pick = pointer.and_then(|at| item_at(&p.items, at));
     }
-    if let (Some((grab, checkpoint, start)), Some(i), Some(at)) = (ed.panel_drag, ed.panel_pick, pointer)
+    if let (Some((grab, checkpoint, start)), Some(i), Some(at)) = (ed.panel_drag.clone(), ed.panel_pick, pointer)
         && resp.dragged_by(egui::PointerButton::Primary)
     {
         let step = if snap_step > 0.0 { snap_step.min(5.0) } else { 1.0 };
@@ -170,7 +174,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
             if moved != *item {
                 if checkpoint.is_none() {
                     open.checkpoint();
-                    ed.panel_drag = Some((grab, Some(open.history_count()), start));
+                    ed.panel_drag = Some((grab, Some(open.history_count()), start.clone()));
                 }
                 if let Some(slot) = open.project.panels.get_mut(panel).and_then(|x| x.items.get_mut(i)) {
                     *slot = moved;
@@ -976,5 +980,153 @@ mod tests {
             o.project.panels[0].items[0].bounds(),
             (Point::new(0.0, 340.0), Point::new(600.0, 400.0))
         );
+    }
+
+    /// One frame of the panel view, 800 x 600 points, snapping to 5 mm.
+    fn plate_frame(ctx: &egui::Context, o: &mut Open, ed: &mut Editor, events: Vec<egui::Event>) {
+        let input = egui::RawInput {
+            events,
+            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 600.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| show(ui, o, ed, 0, 5.0, true));
+        });
+    }
+
+    /// Where plate position `q` is on screen in [`plate_frame`].
+    fn on_plate_screen(ed: &Editor, q: Point) -> egui::Pos2 {
+        egui::pos2(
+            ed.view.offset.x + q.x as f32 * ed.view.zoom,
+            ed.view.offset.y + q.y as f32 * ed.view.zoom,
+        )
+    }
+
+    fn primary(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        }
+    }
+
+    /// A duct with corners that are not whole millimetres, dragged and then Escape: it is
+    /// exactly as it was, and the drag leaves no undo step.
+    #[test]
+    fn escape_puts_a_duct_with_decimal_corners_back_exactly() {
+        let (_tmp, mut o, mut ed) = plate_with_rail_and_duct();
+        let duct = PanelItem::Duct {
+            min: Point::new(0.0, 300.0),
+            max: Point::new(60.1, 360.3),
+        };
+        o.project.panels[0].items[0] = duct.clone();
+        let steps = o.undo_steps();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        plate_frame(&ctx, &mut o, &mut ed, Vec::new());
+        let (a, b) = (
+            on_plate_screen(&ed, Point::new(30.0, 330.0)),
+            on_plate_screen(&ed, Point::new(130.0, 330.0)),
+        );
+        plate_frame(
+            &ctx,
+            &mut o,
+            &mut ed,
+            vec![egui::Event::PointerMoved(a), primary(a, true)],
+        );
+        for k in 1..=4 {
+            let q = a + (b - a) * (k as f32 / 4.0);
+            plate_frame(&ctx, &mut o, &mut ed, vec![egui::Event::PointerMoved(q)]);
+        }
+        assert_eq!(
+            o.project.panels[0].items[0].anchor(),
+            Point::new(100.0, 300.0),
+            "dragged"
+        );
+        assert_eq!(o.undo_steps(), steps + 1);
+        let escape = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        plate_frame(&ctx, &mut o, &mut ed, vec![escape]);
+        plate_frame(&ctx, &mut o, &mut ed, vec![primary(b, false)]);
+        plate_frame(&ctx, &mut o, &mut ed, Vec::new());
+        assert_eq!(o.project.panels[0].items[0], duct, "back exactly as it was");
+        assert_eq!(o.undo_steps(), steps, "and no undo step is left");
+    }
+
+    /// Item `i` dragged from `from` towards `to`; halfway, a translation (as the assistant's
+    /// `translations` tool sets one) makes an undo step. The drag ends there: the rest of it
+    /// moves nothing, so it never lands in the translation's step, and each Undo takes back
+    /// one change.
+    fn drag_ends_when_another_step_comes(mut o: Open, mut ed: Editor, i: usize, from: Point, to: Point) {
+        let before = o.project.panels[0].items[i].clone();
+        let steps = o.undo_steps();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        plate_frame(&ctx, &mut o, &mut ed, Vec::new());
+        let (a, b) = (on_plate_screen(&ed, from), on_plate_screen(&ed, to));
+        plate_frame(
+            &ctx,
+            &mut o,
+            &mut ed,
+            vec![egui::Event::PointerMoved(a), primary(a, true)],
+        );
+        for k in 1..=2 {
+            let q = a + (b - a) * (k as f32 / 4.0);
+            plate_frame(&ctx, &mut o, &mut ed, vec![egui::Event::PointerMoved(q)]);
+        }
+        let halfway = o.project.panels[0].items[i].clone();
+        assert_ne!(halfway, before, "the drag moves it");
+        assert_eq!(o.undo_steps(), steps + 1);
+
+        let file = o.dir.join(wc_core::translate::TRANSLATIONS_FILE);
+        let set = o.translations_change(|dir| wc_core::translate::set_translation(dir, "Motor", "nb", "Motor"));
+        assert!(matches!(set, Ok(true)), "{set:?}");
+        assert_eq!(o.undo_steps(), steps + 2);
+
+        for k in 3..=4 {
+            let q = a + (b - a) * (k as f32 / 4.0);
+            plate_frame(&ctx, &mut o, &mut ed, vec![egui::Event::PointerMoved(q)]);
+        }
+        plate_frame(&ctx, &mut o, &mut ed, vec![primary(b, false)]);
+        plate_frame(&ctx, &mut o, &mut ed, Vec::new());
+        assert!(ed.panel_drag.is_none());
+        assert_eq!(o.project.panels[0].items[i], halfway, "the drag stopped where it was");
+        assert_eq!(o.undo_steps(), steps + 2);
+
+        assert!(o.undo());
+        assert!(!file.exists(), "Undo takes the translation back");
+        assert_eq!(o.project.panels[0].items[i], halfway, "and only the translation");
+        assert!(o.undo());
+        assert_eq!(
+            o.project.panels[0].items[i], before,
+            "the next Undo takes the drag back"
+        );
+    }
+
+    #[test]
+    fn a_rail_drag_ends_when_another_undo_step_comes() {
+        let (_tmp, o, ed) = plate_with_rail_and_duct();
+        drag_ends_when_another_step_comes(o, ed, 1, Point::new(150.0, 100.0), Point::new(150.0, 200.0));
+    }
+
+    #[test]
+    fn a_device_drag_ends_when_another_undo_step_comes() {
+        let (_tmp, mut o, ed) = plate_with_rail_and_duct();
+        o.project.panels[0].items.push(PanelItem::Device {
+            tag: wc_core::DeviceTag::parse("-K1").unwrap_or_default(),
+            at: Point::new(400.0, 150.0),
+            width: 40.0,
+            height: 60.0,
+            rotation: wc_core::geom::Rotation::R0,
+        });
+        drag_ends_when_another_step_comes(o, ed, 2, Point::new(420.0, 180.0), Point::new(520.0, 180.0));
     }
 }
