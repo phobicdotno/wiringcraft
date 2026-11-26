@@ -969,18 +969,22 @@ fn free_spot(panel: &wc_core::panel::Panel, size: (f64, f64)) -> Option<Point> {
             return Some(Point::new(x, top));
         }
     }
-    // Off the rails: the highest, then leftmost, corner next to a device or duct that is free.
-    let mut xs: Vec<f64> = std::iter::once(0.0)
-        .chain(blocks.iter().map(|(_, max)| max.x + GAP))
-        .collect();
-    let mut ys: Vec<f64> = std::iter::once(0.0)
-        .chain(blocks.iter().map(|(_, max)| max.y + GAP))
-        .collect();
-    xs.sort_by(f64::total_cmp);
-    ys.sort_by(f64::total_cmp);
-    ys.iter()
-        .flat_map(|y| xs.iter().map(move |x| Point::new(*x, *y)))
-        .find(|p| inside(p.x, p.y) && covering(&blocks, p.x, p.y).is_none())
+    // Off the rails: the highest, then leftmost, corner next to a device or duct that is free,
+    // a GAP clear of it when there is room, else flush against it.
+    let corner = |gap: f64| {
+        let mut xs: Vec<f64> = std::iter::once(0.0)
+            .chain(blocks.iter().map(|(_, max)| max.x + gap))
+            .collect();
+        let mut ys: Vec<f64> = std::iter::once(0.0)
+            .chain(blocks.iter().map(|(_, max)| max.y + gap))
+            .collect();
+        xs.sort_by(f64::total_cmp);
+        ys.sort_by(f64::total_cmp);
+        ys.iter()
+            .flat_map(|y| xs.iter().map(move |x| Point::new(*x, *y)))
+            .find(|p| inside(p.x, p.y) && covering(&blocks, p.x, p.y).is_none())
+    };
+    corner(GAP).or_else(|| corner(0.0))
 }
 
 #[cfg(test)]
@@ -1004,6 +1008,20 @@ mod tests {
             max: Point::new(60.0, 100.0),
         });
         assert_eq!(free_spot(&p, (45.0, 80.0)), Some(Point::new(60.0 + GAP, 10.0)));
+    }
+
+    #[test]
+    fn a_device_that_only_fits_flush_against_a_duct_is_placed_there() {
+        use wc_core::panel::{GAP, Panel, PanelItem};
+        let mut p = Panel::new("panel1", "Main", 100.0, 100.0);
+        p.items.push(PanelItem::Duct {
+            min: Point::new(0.0, 0.0),
+            max: Point::new(55.0, 100.0),
+        });
+        // 45 mm wide fits only flush in the 45 mm left beside the duct, with no gap.
+        assert_eq!(free_spot(&p, (45.0, 80.0)), Some(Point::new(55.0, 0.0)));
+        // With room to spare it still keeps the gap.
+        assert_eq!(free_spot(&p, (40.0, 80.0)), Some(Point::new(55.0 + GAP, 0.0)));
     }
 
     #[test]
