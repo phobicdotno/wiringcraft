@@ -2079,11 +2079,15 @@ impl App {
                     .into());
                 }
                 let open = need_open(self.open.as_mut())?;
+                let before = crate::panel_pick_before(&self.ed, &open.project);
                 let done = if redo { open.redo() } else { open.undo() };
                 if let Some(e) = open.take_undo_error() {
                     return Err(format!("Not done: {e}"));
                 }
                 self.ed.selection.clear();
+                if done && let Some((id, pick)) = &before {
+                    crate::follow_panel_pick(&mut self.ed, &open.project, id, pick.as_ref());
+                }
                 if let Some(w) = open.take_step_warning() {
                     return Ok(format!("Done, but {w}."));
                 }
