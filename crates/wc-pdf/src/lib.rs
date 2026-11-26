@@ -20,7 +20,7 @@ pub use layout::{
     fit_picture, frame_marks, junctions, logo_boxes, pin_position, title_logo_box, title_logo_boxes, xref_marks,
 };
 pub use picture::{Pictures, read_picture, read_pictures};
-pub use vector::{PageDrawing, Picture, dxf, page_drawings, page_lines, svg};
+pub use vector::{PageDrawing, Picture, dxf, page_drawings, page_file_stem, page_lines, panel_file_stem, svg};
 pub use writer::{Layer, Prim, Stroke, text_width_mm};
 
 #[derive(Debug, Clone)]
@@ -224,7 +224,7 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
             } else {
                 format!("{} {}", page.number, table.title)
             };
-            doc.add_page(size.mm(), &title, drawn);
+            doc.add_page(size.mm(), &page.number, &title, drawn);
             *sheet += 1;
         }
     };
@@ -259,7 +259,12 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
             }
         }
         place_logo(&mut drawn, page);
-        doc.add_page(page.size.mm(), &format!("{} {}", page.number, page.title), drawn);
+        doc.add_page(
+            page.size.mm(),
+            &page.number,
+            &format!("{} {}", page.number, page.title),
+            drawn,
+        );
         sheet += 1;
     }
     // Panel layouts follow the schematic pages, one sheet each.
@@ -269,7 +274,12 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
         let mut drawn =
             layout::draw_panel_page(project, &page, sheet, total, panel, &options.footprints, &options.date);
         place_logo(&mut drawn, &page);
-        doc.add_page(first_size.mm(), &format!("{} {}", page.number, panel.name), drawn);
+        doc.add_page(
+            first_size.mm(),
+            &page.number,
+            &format!("{} {}", page.number, panel.name),
+            drawn,
+        );
         sheet += 1;
     }
     // Drawn PLC cards follow the panel layouts.
@@ -285,7 +295,12 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
         page.size = card_size;
         let mut drawn = layout::draw_card_page(project, &page, sheet, total, card, first, (part, parts), &options.date);
         place_logo(&mut drawn, &page);
-        doc.add_page(card_size.mm(), &format!("{} {}", page.number, page.title), drawn);
+        doc.add_page(
+            card_size.mm(),
+            &page.number,
+            &format!("{} {}", page.number, page.title),
+            drawn,
+        );
         sheet += 1;
     }
     add_reports(&mut doc, back_pages, &mut sheet);
@@ -313,7 +328,12 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
             &mut report.warnings,
         );
         place_logo(&mut drawn, &page);
-        doc.add_page(size.mm(), &format!("{} {}", page.number, page.title), drawn);
+        doc.add_page(
+            size.mm(),
+            &page.number,
+            &format!("{} {}", page.number, page.title),
+            drawn,
+        );
         sheet += 1;
     }
     // Links resolve against the exported page list, so links to pages left out are dropped.
