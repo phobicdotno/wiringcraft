@@ -173,28 +173,6 @@ pub fn pdf_text(s: &str) -> String {
     out
 }
 
-/// A page label prefix as a PDF text string: printable ASCII as a literal string with `(`, `)`
-/// and `\\` escaped, anything else as UTF-16BE hex with a byte order mark.
-fn page_label(s: &str) -> String {
-    if s.chars().all(|c| matches!(c, ' '..='~')) {
-        let mut out = String::from("(");
-        for c in s.chars() {
-            if matches!(c, '(' | ')' | '\\') {
-                out.push('\\');
-            }
-            out.push(c);
-        }
-        out.push(')');
-        return out;
-    }
-    let mut out = String::from("<FEFF");
-    for unit in s.encode_utf16() {
-        let _ = write!(out, "{unit:04X}");
-    }
-    out.push('>');
-    out
-}
-
 impl Doc {
     pub fn new(title: &str) -> Self {
         Self {
@@ -700,3 +678,25 @@ impl Pen {
 }
 
 pub use wc_core::font::text_width_mm;
+
+/// A page label prefix as a PDF text string: printable ASCII as a literal string with `(`, `)`
+/// and `\` escaped, anything else as UTF-16BE hex with a byte order mark.
+fn page_label(s: &str) -> String {
+    if s.chars().all(|c| matches!(c, ' '..='~')) {
+        let mut out = String::from("(");
+        for c in s.chars() {
+            if matches!(c, '(' | ')' | '\\') {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+        out.push(')');
+        return out;
+    }
+    let mut out = String::from("<FEFF");
+    for unit in s.encode_utf16() {
+        let _ = write!(out, "{unit:04X}");
+    }
+    out.push('>');
+    out
+}
