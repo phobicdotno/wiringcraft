@@ -13,6 +13,7 @@ image.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+quick-xml.workspace = true
 
 [lints]
 workspace = true
