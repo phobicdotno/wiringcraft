@@ -542,6 +542,32 @@ fn every_starter_symbol_loads_under_its_file_name_with_distinct_pins() -> Result
 }
 
 #[test]
+fn starter_solenoid_valve_coil_and_its_example_part_load() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
+    project.meta.libraries = vec![LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: starter.to_string_lossy().into(),
+        reference: None,
+    }];
+    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    // The solenoid valve coil (#724): its own tag (no contacts follow it), letter code M for an
+    // actuator in IEC 81346-2, and the coil pins of a relay coil.
+    let (valve, _) = lib.symbol("wc.coil.valve")?;
+    assert_eq!(valve.role, SymbolRole::Standalone);
+    assert_eq!(valve.letter_code, "M");
+    let names: Vec<_> = valve.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["A1", "A2"]);
+    assert_eq!(
+        lib.part("example.ex-sv-24dc")?.0.symbol.as_deref(),
+        Some("wc.coil.valve")
+    );
+    Ok(())
+}
+
+#[test]
 fn lock_restores_a_deleted_vendored_copy_at_the_pinned_version() -> Result<()> {
     let mut f = fixture()?;
     let lib = Library::open(&f.proj, &f.project)?;
