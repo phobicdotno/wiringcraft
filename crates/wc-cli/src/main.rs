@@ -1813,17 +1813,33 @@ impl Cmd {
 }
 
 /// Copy every input of `cmd` that is not a regular file (a FIFO, a character device) into a
-/// private temporary folder, under the name it has, and point the command at the copy. Called
+/// private temporary folder, under the name it has, and point the command at the copy (the
+/// same copy for an input named twice, and no more of it than the importer reads). Called
 /// before the project lock is taken: a FIFO that another command on the same project fills
 /// would otherwise never be read, as its writer waits for the lock this command holds while it
 /// waits for the writer (#658). Regular files, folders, `-` and paths that do not exist are
 /// left as they are, for the command to read (or report) itself. The copies are removed when
 /// the returned folder is dropped; `None` when nothing was copied.
 fn spool_inputs(cmd: &mut Cmd) -> Res<Option<tempfile::TempDir>> {
+    use std::io::Read;
+    // An importer that reads no more than so much of its input gets no more than that: a
+    // stream without an end (`/dev/zero`) would otherwise be copied until the disk is full.
+    // One byte over the limit is kept, which is how the importer sees the input is too large.
+    let limit = match cmd {
+        Cmd::Import(ImportCmd::SymbolQet { .. }) => Some(wc_import::qet::MAX_LEN as u64 + 1),
+        _ => None,
+    };
     let mut spool = None;
+    // A stream can be read once: an input named again gets the copy made the first time.
+    let mut copied: Vec<(PathBuf, PathBuf)> = Vec::new();
     for (n, path) in cmd.inputs_mut().into_iter().enumerate() {
         let stream = path.as_os_str() != "-" && std::fs::metadata(&*path).is_ok_and(|m| !m.is_file() && !m.is_dir());
         if !stream {
+            continue;
+        }
+        let same = std::fs::canonicalize(&*path).unwrap_or_else(|_| path.clone());
+        if let Some((_, copy)) = copied.iter().find(|(from, _)| *from == same) {
+            *path = copy.clone();
             continue;
         }
         let fail = |x: std::io::Error| format!("{}: {x}", escape_field(&path.display().to_string()));
@@ -1835,9 +1851,14 @@ fn spool_inputs(cmd: &mut Cmd) -> Res<Option<tempfile::TempDir>> {
         let own = folder.path().join(n.to_string());
         std::fs::create_dir(&own).map_err(|x| format!("{}: {x}", own.display()))?;
         let copy = own.join(path.file_name().unwrap_or(std::ffi::OsStr::new("input")));
-        let mut from = std::fs::File::open(&*path).map_err(fail)?;
+        let from = std::fs::File::open(&*path).map_err(fail)?;
         let mut to = std::fs::File::create(&copy).map_err(|x| format!("{}: {x}", copy.display()))?;
-        std::io::copy(&mut from, &mut to).map_err(fail)?;
+        match limit {
+            Some(limit) => std::io::copy(&mut (&from).take(limit), &mut to),
+            None => std::io::copy(&mut &from, &mut to),
+        }
+        .map_err(fail)?;
+        copied.push((same, copy.clone()));
         *path = copy;
     }
     Ok(spool)
@@ -9982,69 +10003,7 @@ mod input_tests {
     use super::*;
     use clap::CommandFactory;
 
-    /// A command line for every command that reads a named file, and the inputs it names.
-    const WITH_INPUTS: &[(&[&str], &[&str])] = &[
-        (&["inspect", "in"], &["in"]),
-        (&["logo", "set", "in"], &["in"]),
-        (&["rules", "set", "in"], &["in"]),
-        (&["report-layout", "set", "terminals", "in"], &["in"]),
-        (
-            &[
-                "import",
-                "symbol-dxf",
-                "in",
-                "--id",
-                "a.b",
-                "--name",
-                "B",
-                "--lib",
-                "lib",
-            ],
-            &["in"],
-        ),
-        (
-            &["import", "footprint-dxf", "in", "--part", "a.b", "--lib", "lib"],
-            &["in"],
-        ),
-        (
-            &["import", "model-step", "in", "--part", "a.b", "--lib", "lib"],
-            &["in"],
-        ),
-        (
-            &[
-                "import",
-                "symbol-svg",
-                "in",
-                "--id",
-                "a.b",
-                "--name",
-                "B",
-                "--lib",
-                "lib",
-            ],
-            &["in"],
-        ),
-        (&["import", "plc-csv", "in"], &["in"]),
-        (&["import", "wago", "in"], &["in"]),
-        (&["import", "symbol-kicad", "in", "--lib", "lib"], &["in"]),
-        (&["import", "parts-bmecat", "in", "--lib", "lib"], &["in"]),
-        (&["import", "parts-edz", "in", "--lib", "lib"], &["in"]),
-        (
-            &["import", "parts-edz", "in", "--lib", "lib", "--symbol-map", "map"],
-            &["in", "map"],
-        ),
-        (&["import", "symbol-qet", "in", "two", "--lib", "lib"], &["in", "two"]),
-        (&["import", "parts-csv", "in", "--lib", "lib"], &["in"]),
-        (&["import", "archive", "in", "--lib", "lib"], &["in"]),
-        (&["import", "page-dwg", "in", "--page", "p1"], &["in"]),
-        (&["import", "pdf", "in"], &["in"]),
-        (&["import", "eplan", "in"], &["in"]),
-        (&["import", "swe", "in"], &["in"]),
-        (&["import", "swe", "in", "--symbol-map", "map"], &["in", "map"]),
-        (&["import", "swe-library", "in", "--lib", "lib"], &["in"]),
-        (&["import", "aml", "in"], &["in"]),
-        (&["import", "page-dxf", "in", "--page", "p1"], &["in"]),
-    ];
+    include!("input_commands.rs");
 
     /// Path arguments that are not input files: where output goes, library and project folders.
     const NOT_INPUTS: &[&str] = &["project", "dir", "out", "lib", "svg"];
@@ -10068,10 +10027,14 @@ mod input_tests {
 
     #[test]
     fn every_command_with_an_input_file_lists_it() {
-        for (args, want) in WITH_INPUTS {
+        for args in INPUT_COMMANDS {
             let mut cli = Cli::try_parse_from(["wiringcraft"].iter().chain(*args)).unwrap();
             let got: Vec<PathBuf> = cli.cmd.inputs_mut().into_iter().map(|p| p.clone()).collect();
-            let want: Vec<PathBuf> = want.iter().map(PathBuf::from).collect();
+            let want: Vec<PathBuf> = args
+                .iter()
+                .filter(|a| ["FIFO", "FILE"].contains(a))
+                .map(PathBuf::from)
+                .collect();
             assert_eq!(got, want, "{args:?}");
         }
         // A command that takes a path which is not an output or a folder is in the list above,
@@ -10081,9 +10044,9 @@ mod input_tests {
         assert!(found.len() >= 23, "{found:?}");
         for words in found {
             assert!(
-                WITH_INPUTS
+                INPUT_COMMANDS
                     .iter()
-                    .any(|(args, _)| args.iter().zip(&words).filter(|(a, w)| a == w).count() == words.len()),
+                    .any(|args| args.iter().zip(&words).filter(|(a, w)| a == w).count() == words.len()),
                 "`{}` takes a path that Cmd::inputs_mut and this test do not know",
                 words.join(" ")
             );
@@ -10129,5 +10092,93 @@ mod input_tests {
         let mut cli = Cli::try_parse_from(["wiringcraft", "rules", "set", "-"]).unwrap();
         assert!(spool_inputs(&mut cli.cmd).unwrap().is_none());
         assert!(matches!(cli.cmd, Cmd::Rules(RulesCmd::Set { ref file }) if file.as_os_str() == "-"));
+    }
+
+    /// [`spool_inputs`] on another thread, given twenty seconds: a copy that waits for a
+    /// writer that never comes, or that has no end, fails the test instead of holding it up.
+    #[cfg(unix)]
+    fn spooled(mut cli: Cli) -> (Vec<PathBuf>, Option<tempfile::TempDir>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let spool = spool_inputs(&mut cli.cmd);
+            let inputs: Vec<PathBuf> = cli.cmd.inputs_mut().into_iter().map(|p| p.clone()).collect();
+            let _ = tx.send((inputs, spool));
+        });
+        let (inputs, spool) = rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap();
+        (inputs, spool.unwrap())
+    }
+
+    /// A FIFO named twice is read once: its one writer writes one element, both operands get
+    /// the same copy, and the importer refuses the second for its id as it does for a file.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_named_twice_is_copied_once() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("lamp.elmt");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let element =
+            "<definition type=\"element\"><description><terminal x=\"0\" y=\"0\"/></description></definition>";
+        let writer = {
+            let fifo = fifo.clone();
+            std::thread::spawn(move || {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&fifo)?
+                    .write_all(element.as_bytes())
+            })
+        };
+        let lib = tmp.path().join("lib");
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "symbol-qet".as_ref(),
+            fifo.as_os_str(),
+            fifo.as_os_str(),
+            "--lib".as_ref(),
+            lib.as_os_str(),
+        ])
+        .unwrap();
+        let (inputs, spool) = spooled(cli);
+        writer.join().unwrap().unwrap();
+        let spool = spool.unwrap();
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[0], inputs[1]);
+        assert!(inputs[0].starts_with(spool.path()), "{inputs:?}");
+        assert_eq!(inputs[0].file_name(), fifo.file_name());
+        assert_eq!(std::fs::read_to_string(&inputs[0]).unwrap(), element);
+        let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
+        assert_eq!((written, failed), (1, 1));
+        assert!(lib.join("symbols").join("qet.lamp.json").exists());
+    }
+
+    /// An element stream without an end is copied up to one byte over what the importer
+    /// reads, and refused by it as too large; another command's input has no such limit.
+    #[cfg(unix)]
+    #[test]
+    fn an_endless_element_stream_is_copied_up_to_the_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("lib");
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "symbol-qet".as_ref(),
+            "/dev/zero".as_ref(),
+            "--lib".as_ref(),
+            lib.as_os_str(),
+        ])
+        .unwrap();
+        let (inputs, spool) = spooled(cli);
+        assert!(spool.is_some());
+        let len = std::fs::metadata(&inputs[0]).unwrap().len();
+        assert_eq!(len, wc_import::qet::MAX_LEN as u64 + 1);
+        let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
+        assert_eq!((written, failed), (0, 1));
     }
 }

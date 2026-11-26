@@ -515,66 +515,69 @@ fn an_import_through_a_fifo_gives_what_the_file_gives() -> TestResult {
     Ok(())
 }
 
+#[cfg(unix)]
+include!("../src/input_commands.rs");
+
+/// What a command says on stderr when it finds the project lock taken.
+#[cfg(unix)]
+const WAITS: &str = "waiting for another wiringcraft command";
+
+/// What `from` gives, piece by piece as it comes, until it ends.
+#[cfg(unix)]
+fn follow(mut from: impl std::io::Read + Send + 'static) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = from.read(&mut buf) {
+            if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+/// A command started with FIFO inputs: its name, the writers of its FIFOs, and its stderr.
+#[cfg(unix)]
+struct Running {
+    name: String,
+    child: Child,
+    writers: Vec<FifoWriter>,
+    stderr: std::sync::mpsc::Receiver<Vec<u8>>,
+    /// What it has said on stderr so far.
+    said: Vec<u8>,
+}
+
+#[cfg(unix)]
+impl Running {
+    /// Every FIFO of the command has been written in full, so the command has read them.
+    fn has_read(&self) -> bool {
+        self.writers.iter().all(|(_, w)| w.is_finished())
+    }
+
+    /// The command has said that it waits for the lock.
+    fn says_it_waits(&mut self) -> bool {
+        self.said.extend(self.stderr.try_iter().flatten());
+        String::from_utf8_lossy(&self.said).contains(WAITS)
+    }
+}
+
 /// A FIFO and the thread that writes to it.
 #[cfg(unix)]
 type FifoWriter = (std::path::PathBuf, std::thread::JoinHandle<std::io::Result<()>>);
 
 /// Every command that names an input file reads a FIFO before it waits for the lock (#658):
 /// a writer that cannot get through until the command opens and reads the FIFO finishes while
-/// the lock is still held by another command, and the command then waits for the lock.
+/// the lock is still held by another command, and the command then waits for the lock. The
+/// lock is let go only once every command has said that it waits (or thirty seconds passed):
+/// one that got to the lock late would find it free and never say so.
 /// `FIFO` is the input under test (each one its own FIFO), `FILE` a regular file and `LIB` a
 /// library folder. What is written is not a valid input of any of them: each command fails
 /// once it has the lock, which is after the point this test is about.
 #[cfg(unix)]
 #[test]
 fn every_command_reads_a_fifo_input_before_it_waits_for_the_lock() -> TestResult {
-    let commands: &[&[&str]] = &[
-        &["inspect", "FIFO"],
-        &["logo", "set", "FIFO"],
-        &["rules", "set", "FIFO"],
-        &["report-layout", "set", "terminals", "FIFO"],
-        &[
-            "import",
-            "symbol-dxf",
-            "FIFO",
-            "--id",
-            "t.dxf",
-            "--name",
-            "A",
-            "--lib",
-            "LIB",
-        ],
-        &["import", "footprint-dxf", "FIFO", "--part", "t.part", "--lib", "LIB"],
-        &["import", "model-step", "FIFO", "--part", "t.part", "--lib", "LIB"],
-        &[
-            "import",
-            "symbol-svg",
-            "FIFO",
-            "--id",
-            "t.svg",
-            "--name",
-            "A",
-            "--lib",
-            "LIB",
-        ],
-        &["import", "plc-csv", "FIFO"],
-        &["import", "wago", "FIFO"],
-        &["import", "symbol-kicad", "FIFO", "--lib", "LIB"],
-        &["import", "parts-bmecat", "FIFO", "--lib", "LIB"],
-        &["import", "parts-edz", "FIFO", "--lib", "LIB"],
-        &["import", "parts-edz", "FILE", "--lib", "LIB", "--symbol-map", "FIFO"],
-        &["import", "symbol-qet", "FIFO", "FILE", "FIFO", "--lib", "LIB"],
-        &["import", "parts-csv", "FIFO", "--lib", "LIB"],
-        &["import", "archive", "FIFO"],
-        &["import", "page-dwg", "FIFO", "--page", "p1"],
-        &["import", "pdf", "FIFO"],
-        &["import", "eplan", "FIFO"],
-        &["import", "swe", "FIFO"],
-        &["import", "swe", "FILE", "--symbol-map", "FIFO"],
-        &["import", "swe-library", "FIFO"],
-        &["import", "aml", "FIFO"],
-        &["import", "page-dxf", "FIFO", "--page", "p1"],
-    ];
+    let commands = INPUT_COMMANDS;
     let tmp = tempfile::tempdir()?;
     let dir = tmp.path().join("p");
     new_project(&dir)?;
@@ -622,46 +625,58 @@ fn every_command_reads_a_fifo_input_before_it_waits_for_the_lock() -> TestResult
                 }
             }
         }
-        let child = command.stdout(Stdio::null()).stderr(Stdio::piped()).spawn()?;
-        running.push((args.join(" "), child, writers));
+        let mut child = command.stdout(Stdio::null()).stderr(Stdio::piped()).spawn()?;
+        let stderr = follow(child.stderr.take().ok_or("the command has no stderr")?);
+        running.push(Running {
+            name: args.join(" "),
+            child,
+            writers,
+            stderr,
+            said: Vec::new(),
+        });
     }
 
+    // Until each one has read its input and said that it waits, within a limit.
     let start = Instant::now();
-    let all_written = |running: &[(String, Child, Vec<FifoWriter>)]| {
-        running
-            .iter()
-            .all(|(_, _, writers)| writers.iter().all(|(_, w)| w.is_finished()))
-    };
-    while !all_written(&running) && start.elapsed() < Duration::from_secs(20) {
+    let mut ready = Vec::new();
+    loop {
+        ready.clear();
+        for run in &mut running {
+            ready.push((run.has_read(), run.says_it_waits()));
+        }
+        if ready.iter().all(|(read, waits)| *read && *waits) || start.elapsed() >= Duration::from_secs(30) {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
-    let read_first: Vec<bool> = running
-        .iter()
-        .map(|(_, _, writers)| writers.iter().all(|(_, w)| w.is_finished()))
-        .collect();
-    std::thread::sleep(Duration::from_millis(300));
-    let mut waits = Vec::new();
-    for (_, child, _) in &mut running {
-        waits.push(child.try_wait()?.is_none());
+    let mut still_runs = Vec::new();
+    for run in &mut running {
+        still_runs.push(run.child.try_wait()?.is_none());
     }
     lock.unlock()?;
 
     let mut failures = Vec::new();
-    for (((name, mut child, writers), read_first), waits) in running.into_iter().zip(read_first).zip(waits) {
-        let ended = ends_within(&mut child, Duration::from_secs(30))?;
+    for ((mut run, (read_first, said_it_waits)), still_runs) in running.into_iter().zip(ready).zip(still_runs) {
+        let ended = ends_within(&mut run.child, Duration::from_secs(30))?;
         if !ended {
-            child.kill()?;
+            run.child.kill()?;
         }
-        let out = child.wait_with_output()?;
-        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        run.child.wait()?;
+        // The rest of what it said: its stderr ends with it.
+        run.said.extend(run.stderr.iter().flatten());
+        let name = &run.name;
+        let err = String::from_utf8_lossy(&run.said).into_owned();
         let mut written = true;
-        for (fifo, writer) in writers {
+        for (fifo, writer) in run.writers {
             written &= matches!(finish_writer(&fifo, writer)?, Some(Ok(())));
         }
         if !read_first {
             failures.push(format!("`{name}` did not read its FIFO before the lock: {err}"));
         }
-        if !waits {
+        if !said_it_waits {
+            failures.push(format!("`{name}` did not say it waits while the lock was held: {err}"));
+        }
+        if !still_runs {
             failures.push(format!("`{name}` did not wait for the lock: {err}"));
         }
         if !ended {
@@ -669,9 +684,6 @@ fn every_command_reads_a_fifo_input_before_it_waits_for_the_lock() -> TestResult
         }
         if !written {
             failures.push(format!("the input of `{name}` was not written: {err}"));
-        }
-        if !err.contains("waiting for another wiringcraft command") {
-            failures.push(format!("`{name}` did not say it waits: {err}"));
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
