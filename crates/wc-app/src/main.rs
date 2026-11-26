@@ -3407,6 +3407,29 @@ impl App {
                                 ui.end_row();
                             }
                         }
+                        if form.has(imports::Opt::SymbolMap) {
+                            ui.label("Symbol map").on_hover_text(
+                                "Optional: a text file with one `source name = symbol id` per line, which gives a source block or macro a library symbol",
+                            );
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut form.symbol_map.text)
+                                        .hint_text("none")
+                                        .desired_width(300.0),
+                                );
+                                if ui.button("Browse…").clicked() {
+                                    let start = file.parent().unwrap_or(file.as_path());
+                                    match pick_open("Symbol map", start, ("Symbol map (text file)", &["txt", "map", "*"])) {
+                                        Picked::Path(f) => *error = form.symbol_map.pick(f).err(),
+                                        Picked::Failed(e) | Picked::Unsure(e) => {
+                                            *error = Some(format!("{e} Type the symbol map's path instead."));
+                                        }
+                                        Picked::Cancelled => {}
+                                    }
+                                }
+                            });
+                            ui.end_row();
+                        }
                     });
                     if let Some(e) = error {
                         ui.label(RichText::new(e.as_str()).color(theme::Theme::of(ui.ctx()).error));

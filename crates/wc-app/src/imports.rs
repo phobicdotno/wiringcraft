@@ -111,6 +111,9 @@ pub enum Opt {
     FirstPage,
     /// Which project of a SolidWorks Electrical archive that holds several (`--pick`).
     Project,
+    /// A text file that says which library symbol to draw for which source block or macro
+    /// (`--symbol-map`).
+    SymbolMap,
 }
 
 impl Kind {
@@ -118,7 +121,8 @@ impl Kind {
     pub fn options(self) -> &'static [Opt] {
         match self {
             Kind::PageDwg | Kind::PageDxf => &[Opt::Scale],
-            Kind::Swe => &[Opt::Project, Opt::FirstPage],
+            Kind::Swe => &[Opt::Project, Opt::FirstPage, Opt::SymbolMap],
+            Kind::PartsEdz => &[Opt::SymbolMap],
             Kind::Eplan | Kind::Aml | Kind::Pdf | Kind::Archive => &[Opt::FirstPage],
             _ => &[],
         }
@@ -138,6 +142,8 @@ pub struct Options {
     pub keep_numbers: bool,
     /// Which project of a SolidWorks Electrical archive, counted from 1.
     pub pick: usize,
+    /// The symbol map file of a SolidWorks Electrical or EDZ import; none by default.
+    pub symbol_map: Option<PathBuf>,
 }
 
 impl Default for Options {
@@ -147,6 +153,7 @@ impl Default for Options {
             first_page: None,
             keep_numbers: false,
             pick: 1,
+            symbol_map: None,
         }
     }
 }
@@ -165,6 +172,8 @@ pub struct Form {
     pub projects: Vec<String>,
     /// The project chosen, an index into `projects`.
     pub project: usize,
+    /// The symbol map file, typed or picked with Browse; empty: none.
+    pub symbol_map: crate::prefs::FolderField,
 }
 
 /// The projects of the SolidWorks Electrical archive `file` as the options dialog lists them.
@@ -199,6 +208,7 @@ impl Form {
                 Vec::new()
             },
             project: 0,
+            symbol_map: crate::prefs::FolderField::default(),
         }
     }
 
@@ -234,6 +244,13 @@ impl Form {
                     .map_err(|_| "The first page number must be a whole number, for example 100.".to_owned())?;
                 o.first_page = Some(n);
             }
+        }
+        if self.has(Opt::SymbolMap) && !self.symbol_map.is_empty() {
+            let map = self.symbol_map.path()?;
+            if !map.is_file() {
+                return Err(format!("The symbol map {} is not a file.", map.display()));
+            }
+            o.symbol_map = Some(map);
         }
         Ok(o)
     }
@@ -295,11 +312,12 @@ pub fn start(open: &mut Open, kind: Kind, file: &Path, lib: Option<&Path>, page:
         .unwrap_or_default();
     let mut note = String::new();
     let f = file.to_path_buf();
+    let map = options.symbol_map.clone();
     let (adopt, work): (Adopt, Result<Work, String>) = if kind.needs_library() {
         match lib.map(Path::to_path_buf) {
             Some(lib) => {
                 let work: Work = match kind {
-                    Kind::PartsEdz => Box::new(move |log| run::parts_edz(&f, &lib, None, log)),
+                    Kind::PartsEdz => Box::new(move |log| run::parts_edz(&f, &lib, map.as_deref(), log)),
                     Kind::PartsBmecat => Box::new(move |log| run::parts_bmecat(&f, &lib, log)),
                     _ => Box::new(move |log| run::parts_csv(&f, &lib, log)),
                 };
@@ -388,8 +406,8 @@ fn project_work(open: &Open, kind: Kind, f: PathBuf, page: usize, options: &Opti
         }
         Kind::Swe => {
             let n = if options.keep_numbers { None } else { Some(first()?) };
-            let pick = options.pick;
-            Box::new(move |log| run::swe(&dir, &f, pick, n, None, log))
+            let (pick, map) = (options.pick, options.symbol_map.clone());
+            Box::new(move |log| run::swe(&dir, &f, pick, n, map.as_deref(), log))
         }
         Kind::SweLibrary => Box::new(move |log| run::swe_library(&dir, &f, None, log)),
         Kind::Aml => {
@@ -755,6 +773,10 @@ pub(crate) mod tests {
         for kind in [Kind::PlcCsv, Kind::PartsBmecat, Kind::PartsCsv, Kind::SweLibrary] {
             assert!(kind.options().is_empty(), "{kind:?}");
         }
+        // The symbol map is the SolidWorks project's and the EDZ parts' alone.
+        for kind in [Kind::Eplan, Kind::Aml, Kind::Pdf, Kind::Archive, Kind::PageDxf] {
+            assert!(!Form::new(&open, kind, &file).has(Opt::SymbolMap), "{kind:?}");
+        }
         for bad in ["", "0", "-1", "abc", "inf", "NaN"] {
             let form = Form {
                 scale: bad.to_owned(),
@@ -849,6 +871,133 @@ pub(crate) mod tests {
         let form = Form::new(&open, Kind::Swe, &tmp.path().join("missing.tewzip"));
         assert!(!form.has(Opt::Project) && form.has(Opt::FirstPage));
         assert_eq!(form.options().map(|o| o.pick), Ok(1));
+    }
+
+    /// The symbol the one part in the library folder `lib` points at.
+    fn part_symbol(lib: &Path) -> Option<String> {
+        let file = std::fs::read_dir(lib.join("parts")).ok()?.flatten().next()?.path();
+        let part: wc_core::Part = serde_json::from_str(&std::fs::read_to_string(file).ok()?).ok()?;
+        part.symbol
+    }
+
+    #[test]
+    fn an_edz_part_takes_the_library_symbol_the_symbol_map_gives_its_macro() {
+        let (tmp, mut open) = project();
+        let edz = tmp.path().join("contactor.edz");
+        let xml = r#"<partsmanagement><part P_ARTICLE_PARTNR="ACM.K-1" P_ARTICLE_MANUFACTURER="ACM" P_ARTICLE_DESCR1="en_US@Contactor;" P_ARTICLE_MACRO="ACM\ACM_K1.ema"/></partsmanagement>"#;
+        assert!(write_zip(&edz, &[("parts.xml", xml.as_bytes()), ("ACM_K1.ema", b"m")]));
+
+        // No map by default, as on the command line: the part comes in without a symbol.
+        let form = Form::new(&open, Kind::PartsEdz, &edz);
+        assert!(form.has(Opt::SymbolMap) && !form.has(Opt::FirstPage));
+        assert_eq!(form.options(), Ok(Options::default()));
+        let plain = tmp.path().join("plain");
+        let (done, msg) = import(&mut open, Kind::PartsEdz, &edz, Some(&plain), 0);
+        assert!(done, "{msg}");
+        assert!(msg.contains("imported 1 part(s)"), "{msg}");
+        assert_eq!(part_symbol(&plain), None, "{msg}");
+
+        let map = tmp.path().join("macros.txt");
+        assert!(std::fs::write(&map, "ACM_K1 = wc.coil\n").is_ok());
+        let mut form = Form::new(&open, Kind::PartsEdz, &edz);
+        form.symbol_map.text = map.display().to_string();
+        let options = form.options();
+        let Ok(options) = options else {
+            unreachable!("{options:?}");
+        };
+        assert_eq!(options.symbol_map.as_deref(), Some(map.as_path()));
+        let lib = tmp.path().join("lib");
+        let (done, msg) = import_with(&mut open, Kind::PartsEdz, &edz, Some(&lib), 0, &options);
+        assert!(done, "{msg}");
+        assert_eq!(part_symbol(&lib).as_deref(), Some("wc.coil"), "{msg}");
+
+        // A map that is not there is refused in the form, before the import starts; so it is
+        // for a SolidWorks Electrical project, which takes the same file.
+        for kind in [Kind::PartsEdz, Kind::Swe] {
+            let mut form = Form::new(&open, kind, &edz);
+            assert!(form.has(Opt::SymbolMap), "{kind:?}");
+            form.symbol_map.text = tmp.path().join("missing.txt").display().to_string();
+            assert!(form.options().is_err_and(|e| e.contains("is not a file")), "{kind:?}");
+            form.symbol_map.text = map.display().to_string();
+            assert_eq!(form.options().map(|o| o.symbol_map), Ok(Some(map.clone())), "{kind:?}");
+        }
+    }
+
+    /// A SolidWorks Electrical project database with one page and a coil K1 drawn as the block
+    /// `Coil`.
+    fn swe_database(path: &Path) -> bool {
+        let made = || -> rusqlite::Result<Vec<u8>> {
+            let c = rusqlite::Connection::open_in_memory()?;
+            c.execute_batch(SWE_DATABASE)?;
+            Ok(c.serialize(rusqlite::MAIN_DB)?.to_vec())
+        };
+        made().is_ok_and(|bytes| std::fs::write(path, bytes).is_ok())
+    }
+
+    const SWE_DATABASE: &str = "
+CREATE TABLE tew_bundle (bun_id INTEGER, bun_tag TEXT);
+CREATE TABLE tew_file (fil_id INTEGER, fil_orderno INTEGER, fil_filetype INTEGER, fil_title TEXT, fil_fol_id INTEGER,
+  fil_titleblock TEXT DEFAULT '', fil_bun_id INTEGER DEFAULT 1);
+CREATE TABLE tew_folder (fol_id INTEGER, fol_name TEXT);
+CREATE TABLE tew_translatedtext (tra_objectid INTEGER, tra_objectno INTEGER, tra_lan_strid TEXT, tra_0 TEXT);
+CREATE TABLE tew_component (com_id INTEGER, com_tag TEXT, com_tagpath TEXT, com_type INTEGER,
+  com_com_id INTEGER, com_tagorderno INTEGER, com_fun_id INTEGER, com_loc_id INTEGER, com_parenttagpath TEXT);
+CREATE TABLE tew_buildofmaterial (bom_id INTEGER, bom_objectid INTEGER, bom_orderno INTEGER, bom_reference TEXT, bom_manufacturer TEXT);
+CREATE TABLE tew_symbol (sym_id INTEGER, sym_fil_id INTEGER, sym_com_id INTEGER, sym_blockname TEXT, sym_posx REAL, sym_posy REAL,
+  sym_angle REAL, sym_scalex REAL, sym_scaley REAL, sym_posendx REAL, sym_posendy REAL);
+CREATE TABLE tew_symbolpt (spt_sym_id INTEGER, spt_sct_no INTEGER, spt_no INTEGER, spt_dx REAL, spt_dy REAL);
+CREATE TABLE tew_componentelement (cel_id INTEGER, cel_sym_id INTEGER, cel_sct_no INTEGER, cel_com_id INTEGER, cel_orderno INTEGER);
+CREATE TABLE tew_componentterminal (cte_cel_id INTEGER, cte_no INTEGER, cte_txt TEXT);
+CREATE TABLE tew_line (lin_id INTEGER, lin_fil_id INTEGER, lin_ptstartx REAL, lin_ptstarty REAL, lin_ptendx REAL, lin_ptendy REAL, lin_equ_id INTEGER);
+CREATE TABLE tew_equipotential (equ_id INTEGER, equ_text TEXT);
+CREATE TABLE tew_cable (cab_id INTEGER, cab_tag TEXT, cab_reference TEXT, cab_manufacturer TEXT);
+CREATE TABLE tew_cablewire (caw_cab_id INTEGER, caw_no INTEGER, caw_color TEXT);
+CREATE TABLE tew_wire (wir_id INTEGER, wir_cab_id INTEGER, wir_caw_no INTEGER, wir_tag TEXT,
+  wir_cel_idfrom INTEGER, wir_cte_nofrom INTEGER, wir_cel_idto INTEGER, wir_cte_noto INTEGER,
+  wir_sectiontype INTEGER, wir_sectionorgauge TEXT, wir_color TEXT);
+CREATE TABLE tew_linewirepair (lwp_lin_id INTEGER, lwp_wir_id INTEGER, lwp_wir_orderno INTEGER);
+INSERT INTO tew_bundle VALUES (1, '1');
+INSERT INTO tew_folder VALUES (7, 'Power');
+INSERT INTO tew_file (fil_id, fil_orderno, fil_filetype, fil_title, fil_fol_id) VALUES (10, 1, 12, '01', 7);
+INSERT INTO tew_component (com_id, com_tag, com_tagpath, com_type) VALUES (100, 'K1', '', -1);
+INSERT INTO tew_symbol VALUES (1, 10, 100, 'Coil', 100, 200, 0, 1, 1, NULL, NULL);
+INSERT INTO tew_symbolpt VALUES (1, 0, 0, 0, 5), (1, 0, 1, 0, -5);
+INSERT INTO tew_componentelement (cel_id, cel_sym_id, cel_sct_no) VALUES (50, 1, 0);
+INSERT INTO tew_componentterminal VALUES (50, 0, 'A1'), (50, 1, 'A2');
+";
+
+    #[test]
+    fn a_solidworks_import_reads_the_symbol_map_given_and_none_by_default() {
+        let (tmp, mut open) = project();
+        let db = tmp.path().join("plant.sqlite");
+        assert!(swe_database(&db));
+        // The map names a symbol no library has, which the import says of a map it has read.
+        let map = tmp.path().join("blocks.txt");
+        assert!(std::fs::write(&map, "Coil = nolib.coil\n").is_ok());
+        let unknown = "symbol map names nolib.coil";
+
+        let (done, msg) = import(&mut open, Kind::Swe, &db, None, 0);
+        assert!(done, "{msg}");
+        assert!(!msg.contains(unknown), "{msg}");
+        let devices = open.project.devices.len();
+        assert!(devices > 0, "{msg}");
+        assert!(open.undo());
+
+        let mut form = Form::new(&open, Kind::Swe, &db);
+        form.symbol_map.text = map.display().to_string();
+        let options = form.options();
+        let Ok(options) = options else {
+            unreachable!("{options:?}");
+        };
+        let (done, msg) = import_with(&mut open, Kind::Swe, &db, None, 0, &options);
+        assert!(done, "{msg}");
+        assert!(msg.contains(unknown), "{msg}");
+        assert_eq!(open.project.devices.len(), devices, "{msg}");
+
+        // A map that cannot be read as one stops the import with the line that is wrong.
+        assert!(std::fs::write(&map, "no equals sign\n").is_ok());
+        let (done, msg) = import_with(&mut open, Kind::Swe, &db, None, 0, &options);
+        assert!(!done && msg.contains("line 1"), "{msg}");
     }
 
     #[test]

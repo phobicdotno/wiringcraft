@@ -40,6 +40,8 @@ dirs = "6"
 [dev-dependencies]
 tempfile.workspace = true
 zip.workspace = true
+# A SolidWorks Electrical project database for the import tests.
+rusqlite.workspace = true
 
 [lints]
 workspace = true

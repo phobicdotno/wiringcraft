@@ -3770,6 +3770,7 @@ dependencies = [
  "image",
  "log",
  "rfd",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
