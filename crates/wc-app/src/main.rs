@@ -390,7 +390,8 @@ enum Pending {
     SaveAs,
     Export(Export),
     Marking(wc_report::MarkingOptions),
-    ReportCsv(wc_report::Kind),
+    /// Reports > Save as CSV; `true` for Excel: `;`-separated with a UTF-8 byte order mark.
+    ReportCsv(wc_report::Kind, bool),
     /// File > Import; for parts, the library folder picked in the dialog (none: ask with the
     /// folder picker).
     Import(imports::Kind, Option<import_symbols::ImportTarget>),
@@ -503,7 +504,9 @@ impl chrome::Status for StatusView<'_> {
             Action::Undo => self.open.is_some_and(Open::can_undo),
             Action::Redo => self.open.is_some_and(Open::can_redo),
             Action::Delete if self.ed.panel.is_some() => has && self.ed.panel_pick.is_some(),
-            Action::Delete | Action::Copy | Action::Cut | Action::SaveMacro => has && !self.ed.selection.is_empty(),
+            Action::Delete | Action::Copy | Action::Cut | Action::Duplicate | Action::SaveMacro => {
+                has && !self.ed.selection.is_empty()
+            }
             Action::Rotate if self.ed.panel.is_some() => has && self.ed.panel_pick.is_some(),
             Action::Mirror if self.ed.panel.is_some() => false,
             Action::Rotate | Action::Mirror => {
@@ -982,9 +985,14 @@ impl App {
                 };
                 self.dialog = Some(Dialog::Message(msg));
             }
-            Pending::ReportCsv(kind) => {
+            Pending::ReportCsv(kind, excel) => {
                 let default = open.dir.join("export").join(format!("{}.csv", kind.name()));
-                let (path, note) = match export_target("Save report as CSV", &default, ("CSV", &["csv"]), &pick_save) {
+                let title = if excel {
+                    "Save report as CSV for Excel"
+                } else {
+                    "Save report as CSV"
+                };
+                let (path, note) = match export_target(title, &default, ("CSV", &["csv"]), &pick_save) {
                     Ok(target) => target,
                     Err(why) => {
                         if let Some(why) = why {
@@ -999,7 +1007,7 @@ impl App {
                     parts: &open.parts,
                 };
                 let table = wc_report::build(kind, &inputs);
-                self.ed.message = match write_creating(&path, table.to_csv()) {
+                self.ed.message = match write_creating(&path, report_csv(&table, excel)) {
                     Ok(()) => format!("{}Saved {}", note.replace("\n\n", " "), path.display()),
                     Err(e) => format!("Could not save {}: {e}", path.display()),
                 };
@@ -1276,6 +1284,14 @@ impl App {
         }
     }
 
+    /// Run the command picked in the canvas right-click menu, if any, as its toolbar button
+    /// would be (so a page someone else holds refuses it the same way).
+    fn run_menu_action(&mut self) {
+        if let Some(a) = self.ed.menu_action.take() {
+            self.run(a);
+        }
+    }
+
     /// Show the picker that waits, if it is still for the project open now.
     fn ask_pending(&mut self) {
         // A picker asked for before the import started waits until it is done.
@@ -1311,6 +1327,12 @@ impl App {
         }
         if let Some(name) = self.open.as_ref().and_then(|o| held_for(a, &self.ed, &o.project)) {
             self.ed.message = format!("{name} has this page open; it is read-only here until they leave it.");
+            return;
+        }
+        // The keys are held back while the symbol editor is open; the menu, toolbar and
+        // assistant are too, so the schematic does not change under the editor.
+        if a == Action::Duplicate && self.symbol_editor.is_some() {
+            self.ed.message = "Duplicate was not done: close the symbol editor first.".into();
             return;
         }
         if a == Action::ReportProblem {
@@ -1651,6 +1673,22 @@ impl App {
                     Err(e) => self.ed.message = format!("Nothing was pasted: {e}"),
                 }
             }
+            Action::Duplicate => {
+                // A copy one grid step down and right, through the paste (one undo step, next
+                // free tags), without touching the clipboard.
+                let clip = open.copy(page, &self.ed.selection);
+                let step = if self.prefs.snap > 0.0 { self.prefs.snap } else { 2.5 };
+                match open.paste(page, &clip, clip.anchor + wc_core::geom::Point::new(step, step)) {
+                    Ok(copies) if !copies.is_empty() => {
+                        let n = copies.len();
+                        self.ed.message = format!("Duplicated {n} {}.", if n == 1 { "item" } else { "items" });
+                        self.ed.tool = Tool::Select;
+                        self.ed.selection = copies;
+                    }
+                    Ok(_) => {}
+                    Err(e) => self.ed.message = format!("Nothing was duplicated: {e}"),
+                }
+            }
             Action::AddPage => {
                 self.ed.page = open.add_page();
                 self.ed.selection.clear();
@@ -1907,7 +1945,7 @@ impl App {
     }
 
     fn zoom(&mut self, f: f32) {
-        self.ed.view.zoom = (self.ed.view.zoom * f).clamp(0.3, 60.0);
+        self.ed.zoom_keys(f);
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) -> Vec<Action> {
@@ -1940,17 +1978,18 @@ impl App {
                 (Key::C, Action::CommentTool),
                 (Key::L, Action::LineTool),
                 (Key::Delete, Action::Delete),
+                // Mac laptop keyboards have no Delete key: their "delete" sends Backspace.
+                (Key::Backspace, Action::Delete),
                 (Key::G, Action::ToggleGrid),
                 (Key::F, Action::ZoomFit),
                 (Key::Plus, Action::ZoomIn),
                 (Key::Minus, Action::ZoomOut),
             ] {
-                if i.key_pressed(k) && i.modifiers.is_none() {
+                if pressed_with(i, k, Modifiers::is_none) {
                     out.push(a);
                 }
             }
-            if i.key_pressed(Key::Enter)
-                && i.modifiers.is_none()
+            if pressed_with(i, Key::Enter, Modifiers::is_none)
                 && matches!(self.ed.tool, Tool::Polyline | Tool::BlackBox)
             {
                 self.ed.finish_shape = true;
@@ -3062,7 +3101,15 @@ impl App {
                         ui.horizontal(|ui| {
                             if ui.button("Save as CSV…").clicked() {
                                 let kind = *kind;
-                                then = Some(Box::new(move |app: &mut App| app.ask(Pending::ReportCsv(kind))));
+                                then = Some(Box::new(move |app: &mut App| app.ask(Pending::ReportCsv(kind, false))));
+                            }
+                            if ui
+                                .button("Save as CSV for Excel (semicolon)…")
+                                .on_hover_text("Semicolon-separated with a UTF-8 byte order mark, so Excel opens it in columns with æ ø å intact")
+                                .clicked()
+                            {
+                                let kind = *kind;
+                                then = Some(Box::new(move |app: &mut App| app.ask(Pending::ReportCsv(kind, true))));
                             }
                             if ui.button("Save as Excel").clicked() {
                                 let path = o.dir.join("export").join(format!("{}.xlsx", kind.name()));
@@ -4390,6 +4437,17 @@ fn export_whole(open: &Open, kind: Export, pick: PickSave<'_>) -> Option<String>
     Some(note + &msg)
 }
 
+/// A report's CSV text: plain comma CSV, or for Excel (`excel`) `;`-separated with a leading
+/// UTF-8 byte order mark, as `wiringcraft report --sep ";"` writes it, so Excel in a
+/// comma-decimal locale splits the columns and reads æ ø å right.
+fn report_csv(table: &wc_report::Table, excel: bool) -> String {
+    if excel {
+        format!("\u{feff}{}", table.to_csv_with(';'))
+    } else {
+        table.to_csv()
+    }
+}
+
 /// Write a file, making its folder first.
 fn write_creating(path: &Path, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
     if let Some(d) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -4741,6 +4799,7 @@ fn ctrl_shortcuts(ctx: &egui::Context, dialog_open: bool) -> Vec<Action> {
             (Key::A, Action::SelectAll),
             (Key::F, Action::Find),
             (Key::J, Action::Assistant),
+            (Key::D, Action::Duplicate),
         ] {
             // With Shift first: Ctrl+Shift+N is a new project, Ctrl+Shift+Z redoes (a plain Ctrl
             // shortcut would also take them, as it lets Shift through).
@@ -4760,6 +4819,15 @@ fn ctrl_shortcuts(ctx: &egui::Context, dialog_open: bool) -> Vec<Action> {
         }
     });
     out
+}
+
+/// Whether `key` was pressed this frame with modifiers that `ok` accepts. It looks at the
+/// modifiers held at the press itself: the frame's modifiers can differ, as when Ctrl is let go
+/// before the frame runs, and Ctrl+R must not then rotate.
+fn pressed_with(i: &egui::InputState, key: Key, ok: impl Fn(&Modifiers) -> bool) -> bool {
+    i.events
+        .iter()
+        .any(|e| matches!(e, egui::Event::Key { key: k, pressed: true, modifiers, .. } if *k == key && ok(modifiers)))
 }
 
 fn form_fields(block: &std::collections::BTreeMap<String, String>) -> Vec<(String, String)> {
@@ -5315,6 +5383,7 @@ impl eframe::App for App {
         for a in page_actions {
             self.run(a);
         }
+        self.run_menu_action();
         // The picker opens on the next frame, outside the panel that asked for it.
         if let Some((kind, part)) = self.ed.ask_attach.take() {
             self.queue(Pending::Attach(kind, part));
@@ -5440,9 +5509,13 @@ impl App {
                     ed.delete_selected();
                     false
                 }
-                Action::Cut | Action::Copy | Action::Paste | Action::Rotate | Action::Mirror | Action::SelectAll => {
-                    false
-                }
+                Action::Cut
+                | Action::Copy
+                | Action::Paste
+                | Action::Duplicate
+                | Action::Rotate
+                | Action::Mirror
+                | Action::SelectAll => false,
                 _ => true,
             })
             .collect()
@@ -5750,6 +5823,32 @@ fn changed_fields(
 }
 
 #[cfg(test)]
+mod report_csv_tests {
+    use super::report_csv;
+
+    fn table() -> wc_report::Table {
+        wc_report::Table {
+            columns: vec!["Tag".into(), "Note".into()],
+            rows: vec![vec!["K1".into(), "Relé, 24 V".into()]],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn excel_csv_is_semicolon_separated_with_a_utf8_bom() {
+        let bytes = report_csv(&table(), true).into_bytes();
+        let mut want = vec![0xEF, 0xBB, 0xBF];
+        want.extend_from_slice("Tag;Note\r\nK1;Relé, 24 V\r\n".as_bytes());
+        assert_eq!(bytes, want);
+    }
+
+    #[test]
+    fn plain_csv_is_comma_separated_without_a_bom() {
+        assert_eq!(report_csv(&table(), false), "Tag,Note\r\nK1,\"Relé, 24 V\"\r\n");
+    }
+}
+
+#[cfg(test)]
 mod page_field_tests {
     use super::changed_fields;
 
@@ -5815,7 +5914,8 @@ fn follow_panel_pick(ed: &mut Editor, project: &wc_core::Project, id: &str, tag:
 fn held_for(a: Action, ed: &Editor, project: &wc_core::Project) -> Option<String> {
     // With a panel shown these still work on the schematic page under it (Delete and Rotate go
     // to the panel's picked device instead), so they follow that page's hold.
-    let on_page_under_panel = ed.panel.is_some() && matches!(a, Action::Paste | Action::Cut | Action::Mirror);
+    let on_page_under_panel =
+        ed.panel.is_some() && matches!(a, Action::Paste | Action::Duplicate | Action::Cut | Action::Mirror);
     let name = if a.edits_page_itself() || on_page_under_panel {
         let page = project.pages.get(ed.page)?;
         // Moving a page up or down renumbers its neighbour too.
@@ -6845,6 +6945,80 @@ mod held_tests {
         // The panel was removed.
         follow_panel_pick(&mut ed, &project, "gone", k1.as_ref());
         assert_eq!((ed.panel, ed.panel_pick), (None, None));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod menu_action_tests {
+    use super::*;
+
+    /// An app on a test project with one symbol placed and selected on the first page.
+    fn app() -> (tempfile::TempDir, App, String) {
+        let (tmp, mut open) = crate::state::tests::project();
+        let id = open.place(0, "wc.coil", wc_core::Point::new(90.0, 60.0)).unwrap();
+        let mut ed = Editor::default();
+        ed.selection = vec![Selection::Symbol(id.clone())];
+        let app = App {
+            prefs: Prefs::default(),
+            open: Some(open),
+            ed,
+            chrome: Default::default(),
+            panels: Default::default(),
+            dialog: None,
+            clipboard: Default::default(),
+            copied_text: None,
+            applied_theme: crate::theme::Mode::Light,
+            assistant: Default::default(),
+            open_url: Vec::new(),
+            logged: Default::default(),
+            share: Default::default(),
+            symbol_editor: None,
+            find: None,
+            pending: None,
+            pending_for: None,
+            strip_editor: None,
+            show_layers: false,
+            live: Default::default(),
+            fetch: None,
+            importing: None,
+        };
+        (tmp, app, id)
+    }
+
+    fn rotation(a: &App, id: &str) -> wc_core::geom::Rotation {
+        let open = a.open.as_ref().unwrap();
+        open.project.pages[0]
+            .symbols
+            .iter()
+            .find(|s| s.id == id)
+            .unwrap()
+            .rotation
+    }
+
+    #[test]
+    fn rotate_picked_in_the_menu_turns_the_selected_symbol() {
+        let (_tmp, mut a, id) = app();
+        assert_eq!(rotation(&a, &id), wc_core::geom::Rotation::R0);
+        a.ed.menu_action = Some(Action::Rotate);
+        a.run_menu_action();
+        assert_eq!(rotation(&a, &id), wc_core::geom::Rotation::R90);
+        assert!(a.ed.menu_action.is_none(), "run once");
+        assert!(a.open.as_ref().unwrap().can_undo());
+    }
+
+    #[test]
+    fn rotate_picked_in_the_menu_on_a_held_page_changes_nothing() {
+        let (_tmp, mut a, id) = app();
+        let page_id = a.open.as_ref().unwrap().project.pages[0].id.clone();
+        a.ed.held_by.insert(page_id, "Kim".into());
+        let before = a.open.as_ref().unwrap().project.pages[0].clone();
+        a.ed.menu_action = Some(Action::Rotate);
+        a.run_menu_action();
+        assert_eq!(rotation(&a, &id), wc_core::geom::Rotation::R0);
+        assert_eq!(a.open.as_ref().unwrap().project.pages[0], before);
+        assert!(a.ed.message.contains("Kim has this page open"), "{}", a.ed.message);
+        assert!(a.ed.menu_action.is_none());
     }
 }
 

@@ -23,6 +23,8 @@ pub struct View {
     pub offset: Vec2,
     /// Fit the page on the next frame (after opening, or when asked).
     pub fit: bool,
+    /// The size of the canvas when it was last drawn: Zoom in and Zoom out keep its centre.
+    pub size: Vec2,
 }
 
 impl Default for View {
@@ -31,7 +33,27 @@ impl Default for View {
             zoom: 3.0,
             offset: Vec2::new(20.0, 20.0),
             fit: true,
+            size: Vec2::ZERO,
         }
+    }
+}
+
+/// The schematic canvas' zoom limits, in screen points per millimetre.
+pub const ZOOM_LIMITS: (f32, f32) = (0.3, 60.0);
+
+impl View {
+    /// Zoom by `factor` about `anchor` (relative to the canvas' top-left corner), so the page
+    /// point under it stays put, within `limits`. Zooming out never zooms in, nor the other way.
+    pub fn zoom_about(&mut self, anchor: Vec2, factor: f32, (min, max): (f32, f32)) {
+        let new_zoom = (self.zoom * factor).clamp(min, max);
+        let new_zoom = if factor < 1.0 {
+            new_zoom.min(self.zoom)
+        } else {
+            new_zoom.max(self.zoom)
+        };
+        let a = anchor - self.offset;
+        self.offset += a - a * (new_zoom / self.zoom);
+        self.zoom = new_zoom;
     }
 }
 
@@ -97,6 +119,9 @@ pub struct Editor {
     /// Selected free drawings a sync showed the page without while this person's change was
     /// on its way to the host: selected again when the host accepts it.
     pub waiting_graphics: Option<crate::edit::WaitingGraphics>,
+    /// A command picked in the canvas right-click menu (Rotate, Mirror, Copy, Cut, Delete):
+    /// the app runs it like the toolbar button.
+    pub menu_action: Option<crate::actions::Action>,
 }
 
 impl Default for Editor {
@@ -131,6 +156,7 @@ impl Default for Editor {
             layers: Default::default(),
             live: Vec::new(),
             waiting_graphics: None,
+            menu_action: None,
         }
     }
 }
@@ -168,6 +194,17 @@ enum Drag {
 }
 
 impl Editor {
+    /// Zoom in or out by `factor` from the keys or buttons, about the centre of the visible
+    /// canvas, within the zoom limits of the schematic or of the panel view.
+    pub fn zoom_keys(&mut self, factor: f32) {
+        let limits = if self.panel.is_some() {
+            crate::panel_view::ZOOM_LIMITS
+        } else {
+            ZOOM_LIMITS
+        };
+        self.view.zoom_about(self.view.size / 2.0, factor, limits);
+    }
+
     /// Who holds the page shown, in a shared session: then it is read-only here and only
     /// selecting, panning and zooming work on it. `None` in the panel view and on own pages.
     pub fn held_page<'a>(&'a self, project: &wc_core::Project) -> Option<&'a str> {
@@ -598,6 +635,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
         return;
     }
     let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+    ed.view.size = rect.size();
     let painter = ui.painter_at(rect);
     let t = theme::Theme::of(ui.ctx());
     painter.rect_filled(rect, 0.0, t.backdrop);
@@ -651,11 +689,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
         if scroll.abs() > 0.0
             && let Some(hp) = resp.hover_pos()
         {
-            let factor = (scroll / 300.0).exp();
-            let new_zoom = (ed.view.zoom * factor).clamp(0.3, 60.0);
-            let anchor = hp - rect.min - ed.view.offset;
-            ed.view.offset += anchor - anchor * (new_zoom / ed.view.zoom);
-            ed.view.zoom = new_zoom;
+            ed.view.zoom_about(hp - rect.min, (scroll / 300.0).exp(), ZOOM_LIMITS);
         }
     }
     if resp.dragged_by(egui::PointerButton::Middle) || resp.dragged_by(egui::PointerButton::Secondary) {
@@ -1347,16 +1381,22 @@ fn select_tool(
             (None, false) => ed.selection.clear(),
         }
     }
-    // Right-click on a wire: select it (keeping a selection it is part of) and offer the route
-    // styles for every selected wire.
+    // Right-click on a wire, symbol, free text or drawing: select it (keeping a selection it is
+    // part of) and offer the route styles for every selected wire and the usual edits for the
+    // selected symbols, text and drawings.
     if resp.secondary_clicked()
         && let Some(at) = resp.interact_pointer_pos().map(|p| xf.mm(p))
     {
         let hit = pick(open, ed, page, at, tol);
         right_clicked(ed, hit);
     }
-    if !held && !selected_wires(ed).is_empty() {
-        resp.context_menu(|ui| route_menu(ui, open, ed));
+    if !held && (!edit_menu_actions(ed).is_empty() || !selected_wires(ed).is_empty()) {
+        resp.context_menu(|ui| {
+            if !selected_wires(ed).is_empty() {
+                route_menu(ui, open, ed);
+            }
+            edit_menu(ui, ed);
+        });
     }
     // A drag is only seen once the pointer has moved: it starts where the button went down,
     // so a small target (a sizing corner) is not missed by a quick drag.
@@ -1766,11 +1806,11 @@ fn wired_note(n: usize) -> String {
     }
 }
 
-/// A right-click on `hit`: a wire that is not selected becomes the only selection; a selected
-/// one keeps the selection it is part of, so the menu acts on all of it. Anything else leaves
-/// the selection alone.
+/// A right-click on `hit`: a wire, symbol, free text or drawing that is not selected becomes the
+/// only selection; a selected one keeps the selection it is part of, so the menu acts on all of
+/// it. Anything else leaves the selection alone.
 fn right_clicked(ed: &mut Editor, hit: Option<Selection>) {
-    if let Some(h @ Selection::Wire(_)) = hit
+    if let Some(h @ (Selection::Wire(_) | Selection::Symbol(_) | Selection::Graphic(_))) = hit
         && !ed.is_selected(&h)
     {
         ed.select_only(h);
@@ -1786,6 +1826,53 @@ fn selected_wires(ed: &Editor) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+/// True when a symbol is selected.
+fn has_symbols(ed: &Editor) -> bool {
+    ed.selection.iter().any(|s| matches!(s, Selection::Symbol(_)))
+}
+
+/// The edits the right-click menu offers for the selection, run as the toolbar runs them:
+/// Rotate, Mirror, Copy, Cut and Delete with a symbol selected; Copy, Cut and Delete with only
+/// free text or drawings (Rotate and Mirror turn symbols only); none otherwise.
+fn edit_menu_actions(ed: &Editor) -> &'static [crate::actions::Action] {
+    use crate::actions::Action;
+    if has_symbols(ed) {
+        &[
+            Action::Rotate,
+            Action::Mirror,
+            Action::Copy,
+            Action::Cut,
+            Action::Delete,
+        ]
+    } else if ed.selection.iter().any(|s| matches!(s, Selection::Graphic(_))) {
+        &[Action::Copy, Action::Cut, Action::Delete]
+    } else {
+        &[]
+    }
+}
+
+/// The edit entries of the right-click menu (see [`edit_menu_actions`]). The picked command is
+/// left in [`Editor::menu_action`] for the app to run.
+fn edit_menu(ui: &mut egui::Ui, ed: &mut Editor) {
+    let actions = edit_menu_actions(ed);
+    if actions.is_empty() {
+        return;
+    }
+    if !selected_wires(ed).is_empty() {
+        ui.separator();
+    }
+    for &a in actions {
+        let info = a.info();
+        if ui
+            .add(egui::Button::new(info.label).shortcut_text(info.shortcut))
+            .clicked()
+        {
+            ed.menu_action = Some(a);
+            ui.close_menu();
+        }
+    }
 }
 
 /// The route style shared by all of `wires`, or `None` when they differ.
@@ -1812,6 +1899,11 @@ fn route_menu(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor) {
             ed.message = route_note(open.set_route(ed.page, &wires, style), style);
             ui.close_menu();
         }
+    }
+    // With symbols, text or drawings selected too, the edit entries' Delete removes the whole
+    // selection.
+    if !edit_menu_actions(ed).is_empty() {
+        return;
     }
     ui.separator();
     if ui.add(egui::Button::new("Delete").shortcut_text("Del")).clicked() {
@@ -2225,6 +2317,12 @@ fn wire_tool(
         },
         None => Endpoint::Point { at: cur },
     };
+    // A pin is always on the sheet; a free start, bend or end must be too.
+    let off_sheet = near.is_none() && !on_paper(open, ed.page, cur);
+    if off_sheet && (resp.double_clicked() || resp.clicked_by(egui::PointerButton::Primary)) {
+        ed.message = "Click on the sheet to draw the wire.".into();
+        return;
+    }
     if resp.double_clicked() {
         if let Some((start, mut via)) = ed.wire.take() {
             // The first click of the double click already added this point as a bend.
@@ -2320,6 +2418,40 @@ mod tests {
         for &(x, y) in pts {
             shape_click(open, ed, Point::new(x, y));
         }
+    }
+
+    /// Zoom in and Zoom out keep the page point at the centre of the visible canvas in place
+    /// (#826), and Zoom out from below the lowest zoom does not zoom in.
+    #[test]
+    fn zoom_keys_keep_the_view_centre() {
+        let mut ed = Editor {
+            view: View {
+                zoom: 2.0,
+                offset: Vec2::new(30.0, -40.0),
+                fit: false,
+                size: Vec2::new(800.0, 600.0),
+            },
+            ..Default::default()
+        };
+        let centre = |v: &View| (v.size / 2.0 - v.offset) / v.zoom;
+        let before = centre(&ed.view);
+        ed.zoom_keys(1.25);
+        assert!((ed.view.zoom - 2.5).abs() < 1e-5, "{}", ed.view.zoom);
+        assert!(
+            (centre(&ed.view) - before).length() < 1e-3,
+            "{:?} {before:?}",
+            centre(&ed.view)
+        );
+        ed.zoom_keys(0.8);
+        assert!((centre(&ed.view) - before).length() < 1e-3);
+
+        ed.view.zoom = 0.2;
+        ed.zoom_keys(0.8);
+        assert!(
+            (ed.view.zoom - 0.2).abs() < 1e-6,
+            "Zoom out zoomed in to {}",
+            ed.view.zoom
+        );
     }
 
     #[test]
@@ -2620,6 +2752,7 @@ mod tests {
             zoom: 1.0,
             offset: Vec2::ZERO,
             fit: false,
+            ..Default::default()
         };
         painted(
             &ctx,
@@ -2704,6 +2837,7 @@ mod tests {
                 zoom: 1.0,
                 offset: Vec2::ZERO,
                 fit: false,
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -3795,6 +3929,48 @@ mod tests {
         painted(ctx, o, ed, t + 0.02, vec![button(false)]);
     }
 
+    #[test]
+    fn the_wire_tool_takes_no_start_bend_or_free_end_outside_the_sheet() {
+        let (_tmp, mut o) = project();
+        let mut ed = Editor {
+            tool: Tool::Wire,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        painted(&ctx, &mut o, &mut ed, 0.5, vec![]);
+        // Pan the sheet right and down so the top-left of the canvas is off the paper.
+        ed.view = View {
+            zoom: 3.0,
+            offset: Vec2::new(300.0, 300.0),
+            fit: false,
+        };
+        let (off, on) = (egui::pos2(40.0, 40.0), egui::pos2(500.0, 450.0));
+        let wires = |o: &Open| o.project.pages[0].wires.len();
+
+        // A click outside the sheet starts no wire.
+        click_at(&ctx, &mut o, &mut ed, off, 1.0);
+        assert!(!on_paper(&o, 0, ed.cursor.unwrap()), "{:?}", ed.cursor);
+        assert!(ed.wire.is_none());
+        assert_eq!(ed.message, "Click on the sheet to draw the wire.");
+
+        // Started on the sheet, a click outside adds no bend and a double-click there no end.
+        click_at(&ctx, &mut o, &mut ed, on, 2.0);
+        assert!(on_paper(&o, 0, ed.cursor.unwrap()), "{:?}", ed.cursor);
+        assert!(ed.wire.as_ref().is_some_and(|(_, via)| via.is_empty()));
+        click_at(&ctx, &mut o, &mut ed, off, 3.0);
+        click_at(&ctx, &mut o, &mut ed, off, 3.1);
+        assert!(ed.wire.as_ref().is_some_and(|(_, via)| via.is_empty()), "{:?}", ed.wire);
+        assert_eq!(wires(&o), 0);
+
+        // A double-click on the sheet still ends the wire on a free point.
+        let end = on + Vec2::new(60.0, 40.0);
+        click_at(&ctx, &mut o, &mut ed, end, 4.0);
+        click_at(&ctx, &mut o, &mut ed, end, 4.1);
+        assert!(ed.wire.is_none());
+        assert_eq!(wires(&o), 1);
+    }
+
     /// Page 2 with a free text, a numbered wire, a coil -K1 whose contact is on page 3 (so a
     /// cross-reference shows under the coil), a review comment and a scanned sheet whose
     /// picture is missing (so its placeholder text shows).
@@ -3956,12 +4132,74 @@ mod tests {
         };
         right_clicked(&mut ed, Some(wire("w1")));
         assert_eq!(ed.selection, [wire("w1"), wire("w2")]);
-        right_clicked(&mut ed, Some(Selection::Symbol("s1".into())));
+        right_clicked(&mut ed, Some(Selection::Cloud(0)));
+        right_clicked(&mut ed, Some(Selection::RevisionTable));
         right_clicked(&mut ed, None);
-        assert_eq!(ed.selection, [wire("w1"), wire("w2")], "only wires change it");
+        assert_eq!(
+            ed.selection,
+            [wire("w1"), wire("w2")],
+            "only wires, symbols and drawings change it"
+        );
         right_clicked(&mut ed, Some(wire("w3")));
         assert_eq!(ed.selection, [wire("w3")]);
         assert_eq!(selected_wires(&ed), ["w3"]);
+    }
+
+    #[test]
+    fn right_click_on_a_symbol_selects_it_or_keeps_its_selection() {
+        let sym = |id: &str| Selection::Symbol(id.into());
+        let mut ed = Editor {
+            selection: vec![sym("s1"), Selection::Wire("w1".into())],
+            ..Editor::default()
+        };
+        right_clicked(&mut ed, Some(sym("s1")));
+        assert_eq!(
+            ed.selection,
+            [sym("s1"), Selection::Wire("w1".into())],
+            "a selected one keeps it"
+        );
+        assert!(has_symbols(&ed));
+        right_clicked(&mut ed, Some(sym("s2")));
+        assert_eq!(ed.selection, [sym("s2")], "one not selected becomes the only selection");
+        assert!(selected_wires(&ed).is_empty());
+        let labels = |ed: &Editor| -> Vec<&str> { edit_menu_actions(ed).iter().map(|a| a.info().label).collect() };
+        assert_eq!(labels(&ed), ["Rotate", "Mirror", "Copy", "Cut", "Delete"]);
+    }
+
+    #[test]
+    fn right_click_on_text_or_a_drawing_offers_copy_cut_and_delete() {
+        let labels = |ed: &Editor| -> Vec<&str> { edit_menu_actions(ed).iter().map(|a| a.info().label).collect() };
+        // Not selected: it becomes the only selection, and the menu has the edits that work on it.
+        let mut ed = Editor {
+            selection: vec![Selection::Wire("w1".into())],
+            ..Editor::default()
+        };
+        assert!(labels(&ed).is_empty(), "wires alone keep only the route menu");
+        right_clicked(&mut ed, Some(Selection::Graphic(2)));
+        assert_eq!(ed.selection, [Selection::Graphic(2)]);
+        assert_eq!(labels(&ed), ["Copy", "Cut", "Delete"]);
+        // Selected: the selection it is part of stays.
+        let mut ed = Editor {
+            selection: vec![
+                Selection::Graphic(0),
+                Selection::Graphic(1),
+                Selection::Wire("w1".into()),
+            ],
+            ..Editor::default()
+        };
+        right_clicked(&mut ed, Some(Selection::Graphic(1)));
+        assert_eq!(
+            ed.selection,
+            [
+                Selection::Graphic(0),
+                Selection::Graphic(1),
+                Selection::Wire("w1".into())
+            ]
+        );
+        assert_eq!(labels(&ed), ["Copy", "Cut", "Delete"]);
+        // With a symbol among them, Rotate and Mirror come back.
+        ed.selection.push(Selection::Symbol("s1".into()));
+        assert_eq!(labels(&ed), ["Rotate", "Mirror", "Copy", "Cut", "Delete"]);
     }
 
     #[test]
