@@ -17,7 +17,11 @@ fn run(dir: &Path, args: &[&str], stdin: &str) -> Result<Output, Box<dyn std::er
         .stderr(Stdio::piped())
         .spawn()?;
     if let Some(mut input) = child.stdin.take() {
-        input.write_all(stdin.as_bytes())?;
+        // A command refused before it reads its input may have ended already.
+        match input.write_all(stdin.as_bytes()) {
+            Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => return Err(e.into()),
+            _ => {}
+        }
     }
     Ok(child.wait_with_output()?)
 }
