@@ -551,6 +551,20 @@ fn every_starter_symbol_loads_under_its_file_name_with_distinct_pins() -> Result
     let [end1, wiper, end3] = [0, 1, 2].map(|i| pot.pins[i].at);
     assert_eq!(end1.x, end3.x, "pins 1 and 3 share a vertical line");
     assert_ne!(wiper.x, end1.x, "the wiper sits off the line between 1 and 3");
+    // Plug and socket (#880): one contact each, letter code X, the socket wired from the top
+    // and the plug from the bottom so a plug drawn under a socket mates with it.
+    for (id, dir) in [
+        ("wc.connector.socket", wc_core::symbol::PinDir::Up),
+        ("wc.connector.plug", wc_core::symbol::PinDir::Down),
+    ] {
+        let (s, _) = lib.symbol(id)?;
+        assert_eq!(s.role, SymbolRole::Standalone, "{id}");
+        assert_eq!(s.letter_code, "X", "{id}");
+        assert_eq!(s.category, "terminals", "{id}");
+        let names: Vec<_> = s.pins.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["1"], "{id}");
+        assert_eq!(s.pins[0].dir, dir, "{id}");
+    }
     // The timer relay set (#531): coils drive, delayed contacts follow them.
     for (id, role) in [
         ("wc.coil.ondelay", SymbolRole::Main),
@@ -672,6 +686,31 @@ fn the_starter_current_transformer_has_primary_and_secondary_terminals() -> Resu
     assert_eq!(ct.letter_code, "T");
     let names: Vec<_> = ct.pins.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, ["P1", "P2", "S1", "S2"]);
+    Ok(())
+}
+
+#[test]
+fn the_starter_functional_earth_is_not_the_protective_earth() -> Result<()> {
+    // #897: a plain (functional) earth for signal grounds, 0 V and screens.
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
+    project.meta.libraries = vec![LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: starter.to_string_lossy().into(),
+        reference: None,
+    }];
+    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (fe, _) = lib.symbol("wc.fe")?;
+    let (pe, _) = lib.symbol("wc.pe")?;
+    assert_eq!(fe.id, "wc.fe");
+    assert_eq!(fe.category, "power");
+    assert_eq!(fe.role, SymbolRole::Standalone);
+    let names: Vec<_> = fe.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["FE"]);
+    assert!(!fe.description.is_empty());
+    assert_ne!(fe.description, pe.description);
     Ok(())
 }
 
@@ -799,5 +838,27 @@ fn the_starter_ammeter_and_voltmeter_are_measuring_instruments() -> Result<()> {
         let names: Vec<_> = m.pins.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["1", "2"], "{id}");
     }
+    Ok(())
+}
+
+#[test]
+fn the_starter_battery_has_plus_and_minus_pins() -> Result<()> {
+    // #764: a battery or cell for backup supplies and buffered 24 V DC circuits.
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
+    project.meta.libraries = vec![LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: starter.to_string_lossy().into(),
+        reference: None,
+    }];
+    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (b, _) = lib.symbol("wc.battery")?;
+    assert_eq!(b.role, SymbolRole::Standalone);
+    assert_eq!(b.letter_code, "G");
+    assert_eq!(b.category, "power");
+    let names: Vec<_> = b.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["+", "-"]);
     Ok(())
 }

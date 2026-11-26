@@ -69,22 +69,37 @@ impl Clipboard {
         self.symbols.is_empty() && self.wires.is_empty() && self.graphics.is_empty()
     }
 
-    /// A plain-text line for the system clipboard: the copied device tags.
+    /// How many items were copied, in words: "1 item", "3 items". Drawings count too.
+    pub fn count(&self) -> String {
+        plural(
+            self.symbols.len() + self.wires.len() + self.graphics.len(),
+            "item",
+            "items",
+        )
+    }
+
+    /// A plain-text line for the system clipboard: what was copied and the copied device tags.
     pub fn summary(&self) -> String {
         let tags: Vec<String> = self
             .symbols
             .iter()
             .filter_map(|s| s.tag.as_ref().map(ToString::to_string))
             .collect();
-        format!(
-            "WiringCraft: {} symbols, {} wires {}",
-            self.symbols.len(),
-            self.wires.len(),
-            tags.join(" ")
-        )
-        .trim_end()
-        .to_owned()
+        let mut what = format!(
+            "{}, {}",
+            plural(self.symbols.len(), "symbol", "symbols"),
+            plural(self.wires.len(), "wire", "wires")
+        );
+        if !self.graphics.is_empty() {
+            what += &format!(", {}", plural(self.graphics.len(), "drawing", "drawings"));
+        }
+        format!("WiringCraft: {what} {}", tags.join(" ")).trim_end().to_owned()
     }
+}
+
+/// `n` with the word for one or for many.
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
 }
 
 fn ids(sel: &[Selection]) -> (BTreeSet<&str>, BTreeSet<&str>) {
@@ -759,6 +774,19 @@ impl Open {
         self.checkpoint();
         if let Some(p) = self.project.panels.get_mut(panel) {
             *p = turned;
+        }
+        true
+    }
+
+    /// Take item `item` (a device, DIN rail or wire duct) off panel layout `panel`, in one undo
+    /// step. Returns false, with no undo step, when there is no such item.
+    pub fn delete_panel_item(&mut self, panel: usize, item: usize) -> bool {
+        if self.project.panels.get(panel).is_none_or(|p| item >= p.items.len()) {
+            return false;
+        }
+        self.checkpoint();
+        if let Some(p) = self.project.panels.get_mut(panel) {
+            p.items.remove(item);
         }
         true
     }
@@ -1567,6 +1595,29 @@ mod tests {
     }
 
     #[test]
+    fn copying_only_a_drawing_counts_it() {
+        let (_tmp, mut o, page, _a, _b) = setup();
+        let line = o
+            .add_graphic(
+                page,
+                Shape::Line {
+                    a: Point::new(200.0, 20.0),
+                    b: Point::new(260.0, 20.0),
+                },
+            )
+            .unwrap();
+        let clip = o.copy(page, &[line]);
+        assert!(!clip.is_empty());
+        assert_eq!(clip.count(), "1 item");
+        assert_eq!(clip.summary(), "WiringCraft: 0 symbols, 0 wires, 1 drawing");
+        // With symbols and the wire too, the drawing is counted with them.
+        let all = o.select_all(page);
+        let clip = o.copy(page, &all);
+        assert_eq!(clip.count(), "4 items");
+        assert!(clip.summary().starts_with("WiringCraft: 2 symbols, 1 wire, 1 drawing "));
+    }
+
+    #[test]
     fn copying_a_wire_alone_frees_its_ends_and_delete_many_is_one_step() {
         let (_tmp, mut o, page, a, _b) = setup();
         let w = o.project.pages[page].wires[0].id.clone();
@@ -1580,5 +1631,35 @@ mod tests {
         assert!(o.project.pages[page].symbols.is_empty() && o.project.pages[page].wires.is_empty());
         assert!(o.undo());
         assert_eq!(o.project.pages[page].symbols.len(), 2);
+    }
+
+    #[test]
+    fn a_rail_or_duct_is_taken_off_a_panel_in_one_undo_step() {
+        use wc_core::panel::{Panel, PanelItem};
+        let (_tmp, mut o) = project();
+        let mut panel = Panel::new("panel1", "Panel 1", 600.0, 800.0);
+        panel.items = vec![
+            PanelItem::Duct {
+                min: Point::new(0.0, 0.0),
+                max: Point::new(600.0, 60.0),
+            },
+            PanelItem::Rail {
+                at: Point::new(20.0, 150.0),
+                length: 560.0,
+            },
+        ];
+        o.project.panels.push(panel);
+        let steps = o.undo_steps();
+        assert!(o.delete_panel_item(0, 1));
+        assert_eq!(o.undo_steps(), steps + 1);
+        assert!(matches!(o.project.panels[0].items[..], [PanelItem::Duct { .. }]));
+        assert!(o.delete_panel_item(0, 0));
+        assert!(o.project.panels[0].items.is_empty());
+        // Nothing left to take: no undo step.
+        assert!(!o.delete_panel_item(0, 0));
+        assert_eq!(o.undo_steps(), steps + 2);
+        assert!(o.undo());
+        assert!(o.undo());
+        assert_eq!(o.project.panels[0].items.len(), 2);
     }
 }

@@ -284,6 +284,17 @@ enum Cmd {
         #[arg(long = "type")]
         kind: Option<String>,
     },
+    /// Delete symbols and wires from a page by their ids (as `place`, `box` and `wire` print
+    /// them). Wires that end on a pin of a deleted symbol go too, as in the app; devices keep
+    /// their data. An id that is not on the page is an error and nothing changes. Prints each
+    /// deleted id.
+    Delete {
+        /// The page's id.
+        page: String,
+        /// The ids of the symbols and wires to delete, e.g. `s1 w3`.
+        #[arg(required = true)]
+        ids: Vec<String>,
+    },
     /// The project's locations (cabinets, rooms, panels): the `+` part of device tags.
     #[command(subcommand)]
     Location(LocationCmd),
@@ -323,7 +334,7 @@ enum Cmd {
     /// order under which headings, sorting, grouping and the title-block values above the table.
     #[command(subcommand)]
     ReportLayout(ReportLayoutCmd),
-    /// Set a device's part and description.
+    /// Set a device's part and description, or with neither option print them.
     Device {
         /// Device tag, e.g. `-K1` (taken as a value, though it starts with `-`).
         #[arg(allow_hyphen_values = true)]
@@ -372,9 +383,11 @@ enum Cmd {
         edit: Option<TranslationsCmd>,
     },
     /// Export pages as drawings for other tools: one SVG or DXF file per page in a folder,
-    /// drawn like the PDF (frame, title block, symbols, wires, cross-references).
+    /// drawn like the PDF (frame, title block, symbols, wires, cross-references), and one per
+    /// panel layout (plate, rails, ducts, devices).
     Drawing {
-        /// Output folder; files are named `<page number>.<format>`.
+        /// Output folder; files are named `<page number>.<format>`, and `panel-<name>.<format>`
+        /// for panel layouts.
         out: PathBuf,
         /// `svg` or `dxf`.
         #[arg(long, default_value = "svg")]
@@ -425,11 +438,12 @@ enum Cmd {
         out: PathBuf,
     },
     /// Check the project for mistakes: devices drawn twice, contacts without a coil, shorted
-    /// potentials, open pins, wires ending in the air, devices without a part, plus the
-    /// project's own `[[rule]]` tables in `project.toml` (a cable on every motor, a tag
-    /// pattern, at most N wires on a terminal) and the house rules in each library source's
-    /// `rules.toml`, less the ones `rules_off` turns off. Exits with an error when an error is
-    /// found, so it can guard a commit or a CI job.
+    /// potentials, open pins, wires ending in the air, wire numbers that do not name one
+    /// connection each, devices without a part, plus the project's own `[[rule]]` tables in
+    /// `project.toml` (a cable on every motor, a tag pattern, at most N wires on a terminal)
+    /// and the house rules in each library source's `rules.toml`, less the ones `rules_off`
+    /// turns off. Exits with an error when an error is found, so it can guard a commit or a CI
+    /// job.
     Check {
         /// Also list notes (open pins, devices without a part).
         #[arg(long)]
@@ -1441,8 +1455,9 @@ enum ImportCmd {
         #[arg(long)]
         lib: Option<PathBuf>,
     },
-    /// A DWG drawing onto a page, converted to DXF by an installed converter (ODA File
-    /// Converter, `dwg2dxf`, or the command in WIRINGCRAFT_DWG2DXF with {in} and {out}).
+    /// A DWG drawing onto a page, read by WiringCraft's own DWG reader (AutoCAD 2004 to 2018).
+    /// A file it refuses is converted to DXF by an installed converter (ODA File Converter,
+    /// `dwg2dxf`, or the command in WIRINGCRAFT_DWG2DXF with {in} and {out}).
     PageDwg {
         /// The DWG file.
         file: PathBuf,
@@ -1591,6 +1606,38 @@ fn parse_point(s: &str) -> Result<Point, String> {
     } else {
         Err("coordinates must be finite".into())
     }
+}
+
+/// `delete`: take the symbols and wires named by `ids` off `page`, and the wires ending on a
+/// deleted symbol's pin, as the app's Delete does. An id not on the page is an error and nothing
+/// changes. Returns the deleted ids: symbols first, then wires, each in page order.
+fn delete_items(page: &mut Page, ids: &[String]) -> Res<Vec<String>> {
+    let missing: Vec<String> = ids
+        .iter()
+        .filter(|id| page.symbol(id).is_none() && !page.wires.iter().any(|w| &w.id == *id))
+        .map(|id| format!("{:?}", id))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!("no symbol or wire {} on page {}", missing.join(", "), page.id));
+    }
+    let named = |id: &str| ids.iter().any(|x| x == id);
+    let on_deleted =
+        |end: &Endpoint| matches!(end, Endpoint::Pin { item, .. } if page.symbol(item).is_some() && named(item));
+    let gone_wires: Vec<String> = page
+        .wires
+        .iter()
+        .filter(|w| named(&w.id) || on_deleted(&w.from) || on_deleted(&w.to))
+        .map(|w| w.id.clone())
+        .collect();
+    let gone_symbols: Vec<String> = page
+        .symbols
+        .iter()
+        .filter(|s| named(&s.id))
+        .map(|s| s.id.clone())
+        .collect();
+    page.symbols.retain(|s| !gone_symbols.contains(&s.id));
+    page.wires.retain(|w| !gone_wires.contains(&w.id));
+    Ok(gone_symbols.into_iter().chain(gone_wires).collect())
 }
 
 /// A wire end from `item:pin` or `x,y`. A pin must be one the placed symbol has (its
@@ -2497,12 +2544,26 @@ fn run(mut cli: Cli) -> Res<()> {
                     };
                     let parts = vendored_parts(dir, &p);
                     let step = wc_report::step::panel_step(&p, panel, &parts, &utc_now());
-                    write_out(&out, &step).map_err(e)?;
+                    write_out(&out, &step.text).map_err(e)?;
                     println!(
                         "wrote {} ({} solids)",
                         out.display(),
-                        step.matches("MANIFOLD_SOLID_BREP(").count()
+                        step.text.matches("MANIFOLD_SOLID_BREP(").count()
                     );
+                    if !step.default_depth.is_empty() {
+                        let line = format!(
+                            "warning: no Depth on the part, drawn {} mm deep: {}\n",
+                            wc_report::step::DEFAULT_DEPTH,
+                            step.default_depth.join(", ")
+                        );
+                        // A warning that cannot be shown does not stop the export: it goes to
+                        // standard output instead, with the reason, as `logged_to` does.
+                        if let Err(why) = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes()) {
+                            // Nothing is left to report this to when standard output fails as well.
+                            let note = format!("warning: could not print on standard error: {why}\n{line}");
+                            let _ = std::io::Write::write_all(&mut std::io::stdout(), note.as_bytes());
+                        }
+                    }
                     return Ok(());
                 }
                 PanelCmd::Device {
@@ -3128,6 +3189,15 @@ fn run(mut cli: Cli) -> Res<()> {
             save(dir, &p)?;
             println!("{id}");
         }
+        Cmd::Delete { page, ids } => {
+            let mut p = load(dir)?;
+            let pg = page_mut(&mut p, &page)?;
+            let deleted = delete_items(pg, &ids)?;
+            save(dir, &p)?;
+            for id in deleted {
+                println!("{}", escape_field(&id));
+            }
+        }
         Cmd::Location(lc) => {
             let mut p = load(dir)?;
             match lc {
@@ -3635,6 +3705,11 @@ fn run(mut cli: Cli) -> Res<()> {
         Cmd::Device { tag, part, description } => {
             let mut p = load(dir)?;
             let t = DeviceTag::parse(&tag).map_err(e)?;
+            if part.is_none() && description.is_none() {
+                let info = device_info(&p, &t)?;
+                print!("{info}");
+                return Ok(());
+            }
             if let Some(part) = &part
                 && store::read_vendored_part(dir, part).is_err()
             {
@@ -3698,6 +3773,7 @@ fn run(mut cli: Cli) -> Res<()> {
                     _ => true,
                 })
                 .collect();
+            warn_levels(&p, &kinds);
             // The network list is followed by a topology page per network.
             let networks = if kinds.contains(&wc_report::Kind::Networks) {
                 p.meta.networks.clone()
@@ -3788,30 +3864,42 @@ fn run(mut cli: Cli) -> Res<()> {
             for m in missing {
                 eprintln!("warning: symbol {m} has no vendored copy (run `wiringcraft lib lock`)");
             }
+            // Panel layouts follow the pages, one file each, as their PDF sheets.
+            let options = wc_pdf::Options {
+                pages,
+                date,
+                panels: p.panels.clone(),
+                // A part that cannot be read is named in a warning; the others still export.
+                footprints: if p.panels.is_empty() {
+                    Default::default()
+                } else {
+                    wc_pdf::footprints(vendored_parts_warning_unreadable(dir, &p).values())
+                },
+                ..Default::default()
+            };
             // Only SVG shows pictures; a DXF export neither reads nor checks them.
             let (drawings, report) = if ext == "svg" {
                 let pictures = wc_pdf::read_pictures(dir, &p);
                 let options = wc_pdf::Options {
-                    pages,
-                    date,
                     underlays: pictures.files,
                     unreadable: pictures.unreadable,
-                    ..Default::default()
+                    ..options
                 };
                 wc_pdf::page_drawings(&p, &symbols, &options)
             } else {
-                let options = wc_pdf::Options {
-                    pages,
-                    date,
-                    ..Default::default()
-                };
                 wc_pdf::page_lines(&p, &symbols, &options)
             };
             make_out_dir(&out)?;
             let mut used = std::collections::BTreeSet::new();
             for d in &drawings {
-                let mut stem = file_stem(&d.number, &d.id);
-                while !used.insert(stem.clone()) {
+                // A panel is named after itself: `panel-Cabinet_1`.
+                let mut stem = if d.panel {
+                    wc_pdf::panel_file_stem(d)
+                } else {
+                    file_stem(&d.number, &d.id)
+                };
+                // Compared without case: `A1` and `a1` are one file name on Windows and macOS.
+                while !used.insert(stem.to_lowercase()) {
                     stem.push('_');
                 }
                 write_out(out.join(format!("{stem}.{ext}")), render(d)).map_err(e)?;
@@ -3917,6 +4005,7 @@ fn run(mut cli: Cli) -> Res<()> {
             };
             warn_report_layouts(&inputs);
             let kinds = report_kinds(std::slice::from_ref(&kind))?;
+            warn_levels(&p, &kinds);
             if format == "xlsx" {
                 let Some(path) = out else {
                     return Err("an Excel workbook is not text: pass --out <file>.xlsx".into());
@@ -4757,6 +4846,21 @@ fn warn_report_layouts(inputs: &wc_report::Inputs<'_>) {
     }
     for w in wc_report::network_warnings(inputs) {
         eprintln!("warning: {}", escape_field(&w));
+    }
+}
+
+/// Warns about each terminal `Level` value that is not a level, when `kinds` has the terminal
+/// plan: such a terminal shows no level there.
+fn warn_levels(project: &wc_core::Project, kinds: &[wc_report::Kind]) {
+    if !kinds.contains(&wc_report::Kind::Terminals) {
+        return;
+    }
+    use std::io::Write as _;
+    let mut err = std::io::stderr().lock();
+    for w in wc_report::level_warnings(project) {
+        // Tags and values come from the project file. A warning that cannot be written (stderr
+        // closed or full) is dropped: it must not stop the export.
+        let _ = writeln!(err, "warning: {}", escape_field(&w));
     }
 }
 
@@ -6065,13 +6169,12 @@ fn panel_duct(
 }
 
 /// An error naming `what` when a `w` x `h` box with its top-left corner at `at` is not on the
-/// plate. A small tolerance lets a box typed flush with the plate's edge through.
+/// plate (see [`wc_core::panel::Panel::outline_fits`]).
 fn check_on_plate(panel: &wc_core::panel::Panel, what: &str, at: Point, w: f64, h: f64) -> Result<(), String> {
     if !(at.x.is_finite() && at.y.is_finite()) {
         return Err(format!("{what}: position must be finite"));
     }
-    let eps = 1e-9;
-    if at.x < -eps || at.y < -eps || at.x + w > panel.width + eps || at.y + h > panel.height + eps {
+    if !panel.outline_fits(at, w, h) {
         return Err(format!(
             "{what}: a {w} x {h} mm outline at {},{} is not on the {} x {} mm plate",
             at.x, at.y, panel.width, panel.height
@@ -6212,6 +6315,30 @@ fn page_fields(p: &Project, page: usize) -> String {
         ));
     }
     out
+}
+
+/// The part and description of device `tag`, one per line (`-` when unset), as
+/// `wiringcraft device <tag>` prints them. An error when no device has that tag, in the devices
+/// table or on a page.
+fn device_info(p: &Project, tag: &DeviceTag) -> Res<String> {
+    let drawn = || {
+        p.pages
+            .iter()
+            .any(|pg| pg.symbols.iter().any(|s| s.tag.as_ref() == Some(tag)))
+    };
+    let (part, description) = match p.devices.get(tag) {
+        Some(d) => (d.part.as_deref().unwrap_or(""), d.description.as_str()),
+        None if drawn() => ("", ""),
+        None => return Err(format!("no device {tag}")),
+    };
+    let show = |v: &str| if v.is_empty() { "-".to_owned() } else { escape_field(v) };
+    Ok(format!(
+        "{:<12} {}\n{:<12} {}\n",
+        "part",
+        show(part),
+        "description",
+        show(description)
+    ))
 }
 
 /// The current time in UTC as `YYYY-MM-DDThh:mm:ssZ`.
@@ -6434,8 +6561,9 @@ mod tests {
         let folder = tmp.path().to_owned();
         // A stand-in converter, as WIRINGCRAFT_DWG2DXF names one; a path with a space stays
         // one argument.
-        let out = dwg_to_dxf(&dwg, &folder, Some("cp {in} {out}".into())).unwrap();
+        let (out, by) = dwg_to_dxf(&dwg, &folder, Some("cp {in} {out}".into())).unwrap();
         assert_eq!(out, folder.join("Motor plan.dxf"));
+        assert_eq!(by, "the WIRINGCRAFT_DWG2DXF command");
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "0\nEOF\n");
         let err = dwg_to_dxf(&dwg, &folder, Some("false {in} {out}".into()))
             .err()
@@ -6491,8 +6619,16 @@ mod tests {
         assert!(err.as_ref().is_err_and(|e| e.contains("no-such-page")), "{err:?}");
         assert!(!folder().exists(), "removed after a failed import");
 
-        // And when it works.
+        // The converter makes a DXF that cannot be read: both reasons are given.
         let pages = load(&dir).unwrap().pages;
+        let junk = converter("junk.sh", "echo junk > \"$2\"");
+        let err = import_page_dwg(&dir, &dwg, pages[0].id.clone(), 1.0, Some(junk)).unwrap_err();
+        assert!(
+            err.contains("own DWG reader refused") && err.contains("could not be read either"),
+            "{err}"
+        );
+
+        // And when it works.
         import_page_dwg(&dir, &dwg, pages[0].id.clone(), 1.0, Some(copy)).unwrap();
         assert!(!folder().exists(), "removed after the import");
     }
@@ -6690,6 +6826,58 @@ mod tests {
     }
 
     #[test]
+    fn delete_takes_symbols_and_wires_off_a_page_with_the_wires_on_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        for (at, tag) in [("40,40", "-A1"), ("100,40", "-A2")] {
+            let args = ["box", "p1", "--at", at, "--size", "20,20", "--tag", tag];
+            cli(&dir, &[&args[..], &["--pin", "1:top:10"]].concat()).unwrap();
+        }
+        // w1 runs between the boxes, w2 from s2 into the air, w3 from point to point.
+        cli(&dir, &["wire", "p1", "s1:1", "s2:1"]).unwrap();
+        cli(&dir, &["wire", "p1", "s2:1", "150,20"]).unwrap();
+        cli(&dir, &["wire", "p1", "10,10", "20,10"]).unwrap();
+        let ids = |dir: &Path| {
+            let p = load(dir).unwrap();
+            let pg = p.page("p1").unwrap();
+            let mut ids: Vec<String> = pg.symbols.iter().map(|s| s.id.clone()).collect();
+            ids.extend(pg.wires.iter().map(|w| w.id.clone()));
+            ids
+        };
+
+        // An id that is not there changes nothing, though the others are.
+        let err = cli(&dir, &["delete", "p1", "w3", "nope", "s9"]).unwrap_err();
+        assert_eq!(err, "no symbol or wire \"nope\", \"s9\" on page p1");
+        assert_eq!(ids(&dir), ["s1", "s2", "w1", "w2", "w3"]);
+        assert!(
+            cli(&dir, &["delete", "p9", "w3"])
+                .unwrap_err()
+                .contains("no page \"p9\"")
+        );
+
+        // A wire alone.
+        let mut p = load(&dir).unwrap();
+        let deleted = delete_items(p.page_mut("p1").unwrap(), &["w3".into()]).unwrap();
+        assert_eq!(deleted, ["w3"]);
+        cli(&dir, &["delete", "p1", "w3"]).unwrap();
+        assert_eq!(ids(&dir), ["s1", "s2", "w1", "w2"]);
+
+        // A symbol takes the wires on its pins along; the other symbol and its device stay.
+        let mut p = load(&dir).unwrap();
+        let deleted = delete_items(p.page_mut("p1").unwrap(), &["s2".into()]).unwrap();
+        assert_eq!(deleted, ["s2", "w1", "w2"]);
+        cli(&dir, &["delete", "p1", "s2"]).unwrap();
+        assert_eq!(ids(&dir), ["s1"]);
+        let p = load(&dir).unwrap();
+        assert!(
+            p.devices.contains_key(&DeviceTag::parse("-A2").unwrap()),
+            "the device keeps its data"
+        );
+    }
+
+    #[test]
     fn a_wire_to_a_pin_the_symbol_does_not_have_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
@@ -6748,11 +6936,78 @@ mod tests {
     }
 
     #[test]
+    fn device_with_only_a_tag_shows_it_and_changes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let mut p = load(&dir).unwrap();
+        let k1 = DeviceTag::parse("-K1").unwrap();
+        p.devices.insert(
+            k1.clone(),
+            wc_core::Device {
+                part: Some("maker.contactor".into()),
+                description: "Pump motor".into(),
+                ..Default::default()
+            },
+        );
+        // -K2 is drawn on a page but not in the devices table.
+        p.pages[0].symbols.push(PlacedSymbol {
+            id: "s1".into(),
+            symbol: "wc.coil".into(),
+            at: Point::new(10.0, 10.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: Some(DeviceTag::parse("-K2").unwrap()),
+        });
+        save(&dir, &p).unwrap();
+        let files = |d: &Path| {
+            let mut v: Vec<_> = std::fs::read_dir(d)
+                .unwrap()
+                .map(|f| f.unwrap().path())
+                // The lock file appears with the first command run; it is not project data.
+                .filter(|f| !f.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')))
+                .map(|f| {
+                    let body = if f.is_file() {
+                        std::fs::read(&f).unwrap()
+                    } else {
+                        Vec::new()
+                    };
+                    (f, body)
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        let before = files(&dir);
+
+        let p = load(&dir).unwrap();
+        assert_eq!(
+            device_info(&p, &k1).unwrap(),
+            "part         maker.contactor\ndescription  Pump motor\n"
+        );
+        let k2 = DeviceTag::parse("-K2").unwrap();
+        assert_eq!(device_info(&p, &k2).unwrap(), "part         -\ndescription  -\n");
+        cli(&dir, &["device", "-K1"]).unwrap();
+        cli(&dir, &["device", "-K2"]).unwrap();
+        let err = cli(&dir, &["device", "-K9"]).unwrap_err();
+        assert_eq!(err, "no device -K9");
+        assert_eq!(files(&dir), before, "showing a device saves nothing");
+        let p = load(&dir).unwrap();
+        assert!(!p.devices.contains_key(&DeviceTag::parse("-K9").unwrap()));
+        assert!(!p.devices.contains_key(&k2));
+
+        // An option still edits, and creates a device that was not there.
+        cli(&dir, &["device", "-K9", "--description", "Spare"]).unwrap();
+        let p = load(&dir).unwrap();
+        assert_eq!(p.devices[&DeviceTag::parse("-K9").unwrap()].description, "Spare");
+    }
+
+    #[test]
     fn a_panel_is_renamed_and_resized_keeping_its_layout() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("p");
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
-        cli(&dir, &["device", "--", "-K1"]).unwrap();
+        cli(&dir, &["device", "-K1", "--description", "Pump"]).unwrap();
         cli(&dir, &["panel", "new", "main"]).unwrap();
         cli(&dir, &["panel", "device", "main", "-K1", "--at", "100,600"]).unwrap();
         let before = load(&dir).unwrap().panels[0].clone();
@@ -7492,6 +7747,43 @@ mod tests {
     }
 
     #[test]
+    fn drawing_writes_a_file_per_panel_layout_next_to_the_pages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["panel", "new", "plate1", "--name", "Main cabinet/A"]).unwrap();
+        let number = load(&dir).unwrap().pages[0].number.clone();
+        for ext in ["dxf", "svg"] {
+            let out = tmp.path().join(ext);
+            cli(&dir, &["drawing", out.to_str().unwrap(), "--format", ext]).unwrap();
+            let mut names: Vec<String> = std::fs::read_dir(&out)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            let page = format!("{}.{ext}", file_stem(&number, ""));
+            let mut want = [format!("panel-Main_cabinet_A.{ext}"), page];
+            want.sort();
+            assert_eq!(names, want, "{ext}");
+        }
+        let dxf = std::fs::read_to_string(tmp.path().join("dxf").join("panel-Main_cabinet_A.dxf")).unwrap();
+        assert!(dxf.contains("POLYLINE") && dxf.contains("Main cabinet/A"), "{dxf}");
+        // Names that differ only in case get files of their own, also on Windows and macOS.
+        cli(&dir, &["panel", "new", "plate2", "--name", "Main"]).unwrap();
+        cli(&dir, &["panel", "new", "plate3", "--name", "main"]).unwrap();
+        let out = tmp.path().join("cased");
+        cli(&dir, &["drawing", out.to_str().unwrap(), "--format", "dxf"]).unwrap();
+        let mut names: Vec<String> = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_lowercase())
+            .collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 4, "{names:?}");
+        assert!(names.contains(&"panel-main.dxf".into()) && names.contains(&"panel-main_.dxf".into()));
+    }
+
+    #[test]
     fn find_lists_hits_and_replace_renames_the_device() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("p");
@@ -7709,6 +8001,24 @@ mod tests {
         );
         assert!(!load(&dir).unwrap().lock.symbols.contains_key("aa.good"));
         std::fs::remove_dir(&tmp_path).unwrap();
+
+        // A lock that cannot be written after both copies were taken puts them back, and the
+        // page is not saved.
+        let page_bytes =
+            std::fs::read(dir.join(store::PAGES_DIR).join(format!("{page}{}", store::PAGE_SUFFIX))).unwrap();
+        let lock_blocker = dir.join(format!("{}.tmp", store::LOCK_FILE));
+        std::fs::create_dir(&lock_blocker).unwrap();
+        cli(&dir, &args).unwrap_err();
+        std::fs::remove_dir(&lock_blocker).unwrap();
+        assert!(store::read_vendored_symbol(&dir, "aa.good").is_err(), "copy put back");
+        assert!(store::read_vendored_symbol(&dir, "zz.bad").is_err(), "copy put back");
+        let p = load(&dir).unwrap();
+        assert!(!p.lock.symbols.contains_key("aa.good"));
+        assert!(p.page(&page).is_some_and(|pg| pg.symbols.is_empty()), "page not saved");
+        assert_eq!(
+            std::fs::read(dir.join(store::PAGES_DIR).join(format!("{page}{}", store::PAGE_SUFFIX))).unwrap(),
+            page_bytes
+        );
 
         // And the retry pins both.
         cli(&dir, &args).unwrap();

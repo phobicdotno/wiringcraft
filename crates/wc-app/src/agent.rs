@@ -400,6 +400,17 @@ pub fn specs() -> Vec<Value> {
             &[],
         ),
         tool(
+            "layers",
+            "The editor layers of View > Layers (what the canvas shows: drawings, wire numbers, cross-references, comments, underlay), a setting of this user, not of the project: list them (key, title, shown, locked, lockable), or set one layer shown or hidden and locked or unlocked. A hidden or locked layer's items cannot be picked on the canvas.",
+            json!({
+                "action": {"type": "string", "enum": ["list", "set"]},
+                "layer": {"type": "string", "enum": crate::layers::Layer::ALL.map(crate::layers::Layer::key), "description": "set: the layer's key."},
+                "shown": {"type": "boolean", "description": "set: show (true) or hide (false) the layer."},
+                "locked": {"type": "boolean", "description": "set: lock or unlock the layer (only drawings, cross-references and comments can be locked)."}
+            }),
+            &["action"],
+        ),
+        tool(
             "edit_page_json",
             "Replace a whole page with new content in the page file format (as get_page returns it, without the extra pin and point fields). For bulk edits the other tools cannot do. The page id stays.",
             json!({"page": page_arg(), "content": {"type": "object", "description": "The page: number, title, size, overview (true for a line diagram; leaving it out makes a normal page), cover (true for the cover page; leaving it out keeps the page's current value), title_block (the page's own title-block fields such as revision and date, which win over the project's; leaving it out keeps the page's current ones), symbols, wires, graphics, underlay."}}),
@@ -526,7 +537,7 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "run_check",
-            "Check the project: devices drawn twice, contacts without a coil, shorted potentials, open pins, wires ending in the air, devices without a part, then the check rules of the project's library sources (less the ones the project turns off) and the project's own check rules (see the rules tool).",
+            "Check the project: devices drawn twice, contacts without a coil, shorted potentials, open pins, wires ending in the air, a connection with two wire numbers or a wire number on two connections, devices without a part, then the check rules of the project's library sources (less the ones the project turns off) and the project's own check rules (see the rules tool).",
             json!({}),
             &[],
         ),
@@ -622,7 +633,7 @@ pub fn specs() -> Vec<Value> {
             "run_command",
             "Run a wiringcraft command-line command on the open project (unsaved changes are saved first, and the project is reloaded after). Covers everything. \
              Project and pages: new (a project folder, --template), page (add, list, remove, overview, size, cover, fields), template (show, columns, reset: frame columns and title block), logo (show, set, remove), location (list, set, remove). \
-             Drawing: place, box (a black box with connection points, --pin name:side:offset), box-edit (resize a black box, rename or move its points), wire, device (part, description), number-wires, macro (list, place, show, edit: a project macro's placeholders and value sets), find (text in pages, --replace, --match-case). \
+             Drawing: place, box (a black box with connection points, --pin name:side:offset), box-edit (resize a black box, rename or move its points), wire, delete (symbols and wires by id), device (part, description), number-wires, macro (list, place, show, edit: a project macro's placeholders and value sets), find (text in pages, --replace, --match-case). \
              Terminals: strip (list, order, move, spare, unspare, level), jumper (add, remove, part, list). \
              Revisions: revision (list, add, edit, remove, cloud, uncloud, table). \
              Panels: panel (new, arrange, step, device, show, list, remove). PLC: rack (list, add, set, remove, card add/set/remove: PLC racks and their cards by slot). \
@@ -1076,6 +1087,7 @@ const READ_TOOLS: &[&str] = &[
     "get_devices",
     "select_items",
     "show",
+    "layers",
     "get_template",
     "run_check",
     "get_report",
@@ -1406,12 +1418,17 @@ impl App {
         let Some(p) = open.project.pages.get(self.ed.page) else {
             return;
         };
-        self.ed.selection.retain(|s| match s {
-            Selection::Symbol(id) => p.symbols.iter().any(|x| &x.id == id),
-            Selection::Wire(id) => p.wires.iter().any(|x| &x.id == id),
-            Selection::Graphic(i) => *i < p.graphics.len(),
-            Selection::Cloud(i) => *i < p.clouds.len(),
-            Selection::RevisionTable => p.revision_table.is_some(),
+        // Nothing on a hidden or locked layer stays selected either, as on the canvas.
+        let layers = &self.ed.layers;
+        self.ed.selection.retain(|s| {
+            layers.may_select(s)
+                && match s {
+                    Selection::Symbol(id) => p.symbols.iter().any(|x| &x.id == id),
+                    Selection::Wire(id) => p.wires.iter().any(|x| &x.id == id),
+                    Selection::Graphic(i) => *i < p.graphics.len(),
+                    Selection::Cloud(i) => *i < p.clouds.len(),
+                    Selection::RevisionTable => p.revision_table.is_some(),
+                }
         });
     }
 
@@ -1452,13 +1469,7 @@ impl App {
 
     /// Show a page on screen.
     fn go_to(&mut self, page: usize) {
-        if self.ed.page != page || self.ed.panel.is_some() {
-            self.ed.page = page;
-            self.ed.panel = None;
-            self.ed.panel_pick = None;
-            self.ed.selection.clear();
-            self.ed.view.fit = true;
-        }
+        self.ed.show_page(page);
     }
 
     /// Take the message a command left in a dialog, so the model gets it as a result.
@@ -1575,6 +1586,21 @@ impl App {
         {
             return Err(why);
         }
+        // The tools that do what a held action does (rotate, mirror, copy and paste, select)
+        // are refused while the symbol editor is open, as from the menu: the schematic under
+        // the editor does not change or get selected.
+        if self.symbol_editor.is_some() {
+            let held = match name {
+                "rotate_items" => Some(Action::Rotate.info().label),
+                "mirror_items" => Some(Action::Mirror.info().label),
+                "copy_items" => Some(Action::Paste.info().label),
+                "select_items" => Some("Selecting"),
+                _ => None,
+            };
+            if let Some(what) = held {
+                return Err(crate::symbol_editor_refusal(what));
+            }
+        }
         match name {
             "get_state" => self.tool_state(),
             "get_page" => {
@@ -1679,9 +1705,38 @@ impl App {
                     "rotate_items" => open.rotate_many(page, &sel),
                     "mirror_items" => open.mirror_many(page, &sel),
                     _ => {
+                        // What a hidden or locked layer keeps off the canvas is not selected
+                        // (nor said to be): only the rest is.
+                        let layers = &self.ed.layers;
+                        let (kept, refused): (Vec<_>, Vec<_>) =
+                            ids.iter().zip(sel).partition(|(_, s)| layers.may_select(s));
+                        if kept.is_empty() {
+                            let why = refused
+                                .first()
+                                .and_then(|(_, s)| layers.unselectable_note(s))
+                                .unwrap_or_default()
+                                .replacen("The hit is", "They are", 1);
+                            return Err(format!(
+                                "Nothing selected: {} cannot be selected. {why}",
+                                ids.join(", ")
+                            ));
+                        }
+                        let skipped = if refused.is_empty() {
+                            String::new()
+                        } else {
+                            let names: Vec<&str> = refused.iter().map(|(id, _)| id.as_str()).collect();
+                            let why = refused
+                                .first()
+                                .and_then(|(_, s)| layers.unselectable_note(s))
+                                .unwrap_or_default()
+                                .replacen("The hit is", "Those are", 1);
+                            format!(" Not selected: {}. {why}", names.join(", "))
+                        };
+                        let names: Vec<&str> = kept.iter().map(|(id, _)| id.as_str()).collect();
+                        let msg = format!("Selected {} on the user's screen.{skipped}", names.join(", "));
                         self.go_to(page);
-                        self.ed.selection = sel;
-                        return Ok(format!("Selected {} on the user's screen.", ids.join(", ")));
+                        self.ed.selection = kept.into_iter().map(|(_, s)| s).collect();
+                        return Ok(msg);
                     }
                 }
                 Ok(format!("Done: {}.", ids.join(", ")))
@@ -1800,6 +1855,7 @@ impl App {
                 self.go_to(page);
                 Ok("Showing the page.".into())
             }
+            "layers" => self.tool_layers(v),
             "edit_page_json" => {
                 let page = self.page_of(v, "page")?;
                 let open = need_open(self.open.as_mut())?;
@@ -2075,6 +2131,8 @@ impl App {
                     if !can && self.share.is_host() {
                         return Ok("Nothing to undo or redo.".into());
                     }
+                    // A panel device drag going on ends, as with Undo in the window.
+                    self.ed.panel_drag = None;
                     if redo { self.share.redo() } else { self.share.undo() }?;
                     self.ed.selection.clear();
                     return Ok(if can {
@@ -2085,6 +2143,7 @@ impl App {
                     .into());
                 }
                 let open = need_open(self.open.as_mut())?;
+                self.ed.panel_drag = None;
                 let done = if redo { open.redo() } else { open.undo() };
                 if let Some(e) = open.take_undo_error() {
                     return Err(format!("Not done: {e}"));
@@ -2229,11 +2288,75 @@ impl App {
         })))
     }
 
+    /// The `layers` tool: list the editor layers, or show, hide, lock or unlock one, as the
+    /// Layers window does (saved with the user's settings and applied to the canvas at once).
+    fn tool_layers(&mut self, v: &Value) -> Result<String, String> {
+        use crate::layers::Layer;
+        let list = |l: &crate::layers::Layers| -> Value {
+            Layer::ALL
+                .iter()
+                .map(|&x| {
+                    json!({"key": x.key(), "title": x.title(), "shown": l.shown(x), "locked": l.locked(x), "lockable": x.lockable()})
+                })
+                .collect()
+        };
+        match need_s(v, "action")? {
+            "list" => Ok(pretty(&list(&self.prefs.layers))),
+            "set" => {
+                let key = need_s(v, "layer")?;
+                let layer = Layer::ALL
+                    .into_iter()
+                    .find(|l| l.key() == key)
+                    .ok_or_else(|| format!("No layer {key:?}; get the keys with action list."))?;
+                // A value given but not true or false is refused before anything changes.
+                let flag = |key: &str| match v.get(key) {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(Value::Bool(b)) => Ok(Some(*b)),
+                    Some(_) => Err(format!("`{key}` must be true or false.")),
+                };
+                let shown = flag("shown")?;
+                let locked = flag("locked")?;
+                if shown.is_none() && locked.is_none() {
+                    return Err("Give `shown`, `locked` or both.".into());
+                }
+                if locked == Some(true) && !layer.lockable() {
+                    return Err(format!(
+                        "{} cannot be locked: nothing on it can be picked.",
+                        layer.title()
+                    ));
+                }
+                let now = &self.prefs.layers;
+                if shown.is_none_or(|x| x == now.shown(layer)) && locked.is_none_or(|x| x == now.locked(layer)) {
+                    return Err(format!(
+                        "{} is already {} and {}: nothing to change.",
+                        layer.title(),
+                        if now.shown(layer) { "shown" } else { "hidden" },
+                        if now.locked(layer) { "locked" } else { "unlocked" }
+                    ));
+                }
+                if let Some(x) = shown {
+                    self.prefs.layers.set_shown(layer, x);
+                }
+                if let Some(x) = locked {
+                    self.prefs.layers.set_locked(layer, x);
+                }
+                // Tests do not write the settings file of whoever runs them.
+                if cfg!(test) {
+                    self.apply_layers();
+                } else {
+                    self.layers_changed();
+                }
+                Ok(pretty(&list(&self.prefs.layers)))
+            }
+            other => Err(format!("No layers action {other:?}.")),
+        }
+    }
+
     fn tool_find_symbols(&mut self, v: &Value) -> Result<String, String> {
         let open = need_open(self.open.as_mut())?;
         let q = s(v, "query").unwrap_or_default().to_lowercase();
         let limit = v.get("limit").and_then(Value::as_u64).unwrap_or(30) as usize;
-        let ids: Vec<String> = open.library.iter().map(|(id, _)| id.clone()).collect();
+        let ids: Vec<String> = open.library.iter().map(|e| e.id.clone()).collect();
         let lib = wc_library::Library::open(&open.dir, &open.project).ok();
         let mut out = Vec::new();
         for id in ids {
@@ -3907,6 +4030,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn library_update_from_the_menu_lists_the_new_descriptions() {
+        let (tmp, mut a) = app(vec![]);
+        let o = a.open.as_mut().unwrap();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let mut new = o.symbols["wc.coil"].clone();
+        new.description = "Solenoid winding".into();
+        crate::state::tests::library_first(o, tmp.path(), &new);
+        a.run(Action::LibraryUpdate);
+        let o = a.open.as_ref().unwrap();
+        assert_eq!(o.symbols["wc.coil"], new, "{}", a.ed.message);
+        let row = o.library.iter().find(|e| e.id == "wc.coil").unwrap();
+        assert_eq!(row.description, new.description);
+    }
+
     fn app(answers: Vec<Value>) -> (tempfile::TempDir, App) {
         let (tmp, open) = crate::state::tests::project();
         let mut prefs = crate::prefs::Prefs::default();
@@ -5326,6 +5464,71 @@ mod tests {
         assert!(shortcuts_for(&mut a, egui::Key::Backspace, egui::Modifiers::COMMAND).is_empty());
     }
 
+    /// The plus key zooms in with or without Shift, and so does the unshifted = key it shares
+    /// on many keyboards; Alt with them is not a zoom shortcut here (#685).
+    #[test]
+    fn plus_zooms_in_with_or_without_shift() {
+        let (_tmp, mut a) = app(vec![]);
+        for key in [egui::Key::Plus, egui::Key::Equals] {
+            for m in [egui::Modifiers::NONE, egui::Modifiers::SHIFT] {
+                assert_eq!(shortcuts_for(&mut a, key, m), vec![Action::ZoomIn], "{key:?} {m:?}");
+            }
+            assert!(!shortcuts_for(&mut a, key, egui::Modifiers::ALT).contains(&Action::ZoomIn));
+            // Ctrl+Shift on a Mac: Ctrl set, Command not.
+            let mac_ctrl_shift = egui::Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            };
+            assert!(!shortcuts_for(&mut a, key, mac_ctrl_shift).contains(&Action::ZoomIn));
+        }
+        assert_eq!(
+            shortcuts_for(&mut a, egui::Key::Minus, egui::Modifiers::NONE),
+            vec![Action::ZoomOut]
+        );
+    }
+
+    #[test]
+    fn enter_and_escape_go_to_a_shape_half_drawn_in_the_symbol_editor() {
+        use wc_core::geom::Point;
+        let (_tmp, mut a) = app(vec![]);
+        let ctx = egui::Context::default();
+        let press = |a: &mut App, key| {
+            a.ed.finish_shape = false;
+            let raw = egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| {
+                let _ = a.shortcuts(ctx);
+            });
+        };
+        // Polylines half drawn in both the schematic and the symbol editor.
+        a.ed.tool = crate::state::Tool::Polyline;
+        a.ed.shape_points = vec![Point::new(20.0, 20.0), Point::new(40.0, 20.0)];
+        let mut sym = crate::symbol_editor::SymbolEditor::new(Vec::new());
+        sym.set_tool(crate::symbol_editor::Tool::Polyline);
+        sym.click(Point::new(0.0, 0.0));
+        a.symbol_editor = Some(sym);
+        press(&mut a, egui::Key::Enter);
+        assert!(!a.ed.finish_shape, "the schematic polyline is not ended");
+        press(&mut a, egui::Key::Escape);
+        assert_eq!(a.ed.shape_points.len(), 2, "nor dropped");
+        assert_eq!(a.ed.tool, crate::state::Tool::Polyline);
+        // Nothing drawn in the editor: the schematic gets the keys again.
+        a.symbol_editor = Some(crate::symbol_editor::SymbolEditor::new(Vec::new()));
+        press(&mut a, egui::Key::Enter);
+        assert!(a.ed.finish_shape);
+        press(&mut a, egui::Key::Escape);
+        assert!(a.ed.shape_points.is_empty());
+    }
+
     #[test]
     fn escape_after_leaving_the_black_box_tool_cancels_the_new_tool_s_drawing() {
         use wc_core::geom::Point;
@@ -5359,6 +5562,116 @@ mod tests {
         a.ed.shape_points = vec![Point::new(20.0, 20.0)];
         escape(&mut a);
         assert!(a.ed.shape_points.is_empty(), "the line's first point is dropped");
+    }
+
+    #[test]
+    fn copying_and_cutting_only_a_drawing_counts_it_in_the_message() {
+        let (_tmp, mut a) = app(vec![]);
+        a.open.as_mut().unwrap().project.pages[0]
+            .graphics
+            .push(wc_core::Shape::Line {
+                a: wc_core::geom::Point::new(50.0, 50.0),
+                b: wc_core::geom::Point::new(80.0, 50.0),
+            });
+        a.ed.selection = vec![crate::state::Selection::Graphic(0)];
+        a.run(Action::Copy);
+        assert_eq!(a.ed.message, "Copied 1 item.");
+        a.run(Action::Cut);
+        assert_eq!(a.ed.message, "Cut 1 item.");
+        assert!(
+            a.open.as_ref().unwrap().project.pages[0].graphics.is_empty(),
+            "the cut line is gone"
+        );
+        assert_eq!(a.clipboard.graphics.len(), 1);
+    }
+
+    #[test]
+    fn page_up_and_page_down_open_the_previous_and_next_page() {
+        use crate::chrome::Status;
+        let (_tmp, mut a) = app(vec![]);
+        let ctx = egui::Context::default();
+        let field = egui::Id::new("field");
+        // One frame with `key` pressed, a text field having the keys first when asked.
+        let press = |a: &mut App, key: egui::Key, typing: bool| {
+            for events in [vec![], vec![key]] {
+                let pressed = !events.is_empty();
+                let raw = egui::RawInput {
+                    events: events
+                        .into_iter()
+                        .map(|key| egui::Event::Key {
+                            key,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        })
+                        .collect(),
+                    ..Default::default()
+                };
+                let _ = ctx.run(raw, |ctx| {
+                    if typing {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            let mut s = String::new();
+                            ui.add(egui::TextEdit::singleline(&mut s).id(field));
+                        });
+                        ctx.memory_mut(|m| m.request_focus(field));
+                    }
+                    if pressed {
+                        for act in a.shortcuts(ctx) {
+                            a.run(act);
+                        }
+                    }
+                });
+            }
+        };
+        let numbers = |a: &App| -> Vec<String> {
+            let o = a.open.as_ref().unwrap();
+            o.project.pages.iter().map(|p| p.number.clone()).collect()
+        };
+        let status = |a: &App, act: Action| {
+            crate::StatusView {
+                open: a.open.as_ref(),
+                ed: &a.ed,
+                prefs: &a.prefs,
+                clipboard: &a.clipboard,
+                sharing: false,
+                share_undo: false,
+                share_redo: false,
+                show_layers: false,
+            }
+            .enabled(act)
+        };
+        let before = numbers(&a);
+        let last = before.len() - 1;
+        assert!(last >= 1, "the test project has two pages or more");
+
+        a.ed.page = 0;
+        assert!(!status(&a, Action::PrevPage), "nothing before the first page");
+        press(&mut a, egui::Key::PageUp, false);
+        assert_eq!(a.ed.page, 0, "the first page stays");
+        press(&mut a, egui::Key::PageDown, false);
+        assert_eq!(a.ed.page, 1, "Page Down opens the next page");
+        assert_eq!(numbers(&a), before, "no page is renumbered");
+        press(&mut a, egui::Key::PageUp, false);
+        assert_eq!(a.ed.page, 0, "Page Up opens the previous page");
+
+        a.ed.page = last;
+        assert!(!status(&a, Action::NextPage), "nothing after the last page");
+        press(&mut a, egui::Key::PageDown, false);
+        assert_eq!(a.ed.page, last, "the last page stays");
+
+        // A text field with the keys, or a dialog, keeps the page.
+        press(&mut a, egui::Key::PageUp, true);
+        assert_eq!(a.ed.page, last, "not while typing");
+        a.dialog = Some(crate::Dialog::Message("Busy".into()));
+        press(&mut a, egui::Key::PageUp, false);
+        assert_eq!(a.ed.page, last, "not under a dialog");
+        a.dialog = None;
+
+        // The assistant can do the same.
+        call(&mut a, "run_action", json!({"action": "PrevPage"})).unwrap();
+        assert_eq!(a.ed.page, last - 1);
+        assert_eq!(numbers(&a), before);
     }
 
     #[test]
@@ -5433,6 +5746,92 @@ mod tests {
 
         a.run(Action::Undo);
         assert_eq!(counts(&a), before, "one Undo takes the copy back");
+    }
+
+    #[test]
+    fn schematic_edits_from_the_menu_or_assistant_do_nothing_while_the_symbol_editor_is_open() {
+        for action in [
+            Action::Cut,
+            Action::Copy,
+            Action::Paste,
+            Action::Rotate,
+            Action::Mirror,
+            Action::SelectAll,
+        ] {
+            let (_tmp, mut a) = app(vec![]);
+            let o = a.open.as_mut().unwrap();
+            let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+            o.place(page, "wc.coil", Point::new(50.0, 50.0)).unwrap();
+            o.place(page, "wc.coil", Point::new(90.0, 50.0)).unwrap();
+            a.ed.page = page;
+            let all = a.open.as_ref().unwrap().select_all(page);
+            // Something on the clipboard for Paste; one item selected, so Select All would change it.
+            a.ed.selection = all.clone();
+            a.run(Action::Copy);
+            assert!(!a.clipboard.is_empty(), "{action:?}: the copy is made");
+            a.ed.selection = vec![all[0].clone()];
+            let selection = a.ed.selection.clone();
+            let clipboard = format!("{:?}", a.clipboard);
+            let before = a.open.as_ref().unwrap().project.pages.clone();
+            let undo_before = a.open.as_ref().unwrap().undo_mark();
+            a.symbol_editor = Some(crate::symbol_editor::SymbolEditor::new(Vec::new()));
+
+            a.run(action);
+            let o = a.open.as_ref().unwrap();
+            assert_eq!(o.project.pages, before, "{action:?}: the pages are unchanged");
+            assert_eq!(o.undo_mark(), undo_before, "{action:?}: no undo step");
+            assert_eq!(a.ed.selection, selection, "{action:?}: the selection is unchanged");
+            assert_eq!(
+                format!("{:?}", a.clipboard),
+                clipboard,
+                "{action:?}: the clipboard is unchanged"
+            );
+            assert!(
+                a.ed.message.contains("close the symbol editor first"),
+                "{action:?}: {}",
+                a.ed.message
+            );
+        }
+
+        // The assistant's tools that do the same are refused too.
+        let (_tmp, mut a) = app(vec![]);
+        let o = a.open.as_mut().unwrap();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        o.place(page, "wc.coil", Point::new(50.0, 50.0)).unwrap();
+        a.ed.page = page;
+        let ids: Vec<String> = a
+            .open
+            .as_ref()
+            .unwrap()
+            .select_all(page)
+            .iter()
+            .map(selection_id)
+            .collect();
+        let selection = a.ed.selection.clone();
+        let before = a.open.as_ref().unwrap().project.pages.clone();
+        let undo_before = a.open.as_ref().unwrap().undo_mark();
+        a.symbol_editor = Some(crate::symbol_editor::SymbolEditor::new(Vec::new()));
+        for (tool, what) in [
+            ("rotate_items", "Rotate"),
+            ("mirror_items", "Mirror"),
+            ("copy_items", "Paste"),
+            ("select_items", "Selecting"),
+        ] {
+            let e = a.agent_tool(tool, &json!({"page": "p0002", "ids": ids})).unwrap_err();
+            assert!(
+                e.starts_with(what) && e.contains("close the symbol editor first"),
+                "{tool}: {e}"
+            );
+            let o = a.open.as_ref().unwrap();
+            assert_eq!(o.project.pages, before, "{tool}: the pages are unchanged");
+            assert_eq!(o.undo_mark(), undo_before, "{tool}: no undo step");
+            assert_eq!(a.ed.selection, selection, "{tool}: the selection is unchanged");
+        }
+        // Closed, the assistant rotates again.
+        a.symbol_editor = None;
+        a.agent_tool("rotate_items", &json!({"page": "p0002", "ids": ids}))
+            .unwrap();
+        assert_ne!(a.open.as_ref().unwrap().project.pages, before);
     }
 
     #[test]
@@ -5667,9 +6066,14 @@ mod tests {
             a.symbol_editor.as_ref().unwrap().symbol.graphics.is_empty(),
             "the editor deleted"
         );
+        a.ed.message.clear();
         assert_eq!(
             a.route_to_symbol_editor(vec![Action::Undo, Action::Copy]),
             Vec::<Action>::new()
+        );
+        assert_eq!(
+            a.ed.message, "Copy was not done: close the symbol editor first.",
+            "a held key says why, as from the menu"
         );
         assert_eq!(
             a.symbol_editor.as_ref().unwrap().symbol.graphics.len(),
@@ -5682,6 +6086,62 @@ mod tests {
             "the editor redid the delete"
         );
         assert_eq!(a.open.as_ref().unwrap().project, before, "the project was not touched");
+    }
+
+    #[test]
+    fn page_keys_do_not_switch_the_page_behind_the_symbol_editor() {
+        let (_tmp, mut a) = app(vec![]);
+        let keys = vec![Action::PrevPage, Action::NextPage, Action::ZoomIn];
+        assert_eq!(
+            a.route_to_symbol_editor(keys.clone()),
+            keys,
+            "closed: the project gets them"
+        );
+        a.symbol_editor = Some(crate::symbol_editor::SymbolEditor::new(Vec::new()));
+        a.ed.page = 0;
+        for act in a.route_to_symbol_editor(keys) {
+            a.run(act);
+        }
+        assert_eq!(a.ed.page, 0, "the page under the symbol editor stays");
+    }
+
+    #[test]
+    fn going_to_a_page_closes_the_panel_and_clears_the_selection() {
+        let (_tmp, mut a) = app(vec![]);
+        let fresh = |a: &mut App| {
+            a.ed.view.fit = false;
+            a.ed.selection = vec![crate::state::Selection::Graphic(0)];
+        };
+        fresh(&mut a);
+        a.ed.page = 0;
+        a.go_to(0);
+        assert!(
+            !a.ed.view.fit && a.ed.selection.len() == 1,
+            "the page shown: nothing changes"
+        );
+
+        a.go_to(1);
+        assert_eq!(a.ed.page, 1);
+        assert!(a.ed.view.fit && a.ed.selection.is_empty());
+
+        // From a panel back to the page under it: the panel and its pick go.
+        fresh(&mut a);
+        a.ed.panel = Some(0);
+        a.ed.panel_pick = Some(0);
+        a.go_to(1);
+        assert_eq!((a.ed.panel, a.ed.panel_pick), (None, None));
+        assert!(a.ed.view.fit && a.ed.selection.is_empty());
+
+        // Next page does the same, and also drops a wire being drawn.
+        fresh(&mut a);
+        a.ed.page = 0;
+        a.ed.panel = Some(0);
+        a.ed.panel_pick = Some(0);
+        let at = wc_core::geom::Point::new(0.0, 0.0);
+        a.ed.wire = Some((wc_core::Endpoint::Point { at }, Vec::new()));
+        a.run(Action::NextPage);
+        assert_eq!((a.ed.page, a.ed.panel, a.ed.panel_pick), (1, None, None));
+        assert!(a.ed.view.fit && a.ed.selection.is_empty() && a.ed.wire.is_none());
     }
 
     #[test]
@@ -6196,6 +6656,32 @@ mod tests {
         assert_eq!(graphics3(&a), vec![line]);
         assert_eq!(a.ed.selection, vec![Selection::Graphic(0)]);
         assert!(a.ed.waiting_graphics.is_none());
+    }
+
+    #[test]
+    fn a_guests_pasted_drawing_on_a_layer_hidden_or_locked_meanwhile_comes_back_unselected() {
+        use crate::layers::Layer;
+        for hide in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (_dir, mut a, mut h, mut host_open) = guest_window(tmp.path());
+            let line = paste_line(&mut a);
+            a.sync_session_now(false);
+            assert!(a.ed.waiting_graphics.is_some(), "the paste waits for the host");
+            // While it waits, the user hides or locks the drawings.
+            if hide {
+                a.prefs.layers.set_shown(Layer::Drawings, false);
+            } else {
+                a.prefs.layers.set_locked(Layer::Drawings, true);
+            }
+            a.apply_layers();
+            h.frame(Some(&mut host_open), Some("p0002".into()), false);
+            a.sync_session_now(false);
+            assert_eq!(graphics3(&a), vec![line], "hide={hide}");
+            assert!(a.ed.selection.is_empty(), "hide={hide}: {:?}", a.ed.selection);
+            assert!(a.ed.waiting_graphics.is_none(), "hide={hide}");
+        }
+        // Shown and unlocked, the same paste comes back selected
+        // (`a_guests_pasted_drawing_is_selected_again_once_the_host_accepts_it`).
     }
 
     #[test]
@@ -9978,6 +10464,138 @@ mod tests {
     }
 
     #[test]
+    fn the_layers_tool_shows_hides_and_locks_layers_like_the_layers_window() {
+        use crate::layers::Layer;
+        let (_tmp, mut a) = app(vec![]);
+        let listed: Value = serde_json::from_str(&call(&mut a, "layers", json!({"action": "list"})).unwrap()).unwrap();
+        assert_eq!(listed.as_array().map(Vec::len), Some(Layer::ALL.len()));
+        assert!(
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|l| l["shown"] == true && l["locked"] == false)
+        );
+        call(
+            &mut a,
+            "add_graphic",
+            json!({"page": "p0002", "shape": {"kind": "text", "at": {"x": 30, "y": 30}, "text": "Hello"}}),
+        )
+        .unwrap();
+        call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap();
+        // Hiding the drawings drops the selected drawing at once, as the window does.
+        let out = call(
+            &mut a,
+            "layers",
+            json!({"action": "set", "layer": "drawings", "shown": false}),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(out[0]["key"], "drawings");
+        assert_eq!(out[0]["shown"], false);
+        assert!(!a.prefs.layers.shown(Layer::Drawings));
+        assert!(a.ed.selection.is_empty());
+        assert!(!a.ed.layers.shown(Layer::Drawings));
+        call(
+            &mut a,
+            "layers",
+            json!({"action": "set", "layer": "drawings", "shown": true, "locked": true}),
+        )
+        .unwrap();
+        assert!(a.prefs.layers.shown(Layer::Drawings) && a.prefs.layers.locked(Layer::Drawings));
+        // Refused: a layer with nothing to pick, an unknown layer, nothing to change.
+        let before = a.prefs.layers.clone();
+        for bad in [
+            json!({"action": "set", "layer": "underlay", "locked": true}),
+            json!({"action": "set", "layer": "nope", "shown": true}),
+            json!({"action": "set", "layer": "comments"}),
+            json!({"action": "toggle"}),
+            json!({"action": "set", "layer": "wire-numbers", "shown": false, "locked": "true"}),
+            json!({"action": "set", "layer": "comments", "shown": "false", "locked": true}),
+            // Already so: shown and locked, or an unlockable layer unlocked.
+            json!({"action": "set", "layer": "drawings", "shown": true, "locked": true}),
+            json!({"action": "set", "layer": "drawings", "locked": true}),
+            json!({"action": "set", "layer": "underlay", "shown": true, "locked": false}),
+        ] {
+            assert!(call(&mut a, "layers", bad.clone()).is_err(), "{bad}");
+        }
+        assert_eq!(a.prefs.layers, before);
+    }
+
+    #[test]
+    fn the_assistant_cannot_select_a_drawing_on_a_hidden_or_locked_layer() {
+        use crate::layers::Layer;
+        let (_tmp, mut a) = app(vec![]);
+        call(
+            &mut a,
+            "add_graphic",
+            json!({"page": "p0002", "shape": {"kind": "text", "at": {"x": 30, "y": 30}, "text": "Hello"}}),
+        )
+        .unwrap();
+        call(
+            &mut a,
+            "place_symbol",
+            json!({"symbol": "wc.coil", "x": 50, "y": 50, "page": "2"}),
+        )
+        .unwrap();
+        let k = page2(&a).symbols[0].id.clone();
+        for hide in [true, false] {
+            if hide {
+                a.prefs.layers.set_shown(Layer::Drawings, false);
+            } else {
+                a.prefs.layers.set_locked(Layer::Drawings, true);
+            }
+            a.apply_layers();
+            // Asked for the drawing alone: refused, naming the layer and why.
+            let e = call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap_err();
+            assert!(!a.ed.selection.contains(&Selection::Graphic(0)), "hide={hide}");
+            let state = if hide { "hidden" } else { "locked" };
+            assert!(e.contains("g0") && e.contains(state) && e.contains("Drawings"), "{e}");
+            assert!(!e.contains("Selected"), "{e}");
+            // Asked for it with a symbol: the symbol is selected and only it is named so.
+            let r = call(&mut a, "select_items", json!({"page": "p0002", "ids": [k, "g0"]})).unwrap();
+            assert_eq!(a.ed.selection, vec![Selection::Symbol(k.clone())], "hide={hide}");
+            assert!(r.starts_with(&format!("Selected {k} on the user's screen.")), "{r}");
+            assert!(r.contains("Not selected: g0") && r.contains(state), "{r}");
+            a.prefs.layers = Default::default();
+            a.apply_layers();
+        }
+        let r = call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap();
+        assert!(a.ed.selection.contains(&Selection::Graphic(0)));
+        assert_eq!(r, "Selected g0 on the user's screen.");
+    }
+
+    #[test]
+    fn a_project_opened_by_the_assistant_keeps_the_hidden_and_locked_layers() {
+        use crate::layers::Layer;
+        let (_tmp, mut a) = app(vec![]);
+        call(
+            &mut a,
+            "add_graphic",
+            json!({"page": "p0002", "shape": {"kind": "text", "at": {"x": 30, "y": 30}, "text": "Hello"}}),
+        )
+        .unwrap();
+        a.open.as_mut().unwrap().save().unwrap();
+        let dir = a.open.as_ref().unwrap().dir.clone();
+        for hide in [true, false] {
+            if hide {
+                a.prefs.layers.set_shown(Layer::Drawings, false);
+            } else {
+                a.prefs.layers.set_locked(Layer::Drawings, true);
+            }
+            // The open comes before the canvas is drawn again.
+            call(&mut a, "open_project", json!({"path": dir})).unwrap();
+            assert_eq!(a.ed.layers, a.prefs.layers, "hide={hide}");
+            assert!(call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).is_err());
+            assert!(a.ed.selection.is_empty(), "hide={hide}");
+            a.prefs.layers = Default::default();
+        }
+        call(&mut a, "open_project", json!({"path": dir})).unwrap();
+        call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap();
+        assert_eq!(a.ed.selection, vec![Selection::Graphic(0)]);
+    }
+
+    #[test]
     fn a_drawing_hidden_or_locked_in_the_layer_list_is_not_deleted_before_the_canvas_redraws() {
         use crate::layers::Layer;
         let (_tmp, mut a) = app(vec![]);
@@ -10268,5 +10886,130 @@ mod tests {
         assert_eq!(press(egui::Key::Enter, none, none), (vec![], true));
         // Ctrl pressed after the key, before the frame: the bare press still counts.
         assert_eq!(press(egui::Key::R, none, ctrl).0, vec![Action::Rotate]);
+    }
+
+    /// A panel with one device at the first returned point, moved once to the second, then
+    /// dragged from there (the drag's checkpoint taken), with the button still held.
+    fn panel_drag_going_on(a: &mut App) -> (Point, Point) {
+        use wc_core::panel::{Panel, PanelItem};
+        let first = Point::new(100.0, 100.0);
+        let (from, to) = (Point::new(150.0, 100.0), Point::new(200.0, 100.0));
+        let Some(open) = a.open.as_mut() else {
+            unreachable!("a project is open")
+        };
+        open.project.panels.push(Panel {
+            id: "panel1".into(),
+            name: "Panel 1".into(),
+            width: 400.0,
+            height: 300.0,
+            items: vec![PanelItem::Device {
+                tag: wc_core::DeviceTag::parse("-K1").unwrap_or_default(),
+                at: first,
+                width: 40.0,
+                height: 60.0,
+                rotation: wc_core::geom::Rotation::R0,
+            }],
+        });
+        for p in [from, to] {
+            open.checkpoint();
+            if let Some(PanelItem::Device { at, .. }) = open.project.panels[0].items.first_mut() {
+                *at = p;
+            }
+        }
+        let step = open.history_count();
+        a.ed.panel = Some(0);
+        a.ed.panel_pick = Some(0);
+        a.ed.panel_drag = Some((Point::new(20.0, 30.0), Some(step), from));
+        (first, from)
+    }
+
+    fn panel_device_at(a: &App) -> Point {
+        match a.open.as_ref().and_then(|o| o.project.panels[0].items.first()) {
+            Some(wc_core::panel::PanelItem::Device { at, .. }) => *at,
+            _ => unreachable!("the device is there"),
+        }
+    }
+
+    /// One frame of the panel view with Escape pressed.
+    fn escape_in_panel_view(a: &mut App) {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 700.0))),
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let Some(open) = a.open.as_mut() else {
+            unreachable!("a project is open")
+        };
+        let ed = &mut a.ed;
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| crate::panel_view::show(ui, open, ed, 0, 1.0, true));
+        });
+    }
+
+    #[test]
+    fn undo_during_a_panel_drag_ends_it_so_escape_keeps_what_undo_put_back() {
+        let (_tmp, mut a) = app(vec![]);
+        let (first, _) = panel_drag_going_on(&mut a);
+        // Undo twice while the button is still held: the device is back where it first was.
+        a.run(Action::Undo);
+        a.run(Action::Undo);
+        assert_eq!(panel_device_at(&a), first);
+        assert!(a.ed.panel_drag.is_none(), "Undo ends the drag");
+        // Escape now must not put back the drag's start, which the history no longer has.
+        escape_in_panel_view(&mut a);
+        assert_eq!(panel_device_at(&a), first);
+    }
+
+    #[test]
+    fn the_assistants_undo_during_a_panel_drag_ends_it_too() {
+        let (_tmp, mut a) = app(vec![]);
+        let (first, _) = panel_drag_going_on(&mut a);
+        for _ in 0..2 {
+            assert!(call(&mut a, "undo", json!({})).is_ok());
+        }
+        assert_eq!(panel_device_at(&a), first);
+        assert!(a.ed.panel_drag.is_none(), "the undo tool ends the drag");
+        escape_in_panel_view(&mut a);
+        assert_eq!(panel_device_at(&a), first);
+    }
+
+    #[test]
+    fn undo_in_a_session_during_a_panel_drag_ends_it_too() {
+        use wc_core::panel::PanelItem;
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        a.share.start_host(open, "Hanna", "hanna@example.com").unwrap();
+        let (first, from) = panel_drag_going_on(&mut a);
+        // In the session each sync is a step: the panel at `first`, the move to `from`, the
+        // drag's move.
+        let set = |a: &mut App, p: Point| {
+            if let Some(PanelItem::Device { at, .. }) =
+                a.open.as_mut().and_then(|o| o.project.panels[0].items.first_mut())
+            {
+                *at = p;
+            }
+        };
+        let to = panel_device_at(&a);
+        for p in [first, from, to] {
+            set(&mut a, p);
+            a.share.frame(a.open.as_mut(), None, false);
+        }
+        for _ in 0..2 {
+            a.run(Action::Undo);
+            a.share.frame(a.open.as_mut(), None, false);
+        }
+        assert_eq!(panel_device_at(&a), first);
+        assert!(a.ed.panel_drag.is_none(), "Undo in a session ends the drag");
+        escape_in_panel_view(&mut a);
+        assert_eq!(panel_device_at(&a), first);
+        a.share.stop();
     }
 }
