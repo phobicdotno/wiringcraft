@@ -106,8 +106,14 @@ pub fn number_wires(
         }
         let number = match rule {
             Rule::Sequential => next_sequential(&mut used),
-            Rule::Potential => match nets.get(*n).and_then(|net| net.names.first()) {
-                Some(name) if used.insert(name.clone()) => name.clone(),
+            // Trimmed like kept numbers, so `" 1 "` cannot sit beside a kept `"1"`.
+            Rule::Potential => match nets
+                .get(*n)
+                .and_then(|net| net.names.first())
+                .map(|name| name.trim())
+                .filter(|name| !name.is_empty())
+            {
+                Some(name) if used.insert(name.to_string()) => name.to_string(),
                 _ => next_sequential(&mut used),
             },
             Rule::PageColumn => {
@@ -254,6 +260,16 @@ mod tests {
         p.pages[0].wires[2].number = Some(" 1 ".into());
         number_wires(&mut p, Rule::Sequential, false, |_| None, pos);
         // c keeps 1 without the spaces; the others get 2 and 3, not 1 again.
+        assert_eq!(numbers(&p), [Some("3"), Some("3"), Some("1"), None, Some("2")]);
+    }
+
+    #[test]
+    fn potential_names_are_trimmed_so_they_do_not_repeat_a_kept_number() {
+        let mut p = project();
+        p.pages[0].wires[2].number = Some("1".into());
+        p.pages[0].wires[4].potential = Some(" 1 ".into());
+        number_wires(&mut p, Rule::Potential, false, |_| None, pos);
+        // c keeps 1; e's potential reads as 1 too, so it falls back to the next free number.
         assert_eq!(numbers(&p), [Some("3"), Some("3"), Some("1"), None, Some("2")]);
     }
 
