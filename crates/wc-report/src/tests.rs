@@ -3153,3 +3153,13 @@ fn check_keeps_panel_devices_whose_tag_is_only_drawn_as_interruption_points() {
     // The tag still only names a connection, so it gets no "has no part" note.
     assert!(!found.iter().any(|m| m == "-L1 has no part"), "{found:?}");
 }
+
+#[test]
+fn markdown_cells_with_a_backslash_keep_their_columns() {
+    let mut t = Table::new("Paths", &["Path", "Text", "Next"]);
+    t.rows.push(vec!["C:\\".into(), "a\\|b".into(), "next".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Paths\n\n| Path | Text | Next |\n|---|---|---|\n| C:\\\\ | a\\\\\\|b | next |\n"
+    );
+}
