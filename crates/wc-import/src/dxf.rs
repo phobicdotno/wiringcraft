@@ -408,8 +408,9 @@ fn shapes(
             "CIRCLE" if !xf.keeps_circles() => {
                 // On a pin layer it marks a pin at its centre, which a symbol takes from the
                 // points as it does for POINT; the outline is drawn on a page like any other.
-                if is_pin_layer(&layer) {
-                    points.push((layer.clone(), q(e.f(10), e.f(20))));
+                let at = q(e.f(10), e.f(20));
+                if is_pin_layer(&layer) && at.x.is_finite() && at.y.is_finite() {
+                    points.push((layer.clone(), at));
                 }
                 let (unit, closed) = ellipse_points((0.0, 0.0), (1.0, 0.0), 1.0, 0.0, std::f64::consts::TAU);
                 stretched(e, &unit, closed, skipped)
@@ -592,7 +593,13 @@ fn shapes(
                 polyline(pts, true, true)
             }
             "POINT" => {
-                points.push((layer.clone(), p(e.f(10), e.f(20))));
+                let at = p(e.f(10), e.f(20));
+                if at.x.is_finite() && at.y.is_finite() {
+                    points.push((layer.clone(), at));
+                } else {
+                    let left_out = skipped.entry(PLACED_NOT_NUMBERS.to_owned()).or_default();
+                    *left_out = left_out.saturating_add(1);
+                }
                 None
             }
             "INSERT" => {
@@ -693,9 +700,34 @@ fn shapes(
                 None
             }
         };
-        if let Some(s) = shape {
-            out.push((layer, s));
+        match shape {
+            // Placed past the range of numbers (a huge block placement plus a huge coordinate):
+            // a page file could not hold it.
+            Some(s) if !finite_shape(&s) => {
+                let left_out = skipped.entry(PLACED_NOT_NUMBERS.to_owned()).or_default();
+                *left_out = left_out.saturating_add(1);
+            }
+            Some(s) => out.push((layer, s)),
+            None => {}
         }
+    }
+}
+
+/// Whether every coordinate and size of `s` is a number.
+fn finite_shape(s: &Shape) -> bool {
+    let pt = |p: &Point| p.x.is_finite() && p.y.is_finite();
+    match s {
+        Shape::Line { a, b } | Shape::Rect { min: a, max: b } => pt(a) && pt(b),
+        Shape::Polyline { points, .. } => points.iter().all(pt),
+        Shape::Circle { center, radius, .. } => pt(center) && radius.is_finite(),
+        Shape::Arc {
+            center,
+            radius,
+            start,
+            end,
+        } => pt(center) && radius.is_finite() && start.is_finite() && end.is_finite(),
+        Shape::Text { at, height, angle, .. } => pt(at) && height.is_finite() && angle.is_finite(),
+        Shape::Dimension { a, b, offset, height } => pt(a) && pt(b) && offset.is_finite() && height.is_finite(),
     }
 }
 
@@ -863,6 +895,9 @@ const SPLINE_TOO_FEW: &str = "SPLINE with too few points";
 
 /// The key under which circles and arcs of a stretched block are counted when their angles or
 /// their placed points are not numbers.
+/// The skipped-count key for entities whose placed coordinates are not numbers.
+const PLACED_NOT_NUMBERS: &str = "entities placed outside the number range";
+
 /// The skipped-count key for copies of a block array (MINSERT) whose places are not numbers.
 const ARRAY_NOT_NUMBERS: &str = "copies of a block array placed outside the number range";
 
@@ -1838,6 +1873,9 @@ fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
                 format!(
                     "{n} entit{s} not drawn: in blocks nested more than {MAX_NESTING} deep (or inserting themselves)"
                 )
+            } else if kind == PLACED_NOT_NUMBERS {
+                let s = if n == 1 { "y" } else { "ies" };
+                format!("{n} entit{s} placed outside the number range, left out")
             } else if kind == ARRAY_NOT_NUMBERS {
                 let s = if n == 1 { "y" } else { "ies" };
                 format!("{n} cop{s} of a block array placed outside the number range, left out")
@@ -3049,6 +3087,21 @@ mod tests {
         let (g, skipped) = drawn("0\nINSERT\n2\nOUTER\n41\n2\n42\n2\n", &nested)?;
         assert!(g.is_empty(), "{g:?}");
         assert_eq!(skipped.get(ARRAY_NOT_NUMBERS), Some(&2), "{skipped:?}");
+        // A copy at 1e308 is a number, but a line end at 1e308 in it is not once placed: that
+        // line is left out and counted, the one that stays in range is drawn. A single INSERT
+        // alike.
+        let far = "0\nBLOCK\n2\nF\n10\n0\n20\n0\n0\nLINE\n10\n0\n20\n0\n11\n1e308\n21\n0\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n0\nPOINT\n10\n1e308\n20\n0\n0\nENDBLK\n";
+        for (ents, kept) in [
+            ("0\nINSERT\n2\nF\n10\n0\n20\n0\n70\n2\n44\n1e308\n", 3),
+            ("0\nINSERT\n2\nF\n10\n1e308\n20\n0\n", 1),
+        ] {
+            let (g, skipped) = drawn(ents, far)?;
+            assert_eq!(g.len(), kept, "{g:?}");
+            assert!(g.iter().all(finite_shape), "{g:?}");
+            // The far line and the far POINT.
+            assert_eq!(skipped.get(PLACED_NOT_NUMBERS), Some(&2), "{skipped:?}");
+            assert!(!skipped.contains_key(ARRAY_NOT_NUMBERS), "{skipped:?}");
+        }
         Ok(())
     }
 
