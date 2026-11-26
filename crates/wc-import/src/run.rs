@@ -785,8 +785,9 @@ fn number_free(p: &Project, number: &str) -> Res<()> {
     let number = number.trim();
     match p.pages.iter().find(|pg| pg.number.trim() == number) {
         Some(pg) => Err(format!(
-            "page number {number} is taken by page {}; import with --first-page to number the pages from a free number",
-            pg.id
+            "page number {} is taken by page {}; import with --first-page to number the pages from a free number",
+            escape_field(number),
+            escape_field(&pg.id)
         )),
         None => Ok(()),
     }
@@ -2122,6 +2123,21 @@ mod tests {
         // A free number goes through.
         assert_eq!(pdf(&dir, &pdf_file, 2, &mut Log::default()), Ok(()));
         assert!(matches!(load(&dir), Ok(p) if p.page("pdf-2").is_some_and(|pg| pg.number == "2")));
+    }
+
+    /// The refusal escapes the page id and number it names: an id from a file stem may hold ESC.
+    #[test]
+    fn a_taken_page_number_is_named_without_control_characters() {
+        let mut p = Project::new("t");
+        p.pages.push(Page::new("a\u{1b}[31m", "7\u{1b}", "Mine"));
+        let Err(why) = number_free(&p, "7\u{1b}") else {
+            unreachable!("a taken page number went through");
+        };
+        assert!(!why.contains('\u{1b}'), "{why:?}");
+        assert!(
+            why.starts_with("page number 7\\u{1b} is taken by page a\\u{1b}[31m;"),
+            "{why:?}"
+        );
     }
 
     #[test]
