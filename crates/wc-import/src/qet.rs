@@ -82,17 +82,7 @@ fn finite(s: &Shape) -> bool {
     }
 }
 
-/// `filling:...` from a QElectroTech style string; anything but `none` fills.
-fn filled(e: &BytesStart) -> bool {
-    attr(e, "style").is_some_and(|s| {
-        s.split(';').any(|kv| {
-            kv.split_once(':')
-                .is_some_and(|(k, v)| k.trim() == "filling" && !matches!(v.trim(), "" | "none"))
-        })
-    })
-}
-
-/// Whether an ellipse or polygon comes in solid (#875): WiringCraft fills in the line colour, so
+/// Whether a rectangle, ellipse, circle or polygon comes in solid (#875, #924): WiringCraft fills in the line colour, so
 /// only a dark filling is kept. `white`, light grey and the hatch patterns stay hollow, as does
 /// `none`, since drawing them solid in the line colour would hide what the element shows.
 fn solid_fill(e: &BytesStart) -> bool {
@@ -359,10 +349,19 @@ fn shape(
             _ => skip(),
         },
         "rect" => match (n("x"), n("y"), n("width"), n("height")) {
-            (Some(x), Some(y), Some(w), Some(h)) => graphics.push(Shape::Rect {
-                min: pt(x.min(x + w), y.min(y + h)),
-                max: pt(x.max(x + w), y.max(y + h)),
-            }),
+            (Some(x), Some(y), Some(w), Some(h)) => {
+                let (min, max) = (pt(x.min(x + w), y.min(y + h)), pt(x.max(x + w), y.max(y + h)));
+                if solid_fill(e) {
+                    // WiringCraft's rectangle has no fill, so a solid one also gets a filled
+                    // closed polyline under its outline, as `push_closed` does for polygons.
+                    graphics.push(Shape::Polyline {
+                        points: vec![min, Point::new(max.x, min.y), max, Point::new(min.x, max.y)],
+                        closed: true,
+                        filled: true,
+                    });
+                }
+                graphics.push(Shape::Rect { min, max });
+            }
             _ => skip(),
         },
         "ellipse" | "circle" => {
@@ -377,7 +376,7 @@ fn shape(
                         graphics.push(Shape::Circle {
                             center: pt(x + w / 2.0, y + h / 2.0),
                             radius: w / 2.0 * scale,
-                            filled: filled(e),
+                            filled: solid_fill(e),
                         });
                     } else {
                         let points = ellipse_points(x, y, w, h, 0.0, 360.0)
@@ -632,6 +631,54 @@ mod tests {
                 (ELLIPSE_STEPS, true, false),
                 (3, true, false),
                 (ELLIPSE_STEPS, true, false)
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn light_filled_circles_and_rects_stay_hollow_dark_ones_fill() -> Result<()> {
+        let el = r#"<definition type="element"><description>
+<circle x="0" y="0" diameter="4" style="filling:white"/>
+<ellipse x="10" y="0" width="4" height="4" style="filling:black"/>
+<ellipse x="20" y="0" width="4" height="4" style="filling:hor"/>
+<rect x="0" y="10" width="4" height="2" style="filling:black"/>
+<rect x="10" y="10" width="4" height="2" style="filling:white"/>
+<terminal x="0" y="0" orientation="n"/>
+</description></definition>"#;
+        let (imp, _) = element(el, "qet.fills", 1.0)?;
+        let circles: Vec<bool> = imp
+            .symbol
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Circle { filled, .. } => Some(*filled),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(circles, vec![false, true, false]);
+        let rects: Vec<&Shape> = imp
+            .symbol
+            .graphics
+            .iter()
+            .filter(|g| matches!(g, Shape::Rect { .. } | Shape::Polyline { .. }))
+            .collect();
+        let (a, b) = (Point::new(0.0, 10.0), Point::new(4.0, 12.0));
+        assert_eq!(
+            rects,
+            vec![
+                // The black rectangle: its fill, then its outline.
+                &Shape::Polyline {
+                    points: vec![a, Point::new(4.0, 10.0), b, Point::new(0.0, 12.0)],
+                    closed: true,
+                    filled: true
+                },
+                &Shape::Rect { min: a, max: b },
+                // The white one stays a plain rectangle.
+                &Shape::Rect {
+                    min: Point::new(10.0, 10.0),
+                    max: Point::new(14.0, 12.0)
+                }
             ]
         );
         Ok(())

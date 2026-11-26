@@ -254,7 +254,9 @@ impl Table {
                 .replace('<', "&lt;")
                 .replace('>', "&gt;")
         };
-        let cell = |s: &str| line(s).replace('|', "\\|");
+        // In a cell a backslash is doubled before `|` is escaped, so a cell ending in `\` does
+        // not escape the column bar after it and each cell shows its text as written.
+        let cell = |s: &str| line(s).replace('\\', "\\\\").replace('|', "\\|");
         let mut out = format!(
             "## {}\n\n| {} |\n|{}\n",
             line(&self.title),
