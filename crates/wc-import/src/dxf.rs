@@ -265,9 +265,16 @@ impl Xf {
     }
     /// DXF coordinates (y up) to DXF coordinates.
     fn apply(&self, x: f64, y: f64) -> (f64, f64) {
-        let (x, y) = (x - self.base.0, y - self.base.1);
         let m = &self.m;
-        (self.at.0 + m[0] * x + m[1] * y, self.at.1 + m[2] * x + m[3] * y)
+        let (dx, dy) = (x - self.base.0, y - self.base.1);
+        if dx.is_finite() && dy.is_finite() {
+            return (self.at.0 + m[0] * dx + m[1] * dy, self.at.1 + m[2] * dx + m[3] * dy);
+        }
+        // A point and base point far apart on either side overflow when subtracted: each is
+        // placed on its own then, so a placement that shrinks them can still bring them in range.
+        let (bx, by) = self.base;
+        let at = (self.at.0 - (m[0] * bx + m[1] * by), self.at.1 - (m[2] * bx + m[3] * by));
+        (at.0 + m[0] * x + m[1] * y, at.1 + m[2] * x + m[3] * y)
     }
     /// This placement inside `outer`: `outer` applied after this one. This one's base point
     /// stays apart; `outer`'s is taken off this one's origin.
@@ -4366,6 +4373,42 @@ mod tests {
                 (Point::new(0.0, 0.0), Point::new(0.0, -2.0)),
                 (Point::new(10.0, 0.0), Point::new(10.0, -2.0)),
             ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_point_far_from_a_far_base_point_is_placed_when_shrunk() -> Result<()> {
+        // The point minus the base point is past the numbers, but halved it is in range.
+        let blocks = "0\nBLOCK\n2\nFAR\n10\n1e308\n20\n0\n0\nLINE\n10\n-1e308\n20\n0\n11\n-1e308\n21\n1\n0\nENDBLK\n";
+        let ents = "0\nINSERT\n2\nFAR\n10\n0\n20\n0\n41\n0.5\n42\n0.5\n";
+        let (g, skipped) = drawn(ents, blocks)?;
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(
+            g,
+            [Shape::Line {
+                a: Point::new(-1e308, 0.0),
+                b: Point::new(-1e308, -0.5)
+            }]
+        );
+        let imported = page(&dxf(ents, blocks), 1.0, &BTreeSet::new());
+        assert!(imported.is_ok(), "{:?}", imported.err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_dimension_block_with_a_far_base_point_in_a_scaled_block_is_placed() -> Result<()> {
+        // The dimension's base point doubled is past the numbers; its line placed is not.
+        let blocks = "0\nBLOCK\n2\n*D1\n10\n1e308\n20\n0\n0\nLINE\n10\n1e308\n20\n0\n11\n1e308\n21\n1\n0\nENDBLK\n\
+                      0\nBLOCK\n2\nOUTER\n10\n0\n20\n0\n0\nDIMENSION\n2\n*D1\n0\nENDBLK\n";
+        let (g, skipped) = drawn("0\nINSERT\n2\nOUTER\n41\n2\n42\n2\n", blocks)?;
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(
+            g,
+            [Shape::Line {
+                a: Point::new(0.0, 0.0),
+                b: Point::new(0.0, -2.0)
+            }]
         );
         Ok(())
     }
