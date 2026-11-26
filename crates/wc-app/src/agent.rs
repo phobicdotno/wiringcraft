@@ -5360,6 +5360,47 @@ mod tests {
     }
 
     #[test]
+    fn enter_and_escape_go_to_a_shape_half_drawn_in_the_symbol_editor() {
+        use wc_core::geom::Point;
+        let (_tmp, mut a) = app(vec![]);
+        let ctx = egui::Context::default();
+        let press = |a: &mut App, key| {
+            a.ed.finish_shape = false;
+            let raw = egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| {
+                let _ = a.shortcuts(ctx);
+            });
+        };
+        // Polylines half drawn in both the schematic and the symbol editor.
+        a.ed.tool = crate::state::Tool::Polyline;
+        a.ed.shape_points = vec![Point::new(20.0, 20.0), Point::new(40.0, 20.0)];
+        let mut sym = crate::symbol_editor::SymbolEditor::new(Vec::new());
+        sym.set_tool(crate::symbol_editor::Tool::Polyline);
+        sym.click(Point::new(0.0, 0.0));
+        a.symbol_editor = Some(sym);
+        press(&mut a, egui::Key::Enter);
+        assert!(!a.ed.finish_shape, "the schematic polyline is not ended");
+        press(&mut a, egui::Key::Escape);
+        assert_eq!(a.ed.shape_points.len(), 2, "nor dropped");
+        assert_eq!(a.ed.tool, crate::state::Tool::Polyline);
+        // Nothing drawn in the editor: the schematic gets the keys again.
+        a.symbol_editor = Some(crate::symbol_editor::SymbolEditor::new(Vec::new()));
+        press(&mut a, egui::Key::Enter);
+        assert!(a.ed.finish_shape);
+        press(&mut a, egui::Key::Escape);
+        assert!(a.ed.shape_points.is_empty());
+    }
+
+    #[test]
     fn escape_after_leaving_the_black_box_tool_cancels_the_new_tool_s_drawing() {
         use wc_core::geom::Point;
         let (_tmp, mut a) = app(vec![]);
