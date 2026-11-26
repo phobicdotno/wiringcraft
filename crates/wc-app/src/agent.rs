@@ -10162,4 +10162,71 @@ mod tests {
         // Ctrl pressed after the key, before the frame: the bare press still counts.
         assert_eq!(press(egui::Key::R, none, ctrl).0, vec![Action::Rotate]);
     }
+
+    #[test]
+    fn undo_during_a_panel_drag_ends_it_so_escape_keeps_what_undo_put_back() {
+        use wc_core::panel::{Panel, PanelItem};
+        let (_tmp, mut a) = app(vec![]);
+        let at = |a: &App| match a.open.as_ref().and_then(|o| o.project.panels[0].items.first()) {
+            Some(PanelItem::Device { at, .. }) => *at,
+            _ => unreachable!("the device is there"),
+        };
+        let first = Point::new(100.0, 100.0);
+        let (from, to) = (Point::new(150.0, 100.0), Point::new(200.0, 100.0));
+        let Some(open) = a.open.as_mut() else {
+            unreachable!("a project is open")
+        };
+        open.project.panels.push(Panel {
+            id: "panel1".into(),
+            name: "Panel 1".into(),
+            width: 400.0,
+            height: 300.0,
+            items: vec![PanelItem::Device {
+                tag: wc_core::DeviceTag::parse("-K1").unwrap_or_default(),
+                at: first,
+                width: 40.0,
+                height: 60.0,
+                rotation: wc_core::geom::Rotation::R0,
+            }],
+        });
+        // An earlier move, then a drag from there that has moved the device (its checkpoint taken).
+        for p in [from, to] {
+            open.checkpoint();
+            if let Some(PanelItem::Device { at, .. }) = open.project.panels[0].items.first_mut() {
+                *at = p;
+            }
+        }
+        a.ed.panel = Some(0);
+        a.ed.panel_pick = Some(0);
+        a.ed.panel_drag = Some((Point::new(20.0, 30.0), true, from));
+
+        // Undo twice while the button is still held: the device is back where it first was.
+        a.run(Action::Undo);
+        a.run(Action::Undo);
+        assert_eq!(at(&a), first);
+        assert!(a.ed.panel_drag.is_none(), "Undo ends the drag");
+
+        // Escape now must not put back the drag's start, which the history no longer has.
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 700.0))),
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let Some(open) = a.open.as_mut() else {
+            unreachable!("a project is open")
+        };
+        let ed = &mut a.ed;
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| crate::panel_view::show(ui, open, ed, 0, 1.0));
+        });
+        assert_eq!(at(&a), first);
+    }
 }

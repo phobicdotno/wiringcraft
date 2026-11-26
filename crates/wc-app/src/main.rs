@@ -1488,6 +1488,9 @@ impl App {
                 // Changes not synced yet (an assistant's, made with no frame in between) go into
                 // the session's history first, so Undo takes back the latest one.
                 self.sync_session_now(false);
+                // A panel device drag going on ends here: Escape must not put back a start
+                // position the history no longer has.
+                self.ed.panel_drag = None;
                 let r = if a == Action::Undo {
                     self.share.undo()
                 } else {
@@ -1529,6 +1532,8 @@ impl App {
             }
             Action::SaveAs => self.pending = Some(Pending::SaveAs),
             Action::Undo | Action::Redo => {
+                // As in a shared session: a panel device drag going on ends here.
+                self.ed.panel_drag = None;
                 let done = if a == Action::Undo { open.undo() } else { open.redo() };
                 if done {
                     self.ed.selection.clear();
