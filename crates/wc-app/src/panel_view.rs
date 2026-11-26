@@ -145,16 +145,32 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
         && matches!(p.items.get(i), Some(PanelItem::Device { .. }))
     {
         let step = if snap_step > 0.0 { snap_step.min(5.0) } else { 1.0 };
-        let presses: Vec<(f64, f64)> = ui.input_mut(|inp| {
-            [
-                (egui::Key::ArrowLeft, -1.0, 0.0),
-                (egui::Key::ArrowRight, 1.0, 0.0),
-                (egui::Key::ArrowUp, 0.0, -1.0),
-                (egui::Key::ArrowDown, 0.0, 1.0),
-            ]
-            .into_iter()
-            .flat_map(|(k, dx, dy)| std::iter::repeat_n((dx, dy), inp.count_and_consume_key(egui::Modifiers::NONE, k)))
-            .collect()
+        // The presses in the order they came, so Right then Left ends where it started.
+        let mut presses: Vec<(f64, f64)> = Vec::new();
+        ui.input_mut(|inp| {
+            inp.events.retain(|e| {
+                let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = e
+                else {
+                    return true;
+                };
+                let d = match key {
+                    egui::Key::ArrowLeft => (-1.0, 0.0),
+                    egui::Key::ArrowRight => (1.0, 0.0),
+                    egui::Key::ArrowUp => (0.0, -1.0),
+                    egui::Key::ArrowDown => (0.0, 1.0),
+                    _ => return true,
+                };
+                if !modifiers.is_none() {
+                    return true;
+                }
+                presses.push(d);
+                false
+            });
         });
         for (dx, dy) in presses {
             let Some(PanelItem::Device {
@@ -448,6 +464,50 @@ mod tests {
             unreachable!("the device is there")
         };
         assert_eq!(*at, Point::new(100.0, 100.0));
+    }
+
+    #[test]
+    fn arrow_keys_in_one_frame_move_the_device_in_the_order_pressed() {
+        let (_tmp, mut open) = crate::state::tests::project();
+        open.project.panels.push(wc_core::panel::Panel {
+            id: "panel1".into(),
+            name: "Panel 1".into(),
+            width: 400.0,
+            height: 300.0,
+            items: vec![PanelItem::Device {
+                tag: wc_core::DeviceTag::parse("-K1").unwrap_or_default(),
+                at: Point::new(0.0, 0.0),
+                width: 40.0,
+                height: 60.0,
+                rotation: wc_core::geom::Rotation::R0,
+            }],
+        });
+        let mut ed = Editor::default();
+        ed.panel = Some(0);
+        ed.panel_pick = Some(0);
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let input = egui::RawInput {
+            events: vec![key(egui::Key::ArrowRight), key(egui::Key::ArrowLeft)],
+            ..Default::default()
+        };
+        let steps = open.undo_steps();
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show(ui, &mut open, &mut ed, 0, 5.0));
+        });
+        // Right moves it off the edge, then Left brings it back: two undo steps.
+        let Some(PanelItem::Device { at, .. }) = open.project.panels[0].items.first() else {
+            unreachable!("the device is there")
+        };
+        assert_eq!(*at, Point::new(0.0, 0.0));
+        assert_eq!(open.undo_steps(), steps + 2);
     }
 
     #[test]
