@@ -3157,6 +3157,31 @@ fn a_repeated_wire_number_is_named_on_the_connection_drawn_second() {
 }
 
 #[test]
+fn two_wire_numbers_on_one_connection_are_named_on_its_first_wire_even_unnumbered() {
+    let (mut p, s, parts) = fixture();
+    // One connection drawn first by an unnumbered wire, then by wires numbered 7 and 8.
+    p.pages[0].wires = vec![
+        wire("a0", pin("s2", "14"), pin("s4", "1"), None, None),
+        wire("a1", pin("s4", "1"), pin("s2", "13"), Some("7"), None),
+        wire("a2", pin("s2", "13"), pin("s4", "1"), Some("8"), None),
+    ];
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found: Vec<_> = check(&i)
+        .into_iter()
+        .filter(|f| f.message.contains("wire number"))
+        .map(|f| (f.item.unwrap_or_default(), f.message))
+        .collect();
+    assert_eq!(
+        found,
+        [("a0".to_owned(), "one connection has wire numbers 7 and 8".to_owned())]
+    );
+}
+
+#[test]
 fn rows_of_the_wire_cable_terminal_and_plc_lists_link_to_their_page() {
     let (mut p, mut s, parts) = fixture();
     let mut input = sym("wc.plc.input", SymbolRole::Standalone, &["I"]);

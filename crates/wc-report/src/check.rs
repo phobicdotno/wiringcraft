@@ -501,17 +501,18 @@ fn wire_nets_off_overview(i: &Inputs<'_>) -> WireNets {
 /// purpose and do not count; wires that touch no pin are no connection, as for numbering.
 fn wire_numbers(i: &Inputs<'_>, wire_net: &WireNets, out: &mut Vec<Finding>) {
     let p = i.project;
-    // Per net: its numbers, and its first numbered wire (page, wire id) in drawing order.
-    let mut by_net: BTreeMap<usize, (BTreeSet<&str>, (&Page, &str))> = BTreeMap::new();
+    // Per net: its numbers.
+    let mut by_net: BTreeMap<usize, BTreeSet<&str>> = BTreeMap::new();
     // Per number: the nets it is on, each with the first wire carrying it.
     let mut by_number: BTreeMap<&str, Vec<(usize, &Page, &str)>> = BTreeMap::new();
-    // Where each net is first drawn, by any of its wires, numbered or not.
-    let mut first_drawn: BTreeMap<usize, usize> = BTreeMap::new();
+    // Where each net is first drawn, by any of its wires, numbered or not: its place in
+    // drawing order and that first wire (page, wire id).
+    let mut first_drawn: BTreeMap<usize, (usize, &Page, &str)> = BTreeMap::new();
     for (pi, page) in p.pages.iter().enumerate().filter(|(_, pg)| !pg.overview) {
-        for wi in 0..page.wires.len() {
+        for (wi, w) in page.wires.iter().enumerate() {
             if let Some(&net) = wire_net.get(&(pi, wi)) {
                 let next = first_drawn.len();
-                first_drawn.entry(net).or_insert(next);
+                first_drawn.entry(net).or_insert((next, page, w.id.as_str()));
             }
         }
     }
@@ -523,18 +524,18 @@ fn wire_numbers(i: &Inputs<'_>, wire_net: &WireNets, out: &mut Vec<Finding>) {
             let Some(&net) = wire_net.get(&(pi, wi)) else {
                 continue;
             };
-            by_net
-                .entry(net)
-                .or_insert_with(|| (BTreeSet::new(), (page, w.id.as_str())))
-                .0
-                .insert(number);
+            by_net.entry(net).or_default().insert(number);
             let nets = by_number.entry(number).or_default();
             if !nets.iter().any(|(n, ..)| *n == net) {
                 nets.push((net, page, w.id.as_str()));
             }
         }
     }
-    for (numbers, (page, wire)) in by_net.values().filter(|(n, _)| n.len() > 1) {
+    // Named on the net's first wire, numbered or not.
+    for (net, numbers) in by_net.iter().filter(|(_, n)| n.len() > 1) {
+        let Some(&(_, page, wire)) = first_drawn.get(net) else {
+            continue;
+        };
         let mut list: Vec<&str> = numbers.iter().copied().collect();
         list.sort_by_key(|n| natural_key(n));
         let list = match list.split_last() {
@@ -549,7 +550,7 @@ fn wire_numbers(i: &Inputs<'_>, wire_net: &WireNets, out: &mut Vec<Finding>) {
         ));
     }
     for (number, nets) in by_number.iter_mut().filter(|(_, n)| n.len() > 1) {
-        nets.sort_by_key(|(net, ..)| first_drawn.get(net).copied().unwrap_or(usize::MAX));
+        nets.sort_by_key(|(net, ..)| first_drawn.get(net).map_or(usize::MAX, |&(order, ..)| order));
         // Named on the second connection in drawing order (by any of its wires): the first may
         // well be the right one.
         let Some((_, page, wire)) = nets.get(1) else { continue };
