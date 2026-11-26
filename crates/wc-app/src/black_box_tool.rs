@@ -247,6 +247,23 @@ pub fn hint(draft: Option<&BoxDraft>) -> &'static str {
 /// The connection points of a box resized to a new size, each kept on its edge (#524).
 pub use wc_core::box_edit::resized_pins;
 
+/// Whether a black box edit changed the connection point `pin`: renamed, taken off, moved, or
+/// its name taken by another point (also a new point just like one taken off). A wire being
+/// drawn from such a point would be saved on a stale point, so the Properties form and the
+/// assistant both drop it.
+pub(crate) fn point_changed(
+    pin: &str,
+    old: &[BoxPin],
+    new: &[BoxPin],
+    renamed: &BTreeMap<String, String>,
+    removed: &std::collections::BTreeSet<String>,
+) -> bool {
+    renamed.contains_key(pin)
+        || removed.contains(pin)
+        || renamed.values().any(|to| to == pin)
+        || old.iter().find(|p| p.name == pin) != new.iter().find(|p| p.name == pin)
+}
+
 /// The size of a box `start` (width, height) after its sizing corner was dragged by `d` (page
 /// mm) on a box placed turned by `rotation` and maybe mirrored: in whole steps of `step`, and
 /// at least one step (and 1 mm) each way.

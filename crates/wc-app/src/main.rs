@@ -272,6 +272,9 @@ enum Leave {
     Close,
 }
 
+/// Why a window close was called off while a dialog holds work of its own (#1019).
+const DIALOG_HOLDS_CLOSE: &str = "The window was not closed: finish or close the open dialog first.";
+
 /// Where a window close the person asked for stands (#1019).
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 enum Closing {
@@ -649,12 +652,14 @@ impl App {
         }
         // A save waiting for a typed value runs on the project it was asked for first: a
         // joined copy waits for it, also when an assistant's Undo syncs before the panels.
-        // So does a close waiting a frame for a typed value.
-        // And so does the unsaved-changes question: its answer saves or drops the project
-        // it was asked about.
+        // So does a close, from the frame it waits for a typed value until the window is gone
+        // (after Don't save, a join would save what the person chose to drop), and an Open
+        // whose file dialog has not been shown yet. And so does the unsaved-changes question:
+        // its answer saves or drops the project it was asked about.
         let busy = busy
             || !self.after_typed.is_empty()
-            || self.closing == Closing::WaitsForTyped
+            || self.closing != Closing::No
+            || matches!(self.pending, Some(Pending::Open))
             || matches!(self.dialog, Some(Dialog::Unsaved(_)));
         let page = self.open.as_ref().and_then(|o| match self.ed.panel {
             Some(_) => None,
@@ -833,7 +838,8 @@ impl App {
     /// project the person is asked first whether to save them (#1019); it opens once answered.
     fn open_dir(&mut self, dir: &std::path::Path, prefs: &mut Prefs) {
         // A black box change the save refused is not in the project yet either.
-        let unsaved = self.open.as_ref().is_some_and(|o| o.dirty) || panels::black_box_draft_refused(&self.panels);
+        let unsaved =
+            self.open.as_ref().is_some_and(|o| o.dirty) || panels::black_box_draft_refused(&self.panels, &self.ed);
         if self.importing.is_none() && unsaved {
             self.ask_unsaved(Leave::Open(dir.to_path_buf()));
             return;
@@ -1390,18 +1396,41 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.closing = Closing::WaitsForTyped;
             ctx.request_repaint();
-        } else if open.dirty || panels::black_box_draft_refused(&self.panels) {
+        } else if open.dirty || panels::black_box_draft_refused(&self.panels, &self.ed) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.ask_unsaved(Leave::Close);
+        } else if self.dialog_holds_work() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.closing = Closing::No;
+            self.ed.message = DIALOG_HOLDS_CLOSE.into();
         }
+    }
+
+    /// Whether the open dialog holds work of its own not applied yet (Project properties with
+    /// a name typed, say): closing the window or asking about unsaved changes waits until it
+    /// is finished or closed.
+    fn dialog_holds_work(&self) -> bool {
+        self.dialog.as_ref().is_some_and(|d| {
+            !matches!(
+                d,
+                Dialog::Message(_)
+                    | Dialog::Unsaved(_)
+                    | Dialog::OpenPath(..)
+                    | Dialog::Report { .. }
+                    | Dialog::Fetching(_)
+            )
+        })
     }
 
     /// The frame after a close waited for a typed value, once the panels entered it: ask about
     /// unsaved changes, or close.
     fn close_or_ask(&mut self) {
-        if self.open.as_ref().is_some_and(|o| o.dirty) || panels::black_box_draft_refused(&self.panels) {
+        if self.open.as_ref().is_some_and(|o| o.dirty) || panels::black_box_draft_refused(&self.panels, &self.ed) {
             self.closing = Closing::No;
             self.ask_unsaved(Leave::Close);
+        } else if self.dialog_holds_work() {
+            self.closing = Closing::No;
+            self.ed.message = DIALOG_HOLDS_CLOSE.into();
         } else {
             self.closing = Closing::Go;
         }
@@ -1444,7 +1473,11 @@ impl App {
     /// change), the project stays open as it is.
     fn save_and_leave(&mut self, leave: Leave) {
         self.carry_out(Action::Save);
-        if self.open.as_ref().is_some_and(|o| o.dirty) || panels::black_box_draft_refused(&self.panels) {
+        // While an assistant command runs, Save waits (`SAVE_WAITS`): nothing was saved.
+        if self.assistant.command_running()
+            || self.open.as_ref().is_some_and(|o| o.dirty)
+            || panels::black_box_draft_refused(&self.panels, &self.ed)
+        {
             return;
         }
         self.leave(leave);
@@ -1724,14 +1757,16 @@ impl App {
         // A black box form changed and not applied yet is applied before the project is saved.
         // Why it was refused, or what to check after it went in, stays in the message the save
         // leaves.
-        let refused = if saves_project(a) && !self.assistant.command_running() {
-            match panels::apply_black_box_draft(open, &mut self.ed, &mut self.panels) {
-                Ok(note) => note,
-                Err(r) => Some(r),
-            }
-        } else {
-            None
-        };
+        // Not for a Save as that is refused in a shared session: a refused save changes nothing.
+        let refused =
+            if saves_project(a) && !self.assistant.command_running() && !(a == Action::SaveAs && self.share.active()) {
+                match panels::apply_black_box_draft(open, &mut self.ed, &mut self.panels) {
+                    Ok(note) => note,
+                    Err(r) => Some(r),
+                }
+            } else {
+                None
+            };
         if let Some(r) = &refused {
             self.ed.message = r.clone();
         }
@@ -5776,7 +5811,7 @@ impl eframe::App for App {
         // A fetched base project replaces the open one: not while a save waits for a typed
         // value, which first goes into the project it was asked for, nor while a close waits
         // for one, which asks about the project the value was typed in.
-        if self.after_typed.is_empty() && self.closing != Closing::WaitsForTyped {
+        if self.after_typed.is_empty() && self.closing == Closing::No {
             self.poll_fetch(ctx);
         } else {
             ctx.request_repaint();
@@ -8225,7 +8260,7 @@ mod nudge_tests {
         app.save_and_leave(Leave::Close);
         assert!(!app.open.as_ref().unwrap().dirty, "the project itself was saved");
         assert!(
-            panels::black_box_draft_refused(&app.panels),
+            panels::black_box_draft_refused(&app.panels, &app.ed),
             "the form keeps the change"
         );
         assert!(app.ed.message.contains("not changed"), "{}", app.ed.message);
@@ -8285,6 +8320,68 @@ mod nudge_tests {
             matches!(app.dialog, Some(Dialog::Unsaved(Leave::Close))),
             "the question stays"
         );
+    }
+
+    /// After Don't save the window is closing: a session join approved meanwhile does not save
+    /// the changes the person chose to drop (#1019).
+    #[test]
+    fn a_session_join_does_not_save_after_dont_save() {
+        let (tmp, mut app, ctx) = changed_app();
+        let first = app.open.as_ref().unwrap().dir.clone();
+        app_frame(&mut app, &ctx, Vec::new(), true);
+        assert!(matches!(app.dialog, Some(Dialog::Unsaved(Leave::Close))));
+        let (_host, guest) = crate::share::tests::let_in_guest(tmp.path()).unwrap();
+        app.share = guest;
+        app.dialog = None;
+        app.leave(Leave::Close);
+        app.sync_session_now(false);
+        assert_eq!(app.open.as_ref().unwrap().dir, first, "not joined while closing");
+        assert_eq!(
+            coil_on_disk(&app),
+            Point::new(55.0, 60.0),
+            "the dropped change is not saved"
+        );
+    }
+
+    /// An Open whose file dialog has not been shown yet keeps a join from saving and replacing
+    /// the project it will ask about (#1019).
+    #[test]
+    fn a_session_join_waits_while_an_open_is_pending() {
+        let (tmp, mut app, _ctx) = changed_app();
+        let first = app.open.as_ref().unwrap().dir.clone();
+        app.run(Action::Open);
+        assert!(matches!(app.pending, Some(Pending::Open)));
+        let (_host, guest) = crate::share::tests::let_in_guest(tmp.path()).unwrap();
+        app.share = guest;
+        app.sync_session_now(false);
+        let open = app.open.as_ref().unwrap();
+        assert_eq!(open.dir, first, "not joined while the Open waits");
+        assert!(open.dirty, "nothing was saved without asking");
+    }
+
+    /// A project with nothing unsaved still does not close over a dialog holding work of its
+    /// own (Project properties): the close is called off and the dialog stays (#1019).
+    #[test]
+    fn closing_waits_for_a_dialog_that_holds_work() {
+        use egui::ViewportCommand::{CancelClose, Close};
+        let (_tmp, mut app, ctx) = app(Point::new(55.0, 60.0), false);
+        app.open.as_mut().unwrap().save().unwrap();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        app.run(Action::ProjectProps);
+        assert!(matches!(app.dialog, Some(Dialog::ProjectProps { .. })));
+        let sent = app_frame(&mut app, &ctx, Vec::new(), true);
+        assert!(sent.contains(&CancelClose), "the close is called off");
+        assert!(!sent.contains(&Close));
+        assert!(
+            matches!(app.dialog, Some(Dialog::ProjectProps { .. })),
+            "the dialog stays"
+        );
+        assert_eq!(app.ed.message, DIALOG_HOLDS_CLOSE);
+        // A message box holds nothing: the window closes.
+        app.dialog = Some(Dialog::Message("Note".into()));
+        let sent = app_frame(&mut app, &ctx, Vec::new(), true);
+        assert!(!sent.contains(&CancelClose));
     }
 
     /// A close asked for while a field has the keyboard waits a frame for the typed value; a
