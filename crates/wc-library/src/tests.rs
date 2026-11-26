@@ -599,6 +599,32 @@ fn starter_solenoid_valve_coil_and_its_example_part_load() -> Result<()> {
 }
 
 #[test]
+fn starter_photoelectric_sensor_and_its_example_part_load() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
+    project.meta.libraries = vec![LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: starter.to_string_lossy().into(),
+        reference: None,
+    }];
+    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    // The photoelectric sensor (#756): letter code B for a sensor in IEC 81346-2, and the same
+    // three wires as the 3-wire proximity sensors.
+    let (photo, _) = lib.symbol("wc.sensor.photo3")?;
+    assert_eq!(photo.role, SymbolRole::Standalone);
+    assert_eq!(photo.letter_code, "B");
+    let names: Vec<_> = photo.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["BN", "BK", "BU"]);
+    assert_eq!(
+        lib.part("example.ex-ps-m18-pnp")?.0.symbol.as_deref(),
+        Some("wc.sensor.photo3")
+    );
+    Ok(())
+}
+
+#[test]
 fn lock_restores_a_deleted_vendored_copy_at_the_pinned_version() -> Result<()> {
     let mut f = fixture()?;
     let lib = Library::open(&f.proj, &f.project)?;
