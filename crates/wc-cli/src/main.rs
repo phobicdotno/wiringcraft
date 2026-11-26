@@ -13,48 +13,49 @@ type Res<T> = Result<T, String>;
 
 // Every `print!` and `println!` below writes through these, not the standard ones: those panic
 // when the reader of a pipe stops early (`wiringcraft ... | more`), which on Windows, with no
-// SIGPIPE to end the program, reported a crash. These end the command quietly instead (#567).
+// SIGPIPE to end the program, reported a crash (#567). These keep the first error, drop later
+// output, and let the command run to its end, so its changes are still saved (#550).
 macro_rules! print {
     ($($arg:tt)*) => {
-        $crate::print_out(format_args!($($arg)*))
+        $crate::write_stdout(|out| std::io::Write::write_fmt(out, format_args!($($arg)*)))
     };
 }
 macro_rules! println {
     () => {
-        $crate::print_out(format_args!("\n"))
+        $crate::write_stdout(|out| std::io::Write::write_all(out, b"\n"))
     };
     ($($arg:tt)*) => {
-        $crate::print_out(format_args!("{}\n", format_args!($($arg)*)))
+        $crate::write_stdout(|out| {
+            std::io::Write::write_fmt(out, format_args!("{}\n", format_args!($($arg)*)))
+        })
     };
 }
 
-/// Why writing to stdout stopped the command. It unwinds the command's thread without a panic
-/// message, and [`finish`] turns it into the program's end: quiet when the reader has gone away.
-struct StdoutError(std::io::Error);
-
-/// What `print!` and `println!` do.
-fn print_out(args: std::fmt::Arguments) {
-    stdout_result(std::io::Write::write_fmt(&mut std::io::stdout().lock(), args));
+thread_local! {
+    /// The first error writing to stdout on this thread, the command's; output after it is
+    /// dropped, and [`with_stdout_error`] reports it once the command has ended.
+    static STDOUT_ERROR: std::cell::RefCell<Option<std::io::Error>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-/// The value of `r`, the result of a write to stdout, when it worked; stop the command with
-/// [`StdoutError`] when it did not, such as when the reader of a pipe has closed it.
-fn stdout_result<T>(r: std::io::Result<T>) -> T {
-    match r {
-        Ok(v) => v,
-        Err(err) => std::panic::resume_unwind(Box::new(StdoutError(err))),
+/// Write to stdout with `write`, unless an earlier write failed.
+fn write_stdout(write: impl FnOnce(&mut std::io::StdoutLock<'static>) -> std::io::Result<()>) {
+    if STDOUT_ERROR.with_borrow(Option::is_some) {
+        return;
+    }
+    if let Err(err) = write(&mut std::io::stdout().lock()) {
+        STDOUT_ERROR.set(Some(err));
     }
 }
 
-/// The result of the command from its thread's end: a closed stdout ends it quietly.
-fn finish(joined: std::thread::Result<Res<()>>) -> Res<()> {
-    match joined {
-        Ok(result) => result,
-        Err(payload) => match payload.downcast::<StdoutError>() {
-            Ok(err) if err.0.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
-            Ok(err) => Err(format!("could not write the output: {}", err.0)),
-            Err(_) => Err("the command stopped unexpectedly".into()),
-        },
+/// The command's `result`, with what went wrong writing its output: nothing when the reader of
+/// a pipe went away early (`| more`, `| head -1`), as other command-line tools do.
+fn with_stdout_error(result: Res<()>) -> Res<()> {
+    let failed = STDOUT_ERROR.take();
+    result?;
+    match failed {
+        Some(err) if err.kind() != std::io::ErrorKind::BrokenPipe => Err(format!("could not write the output: {err}")),
+        _ => Ok(()),
     }
 }
 
@@ -1649,7 +1650,7 @@ fn run(cli: Cli) -> Res<()> {
             let mut p = load(dir)?;
             match lc {
                 LocationCmd::List => {
-                    stdout_result(write_locations(&mut std::io::stdout(), &p.meta.locations));
+                    write_stdout(|out| write_locations(out, &p.meta.locations));
                 }
                 LocationCmd::Set { path, description } => {
                     let description = description.unwrap_or_else(|| {
@@ -3770,9 +3771,11 @@ fn main() -> ExitCode {
     // Parsing runs there too: clap's derived parser builds every subcommand on the stack.
     let worker = std::thread::Builder::new()
         .stack_size(STACK)
-        .spawn(|| run(Cli::parse()));
+        .spawn(|| with_stdout_error(run(Cli::parse())));
     let result = match worker {
-        Ok(handle) => finish(handle.join()),
+        Ok(handle) => handle
+            .join()
+            .unwrap_or_else(|_| Err("the command stopped unexpectedly".into())),
         Err(err) => Err(format!("could not start the command: {err}")),
     };
     match result {
@@ -5059,42 +5062,43 @@ mod tests {
         }
     }
 
-    /// Run `f` on a thread as `main` runs a command, and end it as `main` does.
+    /// Run `f` on its own thread, as `main` runs a command, with its stdout errors.
     fn run_like_main(f: impl FnOnce() -> Res<()> + Send + 'static) -> Res<()> {
-        finish(std::thread::spawn(f).join())
+        std::thread::spawn(move || with_stdout_error(f())).join().unwrap()
     }
 
     #[test]
-    fn a_closed_stdout_ends_the_command_quietly() {
-        let after = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let seen = after.clone();
-        let result = run_like_main(move || {
+    fn a_closed_stdout_lets_the_command_finish_quietly() {
+        let result = run_like_main(|| {
             let locations = [wc_core::project::Location {
                 path: "A1".into(),
                 description: String::new(),
             }];
-            stdout_result(write_locations(&mut ClosedPipe, &locations));
-            seen.store(true, std::sync::atomic::Ordering::SeqCst);
-            Err("went on writing".into())
+            write_stdout(|_| write_locations(&mut ClosedPipe, &locations));
+            // Later output is dropped, not written to the real stdout or failed on.
+            println!("after the reader went away");
+            Ok(())
         });
         assert_eq!(result, Ok(()));
-        assert!(!after.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn the_command_error_wins_over_a_closed_stdout() {
+        let result = run_like_main(|| {
+            write_stdout(|_| Err(std::io::ErrorKind::BrokenPipe.into()));
+            Err("no such page".into())
+        });
+        assert_eq!(result, Err("no such page".into()));
     }
 
     #[test]
     fn other_stdout_errors_are_reported() {
         let result = run_like_main(|| {
-            stdout_result::<()>(Err(std::io::Error::other("disk full")));
+            write_stdout(|_| Err(std::io::Error::other("disk full")));
+            write_stdout(|_| Err(std::io::Error::other("a second error")));
             Ok(())
         });
         assert_eq!(result, Err("could not write the output: disk full".into()));
-    }
-
-    #[test]
-    fn a_panic_is_still_reported_as_one() {
-        #[allow(clippy::panic)]
-        let result = run_like_main(|| panic!("boom"));
-        assert_eq!(result, Err("the command stopped unexpectedly".into()));
     }
 
     #[cfg(unix)]
