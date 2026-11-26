@@ -582,6 +582,35 @@ fn every_starter_symbol_loads_under_its_file_name_with_distinct_pins() -> Result
 }
 
 #[test]
+fn every_starter_part_loads_under_its_file_name_and_names_a_starter_symbol() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
+    project.meta.libraries = vec![LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: starter.to_string_lossy().into(),
+        reference: None,
+    }];
+    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let symbols = lib.index(ItemKind::Symbol);
+    let parts = lib.index(ItemKind::Part);
+    assert!(!parts.is_empty(), "the starter library has no parts");
+    for id in parts.keys() {
+        let (p, _) = lib.part(id)?;
+        assert_eq!(&p.id, id, "file name and id differ");
+        assert!(!p.description.trim().is_empty(), "{id} has no description");
+        if let Some(symbol) = &p.symbol {
+            assert!(
+                symbols.contains_key(symbol),
+                "{id} names symbol {symbol}, which is not in the starter library"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn starter_solenoid_valve_coil_and_its_example_part_load() -> Result<()> {
     let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
     let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
