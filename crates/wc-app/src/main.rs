@@ -1616,7 +1616,7 @@ impl App {
                     self.ed.message = "Turned, the device would not fit on the plate.".into();
                 }
             }
-            Action::Rotate | Action::Mirror if self.ed.tool == Tool::Place => {
+            Action::Rotate | Action::Mirror if self.ed.tool == Tool::Place && self.ed.panel.is_none() => {
                 canvas::turn_place(&mut self.ed, a == Action::Mirror);
             }
             Action::Rotate => open.rotate_many(page, &self.ed.selection),

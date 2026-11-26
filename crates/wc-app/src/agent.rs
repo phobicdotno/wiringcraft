@@ -4005,6 +4005,27 @@ mod tests {
         assert_eq!((s.rotation, s.mirror), (Rotation::R0, false));
     }
 
+    /// With a panel shown, Mirror does what it did before the place tool turned symbols: it
+    /// does not turn the symbol on the pointer, which the panel view does not show (#738).
+    #[test]
+    fn mirror_with_a_panel_shown_leaves_the_place_turn_alone() {
+        use crate::state::{Selection, Tool};
+        use wc_core::geom::Rotation;
+        let (_tmp, mut a) = app(vec![]);
+        let Some(open) = a.open.as_mut() else { unreachable!() };
+        let sid = open.place(0, "wc.coil", wc_core::Point::new(100.0, 60.0)).unwrap();
+        a.ed.page = 0;
+        a.ed.selection = vec![Selection::Symbol(sid.clone())];
+        a.ed.tool = Tool::Place;
+        a.ed.place_symbol = Some("wc.coil".into());
+        a.ed.panel = Some(0);
+        a.run(Action::Mirror);
+        assert_eq!(a.ed.place_turn, (Rotation::R0, false));
+        let Some(open) = a.open.as_ref() else { unreachable!() };
+        let s = open.project.pages[0].symbols.iter().find(|s| s.id == sid).unwrap();
+        assert!(s.mirror, "Mirror went to the selection, as before");
+    }
+
     /// A worker that ends only after far more polls than the old fixed bounds (1000) allowed
     /// is still waited for (#678).
     #[test]
