@@ -314,7 +314,58 @@ fn table_of_contents_goes_first_and_its_rows_link_to_pages() {
     // The contents rows jump to the schematic pages, which are now the 2nd and 3rd page objects.
     assert!(text.contains("/Dest [9 0 R /Fit]"), "row 1 -> page 1");
     assert!(text.contains("/Dest [12 0 R /Fit]"), "row 2 -> page 2");
-    assert_eq!(text.matches("/Subtype /Link").count(), 2);
+    // The third row is the parts list (#693).
+    assert_eq!(text.matches("/Subtype /Link").count(), 3);
+}
+
+#[test]
+fn table_of_contents_lists_the_sheets_after_the_schematic_pages() {
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Mains")];
+    let band = project.meta.template.band_height();
+    let per_page = layout::rows_per_page(layout::report_size(project.pages[0].size, band, 1), band);
+    // One row short of a full page, so the rows of the later sheets run onto a second page.
+    let mut rows = vec![vec!["1".to_owned(), "Mains".to_owned()]];
+    rows.resize(per_page - 1, vec![String::new(), "Note".to_owned()]);
+    let contents = wc_report::Table {
+        title: "Table of contents".into(),
+        columns: vec!["Page".into(), "Title".into()],
+        rows,
+        row_pages: vec!["p1".into()],
+        front: true,
+        ..Default::default()
+    };
+    let parts = wc_report::Table {
+        title: "Parts list".into(),
+        columns: vec!["Part".into()],
+        ..Default::default()
+    };
+    let opts = Options {
+        reports: vec![contents, parts],
+        panels: vec![wc_core::panel::Panel::with_rails("main", "Cabinet", 600.0, 800.0)],
+        networks: vec![wc_core::network::Network {
+            name: "PN1".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    // Two contents pages, the schematic page, the panel, the parts list and the network.
+    assert_eq!(report.pages, 6);
+    let at = |title: &str| {
+        text.find(&format!("/Title {}", writer::pdf_text(title)))
+            .unwrap_or(usize::MAX)
+    };
+    assert!(at("R2 Table of contents (2/2)") < usize::MAX);
+    // The parts list is the third report page, after the two contents pages.
+    assert!(at("R3 Parts list") < usize::MAX);
+    let shows = |s: &str| text.contains(&format!("{} Tj", writer::pdf_text(s)));
+    for cell in ["P1", "Cabinet", "R3", "Parts list", "N1", "Network PN1"] {
+        assert!(shows(cell), "{cell}");
+    }
+    // The schematic page and the three later sheets are linked from the contents.
+    assert_eq!(text.matches("/Subtype /Link").count(), 4);
 }
 
 #[test]

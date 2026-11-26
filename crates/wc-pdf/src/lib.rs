@@ -155,6 +155,11 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
             }
         })
         .collect();
+    let card_size = layout::card_size(first_size, project.meta.template.band_height());
+    let card_rows = layout::card_rows_per_page(card_size, project.meta.template.band_height());
+    // The contents also lists the sheets that follow the schematic pages, each row linked to
+    // its sheet (#693).
+    let (reports, extra_ids) = list_extra_sheets(reports, options, per_page, card_rows);
     // The lines of each report table's pages.
     let paged: Vec<Vec<Vec<layout::TableLine>>> = reports.iter().map(|t| layout::table_pages(t, per_page)).collect();
     // Each report page: (table, its page, part, parts). Front tables (the table of contents)
@@ -173,8 +178,6 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
     };
     let (front_pages, back_pages) = (split(true), split(false));
     // Each drawn card sheet: (card, first row, part, parts).
-    let card_size = layout::card_size(first_size, project.meta.template.band_height());
-    let card_rows = layout::card_rows_per_page(card_size, project.meta.template.band_height());
     let card_pages: Vec<(usize, usize, usize, usize)> = options
         .plc_cards
         .iter()
@@ -314,12 +317,105 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
         sheet += 1;
     }
     // Links resolve against the exported page list, so links to pages left out are dropped.
+    // The sheets after the schematic pages follow them in the order the contents lists them.
     let index: BTreeMap<String, usize> = pages
         .iter()
+        .map(|p| p.id.clone())
+        .chain(extra_ids)
         .enumerate()
-        .map(|(i, p)| (p.id.clone(), offset + i))
+        .map(|(i, id)| (id, offset + i))
         .collect();
     (doc.finish(&index), report)
+}
+
+/// Link target of the `n`th sheet after the schematic pages; no page id starts with a
+/// control character.
+fn extra_sheet_id(n: usize) -> String {
+    format!("\u{1}sheet-{n}")
+}
+
+/// `reports` with a row per sheet that follows the schematic pages (panel layouts, PLC cards,
+/// the report pages after them and network topologies, in that order) added to the first
+/// front table (the table of contents), and the link targets of those sheets in that order.
+/// A front table that grows onto another page moves the report numbers, which count from the
+/// first front page.
+fn list_extra_sheets<'a>(
+    mut reports: Vec<std::borrow::Cow<'a, wc_report::Table>>,
+    options: &Options,
+    per_page: usize,
+    card_rows: usize,
+) -> (Vec<std::borrow::Cow<'a, wc_report::Table>>, Vec<String>) {
+    let Some(first) = reports.iter().position(|t| t.front) else {
+        return (reports, Vec::new());
+    };
+    let parted = |title: &str, part: usize, parts: usize| {
+        if parts > 1 {
+            format!("{title} ({part}/{parts})")
+        } else {
+            title.to_owned()
+        }
+    };
+    // (number, title); a report page's number is filled in once the front pages are counted.
+    let mut rows: Vec<(Option<String>, String)> = Vec::new();
+    for (k, panel) in options.panels.iter().enumerate() {
+        rows.push((Some(format!("P{}", k + 1)), panel.name.clone()));
+    }
+    let mut card_no = 0;
+    for card in &options.plc_cards {
+        let n = layout::card_rows_of(card).len().div_ceil(card_rows).max(1);
+        for part in 1..=n {
+            card_no += 1;
+            rows.push((
+                Some(format!("C{card_no}")),
+                parted(&format!("PLC card {}", card.card), part, n),
+            ));
+        }
+    }
+    for t in reports.iter().filter(|t| !t.front) {
+        let n = layout::table_pages(t, per_page).len();
+        for part in 1..=n {
+            rows.push((None, parted(&t.title, part, n)));
+        }
+    }
+    for (k, net) in options.networks.iter().enumerate() {
+        rows.push((Some(format!("N{}", k + 1)), format!("Network {}", net.name)));
+    }
+    if rows.is_empty() {
+        return (reports, Vec::new());
+    }
+    let ids: Vec<String> = (0..rows.len()).map(extra_sheet_id).collect();
+    if let Some(t) = reports.get_mut(first) {
+        let t = t.to_mut();
+        let width = t.columns.len().max(2);
+        // Every earlier row describes a page or none; the new ones each describe a sheet.
+        t.row_pages.resize(t.rows.len(), String::new());
+        for (_, title) in &rows {
+            let mut row = vec![String::new(), title.clone()];
+            row.resize(width, String::new());
+            t.rows.push(row);
+        }
+        t.row_pages.extend(ids.iter().cloned());
+    }
+    let front: usize = reports
+        .iter()
+        .filter(|t| t.front)
+        .map(|t| layout::table_pages(t, per_page).len())
+        .sum();
+    let mut report_no = front;
+    if let Some(t) = reports.get_mut(first) {
+        let t = t.to_mut();
+        let start = t.rows.len() - rows.len();
+        for ((number, _), row) in rows.into_iter().zip(t.rows.iter_mut().skip(start)) {
+            let number = number.unwrap_or_else(|| {
+                report_no += 1;
+                format!("R{report_no}")
+            });
+            if let Some(cell) = row.first_mut() {
+                *cell = number;
+            }
+        }
+    }
+    (reports, ids)
 }
 
 /// `table` without the rows that describe a page not in `pages`. Rows that describe no page
