@@ -151,11 +151,18 @@ impl AttachPath {
             return None;
         }
         match crate::prefs::project_path(typed) {
-            Ok(f) if f.is_file() => Some(f),
-            Ok(f) => {
-                self.error = Some(format!("{} is not a file.", f.display()));
-                None
-            }
+            Ok(f) => match std::fs::metadata(&f) {
+                Ok(m) if m.is_file() => Some(f),
+                Ok(_) => {
+                    self.error = Some(format!("{} is not a file.", f.display()));
+                    None
+                }
+                // Why it cannot be read: not there, or no access to a folder on the way.
+                Err(e) => {
+                    self.error = Some(format!("{} cannot be read: {e}", f.display()));
+                    None
+                }
+            },
             Err(e) => {
                 self.error = Some(e);
                 None
@@ -2359,6 +2366,13 @@ mod tests {
         assert_eq!(form.typed_file(), None);
         assert_eq!(form.error.as_deref(), Some("Type the full path of the file."));
         form.file.text = tmp.path().join("missing.dxf").display().to_string();
+        assert_eq!(form.typed_file(), None);
+        assert!(
+            form.error.as_deref().is_some_and(|e| e.contains("cannot be read: ")),
+            "{form:?}"
+        );
+        // A folder is there, but is not a file.
+        form.file.text = tmp.path().display().to_string();
         assert_eq!(form.typed_file(), None);
         assert!(
             form.error.as_deref().is_some_and(|e| e.ends_with("is not a file.")),
