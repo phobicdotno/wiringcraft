@@ -43,14 +43,42 @@ use its reading tools, and no new turn starts). The window has the view controls
 (zoom, grid, theme, layers). Messages that name a command line option are worded
 for the app.
 
+Where the format has options on the command line, a small dialog asks for them after the file
+is picked, with the command line's defaults filled in; a format without options starts at once.
+A DWG or DXF drawing has its scale (`--scale`, 1 by default: the drawing's coordinates are
+multiplied by it to get mm). The imports that add pages (EPLAN, SolidWorks Electrical,
+AutomationML, PDF, archive) have the first page number (`--first-page`), filled in with the
+command line's default, or with the number after the project's highest page number when that is
+higher; a SolidWorks Electrical import can keep the source's own page numbers instead, as the
+command line does without `--first-page`.
+
 Changes not saved yet are saved first, the imported pages and devices come in as one undo step,
-and the import's report and warnings are shown when it is done. New pages are numbered from the
-CLI's default first page, or after the project's highest page number when that is higher. The
-app imports the first project of a SolidWorks archive with its pages numbered from 100, or from
-one above the project's highest numeric page number when that is higher (with page 101 in use,
-from 102 even when 100 is free, since the imported pages follow on from one number), instead of
-its own page numbers, and with no symbol map, and an archive's KiCad libraries and parts lists are listed, not imported; use the CLI for
-`--pick`, `--symbol-map`, `--first-page` and `--lib` there.
+and the import's report and warnings are shown when it is done. The first page number offered
+is the CLI's default, or one above the project's highest numeric page number when that is higher
+(with page 101 in use, 102 even when 100 is free, since the imported pages follow on from one
+number); for a SolidWorks archive it is offered from 100 in the same way, with its own page
+numbers as the other choice. A SolidWorks archive that holds several projects lists them (number,
+folder and name) and the first is chosen, as `--pick 1`; when the archive's project list cannot
+be read, the folders are listed alone and the dialog says why. A first page number above
+1 000 000 000 is refused, on the command line too.
+
+A SolidWorks Electrical project and an EDZ parts import have the symbol map file
+(`--symbol-map`): a field with a Browse button, empty by default, which imports with no map as
+the command line does without the option. A file that is not there is refused before the import
+starts. A relative path typed there is taken inside the projects folder, as a typed import file
+is; the empty field names that folder.
+
+An archive has the library folder for the KiCad symbol libraries and parts lists inside it
+(`--lib`): "Do not import them" by default, which lists them with a warning as the command line
+does without `--lib`, or the project's own `library/`, one of its other library folders, or
+another folder typed or picked with Browse, as for a parts import. When the project's library
+folders cannot be listed, the dialog says why and another folder can still be chosen. The
+entries of an archive are numbered on from the first page number, also past the limit on the
+number typed. A folder that is not among
+the project's libraries yet is added to them once something was written there (a symbol
+library or a part), also when the folder was there before. The SolidWorks Electrical libraries
+import vendors into the project, as `import swe-library` does without `--lib`; writing them
+into a library folder instead (`import swe-library --lib`) is on the command line only.
 
 In the app, **Library → Import symbols…** takes DXF, SVG, `.kicad_sym` and `.elmt` files together,
 each read by its extension, and writes them into one of the project's library folders. The
