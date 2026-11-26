@@ -175,10 +175,11 @@ fn esc(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// Rough rendered width of `text` in a proportional sans-serif font at `size` px. Errs on the
-/// wide side (0.6 em per character) so text fits even in the widest fallback fonts.
+/// Upper bound on the rendered width of `text` in a proportional sans-serif font at `size` px.
+/// Uses 1.0 em per character (about the widest advance in Helvetica/Arial, e.g. "W" or "M") so
+/// no subject is clipped, at the cost of some spare space for narrow text.
 fn text_width(text: &str, size: f64) -> f64 {
-    text.chars().count() as f64 * size * 0.6
+    text.chars().count() as f64 * size
 }
 
 /// Width of a bold 12 px branch/tag badge.
@@ -362,7 +363,17 @@ mod tests {
         let svg = subway_svg(&rows);
         let text_x = 20.0 + 22.0 + 12.0;
         let badges = badge_width(&rows[0].commit.refs[0]) + badge_width(&rows[0].commit.refs[1]) + 12.0;
-        let need = text_x + badges + 200.0 * 12.0 * 0.6;
+        let need = text_x + badges + 200.0 * 12.0;
+        assert!(svg_width(&svg) >= need, "width {} < needed {need}", svg_width(&svg));
+    }
+
+    #[test]
+    fn svg_fits_wide_glyph_subjects() {
+        let mut wide = c("w", &[]);
+        wide.subject = "W".repeat(200);
+        let svg = subway_svg(&layout(vec![wide]));
+        let text_x = 20.0 + 22.0 + 12.0;
+        let need = text_x + 200.0 * 1.0 * 12.0;
         assert!(svg_width(&svg) >= need, "width {} < needed {need}", svg_width(&svg));
     }
 
