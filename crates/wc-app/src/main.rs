@@ -541,6 +541,7 @@ impl chrome::Status for StatusView<'_> {
                 })
             }
             Action::Mirror if self.ed.panel.is_some() => false,
+            Action::Rotate | Action::Mirror if self.ed.tool == Tool::Place => has,
             Action::Rotate | Action::Mirror => {
                 has && self.ed.selection.iter().any(|s| matches!(s, Selection::Symbol(_)))
             }
@@ -1303,6 +1304,11 @@ impl App {
     fn run(&mut self, a: Action) {
         let earlier = self.pending.take();
         self.carry_out(a);
+        // The turn for the symbol on the pointer belongs to the place tool: an action that
+        // leaves it sets the turn back, also before the canvas is next drawn.
+        if self.ed.tool != Tool::Place {
+            self.ed.reset_place_turn();
+        }
         match (earlier, self.pending.is_some()) {
             (Some(e), true) => {
                 self.pending = Some(e);
@@ -1472,21 +1478,21 @@ impl App {
                 self.prefs.save();
             }
             Action::Select => {
-                self.ed.tool = Tool::Select;
+                self.ed.set_tool(Tool::Select);
                 self.ed.wire = None;
                 self.ed.shape_points.clear();
             }
             Action::PlaceSymbol => {
-                self.ed.tool = Tool::Place;
+                self.ed.set_tool(Tool::Place);
                 self.ed.wire = None;
                 self.ed.shape_points.clear();
             }
             Action::DrawWire => {
-                self.ed.tool = Tool::Wire;
+                self.ed.set_tool(Tool::Wire);
                 self.ed.shape_points.clear();
             }
             Action::BlackBoxTool => {
-                self.ed.tool = Tool::BlackBox;
+                self.ed.set_tool(Tool::BlackBox);
                 self.ed.wire = None;
                 self.ed.shape_points.clear();
                 self.ed.black_box = None;
@@ -1502,7 +1508,7 @@ impl App {
             | Action::CloudTool
             | Action::RevisionTableTool
             | Action::CommentTool => {
-                self.ed.tool = match a {
+                self.ed.set_tool(match a {
                     Action::TextTool => Tool::Text,
                     Action::CommentTool => Tool::Comment,
                     Action::LineTool => Tool::Line,
@@ -1513,7 +1519,7 @@ impl App {
                     Action::CloudTool => Tool::Cloud,
                     Action::RevisionTableTool => Tool::RevisionTable,
                     _ => Tool::Rect,
-                };
+                });
                 self.ed.wire = None;
                 self.ed.shape_points.clear();
                 self.ed.message = match a {
@@ -1676,6 +1682,9 @@ impl App {
                     self.ed.message = "Turned, the device would not fit on the plate.".into();
                 }
             }
+            Action::Rotate | Action::Mirror if self.ed.tool == Tool::Place && self.ed.panel.is_none() => {
+                canvas::turn_place(&mut self.ed, a == Action::Mirror);
+            }
             Action::Rotate => open.rotate_many(page, &self.ed.selection),
             Action::Mirror => open.mirror_many(page, &self.ed.selection),
             // From the keyboard too: the schematic page is hidden behind the panel (#824).
@@ -1686,7 +1695,7 @@ impl App {
                 );
             }
             Action::SelectAll => {
-                self.ed.tool = Tool::Select;
+                self.ed.set_tool(Tool::Select);
                 self.ed.selection = self.prefs.layers.keep(open.select_all(page));
             }
             Action::Copy | Action::Cut => {
@@ -1730,7 +1739,7 @@ impl App {
                             pasted.len(),
                             if pasted.len() == 1 { "" } else { "s" }
                         );
-                        self.ed.tool = Tool::Select;
+                        self.ed.set_tool(Tool::Select);
                         self.ed.selection = pasted;
                     }
                     Ok(_) => {}
@@ -3243,7 +3252,7 @@ impl App {
                         && let Some(i) = o.project.pages.iter().position(|p| p.id == pid)
                     {
                         self.ed.page = i;
-                        self.ed.tool = Tool::Select;
+                        self.ed.set_tool(Tool::Select);
                         self.ed.view.fit = true;
                         self.ed.selection = item
                             .and_then(|it| {
@@ -4395,7 +4404,7 @@ impl App {
         let Some(open) = self.open.as_mut() else { return };
         match open.insert_macro(page, path, value_set) {
             Ok(items) if !items.is_empty() => {
-                self.ed.tool = Tool::Select;
+                self.ed.set_tool(Tool::Select);
                 let name = match value_set {
                     Some(set) => format!("{name} ({set})"),
                     None => name.to_owned(),
@@ -5852,7 +5861,7 @@ impl App {
                 self.ed.selection.clear();
                 self.ed.message = format!("Comment {id} added.");
                 self.ed.comment = Some(id);
-                self.ed.tool = Tool::Select;
+                self.ed.set_tool(Tool::Select);
             }
             Err(err) => self.ed.message = err.to_string(),
         }
@@ -5921,7 +5930,7 @@ impl App {
             self.ed.wire = None;
         }
         self.ed.page = i;
-        self.ed.tool = Tool::Select;
+        self.ed.set_tool(Tool::Select);
         self.ed.view.fit = true;
         // A hit on a hidden or locked layer would be dropped from the selection on the next
         // frame without a word: say why instead.

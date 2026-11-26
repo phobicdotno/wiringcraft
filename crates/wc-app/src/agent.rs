@@ -4108,6 +4108,110 @@ mod tests {
         }
     }
 
+    /// With the place tool, Rotate and Mirror turn the symbol on the pointer: the selected
+    /// symbol on the page stays as it is and no undo step is made (#738).
+    #[test]
+    fn rotate_and_mirror_with_the_place_tool_turn_the_symbol_on_the_pointer() {
+        use crate::state::{Selection, Tool};
+        use wc_core::geom::Rotation;
+        let (_tmp, mut a) = app(vec![]);
+        let Some(open) = a.open.as_mut() else { unreachable!() };
+        let sid = open.place(0, "wc.coil", wc_core::Point::new(100.0, 60.0)).unwrap();
+        let steps = open.undo_steps();
+        a.ed.page = 0;
+        a.ed.selection = vec![Selection::Symbol(sid.clone())];
+        a.ed.tool = Tool::Place;
+        a.ed.place_symbol = Some("wc.coil".into());
+        a.run(Action::Rotate);
+        a.run(Action::Mirror);
+        assert_eq!(a.ed.place_turn, (Rotation::R90, true));
+        let Some(open) = a.open.as_ref() else { unreachable!() };
+        let s = open.project.pages[0].symbols.iter().find(|s| s.id == sid).unwrap();
+        assert_eq!(
+            (s.rotation, s.mirror),
+            (Rotation::R0, false),
+            "the placed symbol is untouched"
+        );
+        assert_eq!(open.undo_steps(), steps, "no undo step");
+        assert_eq!(a.ed.selection, vec![Selection::Symbol(sid)]);
+        // Choosing Place again keeps the turn.
+        a.run(Action::PlaceSymbol);
+        assert_eq!(a.ed.place_turn, (Rotation::R90, true));
+        // Select then Place in one frame, with no canvas drawn between, starts upright.
+        a.run(Action::Select);
+        a.run(Action::PlaceSymbol);
+        assert_eq!(a.ed.place_turn, (Rotation::R0, false));
+        let (rotation, mirror) = a.ed.place_turn;
+        let Some(open) = a.open.as_mut() else { unreachable!() };
+        let placed = open
+            .place_turned(0, "wc.coil", wc_core::Point::new(150.0, 60.0), rotation, mirror)
+            .unwrap();
+        let s = open.project.pages[0].symbols.iter().find(|s| s.id == placed).unwrap();
+        assert_eq!((s.rotation, s.mirror), (Rotation::R0, false));
+    }
+
+    /// With a panel shown, Mirror does what it did before the place tool turned symbols: it
+    /// does not turn the symbol on the pointer, which the panel view does not show (#738).
+    #[test]
+    fn mirror_with_a_panel_shown_leaves_the_place_turn_alone() {
+        use crate::state::{Selection, Tool};
+        use wc_core::geom::Rotation;
+        let (_tmp, mut a) = app(vec![]);
+        let Some(open) = a.open.as_mut() else { unreachable!() };
+        let sid = open.place(0, "wc.coil", wc_core::Point::new(100.0, 60.0)).unwrap();
+        a.ed.page = 0;
+        a.ed.selection = vec![Selection::Symbol(sid.clone())];
+        a.ed.tool = Tool::Place;
+        a.ed.place_symbol = Some("wc.coil".into());
+        a.ed.panel = Some(0);
+        a.run(Action::Mirror);
+        assert_eq!(a.ed.place_turn, (Rotation::R0, false));
+        let Some(open) = a.open.as_ref() else { unreachable!() };
+        let s = open.project.pages[0].symbols.iter().find(|s| s.id == sid).unwrap();
+        assert!(s.mirror, "Mirror went to the selection, as before");
+    }
+
+    /// Going to a find hit leaves the place tool, and with it the turn for the symbol on the
+    /// pointer: placing again later starts upright (#738).
+    #[test]
+    fn going_to_a_find_hit_sets_the_place_turn_back() {
+        use crate::state::Tool;
+        use wc_core::geom::Rotation;
+        let (_tmp, mut a) = app(vec![]);
+        let Some(open) = a.open.as_ref() else { unreachable!() };
+        let page = open.project.pages[0].id.clone();
+        a.ed.tool = Tool::Place;
+        a.ed.place_symbol = Some("wc.coil".into());
+        crate::canvas::turn_place(&mut a.ed, true);
+        assert_eq!(a.ed.place_turn, (Rotation::R0, true));
+        a.show_found(&page, None);
+        assert_eq!(a.ed.tool, Tool::Select);
+        assert_eq!(a.ed.place_turn, (Rotation::R0, false));
+    }
+
+    /// R, then Escape (Select), then S: the preview is upright again and the status no longer
+    /// tells of the old turn. A status about something else stays (#738).
+    #[test]
+    fn leaving_the_place_tool_clears_only_the_turn_status() {
+        use crate::state::Tool;
+        use wc_core::geom::Rotation;
+        let (_tmp, mut a) = app(vec![]);
+        a.ed.tool = Tool::Place;
+        a.ed.place_symbol = Some("wc.coil".into());
+        a.run(Action::Rotate);
+        assert_eq!(a.ed.message, "Turned 90°, R turns again, M mirrors.");
+        a.run(Action::Select);
+        a.run(Action::PlaceSymbol);
+        assert_eq!(a.ed.place_turn, (Rotation::R0, false));
+        assert!(a.ed.message.is_empty(), "{}", a.ed.message);
+        // Another status stays when the turn is set back.
+        a.run(Action::Rotate);
+        a.ed.message = "Saved.".into();
+        a.run(Action::Select);
+        assert_eq!(a.ed.place_turn, (Rotation::R0, false));
+        assert_eq!(a.ed.message, "Saved.");
+    }
+
     /// A worker that ends only after far more polls than the old fixed bounds (1000) allowed
     /// is still waited for (#678).
     #[test]

@@ -4,7 +4,7 @@
 //! Page coordinates are millimetres with y pointing down, like the paper and the PDF export.
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape as EShape, Stroke, Vec2};
-use wc_core::geom::{Align, Point};
+use wc_core::geom::{Align, Point, Rotation};
 use wc_core::route::Route;
 use wc_core::{Endpoint, Page, Shape};
 
@@ -65,6 +65,9 @@ pub struct Editor {
     pub selection: Vec<Selection>,
     /// Library symbol the place tool puts down.
     pub place_symbol: Option<String>,
+    /// The turn and mirror the place tool puts the symbol down with (R and M set them while
+    /// the symbol hangs on the pointer). Set back when another tool is picked.
+    pub place_turn: (Rotation, bool),
     /// A wire being drawn: its start and the bends so far.
     pub wire: Option<(Endpoint, Vec<Point>)>,
     pub view: View,
@@ -135,6 +138,7 @@ impl Default for Editor {
             tool: Tool::Select,
             selection: Vec::new(),
             place_symbol: None,
+            place_turn: (Rotation::R0, false),
             wire: None,
             view: View::default(),
             cursor: None,
@@ -213,6 +217,27 @@ enum Drag {
 }
 
 impl Editor {
+    /// Change the tool. The turn for the symbol on the pointer belongs to the place tool:
+    /// any other tool sets it back.
+    pub fn set_tool(&mut self, tool: Tool) {
+        self.tool = tool;
+        if tool != Tool::Place {
+            self.reset_place_turn();
+        }
+    }
+
+    /// Set the turn for the symbol on the pointer back to upright. A status that still tells
+    /// of the old turn goes with it; any other status stays.
+    pub fn reset_place_turn(&mut self) {
+        if self.place_turn == (Rotation::R0, false) {
+            return;
+        }
+        self.place_turn = (Rotation::R0, false);
+        if self.message.ends_with(TURN_STATUS_END) || self.message.contains(TURN_KEPT_STATUS) {
+            self.message.clear();
+        }
+    }
+
     /// Whether a select-tool drag (a move, a selection box, a logo or black box sizing drag)
     /// is going on, so Escape cancels it instead of doing what it does otherwise.
     pub fn select_dragging(&self) -> bool {
@@ -772,6 +797,11 @@ pub fn show(
     let layers = ed.layers.clone();
     ed.selection.retain(|s| layers.may_select(s));
     let finish = std::mem::take(&mut ed.finish_shape);
+    // The turn for the symbol on the pointer belongs to the place tool: another tool sets it
+    // back, also while a panel is shown.
+    if ed.tool != Tool::Place {
+        ed.reset_place_turn();
+    }
     if let Some(panel) = ed.panel {
         crate::panel_view::show(ui, open, ed, panel, snap_step, keyboard_edits);
         return;
@@ -1206,7 +1236,7 @@ pub fn show(
     // page) work: a tool that draws or places falls back to Select.
     let held = ed.held_page(&open.project).is_some();
     if held && !matches!(ed.tool, Tool::Select | Tool::Comment) {
-        ed.tool = Tool::Select;
+        ed.set_tool(Tool::Select);
         ed.wire = None;
         ed.shape_points.clear();
         ed.black_box = None;
@@ -1488,7 +1518,7 @@ fn leave_unpickable_layer(ed: &mut Editor) {
     let Some(why) = ed.layers.refusal(layer) else {
         return;
     };
-    ed.tool = Tool::Select;
+    ed.set_tool(Tool::Select);
     ed.shape_points.clear();
     ed.shape_page = None;
     ed.message = why;
@@ -2539,6 +2569,41 @@ fn on_paper(open: &Open, page: usize, at: Point) -> bool {
     })
 }
 
+/// How the status after R or M ends.
+const TURN_STATUS_END: &str = ", R turns again, M mirrors.";
+/// What the status after placing a turned symbol says about the turn staying on.
+const TURN_KEPT_STATUS: &str = "The next ones are too until you change it with R or M";
+
+/// R (`mirror` false) or M (`mirror` true) with the place tool: turn the symbol on the pointer
+/// a quarter clockwise, or mirror it, for this and the next symbols placed.
+pub fn turn_place(ed: &mut Editor, mirror: bool) {
+    let (rotation, mirrored) = &mut ed.place_turn;
+    if mirror {
+        *mirrored = !*mirrored;
+    } else {
+        *rotation = Rotation::from_degrees(rotation.degrees() + 90).unwrap_or_default();
+    }
+    let turn = turn_words(*rotation, *mirrored).unwrap_or_else(|| "not turned".into());
+    let mut first = turn.chars();
+    let turn: String = first
+        .next()
+        .map(|c| c.to_ascii_uppercase())
+        .into_iter()
+        .chain(first)
+        .collect();
+    ed.message = format!("{turn}{TURN_STATUS_END}");
+}
+
+/// How a turn reads in a status message ("turned 90° and mirrored"); `None` when not turned.
+fn turn_words(rotation: Rotation, mirrored: bool) -> Option<String> {
+    match (rotation.degrees(), mirrored) {
+        (0, false) => None,
+        (0, true) => Some("mirrored".into()),
+        (d, false) => Some(format!("turned {d}°")),
+        (d, true) => Some(format!("turned {d}° and mirrored")),
+    }
+}
+
 fn place_tool(
     painter: &egui::Painter,
     resp: &egui::Response,
@@ -2556,7 +2621,7 @@ fn place_tool(
     if let Some(sym) = open.symbols.get(&id) {
         let stroke = Stroke::new(xf.len(0.3).max(1.0), t.ghost);
         for g in &sym.graphics {
-            paint_shape(painter, xf, &g.placed(at, wc_core::geom::Rotation::R0, false), stroke);
+            paint_shape(painter, xf, &g.placed(at, ed.place_turn.0, ed.place_turn.1), stroke);
         }
     } else {
         painter.rect_stroke(
@@ -2571,7 +2636,8 @@ fn place_tool(
             ed.message = "Click on the sheet to place the symbol.".into();
             return;
         }
-        match open.place(ed.page, &id, at) {
+        let (rotation, mirror) = ed.place_turn;
+        match open.place_turned(ed.page, &id, at, rotation, mirror) {
             Ok(sid) => {
                 let wired = auto_wire(
                     open,
@@ -2580,7 +2646,10 @@ fn place_tool(
                     std::iter::once(sid.clone()).collect(),
                 );
                 ed.select_only(Selection::Symbol(sid));
-                ed.message = format!("Placed {id}.{}", wired_note(wired));
+                let turn = turn_words(rotation, mirror)
+                    .map(|w| format!(", {w}. {TURN_KEPT_STATUS}"))
+                    .unwrap_or_default();
+                ed.message = format!("Placed {id}{turn}.{}", wired_note(wired));
             }
             Err(e) => ed.message = format!("Could not place {id}: {e}"),
         }
@@ -2912,6 +2981,61 @@ mod tests {
         let spot = f.item.as_deref().and_then(|item| live_spot(&o, page, item));
         assert_eq!(spot, Some((Point::new(40.0, 30.0), Point::new(90.0, 60.0))));
         assert_eq!(live_spot(&o, page, "cloud 7"), None, "no such cloud");
+    }
+
+    #[test]
+    fn r_and_m_turn_and_mirror_the_symbol_before_it_is_placed() {
+        let (_tmp, mut open) = project();
+        let mut ed = Editor {
+            tool: Tool::Place,
+            place_symbol: Some("wc.coil".into()),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        painted(&ctx, &mut open, &mut ed, 0.5, vec![]);
+        // R twice and M while the symbol hangs on the pointer.
+        turn_place(&mut ed, false);
+        turn_place(&mut ed, false);
+        turn_place(&mut ed, true);
+        assert_eq!(ed.place_turn, (Rotation::R180, true));
+        assert_eq!(ed.message, "Turned 180° and mirrored, R turns again, M mirrors.");
+        let steps = |o: &Open| {
+            o.project.pages[0]
+                .symbols
+                .iter()
+                .map(|s| (s.rotation, s.mirror))
+                .collect::<Vec<_>>()
+        };
+        click_at(&ctx, &mut open, &mut ed, egui::pos2(400.0, 300.0), 1.0);
+        assert_eq!(steps(&open), [(Rotation::R180, true)]);
+        // The status says the turn is still on for the next symbol.
+        assert!(
+            ed.message.starts_with(
+                "Placed wc.coil, turned 180° and mirrored. The next ones are too until you change it with R or M."
+            ),
+            "{}",
+            ed.message
+        );
+        // One undo step takes the placed symbol back off.
+        assert!(open.undo());
+        assert!(open.project.pages[0].symbols.is_empty());
+        // The turn stays for the next symbols placed with the tool.
+        click_at(&ctx, &mut open, &mut ed, egui::pos2(400.0, 300.0), 2.0);
+        turn_place(&mut ed, false);
+        click_at(&ctx, &mut open, &mut ed, egui::pos2(500.0, 300.0), 3.0);
+        assert_eq!(steps(&open), [(Rotation::R180, true), (Rotation::R270, true)]);
+        // Another tool sets it back.
+        ed.tool = Tool::Select;
+        painted(&ctx, &mut open, &mut ed, 4.0, vec![]);
+        assert_eq!(ed.place_turn, (Rotation::R0, false));
+        // Also while a panel is shown: the panel view returns early, the reset still runs.
+        ed.tool = Tool::Place;
+        turn_place(&mut ed, false);
+        ed.tool = Tool::Select;
+        ed.panel = Some(0);
+        painted(&ctx, &mut open, &mut ed, 5.0, vec![]);
+        assert_eq!(ed.place_turn, (Rotation::R0, false));
     }
 
     #[test]
