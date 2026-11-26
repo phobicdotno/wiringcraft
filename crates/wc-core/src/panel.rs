@@ -104,6 +104,19 @@ impl PanelItem {
             _ => None,
         }
     }
+
+    /// The outline the item covers on the plate, as (top-left, bottom-right): a rail is 35 mm
+    /// tall about its centre line, a duct is its rectangle, a device is turned as it stands.
+    pub fn bounds(&self) -> (Point, Point) {
+        match self {
+            PanelItem::Rail { at, length } => (Point::new(at.x, at.y - 17.5), Point::new(at.x + length, at.y + 17.5)),
+            PanelItem::Duct { min, max } => (
+                Point::new(min.x.min(max.x), min.y.min(max.y)),
+                Point::new(min.x.max(max.x), min.y.max(max.y)),
+            ),
+            PanelItem::Device { .. } => self.device_bounds().unwrap_or_default(),
+        }
+    }
 }
 
 impl Panel {
@@ -508,6 +521,21 @@ mod tests {
 
     fn tag(s: &str) -> Option<DeviceTag> {
         DeviceTag::parse(s).ok()
+    }
+
+    #[test]
+    fn rails_and_ducts_have_an_outline_on_the_plate() {
+        let rail = PanelItem::Rail {
+            at: Point::new(20.0, 100.0),
+            length: 300.0,
+        };
+        assert_eq!(rail.bounds(), (Point::new(20.0, 82.5), Point::new(320.0, 117.5)));
+        // A duct drawn from its far corner still covers the same rectangle.
+        let duct = PanelItem::Duct {
+            min: Point::new(60.0, 40.0),
+            max: Point::new(0.0, 0.0),
+        };
+        assert_eq!(duct.bounds(), (Point::new(0.0, 0.0), Point::new(60.0, 40.0)));
     }
 
     #[test]
