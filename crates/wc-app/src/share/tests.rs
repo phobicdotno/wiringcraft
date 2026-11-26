@@ -6530,3 +6530,16 @@ fn a_refusal_that_comes_with_the_end_of_the_session_is_still_told() -> Result<()
     assert!(g.take_refused_pages().contains("p0003"));
     Ok(())
 }
+
+/// A guest asking to join a host sharing a project in `tmp`, already let in: the guest's
+/// next frame that is not busy opens the joined copy (under `tmp`/guest). The host is
+/// returned too, to keep the session alive.
+pub(crate) fn let_in_guest(tmp: &Path) -> std::result::Result<(Share, Share), Box<dyn std::error::Error>> {
+    let mut host_open = project(&tmp.join("host"))?;
+    let (mut h, _) = host(&host_open);
+    let g = guest(&mut h, "Ola", &tmp.join("guest"));
+    h.frame(Some(&mut host_open), None, false);
+    let ids = pending(&h);
+    approve(&mut h, ids[0], true);
+    Ok((h, g))
+}

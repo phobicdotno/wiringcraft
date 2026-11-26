@@ -630,9 +630,7 @@ impl App {
                 self.dialog,
                 Some(Dialog::Cover { .. } | Dialog::Template { .. } | Dialog::Racks { .. })
             )
-            || self.assistant.command_running()
-            // A save waiting for a typed value runs on the project it was asked for first.
-            || !self.after_typed.is_empty();
+            || self.assistant.command_running();
         self.share.set_command_running(self.assistant.command_running());
         self.sync_session_now(busy);
         // Others' changes arrive without any input here.
@@ -645,6 +643,9 @@ impl App {
         if !self.share.active() {
             return;
         }
+        // A save waiting for a typed value runs on the project it was asked for first: a
+        // joined copy waits for it, also when an assistant's Undo syncs before the panels.
+        let busy = busy || !self.after_typed.is_empty();
         let page = self.open.as_ref().and_then(|o| match self.ed.panel {
             Some(_) => None,
             None => o.project.pages.get(self.ed.page).map(|p| p.id.clone()),
@@ -5629,14 +5630,17 @@ impl eframe::App for App {
         } else {
             actions.extend(self.route_to_symbol_editor(keys));
         }
-        let mut after_panels = std::mem::take(&mut self.after_typed);
-        if after_panels.is_empty() {
-            self.after_typed = wait_for_typed_value(ctx, &mut actions);
-        } else {
+        // The waiting actions stay in `after_typed` until they run after the panels, so
+        // whatever checks it meanwhile (a session join, say, also one an assistant's Undo
+        // brings about) still sees the save waiting.
+        let typed_waits = !self.after_typed.is_empty();
+        if typed_waits {
             // A save waiting for a typed value runs first: this frame's actions (an Open that
             // would replace the project, say) wait behind it.
             enter_typed_value(ctx);
-            after_panels.append(&mut actions);
+            self.after_typed.append(&mut actions);
+        } else {
+            self.after_typed = wait_for_typed_value(ctx, &mut actions);
         }
         for a in actions {
             self.run(a);
@@ -5649,7 +5653,7 @@ impl eframe::App for App {
         self.live_check(ctx);
         // A fetched base project replaces the open one: not while a save waits for a typed
         // value, which first goes into the project it was asked for.
-        if after_panels.is_empty() && self.after_typed.is_empty() {
+        if self.after_typed.is_empty() {
             self.poll_fetch(ctx);
         } else {
             ctx.request_repaint();
@@ -5756,6 +5760,11 @@ impl eframe::App for App {
             self.run(a);
         }
         // The panels have entered the value typed in the field that gave up the keyboard.
+        let after_panels = if typed_waits {
+            std::mem::take(&mut self.after_typed)
+        } else {
+            Vec::new()
+        };
         for a in after_panels {
             self.run(a);
         }
@@ -7947,6 +7956,69 @@ mod nudge_tests {
         assert!(app.open.as_ref().unwrap().dirty, "with the typed value entered");
         // The folder picker is not shown in a test.
         app.pending = None;
+    }
+
+    /// A session join that would replace the open project waits while a save waits for a
+    /// typed value, also when something syncs the session before the panels have entered it
+    /// (an assistant's Undo does): the typed value is saved in the project it was typed in,
+    /// then the joined copy opens (#932).
+    #[test]
+    fn a_session_join_waits_while_a_save_waits_for_a_typed_value() {
+        let (tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        let mut frame = eframe::Frame::_new_kittest();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        let field = egui::Id::new(panels::TAG_FIELD);
+        let mut frame_with = |app: &mut App, events: Vec<egui::Event>, modifiers: Modifiers| {
+            let raw = egui::RawInput {
+                events,
+                modifiers,
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| eframe::App::update(app, ctx, &mut frame));
+        };
+        frame_with(&mut app, Vec::new(), Modifiers::NONE);
+        ctx.memory_mut(|m| m.request_focus(field));
+        frame_with(&mut app, Vec::new(), Modifiers::NONE);
+        assert!(
+            ctx.memory(|m| m.has_focus(field)),
+            "the device tag field has the keyboard"
+        );
+        let first = app.open.as_ref().unwrap().dir.clone();
+        let page = app.ed.page;
+        let before = app.open.as_ref().unwrap().project.pages[page].symbols[1]
+            .tag
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap();
+        let typed = format!("{before}7");
+        // A host has let this window in: the joined copy opens at the next sync that may.
+        let (_host, guest) = crate::share::tests::let_in_guest(tmp.path()).unwrap();
+        app.share = guest;
+        let save = egui::Event::Key {
+            key: Key::S,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        };
+        frame_with(&mut app, vec![egui::Event::Text("7".into()), save], Modifiers::COMMAND);
+        assert_eq!(app.after_typed, [Action::Save], "the save waits a frame");
+        assert_eq!(app.open.as_ref().unwrap().dir, first, "not joined in the Ctrl+S frame");
+        // A sync before the panels of the next frame, as an assistant's Undo makes.
+        app.sync_session_now(false);
+        assert_eq!(app.open.as_ref().unwrap().dir, first, "the join waits for the save");
+        frame_with(&mut app, Vec::new(), Modifiers::NONE);
+        assert!(app.after_typed.is_empty(), "the save ran");
+        let saved = wc_core::store::load(&first).unwrap();
+        assert!(
+            saved.pages[page]
+                .symbols
+                .iter()
+                .any(|s| s.tag.as_ref().is_some_and(|t| t.to_string() == typed)),
+            "the typed tag is saved in the project it was typed in"
+        );
+        assert_ne!(app.open.as_ref().unwrap().dir, first, "then the joined copy opened");
     }
 
     /// A black box form changed and not applied is applied by Ctrl+S: the project read back
