@@ -1340,8 +1340,8 @@ pub fn add_and_save_with(
 
 /// Every file a save of the project may write or remove, with its bytes before (`None` when it
 /// does not exist yet): the project's own files, every file in its page, panel and comment
-/// folders, and the files of the pages and panels about to be added. [`put_files_back`] restores
-/// them when a save fails half way.
+/// folders, the black box symbol files its cleanup may remove, and the files of the pages and
+/// panels about to be added. [`put_files_back`] restores them when a save fails half way.
 pub fn snapshot_project(dir: &Path, new_pages: &[&str], new_panels: &[&str]) -> Res<Written> {
     // Every file the save may write or remove, read before anything is written: the project's
     // own files, every file in its page, panel and comment folders, and the files the new pages
@@ -1374,6 +1374,9 @@ pub fn snapshot_project(dir: &Path, new_pages: &[&str], new_panels: &[&str]) -> 
             }
         }
     }
+    // The save ends by removing unused black box symbol files: one that fails half way through
+    // that cleanup must be able to put back the ones already gone (#606).
+    paths.extend(store::removable_box_symbol_files(dir).map_err(e)?);
     for id in new_pages {
         paths.push(dir.join(store::PAGES_DIR).join(format!("{id}{}", store::PAGE_SUFFIX)));
     }

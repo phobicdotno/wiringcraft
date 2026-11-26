@@ -3332,9 +3332,7 @@ impl App {
     /// [`App::apply_rules`], a layout changed in the project while the dialog was open keeps
     /// the dialog open on the draft, and another project open now gets nothing.
     fn apply_report_layout(&mut self, form: &report_layout_form::Form, dir: &std::path::Path) -> Result<(), String> {
-        if let Some(why) = form.problem() {
-            return Err(why);
-        }
+        let layout = form.kept()?;
         let Some(o) = self.open.as_mut().filter(|o| o.dir == dir) else {
             return Err("The report layout was not kept: another project was opened while it was edited.".into());
         };
@@ -3356,7 +3354,7 @@ impl App {
                         .into(),
                 );
             }
-            o.set_report_layout(form.kind, form.layout());
+            o.set_report_layout(form.kind, layout);
         }
         self.dialog = Some(Dialog::Reports(form.kind));
         Ok(())

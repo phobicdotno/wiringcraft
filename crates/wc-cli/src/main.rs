@@ -82,6 +82,54 @@ fn import_page_dwg(dir: &Path, file: &Path, page: String, scale: f64, template: 
     logged(|log| run::import_page_dwg(dir, file, &page, scale, template, log))
 }
 
+// Every `print!` and `println!` below writes through these, not the standard ones: those panic
+// when the reader of a pipe stops early (`wiringcraft ... | more`), which on Windows, with no
+// SIGPIPE to end the program, reported a crash (#567). These keep the first error, drop later
+// output, and let the command run to its end, so its changes are still saved (#550).
+macro_rules! print {
+    ($($arg:tt)*) => {
+        $crate::write_stdout(|out| std::io::Write::write_fmt(out, format_args!($($arg)*)))
+    };
+}
+macro_rules! println {
+    () => {
+        $crate::write_stdout(|out| std::io::Write::write_all(out, b"\n"))
+    };
+    ($($arg:tt)*) => {
+        $crate::write_stdout(|out| {
+            std::io::Write::write_fmt(out, format_args!("{}\n", format_args!($($arg)*)))
+        })
+    };
+}
+
+thread_local! {
+    /// The first error writing to stdout on this thread, the command's; output after it is
+    /// dropped, and [`with_stdout_error`] reports it once the command has ended.
+    static STDOUT_ERROR: std::cell::RefCell<Option<std::io::Error>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Write to stdout with `write`, unless an earlier write failed.
+fn write_stdout(write: impl FnOnce(&mut std::io::StdoutLock<'static>) -> std::io::Result<()>) {
+    if STDOUT_ERROR.with_borrow(Option::is_some) {
+        return;
+    }
+    if let Err(err) = write(&mut std::io::stdout().lock()) {
+        STDOUT_ERROR.set(Some(err));
+    }
+}
+
+/// The command's `result`, with what went wrong writing its output: nothing when the reader of
+/// a pipe went away early (`| more`, `| head -1`), as other command-line tools do.
+fn with_stdout_error(result: Res<()>) -> Res<()> {
+    let failed = STDOUT_ERROR.take();
+    result?;
+    match failed {
+        Some(err) if err.kind() != std::io::ErrorKind::BrokenPipe => Err(format!("could not write the output: {err}")),
+        _ => Ok(()),
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "wiringcraft", version, about = "Electrical schematic and wiring design")]
 struct Cli {
@@ -243,6 +291,11 @@ enum Cmd {
     /// terminal levels. The terminal plan and the WAGO configurator export follow it.
     #[command(subcommand)]
     Strip(StripCmd),
+    /// PLC racks and the I/O cards in their slots (`[[rack]]` in project.toml), laid out by the
+    /// PLC card overview (`pdf --report plc-cards`). After a change the overview's rack
+    /// warnings are printed.
+    #[command(subcommand)]
+    Rack(RackCmd),
     /// The project logo, shown on the cover page and in every title block.
     #[command(subcommand)]
     Logo(LogoCmd),
@@ -770,6 +823,109 @@ enum JumperCmd {
     },
     /// List the project's jumpers.
     List,
+}
+
+#[derive(Subcommand)]
+enum RackCmd {
+    /// List the racks with their cards by slot: tag, type, channels, start address and step.
+    List,
+    /// Add a rack, e.g. `rack add -A1 --description "Main PLC"`.
+    Add {
+        /// The rack's name, usually the PLC's device tag, e.g. `-A1` (taken as a value, though
+        /// it starts with `-`).
+        #[arg(allow_hyphen_values = true)]
+        name: String,
+        /// What the rack is, e.g. `Main PLC`.
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// Remove a rack and its cards, e.g. `rack remove -A1`.
+    Remove {
+        /// The rack's name (taken as a value, though it starts with `-`).
+        #[arg(allow_hyphen_values = true)]
+        name: String,
+    },
+    /// Rename a rack or change its description, e.g. `rack set -A1 --name -A2`.
+    Set {
+        /// The rack's name (taken as a value, though it starts with `-`).
+        #[arg(allow_hyphen_values = true)]
+        name: String,
+        /// Its new name (taken as a value, though it starts with `-`).
+        #[arg(long = "name", allow_hyphen_values = true)]
+        new_name: Option<String>,
+        /// Its new description; empty clears it.
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// The cards in a rack's slots.
+    #[command(subcommand)]
+    Card(RackCardCmd),
+}
+
+#[derive(Subcommand)]
+enum RackCardCmd {
+    /// Add a card to a free slot, e.g.
+    /// `rack card add -A1 1 --type "DI 16x24 V DC" --channels 16 --start %IX0.0`.
+    Add {
+        /// The rack's name (taken as a value, though it starts with `-`).
+        #[arg(allow_hyphen_values = true)]
+        rack: String,
+        /// The card's slot, 0 to 999.
+        slot: u32,
+        /// The card's device tag, e.g. `-A1.DI1` (taken as a value, though it starts with `-`).
+        #[arg(long, allow_hyphen_values = true)]
+        tag: Option<String>,
+        /// What the card is, e.g. `DI 16x24 V DC` or an order number.
+        #[arg(long = "type")]
+        kind: Option<String>,
+        /// How many channels it has, at most 256.
+        #[arg(long, default_value_t = 16)]
+        channels: u32,
+        /// The address of channel 0, e.g. `%IX0.0` or `%IW64`.
+        #[arg(long)]
+        start: Option<String>,
+        /// Bytes from one channel to the next for byte, word and double word cards, 1 to 64
+        /// (default: the address's size).
+        #[arg(long)]
+        step: Option<u32>,
+    },
+    /// Change a card, e.g. `rack card set -A1 1 --start %IX4.0`; options left out are kept.
+    Set {
+        /// The rack's name (taken as a value, though it starts with `-`).
+        #[arg(allow_hyphen_values = true)]
+        rack: String,
+        /// The card's slot.
+        slot: u32,
+        /// Move the card to this slot, 0 to 999.
+        #[arg(long = "slot")]
+        new_slot: Option<u32>,
+        /// The card's device tag; empty clears it (taken as a value, though it starts with `-`).
+        #[arg(long, allow_hyphen_values = true)]
+        tag: Option<String>,
+        /// What the card is; empty clears it.
+        #[arg(long = "type")]
+        kind: Option<String>,
+        /// How many channels it has, at most 256.
+        #[arg(long)]
+        channels: Option<u32>,
+        /// The address of channel 0.
+        #[arg(long)]
+        start: Option<String>,
+        /// Bytes from one channel to the next, 1 to 64.
+        #[arg(long, conflicts_with = "no_step")]
+        step: Option<u32>,
+        /// Go back to the address's own size as the step.
+        #[arg(long)]
+        no_step: bool,
+    },
+    /// Take a card out of its slot, e.g. `rack card remove -A1 1`.
+    Remove {
+        /// The rack's name (taken as a value, though it starts with `-`).
+        #[arg(allow_hyphen_values = true)]
+        rack: String,
+        /// The card's slot.
+        slot: u32,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2108,7 +2264,8 @@ fn run(cli: Cli) -> Res<()> {
             match p.lock.symbols.get(&symbol_id) {
                 None => {
                     return Err(format!(
-                        "the project does not pin symbol {symbol_id}; run `wiringcraft lib lock` first"
+                        "the project does not pin symbol {symbol_id}; put its entry in {} back from the project's history (e.g. `git checkout`), or run `wiringcraft lib lock` when a configured library has the symbol",
+                        store::LOCK_FILE
                     ));
                 }
                 Some(l) if l.hash != old.hash() => {
@@ -2303,7 +2460,7 @@ fn run(cli: Cli) -> Res<()> {
             let mut p = load(dir)?;
             match lc {
                 LocationCmd::List => {
-                    write_locations(&mut std::io::stdout(), &p.meta.locations).map_err(e)?;
+                    write_stdout(|out| write_locations(out, &p.meta.locations));
                 }
                 LocationCmd::Set { path, description } => {
                     let description = description.unwrap_or_else(|| {
@@ -2467,7 +2624,10 @@ fn run(cli: Cli) -> Res<()> {
             let mut p = load(dir)?;
             let library = wc_library::library_rules(dir, &p);
             match rc {
-                RulesCmd::List { json } => print!("{}", rules_list(&p, &library, json)?),
+                RulesCmd::List { json } => {
+                    let text = rules_list(&p, &library, json)?;
+                    print!("{text}");
+                }
                 RulesCmd::Set { file } => {
                     let rules = rules_from_file(&file)?;
                     let n = rules.len();
@@ -2657,6 +2817,27 @@ fn run(cli: Cli) -> Res<()> {
                         }
                     }
                 }
+            }
+        }
+        Cmd::Rack(rc) => {
+            let mut p = load(dir)?;
+            if let RackCmd::List = rc {
+                print!("{}", rack_list(&p.meta.racks));
+                return Ok(());
+            }
+            if edit_racks(&mut p.meta.racks, rc)? {
+                save(dir, &p)?;
+            }
+            let (symbols, _) = store::vendored_symbols(dir, &p);
+            let parts = vendored_parts_warning_unreadable(dir, &p);
+            let inputs = wc_report::Inputs {
+                project: &p,
+                symbols: &symbols,
+                parts: &parts,
+            };
+            for w in wc_report::plc_rack_warnings(&inputs) {
+                // Rack names and tags come from the command line or the project file.
+                eprintln!("warning: {}", escape_field(&w));
             }
         }
         Cmd::Strip(sc) => {
@@ -3608,6 +3789,203 @@ fn update_library_part(
     Ok(())
 }
 
+/// `rack list`: each rack on a line of its own, its cards under it by slot.
+fn rack_list(racks: &[wc_core::plc_rack::PlcRack]) -> String {
+    let mut out = String::new();
+    for rack in racks {
+        let mut line = escape_field(&rack.name);
+        if !rack.description.is_empty() {
+            line += &format!(" ({})", escape_field(&rack.description));
+        }
+        out += &line;
+        out.push('\n');
+        let mut cards: Vec<_> = rack.cards.iter().collect();
+        cards.sort_by_key(|c| c.slot);
+        for c in cards {
+            let mut line = format!("  slot {}:", c.slot);
+            if !c.tag.is_empty() {
+                line += &format!(" {}", escape_field(&c.tag));
+            }
+            if !c.kind.is_empty() {
+                line += &format!(" \"{}\"", escape_field(&c.kind));
+            }
+            line += &format!(" {} channels", c.channels);
+            if !c.start.is_empty() {
+                line += &format!(" from {}", escape_field(&c.start));
+            }
+            if let Some(step) = c.step {
+                line += &format!(" step {step}");
+            }
+            out += &line;
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// `rack add`, `remove`, `set` and `rack card ...` on `racks`, refused with the PLC racks
+/// form's range check ([`wc_core::plc_rack::problem`]); true when they changed.
+fn edit_racks(racks: &mut Vec<wc_core::plc_rack::PlcRack>, cmd: RackCmd) -> Res<bool> {
+    use wc_core::plc_rack::{PlcCard, PlcRack};
+    let find = |racks: &[PlcRack], name: &str| -> Res<usize> {
+        let name = name.trim();
+        racks
+            .iter()
+            .position(|r| r.name.trim() == name)
+            .ok_or_else(|| format!("there is no rack {}", escape_field(name)))
+    };
+    let taken = |racks: &[PlcRack], name: &str| -> Res<()> {
+        if racks.iter().any(|r| r.name.trim() == name) {
+            return Err(format!("there already is a rack {}", escape_field(name)));
+        }
+        Ok(())
+    };
+    let card_at = |rack: &PlcRack, slot: u32| -> Res<usize> {
+        rack.cards
+            .iter()
+            .position(|c| c.slot == slot)
+            .ok_or_else(|| format!("rack {} has no card in slot {slot}", escape_field(&rack.name)))
+    };
+    let slot_free = |rack: &PlcRack, slot: u32| -> Res<()> {
+        if rack.cards.iter().any(|c| c.slot == slot) {
+            return Err(format!(
+                "rack {} already has a card in slot {slot}",
+                escape_field(&rack.name)
+            ));
+        }
+        Ok(())
+    };
+    let mut new = racks.clone();
+    match cmd {
+        RackCmd::List => {}
+        RackCmd::Add { name, description } => {
+            let name = name.trim();
+            if name.is_empty() {
+                return Err("a rack needs a name".into());
+            }
+            taken(&new, name)?;
+            new.push(PlcRack {
+                name: name.to_owned(),
+                description: description.unwrap_or_default().trim().to_owned(),
+                ..PlcRack::default()
+            });
+        }
+        RackCmd::Remove { name } => {
+            let i = find(&new, &name)?;
+            new.remove(i);
+        }
+        RackCmd::Set {
+            name,
+            new_name,
+            description,
+        } => {
+            let i = find(&new, &name)?;
+            if let Some(to) = new_name.as_deref().map(str::trim) {
+                if to.is_empty() {
+                    return Err("a rack needs a name".into());
+                }
+                if new.get(i).is_some_and(|r| r.name.trim() != to) {
+                    taken(&new, to)?;
+                }
+            }
+            let Some(r) = new.get_mut(i) else {
+                return Err(format!("there is no rack {}", escape_field(&name)));
+            };
+            if let Some(to) = new_name.as_deref().map(str::trim) {
+                r.name = to.to_owned();
+            }
+            if let Some(d) = description {
+                r.description = d.trim().to_owned();
+            }
+        }
+        RackCmd::Card(RackCardCmd::Add {
+            rack,
+            slot,
+            tag,
+            kind,
+            channels,
+            start,
+            step,
+        }) => {
+            let i = find(&new, &rack)?;
+            let Some(r) = new.get_mut(i) else {
+                return Err(format!("there is no rack {}", escape_field(&rack)));
+            };
+            slot_free(r, slot)?;
+            r.cards.push(PlcCard {
+                slot,
+                tag: tag.unwrap_or_default().trim().to_owned(),
+                kind: kind.unwrap_or_default().trim().to_owned(),
+                channels,
+                start: start.unwrap_or_default().trim().to_owned(),
+                step,
+                ..PlcCard::default()
+            });
+        }
+        RackCmd::Card(RackCardCmd::Set {
+            rack,
+            slot,
+            new_slot,
+            tag,
+            kind,
+            channels,
+            start,
+            step,
+            no_step,
+        }) => {
+            let i = find(&new, &rack)?;
+            let Some(r) = new.get_mut(i) else {
+                return Err(format!("there is no rack {}", escape_field(&rack)));
+            };
+            let c = card_at(r, slot)?;
+            let to = new_slot.filter(|&to| to != slot);
+            if let Some(to) = to {
+                slot_free(r, to)?;
+            }
+            let Some(card) = r.cards.get_mut(c) else {
+                return Err(format!("rack {} has no card in slot {slot}", escape_field(&r.name)));
+            };
+            if let Some(to) = to {
+                card.slot = to;
+            }
+            if let Some(t) = tag {
+                card.tag = t.trim().to_owned();
+            }
+            if let Some(k) = kind {
+                card.kind = k.trim().to_owned();
+            }
+            if let Some(n) = channels {
+                card.channels = n;
+            }
+            if let Some(a) = start {
+                card.start = a.trim().to_owned();
+            }
+            if step.is_some() {
+                card.step = step;
+            }
+            if no_step {
+                card.step = None;
+            }
+        }
+        RackCmd::Card(RackCardCmd::Remove { rack, slot }) => {
+            let i = find(&new, &rack)?;
+            let Some(r) = new.get_mut(i) else {
+                return Err(format!("there is no rack {}", escape_field(&rack)));
+            };
+            let c = card_at(r, slot)?;
+            r.cards.remove(c);
+        }
+    }
+    if let Some(why) = wc_core::plc_rack::problem(&new) {
+        return Err(format!("the racks were not changed: {}", escape_field(&why)));
+    }
+    if new == *racks {
+        return Ok(false);
+    }
+    *racks = new;
+    Ok(true)
+}
+
 /// Warns about the project's report layouts that name a report or column it does not have,
 /// about PLC racks with cards that cannot be laid out or points on no card, and about
 /// fieldbus networks with unknown devices, shared addresses or ports used twice.
@@ -3825,7 +4203,7 @@ fn main() -> ExitCode {
     // Parsing runs there too: clap's derived parser builds every subcommand on the stack.
     let worker = std::thread::Builder::new()
         .stack_size(STACK)
-        .spawn(|| run(Cli::parse()));
+        .spawn(|| with_stdout_error(run(Cli::parse())));
     let result = match worker {
         Ok(handle) => handle
             .join()
@@ -4130,6 +4508,26 @@ fn vendored_parts(dir: &Path, p: &wc_core::Project) -> std::collections::BTreeMa
         .collect()
 }
 
+/// [`vendored_parts`], with a warning naming each used part that cannot be read and why, so
+/// the warnings worked out from the parts do not quietly leave it out.
+fn vendored_parts_warning_unreadable(
+    dir: &Path,
+    p: &wc_core::Project,
+) -> std::collections::BTreeMap<String, wc_core::Part> {
+    let mut parts = std::collections::BTreeMap::new();
+    for id in p.used_parts() {
+        match store::read_vendored_part(dir, &id) {
+            Ok(part) => {
+                parts.insert(id, part);
+            }
+            // The part id and the reason come from the project: escaped, so they cannot steer
+            // the terminal.
+            Err(err) => eprintln!("warning: {}", escape_field(&format!("cannot read part {id}: {err}"))),
+        }
+    }
+    parts
+}
+
 /// The upright size of the device `tag`'s part, if it has a part with a size. A part that
 /// cannot be read gives an error naming it and the reason, so a damaged or missing copy is not
 /// mistaken for a part without a size.
@@ -4271,6 +4669,57 @@ fn file_stem(number: &str, id: &str) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// A stdout whose reader has gone away, as Windows reports it for `| more` that stopped.
+    struct ClosedPipe;
+
+    impl std::io::Write for ClosedPipe {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    /// Run `f` on its own thread, as `main` runs a command, with its stdout errors.
+    fn run_like_main(f: impl FnOnce() -> Res<()> + Send + 'static) -> Res<()> {
+        std::thread::spawn(move || with_stdout_error(f())).join().unwrap()
+    }
+
+    #[test]
+    fn a_closed_stdout_lets_the_command_finish_quietly() {
+        let result = run_like_main(|| {
+            let locations = [wc_core::project::Location {
+                path: "A1".into(),
+                description: String::new(),
+            }];
+            write_stdout(|_| write_locations(&mut ClosedPipe, &locations));
+            // Later output is dropped, not written to the real stdout or failed on.
+            println!("after the reader went away");
+            Ok(())
+        });
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn the_command_error_wins_over_a_closed_stdout() {
+        let result = run_like_main(|| {
+            write_stdout(|_| Err(std::io::ErrorKind::BrokenPipe.into()));
+            Err("no such page".into())
+        });
+        assert_eq!(result, Err("no such page".into()));
+    }
+
+    #[test]
+    fn other_stdout_errors_are_reported() {
+        let result = run_like_main(|| {
+            write_stdout(|_| Err(std::io::Error::other("disk full")));
+            write_stdout(|_| Err(std::io::Error::other("a second error")));
+            Ok(())
+        });
+        assert_eq!(result, Err("could not write the output: disk full".into()));
+    }
 
     /// Walks the whole command tree and lists every subcommand and argument
     /// (positional or option) whose `--help` line would be blank.
@@ -5902,6 +6351,75 @@ mod tests {
         let err = cli(&dir, &["jumper", "remove", "--", "-X1", "9"]).unwrap_err();
         assert!(err.contains("no jumper of -X1 has terminal 9"), "{err}");
         assert!(cli(&dir, &["jumper", "add", "--", "-X1", "1.2", "3.4"]).is_err());
+    }
+
+    #[test]
+    fn rack_commands_add_list_edit_and_remove_racks_and_cards() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let racks = || load(&dir).unwrap().meta.racks;
+        cli(&dir, &["rack", "add", "-A1", "--description", "Main PLC"]).unwrap();
+        let err = cli(&dir, &["rack", "add", "-A1"]).unwrap_err();
+        assert!(err.contains("there already is a rack -A1"), "{err}");
+        let add = ["rack", "card", "add", "-A1"];
+        cli(
+            &dir,
+            &[
+                &add[..],
+                &["2", "--type", "AI 4x 4-20 mA", "--channels", "4", "--start", "%IW64"],
+            ]
+            .concat(),
+        )
+        .unwrap();
+        cli(
+            &dir,
+            &[&add[..], &["1", "--tag", "-A1.DI1", "--start", "%IX0.0"]].concat(),
+        )
+        .unwrap();
+        let err = cli(&dir, &[&add[..], &["1"]].concat()).unwrap_err();
+        assert!(err.contains("already has a card in slot 1"), "{err}");
+        assert_eq!(
+            rack_list(&racks()),
+            "-A1 (Main PLC)\n  slot 1: -A1.DI1 16 channels from %IX0.0\n  \
+             slot 2: \"AI 4x 4-20 mA\" 4 channels from %IW64\n"
+        );
+
+        // The form's range checks: nothing is saved past them.
+        for bad in [
+            &["1000"][..],
+            &["3", "--channels", "257"],
+            &["3", "--step", "0"],
+            &["3", "--step", "65"],
+        ] {
+            let err = cli(&dir, &[&add[..], bad].concat()).unwrap_err();
+            assert!(err.contains("the racks were not changed"), "{bad:?}: {err}");
+        }
+        assert_eq!(racks()[0].cards.len(), 2);
+
+        let set = ["rack", "card", "set", "-A1"];
+        cli(
+            &dir,
+            &[&set[..], &["2", "--slot", "3", "--step", "1", "--tag", "-A1.AI1"]].concat(),
+        )
+        .unwrap();
+        let card = racks()[0].cards.iter().find(|c| c.slot == 3).cloned().unwrap();
+        assert_eq!((card.step, card.tag.as_str(), card.channels), (Some(1), "-A1.AI1", 4));
+        cli(&dir, &[&set[..], &["3", "--no-step"]].concat()).unwrap();
+        assert_eq!(racks()[0].cards.iter().find(|c| c.slot == 3).unwrap().step, None);
+        let err = cli(&dir, &[&set[..], &["3", "--slot", "1"]].concat()).unwrap_err();
+        assert!(err.contains("already has a card in slot 1"), "{err}");
+        assert!(cli(&dir, &[&set[..], &["9", "--channels", "8"]].concat()).is_err());
+
+        cli(&dir, &["rack", "set", "-A1", "--name", "-A2", "--description", ""]).unwrap();
+        assert_eq!((racks()[0].name.as_str(), racks()[0].description.as_str()), ("-A2", ""));
+        cli(&dir, &["rack", "card", "remove", "-A2", "1"]).unwrap();
+        assert_eq!(racks()[0].cards.len(), 1);
+        let err = cli(&dir, &["rack", "remove", "-A1"]).unwrap_err();
+        assert!(err.contains("there is no rack -A1"), "{err}");
+        cli(&dir, &["rack", "remove", "-A2"]).unwrap();
+        assert!(racks().is_empty());
+        cli(&dir, &["rack", "list"]).unwrap();
     }
 
     #[test]
@@ -8577,5 +9095,63 @@ mod tests {
             assert!(err.contains(word), "{err}");
             assert!(!bad.exists());
         }
+    }
+}
+
+#[cfg(test)]
+mod box_cleanup_rollback_tests {
+    use super::*;
+
+    /// A save that removes some unused black box symbol files and then fails: the rollback puts
+    /// the removed ones back (#606), and leaves links and other symbols alone.
+    #[test]
+    fn a_failed_save_puts_back_box_symbol_files_its_cleanup_removed() {
+        let Ok(tmp) = tempfile::tempdir() else {
+            unreachable!("no temporary folder")
+        };
+        let dir = tmp.path();
+        let p = Project::new("Cleanup");
+        if let Err(err) = store::save(dir, &p) {
+            unreachable!("{err}");
+        }
+        let folder = dir.join("vendor").join("symbols");
+        let Ok(()) = std::fs::create_dir_all(&folder) else {
+            unreachable!("no symbol folder")
+        };
+        for (name, body) in [
+            ("box.p1.s1.json", "one"),
+            ("box.p1.s2.json", "two"),
+            ("relay.json", "relay"),
+        ] {
+            let Ok(()) = std::fs::write(folder.join(name), body) else {
+                unreachable!("cannot write {name}")
+            };
+        }
+        #[cfg(unix)]
+        let Ok(()) = std::os::unix::fs::symlink("relay.json", folder.join("box.p1.s3.json")) else {
+            unreachable!("cannot make a link")
+        };
+        let Ok(before) = snapshot_project(dir, &[], &[]) else {
+            unreachable!("no snapshot")
+        };
+        let saved: Vec<&Path> = before.iter().map(|(path, _)| path.as_path()).collect();
+        let named = |name: &str| saved.iter().any(|p| p.file_name().is_some_and(|n| n == name));
+        assert!(named("box.p1.s1.json") && named("box.p1.s2.json"));
+        assert!(!named("relay.json") && !named("box.p1.s3.json"), "{saved:?}");
+        // The cleanup removed one file before it failed on the next.
+        let Ok(()) = std::fs::remove_file(folder.join("box.p1.s1.json")) else {
+            unreachable!("cannot remove")
+        };
+        assert_eq!(put_files_back(&before), Vec::<String>::new());
+        assert_eq!(
+            std::fs::read_to_string(folder.join("box.p1.s1.json")).ok().as_deref(),
+            Some("one")
+        );
+        assert_eq!(
+            std::fs::read_to_string(folder.join("box.p1.s2.json")).ok().as_deref(),
+            Some("two")
+        );
+        #[cfg(unix)]
+        assert!(std::fs::symlink_metadata(folder.join("box.p1.s3.json")).is_ok_and(|m| m.file_type().is_symlink()));
     }
 }

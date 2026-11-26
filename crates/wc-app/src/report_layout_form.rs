@@ -191,6 +191,16 @@ impl Form {
         (!self.columns.iter().any(|c| c.shown)).then(|| "Show at least one column.".to_owned())
     }
 
+    /// The layout OK keeps for the report ([`Form::layout`]), or why it cannot be kept
+    /// ([`Form::problem`]). The dialog and the assistant's `report_layouts` tool both keep a
+    /// layout through this.
+    pub fn kept(&self) -> Result<Option<ReportLayout>, String> {
+        match self.problem() {
+            Some(why) => Err(why),
+            None => Ok(self.layout()),
+        }
+    }
+
     /// Move column `i` one place up (`-1`) or down (`1`).
     pub fn move_column(&mut self, i: usize, by: isize) {
         let len = self.columns.len();
