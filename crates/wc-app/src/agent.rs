@@ -1719,9 +1719,13 @@ impl App {
                         };
                         if turned.is_empty() {
                             return Err(format!(
-                                "Nothing changed: {} {} no symbol, and only symbols {verb}.",
+                                "Nothing changed: {} {}, and only symbols {verb}.",
                                 names(&left),
-                                if left.len() == 1 { "is" } else { "are" }
+                                if left.len() == 1 {
+                                    "is not a symbol"
+                                } else {
+                                    "are not symbols"
+                                }
                             ));
                         }
                         if name == "rotate_items" {
@@ -5938,7 +5942,10 @@ mod tests {
             let undo = a.open.as_ref().unwrap().undo_mark();
             let e = call(&mut a, tool, json!({"page": "p0002", "ids": [wire, "g0"]})).unwrap_err();
             assert!(
-                e.starts_with("Nothing changed") && e.contains(&wire) && e.contains("g0"),
+                e.starts_with("Nothing changed")
+                    && e.contains(&wire)
+                    && e.contains("g0")
+                    && e.contains("are not symbols"),
                 "{tool}: {e}"
             );
             assert_eq!(page2(&a), &before, "{tool}");
