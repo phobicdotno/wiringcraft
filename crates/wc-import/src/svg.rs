@@ -232,7 +232,7 @@ fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
                 }
             }
             'A' => {
-                for seg in v.chunks_exact(7) {
+                for seg in v.as_chunks::<7>().0 {
                     let (bx, by) = if rel { (x, y) } else { (0.0, 0.0) };
                     let (ex, ey) = (bx + seg[5], by + seg[6]);
                     let arc = Arc {
