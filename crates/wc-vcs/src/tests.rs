@@ -183,6 +183,27 @@ fn revert_refuses_while_another_operation_is_in_progress() -> Result<()> {
 }
 
 #[test]
+fn revert_keeps_the_reason_of_a_lookup_that_fails_loudly() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    store::create(dir, "Demo")?;
+    let git = Git::new(dir);
+    git.init()?;
+    let head = git.head().unwrap_or_default();
+    // A corrupt object under a made-up id: the lookup of that version fails and git says why,
+    // while the checks before it (identity, operation files) still pass.
+    let id = "1".repeat(head.len());
+    let objects = dir.join(".git").join("objects").join(&id[..2]);
+    std::fs::create_dir_all(&objects).map_err(|e| wc_core::Error::io("mkdir", e))?;
+    std::fs::write(objects.join(&id[2..]), "not an object").map_err(|e| wc_core::Error::io("write", e))?;
+    let err = git.revert(&id).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(!err.contains("no such version"), "{err}");
+    assert!(err.contains("corrupt"), "{err}");
+    assert_eq!(git.head(), Some(head), "nothing was reverted");
+    Ok(())
+}
+
+#[test]
 fn a_failed_revert_in_a_linked_worktree_is_undone() -> Result<()> {
     let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
     let dir = tmp.path().join("main");
