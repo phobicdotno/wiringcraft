@@ -2465,18 +2465,25 @@ fn a_symbol_taken_from_the_session_is_offered_in_the_symbol_list() -> TestResult
     let mut open = project(&tmp.path().join("p"))?;
     open.place(1, "wc.coil", wc_core::Point::new(20.0, 120.0))?;
     let coil = open.symbols.remove("wc.coil").ok_or("no coil")?;
-    open.library.retain(|(i, _)| i != "wc.coil");
+    open.library.retain(|e| e.id != "wc.coil");
     let offered = [("wc.coil".to_owned(), coil)].into_iter().collect();
     assert!(take_files(&mut open, &offered, &BTreeMap::new()).is_empty());
     assert!(open.symbols.contains_key("wc.coil"));
-    assert!(open.library.iter().any(|(i, _)| i == "wc.coil"));
-    // A newer definition under the same id is listed by its new name.
+    let listed = |open: &Open| open.library.iter().find(|e| e.id == "wc.coil").cloned();
+    let entry = listed(&open).ok_or("not listed")?;
+    assert_eq!(entry.description, open.symbols["wc.coil"].description);
+    // A newer definition under the same id is listed by its new name and description.
     let mut renamed = open.symbols["wc.coil"].clone();
     renamed.name = "Coil B".into();
+    renamed.description = "Solenoid winding".into();
     open.project.lock.symbols.get_mut("wc.coil").ok_or("pin")?.hash = renamed.hash();
     let offered = [("wc.coil".to_owned(), renamed)].into_iter().collect();
     assert!(take_files(&mut open, &offered, &BTreeMap::new()).is_empty());
-    assert!(open.library.iter().any(|(i, n)| i == "wc.coil" && n == "Coil B"));
+    let entry = listed(&open).ok_or("not listed")?;
+    assert_eq!(entry.name, "Coil B");
+    assert_eq!(entry.description, "Solenoid winding");
+    assert!(entry.matches("solenoid"));
+    assert_eq!(open.library.iter().filter(|e| e.id == "wc.coil").count(), 1);
     Ok(())
 }
 

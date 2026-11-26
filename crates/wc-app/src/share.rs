@@ -977,7 +977,7 @@ fn delist_taken_back(delist: &mut std::collections::BTreeSet<(ItemKind, String)>
             continue;
         }
         match kind {
-            ItemKind::Symbol => open.library.retain(|(i, _)| *i != id),
+            ItemKind::Symbol => open.library.retain(|e| e.id != id),
             ItemKind::Part => open.part_library.retain(|(i, _)| *i != id),
         }
     }
@@ -1286,10 +1286,11 @@ pub fn take_files(
         }
         match store::write_vendored_symbol(&open.dir, s) {
             Ok(_) => {
-                match open.library.iter_mut().find(|(i, _)| *i == id) {
-                    Some(row) => row.1 = s.name.clone(),
+                let entry = crate::state::LibraryEntry::of(&id, s);
+                match open.library.iter_mut().find(|e| e.id == id) {
+                    Some(row) => *row = entry,
                     None => {
-                        open.library.push((id.clone(), s.name.clone()));
+                        open.library.push(entry);
                         open.library.sort();
                     }
                 }

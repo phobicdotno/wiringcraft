@@ -92,6 +92,10 @@ sym("wc.plc.output", "PLC digital output", "plc", "A", "standalone",
 sym("wc.pe", "Protective earth", "power", "", "standalone",
     [line((0, 0), (0, 5)), line((-4, 5), (4, 5)), line((-2.6, 6.5), (2.6, 6.5)), line((-1.2, 8), (1.2, 8))],
     [pin("PE", 0, 0, "up")], tag_at=(4, 3))
+sym("wc.fe", "Functional earth", "power", "", "standalone",
+    [line((0, 0), (0, 5)), line((-4, 5), (4, 5)), line((-2.6, 6.5), (2.6, 6.5)), line((-1.2, 8), (1.2, 8))],
+    [pin("FE", 0, 0, "up")], tag_at=(4, 3),
+    desc="Functional (signal) earth: 0 V references, signal grounds and screen earthing. Not a protective earth; use wc.pe for the protective conductor.")
 sym("wc.potentiometer", "Potentiometer", "passive", "R", "standalone",
     # Resistor body with the wiper arrow touching its right side.
     [line((0, 0), (0, 6.5)), rect((-1.8, 6.5), (1.8, 13.5)), line((0, 13.5), (0, 20)),

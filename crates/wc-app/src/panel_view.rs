@@ -1,6 +1,7 @@
 //! The panel layout view: the mounting plate with its ducts, DIN rails and device footprints,
-//! drawn to scale. Devices are picked and dragged with the primary button; the wheel zooms and
-//! the middle or secondary button pans, as on the schematic canvas.
+//! drawn to scale. Devices are picked and dragged with the primary button, and rails and ducts
+//! picked with it, so Delete takes them off; the wheel zooms and the middle or secondary button
+//! pans, as on the schematic canvas.
 
 use eframe::egui::{self, Align2, FontId, Rect, Sense, Stroke, Vec2};
 use wc_core::Point;
@@ -35,6 +36,28 @@ fn kept_on_plate(item: &PanelItem, to: Point, pw: f64, ph: f64) -> Option<Point>
         to.x.clamp(0.0, (pw - w).max(0.0)),
         to.y.clamp(0.0, (ph - h).max(0.0)),
     ))
+}
+
+/// Which item lies under a plate position: a device first, as they are drawn on top, then a
+/// rail, then a duct, topmost first within each.
+fn item_at(items: &[PanelItem], at: Point) -> Option<usize> {
+    let under = |i: usize, item: &PanelItem| {
+        let (a, b) = item.bounds();
+        (at.x >= a.x && at.x <= b.x && at.y >= a.y && at.y <= b.y).then_some(i)
+    };
+    device_at(items, at)
+        .or_else(|| {
+            let rails = items.iter().enumerate().rev();
+            rails
+                .filter(|(_, it)| matches!(it, PanelItem::Rail { .. }))
+                .find_map(|(i, it)| under(i, it))
+        })
+        .or_else(|| {
+            let ducts = items.iter().enumerate().rev();
+            ducts
+                .filter(|(_, it)| matches!(it, PanelItem::Duct { .. }))
+                .find_map(|(i, it)| under(i, it))
+        })
 }
 
 /// The panel view's zoom limits, in screen points per millimetre: lower than the schematic's,
@@ -88,7 +111,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
     if resp.drag_started_by(egui::PointerButton::Primary)
         && let Some(at) = pressed_at.or(pointer)
     {
-        ed.panel_pick = device_at(&p.items, at);
+        ed.panel_pick = item_at(&p.items, at);
         if let Some(i) = ed.panel_pick
             && let Some(PanelItem::Device { at: a, .. }) = p.items.get(i)
         {
@@ -96,7 +119,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
         }
     }
     if resp.clicked_by(egui::PointerButton::Primary) {
-        ed.panel_pick = pointer.and_then(|at| device_at(&p.items, at));
+        ed.panel_pick = pointer.and_then(|at| item_at(&p.items, at));
     }
     if let (Some((grab, checkpoint)), Some(i), Some(at)) = (ed.panel_drag, ed.panel_pick, pointer)
         && resp.dragged_by(egui::PointerButton::Primary)
@@ -165,12 +188,19 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
         );
     }
     let hair = Stroke::new(1.0_f32, t.faint);
-    for item in &p.items {
+    let picked_stroke = Stroke::new(2.0_f32, t.selection);
+    for (i, item) in p.items.iter().enumerate() {
+        let picked = ed.panel_pick == Some(i);
         match item {
             PanelItem::Duct { min, max } => {
                 let r = Rect::from_two_pos(xf.s(*min), xf.s(*max));
                 painter.rect_filled(r, 0.0, t.grid.gamma_multiply(0.6));
-                painter.rect_stroke(r, 0.0, hair, egui::StrokeKind::Inside);
+                painter.rect_stroke(
+                    r,
+                    0.0,
+                    if picked { picked_stroke } else { hair },
+                    egui::StrokeKind::Inside,
+                );
                 // Slots across the duct.
                 let vertical = (max.y - min.y) > (max.x - min.x);
                 let (len, along) = if vertical {
@@ -191,11 +221,17 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
             }
             PanelItem::Rail { at, length } => {
                 let st = Stroke::new(1.0_f32, t.muted);
-                let r = Rect::from_two_pos(
-                    xf.s(Point::new(at.x, at.y - 17.5)),
-                    xf.s(Point::new(at.x + length, at.y + 17.5)),
+                let (a, b) = item.bounds();
+                let r = Rect::from_two_pos(xf.s(a), xf.s(b));
+                if picked {
+                    painter.rect_filled(r, 0.0, t.accent_soft);
+                }
+                painter.rect_stroke(
+                    r,
+                    0.0,
+                    if picked { picked_stroke } else { st },
+                    egui::StrokeKind::Inside,
                 );
-                painter.rect_stroke(r, 0.0, st, egui::StrokeKind::Inside);
                 for dy in [-12.5, 12.5] {
                     painter.line_segment(
                         [
@@ -264,21 +300,34 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
             }
         }
     }
-    // The picked device's full tag and size, at the bottom of the view.
-    let info = ed.panel_pick.and_then(|i| p.items.get(i)).and_then(|item| match item {
+    // The picked item's full tag or kind, size and place, at the bottom of the view.
+    let info = ed.panel_pick.and_then(|i| p.items.get(i)).map(|item| match item {
         PanelItem::Device {
             tag,
             at,
             width,
             height,
             rotation,
-        } => Some(format!(
+        } => format!(
             "{tag}  ·  {width} x {height} mm{} at x {:.0}, y {:.0}  ·  drag to move, R to rotate, Delete to take it off the plate",
             turned_note(*rotation),
             at.x,
             at.y
-        )),
-        _ => None,
+        ),
+        PanelItem::Rail { at, length } => format!(
+            "DIN rail  ·  {length:.0} mm long at x {:.0}, y {:.0}  ·  Delete to take it off the plate",
+            at.x, at.y
+        ),
+        PanelItem::Duct { .. } => {
+            let (a, b) = item.bounds();
+            format!(
+                "Wire duct  ·  {:.0} x {:.0} mm at x {:.0}, y {:.0}  ·  Delete to take it off the plate",
+                b.x - a.x,
+                b.y - a.y,
+                a.x,
+                a.y
+            )
+        }
     });
     let hint = info.unwrap_or_else(|| {
         let n = p.device_tags().len();
@@ -458,5 +507,32 @@ mod tests {
         // Turned, it covers 40 x 10 mm.
         assert_eq!(device_at(&items, Point::new(30.0, 5.0)), Some(0));
         assert_eq!(device_at(&items, Point::new(5.0, 30.0)), None);
+    }
+
+    #[test]
+    fn picks_a_device_before_the_rail_and_the_rail_before_the_duct() {
+        let items = vec![
+            PanelItem::Duct {
+                min: Point::new(0.0, 0.0),
+                max: Point::new(200.0, 60.0),
+            },
+            PanelItem::Rail {
+                at: Point::new(0.0, 50.0),
+                length: 100.0,
+            },
+            PanelItem::Device {
+                tag: wc_core::DeviceTag::parse("-K1").unwrap_or_default(),
+                at: Point::new(10.0, 20.0),
+                width: 18.0,
+                height: 60.0,
+                rotation: wc_core::geom::Rotation::R0,
+            },
+        ];
+        assert_eq!(item_at(&items, Point::new(15.0, 50.0)), Some(2));
+        // The rail is 35 mm tall about its centre line and lies over the duct.
+        assert_eq!(item_at(&items, Point::new(60.0, 40.0)), Some(1));
+        assert_eq!(item_at(&items, Point::new(60.0, 66.0)), Some(1));
+        assert_eq!(item_at(&items, Point::new(150.0, 30.0)), Some(0));
+        assert_eq!(item_at(&items, Point::new(150.0, 90.0)), None);
     }
 }
