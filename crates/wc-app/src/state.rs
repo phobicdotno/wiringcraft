@@ -379,7 +379,9 @@ fn put_back_files(written: &Written) -> (Vec<String>, Vec<String>, Unwritten) {
 /// What [`Open::back_to`] goes back to, or [`Open::keep`] builds on.
 pub(crate) struct Mark {
     kept: Kept,
-    symbols: std::collections::BTreeSet<String>,
+    /// The symbols loaded at the mark, so one the change replaced (a pinned version loaded
+    /// over another, say) is put back too.
+    symbols: BTreeMap<String, Symbol>,
     parts: std::collections::BTreeSet<String>,
     /// The vendored symbol and part files there were, or why that is not known.
     files: Result<std::collections::BTreeSet<(ItemKind, String)>, String>,
@@ -3118,7 +3120,7 @@ impl Open {
         self.marks += 1;
         Mark {
             kept,
-            symbols: self.symbols.keys().cloned().collect(),
+            symbols: self.symbols.clone(),
             parts: self.parts.keys().cloned().collect(),
             files: vendor_names(&self.dir),
             edits_from: self.mark_edits.len(),
@@ -3170,7 +3172,22 @@ impl Open {
             // A file still to be written is unsaved work, whatever the history put back says.
             self.edited();
         }
-        self.symbols.retain(|id, _| mark.symbols.contains(id));
+        // Symbols the change loaded are let go and those it replaced are put back. One put
+        // back that is the version the project pins again (a box edit taken back, say) is
+        // written to its file by the next save, as its file may hold the replaced version.
+        for (id, was) in &mark.symbols {
+            let replaced = self.symbols.get(id).is_some_and(|now| now.hash() != was.hash());
+            let pinned = self
+                .project
+                .lock
+                .symbols
+                .get(id)
+                .is_some_and(|pin| pin.hash == was.hash());
+            if replaced && pinned {
+                self.stale_symbol_files.insert(id.clone());
+            }
+        }
+        self.symbols = mark.symbols;
         self.parts.retain(|id, _| mark.parts.contains(id));
         let (before, now) = match (mark.files, vendor_names(&self.dir)) {
             (Ok(before), Ok(now)) => (before, now),
@@ -6494,6 +6511,29 @@ pub(crate) mod tests {
         std::fs::remove_file(store::vendor_path(&o.dir, ItemKind::Symbol, "wc.coil").unwrap()).unwrap();
         o.place(1, "wc.coil", Point::new(40.0, 20.0)).unwrap();
         assert_eq!(o.symbols["wc.coil"], old);
+        assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), old);
+    }
+
+    #[test]
+    fn a_refused_change_puts_back_a_symbol_it_replaced_with_the_pinned_version() {
+        let (_tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let old = o.symbols["wc.coil"].clone();
+        o.save().unwrap();
+        let mut new = old.clone();
+        new.name = "Coil, changed".into();
+        store::write_vendored_symbol(&o.dir, &new).unwrap();
+        let mut o = Open::load(&o.dir).unwrap();
+        assert_eq!(o.symbols["wc.coil"], new, "loaded as the file has it");
+        // The pinned copy put back, then a change places with it and is refused.
+        store::write_vendored_symbol(&o.dir, &old).unwrap();
+        let m = o.mark();
+        o.place(1, "wc.coil", Point::new(40.0, 20.0)).unwrap();
+        assert_eq!(o.symbols["wc.coil"], old, "the change loaded the pinned version");
+        o.back_to(m).unwrap();
+        assert_eq!(o.symbols["wc.coil"], new, "the symbol loaded at the mark is back");
+        // It is not the pinned version, so its file is left as it is.
+        assert!(!o.stale_symbol_files.contains("wc.coil"));
         assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), old);
     }
 
