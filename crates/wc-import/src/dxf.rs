@@ -405,10 +405,17 @@ fn shapes(
         let flip = e.f_or(230, 1.0) < 0.0;
         let q = |x: f64, y: f64| if flip { p(-x, y) } else { p(x, y) };
         let shape = match e.kind.as_str() {
-            "LINE" => Some(Shape::Line {
-                a: p(e.f(10), e.f(20)),
-                b: p(e.f(11), e.f(21)),
-            }),
+            "LINE" => {
+                // Ends that are not numbers once placed (a coordinate near the limit times the
+                // scale) leave the line out, and say so: the page could not be read back.
+                let (a, b) = (p(e.f(10), e.f(20)), p(e.f(11), e.f(21)));
+                if [a, b].iter().all(|p| p.x.is_finite() && p.y.is_finite()) {
+                    Some(Shape::Line { a, b })
+                } else {
+                    *skipped.entry(LINE_NOT_NUMBERS.to_owned()).or_default() += 1;
+                    None
+                }
+            }
             // Scaled differently along x and y, a circle is an ellipse: drawn by its points.
             "CIRCLE" if !xf.keeps_circles() => {
                 // On a pin layer it marks a pin at its centre, which a symbol takes from the
@@ -453,16 +460,7 @@ fn shapes(
             "LWPOLYLINE" => {
                 // Vertices in order, each with the bulge (code 42) of the segment it starts: a
                 // bulged segment is an arc, sampled in the entity's own coordinates.
-                let mut vs: Vec<((f64, f64), f64)> = Vec::new();
-                for (code, v) in &e.codes {
-                    let n = v.trim().parse::<f64>().unwrap_or(f64::NAN);
-                    match (*code, vs.last_mut()) {
-                        (10, _) => vs.push(((n, f64::NAN), 0.0)),
-                        (20, Some(last)) => last.0.1 = n,
-                        (42, Some(last)) if n.is_finite() => last.1 = n,
-                        _ => {}
-                    }
-                }
+                let mut vs = vertices(e);
                 vs.retain(|((x, y), _)| x.is_finite() && y.is_finite());
                 let closed = (e.f(70) as i64) & 1 == 1;
                 let raw = if vs.iter().any(|(_, b)| b.abs() >= 1e-9) {
@@ -488,6 +486,54 @@ fn shapes(
                     _ => {
                         *skipped.entry(POLYLINE_NOT_NUMBERS.to_owned()).or_default() += 1;
                         None
+                    }
+                }
+            }
+            "LEADER" => {
+                // Vertices from the repeated 10/20 codes. A spline path (72 = 1) is drawn
+                // straight through the same vertices.
+                let all = vertices(e);
+                let vs: Vec<(f64, f64)> = all
+                    .iter()
+                    .map(|(p, _)| *p)
+                    .filter(|(x, y)| x.is_finite() && y.is_finite())
+                    .collect();
+                let pts: Vec<Point> = vs.iter().map(|&(x, y)| q(x, y)).collect();
+                if pts.len() < 2 || !pts.iter().all(|p| p.x.is_finite() && p.y.is_finite()) {
+                    *skipped.entry("LEADER".to_owned()).or_default() += 1;
+                    None
+                } else {
+                    // Drawn without its vertices that are not numbers: say how many.
+                    if all.len() > vs.len() {
+                        *skipped.entry(LEADER_BAD_VERTICES.to_owned()).or_default() += all.len() - vs.len();
+                    }
+                    out.push((
+                        layer.clone(),
+                        Shape::Polyline {
+                            points: pts,
+                            closed: false,
+                            filled: false,
+                        },
+                    ));
+                    // 71 = 1: a filled arrow head with its tip on the first vertex, pointing
+                    // along the first segment, AutoCAD's metric default size (2.5 long, 0.83
+                    // wide), made in the entity's own coordinates so a placement scales it.
+                    let (x0, y0) = vs[0];
+                    let next = vs.iter().find(|&&(x, y)| (x - x0).hypot(y - y0) > 1e-9);
+                    match next {
+                        Some(&(x1, y1)) if e.f(71) as i64 == 1 => {
+                            let len = (x1 - x0).hypot(y1 - y0);
+                            let (dx, dy) = ((x1 - x0) / len, (y1 - y0) / len);
+                            let (bx, by) = (x0 + 2.5 * dx, y0 + 2.5 * dy);
+                            let (hx, hy) = (-dy * 0.415, dx * 0.415);
+                            let head = vec![q(x0, y0), q(bx + hx, by + hy), q(bx - hx, by - hy)];
+                            if head.iter().all(|p| p.x.is_finite() && p.y.is_finite()) {
+                                polyline(head, true, true)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
                     }
                 }
             }
@@ -681,9 +727,38 @@ fn shapes(
             }
         };
         if let Some(s) = shape {
-            out.push((layer, s));
+            // Anything else not numbers once placed (a radius near the limit times the scale)
+            // is left out and said too: the page could not be read back.
+            let (a, b) = s.bounds();
+            // Bounds miss a text's height and an arc's angles.
+            let more = match &s {
+                Shape::Text { height, angle, .. } => vec![*height, *angle],
+                Shape::Arc { start, end, .. } => vec![*start, *end],
+                _ => Vec::new(),
+            };
+            if [a.x, a.y, b.x, b.y].iter().chain(&more).all(|v| v.is_finite()) {
+                out.push((layer, s));
+            } else {
+                *skipped.entry(NOT_NUMBERS_PLACED.to_owned()).or_default() += 1;
+            }
         }
     }
+}
+
+/// The vertices of an LWPOLYLINE or LEADER in order, from the repeated 10/20 codes, each with
+/// the bulge (code 42) of the segment it starts. A coordinate that is not a number is NaN.
+fn vertices(e: &Entity) -> Vec<((f64, f64), f64)> {
+    let mut vs: Vec<((f64, f64), f64)> = Vec::new();
+    for (code, v) in &e.codes {
+        let n = v.trim().parse::<f64>().unwrap_or(f64::NAN);
+        match (*code, vs.last_mut()) {
+            (10, _) => vs.push(((n, f64::NAN), 0.0)),
+            (20, Some(last)) => last.0.1 = n,
+            (42, Some(last)) if n.is_finite() => last.1 = n,
+            _ => {}
+        }
+    }
+    vs
 }
 
 /// A polyline of at least two points, or nothing.
@@ -852,11 +927,24 @@ const SPLINE_TOO_FEW: &str = "SPLINE with too few points";
 /// their placed points are not numbers.
 const STRETCHED_NOT_NUMBERS: &str = "CIRCLE or ARC of a stretched block whose points are not numbers";
 
+/// The `skipped` key of the vertices left out of a drawn LEADER because they are not numbers.
+const LEADER_BAD_VERTICES: &str = "LEADER vertex that is not numbers";
+
 /// The key under which hatches with a boundary that is not all numbers are counted.
 /// The `skipped` key of a polyline whose points, or the arcs of its bulges, are not numbers once
 /// placed.
 const POLYLINE_NOT_NUMBERS: &str = "LWPOLYLINE whose points are not numbers once placed";
 const HATCH_NOT_NUMBERS: &str = "HATCH with a boundary that is not numbers";
+/// The `skipped` key of a line whose ends are not numbers once placed.
+const LINE_NOT_NUMBERS: &str = "LINE whose ends are not numbers once placed";
+/// The `skipped` key of any other entity that is not numbers once placed (e.g. a radius).
+const NOT_NUMBERS_PLACED: &str = "entity whose size is not a number once placed";
+/// How far from the middle of the drawing (mm, once scaled) an entity may lie and still be
+/// moved onto the page: 1000 km, far past any real drawing, near enough that moving keeps its
+/// shape.
+const FAR_OUT: f64 = 1e9;
+/// The `skipped` key of an entity farther out than [`FAR_OUT`].
+const TOO_FAR_OUT: &str = "entity too far from the rest of the drawing";
 
 /// The `skipped` key of a polyline left out because its bulges would give more than
 /// [`MAX_BULGED_POINTS`] points.
@@ -1869,7 +1957,7 @@ fn with_holes_kept(loops: &[Vec<(f64, f64)>], style: i64) -> Option<(Vec<Loop>, 
 }
 
 /// One warning per entity kind that was not read.
-fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
+pub(crate) fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
     skipped
         .into_iter()
         .map(|(kind, n)| {
@@ -1892,9 +1980,21 @@ fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
             } else if kind == SPLINE_NOT_CURVE {
                 let s = if n == 1 { "" } else { "s" };
                 format!("{n} SPLINE{s} whose knots make no curve, drawn through their points")
+            } else if kind == NOT_NUMBERS_PLACED {
+                let s = if n == 1 { "y" } else { "ies" };
+                format!("{n} entit{s} whose size is not a number once placed, left out")
+            } else if kind == TOO_FAR_OUT {
+                let s = if n == 1 { "y" } else { "ies" };
+                format!("{n} entit{s} more than 1000 km from the rest of the drawing, left out")
+            } else if kind == LINE_NOT_NUMBERS {
+                let s = if n == 1 { "" } else { "s" };
+                format!("{n} line{s} whose ends are not numbers once placed, left out")
             } else if kind == POLYLINE_NOT_NUMBERS {
                 let s = if n == 1 { "" } else { "s" };
                 format!("{n} polyline{s} whose points are not numbers once placed, left out")
+            } else if kind == LEADER_BAD_VERTICES {
+                let (s, are) = if n == 1 { ("vertex", "is") } else { ("vertices", "are") };
+                format!("{n} LEADER {s} that {are} not numbers, left out of the line")
             } else if kind == HATCH_NOT_NUMBERS {
                 let s = if n == 1 { "" } else { "es" };
                 format!("{n} HATCH{s} with a boundary that is not numbers: that boundary left out")
@@ -2137,10 +2237,20 @@ fn normalise_block_name(n: &str) -> String {
 /// DEVICE, BMK or REF; everything else is kept as graphics. The drawing is moved so its top-left
 /// corner sits inside the page frame.
 pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<ImportedPage> {
+    check_scale(scale)?;
+    page_of(&parse(text)?, scale, known_symbols)
+}
+
+pub(crate) fn check_scale(scale: f64) -> Result<()> {
     if !(scale.is_finite() && scale > 0.0) {
         return Err(Error::Format("scale must be a positive number".into()));
     }
-    let d = parse(text)?;
+    Ok(())
+}
+
+/// [`page`] for a drawing already read, from a DXF or a DWG file ([`crate::dwg::page`]).
+pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>) -> Result<ImportedPage> {
+    check_scale(scale)?;
     let known: BTreeMap<String, &String> = known_symbols.iter().map(|s| (normalise_block_name(s), s)).collect();
     let mut out = ImportedPage::default();
     let mut tag_warnings = Vec::new();
@@ -2181,7 +2291,10 @@ pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<
                             })
                             .ok()
                     });
-                let rotation = Rotation::from_degrees(-(e.f(50).round() as i64)).unwrap_or_default();
+                // Taken to a turn first: a huge angle (a damaged file) would saturate the cast
+                // and overflow when negated.
+                let turn = e.f(50).round().rem_euclid(360.0);
+                let rotation = Rotation::from_degrees(-(turn as i64)).unwrap_or_default();
                 out.symbols.push(PlacedSymbol {
                     id: String::new(),
                     symbol: (*id).clone(),
@@ -2200,7 +2313,7 @@ pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<
     }
     let mut skipped = BTreeMap::new();
     shapes(
-        &d,
+        d,
         &plain,
         Xf::ID,
         scale,
@@ -2213,7 +2326,59 @@ pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<
         &mut { MAX_DRAWN },
     );
     out.graphics = raw.into_iter().map(|(_, s)| s).collect();
-    out.warnings = skipped_warnings(skipped);
+    out.warnings = skipped_warnings(skipped.clone());
+    // Entities farther than FAR_OUT from the middle of the drawing (the median point, which a
+    // few stray ones cannot move) are left out and said: moving one onto the page would drag
+    // the rest out of range or overflow. A drawing far from its own origin keeps everything.
+    // A symbol placed where its position is not a number (a coordinate near the limit times the
+    // scale) is left out and said first, so it cannot pull the middle away.
+    let placed = out.symbols.len();
+    out.symbols.retain(|s| s.at.x.is_finite() && s.at.y.is_finite());
+    if out.symbols.len() < placed {
+        *skipped.entry(NOT_NUMBERS_PLACED.to_owned()).or_default() += placed - out.symbols.len();
+        out.warnings = skipped_warnings(skipped.clone());
+    }
+    // An entity wider or taller than the window around the middle can never stay; leave it out
+    // before the middle is found, so its centre cannot pull the middle away from the rest.
+    let fits = |s: &Shape| {
+        let (a, b) = s.bounds();
+        b.x - a.x <= 2.0 * FAR_OUT && b.y - a.y <= 2.0 * FAR_OUT
+    };
+    let drawn = out.graphics.len();
+    out.graphics.retain(fits);
+    let oversized = drawn - out.graphics.len();
+    let mut xs: Vec<f64> = Vec::new();
+    let mut ys: Vec<f64> = Vec::new();
+    // One position per entity (the middle of its bounds), so a long line does not count twice.
+    for p in out
+        .graphics
+        .iter()
+        .map(|s| {
+            let (a, b) = s.bounds();
+            Point::new(a.x / 2.0 + b.x / 2.0, a.y / 2.0 + b.y / 2.0)
+        })
+        .chain(out.symbols.iter().map(|s| s.at))
+    {
+        xs.push(p.x);
+        ys.push(p.y);
+    }
+    let middle = |v: &mut Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v.get(v.len() / 2).copied().unwrap_or(0.0)
+    };
+    let mid = Point::new(middle(&mut xs), middle(&mut ys));
+    let near = |p: Point| (p.x - mid.x).abs() <= FAR_OUT && (p.y - mid.y).abs() <= FAR_OUT;
+    let before = out.graphics.len() + out.symbols.len();
+    out.graphics.retain(|s| {
+        let (a, b) = s.bounds();
+        near(a) && near(b)
+    });
+    out.symbols.retain(|s| near(s.at));
+    let far = oversized + before - out.graphics.len() - out.symbols.len();
+    if far > 0 {
+        *skipped.entry(TOO_FAR_OUT.to_owned()).or_default() += far;
+        out.warnings = skipped_warnings(skipped);
+    }
     out.warnings.extend(tag_warnings);
     // Move into the frame: top-left at (20, 20) mm.
     let mut pts: Vec<Point> = out
@@ -2234,10 +2399,17 @@ pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<
         return Err(Error::Format(why));
     }
     let (min, _) = wc_core::geom::bounds_of(&pts);
-    let shift = Point::new(20.0 - min.x, 20.0 - min.y);
-    out.graphics = out.graphics.iter().map(|s| s.translate(shift)).collect();
+    // Subtract the corner first and add the frame offset after: in one step `20 - min` would
+    // round the 20 away for a drawing far from its origin.
+    let back = Point::new(-min.x, -min.y);
+    let frame = Point::new(20.0, 20.0);
+    out.graphics = out
+        .graphics
+        .iter()
+        .map(|s| s.translate(back).translate(frame))
+        .collect();
     for s in &mut out.symbols {
-        s.at = s.at + shift;
+        s.at = s.at + back + frame;
     }
     Ok(out)
 }
@@ -2338,6 +2510,198 @@ mod tests {
         assert_eq!(p.symbols.len(), 1);
         assert_eq!(p.symbols[0].tag.as_ref().map(|t| t.to_string()).as_deref(), Some("-K7"));
         assert_eq!(p.graphics.len(), 3, "logo exploded into two lines plus the polyline");
+        Ok(())
+    }
+
+    /// A line whose ends overflow once scaled is left out and counted, and a drawing left with
+    /// nothing says why.
+    #[test]
+    fn a_line_that_overflows_once_placed_is_left_out_and_said() -> Result<()> {
+        let ents = "0\nLINE\n10\n0\n20\n0\n11\n1e308\n21\n0\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n";
+        let p = page(&dxf(ents, ""), 10.0, &BTreeSet::new())?;
+        assert_eq!(p.graphics.len(), 1, "{:?}", p.graphics);
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("1 line whose ends are not numbers")),
+            "{:?}",
+            p.warnings
+        );
+        let only = "0\nLINE\n10\n0\n20\n0\n11\n1e308\n21\n0\n";
+        let Err(err) = page(&dxf(only, ""), 10.0, &BTreeSet::new()) else {
+            unreachable!("nothing left to draw");
+        };
+        assert!(err.to_string().contains("1 line whose ends are not numbers"), "{err}");
+        Ok(())
+    }
+
+    /// An entity too far out to move onto the page is left out and said; the rest is moved
+    /// from where it lies, so it keeps its shape (a far-off line would drag it out of range).
+    #[test]
+    fn a_line_too_far_out_is_left_out_and_the_rest_keeps_its_shape() -> Result<()> {
+        let ents = "0\nLINE\n10\n-1e308\n20\n0\n11\n1e308\n21\n0\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n";
+        let p = page(&dxf(ents, ""), 1.0, &BTreeSet::new())?;
+        // The ordinary line keeps its ends and length, at the frame's corner.
+        let [Shape::Line { a, b }] = p.graphics.as_slice() else {
+            unreachable!("{:?}", p.graphics);
+        };
+        assert_eq!((*a, *b), (Point::new(20.0, 20.0), Point::new(25.0, 20.0)));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("1 entity more than 1000 km from the rest of the drawing")),
+            "{:?}",
+            p.warnings
+        );
+        let only = "0\nLINE\n10\n-1e308\n20\n0\n11\n1e308\n21\n0\n";
+        let Err(err) = page(&dxf(only, ""), 1.0, &BTreeSet::new()) else {
+            unreachable!("nothing left to draw");
+        };
+        assert!(err.to_string().contains("1000 km"), "{err}");
+        Ok(())
+    }
+
+    /// A symbol whose position overflows once scaled is left out and said; the others stay.
+    #[test]
+    fn a_symbol_placed_out_of_range_is_left_out_and_the_rest_kept() -> Result<()> {
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        let ents = "0\nINSERT\n2\nWC.COIL\n10\n0\n20\n0\n0\nINSERT\n2\nWC.COIL\n10\n1e308\n20\n0\n";
+        let p = page(&dxf(ents, ""), 10.0, &known)?;
+        assert_eq!(p.symbols.len(), 1, "{:?}", p.symbols);
+        assert_eq!(p.symbols[0].at, Point::new(20.0, 20.0));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("1 entity whose size is not a number once placed")),
+            "{:?}",
+            p.warnings
+        );
+        Ok(())
+    }
+
+    /// Lines too long for any window are left out before the middle is found, so they cannot
+    /// pull it away from a compact drawing far out.
+    #[test]
+    fn lines_too_long_to_place_do_not_move_the_middle() -> Result<()> {
+        let long = "0\nLINE\n10\n-1e12\n20\n0\n11\n1e12\n21\n0\n";
+        let ents = format!("{long}{long}0\nLINE\n10\n2e9\n20\n0\n11\n2000000005\n21\n0\n");
+        let p = page(&dxf(&ents, ""), 1.0, &BTreeSet::new())?;
+        let [Shape::Line { a, b }] = p.graphics.as_slice() else {
+            unreachable!("{:?}", p.graphics);
+        };
+        assert_eq!((*a, *b), (Point::new(20.0, 20.0), Point::new(25.0, 20.0)));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("2 entities more than 1000 km from the rest")),
+            "{:?}",
+            p.warnings
+        );
+        Ok(())
+    }
+
+    /// A drawing very far from its own origin still lands at the frame offset, its size kept.
+    #[test]
+    fn a_drawing_very_far_out_keeps_the_frame_offset_and_its_length() -> Result<()> {
+        let ents = "0\nLINE\n10\n1e18\n20\n0\n11\n1000000000000000128\n21\n0\n";
+        let p = page(&dxf(ents, ""), 1.0, &BTreeSet::new())?;
+        let [Shape::Line { a, b }] = p.graphics.as_slice() else {
+            unreachable!("{:?}", p.graphics);
+        };
+        assert_eq!((*a, *b), (Point::new(20.0, 20.0), Point::new(148.0, 20.0)));
+        Ok(())
+    }
+
+    /// One stray line far away counts once in finding the middle, not once per end, so it
+    /// cannot outvote two symbols and drag the page to itself.
+    #[test]
+    fn a_stray_line_counts_once_and_cannot_outvote_the_symbols() -> Result<()> {
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        let ents = "0\nINSERT\n2\nWC.COIL\n10\n0\n20\n0\n0\nINSERT\n2\nWC.COIL\n10\n5\n20\n0\n\
+                    0\nLINE\n10\n1e12\n20\n0\n11\n1000000000005\n21\n0\n";
+        let p = page(&dxf(ents, ""), 1.0, &known)?;
+        assert_eq!(p.symbols.len(), 2, "{:?}", p.symbols);
+        assert!(p.graphics.is_empty(), "{:?}", p.graphics);
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("1 entity more than 1000 km from the rest")),
+            "{:?}",
+            p.warnings
+        );
+        Ok(())
+    }
+
+    /// A compact drawing far from its own origin (map coordinates) is moved onto the page whole.
+    #[test]
+    fn a_drawing_far_from_its_origin_comes_onto_the_page_whole() -> Result<()> {
+        let ents = "0\nLINE\n10\n2e9\n20\n0\n11\n2000000005\n21\n0\n";
+        let p = page(&dxf(ents, ""), 1.0, &BTreeSet::new())?;
+        let [Shape::Line { a, b }] = p.graphics.as_slice() else {
+            unreachable!("{:?}", p.graphics);
+        };
+        assert_eq!((*a, *b), (Point::new(20.0, 20.0), Point::new(25.0, 20.0)));
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+        Ok(())
+    }
+
+    /// A text whose height overflows once scaled is left out and said (its bounds are only its
+    /// anchor); an ordinary text comes through unchanged and survives a save and reload.
+    #[test]
+    fn a_text_whose_height_overflows_once_scaled_is_left_out_and_said() -> Result<()> {
+        let ents = "0\nTEXT\n10\n0\n20\n0\n40\n1e308\n1\nHUGE\n0\nTEXT\n10\n0\n20\n0\n40\n2.5\n1\nA1\n";
+        let p = page(&dxf(ents, ""), 10.0, &BTreeSet::new())?;
+        let [Shape::Text { text, height, .. }] = p.graphics.as_slice() else {
+            unreachable!("{:?}", p.graphics);
+        };
+        assert_eq!((text.as_str(), *height), ("A1", 25.0));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("1 entity whose size is not a number once placed")),
+            "{:?}",
+            p.warnings
+        );
+        let json = serde_json::to_string(&p.graphics).map_err(|e| Error::Format(e.to_string()))?;
+        let back: Vec<Shape> = serde_json::from_str(&json).map_err(|e| Error::Format(e.to_string()))?;
+        assert_eq!(back, p.graphics);
+        Ok(())
+    }
+
+    /// A circle whose radius overflows once scaled is left out and said, never saved as a
+    /// radius that is not a number.
+    #[test]
+    fn a_circle_whose_radius_overflows_once_scaled_is_left_out_and_said() -> Result<()> {
+        let ents = "0\nCIRCLE\n10\n0\n20\n0\n40\n1e308\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n";
+        let p = page(&dxf(ents, ""), 10.0, &BTreeSet::new())?;
+        assert_eq!(p.graphics.len(), 1, "{:?}", p.graphics);
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("1 entity whose size is not a number once placed")),
+            "{:?}",
+            p.warnings
+        );
+        Ok(())
+    }
+
+    /// A symbol's rotation is read as a quarter turn; a huge angle (a damaged file, or a DWG
+    /// angle of -1e18 radians) does not overflow.
+    #[test]
+    fn a_symbol_rotation_of_any_size_is_read() -> Result<()> {
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        for (angle, want) in [
+            ("90", Rotation::R270),
+            ("-90", Rotation::R90),
+            ("450", Rotation::R270),
+            ("-5.7e19", Rotation::R0),
+            ("1e300", Rotation::R0),
+        ] {
+            let ents = format!("0\nINSERT\n2\nWC.COIL\n10\n0\n20\n0\n50\n{angle}\n");
+            let p = page(&dxf(&ents, ""), 1.0, &known)?;
+            assert_eq!(p.symbols.len(), 1, "{angle}");
+            assert_eq!(p.symbols[0].rotation, want, "{angle}");
+        }
         Ok(())
     }
 
@@ -2442,6 +2806,63 @@ mod tests {
         assert!(r.is_ok());
         // Truncated pair list and garbage numbers.
         let _ = symbol("0\nSECTION\n2\nENTITIES\n0\nLINE\n10\nNaN\n20", "x", "x");
+    }
+
+    #[test]
+    fn a_leader_is_drawn_with_its_arrow_head() -> Result<()> {
+        let leader = |arrow: u8| {
+            format!("0\nLEADER\n8\n0\n71\n{arrow}\n72\n0\n76\n3\n10\n0\n20\n0\n10\n10\n20\n0\n10\n10\n20\n10\n")
+        };
+        let near = |a: Point, x: f64, y: f64| (a.x - x).abs() < 1e-9 && (a.y - y).abs() < 1e-9;
+        for arrow in [0, 1] {
+            let d = parse(&dxf(&leader(arrow), ""))?;
+            let mut skipped = BTreeMap::new();
+            let mut budget = MAX_DRAWN;
+            let (shapes, _) = draw_mapped(&d, &d.entities, [1.0, 0.0, 0.0, 1.0], 0.0, &mut skipped, &mut budget);
+            assert!(skipped.is_empty(), "{skipped:?}");
+            assert_eq!(shapes.len(), 1 + arrow as usize, "{shapes:?}");
+            // The line through the vertices, y down on the page.
+            let Shape::Polyline { points, closed, filled } = &shapes[0].1 else {
+                unreachable!("the leader line is a polyline: {shapes:?}")
+            };
+            assert!(!*closed && !*filled);
+            assert_eq!(points.len(), 3);
+            assert!(near(points[0], 0.0, 0.0) && near(points[1], 10.0, 0.0) && near(points[2], 10.0, -10.0));
+            if arrow == 1 {
+                let Shape::Polyline { points, closed, filled } = &shapes[1].1 else {
+                    unreachable!("the arrow head is a polyline: {shapes:?}")
+                };
+                assert!(*closed && *filled);
+                // Tip on the first vertex, base 2.5 along the first segment, 0.83 wide.
+                assert!(near(points[0], 0.0, 0.0), "{points:?}");
+                assert!(
+                    near(points[1], 2.5, -0.415) && near(points[2], 2.5, 0.415),
+                    "{points:?}"
+                );
+            }
+            let (_, warnings) = footprint(&dxf(&leader(arrow), ""))?;
+            assert!(!warnings.iter().any(|w| w.contains("LEADER")), "{warnings:?}");
+        }
+        // A vertex that is not numbers is left out, the rest drawn, and the leader says so.
+        let (f, warnings) = footprint(&dxf(
+            "0\nLEADER\n71\n0\n76\n3\n10\n0\n20\n0\n10\nbad\n20\n5\n10\n10\n20\n10\n",
+            "",
+        ))?;
+        assert_eq!(f.shapes.len(), 1, "{:?}", f.shapes);
+        assert!((f.width - 10.0).abs() < 1e-9 && (f.height - 10.0).abs() < 1e-9);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("1 LEADER vertex that is not numbers")),
+            "{warnings:?}"
+        );
+        // One vertex draws nothing and is still said.
+        let (_, warnings) = footprint(&dxf(
+            "0\nLINE\n10\n0\n20\n0\n11\n5\n21\n5\n0\nLEADER\n71\n1\n76\n1\n10\n0\n20\n0\n",
+            "",
+        ))?;
+        assert!(warnings.iter().any(|w| w.contains("LEADER")), "{warnings:?}");
+        Ok(())
     }
 
     #[test]

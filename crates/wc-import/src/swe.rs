@@ -2875,4 +2875,4 @@ pub fn build_with(
 pub mod cabinet;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

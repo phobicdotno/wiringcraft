@@ -76,7 +76,7 @@ fn connection(page: u32, from: &str, to: &str, props: &[(u16, u16, &str)], cable
     record(CLASS_CONNECTION, 900, &body)
 }
 
-fn sample() -> Tables {
+pub(crate) fn sample() -> Tables {
     let mut t = Tables::new();
     let mut pages = Vec::new();
     for (id, name, desc) in [
