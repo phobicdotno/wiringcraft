@@ -355,6 +355,147 @@ fn cable_list_groups_cores_by_cable() {
 }
 
 #[test]
+fn check_names_a_cable_core_on_two_connections() {
+    let (mut p, s, parts) = fixture();
+    let found = |p: &Project| {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        check(&i)
+            .into_iter()
+            .filter(|f| f.message.contains("cable core"))
+            .map(|f| (f.page_id, f.item, f.message))
+            .collect::<Vec<_>>()
+    };
+    let set_core = |p: &mut Project, page: usize, id: &str, core: &str| {
+        if let Some(w) = p.pages[page].wires.iter_mut().find(|w| w.id == id) {
+            w.cable = Some(wc_core::CableCore {
+                cable: DeviceTag::parse("-W1").unwrap(),
+                core: core.into(),
+            });
+        }
+    };
+    // w2 (-K1:14 to -X1.1:1) and w4 (-K1:A2 to -X2:1) are two connections.
+    set_core(&mut p, 0, "w2", "1");
+    set_core(&mut p, 0, "w4", "2");
+    assert!(found(&p).is_empty());
+    // A core drawn in two pieces of one connection is one conductor.
+    p.pages[0].wires.push(wire(
+        "w5",
+        pin("s4", "1"),
+        Endpoint::Point {
+            at: Point::new(110.0, 60.0),
+        },
+        None,
+        None,
+    ));
+    set_core(&mut p, 0, "w5", "1");
+    assert!(found(&p).is_empty());
+    // A wire naming only the cable names no core.
+    set_core(&mut p, 0, "w3", "");
+    set_core(&mut p, 0, "w1", " ");
+    assert!(found(&p).is_empty());
+    // A repeat on an overview page does not count.
+    let mut overview = p.pages[0].clone();
+    overview.id = "ov".into();
+    overview.number = "1".into();
+    overview.overview = true;
+    if let Some(c) = overview
+        .wires
+        .iter_mut()
+        .find(|w| w.id == "w4")
+        .and_then(|w| w.cable.as_mut())
+    {
+        c.core = "1".into();
+    }
+    p.pages.insert(0, overview);
+    assert!(found(&p).is_empty());
+    // The same core on a second connection is named on the second one's wire.
+    set_core(&mut p, 1, "w4", "1");
+    assert_eq!(
+        found(&p),
+        [(
+            Some("p2".to_owned()),
+            Some("w4".to_owned()),
+            "cable core -W1:1 is on 2 connections".to_owned()
+        )]
+    );
+    // Wire ids need not be unique on a page (a replaced page can repeat them): the second
+    // connection's wire still counts when it shares the first one's id.
+    let w4 = p.pages[1].wires.iter_mut().find(|w| w.id == "w4");
+    let Some(w4) = w4 else {
+        unreachable!("the fixture has w4")
+    };
+    w4.id = "w2".into();
+    assert_eq!(
+        found(&p),
+        [(
+            Some("p2".to_owned()),
+            Some("w2".to_owned()),
+            "cable core -W1:1 is on 2 connections".to_owned()
+        )]
+    );
+}
+
+#[test]
+fn check_cable_cores_ignore_overview_wiring_that_joins_connections() {
+    let (mut p, s, parts) = fixture();
+    let found = |p: &Project| {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        check(&i)
+            .into_iter()
+            .filter(|f| f.message.contains("cable core"))
+            .map(|f| (f.page_id, f.item, f.message))
+            .collect::<Vec<_>>()
+    };
+    // w1 (24V, at -K1:A1) and w4 (0V, at -K1:A2) are two connections sharing core -W1:1.
+    for w in p.pages[0].wires.iter_mut().filter(|w| w.id == "w1" || w.id == "w4") {
+        w.cable = Some(wc_core::CableCore {
+            cable: DeviceTag::parse("-W1").unwrap(),
+            core: "1".into(),
+        });
+    }
+    let expected = [(
+        Some("p2".to_owned()),
+        Some("w4".to_owned()),
+        "cable core -W1:1 is on 2 connections".to_owned(),
+    )];
+    assert_eq!(found(&p), expected);
+    // An overview page whose wiring joins the 24V and 0V potentials into one net.
+    let mut overview = Page::new("ov", "1", "Overview");
+    overview.overview = true;
+    let mid = Point::new(20.0, 20.0);
+    overview.wires = vec![
+        wire(
+            "o1",
+            Endpoint::Point {
+                at: Point::new(10.0, 20.0),
+            },
+            Endpoint::Point { at: mid },
+            None,
+            Some("24V"),
+        ),
+        wire(
+            "o2",
+            Endpoint::Point { at: mid },
+            Endpoint::Point {
+                at: Point::new(30.0, 20.0),
+            },
+            None,
+            Some("0V"),
+        ),
+    ];
+    p.pages.insert(0, overview);
+    assert_eq!(found(&p), expected);
+}
+
+#[test]
 fn project_check_finds_the_usual_mistakes() {
     let (mut p, s, parts) = fixture();
     {
@@ -2892,6 +3033,73 @@ fn project_check_flags_a_wire_on_one_pin_at_both_ends() {
     assert_eq!(found[0].severity, Severity::Warning);
     assert_eq!(found[0].message, "wire 7 starts and ends on =A+C1-K1:13");
     assert_eq!(found[0].item.as_deref(), Some("w5"));
+}
+
+#[test]
+fn rows_of_the_wire_cable_terminal_and_plc_lists_link_to_their_page() {
+    let (mut p, mut s, parts) = fixture();
+    let mut input = sym("wc.plc.input", SymbolRole::Standalone, &["I"]);
+    input.category = "plc".into();
+    input.name = "PLC digital input".into();
+    s.insert(input.id.clone(), input);
+    // A second page, numbered 7 with the id p7, with a terminal, a PLC input and a cable core.
+    let mut second = Page::new("p7", "7", "Field");
+    second.symbols = vec![
+        place("t1", "term", 10.0, Some("-X1.3")),
+        place("in1", "wc.plc.input", 40.0, Some("-A1.I1")),
+    ];
+    let mut core = wire("w20", pin("t1", "2"), pin("in1", "I"), Some("20"), None);
+    core.cable = Some(wc_core::CableCore {
+        cable: DeviceTag::parse("-W1").unwrap(),
+        core: "2".into(),
+    });
+    second.wires.push(core);
+    p.pages.push(second);
+    if let Some(w) = p.pages[0].wires.iter_mut().find(|w| w.id == "w2") {
+        w.cable = Some(wc_core::CableCore {
+            cable: DeviceTag::parse("-W1").unwrap(),
+            core: "1".into(),
+        });
+    }
+    p.meta.strips.push(wc_core::project::StripLayout {
+        strip: DeviceTag::parse("-X1").unwrap(),
+        spares: vec!["9".into()],
+        order: vec![],
+    });
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let id_of = |number: &str| p.pages.iter().find(|pg| pg.number == number).map(|pg| pg.id.clone());
+    for (kind, page_column) in [
+        (Kind::Wires, 0),
+        (Kind::Cables, 4),
+        (Kind::Terminals, 5),
+        (Kind::Plc, 5),
+    ] {
+        let t = build(kind, &i);
+        assert!(!t.rows.is_empty(), "{kind:?}");
+        for (n, row) in t.rows.iter().enumerate() {
+            let link = t.row_pages.get(n).cloned().unwrap_or_default();
+            let want = id_of(&row[page_column]).unwrap_or_default();
+            assert_eq!(link, want, "{kind:?} row {row:?}");
+        }
+        assert!(t.row_pages.iter().any(|l| l == "p7"), "{kind:?}");
+    }
+    // The spare terminal is on no page and links nowhere.
+    let t = build(Kind::Terminals, &i);
+    let spare = t.rows.iter().position(|r| r[5] == SPARE_PAGE).unwrap();
+    assert_eq!(t.row_pages.get(spare).map(String::as_str).unwrap_or(""), "");
+    // A sorted layout keeps each row's link with it.
+    let layout = ReportLayout {
+        sort: vec!["-Page".into()],
+        ..Default::default()
+    };
+    let sorted = build_with(Kind::Wires, &i, Some(&layout));
+    assert_eq!(sorted.rows[0][0], "7");
+    assert_eq!(sorted.row_pages[0], "p7");
+    assert_eq!(sorted.row_pages[1], "p2");
 }
 
 #[test]
