@@ -1768,6 +1768,12 @@ pub fn put_file_back(path: &Path, before: Option<&[u8]>) -> Result<(), String> {
     if std::fs::read(path).is_ok_and(|now| now == bytes) {
         return Ok(());
     }
+    // The file put back keeps the permissions the file there has now (a regular file, not a
+    // link): the staging file is made with the default ones (#664).
+    let keep = std::fs::symlink_metadata(path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)
+        .map(|m| m.permissions());
     // The staging file is made new (never one already there, which could be a link to a file
     // elsewhere), and only that file is removed when something fails.
     let mut made = None;
@@ -1788,10 +1794,14 @@ pub fn put_file_back(path: &Path, before: Option<&[u8]>) -> Result<(), String> {
         return Err(format!("{}: no free name for the staging file", path.display()));
     };
     use std::io::Write as _;
-    let done = file.write_all(bytes).and_then(|()| file.sync_all()).and_then(|()| {
-        drop(file);
-        std::fs::rename(&part, path)
-    });
+    let done = file
+        .write_all(bytes)
+        .and_then(|()| keep.map_or(Ok(()), |perm| file.set_permissions(perm)))
+        .and_then(|()| file.sync_all())
+        .and_then(|()| {
+            drop(file);
+            std::fs::rename(&part, path)
+        });
     done.map_err(|x| match std::fs::remove_file(&part) {
         Ok(()) => fail(x),
         Err(y) => format!("{}; the staging file {} is left: {y}", fail(x), part.display()),
@@ -1821,6 +1831,23 @@ mod tests {
         match tempfile::tempdir() {
             Ok(t) => t,
             Err(x) => unreachable!("no temp folder: {x}"),
+        }
+    }
+
+    /// A file put back keeps the permissions it has, not the default ones of a new file (#664).
+    #[cfg(unix)]
+    #[test]
+    fn a_file_put_back_keeps_its_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let t = tmp();
+        let mode = |p: &Path| std::fs::metadata(p).map(|m| m.permissions().mode() & 0o777).ok();
+        for want in [0o600, 0o640, 0o444] {
+            let path = t.path().join(format!("page-{want:o}.toml"));
+            assert!(std::fs::write(&path, "now").is_ok());
+            assert!(std::fs::set_permissions(&path, std::fs::Permissions::from_mode(want)).is_ok());
+            assert_eq!(put_file_back(&path, Some(b"before")), Ok(()));
+            assert_eq!(std::fs::read(&path).ok().as_deref(), Some(&b"before"[..]));
+            assert_eq!(mode(&path), Some(want), "{want:o}");
         }
     }
 
