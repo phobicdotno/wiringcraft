@@ -1,4 +1,4 @@
-//! Vector PDF export: schematic pages, then report tables, panel layouts, PLC card sheets and
+//! Vector PDF export: schematic pages, report tables, panel layouts, PLC card sheets and
 //! network topology sheets.
 //!
 //! Output is plain PDF 1.7 written by hand (no dependencies): lines and curves stay vectors,
