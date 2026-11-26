@@ -1515,6 +1515,9 @@ fn hatch_loops(e: &Entity) -> (Vec<HatchLoop>, usize) {
             };
         } else {
             let edges = cur.count(93);
+            // Edges (each a bounded number of points) whose samples together would pass
+            // MAX_BULGED_POINTS: the loop is read to its end but left out.
+            let mut over = false;
             for edge in 0..edges {
                 let Some(kind) = cur.take(72) else { break };
                 let seg: Vec<(f64, f64)> = match kind as i64 {
@@ -1624,7 +1627,14 @@ fn hatch_loops(e: &Entity) -> (Vec<HatchLoop>, usize) {
                     seg.reverse();
                 }
                 let skip = usize::from(pts.last().is_some_and(|end| d(*end, seg.first()) < 1e-9));
-                pts.extend(seg.into_iter().skip(skip));
+                over |= pts.len() + seg.len().saturating_sub(skip) > MAX_BULGED_POINTS;
+                if !over {
+                    pts.extend(seg.into_iter().skip(skip));
+                }
+            }
+            if over {
+                too_many += 1;
+                pts = Vec::new();
             }
         }
         // Source boundary objects: a count and that many handles.
@@ -2197,7 +2207,12 @@ pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<
         .collect();
     pts.extend(out.symbols.iter().map(|s| s.at));
     if pts.is_empty() {
-        return Err(Error::Format("the drawing has no entities WiringCraft can read".into()));
+        // Say what was left out, which is often why nothing is left to draw.
+        let mut why = "the drawing has no entities WiringCraft can read".to_owned();
+        if !out.warnings.is_empty() {
+            why.push_str(&format!(" ({})", out.warnings.join("; ")));
+        }
+        return Err(Error::Format(why));
     }
     let (min, _) = wc_core::geom::bounds_of(&pts);
     let shift = Point::new(20.0 - min.x, 20.0 - min.y);
@@ -3014,6 +3029,26 @@ mod tests {
             .map(|i| ((1e16 + if i % 2 == 0 { 0.0 } else { 2.0 }, 1e16), 0.5))
             .collect();
         assert_eq!(bulged(&far, true), Err(BulgeError::TooManyPoints));
+        // A hatch loop of 6000 half-circle arc edges (37 points each) is left out the same way.
+        let arcs: String = (0..n)
+            .map(|i| {
+                let c = 2 * i + 1;
+                format!("72\n2\n10\n{c}\n20\n0\n40\n1\n50\n180\n51\n0\n73\n0\n")
+            })
+            .collect();
+        let edge_hatch = format!("0\nHATCH\n8\n0\n2\nSOLID\n70\n1\n91\n1\n92\n1\n93\n{n}\n{arcs}97\n0\n");
+        let (g, skipped) = drawn(&format!("{edge_hatch}{half}"), "")?;
+        assert_eq!(skipped.get(HATCH_TOO_MANY_POINTS), Some(&1), "{skipped:?}");
+        assert_eq!(g.len(), 1, "only the half circle is drawn");
+        // A page with nothing else to draw says why in its error.
+        let Err(e) = page(&dxf(&many, ""), 1.0, &BTreeSet::new()) else {
+            unreachable!("a page with nothing drawn is refused")
+        };
+        assert!(e.to_string().contains("more than 200000 points"), "{e}");
+        let Err(e) = page(&dxf("", ""), 1.0, &BTreeSet::new()) else {
+            unreachable!("an empty page is refused")
+        };
+        assert!(e.to_string().ends_with("WiringCraft can read"), "{e}");
         Ok(())
     }
 
