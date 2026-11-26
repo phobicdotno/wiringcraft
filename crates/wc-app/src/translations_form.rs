@@ -119,6 +119,16 @@ impl Form {
     /// read again first so translations changed there meanwhile are kept. Returns a line
     /// saying what was done.
     pub fn save(&self) -> Result<String, String> {
+        self.save_locked(|| {})
+    }
+
+    /// [`Form::save`], calling `locked` once the translations lock is held and before the
+    /// file is read (for a test to start another save there).
+    fn save_locked(&self, locked: impl FnOnce()) -> Result<String, String> {
+        // Held from the re-read until the save is in, like `translations set` from the command
+        // line or the assistant: a set made at the same moment waits, or is read here.
+        let _lock = wc_core::translate::lock_translations(&self.dir).map_err(|e| e.to_string())?;
+        locked();
         let mut dict = Dictionary::load(&self.dir).map_err(|e| e.to_string())?;
         if dict.source() != self.source {
             // The rows are texts in the old source language: they would be filed under the
@@ -277,6 +287,38 @@ mod tests {
             changed
         );
         assert_eq!(f.rows.iter().find(|r| r.text == "Spare").unwrap().cells[0], "Reserve");
+    }
+
+    #[test]
+    fn a_set_translation_during_a_save_waits_and_both_edits_are_kept() {
+        let (tmp, mut f) = form("source = \"en\"\n[[text]]\nen = \"Pumps\"\nnb = \"Pumper\"\n");
+        let col = f.langs.iter().position(|l| l == "nb").unwrap();
+        f.rows.iter_mut().find(|r| r.text == "Spare").unwrap().cells[col] = "Reserve".into();
+        let at = tmp.path().to_owned();
+        let mut other = None;
+        // The command line sets another text while the form holds the lock and has not read
+        // the file yet: it has to wait for the form's save, then keep the form's edit.
+        let lock = tmp.path().join(wc_core::translate::TRANSLATIONS_LOCK);
+        let saved = f.save_locked(|| {
+            // The lock is held here: another handle on the lock file cannot take it.
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(&lock)
+                .map(|f| matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+            assert!(matches!(held, Ok(true)), "the lock is not held: {held:?}");
+            let t = std::thread::spawn(move || wc_core::translate::set_translation(&at, "Pumps", "de", "Pumpen"));
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            other = Some((t.is_finished(), t));
+        });
+        assert!(saved.unwrap().starts_with("Saved 1 translation"));
+        let (finished_early, t) = other.unwrap();
+        assert!(!finished_early, "the set did not wait for the form's save");
+        assert!(t.join().unwrap().unwrap());
+        let d = wc_core::translate::Dictionary::load(tmp.path()).unwrap();
+        assert_eq!(d.lookup("Spare", "nb").as_deref(), Some("Reserve"));
+        assert_eq!(d.lookup("Pumps", "de").as_deref(), Some("Pumpen"));
+        assert_eq!(d.lookup("Pumps", "nb").as_deref(), Some("Pumper"));
     }
 
     #[test]

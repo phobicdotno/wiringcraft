@@ -201,6 +201,14 @@ enum Dialog {
         lib: prefs::FolderField,
         error: Option<String>,
     },
+    /// Attach footprint drawing / Attach 3D model without a file picker: the file typed, and
+    /// why the picker could not be used or the typed path was refused.
+    AttachPath {
+        kind: panels::Attach,
+        part: String,
+        file: prefs::FolderField,
+        error: Option<String>,
+    },
     /// Parts import: the library folder to write into, then the file.
     ImportParts {
         kind: imports::Kind,
@@ -375,6 +383,8 @@ enum Pending {
     Import(imports::Kind, Option<import_symbols::ImportTarget>),
     /// The WAGO configurator's article list to read back.
     WagoList,
+    /// The panel layout's footprint drawing or 3D model for this part.
+    Attach(panels::Attach, String),
 }
 
 /// Queue the picker `p` for the project in `dir` unless another waits: false when one does.
@@ -831,6 +841,11 @@ impl App {
         let Some(open) = self.open.as_mut() else { return };
         match p {
             Pending::Open | Pending::Import(..) => {}
+            Pending::Attach(kind, part) => match attach_target(kind, &part, &open.dir, &pick_open) {
+                Some(Ok(file)) => self.ed.message = kind.apply(open, &part, &file),
+                Some(Err(form)) => self.dialog = Some(form),
+                None => {}
+            },
             Pending::SaveAs => {
                 let parent = open
                     .dir
@@ -1897,6 +1912,7 @@ impl App {
             Dialog::ImportSymbols { .. } => "Import symbols",
             Dialog::ImportParts { .. } => "Import parts",
             Dialog::ImportPath { .. } => "Import",
+            Dialog::AttachPath { kind, .. } => kind.title(),
             Dialog::Report { .. } => "Report a problem",
             Dialog::WagoMarking { .. } => "WAGO marking",
         };
@@ -3346,6 +3362,40 @@ impl App {
                         }
                     });
                 }
+                Dialog::AttachPath {
+                    kind,
+                    part,
+                    file,
+                    error,
+                } => {
+                    let (label, extensions) = kind.filter();
+                    ui.label(format!("{} for {part}", kind.title()));
+                    ui.label(format!("File ({label}: .{}), full path:", extensions.join(", .")));
+                    let r = ui.add(egui::TextEdit::singleline(&mut file.text).desired_width(380.0));
+                    if let Some(e) = error {
+                        ui.label(RichText::new(e.as_str()).color(theme::Theme::of(ui.ctx()).error));
+                    }
+                    ui.horizontal(|ui| {
+                        let go = ui.button("Attach").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)));
+                        if go {
+                            match typed_file(file) {
+                                Ok(f) => {
+                                    let (kind, part) = (*kind, part.clone());
+                                    then = Some(Box::new(move |app: &mut App| {
+                                        if let Some(open) = app.open.as_mut() {
+                                            app.ed.message = kind.apply(open, &part, &f);
+                                        }
+                                    }));
+                                    keep = false;
+                                }
+                                Err(e) => *error = Some(e),
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                }
                 Dialog::ImportParts { kind, targets, chosen } => {
                     ui.label(kind.title());
                     ui.horizontal(|ui| {
@@ -3962,6 +4012,35 @@ fn pick_open(title: &str, dir: &Path, filter: (&str, &[&str])) -> Picked {
     let shown = std::time::Instant::now();
     let r = dialog.pick_file();
     picker_outcome(r, shown.elapsed(), &applog::take_picker_errors())
+}
+
+/// A file picker: [`pick_open`], or a stand-in for it in tests.
+type PickOpen<'a> = &'a dyn Fn(&str, &Path, (&str, &[&str])) -> Picked;
+
+/// The file to attach as `kind` to `part`, asked for with the file picker `pick` opening in
+/// `dir`: the file, or where no picker can open (or one perhaps never showed) the form to type
+/// its path in, with why; `None` when the person cancelled.
+fn attach_target(kind: panels::Attach, part: &str, dir: &Path, pick: PickOpen<'_>) -> Option<Result<PathBuf, Dialog>> {
+    match pick(kind.title(), dir, kind.filter()) {
+        Picked::Path(f) => Some(Ok(f)),
+        Picked::Failed(e) | Picked::Unsure(e) => Some(Err(Dialog::AttachPath {
+            kind,
+            part: part.to_owned(),
+            file: prefs::FolderField::default(),
+            error: Some(format!("{e} Type the file's path instead.")),
+        })),
+        Picked::Cancelled => None,
+    }
+}
+
+/// The file typed in a path form, when it is one.
+fn typed_file(field: &prefs::FolderField) -> Result<PathBuf, String> {
+    let f = field.path()?;
+    match std::fs::metadata(&f) {
+        Ok(m) if m.is_file() => Ok(f),
+        Ok(_) => Err(format!("{} is not a file.", f.display())),
+        Err(e) => Err(format!("{}: {e}", f.display())),
+    }
 }
 
 /// A save dialog: [`pick_save`], or a stand-in for it in tests.
@@ -4957,6 +5036,11 @@ impl eframe::App for App {
         }
         for a in page_actions {
             self.run(a);
+        }
+        // The picker opens on the next frame, outside the panel that asked for it.
+        if let Some((kind, part)) = self.ed.ask_attach.take() {
+            self.queue(Pending::Attach(kind, part));
+            ctx.request_repaint();
         }
         if let Some(at) = self.ed.ask_text.take() {
             self.dialog = Some(Dialog::Text(at, String::new(), false));
@@ -6039,6 +6123,70 @@ mod marking_tests {
         let msg = export_whole(&o, Export::Aml, &failed).unwrap();
         assert!(msg.contains("So it goes to the usual place"), "{msg}");
         assert!(usual.is_file());
+    }
+
+    #[test]
+    fn attaching_a_footprint_or_model_without_a_file_picker_offers_a_typed_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // The picker is asked for the kind of file each button attaches, in the project folder.
+        let seen = std::cell::RefCell::new(Vec::new());
+        let failed = |title: &str, at: &Path, filter: (&str, &[&str])| {
+            seen.borrow_mut()
+                .push((title.to_owned(), at.to_path_buf(), filter.1.to_vec().join(",")));
+            Picked::Failed("The file picker could not open.".into())
+        };
+        for kind in [panels::Attach::Footprint, panels::Attach::Model] {
+            // Without a picker the form to type the path opens, with the reason and for the part.
+            let Some(Err(Dialog::AttachPath {
+                kind: k,
+                part,
+                file,
+                error,
+            })) = attach_target(kind, "io.8", dir, &failed)
+            else {
+                unreachable!("no typed path form");
+            };
+            assert_eq!((k, part.as_str(), file.text.as_str()), (kind, "io.8", ""));
+            let error = error.unwrap_or_default();
+            assert!(
+                error.contains("could not open") && error.contains("Type the file's path"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            *seen.borrow(),
+            [
+                ("Footprint drawing".to_owned(), dir.to_path_buf(), "dxf".to_owned()),
+                ("3D model".to_owned(), dir.to_path_buf(), "step,stp,STEP,STP".to_owned()),
+            ]
+        );
+        // A picker that perhaps never showed offers the form too.
+        let unsure = |_: &str, _: &Path, _: (&str, &[&str])| Picked::Unsure("At once.".into());
+        assert!(matches!(
+            attach_target(panels::Attach::Model, "io.8", dir, &unsure),
+            Some(Err(Dialog::AttachPath { .. }))
+        ));
+        // A picked file is attached; Cancel does nothing.
+        let dxf = dir.join("io-8.dxf");
+        let picked = |_: &str, _: &Path, _: (&str, &[&str])| Picked::Path(dxf.clone());
+        assert!(matches!(
+            attach_target(panels::Attach::Footprint, "io.8", dir, &picked),
+            Some(Ok(f)) if f == dxf
+        ));
+        let cancel = |_: &str, _: &Path, _: (&str, &[&str])| Picked::Cancelled;
+        assert!(attach_target(panels::Attach::Footprint, "io.8", dir, &cancel).is_none());
+
+        // The typed path must name a file.
+        let typed = prefs::FolderField::typed(dxf.display().to_string());
+        // A missing file says why it cannot be read; a folder is not a file.
+        let missing = typed_file(&typed).unwrap_err();
+        assert!(missing.starts_with(&format!("{}: ", dxf.display())), "{missing}");
+        let folder = prefs::FolderField::typed(dir.display().to_string());
+        assert!(typed_file(&folder).unwrap_err().contains("is not a file"));
+        std::fs::write(&dxf, "0\nEOF\n").unwrap();
+        assert_eq!(typed_file(&typed), Ok(dxf.clone()));
+        assert!(typed_file(&prefs::FolderField::default()).is_err());
     }
 
     #[test]

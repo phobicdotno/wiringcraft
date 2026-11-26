@@ -674,6 +674,41 @@ enum MacroCmd {
         #[arg(long = "value", value_name = "NAME=VALUE")]
         values: Vec<String>,
     },
+    /// Show a macro: its description, placeholders (name, default, description), value sets,
+    /// the placeholders its texts use, and a problem `edit` would refuse to save.
+    Show {
+        /// The macro's name or file name.
+        name: String,
+    },
+    /// Edit a project macro's description, placeholders and value sets (a library's macros
+    /// are not edited here). The changes are made in the order of the options below, and the
+    /// macro is written only when its placeholders and value sets then check out.
+    Edit {
+        /// The macro's name or file name.
+        name: String,
+        /// The macro's new description.
+        #[arg(long)]
+        description: Option<String>,
+        /// Rename a placeholder, `old=new`: in its declaration, its values in the value sets
+        /// and its uses in the macro's texts. Repeatable.
+        #[arg(long, value_name = "OLD=NEW")]
+        rename: Vec<String>,
+        /// Declare a placeholder, or change one's default and description, as
+        /// `name[:default[:description]]`; a part left out stays as it was. Repeatable.
+        #[arg(long, value_name = "NAME[:DEFAULT[:DESCRIPTION]]")]
+        placeholder: Vec<String>,
+        /// Remove a placeholder and its values in the value sets. Its texts must no longer use
+        /// it. Repeatable.
+        #[arg(long, value_name = "NAME")]
+        remove: Vec<String>,
+        /// Give a value set a placeholder's value, `set:name=value`, adding the set if it is
+        /// not there; an empty value is stored empty, not the default. Repeatable.
+        #[arg(long, value_name = "SET:NAME=VALUE")]
+        set: Vec<String>,
+        /// Remove a value set. Repeatable.
+        #[arg(long, value_name = "SET")]
+        remove_set: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1843,6 +1878,190 @@ fn write_locations(out: &mut impl std::io::Write, locations: &[wc_core::project:
     Ok(())
 }
 
+/// A macro `macro` commands can name: from the project's own `macros` folder or a library
+/// source's. Whether it is the project's comes from where it was found, not from the source's
+/// name, which a library source may share.
+struct FoundMacro {
+    source: String,
+    id: String,
+    path: PathBuf,
+    project: bool,
+}
+
+/// The macro named `name` among `found`: a file id match first, then one by its name, both
+/// without regard to case. With no match, files that could not be read are named with why.
+fn find_macro<'a>(found: &'a [FoundMacro], name: &str) -> Res<&'a FoundMacro> {
+    let file = name.trim();
+    let file = file.strip_suffix(".json").unwrap_or(file);
+    if let Some(f) = found.iter().find(|f| f.id.eq_ignore_ascii_case(file)) {
+        return Ok(f);
+    }
+    let mut unread = Vec::new();
+    for f in found {
+        match wc_core::macros::read_macro(&f.path) {
+            Ok(m) if m.name.eq_ignore_ascii_case(name.trim()) => return Ok(f),
+            Ok(_) => {}
+            // Escaped: a folder name or a read error could hold control characters.
+            Err(err) => unread.push(format!(
+                "{}: {}",
+                escape_field(&f.path.display().to_string()),
+                escape_field(&err.to_string())
+            )),
+        }
+    }
+    if unread.is_empty() {
+        Err(format!("no macro {name:?}"))
+    } else {
+        Err(format!(
+            "no macro {name:?}; these macro files could not be read: {}",
+            unread.join("; ")
+        ))
+    }
+}
+
+/// What `macro show` prints for `m` from `source`. Each value from the file is escaped with
+/// [`escape_field`], so it stays on its line and cannot send the terminal control sequences.
+fn macro_text(m: &wc_core::macros::Macro, source: &str) -> String {
+    use std::fmt::Write as _;
+    let x = |v: &str| escape_field(v);
+    let mut out = format!("{} ({})\n", x(&m.name), x(source));
+    if !m.description.is_empty() {
+        let _ = writeln!(out, "description: {}", x(&m.description));
+    }
+    let _ = writeln!(
+        out,
+        "placeholders:{}",
+        if m.placeholders.is_empty() { " none" } else { "" }
+    );
+    for p in &m.placeholders {
+        let default = if p.default.is_empty() {
+            String::new()
+        } else {
+            format!(" = {}", x(&p.default))
+        };
+        let description = if p.description.is_empty() {
+            String::new()
+        } else {
+            format!("  ({})", x(&p.description))
+        };
+        let _ = writeln!(out, "  {}{default}{description}", x(&p.name));
+    }
+    let _ = writeln!(out, "value sets:{}", if m.value_sets.is_empty() { " none" } else { "" });
+    for v in &m.value_sets {
+        let values: Vec<String> = v.values.iter().map(|(k, val)| format!("{}={}", x(k), x(val))).collect();
+        let description = if v.description.is_empty() {
+            String::new()
+        } else {
+            format!("  ({})", x(&v.description))
+        };
+        let _ = writeln!(out, "  {}: {}{description}", x(&v.name), values.join(", "));
+    }
+    let used = m.used_placeholders();
+    let _ = writeln!(
+        out,
+        "used in texts: {}",
+        if used.is_empty() {
+            "none".to_owned()
+        } else {
+            used.iter().map(|u| x(u)).collect::<Vec<_>>().join(", ")
+        }
+    );
+    if let Err(err) = m.check() {
+        let _ = writeln!(out, "problem: {}", x(&err.to_string()));
+    }
+    out
+}
+
+/// Apply `macro edit`'s options to `m`, in the order its help gives. The caller checks and
+/// writes the result.
+fn edit_macro(
+    m: &mut wc_core::macros::Macro,
+    description: Option<String>,
+    rename: &[String],
+    placeholder: &[String],
+    remove: &[String],
+    set: &[String],
+    remove_set: &[String],
+) -> Res<()> {
+    use wc_core::macros::{Placeholder, ValueSet, key};
+    if let Some(d) = description {
+        m.description = d.trim().to_owned();
+    }
+    for r in rename {
+        let (old, new) = r
+            .split_once('=')
+            .ok_or_else(|| format!("--rename {r:?}: write it as old=new"))?;
+        m.rename_declared(old, new).map_err(e)?;
+    }
+    for p in placeholder {
+        let mut parts = p.splitn(3, ':');
+        let name = parts.next().unwrap_or_default().trim();
+        if name.is_empty() {
+            return Err(format!("--placeholder {p:?}: give a name"));
+        }
+        let (default, description) = (parts.next(), parts.next());
+        let i = match m.placeholders.iter().position(|q| key(&q.name) == key(name)) {
+            Some(i) => i,
+            None => {
+                m.placeholders.push(Placeholder {
+                    name: name.to_owned(),
+                    ..Default::default()
+                });
+                m.placeholders.len() - 1
+            }
+        };
+        if let Some(q) = m.placeholders.get_mut(i) {
+            if let Some(d) = default {
+                q.default = d.to_owned();
+            }
+            if let Some(d) = description {
+                q.description = d.trim().to_owned();
+            }
+        }
+    }
+    for name in remove {
+        let before = m.placeholders.len();
+        m.placeholders.retain(|q| key(&q.name) != key(name));
+        if m.placeholders.len() == before {
+            return Err(format!("--remove {name:?}: no such placeholder"));
+        }
+        for v in &mut m.value_sets {
+            v.values.retain(|k, _| key(k) != key(name));
+        }
+    }
+    for s in set {
+        let parsed = s
+            .split_once(':')
+            .and_then(|(set, value)| value.split_once('=').map(|(k, v)| (set.trim(), k.trim(), v)));
+        let Some((set_name, name, value)) = parsed.filter(|(set, k, _)| !set.is_empty() && !k.is_empty()) else {
+            return Err(format!("--set {s:?}: write it as set:name=value"));
+        };
+        let i = match m.value_sets.iter().position(|v| key(&v.name) == key(set_name)) {
+            Some(i) => i,
+            None => {
+                m.value_sets.push(ValueSet {
+                    name: set_name.to_owned(),
+                    ..Default::default()
+                });
+                m.value_sets.len() - 1
+            }
+        };
+        if let Some(v) = m.value_sets.get_mut(i) {
+            // The value replaces one given under the name in another case.
+            v.values.retain(|k, _| key(k) != key(name));
+            v.values.insert(name.to_owned(), value.to_owned());
+        }
+    }
+    for name in remove_set {
+        let before = m.value_sets.len();
+        m.value_sets.retain(|v| key(&v.name) != key(name));
+        if m.value_sets.len() == before {
+            return Err(format!("--remove-set {name:?}: no such value set"));
+        }
+    }
+    Ok(())
+}
+
 fn run(cli: Cli) -> Res<()> {
     let dir = cli.project.as_path();
     match cli.cmd {
@@ -2374,9 +2593,28 @@ fn run(cli: Cli) -> Res<()> {
             let before = snapshot_project(dir, &[], &[])?;
             let (symbol_path, symbol_before) = vendored_bytes(dir, ItemKind::Symbol, &symbol_id)?;
             // A link would be replaced by a plain file, and a failed save could not put it back.
-            if std::fs::symlink_metadata(&symbol_path).is_ok_and(|m| m.file_type().is_symlink()) {
+            if is_link(&symbol_path)? {
                 return Err(format!(
                     "the file of symbol {symbol_id} is a link; box-edit does not replace it (copy its target over it first)"
+                ));
+            }
+            // The same for the project's own files (pages, panels, lock, ...): both the save and
+            // the rollback would put a plain file where the link was (#614), so refuse before any
+            // write.
+            let mut linked: Vec<String> = Vec::new();
+            for (path, _) in &before {
+                if is_link(path)? {
+                    linked.push(escape_field(&path.display().to_string()));
+                }
+            }
+            if !linked.is_empty() {
+                return Err(format!(
+                    "{} a link; box-edit does not replace project files that are links (copy each target over its link first)",
+                    if linked.len() == 1 {
+                        format!("{} is", linked[0])
+                    } else {
+                        format!("{} are", linked.join(", "))
+                    }
                 ));
             }
             store::write_vendored_symbol(dir, &new).map_err(e)?;
@@ -2472,18 +2710,28 @@ fn run(cli: Cli) -> Res<()> {
         }
         Cmd::Macro(mc) => {
             let mut p = load(dir)?;
-            let mut found: Vec<(String, String, PathBuf)> = wc_core::macros::list_macros(dir)
+            let mut found: Vec<FoundMacro> = wc_core::macros::list_macros(dir)
                 .into_iter()
-                .map(|(id, path)| ("project".to_owned(), id, path))
+                .map(|(id, path)| FoundMacro {
+                    source: "project".to_owned(),
+                    id,
+                    path,
+                    project: true,
+                })
                 .collect();
             // A library that cannot be opened is reported; the project's macros stay usable.
             match wc_library::Library::open(dir, &p) {
-                Ok(lib) => found.extend(lib.macros()),
+                Ok(lib) => found.extend(lib.macros().into_iter().map(|(source, id, path)| FoundMacro {
+                    source,
+                    id,
+                    path,
+                    project: false,
+                })),
                 Err(err) => eprintln!("warning: the library's macros are not listed: {err}"),
             }
             match mc {
                 MacroCmd::List => {
-                    for (source, id, path) in &found {
+                    for FoundMacro { source, id, path, .. } in &found {
                         match wc_core::macros::read_macro(path) {
                             Ok(m) => {
                                 let sets: Vec<&str> = m.value_sets.iter().map(|v| v.name.as_str()).collect();
@@ -2499,6 +2747,32 @@ fn run(cli: Cli) -> Res<()> {
                         }
                     }
                 }
+                MacroCmd::Show { name } => {
+                    let f = find_macro(&found, &name)?;
+                    let m = wc_core::macros::read_macro(&f.path).map_err(e)?;
+                    print!("{}", macro_text(&m, &f.source));
+                }
+                MacroCmd::Edit {
+                    name,
+                    description,
+                    rename,
+                    placeholder,
+                    remove,
+                    set,
+                    remove_set,
+                } => {
+                    let f = find_macro(&found, &name)?;
+                    if !f.project {
+                        return Err(format!(
+                            "macro {name:?} belongs to the {} library; only the project's own macros are edited",
+                            f.source
+                        ));
+                    }
+                    let mut m = wc_core::macros::read_macro(&f.path).map_err(e)?;
+                    edit_macro(&mut m, description, &rename, &placeholder, &remove, &set, &remove_set)?;
+                    wc_core::macros::write_macro_file(&f.path, &m).map_err(e)?;
+                    print!("{}", macro_text(&m, &f.source));
+                }
                 MacroCmd::Place {
                     page,
                     name,
@@ -2506,21 +2780,7 @@ fn run(cli: Cli) -> Res<()> {
                     set,
                     values,
                 } => {
-                    let mut wanted = None;
-                    let file = name.trim();
-                    let file = file.strip_suffix(".json").unwrap_or(file);
-                    for (_, id, path) in &found {
-                        if id.eq_ignore_ascii_case(file) {
-                            wanted = Some(path.clone());
-                            break;
-                        }
-                        if wanted.is_none()
-                            && wc_core::macros::read_macro(path).is_ok_and(|m| m.name.eq_ignore_ascii_case(name.trim()))
-                        {
-                            wanted = Some(path.clone());
-                        }
-                    }
-                    let path = wanted.ok_or_else(|| format!("no macro {name:?}"))?;
+                    let path = find_macro(&found, &name)?.path.clone();
                     let mut typed = std::collections::BTreeMap::new();
                     for v in &values {
                         let (k, val) = v
@@ -4212,6 +4472,16 @@ fn comment_cmd(dir: &Path, cc: CommentCmd) -> Res<()> {
 /// dispatch keep large frames in debug builds, and Windows gives the main thread only 1 MiB,
 /// which overflowed there once one more import command was added (#312).
 const STACK: usize = 16 * 1024 * 1024;
+
+/// Whether `path` is a symbolic link. A missing file is not one; any other error reading its
+/// metadata is returned with the path, so a check that cannot tell refuses instead of guessing.
+fn is_link(path: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) => Ok(m.file_type().is_symlink()),
+        Err(x) if x.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(x) => Err(format!("{}: {x}", escape_field(&path.display().to_string()))),
+    }
+}
 
 fn main() -> ExitCode {
     // Parsing runs there too: clap's derived parser builds every subcommand on the stack.
@@ -8366,6 +8636,87 @@ mod tests {
             assert_eq!(std::fs::read_link(&path).unwrap(), target);
             assert_eq!(std::fs::read(&target).unwrap(), before);
         }
+    }
+
+    /// A missing file is not a link; a path whose metadata cannot be read for another reason is
+    /// an error naming it, not "not a link".
+    #[cfg(unix)]
+    #[test]
+    fn is_link_tells_missing_from_unreadable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("plain.json");
+        std::fs::write(&file, "{}").unwrap();
+        let link = tmp.path().join("link.json");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert_eq!(is_link(&file), Ok(false));
+        assert_eq!(is_link(&link), Ok(true));
+        assert_eq!(is_link(&tmp.path().join("missing.json")), Ok(false));
+        // A plain file used as a folder: not a "not found" error.
+        let err = is_link(&file.join("inside.json")).unwrap_err();
+        assert!(err.contains("inside.json"), "{err}");
+    }
+
+    /// A page file that is a link is refused before anything is written, so neither the save
+    /// nor a rollback replaces the link with a plain file (#614).
+    #[cfg(unix)]
+    #[test]
+    fn box_edit_refuses_a_linked_page_file_before_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        cli(
+            &dir,
+            &["box", "p1", "--at", "40,40", "--size", "20,10", "--pin", "1:left:5"],
+        )
+        .unwrap();
+        let page = dir.join(store::PAGES_DIR).join(format!("p1{}", store::PAGE_SUFFIX));
+        let target = tmp.path().join("p1-elsewhere.json");
+        std::fs::rename(&page, &target).unwrap();
+        std::os::unix::fs::symlink(&target, &page).unwrap();
+        let page_before = std::fs::read(&target).unwrap();
+        let symbol_before = store::read_vendored_symbol(&dir, "box.p1.s1").unwrap();
+        let lock_before = std::fs::read(dir.join(store::LOCK_FILE)).unwrap();
+
+        let err = cli(&dir, &["box-edit", "p1", "s1", "--size", "30,10"]).unwrap_err();
+        assert!(err.contains("link"), "{err}");
+        assert!(err.contains(&format!("p1{}", store::PAGE_SUFFIX)), "{err}");
+        assert!(std::fs::symlink_metadata(&page).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_link(&page).unwrap(), target);
+        assert_eq!(std::fs::read(&target).unwrap(), page_before);
+        assert_eq!(store::read_vendored_symbol(&dir, "box.p1.s1").unwrap(), symbol_before);
+        assert_eq!(std::fs::read(dir.join(store::LOCK_FILE)).unwrap(), lock_before);
+
+        // With the link replaced by its target's bytes the same edit goes through.
+        std::fs::remove_file(&page).unwrap();
+        std::fs::copy(&target, &page).unwrap();
+        cli(&dir, &["box-edit", "p1", "s1", "--size", "30,10"]).unwrap();
+        assert_ne!(store::read_vendored_symbol(&dir, "box.p1.s1").unwrap(), symbol_before);
+    }
+
+    #[test]
+    fn box_edit_refuses_to_join_a_removed_points_wire_to_a_free_wire_end_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        cli(
+            &dir,
+            &["box", "p1", "--at", "40,40", "--size", "20,10", "--pin", "IN:left:5"],
+        )
+        .unwrap();
+        cli(&dir, &["wire", "p1", "s1:IN", "0,0"]).unwrap();
+        let p = load(&dir).unwrap();
+        let pg = p.page("p1").unwrap();
+        let sym = store::read_vendored_symbol(&dir, &pg.symbols[0].symbol).unwrap();
+        let at = wc_pdf::pin_position(&pg.symbols[0], &sym, "IN").unwrap();
+        // Another wire ends freely where IN is, not joined to it.
+        cli(&dir, &["wire", "p1", &format!("{},{}", at.x, at.y), "0,90"]).unwrap();
+        let before = load(&dir).unwrap();
+        let err = cli(&dir, &["box-edit", "p1", "s1", "--clear-pins"]).unwrap_err();
+        assert!(err.contains("would be joined"), "{err}");
+        assert_eq!(load(&dir).unwrap(), before, "nothing changes");
+        assert_eq!(store::read_vendored_symbol(&dir, &sym.id).unwrap(), sym);
     }
 
     #[test]
