@@ -609,7 +609,7 @@ pub fn specs() -> Vec<Value> {
             "run_command",
             "Run a wiringcraft command-line command on the open project (unsaved changes are saved first, and the project is reloaded after). Covers everything. \
              Project and pages: new (a project folder, --template), page (add, list, remove, overview, size, cover, fields), template (show, columns, reset: frame columns and title block), logo (show, set, remove), location (list, set, remove). \
-             Drawing: place, box (a black box with connection points, --pin name:side:offset), box-edit (resize a black box, rename or move its points), wire, device (part, description), number-wires, macro (list, place), find (text in pages, --replace, --match-case). \
+             Drawing: place, box (a black box with connection points, --pin name:side:offset), box-edit (resize a black box, rename or move its points), wire, device (part, description), number-wires, macro (list, place, show, edit: a project macro's placeholders and value sets), find (text in pages, --replace, --match-case). \
              Terminals: strip (list, order, move, spare, unspare, level), jumper (add, remove, part, list). \
              Revisions: revision (list, add, edit, remove, cloud, uncloud, table). \
              Panels: panel (new, arrange, step, device, show, list, remove). PLC: rack (list, add, set, remove, card add/set/remove: PLC racks and their cards by slot). \

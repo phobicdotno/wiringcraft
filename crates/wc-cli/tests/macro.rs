@@ -1,4 +1,5 @@
-//! `wiringcraft macro`: listing macros and placing one with a chosen value set, run as a program.
+//! `wiringcraft macro`: listing, showing and editing macros and placing one with a chosen value set,
+//! run as a program.
 
 use std::path::Path;
 use std::process::Command;
@@ -222,5 +223,121 @@ fn a_retry_after_a_failed_placement_pins_every_symbol() -> TestResult {
     };
     assert!(err.contains("wc.coil"), "the file is named: {err}");
     assert_eq!(wc_core::store::load(&dir)?.pages, before, "nothing is placed");
+    Ok(())
+}
+
+#[test]
+fn a_project_macro_is_shown_and_edited_and_a_library_one_is_not() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    let lib = tmp.path().join("lib");
+    std::fs::create_dir_all(lib.join("macros"))?;
+    std::fs::write(
+        lib.join("macros/libstarter.json"),
+        STARTER.replace("Motor starter", "Lib starter"),
+    )?;
+    wiringcraft(&dir, &["lib", "add", "mine", "folder", lib.to_str().ok_or("path")?])?;
+    std::fs::create_dir_all(dir.join("macros"))?;
+    let file = dir.join("macros/starter.json");
+    std::fs::write(&file, STARTER)?;
+
+    let shown = wiringcraft(&dir, &["macro", "show", "Motor starter"])?;
+    assert!(shown.starts_with("Motor starter (project)\n"), "{shown}");
+    assert!(shown.contains("  section = 1.5 mm²\n"), "{shown}");
+    assert!(
+        shown.contains("  3 kW: kW=3, part=SIE.3RV2011-1GA10, section=2.5 mm²\n"),
+        "{shown}"
+    );
+    assert!(shown.contains("used in texts: kW, part, section\n"), "{shown}");
+    assert!(!shown.contains("problem:"), "{shown}");
+
+    // A library macro is shown but not edited.
+    assert!(wiringcraft(&dir, &["macro", "show", "libstarter"])?.starts_with("Lib starter (mine)\n"));
+    let Err(err) = wiringcraft(&dir, &["macro", "edit", "libstarter", "--description", "x"]) else {
+        return Err("a library macro was edited".into());
+    };
+    assert!(err.contains("library"), "{err}");
+
+    // An edit that leaves a used placeholder undeclared is refused and nothing is written.
+    let before = std::fs::read_to_string(&file)?;
+    let Err(err) = wiringcraft(&dir, &["macro", "edit", "starter", "--remove", "part"]) else {
+        return Err("removed a placeholder still in use".into());
+    };
+    assert!(err.contains("{{part}} is used"), "{err}");
+    let Err(err) = wiringcraft(&dir, &["macro", "edit", "starter", "--set", "3 kW:volts=400"]) else {
+        return Err("filled an undeclared placeholder".into());
+    };
+    assert!(err.contains("volts"), "{err}");
+    assert_eq!(std::fs::read_to_string(&file)?, before, "nothing is written");
+
+    let shown = wiringcraft(
+        &dir,
+        &[
+            "macro",
+            "edit",
+            "starter",
+            "--description",
+            "Direct on line",
+            "--rename",
+            "kW=power",
+            "--placeholder",
+            "power::Motor power",
+            "--placeholder",
+            "voltage:400 V",
+            "--set",
+            "5.5 kW:power=5.5",
+            "--set",
+            "5.5 kW:part=SIE.3RV2021-4AA10",
+            "--set",
+            "3 kW:voltage=",
+            "--remove-set",
+            "0.75 kW",
+        ],
+    )?;
+    assert!(shown.contains("description: Direct on line\n"), "{shown}");
+    let m: wc_core::macros::Macro = serde_json::from_str(&std::fs::read_to_string(&file)?)?;
+    assert_eq!(m.description, "Direct on line");
+    assert_eq!(m.used_placeholders(), ["power", "part", "section"]);
+    assert_eq!(
+        m.devices.values().next().map(|d| d.description.as_str()),
+        Some("Starter {{power}} kW")
+    );
+    let names: Vec<(&str, &str, &str)> = m
+        .placeholders
+        .iter()
+        .map(|p| (p.name.as_str(), p.default.as_str(), p.description.as_str()))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            ("power", "", "Motor power"),
+            ("part", "", ""),
+            ("section", "1.5 mm²", ""),
+            ("voltage", "400 V", "")
+        ]
+    );
+    let sets: Vec<&str> = m.value_sets.iter().map(|v| v.name.as_str()).collect();
+    assert_eq!(sets, ["3 kW", "5.5 kW"]);
+    let three = m.value_set("3 kW").ok_or("3 kW")?;
+    assert_eq!(three.values.get("power").map(String::as_str), Some("3"));
+    assert_eq!(
+        three.values.get("voltage").map(String::as_str),
+        Some(""),
+        "stored empty"
+    );
+    let big = m.value_set("5.5 kW").ok_or("5.5 kW")?;
+    assert_eq!(big.values.len(), 2);
+
+    // A placeholder no text uses can be removed, with its values.
+    wiringcraft(&dir, &["macro", "edit", "starter", "--remove", "voltage"])?;
+    let m: wc_core::macros::Macro = serde_json::from_str(&std::fs::read_to_string(&file)?)?;
+    assert!(m.placeholders.iter().all(|p| p.name != "voltage"));
+    assert!(m.value_sets.iter().all(|v| !v.values.contains_key("voltage")));
     Ok(())
 }

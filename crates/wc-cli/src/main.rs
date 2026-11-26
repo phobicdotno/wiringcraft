@@ -577,6 +577,41 @@ enum MacroCmd {
         #[arg(long = "value", value_name = "NAME=VALUE")]
         values: Vec<String>,
     },
+    /// Show a macro: its description, placeholders (name, default, description), value sets,
+    /// the placeholders its texts use, and a problem `edit` would refuse to save.
+    Show {
+        /// The macro's name or file name.
+        name: String,
+    },
+    /// Edit a project macro's description, placeholders and value sets (a library's macros
+    /// are not edited here). The changes are made in the order of the options below, and the
+    /// macro is written only when its placeholders and value sets then check out.
+    Edit {
+        /// The macro's name or file name.
+        name: String,
+        /// The macro's new description.
+        #[arg(long)]
+        description: Option<String>,
+        /// Rename a placeholder, `old=new`: in its declaration, its values in the value sets
+        /// and its uses in the macro's texts. Repeatable.
+        #[arg(long, value_name = "OLD=NEW")]
+        rename: Vec<String>,
+        /// Declare a placeholder, or change one's default and description, as
+        /// `name[:default[:description]]`; a part left out stays as it was. Repeatable.
+        #[arg(long, value_name = "NAME[:DEFAULT[:DESCRIPTION]]")]
+        placeholder: Vec<String>,
+        /// Remove a placeholder and its values in the value sets. Its texts must no longer use
+        /// it. Repeatable.
+        #[arg(long, value_name = "NAME")]
+        remove: Vec<String>,
+        /// Give a value set a placeholder's value, `set:name=value`, adding the set if it is
+        /// not there; an empty value is stored empty, not the default. Repeatable.
+        #[arg(long, value_name = "SET:NAME=VALUE")]
+        set: Vec<String>,
+        /// Remove a value set. Repeatable.
+        #[arg(long, value_name = "SET")]
+        remove_set: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1808,6 +1843,162 @@ fn write_locations(out: &mut impl std::io::Write, locations: &[wc_core::project:
     Ok(())
 }
 
+/// The macro named `name` among `found` (source, file id, path): a file id match first, then
+/// one by its name, both without regard to case. Returns its source and path.
+fn find_macro(found: &[(String, String, PathBuf)], name: &str) -> Res<(String, PathBuf)> {
+    let file = name.trim();
+    let file = file.strip_suffix(".json").unwrap_or(file);
+    if let Some((source, _, path)) = found.iter().find(|(_, id, _)| id.eq_ignore_ascii_case(file)) {
+        return Ok((source.clone(), path.clone()));
+    }
+    found
+        .iter()
+        .find(|(_, _, path)| wc_core::macros::read_macro(path).is_ok_and(|m| m.name.eq_ignore_ascii_case(name.trim())))
+        .map(|(source, _, path)| (source.clone(), path.clone()))
+        .ok_or_else(|| format!("no macro {name:?}"))
+}
+
+/// What `macro show` prints for `m` from `source`.
+fn macro_text(m: &wc_core::macros::Macro, source: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = format!("{} ({source})\n", m.name);
+    if !m.description.is_empty() {
+        let _ = writeln!(out, "description: {}", m.description);
+    }
+    let _ = writeln!(
+        out,
+        "placeholders:{}",
+        if m.placeholders.is_empty() { " none" } else { "" }
+    );
+    for p in &m.placeholders {
+        let default = if p.default.is_empty() {
+            String::new()
+        } else {
+            format!(" = {}", p.default)
+        };
+        let description = if p.description.is_empty() {
+            String::new()
+        } else {
+            format!("  ({})", p.description)
+        };
+        let _ = writeln!(out, "  {}{default}{description}", p.name);
+    }
+    let _ = writeln!(out, "value sets:{}", if m.value_sets.is_empty() { " none" } else { "" });
+    for v in &m.value_sets {
+        let values: Vec<String> = v.values.iter().map(|(k, val)| format!("{k}={val}")).collect();
+        let description = if v.description.is_empty() {
+            String::new()
+        } else {
+            format!("  ({})", v.description)
+        };
+        let _ = writeln!(out, "  {}: {}{description}", v.name, values.join(", "));
+    }
+    let used = m.used_placeholders();
+    let _ = writeln!(
+        out,
+        "used in texts: {}",
+        if used.is_empty() {
+            "none".to_owned()
+        } else {
+            used.join(", ")
+        }
+    );
+    if let Err(err) = m.check() {
+        let _ = writeln!(out, "problem: {err}");
+    }
+    out
+}
+
+/// Apply `macro edit`'s options to `m`, in the order its help gives. The caller checks and
+/// writes the result.
+fn edit_macro(
+    m: &mut wc_core::macros::Macro,
+    description: Option<String>,
+    rename: &[String],
+    placeholder: &[String],
+    remove: &[String],
+    set: &[String],
+    remove_set: &[String],
+) -> Res<()> {
+    use wc_core::macros::{Placeholder, ValueSet, key};
+    if let Some(d) = description {
+        m.description = d.trim().to_owned();
+    }
+    for r in rename {
+        let (old, new) = r
+            .split_once('=')
+            .ok_or_else(|| format!("--rename {r:?}: write it as old=new"))?;
+        m.rename_declared(old, new).map_err(e)?;
+    }
+    for p in placeholder {
+        let mut parts = p.splitn(3, ':');
+        let name = parts.next().unwrap_or_default().trim();
+        if name.is_empty() {
+            return Err(format!("--placeholder {p:?}: give a name"));
+        }
+        let (default, description) = (parts.next(), parts.next());
+        let i = match m.placeholders.iter().position(|q| key(&q.name) == key(name)) {
+            Some(i) => i,
+            None => {
+                m.placeholders.push(Placeholder {
+                    name: name.to_owned(),
+                    ..Default::default()
+                });
+                m.placeholders.len() - 1
+            }
+        };
+        if let Some(q) = m.placeholders.get_mut(i) {
+            if let Some(d) = default {
+                q.default = d.to_owned();
+            }
+            if let Some(d) = description {
+                q.description = d.trim().to_owned();
+            }
+        }
+    }
+    for name in remove {
+        let before = m.placeholders.len();
+        m.placeholders.retain(|q| key(&q.name) != key(name));
+        if m.placeholders.len() == before {
+            return Err(format!("--remove {name:?}: no such placeholder"));
+        }
+        for v in &mut m.value_sets {
+            v.values.retain(|k, _| key(k) != key(name));
+        }
+    }
+    for s in set {
+        let parsed = s
+            .split_once(':')
+            .and_then(|(set, value)| value.split_once('=').map(|(k, v)| (set.trim(), k.trim(), v)));
+        let Some((set_name, name, value)) = parsed.filter(|(set, k, _)| !set.is_empty() && !k.is_empty()) else {
+            return Err(format!("--set {s:?}: write it as set:name=value"));
+        };
+        let i = match m.value_sets.iter().position(|v| key(&v.name) == key(set_name)) {
+            Some(i) => i,
+            None => {
+                m.value_sets.push(ValueSet {
+                    name: set_name.to_owned(),
+                    ..Default::default()
+                });
+                m.value_sets.len() - 1
+            }
+        };
+        if let Some(v) = m.value_sets.get_mut(i) {
+            // The value replaces one given under the name in another case.
+            v.values.retain(|k, _| key(k) != key(name));
+            v.values.insert(name.to_owned(), value.to_owned());
+        }
+    }
+    for name in remove_set {
+        let before = m.value_sets.len();
+        m.value_sets.retain(|v| key(&v.name) != key(name));
+        if m.value_sets.len() == before {
+            return Err(format!("--remove-set {name:?}: no such value set"));
+        }
+    }
+    Ok(())
+}
+
 fn page_mut<'a>(p: &'a mut Project, id: &str) -> Res<&'a mut Page> {
     p.page_mut(id).ok_or_else(|| format!("no page {id:?}"))
 }
@@ -2510,6 +2701,31 @@ fn run(cli: Cli) -> Res<()> {
                         }
                     }
                 }
+                MacroCmd::Show { name } => {
+                    let (source, path) = find_macro(&found, &name)?;
+                    let m = wc_core::macros::read_macro(&path).map_err(e)?;
+                    print!("{}", macro_text(&m, &source));
+                }
+                MacroCmd::Edit {
+                    name,
+                    description,
+                    rename,
+                    placeholder,
+                    remove,
+                    set,
+                    remove_set,
+                } => {
+                    let (source, path) = find_macro(&found, &name)?;
+                    if source != "project" {
+                        return Err(format!(
+                            "macro {name:?} belongs to the {source} library; only the project's own macros are edited"
+                        ));
+                    }
+                    let mut m = wc_core::macros::read_macro(&path).map_err(e)?;
+                    edit_macro(&mut m, description, &rename, &placeholder, &remove, &set, &remove_set)?;
+                    wc_core::macros::write_macro_file(&path, &m).map_err(e)?;
+                    print!("{}", macro_text(&m, &source));
+                }
                 MacroCmd::Place {
                     page,
                     name,
@@ -2517,21 +2733,7 @@ fn run(cli: Cli) -> Res<()> {
                     set,
                     values,
                 } => {
-                    let mut wanted = None;
-                    let file = name.trim();
-                    let file = file.strip_suffix(".json").unwrap_or(file);
-                    for (_, id, path) in &found {
-                        if id.eq_ignore_ascii_case(file) {
-                            wanted = Some(path.clone());
-                            break;
-                        }
-                        if wanted.is_none()
-                            && wc_core::macros::read_macro(path).is_ok_and(|m| m.name.eq_ignore_ascii_case(name.trim()))
-                        {
-                            wanted = Some(path.clone());
-                        }
-                    }
-                    let path = wanted.ok_or_else(|| format!("no macro {name:?}"))?;
+                    let (_, path) = find_macro(&found, &name)?;
                     let mut typed = std::collections::BTreeMap::new();
                     for v in &values {
                         let (k, val) = v

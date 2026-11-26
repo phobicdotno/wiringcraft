@@ -272,6 +272,39 @@ impl Macro {
         });
     }
 
+    /// Rename declared placeholder `old` to `new` (names matched without regard to case): its
+    /// declaration, its values in the value sets and its uses in the texts.
+    pub fn rename_declared(&mut self, old: &str, new: &str) -> Result<()> {
+        let bad = |why: String| Err(Error::Invalid(format!("macro {}: {why}", self.name)));
+        let new = new.trim();
+        if new.is_empty() {
+            return bad(format!("placeholder {} needs a new name", old.trim()));
+        }
+        let Some(i) = self.placeholders.iter().position(|p| key(&p.name) == key(old)) else {
+            return bad(format!("no placeholder {}", old.trim()));
+        };
+        if self
+            .placeholders
+            .iter()
+            .enumerate()
+            .any(|(j, p)| j != i && key(&p.name) == key(new))
+        {
+            return bad(format!("placeholder {new} is there already"));
+        }
+        if let Some(p) = self.placeholders.get_mut(i) {
+            p.name = new.to_owned();
+        }
+        for v in &mut self.value_sets {
+            if let Some(k) = v.values.keys().find(|k| key(k) == key(old)).cloned()
+                && let Some(value) = v.values.remove(&k)
+            {
+                v.values.insert(new.to_owned(), value);
+            }
+        }
+        self.rename_placeholder(old, new);
+        Ok(())
+    }
+
     fn for_each_text(&self, mut f: impl FnMut(&str)) {
         let mut copy = self.clone();
         copy.for_each_text_mut(|t| f(t));
@@ -425,6 +458,20 @@ pub fn write_macro(root: &Path, id: &str, m: &Macro) -> Result<PathBuf> {
     let path = root.join(MACROS_DIR).join(format!("{id}.json"));
     write_if_changed(&path, &to_json(m)?)?;
     Ok(path)
+}
+
+/// Check `m` with [`Macro::check`] and write it to `path`, a macro file in a `macros` folder.
+/// Returns the path.
+pub fn write_macro_file(path: &Path, m: &Macro) -> Result<PathBuf> {
+    m.check()?;
+    let not_macro = || Error::Invalid(format!("{} is not a macro file in a macros folder", path.display()));
+    let id = path.file_stem().and_then(|s| s.to_str()).ok_or_else(not_macro)?;
+    let root = path
+        .parent()
+        .filter(|d| d.file_name().is_some_and(|n| n == MACROS_DIR))
+        .and_then(Path::parent)
+        .ok_or_else(not_macro)?;
+    write_macro(root, id, m)
 }
 
 pub fn read_macro(path: &Path) -> Result<Macro> {
@@ -716,6 +763,29 @@ mod tests {
         let mut p = Project::new("x");
         p.pages.push(crate::project::Page::new("p1", "1", "Motors"));
         assert!(place(&mut p, "p1", &starter()?, Point::new(0.0, 0.0)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_declared_placeholder_is_renamed_everywhere_and_written_checked() -> Result<()> {
+        let mut m = starter()?;
+        m.rename_declared("kw", "power")?;
+        assert_eq!(m.placeholders[0].name, "power");
+        assert_eq!(m.used_placeholders(), ["power", "part", "current", "section"]);
+        assert!(m.value_sets.iter().all(|v| v.values.contains_key("power")));
+        assert!(m.value_sets.iter().all(|v| !v.values.keys().any(|k| key(k) == "kw")));
+        m.check()?;
+        assert!(err_of(m.rename_declared("power", "Part")).contains("there already"));
+        assert!(err_of(m.rename_declared("volts", "v")).contains("no placeholder volts"));
+
+        let tmp = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
+        let path = write_macro(tmp.path(), "starter", &m)?;
+        assert_eq!(write_macro_file(&path, &m)?, path);
+        let mut broken = m.clone();
+        broken.placeholders.remove(0);
+        assert!(err_of(write_macro_file(&path, &broken)).contains("{{power}} is used"));
+        assert_eq!(read_macro(&path)?, m, "an unchecked macro is not written");
+        assert!(write_macro_file(&tmp.path().join("starter.json"), &m).is_err());
         Ok(())
     }
 
