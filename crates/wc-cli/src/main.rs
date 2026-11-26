@@ -14,7 +14,9 @@ type Res<T> = Result<T, String>;
 #[derive(Parser)]
 #[command(name = "wiringcraft", version, about = "Electrical schematic and wiring design")]
 struct Cli {
-    /// Project folder.
+    /// Project folder. After a subcommand that takes a device tag, write it as `-C <dir>` or
+    /// `--project <dir>`: an attached `-C<dir>` there is read as a tag, since tags such as
+    /// `-C1` start with a dash too.
     #[arg(short = 'C', long = "project", global = true, default_value = ".")]
     project: PathBuf,
     #[command(subcommand)]
@@ -104,9 +106,9 @@ enum Cmd {
         number: Option<String>,
         #[arg(long)]
         potential: Option<String>,
-        /// The cable this wire is a core of, e.g. `=PUMP-W1` (use `--cable=-W1` for a tag that
-        /// starts with `-`).
-        #[arg(long)]
+        /// The cable this wire is a core of, e.g. `=PUMP-W1` or `-W1` (taken as a value, though
+        /// it starts with `-`).
+        #[arg(long, allow_hyphen_values = true)]
         cable: Option<String>,
         /// The core's name in the cable, e.g. `1` or `BN`.
         #[arg(long)]
@@ -148,6 +150,8 @@ enum Cmd {
     Template(TemplateCmd),
     /// Set a device's part and description.
     Device {
+        /// Device tag, e.g. `-K1` (taken as a value, though it starts with `-`).
+        #[arg(allow_hyphen_values = true)]
         tag: String,
         #[arg(long)]
         part: Option<String>,
@@ -507,20 +511,26 @@ enum TemplateCmd {
 
 #[derive(Subcommand)]
 enum JumperCmd {
-    /// Jumper terminals of a strip, e.g. `jumper add -- -X1 3 4 5`. A jumper that shares a
+    /// Jumper terminals of a strip, e.g. `jumper add -X1 3 4 5`. A jumper that shares a
     /// terminal with them becomes one with them.
     Add {
-        /// The strip, e.g. `-X1` (after `--`, as it starts with `-`).
+        /// The strip, e.g. `-X1` (taken as a value, though it starts with `-`).
+        #[arg(allow_hyphen_values = true)]
         strip: String,
         /// Terminal numbers, at least two.
         terminals: Vec<String>,
     },
-    /// Take terminals out of their jumper, e.g. `jumper remove -- -X1 4`.
-    Remove { strip: String, terminals: Vec<String> },
+    /// Take terminals out of their jumper, e.g. `jumper remove -X1 4`.
+    Remove {
+        #[arg(allow_hyphen_values = true)]
+        strip: String,
+        terminals: Vec<String>,
+    },
     /// Give the jumper holding a terminal a part (article), e.g.
-    /// `jumper part -- -X1 3 wago.2002-402`; leave the part out to clear it. A part the project
+    /// `jumper part -X1 3 wago.2002-402`; leave the part out to clear it. A part the project
     /// does not have yet is taken from its libraries.
     Part {
+        #[arg(allow_hyphen_values = true)]
         strip: String,
         terminal: String,
         part: Option<String>,
@@ -532,16 +542,29 @@ enum JumperCmd {
 #[derive(Subcommand)]
 enum StripCmd {
     /// List terminal strips with their terminals in rail order; spares are marked `(spare)`.
-    /// Give a strip to list only that one, e.g. `strip list -- -X1`.
-    List { strip: Option<String> },
-    /// Put a strip's terminals in this rail order, e.g. `strip order -- -X1 3 1 2`. Terminals
+    /// Give a strip to list only that one, e.g. `strip list -X1`.
+    List {
+        #[arg(allow_hyphen_values = true)]
+        strip: Option<String>,
+    },
+    /// Put a strip's terminals in this rail order, e.g. `strip order -X1 3 1 2`. Terminals
     /// left out follow at the end; no terminals goes back to the order by number.
-    Order { strip: String, terminals: Vec<String> },
-    /// Move a terminal to a place on the rail (1 is first), e.g. `strip move -- -X1 3 1`.
-    Move { strip: String, terminal: String, to: usize },
-    /// Add a spare terminal (on the rail, not drawn), e.g. `strip spare --after 2 -- -X1 S1`;
+    Order {
+        #[arg(allow_hyphen_values = true)]
+        strip: String,
+        terminals: Vec<String>,
+    },
+    /// Move a terminal to a place on the rail (1 is first), e.g. `strip move -X1 3 1`.
+    Move {
+        #[arg(allow_hyphen_values = true)]
+        strip: String,
+        terminal: String,
+        to: usize,
+    },
+    /// Add a spare terminal (on the rail, not drawn), e.g. `strip spare -X1 S1 --after 2`;
     /// without `--after` it goes at the end.
     Spare {
+        #[arg(allow_hyphen_values = true)]
         strip: String,
         terminal: String,
         /// The terminal it goes right after.
@@ -549,13 +572,18 @@ enum StripCmd {
         after: Option<String>,
     },
     /// Take a spare terminal off the strip (and out of its jumper), e.g.
-    /// `strip unspare -- -X1 S1`.
-    Unspare { strip: String, terminal: String },
+    /// `strip unspare -X1 S1`.
+    Unspare {
+        #[arg(allow_hyphen_values = true)]
+        strip: String,
+        terminal: String,
+    },
     /// Set a terminal's level on a multi-level terminal (1 is the bottom), e.g.
-    /// `strip level -- -X1 4 2`; leave the level out to clear the terminal's own `Level`
+    /// `strip level -X1 4 2`; leave the level out to clear the terminal's own `Level`
     /// property. Levels are inferred in number order, not rail order: a terminal whose next
     /// number up has level 2 or more is still level 1.
     Level {
+        #[arg(allow_hyphen_values = true)]
         strip: String,
         terminal: String,
         level: Option<u32>,
@@ -6597,6 +6625,159 @@ mod tests {
         let err = cli(&dir, &["jumper", "remove", "--", "-X1", "9"]).unwrap_err();
         assert!(err.contains("no jumper of -X1 has terminal 9"), "{err}");
         assert!(cli(&dir, &["jumper", "add", "--", "-X1", "1.2", "3.4"]).is_err());
+    }
+
+    #[test]
+    fn the_project_option_is_kept_apart_from_dash_tags() {
+        let parsed = |args: &[&str]| -> (PathBuf, Option<String>) {
+            let Ok(c) = Cli::try_parse_from(args) else {
+                unreachable!("{args:?}")
+            };
+            let Cmd::Strip(StripCmd::List { strip }) = c.cmd else {
+                unreachable!()
+            };
+            (c.project, strip)
+        };
+        let other = || PathBuf::from("other");
+        let x1 = Some("-X1".to_string());
+        // Separated, long or before the subcommand: the project, the tag stays a tag.
+        assert_eq!(
+            parsed(&["wiringcraft", "strip", "list", "-C", "other", "-X1"]),
+            (other(), x1.clone())
+        );
+        assert_eq!(
+            parsed(&["wiringcraft", "strip", "list", "-X1", "-C", "other"]),
+            (other(), x1.clone())
+        );
+        assert_eq!(
+            parsed(&["wiringcraft", "strip", "list", "--project", "other", "-X1"]),
+            (other(), x1.clone())
+        );
+        assert_eq!(
+            parsed(&["wiringcraft", "strip", "list", "--project=other", "-X1"]),
+            (other(), x1.clone())
+        );
+        assert_eq!(
+            parsed(&["wiringcraft", "-Cother", "strip", "list", "-X1"]),
+            (other(), x1.clone())
+        );
+        assert_eq!(parsed(&["wiringcraft", "-Cother", "strip", "list"]), (other(), None));
+        // Attached after the subcommand it is a tag: `-C1` is a capacitor strip as much as a path.
+        assert_eq!(
+            parsed(&["wiringcraft", "strip", "list", "-C1"]),
+            (PathBuf::from("."), Some("-C1".into()))
+        );
+        let Ok(c) = Cli::try_parse_from(["wiringcraft", "device", "-C", "other", "-C1"]) else {
+            unreachable!()
+        };
+        let Cmd::Device { tag, .. } = c.cmd else { unreachable!() };
+        assert_eq!((c.project, tag.as_str()), (other(), "-C1"));
+    }
+
+    #[test]
+    fn cable_device_and_strip_tags_may_start_with_a_dash_without_a_double_dash() {
+        let Ok(tmp) = tempfile::tempdir() else { unreachable!() };
+        let dir = tmp.path().join("p");
+        let Some(path) = dir.to_str() else { unreachable!() };
+        let Ok(cmd) = Cli::try_parse_from(["wiringcraft", "new", path, "--no-git"]) else {
+            unreachable!()
+        };
+        assert!(run(cmd).is_ok());
+        assert!(cli(&dir, &["page", "add", "p1", "--number", "1"]).is_ok());
+        let tag = |t: &str| DeviceTag::parse(t).ok();
+
+        // A cable tag right after `--cable`, before or after other options.
+        let wired = cli(&dir, &["wire", "p1", "1,2", "30,2", "--cable", "-W2", "--core", "1"]);
+        assert!(wired.is_ok(), "{wired:?}");
+        let wired = cli(&dir, &["wire", "p1", "1,5", "30,5", "--core", "2", "--cable", "-W2"]);
+        assert!(wired.is_ok(), "{wired:?}");
+        let Ok(p) = load(&dir) else { unreachable!() };
+        let Some(pg) = p.pages.iter().find(|pg| pg.id == "p1") else {
+            unreachable!()
+        };
+        let cores: Vec<_> = pg
+            .wires
+            .iter()
+            .filter_map(|w| w.cable.as_ref())
+            .map(|c| (Some(c.cable.clone()), c.core.clone()))
+            .collect();
+        assert_eq!(cores, [(tag("-W2"), "1".to_string()), (tag("-W2"), "2".to_string())]);
+
+        // A device tag as typed, with its options on either side; the options stay options.
+        assert!(cli(&dir, &["device", "-K1", "--description", "one"]).is_ok());
+        assert!(cli(&dir, &["device", "--description", "two", "-K2"]).is_ok());
+        assert!(cli(&dir, &["device", "--description", "three"]).is_err(), "no tag");
+        let Ok(p) = load(&dir) else { unreachable!() };
+        let described = |t: &str| tag(t).and_then(|t| p.devices.get(&t)).map(|d| d.description.clone());
+        assert_eq!(described("-K1").as_deref(), Some("one"));
+        assert_eq!(described("-K2").as_deref(), Some("two"));
+
+        // A strip tag in the strip and jumper commands; `--after` stays an option.
+        assert!(cli(&dir, &["strip", "spare", "-X1", "S1"]).is_ok());
+        assert!(cli(&dir, &["strip", "spare", "-X1", "S3", "--after", "S1"]).is_ok());
+        assert!(cli(&dir, &["strip", "spare", "--after", "S1", "-X1", "S2"]).is_ok());
+        assert!(cli(&dir, &["strip", "move", "-X1", "S3", "1"]).is_ok());
+        assert!(cli(&dir, &["strip", "list", "-X1"]).is_ok());
+        let Ok(p) = load(&dir) else { unreachable!() };
+        let (symbols, _) = store::vendored_symbols(&dir, &p);
+        let strips = wc_core::project::strip_terminals(&p, |id| symbols.get(id).map(|s| s.role));
+        let Some(x1) = tag("-X1") else { unreachable!() };
+        let rail: Vec<_> = strips.get(&x1).into_iter().flatten().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(rail, ["S3", "S1", "S2"]);
+        let rail = || -> Vec<String> {
+            let Ok(p) = load(&dir) else { unreachable!() };
+            let (symbols, _) = store::vendored_symbols(&dir, &p);
+            let mut strips = wc_core::project::strip_terminals(&p, |id| symbols.get(id).map(|s| s.role));
+            strips
+                .remove(&x1)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(t, _)| t)
+                .collect()
+        };
+        assert!(cli(&dir, &["strip", "order", "-X1", "S2", "S1", "S3"]).is_ok());
+        assert_eq!(rail(), ["S2", "S1", "S3"]);
+        assert!(cli(&dir, &["strip", "unspare", "-X1", "S3"]).is_ok());
+        assert_eq!(rail(), ["S2", "S1"]);
+        assert!(cli(&dir, &["strip", "level", "-X1", "S1", "2"]).is_ok());
+        let level = || {
+            let Ok(p) = load(&dir) else { unreachable!() };
+            tag("-X1.S1")
+                .and_then(|t| p.devices.get(&t))
+                .and_then(|d| d.properties.get(wc_report::LEVEL_PROPERTY).cloned())
+        };
+        assert_eq!(level().as_deref(), Some("2"));
+        assert!(cli(&dir, &["strip", "level", "-X1", "S1"]).is_ok());
+        assert_eq!(level(), None);
+
+        // Jumpers: a jumper left with one terminal is dropped, so this one keeps two.
+        assert!(cli(&dir, &["jumper", "add", "-X1", "S1", "S2", "S4"]).is_ok());
+        assert!(cli(&dir, &["jumper", "remove", "-X1", "S2"]).is_ok());
+        let Ok(p) = load(&dir) else { unreachable!() };
+        let Some(j) = p.meta.jumpers.first() else {
+            unreachable!()
+        };
+        let kept = ["S1", "S4"].map(String::from);
+        assert_eq!((&j.strip, j.terminals.as_slice()), (&x1, kept.as_slice()));
+        let Ok(mut p) = load(&dir) else { unreachable!() };
+        p.meta.libraries.push(LibrarySource {
+            name: "starter".into(),
+            kind: "folder".into(),
+            location: Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../library")
+                .to_string_lossy()
+                .into_owned(),
+            reference: None,
+        });
+        assert!(save(&dir, &p).is_ok());
+        let parted = cli(&dir, &["jumper", "part", "-X1", "S4", "example.ex-tb-2-5"]);
+        assert!(parted.is_ok(), "{parted:?}");
+        let Ok(p) = load(&dir) else { unreachable!() };
+        let part = p.meta.jumpers.first().and_then(|j| j.part.as_deref());
+        assert_eq!(part, Some("example.ex-tb-2-5"));
+        assert!(cli(&dir, &["jumper", "part", "-X1", "S1"]).is_ok());
+        let Ok(p) = load(&dir) else { unreachable!() };
+        assert_eq!(p.meta.jumpers.first().and_then(|j| j.part.clone()), None);
     }
 
     #[test]
