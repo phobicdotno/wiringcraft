@@ -66,8 +66,9 @@ pub fn number_wires(
             let Some(&n) = wire_net.get(&(page.id.clone(), w.id.clone())) else {
                 continue;
             };
-            if let Some(num) = w.number.as_ref().filter(|s| !s.trim().is_empty()) {
-                existing.entry(n).or_insert_with(|| num.clone());
+            // Kept trimmed, so `" 5"` and a new `"5"` cannot both exist.
+            if let Some(num) = w.number.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                existing.entry(n).or_insert_with(|| num.to_string());
             }
             let mut pts: Vec<Point> = w.via.clone();
             pts.extend([&w.from, &w.to].into_iter().filter_map(|e| position(page, e)));
@@ -244,6 +245,15 @@ mod tests {
         // a/b keep 1 (now on both wires); the others skip it.
         assert_eq!(numbers(&p), [Some("1"), Some("1"), Some("2"), None, Some("3")]);
         number_wires(&mut p, Rule::Sequential, true, |_| None, pos);
+        assert_eq!(numbers(&p), [Some("3"), Some("3"), Some("1"), None, Some("2")]);
+    }
+
+    #[test]
+    fn kept_numbers_are_trimmed_so_they_are_not_given_twice() {
+        let mut p = project();
+        p.pages[0].wires[2].number = Some(" 1 ".into());
+        number_wires(&mut p, Rule::Sequential, false, |_| None, pos);
+        // c keeps 1 without the spaces; the others get 2 and 3, not 1 again.
         assert_eq!(numbers(&p), [Some("3"), Some("3"), Some("1"), None, Some("2")]);
     }
 
