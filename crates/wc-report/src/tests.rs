@@ -3055,6 +3055,83 @@ fn check_names_a_connection_with_two_wire_numbers_and_a_number_on_two_connection
 }
 
 #[test]
+fn wire_numbers_tell_apart_same_id_wires_of_separate_connections() {
+    let (mut p, s, parts) = fixture();
+    let found = |p: &Project| {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        check(&i)
+            .into_iter()
+            .filter(|f| f.message.contains("wire number"))
+            .map(|f| (f.item.unwrap_or_default(), f.message))
+            .collect::<Vec<_>>()
+    };
+    // Wire ids need not be unique on a page (a replaced page can repeat them): w3 takes w2's id
+    // and stays a separate connection.
+    p.pages[0].wires[2].id = "w2".into();
+    assert!(found(&p).is_empty(), "two connections with numbers 2 and 3");
+    // The same number on both is a number on two connections.
+    p.pages[0].wires[2].number = Some("2".into());
+    assert_eq!(
+        found(&p),
+        [("w2".to_owned(), "wire number 2 is on 2 connections".to_owned())]
+    );
+}
+
+#[test]
+fn wire_numbers_ignore_overview_wiring_that_joins_connections() {
+    let (mut p, s, parts) = fixture();
+    let found = |p: &Project| {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        check(&i)
+            .into_iter()
+            .filter(|f| f.message.contains("wire number"))
+            .map(|f| (f.item.unwrap_or_default(), f.message))
+            .collect::<Vec<_>>()
+    };
+    // w1 (24V, numbered 1) and w4 (0V) are two connections; w4 takes number 1 too.
+    p.pages[0].wires[3].number = Some("1".into());
+    let expected = [("w4".to_owned(), "wire number 1 is on 2 connections".to_owned())];
+    assert_eq!(found(&p), expected);
+    // An overview page whose wiring joins the 24V and 0V potentials into one net.
+    let mut overview = Page::new("ov", "1", "Overview");
+    overview.overview = true;
+    let mid = Point::new(20.0, 20.0);
+    overview.wires = vec![
+        wire(
+            "o1",
+            Endpoint::Point {
+                at: Point::new(10.0, 20.0),
+            },
+            Endpoint::Point { at: mid },
+            None,
+            Some("24V"),
+        ),
+        wire(
+            "o2",
+            Endpoint::Point { at: mid },
+            Endpoint::Point {
+                at: Point::new(30.0, 20.0),
+            },
+            None,
+            Some("0V"),
+        ),
+    ];
+    p.pages.insert(0, overview);
+    assert_eq!(found(&p), expected);
+    // With w4 numbered 4 the two connections do not become one with numbers 1 and 4.
+    p.pages[1].wires[3].number = Some("4".into());
+    assert!(found(&p).is_empty());
+}
+
+#[test]
 fn a_repeated_wire_number_is_named_on_the_connection_drawn_second() {
     let (mut p, s, parts) = fixture();
     // Connection a is drawn first by an unnumbered wire; b's wire takes 7 before a's second does.

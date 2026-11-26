@@ -483,27 +483,36 @@ pub fn check_with(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet]) -> V
 /// purpose and do not count; wires that touch no pin are no connection, as for numbering.
 fn wire_numbers(i: &Inputs<'_>, out: &mut Vec<Finding>) {
     let p = i.project;
-    let (_, wire_net) = wc_core::connectivity::wire_nets(p, |id| i.symbols.get(id).map(|s| s.role));
+    // Connections come from the wiring outside overview pages only: an overview wire can carry
+    // potentials or link interruption points and so join two connections into one net, which
+    // would hide a reused number or make up two numbers on one connection. Pages keep their
+    // places, so page indices stay the same.
+    let mut wiring = p.clone();
+    for page in wiring.pages.iter_mut().filter(|pg| pg.overview) {
+        page.wires.clear();
+    }
+    // Wires are known by their place: ids need not be unique on a page.
+    let (_, wire_net) = wc_core::connectivity::wire_nets_by_place(&wiring, |id| i.symbols.get(id).map(|s| s.role));
     // Per net: its numbers, and its first numbered wire (page, wire id) in drawing order.
     let mut by_net: BTreeMap<usize, (BTreeSet<&str>, (&Page, &str))> = BTreeMap::new();
     // Per number: the nets it is on, each with the first wire carrying it.
     let mut by_number: BTreeMap<&str, Vec<(usize, &Page, &str)>> = BTreeMap::new();
     // Where each net is first drawn, by any of its wires, numbered or not.
     let mut first_drawn: BTreeMap<usize, usize> = BTreeMap::new();
-    for page in p.pages.iter().filter(|pg| !pg.overview) {
-        for w in &page.wires {
-            if let Some(&net) = wire_net.get(&(page.id.clone(), w.id.clone())) {
+    for (pi, page) in p.pages.iter().enumerate().filter(|(_, pg)| !pg.overview) {
+        for wi in 0..page.wires.len() {
+            if let Some(&net) = wire_net.get(&(pi, wi)) {
                 let next = first_drawn.len();
                 first_drawn.entry(net).or_insert(next);
             }
         }
     }
-    for page in p.pages.iter().filter(|pg| !pg.overview) {
-        for w in &page.wires {
+    for (pi, page) in p.pages.iter().enumerate().filter(|(_, pg)| !pg.overview) {
+        for (wi, w) in page.wires.iter().enumerate() {
             let Some(number) = w.number.as_deref().map(str::trim).filter(|n| !n.is_empty()) else {
                 continue;
             };
-            let Some(&net) = wire_net.get(&(page.id.clone(), w.id.clone())) else {
+            let Some(&net) = wire_net.get(&(pi, wi)) else {
                 continue;
             };
             by_net
