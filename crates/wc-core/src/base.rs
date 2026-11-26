@@ -36,12 +36,17 @@ pub fn create_from(base: &Path, dir: &Path, name: &str, date: &str) -> Result<Pr
     }
     // Its files may be half way through a box-edit: copied as they are, the new project would
     // start with them mismatched and with the journal, which would put the base's values back.
-    if fs::symlink_metadata(base.join(store::BOX_EDIT_JOURNAL)).is_ok() {
-        return Err(Error::Invalid(format!(
-            "a box-edit run on the base project {} stopped half way ({} is there); run any wiringcraft command in that project to put it back first (and commit the result, for a repository)",
-            base.display(),
-            store::BOX_EDIT_JOURNAL
-        )));
+    let journal = base.join(store::BOX_EDIT_JOURNAL);
+    match fs::symlink_metadata(&journal) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(Error::io(&journal, e)),
+        Ok(_) => {
+            return Err(Error::Invalid(format!(
+                "a box-edit run on the base project {} stopped half way ({} is there); run any wiringcraft command in that project to put it back first (and commit the result, for a repository)",
+                base.display(),
+                store::BOX_EDIT_JOURNAL
+            )));
+        }
     }
     let base_full = fs::canonicalize(base).map_err(|e| Error::io(base, e))?;
     let target = resolved(dir)?;

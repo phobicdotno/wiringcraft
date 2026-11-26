@@ -1775,7 +1775,13 @@ pub fn put_file_back(path: &Path, before: Option<&[u8]>) -> Result<(), String> {
         let mut part = path.as_os_str().to_owned();
         part.push(format!(".restore-{}-{n}", std::process::id()));
         let part = PathBuf::from(part);
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&part) {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // Made readable by its owner only before any bytes go in: the bytes may be a file of
+        // the project's that others are not to read.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        match options.open(&part) {
             Ok(file) => {
                 made = Some((part, file));
                 break;

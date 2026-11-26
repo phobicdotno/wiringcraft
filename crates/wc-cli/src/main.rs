@@ -9514,6 +9514,13 @@ mod tests {
         cli(&dir, &["location", "list"]).unwrap();
         assert!(!dir.join(BOX_EDIT_JOURNAL).exists());
         assert_eq!(bytes_now(&before), before);
+        // The symbol file put back was staged readable by its owner only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&symbol_path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "{mode:o}");
+        }
         cli(&dir, &["box-edit", "p1", "s1", "--size", "30,10"]).unwrap();
         assert!(!dir.join(BOX_EDIT_JOURNAL).exists());
     }
