@@ -661,7 +661,14 @@ fn shapes(
             }
         };
         if let Some(s) = shape {
-            out.push((layer, s));
+            // Anything else not numbers once placed (a radius near the limit times the scale)
+            // is left out and said too: the page could not be read back.
+            let (a, b) = s.bounds();
+            if [a.x, a.y, b.x, b.y].iter().all(|v| v.is_finite()) {
+                out.push((layer, s));
+            } else {
+                *skipped.entry(NOT_NUMBERS_PLACED.to_owned()).or_default() += 1;
+            }
         }
     }
 }
@@ -795,6 +802,8 @@ const POLYLINE_NOT_NUMBERS: &str = "LWPOLYLINE whose points are not numbers once
 const HATCH_NOT_NUMBERS: &str = "HATCH with a boundary that is not numbers";
 /// The `skipped` key of a line whose ends are not numbers once placed.
 const LINE_NOT_NUMBERS: &str = "LINE whose ends are not numbers once placed";
+/// The `skipped` key of any other entity that is not numbers once placed (e.g. a radius).
+const NOT_NUMBERS_PLACED: &str = "entity whose size is not a number once placed";
 /// The `skipped` key of an entity whose points are not numbers once moved into the page frame.
 const NOT_NUMBERS_ON_PAGE: &str = "entity whose points are not numbers once moved onto the page";
 
@@ -1754,6 +1763,9 @@ pub(crate) fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> 
             } else if kind == SPLINE_NOT_CURVE {
                 let s = if n == 1 { "" } else { "s" };
                 format!("{n} SPLINE{s} whose knots make no curve, drawn through their points")
+            } else if kind == NOT_NUMBERS_PLACED {
+                let s = if n == 1 { "y" } else { "ies" };
+                format!("{n} entit{s} whose size is not a number once placed, left out")
             } else if kind == NOT_NUMBERS_ON_PAGE {
                 let s = if n == 1 { "y" } else { "ies" };
                 format!("{n} entit{s} whose points are not numbers once moved onto the page, left out")
@@ -2141,6 +2153,23 @@ mod tests {
             unreachable!("nothing left to draw");
         };
         assert!(err.to_string().contains("once moved onto the page"), "{err}");
+        Ok(())
+    }
+
+    /// A circle whose radius overflows once scaled is left out and said, never saved as a
+    /// radius that is not a number.
+    #[test]
+    fn a_circle_whose_radius_overflows_once_scaled_is_left_out_and_said() -> Result<()> {
+        let ents = "0\nCIRCLE\n10\n0\n20\n0\n40\n1e308\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n";
+        let p = page(&dxf(ents, ""), 10.0, &BTreeSet::new())?;
+        assert_eq!(p.graphics.len(), 1, "{:?}", p.graphics);
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("1 entity whose size is not a number once placed")),
+            "{:?}",
+            p.warnings
+        );
         Ok(())
     }
 
