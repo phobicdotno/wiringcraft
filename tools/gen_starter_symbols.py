@@ -377,7 +377,7 @@ sym("wc.fuse.3p", "Fuse switch disconnector, 3-pole", "protection", "Q", "standa
      line((-10.5, 7.5), (-11.5, 7.5))],
     [pin("1", -5, 0, "up"), pin("2", -5, 15, "down"), pin("3", 0, 0, "up"), pin("4", 0, 15, "down"), pin("5", 5, 0, "up"), pin("6", 5, 15, "down")],
     tag_at=(-17, 8), labels=False,
-    desc="Fuse switch disconnector, 3-pole, turned by hand: a fuse in each pole protects the feeder, and the switch isolates it so the fuses can be changed safely.")
+    desc="Fuse switch disconnector, 3-pole, turned by hand: a fuse in each pole protects the feeder, and the switch opens all three poles together.")
 sym("wc.heater.1ph", "Heater, 1-phase", "loads", "E", "standalone",
     [line((-5, 0), (-5, 6)),
      rect((-6.5, 6), (-3.5, 13)),

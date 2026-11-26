@@ -1,6 +1,6 @@
 {
   "category": "protection",
-  "description": "Fuse switch disconnector, 3-pole, turned by hand: a fuse in each pole protects the feeder, and the switch isolates it so the fuses can be changed safely.",
+  "description": "Fuse switch disconnector, 3-pole, turned by hand: a fuse in each pole protects the feeder, and the switch opens all three poles together.",
   "graphics": [
     {
       "a": {
