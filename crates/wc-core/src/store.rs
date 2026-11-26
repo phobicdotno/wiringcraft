@@ -1643,7 +1643,11 @@ mod staging_tests {
         let (_watch, seen) = watch(|what, _| what == Synced::Folder);
 
         let failed = save(&root, &p);
-        assert!(matches!(&failed, Err(Error::Io { .. })), "{failed:?}");
+        // The page write failure is the one reported, not the folder sync failure after it.
+        assert!(
+            matches!(&failed, Err(Error::Io { path, .. }) if *path == blocker),
+            "{failed:?}"
+        );
         // Both folders with a file in place were still synced, failing or not.
         assert_eq!(folders_of(&seen), [root.clone(), pages.clone()]);
         assert!(pages.join(format!("p0000{PAGE_SUFFIX}")).exists());
