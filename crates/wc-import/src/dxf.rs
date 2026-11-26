@@ -1986,6 +1986,7 @@ pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<
     let d = parse(text)?;
     let known: BTreeMap<String, &String> = known_symbols.iter().map(|s| (normalise_block_name(s), s)).collect();
     let mut out = ImportedPage::default();
+    let mut tag_warnings = Vec::new();
     let mut raw = Vec::new();
     let mut points = Vec::new();
     let mut plain = Vec::new();
@@ -2013,7 +2014,16 @@ pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<
                         )
                     })
                     .and_then(|a| a.get(1))
-                    .and_then(|v| DeviceTag::parse(&special_codes(v)).ok());
+                    .map(special_codes)
+                    .filter(|v| !v.trim().is_empty())
+                    .and_then(|v| {
+                        DeviceTag::parse(&v)
+                            .map_err(|why| {
+                                tag_warnings
+                                    .push(format!("{id}: device tag {v:?} not read ({why}), placed without a tag"))
+                            })
+                            .ok()
+                    });
                 let rotation = Rotation::from_degrees(-(e.f(50).round() as i64)).unwrap_or_default();
                 out.symbols.push(PlacedSymbol {
                     id: String::new(),
@@ -2046,6 +2056,7 @@ pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<
     );
     out.graphics = raw.into_iter().map(|(_, s)| s).collect();
     out.warnings = skipped_warnings(skipped);
+    out.warnings.extend(tag_warnings);
     // Move into the frame: top-left at (20, 20) mm.
     let mut pts: Vec<Point> = out
         .graphics
@@ -2461,6 +2472,51 @@ mod tests {
                 .map(|t| t.to_string())
                 .as_deref(),
             Some("-K\u{c5}1")
+        );
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+        Ok(())
+    }
+
+    #[test]
+    fn a_page_exported_to_dxf_reads_back_its_accents() -> Result<()> {
+        let mut project = wc_core::Project::new("Round trip");
+        let mut drawn = wc_core::Page::new("p1", "1", "Page");
+        drawn.graphics.push(Shape::Text {
+            at: Point::new(120.0, 80.0),
+            text: "\u{c5}lesund".into(),
+            height: 3.0,
+            align: Align::Left,
+            angle: 0.0,
+        });
+        project.pages = vec![drawn];
+        let (pages, _) = wc_pdf::page_lines(&project, &BTreeMap::new(), &wc_pdf::Options::default());
+        let Some(exported) = pages.first().map(wc_pdf::dxf) else {
+            unreachable!("one page is exported");
+        };
+        assert!(exported.contains("\\U+00C5lesund"), "the export writes the code");
+        let p = page(&exported, 1.0, &BTreeSet::new())?;
+        assert!(
+            p.graphics
+                .iter()
+                .any(|g| matches!(g, Shape::Text { text, .. } if text == "\u{c5}lesund")),
+            "the import reads the character back"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_tag_that_is_not_a_device_tag_is_said() -> Result<()> {
+        let blocks = "0\nBLOCK\n2\nWC.COIL\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n0\nENDBLK\n";
+        let ents = "0\nINSERT\n2\nWC.COIL\n10\n50\n20\n100\n66\n1\n0\nATTRIB\n2\nTAG\n1\nK\\U+00C51\n";
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        let p = page(&dxf(ents, blocks), 1.0, &known)?;
+        assert_eq!(p.symbols.len(), 1);
+        assert!(p.symbols[0].tag.is_none());
+        assert_eq!(p.warnings.len(), 1, "{:?}", p.warnings);
+        let w = &p.warnings[0];
+        assert!(
+            w.contains("wc.coil") && w.contains("\"K\u{c5}1\"") && w.contains("must start with"),
+            "{w}"
         );
         Ok(())
     }
