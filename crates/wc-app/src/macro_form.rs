@@ -34,12 +34,23 @@ pub struct SetRow {
     pub undeclared: BTreeMap<String, String>,
 }
 
+/// A value set given by its values' placeholder names, as the assistant sets it: a placeholder
+/// without a value uses its default, and an empty value is stored empty.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct NamedSet {
+    pub name: String,
+    pub description: String,
+    pub values: BTreeMap<String, String>,
+}
+
 /// A project macro's placeholders and value sets, being edited.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Form {
     pub path: PathBuf,
     /// The macro as read, the rest of which is saved unchanged.
     pub base: Macro,
+    /// The macro's description.
+    pub description: String,
     pub placeholders: Vec<PlaceholderRow>,
     pub sets: Vec<SetRow>,
 }
@@ -85,6 +96,7 @@ impl Form {
             .collect();
         Ok(Form {
             path: path.to_owned(),
+            description: base.description.clone(),
             base,
             placeholders,
             sets,
@@ -124,11 +136,81 @@ impl Form {
         });
     }
 
+    /// Put `rows` in place of the placeholders, keeping each value set's values for the ones
+    /// kept (by [`PlaceholderRow::was`]; a row without one that names a placeholder already
+    /// there keeps it).
+    pub fn set_placeholders(&mut self, mut rows: Vec<PlaceholderRow>) {
+        for r in &mut rows {
+            if r.was.trim().is_empty()
+                && let Some(p) = self
+                    .placeholders
+                    .iter()
+                    .find(|p| !p.was.is_empty() && key(&p.was) == key(&r.name))
+            {
+                r.was = p.was.clone();
+            }
+        }
+        for s in &mut self.sets {
+            let old: Vec<(&str, String, bool)> = self
+                .placeholders
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let v = s.values.get(i).cloned().unwrap_or_default();
+                    (p.was.as_str(), v, s.stored_empty.get(i).copied().unwrap_or(false))
+                })
+                .collect();
+            let kept: Vec<(String, bool)> = rows
+                .iter()
+                .map(|r| {
+                    old.iter()
+                        .find(|(was, ..)| !r.was.trim().is_empty() && key(was) == key(&r.was))
+                        .map(|(_, v, e)| (v.clone(), *e))
+                        .unwrap_or_default()
+                })
+                .collect();
+            (s.values, s.stored_empty) = kept.into_iter().unzip();
+        }
+        self.placeholders = rows;
+    }
+
+    /// Put `sets` in place of the value sets, their values matched to the placeholders by
+    /// name. Values for names no placeholder has are kept, so that saving reports them.
+    pub fn set_value_sets(&mut self, sets: Vec<NamedSet>) {
+        self.sets = sets
+            .into_iter()
+            .map(|s| {
+                let value = |p: &PlaceholderRow| {
+                    s.values
+                        .iter()
+                        .find(|(k, _)| key(k) == key(&p.name))
+                        .map(|(_, v)| v.clone())
+                };
+                let values: Vec<Option<String>> = self.placeholders.iter().map(value).collect();
+                SetRow {
+                    stored_empty: values.iter().map(|v| v.as_deref() == Some("")).collect(),
+                    values: values.into_iter().map(Option::unwrap_or_default).collect(),
+                    undeclared: s
+                        .values
+                        .iter()
+                        .filter(|(k, _)| !self.placeholders.iter().any(|p| key(&p.name) == key(k)))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                    name: s.name,
+                    description: s.description,
+                }
+            })
+            .collect();
+    }
+
     /// The macro the form describes: placeholders renamed in its texts, the value sets filled
     /// from the table (an empty cell keeps the default, unless it was stored empty). Checked
     /// with [`Macro::check`].
     pub fn to_macro(&self) -> Result<Macro, String> {
         let mut m = self.base.clone();
+        if self.description != self.base.description {
+            m.description = self.description.trim().to_owned();
+        }
         let renames: Vec<(&str, &str)> = self
             .placeholders
             .iter()
