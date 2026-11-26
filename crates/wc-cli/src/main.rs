@@ -1174,6 +1174,18 @@ enum PageCmd {
         #[arg(long)]
         off: bool,
     },
+    /// Change a page's number or title. A number another page already uses is refused; the
+    /// pages are sorted by number again afterwards.
+    Edit {
+        /// The page's id.
+        id: String,
+        /// The new page number, e.g. `3` or `3.1`.
+        #[arg(long)]
+        number: Option<String>,
+        /// The new page title.
+        #[arg(long)]
+        title: Option<String>,
+    },
     /// Change a page's sheet size (as `page add --size` takes it). What is drawn stays where it
     /// is; a smaller sheet can leave some of it outside the frame.
     Size {
@@ -2688,6 +2700,34 @@ fn run(mut cli: Cli) -> Res<()> {
                         .find(|pg| pg.id == id)
                         .ok_or_else(|| format!("no page {id:?}"))?;
                     page.overview = !off;
+                }
+                PageCmd::Edit { id, number, title } => {
+                    if number.is_none() && title.is_none() {
+                        return Err("give --number, --title or both".into());
+                    }
+                    let i = p
+                        .pages
+                        .iter()
+                        .position(|pg| pg.id == id)
+                        .ok_or_else(|| format!("no page {id:?}"))?;
+                    let number = number.map(|n| n.trim().to_owned());
+                    if let Some(n) = &number {
+                        if n.is_empty() {
+                            return Err("the page number cannot be empty".into());
+                        }
+                        if let Some(other) = p.pages.iter().find(|pg| pg.number == *n && pg.id != id) {
+                            return Err(format!("page {:?} already has number {n:?}", other.id));
+                        }
+                    }
+                    if let Some(page) = p.pages.get_mut(i) {
+                        if let Some(n) = number {
+                            page.number = n;
+                        }
+                        if let Some(t) = title {
+                            page.title = t.trim().to_owned();
+                        }
+                    }
+                    p.sort_pages();
                 }
                 PageCmd::Size { id, size } => {
                     let size = PageSize::parse(&size)?;
@@ -7319,6 +7359,49 @@ mod tests {
                 height: 100
             }
         );
+    }
+
+    #[test]
+    fn a_page_is_renumbered_and_retitled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["page", "add", "a", "--number", "2", "--title", "Power"]).unwrap();
+        cli(&dir, &["page", "add", "b", "--number", "3", "--title", "Control"]).unwrap();
+        let pages = |dir: &Path| -> Vec<(String, String, String)> {
+            load(dir)
+                .unwrap()
+                .pages
+                .iter()
+                .map(|p| (p.id.clone(), p.number.clone(), p.title.clone()))
+                .collect()
+        };
+        cli(&dir, &["page", "edit", "b", "--number", " 1.5 "]).unwrap();
+        cli(&dir, &["page", "edit", "a", "--title", "Main power"]).unwrap();
+        let got = pages(&dir);
+        let ids: Vec<&str> = got.iter().map(|x| x.0.as_str()).collect();
+        assert_eq!(ids, ["p0001", "b", "a"], "sorted by the new number");
+        assert_eq!(got[1], ("b".into(), "1.5".into(), "Control".into()));
+        assert_eq!(got[2], ("a".into(), "2".into(), "Main power".into()));
+        // Refused, and nothing changes.
+        let before = pages(&dir);
+        let err = cli(&dir, &["page", "edit", "a", "--number", "1"]).unwrap_err();
+        assert!(err.contains("already has number"), "{err}");
+        assert!(
+            cli(&dir, &["page", "edit", "a", "--number", "  "])
+                .unwrap_err()
+                .contains("empty")
+        );
+        assert!(
+            cli(&dir, &["page", "edit", "nope", "--title", "X"])
+                .unwrap_err()
+                .contains("no page")
+        );
+        assert!(cli(&dir, &["page", "edit", "a"]).is_err());
+        assert_eq!(pages(&dir), before);
+        // Its own number again is fine.
+        cli(&dir, &["page", "edit", "a", "--number", "2", "--title", "Power"]).unwrap();
+        assert_eq!(pages(&dir)[2], ("a".into(), "2".into(), "Power".into()));
     }
 
     #[test]
