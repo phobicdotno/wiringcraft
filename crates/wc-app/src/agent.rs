@@ -2635,7 +2635,11 @@ impl App {
 
     fn tool_macros(&mut self, v: &Value) -> Result<String, String> {
         let action = need_s(v, "action")?;
-        let page = self.page_of(v, "page")?;
+        // Only inserting and saving work on a page: the others work in a project without pages.
+        let page = match action {
+            "insert" | "save" => self.page_of(v, "page")?,
+            _ => 0,
+        };
         let open = need_open(self.open.as_mut())?;
         match action {
             "list" => {
@@ -2669,27 +2673,34 @@ impl App {
                 if let Some(d) = s(v, "description") {
                     form.description = d.to_owned();
                 }
+                // A field left out is empty; one given as something other than a text is a
+                // mistake, not a request to clear it.
+                let text = |o: &Value, what: &str, field: &str| match o.get(field) {
+                    None => Ok(String::new()),
+                    Some(Value::String(t)) => Ok(t.clone()),
+                    Some(other) => Err(format!("A {what}'s {field} is a text, not {other}.")),
+                };
                 if let Some(list) = v.get("placeholders") {
-                    // A field left out is empty; one given as something other than a text is
-                    // a mistake, not a request to clear it.
-                    let text = |p: &Value, field: &str| match p.get(field) {
-                        None => Ok(String::new()),
-                        Some(Value::String(t)) => Ok(t.clone()),
-                        Some(other) => Err(format!("A placeholder's {field} is a text, not {other}.")),
-                    };
-                    let rows = list
+                    let rows: Vec<crate::macro_form::PlaceholderRow> = list
                         .as_array()
                         .ok_or("placeholders is a list.")?
                         .iter()
                         .map(|p| {
                             Ok(crate::macro_form::PlaceholderRow {
-                                was: text(p, "was")?,
-                                name: text(p, "name")?,
-                                description: text(p, "description")?,
-                                default: text(p, "default")?,
+                                was: text(p, "placeholder", "was")?,
+                                name: text(p, "placeholder", "name")?,
+                                description: text(p, "placeholder", "description")?,
+                                default: text(p, "placeholder", "default")?,
                             })
                         })
                         .collect::<Result<_, String>>()?;
+                    // Two rows renaming one placeholder would both take its values.
+                    let mut renamed = std::collections::BTreeSet::new();
+                    for r in rows.iter().filter(|r| !r.was.trim().is_empty()) {
+                        if !renamed.insert(wc_core::macros::key(&r.was)) {
+                            return Err(format!("Placeholder {} is renamed by two rows.", r.was.trim()));
+                        }
+                    }
                     form.set_placeholders(rows);
                 }
                 if let Some(list) = v.get("value_sets") {
@@ -2716,8 +2727,8 @@ impl App {
                             values.insert(k.clone(), val);
                         }
                         sets.push(crate::macro_form::NamedSet {
-                            name: s(set, "name").unwrap_or_default().to_owned(),
-                            description: s(set, "description").unwrap_or_default().to_owned(),
+                            name: text(set, "value set", "name")?,
+                            description: text(set, "value set", "description")?,
                             values,
                         });
                     }
@@ -5779,6 +5790,28 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("default"), "{err}");
         assert_eq!(std::fs::read(&path).unwrap(), before);
+        // So is a value set's description given as something other than a text, and two rows
+        // renaming one placeholder (which would both take its values).
+        let err = call(
+            &mut a,
+            "macros",
+            json!({"action": "edit", "name": "Starter", "value_sets": [{"name": "Small", "description": 5}]}),
+        )
+        .unwrap_err();
+        assert!(err.contains("description"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let err = call(
+            &mut a,
+            "macros",
+            json!({"action": "edit", "name": "Starter",
+                   "placeholders": [{"name": "a", "was": "power"}, {"name": "b", "was": "POWER"}]}),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_lowercase().contains("placeholder power is renamed by two rows"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
 
         // Renamed, a placeholder keeps its values; a new one with its old name is new, with
         // its own default and none of the renamed one's values.
@@ -5795,6 +5828,23 @@ mod tests {
         assert_eq!(small.get("watts").map(String::as_str), Some("0.75"));
         assert_eq!(small.get("power"), None);
         assert_eq!(m.placeholders[1].default, "9");
+
+        // Listing, reading and editing macros needs no page.
+        a.open.as_mut().unwrap().project.pages.clear();
+        assert!(
+            call(&mut a, "macros", json!({"action": "list"}))
+                .unwrap()
+                .contains("Starter")
+        );
+        assert!(call(&mut a, "macros", json!({"action": "get", "name": "Starter"})).is_ok());
+        call(
+            &mut a,
+            "macros",
+            json!({"action": "edit", "name": "Starter", "description": "Starter"}),
+        )
+        .unwrap();
+        let err = call(&mut a, "macros", json!({"action": "insert", "name": "Starter"})).unwrap_err();
+        assert!(err.contains("no pages"), "{err}");
 
         // A library's macro is not edited.
         let lib = tmp.path().join("lib");
