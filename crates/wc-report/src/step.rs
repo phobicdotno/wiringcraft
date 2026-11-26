@@ -45,7 +45,8 @@ fn blocks(project: &Project, panel: &Panel, parts: &BTreeMap<String, Part>) -> (
         [0.0, 0.0, 0.0],
         [panel.width, panel.height, PLATE],
     )];
-    let mut guessed: Vec<String> = Vec::new();
+    // Indexes in `out` of the device boxes drawn at the default depth.
+    let mut guessed: Vec<usize> = Vec::new();
     let mut rails: Vec<(f64, f64, f64)> = Vec::new();
     for item in &panel.items {
         match item {
@@ -76,7 +77,7 @@ fn blocks(project: &Project, panel: &Panel, parts: &BTreeMap<String, Part>) -> (
                 .and_then(|id| parts.get(id))
                 .and_then(part_depth);
             let depth = depth.unwrap_or_else(|| {
-                guessed.push(tag.to_string());
+                guessed.push(out.len());
                 DEFAULT_DEPTH
             });
             // A device on a rail sits on the rail; anything else on the plate.
@@ -92,7 +93,17 @@ fn blocks(project: &Project, panel: &Panel, parts: &BTreeMap<String, Part>) -> (
             ));
         }
     }
-    out.retain(|(_, a, b)| (0..3).all(|k| a[k].is_finite() && b[k].is_finite() && b[k] - a[k] > 1e-6));
+    // Boxes too thin to be a solid are left out, and so are their tags in the guessed list.
+    let keep: Vec<bool> = out
+        .iter()
+        .map(|(_, a, b)| (0..3).all(|k| a[k].is_finite() && b[k].is_finite() && b[k] - a[k] > 1e-6))
+        .collect();
+    let guessed = guessed
+        .into_iter()
+        .filter(|&i| keep[i])
+        .map(|i| out[i].0.clone())
+        .collect();
+    let out = out.into_iter().zip(keep).filter_map(|(b, k)| k.then_some(b)).collect();
     (out, guessed)
 }
 
@@ -311,6 +322,23 @@ mod tests {
         // Lying on its side it covers x 50..150 and y 100..120 (model y 180..200).
         assert!(step.contains("CARTESIAN_POINT('',(50.,180.,2.))"), "{step}");
         assert!(step.contains("CARTESIAN_POINT('',(150.,200.,77.))"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_device_too_thin_to_draw_is_not_listed_as_guessed() -> Result<(), wc_core::Error> {
+        let project = Project::new("x");
+        let mut panel = Panel::new("main", "Cabinet", 400.0, 300.0);
+        panel.items.push(PanelItem::Device {
+            tag: DeviceTag::parse("-K7")?,
+            at: Point::new(50.0, 100.0),
+            width: 0.0000001,
+            height: 90.0,
+            rotation: wc_core::geom::Rotation::R0,
+        });
+        let done = panel_step(&project, &panel, &BTreeMap::new(), "2026-11-26T12:00:00");
+        assert!(!done.text.contains("'-K7'"), "{}", done.text);
+        assert!(done.default_depth.is_empty(), "{:?}", done.default_depth);
         Ok(())
     }
 

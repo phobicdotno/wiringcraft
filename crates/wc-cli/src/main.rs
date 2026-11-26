@@ -2504,11 +2504,13 @@ fn run(mut cli: Cli) -> Res<()> {
                         step.text.matches("MANIFOLD_SOLID_BREP(").count()
                     );
                     if !step.default_depth.is_empty() {
-                        eprintln!(
-                            "warning: no Depth on the part, drawn {} mm deep: {}",
+                        let line = format!(
+                            "warning: no Depth on the part, drawn {} mm deep: {}\n",
                             wc_report::step::DEFAULT_DEPTH,
                             step.default_depth.join(", ")
                         );
+                        // A warning that cannot be shown does not stop the command.
+                        let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
                     }
                     return Ok(());
                 }
