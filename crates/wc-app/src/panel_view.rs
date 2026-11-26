@@ -73,7 +73,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
         if let Some(i) = ed.panel_pick
             && let Some(PanelItem::Device { at: a, .. }) = p.items.get(i)
         {
-            ed.panel_drag = Some((Point::new(at.x - a.x, at.y - a.y), false, *a));
+            ed.panel_drag = Some((Point::new(at.x - a.x, at.y - a.y), None, *a));
         }
     }
     // Escape puts the device back where the drag started and drops the drag's undo step; the
@@ -82,14 +82,15 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
         && ui.input(|inp| inp.key_pressed(egui::Key::Escape))
     {
         ed.panel_drag = None;
-        if checkpoint
+        if let Some(step) = checkpoint
             && let Some(PanelItem::Device { at, .. }) =
                 open.project.panels.get_mut(panel).and_then(|x| x.items.get_mut(i))
         {
             *at = start;
             open.edited();
-            // Only when the latest step is this drag's: then it changes nothing any more.
-            if open.before_last_change() == Some(&open.project) {
+            // Only when the latest step is still this drag's (nothing has touched the history
+            // since its checkpoint): then it changes nothing any more.
+            if open.history_count() == step && open.before_last_change() == Some(&open.project) {
                 open.forget_terminal_change();
                 open.forget_last_change();
             }
@@ -123,9 +124,9 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
         }
         let moved = matches!(p.items.get(i), Some(PanelItem::Device { at: a, .. }) if *a != to);
         if moved {
-            if !checkpoint {
+            if checkpoint.is_none() {
                 open.checkpoint();
-                ed.panel_drag = Some((grab, true, start));
+                ed.panel_drag = Some((grab, Some(open.history_count()), start));
             }
             if let Some(PanelItem::Device {
                 at: a,
@@ -454,5 +455,94 @@ mod tests {
         frame(&mut open, &mut ed, 1.35, vec![]);
         assert_eq!(device_at_now(&open), start);
         assert_eq!(open.undo_steps(), steps_before);
+    }
+
+    /// Dragged away and back to its start with the button held, then a file-only edit (a
+    /// translation, as the assistant's `translations` tool sets one) makes an undo step whose
+    /// project is the start too: Escape keeps that step and drops nothing.
+    #[test]
+    fn escape_keeps_an_undo_step_made_after_the_drags_own() {
+        let (_tmp, mut open) = crate::state::tests::project();
+        let start = Point::new(100.0, 100.0);
+        open.project.panels.push(wc_core::panel::Panel {
+            id: "panel1".into(),
+            name: "Panel 1".into(),
+            width: 400.0,
+            height: 300.0,
+            items: vec![PanelItem::Device {
+                tag: wc_core::DeviceTag::parse("-K1").unwrap_or_default(),
+                at: start,
+                width: 40.0,
+                height: 60.0,
+                rotation: wc_core::geom::Rotation::R0,
+            }],
+        });
+        let mut ed = Editor::default();
+        ed.panel = Some(0);
+        ed.view.fit = true;
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let frame = |open: &mut Open, ed: &mut Editor, time: f64, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1000.0, 700.0))),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| show(ui, open, ed, 0, 1.0));
+            });
+        };
+        let device_at_now = |open: &Open| match open.project.panels[0].items.first() {
+            Some(PanelItem::Device { at, .. }) => *at,
+            _ => unreachable!("the device is there"),
+        };
+        frame(&mut open, &mut ed, 0.5, vec![]);
+        let probe = egui::pos2(500.0, 350.0);
+        frame(&mut open, &mut ed, 0.6, vec![egui::Event::PointerMoved(probe)]);
+        let Some(seen) = ed.cursor else {
+            unreachable!("the pointer is over the plate")
+        };
+        let zoom = ed.view.zoom;
+        let on_screen = |m: Point| probe + Vec2::new(((m.x - seen.x) as f32) * zoom, ((m.y - seen.y) as f32) * zoom);
+        let a = on_screen(Point::new(120.0, 130.0));
+        let steps_before = open.undo_steps();
+        frame(&mut open, &mut ed, 1.0, vec![egui::Event::PointerMoved(a)]);
+        let press = egui::Event::PointerButton {
+            pos: a,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&mut open, &mut ed, 1.01, vec![press]);
+        for (k, t) in [(1.0, 1.05), (2.0, 1.1), (3.0, 1.15), (0.0, 1.2)] {
+            let to = on_screen(Point::new(120.0 + 10.0 * k, 130.0));
+            frame(&mut open, &mut ed, t, vec![egui::Event::PointerMoved(to)]);
+        }
+        assert_eq!(device_at_now(&open), start, "dragged back to its start");
+        assert_eq!(open.undo_steps(), steps_before + 1);
+
+        let file = open.dir.join(wc_core::translate::TRANSLATIONS_FILE);
+        let set = open.translations_change(|dir| wc_core::translate::set_translation(dir, "Motor", "nb", "Motor"));
+        assert!(matches!(set, Ok(true)), "{set:?}");
+        assert_eq!(open.undo_steps(), steps_before + 2, "the translation is an undo step");
+        assert_eq!(open.before_last_change(), Some(&open.project));
+
+        let escape = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&mut open, &mut ed, 1.25, vec![escape]);
+        assert!(ed.panel_drag.is_none());
+        assert_eq!(device_at_now(&open), start);
+        assert_eq!(open.undo_steps(), steps_before + 2, "Escape drops no step");
+        assert!(file.exists());
+        // Undo takes back the translation, not the drag.
+        assert!(open.undo());
+        assert!(!file.exists(), "Undo takes the translation back");
+        assert_eq!(open.undo_steps(), steps_before + 1);
     }
 }

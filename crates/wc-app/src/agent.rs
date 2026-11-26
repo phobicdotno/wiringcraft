@@ -10301,9 +10301,10 @@ mod tests {
                 *at = p;
             }
         }
+        let step = open.history_count();
         a.ed.panel = Some(0);
         a.ed.panel_pick = Some(0);
-        a.ed.panel_drag = Some((Point::new(20.0, 30.0), true, from));
+        a.ed.panel_drag = Some((Point::new(20.0, 30.0), Some(step), from));
         (first, from)
     }
 
