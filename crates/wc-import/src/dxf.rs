@@ -110,6 +110,7 @@ pub(crate) fn draw_mapped(
         1.0,
         0,
         &|_| false,
+        &|_| false,
         &mut out,
         &mut points,
         skipped,
@@ -337,6 +338,7 @@ fn shapes(
     scale: f64,
     depth: usize,
     skip_layer: &dyn Fn(&str) -> bool,
+    hidden_text: &dyn Fn(&str) -> bool,
     out: &mut Vec<(String, Shape)>,
     points: &mut Vec<(String, Point)>,
     skipped: &mut BTreeMap<String, usize>,
@@ -563,8 +565,9 @@ fn shapes(
                 }
                 None
             }
-            // Code 70 bit 1 on an attribute: invisible, so not drawn (and not a skipped entity).
-            "ATTRIB" if (e.f(70) as i64) & 1 != 0 => None,
+            // Code 70 bit 1 on an attribute: invisible, so not drawn (and not a skipped entity),
+            // except on the layers `hidden_text` names (a symbol's pin layers: it names a pin).
+            "ATTRIB" if (e.f(70) as i64) & 1 != 0 && !hidden_text(&layer) => None,
             "TEXT" | "MTEXT" | "ATTRIB" => {
                 let raw = e.get(1).unwrap_or("");
                 let text = if e.kind == "MTEXT" {
@@ -618,6 +621,7 @@ fn shapes(
                         scale,
                         depth + 1,
                         skip_layer,
+                        hidden_text,
                         out,
                         points,
                         skipped,
@@ -639,6 +643,7 @@ fn shapes(
                         scale,
                         depth + 1,
                         skip_layer,
+                        hidden_text,
                         out,
                         points,
                         skipped,
@@ -1813,22 +1818,16 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
         1.0,
         0,
         &|_| false,
+        // An invisible attribute on a pin layer still names a pin; pin-layer text is never
+        // kept as graphics below.
+        &|l| is_pin_layer(l),
         &mut raw,
         &mut points,
         &mut skipped,
         &mut { MAX_DRAWN },
     );
     let mut pins: Vec<(Option<String>, Point)> = points.into_iter().map(|(_, p)| (None, p)).collect();
-    // An invisible attribute is not drawn, but on a pin layer it still names a pin.
-    let mut labels: Vec<(Point, String)> = d
-        .entities
-        .iter()
-        .filter(|e| e.kind == "ATTRIB" && (e.f(70) as i64) & 1 != 0 && is_pin_layer(&e.layer()))
-        .filter_map(|e| {
-            let text = e.get(1)?;
-            (!text.trim().is_empty()).then(|| (Point::new(e.f(10), -e.f(20)), text.to_owned()))
-        })
-        .collect();
+    let mut labels = Vec::new();
     let mut graphics = Vec::new();
     for (layer, s) in raw {
         match (is_pin_layer(&layer), &s) {
@@ -1868,6 +1867,7 @@ pub fn footprint(text: &str) -> Result<(wc_core::Footprint, Vec<String>)> {
         Xf::ID,
         1.0,
         0,
+        &|_| false,
         &|_| false,
         &mut raw,
         &mut points,
@@ -1964,6 +1964,7 @@ pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<
         scale,
         0,
         &|_| false,
+        &|_| false,
         &mut raw,
         &mut points,
         &mut skipped,
@@ -2039,6 +2040,36 @@ mod tests {
         let s = symbol(&dxf(ents, ""), "my.coil", "Coil")?;
         assert_eq!(s.pins.len(), 1);
         assert_eq!(s.pins[0].name, "A1");
+        assert!(
+            !s.graphics.iter().any(|g| matches!(g, Shape::Text { .. })),
+            "{:?}",
+            s.graphics
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn visible_and_invisible_pin_labels_are_matched_in_drawing_order() -> Result<()> {
+        // Visible A1 on the first pin, listed before invisible A2 between the pins: A1 names the
+        // first pin, and A2 the second one.
+        let ents = "0\nPOINT\n8\nPIN\n10\n0\n20\n0\n0\nPOINT\n8\nPIN\n10\n8\n20\n0\n\
+                    0\nTEXT\n8\nPIN\n10\n0\n20\n0\n40\n2\n1\nA1\n\
+                    0\nATTRIB\n8\nPIN\n10\n3\n20\n0\n40\n2\n2\nPIN2\n1\nA2\n70\n1\n";
+        let s = symbol(&dxf(ents, ""), "my.coil", "Coil")?;
+        let names: Vec<(&str, Point)> = s.pins.iter().map(|p| (p.name.as_str(), p.at)).collect();
+        assert_eq!(names, [("A1", Point::new(0.0, 0.0)), ("A2", Point::new(8.0, 0.0))]);
+        Ok(())
+    }
+
+    #[test]
+    fn an_invisible_pin_label_inside_a_block_names_its_pin() -> Result<()> {
+        // A block holding a pin and an invisible attribute next to it, placed at (10, 20).
+        let blocks = "0\nBLOCK\n2\nTERM\n0\nPOINT\n8\nPIN\n10\n0\n20\n0\n\
+                      0\nATTRIB\n8\nPIN\n10\n1\n20\n1\n40\n2\n2\nPIN\n1\nX3\n70\n1\n0\nENDBLK\n";
+        let ents = "0\nLINE\n8\n0\n10\n0\n20\n0\n11\n10\n21\n20\n0\nINSERT\n2\nTERM\n10\n10\n20\n20\n";
+        let s = symbol(&dxf(ents, blocks), "my.term", "Terminal")?;
+        assert_eq!(s.pins.len(), 1);
+        assert_eq!(s.pins[0].name, "X3");
         assert!(
             !s.graphics.iter().any(|g| matches!(g, Shape::Text { .. })),
             "{:?}",
@@ -2405,6 +2436,7 @@ mod tests {
             Xf::ID,
             1.0,
             0,
+            &|_| false,
             &|_| false,
             &mut raw,
             &mut points,
@@ -3297,6 +3329,7 @@ mod tests {
             1e300,
             0,
             &|_| false,
+            &|_| false,
             &mut raw,
             &mut points,
             &mut skipped,
@@ -3382,6 +3415,7 @@ mod tests {
             Xf::ID,
             1.75e308,
             0,
+            &|_| false,
             &|_| false,
             &mut raw,
             &mut points,
