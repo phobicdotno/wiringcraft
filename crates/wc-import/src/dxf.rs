@@ -568,20 +568,16 @@ fn shapes(
                 let text = if e.kind == "MTEXT" {
                     mtext_plain(raw)
                 } else {
-                    raw.to_owned()
+                    special_codes(raw)
                 };
-                let align = match e.f(72) as i64 {
-                    1 | 4 => Align::Center,
-                    2 => Align::Right,
-                    _ => Align::Left,
-                };
+                let ((x, y), align, angle) = text_anchor(e);
                 (!text.trim().is_empty()).then(|| Shape::Text {
-                    at: p(e.f(10), e.f(20)),
+                    at: p(x, y),
                     text,
                     height: (e.f_or(40, 2.5) * r_scale).max(0.5),
                     align,
-                    // Code 50: rotation in degrees, counter-clockwise; a turned block turns it too.
-                    angle: normal_angle(e.f(50) + xf.rot),
+                    // Rotation in degrees, counter-clockwise; a turned block turns it too.
+                    angle: normal_angle(angle + xf.rot),
                 })
             }
             "SOLID" | "TRACE" => {
@@ -669,6 +665,50 @@ const TURN_STEPS: f64 = 72.0;
 
 /// A sweep brought into (0, `full`]: a whole number of turns is one full turn. `None` when it is
 /// not a number.
+/// Where a TEXT, ATTRIB or MTEXT hangs, how it is aligned there, and its rotation in degrees.
+///
+/// MTEXT: the attachment point (71, 1 to 9) runs left, centre, right on each row; the rotation
+/// is code 50, or the direction 11/21 when there is no 50. Code 72 is the drawing direction.
+///
+/// TEXT and ATTRIB: the alignment is code 72 (1 and 4 centre, 2 right). A justified text
+/// (72 = 1, 2 or 4, or a vertical alignment: 73 on TEXT, 74 on ATTRIB) sits on its second
+/// point 11/21 when one is given; 10/20 is the left baseline start, which some writers leave
+/// at 0,0.
+fn text_anchor(e: &Entity) -> ((f64, f64), Align, f64) {
+    let at = (e.f(10), e.f(20));
+    if e.kind == "MTEXT" {
+        let align = match e.f_or(71, 1.0) as i64 {
+            a @ 1..=9 => match (a - 1) % 3 {
+                1 => Align::Center,
+                2 => Align::Right,
+                _ => Align::Left,
+            },
+            _ => Align::Left,
+        };
+        let angle = match e.get(50) {
+            Some(_) => e.f(50),
+            None if e.get(11).is_some() && (e.f(11) != 0.0 || e.f(21) != 0.0) => e.f(21).atan2(e.f(11)).to_degrees(),
+            None => 0.0,
+        };
+        return (at, align, angle);
+    }
+    let h = e.f(72) as i64;
+    let align = match h {
+        1 | 4 => Align::Center,
+        2 => Align::Right,
+        _ => Align::Left,
+    };
+    // Vertical alignment: 73 on TEXT, 74 on ATTRIB (where 73 is the field length).
+    let vertical = if e.kind == "TEXT" { e.f(73) } else { e.f(74) };
+    let justified = matches!(h, 1 | 2 | 4) || vertical as i64 != 0;
+    let at = if justified && e.get(11).is_some() {
+        (e.f(11), e.f(21))
+    } else {
+        at
+    };
+    (at, align, e.f(50))
+}
+
 fn turn(sweep: f64, full: f64) -> Option<f64> {
     if !sweep.is_finite() {
         return None;
@@ -1555,8 +1595,25 @@ fn area2(lp: &[(f64, f64)]) -> f64 {
         .sum()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The hole search's work so far on this thread: vertices visited, point pairs and wall edges
+    /// collected, crossing tests. Tests read it to check the budgets bound the work done.
+    static HOLE_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts `n` units of hole search work (in tests only; does nothing otherwise).
+#[inline]
+fn tally_work(n: usize) {
+    #[cfg(test)]
+    HOLE_WORK.with(|w| w.set(w.get().saturating_add(n)));
+    #[cfg(not(test))]
+    let _ = n;
+}
+
 /// Whether `pt` lies inside the loop (even-odd rule).
 fn inside(pt: (f64, f64), lp: &[(f64, f64)]) -> bool {
+    tally_work(lp.len());
     let mut odd = false;
     for (b, a) in loop_edges(lp) {
         if (a.1 > pt.1) != (b.1 > pt.1) && pt.0 < (b.0 - a.0) * (pt.1 - a.1) / (b.1 - a.1) + a.0 {
@@ -1577,6 +1634,7 @@ fn hatch_style(e: &Entity) -> i64 {
 
 /// Whether segments p-q and c-d cross at a point inside both (touching at an end does not count).
 fn crosses(p: (f64, f64), q: (f64, f64), c: (f64, f64), d: (f64, f64)) -> bool {
+    tally_work(1);
     let side = |a: (f64, f64), b: (f64, f64), x: (f64, f64)| (b.0 - a.0) * (x.1 - a.1) - (b.1 - a.1) * (x.0 - a.0);
     let eps = 1e-12;
     let (d1, d2) = (side(p, q, c), side(p, q, d));
@@ -1688,6 +1746,7 @@ fn with_holes_kept(loops: &[Vec<(f64, f64)>], style: i64) -> Option<(Vec<Loop>, 
                 pairs.push(((p.0 - h.0).hypot(p.1 - h.1), a, b));
             }
         }
+        tally_work(pairs.len());
         pairs.sort_by(|x, y| x.0.total_cmp(&y.0));
         let mut walls: Vec<((f64, f64), (f64, f64))> = loop_edges(o).collect();
         walls.extend(loop_edges(&lp));
@@ -1696,6 +1755,7 @@ fn with_holes_kept(loops: &[Vec<(f64, f64)>], style: i64) -> Option<(Vec<Loop>, 
                 walls.extend(loop_edges(other));
             }
         }
+        tally_work(walls.len());
         let tries = (BRIDGE_BUDGET * 4 / walls.len().max(1)).max(1);
         let clear = |p: (f64, f64), h: (f64, f64)| !walls.iter().any(|&(c, d)| crosses(p, h, c, d));
         // No clear bridge within the budget: leave the hatch unfilled rather than fill the hole.
@@ -1759,7 +1819,8 @@ fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
         .collect()
 }
 
-/// MTEXT carries inline formatting codes; keep only the text.
+/// MTEXT carries inline formatting codes; keep only the text, with its `\U+XXXX` and `%%`
+/// codes turned into characters.
 fn mtext_plain(s: &str) -> String {
     let mut out = String::new();
     let mut chars = s.chars().peekable();
@@ -1770,6 +1831,28 @@ fn mtext_plain(s: &str) -> String {
                 Some('\\') => out.push('\\'),
                 Some('{') => out.push('{'),
                 Some('}') => out.push('}'),
+                Some('U') => {
+                    // `\U+XXXX`: a character by its code. Decoded here, so an escaped backslash
+                    // before `U+` (`\\U+00C5`) stays as written. Any other `\U` (no `+`, or not
+                    // four hex digits) is not a formatting code and stays as written too.
+                    let hex: String = match chars.peek() {
+                        Some('+') => chars.clone().skip(1).take(4).collect(),
+                        _ => String::new(),
+                    };
+                    let code = (hex.len() == 4 && hex.chars().all(|c| c.is_ascii_hexdigit()))
+                        .then(|| u32::from_str_radix(&hex, 16).ok())
+                        .flatten()
+                        .and_then(char::from_u32);
+                    match code {
+                        Some(c) => {
+                            out.push(c);
+                            for _ in 0..5 {
+                                chars.next();
+                            }
+                        }
+                        None => out.push_str("\\U"),
+                    }
+                }
                 Some(_) => {
                     // Formatting code: skip to ';' if it takes an argument.
                     let rest: String = chars.clone().take_while(|c| *c != ';' && *c != '\\').collect();
@@ -1781,8 +1864,67 @@ fn mtext_plain(s: &str) -> String {
                 }
                 None => {}
             },
+            '%' if chars.peek() == Some(&'%') => {
+                // `%%` codes, read from the text as written: a `%` that `\U+0025` produced
+                // never starts one.
+                match chars.clone().nth(1).and_then(percent_code) {
+                    Some(d) => {
+                        out.push_str(d);
+                        chars.next();
+                        chars.next();
+                    }
+                    None => out.push('%'),
+                }
+            }
             '{' | '}' => {}
             c => out.push(c),
+        }
+    }
+    out
+}
+
+/// `\U+XXXX` (four hex digits) at the start of `s`: the character with that code, as CAD
+/// programs write any character outside ASCII. The code is seven bytes long.
+fn unicode_code(s: &str) -> Option<char> {
+    s.strip_prefix("\\U+")?
+        .get(..4)
+        .filter(|h| h.chars().all(|c| c.is_ascii_hexdigit()))
+        .and_then(|h| u32::from_str_radix(h, 16).ok())
+        .and_then(char::from_u32)
+}
+
+/// The `%%` code whose letter is `c`: `%%c` diameter, `%%d` degree, `%%p` plus/minus, `%%%` a
+/// percent sign; `%%u` and `%%o` (underline and overline on/off) are dropped.
+fn percent_code(c: char) -> Option<&'static str> {
+    match c.to_ascii_lowercase() {
+        'c' => Some("\u{2300}"),
+        'd' => Some("\u{b0}"),
+        'p' => Some("\u{b1}"),
+        '%' => Some("%"),
+        'u' | 'o' => Some(""),
+        _ => None,
+    }
+}
+
+/// The text of a TEXT or ATTRIB: its `\U+XXXX` and `%%` codes turned into characters, in one
+/// pass, so a character a code produces never starts another code. Anything else is kept.
+fn special_codes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(c) = rest.chars().next() {
+        if let Some(u) = unicode_code(rest) {
+            out.push(u);
+            rest = &rest[7..];
+        } else if let Some(d) = rest
+            .strip_prefix("%%")
+            .and_then(|r| r.chars().next())
+            .and_then(percent_code)
+        {
+            out.push_str(d);
+            rest = &rest[3..];
+        } else {
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
         }
     }
     out
@@ -1900,6 +2042,7 @@ pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<
     let d = parse(text)?;
     let known: BTreeMap<String, &String> = known_symbols.iter().map(|s| (normalise_block_name(s), s)).collect();
     let mut out = ImportedPage::default();
+    let mut tag_warnings = Vec::new();
     let mut raw = Vec::new();
     let mut points = Vec::new();
     let mut plain = Vec::new();
@@ -1927,7 +2070,16 @@ pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<
                         )
                     })
                     .and_then(|a| a.get(1))
-                    .and_then(|v| DeviceTag::parse(v).ok());
+                    .map(special_codes)
+                    .filter(|v| !v.trim().is_empty())
+                    .and_then(|v| {
+                        DeviceTag::parse(&v)
+                            .map_err(|why| {
+                                tag_warnings
+                                    .push(format!("{id}: device tag {v:?} not read ({why}), placed without a tag"))
+                            })
+                            .ok()
+                    });
                 let rotation = Rotation::from_degrees(-(e.f(50).round() as i64)).unwrap_or_default();
                 out.symbols.push(PlacedSymbol {
                     id: String::new(),
@@ -1960,6 +2112,7 @@ pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<
     );
     out.graphics = raw.into_iter().map(|(_, s)| s).collect();
     out.warnings = skipped_warnings(skipped);
+    out.warnings.extend(tag_warnings);
     // Move into the frame: top-left at (20, 20) mm.
     let mut pts: Vec<Point> = out
         .graphics
@@ -2337,6 +2490,99 @@ mod tests {
         assert_eq!(mtext_plain(r"{\fArial|b1;Motor}\PM1"), "Motor M1");
     }
 
+    #[test]
+    fn text_codes_become_characters() -> Result<()> {
+        assert_eq!(
+            special_codes(r"\U+00C5lesund 3%%c 20%%D %%p1 50%%% %%uline%%u"),
+            "\u{c5}lesund 3\u{2300} 20\u{b0} \u{b1}1 50% line"
+        );
+        // Malformed codes stay as written.
+        assert_eq!(special_codes(r"\U+00G1 \U+12 100%% %%x"), r"\U+00G1 \U+12 100%% %%x");
+        let ents = "0\nTEXT\n8\n0\n10\n5\n20\n5\n40\n2\n1\n\\U+00C5lesund %%c6\n\
+                    0\nMTEXT\n8\n0\n10\n5\n20\n9\n40\n2\n1\n{\\fArial;\\U+00D8st}\\P20%%d\n";
+        let p = page(&dxf(ents, ""), 1.0, &BTreeSet::new())?;
+        let texts: Vec<&str> = p
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["\u{c5}lesund \u{2300}6", "\u{d8}st 20\u{b0}"]);
+        // The form WiringCraft's own DXF export writes reads back as drawn.
+        assert_eq!(special_codes(r"\U+00C5lesund"), "\u{c5}lesund");
+        // In MTEXT an escaped backslash before U+ stays literal; a lone one is a code.
+        assert_eq!(mtext_plain(r"\\U+00C5"), r"\U+00C5");
+        assert_eq!(mtext_plain(r"\U+00C5"), "\u{c5}");
+        assert_eq!(mtext_plain(r"\U+00G1 \U+"), r"\U+00G1 \U+");
+        assert_eq!(mtext_plain(r"\U1234"), r"\U1234");
+        assert_eq!(mtext_plain(r"\U1234;tail"), r"\U1234;tail");
+        // A `%` written as `\U+0025` never starts a `%%` code.
+        assert_eq!(special_codes(r"\U+0025%%c"), "%\u{2300}");
+        assert_eq!(mtext_plain(r"\U+0025%%c"), "%\u{2300}");
+        assert_eq!(mtext_plain(r"{\fArial;50%%%}%%D %%x"), "50%\u{b0} %%x");
+        // A known symbol's TAG attribute is decoded before it is read as a device tag.
+        let blocks = "0\nBLOCK\n2\nWC.COIL\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n0\nENDBLK\n";
+        let ents = "0\nINSERT\n2\nWC.COIL\n10\n50\n20\n100\n66\n1\n0\nATTRIB\n2\nTAG\n1\n-K\\U+00C51\n";
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        let p = page(&dxf(ents, blocks), 1.0, &known)?;
+        assert_eq!(
+            p.symbols
+                .first()
+                .and_then(|s| s.tag.as_ref())
+                .map(|t| t.to_string())
+                .as_deref(),
+            Some("-K\u{c5}1")
+        );
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+        Ok(())
+    }
+
+    #[test]
+    fn a_page_exported_to_dxf_reads_back_its_accents() -> Result<()> {
+        let mut project = wc_core::Project::new("Round trip");
+        let mut drawn = wc_core::Page::new("p1", "1", "Page");
+        drawn.graphics.push(Shape::Text {
+            at: Point::new(120.0, 80.0),
+            text: "\u{c5}lesund".into(),
+            height: 3.0,
+            align: Align::Left,
+            angle: 0.0,
+        });
+        project.pages = vec![drawn];
+        let (pages, _) = wc_pdf::page_lines(&project, &BTreeMap::new(), &wc_pdf::Options::default());
+        let Some(exported) = pages.first().map(wc_pdf::dxf) else {
+            unreachable!("one page is exported");
+        };
+        assert!(exported.contains("\\U+00C5lesund"), "the export writes the code");
+        let p = page(&exported, 1.0, &BTreeSet::new())?;
+        assert!(
+            p.graphics
+                .iter()
+                .any(|g| matches!(g, Shape::Text { text, .. } if text == "\u{c5}lesund")),
+            "the import reads the character back"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_tag_that_is_not_a_device_tag_is_said() -> Result<()> {
+        let blocks = "0\nBLOCK\n2\nWC.COIL\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n0\nENDBLK\n";
+        let ents = "0\nINSERT\n2\nWC.COIL\n10\n50\n20\n100\n66\n1\n0\nATTRIB\n2\nTAG\n1\nK\\U+00C51\n";
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        let p = page(&dxf(ents, blocks), 1.0, &known)?;
+        assert_eq!(p.symbols.len(), 1);
+        assert!(p.symbols[0].tag.is_none());
+        assert_eq!(p.warnings.len(), 1, "{:?}", p.warnings);
+        let w = &p.warnings[0];
+        assert!(
+            w.contains("wc.coil") && w.contains("\"K\u{c5}1\"") && w.contains("must start with"),
+            "{w}"
+        );
+        Ok(())
+    }
+
     /// Every graphic of a drawing in DXF coordinates turned to page ones (y down, scale 1).
     fn drawn(entities: &str, blocks: &str) -> Result<(Vec<Shape>, BTreeMap<String, usize>)> {
         let d = parse(&dxf(entities, blocks))?;
@@ -2365,6 +2611,50 @@ mod tests {
 
     fn near(a: Point, b: Point) -> bool {
         a.distance(b) < 1e-6
+    }
+
+    #[test]
+    fn mtext_and_justified_text_are_placed_by_their_alignment() -> Result<()> {
+        // MTEXT: 71 is the attachment point, 72 = 1 is the drawing direction (left to right).
+        let ents = "0\nMTEXT\n8\n0\n10\n5\n20\n5\n40\n2\n71\n1\n72\n1\n1\nLeft\n\
+                    0\nMTEXT\n8\n0\n10\n5\n20\n5\n40\n2\n71\n5\n72\n1\n1\nMiddle\n\
+                    0\nMTEXT\n8\n0\n10\n5\n20\n5\n40\n2\n71\n9\n11\n0\n21\n1\n1\nTurned\n\
+                    0\nTEXT\n8\n0\n10\n0\n20\n0\n11\n50\n21\n20\n40\n2\n72\n2\n1\nRight\n\
+                    0\nTEXT\n8\n0\n10\n3\n20\n4\n11\n50\n21\n20\n40\n2\n1\nPlain\n\
+                    0\nATTRIB\n8\n0\n10\n0\n20\n0\n11\n50\n21\n20\n40\n2\n72\n0\n74\n2\n1\nMiddle tag\n\
+                    0\nATTRIB\n8\n0\n10\n3\n20\n4\n11\n50\n21\n20\n40\n2\n73\n8\n1\nField\n";
+        let (g, _) = drawn(ents, "")?;
+        let placed: Vec<(&str, Point, Align, f64)> = g
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Text {
+                    text, at, align, angle, ..
+                } => Some((text.as_str(), *at, *align, *angle)),
+                _ => None,
+            })
+            .collect();
+        let want = [
+            ("Left", Point::new(5.0, -5.0), Align::Left, 0.0),
+            ("Middle", Point::new(5.0, -5.0), Align::Center, 0.0),
+            // No code 50: the direction 11/21 turns it a quarter.
+            ("Turned", Point::new(5.0, -5.0), Align::Right, 90.0),
+            // Justified: on its second point, not the 0,0 start.
+            ("Right", Point::new(50.0, -20.0), Align::Right, 0.0),
+            // Left aligned: on 10/20 even with an 11/21.
+            ("Plain", Point::new(3.0, -4.0), Align::Left, 0.0),
+            // ATTRIB: 74 is the vertical alignment, so this one sits on 11/21.
+            ("Middle tag", Point::new(50.0, -20.0), Align::Left, 0.0),
+            // ATTRIB: 73 is the field length, not an alignment; it stays on 10/20.
+            ("Field", Point::new(3.0, -4.0), Align::Left, 0.0),
+        ];
+        assert_eq!(placed.len(), want.len(), "{placed:?}");
+        for (got, want) in placed.iter().zip(&want) {
+            assert!(
+                got.0 == want.0 && near(got.1, want.1) && got.2 == want.2 && (got.3 - want.3).abs() < 1e-9,
+                "{got:?} != {want:?}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -2954,9 +3244,19 @@ mod tests {
                 vec![(a, a), (b, a), (b, b), (a, b)]
             })
             .collect();
-        let started = std::time::Instant::now();
+        // The work each call really does (vertices visited, pairs and walls collected, crossing
+        // tests), counted rather than timed: a timing bound fails on a busy machine, a count
+        // does not. Each call must stay within the nesting budget plus the bridge budget.
+        let work_of = |loops: &[Vec<(f64, f64)>], style: i64| {
+            HOLE_WORK.with(|w| w.set(0));
+            let out = with_holes(loops, style);
+            (out, HOLE_WORK.with(std::cell::Cell::get))
+        };
+        let limit = NESTING_BUDGET + HATCH_BRIDGE_WORK;
         // Nesting found walking out from the smallest loop around: cheap for proper nesting.
-        assert!(with_holes(&loops[..40], 1).is_some());
+        let (out, work) = work_of(&loops[..40], 1);
+        assert!(out.is_some());
+        assert!(work < 10_000, "{work}");
         // Side by side loops need every pair compared; that many stop at the budget.
         let apart: Vec<Vec<(f64, f64)>> = (0..5000)
             .map(|i| {
@@ -2964,7 +3264,9 @@ mod tests {
                 vec![(a, 0.0), (a + 1.0, 0.0), (a + 1.0, 1.0), (a, 1.0)]
             })
             .collect();
-        assert!(with_holes(&apart, 0).is_none());
+        let (out, work) = work_of(&apart, 0);
+        assert!(out.is_none());
+        assert!(work <= NESTING_BUDGET, "{work}");
         // Deep nesting with normal style: every other loop is a hole to bridge, and all the
         // bridges together stop at the hatch's budget.
         let deep: Vec<Vec<(f64, f64)>> = (0..20_000)
@@ -2973,8 +3275,9 @@ mod tests {
                 vec![(a, a), (b, a), (b, b), (a, b)]
             })
             .collect();
-        assert!(with_holes(&deep, 0).is_none());
-        assert!(started.elapsed().as_secs() < 10);
+        let (out, work) = work_of(&deep, 0);
+        assert!(out.is_none());
+        assert!(work <= limit, "{work}");
     }
 
     #[test]

@@ -1,0 +1,102 @@
+{
+  "category": "passive",
+  "description": "Diode: lets current through from anode A to cathode K only; used as a freewheeling diode across a DC relay coil or solenoid valve.",
+  "graphics": [
+    {
+      "a": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 5.0
+      },
+      "kind": "line"
+    },
+    {
+      "closed": true,
+      "filled": false,
+      "kind": "polyline",
+      "points": [
+        {
+          "x": -2.5,
+          "y": 5.0
+        },
+        {
+          "x": 2.5,
+          "y": 5.0
+        },
+        {
+          "x": 0.0,
+          "y": 10.0
+        }
+      ]
+    },
+    {
+      "a": {
+        "x": -2.5,
+        "y": 10.0
+      },
+      "b": {
+        "x": 2.5,
+        "y": 10.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 10.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "kind": "line"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "A"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 14.4
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "K"
+    }
+  ],
+  "id": "wc.diode",
+  "letter_code": "R",
+  "name": "Diode",
+  "pins": [
+    {
+      "at": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "A"
+    },
+    {
+      "at": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "dir": "down",
+      "name": "K"
+    }
+  ],
+  "role": "standalone",
+  "tag_at": {
+    "x": -5.0,
+    "y": 8.0
+  }
+}

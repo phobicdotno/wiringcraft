@@ -88,7 +88,7 @@ For the other areas, the chapter to read in each help is:
 | Function | EPLAN | SWE | WiringCraft | Triage |
 |---|---|---|---|---|
 | Place, move, rotate, mirror symbols | yes | yes | yes | done |
-| Select, box select, copy, cut, paste, delete, undo/redo | yes | yes | yes | done |
+| Select, box select, copy, cut, paste, duplicate (Ctrl+D), delete, undo/redo | yes | yes | yes | done |
 | Grid, snap, zoom, pan, fit page | yes | yes | yes | done |
 | Free graphics: lines, rectangles, texts | yes | yes | yes | done |
 | Circles, arcs and polylines in the editor | yes | yes | yes: drawn by hand (Graphics toolbar), picked, moved, deleted and exported like other drawings | done |
@@ -194,8 +194,8 @@ For the other areas, the chapter to read in each help is:
 
 | Function | EPLAN | SWE | WiringCraft | Triage |
 |---|---|---|---|---|
-| 2D mounting plate with rails and ducts | add-on (Pro Panel) | yes | yes | done |
-| Place devices onto rails from the schematic | add-on | yes | yes: `panel arrange`, or one device at a time with `panel device <panel> <tag> --at x,y [--rotate 90]` (or `--remove`); `panel show` lists each device with its place, size and turn (#507) | done |
+| 2D mounting plate with rails and ducts | add-on (Pro Panel) | yes | yes: `panel rail <panel> --at x,y --length L` and `panel duct <panel> --at x,y --length L [--width W] [--vertical]` add one, `--remove N` takes one off, numbered as `panel show` lists them (#817) | done |
+| Place devices onto rails from the schematic | add-on | yes | yes: `panel arrange`, or one device at a time with `panel device <panel> <tag> --at x,y [--rotate 90]` (or `--remove`); `panel show` lists each device with its place, size and turn (#507); `panel edit <panel> [--name ...] [--width W] [--height H]` renames a layout or changes its plate size, keeping rails, ducts and devices where they are and refusing a size that would leave any of them sticking out (#734) | done |
 | Maker outline drawings as device footprints | yes (2D macros of the part) | yes (2D footprint) | yes: `import footprint-dxf`, or Attach footprint drawing in the app's panel layout properties, stores a maker DXF with the part; layout pages in the app and the PDF draw it at real size (shrunk to fit a smaller device box), and a part without a `Width` or `Height` takes it from the drawing. A device can be turned in quarter steps (Rotate 90° in its properties, or R on the layout); its box, its drawing and its STEP block turn with it (#485) | done (#312, #485) |
 | 3D model export (STEP) | add-on | yes | yes | done |
 | Maker 3D models (STEP) give a part's size | yes (Pro Panel) | yes | partly: `import model-step` reads a maker's STEP model (mm, m or inch) and stores its bounding box with the part, as does Attach 3D model in the app's panel layout properties (#501); a part without `Width`, `Height` or `Depth` takes them from it for layouts and the STEP export. An assembly model is measured with its parts where they are placed, nested assemblies included (#500), each part in its own length unit (#510). Not yet: the model's shape in 3D | size done (#313, #500, #501, #510); the shape in 3D later, with the SolidCraft export (phase 5) |
@@ -207,7 +207,7 @@ For the other areas, the chapter to read in each help is:
 
 | Function | EPLAN | SWE | WiringCraft | Triage |
 |---|---|---|---|---|
-| Project check with errors and warnings | yes | yes | yes, in the app and the CLI | done |
+| Project check with errors and warnings | yes | yes | yes, in the app and the CLI; it also warns about panel layout devices that overlap, stick out of the plate or are no longer in the project | done (#733) |
 | Online check while drawing | yes | partly | yes: the check runs again shortly after each edit, off the window thread; problems are ringed on the canvas and counted in the status bar (File → Check while drawing turns it off) | done (#269) |
 | User-defined check rules | yes | no | yes: `[[rule]]` tables in `project.toml` (a cable on matching devices, a tag pattern, at most N wires per pin), run with the built-in check in the app and `wiringcraft check`; added, changed, reordered and deleted in the Rules dialog next to the check list (one undo step); house rules in a library source's `rules.toml` run for every project using it, named by source, and a project turns one off with `rules_off = ["source:2"]` or by name; listed, replaced from a TOML or JSON file and turned off or on with `wiringcraft rules list/set/off/on`, with the dialog's checks; see `wc_core::check_rule` | done (#274, #429, #430, #587) |
 

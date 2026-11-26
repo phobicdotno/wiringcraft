@@ -173,6 +173,23 @@ pub fn pdf_text(s: &str) -> String {
     out
 }
 
+/// Encode a PDF text string (bookmark titles, the document title, layer names) as a hex
+/// string. Readers decode these as PDFDocEncoding or UTF-16, not as the page font's WinAnsi, so
+/// `pdf_text` would turn an en dash into "Œ" there. Printable ASCII is the same in every one of
+/// them and is written as is; anything else is written as UTF-16BE with a byte order mark, which
+/// holds any character (#726).
+pub fn pdf_text_string(s: &str) -> String {
+    if s.chars().all(|c| matches!(c, ' '..='~')) {
+        return pdf_text(s);
+    }
+    let mut out = String::from("<FEFF");
+    for unit in s.encode_utf16() {
+        let _ = write!(out, "{unit:04X}");
+    }
+    out.push('>');
+    out
+}
+
 impl Doc {
     pub fn new(title: &str) -> Self {
         Self {
@@ -273,7 +290,7 @@ impl Doc {
         for (k, l) in used.iter().enumerate() {
             objs.push((
                 ocg_obj(k),
-                format!("<< /Type /OCG /Name {} >>", pdf_text(l.title())).into_bytes(),
+                format!("<< /Type /OCG /Name {} >>", pdf_text_string(l.title())).into_bytes(),
             ));
         }
         let properties = if used.is_empty() {
@@ -309,7 +326,7 @@ impl Doc {
         }
         objs.push((
             5,
-            format!("<< /Title {} /Producer (WiringCraft) >>", pdf_text(&self.title)).into_bytes(),
+            format!("<< /Title {} /Producer (WiringCraft) >>", pdf_text_string(&self.title)).into_bytes(),
         ));
         for (i, p) in self.pages.iter().enumerate() {
             let (w, h) = (p.size_mm.0 * PT_PER_MM, p.size_mm.1 * PT_PER_MM);
@@ -381,7 +398,7 @@ impl Doc {
             objs.push((page_obj(i) + 1, content));
             let mut item = format!(
                 "<< /Title {} /Parent 4 0 R /Dest [{} 0 R /Fit]",
-                pdf_text(&p.title),
+                pdf_text_string(&p.title),
                 page_obj(i)
             );
             if i > 0 {
