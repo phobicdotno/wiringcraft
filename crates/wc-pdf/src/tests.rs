@@ -385,6 +385,24 @@ fn wire_numbers_cross_references_and_drawings_are_optional_layers() {
     assert!(d.contains("0\nTEXT\n8\nWIRE-NUMBERS\n"));
     assert!(d.contains("0\nLINE\n8\nDRAWINGS\n"));
 
+    // In SVG the wire number sits in its own group that Inkscape shows as a layer.
+    let s = svg(&pages[0]);
+    assert!(s.contains("xmlns:inkscape=\"http://www.inkscape.org/namespaces/inkscape\""));
+    let open = "id=\"wire-numbers\" inkscape:groupmode=\"layer\" inkscape:label=\"Wire numbers\">";
+    let Some(at) = s.find(open) else {
+        unreachable!("no wire-numbers group: {s}")
+    };
+    let group = &s[at..at + s[at..].find("</g>").unwrap_or(0)];
+    assert!(group.contains(">101</text>"), "{group}");
+    assert!(s.contains("id=\"drawings\" inkscape:groupmode=\"layer\""));
+    // Symbol labels have no layer and stay outside the layer groups.
+    let Some(k1) = s.find(">-K1</text>") else {
+        unreachable!("no -K1 label")
+    };
+    let last_open = s[..k1].rfind("<g ").unwrap_or(0);
+    assert!(!s[last_open..k1].contains("inkscape:groupmode"));
+    assert_well_formed(&s);
+
     // A page with nothing optional declares no layers.
     project.pages[0].wires.clear();
     project.pages[0].graphics.clear();
@@ -912,6 +930,58 @@ fn a_jpeg_cut_short_after_its_header_is_a_warning_for_the_logo_and_an_underlay()
     assert!(!String::from_utf8_lossy(&pdf).contains("/Subtype /Image"));
     assert_eq!(report.warnings.len(), 2, "{:?}", report.warnings);
     assert!(report.warnings.iter().all(|w| w.contains("damaged")));
+}
+
+/// A minimal JPEG: SOI, an optional APP14 `Adobe` segment, a baseline frame header 300 wide
+/// and 200 high with `channels` components, a scan header, one scan byte and EOI.
+fn tiny_jpeg(channels: u8, adobe: bool) -> Vec<u8> {
+    let mut b = vec![0xFF, 0xD8];
+    if adobe {
+        // APP14: "Adobe", version 100, flags0, flags1, transform 0 (no colour transform).
+        b.extend([0xFF, 0xEE, 0x00, 0x0E]);
+        b.extend(b"Adobe");
+        b.extend([0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    }
+    // SOF0: precision 8, height 200, width 300, then one 3-byte entry per component.
+    let sof_len = 8 + 3 * u16::from(channels);
+    b.extend([0xFF, 0xC0]);
+    b.extend(sof_len.to_be_bytes());
+    b.extend([0x08, 0x00, 0xC8, 0x01, 0x2C, channels]);
+    for c in 1..=channels {
+        b.extend([c, 0x11, 0x00]);
+    }
+    // SOS with one component, then a scan byte and EOI.
+    b.extend([
+        0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00, 0x00, 0xFF, 0xD9,
+    ]);
+    b
+}
+
+#[test]
+fn jpeg_pictures_get_the_colour_space_of_their_channel_count() {
+    for (channels, adobe, space, extra) in [
+        (1, false, "DeviceGray", ""),
+        (3, false, "DeviceRGB", ""),
+        (4, false, "DeviceCMYK", ""),
+        (4, true, "DeviceCMYK", " /Decode [1 0 1 0 1 0 1 0]"),
+        // The Adobe segment only inverts CMYK.
+        (3, true, "DeviceRGB", ""),
+    ] {
+        let bytes = tiny_jpeg(channels, adobe);
+        let Ok(img) = picture::decode(&bytes) else {
+            unreachable!("{channels} channels, adobe {adobe}: not decoded");
+        };
+        assert_eq!((img.width, img.height), (300, 200), "{channels} channels");
+        assert_eq!(img.colour_space, space, "{channels} channels, adobe {adobe}");
+        assert_eq!(img.extra, extra, "{channels} channels, adobe {adobe}");
+        assert_eq!(img.filter, "DCTDecode");
+        assert_eq!(img.data, bytes, "a JPEG is embedded as it is");
+        assert!(img.alpha.is_none());
+    }
+    let Err(why) = picture::decode(&tiny_jpeg(2, false)) else {
+        unreachable!("a 2-channel JPEG was accepted");
+    };
+    assert!(why.contains("2 colour channels"), "{why}");
 }
 
 #[test]
@@ -1822,6 +1892,23 @@ fn svg_images(s: &str) -> Vec<(f64, f64, f64, f64, String)> {
         .collect()
 }
 
+/// Fails unless `s` parses as XML with every element closed.
+fn assert_well_formed(s: &str) {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(s);
+    let mut depth = 0usize;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(_)) => depth += 1,
+            Ok(Event::End(_)) => depth -= 1,
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(e) => unreachable!("not XML at {}: {e}\n{s}", reader.buffer_position()),
+        }
+    }
+    assert_eq!(depth, 0, "unclosed elements:\n{s}");
+}
+
 #[test]
 fn svg_drawings_show_the_logo_and_the_underlay() {
     let mut png = Vec::new();
@@ -1879,7 +1966,11 @@ fn svg_drawings_show_the_logo_and_the_underlay() {
         (images[0].0, images[0].1, images[0].2, images[0].3),
         (0.0, 0.0, 420.0, 297.0)
     );
-    assert!(page.find("<image").unwrap_or(usize::MAX) < page.find("<g ").unwrap_or(0));
+    // The underlay sits in its own "scans" layer, before the drawing's group.
+    let scans = "<g id=\"scans\" inkscape:groupmode=\"layer\" inkscape:label=\"Scanned sheets\">\n<image";
+    assert!(page.contains(scans), "{page}");
+    assert!(page.find(scans).unwrap_or(usize::MAX) < page.find("<g fill").unwrap_or(0));
+    assert_well_formed(&page);
     assert!(page.rfind("<image").unwrap_or(0) > page.find("</g>").unwrap_or(usize::MAX));
     // DXF has no pictures and stays as it was.
     assert!(!dxf(&pages[1]).contains("base64"));
@@ -2697,6 +2788,15 @@ fn a_declared_node_with_a_blank_tag_keeps_its_box_address_and_station() {
         "{:?}",
         report.warnings
     );
+}
+
+#[test]
+fn page_text_writes_the_rest_of_winansi() {
+    // Euro, curly quotes and ellipsis have WinAnsi codes in the built-in font: no '?'.
+    assert_eq!(writer::pdf_text("€ “x” …"), "<80209378942085>");
+    assert_eq!(writer::pdf_text("„Œœ Šš™’"), "<848C9C208A9A9992>");
+    // An arrow still becomes '>', and a glyph the font lacks '?'.
+    assert_eq!(writer::pdf_text("→Д"), "<3E3F>");
 }
 
 #[test]
