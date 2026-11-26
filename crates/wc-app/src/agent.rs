@@ -1418,12 +1418,17 @@ impl App {
         let Some(p) = open.project.pages.get(self.ed.page) else {
             return;
         };
-        self.ed.selection.retain(|s| match s {
-            Selection::Symbol(id) => p.symbols.iter().any(|x| &x.id == id),
-            Selection::Wire(id) => p.wires.iter().any(|x| &x.id == id),
-            Selection::Graphic(i) => *i < p.graphics.len(),
-            Selection::Cloud(i) => *i < p.clouds.len(),
-            Selection::RevisionTable => p.revision_table.is_some(),
+        // Nothing on a hidden or locked layer stays selected either, as on the canvas.
+        let layers = &self.ed.layers;
+        self.ed.selection.retain(|s| {
+            layers.may_select(s)
+                && match s {
+                    Selection::Symbol(id) => p.symbols.iter().any(|x| &x.id == id),
+                    Selection::Wire(id) => p.wires.iter().any(|x| &x.id == id),
+                    Selection::Graphic(i) => *i < p.graphics.len(),
+                    Selection::Cloud(i) => *i < p.clouds.len(),
+                    Selection::RevisionTable => p.revision_table.is_some(),
+                }
         });
     }
 
@@ -2277,6 +2282,15 @@ impl App {
                     return Err(format!(
                         "{} cannot be locked: nothing on it can be picked.",
                         layer.title()
+                    ));
+                }
+                let now = &self.prefs.layers;
+                if shown.is_none_or(|x| x == now.shown(layer)) && locked.is_none_or(|x| x == now.locked(layer)) {
+                    return Err(format!(
+                        "{} is already {} and {}: nothing to change.",
+                        layer.title(),
+                        if now.shown(layer) { "shown" } else { "hidden" },
+                        if now.locked(layer) { "locked" } else { "unlocked" }
                     ));
                 }
                 if let Some(x) = shown {
@@ -10094,10 +10108,40 @@ mod tests {
             json!({"action": "toggle"}),
             json!({"action": "set", "layer": "wire-numbers", "shown": false, "locked": "true"}),
             json!({"action": "set", "layer": "comments", "shown": "false", "locked": true}),
+            // Already so: shown and locked, or an unlockable layer unlocked.
+            json!({"action": "set", "layer": "drawings", "shown": true, "locked": true}),
+            json!({"action": "set", "layer": "drawings", "locked": true}),
+            json!({"action": "set", "layer": "underlay", "shown": true, "locked": false}),
         ] {
             assert!(call(&mut a, "layers", bad.clone()).is_err(), "{bad}");
         }
         assert_eq!(a.prefs.layers, before);
+    }
+
+    #[test]
+    fn the_assistant_cannot_select_a_drawing_on_a_hidden_or_locked_layer() {
+        use crate::layers::Layer;
+        let (_tmp, mut a) = app(vec![]);
+        call(
+            &mut a,
+            "add_graphic",
+            json!({"page": "p0002", "shape": {"kind": "text", "at": {"x": 30, "y": 30}, "text": "Hello"}}),
+        )
+        .unwrap();
+        for hide in [true, false] {
+            if hide {
+                a.prefs.layers.set_shown(Layer::Drawings, false);
+            } else {
+                a.prefs.layers.set_locked(Layer::Drawings, true);
+            }
+            a.apply_layers();
+            let _ = call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]}));
+            assert!(!a.ed.selection.contains(&Selection::Graphic(0)), "hide={hide}");
+            a.prefs.layers = Default::default();
+            a.apply_layers();
+        }
+        call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap();
+        assert!(a.ed.selection.contains(&Selection::Graphic(0)));
     }
 
     #[test]
