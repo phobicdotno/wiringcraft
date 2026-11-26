@@ -957,6 +957,18 @@ impl Open {
     }
 }
 
+/// A black box's width and height, both above zero (as [`wc_core::black_box`] asks), checked
+/// before a box is drawn from a corner or its points are fitted to the size.
+fn box_size_ok(width: f64, height: f64) -> Result<(), String> {
+    if width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "A black box needs a width and height above zero, not {width} by {height}."
+        ))
+    }
+}
+
 /// The app as the assistant's toolbox.
 pub struct AppTools<'a>(pub &'a mut App);
 
@@ -2290,6 +2302,7 @@ impl App {
             "add" => {
                 let at = Point::new(need_num(v, "x")?, need_num(v, "y")?);
                 let size = Point::new(need_num(v, "width")?, need_num(v, "height")?);
+                box_size_ok(size.x, size.y)?;
                 let device = s(v, "tag").filter(|t| !t.trim().is_empty()).map(tag).transpose()?;
                 let open = need_open(self.open.as_mut())?;
                 let id = open.add_black_box(page, at, at + size, &pins.unwrap_or_default(), device)?;
@@ -2309,13 +2322,18 @@ impl App {
                 let Some((w, h, old)) = layout else {
                     return Err(format!("{id} is not a black box."));
                 };
-                let width = num(v, "width").unwrap_or(w);
-                let height = num(v, "height").unwrap_or(h);
-                if !(width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0) {
-                    return Err(format!(
-                        "A black box needs a width and height above zero, not {width} by {height}."
-                    ));
-                }
+                // Given, a size must be a number: a bad one is refused, not taken as left out.
+                let width = if v.get("width").is_some() {
+                    need_num(v, "width")?
+                } else {
+                    w
+                };
+                let height = if v.get("height").is_some() {
+                    need_num(v, "height")?
+                } else {
+                    h
+                };
+                box_size_ok(width, height)?;
                 let renamed: BTreeMap<String, String> = match v.get("rename") {
                     None | Some(Value::Null) => BTreeMap::new(),
                     Some(Value::Object(m)) => m
@@ -2345,6 +2363,11 @@ impl App {
                     }
                     kept
                 });
+                // Every rename lands on a point of the new list, a name kept as it is too: else
+                // the point would be taken off and its wires cut loose.
+                if let Some(to) = renamed.values().find(|to| !pins.iter().any(|p| &p.name == *to)) {
+                    return Err(format!("The new points have no {to} to rename a point to."));
+                }
                 // An old point that is neither renamed nor in the new list is taken off.
                 let removed: std::collections::BTreeSet<String> = old
                     .iter()
@@ -6543,6 +6566,11 @@ mod tests {
             .trim_start_matches("Drew black box ")
             .trim_end_matches('.')
             .to_owned();
+        // A negative size would draw the box off its given corner: refused, the page unchanged.
+        let count = page2(&a).symbols.len();
+        let flipped = json!({"action": "add", "page": "2", "x": 40, "y": 40, "width": -10, "height": 10});
+        assert!(call(&mut a, "black_box", flipped).is_err());
+        assert_eq!(page2(&a).symbols.len(), count);
         let layout = |a: &App| {
             let o = a.open.as_ref().unwrap();
             let placed = page2(a).symbol(&id).unwrap();
@@ -6613,6 +6641,13 @@ mod tests {
             args.as_object_mut().unwrap().extend(size.as_object().unwrap().clone());
             assert!(call(&mut a, "black_box", args).is_err());
         }
+        // A size that is not a number is refused, not taken as left out.
+        let text = json!({"action": "edit", "page": "2", "id": id, "width": "30", "height": 30});
+        assert!(call(&mut a, "black_box", text).is_err());
+        assert_eq!((layout(&a).0, layout(&a).1), (10.0, 20.0));
+        // A name kept as it is must still be one of the new points.
+        let keep = json!({"action": "edit", "page": "2", "id": id, "rename": {"Q": "Q"}, "pins": []});
+        assert!(call(&mut a, "black_box", keep).is_err());
         let merge = json!({"action": "edit", "page": "2", "id": id, "rename": {"IN": "Z", "Q": "Z"}});
         assert!(call(&mut a, "black_box", merge).unwrap_err().contains("renamed to Z"));
         assert_eq!(layout(&a).0, 10.0);

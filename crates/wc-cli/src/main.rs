@@ -97,6 +97,9 @@ enum Cmd {
         /// A connection point, `name:side:offset` as for `box`. Repeat for each point.
         #[arg(long = "pin")]
         pins: Vec<String>,
+        /// Take every connection point off (wires on them keep a free end).
+        #[arg(long, conflicts_with = "pins")]
+        clear_pins: bool,
         /// Rename a point, `OLD=NEW`. Repeat for each.
         #[arg(long = "rename")]
         renames: Vec<String>,
@@ -1622,19 +1625,23 @@ fn run(cli: Cli) -> Res<()> {
             id,
             size,
             pins,
+            clear_pins,
             renames,
         } => {
             let mut p = load(dir)?;
             let pins = pins.iter().map(|s| parse_box_pin(s)).collect::<Res<Vec<_>>>()?;
-            let renamed = renames
-                .iter()
-                .map(|r| {
-                    let (from, to) = r
-                        .split_once('=')
-                        .ok_or_else(|| format!("{r:?}: expected OLD=NEW, e.g. OUT=Q"))?;
-                    Ok((from.trim().to_owned(), to.trim().to_owned()))
-                })
-                .collect::<Res<std::collections::BTreeMap<_, _>>>()?;
+            let mut renamed = std::collections::BTreeMap::new();
+            for r in &renames {
+                let (from, to) = r
+                    .split_once('=')
+                    .ok_or_else(|| format!("{r:?}: expected OLD=NEW, e.g. OUT=Q"))?;
+                if renamed.insert(from.trim().to_owned(), to.trim().to_owned()).is_some() {
+                    return Err(format!(
+                        "connection point {} is renamed twice",
+                        escape_field(from.trim())
+                    ));
+                }
+            }
             let pg = p.page(&page).ok_or_else(|| format!("no page {page:?}"))?;
             let symbol_id = pg
                 .symbol(&id)
@@ -1645,10 +1652,18 @@ fn run(cli: Cli) -> Res<()> {
             let Some((w, h, old_pins)) = wc_core::black_box_layout(&old) else {
                 return Err(format!("{id} is not a black box"));
             };
-            if p.lock.symbols.get(&symbol_id).map(|l| l.hash.as_str()) != Some(old.hash().as_str()) {
-                return Err(format!(
-                    "the file of symbol {symbol_id} is not the version the project pins; run `wiringcraft lib lock` first"
-                ));
+            match p.lock.symbols.get(&symbol_id) {
+                None => {
+                    return Err(format!(
+                        "the project does not pin symbol {symbol_id}; run `wiringcraft lib lock` first"
+                    ));
+                }
+                Some(l) if l.hash != old.hash() => {
+                    return Err(format!(
+                        "the file of symbol {symbol_id} is not the version the project pins (changed outside wiringcraft?); put the pinned version back from the project's history (e.g. `git checkout`) before editing the box"
+                    ));
+                }
+                Some(_) => {}
             }
             if let Some(from) = renamed.keys().find(|f| old.pin(f).is_none()) {
                 return Err(format!("the box has no connection point {from} to rename"));
@@ -1665,7 +1680,9 @@ fn run(cli: Cli) -> Res<()> {
                     "a black box needs a width and height above zero, not {width} by {height}"
                 ));
             }
-            let pins = if pins.is_empty() {
+            let pins = if !pins.is_empty() || clear_pins {
+                pins
+            } else {
                 // The points stay (renamed as asked), each kept on its edge of the new size.
                 old_pins
                     .iter()
@@ -1678,8 +1695,6 @@ fn run(cli: Cli) -> Res<()> {
                         },
                     })
                     .collect()
-            } else {
-                pins
             };
             let mut new = wc_core::black_box(&symbol_id, &old.name, width, height, &pins).map_err(e)?;
             new.tag_at = old.tag_at;
@@ -1767,7 +1782,7 @@ fn run(cli: Cli) -> Res<()> {
                 });
             }
             for w in warnings {
-                eprintln!("warning: {w}");
+                eprintln!("warning: {}", escape_field(&w));
             }
         }
         Cmd::Wire {
@@ -8255,6 +8270,18 @@ mod tests {
         let p = load(&dir).unwrap();
         let ends: Vec<Endpoint> = p.page("p1").unwrap().wires.iter().map(|w| w.from.clone()).collect();
         assert_eq!(ends[..2], [pin("Q"), pin("IN")]);
+
+        // One point renamed twice is refused; `--clear-pins` cannot go with `--pin`.
+        assert!(cli(&dir, &["box-edit", "p1", "s1", "--rename", "Q=Z", "--rename", "Q=Y"]).is_err());
+        assert!(cli(&dir, &["box-edit", "p1", "s1", "--clear-pins", "--pin", "Q:left:5"]).is_err());
+        assert_eq!(layout().2.len(), 3);
+        // Every point taken off: the wires keep free ends where the points were.
+        cli(&dir, &["box-edit", "p1", "s1", "--clear-pins"]).unwrap();
+        assert!(layout().2.is_empty());
+        let p = load(&dir).unwrap();
+        let ends: Vec<Endpoint> = p.page("p1").unwrap().wires.iter().map(|w| w.from.clone()).collect();
+        let at = |x, y| Endpoint::Point { at: Point::new(x, y) };
+        assert_eq!(ends[..2], [at(40.0, 45.0), at(50.0, 45.0)]);
     }
 
     #[test]
