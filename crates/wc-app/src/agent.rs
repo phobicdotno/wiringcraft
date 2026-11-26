@@ -781,6 +781,45 @@ fn need_open(open: Option<&mut Open>) -> Result<&mut Open, String> {
     open.ok_or_else(|| "No project is open. Use open_project first.".to_owned())
 }
 
+/// An error naming the first key of a report layout (or of one of its column entries) that
+/// [`wc_core::report_layout::ReportLayout`] does not have, since serde would drop it silently
+/// (`columns` for `column` would then keep the built-in columns). The known keys are the ones
+/// the layout itself serializes, so they follow its fields.
+fn report_layout_unknown_key(layout: &serde_json::Map<String, Value>) -> Result<(), String> {
+    use wc_core::report_layout::{ReportColumn, ReportLayout};
+    let keys = |v: Value| -> Vec<String> { v.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default() };
+    let column = ReportColumn {
+        from: "x".into(),
+        heading: Some("x".into()),
+    };
+    let known = keys(json!(ReportLayout {
+        kind: "x".into(),
+        title: Some("x".into()),
+        columns: vec![column.clone()],
+        sort: vec!["x".into()],
+        group: Some("x".into()),
+        header: vec!["x".into()],
+    }));
+    let known_column = keys(json!(column));
+    let unknown = |fields: &serde_json::Map<String, Value>, known: &[String], what: &str| match fields
+        .keys()
+        .find(|k| !known.contains(k))
+    {
+        Some(k) => Err(format!(
+            "Unknown {what} key {k:?}; known keys are {}.",
+            known.join(", ")
+        )),
+        None => Ok(()),
+    };
+    unknown(layout, &known, "layout")?;
+    if let Some(Value::Array(columns)) = layout.get("column") {
+        for c in columns.iter().filter_map(Value::as_object) {
+            unknown(c, &known_column, "column")?;
+        }
+    }
+    Ok(())
+}
+
 impl Open {
     /// A page by its number or id.
     fn find_page(&self, key: &str) -> Option<usize> {
@@ -2833,23 +2872,24 @@ impl App {
             };
             wc_report::build_builtin(kind, &inputs).columns
         };
-        // What wc_report warns about the project's layout for `kind` (as `wc_report` and
-        // `wiringcraft report` name it).
-        let warnings = |open: &crate::state::Open, kind: wc_report::Kind| -> Vec<String> {
+        // What wc_report warns about the project's report layouts (as `wc_report` and
+        // `wiringcraft report` name it), and which of those are about `kind`.
+        let all_warnings = |open: &crate::state::Open| -> Vec<String> {
             let inputs = wc_report::Inputs {
                 project: &open.project,
                 symbols: &open.symbols,
                 parts: &open.parts,
             };
-            let about = format!("report layout for \"{}\":", kind.name());
             wc_report::layout_warnings(&inputs)
-                .into_iter()
-                .filter(|w| w.starts_with(&about))
-                .collect()
+        };
+        let warnings_for = |all: &[String], kind: wc_report::Kind| -> Vec<String> {
+            let about = format!("report layout for \"{}\":", kind.name());
+            all.iter().filter(|w| w.starts_with(&about)).cloned().collect()
         };
         match action {
             "get" => {
                 let kinds = kind.map_or_else(|| wc_report::Kind::ALL.to_vec(), |k| vec![k]);
+                let all = all_warnings(open);
                 let out: Vec<Value> = kinds
                     .into_iter()
                     .map(|k| {
@@ -2857,7 +2897,7 @@ impl App {
                             "kind": k.name(),
                             "layout": wc_report::layout_for(&open.project, k),
                             "builtin_columns": builtin(open, k),
-                            "warnings": warnings(open, k),
+                            "warnings": warnings_for(&all, k),
                         })
                     })
                     .collect();
@@ -2873,6 +2913,7 @@ impl App {
                     let Some(fields) = given.as_object_mut() else {
                         return Err("The layout must be an object.".into());
                     };
+                    report_layout_unknown_key(fields)?;
                     fields.insert("kind".into(), json!(kind.name()));
                     let layout: wc_core::report_layout::ReportLayout =
                         serde_json::from_value(given).map_err(|e| format!("Bad layout: {e}"))?;
@@ -2888,7 +2929,7 @@ impl App {
                 } else {
                     format!("The {} report's layout is set.", kind.name())
                 };
-                let warned = warnings(open, kind);
+                let warned = warnings_for(&all_warnings(open), kind);
                 if !warned.is_empty() {
                     said.push_str(&format!(" Warnings:\n{}", warned.join("\n")));
                 }
@@ -6328,6 +6369,33 @@ mod tests {
         ] {
             assert!(call(&mut a, "report_layouts", bad.clone()).is_err(), "{bad}");
         }
+        assert!(reports(&a).is_empty());
+
+        // Unknown keys, at the top or in a column entry, are named and change nothing, even
+        // over a kept layout; an empty layout is the built-in one.
+        let tag = json!({"action": "set", "kind": "parts", "layout": {"title": "Kept"}});
+        call(&mut a, "report_layouts", tag).unwrap();
+        let before = reports(&a);
+        assert_eq!(before.len(), 1);
+        for (layout, key) in [
+            (json!({"columns": [{"from": builtin[0]}]}), "\"columns\""),
+            (json!({"column": [{"from": builtin[0], "title": "X"}]}), "\"title\""),
+        ] {
+            let err = call(
+                &mut a,
+                "report_layouts",
+                json!({"action": "set", "kind": "parts", "layout": layout}),
+            )
+            .unwrap_err();
+            assert!(err.contains(key), "{err}");
+            assert_eq!(reports(&a), before);
+        }
+        call(
+            &mut a,
+            "report_layouts",
+            json!({"action": "set", "kind": "parts", "layout": {}}),
+        )
+        .unwrap();
         assert!(reports(&a).is_empty());
         let mark = a.open.as_ref().unwrap().undo_mark();
 
