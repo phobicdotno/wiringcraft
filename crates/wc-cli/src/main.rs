@@ -1820,7 +1820,9 @@ impl Cmd {
 /// before the project lock is taken: a FIFO that another command on the same project fills
 /// would otherwise never be read, as its writer waits for the lock this command holds while it
 /// waits for the writer (#658). Regular files, folders, `-` and paths that do not exist are
-/// left as they are, for the command to read (or report) itself. On Unix the `.edb` folder an
+/// left as they are, for the command to read (or report) itself, and so is a stream that cannot
+/// be opened, and an element stream `import symbol-qet` refuses unread for its id, which an
+/// earlier element has. On Unix the `.edb` folder an
 /// Eplan `.elk` stream names stays beside its copy, as a link to the one beside the operand.
 /// The copies are removed when the returned folder is dropped; `None` when nothing was copied.
 fn spool_inputs(cmd: &mut Cmd) -> Res<Option<tempfile::TempDir>> {
@@ -1834,15 +1836,49 @@ fn spool_inputs(cmd: &mut Cmd) -> Res<Option<tempfile::TempDir>> {
         Cmd::Import(ImportCmd::SymbolQet { .. }) => Some(wc_import::qet::MAX_LEN as u64 + 1),
         _ => None,
     };
+    let qet = match cmd {
+        Cmd::Import(ImportCmd::SymbolQet { prefix, scale, .. }) => Some((prefix.clone(), *scale)),
+        _ => None,
+    };
+    // The elements before this one, as `import symbol-qet` will read them, each with its id.
+    let mut earlier: Vec<(String, PathBuf)> = Vec::new();
     let mut spool = None;
     // A stream can be read once: an input named again gets the copy made the first time.
     let mut copied: Vec<(PathBuf, PathBuf)> = Vec::new();
     for (n, path) in cmd.inputs_mut().into_iter().enumerate() {
+        let id = qet.as_ref().map(|(prefix, _)| qet_id(path, prefix));
         let stream = path.as_os_str() != "-" && std::fs::metadata(&*path).is_ok_and(|m| !m.is_file() && !m.is_dir());
         if !stream {
+            earlier.extend(id.map(|id| (id, path.clone())));
+            continue;
+        }
+        // An element whose id an earlier one has is refused without being opened: it is not
+        // opened here either, where a FIFO without a writer would hold the command up. The
+        // earlier one has the id when it can be read as an element, as the import decides.
+        if let (Some(id), Some((_, scale))) = (&id, &qet)
+            && earlier
+                .iter()
+                .any(|(other, file)| other == id && qet_element(file, id, *scale).is_ok())
+        {
             continue;
         }
         let same = std::fs::canonicalize(&*path).unwrap_or_else(|_| path.clone());
+        let first = copied
+            .iter()
+            .find(|(from, _)| *from == same)
+            .map(|(_, copy)| copy.clone());
+        // A stream that cannot be opened is left for the command to report, as a path that
+        // does not exist is: nothing of it was read.
+        let from = match &first {
+            Some(_) => None,
+            None => match std::fs::File::open(&*path) {
+                Ok(from) => Some(from),
+                Err(_) => {
+                    earlier.extend(id.map(|id| (id, path.clone())));
+                    continue;
+                }
+            },
+        };
         let fail = |x: std::io::Error| format!("{}: {x}", escape_field(&path.display().to_string()));
         let folder = match &spool {
             Some(folder) => folder,
@@ -1853,13 +1889,12 @@ fn spool_inputs(cmd: &mut Cmd) -> Res<Option<tempfile::TempDir>> {
         std::fs::create_dir(&own).map_err(|x| format!("{}: {x}", own.display()))?;
         let copy = own.join(path.file_name().unwrap_or(std::ffi::OsStr::new("input")));
         let at_copy = |x: std::io::Error| format!("{}: {x}", copy.display());
-        if let Some((_, first)) = copied.iter().find(|(from, _)| *from == same) {
+        if let Some(first) = &first {
             // The bytes read the first time, under the name this operand has.
             std::fs::hard_link(first, &copy)
                 .or_else(|_| std::fs::copy(first, &copy).map(|_| ()))
                 .map_err(at_copy)?;
-        } else {
-            let from = std::fs::File::open(&*path).map_err(fail)?;
+        } else if let Some(from) = from {
             let mut to = std::fs::File::create(&copy).map_err(at_copy)?;
             match limit {
                 Some(limit) => std::io::copy(&mut (&from).take(limit), &mut to),
@@ -1872,6 +1907,7 @@ fn spool_inputs(cmd: &mut Cmd) -> Res<Option<tempfile::TempDir>> {
         if eplan {
             link_elk_folder(path, &copy)?;
         }
+        earlier.extend(id.map(|id| (id, copy.clone())));
         *path = copy;
     }
     Ok(spool)
@@ -5103,6 +5139,31 @@ fn import_kicad(text: &str, lib: &Path, prefix: &str, scale: f64, category: &str
     Ok(n)
 }
 
+/// The symbol id `import symbol-qet` gives the element in `file`: the prefix and the file stem.
+fn qet_id(file: &Path, prefix: &str) -> String {
+    let stem = wc_import::id_segment(
+        &file
+            .file_stem()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    );
+    format!("{}.{stem}", prefix.trim_end_matches('.'))
+}
+
+/// The element in `file` as the symbol `id`, with warnings.
+fn qet_element(file: &Path, id: &str, scale: f64) -> Res<(wc_import::qet::Imported, Vec<String>)> {
+    use std::io::Read;
+    std::fs::File::open(file)
+        .and_then(|f| {
+            // Read at most one byte past the limit, so a huge file is refused cheaply.
+            let mut text = String::new();
+            f.take(wc_import::qet::MAX_LEN as u64 + 1).read_to_string(&mut text)?;
+            Ok(text)
+        })
+        .map_err(e)
+        .and_then(|text| wc_import::qet::element(&text, id, scale).map_err(e))
+}
+
 fn import_qet(
     files: &[PathBuf],
     lib: &Path,
@@ -5111,29 +5172,14 @@ fn import_qet(
     category: &str,
     letter_code: &str,
 ) -> Res<(usize, usize)> {
-    use std::io::Read;
     let (mut written, mut failed) = (0, 0);
     // Two files whose names give the same id would overwrite each other: the later one fails.
     let mut ids: std::collections::BTreeMap<String, PathBuf> = Default::default();
     for file in files {
-        let stem = wc_import::id_segment(
-            &file
-                .file_stem()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-        );
-        let id = format!("{}.{stem}", prefix.trim_end_matches('.'));
+        let id = qet_id(file, prefix);
         let read = match ids.get(&id) {
             Some(first) => Err(format!("gives the same id {id} as {}, skipped", first.display())),
-            None => std::fs::File::open(file)
-                .and_then(|f| {
-                    // Read at most one byte past the limit, so a huge file is refused cheaply.
-                    let mut text = String::new();
-                    f.take(wc_import::qet::MAX_LEN as u64 + 1).read_to_string(&mut text)?;
-                    Ok(text)
-                })
-                .map_err(e)
-                .and_then(|text| wc_import::qet::element(&text, &id, scale).map_err(e)),
+            None => qet_element(file, &id, scale),
         };
         let (mut imp, warnings) = match read {
             Ok(r) => r,
@@ -10270,8 +10316,91 @@ mod input_tests {
         assert!(edb.join("page.eod").exists());
     }
 
-    /// A FIFO named twice is read once: its one writer writes one element, both operands get
-    /// the same bytes under the same name, and the importer refuses the second for its id as
+    const ELEMENT: &str =
+        "<definition type=\"element\"><description><terminal x=\"0\" y=\"0\"/></description></definition>";
+
+    /// A FIFO whose id an earlier element has is not opened: the import refuses it for its
+    /// id, so a FIFO without a writer does not hold the command up. When the earlier file is
+    /// no element, the FIFO is read and imported.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_with_the_id_of_an_earlier_element_is_not_opened() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let (file, fifo) = (a.join("lamp.elmt"), b.join("lamp.elmt"));
+        mkfifo(&fifo);
+        let parse = |lib: &Path| {
+            Cli::try_parse_from([
+                "wiringcraft".as_ref(),
+                "import".as_ref(),
+                "symbol-qet".as_ref(),
+                file.as_os_str(),
+                fifo.as_os_str(),
+                "--lib".as_ref(),
+                lib.as_os_str(),
+            ])
+            .unwrap()
+        };
+        // No writer: a copy of the FIFO would never end.
+        std::fs::write(&file, ELEMENT).unwrap();
+        let lib = tmp.path().join("lib");
+        let (inputs, spool) = spooled(parse(&lib));
+        assert!(spool.is_none());
+        assert_eq!(inputs, [file.clone(), fifo.clone()]);
+        let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
+        assert_eq!((written, failed), (1, 1));
+
+        std::fs::write(&file, "no element").unwrap();
+        let lib = tmp.path().join("lib2");
+        let writer = writer(&fifo, ELEMENT.as_bytes().to_vec());
+        let (inputs, spool) = spooled(parse(&lib));
+        writer.join().unwrap().unwrap();
+        let spool = spool.unwrap();
+        assert!(inputs[1].starts_with(spool.path()), "{inputs:?}");
+        let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
+        assert_eq!((written, failed), (1, 1));
+        assert!(lib.join("symbols").join("qet.lamp.json").exists());
+    }
+
+    /// A stream that cannot be opened (a socket) is left to the import, which counts it as
+    /// failed and imports the elements before and after it.
+    #[cfg(unix)]
+    #[test]
+    fn a_stream_that_cannot_be_opened_fails_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (before, socket, after) = (
+            tmp.path().join("before.elmt"),
+            tmp.path().join("socket.elmt"),
+            tmp.path().join("after.elmt"),
+        );
+        std::fs::write(&before, ELEMENT).unwrap();
+        std::fs::write(&after, ELEMENT).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let lib = tmp.path().join("lib");
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "symbol-qet".as_ref(),
+            before.as_os_str(),
+            socket.as_os_str(),
+            after.as_os_str(),
+            "--lib".as_ref(),
+            lib.as_os_str(),
+        ])
+        .unwrap();
+        let (inputs, spool) = spooled(cli);
+        assert!(spool.is_none());
+        assert_eq!(inputs, [before, socket, after]);
+        let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
+        assert_eq!((written, failed), (2, 1));
+        assert!(lib.join("symbols").join("qet.before.json").exists());
+        assert!(lib.join("symbols").join("qet.after.json").exists());
+    }
+
+    /// A FIFO named twice is read once: its one writer writes one element, the first operand
+    /// gets the copy, and the second is left unread, as the importer refuses it for its id as
     /// it does for a file.
     #[cfg(unix)]
     #[test]
@@ -10312,12 +10441,10 @@ mod input_tests {
         writer.join().unwrap().unwrap();
         let spool = spool.unwrap();
         assert_eq!(inputs.len(), 2);
-        assert_ne!(inputs[0], inputs[1]);
-        for input in &inputs {
-            assert!(input.starts_with(spool.path()), "{inputs:?}");
-            assert_eq!(input.file_name(), fifo.file_name());
-            assert_eq!(std::fs::read_to_string(input).unwrap(), element);
-        }
+        assert!(inputs[0].starts_with(spool.path()), "{inputs:?}");
+        assert_eq!(inputs[0].file_name(), fifo.file_name());
+        assert_eq!(std::fs::read_to_string(&inputs[0]).unwrap(), element);
+        assert_eq!(inputs[1], fifo);
         let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
         assert_eq!((written, failed), (1, 1));
         assert!(lib.join("symbols").join("qet.lamp.json").exists());
