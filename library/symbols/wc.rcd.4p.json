@@ -242,12 +242,30 @@
     {
       "align": "center",
       "at": {
-        "x": -12.0,
+        "x": -13.0,
         "y": 7.8
       },
       "height": 2.0,
       "kind": "text",
-      "text": "I\u0394"
+      "text": "I"
+    },
+    {
+      "closed": true,
+      "kind": "polyline",
+      "points": [
+        {
+          "x": -12.4,
+          "y": 7.8
+        },
+        {
+          "x": -11.65,
+          "y": 6.4
+        },
+        {
+          "x": -10.9,
+          "y": 7.8
+        }
+      ]
     },
     {
       "center": {
