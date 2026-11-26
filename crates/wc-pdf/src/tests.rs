@@ -2767,3 +2767,83 @@ fn bookmarks_and_the_document_title_are_text_strings_not_font_codes() {
     // The page itself still draws the title with the font's own codes.
     assert!(text.contains(&format!("{} Tj", writer::pdf_text("Motor – pump Ω"))));
 }
+
+/// Decode a hex PDF text string written by `pdf_text_string`: UTF-16BE after a byte order mark,
+/// otherwise one byte per character (printable ASCII only).
+fn decode_text_string(hex: &str) -> Option<String> {
+    let hex = hex.strip_prefix('<')?.strip_suffix('>')?;
+    if let Some(units) = hex.strip_prefix("FEFF") {
+        let units: Option<Vec<u16>> = (0..units.len())
+            .step_by(4)
+            .map(|i| units.get(i..i + 4).and_then(|u| u16::from_str_radix(u, 16).ok()))
+            .collect();
+        return String::from_utf16(&units?).ok();
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| hex.get(i..i + 2).and_then(|b| u8::from_str_radix(b, 16).ok()))
+        .map(|b| b.filter(u8::is_ascii).map(char::from))
+        .collect()
+}
+
+#[test]
+fn a_title_with_euro_quotes_and_other_scripts_round_trips_as_a_text_string() {
+    // WinAnsi puts € at 0x80 and the curly quotes at 0x93/0x94, which PDFDocEncoding reads as
+    // other characters; the document title must come out as typed (#803).
+    for title in ["Pumpe 1 200 € „Nord“ “A”", "Ω → 日本"] {
+        let project = Project::new(title);
+        let (pdf, _) = export(&project, &BTreeMap::new(), &Options::default());
+        let text = String::from_utf8_lossy(&pdf);
+        let Some(at) = text.find("/Producer (WiringCraft)") else {
+            unreachable!("the info dictionary is written")
+        };
+        let Some(start) = text[..at].rfind("/Title ") else {
+            unreachable!("the info dictionary has a title")
+        };
+        let written = text[start + "/Title ".len()..at].trim();
+        assert_eq!(written, writer::pdf_text_string(title));
+        assert!(written.starts_with("<FEFF"), "{written}");
+        assert_ne!(written, writer::pdf_text(title), "not the page font's codes");
+        assert_eq!(decode_text_string(written).as_deref(), Some(title));
+    }
+    // Plain ASCII stays a simple one-byte string.
+    assert_eq!(writer::pdf_text_string("Plant 7"), writer::pdf_text("Plant 7"));
+    assert_eq!(
+        decode_text_string(&writer::pdf_text_string("Plant 7")).as_deref(),
+        Some("Plant 7")
+    );
+}
+
+#[test]
+fn layer_names_are_text_strings() {
+    // Layer names are read as PDF text strings, like the title: each declared layer's /Name is
+    // `pdf_text_string` of its title, and a non-ASCII name would come out as UTF-16 (#803).
+    let mut p1 = Page::new("p1", "1", "Main");
+    p1.graphics.push(Shape::Line {
+        a: Point::new(20.0, 20.0),
+        b: Point::new(60.0, 20.0),
+    });
+    let mut project = Project::new("Layers");
+    project.pages = vec![p1];
+    let (pdf, _) = export(&project, &BTreeMap::new(), &Options::default());
+    let text = String::from_utf8_lossy(&pdf);
+    let names: Vec<&str> = text
+        .match_indices("/Type /OCG /Name ")
+        .filter_map(|(i, m)| {
+            let rest = &text[i + m.len()..];
+            rest.find(" >>").map(|end| &rest[..end])
+        })
+        .collect();
+    assert!(!names.is_empty(), "the drawing layer is declared");
+    for name in &names {
+        let Some(title) = decode_text_string(name) else {
+            unreachable!("{name} is a text string")
+        };
+        assert!(writer::Layer::ALL.iter().any(|l| l.title() == title), "{title}");
+        assert_eq!(*name, writer::pdf_text_string(&title));
+    }
+    let Some(name) = decode_text_string(&writer::pdf_text_string("Leitungen → Ω 日本")) else {
+        unreachable!("non-ASCII names are written as UTF-16")
+    };
+    assert_eq!(name, "Leitungen → Ω 日本");
+}
