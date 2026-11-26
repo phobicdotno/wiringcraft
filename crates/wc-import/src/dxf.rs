@@ -571,8 +571,15 @@ fn shapes(
                     special_codes(raw)
                 };
                 let ((x, y), align, angle) = text_anchor(e);
+                // TEXT and ATTRIB sit in their own (perhaps mirrored) coordinates, with the
+                // rotation measured there; MTEXT's point is in world coordinates already.
+                let (at, angle) = if e.kind == "MTEXT" {
+                    (p(x, y), angle)
+                } else {
+                    (q(x, y), if flip { 180.0 - angle } else { angle })
+                };
                 (!text.trim().is_empty()).then(|| Shape::Text {
-                    at: p(x, y),
+                    at,
                     text,
                     height: (e.f_or(40, 2.5) * r_scale).max(0.5),
                     align,
@@ -3024,6 +3031,33 @@ mod tests {
         assert!(
             near(*e.last().unwrap_or(&Point::new(0.0, 0.0)), Point::new(0.0, 2.5)),
             "{e:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_mirrored_text_and_attrib_land_on_the_other_side() -> Result<()> {
+        // Extrusion (0, 0, -1): the insertion point and rotation are in mirrored coordinates.
+        let ents = "0\nTEXT\n10\n10\n20\n5\n40\n2\n50\n30\n230\n-1\n1\nK1\n\
+                    0\nATTRIB\n10\n0\n20\n0\n11\n4\n21\n3\n72\n2\n40\n2\n230\n-1\n1\nX\n2\nTAG\n\
+                    0\nTEXT\n10\n10\n20\n5\n40\n2\n50\n30\n1\nPLAIN\n\
+                    0\nMTEXT\n10\n10\n20\n5\n40\n2\n230\n-1\n1\nM\n";
+        let (g, _) = drawn(ents, "")?;
+        let placed: Vec<(Point, f64)> = g
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Text { at, angle, .. } => Some((*at, *angle)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            placed,
+            [
+                (Point::new(-10.0, -5.0), 150.0),
+                (Point::new(-4.0, -3.0), 180.0),
+                (Point::new(10.0, -5.0), 30.0),
+                (Point::new(10.0, -5.0), 0.0),
+            ]
         );
         Ok(())
     }
