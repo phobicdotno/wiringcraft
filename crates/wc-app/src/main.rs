@@ -645,7 +645,8 @@ impl App {
         }
         // A save waiting for a typed value runs on the project it was asked for first: a
         // joined copy waits for it, also when an assistant's Undo syncs before the panels.
-        let busy = busy || !self.after_typed.is_empty();
+        // So does a close waiting a frame for a typed value.
+        let busy = busy || !self.after_typed.is_empty() || self.closing == Closing::WaitsForTyped;
         let page = self.open.as_ref().and_then(|o| match self.ed.panel {
             Some(_) => None,
             None => o.project.pages.get(self.ed.page).map(|p| p.id.clone()),
@@ -815,7 +816,9 @@ impl App {
     /// Open the project in `dir` in place of the open one. With unsaved changes in the open
     /// project the person is asked first whether to save them (#1019); it opens once answered.
     fn open_dir(&mut self, dir: &std::path::Path, prefs: &mut Prefs) {
-        if self.importing.is_none() && self.open.as_ref().is_some_and(|o| o.dirty) {
+        // A black box change the save refused is not in the project yet either.
+        let unsaved = self.open.as_ref().is_some_and(|o| o.dirty) || panels::black_box_draft_refused(&self.panels);
+        if self.importing.is_none() && unsaved {
             self.ask_unsaved(Leave::Open(dir.to_path_buf()));
             return;
         }
@@ -1371,7 +1374,7 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.closing = Closing::WaitsForTyped;
             ctx.request_repaint();
-        } else if open.dirty {
+        } else if open.dirty || panels::black_box_draft_refused(&self.panels) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.ask_unsaved(Leave::Close);
         }
@@ -1380,7 +1383,7 @@ impl App {
     /// The frame after a close waited for a typed value, once the panels entered it: ask about
     /// unsaved changes, or close.
     fn close_or_ask(&mut self) {
-        if self.open.as_ref().is_some_and(|o| o.dirty) {
+        if self.open.as_ref().is_some_and(|o| o.dirty) || panels::black_box_draft_refused(&self.panels) {
             self.closing = Closing::No;
             self.ask_unsaved(Leave::Close);
         } else {
@@ -5653,8 +5656,9 @@ impl eframe::App for App {
         }
         self.live_check(ctx);
         // A fetched base project replaces the open one: not while a save waits for a typed
-        // value, which first goes into the project it was asked for.
-        if self.after_typed.is_empty() {
+        // value, which first goes into the project it was asked for, nor while a close waits
+        // for one, which asks about the project the value was typed in.
+        if self.after_typed.is_empty() && self.closing != Closing::WaitsForTyped {
             self.poll_fetch(ctx);
         } else {
             ctx.request_repaint();
@@ -8109,6 +8113,60 @@ mod nudge_tests {
         assert!(app.ed.message.contains("not changed"), "{}", app.ed.message);
         let sent = app_frame(&mut app, &ctx, Vec::new(), false);
         assert!(!sent.contains(&egui::ViewportCommand::Close), "the window stays open");
+        // The project is saved, but the refused change is not in it: a second close, or an
+        // Open, asks again instead of dropping it.
+        let sent = app_frame(&mut app, &ctx, Vec::new(), true);
+        assert!(sent.contains(&egui::ViewportCommand::CancelClose));
+        assert!(matches!(app.dialog, Some(Dialog::Unsaved(Leave::Close))));
+        app.dialog = None;
+        let other = _tmp.path().join("other");
+        wc_core::store::create(&other, "Other").unwrap();
+        let mut prefs = std::mem::take(&mut app.prefs);
+        app.open_dir(&other, &mut prefs);
+        app.prefs = prefs;
+        assert!(matches!(app.dialog, Some(Dialog::Unsaved(Leave::Open(_)))));
+        assert_ne!(app.open.as_ref().unwrap().dir, other, "not opened before the answer");
+    }
+
+    /// A close asked for while a field has the keyboard waits a frame for the typed value; a
+    /// fetched base project or a session join does not replace the open project in that frame
+    /// (#1019).
+    #[test]
+    fn a_fetched_project_or_a_join_waits_while_a_close_waits_for_a_typed_value() {
+        let (tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        let field = egui::Id::new(panels::TAG_FIELD);
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        ctx.memory_mut(|m| m.request_focus(field));
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        assert!(
+            ctx.memory(|m| m.has_focus(field)),
+            "the device tag field has the keyboard"
+        );
+        let was_open = app.open.as_ref().unwrap().dir.clone();
+        let new_dir = tmp.path().join("fetched");
+        wc_core::store::create(&new_dir, "Fetched").unwrap();
+        let (tx, done) = std::sync::mpsc::channel();
+        tx.send(Ok(())).unwrap();
+        app.fetch = Some(BaseFetch {
+            dir: new_dir,
+            source: "https://example.invalid/base.git".into(),
+            was_open: Some(was_open.clone()),
+            made: false,
+            cancel: std::sync::Arc::default(),
+            done,
+        });
+        let (_host, guest) = crate::share::tests::let_in_guest(tmp.path()).unwrap();
+        app.share = guest;
+        let sent = app_frame(&mut app, &ctx, vec![egui::Event::Text("7".into())], true);
+        assert!(sent.contains(&egui::ViewportCommand::CancelClose));
+        assert_eq!(app.closing, Closing::WaitsForTyped);
+        assert!(app.fetch.is_some(), "the fetch waits");
+        assert_eq!(app.open.as_ref().unwrap().dir, was_open, "not replaced by the fetch");
+        // A sync before the panels of the next frame, as an assistant's Undo makes.
+        app.sync_session_now(false);
+        assert_eq!(app.open.as_ref().unwrap().dir, was_open, "the join waits for the close");
     }
 
     #[test]
