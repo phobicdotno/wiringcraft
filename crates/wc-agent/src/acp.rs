@@ -883,9 +883,10 @@ read l
     }
 
     /// Run one prompt against a stand-in adapter that sends `update` (a `session/update`
-    /// notification's `update`) and then fails the prompt. Returns the last poll.
+    /// notification's `update`) and then fails the prompt. Returns the last poll, or why the
+    /// stand-in could not be set up.
     #[cfg(unix)]
-    fn failed_turn_after(name: &str, update: &str) -> Option<AcpPolled> {
+    fn failed_turn_after(name: &str, update: &str) -> Result<AcpPolled, String> {
         let dir = std::env::temp_dir().join(format!("wc-acp-{name}-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let script = dir.join("agent.sh");
@@ -898,9 +899,9 @@ echo '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32603,"message":"overloaded"}}}
 read l
 "#
         );
-        std::fs::write(&script, body).ok()?;
+        std::fs::write(&script, body).map_err(|e| format!("writing {}: {e}", script.display()))?;
         let argv = vec!["sh".to_owned(), script.to_string_lossy().into_owned()];
-        let mut acp = Acp::start(&argv, &dir, json!({}), "note", "", Arc::new(|| {})).ok()?;
+        let mut acp = Acp::start(&argv, &dir, json!({}), "note", "", Arc::new(|| {}))?;
         acp.prompt("hi", &[]);
         let mut log = Vec::new();
         let mut polled = AcpPolled::default();
@@ -913,7 +914,7 @@ read l
         }
         drop(acp);
         let _ = std::fs::remove_dir_all(&dir);
-        Some(polled)
+        Ok(polled)
     }
 
     /// A status update from the adapter is not Claude answering, so the failed message is
@@ -922,14 +923,14 @@ read l
     #[test]
     fn only_claudes_own_output_keeps_a_failed_turn_answered() {
         let status = r#"{"sessionUpdate":"available_commands_update","availableCommands":[]}"#;
-        let Some(p) = failed_turn_after("status", status) else {
-            return;
-        };
+        let r = failed_turn_after("status", status);
+        assert!(r.is_ok(), "stand-in adapter for a status update: {r:?}");
+        let Ok(p) = r else { unreachable!() };
         assert!(p.finished && p.unanswered, "{p:?}");
         let words = r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"On it"}}"#;
-        let Some(p) = failed_turn_after("words", words) else {
-            return;
-        };
+        let r = failed_turn_after("words", words);
+        assert!(r.is_ok(), "stand-in adapter for a message chunk: {r:?}");
+        let Ok(p) = r else { unreachable!() };
         assert!(p.finished && !p.unanswered, "{p:?}");
     }
 }
