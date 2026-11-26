@@ -233,17 +233,7 @@ impl Form {
                 self.path.display()
             ));
         }
-        let id = self
-            .path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| format!("{} is not a macro file", self.path.display()))?;
-        let root = self
-            .path
-            .parent()
-            .and_then(Path::parent)
-            .ok_or_else(|| format!("{} is not in a macros folder", self.path.display()))?;
-        wc_core::macros::write_macro(root, id, &m).map_err(|e| e.to_string())
+        wc_core::macros::write_macro_file(&self.path, &m).map_err(|e| e.to_string())
     }
 }
 
