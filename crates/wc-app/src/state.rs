@@ -5020,6 +5020,52 @@ pub(crate) mod tests {
 
     /// A project with a macro saved twice from its form (descriptions "A coil", then "Two"),
     /// and the file's text after each save.
+    #[test]
+    fn a_failed_undo_or_redo_keeps_the_steps_mark_for_taking_a_move_back() {
+        use wc_core::geom::Shape;
+        let line = |x: f64| Shape::Line {
+            a: Point::new(x, 100.0),
+            b: Point::new(x + 10.0, 100.0),
+        };
+        let (_tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let Some(g) = o.add_graphic(1, line(10.0)) else {
+            unreachable!()
+        };
+        let page = o.project.pages[1].id.clone();
+        // A move's checkpoint, then an assistant turn that deletes the line and draws another:
+        // the same count of drawings, folded into one step.
+        o.begin_drag_move();
+        let Some(id) = o.last_step_id() else { unreachable!() };
+        o.drag_move_by(1, std::slice::from_ref(&g), Point::new(-40.0, 0.0));
+        let mark = o.start_turn();
+        o.delete_many(1, std::slice::from_ref(&g));
+        o.add_graphic(1, line(200.0));
+        o.squash_undo(mark);
+        let symbol = o.project.lock.symbols.keys().next().unwrap().clone();
+        let fail = |o: &mut Open| {
+            o.stale_symbol_files.insert(symbol.clone());
+            o.fail_symbol_writes = [true].into();
+        };
+        let pass = |o: &mut Open| {
+            o.stale_symbol_files.clear();
+            o.fail_symbol_writes = Default::default();
+        };
+        // A failed Undo puts the folded step back as it was.
+        fail(&mut o);
+        assert!(!o.undo());
+        assert!(o.take_undo_error().is_some());
+        pass(&mut o);
+        assert!(o.take_back_move(id, &page, std::slice::from_ref(&g)).is_err());
+        // The same for a failed Redo, with the folded step waiting in the redo history.
+        assert!(o.undo(), "{:?}", o.take_undo_error());
+        fail(&mut o);
+        assert!(!o.redo());
+        assert!(o.take_undo_error().is_some());
+        pass(&mut o);
+        assert!(o.take_back_move(id, &page, std::slice::from_ref(&g)).is_err());
+    }
+
     fn macro_edited_twice() -> (tempfile::TempDir, Open, PathBuf, [String; 3]) {
         let (tmp, mut o) = project();
         let id = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
