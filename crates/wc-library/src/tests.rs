@@ -521,6 +521,8 @@ fn every_starter_symbol_loads_under_its_file_name_with_distinct_pins() -> Result
         ("wc.coil.offdelay", SymbolRole::Main),
         ("wc.contact.no.ondelay", SymbolRole::Auxiliary),
         ("wc.contact.nc.ondelay", SymbolRole::Auxiliary),
+        ("wc.contact.no.offdelay", SymbolRole::Auxiliary),
+        ("wc.contact.nc.offdelay", SymbolRole::Auxiliary),
     ] {
         assert_eq!(lib.symbol(id)?.0.role, role, "{id}");
     }
