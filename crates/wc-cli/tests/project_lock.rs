@@ -30,12 +30,25 @@ fn ends_within(child: &mut Child, limit: Duration) -> Result<bool, Box<dyn std::
     Ok(false)
 }
 
-/// Let a writer still waiting to open `fifo` through, so a failing test ends instead of
-/// hanging. Opened for reading and writing, which does not wait for the other end, so it never
-/// blocks, also when the writer is already gone.
+/// Wait for the thread writing `fifo` to end, at most ten seconds, and return what it
+/// returned (`None` when it did not end). A reader is kept open and drained meanwhile, opened
+/// for reading and writing so the open itself never waits: a writer that has yet to open the
+/// FIFO, or is blocked writing, gets through whatever the command under test did.
 #[cfg(unix)]
-fn release_fifo_writer(fifo: &Path) {
-    drop(std::fs::OpenOptions::new().read(true).write(true).open(fifo));
+fn finish_writer(fifo: &Path, writer: std::thread::JoinHandle<std::io::Result<()>>) -> Option<std::io::Result<()>> {
+    use std::io::Read;
+    if let Ok(mut reader) = std::fs::OpenOptions::new().read(true).write(true).open(fifo) {
+        // Left running when the test ends: it holds only this end of the FIFO.
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            while reader.read(&mut buf).is_ok_and(|n| n > 0) {}
+        });
+    }
+    let start = Instant::now();
+    while !writer.is_finished() && start.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if writer.is_finished() { writer.join().ok() } else { None }
 }
 
 #[test]
@@ -216,12 +229,11 @@ fn a_command_reads_a_named_fifo_before_it_waits_for_the_lock() -> TestResult {
         child.kill()?;
     }
     let out = child.wait_with_output()?;
-    release_fifo_writer(&fifo);
-    let written = writer.join();
+    let written = finish_writer(&fifo, writer);
     assert!(read_first, "the FIFO is read before the lock is taken");
     assert!(waits, "it waits for the lock");
     assert!(ended, "it runs once the lock is free");
-    let Ok(Ok(())) = written else {
+    let Some(Ok(())) = written else {
         unreachable!("the input was written");
     };
     let err = String::from_utf8_lossy(&out.stderr);
@@ -282,12 +294,11 @@ fn a_wago_import_reads_a_named_fifo_before_it_waits_for_the_lock() -> TestResult
         child.kill()?;
     }
     let out = child.wait_with_output()?;
-    release_fifo_writer(&fifo);
-    let written = writer.join();
+    let written = finish_writer(&fifo, writer);
     assert!(read_first, "the FIFO is read before the lock is taken");
     assert!(waits, "it waits for the lock");
     assert!(ended, "it runs once the lock is free");
-    let Ok(Ok(())) = written else {
+    let Some(Ok(())) = written else {
         unreachable!("the input was written");
     };
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -403,13 +414,12 @@ fn a_plc_csv_import_reads_a_named_fifo_before_it_waits_for_the_lock() -> TestRes
         child.kill()?;
     }
     let out = child.wait_with_output()?;
-    release_fifo_writer(&fifo);
-    let written = writer.join();
+    let written = finish_writer(&fifo, writer);
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(read_first, "the FIFO is read before the lock is taken: {err}");
     assert!(waits, "it waits for the lock: {err}");
     assert!(ended, "it runs once the lock is free");
-    let Ok(Ok(())) = written else {
+    let Some(Ok(())) = written else {
         unreachable!("the input was written");
     };
     assert!(!err.contains("cannot read"), "{err}");
