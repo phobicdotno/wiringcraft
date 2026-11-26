@@ -1,6 +1,6 @@
 {
   "category": "sensors",
-  "description": "Inductive or capacitive proximity sensor, 3-wire: supply on BN and BU, output on BK.",
+  "description": "Inductive proximity sensor, 3-wire, for metal targets: supply on BN and BU, output on BK. For the capacitive kind use wc.sensor.prox3.capacitive.",
   "graphics": [
     {
       "kind": "rect",
@@ -94,7 +94,7 @@
   ],
   "id": "wc.sensor.prox3",
   "letter_code": "B",
-  "name": "Proximity sensor, 3-wire",
+  "name": "Inductive proximity sensor, 3-wire",
   "pins": [
     {
       "at": {
