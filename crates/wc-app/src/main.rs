@@ -1567,18 +1567,26 @@ impl App {
         }
         let Some(open) = self.open.as_mut() else { return };
         // A black box form changed and not applied yet is applied before the project is saved.
-        if saves_project(a)
-            && !self.assistant.command_running()
-            && let Some(refused) = panels::apply_black_box_draft(open, &mut self.ed, &mut self.panels)
-        {
-            self.ed.message = refused;
+        // Why it was refused stays in the message the save leaves.
+        let refused = if saves_project(a) && !self.assistant.command_running() {
+            panels::apply_black_box_draft(open, &mut self.ed, &mut self.panels)
+        } else {
+            None
+        };
+        if let Some(r) = &refused {
+            self.ed.message = r.clone();
         }
         match a {
             Action::Save if self.assistant.command_running() => {
                 self.ed.message = App::SAVE_WAITS.into();
             }
             Action::Save => match open.save() {
-                Ok(n) => self.ed.message = format!("Saved ({n} files changed)."),
+                Ok(n) => {
+                    self.ed.message = match &refused {
+                        Some(r) => format!("Saved ({n} files changed). {r}"),
+                        None => format!("Saved ({n} files changed)."),
+                    }
+                }
                 // A file changed outside that Save would write over asks first (#662).
                 Err(e) => {
                     // Only when that is what stopped this save: another error is shown as it is.
@@ -5462,11 +5470,15 @@ impl eframe::App for App {
         } else {
             actions.extend(self.route_to_symbol_editor(keys));
         }
-        let after_panels = std::mem::take(&mut self.after_typed);
-        if !after_panels.is_empty() {
+        let mut after_panels = std::mem::take(&mut self.after_typed);
+        if after_panels.is_empty() {
+            self.after_typed = wait_for_typed_value(ctx, &mut actions);
+        } else {
+            // A save waiting for a typed value runs first: this frame's actions (an Open that
+            // would replace the project, say) wait behind it.
             enter_typed_value(ctx);
+            after_panels.append(&mut actions);
         }
-        self.after_typed = wait_for_typed_value(ctx, &mut actions);
         for a in actions {
             self.run(a);
         }
@@ -7429,7 +7441,19 @@ mod nudge_tests {
         frame_with(&mut app, vec![egui::Event::Text("7".into()), save], Modifiers::COMMAND);
         assert_eq!(tag(&app), Some(before), "typed, not entered yet");
         assert_eq!(app.after_typed, [Action::Save], "the save waits a frame");
-        frame_with(&mut app, Vec::new(), Modifiers::NONE);
+        // Ctrl+O in the frame the save waits for runs after the save, on the project saved.
+        let open_key = egui::Event::Key {
+            key: Key::O,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        };
+        frame_with(&mut app, vec![open_key], Modifiers::COMMAND);
+        assert!(
+            matches!(app.pending, Some(Pending::Open)),
+            "the Open waited behind the save"
+        );
         assert_eq!(tag(&app).as_ref(), Some(&typed), "entered before the save");
         let open = app.open.as_ref().unwrap();
         assert!(!open.dirty, "saved after the value was entered");

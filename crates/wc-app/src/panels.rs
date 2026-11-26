@@ -957,14 +957,7 @@ pub fn apply_black_box_draft(open: &mut Open, ed: &mut Editor, ps: &mut PanelSta
     if current.as_ref() != Some(hash) || !form.changed() {
         return None;
     }
-    match open.edit_black_box(
-        *page,
-        id,
-        (form.width, form.height),
-        &form.pins(),
-        &form.renamed(),
-        &form.removed(),
-    ) {
+    match apply_box_form(open, ed, form, *page, id) {
         Ok(warnings) => {
             if !warnings.is_empty() {
                 ed.message = format!("Black box changed. Check: {}.", warnings.join("; "));
@@ -977,6 +970,36 @@ pub fn apply_black_box_draft(open: &mut Open, ed: &mut Editor, ps: &mut PanelSta
             Some(format!("The black box was not changed: {e}"))
         }
     }
+}
+
+/// Apply the black box form to the box `id` on `page` as one undo step, for its Apply button
+/// and before a save: the warnings, or why it was refused. A wire being drawn from a point the
+/// change removed or renamed is dropped, as it could no longer be drawn.
+fn apply_box_form(
+    open: &mut Open,
+    ed: &mut Editor,
+    form: &crate::black_box_tool::BoxEdit,
+    page: usize,
+    id: &str,
+) -> Result<Vec<String>, String> {
+    let warnings = open.edit_black_box(
+        page,
+        id,
+        (form.width, form.height),
+        &form.pins(),
+        &form.renamed(),
+        &form.removed(),
+    )?;
+    let lost = ed.wire.as_ref().is_some_and(|(start, _)| {
+        open.project
+            .pages
+            .get(ed.page)
+            .is_some_and(|pg| open.end_pos(pg, start).is_none())
+    });
+    if lost {
+        ed.wire = None;
+    }
+    Ok(warnings)
 }
 
 /// The fields of the black box form; `true` when it is done with (applied or reset).
@@ -1041,14 +1064,7 @@ fn black_box_form(
         return true;
     }
     if apply {
-        match open.edit_black_box(
-            page,
-            id,
-            (form.width, form.height),
-            &form.pins(),
-            &form.renamed(),
-            &form.removed(),
-        ) {
+        match apply_box_form(open, ed, form, page, id) {
             Ok(warnings) => {
                 ed.message = if warnings.is_empty() {
                     "Black box changed.".into()
@@ -2688,7 +2704,17 @@ mod tests {
         if let Some((_, f)) = ps.black_box.as_mut() {
             f.rows[0].name = "A".into();
         }
+        // A wire being drawn from the point renamed can no longer be drawn: it is dropped.
+        ed.page = 1;
+        ed.wire = Some((
+            wc_core::Endpoint::Pin {
+                item: id.clone(),
+                pin: "1".into(),
+            },
+            Vec::new(),
+        ));
         assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), None);
+        assert!(ed.wire.is_none(), "the wire from the renamed point is dropped");
         assert_eq!(o.undo_steps(), steps + 1, "one undo step");
         assert!(ps.black_box.is_none(), "the form is read again");
         let symbol = o.project.pages[1]
