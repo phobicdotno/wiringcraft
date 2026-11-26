@@ -558,16 +558,17 @@ pub fn archive(dir: &Path, file: &Path, first_page: usize, lib: Option<&Path>, l
                 let number = next;
                 let id = format!("dxf-{number}");
                 next = page_after(next, 1)?;
+                // The number first: the refusal then names the page that holds it.
+                if let Err(why) = number_free(&p, &number.to_string()) {
+                    Err(why)
                 // Page files are named by id, and some folders do not tell `DXF-300`
                 // from `dxf-300`.
-                if p.pages.iter().any(|pg| pg.id.eq_ignore_ascii_case(&id)) {
+                } else if p.pages.iter().any(|pg| pg.id.eq_ignore_ascii_case(&id)) {
                     // Never added over an earlier page: removing it again on failure
                     // would delete that page.
                     Err(format!(
                         "page {id} exists; remove it or import with --first-page to number the pages from a free number"
                     ))
-                } else if let Err(why) = number_free(&p, &number.to_string()) {
-                    Err(why)
                 } else {
                     p.pages.push(Page::new(id.clone(), number.to_string(), raw.clone()));
                     p.sort_pages();
@@ -1501,7 +1502,11 @@ pub fn add_built(
 ) -> Result<(Written, usize), String> {
     let cover_fields = keep_one_cover(p, &mut built.pages);
     // Refuse before anything is written: a repeated import must not overwrite the symbol files of
-    // an earlier one and then fail half way.
+    // an earlier one and then fail half way. Numbers first, so the refusal names the page that
+    // holds a number taken.
+    for page in &built.pages {
+        number_free(p, &page.number)?;
+    }
     if let Some(page) = built.pages.iter().find(|pg| p.page(&pg.id).is_some()) {
         return Err(format!(
             "page {} exists; remove it or import into a fresh project",
@@ -1511,9 +1516,6 @@ pub fn add_built(
     let mut ids = std::collections::BTreeSet::new();
     if let Some(page) = built.pages.iter().find(|pg| !ids.insert(pg.id.as_str())) {
         return Err(format!("the import has page {} twice", page.id));
-    }
-    for page in &built.pages {
-        number_free(p, &page.number)?;
     }
     // A new version of a symbol must keep every pin a wire in the project ends on: one the lock
     // pins in another version, and one the project only has a copy of (no lock entry), which
@@ -2088,6 +2090,8 @@ mod tests {
         let mut p = Project::new("t");
         p.pages.push(Page::new("p0001", " 1 ", "Cover"));
         p.pages.push(Page::new("x", "200", "Mine"));
+        // Holds the id the archive's drawing would get, not its number: the number is named.
+        p.pages.push(Page::new("DXF-200", "5", "Mine too"));
         assert!(store::save(&dir, &p).is_ok());
         let before = files(&dir);
         let pdf_file = tmp.path().join("sheet.pdf");
@@ -2123,6 +2127,55 @@ mod tests {
         // A free number goes through.
         assert_eq!(pdf(&dir, &pdf_file, 2, &mut Log::default()), Ok(()));
         assert!(matches!(load(&dir), Ok(p) if p.page("pdf-2").is_some_and(|pg| pg.number == "2")));
+    }
+
+    /// EPLAN and SolidWorks Electrical imports refuse a page number in use the same way, naming
+    /// the page with that number before a page id the import shares with the project.
+    #[test]
+    fn an_eplan_or_swe_import_onto_a_page_number_in_use_is_refused_and_writes_nothing() {
+        let tmp = tmp();
+        let edb = tmp.path().join("plant.edb");
+        assert!(std::fs::create_dir(&edb).is_ok());
+        for (name, bytes) in crate::eplan::tests::sample() {
+            assert!(std::fs::write(edb.join(name), bytes).is_ok());
+        }
+        let db = tmp.path().join("plant.db");
+        let Some(db_path) = db.to_str() else {
+            unreachable!("temp path is not UTF-8")
+        };
+        let conn = crate::swe::tests::sample();
+        assert!(conn.execute("VACUUM INTO ?1", [db_path]).is_ok());
+        type Route<'a> = &'a dyn Fn(&Path) -> Res<()>;
+        let eplan_route = |dir: &Path| eplan(dir, &edb, 200, &mut Log::default());
+        let swe_route = |dir: &Path| swe(dir, &db, 1, Some(200), None, &mut Log::default());
+        let routes: [(&str, Route); 2] = [("eplan", &eplan_route), ("swe", &swe_route)];
+        for (name, import) in routes {
+            // The ids the import gives its pages, from a fresh project.
+            let fresh = tmp.path().join(format!("{name}-fresh"));
+            assert!(store::save(&fresh, &Project::new("t")).is_ok());
+            assert_eq!(import(&fresh), Ok(()), "{name}");
+            let Ok(imported) = load(&fresh) else {
+                unreachable!("{name}: not saved")
+            };
+            let Some(first) = imported.pages.iter().find(|pg| pg.number == "200") else {
+                unreachable!("{name}: no page 200 in {:?}", imported.pages)
+            };
+
+            let dir = tmp.path().join(name);
+            let mut p = Project::new("t");
+            p.pages.push(Page::new("x", "200", "Mine"));
+            p.pages.push(Page::new(first.id.clone(), "999", "Same id"));
+            assert!(store::save(&dir, &p).is_ok());
+            let before = files(&dir);
+            match import(&dir) {
+                Err(why) => assert!(
+                    why.starts_with("page number 200 is taken by page x;") && why.contains("--first-page"),
+                    "{name}: {why}"
+                ),
+                Ok(()) => unreachable!("{name}: an import onto page number 200 went through"),
+            }
+            assert_eq!(files(&dir), before, "{name}");
+        }
     }
 
     /// The refusal escapes the page id and number it names: an id from a file stem may hold ESC.
