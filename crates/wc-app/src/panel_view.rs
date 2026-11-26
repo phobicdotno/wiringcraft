@@ -801,7 +801,7 @@ mod tests {
                 ..Default::default()
             };
             let _ = ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| show(ui, open, ed, 0, 1.0));
+                egui::CentralPanel::default().show(ctx, |ui| show(ui, open, ed, 0, 1.0, true));
             });
         };
         let button = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
@@ -888,7 +888,7 @@ mod tests {
                 ..Default::default()
             };
             let _ = ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| show(ui, open, ed, 0, 1.0));
+                egui::CentralPanel::default().show(ctx, |ui| show(ui, open, ed, 0, 1.0, true));
             });
         };
         let device_at_now = |open: &Open| match open.project.panels[0].items.first() {
