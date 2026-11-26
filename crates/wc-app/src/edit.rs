@@ -763,6 +763,38 @@ impl Open {
         true
     }
 
+    /// Put device `tag` on panel layout `panel`, in one undo step: on the first DIN rail with
+    /// room, else at the top-left free spot, inside the plate. Returns its index in the panel's
+    /// items, or a plain message, with no undo step, when its part has no size or it does not
+    /// fit anywhere.
+    pub fn place_panel_device(&mut self, panel: usize, tag: &DeviceTag) -> Result<usize, String> {
+        use wc_core::panel::{PanelItem, part_size};
+        let Some(mut placed) = self.project.panels.get(panel).cloned() else {
+            return Err("That panel layout is gone.".into());
+        };
+        let size = self
+            .project
+            .devices
+            .get(tag)
+            .and_then(|d| d.part.as_ref())
+            .and_then(|id| self.parts.get(id))
+            .and_then(part_size)
+            .ok_or_else(|| format!("{tag} has no size: give its part a Width and Height first."))?;
+        let at = free_spot(&placed, size)
+            .ok_or_else(|| format!("{tag} ({} x {} mm) does not fit anywhere on the plate.", size.0, size.1))?;
+        placed.place_device(tag.clone(), at, size, Rotation::R0)?;
+        let index = placed
+            .items
+            .iter()
+            .position(|i| matches!(i, PanelItem::Device { tag: t, .. } if t == tag))
+            .ok_or("The device did not land on the plate.")?;
+        self.checkpoint();
+        if let Some(p) = self.project.panels.get_mut(panel) {
+            *p = placed;
+        }
+        Ok(index)
+    }
+
     /// Mirror the selected symbols left to right, in one undo step.
     pub fn mirror_many(&mut self, page: usize, sel: &[Selection]) {
         self.change_symbols(page, sel, |s| s.mirror = !s.mirror);
@@ -883,10 +915,135 @@ impl Open {
     }
 }
 
+/// Where an upright `size` device goes on `panel` without covering another device: the first
+/// free place along the DIN rails (top to bottom), centred on the rail, else the top-left free
+/// spot clear of devices and ducts. None when it fits nowhere on the plate.
+fn free_spot(panel: &wc_core::panel::Panel, size: (f64, f64)) -> Option<Point> {
+    use wc_core::panel::{GAP, PanelItem};
+    let (w, h) = size;
+    let eps = 1e-9;
+    let inside = |x: f64, y: f64| x >= -eps && y >= -eps && x + w <= panel.width + eps && y + h <= panel.height + eps;
+    let covering = |blocks: &[(Point, Point)], x: f64, y: f64| {
+        blocks
+            .iter()
+            .filter(|(min, max)| min.x < x + w && max.x > x && min.y < y + h && max.y > y)
+            .map(|(_, max)| max.x + GAP)
+            .reduce(f64::max)
+    };
+    let devices: Vec<(Point, Point)> = panel.items.iter().filter_map(PanelItem::device_bounds).collect();
+    let mut rails: Vec<(Point, f64)> = panel
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            PanelItem::Rail { at, length } => Some((*at, *length)),
+            _ => None,
+        })
+        .collect();
+    rails.sort_by(|a, b| a.0.y.total_cmp(&b.0.y).then(a.0.x.total_cmp(&b.0.x)));
+    for (at, length) in rails {
+        let top = at.y - h / 2.0;
+        let mut x = at.x;
+        // Past every device this outline would cover; each step moves right, so it ends.
+        while let Some(past) = covering(&devices, x, top) {
+            x = past;
+        }
+        if x + w <= at.x + length + eps && inside(x, top) {
+            return Some(Point::new(x, top));
+        }
+    }
+    // Off the rails: the highest, then leftmost, corner next to a device or duct that is free.
+    let mut blocks = devices;
+    blocks.extend(panel.items.iter().filter_map(|i| match i {
+        PanelItem::Duct { min, max } => Some((*min, *max)),
+        _ => None,
+    }));
+    let mut xs: Vec<f64> = std::iter::once(0.0)
+        .chain(blocks.iter().map(|(_, max)| max.x + GAP))
+        .collect();
+    let mut ys: Vec<f64> = std::iter::once(0.0)
+        .chain(blocks.iter().map(|(_, max)| max.y + GAP))
+        .collect();
+    xs.sort_by(f64::total_cmp);
+    ys.sort_by(f64::total_cmp);
+    ys.iter()
+        .flat_map(|y| xs.iter().map(move |x| Point::new(*x, *y)))
+        .find(|p| inside(p.x, p.y) && covering(&blocks, p.x, p.y).is_none())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_device_is_placed_on_the_plate_from_the_list_in_one_undo_step() {
+        use wc_core::panel::{Panel, PanelItem};
+        let (_tmp, mut o) = crate::state::tests::project();
+        let sized = |w: &str, h: &str| wc_core::Part {
+            properties: [("Width".to_owned(), w.to_owned()), ("Height".to_owned(), h.to_owned())].into(),
+            ..Default::default()
+        };
+        o.parts.insert("p.k".into(), sized("45", "80"));
+        o.parts.insert("p.big".into(), sized("900", "80"));
+        o.parts.insert("p.none".into(), wc_core::Part::default());
+        let tag = |s: &str| DeviceTag::parse(s).unwrap();
+        for (t, part) in [("-K1", "p.k"), ("-K2", "p.big"), ("-K3", "p.none")] {
+            let d = Device {
+                part: Some(part.into()),
+                ..Default::default()
+            };
+            o.project.devices.insert(tag(t), d);
+        }
+        o.project.panels.push(Panel::with_rails("panel1", "Main", 600.0, 400.0));
+        o.project.panels.push(Panel::new("panel2", "Bare", 300.0, 200.0));
+        let mark = o.undo_mark();
+
+        let i = o.place_panel_device(0, &tag("-K1")).unwrap();
+        assert_eq!(o.undo_mark(), mark + 1, "one undo step");
+        let p = &o.project.panels[0];
+        let (min, max) = p.items[i].device_bounds().unwrap();
+        assert!(
+            min.x >= 0.0 && min.y >= 0.0 && max.x <= p.width && max.y <= p.height,
+            "on the plate"
+        );
+        let rail = p.items.iter().find_map(|i| match i {
+            PanelItem::Rail { at, .. } => Some(*at),
+            _ => None,
+        });
+        assert_eq!(
+            Some((min.x, (min.y + max.y) / 2.0)),
+            rail.map(|r| (r.x, r.y)),
+            "on the first rail"
+        );
+        // A second one goes beside it, not on top of it.
+        o.project
+            .devices
+            .insert(tag("-K4"), o.project.devices[&tag("-K1")].clone());
+        let j = o.place_panel_device(0, &tag("-K4")).unwrap();
+        let (min2, _) = o.project.panels[0].items[j].device_bounds().unwrap();
+        assert!(min2.x >= max.x, "beside the first");
+        assert!(o.undo());
+        assert!(o.undo());
+        assert!(o.project.panels[0].device_tags().is_empty(), "Undo takes it off again");
+
+        // Without rails: the top-left corner.
+        let i = o.place_panel_device(1, &tag("-K1")).unwrap();
+        assert_eq!(
+            o.project.panels[1].items[i].device_bounds().map(|b| b.0),
+            Some(Point::new(0.0, 0.0))
+        );
+
+        // Too big, or no size: a message and no change.
+        let (before, mark) = (o.project.clone(), o.undo_mark());
+        assert!(
+            o.place_panel_device(0, &tag("-K2"))
+                .unwrap_err()
+                .contains("does not fit")
+        );
+        assert!(o.place_panel_device(0, &tag("-K3")).unwrap_err().contains("no size"));
+        assert_eq!(o.project, before);
+        assert_eq!(o.undo_mark(), mark);
+    }
 
     #[test]
     fn a_drawing_taken_off_is_selected_again_where_it_comes_back() {

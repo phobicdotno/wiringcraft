@@ -2091,7 +2091,7 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, pi: usi
     }
     // Devices with a part that could go on the plate but are not on it.
     let on_plate = panel.device_tags();
-    let missing: Vec<String> = open
+    let missing: Vec<(wc_core::DeviceTag, String)> = open
         .project
         .devices
         .iter()
@@ -2100,18 +2100,38 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, pi: usi
             let part = open.parts.get(d.part.as_ref()?)?;
             (!on_door(part)).then(|| {
                 let size = part_size(part).map_or_else(|| "no size".to_owned(), |(w, h)| format!("{w} x {h}"));
-                format!("{tag}  ({size})")
+                (tag.clone(), format!("{tag}  ({size})"))
             })
         })
         .collect();
+    // Set when a Place button is pressed, applied once the panel is no longer borrowed (#928).
+    let mut place: Option<wc_core::DeviceTag> = None;
     if missing.is_empty() {
         ui.label(RichText::new("Every device with a part is on the plate.").color(t.faint));
     } else {
         ui.label(RichText::new(format!("Not on the plate yet ({})", missing.len())).color(t.muted));
-        for m in missing {
-            ui.label(RichText::new(m).monospace());
+        for (tag, m) in missing {
+            ui.horizontal(|ui| {
+                if ui
+                    .small_button("Place")
+                    .on_hover_text("Put this device on the first DIN rail with room, else in a free spot")
+                    .clicked()
+                {
+                    place = Some(tag);
+                }
+                ui.label(RichText::new(m).monospace());
+            });
         }
         ui.label(RichText::new("Page menu → Arrange devices puts them on the rails.").color(t.faint));
+    }
+    if let Some(tag) = place {
+        match open.place_panel_device(pi, &tag) {
+            Ok(item) => {
+                ed.panel_pick = Some(item);
+                ed.message = format!("Placed {tag} on the plate; drag it to move it.");
+            }
+            Err(e) => ed.message = e,
+        }
     }
     if let Some(item) = turn
         && !open.rotate_panel_device(pi, item)
