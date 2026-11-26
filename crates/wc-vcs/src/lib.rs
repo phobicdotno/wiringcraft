@@ -16,7 +16,7 @@ mod git;
 pub mod subway;
 
 pub use changes::{Change, PageVersion, changes, page_history};
-pub use git::{Git, MergeOutcome};
+pub use git::{Git, MergeOutcome, PARENT_PROJECT_ENV};
 pub use subway::{Commit, Edge, Row, history, subway_svg, subway_text};
 
 #[derive(Debug, thiserror::Error)]

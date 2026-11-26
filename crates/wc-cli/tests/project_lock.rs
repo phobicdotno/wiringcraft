@@ -60,22 +60,85 @@ fn a_command_waits_for_the_lock_another_process_holds() -> TestResult {
     let Some(mut input) = child.stdin.take() else {
         unreachable!("stdin is piped");
     };
-    input.write_all(b"[[rule]]\nkind = \"max-wires\"\nmax = 2\n")?;
-    drop(input);
-    assert!(
-        !ends_within(&mut child, Duration::from_millis(600))?,
-        "it waits for the lock"
-    );
+    // More than a pipe holds: the writer only gets through when the command reads its input
+    // while it is still waiting for the lock.
+    let mut rules = String::from("[[rule]]\nkind = \"max-wires\"\nmax = 2\n");
+    for _ in 0..4096 {
+        rules.push_str("# padding to fill the pipe ................................\n");
+    }
+    assert!(rules.len() > 200_000);
+    let writer = std::thread::spawn(move || input.write_all(rules.as_bytes()));
+    let start = Instant::now();
+    while !writer.is_finished() && start.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let read_first = writer.is_finished();
+    let waits = !ends_within(&mut child, Duration::from_millis(300))?;
     lock.unlock()?;
-    assert!(
-        ends_within(&mut child, Duration::from_secs(20))?,
-        "it runs once the lock is free"
-    );
+    let ended = ends_within(&mut child, Duration::from_secs(20))?;
+    if !ended {
+        child.kill()?;
+    }
+    assert!(read_first, "the input is read before the lock is taken");
+    assert!(waits, "it waits for the lock");
+    assert!(ended, "it runs once the lock is free");
+    let Ok(Ok(())) = writer.join() else {
+        unreachable!("the input was written");
+    };
     let out = child.wait_with_output()?;
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{err}");
     assert!(err.contains("waiting for another wiringcraft command"), "{err}");
     let toml = std::fs::read_to_string(dir.join("project.toml"))?;
     assert!(toml.contains("max-wires"), "{toml}");
+    Ok(())
+}
+
+/// A git hook that runs wiringcraft on the project while `vcs commit` holds the project's lock
+/// does not wait for that lock (it would wait for good: the commit waits for the hook).
+#[cfg(unix)]
+#[test]
+fn a_git_hook_running_wiringcraft_on_the_project_does_not_hang_a_commit() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .status()?;
+    assert!(status.success());
+    let hook = dir.join(".git").join("hooks").join("pre-commit");
+    std::fs::create_dir_all(hook.parent().ok_or("a folder")?)?;
+    let marker = tmp.path().join("hook-ran");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\n\"{}\" -C . page list > /dev/null && touch \"{}\"\n",
+            env!("CARGO_BIN_EXE_wiringcraft"),
+            marker.display()
+        ),
+    )?;
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))?;
+    let added = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("-C")
+        .arg(&dir)
+        .args(["page", "add", "p2", "--number", "2"])
+        .status()?;
+    assert!(added.success());
+    let mut commit = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("-C")
+        .arg(&dir)
+        .args(["vcs", "commit", "-m", "A page"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let ended = ends_within(&mut commit, Duration::from_secs(30))?;
+    if !ended {
+        commit.kill()?;
+    }
+    let out = commit.wait_with_output()?;
+    assert!(ended, "the commit ends");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(marker.exists(), "the hook ran wiringcraft");
     Ok(())
 }

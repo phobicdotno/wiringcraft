@@ -20,6 +20,11 @@ const GITIGNORE: &str = "\
 /.wiringcraft.lock
 ";
 
+/// The variable every git command this crate runs gets, naming the project folder it runs
+/// for. A wiringcraft command that git starts in turn (from a hook) on the same project sees
+/// that the command which started git already holds the project, and does not wait for it.
+pub const PARENT_PROJECT_ENV: &str = "WIRINGCRAFT_GIT_PARENT_PROJECT";
+
 /// A project folder's git repository.
 #[derive(Debug, Clone)]
 pub struct Git {
@@ -54,6 +59,7 @@ impl Git {
             .args(args)
             .current_dir(&self.dir)
             .env("GIT_TERMINAL_PROMPT", "0")
+            .env(PARENT_PROJECT_ENV, &self.dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -109,6 +115,7 @@ impl Git {
             .args(args)
             .current_dir(&self.dir)
             .env("GIT_TERMINAL_PROMPT", "0")
+            .env(PARENT_PROJECT_ENV, &self.dir)
             .output()
             .map_err(Error::Spawn)?;
         if out.status.success() {

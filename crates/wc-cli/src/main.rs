@@ -4202,11 +4202,18 @@ fn main() -> ExitCode {
 /// held until the returned file is dropped (or the process ends, even by a crash). A second
 /// command waits for the first, saying so. The lock file is [`project_lock_path`], inside the
 /// project, so every command on the project finds the same one whatever its environment.
-/// `None`, and the command runs unlocked, when `dir` is not a project, or with a warning when
-/// the lock cannot be taken (a read-only folder): the lock guards against overlapping runs, it
-/// is never a reason to refuse one.
+/// `None`, and the command runs unlocked, when `dir` is not a project; when a git command that
+/// a wiringcraft command runs on this project started this one (a hook), as that command holds
+/// the lock and waits for this one; or, with a warning, when the lock cannot be taken (a
+/// read-only folder): the lock guards against overlapping runs, it is never a reason to refuse
+/// one.
 fn project_lock(dir: &Path) -> Option<std::fs::File> {
     if !dir.join(store::PROJECT_FILE).is_file() {
+        return None;
+    }
+    if let Some(parent) = std::env::var_os(wc_vcs::PARENT_PROJECT_ENV)
+        && same_folder(Path::new(&parent), dir)
+    {
         return None;
     }
     let path = project_lock_path(dir);
@@ -4230,35 +4237,66 @@ fn project_lock(dir: &Path) -> Option<std::fs::File> {
             return None;
         }
     };
-    match file.try_lock() {
-        Ok(()) => Some(file),
+    let file = match file.try_lock() {
+        Ok(()) => file,
         Err(std::fs::TryLockError::WouldBlock) => {
             eprintln!("waiting for another wiringcraft command on this project to finish");
             match file.lock() {
-                Ok(()) => Some(file),
+                Ok(()) => file,
                 Err(err) => {
                     unlocked(err.to_string());
-                    None
+                    return None;
                 }
             }
         }
         Err(std::fs::TryLockError::Error(err)) => {
             unlocked(err.to_string());
-            None
+            return None;
         }
+    };
+    keep_lock_out_of_git(dir);
+    Some(file)
+}
+
+/// Whether `a` and `b` are the same folder (by their canonical paths).
+fn same_folder(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
     }
 }
 
-/// Where [`project_lock`] keeps the lock of the project in `dir`: in its git folder when it has
-/// one, so the project's own files and history get nothing extra, else `.wiringcraft.lock` in
-/// the project folder (which a project's `.gitignore` leaves out).
+/// Where [`project_lock`] keeps the lock of the project in `dir`: `.wiringcraft.lock` in the
+/// project folder, always there so a command started before `vcs init` and one started after
+/// it wait on the same file. A new project's `.gitignore` leaves it out.
 fn project_lock_path(dir: &Path) -> PathBuf {
-    let git = dir.join(".git");
-    if git.is_dir() {
-        git.join("wiringcraft.lock")
-    } else {
-        dir.join(".wiringcraft.lock")
+    dir.join(LOCK_NAME)
+}
+
+/// The name of [`project_lock_path`] in the project folder.
+const LOCK_NAME: &str = ".wiringcraft.lock";
+
+/// Leave the lock file out of the project's git history in a repository whose `.gitignore`
+/// predates it: listed in `.git/info/exclude`, which stays local. Best effort: a project whose
+/// exclude list cannot be written only shows the file as new.
+fn keep_lock_out_of_git(dir: &Path) {
+    let info = dir.join(".git").join("info");
+    if !dir.join(".git").is_dir() {
+        return;
     }
+    let exclude = info.join("exclude");
+    let line = format!("/{LOCK_NAME}");
+    let text = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if text.lines().any(|l| l.trim() == line) {
+        return;
+    }
+    let mut text = text;
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&line);
+    text.push('\n');
+    let _ = std::fs::create_dir_all(&info).and_then(|()| std::fs::write(&exclude, text));
 }
 
 /// Parse report names; `all` means every report.
@@ -4960,12 +4998,15 @@ mod tests {
         assert!(project_lock(&dir).is_none());
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
         let held = project_lock(&dir).unwrap();
-        // Outside the project's files: in the git folder when there is one.
         assert_eq!(project_lock_path(&dir), dir.join(".wiringcraft.lock"));
+        // In a repository, git is told to leave it out, once.
         let other = tmp.path().join("other");
         store::create(&other, "Other").unwrap();
         std::fs::create_dir(other.join(".git")).unwrap();
-        assert_eq!(project_lock_path(&other), other.join(".git").join("wiringcraft.lock"));
+        drop(project_lock(&other).unwrap());
+        drop(project_lock(&other).unwrap());
+        let exclude = std::fs::read_to_string(other.join(".git/info/exclude")).unwrap();
+        assert_eq!(exclude, "/.wiringcraft.lock\n");
         // Another project is not held up.
         cli(&other, &["template", "columns", "14"]).unwrap();
         let toml = dir.join(store::PROJECT_FILE);
