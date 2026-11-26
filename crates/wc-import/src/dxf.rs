@@ -709,6 +709,15 @@ fn shapes(
             // Placed past the range of numbers (a huge block placement plus a huge coordinate):
             // a page file could not hold it.
             Some(s) if !finite_shape(&s) => {
+                // A pin circle too big to draw still marks its pin when its centre is in range,
+                // as a stretched one does; the outline is what is left out.
+                if let Shape::Circle { center, .. } = &s
+                    && is_pin_layer(&layer)
+                    && center.x.is_finite()
+                    && center.y.is_finite()
+                {
+                    points.push((layer.clone(), *center));
+                }
                 let left_out = skipped.entry(PLACED_NOT_NUMBERS.to_owned()).or_default();
                 *left_out = left_out.saturating_add(1);
             }
@@ -2264,8 +2273,8 @@ pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<
         &mut { MAX_DRAWN },
     );
     out.graphics = raw.into_iter().map(|(_, s)| s).collect();
-    out.warnings = skipped_warnings(skipped);
-    out.warnings.extend(tag_warnings);
+    out.warnings = skipped_warnings(skipped.clone());
+    out.warnings.extend(tag_warnings.iter().cloned());
     // Move into the frame: top-left at (20, 20) mm.
     let mut pts: Vec<Point> = out
         .graphics
@@ -2289,6 +2298,17 @@ pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<
     out.graphics = out.graphics.iter().map(|s| s.translate(shift)).collect();
     for s in &mut out.symbols {
         s.at = s.at + shift;
+    }
+    // The move can carry a shape far out past the range of numbers: left out and counted.
+    let before = out.graphics.len() + out.symbols.len();
+    out.graphics.retain(finite_shape);
+    out.symbols.retain(|s| s.at.x.is_finite() && s.at.y.is_finite());
+    let moved_out = before - out.graphics.len() - out.symbols.len();
+    if moved_out > 0 {
+        let left_out = skipped.entry(PLACED_NOT_NUMBERS.to_owned()).or_default();
+        *left_out = left_out.saturating_add(moved_out);
+        out.warnings = skipped_warnings(skipped);
+        out.warnings.extend(tag_warnings);
     }
     Ok(out)
 }
@@ -2328,6 +2348,40 @@ mod tests {
             "y flipped: the lower pin is further down"
         );
         assert_eq!(s.graphics.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn far_pin_circles_and_shapes_moved_past_the_numbers_are_handled() -> Result<()> {
+        // A pin circle whose radius overflows once scaled: the pin stays (once), the outline
+        // is left out.
+        let blocks = "0\nBLOCK\n2\nP\n10\n0\n20\n0\n0\nCIRCLE\n8\nPIN\n10\n1\n20\n1\n40\n1e308\n0\nENDBLK\n";
+        let ents = "0\nINSERT\n2\nP\n10\n0\n20\n0\n41\n2\n42\n2\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n";
+        let (s, warnings) = symbol_with_warnings(&dxf(ents, blocks), "my.far", "Far")?;
+        assert_eq!(s.pins.len(), 1, "{:?}", s.pins);
+        // The symbol is moved so its first pin is the origin: the pin at the placed centre
+        // (2, -2) puts the line's start at (-2, 2).
+        assert_eq!(s.pins[0].at, Point::new(0.0, 0.0));
+        assert!(
+            matches!(&s.graphics[..], [Shape::Line { a, .. }] if *a == Point::new(-2.0, 2.0)),
+            "{:?}",
+            s.graphics
+        );
+        assert!(
+            warnings.iter().any(|w| w.starts_with("1 entity placed outside")),
+            "{warnings:?}"
+        );
+        // Moving a page into the frame can push a far shape past the numbers: left out and
+        // counted, the rest kept.
+        let ents = "0\nLINE\n10\n-1e308\n20\n0\n11\n-1e308\n21\n1\n0\nLINE\n10\n1.7e308\n20\n0\n11\n1.7e308\n21\n1\n";
+        let p = page(&dxf(ents, ""), 1.0, &BTreeSet::new())?;
+        assert_eq!(p.graphics.len(), 1, "{:?}", p.graphics);
+        assert!(p.graphics.iter().all(finite_shape), "{:?}", p.graphics);
+        assert!(
+            p.warnings.iter().any(|w| w.starts_with("1 entity placed outside")),
+            "{:?}",
+            p.warnings
+        );
         Ok(())
     }
 
