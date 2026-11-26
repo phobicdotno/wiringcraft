@@ -1376,6 +1376,24 @@ fn marker_list_headers_and_types_follow_the_language_and_warnings_still_find_wir
 }
 
 #[test]
+fn a_numbered_wire_repeated_on_an_overview_gets_no_extra_markers() {
+    let (mut p, s, parts) = fixture();
+    p.pages[0].wires[0].number = Some("7".into());
+    let mut overview = p.pages[0].clone();
+    overview.id = "ov".into();
+    overview.overview = true;
+    p.pages.push(overview);
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = marking_list(&i, &[MarkerKind::Wires]);
+    let rows: Vec<String> = t.rows.iter().map(|r| r.join("|")).collect();
+    assert!(rows.contains(&"Wire||7|2".to_owned()), "{rows:?}");
+}
+
+#[test]
 fn formula_warnings_check_every_marker_line_and_free_marker_texts() {
     let (mut p, s, parts) = fixture();
     p.pages[0].wires[0].number = Some("=1".into());
