@@ -5490,10 +5490,20 @@ impl eframe::App for App {
                         panels::properties(ui, open, &mut self.ed, &mut self.panels);
                     });
                 });
+            // Keyboard edits wait while a dialog, an import or the symbol editor has the keyboard,
+            // as the schematic's arrow keys do.
+            let keyboard_edits = self.dialog.is_none() && self.importing.is_none() && self.symbol_editor.is_none();
             egui::CentralPanel::default().frame(egui::Frame::new()).show(ctx, |ui| {
                 self.ed.auto_wire = self.prefs.auto_wire;
                 self.ed.layers = self.prefs.layers.clone();
-                canvas::show(ui, open, &mut self.ed, self.prefs.show_grid, self.prefs.snap);
+                canvas::show(
+                    ui,
+                    open,
+                    &mut self.ed,
+                    self.prefs.show_grid,
+                    self.prefs.snap,
+                    keyboard_edits,
+                );
                 let held = open
                     .project
                     .pages
@@ -7305,6 +7315,72 @@ mod nudge_tests {
             assert!(app.open.as_mut().unwrap().undo());
             assert_eq!((coil_at(&app), wires(&app)), (Point::new(55.0, 60.0), 0));
         }
+    }
+
+    #[test]
+    fn an_arrow_press_through_the_app_frame_leaves_the_panel_device_alone_behind_a_dialog() {
+        use wc_core::panel::{Panel, PanelItem};
+        let (_tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        let open = app.open.as_mut().unwrap();
+        open.project.panels.push(Panel {
+            id: "panel1".into(),
+            name: "Panel 1".into(),
+            width: 400.0,
+            height: 300.0,
+            items: vec![PanelItem::Device {
+                tag: wc_core::DeviceTag::parse("-K1").unwrap(),
+                at: Point::new(100.0, 100.0),
+                width: 40.0,
+                height: 60.0,
+                rotation: wc_core::geom::Rotation::R0,
+            }],
+        });
+        let panel = open.project.panels.len() - 1;
+        app.ed.panel = Some(panel);
+        app.ed.panel_pick = Some(0);
+        let mut frame = eframe::Frame::_new_kittest();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame)
+        });
+        let device_at = |app: &App| {
+            let open = app.open.as_ref().unwrap();
+            match open.project.panels[panel].items.first() {
+                Some(PanelItem::Device { at, .. }) => *at,
+                _ => unreachable!("the device is there"),
+            }
+        };
+        let undo_steps = |app: &App| app.open.as_ref().unwrap().undo_steps();
+        let right = || egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+
+        // A message box is open: the press leaves the device and the undo history alone.
+        app.dialog = Some(Dialog::Message("Something to read.".into()));
+        let steps = undo_steps(&app);
+        let _ = ctx.run(right(), |ctx| eframe::App::update(&mut app, ctx, &mut frame));
+        assert!(app.dialog.is_some(), "the message box is still open");
+        assert_eq!(device_at(&app), Point::new(100.0, 100.0));
+        assert_eq!(undo_steps(&app), steps);
+
+        // With the message box closed, the same press moves the device one step.
+        app.dialog = None;
+        let _ = ctx.run(right(), |ctx| eframe::App::update(&mut app, ctx, &mut frame));
+        assert_eq!(device_at(&app), Point::new(105.0, 100.0));
+        assert_eq!(undo_steps(&app), steps + 1);
+        assert_eq!(
+            coil_at(&app),
+            Point::new(80.0, 60.0),
+            "the page behind the panel stays put"
+        );
     }
 }
 
