@@ -201,6 +201,16 @@ enum Dialog {
         lib: prefs::FolderField,
         error: Option<String>,
     },
+    /// File > Import, after the file is picked: the options the command line has for the
+    /// format, with its defaults filled in.
+    ImportOptions {
+        file: PathBuf,
+        /// The library folder for parts, chosen before the file.
+        lib: Option<PathBuf>,
+        target: Option<import_symbols::ImportTarget>,
+        form: Box<imports::Form>,
+        error: Option<String>,
+    },
     /// Parts import: the library folder to write into, then the file.
     ImportParts {
         kind: imports::Kind,
@@ -971,7 +981,30 @@ impl App {
         } else {
             None
         };
-        self.import_from(kind, &file, lib.as_deref(), target);
+        self.import_picked(kind, &file, lib.as_deref(), target);
+    }
+
+    /// The file is chosen: ask for the options the format has ([`imports::Kind::options`]), or
+    /// start at once when it has none.
+    fn import_picked(
+        &mut self,
+        kind: imports::Kind,
+        file: &Path,
+        lib: Option<&Path>,
+        target: Option<import_symbols::ImportTarget>,
+    ) {
+        if kind.options().is_empty() {
+            self.import_from(kind, file, lib, target, &imports::Options::default());
+            return;
+        }
+        let Some(open) = self.open.as_ref() else { return };
+        self.dialog = Some(Dialog::ImportOptions {
+            file: file.to_path_buf(),
+            lib: lib.map(Path::to_path_buf),
+            target,
+            form: Box::new(imports::Form::new(open, kind, file)),
+            error: None,
+        });
     }
 
     /// Why an import cannot run now: it writes to the project folder, which a shared session or
@@ -991,7 +1024,7 @@ impl App {
         }
     }
 
-    /// Start the import of `file` (parts into `lib`) on a worker thread; [`App::poll_import`]
+    /// Start the import of `file` (parts into `lib`) with `options` on a worker thread; [`App::poll_import`]
     /// shows what it says while it runs and takes the result in when it ends. `target` is the
     /// library folder chosen in the parts dialog, declared in the project when it is new.
     fn import_from(
@@ -1000,6 +1033,7 @@ impl App {
         file: &Path,
         lib: Option<&Path>,
         target: Option<import_symbols::ImportTarget>,
+        options: &imports::Options,
     ) {
         // Checked again here: the typed path form stays open while a session or a command starts.
         if let Some(why) = self.import_refused() {
@@ -1008,7 +1042,7 @@ impl App {
         }
         let Some(open) = self.open.as_mut() else { return };
         applog::info(&format!("import {kind:?} {}", file.display()));
-        let job = imports::start(open, kind, file, lib, self.ed.page);
+        let job = imports::start(open, kind, file, lib, self.ed.page, options);
         // Nothing half done is left: a tool's preview, a wire being drawn.
         self.ed.wire = None;
         self.ed.shape_points.clear();
@@ -1879,6 +1913,7 @@ impl App {
             Dialog::ImportSymbols { .. } => "Import symbols",
             Dialog::ImportParts { .. } => "Import parts",
             Dialog::ImportPath { .. } => "Import",
+            Dialog::ImportOptions { .. } => "Import options",
             Dialog::Report { .. } => "Report a problem",
             Dialog::WagoMarking { .. } => "WAGO marking",
         };
@@ -3315,7 +3350,7 @@ impl App {
                                     let (kind, target) = (*kind, target.clone());
                                     let l = l.or_else(|| target.as_ref().map(|t| t.root.clone()));
                                     then = Some(Box::new(move |app: &mut App| {
-                                        app.import_from(kind, &f, l.as_deref(), target);
+                                        app.import_picked(kind, &f, l.as_deref(), target);
                                     }));
                                     keep = false;
                                 }
@@ -3323,6 +3358,45 @@ impl App {
                             }
                         }
                         if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                }
+                Dialog::ImportOptions {
+                    file,
+                    lib,
+                    target,
+                    form,
+                    error,
+                } => {
+                    ui.label(form.kind.title());
+                    ui.label(file.display().to_string());
+                    egui::Grid::new("import_options").num_columns(2).show(ui, |ui| {
+                        if form.has(imports::Opt::Scale) {
+                            ui.label("Scale").on_hover_text(
+                                "The drawing's coordinates are multiplied by this to get mm: 1 for a drawing in mm, 10 for one in cm, 25.4 for one in inches",
+                            );
+                            ui.add(egui::TextEdit::singleline(&mut form.scale).desired_width(80.0));
+                            ui.end_row();
+                        }
+                    });
+                    if let Some(e) = error {
+                        ui.label(RichText::new(e.as_str()).color(theme::Theme::of(ui.ctx()).error));
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Import").clicked() {
+                            match form.options() {
+                                Ok(options) => {
+                                    let (kind, f, l, target) = (form.kind, file.clone(), lib.clone(), target.clone());
+                                    then = Some(Box::new(move |app: &mut App| {
+                                        app.import_from(kind, &f, l.as_deref(), target, &options);
+                                    }));
+                                    keep = false;
+                                }
+                                Err(e) => *error = Some(e),
+                            }
+                        }
+                        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
                             keep = false;
                         }
                     });

@@ -2,7 +2,8 @@
 //! through the same functions as the CLI ([`wc_import::run`]). The file and, for parts, the
 //! library folder come from the system pickers. The import runs on a worker thread ([`Job`])
 //! while the window shows what it has said so far; at the end what it said is shown in a
-//! message.
+//! message. The options the command line has for a format ([`Opt`]) are asked for in a small
+//! dialog after the file is picked ([`Form`]), with the command line's defaults filled in.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
@@ -101,6 +102,75 @@ impl Kind {
     }
 }
 
+/// An option of an import that `wiringcraft import` has too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Opt {
+    /// Millimetres per drawing unit (`--scale`).
+    Scale,
+}
+
+impl Kind {
+    /// The options asked for after the file is picked; none: the import starts at once.
+    pub fn options(self) -> &'static [Opt] {
+        match self {
+            Kind::PageDwg | Kind::PageDxf => &[Opt::Scale],
+            _ => &[],
+        }
+    }
+}
+
+/// What an import runs with besides its file. The default is the command line's.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Options {
+    /// A drawing's coordinates are multiplied by this to get mm.
+    pub scale: f64,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self { scale: 1.0 }
+    }
+}
+
+/// The options dialog: an import's options as typed, starting from the command line's defaults.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Form {
+    pub kind: Kind,
+    pub scale: String,
+}
+
+impl Form {
+    /// The form for importing `file` as `kind` into `open`, with the defaults filled in.
+    pub fn new(_open: &Open, kind: Kind, _file: &Path) -> Self {
+        Self {
+            kind,
+            scale: "1".to_owned(),
+        }
+    }
+
+    /// Whether the form shows `opt`.
+    pub fn has(&self, opt: Opt) -> bool {
+        self.kind.options().contains(&opt)
+    }
+
+    /// What was typed, as the import's options, or what to correct.
+    pub fn options(&self) -> Result<Options, String> {
+        let mut o = Options::default();
+        if self.has(Opt::Scale) {
+            // A decimal comma is read as a point.
+            o.scale = self
+                .scale
+                .trim()
+                .replace(',', ".")
+                .parse::<f64>()
+                .ok()
+                .filter(|s| s.is_finite() && *s > 0.0)
+                .ok_or_else(|| "The scale must be a number above 0, for example 1 or 0.1.".to_owned())?;
+        }
+        Ok(o)
+    }
+}
+
 /// The first page number for an import: `default`, or the number after the project's highest
 /// numeric page when that is higher, so the new pages never take a number in use. None when
 /// the highest page number has no number after it.
@@ -146,10 +216,11 @@ pub struct Job {
 }
 
 /// Start importing `file` as `kind`: parts into the library folder `lib`, everything else into
-/// the open project (a DWG or DXF drawing onto page `page`). Changes not saved yet are saved
-/// first, since the import works on the project folder. The import runs on a worker thread;
-/// a reason it cannot start (no free page number, say) comes back from the job as its result.
-pub fn start(open: &mut Open, kind: Kind, file: &Path, lib: Option<&Path>, page: usize) -> Job {
+/// the open project (a DWG or DXF drawing onto page `page`), with the options `options`.
+/// Changes not saved yet are saved first, since the import works on the project folder. The
+/// import runs on a worker thread; a reason it cannot start (no free page number, say) comes
+/// back from the job as its result.
+pub fn start(open: &mut Open, kind: Kind, file: &Path, lib: Option<&Path>, page: usize, options: &Options) -> Job {
     let name = file
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -184,7 +255,7 @@ pub fn start(open: &mut Open, kind: Kind, file: &Path, lib: Option<&Path>, page:
                 Err(format!("the project could not be saved first: {e}")),
             ),
             // What was written comes in also when a part of an archive failed.
-            Ok(()) => (Adopt::Project, project_work(open, kind, f, page)),
+            Ok(()) => (Adopt::Project, project_work(open, kind, f, page, options)),
         }
     };
     let (lines, done) = spawn(work);
@@ -232,8 +303,9 @@ fn spawn(work: Result<Work, String>) -> Running {
 
 /// The import of `file` into the project folder, ready to run on the worker thread, or why
 /// it cannot run.
-fn project_work(open: &Open, kind: Kind, f: PathBuf, page: usize) -> Result<Work, String> {
+fn project_work(open: &Open, kind: Kind, f: PathBuf, page: usize, options: &Options) -> Result<Work, String> {
     let dir = open.dir.clone();
+    let scale = options.scale;
     // Only for the imports that add pages, numbered from a free number.
     let first = || {
         first_free_page(open, kind.first_page()).ok_or_else(|| {
@@ -269,10 +341,10 @@ fn project_work(open: &Open, kind: Kind, f: PathBuf, page: usize) -> Result<Work
             };
             let id = pg.id.clone();
             if kind == Kind::PageDxf {
-                Box::new(move |log| run::page_dxf(&dir, &f, &id, 1.0, log))
+                Box::new(move |log| run::page_dxf(&dir, &f, &id, scale, log))
             } else {
                 let converter = std::env::var("WIRINGCRAFT_DWG2DXF").ok();
-                Box::new(move |log| run::import_page_dwg(&dir, &f, &id, 1.0, converter, log))
+                Box::new(move |log| run::import_page_dwg(&dir, &f, &id, scale, converter, log))
             }
         }
     })
@@ -354,11 +426,24 @@ impl Job {
     }
 }
 
+/// Import `file` as `kind` with the default options and wait for it ([`import_with`]).
+#[cfg(test)]
+pub fn import(open: &mut Open, kind: Kind, file: &Path, lib: Option<&Path>, page: usize) -> (bool, String) {
+    import_with(open, kind, file, lib, page, &Options::default())
+}
+
 /// Import `file` as `kind` and wait for it: [`start`], then [`Job::finish`]. Returns the text
 /// for the message dialog and whether it was done. The app polls instead ([`Job::poll`]).
 #[cfg(test)]
-pub fn import(open: &mut Open, kind: Kind, file: &Path, lib: Option<&Path>, page: usize) -> (bool, String) {
-    let job = start(open, kind, file, lib, page);
+pub fn import_with(
+    open: &mut Open,
+    kind: Kind,
+    file: &Path,
+    lib: Option<&Path>,
+    page: usize,
+    options: &Options,
+) -> (bool, String) {
+    let job = start(open, kind, file, lib, page, options);
     let (r, log) = job.wait();
     job.finish(open, r, &log)
 }
@@ -508,6 +593,74 @@ pub(crate) mod tests {
         assert!(done, "{msg}");
         let shapes = open.project.pages.get(page).map_or(0, |pg| pg.graphics.len());
         assert_eq!(shapes, 1, "{msg}");
+    }
+
+    /// A DXF drawing with one line from the origin to x = 10.
+    const DXF_LINE: &str = "0\nSECTION\n2\nENTITIES\n0\nLINE\n8\n0\n10\n0\n20\n0\n11\n10\n21\n0\n0\nENDSEC\n0\nEOF\n";
+
+    /// How wide the shapes on `page` are together, in mm.
+    fn drawn_width(open: &Open, page: usize) -> f64 {
+        let xs: Vec<f64> = open
+            .project
+            .pages
+            .get(page)
+            .map(|pg| {
+                pg.graphics
+                    .iter()
+                    .map(|g| g.bounds())
+                    .flat_map(|(a, b)| [a.x, b.x])
+                    .collect()
+            })
+            .unwrap_or_default();
+        let (lo, hi) = xs
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(lo, hi), x| (lo.min(*x), hi.max(*x)));
+        if xs.is_empty() { 0.0 } else { hi - lo }
+    }
+
+    #[test]
+    fn a_drawing_comes_in_at_the_scale_given_as_the_command_line_scales_it() {
+        let (tmp, mut open) = project();
+        let page = open.add_page();
+        let dxf = tmp.path().join("plan.dxf");
+        assert!(std::fs::write(&dxf, DXF_LINE).is_ok());
+        let form = Form {
+            scale: "2,5".to_owned(),
+            ..Form::new(&open, Kind::PageDxf, &dxf)
+        };
+        let options = form.options();
+        let Ok(options) = options else {
+            unreachable!("{options:?}");
+        };
+        let (done, msg) = import_with(&mut open, Kind::PageDxf, &dxf, None, page, &options);
+        assert!(done, "{msg}");
+        assert!((drawn_width(&open, page) - 25.0).abs() < 1e-6, "{msg}");
+        // The default is the command line's: 1.
+        let other = open.add_page();
+        let (done, msg) = import(&mut open, Kind::PageDxf, &dxf, None, other);
+        assert!(done, "{msg}");
+        assert!((drawn_width(&open, other) - 10.0).abs() < 1e-6, "{msg}");
+    }
+
+    #[test]
+    fn the_options_form_shows_only_what_the_format_has_with_the_defaults() {
+        let (tmp, open) = project();
+        let file = tmp.path().join("x");
+        for kind in [Kind::PageDwg, Kind::PageDxf] {
+            let form = Form::new(&open, kind, &file);
+            assert!(form.has(Opt::Scale), "{kind:?}");
+            assert_eq!(form.options(), Ok(Options::default()), "{kind:?}");
+        }
+        for kind in [Kind::PlcCsv, Kind::PartsBmecat, Kind::PartsCsv, Kind::SweLibrary] {
+            assert!(kind.options().is_empty(), "{kind:?}");
+        }
+        for bad in ["", "0", "-1", "abc", "inf", "NaN"] {
+            let form = Form {
+                scale: bad.to_owned(),
+                ..Form::new(&open, Kind::PageDwg, &file)
+            };
+            assert!(form.options().is_err(), "{bad:?}");
+        }
     }
 
     #[test]

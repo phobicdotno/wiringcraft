@@ -3936,12 +3936,41 @@ mod tests {
     }
 
     #[test]
+    fn a_picked_file_asks_for_the_options_its_format_has_and_starts_at_once_without_any() {
+        let (tmp, mut a) = app(vec![]);
+        let dxf = tmp.path().join("plan.dxf");
+        a.import_picked(crate::imports::Kind::PageDxf, &dxf, None, None);
+        assert!(a.importing.is_none());
+        let Some(Dialog::ImportOptions { form, file, .. }) = &a.dialog else {
+            unreachable!("no options dialog");
+        };
+        assert_eq!(file, &dxf);
+        assert!(form.has(crate::imports::Opt::Scale));
+        assert_eq!(form.scale, "1");
+
+        // A PLC address list has no options: it starts as before.
+        a.dialog = None;
+        let csv = tmp.path().join("plc.csv");
+        std::fs::write(&csv, "device;address\n").unwrap();
+        a.import_picked(crate::imports::Kind::PlcCsv, &csv, None, None);
+        assert!(a.dialog.is_none());
+        assert!(a.importing.is_some());
+        until_imported(&mut a);
+    }
+
+    #[test]
     fn an_import_runs_off_the_window_thread_with_edits_held_until_it_is_taken_in() {
         let (tmp, mut a) = app(vec![]);
         let aml = tmp.path().join("plant.aml");
         std::fs::write(&aml, crate::imports::tests::AML).unwrap();
         let pages = a.open.as_ref().unwrap().project.pages.len();
-        a.import_from(crate::imports::Kind::Aml, &aml, None, None);
+        a.import_from(
+            crate::imports::Kind::Aml,
+            &aml,
+            None,
+            None,
+            &crate::imports::Options::default(),
+        );
         assert!(a.importing.is_some());
         assert!(a.dialog.is_none());
 
@@ -3961,7 +3990,13 @@ mod tests {
         assert_eq!(a.open.as_ref().unwrap().dir, dir);
         assert!(matches!(&a.dialog, Some(Dialog::Message(m)) if m.contains("import is running")));
         a.dialog = None;
-        a.import_from(crate::imports::Kind::Aml, &aml, None, None);
+        a.import_from(
+            crate::imports::Kind::Aml,
+            &aml,
+            None,
+            None,
+            &crate::imports::Options::default(),
+        );
         assert!(matches!(&a.dialog, Some(Dialog::Message(m)) if m.contains("import is running")));
         a.dialog = None;
         assert_eq!(a.open.as_ref().unwrap().project.pages.len(), pages);
@@ -3988,7 +4023,13 @@ mod tests {
     fn a_failing_import_shows_why_once_it_ends() {
         let (tmp, mut a) = app(vec![]);
         let before = a.open.as_ref().unwrap().project.clone();
-        a.import_from(crate::imports::Kind::Aml, &tmp.path().join("missing.aml"), None, None);
+        a.import_from(
+            crate::imports::Kind::Aml,
+            &tmp.path().join("missing.aml"),
+            None,
+            None,
+            &crate::imports::Options::default(),
+        );
         until_imported(&mut a);
         let Some(Dialog::Message(msg)) = &a.dialog else {
             unreachable!("no message");
@@ -4004,7 +4045,13 @@ mod tests {
         let (tmp, mut a) = app(vec![]);
         let aml = tmp.path().join("plant.aml");
         std::fs::write(&aml, crate::imports::tests::AML).unwrap();
-        a.import_from(crate::imports::Kind::Aml, &aml, None, None);
+        a.import_from(
+            crate::imports::Kind::Aml,
+            &aml,
+            None,
+            None,
+            &crate::imports::Options::default(),
+        );
         assert!(a.importing.is_some());
         a.assistant.input = "add a page".into();
         let shot = crate::screenshot::Shot::from_rgba(1, 1, vec![0, 0, 0, 255]).unwrap();
@@ -4032,7 +4079,13 @@ mod tests {
         let (tmp, mut a) = app(vec![]);
         let aml = tmp.path().join("plant.aml");
         std::fs::write(&aml, crate::imports::tests::AML).unwrap();
-        a.import_from(crate::imports::Kind::Aml, &aml, None, None);
+        a.import_from(
+            crate::imports::Kind::Aml,
+            &aml,
+            None,
+            None,
+            &crate::imports::Options::default(),
+        );
         // Opening another project is refused while it runs; this one got there all the same.
         let other = tmp.path().join("other");
         wc_core::store::create(&other, "Other").unwrap();
@@ -4075,7 +4128,13 @@ mod tests {
 
         let aml = tmp.path().join("plant.aml");
         std::fs::write(&aml, crate::imports::tests::AML).unwrap();
-        a.import_from(crate::imports::Kind::Aml, &aml, None, None);
+        a.import_from(
+            crate::imports::Kind::Aml,
+            &aml,
+            None,
+            None,
+            &crate::imports::Options::default(),
+        );
         assert!(cancelled(&mut a));
         assert!(a.ed.message.contains("not closed"), "{}", a.ed.message);
         until_imported(&mut a);
@@ -4087,7 +4146,13 @@ mod tests {
         let (tmp, mut a) = app(vec![]);
         let aml = tmp.path().join("plant.aml");
         std::fs::write(&aml, crate::imports::tests::AML).unwrap();
-        a.import_from(crate::imports::Kind::Aml, &aml, None, None);
+        a.import_from(
+            crate::imports::Kind::Aml,
+            &aml,
+            None,
+            None,
+            &crate::imports::Options::default(),
+        );
         assert!(a.importing.is_some());
         let zoom = a.ed.view.zoom;
         a.run(Action::ZoomIn);

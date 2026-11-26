@@ -43,6 +43,11 @@ use its reading tools, and no new turn starts). The window has the view controls
 (zoom, grid, theme, layers). Messages that name a command line option are worded
 for the app.
 
+Where the format has options on the command line, a small dialog asks for them after the file
+is picked, with the command line's defaults filled in; a format without options starts at once.
+A DWG or DXF drawing has its scale (`--scale`, 1 by default: the drawing's coordinates are
+multiplied by it to get mm).
+
 Changes not saved yet are saved first, the imported pages and devices come in as one undo step,
 and the import's report and warnings are shown when it is done. New pages are numbered from the
 CLI's default first page, or after the project's highest page number when that is higher. The
