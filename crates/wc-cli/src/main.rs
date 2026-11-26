@@ -372,9 +372,11 @@ enum Cmd {
         edit: Option<TranslationsCmd>,
     },
     /// Export pages as drawings for other tools: one SVG or DXF file per page in a folder,
-    /// drawn like the PDF (frame, title block, symbols, wires, cross-references).
+    /// drawn like the PDF (frame, title block, symbols, wires, cross-references), and one per
+    /// panel layout (plate, rails, ducts, devices).
     Drawing {
-        /// Output folder; files are named `<page number>.<format>`.
+        /// Output folder; files are named `<page number>.<format>`, and `panel-<name>.<format>`
+        /// for panel layouts.
         out: PathBuf,
         /// `svg` or `dxf`.
         #[arg(long, default_value = "svg")]
@@ -3746,29 +3748,35 @@ fn run(mut cli: Cli) -> Res<()> {
             for m in missing {
                 eprintln!("warning: symbol {m} has no vendored copy (run `wiringcraft lib lock`)");
             }
+            // Panel layouts follow the pages, one file each, as their PDF sheets.
+            let options = wc_pdf::Options {
+                pages,
+                date,
+                panels: p.panels.clone(),
+                footprints: wc_pdf::footprints(vendored_parts(dir, &p).values()),
+                ..Default::default()
+            };
             // Only SVG shows pictures; a DXF export neither reads nor checks them.
             let (drawings, report) = if ext == "svg" {
                 let pictures = wc_pdf::read_pictures(dir, &p);
                 let options = wc_pdf::Options {
-                    pages,
-                    date,
                     underlays: pictures.files,
                     unreadable: pictures.unreadable,
-                    ..Default::default()
+                    ..options
                 };
                 wc_pdf::page_drawings(&p, &symbols, &options)
             } else {
-                let options = wc_pdf::Options {
-                    pages,
-                    date,
-                    ..Default::default()
-                };
                 wc_pdf::page_lines(&p, &symbols, &options)
             };
             make_out_dir(&out)?;
             let mut used = std::collections::BTreeSet::new();
             for d in &drawings {
-                let mut stem = file_stem(&d.number, &d.id);
+                // A panel is named after itself: `panel-Cabinet_1`.
+                let mut stem = if d.panel {
+                    format!("panel-{}", file_stem(&d.title, &d.id.replacen("panel-", "", 1)))
+                } else {
+                    file_stem(&d.number, &d.id)
+                };
                 while !used.insert(stem.clone()) {
                     stem.push('_');
                 }
@@ -7404,6 +7412,30 @@ mod tests {
         p.pages[0].id = "a\u{1b}[2Jb".into();
         let err = check_pages(&p, &["nope".into()]).unwrap_err();
         assert!(err.contains("a\\u{1b}[2Jb") && !err.contains('\u{1b}'), "{err}");
+    }
+
+    #[test]
+    fn drawing_writes_a_file_per_panel_layout_next_to_the_pages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["panel", "new", "plate1", "--name", "Main cabinet/A"]).unwrap();
+        let number = load(&dir).unwrap().pages[0].number.clone();
+        for ext in ["dxf", "svg"] {
+            let out = tmp.path().join(ext);
+            cli(&dir, &["drawing", out.to_str().unwrap(), "--format", ext]).unwrap();
+            let mut names: Vec<String> = std::fs::read_dir(&out)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            let page = format!("{}.{ext}", file_stem(&number, ""));
+            let mut want = [format!("panel-Main_cabinet_A.{ext}"), page];
+            want.sort();
+            assert_eq!(names, want, "{ext}");
+        }
+        let dxf = std::fs::read_to_string(tmp.path().join("dxf").join("panel-Main_cabinet_A.dxf")).unwrap();
+        assert!(dxf.contains("POLYLINE") && dxf.contains("Main cabinet/A"), "{dxf}");
     }
 
     #[test]

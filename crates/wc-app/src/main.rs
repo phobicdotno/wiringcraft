@@ -5154,7 +5154,8 @@ fn same_dir(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// Every page as SVG and DXF in `export/drawings`, named by page number.
+/// Every page as SVG and DXF in `export/drawings`, named by page number, and every panel
+/// layout, named `panel-<name>`.
 fn export_drawings(open: &Open) -> String {
     export_drawings_to(open, &open.dir.join("export").join("drawings"))
 }
@@ -5165,6 +5166,8 @@ fn export_drawings_to(open: &Open, dir: &Path) -> String {
     let options = wc_pdf::Options {
         underlays: pictures.files,
         unreadable: pictures.unreadable,
+        panels: open.project.panels.clone(),
+        footprints: wc_pdf::footprints(open.parts.values()),
         ..Default::default()
     };
     let (pages, report) = wc_pdf::page_drawings(&open.project, &open.symbols, &options);
@@ -5172,15 +5175,20 @@ fn export_drawings_to(open: &Open, dir: &Path) -> String {
     let files: Vec<(String, &wc_pdf::PageDrawing)> = pages
         .iter()
         .map(|page| {
-            let base = if page.number.trim().is_empty() {
-                &page.id
+            // A panel layout is named after itself (`panel-Main_cabinet`), a page by its number.
+            let (prefix, name) = if page.panel {
+                ("panel-", page.title.trim())
             } else {
-                page.number.trim()
+                ("", page.number.trim())
             };
+            let base = if name.is_empty() { &page.id } else { name };
             let mut stem: String = base
                 .chars()
                 .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
                 .collect();
+            if !(prefix.is_empty() || name.is_empty()) {
+                stem.insert_str(0, prefix);
+            }
             // Compared without case: `A1` and `a1` are one file name on Windows and macOS.
             while !used.insert(stem.to_lowercase()) {
                 stem.push('_');
@@ -5242,7 +5250,12 @@ fn export_drawings_to(open: &Open, dir: &Path) -> String {
     }
     match written {
         Ok(()) => {
-            let mut m = format!("Exported {} pages as SVG and DXF to\n{}", pages.len(), dir.display());
+            let panels = pages.iter().filter(|p| p.panel).count();
+            let mut m = format!("Exported {} pages", pages.len() - panels);
+            if panels > 0 {
+                m.push_str(&format!(" and {panels} panel layout(s)"));
+            }
+            m.push_str(&format!(" as SVG and DXF to\n{}", dir.display()));
             if !report.warnings.is_empty() {
                 m.push_str("\n\nWarnings:\n");
                 m.push_str(&report.warnings.join("\n"));
@@ -6618,6 +6631,31 @@ mod marking_tests {
             .collect();
         names.sort();
         assert_eq!(names, ["a1.dxf", "a1.svg", "a1_.dxf", "a1_.svg"]);
+    }
+
+    #[test]
+    fn drawings_include_a_file_per_panel_layout() {
+        let (_tmp, mut o) = state::tests::project();
+        o.project.pages.truncate(1);
+        o.project.pages[0].number = "1".into();
+        o.project.panels.push(wc_core::panel::Panel::with_rails(
+            "plate1",
+            "Main cabinet",
+            600.0,
+            800.0,
+        ));
+        let own = o.dir.join("export").join("drawings");
+        let msg = export_drawings_to(&o, &own);
+        assert!(msg.starts_with("Exported 1 pages and 1 panel layout(s)"), "{msg}");
+        let mut names: Vec<String> = std::fs::read_dir(&own)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["1.dxf", "1.svg", "panel-Main_cabinet.dxf", "panel-Main_cabinet.svg"]
+        );
     }
 
     #[test]
