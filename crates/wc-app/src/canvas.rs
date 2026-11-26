@@ -1993,8 +1993,8 @@ fn cancel_drag(open: &mut Open, ed: &mut Editor) {
             // Said only when the move is still there to undo: a move already undone has
             // nothing to take back.
             if open.has_undo_step(id) && !open.take_back_move(id, &page, &items) {
-                ed.message = "The move could not be taken back: a drawing, cloud or wire was added or \
-                              deleted during it. Undo goes back step by step."
+                ed.message = "The move could not be taken back: items were added or deleted during it. \
+                              Undo goes back step by step."
                     .into();
             }
         }
@@ -5009,6 +5009,35 @@ mod tests {
         assert_eq!(at(&o), start, "Escape still finds the redone move");
         assert_eq!(o.undo_steps(), steps);
         assert!(ed.message.is_empty(), "{}", ed.message);
+    }
+
+    #[test]
+    fn escape_after_an_assistant_turn_folded_into_one_step_only_ends_the_drag() {
+        let (_tmp, mut o, mut ed, _) = moving_coil();
+        let page = ed.page;
+        let line = |x: f64| Shape::Line {
+            a: Point::new(x, 100.0),
+            b: Point::new(x + 10.0, 100.0),
+        };
+        let Some(g) = o.add_graphic(page, line(10.0)) else {
+            unreachable!()
+        };
+        ed.selection.push(g.clone());
+        drag(&mut o, &mut ed, Point::new(-40.0, 0.0));
+        // One assistant turn deletes the line and draws another: the same count of drawings,
+        // and the step in between is folded away.
+        let mark = o.start_turn();
+        o.delete_many(page, &[g]);
+        o.add_graphic(page, line(200.0));
+        o.squash_undo(mark);
+        let now = o.project.pages[page].clone();
+        cancel_drag(&mut o, &mut ed);
+        assert!(ed.drag.is_none());
+        assert_eq!(
+            o.project.pages[page], now,
+            "the new line is not moved by the old one's offset"
+        );
+        assert!(!ed.message.is_empty(), "the editor says why");
     }
 
     #[test]

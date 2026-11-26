@@ -202,6 +202,9 @@ struct Step {
     /// How far the running move drag had moved its items in `project` (see
     /// [`Open::drag_offset`]); zero outside a drag.
     offset: Point,
+    /// Later steps were folded into this one (an assistant turn, a command): what happened in
+    /// between is no longer in the history, so [`Open::take_back_move`] cannot check it.
+    folded: bool,
 }
 
 impl Step {
@@ -211,6 +214,7 @@ impl Step {
             files,
             id: next_revision(),
             offset,
+            folded: false,
         }
     }
 }
@@ -1306,8 +1310,9 @@ impl Open {
     /// as if the changes after it were made at the start position. Jumpers and strip layouts
     /// follow the terminals back in each. Returns false, changing nothing, when that step is no
     /// longer in the history (the move was undone, or trimmed off the oldest end), carries file
-    /// edits a move never makes, or a drawing, cloud or wire on the page was added or deleted since
-    /// (`items` names those by place in their list).
+    /// edits a move never makes, has later steps folded into it or after it (an assistant turn,
+    /// whose steps in between can no longer be checked), or a drawing, cloud or wire on the page
+    /// was added or deleted since (`items` names those by place in their list).
     pub fn take_back_move(&mut self, id: u64, page: &str, items: &[Selection]) -> bool {
         let Some(at) = self.undo.iter().position(|s| s.id == id) else {
             return false;
@@ -1318,7 +1323,8 @@ impl Open {
         let counts = |p: &Project| p.page(page).map(|p| (p.graphics.len(), p.clouds.len(), p.wires.len()));
         let start = counts(&first.project);
         let later = self.undo.iter().skip(at + 1).chain(&self.redo).map(|s| &s.project);
-        if !first.files.is_empty() || later.chain([&self.project]).any(|p| counts(p) != start) {
+        let folded = self.undo.iter().skip(at).chain(&self.redo).any(|s| s.folded);
+        if folded || !first.files.is_empty() || later.chain([&self.project]).any(|p| counts(p) != start) {
             return false;
         }
         // The change in progress (the move's frames since the last checkpoint) is followed first.
@@ -1459,6 +1465,7 @@ impl Open {
             let later: Vec<FileEdit> = self.undo.drain(start + 1..).flat_map(|s| s.files).collect();
             if let Some(first) = self.undo.get_mut(start) {
                 first.files.extend(later);
+                first.folded = true;
             }
             self.history += 1;
             self.touch();
@@ -1499,6 +1506,7 @@ impl Open {
                     files,
                     id,
                     offset,
+                    folded,
                 } = prev;
                 let now = std::mem::replace(&mut self.project, project);
                 // The step keeps its id across Undo and Redo, so a move redone during its drag
@@ -1508,6 +1516,7 @@ impl Open {
                     files,
                     id,
                     offset: std::mem::replace(&mut self.drag_offset, offset),
+                    folded,
                 });
                 let left = self
                     .redo
@@ -1564,6 +1573,7 @@ impl Open {
                     files,
                     id,
                     offset,
+                    folded,
                 } = next;
                 let now = std::mem::replace(&mut self.project, project);
                 // The step keeps its id across Undo and Redo, so a move redone during its drag
@@ -1573,6 +1583,7 @@ impl Open {
                     files,
                     id,
                     offset: std::mem::replace(&mut self.drag_offset, offset),
+                    folded,
                 });
                 let left = self
                     .undo
