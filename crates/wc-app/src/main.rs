@@ -1940,6 +1940,8 @@ impl App {
                 (Key::C, Action::CommentTool),
                 (Key::L, Action::LineTool),
                 (Key::Delete, Action::Delete),
+                // Mac laptop keyboards have no Delete key: their "delete" sends Backspace.
+                (Key::Backspace, Action::Delete),
                 (Key::G, Action::ToggleGrid),
                 (Key::F, Action::ZoomFit),
                 (Key::Plus, Action::ZoomIn),
