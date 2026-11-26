@@ -68,6 +68,12 @@ pub struct PanelState {
     /// The form for the selected black box's size and points: the page, item and symbol
     /// version it was read from (another version, after an Undo say, reads it again).
     black_box: Option<((usize, String, String), crate::black_box_tool::BoxEdit)>,
+    /// Edit buffers for the shown panel layout's name, plate width and plate height, and the
+    /// id of the panel they belong to.
+    panel_for: Option<String>,
+    panel_fields: [PanelField; 3],
+    /// Why the last name or size entered for the panel layout was refused.
+    panel_error: Option<String>,
 }
 
 impl PanelState {
@@ -550,28 +556,31 @@ pub fn library(ui: &mut egui::Ui, open: &Open, ed: &mut Editor, ps: &mut PanelSt
             .margin(egui::Margin::symmetric(8, 5)),
     );
     ui.add_space(2.0);
-    let q = ps.search.to_lowercase();
     egui::ScrollArea::vertical()
         .id_salt("library")
         .max_height(ui.available_height() * 0.45)
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
             let t = Theme::of(ui.ctx());
-            for (id, name) in &open.library {
-                if !q.is_empty() && !id.to_lowercase().contains(&q) && !name.to_lowercase().contains(&q) {
+            for entry in &open.library {
+                if !entry.matches(&ps.search) {
                     continue;
                 }
+                let (id, name) = (&entry.id, &entry.name);
                 let picked = ed.place_symbol.as_deref() == Some(id.as_str()) && ed.tool == Tool::Place;
                 let vendored = open.symbols.contains_key(id);
                 let text = RichText::new(name);
                 let lead = Lead::Dot(if vendored { t.accent } else { t.border });
-                let r = row(ui, picked, lead, if vendored { text } else { text.italics() }, false).on_hover_text(
-                    if vendored {
-                        format!("{id}\nIn this project")
-                    } else {
-                        format!("{id}\nFrom the library; copied into the project when placed")
-                    },
-                );
+                let whence = if vendored {
+                    "In this project"
+                } else {
+                    "From the library; copied into the project when placed"
+                };
+                let hover = match entry.description.trim() {
+                    "" => format!("{id}\n{whence}"),
+                    d => format!("{id}\n{d}\n{whence}"),
+                };
+                let r = row(ui, picked, lead, if vendored { text } else { text.italics() }, false).on_hover_text(hover);
                 if r.clicked() {
                     ed.place_symbol = Some(id.clone());
                     ed.tool = Tool::Place;
@@ -1028,8 +1037,11 @@ pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut 
     section(ui, "Properties", None);
     forget_spec_unless_wires(ed, ps);
     if let Some(pi) = ed.panel {
-        panel_properties(ui, open, ed, pi);
+        panel_properties(ui, open, ed, ps, pi);
         return;
+    }
+    if let Some(refused) = enter_panel_draft(open, ps) {
+        ed.message = refused;
     }
     if ed.selection.is_empty()
         && let Some(id) = ed.comment.clone()
@@ -1979,16 +1991,143 @@ impl Attach {
     }
 }
 
-/// The properties of the panel layout shown: plate size, the picked device, and the devices
-/// with a part that are not on the plate yet.
-fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, pi: usize) {
-    use wc_core::panel::{PanelItem, on_door, part_size};
+/// The smallest and largest mounting plate side, in mm, that the panel layout fields take.
+const PLATE_SIDE: std::ops::RangeInclusive<f64> = 10.0..=10_000.0;
+
+/// The panel layout fields, in order: name, plate width, plate height.
+const PANEL_FIELDS: [&str; 3] = ["Name", "Plate width", "Plate height"];
+
+/// One panel layout field: what it shows, and whether it was typed in since it was last read
+/// from the project or entered.
+#[derive(Default, Clone, Debug, PartialEq)]
+struct PanelField {
+    text: String,
+    edited: bool,
+}
+
+/// Enter `text` in field `field` (of [`PANEL_FIELDS`]) of the panel layout `id`, as one undo
+/// step when it changes the panel; a value that is not taken is refused with the reason.
+fn enter_panel_field(open: &mut Open, id: &str, field: usize, text: &str) -> Result<(), String> {
+    let Some(mut changed) = open.project.panels.iter().find(|p| p.id == id).cloned() else {
+        return Ok(());
+    };
+    let text = text.trim();
+    if field == 0 {
+        if text.is_empty() {
+            return Err("A panel layout needs a name.".into());
+        }
+        changed.name = text.to_owned();
+    } else {
+        let side = if field == 1 { "width" } else { "height" };
+        let v = parse_number(text).filter(|v| PLATE_SIDE.contains(v)).ok_or_else(|| {
+            format!(
+                "The plate {side} must be a number from {} to {} mm.",
+                PLATE_SIDE.start(),
+                PLATE_SIDE.end()
+            )
+        })?;
+        if field == 1 {
+            changed.width = v;
+        } else {
+            changed.height = v;
+        }
+    }
+    if open.project.panels.iter().any(|p| p.id == id && *p != changed) {
+        open.checkpoint();
+        if let Some(p) = open.project.panels.iter_mut().find(|p| p.id == id) {
+            *p = changed;
+        }
+    }
+    Ok(())
+}
+
+/// Enter what was typed in the panel layout fields and not entered yet, in the panel it was
+/// typed for: called when another panel layout, or no panel layout, is shown. Returns why a
+/// value was refused, as a message naming the panel layout.
+fn enter_panel_draft(open: &mut Open, ps: &mut PanelState) -> Option<String> {
+    let id = ps.panel_for.take()?;
+    ps.panel_error = None;
+    let mut refused = None;
+    for (i, field) in ps.panel_fields.iter_mut().enumerate() {
+        if std::mem::take(&mut field.edited)
+            && let Err(e) = enter_panel_field(open, &id, i, &field.text)
+        {
+            let name = open
+                .project
+                .panels
+                .iter()
+                .find(|p| p.id == id)
+                .map_or(id.as_str(), |p| p.name.as_str());
+            refused = Some(format!("{name} not changed: {e}"));
+        }
+    }
+    refused
+}
+
+/// The panel layout's name and plate size fields. Each is entered on Enter or when it is left,
+/// as one undo step; a field not typed in shows the project's value (after an Undo, say), also
+/// while it has the focus.
+fn panel_fields(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut PanelState, pi: usize) {
     let t = Theme::of(ui.ctx());
+    let Some(id) = open.project.panels.get(pi).map(|p| p.id.clone()) else {
+        return;
+    };
+    if ps.panel_for.as_deref() != Some(id.as_str()) {
+        if let Some(refused) = enter_panel_draft(open, ps) {
+            ed.message = refused;
+        }
+        ps.panel_for = Some(id.clone());
+    }
     let Some(panel) = open.project.panels.get(pi) else {
         return;
     };
-    ui.label(RichText::new(&panel.name).strong());
-    ui.label(RichText::new(format!("Mounting plate {} x {} mm", panel.width, panel.height)).color(t.faint));
+    let values = [panel.name.clone(), panel.width.to_string(), panel.height.to_string()];
+    for (field, value) in ps.panel_fields.iter_mut().zip(values) {
+        if !field.edited {
+            field.text = value;
+        }
+    }
+    let mut entered = Vec::new();
+    egui::Grid::new("panel-props")
+        .num_columns(2)
+        .spacing([10.0, 4.0])
+        .show(ui, |ui| {
+            for (i, (field, label)) in ps.panel_fields.iter_mut().zip(PANEL_FIELDS).enumerate() {
+                ui.label(RichText::new(label).color(t.muted));
+                let r = ui
+                    .horizontal(|ui| {
+                        let width = if i == 0 { 160.0 } else { 70.0 };
+                        let r = ui.add(egui::TextEdit::singleline(&mut field.text).desired_width(width));
+                        if i > 0 {
+                            ui.label("mm");
+                        }
+                        r
+                    })
+                    .inner;
+                field.edited |= r.changed();
+                if committed(&r) && std::mem::take(&mut field.edited) {
+                    entered.push((i, field.text.clone()));
+                }
+                ui.end_row();
+            }
+        });
+    for (i, text) in entered {
+        ps.panel_error = enter_panel_field(open, &id, i, &text).err();
+    }
+    if let Some(err) = &ps.panel_error {
+        ui.label(RichText::new(err).color(t.error).small());
+    }
+}
+
+/// The properties of the panel layout shown: plate size, the picked device, and the devices
+/// with a part that are not on the plate yet.
+fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut PanelState, pi: usize) {
+    use wc_core::panel::{PanelItem, on_door, part_size};
+    let t = Theme::of(ui.ctx());
+    panel_fields(ui, open, ed, ps, pi);
+    let Some(panel) = open.project.panels.get(pi) else {
+        return;
+    };
     ui.add_space(6.0);
     // Set when the Rotate button is pressed, applied once the panel is no longer borrowed.
     let mut turn: Option<usize> = None;
@@ -2091,7 +2230,7 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, pi: usi
     }
     // Devices with a part that could go on the plate but are not on it.
     let on_plate = panel.device_tags();
-    let missing: Vec<String> = open
+    let missing: Vec<(wc_core::DeviceTag, String)> = open
         .project
         .devices
         .iter()
@@ -2100,18 +2239,38 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, pi: usi
             let part = open.parts.get(d.part.as_ref()?)?;
             (!on_door(part)).then(|| {
                 let size = part_size(part).map_or_else(|| "no size".to_owned(), |(w, h)| format!("{w} x {h}"));
-                format!("{tag}  ({size})")
+                (tag.clone(), format!("{tag}  ({size})"))
             })
         })
         .collect();
+    // Set when a Place button is pressed, applied once the panel is no longer borrowed (#928).
+    let mut place: Option<wc_core::DeviceTag> = None;
     if missing.is_empty() {
         ui.label(RichText::new("Every device with a part is on the plate.").color(t.faint));
     } else {
         ui.label(RichText::new(format!("Not on the plate yet ({})", missing.len())).color(t.muted));
-        for m in missing {
-            ui.label(RichText::new(m).monospace());
+        for (tag, m) in missing {
+            ui.horizontal(|ui| {
+                if ui
+                    .small_button("Place")
+                    .on_hover_text("Put this device on the first DIN rail with room, else in a free spot")
+                    .clicked()
+                {
+                    place = Some(tag);
+                }
+                ui.label(RichText::new(m).monospace());
+            });
         }
         ui.label(RichText::new("Page menu → Arrange devices puts them on the rails.").color(t.faint));
+    }
+    if let Some(tag) = place {
+        match open.place_panel_device(pi, &tag) {
+            Ok(item) => {
+                ed.panel_pick = Some(item);
+                ed.message = format!("Placed {tag} on the plate; drag it to move it.");
+            }
+            Err(e) => ed.message = e,
+        }
     }
     if let Some(item) = turn
         && !open.rotate_panel_device(pi, item)
@@ -2194,6 +2353,214 @@ mod tests {
             "the jumper's part is shown: {texts:?}"
         );
         Ok(())
+    }
+
+    /// A project with two panel layouts, the first shown, and a function drawing one frame of
+    /// the properties with the given input events.
+    struct PanelHarness {
+        _tmp: tempfile::TempDir,
+        o: Open,
+        ed: Editor,
+        ps: PanelState,
+        ctx: egui::Context,
+    }
+
+    impl PanelHarness {
+        fn new() -> Self {
+            let (tmp, mut o) = crate::state::tests::project();
+            for n in [1, 2] {
+                o.project.panels.push(wc_core::panel::Panel::with_rails(
+                    format!("panel{n}"),
+                    format!("Panel {n}"),
+                    600.0,
+                    800.0,
+                ));
+            }
+            let mut ed = Editor::default();
+            ed.panel = Some(0);
+            let ctx = egui::Context::default();
+            crate::theme::install_fonts(&ctx);
+            Self {
+                _tmp: tmp,
+                o,
+                ed,
+                ps: PanelState::default(),
+                ctx,
+            }
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) {
+            let input = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let Self { o, ed, ps, ctx, .. } = self;
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| properties(ui, o, ed, ps));
+            });
+        }
+
+        fn key(&mut self, key: egui::Key) {
+            self.frame(vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }]);
+        }
+
+        fn type_text(&mut self, text: &str) {
+            self.frame(vec![egui::Event::Text(text.into())]);
+        }
+
+        fn texts(&self) -> Vec<String> {
+            self.ps.panel_fields.iter().map(|f| f.text.clone()).collect()
+        }
+
+        /// Tab to the name field and type `text` at its end; false when it never took it.
+        fn type_in_name(&mut self, text: &str) -> bool {
+            for _ in 0..6 {
+                self.key(egui::Key::Tab);
+                self.type_text(text);
+                if self.ps.panel_fields[0].text.ends_with(text) {
+                    return true;
+                }
+            }
+            false
+        }
+    }
+
+    #[test]
+    fn a_panel_layouts_name_and_plate_size_are_typed_in_its_properties() {
+        let mut h = PanelHarness::new();
+        h.frame(Vec::new());
+        assert_eq!(h.texts(), ["Panel 1", "600", "800"]);
+        let mark = h.o.undo_mark();
+
+        // Type in the name field, then Tab on to the width field and type there.
+        assert!(h.type_in_name("A"), "the name field never took the typing");
+        assert_eq!(h.o.project.panels[0].name, "Panel 1", "nothing is changed while typing");
+        h.key(egui::Key::Tab);
+        h.type_text("5");
+        h.key(egui::Key::Tab);
+        h.frame(Vec::new());
+        assert_eq!(h.o.project.panels[0].name, "Panel 1A");
+        assert_eq!(h.o.project.panels[0].width, 6005.0);
+        assert_eq!(h.o.project.panels[0].height, 800.0);
+        assert_eq!(h.o.undo_mark(), mark + 2, "one undo step each");
+
+        // A height of zero typed in the focused height field is refused with a reason.
+        h.ps.panel_fields[2] = PanelField {
+            text: "0".into(),
+            edited: true,
+        };
+        h.key(egui::Key::Enter);
+        h.frame(Vec::new());
+        assert_eq!(h.o.project.panels[0].height, 800.0);
+        assert_eq!(h.o.undo_mark(), mark + 2);
+        assert!(
+            h.ps.panel_error.as_deref().is_some_and(|e| e.contains("height")),
+            "{:?}",
+            h.ps.panel_error
+        );
+        assert_eq!(h.ps.panel_fields[2].text, "800");
+
+        // One Undo puts the width back, the next the name; the fields follow.
+        assert!(h.o.undo());
+        h.frame(Vec::new());
+        assert_eq!(h.o.project.panels[0].width, 600.0);
+        assert_eq!(h.o.project.panels[0].name, "Panel 1A");
+        assert!(h.o.undo());
+        h.frame(Vec::new());
+        assert_eq!(h.o.project.panels[0].name, "Panel 1");
+        assert_eq!(h.texts(), ["Panel 1", "600", "800"]);
+    }
+
+    #[test]
+    fn a_focused_panel_field_not_typed_in_follows_the_project_and_enters_nothing() {
+        let mut h = PanelHarness::new();
+        h.frame(Vec::new());
+        // The name field takes the focus, then the name changes underneath (an Undo, say).
+        h.key(egui::Key::Tab);
+        h.o.project.panels[0].name = "Other".into();
+        let mark = h.o.undo_mark();
+        h.frame(Vec::new());
+        assert_eq!(h.ps.panel_fields[0].text, "Other");
+        // Leaving the field enters nothing: the width field, next, takes the typing.
+        h.key(egui::Key::Tab);
+        h.frame(Vec::new());
+        assert_eq!(h.o.project.panels[0].name, "Other");
+        assert_eq!(h.o.undo_mark(), mark, "no undo step");
+        h.type_text("5");
+        assert_eq!(h.ps.panel_fields[1].text, "6005");
+    }
+
+    #[test]
+    fn a_panel_field_typed_in_is_entered_in_its_panel_when_another_is_shown() {
+        let mut h = PanelHarness::new();
+        h.frame(Vec::new());
+        let mark = h.o.undo_mark();
+        assert!(h.type_in_name("A"), "the name field never took the typing");
+        // Panel 2 is picked in the navigator with the name half typed.
+        h.ed.panel = Some(1);
+        h.frame(Vec::new());
+        assert_eq!(h.o.project.panels[0].name, "Panel 1A");
+        assert_eq!(h.o.project.panels[1].name, "Panel 2");
+        assert_eq!(h.o.undo_mark(), mark + 1);
+        assert_eq!(h.texts(), ["Panel 2", "600", "800"]);
+        // The same when a page is shown instead.
+        assert!(h.type_in_name("B"), "the name field never took the typing");
+        h.ed.panel = None;
+        h.frame(Vec::new());
+        assert_eq!(h.o.project.panels[1].name, "Panel 2B");
+        assert_eq!(h.o.undo_mark(), mark + 2);
+        // A draft that is refused changes nothing and says why.
+        h.ed.panel = Some(0);
+        h.frame(Vec::new());
+        h.ps.panel_fields[1] = PanelField {
+            text: "0".into(),
+            edited: true,
+        };
+        h.ed.panel = Some(1);
+        h.frame(Vec::new());
+        assert_eq!(h.o.project.panels[0].width, 600.0);
+        assert_eq!(h.o.undo_mark(), mark + 2);
+        assert!(h.ed.message.contains("Panel 1A not changed"), "{}", h.ed.message);
+    }
+
+    #[test]
+    fn panel_layout_values_outside_the_limits_are_refused() {
+        let mut h = PanelHarness::new();
+        let refused = [
+            (0, "  "),
+            (1, "abc"),
+            (1, "12x"),
+            (1, "9.99"),
+            (2, "10000.01"),
+            (2, "-600"),
+            (2, "0"),
+        ];
+        for (field, text) in refused {
+            let (before, mark) = (h.o.project.clone(), h.o.undo_mark());
+            let r = enter_panel_field(&mut h.o, "panel1", field, text);
+            assert!(r.as_ref().is_err_and(|e| !e.is_empty()), "{text:?}: {r:?}");
+            assert_eq!(h.o.project, before, "{text:?}");
+            assert_eq!(h.o.undo_mark(), mark, "{text:?}");
+        }
+        for (field, text, width, height) in [(1, "10", 10.0, 800.0), (2, " 10000 ", 10.0, 10000.0)] {
+            let mark = h.o.undo_mark();
+            assert_eq!(enter_panel_field(&mut h.o, "panel1", field, text), Ok(()));
+            assert_eq!(
+                (h.o.project.panels[0].width, h.o.project.panels[0].height),
+                (width, height)
+            );
+            assert_eq!(h.o.undo_mark(), mark + 1);
+        }
+        // The same value again is no undo step.
+        let mark = h.o.undo_mark();
+        assert_eq!(enter_panel_field(&mut h.o, "panel1", 2, "10000"), Ok(()));
+        assert_eq!(h.o.undo_mark(), mark);
     }
 
     #[test]
