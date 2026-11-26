@@ -4908,6 +4908,29 @@ fn arrow_steps(i: &egui::InputState, step: f64) -> Vec<wc_core::geom::Point> {
 /// A project's title-block fields as form rows: the standard fields first (empty when not
 /// set), then any others the project has.
 /// The Ctrl shortcuts pressed this frame, none while a dialog is open.
+/// Whether `a` saves the open project: what was typed in a field and not entered yet is
+/// entered first.
+fn saves_project(a: Action) -> bool {
+    matches!(a, Action::Save | Action::SaveAs | Action::NewProject)
+}
+
+/// A value typed in a field (a Properties field, say) is entered when the field is left or on
+/// Enter. When this frame's actions save the project while a field still has the keyboard
+/// (Ctrl+S typed in it), the field gives it up now, so the panels drawn later in this frame
+/// enter its value as one undo step, as if it had been left; a refused value shows its reason
+/// there. The saving action and those after it are taken out of `actions` and returned, to run
+/// once the panels are drawn (#932).
+fn wait_for_typed_value(ctx: &egui::Context, actions: &mut Vec<Action>) -> Vec<Action> {
+    let Some(at) = actions.iter().position(|a| saves_project(*a)) else {
+        return Vec::new();
+    };
+    let Some(field) = ctx.memory(|m| m.focused()) else {
+        return Vec::new();
+    };
+    ctx.memory_mut(|m| m.surrender_focus(field));
+    actions.split_off(at)
+}
+
 fn ctrl_shortcuts(ctx: &egui::Context, dialog_open: bool) -> Vec<Action> {
     let mut out = Vec::new();
     if dialog_open {
@@ -5417,6 +5440,7 @@ impl eframe::App for App {
         } else {
             actions.extend(self.route_to_symbol_editor(keys));
         }
+        let after_panels = wait_for_typed_value(ctx, &mut actions);
         for a in actions {
             self.run(a);
         }
@@ -5526,6 +5550,10 @@ impl eframe::App for App {
             }
         }
         for a in page_actions {
+            self.run(a);
+        }
+        // The panels have entered the value typed in the field that gave up the keyboard.
+        for a in after_panels {
             self.run(a);
         }
         self.run_menu_action();
@@ -7327,6 +7355,70 @@ mod nudge_tests {
             assert!(app.open.as_mut().unwrap().undo());
             assert_eq!((coil_at(&app), wires(&app)), (Point::new(55.0, 60.0), 0));
         }
+    }
+
+    /// A device tag typed in the Properties panel and not entered yet (the field still has the
+    /// keyboard) is entered before Ctrl+S saves: the saved project has it (#932).
+    #[test]
+    fn ctrl_s_saves_a_value_typed_but_not_entered_yet() {
+        let (_tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        let mut frame = eframe::Frame::_new_kittest();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        let field = egui::Id::new(panels::TAG_FIELD);
+        let mut frame_with = |app: &mut App, events: Vec<egui::Event>, modifiers: Modifiers| {
+            let raw = egui::RawInput {
+                events,
+                modifiers,
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| eframe::App::update(app, ctx, &mut frame));
+        };
+        let tag = |app: &App| {
+            let open = app.open.as_ref().unwrap();
+            open.project.pages[app.ed.page].symbols[1]
+                .tag
+                .as_ref()
+                .map(ToString::to_string)
+        };
+        frame_with(&mut app, Vec::new(), Modifiers::NONE);
+        ctx.memory_mut(|m| m.request_focus(field));
+        frame_with(&mut app, Vec::new(), Modifiers::NONE);
+        assert!(
+            ctx.memory(|m| m.has_focus(field)),
+            "the device tag field has the keyboard"
+        );
+        let before = tag(&app).unwrap();
+        // The cursor goes to the end of the field: "-K2" becomes "-K27".
+        frame_with(&mut app, vec![egui::Event::Text("7".into())], Modifiers::NONE);
+        let typed = format!("{before}7");
+        let tag = |app: &App| {
+            let open = app.open.as_ref().unwrap();
+            open.project.pages[app.ed.page].symbols[1]
+                .tag
+                .as_ref()
+                .map(ToString::to_string)
+        };
+        assert_eq!(tag(&app), Some(before), "typed, not entered yet");
+        let save = egui::Event::Key {
+            key: Key::S,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        };
+        frame_with(&mut app, vec![save], Modifiers::COMMAND);
+        assert_eq!(tag(&app).as_ref(), Some(&typed), "entered before the save");
+        let open = app.open.as_ref().unwrap();
+        assert!(!open.dirty, "saved after the value was entered");
+        let saved = wc_core::store::load(&open.dir).unwrap();
+        let page = &saved.pages[app.ed.page];
+        assert!(
+            page.symbols
+                .iter()
+                .any(|s| s.tag.as_ref().is_some_and(|t| t.to_string() == typed)),
+            "the saved project has the typed tag"
+        );
     }
 
     #[test]

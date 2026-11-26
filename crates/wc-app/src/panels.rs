@@ -1028,6 +1028,9 @@ fn black_box_form(
     false
 }
 
+/// The id of the selected symbol's device tag field.
+pub(crate) const TAG_FIELD: &str = "wc.properties.device_tag";
+
 fn committed(r: &egui::Response) -> bool {
     r.lost_focus() || (r.has_focus() && r.ctx.input(|i| i.key_pressed(egui::Key::Enter)))
 }
@@ -1146,7 +1149,7 @@ fn selection_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps:
                     ui.label(sym_name).on_hover_text(&placed.symbol);
                     ui.end_row();
                     ui.label("Device tag");
-                    let r = ui.text_edit_singleline(&mut ps.tag);
+                    let r = ui.add(egui::TextEdit::singleline(&mut ps.tag).id(egui::Id::new(TAG_FIELD)));
                     if committed(&r) {
                         let new = if ps.tag.trim().is_empty() {
                             Ok(None)
