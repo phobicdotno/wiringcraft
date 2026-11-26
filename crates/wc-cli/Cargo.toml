@@ -24,6 +24,10 @@ toml.workspace = true
 # A private, unique folder for archive entries on their way to the single-file importers.
 tempfile.workspace = true
 
+# Restores the default SIGPIPE action, so piping into `head` ends the program quietly.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # Tests write an EDZ archive.
 sevenz-rust2 = { workspace = true, features = ["compress"] }

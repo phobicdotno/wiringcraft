@@ -3666,6 +3666,14 @@ fn comment_cmd(dir: &Path, cc: CommentCmd) -> Res<()> {
 const STACK: usize = 16 * 1024 * 1024;
 
 fn main() -> ExitCode {
+    // Rust ignores SIGPIPE, so a write to a closed pipe (`wiringcraft ... | head -1`) makes
+    // `println!` panic. Restore the default, as other command-line tools have it: the program
+    // ends quietly, like `cat` does, instead of reporting a crash (#550).
+    #[cfg(unix)]
+    // SAFETY: called first thing, before any other thread exists; it only resets a handler.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     // Parsing runs there too: clap's derived parser builds every subcommand on the stack.
     let worker = std::thread::Builder::new()
         .stack_size(STACK)
