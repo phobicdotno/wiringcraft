@@ -26,6 +26,23 @@ pub fn part_label(p: &Part) -> String {
     }
 }
 
+/// The parts the project uses that `parts` does not hold but whose copy in the project's
+/// library (`vendor/parts/`) is there and cannot be read, by id with the reason: the project
+/// check reports those as unreadable, not as missing
+/// ([`wc_report::check_with_unreadable`]).
+pub fn unreadable_parts(dir: &Path, project: &Project, parts: &BTreeMap<String, Part>) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for id in project.used_parts() {
+        if parts.contains_key(&id) || !store::vendor_path(dir, ItemKind::Part, &id).is_ok_and(|f| f.exists()) {
+            continue;
+        }
+        if let Err(e) = store::read_vendored_part(dir, &id) {
+            out.insert(id, e.to_string());
+        }
+    }
+    out
+}
+
 /// What a click on the canvas does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
