@@ -2262,8 +2262,14 @@ impl App {
                     .into_iter()
                     .find(|l| l.key() == key)
                     .ok_or_else(|| format!("No layer {key:?}; get the keys with action list."))?;
-                let shown = v.get("shown").and_then(Value::as_bool);
-                let locked = v.get("locked").and_then(Value::as_bool);
+                // A value given but not true or false is refused before anything changes.
+                let flag = |key: &str| match v.get(key) {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(Value::Bool(b)) => Ok(Some(*b)),
+                    Some(_) => Err(format!("`{key}` must be true or false.")),
+                };
+                let shown = flag("shown")?;
+                let locked = flag("locked")?;
                 if shown.is_none() && locked.is_none() {
                     return Err("Give `shown`, `locked` or both.".into());
                 }
@@ -9979,6 +9985,8 @@ mod tests {
             json!({"action": "set", "layer": "nope", "shown": true}),
             json!({"action": "set", "layer": "comments"}),
             json!({"action": "toggle"}),
+            json!({"action": "set", "layer": "wire-numbers", "shown": false, "locked": "true"}),
+            json!({"action": "set", "layer": "comments", "shown": "false", "locked": true}),
         ] {
             assert!(call(&mut a, "layers", bad.clone()).is_err(), "{bad}");
         }
