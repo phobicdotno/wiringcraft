@@ -23,6 +23,8 @@ pub struct View {
     pub offset: Vec2,
     /// Fit the page on the next frame (after opening, or when asked).
     pub fit: bool,
+    /// The size of the canvas when it was last drawn: Zoom in and Zoom out keep its centre.
+    pub size: Vec2,
 }
 
 impl Default for View {
@@ -31,7 +33,27 @@ impl Default for View {
             zoom: 3.0,
             offset: Vec2::new(20.0, 20.0),
             fit: true,
+            size: Vec2::ZERO,
         }
+    }
+}
+
+/// The schematic canvas' zoom limits, in screen points per millimetre.
+pub const ZOOM_LIMITS: (f32, f32) = (0.3, 60.0);
+
+impl View {
+    /// Zoom by `factor` about `anchor` (relative to the canvas' top-left corner), so the page
+    /// point under it stays put, within `limits`. Zooming out never zooms in, nor the other way.
+    pub fn zoom_about(&mut self, anchor: Vec2, factor: f32, (min, max): (f32, f32)) {
+        let new_zoom = (self.zoom * factor).clamp(min, max);
+        let new_zoom = if factor < 1.0 {
+            new_zoom.min(self.zoom)
+        } else {
+            new_zoom.max(self.zoom)
+        };
+        let a = anchor - self.offset;
+        self.offset += a - a * (new_zoom / self.zoom);
+        self.zoom = new_zoom;
     }
 }
 
@@ -172,6 +194,17 @@ enum Drag {
 }
 
 impl Editor {
+    /// Zoom in or out by `factor` from the keys or buttons, about the centre of the visible
+    /// canvas, within the zoom limits of the schematic or of the panel view.
+    pub fn zoom_keys(&mut self, factor: f32) {
+        let limits = if self.panel.is_some() {
+            crate::panel_view::ZOOM_LIMITS
+        } else {
+            ZOOM_LIMITS
+        };
+        self.view.zoom_about(self.view.size / 2.0, factor, limits);
+    }
+
     /// Who holds the page shown, in a shared session: then it is read-only here and only
     /// selecting, panning and zooming work on it. `None` in the panel view and on own pages.
     pub fn held_page<'a>(&'a self, project: &wc_core::Project) -> Option<&'a str> {
@@ -602,6 +635,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
         return;
     }
     let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+    ed.view.size = rect.size();
     let painter = ui.painter_at(rect);
     let t = theme::Theme::of(ui.ctx());
     painter.rect_filled(rect, 0.0, t.backdrop);
@@ -655,11 +689,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
         if scroll.abs() > 0.0
             && let Some(hp) = resp.hover_pos()
         {
-            let factor = (scroll / 300.0).exp();
-            let new_zoom = (ed.view.zoom * factor).clamp(0.3, 60.0);
-            let anchor = hp - rect.min - ed.view.offset;
-            ed.view.offset += anchor - anchor * (new_zoom / ed.view.zoom);
-            ed.view.zoom = new_zoom;
+            ed.view.zoom_about(hp - rect.min, (scroll / 300.0).exp(), ZOOM_LIMITS);
         }
     }
     if resp.dragged_by(egui::PointerButton::Middle) || resp.dragged_by(egui::PointerButton::Secondary) {
@@ -2384,6 +2414,40 @@ mod tests {
         }
     }
 
+    /// Zoom in and Zoom out keep the page point at the centre of the visible canvas in place
+    /// (#826), and Zoom out from below the lowest zoom does not zoom in.
+    #[test]
+    fn zoom_keys_keep_the_view_centre() {
+        let mut ed = Editor {
+            view: View {
+                zoom: 2.0,
+                offset: Vec2::new(30.0, -40.0),
+                fit: false,
+                size: Vec2::new(800.0, 600.0),
+            },
+            ..Default::default()
+        };
+        let centre = |v: &View| (v.size / 2.0 - v.offset) / v.zoom;
+        let before = centre(&ed.view);
+        ed.zoom_keys(1.25);
+        assert!((ed.view.zoom - 2.5).abs() < 1e-5, "{}", ed.view.zoom);
+        assert!(
+            (centre(&ed.view) - before).length() < 1e-3,
+            "{:?} {before:?}",
+            centre(&ed.view)
+        );
+        ed.zoom_keys(0.8);
+        assert!((centre(&ed.view) - before).length() < 1e-3);
+
+        ed.view.zoom = 0.2;
+        ed.zoom_keys(0.8);
+        assert!(
+            (ed.view.zoom - 0.2).abs() < 1e-6,
+            "Zoom out zoomed in to {}",
+            ed.view.zoom
+        );
+    }
+
     #[test]
     fn a_revision_is_added_a_cloud_drawn_and_the_table_placed_moved_and_taken_off() {
         use crate::state::RevisionRow;
@@ -2682,6 +2746,7 @@ mod tests {
             zoom: 1.0,
             offset: Vec2::ZERO,
             fit: false,
+            ..Default::default()
         };
         painted(
             &ctx,
@@ -2766,6 +2831,7 @@ mod tests {
                 zoom: 1.0,
                 offset: Vec2::ZERO,
                 fit: false,
+                ..Default::default()
             },
             ..Default::default()
         };
