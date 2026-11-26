@@ -788,6 +788,36 @@ fn a_coil_drawn_only_on_an_overview_page_still_exists_for_its_contacts() {
     assert!(!check(&i).iter().any(|f| f.message.contains("contact -K9 has no coil")));
 }
 
+#[test]
+fn an_interruption_point_repeated_on_an_overview_page_is_not_its_own_partner() {
+    let (mut p, mut s, parts) = fixture();
+    let arrow = sym("arrow", SymbolRole::Interruption, &["1"]);
+    s.insert(arrow.id.clone(), arrow);
+    p.pages[0].symbols.push(place("s9", "arrow", 200.0, Some("-L1")));
+    // The same point again, on a line diagram.
+    let mut overview = Page::new("p9", "9", "Line diagram");
+    overview.symbols.push(place("s20", "arrow", 100.0, Some("-L1")));
+    p.pages.push(overview);
+    let lonely = |p: &Project| -> Vec<Option<String>> {
+        check(&Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        })
+        .into_iter()
+        .filter(|f| f.message == "interruption point -L1 has no partner")
+        .map(|f| f.page_id)
+        .collect()
+    };
+    assert!(lonely(&p).is_empty(), "on a normal page the two points are partners");
+    p.pages[1].overview = true;
+    assert_eq!(
+        lonely(&p),
+        vec![Some(p.pages[0].id.clone())],
+        "the schematic point has no partner; the overview copy still has the schematic one"
+    );
+}
+
 /// The `FileName` attribute of the `CAEXFile` element in `xml`, as an XML reader sees it.
 fn caex_file_name(xml: &str) -> Option<String> {
     use quick_xml::events::Event;
