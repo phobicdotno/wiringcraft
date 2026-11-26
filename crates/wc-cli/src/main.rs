@@ -222,8 +222,8 @@ enum Cmd {
     /// Print a report (contents, parts, devices, wires, nets, terminals, cables, plc, plc-cards, locations, networks) as a table, CSV or Markdown,
     /// or save it as an Excel workbook (`--format xlsx --out <file>`, one sheet per report).
     Report {
-        /// contents, parts, devices, wires, nets, terminals, cables, plc, plc-cards, locations
-        /// or networks.
+        /// contents, parts, devices, wires, nets, terminals, cables, plc, plc-cards, locations,
+        /// networks, or `all` (every report; one sheet each with `--format xlsx`).
         kind: String,
         /// `text`, `csv`, `md` or `xlsx`.
         #[arg(long, default_value = "text")]
@@ -690,7 +690,7 @@ enum StripCmd {
 
 #[derive(Subcommand)]
 enum PageCmd {
-    /// Add a page after the others.
+    /// Add a page, placed by its `--number` among the existing pages.
     Add {
         /// The new page's id, e.g. `p1`; other commands name the page by it.
         id: String,
