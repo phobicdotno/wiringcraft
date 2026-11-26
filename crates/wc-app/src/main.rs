@@ -1666,6 +1666,7 @@ impl App {
                 let step = if self.prefs.snap > 0.0 { self.prefs.snap } else { 2.5 };
                 match open.paste(page, &clip, clip.anchor + wc_core::geom::Point::new(step, step)) {
                     Ok(copies) if !copies.is_empty() => {
+                        self.ed.message = format!("Duplicated {} items.", copies.len());
                         self.ed.tool = Tool::Select;
                         self.ed.selection = copies;
                     }

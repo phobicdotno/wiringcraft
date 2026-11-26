@@ -5429,6 +5429,7 @@ mod tests {
         // With the editor closed, Duplicate works again.
         a.symbol_editor = None;
         a.run(Action::Duplicate);
+        assert_eq!(a.ed.message, "Duplicated 1 items.", "the refusal is not left behind");
         assert_eq!(
             a.open.as_ref().unwrap().project.pages[page].symbols.len(),
             before.symbols.len() + 1
