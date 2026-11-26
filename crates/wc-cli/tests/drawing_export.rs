@@ -1,0 +1,94 @@
+//! `wiringcraft drawing` writes a file per panel layout (#927). A part that cannot be read is
+//! named in a warning with the reason, and the readable parts still draw their footprints.
+
+use std::process::Command;
+
+use wc_core::lock::ItemKind;
+use wc_core::panel::{Panel, PanelItem};
+use wc_core::store;
+use wc_core::{DeviceTag, Footprint, Part, Point, Shape};
+
+type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+#[test]
+fn an_unreadable_part_is_warned_about_and_the_readable_footprint_is_still_drawn() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let made = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .output()?;
+    assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+
+    // Two devices on one plate: one whose part has a footprint (a circle), one whose part
+    // file is damaged.
+    let mut project = store::load(&dir)?;
+    let mut panel = Panel::new("main", "Main", 600.0, 800.0);
+    for (i, (tag, part)) in [("+CAB1-A1", "maker.good"), ("+CAB1-A2", "maker.bad")]
+        .into_iter()
+        .enumerate()
+    {
+        let tag = DeviceTag::parse(tag)?;
+        project.devices.insert(
+            tag.clone(),
+            wc_core::Device {
+                part: Some(part.into()),
+                ..Default::default()
+            },
+        );
+        panel.items.push(PanelItem::Device {
+            tag,
+            at: Point::new(100.0 + 200.0 * i as f64, 100.0),
+            width: 50.0,
+            height: 50.0,
+            rotation: Default::default(),
+        });
+    }
+    project.panels.push(panel);
+    store::save(&dir, &project)?;
+    let good = Part {
+        id: "maker.good".into(),
+        footprint: Some(Footprint {
+            width: 50.0,
+            height: 50.0,
+            shapes: vec![Shape::Circle {
+                center: Point::new(25.0, 25.0),
+                radius: 20.0,
+                filled: false,
+            }],
+        }),
+        ..Part::default()
+    };
+    store::write_vendored_part(&dir, &good)?;
+    let bad = store::vendor_path(&dir, ItemKind::Part, "maker.bad")?;
+    std::fs::write(&bad, "{ not json")?;
+
+    for ext in ["dxf", "svg"] {
+        let out_dir = tmp.path().join(ext);
+        let out = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+            .arg("-C")
+            .arg(&dir)
+            .arg("drawing")
+            .arg(&out_dir)
+            .args(["--format", ext])
+            .output()?;
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{ext}: {stderr}");
+        // The warning names the part and says why it cannot be read.
+        let Some(line) = stderr.lines().find(|l| l.contains("cannot read part maker.bad")) else {
+            unreachable!("{ext}: no warning about maker.bad in {stderr}")
+        };
+        assert!(line.starts_with("warning: ") && line.len() > "warning: cannot read part maker.bad: ".len());
+        assert!(!stderr.contains("maker.good"), "{ext}: {stderr}");
+        // The readable part's footprint circle (radius 20 mm at 1:5) is drawn on the panel.
+        let drawn = std::fs::read_to_string(out_dir.join(format!("panel-Main.{ext}")))?;
+        let circle = if ext == "dxf" { "CIRCLE" } else { "<circle " };
+        assert_eq!(drawn.matches(circle).count(), 1, "{ext}");
+        assert!(
+            drawn.contains(if ext == "dxf" { "40\n4\n" } else { "r=\"4\"" }),
+            "{ext}"
+        );
+    }
+    Ok(())
+}
