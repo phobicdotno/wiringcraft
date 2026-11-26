@@ -1,0 +1,67 @@
+{
+  "category": "terminals",
+  "description": "One contact of a plug-in connector, male side; the solid pin end at the top mates with a socket.",
+  "graphics": [
+    {
+      "closed": true,
+      "filled": true,
+      "kind": "polyline",
+      "points": [
+        {
+          "x": -0.8,
+          "y": 0.0
+        },
+        {
+          "x": 0.8,
+          "y": 0.0
+        },
+        {
+          "x": 0.8,
+          "y": 4.0
+        },
+        {
+          "x": -0.8,
+          "y": 4.0
+        }
+      ]
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 4.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 10.0
+      },
+      "kind": "line"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 9.4
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "1"
+    }
+  ],
+  "id": "wc.connector.plug",
+  "letter_code": "X",
+  "name": "Plug (male contact)",
+  "pins": [
+    {
+      "at": {
+        "x": 0.0,
+        "y": 10.0
+      },
+      "dir": "down",
+      "name": "1"
+    }
+  ],
+  "role": "standalone",
+  "tag_at": {
+    "x": -6.0,
+    "y": 5.0
+  }
+}

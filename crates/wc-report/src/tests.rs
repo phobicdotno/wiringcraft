@@ -496,6 +496,36 @@ fn check_cable_cores_ignore_overview_wiring_that_joins_connections() {
 }
 
 #[test]
+fn wires_on_an_overview_page_are_not_listed_twice() {
+    let (mut p, s, parts) = fixture();
+    let w1 = DeviceTag::parse("-W1").unwrap();
+    if let Some(w) = p.pages[0].wires.iter_mut().find(|w| w.id == "w2") {
+        w.cable = Some(wc_core::CableCore {
+            cable: w1,
+            core: "1".into(),
+        });
+    }
+    let counts = |p: &Project| {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        (wire_list(&i).rows.len(), cable_list(&i).rows.len())
+    };
+    let before = counts(&p);
+    // The same schematic again, drawn on a line diagram.
+    let mut overview = p.pages[0].clone();
+    overview.id = "p9".into();
+    overview.number = "9".into();
+    overview.overview = true;
+    p.pages.push(overview);
+    assert_eq!(counts(&p), before, "an overview page adds no rows");
+    p.pages.last_mut().unwrap().overview = false;
+    assert!(counts(&p).0 > before.0, "a normal page does");
+}
+
+#[test]
 fn project_check_finds_the_usual_mistakes() {
     let (mut p, s, parts) = fixture();
     {
