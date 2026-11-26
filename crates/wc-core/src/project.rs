@@ -1651,6 +1651,28 @@ impl Page {
         self.symbols.iter().find(|s| s.id == id)
     }
 
+    /// Take the symbols named in `symbols` and the wires named in `wires` off this page, and
+    /// with them every wire that ends on a pin of one of those symbols. Returns the removed ids:
+    /// symbols first, then wires, each in page order. Ids not on the page are skipped.
+    pub fn remove_symbols_and_wires(&mut self, symbols: &[&str], wires: &[&str]) -> Vec<String> {
+        let on_removed = |end: &Endpoint| matches!(end, Endpoint::Pin { item, .. } if symbols.contains(&item.as_str()));
+        let gone_wires: Vec<String> = self
+            .wires
+            .iter()
+            .filter(|w| wires.contains(&w.id.as_str()) || on_removed(&w.from) || on_removed(&w.to))
+            .map(|w| w.id.clone())
+            .collect();
+        let gone_symbols: Vec<String> = self
+            .symbols
+            .iter()
+            .filter(|s| symbols.contains(&s.id.as_str()))
+            .map(|s| s.id.clone())
+            .collect();
+        self.symbols.retain(|s| !gone_symbols.contains(&s.id));
+        self.wires.retain(|w| !gone_wires.contains(&w.id));
+        gone_symbols.into_iter().chain(gone_wires).collect()
+    }
+
     /// Next free id with the given prefix (`s1`, `s2`, ...).
     pub fn next_id(&self, prefix: &str) -> String {
         let used = |id: &str| self.symbols.iter().any(|s| s.id == id) || self.wires.iter().any(|w| w.id == id);
@@ -2049,6 +2071,32 @@ pub fn natural_key(s: &str) -> Vec<(String, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removing_symbols_takes_the_wires_on_their_pins_too() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut page = Page::new("p1", "1", "P");
+        for id in ["s1", "s2"] {
+            page.symbols.push(PlacedSymbol {
+                id: id.into(),
+                symbol: "k".into(),
+                at: Point::default(),
+                rotation: Rotation::default(),
+                mirror: false,
+                tag: None,
+            });
+        }
+        page.wires = serde_json::from_str(
+            r#"[{"id":"w1","from":{"item":"s1","pin":"1"},"to":{"at":{"x":0.0,"y":0.0}}},
+                {"id":"w2","from":{"at":{"x":0.0,"y":0.0}},"to":{"item":"s2","pin":"1"}},
+                {"id":"w3","from":{"at":{"x":0.0,"y":0.0}},"to":{"at":{"x":5.0,"y":0.0}}},
+                {"id":"w4","from":{"item":"s1","pin":"2"},"to":{"item":"s2","pin":"2"}}]"#,
+        )?;
+        let removed = page.remove_symbols_and_wires(&["s2", "nope"], &["w3"]);
+        assert_eq!(removed, ["s2", "w2", "w3", "w4"]);
+        assert_eq!(page.symbols.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["s1"]);
+        assert_eq!(page.wires.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), ["w1"]);
+        Ok(())
+    }
 
     #[test]
     fn a_device_with_one_part_reads_and_writes_as_before() -> std::result::Result<(), Box<dyn std::error::Error>> {
