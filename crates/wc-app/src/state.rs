@@ -2149,21 +2149,9 @@ impl Open {
         self.unwritten_files.iter().find_map(|(rel, should)| {
             let found = self.unwritten_found.get(rel)?;
             let path = self.dir.join(rel);
-            let changed = match (found, snapshot_file(&path)) {
-                (Found::Bytes(found), Ok(now)) => (now != *found && now != *should).then(String::new),
-                // Not known what WiringCraft left there: a file there now may be from outside.
-                (Found::Unread(why), Ok(now)) => (now.is_some() && now != *should)
-                    .then(|| format!(" (it could not be read when WiringCraft left it: {why})")),
-                (Found::WriteOverUnread(_), Ok(now)) => (now.is_some() && now != *should).then(String::new),
-                // Not readable now: what it holds is not known, so it is not written over
-                // unless the user chose to.
-                (Found::Bytes(_) | Found::Unread(_), Err(why)) => Some(format!(" (it cannot be read now: {why})")),
-                // Consent covers the unreadable entry the user saw only, told by its metadata.
-                (Found::WriteOverUnread(seen), Err(why)) => {
-                    (stamp_of(&path) != *seen).then(|| format!(" (it cannot be read now, and changed since: {why})"))
-                }
-            };
-            changed.map(|note| (path, note))
+            found
+                .change(snapshot_file(&path), should, &path)
+                .map(|note| (path, note))
         })
     }
 
@@ -2283,18 +2271,34 @@ impl Open {
         }
         for (rel, should) in self.unwritten_files.clone() {
             let path = self.dir.join(&rel);
+            let cannot = |e: std::io::Error| {
+                format!(
+                    "not saved: {} cannot be written as the project needs it: {e}",
+                    path.display()
+                )
+            };
             let folder = match (&should, path.parent()) {
                 (Some(_), Some(dir)) => std::fs::create_dir_all(dir),
                 _ => Ok(()),
             };
-            folder
-                .and_then(|()| restore_file(&path, should.as_deref()))
-                .map_err(|e| {
-                    format!(
-                        "not saved: {} cannot be written as the project needs it: {e}",
-                        path.display()
-                    )
-                })?;
+            folder.map_err(cannot)?;
+            // The check above and this write are separate steps: another program can change
+            // the file in between. So the file is moved aside first and checked again as
+            // moved (#670); only what the check admits is deleted or replaced.
+            match self.unwritten_found.get(&rel) {
+                Some(found) => match repair_file(&path, should.as_deref(), found).map_err(cannot)? {
+                    Repair::Done => {}
+                    Repair::ChangedOutside(note) => {
+                        return Err(format!(
+                            "not saved: {} {}{note}. Keep that version, or write the project's version over it.",
+                            path.display(),
+                            Self::CHANGED_OUTSIDE
+                        ));
+                    }
+                },
+                // Nothing known about what was there: written as before.
+                None => restore_file(&path, should.as_deref()).map_err(cannot)?,
+            }
             self.drop_unwritten(&rel);
         }
         Ok(())
@@ -4302,6 +4306,234 @@ impl Found {
     fn of(snapshot: Result<Option<Vec<u8>>, String>) -> Self {
         snapshot.map_or_else(Self::Unread, Self::Bytes)
     }
+
+    /// Whether `now` (what the file at `path` holds, [`snapshot_file`]) was changed outside
+    /// WiringCraft since it was found like this, with a note for the message (empty when there
+    /// is nothing to add); `None` when the project's version (`should`) may go over it.
+    fn change(&self, now: Result<Option<Vec<u8>>, String>, should: &Option<Vec<u8>>, path: &Path) -> Option<String> {
+        match (self, now) {
+            (Found::Bytes(found), Ok(now)) => (now != *found && now != *should).then(String::new),
+            // Not known what WiringCraft left there: a file there now may be from outside.
+            (Found::Unread(why), Ok(now)) => (now.is_some() && now != *should)
+                .then(|| format!(" (it could not be read when WiringCraft left it: {why})")),
+            (Found::WriteOverUnread(_), Ok(now)) => (now.is_some() && now != *should).then(String::new),
+            // Not readable now: what it holds is not known, so it is not written over unless
+            // the user chose to.
+            (Found::Bytes(_) | Found::Unread(_), Err(why)) => Some(format!(" (it cannot be read now: {why})")),
+            // Consent covers the unreadable entry the user saw only, told by its metadata.
+            (Found::WriteOverUnread(seen), Err(why)) => {
+                (stamp_of(path) != *seen).then(|| format!(" (it cannot be read now, and changed since: {why})"))
+            }
+        }
+    }
+}
+
+/// How [`repair_file`] ended.
+enum Repair {
+    /// The file holds the project's version (or is gone, when it should be).
+    Done,
+    /// Another program changed the file just before the repair: it is left as that program
+    /// left it, with a note for the message ([`Found::change`]).
+    ChangedOutside(String),
+}
+
+/// Put the project's version (`should`; `None`: no file) at `path`, where a repair was waiting,
+/// without losing a change another program makes at the same moment (#670).
+///
+/// A file there is first moved aside (renamed within its folder, one step), so no later write
+/// can land in it unseen. What was moved is then checked against `found`
+/// ([`Found::change`]): when it was changed outside, it is put back as it was, and the result
+/// says so. Otherwise the project's version is put in place without replacing an entry that
+/// appeared there meanwhile (that is reported as changed outside too). The moved file is let
+/// go only when it still holds what was checked; one written again in between (through a
+/// handle opened before the move) is kept next to it, and the result names where. Anything
+/// else than a file or link at `path`, such as a folder, is repaired by [`restore_file`] as
+/// before. An error when a step fails; the moved file is put back first, or the error says
+/// where it is kept.
+fn repair_file(path: &Path, should: Option<&[u8]>, found: &Found) -> std::io::Result<Repair> {
+    #[cfg(test)]
+    if tests::restore_fails(path) {
+        return Err(std::io::Error::other("blocked by the test"));
+    }
+    let moved = match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_file() || m.is_symlink() => {
+            // The name is reserved first (a new empty file, `create_new`), so the move can only
+            // replace this call's own placeholder, never an entry another program made there.
+            let aside = reserve_beside(path, "aside")?;
+            if let Err(e) = std::fs::rename(path, &aside) {
+                let _ = std::fs::remove_file(&aside);
+                return Err(e);
+            }
+            Some(aside)
+        }
+        Ok(_) => return restore_file(path, should).map(|()| Repair::Done),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    let now = match &moved {
+        Some(aside) => snapshot_file(aside),
+        None => Ok(None),
+    };
+    let stamp = moved.as_deref().and_then(stamp_of);
+    #[cfg(test)]
+    if let Some(aside) = &moved {
+        tests::write_moved_after_check(aside);
+    }
+    #[cfg(test)]
+    tests::run_hook("moved aside", path);
+    let put_back = |aside: &Path| match place_new(aside, path) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(std::io::Error::other(format!(
+            "another file appeared there meanwhile; the one that was there is kept as {}",
+            aside.display()
+        ))),
+        Err(e) => Err(std::io::Error::other(format!(
+            "{e}; the file that was there is kept as {}",
+            aside.display()
+        ))),
+    };
+    // The moved file is removed only while it holds what was checked: read again just before.
+    let let_go = |aside: &Path| -> std::io::Result<Option<String>> {
+        let same = match (&now, snapshot_file(aside)) {
+            (Ok(was), Ok(is)) => *was == is && stamp_of(aside) == stamp,
+            (Err(_), _) | (_, Err(_)) => stamp_of(aside) == stamp,
+        };
+        if !same {
+            return Ok(Some(format!(
+                " (it was written again while it was repaired; that version is kept as {})",
+                aside.display()
+            )));
+        }
+        std::fs::remove_file(aside).map_err(|e| {
+            std::io::Error::other(format!(
+                "the project's version is in place, but the file that was there could not be removed from {}: {e}",
+                aside.display()
+            ))
+        })?;
+        Ok(None)
+    };
+    let stamp_at = moved.as_deref().unwrap_or(path);
+    if let Some(note) = found.change(now.clone(), &should.map(<[u8]>::to_vec), stamp_at) {
+        if let Some(aside) = &moved {
+            put_back(aside)?;
+        }
+        return Ok(Repair::ChangedOutside(note));
+    }
+    let placed = match should {
+        // Already the project's version: the moved file itself goes back.
+        Some(bytes) if now.as_ref().is_ok_and(|n| n.as_deref() == Some(bytes)) => match &moved {
+            Some(aside) => place_new(aside, path),
+            None => Ok(true),
+        },
+        Some(bytes) => write_staging_beside(path, bytes).and_then(|new| {
+            let placed = place_new(&new, path);
+            if std::fs::symlink_metadata(&new).is_ok() {
+                let _ = std::fs::remove_file(&new);
+            }
+            placed
+        }),
+        None => match std::fs::symlink_metadata(path) {
+            Ok(_) => Ok(false),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(e) => Err(e),
+        },
+    };
+    match placed {
+        Ok(placed) => {
+            let kept = match &moved {
+                Some(aside) if std::fs::symlink_metadata(aside).is_ok() => let_go(aside)?,
+                _ => None,
+            };
+            Ok(match (placed, kept) {
+                (_, Some(note)) => Repair::ChangedOutside(note),
+                (true, None) => Repair::Done,
+                // An entry appeared where the project's version was to go: another program's.
+                (false, None) => Repair::ChangedOutside(" (it appeared again while it was being written)".into()),
+            })
+        }
+        Err(e) => {
+            if let Some(aside) = &moved {
+                put_back(aside).map_err(|again| std::io::Error::other(format!("{e}; then {again}")))?;
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Write `bytes` to a new file next to `path` ([`unused_beside`]), created here and only here
+/// (`create_new`: never through a link or into a file someone else put at that name).
+fn write_staging_beside(path: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    for _ in 0..10 {
+        let new = unused_beside(path, "new")?;
+        #[cfg(test)]
+        tests::run_hook("staging name chosen", &new);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&new) {
+            Ok(mut file) => {
+                if let Err(e) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+                    drop(file);
+                    let _ = std::fs::remove_file(&new);
+                    return Err(e);
+                }
+                return Ok(new);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other("no free name next to it"))
+}
+
+/// A new empty file next to `path` ([`unused_beside`]), created here (`create_new`), that holds
+/// the name for a file of a repair (`what`) until it is renamed over.
+fn reserve_beside(path: &Path, what: &str) -> std::io::Result<PathBuf> {
+    for _ in 0..10 {
+        let name = unused_beside(path, what)?;
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&name) {
+            Ok(_) => return Ok(name),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other("no free name next to it"))
+}
+
+/// A path next to `path` that nothing is at yet, for a file of a repair (`what`).
+fn unused_beside(path: &Path, what: &str) -> std::io::Result<PathBuf> {
+    let name = path.file_name().ok_or_else(|| std::io::Error::other("no file name"))?;
+    for n in 0..1000u32 {
+        let mut candidate = std::ffi::OsString::from(".");
+        candidate.push(name);
+        candidate.push(format!(".wc-{what}-{}-{n}", std::process::id()));
+        let candidate = path.with_file_name(candidate);
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other("no free name next to it"))
+}
+
+/// Move the file at `from` to `to` without replacing anything at `to`: `false` (and `from`
+/// left as it is) when something is there. Done by a hard link, then removing `from`; where
+/// the file system has no hard links, by a rename once nothing is seen at `to`.
+fn place_new(from: &Path, to: &Path) -> std::io::Result<bool> {
+    match std::fs::hard_link(from, to) {
+        Ok(()) => {
+            std::fs::remove_file(from)?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported || e.kind() == std::io::ErrorKind::PermissionDenied => {
+            if std::fs::symlink_metadata(to).is_ok() {
+                return Ok(false);
+            }
+            std::fs::rename(from, to)?;
+            Ok(true)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn snapshot_file(path: &Path) -> Result<Option<Vec<u8>>, String> {
@@ -4513,6 +4745,44 @@ pub(crate) mod tests {
         FAIL_RESTORE.with(|f| f.borrow_mut().clear());
     }
 
+    thread_local! {
+        /// Text written into the next file a repair moves aside, after it was checked: a
+        /// program writing through a handle it opened before the move.
+        static WRITE_MOVED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    }
+
+    type Hook = Box<dyn FnOnce(&Path)>;
+
+    thread_local! {
+        /// Steps run once at a named point of a repair (in this test's thread): another
+        /// program acting at that moment.
+        static HOOKS: std::cell::RefCell<Vec<(&'static str, Hook)>> = std::cell::RefCell::new(Vec::new());
+    }
+
+    #[cfg(unix)]
+    fn at(point: &'static str, step: impl FnOnce(&Path) + 'static) {
+        HOOKS.with(|h| h.borrow_mut().push((point, Box::new(step))));
+    }
+
+    pub(super) fn run_hook(point: &str, path: &Path) {
+        let step = HOOKS.with(|h| {
+            let mut h = h.borrow_mut();
+            let i = h.iter().position(|(p, _)| *p == point)?;
+            Some(h.remove(i).1)
+        });
+        if let Some(step) = step {
+            step(path);
+        }
+    }
+
+    pub(super) fn write_moved_after_check(aside: &Path) {
+        if let Some(text) = WRITE_MOVED.with(|w| w.borrow_mut().take()) {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(aside).unwrap();
+            f.write_all(text.as_bytes()).unwrap();
+        }
+    }
+
     pub(super) fn restore_fails(path: &Path) -> bool {
         let outside: Vec<(PathBuf, String)> = OUTSIDE_WRITE.with(|w| {
             let mut w = w.borrow_mut();
@@ -4672,6 +4942,168 @@ pub(crate) mod tests {
         o.write_over_outside_version(&path);
         o.save().unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), two, "as the project needs it");
+    }
+
+    /// Another program writes a waiting macro after Save's check found it as WiringCraft left
+    /// it, just before the repair: the edit is not lost, and Save names the file (#670).
+    #[test]
+    fn a_save_does_not_lose_a_waiting_file_changed_right_after_its_check() {
+        let (_tmp, mut o, path, [_, _, two]) = macro_edited_twice();
+        let symbol = o.project.lock.symbols.keys().next().unwrap().clone();
+        o.stale_symbol_files.insert(symbol);
+        o.fail_symbol_writes = [true].into();
+        fail_restores(&path, 1);
+        assert!(!o.undo());
+        assert!(o.take_undo_error().is_some());
+        let_restores_through();
+        o.stale_symbol_files.clear();
+        o.fail_symbol_writes = Default::default();
+        assert_eq!(o.changed_outside(), None, "as WiringCraft left it");
+
+        let outside = format!("{two}\n# edited between the check and the repair\n");
+        write_outside_before(&path, &path, &outside);
+        let err = o.save().unwrap_err();
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains(Open::CHANGED_OUTSIDE), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), outside, "the edit survives");
+        assert_eq!(o.changed_outside(), Some(path.clone()), "still asked about");
+        let dir = path.parent().unwrap();
+        let left: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".wc-"))
+            .collect();
+        assert!(left.is_empty(), "nothing left beside it: {left:?}");
+
+        // Keeping it lets the save through with that version.
+        o.keep_outside_version(&path);
+        o.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), outside);
+    }
+
+    /// When the project's version cannot be staged (every staging name taken), the file that
+    /// was moved aside goes back where it was, untouched (#670).
+    #[test]
+    fn a_repair_that_cannot_stage_puts_the_file_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("m.yaml");
+        std::fs::write(&path, "left").unwrap();
+        for n in 0..1000u32 {
+            let name = format!(".m.yaml.wc-new-{}-{n}", std::process::id());
+            std::fs::write(tmp.path().join(name), "").unwrap();
+        }
+        let left = Found::Bytes(Some(b"left".to_vec()));
+        let err = repair_file(&path, Some(b"new"), &left).err().unwrap();
+        assert!(err.to_string().contains("no free name"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"left", "put back");
+        let aside = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains("wc-aside"))
+            .count();
+        assert_eq!(aside, 0, "nothing left aside");
+    }
+
+    /// A link another program puts at the staging name right after it was chosen is not
+    /// written through: the file it points at stays as it was (#670).
+    #[cfg(unix)]
+    #[test]
+    fn a_link_put_at_the_staging_name_is_not_written_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("m.yaml");
+        std::fs::write(&path, "left").unwrap();
+        let target = tmp.path().join("outside.txt");
+        std::fs::write(&target, "theirs").unwrap();
+        let t = target.clone();
+        at("staging name chosen", move |new| {
+            std::os::unix::fs::symlink(&t, new).unwrap()
+        });
+        let left = Found::Bytes(Some(b"left".to_vec()));
+        assert!(matches!(repair_file(&path, Some(b"new"), &left).unwrap(), Repair::Done));
+        assert_eq!(std::fs::read(&target).unwrap(), b"theirs", "not written through");
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    }
+
+    /// A dangling link another program puts where a file is to be deleted, after it was moved
+    /// aside, counts as changed outside: it is left there and the repair keeps waiting (#670).
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_link_put_where_a_deleted_file_was_is_reported() {
+        let (_tmp, mut o, path, _) = macro_edited_twice();
+        let held = std::fs::read(&path).unwrap();
+        let rel = path.strip_prefix(&o.dir).unwrap().to_path_buf();
+        o.unwritten_files.insert(rel.clone(), None);
+        o.unwritten_found.insert(rel.clone(), Found::Bytes(Some(held)));
+        let nowhere = path.with_file_name("nowhere");
+        at("moved aside", move |p| std::os::unix::fs::symlink(&nowhere, p).unwrap());
+        let err = o.save().unwrap_err();
+        assert!(err.contains(Open::CHANGED_OUTSIDE), "{err}");
+        assert!(std::fs::symlink_metadata(&path).unwrap().is_symlink(), "left there");
+        assert!(o.unwritten_files.contains_key(&rel), "still waiting");
+    }
+
+    /// A reserved name is a file made by the reservation itself, so a second reservation (or
+    /// another program) never gets the same one (#670).
+    #[test]
+    fn a_reserved_repair_name_is_held_by_a_new_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("m.yaml");
+        let first = reserve_beside(&path, "aside").unwrap();
+        assert!(first.is_file());
+        let second = reserve_beside(&path, "aside").unwrap();
+        assert_ne!(first, second);
+        assert!(second.is_file());
+    }
+
+    /// The repair itself: a waiting deletion or replacement is done when the file holds what
+    /// the check admitted, and a file changed outside is put back untouched (#670).
+    #[test]
+    fn a_repair_moves_the_file_aside_and_checks_it_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("m.yaml");
+        let left = Found::Bytes(Some(b"left".to_vec()));
+        // Replaced when it holds what WiringCraft left.
+        std::fs::write(&path, "left").unwrap();
+        assert!(matches!(repair_file(&path, Some(b"new"), &left).unwrap(), Repair::Done));
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        // Deleted when it should be gone.
+        std::fs::write(&path, "left").unwrap();
+        assert!(matches!(repair_file(&path, None, &left).unwrap(), Repair::Done));
+        assert!(!path.exists());
+        // Written where nothing was left, and nothing is.
+        assert!(matches!(
+            repair_file(&path, Some(b"new"), &Found::Bytes(None)).unwrap(),
+            Repair::Done
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        // Changed outside: neither deleted nor replaced.
+        std::fs::write(&path, "theirs").unwrap();
+        for should in [None, Some(&b"new"[..])] {
+            let Repair::ChangedOutside(_) = repair_file(&path, should, &left).unwrap() else {
+                unreachable!("changed outside")
+            };
+            assert_eq!(std::fs::read(&path).unwrap(), b"theirs");
+        }
+        assert_eq!(
+            std::fs::read_dir(tmp.path()).unwrap().count(),
+            1,
+            "nothing left beside it"
+        );
+        // Written again through an old handle after the check: that version is kept beside it
+        // and named, not let go.
+        std::fs::write(&path, "left").unwrap();
+        WRITE_MOVED.with(|w| *w.borrow_mut() = Some("+late".into()));
+        let Repair::ChangedOutside(note) = repair_file(&path, Some(b"new"), &left).unwrap() else {
+            unreachable!("written again")
+        };
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        let kept: Vec<PathBuf> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| *p != path)
+            .collect();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(std::fs::read(&kept[0]).unwrap(), b"left+late");
+        assert!(note.contains(&kept[0].display().to_string()), "{note}");
     }
 
     /// A repair noted while the file could not be read (a folder in its place): a macro file

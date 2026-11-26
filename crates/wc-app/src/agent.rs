@@ -5294,6 +5294,38 @@ mod tests {
         assert!(o.project.pages[0].symbols.is_empty());
     }
 
+    /// The actions a single key press (with `modifiers` held) asks for in the editor.
+    fn shortcuts_for(a: &mut App, key: egui::Key, modifiers: egui::Modifiers) -> Vec<Action> {
+        let raw = egui::RawInput {
+            modifiers,
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..Default::default()
+        };
+        let mut got = Vec::new();
+        let _ = egui::Context::default().run(raw, |ctx| got = a.shortcuts(ctx));
+        got
+    }
+
+    /// Backspace deletes the selection like Delete, for keyboards without a Delete key (#686).
+    #[test]
+    fn backspace_deletes_the_selection_like_delete() {
+        let (_tmp, mut a) = app(vec![]);
+        for key in [egui::Key::Delete, egui::Key::Backspace] {
+            assert_eq!(
+                shortcuts_for(&mut a, key, egui::Modifiers::NONE),
+                vec![Action::Delete],
+                "{key:?}"
+            );
+        }
+        assert!(shortcuts_for(&mut a, egui::Key::Backspace, egui::Modifiers::COMMAND).is_empty());
+    }
+
     #[test]
     fn escape_after_leaving_the_black_box_tool_cancels_the_new_tool_s_drawing() {
         use wc_core::geom::Point;
@@ -10095,5 +10127,39 @@ mod tests {
             open.project.meta.libraries, p.meta.libraries,
             "the base project's library sources, no starter library added"
         );
+    }
+
+    /// A single-key shortcut goes by the modifiers held at the key press, not those of the frame:
+    /// Ctrl+R with Ctrl let go before the frame runs is not R (#709).
+    #[test]
+    fn single_key_shortcuts_check_the_modifiers_of_the_press() {
+        let (_tmp, mut a) = app(vec![]);
+        a.ed.tool = crate::state::Tool::Polyline;
+        let mut press = |key, at_press: egui::Modifiers, in_frame: egui::Modifiers| {
+            let raw = egui::RawInput {
+                modifiers: in_frame,
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: at_press,
+                }],
+                ..Default::default()
+            };
+            a.ed.finish_shape = false;
+            let mut got = Vec::new();
+            let _ = egui::Context::default().run(raw, |ctx| got = a.shortcuts(ctx));
+            (got, a.ed.finish_shape)
+        };
+        let (none, ctrl) = (egui::Modifiers::NONE, egui::Modifiers::COMMAND);
+        // Ctrl+R still opens the reports (a Ctrl shortcut), but does not also rotate.
+        assert_eq!(press(egui::Key::R, ctrl, none), (vec![Action::Reports], false));
+        assert_eq!(press(egui::Key::Delete, ctrl, none), (vec![], false));
+        assert_eq!(press(egui::Key::Enter, ctrl, none), (vec![], false));
+        assert_eq!(press(egui::Key::R, none, none), (vec![Action::Rotate], false));
+        assert_eq!(press(egui::Key::Enter, none, none), (vec![], true));
+        // Ctrl pressed after the key, before the frame: the bare press still counts.
+        assert_eq!(press(egui::Key::R, none, ctrl).0, vec![Action::Rotate]);
     }
 }
