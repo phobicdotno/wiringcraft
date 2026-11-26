@@ -198,18 +198,18 @@ struct Step {
     /// Tells this step apart from every other, for finding it again (see
     /// [`Open::take_back_move`]). A step moved between Undo and Redo gets a new one.
     id: u64,
+    /// How far the running move drag had moved its items in `project` (see
+    /// [`Open::drag_offset`]); zero outside a drag.
+    offset: Point,
 }
 
 impl Step {
-    fn of(project: Project) -> Step {
-        Step::with_files(project, Vec::new())
-    }
-
-    fn with_files(project: Project, files: Vec<FileEdit>) -> Step {
+    fn new(project: Project, files: Vec<FileEdit>, offset: Point) -> Step {
         Step {
             project,
             files,
             id: next_revision(),
+            offset,
         }
     }
 }
@@ -493,6 +493,10 @@ pub struct Open {
     /// The terminal numbering before the change in progress (taken at its checkpoint), so
     /// jumpers can follow their terminals once it is done.
     terminals_before: Option<wc_core::project::TerminalNumbers>,
+    /// How far the running select-tool move drag has moved its items in `project`: kept with
+    /// every undo and redo step taken during the drag, so Escape can take back from each just
+    /// the part of the move it holds (#863). Zero outside a drag.
+    drag_offset: Point,
     /// In a shared session, the pages someone else has open (page id to their name). Tools that
     /// work on every page leave these alone; the session would refuse the change otherwise.
     pub held_by_others: BTreeMap<String, String>,
@@ -603,6 +607,7 @@ impl Open {
             underlays: BTreeMap::new(),
             picture_problems: BTreeMap::new(),
             terminals_before: None,
+            drag_offset: Point::new(0.0, 0.0),
             held_by_others: BTreeMap::new(),
             symbol_versions: BTreeMap::new(),
             part_versions: BTreeMap::new(),
@@ -1216,7 +1221,8 @@ impl Open {
         // snapshot and this change start from that.
         self.follow_terminals();
         self.terminals_before = Some(self.terminal_numbers());
-        self.undo.push(Step::of(self.project.clone()));
+        self.undo
+            .push(Step::new(self.project.clone(), Vec::new(), self.drag_offset));
         self.trim_undo();
         self.redo.clear();
         self.edited();
@@ -1269,29 +1275,70 @@ impl Open {
         self.undo.last().map(|s| s.id)
     }
 
-    /// Take back a move of `items` by `d` on page `page` whose checkpoint is the undo step `id`,
+    /// A select-tool move drag begins: its checkpoint, from which [`Open::drag_move_by`]
+    /// counts how far the items moved.
+    pub fn begin_drag_move(&mut self) {
+        self.drag_offset = Point::new(0.0, 0.0);
+        self.checkpoint();
+    }
+
+    /// One frame of a move drag: [`Open::move_by`], counted in the drag's offset.
+    pub fn drag_move_by(&mut self, page: usize, sel: &[Selection], d: Point) {
+        self.move_by(page, sel, d);
+        self.drag_offset = self.drag_offset + d;
+    }
+
+    /// A move drag ended: later steps are no part of it.
+    pub fn end_drag_move(&mut self) {
+        self.drag_offset = Point::new(0.0, 0.0);
+    }
+
+    /// Take back a move of `items` on page `page` whose checkpoint is the undo step `id`,
     /// keeping the changes recorded after it (a rotate during the move, #863): the items go back
-    /// by `d` now and in every later undo and redo step, and the move's own step is dropped, so
-    /// Undo and Redo then work as if the changes after it were made at the start position.
-    /// Returns false, changing nothing, when that step is no longer in the history (the move
-    /// was undone, or trimmed off the oldest end) or carries file edits a move never makes.
-    pub fn take_back_move(&mut self, id: u64, page: &str, items: &[Selection], d: Point) -> bool {
+    /// by as far as the drag had moved them, now and in every later undo and redo step (each by
+    /// its own part of the move), and the move's own step is dropped, so Undo and Redo then work
+    /// as if the changes after it were made at the start position. Jumpers and strip layouts
+    /// follow the terminals back in each. Returns false, changing nothing, when that step is no
+    /// longer in the history (the move was undone, or trimmed off the oldest end), carries file
+    /// edits a move never makes, or a drawing or cloud on the page was added or deleted since
+    /// (`items` names those by place in their list).
+    pub fn take_back_move(&mut self, id: u64, page: &str, items: &[Selection]) -> bool {
         let Some(at) = self.undo.iter().position(|s| s.id == id) else {
             return false;
         };
-        if !self.undo[at].files.is_empty() {
+        let Some(first) = self.undo.get(at) else {
+            return false;
+        };
+        let counts = |p: &Project| p.page(page).map(|p| (p.graphics.len(), p.clouds.len()));
+        let start = counts(&first.project);
+        let later = self.undo.iter().skip(at + 1).chain(&self.redo).map(|s| &s.project);
+        if !first.files.is_empty() || later.chain([&self.project]).any(|p| counts(p) != start) {
             return false;
         }
-        let back = Point::new(-d.x, -d.y);
-        let undo = self.undo[at + 1..].iter_mut();
-        for p in undo
-            .chain(self.redo.iter_mut())
-            .map(|s| &mut s.project)
-            .chain(std::iter::once(&mut self.project))
-        {
-            if let Some(p) = p.page_mut(page) {
-                crate::edit::move_items(p, items, back);
+        // The change in progress (the move's frames since the last checkpoint) is followed first.
+        self.follow_terminals();
+        let symbols = &self.symbols;
+        let role = |id: &str| symbols.get(id).map(|s| s.role);
+        let back = |p: &mut Project, d: Point| {
+            let before = p
+                .meta
+                .follows_terminals()
+                .then(|| wc_core::project::terminal_numbers(p, role));
+            if let Some(pg) = p.page_mut(page) {
+                crate::edit::move_items(pg, items, Point::new(-d.x, -d.y));
             }
+            if let Some(before) = before {
+                wc_core::project::follow_terminals_in(p, &before, role);
+            }
+        };
+        for s in self.undo.iter_mut().skip(at + 1).chain(self.redo.iter_mut()) {
+            back(&mut s.project, s.offset);
+            s.offset = Point::new(0.0, 0.0);
+        }
+        back(&mut self.project, self.drag_offset);
+        self.drag_offset = Point::new(0.0, 0.0);
+        if self.terminals_before.is_some() {
+            self.terminals_before = Some(self.terminal_numbers());
         }
         self.undo.remove(at);
         self.history += 1;
@@ -1441,9 +1488,12 @@ impl Open {
                     }
                 };
                 self.forget_terminal_change();
-                let Step { project, files, .. } = prev;
+                let Step {
+                    project, files, offset, ..
+                } = prev;
+                let now = std::mem::replace(&mut self.project, project);
                 self.redo
-                    .push(Step::with_files(std::mem::replace(&mut self.project, project), files));
+                    .push(Step::new(now, files, std::mem::replace(&mut self.drag_offset, offset)));
                 let left = self
                     .redo
                     .last()
@@ -1463,7 +1513,8 @@ impl Open {
                         };
                         let restored = std::mem::replace(&mut self.project, cur.project);
                         self.undo_error = Some(e);
-                        self.undo.push(Step::with_files(restored, cur.files));
+                        let offset = std::mem::replace(&mut self.drag_offset, cur.offset);
+                        self.undo.push(Step::new(restored, cur.files, offset));
                     }
                     return false;
                 }
@@ -1493,9 +1544,12 @@ impl Open {
                     }
                 };
                 self.forget_terminal_change();
-                let Step { project, files, .. } = next;
+                let Step {
+                    project, files, offset, ..
+                } = next;
+                let now = std::mem::replace(&mut self.project, project);
                 self.undo
-                    .push(Step::with_files(std::mem::replace(&mut self.project, project), files));
+                    .push(Step::new(now, files, std::mem::replace(&mut self.drag_offset, offset)));
                 let left = self
                     .undo
                     .last()
@@ -1514,7 +1568,8 @@ impl Open {
                         };
                         let restored = std::mem::replace(&mut self.project, cur.project);
                         self.undo_error = Some(e);
-                        self.redo.push(Step::with_files(restored, cur.files));
+                        let offset = std::mem::replace(&mut self.drag_offset, cur.offset);
+                        self.redo.push(Step::new(restored, cur.files, offset));
                     }
                     return false;
                 }
