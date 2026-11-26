@@ -343,8 +343,15 @@ fn convert(
                 }
                 Some("text") => {
                     if let (Some(t), Some(at)) = (g.arg(1), g.first("at")) {
-                        let height = g
-                            .first("effects")
+                        let effects = g.first("effects");
+                        // Only the horizontal words matter; `top` and `bottom` are ignored.
+                        let justify = effects.and_then(|e| e.first("justify"));
+                        let align = match justify.map(|j| j.items()) {
+                            Some(words) if words.iter().any(|w| w.atom() == Some("left")) => Align::Left,
+                            Some(words) if words.iter().any(|w| w.atom() == Some("right")) => Align::Right,
+                            _ => Align::Center,
+                        };
+                        let height = effects
                             .and_then(|e| e.first("font"))
                             .and_then(|f| f.first("size"))
                             .and_then(|s| s.num(1))
@@ -353,7 +360,7 @@ fn convert(
                             at: pt(at.num(1).unwrap_or(0.0), at.num(2).unwrap_or(0.0)),
                             text: t.to_owned(),
                             height: height * scale,
-                            align: Align::Center,
+                            align,
                             // KiCad stores tenths of a degree in old files and degrees now.
                             angle: at.num(3).map(|a| if a > 360.0 { a / 10.0 } else { a }).unwrap_or(0.0),
                         });
@@ -647,6 +654,39 @@ mod tests {
         assert_eq!(derived.description, "24 V coil");
         assert_eq!(derived.pins.len(), 2);
         assert_eq!(syms[3].symbol.id, "kicad.relays.relay_coil_24v_b");
+        Ok(())
+    }
+
+    #[test]
+    fn texts_keep_their_left_or_right_justification() -> Result<()> {
+        let lib = r#"(kicad_symbol_lib
+  (symbol "J" (property "Reference" "J" (at 0 0 0))
+    (symbol "J_0_1"
+      (text "L" (at 0 0 0) (effects (font (size 1.27 1.27)) (justify left)))
+      (text "R" (at 0 2 0) (effects (font (size 1.27 1.27)) (justify right bottom)))
+      (text "C" (at 0 4 0) (effects (font (size 1.27 1.27)) (justify top)))
+      (text "N" (at 0 6 0) (effects (font (size 1.27 1.27)))))
+    (symbol "J_1_1" (pin passive line (at 0 0 0) (length 1) (name "~") (number "1")))))"#;
+        let (syms, warnings) = symbols(lib, "k", 1.0)?;
+        assert_eq!(syms.len(), 1, "{warnings:?}");
+        let aligns: Vec<(&str, Align)> = syms[0]
+            .symbol
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Text { text, align, .. } => Some((text.as_str(), *align)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            aligns,
+            vec![
+                ("L", Align::Left),
+                ("R", Align::Right),
+                ("C", Align::Center),
+                ("N", Align::Center)
+            ]
+        );
         Ok(())
     }
 
