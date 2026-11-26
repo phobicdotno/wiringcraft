@@ -5272,14 +5272,7 @@ fn export_drawings_to(open: &Open, dir: &Path) -> String {
             let mut stem = if page.panel {
                 wc_pdf::panel_file_stem(page)
             } else {
-                let base = if page.number.trim().is_empty() {
-                    &page.id
-                } else {
-                    page.number.trim()
-                };
-                base.chars()
-                    .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
-                    .collect()
+                wc_pdf::page_file_stem(page)
             };
             // Compared without case: `A1` and `a1` are one file name on Windows and macOS.
             while !used.insert(stem.to_lowercase()) {

@@ -224,6 +224,27 @@ fn dxf_text_keeps_percent_signs_backslashes_and_wide_characters_literal() {
 }
 
 #[test]
+fn page_files_are_named_after_the_page_number() {
+    let page = |number: &str| PageDrawing {
+        id: "p-7".into(),
+        number: number.into(),
+        title: String::new(),
+        size_mm: (100.0, 100.0),
+        prims: Vec::new(),
+        pictures: Vec::new(),
+        panel: false,
+    };
+    // The app and the command line name page files the same way: `1.2` keeps its dot.
+    assert_eq!(crate::page_file_stem(&page("1.2")), "1.2");
+    assert_eq!(crate::page_file_stem(&page(" A/1 ")), "A_1");
+    // Without a number, the page's id names the file.
+    assert_eq!(crate::page_file_stem(&page("  ")), "p-7");
+    // Leading dots are left out, and a name of only dots falls back to `page`.
+    assert_eq!(crate::page_file_stem(&page(".hidden")), "hidden");
+    assert_eq!(crate::page_file_stem(&page("..")), "page");
+}
+
+#[test]
 fn arcs_keep_their_side_in_svg_and_dxf() {
     // A quarter arc from 0 to 90 degrees clockwise on the page: from the right of the centre to
     // below it. In DXF (y up) that is from 270 to 360 counter-clockwise.

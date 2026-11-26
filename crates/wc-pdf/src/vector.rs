@@ -212,6 +212,31 @@ pub fn panel_file_stem(d: &PageDrawing) -> String {
     format!("panel-{safe}")
 }
 
+/// The file name, without extension, of a schematic page's drawing: the page's number (its id
+/// when it has none), with every character but letters, digits, `-`, `_` and `.` written as `_`
+/// and leading dots left out, so `1.2` stays `1.2` and `A/1` becomes `A_1`; `page` when nothing
+/// is left. The app and the command line both name page files this way.
+pub fn page_file_stem(d: &PageDrawing) -> String {
+    let number = d.number.trim();
+    let base = if number.is_empty() { d.id.as_str() } else { number };
+    let stem: String = base
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let stem = stem.trim_start_matches('.');
+    if stem.is_empty() {
+        "page".into()
+    } else {
+        stem.to_owned()
+    }
+}
+
 /// Standard base64 with padding.
 pub(crate) fn base64(bytes: &[u8]) -> String {
     const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
