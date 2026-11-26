@@ -1950,7 +1950,10 @@ impl App {
                 (Key::Minus, Action::ZoomOut),
             ] {
                 // + often needs Shift, so the zoom-in keys also count with Shift held.
-                let shift_ok = matches!(k, Key::Plus | Key::Equals) && i.modifiers.shift_only();
+                // Shift and nothing else: `shift_only` does not look at the Mac's Ctrl key.
+                let m = i.modifiers;
+                let shift_ok =
+                    matches!(k, Key::Plus | Key::Equals) && m.shift && !(m.ctrl || m.alt || m.command || m.mac_cmd);
                 if i.key_pressed(k) && (i.modifiers.is_none() || shift_ok) {
                     out.push(a);
                 }

@@ -5336,6 +5336,13 @@ mod tests {
                 assert_eq!(shortcuts_for(&mut a, key, m), vec![Action::ZoomIn], "{key:?} {m:?}");
             }
             assert!(!shortcuts_for(&mut a, key, egui::Modifiers::ALT).contains(&Action::ZoomIn));
+            // Ctrl+Shift on a Mac: Ctrl set, Command not.
+            let mac_ctrl_shift = egui::Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            };
+            assert!(!shortcuts_for(&mut a, key, mac_ctrl_shift).contains(&Action::ZoomIn));
         }
         assert_eq!(
             shortcuts_for(&mut a, egui::Key::Minus, egui::Modifiers::NONE),
