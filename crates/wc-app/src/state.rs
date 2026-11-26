@@ -2488,7 +2488,8 @@ impl Open {
     /// wires on it follow; `removed` names the old points that were taken off (a new point may
     /// reuse such a name, and is still another point). A wire on a point that is gone keeps its
     /// end where the point was, as a free end. The box's symbol gets a new version (its file and
-    /// lock entry); Undo puts the earlier one back. Returns warnings: the wires on points that
+    /// lock entry); Undo puts the earlier one back. A removed point's free end may not land on
+    /// another wire's free end, which would join them. Returns warnings: the wires on points that
     /// are gone or moved, and other boxes that place the same symbol (they change too). Nothing
     /// changes when the box is refused or its symbol file cannot be written.
     pub fn edit_black_box(
@@ -4945,6 +4946,48 @@ pub(crate) mod tests {
                 pin: "2".into()
             }
         );
+    }
+
+    #[test]
+    fn removing_a_box_point_where_another_wire_has_a_free_end_is_refused() {
+        use wc_core::{BoxPin, BoxSide};
+        let (_tmp, mut o) = project();
+        let pins = [BoxPin {
+            name: "1".into(),
+            side: BoxSide::Left,
+            offset: 5.0,
+        }];
+        let id = o
+            .add_black_box(1, Point::new(40.0, 40.0), Point::new(60.0, 50.0), &pins, None)
+            .unwrap();
+        let free = |x, y| Endpoint::Point { at: Point::new(x, y) };
+        let on_1 = Endpoint::Pin {
+            item: id.clone(),
+            pin: "1".into(),
+        };
+        o.add_wire(1, on_1.clone(), free(0.0, 0.0), Vec::new());
+        // Another wire ends freely where point 1 is (40, 45), not joined to it.
+        o.add_wire(1, free(40.0, 45.0), free(0.0, 90.0), Vec::new());
+        let removed: std::collections::BTreeSet<String> = ["1".to_owned()].into_iter().collect();
+        let before = o.project.clone();
+        let symbol = o.symbols[&format!("box.{}.{id}", o.project.pages[1].id)].clone();
+        let steps = o.undo_mark();
+        let err = o
+            .edit_black_box(1, &id, (20.0, 10.0), &[], &BTreeMap::new(), &removed)
+            .unwrap_err();
+        assert!(
+            err.contains("wire w1") && err.contains("wire w2") && err.contains("joined"),
+            "{err}"
+        );
+        assert_eq!(o.project, before, "nothing changes");
+        assert_eq!(o.symbols[&symbol.id], symbol);
+        assert_eq!(o.undo_mark(), steps);
+
+        // With that wire end moved away the point comes off, and its wire keeps a free end.
+        o.project.pages[1].wires[1].from = free(30.0, 45.0);
+        o.edit_black_box(1, &id, (20.0, 10.0), &[], &BTreeMap::new(), &removed)
+            .unwrap();
+        assert_eq!(o.project.pages[1].wires[0].from, free(40.0, 45.0));
     }
 
     #[test]

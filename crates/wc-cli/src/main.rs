@@ -8695,6 +8695,31 @@ mod tests {
     }
 
     #[test]
+    fn box_edit_refuses_to_join_a_removed_points_wire_to_a_free_wire_end_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        cli(
+            &dir,
+            &["box", "p1", "--at", "40,40", "--size", "20,10", "--pin", "IN:left:5"],
+        )
+        .unwrap();
+        cli(&dir, &["wire", "p1", "s1:IN", "0,0"]).unwrap();
+        let p = load(&dir).unwrap();
+        let pg = p.page("p1").unwrap();
+        let sym = store::read_vendored_symbol(&dir, &pg.symbols[0].symbol).unwrap();
+        let at = wc_pdf::pin_position(&pg.symbols[0], &sym, "IN").unwrap();
+        // Another wire ends freely where IN is, not joined to it.
+        cli(&dir, &["wire", "p1", &format!("{},{}", at.x, at.y), "0,90"]).unwrap();
+        let before = load(&dir).unwrap();
+        let err = cli(&dir, &["box-edit", "p1", "s1", "--clear-pins"]).unwrap_err();
+        assert!(err.contains("would be joined"), "{err}");
+        assert_eq!(load(&dir).unwrap(), before, "nothing changes");
+        assert_eq!(store::read_vendored_symbol(&dir, &sym.id).unwrap(), sym);
+    }
+
+    #[test]
     fn a_black_box_is_drawn_wired_tagged_listed_and_reloaded() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
