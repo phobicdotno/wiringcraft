@@ -71,10 +71,12 @@ macro_rules! err {
 /// PLC addresses from a CSV list onto the project's devices (`import plc-csv`).
 pub fn plc_csv(dir: &Path, file: &Path, log: &mut Log) -> Res<()> {
     let mut p = load(dir)?;
-    let bytes = std::fs::read(file).map_err(e)?;
-    let (rows, warnings) = crate::csv::plc_addresses(&crate::csv::decode(&bytes)).map_err(e)?;
+    let bytes = read_file(file)?;
+    let (rows, warnings) = crate::csv::file_rows(&bytes)
+        .and_then(|rows| crate::csv::plc_addresses_from_rows(&rows))
+        .map_err(e)?;
     for w in warnings {
-        err!(log, "warning: {w}");
+        err!(log, "warning: {}", escape_field(&w));
     }
     let applied = crate::csv::apply_plc_addresses(&mut p, &rows);
     for t in &applied.unknown {
@@ -97,7 +99,7 @@ pub fn plc_csv(dir: &Path, file: &Path, log: &mut Log) -> Res<()> {
 pub fn parts_bmecat(file: &Path, lib: &Path, log: &mut Log) -> Res<()> {
     let (n, warnings) = import_bmecat(file, lib)?;
     for w in warnings {
-        err!(log, "warning: {w}");
+        err!(log, "warning: {}", escape_field(&w));
     }
     out!(log, "imported {n} part(s) into {}", lib.display());
     Ok(())
@@ -107,7 +109,7 @@ pub fn parts_bmecat(file: &Path, lib: &Path, log: &mut Log) -> Res<()> {
 pub fn parts_edz(file: &Path, lib: &Path, symbol_map: Option<&Path>, log: &mut Log) -> Res<()> {
     let (n, report, warnings) = import_edz(file, lib, symbol_map)?;
     for w in warnings {
-        err!(log, "warning: {w}");
+        err!(log, "warning: {}", escape_field(&w));
     }
     for line in report.lines() {
         out!(log, "{line}");
@@ -118,13 +120,15 @@ pub fn parts_edz(file: &Path, lib: &Path, symbol_map: Option<&Path>, log: &mut L
 
 /// Parts from a CSV list into the library folder `lib` (`import parts-csv`).
 pub fn parts_csv(file: &Path, lib: &Path, log: &mut Log) -> Res<()> {
-    let bytes = std::fs::read(file).map_err(e)?;
-    let (parts, warnings) = crate::csv::parts(&crate::csv::decode(&bytes)).map_err(e)?;
+    let bytes = read_file(file)?;
+    let (parts, warnings) = crate::csv::file_rows(&bytes)
+        .and_then(|rows| crate::csv::parts_from_rows(&rows))
+        .map_err(e)?;
     for p in &parts {
         wc_library::write_part(lib, p).map_err(e)?;
     }
     for w in warnings {
-        err!(log, "warning: {w}");
+        err!(log, "warning: {}", escape_field(&w));
     }
     out!(log, "imported {} part(s) into {}", parts.len(), lib.display());
     Ok(())
@@ -147,7 +151,7 @@ pub fn eplan(dir: &Path, path: &Path, first_page: usize, log: &mut Log) -> Res<(
     let ep = crate::eplan::read(&tables).map_err(e)?;
     let (built, warnings) = crate::eplan::build(&ep, first_page);
     for w in ep.warnings.iter().chain(&warnings) {
-        err!(log, "warning: {w}");
+        err!(log, "warning: {}", escape_field(w));
     }
     let source = format!(
         "import:{}",
@@ -219,7 +223,7 @@ pub fn swe(
         }
         let info_warnings = got.info.iter().flat_map(|i| &i.warnings);
         for w in got.info_warning.iter().chain(info_warnings) {
-            err!(log, "warning: {w}");
+            err!(log, "warning: {}", escape_field(w));
         }
         (got.bytes, got.info, Some(got.folder))
     };
@@ -229,7 +233,7 @@ pub fn swe(
     sw.info = info;
     let choice = swe_symbol_choice(dir, &p, symbol_map)?;
     for w in &choice.2 {
-        err!(log, "warning: {w}");
+        err!(log, "warning: {}", escape_field(w));
     }
     // The archive's catalog: devices that name one of its parts are linked to it, the part
     // comes along, and its size is used for layout footprints the source gives no box.
@@ -267,7 +271,7 @@ pub fn swe(
     }
     let (built, warnings, report) = crate::swe::build_with(&sw, first_page, &choice.0);
     for w in sw.warnings.iter().chain(&warnings) {
-        err!(log, "warning: {w}");
+        err!(log, "warning: {}", escape_field(w));
     }
     let linked =
         (catalog_read && !sw.catalog.is_empty()).then(|| built.devices.values().filter(|d| d.part.is_some()).count());
@@ -319,7 +323,7 @@ pub fn swe_library(dir: &Path, path: &Path, lib: Option<&Path>, log: &mut Log) -
     );
     let (report, warnings) = import_swe_library(dir, path, lib, &source)?;
     for w in warnings {
-        err!(log, "warning: {w}");
+        err!(log, "warning: {}", escape_field(&w));
     }
     for line in report.lines() {
         out!(log, "{line}");
@@ -334,10 +338,10 @@ pub fn swe_library(dir: &Path, path: &Path, lib: Option<&Path>, log: &mut Log) -
 /// AutomationML devices and connections as overview pages (`import aml`).
 pub fn aml(dir: &Path, file: &Path, first_page: usize, log: &mut Log) -> Res<()> {
     let mut p = load(dir)?;
-    let text = std::fs::read(file).map_err(e)?;
+    let text = read_file(file)?;
     let imp = crate::aml::parse(&String::from_utf8_lossy(&text)).map_err(e)?;
     for w in &imp.warnings {
-        err!(log, "warning: {w}");
+        err!(log, "warning: {}", escape_field(w));
     }
     let built = crate::aml::build(&imp, first_page);
     let source = format!(
@@ -360,15 +364,22 @@ pub fn aml(dir: &Path, file: &Path, first_page: usize, log: &mut Log) -> Res<()>
 /// The open-format parts of another tool's project archive (`import archive`).
 pub fn archive(dir: &Path, file: &Path, first_page: usize, lib: Option<&Path>, log: &mut Log) -> Res<()> {
     use crate::archive::Kind;
-    let bytes = std::fs::read(file).map_err(e)?;
+    let bytes = read_file(file)?;
     let entries = crate::archive::open_entries(
         &bytes,
-        &[Kind::Pdf, Kind::Dxf, Kind::AutomationMl, Kind::KicadSymbols, Kind::Csv],
+        &[
+            Kind::Pdf,
+            Kind::Dxf,
+            Kind::AutomationMl,
+            Kind::KicadSymbols,
+            Kind::Csv,
+            Kind::Spreadsheet,
+        ],
     )
     .map_err(e)?;
     if entries.is_empty() {
         return Err(
-            "no importable PDF, DXF, AutomationML, KiCad symbols or CSV lists inside; run `wiringcraft inspect` to see what is there"
+            "no importable PDF, DXF, AutomationML, KiCad symbols, CSV lists or Excel lists inside; run `wiringcraft inspect` to see what is there"
                 .into(),
         );
     }
@@ -382,8 +393,11 @@ pub fn archive(dir: &Path, file: &Path, first_page: usize, lib: Option<&Path>, l
         .into_iter()
         .map(|(raw, kind, data)| ((escape_field(&raw), raw), kind, data))
         .collect();
-    // CSV lists come last, so PLC addresses reach devices that pages in the same archive add.
-    let (csvs, entries): (Vec<_>, Vec<_>) = entries.into_iter().partition(|(_, kind, _)| *kind == Kind::Csv);
+    // CSV and Excel lists come last, so PLC addresses reach devices that pages in the same
+    // archive add.
+    let (csvs, entries): (Vec<_>, Vec<_>) = entries
+        .into_iter()
+        .partition(|(_, kind, _)| matches!(kind, Kind::Csv | Kind::Spreadsheet));
     // Two entries with the same file name would write the same ids over each other.
     let mut prefixes = std::collections::BTreeSet::new();
     for (raw, _, data) in symbols {
@@ -493,8 +507,16 @@ pub fn archive(dir: &Path, file: &Path, first_page: usize, lib: Option<&Path>, l
     for (i, ((name, _), _, data)) in csvs.into_iter().enumerate() {
         out!(log, "{name}:");
         // Told apart by header, the same column names `plc-csv` and `parts-csv` read.
-        let path = tmp.join(format!("list-{i}.csv"));
-        let cmd = match crate::csv::kind(&crate::csv::decode(&data)) {
+        let rows = match crate::csv::file_rows(&data) {
+            Ok(rows) => rows,
+            Err(err) => {
+                err!(log, "warning: {name}: {err}");
+                continue;
+            }
+        };
+        let ext = if crate::xlsx::is_xlsx(&data) { "xlsx" } else { "csv" };
+        let path = tmp.join(format!("list-{i}.{ext}"));
+        let cmd = match crate::csv::kind_of_rows(&rows) {
             Some(crate::csv::CsvKind::PlcAddresses) => None,
             Some(crate::csv::CsvKind::Parts) => match lib {
                 Some(lib) => Some(lib),
@@ -528,10 +550,10 @@ pub fn page_dxf(dir: &Path, file: &Path, page: &str, scale: f64, log: &mut Log) 
     let mut p = load(dir)?;
     let lib = wc_library::Library::open(dir, &p).map_err(e)?;
     let known: std::collections::BTreeSet<String> = lib.index(ItemKind::Symbol).into_keys().collect();
-    let text = std::fs::read(file).map_err(e)?;
+    let text = read_file(file)?;
     let imported = crate::dxf::page(&String::from_utf8_lossy(&text), scale, &known).map_err(e)?;
     for w in &imported.warnings {
-        err!(log, "warning: {w}");
+        err!(log, "warning: {}", escape_field(w));
     }
     // The page must be there before anything is taken (a retry would skip the copies).
     page_mut(&mut p, page)?;
@@ -628,17 +650,39 @@ pub fn page_mut<'a>(p: &'a mut Project, id: &str) -> Res<&'a mut Page> {
     p.page_mut(id).ok_or_else(|| format!("no page {id:?}"))
 }
 
+/// The project in `dir`; a folder without one says so with [`no_project`].
 pub fn load(dir: &Path) -> Res<Project> {
+    // The entry itself, not where a link leads: a broken link is reported as the load fails.
+    if let Err(err) = std::fs::symlink_metadata(dir.join(store::PROJECT_FILE))
+        && err.kind() == std::io::ErrorKind::NotFound
+    {
+        return Err(no_project(dir));
+    }
     store::load(dir).map_err(e)
 }
 
-/// Save the project. Jumpers first follow their terminals: what the command renamed, moved or
-/// deleted is found by comparing with the project as it is on disk.
+/// What a command says when its folder holds no project: where it looked, and how to get one.
+pub fn no_project(dir: &Path) -> String {
+    format!(
+        "no WiringCraft project in {} (no {}): use -C <folder> or create one with wiringcraft new <folder>",
+        escape_field(&dir.display().to_string()),
+        store::PROJECT_FILE
+    )
+}
+
+/// The bytes of the input file `path`; a failure names the file.
+pub fn read_file(path: impl AsRef<Path>) -> Res<Vec<u8>> {
+    let path = path.as_ref();
+    std::fs::read(path).map_err(|err| format!("cannot read {}: {err}", escape_field(&path.display().to_string())))
+}
+
+/// Save the project. Jumpers and strip layouts first follow their terminals: what the command
+/// renamed, moved or deleted is found by comparing with the project as it is on disk.
 pub fn save(dir: &Path, p: &Project) -> Res<()> {
     let mut p = p.clone();
     // A new project has nothing on disk to compare with; any other load failure is reported.
     let on_disk = dir.join(store::PROJECT_FILE).exists();
-    if !p.meta.jumpers.is_empty() && on_disk {
+    if p.meta.follows_terminals() && on_disk {
         let old = store::load(dir).map_err(|err| format!("jumpers not updated: {}", e(err)))?;
         let (old_symbols, _) = store::vendored_symbols(dir, &old);
         let before = wc_core::project::terminal_numbers(&old, |id| old_symbols.get(id).map(|s| s.role));
@@ -659,7 +703,7 @@ pub fn save_imported(dir: &Path, p: &Project) -> Res<()> {
 /// staging file), already escaped with [`escape_field`] by the caller.
 pub fn import_pdf(dir: &Path, file: &Path, first_page: usize, source: &str, log: &mut Log) -> Result<(), String> {
     let mut p = load(dir)?;
-    let bytes = std::fs::read(file).map_err(e)?;
+    let bytes = read_file(file)?;
     let traced = crate::pdf::pages(&bytes).map_err(e)?;
     let stem = file
         .file_stem()
@@ -690,6 +734,16 @@ pub fn import_pdf(dir: &Path, file: &Path, first_page: usize, source: &str, log:
                     "page {}: scanned sheet saved as {file}, shown under the page",
                     first_page + i
                 );
+                if let Some(warning) = &t.scan_warning {
+                    // The reason can quote the file: written so it cannot send control sequences.
+                    err!(
+                        log,
+                        "warning: {} page {}: the scanned sheet was read only in part ({})",
+                        source,
+                        i + 1,
+                        escape_field(warning)
+                    );
+                }
                 Some(wc_core::Underlay {
                     file,
                     min: scan.min,
@@ -828,7 +882,7 @@ pub fn dwg_to_dxf(file: &Path, tmp: &Path, template: Option<String>) -> Res<Path
 /// Import a BMEcat catalogue's parts into a library folder. Files that are not UTF-8 are read
 /// as Latin-1, which BMEcat 1.2 catalogues often declare. Returns the count and warnings.
 pub fn import_bmecat(file: &Path, lib: &Path) -> Res<(usize, Vec<String>)> {
-    let bytes = std::fs::read(file).map_err(e)?;
+    let bytes = read_file(file)?;
     let (parts, warnings) = crate::bmecat::parts(&crate::csv::decode(&bytes)).map_err(e)?;
     for p in &parts {
         wc_library::write_part(lib, p).map_err(e)?;
@@ -950,7 +1004,7 @@ pub fn kicad_prefix(name: &str) -> String {
 pub fn read_kicad(text: &str, prefix: &str, scale: f64, log: &mut Log) -> Res<Vec<crate::kicad::Imported>> {
     let (symbols, warnings) = crate::kicad::symbols(text, prefix, scale).map_err(e)?;
     for w in warnings {
-        err!(log, "warning: {w}");
+        err!(log, "warning: {}", escape_field(&w));
     }
     Ok(symbols)
 }
@@ -1207,6 +1261,30 @@ pub fn add_and_save_with(
     replace: Replace,
     finish: impl FnOnce(&mut Project),
 ) -> Res<usize> {
+    let pages: Vec<&str> = built.pages.iter().map(|pg| pg.id.as_str()).collect();
+    let panels: Vec<&str> = built.panels.iter().map(|n| n.id.as_str()).collect();
+    let project_files = snapshot_project(dir, &pages, &panels)?;
+    let (written, joined) = add_built(dir, p, built, source, replace)?;
+    finish(p);
+    if let Err(err) = save_imported(dir, p) {
+        let mut failed = put_files_back(&project_files);
+        failed.extend(put_files_back(&written));
+        if failed.is_empty() {
+            return Err(err);
+        }
+        return Err(format!(
+            "{err}; putting back the vendored files failed too: {}",
+            failed.join("; ")
+        ));
+    }
+    Ok(joined)
+}
+
+/// Every file a save of the project may write or remove, with its bytes before (`None` when it
+/// does not exist yet): the project's own files, every file in its page, panel and comment
+/// folders, and the files of the pages and panels about to be added. [`put_files_back`] restores
+/// them when a save fails half way.
+pub fn snapshot_project(dir: &Path, new_pages: &[&str], new_panels: &[&str]) -> Res<Written> {
     // Every file the save may write or remove, read before anything is written: the project's
     // own files, every file in its page, panel and comment folders, and the files the new pages
     // and panels will get.
@@ -1238,17 +1316,11 @@ pub fn add_and_save_with(
             }
         }
     }
-    for page in &built.pages {
-        paths.push(
-            dir.join(store::PAGES_DIR)
-                .join(format!("{}{}", page.id, store::PAGE_SUFFIX)),
-        );
+    for id in new_pages {
+        paths.push(dir.join(store::PAGES_DIR).join(format!("{id}{}", store::PAGE_SUFFIX)));
     }
-    for panel in &built.panels {
-        paths.push(
-            dir.join(store::PANELS_DIR)
-                .join(format!("{}{}", panel.id, store::PANEL_SUFFIX)),
-        );
+    for id in new_panels {
+        paths.push(dir.join(store::PANELS_DIR).join(format!("{id}{}", store::PANEL_SUFFIX)));
     }
     paths.sort();
     paths.dedup();
@@ -1261,20 +1333,7 @@ pub fn add_and_save_with(
         };
         project_files.push((path, before));
     }
-    let (written, joined) = add_built(dir, p, built, source, replace)?;
-    finish(p);
-    if let Err(err) = save_imported(dir, p) {
-        let mut failed = put_files_back(&project_files);
-        failed.extend(put_files_back(&written));
-        if failed.is_empty() {
-            return Err(err);
-        }
-        return Err(format!(
-            "{err}; putting back the vendored files failed too: {}",
-            failed.join("; ")
-        ));
-    }
-    Ok(joined)
+    Ok(project_files)
 }
 
 /// Wire ends in `p` on pins of the symbol `symbol.id` that `symbol` does not have:
@@ -1354,6 +1413,18 @@ pub fn add_built(
             }
         }
     }
+    // A new version replaces the project's copy only when both are the same item of their
+    // library: ids given by name can move to another block in another catalog (#301).
+    for symbol in &built.symbols {
+        if replace == Replace::No || !p.lock.symbols.get(&symbol.id).is_some_and(|e| e.hash != symbol.hash()) {
+            continue;
+        }
+        if let Ok(have) = store::read_vendored_symbol(dir, &symbol.id)
+            && let Some(why) = wc_core::symbol::replace_refused(&have, symbol)
+        {
+            return Err(format!("{why}; import into a fresh project"));
+        }
+    }
     // A library item already in the project may come again unchanged (same content hash), or
     // in a new version when the project's copy is still the one its lock pinned: nobody changed
     // it in the project, so the import replaces it (a block now drawn, a newer catalog). Every
@@ -1431,12 +1502,12 @@ pub fn add_built(
     }
     // The imported pages can renumber the project's terminals tagged with only their strip, so
     // the project's own jumpers follow first; the imported ones already have the final numbers.
-    let before = if p.meta.jumpers.is_empty() {
+    let before = if !p.meta.follows_terminals() {
         None
     } else {
         // A symbol the project has no readable copy of, which the import brings, changes which
-        // placed items are terminals. Whether the jumpers' numbers were given with it or without
-        // it cannot be told, so jumpers on a strip it renumbers are not guessed at.
+        // placed items are terminals. Whether the jumpers' and rail order's numbers were given
+        // with it or without it cannot be told, so a strip it renumbers is not guessed at.
         let (own, _) = store::vendored_symbols(dir, p);
         let mut symbols = own.clone();
         for s in &built.symbols {
@@ -1455,10 +1526,9 @@ pub fn add_built(
                     .map(|(_, (strip, _))| strip),
             )
             .collect();
-        if let Some(strip) = strips
-            .into_iter()
-            .find(|s| p.meta.jumpers.iter().any(|j| &j.strip == *s))
-        {
+        if let Some(strip) = strips.into_iter().find(|s| {
+            p.meta.jumpers.iter().any(|j| &j.strip == *s) || p.meta.strip_layout(s).is_some_and(|l| !l.is_empty())
+        }) {
             let missing: Vec<&str> = built
                 .symbols
                 .iter()
@@ -1467,7 +1537,7 @@ pub fn add_built(
                 .filter(|id| p.pages.iter().any(|pg| pg.symbols.iter().any(|ps| ps.symbol == *id)))
                 .collect();
             return Err(format!(
-                "the jumpers of {strip} cannot be kept on their terminals: the project has no readable copy of {} that the import brings, so its terminal numbers are unclear; restore the file (for example from the project's history) and import again",
+                "the jumpers and rail order of {strip} cannot be kept on their terminals: the project has no readable copy of {} that the import brings, so its terminal numbers are unclear; restore the file (for example from the project's history) and import again",
                 missing.join(", ")
             ));
         }

@@ -5,6 +5,7 @@ use wc_core::symbol::{Pin, PinDir, SymbolRole};
 
 fn sym(id: &str, pin_y: f64) -> Symbol {
     Symbol {
+        source: String::new(),
         id: id.into(),
         name: "Coil".into(),
         category: "relays".into(),
@@ -454,5 +455,177 @@ fn an_update_checks_every_item_before_it_writes_any() -> Result<()> {
         wc_core::store::read_vendored_symbol(&f.proj, "other")?.pins[1].at.y,
         7.0
     );
+    Ok(())
+}
+
+#[test]
+fn a_folder_source_with_a_rules_file_gives_its_rules_in_source_order() -> Result<()> {
+    let f = fixture()?;
+    let io = |e: std::io::Error| wc_core::Error::io("rules", e);
+    // No rules files: nothing.
+    assert!(library_rules(&f.proj, &f.project).is_empty());
+    std::fs::write(
+        f.company.join("rules.toml"),
+        "[[rule]]\nname = \"motor-cable\"\nkind = \"cable\"\ndevices = \"-M*\"\n",
+    )
+    .map_err(io)?;
+    let personal = f.proj.join("../personal");
+    std::fs::write(personal.join("rules.toml"), "[[rule]\n").map_err(io)?;
+    let sets = library_rules(&f.proj, &f.project);
+    assert_eq!(sets.len(), 2);
+    assert_eq!(sets[0].source, "company");
+    let rules = sets[0].rules.as_ref().map_err(|e| wc_core::Error::Invalid(e.clone()))?;
+    assert_eq!(rules[0].name.as_deref(), Some("motor-cable"));
+    assert_eq!(sets[1].source, "personal");
+    assert!(sets[1].rules.is_err(), "a file that does not parse says so");
+
+    // A source that cannot be resolved says why, under its name, rather than vanishing.
+    let mut project = f.project.clone();
+    project.meta.libraries.push(wc_core::project::LibrarySource {
+        name: "odd".into(),
+        kind: "zip".into(),
+        location: "x".into(),
+        reference: None,
+    });
+    let sets = library_rules(&f.proj, &project);
+    assert_eq!(sets.len(), 3);
+    assert_eq!(sets[2].source, "odd");
+    let why = sets[2].rules.as_ref().err().cloned().unwrap_or_default();
+    assert!(why.contains("unknown kind"), "{why}");
+    Ok(())
+}
+
+#[test]
+fn every_starter_symbol_loads_under_its_file_name_with_distinct_pins() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
+    project.meta.libraries = vec![LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: starter.to_string_lossy().into(),
+        reference: None,
+    }];
+    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let ids = lib.index(ItemKind::Symbol);
+    for id in ids.keys() {
+        let (s, _) = lib.symbol(id)?;
+        assert_eq!(&s.id, id, "file name and id differ");
+        assert!(!s.pins.is_empty(), "{id} has no pins");
+        let names: std::collections::BTreeSet<_> = s.pins.iter().map(|p| &p.name).collect();
+        assert_eq!(names.len(), s.pins.len(), "{id} repeats a pin name");
+    }
+    // The timer relay set (#531): coils drive, delayed contacts follow them.
+    for (id, role) in [
+        ("wc.coil.ondelay", SymbolRole::Main),
+        ("wc.coil.offdelay", SymbolRole::Main),
+        ("wc.contact.no.ondelay", SymbolRole::Auxiliary),
+        ("wc.contact.nc.ondelay", SymbolRole::Auxiliary),
+    ] {
+        assert_eq!(lib.symbol(id)?.0.role, role, "{id}");
+    }
+    Ok(())
+}
+
+#[test]
+fn lock_restores_a_deleted_vendored_copy_at_the_pinned_version() -> Result<()> {
+    let mut f = fixture()?;
+    let lib = Library::open(&f.proj, &f.project)?;
+    lock_missing(&f.proj, &mut f.project, &lib)?;
+    let pinned = f.project.lock.get(ItemKind::Symbol, "coil").cloned();
+    let path = wc_core::store::vendor_path(&f.proj, ItemKind::Symbol, "coil")?;
+    std::fs::remove_file(&path).map_err(|e| wc_core::Error::io("rm", e))?;
+
+    let left = lock_missing(&f.proj, &mut f.project, &lib)?;
+    assert!(left.is_empty(), "{left:?}");
+    assert_eq!(left.restored, vec![(ItemKind::Symbol, "coil".to_string())]);
+    assert_eq!(
+        wc_core::store::read_vendored_symbol(&f.proj, "coil")?.pins[1].at.y,
+        10.0
+    );
+    assert_eq!(f.project.lock.get(ItemKind::Symbol, "coil").cloned(), pinned);
+
+    // A readable copy is left alone.
+    assert!(lock_missing(&f.proj, &mut f.project, &lib)?.restored.is_empty());
+    Ok(())
+}
+
+#[test]
+fn lock_restores_the_pinned_version_from_another_source_and_keeps_the_pin() -> Result<()> {
+    let mut f = fixture()?;
+    let lib = Library::open(&f.proj, &f.project)?;
+    lock_missing(&f.proj, &mut f.project, &lib)?;
+    let pinned = f.project.lock.get(ItemKind::Symbol, "coil").cloned();
+    let path = wc_core::store::vendor_path(&f.proj, ItemKind::Symbol, "coil")?;
+    std::fs::write(&path, "not json").map_err(|e| wc_core::Error::io("write", e))?;
+
+    // The pinned source moved on; another source holds the pinned version.
+    write_symbol(&f.company, &sym("coil", 12.5))?;
+    let personal = f.proj.join("../personal");
+    write_symbol(&personal, &sym("coil", 10.0))?;
+    let left = lock_missing(&f.proj, &mut f.project, &lib)?;
+    assert!(left.is_empty(), "{left:?}");
+    assert_eq!(left.restored, vec![(ItemKind::Symbol, "coil".to_string())]);
+    assert_eq!(
+        wc_core::store::read_vendored_symbol(&f.proj, "coil")?.pins[1].at.y,
+        10.0
+    );
+    assert_eq!(
+        f.project.lock.get(ItemKind::Symbol, "coil").cloned(),
+        pinned,
+        "the pin is unchanged"
+    );
+    Ok(())
+}
+
+#[test]
+fn lock_reports_a_failed_write_of_the_pinned_version_as_a_write_failure() -> Result<()> {
+    let mut f = fixture()?;
+    let lib = Library::open(&f.proj, &f.project)?;
+    lock_missing(&f.proj, &mut f.project, &lib)?;
+    let path = wc_core::store::vendor_path(&f.proj, ItemKind::Symbol, "coil")?;
+    // A folder where the vendored file belongs: unreadable, and not replaced by a write.
+    std::fs::remove_file(&path).map_err(|e| wc_core::Error::io("rm", e))?;
+    std::fs::create_dir_all(path.join("x")).map_err(|e| wc_core::Error::io("mkdir", e))?;
+
+    let left = lock_missing(&f.proj, &mut f.project, &lib)?;
+    assert!(left.restored.is_empty(), "{left:?}");
+    assert_eq!(left.unrestorable.len(), 1, "{left:?}");
+    let why = &left.unrestorable[0].2;
+    assert!(why.contains("writing it failed"), "{why}");
+    assert!(why.contains("coil.json"), "the failed file is named: {why}");
+    assert!(!why.contains("no library source"), "{why}");
+    Ok(())
+}
+
+#[test]
+fn lock_does_not_restore_another_version_or_an_item_gone_from_the_library() -> Result<()> {
+    let mut f = fixture()?;
+    let lib = Library::open(&f.proj, &f.project)?;
+    lock_missing(&f.proj, &mut f.project, &lib)?;
+    let pinned = f.project.lock.get(ItemKind::Symbol, "coil").cloned();
+    let path = wc_core::store::vendor_path(&f.proj, ItemKind::Symbol, "coil")?;
+    std::fs::write(&path, "not json").map_err(|e| wc_core::Error::io("write", e))?;
+
+    // No source holds the pinned version any more: nothing is taken, and the reason and the
+    // way out are given.
+    write_symbol(&f.company, &sym("coil", 12.5))?;
+    let left = lock_missing(&f.proj, &mut f.project, &lib)?;
+    assert!(left.restored.is_empty());
+    assert_eq!(left.unrestorable.len(), 1, "{left:?}");
+    let why = &left.unrestorable[0].2;
+    assert!(why.contains("another version"), "{why}");
+    assert!(why.contains("project's history"), "{why}");
+    assert!(
+        wc_core::store::read_vendored_symbol(&f.proj, "coil").is_err(),
+        "nothing taken"
+    );
+    assert_eq!(f.project.lock.get(ItemKind::Symbol, "coil").cloned(), pinned);
+
+    f.project.meta.libraries.clear();
+    let lib = Library::open(&f.proj, &f.project)?;
+    let left = lock_missing(&f.proj, &mut f.project, &lib)?;
+    assert_eq!(left.unrestorable.len(), 1, "{left:?}");
+    assert!(left.unrestorable[0].2.contains("no library has it"), "{left:?}");
     Ok(())
 }

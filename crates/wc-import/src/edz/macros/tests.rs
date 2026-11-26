@@ -458,3 +458,171 @@ fn an_overlong_device_tag_is_not_taken_as_one() -> TestResult {
     assert_eq!(s.pins.first().map(|p| p.name.as_str()), Some("1"));
     Ok(())
 }
+
+/// A PLC module whose multi-line variant A holds terminals 1 and 2 and variant B terminals 2
+/// to 4 (or only 2), and whose overview lists 1 to 5 on one placement.
+fn split_module(with_b: bool) -> String {
+    split_module_with(if with_b { &["2", "3", "4"] } else { &[] })
+}
+
+fn split_module_with(b_names: &[&str]) -> String {
+    let point = |x: u32, name: &str| {
+        format!(r#"<O17 A1381="300" A185="{name}"><S40x1201 A762="{x}/0"/><P144 P20013="A" P20014="1"/></O17>"#)
+    };
+    let b = if b_names.is_empty() {
+        String::new()
+    } else {
+        let points: String = b_names.iter().zip(0u32..).map(|(n, k)| point(8 * k, n)).collect();
+        format!(r#"<MacroVariant MacroFuncType="1" VariantId="1" ReferencePoint="0/0">{points}</MacroVariant>"#)
+    };
+    format!(
+        r#"<EplanPxfRoot>
+        <MacroVariant MacroFuncType="4" VariantId="0" ReferencePoint="0/0">
+         <O17 A1381="200" A1382="1" A185="1;2;3;4;5"><S40x1201 A762="0/0"/><P144 P20013="A" P20014="1"/></O17>
+        </MacroVariant>
+        <MacroVariant MacroFuncType="1" VariantId="0" ReferencePoint="0/0">{}{}</MacroVariant>
+        {b}
+        </EplanPxfRoot>"#,
+        point(0, "1"),
+        point(8, "2")
+    )
+}
+
+#[test]
+fn terminals_in_other_multi_line_variants_complete_the_symbol() -> TestResult {
+    let m = read("plc.ema", &split_module(true))?;
+    let s = &m.symbol;
+    let names: Vec<&str> = s.pins.iter().map(|p| p.name.as_str()).collect();
+    // Variant B's 2 is variant A's and is not repeated; the overview is not needed.
+    assert_eq!(names, ["1", "2", "3", "4"]);
+    // B's points go in a column a grid step right of the drawing, facing right.
+    let p = pin(s, "3")?;
+    assert!(near(p.at, 12.0, 0.0) && p.dir == PinDir::Right, "{p:?}");
+    let p = pin(s, "4")?;
+    assert!(near(p.at, 12.0, 4.0) && p.dir == PinDir::Right, "{p:?}");
+    // Variant B gave pins and is not left out; the overview gave none and is.
+    let want: BTreeMap<String, usize> = [
+        ("overview representations", 1),
+        ("library graphics of connection points (pins kept)", 2),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v))
+    .collect();
+    assert_eq!(m.left_out, want);
+    Ok(())
+}
+
+#[test]
+fn without_other_variants_the_overview_completes_the_symbol() -> TestResult {
+    let m = read("plc.ema", &split_module(false))?;
+    let names: Vec<&str> = m.symbol.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["1", "2", "3", "4", "5"]);
+    let want: BTreeMap<String, usize> = [("library graphics of connection points (pins kept)".to_owned(), 2)]
+        .into_iter()
+        .collect();
+    assert_eq!(m.left_out, want, "the overview is not left out");
+    Ok(())
+}
+
+#[test]
+fn a_variant_with_only_variant_as_points_leaves_the_overview_to_complete_the_symbol() -> TestResult {
+    let m = read("plc.ema", &split_module_with(&["2"]))?;
+    let names: Vec<&str> = m.symbol.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["1", "2", "3", "4", "5"]);
+    // Variant B gave nothing new and is left out; the overview gave pins.
+    assert_eq!(
+        m.left_out.get("other variants of the multi-line representation"),
+        Some(&1)
+    );
+    assert_eq!(m.left_out.get("overview representations"), None);
+    Ok(())
+}
+
+#[test]
+fn points_from_other_variants_count_toward_the_most_a_macro_may_hold() {
+    let mut text = many_points(MAX_PINS).replace("</EplanPxfRoot>", "");
+    text.push_str(r#"<MacroVariant MacroFuncType="1" VariantId="1" ReferencePoint="0/0">"#);
+    text.push_str(r#"<O17 A1381="300" A185="new"><S40x1201 A762="0/0"/></O17>"#);
+    text.push_str("</MacroVariant></EplanPxfRoot>");
+    let e = read("big.ema", &text).err().map(|e| e.to_string()).unwrap_or_default();
+    assert_eq!(e, format!("holds more than {MAX_PINS} connection points"));
+}
+
+#[test]
+fn a_terminal_designation_without_a_pin_in_variant_a_comes_from_another_variant() -> TestResult {
+    // Variant A draws terminal X1 with designations 1;2;3, but the terminal symbol has two
+    // pins; variant B holds 3 as a connection point of its own.
+    let text = r#"<EplanPxfRoot>
+        <MacroVariant MacroFuncType="1" VariantId="0" ReferencePoint="0/0">
+         <O17 A1381="100" A185="1;2;3"><S40x1201 A762="0/0"/><P144 P20013="X" P20014="1"/></O17>
+        </MacroVariant>
+        <MacroVariant MacroFuncType="1" VariantId="1" ReferencePoint="0/0">
+         <O17 A1381="300" A185="3"><S40x1201 A762="0/0"/><P144 P20013="X" P20014="1"/></O17>
+        </MacroVariant></EplanPxfRoot>"#;
+    let s = read("x.ema", text)?.symbol;
+    let names: Vec<&str> = s.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["1", "2", "3"]);
+    Ok(())
+}
+
+#[test]
+fn a_terminal_gets_a_pin_per_designation_and_a_fuse_is_drawn_as_fuses() -> TestResult {
+    let terminal = r#"<EplanPxfRoot Name="X">
+ <MacroVariant VariantId="0" ReferencePoint="50/100" MacroFuncType="1" DocumentType="1">
+  <ESymLib Name="IEC_symbol" ID="1"/>
+  <O17 A1261="1" A1262="30" A1263="0" A1381="100" A1382="1" A185="1;2;3;4">
+   <S40x1201 A762="60/90"/>
+   <P144 P20013="X" P20014="1"/>
+  </O17>
+ </MacroVariant>
+</EplanPxfRoot>"#;
+    let m = read("terminal4.ema", terminal)?;
+    let s = &m.symbol;
+    assert_eq!(s.pins.len(), 4, "{:?}", s.pins);
+    // In pairs, top and bottom, a grid step apart; the macro's designations kept.
+    for (name, x, y, dir) in [
+        ("1", 10.0, 9.0, PinDir::Up),
+        ("2", 10.0, 11.0, PinDir::Down),
+        ("3", 14.0, 9.0, PinDir::Up),
+        ("4", 14.0, 11.0, PinDir::Down),
+    ] {
+        let p = pin(s, name)?;
+        assert!(near(p.at, x, y) && p.dir == dir, "{name}: {p:?}");
+    }
+    assert_eq!(s.role, SymbolRole::Terminal);
+
+    let fuse = r#"<EplanPxfRoot Name="F">
+ <MacroVariant VariantId="0" ReferencePoint="50/100" MacroFuncType="1" DocumentType="1">
+  <ESymLib Name="IEC_symbol" ID="1"/>
+  <O17 A1261="1" A1262="50" A1263="0" A1381="502" A1382="1" A185="1;2;3;4">
+   <S40x1201 A762="60/90"/>
+   <P144 P20013="F" P20014="1"/>
+  </O17>
+ </MacroVariant>
+</EplanPxfRoot>"#;
+    let m = read("fuse2.ema", fuse)?;
+    let s = &m.symbol;
+    assert_eq!(s.pins.len(), 4);
+    for (name, x, y, dir) in [
+        ("1", 10.0, 10.0, PinDir::Up),
+        ("2", 10.0, 18.0, PinDir::Down),
+        ("3", 14.0, 10.0, PinDir::Up),
+        ("4", 14.0, 18.0, PinDir::Down),
+    ] {
+        let p = pin(s, name)?;
+        assert!(near(p.at, x, y) && p.dir == dir, "{name}: {p:?}");
+    }
+    // One fuse body per pole, not a box round all of them.
+    let bodies = s
+        .graphics
+        .iter()
+        .filter(|g| matches!(g, Shape::Rect { min, max } if (max.x - min.x - 2.0).abs() < 1e-9))
+        .count();
+    assert_eq!(bodies, 2, "{:?}", s.graphics);
+
+    // A one-pole fuse whose points are named like a coil's is still a fuse.
+    let m = read("fuse1.ema", &fuse.replace("1;2;3;4", "A1;A2"))?;
+    assert_eq!(m.symbol.role, SymbolRole::Standalone, "not a coil");
+    assert!(near(pin(&m.symbol, "A2")?.at, 10.0, 18.0));
+    Ok(())
+}

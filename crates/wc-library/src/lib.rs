@@ -28,9 +28,14 @@ pub enum Error {
     Source { name: String, message: String },
     #[error("{kind:?} {id:?} is not in any library source")]
     NotFound { kind: ItemKind, id: String },
-    /// An update failed and could not put back every file it had changed.
+    /// An update failed and could not put back every file it had changed. `written` is how
+    /// many of the items, in the order given, it had started to write.
     #[error("{error}; putting back the files the update changed failed too: {failed}")]
-    NotPutBack { error: Box<Error>, failed: String },
+    NotPutBack {
+        error: Box<Error>,
+        failed: String,
+        written: usize,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -92,13 +97,60 @@ impl Library {
 
     /// Part `id` as source `source` has it (not necessarily the source that wins for it).
     pub fn part_in(&self, source: &str, id: &str) -> Result<Part> {
+        self.item_in(ItemKind::Part, source, id)
+    }
+
+    /// Symbol `id` as source `source` has it (not necessarily the source that wins for it).
+    pub fn symbol_in(&self, source: &str, id: &str) -> Result<Symbol> {
+        self.item_in(ItemKind::Symbol, source, id)
+    }
+
+    /// Item `id` of `kind` in a version `fits` accepts (or says why not): the source named
+    /// `first` is tried first, then every other source in order. The reason it is not found
+    /// names what each source had (why `fits` refused it, or why it could not be read).
+    pub fn find_version<T: serde::de::DeserializeOwned>(
+        &self,
+        kind: ItemKind,
+        id: &str,
+        first: &str,
+        fits: impl Fn(&T) -> std::result::Result<(), String>,
+    ) -> std::result::Result<T, String> {
+        let order = self
+            .sources
+            .iter()
+            .filter(|s| s.name == first)
+            .chain(self.sources.iter().filter(|s| s.name != first));
+        let mut seen = Vec::new();
+        for s in order {
+            // Each source read from its own folder: two may share a name.
+            match Self::item_at::<T>(kind, s, id) {
+                Ok(item) => match fits(&item) {
+                    Ok(()) => return Ok(item),
+                    Err(why) => seen.push(format!("{}: {why}", s.name)),
+                },
+                Err(Error::NotFound { .. }) => {}
+                Err(e) => seen.push(format!("{}: {e}", s.name)),
+            }
+        }
+        Err(if seen.is_empty() {
+            "no library has it".to_owned()
+        } else {
+            seen.join("; ")
+        })
+    }
+
+    fn item_in<T: serde::de::DeserializeOwned>(&self, kind: ItemKind, source: &str, id: &str) -> Result<T> {
         store::check_id(id)?;
-        let not_found = || Error::NotFound {
-            kind: ItemKind::Part,
-            id: id.into(),
-        };
+        let not_found = || Error::NotFound { kind, id: id.into() };
         let s = self.sources.iter().find(|s| s.name == source).ok_or_else(not_found)?;
-        let path = s.root.join(ItemKind::Part.dir()).join(format!("{id}.json"));
+        Self::item_at(kind, s, id)
+    }
+
+    /// Item `id` read from source `s`'s folder.
+    fn item_at<T: serde::de::DeserializeOwned>(kind: ItemKind, s: &Source, id: &str) -> Result<T> {
+        store::check_id(id)?;
+        let not_found = || Error::NotFound { kind, id: id.into() };
+        let path = s.root.join(kind.dir()).join(format!("{id}.json"));
         // An entry that is there but cannot be followed (a link to nothing) says so.
         match std::fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(not_found()),
@@ -401,22 +453,79 @@ fn is_wrong_id(e: &Error) -> bool {
     matches!(e, Error::Source { message, .. } if message.contains(DECLARES))
 }
 
-/// What [`lock_missing`] could not pin.
+/// What [`lock_missing`] could not pin, and the pinned items whose vendored copy it repaired.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Unpinned {
     /// Used items that no library source holds.
     pub missing: Vec<(ItemKind, String)>,
     /// Used items whose library file declares another id, with the reason (see [`State::WrongId`]).
     pub wrong_id: Vec<(ItemKind, String, String)>,
+    /// Pinned items whose vendored copy was missing or unreadable, written again at the pinned
+    /// version from the library.
+    pub restored: Vec<(ItemKind, String)>,
+    /// Pinned items whose vendored copy is missing or unreadable and could not be written again
+    /// at the pinned version, with the reason.
+    pub unrestorable: Vec<(ItemKind, String, String)>,
 }
 
 impl Unpinned {
+    /// Nothing left undone: every used item is pinned and has a readable vendored copy.
     pub fn is_empty(&self) -> bool {
-        self.missing.is_empty() && self.wrong_id.is_empty()
+        self.missing.is_empty() && self.wrong_id.is_empty() && self.unrestorable.is_empty()
     }
 }
 
-/// Pin every used item that is not pinned yet. Items it cannot pin are returned.
+/// Why the project's vendored copy of `kind` `id` does not read, if it does not.
+fn vendored_error(project_dir: &Path, kind: ItemKind, id: &str) -> Option<String> {
+    match kind {
+        ItemKind::Symbol => store::read_vendored_symbol(project_dir, id).err(),
+        ItemKind::Part => store::read_vendored_part(project_dir, id).err(),
+    }
+    .map(|e| e.to_string())
+}
+
+/// Write the vendored copy of pinned item `id` again from the library, at the pinned version
+/// (`pin`): the pinned source is searched first, then the others, and only a file that declares
+/// `id` and holds that version is taken. The lock entry is left as it is.
+fn restore_pinned(project_dir: &Path, lib: &Library, kind: ItemKind, id: &str, pin: &LockEntry) -> Result<Restore> {
+    let fits = |declared: &str, hash: String| -> std::result::Result<(), String> {
+        if declared != id {
+            return Err(format!("its file declares id {declared:?}"));
+        }
+        if hash != pin.hash {
+            return Err("it holds another version than the pinned one".into());
+        }
+        Ok(())
+    };
+    // Finding the pinned version and writing it are told apart: a failed write is not fixed by
+    // adding a library source, so it keeps its own error (which names the file).
+    let not_found = |message: String| Error::Source {
+        name: pin.source.clone(),
+        message,
+    };
+    match kind {
+        ItemKind::Symbol => match lib.find_version(kind, id, &pin.source, |s: &Symbol| fits(&s.id, s.hash())) {
+            Ok(s) => store::write_vendored_symbol(project_dir, &s)?,
+            Err(message) => return Ok(Restore::NotFound(not_found(message))),
+        },
+        ItemKind::Part => match lib.find_version(kind, id, &pin.source, |p: &Part| fits(&p.id, p.hash())) {
+            Ok(p) => store::write_vendored_part(project_dir, &p)?,
+            Err(message) => return Ok(Restore::NotFound(not_found(message))),
+        },
+    };
+    Ok(Restore::Done)
+}
+
+/// What [`restore_pinned`] did when it could write (an error is a failed write).
+enum Restore {
+    Done,
+    /// No library source holds the pinned version.
+    NotFound(Error),
+}
+
+/// Pin every used item that is not pinned yet, and write the vendored copy of a pinned item
+/// again when it is missing or unreadable (at the pinned version only: a library holding another
+/// version is left to `update`). Items it cannot pin or repair are returned.
 pub fn lock_missing(project_dir: &Path, project: &mut Project, lib: &Library) -> Result<Unpinned> {
     lock_missing_then(project_dir, project, lib, || {})
 }
@@ -431,15 +540,38 @@ fn lock_missing_then(
 ) -> Result<Unpinned> {
     let mut left = Unpinned::default();
     let mut todo = Vec::new();
+    let mut repair = Vec::new();
     for s in status(project_dir, project, lib) {
-        match s.state {
-            State::NotLocked => todo.push((s.kind, s.id)),
+        match (&s.state, s.locked) {
+            (State::NotLocked, _) => todo.push((s.kind, s.id)),
             // Used but not pinned, and its library file cannot be taken.
-            State::WrongId if s.locked.is_none() => left.wrong_id.push((s.kind, s.id, s.changes.join("; "))),
-            _ => {}
+            (State::WrongId, None) => left.wrong_id.push((s.kind, s.id, s.changes.join("; "))),
+            (_, Some(pin)) => {
+                if let Some(why) = vendored_error(project_dir, s.kind, &s.id) {
+                    repair.push((s.kind, s.id, pin, why));
+                }
+            }
+            (_, None) => {}
         }
     }
     after_scan();
+    for (kind, id, pin, broken) in repair {
+        match restore_pinned(project_dir, lib, kind, &id, &pin) {
+            Ok(Restore::Done) => left.restored.push((kind, id)),
+            Ok(Restore::NotFound(e)) => {
+                let why = format!(
+                    "{broken}; the pinned version is in no library source ({e}); put the file back from the project's history, or add a library source that holds the pinned version, and run `wiringcraft lib lock` again"
+                );
+                left.unrestorable.push((kind, id, why));
+            }
+            Err(e) => {
+                let why = format!(
+                    "{broken}; the pinned version was found but writing it failed ({e}); fix that and run `wiringcraft lib lock` again"
+                );
+                left.unrestorable.push((kind, id, why));
+            }
+        }
+    }
     for (kind, id) in todo {
         match take(project_dir, project, lib, kind, &id) {
             Ok(_) => {}
@@ -502,6 +634,18 @@ pub fn update_items(
     lib: &Library,
     items: &[(ItemKind, String, String)],
 ) -> Result<Vec<(ItemKind, String)>> {
+    update_items_then(project_dir, project, lib, items, || {})
+}
+
+/// [`update_items`], calling `after_backup` once every file has been read for its backup and
+/// before any is written (where a caller's tests can make a write fail).
+pub fn update_items_then(
+    project_dir: &Path,
+    project: &mut Project,
+    lib: &Library,
+    items: &[(ItemKind, String, String)],
+    after_backup: impl FnOnce(),
+) -> Result<Vec<(ItemKind, String)>> {
     let fetched = items
         .iter()
         .map(|(kind, id, hash)| fetch(lib, *kind, id, Some(hash)))
@@ -518,6 +662,7 @@ pub fn update_items(
         };
         before.push((path, was));
     }
+    after_backup();
     let lock = project.lock.clone();
     for (n, ((_, id, _), item)) in items.iter().zip(fetched).enumerate() {
         if let Err(e) = store_item(project_dir, project, id, item) {
@@ -542,6 +687,7 @@ pub fn update_items(
             return Err(Error::NotPutBack {
                 error: Box::new(e),
                 failed: failed.join("; "),
+                written: n + 1,
             });
         }
     }
@@ -582,6 +728,41 @@ pub fn write_part(root: &Path, p: &Part) -> Result<PathBuf> {
     let path = root.join("parts").join(format!("{}.json", p.id));
     store::write_if_changed(&path, &store::to_json(p)?)?;
     Ok(path)
+}
+
+/// The check rules of the project's library sources ([`wc_core::check_rule`]), in the order
+/// the project lists the sources: each source with a `rules.toml` in its folder, read now. A
+/// source whose folder is not there (a git source never synced) or has no rules file adds
+/// nothing; one that cannot be resolved (an unknown kind, say), or whose file cannot be read
+/// or parsed, says why.
+pub fn library_rules(project_dir: &Path, project: &Project) -> Vec<wc_core::check_rule::RuleSet> {
+    use wc_core::check_rule::{LIBRARY_RULES_FILE, RuleSet, parse_rules};
+    project
+        .meta
+        .libraries
+        .iter()
+        .filter_map(|s| {
+            let root = match Source::resolve(project_dir, s) {
+                Ok(source) => source.root,
+                Err(e) => {
+                    return Some(RuleSet {
+                        source: s.name.clone(),
+                        rules: Err(e.to_string()),
+                    });
+                }
+            };
+            let path = root.join(LIBRARY_RULES_FILE);
+            let rules = match std::fs::read_to_string(&path) {
+                Ok(text) => parse_rules(&text),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+                Err(e) => Err(e.to_string()),
+            };
+            Some(RuleSet {
+                source: s.name.clone(),
+                rules,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

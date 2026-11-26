@@ -52,9 +52,9 @@ fn a_cabinet_layout_page_becomes_a_panel() {
             .items
             .iter()
             .find_map(|i| match i {
-                PanelItem::Device { tag, at, width, height } if tag.to_string().ends_with(end) => {
-                    Some((*at, *width, *height))
-                }
+                PanelItem::Device {
+                    tag, at, width, height, ..
+                } if tag.to_string().ends_with(end) => Some((*at, *width, *height)),
                 _ => None,
             })
             .unwrap()
@@ -131,9 +131,43 @@ fn every_layout_item_is_accounted_for() {
         .collect();
     let l = layouts(&sw, &tags, &built.devices, &built.parts);
     assert_eq!(
-        l.rails + l.ducts + l.devices + l.plates + l.no_size + l.upright + l.other,
+        l.rails + l.ducts + l.devices + l.plates + l.no_size + l.upright + l.other + l.far_off,
         l.items_in
     );
+}
+
+#[test]
+fn items_far_from_the_origin_are_left_out_and_counted() {
+    let c = with_layout();
+    // No plate, so the panel is the box round its items; two of them sit near -1e305 and +1e305.
+    c.execute_batch(
+        "
+DELETE FROM tew_symbol WHERE sym_id = 20;
+INSERT INTO tew_symbol VALUES
+  (29, 12, NULL, 'Rail 35', -1e305, 600, 0, 1, 1, 500, -7.5),
+  (30, 12, NULL, 'Duct 40x60', 1e305, 800, 0, 1, 1, 40, -800);
+UPDATE tew_symbol SET sym_posx = 1e305, sym_posendx = NULL, sym_posendy = NULL WHERE sym_id = 24;
+",
+    )
+    .unwrap();
+    let sw = read(&c).unwrap();
+    let (built, _, report) = build(&sw, None);
+    let panel = &built.panels[0];
+    assert!(panel.width.is_finite() && panel.height.is_finite());
+    // The duct, rail and K1 that are left span x 0 to 550 and y 0 to 800.
+    assert_eq!((panel.width, panel.height), (550.0, 800.0));
+    assert!(panel.items.iter().all(|i| match i {
+        PanelItem::Device { at, .. } | PanelItem::Rail { at, .. } => at.x.abs() <= 1e6 && at.y.abs() <= 1e6,
+        PanelItem::Duct { min, max } => min.x.abs() <= 1e6 && max.x.abs() <= 1e6,
+    }));
+    let items = report.iter().find(|r| r.what == "cabinet layout items").unwrap();
+    assert!(
+        items.note.contains("3 item(s) reaching more than 1 km"),
+        "{}",
+        items.note
+    );
+    // F1 was left out before it was counted as estimated.
+    assert!(!items.note.contains("estimated"), "{}", items.note);
 }
 
 #[test]
@@ -221,9 +255,9 @@ INSERT INTO tew_symbol VALUES (40, 12, 105, 'FP_SWITCH', 300, 640, 0, 1, 1, NULL
             .items
             .iter()
             .find_map(|i| match i {
-                PanelItem::Device { tag, at, width, height } if tag.to_string().ends_with(end) => {
-                    Some((*at, *width, *height))
-                }
+                PanelItem::Device {
+                    tag, at, width, height, ..
+                } if tag.to_string().ends_with(end) => Some((*at, *width, *height)),
                 _ => None,
             })
             .unwrap()
@@ -303,9 +337,9 @@ INSERT INTO tew_symbol VALUES (40, 12, 105, 'FP_SWITCH', 300, 640, 0, 0.5, 1, NU
             .items
             .iter()
             .find_map(|i| match i {
-                PanelItem::Device { tag, at, width, height } if tag.to_string().ends_with(end) => {
-                    Some((*at, *width, *height))
-                }
+                PanelItem::Device {
+                    tag, at, width, height, ..
+                } if tag.to_string().ends_with(end) => Some((*at, *width, *height)),
                 _ => None,
             })
             .unwrap()

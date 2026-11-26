@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use wc_core::{Page, Project};
 
+use crate::history::Uses;
 use crate::protocol::check_edit;
 use crate::{Change, GuestMsg, HostMsg, Journal, Peer, PeerId, ProjectEdit, Refusal, Snapshot, apply_edit};
 use crate::{ChangeInfo, ChangeKind, Parts, redo_target, undo_target};
@@ -57,6 +58,9 @@ pub struct Host {
     /// user shared ([`Host::share_files`]) and what participants added since.
     symbols: BTreeMap<String, wc_core::Symbol>,
     parts: BTreeMap<String, wc_core::Part>,
+    /// The hash of each file in `symbols` and `parts`, kept as they change so a look at which
+    /// files the session lacks does not hash them again.
+    file_hashes: BTreeMap<(wc_core::lock::ItemKind, String), String>,
     /// Versions an update ([`ProjectEdit::UpdateItems`]) replaced, by id and hash, so an undo
     /// can lock and store them again.
     old_symbols: BTreeMap<(String, String), wc_core::Symbol>,
@@ -69,12 +73,15 @@ pub struct Host {
     added_pictures: (usize, usize),
 }
 
-/// A recorded change and the parts of the project it changed, before and after.
+/// A recorded change and the parts of the project it changed, before and after, with the
+/// versions of the symbols and parts the "before" side was drawn with ([`Parts::uses`]): what
+/// an undo of it puts back.
 #[derive(Debug, Clone)]
 struct Entry {
     info: ChangeInfo,
     before: Parts,
     after: Parts,
+    before_uses: Uses,
 }
 
 /// Keep a name or email usable in a git author line (`Name <email>`).
@@ -117,6 +124,7 @@ impl Host {
             take_backs_held: None,
             symbols: BTreeMap::new(),
             parts: BTreeMap::new(),
+            file_hashes: BTreeMap::new(),
             old_symbols: BTreeMap::new(),
             old_parts: BTreeMap::new(),
             pictures: BTreeMap::new(),
@@ -126,9 +134,28 @@ impl Host {
 
     /// The project's vendored symbol and part files, sent to every guest that joins so they can
     /// draw the project without the host's libraries.
-    pub fn share_files(&mut self, symbols: BTreeMap<String, wc_core::Symbol>, parts: BTreeMap<String, wc_core::Part>) {
+    /// A file holding another item than the one it is the file of is no file of either.
+    pub fn share_files(
+        &mut self,
+        mut symbols: BTreeMap<String, wc_core::Symbol>,
+        mut parts: BTreeMap<String, wc_core::Part>,
+    ) {
+        use wc_core::lock::ItemKind;
+        symbols.retain(|id, s| s.id == *id);
+        parts.retain(|id, p| p.id == *id);
+        self.file_hashes = symbols
+            .iter()
+            .map(|(id, s)| ((ItemKind::Symbol, id.clone()), s.hash()))
+            .chain(parts.iter().map(|(id, p)| ((ItemKind::Part, id.clone()), p.hash())))
+            .collect();
         self.symbols = symbols;
         self.parts = parts;
+    }
+
+    /// The items the session locks that it has no file of in that version (a host that shared
+    /// the project with a copy missing): kind and id.
+    pub fn files_missing(&self) -> Vec<(wc_core::lock::ItemKind, String)> {
+        crate::files_missing(&self.project.lock, &self.file_hashes)
     }
 
     /// The project's picture files (the logo, page underlays) by project path, sent to every
@@ -467,10 +494,9 @@ impl Host {
             let mut probe = Project::new("");
             probe.lock = self.project.lock.clone();
             probe.pages = vec![p.clone()];
-            self.dangling_in(&probe)
+            probe
         };
-        let was = on_page(current);
-        let dangling: Vec<String> = on_page(&page).difference(&was).cloned().collect();
+        let dangling = self.newly_dangling(&on_page(current), &on_page(&page));
         if !dangling.is_empty() {
             return Err(Refusal::Invalid {
                 reason: format!(
@@ -499,8 +525,18 @@ impl Host {
             ..Parts::default()
         };
         let (before, after) = (parts(before), parts(page.clone()));
+        // A page edit leaves the lock as it was: the old page was drawn with its versions.
+        let uses = before.uses(&self.project.lock);
         self.send_others(HOST, HostMsg::PageChanged { page, by });
-        self.remember(by, Some(id.clone()), message, ChangeKind::Edit, None, before, after);
+        self.remember(
+            by,
+            Some(id.clone()),
+            message,
+            ChangeKind::Edit,
+            None,
+            (before, uses),
+            after,
+        );
         Ok(())
     }
 
@@ -550,16 +586,41 @@ impl Host {
             self.add_picture(picture)?;
             return Ok(false);
         }
+        // An item the session locks in that version but has no file of (the host shared with
+        // the copy missing) still goes in: its file is what guests lack.
+        let fills = match &edit {
+            ProjectEdit::AddItems { symbols, parts } => {
+                symbols
+                    .iter()
+                    .any(|(s, _)| self.symbols.get(&s.id).is_none_or(|have| have.hash() != s.hash()))
+                    || parts
+                        .iter()
+                        .any(|(p, _)| self.parts.get(&p.id).is_none_or(|have| have.hash() != p.hash()))
+            }
+            _ => false,
+        };
         let before = self.project.clone();
         apply_edit(&mut self.project, &edit);
-        if self.project == before {
+        if self.project == before && !fills {
             return Ok(false);
         }
         // Pages set whole, as a page edit: a wire may not newly end on a pin the locked version of
         // its symbol lacks (an update may have dropped the pin after the author drew the wire).
-        if edit.set_pages().next().is_some() {
-            let was = self.dangling_in(&before);
-            let dangling: Vec<String> = self.dangling_in(&self.project).difference(&was).cloned().collect();
+        let set: BTreeSet<&str> = edit.set_pages().map(|p| p.id.as_str()).collect();
+        if !set.is_empty() {
+            // Only the pages set can have changed ends: the others are left out of both scans.
+            let only = |p: &Project| {
+                let mut probe = Project::new("");
+                probe.lock = p.lock.clone();
+                probe.pages = p
+                    .pages
+                    .iter()
+                    .filter(|pg| set.contains(pg.id.as_str()))
+                    .cloned()
+                    .collect();
+                probe
+            };
+            let dangling = self.newly_dangling(&only(&before), &only(&self.project));
             if !dangling.is_empty() {
                 self.project = before;
                 return Err(Refusal::Invalid {
@@ -621,7 +682,11 @@ impl Host {
                 },
             ));
         }
-        self.remember(by, page, message, ChangeKind::Edit, None, was, now);
+        // A file put back alone (the project as it was) is no step to undo.
+        if self.project != before {
+            let uses = was.uses(&before.lock);
+            self.remember(by, page, message, ChangeKind::Edit, None, (was, uses), now);
+        }
         Ok(true)
     }
 
@@ -745,8 +810,7 @@ impl Host {
         apply_edit(&mut self.project, &edit);
         // Every wire end the undo leaves must be on a pin of its symbol's locked version: a symbol
         // locked again in an older version, or a wire put back on a pin a later update dropped.
-        let was = self.dangling_in(&before);
-        let dangling: Vec<String> = self.dangling_in(&self.project).difference(&was).cloned().collect();
+        let dangling = self.newly_dangling(&before, &self.project);
         if !dangling.is_empty() {
             self.project = before;
             return invalid(format!(
@@ -755,6 +819,18 @@ impl Host {
                 dangling.join(", ")
             ));
         }
+        // What it brings back was drawn with the versions it used then: one locked in another
+        // version now (someone added the symbol again, updated) would be drawn with that one.
+        let other = Parts::other_versions(&entry.before_uses, &self.project.lock);
+        if !other.is_empty() {
+            self.project = before;
+            return invalid(format!(
+                "\"{}\" cannot be taken back: it was drawn with another version of {} than the project has now",
+                entry.info.message,
+                other.join(", ")
+            ));
+        }
+        let replaced_uses = entry.after.uses(&before.lock);
         // The message names the edit itself: a redo of "Undo X" is "Redo X".
         let what = match kind {
             ChangeKind::Redo => entry
@@ -855,7 +931,17 @@ impl Host {
                 },
             ));
         }
-        self.remember(by, entry.info.page, message, kind, Some(id), entry.after, entry.before);
+        self.remember(
+            by,
+            entry.info.page,
+            message,
+            kind,
+            Some(id),
+            // What it replaced was drawn with the versions locked until now (a library update
+            // since may have moved them on); what it put back was checked against those above.
+            (entry.after, replaced_uses),
+            entry.before,
+        );
         Ok(())
     }
 
@@ -868,7 +954,7 @@ impl Host {
         message: String,
         kind: ChangeKind,
         reverts: Option<u64>,
-        before: Parts,
+        (before, before_uses): (Parts, Uses),
         after: Parts,
     ) {
         let info = ChangeInfo {
@@ -891,6 +977,7 @@ impl Host {
             info: info.clone(),
             before,
             after,
+            before_uses,
         });
         if self.history.len() > crate::MAX_HISTORY {
             let extra = self.history.len() - crate::MAX_HISTORY;
@@ -917,14 +1004,36 @@ impl Host {
     /// Symbol `id` in the version `hash`: the one guests get, or one an update replaced.
     /// Wire ends in `project` on pins the locked version of their symbol does not have, for the
     /// versions the session has.
-    fn dangling_in(&self, project: &Project) -> BTreeSet<String> {
-        project
+    /// The wire ends dangling in `project`, counted (two wires sharing an id count twice), each
+    /// with its label.
+    fn dangling_in(&self, project: &Project) -> BTreeMap<wc_core::project::DanglingEnd, (usize, String)> {
+        let mut out: BTreeMap<_, (usize, String)> = BTreeMap::new();
+        let ends = project
             .lock
             .symbols
             .iter()
             .filter_map(|(id, e)| Some((id, self.symbol_version(id, &e.hash)?)))
-            .flat_map(|(id, s)| project.dangling_pins(id, &s))
-            .collect()
+            .flat_map(|(id, s)| project.dangling_ends(id, &s));
+        for (end, label) in ends {
+            out.entry(end).or_insert((0, label)).0 += 1;
+        }
+        out
+    }
+
+    /// The labels of wire ends dangling in `after` that did not dangle in `before`: compared by
+    /// what each end is, not by its label (a renamed device relabels an end already dangling;
+    /// two wires on one missing pin share a label), and by how many there are of it.
+    fn newly_dangling(&self, before: &Project, after: &Project) -> Vec<String> {
+        let was = self.dangling_in(before);
+        let mut out: Vec<String> = self
+            .dangling_in(after)
+            .into_iter()
+            .filter(|(k, (n, _))| was.get(k).is_none_or(|(m, _)| n > m))
+            .map(|(_, (_, label))| label)
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
 
     fn symbol_version(&self, id: &str, hash: &str) -> Option<wc_core::Symbol> {
@@ -946,6 +1055,8 @@ impl Host {
     /// an undo ([`Self::symbol_version`]).
     fn take_versions(&mut self, symbols: Vec<wc_core::Symbol>, parts: Vec<wc_core::Part>, keep: bool) {
         for s in symbols {
+            self.file_hashes
+                .insert((wc_core::lock::ItemKind::Symbol, s.id.clone()), s.hash());
             if let Some(old) = self.symbols.insert(s.id.clone(), s)
                 && keep
                 && self.symbols.get(&old.id).is_some_and(|now| now.hash() != old.hash())
@@ -954,6 +1065,8 @@ impl Host {
             }
         }
         for p in parts {
+            self.file_hashes
+                .insert((wc_core::lock::ItemKind::Part, p.id.clone()), p.hash());
             if let Some(old) = self.parts.insert(p.id.clone(), p)
                 && keep
                 && self.parts.get(&old.id).is_some_and(|now| now.hash() != old.hash())

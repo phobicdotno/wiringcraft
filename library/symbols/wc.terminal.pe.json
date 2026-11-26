@@ -1,0 +1,135 @@
+{
+  "category": "terminals",
+  "description": "Protective earth terminal of a terminal strip, bonded to the mounting rail; the strip is the device tag, the terminal number is its index.",
+  "graphics": [
+    {
+      "a": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 5.5
+      },
+      "kind": "line"
+    },
+    {
+      "center": {
+        "x": 0.0,
+        "y": 7.5
+      },
+      "kind": "circle",
+      "radius": 2.0
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 9.5
+      },
+      "b": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 2.0,
+        "y": 7.5
+      },
+      "b": {
+        "x": 5.0,
+        "y": 7.5
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 5.0,
+        "y": 7.5
+      },
+      "b": {
+        "x": 5.0,
+        "y": 9.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 3.0,
+        "y": 9.0
+      },
+      "b": {
+        "x": 7.0,
+        "y": 9.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 3.7,
+        "y": 10.2
+      },
+      "b": {
+        "x": 6.3,
+        "y": 10.2
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 4.4,
+        "y": 11.4
+      },
+      "b": {
+        "x": 5.6,
+        "y": 11.4
+      },
+      "kind": "line"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "1"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 14.4
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "2"
+    }
+  ],
+  "id": "wc.terminal.pe",
+  "letter_code": "X",
+  "name": "PE terminal",
+  "pins": [
+    {
+      "at": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "1"
+    },
+    {
+      "at": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "dir": "down",
+      "name": "2"
+    }
+  ],
+  "role": "terminal",
+  "tag_at": {
+    "x": -8.0,
+    "y": 8.0
+  }
+}

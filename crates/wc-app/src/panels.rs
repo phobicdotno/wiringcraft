@@ -23,6 +23,31 @@ pub struct PanelState {
     potential: String,
     text: String,
     text_height: f64,
+    /// Edit buffer for a free drawing's own values (a circle's centre and radius, an arc's
+    /// radius and angles, a polyline closed or open).
+    shape: Option<Shape>,
+    /// Which of `shape`'s fields (as [`shape_fields`] lists them) are being typed in or dragged:
+    /// those are not read again from the drawing meanwhile. The others are, each frame, so a
+    /// drawing moved on the canvas is not put back by the next value set here.
+    shape_in_use: Vec<bool>,
+    /// The drawing's values when each field was read: a field is applied only when it differs
+    /// from these, to the drawing as it is then (moved meanwhile, it stays where it went).
+    shape_base: Option<Shape>,
+    /// Why values set for the drawing were refused, as shown: those of `shape_refused`.
+    shape_error: Option<String>,
+    /// The fields whose values were refused, each with its reason: a reason stays until a
+    /// value is entered in its own field again, and is taken (or changes nothing).
+    shape_refused: std::collections::BTreeMap<usize, String>,
+    /// Which of `shape`'s fields have been typed in or dragged since they took the focus: a
+    /// field only tabbed through enters nothing.
+    shape_touched: Vec<bool>,
+    /// The page, index and [`PanelState::drawing_gen`] of the drawing `shape` was read for.
+    shape_slot: Option<(usize, usize, u64)>,
+    /// The drawing whose properties are shown: its page and index, a hash of the drawings
+    /// before it, how many the page had, and its kind. Another drawing at that index is told by these.
+    drawing_seen: Option<(usize, usize, u64, usize, std::mem::Discriminant<Shape>)>,
+    /// Counts the drawings shown: one more each time another drawing takes the place.
+    drawing_gen: u64,
     cable: String,
     core: String,
     cable_error: Option<String>,
@@ -40,6 +65,9 @@ pub struct PanelState {
     /// the wires it belongs to.
     spec: [SpecField; 3],
     spec_for: (usize, Vec<String>),
+    /// The form for the selected black box's size and points: the page, item and symbol
+    /// version it was read from (another version, after an Undo say, reads it again).
+    black_box: Option<((usize, String, String), crate::black_box_tool::BoxEdit)>,
 }
 
 impl PanelState {
@@ -589,9 +617,406 @@ fn load_buffers(open: &Open, ed: &Editor, ps: &mut PanelState) {
                 ps.text = text.clone();
                 ps.text_height = *height;
             }
+            ps.shape_in_use.clear();
+            ps.shape_touched.clear();
+            ps.shape_error = None;
+            ps.shape_refused.clear();
         }
-        None => {}
+        Some(Selection::Cloud(_) | Selection::RevisionTable) | None => {}
     }
+}
+
+/// What [`shape_rows`] commits: each field whose edit ended with another value, with that
+/// value (each is set on its own), and the fields a value was entered in (typed or dragged,
+/// changed or not).
+struct ShapeCommit {
+    changes: Vec<(usize, f64)>,
+    entered: Vec<(usize, f64)>,
+}
+
+/// A number typed in a drawing's field, read as egui reads one: spaces ignored, and the minus
+/// sign taken for a hyphen.
+fn parse_number(text: &str) -> Option<f64> {
+    text.split_whitespace()
+        .collect::<String>()
+        .replace('\u{2212}', "-")
+        .parse()
+        .ok()
+}
+
+/// The fields of a circle, an arc or a polyline (`drawing`, read into the edit buffer except
+/// for a field in use). When values are committed (a drag ended, a typed value left its field,
+/// the closed box was ticked), the fields that ended, with the drawing as it is now with those
+/// of them that changed set. A field only tabbed through, or typed in with text that is not a
+/// number, is no change, and a field still in use is left to its own commit.
+fn shape_rows(
+    ui: &mut egui::Ui,
+    ps: &mut PanelState,
+    drawing: &Shape,
+    slot: (usize, usize, u64),
+) -> Option<ShapeCommit> {
+    let now = shape_fields(drawing);
+    // A draft is for the drawing in its slot: another drawing taking its place drops it.
+    if ps.shape_slot != Some(slot) || ps.shape_in_use.len() != now.len() {
+        ps.shape_in_use = vec![false; now.len()];
+        ps.shape_slot = Some(slot);
+    }
+    if ps.shape_touched.len() != now.len() {
+        ps.shape_touched = vec![false; now.len()];
+    }
+    let mut draft = ps.shape.as_ref().map(shape_fields).unwrap_or_default();
+    let mut base = ps.shape_base.as_ref().map(shape_fields).unwrap_or_default();
+    if draft.len() != now.len() || base.len() != now.len() {
+        (draft, base) = (now.clone(), now.clone());
+    }
+    for (((d, b), n), used) in draft.iter_mut().zip(base.iter_mut()).zip(&now).zip(&ps.shape_in_use) {
+        if !used {
+            (*d, *b) = (*n, *n);
+        }
+    }
+    let mut shape = drawing.clone();
+    set_shape_fields(&mut shape, &draft);
+    let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+    // Text typed, pasted or deleted, or a value stepped with an arrow key, this frame (it goes
+    // to the field with focus; egui steps a value only for an arrow with no modifier). A field
+    // left without any is no entry, even when egui reads its rounded text back as another number.
+    let typing = ui.input(|i| {
+        i.events.iter().any(|e| match e {
+            egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Cut => true,
+            egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } => match key {
+                egui::Key::Backspace | egui::Key::Delete => true,
+                egui::Key::ArrowUp | egui::Key::ArrowDown => modifiers.is_none(),
+                _ => false,
+            },
+            _ => false,
+        })
+    });
+    let mut ended = vec![false; now.len()];
+    let mut in_use = vec![false; now.len()];
+    let mut entered = vec![false; now.len()];
+    let touched = &mut ps.shape_touched;
+    let mut field = 0;
+    let mut num = |ui: &mut egui::Ui, label: &str, v: &mut f64, suffix: &str| {
+        ui.label(label);
+        // Typed text is read when it leaves the field, not as it is typed: a number typed and
+        // then spoiled ("7x") is no value, rather than its last good prefix.
+        let read = std::cell::Cell::new(None);
+        let r = ui.add(
+            egui::DragValue::new(v)
+                .speed(0.1)
+                .max_decimals(SHAPE_DECIMALS)
+                .update_while_editing(false)
+                .custom_parser(|text| {
+                    let v = parse_number(text);
+                    read.set(Some(v.is_some()));
+                    v
+                })
+                .suffix(suffix),
+        );
+        ui.end_row();
+        let done = r.drag_stopped() || r.lost_focus();
+        if let Some(e) = ended.get_mut(field) {
+            *e = done;
+        }
+        // A value is entered when the field was typed in or dragged and what it holds is a
+        // number; tabbing through it, or text that is no number, enters none.
+        if let Some(t) = touched.get_mut(field) {
+            // Text typed and entered in one frame is applied as the field loses focus.
+            if r.changed() && (r.has_focus() || r.dragged() || (r.lost_focus() && !escape && typing)) {
+                *t = true;
+            }
+            if done {
+                if let Some(en) = entered.get_mut(field) {
+                    *en = *t && read.get() != Some(false);
+                }
+                *t = false;
+            }
+        }
+        // A field still in use, also one focus just moved to as another one ended.
+        if let Some(u) = in_use.get_mut(field) {
+            *u = (r.has_focus() || r.dragged()) && !done;
+        }
+        field += 1;
+    };
+    match &mut shape {
+        Shape::Circle { center, radius, .. } => {
+            num(ui, "Centre X", &mut center.x, " mm");
+            num(ui, "Centre Y", &mut center.y, " mm");
+            num(ui, "Radius", radius, " mm");
+        }
+        Shape::Arc {
+            center,
+            radius,
+            start,
+            end,
+        } => {
+            num(ui, "Centre X", &mut center.x, " mm");
+            num(ui, "Centre Y", &mut center.y, " mm");
+            num(ui, "Radius", radius, " mm");
+            num(ui, "Start angle", start, "°");
+            num(ui, "End angle", end, "°");
+        }
+        Shape::Polyline { points, closed, .. } => {
+            ui.label("Points");
+            ui.label(points.len().to_string());
+            ui.end_row();
+            ui.label("Closed");
+            let can = *closed || points.len() >= 3;
+            let r = ui
+                .add_enabled(can, egui::Checkbox::without_text(closed))
+                .on_disabled_hover_text("A polyline needs three points or more to close.");
+            ui.end_row();
+            if let Some(e) = ended.first_mut() {
+                *e = r.changed();
+            }
+            if let Some(en) = entered.first_mut() {
+                *en = r.changed();
+            }
+        }
+        _ => {}
+    }
+    let mut draft = shape_fields(&shape);
+    ps.shape_in_use = in_use;
+    let fields: Vec<usize> = ended.iter().enumerate().filter_map(|(k, &e)| e.then_some(k)).collect();
+    if fields.is_empty() {
+        ps.shape = Some(shape);
+        ps.shape_base = Some(with_fields(drawing, &base));
+        return None;
+    }
+    // Escape drops what was entered in the fields it ended (an arrow key may already have
+    // changed one).
+    if escape {
+        for (k, (d, b)) in draft.iter_mut().zip(&base).enumerate() {
+            if ended.get(k).copied().unwrap_or(false) {
+                *d = *b;
+            }
+        }
+        ps.shape = Some(with_fields(drawing, &draft));
+        ps.shape_base = Some(with_fields(drawing, &base));
+        return None;
+    }
+    let mut changes = Vec::new();
+    for (k, ((d, b), e)) in draft.iter().zip(base.iter_mut()).zip(&ended).enumerate() {
+        if !e {
+            continue;
+        }
+        // Not within reach of the shown value (a number that is not finite included).
+        let shown = (d - *b).abs() <= SAME_VALUE;
+        if !shown {
+            changes.push((k, *d));
+        }
+        // What was entered is the baseline now.
+        *b = *d;
+    }
+    ps.shape = Some(with_fields(drawing, &draft));
+    ps.shape_base = Some(with_fields(drawing, &base));
+    let entered = fields
+        .iter()
+        .copied()
+        .filter(|&k| entered.get(k).copied().unwrap_or(false))
+        .filter_map(|k| Some((k, *draft.get(k)?)))
+        .collect();
+    Some(ShapeCommit { changes, entered })
+}
+
+/// Decimals shown in a drawing's fields (egui may show fewer for a large value): the text
+/// read back from a field left untouched is the value it showed to within [`SAME_VALUE`].
+const SHAPE_DECIMALS: usize = 6;
+/// A field whose value moved less than this (a ten-thousandth of a millimetre or a degree) from
+/// what it showed was not changed.
+const SAME_VALUE: f64 = 1e-4;
+
+/// The values [`shape_rows`] shows for a drawing, in its order: a circle's centre x, centre y
+/// and radius; an arc's, then its start and end angle; a polyline's closed box (1 when ticked).
+fn shape_fields(s: &Shape) -> Vec<f64> {
+    match s {
+        Shape::Circle { center, radius, .. } => vec![center.x, center.y, *radius],
+        Shape::Arc {
+            center,
+            radius,
+            start,
+            end,
+        } => vec![center.x, center.y, *radius, *start, *end],
+        Shape::Polyline { closed, .. } => vec![if *closed { 1.0 } else { 0.0 }],
+        _ => Vec::new(),
+    }
+}
+
+/// Set `s`'s fields from `v`, in [`shape_fields`]' order.
+fn set_shape_fields(s: &mut Shape, v: &[f64]) {
+    match (s, v) {
+        (Shape::Circle { center, radius, .. }, [x, y, r]) => {
+            (center.x, center.y, *radius) = (*x, *y, *r);
+        }
+        (
+            Shape::Arc {
+                center,
+                radius,
+                start,
+                end,
+            },
+            [x, y, r, a, b],
+        ) => {
+            (center.x, center.y, *radius, *start, *end) = (*x, *y, *r, *a, *b);
+        }
+        (Shape::Polyline { closed, .. }, [c]) => *closed = *c != 0.0,
+        _ => {}
+    }
+}
+
+/// `s` with its fields set from `v`.
+fn with_fields(s: &Shape, v: &[f64]) -> Shape {
+    let mut out = s.clone();
+    set_shape_fields(&mut out, v);
+    out
+}
+
+/// The selected black box's size and connection points, changed together with Apply as one
+/// undo step ([`Open::edit_black_box`]).
+fn black_box_section(
+    ui: &mut egui::Ui,
+    open: &mut Open,
+    ed: &mut Editor,
+    ps: &mut PanelState,
+    page: usize,
+    id: &str,
+    t: &Theme,
+) {
+    use crate::black_box_tool::BoxEdit;
+    let Some(sym) = open
+        .project
+        .pages
+        .get(page)
+        .and_then(|p| p.symbol(id))
+        .and_then(|s| open.symbols.get(&s.symbol))
+    else {
+        return;
+    };
+    let key = (page, id.to_owned(), sym.hash());
+    if ps.black_box.as_ref().map(|(k, _)| k) != Some(&key) {
+        ps.black_box = BoxEdit::load(sym).map(|f| (key.clone(), f));
+    }
+    let Some((_, form)) = ps.black_box.as_mut() else {
+        return;
+    };
+    ui.add_space(6.0);
+    subsection(ui, "Black box");
+    // The fields belong to this box: a value half typed for another box is not carried over.
+    let done = ui
+        .push_id(&key, |ui| black_box_form(ui, open, ed, form, page, id, t))
+        .inner;
+    if done {
+        ps.black_box = None;
+    }
+}
+
+/// A size field of the black box form. A loaded size outside 1-5000 mm is kept until the user
+/// types or drags a new one: egui clamps a field's value to its range whenever the field loses
+/// focus, even untouched, so the range is applied here, to changes only.
+fn box_size_field(ui: &mut egui::Ui, value: &mut f64) {
+    let before = *value;
+    // Shown in full, so that leaving the field untouched reads back the very same number.
+    let r = ui.add(
+        egui::DragValue::new(value)
+            .speed(0.5)
+            .suffix(" mm")
+            .custom_formatter(|v, _| format!("{v}")),
+    );
+    if r.changed() && *value != before {
+        *value = value.clamp(1.0, 5000.0);
+    }
+}
+
+/// The fields of the black box form; `true` when it is done with (applied or reset).
+fn black_box_form(
+    ui: &mut egui::Ui,
+    open: &mut Open,
+    ed: &mut Editor,
+    form: &mut crate::black_box_tool::BoxEdit,
+    page: usize,
+    id: &str,
+    t: &Theme,
+) -> bool {
+    use crate::black_box_tool::side_label;
+    use wc_core::BoxSide;
+    egui::Grid::new("box-size")
+        .num_columns(2)
+        .spacing([8.0, 6.0])
+        .show(ui, |ui| {
+            ui.label("Width");
+            box_size_field(ui, &mut form.width);
+            ui.end_row();
+            ui.label("Height");
+            box_size_field(ui, &mut form.height);
+            ui.end_row();
+        });
+    ui.label(RichText::new("Connection points: name, edge and mm along it").color(t.faint));
+    let mut remove = None;
+    egui::Grid::new("box-pins")
+        .num_columns(4)
+        .spacing([6.0, 4.0])
+        .show(ui, |ui| {
+            for (i, row) in form.rows.iter_mut().enumerate() {
+                ui.add(egui::TextEdit::singleline(&mut row.name).desired_width(48.0));
+                egui::ComboBox::from_id_salt(("box-side", i))
+                    .width(70.0)
+                    .selected_text(side_label(row.side))
+                    .show_ui(ui, |ui| {
+                        for side in [BoxSide::Top, BoxSide::Bottom, BoxSide::Left, BoxSide::Right] {
+                            ui.selectable_value(&mut row.side, side, side_label(side));
+                        }
+                    });
+                ui.add(egui::DragValue::new(&mut row.offset).speed(0.5).suffix(" mm"));
+                if ui.small_button("\u{2715}").on_hover_text("Remove this point").clicked() {
+                    remove = Some(i);
+                }
+                ui.end_row();
+            }
+        });
+    if let Some(i) = remove {
+        form.rows.remove(i);
+    }
+    let (mut apply, mut reset) = (false, false);
+    ui.horizontal(|ui| {
+        if ui.small_button("+ Point").clicked() {
+            form.add_row();
+        }
+        let changed = form.changed();
+        apply = ui.add_enabled(changed, egui::Button::new("Apply")).clicked();
+        reset = ui.add_enabled(changed, egui::Button::new("Reset")).clicked();
+    });
+    if reset {
+        return true;
+    }
+    if apply {
+        match open.edit_black_box(
+            page,
+            id,
+            (form.width, form.height),
+            &form.pins(),
+            &form.renamed(),
+            &form.removed(),
+        ) {
+            Ok(warnings) => {
+                ed.message = if warnings.is_empty() {
+                    "Black box changed.".into()
+                } else {
+                    format!("Black box changed. Check: {}.", warnings.join("; "))
+                };
+                return true;
+            }
+            Err(e) => form.error = Some(e),
+        }
+    }
+    if let Some(err) = &form.error {
+        ui.label(RichText::new(err).color(t.error).small());
+    }
+    false
 }
 
 fn committed(r: &egui::Response) -> bool {
@@ -783,12 +1208,57 @@ fn selection_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps:
             if let Some(tag) = placed.tag.clone() {
                 device_section(ui, open, ps, &tag, t);
             }
-            if let Some(sym) = open.symbols.get(&placed.symbol) {
+            if open
+                .symbols
+                .get(&placed.symbol)
+                .is_some_and(|s| wc_core::black_box_layout(s).is_some())
+            {
+                black_box_section(ui, open, ed, ps, page_idx, &id, t);
+            } else if let Some(sym) = open.symbols.get(&placed.symbol) {
                 ui.add_space(6.0);
                 subsection(ui, "Pins");
                 let names: Vec<&str> = sym.pins.iter().map(|p| p.name.as_str()).collect();
                 ui.label(names.join("  "));
             }
+        }
+        Some(Selection::Cloud(i)) => {
+            let Some(cloud) = open.project.pages.get(page_idx).and_then(|p| p.clouds.get(i)).cloned() else {
+                ed.selection.clear();
+                return;
+            };
+            ui.strong("Revision cloud");
+            let letters: Vec<String> = open.project.meta.revisions.iter().map(|r| r.letter.clone()).collect();
+            let mut chosen = cloud.revision.clone();
+            ui.horizontal(|ui| {
+                ui.label("Revision");
+                egui::ComboBox::from_id_salt("cloud-revision")
+                    .selected_text(chosen.as_str())
+                    .show_ui(ui, |ui| {
+                        for l in &letters {
+                            ui.selectable_value(&mut chosen, l.clone(), l.as_str());
+                        }
+                    });
+            });
+            if chosen != cloud.revision {
+                open.set_cloud_revision(page_idx, i, &chosen);
+            }
+            if let Some(r) = open.project.cloud_revision(&cloud.revision) {
+                ui.label(RichText::new(format!("{} {}", r.date, r.text)).color(t.faint));
+            } else {
+                ui.colored_label(t.warning, format!("No revision {} in the project.", cloud.revision));
+            }
+            ui.label(RichText::new("Drag to move it; Delete takes it off.").color(t.faint));
+        }
+        Some(Selection::RevisionTable) => {
+            ui.strong("Revision table");
+            ui.label(format!("{} revisions", open.project.meta.revisions.len()));
+            ui.label(
+                RichText::new(
+                    "Drag to move it; Delete takes it off the page. Revisions are listed in File → Project \
+                     properties.",
+                )
+                .color(t.faint),
+            );
         }
         Some(Selection::Graphic(i)) => {
             let Some(g) = open
@@ -808,47 +1278,138 @@ fn selection_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps:
                 Shape::Circle { .. } => "Circle",
                 Shape::Arc { .. } => "Arc",
                 Shape::Text { .. } => "Text",
+                Shape::Dimension { .. } => "Dimension",
             };
-            egui::Grid::new("gfx-props")
-                .num_columns(2)
-                .spacing([8.0, 6.0])
-                .show(ui, |ui| {
-                    ui.label("Drawing");
-                    ui.label(kind);
-                    ui.end_row();
-                    if let Shape::Text { at, .. } = &g {
-                        ui.label("Text");
-                        let r = ui.text_edit_singleline(&mut ps.text);
+            // The fields are this drawing's: one being typed in when another is selected goes
+            // with its drawing, not into the same field of the next one. Drawings carry no id, so
+            // the one at this index is taken for another when a drawing before it changes, or
+            // when the page has fewer drawings (one deleted, this one maybe): the fields then
+            // read it afresh and lose what was being typed. One appended after it leaves them be.
+            let graphics = open
+                .project
+                .pages
+                .get(page_idx)
+                .map(|p| p.graphics.as_slice())
+                .unwrap_or_default();
+            let count = graphics.len();
+            let before = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                format!("{:?}", graphics.get(..i).unwrap_or_default()).hash(&mut h);
+                h.finish()
+            };
+            // A drawing of another kind in its place is another drawing too.
+            let kind_now = std::mem::discriminant(&g);
+            let same = matches!(ps.drawing_seen, Some((p, j, h, n, k))
+                if p == page_idx && j == i && h == before && count >= n && k == kind_now);
+            if !same {
+                ps.drawing_gen += 1;
+                if let Shape::Text { text, height, .. } = &g {
+                    ps.text = text.clone();
+                    ps.text_height = *height;
+                }
+                ps.shape = None;
+                ps.shape_base = None;
+                ps.shape_in_use.clear();
+                ps.shape_touched.clear();
+                ps.shape_error = None;
+                ps.shape_refused.clear();
+            }
+            ps.drawing_seen = Some((page_idx, i, before, count, kind_now));
+            let shown = ps.drawing_gen;
+            ui.push_id(("gfx-props", page_idx, i, shown), |ui| {
+                egui::Grid::new("gfx-props")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("Drawing");
+                        ui.label(kind);
                         ui.end_row();
-                        ui.label("Height");
-                        let h = ui.add(
-                            egui::DragValue::new(&mut ps.text_height)
-                                .range(0.5..=50.0)
-                                .speed(0.1)
-                                .suffix(" mm"),
-                        );
-                        ui.end_row();
-                        if committed(&r) || h.drag_stopped() || h.lost_focus() {
-                            if ps.text.trim().is_empty() {
-                                // An empty text would vanish; put the old one back.
-                                ps.loaded_for = None;
-                            } else {
-                                open.set_text(page_idx, i, ps.text.trim(), ps.text_height);
+                        if let Shape::Text { at, .. } = &g {
+                            ui.label("Text");
+                            let r = ui.text_edit_singleline(&mut ps.text);
+                            ui.end_row();
+                            ui.label("Height");
+                            let h = ui.add(
+                                egui::DragValue::new(&mut ps.text_height)
+                                    .range(0.5..=50.0)
+                                    .speed(0.1)
+                                    .suffix(" mm"),
+                            );
+                            ui.end_row();
+                            if committed(&r) || h.drag_stopped() || h.lost_focus() {
+                                if ps.text.trim().is_empty() {
+                                    // An empty text would vanish; put the old one back.
+                                    ps.loaded_for = None;
+                                } else {
+                                    open.set_text(page_idx, i, ps.text.trim(), ps.text_height);
+                                }
+                            }
+                            ui.label("Position");
+                            ui.label(format!("{:.1}, {:.1} mm", at.x, at.y));
+                            ui.end_row();
+                        } else if matches!(g, Shape::Circle { .. } | Shape::Arc { .. } | Shape::Polyline { .. }) {
+                            if let Some(c) = shape_rows(ui, ps, &g, (page_idx, i, shown)) {
+                                // Each field is set on its own (one undo step each): a field
+                                // refused (no radius, an arc of no angle) keeps its reason and
+                                // reads the drawing's own value again, and does not take a good
+                                // value entered in another field with it.
+                                let mut cur = g.clone();
+                                let mut refused = Vec::new();
+                                for (k, v) in c.changes {
+                                    let mut values = shape_fields(&cur);
+                                    if let Some(f) = values.get_mut(k) {
+                                        *f = v;
+                                    }
+                                    let next = with_fields(&cur, &values);
+                                    match open.set_shape(page_idx, i, next.clone()) {
+                                        Ok(_) => cur = next,
+                                        Err(why) => {
+                                            ps.shape_refused.insert(k, why.to_owned());
+                                            refused.push(k);
+                                        }
+                                    }
+                                }
+                                // A refused field entered again with a value that is taken (or
+                                // changes nothing and would be taken) takes its reason back;
+                                // another field doesn't. A value too near the stored one to be a
+                                // change is still checked: 0 for a radius of 0.00005 is no radius.
+                                for (k, v) in c.entered.iter().filter(|(k, _)| !refused.contains(k)) {
+                                    let mut values = shape_fields(&cur);
+                                    if let Some(f) = values.get_mut(*k) {
+                                        *f = *v;
+                                    }
+                                    match open.shape_checked(page_idx, i, with_fields(&cur, &values)) {
+                                        Ok(_) => {
+                                            ps.shape_refused.remove(k);
+                                        }
+                                        Err(why) => {
+                                            ps.shape_refused.insert(*k, why.to_owned());
+                                        }
+                                    }
+                                }
+                                let mut why: Vec<&str> = Vec::new();
+                                for w in ps.shape_refused.values() {
+                                    if !why.contains(&w.as_str()) {
+                                        why.push(w);
+                                    }
+                                }
+                                ps.shape_error = (!why.is_empty()).then(|| why.join(" "));
+                            }
+                            if let Some(err) = &ps.shape_error {
+                                ui.label("");
+                                ui.label(RichText::new(err).color(t.error).small());
+                                ui.end_row();
+                            }
+                        } else {
+                            for (label, value) in drawing_rows(&g) {
+                                ui.label(label);
+                                ui.label(value);
+                                ui.end_row();
                             }
                         }
-                        ui.label("Position");
-                        ui.label(format!("{:.1}, {:.1} mm", at.x, at.y));
-                        ui.end_row();
-                    } else {
-                        let (a, b) = g.bounds();
-                        ui.label("From");
-                        ui.label(format!("{:.1}, {:.1} mm", a.x, a.y));
-                        ui.end_row();
-                        ui.label("To");
-                        ui.label(format!("{:.1}, {:.1} mm", b.x, b.y));
-                        ui.end_row();
-                    }
-                });
+                    });
+            });
         }
         Some(Selection::Wire(id)) => {
             let Some(wire) = open
@@ -1284,7 +1845,11 @@ fn rotation_label(r: Rotation) -> &'static str {
     }
 }
 
-pub fn status_bar(ui: &mut egui::Ui, open: Option<&Open>, ed: &Editor) {
+/// The status bar. `live` is the check while drawing's text, whether a check is pending and
+/// whether the last one failed, or `None` when that is off; it returns true when that text was
+/// clicked.
+pub fn status_bar(ui: &mut egui::Ui, open: Option<&Open>, ed: &Editor, live: Option<(String, bool, bool)>) -> bool {
+    let mut show_check = false;
     let t = Theme::of(ui.ctx());
     let sep = |ui: &mut egui::Ui| {
         let (r, _) = ui.allocate_exact_size(egui::vec2(1.0, 14.0), egui::Sense::hover());
@@ -1305,11 +1870,15 @@ pub fn status_bar(ui: &mut egui::Ui, open: Option<&Open>, ed: &Editor) {
             Tool::Wire => "Draw wire",
             Tool::Text => "Text",
             Tool::Comment => "Comment",
+            Tool::BlackBox => "Black box",
             Tool::Line => "Line",
             Tool::Rect => "Rectangle",
             Tool::Circle => "Circle",
             Tool::Arc => "Arc",
             Tool::Polyline => "Polyline",
+            Tool::Dimension => "Dimension",
+            Tool::Cloud => "Revision cloud",
+            Tool::RevisionTable => "Revision table",
         };
         // The current tool as an accent pill.
         let g = ui
@@ -1330,6 +1899,27 @@ pub fn status_bar(ui: &mut egui::Ui, open: Option<&Open>, ed: &Editor) {
         ui.label(RichText::new(&ed.message).color(t.muted));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if let Some(o) = open {
+                if let Some((mut text, pending, failed)) = live {
+                    let errors = ed.live.iter().any(|f| f.severity == wc_report::Severity::Error);
+                    let warnings = ed.live.iter().any(|f| f.severity == wc_report::Severity::Warning);
+                    let c = if errors || failed {
+                        t.error
+                    } else if warnings {
+                        t.warning
+                    } else {
+                        t.muted
+                    };
+                    if pending {
+                        text.push_str(" …");
+                    }
+                    let r = ui
+                        .add(egui::Label::new(RichText::new(text).color(c)).sense(egui::Sense::click()))
+                        .on_hover_text("Problems the check found after the last edit: click to list them");
+                    show_check = r.clicked();
+                    if !o.branch.is_empty() {
+                        sep(ui);
+                    }
+                }
                 if !o.branch.is_empty() {
                     ui.label(RichText::new(&o.branch).monospace().color(t.text));
                     let (r, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
@@ -1349,20 +1939,34 @@ pub fn status_bar(ui: &mut egui::Ui, open: Option<&Open>, ed: &Editor) {
             }
         });
     });
+    show_check
 }
 
 /// The properties of the panel layout shown: plate size, the picked device, and the devices
 /// with a part that are not on the plate yet.
-fn panel_properties(ui: &mut egui::Ui, open: &Open, ed: &Editor, pi: usize) {
+fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, pi: usize) {
     use wc_core::panel::{PanelItem, on_door, part_size};
     let t = Theme::of(ui.ctx());
+    // The footprint drawing picked below, attached once the panel is drawn.
+    let mut attach: Option<(String, std::path::PathBuf)> = None;
+    // The STEP model picked below, its size stored once the panel is drawn.
+    let mut model: Option<(String, std::path::PathBuf)> = None;
     let Some(panel) = open.project.panels.get(pi) else {
         return;
     };
     ui.label(RichText::new(&panel.name).strong());
     ui.label(RichText::new(format!("Mounting plate {} x {} mm", panel.width, panel.height)).color(t.faint));
     ui.add_space(6.0);
-    if let Some(PanelItem::Device { tag, at, width, height }) = ed.panel_pick.and_then(|i| panel.items.get(i)) {
+    // Set when the Rotate button is pressed, applied once the panel is no longer borrowed.
+    let mut turn: Option<usize> = None;
+    if let Some(PanelItem::Device {
+        tag,
+        at,
+        width,
+        height,
+        rotation,
+    }) = ed.panel_pick.and_then(|i| panel.items.get(i))
+    {
         let dev = open.project.devices.get(tag);
         egui::Grid::new("panel-dev")
             .num_columns(2)
@@ -1380,10 +1984,81 @@ fn panel_properties(ui: &mut egui::Ui, open: &Open, ed: &Editor, pi: usize) {
                 ui.label(RichText::new("Size").color(t.muted));
                 ui.label(format!("{width} x {height} mm"));
                 ui.end_row();
+                // The maker's 3D model of the part, when one is attached (#501).
+                if let Some(m) = dev
+                    .and_then(|d| d.part.as_ref())
+                    .and_then(|p| open.parts.get(p))
+                    .and_then(|p| p.model)
+                {
+                    use wc_core::geom::format_length as mm;
+                    ui.label(RichText::new("3D model").color(t.muted));
+                    ui.label(format!("{} x {} x {} mm", mm(m.width), mm(m.height), mm(m.depth)));
+                    ui.end_row();
+                }
+                ui.label(RichText::new("Rotation").color(t.muted));
+                ui.horizontal(|ui| {
+                    ui.label(match rotation {
+                        wc_core::geom::Rotation::R0 => "0°",
+                        wc_core::geom::Rotation::R90 => "90°",
+                        wc_core::geom::Rotation::R180 => "180°",
+                        wc_core::geom::Rotation::R270 => "270°",
+                    });
+                    if ui
+                        .small_button("Rotate 90°")
+                        .on_hover_text("Turn the device a quarter clockwise on the plate (R)")
+                        .clicked()
+                    {
+                        turn = ed.panel_pick;
+                    }
+                });
+                ui.end_row();
                 ui.label(RichText::new("Position").color(t.muted));
                 ui.label(format!("x {:.0}, y {:.0} mm", at.x, at.y));
                 ui.end_row();
             });
+        // A maker's outline drawing for the device's part (#484).
+        let part = dev.and_then(|d| d.part.clone());
+        if let Some(part) = part {
+            let has = open.parts.get(&part).is_some_and(|p| p.footprint.is_some());
+            let label = if has {
+                "Replace footprint drawing..."
+            } else {
+                "Attach footprint drawing..."
+            };
+            if ui
+                .button(label)
+                .on_hover_text(
+                    "Pick the maker's DXF outline (front view, mm at 1:1); it is stored with the part in its library",
+                )
+                .clicked()
+                && let Some(file) = rfd::FileDialog::new()
+                    .set_title("Footprint drawing")
+                    .add_filter("DXF drawings", &["dxf"])
+                    .pick_file()
+            {
+                attach = Some((part.clone(), file));
+            }
+            // The size of the maker's 3D model, for a part without a width and height (#501).
+            let has = open.parts.get(&part).is_some_and(|p| p.model.is_some());
+            let label = if has {
+                "Replace 3D model..."
+            } else {
+                "Attach 3D model..."
+            };
+            if ui
+                .button(label)
+                .on_hover_text(
+                    "Pick the maker's STEP model; its size is stored with the part in its library and sizes the device on the plate when the part has no width and height or footprint",
+                )
+                .clicked()
+                && let Some(file) = rfd::FileDialog::new()
+                    .set_title("3D model")
+                    .add_filter("STEP models", &["step", "stp", "STEP", "STP"])
+                    .pick_file()
+            {
+                model = Some((part, file));
+            }
+        }
         ui.add_space(6.0);
     } else {
         ui.label(RichText::new("Click a device on the plate to see it; drag it to move it.").color(t.faint));
@@ -1412,6 +2087,34 @@ fn panel_properties(ui: &mut egui::Ui, open: &Open, ed: &Editor, pi: usize) {
             ui.label(RichText::new(m).monospace());
         }
         ui.label(RichText::new("Page menu → Arrange devices puts them on the rails.").color(t.faint));
+    }
+    if let Some((part, file)) = attach {
+        ed.message = open.attach_footprint(&part, &file).unwrap_or_else(|e| e);
+    }
+    if let Some((part, file)) = model {
+        ed.message = open.attach_model(&part, &file).unwrap_or_else(|e| e);
+    }
+    if let Some(item) = turn
+        && !open.rotate_panel_device(pi, item)
+    {
+        ed.message = "Turned, the device would not fit on the plate.".into();
+    }
+}
+
+/// The Properties rows of a drawing without fields of its own: a dimension shows its length
+/// and the two points it measures, other drawings the corners of their bounds.
+fn drawing_rows(g: &Shape) -> Vec<(&'static str, String)> {
+    let at = |p: wc_core::Point| format!("{:.1}, {:.1} mm", p.x, p.y);
+    match g {
+        Shape::Dimension { a, b, .. } => vec![
+            ("Length", format!("{} mm", wc_core::geom::format_length(a.distance(*b)))),
+            ("From", at(*a)),
+            ("To", at(*b)),
+        ],
+        _ => {
+            let (a, b) = g.bounds();
+            vec![("From", at(a)), ("To", at(b))]
+        }
     }
 }
 
@@ -1471,6 +2174,77 @@ mod tests {
             texts.iter().all(|t| t != "none"),
             "the jumper's part is shown: {texts:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_black_box_size_outside_the_field_range_is_kept_until_it_is_edited() -> Result<(), Box<dyn std::error::Error>> {
+        use wc_core::{BoxPin, BoxSide};
+        let (_tmp, mut o) = crate::state::tests::project();
+        let pins = [BoxPin {
+            name: "1".into(),
+            side: BoxSide::Left,
+            offset: 5.0,
+        }];
+        let id = o.add_black_box(
+            1,
+            wc_core::geom::Point::new(40.0, 40.0),
+            wc_core::geom::Point::new(60.0, 50.0),
+            &pins,
+            None,
+        )?;
+        let symbol_id = format!("box.{}.{id}", o.project.pages[1].id);
+        // A box narrower than the field's 1 mm minimum, as an older file could hold.
+        let narrow = wc_core::black_box(&symbol_id, "Black box", 0.5, 10.0, &pins)?;
+        o.symbols.insert(symbol_id.clone(), narrow.clone());
+        let mut ed = Editor::default();
+        let mut ps = PanelState::default();
+        let t = Theme::of(&egui::Context::default());
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut frame_with = |o: &mut Open, ps: &mut PanelState, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| black_box_section(ui, o, &mut ed, ps, 1, &id, &t));
+            });
+        };
+        let tab = || egui::Event::Key {
+            key: egui::Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame_with(&mut o, &mut ps, Vec::new());
+        let form = |ps: &PanelState| ps.black_box.as_ref().map(|(_, f)| (f.width, f.changed()));
+        assert_eq!(form(&ps), Some((0.5, false)), "showing the form changes nothing");
+        // Tabbing into the Width field and on out of it without typing changes nothing either.
+        for _ in 0..3 {
+            frame_with(&mut o, &mut ps, vec![tab()]);
+            frame_with(&mut o, &mut ps, Vec::new());
+        }
+        assert_eq!(form(&ps), Some((0.5, false)), "focus passing through changes nothing");
+        // Nor for a size that the field's usual rounding would show differently.
+        let mut odd = PanelState::default();
+        let odd_box = wc_core::black_box(&symbol_id, "Black box", 0.500001, 10.0, &pins)?;
+        o.symbols.insert(symbol_id.clone(), odd_box);
+        frame_with(&mut o, &mut odd, Vec::new());
+        for _ in 0..3 {
+            frame_with(&mut o, &mut odd, vec![tab()]);
+            frame_with(&mut o, &mut odd, Vec::new());
+        }
+        assert_eq!(form(&odd), Some((0.500001, false)));
+        o.symbols.insert(symbol_id.clone(), narrow.clone());
+        let mut frame = |o: &mut Open, ps: &mut PanelState| frame_with(o, ps, Vec::new());
+        // Renaming a point leaves the width alone.
+        if let Some((_, f)) = ps.black_box.as_mut() {
+            f.rows[0].name = "A".into();
+        }
+        frame(&mut o, &mut ps);
+        assert_eq!(form(&ps), Some((0.5, true)));
         Ok(())
     }
 
@@ -1693,5 +2467,762 @@ mod tests {
         symbol.selection = vec![Selection::Symbol("s1".into())];
         forget_spec_unless_wires(&symbol, &mut ps);
         assert_eq!(ps.spec_for, (0, Vec::new()), "a symbol shows: forgotten");
+    }
+
+    /// A properties panel showing free drawings on the first page, driven a frame at a time.
+    struct ShapePanel {
+        _tmp: tempfile::TempDir,
+        o: Open,
+        ed: Editor,
+        ps: PanelState,
+        ctx: egui::Context,
+        /// The drawings' indices on the page.
+        at: Vec<usize>,
+    }
+
+    impl ShapePanel {
+        fn new(shapes: &[Shape]) -> Self {
+            let (_tmp, mut o) = crate::state::tests::project();
+            let mut at = Vec::new();
+            for g in shapes {
+                at.push(o.project.pages[0].graphics.len());
+                o.add_graphic(0, g.clone());
+            }
+            let mut ed = Editor::default();
+            ed.selection = vec![Selection::Graphic(at[0])];
+            let ctx = egui::Context::default();
+            crate::theme::install_fonts(&ctx);
+            let mut me = Self {
+                _tmp,
+                o,
+                ed,
+                ps: PanelState::default(),
+                ctx,
+                at,
+            };
+            // Grids lay out over a frame before they show.
+            me.frame(Vec::new());
+            me.frame(Vec::new());
+            me
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) {
+            let input = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let (o, ed, ps) = (&mut self.o, &mut self.ed, &mut self.ps);
+            let _ = self.ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| properties(ui, o, ed, ps));
+            });
+        }
+
+        fn key(&mut self, key: egui::Key) {
+            self.frame(vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }]);
+        }
+
+        /// Tab `n` times from nothing focused.
+        fn tab(&mut self, n: usize) {
+            for _ in 0..n {
+                self.key(egui::Key::Tab);
+            }
+        }
+
+        /// Replace the focused field's text with `text`.
+        fn typed(&mut self, text: &str) {
+            self.frame(vec![
+                egui::Event::Key {
+                    key: egui::Key::A,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                },
+                egui::Event::Text(text.into()),
+            ]);
+        }
+
+        /// Replace the focused field's text with `text` and press Enter, all in one frame.
+        fn typed_and_entered(&mut self, text: &str) {
+            self.frame(vec![
+                egui::Event::Key {
+                    key: egui::Key::A,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                },
+                egui::Event::Text(text.into()),
+                egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Default::default(),
+                },
+            ]);
+        }
+
+        fn drawing(&self, k: usize) -> Shape {
+            self.o.project.pages[0].graphics[self.at[k]].clone()
+        }
+
+        /// A frame in which `f` runs first, before the panel is drawn.
+        fn frame_with(&mut self, f: impl FnOnce(&egui::Context)) {
+            self.frame_events_with(Vec::new(), f);
+        }
+
+        /// A frame of `events` in which `f` runs first, before the panel is drawn.
+        fn frame_events_with(&mut self, events: Vec<egui::Event>, f: impl FnOnce(&egui::Context)) {
+            let input = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let (o, ed, ps) = (&mut self.o, &mut self.ed, &mut self.ps);
+            let mut f = Some(f);
+            let _ = self.ctx.run(input, |ctx| {
+                if let Some(f) = f.take() {
+                    f(ctx);
+                }
+                egui::CentralPanel::default().show(ctx, |ui| properties(ui, o, ed, ps));
+            });
+        }
+    }
+
+    fn text(s: &str) -> Shape {
+        Shape::Text {
+            at: wc_core::geom::Point::new(20.0, 20.0),
+            text: s.into(),
+            height: 3.5,
+            align: Default::default(),
+            angle: 0.0,
+        }
+    }
+
+    /// The tabs from nothing focused to a text drawing's text field.
+    fn tabs_to_text() -> Result<usize, &'static str> {
+        for n in 1..30 {
+            let mut p = ShapePanel::new(&[text("a")]);
+            p.tab(n);
+            p.typed("b");
+            p.key(egui::Key::Enter);
+            if p.drawing(0) == text("b") {
+                return Ok(n);
+            }
+        }
+        Err("no text field reached by tabbing")
+    }
+
+    fn circle(x: f64, r: f64) -> Shape {
+        Shape::Circle {
+            center: wc_core::geom::Point::new(x, 50.0),
+            radius: r,
+            filled: false,
+        }
+    }
+
+    /// The tabs from nothing focused to a circle's radius field: found by typing a new radius
+    /// after each count until one lands there.
+    fn tabs_to_radius() -> Result<usize, &'static str> {
+        for n in 1..30 {
+            let mut p = ShapePanel::new(&[circle(100.0, 5.0)]);
+            p.tab(n);
+            p.typed("7");
+            p.key(egui::Key::Enter);
+            if p.drawing(0) == circle(100.0, 7.0) {
+                return Ok(n);
+            }
+        }
+        Err("no radius field reached by tabbing")
+    }
+
+    #[test]
+    fn a_radius_typed_in_the_panel_is_one_undo_step() -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let mut p = ShapePanel::new(&[circle(100.0, 5.0)]);
+        let mark = p.o.undo_mark();
+        p.tab(n);
+        p.typed("7");
+        p.key(egui::Key::Enter);
+        assert_eq!(p.drawing(0), circle(100.0, 7.0));
+        assert_eq!(p.o.undo_mark(), mark + 1, "one undo step");
+        assert!(p.o.undo());
+        assert_eq!(p.drawing(0), circle(100.0, 5.0));
+        Ok(())
+    }
+
+    #[test]
+    fn a_radius_field_tabbed_through_or_spoiled_changes_nothing() -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        // Shown to six decimals: read back as it was.
+        for typed in [None, Some("7x")] {
+            let mut p = ShapePanel::new(&[circle(100.0, 7.123_456_789)]);
+            let (before, mark) = (p.o.project.clone(), p.o.undo_mark());
+            p.tab(n);
+            if let Some(t) = typed {
+                // "7" first, a number of its own, then spoiled.
+                p.typed(&t[..1]);
+                p.frame(vec![egui::Event::Text(t[1..].into())]);
+            }
+            p.key(egui::Key::Enter);
+            p.key(egui::Key::Tab);
+            p.frame(Vec::new());
+            assert_eq!(p.o.project, before, "{typed:?}: nothing changed");
+            assert_eq!(p.o.undo_mark(), mark, "{typed:?}: no undo step");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_radius_typed_for_one_circle_does_not_go_to_the_next_one_selected() -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let mut p = ShapePanel::new(&[circle(100.0, 5.0), circle(150.0, 5.0)]);
+        p.tab(n);
+        p.typed("7");
+        // Another circle selected while the field has the typing, then Enter.
+        p.ed.selection = vec![Selection::Graphic(p.at[1])];
+        p.frame(Vec::new());
+        p.key(egui::Key::Enter);
+        p.frame(Vec::new());
+        assert_eq!(
+            p.drawing(1),
+            circle(150.0, 5.0),
+            "the circle selected after keeps its radius"
+        );
+        assert_eq!(p.drawing(0), circle(100.0, 5.0), "the draft was dropped with its field");
+        Ok(())
+    }
+
+    #[test]
+    fn a_radius_set_while_the_circle_was_moved_leaves_it_where_it_went() -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let mut p = ShapePanel::new(&[circle(100.0, 5.0)]);
+        p.tab(n);
+        p.typed("7");
+        // Moved meanwhile (the assistant, a guest's change).
+        let i = p.at[0];
+        p.o.project.pages[0].graphics[i] = circle(120.0, 5.0);
+        p.key(egui::Key::Enter);
+        assert_eq!(p.drawing(0), circle(120.0, 7.0));
+        Ok(())
+    }
+
+    #[test]
+    fn a_radius_of_zero_is_refused_with_its_reason() -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let mut p = ShapePanel::new(&[circle(100.0, 5.0)]);
+        p.tab(n);
+        p.typed("0");
+        p.key(egui::Key::Enter);
+        assert_eq!(p.drawing(0), circle(100.0, 5.0));
+        assert_eq!(p.ps.shape_error.as_deref(), Some("The radius must be above zero."));
+        Ok(())
+    }
+
+    #[test]
+    fn a_radius_being_typed_changes_nothing_when_the_page_becomes_held() -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let mut p = ShapePanel::new(&[circle(100.0, 5.0)]);
+        p.tab(n);
+        p.typed("7");
+        let (before, mark) = (p.o.project.clone(), p.o.undo_mark());
+        let page = p.o.project.pages[0].id.clone();
+        p.ed.held_by.insert(page, "Ola".into());
+        p.frame(Vec::new());
+        p.key(egui::Key::Enter);
+        assert_eq!(p.o.project, before, "nothing was changed");
+        assert_eq!(p.o.undo_mark(), mark, "no undo step");
+        Ok(())
+    }
+
+    #[test]
+    fn escape_drops_a_radius_changed_with_an_arrow_key() -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let mut p = ShapePanel::new(&[circle(100.0, 5.0)]);
+        let (before, mark) = (p.o.project.clone(), p.o.undo_mark());
+        p.tab(n);
+        p.key(egui::Key::ArrowUp);
+        p.key(egui::Key::Escape);
+        p.frame(Vec::new());
+        assert_eq!(p.o.project, before);
+        assert_eq!(p.o.undo_mark(), mark);
+        Ok(())
+    }
+
+    #[test]
+    fn a_refusal_shown_goes_when_a_good_value_is_entered() -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let mut p = ShapePanel::new(&[circle(100.0, 5.0)]);
+        p.tab(n);
+        p.typed("0");
+        p.key(egui::Key::Enter);
+        assert!(p.ps.shape_error.is_some());
+        // The radius it has, entered again: no change, and no refusal shown any more.
+        p.tab(n);
+        p.typed("5");
+        p.key(egui::Key::Enter);
+        assert_eq!(p.ps.shape_error, None);
+        assert_eq!(p.drawing(0), circle(100.0, 5.0));
+        Ok(())
+    }
+
+    #[test]
+    fn a_radius_typed_for_a_circle_deleted_meanwhile_does_not_go_to_the_next_one()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let mut p = ShapePanel::new(&[circle(100.0, 5.0), circle(150.0, 5.0)]);
+        p.tab(n);
+        p.typed("7");
+        // The circle is deleted (by the assistant); the next one takes its place in the list.
+        let i = p.at[0];
+        p.o.project.pages[0].graphics.remove(i);
+        p.key(egui::Key::Enter);
+        p.frame(Vec::new());
+        assert_eq!(p.o.project.pages[0].graphics[i], circle(150.0, 5.0));
+        Ok(())
+    }
+
+    #[test]
+    fn a_field_tabbed_into_as_another_commits_keeps_a_change_made_meanwhile() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let n = tabs_to_radius()?;
+        let mut p = ShapePanel::new(&[circle(100.0, 5.0)]);
+        // Centre Y, then Tab: Y is committed and the radius field takes the focus.
+        p.tab(n - 1);
+        p.typed("60");
+        p.key(egui::Key::Tab);
+        let i = p.at[0];
+        assert_eq!(p.o.project.pages[0].graphics[i], circle(100.0, 5.0).moved_y(60.0));
+        // The radius changes elsewhere while its field has the focus, then the field is left
+        // untouched: the change stays.
+        p.o.project.pages[0].graphics[i] = circle(100.0, 9.0).moved_y(60.0);
+        p.frame(Vec::new());
+        p.key(egui::Key::Tab);
+        p.frame(Vec::new());
+        assert_eq!(p.o.project.pages[0].graphics[i], circle(100.0, 9.0).moved_y(60.0));
+        Ok(())
+    }
+
+    #[test]
+    fn a_refusal_stays_while_another_field_is_only_tabbed_through() -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let mut p = ShapePanel::new(&[circle(100.0, 5.0)]);
+        p.tab(n);
+        p.typed("0");
+        p.key(egui::Key::Enter);
+        assert!(p.ps.shape_error.is_some());
+        // Centre X, then on to Centre Y: the radius was not entered again.
+        p.tab(n - 2);
+        p.key(egui::Key::Tab);
+        p.frame(Vec::new());
+        assert!(p.ps.shape_error.is_some(), "the radius's refusal is still shown");
+        Ok(())
+    }
+
+    #[test]
+    fn a_field_focused_in_the_frame_another_commits_keeps_a_change_made_meanwhile()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let radius = {
+            let mut p = ShapePanel::new(&[circle(100.0, 5.0)]);
+            p.tab(n);
+            p.ctx.memory(|m| m.focused()).ok_or("the radius field has the focus")?
+        };
+        let mut p = ShapePanel::new(&[circle(100.0, 5.0)]);
+        p.tab(n - 1);
+        p.typed("60");
+        // In one frame Centre Y ends and the radius field takes the focus.
+        p.frame_with(|ctx| ctx.memory_mut(|m| m.request_focus(radius)));
+        let i = p.at[0];
+        assert_eq!(p.o.project.pages[0].graphics[i], circle(100.0, 5.0).moved_y(60.0));
+        assert_eq!(p.ctx.memory(|m| m.focused()), Some(radius));
+        let mark = p.o.undo_mark();
+        // The radius changes elsewhere while its field has the focus, then the field is left
+        // untouched: the change stays, with no step of its own.
+        p.o.project.pages[0].graphics[i] = circle(100.0, 9.0).moved_y(60.0);
+        p.frame(Vec::new());
+        p.key(egui::Key::Tab);
+        p.frame(Vec::new());
+        assert_eq!(p.o.project.pages[0].graphics[i], circle(100.0, 9.0).moved_y(60.0));
+        assert_eq!(p.o.undo_mark(), mark);
+        Ok(())
+    }
+
+    #[test]
+    fn a_radius_dragged_as_another_field_commits_is_one_step_of_its_own() -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let radius = {
+            let mut p = ShapePanel::new(&[circle(100.0, 5.0)]);
+            p.tab(n);
+            p.ctx.memory(|m| m.focused()).ok_or("the radius field has the focus")?
+        };
+        let mut p = ShapePanel::new(&[circle(100.0, 5.0)]);
+        let rect = p.ctx.read_response(radius).ok_or("the radius field is shown")?.rect;
+        p.tab(n - 1);
+        let y = p.ctx.memory(|m| m.focused()).ok_or("Centre Y has the focus")?;
+        p.typed("60");
+        let mark = p.o.undo_mark();
+        let at = rect.center();
+        let pointer = |x: f32, pressed: Option<bool>| {
+            let mut ev = vec![egui::Event::PointerMoved(egui::pos2(at.x + x, at.y))];
+            if let Some(pressed) = pressed {
+                ev.push(egui::Event::PointerButton {
+                    pos: egui::pos2(at.x + x, at.y),
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                });
+            }
+            ev
+        };
+        // Pressing on the radius ends Centre Y ("60"); as the radius is dragged, Centre Y
+        // takes the focus (from the keyboard) and ends again.
+        p.frame(pointer(0.0, Some(true)));
+        p.frame(pointer(20.0, None));
+        p.frame_with(|ctx| ctx.memory_mut(|m| m.request_focus(y)));
+        p.frame(pointer(30.0, None));
+        p.frame_with(|ctx| ctx.memory_mut(|m| m.surrender_focus(y)));
+        p.frame(pointer(40.0, None));
+        p.frame(pointer(40.0, Some(false)));
+        p.frame(Vec::new());
+        let i = p.at[0];
+        let Shape::Circle { center, radius: r, .. } = p.o.project.pages[0].graphics[i] else {
+            return Err("still a circle".into());
+        };
+        assert_eq!(center.y, 60.0);
+        assert!(r > 5.0, "dragged: {r}");
+        // One step for Centre Y, one for the whole drag.
+        p.o.undo();
+        let Shape::Circle { center, radius: r, .. } = p.o.project.pages[0].graphics[i] else {
+            return Err("still a circle".into());
+        };
+        assert_eq!((center.y, r), (60.0, 5.0), "the drag is undone in one step");
+        p.o.undo();
+        assert_eq!(p.o.undo_mark(), mark);
+        Ok(())
+    }
+
+    #[test]
+    fn a_good_value_ended_with_a_refused_one_is_kept() -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let radius = {
+            let mut p = ShapePanel::new(&[circle(100.0, 5.0)]);
+            p.tab(n);
+            p.ctx.memory(|m| m.focused()).ok_or("the radius field has the focus")?
+        };
+        let mut p = ShapePanel::new(&[circle(100.0, 5.0)]);
+        let rect = p.ctx.read_response(radius).ok_or("the radius field is shown")?.rect;
+        let y = {
+            p.tab(n - 1);
+            let y = p.ctx.memory(|m| m.focused()).ok_or("Centre Y has the focus")?;
+            p.key(egui::Key::Escape);
+            p.frame(Vec::new());
+            y
+        };
+        let at = rect.center();
+        let pointer = |x: f32, pressed: Option<bool>| {
+            let mut ev = vec![egui::Event::PointerMoved(egui::pos2(at.x + x, at.y))];
+            if let Some(pressed) = pressed {
+                ev.push(egui::Event::PointerButton {
+                    pos: egui::pos2(at.x + x, at.y),
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                });
+            }
+            ev
+        };
+        // The radius is dragged below nothing while Centre Y is typed in; both end in one frame.
+        p.frame(pointer(0.0, Some(true)));
+        p.frame(pointer(-20.0, None));
+        p.frame_with(|ctx| ctx.memory_mut(|m| m.request_focus(y)));
+        p.typed("60");
+        p.frame(pointer(-90.0, None));
+        p.frame_events_with(pointer(-90.0, Some(false)), |ctx| {
+            ctx.memory_mut(|m| m.surrender_focus(y))
+        });
+        p.frame(Vec::new());
+        let i = p.at[0];
+        assert_eq!(
+            p.o.project.pages[0].graphics[i],
+            circle(100.0, 5.0).moved_y(60.0),
+            "Centre Y is kept"
+        );
+        assert!(p.ps.shape_error.is_some(), "the radius's refusal is shown");
+        assert_eq!(p.ps.shape_refused.keys().copied().collect::<Vec<_>>(), [2]);
+        Ok(())
+    }
+
+    fn arc(radius: f64, start: f64, end: f64) -> Shape {
+        Shape::Arc {
+            center: wc_core::geom::Point::new(100.0, 50.0),
+            radius,
+            start,
+            end,
+        }
+    }
+
+    #[test]
+    fn each_refused_field_keeps_its_reason_until_it_is_entered_again() -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let mut p = ShapePanel::new(&[arc(5.0, 0.0, 90.0)]);
+        // Radius 0, then an end angle at the start angle: both refused.
+        p.tab(n);
+        p.typed("0");
+        p.key(egui::Key::Enter);
+        p.tab(n + 2);
+        p.typed("0");
+        p.key(egui::Key::Enter);
+        assert_eq!(p.drawing(0), arc(5.0, 0.0, 90.0));
+        assert_eq!(p.ps.shape_refused.keys().copied().collect::<Vec<_>>(), [2, 4]);
+        // The end angle entered again: its reason goes, the radius's stays.
+        p.tab(n + 2);
+        p.typed("90");
+        p.key(egui::Key::Enter);
+        assert_eq!(p.ps.shape_refused.keys().copied().collect::<Vec<_>>(), [2]);
+        assert!(p.ps.shape_error.is_some(), "the radius's refusal is still shown");
+        Ok(())
+    }
+
+    #[test]
+    fn a_value_typed_and_entered_in_one_frame_takes_the_refusal_back() -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let mut p = ShapePanel::new(&[circle(100.0, 5.0)]);
+        p.tab(n);
+        p.typed("0");
+        p.key(egui::Key::Enter);
+        assert!(p.ps.shape_error.is_some());
+        p.tab(n);
+        p.typed_and_entered("4");
+        assert_eq!(p.drawing(0), circle(100.0, 4.0));
+        assert!(p.ps.shape_error.is_none(), "{:?}", p.ps.shape_error);
+        Ok(())
+    }
+
+    #[test]
+    fn a_refused_value_entered_again_too_near_the_stored_one_to_change_it_is_still_refused()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let mut p = ShapePanel::new(&[circle(100.0, 0.00005)]);
+        p.tab(n);
+        p.typed("-1");
+        p.key(egui::Key::Enter);
+        assert!(p.ps.shape_error.is_some());
+        let mark = p.o.undo_mark();
+        // 0 is within reach of the stored 0.00005, so nothing is set, but it is no radius.
+        p.tab(n);
+        p.typed("0");
+        p.key(egui::Key::Enter);
+        assert!(p.ps.shape_error.is_some(), "0 is no radius: the refusal stays");
+        assert_eq!(p.drawing(0), circle(100.0, 0.00005));
+        assert_eq!(p.o.undo_mark(), mark);
+        Ok(())
+    }
+
+    #[test]
+    fn a_refusal_stays_when_its_field_is_spoiled_or_tabbed_through() -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let mut p = ShapePanel::new(&[circle(100.0, 5.0)]);
+        p.tab(n);
+        p.typed("0");
+        p.key(egui::Key::Enter);
+        assert!(p.ps.shape_error.is_some());
+        let mark = p.o.undo_mark();
+        // Text that is no number.
+        p.tab(n);
+        p.typed("7");
+        p.frame(vec![egui::Event::Text("x".into())]);
+        p.key(egui::Key::Enter);
+        assert!(p.ps.shape_error.is_some(), "spoiled: still shown");
+        // Tabbed through.
+        p.tab(n);
+        p.key(egui::Key::Tab);
+        p.frame(Vec::new());
+        assert!(p.ps.shape_error.is_some(), "tabbed through: still shown");
+        assert_eq!(p.drawing(0), circle(100.0, 5.0));
+        assert_eq!(p.o.undo_mark(), mark);
+        Ok(())
+    }
+
+    #[test]
+    fn a_value_stepped_and_entered_in_one_frame_takes_the_refusal_back() -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let mut p = ShapePanel::new(&[circle(100.0, 5.0)]);
+        p.tab(n);
+        p.typed("0");
+        p.key(egui::Key::Enter);
+        assert!(p.ps.shape_error.is_some());
+        p.tab(n);
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        };
+        p.frame(vec![key(egui::Key::ArrowUp), key(egui::Key::Enter)]);
+        assert_ne!(p.drawing(0), circle(100.0, 5.0), "the arrow key stepped the radius");
+        assert!(p.ps.shape_error.is_none(), "{:?}", p.ps.shape_error);
+        Ok(())
+    }
+
+    #[test]
+    fn a_modified_arrow_key_as_a_field_is_left_is_no_entry() -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let mut p = ShapePanel::new(&[circle(100.0, 7.123456789)]);
+        p.tab(n);
+        p.typed("0");
+        p.key(egui::Key::Enter);
+        assert!(p.ps.shape_error.is_some());
+        p.tab(n);
+        // Ctrl+ArrowUp steps nothing; egui reads the shown 7.123457 back as Enter ends the field.
+        p.frame(vec![
+            egui::Event::Key {
+                key: egui::Key::ArrowUp,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            },
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            },
+        ]);
+        assert!(p.ps.shape_error.is_some(), "no value was entered: still shown");
+        assert_eq!(p.drawing(0), circle(100.0, 7.123456789));
+        Ok(())
+    }
+
+    #[test]
+    fn a_refusal_stays_when_a_field_with_more_decimals_than_shown_is_tabbed_through()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let mut p = ShapePanel::new(&[circle(100.0, 7.123456789)]);
+        p.tab(n);
+        p.typed("0");
+        p.key(egui::Key::Enter);
+        assert!(p.ps.shape_error.is_some());
+        let mark = p.o.undo_mark();
+        // egui reads the shown 7.123457 back as the field loses focus: no text was entered.
+        p.tab(n);
+        p.key(egui::Key::Tab);
+        p.frame(Vec::new());
+        assert!(p.ps.shape_error.is_some(), "tabbed through: still shown");
+        assert_eq!(p.drawing(0), circle(100.0, 7.123456789));
+        assert_eq!(p.o.undo_mark(), mark);
+        Ok(())
+    }
+
+    #[test]
+    fn a_text_being_typed_keeps_its_field_when_a_drawing_is_added_after_it() -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_text()?;
+        let mut p = ShapePanel::new(&[text("a")]);
+        p.tab(n);
+        p.typed("b");
+        p.o.project.pages[0].graphics.push(circle(100.0, 5.0));
+        p.frame(Vec::new());
+        p.key(egui::Key::Enter);
+        assert_eq!(p.drawing(0), text("b"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_text_being_typed_does_not_go_to_a_drawing_moved_into_its_place() -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_text()?;
+        // Two texts alike: the second takes the first's place when it is deleted.
+        let mut p = ShapePanel::new(&[text("a"), text("a")]);
+        p.tab(n);
+        p.typed("b");
+        let i = p.at[0];
+        p.o.project.pages[0].graphics.remove(i);
+        p.frame(Vec::new());
+        p.key(egui::Key::Enter);
+        p.frame(Vec::new());
+        assert_eq!(p.o.project.pages[0].graphics[i], text("a"), "Enter");
+        // Nor through the height field: it writes the text the drawing has.
+        p.tab(n + 1);
+        p.key(egui::Key::ArrowUp);
+        p.key(egui::Key::Tab);
+        p.frame(Vec::new());
+        let Shape::Text { text: now, height, .. } = &p.o.project.pages[0].graphics[i] else {
+            return Err("still a text".into());
+        };
+        assert_eq!(now, "a", "Height");
+        assert!(*height > 3.5, "the height was set: {height}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_refusal_goes_when_a_drawing_of_another_kind_takes_its_place() -> Result<(), Box<dyn std::error::Error>> {
+        let n = tabs_to_radius()?;
+        let mut p = ShapePanel::new(&[circle(100.0, 5.0)]);
+        p.tab(n);
+        p.typed("0");
+        p.key(egui::Key::Enter);
+        assert!(p.ps.shape_error.is_some());
+        // A polyline in the circle's place has no radius: the refusal is not its own.
+        let i = p.at[0];
+        p.o.project.pages[0].graphics[i] = Shape::Polyline {
+            points: vec![
+                wc_core::Point::new(10.0, 10.0),
+                wc_core::Point::new(20.0, 10.0),
+                wc_core::Point::new(20.0, 20.0),
+            ],
+            closed: false,
+            filled: false,
+        };
+        p.frame(Vec::new());
+        assert_eq!(p.ps.shape_error, None);
+        assert!(p.ps.shape_refused.is_empty());
+        Ok(())
+    }
+
+    trait MovedY {
+        fn moved_y(self, y: f64) -> Shape;
+    }
+
+    impl MovedY for Shape {
+        fn moved_y(mut self, y: f64) -> Shape {
+            if let Shape::Circle { center, .. } = &mut self {
+                center.y = y;
+            }
+            self
+        }
+    }
+
+    #[test]
+    fn a_dimension_shows_the_points_it_measures_not_its_bounds() {
+        let d = Shape::Dimension {
+            a: wc_core::Point::new(10.0, 20.0),
+            b: wc_core::Point::new(40.0, 60.0),
+            offset: 100.0,
+            height: 2.5,
+        };
+        assert_eq!(
+            drawing_rows(&d),
+            vec![
+                ("Length", "50 mm".to_string()),
+                ("From", "10.0, 20.0 mm".to_string()),
+                ("To", "40.0, 60.0 mm".to_string()),
+            ]
+        );
+        let line = Shape::Line {
+            a: wc_core::Point::new(5.0, 1.0),
+            b: wc_core::Point::new(2.0, 3.0),
+        };
+        assert_eq!(
+            drawing_rows(&line),
+            vec![("From", "2.0, 1.0 mm".to_string()), ("To", "5.0, 3.0 mm".to_string())]
+        );
     }
 }

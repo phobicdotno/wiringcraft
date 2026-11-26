@@ -23,6 +23,10 @@ pub enum Icon {
     Circle,
     Arc,
     Polyline,
+    Dimension,
+    Cloud,
+    RevisionTable,
+    BlackBox,
     Copy,
     Cut,
     Paste,
@@ -37,6 +41,7 @@ pub enum Icon {
     ZoomOut,
     ZoomFit,
     Grid,
+    Layers,
     Library,
     Update,
     Pdf,
@@ -237,6 +242,69 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32, accent: Color32) {
                 p.circle_filled(at(x, y), 1.5 * s, accent);
             }
         }
+        Icon::Dimension => {
+            // Two extension lines, the dimension line between them with arrow heads.
+            p.line_segment([at(4.0, 6.0), at(4.0, 20.0)], thin);
+            p.line_segment([at(20.0, 6.0), at(20.0, 20.0)], thin);
+            line((5.0, 12.0), (19.0, 12.0));
+            for tip in [
+                [(4.5, 12.0), (9.0, 9.5), (9.0, 14.5)],
+                [(19.5, 12.0), (15.0, 9.5), (15.0, 14.5)],
+            ] {
+                p.add(Shape::convex_polygon(
+                    tip.iter().map(|&(x, y)| at(x, y)).collect(),
+                    accent,
+                    Stroke::NONE,
+                ));
+            }
+        }
+        Icon::Cloud => {
+            // Scallops round a rectangle, and the revision triangle on top.
+            for (x, y) in [
+                (6.0, 9.0),
+                (12.0, 9.0),
+                (18.0, 9.0),
+                (6.0, 19.0),
+                (12.0, 19.0),
+                (18.0, 19.0),
+            ] {
+                arc(
+                    x,
+                    y,
+                    3.0,
+                    if y < 12.0 { 180.0 } else { 0.0 },
+                    if y < 12.0 { 360.0 } else { 180.0 },
+                );
+            }
+            arc(3.0, 14.0, 5.0, 90.0, 270.0);
+            arc(21.0, 14.0, 5.0, 270.0, 450.0);
+            poly(&[(12.0, 1.0), (8.5, 6.0), (15.5, 6.0)], true);
+        }
+        Icon::RevisionTable => {
+            p.rect_stroke(
+                Rect::from_min_max(at(3.0, 5.0), at(21.0, 19.0)),
+                0.0,
+                st,
+                eframe::egui::StrokeKind::Inside,
+            );
+            for y in [9.5, 14.0] {
+                p.line_segment([at(3.0, y), at(21.0, y)], thin);
+            }
+            p.line_segment([at(8.0, 5.0), at(8.0, 19.0)], thin);
+        }
+        Icon::BlackBox => {
+            // A box with connection points sticking out of its sides.
+            p.rect_stroke(
+                Rect::from_min_max(at(6.0, 5.0), at(18.0, 19.0)),
+                0.0,
+                st,
+                eframe::egui::StrokeKind::Inside,
+            );
+            for y in [9.0, 15.0] {
+                aline((2.0, y), (6.0, y));
+                aline((18.0, y), (22.0, y));
+            }
+        }
         Icon::Mirror => {
             p.line_segment([at(12.0, 2.0), at(12.0, 22.0)], thin);
             poly(&[(9.5, 5.0), (3.0, 18.0), (9.5, 18.0)], true);
@@ -362,6 +430,14 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, c: Color32, accent: Color32) {
                     p.circle_filled(at(4.5 + i as f32 * 5.0, 4.5 + j as f32 * 5.0), 1.1 * s, c);
                 }
             }
+        }
+        Icon::Layers => {
+            // Three sheets stacked; the top one picked out.
+            poly(&[(3.0, 15.0), (12.0, 19.5), (21.0, 15.0)], false);
+            poly(&[(3.0, 11.5), (12.0, 16.0), (21.0, 11.5)], false);
+            let top = [(12.0, 3.5), (21.0, 8.0), (12.0, 12.5), (3.0, 8.0)];
+            let v: Vec<Pos2> = top.iter().map(|(x, y)| at(*x, *y)).collect();
+            p.add(Shape::closed_line(v, ast));
         }
         Icon::Library => {
             p.rect_stroke(

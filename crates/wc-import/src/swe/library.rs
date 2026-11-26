@@ -11,7 +11,9 @@
 //! column pointing at another table's row is `<prefix>_<other prefix>_id` (`wir_cab_id`,
 //! `caw_cab_id` in the project database). The prefixes of these library tables are not fixed
 //! here: each table's prefix is the one most of its columns share, and fields are found by their
-//! name after the prefix (`reference`, `manufacturer`, `txt`, ...). A table without the fields
+//! name after the prefix (`reference`, `manufacturer`, `txt`, ...). Archives from other installations
+//! mix prefixes in one table (#293), so a field without the table's prefix is taken from the one
+//! column that has it under another prefix. A table without the fields
 //! this needs is skipped with a warning, so one odd table never stops the rest.
 //!
 //! Parts become WiringCraft parts (`<manufacturer>.<reference>` ids, as [`Part::make_id`]
@@ -152,31 +154,125 @@ impl Table {
     }
 
     /// The column for the first of `fields` the table has (case-insensitive).
+    ///
+    /// The table's own `<prefix>_<field>` (or a bare `<field>`) comes first. Archives from other
+    /// installations mix prefixes within one table (#293): when no field has the table's prefix,
+    /// a column `<other prefix>_<field>` is taken, but only when exactly one column has that
+    /// field, so a guess between two candidates is never made.
     fn field(&self, fields: &[&str]) -> Option<&str> {
-        fields.iter().find_map(|f| {
-            let want = format!("{}_{f}", self.prefix);
-            self.columns
-                .iter()
-                .find(|c| c.eq_ignore_ascii_case(&want))
-                .map(String::as_str)
-        })
+        fields
+            .iter()
+            .find_map(|f| self.own_field(f))
+            .or_else(|| fields.iter().find_map(|f| self.other_prefix_field(f)))
     }
 
-    /// The column pointing at a row of `other`: `<prefix>_<other prefix>_id`.
+    /// `<prefix>_<field>` or a bare `<field>`.
+    fn own_field(&self, field: &str) -> Option<&str> {
+        let want = format!("{}_{field}", self.prefix);
+        self.columns
+            .iter()
+            .find(|c| c.eq_ignore_ascii_case(&want))
+            .or_else(|| self.columns.iter().find(|c| c.eq_ignore_ascii_case(field)))
+            .map(String::as_str)
+    }
+
+    /// The one column named `<any prefix>_<field>`; `None` when none or several are.
+    fn other_prefix_field(&self, field: &str) -> Option<&str> {
+        self.other_prefix_field_except(field, None)
+    }
+
+    /// Like [`Table::other_prefix_field`], leaving the column `except` out.
+    fn other_prefix_field_except(&self, field: &str, except: Option<&str>) -> Option<&str> {
+        let mut found = self.columns.iter().map(String::as_str).filter(|c| {
+            Some(*c) != except
+                && c.split_once('_')
+                    .is_some_and(|(_, rest)| rest.eq_ignore_ascii_case(field))
+        });
+        let first = found.next()?;
+        found.next().is_none().then_some(first)
+    }
+
+    /// The column pointing at a row of `other`: `<prefix>_<other prefix>_id`. The other prefix
+    /// is the one the other table's id column carries, then the other table's own when that
+    /// differs.
+    ///
+    /// The table's own id is never taken for a link: when both tables share a prefix, the bare
+    /// `<other prefix>_id` would be it. Its own `<prefix>_id` (or bare `id`) is always left out.
+    /// An id found only under another prefix may as well be a bare foreign key (`ele_id` in a
+    /// terminal table), so it is left out only while another candidate is there to take.
     fn link(&self, other: &Table) -> Option<&str> {
-        self.field(&[&format!("{}_id", other.prefix)])
+        self.link_from(other, None)
     }
 
-    /// The column for `fields`, or an error naming what is missing.
+    /// Like [`Table::link`] for a table whose own id column the caller knows (`id`): that
+    /// column is never the link, even as the only candidate.
+    fn link_from(&self, other: &Table, id: Option<&str>) -> Option<&str> {
+        let mut prefixes = Vec::new();
+        if let Some((p, _)) = other.field(&["id"]).and_then(|c| c.split_once('_')) {
+            prefixes.push(p);
+        }
+        if !prefixes.iter().any(|q| q.eq_ignore_ascii_case(&other.prefix)) {
+            prefixes.push(other.prefix.as_str());
+        }
+        // A table's prefix taken from its `<p>_id` column alone (`ele_id, no, txt`) is not its
+        // own: that column is a bare foreign key there, not the table's id.
+        let own_id = self.own_field("id").filter(|c| !self.prefix_only_from(c));
+        let maybe_own_id = self.field(&["id"]);
+        let mut candidates: Vec<&str> = Vec::new();
+        for p in &prefixes {
+            let f = format!("{p}_id");
+            for c in [self.own_field(&f), self.other_prefix_field_except(&f, own_id)]
+                .into_iter()
+                .flatten()
+            {
+                if Some(c) != own_id && Some(c) != id && !candidates.contains(&c) {
+                    candidates.push(c);
+                }
+            }
+        }
+        candidates
+            .iter()
+            .find(|c| Some(**c) != maybe_own_id)
+            .or_else(|| candidates.first())
+            .copied()
+    }
+
+    /// Whether `column` is `<prefix>_...` and the only column with the table's prefix, so the
+    /// prefix came from it alone.
+    fn prefix_only_from(&self, column: &str) -> bool {
+        let has_prefix = |c: &str| {
+            c.split_once('_')
+                .is_some_and(|(p, _)| p.eq_ignore_ascii_case(&self.prefix))
+        };
+        has_prefix(column) && self.columns.iter().filter(|c| has_prefix(c)).count() == 1
+    }
+
+    /// The column for `fields`, or an error naming what is missing and the columns there are,
+    /// so a report from an unknown layout says what to map.
     fn need(&self, fields: &[&str]) -> std::result::Result<&str, String> {
         self.field(fields).ok_or_else(|| {
-            format!(
-                "{} has no {}_{} column",
-                self.name,
+            self.missing(&format!(
+                "{}_{}",
                 self.prefix,
                 fields.first().copied().unwrap_or_default()
-            )
+            ))
         })
+    }
+
+    /// That this table has no `column`, with the columns it has (the first 16), so a report
+    /// from an unknown layout says what to map.
+    fn missing(&self, column: &str) -> String {
+        const SHOWN: usize = 16;
+        let mut columns = self.columns.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
+        if self.columns.len() > SHOWN {
+            columns.push_str(&format!(", ... ({} in all)", self.columns.len()));
+        }
+        format!("{} has no {column} column (its columns: {columns})", self.name)
+    }
+
+    /// That this table has no column linking it to `other`, as [`Table::missing`].
+    fn missing_link(&self, other: &Table) -> String {
+        self.missing(&format!("{}_{}_id", self.prefix, other.prefix))
     }
 }
 
@@ -283,6 +379,9 @@ pub fn read_catalog(conn: &Connection, report: &mut LibraryReport, warnings: &mu
                 description,
                 symbol: None,
                 properties,
+                contacts: None,
+                footprint: None,
+                model: None,
             },
         );
     }
@@ -319,12 +418,12 @@ fn catalog_terminals(
     let found = (|| -> std::result::Result<_, String> {
         let el_id = elements.need(&["id"])?.to_owned();
         let el_ref = elements
-            .link(refs)
-            .ok_or_else(|| format!("tew_catelement has no {}_{}_id column", elements.prefix, refs.prefix))?
+            .link_from(refs, Some(&el_id))
+            .ok_or_else(|| elements.missing_link(refs))?
             .to_owned();
         let t_el = terms
             .link(&elements)
-            .ok_or_else(|| format!("tew_catterminal has no {}_{}_id column", terms.prefix, elements.prefix))?
+            .ok_or_else(|| terms.missing_link(&elements))?
             .to_owned();
         let t_mark = terms.need(&["txt", "name", "label", "tag", "mark"])?.to_owned();
         Ok((el_id, el_ref, t_el, t_mark))
@@ -460,8 +559,8 @@ pub fn read_cable_types(
         None => warnings.push("no tew_cablereferencewire table; cable types come without cores".into()),
         Some(wires) => match wires.link(&cables) {
             None => warnings.push(format!(
-                "cable types come without cores: tew_cablereferencewire has no {}_{}_id column",
-                wires.prefix, cables.prefix
+                "cable types come without cores: {}",
+                wires.missing_link(&cables)
             )),
             Some(link) => {
                 let no = wires.field(&["no", "number", "orderno"]);
@@ -544,6 +643,9 @@ pub fn read_cable_types(
                 },
                 symbol: None,
                 properties,
+                contacts: None,
+                footprint: None,
+                model: None,
             },
         );
     }
@@ -565,6 +667,35 @@ pub fn read_blocks(
     report: &mut LibraryReport,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<Symbol>> {
+    Ok(read_named_blocks(conn, drawings, report, warnings)?
+        .into_iter()
+        .map(|(_, s)| s)
+        .collect())
+}
+
+/// What names a SolidWorks Electrical block in [`wc_core::Symbol::source`]: its GUID when it
+/// has one, else its path in the library, else its name as the source spells it.
+fn block_identity(name: &str, guid: &str, path: &str) -> String {
+    let (kind, value) = [("guid", guid), ("path", path), ("name", name)]
+        .into_iter()
+        .find(|(_, v)| !v.trim().is_empty())
+        .unwrap_or(("name", name));
+    let value = if kind == "guid" {
+        value.trim().trim_matches(['{', '}']).to_ascii_lowercase()
+    } else {
+        value.trim().to_owned()
+    };
+    format!("solidworks-electrical:block:{kind}:{value}")
+}
+
+/// [`read_blocks`], each symbol with its block's name as the source has it (an empty name gets
+/// another symbol name), which is the name its drawing is found under.
+fn read_named_blocks(
+    conn: &Connection,
+    drawings: Option<&SweDrawings>,
+    report: &mut LibraryReport,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<(String, Symbol)>> {
     // The counts are for this call's result, also when the report was used before.
     (report.blocks_in, report.blocks_out, report.blocks_drawn) = (0, 0, 0);
     let Some(blocks) = Table::open(conn, "tew_block")? else {
@@ -580,7 +711,7 @@ pub fn read_blocks(
         let name = blocks.need(&["name", "blockname"])?.to_owned();
         let link = points
             .link(&blocks)
-            .ok_or_else(|| format!("tew_blockpt has no {}_{}_id column", points.prefix, blocks.prefix))?
+            .ok_or_else(|| points.missing_link(&blocks))?
             .to_owned();
         let x = points.need(&["dx", "x", "posx"])?.to_owned();
         let y = points.need(&["dy", "y", "posy"])?.to_owned();
@@ -597,8 +728,12 @@ pub fn read_blocks(
         .field(&["description", "label"])
         .map(text)
         .unwrap_or_else(|| "''".into());
+    // What names a block across catalogs (#301): its GUID, else its path in the library, else
+    // its name as the source spells it.
+    let guid = blocks.field(&["guid", "uuid"]).map(text).unwrap_or_else(|| "''".into());
+    let path = blocks.field(&["path"]).map(text).unwrap_or_else(|| "''".into());
     let q = format!(
-        "SELECT {}, {}, {description} FROM tew_block ORDER BY {}",
+        "SELECT {}, {}, {description}, {guid}, {path} FROM tew_block ORDER BY {}",
         quoted(&id),
         text(&name),
         quoted(&id)
@@ -606,13 +741,33 @@ pub fn read_blocks(
     let mut st = conn.prepare(&q).map_err(sql)?;
     let rows = st
         .query_map([], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+            ))
         })
         .map_err(sql)?;
     // Every row the source has counts, also one that cannot be read.
     let rows: Vec<rusqlite::Result<_>> = rows.collect();
     report.blocks_in = rows.len();
-    let rows = readable(rows.into_iter(), "symbol block", warnings);
+    let mut rows: Vec<(i64, String, String, String)> = readable(rows.into_iter(), "symbol block", warnings)
+        .into_iter()
+        .map(|(row, name, description, guid, path)| {
+            let identity = block_identity(&name, &guid, &path);
+            (row, name, description, identity)
+        })
+        .collect();
+    // Blocks whose names clean up alike are numbered in the order of what names them, not of
+    // their rows, so another catalog with the same blocks in another order gives each block
+    // the same id.
+    rows.sort_by(|a, b| (&a.3, a.0).cmp(&(&b.3, b.0)));
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    for r in &rows {
+        *seen.entry(r.3.clone()).or_default() += 1;
+    }
 
     let no = points.field(&["no", "orderno"]);
     let pin_name = points.field(&["txt", "name", "label", "tag"]);
@@ -662,7 +817,7 @@ pub fn read_blocks(
         ));
     }
 
-    let mut by_id: BTreeMap<String, Symbol> = BTreeMap::new();
+    let mut by_id: BTreeMap<String, (String, Symbol)> = BTreeMap::new();
     let mut skipped = 0usize;
     // One entity budget for every block drawing, like the project import's.
     let mut budget = drawings.map_or(0, SweDrawings::draw_limit);
@@ -670,7 +825,7 @@ pub fn read_blocks(
     // Blocks boxed, and blocks drawn only in part, because that budget ran out.
     let (mut over_budget, mut cut_short) = (0usize, 0usize);
     let mut drawn_blocks = 0usize;
-    for (row, name, description) in rows {
+    for (row, name, description, identity) in rows {
         let Some(points) = pts.remove(&row).filter(|p| !p.is_empty()) else {
             skipped += 1;
             continue;
@@ -699,23 +854,34 @@ pub fn read_blocks(
                 boxed
             }
         };
+        let source = name.clone();
+        // Two blocks named the same way cannot be told apart by a later import.
+        let identity = if seen.get(&identity).copied().unwrap_or(0) > 1 {
+            format!("{}{identity}", wc_core::symbol::AMBIGUOUS_SOURCE)
+        } else {
+            identity
+        };
         by_id.insert(
             sid.clone(),
-            Symbol {
-                id: sid,
-                name: if name.is_empty() {
-                    "SolidWorks Electrical block".into()
-                } else {
-                    name
+            (
+                source,
+                Symbol {
+                    source: identity,
+                    id: sid,
+                    name: if name.is_empty() {
+                        "SolidWorks Electrical block".into()
+                    } else {
+                        name
+                    },
+                    category: "SolidWorks Electrical library".to_owned(),
+                    letter_code: String::new(),
+                    role: Default::default(),
+                    graphics,
+                    pins,
+                    tag_at: Point::new(0.0, -super::MARGIN - 1.0),
+                    description,
                 },
-                category: "SolidWorks Electrical library".to_owned(),
-                letter_code: String::new(),
-                role: Default::default(),
-                graphics,
-                pins,
-                tag_at: Point::new(0.0, -super::MARGIN - 1.0),
-                description,
-            },
+            ),
         );
     }
     if skipped > 0 {
@@ -847,6 +1013,27 @@ fn read_warnings(d: &SweDrawings) -> Vec<String> {
 }
 
 fn from_archive_with<R: Read + std::io::Seek>(reader: R, draw: bool) -> Result<SweLibrary> {
+    from_archive_within(reader, draw, super::drawings::Limits::ARCHIVE)
+}
+
+/// The block names (trimmed, lower case, as [`super::drawings::block_key`] keys them) of the
+/// blocks [`read_blocks`] imports (those with connection points), each with how many share it.
+/// Only their drawings are read.
+fn importable_blocks(app_data: &Connection) -> Result<BTreeMap<String, usize>> {
+    let (mut report, mut warnings) = (LibraryReport::default(), Vec::new());
+    let mut keys: BTreeMap<String, usize> = BTreeMap::new();
+    for (name, _) in read_named_blocks(app_data, None, &mut report, &mut warnings)? {
+        *keys.entry(super::drawings::block_key(&name)).or_default() += 1;
+    }
+    Ok(keys)
+}
+
+/// [`from_archive_with`] with byte limits `lim` on the block drawings read.
+fn from_archive_within<R: Read + std::io::Seek>(
+    reader: R,
+    draw: bool,
+    lim: super::drawings::Limits,
+) -> Result<SweLibrary> {
     let mut zip =
         zip::ZipArchive::new(reader).map_err(|e| Error::Format(format!("not a SolidWorks Electrical archive: {e}")))?;
     let catalog = find_entry(&zip, CATALOG_DB);
@@ -866,14 +1053,15 @@ fn from_archive_with<R: Read + std::io::Seek>(reader: R, draw: bool) -> Result<S
     };
     // Block drawings only matter when there are blocks to draw.
     let mut drawing_warnings = Vec::new();
-    let drawings = if draw && app_data.is_some() {
+    let drawings = if draw && let Some(app) = app_data.as_ref() {
+        let blocks = importable_blocks(app)?;
         let mut reader = zip.into_inner();
         // No project folder: only the shared library's block files are read. A rewind that
         // fails leaves the blocks boxes, like a drawing read that fails.
         let read = reader
             .seek(std::io::SeekFrom::Start(0))
             .map_err(|e| Error::Format(format!("archive: {e}")))
-            .and_then(|_| super::drawings_from_archive(reader, ""));
+            .and_then(|_| super::drawings::block_drawings_within(reader, &blocks, lim));
         match read {
             Ok(d) => {
                 drawing_warnings = read_warnings(&d);

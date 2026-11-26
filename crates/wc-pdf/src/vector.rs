@@ -288,7 +288,7 @@ pub fn svg(page: &PageDrawing) -> String {
                     format!("stroke=\"{}\" stroke-width=\"{}\"", rgb(ink), num(ink.width))
                 };
                 let sweep = end - start;
-                if sweep >= 359.999 {
+                if sweep.abs() >= 359.999 {
                     let _ = writeln!(
                         out,
                         "<circle cx=\"{}\" cy=\"{}\" r=\"{}\" {paint}/>",
@@ -297,10 +297,13 @@ pub fn svg(page: &PageDrawing) -> String {
                         num(*radius)
                     );
                 } else {
-                    // Page angles run clockwise with y down, which is SVG's positive sweep.
-                    let a = on_circle(*center, *radius, *start);
-                    let b = on_circle(*center, *radius, *end);
-                    let large = u8::from(sweep > 180.0);
+                    // Page angles run clockwise with y down, which is SVG's positive sweep. A
+                    // negative sweep (an arc stored past a full turn) is the same path drawn
+                    // from its end.
+                    let (from, to) = if sweep < 0.0 { (end, start) } else { (start, end) };
+                    let a = on_circle(*center, *radius, *from);
+                    let b = on_circle(*center, *radius, *to);
+                    let large = u8::from(sweep.abs() > 180.0);
                     let _ = writeln!(
                         out,
                         "<path d=\"M{} {} A{r} {r} 0 {large} 1 {} {}\" {paint}/>",
@@ -449,7 +452,8 @@ pub fn dxf(page: &PageDrawing) -> String {
                 ..
             } => {
                 let colour = aci(ink).to_string();
-                if end - start >= 359.999 {
+                let full = (end - start).abs() >= 359.999;
+                if full {
                     pair(0, "CIRCLE");
                 } else {
                     pair(0, "ARC");
@@ -459,11 +463,13 @@ pub fn dxf(page: &PageDrawing) -> String {
                 pair(10, &num(center.0));
                 pair(20, &num(y(center.1)));
                 pair(40, &num(*radius));
-                if end - start < 359.999 {
+                if !full {
                     // Clockwise on a y-down page is counter-clockwise with y up, mirrored: the
-                    // DXF arc runs from -end to -start.
-                    pair(50, &num((-end).rem_euclid(360.0)));
-                    pair(51, &num((-start).rem_euclid(360.0)));
+                    // DXF arc runs from -end to -start (from -start to -end for a negative
+                    // sweep, drawn the other way round).
+                    let (from, to) = if end < start { (end, start) } else { (start, end) };
+                    pair(50, &num((-to).rem_euclid(360.0)));
+                    pair(51, &num((-from).rem_euclid(360.0)));
                 }
             }
             Prim::Text {

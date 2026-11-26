@@ -30,9 +30,12 @@ const MENUS: &[(&str, &[Option<Action>])] = &[
             Some(Action::SaveAs),
             None,
             Some(Action::ProjectProps),
+            Some(Action::Translations),
             None,
             Some(Action::Check),
+            Some(Action::LiveCheck),
             Some(Action::Reports),
+            Some(Action::PlcRacks),
             Some(Action::ExportPdf),
             Some(Action::ExportDrawings),
             Some(Action::ExportAml),
@@ -71,6 +74,7 @@ const MENUS: &[(&str, &[Option<Action>])] = &[
             Some(Action::Delete),
             None,
             Some(Action::NumberWires),
+            Some(Action::TerminalStrips),
         ],
     ),
     (
@@ -112,6 +116,7 @@ const MENUS: &[(&str, &[Option<Action>])] = &[
             Some(Action::ZoomFit),
             None,
             Some(Action::ToggleGrid),
+            Some(Action::Layers),
             Some(Action::ToggleChrome),
             Some(Action::ToggleTheme),
             None,
@@ -222,9 +227,6 @@ fn icon_button_rect(
     let info = a.info();
     let enabled = status.enabled(a);
     let sense = if enabled { Sense::click() } else { Sense::hover() };
-    // Whether the button had keyboard focus as the frame's keys were handed out: a press
-    // elsewhere later in the same frame may take it away, after Enter already counted.
-    let had_focus = id.is_some_and(|id| ui.memory(|m| m.has_focus(id)));
     let (rect, resp) = match id {
         Some(id) => {
             let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
@@ -267,7 +269,7 @@ fn icon_button_rect(
     // keeps egui's own rule. Where the release that made the click happened counts (the frame's
     // first: egui clicks on it), not where the pointer went after it in the same frame. Enter or
     // Space on the focused button is no pointer click, and counts wherever the pointer is.
-    let (released_off, keyed) = ui.input(|i| {
+    let released_off = ui.input(|i| {
         let release = i.events.iter().find_map(|e| match e {
             egui::Event::PointerButton {
                 pos,
@@ -277,12 +279,12 @@ fn icon_button_rect(
             } => Some(*pos),
             _ => None,
         });
-        (
-            id.is_some() && release.is_some_and(|p| !rect.contains(p)),
-            i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space),
-        )
+        id.is_some() && release.is_some_and(|p| !rect.contains(p))
     });
-    let keyed = keyed && (had_focus || resp.has_focus());
+    // A key counts only when it activated this button (egui's own keyboard click, which it
+    // gives the button focused as the keys are handed out): focus that a Tab in the same frame
+    // took elsewhere does not make a pointer release off the button count.
+    let keyed = resp.clicked() && !resp.clicked_by(egui::PointerButton::Primary);
     (resp.on_hover_text(tip).clicked() && (keyed || !released_off), rect)
 }
 
@@ -587,6 +589,18 @@ mod tests {
         (rects, out)
     }
 
+    /// The Start tab's buttons, in the order the ribbon lays them out.
+    fn start_order() -> Vec<Action> {
+        RIBBON[0].1.iter().flat_map(|(_, a)| a.iter().copied()).collect()
+    }
+
+    /// Where Undo is among the Start tab's buttons.
+    fn undo_index() -> usize {
+        let at = start_order().iter().position(|a| *a == Action::Undo);
+        assert!(at.is_some(), "the Start tab has no Undo");
+        at.unwrap_or_default()
+    }
+
     /// One frame of the ribbon in a window `width` points wide, as the app lays it out; returns
     /// the icon rectangles and adds the commands clicked to `out`.
     fn ribbon_frame(
@@ -617,77 +631,84 @@ mod tests {
         ribbon_frames(tab, &[(width, Vec::new())]).0
     }
 
-    /// Two window widths 10 points apart where the Start tab's groups wrap differently, so
-    /// Undo sits elsewhere in the wider one. Found rather than fixed, so a new button on the
-    /// tab does not break the tests that need such a pair.
+    /// The button at the other width where Undo is at `from`, if another one is there.
+    fn other_where_undo_was(from: f32, to: f32) -> Option<Action> {
+        let at = ribbon_icons(0, from).get(undo_index())?.center();
+        let there = ribbon_icons(0, to).iter().position(|r| r.contains(at))?;
+        start_order().get(there).copied().filter(|a| *a != Action::Undo)
+    }
+
+    /// The first window width in `widths` (stepped by 10 points) where widening by 10 points
+    /// puts another button where Undo was. Found rather than fixed, so a new button on the
+    /// Start tab does not break the tests that need such a pair.
+    fn undo_moving_width(widths: std::ops::Range<u32>) -> Option<f32> {
+        widths
+            .step_by(10)
+            .map(|w| w as f32)
+            .find(|w| other_where_undo_was(*w, w + 10.0).is_some())
+    }
+
+    /// Two window widths 10 points apart, the window's usual size or wider, where Undo sits
+    /// elsewhere in the wider one.
     fn undo_moving_widths() -> (f32, f32) {
-        let start = RIBBON[0].1;
-        let order: Vec<Action> = start.iter().flat_map(|(_, a)| a.iter().copied()).collect();
-        let undo = order.iter().position(|a| *a == Action::Undo).unwrap_or(usize::MAX);
-        (100..250)
-            .map(|k| k as f32 * 10.0)
-            .find(|w| {
-                let before = ribbon_icons(0, *w).get(undo).map(|r| r.center());
-                let after = ribbon_icons(0, w + 10.0).get(undo).copied();
-                matches!((before, after), (Some(a), Some(b)) if !b.contains(a))
-            })
-            .map_or((1210.0, 1220.0), |w| (w, w + 10.0))
+        let w = undo_moving_width(1000..2500);
+        assert!(w.is_some(), "no window width moves the Undo button");
+        let w = w.unwrap_or(1210.0);
+        (w, w + 10.0)
     }
 
     #[test]
     fn a_ribbon_press_stays_with_its_button_when_the_groups_move() {
-        let start = RIBBON[0].1;
-        let order: Vec<Action> = start.iter().flat_map(|(_, a)| a.iter().copied()).collect();
-        let undo = order.iter().position(|a| *a == Action::Undo).unwrap_or(usize::MAX);
-        // Two window widths 10 points apart where the groups wrap differently, so that in the
-        // wider window another button sits where Undo was (found, so new buttons do not break
-        // the test).
-        let other_at = |narrow: f32| {
-            let at = ribbon_icons(0, narrow).get(undo)?.center();
-            let moved = ribbon_icons(0, narrow + 10.0);
-            let there = moved.iter().position(|r| r.contains(at)).map(|i| order[i])?;
-            (there != Action::Undo).then_some((narrow, at, there))
-        };
-        let found = (100..250).map(|k| k as f32 * 10.0).find_map(other_at);
-        assert!(found.is_some(), "no width moves the Undo button");
-        let Some((narrow, at, there)) = found else { return };
-        let wide = narrow + 10.0;
-        let there = Some(there);
-        assert!(there.is_some_and(|a| a != Action::Undo), "{there:?} at {at:?}");
-        let button = |pressed| egui::Event::PointerButton {
-            pos: at,
-            button: egui::PointerButton::Primary,
-            pressed,
-            modifiers: egui::Modifiers::NONE,
-        };
-        let (_, out) = ribbon_frames(
-            0,
-            &[
-                (narrow, Vec::new()),
-                (narrow, vec![egui::Event::PointerMoved(at)]),
-                (narrow, vec![button(true)]),
-                (wide, vec![button(false)]),
-            ],
+        let undo = undo_index();
+        let (narrow, wide) = undo_moving_widths();
+        // Below the window's minimum of 900 points the groups wrap onto more rows (#351).
+        let small = (600..890)
+            .step_by(10)
+            .map(|w| w as f32)
+            .find(|w| other_where_undo_was(*w, w + 10.0).is_some() && other_where_undo_was(w + 10.0, *w).is_some());
+        assert!(
+            small.is_some(),
+            "no width below the minimum moves the Undo button both ways"
         );
-        assert!(out.is_empty(), "{out:?}");
-        // Released where it was pressed, the press is a click on Undo.
-        let (_, out) = ribbon_frames(
-            0,
-            &[
-                (narrow, Vec::new()),
-                (narrow, vec![egui::Event::PointerMoved(at)]),
-                (narrow, vec![button(true)]),
-                (narrow, vec![button(false)]),
-            ],
-        );
-        assert_eq!(out, [Action::Undo]);
+        let small = small.unwrap_or(740.0);
+        // Widened and narrowed.
+        for (from, to) in [(narrow, wide), (small, small + 10.0), (small + 10.0, small)] {
+            let at = ribbon_icons(0, from)[undo].center();
+            // At the other width another button sits where Undo was.
+            let there = other_where_undo_was(from, to);
+            assert!(
+                there.is_some_and(|a| a != Action::Undo),
+                "{from} to {to}: {there:?} at {at:?}"
+            );
+            let button = |pressed| egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let press_then_release_at = |width| {
+                ribbon_frames(
+                    0,
+                    &[
+                        (from, Vec::new()),
+                        (from, vec![egui::Event::PointerMoved(at)]),
+                        (from, vec![button(true)]),
+                        (width, vec![button(false)]),
+                    ],
+                )
+                .1
+            };
+            // Released over the button that took its place: a click on neither.
+            let out = press_then_release_at(to);
+            assert!(out.is_empty(), "{from} to {to}: {out:?}");
+            // Released where it was pressed, the press is a click on Undo.
+            assert_eq!(press_then_release_at(from), [Action::Undo], "{from}");
+        }
     }
 
     #[test]
     fn a_ribbon_release_counts_where_it_happened_not_where_the_pointer_went_after() {
-        let start = RIBBON[0].1;
-        let order: Vec<Action> = start.iter().flat_map(|(_, a)| a.iter().copied()).collect();
-        let undo = order.iter().position(|a| *a == Action::Undo).unwrap_or(usize::MAX);
+        let undo = undo_index();
         let (narrow, wide) = undo_moving_widths();
         let at = ribbon_icons(0, narrow)[undo].center();
         let now = ribbon_icons(0, wide)[undo].center();
@@ -719,9 +740,7 @@ mod tests {
         let mut out = Vec::new();
         let _ = ctx.run(egui::RawInput::default(), |_| {});
         let rects = ribbon_frame(&ctx, &mut state, 1210.0, Vec::new(), &mut out);
-        let start = RIBBON[0].1;
-        let order: Vec<Action> = start.iter().flat_map(|(_, a)| a.iter().copied()).collect();
-        let undo = order.iter().position(|a| *a == Action::Undo).unwrap_or(usize::MAX);
+        let undo = undo_index();
         let at = rects[undo].center();
         let off = egui::pos2(at.x, 590.0);
         ctx.memory_mut(|m| m.request_focus(ribbon_id("Edit", Action::Undo)));
@@ -771,10 +790,51 @@ mod tests {
     }
 
     #[test]
+    fn a_tab_and_enter_beside_a_release_off_the_button_do_not_count_as_its_click() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut state = ChromeState { ribbon_tab: 0 };
+        let mut out = Vec::new();
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let (narrow, wide) = undo_moving_widths();
+        let rects = ribbon_frame(&ctx, &mut state, narrow, Vec::new(), &mut out);
+        let at = rects[undo_index()].center();
+        ctx.memory_mut(|m| m.request_focus(ribbon_id("Edit", Action::Undo)));
+        let key = |key, pressed| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        ribbon_frame(&ctx, &mut state, narrow, vec![egui::Event::PointerMoved(at)], &mut out);
+        ribbon_frame(&ctx, &mut state, narrow, vec![button(at, true)], &mut out);
+        // The ribbon widens (Undo moves), and in that frame Tab takes the focus on, Enter is
+        // pressed, and the pointer is let go where Undo was: not Undo's click.
+        ribbon_frame(
+            &ctx,
+            &mut state,
+            wide,
+            vec![
+                key(egui::Key::Tab, true),
+                key(egui::Key::Enter, true),
+                button(at, false),
+            ],
+            &mut out,
+        );
+        ribbon_frame(&ctx, &mut state, wide, vec![key(egui::Key::Enter, false)], &mut out);
+        assert!(!out.contains(&Action::Undo), "{out:?}");
+    }
+
+    #[test]
     fn a_ribbon_click_is_judged_by_the_release_that_made_it() {
-        let start = RIBBON[0].1;
-        let order: Vec<Action> = start.iter().flat_map(|(_, a)| a.iter().copied()).collect();
-        let undo = order.iter().position(|a| *a == Action::Undo).unwrap_or(usize::MAX);
+        let undo = undo_index();
         let (narrow, wide) = undo_moving_widths();
         let at = ribbon_icons(0, narrow)[undo].center();
         let now = ribbon_icons(0, wide)[undo].center();

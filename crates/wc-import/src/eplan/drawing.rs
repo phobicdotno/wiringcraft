@@ -23,6 +23,9 @@ use super::{EplanConnection, EplanFunction, EplanNode, EplanProject, device_tag,
 /// Function categories (Eplan's function definition numbers) this module draws specially.
 pub const KIND_TERMINAL: u16 = 100;
 pub const KIND_BREAKER: u16 = 501;
+/// Fuses: the protective device category next to the circuit breakers (inferred from real
+/// maker macros, where it held fuse holders with one pair of connection points per pole).
+pub const KIND_FUSE: u16 = 502;
 pub const KIND_BUTTON_CONTACT: u16 = 600;
 pub const KIND_LAMP: u16 = 900;
 /// Relay and contactor contacts.
@@ -222,7 +225,8 @@ pub fn symbol_for(f: &EplanFunction) -> Option<Symbol> {
     }
     let mut g = Vec::new();
     let mut pins = Vec::new();
-    let is_coil = n == 2 && names.iter().all(|p| p.to_ascii_uppercase().starts_with('A'));
+    // A fuse's points may be named A1/A2 too; its category says what it is.
+    let is_coil = f.kind != KIND_FUSE && n == 2 && names.iter().all(|p| p.to_ascii_uppercase().starts_with('A'));
     let contacts = KIND_CONTACTS.contains(&f.kind) || f.kind == KIND_BUTTON_CONTACT;
     let (kind, role, tag_at) = if f.kind == KIND_TERMINAL {
         g.push(Shape::Circle {
@@ -320,6 +324,19 @@ pub fn symbol_for(f: &EplanFunction) -> Option<Symbol> {
             pins.push(pin(&names[2 * k + 1], x, LENGTH, PinDir::Down));
         }
         ("switch", SymbolRole::Standalone, Point::new(-10.0, 4.5))
+    } else if f.kind == KIND_FUSE && n.is_multiple_of(2) {
+        // One fuse per pole: a body round the line, a grid step apart.
+        for (k, [top, bottom]) in names.as_chunks::<2>().0.iter().enumerate() {
+            let x = GRID * k as f64;
+            g.push(line(x, 0.0, x, LENGTH));
+            g.push(Shape::Rect {
+                min: Point::new(x - 1.0, 2.0),
+                max: Point::new(x + 1.0, 6.0),
+            });
+            pins.push(pin(top, x, 0.0, PinDir::Up));
+            pins.push(pin(bottom, x, LENGTH, PinDir::Down));
+        }
+        ("fuse", SymbolRole::Standalone, Point::new(-10.0, 4.5))
     } else {
         let w = GRID * (n as f64 - 1.0);
         g.push(Shape::Rect {
@@ -347,6 +364,7 @@ pub fn symbol_for(f: &EplanFunction) -> Option<Symbol> {
     let key: Vec<&str> = pins.iter().map(|p| p.name.as_str()).collect();
     let id = format!("eplan.{kind}.{}", safe(&key.join("-")));
     Some(Symbol {
+        source: String::new(),
         id: if kind == "terminal" {
             format!("eplan.terminal.{}", safe(&f.terminal))
         } else {

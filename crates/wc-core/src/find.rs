@@ -250,8 +250,19 @@ pub fn replace(
     with: &str,
     opts: FindOptions,
 ) -> Result<usize, String> {
+    replace_renaming(project, hits, query, with, opts).map(|(n, _)| n)
+}
+
+/// [`replace`], also returning the devices it renamed: old tag to new tag.
+pub fn replace_renaming(
+    project: &mut Project,
+    hits: &[Hit],
+    query: &str,
+    with: &str,
+    opts: FindOptions,
+) -> Result<(usize, BTreeMap<DeviceTag, DeviceTag>), String> {
     if query.is_empty() {
-        return Ok(0);
+        return Ok((0, BTreeMap::new()));
     }
     let mut p = project.clone();
     let mut changed = 0usize;
@@ -388,7 +399,7 @@ pub fn replace(
         changed += p.rename_device(temp, to).max(1);
     }
     *project = p;
-    Ok(changed)
+    Ok((changed, renames))
 }
 
 #[cfg(test)]

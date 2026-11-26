@@ -1442,6 +1442,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "hayro-ccitt"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "adbed896e99325bc312778bb9c9c289d795d51c12775c44dd5e4352f679c7e46"
+
+[[package]]
+name = "hayro-ccitt"
+version = "0.5.0"
+source = "git+https://github.com/LaurenzV/hayro?rev=e7ada1354dff4041cdeed3d8ba56fe01b6186132#e7ada1354dff4041cdeed3d8ba56fe01b6186132"
+
+[[package]]
+name = "hayro-jbig2"
+version = "0.4.0"
+source = "git+https://github.com/LaurenzV/hayro?rev=e7ada1354dff4041cdeed3d8ba56fe01b6186132#e7ada1354dff4041cdeed3d8ba56fe01b6186132"
+dependencies = [
+ "hayro-ccitt 0.5.0 (git+https://github.com/LaurenzV/hayro?rev=e7ada1354dff4041cdeed3d8ba56fe01b6186132)",
+]
+
+[[package]]
+name = "hayro-jpeg2000"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e5e5f2b3de970707fc22fd956d8f44211602939d5e4588603afa919cb7b3740"
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3786,18 +3811,23 @@ dependencies = [
 name = "wc-core"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror 2.0.21",
  "toml 0.8.23",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "wc-import"
 version = "0.1.0"
 dependencies = [
+ "hayro-ccitt 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "hayro-jbig2",
+ "hayro-jpeg2000",
  "image",
  "miniz_oxide 0.8.9",
  "quick-xml 0.37.5",
@@ -3840,6 +3870,7 @@ name = "wc-report"
 version = "0.1.0"
 dependencies = [
  "wc-core",
+ "zip",
 ]
 
 [[package]]
