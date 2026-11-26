@@ -4960,6 +4960,18 @@ fn put_back_at(dir: &Path, rel: &str, before: Option<&[u8]>) -> Result<(), Strin
             m.is_file().then(|| m.permissions())
         }
         Err(Errno::NOENT | Errno::LOOP) => None,
+        // A file this user may write but not read (mode 0200) is still put back, keeping its
+        // permissions, as `put_file_back` does.
+        Err(Errno::ACCESS) => {
+            let m = rustix::fs::statat(&at, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|x| fail(x.into()))?;
+            (rustix::fs::FileType::from_raw_mode(m.st_mode) == rustix::fs::FileType::RegularFile).then(|| {
+                use std::os::unix::fs::PermissionsExt as _;
+                // `st_mode` is a u16 on some systems (macOS).
+                #[allow(clippy::useless_conversion)]
+                let mode = u32::from(m.st_mode) & 0o7777;
+                std::fs::Permissions::from_mode(mode)
+            })
+        }
         Err(x) => return Err(fail(x.into())),
     };
     // The staging file is made new beside it, readable by its owner only before any bytes go in.
@@ -4992,7 +5004,11 @@ fn put_back_at(dir: &Path, rel: &str, before: Option<&[u8]>) -> Result<(), Strin
         Err(y) => format!(
             "{}; the staging file {} is left: {}",
             fail(x),
-            shown(&format!("{}{part}", &rel[..rel.len() - name.len()])),
+            shown(&if folders.is_empty() {
+                part
+            } else {
+                format!("{folders}/{part}")
+            }),
             std::io::Error::from(y)
         ),
     })
@@ -9902,6 +9918,33 @@ mod tests {
         assert_eq!(std::fs::read(outside.join("a.comments.json")).unwrap(), b"outside");
         assert!(std::fs::read_dir(outside.join(kind)).unwrap().next().is_none());
         assert!(journal.exists());
+    }
+
+    /// A journaled file its owner may write but not read (mode 0200) is put back all the same,
+    /// keeping its mode. Only a user other than root is refused the read: run as one, e.g.
+    /// `setpriv --reuid=65534 --regid=65534 --clear-groups`, to take that path.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_only_file_is_put_back_keeping_its_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, _, _) = box_edit_project(tmp.path());
+        let comments = dir.join(store::COMMENTS_DIR);
+        std::fs::create_dir_all(&comments).unwrap();
+        let target = comments.join("w.comments.json");
+        std::fs::write(&target, b"half written").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o200)).unwrap();
+        let name = format!("{}/w.comments.json", store::COMMENTS_DIR);
+        let mut bytes = JOURNAL_HEADER.to_vec();
+        bytes.extend_from_slice(format!("{} 2\n{name}hiend 1\n", name.len()).as_bytes());
+        std::fs::write(dir.join(BOX_EDIT_JOURNAL), &bytes).unwrap();
+
+        assert!(undo_stopped_box_edit(&dir).unwrap().is_some());
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o200);
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"hi");
+        assert!(!dir.join(BOX_EDIT_JOURNAL).exists());
     }
 
     #[test]
