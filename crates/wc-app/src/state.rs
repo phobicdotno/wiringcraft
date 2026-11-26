@@ -219,11 +219,12 @@ struct FileEdit {
 /// Write `edits` (in project folder `dir`) as they were before them (`undo`, newest first) or
 /// after them, each replaced whole ([`restore_file`]), so a failed write leaves the file as it
 /// was; a file there was none of is removed. Nothing is written when a file was changed outside
-/// since ([`changed_outside`]). When one cannot be written, those already written are put back as they were just
-/// before this call (a change made outside since stays). The error names every file of
-/// `edits` left other than written: the one that failed with its reason, those put back,
-/// those that could not be put back with their reason, and those not reached. Returns the
-/// files written as they were just before, for [`put_back_files`] when what follows fails.
+/// since ([`changed_outside`]). When one cannot be written, those already written are put back
+/// as they were just before this call ([`put_back_files`]: one changed outside since it was
+/// written stays as it is). The error names every file of `edits` left other than written: the
+/// one that failed with its reason, those put back, those not put back with their reason, and
+/// those not reached. Returns the files written, for [`put_back_files`] when what follows
+/// fails.
 fn write_edits(dir: &Path, edits: &[FileEdit], undo: bool) -> Result<Written, String> {
     let order: Vec<&FileEdit> = if undo {
         edits.iter().rev().collect()
@@ -234,14 +235,15 @@ fn write_edits(dir: &Path, edits: &[FileEdit], undo: bool) -> Result<Written, St
     let mut written: Written = Vec::new();
     for (i, e) in order.iter().enumerate() {
         let text = if undo { &e.before } else { &e.after };
+        let wrote = text.as_deref().map(|t| t.as_bytes().to_vec());
         let path = dir.join(&e.path);
         let done = snapshot_file(&path).and_then(|was| {
-            restore_file(&path, text.as_deref().map(str::as_bytes))
+            restore_file(&path, wrote.as_deref())
                 .map(|()| was)
                 .map_err(|err| format!("{} could not be written: {err}", path.display()))
         });
         match done {
-            Ok(was) => written.push((path, was)),
+            Ok(was) => written.push(WrittenFile { path, was, wrote }),
             Err(mut msg) => {
                 let (back, stuck) = put_back_files(&written);
                 let left: Vec<String> = order
@@ -265,45 +267,83 @@ fn write_edits(dir: &Path, edits: &[FileEdit], undo: bool) -> Result<Written, St
     Ok(written)
 }
 
-/// Refuse to write `order` (the edits of [`write_edits`], in the order it writes them) when a
-/// file does not hold what its edit left there: the text after the edit for `undo`, the text
-/// before it otherwise (#657). Then another program changed the file since, and writing the
-/// recorded text would lose that change. Only the first edit of each file is compared: the
-/// later ones follow what this call writes.
-fn changed_outside(dir: &Path, order: &[&FileEdit], undo: bool) -> Result<(), String> {
-    let mut seen = std::collections::BTreeSet::new();
-    let mut changed = Vec::new();
+/// The files of `order` (the edits of [`write_edits`], in the order it writes them, paths
+/// relative to `dir`) that another program changed, each once (#657). The first edit of a file
+/// is compared with the file: it must hold what that edit left there, the text after the edit
+/// for `undo`, the text before it otherwise. Each later edit of the same file (a step made of
+/// several changes, [`Open::squash_undo`]) is compared with what the edit written just before
+/// it leaves there: when the two do not join, the file was changed outside between them, and
+/// writing them one after the other would lose that change. An error when a file cannot be
+/// read.
+fn outside_changes<'a>(dir: &Path, order: &[&'a FileEdit], undo: bool) -> Result<Vec<&'a PathBuf>, String> {
+    let mut holds: BTreeMap<&PathBuf, &Option<String>> = BTreeMap::new();
+    let mut changed: Vec<&PathBuf> = Vec::new();
     for e in order {
-        if !seen.insert(&e.path) {
-            continue;
-        }
-        let expected = if undo { &e.after } else { &e.before };
-        let path = dir.join(&e.path);
-        if snapshot_file(&path)?.as_deref() != expected.as_deref().map(str::as_bytes) {
-            changed.push(path.display().to_string());
+        let (expected, writes) = if undo {
+            (&e.after, &e.before)
+        } else {
+            (&e.before, &e.after)
+        };
+        let same = match holds.insert(&e.path, writes) {
+            Some(held) => held == expected,
+            None => snapshot_file(&dir.join(&e.path))?.as_deref() == expected.as_deref().map(str::as_bytes),
+        };
+        if !same && !changed.contains(&&e.path) {
+            changed.push(&e.path);
         }
     }
+    Ok(changed)
+}
+
+/// Refuse to write `order` (the edits of [`write_edits`], in the order it writes them) when
+/// another program changed one of its files since ([`outside_changes`]): writing the recorded
+/// text would lose that change.
+fn changed_outside(dir: &Path, order: &[&FileEdit], undo: bool) -> Result<(), String> {
+    let changed = outside_changes(dir, order, undo)?;
     if changed.is_empty() {
         return Ok(());
     }
+    let changed: Vec<String> = changed.iter().map(|p| dir.join(p).display().to_string()).collect();
     Err(format!(
         "Not done, and nothing was changed: {} was changed outside this window since, and this would write over that change.",
         changed.join("; ")
     ))
 }
 
-/// Files [`write_edits`] wrote, each as it was just before, in the order written.
-type Written = Vec<(PathBuf, Option<Vec<u8>>)>;
+/// A file [`write_edits`] wrote: as it was just before (`was`) and what was written (`wrote`),
+/// `None` for no file.
+#[derive(Debug)]
+struct WrittenFile {
+    path: PathBuf,
+    was: Option<Vec<u8>>,
+    wrote: Option<Vec<u8>>,
+}
+
+/// Files [`write_edits`] wrote, in the order written.
+type Written = Vec<WrittenFile>;
 
 /// Put the files of `written` back as they were before [`write_edits`] wrote them, newest
-/// first (a change made outside before that stays). Returns those put back, and those that
-/// could not be with their reason.
+/// first (a change made outside before that stays). A file that no longer holds what was
+/// written was changed outside since: it is left as it is, and so is every earlier write of
+/// it. Returns those put back, and those that were not with their reason.
 fn put_back_files(written: &Written) -> (Vec<String>, Vec<String>) {
     let (mut back, mut stuck) = (Vec::new(), Vec::new());
-    for (path, was) in written.iter().rev() {
-        match restore_file(path, was.as_deref()) {
-            Ok(()) => back.push(path.display().to_string()),
-            Err(e) => stuck.push(format!("{}: {e}", path.display())),
+    let mut left: std::collections::BTreeSet<&PathBuf> = std::collections::BTreeSet::new();
+    for f in written.iter().rev() {
+        if left.contains(&f.path) {
+            continue;
+        }
+        let done = match snapshot_file(&f.path) {
+            Ok(now) if now == f.wrote => restore_file(&f.path, f.was.as_deref()).map_err(|e| e.to_string()),
+            Ok(_) => Err("changed outside this window since it was written, so it is left as it is".to_owned()),
+            Err(e) => Err(e),
+        };
+        match done {
+            Ok(()) => back.push(f.path.display().to_string()),
+            Err(e) => {
+                left.insert(&f.path);
+                stuck.push(format!("{}: {e}", f.path.display()));
+            }
         }
     }
     (back, stuck)
@@ -2852,14 +2892,52 @@ impl Open {
     /// A symbol or part file the change added (there was none, and the project as it was does
     /// not pin it) is removed; files that were there are never touched, nor rewritten. One that
     /// cannot be removed is reported, and is harmless: an unpinned part copy is pinned again
-    /// when it is next used. Project files the change rewrote (a macro saved) are put back.
+    /// when it is next used. Project files the change rewrote (a macro saved, a translation
+    /// set) are put back. One of those another program changed since is left as it is, so that
+    /// change is not lost, and the error names it; the others are put back all the same.
     pub(crate) fn back_to(&mut self, mark: Mark) -> Result<(), String> {
         // Project files the change rewrote are put back, newest first; they are kept apart
         // from the undo history, which may have dropped their steps.
         let edits = self.mark_edits.split_off(mark.edits_from.min(self.mark_edits.len()));
         self.end_mark();
-        // Every problem is reported, the files not put back first.
-        let mut errors: Vec<String> = write_edits(&self.dir, &edits, true).err().into_iter().collect();
+        // Every problem is reported, the files not put back first. A file another program
+        // changed since is left as it is and named; the others are put back all the same, so
+        // no file of the change stays behind unnamed.
+        let mut errors: Vec<String> = Vec::new();
+        let (mut changed, mut clear): (Vec<String>, Vec<FileEdit>) = (Vec::new(), Vec::new());
+        let mut checked: BTreeMap<&PathBuf, bool> = BTreeMap::new();
+        for e in &edits {
+            let ok = match checked.get(&e.path) {
+                Some(ok) => *ok,
+                None => {
+                    let own: Vec<&FileEdit> = edits.iter().rev().filter(|o| o.path == e.path).collect();
+                    let ok = match outside_changes(&self.dir, &own, true) {
+                        Ok(found) => {
+                            if !found.is_empty() {
+                                changed.push(self.dir.join(&e.path).display().to_string());
+                            }
+                            found.is_empty()
+                        }
+                        Err(why) => {
+                            errors.push(format!("Not put back: {why}"));
+                            false
+                        }
+                    };
+                    checked.insert(&e.path, ok);
+                    ok
+                }
+            };
+            if ok {
+                clear.push(e.clone());
+            }
+        }
+        if !changed.is_empty() {
+            errors.push(format!(
+                "Not put back: {} was changed outside this window since, and putting it back would write over that change. It is left as it is.",
+                changed.join("; ")
+            ));
+        }
+        errors.extend(write_edits(&self.dir, &clear, true).err());
         self.put_back(mark.kept);
         self.symbols.retain(|id, _| mark.symbols.contains(id));
         self.parts.retain(|id, _| mark.parts.contains(id));
@@ -8110,11 +8188,11 @@ pub(crate) mod tests {
             before: before.map(str::to_owned),
             after: after.map(str::to_owned),
         };
-        // b was written twice in the step: only what the step left last is compared.
+        // b was written twice in the step: the file is compared with what the step left last.
         let edits = [
             edit("a.json", Some("A0"), Some("A1")),
             edit("b.json", None, Some("B1")),
-            edit("b.json", Some("other"), Some("B2")),
+            edit("b.json", Some("B1"), Some("B2")),
             edit("c.json", Some("C0"), None),
         ];
         let read = |name: &str| std::fs::read_to_string(dir.join(name)).ok();
@@ -8144,6 +8222,198 @@ pub(crate) mod tests {
         std::fs::remove_file(dir.join("c.json")).unwrap();
         write_edits(dir, &edits, true).unwrap();
         assert_eq!(all(), texts([Some("A0"), None, Some("C0")]));
+    }
+
+    #[test]
+    fn a_replay_is_refused_when_a_file_was_changed_outside_between_two_edits_of_the_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let edit = |name: &str, before: &str, after: &str| FileEdit {
+            path: PathBuf::from(name),
+            before: Some(before.into()),
+            after: Some(after.into()),
+        };
+        // One step: b went B0 to B1, another program wrote "outside", then the step went on
+        // from that to B2. Undo would write "outside" and then B0 over it.
+        let edits = [
+            edit("a.json", "A0", "A1"),
+            edit("b.json", "B0", "B1"),
+            edit("b.json", "outside", "B2"),
+        ];
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
+        let put = |name: &str, text: &str| std::fs::write(dir.join(name), text).unwrap();
+        put("a.json", "A1");
+        put("b.json", "B2");
+        let err = write_edits(dir, &edits, true).unwrap_err();
+        assert!(err.contains("b.json") && err.contains("changed outside"), "{err}");
+        assert!(err.contains("nothing was changed") && !err.contains("a.json"), "{err}");
+        assert_eq!((read("a.json"), read("b.json")), ("A1".into(), "B2".into()));
+        // Redo meets the same break, with every file as it was before the step.
+        put("a.json", "A0");
+        put("b.json", "B0");
+        let err = write_edits(dir, &edits, false).unwrap_err();
+        assert!(err.contains("b.json") && err.contains("changed outside"), "{err}");
+        assert_eq!((read("a.json"), read("b.json")), ("A0".into(), "B0".into()));
+        // Edits that join are one step both ways.
+        let edits = [
+            edit("a.json", "A0", "A1"),
+            edit("b.json", "B0", "B1"),
+            edit("b.json", "B1", "B2"),
+        ];
+        write_edits(dir, &edits, false).unwrap();
+        assert_eq!((read("a.json"), read("b.json")), ("A1".into(), "B2".into()));
+        write_edits(dir, &edits, true).unwrap();
+        assert_eq!((read("a.json"), read("b.json")), ("A0".into(), "B0".into()));
+    }
+
+    #[test]
+    fn files_written_are_not_put_back_over_a_change_made_outside_since() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let edit = |name: &str, before: Option<&str>, after: Option<&str>| FileEdit {
+            path: PathBuf::from(name),
+            before: before.map(str::to_owned),
+            after: after.map(str::to_owned),
+        };
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).ok();
+        let put = |name: &str, text: &str| std::fs::write(dir.join(name), text).unwrap();
+        put("a.json", "A0");
+        put("b.json", "B0");
+        put("c.json", "C0");
+        // b is written twice, c is removed and d is new.
+        let edits = [
+            edit("a.json", Some("A0"), Some("A1")),
+            edit("b.json", Some("B0"), Some("B1")),
+            edit("b.json", Some("B1"), Some("B2")),
+            edit("c.json", Some("C0"), None),
+            edit("d.json", None, Some("D1")),
+        ];
+        let written = write_edits(dir, &edits, false).unwrap();
+        // Before what follows fails, another program saves b, writes c again and removes d.
+        put("b.json", "outside");
+        put("c.json", "new");
+        std::fs::remove_file(dir.join("d.json")).unwrap();
+        let (back, stuck) = put_back_files(&written);
+        assert_eq!(read("a.json").as_deref(), Some("A0"), "put back");
+        assert_eq!(read("b.json").as_deref(), Some("outside"), "left as it is");
+        assert_eq!(read("c.json").as_deref(), Some("new"), "left as it is");
+        assert_eq!(read("d.json"), None);
+        assert_eq!(back.len(), 1, "{back:?}");
+        assert!(back[0].ends_with("a.json"), "{back:?}");
+        // Each file left is named once, with why.
+        assert_eq!(stuck.len(), 3, "{stuck:?}");
+        for name in ["b.json", "c.json", "d.json"] {
+            assert!(
+                stuck.iter().any(|s| s.contains(name) && s.contains("changed outside")),
+                "{name}: {stuck:?}"
+            );
+        }
+        // Untouched since, every file goes back, b through both its writes.
+        put("b.json", "B0");
+        put("c.json", "C0");
+        let written = write_edits(dir, &edits, false).unwrap();
+        assert_eq!(read("b.json").as_deref(), Some("B2"));
+        let (back, stuck) = put_back_files(&written);
+        assert!(stuck.is_empty(), "{stuck:?}");
+        assert_eq!(back.len(), 5);
+        assert_eq!(
+            [read("a.json"), read("b.json"), read("c.json"), read("d.json")],
+            [Some("A0".into()), Some("B0".into()), Some("C0".into()), None]
+        );
+    }
+
+    #[test]
+    fn a_change_taken_back_leaves_a_file_changed_outside_and_puts_the_others_back() {
+        let (_tmp, mut o) = project();
+        let id = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let clip = o.copy(1, &[Selection::Symbol(id)]);
+        let path = o.save_macro(&clip, "Coil", "").unwrap();
+        let first = std::fs::read_to_string(&path).unwrap();
+        let translations = o.dir.join(wc_core::translate::TRANSLATIONS_FILE);
+        assert!(translate(&mut o, "Control", "Styring"));
+        let was = translations_file(&o).unwrap_or_default();
+        let (project, steps) = (o.project.clone(), o.undo_steps());
+        let save_macro = |o: &mut Open| {
+            let mut form = crate::macro_form::Form::open(&path).unwrap();
+            form.description = "Gone".into();
+            o.save_macro_form(&form).unwrap();
+        };
+
+        // The change saves the macro and sets a translation.
+        let mark = o.mark();
+        save_macro(&mut o);
+        o.checkpoint();
+        o.project.pages[0].title = "Main".into();
+        assert!(translate(&mut o, "Main", "Hoved"));
+        // Another program saves the translations before the change is taken back.
+        let outside = "source = \"en\"\n\n[[text]]\nen = \"Control\"\nnb = \"Kontroll\"\n";
+        std::fs::write(&translations, outside).unwrap();
+        let err = o.back_to(mark).unwrap_err();
+        assert!(
+            err.contains(&translations.display().to_string()) && err.contains("changed outside"),
+            "{err}"
+        );
+        assert!(
+            err.contains("left as it is") && !err.contains("nothing was changed"),
+            "{err}"
+        );
+        assert!(
+            !err.contains(&path.display().to_string()),
+            "the macro is not named: {err}"
+        );
+        assert_eq!(translations_file(&o).as_deref(), Some(outside), "left as it is");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), first, "the macro is put back");
+        assert_eq!((&o.project, o.undo_steps()), (&project, steps));
+        assert!(o.mark_edits.is_empty());
+
+        // Changed outside between the change's two translations: left as well.
+        std::fs::write(&translations, &was).unwrap();
+        let mark = o.mark();
+        save_macro(&mut o);
+        assert!(translate(&mut o, "Main", "Hoved"));
+        std::fs::write(&translations, outside).unwrap();
+        assert!(translate(&mut o, "Main", "Hoved"));
+        let left = translations_file(&o);
+        let err = o.back_to(mark).unwrap_err();
+        assert!(err.contains("changed outside"), "{err}");
+        assert_eq!(translations_file(&o), left, "left as it is");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), first, "the macro is put back");
+
+        // With no file changed outside, both go back and nothing is reported.
+        std::fs::write(&translations, &was).unwrap();
+        let mark = o.mark();
+        save_macro(&mut o);
+        assert!(translate(&mut o, "Main", "Hoved"));
+        assert!(translate(&mut o, "Control", "Kontroll"));
+        o.back_to(mark).unwrap();
+        assert_eq!(translations_file(&o).as_deref(), Some(was.as_str()));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
+        assert_eq!((&o.project, o.undo_steps()), (&project, steps));
+    }
+
+    #[test]
+    fn a_step_squashed_over_an_outside_change_of_the_translations_is_refused_whole() {
+        let (_tmp, mut o) = project();
+        let path = o.dir.join(wc_core::translate::TRANSLATIONS_FILE);
+        let mark = o.undo_mark();
+        o.checkpoint();
+        o.project.pages[0].title = "Main".into();
+        assert!(translate(&mut o, "Main", "Hoved"));
+        let outside = "source = \"en\"\n\n[[text]]\nen = \"Control\"\nnb = \"Kontroll\"\n";
+        std::fs::write(&path, outside).unwrap();
+        assert!(translate(&mut o, "Main", "Hoved"));
+        o.squash_undo(mark);
+        let (project, steps, file) = (o.project.clone(), o.undo_steps(), translations_file(&o));
+        assert_eq!(steps, 1);
+        assert!(!o.undo());
+        let err = o.take_undo_error().unwrap_or_default();
+        assert!(
+            err.contains(wc_core::translate::TRANSLATIONS_FILE) && err.contains("changed outside"),
+            "{err}"
+        );
+        assert_eq!(translations_file(&o), file, "left as it is");
+        assert_eq!((&o.project, o.undo_steps()), (&project, steps), "nothing changed");
+        assert!(!o.can_redo());
     }
 
     #[test]
@@ -8333,9 +8603,32 @@ pub(crate) mod tests {
         assert!(o.mark_edits.is_empty());
     }
 
-    /// The project's `translations.toml` as it is on disk, if there is one.
+    /// The project's `translations.toml` as it is on disk: `None` only when there is no such
+    /// entry. Anything else that cannot be read as text (a folder there, say) fails the test,
+    /// so it never stands for a removed file.
     fn translations_file(o: &Open) -> Option<String> {
-        std::fs::read_to_string(o.dir.join(wc_core::translate::TRANSLATIONS_FILE)).ok()
+        let path = o.dir.join(wc_core::translate::TRANSLATIONS_FILE);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Some(text),
+            Err(e) => {
+                assert_eq!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound,
+                    "{} cannot be read: {e}",
+                    path.display()
+                );
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn a_folder_in_place_of_the_translations_does_not_read_as_no_file() {
+        let (_tmp, o) = project();
+        assert_eq!(translations_file(&o), None);
+        std::fs::create_dir(o.dir.join(wc_core::translate::TRANSLATIONS_FILE)).unwrap();
+        let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| translations_file(&o)));
+        assert!(read.is_err(), "a folder there is not a removed file");
     }
 
     /// Set a translation into `nb` the way the assistant's tool does. Returns whether the file
