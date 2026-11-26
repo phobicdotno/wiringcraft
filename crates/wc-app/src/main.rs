@@ -1672,7 +1672,7 @@ impl App {
             Action::Copy | Action::Cut => {
                 let clip = open.copy(page, &self.ed.selection);
                 if !clip.is_empty() {
-                    let n = clip.symbols.len() + clip.wires.len();
+                    let n = clip.count();
                     self.copied_text = Some(clip.summary());
                     self.clipboard = clip;
                     if a == Action::Cut {
@@ -1683,9 +1683,9 @@ impl App {
                             .partition(|s| matches!(s, Selection::Cloud(_) | Selection::RevisionTable));
                         open.delete_many(page, &sel);
                         self.ed.selection = kept;
-                        self.ed.message = format!("Cut {n} items.");
+                        self.ed.message = format!("Cut {n}.");
                     } else {
-                        self.ed.message = format!("Copied {n} items.");
+                        self.ed.message = format!("Copied {n}.");
                     }
                 }
             }
