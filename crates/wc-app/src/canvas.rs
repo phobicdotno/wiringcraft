@@ -1816,13 +1816,19 @@ fn cancel_drag(open: &mut Open, ed: &mut Editor) {
             let Some(at) = open.project.pages.iter().position(|p| p.id == page) else {
                 return;
             };
-            let was = open
-                .before_last_change()
-                .and_then(|b| b.pages.iter().find(|p| p.id == page))
-                .cloned();
+            let before = open.before_last_change();
+            let was = before.and_then(|b| b.pages.iter().find(|p| p.id == page)).cloned();
+            // The jumpers, strip layouts and spare device data the moved terminals took along
+            // (follow_terminals runs every frame of the drag) go back with them.
+            let followed = before.map(|b| (b.meta.jumpers.clone(), b.meta.strips.clone(), b.devices.clone()));
             // Only the page moved on: a sync of other pages since the drag began stays.
             if let (Some(was), Some(now)) = (was, open.project.pages.get_mut(at)) {
                 *now = was;
+                if let Some((jumpers, strips, devices)) = followed {
+                    open.project.meta.jumpers = jumpers;
+                    open.project.meta.strips = strips;
+                    open.project.devices = devices;
+                }
                 open.forget_terminal_change();
                 open.forget_last_change();
                 // A save while the button was held wrote the moved page: this is unsaved again.
@@ -4406,6 +4412,26 @@ mod tests {
         drag_released(&mut o, &mut ed, false);
         assert!(o.project.pages[ed.page].wires.is_empty());
         assert!(ed.message.is_empty());
+    }
+
+    #[test]
+    fn escape_during_a_move_puts_followed_jumpers_back() {
+        let (_tmp, mut o, mut ed, _) = moving_coil();
+        let x1 = wc_core::DeviceTag::parse("-X1").unwrap();
+        o.project.meta.add_jumper(&x1, &["1".into(), "2".into()]).unwrap();
+        let before = o.project.clone();
+        drag(&mut o, &mut ed, Point::new(-40.0, 0.0));
+        // What following the moved terminals does every frame of the drag (#836 review).
+        o.project.meta.jumpers.clear();
+        o.project.meta.add_jumper(&x1, &["1".into(), "3".into()]).unwrap();
+        cancel_drag(&mut o, &mut ed);
+        assert_eq!(o.project.pages, before.pages);
+        assert_eq!(
+            o.project.meta.jumpers, before.meta.jumpers,
+            "the jumper joins 1 and 2 again"
+        );
+        assert_eq!(o.project.meta.strips, before.meta.strips);
+        assert_eq!(o.project.devices, before.devices);
     }
 
     #[test]
