@@ -398,10 +398,17 @@ fn shapes(
         let flip = e.f_or(230, 1.0) < 0.0;
         let q = |x: f64, y: f64| if flip { p(-x, y) } else { p(x, y) };
         let shape = match e.kind.as_str() {
-            "LINE" => Some(Shape::Line {
-                a: p(e.f(10), e.f(20)),
-                b: p(e.f(11), e.f(21)),
-            }),
+            "LINE" => {
+                // Ends that are not numbers once placed (a coordinate near the limit times the
+                // scale) leave the line out, and say so: the page could not be read back.
+                let (a, b) = (p(e.f(10), e.f(20)), p(e.f(11), e.f(21)));
+                if [a, b].iter().all(|p| p.x.is_finite() && p.y.is_finite()) {
+                    Some(Shape::Line { a, b })
+                } else {
+                    *skipped.entry(LINE_NOT_NUMBERS.to_owned()).or_default() += 1;
+                    None
+                }
+            }
             // Scaled differently along x and y, a circle is an ellipse: drawn by its points.
             "CIRCLE" if !xf.keeps_circles() => {
                 // On a pin layer it marks a pin at its centre, which a symbol takes from the
@@ -786,6 +793,8 @@ const STRETCHED_NOT_NUMBERS: &str = "CIRCLE or ARC of a stretched block whose po
 /// placed.
 const POLYLINE_NOT_NUMBERS: &str = "LWPOLYLINE whose points are not numbers once placed";
 const HATCH_NOT_NUMBERS: &str = "HATCH with a boundary that is not numbers";
+/// The `skipped` key of a line whose ends are not numbers once placed.
+const LINE_NOT_NUMBERS: &str = "LINE whose ends are not numbers once placed";
 
 /// Points along a B-spline from its control points, knots and weights, sampled evenly over the
 /// knot range. `None` when the data do not make a spline.
@@ -1743,6 +1752,9 @@ pub(crate) fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> 
             } else if kind == SPLINE_NOT_CURVE {
                 let s = if n == 1 { "" } else { "s" };
                 format!("{n} SPLINE{s} whose knots make no curve, drawn through their points")
+            } else if kind == LINE_NOT_NUMBERS {
+                let s = if n == 1 { "" } else { "s" };
+                format!("{n} line{s} whose ends are not numbers once placed, left out")
             } else if kind == POLYLINE_NOT_NUMBERS {
                 let s = if n == 1 { "" } else { "s" };
                 format!("{n} polyline{s} whose points are not numbers once placed, left out")
@@ -1984,7 +1996,15 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
         .collect();
     pts.extend(out.symbols.iter().map(|s| s.at));
     if pts.is_empty() {
-        return Err(Error::Format("the drawing has no entities WiringCraft can read".into()));
+        // What was left out says why, when anything was.
+        let why = if out.warnings.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", out.warnings.join("; "))
+        };
+        return Err(Error::Format(format!(
+            "the drawing has no entities WiringCraft can read{why}"
+        )));
     }
     let (min, _) = wc_core::geom::bounds_of(&pts);
     let shift = Point::new(20.0 - min.x, 20.0 - min.y);
@@ -2045,6 +2065,28 @@ mod tests {
         assert_eq!(p.symbols.len(), 1);
         assert_eq!(p.symbols[0].tag.as_ref().map(|t| t.to_string()).as_deref(), Some("-K7"));
         assert_eq!(p.graphics.len(), 3, "logo exploded into two lines plus the polyline");
+        Ok(())
+    }
+
+    /// A line whose ends overflow once scaled is left out and counted, and a drawing left with
+    /// nothing says why.
+    #[test]
+    fn a_line_that_overflows_once_placed_is_left_out_and_said() -> Result<()> {
+        let ents = "0\nLINE\n10\n0\n20\n0\n11\n1e308\n21\n0\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n";
+        let p = page(&dxf(ents, ""), 10.0, &BTreeSet::new())?;
+        assert_eq!(p.graphics.len(), 1, "{:?}", p.graphics);
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("1 line whose ends are not numbers")),
+            "{:?}",
+            p.warnings
+        );
+        let only = "0\nLINE\n10\n0\n20\n0\n11\n1e308\n21\n0\n";
+        let Err(err) = page(&dxf(only, ""), 10.0, &BTreeSet::new()) else {
+            unreachable!("nothing left to draw");
+        };
+        assert!(err.to_string().contains("1 line whose ends are not numbers"), "{err}");
         Ok(())
     }
 
