@@ -377,6 +377,8 @@ fn a_project_macro_is_shown_and_edited_and_a_library_one_is_not() -> TestResult 
     Ok(())
 }
 
+// Windows does not allow control characters in a folder name.
+#[cfg(unix)]
 #[test]
 fn an_unreadable_macro_file_is_named_escaped() -> TestResult {
     let tmp = tempfile::tempdir()?;
