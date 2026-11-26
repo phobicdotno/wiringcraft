@@ -328,7 +328,14 @@ impl Form {
                     .first_page
                     .trim()
                     .parse::<usize>()
-                    .map_err(|_| "The first page number must be a whole number, for example 100.".to_owned())?;
+                    .ok()
+                    .filter(|n| *n <= run::MAX_FIRST_PAGE)
+                    .ok_or_else(|| {
+                        format!(
+                            "The first page number must be a whole number up to {}, for example 100.",
+                            run::MAX_FIRST_PAGE
+                        )
+                    })?;
                 o.first_page = Some(n);
             }
         }
