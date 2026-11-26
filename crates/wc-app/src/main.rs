@@ -344,6 +344,12 @@ fn held_by_symbol_editor(a: Action) -> bool {
     )
 }
 
+/// Why `what` (an action's label, or what an assistant tool does) was refused while the symbol
+/// editor is open.
+fn symbol_editor_refusal(what: &str) -> String {
+    format!("{what} was not done: close the symbol editor first.")
+}
+
 /// The actions that do not change the project, its folder or which project is open: the only
 /// ones carried out while an import runs.
 fn allowed_while_importing(a: Action) -> bool {
@@ -1347,7 +1353,7 @@ impl App {
         // The keys are held back while the symbol editor is open; the menu, toolbar and
         // assistant are too, so the schematic does not change or get selected under the editor.
         if held_by_symbol_editor(a) && self.symbol_editor.is_some() {
-            self.ed.message = format!("{} was not done: close the symbol editor first.", a.info().label);
+            self.ed.message = symbol_editor_refusal(a.info().label);
             return;
         }
         if a == Action::ReportProblem {
@@ -5601,7 +5607,12 @@ impl App {
                     ed.delete_selected();
                     false
                 }
-                a => !held_by_symbol_editor(*a),
+                a if held_by_symbol_editor(*a) => {
+                    // Held back, and said so, as from the menu.
+                    self.ed.message = symbol_editor_refusal(a.info().label);
+                    false
+                }
+                _ => true,
             })
             .collect()
     }
