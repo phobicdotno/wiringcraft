@@ -104,9 +104,41 @@ impl PanelItem {
             _ => None,
         }
     }
+
+    /// The outline the item covers on the plate, as (top-left, bottom-right): a rail is 35 mm
+    /// tall about its centre line, a duct is its rectangle, a device is turned as it stands.
+    pub fn bounds(&self) -> (Point, Point) {
+        match self {
+            PanelItem::Rail { at, length } => (Point::new(at.x, at.y - 17.5), Point::new(at.x + length, at.y + 17.5)),
+            PanelItem::Duct { min, max } => (
+                Point::new(min.x.min(max.x), min.y.min(max.y)),
+                Point::new(min.x.max(max.x), min.y.max(max.y)),
+            ),
+            PanelItem::Device { .. } => self.device_bounds().unwrap_or_default(),
+        }
+    }
+}
+
+/// Whether the outline from `min` (top-left) to `max` (bottom-right) lies on a plate of
+/// `width` x `height` millimetres. A small tolerance lets an outline flush with the plate's
+/// edge through, so a size typed exactly or reached by adding up decimals still fits. An
+/// outline or plate size that is not a finite number never fits.
+pub fn outline_on_plate(width: f64, height: f64, min: Point, max: Point) -> bool {
+    let finite = [width, height, min.x, min.y, max.x, max.y];
+    if !finite.iter().all(|v| v.is_finite()) {
+        return false;
+    }
+    let eps = 1e-9;
+    !(min.x < -eps || min.y < -eps || max.x > width + eps || max.y > height + eps)
 }
 
 impl Panel {
+    /// Whether a `w` x `h` millimetre outline with its top-left corner at `at` lies on this
+    /// plate, edges included. See [`outline_on_plate`].
+    pub fn outline_fits(&self, at: Point, w: f64, h: f64) -> bool {
+        outline_on_plate(self.width, self.height, at, Point::new(at.x + w, at.y + h))
+    }
+
     /// An empty plate.
     pub fn new(id: impl Into<String>, name: impl Into<String>, width: f64, height: f64) -> Self {
         Self {
@@ -203,9 +235,7 @@ impl Panel {
             return Err(format!("{tag}: position must be finite"));
         }
         let (w, h) = turned_size(width, height, rotation);
-        // A small tolerance, so a device typed flush with the plate's edge is accepted.
-        let eps = 1e-9;
-        if at.x < -eps || at.y < -eps || at.x + w > self.width + eps || at.y + h > self.height + eps {
+        if !self.outline_fits(at, w, h) {
             return Err(format!(
                 "{tag}: a {w} x {h} mm outline at {},{} is not on the {} x {} mm plate",
                 at.x, at.y, self.width, self.height
@@ -263,10 +293,7 @@ impl Panel {
         if !(width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0) {
             return Err(format!("plate size must be positive, got {width} x {height} mm"));
         }
-        // A small tolerance, so something flush with the new edge still counts as on the plate.
-        let eps = 1e-9;
-        let outside =
-            |min: Point, max: Point| min.x < -eps || min.y < -eps || max.x > width + eps || max.y > height + eps;
+        let outside = |min: Point, max: Point| !outline_on_plate(width, height, min, max);
         let sticking_out: Vec<String> = self
             .items
             .iter()
@@ -508,6 +535,21 @@ mod tests {
 
     fn tag(s: &str) -> Option<DeviceTag> {
         DeviceTag::parse(s).ok()
+    }
+
+    #[test]
+    fn rails_and_ducts_have_an_outline_on_the_plate() {
+        let rail = PanelItem::Rail {
+            at: Point::new(20.0, 100.0),
+            length: 300.0,
+        };
+        assert_eq!(rail.bounds(), (Point::new(20.0, 82.5), Point::new(320.0, 117.5)));
+        // A duct drawn from its far corner still covers the same rectangle.
+        let duct = PanelItem::Duct {
+            min: Point::new(60.0, 40.0),
+            max: Point::new(0.0, 0.0),
+        };
+        assert_eq!(duct.bounds(), (Point::new(0.0, 0.0), Point::new(60.0, 40.0)));
     }
 
     #[test]
@@ -860,6 +902,33 @@ mod tests {
         let (min, max, a, b) = frame_and_edge(Rotation::R270);
         assert!(close(min, 10.0, 30.0) && close(max, 110.0, 50.0));
         assert!(close(a, 10.0, 50.0) && close(b, 10.0, 30.0), "{a:?} {b:?}");
+    }
+
+    #[test]
+    fn an_outline_fits_on_the_plate_up_to_its_edge_but_not_past_it() {
+        let p = Panel::new("p", "P", 600.0, 800.0);
+        // Exactly on each edge.
+        assert!(p.outline_fits(Point::new(0.0, 0.0), 600.0, 800.0));
+        assert!(p.outline_fits(Point::new(555.0, 715.0), 45.0, 85.0));
+        // Decimals that add up to a hair over the edge (0.1 + 0.2 > 0.3) still count as flush.
+        let q = Panel::new("q", "Q", 0.3, 0.3);
+        assert!(q.outline_fits(Point::new(0.1, 0.1), 0.2, 0.2));
+        // Just past an edge, on every side.
+        assert!(!p.outline_fits(Point::new(555.001, 0.0), 45.0, 85.0));
+        assert!(!p.outline_fits(Point::new(0.0, 715.001), 45.0, 85.0));
+        assert!(!p.outline_fits(Point::new(-0.001, 0.0), 45.0, 85.0));
+        assert!(!p.outline_fits(Point::new(0.0, -0.001), 45.0, 85.0));
+        // The same rule for a plate size that is not the panel's own, as resizing uses.
+        let (min, max) = (Point::new(100.0, 400.0), Point::new(145.0, 485.0));
+        assert!(outline_on_plate(145.0, 485.0, min, max));
+        assert!(!outline_on_plate(144.999, 485.0, min, max));
+        assert!(!outline_on_plate(145.0, 484.999, min, max));
+        // Something that is not a number is never on the plate.
+        assert!(!p.outline_fits(Point::new(f64::NAN, 0.0), 45.0, 85.0));
+        assert!(!p.outline_fits(Point::new(0.0, 0.0), f64::NAN, 85.0));
+        assert!(!p.outline_fits(Point::new(0.0, 0.0), f64::INFINITY, 85.0));
+        assert!(!outline_on_plate(f64::NAN, 485.0, min, max));
+        assert!(!outline_on_plate(145.0, 485.0, Point::new(100.0, f64::NAN), max));
     }
 
     #[test]
