@@ -102,7 +102,7 @@ fn num(e: &BytesStart, name: &str) -> f64 {
     attr(e, name).and_then(|v| numbers(&v).first().copied()).unwrap_or(0.0)
 }
 
-/// Path data to polylines. Curves are flattened; arcs become straight segments to their end.
+/// Path data to polylines. Curves and elliptical arcs are flattened into short straight segments.
 fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
     let mut out: Vec<(Vec<Point>, bool)> = Vec::new();
     let mut cur: Vec<Point> = Vec::new();
@@ -132,8 +132,12 @@ fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
             cur.clear();
         }
     };
+    // The last cubic and quadratic control points, for `S` and `T` to mirror.
+    let mut cubic_ctrl: Option<(f64, f64)> = None;
+    let mut quad_ctrl: Option<(f64, f64)> = None;
     for (c, v) in cmds {
         let rel = c.is_ascii_lowercase();
+        let (mut next_cubic, mut next_quad) = (None, None);
         let (ox, oy) = if rel { (x, y) } else { (0.0, 0.0) };
         match c.to_ascii_uppercase() {
             'M' => {
@@ -153,7 +157,7 @@ fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
                     cur.push(m.p(x, y));
                 }
             }
-            'L' | 'T' => {
+            'L' => {
                 for p in v.as_chunks::<2>().0 {
                     let (bx, by) = if rel { (x, y) } else { (0.0, 0.0) };
                     x = bx + p[0];
@@ -173,28 +177,74 @@ fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
                     cur.push(m.p(x, y));
                 }
             }
-            'C' | 'S' | 'Q' | 'A' => {
-                let n = match c.to_ascii_uppercase() {
-                    'C' => 6,
-                    'S' | 'Q' => 4,
-                    _ => 7,
-                };
+            'C' | 'S' => {
+                let n = if c.eq_ignore_ascii_case(&'C') { 6 } else { 4 };
                 for seg in v.chunks_exact(n) {
                     let (bx, by) = if rel { (x, y) } else { (0.0, 0.0) };
-                    let (ex, ey) = (bx + seg[n - 2], by + seg[n - 1]);
-                    if n == 6 {
-                        // Cubic Bezier flattened in 8 steps.
-                        let (x0, y0) = (x, y);
-                        let (c1x, c1y, c2x, c2y) = (bx + seg[0], by + seg[1], bx + seg[2], by + seg[3]);
-                        for k in 1..=8 {
-                            let t = k as f64 / 8.0;
-                            let u = 1.0 - t;
-                            let px = u * u * u * x0 + 3.0 * u * u * t * c1x + 3.0 * u * t * t * c2x + t * t * t * ex;
-                            let py = u * u * u * y0 + 3.0 * u * u * t * c1y + 3.0 * u * t * t * c2y + t * t * t * ey;
-                            cur.push(m.p(px, py));
-                        }
+                    // `S` takes its first control point mirrored from the last cubic's second.
+                    let (c1x, c1y) = if n == 6 {
+                        (bx + seg[0], by + seg[1])
                     } else {
-                        cur.push(m.p(ex, ey));
+                        cubic_ctrl.map_or((x, y), |(px, py)| (2.0 * x - px, 2.0 * y - py))
+                    };
+                    let (c2x, c2y) = (bx + seg[n - 4], by + seg[n - 3]);
+                    let (ex, ey) = (bx + seg[n - 2], by + seg[n - 1]);
+                    let (x0, y0) = (x, y);
+                    for k in 1..=CURVE_STEPS {
+                        let t = f64::from(k) / f64::from(CURVE_STEPS);
+                        let u = 1.0 - t;
+                        let px = u * u * u * x0 + 3.0 * u * u * t * c1x + 3.0 * u * t * t * c2x + t * t * t * ex;
+                        let py = u * u * u * y0 + 3.0 * u * u * t * c1y + 3.0 * u * t * t * c2y + t * t * t * ey;
+                        cur.push(m.p(px, py));
+                    }
+                    // Chained `S`s mirror each other's control point.
+                    cubic_ctrl = Some((c2x, c2y));
+                    next_cubic = cubic_ctrl;
+                    x = ex;
+                    y = ey;
+                }
+            }
+            'Q' | 'T' => {
+                let n = if c.eq_ignore_ascii_case(&'Q') { 4 } else { 2 };
+                for seg in v.chunks_exact(n) {
+                    let (bx, by) = if rel { (x, y) } else { (0.0, 0.0) };
+                    // `T` takes its control point mirrored from the last quadratic's.
+                    let (cx, cy) = if n == 4 {
+                        (bx + seg[0], by + seg[1])
+                    } else {
+                        quad_ctrl.map_or((x, y), |(px, py)| (2.0 * x - px, 2.0 * y - py))
+                    };
+                    let (ex, ey) = (bx + seg[n - 2], by + seg[n - 1]);
+                    let (x0, y0) = (x, y);
+                    for k in 1..=CURVE_STEPS {
+                        let t = f64::from(k) / f64::from(CURVE_STEPS);
+                        let u = 1.0 - t;
+                        cur.push(m.p(
+                            u * u * x0 + 2.0 * u * t * cx + t * t * ex,
+                            u * u * y0 + 2.0 * u * t * cy + t * t * ey,
+                        ));
+                    }
+                    // Chained `T`s mirror each other's control point.
+                    quad_ctrl = Some((cx, cy));
+                    next_quad = quad_ctrl;
+                    x = ex;
+                    y = ey;
+                }
+            }
+            'A' => {
+                for seg in v.chunks_exact(7) {
+                    let (bx, by) = if rel { (x, y) } else { (0.0, 0.0) };
+                    let (ex, ey) = (bx + seg[5], by + seg[6]);
+                    let arc = Arc {
+                        from: (x, y),
+                        to: (ex, ey),
+                        radii: (seg[0], seg[1]),
+                        rotation: seg[2],
+                        large: seg[3] != 0.0,
+                        sweep: seg[4] != 0.0,
+                    };
+                    for (px, py) in arc.points() {
+                        cur.push(m.p(px, py));
                     }
                     x = ex;
                     y = ey;
@@ -208,9 +258,78 @@ fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
             }
             _ => {}
         }
+        cubic_ctrl = next_cubic;
+        quad_ctrl = next_quad;
     }
     flush(&mut cur, &mut out, false);
     out
+}
+
+/// Straight segments per Bezier curve.
+const CURVE_STEPS: u32 = 8;
+
+/// An elliptical arc as SVG path data gives it: from its start to its end point, with its radii,
+/// the ellipse's rotation in degrees and the large-arc and sweep flags.
+struct Arc {
+    from: (f64, f64),
+    to: (f64, f64),
+    radii: (f64, f64),
+    rotation: f64,
+    large: bool,
+    sweep: bool,
+}
+
+impl Arc {
+    /// The points after the start, the last one the end point. Radii too small to reach the end
+    /// point are scaled up; a zero radius, or values that are not finite, give a straight line
+    /// (SVG 1.1, appendix F.6).
+    fn points(&self) -> Vec<(f64, f64)> {
+        let ((x1, y1), (x2, y2)) = (self.from, self.to);
+        let line = vec![(x2, y2)];
+        let (mut rx, mut ry) = (self.radii.0.abs(), self.radii.1.abs());
+        if (x1 == x2 && y1 == y2) || rx == 0.0 || ry == 0.0 {
+            return line;
+        }
+        let (sin, cos) = self.rotation.to_radians().sin_cos();
+        let (dx, dy) = ((x1 - x2) / 2.0, (y1 - y2) / 2.0);
+        let (x1p, y1p) = (cos * dx + sin * dy, -sin * dx + cos * dy);
+        let grow = (x1p * x1p) / (rx * rx) + (y1p * y1p) / (ry * ry);
+        if grow > 1.0 {
+            rx *= grow.sqrt();
+            ry *= grow.sqrt();
+        }
+        let (rx2, ry2) = (rx * rx, ry * ry);
+        let den = rx2 * y1p * y1p + ry2 * x1p * x1p;
+        let root = ((rx2 * ry2 - den) / den).max(0.0).sqrt();
+        let coef = if self.large == self.sweep { -root } else { root };
+        let (cxp, cyp) = (coef * rx * y1p / ry, -coef * ry * x1p / rx);
+        let (cx, cy) = (
+            cos * cxp - sin * cyp + (x1 + x2) / 2.0,
+            sin * cxp + cos * cyp + (y1 + y2) / 2.0,
+        );
+        let start = ((y1p - cyp) / ry).atan2((x1p - cxp) / rx);
+        let end = ((-y1p - cyp) / ry).atan2((-x1p - cxp) / rx);
+        let mut delta = end - start;
+        if self.sweep && delta < 0.0 {
+            delta += std::f64::consts::TAU;
+        } else if !self.sweep && delta > 0.0 {
+            delta -= std::f64::consts::TAU;
+        }
+        if ![cx, cy, rx, ry, start, delta].iter().all(|v| v.is_finite()) {
+            return line;
+        }
+        // About one segment per 11.25 degrees.
+        let steps = (delta.abs() / (std::f64::consts::PI / 16.0)).ceil().clamp(2.0, 64.0) as u32;
+        let mut out: Vec<(f64, f64)> = (1..steps)
+            .map(|k| {
+                let (s, c) = (start + delta * f64::from(k) / f64::from(steps)).sin_cos();
+                (cx + rx * cos * c - ry * sin * s, cy + rx * sin * c + ry * cos * s)
+            })
+            .collect();
+        // End exactly on the given point, not on a rounded one.
+        out.push((x2, y2));
+        out
+    }
 }
 
 /// Import an SVG symbol.
@@ -412,6 +531,82 @@ mod tests {
         assert!(symbol("<html></html>", "x", "x").is_err());
         let _ = symbol("<svg><path d=\"M 1e999 0 L NaN 3 Z z z\"/></svg>", "x", "x");
         assert!(symbol("<svg><line x1=\"0\" y1=\"0\" x2=\"1\" y2=\"1\"/></svg>", "../evil", "x").is_err());
+    }
+
+    /// The points of the one polyline in `d`, untransformed.
+    fn one_line(d: &str) -> Vec<Point> {
+        let lines = path(d, &M::ID);
+        assert_eq!(lines.len(), 1, "{d}: {lines:?}");
+        lines.into_iter().next().map(|(pts, _)| pts).unwrap_or_default()
+    }
+
+    fn near(a: Point, b: Point) -> bool {
+        (a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() < 1e-9
+    }
+
+    #[test]
+    fn arcs_follow_their_circle() {
+        // A half circle of radius 5 round (5, 0). The sweep flag goes the way of growing angles,
+        // which with y pointing down is clockwise on screen: through y < 0.
+        for d in ["M 0 0 A 5 5 0 0 1 10 0", "m 0 0 a 5 5 0 0 1 10 0"] {
+            let pts = one_line(d);
+            assert!(pts.len() > 8, "{d}: flattened, not one segment");
+            assert!(
+                near(pts[pts.len() - 1], Point::new(10.0, 0.0)),
+                "{d}: ends on its end point"
+            );
+            for p in &pts {
+                assert!(((p.x - 5.0).hypot(p.y) - 5.0).abs() < 1e-9, "{d}: {p:?} on the circle");
+                assert!(p.y <= 1e-9, "{d}: {p:?} on the sweep side");
+            }
+            assert!(pts.iter().any(|p| p.y < -4.9), "{d}: reaches the top");
+        }
+        // The other sweep goes round the other side.
+        assert!(one_line("M 0 0 A 5 5 0 0 0 10 0").iter().all(|p| p.y >= -1e-9));
+        // The large arc of a circle of radius 10 through two points 10 apart is the long way round.
+        let small = one_line("M 0 0 A 10 10 0 0 1 10 0").len();
+        let large = one_line("M 0 0 A 10 10 0 1 1 10 0").len();
+        assert!(large > small * 3, "{small} {large}");
+        // Radii too small for the end point grow until they reach it: again a half circle.
+        let pts = one_line("M 0 0 A 1 1 0 0 1 10 0");
+        assert!(pts.iter().all(|p| ((p.x - 5.0).hypot(p.y) - 5.0).abs() < 1e-9));
+        // A rotated ellipse: radii 10 and 5 turned by 90 degrees run 5 wide and 10 high.
+        let pts = one_line("M 0 0 A 10 5 90 0 1 0 20");
+        assert!(pts.iter().any(|p| (p.x + 5.0).abs() < 1e-9 || (p.x - 5.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn quadratic_and_smooth_curves_are_flattened() {
+        // A quadratic from (0, 0) to (10, 0) with its control at (5, 10) peaks at (5, 5).
+        let pts = one_line("M 0 0 Q 5 10 10 0");
+        assert!(pts.iter().any(|p| near(*p, Point::new(5.0, 5.0))));
+        // `T` mirrors the control point: the next hump goes below the line.
+        let pts = one_line("M 0 0 Q 5 10 10 0 T 20 0");
+        assert!(pts.iter().any(|p| near(*p, Point::new(15.0, -5.0))));
+        assert!(near(pts[pts.len() - 1], Point::new(20.0, 0.0)));
+        // `S` mirrors the last cubic's second control point.
+        let pts = one_line("M 0 0 C 0 10 10 10 10 0 s 10 -10 10 0");
+        assert!(pts.iter().any(|p| near(*p, Point::new(15.0, -7.5))), "{pts:?}");
+        assert!(near(pts[pts.len() - 1], Point::new(20.0, 0.0)));
+        // Without a curve before it, `T` and `S` take the current point as their control.
+        let pts = one_line("M 0 0 L 1 0 T 11 0");
+        assert!(pts.iter().all(|p| p.y.abs() < 1e-9));
+    }
+
+    #[test]
+    fn hostile_arcs_do_not_panic() {
+        for d in [
+            "M 0 0 A 0 0 0 0 1 10 0",
+            "M 0 0 A 5 5 0 0 1 0 0",
+            "M 0 0 A NaN 5 0 0 1 10 0",
+            "M 0 0 A 1e308 1e308 1e308 1 1 10 0",
+            "M 0 0 A 1e-300 1e-300 0 0 1 1e300 0",
+            "M 0 0 A 5 5 0 0 1",
+        ] {
+            let _ = path(d, &M::ID);
+        }
+        // A zero radius is a straight line.
+        assert_eq!(one_line("M 0 0 A 0 5 0 0 1 10 0").len(), 2);
     }
 
     #[test]
