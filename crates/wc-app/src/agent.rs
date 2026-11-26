@@ -505,9 +505,24 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "run_check",
-            "Check the project: devices drawn twice, contacts without a coil, shorted potentials, open pins, wires ending in the air, devices without a part.",
+            "Check the project: devices drawn twice, contacts without a coil, shorted potentials, open pins, wires ending in the air, devices without a part, then the check rules of the project's library sources (less the ones the project turns off) and the project's own check rules (see the rules tool).",
             json!({}),
             &[],
+        ),
+        tool(
+            "rules",
+            "The project's check rules, which run_check runs: list (the project's own rules, each library source's rules numbered from 1 and whether the project turns it off, and rules_off), set (replace the project's own rules with `rules`, a list in order; send the whole list), off or on (turn a library rule off or back on by `rule`, written source:number or source:name). A rule has kind (cable: the devices have a cable on a pin; tag: their tags match `pattern`, where * is any run, ? one character, # a number; max-wires: at most `max` wire ends on one pin, terminals unless devices or role says otherwise), and optionally devices (tag pattern such as -M*), role (main, auxiliary, standalone, terminal, interruption), severity (error, warning, note; default warning), message ({tag} stands for the tag) and name.",
+            json!({
+                "action": {"type": "string", "enum": ["list", "set", "off", "on"]},
+                "rules": {"type": "array", "items": {"type": "object", "properties": {
+                    "kind": {"type": "string", "enum": wc_core::check_rule::KINDS},
+                    "devices": {"type": "string"}, "role": {"type": "string"}, "pattern": {"type": "string"},
+                    "max": {"type": "integer"}, "severity": {"type": "string"}, "message": {"type": "string"},
+                    "name": {"type": "string"}
+                }, "required": ["kind"]}},
+                "rule": {"type": "string", "description": "off/on: the library rule, as source:number or source:name."}
+            }),
+            &["action"],
         ),
         tool(
             "get_report",
@@ -1834,6 +1849,7 @@ impl App {
             "jumpers" => self.tool_jumpers(v),
             "strips" => self.tool_strips(v),
             "macros" => self.tool_macros(v),
+            "rules" => self.tool_rules(v),
             "number_wires" => {
                 use wc_core::numbering::Rule;
                 let rule = match s(v, "rule").unwrap_or("page_column") {
@@ -2808,6 +2824,128 @@ impl App {
                 })
             }
             other => Err(format!("Unknown strips action {other}.")),
+        }
+    }
+
+    /// The `rules` tool: the project's check rules and the library rules it turns off, kept
+    /// as the check rules dialog keeps them (its checks, one undo step).
+    fn tool_rules(&mut self, v: &Value) -> Result<String, String> {
+        use wc_core::check_rule::{CheckRule, turned_off};
+        let action = need_s(v, "action")?;
+        let open = need_open(self.open.as_mut())?;
+        let library = wc_library::library_rules(&open.dir, &open.project);
+        let off = &open.project.meta.rules_off;
+        match action {
+            "list" => {
+                let sources: Vec<Value> = library
+                    .iter()
+                    .map(|set| match &set.rules {
+                        Ok(rules) => {
+                            let rules: Vec<Value> = rules
+                                .iter()
+                                .enumerate()
+                                .map(|(k, r)| {
+                                    json!({"rule": format!("{}:{}", set.source, k + 1), "off": turned_off(off, &set.source, k + 1, r), "is": r})
+                                })
+                                .collect();
+                            json!({"source": set.source, "rules": rules})
+                        }
+                        Err(e) => json!({"source": set.source, "error": e}),
+                    })
+                    .collect();
+                Ok(pretty(
+                    &json!({"rules": open.project.meta.rules, "library": sources, "rules_off": off}),
+                ))
+            }
+            "set" => {
+                let list = v
+                    .get("rules")
+                    .and_then(Value::as_array)
+                    .ok_or("`rules` must be a list of rules (an empty list removes them all).")?;
+                let mut rules = Vec::with_capacity(list.len());
+                for (k, r) in list.iter().enumerate() {
+                    let rule: CheckRule =
+                        serde_json::from_value(r.clone()).map_err(|e| format!("Rule {}: {e}.", k + 1))?;
+                    if !rule.unknown.is_empty() {
+                        let keys: Vec<&str> = rule.unknown.keys().map(String::as_str).collect();
+                        return Err(format!(
+                            "Rule {}: no such key {} (a rule has kind, devices, role, pattern, max, severity, message and name).",
+                            k + 1,
+                            keys.join(", ")
+                        ));
+                    }
+                    // The dialog's checks: the check would report such a rule instead of running it.
+                    rules.push(crate::rules_form::RuleRow::of(&rule).rule(k + 1)?);
+                }
+                let n = rules.len();
+                open.set_check_rules(rules);
+                Ok(format!("The project has {n} check rule(s) now; run_check runs them."))
+            }
+            "off" | "on" => {
+                let which = need_s(v, "rule")?.trim();
+                // The one rule `which` names, as `turned_off` reads it: by number, or by name.
+                // A selector that could stand for two rules (a rule named "2" and rule 2,
+                // or two rules of one name) is refused rather than guessed.
+                let mut found = None;
+                if let Some((src, sel)) = which.split_once(':')
+                    && let Some(set) = library.iter().find(|set| set.source == src.trim())
+                {
+                    let rules = match &set.rules {
+                        Ok(rules) => rules,
+                        // `on` can still drop the entry as written, below.
+                        Err(e) if action == "off" => {
+                            return Err(format!(
+                                "The check rules of library {} cannot be read, so {which:?} cannot be turned off: {e}",
+                                set.source
+                            ));
+                        }
+                        Err(_) => &Vec::new(),
+                    };
+                    let one = [which.to_owned()];
+                    let hits: Vec<(usize, &CheckRule)> = rules
+                        .iter()
+                        .enumerate()
+                        .map(|(k, r)| (k + 1, r))
+                        .filter(|&(n, r)| turned_off(&one, &set.source, n, r))
+                        .collect();
+                    if hits.len() > 1 {
+                        let list: Vec<String> = hits.iter().map(|(n, _)| format!("{}:{n}", set.source)).collect();
+                        return Err(format!(
+                            "{which:?} could be rule {} of library {}: {:?} is a number and a rule's name too, or two rules share it. An entry in rules_off turns off all of them; name the rule another way (list shows each rule's number and name).",
+                            list.join(" or "),
+                            set.source,
+                            sel.trim()
+                        ));
+                    }
+                    found = hits.first().map(|&(n, r)| (set.source.clone(), n, r.clone()));
+                }
+                let mut now = off.clone();
+                match (action, found) {
+                    ("off", None) => {
+                        return Err(format!(
+                            "No library check rule {which:?}: write source:number or source:name (list shows them)."
+                        ));
+                    }
+                    ("off", Some((src, n, r))) => {
+                        if turned_off(&now, &src, n, &r) {
+                            return Ok(format!("{which} is off already."));
+                        }
+                        now.push(which.to_owned());
+                    }
+                    (_, Some((src, n, r))) => {
+                        // Every entry that turns it off, by number or by name.
+                        now.retain(|o| !turned_off(std::slice::from_ref(o), &src, n, &r));
+                    }
+                    // An entry naming no rule (a source since removed) can still be dropped.
+                    (_, None) => now.retain(|o| o.trim() != which),
+                }
+                if now == *off {
+                    return Ok(format!("{which} is on already."));
+                }
+                open.set_rules_off(now);
+                Ok(format!("{which} is {action} now; run_check shows the effect."))
+            }
+            other => Err(format!("Unknown action {other:?}: use list, set, off or on.")),
         }
     }
 
@@ -5998,6 +6136,143 @@ mod tests {
         let pdf = String::from_utf8_lossy(&std::fs::read(pdf_path).unwrap()).into_owned();
         assert!(pdf.contains(&hex("Reserve / Spare")), "the texts are in both languages");
         assert!(pdf.contains(&hex("Pumpene / Pumps")));
+    }
+
+    #[test]
+    fn the_rules_tool_refuses_a_selector_that_names_two_library_rules() {
+        let (tmp, mut a) = app(vec![]);
+        let odd = tmp.path().join("odd");
+        std::fs::create_dir_all(&odd).unwrap();
+        let rule = |name: &str| format!("[[rule]]\nname = \"{name}\"\nkind = \"cable\"\n\n");
+        let text = ["2", "tags", "dup", "dup"].map(rule).concat();
+        std::fs::write(odd.join("rules.toml"), text).unwrap();
+        a.open.as_mut().unwrap().project.meta.libraries = vec![wc_core::project::LibrarySource {
+            name: "odd".into(),
+            kind: "folder".into(),
+            location: odd.to_string_lossy().into(),
+            reference: None,
+        }];
+        let off = |a: &App| a.open.as_ref().unwrap().project.meta.rules_off.clone();
+        let is_off = |a: &mut App| -> Vec<bool> {
+            let list: Value = serde_json::from_str(&call(a, "rules", json!({"action": "list"})).unwrap()).unwrap();
+            let rules = list["library"][0]["rules"].as_array().unwrap().clone();
+            rules.iter().map(|r| r["off"] == true).collect()
+        };
+        let rules = |a: &mut App, action: &str, rule: &str| call(a, "rules", json!({"action": action, "rule": rule}));
+
+        // "2" is rule 2 by number and rule 1 by name: refused, nothing changes.
+        rules(&mut a, "off", "odd:tags").unwrap();
+        for action in ["on", "off"] {
+            let r = rules(&mut a, action, "odd:2");
+            assert!(r.as_ref().is_err_and(|e| e.contains("odd:1 or odd:2")), "{r:?}");
+        }
+        assert_eq!(off(&a), vec!["odd:tags".to_owned()]);
+        rules(&mut a, "on", "odd:tags").unwrap();
+        assert_eq!(is_off(&mut a), [false; 4], "list agrees with the tool");
+
+        // Two rules named dup: refused by name, each kept apart by number.
+        assert!(rules(&mut a, "off", "odd:dup").is_err());
+        rules(&mut a, "off", "odd:3").unwrap();
+        rules(&mut a, "off", "odd:4").unwrap();
+        rules(&mut a, "on", "odd:3").unwrap();
+        assert_eq!(is_off(&mut a), [false, false, false, true]);
+        assert!(rules(&mut a, "on", "odd:dup").is_err());
+
+        // An entry turning off two rules goes when either is turned on, so list shows both on.
+        a.open.as_mut().unwrap().project.meta.rules_off = vec!["odd:2".into()];
+        assert_eq!(is_off(&mut a), [true, true, false, false]);
+        rules(&mut a, "on", "odd:1").unwrap();
+        assert_eq!(is_off(&mut a), [false; 4]);
+
+        // A rules file that cannot be read: off says why; on still drops the entry as written.
+        std::fs::write(odd.join("rules.toml"), "[[rule]\n").unwrap();
+        let r = rules(&mut a, "off", "odd:1");
+        assert!(r.as_ref().is_err_and(|e| e.contains("cannot be read")), "{r:?}");
+        assert!(off(&a).is_empty());
+        a.open.as_mut().unwrap().project.meta.rules_off = vec!["odd:1".into()];
+        rules(&mut a, "on", "odd:1").unwrap();
+        assert!(off(&a).is_empty());
+    }
+
+    #[test]
+    fn the_rules_tool_lists_sets_and_turns_library_rules_off_and_on() {
+        let (tmp, mut a) = app(vec![]);
+        let house = tmp.path().join("house");
+        std::fs::create_dir_all(&house).unwrap();
+        std::fs::write(
+            house.join("rules.toml"),
+            "[[rule]]\nkind = \"cable\"\n\n[[rule]]\nname = \"tags\"\nkind = \"tag\"\npattern = \"-QQ#\"\n",
+        )
+        .unwrap();
+        a.open.as_mut().unwrap().project.meta.libraries = vec![wc_core::project::LibrarySource {
+            name: "house".into(),
+            kind: "folder".into(),
+            location: house.to_string_lossy().into(),
+            reference: None,
+        }];
+        a.open.as_mut().unwrap().project.pages[1]
+            .symbols
+            .push(wc_core::project::PlacedSymbol {
+                id: "s1".into(),
+                symbol: "wc.coil".into(),
+                at: Point::new(50.0, 50.0),
+                rotation: Default::default(),
+                mirror: false,
+                tag: DeviceTag::parse("-K1").ok(),
+            });
+        let meta = |a: &App| a.open.as_ref().unwrap().project.meta.clone();
+        let check = |a: &mut App| call(a, "run_check", json!({})).unwrap();
+
+        let list: Value = serde_json::from_str(&call(&mut a, "rules", json!({"action": "list"})).unwrap()).unwrap();
+        assert_eq!(list["library"][0]["rules"][1]["rule"], "house:2");
+        assert_eq!(list["library"][0]["rules"][1]["off"], false);
+        let tags = "check rule 2 \"tags\" of library house";
+        assert!(check(&mut a).contains(tags), "the library rule runs");
+
+        // Set: kept as the dialog keeps them, and run by the check.
+        call(
+            &mut a,
+            "rules",
+            json!({"action": "set", "rules": [{"kind": "tag", "pattern": "-ZZ#", "severity": "error", "message": "{tag} breaks the house rule"}]}),
+        )
+        .unwrap();
+        assert_eq!(meta(&a).rules[0].pattern.as_deref(), Some("-ZZ#"));
+        assert!(check(&mut a).contains("-K1 breaks the house rule"));
+        // The dialog's checks refuse a rule the check could not run, and a misspelt key.
+        for bad in [
+            json!([{"kind": "tag"}]),
+            json!([{"kind": "max-wires"}]),
+            json!([{"kind": "cable", "role": "bogus"}]),
+            json!([{"kind": "cable", "severty": "error"}]),
+            json!([{"kind": "nope"}]),
+        ] {
+            let r = call(&mut a, "rules", json!({"action": "set", "rules": bad}));
+            assert!(r.as_ref().is_err_and(|e| e.starts_with("Rule 1")), "{bad}: {r:?}");
+        }
+        assert_eq!(meta(&a).rules.len(), 1, "a refused list changes nothing");
+
+        // Off by name, on by number: both entries that turn it off go.
+        call(&mut a, "rules", json!({"action": "off", "rule": "house:tags"})).unwrap();
+        assert_eq!(meta(&a).rules_off, vec!["house:tags".to_owned()]);
+        assert!(!check(&mut a).contains(tags));
+        assert!(call(&mut a, "rules", json!({"action": "off", "rule": "house:9"})).is_err());
+        call(&mut a, "rules", json!({"action": "off", "rule": "house:1"})).unwrap();
+        let list: Value = serde_json::from_str(&call(&mut a, "rules", json!({"action": "list"})).unwrap()).unwrap();
+        assert_eq!(list["library"][0]["rules"][1]["off"], true);
+        call(&mut a, "rules", json!({"action": "on", "rule": "house:2"})).unwrap();
+        assert_eq!(meta(&a).rules_off, vec!["house:1".to_owned()]);
+
+        // Each change is one undo step; saved into project.toml.
+        let o = a.open.as_mut().unwrap();
+        o.save().unwrap();
+        let toml = std::fs::read_to_string(o.dir.join("project.toml")).unwrap();
+        assert!(toml.contains("rules_off") && toml.contains("-ZZ#"), "{toml}");
+        assert!(o.undo());
+        assert_eq!(o.project.meta.rules_off.len(), 2);
+        assert!(o.undo() && o.undo());
+        assert!(o.project.meta.rules_off.is_empty());
+        assert!(o.undo());
+        assert!(o.project.meta.rules.is_empty());
     }
 
     #[test]
