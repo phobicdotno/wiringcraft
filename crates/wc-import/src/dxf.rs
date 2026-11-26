@@ -266,12 +266,25 @@ impl Xf {
     /// DXF coordinates (y up) to DXF coordinates.
     fn apply(&self, x: f64, y: f64) -> (f64, f64) {
         let m = &self.m;
-        let (dx, dy) = (x - self.base.0, y - self.base.1);
-        if dx.is_finite() && dy.is_finite() {
-            return (self.at.0 + m[0] * dx + m[1] * dy, self.at.1 + m[2] * dx + m[3] * dy);
+        // The point less the base point, exactly: the rounded difference and what rounding
+        // left off (Knuth's two-sum), so a far base point next to a far insertion point keeps
+        // the block's own small lengths.
+        let two_sum = |a: f64, b: f64| {
+            let hi = a + b;
+            let bb = hi - a;
+            (hi, (a - (hi - bb)) + (b - bb))
+        };
+        let ((hx, lx), (hy, ly)) = (two_sum(x, -self.base.0), two_sum(y, -self.base.1));
+        let placed = (
+            (self.at.0 + m[0] * hx + m[1] * hy) + (m[0] * lx + m[1] * ly),
+            (self.at.1 + m[2] * hx + m[3] * hy) + (m[2] * lx + m[3] * ly),
+        );
+        if placed.0.is_finite() && placed.1.is_finite() {
+            return placed;
         }
-        // A point and base point far apart on either side overflow when subtracted: each is
-        // placed on its own then, so a placement that shrinks them can still bring them in range.
+        // The difference, or the difference placed, is past the numbers: the base point and the
+        // point are placed each on their own then, so a placement that brings them back in range
+        // still draws them.
         let (bx, by) = self.base;
         let at = (self.at.0 - (m[0] * bx + m[1] * by), self.at.1 - (m[2] * bx + m[3] * by));
         (at.0 + m[0] * x + m[1] * y, at.1 + m[2] * x + m[3] * y)
@@ -4393,6 +4406,39 @@ mod tests {
         );
         let imported = page(&dxf(ents, blocks), 1.0, &BTreeSet::new());
         assert!(imported.is_ok(), "{:?}", imported.err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_far_block_on_a_far_insertion_point_keeps_its_small_lengths() -> Result<()> {
+        // Base point and insertion point alike far out: the line keeps its length of 1.
+        let blocks = "0\nBLOCK\n2\nFAR\n10\n1e308\n20\n0\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n0\nENDBLK\n";
+        let (g, skipped) = drawn("0\nINSERT\n2\nFAR\n10\n1e308\n20\n0\n", blocks)?;
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(
+            g,
+            [Shape::Line {
+                a: Point::new(0.0, 0.0),
+                b: Point::new(1.0, 0.0)
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_point_whose_placed_difference_overflows_is_placed_another_way() -> Result<()> {
+        // The point less the base point is a number, doubled it is not; placed each on their
+        // own, the line comes back in range.
+        let blocks = "0\nBLOCK\n2\nFAR\n10\n5e307\n20\n0\n0\nLINE\n10\n-5e307\n20\n0\n11\n-5e307\n21\n1\n0\nENDBLK\n";
+        let (g, skipped) = drawn("0\nINSERT\n2\nFAR\n10\n1e308\n20\n0\n41\n2\n42\n2\n", blocks)?;
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(
+            g,
+            [Shape::Line {
+                a: Point::new(-1e308, 0.0),
+                b: Point::new(-1e308, -2.0)
+            }]
+        );
         Ok(())
     }
 
