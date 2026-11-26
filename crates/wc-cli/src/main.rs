@@ -2509,8 +2509,13 @@ fn run(mut cli: Cli) -> Res<()> {
                             wc_report::step::DEFAULT_DEPTH,
                             step.default_depth.join(", ")
                         );
-                        // A warning that cannot be shown does not stop the command.
-                        let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
+                        // A warning that cannot be shown does not stop the export: it goes to
+                        // standard output instead, with the reason, as `logged_to` does.
+                        if let Err(why) = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes()) {
+                            // Nothing is left to report this to when standard output fails as well.
+                            let note = format!("warning: could not print on standard error: {why}\n{line}");
+                            let _ = std::io::Write::write_all(&mut std::io::stdout(), note.as_bytes());
+                        }
                     }
                     return Ok(());
                 }

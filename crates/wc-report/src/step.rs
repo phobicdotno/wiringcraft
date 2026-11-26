@@ -40,28 +40,36 @@ fn blocks(project: &Project, panel: &Panel, parts: &BTreeMap<String, Part>) -> (
     let top = panel.height;
     // Page y (down from the top) to model y (up from the bottom).
     let y = |v: f64| top - v;
-    let mut out: Vec<Block> = vec![(
-        format!("Mounting plate {}", panel.name),
-        [0.0, 0.0, 0.0],
-        [panel.width, panel.height, PLATE],
+    // Each box with whether it is a device drawn at the default depth.
+    let mut out: Vec<(Block, bool)> = vec![(
+        (
+            format!("Mounting plate {}", panel.name),
+            [0.0, 0.0, 0.0],
+            [panel.width, panel.height, PLATE],
+        ),
+        false,
     )];
-    // Indexes in `out` of the device boxes drawn at the default depth.
-    let mut guessed: Vec<usize> = Vec::new();
     let mut rails: Vec<(f64, f64, f64)> = Vec::new();
     for item in &panel.items {
         match item {
             PanelItem::Rail { at, length } => {
                 rails.push((at.x, at.x + length, at.y));
                 out.push((
-                    "DIN rail".into(),
-                    [at.x, y(at.y + 17.5), PLATE],
-                    [at.x + length, y(at.y - 17.5), PLATE + RAIL],
+                    (
+                        "DIN rail".into(),
+                        [at.x, y(at.y + 17.5), PLATE],
+                        [at.x + length, y(at.y - 17.5), PLATE + RAIL],
+                    ),
+                    false,
                 ));
             }
             PanelItem::Duct { min, max } => out.push((
-                "Wire duct".into(),
-                [min.x, y(max.y), PLATE],
-                [max.x, y(min.y), PLATE + DUCT_HEIGHT],
+                (
+                    "Wire duct".into(),
+                    [min.x, y(max.y), PLATE],
+                    [max.x, y(min.y), PLATE + DUCT_HEIGHT],
+                ),
+                false,
             )),
             PanelItem::Device { .. } => {}
         }
@@ -76,10 +84,8 @@ fn blocks(project: &Project, panel: &Panel, parts: &BTreeMap<String, Part>) -> (
                 .and_then(|d| d.part.as_ref())
                 .and_then(|id| parts.get(id))
                 .and_then(part_depth);
-            let depth = depth.unwrap_or_else(|| {
-                guessed.push(out.len());
-                DEFAULT_DEPTH
-            });
+            let guessed = depth.is_none();
+            let depth = depth.unwrap_or(DEFAULT_DEPTH);
             // A device on a rail sits on the rail; anything else on the plate.
             let middle = at.y + height / 2.0;
             let on_rail = rails
@@ -87,24 +93,23 @@ fn blocks(project: &Project, panel: &Panel, parts: &BTreeMap<String, Part>) -> (
                 .any(|(x0, x1, ry)| (middle - ry).abs() < 1.0 && at.x + width > *x0 && at.x < *x1);
             let base = if on_rail { PLATE + RAIL } else { PLATE };
             out.push((
-                tag.to_string(),
-                [at.x, y(at.y + height), base],
-                [at.x + width, y(at.y), base + depth],
+                (
+                    tag.to_string(),
+                    [at.x, y(at.y + height), base],
+                    [at.x + width, y(at.y), base + depth],
+                ),
+                guessed,
             ));
         }
     }
     // Boxes too thin to be a solid are left out, and so are their tags in the guessed list.
-    let keep: Vec<bool> = out
+    out.retain(|((_, a, b), _)| (0..3).all(|k| a[k].is_finite() && b[k].is_finite() && b[k] - a[k] > 1e-6));
+    let guessed = out
         .iter()
-        .map(|(_, a, b)| (0..3).all(|k| a[k].is_finite() && b[k].is_finite() && b[k] - a[k] > 1e-6))
+        .filter(|(_, guessed)| *guessed)
+        .map(|((name, _, _), _)| name.clone())
         .collect();
-    let guessed = guessed
-        .into_iter()
-        .filter(|&i| keep[i])
-        .map(|i| out[i].0.clone())
-        .collect();
-    let out = out.into_iter().zip(keep).filter_map(|(b, k)| k.then_some(b)).collect();
-    (out, guessed)
+    (out.into_iter().map(|(block, _)| block).collect(), guessed)
 }
 
 /// STEP text with one solid per plate, rail, duct and device, and the tags of the devices
