@@ -10128,4 +10128,38 @@ mod tests {
             "the base project's library sources, no starter library added"
         );
     }
+
+    /// A single-key shortcut goes by the modifiers held at the key press, not those of the frame:
+    /// Ctrl+R with Ctrl let go before the frame runs is not R (#709).
+    #[test]
+    fn single_key_shortcuts_check_the_modifiers_of_the_press() {
+        let (_tmp, mut a) = app(vec![]);
+        a.ed.tool = crate::state::Tool::Polyline;
+        let mut press = |key, at_press: egui::Modifiers, in_frame: egui::Modifiers| {
+            let raw = egui::RawInput {
+                modifiers: in_frame,
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: at_press,
+                }],
+                ..Default::default()
+            };
+            a.ed.finish_shape = false;
+            let mut got = Vec::new();
+            let _ = egui::Context::default().run(raw, |ctx| got = a.shortcuts(ctx));
+            (got, a.ed.finish_shape)
+        };
+        let (none, ctrl) = (egui::Modifiers::NONE, egui::Modifiers::COMMAND);
+        // Ctrl+R still opens the reports (a Ctrl shortcut), but does not also rotate.
+        assert_eq!(press(egui::Key::R, ctrl, none), (vec![Action::Reports], false));
+        assert_eq!(press(egui::Key::Delete, ctrl, none), (vec![], false));
+        assert_eq!(press(egui::Key::Enter, ctrl, none), (vec![], false));
+        assert_eq!(press(egui::Key::R, none, none), (vec![Action::Rotate], false));
+        assert_eq!(press(egui::Key::Enter, none, none), (vec![], true));
+        // Ctrl pressed after the key, before the frame: the bare press still counts.
+        assert_eq!(press(egui::Key::R, none, ctrl).0, vec![Action::Rotate]);
+    }
 }
