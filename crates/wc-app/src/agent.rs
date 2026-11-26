@@ -3347,6 +3347,8 @@ fn writes_while_held(args: &[String], dir: &Path, held: &BTreeMap<String, String
         | (Some("export" | "plc-vars" | "inspect"), _) => true,
         (Some("find"), _) => !has("--replace"),
         (Some("vcs"), Some("log" | "changes" | "page-log")) => true,
+        // `rules set`, `off` and `on` change the project; only the listing reads it.
+        (Some("rules"), Some("list")) => true,
         (
             Some(
                 "page" | "panel" | "location" | "jumper" | "strip" | "macro" | "revision" | "template" | "lib"
@@ -7920,6 +7922,31 @@ mod tests {
             assert!(seen.unknown.is_none());
             assert!(seen.reached_by(far.path(), &far_path).unwrap());
             assert!(!seen.reached_by(copy.path(), &copy_path).unwrap());
+        }
+    }
+
+    #[test]
+    fn rules_list_runs_while_a_page_is_held_but_rule_changes_do_not() {
+        let project = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let held: BTreeMap<String, String> = [("p0002".to_owned(), "Ola".to_owned())].into();
+        let classify = |words: &[&str]| {
+            let args: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
+            writes_while_held(&args, project.path(), &held, elsewhere.path())
+        };
+        for words in [&["rules", "list"][..], &["rules", "list", "--json"]] {
+            assert!(classify(words).is_none(), "{words:?}");
+        }
+        for words in [
+            &["rules", "set", "rules.toml"][..],
+            &["rules", "off", "lib:1"],
+            &["rules", "on", "lib:1"],
+            &["rules"],
+        ] {
+            let Some(e) = classify(words) else {
+                unreachable!("{words:?} ran")
+            };
+            assert!(e.contains("Ola") && e.contains("shared session"), "{words:?}: {e}");
         }
     }
 
