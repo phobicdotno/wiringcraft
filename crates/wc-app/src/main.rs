@@ -1636,6 +1636,14 @@ impl App {
                     }
                 }
             }
+            // Like the drawing tools, a copy with drawings or texts is not pasted while their
+            // layer is hidden or locked: they could not be seen or picked afterwards.
+            Action::Paste
+                if !self.clipboard.graphics.is_empty()
+                    && self.prefs.layers.refusal(layers::Layer::Drawings).is_some() =>
+            {
+                self.ed.message = self.prefs.layers.refusal(layers::Layer::Drawings).unwrap_or_default();
+            }
             Action::Paste => {
                 // At the pointer when it is over the sheet, otherwise a little below the original.
                 let at = self

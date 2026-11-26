@@ -9902,6 +9902,35 @@ mod tests {
     }
 
     #[test]
+    fn paste_of_a_copied_text_is_refused_while_the_drawings_layer_is_hidden_or_locked() {
+        use crate::layers::Layer;
+        let (_tmp, mut a) = app(vec![]);
+        call(
+            &mut a,
+            "add_graphic",
+            json!({"page": "p0002", "shape": {"kind": "text", "at": {"x": 30, "y": 30}, "text": "Hello"}}),
+        )
+        .unwrap();
+        a.ed.page = 1;
+        call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap();
+        a.run(Action::Copy);
+        for hide in [true, false] {
+            if hide {
+                a.prefs.layers.set_shown(Layer::Drawings, false);
+            } else {
+                a.prefs.layers.set_locked(Layer::Drawings, true);
+            }
+            a.run(Action::Paste);
+            assert_eq!(page2(&a).graphics.len(), 1, "nothing pasted out of sight");
+            assert!(a.ed.message.contains("Drawings and notes"), "{}", a.ed.message);
+            a.prefs.layers = Default::default();
+        }
+        // Shown and unlocked, the same Paste adds the text.
+        a.run(Action::Paste);
+        assert_eq!(page2(&a).graphics.len(), 2);
+    }
+
+    #[test]
     fn the_text_and_comment_dialogs_add_nothing_to_a_layer_hidden_while_they_were_open() {
         use crate::layers::Layer;
         let (_tmp, mut a) = app(vec![]);
