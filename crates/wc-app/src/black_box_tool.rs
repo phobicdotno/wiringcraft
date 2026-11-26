@@ -239,20 +239,8 @@ pub fn hint(draft: Option<&BoxDraft>) -> &'static str {
     }
 }
 
-/// The connection points `pins` of a box resized to `width` by `height`: each stays on its
-/// edge, its offset along the edge clamped to the new edge length (#524).
-pub fn resized_pins(pins: &[BoxPin], width: f64, height: f64) -> Vec<BoxPin> {
-    pins.iter()
-        .map(|p| BoxPin {
-            name: p.name.clone(),
-            side: p.side,
-            offset: match p.side {
-                BoxSide::Top | BoxSide::Bottom => p.offset.clamp(0.0, width),
-                BoxSide::Left | BoxSide::Right => p.offset.clamp(0.0, height),
-            },
-        })
-        .collect()
-}
+/// The connection points of a box resized to a new size, each kept on its edge (#524).
+pub use wc_core::box_edit::resized_pins;
 
 /// The size of a box `start` (width, height) after its sizing corner was dragged by `d` (page
 /// mm) on a box placed turned by `rotation` and maybe mirrored: in whole steps of `step`, and

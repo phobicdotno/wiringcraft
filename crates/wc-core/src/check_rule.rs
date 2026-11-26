@@ -616,4 +616,31 @@ severty = "error"
             Some(vec![])
         );
     }
+
+    /// The assistant's `rules` tool and the command line both turn rules through
+    /// [`turn_rule`]: a selector that is one rule's number and another's name is refused
+    /// both ways and changes nothing, and turning either rule on drops an entry that turns
+    /// off both.
+    #[test]
+    fn a_selector_that_is_one_rules_number_and_anothers_name_is_refused() {
+        let named = |name: &str| CheckRule {
+            name: Some(name.into()),
+            kind: "cable".into(),
+            ..CheckRule::default()
+        };
+        let sets = [RuleSet {
+            source: "odd".into(),
+            rules: Ok(vec![named("2"), named("tags")]),
+        }];
+        let off = vec!["odd:tags".to_owned()];
+        for turn_off in [true, false] {
+            let r = turn_rule(&off, &sets, "odd:2", turn_off);
+            assert!(r.as_ref().is_err_and(|e| e.contains("odd:1 or odd:2")), "{r:?}");
+        }
+        // An entry already there that turns off both goes when either is turned on.
+        let both = vec!["odd:2".to_owned()];
+        assert_eq!(turn_rule(&both, &sets, "odd:1", false).unwrap(), Some(vec![]));
+        assert_eq!(turn_rule(&both, &sets, "odd:tags", false).unwrap(), Some(vec![]));
+        assert_eq!(turn_rule(&both, &sets, "odd:tags", true).unwrap(), None, "off already");
+    }
 }

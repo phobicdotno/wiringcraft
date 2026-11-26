@@ -14,6 +14,7 @@ mod feedback;
 mod find_window;
 mod icons;
 mod import_symbols;
+mod imports;
 mod layers;
 mod live_check;
 mod macro_form;
@@ -191,6 +192,22 @@ enum Dialog {
     },
     /// Macros to insert.
     Macros(Vec<state::MacroEntry>),
+    /// File > Import without a file picker: the file (and, for parts with no folder chosen,
+    /// the library folder) typed, and why the picker could not be used.
+    ImportPath {
+        kind: imports::Kind,
+        target: Option<import_symbols::ImportTarget>,
+        file: prefs::FolderField,
+        lib: prefs::FolderField,
+        error: Option<String>,
+    },
+    /// Parts import: the library folder to write into, then the file.
+    ImportParts {
+        kind: imports::Kind,
+        targets: Vec<import_symbols::ImportTarget>,
+        /// An index into `targets`; one past the end is another folder, picked after the file.
+        chosen: usize,
+    },
     /// A project macro's placeholders and value sets (Insert macro, Placeholders…).
     MacroEdit {
         form: Box<macro_form::Form>,
@@ -308,8 +325,32 @@ enum Pending {
     Export(Export),
     Marking(wc_report::MarkingOptions),
     ReportCsv(wc_report::Kind),
+    /// File > Import; for parts, the library folder picked in the dialog (none: ask with the
+    /// folder picker).
+    Import(imports::Kind, Option<import_symbols::ImportTarget>),
     /// The WAGO configurator's article list to read back.
     WagoList,
+}
+
+/// Queue the picker `p` for the project in `dir` unless another waits: false when one does.
+fn queue_pending(
+    pending: &mut Option<Pending>,
+    pending_for: &mut Option<PathBuf>,
+    p: Pending,
+    dir: Option<PathBuf>,
+) -> bool {
+    if pending.is_some() {
+        return false;
+    }
+    *pending = Some(p);
+    *pending_for = dir;
+    true
+}
+
+/// Whether a picker queued while `asked_for` was open may still be shown with `now` open:
+/// Open project always, the others only for the same project.
+fn pending_applies(p: &Pending, asked_for: Option<&Path>, now: Option<&Path>) -> bool {
+    matches!(p, Pending::Open) || asked_for == now
 }
 
 /// The whole-project exports that ask where to go.
@@ -712,9 +753,13 @@ impl App {
             }
             return;
         }
+        if let Pending::Import(kind, target) = p {
+            self.import(kind, target);
+            return;
+        }
         let Some(open) = self.open.as_mut() else { return };
         match p {
-            Pending::Open => {}
+            Pending::Open | Pending::Import(..) => {}
             Pending::SaveAs => {
                 let parent = open
                     .dir
@@ -834,6 +879,94 @@ impl App {
         }
     }
 
+    /// File > Import: pick the file (and, for parts, the library folder), then run the import
+    /// the CLI runs and show what it said.
+    fn import(&mut self, kind: imports::Kind, target: Option<import_symbols::ImportTarget>) {
+        if let Some(why) = self.import_refused() {
+            self.dialog = Some(Dialog::Message(why.to_owned()));
+            return;
+        }
+        let Some(open) = self.open.as_ref() else { return };
+        let typed = |file: String, why: String| Dialog::ImportPath {
+            kind,
+            target: target.clone(),
+            file: prefs::FolderField::typed(file),
+            lib: prefs::FolderField::default(),
+            error: Some(why),
+        };
+        let file = match pick_open(kind.title(), &open.dir, kind.filter()) {
+            Picked::Path(f) => f,
+            // Without a picker (or perhaps one that never showed) the path can still be typed.
+            Picked::Failed(e) | Picked::Unsure(e) => {
+                self.dialog = Some(typed(String::new(), e));
+                return;
+            }
+            Picked::Cancelled => return,
+        };
+        let lib = if let Some(t) = target.as_ref().filter(|_| kind.needs_library()) {
+            Some(t.root.clone())
+        } else if kind.needs_library() {
+            let start = open.dir.display().to_string();
+            match pick_folder("Library folder for the imported parts", &start) {
+                Picked::Path(d) => Some(d),
+                Picked::Failed(e) | Picked::Unsure(e) => {
+                    self.dialog = Some(typed(file.display().to_string(), e));
+                    return;
+                }
+                Picked::Cancelled => return,
+            }
+        } else {
+            None
+        };
+        self.import_from(kind, &file, lib.as_deref(), target);
+    }
+
+    /// Why an import cannot run now: it writes to the project folder, which a shared session or
+    /// a running assistant command owns.
+    fn import_refused(&self) -> Option<&'static str> {
+        if self.share.active() {
+            Some("Imports are not available in a shared session: leave the session, import, and share again.")
+        } else if self.assistant.command_running() {
+            Some("The assistant is running a command on the project; import when it is done.")
+        } else {
+            None
+        }
+    }
+
+    /// Run the import of `file` (parts into `lib`) and show what it said; `target` is the
+    /// library folder chosen in the parts dialog, declared in the project when it is new.
+    fn import_from(
+        &mut self,
+        kind: imports::Kind,
+        file: &Path,
+        lib: Option<&Path>,
+        target: Option<import_symbols::ImportTarget>,
+    ) {
+        // Checked again here: the typed path form stays open while a session or a command starts.
+        if let Some(why) = self.import_refused() {
+            self.dialog = Some(Dialog::Message(why.to_owned()));
+            return;
+        }
+        let Some(open) = self.open.as_mut() else { return };
+        let (done, msg) = imports::import(open, kind, file, lib, self.ed.page);
+        // The project's own folder is listed first once parts are in it, as for symbols; so is
+        // a new folder chosen outside the library list.
+        let source = match (target, lib) {
+            (Some(t), _) => t.declare,
+            (None, Some(l)) if kind.needs_library() => new_folder_source(&open.dir, l, &open.project.meta.libraries),
+            (None, _) => None,
+        };
+        if done && let Some(source) = source {
+            open.checkpoint();
+            open.project.meta.libraries.insert(0, source);
+            open.dirty = true;
+            open.refresh_library();
+        }
+        applog::info(&format!("import {kind:?} {}", file.display()));
+        self.prune_selection();
+        self.dialog = Some(Dialog::Message(msg));
+    }
+
     /// Carry out an action. A picker it asks for waits until the frame's actions have run; while
     /// one waits, another is not taken (the first stays and the action says so).
     fn run(&mut self, a: Action) {
@@ -858,11 +991,20 @@ impl App {
         let Some(p) = self.pending.take() else { return };
         let asked_for = self.pending_for.take();
         let now = self.open.as_ref().map(|o| o.dir.clone());
-        if !matches!(p, Pending::Open) && asked_for != now {
+        if !pending_applies(&p, asked_for.as_deref(), now.as_deref()) {
             self.ed.message = "The file dialog was not shown: another project was opened before it could.".into();
             return;
         }
         self.ask(p);
+    }
+
+    /// Queue the picker `p` from a dialog, for the project open now, as [`App::run`] does for an
+    /// action; a picker already waiting stays and this one is not taken.
+    fn queue(&mut self, p: Pending) {
+        let dir = self.open.as_ref().map(|o| o.dir.clone());
+        if !queue_pending(&mut self.pending, &mut self.pending_for, p, dir) {
+            self.ed.message = "Not done: another file dialog is waiting to open; try again after it.".into();
+        }
     }
 
     fn carry_out(&mut self, a: Action) {
@@ -1331,6 +1473,31 @@ impl App {
             }
             Action::InsertMacro => self.dialog = Some(Dialog::Macros(open.macros())),
             Action::ExportDrawings => self.pending = Some(Pending::Export(Export::Drawings)),
+            a if imports::Kind::of(a).is_some() => {
+                if let Some(kind) = imports::Kind::of(a) {
+                    match kind
+                        .needs_library()
+                        .then(|| wc_library::Library::open(&open.dir, &open.project))
+                    {
+                        Some(Ok(lib)) => {
+                            self.dialog = Some(Dialog::ImportParts {
+                                kind,
+                                targets: library_targets(&lib, open),
+                                chosen: 0,
+                            });
+                        }
+                        // Without the project's library list the folder picker asks instead,
+                        // and the status line says why the list is not offered.
+                        Some(Err(e)) => {
+                            self.ed.message = format!(
+                                "The project's libraries could not be read ({e}); pick the library folder for the parts."
+                            );
+                            self.pending = Some(Pending::Import(kind, None));
+                        }
+                        None => self.pending = Some(Pending::Import(kind, None)),
+                    }
+                }
+            }
             Action::ExportAml => self.pending = Some(Pending::Export(Export::Aml)),
             Action::ExportWagoMarking => {
                 let strip = self.ed.marking_strip.take();
@@ -1393,17 +1560,7 @@ impl App {
             Action::ImportSymbols => match wc_library::Library::open(&open.dir, &open.project) {
                 Ok(lib) => {
                     self.dialog = Some(Dialog::ImportSymbols {
-                        targets: import_symbols::targets(
-                            &open.dir,
-                            folder_targets(&lib, open),
-                            &open
-                                .project
-                                .meta
-                                .libraries
-                                .iter()
-                                .map(|l| l.name.clone())
-                                .collect::<Vec<_>>(),
-                        ),
+                        targets: library_targets(&lib, open),
                         chosen: 0,
                         replace: false,
                     });
@@ -1544,6 +1701,8 @@ impl App {
             Dialog::Macros(_) => "Insert macro",
             Dialog::MacroEdit { .. } => "Macro placeholders",
             Dialog::ImportSymbols { .. } => "Import symbols",
+            Dialog::ImportParts { .. } => "Import parts",
+            Dialog::ImportPath { .. } => "Import",
             Dialog::Report { .. } => "Report a problem",
             Dialog::WagoMarking { .. } => "WAGO marking",
         };
@@ -2941,6 +3100,72 @@ impl App {
                         }
                     });
                 }
+                Dialog::ImportPath {
+                    kind,
+                    target,
+                    file,
+                    lib,
+                    error,
+                } => {
+                    ui.label(kind.title());
+                    let (label, extensions) = kind.filter();
+                    ui.label(format!("File ({label}: .{}), full path:", extensions.join(", .")));
+                    let r = ui.add(egui::TextEdit::singleline(&mut file.text).desired_width(380.0));
+                    let ask_lib = kind.needs_library() && target.is_none();
+                    if ask_lib {
+                        ui.label("Library folder for the parts:");
+                        ui.add(egui::TextEdit::singleline(&mut lib.text).desired_width(380.0));
+                    }
+                    if let Some(e) = error {
+                        ui.label(RichText::new(e.as_str()).color(theme::Theme::of(ui.ctx()).error));
+                    }
+                    ui.horizontal(|ui| {
+                        let go = ui.button("Import").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)));
+                        if go {
+                            let folder = typed_library(ask_lib, lib);
+                            match file.path().and_then(|f| folder.map(|l| (f, l))) {
+                                Ok((f, _)) if !f.is_file() => *error = Some(format!("{} is not a file.", f.display())),
+                                Ok((f, l)) => {
+                                    let (kind, target) = (*kind, target.clone());
+                                    let l = l.or_else(|| target.as_ref().map(|t| t.root.clone()));
+                                    then = Some(Box::new(move |app: &mut App| {
+                                        app.import_from(kind, &f, l.as_deref(), target);
+                                    }));
+                                    keep = false;
+                                }
+                                Err(e) => *error = Some(e),
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                }
+                Dialog::ImportParts { kind, targets, chosen } => {
+                    ui.label(kind.title());
+                    ui.horizontal(|ui| {
+                        ui.label("Library folder");
+                        let other = "Another folder…".to_owned();
+                        let shown = |k: usize| targets.get(k).map_or_else(|| other.clone(), |t| t.label());
+                        egui::ComboBox::from_id_salt("import_parts_lib")
+                            .selected_text(shown(*chosen))
+                            .show_ui(ui, |ui| {
+                                for k in 0..=targets.len() {
+                                    ui.selectable_value(chosen, k, shown(k));
+                                }
+                            });
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Choose the file and import…").clicked() {
+                            let pending = Pending::Import(*kind, targets.get(*chosen).cloned());
+                            then = Some(Box::new(move |app: &mut App| app.queue(pending)));
+                            keep = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                }
                 Dialog::ImportSymbols {
                     targets,
                     chosen,
@@ -3705,6 +3930,73 @@ fn main_viewport() -> egui::ViewportBuilder {
         .with_min_inner_size([900.0, 560.0])
         .with_title("WiringCraft")
         .with_icon(window_icon())
+}
+
+/// The library folder typed into the import form, when the form asks for one: a blank field is
+/// refused rather than taken as the projects folder.
+fn typed_library(ask: bool, field: &prefs::FolderField) -> Result<Option<PathBuf>, String> {
+    if !ask {
+        Ok(None)
+    } else if field.is_empty() {
+        Err("Type the library folder for the parts.".to_owned())
+    } else {
+        field.path().map(Some)
+    }
+}
+
+/// The source to add to the project for a parts folder chosen outside its library list (with
+/// "Another folder…" or the folder picker): None when `folder` is already one of `declared`
+/// (compared as given and as canonical paths). Its name is the folder's name, made unique
+/// among `declared`, since library proposals find their destination by name.
+fn new_folder_source(
+    project_dir: &Path,
+    folder: &Path,
+    declared: &[wc_core::project::LibrarySource],
+) -> Option<wc_core::project::LibrarySource> {
+    let same = |a: &Path, b: &Path| {
+        a == b
+            || matches!(
+                (a.canonicalize(), b.canonicalize()),
+                (Ok(x), Ok(y)) if x == y
+            )
+    };
+    let listed = declared.iter().any(|d| {
+        d.kind == "folder" && {
+            let at = Path::new(&d.location);
+            let at = if at.is_absolute() {
+                at.to_path_buf()
+            } else {
+                project_dir.join(at)
+            };
+            same(&at, folder)
+        }
+    });
+    if listed {
+        return None;
+    }
+    let base = folder
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "parts".to_owned());
+    let taken = |n: &str| declared.iter().any(|d| d.name == n);
+    let name = std::iter::once(base.clone())
+        .chain((2..).map(|k| format!("{base}-{k}")))
+        .find(|n| !taken(n))
+        .unwrap_or(base);
+    Some(wc_core::project::LibrarySource {
+        name,
+        kind: "folder".into(),
+        location: folder.display().to_string(),
+        reference: None,
+    })
+}
+
+/// Where imported symbols or parts can go: the project's own library folder first, then its
+/// other library folders ([`import_symbols::targets`]).
+fn library_targets(lib: &wc_library::Library, open: &Open) -> Vec<import_symbols::ImportTarget> {
+    let taken: Vec<String> = open.project.meta.libraries.iter().map(|l| l.name.clone()).collect();
+    import_symbols::targets(&open.dir, folder_targets(lib, open), &taken)
 }
 
 /// The project's library folders that symbols can be written into, in the project's order (the
@@ -5377,6 +5669,29 @@ mod picker_tests {
     use super::*;
 
     #[test]
+    fn a_queued_parts_picker_is_for_its_project_and_dropped_after_a_switch() {
+        let (mut pending, mut pending_for) = (None, None);
+        let a = PathBuf::from("a");
+        let parts = Pending::Import(imports::Kind::PartsCsv, None);
+        assert!(queue_pending(&mut pending, &mut pending_for, parts, Some(a.clone())));
+        // The first picker stays while it waits.
+        assert!(!queue_pending(
+            &mut pending,
+            &mut pending_for,
+            Pending::Open,
+            Some(a.clone())
+        ));
+        let Some(p) = pending.take() else {
+            unreachable!("the parts picker was not queued");
+        };
+        assert!(matches!(p, Pending::Import(imports::Kind::PartsCsv, None)));
+        assert!(pending_applies(&p, pending_for.as_deref(), Some(a.as_path())));
+        assert!(!pending_applies(&p, pending_for.as_deref(), Some(Path::new("b"))));
+        assert!(!pending_applies(&p, pending_for.as_deref(), None));
+        assert!(pending_applies(&Pending::Open, None, Some(Path::new("b"))));
+    }
+
+    #[test]
     fn a_picker_that_never_showed_says_so_instead_of_doing_nothing() {
         use std::time::Duration;
         let d = PathBuf::from("/x");
@@ -5884,5 +6199,44 @@ mod held_tests {
         // The panel was removed.
         follow_panel_pick(&mut ed, &project, "gone", k1.as_ref());
         assert_eq!((ed.panel, ed.panel_pick), (None, None));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod import_folder_tests {
+    use super::*;
+
+    #[test]
+    fn a_blank_library_field_is_refused_not_taken_as_the_projects_folder() {
+        let blank = prefs::FolderField::typed("  ".to_owned());
+        assert!(typed_library(true, &blank).is_err());
+        // Not asked: the field is not read at all.
+        assert_eq!(typed_library(false, &blank), Ok(None));
+        let typed = prefs::FolderField::typed("parts".to_owned());
+        assert!(matches!(typed_library(true, &typed), Ok(Some(_))));
+    }
+
+    #[test]
+    fn a_new_folder_chosen_for_parts_is_declared_and_a_listed_one_is_not() {
+        let t = tempfile::tempdir().unwrap();
+        let project = t.path().join("proj");
+        let listed = project.join("library");
+        let other = t.path().join("vendor");
+        std::fs::create_dir_all(&listed).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let declared = vec![wc_core::project::LibrarySource {
+            name: "vendor".into(),
+            kind: "folder".into(),
+            location: "library".into(),
+            reference: None,
+        }];
+        // Listed already (relative to the project): nothing to add.
+        assert_eq!(new_folder_source(&project, &listed, &declared), None);
+        // New: added as a folder source, its name made unique among the declared ones.
+        let got = new_folder_source(&project, &other, &declared).unwrap();
+        assert_eq!(got.kind, "folder");
+        assert_eq!(got.name, "vendor-2");
+        assert_eq!(Path::new(&got.location), other.as_path());
     }
 }

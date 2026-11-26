@@ -55,9 +55,11 @@ fn point_key(at: Point) -> (i64, i64) {
     ((at.x * 100.0).round() as i64, (at.y * 100.0).round() as i64)
 }
 
-/// A free wire end that would join another wire there, which it did not before.
+/// A free wire end that would join another wire there, which it was not connected to before.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewJoin {
+    /// The index of the page in [`Project::pages`].
+    pub page: usize,
     /// The wire whose end was on a pin and is now a free end.
     pub wire: String,
     /// The other wire with a free end at the same place.
@@ -65,38 +67,84 @@ pub struct NewJoin {
     pub at: Point,
 }
 
-/// The free wire ends of `after` that join another wire's free end at the same place,
-/// although in `before` (the same page, its wires known by id) that end was on a pin and the
-/// two wires did not meet there. This is what turning wire ends on pins into free ends (a
-/// black box point that is removed keeps its wires' ends where it was) must not do: it would
-/// join nets that were separate (#609). Two wires that were on the same pin still meet, as
-/// before.
-pub fn new_point_joins(before: &Page, after: &Page) -> Vec<NewJoin> {
-    // Every free end of `after`: (wire id, the pin it was on before, if it was).
-    type FreeEnd<'a> = (&'a str, Option<&'a Endpoint>, Point);
-    let mut at: BTreeMap<(i64, i64), Vec<FreeEnd>> = BTreeMap::new();
-    for w in &after.wires {
-        let was = before.wires.iter().find(|b| b.id == w.id);
-        for (k, end) in [&w.from, &w.to].into_iter().enumerate() {
-            let Endpoint::Point { at: p } = end else {
-                continue;
-            };
-            let on_pin = was
-                .map(|b| if k == 0 { &b.from } else { &b.to })
-                .filter(|e| matches!(e, Endpoint::Pin { .. }));
-            at.entry(point_key(*p)).or_default().push((&w.id, on_pin, *p));
+/// Which wires of `project` are connected, by wire ends that meet (on a pin or at a free point)
+/// and by potential names: (page index, wire index) to a group number. Interruption points and
+/// jumpers are left out, so wires they alone connect are in different groups.
+fn wire_groups(project: &Project) -> BTreeMap<(usize, usize), usize> {
+    let mut ids: BTreeMap<Node, usize> = BTreeMap::new();
+    let mut dsu = Dsu { parent: Vec::new() };
+    let mut id_of = |n: Node, dsu: &mut Dsu| -> usize {
+        let next = ids.len();
+        *ids.entry(n).or_insert_with(|| {
+            dsu.parent.push(next);
+            next
+        })
+    };
+    let mut first = Vec::new();
+    for (pi, page) in project.pages.iter().enumerate() {
+        let node = |e: &Endpoint| match e {
+            Endpoint::Pin { item, pin } => Node::Pin((page.id.clone(), item.clone(), pin.clone())),
+            Endpoint::Point { at } => {
+                let (x, y) = point_key(*at);
+                Node::Point(page.id.clone(), x, y)
+            }
+        };
+        for (wi, w) in page.wires.iter().enumerate() {
+            let a = id_of(node(&w.from), &mut dsu);
+            let b = id_of(node(&w.to), &mut dsu);
+            dsu.union(a, b);
+            if let Some(name) = &w.potential {
+                let p = id_of(Node::Potential(name.clone()), &mut dsu);
+                dsu.union(a, p);
+            }
+            first.push(((pi, wi), a));
         }
     }
+    first.into_iter().map(|(w, a)| (w, dsu.find(a))).collect()
+}
+
+/// The free wire ends of `after` that join another wire's free end at the same place,
+/// although in `before` (the same project before the change: its pages in the same order, the
+/// wires known by id) that end was on a pin and the two wires were not connected. This is what
+/// turning wire ends on pins into free ends (a black box point that is removed keeps its
+/// wires' ends where it was) must not do: it would join nets that were separate (#609). Wires
+/// that were connected already, such as two on the same pin, may still meet.
+pub fn new_point_joins(before: &Project, after: &Project) -> Vec<NewJoin> {
+    let mut groups = None;
     let mut joins = Vec::new();
-    for ends in at.values() {
-        for (wire, pin, p) in ends {
-            let Some(pin) = pin else { continue };
-            if let Some((other, ..)) = ends.iter().find(|(o, opin, _)| o != wire && *opin != Some(*pin)) {
-                joins.push(NewJoin {
-                    wire: (*wire).to_owned(),
-                    other: (*other).to_owned(),
-                    at: *p,
-                });
+    for (pi, (bp, ap)) in before.pages.iter().zip(&after.pages).enumerate() {
+        // Every free end of the page after: (wire id, its wire index before, whether it was on
+        // a pin, where it is).
+        type FreeEnd<'a> = (&'a str, Option<usize>, bool, Point);
+        let mut at: BTreeMap<(i64, i64), Vec<FreeEnd>> = BTreeMap::new();
+        for w in &ap.wires {
+            let was = bp.wires.iter().position(|b| b.id == w.id);
+            for (k, end) in [&w.from, &w.to].into_iter().enumerate() {
+                let Endpoint::Point { at: p } = end else {
+                    continue;
+                };
+                let on_pin = was
+                    .map(|i| if k == 0 { &bp.wires[i].from } else { &bp.wires[i].to })
+                    .is_some_and(|e| matches!(e, Endpoint::Pin { .. }));
+                at.entry(point_key(*p)).or_default().push((&w.id, was, on_pin, *p));
+            }
+        }
+        for ends in at.values() {
+            for (wire, was, on_pin, p) in ends {
+                if !on_pin {
+                    continue;
+                }
+                let groups = groups.get_or_insert_with(|| wire_groups(before));
+                let group = |i: &Option<usize>| i.and_then(|i| groups.get(&(pi, i)).copied());
+                let connected = |o: &Option<usize>| group(was).is_some() && group(was) == group(o);
+                if let Some((other, ..)) = ends.iter().find(|(o, ow, ..)| o != wire && !connected(ow)) {
+                    joins.push(NewJoin {
+                        page: pi,
+                        wire: (*wire).to_owned(),
+                        other: (*other).to_owned(),
+                        at: *p,
+                    });
+                }
             }
         }
     }
@@ -258,42 +306,60 @@ mod tests {
     #[test]
     fn a_pin_end_made_free_where_another_free_end_is_is_a_new_join() {
         let free = |x: f64, y: f64| Endpoint::Point { at: Point::new(x, y) };
-        let mut before = Page::new("a", "1", "");
-        before.wires = vec![
+        let mut page = Page::new("a", "1", "");
+        page.wires = vec![
             wire("w1", pin("b1", "IN"), pin("k1", "A1"), None),
             wire("w2", pin("b1", "IN"), pin("k2", "A1"), None),
             wire("w3", free(40.0, 45.0), pin("k3", "A1"), None),
             wire("w4", pin("b1", "OUT"), pin("k4", "A1"), None),
         ];
+        let mut before = Project::new("t");
+        before.pages = vec![page];
         // IN (at 40, 45) and OUT (at 60, 45) are removed: their wires keep free ends there.
         let mut after = before.clone();
-        after.wires[0].from = free(40.0, 45.0);
-        after.wires[1].from = free(40.0, 45.0);
-        after.wires[3].from = free(60.0, 45.0);
+        after.pages[0].wires[0].from = free(40.0, 45.0);
+        after.pages[0].wires[1].from = free(40.0, 45.0);
+        after.pages[0].wires[3].from = free(60.0, 45.0);
         let joins = new_point_joins(&before, &after);
         // w1 and w2 were on the same point and still meet; w3's free end was there already.
-        assert_eq!(
-            joins,
-            vec![
-                NewJoin {
-                    wire: "w1".into(),
-                    other: "w3".into(),
-                    at: Point::new(40.0, 45.0)
-                },
-                NewJoin {
-                    wire: "w2".into(),
-                    other: "w3".into(),
-                    at: Point::new(40.0, 45.0)
-                },
-            ]
-        );
+        let join = |wire: &str| NewJoin {
+            page: 0,
+            wire: wire.into(),
+            other: "w3".into(),
+            at: Point::new(40.0, 45.0),
+        };
+        assert_eq!(joins, vec![join("w1"), join("w2")]);
         // Without w3 nothing new joins.
-        before.wires.remove(2);
-        after.wires.remove(2);
+        before.pages[0].wires.remove(2);
+        after.pages[0].wires.remove(2);
         assert_eq!(new_point_joins(&before, &after), vec![]);
         // Two points removed at one place (boxes on top of each other) join their wires.
-        after.wires[2].from = free(40.0, 45.0);
+        after.pages[0].wires[2].from = free(40.0, 45.0);
         assert_eq!(new_point_joins(&before, &after).len(), 3);
+    }
+
+    #[test]
+    fn a_free_end_on_a_wire_already_connected_is_no_new_join() {
+        let free = |x: f64, y: f64| Endpoint::Point { at: Point::new(x, y) };
+        let mut page = Page::new("a", "1", "");
+        // w1 runs from box point A to C; w2 from where A is to the same C: one net already.
+        page.wires = vec![
+            wire("w1", pin("b1", "A"), pin("k1", "C"), None),
+            wire("w2", free(40.0, 45.0), pin("k1", "C"), None),
+            wire("w3", pin("b1", "B"), pin("k3", "A1"), Some("L1")),
+            wire("w4", free(60.0, 45.0), pin("k4", "A1"), Some("L1")),
+        ];
+        let mut before = Project::new("t");
+        before.pages = vec![page];
+        let mut after = before.clone();
+        after.pages[0].wires[0].from = free(40.0, 45.0);
+        // w3 and w4 carry the same potential.
+        after.pages[0].wires[2].from = free(60.0, 45.0);
+        assert_eq!(new_point_joins(&before, &after), vec![]);
+        // On another net it is refused.
+        before.pages[0].wires[1].to = pin("k2", "C");
+        after.pages[0].wires[1].to = pin("k2", "C");
+        assert_eq!(new_point_joins(&before, &after).len(), 1);
     }
 
     #[test]

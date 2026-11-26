@@ -1438,6 +1438,43 @@ impl Open {
         Ok(())
     }
 
+    /// Take in what an import wrote to the project folder, as one Undo step. Call it with no
+    /// changes left unsaved (they would be replaced). Returns whether the project changed.
+    pub fn adopt_saved(&mut self) -> Result<bool, String> {
+        let fresh = Open::load(&self.dir)?;
+        self.branch = fresh.branch;
+        let changed = fresh.project != self.project;
+        // The versions the import replaced are kept, so its undo step can put them back: the
+        // loaded parts too, whose files and pins an import can replace the same way.
+        self.archive_symbols();
+        for p in self.parts.values() {
+            self.part_versions.insert(p.hash(), p.clone());
+        }
+        // And the versions the import pinned: a part no device uses is not loaded below, and
+        // Redo needs its version once Undo has put the old file back.
+        for (id, entry) in &fresh.project.lock.parts {
+            if self.project.lock.parts.get(id) != Some(entry)
+                && let Ok(part) = store::read_vendored_part(&self.dir, id)
+                && part.hash() == entry.hash
+            {
+                self.part_versions.insert(entry.hash.clone(), part);
+            }
+        }
+        self.symbols.extend(fresh.symbols);
+        // An import can write a picture over a file shown before (a PDF scan at the same page).
+        self.underlays.clear();
+        self.picture_problems.clear();
+        if changed {
+            self.forget_terminal_change();
+            self.checkpoint();
+            self.project = fresh.project;
+            self.forget_terminal_change();
+            self.dirty = false;
+        }
+        self.refresh_library();
+        Ok(changed)
+    }
+
     /// Keep the loaded symbol versions, so a step that replaces them can be undone.
     pub fn archive_symbols(&mut self) {
         for sym in self.symbols.values() {
@@ -2247,34 +2284,6 @@ impl Open {
         Ok(id)
     }
 
-    /// A black box edit's wire ends `ends` (page, wire, which end, new end) must not leave a
-    /// free end where another wire already has one: the two would join into one net (#609).
-    fn check_no_new_point_joins(&self, ends: &[(usize, usize, usize, Endpoint)]) -> Result<(), String> {
-        let pages: std::collections::BTreeSet<usize> = ends
-            .iter()
-            .filter(|e| matches!(e.3, Endpoint::Point { .. }))
-            .map(|e| e.0)
-            .collect();
-        for pi in pages {
-            let Some(before) = self.project.pages.get(pi) else {
-                continue;
-            };
-            let mut after = before.clone();
-            for (_, wi, k, to) in ends.iter().filter(|e| e.0 == pi) {
-                if let Some(w) = after.wires.get_mut(*wi) {
-                    *(if *k == 0 { &mut w.from } else { &mut w.to }) = to.clone();
-                }
-            }
-            if let Some(j) = wc_core::connectivity::new_point_joins(before, &after).first() {
-                return Err(format!(
-                    "wire {} on page {} would keep a free end at ({}, {}), where wire {} already ends, and the two would be joined; move one of these wire ends first",
-                    j.wire, before.number, j.at.x, j.at.y, j.other
-                ));
-            }
-        }
-        Ok(())
-    }
-
     /// Change black box `item` on page `page` to `width` by `height` mm (`size`) with the connection
     /// points `pins`, as one undo step. `renamed` maps a point's old name to its new one, and the
     /// wires on it follow; `removed` names the old points that were taken off (a new point may
@@ -2314,7 +2323,6 @@ impl Open {
         let pg = self.project.pages.get(page).ok_or("no page")?;
         let placed = pg.symbol(item).ok_or_else(|| format!("no item {item} on this page"))?;
         let symbol_id = placed.symbol.clone();
-        let (rotation, mirror) = (placed.rotation, placed.mirror);
         let moves = moved.x != 0.0 || moved.y != 0.0;
         let old = self
             .symbols
@@ -2341,117 +2349,19 @@ impl Open {
                 p.number
             ));
         }
-        let mut new = wc_core::black_box(&symbol_id, &old.name, width, height, pins).map_err(|e| e.to_string())?;
-        new.tag_at = old.tag_at;
-        new.description.clone_from(&old.description);
-        new.source.clone_from(&old.source);
-        new.role = old.role;
-        new.letter_code.clone_from(&old.letter_code);
-        let renamed: BTreeMap<&str, &str> = renamed
-            .iter()
-            .filter(|(from, to)| from != to && old.pin(from).is_some() && !removed.contains(*from))
-            .map(|(from, to)| (from.as_str(), to.as_str()))
-            .collect();
-        if let Some((_, to)) = renamed.iter().find(|(_, to)| new.pin(to).is_none()) {
-            return Err(format!("the box has no connection point {to} to rename a point to"));
-        }
-        let removed: Vec<&str> = removed
-            .iter()
-            .filter(|n| old.pin(n).is_some())
-            .map(String::as_str)
-            .collect();
-        if new == old && renamed.is_empty() && removed.is_empty() && !moves {
-            return Ok(Vec::new());
-        }
-        // What an old point is now: its new name, or `None` when it is gone. A name another
-        // point was renamed to, or a new point took, is that point's, not this one's.
-        let taken: Vec<&str> = renamed.values().copied().collect();
-        let now_of = |pin: &str| -> Option<String> {
-            if removed.contains(&pin) {
-                return None;
-            }
-            if let Some(to) = renamed.get(pin) {
-                return Some((*to).to_owned());
-            }
-            (!taken.contains(&pin) && new.pin(pin).is_some()).then(|| pin.to_owned())
+        let edit = wc_core::box_edit::BoxEdit {
+            page,
+            item,
+            size: (width, height),
+            pins,
+            renamed,
+            removed,
+            moved,
         };
-        // Every placed copy of the symbol changes: name the others, and the wires on points
-        // that are gone or moved. Each wire end that changes: (page, wire, which end, new end).
-        let mut warnings = Vec::new();
-        let mut ends: Vec<(usize, usize, usize, Endpoint)> = Vec::new();
-        let mut others = 0usize;
-        for (pi, p) in self.project.pages.iter().enumerate() {
-            let users: Vec<&str> = p
-                .symbols
-                .iter()
-                .filter(|s| s.symbol == symbol_id)
-                .map(|s| s.id.as_str())
-                .collect();
-            others += users.iter().filter(|u| !(pi == page && **u == item)).count();
-            for (wi, w) in p.wires.iter().enumerate() {
-                for (k, end) in [&w.from, &w.to].into_iter().enumerate() {
-                    let Endpoint::Pin { item: on, pin } = end else {
-                        continue;
-                    };
-                    if !users.contains(&on.as_str()) {
-                        continue;
-                    }
-                    match (old.pin(pin), now_of(pin).and_then(|n| new.pin(&n))) {
-                        (_, None) => {
-                            warnings.push(format!(
-                                "wire {} on page {} ended on connection point {pin} of {on}, which is gone: its end stays where the point was",
-                                w.id, p.number
-                            ));
-                            if let Some(at) = self.pin_pos(p, on, pin) {
-                                ends.push((pi, wi, k, Endpoint::Point { at }));
-                            }
-                        }
-                        (Some(a), Some(b)) => {
-                            // The moved box's points are compared where they are on the page.
-                            let (was, now) = if moves && pi == page && on == item {
-                                (
-                                    a.at.transform(rotation, mirror),
-                                    b.at.transform(rotation, mirror) + moved,
-                                )
-                            } else {
-                                (a.at, b.at)
-                            };
-                            if was.distance(now) > 1e-6 || a.dir != b.dir {
-                                warnings.push(format!(
-                                    "wire {} on page {} ends on connection point {} of {on}, which moved: check its route",
-                                    w.id, p.number, b.name
-                                ));
-                            }
-                            if b.name != *pin {
-                                ends.push((
-                                    pi,
-                                    wi,
-                                    k,
-                                    Endpoint::Pin {
-                                        item: on.clone(),
-                                        pin: b.name.clone(),
-                                    },
-                                ));
-                            }
-                        }
-                        (None, Some(_)) => {
-                            warnings.push(format!(
-                                "wire {} on page {} ends on connection point {pin} of {on}, which the box did not have before: it now ends on the new point",
-                                w.id, p.number
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-        self.check_no_new_point_joins(&ends)?;
-        if others > 0 {
-            warnings.push(format!(
-                "{others} other placed box{} use{} the same symbol and changed too",
-                if others == 1 { "" } else { "es" },
-                if others == 1 { "s" } else { "" }
-            ));
-        }
+        let Some(plan) = wc_core::box_edit::plan(&self.project, &old, &edit).map_err(|e| e.to_string())? else {
+            return Ok(Vec::new());
+        };
+        let new = plan.symbol.clone();
         self.write_symbol_file(&new)?;
         self.checkpoint();
         self.project.lock.symbols.insert(
@@ -2464,11 +2374,7 @@ impl Open {
         self.symbol_versions.insert(old.hash(), old);
         self.symbol_versions.insert(new.hash(), new.clone());
         self.symbols.insert(symbol_id.clone(), new);
-        for (pi, wi, k, to) in ends {
-            if let Some(w) = self.project.pages.get_mut(pi).and_then(|p| p.wires.get_mut(wi)) {
-                *(if k == 0 { &mut w.from } else { &mut w.to }) = to;
-            }
-        }
+        plan.apply_ends(&mut self.project);
         if moves
             && let Some(s) = self
                 .project
@@ -2478,7 +2384,7 @@ impl Open {
         {
             s.at = s.at + moved;
         }
-        Ok(warnings)
+        Ok(plan.warnings)
     }
 
     pub fn add_wire(&mut self, page: usize, from: Endpoint, to: Endpoint, via: Vec<Point>) {
@@ -5646,6 +5552,33 @@ pub(crate) mod tests {
         o.parts.insert(pid.to_owned(), edited.clone());
         assert!(o.undo());
         assert_eq!(o.parts[pid], edited);
+    }
+
+    #[test]
+    fn undo_puts_back_a_loaded_part_an_import_replaced() {
+        let (_tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let pid = "example.ex-ct-9-24dc";
+        o.ensure_part(pid).unwrap();
+        o.save().unwrap();
+        o.part_versions.clear();
+        let old = o.parts[pid].clone();
+        // As a second import does: the part's file and its pin replaced on disk.
+        let mut new = old.clone();
+        new.description = "From the second import".into();
+        store::write_vendored_part(&o.dir, &new).unwrap();
+        let mut p = store::load(&o.dir).unwrap();
+        p.lock.parts.get_mut(pid).unwrap().hash = new.hash();
+        store::save(&o.dir, &p).unwrap();
+        assert!(o.adopt_saved().unwrap());
+        assert!(o.undo(), "{:?}", o.take_undo_error());
+        assert_eq!(store::read_vendored_part(&o.dir, pid).unwrap(), old);
+        // Redo puts the imported version back, also when no device uses the part, so it was
+        // never loaded.
+        assert!(!o.project.used_parts().contains(pid));
+        assert!(o.redo(), "{:?}", o.take_undo_error());
+        assert_eq!(o.project.lock.parts[pid].hash, new.hash());
+        assert_eq!(store::read_vendored_part(&o.dir, pid).unwrap(), new);
     }
 
     #[test]
