@@ -1812,8 +1812,10 @@ impl Open {
             ));
         }
         // A repository whose git config names its own work tree would go on recording the
-        // original's files from the copy.
-        if git_worktree_set(&from.join(".git").join("config")) {
+        // original's files from the copy. With `extensions.worktreeConfig` git also reads
+        // `config.worktree`, whose `core.worktree` wins over the common one.
+        let git = from.join(".git");
+        if git_worktree_set(&git.join("config")) || git_worktree_set(&git.join("config.worktree")) {
             return Err(format!(
                 "{}'s git history names its own work tree (core.worktree), so a copy would record \
                  the original's files. Copy the folder by hand and start a new history.",
@@ -1888,7 +1890,10 @@ impl Open {
         // followed by `..` goes where the file system says, not where the text does), also when
         // the library folder itself is missing now; a route it cannot walk (through a file)
         // stays the original's own, as a full path.
-        let repoint = |libs: &mut Vec<wc_core::project::LibrarySource>| {
+        // A library inside the project whose route in the copy is not text (its real folder
+        // has a name that is not UTF-8) cannot be saved without changing that route: refused,
+        // naming the library.
+        let repoint = |libs: &mut Vec<wc_core::project::LibrarySource>| -> Result<(), String> {
             for lib in libs {
                 if lib.kind == "folder" && Path::new(&lib.location).is_relative() {
                     let Ok(at) = destination(&from.join(&lib.location)) else {
@@ -1899,7 +1904,17 @@ impl Open {
                         // Inside the project (`library`, or `../design/library` from `design`):
                         // copied along, so the copy's own, written from the copy's root.
                         Ok(inside) if inside.as_os_str().is_empty() => ".".into(),
-                        Ok(inside) => inside.display().to_string(),
+                        Ok(inside) => match inside.to_str() {
+                            Some(t) => t.to_owned(),
+                            None => {
+                                return Err(format!(
+                                    "library {} lies in the project folder at {}, a name that cannot \
+                                     be saved as text; rename that folder and try again.",
+                                    lib.name,
+                                    inside.display()
+                                ));
+                            }
+                        },
                         // A route the saved text can hold: the relative one when it is valid
                         // text, otherwise the original's own route (through any link) as a
                         // full path, which stays text.
@@ -1910,26 +1925,57 @@ impl Open {
                     };
                 }
             }
+            Ok(())
         };
-        let (old_libraries, old_dirty) = (self.project.meta.libraries.clone(), self.dirty);
-        // The save in the copy repairs stale symbol files there; the original still needs them.
-        let old_stale = self.stale_symbol_files.clone();
-        repoint(&mut self.project.meta.libraries);
-        self.dir = target.clone();
-        if let Err(e) = self.save() {
-            self.dir = from.clone();
-            self.project.meta.libraries = old_libraries;
-            self.dirty = old_dirty;
-            self.stale_symbol_files = old_stale;
+        // Undo and Redo must not bring the old folders back into the copy: their libraries are
+        // pointed from the copy too, all worked out before anything changes.
+        let mut libraries = self.project.meta.libraries.clone();
+        let mut steps: Vec<_> = self
+            .undo
+            .iter()
+            .chain(self.redo.iter())
+            .map(|p| p.meta.libraries.clone())
+            .collect();
+        if let Err(e) = repoint(&mut libraries).and_then(|()| steps.iter_mut().try_for_each(&repoint)) {
             return Err(format!(
                 "{e}\n{}; you are still working in {}.",
                 discard(),
                 from.display()
             ));
         }
-        // Undo and Redo must not bring the old folders back into the copy.
-        for p in self.undo.iter_mut().chain(self.redo.iter_mut()) {
-            repoint(&mut p.meta.libraries);
+        let (old_libraries, old_dirty) = (
+            std::mem::replace(&mut self.project.meta.libraries, libraries),
+            self.dirty,
+        );
+        // The save in the copy repairs stale symbol files there; the original still needs them.
+        let old_stale = self.stale_symbol_files.clone();
+        // Files a failed update could not put back are written again in the copy, under the
+        // copy's folder; the original's records stay as they were when the copy fails.
+        let old_unrestored = self.unrestored_files.clone();
+        self.unrestored_files = old_unrestored
+            .iter()
+            .map(|(path, f)| {
+                let path = path
+                    .strip_prefix(&from)
+                    .map_or_else(|_| path.clone(), |rel| target.join(rel));
+                (path, f.clone())
+            })
+            .collect();
+        self.dir = target.clone();
+        if let Err(e) = self.save() {
+            self.dir = from.clone();
+            self.project.meta.libraries = old_libraries;
+            self.dirty = old_dirty;
+            self.stale_symbol_files = old_stale;
+            self.unrestored_files = old_unrestored;
+            return Err(format!(
+                "{e}\n{}; you are still working in {}.",
+                discard(),
+                from.display()
+            ));
+        }
+        for (p, libs) in self.undo.iter_mut().chain(self.redo.iter_mut()).zip(steps) {
+            p.meta.libraries = libs;
         }
         Ok((target, links))
     }
@@ -3957,6 +4003,90 @@ pub(crate) mod tests {
         // Without it the history is the copy's own.
         std::fs::write(o.dir.join(".git").join("config"), "[core]\n\tbare = false\n").unwrap();
         o.save_as(&to).unwrap();
+    }
+
+    #[test]
+    fn save_as_refuses_a_work_tree_named_in_the_per_worktree_config() {
+        let (tmp, mut o) = project();
+        let git = o.dir.join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        std::fs::write(
+            git.join("config"),
+            "[core]\n\tbare = false\n[extensions]\n\tworktreeConfig = true\n",
+        )
+        .unwrap();
+        std::fs::write(git.join("config.worktree"), "[core]\n\tworktree = /elsewhere\n").unwrap();
+        let to = tmp.path().join("copy");
+        assert!(o.save_as(&to).unwrap_err().contains("core.worktree"));
+        assert!(!to.exists());
+        // Without it the history is the copy's own.
+        std::fs::write(git.join("config.worktree"), "[core]\n\tsparseCheckout = false\n").unwrap();
+        o.save_as(&to).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_library_inside_the_project_whose_real_name_is_not_text_is_refused_and_the_original_stays() {
+        use std::os::unix::ffi::OsStrExt;
+        let (tmp, mut o) = project();
+        let odd = o.dir.join(std::ffi::OsStr::from_bytes(b"lib-\xff"));
+        // macOS file systems refuse a name that is not UTF-8: nothing to test there.
+        if std::fs::create_dir_all(&odd).is_err() {
+            return;
+        }
+        std::os::unix::fs::symlink(&odd, o.dir.join("lib-link")).unwrap();
+        o.project.meta.libraries.push(wc_core::project::LibrarySource {
+            name: "own".into(),
+            kind: "folder".into(),
+            location: "lib-link".into(),
+            reference: None,
+        });
+        let from = o.dir.clone();
+        let libraries = o.project.meta.libraries.clone();
+        let to = tmp.path().join("copy");
+        let err = o.save_as(&to).unwrap_err();
+        assert!(err.contains("library own"), "{err}");
+        assert_eq!(o.dir, from);
+        assert_eq!(o.project.meta.libraries, libraries);
+        assert!(!to.exists());
+    }
+
+    #[test]
+    fn save_as_puts_a_waiting_part_file_back_in_the_copy_and_leaves_the_original_record() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let pid = "example.ex-ct-9-24dc";
+        o.ensure_part(pid).unwrap();
+        changed_part_in_mine(&o, tmp.path(), pid);
+        let coil = o.symbols["wc.coil"].clone();
+        let lib = library_first(&mut o, tmp.path(), &coil);
+        o.save().unwrap();
+        let part_file = store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap();
+        let before = std::fs::read(&part_file).unwrap();
+        o.block_after_snapshot = Some(part_file.clone());
+        assert!(o.update_library(&lib, None).is_err());
+        assert_eq!(o.unrestored_files.len(), 1);
+        // A symbol file waits for its repair too.
+        let mut other = coil.clone();
+        other.name = "Other version".into();
+        store::write_vendored_symbol(&o.dir, &other).unwrap();
+        o.mark_symbol_file_stale("wc.coil");
+        // The blocker is copied along: writing the part in the copy fails, so Save as fails and
+        // the original keeps its record, still under its own folder.
+        let from = o.dir.clone();
+        assert!(o.save_as(&tmp.path().join("copy")).is_err());
+        assert_eq!(o.dir, from);
+        assert_eq!(o.unrestored_files.keys().collect::<Vec<_>>(), [&part_file]);
+        // With the blocker gone the part is written in the copy, not in the original.
+        std::fs::remove_dir(&part_file).unwrap();
+        let to = tmp.path().join("copy2");
+        o.save_as(&to).unwrap();
+        let copied = store::vendor_path(&to, ItemKind::Part, pid).unwrap();
+        assert_eq!(std::fs::read(&copied).unwrap(), before);
+        assert!(!part_file.exists(), "the original's file is not written by the copy");
+        assert!(o.unrestored_files.is_empty());
+        assert_eq!(store::read_vendored_symbol(&to, "wc.coil").unwrap(), coil);
+        assert_eq!(store::read_vendored_symbol(&from, "wc.coil").unwrap(), other);
     }
 
     fn git_worktree_set_in(config: &str) -> bool {
