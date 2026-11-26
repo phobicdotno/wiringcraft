@@ -441,7 +441,9 @@ pub fn arrange(
                 placed = true;
                 break;
             }
-            if !along && r == rail {
+            // Only a device that could stand on this rail but finds it full uses it up; one
+            // too tall for it leaves it to the devices after it.
+            if !along && on_plate && r == rail {
                 rail += 1;
             }
             r += 1;
@@ -897,6 +899,41 @@ mod tests {
         assert_eq!(outlines[0], (Point::new(45.0, 55.0), Point::new(90.0, 555.0)));
         // -K1 stays on the first rail, beside -A1 rather than inside it.
         assert_eq!(outlines[1], (Point::new(91.0, 75.0), Point::new(136.0, 155.0)));
+    }
+
+    #[test]
+    fn a_device_too_tall_for_every_rail_leaves_the_rails_to_the_rest() {
+        let mut project = Project::new("x");
+        let mut parts = BTreeMap::new();
+        for (id, w, h) in [("tall", 80.0, 500.0), ("huge", 45.0, 900.0), ("small", 18.0, 80.0)] {
+            let mut part = Part {
+                id: id.into(),
+                ..Default::default()
+            };
+            part.properties.insert("Width".into(), format!("{w}"));
+            part.properties.insert("Height".into(), format!("{h}"));
+            parts.insert(id.to_string(), part);
+        }
+        for (t, part) in [("-A1", "tall"), ("-A2", "huge"), ("-K1", "small")] {
+            if let Some(t) = tag(t) {
+                project.devices.insert(
+                    t,
+                    Device {
+                        part: Some(part.into()),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        // Rails from x 45 to 155 at y 115, 305, 495 and 685.
+        let mut panel = Panel::with_rails("main", "Main", 200.0, 800.0);
+        let done = arrange(&mut panel, &project, &parts, None);
+        assert_eq!(done.placed, vec!["-A1", "-K1"]);
+        assert_eq!(done.did_not_fit, vec!["-A2"]);
+        let outlines: Vec<(Point, Point)> = panel.items.iter().filter_map(PanelItem::device_bounds).collect();
+        assert_eq!(outlines[0], (Point::new(45.0, 55.0), Point::new(125.0, 555.0)));
+        // -K1 still gets the first rail, beside -A1.
+        assert_eq!(outlines[1], (Point::new(126.0, 75.0), Point::new(144.0, 155.0)));
     }
 
     #[test]
