@@ -1713,6 +1713,7 @@ impl Open {
         }
         for (id, _) in &wanted {
             self.stale_symbol_files.remove(id);
+            self.symbol_file_written(id);
         }
         for (id, want) in wanted {
             if let Some(old) = self.symbols.insert(id, want) {
@@ -2920,14 +2921,12 @@ impl Open {
         };
         let new = plan.symbol.clone();
         self.check_box_file_unchanged(&symbol_id, &old)?;
+        self.check_symbol_repair_baseline(&symbol_id)?;
         self.write_symbol_file(&new)?;
         // The file holds the loaded version again: a later change on disk is checked for, and a
         // repair a refused change queued for it would write an older version over this one.
         self.stale_symbol_files.remove(&symbol_id);
-        if let Ok(path) = store::vendor_path(&self.dir, ItemKind::Symbol, &symbol_id) {
-            let rel = path.strip_prefix(&self.dir).unwrap_or(&path).to_path_buf();
-            self.drop_unwritten(&rel);
-        }
+        self.symbol_file_written(&symbol_id);
         self.checkpoint();
         self.project.lock.symbols.insert(
             symbol_id.clone(),
@@ -2950,6 +2949,34 @@ impl Open {
             s.at = s.at + moved;
         }
         Ok(plan.warnings)
+    }
+
+    /// Before the app writes the file of symbol `id` while a repair waits for it: refused when
+    /// another program changed the file since the app last wrote it, so that change is not
+    /// lost unasked; Save asks which version to keep.
+    fn check_symbol_repair_baseline(&self, id: &str) -> Result<(), String> {
+        let Ok(path) = store::vendor_path(&self.dir, ItemKind::Symbol, id) else {
+            return Ok(());
+        };
+        let rel = path.strip_prefix(&self.dir).unwrap_or(&path);
+        let (Some(should), Some(found)) = (self.unwritten_files.get(rel), self.unwritten_found.get(rel)) else {
+            return Ok(());
+        };
+        match found.change(snapshot_file(&path), should, &path) {
+            Some(note) => Err(format!(
+                "the file of symbol {id} was changed outside WiringCraft{note}; save the project and choose which version to keep before editing the box"
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// The file of symbol `id` was written as the project needs it: a repair waiting for it
+    /// would write another version over it, so it is let go.
+    fn symbol_file_written(&mut self, id: &str) {
+        if let Ok(path) = store::vendor_path(&self.dir, ItemKind::Symbol, id) {
+            let rel = path.strip_prefix(&self.dir).unwrap_or(&path).to_path_buf();
+            self.drop_unwritten(&rel);
+        }
     }
 
     /// Before a black box edit writes its symbol file: the file must still hold `loaded`, the
@@ -6716,6 +6743,47 @@ pub(crate) mod tests {
             store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(),
             accepted,
             "the repair queued by the refusal does not write the old version over it"
+        );
+    }
+
+    #[test]
+    fn a_box_edit_repeated_over_a_file_changed_outside_while_its_repair_waits_is_refused() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let old = o.symbols[&symbol_id].clone();
+        let m = o.mark();
+        widen_box(&mut o, &id);
+        o.back_to(m).unwrap();
+        let mut other = old.clone();
+        other.name = "Box, changed".into();
+        store::write_vendored_symbol(&o.dir, &other).unwrap();
+        let err = o
+            .edit_black_box(1, &id, (30.0, 10.0), &box_pin(), &BTreeMap::new(), &Default::default())
+            .unwrap_err();
+        assert!(err.contains("changed outside"), "{err}");
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), other);
+        // The repair still waits, so Save still asks about that version.
+        let err = o.save().unwrap_err();
+        assert!(err.contains(Open::CHANGED_OUTSIDE), "{err}");
+    }
+
+    #[test]
+    fn an_undo_that_writes_a_symbol_file_lets_its_pending_repair_go() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let first = o.symbols[&symbol_id].clone();
+        widen_box(&mut o, &id);
+        // A further edit is refused: its repair waits to write the widened version.
+        let m = o.mark();
+        o.edit_black_box(1, &id, (40.0, 10.0), &box_pin(), &BTreeMap::new(), &Default::default())
+            .unwrap();
+        o.back_to(m).unwrap();
+        // Undo takes the widening back and writes the first version to the file.
+        assert!(o.undo());
+        assert_eq!(o.project.lock.symbols[&symbol_id].hash, first.hash());
+        o.save().unwrap();
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(),
+            first,
+            "the repair does not write the widened version over what Undo wrote"
         );
     }
 
