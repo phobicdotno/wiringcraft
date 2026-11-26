@@ -5335,6 +5335,30 @@ mod tests {
         assert!(shortcuts_for(&mut a, egui::Key::Backspace, egui::Modifiers::COMMAND).is_empty());
     }
 
+    /// The plus key zooms in with or without Shift, and so does the unshifted = key it shares
+    /// on many keyboards; Alt with them is not a zoom shortcut here (#685).
+    #[test]
+    fn plus_zooms_in_with_or_without_shift() {
+        let (_tmp, mut a) = app(vec![]);
+        for key in [egui::Key::Plus, egui::Key::Equals] {
+            for m in [egui::Modifiers::NONE, egui::Modifiers::SHIFT] {
+                assert_eq!(shortcuts_for(&mut a, key, m), vec![Action::ZoomIn], "{key:?} {m:?}");
+            }
+            assert!(!shortcuts_for(&mut a, key, egui::Modifiers::ALT).contains(&Action::ZoomIn));
+            // Ctrl+Shift on a Mac: Ctrl set, Command not.
+            let mac_ctrl_shift = egui::Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            };
+            assert!(!shortcuts_for(&mut a, key, mac_ctrl_shift).contains(&Action::ZoomIn));
+        }
+        assert_eq!(
+            shortcuts_for(&mut a, egui::Key::Minus, egui::Modifiers::NONE),
+            vec![Action::ZoomOut]
+        );
+    }
+
     #[test]
     fn escape_after_leaving_the_black_box_tool_cancels_the_new_tool_s_drawing() {
         use wc_core::geom::Point;

@@ -2049,11 +2049,18 @@ impl App {
                 (Key::G, Action::ToggleGrid),
                 (Key::F, Action::ZoomFit),
                 (Key::Plus, Action::ZoomIn),
+                // The unshifted key that has + on it on many keyboards (US: = and +).
+                (Key::Equals, Action::ZoomIn),
                 (Key::Minus, Action::ZoomOut),
                 (Key::PageUp, Action::PrevPage),
                 (Key::PageDown, Action::NextPage),
             ] {
-                if pressed_with(i, k, Modifiers::is_none) {
+                // + often needs Shift, so the zoom-in keys also count with Shift held.
+                // Shift and nothing else: `shift_only` does not look at the Mac's Ctrl key.
+                let zoom_in = matches!(k, Key::Plus | Key::Equals);
+                let ok =
+                    |m: &Modifiers| m.is_none() || (zoom_in && m.shift && !(m.ctrl || m.alt || m.command || m.mac_cmd));
+                if pressed_with(i, k, ok) {
                     out.push(a);
                 }
             }
