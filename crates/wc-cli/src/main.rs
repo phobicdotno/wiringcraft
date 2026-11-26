@@ -2288,7 +2288,10 @@ fn run(cli: Cli) -> Res<()> {
             let mut p = load(dir)?;
             let library = wc_library::library_rules(dir, &p);
             match rc {
-                RulesCmd::List { json } => print!("{}", rules_list(&p, &library, json)?),
+                RulesCmd::List { json } => {
+                    let text = rules_list(&p, &library, json)?;
+                    print!("{text}");
+                }
                 RulesCmd::Set { file } => {
                     let rules = rules_from_file(&file)?;
                     let n = rules.len();
