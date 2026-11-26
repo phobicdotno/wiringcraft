@@ -1444,8 +1444,12 @@ impl Open {
         let fresh = Open::load(&self.dir)?;
         self.branch = fresh.branch;
         let changed = fresh.project != self.project;
-        // The versions the import replaced are kept, so its undo step can put them back.
+        // The versions the import replaced are kept, so its undo step can put them back: the
+        // loaded parts too, whose files and pins an import can replace the same way.
         self.archive_symbols();
+        for p in self.parts.values() {
+            self.part_versions.insert(p.hash(), p.clone());
+        }
         self.symbols.extend(fresh.symbols);
         // An import can write a picture over a file shown before (a PDF scan at the same page).
         self.underlays.clear();
@@ -5597,6 +5601,27 @@ pub(crate) mod tests {
         o.parts.insert(pid.to_owned(), edited.clone());
         assert!(o.undo());
         assert_eq!(o.parts[pid], edited);
+    }
+
+    #[test]
+    fn undo_puts_back_a_loaded_part_an_import_replaced() {
+        let (_tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let pid = "example.ex-ct-9-24dc";
+        o.ensure_part(pid).unwrap();
+        o.save().unwrap();
+        o.part_versions.clear();
+        let old = o.parts[pid].clone();
+        // As a second import does: the part's file and its pin replaced on disk.
+        let mut new = old.clone();
+        new.description = "From the second import".into();
+        store::write_vendored_part(&o.dir, &new).unwrap();
+        let mut p = store::load(&o.dir).unwrap();
+        p.lock.parts.get_mut(pid).unwrap().hash = new.hash();
+        store::save(&o.dir, &p).unwrap();
+        assert!(o.adopt_saved().unwrap());
+        assert!(o.undo(), "{:?}", o.take_undo_error());
+        assert_eq!(store::read_vendored_part(&o.dir, pid).unwrap(), old);
     }
 
     #[test]
