@@ -269,3 +269,46 @@ fn rules_lists_sets_and_turns_library_rules_off_and_on() -> TestResult {
     assert!(!std::fs::read_to_string(dir.join("project.toml"))?.contains("gone:4"));
     Ok(())
 }
+
+#[test]
+fn check_names_an_unreadable_part_copy_with_its_reason_not_as_missing() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    let lib = tmp.path().join("lib");
+    for id in ["maker.contactor", "maker.relay"] {
+        let part = wc_core::Part {
+            id: id.into(),
+            ..wc_core::Part::default()
+        };
+        wc_library::write_part(&lib, &part)?;
+    }
+    wiringcraft(&dir, &["lib", "add", "shop", "folder", lib.to_str().ok_or("path")?])?;
+    wiringcraft(&dir, &["device", "--part", "maker.contactor", "--", "-K1"])?;
+    wiringcraft(&dir, &["device", "--part", "maker.relay", "--", "-K2"])?;
+    // -K1's copy is damaged, -K2's is gone.
+    let copy = |id: &str| wc_core::store::vendor_path(&dir, wc_core::lock::ItemKind::Part, id);
+    std::fs::write(copy("maker.contactor")?, "not a part")?;
+    std::fs::remove_file(copy("maker.relay")?)?;
+
+    let out = wiringcraft(&dir, &["check"])?;
+    let Some(line) = out
+        .lines()
+        .find(|l| l.contains("-K1: part maker.contactor in the project's library copy cannot be read: "))
+    else {
+        unreachable!("no unreadable part warning: {out}");
+    };
+    assert!(line.starts_with("warning"), "{out}");
+    assert!(!line.ends_with("cannot be read: "), "the reason follows: {out}");
+    assert!(!out.contains("part maker.contactor is missing"), "{out}");
+    assert!(
+        out.contains("-K2: part maker.relay is missing from the project's library copy"),
+        "{out}"
+    );
+    Ok(())
+}

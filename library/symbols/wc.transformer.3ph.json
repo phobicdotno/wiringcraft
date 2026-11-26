@@ -1,0 +1,200 @@
+{
+  "category": "power",
+  "description": "Three-phase transformer: primary 1U, 1V, 1W, secondary 2U, 2V, 2W.",
+  "graphics": [
+    {
+      "a": {
+        "x": -5.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": -5.0,
+        "y": 8.18
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 5.5
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 5.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": 5.0,
+        "y": 8.18
+      },
+      "kind": "line"
+    },
+    {
+      "center": {
+        "x": 0.0,
+        "y": 11.5
+      },
+      "kind": "circle",
+      "radius": 6.0
+    },
+    {
+      "center": {
+        "x": 0.0,
+        "y": 18.5
+      },
+      "kind": "circle",
+      "radius": 6.0
+    },
+    {
+      "a": {
+        "x": -5.0,
+        "y": 21.82
+      },
+      "b": {
+        "x": -5.0,
+        "y": 30.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 24.5
+      },
+      "b": {
+        "x": 0.0,
+        "y": 30.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 5.0,
+        "y": 21.82
+      },
+      "b": {
+        "x": 5.0,
+        "y": 30.0
+      },
+      "kind": "line"
+    },
+    {
+      "at": {
+        "x": -4.4,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "1U"
+    },
+    {
+      "at": {
+        "x": 0.6,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "1V"
+    },
+    {
+      "at": {
+        "x": 5.6,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "1W"
+    },
+    {
+      "at": {
+        "x": -4.4,
+        "y": 29.4
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "2U"
+    },
+    {
+      "at": {
+        "x": 0.6,
+        "y": 29.4
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "2V"
+    },
+    {
+      "at": {
+        "x": 5.6,
+        "y": 29.4
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "2W"
+    }
+  ],
+  "id": "wc.transformer.3ph",
+  "letter_code": "T",
+  "name": "Three-phase transformer",
+  "pins": [
+    {
+      "at": {
+        "x": -5.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "1U"
+    },
+    {
+      "at": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "1V"
+    },
+    {
+      "at": {
+        "x": 5.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "1W"
+    },
+    {
+      "at": {
+        "x": -5.0,
+        "y": 30.0
+      },
+      "dir": "down",
+      "name": "2U"
+    },
+    {
+      "at": {
+        "x": 0.0,
+        "y": 30.0
+      },
+      "dir": "down",
+      "name": "2V"
+    },
+    {
+      "at": {
+        "x": 5.0,
+        "y": 30.0
+      },
+      "dir": "down",
+      "name": "2W"
+    }
+  ],
+  "role": "standalone",
+  "tag_at": {
+    "x": -11.0,
+    "y": 15.0
+  }
+}
