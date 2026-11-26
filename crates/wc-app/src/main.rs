@@ -504,7 +504,14 @@ impl chrome::Status for StatusView<'_> {
             Action::Redo => self.open.is_some_and(Open::can_redo),
             Action::Delete if self.ed.panel.is_some() => has && self.ed.panel_pick.is_some(),
             Action::Delete | Action::Copy | Action::Cut | Action::SaveMacro => has && !self.ed.selection.is_empty(),
-            Action::Rotate if self.ed.panel.is_some() => has && self.ed.panel_pick.is_some(),
+            // Only a device turns; a picked rail or duct does not.
+            Action::Rotate if self.ed.panel.is_some() => {
+                has && self.open.as_ref().is_some_and(|o| {
+                    let picked = self.ed.panel.zip(self.ed.panel_pick);
+                    let item = picked.and_then(|(pi, i)| o.project.panels.get(pi)?.items.get(i));
+                    matches!(item, Some(wc_core::panel::PanelItem::Device { .. }))
+                })
+            }
             Action::Mirror if self.ed.panel.is_some() => false,
             Action::Rotate | Action::Mirror => {
                 has && self.ed.selection.iter().any(|s| matches!(s, Selection::Symbol(_)))
@@ -1541,12 +1548,7 @@ impl App {
             }
             Action::Delete if self.ed.panel.is_some() => {
                 if let (Some(pi), Some(item)) = (self.ed.panel, self.ed.panel_pick.take()) {
-                    open.checkpoint();
-                    if let Some(panel) = open.project.panels.get_mut(pi)
-                        && item < panel.items.len()
-                    {
-                        panel.items.remove(item);
-                    }
+                    open.delete_panel_item(pi, item);
                 }
             }
             Action::NewPanel => {
