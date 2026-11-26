@@ -614,36 +614,24 @@ fn shapes(
                     let rot = e.f(50);
                     let (s, c) = rot.to_radians().sin_cos();
                     let cells = cols.saturating_mul(rows);
+                    // Read once: a group code is found by a scan of the entity.
+                    let (ix, iy, sx, sy) = (e.f(10), e.f(20), e.f_or(41, 1.0), e.f_or(42, 1.0));
                     // The placement of the copy in a column and row, inside the outer placement.
+                    // A copy placed past the range of numbers is not refused here: its shapes
+                    // are, one by one, and each copy takes from the budget like any other.
                     let cell_xf = |col: usize, row: usize| {
                         let (col, row) = (col as f64 * dx, row as f64 * dy);
-                        let at = (e.f(10) + c * col - s * row, e.f(20) + s * col + c * row);
-                        Xf::shift((-bx, -by))
-                            .then(&Xf::insert(at, e.f_or(41, 1.0), e.f_or(42, 1.0), rot))
-                            .then(&xf)
+                        let at = (ix + c * col - s * row, iy + s * col + c * row);
+                        Xf::shift((-bx, -by)).then(&Xf::insert(at, sx, sy, rot)).then(&xf)
                     };
-                    // Each placement, once inside the outer one and scaled, is linear in the
-                    // column and row, so when the four corners are numbers every copy between
-                    // them is too.
-                    let corners = [(0, 0), (cols - 1, 0), (0, rows - 1), (cols - 1, rows - 1)];
-                    let finite = corners.iter().all(|&(cl, rw)| {
-                        let (x, y) = cell_xf(cl, rw).at;
-                        (x * scale).is_finite() && (y * scale).is_finite()
-                    });
-                    // Copies that would only be turned away (too deep, or placed past the
-                    // numbers) are counted at once instead of one by one.
-                    let refused = if depth + 1 > MAX_NESTING {
-                        Some((TOO_DEEP, cells.saturating_mul(inner.len())))
-                    } else if !finite {
-                        Some((ARRAY_NOT_NUMBERS, cells))
-                    } else {
-                        None
-                    };
-                    if let Some((why, n)) = refused.filter(|&(_, n)| n > 0) {
-                        let left_out = skipped.entry(why.to_owned()).or_default();
-                        *left_out = left_out.saturating_add(n);
+                    // Copies too deep would only be turned away, without taking from the
+                    // budget: counted at once instead of one by one.
+                    let too_deep = depth + 1 > MAX_NESTING;
+                    if too_deep {
+                        let deep = skipped.entry(TOO_DEEP.to_owned()).or_default();
+                        *deep = deep.saturating_add(cells.saturating_mul(inner.len()));
                     }
-                    for cell in 0..if refused.is_some() { 0 } else { cells } {
+                    for cell in 0..if too_deep { 0 } else { cells } {
                         if *budget == 0 {
                             // The copies not drawn are counted like the entities in them.
                             let over = skipped.entry(OVER_LIMIT.to_owned()).or_default();
@@ -897,9 +885,6 @@ const SPLINE_TOO_FEW: &str = "SPLINE with too few points";
 /// their placed points are not numbers.
 /// The skipped-count key for entities whose placed coordinates are not numbers.
 const PLACED_NOT_NUMBERS: &str = "entities placed outside the number range";
-
-/// The skipped-count key for copies of a block array (MINSERT) whose places are not numbers.
-const ARRAY_NOT_NUMBERS: &str = "copies of a block array placed outside the number range";
 
 const STRETCHED_NOT_NUMBERS: &str = "CIRCLE or ARC of a stretched block whose points are not numbers";
 
@@ -1876,9 +1861,6 @@ fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
             } else if kind == PLACED_NOT_NUMBERS {
                 let s = if n == 1 { "y" } else { "ies" };
                 format!("{n} entit{s} placed outside the number range, left out")
-            } else if kind == ARRAY_NOT_NUMBERS {
-                let s = if n == 1 { "y" } else { "ies" };
-                format!("{n} cop{s} of a block array placed outside the number range, left out")
             } else if kind == SPLINE_NOT_NUMBERS {
                 let s = if n == 1 { "" } else { "s" };
                 format!("{n} SPLINE{s} whose points are not numbers once placed, left out")
@@ -3053,7 +3035,7 @@ mod tests {
     }
 
     #[test]
-    fn an_array_too_deep_or_past_the_numbers_is_counted_at_once() -> Result<()> {
+    fn array_copies_too_deep_or_past_the_numbers_are_counted() -> Result<()> {
         let blocks = "0\nBLOCK\n2\nB\n10\n0\n20\n0\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n0\nENDBLK\n";
         let big = "0\nINSERT\n2\nB\n70\n30000\n71\n30000\n44\n1\n45\n1\n";
         // At the nesting limit every copy would be turned away: counted without visiting them.
@@ -3076,17 +3058,48 @@ mod tests {
         assert!(out.is_empty());
         assert_eq!(skipped.get(TOO_DEEP), Some(&(30_000 * 30_000)), "{skipped:?}");
         assert_eq!(budget, MAX_DRAWN - 1);
-        // Spacing so large the far copies overflow: the array is left out with a warning.
+        // Spacing so large the third copy lands past the numbers: its line is left out with a
+        // warning, the first two are drawn.
         let (g, skipped) = drawn("0\nINSERT\n2\nB\n70\n3\n71\n1\n44\n1e308\n", blocks)?;
-        assert!(g.is_empty(), "{g:?}");
-        assert_eq!(skipped.get(ARRAY_NOT_NUMBERS), Some(&3), "{skipped:?}");
-        assert!(skipped_warnings(skipped)[0].starts_with("3 copies of a block array"));
-        // Finite on its own, but past the numbers once inside a block scaled by 2.
+        assert_eq!(g.len(), 2, "{g:?}");
+        assert_eq!(skipped.get(PLACED_NOT_NUMBERS), Some(&1), "{skipped:?}");
+        assert!(skipped_warnings(skipped)[0].starts_with("1 entity placed outside the number range"));
+        // In range on its own, but past the numbers once inside a block scaled by 2.
         let nested =
             format!("{blocks}0\nBLOCK\n2\nOUTER\n10\n0\n20\n0\n0\nINSERT\n2\nB\n70\n2\n44\n1e308\n0\nENDBLK\n");
         let (g, skipped) = drawn("0\nINSERT\n2\nOUTER\n41\n2\n42\n2\n", &nested)?;
-        assert!(g.is_empty(), "{g:?}");
-        assert_eq!(skipped.get(ARRAY_NOT_NUMBERS), Some(&2), "{skipped:?}");
+        assert_eq!(g.len(), 1, "{g:?}");
+        assert!(g.iter().all(finite_shape), "{g:?}");
+        assert_eq!(skipped.get(PLACED_NOT_NUMBERS), Some(&1), "{skipped:?}");
+        // A block whose base point is far out: the placement's own origin overflows once
+        // scaled, but the line drawn from it is in range and kept.
+        let based = "0\nBLOCK\n2\nFAR\n10\n1e308\n20\n0\n0\nLINE\n10\n1e308\n20\n0\n11\n1e308\n21\n1\n0\nENDBLK\n";
+        for ents in [
+            "0\nINSERT\n2\nFAR\n10\n0\n20\n0\n",
+            "0\nINSERT\n2\nFAR\n10\n0\n20\n0\n70\n2\n44\n5\n",
+        ] {
+            let d = parse(&dxf(ents, based))?;
+            let (mut raw, mut skipped) = (Vec::new(), BTreeMap::new());
+            shapes(
+                &d,
+                &d.entities,
+                Xf::ID,
+                2.0,
+                0,
+                &|_| false,
+                &mut raw,
+                &mut Vec::new(),
+                &mut skipped,
+                &mut { MAX_DRAWN },
+            );
+            assert!(skipped.is_empty(), "{skipped:?}");
+            assert!(!raw.is_empty(), "{raw:?}");
+            assert!(
+                raw.iter()
+                    .all(|(_, s)| finite_shape(s) && s.bounds().0.x.abs() <= 10.0 + 1e-9),
+                "{raw:?}"
+            );
+        }
         // A copy at 1e308 is a number, but a line end at 1e308 in it is not once placed: that
         // line is left out and counted, the one that stays in range is drawn. A single INSERT
         // alike.
@@ -3100,7 +3113,6 @@ mod tests {
             assert!(g.iter().all(finite_shape), "{g:?}");
             // The far line and the far POINT.
             assert_eq!(skipped.get(PLACED_NOT_NUMBERS), Some(&2), "{skipped:?}");
-            assert!(!skipped.contains_key(ARRAY_NOT_NUMBERS), "{skipped:?}");
         }
         Ok(())
     }
