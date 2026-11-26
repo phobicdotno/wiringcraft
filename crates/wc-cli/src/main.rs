@@ -4892,6 +4892,12 @@ fn lock_warnings(left: &wc_library::Unpinned) -> Vec<String> {
 
 fn vcs_cmd(dir: &Path, vc: VcsCmd) -> Res<()> {
     let git = wc_vcs::Git::new(dir);
+    if !matches!(vc, VcsCmd::Init) && !git.in_work_tree() {
+        return Err(format!(
+            "{} is not under version control; run `wiringcraft vcs init` first",
+            dir.display()
+        ));
+    }
     match vc {
         VcsCmd::Init => git.init().map_err(e)?,
         VcsCmd::Commit { message } => match git.commit(&message).map_err(e)? {

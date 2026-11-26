@@ -209,6 +209,13 @@ impl Git {
         self.dir.join(".git").exists()
     }
 
+    /// Whether git can keep versions here: the project folder is in a work tree, its own
+    /// repository's or that of a larger one it sits in.
+    pub fn in_work_tree(&self) -> bool {
+        self.run(&["rev-parse", "--is-inside-work-tree"])
+            .is_ok_and(|s| s.trim() == "true")
+    }
+
     /// Make the project folder a repository (no-op when it is one) and record a first version.
     pub fn init(&self) -> Result<()> {
         if !self.is_repo() {
