@@ -318,6 +318,38 @@ fn table_of_contents_goes_first_and_its_rows_link_to_pages() {
 }
 
 #[test]
+fn table_of_contents_lists_only_the_exported_pages() {
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Mains"), Page::new("p2", "2", "Control")];
+    let contents = wc_report::Table {
+        title: "Table of contents".into(),
+        columns: vec!["Page".into(), "Title".into()],
+        rows: vec![
+            vec!["1".into(), "Mains".into()],
+            vec!["2".into(), "Control".into()],
+            vec!["".into(), "Note".into()],
+        ],
+        row_pages: vec!["p1".into(), "p2".into()],
+        front: true,
+        ..Default::default()
+    };
+    let opts = Options {
+        pages: vec!["p2".into()],
+        reports: vec![contents],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    assert_eq!(report.pages, 2);
+    // The left-out page has no row; the exported page and the row naming no page stay.
+    let shows = |s: &str| text.contains(&format!("{} Tj", writer::pdf_text(s)));
+    assert!(!shows("Mains"));
+    assert!(shows("Control"));
+    assert!(shows("Note"));
+    assert_eq!(text.matches("/Subtype /Link").count(), 1);
+}
+
+#[test]
 fn a_report_in_the_project_s_own_layout_prints_that_layout() {
     use wc_core::report_layout::{ReportColumn, ReportLayout};
     let mut project = Project::new("x");

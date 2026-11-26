@@ -1,5 +1,6 @@
 {
   "category": "protection",
+  "description": "Single-pole circuit breaker with thermal and magnetic trip.",
   "graphics": [
     {
       "a": {

@@ -1,5 +1,6 @@
 {
   "category": "operators",
+  "description": "Push button with a make contact that closes while it is pressed.",
   "graphics": [
     {
       "a": {

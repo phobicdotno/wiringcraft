@@ -396,7 +396,8 @@ enum Cmd {
         /// `text`, `csv`, `md` or `xlsx`.
         #[arg(long, default_value = "text")]
         format: String,
-        /// Write to a file instead of standard output.
+        /// Write to a file instead of standard output. With `all` and `--format csv` this is
+        /// a folder, which gets one `<report>.csv` per report.
         #[arg(long)]
         out: Option<PathBuf>,
     },
@@ -1170,9 +1171,11 @@ enum LibCmd {
     /// Pin every used item that is not pinned yet, and write a pinned item's vendored copy again
     /// when it is missing or unreadable.
     Lock,
-    /// Find symbols and parts in the library sources by id, name, category or description.
+    /// Find symbols and parts in the library sources by id, name, category, letter code or
+    /// description.
     Search {
-        /// The text to look for; upper and lower case are alike.
+        /// The words to look for: an item matches when it contains every word, in any order;
+        /// upper and lower case are alike.
         query: String,
     },
     /// Offer the project's copy of an item back to a source for review.
@@ -3531,6 +3534,20 @@ fn run(cli: Cli) -> Res<()> {
                 let refs: Vec<&wc_report::Table> = tables.iter().collect();
                 let bytes = wc_report::xlsx::workbook(&refs).map_err(e)?;
                 write_out(&path, bytes).map_err(e)?;
+                return Ok(());
+            }
+            // Several tables in one CSV file is not a CSV any reader takes: `--out` names a
+            // folder then, with one `<report>.csv` in it per report, as `drawing` does per page.
+            if format == "csv"
+                && kinds.len() > 1
+                && let Some(folder) = &out
+            {
+                make_out_dir(folder)?;
+                for k in &kinds {
+                    let t = wc_report::build(*k, &inputs);
+                    write_out(folder.join(format!("{}.csv", k.name())), t.to_csv()).map_err(e)?;
+                }
+                println!("wrote {} csv file(s) to {}", kinds.len(), folder.display());
                 return Ok(());
             }
             let mut text = String::new();
@@ -9080,6 +9097,39 @@ mod tests {
             z.finish().unwrap();
         }
         cli(&dir, &["import", "archive", only.to_str().unwrap()]).unwrap();
+    }
+
+    #[test]
+    fn all_reports_as_csv_go_to_one_file_each() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let out = tmp.path().join("reports");
+        cli(
+            &dir,
+            &["report", "all", "--format", "csv", "--out", out.to_str().unwrap()],
+        )
+        .unwrap();
+        let mut names: Vec<String> = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|f| f.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        let mut want: Vec<String> = wc_report::Kind::ALL
+            .iter()
+            .map(|k| format!("{}.csv", k.name()))
+            .collect();
+        want.sort();
+        assert_eq!(names, want);
+        // Each file is that one report's table alone, the same as asking for it by name.
+        let one = tmp.path().join("wires.csv");
+        cli(
+            &dir,
+            &["report", "wires", "--format", "csv", "--out", one.to_str().unwrap()],
+        )
+        .unwrap();
+        let wires = std::fs::read_to_string(out.join("wires.csv")).unwrap();
+        assert_eq!(format!("{wires}\n"), std::fs::read_to_string(&one).unwrap());
     }
 
     #[test]
