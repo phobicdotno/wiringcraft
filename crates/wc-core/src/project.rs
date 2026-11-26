@@ -1349,10 +1349,13 @@ impl PageSize {
                 "size {text:?} is not A4, A3, A2, A1 or A0 (add \"portrait\" for an upright sheet) or a custom WIDTHxHEIGHT in millimetres"
             )
         };
-        // Spaces around `x` and before `mm` are fine; inside a number they are not.
-        let dims = lower.strip_suffix("mm").unwrap_or(&lower);
+        // Spaces around `x` (or `×`) and before `mm` are fine, and each side may carry its own
+        // `mm` (`500mm x 700mm`); spaces inside a number are not.
+        let dims = lower.replace('×', "x");
         let (w, h) = dims.split_once('x').ok_or_else(bad)?;
         let side = |name: &str, v: &str| {
+            let v = v.trim();
+            let v = v.strip_suffix("mm").unwrap_or(v);
             v.trim().parse::<u32>().map_err(|e| {
                 format!(
                     "size {text:?}: the {name} {:?} is not a whole number of millimetres ({e}); each side is {} to {} mm",
@@ -2206,6 +2209,27 @@ mod tests {
                     height: 700,
                 },
             ),
+            (
+                "500mm x 700mm",
+                PageSize::Custom {
+                    width: 500,
+                    height: 700,
+                },
+            ),
+            (
+                "500 mm x 700 mm",
+                PageSize::Custom {
+                    width: 500,
+                    height: 700,
+                },
+            ),
+            (
+                "500 × 700",
+                PageSize::Custom {
+                    width: 500,
+                    height: 700,
+                },
+            ),
         ] {
             assert_eq!(PageSize::parse(text), Ok(want), "{text}");
         }
@@ -2222,6 +2246,8 @@ mod tests {
             "ap",
             "a4pp",
             "50 0 x 700 mm",
+            "500mmmm x 700",
+            "500 x 700 mm mm",
         ] {
             assert!(PageSize::parse(bad).is_err(), "{bad}");
         }
