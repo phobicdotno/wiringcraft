@@ -138,24 +138,39 @@ pub struct SymbolEditor {
 struct Drag {
     from: Point,
     item: Item,
-    /// A line end or rectangle corner being dragged (index into [`handles`]) instead of the
-    /// whole item.
+    /// A line end, rectangle corner, circle edge or arc end being dragged (index into
+    /// [`handles`]) instead of the whole item.
     handle: Option<usize>,
     before: Symbol,
 }
 
 /// The points of a shape that can be dragged on their own: a line's two ends, a rectangle's
-/// four corners (top-left, top-right, bottom-right, bottom-left).
+/// four corners (top-left, top-right, bottom-right, bottom-left), a circle's edge at angle 0,
+/// an arc's start and end.
 pub fn handles(shape: &Shape) -> Vec<Point> {
+    let on = |c: Point, r: f64, deg: f64| {
+        let a = deg.to_radians();
+        Point::new(c.x + r * a.cos(), c.y + r * a.sin())
+    };
     match shape {
         Shape::Line { a, b } => vec![*a, *b],
         Shape::Rect { min, max } => vec![*min, Point::new(max.x, min.y), *max, Point::new(min.x, max.y)],
+        Shape::Circle { center, radius, .. } => vec![on(*center, *radius, 0.0)],
+        Shape::Arc {
+            center,
+            radius,
+            start,
+            end,
+        } => vec![on(*center, *radius, *start), on(*center, *radius, *end)],
         _ => Vec::new(),
     }
 }
 
-/// `shape` with handle `k` moved to `to`. A rectangle keeps the opposite corner; nothing
-/// changes when the result would be a line of no length or a rectangle without area.
+/// `shape` with handle `k` moved to `to`. A rectangle keeps the opposite corner; a circle's
+/// radius becomes the distance from its centre to `to`, rounded to the grid; an arc's end
+/// turns to point at `to`, keeping the radius and the other end. Nothing changes when the
+/// result would be a line of no length, a rectangle without area, a circle of radius zero or
+/// an arc whose ends meet.
 fn with_handle(shape: &Shape, k: usize, to: Point) -> Option<Shape> {
     let new = match shape {
         Shape::Line { a, b } => match k {
@@ -172,6 +187,45 @@ fn with_handle(shape: &Shape, k: usize, to: Point) -> Option<Shape> {
             Shape::Rect {
                 min: Point::new(to.x.min(fixed.x), to.y.min(fixed.y)),
                 max: Point::new(to.x.max(fixed.x), to.y.max(fixed.y)),
+            }
+        }
+        Shape::Circle { center, filled, .. } => {
+            let d = ((to.x - center.x).powi(2) + (to.y - center.y).powi(2)).sqrt();
+            let radius = (d / SNAP).round() * SNAP;
+            if k != 0 || radius == 0.0 {
+                return None;
+            }
+            Shape::Circle {
+                center: *center,
+                radius,
+                filled: *filled,
+            }
+        }
+        Shape::Arc {
+            center,
+            radius,
+            start,
+            end,
+        } => {
+            // On the centre (give or take rounding from the handle's sin/cos) has no direction.
+            if (to.x - center.x).hypot(to.y - center.y) < 1e-6 {
+                return None;
+            }
+            let a = angle(*center, to);
+            let (start, end) = match k {
+                0 => (a, *end),
+                1 => (*start, a),
+                _ => return None,
+            };
+            // The same direction, also when one is stored as 360 and the other as 0.
+            if (start - end).rem_euclid(360.0) == 0.0 {
+                return None;
+            }
+            Shape::Arc {
+                center: *center,
+                radius: *radius,
+                start,
+                end,
             }
         }
         _ => return None,
@@ -559,7 +613,7 @@ impl SymbolEditor {
             return;
         }
         self.message.clear();
-        // A handle of the selected line or rectangle wins: it reshapes instead of moving.
+        // A handle of the selected shape wins: it reshapes instead of moving.
         if let Some(Item::Shape(i)) = self.selected
             && let Some(k) = self.symbol.graphics.get(i).and_then(|g| {
                 handles(g)
@@ -608,8 +662,18 @@ impl SymbolEditor {
         match (item, handle) {
             (Item::Shape(i), Some(k)) => {
                 if let Some(g) = self.symbol.graphics.get_mut(i)
+                    // The pointer itself on an arc's centre has no direction, wherever on the
+                    // handle the drag started: test it before the grab offset is added.
+                    && !matches!(g, Shape::Arc { center, .. }
+                        if (p.x - center.x).hypot(p.y - center.y) < 1e-6)
                     && let Some(h) = handles(g).get(k).copied()
-                    && let Some(new) = with_handle(g, k, snap(h + raw))
+                    // A circle or arc rounds its own radius; snapping the point first would
+                    // lose radius and angle when dragging off the axes.
+                    && let to = match g {
+                        Shape::Circle { .. } | Shape::Arc { .. } => h + raw,
+                        _ => snap(h + raw),
+                    }
+                    && let Some(new) = with_handle(g, k, to)
                 {
                     *g = new;
                 }
@@ -624,6 +688,14 @@ impl SymbolEditor {
         if self.symbol != drag.before {
             self.props_dirty = false;
             self.push_undo(drag.before);
+        }
+    }
+
+    /// Escape during a drag: everything goes back to where it was before the drag, with no
+    /// undo step, and the mouse moving on changes nothing.
+    pub fn cancel_drag(&mut self) {
+        if let Some(drag) = self.drag.take() {
+            self.symbol = drag.before;
         }
     }
 
@@ -807,11 +879,13 @@ impl SymbolEditor {
                         self.nudge(d);
                     }
                 }
-                // Enter ends a polyline, Escape drops the shape being drawn.
-                if self.drawing_shape() && ctx.memory(|m| m.focused().is_none()) {
+                // Enter ends a polyline, Escape drops the shape being drawn or cancels a drag.
+                if (self.drawing_shape() || self.dragging()) && ctx.memory(|m| m.focused().is_none()) {
                     let (enter, escape) =
                         ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
-                    if escape {
+                    if escape && self.dragging() {
+                        self.cancel_drag();
+                    } else if escape {
                         self.cancel_shape();
                     } else if enter {
                         self.finish_polyline();
@@ -1599,6 +1673,186 @@ mod tests {
         e.undo();
         e.undo();
         assert_eq!(e.symbol, drawn, "each drag was one step");
+    }
+
+    #[test]
+    fn a_circle_edge_and_arc_ends_reshape_them() {
+        let c = Point::new(0.0, 0.0);
+        let circle = Shape::Circle {
+            center: c,
+            radius: 5.0,
+            filled: true,
+        };
+        assert_eq!(handles(&circle), [Point::new(5.0, 0.0)]);
+        // The radius is the distance to the point, on the grid; the fill stays.
+        assert_eq!(
+            with_handle(&circle, 0, Point::new(0.0, 7.6)),
+            Some(Shape::Circle {
+                center: c,
+                radius: 7.5,
+                filled: true
+            })
+        );
+        assert_eq!(with_handle(&circle, 0, Point::new(1.0, 0.0)), None, "radius zero");
+        assert_eq!(with_handle(&circle, 1, Point::new(5.0, 5.0)), None);
+
+        let arc = Shape::Arc {
+            center: c,
+            radius: 5.0,
+            start: 0.0,
+            end: 90.0,
+        };
+        let [s, e] = handles(&arc)[..] else { unreachable!() };
+        assert_eq!(s, Point::new(5.0, 0.0));
+        assert!((e.x).abs() < 1e-9 && (e.y - 5.0).abs() < 1e-9);
+        // Each end turns to the point; radius and the other end stay.
+        assert_eq!(
+            with_handle(&arc, 0, Point::new(-10.0, 0.0)),
+            Some(Shape::Arc {
+                center: c,
+                radius: 5.0,
+                start: 180.0,
+                end: 90.0
+            })
+        );
+        assert_eq!(
+            with_handle(&arc, 1, Point::new(0.0, -2.5)),
+            Some(Shape::Arc {
+                center: c,
+                radius: 5.0,
+                start: 0.0,
+                end: 270.0
+            })
+        );
+        assert_eq!(with_handle(&arc, 1, Point::new(2.5, 0.0)), None, "ends meet");
+        assert_eq!(with_handle(&arc, 0, c), None, "no direction");
+        // An end stored as 360 meets an end dragged to 0 degrees.
+        let full = Shape::Arc {
+            center: c,
+            radius: 5.0,
+            start: 360.0,
+            end: 90.0,
+        };
+        assert_eq!(with_handle(&full, 1, Point::new(5.0, 0.0)), None, "360 and 0 meet");
+        assert_eq!(
+            with_handle(&full, 1, Point::new(-5.0, 0.0)),
+            Some(Shape::Arc {
+                center: c,
+                radius: 5.0,
+                start: 360.0,
+                end: 180.0
+            }),
+            "another direction is taken; the stored 360 stays"
+        );
+    }
+
+    #[test]
+    fn dragging_a_circle_edge_is_one_undo_step() {
+        let mut e = SymbolEditor::new(Vec::new());
+        e.set_tool(Tool::Circle);
+        e.click(Point::new(0.0, 0.0));
+        e.click(Point::new(5.0, 0.0));
+        let drawn = e.symbol.clone();
+        let steps = e.undo.len();
+        e.set_tool(Tool::Select);
+        e.selected = Some(Item::Shape(0));
+        e.start_drag(Point::new(5.0, 0.0));
+        e.drag_to(Point::new(10.1, 0.0));
+        e.drag_to(Point::new(0.0, 12.4));
+        e.end_drag();
+        assert_eq!(
+            e.symbol.graphics[0],
+            Shape::Circle {
+                center: Point::new(0.0, 0.0),
+                radius: 12.5,
+                filled: false
+            }
+        );
+        assert_eq!(e.undo.len(), steps + 1, "one drag is one step");
+        e.undo();
+        assert_eq!(e.symbol, drawn, "undo brings the old circle back");
+        // Off the axes: the pointer is not snapped first (that would give (5, 2.5) and keep
+        // radius 5); its distance 6.64 rounds to 7.5.
+        e.selected = Some(Item::Shape(0));
+        e.start_drag(Point::new(5.0, 0.0));
+        e.drag_to(Point::new(6.2, 2.4));
+        e.end_drag();
+        assert!(matches!(e.symbol.graphics[0], Shape::Circle { radius, .. } if radius == 7.5));
+    }
+
+    #[test]
+    fn dragging_an_arc_end_onto_its_centre_changes_nothing() {
+        let mut e = SymbolEditor::new(Vec::new());
+        let arc = Shape::Arc {
+            center: Point::new(0.0, 0.0),
+            radius: 5.0,
+            start: 0.0,
+            end: 180.0,
+        };
+        e.symbol.graphics.push(arc.clone());
+        e.set_tool(Tool::Select);
+        e.selected = Some(Item::Shape(0));
+        // The end at 180 degrees sits at y = 6e-16, not 0, so the drag lands just off the centre.
+        e.start_drag(Point::new(-5.0, 0.0));
+        e.drag_to(Point::new(0.0, 0.0));
+        e.end_drag();
+        assert_eq!(e.symbol.graphics[0], arc);
+        assert!(e.undo.is_empty());
+        assert_eq!(with_handle(&arc, 0, Point::new(1e-12, -1e-12)), None);
+        // Grabbed half a millimetre off the handle: the pointer on the centre still changes
+        // nothing (the handle plus the pointer's move would be (0, -0.5), about 270 degrees).
+        e.selected = Some(Item::Shape(0));
+        e.start_drag(Point::new(-5.0, 0.5));
+        assert!(e.drag.as_ref().is_some_and(|d| d.handle == Some(1)));
+        e.drag_to(Point::new(0.0, 0.0));
+        e.end_drag();
+        assert_eq!(e.symbol.graphics[0], arc);
+        assert!(e.undo.is_empty());
+    }
+
+    #[test]
+    fn escape_cancels_a_handle_drag() {
+        let mut e = SymbolEditor::new(Vec::new());
+        e.set_tool(Tool::Circle);
+        e.click(Point::new(0.0, 0.0));
+        e.click(Point::new(5.0, 0.0));
+        let drawn = e.symbol.clone();
+        let steps = e.undo.len();
+        e.set_tool(Tool::Select);
+        e.selected = Some(Item::Shape(0));
+        e.start_drag(Point::new(5.0, 0.0));
+        e.drag_to(Point::new(10.0, 0.0));
+        assert_ne!(e.symbol, drawn);
+        e.cancel_drag();
+        assert!(!e.dragging());
+        assert_eq!(e.symbol, drawn, "the circle is back as it was");
+        // The mouse moving on and being let go changes nothing and leaves no undo step.
+        e.drag_to(Point::new(15.0, 0.0));
+        e.end_drag();
+        assert_eq!(e.symbol, drawn);
+        assert_eq!(e.undo.len(), steps);
+    }
+
+    #[test]
+    fn dragging_an_arc_end_off_the_axes_keeps_its_angle() {
+        let mut e = SymbolEditor::new(Vec::new());
+        e.symbol.graphics.push(Shape::Arc {
+            center: Point::new(0.0, 0.0),
+            radius: 5.0,
+            start: 90.0,
+            end: 180.0,
+        });
+        e.set_tool(Tool::Select);
+        e.selected = Some(Item::Shape(0));
+        // Grab the end at (-5, 0) and drag it to (5, 1): about 11.3 degrees, not 0.
+        e.start_drag(Point::new(-5.0, 0.0));
+        e.drag_to(Point::new(5.0, 1.0));
+        e.end_drag();
+        let Shape::Arc { radius, start, end, .. } = e.symbol.graphics[0] else {
+            unreachable!()
+        };
+        assert_eq!((radius, start), (5.0, 90.0));
+        assert!((end - 1.0_f64.atan2(5.0).to_degrees()).abs() < 1e-9, "end is {end}");
     }
 
     #[test]

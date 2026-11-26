@@ -128,6 +128,11 @@ impl BoxEdit {
     }
 
     /// The points renamed in the form: old name to new.
+    /// The points the box had when the form was opened.
+    pub fn old_pins(&self) -> &[BoxPin] {
+        &self.base.2
+    }
+
     pub fn renamed(&self) -> BTreeMap<String, String> {
         self.rows
             .iter()
