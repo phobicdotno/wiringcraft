@@ -3068,7 +3068,7 @@ impl App {
                     }
                     form.set_value_sets(sets)?;
                 }
-                let path = form.save()?;
+                let path = open.save_macro_form(&form)?;
                 let m = wc_core::macros::read_macro(&path).map_err(|e| e.to_string())?;
                 let names = |v: Vec<&str>| if v.is_empty() { "none".to_owned() } else { v.join(", ") };
                 Ok(format!(
@@ -6112,6 +6112,11 @@ mod tests {
             json!({"action": "edit", "name": "Starter", "placeholders": [{"name": "power", "was": "kW"}]}),
         )
         .unwrap();
+        // The edit is one undo step: Undo puts the file back, Redo writes the edit again.
+        let open = a.open.as_mut().unwrap();
+        assert!(open.undo());
+        assert_eq!(wc_core::macros::read_macro(&path).unwrap().used_placeholders(), ["kW"]);
+        assert!(open.redo());
         let m = wc_core::macros::read_macro(&path).unwrap();
         assert_eq!(m.used_placeholders(), ["power"]);
         assert_eq!(m.description, "Motor starter");

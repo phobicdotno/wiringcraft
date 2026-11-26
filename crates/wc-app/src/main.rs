@@ -1697,18 +1697,23 @@ impl App {
                     ui.separator();
                     ui.horizontal(|ui| {
                         if ui.button("Save").clicked() {
-                            match form.save() {
-                                Ok(path) => {
-                                    then = Some(Box::new(move |app: &mut App| {
+                            // Saved through the project, so the save is one undo step.
+                            let form = form.clone();
+                            then = Some(Box::new(move |app: &mut App| {
+                                let Some(open) = app.open.as_mut() else {
+                                    return;
+                                };
+                                match open.save_macro_form(&form) {
+                                    Ok(path) => {
                                         app.ed.message = format!("Saved macro {}", path.display());
-                                        if let Some(open) = &app.open {
-                                            app.dialog = Some(Dialog::Macros(open.macros()));
-                                        }
-                                    }));
-                                    keep = false;
+                                        app.dialog = Some(Dialog::Macros(open.macros()));
+                                    }
+                                    Err(e) => {
+                                        app.dialog = Some(Dialog::MacroEdit { form, error: Some(e) });
+                                    }
                                 }
-                                Err(e) => *error = Some(e),
-                            }
+                            }));
+                            keep = false;
                         }
                         if ui.button("Cancel").clicked() {
                             then = Some(Box::new(|app: &mut App| {

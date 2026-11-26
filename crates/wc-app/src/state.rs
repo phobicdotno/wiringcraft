@@ -179,13 +179,59 @@ impl WireNumbering {
 /// (`roll_back_update`) keeps its own copy and needs the field added there too.
 struct Kept {
     project: Project,
-    undo: Vec<Project>,
-    redo: Vec<Project>,
+    undo: Vec<Step>,
+    redo: Vec<Step>,
     undo_dropped: usize,
     history: u64,
     form_step: Option<u64>,
     dirty: bool,
     terminals_before: Option<wc_core::project::TerminalNumbers>,
+}
+
+/// One undo or redo step: the project as it is on the other side of the change, and the
+/// project files the change rewrote (a macro's placeholders saved, say), which Undo puts back
+/// and Redo writes again.
+#[derive(Debug, Clone, PartialEq)]
+struct Step {
+    project: Project,
+    files: Vec<FileEdit>,
+}
+
+impl Step {
+    fn of(project: Project) -> Step {
+        Step {
+            project,
+            files: Vec::new(),
+        }
+    }
+}
+
+/// A project file a change rewrote: what it held before and after.
+#[derive(Debug, Clone, PartialEq)]
+struct FileEdit {
+    path: PathBuf,
+    before: String,
+    after: String,
+}
+
+/// Write `edits` as they were before them (`undo`, newest first) or after them. When one cannot
+/// be written, those already written are put back and the error names the file.
+fn write_edits(edits: &[FileEdit], undo: bool) -> Result<(), String> {
+    let order: Vec<&FileEdit> = if undo {
+        edits.iter().rev().collect()
+    } else {
+        edits.iter().collect()
+    };
+    for (i, e) in order.iter().enumerate() {
+        let text = if undo { &e.before } else { &e.after };
+        if let Err(err) = std::fs::write(&e.path, text) {
+            for done in order[..i].iter().rev() {
+                let _ = std::fs::write(&done.path, if undo { &done.after } else { &done.before });
+            }
+            return Err(format!("{} could not be written: {err}", e.path.display()));
+        }
+    }
+    Ok(())
 }
 
 /// What [`Open::back_to`] goes back to, or [`Open::keep`] builds on.
@@ -244,8 +290,8 @@ pub struct Open {
     /// Every part in the project and its library sources, as (id, label), for the part picker.
     pub part_library: Vec<(String, String)>,
     pub dirty: bool,
-    undo: Vec<Project>,
-    redo: Vec<Project>,
+    undo: Vec<Step>,
+    redo: Vec<Step>,
     /// Snapshots dropped from the front of `undo` because it was full, so marks stay valid.
     undo_dropped: usize,
     /// Counts every change to the undo history (checkpoint, undo, redo, squash).
@@ -324,9 +370,9 @@ fn next_revision() -> u64 {
 
 /// The history as it was before a library update, so a failed one leaves no trace in it.
 struct HistoryState {
-    redo: Vec<Project>,
+    redo: Vec<Step>,
     /// The oldest Undo step, when the update's checkpoint pushes it out.
-    evicted: Option<Project>,
+    evicted: Option<Step>,
     dirty: bool,
     history: u64,
 }
@@ -951,7 +997,7 @@ impl Open {
         // snapshot and this change start from that.
         self.follow_terminals();
         self.terminals_before = Some(self.terminal_numbers());
-        self.undo.push(self.project.clone());
+        self.undo.push(Step::of(self.project.clone()));
         if self.undo.len() > UNDO_STEPS {
             self.undo.remove(0);
             self.undo_dropped += 1;
@@ -992,7 +1038,7 @@ impl Open {
     /// The project as it was before the latest change, from the undo history: for taking back
     /// only part of that change (in a shared session, the part that waits here).
     pub fn before_last_change(&self) -> Option<&Project> {
-        self.undo.last()
+        self.undo.last().map(|s| &s.project)
     }
 
     /// Forget the latest undo step, once its change was taken back another way.
@@ -1012,24 +1058,34 @@ impl Open {
     /// session's number too, [`Open::forget_steps_like_now`] drops the ones next to it.
     pub fn renumber_in_history(&mut self, id: &str, from: &str, to: &str) {
         for step in self.undo.iter_mut().chain(self.redo.iter_mut()) {
-            if let Some(page) = step.page_mut(id)
+            if let Some(page) = step.project.page_mut(id)
                 && page.number == from
             {
                 page.number = to.to_owned();
-                step.sort_pages();
+                step.project.sort_pages();
             }
         }
-        self.undo.dedup();
-        self.redo.dedup();
+        // A step that rewrote project files still changes something.
+        let same = |a: &mut Step, b: &mut Step| a.project == b.project && a.files.is_empty();
+        self.undo.dedup_by(same);
+        self.redo.dedup_by(same);
     }
 
     /// Drop the latest undo and redo steps that `like_now` finds the same as the project now
     /// (an Undo or Redo of them would change nothing), down to the first that is not.
     pub fn forget_steps_like_now(&mut self, like_now: impl Fn(&Project, &Project) -> bool) {
-        while self.undo.last().is_some_and(|s| like_now(s, &self.project)) {
+        while self
+            .undo
+            .last()
+            .is_some_and(|s| s.files.is_empty() && like_now(&s.project, &self.project))
+        {
             self.undo.pop();
         }
-        while self.redo.last().is_some_and(|s| like_now(s, &self.project)) {
+        while self
+            .redo
+            .last()
+            .is_some_and(|s| s.files.is_empty() && like_now(&s.project, &self.project))
+        {
             self.redo.pop();
         }
     }
@@ -1058,7 +1114,9 @@ impl Open {
             return;
         };
         if self.undo.len() > start + 1 {
-            self.undo.truncate(start + 1);
+            // The files the later steps rewrote are taken back and written with the first.
+            let later: Vec<FileEdit> = self.undo.drain(start + 1..).flat_map(|s| s.files).collect();
+            self.undo[start].files.extend(later);
             self.history += 1;
             self.touch();
         }
@@ -1083,19 +1141,36 @@ impl Open {
         self.follow_terminals();
         match self.undo.pop() {
             Some(prev) => {
+                if let Err(e) = write_edits(&prev.files, true) {
+                    self.undo_error = Some(e);
+                    self.undo.push(prev);
+                    return false;
+                }
                 self.forget_terminal_change();
-                self.redo.push(std::mem::replace(&mut self.project, prev));
-                let left = self.redo.last().map(|p| p.lock.parts.clone()).unwrap_or_default();
+                let Step { project, files } = prev;
+                self.redo.push(Step {
+                    project: std::mem::replace(&mut self.project, project),
+                    files,
+                });
+                let left = self
+                    .redo
+                    .last()
+                    .map(|s| s.project.lock.parts.clone())
+                    .unwrap_or_default();
                 if let Err(e) = self.sync_vendored(&left) {
                     // The vendored files could not follow: keep the project as it was.
                     if let Some(cur) = self.redo.pop() {
-                        let restored = std::mem::replace(&mut self.project, cur);
+                        let _ = write_edits(&cur.files, false);
+                        let restored = std::mem::replace(&mut self.project, cur.project);
                         self.undo_error = Some(e);
-                        self.undo.push(restored);
+                        self.undo.push(Step {
+                            project: restored,
+                            files: cur.files,
+                        });
                     }
                     return false;
                 }
-                let sources = self.redo.last().map(|p| &p.meta.libraries) != Some(&self.project.meta.libraries);
+                let sources = self.redo.last().map(|s| &s.project.meta.libraries) != Some(&self.project.meta.libraries);
                 self.follow_step(sources);
                 self.edited();
                 self.history += 1;
@@ -1109,18 +1184,35 @@ impl Open {
         self.follow_terminals();
         match self.redo.pop() {
             Some(next) => {
+                if let Err(e) = write_edits(&next.files, false) {
+                    self.undo_error = Some(e);
+                    self.redo.push(next);
+                    return false;
+                }
                 self.forget_terminal_change();
-                self.undo.push(std::mem::replace(&mut self.project, next));
-                let left = self.undo.last().map(|p| p.lock.parts.clone()).unwrap_or_default();
+                let Step { project, files } = next;
+                self.undo.push(Step {
+                    project: std::mem::replace(&mut self.project, project),
+                    files,
+                });
+                let left = self
+                    .undo
+                    .last()
+                    .map(|s| s.project.lock.parts.clone())
+                    .unwrap_or_default();
                 if let Err(e) = self.sync_vendored(&left) {
                     if let Some(cur) = self.undo.pop() {
-                        let restored = std::mem::replace(&mut self.project, cur);
+                        let _ = write_edits(&cur.files, true);
+                        let restored = std::mem::replace(&mut self.project, cur.project);
                         self.undo_error = Some(e);
-                        self.redo.push(restored);
+                        self.redo.push(Step {
+                            project: restored,
+                            files: cur.files,
+                        });
                     }
                     return false;
                 }
-                let sources = self.undo.last().map(|p| &p.meta.libraries) != Some(&self.project.meta.libraries);
+                let sources = self.undo.last().map(|s| &s.project.meta.libraries) != Some(&self.project.meta.libraries);
                 self.follow_step(sources);
                 self.edited();
                 self.history += 1;
@@ -1934,7 +2026,7 @@ impl Open {
             .undo
             .iter()
             .chain(self.redo.iter())
-            .map(|p| p.meta.libraries.clone())
+            .map(|s| s.project.meta.libraries.clone())
             .collect();
         if let Err(e) = repoint(&mut libraries).and_then(|()| steps.iter_mut().try_for_each(&repoint)) {
             return Err(format!(
@@ -1974,8 +2066,8 @@ impl Open {
                 from.display()
             ));
         }
-        for (p, libs) in self.undo.iter_mut().chain(self.redo.iter_mut()).zip(steps) {
-            p.meta.libraries = libs;
+        for (s, libs) in self.undo.iter_mut().chain(self.redo.iter_mut()).zip(steps) {
+            s.project.meta.libraries = libs;
         }
         Ok((target, links))
     }
@@ -2643,8 +2735,11 @@ impl Open {
     /// A symbol or part file the change added (there was none, and the project as it was does
     /// not pin it) is removed; files that were there are never touched, nor rewritten. One that
     /// cannot be removed is reported, and is harmless: an unpinned part copy is pinned again
-    /// when it is next used.
+    /// when it is next used. Project files the change rewrote (a macro saved) are put back.
     pub(crate) fn back_to(&mut self, mark: Mark) -> Result<(), String> {
+        // Project files the change rewrote are put back, newest first.
+        let edits: Vec<FileEdit> = self.undo.iter().flat_map(|s| s.files.iter().cloned()).collect();
+        let files = write_edits(&edits, true);
         self.put_back(mark.kept);
         self.symbols.retain(|id, _| mark.symbols.contains(id));
         self.parts.retain(|id, _| mark.parts.contains(id));
@@ -2670,6 +2765,7 @@ impl Open {
                 failed.push(format!("{}: {e}", path.display()));
             }
         }
+        files?;
         if failed.is_empty() {
             Ok(())
         } else {
@@ -2758,6 +2854,27 @@ impl Open {
         }
         let id = wc_core::macros::macro_id(name);
         wc_core::macros::write_macro(&self.dir, &id, &clip.to_macro(name, description)).map_err(|e| e.to_string())
+    }
+
+    /// Save a project macro's placeholders and value sets from `form` ([`crate::macro_form::Form::save`])
+    /// as one undo step: Undo puts the file back as it was, Redo writes the edit again. Nothing
+    /// is recorded when the file is the same. Returns the file written.
+    pub fn save_macro_form(&mut self, form: &crate::macro_form::Form) -> Result<PathBuf, String> {
+        let read = |p: &Path| std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()));
+        let before = read(&form.path)?;
+        let path = form.save()?;
+        let after = read(&path)?;
+        if after != before {
+            self.checkpoint();
+            if let Some(step) = self.undo.last_mut() {
+                step.files.push(FileEdit {
+                    path: path.clone(),
+                    before,
+                    after,
+                });
+            }
+        }
+        Ok(path)
     }
 
     /// Insert a macro on a page where it was drawn (its anchor), like a paste, with its
@@ -3210,11 +3327,11 @@ impl Open {
         let current = field(&mut now).clone();
         let only_the_form = self.undo_mark() == since + 1
             && self.undo.last().is_some_and(|prev| {
-                let mut p = prev.clone();
+                let mut p = prev.project.clone();
                 let mut was = p.meta.clone();
                 let ok = *field(&mut was) == *before;
                 *field(&mut p.meta) = current.clone();
-                p == self.project && ok
+                p == self.project && ok && prev.files.is_empty()
             });
         // When the undo cannot be done (the symbol files could not follow it), that part alone
         // is put back below, so Cancel still leaves it as it was.
@@ -3232,10 +3349,10 @@ impl Open {
     /// fields (it is a properties form's step, with nothing else in it).
     fn last_step_changed_only_props(&self) -> bool {
         self.undo.last().is_some_and(|prev| {
-            let mut p = prev.clone();
+            let mut p = prev.project.clone();
             p.meta.name.clone_from(&self.project.meta.name);
             p.meta.title_block.clone_from(&self.project.meta.title_block);
-            p == self.project
+            p == self.project && prev.files.is_empty()
         })
     }
 
@@ -3255,10 +3372,9 @@ impl Open {
     pub fn revert_live(&mut self, since: usize, before: &PropsSnapshot) {
         let only_the_form = self.undo_mark() == since + 1
             && self.last_step_changed_only_props()
-            && self
-                .undo
-                .last()
-                .is_some_and(|prev| prev.meta.name == before.name && prev.meta.title_block == before.title_block);
+            && self.undo.last().is_some_and(|prev| {
+                prev.project.meta.name == before.name && prev.project.meta.title_block == before.title_block
+            });
         if only_the_form {
             if self.undo() {
                 self.redo.clear();
@@ -7500,5 +7616,55 @@ pub(crate) mod tests {
         assert!(o.redo());
         let warning = o.take_step_warning().unwrap_or_default();
         assert!(warning.contains("acme.relay"), "{warning}");
+    }
+
+    #[test]
+    fn a_macro_saved_from_its_form_is_undone_and_redone_with_the_change_around_it() {
+        let (_tmp, mut o) = project();
+        let id = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let clip = o.copy(1, &[Selection::Symbol(id)]);
+        let path = o.save_macro(&clip, "Coil", "").unwrap();
+        let first = std::fs::read_to_string(&path).unwrap();
+        let read = || wc_core::macros::read_macro(&path).unwrap().description;
+
+        // Saved alone, it is one undo step; saved the same, it is none.
+        let mut form = crate::macro_form::Form::open(&path).unwrap();
+        form.description = "A coil".into();
+        let steps = o.undo_steps();
+        o.save_macro_form(&form).unwrap();
+        assert_eq!(o.undo_steps(), steps + 1);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(o.undo());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), first, "the file as it was");
+        assert!(o.redo());
+        assert_eq!(read(), "A coil");
+        let form = crate::macro_form::Form::open(&path).unwrap();
+        o.save_macro_form(&form).unwrap();
+        assert_eq!(o.undo_steps(), steps + 1, "nothing changed, no step");
+
+        // With a page edit in one squashed step (an assistant's turn), one Undo takes back both.
+        let mark = o.undo_mark();
+        let pages = o.project.pages.clone();
+        let mut form = crate::macro_form::Form::open(&path).unwrap();
+        form.description = "A relay coil".into();
+        o.save_macro_form(&form).unwrap();
+        o.place(1, "wc.coil", Point::new(60.0, 20.0)).unwrap();
+        o.squash_undo(mark);
+        assert_eq!(o.undo_steps(), steps + 2);
+        assert!(o.undo());
+        assert_eq!(o.project.pages, pages);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+        assert!(o.redo());
+        assert_eq!(read(), "A relay coil");
+        assert_ne!(o.project.pages, pages);
+
+        // A change taken back whole (a failed turn) puts the file back too.
+        let m = o.mark();
+        let mut form = crate::macro_form::Form::open(&path).unwrap();
+        form.description = "Gone".into();
+        o.save_macro_form(&form).unwrap();
+        o.back_to(m).unwrap();
+        assert_eq!(read(), "A relay coil");
+        assert_eq!(o.undo_steps(), steps + 2);
     }
 }
