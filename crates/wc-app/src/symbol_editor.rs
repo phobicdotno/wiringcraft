@@ -808,7 +808,7 @@ impl SymbolEditor {
                     }
                 }
                 // Enter ends a polyline, Escape drops the shape being drawn.
-                if !self.clicks.is_empty() && ctx.memory(|m| m.focused().is_none()) {
+                if self.drawing_shape() && ctx.memory(|m| m.focused().is_none()) {
                     let (enter, escape) =
                         ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
                     if escape {
@@ -1269,6 +1269,23 @@ mod tests {
         e.symbol.name = "Test coil".into();
         e.symbol.letter_code = "K".into();
         e.symbol.role = SymbolRole::Main;
+    }
+
+    #[test]
+    fn cancel_shape_drops_a_half_drawn_line_and_nothing_else() {
+        let mut e = SymbolEditor::new(Vec::new());
+        e.set_tool(Tool::Line);
+        e.click(Point::new(0.0, 0.0));
+        assert!(e.drawing_shape());
+        assert_eq!(e.tool.hint(e.clicks.len()), "Click the end of the line.");
+        e.cancel_shape();
+        assert!(!e.drawing_shape());
+        assert_eq!(e.tool.hint(e.clicks.len()), "Click the start of the line.");
+        assert!(e.symbol.graphics.is_empty());
+        // Nothing half drawn: nothing changes.
+        e.cancel_shape();
+        assert_eq!(e.tool, Tool::Line);
+        assert!(e.symbol.graphics.is_empty());
     }
 
     #[test]

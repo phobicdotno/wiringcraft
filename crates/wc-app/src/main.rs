@@ -2098,9 +2098,9 @@ impl App {
                     out.push(a);
                 }
             }
-            // A shape half drawn in the symbol editor takes Enter and Escape; the editor
-            // handles them itself, so the schematic's drawing is left alone.
-            if self.symbol_editor.as_ref().is_some_and(|e| e.drawing_shape()) {
+            // While the symbol editor is open, Enter and Escape are the editor's (it ends or
+            // drops its own half-drawn shape), so the schematic's drawing and tool are left alone.
+            if self.symbol_editor.is_some() {
                 return;
             }
             if pressed_with(i, Key::Enter, Modifiers::is_none)
@@ -5656,8 +5656,15 @@ impl App {
                     self.ed.message = symbol_editor_refusal(a.info().label);
                     false
                 }
-                // The page behind the symbol editor stays as it is.
-                Action::PrevPage | Action::NextPage => false,
+                // The page behind the symbol editor stays as it is, and so does its tool: the
+                // tool keys would switch it out of sight (the menu and toolbar still can).
+                Action::PrevPage
+                | Action::NextPage
+                | Action::PlaceSymbol
+                | Action::DrawWire
+                | Action::TextTool
+                | Action::CommentTool
+                | Action::LineTool => false,
                 _ => true,
             })
             .collect()

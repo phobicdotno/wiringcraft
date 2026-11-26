@@ -5521,12 +5521,77 @@ mod tests {
         press(&mut a, egui::Key::Escape);
         assert_eq!(a.ed.shape_points.len(), 2, "nor dropped");
         assert_eq!(a.ed.tool, crate::state::Tool::Polyline);
-        // Nothing drawn in the editor: the schematic gets the keys again.
+        // Nothing drawn in the editor: the keys still leave the schematic alone.
         a.symbol_editor = Some(crate::symbol_editor::SymbolEditor::new(Vec::new()));
+        press(&mut a, egui::Key::Enter);
+        assert!(!a.ed.finish_shape);
+        press(&mut a, egui::Key::Escape);
+        assert_eq!(a.ed.shape_points.len(), 2);
+        assert_eq!(a.ed.tool, crate::state::Tool::Polyline);
+        // Editor closed: the schematic gets them again.
+        a.symbol_editor = None;
         press(&mut a, egui::Key::Enter);
         assert!(a.ed.finish_shape);
         press(&mut a, egui::Key::Escape);
         assert!(a.ed.shape_points.is_empty());
+    }
+
+    #[test]
+    fn escape_and_tool_keys_leave_the_schematic_behind_the_symbol_editor_alone() {
+        use wc_core::geom::Point;
+        let (_tmp, mut a) = app(vec![]);
+        let ctx = egui::Context::default();
+        // A wire half drawn on the schematic, one click of a line in the symbol editor.
+        a.run(Action::DrawWire);
+        let wire = Some((
+            wc_core::Endpoint::Point {
+                at: Point::new(10.0, 10.0),
+            },
+            Vec::new(),
+        ));
+        a.ed.wire = wire.clone();
+        let mut sym = crate::symbol_editor::SymbolEditor::new(Vec::new());
+        sym.set_tool(crate::symbol_editor::Tool::Line);
+        sym.click(Point::new(0.0, 0.0));
+        sym.owner = a.open.as_ref().map(|o| o.dir.clone());
+        a.symbol_editor = Some(sym);
+        let raw = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| {
+            let keys = a.shortcuts(ctx);
+            assert!(keys.is_empty(), "{keys:?}");
+            a.symbol_editor_window(ctx);
+        });
+        assert!(
+            !a.symbol_editor.as_ref().unwrap().drawing_shape(),
+            "the editor's click is dropped"
+        );
+        assert_eq!(a.ed.wire, wire, "the schematic wire stays");
+        assert_eq!(a.ed.tool, crate::state::Tool::Wire);
+        // The tool keys do not switch the schematic's tool out of sight.
+        let tools = vec![
+            Action::PlaceSymbol,
+            Action::DrawWire,
+            Action::TextTool,
+            Action::CommentTool,
+            Action::LineTool,
+        ];
+        for act in a.route_to_symbol_editor(tools.clone()) {
+            a.run(act);
+        }
+        assert_eq!(a.ed.tool, crate::state::Tool::Wire);
+        assert_eq!(a.ed.wire, wire);
+        // Closed: they switch it again.
+        a.symbol_editor = None;
+        assert_eq!(a.route_to_symbol_editor(tools.clone()), tools);
     }
 
     #[test]
