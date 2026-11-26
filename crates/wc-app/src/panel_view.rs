@@ -1,6 +1,7 @@
 //! The panel layout view: the mounting plate with its ducts, DIN rails and device footprints,
-//! drawn to scale. Devices are picked and dragged with the primary button; the wheel zooms and
-//! the middle or secondary button pans, as on the schematic canvas.
+//! drawn to scale. Devices are picked and dragged with the primary button, and the arrow keys move
+//! the picked device by one step; the wheel zooms and the middle or secondary button pans, as on
+//! the schematic canvas.
 
 use eframe::egui::{self, Align2, FontId, Rect, Sense, Stroke, Vec2};
 use wc_core::Point;
@@ -16,6 +17,17 @@ fn device_at(items: &[PanelItem], at: Point) -> Option<usize> {
         let (a, b) = item.device_bounds()?;
         (at.x >= a.x && at.x <= b.x && at.y >= a.y && at.y <= b.y).then_some(i)
     })
+}
+
+/// Where a device at `at`, `size` big as turned, goes when an arrow key moves it `step` mm in
+/// the direction (`dx`, `dy`): kept on a plate `plate` big, as a drag keeps it.
+fn nudged(at: Point, size: (f64, f64), plate: (f64, f64), step: f64, dx: f64, dy: f64) -> Point {
+    let (w, h) = size;
+    let (pw, ph) = plate;
+    Point::new(
+        (at.x + dx * step).clamp(0.0, (pw - w).max(0.0)),
+        (at.y + dy * step).clamp(0.0, (ph - h).max(0.0)),
+    )
 }
 
 pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, snap_step: f64) {
@@ -123,6 +135,51 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
     }
     if resp.drag_stopped() {
         ed.panel_drag = None;
+    }
+    // The arrow keys move the picked device by one step each press, one undo step a press, kept
+    // on the plate as a drag keeps it. The keys are used up here, so nothing else (such as the
+    // schematic page behind this view) acts on them too.
+    if ed.panel_drag.is_none()
+        && !ui.ctx().wants_keyboard_input()
+        && let Some(i) = ed.panel_pick
+        && matches!(p.items.get(i), Some(PanelItem::Device { .. }))
+    {
+        let step = if snap_step > 0.0 { snap_step.min(5.0) } else { 1.0 };
+        let presses: Vec<(f64, f64)> = ui.input_mut(|inp| {
+            [
+                (egui::Key::ArrowLeft, -1.0, 0.0),
+                (egui::Key::ArrowRight, 1.0, 0.0),
+                (egui::Key::ArrowUp, 0.0, -1.0),
+                (egui::Key::ArrowDown, 0.0, 1.0),
+            ]
+            .into_iter()
+            .flat_map(|(k, dx, dy)| std::iter::repeat_n((dx, dy), inp.count_and_consume_key(egui::Modifiers::NONE, k)))
+            .collect()
+        });
+        for (dx, dy) in presses {
+            let Some(PanelItem::Device {
+                at,
+                width,
+                height,
+                rotation,
+                ..
+            }) = open.project.panels.get(panel).and_then(|x| x.items.get(i))
+            else {
+                break;
+            };
+            let size = wc_core::panel::turned_size(*width, *height, *rotation);
+            let to = nudged(*at, size, (pw, ph), step, dx, dy);
+            if to == *at {
+                continue;
+            }
+            open.checkpoint();
+            if let Some(PanelItem::Device { at, .. }) =
+                open.project.panels.get_mut(panel).and_then(|x| x.items.get_mut(i))
+            {
+                *at = to;
+            }
+            open.edited();
+        }
     }
     let p = open.project.panels.get(panel).cloned().unwrap_or(p);
 
@@ -311,6 +368,86 @@ mod tests {
         assert_eq!(device_at(&items, Point::new(7.0, 5.0)), Some(2));
         assert_eq!(device_at(&items, Point::new(2.0, 5.0)), Some(1));
         assert_eq!(device_at(&items, Point::new(50.0, 5.0)), None);
+    }
+
+    #[test]
+    fn arrow_keys_move_a_device_one_step_and_keep_it_on_the_plate() {
+        let at = Point::new(100.0, 50.0);
+        assert_eq!(
+            nudged(at, (40.0, 60.0), (400.0, 300.0), 5.0, 1.0, 0.0),
+            Point::new(105.0, 50.0)
+        );
+        assert_eq!(
+            nudged(at, (40.0, 60.0), (400.0, 300.0), 2.5, 0.0, -1.0),
+            Point::new(100.0, 47.5)
+        );
+        // At the plate's edges it stays on the plate.
+        let corner = Point::new(0.0, 240.0);
+        assert_eq!(nudged(corner, (40.0, 60.0), (400.0, 300.0), 5.0, -1.0, 0.0), corner);
+        assert_eq!(nudged(corner, (40.0, 60.0), (400.0, 300.0), 5.0, 0.0, 1.0), corner);
+        assert_eq!(
+            nudged(Point::new(358.0, 0.0), (40.0, 60.0), (400.0, 300.0), 5.0, 1.0, 0.0),
+            Point::new(360.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn arrow_keys_in_the_panel_view_move_the_picked_device() {
+        let (_tmp, mut open) = crate::state::tests::project();
+        open.project.panels.push(wc_core::panel::Panel {
+            id: "panel1".into(),
+            name: "Panel 1".into(),
+            width: 400.0,
+            height: 300.0,
+            items: vec![PanelItem::Device {
+                tag: wc_core::DeviceTag::parse("-K1").unwrap_or_default(),
+                at: Point::new(100.0, 100.0),
+                width: 40.0,
+                height: 60.0,
+                rotation: wc_core::geom::Rotation::R0,
+            }],
+        });
+        let mut ed = Editor::default();
+        ed.panel = Some(0);
+        ed.panel_pick = Some(0);
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let input = egui::RawInput {
+            events: vec![
+                key(egui::Key::ArrowRight),
+                key(egui::Key::ArrowRight),
+                key(egui::Key::ArrowUp),
+            ],
+            ..Default::default()
+        };
+        let steps = open.undo_steps();
+        let mut left = 0;
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show(ui, &mut open, &mut ed, 0, 2.5));
+            // The keys are used up: nothing after the panel view sees them.
+            left = ctx.input(|i| i.events.len());
+        });
+        assert_eq!(left, 0);
+        let Some(PanelItem::Device { at, .. }) = open.project.panels[0].items.first() else {
+            unreachable!("the device is there")
+        };
+        assert_eq!(*at, Point::new(105.0, 97.5));
+        // One undo step a press.
+        assert_eq!(open.undo_steps(), steps + 3);
+        for _ in 0..3 {
+            assert!(open.undo());
+        }
+        let Some(PanelItem::Device { at, .. }) = open.project.panels[0].items.first() else {
+            unreachable!("the device is there")
+        };
+        assert_eq!(*at, Point::new(100.0, 100.0));
     }
 
     #[test]
