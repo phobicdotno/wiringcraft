@@ -574,8 +574,11 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                 (None, false)
             }
             Event::Text(t) => {
-                // Only text for a pending label is read; other text is ignored.
-                if let Some((at, h, align)) = pending_text {
+                // Only text for a pending label is read; other text is ignored. A hidden run
+                // (a `<tspan>` with `display="none"` or `visibility="hidden"`) is skipped and
+                // leaves the label waiting for a visible one.
+                let shown_run = shows.last().copied().unwrap_or((true, true)) == (true, true);
+                if let (Some((at, h, align)), true) = (pending_text, shown_run) {
                     let s = t
                         .unescape()
                         .map_err(|e| Error::Format(format!("SVG: {e}")))?
@@ -625,7 +628,9 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
             }
         }
         let show = shown(&e, &tag, shows.last().copied().unwrap_or((true, true)));
-        if show != (true, true) {
+        // An invisible `<text>` still sets up its label: a `<tspan>` in it can be visible again,
+        // and each run of words is checked on its own.
+        if !show.0 || (!show.1 && tag != "text") {
             // Hidden: no shapes, pins or text, but its children still need its state.
             if !empty {
                 stack.push(m);
@@ -1179,19 +1184,37 @@ mod tests {
             <g style="visibility:hidden"><line x1="0" y1="4" x2="10" y2="4"/></g>
             <g visibility="hidden"><line x1="0" y1="5" x2="10" y2="5" visibility="visible"/></g>
             <line x1="0" y1="6" x2="10" y2="6"/>
+            <text x="0" y="7"><tspan display="none">No1</tspan><tspan>Yes1</tspan></text>
+            <text x="0" y="8"><tspan visibility="hidden">No2</tspan><tspan>Yes2</tspan></text>
+            <text x="0" y="9" visibility="hidden"><tspan visibility="visible">Yes3</tspan></text>
+            <text x="0" y="10" visibility="hidden">No3</text>
+            <text x="0" y="11" display="none"><tspan visibility="visible">No4</tspan></text>
         </svg>"##;
         let s = symbol(svg, "svg.hidden", "Hidden")?;
         assert!(s.pins.is_empty(), "pin in a hidden group: {:?}", s.pins);
-        // Only the visible lines come in; anything else shows up as NaN.
-        let ys: Vec<f64> = s
+        // Only the visible lines and texts come in; anything else shows up as NaN.
+        let ys: Vec<(f64, &str)> = s
             .graphics
             .iter()
             .map(|g| match g {
-                Shape::Line { a, .. } => a.y,
-                _ => f64::NAN,
+                Shape::Line { a, .. } => (a.y, ""),
+                Shape::Text { at, text, .. } => (at.y, text.as_str()),
+                _ => (f64::NAN, ""),
             })
             .collect();
-        assert_eq!(ys, vec![0.0, 5.0, 6.0], "{:?}", s.graphics);
+        assert_eq!(
+            ys,
+            vec![
+                (0.0, ""),
+                (5.0, ""),
+                (6.0, ""),
+                (7.0, "Yes1"),
+                (8.0, "Yes2"),
+                (9.0, "Yes3")
+            ],
+            "{:?}",
+            s.graphics
+        );
         Ok(())
     }
 
