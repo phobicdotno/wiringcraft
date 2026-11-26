@@ -542,6 +542,15 @@ fn every_starter_symbol_loads_under_its_file_name_with_distinct_pins() -> Result
     assert_eq!(capacitor.letter_code, "C");
     let names: Vec<_> = capacitor.pins.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, ["1", "2"]);
+    // The potentiometer (#881): letter code R, ends 1 and 3, the wiper 2 off to the side.
+    let (pot, _) = lib.symbol("wc.potentiometer")?;
+    assert_eq!(pot.role, SymbolRole::Standalone);
+    assert_eq!(pot.letter_code, "R");
+    let names: Vec<_> = pot.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["1", "2", "3"]);
+    let [end1, wiper, end3] = [0, 1, 2].map(|i| pot.pins[i].at);
+    assert_eq!(end1.x, end3.x, "pins 1 and 3 share a vertical line");
+    assert_ne!(wiper.x, end1.x, "the wiper sits off the line between 1 and 3");
     // The timer relay set (#531): coils drive, delayed contacts follow them.
     for (id, role) in [
         ("wc.coil.ondelay", SymbolRole::Main),
@@ -790,5 +799,27 @@ fn the_starter_ammeter_and_voltmeter_are_measuring_instruments() -> Result<()> {
         let names: Vec<_> = m.pins.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["1", "2"], "{id}");
     }
+    Ok(())
+}
+
+#[test]
+fn the_starter_battery_has_plus_and_minus_pins() -> Result<()> {
+    // #764: a battery or cell for backup supplies and buffered 24 V DC circuits.
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
+    project.meta.libraries = vec![LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: starter.to_string_lossy().into(),
+        reference: None,
+    }];
+    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (b, _) = lib.symbol("wc.battery")?;
+    assert_eq!(b.role, SymbolRole::Standalone);
+    assert_eq!(b.letter_code, "G");
+    assert_eq!(b.category, "power");
+    let names: Vec<_> = b.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["+", "-"]);
     Ok(())
 }

@@ -390,7 +390,8 @@ enum Pending {
     SaveAs,
     Export(Export),
     Marking(wc_report::MarkingOptions),
-    ReportCsv(wc_report::Kind),
+    /// Reports > Save as CSV; `true` for Excel: `;`-separated with a UTF-8 byte order mark.
+    ReportCsv(wc_report::Kind, bool),
     /// File > Import; for parts, the library folder picked in the dialog (none: ask with the
     /// folder picker).
     Import(imports::Kind, Option<import_symbols::ImportTarget>),
@@ -499,6 +500,8 @@ impl chrome::Status for StatusView<'_> {
             Action::ArrangePanel | Action::DeletePanel => has && self.ed.panel.is_some(),
             Action::PageUp => has && self.ed.page > 0,
             Action::PageDown => self.open.is_some_and(|o| self.ed.page + 1 < o.project.pages.len()),
+            Action::PrevPage => has && self.ed.page > 0,
+            Action::NextPage => self.open.is_some_and(|o| self.ed.page + 1 < o.project.pages.len()),
             Action::Save => self.open.is_some_and(|o| o.dirty),
             Action::Undo => self.open.is_some_and(Open::can_undo),
             Action::Redo => self.open.is_some_and(Open::can_redo),
@@ -984,9 +987,14 @@ impl App {
                 };
                 self.dialog = Some(Dialog::Message(msg));
             }
-            Pending::ReportCsv(kind) => {
+            Pending::ReportCsv(kind, excel) => {
                 let default = open.dir.join("export").join(format!("{}.csv", kind.name()));
-                let (path, note) = match export_target("Save report as CSV", &default, ("CSV", &["csv"]), &pick_save) {
+                let title = if excel {
+                    "Save report as CSV for Excel"
+                } else {
+                    "Save report as CSV"
+                };
+                let (path, note) = match export_target(title, &default, ("CSV", &["csv"]), &pick_save) {
                     Ok(target) => target,
                     Err(why) => {
                         if let Some(why) = why {
@@ -1001,7 +1009,7 @@ impl App {
                     parts: &open.parts,
                 };
                 let table = wc_report::build(kind, &inputs);
-                self.ed.message = match write_creating(&path, table.to_csv()) {
+                self.ed.message = match write_creating(&path, report_csv(&table, excel)) {
                     Ok(()) => format!("{}Saved {}", note.replace("\n\n", " "), path.display()),
                     Err(e) => format!("Could not save {}: {e}", path.display()),
                 };
@@ -1700,6 +1708,19 @@ impl App {
                     self.ed.page = i;
                 }
             }
+            // Only the page shown changes, as a click in the page tree: no page is renumbered.
+            Action::PrevPage | Action::NextPage => {
+                let to = match a {
+                    Action::PrevPage => page.checked_sub(1),
+                    _ => Some(page + 1),
+                };
+                // A wire started on this page cannot end on another one.
+                if let Some(i) = to.filter(|&i| i < open.project.pages.len())
+                    && self.ed.show_page(i)
+                {
+                    self.ed.wire = None;
+                }
+            }
             Action::PageProps => {
                 if let Some(p) = open.project.pages.get(page) {
                     self.dialog = Some(Dialog::PageProps {
@@ -1888,7 +1909,7 @@ impl App {
                     ed.message = e;
                 }
                 if a == Action::EditSymbol {
-                    ed.choices = open.library.clone();
+                    ed.choices = open.library.iter().map(|e| (e.id.clone(), e.name.clone())).collect();
                     if ed.opened_as.is_none() && ed.message.is_empty() {
                         ed.message = "Pick the symbol to change under \"Open a library symbol\".".into();
                     }
@@ -1910,7 +1931,12 @@ impl App {
                     Ok(lib) => {
                         if a == Action::LibraryUpdate {
                             match open.update_library(&lib, None) {
-                                Ok(done) => self.ed.message = format!("Updated {} library items.", done.len()),
+                                Ok(done) => {
+                                    // The symbol list, editor choices and search show the new
+                                    // names and descriptions.
+                                    open.refresh_library();
+                                    self.ed.message = format!("Updated {} library items.", done.len());
+                                }
                                 Err(e) => self.ed.message = format!("Update failed: {e}"),
                             }
                         }
@@ -1939,7 +1965,58 @@ impl App {
     }
 
     fn zoom(&mut self, f: f32) {
-        self.ed.view.zoom = (self.ed.view.zoom * f).clamp(0.3, 60.0);
+        self.ed.zoom_keys(f);
+    }
+
+    /// The arrow keys move the selection on the page by one snap step, one undo step a press.
+    /// With auto-wiring on, pins of moved symbols that now line up are wired in the same step,
+    /// as when a move drag ends. Nothing moves while a drag is under way.
+    fn nudge_by_arrows(&mut self, ctx: &egui::Context) {
+        if self.dialog.is_some()
+            || ctx.wants_keyboard_input()
+            || self.importing.is_some()
+            || self.symbol_editor.is_some()
+            || self.ed.panel.is_some()
+            || self.ed.dragging()
+            || self.ed.selection.is_empty()
+        {
+            return;
+        }
+        let steps = ctx.input(|i| arrow_steps(i, self.prefs.snap));
+        if steps.is_empty() {
+            return;
+        }
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        if let Some(name) = held_for(Action::Rotate, &self.ed, &open.project) {
+            self.ed.message = format!("{name} has this page open; it is read-only here until they leave it.");
+            return;
+        }
+        let moved: std::collections::BTreeSet<String> = self
+            .ed
+            .selection
+            .iter()
+            .filter_map(|s| match s {
+                Selection::Symbol(id) => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut wired = 0;
+        for d in steps {
+            open.checkpoint();
+            open.move_by(self.ed.page, &self.ed.selection, d);
+            if self.prefs.auto_wire && !moved.is_empty() {
+                wired += open.auto_wire(self.ed.page, &moved);
+            }
+        }
+        if wired > 0 {
+            self.ed.message = if wired == 1 {
+                "Connected 1 wire to pins that line up.".to_owned()
+            } else {
+                format!("Connected {wired} wires to pins that line up.")
+            };
+        }
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) -> Vec<Action> {
@@ -1978,6 +2055,8 @@ impl App {
                 (Key::F, Action::ZoomFit),
                 (Key::Plus, Action::ZoomIn),
                 (Key::Minus, Action::ZoomOut),
+                (Key::PageUp, Action::PrevPage),
+                (Key::PageDown, Action::NextPage),
             ] {
                 if pressed_with(i, k, Modifiers::is_none) {
                     out.push(a);
@@ -3095,7 +3174,15 @@ impl App {
                         ui.horizontal(|ui| {
                             if ui.button("Save as CSV…").clicked() {
                                 let kind = *kind;
-                                then = Some(Box::new(move |app: &mut App| app.ask(Pending::ReportCsv(kind))));
+                                then = Some(Box::new(move |app: &mut App| app.ask(Pending::ReportCsv(kind, false))));
+                            }
+                            if ui
+                                .button("Save as CSV for Excel (semicolon)…")
+                                .on_hover_text("Semicolon-separated with a UTF-8 byte order mark, so Excel opens it in columns with æ ø å intact")
+                                .clicked()
+                            {
+                                let kind = *kind;
+                                then = Some(Box::new(move |app: &mut App| app.ask(Pending::ReportCsv(kind, true))));
                             }
                             if ui.button("Save as Excel").clicked() {
                                 let path = o.dir.join("export").join(format!("{}.xlsx", kind.name()));
@@ -4423,6 +4510,17 @@ fn export_whole(open: &Open, kind: Export, pick: PickSave<'_>) -> Option<String>
     Some(note + &msg)
 }
 
+/// A report's CSV text: plain comma CSV, or for Excel (`excel`) `;`-separated with a leading
+/// UTF-8 byte order mark, as `wiringcraft report --sep ";"` writes it, so Excel in a
+/// comma-decimal locale splits the columns and reads æ ø å right.
+fn report_csv(table: &wc_report::Table, excel: bool) -> String {
+    if excel {
+        format!("\u{feff}{}", table.to_csv_with(';'))
+    } else {
+        table.to_csv()
+    }
+}
+
 /// Write a file, making its folder first.
 fn write_creating(path: &Path, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
     if let Some(d) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -4749,6 +4847,31 @@ fn report_table(ui: &mut egui::Ui, t: &wc_report::Table) {
                     }
                 });
         });
+}
+
+/// The moves of the arrow keys pressed this frame without modifiers, in order: `step`
+/// millimetres a press, y pointing down the page. Each press (or key repeat) is one move, and
+/// each key event's own modifiers decide whether it is a nudge.
+fn arrow_steps(i: &egui::InputState, step: f64) -> Vec<wc_core::geom::Point> {
+    i.events
+        .iter()
+        .filter_map(|e| match e {
+            egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } if modifiers.is_none() => match key {
+                Key::ArrowLeft => Some((-step, 0.0)),
+                Key::ArrowRight => Some((step, 0.0)),
+                Key::ArrowUp => Some((0.0, -step)),
+                Key::ArrowDown => Some((0.0, step)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .map(|(x, y)| wc_core::geom::Point::new(x, y))
+        .collect()
 }
 
 /// A project's title-block fields as form rows: the standard fields first (empty when not
@@ -5250,6 +5373,7 @@ impl eframe::App for App {
         }
         let mut actions = chrome::show(ctx, self.prefs.chrome, &mut self.chrome, &status);
         let keys = self.shortcuts(ctx);
+        self.nudge_by_arrows(ctx);
         // While an import runs no key edits the symbol being drawn either: the keys go to the
         // actions, which wait for the import.
         if self.importing.is_some() {
@@ -5484,13 +5608,16 @@ impl App {
                     ed.delete_selected();
                     false
                 }
+                // The page behind the symbol editor stays as it is.
                 Action::Cut
                 | Action::Copy
                 | Action::Paste
                 | Action::Duplicate
                 | Action::Rotate
                 | Action::Mirror
-                | Action::SelectAll => false,
+                | Action::SelectAll
+                | Action::PrevPage
+                | Action::NextPage => false,
                 _ => true,
             })
             .collect()
@@ -5795,6 +5922,32 @@ fn changed_fields(
         })
         .cloned()
         .collect()
+}
+
+#[cfg(test)]
+mod report_csv_tests {
+    use super::report_csv;
+
+    fn table() -> wc_report::Table {
+        wc_report::Table {
+            columns: vec!["Tag".into(), "Note".into()],
+            rows: vec![vec!["K1".into(), "Relé, 24 V".into()]],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn excel_csv_is_semicolon_separated_with_a_utf8_bom() {
+        let bytes = report_csv(&table(), true).into_bytes();
+        let mut want = vec![0xEF, 0xBB, 0xBF];
+        want.extend_from_slice("Tag;Note\r\nK1;Relé, 24 V\r\n".as_bytes());
+        assert_eq!(bytes, want);
+    }
+
+    #[test]
+    fn plain_csv_is_comma_separated_without_a_bom() {
+        assert_eq!(report_csv(&table(), false), "Tag,Note\r\nK1,\"Relé, 24 V\"\r\n");
+    }
 }
 
 #[cfg(test)]
@@ -6155,6 +6308,59 @@ mod renderer_tests {
         };
         assert!(press(true).is_empty(), "Ctrl+N does nothing under a dialog");
         assert!(matches!(press(false).as_slice(), [Action::AddPage]));
+    }
+
+    #[test]
+    fn arrow_keys_step_the_selection_by_the_snap() {
+        use wc_core::geom::Point;
+        let ctx = egui::Context::default();
+        // `frame` is the frame's modifiers, `keys` each press with its own.
+        let press = |frame: Modifiers, keys: &[(Key, Modifiers)]| {
+            let raw = egui::RawInput {
+                modifiers: frame,
+                events: keys
+                    .iter()
+                    .map(|&(key, modifiers)| egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            let mut got = Vec::new();
+            let _ = ctx.run(raw, |ctx| got = ctx.input(|i| arrow_steps(i, 2.5)));
+            got
+        };
+        let none = Modifiers::NONE;
+        assert_eq!(press(none, &[(Key::ArrowLeft, none)]), [Point::new(-2.5, 0.0)]);
+        assert_eq!(press(none, &[(Key::ArrowDown, none)]), [Point::new(0.0, 2.5)]);
+        assert_eq!(
+            press(none, &[(Key::ArrowRight, none), (Key::ArrowUp, none)]),
+            [Point::new(2.5, 0.0), Point::new(0.0, -2.5)]
+        );
+        // Two presses of one key in a frame are two steps.
+        assert_eq!(
+            press(none, &[(Key::ArrowRight, none), (Key::ArrowRight, none)]),
+            [Point::new(2.5, 0.0), Point::new(2.5, 0.0)]
+        );
+        assert!(press(none, &[(Key::A, none)]).is_empty());
+        assert!(
+            press(Modifiers::COMMAND, &[(Key::ArrowLeft, Modifiers::COMMAND)]).is_empty(),
+            "Ctrl+arrow is not a nudge"
+        );
+        // Each press's own modifiers count, not the frame's: a Ctrl+arrow in a frame that ends
+        // with no modifier held is not a nudge, a plain arrow after Ctrl was let go is.
+        assert!(press(none, &[(Key::ArrowLeft, Modifiers::COMMAND)]).is_empty());
+        assert_eq!(
+            press(
+                Modifiers::COMMAND,
+                &[(Key::ArrowLeft, none), (Key::ArrowUp, Modifiers::COMMAND)]
+            ),
+            [Point::new(-2.5, 0.0)]
+        );
     }
 
     #[test]
@@ -6845,6 +7051,169 @@ fn side_name(side: wc_core::BoxSide) -> &'static str {
         wc_core::BoxSide::Bottom => "bottom",
         wc_core::BoxSide::Left => "left",
         wc_core::BoxSide::Right => "right",
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod nudge_tests {
+    use super::*;
+    use wc_core::geom::Point;
+
+    /// An app with the test project open on its second page, a contact at (50, 20) and a coil
+    /// at `coil` on it, the coil selected; snap 5 mm.
+    fn app(coil: Point, auto_wire: bool) -> (tempfile::TempDir, App, egui::Context) {
+        let (tmp, mut open) = state::tests::project();
+        let page = open.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        open.place(page, "wc.contact.no", Point::new(50.0, 20.0)).unwrap();
+        let k = open.place(page, "wc.coil", coil).unwrap();
+        let prefs = Prefs {
+            snap: 5.0,
+            auto_wire,
+            ..Prefs::default()
+        };
+        let mut ed = Editor::default();
+        ed.page = page;
+        ed.select_only(Selection::Symbol(k));
+        let app = App {
+            prefs,
+            open: Some(open),
+            ed,
+            chrome: Default::default(),
+            panels: Default::default(),
+            dialog: None,
+            clipboard: Default::default(),
+            copied_text: None,
+            applied_theme: theme::Mode::Light,
+            assistant: Default::default(),
+            open_url: Vec::new(),
+            logged: Default::default(),
+            share: Default::default(),
+            symbol_editor: None,
+            find: None,
+            pending: None,
+            pending_for: None,
+            strip_editor: None,
+            show_layers: false,
+            live: Default::default(),
+            fetch: None,
+            importing: None,
+        };
+        (tmp, app, egui::Context::default())
+    }
+
+    /// One frame with `key` pressed; `focus_text` gives a text field the keyboard first.
+    fn press(app: &mut App, ctx: &egui::Context, key: Key, focus_text: bool) {
+        let raw = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| {
+            if focus_text {
+                ctx.memory_mut(|m| m.request_focus(egui::Id::new("a text field")));
+            }
+            app.nudge_by_arrows(ctx);
+        });
+    }
+
+    fn coil_at(app: &App) -> Point {
+        let open = app.open.as_ref().unwrap();
+        open.project.pages[app.ed.page].symbols[1].at
+    }
+
+    fn wires(app: &App) -> usize {
+        let open = app.open.as_ref().unwrap();
+        open.project.pages[app.ed.page].wires.len()
+    }
+
+    #[test]
+    fn an_arrow_press_through_the_app_frame_moves_the_selection() {
+        let (_tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        let mut frame = eframe::Frame::_new_kittest();
+        // As App::new does; the fonts take effect from the next frame.
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame)
+        });
+        assert_eq!(coil_at(&app), Point::new(80.0, 60.0));
+        let raw = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| eframe::App::update(&mut app, ctx, &mut frame));
+        assert_eq!(
+            coil_at(&app),
+            Point::new(85.0, 60.0),
+            "the app's frame nudges the selection"
+        );
+    }
+
+    #[test]
+    fn each_arrow_press_is_one_snap_step_and_one_undo_step() {
+        let (_tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        press(&mut app, &ctx, Key::ArrowRight, false);
+        assert_eq!(coil_at(&app), Point::new(85.0, 60.0));
+        press(&mut app, &ctx, Key::ArrowDown, false);
+        assert_eq!(coil_at(&app), Point::new(85.0, 65.0));
+        assert!(app.open.as_mut().unwrap().undo());
+        assert_eq!(coil_at(&app), Point::new(85.0, 60.0), "one undo takes back one press");
+        assert!(app.open.as_mut().unwrap().undo());
+        assert_eq!(
+            coil_at(&app),
+            Point::new(80.0, 60.0),
+            "the second undo takes back the first press"
+        );
+    }
+
+    #[test]
+    fn nothing_moves_while_a_text_field_has_the_keyboard_or_a_drag_runs() {
+        let (_tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        let revision = app.open.as_ref().unwrap().revision();
+        press(&mut app, &ctx, Key::ArrowRight, true);
+        assert_eq!(coil_at(&app), Point::new(80.0, 60.0));
+        app.ed.start_move_drag();
+        press(&mut app, &ctx, Key::ArrowRight, false);
+        assert_eq!(
+            coil_at(&app),
+            Point::new(80.0, 60.0),
+            "no nudge in the middle of a move drag"
+        );
+        // Nothing selected (and the drag over): a press takes no undo step.
+        let page = app.ed.page;
+        app.ed = Editor::default();
+        app.ed.page = page;
+        press(&mut app, &ctx, Key::ArrowRight, false);
+        assert_eq!(
+            app.open.as_ref().unwrap().revision(),
+            revision,
+            "no press took an undo step or changed the project"
+        );
+    }
+
+    #[test]
+    fn a_nudge_wires_pins_that_line_up_only_with_auto_wiring_on() {
+        for on in [true, false] {
+            let (_tmp, mut app, ctx) = app(Point::new(55.0, 60.0), on);
+            press(&mut app, &ctx, Key::ArrowLeft, false);
+            assert_eq!(coil_at(&app), Point::new(50.0, 60.0));
+            assert_eq!(wires(&app), usize::from(on), "auto-wiring {on}");
+            // The wire is part of the press's undo step.
+            assert!(app.open.as_mut().unwrap().undo());
+            assert_eq!((coil_at(&app), wires(&app)), (Point::new(55.0, 60.0), 0));
+        }
     }
 }
 

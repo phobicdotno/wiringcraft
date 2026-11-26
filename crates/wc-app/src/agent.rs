@@ -1452,13 +1452,7 @@ impl App {
 
     /// Show a page on screen.
     fn go_to(&mut self, page: usize) {
-        if self.ed.page != page || self.ed.panel.is_some() {
-            self.ed.page = page;
-            self.ed.panel = None;
-            self.ed.panel_pick = None;
-            self.ed.selection.clear();
-            self.ed.view.fit = true;
-        }
+        self.ed.show_page(page);
     }
 
     /// Take the message a command left in a dialog, so the model gets it as a result.
@@ -2233,7 +2227,7 @@ impl App {
         let open = need_open(self.open.as_mut())?;
         let q = s(v, "query").unwrap_or_default().to_lowercase();
         let limit = v.get("limit").and_then(Value::as_u64).unwrap_or(30) as usize;
-        let ids: Vec<String> = open.library.iter().map(|(id, _)| id.clone()).collect();
+        let ids: Vec<String> = open.library.iter().map(|e| e.id.clone()).collect();
         let lib = wc_library::Library::open(&open.dir, &open.project).ok();
         let mut out = Vec::new();
         for id in ids {
@@ -3907,6 +3901,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn library_update_from_the_menu_lists_the_new_descriptions() {
+        let (tmp, mut a) = app(vec![]);
+        let o = a.open.as_mut().unwrap();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let mut new = o.symbols["wc.coil"].clone();
+        new.description = "Solenoid winding".into();
+        crate::state::tests::library_first(o, tmp.path(), &new);
+        a.run(Action::LibraryUpdate);
+        let o = a.open.as_ref().unwrap();
+        assert_eq!(o.symbols["wc.coil"], new, "{}", a.ed.message);
+        let row = o.library.iter().find(|e| e.id == "wc.coil").unwrap();
+        assert_eq!(row.description, new.description);
+    }
+
     fn app(answers: Vec<Value>) -> (tempfile::TempDir, App) {
         let (tmp, open) = crate::state::tests::project();
         let mut prefs = crate::prefs::Prefs::default();
@@ -5362,6 +5371,95 @@ mod tests {
     }
 
     #[test]
+    fn page_up_and_page_down_open_the_previous_and_next_page() {
+        use crate::chrome::Status;
+        let (_tmp, mut a) = app(vec![]);
+        let ctx = egui::Context::default();
+        let field = egui::Id::new("field");
+        // One frame with `key` pressed, a text field having the keys first when asked.
+        let press = |a: &mut App, key: egui::Key, typing: bool| {
+            for events in [vec![], vec![key]] {
+                let pressed = !events.is_empty();
+                let raw = egui::RawInput {
+                    events: events
+                        .into_iter()
+                        .map(|key| egui::Event::Key {
+                            key,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        })
+                        .collect(),
+                    ..Default::default()
+                };
+                let _ = ctx.run(raw, |ctx| {
+                    if typing {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            let mut s = String::new();
+                            ui.add(egui::TextEdit::singleline(&mut s).id(field));
+                        });
+                        ctx.memory_mut(|m| m.request_focus(field));
+                    }
+                    if pressed {
+                        for act in a.shortcuts(ctx) {
+                            a.run(act);
+                        }
+                    }
+                });
+            }
+        };
+        let numbers = |a: &App| -> Vec<String> {
+            let o = a.open.as_ref().unwrap();
+            o.project.pages.iter().map(|p| p.number.clone()).collect()
+        };
+        let status = |a: &App, act: Action| {
+            crate::StatusView {
+                open: a.open.as_ref(),
+                ed: &a.ed,
+                prefs: &a.prefs,
+                clipboard: &a.clipboard,
+                sharing: false,
+                share_undo: false,
+                share_redo: false,
+                show_layers: false,
+            }
+            .enabled(act)
+        };
+        let before = numbers(&a);
+        let last = before.len() - 1;
+        assert!(last >= 1, "the test project has two pages or more");
+
+        a.ed.page = 0;
+        assert!(!status(&a, Action::PrevPage), "nothing before the first page");
+        press(&mut a, egui::Key::PageUp, false);
+        assert_eq!(a.ed.page, 0, "the first page stays");
+        press(&mut a, egui::Key::PageDown, false);
+        assert_eq!(a.ed.page, 1, "Page Down opens the next page");
+        assert_eq!(numbers(&a), before, "no page is renumbered");
+        press(&mut a, egui::Key::PageUp, false);
+        assert_eq!(a.ed.page, 0, "Page Up opens the previous page");
+
+        a.ed.page = last;
+        assert!(!status(&a, Action::NextPage), "nothing after the last page");
+        press(&mut a, egui::Key::PageDown, false);
+        assert_eq!(a.ed.page, last, "the last page stays");
+
+        // A text field with the keys, or a dialog, keeps the page.
+        press(&mut a, egui::Key::PageUp, true);
+        assert_eq!(a.ed.page, last, "not while typing");
+        a.dialog = Some(crate::Dialog::Message("Busy".into()));
+        press(&mut a, egui::Key::PageUp, false);
+        assert_eq!(a.ed.page, last, "not under a dialog");
+        a.dialog = None;
+
+        // The assistant can do the same.
+        call(&mut a, "run_action", json!({"action": "PrevPage"})).unwrap();
+        assert_eq!(a.ed.page, last - 1);
+        assert_eq!(numbers(&a), before);
+    }
+
+    #[test]
     fn ctrl_d_duplicates_the_selection_one_grid_step_away_as_one_undo_step() {
         let (_tmp, mut a) = app(vec![]);
         let ctx = egui::Context::default();
@@ -5682,6 +5780,62 @@ mod tests {
             "the editor redid the delete"
         );
         assert_eq!(a.open.as_ref().unwrap().project, before, "the project was not touched");
+    }
+
+    #[test]
+    fn page_keys_do_not_switch_the_page_behind_the_symbol_editor() {
+        let (_tmp, mut a) = app(vec![]);
+        let keys = vec![Action::PrevPage, Action::NextPage, Action::ZoomIn];
+        assert_eq!(
+            a.route_to_symbol_editor(keys.clone()),
+            keys,
+            "closed: the project gets them"
+        );
+        a.symbol_editor = Some(crate::symbol_editor::SymbolEditor::new(Vec::new()));
+        a.ed.page = 0;
+        for act in a.route_to_symbol_editor(keys) {
+            a.run(act);
+        }
+        assert_eq!(a.ed.page, 0, "the page under the symbol editor stays");
+    }
+
+    #[test]
+    fn going_to_a_page_closes_the_panel_and_clears_the_selection() {
+        let (_tmp, mut a) = app(vec![]);
+        let fresh = |a: &mut App| {
+            a.ed.view.fit = false;
+            a.ed.selection = vec![crate::state::Selection::Graphic(0)];
+        };
+        fresh(&mut a);
+        a.ed.page = 0;
+        a.go_to(0);
+        assert!(
+            !a.ed.view.fit && a.ed.selection.len() == 1,
+            "the page shown: nothing changes"
+        );
+
+        a.go_to(1);
+        assert_eq!(a.ed.page, 1);
+        assert!(a.ed.view.fit && a.ed.selection.is_empty());
+
+        // From a panel back to the page under it: the panel and its pick go.
+        fresh(&mut a);
+        a.ed.panel = Some(0);
+        a.ed.panel_pick = Some(0);
+        a.go_to(1);
+        assert_eq!((a.ed.panel, a.ed.panel_pick), (None, None));
+        assert!(a.ed.view.fit && a.ed.selection.is_empty());
+
+        // Next page does the same, and also drops a wire being drawn.
+        fresh(&mut a);
+        a.ed.page = 0;
+        a.ed.panel = Some(0);
+        a.ed.panel_pick = Some(0);
+        let at = wc_core::geom::Point::new(0.0, 0.0);
+        a.ed.wire = Some((wc_core::Endpoint::Point { at }, Vec::new()));
+        a.run(Action::NextPage);
+        assert_eq!((a.ed.page, a.ed.panel, a.ed.panel_pick), (1, None, None));
+        assert!(a.ed.view.fit && a.ed.selection.is_empty() && a.ed.wire.is_none());
     }
 
     #[test]

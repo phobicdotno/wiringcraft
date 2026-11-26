@@ -381,6 +381,8 @@ pub(crate) struct Mark {
     kept: Kept,
     symbols: std::collections::BTreeSet<String>,
     parts: std::collections::BTreeSet<String>,
+    /// The symbol list as it was: a symbol the change loaded may have added or changed a row.
+    library: Vec<LibraryEntry>,
     /// The vendored symbol and part files there were, or why that is not known.
     files: Result<std::collections::BTreeSet<(ItemKind, String)>, String>,
     /// Where the change's own project file edits start in [`Open::mark_edits`].
@@ -419,13 +421,39 @@ fn vendor_names(dir: &Path) -> Result<std::collections::BTreeSet<(ItemKind, Stri
     Ok(out)
 }
 
+/// One symbol in the symbol list: what the list shows, searches and offers to place.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LibraryEntry {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+}
+
+impl LibraryEntry {
+    /// The entry for symbol `s` listed under `id`.
+    pub fn of(id: &str, s: &Symbol) -> Self {
+        Self {
+            id: id.to_owned(),
+            name: s.name.clone(),
+            description: s.description.clone(),
+        }
+    }
+
+    /// Whether every word of `query` appears, ignoring case, in the id, name or description.
+    /// An empty query matches everything.
+    pub fn matches(&self, query: &str) -> bool {
+        let hay = format!("{} {} {}", self.id, self.name, self.description).to_lowercase();
+        query.to_lowercase().split_whitespace().all(|w| hay.contains(w))
+    }
+}
+
 pub struct Open {
     pub dir: PathBuf,
     pub project: Project,
     /// The project's vendored symbols.
     pub symbols: BTreeMap<String, Symbol>,
-    /// Ids of every symbol in the project's library sources (for the picker).
-    pub library: Vec<(String, String)>,
+    /// Every symbol in the project and its library sources (for the picker), by id.
+    pub library: Vec<LibraryEntry>,
     /// The check rules of the project's library sources, read with the library
     /// ([`Open::refresh_library`]) so checks while drawing need not read files.
     pub library_rules: Vec<wc_core::check_rule::RuleSet>,
@@ -674,19 +702,29 @@ impl Open {
         }
     }
 
-    pub fn refresh_library(&mut self) {
-        let mut items: BTreeMap<String, String> =
-            self.symbols.iter().map(|(k, s)| (k.clone(), s.name.clone())).collect();
+    /// Rebuild the symbol list from the loaded vendored symbols and the library sources, so
+    /// each entry carries the name and description of the version in use.
+    fn relist_symbols(&mut self) {
+        let mut items: BTreeMap<String, LibraryEntry> = self
+            .symbols
+            .iter()
+            .map(|(k, s)| (k.clone(), LibraryEntry::of(k, s)))
+            .collect();
         if let Ok(lib) = wc_library::Library::open(&self.dir, &self.project) {
             for id in lib.index(ItemKind::Symbol).into_keys() {
                 if !items.contains_key(&id)
                     && let Ok((s, _)) = lib.symbol(&id)
                 {
-                    items.insert(id, s.name);
+                    let entry = LibraryEntry::of(&id, &s);
+                    items.insert(id, entry);
                 }
             }
         }
-        self.library = items.into_iter().collect();
+        self.library = items.into_values().collect();
+    }
+
+    pub fn refresh_library(&mut self) {
+        self.relist_symbols();
         self.library_rules = wc_library::library_rules(&self.dir, &self.project);
         self.touch();
 
@@ -1451,13 +1489,18 @@ impl Open {
         }
     }
 
-    /// After an undo or redo: rebuild the library list when the step added or removed a library
+    /// After an undo or redo: rebuild the library lists when the step added or removed a library
     /// source (`sources_changed`), so symbols of a source that is gone are no longer offered and
-    /// those of one that came back are; then load every part a device uses that is not loaded,
+    /// those of one that came back are, and otherwise rebuild the symbol list, so a symbol whose
+    /// version the step changed is listed with its own name and description; then load every part a device uses that is not loaded,
     /// since a redo can bring back an assignment whose part an earlier rebuild dropped.
     fn follow_step(&mut self, sources_changed: bool) {
         if sources_changed {
             self.refresh_library();
+        } else {
+            // The step may have brought back another version of a vendored symbol: list it
+            // with its own name and description.
+            self.relist_symbols();
         }
         let missing: Vec<String> = self
             .project
@@ -2561,6 +2604,7 @@ impl Open {
     pub fn ensure_symbols<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
         self.touch();
         let (lock, symbols) = (self.project.lock.clone(), self.symbols.clone());
+        let library = self.library.clone();
         // Putting a terminal copy back follows terminals: jumpers, rail orders and the device
         // data and panel places of spares a strip took along all go back too.
         let (meta, terminals) = (self.project.meta.clone(), self.terminals_before.clone());
@@ -2569,6 +2613,7 @@ impl Open {
             if let Err(e) = self.ensure_symbol(id) {
                 self.project.lock = lock;
                 self.symbols = symbols;
+                self.library = library;
                 self.project.meta = meta;
                 self.project.devices = devices;
                 self.project.panels = panels;
@@ -2613,7 +2658,7 @@ impl Open {
             // settled with it, and tracking starts again from the pinned copy, so putting it
             // back does not read as terminals moved.
             self.follow_terminals();
-            self.symbols.insert(id.to_owned(), fixed);
+            self.load_symbol(id, fixed);
             if self.terminals_before.is_some() {
                 self.terminals_before = Some(self.terminal_numbers());
             }
@@ -2628,8 +2673,21 @@ impl Open {
                 store::read_vendored_symbol(&self.dir, id).map_err(|e| e.to_string())?
             }
         };
-        self.symbols.insert(id.to_owned(), s);
+        self.load_symbol(id, s);
         Ok(())
+    }
+
+    /// Load `s` as the project's symbol `id`, and list it with its own name and description.
+    fn load_symbol(&mut self, id: &str, s: Symbol) {
+        let entry = LibraryEntry::of(id, &s);
+        match self.library.iter_mut().find(|e| e.id == id) {
+            Some(row) => *row = entry,
+            None => {
+                let at = self.library.partition_point(|e| e.id.as_str() < id);
+                self.library.insert(at, entry);
+            }
+        }
+        self.symbols.insert(id.to_owned(), s);
     }
 
     /// The version of symbol `id` that `pin` names: its copy in the project, or, when there is
@@ -3120,6 +3178,7 @@ impl Open {
             kept,
             symbols: self.symbols.keys().cloned().collect(),
             parts: self.parts.keys().cloned().collect(),
+            library: self.library.clone(),
             files: vendor_names(&self.dir),
             edits_from: self.mark_edits.len(),
         }
@@ -3172,6 +3231,7 @@ impl Open {
         }
         self.symbols.retain(|id, _| mark.symbols.contains(id));
         self.parts.retain(|id, _| mark.parts.contains(id));
+        self.library = mark.library;
         let (before, now) = match (mark.files, vendor_names(&self.dir)) {
             (Ok(before), Ok(now)) => (before, now),
             (Err(e), _) | (_, Err(e)) => {
@@ -6414,6 +6474,29 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn undo_and_redo_list_the_symbol_version_they_bring_back() {
+        let (_tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let old = o.symbols["wc.coil"].clone();
+        let mut new = old.clone();
+        new.description = "Solenoid winding".into();
+        o.checkpoint();
+        store::write_vendored_symbol(&o.dir, &new).unwrap();
+        o.project.lock.symbols.get_mut("wc.coil").unwrap().hash = new.hash();
+        o.reload_symbols();
+        o.refresh_library();
+        let listed = |o: &Open| o.library.iter().find(|e| e.id == "wc.coil").unwrap().clone();
+        assert_eq!(listed(&o).description, new.description);
+
+        assert!(o.undo(), "{:?}", o.take_undo_error());
+        assert_eq!(listed(&o).description, old.description);
+        assert!(!listed(&o).matches("solenoid"));
+        assert!(o.redo(), "{:?}", o.take_undo_error());
+        assert_eq!(listed(&o).description, new.description);
+        assert!(listed(&o).matches("solenoid"));
+    }
+
+    #[test]
     fn redo_puts_back_a_new_version_of_a_symbol_no_page_uses() {
         let (_tmp, mut o) = project();
         o.ensure_symbol("wc.coil").unwrap();
@@ -6451,6 +6534,54 @@ pub(crate) mod tests {
         assert_eq!(o.symbols["wc.coil"], old, "placed in the version pinned");
         assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), old);
         assert_eq!(o.project.lock.symbols["wc.coil"].hash, old.hash());
+    }
+
+    #[test]
+    fn a_pinned_symbol_put_back_is_listed_with_its_own_description() {
+        let (tmp, mut o) = project();
+        o.ensure_symbol("wc.coil").unwrap();
+        let old = o.symbols["wc.coil"].clone();
+        o.save().unwrap();
+        std::fs::remove_file(store::vendor_path(&o.dir, ItemKind::Symbol, "wc.coil").unwrap()).unwrap();
+        let mut o = Open::load(&o.dir).unwrap();
+        // The library that wins for the id has a newer version with another description.
+        let mut new = old.clone();
+        new.description = "Solenoid winding".into();
+        library_first(&mut o, tmp.path(), &new);
+        o.refresh_library();
+        let listed = |o: &Open| o.library.iter().find(|e| e.id == "wc.coil").unwrap().clone();
+        assert_eq!(listed(&o).description, new.description);
+        // Placing puts back the pinned version: the list follows it.
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        assert_eq!(o.symbols["wc.coil"], old);
+        assert_eq!(listed(&o).description, old.description);
+        assert!(!listed(&o).matches("solenoid"));
+        assert_eq!(o.library.iter().filter(|e| e.id == "wc.coil").count(), 1);
+    }
+
+    #[test]
+    fn a_refused_change_that_loaded_a_symbol_puts_the_symbol_list_back() {
+        let (tmp, mut o) = project();
+        o.ensure_symbol("wc.coil").unwrap();
+        let old = o.symbols["wc.coil"].clone();
+        o.save().unwrap();
+        std::fs::remove_file(store::vendor_path(&o.dir, ItemKind::Symbol, "wc.coil").unwrap()).unwrap();
+        let mut o = Open::load(&o.dir).unwrap();
+        let mut new = old.clone();
+        new.description = "Solenoid winding".into();
+        library_first(&mut o, tmp.path(), &new);
+        o.refresh_library();
+        let m = o.mark();
+        let listed = o.library.clone();
+        // The change loads the pinned version, which changes its row, and is then refused.
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        assert_ne!(o.library, listed);
+        // A symbol only this project has gets a row of its own.
+        let mut own = old.clone();
+        own.id = "test.own".into();
+        o.load_symbol("test.own", own);
+        o.back_to(m).unwrap();
+        assert_eq!(o.library, listed, "the symbol list is as it was at the mark");
     }
 
     #[test]
@@ -6764,11 +6895,13 @@ pub(crate) mod tests {
         let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library/symbols/wc.breaker.1p.json");
         std::fs::copy(starter, tmp.path().join("mine/symbols/wc.breaker.1p.json")).unwrap();
         let before = o.project.clone();
+        let listed = o.library.clone();
         let undo = o.can_undo();
         let err = o.paste(1, &clip, Point::new(80.0, 80.0)).unwrap_err();
         assert!(err.contains("wc.coil"), "the symbol is named: {err}");
         assert_eq!(o.project, before, "nothing is added, not even the breaker's pin");
         assert!(!o.symbols.contains_key("wc.breaker.1p"));
+        assert_eq!(o.library, listed, "the symbol list goes back too");
         assert_eq!(o.can_undo(), undo, "no undo step");
         let path = o.save_macro(&clip, "Coil", "").unwrap();
         let err = o.insert_macro(1, &path, None).unwrap_err();
@@ -6777,7 +6910,7 @@ pub(crate) mod tests {
     }
 
     /// A library folder named "mine", put ahead of the others, holding `sym`.
-    fn library_first(o: &mut Open, root: &Path, sym: &Symbol) -> wc_library::Library {
+    pub(crate) fn library_first(o: &mut Open, root: &Path, sym: &Symbol) -> wc_library::Library {
         let mine = root.join("mine");
         std::fs::create_dir_all(mine.join("symbols")).unwrap();
         std::fs::write(
@@ -8446,9 +8579,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_symbol_list_keeps_and_searches_descriptions() {
+        let (_tmp, o) = project();
+        let coil = o.library.iter().find(|e| e.id == "wc.coil").unwrap();
+        assert!(coil.description.contains("relay"), "{coil:?}");
+        // Every word must appear, in any order and case, across id, name and description.
+        assert!(coil.matches(""));
+        assert!(coil.matches("CONTACTOR relay"));
+        assert!(coil.matches("coil contactor"));
+        assert!(!coil.matches("contactor timer"));
+        let hits: Vec<&str> = o
+            .library
+            .iter()
+            .filter(|e| e.matches("relay contactor"))
+            .map(|e| e.id.as_str())
+            .collect();
+        assert!(hits.contains(&"wc.coil"), "{hits:?}");
+        // After placing, the vendored copy keeps its description too.
+        let mut o = o;
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        o.place(page, "wc.coil", Point::new(50.0, 50.0)).unwrap();
+        o.refresh_library();
+        let coil = o.library.iter().find(|e| e.id == "wc.coil").unwrap();
+        assert!(coil.matches("relay"));
+    }
+
+    #[test]
     fn placing_vendors_the_symbol_and_tags_the_device() {
         let (_tmp, mut o) = project();
-        assert!(o.library.iter().any(|(id, _)| id == "wc.coil"));
+        assert!(o.library.iter().any(|e| e.id == "wc.coil"));
         let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
         let id = o.place(page, "wc.coil", Point::new(50.0, 50.0)).unwrap();
         assert!(o.symbols.contains_key("wc.coil"));
@@ -9179,7 +9338,7 @@ pub(crate) mod tests {
             description: String::new(),
         };
         wc_library::write_symbol(&root, &sym).unwrap();
-        let listed = |o: &Open| o.library.iter().any(|(id, _)| id == "test.imported");
+        let listed = |o: &Open| o.library.iter().any(|e| e.id == "test.imported");
         o.refresh_library();
         assert!(!listed(&o), "the folder is not a source yet");
 
