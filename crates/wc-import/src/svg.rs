@@ -238,22 +238,24 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                 (None, false)
             }
             Event::Text(t) => {
-                // Skip the line breaks and indents between `<text>` and a `<tspan>`.
-                let s = t
-                    .unescape()
-                    .map_err(|e| Error::Format(format!("SVG: {e}")))?
-                    .trim()
-                    .to_owned();
-                if !s.is_empty()
-                    && let Some((at, h, align)) = pending_text.take()
-                {
-                    shapes.push(Shape::Text {
-                        at,
-                        text: s,
-                        height: h,
-                        align,
-                        angle: 0.0,
-                    });
+                // Only text for a pending label is read; other text is ignored.
+                if let Some((at, h, align)) = pending_text {
+                    let s = t
+                        .unescape()
+                        .map_err(|e| Error::Format(format!("SVG: {e}")))?
+                        .trim()
+                        .to_owned();
+                    // Skip the line breaks and indents between `<text>` and a `<tspan>`.
+                    if !s.is_empty() {
+                        pending_text = None;
+                        shapes.push(Shape::Text {
+                            at,
+                            text: s,
+                            height: h,
+                            align,
+                            angle: 0.0,
+                        });
+                    }
                 }
                 (None, false)
             }
@@ -442,6 +444,9 @@ mod tests {
         // Text that cannot be read is an error, not a skipped line break.
         let bad = r#"<svg><text x="0" y="0">&missing;<tspan>K1</tspan></text></svg>"#;
         assert!(symbol(bad, "svg.bad", "Bad").is_err());
+        // Unreadable text with no label waiting for it is ignored, as before.
+        let title = r#"<svg><title>&missing;</title><line x1="0" y1="0" x2="1" y2="1"/></svg>"#;
+        assert!(symbol(title, "svg.title", "Title").is_ok());
         Ok(())
     }
 
