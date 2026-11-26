@@ -3656,6 +3656,7 @@ fn run(mut cli: Cli) -> Res<()> {
                     _ => true,
                 })
                 .collect();
+            warn_levels(&p, &kinds);
             // The network list is followed by a topology page per network.
             let networks = if kinds.contains(&wc_report::Kind::Networks) {
                 p.meta.networks.clone()
@@ -3875,6 +3876,7 @@ fn run(mut cli: Cli) -> Res<()> {
             };
             warn_report_layouts(&inputs);
             let kinds = report_kinds(std::slice::from_ref(&kind))?;
+            warn_levels(&p, &kinds);
             if format == "xlsx" {
                 let Some(path) = out else {
                     return Err("an Excel workbook is not text: pass --out <file>.xlsx".into());
@@ -4714,6 +4716,18 @@ fn warn_report_layouts(inputs: &wc_report::Inputs<'_>) {
         eprintln!("warning: {}", escape_field(&w));
     }
     for w in wc_report::network_warnings(inputs) {
+        eprintln!("warning: {}", escape_field(&w));
+    }
+}
+
+/// Warns about each terminal `Level` value that is not a level, when `kinds` has the terminal
+/// plan: such a terminal shows no level there.
+fn warn_levels(project: &wc_core::Project, kinds: &[wc_report::Kind]) {
+    if !kinds.contains(&wc_report::Kind::Terminals) {
+        return;
+    }
+    for w in wc_report::level_warnings(project) {
+        // Tags and values come from the project file.
         eprintln!("warning: {}", escape_field(&w));
     }
 }
