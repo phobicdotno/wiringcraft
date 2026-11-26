@@ -1656,6 +1656,75 @@ mod discovery {
     }
 
     #[test]
+    fn the_session_list_stops_at_its_limit_and_keeps_refreshing_listed_sessions() -> TestResult {
+        use crate::discovery::MAX_SESSIONS;
+        let mut b = Browser::bind("127.0.0.1:0".parse()?, FORGET)?;
+        let from: SocketAddr = "192.168.1.40:5000".parse()?;
+        let feed = |b: &mut Browser, ports: Vec<u16>, project: &str| -> TestResult {
+            let mut ports = ports.into_iter();
+            let project = project.to_string();
+            b.receive(|buf| {
+                let Some(port) = ports.next() else {
+                    return Err(std::io::ErrorKind::WouldBlock.into());
+                };
+                let wire = beacon(&project, "Ola", port).encode();
+                buf[..wire.len()].copy_from_slice(&wire);
+                Ok((wire.len(), from))
+            })?;
+            Ok(())
+        };
+        // Twice the limit of distinct sessions, fed over several polls' worth of reads.
+        let ports: Vec<u16> = (0..MAX_SESSIONS * 2)
+            .map(|i| 10_000 + u16::try_from(i).unwrap_or(0))
+            .collect();
+        for chunk in ports.chunks(crate::discovery::MAX_PER_POLL) {
+            feed(&mut b, chunk.to_vec(), "Flood")?;
+        }
+        let list = b.poll()?;
+        assert_eq!(list.len(), MAX_SESSIONS);
+        assert!(list.iter().all(|s| s.addr.port() < 10_000 + 256), "the first ones stay");
+
+        // A session already listed is still refreshed while the list is full.
+        feed(&mut b, vec![10_000], "Renamed")?;
+        let list = b.poll()?;
+        assert_eq!(list.len(), MAX_SESSIONS);
+        let first = list.iter().find(|s| s.addr.port() == 10_000);
+        assert_eq!(first.map(|s| s.project.as_str()), Some("Renamed"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_full_session_list_takes_new_sessions_once_old_ones_are_forgotten() -> TestResult {
+        use crate::discovery::MAX_SESSIONS;
+        // A timeout no pause of the test thread comes near, so the new session stays fresh.
+        let forget = Duration::from_secs(60);
+        let mut b = Browser::bind("127.0.0.1:0".parse()?, forget)?;
+        let from: SocketAddr = "192.168.1.41:5000".parse()?;
+        let send = |b: &mut Browser, ports: std::ops::Range<usize>| -> TestResult {
+            let mut ports = ports;
+            b.receive(|buf| {
+                let Some(i) = ports.next() else {
+                    return Err(std::io::ErrorKind::WouldBlock.into());
+                };
+                let port = 20_000 + u16::try_from(i).unwrap_or(0);
+                let wire = beacon("Old", "Ola", port).encode();
+                buf[..wire.len()].copy_from_slice(&wire);
+                Ok((wire.len(), from))
+            })?;
+            Ok(())
+        };
+        send(&mut b, 0..MAX_SESSIONS)?;
+        // Silent for longer than the timeout, without waiting on the clock.
+        b.age(forget * 2);
+        // No poll in between: the full list makes room by forgetting the silent sessions.
+        send(&mut b, MAX_SESSIONS..MAX_SESSIONS + 1)?;
+        let list = b.poll()?;
+        assert_eq!(list.len(), 1, "{list:?}");
+        assert_eq!(list[0].addr.port(), 20_000 + u16::try_from(MAX_SESSIONS).unwrap_or(0));
+        Ok(())
+    }
+
+    #[test]
     fn a_beacon_from_an_older_build_reads_as_version_0() -> TestResult {
         let mut b = Browser::bind("127.0.0.1:0".parse()?, FORGET)?;
         let from: SocketAddr = "192.168.1.30:5000".parse()?;
@@ -4099,4 +4168,105 @@ fn a_refused_edit_is_named_by_its_seq() {
     g.handle(refused(None));
     g.handle(refused(Some(7)));
     assert_eq!(g.refused_edits, [3, 7].into());
+}
+
+/// The display numbers of `project`'s pages, by page id.
+fn numbers(project: Option<&Project>) -> Vec<(String, String)> {
+    project
+        .map(|p| p.pages.iter().map(|pg| (pg.id.clone(), pg.number.clone())).collect())
+        .unwrap_or_default()
+}
+
+#[test]
+fn two_people_numbering_pages_at_once_cannot_give_two_pages_one_number() -> TestResult {
+    let mut s = Session::new();
+    let (_, a_link, mut a) = s.join("Ola")?;
+    let (_, b_link, mut b) = s.join("Kari")?;
+    // Both pick number 5, free in each copy, before either hears of the other.
+    a_link.send(a.edit_project(ProjectEdit::Renumber {
+        numbers: vec![("p0002".into(), "5".into())],
+    }))?;
+    b_link.send(b.edit_project(ProjectEdit::Renumber {
+        numbers: vec![("p0003".into(), "5".into())],
+    }))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert!(a.refusals.is_empty(), "{:?}", a.refusals);
+    assert!(
+        matches!(&b.refusals[..], [Refusal::Invalid { reason }] if reason.contains("already has number 5")),
+        "{:?}",
+        b.refusals
+    );
+    let want = [("p0001", "1"), ("p0003", "3"), ("p0002", "5")].map(|(i, n)| (i.to_owned(), n.to_owned()));
+    assert_eq!(numbers(Some(s.host.project())), want);
+    assert_eq!(a.project.as_ref(), Some(s.host.project()));
+    assert_eq!(b.project.as_ref(), Some(s.host.project()), "Kari's copy is put right");
+
+    // A new page may not take a number either, while a swap in one change is fine.
+    let mut added = Page::new("p0004", "3", "Valves");
+    a_link.send(a.edit_project(ProjectEdit::AddPage { page: added.clone() }))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert_eq!(a.refusals.len(), 1, "{:?}", a.refusals);
+    assert!(s.host.project().page("p0004").is_none());
+    added.number = "4".into();
+    a_link.send(a.edit_project(ProjectEdit::AddPage { page: added }))?;
+    a_link.send(a.edit_project(ProjectEdit::Renumber {
+        numbers: vec![("p0003".into(), "4".into()), ("p0004".into(), "3".into())],
+    }))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert_eq!(a.refusals.len(), 1, "{:?}", a.refusals);
+    let want =
+        [("p0001", "1"), ("p0004", "3"), ("p0003", "4"), ("p0002", "5")].map(|(i, n)| (i.to_owned(), n.to_owned()));
+    assert_eq!(numbers(Some(s.host.project())), want);
+    assert_eq!(numbers(b.project.as_ref()), want);
+    Ok(())
+}
+
+#[test]
+fn an_undo_cannot_give_back_a_number_another_page_took_since() -> TestResult {
+    let mut s = Session::new();
+    let (_, a_link, mut a) = s.join("Ola")?;
+    let (_, b_link, mut b) = s.join("Kari")?;
+    a_link.send(a.edit_project(ProjectEdit::Renumber {
+        numbers: vec![("p0002".into(), "5".into())],
+    }))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    // Number 2 is free now, and Kari takes it.
+    b_link.send(b.edit_project(ProjectEdit::Renumber {
+        numbers: vec![("p0003".into(), "2".into())],
+    }))?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert!(b.refusals.is_empty(), "{:?}", b.refusals);
+    a_link.send(a.undo())?;
+    s.pump(&mut [(&a_link, &mut a), (&b_link, &mut b)]);
+    assert!(
+        matches!(&a.refusals[..], [Refusal::Invalid { reason }] if reason.contains("another page has number 2")),
+        "{:?}",
+        a.refusals
+    );
+    let want = [("p0001", "1"), ("p0003", "2"), ("p0002", "5")].map(|(i, n)| (i.to_owned(), n.to_owned()));
+    assert_eq!(numbers(Some(s.host.project())), want);
+    assert_eq!(a.project.as_ref(), Some(s.host.project()));
+    Ok(())
+}
+
+#[test]
+fn pages_that_already_share_a_number_stay_editable() -> TestResult {
+    let mut project = demo();
+    project.pages[2].number = "2".into();
+    let mut host = Host::new(project, "Hanna Host", "hanna@example.com", Box::new(Shared::default()));
+    // Renumbering another page, or one of the two to a free number, is fine.
+    host.edit_project(ProjectEdit::Renumber {
+        numbers: vec![("p0001".into(), "0".into())],
+    })?;
+    host.edit_project(ProjectEdit::Renumber {
+        numbers: vec![("p0003".into(), "3".into())],
+    })?;
+    // Giving it back is not.
+    assert!(
+        host.edit_project(ProjectEdit::Renumber {
+            numbers: vec![("p0003".into(), "2".into())],
+        })
+        .is_err()
+    );
+    Ok(())
 }

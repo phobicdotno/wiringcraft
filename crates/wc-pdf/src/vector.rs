@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 
 use wc_core::{Project, Symbol};
 
-use crate::writer::{Prim, Stroke};
+use crate::writer::{Layer, Prim, Stroke};
 use crate::{Options, Report, layout};
 
 /// One page as drawing primitives in page millimetres (y down).
@@ -227,32 +227,69 @@ fn on_circle(c: (f64, f64), r: f64, deg: f64) -> (f64, f64) {
     (c.0 + r * t.cos(), c.1 + r * t.sin())
 }
 
+/// The opening of a drawing group, without its closing `>`: the style every group shares.
+const GROUP: &str = "<g fill=\"none\" stroke-linecap=\"round\" stroke-linejoin=\"round\" \
+                     font-family=\"Helvetica, Arial, sans-serif\"";
+
 /// An SVG document of one page, sized in millimetres with one user unit per millimetre.
 pub fn svg(page: &PageDrawing) -> String {
     let (w, h) = page.size_mm;
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}mm\" \
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<svg xmlns=\"http://www.w3.org/2000/svg\" \
+         xmlns:inkscape=\"http://www.inkscape.org/namespaces/inkscape\" width=\"{w}mm\" \
          height=\"{h}mm\" viewBox=\"0 0 {w} {h}\">\n<title>{} {}</title>\n<rect width=\"{w}\" height=\"{h}\" \
-         fill=\"#ffffff\"/>\n<g fill=\"none\" stroke-linecap=\"round\" stroke-linejoin=\"round\" \
-         font-family=\"Helvetica, Arial, sans-serif\">",
+         fill=\"#ffffff\"/>\n{GROUP}>",
         xml(&page.number),
         xml(&page.title),
         w = num(w),
         h = num(h)
     );
-    // The underlay goes under the drawing: out of the group, before it.
+    // Prims on an optional layer go in a group of their own that Inkscape shows as a layer. A new
+    // group opens whenever the layer changes, so the drawing order stays as it is.
+    let mut current: Option<Layer> = None;
+    let mut opened: BTreeMap<Layer, usize> = BTreeMap::new();
+    // The underlay (the scanned sheet) goes under the drawing, before the group the header
+    // opened, in a layer of its own.
     let mut under = String::new();
     for p in page.pictures.iter().filter(|p| !p.on_top) {
         svg_image(&mut under, p);
     }
     if !under.is_empty() {
-        // Put them just before the group the header opened.
+        opened.insert(Layer::Scans, 1);
         let at = out.rfind("<g ").unwrap_or(out.len());
-        out.insert_str(at, &under);
+        out.insert_str(
+            at,
+            &format!(
+                "<g id=\"{}\" inkscape:groupmode=\"layer\" inkscape:label=\"{}\">\n{under}</g>\n",
+                Layer::Scans.dxf_name().to_ascii_lowercase(),
+                xml(Layer::Scans.title())
+            ),
+        );
     }
     for p in &page.prims {
+        let (Prim::Path { layer, .. } | Prim::Arc { layer, .. } | Prim::Text { layer, .. }) = p;
+        if *layer != current {
+            out.push_str("</g>\n");
+            match layer {
+                Some(l) => {
+                    let n = opened.entry(*l).or_insert(0);
+                    *n += 1;
+                    let name = l.dxf_name().to_ascii_lowercase();
+                    let id = if *n == 1 { name } else { format!("{name}-{n}") };
+                    let _ = writeln!(
+                        out,
+                        "{GROUP} id=\"{id}\" inkscape:groupmode=\"layer\" inkscape:label=\"{}\">",
+                        xml(l.title())
+                    );
+                }
+                None => {
+                    let _ = writeln!(out, "{GROUP}>");
+                }
+            }
+            current = *layer;
+        }
         match p {
             Prim::Path {
                 points,
@@ -372,12 +409,21 @@ fn aci(ink: &Stroke) -> u8 {
 }
 
 /// DXF text: ASCII as is, anything else as `\U+XXXX`, which DXF readers turn back into text.
-fn dxf_text(s: &str) -> String {
+/// A backslash, and a `%` next to another `%`, are written as codes too, so readers do not take
+/// them for a `\U+XXXX` or `%%` code; a character beyond U+FFFF, which has no four-digit code,
+/// becomes `?`.
+pub(crate) fn dxf_text(s: &str) -> String {
+    // Control characters are dropped first, so two `%` they stood between are seen as a pair.
+    let chars: Vec<char> = s.chars().filter(|c| !c.is_control()).collect();
     let mut out = String::new();
-    for ch in s.chars() {
+    for (i, &ch) in chars.iter().enumerate() {
+        let percent_pair =
+            ch == '%' && (i.checked_sub(1).and_then(|j| chars.get(j)) == Some(&'%') || chars.get(i + 1) == Some(&'%'));
         match ch {
-            c if c.is_ascii() && !c.is_control() => out.push(c),
-            c if c.is_control() => {}
+            '\\' => out.push_str("\\U+005C"),
+            '%' if percent_pair => out.push_str("\\U+0025"),
+            c if c.is_ascii() => out.push(c),
+            c if u32::from(c) > 0xFFFF => out.push('?'),
             c => {
                 let _ = write!(out, "\\U+{:04X}", c as u32);
             }
