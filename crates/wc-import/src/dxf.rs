@@ -3992,14 +3992,18 @@ mod tests {
             "{:?}",
             p.warnings
         );
-        // A huge array stops at the shared limit and counts the copies left out.
-        let huge = "0\nINSERT\n2\nWC.COIL\n70\n1e12\n71\n1e12\n44\n1e-9\n45\n1e-9\n";
+        // A huge array stops at the shared limit and counts the copies left out. The symbols
+        // use up the budget the drawn entities share, so the line after them is left out too.
+        let huge = "0\nINSERT\n2\nWC.COIL\n70\n2000\n71\n1001\n44\n1e-9\n45\n1e-9\n\
+                    0\nLINE\n10\n0\n20\n0\n11\n1e-9\n21\n0\n";
         let p = page(&dxf(huge, blocks), 1.0, &known)?;
         assert_eq!(p.symbols.len(), MAX_DRAWN);
+        assert!(p.graphics.is_empty(), "{:?}", p.graphics);
+        // 2000 x 1001 copies, 2000 of them past the limit, plus the line.
         assert!(
             p.warnings
                 .iter()
-                .any(|w| w.contains("entities not drawn: the drawing expands")),
+                .any(|w| w.starts_with("2001 entities not drawn: the drawing expands")),
             "{:?}",
             p.warnings
         );
