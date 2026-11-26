@@ -98,7 +98,8 @@ pub struct BoxEdit<'a> {
 /// symbol, the wire ends that change and the warnings. A rename of a point the box does not
 /// have, one to itself, or one of a removed point is ignored. Returns `Ok(None)` when nothing
 /// would change. Refuses a symbol that is not a black box, a new box [`crate::black_box`]
-/// refuses, and a rename to a point the new box does not have.
+/// refuses, a rename to a point the new box does not have, and a removed point whose wire's
+/// free end would join another wire's free end there that it was not connected to.
 pub fn plan(project: &Project, old: &Symbol, edit: &BoxEdit<'_>) -> crate::Result<Option<BoxEditPlan>> {
     let bad = |why: String| Err(crate::Error::Invalid(why));
     if crate::black_box_layout(old).is_none() {
@@ -234,11 +235,25 @@ pub fn plan(project: &Project, old: &Symbol, edit: &BoxEdit<'_>) -> crate::Resul
             if others == 1 { "s" } else { "" }
         ));
     }
-    Ok(Some(BoxEditPlan {
+    let plan = BoxEditPlan {
         symbol: new,
         ends,
         warnings,
-    }))
+    };
+    // A removed point's free end on another wire's free end would join the two, which were
+    // not connected before (#609).
+    if plan.ends.iter().any(|c| matches!(c.end, Endpoint::Point { .. })) {
+        let mut after = project.clone();
+        plan.apply_ends(&mut after);
+        if let Some(j) = crate::connectivity::new_point_joins(project, &after).first() {
+            let number = project.pages.get(j.page).map_or("?", |p| p.number.as_str());
+            return bad(format!(
+                "wire {} on page {number} would keep a free end at ({}, {}), where wire {} already ends, and the two would be joined; move one of these wire ends first",
+                j.wire, j.at.x, j.at.y, j.other
+            ));
+        }
+    }
+    Ok(Some(plan))
 }
 
 #[cfg(test)]
@@ -378,6 +393,32 @@ mod tests {
                 .iter()
                 .any(|w| w.starts_with("wire w1 on page 1 ended on connection point A"))
         );
+    }
+
+    #[test]
+    fn a_removed_point_may_not_join_its_wire_to_another_net_at_a_free_end() {
+        let (mut p, sym) = setup();
+        let pins = [pin("B", BoxSide::Right, 5.0)];
+        let r = BTreeMap::new();
+        let d: BTreeSet<String> = ["A".to_owned()].into();
+        // w5 ends where A is (100, 55) and at w1's other end: already w1's net, so it may.
+        p.pages[0].wires.push(wire("w5", free(100.0, 55.0), free(80.0, 55.0)));
+        let plan = run(&p, &sym, &edit((20.0, 10.0), &pins, &r, &d));
+        assert_eq!(plan.ends.len(), 2);
+        // w6 ends there instead, on no net of w1's: refused, naming both wires.
+        p.pages[0].wires.pop();
+        p.pages[0].wires.push(wire("w6", free(100.0, 55.0), free(0.0, 0.0)));
+        let Err(err) = plan_err(&p, &sym, &edit((20.0, 10.0), &pins, &r, &d)) else {
+            unreachable!()
+        };
+        assert!(
+            err.contains("wire w1 on page 1") && err.contains("wire w6") && err.contains("joined"),
+            "{err}"
+        );
+    }
+
+    fn plan_err(p: &Project, sym: &Symbol, e: &BoxEdit<'_>) -> Result<(), String> {
+        plan(p, sym, e).map(|_| ()).map_err(|e| e.to_string())
     }
 
     #[test]

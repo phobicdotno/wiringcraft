@@ -1942,15 +1942,48 @@ pub fn status_bar(ui: &mut egui::Ui, open: Option<&Open>, ed: &Editor, live: Opt
     show_check
 }
 
+/// A file the panel layout attaches to a device's part, picked once the panel is drawn (the
+/// file picker, or the path typed where none can open).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attach {
+    /// The maker's DXF outline drawing.
+    Footprint,
+    /// The maker's STEP model, for its size.
+    Model,
+}
+
+impl Attach {
+    /// The picker's title.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Footprint => "Footprint drawing",
+            Self::Model => "3D model",
+        }
+    }
+
+    /// The kind of file the picker shows.
+    pub fn filter(self) -> (&'static str, &'static [&'static str]) {
+        match self {
+            Self::Footprint => ("DXF drawings", &["dxf"]),
+            Self::Model => ("STEP models", &["step", "stp", "STEP", "STP"]),
+        }
+    }
+
+    /// Store `file` with `part` in its library: what was done, or why not.
+    pub fn apply(self, open: &mut Open, part: &str, file: &std::path::Path) -> String {
+        match self {
+            Self::Footprint => open.attach_footprint(part, file),
+            Self::Model => open.attach_model(part, file),
+        }
+        .unwrap_or_else(|e| e)
+    }
+}
+
 /// The properties of the panel layout shown: plate size, the picked device, and the devices
 /// with a part that are not on the plate yet.
 fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, pi: usize) {
     use wc_core::panel::{PanelItem, on_door, part_size};
     let t = Theme::of(ui.ctx());
-    // The footprint drawing picked below, attached once the panel is drawn.
-    let mut attach: Option<(String, std::path::PathBuf)> = None;
-    // The STEP model picked below, its size stored once the panel is drawn.
-    let mut model: Option<(String, std::path::PathBuf)> = None;
     let Some(panel) = open.project.panels.get(pi) else {
         return;
     };
@@ -2031,12 +2064,8 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, pi: usi
                     "Pick the maker's DXF outline (front view, mm at 1:1); it is stored with the part in its library",
                 )
                 .clicked()
-                && let Some(file) = rfd::FileDialog::new()
-                    .set_title("Footprint drawing")
-                    .add_filter("DXF drawings", &["dxf"])
-                    .pick_file()
             {
-                attach = Some((part.clone(), file));
+                ed.ask_attach = Some((Attach::Footprint, part.clone()));
             }
             // The size of the maker's 3D model, for a part without a width and height (#501).
             let has = open.parts.get(&part).is_some_and(|p| p.model.is_some());
@@ -2051,12 +2080,8 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, pi: usi
                     "Pick the maker's STEP model; its size is stored with the part in its library and sizes the device on the plate when the part has no width and height or footprint",
                 )
                 .clicked()
-                && let Some(file) = rfd::FileDialog::new()
-                    .set_title("3D model")
-                    .add_filter("STEP models", &["step", "stp", "STEP", "STP"])
-                    .pick_file()
             {
-                model = Some((part, file));
+                ed.ask_attach = Some((Attach::Model, part));
             }
         }
         ui.add_space(6.0);
@@ -2087,12 +2112,6 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, pi: usi
             ui.label(RichText::new(m).monospace());
         }
         ui.label(RichText::new("Page menu → Arrange devices puts them on the rails.").color(t.faint));
-    }
-    if let Some((part, file)) = attach {
-        ed.message = open.attach_footprint(&part, &file).unwrap_or_else(|e| e);
-    }
-    if let Some((part, file)) = model {
-        ed.message = open.attach_model(&part, &file).unwrap_or_else(|e| e);
     }
     if let Some(item) = turn
         && !open.rotate_panel_device(pi, item)

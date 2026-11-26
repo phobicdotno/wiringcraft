@@ -177,9 +177,26 @@ pub fn set_translation(dir: &Path, text: &str, lang: &str, translation: &str) ->
 /// it out.
 pub const TRANSLATIONS_LOCK: &str = "translations.toml.lock.tmp";
 
+/// The project folder's [`TRANSLATIONS_LOCK`], held until this is dropped. While one is held,
+/// [`set_translation`] and other holders in any process wait for it, so a read of
+/// `translations.toml`, a change and its save made under it are not interleaved with theirs.
+#[derive(Debug)]
+#[must_use = "the lock is let go as soon as this is dropped"]
+pub struct TranslationsLock {
+    _file: std::fs::File,
+}
+
+/// Take the project folder's [`TRANSLATIONS_LOCK`], waiting while another call or process
+/// holds it. Hold the returned lock from reading `translations.toml` until its new contents
+/// are saved (the translations form does this), so a [`set_translation`] made at the same
+/// moment comes before or after, and neither edit is lost.
+pub fn lock_translations(dir: &Path) -> Result<TranslationsLock> {
+    lock_translations_file(dir).map(|file| TranslationsLock { _file: file })
+}
+
 /// Lock the project folder's [`TRANSLATIONS_LOCK`] for this process alone, waiting while
 /// another holds it. The lock is let go when the returned file is closed.
-fn lock_translations(dir: &Path) -> Result<std::fs::File> {
+fn lock_translations_file(dir: &Path) -> Result<std::fs::File> {
     std::fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
     let path = dir.join(TRANSLATIONS_LOCK);
     // A link left at the lock's name is not followed: whatever it points to stays untouched.
@@ -222,7 +239,7 @@ fn set_translation_checked(
         return Err(Error::Invalid("no text to translate".into()));
     }
     // Held until this call returns, so no other call reads the file before this write is in.
-    let _lock = lock_translations(dir)?;
+    let _lock = lock_translations_file(dir)?;
     let path = dir.join(TRANSLATIONS_FILE);
     let read = || match std::fs::read_to_string(&path) {
         Ok(text) => Ok(Some(text)),

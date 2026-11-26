@@ -381,6 +381,10 @@ pub struct Open {
     /// so [`Open::back_to`] puts them back even when their undo steps fell off the history.
     mark_edits: Vec<FileEdit>,
     marks: usize,
+    /// The undo mark of the assistant turn running ([`Open::start_turn`]): while its first
+    /// step is the oldest, a full history folds the steps after it into it instead of
+    /// dropping it, so [`Open::squash_undo`] still makes the turn one step (#641).
+    turn: Option<usize>,
     /// Tests: whether each coming symbol file write fails, in order.
     #[cfg(test)]
     pub(crate) fail_symbol_writes: std::collections::VecDeque<bool>,
@@ -422,8 +426,9 @@ fn next_revision() -> u64 {
 /// The history as it was before a library update, so a failed one leaves no trace in it.
 struct HistoryState {
     redo: Vec<Step>,
-    /// The oldest Undo step, when the update's checkpoint pushes it out.
-    evicted: Option<Step>,
+    /// The two oldest Undo steps and the count dropped before them, when the update's
+    /// checkpoint pushes one out or folds the second into the first ([`Open::trim_undo`]).
+    front: Option<(Vec<Step>, usize)>,
     dirty: bool,
     history: u64,
 }
@@ -458,6 +463,7 @@ impl Open {
             unrestored_files: BTreeMap::new(),
             mark_edits: Vec::new(),
             marks: 0,
+            turn: None,
             #[cfg(test)]
             fail_symbol_writes: Default::default(),
             #[cfg(test)]
@@ -1051,10 +1057,7 @@ impl Open {
         self.follow_terminals();
         self.terminals_before = Some(self.terminal_numbers());
         self.undo.push(Step::of(self.project.clone()));
-        if self.undo.len() > UNDO_STEPS {
-            self.undo.remove(0);
-            self.undo_dropped += 1;
-        }
+        self.trim_undo();
         self.redo.clear();
         self.edited();
         self.history += 1;
@@ -1155,16 +1158,46 @@ impl Open {
             .push([(from.clone(), to.clone())].into_iter().collect());
     }
 
+    /// Drop the oldest undo steps beyond [`UNDO_STEPS`]. While the first step of the running
+    /// assistant turn is the oldest, the step after it is folded into it instead (its file
+    /// edits go with the first's), so the turn stays whole for [`Open::squash_undo`] and no
+    /// file edit is lost. Marks taken after the turn began stay valid either way.
+    fn trim_undo(&mut self) {
+        while self.undo.len() > UNDO_STEPS {
+            // A change inside a [`Mark`] has a history of its own; the turn's step is not in it.
+            let held = self.marks == 0 && self.turn.is_some_and(|t| t <= self.undo_dropped);
+            if held {
+                let next = self.undo.remove(1);
+                self.undo[0].files.extend(next.files);
+            } else {
+                self.undo.remove(0);
+            }
+            self.undo_dropped += 1;
+        }
+    }
+
     /// A mark in the undo history, for [`Open::squash_undo`].
     pub fn undo_mark(&self) -> usize {
         self.undo_dropped + self.undo.len()
     }
 
+    /// An assistant turn starts: returns its undo mark, for [`Open::squash_undo`] once it is
+    /// done. Until then the full history keeps the turn's first step (see `turn`).
+    pub fn start_turn(&mut self) -> usize {
+        let mark = self.undo_mark();
+        self.turn = Some(mark);
+        mark
+    }
+
     /// Make every change since `mark` one undo step, so one Undo takes all of it back
     /// (the assistant's changes in one turn, for example).
     pub fn squash_undo(&mut self, mark: usize) {
-        let Some(start) = mark.checked_sub(self.undo_dropped) else {
-            return;
+        let turn = self.turn.take_if(|t| *t == mark).is_some();
+        let start = match mark.checked_sub(self.undo_dropped) {
+            Some(start) => start,
+            // The turn's first step was kept as the oldest while later ones were folded into it.
+            None if turn && !self.undo.is_empty() => 0,
+            None => return,
         };
         if self.undo.len() > start + 1 {
             // The files the later steps rewrote are taken back and written with the first.
@@ -1730,9 +1763,7 @@ impl Open {
         let lock = self.project.lock.clone();
         let history = HistoryState {
             redo: self.redo.clone(),
-            evicted: (self.undo.len() >= UNDO_STEPS)
-                .then(|| self.undo.first().cloned())
-                .flatten(),
+            front: (self.undo.len() >= UNDO_STEPS).then(|| (self.undo[..2].to_vec(), self.undo_dropped)),
             dirty: self.dirty,
             history: self.history,
         };
@@ -1858,9 +1889,10 @@ impl Open {
         // Whatever undo managed, the lock is the one the files above match.
         self.project.lock = lock;
         self.redo = was.redo;
-        if let Some(oldest) = was.evicted {
-            self.undo.insert(0, oldest);
-            self.undo_dropped = self.undo_dropped.saturating_sub(1);
+        if let Some((front, dropped)) = was.front {
+            let first = 1.min(self.undo.len());
+            self.undo.splice(..first, front);
+            self.undo_dropped = dropped;
         }
         self.dirty = was.dirty;
         self.history = was.history;
@@ -2456,7 +2488,8 @@ impl Open {
     /// wires on it follow; `removed` names the old points that were taken off (a new point may
     /// reuse such a name, and is still another point). A wire on a point that is gone keeps its
     /// end where the point was, as a free end. The box's symbol gets a new version (its file and
-    /// lock entry); Undo puts the earlier one back. Returns warnings: the wires on points that
+    /// lock entry); Undo puts the earlier one back. A removed point's free end may not land on
+    /// another wire's free end, which would join them. Returns warnings: the wires on points that
     /// are gone or moved, and other boxes that place the same symbol (they change too). Nothing
     /// changes when the box is refused or its symbol file cannot be written.
     pub fn edit_black_box(
@@ -2773,10 +2806,8 @@ impl Open {
         // The set-aside steps counted as dropped while the change ran; they are back now.
         self.undo_dropped -= undo.len();
         undo.append(&mut self.undo);
-        let over = undo.len().saturating_sub(UNDO_STEPS);
-        undo.drain(..over);
-        self.undo_dropped += over;
         self.undo = undo;
+        self.trim_undo();
         if self.history == mark.kept.history {
             self.redo = mark.kept.redo;
         }
@@ -4915,6 +4946,48 @@ pub(crate) mod tests {
                 pin: "2".into()
             }
         );
+    }
+
+    #[test]
+    fn removing_a_box_point_where_another_wire_has_a_free_end_is_refused() {
+        use wc_core::{BoxPin, BoxSide};
+        let (_tmp, mut o) = project();
+        let pins = [BoxPin {
+            name: "1".into(),
+            side: BoxSide::Left,
+            offset: 5.0,
+        }];
+        let id = o
+            .add_black_box(1, Point::new(40.0, 40.0), Point::new(60.0, 50.0), &pins, None)
+            .unwrap();
+        let free = |x, y| Endpoint::Point { at: Point::new(x, y) };
+        let on_1 = Endpoint::Pin {
+            item: id.clone(),
+            pin: "1".into(),
+        };
+        o.add_wire(1, on_1.clone(), free(0.0, 0.0), Vec::new());
+        // Another wire ends freely where point 1 is (40, 45), not joined to it.
+        o.add_wire(1, free(40.0, 45.0), free(0.0, 90.0), Vec::new());
+        let removed: std::collections::BTreeSet<String> = ["1".to_owned()].into_iter().collect();
+        let before = o.project.clone();
+        let symbol = o.symbols[&format!("box.{}.{id}", o.project.pages[1].id)].clone();
+        let steps = o.undo_mark();
+        let err = o
+            .edit_black_box(1, &id, (20.0, 10.0), &[], &BTreeMap::new(), &removed)
+            .unwrap_err();
+        assert!(
+            err.contains("wire w1") && err.contains("wire w2") && err.contains("joined"),
+            "{err}"
+        );
+        assert_eq!(o.project, before, "nothing changes");
+        assert_eq!(o.symbols[&symbol.id], symbol);
+        assert_eq!(o.undo_mark(), steps);
+
+        // With that wire end moved away the point comes off, and its wire keeps a free end.
+        o.project.pages[1].wires[1].from = free(30.0, 45.0);
+        o.edit_black_box(1, &id, (20.0, 10.0), &[], &BTreeMap::new(), &removed)
+            .unwrap();
+        assert_eq!(o.project.pages[1].wires[0].from, free(40.0, 45.0));
     }
 
     #[test]
@@ -8002,6 +8075,49 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read_to_string(&copy).unwrap(), first);
         // The original keeps the file as it was when copied.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+    }
+
+    #[test]
+    fn an_assistant_turn_longer_than_the_history_stays_one_step_with_its_macro_edit() {
+        let (_tmp, mut o) = project();
+        let id = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let clip = o.copy(1, &[Selection::Symbol(id)]);
+        let path = o.save_macro(&clip, "Coil", "").unwrap();
+        let first = std::fs::read_to_string(&path).unwrap();
+        // Earlier steps, which a full history drops before the turn's.
+        for n in 0..5 {
+            o.checkpoint();
+            o.project.pages[0].title = format!("Before {n}");
+        }
+        let before = o.project.clone();
+        let turn = o.start_turn();
+        let mut form = crate::macro_form::Form::open(&path).unwrap();
+        form.description = "Saved by the assistant".into();
+        o.save_macro_form(&form).unwrap();
+        let mut form = crate::macro_form::Form::open(&path).unwrap();
+        // Taken in the turn by a tool of its own, after steps were folded or not.
+        let mut inner = 0;
+        for n in 0..UNDO_STEPS + 50 {
+            if n == UNDO_STEPS {
+                inner = o.undo_mark();
+            }
+            o.checkpoint();
+            o.project.pages[0].title = format!("Turn {n}");
+        }
+        o.squash_undo(inner);
+        assert_eq!(o.undo_mark(), inner + 1, "a mark taken in the turn stays valid");
+        form.description = "Saved again".into();
+        o.save_macro_form(&form).unwrap();
+        o.project.pages[0].title = "Last".into();
+        o.squash_undo(turn);
+        assert_eq!(o.undo_steps(), 1, "the turn is one step");
+        assert!(o.undo());
+        assert_eq!(o.project, before);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
+        assert!(!o.can_undo());
+        assert!(o.redo());
+        assert_eq!(o.project.pages[0].title, "Last");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("Saved again"));
     }
 
     #[test]

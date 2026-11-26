@@ -68,6 +68,9 @@ pub struct Editor {
     pub ask_box_pin: Option<(wc_core::BoxSide, f64)>,
     /// The black box tool is done adding connection points; the app asks for the tag.
     pub ask_box_tag: bool,
+    /// The panel layout's Attach footprint drawing / Attach 3D model: the file to ask for, and
+    /// the part it goes with.
+    pub ask_attach: Option<(crate::panels::Attach, String)>,
     /// The review comment shown in the properties panel, by id.
     pub comment: Option<String>,
     pub message: String,
@@ -116,6 +119,7 @@ impl Default for Editor {
             black_box: None,
             ask_box_pin: None,
             ask_box_tag: false,
+            ask_attach: None,
             comment: None,
             message: String::new(),
             marking_strip: None,
