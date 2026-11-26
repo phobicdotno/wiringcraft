@@ -967,15 +967,16 @@ pub fn cable_list(i: &Inputs<'_>) -> Table {
     for (cable, mut list) in cores {
         list.sort_by_key(|a| natural_key(&a.0));
         let device = i.project.devices.get(&cable);
-        let part = device.and_then(|d| d.part.as_ref()).and_then(|id| i.parts.get(id));
-        let kind = part
-            .map(|p| {
-                [p.manufacturer.as_str(), p.order_number.as_str()]
-                    .join(" ")
-                    .trim()
-                    .to_owned()
-            })
-            .unwrap_or_default();
+        let part_id = device.and_then(|d| d.part.as_ref());
+        let part = part_id.and_then(|id| i.parts.get(id));
+        // A part not in the library copy is still named by its id, as in the parts list.
+        let kind = match part {
+            Some(p) => [p.manufacturer.as_str(), p.order_number.as_str()]
+                .join(" ")
+                .trim()
+                .to_owned(),
+            None => part_id.cloned().unwrap_or_default(),
+        };
         let description = device
             .map(|d| d.description.clone())
             .filter(|d| !d.is_empty())

@@ -355,6 +355,32 @@ fn cable_list_groups_cores_by_cable() {
 }
 
 #[test]
+fn cable_list_names_a_part_missing_from_the_library_copy_by_its_id() {
+    let (mut p, s, parts) = fixture();
+    let w1 = DeviceTag::parse("-W1").unwrap();
+    p.devices.insert(
+        w1.clone(),
+        Device {
+            part: Some("LAPP.1119203".into()),
+            ..Default::default()
+        },
+    );
+    if let Some(w) = p.pages[0].wires.iter_mut().find(|w| w.id == "w2") {
+        w.cable = Some(wc_core::CableCore {
+            cable: w1.clone(),
+            core: "1".into(),
+        });
+    }
+    assert!(!parts.contains_key("LAPP.1119203"));
+    let t = cable_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    assert_eq!(t.rows[0][..2], ["-W1", "LAPP.1119203"]);
+}
+
+#[test]
 fn check_names_a_cable_core_on_two_connections() {
     let (mut p, s, parts) = fixture();
     let found = |p: &Project| {
