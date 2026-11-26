@@ -86,6 +86,10 @@ sym("wc.plc.output", "PLC digital output", "plc", "A", "standalone",
 sym("wc.pe", "Protective earth", "power", "", "standalone",
     [line((0, 0), (0, 5)), line((-4, 5), (4, 5)), line((-2.6, 6.5), (2.6, 6.5)), line((-1.2, 8), (1.2, 8))],
     [pin("PE", 0, 0, "up")], tag_at=(4, 3))
+sym("wc.fe", "Functional earth", "power", "", "standalone",
+    [line((0, 0), (0, 5)), line((-4, 5), (4, 5)), line((-2.6, 6.5), (2.6, 6.5)), line((-1.2, 8), (1.2, 8))],
+    [pin("FE", 0, 0, "up")], tag_at=(4, 3),
+    desc="Functional (signal) earth: 0 V references, signal grounds and screen earthing. Not a protective earth; use wc.pe for the protective conductor.")
 
 os.makedirs(OUT, exist_ok=True)
 for s in S:
