@@ -413,18 +413,31 @@ pub fn arrange(
         // height is passed over for it alone, keeping its room for the devices after it.
         let mut r = rail;
         while let Some((at, length, cursor)) = rails.get_mut(r) {
-            let along = *cursor + w <= at.x + *length + 1e-9;
             let top = at.y - h / 2.0;
             let on_plate = top >= -1e-9 && top + h <= plate_height + 1e-9;
+            // Past any device already on the plate that this outline would cover, such as a
+            // tall one from a lower rail reaching up over this one.
+            let mut x = *cursor;
+            while let Some(past) = panel
+                .items
+                .iter()
+                .filter_map(PanelItem::device_bounds)
+                .filter(|(min, max)| min.x < x + w && max.x > x && min.y < top + h && max.y > top)
+                .map(|(_, max)| max.x + GAP)
+                .reduce(f64::max)
+            {
+                x = past;
+            }
+            let along = x + w <= at.x + *length + 1e-9;
             if along && on_plate {
                 panel.items.push(PanelItem::Device {
                     tag: tag.clone(),
-                    at: Point::new(*cursor, top),
+                    at: Point::new(x, top),
                     width: w,
                     height: h,
                     rotation: Rotation::R0,
                 });
-                *cursor += w + GAP;
+                *cursor = x + w + GAP;
                 placed = true;
                 break;
             }
@@ -850,6 +863,40 @@ mod tests {
         // first rail's room.
         assert_eq!(at("-A1"), Some(Point::new(45.0, 305.0 - 125.0)));
         assert_eq!(at("-K1"), Some(Point::new(45.0, 115.0 - 40.0)));
+    }
+
+    #[test]
+    fn a_device_is_not_put_over_a_tall_one_from_a_lower_rail() {
+        let mut project = Project::new("x");
+        let mut parts = BTreeMap::new();
+        for (id, h) in [("tall", 500.0), ("small", 80.0)] {
+            let mut part = Part {
+                id: id.into(),
+                ..Default::default()
+            };
+            part.properties.insert("Width".into(), "45".into());
+            part.properties.insert("Height".into(), format!("{h}"));
+            parts.insert(id.to_string(), part);
+        }
+        for (t, part) in [("-A1", "tall"), ("-K1", "small")] {
+            if let Some(t) = tag(t) {
+                project.devices.insert(
+                    t,
+                    Device {
+                        part: Some(part.into()),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        // -A1 goes on the second rail (y 305) and reaches up over the first (y 115).
+        let mut panel = Panel::with_rails("main", "Main", 600.0, 800.0);
+        let done = arrange(&mut panel, &project, &parts, None);
+        assert_eq!(done.placed, vec!["-A1", "-K1"]);
+        let outlines: Vec<(Point, Point)> = panel.items.iter().filter_map(PanelItem::device_bounds).collect();
+        assert_eq!(outlines[0], (Point::new(45.0, 55.0), Point::new(90.0, 555.0)));
+        // -K1 stays on the first rail, beside -A1 rather than inside it.
+        assert_eq!(outlines[1], (Point::new(91.0, 75.0), Point::new(136.0, 155.0)));
     }
 
     #[test]
