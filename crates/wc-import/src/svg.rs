@@ -107,8 +107,8 @@ fn num(e: &BytesStart, name: &str) -> f64 {
 /// sweep flags) are one `0` or `1` each and may run into the next argument without a separator
 /// (`0110 20` is the flags 0 and 1 and the end x 10). Reading stops at the first argument that is
 /// not well formed, or at an arc with no arguments or a group cut short, as SVG stops drawing a
-/// path at an error: the arguments read before it come back with `false`.
-fn arc_numbers(s: &str) -> (Vec<f64>, bool) {
+/// path at an error: the arguments read before it come back with the reason.
+fn arc_numbers(s: &str) -> (Vec<f64>, Option<String>) {
     let b = s.as_bytes();
     let at = |i: usize| b.get(i).copied();
     let digits = |i: &mut usize| {
@@ -129,7 +129,10 @@ fn arc_numbers(s: &str) -> (Vec<f64>, bool) {
             match first {
                 b'0' => out.push(0.0),
                 b'1' => out.push(1.0),
-                _ => return (out, false),
+                _ => {
+                    let n = out.len() + 1;
+                    return (out, Some(format!("arc argument {n} is a flag that is not 0 or 1")));
+                }
             }
             i += 1;
             continue;
@@ -144,7 +147,8 @@ fn arc_numbers(s: &str) -> (Vec<f64>, bool) {
             digits(&mut i)
         };
         if !whole && !fraction {
-            return (out, false);
+            let n = out.len() + 1;
+            return (out, Some(format!("arc argument {n} is not a number")));
         }
         if matches!(at(i), Some(b'e' | b'E')) {
             let mark = i;
@@ -158,18 +162,30 @@ fn arc_numbers(s: &str) -> (Vec<f64>, bool) {
         }
         match s.get(start..i).and_then(|t| t.parse::<f64>().ok()) {
             Some(v) if v.is_finite() => out.push(v),
-            _ => return (out, false),
+            _ => {
+                let n = out.len() + 1;
+                return (out, Some(format!("arc argument {n} is not a finite number")));
+            }
         }
     }
     // An arc without arguments, or with a group of seven cut short, is an error too.
-    let complete = !out.is_empty() && out.len() % 7 == 0;
-    (out, complete)
+    let error = if out.is_empty() {
+        Some("an arc has no arguments".to_owned())
+    } else if out.len() % 7 != 0 {
+        let n = out.len();
+        Some(format!("an arc is cut short after argument {n} (an arc takes 7)"))
+    } else {
+        None
+    };
+    (out, error)
 }
 
 /// A point of path data, before its transform.
 type Xy = [f64; 2];
 
-fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
+/// The polylines of path data, and why drawing stopped early, if it did: the reason and the
+/// number of the command in the path, counted from 1.
+fn path(d: &str, m: &M) -> (Vec<(Vec<Point>, bool)>, Option<String>) {
     let mut out: Vec<(Vec<Point>, bool)> = Vec::new();
     let mut cur: Vec<Point> = Vec::new();
     let (mut x, mut y, mut sx, mut sy) = (0.0, 0.0, 0.0, 0.0);
@@ -177,7 +193,7 @@ fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
         if cmd.eq_ignore_ascii_case(&'A') {
             arc_numbers(buf)
         } else {
-            (numbers(buf), true)
+            (numbers(buf), None)
         }
     };
     // Tokenise into (command, numbers).
@@ -185,14 +201,15 @@ fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
     let mut buf = String::new();
     let mut cmd = ' ';
     // An argument error ends the path: what came before it is drawn, nothing after it.
-    let mut broken = false;
+    let mut stopped: Option<String> = None;
+    let stop_at = |n: usize, cmd: char, why: String| format!("stopped at command {n} ({cmd}): {why}");
     for c in d.chars() {
         if c.is_ascii_alphabetic() && c != 'e' && c != 'E' {
             if cmd != ' ' {
-                let (v, ok) = args(cmd, &buf);
+                let (v, error) = args(cmd, &buf);
                 cmds.push((cmd, v));
-                if !ok {
-                    broken = true;
+                if let Some(why) = error {
+                    stopped = Some(stop_at(cmds.len(), cmd, why));
                     break;
                 }
             }
@@ -202,8 +219,10 @@ fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
             buf.push(c);
         }
     }
-    if cmd != ' ' && !broken {
-        cmds.push((cmd, args(cmd, &buf).0));
+    if cmd != ' ' && stopped.is_none() {
+        let (v, error) = args(cmd, &buf);
+        cmds.push((cmd, v));
+        stopped = error.map(|why| stop_at(cmds.len(), cmd, why));
     }
     let flush = |cur: &mut Vec<Point>, out: &mut Vec<(Vec<Point>, bool)>, closed: bool| {
         if cur.len() >= 2 {
@@ -357,7 +376,7 @@ fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
         quad_ctrl = next_quad;
     }
     flush(&mut cur, &mut out, false);
-    out
+    (out, stopped)
 }
 
 /// Straight segments per Bezier curve.
@@ -435,6 +454,14 @@ impl Arc {
 
 /// Import an SVG symbol.
 pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
+    symbol_with_warnings(text, id, name).map(|(s, _)| s)
+}
+
+/// Like [`symbol`], with one warning per path that stopped drawing at bad data, naming the path
+/// and why it stopped.
+pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core::Symbol, Vec<String>)> {
+    let mut warnings = Vec::new();
+    let mut path_count = 0usize;
     let mut reader = Reader::from_str(text);
     let mut stack: Vec<M> = vec![M::ID];
     let mut shapes = Vec::new();
@@ -540,7 +567,15 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                 })
             }
             "path" => {
-                let parts = path(&attr(&e, "d").unwrap_or_default(), &m);
+                path_count += 1;
+                let (parts, stopped) = path(&attr(&e, "d").unwrap_or_default(), &m);
+                if let Some(why) = stopped {
+                    let which = match attr(&e, "id") {
+                        Some(i) => format!("path {path_count} (id \"{i}\")"),
+                        None => format!("path {path_count}"),
+                    };
+                    warnings.push(format!("{which} is drawn only in part: {why}"));
+                }
                 let mut first = None;
                 for (pts, closed) in parts {
                     first.get_or_insert(pts[0]);
@@ -594,7 +629,7 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
     if !seen_root {
         return Err(Error::Format("not an SVG file".into()));
     }
-    make_symbol(id, name, shapes, pins)
+    make_symbol(id, name, shapes, pins).map(|s| (s, warnings))
 }
 
 #[cfg(test)]
@@ -636,7 +671,7 @@ mod tests {
 
     /// The points of the one polyline in `d`, untransformed.
     fn one_line(d: &str) -> Vec<Point> {
-        let lines = path(d, &M::ID);
+        let (lines, _) = path(d, &M::ID);
         assert_eq!(lines.len(), 1, "{d}: {lines:?}");
         lines.into_iter().next().map(|(pts, _)| pts).unwrap_or_default()
     }
@@ -711,7 +746,13 @@ mod tests {
         );
         // A flag that is not 0 or 1 ends the arguments, and the path: the line before the arc
         // stays, nothing after it is drawn.
-        assert_eq!(arc_numbers("5 5 0 2 1 10 0"), (vec![5.0, 5.0, 0.0], false));
+        assert_eq!(
+            arc_numbers("5 5 0 2 1 10 0"),
+            (
+                vec![5.0, 5.0, 0.0],
+                Some("arc argument 4 is a flag that is not 0 or 1".to_owned())
+            )
+        );
         assert_eq!(
             one_line("M 0 0 L 1 0 A 5 5 0 2 1 10 0 L 20 0"),
             [Point::new(0.0, 0.0), Point::new(1.0, 0.0)]
@@ -726,6 +767,43 @@ mod tests {
     }
 
     #[test]
+    fn a_path_cut_short_gives_one_warning_with_the_reason() -> Result<()> {
+        let svg = r#"<svg>
+            <path d="M 0 0 L 10 0"/>
+            <path id="arm" d="M 0 0 L 1 0 A 5 5 0 0 1 10 L 20 0"/>
+        </svg>"#;
+        let (s, warnings) = symbol_with_warnings(svg, "svg.cut", "Cut")?;
+        assert_eq!(
+            warnings,
+            [
+                "path 2 (id \"arm\") is drawn only in part: stopped at command 3 (A): an arc is cut short \
+                 after argument 6 (an arc takes 7)"
+            ]
+        );
+        // What came before the error is still drawn.
+        assert_eq!(s.graphics.len(), 2);
+        // The other reasons, and a well-formed file gives none.
+        assert_eq!(
+            path("M 0 0 A 5 . 0 0 1 10 0", &M::ID).1.as_deref(),
+            Some("stopped at command 2 (A): arc argument 2 is not a number")
+        );
+        assert_eq!(
+            path("M 0 0 a", &M::ID).1.as_deref(),
+            Some("stopped at command 2 (a): an arc has no arguments")
+        );
+        assert_eq!(
+            path("M 0 0 A 5 5 0 0 1 1e999 0", &M::ID).1.as_deref(),
+            Some("stopped at command 2 (A): arc argument 6 is not a finite number")
+        );
+        assert!(
+            symbol_with_warnings("<svg><path d=\"M 0 0 A 5 5 0 0 1 10 0\"/></svg>", "x", "x")?
+                .1
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn hostile_arcs_do_not_panic() {
         for d in [
             "M 0 0 A 0 0 0 0 1 10 0",
@@ -735,7 +813,7 @@ mod tests {
             "M 0 0 A 1e-300 1e-300 0 0 1 1e300 0",
             "M 0 0 A 5 5 0 0 1",
         ] {
-            let _ = path(d, &M::ID);
+            let _ = path(d, &M::ID).0;
         }
         // A zero radius is a straight line.
         assert_eq!(one_line("M 0 0 A 0 5 0 0 1 10 0").len(), 2);
