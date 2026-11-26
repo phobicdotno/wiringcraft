@@ -25,8 +25,18 @@ type Block = (String, [f64; 3], [f64; 3]);
 /// A part's depth (out of the plate): its `Depth` property, else its 3D model's depth.
 pub use wc_core::panel::part_depth;
 
-/// The boxes of a panel layout: plate, rails, ducts and devices.
-fn blocks(project: &Project, panel: &Panel, parts: &BTreeMap<String, Part>) -> Vec<Block> {
+/// A panel layout as STEP, with the devices whose depth was guessed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PanelStep {
+    /// The STEP file text.
+    pub text: String,
+    /// Tags of the devices drawn [`DEFAULT_DEPTH`] deep because their part gives no depth.
+    pub default_depth: Vec<String>,
+}
+
+/// The boxes of a panel layout (plate, rails, ducts and devices), and the tags of the devices
+/// drawn [`DEFAULT_DEPTH`] deep.
+fn blocks(project: &Project, panel: &Panel, parts: &BTreeMap<String, Part>) -> (Vec<Block>, Vec<String>) {
     let top = panel.height;
     // Page y (down from the top) to model y (up from the bottom).
     let y = |v: f64| top - v;
@@ -35,6 +45,7 @@ fn blocks(project: &Project, panel: &Panel, parts: &BTreeMap<String, Part>) -> V
         [0.0, 0.0, 0.0],
         [panel.width, panel.height, PLATE],
     )];
+    let mut guessed: Vec<String> = Vec::new();
     let mut rails: Vec<(f64, f64, f64)> = Vec::new();
     for item in &panel.items {
         match item {
@@ -63,8 +74,11 @@ fn blocks(project: &Project, panel: &Panel, parts: &BTreeMap<String, Part>) -> V
                 .get(tag)
                 .and_then(|d| d.part.as_ref())
                 .and_then(|id| parts.get(id))
-                .and_then(part_depth)
-                .unwrap_or(DEFAULT_DEPTH);
+                .and_then(part_depth);
+            let depth = depth.unwrap_or_else(|| {
+                guessed.push(tag.to_string());
+                DEFAULT_DEPTH
+            });
             // A device on a rail sits on the rail; anything else on the plate.
             let middle = at.y + height / 2.0;
             let on_rail = rails
@@ -79,17 +93,15 @@ fn blocks(project: &Project, panel: &Panel, parts: &BTreeMap<String, Part>) -> V
         }
     }
     out.retain(|(_, a, b)| (0..3).all(|k| a[k].is_finite() && b[k].is_finite() && b[k] - a[k] > 1e-6));
-    out
+    (out, guessed)
 }
 
-/// STEP text with one solid per plate, rail, duct and device. `stamp` is the ISO 8601 time
-/// written in the header.
-pub fn panel_step(project: &Project, panel: &Panel, parts: &BTreeMap<String, Part>, stamp: &str) -> String {
+/// STEP text with one solid per plate, rail, duct and device, and the tags of the devices
+/// whose depth was guessed. `stamp` is the ISO 8601 time written in the header.
+pub fn panel_step(project: &Project, panel: &Panel, parts: &BTreeMap<String, Part>, stamp: &str) -> PanelStep {
     let mut w = Writer::default();
-    let solids: Vec<usize> = blocks(project, panel, parts)
-        .iter()
-        .map(|(name, a, b)| w.block(name, *a, *b))
-        .collect();
+    let (boxes, default_depth) = blocks(project, panel, parts);
+    let solids: Vec<usize> = boxes.iter().map(|(name, a, b)| w.block(name, *a, *b)).collect();
     let refs: Vec<String> = solids.iter().map(|s| format!("#{s}")).collect();
     // Product structure and units, after the geometry.
     let ctx_app = w.add("APPLICATION_CONTEXT('automotive design')");
@@ -132,7 +144,10 @@ pub fn panel_step(project: &Project, panel: &Panel, parts: &BTreeMap<String, Par
         let _ = writeln!(out, "#{}={e};", i + 1);
     }
     out.push_str("ENDSEC;\nEND-ISO-10303-21;\n");
-    out
+    PanelStep {
+        text: out,
+        default_depth,
+    }
 }
 
 /// A STEP string: quotes doubled, non-ASCII as `\X2\` hex, which every reader takes.
@@ -292,7 +307,7 @@ mod tests {
             height: 100.0,
             rotation: wc_core::geom::Rotation::R90,
         });
-        let step = panel_step(&project, &panel, &BTreeMap::new(), "2026-11-19T23:00:00");
+        let step = panel_step(&project, &panel, &BTreeMap::new(), "2026-11-19T23:00:00").text;
         // Lying on its side it covers x 50..150 and y 100..120 (model y 180..200).
         assert!(step.contains("CARTESIAN_POINT('',(50.,180.,2.))"), "{step}");
         assert!(step.contains("CARTESIAN_POINT('',(150.,200.,77.))"));
@@ -329,7 +344,10 @@ mod tests {
             height: 10.0,
             rotation: wc_core::geom::Rotation::R0,
         });
-        let step = panel_step(&project, &panel, &parts, "2026-11-16T23:00:00");
+        let done = panel_step(&project, &panel, &parts, "2026-11-16T23:00:00");
+        // Only X9 has no depth to go on.
+        assert_eq!(done.default_depth, ["-X9"]);
+        let step = done.text;
         assert!(step.starts_with("ISO-10303-21;"));
         assert!(step.ends_with("END-ISO-10303-21;\n"));
         // Plate, 2 side ducts, 2 row ducts, 1 rail, 2 devices.

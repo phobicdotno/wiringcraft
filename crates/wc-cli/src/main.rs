@@ -2485,12 +2485,19 @@ fn run(mut cli: Cli) -> Res<()> {
                     };
                     let parts = vendored_parts(dir, &p);
                     let step = wc_report::step::panel_step(&p, panel, &parts, &utc_now());
-                    write_out(&out, &step).map_err(e)?;
+                    write_out(&out, &step.text).map_err(e)?;
                     println!(
                         "wrote {} ({} solids)",
                         out.display(),
-                        step.matches("MANIFOLD_SOLID_BREP(").count()
+                        step.text.matches("MANIFOLD_SOLID_BREP(").count()
                     );
+                    if !step.default_depth.is_empty() {
+                        eprintln!(
+                            "warning: no Depth on the part, drawn {} mm deep: {}",
+                            wc_report::step::DEFAULT_DEPTH,
+                            step.default_depth.join(", ")
+                        );
+                    }
                     return Ok(());
                 }
                 PanelCmd::Device {
