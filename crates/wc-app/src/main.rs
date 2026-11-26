@@ -6835,6 +6835,18 @@ mod marking_tests {
     }
 
     #[test]
+    fn a_page_number_with_a_dot_keeps_its_dot_in_the_drawing_file_names() {
+        let (_tmp, mut o) = state::tests::project();
+        o.project.pages.truncate(1);
+        o.project.pages[0].number = "1.2".into();
+        let own = o.dir.join("export").join("drawings");
+        let msg = export_drawings_to(&o, &own);
+        assert!(msg.starts_with("Exported 1 pages"), "{msg}");
+        assert!(own.join("1.2.svg").is_file());
+        assert!(own.join("1.2.dxf").is_file());
+    }
+
+    #[test]
     fn drawings_include_a_file_per_panel_layout() {
         let (_tmp, mut o) = state::tests::project();
         o.project.pages.truncate(1);

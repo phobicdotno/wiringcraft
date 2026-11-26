@@ -242,6 +242,16 @@ fn page_files_are_named_after_the_page_number() {
     // Leading dots are left out, and a name of only dots falls back to `page`.
     assert_eq!(crate::page_file_stem(&page(".hidden")), "hidden");
     assert_eq!(crate::page_file_stem(&page("..")), "page");
+    // A name Windows keeps for a device, in any case and also before a dot, gets a `_` in front.
+    assert_eq!(crate::page_file_stem(&page(".NUL")), "_NUL");
+    assert_eq!(crate::page_file_stem(&page("con")), "_con");
+    assert_eq!(crate::page_file_stem(&page("com1")), "_com1");
+    assert_eq!(crate::page_file_stem(&page("Aux.2")), "_Aux.2");
+    assert_eq!(crate::page_file_stem(&page("LPT9")), "_LPT9");
+    // Names that only start like a device stay as they are.
+    assert_eq!(crate::page_file_stem(&page("CONSOLE")), "CONSOLE");
+    assert_eq!(crate::page_file_stem(&page("COM10")), "COM10");
+    assert_eq!(crate::page_file_stem(&page("COM0")), "COM0");
 }
 
 #[test]

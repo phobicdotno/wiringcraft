@@ -215,7 +215,9 @@ pub fn panel_file_stem(d: &PageDrawing) -> String {
 /// The file name, without extension, of a schematic page's drawing: the page's number (its id
 /// when it has none), with every character but letters, digits, `-`, `_` and `.` written as `_`
 /// and leading dots left out, so `1.2` stays `1.2` and `A/1` becomes `A_1`; `page` when nothing
-/// is left. The app and the command line both name page files this way.
+/// is left. A name Windows keeps for a device (`CON`, `NUL`, `COM1`, also before a dot as in
+/// `nul.2`) gets a `_` in front, so `CON` becomes `_CON`. The app and the command line both
+/// name page files this way.
 pub fn page_file_stem(d: &PageDrawing) -> String {
     let number = d.number.trim();
     let base = if number.is_empty() { d.id.as_str() } else { number };
@@ -232,8 +234,24 @@ pub fn page_file_stem(d: &PageDrawing) -> String {
     let stem = stem.trim_start_matches('.');
     if stem.is_empty() {
         "page".into()
+    } else if names_a_device(stem) {
+        format!("_{stem}")
     } else {
         stem.to_owned()
+    }
+}
+
+/// Whether Windows takes the file name `stem` for a device such as `NUL` or `COM1`: the part
+/// before the first dot is one of those names, in any case (`nul.txt` is a device as well).
+fn names_a_device(stem: &str) -> bool {
+    let first = stem.split('.').next().unwrap_or(stem).to_ascii_uppercase();
+    match first.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" => true,
+        _ => ["COM", "LPT"].iter().any(|port| {
+            first
+                .strip_prefix(port)
+                .is_some_and(|n| matches!(n, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"))
+        }),
     }
 }
 
