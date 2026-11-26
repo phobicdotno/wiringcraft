@@ -422,3 +422,46 @@ fn a_failed_write_leaves_the_exclude_list_as_it_was() -> Result<()> {
     assert_eq!(after, before);
     Ok(())
 }
+
+#[test]
+fn changes_name_a_file_with_an_accent_as_it_is() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    store::create(dir, "Demo")?;
+    let git = Git::new(dir);
+    git.init()?;
+    let base = git.head().ok_or_else(|| wc_core::Error::Invalid("no head".into()))?;
+    let path = dir.join("café.png");
+    std::fs::write(&path, "1").map_err(|e| wc_core::Error::io(&path, e))?;
+
+    // Not recorded yet.
+    let found = changes(&git, &base, None)?;
+    assert!(
+        found.contains(&Change::File {
+            path: "café.png".into(),
+            status: "added".into()
+        }),
+        "{found:?}"
+    );
+    // Recorded, then changed again in the folder.
+    git.commit("Picture")?;
+    let first = git.head().ok_or_else(|| wc_core::Error::Invalid("no head".into()))?;
+    let found = changes(&git, &base, Some(&first))?;
+    assert!(
+        found.contains(&Change::File {
+            path: "café.png".into(),
+            status: "added".into()
+        }),
+        "{found:?}"
+    );
+    std::fs::write(&path, "2").map_err(|e| wc_core::Error::io(&path, e))?;
+    let found = changes(&git, &first, None)?;
+    assert_eq!(
+        found,
+        [Change::File {
+            path: "café.png".into(),
+            status: "changed".into()
+        }]
+    );
+    Ok(())
+}
