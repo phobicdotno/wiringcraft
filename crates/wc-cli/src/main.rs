@@ -589,6 +589,21 @@ enum PanelCmd {
         #[arg(long, default_value_t = 800.0)]
         height: f64,
     },
+    /// Change a layout's name or plate size. Rails, ducts and devices stay where they are; a
+    /// size that would leave any of them sticking out of the plate is refused.
+    Edit {
+        /// The layout's id.
+        id: String,
+        /// The new name, shown on its page; `""` uses the id.
+        #[arg(long)]
+        name: Option<String>,
+        /// New plate width in mm.
+        #[arg(long)]
+        width: Option<f64>,
+        /// New plate height in mm.
+        #[arg(long)]
+        height: Option<f64>,
+    },
     /// Put devices that have a part and are not on the plate yet onto its rails, sized by the
     /// part's `Width` and `Height` properties.
     Arrange {
@@ -1158,6 +1173,18 @@ enum PageCmd {
         /// Make it a normal page again.
         #[arg(long)]
         off: bool,
+    },
+    /// Change a page's number or title. A number another page already uses is refused; the
+    /// pages are sorted by number again afterwards.
+    Edit {
+        /// The page's id.
+        id: String,
+        /// The new page number, e.g. `3` or `3.1`.
+        #[arg(long)]
+        number: Option<String>,
+        /// The new page title.
+        #[arg(long)]
+        title: Option<String>,
     },
     /// Change a page's sheet size (as `page add --size` takes it). What is drawn stays where it
     /// is; a smaller sheet can leave some of it outside the frame.
@@ -2404,13 +2431,7 @@ fn run(mut cli: Cli) -> Res<()> {
                     if p.panels.iter().any(|x| x.id == id) {
                         return Err(format!("panel {id:?} exists"));
                     }
-                    if !(width.is_finite()
-                        && height.is_finite()
-                        && (200.0..=5000.0).contains(&width)
-                        && (200.0..=5000.0).contains(&height))
-                    {
-                        return Err("plate width and height must be 200 to 5000 mm".into());
-                    }
+                    check_plate_size(width, height)?;
                     let name = if name.is_empty() { id.clone() } else { name };
                     let panel = wc_core::panel::Panel::with_rails(id, name, width, height);
                     let rails = panel
@@ -2421,6 +2442,35 @@ fn run(mut cli: Cli) -> Res<()> {
                     println!("panel {}: {width} x {height} mm, {rails} rail(s)", panel.id);
                     p.panels.push(panel);
                     p.panels.sort_by(|a, b| a.id.cmp(&b.id));
+                }
+                PanelCmd::Edit {
+                    id,
+                    name,
+                    width,
+                    height,
+                } => {
+                    if name.is_none() && width.is_none() && height.is_none() {
+                        return Err("nothing to change: give --name, --width or --height".into());
+                    }
+                    let Some(panel) = p.panels.iter_mut().find(|x| x.id == id) else {
+                        return Err(format!("no panel {id:?}"));
+                    };
+                    let (w, h) = (width.unwrap_or(panel.width), height.unwrap_or(panel.height));
+                    // A name-only edit leaves the plate alone, so it still works when something
+                    // already sticks out past an edge (as `panel arrange` can leave it).
+                    if width.is_some() || height.is_some() {
+                        check_plate_size(w, h)?;
+                        panel.resize(w, h)?;
+                    }
+                    if let Some(name) = name {
+                        panel.name = if name.is_empty() { id.clone() } else { name };
+                    }
+                    println!(
+                        "panel {id}: {} ({} x {} mm)",
+                        escape_field(&panel.name),
+                        panel.width,
+                        panel.height
+                    );
                 }
                 PanelCmd::Arrange { id, location } => {
                     let parts = vendored_parts(dir, &p);
@@ -2634,11 +2684,14 @@ fn run(mut cli: Cli) -> Res<()> {
                     return Ok(());
                 }
                 PageCmd::Remove { id } => {
-                    let before = p.pages.len();
-                    p.pages.retain(|pg| pg.id != id);
-                    if p.pages.len() == before {
+                    if !p.pages.iter().any(|pg| pg.id == id) {
                         return Err(format!("no page {id:?}"));
                     }
+                    // Same rule as the app: a project keeps at least one page.
+                    if p.pages.len() <= 1 {
+                        return Err("A project needs at least one page.".into());
+                    }
+                    p.pages.retain(|pg| pg.id != id);
                 }
                 PageCmd::Overview { id, off } => {
                     let page = p
@@ -2647,6 +2700,34 @@ fn run(mut cli: Cli) -> Res<()> {
                         .find(|pg| pg.id == id)
                         .ok_or_else(|| format!("no page {id:?}"))?;
                     page.overview = !off;
+                }
+                PageCmd::Edit { id, number, title } => {
+                    if number.is_none() && title.is_none() {
+                        return Err("give --number, --title or both".into());
+                    }
+                    let i = p
+                        .pages
+                        .iter()
+                        .position(|pg| pg.id == id)
+                        .ok_or_else(|| format!("no page {id:?}"))?;
+                    let number = number.map(|n| n.trim().to_owned());
+                    if let Some(n) = &number {
+                        if n.is_empty() {
+                            return Err("the page number cannot be empty".into());
+                        }
+                        if let Some(other) = p.pages.iter().find(|pg| pg.number == *n && pg.id != id) {
+                            return Err(format!("page {:?} already has number {n:?}", other.id));
+                        }
+                    }
+                    if let Some(page) = p.pages.get_mut(i) {
+                        if let Some(n) = number {
+                            page.number = n;
+                        }
+                        if let Some(t) = title {
+                            page.title = t.trim().to_owned();
+                        }
+                    }
+                    p.sort_pages();
                 }
                 PageCmd::Size { id, size } => {
                     let size = PageSize::parse(&size)?;
@@ -2702,7 +2783,9 @@ fn run(mut cli: Cli) -> Res<()> {
             mirror,
         } => {
             let mut p = load(dir)?;
-            // Check the inputs before taking the symbol, so a bad tag or turn leaves no copy behind.
+            // Check the inputs before taking the symbol, so a bad page, tag or turn leaves no copy
+            // behind.
+            page_mut(&mut p, &page)?;
             let tag = tag.map(|t| DeviceTag::parse(&t)).transpose().map_err(e)?;
             let rotation = Rotation::from_degrees(rotate).ok_or("rotation must be 0, 90, 180 or 270")?;
             if store::read_vendored_symbol(dir, &symbol).is_err() {
@@ -5892,6 +5975,19 @@ fn import_qet(
     Ok((written, failed))
 }
 
+/// Refuses a plate size outside the 200 to 5000 mm range `panel new` and `panel edit` accept.
+fn check_plate_size(width: f64, height: f64) -> Result<(), String> {
+    if width.is_finite()
+        && height.is_finite()
+        && (200.0..=5000.0).contains(&width)
+        && (200.0..=5000.0).contains(&height)
+    {
+        Ok(())
+    } else {
+        Err("plate width and height must be 200 to 5000 mm".into())
+    }
+}
+
 fn vendored_parts(dir: &Path, p: &wc_core::Project) -> std::collections::BTreeMap<String, wc_core::Part> {
     p.used_parts()
         .into_iter()
@@ -6652,6 +6748,59 @@ mod tests {
     }
 
     #[test]
+    fn a_panel_is_renamed_and_resized_keeping_its_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["device", "--", "-K1"]).unwrap();
+        cli(&dir, &["panel", "new", "main"]).unwrap();
+        cli(&dir, &["panel", "device", "main", "-K1", "--at", "100,600"]).unwrap();
+        let before = load(&dir).unwrap().panels[0].clone();
+
+        cli(
+            &dir,
+            &["panel", "edit", "main", "--name", "Main plate", "--height", "1000"],
+        )
+        .unwrap();
+        let after = load(&dir).unwrap().panels[0].clone();
+        assert_eq!(after.name, "Main plate");
+        assert_eq!((after.width, after.height), (600.0, 1000.0));
+        assert_eq!(after.items, before.items, "rails, ducts and devices are not rebuilt");
+
+        // Too small for the rails, or for the device at y 600..690; out of range; nothing to do;
+        // no such panel: refused, nothing changes.
+        let err = cli(&dir, &["panel", "edit", "main", "--height", "650"]).unwrap_err();
+        assert!(err.contains("sticking out") && err.contains("-K1"), "{err}");
+        assert!(cli(&dir, &["panel", "edit", "main", "--width", "300"]).is_err());
+        assert!(cli(&dir, &["panel", "edit", "main", "--width", "100"]).is_err());
+        assert!(cli(&dir, &["panel", "edit", "main", "--width", "NaN"]).is_err());
+        assert!(cli(&dir, &["panel", "edit", "main"]).is_err());
+        assert!(cli(&dir, &["panel", "edit", "nope", "--name", "x"]).is_err());
+        assert_eq!(load(&dir).unwrap().panels[0], after);
+
+        // An empty name falls back to the id, as `panel new` does.
+        cli(&dir, &["panel", "edit", "main", "--name", ""]).unwrap();
+        assert_eq!(load(&dir).unwrap().panels[0].name, "main");
+
+        // A device taller than the plate (as `panel arrange` can leave it) does not block a
+        // name-only edit, which keeps the plate size; resizing is still refused.
+        let mut p = load(&dir).unwrap();
+        for item in &mut p.panels[0].items {
+            if let wc_core::panel::PanelItem::Device { at, height, .. } = item {
+                *at = Point::new(100.0, 0.0);
+                *height = 1200.0;
+            }
+        }
+        store::save(&dir, &p).unwrap();
+        cli(&dir, &["panel", "edit", "main", "--name", "Tall"]).unwrap();
+        let after = load(&dir).unwrap().panels[0].clone();
+        assert_eq!(after.name, "Tall");
+        assert_eq!((after.width, after.height), (600.0, 1000.0));
+        assert!(cli(&dir, &["panel", "edit", "main", "--name", "x", "--width", "700"]).is_err());
+        assert_eq!(load(&dir).unwrap().panels[0].name, "Tall");
+    }
+
+    #[test]
     fn a_device_is_placed_turned_moved_and_taken_off_a_plate() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("p");
@@ -7215,6 +7364,49 @@ mod tests {
     }
 
     #[test]
+    fn a_page_is_renumbered_and_retitled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["page", "add", "a", "--number", "2", "--title", "Power"]).unwrap();
+        cli(&dir, &["page", "add", "b", "--number", "3", "--title", "Control"]).unwrap();
+        let pages = |dir: &Path| -> Vec<(String, String, String)> {
+            load(dir)
+                .unwrap()
+                .pages
+                .iter()
+                .map(|p| (p.id.clone(), p.number.clone(), p.title.clone()))
+                .collect()
+        };
+        cli(&dir, &["page", "edit", "b", "--number", " 1.5 "]).unwrap();
+        cli(&dir, &["page", "edit", "a", "--title", "Main power"]).unwrap();
+        let got = pages(&dir);
+        let ids: Vec<&str> = got.iter().map(|x| x.0.as_str()).collect();
+        assert_eq!(ids, ["p0001", "b", "a"], "sorted by the new number");
+        assert_eq!(got[1], ("b".into(), "1.5".into(), "Control".into()));
+        assert_eq!(got[2], ("a".into(), "2".into(), "Main power".into()));
+        // Refused, and nothing changes.
+        let before = pages(&dir);
+        let err = cli(&dir, &["page", "edit", "a", "--number", "1"]).unwrap_err();
+        assert!(err.contains("already has number"), "{err}");
+        assert!(
+            cli(&dir, &["page", "edit", "a", "--number", "  "])
+                .unwrap_err()
+                .contains("empty")
+        );
+        assert!(
+            cli(&dir, &["page", "edit", "nope", "--title", "X"])
+                .unwrap_err()
+                .contains("no page")
+        );
+        assert!(cli(&dir, &["page", "edit", "a"]).is_err());
+        assert_eq!(pages(&dir), before);
+        // Its own number again is fine.
+        cli(&dir, &["page", "edit", "a", "--number", "2", "--title", "Power"]).unwrap();
+        assert_eq!(pages(&dir)[2], ("a".into(), "2".into(), "Power".into()));
+    }
+
+    #[test]
     fn a_page_is_added_as_or_made_the_one_cover_page() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("p");
@@ -7244,6 +7436,24 @@ mod tests {
         cli(&dir, &["page", "cover", "c2", "--off"]).unwrap();
         assert!(covers(&dir).is_empty());
         assert!(cli(&dir, &["page", "cover", "nope"]).unwrap_err().contains("no page"));
+    }
+
+    #[test]
+    fn page_remove_keeps_the_last_page_of_a_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let ids = |dir: &Path| -> Vec<String> { load(dir).unwrap().pages.iter().map(|p| p.id.clone()).collect() };
+        let only = ids(&dir);
+        assert_eq!(only.len(), 1);
+        let err = cli(&dir, &["page", "remove", &only[0]]).unwrap_err();
+        assert!(err.contains("at least one page"), "{err}");
+        assert_eq!(ids(&dir), only);
+        // With two pages, removing one works.
+        cli(&dir, &["page", "add", "p0002", "--number", "2"]).unwrap();
+        cli(&dir, &["page", "remove", &only[0]]).unwrap();
+        assert_eq!(ids(&dir), ["p0002"]);
+        assert!(cli(&dir, &["page", "remove", "nope"]).unwrap_err().contains("no page"));
     }
 
     #[test]
@@ -9946,7 +10156,7 @@ mod tests {
     }
 
     #[test]
-    fn place_checks_the_turn_and_tag_before_taking_the_symbol() {
+    fn place_checks_the_page_turn_and_tag_before_taking_the_symbol() {
         let Ok(tmp) = tempfile::tempdir() else { unreachable!() };
         let dir = tmp.path().join("proj");
         let Some(path) = dir.to_str() else { unreachable!() };
@@ -9961,9 +10171,11 @@ mod tests {
         assert!(cli(&dir, &["lib", "add", "starter", "folder", starter]).is_ok());
         assert!(cli(&dir, &["page", "add", "p1", "--number", "1"]).is_ok());
 
-        for bad in [["--rotate", "45"], ["--tag", "-K1."]] {
-            let mut args = vec!["place", "p1", "wc.coil", "--at", "50,50"];
-            args.extend(bad);
+        let missing_page = ["place", "nope", "wc.coil", "--at", "50,50"];
+        let bad_turn = ["place", "p1", "wc.coil", "--at", "50,50", "--rotate", "45"];
+        let bad_tag = ["place", "p1", "wc.coil", "--at", "50,50", "--tag", "-K1."];
+        for bad in [&missing_page[..], &bad_turn[..], &bad_tag[..]] {
+            let args = bad.to_vec();
             assert!(cli(&dir, &args).is_err(), "{bad:?}");
             assert!(
                 store::read_vendored_symbol(&dir, "wc.coil").is_err(),
