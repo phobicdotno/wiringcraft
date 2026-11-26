@@ -3219,3 +3219,15 @@ fn markdown_cells_keep_backslashes_in_links_as_typed() {
          | https://example.com/a\\\\\\|b https://example.com/c\\\\ |\n"
     );
 }
+
+#[test]
+fn markdown_cells_escape_an_uppercase_www_word() {
+    let mut t = Table::new("Links", &["Text"]);
+    t.rows
+        .push(vec!["WWW.example.com/*spare*/path HTTPS://example.com/a_b".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Links\n\n| Text |\n|---|\n\
+         | WWW.example.com/\\*spare\\*/path HTTPS://example.com/a_b |\n"
+    );
+}

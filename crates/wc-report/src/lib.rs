@@ -350,7 +350,14 @@ fn is_autolink(word: &str) -> bool {
     let lower = word.to_ascii_lowercase();
     let web = ["http://", "https://", "www."]
         .iter()
-        .find(|p| lower.starts_with(**p))
+        // The scheme may be in any case, but only a lowercase `www.` is a link.
+        .find(|p| {
+            if **p == "www." {
+                word.starts_with("www.")
+            } else {
+                lower.starts_with(**p)
+            }
+        })
         .map(|p| (&word[p.len()..], *p == "www."));
     if let Some((after, www)) = web {
         // The host must be a domain Markdown accepts: parts of letters, digits, `-` and `_`
