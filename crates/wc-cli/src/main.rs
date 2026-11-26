@@ -2096,6 +2096,14 @@ fn run(cli: Cli) -> Res<()> {
         Cmd::New { .. } => None,
         _ => project_lock(dir),
     };
+    // Under the project lock, so a run still writing is never undone. `new` makes a project
+    // elsewhere and `inspect` reads only an archive: the folder `-C` names is not their project.
+    if !matches!(cli.cmd, Cmd::New { .. } | Cmd::Inspect { .. })
+        && let Some(note) = undo_stopped_box_edit(dir)?
+    {
+        // A warning that cannot be shown does not stop the command.
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), format!("warning: {note}\n").as_bytes());
+    }
     match cli.cmd {
         Cmd::New {
             dir: new_dir,
@@ -2111,6 +2119,8 @@ fn run(cli: Cli) -> Res<()> {
             });
             match template {
                 Some(t) => {
+                    // A template a box-edit run stopped half way in, local or cloned, is refused
+                    // by `create_from` (#653).
                     wc_vcs::base::create_from_base(&t, &new_dir, &name, &wc_core::base::today()).map_err(e)?;
                 }
                 None => {
@@ -2649,19 +2659,41 @@ fn run(cli: Cli) -> Res<()> {
                     }
                 ));
             }
-            store::write_vendored_symbol(dir, &new).map_err(e)?;
-            if let Err(err) = save(dir, &p) {
+            // A run that stops between these writes leaves the journal: the next run puts the
+            // files back from it (#653).
+            let mut journaled = before.clone();
+            journaled.push((symbol_path.clone(), symbol_before.clone()));
+            let journal = Journal::begin(dir, &journaled)?;
+            let written = store::write_vendored_symbol(dir, &new).map_err(e).and_then(|_| {
+                // Tests stop the run here, as a kill between the writes would.
+                #[cfg(test)]
+                if tests::STOP_BOX_EDIT_AFTER_SYMBOL.get() {
+                    return Err(STOPPED.to_owned());
+                }
+                save(dir, &p)
+            });
+            #[cfg(test)]
+            if written.as_ref().is_err_and(|err| err == STOPPED) {
+                // The journal stays behind, no longer locked, as after a kill.
+                drop(journal);
+                return written;
+            }
+            if let Err(err) = written {
                 let mut failed = put_files_back(&before);
                 failed.extend(put_file_back(&symbol_path, symbol_before.as_deref()).err());
-                return Err(if failed.is_empty() {
-                    err
-                } else {
-                    format!(
-                        "{err}; putting back the project files failed too: {}",
-                        failed.join("; ")
-                    )
-                });
+                // The files put back are on disk before the journal goes, or it stays.
+                if failed.is_empty() {
+                    sync_folders(&journaled).map_err(|x| format!("{err}; the project files are put back, but {x}"))?;
+                    journal.finish(dir).map_err(|x| format!("{err}; {x}"))?;
+                    return Err(err);
+                }
+                // The journal stays, so the next run tries again.
+                return Err(format!(
+                    "{err}; putting back the project files failed too: {}",
+                    failed.join("; ")
+                ));
             }
+            journal.finish(dir).map_err(|x| format!("the edit is saved, but {x}"))?;
             for w in warnings {
                 eprintln!("warning: {}", escape_field(&w));
             }
@@ -4513,6 +4545,365 @@ fn comment_cmd(dir: &Path, cc: CommentCmd) -> Res<()> {
 /// which overflowed there once one more import command was added (#312).
 const STACK: usize = 16 * 1024 * 1024;
 
+/// What a box-edit run a test stops between its writes returns.
+#[cfg(test)]
+const STOPPED: &str = "stopped between the writes";
+
+/// The file `box-edit` keeps in the project folder while it writes: the bytes every file it may
+/// change had before (#653). It is removed once the last file is written; one left behind means
+/// a run stopped half way, and the next run puts the files back from it
+/// ([`undo_stopped_box_edit`]).
+use store::BOX_EDIT_JOURNAL;
+const JOURNAL_HEADER: &[u8] = b"wiringcraft box-edit journal 2\n";
+
+/// A journal written and held by this run. The file stays locked while the run writes, so
+/// another run never takes it for one a stopped run left behind.
+struct Journal {
+    path: PathBuf,
+    file: std::fs::File,
+}
+
+impl Journal {
+    /// Write the journal of `files` (each a project file box-edit may change, with its bytes
+    /// before, `None` when it does not exist yet), durably, before the first file is changed.
+    fn begin(dir: &Path, files: &[(PathBuf, Option<Vec<u8>>)]) -> Res<Self> {
+        use std::io::Write as _;
+        let path = dir.join(BOX_EDIT_JOURNAL);
+        let shown = |p: &Path| escape_field(&p.display().to_string());
+        if std::fs::symlink_metadata(&path).is_ok() {
+            return Err(format!(
+                "{} is there: another box-edit run on this project has not finished; run again when it has",
+                shown(&path)
+            ));
+        }
+        let mut bytes = JOURNAL_HEADER.to_vec();
+        for (file, before) in files {
+            let rel = journal_name(dir, file)
+                .ok_or_else(|| format!("{} is not a file box-edit keeps a copy of", shown(file)))?;
+            journal_target_ok(dir, &rel)?;
+            match before {
+                Some(b) => bytes.extend_from_slice(format!("{} {}\n", rel.len(), b.len()).as_bytes()),
+                None => bytes.extend_from_slice(format!("{} -\n", rel.len()).as_bytes()),
+            }
+            bytes.extend_from_slice(rel.as_bytes());
+            bytes.extend_from_slice(before.as_deref().unwrap_or_default());
+        }
+        // The end, with the count: a journal cut short anywhere is refused, never half applied.
+        bytes.extend_from_slice(format!("end {}\n", files.len()).as_bytes());
+        // Written beside it under a name of its own, locked, then moved into place: the journal
+        // is either whole or not there.
+        let mut part = path.as_os_str().to_owned();
+        // Ending in `.tmp`, so a project's git ignore rule keeps one a stop left behind out.
+        part.push(format!(".{}.tmp", std::process::id()));
+        let part = PathBuf::from(part);
+        let fail = |x: std::io::Error| format!("{}: {x}", shown(&part));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // It holds the bytes of the project's files: only their owner reads it.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&part).map_err(fail)?;
+        let written = file
+            .try_lock()
+            .map_err(|x| fail(std::io::Error::other(x.to_string())))
+            .and_then(|()| file.write_all(&bytes).map_err(fail))
+            .and_then(|()| file.sync_all().map_err(fail))
+            .and_then(|()| std::fs::rename(&part, &path).map_err(fail));
+        if let Err(err) = written {
+            drop(file);
+            return Err(match std::fs::remove_file(&part) {
+                Err(x) if x.kind() != std::io::ErrorKind::NotFound => {
+                    format!("{err}; removing {} failed too: {x}", shown(&part))
+                }
+                _ => err,
+            });
+        }
+        // Without its folder entry on disk a power loss could lose the journal after the first
+        // write: stop before writing anything.
+        if let Err(x) = sync_dir(dir) {
+            let removed = std::fs::remove_file(&path);
+            drop(file);
+            return Err(match removed {
+                Ok(()) => format!("{}: {x}; nothing was changed", shown(dir)),
+                Err(r) => format!(
+                    "{}: {x}; nothing was changed, but removing {} failed too ({r}), so it may still be there: remove it before the next run, or that run puts back the files it holds (as they are now)",
+                    shown(dir),
+                    shown(&path)
+                ),
+            });
+        }
+        Ok(Self { path, file })
+    }
+
+    /// Every file is written (or put back): the journal goes, removed while still locked.
+    fn finish(self, dir: &Path) -> Res<()> {
+        let shown = escape_field(&self.path.display().to_string());
+        let removed = match std::fs::remove_file(&self.path) {
+            Err(x) => Err(format!(
+                "removing {shown} failed: {x}; remove that file, or the next run puts the project back as it was before the edit"
+            )),
+            Ok(()) => sync_dir(dir).map_err(|x| {
+                format!(
+                    "{shown} is removed, but making that last on disk failed ({x}); after a power loss the next run may put the project back as it was before the edit"
+                )
+            }),
+        };
+        drop(self.file);
+        removed
+    }
+}
+
+/// Make the renames and removals in `dir` last on disk where the system allows it (Unix);
+/// elsewhere the rename itself is what the system keeps.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+/// The name a journal keeps for `file`: its path inside `dir` with `/` between the parts.
+/// The black box symbol files the save may remove come with the vendored symbol folder
+/// resolved, so they are named by that folder as the project sees it.
+fn journal_name(dir: &Path, file: &Path) -> Option<String> {
+    let rel = match file.strip_prefix(dir) {
+        Ok(rel) => rel.to_path_buf(),
+        Err(_) => {
+            let symbols = dir.join(store::VENDOR_DIR).join(ItemKind::Symbol.dir());
+            let resolved = symbols.canonicalize().ok()?;
+            if file.parent()? != resolved {
+                return None;
+            }
+            Path::new(store::VENDOR_DIR)
+                .join(ItemKind::Symbol.dir())
+                .join(file.file_name()?)
+        }
+    };
+    let parts = rel
+        .components()
+        .map(|c| match c {
+            std::path::Component::Normal(n) => n.to_str(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    journal_name_allowed(&parts).then(|| parts.join("/"))
+}
+
+/// Whether a journal may name the file with these path parts: only the files box-edit may
+/// change (the project's own files, its pages, panels and comments, and vendored symbols).
+fn journal_name_allowed(parts: &[&str]) -> bool {
+    match parts {
+        [name] => [store::PROJECT_FILE, store::DEVICES_FILE, store::LOCK_FILE].contains(name),
+        [folder, name] => [
+            (store::PAGES_DIR, store::PAGE_SUFFIX),
+            (store::PANELS_DIR, store::PANEL_SUFFIX),
+            (store::COMMENTS_DIR, store::COMMENTS_SUFFIX),
+        ]
+        .iter()
+        // As the store and the snapshot take them: any name ending in the suffix, the suffix alone
+        // too (`comments/.comments.json`).
+        .any(|(f, suffix)| folder == f && name.ends_with(suffix)),
+        [vendor, kind, name] => {
+            *vendor == store::VENDOR_DIR && *kind == ItemKind::Symbol.dir() && name.ends_with(".json")
+        }
+        _ => false,
+    }
+}
+
+/// A folder on the way to a journaled file that is a link could lead out of the project, and
+/// a write or removal there would land elsewhere: refused.
+fn journal_target_ok(dir: &Path, rel: &str) -> Res<()> {
+    let mut at = dir.to_path_buf();
+    let parts: Vec<&str> = rel.split('/').collect();
+    for part in &parts[..parts.len().saturating_sub(1)] {
+        at.push(part);
+        if is_link(&at)? {
+            return Err(format!(
+                "{} is a link; box-edit does not write through a linked folder",
+                escape_field(&at.display().to_string())
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The files and their bytes before, as [`Journal::begin`] wrote them; `None` when the bytes
+/// are not a whole journal or name a file box-edit does not change.
+fn parse_journal(dir: &Path, bytes: &[u8]) -> Option<run::Written> {
+    let mut rest = bytes.strip_prefix(JOURNAL_HEADER)?;
+    let mut files = Vec::new();
+    loop {
+        let end = rest.iter().position(|&b| b == b'\n')?;
+        let line = std::str::from_utf8(&rest[..end]).ok()?;
+        rest = &rest[end + 1..];
+        let (first, len) = line.split_once(' ')?;
+        if first == "end" {
+            // The count the run wrote, and nothing after it.
+            return (len.parse::<usize>().ok()? == files.len() && rest.is_empty()).then_some(files);
+        }
+        let rel_len: usize = first.parse().ok()?;
+        let len: Option<usize> = if len == "-" { None } else { Some(len.parse().ok()?) };
+        let rel = std::str::from_utf8(rest.get(..rel_len)?).ok()?;
+        rest = &rest[rel_len..];
+        let parts: Vec<&str> = rel.split('/').collect();
+        if !journal_name_allowed(&parts) || parts.iter().any(|p| matches!(*p, "" | "." | "..")) {
+            return None;
+        }
+        let before = match len {
+            Some(n) => {
+                let b = rest.get(..n)?.to_vec();
+                rest = &rest[n..];
+                Some(b)
+            }
+            None => None,
+        };
+        files.push((parts.iter().fold(dir.to_path_buf(), |p, part| p.join(part)), before));
+    }
+}
+
+/// When a `box-edit` run stopped before it had written every file (killed, power lost), put
+/// the files it may have changed back as they were before it, so the symbol, `library.lock`
+/// and pages agree again (#653). A journal another run still holds is left alone. Says what
+/// it did, `None` when there was nothing to do.
+fn undo_stopped_box_edit(dir: &Path) -> Res<Option<String>> {
+    let path = dir.join(BOX_EDIT_JOURNAL);
+    let shown = escape_field(&path.display().to_string());
+    let not_a_file = || format!("{shown} is not a plain file; remove it");
+    // Only a plain file: a link could lead anywhere, and reading a FIFO would never end.
+    match std::fs::symlink_metadata(&path) {
+        Ok(m) if m.file_type().is_file() => {}
+        Ok(_) => return Err(not_a_file()),
+        Err(x) if x.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(x) => return Err(format!("{shown}: {x}")),
+    }
+    let mut file = None;
+    let mut denied = None;
+    for _ in 0..10 {
+        match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(f) => {
+                file = Some(f);
+                break;
+            }
+            Err(x) if x.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            // Windows: the run holding it may be removing it; it is gone a moment later.
+            Err(x) if x.kind() == std::io::ErrorKind::PermissionDenied && cfg!(windows) => {
+                denied = Some(x);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                if std::fs::symlink_metadata(&path).is_err_and(|m| m.kind() == std::io::ErrorKind::NotFound) {
+                    return Ok(None);
+                }
+            }
+            Err(x) => return Err(format!("{shown}: {x}")),
+        }
+    }
+    let Some(mut file) = file else {
+        return Err(format!(
+            "{shown}: {}",
+            denied.map_or_else(|| "access denied".to_owned(), |x| x.to_string())
+        ));
+    };
+    if !file.metadata().map_err(|x| format!("{shown}: {x}"))?.is_file() {
+        return Err(not_a_file());
+    }
+    // Tests swap the journal here, as another run finishing and starting could.
+    #[cfg(test)]
+    if let Some(between) = tests::BETWEEN_JOURNAL_OPEN_AND_LOCK.take() {
+        between();
+    }
+    match file.try_lock() {
+        Ok(()) => {}
+        // A run is writing now: its journal is not one left behind.
+        Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+        Err(std::fs::TryLockError::Error(x)) => return Err(format!("{shown}: {x}")),
+    }
+    // The run that held it may have finished and removed it just before the lock was taken,
+    // and another run may have put a journal of its own there since: only the file locked
+    // here is one left behind.
+    match std::fs::symlink_metadata(&path) {
+        Ok(now) => {
+            if !same_file(&now, &file).map_err(|x| format!("{shown}: {x}"))? {
+                return Ok(None);
+            }
+        }
+        Err(x) if x.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(x) => return Err(format!("{shown}: {x}")),
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|x| format!("{shown}: {x}"))?;
+    let unreadable = || {
+        format!(
+            "{shown} is left from a box-edit run that stopped, but it cannot be read; put the project files back from the project's history (e.g. `git checkout`) and remove it"
+        )
+    };
+    let files = parse_journal(dir, &bytes).ok_or_else(unreadable)?;
+    for (target, _) in &files {
+        journal_target_ok(dir, &journal_name(dir, target).ok_or_else(unreadable)?)?;
+        // Each file is put back over a plain file or where none is: a link would be replaced by
+        // a plain file, and opening a FIFO to compare its bytes could wait for ever.
+        let target_shown = || escape_field(&target.display().to_string());
+        match std::fs::symlink_metadata(target) {
+            Ok(m) if m.file_type().is_file() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "{} is not a plain file, so the box-edit run that stopped half way cannot be undone; put it back from the project's history (e.g. `git checkout`) and run again",
+                    target_shown()
+                ));
+            }
+            Err(x) if x.kind() == std::io::ErrorKind::NotFound => {}
+            Err(x) => return Err(format!("{}: {x}", target_shown())),
+        }
+    }
+    let failed = put_files_back(&files);
+    if !failed.is_empty() {
+        return Err(format!(
+            "a box-edit run stopped half way, and putting back the files it changed failed: {}",
+            failed.join("; ")
+        ));
+    }
+    // The files put back are on disk before the journal goes, or it stays for the next run.
+    sync_folders(&files).map_err(|x| format!("a box-edit run stopped half way; its files are put back, but {x}"))?;
+    std::fs::remove_file(&path).map_err(|x| format!("{shown}: {x}"))?;
+    sync_dir(dir).map_err(|x| format!("{}: {x}", escape_field(&dir.display().to_string())))?;
+    drop(file);
+    Ok(Some(
+        "a box-edit run stopped before it had written every file; the project files are put back as they were before it".into(),
+    ))
+}
+
+/// Make the files put back last on disk: sync the folder of each (Unix). Says which folder
+/// failed.
+fn sync_folders(files: &[(PathBuf, Option<Vec<u8>>)]) -> Res<()> {
+    let mut folders: Vec<&Path> = files.iter().filter_map(|(f, _)| f.parent()).collect();
+    folders.sort();
+    folders.dedup();
+    for folder in folders {
+        match sync_dir(folder) {
+            Err(x) if x.kind() != std::io::ErrorKind::NotFound => {
+                return Err(format!("{}: {x}", escape_field(&folder.display().to_string())));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Whether the entry `at` names is the file `file` has open. Only Unix tells it (device and
+/// inode); elsewhere the entry being there has to do.
+fn same_file(at: &std::fs::Metadata, file: &std::fs::File) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let m = file.metadata()?;
+        Ok(m.dev() == at.dev() && m.ino() == at.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (at, file);
+        Ok(true)
+    }
+}
+
 /// Whether `path` is a symbolic link. A missing file is not one; any other error reading its
 /// metadata is returned with the path, so a check that cannot tell refuses instead of guessing.
 fn is_link(path: &Path) -> Result<bool, String> {
@@ -5198,6 +5589,13 @@ fn file_stem(number: &str, id: &str) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// Set by a test to stop `box-edit` after its symbol write, as a kill would.
+        pub(super) static STOP_BOX_EDIT_AFTER_SYMBOL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Run by recovery between opening a journal and locking it.
+        pub(super) static BETWEEN_JOURNAL_OPEN_AND_LOCK: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const { std::cell::Cell::new(None) };
+    }
 
     /// A stdout whose reader has gone away, as Windows reports it for `| more` that stopped.
     struct ClosedPipe;
@@ -8902,6 +9300,425 @@ mod tests {
         std::fs::copy(&target, &page).unwrap();
         cli(&dir, &["box-edit", "p1", "s1", "--size", "30,10"]).unwrap();
         assert_ne!(store::read_vendored_symbol(&dir, "box.p1.s1").unwrap(), symbol_before);
+    }
+
+    /// A box-edit project: a box `s1` on page p1 with point 1 wired. Returns the project folder,
+    /// the box's symbol file, and the files a box-edit may change with their bytes now.
+    fn box_edit_project(tmp: &Path) -> (PathBuf, PathBuf, run::Written) {
+        let dir = tmp.join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        cli(
+            &dir,
+            &["box", "p1", "--at", "40,40", "--size", "20,10", "--pin", "1:left:5"],
+        )
+        .unwrap();
+        cli(&dir, &["wire", "p1", "s1:1", "0,0"]).unwrap();
+        let (symbol, symbol_bytes) = vendored_bytes(&dir, ItemKind::Symbol, "box.p1.s1").unwrap();
+        let mut files = snapshot_project(&dir, &[], &[]).unwrap();
+        files.push((symbol.clone(), symbol_bytes));
+        (dir, symbol, files)
+    }
+
+    fn bytes_now(files: &run::Written) -> run::Written {
+        files
+            .iter()
+            .map(|(path, _)| (path.clone(), std::fs::read(path).ok()))
+            .collect()
+    }
+
+    /// A box-edit run that stops between its writes (here: the symbol and `library.lock` are
+    /// new, the page is not) leaves its journal, and the next run puts every file back as it
+    /// was before, so symbol, lock and page agree again (#653).
+    #[test]
+    fn box_edit_stopped_between_writes_is_put_back_by_the_next_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, symbol_path, before) = box_edit_project(tmp.path());
+
+        // A page file the run adds is in its journal as not there before.
+        let extra = dir.join(store::PAGES_DIR).join(format!("zz{}", store::PAGE_SUFFIX));
+        let mut journaled = before.clone();
+        journaled.push((extra.clone(), None));
+        let journal = Journal::begin(&dir, &journaled).unwrap();
+        let mut sym = store::read_vendored_symbol(&dir, "box.p1.s1").unwrap();
+        sym.pins.clear();
+        store::write_vendored_symbol(&dir, &sym).unwrap();
+        let mut p = load(&dir).unwrap();
+        p.lock.symbols.get_mut("box.p1.s1").unwrap().hash = sym.hash();
+        store::save_lock(&dir, &p).unwrap();
+        std::fs::write(&extra, b"{}").unwrap();
+        // The run stops here: the journal stays, no longer locked.
+        drop(journal);
+        assert_ne!(bytes_now(&before), before);
+
+        // Any next run puts the files back first.
+        cli(&dir, &["location", "list"]).unwrap();
+        assert_eq!(bytes_now(&before), before);
+        assert!(!extra.exists());
+        assert!(!dir.join(BOX_EDIT_JOURNAL).exists());
+        assert!(std::fs::read(&symbol_path).is_ok());
+
+        // And the edit then goes through, leaving no journal.
+        cli(&dir, &["box-edit", "p1", "s1", "--size", "30,10"]).unwrap();
+        assert!(!dir.join(BOX_EDIT_JOURNAL).exists());
+        assert_ne!(
+            std::fs::read(&symbol_path).unwrap(),
+            before.last().unwrap().1.clone().unwrap()
+        );
+    }
+
+    /// The journal of a run still writing is locked: another run leaves it and the files alone,
+    /// and a second box-edit refuses instead of writing over it.
+    #[test]
+    fn a_journal_another_run_holds_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, _, before) = box_edit_project(tmp.path());
+        let journal = Journal::begin(&dir, &before).unwrap();
+        // What the other run has written so far stays as it is.
+        let page = dir.join(store::PAGES_DIR).join(format!("p1{}", store::PAGE_SUFFIX));
+        let page_before = std::fs::read(&page).unwrap();
+        std::fs::write(&page, b"half written by the other run").unwrap();
+        assert_eq!(undo_stopped_box_edit(&dir), Ok(None));
+        assert_eq!(std::fs::read(&page).unwrap(), b"half written by the other run");
+        std::fs::write(&page, &page_before).unwrap();
+
+        let err = cli(&dir, &["box-edit", "p1", "s1", "--size", "30,10"]).unwrap_err();
+        assert!(err.contains("has not finished"), "{err}");
+        assert_eq!(bytes_now(&before), before);
+
+        journal.finish(&dir).unwrap();
+        assert!(!dir.join(BOX_EDIT_JOURNAL).exists());
+        assert_eq!(undo_stopped_box_edit(&dir), Ok(None));
+    }
+
+    /// A journal left behind that is replaced, between recovery opening it and locking it, by
+    /// the journal of a run now writing: the old one, locked but no longer at the path, is not
+    /// replayed, and the new one is left alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_journal_swapped_between_open_and_lock_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, _, before) = box_edit_project(tmp.path());
+        let lock = dir.join(store::LOCK_FILE);
+        // The stopped run's journal would put `library.lock` back to other bytes.
+        let mut stale = before.clone();
+        for (path, bytes) in &mut stale {
+            if *path == lock {
+                *bytes = Some(b"stale".to_vec());
+            }
+        }
+        drop(Journal::begin(&dir, &stale).unwrap());
+        let live: std::rc::Rc<std::cell::RefCell<Option<Journal>>> = std::rc::Rc::default();
+        let (into, journal_dir, now) = (live.clone(), dir.clone(), before.clone());
+        BETWEEN_JOURNAL_OPEN_AND_LOCK.set(Some(Box::new(move || {
+            std::fs::remove_file(journal_dir.join(BOX_EDIT_JOURNAL)).unwrap();
+            *into.borrow_mut() = Some(Journal::begin(&journal_dir, &now).unwrap());
+        })));
+
+        assert_eq!(undo_stopped_box_edit(&dir), Ok(None));
+        assert_eq!(bytes_now(&before), before);
+        assert!(dir.join(BOX_EDIT_JOURNAL).exists());
+        live.take().unwrap().finish(&dir).unwrap();
+        assert!(!dir.join(BOX_EDIT_JOURNAL).exists());
+    }
+
+    /// A journal that is not whole, or names a file box-edit does not change, is refused, and
+    /// no file is changed from it.
+    #[test]
+    fn a_broken_journal_is_refused_and_changes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, _, before) = box_edit_project(tmp.path());
+        let journal = dir.join(BOX_EDIT_JOURNAL);
+        let with = |records: &[u8]| {
+            let mut b = JOURNAL_HEADER.to_vec();
+            b.extend_from_slice(records);
+            b
+        };
+        // A whole record, its lengths counted from the name and bytes, and the end line.
+        let one = |name: &str, tail: &[u8]| {
+            let mut b = JOURNAL_HEADER.to_vec();
+            b.extend_from_slice(format!("{} -\n{name}", name.len()).as_bytes());
+            b.extend_from_slice(tail);
+            b
+        };
+        let bad = [
+            b"not a journal".to_vec(),
+            // Cut inside a record, and cut at a record's end (no end line).
+            with(b"12 5\nlibrary.lock"),
+            one("library.lock", b""),
+            // A count that does not match, and bytes after the end.
+            one("library.lock", b"end 2\n"),
+            one("library.lock", b"end 1\nmore"),
+            // Outside the project, or a file box-edit does not change.
+            one("../x.json", b"end 1\n"),
+            one("/x.json", b"end 1\n"),
+            one("notes.txt", b"end 1\n"),
+            one("pages/../x.page.json", b"end 1\n"),
+            one("pages/./x.page.json", b"end 1\n"),
+        ];
+        // The same record with a name box-edit changes is whole: only the name is refused.
+        assert!(parse_journal(&dir, &one("pages/x.page.json", b"end 1\n")).is_some());
+        for bad in bad {
+            std::fs::write(&journal, &bad).unwrap();
+            let err = cli(&dir, &["location", "list"]).unwrap_err();
+            assert!(err.contains("cannot be read"), "{err}");
+            assert_eq!(bytes_now(&before), before);
+            assert_eq!(std::fs::read(&journal).unwrap(), bad);
+        }
+        assert!(!tmp.path().join("x.json").exists());
+
+        // Each file and its bytes come back as written.
+        let good = with(b"12 2\nlibrary.lockhi18 -\npages/p2.page.jsonend 2\n");
+        assert_eq!(
+            parse_journal(&dir, &good),
+            Some(vec![
+                (dir.join(store::LOCK_FILE), Some(b"hi".to_vec())),
+                (dir.join("pages").join("p2.page.json"), None)
+            ])
+        );
+    }
+
+    /// A box-edit run stopped right after its symbol write, in the command's own save path,
+    /// leaves a journal holding the symbol and the project files; the next run puts the symbol
+    /// back so it matches `library.lock` and the pages again. A `new` run elsewhere leaves the
+    /// journal alone.
+    #[test]
+    fn box_edit_killed_after_its_symbol_write_is_put_back_by_the_next_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, symbol_path, before) = box_edit_project(tmp.path());
+        STOP_BOX_EDIT_AFTER_SYMBOL.set(true);
+        let stopped = cli(&dir, &["box-edit", "p1", "s1", "--size", "30,10", "--clear-pins"]);
+        STOP_BOX_EDIT_AFTER_SYMBOL.set(false);
+        assert_eq!(stopped, Err(STOPPED.to_owned()));
+        // Permissions given to the half-edited symbol file are the ones it keeps when put back.
+        #[cfg(unix)]
+        let symbol_mode = {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&symbol_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+            0o640
+        };
+        // The journal holds the project files and the symbol, each with its bytes before.
+        let left = std::fs::read(dir.join(BOX_EDIT_JOURNAL)).unwrap();
+        // Compared by each file's name in the project: the black box symbol files the save may
+        // remove come with their folder resolved (on Windows a `\\?\` path, long names).
+        let named = |files: &run::Written| {
+            files
+                .iter()
+                .map(|(path, bytes)| (journal_name(&dir, path), bytes.clone()))
+                .collect::<Vec<_>>()
+        };
+        let Some(left) = parse_journal(&dir, &left) else {
+            unreachable!("the journal left behind reads")
+        };
+        assert_eq!(named(&left), named(&before));
+        assert!(named(&left).iter().all(|(name, _)| name.is_some()));
+        assert_ne!(std::fs::read(&symbol_path).ok(), before.last().unwrap().1);
+
+        let other = tmp.path().join("other");
+        cli(&dir, &["new", other.to_str().unwrap(), "--no-git"]).unwrap();
+        assert!(dir.join(BOX_EDIT_JOURNAL).exists());
+
+        cli(&dir, &["location", "list"]).unwrap();
+        assert!(!dir.join(BOX_EDIT_JOURNAL).exists());
+        assert_eq!(bytes_now(&before), before);
+        // The symbol file put back keeps the permissions it had.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&symbol_path), symbol_mode, "{:o}", mode(&symbol_path));
+        }
+        cli(&dir, &["box-edit", "p1", "s1", "--size", "30,10"]).unwrap();
+        assert!(!dir.join(BOX_EDIT_JOURNAL).exists());
+    }
+
+    /// On Unix a backslash is part of a file name: `pages/a\b.page.json` is journaled and put
+    /// back as that file, and `pages/a/b.page.json` is left as it is.
+    #[cfg(unix)]
+    #[test]
+    fn a_backslash_in_a_journaled_name_stays_part_of_the_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, _, _) = box_edit_project(tmp.path());
+        let pages = dir.join(store::PAGES_DIR);
+        let slashed = pages.join("a\\b.page.json");
+        let nested = pages.join("a").join("b.page.json");
+        std::fs::create_dir(pages.join("a")).unwrap();
+        std::fs::write(&slashed, b"old").unwrap();
+        std::fs::write(&nested, b"nested").unwrap();
+        let journal = Journal::begin(&dir, &[(slashed.clone(), Some(b"old".to_vec()))]).unwrap();
+        std::fs::write(&slashed, b"new").unwrap();
+        drop(journal);
+
+        assert!(undo_stopped_box_edit(&dir).unwrap().is_some());
+        assert_eq!(std::fs::read(&slashed).unwrap(), b"old");
+        assert_eq!(std::fs::read(&nested).unwrap(), b"nested");
+    }
+
+    /// A comment file named by the suffix alone (an empty list) is one the store reads and a
+    /// save removes: box-edit journals it, and a stopped run's journal puts it back.
+    #[test]
+    fn a_comment_file_named_by_the_suffix_alone_is_journaled_and_put_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, _, _) = box_edit_project(tmp.path());
+        let comments = dir.join(store::COMMENTS_DIR);
+        std::fs::create_dir_all(&comments).unwrap();
+        let empty = comments.join(store::COMMENTS_SUFFIX);
+        std::fs::write(&empty, b"[]").unwrap();
+        let mut before = snapshot_project(&dir, &[], &[]).unwrap();
+        assert!(before.iter().any(|(path, _)| *path == empty));
+        let (symbol, symbol_bytes) = vendored_bytes(&dir, ItemKind::Symbol, "box.p1.s1").unwrap();
+        before.push((symbol, symbol_bytes));
+
+        STOP_BOX_EDIT_AFTER_SYMBOL.set(true);
+        let stopped = cli(&dir, &["box-edit", "p1", "s1", "--size", "30,10"]);
+        STOP_BOX_EDIT_AFTER_SYMBOL.set(false);
+        assert_eq!(stopped, Err(STOPPED.to_owned()));
+        std::fs::remove_file(&empty).unwrap();
+        cli(&dir, &["location", "list"]).unwrap();
+        assert_eq!(bytes_now(&before), before);
+        assert_eq!(std::fs::read(&empty).unwrap(), b"[]");
+        // Made again where none was: its staging file was readable by its owner only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&empty).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "{mode:o}");
+        }
+
+        cli(&dir, &["box-edit", "p1", "s1", "--size", "30,10"]).unwrap();
+        assert!(!dir.join(BOX_EDIT_JOURNAL).exists());
+    }
+
+    /// A command that does not use the `-C` project (`inspect`) leaves a journal there alone,
+    /// and `new --template` refuses a template a box-edit run stopped half way in.
+    #[test]
+    fn commands_that_do_not_use_the_project_leave_its_journal_alone() {
+        use std::io::Write as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, symbol_path, before) = box_edit_project(tmp.path());
+        STOP_BOX_EDIT_AFTER_SYMBOL.set(true);
+        let stopped = cli(&dir, &["box-edit", "p1", "s1", "--size", "30,10", "--clear-pins"]);
+        STOP_BOX_EDIT_AFTER_SYMBOL.set(false);
+        assert_eq!(stopped, Err(STOPPED.to_owned()));
+        let journal = std::fs::read(dir.join(BOX_EDIT_JOURNAL)).unwrap();
+        let now = bytes_now(&before);
+
+        let archive = tmp.path().join("a.zip");
+        let mut z = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        z.start_file("readme.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        z.write_all(b"hi").unwrap();
+        z.finish().unwrap();
+        cli(&dir, &["inspect", archive.to_str().unwrap()]).unwrap();
+        assert_eq!(std::fs::read(dir.join(BOX_EDIT_JOURNAL)).unwrap(), journal);
+        assert_eq!(bytes_now(&before), now);
+
+        let made = tmp.path().join("made");
+        let err = run(Cli::try_parse_from([
+            "wiringcraft",
+            "new",
+            made.to_str().unwrap(),
+            "--no-git",
+            "--template",
+            dir.to_str().unwrap(),
+        ])
+        .unwrap())
+        .unwrap_err();
+        assert!(err.contains("stopped half way"), "{err}");
+        assert!(!made.exists());
+        assert_eq!(bytes_now(&before), now);
+
+        // Once the template is put back it serves again.
+        cli(&dir, &["check"]).ok();
+        assert!(!dir.join(BOX_EDIT_JOURNAL).exists());
+        assert_eq!(bytes_now(&before), before);
+        assert!(symbol_path.exists());
+        run(Cli::try_parse_from([
+            "wiringcraft",
+            "new",
+            made.to_str().unwrap(),
+            "--no-git",
+            "--template",
+            dir.to_str().unwrap(),
+        ])
+        .unwrap())
+        .unwrap();
+    }
+
+    /// The project reached through a linked folder: the box symbol files the save may remove
+    /// come resolved, and are journaled by their name in the project.
+    #[cfg(unix)]
+    #[test]
+    fn box_edit_through_a_linked_project_folder_journals_its_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, symbol_path, _) = box_edit_project(tmp.path());
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        let symbol_before = std::fs::read(&symbol_path).unwrap();
+        cli(&link, &["box-edit", "p1", "s1", "--size", "30,10"]).unwrap();
+        assert_ne!(std::fs::read(&symbol_path).unwrap(), symbol_before);
+        assert!(!dir.join(BOX_EDIT_JOURNAL).exists());
+    }
+
+    /// A journal that is not a plain file (a FIFO, whose reading would never end), or whose
+    /// records lead through a linked folder, is refused and nothing is written through it.
+    #[cfg(unix)]
+    #[test]
+    fn a_journal_that_is_no_plain_file_or_leads_through_a_link_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, _, before) = box_edit_project(tmp.path());
+        let journal = dir.join(BOX_EDIT_JOURNAL);
+        let made = std::process::Command::new("mkfifo").arg(&journal).status().unwrap();
+        assert!(made.success());
+        let err = cli(&dir, &["location", "list"]).unwrap_err();
+        assert!(err.contains("not a plain file"), "{err}");
+        std::fs::remove_file(&journal).unwrap();
+
+        // `comments` is a link to a folder outside the project.
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join(store::COMMENTS_DIR)).unwrap();
+        let mut bytes = JOURNAL_HEADER.to_vec();
+        bytes.extend_from_slice(b"25 2\ncomments/p1.comments.jsonhiend 1\n");
+        std::fs::write(&journal, &bytes).unwrap();
+        let err = cli(&dir, &["location", "list"]).unwrap_err();
+        assert!(err.contains("linked folder"), "{err}");
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+        assert_eq!(bytes_now(&before), before);
+        assert!(journal.exists());
+        std::fs::remove_file(dir.join(store::COMMENTS_DIR)).unwrap();
+
+        // A file to put back that is now a link or a FIFO: refused before anything is put back.
+        let lock = dir.join(store::LOCK_FILE);
+        let page = dir.join(store::PAGES_DIR).join(format!("p1{}", store::PAGE_SUFFIX));
+        let journal_of = |name: &str| {
+            // The unsafe file first: put back last of all, so a replay begun before every
+            // target is checked would already have changed `library.lock`.
+            let mut b = JOURNAL_HEADER.to_vec();
+            b.extend_from_slice(format!("{} 2\n{name}hi", name.len()).as_bytes());
+            b.extend_from_slice(b"12 2\nlibrary.lockhiend 2\n");
+            b
+        };
+        let page_name = format!("{}/p1{}", store::PAGES_DIR, store::PAGE_SUFFIX);
+        let page_bytes = std::fs::read(&page).unwrap();
+        let target = tmp.path().join("page-elsewhere.json");
+        std::fs::write(&target, &page_bytes).unwrap();
+        std::fs::remove_file(&page).unwrap();
+        std::os::unix::fs::symlink(&target, &page).unwrap();
+        std::fs::write(&journal, journal_of(&page_name)).unwrap();
+        let err = cli(&dir, &["location", "list"]).unwrap_err();
+        assert!(err.contains("not a plain file"), "{err}");
+        assert!(std::fs::symlink_metadata(&page).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&target).unwrap(), page_bytes);
+        assert_ne!(std::fs::read(&lock).unwrap(), b"hi");
+
+        std::fs::remove_file(&page).unwrap();
+        let made = std::process::Command::new("mkfifo").arg(&page).status().unwrap();
+        assert!(made.success());
+        let err = cli(&dir, &["location", "list"]).unwrap_err();
+        assert!(err.contains("not a plain file"), "{err}");
+        assert_ne!(std::fs::read(&lock).unwrap(), b"hi");
+        assert!(journal.exists());
     }
 
     #[test]

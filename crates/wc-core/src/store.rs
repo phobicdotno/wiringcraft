@@ -40,6 +40,10 @@ pub const PANELS_DIR: &str = "panels";
 pub const PANEL_SUFFIX: &str = ".panel.json";
 pub const COMMENTS_DIR: &str = "comments";
 pub const COMMENTS_SUFFIX: &str = ".comments.json";
+/// The file a `box-edit` run keeps in the project folder while it writes: the bytes each file
+/// it may change had before. One left behind means a run stopped half way; the next
+/// `wiringcraft` command in the project puts the files back from it.
+pub const BOX_EDIT_JOURNAL: &str = ".box-edit.journal";
 
 /// Ids become file names, so they are restricted to a portable set.
 pub fn check_id(id: &str) -> Result<()> {
