@@ -2609,16 +2609,29 @@ impl App {
             }
             "off" | "on" => {
                 let which = need_s(v, "rule")?.trim();
-                let found = which.split_once(':').and_then(|(src, _)| {
-                    let set = library.iter().find(|set| set.source == src.trim())?;
-                    let rules = set.rules.as_ref().ok()?;
+                // The one rule `which` names, as `turned_off` reads it: by number, or by name.
+                // A selector that could stand for two rules (a rule named "2" and rule 2,
+                // or two rules of one name) is refused rather than guessed.
+                let mut found = None;
+                if let Some((src, sel)) = which.split_once(':')
+                    && let Some(set) = library.iter().find(|set| set.source == src.trim())
+                    && let Ok(rules) = &set.rules
+                {
                     let one = [which.to_owned()];
-                    rules
-                        .iter()
-                        .enumerate()
-                        .find(|(k, r)| turned_off(&one, &set.source, k + 1, r))
-                        .map(|(k, r)| (set.source.clone(), k + 1, r.clone()))
-                });
+                    let hits: Vec<usize> = (1..=rules.len())
+                        .filter(|&n| turned_off(&one, &set.source, n, &rules[n - 1]))
+                        .collect();
+                    if hits.len() > 1 {
+                        let list: Vec<String> = hits.iter().map(|n| format!("{}:{n}", set.source)).collect();
+                        return Err(format!(
+                            "{which:?} could be rule {} of library {}: {:?} is a number and a rule's name too, or two rules share it. An entry in rules_off turns off all of them; name the rule another way (list shows each rule's number and name).",
+                            list.join(" or "),
+                            set.source,
+                            sel.trim()
+                        ));
+                    }
+                    found = hits.first().map(|&n| (set.source.clone(), n, rules[n - 1].clone()));
+                }
                 let mut now = off.clone();
                 match (action, found) {
                     ("off", None) => {
@@ -5708,6 +5721,53 @@ mod tests {
         let pdf = String::from_utf8_lossy(&std::fs::read(pdf_path).unwrap()).into_owned();
         assert!(pdf.contains(&hex("Reserve / Spare")), "the texts are in both languages");
         assert!(pdf.contains(&hex("Pumpene / Pumps")));
+    }
+
+    #[test]
+    fn the_rules_tool_refuses_a_selector_that_names_two_library_rules() {
+        let (tmp, mut a) = app(vec![]);
+        let odd = tmp.path().join("odd");
+        std::fs::create_dir_all(&odd).unwrap();
+        let rule = |name: &str| format!("[[rule]]\nname = \"{name}\"\nkind = \"cable\"\n\n");
+        let text = ["2", "tags", "dup", "dup"].map(rule).concat();
+        std::fs::write(odd.join("rules.toml"), text).unwrap();
+        a.open.as_mut().unwrap().project.meta.libraries = vec![wc_core::project::LibrarySource {
+            name: "odd".into(),
+            kind: "folder".into(),
+            location: odd.to_string_lossy().into(),
+            reference: None,
+        }];
+        let off = |a: &App| a.open.as_ref().unwrap().project.meta.rules_off.clone();
+        let is_off = |a: &mut App| -> Vec<bool> {
+            let list: Value = serde_json::from_str(&call(a, "rules", json!({"action": "list"})).unwrap()).unwrap();
+            let rules = list["library"][0]["rules"].as_array().unwrap().clone();
+            rules.iter().map(|r| r["off"] == true).collect()
+        };
+        let rules = |a: &mut App, action: &str, rule: &str| call(a, "rules", json!({"action": action, "rule": rule}));
+
+        // "2" is rule 2 by number and rule 1 by name: refused, nothing changes.
+        rules(&mut a, "off", "odd:tags").unwrap();
+        for action in ["on", "off"] {
+            let r = rules(&mut a, action, "odd:2");
+            assert!(r.as_ref().is_err_and(|e| e.contains("odd:1 or odd:2")), "{r:?}");
+        }
+        assert_eq!(off(&a), vec!["odd:tags".to_owned()]);
+        rules(&mut a, "on", "odd:tags").unwrap();
+        assert_eq!(is_off(&mut a), [false; 4], "list agrees with the tool");
+
+        // Two rules named dup: refused by name, each kept apart by number.
+        assert!(rules(&mut a, "off", "odd:dup").is_err());
+        rules(&mut a, "off", "odd:3").unwrap();
+        rules(&mut a, "off", "odd:4").unwrap();
+        rules(&mut a, "on", "odd:3").unwrap();
+        assert_eq!(is_off(&mut a), [false, false, false, true]);
+        assert!(rules(&mut a, "on", "odd:dup").is_err());
+
+        // An entry turning off two rules goes when either is turned on, so list shows both on.
+        a.open.as_mut().unwrap().project.meta.rules_off = vec!["odd:2".into()];
+        assert_eq!(is_off(&mut a), [true, true, false, false]);
+        rules(&mut a, "on", "odd:1").unwrap();
+        assert_eq!(is_off(&mut a), [false; 4]);
     }
 
     #[test]
