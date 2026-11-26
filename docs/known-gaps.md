@@ -12,55 +12,55 @@ the todo that covers it, or why it has none. New gaps go straight to the todo li
   `crates/`. Most hits are deliberate, documented behaviour (hostile input is skipped with a
   warning); the real feature gaps are listed below.
 - **README and docs:** read `README.md` and `docs/manufacturer-data.md`.
-- **Branches:** every remote branch not merged into `main` was checked against its pull request.
+- **Branches:** every remote branch not merged into `main` was checked against its pull request
+  (last checked 26 November 2026).
 
 ## Branches
 
-All unmerged remote branches either belong to a merged pull request (squash-merged, so git does
-not see them as merged) or to an open one. None hold lost work.
+There are 235 remote branches not merged into `main`. 231 of them belong to a merged pull
+request (squash-merged, so git does not see them as merged); they hold no lost work and can be
+deleted. The other four:
 
 | Branch | Pull request |
 |---|---|
-| `app/egui-shell`, `app/pages`, `app/editing` | #3, #6, #7 (merged) |
-| `import/aml-pdf-dwg`, `import/eplan`, `import/eplan-drawn-pages` | #2, #5, #16 (merged) |
-| `phase1/library-import-pdf`, `reports/bom-wires-terminals`, `check`, `library/iec-basics` | #1, #4, #13, #14 (merged) |
-| `todo/claim-permissions`, `build/installers` | #58, #72 (merged) |
-| `claude/issue-43-share-session-core`, `-46-manufacturer-data`, `-48-rolling-log`, `-51-auto-wiring` | #79, #80, #81, #85 (merged) |
-| `app/browse-folders` | #82 (open) |
-| `claude/issue-52-wire-route-style` | #87 (open, fixes #52) |
-| `import/swe-locations` | #89 (open, #69) |
-| `frame/row-letters` | #90 (open, #54) |
-
-These branches can be deleted once their pull requests are merged.
+| `app/file-pickers` | #344 (open, #338) |
+| `app/imports` | #349 (open, #338) |
+| `import/dwg-2013-2018` | #299 (open, #292) |
+| `claude/issue-418-pdf-runlength` | #432 (closed without merging; the same work went in with #427, fixing #418), can be deleted |
 
 ## Import
 
 | Gap | Where it shows | Todo |
 |---|---|---|
 | EDZ exchange files: only the multi-line representation, variant A, of an EPLAN macro (`.ema`) becomes a symbol; panel layout, overview, single-line and 3D representations and other variants are counted, not imported. Symbols from EPLAN's own libraries (coils, contacts, lamps) are drawn as the WiringCraft symbol of the same kind, not with EPLAN's drawing, and connection points placed from those libraries keep their pin but not their drawing. Text alignment numbers are read as left, centre, right in rows of three (inferred), and only the horizontal part is used. Connection points that only other multi-line variants (or, without those, the overview) hold are added to the symbol as pins in a column to the right of its drawing, without their drawing (#511); symbols from EPLAN's own libraries get one pin per connection point designation (a terminal with 4 designations has 4, in top and bottom pairs a grid step apart, since #512) but their pin positions follow WiringCraft's drawing of the same kind, not EPLAN's; category 502 is drawn as fuses, one per pair of points (inferred from maker macros); device tag, connection designation and description text placements and terminal descriptions (A186) are not mapped, and the tag position is a guess; a macro whose maker cannot be told (no part names it and the archive holds parts of several makers, or none) keeps the id `eplan.<file name>`, with a warning, and can still be overwritten by another archive's macro of the same name | `crates/wc-import/src/edz/macros.rs` | #513 |
-| SolidWorks Electrical: symbol and page graphics come from the archive's DWG files (`Block/<name>.dwg`, `Projects/<n>/Drawings/<page id>.ewg`); the file layout is checked on synthetic archives only, texts of a symbol scaled differently along x and y keep their size from the mean scale (its circles and arcs are drawn as ellipses), and a bare database import still draws boxes | `crates/wc-import/src/swe/drawings.rs` | #307 |
-| SolidWorks Electrical: page revisions are read from `tew_revision` by column name (the layout is not published), checked on synthetic databases only; the project's own revision and checked-by are not read | `crates/wc-import/src/swe.rs` | #170 |
-| SolidWorks Electrical libraries (`import swe-library`): catalog parts bring their terminals as a text property, not as pins of a symbol; library blocks without a readable DWG file in the archive stay box symbols | `crates/wc-import/src/swe/library.rs` | #59 |
+| SolidWorks Electrical: symbol and page graphics come from the archive's DWG files (`Block/<name>.dwg`, `Projects/<n>/Drawings/<page id>.ewg`); the file layout is checked on synthetic archives only, texts of a symbol scaled differently along x and y keep their size from the mean scale (its circles and arcs are drawn as ellipses since #307), and a bare database import still draws boxes | `crates/wc-import/src/swe/drawings.rs` | Known limit: no real archive to check against |
+| SolidWorks Electrical: page revisions, and the project's revision and checked by from the book's revision rows (since #170), are read from `tew_revision` by column name (the layout is not published), checked on synthetic databases only; with several books the first book's row wins, with a warning when they differ | `crates/wc-import/src/swe.rs` | Known limit: no real database to check against |
+| SolidWorks Electrical libraries (`import swe-library`): catalog parts bring their terminals as a text property, not as pins of a symbol; library blocks are drawn from their DWG files (#59), and blocks without a readable DWG file in the archive stay box symbols | `crates/wc-import/src/swe/library.rs` | Known limit: a catalog part names no symbol, so its terminals stay a property |
 | PDF trace: pictures in other sample layouts than 1-bit gray, 8- or 16-bit gray and RGB and 8-bit CMYK, are refused ("not supported yet"). LZW, CMYK and 16-bit are read since #171; CCITT fax (G3 and G4), JBIG2 and JPEG 2000 since #271, RunLength since #418, checked on small generated samples only (a JPEG 2000 alpha channel is dropped; JBIG2 symbol dictionaries shared through `JBIG2Globals` are tested since #518, and a picture that refers to a segment neither it nor its `JBIG2Globals` holds in full is refused with a message instead of coming out blank since #523; segments after the end of the file segment are not read). The JBIG2 decoder stops once its bitmaps (regions, pattern and symbol dictionaries, page) go over a 256 MiB limit, half for the shared `JBIG2Globals` segments and half for the page, less what symbol dictionaries keep outside it, their decoder contexts and export lists (counted from their headers); text-like scans with symbol dictionaries are read since #423, using an unreleased `hayro-jbig2` commit until a release has the memory limit | `crates/wc-import/src/pdf.rs`, `crates/wc-import/src/pdf_codecs.rs` | #517 (crates.io release) |
 | SolidWorks Electrical cabinet layouts: items are sorted by block name (rail, duct, plate) since the database has no item kind; a footprint without a box size takes the box round its block's DWG drawing, else its catalog part's width and height, else 18 x 90 mm; upright rails are left out (WiringCraft rails run left to right) | `crates/wc-import/src/swe/cabinet.rs` | Known limit: the database has no item kind, so sorting by name stays |
 | Binary DXF | `crates/wc-import/src/dxf.rs` | Not planned: the error tells the user to save as ASCII DXF, which every CAD program can do. |
-| DWG | `crates/wc-import/src/dwg.rs` | Read for AutoCAD 2004, 2007 and 2010 drawings only (2007 checked against one real file, #215; its class section is read as the specification gives it, like 2010 without the second size field, and has only been checked with drawings the tests write); 2004 texts in a code page the reader has no table for (the multi-byte Chinese, Japanese and Korean pages, the DOS pages, ISO 8859 pages other than 8859-1) are read with the legacy decoder, UTF-8 when the bytes are and else byte for byte as Latin-1 (with the euro sign and the two dashes of Windows-1252), with a warning; a DWG page import (`import page-dwg`) still goes through an installed DWG to DXF converter. |
+| DWG | `crates/wc-import/src/dwg.rs` | Read for AutoCAD 2004, 2007 and 2010 drawings only (2007 checked against one real file, #215; its class section is read as the specification gives it, like 2010 without the second size field, and has only been checked with drawings the tests write); 2004 texts in a code page the reader has no table for (the multi-byte Chinese, Japanese and Korean pages, the DOS pages, ISO 8859 pages other than 8859-1) are read with the legacy decoder, UTF-8 when the bytes are and else byte for byte as Latin-1 (with the euro sign and the two dashes of Windows-1252), with a warning; a DWG page import (`import page-dwg`) still goes through an installed DWG to DXF converter. AutoCAD 2013 and 2018 drawings: #292 (pull request #299 open); multi-line attributes of 2018 drawings: #300. |
 | STEP (3D) | `docs/manufacturer-data.md` | Later: 3D belongs to the one-way export to SolidCraft (phase 5). |
 
 ## Editing and app
 
 | Gap | Todo |
 |---|---|
-| A page's own title-block fields (revision, date, checked by) only come from an import; the app, CLI and assistant cannot edit them | #169 |
-| Wire route styles | #52 (pull request #87) |
-| Delete in the wire right-click menu | #88 |
-| Row letters and grid coordinates | #54 (pull request #90) |
-| Assistant runs slow tools on the window thread | #67 |
+| Imports in the app run on the window thread: a large archive freezes the window with no progress shown | #356 |
+| Open, Save As, exports and imports do not all use the system file pickers | #338 (pull requests #344 and #349 open) |
+| Assistant: `get_report` cannot read the plc-cards and networks reports | #537 |
+| Assistant: `add_graphic` and `update_graphic` cannot make dimensions or filled polylines | #539 |
+| Assistant: the `run_command` tool description leaves out half the command line | #540 |
+| Starter library: symbols and example parts still missing (timer relays, motor protection, process switches, sensors, drives, special terminals, lamp and button colours) | #531 to #536, #538 |
+
+Fixed since the first audit: wire route styles (#52), Delete in the wire right-click menu (#88),
+row letters and grid coordinates (#54), slow assistant tools off the window thread (#67), and
+editing a page's own title-block fields in the app, CLI and assistant (#169).
 
 ## Shared sessions
 
-The core (#79), the network transport (#74), discovery (#75) and the app's Share session and
-Join session (#76) are in. In a session the app sends every change to the open page as one page
+Shared sessions (#43) are done: the core (#79), the network transport (#74), discovery (#75) and
+the app's Share session and Join session (#76) are in. In a session the app sends every change to the open page as one page
 edit and project-level changes (devices, comments, panels, pages, project properties) as project
 edits. Tools that change pages nobody else has open (wire numbering, a tag renamed on every page)
 send those pages together as one change (#77); wire numbering leaves pages other people hold as
@@ -92,4 +92,4 @@ versions were sent (counted as version 0) only shows that the host declined.
 
 | Gap | Todo |
 |---|---|
-| Full EPLAN / SolidWorks Electrical feature list with triage | #55 ([feature-matrix.md](feature-matrix.md)) |
+| Full EPLAN / SolidWorks Electrical feature list with triage | Done (#55): [feature-matrix.md](feature-matrix.md) |
