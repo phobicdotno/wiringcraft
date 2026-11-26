@@ -359,6 +359,70 @@ mod tests {
     }
 
     #[test]
+    fn dragging_an_edge_device_outward_takes_no_undo_step() {
+        let (_tmp, mut o) = crate::state::tests::project();
+        let mut plate = wc_core::panel::Panel::new("pl1", "Plate", 200.0, 100.0);
+        plate.items.push(PanelItem::Device {
+            tag: wc_core::DeviceTag::parse("-K1").unwrap_or_default(),
+            at: Point::new(0.0, 0.0),
+            width: 20.0,
+            height: 20.0,
+            rotation: wc_core::geom::Rotation::R0,
+        });
+        o.project.panels.push(plate);
+        o.dirty = false;
+        let panel = o.project.panels.len() - 1;
+        assert!(!o.can_undo());
+        let mut ed = Editor::default();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut frame = |o: &mut Open, ed: &mut Editor, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 600.0))),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| show(ui, o, ed, panel, 0.0));
+            });
+        };
+        // Find where the device's middle (10, 10 mm) is on screen.
+        let probe = egui::pos2(400.0, 300.0);
+        frame(&mut o, &mut ed, vec![egui::Event::PointerMoved(probe)]);
+        frame(&mut o, &mut ed, vec![egui::Event::PointerMoved(probe)]);
+        let Some(c) = ed.cursor else {
+            unreachable!("the pointer is over the plate")
+        };
+        let z = ed.view.zoom;
+        let start = probe + Vec2::new((10.0 - c.x) as f32 * z, (10.0 - c.y) as f32 * z);
+        let button = |at: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        frame(
+            &mut o,
+            &mut ed,
+            vec![egui::Event::PointerMoved(start), button(start, true)],
+        );
+        // Drag left, past the plate's left edge, in 10 px steps.
+        let mut at = start;
+        for _ in 0..4 {
+            at.x -= 10.0;
+            frame(&mut o, &mut ed, vec![egui::Event::PointerMoved(at)]);
+        }
+        frame(&mut o, &mut ed, vec![button(at, false)]);
+        frame(&mut o, &mut ed, Vec::new());
+        assert!(matches!(
+            o.project.panels[panel].items[0],
+            PanelItem::Device { at, .. } if at == Point::new(0.0, 0.0)
+        ));
+        assert!(!o.can_undo(), "no undo step for a drag that moves nothing");
+        assert!(!o.dirty, "the project is not marked as changed");
+    }
+
+    #[test]
     fn picks_a_turned_device_by_its_turned_outline() {
         let items = vec![PanelItem::Device {
             tag: wc_core::DeviceTag::parse("-G1").unwrap_or_default(),
