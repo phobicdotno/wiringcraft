@@ -50,6 +50,8 @@ pub const CLASSES_DAMAGED: &str = "class section damaged (custom entities not co
 /// The skipped-count key for blocks whose base point could not be read: they are kept, placed
 /// as if their base point were (0, 0).
 pub const BASE_UNREAD: &str = "block base points not read (placed from 0, 0)";
+/// The skipped-count key for INSERTs whose block is not in the drawing (or could not be read).
+pub const UNRESOLVED_INSERT: &str = "block references to a block that is not in the drawing (not drawn)";
 /// The key under which entities whose owner is not in the drawing are counted.
 pub const ORPHANS: &str = "entities without an owner";
 
@@ -1244,9 +1246,7 @@ fn lwpolyline(o: &mut Object, e: &mut Codes) -> Result<()> {
     }
     let z = if flags & 1 != 0 { d.bd3()?.2 } else { 1.0 };
     let points = d.bl()?;
-    if flags & 16 != 0 {
-        d.bl()?;
-    }
+    let bulges = if flags & 16 != 0 { d.bl()? } else { 0 };
     if o.version >= Version::R2010 && flags & 1024 != 0 {
         d.bl()?;
     }
@@ -1254,6 +1254,9 @@ fn lwpolyline(o: &mut Object, e: &mut Codes) -> Result<()> {
         d.bl()?;
     }
     e.i(70, i64::from(flags & 512 != 0)).f(230, z);
+    // The points come first and their bulges after them; each bulge goes (as code 42) after
+    // the point that starts its segment.
+    let mut at = Vec::new();
     let (mut x, mut y) = (0.0, 0.0);
     for i in 0..points {
         if i == 0 {
@@ -1262,7 +1265,19 @@ fn lwpolyline(o: &mut Object, e: &mut Codes) -> Result<()> {
             x = d.dd(x)?;
             y = d.dd(y)?;
         }
+        at.push((x, y));
+    }
+    let mut bulge = Vec::new();
+    for _ in 0..bulges {
+        bulge.push(d.rd()?);
+    }
+    for (i, (x, y)) in at.into_iter().enumerate() {
         e.f(10, x).f(20, y);
+        if let Some(&b) = bulge.get(i)
+            && b != 0.0
+        {
+            e.f(42, b);
+        }
     }
     Ok(())
 }
@@ -1346,10 +1361,15 @@ impl Decoded {
                     None => *skipped.entry("DIMENSION".to_owned()).or_default() += 1,
                 },
                 "INSERT" => {
-                    if let Some(name) = item.block.and_then(|b| blocks.get(&b)) {
-                        entity.codes.push((2, name.clone()));
+                    // A reference to a block that is not there draws nothing: counted, while
+                    // its attributes are still drawn.
+                    match item.block.and_then(|b| blocks.get(&b)) {
+                        Some(name) => {
+                            entity.codes.push((2, name.clone()));
+                            list.push(entity);
+                        }
+                        None => *skipped.entry(UNRESOLVED_INSERT.to_owned()).or_default() += 1,
                     }
-                    list.push(entity);
                     for a in own.iter().filter(|c| c.entity.kind == "ATTRIB") {
                         if (a.entity.f(70) as i64) & 1 == 0 {
                             list.push(with_layer(&a.entity, a.layer, &layers));

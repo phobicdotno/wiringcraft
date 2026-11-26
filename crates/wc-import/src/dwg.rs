@@ -97,13 +97,23 @@ fn page_from(
     notes.extend(read.warnings.iter().cloned());
     let mut skipped = read.skipped.clone();
     skipped.remove(objects::CLASSES_DAMAGED);
-    if let Some(n) = skipped.remove(objects::DAMAGED) {
-        let first = objects_why.first().map(String::as_str).unwrap_or("");
+    // The objects' reasons come first, then those of the base points.
+    let damaged = skipped.remove(objects::DAMAGED);
+    let (object_why, base_why) = objects_why.split_at(damaged.unwrap_or(0).min(objects_why.len()));
+    if let Some(n) = damaged {
+        let first = object_why.first().map(String::as_str).unwrap_or("");
         notes.push(format!(
             "{n} object(s) could not be read and are not drawn, the first because of: {first}"
         ));
     }
-    for kind in [objects::BASE_UNREAD, objects::ORPHANS] {
+    if let Some(n) = skipped.remove(objects::BASE_UNREAD) {
+        let kind = objects::BASE_UNREAD;
+        match base_why.first() {
+            Some(first) => notes.push(format!("{n} {kind}, the first because of: {first}")),
+            None => notes.push(format!("{n} {kind}")),
+        }
+    }
+    for kind in [objects::UNRESOLVED_INSERT, objects::ORPHANS] {
         if let Some(n) = skipped.remove(kind) {
             notes.push(format!("{n} {kind}"));
         }

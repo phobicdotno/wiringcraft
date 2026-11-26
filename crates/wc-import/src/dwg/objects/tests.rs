@@ -1423,6 +1423,82 @@ fn a_block_whose_base_point_is_cut_off_is_kept_and_said() -> TestResult {
         "{:?}",
         read.damaged
     );
+    // A page says why, not only how many.
+    let mut objs = objs;
+    objs.push(line(v, 0x201, head(None), (0.0, 0.0), (10.0, 0.0)));
+    let page = crate::dwg::page_of(&sections(v, &objs, &[]), 1.0, &Default::default())?;
+    assert!(
+        page.warnings
+            .iter()
+            .any(|w| w.starts_with("1 block base points not read") && w.contains("base point of block CUT")),
+        "{:?}",
+        page.warnings
+    );
+    Ok(())
+}
+
+#[test]
+fn a_reference_to_a_missing_block_is_counted_and_the_rest_drawn() -> TestResult {
+    for v in [Version::R2004, Version::R2010, Version::R2018] {
+        let mut i = entity(v, 7, 0x201, head(None));
+        i.data.bd3((0.0, 0.0, 0.0)).bb(3).bd(0.0).bd3((0.0, 0.0, 1.0)).b(false);
+        i.handles.h(5, 0x999);
+        let objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            line(v, 0x200, head(None), (0.0, 0.0), (10.0, 0.0)),
+            i,
+        ];
+        let read = dxf_drawing(&sections(v, &objs, &[]))?;
+        assert_eq!(
+            read.skipped.get(UNRESOLVED_INSERT),
+            Some(&1),
+            "{v:?}: {:?}",
+            read.skipped
+        );
+        let page = crate::dwg::page_of(&sections(v, &objs, &[]), 1.0, &Default::default())?;
+        assert!(!page.graphics.is_empty(), "{v:?}: the line is drawn");
+        assert!(
+            page.warnings
+                .iter()
+                .any(|w| w.starts_with("1 block references to a block that is not in the drawing")),
+            "{v:?}: {:?}",
+            page.warnings
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_bulged_lightweight_polyline_is_drawn_with_its_arc() -> TestResult {
+    for v in [Version::R2004, Version::R2010, Version::R2018] {
+        // Open, two points 10 apart, the segment between them a half circle (bulge 1); from
+        // 2010 on with vertex ids too, which come after the bulges.
+        let ids = v >= Version::R2010;
+        let mut p = entity(v, 77, 0x200, head(None));
+        p.data.bs(if ids { 16 | 1024 } else { 16 }).bl(2).bl(2);
+        if ids {
+            p.data.bl(2);
+        }
+        p.data.rd(0.0).rd(0.0).dd(10.0, 0.0).dd(0.0, 0.0).rd(1.0).rd(0.0);
+        if ids {
+            p.data.bl(1).bl(2);
+        }
+        let objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            p,
+        ];
+        let d = drawing(&sections(v, &objs, &[]))?;
+        assert!(d.skipped.is_empty(), "{v:?}: {:?}", d.skipped);
+        // Not a straight line: the arc's middle is 5 off the chord.
+        let off_chord = |s: &Shape| match s {
+            Shape::Polyline { points, .. } => points.iter().any(|p| (p.y.abs() - 5.0).abs() < 1e-6),
+            Shape::Arc { radius, .. } => (*radius - 5.0).abs() < 1e-6,
+            _ => false,
+        };
+        assert!(d.model.iter().any(off_chord), "{v:?}: {:?}", d.model);
+    }
     Ok(())
 }
 
