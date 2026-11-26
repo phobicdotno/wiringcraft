@@ -289,8 +289,17 @@ pub fn save_lock(dir: &Path, project: &Project) -> Result<bool> {
 /// Save a project folder. Page files of deleted pages are removed. Returns the files written.
 ///
 /// Ids that differ only in case are refused before anything is written: on a folder that ignores
-/// case (macOS and Windows by default) they would be one file.
+/// case (macOS and Windows by default) they would be one file. A page or panel id that cannot be
+/// a file name ([`check_id`]) is refused before anything is written too.
 pub fn save(dir: &Path, project: &Project) -> Result<Vec<PathBuf>> {
+    for id in project
+        .pages
+        .iter()
+        .map(|p| &p.id)
+        .chain(project.panels.iter().map(|p| &p.id))
+    {
+        check_id(id)?;
+    }
     unique_ignoring_case("page", project.pages.iter().map(|p| p.id.as_str()))?;
     unique_ignoring_case("panel", project.panels.iter().map(|p| p.id.as_str()))?;
     let mut written = Vec::new();
@@ -938,6 +947,23 @@ mod tests {
         p.panels.push(twin);
         let err = refused(save(dir.path(), &p))?;
         assert!(err.contains("panel ids"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_bad_page_or_panel_id_is_refused_before_anything_is_written() -> Result<()> {
+        for bad_page in [true, false] {
+            let dir = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
+            let mut p = sample()?;
+            if bad_page {
+                p.pages[0].id = "nul".into();
+            } else {
+                p.panels[0].id = "../x".into();
+            }
+            refused(save(dir.path(), &p))?;
+            let left = fs::read_dir(dir.path()).map_err(|e| Error::io(dir.path(), e))?.count();
+            assert_eq!(left, 0, "the folder stays empty (bad page id: {bad_page})");
+        }
         Ok(())
     }
 
