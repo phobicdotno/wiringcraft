@@ -254,26 +254,9 @@ impl Table {
                 .replace('<', "&lt;")
                 .replace('>', "&gt;")
         };
-        // In a cell, Markdown punctuation gets a backslash so the table shows the text as typed:
-        // `*spare*` is not italic, `motor_1_ready` keeps its underscores, `` `X1` `` is not code.
-        // A backslash is doubled, so a cell ending in `\` does not escape the column bar after
-        // it. Letters, digits, spaces and other characters stay as they are.
-        let cell = |s: &str| {
-            let mut out = String::with_capacity(s.len());
-            let mut chars = s.chars().peekable();
-            while let Some(c) = chars.next() {
-                match c {
-                    '\\' | '|' | '`' | '*' | '_' | '[' | ']' | '~' | '&' => {
-                        out.push('\\');
-                        out.push(c);
-                    }
-                    '!' if chars.peek() == Some(&'[') => out.push_str("\\!"),
-                    '#' if out.is_empty() => out.push_str("\\#"),
-                    _ => out.push(c),
-                }
-            }
-            line(&out)
-        };
+        // In a cell, Markdown punctuation gets a backslash so the table shows the text as typed
+        // (see `markdown_cell`); line ends and `<`, `>` are handled as for the title.
+        let cell = |s: &str| line(&markdown_cell(s));
         let mut out = format!(
             "## {}\n\n| {} |\n|{}\n",
             line(&self.title),
@@ -288,6 +271,82 @@ impl Table {
         }
         out
     }
+}
+
+/// One cell's text for a Markdown table, before line ends and `<`, `>` are handled.
+///
+/// Markdown punctuation gets a backslash so the table shows the text as typed: `*spare*` is
+/// not italic, `motor_1_ready` keeps its underscores, `` `X1` `` is not code. A backslash is
+/// doubled, so a cell ending in `\` does not escape the column bar after it.
+///
+/// A word that a Markdown viewer turns into a link by itself (one starting with `http://`,
+/// `https://` or `www.`, or an e-mail address) keeps its characters, because a backslash there
+/// would end up in the link. Only `\` and `|` are escaped in it, so the table stays whole.
+fn markdown_cell(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while !rest.is_empty() {
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let word = &rest[..end];
+        // Characters before the link that Markdown still lets a link start after.
+        let lead = word.len() - word.trim_start_matches(['*', '_', '~', '(']).len();
+        let (before, link) = word.split_at(lead);
+        markdown_text(before, &mut out);
+        if is_autolink(link) {
+            // Markdown leaves trailing punctuation out of the link: that part is plain text.
+            let body = link.trim_end_matches(['?', '!', '.', ',', ':', '*', '_', '~']);
+            for c in body.chars() {
+                if matches!(c, '\\' | '|') {
+                    out.push('\\');
+                }
+                out.push(c);
+            }
+            markdown_text(&link[body.len()..], &mut out);
+        } else {
+            markdown_text(link, &mut out);
+        }
+        let space = rest[end..].len() - rest[end..].trim_start().len();
+        out.push_str(&rest[end..end + space]);
+        rest = &rest[end + space..];
+    }
+    out
+}
+
+/// Escapes the Markdown punctuation in plain cell text (see `markdown_cell`).
+fn markdown_text(s: &str, out: &mut String) {
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' | '|' | '`' | '*' | '_' | '[' | ']' | '~' | '&' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '!' if chars.peek() == Some(&'[') => out.push_str("\\!"),
+            '#' if out.is_empty() => out.push_str("\\#"),
+            _ => out.push(c),
+        }
+    }
+}
+
+/// Whether a Markdown viewer turns this word into a link by itself: a web address starting
+/// with `http://`, `https://` or `www.`, or an e-mail address such as `a_b@example.com`.
+fn is_autolink(word: &str) -> bool {
+    let lower = word.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") || word.starts_with("www.") {
+        return true;
+    }
+    let Some((name, domain)) = word.split_once('@') else {
+        return false;
+    };
+    let domain = domain.trim_end_matches(['.', ',', ':', '!', '?']);
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-' | '_'))
+        && domain.contains('.')
+        && domain
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
 }
 
 /// A cell as a spreadsheet should show it: text that Excel or LibreOffice would run as a formula

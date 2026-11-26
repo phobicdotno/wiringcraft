@@ -3177,3 +3177,16 @@ fn markdown_cells_show_markdown_characters_as_typed() {
          | \\#1 | -K1 2.5 mm² plain |\n"
     );
 }
+
+#[test]
+fn markdown_cells_keep_links_as_typed() {
+    let mut t = Table::new("Links", &["Text"]);
+    t.rows.push(vec!["see https://example.com/a_b *x*".into()]);
+    t.rows.push(vec!["(www.x.no/a_b|c), mail a_b@x.no or a_b@c".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Links\n\n| Text |\n|---|\n\
+         | see https://example.com/a_b \\*x\\* |\n\
+         | (www.x.no/a_b\\|c), mail a_b@x.no or a\\_b@c |\n"
+    );
+}
