@@ -4357,8 +4357,13 @@ fn repair_file(path: &Path, should: Option<&[u8]>, found: &Found) -> std::io::Re
     }
     let moved = match std::fs::symlink_metadata(path) {
         Ok(m) if m.is_file() || m.is_symlink() => {
-            let aside = unused_beside(path, "aside")?;
-            std::fs::rename(path, &aside)?;
+            // The name is reserved first (a new empty file, `create_new`), so the move can only
+            // replace this call's own placeholder, never an entry another program made there.
+            let aside = reserve_beside(path, "aside")?;
+            if let Err(e) = std::fs::rename(path, &aside) {
+                let _ = std::fs::remove_file(&aside);
+                return Err(e);
+            }
             Some(aside)
         }
         Ok(_) => return restore_file(path, should).map(|()| Repair::Done),
@@ -4397,7 +4402,12 @@ fn repair_file(path: &Path, should: Option<&[u8]>, found: &Found) -> std::io::Re
                 aside.display()
             )));
         }
-        std::fs::remove_file(aside)?;
+        std::fs::remove_file(aside).map_err(|e| {
+            std::io::Error::other(format!(
+                "the project's version is in place, but the file that was there could not be removed from {}: {e}",
+                aside.display()
+            ))
+        })?;
         Ok(None)
     };
     let stamp_at = moved.as_deref().unwrap_or(path);
@@ -4463,6 +4473,20 @@ fn write_staging_beside(path: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
                 }
                 return Ok(new);
             }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other("no free name next to it"))
+}
+
+/// A new empty file next to `path` ([`unused_beside`]), created here (`create_new`), that holds
+/// the name for a file of a repair (`what`) until it is renamed over.
+fn reserve_beside(path: &Path, what: &str) -> std::io::Result<PathBuf> {
+    for _ in 0..10 {
+        let name = unused_beside(path, what)?;
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&name) {
+            Ok(_) => return Ok(name),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         }
@@ -4927,6 +4951,19 @@ pub(crate) mod tests {
         o.keep_outside_version(&path);
         o.save().unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), outside);
+    }
+
+    /// A reserved name is a file made by the reservation itself, so a second reservation (or
+    /// another program) never gets the same one (#670).
+    #[test]
+    fn a_reserved_repair_name_is_held_by_a_new_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("m.yaml");
+        let first = reserve_beside(&path, "aside").unwrap();
+        assert!(first.is_file());
+        let second = reserve_beside(&path, "aside").unwrap();
+        assert_ne!(first, second);
+        assert!(second.is_file());
     }
 
     /// The repair itself: a waiting deletion or replacement is done when the file holds what
