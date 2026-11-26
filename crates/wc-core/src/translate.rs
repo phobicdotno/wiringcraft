@@ -558,7 +558,8 @@ nb = ""
             "nb",
             "Pumpene",
             || {
-                let _ = std::fs::write(&path, &other);
+                let wrote = std::fs::write(&path, &other);
+                assert!(wrote.is_ok(), "the other writer could not write: {wrote:?}");
             },
             || {},
         );
@@ -579,7 +580,8 @@ nb = ""
             "nb",
             "Pumper",
             || {
-                let _ = std::fs::write(&new, "source = \"en\"\n");
+                let wrote = std::fs::write(&new, "source = \"en\"\n");
+                assert!(wrote.is_ok(), "the other writer could not write: {wrote:?}");
             },
             || {},
         );
@@ -641,7 +643,8 @@ nb = ""
             "Pumpene",
             || {},
             || {
-                let _ = std::fs::write(&path, &other);
+                let wrote = std::fs::write(&path, &other);
+                assert!(wrote.is_ok(), "the other writer could not write: {wrote:?}");
             },
         );
         assert!(r?);
