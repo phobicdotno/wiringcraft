@@ -519,6 +519,8 @@ impl chrome::Status for StatusView<'_> {
             Action::Redo if self.sharing => self.share_redo,
             Action::DeletePage => self.open.is_some_and(|o| o.project.pages.len() > 1),
             Action::ArrangePanel | Action::DeletePanel => has && self.ed.panel.is_some(),
+            // The panel view shows no schematic page for these to work on (#824).
+            Action::SelectAll | Action::Copy | Action::Cut | Action::Paste if self.ed.panel.is_some() => false,
             Action::PageUp => has && self.ed.page > 0,
             Action::PageDown => self.open.is_some_and(|o| self.ed.page + 1 < o.project.pages.len()),
             Action::PrevPage => has && self.ed.page > 0,
@@ -1602,6 +1604,12 @@ impl App {
                     self.dialog = Some(Dialog::Message(format!("Undo or redo was not done:\n{e}")));
                 }
             }
+            // Before the panel's own Delete: a panel device being dragged stays too.
+            Action::Delete | Action::Cut if self.ed.dragging() => {
+                // A delete would change the drag's history under it, and Escape could no
+                // longer take the move back (#863).
+                self.ed.message = "Let go of the move first, then delete.".into();
+            }
             Action::Delete if self.ed.panel.is_some() => {
                 if let (Some(pi), Some(item)) = (self.ed.panel, self.ed.panel_pick.take()) {
                     open.delete_panel_item(pi, item);
@@ -1670,6 +1678,13 @@ impl App {
             }
             Action::Rotate => open.rotate_many(page, &self.ed.selection),
             Action::Mirror => open.mirror_many(page, &self.ed.selection),
+            // From the keyboard too: the schematic page is hidden behind the panel (#824).
+            Action::SelectAll | Action::Copy | Action::Cut | Action::Paste if self.ed.panel.is_some() => {
+                self.ed.message = format!(
+                    "{} works on schematic pages: close the panel layout first.",
+                    a.info().label
+                );
+            }
             Action::SelectAll => {
                 self.ed.tool = Tool::Select;
                 self.ed.selection = self.prefs.layers.keep(open.select_all(page));
@@ -6147,10 +6162,10 @@ fn follow_panel_pick(
 /// is shown; canvas actions only when the page itself is shown, as in the panel view they work
 /// on the panel.
 fn held_for(a: Action, ed: &Editor, project: &wc_core::Project) -> Option<String> {
-    // With a panel shown these still work on the schematic page under it (Delete and Rotate go
-    // to the panel's picked device instead), so they follow that page's hold.
-    let on_page_under_panel =
-        ed.panel.is_some() && matches!(a, Action::Paste | Action::Duplicate | Action::Cut | Action::Mirror);
+    // With a panel shown Duplicate and Mirror still work on the schematic page under it (Delete
+    // and Rotate go to the panel's picked device instead; Select all, Copy, Cut and Paste are
+    // off), so they follow that page's hold.
+    let on_page_under_panel = ed.panel.is_some() && matches!(a, Action::Duplicate | Action::Mirror);
     let name = if a.edits_page_itself() || on_page_under_panel {
         let page = project.pages.get(ed.page)?;
         // Moving a page up or down renumbers its neighbour too.
@@ -7387,6 +7402,38 @@ mod nudge_tests {
     }
 
     #[test]
+    fn delete_waits_for_a_panel_device_drag_to_end() {
+        use wc_core::panel::{Panel, PanelItem};
+        let (_tmp, mut app, _ctx) = app(Point::new(80.0, 60.0), false);
+        let open = app.open.as_mut().unwrap();
+        open.project.panels.push(Panel {
+            id: "panel1".into(),
+            name: "Panel 1".into(),
+            width: 400.0,
+            height: 300.0,
+            items: vec![PanelItem::Device {
+                tag: wc_core::DeviceTag::parse("-K1").unwrap(),
+                at: Point::new(100.0, 100.0),
+                width: 40.0,
+                height: 60.0,
+                rotation: wc_core::geom::Rotation::R0,
+            }],
+        });
+        let panel = open.project.panels.len() - 1;
+        app.ed.panel = Some(panel);
+        app.ed.panel_pick = Some(0);
+        let items = |app: &App| app.open.as_ref().unwrap().project.panels[panel].items.len();
+        app.ed.panel_drag = Some((Point::new(100.0, 100.0), None, Point::new(0.0, 0.0)));
+        app.carry_out(Action::Delete);
+        assert_eq!(items(&app), 1, "the held device stays");
+        assert_eq!(app.ed.panel_pick, Some(0), "and stays picked");
+        assert!(app.ed.message.contains("Let go"), "{}", app.ed.message);
+        app.ed.panel_drag = None;
+        app.carry_out(Action::Delete);
+        assert_eq!(items(&app), 0, "after letting go, Delete removes it");
+    }
+
+    #[test]
     fn an_arrow_press_through_the_app_frame_leaves_the_panel_device_alone_behind_a_dialog() {
         use wc_core::panel::{Panel, PanelItem};
         let (_tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
@@ -7607,11 +7654,11 @@ mod held_tests {
         ed.held_by.insert("p1".into(), "Kim".into());
         // On the page itself, Rotate turns its symbols: held.
         assert_eq!(held_for(Action::Rotate, &ed, &project).as_deref(), Some("Kim"));
-        // With a panel shown, Rotate turns the picked panel device: not held; Paste still is.
+        // With a panel shown, Rotate turns the picked panel device: not held; Mirror still is.
         ed.panel = Some(0);
         ed.panel_pick = Some(0);
         assert_eq!(held_for(Action::Rotate, &ed, &project), None);
-        assert_eq!(held_for(Action::Paste, &ed, &project).as_deref(), Some("Kim"));
+        assert_eq!(held_for(Action::Mirror, &ed, &project).as_deref(), Some("Kim"));
     }
 
     #[test]
