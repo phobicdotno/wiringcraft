@@ -3841,6 +3841,7 @@ dependencies = [
  "thiserror 2.0.21",
  "wc-core",
  "wc-library",
+ "wc-pdf",
  "wc-report",
  "zip",
 ]

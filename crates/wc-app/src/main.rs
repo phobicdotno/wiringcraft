@@ -390,7 +390,8 @@ enum Pending {
     SaveAs,
     Export(Export),
     Marking(wc_report::MarkingOptions),
-    ReportCsv(wc_report::Kind),
+    /// Reports > Save as CSV; `true` for Excel: `;`-separated with a UTF-8 byte order mark.
+    ReportCsv(wc_report::Kind, bool),
     /// File > Import; for parts, the library folder picked in the dialog (none: ask with the
     /// folder picker).
     Import(imports::Kind, Option<import_symbols::ImportTarget>),
@@ -984,9 +985,14 @@ impl App {
                 };
                 self.dialog = Some(Dialog::Message(msg));
             }
-            Pending::ReportCsv(kind) => {
+            Pending::ReportCsv(kind, excel) => {
                 let default = open.dir.join("export").join(format!("{}.csv", kind.name()));
-                let (path, note) = match export_target("Save report as CSV", &default, ("CSV", &["csv"]), &pick_save) {
+                let title = if excel {
+                    "Save report as CSV for Excel"
+                } else {
+                    "Save report as CSV"
+                };
+                let (path, note) = match export_target(title, &default, ("CSV", &["csv"]), &pick_save) {
                     Ok(target) => target,
                     Err(why) => {
                         if let Some(why) = why {
@@ -1001,7 +1007,7 @@ impl App {
                     parts: &open.parts,
                 };
                 let table = wc_report::build(kind, &inputs);
-                self.ed.message = match write_creating(&path, table.to_csv()) {
+                self.ed.message = match write_creating(&path, report_csv(&table, excel)) {
                     Ok(()) => format!("{}Saved {}", note.replace("\n\n", " "), path.display()),
                     Err(e) => format!("Could not save {}: {e}", path.display()),
                 };
@@ -3095,7 +3101,15 @@ impl App {
                         ui.horizontal(|ui| {
                             if ui.button("Save as CSV…").clicked() {
                                 let kind = *kind;
-                                then = Some(Box::new(move |app: &mut App| app.ask(Pending::ReportCsv(kind))));
+                                then = Some(Box::new(move |app: &mut App| app.ask(Pending::ReportCsv(kind, false))));
+                            }
+                            if ui
+                                .button("Save as CSV for Excel (semicolon)…")
+                                .on_hover_text("Semicolon-separated with a UTF-8 byte order mark, so Excel opens it in columns with æ ø å intact")
+                                .clicked()
+                            {
+                                let kind = *kind;
+                                then = Some(Box::new(move |app: &mut App| app.ask(Pending::ReportCsv(kind, true))));
                             }
                             if ui.button("Save as Excel").clicked() {
                                 let path = o.dir.join("export").join(format!("{}.xlsx", kind.name()));
@@ -4421,6 +4435,17 @@ fn export_whole(open: &Open, kind: Export, pick: PickSave<'_>) -> Option<String>
         _ => export_wago_configurator_to(open, &path),
     };
     Some(note + &msg)
+}
+
+/// A report's CSV text: plain comma CSV, or for Excel (`excel`) `;`-separated with a leading
+/// UTF-8 byte order mark, as `wiringcraft report --sep ";"` writes it, so Excel in a
+/// comma-decimal locale splits the columns and reads æ ø å right.
+fn report_csv(table: &wc_report::Table, excel: bool) -> String {
+    if excel {
+        format!("\u{feff}{}", table.to_csv_with(';'))
+    } else {
+        table.to_csv()
+    }
 }
 
 /// Write a file, making its folder first.
@@ -5795,6 +5820,32 @@ fn changed_fields(
         })
         .cloned()
         .collect()
+}
+
+#[cfg(test)]
+mod report_csv_tests {
+    use super::report_csv;
+
+    fn table() -> wc_report::Table {
+        wc_report::Table {
+            columns: vec!["Tag".into(), "Note".into()],
+            rows: vec![vec!["K1".into(), "Relé, 24 V".into()]],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn excel_csv_is_semicolon_separated_with_a_utf8_bom() {
+        let bytes = report_csv(&table(), true).into_bytes();
+        let mut want = vec![0xEF, 0xBB, 0xBF];
+        want.extend_from_slice("Tag;Note\r\nK1;Relé, 24 V\r\n".as_bytes());
+        assert_eq!(bytes, want);
+    }
+
+    #[test]
+    fn plain_csv_is_comma_separated_without_a_bom() {
+        assert_eq!(report_csv(&table(), false), "Tag,Note\r\nK1,\"Relé, 24 V\"\r\n");
+    }
 }
 
 #[cfg(test)]
