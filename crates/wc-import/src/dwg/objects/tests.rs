@@ -54,6 +54,17 @@ impl W {
             _ => self.bb(0).rs(v),
         }
     }
+    /// A SPLINE's scenario (1 control points, 2 fit points); from 2013 on followed by the
+    /// spline flags (bit 1: fit points) and the knot parameter (15: custom knots) that say
+    /// the same.
+    fn scenario(&mut self, v: Version, scenario: u32) -> &mut Self {
+        self.bl(scenario);
+        if v >= Version::R2013 {
+            let fit = scenario == 2;
+            self.bl(u32::from(fit)).bl(if scenario == 1 { 15 } else { 0 });
+        }
+        self
+    }
     fn bl(&mut self, v: u32) -> &mut Self {
         match v {
             0 => self.bb(2),
@@ -1917,7 +1928,7 @@ fn ellipses_and_splines_are_drawn() -> TestResult {
         // A quadratic spline by control points: (0, 0), (5, 10), (10, 0).
         let mut sp = entity(v, 36, 0x301, model);
         sp.data
-            .bl(1)
+            .scenario(v, 1)
             .bl(2)
             .b(false)
             .b(false)
@@ -1936,7 +1947,7 @@ fn ellipses_and_splines_are_drawn() -> TestResult {
         // A spline by fit points only.
         let mut fit = entity(v, 36, 0x302, model);
         fit.data
-            .bl(2)
+            .scenario(v, 2)
             .bl(3)
             .bd(1e-7)
             .bd3((1.0, 0.0, 0.0))
@@ -1989,7 +2000,7 @@ fn a_spline_listing_too_much_is_a_damaged_object() -> TestResult {
     let v = Version::R2010;
     let mut sp = entity(v, 36, 0x301, head(None));
     sp.data
-        .bl(1)
+        .scenario(v, 1)
         .bl(3)
         .b(false)
         .b(false)
@@ -2029,7 +2040,7 @@ fn a_weighted_closed_spline_a_flipped_ellipse_and_an_unknown_scenario() -> TestR
         let weighted = |h: u64, w: f64| {
             let mut sp = entity(v, 36, h, model);
             sp.data
-                .bl(1)
+                .scenario(v, 1)
                 .bl(2)
                 .b(true)
                 .b(true)
@@ -2049,7 +2060,7 @@ fn a_weighted_closed_spline_a_flipped_ellipse_and_an_unknown_scenario() -> TestR
         };
         // A spline with scenario 3: damaged.
         let mut odd = entity(v, 36, 0x303, model);
-        odd.data.bl(3).bl(2);
+        odd.data.scenario(v, 3).bl(2);
         let objs = vec![
             entry(v, LAYER, LAYER_H, "0"),
             entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
@@ -2102,7 +2113,7 @@ fn an_ellipse_not_a_number_and_a_spline_short_of_knots_are_damaged() -> TestResu
         .bd(1.0);
     let mut sp = entity(v, 36, 0x301, model);
     sp.data
-        .bl(1)
+        .scenario(v, 1)
         .bl(2)
         .b(false)
         .b(false)
@@ -2191,7 +2202,7 @@ fn a_spline_whose_knots_make_no_curve_is_drawn_through_its_points_and_said() -> 
 fn control_spline(v: Version, handle: u64, degree: u32, knots: &[f64]) -> Obj {
     let mut sp = entity(v, 36, handle, head(None));
     sp.data
-        .bl(1)
+        .scenario(v, 1)
         .bl(degree)
         .b(false)
         .b(false)
@@ -2215,7 +2226,7 @@ fn a_fit_spline_with_one_point_is_counted_and_its_tangents_are_kept() -> TestRes
     let v = Version::R2010;
     let mut one = entity(v, 36, 0x300, head(None));
     one.data
-        .bl(2)
+        .scenario(v, 2)
         .bl(3)
         .bd(0.0)
         .bd3((1.0, 0.0, 0.0))
@@ -2235,11 +2246,11 @@ fn a_fit_spline_with_one_point_is_counted_and_its_tangents_are_kept() -> TestRes
 
 #[test]
 fn a_dwg_spline_by_fit_points_is_a_smooth_curve() -> TestResult {
-    for v in [Version::R2004, Version::R2010, Version::R2018] {
+    for v in [Version::R2004, Version::R2010, Version::R2013, Version::R2018] {
         // Scenario 2: fit tolerance, start and end tangents (none given: zero), three fit points.
         let mut fit = entity(v, 36, 0x300, head(None));
         fit.data
-            .bl(2)
+            .scenario(v, 2)
             .bl(3)
             .bd(1e-7)
             .bd3((0.0, 0.0, 0.0))
@@ -2270,6 +2281,68 @@ fn a_dwg_spline_by_fit_points_is_a_smooth_curve() -> TestResult {
             let d = pts.iter().map(|q| (q.x - x).hypot(q.y - y)).fold(f64::MAX, f64::min);
             assert!(d < 0.05, "{v:?}: ({x}, {y}) is {d} away");
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn from_2013_a_splines_flags_and_knot_parameter_decide_its_scenario() -> TestResult {
+    for v in [Version::R2013, Version::R2018] {
+        // Scenario 2 stored, but knot parameter 15 (custom knots): control points.
+        let mut by_knots = entity(v, 36, 0x300, head(None));
+        by_knots
+            .data
+            .bl(2)
+            .bl(0)
+            .bl(15)
+            .bl(2)
+            .b(false)
+            .b(false)
+            .b(false)
+            .bd(0.0)
+            .bd(0.0)
+            .bl(6)
+            .bl(3)
+            .b(false);
+        for k in [0.0, 0.0, 0.0, 1.0, 1.0, 1.0] {
+            by_knots.data.bd(k);
+        }
+        for p in [(0.0, 0.0, 0.0), (5.0, 10.0, 0.0), (10.0, 0.0, 0.0)] {
+            by_knots.data.bd3(p);
+        }
+        // Scenario 1 stored, but flag bit 1 (by fit points) and knot parameter 0: fit points.
+        let mut by_fit = entity(v, 36, 0x301, head(None));
+        by_fit
+            .data
+            .bl(1)
+            .bl(1)
+            .bl(0)
+            .bl(3)
+            .bd(1e-7)
+            .bd3((0.0, 0.0, 0.0))
+            .bd3((0.0, 0.0, 0.0))
+            .bl(3);
+        for p in [(0.0, 20.0, 0.0), (5.0, 25.0, 0.0), (10.0, 20.0, 0.0)] {
+            by_fit.data.bd3(p);
+        }
+        let objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            by_knots,
+            by_fit,
+        ];
+        let d = drawing(&sections(v, &objs, &[]))?;
+        assert!(d.damaged.is_empty(), "{v:?}: {:?}", d.damaged);
+        assert_eq!(d.model.len(), 2, "{v:?}: {:?}", d.model);
+        let reaches = |x: f64, y: f64| {
+            d.model.iter().any(|s| match s {
+                Shape::Polyline { points, .. } => points.iter().any(|q| (q.x - x).hypot(q.y - y) < 0.05),
+                _ => false,
+            })
+        };
+        // The control-point curve starts at (0, 0); the fit-point curve passes (5, 25).
+        assert!(reaches(0.0, 0.0), "{v:?}: {:?}", d.model);
+        assert!(reaches(5.0, -25.0), "{v:?}: {:?}", d.model);
     }
     Ok(())
 }

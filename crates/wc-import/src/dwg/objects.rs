@@ -708,10 +708,21 @@ fn spline_count(o: &mut Object, what: &str) -> Result<u32> {
 }
 
 /// SPLINE, as DXF codes: 70 (closed), 71 degree, and either knots (40), control points (10/20)
-/// and weights (41), or fit points (11/21). Before 2013 a scenario says which: 1 control
-/// points, 2 fit points.
+/// and weights (41), or fit points (11/21). A scenario says which: 1 control points, 2 fit
+/// points. From 2013 on, spline flags and a knot parameter follow it and decide instead: flag
+/// bit 1 means fit points, knot parameter 15 (custom knots) means control points.
 fn spline(o: &mut Object, e: &mut Codes) -> Result<()> {
-    let scenario = o.data.bl()?;
+    let mut scenario = o.data.bl()?;
+    if o.version >= Version::R2013 {
+        let flags = o.data.bl()?;
+        let knot_parameter = o.data.bl()?;
+        if flags & 1 != 0 {
+            scenario = 2;
+        }
+        if knot_parameter == 15 {
+            scenario = 1;
+        }
+    }
     if scenario != 1 && scenario != 2 {
         return Err(bad(format!("a spline has unknown scenario {scenario}")));
     }
