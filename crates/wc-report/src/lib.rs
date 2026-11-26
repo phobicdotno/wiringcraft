@@ -246,17 +246,13 @@ impl Table {
 
     /// A Markdown table under a level-2 heading.
     pub fn to_markdown(&self) -> String {
-        // One line of text: line ends (LF, CR or CRLF) become spaces, and `<` and `>` are
-        // written as entities so a value is never read as HTML.
-        let line = |s: &str| {
-            s.replace("\r\n", " ")
-                .replace(['\r', '\n'], " ")
-                .replace('<', "&lt;")
-                .replace('>', "&gt;")
-        };
+        // One line of text: line ends (LF, CR or CRLF) become spaces.
+        let one_line = |s: &str| s.replace("\r\n", " ").replace(['\r', '\n'], " ");
+        // `<` and `>` are written as entities so a value is never read as HTML.
+        let line = |s: &str| one_line(s).replace('<', "&lt;").replace('>', "&gt;");
         // In a cell, Markdown punctuation gets a backslash so the table shows the text as typed
-        // (see `markdown_cell`); line ends and `<`, `>` are handled as for the title.
-        let cell = |s: &str| line(&markdown_cell(s));
+        // (see `markdown_cell`).
+        let cell = |s: &str| markdown_cell(&one_line(s));
         let mut out = format!(
             "## {}\n\n| {} |\n|{}\n",
             line(&self.title),
@@ -273,15 +269,18 @@ impl Table {
     }
 }
 
-/// One cell's text for a Markdown table, before line ends and `<`, `>` are handled.
+/// One line of cell text for a Markdown table.
 ///
 /// Markdown punctuation gets a backslash so the table shows the text as typed: `*spare*` is
 /// not italic, `motor_1_ready` keeps its underscores, `` `X1` `` is not code. A backslash is
 /// doubled, so a cell ending in `\` does not escape the column bar after it.
 ///
 /// A word that a Markdown viewer turns into a link by itself (one starting with `http://`,
-/// `https://` or `www.`, or an e-mail address) keeps its characters, because a backslash there
-/// would end up in the link. Only `\` and `|` are escaped in it, so the table stays whole.
+/// `https://` or `www.`, or an e-mail address) is kept as typed, because a backslash there
+/// would end up in the link. A viewer also takes in the backslashes of a `|` or a last `\` in
+/// the word, or of escaped text right after it (`https://x.no/&copy;`). Such a word is written
+/// as text that is not a link (`https\://`, `www\.`) with everything escaped; an e-mail
+/// address is written as `<a@x.no>`, which ends the link before the text after it.
 fn markdown_cell(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
@@ -292,32 +291,42 @@ fn markdown_cell(s: &str) -> String {
         let lead = word.len() - word.trim_start_matches(['*', '_', '~', '(']).len();
         let (before, link) = word.split_at(lead);
         markdown_text(before, &mut out);
-        if is_autolink(link) {
-            // Markdown leaves trailing punctuation and a trailing entity such as `&copy;` out
-            // of the link: that part is plain text.
-            let mut body = link;
-            loop {
-                body = body.trim_end_matches(['?', '!', '.', ',', ':', '*', '_', '~']);
-                let Some(head) = body.strip_suffix(';') else {
-                    break;
-                };
-                let name = head.trim_end_matches(|c: char| c.is_ascii_alphanumeric());
-                match name.strip_suffix('&') {
-                    Some(kept) if name.len() < head.len() => body = kept,
-                    _ => break,
-                }
+        // Markdown leaves trailing punctuation and a trailing entity such as `&copy;` out of
+        // a link: that part is plain text.
+        let mut body = link;
+        loop {
+            body = body.trim_end_matches(['?', '!', '.', ',', ':', '*', '_', '~']);
+            let Some(head) = body.strip_suffix(';') else {
+                break;
+            };
+            let name = head.trim_end_matches(|c: char| c.is_ascii_alphanumeric());
+            match name.strip_suffix('&') {
+                Some(kept) if name.len() < head.len() => body = kept,
+                _ => break,
             }
-            // A `\` stays as typed, as a viewer shows it and keeps it in the link, except
-            // before a `|` or at the end of the link, where it is doubled so the table stays whole.
-            let mut chars = body.chars().peekable();
-            while let Some(c) = chars.next() {
-                let next = chars.peek().copied();
-                if c == '|' || (c == '\\' && matches!(next, None | Some('|'))) {
-                    out.push('\\');
-                }
-                out.push(c);
+        }
+        if is_autolink(body) && !link.contains(['<', '>']) {
+            let mut tail = String::new();
+            markdown_text(&link[body.len()..], &mut tail);
+            if !tail.contains('\\') && !body.contains('|') && !body.ends_with('\\') {
+                // A plain link stays as typed, a `\` inside it too.
+                out.push_str(body);
+            } else if body.contains('@') && !body.contains("://") && !body.starts_with("www.") {
+                // An e-mail address before text that needs a backslash: `<...>` ends the link.
+                out.push('<');
+                out.push_str(body);
+                out.push('>');
+            } else {
+                // A viewer would take backslashes into the link, so the word is written as
+                // text that is not a link: `\:` or `www\.` shows as `:` or `www.`.
+                let cut = body.find("://").map_or(4, |i| i + 1);
+                let (head, rest) = body.split_at(cut);
+                out.push_str(&head[..cut - 1]);
+                out.push('\\');
+                out.push_str(&head[cut - 1..]);
+                markdown_text(rest, &mut out);
             }
-            markdown_text(&link[body.len()..], &mut out);
+            out.push_str(&tail);
         } else {
             markdown_text(link, &mut out);
         }
@@ -338,6 +347,8 @@ fn markdown_text(s: &str, out: &mut String) {
                 out.push(c);
             }
             '!' if chars.peek() == Some(&'[') => out.push_str("\\!"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
             '#' if out.is_empty() => out.push_str("\\#"),
             _ => out.push(c),
         }

@@ -3187,7 +3187,7 @@ fn markdown_cells_keep_links_as_typed() {
         t.to_markdown(),
         "## Links\n\n| Text |\n|---|\n\
          | see https://example.com/a_b \\*x\\* |\n\
-         | (www.x.no/a_b\\|c), mail a_b@x.no or a\\_b@c |\n"
+         | (www\\.x.no/a\\_b\\|c), mail a_b@x.no or a\\_b@c |\n"
     );
 }
 
@@ -3201,7 +3201,7 @@ fn markdown_cells_escape_words_that_only_look_like_links() {
         t.to_markdown(),
         "## Links\n\n| Text |\n|---|\n\
          | https://\\*spare\\*/path |\n\
-         | https://example.com/\\&copy; |\n\
+         | https\\://example.com/\\&copy; |\n\
          | https://example.com/a_b. www.a\\_b.no |\n"
     );
 }
@@ -3216,7 +3216,7 @@ fn markdown_cells_keep_backslashes_in_links_as_typed() {
         t.to_markdown(),
         "## Links\n\n| Text |\n|---|\n\
          | https://example.com/a\\b |\n\
-         | https://example.com/a\\\\\\|b https://example.com/c\\\\ |\n"
+         | https\\://example.com/a\\\\\\|b https\\://example.com/c\\\\ |\n"
     );
 }
 
@@ -3229,5 +3229,25 @@ fn markdown_cells_escape_an_uppercase_www_word() {
         t.to_markdown(),
         "## Links\n\n| Text |\n|---|\n\
          | WWW.example.com/\\*spare\\*/path HTTPS://example.com/a_b |\n"
+    );
+}
+
+#[test]
+fn markdown_links_with_text_that_needs_a_backslash_are_written_as_text() {
+    let mut t = Table::new("Links", &["Text"]);
+    t.rows
+        .push(vec!["https://example.com/a_b, https://example.com/a_b*".into()]);
+    t.rows
+        .push(vec!["a_b@x.no&amp; www.x.no/a_b&copy; www.x.no/a_b.".into()]);
+    t.rows
+        .push(vec!["https://example.com/a|b https://example.com/a\\".into()]);
+    t.rows.push(vec!["HTTP://example.com/a\\|b".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Links\n\n| Text |\n|---|\n\
+         | https://example.com/a_b, https\\://example.com/a\\_b\\* |\n\
+         | <a_b@x.no>\\&amp; www\\.x.no/a\\_b\\&copy; www.x.no/a_b. |\n\
+         | https\\://example.com/a\\|b https\\://example.com/a\\\\ |\n\
+         | HTTP\\://example.com/a\\\\\\|b |\n"
     );
 }
