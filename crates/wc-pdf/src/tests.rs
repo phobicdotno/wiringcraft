@@ -236,6 +236,7 @@ fn arcs_keep_their_side_in_svg_and_dxf() {
         size_mm: (100.0, 100.0),
         prims: pen.prims,
         pictures: Vec::new(),
+        panel: false,
     };
     assert!(svg(&page).contains("d=\"M60 50 A10 10 0 0 1 50 60\""));
     assert!(dxf(&page).contains("0\nARC\n8\n0\n62\n7\n10\n50\n20\n50\n40\n10\n50\n270\n51\n0\n"));
@@ -335,6 +336,7 @@ fn dxf_keeps_a_filled_path_that_is_not_convex_as_a_closed_outline() {
             layer: None,
         }],
         pictures: Vec::new(),
+        panel: false,
     };
     let d = dxf(&page);
     assert!(!d.contains("0\nSOLID\n"), "{d}");
@@ -1075,6 +1077,63 @@ fn panel_layouts_print_after_the_schematic_pages() {
     assert!(text.contains(&writer::pdf_text(
         "Cabinet CAB1  ·  plate 600 x 800 mm  ·  scale 1:5  ·  1 device(s)"
     )));
+}
+
+#[test]
+fn a_panel_layout_is_drawn_for_svg_and_dxf_with_its_plate_outline() {
+    use wc_core::panel::Panel;
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Mains")];
+    let opts = Options {
+        panels: vec![Panel::with_rails("main", "Cabinet CAB1", 600.0, 800.0)],
+        ..Default::default()
+    };
+    let (pages, report) = crate::page_lines(&project, &BTreeMap::new(), &opts);
+    assert_eq!(report.pages, 2);
+    let [page, panel] = pages.as_slice() else {
+        unreachable!("the page and the panel: {}", pages.len())
+    };
+    assert!(!page.panel && panel.panel);
+    assert_eq!((panel.id.as_str(), panel.number.as_str()), ("panel-main", "P1"));
+    assert_eq!(panel.title, "Cabinet CAB1");
+    // The 600 x 800 mm plate at 1:5 is a closed 120 x 160 mm outline.
+    let plate = panel.prims.iter().find_map(|p| match p {
+        Prim::Path {
+            points,
+            closed: true,
+            filled: false,
+            ..
+        } => {
+            let xs = points.iter().map(|p| p.0);
+            let ys = points.iter().map(|p| p.1);
+            let (x0, x1) = (xs.clone().fold(f64::MAX, f64::min), xs.fold(f64::MIN, f64::max));
+            let (y0, y1) = (ys.clone().fold(f64::MAX, f64::min), ys.fold(f64::MIN, f64::max));
+            ((x1 - x0 - 120.0).abs() < 1e-6 && (y1 - y0 - 160.0).abs() < 1e-6).then_some((x0, y1))
+        }
+        _ => None,
+    });
+    let Some((x0, y1)) = plate else {
+        unreachable!("no plate outline")
+    };
+    // In the DXF (y up) the plate's bottom left corner is a polyline vertex.
+    let dxf = crate::dxf(panel);
+    let corner = format!(
+        "VERTEX\n8\n0\n10\n{}\n20\n{}\n",
+        crate::vector::num(x0),
+        crate::vector::num(panel.size_mm.1 - y1)
+    );
+    assert!(dxf.contains(&corner), "{corner:?} not in the DXF");
+    assert!(crate::svg(panel).contains("<title>P1 Cabinet CAB1</title>"));
+    // Its file is named after the panel, the same in the app and on the command line.
+    assert_eq!(crate::panel_file_stem(panel), "panel-Cabinet_CAB1");
+    let mut named = panel.clone();
+    named.title = "Main.v1".into();
+    assert_eq!(crate::panel_file_stem(&named), "panel-Main_v1");
+    named.title = " ".into();
+    assert_eq!(crate::panel_file_stem(&named), "panel-main");
+    // Without panels in the options, only the page is drawn.
+    let (pages, _) = crate::page_lines(&project, &BTreeMap::new(), &Options::default());
+    assert_eq!(pages.len(), 1);
 }
 
 #[test]

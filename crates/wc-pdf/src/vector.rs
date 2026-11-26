@@ -1,5 +1,6 @@
-//! SVG and DXF export of schematic pages. Both draw exactly what the PDF export draws (frame,
-//! title block, symbols, wires, cross-references), from the primitives the same layout records.
+//! SVG and DXF export of schematic pages and panel layouts. Both draw exactly what the PDF
+//! export draws (frame, title block, symbols, wires, cross-references; plate, rails, ducts and
+//! devices), from the primitives the same layout records.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -20,6 +21,9 @@ pub struct PageDrawing {
     /// Pictures on the page: the underlay first (drawn under everything), then the project
     /// logo in each of its boxes (drawn on top). Only SVG shows them; DXF has no pictures.
     pub pictures: Vec<Picture>,
+    /// A panel layout's sheet (from [`Options::panels`]) rather than a schematic page: `id` is
+    /// `panel-<panel id>` and `title` the panel's name.
+    pub panel: bool,
 }
 
 /// A picture file placed on a page, as it is embedded in an SVG.
@@ -58,8 +62,9 @@ fn picture_bytes<'a>(options: &'a Options, file: &str, what: &str) -> Result<&'a
         })
 }
 
-/// The schematic pages chosen by `options.pages` (all when empty), drawn as for the PDF export.
-/// Report tables in `options` are not drawn; they are their own export.
+/// The schematic pages chosen by `options.pages` (all when empty), drawn as for the PDF export,
+/// followed by a sheet per panel layout in `options.panels`, drawn as its PDF sheet. Report
+/// tables in `options` are not drawn; they are their own export.
 pub fn page_drawings(
     project: &Project,
     symbols: &BTreeMap<String, Symbol>,
@@ -90,7 +95,7 @@ fn drawings(
         .filter(|p| options.pages.is_empty() || options.pages.contains(&p.id))
         .collect();
     let mut report = Report {
-        pages: pages.len(),
+        pages: pages.len() + options.panels.len(),
         warnings: Vec::new(),
     };
     // The logo is checked once, however many pages show it.
@@ -106,8 +111,26 @@ fn drawings(
             .map(|((mime, size), b)| (mime, size, std::sync::Arc::new(b.clone())))
     });
     let xref = layout::CrossRefs::build(project, symbols);
-    let total = pages.len();
-    let out = pages
+    let total = pages.len() + options.panels.len();
+    let logo_pictures = |page: &wc_core::Page| -> Vec<Picture> {
+        let Some((mime, size, bytes)) = &logo else {
+            return Vec::new();
+        };
+        layout::logo_boxes(project, page)
+            .into_iter()
+            .map(|b| {
+                let (min, max) = layout::fit_picture(b, *size);
+                Picture {
+                    mime,
+                    bytes: bytes.clone(),
+                    min: (min.x, min.y),
+                    max: (max.x, max.y),
+                    on_top: true,
+                }
+            })
+            .collect()
+    };
+    let mut out: Vec<PageDrawing> = pages
         .iter()
         .enumerate()
         .map(|(i, page)| {
@@ -132,18 +155,7 @@ fn drawings(
                     Err(w) => report.warnings.push(w),
                 }
             }
-            if let Some((mime, size, bytes)) = &logo {
-                for b in layout::logo_boxes(project, page) {
-                    let (min, max) = layout::fit_picture(b, *size);
-                    pictures.push(Picture {
-                        mime,
-                        bytes: bytes.clone(),
-                        min: (min.x, min.y),
-                        max: (max.x, max.y),
-                        on_top: true,
-                    });
-                }
-            }
+            pictures.extend(logo_pictures(page));
             PageDrawing {
                 id: page.id.clone(),
                 number: page.number.clone(),
@@ -151,10 +163,53 @@ fn drawings(
                 size_mm: page.size.mm(),
                 prims: drawn.prims,
                 pictures,
+                panel: false,
             }
         })
         .collect();
+    // Panel layouts follow, on the first chosen page's size, as in the PDF.
+    let size = pages.first().map(|p| p.size).unwrap_or_default();
+    for (k, panel) in options.panels.iter().enumerate() {
+        let mut page = wc_core::Page::new(format!("panel-{}", panel.id), format!("P{}", k + 1), panel.name.clone());
+        page.size = size;
+        let drawn = layout::draw_panel_page(
+            project,
+            &page,
+            pages.len() + k,
+            total,
+            panel,
+            &options.footprints,
+            &options.date,
+        );
+        out.push(PageDrawing {
+            pictures: logo_pictures(&page),
+            id: page.id,
+            number: page.number,
+            title: page.title,
+            size_mm: size.mm(),
+            prims: drawn.prims,
+            panel: true,
+        });
+    }
     (out, report)
+}
+
+/// The file name, without extension, of a panel layout's drawing: `panel-` and the panel's
+/// name (its id when it has none), with every character but letters, digits and `-` written as
+/// `_`, so `Main cabinet/A` becomes `panel-Main_cabinet_A`. The app and the command line both
+/// name panel files this way.
+pub fn panel_file_stem(d: &PageDrawing) -> String {
+    let name = d.title.trim();
+    let base = if name.is_empty() {
+        d.id.strip_prefix("panel-").unwrap_or(&d.id)
+    } else {
+        name
+    };
+    let safe: String = base
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+        .collect();
+    format!("panel-{safe}")
 }
 
 /// Standard base64 with padding.
@@ -191,7 +246,7 @@ fn svg_image(out: &mut String, p: &Picture) {
     );
 }
 
-fn num(v: f64) -> String {
+pub(crate) fn num(v: f64) -> String {
     let v = if v.is_finite() { v } else { 0.0 };
     let s = format!("{v:.3}");
     let s = s.trim_end_matches('0').trim_end_matches('.');
