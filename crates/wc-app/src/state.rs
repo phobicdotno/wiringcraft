@@ -220,15 +220,15 @@ struct FileEdit {
 /// was. When one cannot be written, those already written are put back as they were just
 /// before this call (a change made outside since stays). The error names every file of
 /// `edits` left other than written: the one that failed with its reason, those put back,
-/// those that could not be put back with their reason, and those not reached.
-fn write_edits(dir: &Path, edits: &[FileEdit], undo: bool) -> Result<(), String> {
+/// those that could not be put back with their reason, and those not reached. Returns the
+/// files written as they were just before, for [`put_back_files`] when what follows fails.
+fn write_edits(dir: &Path, edits: &[FileEdit], undo: bool) -> Result<Written, String> {
     let order: Vec<&FileEdit> = if undo {
         edits.iter().rev().collect()
     } else {
         edits.iter().collect()
     };
-    // Each file as it was just before it was written, in the order written.
-    let mut written: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
+    let mut written: Written = Vec::new();
     for (i, e) in order.iter().enumerate() {
         let text = if undo { &e.before } else { &e.after };
         let path = dir.join(&e.path);
@@ -240,13 +240,7 @@ fn write_edits(dir: &Path, edits: &[FileEdit], undo: bool) -> Result<(), String>
         match done {
             Ok(was) => written.push((path, was)),
             Err(mut msg) => {
-                let (mut back, mut stuck) = (Vec::new(), Vec::new());
-                for (path, was) in written.iter().rev() {
-                    match restore_file(path, was.as_deref()) {
-                        Ok(()) => back.push(path.display().to_string()),
-                        Err(e) => stuck.push(format!("{}: {e}", path.display())),
-                    }
-                }
+                let (back, stuck) = put_back_files(&written);
                 let left: Vec<String> = order
                     .iter()
                     .skip(i + 1)
@@ -265,7 +259,24 @@ fn write_edits(dir: &Path, edits: &[FileEdit], undo: bool) -> Result<(), String>
             }
         }
     }
-    Ok(())
+    Ok(written)
+}
+
+/// Files [`write_edits`] wrote, each as it was just before, in the order written.
+type Written = Vec<(PathBuf, Option<Vec<u8>>)>;
+
+/// Put the files of `written` back as they were before [`write_edits`] wrote them, newest
+/// first (a change made outside before that stays). Returns those put back, and those that
+/// could not be with their reason.
+fn put_back_files(written: &Written) -> (Vec<String>, Vec<String>) {
+    let (mut back, mut stuck) = (Vec::new(), Vec::new());
+    for (path, was) in written.iter().rev() {
+        match restore_file(path, was.as_deref()) {
+            Ok(()) => back.push(path.display().to_string()),
+            Err(e) => stuck.push(format!("{}: {e}", path.display())),
+        }
+    }
+    (back, stuck)
 }
 
 /// What [`Open::back_to`] goes back to, or [`Open::keep`] builds on.
@@ -1185,11 +1196,14 @@ impl Open {
         self.follow_terminals();
         match self.undo.pop() {
             Some(prev) => {
-                if let Err(e) = write_edits(&self.dir, &prev.files, true) {
-                    self.undo_error = Some(e);
-                    self.undo.push(prev);
-                    return false;
-                }
+                let written = match write_edits(&self.dir, &prev.files, true) {
+                    Ok(written) => written,
+                    Err(e) => {
+                        self.undo_error = Some(e);
+                        self.undo.push(prev);
+                        return false;
+                    }
+                };
                 self.forget_terminal_change();
                 let Step { project, files } = prev;
                 self.redo.push(Step {
@@ -1204,9 +1218,13 @@ impl Open {
                 if let Err(e) = self.sync_vendored(&left) {
                     // The vendored files could not follow: keep the project as it was.
                     if let Some(cur) = self.redo.pop() {
-                        let e = match write_edits(&self.dir, &cur.files, false) {
-                            Ok(()) => e,
-                            Err(files) => format!("{e}\n{files}"),
+                        // The files go back as they were before this step, not as recorded:
+                        // a change made to one outside since stays.
+                        let (_, stuck) = put_back_files(&written);
+                        let e = if stuck.is_empty() {
+                            e
+                        } else {
+                            format!("{e}\nProject files not put back: {}", stuck.join("; "))
                         };
                         let restored = std::mem::replace(&mut self.project, cur.project);
                         self.undo_error = Some(e);
@@ -1231,11 +1249,14 @@ impl Open {
         self.follow_terminals();
         match self.redo.pop() {
             Some(next) => {
-                if let Err(e) = write_edits(&self.dir, &next.files, false) {
-                    self.undo_error = Some(e);
-                    self.redo.push(next);
-                    return false;
-                }
+                let written = match write_edits(&self.dir, &next.files, false) {
+                    Ok(written) => written,
+                    Err(e) => {
+                        self.undo_error = Some(e);
+                        self.redo.push(next);
+                        return false;
+                    }
+                };
                 self.forget_terminal_change();
                 let Step { project, files } = next;
                 self.undo.push(Step {
@@ -1249,9 +1270,13 @@ impl Open {
                     .unwrap_or_default();
                 if let Err(e) = self.sync_vendored(&left) {
                     if let Some(cur) = self.undo.pop() {
-                        let e = match write_edits(&self.dir, &cur.files, true) {
-                            Ok(()) => e,
-                            Err(files) => format!("{e}\n{files}"),
+                        // The files go back as they were before this step, not as recorded:
+                        // a change made to one outside since stays.
+                        let (_, stuck) = put_back_files(&written);
+                        let e = if stuck.is_empty() {
+                            e
+                        } else {
+                            format!("{e}\nProject files not put back: {}", stuck.join("; "))
                         };
                         let restored = std::mem::replace(&mut self.project, cur.project);
                         self.undo_error = Some(e);
@@ -7820,6 +7845,33 @@ pub(crate) mod tests {
             "{err}"
         );
         assert!(err.contains("not checked: not listed"), "{err}");
+    }
+
+    #[test]
+    fn undo_and_redo_that_fail_on_library_files_leave_a_macro_changed_outside_as_it_was() {
+        let (_tmp, mut o) = project();
+        let id = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let clip = o.copy(1, &[Selection::Symbol(id)]);
+        let path = o.save_macro(&clip, "Coil", "").unwrap();
+        let mut form = crate::macro_form::Form::open(&path).unwrap();
+        form.description = "A coil".into();
+        o.save_macro_form(&form).unwrap();
+        let symbol = o.project.lock.symbols.keys().next().unwrap().clone();
+        // The macro is changed outside, then the step's symbol file cannot be written.
+        let fail = |o: &mut Open| {
+            std::fs::write(&path, "outside").unwrap();
+            o.stale_symbol_files.insert(symbol.clone());
+            o.fail_symbol_writes = [true].into();
+        };
+        fail(&mut o);
+        assert!(!o.undo());
+        assert!(o.take_undo_error().is_some());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "outside", "Undo");
+        assert!(o.undo());
+        fail(&mut o);
+        assert!(!o.redo());
+        assert!(o.take_undo_error().is_some());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "outside", "Redo");
     }
 
     #[test]
