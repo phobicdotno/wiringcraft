@@ -1308,24 +1308,29 @@ impl Open {
     /// by as far as the drag had moved them, now and in every later undo and redo step (each by
     /// its own part of the move), and the move's own step is dropped, so Undo and Redo then work
     /// as if the changes after it were made at the start position. Jumpers and strip layouts
-    /// follow the terminals back in each. Returns false, changing nothing, when that step is no
-    /// longer in the history (the move was undone, or trimmed off the oldest end), carries file
-    /// edits a move never makes, has later steps folded into it or after it (an assistant turn,
-    /// whose steps in between can no longer be checked), or a drawing, cloud or wire on the page
-    /// was added or deleted since (`items` names those by place in their list).
-    pub fn take_back_move(&mut self, id: u64, page: &str, items: &[Selection]) -> bool {
+    /// follow the terminals back in each. Refuses with the reason, changing nothing, when that
+    /// step is no longer in the history (the move was undone, or trimmed off the oldest end),
+    /// carries file edits a move never makes, has later steps folded into it or after it (an
+    /// assistant turn, whose steps in between can no longer be checked), or a drawing, cloud or
+    /// wire on the page was added or deleted since (`items` names those by place in their list).
+    pub fn take_back_move(&mut self, id: u64, page: &str, items: &[Selection]) -> Result<(), &'static str> {
         let Some(at) = self.undo.iter().position(|s| s.id == id) else {
-            return false;
+            return Err("the move is no longer in the undo history");
         };
         let Some(first) = self.undo.get(at) else {
-            return false;
+            return Err("the move is no longer in the undo history");
         };
         let counts = |p: &Project| p.page(page).map(|p| (p.graphics.len(), p.clouds.len(), p.wires.len()));
         let start = counts(&first.project);
         let later = self.undo.iter().skip(at + 1).chain(&self.redo).map(|s| &s.project);
-        let folded = self.undo.iter().skip(at).chain(&self.redo).any(|s| s.folded);
-        if folded || !first.files.is_empty() || later.chain([&self.project]).any(|p| counts(p) != start) {
-            return false;
+        if self.undo.iter().skip(at).chain(&self.redo).any(|s| s.folded) {
+            return Err("an assistant turn during it was recorded as one step");
+        }
+        if !first.files.is_empty() {
+            return Err("project files were changed with it");
+        }
+        if later.chain([&self.project]).any(|p| counts(p) != start) {
+            return Err("items were added or deleted during it");
         }
         // The change in progress (the move's frames since the last checkpoint) is followed first.
         self.follow_terminals();
@@ -1355,7 +1360,7 @@ impl Open {
         self.undo.remove(at);
         self.history += 1;
         self.edited();
-        true
+        Ok(())
     }
 
     /// Forget the latest undo step, once its change was taken back another way.
@@ -1429,7 +1434,11 @@ impl Open {
             let held = self.marks == 0 && self.turn.is_some_and(|t| t <= self.undo_dropped);
             if held {
                 let next = self.undo.remove(1);
-                self.undo[0].files.extend(next.files);
+                if let Some(first) = self.undo.first_mut() {
+                    first.files.extend(next.files);
+                    // What the folded step did is no longer checkable on its own.
+                    first.folded = true;
+                }
             } else {
                 self.undo.remove(0);
             }
@@ -1538,7 +1547,12 @@ impl Open {
                         let restored = std::mem::replace(&mut self.project, cur.project);
                         self.undo_error = Some(e);
                         let offset = std::mem::replace(&mut self.drag_offset, cur.offset);
-                        self.undo.push(Step::new(restored, cur.files, offset));
+                        // The step goes back whole: its id and folded mark too.
+                        self.undo.push(Step {
+                            project: restored,
+                            offset,
+                            ..cur
+                        });
                     }
                     return false;
                 }
@@ -1604,7 +1618,12 @@ impl Open {
                         let restored = std::mem::replace(&mut self.project, cur.project);
                         self.undo_error = Some(e);
                         let offset = std::mem::replace(&mut self.drag_offset, cur.offset);
-                        self.redo.push(Step::new(restored, cur.files, offset));
+                        // The step goes back whole: its id and folded mark too.
+                        self.redo.push(Step {
+                            project: restored,
+                            offset,
+                            ..cur
+                        });
                     }
                     return false;
                 }

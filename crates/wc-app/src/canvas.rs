@@ -1992,10 +1992,10 @@ fn cancel_drag(open: &mut Open, ed: &mut Editor) {
         }) => {
             // Said only when the move is still there to undo: a move already undone has
             // nothing to take back.
-            if open.has_undo_step(id) && !open.take_back_move(id, &page, &items) {
-                ed.message = "The move could not be taken back: items were added or deleted during it. \
-                              Undo goes back step by step."
-                    .into();
+            if open.has_undo_step(id)
+                && let Err(why) = open.take_back_move(id, &page, &items)
+            {
+                ed.message = format!("The move could not be taken back: {why}. Undo goes back step by step.");
             }
         }
         Some(Drag::Logo {
@@ -2201,7 +2201,12 @@ fn route_menu(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor) {
     }
     ui.separator();
     if ui.add(egui::Button::new("Delete").shortcut_text("Del")).clicked() {
-        delete_selected_wires(open, ed);
+        if ed.dragging() {
+            // As the Delete key: Escape must still be able to take the move back (#863).
+            ed.message = "Let go of the move first, then delete.".into();
+        } else {
+            delete_selected_wires(open, ed);
+        }
         ui.close_menu();
     }
 }
@@ -5038,6 +5043,24 @@ mod tests {
             "the new line is not moved by the old one's offset"
         );
         assert!(!ed.message.is_empty(), "the editor says why");
+    }
+
+    #[test]
+    fn escape_after_a_long_assistant_turn_trimmed_into_the_move_only_ends_the_drag() {
+        let (_tmp, mut o, mut ed, _) = moving_coil();
+        let page = ed.page;
+        // The move is the first step of an assistant turn that runs past the undo limit: the
+        // steps after it are folded into it as the oldest ones are trimmed.
+        let _mark = o.start_turn();
+        drag(&mut o, &mut ed, Point::new(-40.0, 0.0));
+        for _ in 0..450 {
+            o.checkpoint();
+        }
+        let now = o.project.pages[page].clone();
+        cancel_drag(&mut o, &mut ed);
+        assert!(ed.drag.is_none());
+        assert_eq!(o.project.pages[page], now, "nothing is moved");
+        assert!(ed.message.contains("one step"), "{}", ed.message);
     }
 
     #[test]

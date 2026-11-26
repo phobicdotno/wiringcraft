@@ -1597,6 +1597,12 @@ impl App {
                     self.dialog = Some(Dialog::Message(format!("Undo or redo was not done:\n{e}")));
                 }
             }
+            // Before the panel's own Delete: a panel device being dragged stays too.
+            Action::Delete | Action::Cut if self.ed.dragging() => {
+                // A delete would change the drag's history under it, and Escape could no
+                // longer take the move back (#863).
+                self.ed.message = "Let go of the move first, then delete.".into();
+            }
             Action::Delete if self.ed.panel.is_some() => {
                 if let (Some(pi), Some(item)) = (self.ed.panel, self.ed.panel_pick.take()) {
                     open.delete_panel_item(pi, item);
@@ -1651,11 +1657,6 @@ impl App {
                     self.ed.panel_pick = None;
                     self.ed.view.fit = true;
                 }
-            }
-            Action::Delete | Action::Cut if self.ed.dragging() => {
-                // A delete would change the drag's history under it, and Escape could no
-                // longer take the move back (#863).
-                self.ed.message = "Let go of the move first, then delete.".into();
             }
             Action::Delete => {
                 let sel = std::mem::take(&mut self.ed.selection);
@@ -7320,6 +7321,38 @@ mod nudge_tests {
             assert!(app.open.as_mut().unwrap().undo());
             assert_eq!((coil_at(&app), wires(&app)), (Point::new(55.0, 60.0), 0));
         }
+    }
+
+    #[test]
+    fn delete_waits_for_a_panel_device_drag_to_end() {
+        use wc_core::panel::{Panel, PanelItem};
+        let (_tmp, mut app, _ctx) = app(Point::new(80.0, 60.0), false);
+        let open = app.open.as_mut().unwrap();
+        open.project.panels.push(Panel {
+            id: "panel1".into(),
+            name: "Panel 1".into(),
+            width: 400.0,
+            height: 300.0,
+            items: vec![PanelItem::Device {
+                tag: wc_core::DeviceTag::parse("-K1").unwrap(),
+                at: Point::new(100.0, 100.0),
+                width: 40.0,
+                height: 60.0,
+                rotation: wc_core::geom::Rotation::R0,
+            }],
+        });
+        let panel = open.project.panels.len() - 1;
+        app.ed.panel = Some(panel);
+        app.ed.panel_pick = Some(0);
+        let items = |app: &App| app.open.as_ref().unwrap().project.panels[panel].items.len();
+        app.ed.panel_drag = Some((Point::new(100.0, 100.0), None, Point::new(0.0, 0.0)));
+        app.carry_out(Action::Delete);
+        assert_eq!(items(&app), 1, "the held device stays");
+        assert_eq!(app.ed.panel_pick, Some(0), "and stays picked");
+        assert!(app.ed.message.contains("Let go"), "{}", app.ed.message);
+        app.ed.panel_drag = None;
+        app.carry_out(Action::Delete);
+        assert_eq!(items(&app), 0, "after letting go, Delete removes it");
     }
 
     #[test]
