@@ -414,7 +414,25 @@ impl Git {
                 message: format!("another revert, cherry-pick or merge is in progress ({f}); finish or abort it first"),
             });
         }
-        args.extend(["revert", "--no-edit", END_OF_OPTIONS, commit]);
+        // Resolved to one commit first: `git revert` hands what follows `--end-of-options` to
+        // its revision walk, which still reads `--all` there as every branch.
+        let resolved = self.run(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            END_OF_OPTIONS,
+            &format!("{commit}^{{commit}}"),
+        ]);
+        let commit = match resolved {
+            Ok(id) if !id.trim().is_empty() => id.trim().to_owned(),
+            _ => {
+                return Err(Error::Git {
+                    args: format!("revert {commit}"),
+                    message: format!("no such version: {commit}"),
+                });
+            }
+        };
+        args.extend(["revert", "--no-edit", END_OF_OPTIONS, &commit]);
         if let Err(e) = self.run(&args) {
             // Only this call's revert can be in progress here (checked above), so aborting it
             // cannot throw away earlier work.
