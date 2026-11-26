@@ -1,0 +1,178 @@
+{
+  "category": "sensors",
+  "description": "Photoelectric sensor, 3-wire, PNP output: supply on BN and BU, output on BK. Detects targets by a light beam (through-beam, retro-reflective or diffuse).",
+  "graphics": [
+    {
+      "kind": "rect",
+      "max": {
+        "x": 7.0,
+        "y": 11.0
+      },
+      "min": {
+        "x": -7.0,
+        "y": 4.0
+      }
+    },
+    {
+      "a": {
+        "x": -5.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": -5.0,
+        "y": 4.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 5.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": 5.0,
+        "y": 4.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 11.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": -4.5,
+        "y": 5.5
+      },
+      "b": {
+        "x": -1.5,
+        "y": 8.5
+      },
+      "kind": "line"
+    },
+    {
+      "closed": true,
+      "kind": "polyline",
+      "points": [
+        {
+          "x": -1.5,
+          "y": 8.5
+        },
+        {
+          "x": -3.0,
+          "y": 8.2
+        },
+        {
+          "x": -1.8,
+          "y": 7.0
+        }
+      ]
+    },
+    {
+      "a": {
+        "x": -1.5,
+        "y": 5.5
+      },
+      "b": {
+        "x": 1.5,
+        "y": 8.5
+      },
+      "kind": "line"
+    },
+    {
+      "closed": true,
+      "kind": "polyline",
+      "points": [
+        {
+          "x": 1.5,
+          "y": 8.5
+        },
+        {
+          "x": 0.0,
+          "y": 8.2
+        },
+        {
+          "x": 1.2,
+          "y": 7.0
+        }
+      ]
+    },
+    {
+      "at": {
+        "x": 2.8,
+        "y": 8.3
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "PNP"
+    },
+    {
+      "at": {
+        "x": -3.8,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "BN"
+    },
+    {
+      "at": {
+        "x": 6.2,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "BU"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 14.4
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "BK"
+    }
+  ],
+  "id": "wc.sensor.photo3",
+  "letter_code": "B",
+  "name": "Photoelectric sensor, 3-wire, PNP",
+  "pins": [
+    {
+      "at": {
+        "x": -5.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "BN"
+    },
+    {
+      "at": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "dir": "down",
+      "name": "BK"
+    },
+    {
+      "at": {
+        "x": 5.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "BU"
+    }
+  ],
+  "role": "standalone",
+  "tag_at": {
+    "x": -10.0,
+    "y": 8.0
+  }
+}

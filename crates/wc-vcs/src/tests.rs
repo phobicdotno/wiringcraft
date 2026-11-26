@@ -183,6 +183,27 @@ fn revert_refuses_while_another_operation_is_in_progress() -> Result<()> {
 }
 
 #[test]
+fn revert_keeps_the_reason_of_a_lookup_that_fails_loudly() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    store::create(dir, "Demo")?;
+    let git = Git::new(dir);
+    git.init()?;
+    let head = git.head().unwrap_or_default();
+    // A corrupt object under a made-up id: the lookup of that version fails and git says why,
+    // while the checks before it (identity, operation files) still pass.
+    let id = "1".repeat(head.len());
+    let objects = dir.join(".git").join("objects").join(&id[..2]);
+    std::fs::create_dir_all(&objects).map_err(|e| wc_core::Error::io("mkdir", e))?;
+    std::fs::write(objects.join(&id[2..]), "not an object").map_err(|e| wc_core::Error::io("write", e))?;
+    let err = git.revert(&id).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(!err.contains("no such version"), "{err}");
+    assert!(err.contains("corrupt"), "{err}");
+    assert_eq!(git.head(), Some(head), "nothing was reverted");
+    Ok(())
+}
+
+#[test]
 fn a_failed_revert_in_a_linked_worktree_is_undone() -> Result<()> {
     let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
     let dir = tmp.path().join("main");
@@ -482,5 +503,94 @@ fn a_failed_write_leaves_the_exclude_list_as_it_was() -> Result<()> {
     assert!(git.exclude_locally("other.lock").is_err());
     let after = std::fs::read(&exclude).map_err(|e| wc_core::Error::io("read", e))?;
     assert_eq!(after, before);
+    Ok(())
+}
+
+#[test]
+fn changes_name_a_file_with_an_accent_as_it_is() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    store::create(dir, "Demo")?;
+    let git = Git::new(dir);
+    git.init()?;
+    let base = git.head().ok_or_else(|| wc_core::Error::Invalid("no head".into()))?;
+    let path = dir.join("café.png");
+    std::fs::write(&path, "1").map_err(|e| wc_core::Error::io(&path, e))?;
+
+    // Not recorded yet.
+    let found = changes(&git, &base, None)?;
+    assert!(
+        found.contains(&Change::File {
+            path: "café.png".into(),
+            status: "added".into()
+        }),
+        "{found:?}"
+    );
+    // Recorded, then changed again in the folder.
+    git.commit("Picture")?;
+    let first = git.head().ok_or_else(|| wc_core::Error::Invalid("no head".into()))?;
+    let found = changes(&git, &base, Some(&first))?;
+    assert!(
+        found.contains(&Change::File {
+            path: "café.png".into(),
+            status: "added".into()
+        }),
+        "{found:?}"
+    );
+    std::fs::write(&path, "2").map_err(|e| wc_core::Error::io(&path, e))?;
+    let found = changes(&git, &first, None)?;
+    assert_eq!(
+        found,
+        [Change::File {
+            path: "café.png".into(),
+            status: "changed".into()
+        }]
+    );
+    Ok(())
+}
+
+#[test]
+fn a_name_that_starts_with_a_dash_is_never_a_git_option() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    let mut p = store::create(dir, "Demo")?;
+    let git = Git::new(dir);
+    git.init()?;
+    // A second version on main, and a branch `side` that main follows: a bare `git merge`
+    // would merge it, and `git revert --all` would undo every version.
+    p.meta.title_block.insert("customer".into(), "ACME".into());
+    store::save(dir, &p)?;
+    git.commit("Customer")?;
+    git.create_branch("side")?;
+    p.meta.title_block.insert("customer".into(), "Side".into());
+    store::save(dir, &p)?;
+    git.commit("On side")?;
+    git.switch("main")?;
+    git.run(&["config", "branch.main.remote", "."])?;
+    git.run(&["config", "branch.main.merge", "refs/heads/side"])?;
+    let head = git.head();
+
+    assert!(git.switch("--detach").is_err(), "no such branch");
+    assert_eq!(git.current_branch().as_deref(), Some("main"), "HEAD is not detached");
+    assert!(git.merge("--log").is_err(), "no such branch");
+    // Refused before git runs: `git revert --all` would walk every branch, even after
+    // `--end-of-options`, and fail (then be undone) only by chance.
+    let refused = git.revert("--all").err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(refused.contains("no such version: --all"), "{refused}");
+    assert!(git.author_and_subject("--output=log").is_err(), "no such version");
+    assert!(git.create_branch("-x").is_err(), "not a branch name");
+    assert_eq!(git.show("--output=shown", "project.json"), None, "no such version");
+    assert_eq!(git.head(), head, "nothing was merged or reverted");
+    assert_eq!(git.current_branch().as_deref(), Some("main"));
+
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|e| wc_core::Error::io("read", e))? {
+        let entry = entry.map_err(|e| wc_core::Error::io("read", e))?;
+        names.push(entry.file_name().to_string_lossy().into_owned());
+    }
+    assert!(
+        !names.iter().any(|n| n.starts_with("shown") || n.starts_with("log")),
+        "git wrote no file: {names:?}"
+    );
     Ok(())
 }

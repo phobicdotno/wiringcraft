@@ -79,7 +79,9 @@ device or the project properties before it takes the item, the waiting change is
 says so; a change of the page's number alone keeps it. Undo while a change waits takes that change
 back here only. For the first few seconds after an item is sent, while the session answers,
 everything waits, as before. The host refuses a page that places a symbol the project does not lock
-(#286); placements a page already had stay editable.
+(#286); placements a page already had stay editable. It also refuses a change or an undo that
+gives a page a number another page has, as when two people renumber at once (#748); pages that
+already shared a number stay editable.
 
 Host and guests must run builds with the same session protocol version
 (`wc_share::PROTOCOL_VERSION`, raised whenever a message changes). A guest on another version is
