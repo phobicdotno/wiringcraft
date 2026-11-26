@@ -825,10 +825,6 @@ mod tests {
         lines.into_iter().next().map(|(pts, _)| pts).unwrap_or_default()
     }
 
-    fn near(a: Point, b: Point) -> bool {
-        (a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() < 1e-9
-    }
-
     #[test]
     fn arcs_follow_their_circle() {
         // A half circle of radius 5 round (5, 0). The sweep flag goes the way of growing angles,
