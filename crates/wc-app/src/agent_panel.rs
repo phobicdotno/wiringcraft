@@ -26,6 +26,13 @@ impl App {
 
     /// Send the input box's text, and the screenshots waiting, to the assistant.
     pub(crate) fn assistant_send(&mut self, ctx: &egui::Context) {
+        // A turn started now would fold the import's undo step into its own.
+        if self.importing.is_some() {
+            self.assistant_log(Entry::Error(
+                "Not sent: an import is running; send it again when it is done.".into(),
+            ));
+            return;
+        }
         let shots: Vec<Shot> = self.assistant.waiting.iter().map(|(s, _)| s.clone()).collect();
         let images = match shots.iter().map(Shot::to_agent).collect::<Result<Vec<_>, _>>() {
             Ok(i) => i,
