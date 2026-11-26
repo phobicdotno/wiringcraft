@@ -258,6 +258,8 @@ fn convert(name: &str, sym: &Sexp, body: &Sexp, base: &str, wanted: u32, prefix:
         let n = s.first(head)?;
         Some(pt(n.num(1)?, n.num(2)?))
     };
+    // KiCad's `outline` fill is solid in the line colour; `background` and `none` stay hollow.
+    let filled = |s: &Sexp| s.first("fill").and_then(|f| f.first("type")).and_then(|t| t.arg(1)) == Some("outline");
     let mut graphics = Vec::new();
     let mut pins: Vec<Pin> = Vec::new();
     for unit in body.all("symbol") {
@@ -269,16 +271,22 @@ fn convert(name: &str, sym: &Sexp, body: &Sexp, base: &str, wanted: u32, prefix:
         for g in unit.items() {
             match g.head() {
                 Some("polyline") => {
-                    let points: Vec<Point> = g
+                    let mut points: Vec<Point> = g
                         .first("pts")
                         .map(|p| p.all("xy").filter_map(|x| Some(pt(x.num(1)?, x.num(2)?))).collect())
                         .unwrap_or_default();
+                    // A polyline that ends where it starts is closed; drop the repeated point.
+                    let ends_at_start = points.len() > 2 && points.first() == points.last();
+                    if ends_at_start {
+                        points.pop();
+                    }
+                    let filled = filled(g) && points.len() > 2;
                     match points.as_slice() {
                         [a, b] => graphics.push(Shape::Line { a: *a, b: *b }),
                         [_, _, ..] => graphics.push(Shape::Polyline {
                             points,
-                            closed: false,
-                            filled: false,
+                            closed: ends_at_start || filled,
+                            filled,
                         }),
                         _ => {}
                     }
@@ -311,20 +319,28 @@ fn convert(name: &str, sym: &Sexp, body: &Sexp, base: &str, wanted: u32, prefix:
                 }
                 Some("rectangle") => {
                     if let (Some(a), Some(b)) = (xy(g, "start"), xy(g, "end")) {
-                        graphics.push(Shape::Rect {
-                            min: Point::new(a.x.min(b.x), a.y.min(b.y)),
-                            max: Point::new(a.x.max(b.x), a.y.max(b.y)),
+                        let (min, max) = (
+                            Point::new(a.x.min(b.x), a.y.min(b.y)),
+                            Point::new(a.x.max(b.x), a.y.max(b.y)),
+                        );
+                        // A rectangle has no fill of its own: a filled one becomes a filled polyline.
+                        graphics.push(if filled(g) {
+                            Shape::Polyline {
+                                points: vec![min, Point::new(max.x, min.y), max, Point::new(min.x, max.y)],
+                                closed: true,
+                                filled: true,
+                            }
+                        } else {
+                            Shape::Rect { min, max }
                         });
                     }
                 }
                 Some("circle") => {
                     if let (Some(center), Some(r)) = (xy(g, "center"), g.first("radius").and_then(|r| r.num(1))) {
-                        let filled =
-                            g.first("fill").and_then(|f| f.first("type")).and_then(|t| t.arg(1)) == Some("outline");
                         graphics.push(Shape::Circle {
                             center,
                             radius: r * scale,
-                            filled,
+                            filled: filled(g),
                         });
                     }
                 }
@@ -586,6 +602,73 @@ mod tests {
         assert_eq!(derived.description, "24 V coil");
         assert_eq!(derived.pins.len(), 2);
         assert_eq!(syms[3].symbol.id, "kicad.relays.relay_coil_24v_b");
+        Ok(())
+    }
+
+    #[test]
+    fn filled_closed_polylines_and_rectangles_come_in_filled() -> Result<()> {
+        let lib = r#"(kicad_symbol_lib
+  (symbol "D" (property "Reference" "D" (at 0 0 0))
+    (symbol "D_0_1"
+      (polyline (pts (xy -1 1) (xy -1 -1) (xy 1 0) (xy -1 1)) (stroke (width 0.254)) (fill (type outline)))
+      (polyline (pts (xy 1 1) (xy 1 -1)) (stroke (width 0.254)) (fill (type none)))
+      (polyline (pts (xy 2 1) (xy 3 1) (xy 3 2) (xy 2 1)) (fill (type background)))
+      (polyline (pts (xy 0 5) (xy 2 5) (xy 1 6)) (fill (type outline)))
+      (polyline (pts (xy 0 8) (xy 2 8) (xy 0 8)) (fill (type none)))
+      (rectangle (start 4 1) (end 5 -1) (fill (type outline)))
+      (rectangle (start 6 1) (end 7 -1) (fill (type background))))
+    (symbol "D_1_1"
+      (pin passive line (at 0 0 0) (length 1) (name "~") (number "1"))
+      (pin passive line (at 9 0 180) (length 1) (name "~") (number "2")))))"#;
+        let (syms, warnings) = symbols(lib, "k", 1.0)?;
+        assert_eq!(syms.len(), 1, "{warnings:?}");
+        let g = &syms[0].symbol.graphics;
+        // The triangle: closed, filled, three points without the repeated first one.
+        assert!(
+            g.contains(&Shape::Polyline {
+                points: vec![Point::new(-1.0, -1.0), Point::new(-1.0, 1.0), Point::new(1.0, 0.0)],
+                closed: true,
+                filled: true,
+            }),
+            "{g:?}"
+        );
+        // The bar stays a line.
+        assert!(g.contains(&Shape::Line {
+            a: Point::new(1.0, -1.0),
+            b: Point::new(1.0, 1.0)
+        }));
+        // An outline fill closes a triangle that does not repeat its first point.
+        assert!(
+            g.contains(&Shape::Polyline {
+                points: vec![Point::new(0.0, -5.0), Point::new(2.0, -5.0), Point::new(1.0, -6.0)],
+                closed: true,
+                filled: true,
+            }),
+            "{g:?}"
+        );
+        // Three points that end where they start are a line there and back.
+        assert!(g.contains(&Shape::Line {
+            a: Point::new(0.0, -8.0),
+            b: Point::new(2.0, -8.0)
+        }));
+        // A background fill is closed but hollow.
+        assert!(
+            g.iter()
+                .any(|s| matches!(s, Shape::Polyline { points, closed: true, filled: false } if points.len() == 3))
+        );
+        // A filled rectangle becomes a filled polyline; a background one stays a rectangle.
+        assert!(
+            g.iter()
+                .any(|s| matches!(s, Shape::Polyline { points, closed: true, filled: true } if points.len() == 4))
+        );
+        assert!(
+            g.iter()
+                .any(|s| matches!(s, Shape::Rect { min, .. } if (min.x - 6.0).abs() < 1e-9))
+        );
+        assert!(
+            !g.iter()
+                .any(|s| matches!(s, Shape::Rect { min, .. } if (min.x - 4.0).abs() < 1e-9))
+        );
         Ok(())
     }
 
