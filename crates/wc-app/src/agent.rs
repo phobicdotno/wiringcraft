@@ -165,6 +165,10 @@ impl Assistant {
     }
 }
 
+/// Why a changing tool waits while the unsaved-changes question is open.
+const UNSAVED_ASKED: &str = "the person is being asked whether to save the open project's unsaved \
+                             changes; wait for their answer.";
+
 /// What `open_project` says while the person is asked about the open project's unsaved changes.
 const OPEN_ASKED: &str = "Not opened yet: the open project has unsaved changes, and the person was \
                           asked whether to save them first. It opens when they answer; wait for them \
@@ -3586,6 +3590,11 @@ impl App {
                 "{name} was not run: an import is running in the app; wait until it is done."
             )));
         }
+        // While the person is asked whether to save the open project's unsaved changes, a
+        // change would land in what they are answering about: only the reading tools run.
+        if matches!(self.dialog, Some(Dialog::Unsaved(_))) && !READ_TOOLS.contains(&name) {
+            return Started::Done(Err(format!("{name} was not run: {UNSAVED_ASKED}")));
+        }
         match name {
             "run_command" => match self.command_start(v) {
                 Ok(p) => Started::Running(p),
@@ -4129,6 +4138,13 @@ mod tests {
         assert_eq!(r, Ok(OPEN_ASKED.to_owned()));
         assert!(matches!(a.dialog, Some(Dialog::Unsaved(crate::Leave::Open(_)))));
         assert_eq!(a.open.as_ref().unwrap().dir, first);
+        // While the question is open only the reading tools run, also later in the same answer.
+        let placed = a.agent_start("place_symbol", &json!({ "symbol": "wc.coil", "x": 20, "y": 20 }));
+        assert!(
+            matches!(&placed, Started::Done(Err(e)) if e.contains(UNSAVED_ASKED)),
+            "an edit waits for the answer"
+        );
+        assert!(matches!(a.agent_start("get_state", &json!({})), Started::Done(Ok(_))));
     }
 
     fn app(answers: Vec<Value>) -> (tempfile::TempDir, App) {

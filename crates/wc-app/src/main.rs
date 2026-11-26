@@ -4620,7 +4620,13 @@ impl App {
         let mut prefs = std::mem::take(&mut self.prefs);
         self.open_dir(dir, &mut prefs);
         self.prefs = prefs;
-        if let Err(e) = recorded {
+        if let Err(e) = &recorded
+            && matches!(self.dialog, Some(Dialog::Unsaved(_)))
+        {
+            // The open project's unsaved changes are asked about first: the question stays, and
+            // the new project is not open yet.
+            self.ed.message = format!("The new project's first version could not be recorded: {e}");
+        } else if let Err(e) = recorded {
             self.dialog = Some(Dialog::Message(match self.dialog.take() {
                 // Opening it failed too: both reasons show.
                 Some(Dialog::Message(m)) => format!("{m}\nIts first version could not be recorded either:\n{e}"),
@@ -5820,7 +5826,8 @@ impl eframe::App for App {
         // A fetched base project replaces the open one: not while a save waits for a typed
         // value, which first goes into the project it was asked for, nor while a close waits
         // for one, which asks about the project the value was typed in.
-        if self.after_typed.is_empty() && self.closing == Closing::No {
+        // Nor while an Open waits for its file dialog: it asks about the project open now.
+        if self.after_typed.is_empty() && self.closing == Closing::No && !matches!(self.pending, Some(Pending::Open)) {
             self.poll_fetch(ctx);
         } else {
             ctx.request_repaint();
