@@ -16,7 +16,8 @@
 //! atomically (temporary file, then rename) and only when its content changed, so version
 //! control shows real changes only and a crash never leaves a half-written file. A write counts
 //! as done only once it would last through a power loss: the new bytes are synced before the
-//! rename, and the folder is synced after it (see [`replace_whole`]).
+//! rename, and the folder is synced after it (see [`replace_whole`]). A folder whose sync failed
+//! stays owed until a later write or save in the same place gets it synced.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -102,9 +103,13 @@ fn to_toml<T: Serialize>(value: &T, path: &Path) -> Result<String> {
 /// Write `content` to `path` atomically, skipping the write when the file already holds it.
 /// Returns whether the file changed. A changed file is on disk when this returns (see
 /// [`replace_whole`]), and so is every folder this call had to make for it.
+///
+/// A folder sync that failed in an earlier write to this place is tried again here, also when
+/// the file already holds `content`: `Ok` means nothing is owed any more.
 pub fn write_if_changed(path: &Path, content: &str) -> Result<bool> {
     let mut folders = Folders::new();
     let changed = stage_if_changed(path, content, &mut folders);
+    add_owed(&folder_of(path), &mut folders);
     synced(changed, &folders)
 }
 
@@ -144,10 +149,15 @@ fn folder_of(path: &Path) -> PathBuf {
 
 /// Sync `folders`, then hand back `result`. The folders are synced after a failure too, so the
 /// files that did get into place before it are on disk; the failure is what is reported then.
+/// A folder whose sync failed is owed from then on (see [`OWED`]), one that got synced is not.
 fn synced<T>(result: Result<T>, folders: &Folders) -> Result<T> {
     let mut outcome = Ok(());
     for dir in folders {
-        let one = folder_synced(dir, sync_dir(dir));
+        let raw = sync_folder(dir);
+        // A folder that is not there has no entries left to keep.
+        let gone = raw.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+        let one = folder_synced(dir, raw);
+        settle(dir, one.is_err() && !gone);
         if outcome.is_ok() {
             outcome = one;
         }
@@ -155,6 +165,105 @@ fn synced<T>(result: Result<T>, folders: &Folders) -> Result<T> {
     let value = result?;
     outcome?;
     Ok(value)
+}
+
+/// The folders whose sync failed and was reported, by resolved path, each with the path it was
+/// synced under. The write that reported the failure left its files in place, so a second try
+/// finds nothing to write and would sync nothing: this list is what makes it sync the folder
+/// after all. An entry leaves the list when its folder gets synced, or is gone.
+///
+/// It is empty unless a folder sync failed, and then a write costs one look at it and no sync.
+/// It lasts as long as the process: a failure the process did not get to try again was reported
+/// as a failed write, and is not known to the next process.
+static OWED: std::sync::Mutex<BTreeMap<PathBuf, PathBuf>> = std::sync::Mutex::new(BTreeMap::new());
+
+fn owed() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, PathBuf>> {
+    OWED.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `dir` as a full path, as it is spelled (links not followed).
+fn spelled(dir: &Path) -> PathBuf {
+    std::path::absolute(dir).unwrap_or_else(|_| dir.to_owned())
+}
+
+/// `dir` as a full path with its links followed, so one folder has one name in [`OWED`].
+fn resolved(dir: &Path) -> PathBuf {
+    dir.canonicalize().unwrap_or_else(|_| spelled(dir))
+}
+
+/// Note whether the folder `dir` is owed a sync after an attempt.
+fn settle(dir: &Path, failed: bool) {
+    let mut owed = owed();
+    if failed {
+        owed.entry(resolved(dir)).or_insert_with(|| spelled(dir));
+    } else if !owed.is_empty() {
+        owed.remove(&resolved(dir));
+    }
+}
+
+/// Add to `folders` the folders owed a sync around `at`: `at` itself, the folders it lies in (a
+/// folder made for a write is an entry in the one above it) and the folders inside it (a save of
+/// a project folder covers its page folders).
+fn add_owed(at: &Path, folders: &mut Folders) {
+    let mut owed = owed();
+    if owed.is_empty() {
+        return;
+    }
+    owed.retain(|dir, _| dir.exists());
+    let (real, given) = (resolved(at), spelled(at));
+    let listed: Vec<PathBuf> = folders.iter().map(|f| resolved(f)).collect();
+    let near = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
+    for (dir, as_given) in owed.iter() {
+        if (near(dir, &real) || near(as_given, &given)) && !listed.contains(dir) {
+            folders.insert(dir.clone());
+        }
+    }
+}
+
+/// What a sync is of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Synced {
+    /// A staging file, before it gets its name.
+    File,
+    /// A folder, after its entries changed.
+    Folder,
+}
+
+/// Sync the staging `file` at `path`.
+fn sync_file(file: &fs::File, path: &Path) -> std::io::Result<()> {
+    watched(Synced::File, path)?;
+    file.sync_all()
+}
+
+/// [`sync_dir`] for the write path.
+fn sync_folder(dir: &Path) -> std::io::Result<()> {
+    watched(Synced::Folder, dir)?;
+    sync_dir(dir)
+}
+
+/// Every sync of the write path passes here first. Outside tests this does nothing.
+#[cfg(not(test))]
+fn watched(_what: Synced, _path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// What a test put in the way of the syncs its thread makes (see [`watched`]).
+#[cfg(test)]
+type SyncWatch = Box<dyn FnMut(Synced, &Path) -> std::io::Result<()>>;
+
+#[cfg(test)]
+thread_local! {
+    static SYNC_WATCH: std::cell::RefCell<Option<SyncWatch>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Every sync of the write path passes here first. A test sees each one through
+/// [`SYNC_WATCH`], and can fail it: the error it gives is the outcome of the sync.
+#[cfg(test)]
+fn watched(what: Synced, path: &Path) -> std::io::Result<()> {
+    SYNC_WATCH.with(|watch| match watch.borrow_mut().as_mut() {
+        Some(tell) => tell(what, path),
+        None => Ok(()),
+    })
 }
 
 /// Make the renames and removals in `dir` last on disk where the system allows it (Unix);
@@ -190,8 +299,7 @@ fn folder_synced(dir: &Path, outcome: std::io::Result<()>) -> Result<()> {
 /// write and leaves the file as it was. A folder that cannot be synced does not fail it.
 pub fn replace_whole(path: &Path, bytes: &[u8]) -> Result<()> {
     rename_staged(path, bytes)?;
-    let dir = folder_of(path);
-    folder_synced(&dir, sync_dir(&dir))
+    synced(Ok(()), &Folders::from([folder_of(path)]))
 }
 
 /// [`replace_whole`] without the folder sync.
@@ -234,7 +342,7 @@ fn write_staging(tmp: &Path, content: &[u8]) -> std::io::Result<()> {
     }
     let mut file = fs::OpenOptions::new().write(true).create_new(true).open(tmp)?;
     file.write_all(content)?;
-    file.sync_all()
+    sync_file(&file, tmp)
 }
 
 /// Load a whole project folder.
@@ -359,12 +467,14 @@ pub fn save_lock(dir: &Path, project: &Project) -> Result<bool> {
 ///
 /// Every file written is synced, and each folder the save changed (a file written or removed
 /// in it) is synced once at the end, so the whole save is on disk when this returns. Files that
-/// did not change cost no sync.
+/// did not change cost no sync. A folder sync that failed in an earlier save of this folder is
+/// tried again here, also when no file changed: `Ok` means nothing is owed any more.
 pub fn save(dir: &Path, project: &Project) -> Result<Vec<PathBuf>> {
     unique_ignoring_case("page", project.pages.iter().map(|p| p.id.as_str()))?;
     unique_ignoring_case("panel", project.panels.iter().map(|p| p.id.as_str()))?;
     let mut folders = Folders::new();
     let written = save_files(dir, project, &mut folders);
+    add_owed(dir, &mut folders);
     synced(written, &folders)
 }
 
@@ -1289,5 +1399,269 @@ mod staging_tests {
         assert!(write_if_changed(&path, "x\n").unwrap());
         assert_eq!(fs::read_to_string(&path).unwrap(), "x\n");
         assert!(!PathBuf::from(&tmp).exists());
+    }
+
+    /// Each sync this thread makes, in order, while the watch lives.
+    type Seen = std::rc::Rc<std::cell::RefCell<Vec<(Synced, PathBuf)>>>;
+
+    /// Takes the watch off the syncs again when it goes.
+    struct Watch;
+
+    impl Drop for Watch {
+        fn drop(&mut self) {
+            SYNC_WATCH.with(|watch| *watch.borrow_mut() = None);
+        }
+    }
+
+    /// Record every sync this thread makes, and fail the ones `fail` picks.
+    fn watch(fail: impl Fn(Synced, &Path) -> bool + 'static) -> (Watch, Seen) {
+        let seen = Seen::default();
+        let log = seen.clone();
+        let tell = move |what: Synced, path: &Path| {
+            log.borrow_mut().push((what, path.to_owned()));
+            if fail(what, path) {
+                return Err(std::io::Error::other("the disk went away"));
+            }
+            Ok(())
+        };
+        SYNC_WATCH.with(|watch| *watch.borrow_mut() = Some(Box::new(tell)));
+        (Watch, seen)
+    }
+
+    /// The syncs seen so far, and none of them after this.
+    fn taken(seen: &Seen) -> Vec<(Synced, PathBuf)> {
+        std::mem::take(&mut *seen.borrow_mut())
+    }
+
+    fn folders_of(seen: &Seen) -> Vec<PathBuf> {
+        let all = taken(seen);
+        all.into_iter()
+            .filter(|(what, _)| *what == Synced::Folder)
+            .map(|(_, p)| p)
+            .collect()
+    }
+
+    fn staging_of(path: &Path) -> PathBuf {
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        PathBuf::from(tmp)
+    }
+
+    #[test]
+    fn the_staged_file_is_synced_before_it_gets_its_name_and_the_folder_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = resolved(dir.path());
+        let path = root.join("devices.json");
+        fs::write(&path, "old\n").unwrap();
+
+        // What the file under the real name held at each sync.
+        let held = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (at, log) = (path.clone(), held.clone());
+        let tell = move |what: Synced, synced: &Path| {
+            let holds = fs::read_to_string(&at)?;
+            log.borrow_mut().push((what, synced.to_owned(), holds));
+            Ok(())
+        };
+        SYNC_WATCH.with(|watch| *watch.borrow_mut() = Some(Box::new(tell)));
+        let _watch = Watch;
+
+        assert!(write_if_changed(&path, "new\n").unwrap());
+        assert_eq!(
+            *held.borrow(),
+            [
+                (Synced::File, staging_of(&path), "old\n".to_string()),
+                (Synced::Folder, root.clone(), "new\n".to_string()),
+            ]
+        );
+
+        held.borrow_mut().clear();
+        replace_whole(&path, b"newer\n").unwrap();
+        assert_eq!(
+            *held.borrow(),
+            [
+                (Synced::File, staging_of(&path), "new\n".to_string()),
+                (Synced::Folder, root, "newer\n".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_staged_file_that_cannot_be_synced_never_gets_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = resolved(dir.path());
+        let path = root.join("devices.json");
+        fs::write(&path, "old\n").unwrap();
+        let (_watch, seen) = watch(|what, _| what == Synced::File);
+
+        let failed = write_if_changed(&path, "new\n").unwrap_err().to_string();
+        assert!(
+            failed.contains("devices.json.tmp") && failed.contains("the disk went away"),
+            "{failed}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "old\n");
+        assert_eq!(files_under(&root), [PathBuf::from("devices.json")]);
+        // No entry changed, so no folder is synced.
+        assert_eq!(taken(&seen), [(Synced::File, staging_of(&path))]);
+
+        assert!(replace_whole(&path, b"new\n").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "old\n");
+        assert_eq!(files_under(&root), [PathBuf::from("devices.json")]);
+        assert_eq!(taken(&seen), [(Synced::File, staging_of(&path))]);
+    }
+
+    fn three_pages() -> Project {
+        let mut p = Project::new("Demo");
+        for i in 0..3 {
+            p.pages.push(Page::new(format!("p{i:04}"), i.to_string(), "Page"));
+        }
+        p
+    }
+
+    #[test]
+    fn a_save_syncs_each_file_it_writes_and_each_folder_it_changed_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = resolved(dir.path());
+        let pages = root.join(PAGES_DIR);
+        let mut p = three_pages();
+        let (_watch, seen) = watch(|_, _| false);
+
+        // Six files, two folders: the three pages share one folder sync, after all the files.
+        let written = save(&root, &p).unwrap();
+        assert_eq!(written.len(), 6);
+        let mut expected: Vec<(Synced, PathBuf)> = written.iter().map(|w| (Synced::File, staging_of(w))).collect();
+        expected.push((Synced::Folder, root.clone()));
+        expected.push((Synced::Folder, pages.clone()));
+        assert_eq!(taken(&seen), expected);
+
+        // Nothing changed: no sync at all.
+        assert!(save(&root, &p).unwrap().is_empty());
+        assert_eq!(taken(&seen), []);
+
+        // One page changed: its file and its folder, nothing else.
+        p.pages[1].title = "Changed".into();
+        let page = pages.join(format!("p0001{PAGE_SUFFIX}"));
+        assert_eq!(save(&root, &p).unwrap(), std::slice::from_ref(&page));
+        assert_eq!(
+            taken(&seen),
+            [(Synced::File, staging_of(&page)), (Synced::Folder, pages.clone())]
+        );
+
+        // A page removed: no file to sync, and the folder it left.
+        p.pages.pop();
+        assert!(save(&root, &p).unwrap().is_empty());
+        assert_eq!(taken(&seen), [(Synced::Folder, pages)]);
+    }
+
+    #[test]
+    fn a_folder_sync_that_fails_after_a_failed_write_leaves_the_first_failure_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = resolved(dir.path());
+        let pages = root.join(PAGES_DIR);
+        let mut p = three_pages();
+        // The second page cannot be written, after the first is in place.
+        p.pages[1].id = "not a file name".into();
+        let (_watch, seen) = watch(|what, _| what == Synced::Folder);
+
+        let failed = save(&root, &p);
+        assert!(
+            matches!(&failed, Err(Error::Invalid(m)) if m.contains("not a file name")),
+            "{failed:?}"
+        );
+        // Both folders with a file in place were still synced, failing or not.
+        assert_eq!(folders_of(&seen), [root.clone(), pages.clone()]);
+        assert!(pages.join(format!("p0000{PAGE_SUFFIX}")).exists());
+
+        // With no write failure, the folder sync failure is the one reported.
+        p.pages[1].id = "p0001".into();
+        let failed = save(&root, &p).unwrap_err().to_string();
+        assert!(failed.contains("the disk went away"), "{failed}");
+    }
+
+    #[test]
+    fn a_folder_whose_sync_failed_is_synced_by_the_next_write_of_the_same_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = resolved(dir.path());
+        let symbols = root.join("vendor").join("symbols");
+        let path = symbols.join("a.json");
+        let broken = std::rc::Rc::new(std::cell::Cell::new(true));
+        let now = broken.clone();
+        let (_watch, seen) = watch(move |what, _| what == Synced::Folder && now.get());
+        let owed = [root.clone(), root.join("vendor"), symbols.clone()];
+
+        // The file gets into place, with the two folders made for it; no folder sync holds.
+        assert!(write_if_changed(&path, "{}\n").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{}\n");
+        assert_eq!(folders_of(&seen), owed);
+
+        // A second try has nothing to write. It still fails while the folders cannot be synced.
+        assert!(write_if_changed(&path, "{}\n").is_err());
+        assert_eq!(taken(&seen), owed.clone().map(|dir| (Synced::Folder, dir)));
+
+        // Once they can, it syncs all three and says the file did not change.
+        broken.set(false);
+        assert!(!write_if_changed(&path, "{}\n").unwrap());
+        assert_eq!(taken(&seen), owed.map(|dir| (Synced::Folder, dir)));
+
+        // Nothing is owed after that: an unchanged file costs no sync again.
+        assert!(!write_if_changed(&path, "{}\n").unwrap());
+        assert_eq!(taken(&seen), []);
+
+        // A changed file whose folder is owed syncs that folder once, not twice.
+        broken.set(true);
+        assert!(write_if_changed(&path, "[]\n").is_err());
+        broken.set(false);
+        taken(&seen);
+        assert!(write_if_changed(&path, "{}\n").unwrap());
+        assert_eq!(folders_of(&seen), [symbols]);
+    }
+
+    #[test]
+    fn a_save_that_only_removed_a_file_still_owes_the_folder_sync_that_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = resolved(dir.path());
+        let pages = root.join(PAGES_DIR);
+        let mut p = three_pages();
+        save(&root, &p).unwrap();
+
+        let broken = std::rc::Rc::new(std::cell::Cell::new(true));
+        let now = broken.clone();
+        let (_watch, seen) = watch(move |what, _| what == Synced::Folder && now.get());
+        p.pages.pop();
+        assert!(save(&root, &p).is_err());
+        assert!(!pages.join(format!("p0002{PAGE_SUFFIX}")).exists());
+        assert_eq!(taken(&seen), [(Synced::Folder, pages.clone())]);
+
+        // The file is gone, so the next save finds nothing to do but the sync it owes.
+        broken.set(false);
+        assert!(save(&root, &p).unwrap().is_empty());
+        assert_eq!(taken(&seen), [(Synced::Folder, pages.clone())]);
+        assert!(save(&root, &p).unwrap().is_empty());
+        assert_eq!(taken(&seen), []);
+
+        // A write elsewhere in the project folder gets an owed page folder synced too.
+        broken.set(true);
+        p.pages.pop();
+        assert!(save(&root, &p).is_err());
+        broken.set(false);
+        taken(&seen);
+        let meta = fs::read_to_string(root.join(PROJECT_FILE)).unwrap();
+        assert!(!write_if_changed(&root.join(PROJECT_FILE), &meta).unwrap());
+        assert_eq!(taken(&seen), [(Synced::Folder, pages)]);
+    }
+
+    #[test]
+    fn an_owed_folder_that_is_gone_is_owed_no_more() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = resolved(dir.path());
+        let pages = root.join(PAGES_DIR);
+        let path = pages.join("a.json");
+        fs::create_dir(&pages).unwrap();
+        let (_watch, seen) = watch(|what, path| what == Synced::Folder && path.ends_with(PAGES_DIR));
+
+        assert!(write_if_changed(&path, "{}\n").is_err());
+        fs::remove_dir_all(&pages).unwrap();
+        taken(&seen);
+        assert!(write_if_changed(&root.join("b.json"), "{}\n").unwrap());
+        assert_eq!(folders_of(&seen), [root]);
     }
 }
