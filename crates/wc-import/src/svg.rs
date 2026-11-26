@@ -99,14 +99,29 @@ fn attr(e: &BytesStart, name: &str) -> Option<String> {
 }
 
 /// A presentation value such as `fill`: a property of the same name in `style` wins over the
-/// attribute (`style="fill:#000"` over `fill="none"`).
+/// attribute (`style="fill:#000"` over `fill="none"`). Within `style`, an `!important`
+/// declaration wins over a normal one, and the last one wins between equals.
 fn presentation(e: &BytesStart, name: &str) -> Option<String> {
     attr(e, "style")
         .and_then(|st| {
-            st.split(';').rev().find_map(|decl| {
-                let (k, v) = decl.split_once(':')?;
-                k.trim().eq_ignore_ascii_case(name).then(|| v.trim().to_owned())
-            })
+            let decls: Vec<String> = st
+                .split(';')
+                .filter_map(|decl| {
+                    let (k, v) = decl.split_once(':')?;
+                    k.trim().eq_ignore_ascii_case(name).then(|| v.trim().to_owned())
+                })
+                .collect();
+            let important = |v: &String| {
+                v.len()
+                    .checked_sub("!important".len())
+                    .is_some_and(|i| v.is_char_boundary(i) && v[i..].eq_ignore_ascii_case("!important"))
+            };
+            decls
+                .iter()
+                .rev()
+                .find(|v| important(v))
+                .or_else(|| decls.last())
+                .cloned()
         })
         .or_else(|| attr(e, name))
 }
@@ -863,10 +878,16 @@ mod tests {
             <rect width="1" height="1" style="fill:rgb(100%, 100%, 100%)"/>
             <rect width="1" height="1" fill="rgb(255,0,0)"/>
             <rect width="1" height="1" fill="rgb(0%,0%,0%)"/>
+            <rect width="1" height="1" style="fill:none!important;fill:black"/>
+            <rect width="1" height="1" style="fill:black !important;fill:none"/>
+            <rect width="1" height="1" style="fill:black;fill:none"/>
+            <rect width="1" height="1" style="fill:none;fill:black"/>
         </svg>"##;
         assert_eq!(
             fills_of(svg)?,
-            vec![false, false, true, false, false, false, true, true]
+            vec![
+                false, false, true, false, false, false, true, true, false, true, false, true
+            ]
         );
         Ok(())
     }
