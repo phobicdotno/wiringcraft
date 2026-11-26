@@ -4,6 +4,8 @@ WiringCraft writes the project's terminal strips as a list for the WAGO configur
 (smartDESIGNER). The app has it under File → WAGO configurator (ribbon: Start → Project → WAGO
 configurator) and asks where to save it, starting at
 `export/wago-configurator.csv`; the command line has `wiringcraft export wago-configurator <out>`.
+The assistant writes the same list with its `export` tool (format `wago-configurator`), straight
+to `export/wago-configurator.csv` without asking.
 
 The file is written the same way as the [smartScript marker export](wago-marking.md):
 semicolon-separated UTF-8 with a byte-order mark and CRLF line ends, so Excel and the WAGO tools

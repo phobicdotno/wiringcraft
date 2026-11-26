@@ -243,7 +243,7 @@ For the other areas, the chapter to read in each help is:
 |---|---|---|---|---|
 | Scripting API | yes (C# scripts, API) | yes (API) | yes: the `wiringcraft` command line | done |
 | Generating schematics from tables or configurators | add-on (Cogineer) | no | partly: the assistant draws from plain words | later |
-| AI assistant that edits the open project | no | no | yes | done |
+| AI assistant that edits the open project | no | no | yes: its `get_state` also tells how the grid, auto-wiring, checking while drawing, theme and menu style are set, so it switches one knowingly | done |
 | Log file for bug reports | yes | yes | yes | done (#48) |
 
 ## 16. Other disciplines
