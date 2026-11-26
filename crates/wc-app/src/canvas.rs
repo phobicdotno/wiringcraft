@@ -2444,6 +2444,12 @@ fn wire_tool(
         },
         None => Endpoint::Point { at: cur },
     };
+    // A pin is always on the sheet; a free start, bend or end must be too.
+    let off_sheet = near.is_none() && !on_paper(open, ed.page, cur);
+    if off_sheet && (resp.double_clicked() || resp.clicked_by(egui::PointerButton::Primary)) {
+        ed.message = "Click on the sheet to draw the wire.".into();
+        return;
+    }
     if resp.double_clicked() {
         if let Some((start, mut via)) = ed.wire.take() {
             // The first click of the double click already added this point as a bend.
@@ -4079,6 +4085,48 @@ mod tests {
         painted(ctx, o, ed, t, vec![egui::Event::PointerMoved(pos)]);
         painted(ctx, o, ed, t + 0.01, vec![button(true)]);
         painted(ctx, o, ed, t + 0.02, vec![button(false)]);
+    }
+
+    #[test]
+    fn the_wire_tool_takes_no_start_bend_or_free_end_outside_the_sheet() {
+        let (_tmp, mut o) = project();
+        let mut ed = Editor {
+            tool: Tool::Wire,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        painted(&ctx, &mut o, &mut ed, 0.5, vec![]);
+        // Pan the sheet right and down so the top-left of the canvas is off the paper.
+        ed.view = View {
+            zoom: 3.0,
+            offset: Vec2::new(300.0, 300.0),
+            fit: false,
+        };
+        let (off, on) = (egui::pos2(40.0, 40.0), egui::pos2(500.0, 450.0));
+        let wires = |o: &Open| o.project.pages[0].wires.len();
+
+        // A click outside the sheet starts no wire.
+        click_at(&ctx, &mut o, &mut ed, off, 1.0);
+        assert!(!on_paper(&o, 0, ed.cursor.unwrap()), "{:?}", ed.cursor);
+        assert!(ed.wire.is_none());
+        assert_eq!(ed.message, "Click on the sheet to draw the wire.");
+
+        // Started on the sheet, a click outside adds no bend and a double-click there no end.
+        click_at(&ctx, &mut o, &mut ed, on, 2.0);
+        assert!(on_paper(&o, 0, ed.cursor.unwrap()), "{:?}", ed.cursor);
+        assert!(ed.wire.as_ref().is_some_and(|(_, via)| via.is_empty()));
+        click_at(&ctx, &mut o, &mut ed, off, 3.0);
+        click_at(&ctx, &mut o, &mut ed, off, 3.1);
+        assert!(ed.wire.as_ref().is_some_and(|(_, via)| via.is_empty()), "{:?}", ed.wire);
+        assert_eq!(wires(&o), 0);
+
+        // A double-click on the sheet still ends the wire on a free point.
+        let end = on + Vec2::new(60.0, 40.0);
+        click_at(&ctx, &mut o, &mut ed, end, 4.0);
+        click_at(&ctx, &mut o, &mut ed, end, 4.1);
+        assert!(ed.wire.is_none());
+        assert_eq!(wires(&o), 1);
     }
 
     /// Page 2 with a free text, a numbered wire, a coil -K1 whose contact is on page 3 (so a
