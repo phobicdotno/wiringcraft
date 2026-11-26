@@ -111,7 +111,7 @@ pub(crate) fn draw_mapped(
     shapes(
         d,
         ents,
-        Xf { m, at: (0.0, 0.0), rot },
+        Xf { m, rot, ..Xf::ID },
         1.0,
         0,
         &|_| false,
@@ -231,6 +231,9 @@ fn parse(text: &str) -> Result<Drawing> {
 /// unevenly scaled ones compose exactly, plus the sum of the turns for text directions.
 #[derive(Debug, Clone, Copy)]
 struct Xf {
+    /// The block's base point, taken off each coordinate before anything else: kept apart from
+    /// `at` so a far base point does not swallow a small move such as an array copy's offset.
+    base: (f64, f64),
     /// Linear part, row by row: x' = m[0] x + m[1] y, y' = m[2] x + m[3] y.
     m: [f64; 4],
     at: (f64, f64),
@@ -240,6 +243,7 @@ struct Xf {
 
 impl Xf {
     const ID: Xf = Xf {
+        base: (0.0, 0.0),
         m: [1.0, 0.0, 0.0, 1.0],
         at: (0.0, 0.0),
         rot: 0.0,
@@ -252,21 +256,25 @@ impl Xf {
             m: [c * sx, -s * sy, s * sx, c * sy],
             at,
             rot,
+            ..Xf::ID
         }
     }
-    /// A move by `by`.
-    fn shift(by: (f64, f64)) -> Xf {
-        Xf { at: by, ..Xf::ID }
+    /// A move that puts the base point `base` on (0, 0).
+    fn from_base(base: (f64, f64)) -> Xf {
+        Xf { base, ..Xf::ID }
     }
     /// DXF coordinates (y up) to DXF coordinates.
     fn apply(&self, x: f64, y: f64) -> (f64, f64) {
+        let (x, y) = (x - self.base.0, y - self.base.1);
         let m = &self.m;
         (self.at.0 + m[0] * x + m[1] * y, self.at.1 + m[2] * x + m[3] * y)
     }
-    /// This placement inside `outer`: `outer` applied after this one.
+    /// This placement inside `outer`: `outer` applied after this one. This one's base point
+    /// stays apart; `outer`'s is taken off this one's origin.
     fn then(&self, outer: &Xf) -> Xf {
         let (a, b) = (&outer.m, &self.m);
         Xf {
+            base: self.base,
             m: [
                 a[0] * b[0] + a[1] * b[2],
                 a[0] * b[1] + a[1] * b[3],
@@ -697,7 +705,7 @@ fn shapes(
                     let cell_xf = |col: usize, row: usize| {
                         let (col, row) = (col as f64 * dx, row as f64 * dy);
                         let at = (ix + c * col - s * row, iy + s * col + c * row);
-                        Xf::shift((-bx, -by)).then(&Xf::insert(at, sx, sy, rot)).then(&xf)
+                        Xf::from_base((bx, by)).then(&Xf::insert(at, sx, sy, rot)).then(&xf)
                     };
                     // Copies too deep would only be turned away, without taking from the
                     // budget: counted at once instead of one by one.
@@ -740,7 +748,7 @@ fn shapes(
                 if let Some((name, inner)) = e.get(2).and_then(|n| d.block(n)) {
                     // Placed by its base point like any block (normally (0, 0) for a dimension).
                     let (bx, by) = d.bases.get(name).copied().unwrap_or_default();
-                    let dxf = Xf::shift((-bx, -by)).then(&xf);
+                    let dxf = Xf::from_base((bx, by)).then(&xf);
                     shapes(
                         d,
                         inner,
@@ -3829,8 +3837,7 @@ mod tests {
         assert_eq!(g.len(), 1, "{g:?}");
         assert!(g.iter().all(finite_shape), "{g:?}");
         assert_eq!(skipped.get(LINE_NOT_NUMBERS), Some(&1), "{skipped:?}");
-        // A block whose base point is far out: the placement's own origin overflows once
-        // scaled, but the line drawn from it is in range and kept.
+        // A block whose base point is far out: the line drawn from it is in range and kept.
         let based = "0\nBLOCK\n2\nFAR\n10\n1e308\n20\n0\n0\nLINE\n10\n1e308\n20\n0\n11\n1e308\n21\n1\n0\nENDBLK\n";
         for ents in [
             "0\nINSERT\n2\nFAR\n10\n0\n20\n0\n",
@@ -4322,6 +4329,44 @@ mod tests {
             _ => false,
         };
         assert!(g.len() == 1 && g.iter().all(placed), "{g:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn array_copies_of_a_block_with_a_far_base_point_stay_apart() -> Result<()> {
+        // The base point is far past the column spacing: the spacing must not be lost to it.
+        let blocks = "0\nBLOCK\n2\nFAR\n10\n1e308\n20\n0\n0\nLINE\n10\n1e308\n20\n0\n11\n1e308\n21\n1\n0\nENDBLK\n";
+        let d = parse(&dxf("0\nINSERT\n2\nFAR\n10\n0\n20\n0\n70\n2\n44\n5\n", blocks))?;
+        let (mut raw, mut skipped) = (Vec::new(), BTreeMap::new());
+        shapes(
+            &d,
+            &d.entities,
+            Xf::ID,
+            2.0,
+            0,
+            &|_| false,
+            &|_| false,
+            &mut raw,
+            &mut Vec::new(),
+            &mut skipped,
+            &mut { MAX_DRAWN },
+        );
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let lines: Vec<(Point, Point)> = raw
+            .iter()
+            .filter_map(|(_, s)| match s {
+                Shape::Line { a, b } => Some((*a, *b)),
+                _ => None,
+            })
+            .collect();
+        // At page scale 2: the copies start at x = 0 and x = 10 and run 2 up the page.
+        assert_eq!(
+            lines,
+            [
+                (Point::new(0.0, 0.0), Point::new(0.0, -2.0)),
+                (Point::new(10.0, 0.0), Point::new(10.0, -2.0)),
+            ]
+        );
         Ok(())
     }
 
