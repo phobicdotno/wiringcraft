@@ -314,7 +314,157 @@ fn table_of_contents_goes_first_and_its_rows_link_to_pages() {
     // The contents rows jump to the schematic pages, which are now the 2nd and 3rd page objects.
     assert!(text.contains("/Dest [9 0 R /Fit]"), "row 1 -> page 1");
     assert!(text.contains("/Dest [12 0 R /Fit]"), "row 2 -> page 2");
+    // The third row is the parts list (#693).
+    assert_eq!(text.matches("/Subtype /Link").count(), 3);
+}
+
+#[test]
+fn table_of_contents_lists_the_sheets_after_the_schematic_pages() {
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Mains")];
+    let band = project.meta.template.band_height();
+    let per_page = layout::rows_per_page(layout::report_size(project.pages[0].size, band, 1), band);
+    // One row short of a full page, so the rows of the later sheets run onto a second page.
+    let mut rows = vec![vec!["1".to_owned(), "Mains".to_owned()]];
+    rows.resize(per_page - 1, vec![String::new(), "Note".to_owned()]);
+    let contents = wc_report::Table {
+        title: "Table of contents".into(),
+        columns: vec!["Page".into(), "Title".into()],
+        rows,
+        row_pages: vec!["p1".into()],
+        front: true,
+        ..Default::default()
+    };
+    let parts = wc_report::Table {
+        title: "Parts list".into(),
+        columns: vec!["Part".into()],
+        ..Default::default()
+    };
+    let opts = Options {
+        reports: vec![contents, parts],
+        panels: vec![wc_core::panel::Panel::with_rails("main", "Cabinet", 600.0, 800.0)],
+        networks: vec![wc_core::network::Network {
+            name: "PN1".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    // Two contents pages, the schematic page, the panel, the parts list and the network.
+    assert_eq!(report.pages, 6);
+    let at = |title: &str| {
+        text.find(&format!("/Title {}", writer::pdf_text(title)))
+            .unwrap_or(usize::MAX)
+    };
+    assert!(at("R2 Table of contents (2/2)") < usize::MAX);
+    // The parts list is the third report page, after the two contents pages.
+    assert!(at("R3 Parts list") < usize::MAX);
+    let shows = |s: &str| text.contains(&format!("{} Tj", writer::pdf_text(s)));
+    for cell in ["P1", "Cabinet", "R3", "Parts list", "N1", "Network PN1"] {
+        assert!(shows(cell), "{cell}");
+    }
+    // The schematic page and the three later sheets are linked from the contents.
+    assert_eq!(text.matches("/Subtype /Link").count(), 4);
+}
+
+/// A contents table as `wc_report::contents` builds it, with `rows` of (page, title).
+fn contents_table(rows: &[(&str, &str)], row_pages: &[&str]) -> wc_report::Table {
+    wc_report::Table {
+        title: "Table of contents".into(),
+        columns: ["Page", "Title", "Devices", "Wires"].map(String::from).to_vec(),
+        rows: rows
+            .iter()
+            .map(|(p, t)| vec![(*p).to_owned(), (*t).to_owned(), String::new(), String::new()])
+            .collect(),
+        row_pages: row_pages.iter().map(|p| (*p).to_owned()).collect(),
+        front: true,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn later_sheets_fill_the_columns_of_a_contents_layout() {
+    use wc_core::report_layout::{ReportColumn, ReportLayout};
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Mains")];
+    // The project's layout shows the title first and the page renamed, without the counts.
+    let layout = ReportLayout {
+        columns: vec![
+            ReportColumn {
+                from: "Title".into(),
+                heading: None,
+            },
+            ReportColumn {
+                from: "Page".into(),
+                heading: Some("Sheet".into()),
+            },
+        ],
+        ..Default::default()
+    };
+    let contents = contents_table(&[("1", "Mains")], &["p1"]).with_layout(&layout);
+    let parts = wc_report::Table {
+        title: "Parts list".into(),
+        columns: vec!["Part".into()],
+        ..Default::default()
+    };
+    let opts = Options {
+        reports: vec![contents, parts],
+        ..Default::default()
+    };
+    let (pdf, _) = export(&project, &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    let at = |s: &str| text.find(&format!("{} Tj", writer::pdf_text(s)));
+    // The row reads "Parts list | R2", like "Mains | 1" above it.
+    let (Some(mains), Some(sheet), Some(title), Some(number)) = (at("Mains"), at("Sheet"), at("Parts list"), at("R2"))
+    else {
+        unreachable!("the contents shows both rows")
+    };
+    assert!(sheet < mains && mains < title && title < number);
+    // Both on the contents page, not "R2" from the parts list's own sheet.
+    assert!(!text[title..number].contains("endstream"));
     assert_eq!(text.matches("/Subtype /Link").count(), 2);
+}
+
+#[test]
+fn a_contents_grouped_by_page_counts_a_heading_per_later_sheet() {
+    use wc_core::report_layout::ReportLayout;
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Mains")];
+    let band = project.meta.template.band_height();
+    let per_page = layout::rows_per_page(layout::report_size(project.pages[0].size, band, 2), band);
+    // Page 1 as a heading with its rows takes all but three lines. The panel and the parts
+    // list then each take a heading and a row: four lines, so the parts list row runs onto
+    // a second contents page and the parts list itself is R3.
+    let mut rows = vec![("1", "Mains")];
+    rows.resize(per_page - 4, ("1", "Note"));
+    let layout = ReportLayout {
+        group: Some("Page".into()),
+        ..Default::default()
+    };
+    let contents = contents_table(&rows, &["p1"]).with_layout(&layout);
+    let parts = wc_report::Table {
+        title: "Parts list".into(),
+        columns: vec!["Part".into()],
+        ..Default::default()
+    };
+    let opts = Options {
+        reports: vec![contents, parts],
+        panels: vec![wc_core::panel::Panel::with_rails("main", "Cabinet", 600.0, 800.0)],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    assert_eq!(report.pages, 5);
+    let has = |title: &str| text.contains(&format!("/Title {}", writer::pdf_text(title)));
+    assert!(has("R2 Table of contents (2/2)"));
+    assert!(has("R3 Parts list"));
+    // The parts list's row in the contents is headed R3: the last text before its title.
+    let Some(title) = text.find(&format!("{} Tj", writer::pdf_text("Parts list"))) else {
+        unreachable!("the contents lists the parts list")
+    };
+    let row = text[..title].rsplit("Tj").nth(1).unwrap_or_default();
+    assert!(row.contains(&writer::pdf_text("Page: R3")), "{row}");
 }
 
 #[test]
@@ -2453,4 +2603,25 @@ fn a_project_with_nothing_to_print_says_so() {
         "{:?}",
         report.warnings
     );
+}
+
+#[test]
+fn bookmarks_and_the_document_title_are_text_strings_not_font_codes() {
+    // A reader decodes bookmark titles as PDFDocEncoding or UTF-16: the page font's WinAnsi
+    // en dash (0x96) would show as "Œ" there, and Ω could not be written at all (#726).
+    let mut project = Project::new("Pumpe – Ålesund");
+    project.pages = vec![Page::new("p1", "1", "Motor – pump Ω"), Page::new("p2", "2", "Control")];
+    let (pdf, _) = export(&project, &BTreeMap::new(), &Options::default());
+    let text = String::from_utf8_lossy(&pdf);
+    let utf16 = |s: &str| -> String {
+        let units: String = s.encode_utf16().map(|u| format!("{u:04X}")).collect();
+        format!("<FEFF{units}>")
+    };
+    assert_eq!(writer::pdf_text_string("1 Motor – pump Ω"), utf16("1 Motor – pump Ω"));
+    assert!(text.contains(&format!("/Title {}", utf16("1 Motor – pump Ω"))));
+    assert!(text.contains(&format!("/Title {} /Producer", utf16("Pumpe – Ålesund"))));
+    // Plain ASCII titles stay as they were, the same bytes in every encoding.
+    assert!(text.contains(&format!("/Title {}", writer::pdf_text("2 Control"))));
+    // The page itself still draws the title with the font's own codes.
+    assert!(text.contains(&format!("{} Tj", writer::pdf_text("Motor – pump Ω"))));
 }

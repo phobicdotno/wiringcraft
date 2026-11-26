@@ -4854,7 +4854,7 @@ impl Journal {
         }
         // Without its folder entry on disk a power loss could lose the journal after the first
         // write: stop before writing anything.
-        if let Err(x) = sync_dir(dir) {
+        if let Err(x) = store::sync_dir(dir) {
             let removed = std::fs::remove_file(&path);
             drop(file);
             return Err(match removed {
@@ -4876,7 +4876,7 @@ impl Journal {
             Err(x) => Err(format!(
                 "removing {shown} failed: {x}; remove that file, or the next run puts the project back as it was before the edit"
             )),
-            Ok(()) => sync_dir(dir).map_err(|x| {
+            Ok(()) => store::sync_dir(dir).map_err(|x| {
                 format!(
                     "{shown} is removed, but making that last on disk failed ({x}); after a power loss the next run may put the project back as it was before the edit"
                 )
@@ -4885,16 +4885,6 @@ impl Journal {
         drop(self.file);
         removed
     }
-}
-
-/// Make the renames and removals in `dir` last on disk where the system allows it (Unix);
-/// elsewhere the rename itself is what the system keeps.
-fn sync_dir(dir: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    std::fs::File::open(dir)?.sync_all()?;
-    #[cfg(not(unix))]
-    let _ = dir;
-    Ok(())
 }
 
 /// The name a journal keeps for `file`: its path inside `dir` with `/` between the parts.
@@ -5106,7 +5096,7 @@ fn undo_stopped_box_edit(dir: &Path) -> Res<Option<String>> {
     // The files put back are on disk before the journal goes, or it stays for the next run.
     sync_folders(&files).map_err(|x| format!("a box-edit run stopped half way; its files are put back, but {x}"))?;
     std::fs::remove_file(&path).map_err(|x| format!("{shown}: {x}"))?;
-    sync_dir(dir).map_err(|x| format!("{}: {x}", escape_field(&dir.display().to_string())))?;
+    store::sync_dir(dir).map_err(|x| format!("{}: {x}", escape_field(&dir.display().to_string())))?;
     drop(file);
     Ok(Some(
         "a box-edit run stopped before it had written every file; the project files are put back as they were before it".into(),
@@ -5255,7 +5245,7 @@ fn sync_folders(files: &[(PathBuf, Option<Vec<u8>>)]) -> Res<()> {
     folders.sort();
     folders.dedup();
     for folder in folders {
-        match sync_dir(folder) {
+        match store::sync_dir(folder) {
             Err(x) if x.kind() != std::io::ErrorKind::NotFound => {
                 return Err(format!("{}: {x}", escape_field(&folder.display().to_string())));
             }
