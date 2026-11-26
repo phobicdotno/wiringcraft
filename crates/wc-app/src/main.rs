@@ -3830,10 +3830,10 @@ fn attach_target(kind: panels::Attach, part: &str, dir: &Path, pick: PickOpen<'_
 /// The file typed in a path form, when it is one.
 fn typed_file(field: &prefs::FolderField) -> Result<PathBuf, String> {
     let f = field.path()?;
-    if f.is_file() {
-        Ok(f)
-    } else {
-        Err(format!("{} is not a file.", f.display()))
+    match std::fs::metadata(&f) {
+        Ok(m) if m.is_file() => Ok(f),
+        Ok(_) => Err(format!("{} is not a file.", f.display())),
+        Err(e) => Err(format!("{}: {e}", f.display())),
     }
 }
 
@@ -5959,7 +5959,11 @@ mod marking_tests {
 
         // The typed path must name a file.
         let typed = prefs::FolderField::typed(dxf.display().to_string());
-        assert!(typed_file(&typed).unwrap_err().contains("is not a file"));
+        // A missing file says why it cannot be read; a folder is not a file.
+        let missing = typed_file(&typed).unwrap_err();
+        assert!(missing.starts_with(&format!("{}: ", dxf.display())), "{missing}");
+        let folder = prefs::FolderField::typed(dir.display().to_string());
+        assert!(typed_file(&folder).unwrap_err().contains("is not a file"));
         std::fs::write(&dxf, "0\nEOF\n").unwrap();
         assert_eq!(typed_file(&typed), Ok(dxf.clone()));
         assert!(typed_file(&prefs::FolderField::default()).is_err());
