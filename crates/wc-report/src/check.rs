@@ -73,6 +73,8 @@ pub fn check_with(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet]) -> V
     let p = i.project;
     let mut out = Vec::new();
     let role = |symbol: &str| i.symbols.get(symbol).map(|s| s.role);
+    // Connections outside overview pages, by wire place; cable cores and wire numbers share them.
+    let wire_net = wire_nets_off_overview(i);
 
     // Revision clouds whose revision the project does not list.
     for page in &p.pages {
@@ -376,7 +378,7 @@ pub fn check_with(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet]) -> V
         }
     }
 
-    cable_cores(i, &mut out);
+    cable_cores(i, &wire_net, &mut out);
 
     // Shorts: one net carrying two potential names (for example L1 and L2).
     let nets = wc_core::connectivity::nets_linked(p, |id| i.symbols.get(id).map(|s| s.role));
@@ -400,7 +402,7 @@ pub fn check_with(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet]) -> V
         }
     }
 
-    wire_numbers(i, &mut out);
+    wire_numbers(i, &wire_net, &mut out);
 
     // Panel layouts: devices covering each other, sticking out of the plate, or whose tag is
     // no longer in the project. Outlines that only touch do not overlap. A tag is in the project
@@ -477,22 +479,28 @@ pub fn check_with(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet]) -> V
     out
 }
 
+/// Each wire's connection (net), keyed by its place (page index, wire index): ids need not be
+/// unique on a page.
+type WireNets = BTreeMap<(usize, usize), usize>;
+
+/// The connections of the wiring outside overview pages, by wire place. An overview wire can
+/// carry potentials or link interruption points and so join two connections into one net, which
+/// would hide a reused wire number or cable core, or make up two numbers on one connection.
+/// Pages keep their places, so page indices stay the same; overview wires get no entry.
+fn wire_nets_off_overview(i: &Inputs<'_>) -> WireNets {
+    let mut wiring = i.project.clone();
+    for page in wiring.pages.iter_mut().filter(|pg| pg.overview) {
+        page.wires.clear();
+    }
+    wc_core::connectivity::wire_nets_by_place(&wiring, |id| i.symbols.get(id).map(|s| s.role)).1
+}
+
 /// Wire numbers that do not name one connection each: a connection (net) whose wires carry
 /// two different numbers, and one number on wires of two connections. Wire numbering never
 /// makes either; numbers typed or imported can. Wires on overview pages repeat connections on
 /// purpose and do not count; wires that touch no pin are no connection, as for numbering.
-fn wire_numbers(i: &Inputs<'_>, out: &mut Vec<Finding>) {
+fn wire_numbers(i: &Inputs<'_>, wire_net: &WireNets, out: &mut Vec<Finding>) {
     let p = i.project;
-    // Connections come from the wiring outside overview pages only: an overview wire can carry
-    // potentials or link interruption points and so join two connections into one net, which
-    // would hide a reused number or make up two numbers on one connection. Pages keep their
-    // places, so page indices stay the same.
-    let mut wiring = p.clone();
-    for page in wiring.pages.iter_mut().filter(|pg| pg.overview) {
-        page.wires.clear();
-    }
-    // Wires are known by their place: ids need not be unique on a page.
-    let (_, wire_net) = wc_core::connectivity::wire_nets_by_place(&wiring, |id| i.symbols.get(id).map(|s| s.role));
     // Per net: its numbers, and its first numbered wire (page, wire id) in drawing order.
     let mut by_net: BTreeMap<usize, (BTreeSet<&str>, (&Page, &str))> = BTreeMap::new();
     // Per number: the nets it is on, each with the first wire carrying it.
@@ -811,17 +819,8 @@ fn on_segment(p: Point, a: Point, b: Point) -> bool {
 /// one connection (net). Wires on overview pages repeat connections on purpose and do not count;
 /// wires that touch no pin are no connection, and a wire naming only its cable (no core) names
 /// no conductor.
-fn cable_cores(i: &Inputs<'_>, out: &mut Vec<Finding>) {
+fn cable_cores(i: &Inputs<'_>, wire_net: &WireNets, out: &mut Vec<Finding>) {
     let p = i.project;
-    // Connections come from the wiring outside overview pages only: an overview wire can carry
-    // potentials or link interruption points and so join two connections into one net, which
-    // would hide a reused core. Pages keep their places, so page indices stay the same.
-    let mut wiring = p.clone();
-    for page in wiring.pages.iter_mut().filter(|pg| pg.overview) {
-        page.wires.clear();
-    }
-    // Wires are known by their place: ids need not be unique on a page.
-    let (_, wire_net) = wc_core::connectivity::wire_nets_by_place(&wiring, |id| i.symbols.get(id).map(|s| s.role));
     // Per core: the nets it is on, in drawing order, each with the first wire naming it there.
     type Uses<'p> = Vec<(usize, &'p Page, &'p str)>;
     let mut by_core: BTreeMap<(&DeviceTag, &str), Uses> = BTreeMap::new();
