@@ -585,18 +585,18 @@ enum RulesCmd {
     /// the check could not run is refused and nothing is changed. An empty file removes them
     /// all.
     Set {
-        /// The rules file: TOML, or JSON with a `.json` name; `-` reads TOML from stdin.
+        /// The rules file (`.toml` or `.json`), or `-` for TOML from stdin.
         file: PathBuf,
     },
     /// Turn a library rule off for this project, by `source:number` or `source:name`.
     Off {
-        /// The library rule, as `source:number` or `source:name`.
+        /// The library rule, `source:number` or `source:name`.
         rule: String,
     },
     /// Turn a library rule back on, by `source:number` or `source:name`: every `rules_off`
     /// entry that turns it off is removed.
     On {
-        /// The library rule, as `source:number` or `source:name`.
+        /// The library rule, `source:number` or `source:name`.
         rule: String,
     },
 }
