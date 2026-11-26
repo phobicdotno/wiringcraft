@@ -13,6 +13,8 @@ use crate::Table;
 
 /// Longest sheet name Excel accepts.
 const MAX_SHEET_NAME: usize = 31;
+/// The sheet name Excel keeps for itself (in any case).
+const RESERVED_SHEET_NAME: &str = "History";
 /// Excel's limits: characters in a cell, columns and rows (the header row included).
 const MAX_CELL_CHARS: usize = 32_767;
 const MAX_COLUMNS: usize = 16_384;
@@ -102,7 +104,9 @@ fn check_limits(t: &Table) -> std::io::Result<()> {
 }
 
 /// A sheet name Excel accepts: no `[]:*?/\`, no leading or trailing apostrophe, at most 31
-/// characters, not empty and not used by an earlier sheet (names compare without case).
+/// characters, not empty, not used by an earlier sheet (names compare without case) and not
+/// `History`, which Excel keeps for its change tracking: it repairs a workbook with a sheet of
+/// that name when opening it.
 fn sheet_name(title: &str, number: usize, taken: &mut BTreeSet<String>) -> String {
     let clean: String = title
         .chars()
@@ -126,7 +130,7 @@ fn sheet_name(title: &str, number: usize, taken: &mut BTreeSet<String>) -> Strin
     };
     let mut name = base.clone();
     let mut n = 2;
-    while taken.contains(&name.to_lowercase()) {
+    while name.eq_ignore_ascii_case(RESERVED_SHEET_NAME) || taken.contains(&name.to_lowercase()) {
         let suffix = format!(" ({n})");
         let keep = MAX_SHEET_NAME - suffix.chars().count();
         name = format!("{}{suffix}", tidy(&base, keep));
@@ -311,6 +315,10 @@ mod tests {
         // Shortening must not leave an apostrophe at the end.
         let cut = format!("{}'tail", "A".repeat(30));
         assert_eq!(sheet_name(&cut, 7, &mut taken), "A".repeat(30));
+        // Excel's own change-tracking sheet name is never used, in any case.
+        assert_eq!(sheet_name("History", 8, &mut taken), "History (2)");
+        assert_eq!(sheet_name(" history ", 9, &mut taken), "history (3)");
+        assert_eq!(sheet_name("History list", 10, &mut taken), "History list");
     }
 
     #[test]

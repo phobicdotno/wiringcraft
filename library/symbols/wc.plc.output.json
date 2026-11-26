@@ -1,5 +1,6 @@
 {
   "category": "plc",
+  "description": "Digital output channel of a PLC.",
   "graphics": [
     {
       "kind": "rect",

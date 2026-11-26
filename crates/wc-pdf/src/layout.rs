@@ -162,7 +162,9 @@ impl CrossRefs {
                 };
                 match sym.role {
                     SymbolRole::Main => x.mains.entry(tag.clone()).or_default().push(a),
-                    SymbolRole::Auxiliary => x.auxes.entry(tag.clone()).or_default().push(a),
+                    // A contact repeated on an overview page (line diagram) is not listed
+                    // under its coil again: the schematic page draws it in detail (#1076).
+                    SymbolRole::Auxiliary if !page.overview => x.auxes.entry(tag.clone()).or_default().push(a),
                     SymbolRole::Interruption => x.links.entry(tag.clone()).or_default().push(a),
                     _ => {}
                 }
@@ -1528,6 +1530,14 @@ pub fn draw_panel_page(
     }
     pen.colour(0.0, 0.0, 0.0);
     pen.width(0.35);
+    // How many devices on the plate share each product part (`-K1`), so a shared one is
+    // labelled with its full tag instead.
+    let mut products: BTreeMap<&[String], usize> = BTreeMap::new();
+    for item in &panel.items {
+        if let PanelItem::Device { tag, .. } = item {
+            *products.entry(tag.product.as_slice()).or_default() += 1;
+        }
+    }
     for item in &panel.items {
         if let PanelItem::Device {
             tag,
@@ -1563,9 +1573,13 @@ pub fn draw_panel_page(
                 pen.colour(0.0, 0.0, 0.0);
                 pen.rect(p(at.x, at.y), p(at.x + width, at.y + height));
             }
-            // The product aspect is what fits on a narrow device; the full tag is in the list.
-            let label = tag.product.join(".");
-            let label = format!("-{label}");
+            // The product part fits on a narrow device. When another device on the plate has the
+            // same product part (`+CAB1-K1` and `+CAB2-K1`), the full tag tells them apart.
+            let label = if products.get(tag.product.as_slice()).copied().unwrap_or(0) > 1 {
+                tag.to_string()
+            } else {
+                format!("-{}", tag.product.join("."))
+            };
             let per_char = label.chars().count().max(1) as f64 * 0.62;
             let across = (width * k / per_char).min(height * k * 0.5).min(2.5);
             let along = (height * k / per_char).min(width * k * 0.6).min(2.5);

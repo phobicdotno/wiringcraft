@@ -78,6 +78,11 @@ pub const TOO_DEEP: &str = "entities in blocks nested too deep (or inserting the
 /// each insert the next many times would otherwise fill the memory.
 pub const MAX_DRAWN: usize = 2_000_000;
 
+/// The most points one polyline or HATCH boundary loop with bulges is sampled into (each bulged
+/// side becomes up to 72 points). Real drawings stay far below it; past it the polyline or loop
+/// is left out before its points are made, and counted.
+pub const MAX_BULGED_POINTS: usize = 200_000;
+
 /// The key under which entities left out over [`MAX_DRAWN`] are counted.
 pub(crate) const OVER_LIMIT: &str = "over the limit";
 
@@ -109,6 +114,7 @@ pub(crate) fn draw_mapped(
         Xf { m, at: (0.0, 0.0), rot },
         1.0,
         0,
+        &|_| false,
         &|_| false,
         &mut out,
         &mut points,
@@ -337,6 +343,7 @@ fn shapes(
     scale: f64,
     depth: usize,
     skip_layer: &dyn Fn(&str) -> bool,
+    hidden_text: &dyn Fn(&str) -> bool,
     out: &mut Vec<(String, Shape)>,
     points: &mut Vec<(String, Point)>,
     skipped: &mut BTreeMap<String, usize>,
@@ -345,7 +352,8 @@ fn shapes(
     if depth > MAX_NESTING {
         // Block nesting this deep is either a cycle or not worth drawing; say what is left out.
         if !ents.is_empty() {
-            *skipped.entry(TOO_DEEP.to_owned()).or_default() += ents.len();
+            let deep = skipped.entry(TOO_DEEP.to_owned()).or_default();
+            *deep = deep.saturating_add(ents.len());
         }
         return;
     }
@@ -385,7 +393,8 @@ fn shapes(
     for (i, e) in ents.iter().enumerate() {
         if *budget == 0 {
             // This entity and every one after it at this level are left out.
-            *skipped.entry(OVER_LIMIT.to_owned()).or_default() += ents.len() - i;
+            let over = skipped.entry(OVER_LIMIT.to_owned()).or_default();
+            *over = over.saturating_add(ents.len() - i);
             return;
         }
         *budget -= 1;
@@ -398,16 +407,24 @@ fn shapes(
         let flip = e.f_or(230, 1.0) < 0.0;
         let q = |x: f64, y: f64| if flip { p(-x, y) } else { p(x, y) };
         let shape = match e.kind.as_str() {
-            "LINE" => Some(Shape::Line {
-                a: p(e.f(10), e.f(20)),
-                b: p(e.f(11), e.f(21)),
-            }),
+            "LINE" => {
+                // Ends that are not numbers once placed (a coordinate near the limit times the
+                // scale) leave the line out, and say so: the page could not be read back.
+                let (a, b) = (p(e.f(10), e.f(20)), p(e.f(11), e.f(21)));
+                if [a, b].iter().all(|p| p.x.is_finite() && p.y.is_finite()) {
+                    Some(Shape::Line { a, b })
+                } else {
+                    *skipped.entry(LINE_NOT_NUMBERS.to_owned()).or_default() += 1;
+                    None
+                }
+            }
             // Scaled differently along x and y, a circle is an ellipse: drawn by its points.
             "CIRCLE" if !xf.keeps_circles() => {
                 // On a pin layer it marks a pin at its centre, which a symbol takes from the
                 // points as it does for POINT; the outline is drawn on a page like any other.
-                if is_pin_layer(&layer) {
-                    points.push((layer.clone(), q(e.f(10), e.f(20))));
+                let at = q(e.f(10), e.f(20));
+                if is_pin_layer(&layer) && at.x.is_finite() && at.y.is_finite() {
+                    points.push((layer.clone(), at));
                 }
                 let (unit, closed) = ellipse_points((0.0, 0.0), (1.0, 0.0), 1.0, 0.0, std::f64::consts::TAU);
                 stretched(e, &unit, closed, skipped)
@@ -446,29 +463,25 @@ fn shapes(
             "LWPOLYLINE" => {
                 // Vertices in order, each with the bulge (code 42) of the segment it starts: a
                 // bulged segment is an arc, sampled in the entity's own coordinates.
-                let mut vs: Vec<((f64, f64), f64)> = Vec::new();
-                for (code, v) in &e.codes {
-                    let n = v.trim().parse::<f64>().unwrap_or(f64::NAN);
-                    match (*code, vs.last_mut()) {
-                        (10, _) => vs.push(((n, f64::NAN), 0.0)),
-                        (20, Some(last)) => last.0.1 = n,
-                        (42, Some(last)) if n.is_finite() => last.1 = n,
-                        _ => {}
-                    }
-                }
+                let mut vs = vertices(e);
                 vs.retain(|((x, y), _)| x.is_finite() && y.is_finite());
                 let closed = (e.f(70) as i64) & 1 == 1;
                 let raw = if vs.iter().any(|(_, b)| b.abs() >= 1e-9) {
                     bulged(&vs, closed)
                 } else {
-                    Some(vs.iter().map(|(p, _)| *p).collect())
+                    Ok(vs.iter().map(|(p, _)| *p).collect())
                 };
-                // A bulge that gives no arc, or points that are not numbers once placed (a huge
-                // INSERT scale), leave the polyline out, and say so.
-                let pts: Option<Vec<Point>> = raw.map(|r| r.into_iter().map(|(x, y)| q(x, y)).collect());
+                // Bulges that would give too many points, a bulge that gives no arc, or points
+                // that are not numbers once placed (a huge INSERT scale), leave the polyline
+                // out, and say so.
+                let pts = raw.map(|r| r.into_iter().map(|(x, y)| q(x, y)).collect::<Vec<Point>>());
                 match pts {
-                    Some(pts) if pts.len() < 2 => None,
-                    Some(pts) if pts.iter().all(|p| p.x.is_finite() && p.y.is_finite()) => Some(Shape::Polyline {
+                    Err(BulgeError::TooManyPoints) => {
+                        *skipped.entry(POLYLINE_TOO_MANY_POINTS.to_owned()).or_default() += 1;
+                        None
+                    }
+                    Ok(pts) if pts.len() < 2 => None,
+                    Ok(pts) if pts.iter().all(|p| p.x.is_finite() && p.y.is_finite()) => Some(Shape::Polyline {
                         points: pts,
                         closed,
                         filled: false,
@@ -476,6 +489,54 @@ fn shapes(
                     _ => {
                         *skipped.entry(POLYLINE_NOT_NUMBERS.to_owned()).or_default() += 1;
                         None
+                    }
+                }
+            }
+            "LEADER" => {
+                // Vertices from the repeated 10/20 codes. A spline path (72 = 1) is drawn
+                // straight through the same vertices.
+                let all = vertices(e);
+                let vs: Vec<(f64, f64)> = all
+                    .iter()
+                    .map(|(p, _)| *p)
+                    .filter(|(x, y)| x.is_finite() && y.is_finite())
+                    .collect();
+                let pts: Vec<Point> = vs.iter().map(|&(x, y)| q(x, y)).collect();
+                if pts.len() < 2 || !pts.iter().all(|p| p.x.is_finite() && p.y.is_finite()) {
+                    *skipped.entry("LEADER".to_owned()).or_default() += 1;
+                    None
+                } else {
+                    // Drawn without its vertices that are not numbers: say how many.
+                    if all.len() > vs.len() {
+                        *skipped.entry(LEADER_BAD_VERTICES.to_owned()).or_default() += all.len() - vs.len();
+                    }
+                    out.push((
+                        layer.clone(),
+                        Shape::Polyline {
+                            points: pts,
+                            closed: false,
+                            filled: false,
+                        },
+                    ));
+                    // 71 = 1: a filled arrow head with its tip on the first vertex, pointing
+                    // along the first segment, AutoCAD's metric default size (2.5 long, 0.83
+                    // wide), made in the entity's own coordinates so a placement scales it.
+                    let (x0, y0) = vs[0];
+                    let next = vs.iter().find(|&&(x, y)| (x - x0).hypot(y - y0) > 1e-9);
+                    match next {
+                        Some(&(x1, y1)) if e.f(71) as i64 == 1 => {
+                            let len = (x1 - x0).hypot(y1 - y0);
+                            let (dx, dy) = ((x1 - x0) / len, (y1 - y0) / len);
+                            let (bx, by) = (x0 + 2.5 * dx, y0 + 2.5 * dy);
+                            let (hx, hy) = (-dy * 0.415, dx * 0.415);
+                            let head = vec![q(x0, y0), q(bx + hx, by + hy), q(bx - hx, by - hy)];
+                            if head.iter().all(|p| p.x.is_finite() && p.y.is_finite()) {
+                                polyline(head, true, true)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
                     }
                 }
             }
@@ -523,7 +584,14 @@ fn shapes(
                     let pt = q(x, y);
                     x.is_finite() && y.is_finite() && pt.x.is_finite() && pt.y.is_finite()
                 };
-                let (loops, bad): (Vec<_>, Vec<_>) = hatch_loops(e)
+                let (all_loops, too_many) = hatch_loops(e);
+                // A loop whose bulges would give too many points is left out before its points
+                // are made, and counted: a solid hatch that lost one is drawn as outlines too.
+                if too_many > 0 {
+                    *skipped.entry(HATCH_TOO_MANY_POINTS.to_owned()).or_default() += 1;
+                    solid = false;
+                }
+                let (loops, bad): (Vec<_>, Vec<_>) = all_loops
                     .into_iter()
                     .partition(|(lp, _)| lp.iter().all(|pt| placed(*pt)));
                 let (loops, fit_failed): (Vec<_>, Vec<usize>) = loops.into_iter().unzip();
@@ -563,25 +631,31 @@ fn shapes(
                 }
                 None
             }
+            // Code 70 bit 1 on an attribute: invisible, so not drawn (and not a skipped entity),
+            // except on the layers `hidden_text` names (a symbol's pin layers: it names a pin).
+            "ATTRIB" if (e.f(70) as i64) & 1 != 0 && !hidden_text(&layer) => None,
             "TEXT" | "MTEXT" | "ATTRIB" => {
                 let raw = e.get(1).unwrap_or("");
                 let text = if e.kind == "MTEXT" {
                     mtext_plain(raw)
                 } else {
-                    raw.to_owned()
+                    special_codes(raw)
                 };
-                let align = match e.f(72) as i64 {
-                    1 | 4 => Align::Center,
-                    2 => Align::Right,
-                    _ => Align::Left,
+                let ((x, y), align, angle) = text_anchor(e);
+                // TEXT and ATTRIB sit in their own (perhaps mirrored) coordinates, with the
+                // rotation measured there; MTEXT's point is in world coordinates already.
+                let (at, angle) = if e.kind == "MTEXT" {
+                    (p(x, y), angle)
+                } else {
+                    (q(x, y), if flip { 180.0 - angle } else { angle })
                 };
                 (!text.trim().is_empty()).then(|| Shape::Text {
-                    at: p(e.f(10), e.f(20)),
+                    at,
                     text,
                     height: (e.f_or(40, 2.5) * r_scale).max(0.5),
                     align,
-                    // Code 50: rotation in degrees, counter-clockwise; a turned block turns it too.
-                    angle: normal_angle(e.f(50) + xf.rot),
+                    // Rotation in degrees, counter-clockwise; a turned block turns it too.
+                    angle: normal_angle(angle + xf.rot),
                 })
             }
             "SOLID" | "TRACE" => {
@@ -594,33 +668,79 @@ fn shapes(
                 polyline(pts, true, true)
             }
             "POINT" => {
-                points.push((layer.clone(), p(e.f(10), e.f(20))));
+                let at = p(e.f(10), e.f(20));
+                if at.x.is_finite() && at.y.is_finite() {
+                    points.push((layer.clone(), at));
+                } else {
+                    let left_out = skipped.entry(PLACED_NOT_NUMBERS.to_owned()).or_default();
+                    *left_out = left_out.saturating_add(1);
+                }
                 None
             }
             "INSERT" => {
                 if let Some((name, inner)) = e.get(2).and_then(|n| d.block(n)) {
                     // The block's base point goes on the insertion point.
                     let (bx, by) = d.bases.get(name).copied().unwrap_or_default();
-                    let ixf = Xf::shift((-bx, -by))
-                        .then(&Xf::insert(
-                            (e.f(10), e.f(20)),
-                            e.f_or(41, 1.0),
-                            e.f_or(42, 1.0),
-                            e.f(50),
-                        ))
-                        .then(&xf);
-                    shapes(
-                        d,
-                        inner,
-                        ixf,
-                        scale,
-                        depth + 1,
-                        skip_layer,
-                        out,
-                        points,
-                        skipped,
-                        budget,
-                    );
+                    // An array (MINSERT): one copy per column and row, the spacings along the
+                    // block's own turned axes (not scaled), as AutoCAD draws it.
+                    let array = ArrayCells::of(e);
+                    let cells = array.len();
+                    // Read once: a group code is found by a scan of the entity.
+                    let (ix, iy, sx, sy, rot) = (e.f(10), e.f(20), e.f_or(41, 1.0), e.f_or(42, 1.0), e.f(50));
+                    // The placement of a copy, inside the outer placement. A copy placed past
+                    // the range of numbers is not refused here: its shapes are, one by one, and
+                    // each copy takes from the budget like any other.
+                    let cell_xf = |cell: usize| {
+                        Xf::shift((-bx, -by))
+                            .then(&Xf::insert(array.at(cell, (ix, iy)), sx, sy, rot))
+                            .then(&xf)
+                    };
+                    // Copies too deep would only be turned away, without taking from the
+                    // budget: counted at once instead of one by one.
+                    let too_deep = depth + 1 > MAX_NESTING;
+                    if too_deep {
+                        let deep = skipped.entry(TOO_DEEP.to_owned()).or_default();
+                        *deep = deep.saturating_add(cells.saturating_mul(inner.len()));
+                    }
+                    for cell in 0..if too_deep { 0 } else { cells } {
+                        if *budget == 0 {
+                            // The copies not drawn are counted like the entities in them.
+                            let over = skipped.entry(OVER_LIMIT.to_owned()).or_default();
+                            *over = over.saturating_add((cells - cell).saturating_mul(inner.len()));
+                            break;
+                        }
+                        let ixf = cell_xf(cell);
+                        shapes(
+                            d,
+                            inner,
+                            ixf,
+                            scale,
+                            depth + 1,
+                            skip_layer,
+                            hidden_text,
+                            out,
+                            points,
+                            skipped,
+                            budget,
+                        );
+                        if inner.is_empty() {
+                            // An empty block draws nothing however many copies it has.
+                            break;
+                        }
+                    }
+                } else {
+                    // A cut-down file or an xref: the block is not here to draw.
+                    // The name goes into a warning a terminal shows: no control characters.
+                    // Cut to a short length first: an array can visit this INSERT many times.
+                    let name: String = e
+                        .get(2)
+                        .unwrap_or_default()
+                        .chars()
+                        .take(MISSING_BLOCK_NAME_LEN)
+                        .map(|c| if c.is_control() { '?' } else { c })
+                        .collect();
+                    let name = name.trim();
+                    *skipped.entry(format!("{MISSING_BLOCK}{name}")).or_default() += 1;
                 }
                 None
             }
@@ -637,6 +757,7 @@ fn shapes(
                         scale,
                         depth + 1,
                         skip_layer,
+                        hidden_text,
                         out,
                         points,
                         skipped,
@@ -649,14 +770,84 @@ fn shapes(
             // viewports, which draw nothing themselves.
             "ATTDEF" | "VIEWPORT" => None,
             other => {
-                *skipped.entry(other.to_owned()).or_default() += 1;
+                // The kind is the file's own text, so it can name a key already counted in bulk.
+                let left_out = skipped.entry(other.to_owned()).or_default();
+                *left_out = left_out.saturating_add(1);
                 None
             }
         };
-        if let Some(s) = shape {
-            out.push((layer, s));
+        match shape {
+            // Placed past the range of numbers (a huge block placement plus a huge coordinate),
+            // or a size that is not a number once placed (a radius or text height near the limit
+            // times the scale): a page file could not hold it, so it is left out and said.
+            Some(s) if !finite_shape(&s) => {
+                // A pin circle too big to draw still marks its pin when its centre is in range,
+                // as a stretched one does; the outline is what is left out.
+                if let Shape::Circle { center, .. } = &s
+                    && is_pin_layer(&layer)
+                    && center.x.is_finite()
+                    && center.y.is_finite()
+                {
+                    points.push((layer.clone(), *center));
+                }
+                let key = if finite_points(&s) {
+                    NOT_NUMBERS_PLACED
+                } else {
+                    PLACED_NOT_NUMBERS
+                };
+                let left_out = skipped.entry(key.to_owned()).or_default();
+                *left_out = left_out.saturating_add(1);
+            }
+            Some(s) => out.push((layer, s)),
+            None => {}
         }
     }
+}
+
+/// Whether every point of `s` (its ends, corners, centre or anchor) is a number; its sizes and
+/// angles are not looked at.
+fn finite_points(s: &Shape) -> bool {
+    let pt = |p: &Point| p.x.is_finite() && p.y.is_finite();
+    match s {
+        Shape::Line { a, b } | Shape::Rect { min: a, max: b } | Shape::Dimension { a, b, .. } => pt(a) && pt(b),
+        Shape::Polyline { points, .. } => points.iter().all(pt),
+        Shape::Circle { center, .. } | Shape::Arc { center, .. } => pt(center),
+        Shape::Text { at, .. } => pt(at),
+    }
+}
+
+/// Whether every coordinate and size of `s` is a number.
+fn finite_shape(s: &Shape) -> bool {
+    let pt = |p: &Point| p.x.is_finite() && p.y.is_finite();
+    match s {
+        Shape::Line { a, b } | Shape::Rect { min: a, max: b } => pt(a) && pt(b),
+        Shape::Polyline { points, .. } => points.iter().all(pt),
+        Shape::Circle { center, radius, .. } => pt(center) && radius.is_finite(),
+        Shape::Arc {
+            center,
+            radius,
+            start,
+            end,
+        } => pt(center) && radius.is_finite() && start.is_finite() && end.is_finite(),
+        Shape::Text { at, height, angle, .. } => pt(at) && height.is_finite() && angle.is_finite(),
+        Shape::Dimension { a, b, offset, height } => pt(a) && pt(b) && offset.is_finite() && height.is_finite(),
+    }
+}
+
+/// The vertices of an LWPOLYLINE or LEADER in order, from the repeated 10/20 codes, each with
+/// the bulge (code 42) of the segment it starts. A coordinate that is not a number is NaN.
+fn vertices(e: &Entity) -> Vec<((f64, f64), f64)> {
+    let mut vs: Vec<((f64, f64), f64)> = Vec::new();
+    for (code, v) in &e.codes {
+        let n = v.trim().parse::<f64>().unwrap_or(f64::NAN);
+        match (*code, vs.last_mut()) {
+            (10, _) => vs.push(((n, f64::NAN), 0.0)),
+            (20, Some(last)) => last.0.1 = n,
+            (42, Some(last)) if n.is_finite() => last.1 = n,
+            _ => {}
+        }
+    }
+    vs
 }
 
 /// A polyline of at least two points, or nothing.
@@ -669,6 +860,50 @@ const TURN_STEPS: f64 = 72.0;
 
 /// A sweep brought into (0, `full`]: a whole number of turns is one full turn. `None` when it is
 /// not a number.
+/// Where a TEXT, ATTRIB or MTEXT hangs, how it is aligned there, and its rotation in degrees.
+///
+/// MTEXT: the attachment point (71, 1 to 9) runs left, centre, right on each row; the rotation
+/// is code 50, or the direction 11/21 when there is no 50. Code 72 is the drawing direction.
+///
+/// TEXT and ATTRIB: the alignment is code 72 (1 and 4 centre, 2 right). A justified text
+/// (72 = 1, 2 or 4, or a vertical alignment: 73 on TEXT, 74 on ATTRIB) sits on its second
+/// point 11/21 when one is given; 10/20 is the left baseline start, which some writers leave
+/// at 0,0.
+fn text_anchor(e: &Entity) -> ((f64, f64), Align, f64) {
+    let at = (e.f(10), e.f(20));
+    if e.kind == "MTEXT" {
+        let align = match e.f_or(71, 1.0) as i64 {
+            a @ 1..=9 => match (a - 1) % 3 {
+                1 => Align::Center,
+                2 => Align::Right,
+                _ => Align::Left,
+            },
+            _ => Align::Left,
+        };
+        let angle = match e.get(50) {
+            Some(_) => e.f(50),
+            None if e.get(11).is_some() && (e.f(11) != 0.0 || e.f(21) != 0.0) => e.f(21).atan2(e.f(11)).to_degrees(),
+            None => 0.0,
+        };
+        return (at, align, angle);
+    }
+    let h = e.f(72) as i64;
+    let align = match h {
+        1 | 4 => Align::Center,
+        2 => Align::Right,
+        _ => Align::Left,
+    };
+    // Vertical alignment: 73 on TEXT, 74 on ATTRIB (where 73 is the field length).
+    let vertical = if e.kind == "TEXT" { e.f(73) } else { e.f(74) };
+    let justified = matches!(h, 1 | 2 | 4) || vertical as i64 != 0;
+    let at = if justified && e.get(11).is_some() {
+        (e.f(11), e.f(21))
+    } else {
+        at
+    };
+    (at, align, e.f(50))
+}
+
 fn turn(sweep: f64, full: f64) -> Option<f64> {
     if !sweep.is_finite() {
         return None;
@@ -777,15 +1012,49 @@ const SPLINE_NOT_NUMBERS: &str = "SPLINE whose points are not numbers once place
 /// The key under which splines with too few points to draw are counted.
 const SPLINE_TOO_FEW: &str = "SPLINE with too few points";
 
+/// The skipped-count key for entities whose placed coordinates are not numbers.
+const PLACED_NOT_NUMBERS: &str = "entities placed outside the number range";
+
 /// The key under which circles and arcs of a stretched block are counted when their angles or
 /// their placed points are not numbers.
 const STRETCHED_NOT_NUMBERS: &str = "CIRCLE or ARC of a stretched block whose points are not numbers";
+
+/// The `skipped` key of the vertices left out of a drawn LEADER because they are not numbers.
+const LEADER_BAD_VERTICES: &str = "LEADER vertex that is not numbers";
+
+/// The start of the `skipped` key of an INSERT whose block is not in the file; the block's
+/// name follows (empty when the INSERT names none), so the warning can name a few of them.
+const MISSING_BLOCK: &str = "INSERT of a block not in the file: ";
+
+/// How many missing block names the warning lists.
+const MISSING_BLOCK_NAMES: usize = 3;
+
+/// How many characters of a missing block's name the warning keeps.
+const MISSING_BLOCK_NAME_LEN: usize = 64;
 
 /// The key under which hatches with a boundary that is not all numbers are counted.
 /// The `skipped` key of a polyline whose points, or the arcs of its bulges, are not numbers once
 /// placed.
 const POLYLINE_NOT_NUMBERS: &str = "LWPOLYLINE whose points are not numbers once placed";
 const HATCH_NOT_NUMBERS: &str = "HATCH with a boundary that is not numbers";
+/// The `skipped` key of a line whose ends are not numbers once placed.
+const LINE_NOT_NUMBERS: &str = "LINE whose ends are not numbers once placed";
+/// The `skipped` key of any other entity that is not numbers once placed (e.g. a radius).
+const NOT_NUMBERS_PLACED: &str = "entity whose size is not a number once placed";
+/// How far from the middle of the drawing (mm, once scaled) an entity may lie and still be
+/// moved onto the page: 1000 km, far past any real drawing, near enough that moving keeps its
+/// shape.
+const FAR_OUT: f64 = 1e9;
+/// The `skipped` key of an entity farther out than [`FAR_OUT`].
+const TOO_FAR_OUT: &str = "entity too far from the rest of the drawing";
+
+/// The `skipped` key of a polyline left out because its bulges would give more than
+/// [`MAX_BULGED_POINTS`] points.
+const POLYLINE_TOO_MANY_POINTS: &str = "polyline with too many bulged points";
+
+/// The `skipped` key of a HATCH with a boundary loop left out because its bulges would give more
+/// than [`MAX_BULGED_POINTS`] points.
+const HATCH_TOO_MANY_POINTS: &str = "HATCH with too many bulged boundary points";
 
 /// Points along a B-spline from its control points, knots and weights, sampled evenly over the
 /// knot range. `None` when the data do not make a spline.
@@ -1342,24 +1611,36 @@ impl Cursor<'_> {
 
 /// Points of a polyline vertex list with bulges: an arc between two points where the bulge is
 /// not zero (bulge = tan(sweep / 4), positive counter-clockwise).
-/// `None` when a bulged segment cannot be sampled (its numbers overflow), so the caller does not
-/// draw a straight side in place of an arc.
-fn bulged(vertices: &[((f64, f64), f64)], closed: bool) -> Option<Vec<(f64, f64)>> {
-    let mut out = Vec::new();
+/// An error when a bulged segment cannot be sampled (its numbers overflow), so the caller does
+/// not draw a straight side in place of an arc, or when the points would number more than
+/// [`MAX_BULGED_POINTS`] (checked before any is made).
+fn bulged(vertices: &[((f64, f64), f64)], closed: bool) -> std::result::Result<Vec<(f64, f64)>, BulgeError> {
     let n = vertices.len();
-    for i in 0..n {
+    // The side from vertex i: its end, when it is an arc (a bulge and a chord to bend).
+    let arc_side = |i: usize| {
         let (a, bulge) = vertices[i];
+        let &(b, _) = vertices.get(i + 1).or(if closed { vertices.first() } else { None })?;
+        let chord = (b.0 - a.0).hypot(b.1 - a.1);
+        (bulge.abs() >= 1e-9 && chord >= 1e-12).then_some((a, b, bulge, chord))
+    };
+    // Each arc side adds the inner samples of its sweep (4 atan(bulge)) after its start vertex,
+    // as `arc_points` samples it: a quick check before anything is made.
+    let expected = (0..n).fold(n, |sum, i| {
+        let steps = arc_side(i).map_or(0, |(_, _, bulge, _)| {
+            let sweep = (4.0 * bulge.atan()).abs();
+            ((TURN_STEPS * sweep / std::f64::consts::TAU).ceil() as usize).max(2) - 1
+        });
+        sum.saturating_add(steps)
+    });
+    if expected > MAX_BULGED_POINTS {
+        return Err(BulgeError::TooManyPoints);
+    }
+    let mut out = Vec::with_capacity(expected);
+    for (i, &(a, _)) in vertices.iter().enumerate() {
         out.push(a);
-        let Some(&(b, _)) = vertices.get(i + 1).or(if closed { vertices.first() } else { None }) else {
+        let Some((a, b, bulge, chord)) = arc_side(i) else {
             continue;
         };
-        if bulge.abs() < 1e-9 {
-            continue;
-        }
-        let chord = (b.0 - a.0).hypot(b.1 - a.1);
-        if chord < 1e-12 {
-            continue;
-        }
         let sweep = 4.0 * bulge.atan();
         let r = chord / (2.0 * (sweep / 2.0).sin()).abs();
         // Centre: from the chord's midpoint along its normal.
@@ -1371,25 +1652,45 @@ fn bulged(vertices: &[((f64, f64), f64)], closed: bool) -> Option<Vec<(f64, f64)
         let a1 = (b.1 - c.1).atan2(b.0 - c.0).to_degrees();
         let pts = arc_points(c, r, a0, a1, bulge > 0.0);
         if pts.len() < 2 || !pts.iter().all(|p| p.0.is_finite() && p.1.is_finite()) {
-            return None;
+            return Err(BulgeError::NotNumbers);
         }
-        out.extend(pts.iter().skip(1).take(pts.len().saturating_sub(2)));
+        // Rounding can put the centre where the arc comes out a full turn, more points than
+        // the quick check counted: the limit holds for the points actually made.
+        let inner = pts.len().saturating_sub(2);
+        if out.len() + inner + (n - 1 - i) > MAX_BULGED_POINTS {
+            return Err(BulgeError::TooManyPoints);
+        }
+        out.extend(pts.iter().skip(1).take(inner));
     }
-    Some(out)
+    Ok(out)
 }
 
+/// Why a polyline with bulges gives no points.
+#[derive(Debug, PartialEq)]
+enum BulgeError {
+    /// A bulged side's numbers overflow.
+    NotNumbers,
+    /// The points would number more than [`MAX_BULGED_POINTS`].
+    TooManyPoints,
+}
+
+/// A HATCH boundary loop as DXF points, with how many of its spline edges were joined straight.
+type HatchLoop = (Vec<(f64, f64)>, usize);
+
 /// The boundary loops of a HATCH, as DXF points, each with how many of its spline edges were
-/// joined straight because their fit points could not be interpolated. Unreadable loops are left
-/// out.
-fn hatch_loops(e: &Entity) -> Vec<(Vec<(f64, f64)>, usize)> {
+/// joined straight because their fit points could not be interpolated, and how many loops were
+/// left out because their bulges would give more than [`MAX_BULGED_POINTS`] points. Unreadable
+/// loops are left out.
+fn hatch_loops(e: &Entity) -> (Vec<HatchLoop>, usize) {
     let mut cur = Cursor { codes: &e.codes, i: 0 };
     // Skip the elevation point, extrusion, pattern name and flags up to the loop count.
     let Some(start) = e.codes.iter().position(|(c, _)| *c == 91) else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
     cur.i = start;
     let loops = cur.count(91);
     let mut out = Vec::new();
+    let mut too_many = 0;
     for _ in 0..loops {
         let Some(flags) = cur.take(92) else { break };
         let mut pts: Vec<(f64, f64)> = Vec::new();
@@ -1407,9 +1708,20 @@ fn hatch_loops(e: &Entity) -> Vec<(Vec<(f64, f64)>, usize)> {
             }
             // A bulge that cannot be sampled marks the loop as not numbers, so the HATCH arm
             // leaves it out and counts it rather than drawing a straight side.
-            pts = bulged(&vs, true).unwrap_or_else(|| vec![(f64::NAN, f64::NAN); 3]);
+            pts = match bulged(&vs, true) {
+                Ok(pts) => pts,
+                Err(BulgeError::NotNumbers) => vec![(f64::NAN, f64::NAN); 3],
+                // Left out before its points are made: an empty loop is not kept below.
+                Err(BulgeError::TooManyPoints) => {
+                    too_many += 1;
+                    Vec::new()
+                }
+            };
         } else {
             let edges = cur.count(93);
+            // Edges (each a bounded number of points) whose samples together would pass
+            // MAX_BULGED_POINTS: the loop is read to its end but left out.
+            let mut over = false;
             for edge in 0..edges {
                 let Some(kind) = cur.take(72) else { break };
                 let seg: Vec<(f64, f64)> = match kind as i64 {
@@ -1519,7 +1831,14 @@ fn hatch_loops(e: &Entity) -> Vec<(Vec<(f64, f64)>, usize)> {
                     seg.reverse();
                 }
                 let skip = usize::from(pts.last().is_some_and(|end| d(*end, seg.first()) < 1e-9));
-                pts.extend(seg.into_iter().skip(skip));
+                over |= pts.len() + seg.len().saturating_sub(skip) > MAX_BULGED_POINTS;
+                if !over {
+                    pts.extend(seg.into_iter().skip(skip));
+                }
+            }
+            if over {
+                too_many += 1;
+                pts = Vec::new();
             }
         }
         // Source boundary objects: a count and that many handles.
@@ -1538,7 +1857,7 @@ fn hatch_loops(e: &Entity) -> Vec<(Vec<(f64, f64)>, usize)> {
             out.push((pts, fit_failed));
         }
     }
-    out
+    (out, too_many)
 }
 
 /// The edges of a loop as point pairs, the last one closing it.
@@ -1555,8 +1874,25 @@ fn area2(lp: &[(f64, f64)]) -> f64 {
         .sum()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The hole search's work so far on this thread: vertices visited, point pairs and wall edges
+    /// collected, crossing tests. Tests read it to check the budgets bound the work done.
+    static HOLE_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts `n` units of hole search work (in tests only; does nothing otherwise).
+#[inline]
+fn tally_work(n: usize) {
+    #[cfg(test)]
+    HOLE_WORK.with(|w| w.set(w.get().saturating_add(n)));
+    #[cfg(not(test))]
+    let _ = n;
+}
+
 /// Whether `pt` lies inside the loop (even-odd rule).
 fn inside(pt: (f64, f64), lp: &[(f64, f64)]) -> bool {
+    tally_work(lp.len());
     let mut odd = false;
     for (b, a) in loop_edges(lp) {
         if (a.1 > pt.1) != (b.1 > pt.1) && pt.0 < (b.0 - a.0) * (pt.1 - a.1) / (b.1 - a.1) + a.0 {
@@ -1577,6 +1913,7 @@ fn hatch_style(e: &Entity) -> i64 {
 
 /// Whether segments p-q and c-d cross at a point inside both (touching at an end does not count).
 fn crosses(p: (f64, f64), q: (f64, f64), c: (f64, f64), d: (f64, f64)) -> bool {
+    tally_work(1);
     let side = |a: (f64, f64), b: (f64, f64), x: (f64, f64)| (b.0 - a.0) * (x.1 - a.1) - (b.1 - a.1) * (x.0 - a.0);
     let eps = 1e-12;
     let (d1, d2) = (side(p, q, c), side(p, q, d));
@@ -1688,6 +2025,7 @@ fn with_holes_kept(loops: &[Vec<(f64, f64)>], style: i64) -> Option<(Vec<Loop>, 
                 pairs.push(((p.0 - h.0).hypot(p.1 - h.1), a, b));
             }
         }
+        tally_work(pairs.len());
         pairs.sort_by(|x, y| x.0.total_cmp(&y.0));
         let mut walls: Vec<((f64, f64), (f64, f64))> = loop_edges(o).collect();
         walls.extend(loop_edges(&lp));
@@ -1696,6 +2034,7 @@ fn with_holes_kept(loops: &[Vec<(f64, f64)>], style: i64) -> Option<(Vec<Loop>, 
                 walls.extend(loop_edges(other));
             }
         }
+        tally_work(walls.len());
         let tries = (BRIDGE_BUDGET * 4 / walls.len().max(1)).max(1);
         let clear = |p: (f64, f64), h: (f64, f64)| !walls.iter().any(|&(c, d)| crosses(p, h, c, d));
         // No clear bridge within the budget: leave the hatch unfilled rather than fill the hole.
@@ -1720,7 +2059,26 @@ fn with_holes_kept(loops: &[Vec<(f64, f64)>], style: i64) -> Option<(Vec<Loop>, 
 }
 
 /// One warning per entity kind that was not read.
-fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
+pub(crate) fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
+    // Inserts of missing blocks make one line together, naming a few of the blocks.
+    let (missing, skipped): (Vec<_>, Vec<_>) = skipped.into_iter().partition(|(k, _)| k.starts_with(MISSING_BLOCK));
+    let missing_line = (!missing.is_empty()).then(|| {
+        let n: usize = missing.iter().map(|(_, n)| n).sum();
+        let mut names: Vec<&str> = missing
+            .iter()
+            .map(|(k, _)| k.get(MISSING_BLOCK.len()..).unwrap_or_default())
+            .map(|name| if name.is_empty() { "(no name)" } else { name })
+            .take(MISSING_BLOCK_NAMES)
+            .collect();
+        if missing.len() > MISSING_BLOCK_NAMES {
+            names.push("...");
+        }
+        let (s, its) = if n == 1 { ("", "its") } else { ("s", "their") };
+        format!(
+            "{n} block insert{s} not drawn: {its} block is not in the file ({})",
+            names.join(", ")
+        )
+    });
     skipped
         .into_iter()
         .map(|(kind, n)| {
@@ -1731,6 +2089,9 @@ fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
                 format!(
                     "{n} entit{s} not drawn: in blocks nested more than {MAX_NESTING} deep (or inserting themselves)"
                 )
+            } else if kind == PLACED_NOT_NUMBERS {
+                let s = if n == 1 { "y" } else { "ies" };
+                format!("{n} entit{s} placed outside the number range, left out")
             } else if kind == SPLINE_NOT_NUMBERS {
                 let s = if n == 1 { "" } else { "s" };
                 format!("{n} SPLINE{s} whose points are not numbers once placed, left out")
@@ -1743,12 +2104,32 @@ fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
             } else if kind == SPLINE_NOT_CURVE {
                 let s = if n == 1 { "" } else { "s" };
                 format!("{n} SPLINE{s} whose knots make no curve, drawn through their points")
+            } else if kind == NOT_NUMBERS_PLACED {
+                let s = if n == 1 { "y" } else { "ies" };
+                format!("{n} entit{s} whose size is not a number once placed, left out")
+            } else if kind == TOO_FAR_OUT {
+                let s = if n == 1 { "y" } else { "ies" };
+                format!("{n} entit{s} more than 1000 km from the rest of the drawing, left out")
+            } else if kind == LINE_NOT_NUMBERS {
+                let s = if n == 1 { "" } else { "s" };
+                format!("{n} line{s} whose ends are not numbers once placed, left out")
             } else if kind == POLYLINE_NOT_NUMBERS {
                 let s = if n == 1 { "" } else { "s" };
                 format!("{n} polyline{s} whose points are not numbers once placed, left out")
+            } else if kind == LEADER_BAD_VERTICES {
+                let (s, are) = if n == 1 { ("vertex", "is") } else { ("vertices", "are") };
+                format!("{n} LEADER {s} that {are} not numbers, left out of the line")
             } else if kind == HATCH_NOT_NUMBERS {
                 let s = if n == 1 { "" } else { "es" };
                 format!("{n} HATCH{s} with a boundary that is not numbers: that boundary left out")
+            } else if kind == POLYLINE_TOO_MANY_POINTS {
+                let s = if n == 1 { "" } else { "s" };
+                format!("{n} polyline{s} whose arcs would need more than {MAX_BULGED_POINTS} points, left out")
+            } else if kind == HATCH_TOO_MANY_POINTS {
+                let s = if n == 1 { "" } else { "es" };
+                format!(
+                    "{n} HATCH{s} with a boundary whose arcs would need more than {MAX_BULGED_POINTS} points: that boundary left out"
+                )
             } else if kind == HATCH_UNFILLED {
                 let s = if n == 1 { "" } else { "es" };
                 format!("{n} solid HATCH{s} with too many or too complex holes drawn as outline only, not filled")
@@ -1756,10 +2137,12 @@ fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
                 format!("{n} {kind} entit{} not read", if n == 1 { "y" } else { "ies" })
             }
         })
+        .chain(missing_line)
         .collect()
 }
 
-/// MTEXT carries inline formatting codes; keep only the text.
+/// MTEXT carries inline formatting codes; keep only the text, with its `\U+XXXX` and `%%`
+/// codes turned into characters.
 fn mtext_plain(s: &str) -> String {
     let mut out = String::new();
     let mut chars = s.chars().peekable();
@@ -1770,6 +2153,28 @@ fn mtext_plain(s: &str) -> String {
                 Some('\\') => out.push('\\'),
                 Some('{') => out.push('{'),
                 Some('}') => out.push('}'),
+                Some('U') => {
+                    // `\U+XXXX`: a character by its code. Decoded here, so an escaped backslash
+                    // before `U+` (`\\U+00C5`) stays as written. Any other `\U` (no `+`, or not
+                    // four hex digits) is not a formatting code and stays as written too.
+                    let hex: String = match chars.peek() {
+                        Some('+') => chars.clone().skip(1).take(4).collect(),
+                        _ => String::new(),
+                    };
+                    let code = (hex.len() == 4 && hex.chars().all(|c| c.is_ascii_hexdigit()))
+                        .then(|| u32::from_str_radix(&hex, 16).ok())
+                        .flatten()
+                        .and_then(char::from_u32);
+                    match code {
+                        Some(c) => {
+                            out.push(c);
+                            for _ in 0..5 {
+                                chars.next();
+                            }
+                        }
+                        None => out.push_str("\\U"),
+                    }
+                }
                 Some(_) => {
                     // Formatting code: skip to ';' if it takes an argument.
                     let rest: String = chars.clone().take_while(|c| *c != ';' && *c != '\\').collect();
@@ -1781,8 +2186,67 @@ fn mtext_plain(s: &str) -> String {
                 }
                 None => {}
             },
+            '%' if chars.peek() == Some(&'%') => {
+                // `%%` codes, read from the text as written: a `%` that `\U+0025` produced
+                // never starts one.
+                match chars.clone().nth(1).and_then(percent_code) {
+                    Some(d) => {
+                        out.push_str(d);
+                        chars.next();
+                        chars.next();
+                    }
+                    None => out.push('%'),
+                }
+            }
             '{' | '}' => {}
             c => out.push(c),
+        }
+    }
+    out
+}
+
+/// `\U+XXXX` (four hex digits) at the start of `s`: the character with that code, as CAD
+/// programs write any character outside ASCII. The code is seven bytes long.
+fn unicode_code(s: &str) -> Option<char> {
+    s.strip_prefix("\\U+")?
+        .get(..4)
+        .filter(|h| h.chars().all(|c| c.is_ascii_hexdigit()))
+        .and_then(|h| u32::from_str_radix(h, 16).ok())
+        .and_then(char::from_u32)
+}
+
+/// The `%%` code whose letter is `c`: `%%c` diameter, `%%d` degree, `%%p` plus/minus, `%%%` a
+/// percent sign; `%%u` and `%%o` (underline and overline on/off) are dropped.
+fn percent_code(c: char) -> Option<&'static str> {
+    match c.to_ascii_lowercase() {
+        'c' => Some("\u{2300}"),
+        'd' => Some("\u{b0}"),
+        'p' => Some("\u{b1}"),
+        '%' => Some("%"),
+        'u' | 'o' => Some(""),
+        _ => None,
+    }
+}
+
+/// The text of a TEXT or ATTRIB: its `\U+XXXX` and `%%` codes turned into characters, in one
+/// pass, so a character a code produces never starts another code. Anything else is kept.
+fn special_codes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(c) = rest.chars().next() {
+        if let Some(u) = unicode_code(rest) {
+            out.push(u);
+            rest = &rest[7..];
+        } else if let Some(d) = rest
+            .strip_prefix("%%")
+            .and_then(|r| r.chars().next())
+            .and_then(percent_code)
+        {
+            out.push_str(d);
+            rest = &rest[3..];
+        } else {
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
         }
     }
     out
@@ -1811,6 +2275,9 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
         1.0,
         0,
         &|_| false,
+        // An invisible attribute on a pin layer still names a pin; pin-layer text is never
+        // kept as graphics below.
+        &|l| is_pin_layer(l),
         &mut raw,
         &mut points,
         &mut skipped,
@@ -1858,6 +2325,7 @@ pub fn footprint(text: &str) -> Result<(wc_core::Footprint, Vec<String>)> {
         1.0,
         0,
         &|_| false,
+        &|_| false,
         &mut raw,
         &mut points,
         &mut skipped,
@@ -1889,20 +2357,73 @@ fn normalise_block_name(n: &str) -> String {
     n.trim().to_lowercase().replace([' ', '/'], "-")
 }
 
+/// The copies of an INSERT placed as an array (MINSERT): column and row counts (codes 70 and
+/// 71) and spacings (44 and 45), the spacings along the block's own axes turned by code 50 and
+/// not scaled, as AutoCAD draws it. A plain INSERT is one copy.
+struct ArrayCells {
+    cols: usize,
+    rows: usize,
+    spacing: (f64, f64),
+    /// Sine and cosine of the turn.
+    turn: (f64, f64),
+}
+
+impl ArrayCells {
+    fn of(e: &Entity) -> Self {
+        let count = |code: i32| e.f_or(code, 1.0).clamp(1.0, f64::from(u32::MAX)) as usize;
+        ArrayCells {
+            cols: count(70),
+            rows: count(71),
+            spacing: (e.f(44), e.f(45)),
+            turn: e.f(50).to_radians().sin_cos(),
+        }
+    }
+
+    /// How many copies, stopping at `usize::MAX`.
+    fn len(&self) -> usize {
+        self.cols.saturating_mul(self.rows)
+    }
+
+    /// Where copy `cell` (counted along the first row, then the next) lies for an insertion
+    /// point `(ix, iy)`, in the drawing's own coordinates. The column step is added to the
+    /// insertion point before the row step: summed on their own first, two steps near the
+    /// limit could overflow where the copy itself is in range.
+    fn at(&self, cell: usize, (ix, iy): (f64, f64)) -> (f64, f64) {
+        let (s, c) = self.turn;
+        let col = (cell % self.cols) as f64 * self.spacing.0;
+        let row = (cell / self.cols) as f64 * self.spacing.1;
+        (ix + c * col - s * row, iy + s * col + c * row)
+    }
+}
+
 /// Import a whole drawing. Block references whose name matches a library symbol id
 /// (case-insensitive) become placed symbols, with a device tag from an attribute named TAG,
 /// DEVICE, BMK or REF; everything else is kept as graphics. The drawing is moved so its top-left
 /// corner sits inside the page frame.
 pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<ImportedPage> {
+    check_scale(scale)?;
+    page_of(&parse(text)?, scale, known_symbols)
+}
+
+pub(crate) fn check_scale(scale: f64) -> Result<()> {
     if !(scale.is_finite() && scale > 0.0) {
         return Err(Error::Format("scale must be a positive number".into()));
     }
-    let d = parse(text)?;
+    Ok(())
+}
+
+/// [`page`] for a drawing already read, from a DXF or a DWG file ([`crate::dwg::page`]).
+pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>) -> Result<ImportedPage> {
+    check_scale(scale)?;
     let known: BTreeMap<String, &String> = known_symbols.iter().map(|s| (normalise_block_name(s), s)).collect();
     let mut out = ImportedPage::default();
+    let mut tag_warnings = Vec::new();
     let mut raw = Vec::new();
     let mut points = Vec::new();
     let mut plain = Vec::new();
+    let mut skipped: BTreeMap<String, usize> = BTreeMap::new();
+    // Placed symbols take from the same budget as the drawn entities.
+    let mut budget = MAX_DRAWN;
     // Attributes follow their INSERT in the entity list.
     let mut i = 0;
     while i < d.entities.len() {
@@ -1927,16 +2448,51 @@ pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<
                         )
                     })
                     .and_then(|a| a.get(1))
-                    .and_then(|v| DeviceTag::parse(v).ok());
-                let rotation = Rotation::from_degrees(-(e.f(50).round() as i64)).unwrap_or_default();
-                out.symbols.push(PlacedSymbol {
-                    id: String::new(),
-                    symbol: (*id).clone(),
-                    at: Point::new(e.f(10) * scale, -e.f(20) * scale),
-                    rotation,
-                    mirror: e.f_or(41, 1.0) < 0.0,
-                    tag,
-                });
+                    .map(special_codes)
+                    .filter(|v| !v.trim().is_empty())
+                    .and_then(|v| {
+                        DeviceTag::parse(&v)
+                            .map_err(|why| {
+                                tag_warnings
+                                    .push(format!("{id}: device tag {v:?} not read ({why}), placed without a tag"))
+                            })
+                            .ok()
+                    });
+                // Taken to a turn first: a huge angle (a damaged file) would saturate the cast
+                // and overflow when negated.
+                let turn = e.f(50).round().rem_euclid(360.0);
+                let rotation = Rotation::from_degrees(-(turn as i64)).unwrap_or_default();
+                // An array places one symbol per copy. The copies share the attributes, so
+                // only the first keeps the device tag: the rest would repeat it.
+                let cells = ArrayCells::of(e);
+                let copies = cells.len();
+                if copies > 1
+                    && let Some(t) = &tag
+                {
+                    tag_warnings.push(format!(
+                        "{id}: an array of {copies} copies, only the first keeps the device tag {t}, the others are placed without a tag"
+                    ));
+                }
+                let (ix, iy, mirror) = (e.f(10), e.f(20), e.f_or(41, 1.0) < 0.0);
+                let mut tag = tag;
+                for cell in 0..copies {
+                    if budget == 0 {
+                        let over = skipped.entry(OVER_LIMIT.to_owned()).or_default();
+                        *over = over.saturating_add(copies - cell);
+                        break;
+                    }
+                    budget -= 1;
+                    let (x, y) = cells.at(cell, (ix, iy));
+                    out.symbols.push(PlacedSymbol {
+                        id: String::new(),
+                        symbol: (*id).clone(),
+                        // Past the range of numbers, it is left out and said below.
+                        at: Point::new(x * scale, -y * scale),
+                        rotation,
+                        mirror,
+                        tag: tag.take(),
+                    });
+                }
             }
             None => {
                 plain.push(e.clone());
@@ -1945,21 +2501,74 @@ pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<
         }
         i = j;
     }
-    let mut skipped = BTreeMap::new();
     shapes(
-        &d,
+        d,
         &plain,
         Xf::ID,
         scale,
         0,
         &|_| false,
+        &|_| false,
         &mut raw,
         &mut points,
         &mut skipped,
-        &mut { MAX_DRAWN },
+        &mut budget,
     );
     out.graphics = raw.into_iter().map(|(_, s)| s).collect();
-    out.warnings = skipped_warnings(skipped);
+    out.warnings = skipped_warnings(skipped.clone());
+    // Entities farther than FAR_OUT from the middle of the drawing (the median point, which a
+    // few stray ones cannot move) are left out and said: moving one onto the page would drag
+    // the rest out of range or overflow. A drawing far from its own origin keeps everything.
+    // A symbol placed where its position is not a number (a coordinate near the limit times the
+    // scale) is left out and said first, so it cannot pull the middle away.
+    let placed = out.symbols.len();
+    out.symbols.retain(|s| s.at.x.is_finite() && s.at.y.is_finite());
+    if out.symbols.len() < placed {
+        *skipped.entry(NOT_NUMBERS_PLACED.to_owned()).or_default() += placed - out.symbols.len();
+        out.warnings = skipped_warnings(skipped.clone());
+    }
+    // An entity wider or taller than the window around the middle can never stay; leave it out
+    // before the middle is found, so its centre cannot pull the middle away from the rest.
+    let fits = |s: &Shape| {
+        let (a, b) = s.bounds();
+        b.x - a.x <= 2.0 * FAR_OUT && b.y - a.y <= 2.0 * FAR_OUT
+    };
+    let drawn = out.graphics.len();
+    out.graphics.retain(fits);
+    let oversized = drawn - out.graphics.len();
+    let mut xs: Vec<f64> = Vec::new();
+    let mut ys: Vec<f64> = Vec::new();
+    // One position per entity (the middle of its bounds), so a long line does not count twice.
+    for p in out
+        .graphics
+        .iter()
+        .map(|s| {
+            let (a, b) = s.bounds();
+            Point::new(a.x / 2.0 + b.x / 2.0, a.y / 2.0 + b.y / 2.0)
+        })
+        .chain(out.symbols.iter().map(|s| s.at))
+    {
+        xs.push(p.x);
+        ys.push(p.y);
+    }
+    let middle = |v: &mut Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v.get(v.len() / 2).copied().unwrap_or(0.0)
+    };
+    let mid = Point::new(middle(&mut xs), middle(&mut ys));
+    let near = |p: Point| (p.x - mid.x).abs() <= FAR_OUT && (p.y - mid.y).abs() <= FAR_OUT;
+    let before = out.graphics.len() + out.symbols.len();
+    out.graphics.retain(|s| {
+        let (a, b) = s.bounds();
+        near(a) && near(b)
+    });
+    out.symbols.retain(|s| near(s.at));
+    let far = oversized + before - out.graphics.len() - out.symbols.len();
+    if far > 0 {
+        *skipped.entry(TOO_FAR_OUT.to_owned()).or_default() += far;
+        out.warnings = skipped_warnings(skipped.clone());
+    }
+    out.warnings.extend(tag_warnings.iter().cloned());
     // Move into the frame: top-left at (20, 20) mm.
     let mut pts: Vec<Point> = out
         .graphics
@@ -1971,13 +2580,36 @@ pub fn page(text: &str, scale: f64, known_symbols: &BTreeSet<String>) -> Result<
         .collect();
     pts.extend(out.symbols.iter().map(|s| s.at));
     if pts.is_empty() {
-        return Err(Error::Format("the drawing has no entities WiringCraft can read".into()));
+        // Say what was left out, which is often why nothing is left to draw.
+        let mut why = "the drawing has no entities WiringCraft can read".to_owned();
+        if !out.warnings.is_empty() {
+            why.push_str(&format!(" ({})", out.warnings.join("; ")));
+        }
+        return Err(Error::Format(why));
     }
     let (min, _) = wc_core::geom::bounds_of(&pts);
-    let shift = Point::new(20.0 - min.x, 20.0 - min.y);
-    out.graphics = out.graphics.iter().map(|s| s.translate(shift)).collect();
+    // Subtract the corner first and add the frame offset after: in one step `20 - min` would
+    // round the 20 away for a drawing far from its origin.
+    let back = Point::new(-min.x, -min.y);
+    let frame = Point::new(20.0, 20.0);
+    out.graphics = out
+        .graphics
+        .iter()
+        .map(|s| s.translate(back).translate(frame))
+        .collect();
     for s in &mut out.symbols {
-        s.at = s.at + shift;
+        s.at = s.at + back + frame;
+    }
+    // The move can carry a shape far out past the range of numbers: left out and counted.
+    let before = out.graphics.len() + out.symbols.len();
+    out.graphics.retain(finite_shape);
+    out.symbols.retain(|s| s.at.x.is_finite() && s.at.y.is_finite());
+    let moved_out = before - out.graphics.len() - out.symbols.len();
+    if moved_out > 0 {
+        let left_out = skipped.entry(PLACED_NOT_NUMBERS.to_owned()).or_default();
+        *left_out = left_out.saturating_add(moved_out);
+        out.warnings = skipped_warnings(skipped);
+        out.warnings.extend(tag_warnings);
     }
     Ok(out)
 }
@@ -2021,6 +2653,163 @@ mod tests {
     }
 
     #[test]
+    fn an_unread_kind_named_like_a_full_count_stays_full() -> Result<()> {
+        // An entity whose kind is the too-deep key, after that count reached usize::MAX.
+        let d = parse(&dxf(&format!("0\n{TOO_DEEP}\n"), ""))?;
+        let mut skipped = BTreeMap::from([(TOO_DEEP.to_owned(), usize::MAX)]);
+        let (shapes, _) = draw(&d, &d.entities, &mut skipped, &mut { MAX_DRAWN });
+        assert!(shapes.is_empty());
+        assert_eq!(skipped.get(TOO_DEEP), Some(&usize::MAX), "{skipped:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn far_pin_circles_and_shapes_moved_past_the_numbers_are_handled() -> Result<()> {
+        // A pin circle whose radius overflows once scaled: the pin stays (once), the outline
+        // is left out.
+        let blocks = "0\nBLOCK\n2\nP\n10\n0\n20\n0\n0\nCIRCLE\n8\nPIN\n10\n1\n20\n1\n40\n1e308\n0\nENDBLK\n";
+        let ents = "0\nINSERT\n2\nP\n10\n0\n20\n0\n41\n2\n42\n2\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n";
+        let (s, warnings) = symbol_with_warnings(&dxf(ents, blocks), "my.far", "Far")?;
+        assert_eq!(s.pins.len(), 1, "{:?}", s.pins);
+        // The symbol is moved so its first pin is the origin: the pin at the placed centre
+        // (2, -2) puts the line's start at (-2, 2).
+        assert_eq!(s.pins[0].at, Point::new(0.0, 0.0));
+        assert!(
+            matches!(&s.graphics[..], [Shape::Line { a, .. }] if *a == Point::new(-2.0, 2.0)),
+            "{:?}",
+            s.graphics
+        );
+        // The outline's radius is what is not a number: said as a size.
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("1 entity whose size is not a number once placed")),
+            "{warnings:?}"
+        );
+        // A shape far past the rest could be pushed past the numbers by the move into the
+        // frame: it is left out (as too far from the rest) and said, the rest kept.
+        let ents = "0\nLINE\n10\n-1e308\n20\n0\n11\n-1e308\n21\n1\n0\nLINE\n10\n1.7e308\n20\n0\n11\n1.7e308\n21\n1\n";
+        let p = page(&dxf(ents, ""), 1.0, &BTreeSet::new())?;
+        assert_eq!(p.graphics.len(), 1, "{:?}", p.graphics);
+        assert!(p.graphics.iter().all(finite_shape), "{:?}", p.graphics);
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("1 entity more than 1000 km from the rest")),
+            "{:?}",
+            p.warnings
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_invisible_attribute_on_the_pin_layer_still_names_a_pin() -> Result<()> {
+        let ents = "0\nLINE\n8\n0\n10\n0\n20\n20\n11\n0\n21\n0\n\
+                    0\nPOINT\n8\nPIN\n10\n0\n20\n20\n\
+                    0\nATTRIB\n8\nPIN\n10\n1\n20\n19\n40\n2\n2\nPIN1\n1\nA1\n70\n1\n";
+        let s = symbol(&dxf(ents, ""), "my.coil", "Coil")?;
+        assert_eq!(s.pins.len(), 1);
+        assert_eq!(s.pins[0].name, "A1");
+        assert!(
+            !s.graphics.iter().any(|g| matches!(g, Shape::Text { .. })),
+            "{:?}",
+            s.graphics
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn visible_and_invisible_pin_labels_are_matched_in_drawing_order() -> Result<()> {
+        // Visible A1 on the first pin, listed before invisible A2 between the pins: A1 names the
+        // first pin, and A2 the second one.
+        let ents = "0\nPOINT\n8\nPIN\n10\n0\n20\n0\n0\nPOINT\n8\nPIN\n10\n8\n20\n0\n\
+                    0\nTEXT\n8\nPIN\n10\n0\n20\n0\n40\n2\n1\nA1\n\
+                    0\nATTRIB\n8\nPIN\n10\n3\n20\n0\n40\n2\n2\nPIN2\n1\nA2\n70\n1\n";
+        let s = symbol(&dxf(ents, ""), "my.coil", "Coil")?;
+        let names: Vec<(&str, Point)> = s.pins.iter().map(|p| (p.name.as_str(), p.at)).collect();
+        assert_eq!(names, [("A1", Point::new(0.0, 0.0)), ("A2", Point::new(8.0, 0.0))]);
+        Ok(())
+    }
+
+    #[test]
+    fn an_invisible_pin_label_inside_a_block_names_its_pin() -> Result<()> {
+        // A block holding a pin and an invisible attribute next to it, placed at (10, 20).
+        let blocks = "0\nBLOCK\n2\nTERM\n0\nPOINT\n8\nPIN\n10\n0\n20\n0\n\
+                      0\nATTRIB\n8\nPIN\n10\n1\n20\n1\n40\n2\n2\nPIN\n1\nX3\n70\n1\n0\nENDBLK\n";
+        let ents = "0\nLINE\n8\n0\n10\n0\n20\n0\n11\n10\n21\n20\n0\nINSERT\n2\nTERM\n10\n10\n20\n20\n";
+        let s = symbol(&dxf(ents, blocks), "my.term", "Terminal")?;
+        assert_eq!(s.pins.len(), 1);
+        assert_eq!(s.pins[0].name, "X3");
+        assert!(
+            !s.graphics.iter().any(|g| matches!(g, Shape::Text { .. })),
+            "{:?}",
+            s.graphics
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_insert_of_a_block_not_in_the_file_is_said() -> Result<()> {
+        let line = "0\nLINE\n8\n0\n10\n0\n20\n0\n11\n10\n21\n0\n";
+        let ents = format!("{line}0\nINSERT\n2\nNOPE\n10\n5\n20\n5\n");
+        let (s, warnings) = symbol_with_warnings(&dxf(&ents, ""), "my.part", "Part")?;
+        assert_eq!(s.graphics.len(), 1, "the line comes in: {:?}", s.graphics);
+        assert_eq!(
+            warnings,
+            ["1 block insert not drawn: its block is not in the file (NOPE)"]
+        );
+
+        // The block is there: drawn, and nothing said.
+        let blocks = "0\nBLOCK\n2\nNOPE\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n0\nENDBLK\n";
+        let (s, warnings) = symbol_with_warnings(&dxf(&ents, blocks), "my.part", "Part")?;
+        assert_eq!(s.graphics.len(), 2);
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        // Several missing blocks make one line, naming the first few; one with no name too.
+        let ents: String = ["A", "B", "B", "C", "D"]
+            .iter()
+            .map(|b| format!("0\nINSERT\n2\n{b}\n10\n0\n20\n0\n"))
+            .chain(["0\nINSERT\n10\n0\n20\n0\n".to_owned()])
+            .collect();
+        let (_, warnings) = symbol_with_warnings(&dxf(&format!("{line}{ents}"), ""), "my.part", "Part")?;
+        assert_eq!(
+            warnings,
+            ["6 block inserts not drawn: their block is not in the file ((no name), A, B, ...)"]
+        );
+
+        // A name with control characters is shown without them.
+        let ents = format!("{line}0\nINSERT\n2\nX\u{1b}[2J\n10\n0\n20\n0\n");
+        let (_, warnings) = symbol_with_warnings(&dxf(&ents, ""), "my.part", "Part")?;
+        assert_eq!(
+            warnings,
+            ["1 block insert not drawn: its block is not in the file (X?[2J)"]
+        );
+
+        // A long name inside a block placed as an array: cut short, every copy counted.
+        let long = "L".repeat(10_000);
+        let blocks = format!("0\nBLOCK\n2\nARR\n0\nINSERT\n2\n{long}\n10\n0\n20\n0\n0\nENDBLK\n");
+        let ents = format!("{line}0\nINSERT\n2\nARR\n10\n0\n20\n0\n70\n4\n71\n5\n44\n1\n45\n1\n");
+        let (_, warnings) = symbol_with_warnings(&dxf(&ents, &blocks), "my.part", "Part")?;
+        let short = "L".repeat(MISSING_BLOCK_NAME_LEN);
+        assert_eq!(
+            warnings,
+            [format!(
+                "20 block inserts not drawn: their block is not in the file ({short})"
+            )]
+        );
+
+        // Leading spaces count toward the cut too: a name past them is not looked for.
+        let spaced = format!("{}X", " ".repeat(10_000));
+        let blocks = format!("0\nBLOCK\n2\nARR\n0\nINSERT\n2\n{spaced}\n10\n0\n20\n0\n0\nENDBLK\n");
+        let (_, warnings) = symbol_with_warnings(&dxf(&ents, &blocks), "my.part", "Part")?;
+        assert_eq!(
+            warnings,
+            ["20 block inserts not drawn: their block is not in the file ((no name))"]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn page_with_known_block_and_exploded_block() -> Result<()> {
         let blocks = "0\nBLOCK\n2\nWC.COIL\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n0\nENDBLK\n\
                       0\nBLOCK\n2\nLOGO\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n0\nLINE\n10\n0\n20\n0\n11\n0\n21\n1\n0\nENDBLK\n";
@@ -2032,6 +2821,229 @@ mod tests {
         assert_eq!(p.symbols.len(), 1);
         assert_eq!(p.symbols[0].tag.as_ref().map(|t| t.to_string()).as_deref(), Some("-K7"));
         assert_eq!(p.graphics.len(), 3, "logo exploded into two lines plus the polyline");
+        Ok(())
+    }
+
+    /// A line whose ends overflow once scaled is left out and counted, and a drawing left with
+    /// nothing says why.
+    #[test]
+    fn a_line_that_overflows_once_placed_is_left_out_and_said() -> Result<()> {
+        let ents = "0\nLINE\n10\n0\n20\n0\n11\n1e308\n21\n0\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n";
+        let p = page(&dxf(ents, ""), 10.0, &BTreeSet::new())?;
+        assert_eq!(p.graphics.len(), 1, "{:?}", p.graphics);
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("1 line whose ends are not numbers")),
+            "{:?}",
+            p.warnings
+        );
+        let only = "0\nLINE\n10\n0\n20\n0\n11\n1e308\n21\n0\n";
+        let Err(err) = page(&dxf(only, ""), 10.0, &BTreeSet::new()) else {
+            unreachable!("nothing left to draw");
+        };
+        assert!(err.to_string().contains("1 line whose ends are not numbers"), "{err}");
+        Ok(())
+    }
+
+    /// An entity too far out to move onto the page is left out and said; the rest is moved
+    /// from where it lies, so it keeps its shape (a far-off line would drag it out of range).
+    #[test]
+    fn a_line_too_far_out_is_left_out_and_the_rest_keeps_its_shape() -> Result<()> {
+        let ents = "0\nLINE\n10\n-1e308\n20\n0\n11\n1e308\n21\n0\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n";
+        let p = page(&dxf(ents, ""), 1.0, &BTreeSet::new())?;
+        // The ordinary line keeps its ends and length, at the frame's corner.
+        let [Shape::Line { a, b }] = p.graphics.as_slice() else {
+            unreachable!("{:?}", p.graphics);
+        };
+        assert_eq!((*a, *b), (Point::new(20.0, 20.0), Point::new(25.0, 20.0)));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("1 entity more than 1000 km from the rest of the drawing")),
+            "{:?}",
+            p.warnings
+        );
+        let only = "0\nLINE\n10\n-1e308\n20\n0\n11\n1e308\n21\n0\n";
+        let Err(err) = page(&dxf(only, ""), 1.0, &BTreeSet::new()) else {
+            unreachable!("nothing left to draw");
+        };
+        assert!(err.to_string().contains("1000 km"), "{err}");
+        Ok(())
+    }
+
+    /// A symbol whose position overflows once scaled is left out and said; the others stay.
+    #[test]
+    fn a_symbol_placed_out_of_range_is_left_out_and_the_rest_kept() -> Result<()> {
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        let ents = "0\nINSERT\n2\nWC.COIL\n10\n0\n20\n0\n0\nINSERT\n2\nWC.COIL\n10\n1e308\n20\n0\n";
+        let p = page(&dxf(ents, ""), 10.0, &known)?;
+        assert_eq!(p.symbols.len(), 1, "{:?}", p.symbols);
+        assert_eq!(p.symbols[0].at, Point::new(20.0, 20.0));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("1 entity whose size is not a number once placed")),
+            "{:?}",
+            p.warnings
+        );
+        Ok(())
+    }
+
+    /// Lines too long for any window are left out before the middle is found, so they cannot
+    /// pull it away from a compact drawing far out.
+    #[test]
+    fn lines_too_long_to_place_do_not_move_the_middle() -> Result<()> {
+        let long = "0\nLINE\n10\n-1e12\n20\n0\n11\n1e12\n21\n0\n";
+        let ents = format!("{long}{long}0\nLINE\n10\n2e9\n20\n0\n11\n2000000005\n21\n0\n");
+        let p = page(&dxf(&ents, ""), 1.0, &BTreeSet::new())?;
+        let [Shape::Line { a, b }] = p.graphics.as_slice() else {
+            unreachable!("{:?}", p.graphics);
+        };
+        assert_eq!((*a, *b), (Point::new(20.0, 20.0), Point::new(25.0, 20.0)));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("2 entities more than 1000 km from the rest")),
+            "{:?}",
+            p.warnings
+        );
+        Ok(())
+    }
+
+    /// A drawing very far from its own origin still lands at the frame offset, its size kept.
+    #[test]
+    fn a_drawing_very_far_out_keeps_the_frame_offset_and_its_length() -> Result<()> {
+        let ents = "0\nLINE\n10\n1e18\n20\n0\n11\n1000000000000000128\n21\n0\n";
+        let p = page(&dxf(ents, ""), 1.0, &BTreeSet::new())?;
+        let [Shape::Line { a, b }] = p.graphics.as_slice() else {
+            unreachable!("{:?}", p.graphics);
+        };
+        assert_eq!((*a, *b), (Point::new(20.0, 20.0), Point::new(148.0, 20.0)));
+        Ok(())
+    }
+
+    /// One stray line far away counts once in finding the middle, not once per end, so it
+    /// cannot outvote two symbols and drag the page to itself.
+    #[test]
+    fn a_stray_line_counts_once_and_cannot_outvote_the_symbols() -> Result<()> {
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        let ents = "0\nINSERT\n2\nWC.COIL\n10\n0\n20\n0\n0\nINSERT\n2\nWC.COIL\n10\n5\n20\n0\n\
+                    0\nLINE\n10\n1e12\n20\n0\n11\n1000000000005\n21\n0\n";
+        let p = page(&dxf(ents, ""), 1.0, &known)?;
+        assert_eq!(p.symbols.len(), 2, "{:?}", p.symbols);
+        assert!(p.graphics.is_empty(), "{:?}", p.graphics);
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("1 entity more than 1000 km from the rest")),
+            "{:?}",
+            p.warnings
+        );
+        Ok(())
+    }
+
+    /// A compact drawing far from its own origin (map coordinates) is moved onto the page whole.
+    #[test]
+    fn a_drawing_far_from_its_origin_comes_onto_the_page_whole() -> Result<()> {
+        let ents = "0\nLINE\n10\n2e9\n20\n0\n11\n2000000005\n21\n0\n";
+        let p = page(&dxf(ents, ""), 1.0, &BTreeSet::new())?;
+        let [Shape::Line { a, b }] = p.graphics.as_slice() else {
+            unreachable!("{:?}", p.graphics);
+        };
+        assert_eq!((*a, *b), (Point::new(20.0, 20.0), Point::new(25.0, 20.0)));
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+        Ok(())
+    }
+
+    /// A text whose height overflows once scaled is left out and said (its bounds are only its
+    /// anchor); an ordinary text comes through unchanged and survives a save and reload.
+    #[test]
+    fn a_text_whose_height_overflows_once_scaled_is_left_out_and_said() -> Result<()> {
+        let ents = "0\nTEXT\n10\n0\n20\n0\n40\n1e308\n1\nHUGE\n0\nTEXT\n10\n0\n20\n0\n40\n2.5\n1\nA1\n";
+        let p = page(&dxf(ents, ""), 10.0, &BTreeSet::new())?;
+        let [Shape::Text { text, height, .. }] = p.graphics.as_slice() else {
+            unreachable!("{:?}", p.graphics);
+        };
+        assert_eq!((text.as_str(), *height), ("A1", 25.0));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("1 entity whose size is not a number once placed")),
+            "{:?}",
+            p.warnings
+        );
+        let json = serde_json::to_string(&p.graphics).map_err(|e| Error::Format(e.to_string()))?;
+        let back: Vec<Shape> = serde_json::from_str(&json).map_err(|e| Error::Format(e.to_string()))?;
+        assert_eq!(back, p.graphics);
+        Ok(())
+    }
+
+    /// A circle whose radius overflows once scaled is left out and said, never saved as a
+    /// radius that is not a number.
+    #[test]
+    fn a_circle_whose_radius_overflows_once_scaled_is_left_out_and_said() -> Result<()> {
+        let ents = "0\nCIRCLE\n10\n0\n20\n0\n40\n1e308\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n";
+        let p = page(&dxf(ents, ""), 10.0, &BTreeSet::new())?;
+        assert_eq!(p.graphics.len(), 1, "{:?}", p.graphics);
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("1 entity whose size is not a number once placed")),
+            "{:?}",
+            p.warnings
+        );
+        Ok(())
+    }
+
+    /// A symbol's rotation is read as a quarter turn; a huge angle (a damaged file, or a DWG
+    /// angle of -1e18 radians) does not overflow.
+    #[test]
+    fn a_symbol_rotation_of_any_size_is_read() -> Result<()> {
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        for (angle, want) in [
+            ("90", Rotation::R270),
+            ("-90", Rotation::R90),
+            ("450", Rotation::R270),
+            ("-5.7e19", Rotation::R0),
+            ("1e300", Rotation::R0),
+        ] {
+            let ents = format!("0\nINSERT\n2\nWC.COIL\n10\n0\n20\n0\n50\n{angle}\n");
+            let p = page(&dxf(&ents, ""), 1.0, &known)?;
+            assert_eq!(p.symbols.len(), 1, "{angle}");
+            assert_eq!(p.symbols[0].rotation, want, "{angle}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn invisible_attributes_are_not_drawn() -> Result<()> {
+        let blocks = "0\nBLOCK\n2\nWC.COIL\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n0\nENDBLK\n\
+                      0\nBLOCK\n2\nBOX\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n0\nENDBLK\n";
+        // A plain block with a visible and an invisible (70 bit 1) attribute, and a known
+        // symbol whose tag is invisible.
+        let ents = "0\nINSERT\n2\nBOX\n10\n0\n20\n0\n66\n1\n\
+                    0\nATTRIB\n2\nNOTE\n1\nShown\n10\n0\n20\n5\n70\n0\n\
+                    0\nATTRIB\n2\nPART\n1\nHidden 123\n10\n0\n20\n10\n70\n9\n\
+                    0\nINSERT\n2\nWC.COIL\n10\n50\n20\n100\n66\n1\n0\nATTRIB\n2\nTAG\n1\n-K7\n70\n1\n";
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        let p = page(&dxf(ents, blocks), 1.0, &known)?;
+        let texts: Vec<&str> = p
+            .graphics
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["Shown"], "{:?}", p.graphics);
+        assert!(
+            p.warnings.is_empty(),
+            "an invisible attribute is not a skipped entity: {:?}",
+            p.warnings
+        );
+        assert_eq!(p.symbols.len(), 1);
+        assert_eq!(p.symbols[0].tag.as_ref().map(|t| t.to_string()).as_deref(), Some("-K7"));
         Ok(())
     }
 
@@ -2105,6 +3117,63 @@ mod tests {
         assert!(r.is_ok());
         // Truncated pair list and garbage numbers.
         let _ = symbol("0\nSECTION\n2\nENTITIES\n0\nLINE\n10\nNaN\n20", "x", "x");
+    }
+
+    #[test]
+    fn a_leader_is_drawn_with_its_arrow_head() -> Result<()> {
+        let leader = |arrow: u8| {
+            format!("0\nLEADER\n8\n0\n71\n{arrow}\n72\n0\n76\n3\n10\n0\n20\n0\n10\n10\n20\n0\n10\n10\n20\n10\n")
+        };
+        let near = |a: Point, x: f64, y: f64| (a.x - x).abs() < 1e-9 && (a.y - y).abs() < 1e-9;
+        for arrow in [0, 1] {
+            let d = parse(&dxf(&leader(arrow), ""))?;
+            let mut skipped = BTreeMap::new();
+            let mut budget = MAX_DRAWN;
+            let (shapes, _) = draw_mapped(&d, &d.entities, [1.0, 0.0, 0.0, 1.0], 0.0, &mut skipped, &mut budget);
+            assert!(skipped.is_empty(), "{skipped:?}");
+            assert_eq!(shapes.len(), 1 + arrow as usize, "{shapes:?}");
+            // The line through the vertices, y down on the page.
+            let Shape::Polyline { points, closed, filled } = &shapes[0].1 else {
+                unreachable!("the leader line is a polyline: {shapes:?}")
+            };
+            assert!(!*closed && !*filled);
+            assert_eq!(points.len(), 3);
+            assert!(near(points[0], 0.0, 0.0) && near(points[1], 10.0, 0.0) && near(points[2], 10.0, -10.0));
+            if arrow == 1 {
+                let Shape::Polyline { points, closed, filled } = &shapes[1].1 else {
+                    unreachable!("the arrow head is a polyline: {shapes:?}")
+                };
+                assert!(*closed && *filled);
+                // Tip on the first vertex, base 2.5 along the first segment, 0.83 wide.
+                assert!(near(points[0], 0.0, 0.0), "{points:?}");
+                assert!(
+                    near(points[1], 2.5, -0.415) && near(points[2], 2.5, 0.415),
+                    "{points:?}"
+                );
+            }
+            let (_, warnings) = footprint(&dxf(&leader(arrow), ""))?;
+            assert!(!warnings.iter().any(|w| w.contains("LEADER")), "{warnings:?}");
+        }
+        // A vertex that is not numbers is left out, the rest drawn, and the leader says so.
+        let (f, warnings) = footprint(&dxf(
+            "0\nLEADER\n71\n0\n76\n3\n10\n0\n20\n0\n10\nbad\n20\n5\n10\n10\n20\n10\n",
+            "",
+        ))?;
+        assert_eq!(f.shapes.len(), 1, "{:?}", f.shapes);
+        assert!((f.width - 10.0).abs() < 1e-9 && (f.height - 10.0).abs() < 1e-9);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("1 LEADER vertex that is not numbers")),
+            "{warnings:?}"
+        );
+        // One vertex draws nothing and is still said.
+        let (_, warnings) = footprint(&dxf(
+            "0\nLINE\n10\n0\n20\n0\n11\n5\n21\n5\n0\nLEADER\n71\n1\n76\n1\n10\n0\n20\n0\n",
+            "",
+        ))?;
+        assert!(warnings.iter().any(|w| w.contains("LEADER")), "{warnings:?}");
+        Ok(())
     }
 
     #[test]
@@ -2337,6 +3406,99 @@ mod tests {
         assert_eq!(mtext_plain(r"{\fArial|b1;Motor}\PM1"), "Motor M1");
     }
 
+    #[test]
+    fn text_codes_become_characters() -> Result<()> {
+        assert_eq!(
+            special_codes(r"\U+00C5lesund 3%%c 20%%D %%p1 50%%% %%uline%%u"),
+            "\u{c5}lesund 3\u{2300} 20\u{b0} \u{b1}1 50% line"
+        );
+        // Malformed codes stay as written.
+        assert_eq!(special_codes(r"\U+00G1 \U+12 100%% %%x"), r"\U+00G1 \U+12 100%% %%x");
+        let ents = "0\nTEXT\n8\n0\n10\n5\n20\n5\n40\n2\n1\n\\U+00C5lesund %%c6\n\
+                    0\nMTEXT\n8\n0\n10\n5\n20\n9\n40\n2\n1\n{\\fArial;\\U+00D8st}\\P20%%d\n";
+        let p = page(&dxf(ents, ""), 1.0, &BTreeSet::new())?;
+        let texts: Vec<&str> = p
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["\u{c5}lesund \u{2300}6", "\u{d8}st 20\u{b0}"]);
+        // The form WiringCraft's own DXF export writes reads back as drawn.
+        assert_eq!(special_codes(r"\U+00C5lesund"), "\u{c5}lesund");
+        // In MTEXT an escaped backslash before U+ stays literal; a lone one is a code.
+        assert_eq!(mtext_plain(r"\\U+00C5"), r"\U+00C5");
+        assert_eq!(mtext_plain(r"\U+00C5"), "\u{c5}");
+        assert_eq!(mtext_plain(r"\U+00G1 \U+"), r"\U+00G1 \U+");
+        assert_eq!(mtext_plain(r"\U1234"), r"\U1234");
+        assert_eq!(mtext_plain(r"\U1234;tail"), r"\U1234;tail");
+        // A `%` written as `\U+0025` never starts a `%%` code.
+        assert_eq!(special_codes(r"\U+0025%%c"), "%\u{2300}");
+        assert_eq!(mtext_plain(r"\U+0025%%c"), "%\u{2300}");
+        assert_eq!(mtext_plain(r"{\fArial;50%%%}%%D %%x"), "50%\u{b0} %%x");
+        // A known symbol's TAG attribute is decoded before it is read as a device tag.
+        let blocks = "0\nBLOCK\n2\nWC.COIL\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n0\nENDBLK\n";
+        let ents = "0\nINSERT\n2\nWC.COIL\n10\n50\n20\n100\n66\n1\n0\nATTRIB\n2\nTAG\n1\n-K\\U+00C51\n";
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        let p = page(&dxf(ents, blocks), 1.0, &known)?;
+        assert_eq!(
+            p.symbols
+                .first()
+                .and_then(|s| s.tag.as_ref())
+                .map(|t| t.to_string())
+                .as_deref(),
+            Some("-K\u{c5}1")
+        );
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+        Ok(())
+    }
+
+    #[test]
+    fn a_page_exported_to_dxf_reads_back_its_accents() -> Result<()> {
+        let mut project = wc_core::Project::new("Round trip");
+        let mut drawn = wc_core::Page::new("p1", "1", "Page");
+        drawn.graphics.push(Shape::Text {
+            at: Point::new(120.0, 80.0),
+            text: "\u{c5}lesund".into(),
+            height: 3.0,
+            align: Align::Left,
+            angle: 0.0,
+        });
+        project.pages = vec![drawn];
+        let (pages, _) = wc_pdf::page_lines(&project, &BTreeMap::new(), &wc_pdf::Options::default());
+        let Some(exported) = pages.first().map(wc_pdf::dxf) else {
+            unreachable!("one page is exported");
+        };
+        assert!(exported.contains("\\U+00C5lesund"), "the export writes the code");
+        let p = page(&exported, 1.0, &BTreeSet::new())?;
+        assert!(
+            p.graphics
+                .iter()
+                .any(|g| matches!(g, Shape::Text { text, .. } if text == "\u{c5}lesund")),
+            "the import reads the character back"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_tag_that_is_not_a_device_tag_is_said() -> Result<()> {
+        let blocks = "0\nBLOCK\n2\nWC.COIL\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n0\nENDBLK\n";
+        let ents = "0\nINSERT\n2\nWC.COIL\n10\n50\n20\n100\n66\n1\n0\nATTRIB\n2\nTAG\n1\nK\\U+00C51\n";
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        let p = page(&dxf(ents, blocks), 1.0, &known)?;
+        assert_eq!(p.symbols.len(), 1);
+        assert!(p.symbols[0].tag.is_none());
+        assert_eq!(p.warnings.len(), 1, "{:?}", p.warnings);
+        let w = &p.warnings[0];
+        assert!(
+            w.contains("wc.coil") && w.contains("\"K\u{c5}1\"") && w.contains("must start with"),
+            "{w}"
+        );
+        Ok(())
+    }
+
     /// Every graphic of a drawing in DXF coordinates turned to page ones (y down, scale 1).
     fn drawn(entities: &str, blocks: &str) -> Result<(Vec<Shape>, BTreeMap<String, usize>)> {
         let d = parse(&dxf(entities, blocks))?;
@@ -2347,6 +3509,7 @@ mod tests {
             Xf::ID,
             1.0,
             0,
+            &|_| false,
             &|_| false,
             &mut raw,
             &mut points,
@@ -2365,6 +3528,50 @@ mod tests {
 
     fn near(a: Point, b: Point) -> bool {
         a.distance(b) < 1e-6
+    }
+
+    #[test]
+    fn mtext_and_justified_text_are_placed_by_their_alignment() -> Result<()> {
+        // MTEXT: 71 is the attachment point, 72 = 1 is the drawing direction (left to right).
+        let ents = "0\nMTEXT\n8\n0\n10\n5\n20\n5\n40\n2\n71\n1\n72\n1\n1\nLeft\n\
+                    0\nMTEXT\n8\n0\n10\n5\n20\n5\n40\n2\n71\n5\n72\n1\n1\nMiddle\n\
+                    0\nMTEXT\n8\n0\n10\n5\n20\n5\n40\n2\n71\n9\n11\n0\n21\n1\n1\nTurned\n\
+                    0\nTEXT\n8\n0\n10\n0\n20\n0\n11\n50\n21\n20\n40\n2\n72\n2\n1\nRight\n\
+                    0\nTEXT\n8\n0\n10\n3\n20\n4\n11\n50\n21\n20\n40\n2\n1\nPlain\n\
+                    0\nATTRIB\n8\n0\n10\n0\n20\n0\n11\n50\n21\n20\n40\n2\n72\n0\n74\n2\n1\nMiddle tag\n\
+                    0\nATTRIB\n8\n0\n10\n3\n20\n4\n11\n50\n21\n20\n40\n2\n73\n8\n1\nField\n";
+        let (g, _) = drawn(ents, "")?;
+        let placed: Vec<(&str, Point, Align, f64)> = g
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Text {
+                    text, at, align, angle, ..
+                } => Some((text.as_str(), *at, *align, *angle)),
+                _ => None,
+            })
+            .collect();
+        let want = [
+            ("Left", Point::new(5.0, -5.0), Align::Left, 0.0),
+            ("Middle", Point::new(5.0, -5.0), Align::Center, 0.0),
+            // No code 50: the direction 11/21 turns it a quarter.
+            ("Turned", Point::new(5.0, -5.0), Align::Right, 90.0),
+            // Justified: on its second point, not the 0,0 start.
+            ("Right", Point::new(50.0, -20.0), Align::Right, 0.0),
+            // Left aligned: on 10/20 even with an 11/21.
+            ("Plain", Point::new(3.0, -4.0), Align::Left, 0.0),
+            // ATTRIB: 74 is the vertical alignment, so this one sits on 11/21.
+            ("Middle tag", Point::new(50.0, -20.0), Align::Left, 0.0),
+            // ATTRIB: 73 is the field length, not an alignment; it stays on 10/20.
+            ("Field", Point::new(3.0, -4.0), Align::Left, 0.0),
+        ];
+        assert_eq!(placed.len(), want.len(), "{placed:?}");
+        for (got, want) in placed.iter().zip(&want) {
+            assert!(
+                got.0 == want.0 && near(got.1, want.1) && got.2 == want.2 && (got.3 - want.3).abs() < 1e-9,
+                "{got:?} != {want:?}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -2601,6 +3808,80 @@ mod tests {
     }
 
     #[test]
+    fn bulges_that_would_give_too_many_points_are_left_out() -> Result<()> {
+        // 6000 vertices each bulged 1 (a half circle, 36 steps) would give about 222 000 points.
+        let n = 6000;
+        let vertices: String = (0..n).map(|i| format!("10\n{i}\n20\n0\n42\n1\n")).collect();
+        let many = format!("0\nLWPOLYLINE\n8\n0\n90\n{n}\n70\n0\n{vertices}");
+        let loop_vertices: String = (0..n).map(|i| format!("10\n{i}\n20\n0\n42\n1\n")).collect();
+        let hatch = format!(
+            "0\nHATCH\n8\n0\n2\nSOLID\n70\n1\n91\n2\n\
+             92\n2\n72\n1\n73\n1\n93\n{n}\n{loop_vertices}97\n0\n\
+             92\n2\n72\n0\n73\n1\n93\n3\n10\n0\n20\n0\n10\n5\n20\n0\n10\n0\n20\n5\n97\n0\n"
+        );
+        // An ordinary bulged polyline still draws its arc.
+        let half = "0\nLWPOLYLINE\n8\n0\n90\n2\n70\n0\n10\n0\n20\n0\n42\n1\n10\n10\n20\n0\n";
+        let (g, skipped) = drawn(&format!("{many}{hatch}{half}"), "")?;
+        assert_eq!(skipped.get(POLYLINE_TOO_MANY_POINTS), Some(&1), "{skipped:?}");
+        assert_eq!(skipped.get(HATCH_TOO_MANY_POINTS), Some(&1), "{skipped:?}");
+        assert!(!skipped.contains_key(POLYLINE_NOT_NUMBERS), "{skipped:?}");
+        assert!(!skipped.contains_key(HATCH_NOT_NUMBERS), "{skipped:?}");
+        // The hatch keeps its other loop, as an outline (the lost one may have been a hole);
+        // the half circle is drawn.
+        assert_eq!(g.len(), 2, "{g:?}");
+        let (triangle, closed, filled) = poly(&g[0]);
+        assert!(closed && !filled);
+        assert_eq!(triangle.len(), 3);
+        let (arc, _, _) = poly(&g[1]);
+        assert!(arc.iter().any(|q| near(*q, Point::new(5.0, 5.0))), "{arc:?}");
+        // The warnings name the limit.
+        let warnings = skipped_warnings(skipped);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w == "1 polyline whose arcs would need more than 200000 points, left out"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("1 HATCH with a boundary whose arcs")),
+            "{warnings:?}"
+        );
+        // Just under the limit, a polyline is still sampled: 5500 closed half circles make
+        // 5500 * 36 = 198 000 points.
+        let ok: Vec<((f64, f64), f64)> = (0..5500).map(|i| ((f64::from(i), 0.0), 1.0)).collect();
+        assert!(bulged(&ok, true).is_ok_and(|pts| pts.len() == 198_000));
+        // Far from the origin rounding can put an arc's centre on its end, so each side comes
+        // out a full turn: the limit holds for the points actually made, not the bulges' count.
+        let far: Vec<((f64, f64), f64)> = (0..8000)
+            .map(|i| ((1e16 + if i % 2 == 0 { 0.0 } else { 2.0 }, 1e16), 0.5))
+            .collect();
+        assert_eq!(bulged(&far, true), Err(BulgeError::TooManyPoints));
+        // A hatch loop of 6000 half-circle arc edges (37 points each) is left out the same way.
+        let arcs: String = (0..n)
+            .map(|i| {
+                let c = 2 * i + 1;
+                format!("72\n2\n10\n{c}\n20\n0\n40\n1\n50\n180\n51\n0\n73\n0\n")
+            })
+            .collect();
+        let edge_hatch = format!("0\nHATCH\n8\n0\n2\nSOLID\n70\n1\n91\n1\n92\n1\n93\n{n}\n{arcs}97\n0\n");
+        let (g, skipped) = drawn(&format!("{edge_hatch}{half}"), "")?;
+        assert_eq!(skipped.get(HATCH_TOO_MANY_POINTS), Some(&1), "{skipped:?}");
+        assert_eq!(g.len(), 1, "only the half circle is drawn");
+        // A page with nothing else to draw says why in its error.
+        let Err(e) = page(&dxf(&many, ""), 1.0, &BTreeSet::new()) else {
+            unreachable!("a page with nothing drawn is refused")
+        };
+        assert!(e.to_string().contains("more than 200000 points"), "{e}");
+        let Err(e) = page(&dxf("", ""), 1.0, &BTreeSet::new()) else {
+            unreachable!("an empty page is refused")
+        };
+        assert!(e.to_string().ends_with("WiringCraft can read"), "{e}");
+        Ok(())
+    }
+
+    #[test]
     fn entities_not_read_are_counted_per_kind() -> Result<()> {
         let ents = "0\n3DFACE\n8\n0\n0\n3DFACE\n8\n0\n0\nMLINE\n8\n0\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n";
         let p = page(&dxf(ents, ""), 1.0, &BTreeSet::new())?;
@@ -2619,6 +3900,236 @@ mod tests {
         );
         let (g, _) = drawn("0\nINSERT\n2\nB\n10\n0\n20\n0\n", blocks)?;
         assert!(matches!(&g[..], [Shape::Text { angle, .. }] if *angle == 0.0), "{g:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_arrayed_insert_draws_every_copy() -> Result<()> {
+        let blocks = "0\nBLOCK\n2\nB\n10\n0\n20\n0\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n0\nENDBLK\n";
+        let starts = |g: &[Shape]| -> Vec<(f64, f64)> {
+            g.iter()
+                .filter_map(|s| match s {
+                    Shape::Line { a, .. } => Some((a.x, a.y)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let near = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9;
+        // 3 columns 10 apart, 2 rows 5 apart (y flipped on the page).
+        let (g, _) = drawn("0\nINSERT\n2\nB\n10\n1\n20\n2\n70\n3\n71\n2\n44\n10\n45\n5\n", blocks)?;
+        let want = [
+            (1.0, -2.0),
+            (11.0, -2.0),
+            (21.0, -2.0),
+            (1.0, -7.0),
+            (11.0, -7.0),
+            (21.0, -7.0),
+        ];
+        let got = starts(&g);
+        assert_eq!(got.len(), 6, "{g:?}");
+        for w in want {
+            assert!(got.iter().any(|p| near(*p, w)), "{w:?} not in {got:?}");
+        }
+        // Turned by 90 degrees: the columns run up, the rows run left; the spacing is not scaled.
+        let turned = "0\nINSERT\n2\nB\n10\n0\n20\n0\n41\n2\n42\n2\n50\n90\n70\n2\n71\n2\n44\n10\n45\n5\n";
+        let (g, _) = drawn(turned, blocks)?;
+        let got = starts(&g);
+        assert_eq!(got.len(), 4, "{g:?}");
+        for w in [(0.0, 0.0), (0.0, -10.0), (-5.0, 0.0), (-5.0, -10.0)] {
+            assert!(got.iter().any(|p| near(*p, w)), "{w:?} not in {got:?}");
+        }
+        // A huge array stops at the budget and counts the copies left out.
+        let d = parse(&dxf("0\nINSERT\n2\nB\n70\n30000\n71\n30000\n44\n1\n", blocks))?;
+        let mut skipped = BTreeMap::new();
+        let mut budget = 10;
+        let (shapes, _) = draw(&d, &d.entities, &mut skipped, &mut budget);
+        assert_eq!(shapes.len(), 9);
+        assert_eq!(skipped.get(OVER_LIMIT), Some(&(30_000 * 30_000 - 9)), "{skipped:?}");
+        // A count already there and a bulk count past usize::MAX stop at usize::MAX.
+        let two = "0\nBLOCK\n2\nB\n10\n0\n20\n0\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n0\nLINE\n10\n0\n20\n0\n11\n0\n21\n1\n0\nENDBLK\n";
+        let d = parse(&dxf("0\nINSERT\n2\nB\n70\n1e12\n71\n1e12\n", two))?;
+        let mut skipped = BTreeMap::from([(OVER_LIMIT.to_owned(), 5)]);
+        let (shapes, _) = draw(&d, &d.entities, &mut skipped, &mut 1);
+        assert!(shapes.is_empty());
+        assert_eq!(skipped.get(OVER_LIMIT), Some(&usize::MAX), "{skipped:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn array_copies_too_deep_or_past_the_numbers_are_counted() -> Result<()> {
+        let blocks = "0\nBLOCK\n2\nB\n10\n0\n20\n0\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n0\nENDBLK\n";
+        let big = "0\nINSERT\n2\nB\n70\n30000\n71\n30000\n44\n1\n45\n1\n";
+        // At the nesting limit every copy would be turned away: counted without visiting them.
+        let d = parse(&dxf(big, blocks))?;
+        let mut skipped = BTreeMap::new();
+        let mut budget = MAX_DRAWN;
+        let mut out = Vec::new();
+        shapes(
+            &d,
+            &d.entities,
+            Xf::ID,
+            1.0,
+            MAX_NESTING,
+            &|_| false,
+            &|_| false,
+            &mut out,
+            &mut Vec::new(),
+            &mut skipped,
+            &mut budget,
+        );
+        assert!(out.is_empty());
+        assert_eq!(skipped.get(TOO_DEEP), Some(&(30_000 * 30_000)), "{skipped:?}");
+        assert_eq!(budget, MAX_DRAWN - 1);
+        // Spacing so large the third copy lands past the numbers: its line is left out with a
+        // warning, the first two are drawn.
+        let (g, skipped) = drawn("0\nINSERT\n2\nB\n70\n3\n71\n1\n44\n1e308\n", blocks)?;
+        assert_eq!(g.len(), 2, "{g:?}");
+        assert_eq!(skipped.get(LINE_NOT_NUMBERS), Some(&1), "{skipped:?}");
+        assert!(skipped_warnings(skipped)[0].starts_with("1 line whose ends are not numbers"));
+        // In range on its own, but past the numbers once inside a block scaled by 2.
+        let nested =
+            format!("{blocks}0\nBLOCK\n2\nOUTER\n10\n0\n20\n0\n0\nINSERT\n2\nB\n70\n2\n44\n1e308\n0\nENDBLK\n");
+        let (g, skipped) = drawn("0\nINSERT\n2\nOUTER\n41\n2\n42\n2\n", &nested)?;
+        assert_eq!(g.len(), 1, "{g:?}");
+        assert!(g.iter().all(finite_shape), "{g:?}");
+        assert_eq!(skipped.get(LINE_NOT_NUMBERS), Some(&1), "{skipped:?}");
+        // A block whose base point is far out: the placement's own origin overflows once
+        // scaled, but the line drawn from it is in range and kept.
+        let based = "0\nBLOCK\n2\nFAR\n10\n1e308\n20\n0\n0\nLINE\n10\n1e308\n20\n0\n11\n1e308\n21\n1\n0\nENDBLK\n";
+        for ents in [
+            "0\nINSERT\n2\nFAR\n10\n0\n20\n0\n",
+            "0\nINSERT\n2\nFAR\n10\n0\n20\n0\n70\n2\n44\n5\n",
+        ] {
+            let d = parse(&dxf(ents, based))?;
+            let (mut raw, mut skipped) = (Vec::new(), BTreeMap::new());
+            shapes(
+                &d,
+                &d.entities,
+                Xf::ID,
+                2.0,
+                0,
+                &|_| false,
+                &|_| false,
+                &mut raw,
+                &mut Vec::new(),
+                &mut skipped,
+                &mut { MAX_DRAWN },
+            );
+            assert!(skipped.is_empty(), "{skipped:?}");
+            assert!(!raw.is_empty(), "{raw:?}");
+            assert!(
+                raw.iter()
+                    .all(|(_, s)| finite_shape(s) && s.bounds().0.x.abs() <= 10.0 + 1e-9),
+                "{raw:?}"
+            );
+        }
+        // A copy at 1e308 is a number, but a line end at 1e308 in it is not once placed: that
+        // line is left out and counted, the one that stays in range is drawn. A single INSERT
+        // alike.
+        let far = "0\nBLOCK\n2\nF\n10\n0\n20\n0\n0\nLINE\n10\n0\n20\n0\n11\n1e308\n21\n0\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n0\nPOINT\n10\n1e308\n20\n0\n0\nENDBLK\n";
+        for (ents, kept) in [
+            ("0\nINSERT\n2\nF\n10\n0\n20\n0\n70\n2\n44\n1e308\n", 3),
+            ("0\nINSERT\n2\nF\n10\n1e308\n20\n0\n", 1),
+        ] {
+            let (g, skipped) = drawn(ents, far)?;
+            assert_eq!(g.len(), kept, "{g:?}");
+            assert!(g.iter().all(finite_shape), "{g:?}");
+            // The far line, and the far POINT.
+            assert_eq!(skipped.get(LINE_NOT_NUMBERS), Some(&1), "{skipped:?}");
+            assert_eq!(skipped.get(PLACED_NOT_NUMBERS), Some(&1), "{skipped:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_arrayed_known_symbol_places_every_copy() -> Result<()> {
+        let blocks = "0\nBLOCK\n2\nWC.COIL\n10\n0\n20\n0\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n0\nENDBLK\n";
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        let at = |p: &ImportedPage| -> Vec<(f64, f64)> { p.symbols.iter().map(|s| (s.at.x, s.at.y)).collect() };
+        // 3 columns 10 apart, 2 rows 5 apart (y flipped on the page), moved so the lowest
+        // left copy sits at the frame corner (20, 20).
+        let ents = "0\nINSERT\n66\n1\n2\nWC.COIL\n10\n1\n20\n2\n70\n3\n71\n2\n44\n10\n45\n5\n0\nATTRIB\n2\nTAG\n1\n-K1\n0\nSEQEND\n";
+        let p = page(&dxf(ents, blocks), 1.0, &known)?;
+        assert_eq!(
+            at(&p),
+            [
+                (20.0, 25.0),
+                (30.0, 25.0),
+                (40.0, 25.0),
+                (20.0, 20.0),
+                (30.0, 20.0),
+                (40.0, 20.0)
+            ]
+        );
+        assert!(p.symbols.iter().all(|s| s.symbol == "wc.coil"));
+        // Only the first copy keeps the tag, and that is said.
+        let tags: Vec<_> = p
+            .symbols
+            .iter()
+            .map(|s| s.tag.as_ref().map(|t| t.to_string()))
+            .collect();
+        assert_eq!(tags[0].as_deref(), Some("-K1"));
+        assert!(tags[1..].iter().all(Option::is_none), "{tags:?}");
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("an array of 6 copies, only the first keeps the device tag -K1")),
+            "{:?}",
+            p.warnings
+        );
+        // Turned by 90 degrees: the columns run up, the rows run left; the spacing is not scaled.
+        let turned = "0\nINSERT\n2\nWC.COIL\n10\n0\n20\n0\n41\n2\n42\n2\n50\n90\n70\n2\n71\n2\n44\n10\n45\n5\n";
+        let p = page(&dxf(turned, blocks), 1.0, &known)?;
+        assert_eq!(at(&p), [(25.0, 30.0), (25.0, 20.0), (20.0, 30.0), (20.0, 20.0)]);
+        assert!(p.symbols.iter().all(|s| s.rotation == p.symbols[0].rotation));
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+        // A copy whose position is not a number once scaled is left out and said.
+        let far = "0\nINSERT\n2\nWC.COIL\n10\n0\n20\n0\n70\n2\n44\n1e308\n";
+        let p = page(&dxf(far, blocks), 10.0, &known)?;
+        assert_eq!(p.symbols.len(), 1);
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("1 entity whose size is not a number once placed")),
+            "{:?}",
+            p.warnings
+        );
+        // A huge array stops at the shared limit and counts the copies left out. The symbols
+        // use up the budget the drawn entities share, so the line after them is left out too.
+        let huge = "0\nINSERT\n2\nWC.COIL\n70\n2000\n71\n1001\n44\n1e-9\n45\n1e-9\n\
+                    0\nLINE\n10\n0\n20\n0\n11\n1e-9\n21\n0\n";
+        let p = page(&dxf(huge, blocks), 1.0, &known)?;
+        assert_eq!(p.symbols.len(), MAX_DRAWN);
+        assert!(p.graphics.is_empty(), "{:?}", p.graphics);
+        // 2000 x 1001 copies, 2000 of them past the limit, plus the line.
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.starts_with("2001 entities not drawn: the drawing expands")),
+            "{:?}",
+            p.warnings
+        );
+        Ok(())
+    }
+
+    /// A copy in range whose column and row steps would overflow summed on their own is kept:
+    /// the steps are added to the insertion point one at a time.
+    #[test]
+    fn an_array_copy_in_range_past_two_large_steps_is_kept() -> Result<()> {
+        let ins = "0\nINSERT\n2\nB\n10\n-1e308\n20\n0\n50\n45\n70\n2\n71\n2\n44\n1.5e308\n45\n-1.5e308\n";
+        let d = parse(&dxf(ins, ""))?;
+        let cells = ArrayCells::of(&d.entities[0]);
+        let (x, y) = cells.at(3, (-1e308, 0.0));
+        assert!(x.is_finite() && y.is_finite() && x > 1e308, "{x} {y}");
+        // Drawn: all four copies of the line are kept, the last one included.
+        let blocks = "0\nBLOCK\n2\nB\n10\n0\n20\n0\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n0\nENDBLK\n";
+        let (g, skipped) = drawn(ins, blocks)?;
+        assert_eq!(g.len(), 4, "{g:?} {skipped:?}");
+        assert!(g.iter().all(finite_shape), "{g:?}");
+        assert!(
+            g.iter().any(|s| matches!(s, Shape::Line { a, .. } if a.x > 1e308)),
+            "{g:?}"
+        );
         Ok(())
     }
 
@@ -2734,6 +4245,33 @@ mod tests {
         assert!(
             near(*e.last().unwrap_or(&Point::new(0.0, 0.0)), Point::new(0.0, 2.5)),
             "{e:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_mirrored_text_and_attrib_land_on_the_other_side() -> Result<()> {
+        // Extrusion (0, 0, -1): the insertion point and rotation are in mirrored coordinates.
+        let ents = "0\nTEXT\n10\n10\n20\n5\n40\n2\n50\n30\n230\n-1\n1\nK1\n\
+                    0\nATTRIB\n10\n0\n20\n0\n11\n4\n21\n3\n72\n2\n40\n2\n230\n-1\n1\nX\n2\nTAG\n\
+                    0\nTEXT\n10\n10\n20\n5\n40\n2\n50\n30\n1\nPLAIN\n\
+                    0\nMTEXT\n10\n10\n20\n5\n40\n2\n230\n-1\n1\nM\n";
+        let (g, _) = drawn(ents, "")?;
+        let placed: Vec<(Point, f64)> = g
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Text { at, angle, .. } => Some((*at, *angle)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            placed,
+            [
+                (Point::new(-10.0, -5.0), 150.0),
+                (Point::new(-4.0, -3.0), 180.0),
+                (Point::new(10.0, -5.0), 30.0),
+                (Point::new(10.0, -5.0), 0.0),
+            ]
         );
         Ok(())
     }
@@ -2954,9 +4492,19 @@ mod tests {
                 vec![(a, a), (b, a), (b, b), (a, b)]
             })
             .collect();
-        let started = std::time::Instant::now();
+        // The work each call really does (vertices visited, pairs and walls collected, crossing
+        // tests), counted rather than timed: a timing bound fails on a busy machine, a count
+        // does not. Each call must stay within the nesting budget plus the bridge budget.
+        let work_of = |loops: &[Vec<(f64, f64)>], style: i64| {
+            HOLE_WORK.with(|w| w.set(0));
+            let out = with_holes(loops, style);
+            (out, HOLE_WORK.with(std::cell::Cell::get))
+        };
+        let limit = NESTING_BUDGET + HATCH_BRIDGE_WORK;
         // Nesting found walking out from the smallest loop around: cheap for proper nesting.
-        assert!(with_holes(&loops[..40], 1).is_some());
+        let (out, work) = work_of(&loops[..40], 1);
+        assert!(out.is_some());
+        assert!(work < 10_000, "{work}");
         // Side by side loops need every pair compared; that many stop at the budget.
         let apart: Vec<Vec<(f64, f64)>> = (0..5000)
             .map(|i| {
@@ -2964,7 +4512,9 @@ mod tests {
                 vec![(a, 0.0), (a + 1.0, 0.0), (a + 1.0, 1.0), (a, 1.0)]
             })
             .collect();
-        assert!(with_holes(&apart, 0).is_none());
+        let (out, work) = work_of(&apart, 0);
+        assert!(out.is_none());
+        assert!(work <= NESTING_BUDGET, "{work}");
         // Deep nesting with normal style: every other loop is a hole to bridge, and all the
         // bridges together stop at the hatch's budget.
         let deep: Vec<Vec<(f64, f64)>> = (0..20_000)
@@ -2973,8 +4523,9 @@ mod tests {
                 vec![(a, a), (b, a), (b, b), (a, b)]
             })
             .collect();
-        assert!(with_holes(&deep, 0).is_none());
-        assert!(started.elapsed().as_secs() < 10);
+        let (out, work) = work_of(&deep, 0);
+        assert!(out.is_none());
+        assert!(work <= limit, "{work}");
     }
 
     #[test]
@@ -3239,6 +4790,7 @@ mod tests {
             1e300,
             0,
             &|_| false,
+            &|_| false,
             &mut raw,
             &mut points,
             &mut skipped,
@@ -3324,6 +4876,7 @@ mod tests {
             Xf::ID,
             1.75e308,
             0,
+            &|_| false,
             &|_| false,
             &mut raw,
             &mut points,

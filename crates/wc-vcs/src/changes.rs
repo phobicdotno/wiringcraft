@@ -21,6 +21,16 @@ pub enum Change {
         from: String,
         to: String,
     },
+    /// The page's display number changed (`page` is the new one).
+    PageRenumbered {
+        page: String,
+        from: String,
+    },
+    /// A setting of the page itself changed: `what` names it (sheet size, title block, ...).
+    PageSettingChanged {
+        page: String,
+        what: String,
+    },
     SymbolAdded {
         page: String,
         item: String,
@@ -70,6 +80,8 @@ impl std::fmt::Display for Change {
             Change::PageAdded { page, title } => write!(f, "page {page} added ({title})"),
             Change::PageRemoved { page, title } => write!(f, "page {page} removed ({title})"),
             Change::PageRenamed { page, from, to } => write!(f, "page {page} renamed {from:?} -> {to:?}"),
+            Change::PageRenumbered { page, from } => write!(f, "page {from} renumbered -> {page}"),
+            Change::PageSettingChanged { page, what } => write!(f, "page {page}: {what} changed"),
             Change::SymbolAdded { page, item, what } => write!(f, "page {page}: {what} {item} added"),
             Change::SymbolRemoved { page, item, what } => write!(f, "page {page}: {what} {item} removed"),
             Change::SymbolMoved { page, item, what } => write!(f, "page {page}: {what} {item} moved"),
@@ -85,6 +97,30 @@ impl std::fmt::Display for Change {
 
 fn parse_page(text: Option<String>) -> Option<Page> {
     text.and_then(|t| serde_json::from_str(&t).ok())
+}
+
+/// One side of a page file: `Ok(None)` when the file is not there, `Err` (saying why) when it
+/// is there but cannot be read as a page.
+fn read_side(path: &str, text: Option<String>) -> wc_core::Result<Option<Page>> {
+    match text {
+        None => Ok(None),
+        Some(t) => serde_json::from_str(&t)
+            .map(Some)
+            .map_err(|source| wc_core::Error::Json {
+                path: path.into(),
+                source,
+            }),
+    }
+}
+
+/// A file in the working folder: `Ok(None)` only when it is not there; any other failure to
+/// read it (no permission, not UTF-8) is an error, since the file still exists.
+fn read_working(path: &std::path::Path) -> wc_core::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(wc_core::Error::io(path, e)),
+    }
 }
 
 fn tag_or_symbol(s: &wc_core::PlacedSymbol) -> String {
@@ -108,6 +144,12 @@ pub fn page_changes(old: Option<&Page>, new: Option<&Page>) -> Vec<Change> {
         }),
         (Some(o), Some(n)) => {
             let page = n.number.clone();
+            if o.number != n.number {
+                out.push(Change::PageRenumbered {
+                    page: page.clone(),
+                    from: o.number.clone(),
+                });
+            }
             if o.title != n.title {
                 out.push(Change::PageRenamed {
                     page: page.clone(),
@@ -176,7 +218,31 @@ pub fn page_changes(old: Option<&Page>, new: Option<&Page>) -> Vec<Change> {
                 }
             }
             if o.graphics != n.graphics {
-                out.push(Change::GraphicsChanged { page });
+                out.push(Change::GraphicsChanged { page: page.clone() });
+            }
+            let settings = [
+                ("sheet size", o.size != n.size),
+                ("title block", o.title_block != n.title_block),
+                ("revision clouds", o.clouds != n.clouds),
+                ("revision table", o.revision_table != n.revision_table),
+                ("underlay", o.underlay != n.underlay),
+                ("overview setting", o.overview != n.overview),
+                ("cover setting", o.cover != n.cover),
+            ];
+            for (what, changed) in settings {
+                if changed {
+                    out.push(Change::PageSettingChanged {
+                        page: page.clone(),
+                        what: what.into(),
+                    });
+                }
+            }
+            // Anything else that differs (a part of the page added later) is still a change.
+            if out.is_empty() && o != n {
+                out.push(Change::PageSettingChanged {
+                    page,
+                    what: "page".into(),
+                });
             }
         }
         (None, None) => {}
@@ -186,29 +252,47 @@ pub fn page_changes(old: Option<&Page>, new: Option<&Page>) -> Vec<Change> {
 
 /// Changes from `from` to `to` (a revision, or `None` for the working folder).
 pub fn changes(git: &Git, from: &str, to: Option<&str>) -> Result<Vec<Change>> {
-    let mut args = vec!["diff", "--name-status", "--no-renames", from];
+    // `-z`: paths as they are (no quoting of accents, tabs or quotes), every field NUL-ended.
+    let mut args = vec!["diff", "--name-status", "--no-renames", "-z", from];
     if let Some(t) = to {
         args.push(t);
     }
-    let mut text = git.run(&args)?;
+    let text = git.run(&args)?;
+    let mut entries: Vec<(String, String)> = Vec::new();
+    let mut fields = text.split('\0');
+    while let (Some(status), Some(path)) = (fields.next(), fields.next()) {
+        if status.is_empty() || path.is_empty() {
+            continue;
+        }
+        entries.push((status.to_owned(), path.to_owned()));
+    }
     if to.is_none() {
         // New files the user has not recorded yet are changes too.
-        for path in git.run(&["ls-files", "--others", "--exclude-standard"])?.lines() {
-            text.push_str(&format!("A\t{path}\n"));
+        let others = git.run(&["ls-files", "--others", "--exclude-standard", "-z"])?;
+        for path in others.split('\0').filter(|p| !p.is_empty()) {
+            entries.push(("A".to_owned(), path.to_owned()));
         }
     }
     let mut out = Vec::new();
-    for line in text.lines() {
-        let mut parts = line.splitn(2, '\t');
-        let (Some(status), Some(path)) = (parts.next(), parts.next()) else {
-            continue;
-        };
-        if path.starts_with("pages/") && path.ends_with(".page.json") {
-            let old = parse_page(git.show(from, path));
+    for (status, path) in &entries {
+        let (status, path) = (status.as_str(), path.as_str());
+        let pages = if path.starts_with("pages/") && path.ends_with(".page.json") {
+            let old = read_side(path, git.show(from, path));
             let new = match to {
-                Some(t) => parse_page(git.show(t, path)),
-                None => parse_page(std::fs::read_to_string(git.dir.join(path)).ok()),
+                Some(t) => read_side(path, git.show(t, path)),
+                None => read_working(&git.dir.join(path)).and_then(|text| read_side(path, text)),
             };
+            // A side whose file is there but is no page (conflict markers, a hand edit, a
+            // newer format, bytes that are not text) cannot be compared: the file itself is
+            // listed instead.
+            match (old, new) {
+                (Ok(old), Ok(new)) => Some((old, new)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some((old, new)) = pages {
             out.extend(page_changes(old.as_ref(), new.as_ref()));
         } else {
             let status = match status {

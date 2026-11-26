@@ -26,6 +26,52 @@ pub fn part_label(p: &Part) -> String {
     }
 }
 
+/// The parts the project uses that `parts` does not hold but whose copy in the project's
+/// library (`vendor/parts/`) is there and cannot be read, by id with the reason: the project
+/// check reports those as unreadable, not as missing
+/// ([`wc_report::check_with_unreadable`]). An id that cannot name a file there at all is
+/// unreadable too, with the reason the id is refused.
+pub fn unreadable_parts(dir: &Path, project: &Project, parts: &BTreeMap<String, Part>) -> BTreeMap<String, String> {
+    unreadable_parts_looked_up(dir, project, parts, Path::try_exists)
+}
+
+/// [`unreadable_parts`], with `exists` telling whether a copy's file is there: tests give a
+/// lookup that fails, which permission bits cannot do when they run as root.
+fn unreadable_parts_looked_up(
+    dir: &Path,
+    project: &Project,
+    parts: &BTreeMap<String, Part>,
+    exists: impl Fn(&Path) -> std::io::Result<bool>,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for id in project.used_parts() {
+        if parts.contains_key(&id) {
+            continue;
+        }
+        let path = match store::vendor_path(dir, ItemKind::Part, &id) {
+            Ok(path) => path,
+            Err(e) => {
+                out.insert(id, e.to_string());
+                continue;
+            }
+        };
+        // Only a copy known to be absent is missing: one that cannot even be looked for (a
+        // folder that may not be entered) is unreadable, with that reason.
+        match exists(&path) {
+            Ok(false) => {}
+            Ok(true) => {
+                if let Err(e) = store::read_vendored_part(dir, &id) {
+                    out.insert(id, e.to_string());
+                }
+            }
+            Err(e) => {
+                out.insert(id, format!("{}: {e}", path.display()));
+            }
+        }
+    }
+    out
+}
+
 /// What a click on the canvas does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
@@ -195,13 +241,26 @@ struct Kept {
 struct Step {
     project: Project,
     files: Vec<FileEdit>,
+    /// Tells this step apart from every other, for finding it again (see
+    /// [`Open::take_back_move`]). A step keeps it when Undo and Redo move it between the two
+    /// histories.
+    id: u64,
+    /// How far the running move drag had moved its items in `project` (see
+    /// [`Open::drag_offset`]); zero outside a drag.
+    offset: Point,
+    /// Later steps were folded into this one (an assistant turn, a command): what happened in
+    /// between is no longer in the history, so [`Open::take_back_move`] cannot check it.
+    folded: bool,
 }
 
 impl Step {
-    fn of(project: Project) -> Step {
+    fn new(project: Project, files: Vec<FileEdit>, offset: Point) -> Step {
         Step {
             project,
-            files: Vec::new(),
+            files,
+            id: next_revision(),
+            offset,
+            folded: false,
         }
     }
 }
@@ -379,8 +438,12 @@ fn put_back_files(written: &Written) -> (Vec<String>, Vec<String>, Unwritten) {
 /// What [`Open::back_to`] goes back to, or [`Open::keep`] builds on.
 pub(crate) struct Mark {
     kept: Kept,
-    symbols: std::collections::BTreeSet<String>,
+    /// The symbols loaded at the mark, so one the change replaced (a pinned version loaded
+    /// over another, say) is put back too.
+    symbols: BTreeMap<String, Symbol>,
     parts: std::collections::BTreeSet<String>,
+    /// The symbol list as it was: a symbol the change loaded may have added or changed a row.
+    library: Vec<LibraryEntry>,
     /// The vendored symbol and part files there were, or why that is not known.
     files: Result<std::collections::BTreeSet<(ItemKind, String)>, String>,
     /// Where the change's own project file edits start in [`Open::mark_edits`].
@@ -419,13 +482,39 @@ fn vendor_names(dir: &Path) -> Result<std::collections::BTreeSet<(ItemKind, Stri
     Ok(out)
 }
 
+/// One symbol in the symbol list: what the list shows, searches and offers to place.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LibraryEntry {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+}
+
+impl LibraryEntry {
+    /// The entry for symbol `s` listed under `id`.
+    pub fn of(id: &str, s: &Symbol) -> Self {
+        Self {
+            id: id.to_owned(),
+            name: s.name.clone(),
+            description: s.description.clone(),
+        }
+    }
+
+    /// Whether every word of `query` appears, ignoring case, in the id, name or description.
+    /// An empty query matches everything.
+    pub fn matches(&self, query: &str) -> bool {
+        let hay = format!("{} {} {}", self.id, self.name, self.description).to_lowercase();
+        query.to_lowercase().split_whitespace().all(|w| hay.contains(w))
+    }
+}
+
 pub struct Open {
     pub dir: PathBuf,
     pub project: Project,
     /// The project's vendored symbols.
     pub symbols: BTreeMap<String, Symbol>,
-    /// Ids of every symbol in the project's library sources (for the picker).
-    pub library: Vec<(String, String)>,
+    /// Every symbol in the project and its library sources (for the picker), by id.
+    pub library: Vec<LibraryEntry>,
     /// The check rules of the project's library sources, read with the library
     /// ([`Open::refresh_library`]) so checks while drawing need not read files.
     pub library_rules: Vec<wc_core::check_rule::RuleSet>,
@@ -445,6 +534,9 @@ pub struct Open {
     /// differs between any two opened projects: checks while drawing look at this instead of
     /// comparing the whole project each frame.
     revision: u64,
+    /// Changes with every library reload ([`Open::refresh_library`]), which may find the
+    /// files of the project's library copy changed while the loaded project stays the same.
+    library_load: u64,
     /// The `history` count right after a properties form made its own undo step, so later
     /// typing in the form joins that step only while nothing else has touched the history.
     form_step: Option<u64>,
@@ -457,6 +549,10 @@ pub struct Open {
     /// The terminal numbering before the change in progress (taken at its checkpoint), so
     /// jumpers can follow their terminals once it is done.
     terminals_before: Option<wc_core::project::TerminalNumbers>,
+    /// How far the running select-tool move drag has moved its items in `project`: kept with
+    /// every undo and redo step taken during the drag, so Escape can take back from each just
+    /// the part of the move it holds (#863). Zero outside a drag.
+    drag_offset: Point,
     /// In a shared session, the pages someone else has open (page id to their name). Tools that
     /// work on every page leave these alone; the session would refuse the change otherwise.
     pub held_by_others: BTreeMap<String, String>,
@@ -485,6 +581,10 @@ pub struct Open {
     /// and does not write over it unasked (#662). Once the user chose to write over it, what
     /// it held then: a later change is asked about again.
     unwritten_found: BTreeMap<PathBuf, Found>,
+    /// For each of [`Open::unwritten_files`] that is a symbol file [`Open::back_to`] queued to
+    /// be repaired: the symbol id and the version (content hash) it is to hold, so a change
+    /// taken back around it can retarget or let it go when the pin it puts back differs.
+    symbol_repairs: BTreeMap<PathBuf, (String, String)>,
     /// Project files rewritten while a [`Mark`] is open (`marks` counts them), oldest first,
     /// so [`Open::back_to`] puts them back even when their undo steps fell off the history.
     mark_edits: Vec<FileEdit>,
@@ -562,11 +662,13 @@ impl Open {
             undo_dropped: 0,
             history: 0,
             revision: next_revision(),
+            library_load: next_revision(),
             form_step: None,
             branch: wc_vcs::Git::new(dir).current_branch().unwrap_or_default(),
             underlays: BTreeMap::new(),
             picture_problems: BTreeMap::new(),
             terminals_before: None,
+            drag_offset: Point::new(0.0, 0.0),
             held_by_others: BTreeMap::new(),
             symbol_versions: BTreeMap::new(),
             part_versions: BTreeMap::new(),
@@ -574,6 +676,7 @@ impl Open {
             unrestored_files: BTreeMap::new(),
             unwritten_files: BTreeMap::new(),
             unwritten_found: BTreeMap::new(),
+            symbol_repairs: BTreeMap::new(),
             mark_edits: Vec::new(),
             command_translations: None,
             marks: 0,
@@ -674,20 +777,31 @@ impl Open {
         }
     }
 
-    pub fn refresh_library(&mut self) {
-        let mut items: BTreeMap<String, String> =
-            self.symbols.iter().map(|(k, s)| (k.clone(), s.name.clone())).collect();
+    /// Rebuild the symbol list from the loaded vendored symbols and the library sources, so
+    /// each entry carries the name and description of the version in use.
+    fn relist_symbols(&mut self) {
+        let mut items: BTreeMap<String, LibraryEntry> = self
+            .symbols
+            .iter()
+            .map(|(k, s)| (k.clone(), LibraryEntry::of(k, s)))
+            .collect();
         if let Ok(lib) = wc_library::Library::open(&self.dir, &self.project) {
             for id in lib.index(ItemKind::Symbol).into_keys() {
                 if !items.contains_key(&id)
                     && let Ok((s, _)) = lib.symbol(&id)
                 {
-                    items.insert(id, s.name);
+                    let entry = LibraryEntry::of(&id, &s);
+                    items.insert(id, entry);
                 }
             }
         }
-        self.library = items.into_iter().collect();
+        self.library = items.into_values().collect();
+    }
+
+    pub fn refresh_library(&mut self) {
+        self.relist_symbols();
         self.library_rules = wc_library::library_rules(&self.dir, &self.project);
+        self.library_load = next_revision();
         self.touch();
 
         self.parts = self
@@ -1153,6 +1267,11 @@ impl Open {
         self.revision
     }
 
+    /// Which library reload is shown: see the `library_load` field.
+    pub fn library_load(&self) -> u64 {
+        self.library_load
+    }
+
     /// Note an edit of the project, its symbols or its parts made without an undo step (a
     /// shared session's sync, say), so checks while drawing see it.
     pub fn touch(&mut self) {
@@ -1170,7 +1289,8 @@ impl Open {
         // snapshot and this change start from that.
         self.follow_terminals();
         self.terminals_before = Some(self.terminal_numbers());
-        self.undo.push(Step::of(self.project.clone()));
+        self.undo
+            .push(Step::new(self.project.clone(), Vec::new(), self.drag_offset));
         self.trim_undo();
         self.redo.clear();
         self.edited();
@@ -1199,6 +1319,13 @@ impl Open {
         changed
     }
 
+    /// Follow the terminals from `before` (numbers taken earlier) to now: for taking a change
+    /// back, the jumpers go back with their terminals the way they followed them there.
+    pub fn follow_terminals_from(&mut self, before: wc_core::project::TerminalNumbers) -> bool {
+        self.terminals_before = Some(before);
+        self.follow_terminals()
+    }
+
     /// Forget the change in progress without following it: the project was replaced as a whole
     /// (undo, redo, a command's result), and its jumpers already belong to its drawing.
     pub fn forget_terminal_change(&mut self) {
@@ -1209,6 +1336,99 @@ impl Open {
     /// only part of that change (in a shared session, the part that waits here).
     pub fn before_last_change(&self) -> Option<&Project> {
         self.undo.last().map(|s| &s.project)
+    }
+
+    /// The id of the latest undo step: right after a [`Open::checkpoint`], the step it took.
+    pub fn last_step_id(&self) -> Option<u64> {
+        self.undo.last().map(|s| s.id)
+    }
+
+    /// A select-tool move drag begins: its checkpoint, from which [`Open::drag_move_by`]
+    /// counts how far the items moved.
+    pub fn begin_drag_move(&mut self) {
+        self.drag_offset = Point::new(0.0, 0.0);
+        self.checkpoint();
+    }
+
+    /// One frame of a move drag: [`Open::move_by`], counted in the drag's offset.
+    pub fn drag_move_by(&mut self, page: usize, sel: &[Selection], d: Point) {
+        self.move_by(page, sel, d);
+        self.drag_offset = self.drag_offset + d;
+    }
+
+    /// A move drag ended: later steps are no part of it.
+    pub fn end_drag_move(&mut self) {
+        self.drag_offset = Point::new(0.0, 0.0);
+    }
+
+    /// Whether the undo step `id` is still in the undo history.
+    pub fn has_undo_step(&self, id: u64) -> bool {
+        self.undo.iter().any(|s| s.id == id)
+    }
+
+    /// Take back a move of `items` on page `page` whose checkpoint is the undo step `id`,
+    /// keeping the changes recorded after it (a rotate during the move, #863): the items go back
+    /// by as far as the drag had moved them, now and in every later undo and redo step (each by
+    /// its own part of the move), and the move's own step is dropped, so Undo and Redo then work
+    /// as if the changes after it were made at the start position. Jumpers and strip layouts
+    /// follow the terminals back in each. Refuses with the reason, changing nothing, when that
+    /// step is no longer in the history (the move was undone, or trimmed off the oldest end),
+    /// carries file edits a move never makes, has later steps folded into it or after it (an
+    /// assistant turn, whose steps in between can no longer be checked), or a drawing, cloud or
+    /// wire on the page was added or deleted since (`items` names those by place in their list).
+    pub fn take_back_move(&mut self, id: u64, page: &str, items: &[Selection]) -> Result<(), &'static str> {
+        let Some(at) = self.undo.iter().position(|s| s.id == id) else {
+            return Err("the move is no longer in the undo history");
+        };
+        let Some(first) = self.undo.get(at) else {
+            return Err("the move is no longer in the undo history");
+        };
+        let counts = |p: &Project| p.page(page).map(|p| (p.graphics.len(), p.clouds.len(), p.wires.len()));
+        let start = counts(&first.project);
+        let later = self.undo.iter().skip(at + 1).chain(&self.redo).map(|s| &s.project);
+        // Dropping the move's step would shift the start of an assistant turn begun after it,
+        // and the turn would no longer fold into one step.
+        if self.turn.is_some_and(|t| t > self.undo_dropped + at) {
+            return Err("an assistant turn started after it is still running");
+        }
+        if self.undo.iter().skip(at).chain(&self.redo).any(|s| s.folded) {
+            return Err("an assistant turn during it was recorded as one step");
+        }
+        if !first.files.is_empty() {
+            return Err("project files were changed with it");
+        }
+        if later.chain([&self.project]).any(|p| counts(p) != start) {
+            return Err("items were added or deleted during it");
+        }
+        // The change in progress (the move's frames since the last checkpoint) is followed first.
+        self.follow_terminals();
+        let symbols = &self.symbols;
+        let role = |id: &str| symbols.get(id).map(|s| s.role);
+        let back = |p: &mut Project, d: Point| {
+            let before = p
+                .meta
+                .follows_terminals()
+                .then(|| wc_core::project::terminal_numbers(p, role));
+            if let Some(pg) = p.page_mut(page) {
+                crate::edit::move_items(pg, items, Point::new(-d.x, -d.y));
+            }
+            if let Some(before) = before {
+                wc_core::project::follow_terminals_in(p, &before, role);
+            }
+        };
+        for s in self.undo.iter_mut().skip(at + 1).chain(self.redo.iter_mut()) {
+            back(&mut s.project, s.offset);
+            s.offset = Point::new(0.0, 0.0);
+        }
+        back(&mut self.project, self.drag_offset);
+        self.drag_offset = Point::new(0.0, 0.0);
+        if self.terminals_before.is_some() {
+            self.terminals_before = Some(self.terminal_numbers());
+        }
+        self.undo.remove(at);
+        self.history += 1;
+        self.edited();
+        Ok(())
     }
 
     /// Forget the latest undo step, once its change was taken back another way.
@@ -1282,7 +1502,11 @@ impl Open {
             let held = self.marks == 0 && self.turn.is_some_and(|t| t <= self.undo_dropped);
             if held {
                 let next = self.undo.remove(1);
-                self.undo[0].files.extend(next.files);
+                if let Some(first) = self.undo.first_mut() {
+                    first.files.extend(next.files);
+                    // What the folded step did is no longer checkable on its own.
+                    first.folded = true;
+                }
             } else {
                 self.undo.remove(0);
             }
@@ -1318,6 +1542,7 @@ impl Open {
             let later: Vec<FileEdit> = self.undo.drain(start + 1..).flat_map(|s| s.files).collect();
             if let Some(first) = self.undo.get_mut(start) {
                 first.files.extend(later);
+                first.folded = true;
             }
             self.history += 1;
             self.touch();
@@ -1353,10 +1578,22 @@ impl Open {
                     }
                 };
                 self.forget_terminal_change();
-                let Step { project, files } = prev;
-                self.redo.push(Step {
-                    project: std::mem::replace(&mut self.project, project),
+                let Step {
+                    project,
                     files,
+                    id,
+                    offset,
+                    folded,
+                } = prev;
+                let now = std::mem::replace(&mut self.project, project);
+                // The step keeps its id across Undo and Redo, so a move redone during its drag
+                // is still found by Escape.
+                self.redo.push(Step {
+                    project: now,
+                    files,
+                    id,
+                    offset: std::mem::replace(&mut self.drag_offset, offset),
+                    folded,
                 });
                 let left = self
                     .redo
@@ -1377,9 +1614,12 @@ impl Open {
                         };
                         let restored = std::mem::replace(&mut self.project, cur.project);
                         self.undo_error = Some(e);
+                        let offset = std::mem::replace(&mut self.drag_offset, cur.offset);
+                        // The step goes back whole: its id and folded mark too.
                         self.undo.push(Step {
                             project: restored,
-                            files: cur.files,
+                            offset,
+                            ..cur
                         });
                     }
                     return false;
@@ -1410,10 +1650,22 @@ impl Open {
                     }
                 };
                 self.forget_terminal_change();
-                let Step { project, files } = next;
-                self.undo.push(Step {
-                    project: std::mem::replace(&mut self.project, project),
+                let Step {
+                    project,
                     files,
+                    id,
+                    offset,
+                    folded,
+                } = next;
+                let now = std::mem::replace(&mut self.project, project);
+                // The step keeps its id across Undo and Redo, so a move redone during its drag
+                // is still found by Escape.
+                self.undo.push(Step {
+                    project: now,
+                    files,
+                    id,
+                    offset: std::mem::replace(&mut self.drag_offset, offset),
+                    folded,
                 });
                 let left = self
                     .undo
@@ -1433,9 +1685,12 @@ impl Open {
                         };
                         let restored = std::mem::replace(&mut self.project, cur.project);
                         self.undo_error = Some(e);
+                        let offset = std::mem::replace(&mut self.drag_offset, cur.offset);
+                        // The step goes back whole: its id and folded mark too.
                         self.redo.push(Step {
                             project: restored,
-                            files: cur.files,
+                            offset,
+                            ..cur
                         });
                     }
                     return false;
@@ -1451,13 +1706,18 @@ impl Open {
         }
     }
 
-    /// After an undo or redo: rebuild the library list when the step added or removed a library
+    /// After an undo or redo: rebuild the library lists when the step added or removed a library
     /// source (`sources_changed`), so symbols of a source that is gone are no longer offered and
-    /// those of one that came back are; then load every part a device uses that is not loaded,
+    /// those of one that came back are, and otherwise rebuild the symbol list, so a symbol whose
+    /// version the step changed is listed with its own name and description; then load every part a device uses that is not loaded,
     /// since a redo can bring back an assignment whose part an earlier rebuild dropped.
     fn follow_step(&mut self, sources_changed: bool) {
         if sources_changed {
             self.refresh_library();
+        } else {
+            // The step may have brought back another version of a vendored symbol: list it
+            // with its own name and description.
+            self.relist_symbols();
         }
         let missing: Vec<String> = self
             .project
@@ -1704,6 +1964,7 @@ impl Open {
         }
         for (id, _) in &wanted {
             self.stale_symbol_files.remove(id);
+            self.symbol_file_written(id);
         }
         for (id, want) in wanted {
             if let Some(old) = self.symbols.insert(id, want) {
@@ -1827,8 +2088,9 @@ impl Open {
             .into_iter()
             .filter(|s| kind.is_none_or(|k| s.kind == k))
             .collect();
-        // An item named on purpose whose library file is wrong stops the update.
-        if let Some(bad) = wc_library::wrong_named(&all, only) {
+        // An item named on purpose that the project does not have, or whose library file is
+        // wrong, stops the update.
+        if let Some(bad) = wc_library::unknown_named(&all, only).or_else(|| wc_library::wrong_named(&all, only)) {
             return Err(bad.to_string());
         }
         // Exactly these versions are taken, as seen here: an item whose library file changes
@@ -2121,6 +2383,7 @@ impl Open {
             // What the file holds now, as WiringCraft left it: a later change is from outside.
             self.unwritten_found
                 .insert(rel.clone(), Found::of(snapshot_file(&path)));
+            self.symbol_repairs.remove(&rel);
             if replace {
                 self.unwritten_files.insert(rel, should);
             } else {
@@ -2134,6 +2397,7 @@ impl Open {
     fn drop_unwritten(&mut self, rel: &Path) {
         self.unwritten_files.remove(rel);
         self.unwritten_found.remove(rel);
+        self.symbol_repairs.remove(rel);
     }
 
     /// The first project file waiting to be written again ([`Open::keep_unwritten`]) that was
@@ -2149,21 +2413,9 @@ impl Open {
         self.unwritten_files.iter().find_map(|(rel, should)| {
             let found = self.unwritten_found.get(rel)?;
             let path = self.dir.join(rel);
-            let changed = match (found, snapshot_file(&path)) {
-                (Found::Bytes(found), Ok(now)) => (now != *found && now != *should).then(String::new),
-                // Not known what WiringCraft left there: a file there now may be from outside.
-                (Found::Unread(why), Ok(now)) => (now.is_some() && now != *should)
-                    .then(|| format!(" (it could not be read when WiringCraft left it: {why})")),
-                (Found::WriteOverUnread(_), Ok(now)) => (now.is_some() && now != *should).then(String::new),
-                // Not readable now: what it holds is not known, so it is not written over
-                // unless the user chose to.
-                (Found::Bytes(_) | Found::Unread(_), Err(why)) => Some(format!(" (it cannot be read now: {why})")),
-                // Consent covers the unreadable entry the user saw only, told by its metadata.
-                (Found::WriteOverUnread(seen), Err(why)) => {
-                    (stamp_of(&path) != *seen).then(|| format!(" (it cannot be read now, and changed since: {why})"))
-                }
-            };
-            changed.map(|note| (path, note))
+            found
+                .change(snapshot_file(&path), should, &path)
+                .map(|note| (path, note))
         })
     }
 
@@ -2171,6 +2423,10 @@ impl Open {
     /// to it is dropped, and the next save leaves the file as it is.
     pub fn keep_outside_version(&mut self, path: &Path) {
         let rel = path.strip_prefix(&self.dir).unwrap_or(path).to_path_buf();
+        // A symbol file kept that way is not written with the loaded version either.
+        if let Some((id, _)) = self.symbol_repairs.get(&rel) {
+            self.stale_symbol_files.remove(id);
+        }
         self.drop_unwritten(&rel);
     }
 
@@ -2283,18 +2539,40 @@ impl Open {
         }
         for (rel, should) in self.unwritten_files.clone() {
             let path = self.dir.join(&rel);
+            let cannot = |e: std::io::Error| {
+                format!(
+                    "not saved: {} cannot be written as the project needs it: {e}",
+                    path.display()
+                )
+            };
             let folder = match (&should, path.parent()) {
                 (Some(_), Some(dir)) => std::fs::create_dir_all(dir),
                 _ => Ok(()),
             };
-            folder
-                .and_then(|()| restore_file(&path, should.as_deref()))
-                .map_err(|e| {
-                    format!(
-                        "not saved: {} cannot be written as the project needs it: {e}",
-                        path.display()
-                    )
-                })?;
+            folder.map_err(cannot)?;
+            // The check above and this write are separate steps: another program can change
+            // the file in between. So the file is moved aside first and checked again as
+            // moved (#670); only what the check admits is deleted or replaced.
+            match self.unwritten_found.get(&rel) {
+                Some(found) => match repair_file(&path, should.as_deref(), found).map_err(cannot)? {
+                    Repair::Done => {}
+                    Repair::ChangedOutside(note) => {
+                        return Err(format!(
+                            "not saved: {} {}{note}. Keep that version, or write the project's version over it.",
+                            path.display(),
+                            Self::CHANGED_OUTSIDE
+                        ));
+                    }
+                },
+                // Nothing known about what was there: written as before.
+                None => restore_file(&path, should.as_deref()).map_err(cannot)?,
+            }
+            // A symbol file repaired with the loaded version is not written again unchecked.
+            if let Some((id, hash)) = self.symbol_repairs.get(&rel)
+                && self.symbols.get(id).is_some_and(|s| s.hash() == *hash)
+            {
+                self.stale_symbol_files.remove(id);
+            }
             self.drop_unwritten(&rel);
         }
         Ok(())
@@ -2517,6 +2795,7 @@ impl Open {
         // Project files waiting to be written are named relative to the folder: the copy's.
         let old_unwritten = self.unwritten_files.clone();
         let old_found = self.unwritten_found.clone();
+        let old_repairs = self.symbol_repairs.clone();
         self.unrestored_files = old_unrestored
             .iter()
             .map(|(path, f)| {
@@ -2535,6 +2814,7 @@ impl Open {
             self.unrestored_files = old_unrestored;
             self.unwritten_files = old_unwritten;
             self.unwritten_found = old_found;
+            self.symbol_repairs = old_repairs;
             return Err(format!(
                 "{e}\n{}; you are still working in {}.",
                 discard(),
@@ -2557,6 +2837,7 @@ impl Open {
     pub fn ensure_symbols<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
         self.touch();
         let (lock, symbols) = (self.project.lock.clone(), self.symbols.clone());
+        let library = self.library.clone();
         // Putting a terminal copy back follows terminals: jumpers, rail orders and the device
         // data and panel places of spares a strip took along all go back too.
         let (meta, terminals) = (self.project.meta.clone(), self.terminals_before.clone());
@@ -2565,6 +2846,7 @@ impl Open {
             if let Err(e) = self.ensure_symbol(id) {
                 self.project.lock = lock;
                 self.symbols = symbols;
+                self.library = library;
                 self.project.meta = meta;
                 self.project.devices = devices;
                 self.project.panels = panels;
@@ -2609,7 +2891,7 @@ impl Open {
             // settled with it, and tracking starts again from the pinned copy, so putting it
             // back does not read as terminals moved.
             self.follow_terminals();
-            self.symbols.insert(id.to_owned(), fixed);
+            self.load_symbol(id, fixed);
             if self.terminals_before.is_some() {
                 self.terminals_before = Some(self.terminal_numbers());
             }
@@ -2624,8 +2906,21 @@ impl Open {
                 store::read_vendored_symbol(&self.dir, id).map_err(|e| e.to_string())?
             }
         };
-        self.symbols.insert(id.to_owned(), s);
+        self.load_symbol(id, s);
         Ok(())
+    }
+
+    /// Load `s` as the project's symbol `id`, and list it with its own name and description.
+    fn load_symbol(&mut self, id: &str, s: Symbol) {
+        let entry = LibraryEntry::of(id, &s);
+        match self.library.iter_mut().find(|e| e.id == id) {
+            Some(row) => *row = entry,
+            None => {
+                let at = self.library.partition_point(|e| e.id.as_str() < id);
+                self.library.insert(at, entry);
+            }
+        }
+        self.symbols.insert(id.to_owned(), s);
     }
 
     /// The version of symbol `id` that `pin` names: its copy in the project, or, when there is
@@ -2699,6 +2994,19 @@ impl Open {
     }
 
     pub fn place(&mut self, page: usize, symbol: &str, at: Point) -> Result<String, String> {
+        self.place_turned(page, symbol, at, Rotation::R0, false)
+    }
+
+    /// Place `symbol` at `at` on page `page`, turned by `rotation` and mirrored when `mirror`
+    /// is set, as one undo step. Returns the new item's id.
+    pub fn place_turned(
+        &mut self,
+        page: usize,
+        symbol: &str,
+        at: Point,
+        rotation: Rotation,
+        mirror: bool,
+    ) -> Result<String, String> {
         self.ensure_symbol(symbol)?;
         let letter = self
             .symbols
@@ -2716,8 +3024,8 @@ impl Open {
             id: id.clone(),
             symbol: symbol.to_owned(),
             at,
-            rotation: Rotation::R0,
-            mirror: false,
+            rotation,
+            mirror,
             tag,
         });
         Ok(id)
@@ -2893,9 +3201,12 @@ impl Open {
         };
         let new = plan.symbol.clone();
         self.check_box_file_unchanged(&symbol_id, &old)?;
+        self.check_symbol_repair_baseline(&symbol_id)?;
         self.write_symbol_file(&new)?;
-        // The file holds the loaded version again: a later change on disk is checked for.
+        // The file holds the loaded version again: a later change on disk is checked for, and a
+        // repair a refused change queued for it would write an older version over this one.
         self.stale_symbol_files.remove(&symbol_id);
+        self.symbol_file_written(&symbol_id);
         self.checkpoint();
         self.project.lock.symbols.insert(
             symbol_id.clone(),
@@ -2918,6 +3229,34 @@ impl Open {
             s.at = s.at + moved;
         }
         Ok(plan.warnings)
+    }
+
+    /// Before the app writes the file of symbol `id` while a repair waits for it: refused when
+    /// another program changed the file since the app last wrote it, so that change is not
+    /// lost unasked; Save asks which version to keep.
+    fn check_symbol_repair_baseline(&self, id: &str) -> Result<(), String> {
+        let Ok(path) = store::vendor_path(&self.dir, ItemKind::Symbol, id) else {
+            return Ok(());
+        };
+        let rel = path.strip_prefix(&self.dir).unwrap_or(&path);
+        let (Some(should), Some(found)) = (self.unwritten_files.get(rel), self.unwritten_found.get(rel)) else {
+            return Ok(());
+        };
+        match found.change(snapshot_file(&path), should, &path) {
+            Some(note) => Err(format!(
+                "the file of symbol {id} was changed outside WiringCraft{note}; save the project and choose which version to keep before editing the box"
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// The file of symbol `id` was written as the project needs it: a repair waiting for it
+    /// would write another version over it, so it is let go.
+    fn symbol_file_written(&mut self, id: &str) {
+        if let Ok(path) = store::vendor_path(&self.dir, ItemKind::Symbol, id) {
+            let rel = path.strip_prefix(&self.dir).unwrap_or(&path).to_path_buf();
+            self.drop_unwritten(&rel);
+        }
     }
 
     /// Before a black box edit writes its symbol file: the file must still hold `loaded`, the
@@ -3102,6 +3441,33 @@ impl Open {
         })
     }
 
+    /// Queue the file of symbol `id` to be written with `sym` by the next save, as a repair
+    /// [`Open::back_to`] tracks. A file already waiting keeps what it held when first queued,
+    /// so a change made outside since is still asked about; otherwise what the app `wrote` to
+    /// it (what it holds now when not known). The error says why it could not be queued.
+    fn queue_symbol_repair(&mut self, id: &str, sym: &Symbol, wrote: Option<&Symbol>) -> Result<(), String> {
+        let why = |e: wc_core::Error| format!("The file of symbol {id} is not written back: {e}");
+        let path = store::vendor_path(&self.dir, ItemKind::Symbol, id).map_err(why)?;
+        let bytes = Some(store::to_json(sym).map_err(why)?.into_bytes());
+        let wrote = wrote.map(store::to_json).transpose().map_err(why)?;
+        let rel = path
+            .strip_prefix(&self.dir)
+            .map_or_else(|_| path.clone(), Path::to_path_buf);
+        if self.unwritten_found.contains_key(&rel) {
+            self.unwritten_files.insert(rel.clone(), bytes);
+            self.edited();
+        } else {
+            self.keep_unwritten(vec![(path, bytes)], true);
+            // A change another program made after the app wrote the file is asked about too.
+            if let Some(json) = wrote {
+                self.unwritten_found
+                    .insert(rel.clone(), Found::Bytes(Some(json.into_bytes())));
+            }
+        }
+        self.symbol_repairs.insert(rel, (id.to_owned(), sym.hash()));
+        Ok(())
+    }
+
     /// Start a change that may be refused as a whole: the project and the symbols and parts
     /// loaded now are kept, and the undo history is set aside, so the change's own undo steps
     /// collect apart from it. [`Open::keep`] or [`Open::back_to`] ends it. Undo and redo
@@ -3114,8 +3480,9 @@ impl Open {
         self.marks += 1;
         Mark {
             kept,
-            symbols: self.symbols.keys().cloned().collect(),
+            symbols: self.symbols.clone(),
             parts: self.parts.keys().cloned().collect(),
+            library: self.library.clone(),
             files: vendor_names(&self.dir),
             edits_from: self.mark_edits.len(),
         }
@@ -3161,13 +3528,98 @@ impl Open {
         // changed since is left as it is and named; the others are put back all the same, so
         // no file of the change stays behind unnamed.
         let mut errors: Vec<String> = self.write_back(&edits).err().into_iter().collect();
+        // The symbol versions the change pinned: the files it wrote hold those.
+        let pinned_by_change = self.project.lock.symbols.clone();
         self.put_back(mark.kept);
         if !self.unwritten_files.is_empty() {
             // A file still to be written is unsaved work, whatever the history put back says.
             self.edited();
         }
-        self.symbols.retain(|id, _| mark.symbols.contains(id));
+        // Symbols the change loaded are let go and those it replaced are put back, with the
+        // symbol list as it was. One put back that is the version the project pins again (a
+        // box edit taken back, say) is written to its file by the next save, as its file may
+        // hold the replaced version: that is unsaved work. Only a version the change pinned
+        // is taken for one it wrote: one another program wrote and that was read in meanwhile
+        // is left in its file.
+        let pin = |o: &Self, id: &str| o.project.lock.symbols.get(id).map(|e| e.hash.clone());
+        for (id, was) in &mark.symbols {
+            let replaced = self.symbols.get(id).filter(|now| now.hash() != was.hash());
+            let written = replaced
+                .filter(|now| pinned_by_change.get(id).is_some_and(|e| e.hash == now.hash()))
+                .cloned();
+            if let Some(wrote) = written
+                && pin(self, id) == Some(was.hash())
+            {
+                self.stale_symbol_files.insert(id.clone());
+                // Queued with what the app wrote there, so the next save does not write over a
+                // change another program made to it since.
+                if let Err(e) = self.queue_symbol_repair(id, was, Some(&wrote)) {
+                    errors.push(e);
+                }
+                self.edited();
+            }
+        }
+        // A file waiting for the pinned version that is now loaded, where the symbol put back
+        // is another version (a box edit taken back inside a change that is taken back too):
+        // the next save writes that pinned version to the file all the same.
+        for id in self.stale_symbol_files.clone() {
+            let (Some(now), Some(was)) = (self.symbols.get(&id), mark.symbols.get(&id)) else {
+                continue;
+            };
+            if now.hash() != was.hash() && pin(self, &id) == Some(now.hash()) {
+                let now = now.clone();
+                if let Err(e) = self.queue_symbol_repair(&id, &now, None) {
+                    errors.push(e);
+                }
+            }
+        }
+        self.symbols = mark.symbols;
+        // A file waiting to be written (from a change taken back inside this one, say) is let
+        // go when the loaded symbol is gone or not the version the project pins, so a save
+        // never writes a version the lock does not name.
+        let stale = std::mem::take(&mut self.stale_symbol_files);
+        self.stale_symbol_files = stale
+            .into_iter()
+            .filter(|id| {
+                self.symbols
+                    .get(id)
+                    .is_some_and(|s| pin(self, id).is_none_or(|h| h == s.hash()))
+            })
+            .collect();
+        // A repair queued by a change taken back inside this one is for the version that change
+        // pinned. When the pin put back now is another one, the repair is retargeted to the
+        // loaded symbol if that is the pinned version (its baseline kept, so a change made
+        // outside since is still asked about), or let go otherwise.
+        for (rel, (id, hash)) in self.symbol_repairs.clone() {
+            let wanted = pin(self, &id);
+            if wanted.as_deref() == Some(hash.as_str()) {
+                continue;
+            }
+            match self.symbols.get(&id).filter(|s| wanted == Some(s.hash())).cloned() {
+                Some(sym) => match store::to_json(&sym) {
+                    Ok(json) => {
+                        self.unwritten_files.insert(rel.clone(), Some(json.into_bytes()));
+                        self.symbol_repairs.insert(rel, (id.clone(), sym.hash()));
+                        self.stale_symbol_files.insert(id);
+                    }
+                    // The queued version is not the pinned one: let go, and the next save writes
+                    // the pinned one as the loaded symbol.
+                    Err(e) => {
+                        errors.push(format!("The file of symbol {id} is not written back as queued: {e}"));
+                        self.drop_unwritten(&rel);
+                        self.stale_symbol_files.insert(id);
+                    }
+                },
+                None => self.drop_unwritten(&rel),
+            }
+        }
+        if !self.stale_symbol_files.is_empty() || !self.symbol_repairs.is_empty() {
+            // A file still to be written back is unsaved work, also after a change taken back
+            // inside this one queued it.
+            self.edited();
+        }
         self.parts.retain(|id, _| mark.parts.contains(id));
+        self.library = mark.library;
         let (before, now) = match (mark.files, vendor_names(&self.dir)) {
             (Ok(before), Ok(now)) => (before, now),
             (Err(e), _) | (_, Err(e)) => {
@@ -4302,6 +4754,234 @@ impl Found {
     fn of(snapshot: Result<Option<Vec<u8>>, String>) -> Self {
         snapshot.map_or_else(Self::Unread, Self::Bytes)
     }
+
+    /// Whether `now` (what the file at `path` holds, [`snapshot_file`]) was changed outside
+    /// WiringCraft since it was found like this, with a note for the message (empty when there
+    /// is nothing to add); `None` when the project's version (`should`) may go over it.
+    fn change(&self, now: Result<Option<Vec<u8>>, String>, should: &Option<Vec<u8>>, path: &Path) -> Option<String> {
+        match (self, now) {
+            (Found::Bytes(found), Ok(now)) => (now != *found && now != *should).then(String::new),
+            // Not known what WiringCraft left there: a file there now may be from outside.
+            (Found::Unread(why), Ok(now)) => (now.is_some() && now != *should)
+                .then(|| format!(" (it could not be read when WiringCraft left it: {why})")),
+            (Found::WriteOverUnread(_), Ok(now)) => (now.is_some() && now != *should).then(String::new),
+            // Not readable now: what it holds is not known, so it is not written over unless
+            // the user chose to.
+            (Found::Bytes(_) | Found::Unread(_), Err(why)) => Some(format!(" (it cannot be read now: {why})")),
+            // Consent covers the unreadable entry the user saw only, told by its metadata.
+            (Found::WriteOverUnread(seen), Err(why)) => {
+                (stamp_of(path) != *seen).then(|| format!(" (it cannot be read now, and changed since: {why})"))
+            }
+        }
+    }
+}
+
+/// How [`repair_file`] ended.
+enum Repair {
+    /// The file holds the project's version (or is gone, when it should be).
+    Done,
+    /// Another program changed the file just before the repair: it is left as that program
+    /// left it, with a note for the message ([`Found::change`]).
+    ChangedOutside(String),
+}
+
+/// Put the project's version (`should`; `None`: no file) at `path`, where a repair was waiting,
+/// without losing a change another program makes at the same moment (#670).
+///
+/// A file there is first moved aside (renamed within its folder, one step), so no later write
+/// can land in it unseen. What was moved is then checked against `found`
+/// ([`Found::change`]): when it was changed outside, it is put back as it was, and the result
+/// says so. Otherwise the project's version is put in place without replacing an entry that
+/// appeared there meanwhile (that is reported as changed outside too). The moved file is let
+/// go only when it still holds what was checked; one written again in between (through a
+/// handle opened before the move) is kept next to it, and the result names where. Anything
+/// else than a file or link at `path`, such as a folder, is repaired by [`restore_file`] as
+/// before. An error when a step fails; the moved file is put back first, or the error says
+/// where it is kept.
+fn repair_file(path: &Path, should: Option<&[u8]>, found: &Found) -> std::io::Result<Repair> {
+    #[cfg(test)]
+    if tests::restore_fails(path) {
+        return Err(std::io::Error::other("blocked by the test"));
+    }
+    let moved = match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_file() || m.is_symlink() => {
+            // The name is reserved first (a new empty file, `create_new`), so the move can only
+            // replace this call's own placeholder, never an entry another program made there.
+            let aside = reserve_beside(path, "aside")?;
+            if let Err(e) = std::fs::rename(path, &aside) {
+                let _ = std::fs::remove_file(&aside);
+                return Err(e);
+            }
+            Some(aside)
+        }
+        Ok(_) => return restore_file(path, should).map(|()| Repair::Done),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    let now = match &moved {
+        Some(aside) => snapshot_file(aside),
+        None => Ok(None),
+    };
+    let stamp = moved.as_deref().and_then(stamp_of);
+    #[cfg(test)]
+    if let Some(aside) = &moved {
+        tests::write_moved_after_check(aside);
+    }
+    #[cfg(test)]
+    tests::run_hook("moved aside", path);
+    let put_back = |aside: &Path| match place_new(aside, path) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(std::io::Error::other(format!(
+            "another file appeared there meanwhile; the one that was there is kept as {}",
+            aside.display()
+        ))),
+        Err(e) => Err(std::io::Error::other(format!(
+            "{e}; the file that was there is kept as {}",
+            aside.display()
+        ))),
+    };
+    // The moved file is removed only while it holds what was checked: read again just before.
+    let let_go = |aside: &Path| -> std::io::Result<Option<String>> {
+        let same = match (&now, snapshot_file(aside)) {
+            (Ok(was), Ok(is)) => *was == is && stamp_of(aside) == stamp,
+            (Err(_), _) | (_, Err(_)) => stamp_of(aside) == stamp,
+        };
+        if !same {
+            return Ok(Some(format!(
+                " (it was written again while it was repaired; that version is kept as {})",
+                aside.display()
+            )));
+        }
+        std::fs::remove_file(aside).map_err(|e| {
+            std::io::Error::other(format!(
+                "the project's version is in place, but the file that was there could not be removed from {}: {e}",
+                aside.display()
+            ))
+        })?;
+        Ok(None)
+    };
+    let stamp_at = moved.as_deref().unwrap_or(path);
+    if let Some(note) = found.change(now.clone(), &should.map(<[u8]>::to_vec), stamp_at) {
+        if let Some(aside) = &moved {
+            put_back(aside)?;
+        }
+        return Ok(Repair::ChangedOutside(note));
+    }
+    let placed = match should {
+        // Already the project's version: the moved file itself goes back.
+        Some(bytes) if now.as_ref().is_ok_and(|n| n.as_deref() == Some(bytes)) => match &moved {
+            Some(aside) => place_new(aside, path),
+            None => Ok(true),
+        },
+        Some(bytes) => write_staging_beside(path, bytes).and_then(|new| {
+            let placed = place_new(&new, path);
+            if std::fs::symlink_metadata(&new).is_ok() {
+                let _ = std::fs::remove_file(&new);
+            }
+            placed
+        }),
+        None => match std::fs::symlink_metadata(path) {
+            Ok(_) => Ok(false),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(e) => Err(e),
+        },
+    };
+    match placed {
+        Ok(placed) => {
+            let kept = match &moved {
+                Some(aside) if std::fs::symlink_metadata(aside).is_ok() => let_go(aside)?,
+                _ => None,
+            };
+            Ok(match (placed, kept) {
+                (_, Some(note)) => Repair::ChangedOutside(note),
+                (true, None) => Repair::Done,
+                // An entry appeared where the project's version was to go: another program's.
+                (false, None) => Repair::ChangedOutside(" (it appeared again while it was being written)".into()),
+            })
+        }
+        Err(e) => {
+            if let Some(aside) = &moved {
+                put_back(aside).map_err(|again| std::io::Error::other(format!("{e}; then {again}")))?;
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Write `bytes` to a new file next to `path` ([`unused_beside`]), created here and only here
+/// (`create_new`: never through a link or into a file someone else put at that name).
+fn write_staging_beside(path: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    for _ in 0..10 {
+        let new = unused_beside(path, "new")?;
+        #[cfg(test)]
+        tests::run_hook("staging name chosen", &new);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&new) {
+            Ok(mut file) => {
+                if let Err(e) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+                    drop(file);
+                    let _ = std::fs::remove_file(&new);
+                    return Err(e);
+                }
+                return Ok(new);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other("no free name next to it"))
+}
+
+/// A new empty file next to `path` ([`unused_beside`]), created here (`create_new`), that holds
+/// the name for a file of a repair (`what`) until it is renamed over.
+fn reserve_beside(path: &Path, what: &str) -> std::io::Result<PathBuf> {
+    for _ in 0..10 {
+        let name = unused_beside(path, what)?;
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&name) {
+            Ok(_) => return Ok(name),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other("no free name next to it"))
+}
+
+/// A path next to `path` that nothing is at yet, for a file of a repair (`what`).
+fn unused_beside(path: &Path, what: &str) -> std::io::Result<PathBuf> {
+    let name = path.file_name().ok_or_else(|| std::io::Error::other("no file name"))?;
+    for n in 0..1000u32 {
+        let mut candidate = std::ffi::OsString::from(".");
+        candidate.push(name);
+        candidate.push(format!(".wc-{what}-{}-{n}", std::process::id()));
+        let candidate = path.with_file_name(candidate);
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other("no free name next to it"))
+}
+
+/// Move the file at `from` to `to` without replacing anything at `to`: `false` (and `from`
+/// left as it is) when something is there. Done by a hard link, then removing `from`; where
+/// the file system has no hard links, by a rename once nothing is seen at `to`.
+fn place_new(from: &Path, to: &Path) -> std::io::Result<bool> {
+    match std::fs::hard_link(from, to) {
+        Ok(()) => {
+            std::fs::remove_file(from)?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported || e.kind() == std::io::ErrorKind::PermissionDenied => {
+            if std::fs::symlink_metadata(to).is_ok() {
+                return Ok(false);
+            }
+            std::fs::rename(from, to)?;
+            Ok(true)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn snapshot_file(path: &Path) -> Result<Option<Vec<u8>>, String> {
@@ -4484,6 +5164,53 @@ fn version_fits(item_id: &str, hash: &str, id: &str, pin: &str) -> Result<(), St
 pub(crate) mod tests {
     use super::*;
 
+    /// A part copy that cannot be looked for (say, in a folder that may not be entered) is
+    /// reported as unreadable with the reason, not as missing (#1035). The failing lookup is
+    /// injected, so this holds when the tests run as root too.
+    #[test]
+    fn a_part_copy_that_cannot_be_looked_for_is_unreadable_with_the_reason() {
+        let (_tmp, mut o) = project();
+        o.project.devices.insert(
+            DeviceTag::parse("-K1").unwrap(),
+            wc_core::project::Device {
+                part: Some("maker.contactor".into()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            unreadable_parts(&o.dir, &o.project, &BTreeMap::new()).is_empty(),
+            "absent is missing"
+        );
+        let found = unreadable_parts_looked_up(&o.dir, &o.project, &BTreeMap::new(), |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        });
+        let why = found.get("maker.contactor").map(String::as_str).unwrap_or_default();
+        assert!(why.contains("maker.contactor.json"), "names the file: {found:?}");
+        assert!(why.to_lowercase().contains("permission denied"), "and why: {found:?}");
+    }
+
+    /// A used part id that cannot name a file in the project's library is reported as
+    /// unreadable with the reason the id is refused, not skipped; a valid id whose copy is
+    /// absent stays missing (not listed here).
+    #[test]
+    fn a_used_part_id_that_cannot_name_a_file_is_unreadable_with_the_reason() {
+        let (_tmp, mut o) = project();
+        for (tag, part) in [("-K1", "../escape"), ("-K2", "maker.absent")] {
+            o.project.devices.insert(
+                DeviceTag::parse(tag).unwrap(),
+                wc_core::project::Device {
+                    part: Some(part.into()),
+                    ..Default::default()
+                },
+            );
+        }
+        let found = unreadable_parts(&o.dir, &o.project, &BTreeMap::new());
+        let why = found.get("../escape").map(String::as_str).unwrap_or_default();
+        assert!(why.contains("must be 1-128"), "keeps the reason: {found:?}");
+        assert!(!found.contains_key("maker.absent"), "absent is missing: {found:?}");
+        assert_eq!(found.len(), 1, "{found:?}");
+    }
+
     thread_local! {
         /// A file whose writes by `restore_file` fail, after letting this many through.
         static FAIL_RESTORE: std::cell::RefCell<Vec<(PathBuf, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -4511,6 +5238,44 @@ pub(crate) mod tests {
 
     fn let_restores_through() {
         FAIL_RESTORE.with(|f| f.borrow_mut().clear());
+    }
+
+    thread_local! {
+        /// Text written into the next file a repair moves aside, after it was checked: a
+        /// program writing through a handle it opened before the move.
+        static WRITE_MOVED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    }
+
+    type Hook = Box<dyn FnOnce(&Path)>;
+
+    thread_local! {
+        /// Steps run once at a named point of a repair (in this test's thread): another
+        /// program acting at that moment.
+        static HOOKS: std::cell::RefCell<Vec<(&'static str, Hook)>> = std::cell::RefCell::new(Vec::new());
+    }
+
+    #[cfg(unix)]
+    fn at(point: &'static str, step: impl FnOnce(&Path) + 'static) {
+        HOOKS.with(|h| h.borrow_mut().push((point, Box::new(step))));
+    }
+
+    pub(super) fn run_hook(point: &str, path: &Path) {
+        let step = HOOKS.with(|h| {
+            let mut h = h.borrow_mut();
+            let i = h.iter().position(|(p, _)| *p == point)?;
+            Some(h.remove(i).1)
+        });
+        if let Some(step) = step {
+            step(path);
+        }
+    }
+
+    pub(super) fn write_moved_after_check(aside: &Path) {
+        if let Some(text) = WRITE_MOVED.with(|w| w.borrow_mut().take()) {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(aside).unwrap();
+            f.write_all(text.as_bytes()).unwrap();
+        }
     }
 
     pub(super) fn restore_fails(path: &Path) -> bool {
@@ -4541,6 +5306,70 @@ pub(crate) mod tests {
 
     /// A project with a macro saved twice from its form (descriptions "A coil", then "Two"),
     /// and the file's text after each save.
+    #[test]
+    fn a_failed_undo_or_redo_keeps_the_steps_mark_for_taking_a_move_back() {
+        use wc_core::geom::Shape;
+        let line = |x: f64| Shape::Line {
+            a: Point::new(x, 100.0),
+            b: Point::new(x + 10.0, 100.0),
+        };
+        let (_tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let Some(g) = o.add_graphic(1, line(10.0)) else {
+            unreachable!()
+        };
+        let page = o.project.pages[1].id.clone();
+        // A move's checkpoint, then an assistant turn that deletes the line and draws another:
+        // the same count of drawings, folded into one step.
+        o.begin_drag_move();
+        let Some(id) = o.last_step_id() else { unreachable!() };
+        o.drag_move_by(1, std::slice::from_ref(&g), Point::new(-40.0, 0.0));
+        let mark = o.start_turn();
+        o.delete_many(1, std::slice::from_ref(&g));
+        o.add_graphic(1, line(200.0));
+        o.squash_undo(mark);
+        let symbol = o.project.lock.symbols.keys().next().unwrap().clone();
+        let fail = |o: &mut Open| {
+            o.stale_symbol_files.insert(symbol.clone());
+            o.fail_symbol_writes = [true].into();
+        };
+        let pass = |o: &mut Open| {
+            o.stale_symbol_files.clear();
+            o.fail_symbol_writes = Default::default();
+        };
+        // A failed Undo puts the folded step back as it was.
+        fail(&mut o);
+        assert!(!o.undo());
+        assert!(o.take_undo_error().is_some());
+        pass(&mut o);
+        assert!(o.take_back_move(id, &page, std::slice::from_ref(&g)).is_err());
+        // The same for a failed Redo, with the folded step waiting in the redo history.
+        assert!(o.undo(), "{:?}", o.take_undo_error());
+        fail(&mut o);
+        assert!(!o.redo());
+        assert!(o.take_undo_error().is_some());
+        pass(&mut o);
+        assert!(o.take_back_move(id, &page, std::slice::from_ref(&g)).is_err());
+    }
+
+    #[test]
+    fn a_move_is_not_taken_back_under_an_assistant_turn_begun_after_it() {
+        let (_tmp, mut o) = project();
+        let id = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let sel = [Selection::Symbol(id)];
+        let page = o.project.pages[1].id.clone();
+        o.begin_drag_move();
+        let Some(step) = o.last_step_id() else { unreachable!() };
+        o.drag_move_by(1, &sel, Point::new(-10.0, 0.0));
+        let mark = o.start_turn();
+        o.rotate_many(1, &sel);
+        o.rotate_many(1, &sel);
+        assert!(o.take_back_move(step, &page, &sel).is_err());
+        let steps = o.undo_steps();
+        o.squash_undo(mark);
+        assert_eq!(o.undo_steps(), steps - 1, "the turn's two steps fold into one");
+    }
+
     fn macro_edited_twice() -> (tempfile::TempDir, Open, PathBuf, [String; 3]) {
         let (tmp, mut o) = project();
         let id = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
@@ -4672,6 +5501,168 @@ pub(crate) mod tests {
         o.write_over_outside_version(&path);
         o.save().unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), two, "as the project needs it");
+    }
+
+    /// Another program writes a waiting macro after Save's check found it as WiringCraft left
+    /// it, just before the repair: the edit is not lost, and Save names the file (#670).
+    #[test]
+    fn a_save_does_not_lose_a_waiting_file_changed_right_after_its_check() {
+        let (_tmp, mut o, path, [_, _, two]) = macro_edited_twice();
+        let symbol = o.project.lock.symbols.keys().next().unwrap().clone();
+        o.stale_symbol_files.insert(symbol);
+        o.fail_symbol_writes = [true].into();
+        fail_restores(&path, 1);
+        assert!(!o.undo());
+        assert!(o.take_undo_error().is_some());
+        let_restores_through();
+        o.stale_symbol_files.clear();
+        o.fail_symbol_writes = Default::default();
+        assert_eq!(o.changed_outside(), None, "as WiringCraft left it");
+
+        let outside = format!("{two}\n# edited between the check and the repair\n");
+        write_outside_before(&path, &path, &outside);
+        let err = o.save().unwrap_err();
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains(Open::CHANGED_OUTSIDE), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), outside, "the edit survives");
+        assert_eq!(o.changed_outside(), Some(path.clone()), "still asked about");
+        let dir = path.parent().unwrap();
+        let left: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".wc-"))
+            .collect();
+        assert!(left.is_empty(), "nothing left beside it: {left:?}");
+
+        // Keeping it lets the save through with that version.
+        o.keep_outside_version(&path);
+        o.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), outside);
+    }
+
+    /// When the project's version cannot be staged (every staging name taken), the file that
+    /// was moved aside goes back where it was, untouched (#670).
+    #[test]
+    fn a_repair_that_cannot_stage_puts_the_file_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("m.yaml");
+        std::fs::write(&path, "left").unwrap();
+        for n in 0..1000u32 {
+            let name = format!(".m.yaml.wc-new-{}-{n}", std::process::id());
+            std::fs::write(tmp.path().join(name), "").unwrap();
+        }
+        let left = Found::Bytes(Some(b"left".to_vec()));
+        let err = repair_file(&path, Some(b"new"), &left).err().unwrap();
+        assert!(err.to_string().contains("no free name"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"left", "put back");
+        let aside = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains("wc-aside"))
+            .count();
+        assert_eq!(aside, 0, "nothing left aside");
+    }
+
+    /// A link another program puts at the staging name right after it was chosen is not
+    /// written through: the file it points at stays as it was (#670).
+    #[cfg(unix)]
+    #[test]
+    fn a_link_put_at_the_staging_name_is_not_written_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("m.yaml");
+        std::fs::write(&path, "left").unwrap();
+        let target = tmp.path().join("outside.txt");
+        std::fs::write(&target, "theirs").unwrap();
+        let t = target.clone();
+        at("staging name chosen", move |new| {
+            std::os::unix::fs::symlink(&t, new).unwrap()
+        });
+        let left = Found::Bytes(Some(b"left".to_vec()));
+        assert!(matches!(repair_file(&path, Some(b"new"), &left).unwrap(), Repair::Done));
+        assert_eq!(std::fs::read(&target).unwrap(), b"theirs", "not written through");
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    }
+
+    /// A dangling link another program puts where a file is to be deleted, after it was moved
+    /// aside, counts as changed outside: it is left there and the repair keeps waiting (#670).
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_link_put_where_a_deleted_file_was_is_reported() {
+        let (_tmp, mut o, path, _) = macro_edited_twice();
+        let held = std::fs::read(&path).unwrap();
+        let rel = path.strip_prefix(&o.dir).unwrap().to_path_buf();
+        o.unwritten_files.insert(rel.clone(), None);
+        o.unwritten_found.insert(rel.clone(), Found::Bytes(Some(held)));
+        let nowhere = path.with_file_name("nowhere");
+        at("moved aside", move |p| std::os::unix::fs::symlink(&nowhere, p).unwrap());
+        let err = o.save().unwrap_err();
+        assert!(err.contains(Open::CHANGED_OUTSIDE), "{err}");
+        assert!(std::fs::symlink_metadata(&path).unwrap().is_symlink(), "left there");
+        assert!(o.unwritten_files.contains_key(&rel), "still waiting");
+    }
+
+    /// A reserved name is a file made by the reservation itself, so a second reservation (or
+    /// another program) never gets the same one (#670).
+    #[test]
+    fn a_reserved_repair_name_is_held_by_a_new_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("m.yaml");
+        let first = reserve_beside(&path, "aside").unwrap();
+        assert!(first.is_file());
+        let second = reserve_beside(&path, "aside").unwrap();
+        assert_ne!(first, second);
+        assert!(second.is_file());
+    }
+
+    /// The repair itself: a waiting deletion or replacement is done when the file holds what
+    /// the check admitted, and a file changed outside is put back untouched (#670).
+    #[test]
+    fn a_repair_moves_the_file_aside_and_checks_it_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("m.yaml");
+        let left = Found::Bytes(Some(b"left".to_vec()));
+        // Replaced when it holds what WiringCraft left.
+        std::fs::write(&path, "left").unwrap();
+        assert!(matches!(repair_file(&path, Some(b"new"), &left).unwrap(), Repair::Done));
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        // Deleted when it should be gone.
+        std::fs::write(&path, "left").unwrap();
+        assert!(matches!(repair_file(&path, None, &left).unwrap(), Repair::Done));
+        assert!(!path.exists());
+        // Written where nothing was left, and nothing is.
+        assert!(matches!(
+            repair_file(&path, Some(b"new"), &Found::Bytes(None)).unwrap(),
+            Repair::Done
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        // Changed outside: neither deleted nor replaced.
+        std::fs::write(&path, "theirs").unwrap();
+        for should in [None, Some(&b"new"[..])] {
+            let Repair::ChangedOutside(_) = repair_file(&path, should, &left).unwrap() else {
+                unreachable!("changed outside")
+            };
+            assert_eq!(std::fs::read(&path).unwrap(), b"theirs");
+        }
+        assert_eq!(
+            std::fs::read_dir(tmp.path()).unwrap().count(),
+            1,
+            "nothing left beside it"
+        );
+        // Written again through an old handle after the check: that version is kept beside it
+        // and named, not let go.
+        std::fs::write(&path, "left").unwrap();
+        WRITE_MOVED.with(|w| *w.borrow_mut() = Some("+late".into()));
+        let Repair::ChangedOutside(note) = repair_file(&path, Some(b"new"), &left).unwrap() else {
+            unreachable!("written again")
+        };
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        let kept: Vec<PathBuf> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| *p != path)
+            .collect();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(std::fs::read(&kept[0]).unwrap(), b"left+late");
+        assert!(note.contains(&kept[0].display().to_string()), "{note}");
     }
 
     /// A repair noted while the file could not be read (a folder in its place): a macro file
@@ -5982,6 +6973,29 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn undo_and_redo_list_the_symbol_version_they_bring_back() {
+        let (_tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let old = o.symbols["wc.coil"].clone();
+        let mut new = old.clone();
+        new.description = "Solenoid winding".into();
+        o.checkpoint();
+        store::write_vendored_symbol(&o.dir, &new).unwrap();
+        o.project.lock.symbols.get_mut("wc.coil").unwrap().hash = new.hash();
+        o.reload_symbols();
+        o.refresh_library();
+        let listed = |o: &Open| o.library.iter().find(|e| e.id == "wc.coil").unwrap().clone();
+        assert_eq!(listed(&o).description, new.description);
+
+        assert!(o.undo(), "{:?}", o.take_undo_error());
+        assert_eq!(listed(&o).description, old.description);
+        assert!(!listed(&o).matches("solenoid"));
+        assert!(o.redo(), "{:?}", o.take_undo_error());
+        assert_eq!(listed(&o).description, new.description);
+        assert!(listed(&o).matches("solenoid"));
+    }
+
+    #[test]
     fn redo_puts_back_a_new_version_of_a_symbol_no_page_uses() {
         let (_tmp, mut o) = project();
         o.ensure_symbol("wc.coil").unwrap();
@@ -6019,6 +7033,54 @@ pub(crate) mod tests {
         assert_eq!(o.symbols["wc.coil"], old, "placed in the version pinned");
         assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), old);
         assert_eq!(o.project.lock.symbols["wc.coil"].hash, old.hash());
+    }
+
+    #[test]
+    fn a_pinned_symbol_put_back_is_listed_with_its_own_description() {
+        let (tmp, mut o) = project();
+        o.ensure_symbol("wc.coil").unwrap();
+        let old = o.symbols["wc.coil"].clone();
+        o.save().unwrap();
+        std::fs::remove_file(store::vendor_path(&o.dir, ItemKind::Symbol, "wc.coil").unwrap()).unwrap();
+        let mut o = Open::load(&o.dir).unwrap();
+        // The library that wins for the id has a newer version with another description.
+        let mut new = old.clone();
+        new.description = "Solenoid winding".into();
+        library_first(&mut o, tmp.path(), &new);
+        o.refresh_library();
+        let listed = |o: &Open| o.library.iter().find(|e| e.id == "wc.coil").unwrap().clone();
+        assert_eq!(listed(&o).description, new.description);
+        // Placing puts back the pinned version: the list follows it.
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        assert_eq!(o.symbols["wc.coil"], old);
+        assert_eq!(listed(&o).description, old.description);
+        assert!(!listed(&o).matches("solenoid"));
+        assert_eq!(o.library.iter().filter(|e| e.id == "wc.coil").count(), 1);
+    }
+
+    #[test]
+    fn a_refused_change_that_loaded_a_symbol_puts_the_symbol_list_back() {
+        let (tmp, mut o) = project();
+        o.ensure_symbol("wc.coil").unwrap();
+        let old = o.symbols["wc.coil"].clone();
+        o.save().unwrap();
+        std::fs::remove_file(store::vendor_path(&o.dir, ItemKind::Symbol, "wc.coil").unwrap()).unwrap();
+        let mut o = Open::load(&o.dir).unwrap();
+        let mut new = old.clone();
+        new.description = "Solenoid winding".into();
+        library_first(&mut o, tmp.path(), &new);
+        o.refresh_library();
+        let m = o.mark();
+        let listed = o.library.clone();
+        // The change loads the pinned version, which changes its row, and is then refused.
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        assert_ne!(o.library, listed);
+        // A symbol only this project has gets a row of its own.
+        let mut own = old.clone();
+        own.id = "test.own".into();
+        o.load_symbol("test.own", own);
+        o.back_to(m).unwrap();
+        assert_eq!(o.library, listed, "the symbol list is as it was at the mark");
     }
 
     #[test]
@@ -6063,6 +7125,299 @@ pub(crate) mod tests {
         o.place(1, "wc.coil", Point::new(40.0, 20.0)).unwrap();
         assert_eq!(o.symbols["wc.coil"], old);
         assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), old);
+    }
+
+    #[test]
+    fn a_refused_change_puts_back_a_symbol_it_replaced_with_the_pinned_version() {
+        let (_tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let old = o.symbols["wc.coil"].clone();
+        o.save().unwrap();
+        let mut new = old.clone();
+        new.name = "Coil, changed".into();
+        store::write_vendored_symbol(&o.dir, &new).unwrap();
+        let mut o = Open::load(&o.dir).unwrap();
+        assert_eq!(o.symbols["wc.coil"], new, "loaded as the file has it");
+        // The pinned copy put back, then a change places with it and is refused.
+        store::write_vendored_symbol(&o.dir, &old).unwrap();
+        let m = o.mark();
+        o.place(1, "wc.coil", Point::new(40.0, 20.0)).unwrap();
+        assert_eq!(o.symbols["wc.coil"], old, "the change loaded the pinned version");
+        o.back_to(m).unwrap();
+        assert_eq!(o.symbols["wc.coil"], new, "the symbol loaded at the mark is back");
+        // It is not the pinned version, so its file is left as it is.
+        assert!(!o.stale_symbol_files.contains("wc.coil"));
+        assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), old);
+    }
+
+    /// A saved project with one black box on page 1: its item and symbol ids.
+    fn saved_box() -> (tempfile::TempDir, Open, String, String) {
+        let (tmp, mut o) = project();
+        let id = o
+            .add_black_box(1, Point::new(40.0, 40.0), Point::new(60.0, 50.0), &box_pin(), None)
+            .unwrap();
+        let symbol_id = format!("box.{}.{id}", o.project.pages[1].id);
+        o.save().unwrap();
+        (tmp, o, id, symbol_id)
+    }
+
+    /// The one point of the box [`saved_box`] places.
+    fn box_pin() -> [wc_core::BoxPin; 1] {
+        [wc_core::BoxPin {
+            name: "IN".into(),
+            side: wc_core::BoxSide::Left,
+            offset: 5.0,
+        }]
+    }
+
+    /// Black box `id` on page 1 made 30 mm wide, its point kept.
+    fn widen_box(o: &mut Open, id: &str) {
+        o.edit_black_box(1, id, (30.0, 10.0), &box_pin(), &BTreeMap::new(), &Default::default())
+            .unwrap();
+    }
+
+    #[test]
+    fn a_refused_box_edit_is_unsaved_work_until_its_file_is_written_back() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let old = o.symbols[&symbol_id].clone();
+        let m = o.mark();
+        widen_box(&mut o, &id);
+        assert_ne!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), old);
+        o.back_to(m).unwrap();
+        assert_eq!(o.symbols[&symbol_id], old);
+        assert!(o.dirty, "the box file still holds the refused edit");
+        o.save().unwrap();
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), old);
+    }
+
+    #[test]
+    fn a_box_edit_repeated_after_a_refusal_is_not_saved_over_by_the_repair() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let m = o.mark();
+        widen_box(&mut o, &id);
+        o.back_to(m).unwrap();
+        // The same edit again, kept: its file holds the version the project now pins.
+        widen_box(&mut o, &id);
+        let accepted = o.symbols[&symbol_id].clone();
+        assert_eq!(o.project.lock.symbols[&symbol_id].hash, accepted.hash());
+        o.save().unwrap();
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(),
+            accepted,
+            "the repair queued by the refusal does not write the old version over it"
+        );
+    }
+
+    #[test]
+    fn a_box_edit_repeated_over_a_file_changed_outside_while_its_repair_waits_is_refused() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let old = o.symbols[&symbol_id].clone();
+        let m = o.mark();
+        widen_box(&mut o, &id);
+        o.back_to(m).unwrap();
+        let mut other = old.clone();
+        other.name = "Box, changed".into();
+        store::write_vendored_symbol(&o.dir, &other).unwrap();
+        let err = o
+            .edit_black_box(1, &id, (30.0, 10.0), &box_pin(), &BTreeMap::new(), &Default::default())
+            .unwrap_err();
+        assert!(err.contains("changed outside"), "{err}");
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), other);
+        // The repair still waits, so Save still asks about that version.
+        let err = o.save().unwrap_err();
+        assert!(err.contains(Open::CHANGED_OUTSIDE), "{err}");
+    }
+
+    #[test]
+    fn an_undo_that_writes_a_symbol_file_lets_its_pending_repair_go() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let first = o.symbols[&symbol_id].clone();
+        widen_box(&mut o, &id);
+        // A further edit is refused: its repair waits to write the widened version.
+        let m = o.mark();
+        o.edit_black_box(1, &id, (40.0, 10.0), &box_pin(), &BTreeMap::new(), &Default::default())
+            .unwrap();
+        o.back_to(m).unwrap();
+        // Undo takes the widening back and writes the first version to the file.
+        assert!(o.undo());
+        assert_eq!(o.project.lock.symbols[&symbol_id].hash, first.hash());
+        o.save().unwrap();
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(),
+            first,
+            "the repair does not write the widened version over what Undo wrote"
+        );
+    }
+
+    #[test]
+    fn a_symbol_file_changed_outside_before_a_box_edit_is_refused_is_not_written_over_unasked() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let old = o.symbols[&symbol_id].clone();
+        let m = o.mark();
+        widen_box(&mut o, &id);
+        // Another program changes the box file before the edit is refused.
+        let mut other = old.clone();
+        other.name = "Box, changed".into();
+        store::write_vendored_symbol(&o.dir, &other).unwrap();
+        o.back_to(m).unwrap();
+        let err = o.save().unwrap_err();
+        assert!(err.contains(Open::CHANGED_OUTSIDE), "{err}");
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), other);
+    }
+
+    #[test]
+    fn a_symbol_file_repaired_on_save_is_not_written_again_unchecked() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let old = o.symbols[&symbol_id].clone();
+        let m = o.mark();
+        widen_box(&mut o, &id);
+        o.back_to(m).unwrap();
+        // The checked repair writes the file; a second, unchecked write would fail here.
+        o.fail_symbol_writes = [true].into();
+        o.save().unwrap();
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), old);
+    }
+
+    #[test]
+    fn nested_refused_changes_never_save_a_symbol_version_the_project_does_not_pin() {
+        let (_tmp, o, id, symbol_id) = saved_box();
+        let pinned = o.symbols[&symbol_id].clone();
+        // The box file is changed outside the app: loaded as the file has it.
+        let mut other = pinned.clone();
+        other.name = "Box, changed".into();
+        store::write_vendored_symbol(&o.dir, &other).unwrap();
+        let mut o = Open::load(&o.dir).unwrap();
+        assert_eq!(o.symbols[&symbol_id], other);
+        let listed = o.library.clone();
+        // The pinned copy put back; a change loads it and edits the box in an inner change.
+        store::write_vendored_symbol(&o.dir, &pinned).unwrap();
+        let outer = o.mark();
+        o.ensure_symbol(&symbol_id).unwrap();
+        o.refresh_library();
+        let inner = o.mark();
+        widen_box(&mut o, &id);
+        o.back_to(inner).unwrap();
+        assert!(o.stale_symbol_files.contains(&symbol_id));
+        o.back_to(outer).unwrap();
+        assert_eq!(o.symbols[&symbol_id], other, "the symbol loaded at the mark is back");
+        assert_eq!(o.library, listed, "and so is its list row");
+        assert!(o.dirty, "the box file still holds the refused edit");
+        o.save().unwrap();
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(),
+            pinned,
+            "the file holds the version the project pins, not the refused edit or the loaded one"
+        );
+    }
+
+    #[test]
+    fn a_repair_queued_by_a_refused_change_follows_the_pin_an_enclosing_refusal_puts_back() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let first = o.symbols[&symbol_id].clone();
+        // The outer change edits the box: the project pins that version.
+        let outer = o.mark();
+        widen_box(&mut o, &id);
+        let pinned = o.symbols[&symbol_id].clone();
+        assert_ne!(pinned, first);
+        // Another program changes the box file and it is read in; then the pinned copy is put
+        // back, and a middle change loads it and edits the box in an inner change.
+        let mut other = pinned.clone();
+        other.name = "Box, changed".into();
+        store::write_vendored_symbol(&o.dir, &other).unwrap();
+        o.reload_symbols();
+        assert_eq!(o.symbols[&symbol_id], other);
+        store::write_vendored_symbol(&o.dir, &pinned).unwrap();
+        let middle = o.mark();
+        o.ensure_symbol(&symbol_id).unwrap();
+        let inner = o.mark();
+        o.edit_black_box(1, &id, (40.0, 10.0), &box_pin(), &BTreeMap::new(), &Default::default())
+            .unwrap();
+        o.back_to(inner).unwrap();
+        o.back_to(middle).unwrap();
+        // The middle refusal queued the middle pin for the box file; the outer refusal pins the
+        // first version again.
+        o.back_to(outer).unwrap();
+        assert_eq!(o.project.lock.symbols[&symbol_id].hash, first.hash());
+        assert_eq!(o.symbols[&symbol_id], first);
+        assert!(o.dirty, "the box file still holds the refused edit");
+        o.save().unwrap();
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(),
+            first,
+            "the file holds the version the project pins again, not one a refused change pinned"
+        );
+    }
+
+    #[test]
+    fn a_symbol_file_changed_outside_while_its_repair_waits_is_not_written_over_unasked() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let old = o.symbols[&symbol_id].clone();
+        let m = o.mark();
+        widen_box(&mut o, &id);
+        o.back_to(m).unwrap();
+        // Another program changes the box file before the repair is saved.
+        let mut other = old.clone();
+        other.name = "Box, changed".into();
+        store::write_vendored_symbol(&o.dir, &other).unwrap();
+        let err = o.save().unwrap_err();
+        assert!(err.contains(Open::CHANGED_OUTSIDE), "{err}");
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), other);
+        // Keeping that version leaves it in its file.
+        let path = o.changed_outside().unwrap();
+        o.keep_outside_version(&path);
+        o.save().unwrap();
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), other);
+    }
+
+    #[test]
+    fn a_symbol_repair_written_over_an_outside_change_on_request_holds_the_pinned_version() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let old = o.symbols[&symbol_id].clone();
+        let m = o.mark();
+        widen_box(&mut o, &id);
+        o.back_to(m).unwrap();
+        let mut other = old.clone();
+        other.name = "Box, changed".into();
+        store::write_vendored_symbol(&o.dir, &other).unwrap();
+        assert!(o.save().is_err());
+        let path = o.changed_outside().unwrap();
+        o.write_over_outside_version(&path);
+        o.save().unwrap();
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), old);
+    }
+
+    #[test]
+    fn a_box_edit_refused_inside_a_refused_change_is_unsaved_work() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let old = o.symbols[&symbol_id].clone();
+        let outer = o.mark();
+        let inner = o.mark();
+        widen_box(&mut o, &id);
+        o.back_to(inner).unwrap();
+        o.back_to(outer).unwrap();
+        assert!(o.dirty, "the box file still holds the refused edit");
+        o.save().unwrap();
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), old);
+    }
+
+    #[test]
+    fn a_symbol_file_another_program_wrote_during_a_refused_change_is_left_as_it_is() {
+        let (_tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let old = o.symbols["wc.coil"].clone();
+        o.save().unwrap();
+        let m = o.mark();
+        // Another program writes another version, which the change reads in.
+        let mut other = old.clone();
+        other.name = "Coil, changed".into();
+        store::write_vendored_symbol(&o.dir, &other).unwrap();
+        o.reload_symbols();
+        assert_eq!(o.symbols["wc.coil"], other);
+        o.back_to(m).unwrap();
+        assert_eq!(o.symbols["wc.coil"], old);
+        assert!(!o.stale_symbol_files.contains("wc.coil"));
+        o.save().unwrap();
+        assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), other);
     }
 
     #[test]
@@ -6332,11 +7687,13 @@ pub(crate) mod tests {
         let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library/symbols/wc.breaker.1p.json");
         std::fs::copy(starter, tmp.path().join("mine/symbols/wc.breaker.1p.json")).unwrap();
         let before = o.project.clone();
+        let listed = o.library.clone();
         let undo = o.can_undo();
         let err = o.paste(1, &clip, Point::new(80.0, 80.0)).unwrap_err();
         assert!(err.contains("wc.coil"), "the symbol is named: {err}");
         assert_eq!(o.project, before, "nothing is added, not even the breaker's pin");
         assert!(!o.symbols.contains_key("wc.breaker.1p"));
+        assert_eq!(o.library, listed, "the symbol list goes back too");
         assert_eq!(o.can_undo(), undo, "no undo step");
         let path = o.save_macro(&clip, "Coil", "").unwrap();
         let err = o.insert_macro(1, &path, None).unwrap_err();
@@ -6345,7 +7702,7 @@ pub(crate) mod tests {
     }
 
     /// A library folder named "mine", put ahead of the others, holding `sym`.
-    fn library_first(o: &mut Open, root: &Path, sym: &Symbol) -> wc_library::Library {
+    pub(crate) fn library_first(o: &mut Open, root: &Path, sym: &Symbol) -> wc_library::Library {
         let mine = root.join("mine");
         std::fs::create_dir_all(mine.join("symbols")).unwrap();
         std::fs::write(
@@ -6850,6 +8207,41 @@ pub(crate) mod tests {
         o.parts.insert(pid.to_owned(), edited.clone());
         assert!(o.undo());
         assert_eq!(o.parts[pid], edited);
+    }
+
+    #[test]
+    fn an_update_naming_an_unknown_id_takes_nothing_and_keeps_the_history() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let pid = "example.ex-ct-9-24dc";
+        o.ensure_part(pid).unwrap();
+        o.place(1, "wc.coil", Point::new(60.0, 20.0)).unwrap();
+        changed_part_in_mine(&o, tmp.path(), pid);
+        let coil = o.symbols["wc.coil"].clone();
+        let lib = library_first(&mut o, tmp.path(), &coil);
+        // Something to undo and something to redo.
+        assert!(o.undo());
+        let (undo, redo, history, dirty) = (o.undo.len(), o.redo.len(), o.history, o.dirty);
+        assert!(undo > 0 && redo > 0);
+        let lock = o.project.lock.clone();
+        assert!(lock.parts.contains_key(pid), "the part is pinned");
+        let file = std::fs::read(store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap()).unwrap();
+        // The known part has a newer version, but the unknown id stops the whole update.
+        let only = [pid.to_owned(), "nosuch.item".to_owned()];
+        let err = o.update_library(&lib, Some(&only)).unwrap_err();
+        assert!(err.contains("nosuch.item"), "{err}");
+        assert_eq!(o.project.lock, lock);
+        assert_eq!(
+            std::fs::read(store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap()).unwrap(),
+            file
+        );
+        assert_eq!(
+            (o.undo.len(), o.redo.len(), o.history, o.dirty),
+            (undo, redo, history, dirty)
+        );
+        // The known id alone is taken.
+        let done = o.update_library(&lib, Some(&only[..1])).unwrap();
+        assert_eq!(done, vec![(ItemKind::Part, pid.to_owned())]);
     }
 
     #[test]
@@ -8014,9 +9406,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_symbol_list_keeps_and_searches_descriptions() {
+        let (_tmp, o) = project();
+        let coil = o.library.iter().find(|e| e.id == "wc.coil").unwrap();
+        assert!(coil.description.contains("relay"), "{coil:?}");
+        // Every word must appear, in any order and case, across id, name and description.
+        assert!(coil.matches(""));
+        assert!(coil.matches("CONTACTOR relay"));
+        assert!(coil.matches("coil contactor"));
+        assert!(!coil.matches("contactor timer"));
+        let hits: Vec<&str> = o
+            .library
+            .iter()
+            .filter(|e| e.matches("relay contactor"))
+            .map(|e| e.id.as_str())
+            .collect();
+        assert!(hits.contains(&"wc.coil"), "{hits:?}");
+        // After placing, the vendored copy keeps its description too.
+        let mut o = o;
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        o.place(page, "wc.coil", Point::new(50.0, 50.0)).unwrap();
+        o.refresh_library();
+        let coil = o.library.iter().find(|e| e.id == "wc.coil").unwrap();
+        assert!(coil.matches("relay"));
+    }
+
+    #[test]
     fn placing_vendors_the_symbol_and_tags_the_device() {
         let (_tmp, mut o) = project();
-        assert!(o.library.iter().any(|(id, _)| id == "wc.coil"));
+        assert!(o.library.iter().any(|e| e.id == "wc.coil"));
         let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
         let id = o.place(page, "wc.coil", Point::new(50.0, 50.0)).unwrap();
         assert!(o.symbols.contains_key("wc.coil"));
@@ -8747,7 +10165,7 @@ pub(crate) mod tests {
             description: String::new(),
         };
         wc_library::write_symbol(&root, &sym).unwrap();
-        let listed = |o: &Open| o.library.iter().any(|(id, _)| id == "test.imported");
+        let listed = |o: &Open| o.library.iter().any(|e| e.id == "test.imported");
         o.refresh_library();
         assert!(!listed(&o), "the folder is not a source yet");
 

@@ -25,6 +25,8 @@ pub const NAME: &str = "wiringcraft-app";
 pub const TOKEN_VAR: &str = "WIRINGCRAFT_BRIDGE_TOKEN";
 /// The MCP protocol version offered when the agent asks for none we know.
 pub const MCP_VERSION: &str = "2025-06-18";
+/// The MCP protocol versions the bridge speaks; `initialize` echoes one of these back.
+const MCP_VERSIONS: [&str; 3] = ["2024-11-05", "2025-03-26", MCP_VERSION];
 /// How long a tool call waits for the window thread.
 const CALL_TIMEOUT: Duration = Duration::from_secs(300);
 /// How long a new connection has to send the token.
@@ -263,7 +265,10 @@ pub fn handle(
     let ok = |result: Value| Some(json!({"jsonrpc": "2.0", "id": id, "result": result}));
     match method {
         "initialize" => {
-            let version = msg["params"]["protocolVersion"].as_str().unwrap_or(MCP_VERSION);
+            let version = msg["params"]["protocolVersion"]
+                .as_str()
+                .filter(|v| MCP_VERSIONS.contains(v))
+                .unwrap_or(MCP_VERSION);
             ok(json!({
                 "protocolVersion": version,
                 "capabilities": {"tools": {"listChanged": false}},
@@ -342,6 +347,15 @@ mod tests {
         let init = init.unwrap_or_default();
         assert_eq!(init["result"]["protocolVersion"], "2025-03-26");
         assert_eq!(init["result"]["instructions"], "note");
+        for params in [json!({"protocolVersion": "2099-01-01"}), json!({})] {
+            let init = handle(
+                &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": params}),
+                &specs,
+                "",
+                &mut call,
+            );
+            assert_eq!(init.unwrap_or_default()["result"]["protocolVersion"], MCP_VERSION);
+        }
         assert!(
             handle(
                 &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),

@@ -34,6 +34,12 @@ struct Snapshot {
     /// The library sources' check rules, as last loaded
     /// ([`Open::library_rules`](crate::state::Open::library_rules)).
     library: Vec<RuleSet>,
+    /// The library reload the inputs come from ([`Open::library_load`]): a reload checks
+    /// again even when the loaded inputs are equal, as a part copy that could not be read
+    /// may now be gone, or the other way round.
+    ///
+    /// [`Open::library_load`]: crate::state::Open::library_load
+    library_load: u64,
 }
 
 impl Snapshot {
@@ -43,6 +49,7 @@ impl Snapshot {
             && self.parts == open.parts
             && self.dir.as_path() == open.dir.as_path()
             && self.library == open.library_rules
+            && self.library_load == open.library_load()
     }
 }
 
@@ -186,17 +193,22 @@ impl LiveCheck {
             parts: open.parts.clone(),
             dir: open.dir.clone(),
             library: open.library_rules.clone(),
+            library_load: open.library_load(),
         });
         let (tx, rx) = channel();
         let input = Arc::clone(&snap);
         let spawned = std::thread::Builder::new().name("live-check".into()).spawn(move || {
-            let found = wc_report::check_with(
+            // Parts whose library copy cannot be read are reported with the reason; the files
+            // are read here, off the window's thread.
+            let unreadable = crate::state::unreadable_parts(&input.dir, &input.project, &input.parts);
+            let found = wc_report::check_with_unreadable(
                 &wc_report::Inputs {
                     project: &input.project,
                     symbols: &input.symbols,
                     parts: &input.parts,
                 },
                 &input.library,
+                &unreadable,
             );
             // The window may have moved on; then nobody waits for this.
             let _ = tx.send(found);
@@ -635,6 +647,82 @@ mod tests {
             live.status(&live.findings),
             "Check: not run, the check could not be started: no threads",
             "a failure is not shown as a clean result"
+        );
+    }
+
+    #[test]
+    fn a_part_copy_that_cannot_be_read_is_reported_with_the_reason() {
+        let (_dir, mut o) = coil_twice();
+        let tag = |t: &str| DeviceTag::parse(t).unwrap();
+        for (t, part) in [("-K1", "maker.contactor"), ("-K2", "maker.relay")] {
+            let device = wc_core::project::Device {
+                part: Some(part.into()),
+                ..Default::default()
+            };
+            o.project.devices.insert(tag(t), device);
+        }
+        // The contactor's copy is there but is not a part; the relay has no copy.
+        let path = wc_core::store::vendor_path(&o.dir, wc_core::lock::ItemKind::Part, "maker.contactor").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ not json").unwrap();
+        o.refresh_library();
+        o.touch();
+        let unreadable = |f: &[Finding]| {
+            f.iter()
+                .filter(|f| {
+                    f.message
+                        .starts_with("-K1: part maker.contactor in the project's library copy cannot be read: ")
+                        && !f.message.ends_with("cannot be read: ")
+                })
+                .count()
+        };
+        let missing = |f: &[Finding]| {
+            f.iter()
+                .filter(|f| f.message.contains("is missing from the project's library copy"))
+                .map(|f| f.message.clone())
+                .collect::<Vec<_>>()
+        };
+        let found = crate::run_check(&o);
+        assert_eq!(unreadable(&found), 1, "the Check dialog: {found:?}");
+        assert_eq!(
+            missing(&found),
+            ["-K2: part maker.relay is missing from the project's library copy"],
+            "only the part without a copy is missing"
+        );
+
+        let mut live = LiveCheck::default();
+        let mut now = Instant::now();
+        live.poll(&o, false, now);
+        now += SETTLE;
+        settle(&mut live, &o, &mut now);
+        assert_eq!(unreadable(&live.findings), 1, "{:?}", live.findings);
+        assert_eq!(
+            missing(&live.findings),
+            ["-K2: part maker.relay is missing from the project's library copy"]
+        );
+
+        // The copy is taken away and the library reloaded: the loaded parts stay the same
+        // (none), yet the reload checks again and the part is now missing.
+        std::fs::remove_file(&path).unwrap();
+        o.refresh_library();
+        checks_the_edit(&mut live, &o, &mut now);
+        assert_eq!(unreadable(&live.findings), 0, "{:?}", live.findings);
+        assert_eq!(
+            missing(&live.findings),
+            [
+                "-K1: part maker.contactor is missing from the project's library copy",
+                "-K2: part maker.relay is missing from the project's library copy",
+            ]
+        );
+
+        // And back: a copy that cannot be read turns up.
+        std::fs::write(&path, "{ not json").unwrap();
+        o.refresh_library();
+        checks_the_edit(&mut live, &o, &mut now);
+        assert_eq!(unreadable(&live.findings), 1, "{:?}", live.findings);
+        assert_eq!(
+            missing(&live.findings),
+            ["-K2: part maker.relay is missing from the project's library copy"]
         );
     }
 }

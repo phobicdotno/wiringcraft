@@ -222,8 +222,16 @@ fn resolve_typed(typed: &str, home: Option<&Path>, windows: bool, projects: &Pat
     Ok(if p.is_absolute() { p } else { projects.join(p) })
 }
 
+#[cfg(not(test))]
 fn path() -> Option<PathBuf> {
     config_dir().map(|d| d.join("prefs.toml"))
+}
+
+/// Tests never read or write the settings of the person running them: opening a project
+/// remembers it and saves the preferences.
+#[cfg(test)]
+fn path() -> Option<PathBuf> {
+    None
 }
 
 /// WiringCraft's own folder for Claude Code to start in. Never the project folder: a project
