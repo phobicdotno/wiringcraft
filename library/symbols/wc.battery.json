@@ -1,0 +1,116 @@
+{
+  "category": "power",
+  "description": "Battery or cell: the long plate is the positive side (+), the short plate the negative side (-).",
+  "graphics": [
+    {
+      "a": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 5.5
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": -4.0,
+        "y": 5.5
+      },
+      "b": {
+        "x": 4.0,
+        "y": 5.5
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": -2.0,
+        "y": 7.0
+      },
+      "b": {
+        "x": 2.0,
+        "y": 7.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": -4.0,
+        "y": 8.0
+      },
+      "b": {
+        "x": 4.0,
+        "y": 8.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": -2.0,
+        "y": 9.5
+      },
+      "b": {
+        "x": 2.0,
+        "y": 9.5
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 9.5
+      },
+      "b": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "kind": "line"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "+"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 14.4
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "-"
+    }
+  ],
+  "id": "wc.battery",
+  "letter_code": "G",
+  "name": "Battery",
+  "pins": [
+    {
+      "at": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "+"
+    },
+    {
+      "at": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "dir": "down",
+      "name": "-"
+    }
+  ],
+  "role": "standalone",
+  "tag_at": {
+    "x": -7.0,
+    "y": 8.0
+  }
+}
