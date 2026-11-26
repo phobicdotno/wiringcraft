@@ -888,6 +888,9 @@ fn the_starter_dc_motor_has_plus_and_minus_pins() -> Result<()> {
     assert_eq!(m.category, "drives");
     let names: Vec<_> = m.pins.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, ["+", "-"]);
+    // Origin at the + pin, - one 5 mm grid step to its right (as wc.rcd.2p).
+    assert_eq!((m.pins[0].at.x, m.pins[0].at.y), (0.0, 0.0));
+    assert_eq!((m.pins[1].at.x, m.pins[1].at.y), (5.0, 0.0));
     Ok(())
 }
 
@@ -911,6 +914,9 @@ fn the_starter_flow_switch_is_a_make_contact_tagged_b() -> Result<()> {
     assert_eq!(s.category, "sensors");
     let names: Vec<_> = s.pins.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, ["13", "14"]);
+    // On the 5 mm grid: 13 at the origin, 14 three grid steps below it.
+    assert_eq!((s.pins[0].at.x, s.pins[0].at.y), (0.0, 0.0));
+    assert_eq!((s.pins[1].at.x, s.pins[1].at.y), (0.0, 15.0));
     Ok(())
 }
 

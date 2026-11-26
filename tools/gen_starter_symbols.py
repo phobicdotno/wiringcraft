@@ -118,10 +118,11 @@ sym("wc.connector.plug", "Plug (male contact)", "terminals", "X", "standalone",
     desc="One contact of a plug-in connector, male side; the solid pin end at the top mates with a socket.")
 sym("wc.motor.dc", "DC motor", "drives", "M", "standalone",
     # Circle with M, the DC mark (a solid line over a dashed one) under it.
-    [line((-2.5, 0), (-2.5, 4.3)), line((2.5, 0), (2.5, 4.3)), circle((0, 9), 5), text((0, 10.3), "M", 3.5, "center"),
-     line((-1.5, 11.8), (1.5, 11.8)), line((-1.5, 12.8), (-0.8, 12.8)), line((-0.35, 12.8), (0.35, 12.8)),
-     line((0.8, 12.8), (1.5, 12.8))],
-    [pin("+", -2.5, 0, "up"), pin("-", 2.5, 0, "up")], tag_at=(-9, 9),
+    # Origin at the + pin, - one grid step to the right (as wc.rcd.2p), so both sit on the 5 mm grid.
+    [line((0, 0), (0, 4.3)), line((5, 0), (5, 4.3)), circle((2.5, 9), 5), text((2.5, 10.3), "M", 3.5, "center"),
+     line((1, 11.8), (4, 11.8)), line((1, 12.8), (1.7, 12.8)), line((2.15, 12.8), (2.85, 12.8)),
+     line((3.3, 12.8), (4, 12.8))],
+    [pin("+", 0, 0, "up"), pin("-", 5, 0, "up")], tag_at=(-6.5, 9),
     desc="DC motor (for example a 24 V DC drive, pump or actuator); + and - are the armature terminals.")
 sym("wc.switch.flow", "Flow switch, make", "sensors", "B", "standalone",
     # Make contact worked through the dashed link by a box with a flow arrow in it.
