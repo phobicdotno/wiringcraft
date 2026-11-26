@@ -207,7 +207,7 @@ enum Drag {
 impl Editor {
     /// Whether a select-tool drag (a move, a selection box, a logo or black box sizing drag)
     /// is going on, so Escape cancels it instead of doing what it does otherwise.
-    pub fn dragging(&self) -> bool {
+    pub fn select_dragging(&self) -> bool {
         self.tool == Tool::Select && self.drag.is_some()
     }
 
@@ -215,7 +215,7 @@ impl Editor {
     /// its next frame, #737), else drop the black box, shape or wire being drawn. Returns true
     /// when there was nothing to drop, and Escape goes back to the Select tool.
     pub fn escape(&mut self) -> bool {
-        if self.dragging() {
+        if self.select_dragging() {
             self.cancel_drag = true;
         } else if self.tool == Tool::BlackBox && self.black_box.is_some() {
             self.black_box = None;
@@ -297,6 +297,8 @@ impl Editor {
         self.drag = Some(Drag::Move {
             from: Point::new(0.0, 0.0),
             checkpoint: false,
+            page: String::new(),
+            step: 0,
         });
     }
 }
@@ -2577,6 +2579,7 @@ mod tests {
                 start: (from, from),
                 size: false,
                 checkpoint: true,
+                step: 0,
             }),
             ..Editor::default()
         };
@@ -4501,12 +4504,12 @@ mod tests {
         let steps = o.undo_steps();
         drag(&mut o, &mut ed, Point::new(-40.0, 0.0));
         assert_ne!(o.project.pages, before.pages);
-        assert!(ed.dragging());
+        assert!(ed.select_dragging());
         // Saved while the button is held: the file has the moved page.
         o.dirty = false;
         cancel_drag(&mut o, &mut ed);
         assert!(o.dirty, "the page put back is unsaved again");
-        assert!(!ed.dragging());
+        assert!(!ed.select_dragging());
         assert_eq!(o.project.pages, before.pages, "the move is taken back");
         assert_eq!(o.undo_steps(), steps, "and leaves no undo step behind");
         // The release that follows adds no wires.
@@ -4641,7 +4644,7 @@ mod tests {
     fn a_tool_change_ends_a_drag_so_escape_leaves_the_new_tool() {
         let (_tmp, mut o, mut ed, _) = moving_coil();
         drag(&mut o, &mut ed, Point::new(-40.0, 0.0));
-        assert!(ed.dragging());
+        assert!(ed.select_dragging());
         // W during the move, the button let go, a wire started, then Escape twice.
         ed.tool = Tool::Wire;
         end_drag_off_select(&mut ed);
