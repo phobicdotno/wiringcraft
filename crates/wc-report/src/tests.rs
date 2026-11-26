@@ -505,24 +505,36 @@ fn wires_on_an_overview_page_are_not_listed_twice() {
             core: "1".into(),
         });
     }
-    let counts = |p: &Project| {
+    let lists = |p: &Project| {
         let i = Inputs {
             project: p,
             symbols: &s,
             parts: &parts,
         };
-        (wire_list(&i).rows.len(), cable_list(&i).rows.len())
+        (wire_list(&i).rows, cable_list(&i).rows)
     };
-    let before = counts(&p);
+    let schematic = p.pages[0].number.clone();
+    let (wires, cables) = lists(&p);
+    // The baseline lists the schematic's cable core, so the checks below compare real rows.
+    assert_eq!(cables.len(), 1);
+    assert_eq!(cables[0][0], "-W1");
+    assert_eq!(cables[0][3], "1");
+    assert_eq!(cables[0][4], schematic);
     // The same schematic again, drawn on a line diagram.
     let mut overview = p.pages[0].clone();
     overview.id = "p9".into();
     overview.number = "9".into();
     overview.overview = true;
     p.pages.push(overview);
-    assert_eq!(counts(&p), before, "an overview page adds no rows");
+    let (same_wires, same_cables) = lists(&p);
+    assert_eq!(same_wires.len(), wires.len(), "an overview page adds no wire rows");
+    assert_eq!(same_cables, cables, "an overview page adds no cable rows");
     p.pages.last_mut().unwrap().overview = false;
-    assert!(counts(&p).0 > before.0, "a normal page does");
+    let (more_wires, more_cables) = lists(&p);
+    assert!(more_wires.len() > wires.len(), "a normal page does");
+    assert_eq!(more_cables.len(), cables.len() + 1, "one more core row");
+    assert_eq!(more_cables[0], cables[0]);
+    assert_eq!(more_cables[1][..5], ["", "", "", "1", "9"], "the copied page's core");
 }
 
 #[test]
