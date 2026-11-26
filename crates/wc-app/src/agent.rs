@@ -1053,8 +1053,6 @@ fn box_size_ok(width: f64, height: f64) -> Result<(), String> {
 /// The app as the assistant's toolbox.
 pub struct AppTools<'a>(pub &'a mut App);
 
-/// Whether tool `name` with input `v` changes the page its `page` field names (the shown page
-/// without one). Tools that only read, select, show or comment do not.
 /// The tools that change neither the project, its folder nor which project is open: the only
 /// ones run while an import runs.
 const READ_TOOLS: &[&str] = &[
@@ -1071,6 +1069,8 @@ const READ_TOOLS: &[&str] = &[
     "todo",
 ];
 
+/// Whether tool `name` with input `v` changes the page its `page` field names (the shown page
+/// without one). Tools that only read, select, show or comment do not.
 fn edits_page(name: &str, v: &Value) -> bool {
     match name {
         "place_symbol" | "add_wire" | "update_symbol" | "update_wire" | "add_graphic" | "update_graphic"

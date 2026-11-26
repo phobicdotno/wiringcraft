@@ -295,7 +295,11 @@ impl Job {
         for line in self.lines() {
             log.out(line);
         }
-        (Err("the import stopped without an answer".to_owned()), log)
+        // What it wrote before it stopped is still taken in (a project import as an undo step).
+        (
+            Err("the import stopped part way without an answer; what it wrote before that is kept".to_owned()),
+            log,
+        )
     }
 
     /// Take the ended import's result `r` and `log` into `open`: what it wrote to the project

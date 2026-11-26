@@ -38,8 +38,8 @@ Parts imports first ask for the library folder, like Import symbols: the project
 folders, or another folder picked with the folder picker. Where the picker cannot open (Linux
 without a desktop portal), the file and folder are typed into a dialog instead. The import runs
 off the window thread: a window shows what it has done so far, and until it ends the project
-cannot be edited, saved, shared or replaced by another one (the assistant can only read it).
-What it added comes in as one undo step. Messages that name a command line option are worded
+cannot be edited, saved, shared or replaced by another one (a running assistant turn may only
+use its reading tools, and no new turn starts). Messages that name a command line option are worded
 for the app.
 
 Changes not saved yet are saved first, the imported pages and devices come in as one undo step,
