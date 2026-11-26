@@ -6020,13 +6020,12 @@ fn panel_duct(
 }
 
 /// An error naming `what` when a `w` x `h` box with its top-left corner at `at` is not on the
-/// plate. A small tolerance lets a box typed flush with the plate's edge through.
+/// plate (see [`wc_core::panel::Panel::outline_fits`]).
 fn check_on_plate(panel: &wc_core::panel::Panel, what: &str, at: Point, w: f64, h: f64) -> Result<(), String> {
     if !(at.x.is_finite() && at.y.is_finite()) {
         return Err(format!("{what}: position must be finite"));
     }
-    let eps = 1e-9;
-    if at.x < -eps || at.y < -eps || at.x + w > panel.width + eps || at.y + h > panel.height + eps {
+    if !panel.outline_fits(at, w, h) {
         return Err(format!(
             "{what}: a {w} x {h} mm outline at {},{} is not on the {} x {} mm plate",
             at.x, at.y, panel.width, panel.height
