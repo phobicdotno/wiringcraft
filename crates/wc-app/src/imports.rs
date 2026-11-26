@@ -886,6 +886,16 @@ pub(crate) mod tests {
             };
             assert!(form.options().is_err(), "{bad:?}");
         }
+        // The largest first page number is taken, the next one refused here, in the dialog.
+        let at = |n: usize| Form {
+            first_page: n.to_string(),
+            ..Form::new(&open, Kind::Pdf, &file)
+        };
+        assert_eq!(
+            at(run::MAX_FIRST_PAGE).options().map(|o| o.first_page),
+            Ok(Some(run::MAX_FIRST_PAGE))
+        );
+        assert!(at(run::MAX_FIRST_PAGE + 1).options().is_err());
         // Keeping the source's numbers is the SolidWorks import's alone, and needs no number.
         let keep = |kind| Form {
             first_page: String::new(),
