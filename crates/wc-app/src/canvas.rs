@@ -168,14 +168,18 @@ impl Default for Editor {
 #[derive(Debug, Clone)]
 enum Drag {
     /// Moving the selection: the grab point (snapped, page mm) and whether the undo checkpoint
-    /// for this drag was taken. Escape (#737) needs the rest: the id of the page it moves on, and
-    /// the history count right after its checkpoint (any other count means a change was recorded
-    /// during the drag, a rotate say).
+    /// for this drag was taken. Escape (#737, #863) needs the rest: the id of the page it moves
+    /// on, the history count right after its checkpoint (any other count means a change was
+    /// recorded during the drag, a rotate say), that checkpoint's undo step, the items moved
+    /// (the selection when the drag began, not as it is later) and how far they moved in all.
     Move {
         from: Point,
         checkpoint: bool,
         page: String,
         step: u64,
+        id: u64,
+        items: Vec<Selection>,
+        offset: Point,
     },
     /// Drawing a selection box from this corner.
     Box { from: Point },
@@ -299,6 +303,9 @@ impl Editor {
             checkpoint: false,
             page: String::new(),
             step: 0,
+            id: 0,
+            items: Vec::new(),
+            offset: Point::new(0.0, 0.0),
         });
     }
 }
@@ -1521,25 +1528,30 @@ fn select_tool(
             checkpoint,
             page: on,
             step,
+            id,
+            items,
+            offset,
         }) if resp.dragged_by(egui::PointerButton::Primary) => {
             if let Some(cur) = ed.cursor {
                 // Move by whole snap steps so pins stay on the grid.
                 let target = snap(cur, snap_step);
                 if target != from {
-                    let step = if checkpoint {
-                        step
+                    let (step, id) = if checkpoint {
+                        (step, id)
                     } else {
                         open.checkpoint();
-                        open.history_count()
+                        (open.history_count(), open.last_step_id().unwrap_or(0))
                     };
                     let d = Point::new(target.x - from.x, target.y - from.y);
-                    let sel = ed.selection.clone();
-                    open.move_by(ed.page, &sel, d);
+                    open.move_by(ed.page, &items, d);
                     ed.drag = Some(Drag::Move {
                         from: target,
                         checkpoint: true,
                         page: on,
                         step,
+                        id,
+                        items,
+                        offset: offset + d,
                     });
                 }
             }
@@ -1742,6 +1754,9 @@ fn drag_start(
                 checkpoint: false,
                 page: page.id.clone(),
                 step: 0,
+                id: 0,
+                items: ed.selection.clone(),
+                offset: Point::new(0.0, 0.0),
             }
         }
         (_, None) => Drag::Box { from: at },
@@ -1834,11 +1849,12 @@ fn stop_if_held(ed: &mut Editor, held: bool) {
 /// Escape during a select-tool drag (#737): a move puts the page it began on back as it was
 /// when the drag started, and a logo drag puts the logo back; the drag's undo checkpoint is
 /// dropped, so it is as if the drag never happened. When another change was recorded since that
-/// checkpoint (a rotate during the move, an Undo), the drag is only ended: what was done stays,
-/// with its undo steps, so Undo takes it back in order and no snapshot is left out of step. A
-/// black box sizing drag (which only changes the box on release) and a selection box are just
-/// dropped. The drag ends, so the release that follows does nothing (no wiring of pins that line
-/// up).
+/// checkpoint (a rotate during the move, #863), only the move is taken back: the moved items go
+/// back to where they started and keep what was done to them, and the undo and redo steps
+/// recorded since get the start position too, so Undo then takes back the rotate alone. Once the
+/// move itself was undone during the drag, the drag is only ended. A black box sizing drag
+/// (which only changes the box on release) and a selection box are just dropped. The drag ends,
+/// so the release that follows does nothing (no wiring of pins that line up).
 fn cancel_drag(open: &mut Open, ed: &mut Editor) {
     match ed.drag.take() {
         Some(Drag::Move {
@@ -1870,6 +1886,16 @@ fn cancel_drag(open: &mut Open, ed: &mut Editor) {
                 // A save while the button was held wrote the moved page: this is unsaved again.
                 open.edited();
             }
+        }
+        Some(Drag::Move {
+            checkpoint: true,
+            page,
+            id,
+            items,
+            offset,
+            ..
+        }) if offset != Point::new(0.0, 0.0) => {
+            open.take_back_move(id, &page, &items, offset);
         }
         Some(Drag::Logo {
             checkpoint: true, step, ..
@@ -4399,6 +4425,9 @@ mod tests {
             checkpoint: true,
             page: o.project.pages[ed.page].id.clone(),
             step: o.history_count(),
+            id: o.last_step_id().unwrap_or(0),
+            items: ed.selection.clone(),
+            offset: d,
         });
     }
 
@@ -4631,25 +4660,68 @@ mod tests {
     }
 
     #[test]
-    fn escape_after_a_rotate_during_a_move_ends_the_drag_and_undo_takes_both_back() {
+    fn escape_after_a_rotate_during_a_move_puts_the_items_back_turned() {
         let (_tmp, mut o, mut ed, coil) = moving_coil();
         let page = ed.page;
         let at = |o: &Open| o.project.pages[page].symbol(&coil).map(|s| (s.at, s.rotation));
         let Some((start, r0)) = at(&o) else { unreachable!() };
+        let steps = o.undo_steps();
         drag(&mut o, &mut ed, Point::new(-40.0, 0.0));
-        let Some((moved, _)) = at(&o) else { unreachable!() };
+        o.rotate_many(page, &ed.selection.clone());
+        let Some((moved, turned)) = at(&o) else { unreachable!() };
+        assert_ne!(moved, start);
+        assert_ne!(turned, r0);
+        o.dirty = false;
+        cancel_drag(&mut o, &mut ed);
+        assert!(ed.drag.is_none());
+        assert!(o.dirty, "unsaved again");
+        assert_eq!(at(&o), Some((start, turned)), "back at the start, still turned");
+        assert_eq!(o.undo_steps(), steps + 1, "only the rotate's undo step is left");
+        assert!(o.undo());
+        assert_eq!(at(&o), Some((start, r0)), "Undo takes back only the rotate");
+        assert_eq!(o.undo_steps(), steps);
+        assert!(o.redo());
+        assert_eq!(at(&o), Some((start, turned)), "Redo turns it again at the start");
+        // The release that follows adds no wires.
+        drag_released(&mut o, &mut ed, false);
+        assert!(o.project.pages[page].wires.is_empty());
+    }
+
+    #[test]
+    fn escape_after_a_rotate_and_its_undo_during_a_move_keeps_the_rotate_for_redo() {
+        let (_tmp, mut o, mut ed, coil) = moving_coil();
+        let page = ed.page;
+        let at = |o: &Open| o.project.pages[page].symbol(&coil).map(|s| (s.at, s.rotation));
+        let Some((start, r0)) = at(&o) else { unreachable!() };
+        let steps = o.undo_steps();
+        drag(&mut o, &mut ed, Point::new(-40.0, 0.0));
         o.rotate_many(page, &ed.selection.clone());
         let Some((_, turned)) = at(&o) else { unreachable!() };
-        assert_ne!(turned, r0);
+        assert!(o.undo(), "the rotate is undone, the move is not");
+        cancel_drag(&mut o, &mut ed);
+        assert_eq!(at(&o), Some((start, r0)), "the move is taken back");
+        assert_eq!(o.undo_steps(), steps, "with its undo step");
+        assert!(o.redo());
+        assert_eq!(at(&o), Some((start, turned)), "Redo turns it at the start");
+    }
+
+    #[test]
+    fn escape_after_the_move_was_undone_and_a_rotate_made_only_ends_the_drag() {
+        let (_tmp, mut o, mut ed, coil) = moving_coil();
+        let page = ed.page;
+        let at = |o: &Open| o.project.pages[page].symbol(&coil).map(|s| (s.at, s.rotation));
+        let Some((start, _)) = at(&o) else { unreachable!() };
+        drag(&mut o, &mut ed, Point::new(-40.0, 0.0));
+        assert!(o.undo(), "the move is undone");
+        // The rotate's checkpoint takes the place the move's step had in the history.
+        o.rotate_many(page, &ed.selection.clone());
+        let now = at(&o);
         let steps = o.undo_steps();
         cancel_drag(&mut o, &mut ed);
         assert!(ed.drag.is_none());
-        assert_eq!(at(&o), Some((moved, turned)), "the drag only ends");
-        assert_eq!(o.undo_steps(), steps, "both changes keep their undo steps");
-        assert!(o.undo());
-        assert_eq!(at(&o), Some((moved, r0)), "Undo takes back the rotate");
-        assert!(o.undo());
-        assert_eq!(at(&o), Some((start, r0)), "and then the move");
+        assert_eq!(at(&o), now, "nothing moves");
+        assert_eq!(now.map(|(p, _)| p), Some(start));
+        assert_eq!(o.undo_steps(), steps, "the rotate keeps its undo step");
     }
 
     #[test]
@@ -4739,6 +4811,9 @@ mod tests {
             checkpoint: false,
             page: o.project.pages[ed.page].id.clone(),
             step: 0,
+            id: 0,
+            items: ed.selection.clone(),
+            offset: Point::new(0.0, 0.0),
         });
         cancel_drag(&mut o, &mut ed);
         assert!(ed.drag.is_none());

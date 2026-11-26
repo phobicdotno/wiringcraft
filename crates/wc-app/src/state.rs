@@ -195,13 +195,21 @@ struct Kept {
 struct Step {
     project: Project,
     files: Vec<FileEdit>,
+    /// Tells this step apart from every other, for finding it again (see
+    /// [`Open::take_back_move`]). A step moved between Undo and Redo gets a new one.
+    id: u64,
 }
 
 impl Step {
     fn of(project: Project) -> Step {
+        Step::with_files(project, Vec::new())
+    }
+
+    fn with_files(project: Project, files: Vec<FileEdit>) -> Step {
         Step {
             project,
-            files: Vec::new(),
+            files,
+            id: next_revision(),
         }
     }
 }
@@ -1256,6 +1264,41 @@ impl Open {
         self.undo.last().map(|s| &s.project)
     }
 
+    /// The id of the latest undo step: right after a [`Open::checkpoint`], the step it took.
+    pub fn last_step_id(&self) -> Option<u64> {
+        self.undo.last().map(|s| s.id)
+    }
+
+    /// Take back a move of `items` by `d` on page `page` whose checkpoint is the undo step `id`,
+    /// keeping the changes recorded after it (a rotate during the move, #863): the items go back
+    /// by `d` now and in every later undo and redo step, and the move's own step is dropped, so
+    /// Undo and Redo then work as if the changes after it were made at the start position.
+    /// Returns false, changing nothing, when that step is no longer in the history (the move
+    /// was undone, or trimmed off the oldest end) or carries file edits a move never makes.
+    pub fn take_back_move(&mut self, id: u64, page: &str, items: &[Selection], d: Point) -> bool {
+        let Some(at) = self.undo.iter().position(|s| s.id == id) else {
+            return false;
+        };
+        if !self.undo[at].files.is_empty() {
+            return false;
+        }
+        let back = Point::new(-d.x, -d.y);
+        let undo = self.undo[at + 1..].iter_mut();
+        for p in undo
+            .chain(self.redo.iter_mut())
+            .map(|s| &mut s.project)
+            .chain(std::iter::once(&mut self.project))
+        {
+            if let Some(p) = p.page_mut(page) {
+                crate::edit::move_items(p, items, back);
+            }
+        }
+        self.undo.remove(at);
+        self.history += 1;
+        self.edited();
+        true
+    }
+
     /// Forget the latest undo step, once its change was taken back another way.
     pub fn forget_last_change(&mut self) {
         if self.undo.pop().is_some() {
@@ -1398,11 +1441,9 @@ impl Open {
                     }
                 };
                 self.forget_terminal_change();
-                let Step { project, files } = prev;
-                self.redo.push(Step {
-                    project: std::mem::replace(&mut self.project, project),
-                    files,
-                });
+                let Step { project, files, .. } = prev;
+                self.redo
+                    .push(Step::with_files(std::mem::replace(&mut self.project, project), files));
                 let left = self
                     .redo
                     .last()
@@ -1422,10 +1463,7 @@ impl Open {
                         };
                         let restored = std::mem::replace(&mut self.project, cur.project);
                         self.undo_error = Some(e);
-                        self.undo.push(Step {
-                            project: restored,
-                            files: cur.files,
-                        });
+                        self.undo.push(Step::with_files(restored, cur.files));
                     }
                     return false;
                 }
@@ -1455,11 +1493,9 @@ impl Open {
                     }
                 };
                 self.forget_terminal_change();
-                let Step { project, files } = next;
-                self.undo.push(Step {
-                    project: std::mem::replace(&mut self.project, project),
-                    files,
-                });
+                let Step { project, files, .. } = next;
+                self.undo
+                    .push(Step::with_files(std::mem::replace(&mut self.project, project), files));
                 let left = self
                     .undo
                     .last()
@@ -1478,10 +1514,7 @@ impl Open {
                         };
                         let restored = std::mem::replace(&mut self.project, cur.project);
                         self.undo_error = Some(e);
-                        self.redo.push(Step {
-                            project: restored,
-                            files: cur.files,
-                        });
+                        self.redo.push(Step::with_files(restored, cur.files));
                     }
                     return false;
                 }
