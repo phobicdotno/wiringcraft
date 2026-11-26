@@ -597,26 +597,43 @@ fn shapes(
                 if let Some((name, inner)) = e.get(2).and_then(|n| d.block(n)) {
                     // The block's base point goes on the insertion point.
                     let (bx, by) = d.bases.get(name).copied().unwrap_or_default();
-                    let ixf = Xf::shift((-bx, -by))
-                        .then(&Xf::insert(
-                            (e.f(10), e.f(20)),
-                            e.f_or(41, 1.0),
-                            e.f_or(42, 1.0),
-                            e.f(50),
-                        ))
-                        .then(&xf);
-                    shapes(
-                        d,
-                        inner,
-                        ixf,
-                        scale,
-                        depth + 1,
-                        skip_layer,
-                        out,
-                        points,
-                        skipped,
-                        budget,
-                    );
+                    // An array (MINSERT): one copy per column and row, the spacings along the
+                    // block's own turned axes (not scaled), as AutoCAD draws it.
+                    let count = |code: i32| e.f_or(code, 1.0).clamp(1.0, f64::from(u32::MAX)) as usize;
+                    let (cols, rows) = (count(70), count(71));
+                    let (dx, dy) = (e.f(44), e.f(45));
+                    let rot = e.f(50);
+                    let (s, c) = rot.to_radians().sin_cos();
+                    let cells = cols.saturating_mul(rows);
+                    for cell in 0..cells {
+                        if *budget == 0 {
+                            // The copies not drawn are counted like the entities in them.
+                            *skipped.entry(OVER_LIMIT.to_owned()).or_default() +=
+                                (cells - cell).saturating_mul(inner.len());
+                            break;
+                        }
+                        let (col, row) = ((cell % cols) as f64 * dx, (cell / cols) as f64 * dy);
+                        let at = (e.f(10) + c * col - s * row, e.f(20) + s * col + c * row);
+                        let ixf = Xf::shift((-bx, -by))
+                            .then(&Xf::insert(at, e.f_or(41, 1.0), e.f_or(42, 1.0), rot))
+                            .then(&xf);
+                        shapes(
+                            d,
+                            inner,
+                            ixf,
+                            scale,
+                            depth + 1,
+                            skip_layer,
+                            out,
+                            points,
+                            skipped,
+                            budget,
+                        );
+                        if inner.is_empty() {
+                            // An empty block draws nothing however many copies it has.
+                            break;
+                        }
+                    }
                 }
                 None
             }
@@ -2909,6 +2926,51 @@ mod tests {
         );
         let (g, _) = drawn("0\nINSERT\n2\nB\n10\n0\n20\n0\n", blocks)?;
         assert!(matches!(&g[..], [Shape::Text { angle, .. }] if *angle == 0.0), "{g:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_arrayed_insert_draws_every_copy() -> Result<()> {
+        let blocks = "0\nBLOCK\n2\nB\n10\n0\n20\n0\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n0\nENDBLK\n";
+        let starts = |g: &[Shape]| -> Vec<(f64, f64)> {
+            g.iter()
+                .filter_map(|s| match s {
+                    Shape::Line { a, .. } => Some((a.x, a.y)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let near = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9;
+        // 3 columns 10 apart, 2 rows 5 apart (y flipped on the page).
+        let (g, _) = drawn("0\nINSERT\n2\nB\n10\n1\n20\n2\n70\n3\n71\n2\n44\n10\n45\n5\n", blocks)?;
+        let want = [
+            (1.0, -2.0),
+            (11.0, -2.0),
+            (21.0, -2.0),
+            (1.0, -7.0),
+            (11.0, -7.0),
+            (21.0, -7.0),
+        ];
+        let got = starts(&g);
+        assert_eq!(got.len(), 6, "{g:?}");
+        for w in want {
+            assert!(got.iter().any(|p| near(*p, w)), "{w:?} not in {got:?}");
+        }
+        // Turned by 90 degrees: the columns run up, the rows run left; the spacing is not scaled.
+        let turned = "0\nINSERT\n2\nB\n10\n0\n20\n0\n41\n2\n42\n2\n50\n90\n70\n2\n71\n2\n44\n10\n45\n5\n";
+        let (g, _) = drawn(turned, blocks)?;
+        let got = starts(&g);
+        assert_eq!(got.len(), 4, "{g:?}");
+        for w in [(0.0, 0.0), (0.0, -10.0), (-5.0, 0.0), (-5.0, -10.0)] {
+            assert!(got.iter().any(|p| near(*p, w)), "{w:?} not in {got:?}");
+        }
+        // A huge array stops at the budget and counts the copies left out.
+        let d = parse(&dxf("0\nINSERT\n2\nB\n70\n30000\n71\n30000\n44\n1\n", blocks))?;
+        let mut skipped = BTreeMap::new();
+        let mut budget = 10;
+        let (shapes, _) = draw(&d, &d.entities, &mut skipped, &mut budget);
+        assert_eq!(shapes.len(), 9);
+        assert_eq!(skipped.get(OVER_LIMIT), Some(&(30_000 * 30_000 - 9)), "{skipped:?}");
         Ok(())
     }
 
