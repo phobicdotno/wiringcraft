@@ -1951,15 +1951,14 @@ impl App {
             ] {
                 // + often needs Shift, so the zoom-in keys also count with Shift held.
                 // Shift and nothing else: `shift_only` does not look at the Mac's Ctrl key.
-                let m = i.modifiers;
-                let shift_ok =
-                    matches!(k, Key::Plus | Key::Equals) && m.shift && !(m.ctrl || m.alt || m.command || m.mac_cmd);
-                if i.key_pressed(k) && (i.modifiers.is_none() || shift_ok) {
+                let zoom_in = matches!(k, Key::Plus | Key::Equals);
+                let ok =
+                    |m: &Modifiers| m.is_none() || (zoom_in && m.shift && !(m.ctrl || m.alt || m.command || m.mac_cmd));
+                if pressed_with(i, k, ok) {
                     out.push(a);
                 }
             }
-            if i.key_pressed(Key::Enter)
-                && i.modifiers.is_none()
+            if pressed_with(i, Key::Enter, Modifiers::is_none)
                 && matches!(self.ed.tool, Tool::Polyline | Tool::BlackBox)
             {
                 self.ed.finish_shape = true;
@@ -4769,6 +4768,15 @@ fn ctrl_shortcuts(ctx: &egui::Context, dialog_open: bool) -> Vec<Action> {
         }
     });
     out
+}
+
+/// Whether `key` was pressed this frame with modifiers that `ok` accepts. It looks at the
+/// modifiers held at the press itself: the frame's modifiers can differ, as when Ctrl is let go
+/// before the frame runs, and Ctrl+R must not then rotate.
+fn pressed_with(i: &egui::InputState, key: Key, ok: impl Fn(&Modifiers) -> bool) -> bool {
+    i.events
+        .iter()
+        .any(|e| matches!(e, egui::Event::Key { key: k, pressed: true, modifiers, .. } if *k == key && ok(modifiers)))
 }
 
 fn form_fields(block: &std::collections::BTreeMap<String, String>) -> Vec<(String, String)> {
