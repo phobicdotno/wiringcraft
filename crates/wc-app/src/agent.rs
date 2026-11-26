@@ -3578,8 +3578,13 @@ fn writes_while_held(args: &[String], dir: &Path, held: &BTreeMap<String, String
     let project = Guarded::new(dir);
     // Run from inside the project folder, even a bare file name could land on a held page: only
     // a command with nothing after its own words (`check`, `page list`) runs there.
+    // `report-layout show <kind>` names a report, not a file: a word of the command too.
+    let layout_kind = arg(0) == Some("report-layout")
+        && arg(1) == Some("show")
+        && arg(2).is_some_and(|k| wc_report::Kind::parse(k).is_some());
     let words = match arg(0) {
         Some("vcs") => 2,
+        _ if layout_kind => 3,
         _ if matches!(arg(1), Some("list" | "show")) => 2,
         _ => 1,
     };
@@ -3592,7 +3597,7 @@ fn writes_while_held(args: &[String], dir: &Path, held: &BTreeMap<String, String
             args.join(" ")
         ));
     }
-    for a in args {
+    for a in args.iter().skip(if layout_kind { 3 } else { 0 }) {
         let why = match project.reached_by(cwd, split_flag(a).1) {
             Ok(false) => continue,
             Ok(true) => "is in the project folder or links to a file in it".to_owned(),
@@ -8542,6 +8547,8 @@ mod tests {
             vec!["page", "list"],
             vec!["vcs", "log"],
             vec!["find", "-K1"],
+            vec!["report-layout", "show"],
+            vec!["report-layout", "show", "devices"],
         ] {
             let args: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
             assert!(
@@ -8549,6 +8556,9 @@ mod tests {
                 "{args:?}"
             );
         }
+        // A word that is not a report could be a file.
+        let unknown: Vec<String> = ["report-layout", "show", "out.json"].map(String::from).to_vec();
+        assert!(writes_while_held(&unknown, &dir, &held, &dir.join("pages")).is_some());
         assert!(writes_while_held(&args, &dir, &held, out.path()).is_none());
         // An export writes its own file names into the folder it is given: a file there that
         // links to a held page, by name or as the same file, is a way onto the page.
