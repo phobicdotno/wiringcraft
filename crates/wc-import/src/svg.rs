@@ -103,10 +103,78 @@ fn num(e: &BytesStart, name: &str) -> f64 {
 }
 
 /// Path data to polylines. Curves and elliptical arcs are flattened into short straight segments.
+/// The arguments of an arc command: groups of seven, whose fourth and fifth (the large-arc and
+/// sweep flags) are one `0` or `1` each and may run into the next argument without a separator
+/// (`0110 20` is the flags 0 and 1 and the end x 10). Reading stops at the first argument that is
+/// not well formed, as SVG stops drawing a path at an error.
+fn arc_numbers(s: &str) -> Vec<f64> {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    loop {
+        while i < b.len() && (b[i].is_ascii_whitespace() || b[i] == b',') {
+            i += 1;
+        }
+        if i >= b.len() {
+            break;
+        }
+        if matches!(out.len() % 7, 3 | 4) {
+            match b[i] {
+                b'0' => out.push(0.0),
+                b'1' => out.push(1.0),
+                _ => break,
+            }
+            i += 1;
+            continue;
+        }
+        let start = i;
+        if matches!(b[i], b'+' | b'-') {
+            i += 1;
+        }
+        let digits = |i: &mut usize| {
+            let from = *i;
+            while *i < b.len() && b[*i].is_ascii_digit() {
+                *i += 1;
+            }
+            *i > from
+        };
+        let whole = digits(&mut i);
+        let fraction = i < b.len() && b[i] == b'.' && {
+            i += 1;
+            digits(&mut i)
+        };
+        if !whole && !fraction {
+            break;
+        }
+        if i < b.len() && matches!(b[i], b'e' | b'E') {
+            let mark = i;
+            i += 1;
+            if i < b.len() && matches!(b[i], b'+' | b'-') {
+                i += 1;
+            }
+            if !digits(&mut i) {
+                i = mark;
+            }
+        }
+        match s[start..i].parse::<f64>() {
+            Ok(v) if v.is_finite() => out.push(v),
+            _ => break,
+        }
+    }
+    out
+}
+
 fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
     let mut out: Vec<(Vec<Point>, bool)> = Vec::new();
     let mut cur: Vec<Point> = Vec::new();
     let (mut x, mut y, mut sx, mut sy) = (0.0, 0.0, 0.0, 0.0);
+    let args = |cmd: char, buf: &str| {
+        if cmd.eq_ignore_ascii_case(&'A') {
+            arc_numbers(buf)
+        } else {
+            numbers(buf)
+        }
+    };
     // Tokenise into (command, numbers).
     let mut cmds: Vec<(char, Vec<f64>)> = Vec::new();
     let mut buf = String::new();
@@ -114,7 +182,7 @@ fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
     for c in d.chars() {
         if c.is_ascii_alphabetic() && c != 'e' && c != 'E' {
             if cmd != ' ' {
-                cmds.push((cmd, numbers(&buf)));
+                cmds.push((cmd, args(cmd, &buf)));
             }
             cmd = c;
             buf.clear();
@@ -123,7 +191,7 @@ fn path(d: &str, m: &M) -> Vec<(Vec<Point>, bool)> {
         }
     }
     if cmd != ' ' {
-        cmds.push((cmd, numbers(&buf)));
+        cmds.push((cmd, args(cmd, &buf)));
     }
     let flush = |cur: &mut Vec<Point>, out: &mut Vec<(Vec<Point>, bool)>, closed: bool| {
         if cur.len() >= 2 {
@@ -597,6 +665,25 @@ mod tests {
         // Without a curve before it, `T` and `S` take the current point as their control.
         let pts = one_line("M 0 0 L 1 0 T 11 0");
         assert!(pts.iter().all(|p| p.y.abs() < 1e-9));
+    }
+
+    #[test]
+    fn arc_flags_may_run_into_the_next_number() {
+        // Flags 0 and 1, then the end point (10, 20); the line goes on from there.
+        let pts = one_line("M 0 0 A 10 10 0 0110 20 L 30 20");
+        let Some(end) = pts.iter().position(|p| near(*p, Point::new(10.0, 20.0))) else {
+            unreachable!("the arc ends on (10, 20): {pts:?}");
+        };
+        assert!(end > 1, "the arc is flattened");
+        assert_eq!(pts[end + 1..], [Point::new(30.0, 20.0)]);
+        assert_eq!(
+            arc_numbers("10,10 0 1,0-5.5.5 1 1 0 0 1 1e1 1e+1"),
+            vec![
+                10.0, 10.0, 0.0, 1.0, 0.0, -5.5, 0.5, 1.0, 1.0, 0.0, 0.0, 1.0, 10.0, 10.0
+            ]
+        );
+        // A flag that is not 0 or 1 ends the arguments.
+        assert_eq!(arc_numbers("5 5 0 2 1 10 0"), vec![5.0, 5.0, 0.0]);
     }
 
     #[test]
