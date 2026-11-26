@@ -9486,7 +9486,19 @@ mod tests {
         assert_eq!(stopped, Err(STOPPED.to_owned()));
         // The journal holds the project files and the symbol, each with its bytes before.
         let left = std::fs::read(dir.join(BOX_EDIT_JOURNAL)).unwrap();
-        assert_eq!(parse_journal(&dir, &left), Some(before.clone()));
+        // Compared by each file's name in the project: the black box symbol files the save may
+        // remove come with their folder resolved (on Windows a `\\?\` path, long names).
+        let named = |files: &run::Written| {
+            files
+                .iter()
+                .map(|(path, bytes)| (journal_name(&dir, path), bytes.clone()))
+                .collect::<Vec<_>>()
+        };
+        let Some(left) = parse_journal(&dir, &left) else {
+            unreachable!("the journal left behind reads")
+        };
+        assert_eq!(named(&left), named(&before));
+        assert!(named(&left).iter().all(|(name, _)| name.is_some()));
         assert_ne!(std::fs::read(&symbol_path).ok(), before.last().unwrap().1);
 
         let other = tmp.path().join("other");
