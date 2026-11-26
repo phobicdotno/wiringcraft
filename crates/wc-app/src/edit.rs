@@ -726,13 +726,9 @@ impl Open {
         let Some(p) = self.project.pages.get_mut(page) else {
             return;
         };
-        p.symbols.retain(|s| !syms.contains(s.id.as_str()));
-        p.wires.retain(|w| {
-            !wires.contains(w.id.as_str())
-                && ![&w.from, &w.to]
-                    .iter()
-                    .any(|e| pin_item(e).is_some_and(|i| syms.contains(i)))
-        });
+        let syms: Vec<&str> = syms.into_iter().collect();
+        let wires: Vec<&str> = wires.into_iter().collect();
+        p.remove_symbols_and_wires(&syms, &wires);
         let gone = graphic_ids(sel);
         let mut i = 0;
         p.graphics.retain(|_| {

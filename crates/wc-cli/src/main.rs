@@ -1620,24 +1620,13 @@ fn delete_items(page: &mut Page, ids: &[String]) -> Res<Vec<String>> {
     if !missing.is_empty() {
         return Err(format!("no symbol or wire {} on page {}", missing.join(", "), page.id));
     }
-    let named = |id: &str| ids.iter().any(|x| x == id);
-    let on_deleted =
-        |end: &Endpoint| matches!(end, Endpoint::Pin { item, .. } if page.symbol(item).is_some() && named(item));
-    let gone_wires: Vec<String> = page
-        .wires
+    let symbols: Vec<&str> = ids
         .iter()
-        .filter(|w| named(&w.id) || on_deleted(&w.from) || on_deleted(&w.to))
-        .map(|w| w.id.clone())
+        .map(String::as_str)
+        .filter(|id| page.symbol(id).is_some())
         .collect();
-    let gone_symbols: Vec<String> = page
-        .symbols
-        .iter()
-        .filter(|s| named(&s.id))
-        .map(|s| s.id.clone())
-        .collect();
-    page.symbols.retain(|s| !gone_symbols.contains(&s.id));
-    page.wires.retain(|w| !gone_wires.contains(&w.id));
-    Ok(gone_symbols.into_iter().chain(gone_wires).collect())
+    let wires: Vec<&str> = ids.iter().map(String::as_str).collect();
+    Ok(page.remove_symbols_and_wires(&symbols, &wires))
 }
 
 /// A wire end from `item:pin` or `x,y`. A pin must be one the placed symbol has (its
