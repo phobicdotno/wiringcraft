@@ -597,6 +597,11 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
     let layers = ed.layers.clone();
     ed.selection.retain(|s| layers.may_select(s));
     let finish = std::mem::take(&mut ed.finish_shape);
+    // The turn for the symbol on the pointer belongs to the place tool: another tool sets it
+    // back, also while a panel is shown.
+    if ed.tool != Tool::Place {
+        ed.place_turn = (Rotation::R0, false);
+    }
     if let Some(panel) = ed.panel {
         crate::panel_view::show(ui, open, ed, panel, snap_step);
         return;
@@ -1046,9 +1051,6 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
     ed.cursor = hover.map(|p| snap(p, snap_step));
     let tol = (6.0 / f64::from(xf.zoom)).max(0.8);
 
-    if ed.tool != Tool::Place {
-        ed.place_turn = (Rotation::R0, false);
-    }
     match ed.tool {
         Tool::Select => select_tool(&painter, &resp, open, ed, &page, &xf, tol, snap_step, held),
         Tool::Place => place_tool(&painter, &resp, open, ed, &xf, &t),
@@ -2154,13 +2156,25 @@ pub fn turn_place(ed: &mut Editor, mirror: bool) {
     } else {
         *rotation = Rotation::from_degrees(rotation.degrees() + 90).unwrap_or_default();
     }
-    let turn = match (rotation.degrees(), *mirrored) {
-        (0, false) => "Not turned".to_owned(),
-        (0, true) => "Mirrored".to_owned(),
-        (d, false) => format!("Turned {d}°"),
-        (d, true) => format!("Turned {d}° and mirrored"),
-    };
+    let turn = turn_words(*rotation, *mirrored).unwrap_or_else(|| "not turned".into());
+    let mut first = turn.chars();
+    let turn: String = first
+        .next()
+        .map(|c| c.to_ascii_uppercase())
+        .into_iter()
+        .chain(first)
+        .collect();
     ed.message = format!("{turn}, R turns again, M mirrors.");
+}
+
+/// How a turn reads in a status message ("turned 90° and mirrored"); `None` when not turned.
+fn turn_words(rotation: Rotation, mirrored: bool) -> Option<String> {
+    match (rotation.degrees(), mirrored) {
+        (0, false) => None,
+        (0, true) => Some("mirrored".into()),
+        (d, false) => Some(format!("turned {d}°")),
+        (d, true) => Some(format!("turned {d}° and mirrored")),
+    }
 }
 
 fn place_tool(
@@ -2205,7 +2219,10 @@ fn place_tool(
                     std::iter::once(sid.clone()).collect(),
                 );
                 ed.select_only(Selection::Symbol(sid));
-                ed.message = format!("Placed {id}.{}", wired_note(wired));
+                let turn = turn_words(rotation, mirror)
+                    .map(|w| format!(", {w}. The next ones are too until you change it with R or M"))
+                    .unwrap_or_default();
+                ed.message = format!("Placed {id}{turn}.{}", wired_note(wired));
             }
             Err(e) => ed.message = format!("Could not place {id}: {e}"),
         }
@@ -2490,6 +2507,14 @@ mod tests {
         };
         click_at(&ctx, &mut open, &mut ed, egui::pos2(400.0, 300.0), 1.0);
         assert_eq!(steps(&open), [(Rotation::R180, true)]);
+        // The status says the turn is still on for the next symbol.
+        assert!(
+            ed.message.starts_with(
+                "Placed wc.coil, turned 180° and mirrored. The next ones are too until you change it with R or M."
+            ),
+            "{}",
+            ed.message
+        );
         // One undo step takes the placed symbol back off.
         assert!(open.undo());
         assert!(open.project.pages[0].symbols.is_empty());
@@ -2501,6 +2526,13 @@ mod tests {
         // Another tool sets it back.
         ed.tool = Tool::Select;
         painted(&ctx, &mut open, &mut ed, 4.0, vec![]);
+        assert_eq!(ed.place_turn, (Rotation::R0, false));
+        // Also while a panel is shown: the panel view returns early, the reset still runs.
+        ed.tool = Tool::Place;
+        turn_place(&mut ed, false);
+        ed.tool = Tool::Select;
+        ed.panel = Some(0);
+        painted(&ctx, &mut open, &mut ed, 5.0, vec![]);
         assert_eq!(ed.place_turn, (Rotation::R0, false));
     }
 
