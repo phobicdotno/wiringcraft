@@ -9,13 +9,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
+use wc_core::lock::{ItemKind, LockEntry, Lockfile};
 use wc_core::panel::Panel;
 use wc_core::{Comment, Device, DeviceTag, Page, Project, ProjectMeta};
 
 use crate::PeerId;
 
 /// Some parts of a project. A key with `None` means "not there" (a page or device that did
-/// not exist). Comments are kept per page: every comment on that page.
+/// not exist). Comments are kept per page: every comment on that page. Lock entries of
+/// symbols and parts are kept by id (`None`: the project did not lock it), so taking back a
+/// change that added an item takes its lock entry back too; the vendored file stays.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Parts {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -28,6 +31,21 @@ pub struct Parts {
     pub panels: BTreeMap<String, Option<Panel>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub comments: BTreeMap<String, Vec<Comment>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub lock_symbols: BTreeMap<String, Option<LockEntry>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub lock_parts: BTreeMap<String, Option<LockEntry>>,
+}
+
+/// The version (lock hash) of each symbol and part that some [`Parts`] use, by kind and id:
+/// the versions their pages, devices and jumpers were drawn with.
+pub type Uses = BTreeMap<(ItemKind, String), String>;
+
+fn kind_name(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::Symbol => "symbol",
+        ItemKind::Part => "part",
+    }
 }
 
 fn comments_on(project: &Project, page: &str) -> Vec<Comment> {
@@ -41,10 +59,26 @@ impl Parts {
             && self.devices.is_empty()
             && self.panels.is_empty()
             && self.comments.is_empty()
+            && self.lock_symbols.is_empty()
+            && self.lock_parts.is_empty()
+    }
+
+    /// The lock entries of one kind of item.
+    pub fn lock(&self, kind: ItemKind) -> &BTreeMap<String, Option<LockEntry>> {
+        match kind {
+            ItemKind::Symbol => &self.lock_symbols,
+            ItemKind::Part => &self.lock_parts,
+        }
+    }
+
+    fn lock_mut(&mut self, kind: ItemKind) -> &mut BTreeMap<String, Option<LockEntry>> {
+        match kind {
+            ItemKind::Symbol => &mut self.lock_symbols,
+            ItemKind::Part => &mut self.lock_parts,
+        }
     }
 
     /// What differs between two versions of a project: `(before, after)`, with the same keys.
-    /// The symbol lock is left out: each copy keeps its own.
     pub fn delta(before: &Project, after: &Project) -> (Parts, Parts) {
         let mut b = Parts::default();
         let mut a = Parts::default();
@@ -105,6 +139,16 @@ impl Parts {
                 a.comments.insert(page.to_owned(), y);
             }
         }
+        for kind in [ItemKind::Symbol, ItemKind::Part] {
+            let (x, y) = (before.lock.map(kind), after.lock.map(kind));
+            let ids: BTreeSet<&String> = x.keys().chain(y.keys()).collect();
+            for id in ids {
+                if x.get(id) != y.get(id) {
+                    b.lock_mut(kind).insert(id.clone(), x.get(id).cloned());
+                    a.lock_mut(kind).insert(id.clone(), y.get(id).cloned());
+                }
+            }
+        }
         (b, a)
     }
 
@@ -132,10 +176,25 @@ impl Parts {
                 .keys()
                 .map(|page| (page.clone(), comments_on(project, page)))
                 .collect(),
+            lock_symbols: read_lock(project, keys, ItemKind::Symbol),
+            lock_parts: read_lock(project, keys, ItemKind::Part),
         }
     }
 
     /// Put these parts into `project`.
+    /// Add `newer` to these parts: where both name a record, `newer`'s version stays.
+    pub fn merge(&mut self, newer: Parts) {
+        if newer.meta.is_some() {
+            self.meta = newer.meta;
+        }
+        self.pages.extend(newer.pages);
+        self.devices.extend(newer.devices);
+        self.panels.extend(newer.panels);
+        self.comments.extend(newer.comments);
+        self.lock_symbols.extend(newer.lock_symbols);
+        self.lock_parts.extend(newer.lock_parts);
+    }
+
     pub fn apply(&self, project: &mut Project) {
         if let Some(meta) = &self.meta {
             project.meta = (**meta).clone();
@@ -179,7 +238,82 @@ impl Parts {
             }
             project.sort_comments();
         }
+        for kind in [ItemKind::Symbol, ItemKind::Part] {
+            for (id, entry) in self.lock(kind) {
+                match entry {
+                    Some(e) => {
+                        project.lock.map_mut(kind).insert(id.clone(), e.clone());
+                    }
+                    None => {
+                        project.lock.map_mut(kind).remove(id);
+                    }
+                }
+            }
+        }
     }
+
+    /// The versions in `lock` of the symbols and parts that these parts' pages, devices and
+    /// jumpers use. One `lock` does not lock is left out.
+    pub fn uses(&self, lock: &Lockfile) -> Uses {
+        let mut probe = Project::new("");
+        Parts {
+            meta: self.meta.clone(),
+            pages: self.pages.clone(),
+            devices: self.devices.clone(),
+            ..Parts::default()
+        }
+        .apply(&mut probe);
+        let symbols = probe.used_symbols().into_iter().map(|id| (ItemKind::Symbol, id));
+        let parts = probe.used_parts().into_iter().map(|id| (ItemKind::Part, id));
+        symbols
+            .chain(parts)
+            .filter_map(|(kind, id)| {
+                let hash = lock.map(kind).get(&id)?.hash.clone();
+                Some(((kind, id), hash))
+            })
+            .collect()
+    }
+
+    /// Items of `recorded` that `lock` locks in another version (`symbol id` or `part id`):
+    /// parts drawn with those versions are not to come back against these.
+    pub fn other_versions(recorded: &Uses, lock: &Lockfile) -> Vec<String> {
+        recorded
+            .iter()
+            .filter(|((kind, id), hash)| lock.map(*kind).get(id).is_some_and(|e| e.hash != **hash))
+            .map(|((kind, id), _)| format!("{} {id}", kind_name(*kind)))
+            .collect()
+    }
+
+    /// Items that putting these parts into `project` would leave used without a lock entry
+    /// (`symbol id` or `part id`): a lock entry taken out while a page, device or jumper still
+    /// uses the item, or a page or device brought back that uses an item no longer locked.
+    /// Items already used without a lock before are not counted.
+    pub fn unlocked_uses(&self, project: &Project) -> Vec<String> {
+        let mut after = project.clone();
+        self.apply(&mut after);
+        let unlocked = |p: &Project| -> BTreeSet<String> {
+            p.used_symbols()
+                .into_iter()
+                .filter(|id| !p.lock.symbols.contains_key(id))
+                .map(|id| format!("symbol {id}"))
+                .chain(
+                    p.used_parts()
+                        .into_iter()
+                        .filter(|id| !p.lock.parts.contains_key(id))
+                        .map(|id| format!("part {id}")),
+                )
+                .collect()
+        };
+        let had = unlocked(project);
+        unlocked(&after).into_iter().filter(|i| !had.contains(i)).collect()
+    }
+}
+
+fn read_lock(project: &Project, keys: &Parts, kind: ItemKind) -> BTreeMap<String, Option<LockEntry>> {
+    keys.lock(kind)
+        .keys()
+        .map(|id| (id.clone(), project.lock.map(kind).get(id).cloned()))
+        .collect()
 }
 
 /// What a recorded change was.

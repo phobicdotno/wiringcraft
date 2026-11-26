@@ -333,6 +333,9 @@ pub struct Built {
     pub title_block: BTreeMap<String, String>,
     /// Cabinet panel layouts, from importers that have them.
     pub panels: Vec<wc_core::panel::Panel>,
+    /// Terminal jumpers, from importers that have them; jumpers of one strip that share a
+    /// terminal are already one.
+    pub jumpers: Vec<wc_core::project::Jumper>,
 }
 
 const PIN_STEP: f64 = 7.5;
@@ -392,6 +395,9 @@ pub fn device_entry(d: &AmlDevice, parts: &mut Vec<wc_core::Part>) -> Option<(De
             description: d.name.clone(),
             symbol: None,
             properties: d.properties.clone(),
+            contacts: None,
+            footprint: None,
+            model: None,
         };
         let id = p.id.clone();
         if !parts.iter().any(|q| q.id == id) {
@@ -473,6 +479,7 @@ pub fn layout(imp: &AmlImport, sections: &[Section], prefix: &str, first_page_nu
             }
             let description = d.path.join(" / ");
             built.symbols.push(Symbol {
+                source: String::new(),
                 id: id.clone(),
                 name: format!("{} (imported)", d.name),
                 category: "imported".into(),
@@ -670,6 +677,7 @@ mod tests {
         // Export a small project with the report crate's AutomationML writer and import it:
         // devices, part data and connections survive the trip.
         let sym = |id: &str, pins: &[&str]| Symbol {
+            source: String::new(),
             id: id.into(),
             name: id.into(),
             category: String::new(),

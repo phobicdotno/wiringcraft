@@ -45,7 +45,10 @@ fn parts_come_with_number_maker_description_and_properties() -> TestResult {
         ("items/readme.txt", b"hello"),
     ])?;
     let (parts, report, warnings) = read(&edz)?;
-    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(
+        warnings,
+        ["macro items/macros/SIE_3RT2015.ema not imported: it is not an EPLAN macro (no EplanPxfRoot)"]
+    );
     assert_eq!(parts.len(), 2);
     let c = parts
         .iter()
@@ -76,6 +79,9 @@ fn parts_come_with_number_maker_description_and_properties() -> TestResult {
             parts: 2,
             part_files: 1,
             macros: 1,
+            macro_symbols: 0,
+            macros_unread: 1,
+            left_out: BTreeMap::new(),
             pictures: 1,
             other: 1,
             too_large: 0,
@@ -87,7 +93,7 @@ fn parts_come_with_number_maker_description_and_properties() -> TestResult {
         report.lines(),
         [
             "2 part(s) from 1 part file(s)",
-            "1 macro(s) (.ema): not imported",
+            "1 macro(s) (.ema): 0 read as symbols, 1 not readable as symbols",
             "1 picture(s): not imported",
             "1 other file(s): not imported",
             "macro file: items/macros/SIE_3RT2015.ema",
@@ -133,7 +139,10 @@ fn an_archive_without_parts_says_so() -> TestResult {
     let (parts, report, warnings) = read(&edz)?;
     assert!(parts.is_empty());
     assert_eq!(report.macros, 1);
-    assert_eq!(warnings, ["the archive holds no part data"]);
+    assert_eq!(
+        warnings.last().map(String::as_str),
+        Some("the archive holds no part data")
+    );
     Ok(())
 }
 
@@ -186,7 +195,7 @@ fn an_xml_file_over_the_entry_limit_is_skipped_and_reported() -> TestResult {
         assert!(
             report
                 .lines()
-                .contains(&"1 XML file(s) over the size limit: skipped".to_owned())
+                .contains(&"1 XML or macro file(s) over the size limit: skipped".to_owned())
         );
     }
     Ok(())
@@ -388,4 +397,267 @@ fn control_characters_in_macro_names_print_as_plain_text() -> TestResult {
         "{lines:?}"
     );
     Ok(())
+}
+
+/// A macro as EPLAN writes one, cut down: a black box with two connection points.
+const CONTACTOR_MACRO: &str = r#"<EplanPxfRoot Name="SIE_3RT2015">
+ <MacroVariant VariantId="0" ReferencePoint="0/40" MacroFuncType="1" DocumentType="1">
+  <ESymLib Name="SPECIAL" ID="0"/>
+  <O17 A1261="0" A1262="1" A1381="301"><S89x5 A1651="0/-20" A1652="20/0"/><S40x1201 A762="0/40"/><P144 P20013="Q"/></O17>
+  <O17 A1261="0" A1262="40" A1263="0" A1381="300" A185="1"><S40x1201 A762="4/40"/></O17>
+  <O17 A1261="0" A1262="40" A1263="2" A1381="300" A185="2"><S40x1201 A762="4/20"/></O17>
+ </MacroVariant>
+</EplanPxfRoot>"#;
+
+#[test]
+fn macros_become_symbols_and_parts_get_the_symbol_of_the_macro_they_name() -> TestResult {
+    let edz = seven_zip(&[
+        ("items/parts.xml", PARTS_WITH_MACROS.as_bytes()),
+        ("items/macros/sie_3rt2015.EMA", CONTACTOR_MACRO.as_bytes()),
+        ("items/macros/OTHER.ema", b"binary macro"),
+    ])?;
+    let got = read_all(&edz)?;
+    assert_eq!(got.symbols.len(), 1);
+    let s = &got.symbols[0];
+    assert_eq!(s.id, "eplan.sie.sie_3rt2015");
+    assert_eq!(s.letter_code, "Q");
+    assert_eq!(s.pins.len(), 2);
+    assert_eq!(
+        (got.report.macros, got.report.macro_symbols, got.report.macros_unread),
+        (2, 1, 1)
+    );
+    assert!(
+        got.warnings
+            .iter()
+            .any(|w| w.starts_with("macro items/macros/OTHER.ema not imported: it is not an EPLAN macro")),
+        "{:?}",
+        got.warnings
+    );
+    let contactor = got
+        .parts
+        .iter()
+        .find(|p| p.id == Part::make_id("SIE", "3RT2015-1BB41"))
+        .ok_or("no contactor")?;
+    assert_eq!(contactor.symbol.as_deref(), Some("eplan.sie.sie_3rt2015"));
+    let lines = got.report.lines();
+    assert!(
+        lines.contains(&"2 macro(s) (.ema): 1 read as symbols, 1 not readable as symbols".to_owned()),
+        "{lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("drawn with symbol eplan.sie.sie_3rt2015")),
+        "{lines:?}"
+    );
+    // A symbol map still decides over the macro's own symbol.
+    let mut parts = got.parts.clone();
+    let mut report = got.report.clone();
+    let map: BTreeMap<String, String> = [("sie_3rt2015".to_owned(), "wc.coil".to_owned())].into();
+    apply_symbol_map(&mut parts, &map, &mut report);
+    assert!(parts.iter().any(|p| p.symbol.as_deref() == Some("wc.coil")));
+    Ok(())
+}
+
+#[test]
+fn a_macro_counts_towards_the_total_limit() -> TestResult {
+    let edz = zip(&[("m.ema", CONTACTOR_MACRO.as_bytes())])?;
+    let limits = Limits { total: 10, ..LIMITS };
+    let got = read_all_with(&edz, limits)?;
+    assert!(got.symbols.is_empty());
+    assert_eq!(got.report.too_large, 1);
+    Ok(())
+}
+
+#[test]
+fn a_part_naming_its_macro_without_the_extension_gets_its_symbol() -> TestResult {
+    let xml = r#"<partsmanagement><part P_ARTICLE_PARTNR="SIE.3RT2015" P_ARTICLE_MANUFACTURER="SIE" P_ARTICLE_MACRO="$(MD_MACROS)\SIE\SIE_3RT2015"/></partsmanagement>"#;
+    let edz = zip(&[
+        ("parts.xml", xml.as_bytes()),
+        ("SIE_3RT2015.ema", CONTACTOR_MACRO.as_bytes()),
+    ])?;
+    let got = read_all(&edz)?;
+    let part = got.parts.first().ok_or("no part")?;
+    assert_eq!(part.symbol.as_deref(), Some("eplan.sie.sie_3rt2015"));
+    let m = got.report.part_macros.first().ok_or("no part macro")?;
+    assert!(m.in_archive, "{m:?}");
+    Ok(())
+}
+
+#[test]
+fn macros_do_not_use_up_the_part_xml_budget() -> TestResult {
+    let edz = zip(&[("a.ema", CONTACTOR_MACRO.as_bytes()), ("parts.xml", PARTS.as_bytes())])?;
+    let total = PARTS.len().max(CONTACTOR_MACRO.len()) as u64 + 1;
+    let got = read_all_with(&edz, Limits { total, ..LIMITS })?;
+    assert_eq!(got.report.too_large, 0);
+    assert!(got.report.parts > 0);
+    assert_eq!(got.symbols.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn the_parts_only_reader_links_no_part_to_a_symbol_it_does_not_return() -> TestResult {
+    let xml = r#"<partsmanagement><part P_ARTICLE_PARTNR="SIE.3RT2015" P_ARTICLE_MANUFACTURER="SIE" P_ARTICLE_MACRO="SIE_3RT2015.ema"/></partsmanagement>"#;
+    let edz = zip(&[
+        ("parts.xml", xml.as_bytes()),
+        ("SIE_3RT2015.ema", CONTACTOR_MACRO.as_bytes()),
+    ])?;
+    let (parts, report, _) = read(&edz)?;
+    assert_eq!(parts.first().and_then(|p| p.symbol.clone()), None);
+    assert!(report.part_macros.iter().all(|m| m.symbol.is_none()));
+    Ok(())
+}
+
+#[test]
+fn macros_of_the_same_file_name_are_told_apart_by_their_path() -> TestResult {
+    let other = CONTACTOR_MACRO.replace("P20013=\"Q\"", "P20013=\"K\"");
+    let xml = r#"<partsmanagement><part P_ARTICLE_PARTNR="B.1" P_ARTICLE_MANUFACTURER="B" P_ARTICLE_MACRO="$(MD_MACROS)\B\relay.ema"/></partsmanagement>"#;
+    let edz = zip(&[
+        ("parts.xml", xml.as_bytes()),
+        ("macros/A/relay.ema", CONTACTOR_MACRO.as_bytes()),
+        ("macros/B/relay.ema", other.as_bytes()),
+    ])?;
+    let got = read_all(&edz)?;
+    let part = got.parts.first().ok_or("no part")?;
+    let id = part.symbol.clone().ok_or("no symbol")?;
+    let s = got.symbols.iter().find(|s| s.id == id).ok_or("no such symbol")?;
+    assert_eq!(s.letter_code, "K");
+    Ok(())
+}
+
+#[test]
+fn only_the_macro_whose_symbol_a_part_got_reports_it() -> TestResult {
+    let xml = r#"<partsmanagement><part P_ARTICLE_PARTNR="B.1" P_ARTICLE_MANUFACTURER="B" P_ARTICLE_MACRO="one.ema" P_ARTICLE_GROUPSYMBOLMACRO="two.ema"/></partsmanagement>"#;
+    let edz = zip(&[
+        ("parts.xml", xml.as_bytes()),
+        ("one.ema", CONTACTOR_MACRO.as_bytes()),
+        ("two.ema", CONTACTOR_MACRO.as_bytes()),
+    ])?;
+    let got = read_all(&edz)?;
+    let symbols: Vec<Option<&str>> = got.report.part_macros.iter().map(|m| m.symbol.as_deref()).collect();
+    assert_eq!(symbols, [Some("eplan.b.one"), None]);
+    assert!(got.report.part_macros.iter().all(|m| m.in_archive));
+    // A map choosing the group symbol macro takes the report row with it.
+    let (mut parts, mut report) = (got.parts.clone(), got.report.clone());
+    let map: BTreeMap<String, String> = [("two".to_owned(), "wc.coil".to_owned())].into();
+    apply_symbol_map(&mut parts, &map, &mut report);
+    let symbols: Vec<Option<&str>> = report.part_macros.iter().map(|m| m.symbol.as_deref()).collect();
+    assert_eq!(symbols, [None, Some("wc.coil")]);
+    Ok(())
+}
+
+#[test]
+fn a_symbol_map_names_an_extensionless_macro_by_either_spelling() -> TestResult {
+    let xml = r#"<partsmanagement><part P_ARTICLE_PARTNR="B.1" P_ARTICLE_MANUFACTURER="B" P_ARTICLE_MACRO="$(MD_MACROS)\B\relay"/></partsmanagement>"#;
+    let edz = zip(&[("parts.xml", xml.as_bytes()), ("relay.ema", CONTACTOR_MACRO.as_bytes())])?;
+    let got = read_all(&edz)?;
+    assert_eq!(
+        got.parts.first().and_then(|p| p.symbol.as_deref()),
+        Some("eplan.b.relay")
+    );
+    for key in ["relay.ema", "relay"] {
+        let (mut parts, mut report) = (got.parts.clone(), got.report.clone());
+        let map: BTreeMap<String, String> = [(key.to_owned(), "wc.coil".to_owned())].into();
+        assert_eq!(apply_symbol_map(&mut parts, &map, &mut report), 1, "{key}");
+        assert_eq!(
+            parts.first().and_then(|p| p.symbol.as_deref()),
+            Some("wc.coil"),
+            "{key}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn generic_macro_names_from_two_makers_get_different_symbol_ids() -> TestResult {
+    let archive = |maker: &str| {
+        let xml = format!(
+            r#"<partsmanagement><part P_ARTICLE_PARTNR="{maker}.1" P_ARTICLE_MANUFACTURER="{maker}" P_ARTICLE_MACRO="Macro_0001.ema"/></partsmanagement>"#
+        );
+        zip(&[
+            ("parts.xml", xml.as_bytes()),
+            ("Macro_0001.ema", CONTACTOR_MACRO.as_bytes()),
+        ])
+    };
+    let a = read_all(&archive("SIE")?)?;
+    let b = read_all(&archive("Phoenix Contact")?)?;
+    let ids = |e: &Edz| e.symbols.iter().map(|s| s.id.clone()).collect::<Vec<_>>();
+    assert_eq!(ids(&a), ["eplan.sie.macro_0001"]);
+    assert_eq!(ids(&b), ["eplan.phoenix_contact.macro_0001"]);
+    assert_eq!(
+        b.parts.first().and_then(|p| p.symbol.as_deref()),
+        Some("eplan.phoenix_contact.macro_0001")
+    );
+    assert!(a.warnings.iter().all(|w| !w.contains("no maker")), "{:?}", a.warnings);
+    Ok(())
+}
+
+#[test]
+fn a_macro_no_part_names_takes_the_archive_maker_and_without_one_is_warned_about() -> TestResult {
+    let xml = r#"<partsmanagement><part P_ARTICLE_PARTNR="RIT.1" P_ARTICLE_MANUFACTURER="RIT"/></partsmanagement>"#;
+    let got = read_all(&zip(&[
+        ("parts.xml", xml.as_bytes()),
+        ("loose.ema", CONTACTOR_MACRO.as_bytes()),
+    ])?)?;
+    assert_eq!(got.symbols.first().map(|s| s.id.as_str()), Some("eplan.rit.loose"));
+
+    // Two makers, and the macro named by neither: no maker, so the id stays as it was, warned.
+    let xml = r#"<partsmanagement><part P_ARTICLE_PARTNR="A.1" P_ARTICLE_MANUFACTURER="A"/><part P_ARTICLE_PARTNR="B.1" P_ARTICLE_MANUFACTURER="B"/></partsmanagement>"#;
+    let got = read_all(&zip(&[
+        ("parts.xml", xml.as_bytes()),
+        ("loose.ema", CONTACTOR_MACRO.as_bytes()),
+    ])?)?;
+    assert_eq!(got.symbols.first().map(|s| s.id.as_str()), Some("eplan.loose"));
+    assert!(
+        got.warnings
+            .iter()
+            .any(|w| w.starts_with("macro loose.ema: no maker is known for it")),
+        "{:?}",
+        got.warnings
+    );
+    Ok(())
+}
+
+#[test]
+fn macros_sharing_a_file_name_take_the_maker_of_the_part_naming_each_by_path() -> TestResult {
+    let xml = r#"<partsmanagement><part P_ARTICLE_PARTNR="A.1" P_ARTICLE_MANUFACTURER="A" P_ARTICLE_MACRO="$(MD_MACROS)\A\relay.ema"/><part P_ARTICLE_PARTNR="B.1" P_ARTICLE_MANUFACTURER="B" P_ARTICLE_MACRO="$(MD_MACROS)\B\relay.ema"/></partsmanagement>"#;
+    let got = read_all(&zip(&[
+        ("parts.xml", xml.as_bytes()),
+        ("macros/A/relay.ema", CONTACTOR_MACRO.as_bytes()),
+        ("macros/B/relay.ema", CONTACTOR_MACRO.as_bytes()),
+    ])?)?;
+    let mut ids: Vec<&str> = got.symbols.iter().map(|s| s.id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["eplan.a.relay", "eplan.b.relay"]);
+    let symbol = |maker: &str| {
+        got.parts
+            .iter()
+            .find(|p| p.manufacturer == maker)
+            .and_then(|p| p.symbol.as_deref())
+    };
+    assert_eq!(symbol("A"), Some("eplan.a.relay"));
+    assert_eq!(symbol("B"), Some("eplan.b.relay"));
+    Ok(())
+}
+
+#[test]
+fn long_maker_names_that_differ_past_the_cut_get_different_ids() {
+    let a = "Very Long Manufacturer Name Of Electrical Parts GmbH North";
+    let b = "Very Long Manufacturer Name Of Electrical Parts GmbH South";
+    let (Some(x), Some(y)) = (maker_segment(a), maker_segment(b)) else {
+        unreachable!("both are makers");
+    };
+    assert_ne!(x, y);
+    assert!(
+        x.chars().count() <= MAX_MAKER && y.chars().count() <= MAX_MAKER,
+        "{x} {y}"
+    );
+    assert_eq!(maker_segment(a), Some(x), "the same name gives the same segment");
+    assert_eq!(maker_segment("SIE").as_deref(), Some("sie"));
+    assert_eq!(
+        maker_segment(a),
+        maker_segment(&a.to_uppercase()),
+        "case does not make another maker"
+    );
+    assert_eq!(maker_segment("  "), None);
 }

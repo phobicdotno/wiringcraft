@@ -3,11 +3,12 @@
 
 use crate::icons::Icon;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
     NewProject,
     Open,
     ProjectProps,
+    Translations,
     Save,
     Undo,
     Redo,
@@ -19,6 +20,13 @@ pub enum Action {
     TextTool,
     LineTool,
     RectTool,
+    CircleTool,
+    ArcTool,
+    PolylineTool,
+    DimensionTool,
+    CloudTool,
+    RevisionTableTool,
+    BlackBoxTool,
     Delete,
     Rotate,
     Mirror,
@@ -42,6 +50,7 @@ pub enum Action {
     ZoomOut,
     ZoomFit,
     ToggleGrid,
+    Layers,
     ToggleAutoWire,
     LibraryStatus,
     LibraryUpdate,
@@ -54,9 +63,12 @@ pub enum Action {
     ExportWagoMarking,
     ExportWagoConfigurator,
     ImportWagoConfigurator,
+    TerminalStrips,
     NumberWires,
     Reports,
+    PlcRacks,
     Check,
+    LiveCheck,
     Commit,
     NewBranch,
     History,
@@ -91,6 +103,13 @@ impl Action {
                 | Action::TextTool
                 | Action::LineTool
                 | Action::RectTool
+                | Action::CircleTool
+                | Action::ArcTool
+                | Action::PolylineTool
+                | Action::DimensionTool
+                | Action::CloudTool
+                | Action::RevisionTableTool
+                | Action::BlackBoxTool
                 | Action::Delete
                 | Action::Rotate
                 | Action::Mirror
@@ -113,6 +132,7 @@ impl Action {
         Action::NewProject,
         Action::Open,
         Action::ProjectProps,
+        Action::Translations,
         Action::Save,
         Action::Undo,
         Action::Redo,
@@ -124,6 +144,13 @@ impl Action {
         Action::TextTool,
         Action::LineTool,
         Action::RectTool,
+        Action::CircleTool,
+        Action::ArcTool,
+        Action::PolylineTool,
+        Action::DimensionTool,
+        Action::CloudTool,
+        Action::RevisionTableTool,
+        Action::BlackBoxTool,
         Action::Delete,
         Action::Rotate,
         Action::Mirror,
@@ -147,6 +174,7 @@ impl Action {
         Action::ZoomOut,
         Action::ZoomFit,
         Action::ToggleGrid,
+        Action::Layers,
         Action::ToggleAutoWire,
         Action::LibraryStatus,
         Action::LibraryUpdate,
@@ -159,9 +187,12 @@ impl Action {
         Action::ExportWagoMarking,
         Action::ExportWagoConfigurator,
         Action::ImportWagoConfigurator,
+        Action::TerminalStrips,
         Action::NumberWires,
         Action::Reports,
+        Action::PlcRacks,
         Action::Check,
+        Action::LiveCheck,
         Action::Commit,
         Action::NewBranch,
         Action::History,
@@ -200,6 +231,12 @@ impl Action {
             Action::ProjectProps => i(
                 "Project properties",
                 "Project name and title-block fields",
+                Icon::Properties,
+                "",
+            ),
+            Action::Translations => i(
+                "Translations",
+                "Translate the project's texts into other languages (translations.toml)",
                 Icon::Properties,
                 "",
             ),
@@ -269,6 +306,48 @@ impl Action {
             ),
             Action::LineTool => i("Line", "Draw a line: click both ends", Icon::Line, "L"),
             Action::RectTool => i("Rectangle", "Draw a rectangle: click two corners", Icon::Rect, ""),
+            Action::CircleTool => i(
+                "Circle",
+                "Draw a circle: click the centre, then a point on it",
+                Icon::Circle,
+                "",
+            ),
+            Action::ArcTool => i(
+                "Arc",
+                "Draw an arc: click the centre, the start and the end (it runs clockwise)",
+                Icon::Arc,
+                "",
+            ),
+            Action::PolylineTool => i(
+                "Polyline",
+                "Draw a polyline: click each point; double-click or Enter ends it, a click on the first point closes it",
+                Icon::Polyline,
+                "",
+            ),
+            Action::DimensionTool => i(
+                "Dimension",
+                "Draw a dimension: click both points to measure, then where the dimension line goes",
+                Icon::Dimension,
+                "",
+            ),
+            Action::CloudTool => i(
+                "Revision cloud",
+                "Draw a revision cloud with the latest revision: click two corners",
+                Icon::Cloud,
+                "",
+            ),
+            Action::RevisionTableTool => i(
+                "Revision table",
+                "Place the page's revision table: click its top-left corner (Delete takes it off)",
+                Icon::RevisionTable,
+                "",
+            ),
+            Action::BlackBoxTool => i(
+                "Black box",
+                "Draw a black box for a device without a symbol: drag its rectangle, click its edges to add connection points, then click inside it (or press Enter) to tag it",
+                Icon::BlackBox,
+                "",
+            ),
             Action::Delete => i("Delete", "Delete the selection", Icon::Delete, "Del"),
             Action::Rotate => i("Rotate", "Rotate the selected symbols 90°", Icon::Rotate, "R"),
             Action::Mirror => i("Mirror", "Mirror the selected symbols left to right", Icon::Mirror, "M"),
@@ -347,6 +426,12 @@ impl Action {
             Action::ZoomOut => i("Zoom out", "Zoom out", Icon::ZoomOut, "-"),
             Action::ZoomFit => i("Fit page", "Show the whole page", Icon::ZoomFit, "F"),
             Action::ToggleGrid => i("Grid", "Show or hide the grid", Icon::Grid, "G"),
+            Action::Layers => i(
+                "Layers",
+                "Show, hide and lock drawings, wire numbers, cross-references, comments and scanned sheets on the canvas",
+                Icon::Layers,
+                "",
+            ),
             Action::ToggleAutoWire => i(
                 "Auto-wire",
                 "Draw wires between pins that line up when a symbol is placed or moved (hold Alt to skip once)",
@@ -403,6 +488,12 @@ impl Action {
                 Icon::Reports,
                 "",
             ),
+            Action::TerminalStrips => i(
+                "Terminal strips",
+                "Edit terminal strips: order the terminals on the rail, add spares, set levels; the terminal plan and WAGO export follow",
+                Icon::Reports,
+                "",
+            ),
             Action::NumberWires => i(
                 "Number wires",
                 "Give every connection without a number one, from its page and column (3.4)",
@@ -421,11 +512,23 @@ impl Action {
                 Icon::Check,
                 "Ctrl+E",
             ),
+            Action::LiveCheck => i(
+                "Check while drawing",
+                "Check the project again shortly after each edit and mark problems on the canvas",
+                Icon::Check,
+                "",
+            ),
             Action::Reports => i(
                 "Reports",
                 "Contents, parts, devices, wires, nets, terminals, cables, PLC I/O and locations as tables",
                 Icon::Reports,
                 "Ctrl+R",
+            ),
+            Action::PlcRacks => i(
+                "PLC racks",
+                "Add and edit the PLC racks and the I/O cards in their slots, laid out on the PLC card overview",
+                Icon::Reports,
+                "",
             ),
             Action::Commit => i("Commit", "Record a version of the project", Icon::Commit, "Ctrl+K"),
             Action::NewBranch => i("Branch", "Start a branch from this version", Icon::Branch, ""),
@@ -473,11 +576,22 @@ pub const TOOLBAR: &[&[Action]] = &[
         Action::Select,
         Action::PlaceSymbol,
         Action::DrawWire,
+        Action::BlackBoxTool,
         Action::Rotate,
         Action::Mirror,
         Action::Delete,
     ],
-    &[Action::TextTool, Action::LineTool, Action::RectTool],
+    &[
+        Action::TextTool,
+        Action::LineTool,
+        Action::RectTool,
+        Action::CircleTool,
+        Action::ArcTool,
+        Action::PolylineTool,
+        Action::DimensionTool,
+        Action::CloudTool,
+        Action::RevisionTableTool,
+    ],
     &[
         Action::AddPage,
         Action::CoverPage,
@@ -486,7 +600,13 @@ pub const TOOLBAR: &[&[Action]] = &[
         Action::PageProps,
         Action::DeletePage,
     ],
-    &[Action::ZoomIn, Action::ZoomOut, Action::ZoomFit, Action::ToggleGrid],
+    &[
+        Action::ZoomIn,
+        Action::ZoomOut,
+        Action::ZoomFit,
+        Action::ToggleGrid,
+        Action::Layers,
+    ],
     &[
         Action::LibraryStatus,
         Action::LibraryUpdate,
@@ -543,11 +663,25 @@ pub const RIBBON: &[(&str, &[RibbonGroup])] = &[
                     Action::Select,
                     Action::PlaceSymbol,
                     Action::DrawWire,
+                    Action::BlackBoxTool,
                     Action::Rotate,
                     Action::Mirror,
                 ],
             ),
-            ("Graphics", &[Action::TextTool, Action::LineTool, Action::RectTool]),
+            (
+                "Graphics",
+                &[
+                    Action::TextTool,
+                    Action::LineTool,
+                    Action::RectTool,
+                    Action::CircleTool,
+                    Action::ArcTool,
+                    Action::PolylineTool,
+                    Action::DimensionTool,
+                    Action::CloudTool,
+                    Action::RevisionTableTool,
+                ],
+            ),
         ],
     ),
     (
@@ -566,9 +700,17 @@ pub const RIBBON: &[(&str, &[RibbonGroup])] = &[
                     Action::DeletePage,
                 ],
             ),
+            ("Terminals", &[Action::TerminalStrips]),
             (
                 "View",
-                &[Action::ZoomIn, Action::ZoomOut, Action::ZoomFit, Action::ToggleGrid],
+                &[
+                    Action::ZoomIn,
+                    Action::ZoomOut,
+                    Action::ZoomFit,
+                    Action::ToggleGrid,
+                    Action::Layers,
+                    Action::LiveCheck,
+                ],
             ),
         ],
     ),

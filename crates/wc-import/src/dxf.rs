@@ -156,6 +156,9 @@ fn parse(text: &str) -> Result<Drawing> {
             if let Some(p) = polyline.as_mut() {
                 p.codes.push((10, e.get(10).unwrap_or("0").into()));
                 p.codes.push((20, e.get(20).unwrap_or("0").into()));
+                if let Some(bulge) = e.get(42) {
+                    p.codes.push((42, bulge.into()));
+                }
             }
         }
         "SEQEND" => {
@@ -271,9 +274,51 @@ impl Xf {
     fn det(&self) -> f64 {
         self.m[0] * self.m[3] - self.m[1] * self.m[2]
     }
+    /// Each axis's largest entry and the determinant of the matrix with each axis divided by
+    /// it, so a huge or tiny scale does not overflow or underflow when multiplied, and a tiny axis
+    /// next to a huge one is not lost. None when an entry is not a number.
+    fn normalized_det(&self) -> Option<(f64, f64, f64)> {
+        let [a, b, c, d] = self.m;
+        let (nx, ny) = (a.abs().max(c.abs()), b.abs().max(d.abs()));
+        if !nx.is_finite() || !ny.is_finite() {
+            return None;
+        }
+        if nx == 0.0 || ny == 0.0 {
+            return Some((nx, ny, 0.0));
+        }
+        Some((nx, ny, (a / nx) * (d / ny) - (b / ny) * (c / nx)))
+    }
     /// How lengths grow (the mean of the two axes' scales): radii and text heights.
     fn len_scale(&self) -> f64 {
-        self.det().abs().sqrt()
+        let Some((nx, ny, det)) = self.normalized_det() else {
+            return self.det().abs().sqrt();
+        };
+        // Multiplied first where that stays in range, so a plain scale of 2 gives exactly 2.
+        let both = nx * ny;
+        if both.is_normal() {
+            (both * det.abs()).sqrt()
+        } else {
+            nx.sqrt() * ny.sqrt() * det.abs().sqrt()
+        }
+    }
+    /// Whether the placement mirrors, so arcs run the other way round; read from the normalized
+    /// matrix so a tiny mirrored scale does not underflow to a determinant of -0.
+    fn mirrors(&self) -> bool {
+        self.normalized_det()
+            .map_or_else(|| self.det() < 0.0, |(_, _, det)| det < 0.0)
+    }
+    /// Whether every direction grows alike (turns, mirrors and one scale), so a circle stays a
+    /// circle. A placement scaled differently along x and y makes it an ellipse.
+    fn keeps_circles(&self) -> bool {
+        // Normalized first, so a tiny or huge scale does not underflow or overflow when squared.
+        let big = self.m.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        if big == 0.0 || !big.is_finite() {
+            return true;
+        }
+        let [a, b, c, d] = self.m.map(|v| v / big);
+        let (x, y) = (a * a + c * c, b * b + d * d);
+        let tol = 1e-9 * x.max(y);
+        (x - y).abs() <= tol && (a * b + c * d).abs() <= tol
     }
     /// Where the direction at angle 0 points once placed, in degrees, written as close to the
     /// sum of the turns as possible so plain turns keep their angles as written.
@@ -309,6 +354,34 @@ fn shapes(
         Point::new(x * scale, -y * scale)
     };
     let r_scale = xf.len_scale() * scale;
+    // A circle or arc under a placement that stretches it: `unit` holds its points on the unit
+    // circle, which are placed as the centre plus the placed radius vectors, so a huge centre and
+    // radius that place within range never overflow on the way. Left out and counted when the
+    // placed points are not numbers.
+    let stretched = |e: &Entity, unit: &[(f64, f64)], closed: bool, skipped: &mut BTreeMap<String, usize>| {
+        let flip = e.f_or(230, 1.0) < 0.0;
+        let r = e.f(40);
+        let (cx, cy) = (e.f(10), e.f(20));
+        let center = if flip { p(-cx, cy) } else { p(cx, cy) };
+        // The linear part of the placement on the page (y flipped), on a vector in the entity's
+        // own coordinates.
+        let lin = |dx: f64, dy: f64| {
+            let dx = if flip { -dx } else { dx };
+            let m = &xf.m;
+            ((m[0] * dx + m[1] * dy) * scale, -(m[2] * dx + m[3] * dy) * scale)
+        };
+        let (u, v) = (lin(r, 0.0), lin(0.0, r));
+        let pts: Vec<Point> = unit
+            .iter()
+            .map(|(c, s)| Point::new(center.x + c * u.0 + s * v.0, center.y + c * u.1 + s * v.1))
+            .collect();
+        // Angles that are not numbers give no points at all.
+        if pts.len() < 2 || !pts.iter().all(|q| q.x.is_finite() && q.y.is_finite()) {
+            *skipped.entry(STRETCHED_NOT_NUMBERS.to_owned()).or_default() += 1;
+            return None;
+        }
+        polyline(pts, closed, false)
+    };
     for (i, e) in ents.iter().enumerate() {
         if *budget == 0 {
             // This entity and every one after it at this level are left out.
@@ -329,11 +402,25 @@ fn shapes(
                 a: p(e.f(10), e.f(20)),
                 b: p(e.f(11), e.f(21)),
             }),
+            // Scaled differently along x and y, a circle is an ellipse: drawn by its points.
+            "CIRCLE" if !xf.keeps_circles() => {
+                // On a pin layer it marks a pin at its centre, which a symbol takes from the
+                // points as it does for POINT; the outline is drawn on a page like any other.
+                if is_pin_layer(&layer) {
+                    points.push((layer.clone(), q(e.f(10), e.f(20))));
+                }
+                let (unit, closed) = ellipse_points((0.0, 0.0), (1.0, 0.0), 1.0, 0.0, std::f64::consts::TAU);
+                stretched(e, &unit, closed, skipped)
+            }
             "CIRCLE" => Some(Shape::Circle {
                 center: q(e.f(10), e.f(20)),
                 radius: e.f(40) * r_scale,
                 filled: false,
             }),
+            "ARC" if !xf.keeps_circles() => {
+                let unit = arc_points((0.0, 0.0), 1.0, e.f(50), e.f(51), true);
+                stretched(e, &unit, false, skipped)
+            }
             "ARC" => {
                 // Mirrored in x, the arc from s to e runs from 180 - e to 180 - s.
                 let (s, en) = if flip {
@@ -344,7 +431,7 @@ fn shapes(
                 // A mirroring placement turns the angle a into x_angle - a, so the arc runs the
                 // other way round; any other placement turns it by x_angle.
                 let turn = xf.x_angle();
-                let (s, en) = if xf.det() < 0.0 {
+                let (s, en) = if xf.mirrors() {
                     (turn - en, turn - s)
                 } else {
                     (s + turn, en + turn)
@@ -357,19 +444,40 @@ fn shapes(
                 })
             }
             "LWPOLYLINE" => {
-                let xs = e.all(10);
-                let ys = e.all(20);
-                let pts: Vec<Point> = xs
-                    .iter()
-                    .zip(&ys)
-                    .filter(|(x, y)| x.is_finite() && y.is_finite())
-                    .map(|(x, y)| q(*x, *y))
-                    .collect();
-                (pts.len() >= 2).then(|| Shape::Polyline {
-                    points: pts,
-                    closed: (e.f(70) as i64) & 1 == 1,
-                    filled: false,
-                })
+                // Vertices in order, each with the bulge (code 42) of the segment it starts: a
+                // bulged segment is an arc, sampled in the entity's own coordinates.
+                let mut vs: Vec<((f64, f64), f64)> = Vec::new();
+                for (code, v) in &e.codes {
+                    let n = v.trim().parse::<f64>().unwrap_or(f64::NAN);
+                    match (*code, vs.last_mut()) {
+                        (10, _) => vs.push(((n, f64::NAN), 0.0)),
+                        (20, Some(last)) => last.0.1 = n,
+                        (42, Some(last)) if n.is_finite() => last.1 = n,
+                        _ => {}
+                    }
+                }
+                vs.retain(|((x, y), _)| x.is_finite() && y.is_finite());
+                let closed = (e.f(70) as i64) & 1 == 1;
+                let raw = if vs.iter().any(|(_, b)| b.abs() >= 1e-9) {
+                    bulged(&vs, closed)
+                } else {
+                    Some(vs.iter().map(|(p, _)| *p).collect())
+                };
+                // A bulge that gives no arc, or points that are not numbers once placed (a huge
+                // INSERT scale), leave the polyline out, and say so.
+                let pts: Option<Vec<Point>> = raw.map(|r| r.into_iter().map(|(x, y)| q(x, y)).collect());
+                match pts {
+                    Some(pts) if pts.len() < 2 => None,
+                    Some(pts) if pts.iter().all(|p| p.x.is_finite() && p.y.is_finite()) => Some(Shape::Polyline {
+                        points: pts,
+                        closed,
+                        filled: false,
+                    }),
+                    _ => {
+                        *skipped.entry(POLYLINE_NOT_NUMBERS.to_owned()).or_default() += 1;
+                        None
+                    }
+                }
             }
             "ELLIPSE" => {
                 // The minor axis is the extrusion turned onto the major one, so a downward
@@ -385,19 +493,57 @@ fn shapes(
                 polyline(pts.into_iter().map(|(x, y)| p(x, y)).collect(), closed, false)
             }
             "SPLINE" => {
-                let (pts, closed) = spline_points(e);
-                polyline(pts.into_iter().map(|(x, y)| p(x, y)).collect(), closed, false)
+                let (pts, closed, shape) = spline_points(e);
+                // Placed on the page, every sample must still be a number (a huge scale could
+                // overflow a curve that bulges past its points).
+                let placed: Vec<Point> = pts.into_iter().map(|(x, y)| p(x, y)).collect();
+                let numbers = placed.iter().all(|q| q.x.is_finite() && q.y.is_finite());
+                let drawn = if numbers { polyline(placed, closed, false) } else { None };
+                // Knots that make no curve (wrong count or degree, an empty interval) or fit points
+                // that could not be interpolated: the points are still joined, and said; a spline
+                // with too few points to join is said too.
+                let note = match (&drawn, shape) {
+                    (None, _) if !numbers => Some(SPLINE_NOT_NUMBERS),
+                    (None, _) => Some(SPLINE_TOO_FEW),
+                    (Some(_), SplineShape::KnotsNoCurve) => Some(SPLINE_NOT_CURVE),
+                    (Some(_), SplineShape::FitNotInterpolated) => Some(SPLINE_FIT_FAILED),
+                    (Some(_), SplineShape::Curve) => None,
+                };
+                if let Some(note) = note {
+                    *skipped.entry(note.to_owned()).or_default() += 1;
+                }
+                drawn
             }
             "HATCH" => {
-                let solid = e.get(2).is_some_and(|n| n.trim().eq_ignore_ascii_case("SOLID")) || e.f(70) as i64 == 1;
-                let loops = hatch_loops(e);
+                let mut solid = e.get(2).is_some_and(|n| n.trim().eq_ignore_ascii_case("SOLID")) || e.f(70) as i64 == 1;
+                // A loop whose points are not all numbers, in the drawing or once placed on the
+                // page (a huge radius or scale), is left out and counted. A solid hatch that lost
+                // one is drawn as outlines: the lost loop may have been a hole.
+                let placed = |(x, y): (f64, f64)| {
+                    let pt = q(x, y);
+                    x.is_finite() && y.is_finite() && pt.x.is_finite() && pt.y.is_finite()
+                };
+                let (loops, bad): (Vec<_>, Vec<_>) = hatch_loops(e)
+                    .into_iter()
+                    .partition(|(lp, _)| lp.iter().all(|pt| placed(*pt)));
+                let (loops, fit_failed): (Vec<_>, Vec<usize>) = loops.into_iter().unzip();
+                if !bad.is_empty() {
+                    *skipped.entry(HATCH_NOT_NUMBERS.to_owned()).or_default() += 1;
+                    solid = false;
+                }
                 // Islands inside a solid fill stay open: each is cut into the loop around it.
                 // Style (75): 0 fills every other level, 1 only the outermost area, 2 ignores
                 // islands.
                 let style = hatch_style(e);
+                // Spline edges joined straight are said only for loops that are drawn: placed,
+                // and kept by the fill style.
+                let mut drawn_failed: usize = fit_failed.iter().sum();
                 let (outlines, filled) = if solid {
-                    match with_holes(&loops, style) {
-                        Some(o) => (o, true),
+                    match with_holes_kept(&loops, style) {
+                        Some((o, kept)) => {
+                            drawn_failed = fit_failed.iter().zip(&kept).filter(|(_, k)| **k).map(|(n, _)| n).sum();
+                            (o, true)
+                        }
                         None => {
                             // Too many holes to cut in: the boundaries, not a wrong fill.
                             *skipped.entry(HATCH_UNFILLED.to_owned()).or_default() += 1;
@@ -407,6 +553,9 @@ fn shapes(
                 } else {
                     (loops, false)
                 };
+                if drawn_failed > 0 {
+                    *skipped.entry(SPLINE_FIT_FAILED.to_owned()).or_default() += drawn_failed;
+                }
                 for lp in outlines {
                     if let Some(s) = polyline(lp.into_iter().map(|(x, y)| q(x, y)).collect(), true, filled) {
                         out.push((layer.clone(), s));
@@ -449,7 +598,7 @@ fn shapes(
                 None
             }
             "INSERT" => {
-                if let Some((name, inner)) = e.get(2).and_then(|n| d.blocks.get_key_value(n)) {
+                if let Some((name, inner)) = e.get(2).and_then(|n| d.block(n)) {
                     // The block's base point goes on the insertion point.
                     let (bx, by) = d.bases.get(name).copied().unwrap_or_default();
                     let ixf = Xf::shift((-bx, -by))
@@ -573,10 +722,9 @@ fn de_boor(ctrl: &[(f64, f64, f64)], knots: &[f64], p: usize, u: f64) -> Option<
     if n <= p || knots.len() != n + p + 1 {
         return None;
     }
-    let mut k = p;
-    while k + 1 < n && knots.get(k + 1).is_some_and(|&t| t <= u) {
-        k += 1;
-    }
+    // The knot span holding u, by binary search (the knots are sorted): a long spline sampled
+    // many times would cost samples x knots with a scan.
+    let k = p + knots.get(p + 1..n)?.partition_point(|&t| t <= u);
     let mut d: Vec<(f64, f64, f64)> = ctrl.get(k - p..=k)?.to_vec();
     for r in 1..=p {
         for j in (r..=p).rev() {
@@ -614,6 +762,30 @@ const HATCH_BRIDGE_WORK: usize = 20_000_000;
 
 /// The `skipped` key of a solid hatch drawn as its boundaries because its holes could not be cut.
 const HATCH_UNFILLED: &str = "solid HATCH (holes too complex)";
+
+/// The key under which splines whose knots make no curve are counted (drawn through their
+/// points instead).
+const SPLINE_NOT_CURVE: &str = "SPLINE whose knots make no curve";
+
+/// The key under which splines whose fit points could not be interpolated are counted (drawn
+/// through their points as a polygon instead).
+const SPLINE_FIT_FAILED: &str = "SPLINE whose fit points could not be interpolated";
+
+/// The key under which splines whose points are not numbers once placed are counted.
+const SPLINE_NOT_NUMBERS: &str = "SPLINE whose points are not numbers once placed";
+
+/// The key under which splines with too few points to draw are counted.
+const SPLINE_TOO_FEW: &str = "SPLINE with too few points";
+
+/// The key under which circles and arcs of a stretched block are counted when their angles or
+/// their placed points are not numbers.
+const STRETCHED_NOT_NUMBERS: &str = "CIRCLE or ARC of a stretched block whose points are not numbers";
+
+/// The key under which hatches with a boundary that is not all numbers are counted.
+/// The `skipped` key of a polyline whose points, or the arcs of its bulges, are not numbers once
+/// placed.
+const POLYLINE_NOT_NUMBERS: &str = "LWPOLYLINE whose points are not numbers once placed";
+const HATCH_NOT_NUMBERS: &str = "HATCH with a boundary that is not numbers";
 
 /// Points along a B-spline from its control points, knots and weights, sampled evenly over the
 /// knot range. `None` when the data do not make a spline.
@@ -665,22 +837,473 @@ fn bspline_points(ctrl: &[(f64, f64)], knots: &[f64], weights: &[f64], degree: u
     Some(out)
 }
 
+/// The most fit points a spline is interpolated through; beyond, they are joined straight (the
+/// curve is sampled at most 2000 times, too few to pass through more points).
+const MAX_FIT_POINTS: usize = 500;
+
+/// Points along the B-spline of degree `degree` (3 when 0, at most one less than the points)
+/// that passes through `fit`: global interpolation with chord-length parameters and averaged
+/// knots (The NURBS Book, 9.2.1), as a CAD program derives the control points of a spline drawn
+/// by its fit points. With `tangents` (start and end directions) the curve also leaves and
+/// enters along them (9.2.2): two more control points, each tangent scaled to the length of the
+/// fit polygon. A degree of 1 is the fit points themselves. `None` when there are fewer than
+/// three distinct points (two with tangents) or the system cannot be solved.
+fn through_fit_points(fit: &[(f64, f64)], degree: usize, tangents: Tangents) -> Option<Vec<(f64, f64)>> {
+    if !fit.iter().all(|pt| pt.0.is_finite() && pt.1.is_finite()) {
+        return None;
+    }
+    let mut q = distinct_fit(fit, false);
+    // A repeat merge must not lose the curve's end: the last point given is its end.
+    if let (Some(last), Some(&end)) = (q.last_mut(), fit.last()) {
+        *last = end;
+    }
+    let n = q.len();
+    let p = if degree == 0 { 3 } else { degree }.min(MAX_SPLINE_DEGREE);
+    // Degree 1 is the polyline through the points: the points as given.
+    if p == 1 {
+        return (fit.len() >= 2 && fit.len() <= MAX_FIT_POINTS).then(|| fit.to_vec());
+    }
+    // Unit start and end directions. When only one is given, the other end follows its last
+    // chord, so the given one is not lost.
+    let unit = unit_direction;
+    let chord = |a: usize, b: usize| {
+        let (pa, pb) = (q.get(a)?, q.get(b)?);
+        unit((pb.0 - pa.0, pb.1 - pa.1))
+    };
+    let (t0, t1) = (tangents.0.and_then(unit), tangents.1.and_then(unit));
+    let tangents = match (t0, t1) {
+        (None, None) => None,
+        (a, b) => Some((
+            a.or_else(|| chord(0, 1))?,
+            b.or_else(|| chord(n.checked_sub(2)?, n - 1))?,
+        )),
+    };
+    let fewest = if tangents.is_some() { 2 } else { 3 };
+    if !(fewest..=MAX_FIT_POINTS).contains(&n) {
+        return None;
+    }
+    // Chord-length parameters from 0 to 1.
+    let mut params = Vec::with_capacity(n);
+    let mut total = 0.0;
+    params.push(0.0);
+    for w in q.windows(2) {
+        if let [a, b] = w {
+            total += (b.0 - a.0).hypot(b.1 - a.1);
+        }
+        params.push(total);
+    }
+    if !(total.is_finite() && total > 0.0) {
+        return None;
+    }
+    for t in &mut params {
+        *t /= total;
+    }
+    *params.last_mut()? = 1.0;
+    let average = |j: usize, p: usize| Some(params.get(j..j + p)?.iter().sum::<f64>() / p as f64);
+    let (q0, qn) = (*q.first()?, *q.last()?);
+    match tangents {
+        None => {
+            let p = p.min(n - 1);
+            // Clamped knots, the inner ones averaged from the parameters (9.8).
+            let mut knots = vec![0.0; p + 1];
+            for j in 1..n - p {
+                knots.push(average(j, p)?);
+            }
+            knots.extend(std::iter::repeat_n(1.0, p + 1));
+            let mut rows = Vec::with_capacity(n);
+            for &u in &params {
+                let span = (p + knots.get(p + 1..n)?.partition_point(|&t| t <= u)).min(n - 1);
+                rows.push((span.checked_sub(p)?, basis(&knots, span, u, p)?));
+            }
+            let ctrl = solve_band(&rows, &q, p)?;
+            bspline_points(&ctrl, &knots, &[], p)
+        }
+        Some((d0, d1)) => {
+            // n + 2 control points; inner knots averaged over p parameters each (9.22).
+            let p = p.min(n);
+            let count = n + 2;
+            let mut knots = vec![0.0; p + 1];
+            for j in 0..=n.checked_sub(p)? {
+                knots.push(average(j, p)?);
+            }
+            knots.extend(std::iter::repeat_n(1.0, p + 1));
+            if knots.len() != count + p + 1 {
+                return None;
+            }
+            let (first, last) = (*knots.get(p + 1)?, *knots.get(count - 1)?);
+            let pf = p as f64;
+            let start = (q0.0 + first / pf * total * d0.0, q0.1 + first / pf * total * d0.1);
+            let end = (
+                qn.0 - (1.0 - last) / pf * total * d1.0,
+                qn.1 - (1.0 - last) / pf * total * d1.1,
+            );
+            // Rows: P0 = Q0, P1 from the start tangent, one per inner fit point, P(n) from the end
+            // tangent, P(n + 1) = Q(n - 1).
+            let mut rows = vec![(0, vec![1.0]), (1, vec![1.0])];
+            let mut rhs = vec![q0, start];
+            for (&u, &pt) in params.iter().zip(&q).take(n - 1).skip(1) {
+                let span = (p + knots.get(p + 1..count)?.partition_point(|&t| t <= u)).min(count - 1);
+                rows.push((span.checked_sub(p)?, basis(&knots, span, u, p)?));
+                rhs.push(pt);
+            }
+            rows.push((count - 2, vec![1.0]));
+            rows.push((count - 1, vec![1.0]));
+            rhs.push(end);
+            rhs.push(qn);
+            let ctrl = solve_band(&rows, &rhs, p)?;
+            bspline_points(&ctrl, &knots, &[], p)
+        }
+    }
+}
+
+/// Points along the closed B-spline of degree `degree` (3 when 0) through `fit`, the way a CAD
+/// program draws a closed spline given by fit points: periodic interpolation (The NURBS Book,
+/// 9.2.4) with chord-length parameters around the loop, the closing chord included, and
+/// periodic knots (at the parameters for an odd degree, halfway between them for an even one),
+/// so the curve passes the start point without a corner. A last fit point that repeats the
+/// first is dropped. The points end where they start. `None` when there are fewer than three
+/// distinct points or the system cannot be solved.
+fn through_fit_points_closed(fit: &[(f64, f64)], degree: usize) -> Option<Vec<(f64, f64)>> {
+    if !fit.iter().all(|pt| pt.0.is_finite() && pt.1.is_finite()) {
+        return None;
+    }
+    // Degree 1 is the closed polygon through the points as given, every one of them kept.
+    if degree == 1 {
+        if !(3..=MAX_FIT_POINTS).contains(&fit.len()) {
+            return None;
+        }
+        let mut out = fit.to_vec();
+        let first = *fit.first()?;
+        if fit.last() != Some(&first) {
+            out.push(first);
+        }
+        return Some(out);
+    }
+    let q = distinct_fit(fit, true);
+    let n = q.len();
+    if !(3..=MAX_FIT_POINTS).contains(&n) {
+        return None;
+    }
+    let p = if degree == 0 { 3 } else { degree }.min(MAX_SPLINE_DEGREE).min(n - 1);
+    // Chord-length parameters around the loop, period 1.
+    let mut params = Vec::with_capacity(n);
+    let mut total = 0.0;
+    for (k, a) in q.iter().enumerate() {
+        params.push(total);
+        let b = q.get((k + 1) % n)?;
+        total += (b.0 - a.0).hypot(b.1 - a.1);
+    }
+    if !(total.is_finite() && total > 0.0) {
+        return None;
+    }
+    for t in &mut params {
+        *t /= total;
+    }
+    // The parameter of point j for any j, one period further for each loop.
+    let param = |j: i64| -> Option<f64> {
+        let k = j.rem_euclid(n as i64);
+        Some(params.get(k as usize)? + (j - k).div_euclid(n as i64) as f64)
+    };
+    // Periodic knot j: at a parameter for an odd degree, halfway to the next for an even one.
+    let tau = |j: i64| -> Option<f64> {
+        if p % 2 == 1 {
+            param(j)
+        } else {
+            Some((param(j)? + param(j + 1)?) / 2.0)
+        }
+    };
+    // n + p control points (the last p repeat the first p) over n + 2p + 1 knots; the curve's
+    // range [knot p, knot n + p] is one period, from the first point's parameter (odd degree)
+    // or from halfway to the second (even degree).
+    let knots: Vec<f64> = (0..n + 2 * p + 1)
+        .map(|m| tau(m as i64 - p as i64))
+        .collect::<Option<_>>()?;
+    let (u0, u1) = (*knots.get(p)?, *knots.get(n + p)?);
+    // One row per fit point: the basis functions at its parameter, folded onto the n
+    // control points.
+    let mut a = vec![0.0; n * n];
+    for (k, &u) in params.iter().enumerate() {
+        // Within the curve's range, which may start a little after 0 for an even degree.
+        let u = if u < u0 { u + 1.0 } else { u };
+        let u = u.min(u1 - (u1 - u0) * 1e-12);
+        let span = p + knots.get(p + 1..n + p)?.partition_point(|&t| t <= u);
+        for (r, v) in basis(&knots, span, u, p)?.into_iter().enumerate() {
+            *a.get_mut(k * n + (span - p + r) % n)? += v;
+        }
+    }
+    let ctrl = solve_dense(a, &q)?;
+    let ext: Vec<(f64, f64)> = ctrl.iter().chain(ctrl.iter().take(p)).copied().collect();
+    let mut out = bspline_points(&ext, &knots, &[], p)?;
+    // The curve ends where it starts; snap the rounding away.
+    let first = *out.first()?;
+    if let Some(last) = out.last_mut()
+        && (last.0 - first.0).hypot(last.1 - first.1) < 1e-6
+    {
+        *last = first;
+    }
+    Some(out)
+}
+
+/// Solve the square system `a` (row by row, `n` x `n`) for two right-hand sides at once, by
+/// Gaussian elimination with partial pivoting. `None` when it is singular or the result is not
+/// numbers.
+fn solve_dense(mut a: Vec<f64>, rhs: &[(f64, f64)]) -> Option<Vec<(f64, f64)>> {
+    let n = rhs.len();
+    if a.len() != n * n {
+        return None;
+    }
+    let at = |a: &[f64], i: usize, c: usize| a.get(i * n + c).copied();
+    let mut b: Vec<(f64, f64)> = rhs.to_vec();
+    for j in 0..n {
+        let mut pivot = j;
+        for i in j + 1..n {
+            if at(&a, i, j)?.abs() > at(&a, pivot, j)?.abs() {
+                pivot = i;
+            }
+        }
+        if at(&a, pivot, j)?.abs() < 1e-14 {
+            return None;
+        }
+        if pivot != j {
+            for c in 0..n {
+                a.swap(pivot * n + c, j * n + c);
+            }
+            b.swap(pivot, j);
+        }
+        let d = at(&a, j, j)?;
+        let bj = *b.get(j)?;
+        for i in j + 1..n {
+            let f = at(&a, i, j)? / d;
+            if f == 0.0 {
+                continue;
+            }
+            for c in j..n {
+                let v = at(&a, j, c)?;
+                *a.get_mut(i * n + c)? -= f * v;
+            }
+            let bi = b.get_mut(i)?;
+            bi.0 -= f * bj.0;
+            bi.1 -= f * bj.1;
+        }
+    }
+    for j in (0..n).rev() {
+        let (mut x, mut y) = *b.get(j)?;
+        for c in j + 1..n {
+            let (v, bc) = (at(&a, j, c)?, *b.get(c)?);
+            x -= v * bc.0;
+            y -= v * bc.1;
+        }
+        let d = at(&a, j, j)?;
+        *b.get_mut(j)? = (x / d, y / d);
+    }
+    b.iter().all(|(x, y)| x.is_finite() && y.is_finite()).then_some(b)
+}
+
+/// A spline's start and end tangents as given (either may be missing).
+type Tangents = (Option<(f64, f64)>, Option<(f64, f64)>);
+
+/// Solve the square system whose row `i` has the values `rows[i].1` from column `rows[i].0` on,
+/// for two right-hand sides at once. The matrix is banded (no value more than `p` columns from
+/// the diagonal) and totally positive, so it is solved in its band without pivoting: O(n p^2).
+/// `None` when a value lies outside the band, a pivot is zero, or the result is not numbers.
+fn solve_band(rows: &[(usize, Vec<f64>)], rhs: &[(f64, f64)], p: usize) -> Option<Vec<(f64, f64)>> {
+    let n = rows.len();
+    if rhs.len() != n {
+        return None;
+    }
+    let w = 2 * p + 1;
+    let mut band = vec![0.0; n * w];
+    let at = |i: usize, c: usize| (c + p).checked_sub(i).filter(|o| *o < w).map(|o| i * w + o);
+    for (i, (from, vals)) in rows.iter().enumerate() {
+        for (r, v) in vals.iter().enumerate() {
+            *band.get_mut(at(i, from + r)?)? = *v;
+        }
+    }
+    let (mut x, mut y): (Vec<f64>, Vec<f64>) = rhs.iter().copied().unzip();
+    for j in 0..n {
+        let pivot = *band.get(at(j, j)?)?;
+        if pivot.abs() < 1e-14 {
+            return None;
+        }
+        for i in j + 1..n.min(j + p + 1) {
+            let f = *band.get(at(i, j)?)? / pivot;
+            if f == 0.0 {
+                continue;
+            }
+            for c in j..n.min(j + p + 1) {
+                let v = *band.get(at(j, c)?)?;
+                *band.get_mut(at(i, c)?)? -= f * v;
+            }
+            let (xj, yj) = (*x.get(j)?, *y.get(j)?);
+            *x.get_mut(i)? -= f * xj;
+            *y.get_mut(i)? -= f * yj;
+        }
+    }
+    for j in (0..n).rev() {
+        for c in j + 1..n.min(j + p + 1) {
+            let v = *band.get(at(j, c)?)?;
+            let (xc, yc) = (*x.get(c)?, *y.get(c)?);
+            *x.get_mut(j)? -= v * xc;
+            *y.get_mut(j)? -= v * yc;
+        }
+        let d = *band.get(at(j, j)?)?;
+        *x.get_mut(j)? /= d;
+        *y.get_mut(j)? /= d;
+    }
+    let ctrl: Vec<(f64, f64)> = x.into_iter().zip(y).collect();
+    ctrl.iter().all(|(a, b)| a.is_finite() && b.is_finite()).then_some(ctrl)
+}
+
+/// The p + 1 B-spline basis functions not zero at `u` in knot span `span` (The NURBS Book,
+/// algorithm A2.2).
+fn basis(knots: &[f64], span: usize, u: f64, p: usize) -> Option<Vec<f64>> {
+    let mut n = vec![0.0; p + 1];
+    let (mut left, mut right) = (vec![0.0; p + 1], vec![0.0; p + 1]);
+    *n.first_mut()? = 1.0;
+    for j in 1..=p {
+        *left.get_mut(j)? = u - knots.get((span + 1).checked_sub(j)?)?;
+        *right.get_mut(j)? = knots.get(span + j)? - u;
+        let mut saved = 0.0;
+        for r in 0..j {
+            let (rr, lj) = (*right.get(r + 1)?, *left.get(j - r)?);
+            let denom = rr + lj;
+            let temp = if denom.abs() < 1e-300 { 0.0 } else { *n.get(r)? / denom };
+            *n.get_mut(r)? = saved + rr * temp;
+            saved = lj * temp;
+        }
+        *n.get_mut(j)? = saved;
+    }
+    Some(n)
+}
+
+/// How the points of a spline were found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SplineShape {
+    /// A curve (or no curve to make: a spline with no knots and too few fit points for one).
+    Curve,
+    /// Its knots make no curve: its points are joined straight.
+    KnotsNoCurve,
+    /// It has no knots, and its fit points were enough for a curve but could not be
+    /// interpolated (a system that cannot be solved, parameters that round to the same value),
+    /// or some were left out as not numbers: they are joined straight.
+    FitNotInterpolated,
+}
+
+/// Whether fit points `fit` are enough for an interpolated curve, so that no curve through them
+/// is a failure rather than nothing to curve: at least three distinct points (around the loop
+/// when `closed`), or two with a usable tangent on an open spline, and at most
+/// [`MAX_FIT_POINTS`] (beyond, they are joined straight on purpose).
+fn fit_makes_curve(fit: &[(f64, f64)], closed: bool, tangents: Tangents) -> bool {
+    let tangent = tangents.0.and_then(unit_direction).is_some() || tangents.1.and_then(unit_direction).is_some();
+    let least = if !closed && tangent { 2 } else { 3 };
+    fit.len() <= MAX_FIT_POINTS && distinct_fit(fit, closed).len() >= least
+}
+
+/// Fit points without those within 1e-12 of the one before; when `closed`, also without the
+/// last ones that repeat the first. Interpolation counts and uses these.
+fn distinct_fit(fit: &[(f64, f64)], closed: bool) -> Vec<(f64, f64)> {
+    let near = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).hypot(a.1 - b.1) <= 1e-12;
+    let mut q: Vec<(f64, f64)> = Vec::with_capacity(fit.len());
+    for &pt in fit {
+        if q.last().is_none_or(|&l| !near(l, pt)) {
+            q.push(pt);
+        }
+    }
+    while closed && q.len() > 1 && q.first().zip(q.last()).is_some_and(|(&a, &b)| near(a, b)) {
+        q.pop();
+    }
+    q
+}
+
+/// The unit direction of a tangent of any size: scaled by its largest part first, so a tiny or
+/// huge given tangent keeps its direction (only zero and values that are not numbers have none).
+fn unit_direction((x, y): (f64, f64)) -> Option<(f64, f64)> {
+    let m = x.abs().max(y.abs());
+    if !(m.is_finite() && m > 0.0) {
+        return None;
+    }
+    let (x, y) = (x / m, y / m);
+    let l = x.hypot(y);
+    Some((x / l, y / l))
+}
+
+/// The fit points of a SPLINE (codes 11/21, each x followed by its y), and whether any was left
+/// out because a coordinate is missing, not a number or not finite.
+fn fit_pairs(e: &Entity) -> (Vec<(f64, f64)>, bool) {
+    let number = |v: &str| v.trim().parse::<f64>().ok().filter(|v| v.is_finite());
+    let mut fit = Vec::new();
+    let mut invalid = false;
+    // The x of the point being read: `Some(None)` when it is not a number.
+    let mut x: Option<Option<f64>> = None;
+    for (c, v) in &e.codes {
+        match *c {
+            11 => {
+                if x.is_some() {
+                    invalid = true;
+                }
+                x = Some(number(v));
+            }
+            21 => match x.take() {
+                Some(Some(px)) => match number(v) {
+                    Some(py) => fit.push((px, py)),
+                    None => invalid = true,
+                },
+                _ => invalid = true,
+            },
+            _ => {}
+        }
+    }
+    (fit, invalid || x.is_some())
+}
+
 /// Points of a SPLINE entity: the curve through its control points, else through its fit
-/// points; and whether it is closed.
-fn spline_points(e: &Entity) -> (Vec<(f64, f64)>, bool) {
+/// points (with its end tangents, codes 12/22 and 13/23, when given); whether it is closed; and
+/// how its points were found.
+fn spline_points(e: &Entity) -> (Vec<(f64, f64)>, bool, SplineShape) {
     let closed = (e.f(70) as i64) & 1 == 1;
     // Whole pairs only, both coordinates finite: a NaN would make the project file unreadable.
     let finite = |(x, y): &(f64, f64)| x.is_finite() && y.is_finite();
     let ctrl: Vec<(f64, f64)> = e.all(10).into_iter().zip(e.all(20)).filter(finite).collect();
-    let fit: Vec<(f64, f64)> = e.all(11).into_iter().zip(e.all(21)).filter(finite).collect();
+    let (fit, fit_invalid) = fit_pairs(e);
     let degree = e.f_or(71, 3.0).max(0.0) as usize;
-    if let Some(pts) = bspline_points(&ctrl, &e.all(40), &e.all(41), degree) {
-        return (pts, closed);
+    let knots = e.all(40);
+    if let Some(pts) = bspline_points(&ctrl, &knots, &e.all(41), degree) {
+        return (pts, closed, SplineShape::Curve);
     }
+    // A tangent counts only when both its coordinates are numbers in the file.
+    let number = |c: i32| {
+        e.get(c)
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+    };
+    let tangent = |x: i32, y: i32| number(x).zip(number(y));
+    let tangents = (tangent(12, 22), tangent(13, 23));
+    // A closed spline goes round smoothly through its first point; its end tangents, if any,
+    // do not apply.
+    // A fit point that is not a pair of numbers leaves a gap: no curve is made through the rest.
+    let through = if fit_invalid {
+        None
+    } else if closed {
+        through_fit_points_closed(&fit, degree)
+    } else {
+        through_fit_points(&fit, degree, tangents)
+    };
+    if let Some(pts) = through {
+        return (pts, closed, SplineShape::Curve);
+    }
+    let shape = if !(knots.is_empty() || ctrl.is_empty()) {
+        SplineShape::KnotsNoCurve
+    } else if fit_makes_curve(&fit, closed, tangents) || (fit_invalid && fit.len() >= 2) {
+        // Enough points for a curve that could not be made, or points left out as not numbers
+        // (as a hatch spline edge with such a point is said too).
+        SplineShape::FitNotInterpolated
+    } else {
+        SplineShape::Curve
+    };
     if fit.len() >= 2 {
-        return (fit, closed);
+        return (fit, closed, shape);
     }
-    (ctrl, closed)
+    (ctrl, closed, shape)
 }
 
 /// Reads the group codes of an entity in order.
@@ -699,6 +1322,16 @@ impl Cursor<'_> {
         self.i += 1;
         v.trim().parse::<f64>().ok().filter(|v| v.is_finite()).or(Some(0.0))
     }
+    /// Whether the pair `ahead` places on holds `code` with a number (not moving the cursor).
+    fn valid_at(&self, ahead: usize, code: i32) -> bool {
+        self.codes
+            .get(self.i + ahead)
+            .is_some_and(|(c, v)| *c == code && v.trim().parse::<f64>().is_ok_and(f64::is_finite))
+    }
+    /// Whether the next pair holds `code` with a number.
+    fn valid(&self, code: i32) -> bool {
+        self.valid_at(0, code)
+    }
     fn count(&mut self, code: i32) -> usize {
         self.take(code).map_or(0, |n| n.clamp(0.0, 100_000.0) as usize)
     }
@@ -709,7 +1342,9 @@ impl Cursor<'_> {
 
 /// Points of a polyline vertex list with bulges: an arc between two points where the bulge is
 /// not zero (bulge = tan(sweep / 4), positive counter-clockwise).
-fn bulged(vertices: &[((f64, f64), f64)], closed: bool) -> Vec<(f64, f64)> {
+/// `None` when a bulged segment cannot be sampled (its numbers overflow), so the caller does not
+/// draw a straight side in place of an arc.
+fn bulged(vertices: &[((f64, f64), f64)], closed: bool) -> Option<Vec<(f64, f64)>> {
     let mut out = Vec::new();
     let n = vertices.len();
     for i in 0..n {
@@ -735,13 +1370,18 @@ fn bulged(vertices: &[((f64, f64), f64)], closed: bool) -> Vec<(f64, f64)> {
         let a0 = (a.1 - c.1).atan2(a.0 - c.0).to_degrees();
         let a1 = (b.1 - c.1).atan2(b.0 - c.0).to_degrees();
         let pts = arc_points(c, r, a0, a1, bulge > 0.0);
+        if pts.len() < 2 || !pts.iter().all(|p| p.0.is_finite() && p.1.is_finite()) {
+            return None;
+        }
         out.extend(pts.iter().skip(1).take(pts.len().saturating_sub(2)));
     }
-    out
+    Some(out)
 }
 
-/// The boundary loops of a HATCH, as DXF points. Unreadable loops are left out.
-fn hatch_loops(e: &Entity) -> Vec<Vec<(f64, f64)>> {
+/// The boundary loops of a HATCH, as DXF points, each with how many of its spline edges were
+/// joined straight because their fit points could not be interpolated. Unreadable loops are left
+/// out.
+fn hatch_loops(e: &Entity) -> Vec<(Vec<(f64, f64)>, usize)> {
     let mut cur = Cursor { codes: &e.codes, i: 0 };
     // Skip the elevation point, extrusion, pattern name and flags up to the loop count.
     let Some(start) = e.codes.iter().position(|(c, _)| *c == 91) else {
@@ -753,6 +1393,8 @@ fn hatch_loops(e: &Entity) -> Vec<Vec<(f64, f64)>> {
     for _ in 0..loops {
         let Some(flags) = cur.take(92) else { break };
         let mut pts: Vec<(f64, f64)> = Vec::new();
+        // Spline edges of this loop whose fit points could not be interpolated (joined straight).
+        let mut fit_failed = 0;
         if (flags as i64) & 2 == 2 {
             let has_bulge = cur.take(72).unwrap_or(0.0) != 0.0;
             let _closed = cur.take(73);
@@ -763,7 +1405,9 @@ fn hatch_loops(e: &Entity) -> Vec<Vec<(f64, f64)>> {
                 let bulge = if has_bulge { cur.take(42).unwrap_or(0.0) } else { 0.0 };
                 vs.push((v, bulge));
             }
-            pts = bulged(&vs, true);
+            // A bulge that cannot be sampled marks the loop as not numbers, so the HATCH arm
+            // leaves it out and counts it rather than drawing a straight side.
+            pts = bulged(&vs, true).unwrap_or_else(|| vec![(f64::NAN, f64::NAN); 3]);
         } else {
             let edges = cur.count(93);
             for edge in 0..edges {
@@ -833,11 +1477,34 @@ fn hatch_loops(e: &Entity) -> Vec<Vec<(f64, f64)>> {
                         let fit_follows = matches!(cur.codes.get(cur.i + 1), Some((11 | 12, _)))
                             || (next_is_count && (zero || edge + 1 < edges));
                         let nf = if fit_follows { cur.count(97) } else { 0 };
-                        let fit: Vec<(f64, f64)> = (0..nf).filter_map(|_| cur.point(11, 21)).collect();
-                        let _ = (cur.point(12, 22), cur.point(13, 23));
-                        bspline_points(&ctrl, &knots, &weights, degree)
-                            .or((fit.len() >= 2).then_some(fit))
-                            .unwrap_or(ctrl)
+                        // Fit points are interpolated only when they are all numbers (the cursor
+                        // reads anything else as 0).
+                        let mut numbers = true;
+                        let fit: Vec<(f64, f64)> = (0..nf)
+                            .filter_map(|_| {
+                                numbers &= cur.valid(11) && cur.valid_at(1, 21);
+                                cur.point(11, 21)
+                            })
+                            .collect();
+                        let mut tangent = |x: i32, y: i32| {
+                            let valid = cur.valid(x) && cur.valid_at(1, y);
+                            cur.point(x, y).filter(|_| valid)
+                        };
+                        let tangents = (tangent(12, 22), tangent(13, 23));
+                        if let Some(pts) = bspline_points(&ctrl, &knots, &weights, degree)
+                            .or_else(|| numbers.then(|| through_fit_points(&fit, degree, tangents)).flatten())
+                        {
+                            pts
+                        } else if fit.len() >= 2 {
+                            // A fit point that is not a number, or enough of them for a curve
+                            // that could not be made: joined straight, and said.
+                            if !numbers || fit_makes_curve(&fit, false, tangents) {
+                                fit_failed += 1;
+                            }
+                            fit
+                        } else {
+                            ctrl
+                        }
                     }
                     _ => break,
                 };
@@ -868,7 +1535,7 @@ fn hatch_loops(e: &Entity) -> Vec<Vec<(f64, f64)>> {
             pts.pop();
         }
         if pts.len() >= 3 {
-            out.push(pts);
+            out.push((pts, fit_failed));
         }
     }
     out
@@ -917,14 +1584,32 @@ fn crosses(p: (f64, f64), q: (f64, f64), c: (f64, f64), d: (f64, f64)) -> bool {
     ((d1 > eps && d2 < -eps) || (d1 < -eps && d2 > eps)) && ((d3 > eps && d4 < -eps) || (d3 < -eps && d4 > eps))
 }
 
+/// A closed boundary, as DXF points.
+type Loop = Vec<(f64, f64)>;
+
+/// [`with_holes_kept`] without the loops it kept.
+#[cfg(test)]
+fn with_holes(loops: &[Vec<(f64, f64)>], style: i64) -> Option<Vec<Vec<(f64, f64)>>> {
+    with_holes_kept(loops, style).map(|(out, _)| out)
+}
+
 /// The loops of a solid fill as outlines that fill right with the non-zero and even-odd rules
 /// alike: every loop inside an odd number of others is a hole, cut into the loop just around it
 /// along the shortest bridge, so one outline goes round the solid part and back round the hole.
-/// `None` when the loops are too many or too big to work out within the budgets: a fill that
-/// covered the holes would be wrong.
-fn with_holes(loops: &[Vec<(f64, f64)>], style: i64) -> Option<Vec<Vec<(f64, f64)>>> {
-    let mut loops: Vec<Vec<(f64, f64)>> = loops.iter().filter(|l| l.len() >= 3).cloned().collect();
-    loops.sort_by(|a, b| area2(b).abs().total_cmp(&area2(a).abs()));
+/// Also, for each loop given, whether the fill style keeps it (Outer drops islands inside
+/// islands, Ignore every island; a loop of fewer than three points is dropped). `None` when the
+/// loops are too many or too big to work out within the budgets: a fill that covered the holes
+/// would be wrong.
+fn with_holes_kept(loops: &[Vec<(f64, f64)>], style: i64) -> Option<(Vec<Loop>, Vec<bool>)> {
+    let mut kept = vec![false; loops.len()];
+    let mut order: Vec<usize> = (0..loops.len())
+        .filter(|&i| loops.get(i).is_some_and(|l| l.len() >= 3))
+        .collect();
+    order.sort_by(|&a, &b| {
+        let area = |i: usize| loops.get(i).map_or(0.0, |l| area2(l).abs());
+        area(b).total_cmp(&area(a))
+    });
+    let loops: Vec<Vec<(f64, f64)>> = order.iter().filter_map(|&i| loops.get(i).cloned()).collect();
     // For each loop, the smallest loop around it (bigger, so earlier) and its nesting depth.
     let mut parent: Vec<Option<usize>> = Vec::with_capacity(loops.len());
     let mut depth: Vec<usize> = Vec::with_capacity(loops.len());
@@ -955,6 +1640,9 @@ fn with_holes(loops: &[Vec<(f64, f64)>], style: i64) -> Option<Vec<Vec<(f64, f64
         let level = *depth.get(i)?;
         if (style == 1 && level >= 2) || (style == 2 && level >= 1) {
             continue;
+        }
+        if let Some(k) = order.get(i).and_then(|&o| kept.get_mut(o)) {
+            *k = true;
         }
         let mut lp = lp.clone();
         if level.is_multiple_of(2) {
@@ -1028,7 +1716,7 @@ fn with_holes(loops: &[Vec<(f64, f64)>], style: i64) -> Option<Vec<Vec<(f64, f64
         cut.extend(o.get(a..)?);
         *o = cut;
     }
-    Some(outer.into_iter().flatten().collect())
+    Some((outer.into_iter().flatten().collect(), kept))
 }
 
 /// One warning per entity kind that was not read.
@@ -1043,6 +1731,24 @@ fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
                 format!(
                     "{n} entit{s} not drawn: in blocks nested more than {MAX_NESTING} deep (or inserting themselves)"
                 )
+            } else if kind == SPLINE_NOT_NUMBERS {
+                let s = if n == 1 { "" } else { "s" };
+                format!("{n} SPLINE{s} whose points are not numbers once placed, left out")
+            } else if kind == SPLINE_TOO_FEW {
+                let s = if n == 1 { "" } else { "s" };
+                format!("{n} SPLINE{s} with too few points to draw, left out")
+            } else if kind == SPLINE_FIT_FAILED {
+                let s = if n == 1 { "" } else { "s" };
+                format!("{n} SPLINE{s} whose fit points could not be interpolated, drawn through their points")
+            } else if kind == SPLINE_NOT_CURVE {
+                let s = if n == 1 { "" } else { "s" };
+                format!("{n} SPLINE{s} whose knots make no curve, drawn through their points")
+            } else if kind == POLYLINE_NOT_NUMBERS {
+                let s = if n == 1 { "" } else { "s" };
+                format!("{n} polyline{s} whose points are not numbers once placed, left out")
+            } else if kind == HATCH_NOT_NUMBERS {
+                let s = if n == 1 { "" } else { "es" };
+                format!("{n} HATCH{s} with a boundary that is not numbers: that boundary left out")
             } else if kind == HATCH_UNFILLED {
                 let s = if n == 1 { "" } else { "es" };
                 format!("{n} solid HATCH{s} with too many or too complex holes drawn as outline only, not filled")
@@ -1134,6 +1840,40 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
     // Top-to-bottom, left-to-right, so the first pin (the origin) is the top one.
     pins.sort_by(|a, b| a.1.y.total_cmp(&b.1.y).then(a.1.x.total_cmp(&b.1.x)));
     Ok((make_symbol(id, name, graphics, pins)?, skipped_warnings(skipped)))
+}
+
+/// Import a maker's outline drawing (usually the front view from its CAE data) as a part's
+/// footprint for cabinet layouts (#312). Units are taken as mm at 1:1; every entity WiringCraft
+/// can read is kept, moved so the drawing's top-left corner is at (0, 0), and the drawing's
+/// extents become the footprint's width and height. Warnings name the kinds of entity not read.
+pub fn footprint(text: &str) -> Result<(wc_core::Footprint, Vec<String>)> {
+    let d = parse(text)?;
+    let mut raw = Vec::new();
+    let mut points = Vec::new();
+    let mut skipped = BTreeMap::new();
+    shapes(
+        &d,
+        &d.entities,
+        Xf::ID,
+        1.0,
+        0,
+        &|_| false,
+        &mut raw,
+        &mut points,
+        &mut skipped,
+        &mut { MAX_DRAWN },
+    );
+    let graphics: Vec<Shape> = raw.into_iter().map(|(_, s)| s).collect();
+    let warnings = skipped_warnings(skipped);
+    let Some(footprint) = wc_core::Footprint::from_shapes(graphics) else {
+        // Say what was left out, which is often why nothing usable is left.
+        let mut why = "the drawing has no outline WiringCraft can read, or it is not a usable size".to_owned();
+        if !warnings.is_empty() {
+            why.push_str(&format!(" ({})", warnings.join("; ")));
+        }
+        return Err(Error::Format(why));
+    };
+    Ok((footprint, warnings))
 }
 
 /// The result of importing a drawing onto a page.
@@ -1296,6 +2036,64 @@ mod tests {
     }
 
     #[test]
+    fn a_maker_outline_becomes_a_footprint_at_its_real_size() -> Result<()> {
+        // A 22.5 x 100 mm module drawn with its lower-left corner at (500, 300), a screw circle
+        // near the top, and a 3D face that is not read.
+        let ents = "0\nLWPOLYLINE\n8\nOUTLINE\n90\n4\n70\n1\n10\n500\n20\n300\n10\n522.5\n20\n300\n10\n522.5\n20\n400\n10\n500\n20\n400\n\
+                    0\nCIRCLE\n8\n0\n10\n511.25\n20\n395\n40\n2\n\
+                    0\n3DFACE\n8\n0\n10\n0\n20\n0\n30\n0\n";
+        let (f, warnings) = footprint(&dxf(ents, ""))?;
+        assert!((f.width - 22.5).abs() < 1e-9, "{}", f.width);
+        assert!((f.height - 100.0).abs() < 1e-9, "{}", f.height);
+        assert_eq!(f.shapes.len(), 2);
+        let Shape::Circle { center, .. } = &f.shapes[1] else {
+            unreachable!("the screw is a circle")
+        };
+        assert!(
+            (center.x - 11.25).abs() < 1e-9 && (center.y - 5.0).abs() < 1e-9,
+            "{center:?}"
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(footprint(&dxf("", "")).is_err(), "an empty drawing is refused");
+        // Only entities it cannot read: the error names them.
+        let Err(e) = footprint(&dxf("0\n3DFACE\n8\n0\n10\n0\n20\n0\n30\n0\n", "")) else {
+            unreachable!("nothing readable is refused")
+        };
+        assert!(e.to_string().contains("3DFACE"), "{e}");
+        // A bulged side is an arc: a half circle over a 10 mm chord stands 5 mm high.
+        let half = "0\nLWPOLYLINE\n8\n0\n90\n2\n70\n1\n10\n0\n20\n0\n42\n1\n10\n10\n20\n0\n";
+        let (f, _) = footprint(&dxf(half, ""))?;
+        assert!(
+            (f.width - 10.0).abs() < 1e-6 && (f.height - 5.0).abs() < 1e-6,
+            "{} x {}",
+            f.width,
+            f.height
+        );
+        // A block referenced in another case than it is defined in is still drawn.
+        let blocks = "0\nBLOCK\n2\nOUTLINE\n0\nLWPOLYLINE\n90\n4\n70\n1\n10\n0\n20\n0\n10\n20\n20\n0\n10\n20\n20\n40\n10\n0\n20\n40\n0\nENDBLK\n";
+        let (f, _) = footprint(&dxf("0\nINSERT\n2\noutline\n10\n0\n20\n0\n", blocks))?;
+        assert_eq!((f.width, f.height), (20.0, 40.0));
+        // The old POLYLINE/VERTEX form keeps its bulges too.
+        let old_form = "0\nPOLYLINE\n8\n0\n70\n1\n0\nVERTEX\n8\n0\n10\n0\n20\n0\n42\n1\n\
+                        0\nVERTEX\n8\n0\n10\n10\n20\n0\n0\nSEQEND\n";
+        let (f, _) = footprint(&dxf(old_form, ""))?;
+        assert!((f.height - 5.0).abs() < 1e-6, "{}", f.height);
+        // A polyline scaled past the number range is left out and said, the rest still drawn.
+        let huge = "0\nBLOCK\n2\nHUGE\n0\nLWPOLYLINE\n90\n2\n70\n0\n10\n0\n20\n0\n10\n1e308\n20\n0\n0\nENDBLK\n";
+        let ents = format!("{half}0\nINSERT\n2\nHUGE\n10\n0\n20\n0\n41\n10\n42\n10\n");
+        let (f, warnings) = footprint(&dxf(&ents, huge))?;
+        assert!((f.width - 10.0).abs() < 1e-6, "{}", f.width);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("polyline whose points are not numbers")),
+            "{warnings:?}"
+        );
+        assert!(footprint("not a dxf").is_err());
+        Ok(())
+    }
+
+    #[test]
     fn hostile_input() {
         assert!(symbol("not a dxf", "x", "x").is_err());
         assert!(symbol("AutoCAD Binary DXF\r\n", "x", "x").is_err());
@@ -1333,6 +2131,182 @@ mod tests {
                 if (*start + 90.0).abs() < 1e-9 && end.abs() < 1e-9)),
             "{shapes:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_circle_scaled_differently_along_x_and_y_is_an_ellipse() -> Result<()> {
+        // A radius-10 circle and a quarter arc, inserted at scale (4, 1) and at scale 2 (#307).
+        let blocks = "0\nBLOCK\n2\nB\n0\nCIRCLE\n10\n0\n20\n0\n40\n10\n\
+                      0\nARC\n10\n0\n20\n0\n40\n10\n50\n0\n51\n90\n0\nENDBLK\n";
+        let d = parse(&dxf(
+            "0\nINSERT\n2\nB\n10\n0\n20\n0\n41\n4\n42\n1\n0\nINSERT\n2\nB\n10\n100\n20\n0\n41\n2\n42\n2\n",
+            blocks,
+        ))?;
+        let mut skipped = BTreeMap::new();
+        let mut budget = MAX_DRAWN;
+        let (shapes, _) = draw_mapped(&d, &d.entities, [1.0, 0.0, 0.0, 1.0], 0.0, &mut skipped, &mut budget);
+        let polylines: Vec<(&Vec<Point>, bool)> = shapes
+            .iter()
+            .filter_map(|(_, s)| match s {
+                Shape::Polyline { points, closed, .. } => Some((points, *closed)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(polylines.len(), 2, "{shapes:?}");
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        // The circle: 80 x 20 around the insertion point, closed.
+        let (circle, closed) = polylines[0];
+        assert!(closed);
+        let (min_x, max_x) = circle
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(a, b), p| (a.min(p.x), b.max(p.x)));
+        let (min_y, max_y) = circle
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(a, b), p| (a.min(p.y), b.max(p.y)));
+        assert!(
+            near(min_x, -40.0) && near(max_x, 40.0) && near(min_y, -10.0) && near(max_y, 10.0),
+            "{circle:?}"
+        );
+        // The arc runs from (40, 0) to (0, 10), which is (0, -10) on the y-down page.
+        let (arc, closed) = polylines[1];
+        assert!(!closed);
+        let (first, last) = (arc[0], arc[arc.len() - 1]);
+        assert!(near(first.x, 40.0) && near(first.y, 0.0), "{first:?}");
+        assert!(near(last.x, 0.0) && near(last.y, -10.0), "{last:?}");
+        // A uniform scale keeps them a circle and an arc.
+        assert!(
+            shapes
+                .iter()
+                .any(|(_, s)| matches!(s, Shape::Circle { radius, .. } if near(*radius, 20.0))),
+            "{shapes:?}"
+        );
+        assert!(
+            shapes
+                .iter()
+                .any(|(_, s)| matches!(s, Shape::Arc { radius, .. } if near(*radius, 20.0))),
+            "{shapes:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_pin_circle_in_a_stretched_block_is_still_a_pin() -> Result<()> {
+        let blocks = "0\nBLOCK\n2\nP\n0\nCIRCLE\n8\nPIN\n10\n0\n20\n5\n40\n1\n\
+                      0\nLINE\n8\n0\n10\n0\n20\n0\n11\n0\n21\n5\n0\nENDBLK\n";
+        // A closed outline drawn on the pin layer is not a pin.
+        let ents = "0\nINSERT\n2\nP\n10\n0\n20\n0\n41\n4\n42\n1\n0\nPOINT\n8\nPIN\n10\n0\n20\n0\n\
+                    0\nLWPOLYLINE\n8\nPIN\n70\n1\n10\n10\n20\n10\n10\n12\n20\n10\n10\n12\n20\n12\n";
+        let s = symbol(&dxf(ents, blocks), "my.stretched", "Stretched")?;
+        assert_eq!(s.pins.len(), 2, "{:?}", s.pins);
+        assert_eq!(s.pins[0].at.distance(s.pins[1].at), 5.0, "{:?}", s.pins);
+        Ok(())
+    }
+
+    #[test]
+    fn a_huge_stretched_circle_that_places_in_range_is_drawn() -> Result<()> {
+        // Centre and radius 1e308 at scale (0.5, 0.25): adding them in the block overflows, but
+        // the placed ellipse is in range.
+        let blocks = "0\nBLOCK\n2\nB\n0\nCIRCLE\n10\n1e308\n20\n0\n40\n1e308\n\
+                      0\nARC\n10\n1e308\n20\n0\n40\n1e308\n50\n0\n51\n90\n0\nENDBLK\n";
+        let d = parse(&dxf("0\nINSERT\n2\nB\n10\n0\n20\n0\n41\n0.5\n42\n0.25\n", blocks))?;
+        let mut skipped = BTreeMap::new();
+        let mut budget = MAX_DRAWN;
+        let (shapes, _) = draw_mapped(&d, &d.entities, [1.0, 0.0, 0.0, 1.0], 0.0, &mut skipped, &mut budget);
+        assert_eq!(shapes.len(), 2, "{shapes:?} {skipped:?}");
+        for (_, s) in &shapes {
+            assert!(
+                matches!(s, Shape::Polyline { points, .. } if points.iter().all(|p| p.x.is_finite() && p.y.is_finite())),
+                "{s:?}"
+            );
+        }
+        // One whose placed points are out of range is left out and counted.
+        let d = parse(&dxf("0\nINSERT\n2\nB\n10\n0\n20\n0\n41\n4\n42\n1\n", blocks))?;
+        let mut skipped = BTreeMap::new();
+        let mut budget = MAX_DRAWN;
+        let (shapes, _) = draw_mapped(&d, &d.entities, [1.0, 0.0, 0.0, 1.0], 0.0, &mut skipped, &mut budget);
+        assert!(shapes.is_empty(), "{shapes:?}");
+        assert_eq!(skipped.get(STRETCHED_NOT_NUMBERS), Some(&2), "{skipped:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn stretched_circles_on_a_page_tiny_scales_and_lost_arcs() -> Result<()> {
+        type Drawn = (Vec<(String, Shape)>, BTreeMap<String, usize>);
+        let draw = |blocks: &str, insert: &str| -> Result<Drawn> {
+            let d = parse(&dxf(insert, blocks))?;
+            let mut skipped = BTreeMap::new();
+            let mut budget = MAX_DRAWN;
+            let (shapes, _) = draw_mapped(&d, &d.entities, [1.0, 0.0, 0.0, 1.0], 0.0, &mut skipped, &mut budget);
+            Ok((shapes, skipped))
+        };
+        // On a page, a circle on a pin layer is drawn like any other: stretched to 80 x 20.
+        let (shapes, _) = draw(
+            "0\nBLOCK\n2\nB\n0\nCIRCLE\n8\nPIN\n10\n0\n20\n0\n40\n10\n0\nENDBLK\n",
+            "0\nINSERT\n2\nB\n10\n0\n20\n0\n41\n4\n42\n1\n",
+        )?;
+        let width = |s: &Shape| match s {
+            Shape::Polyline { points, .. } => {
+                let xs = points.iter().map(|p| p.x);
+                xs.clone().fold(f64::MIN, f64::max) - xs.fold(f64::MAX, f64::min)
+            }
+            _ => 0.0,
+        };
+        assert_eq!(shapes.len(), 1, "{shapes:?}");
+        assert!((width(&shapes[0].1) - 80.0).abs() < 1e-9, "{shapes:?}");
+        // Scales (1e-200, 2e-200) on a radius of 1e200: an ellipse 2 x 4, not a circle of radius 0.
+        let (shapes, _) = draw(
+            "0\nBLOCK\n2\nB\n0\nCIRCLE\n10\n0\n20\n0\n40\n1e200\n0\nENDBLK\n",
+            "0\nINSERT\n2\nB\n10\n0\n20\n0\n41\n1e-200\n42\n2e-200\n",
+        )?;
+        assert_eq!(shapes.len(), 1, "{shapes:?}");
+        assert!((width(&shapes[0].1) - 2.0).abs() < 1e-9, "{shapes:?}");
+        // A uniform scale of 1e200 on a radius of 1e-200: a circle and an arc of radius 1.
+        let (shapes, _) = draw(
+            "0\nBLOCK\n2\nB\n0\nCIRCLE\n10\n0\n20\n0\n40\n1e-200\n\
+             0\nARC\n10\n0\n20\n0\n40\n1e-200\n50\n0\n51\n90\n0\nENDBLK\n",
+            "0\nINSERT\n2\nB\n10\n0\n20\n0\n41\n1e200\n42\n1e200\n",
+        )?;
+        assert_eq!(shapes.len(), 2, "{shapes:?}");
+        assert!(
+            shapes.iter().all(|(_, s)| matches!(s,
+                Shape::Circle { radius, .. } | Shape::Arc { radius, .. } if (*radius - 1.0).abs() < 1e-9)),
+            "{shapes:?}"
+        );
+        // Scales (1e200, 1e-200) keep a text's mean scale of 1, not a height of 0.
+        let (shapes, _) = draw(
+            "0\nBLOCK\n2\nB\n0\nTEXT\n10\n0\n20\n0\n40\n2.5\n1\nT\n0\nENDBLK\n",
+            "0\nINSERT\n2\nB\n10\n0\n20\n0\n41\n1e200\n42\n1e-200\n",
+        )?;
+        assert!(
+            matches!(&shapes[..], [(_, Shape::Text { height, .. })] if (*height - 2.5).abs() < 1e-9),
+            "{shapes:?}"
+        );
+        // Mirrored at scales (-1e-200, 1e-200), a quarter arc of radius 1e200 runs like one of
+        // radius 1 mirrored at (-1, 1), not the other way round.
+        let arc = |r: &str, sx: &str, sy: &str| {
+            draw(
+                &format!("0\nBLOCK\n2\nB\n0\nARC\n10\n0\n20\n0\n40\n{r}\n50\n0\n51\n90\n0\nENDBLK\n"),
+                &format!("0\nINSERT\n2\nB\n10\n0\n20\n0\n41\n{sx}\n42\n{sy}\n"),
+            )
+            .map(|(s, _)| s)
+        };
+        let (tiny, plain) = (arc("1e200", "-1e-200", "1e-200")?, arc("1", "-1", "1")?);
+        assert!(
+            matches!((&tiny[..], &plain[..]), (
+                [(_, Shape::Arc { radius: r1, start: s1, end: e1, .. })],
+                [(_, Shape::Arc { radius: r2, start: s2, end: e2, .. })],
+            ) if (r1 - r2).abs() < 1e-9 && (s1 - s2).abs() < 1e-9 && (e1 - e2).abs() < 1e-9),
+            "{tiny:?} {plain:?}"
+        );
+        // An arc whose angles give no points is left out and said, next to a line that is drawn.
+        let (shapes, skipped) = draw(
+            "0\nBLOCK\n2\nB\n0\nARC\n10\n0\n20\n0\n40\n1\n50\n-1e308\n51\n1e308\n\
+             0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n0\nENDBLK\n",
+            "0\nINSERT\n2\nB\n10\n0\n20\n0\n41\n4\n42\n1\n",
+        )?;
+        assert_eq!(shapes.len(), 1, "{shapes:?}");
+        assert_eq!(skipped.get(STRETCHED_NOT_NUMBERS), Some(&1), "{skipped:?}");
         Ok(())
     }
 
@@ -1456,8 +2430,128 @@ mod tests {
         let ents = "0\nSPLINE\n71\n3\n74\n3\n11\n0\n21\n0\n11\n5\n21\n5\n11\n10\n21\n0\n";
         let (g, _) = drawn(ents, "")?;
         let (s, _, _) = poly(&g[0]);
-        assert_eq!(s, [Point::new(0.0, 0.0), Point::new(5.0, -5.0), Point::new(10.0, 0.0)]);
+        // A smooth curve through the three points, not two straight segments.
+        let near = |a: &Point, b: Point| a.distance(b) < 1e-6;
+        assert!(s.len() > 10, "{s:?}");
+        assert!(near(&s[0], Point::new(0.0, 0.0)) && s.last().is_some_and(|q| near(q, Point::new(10.0, 0.0))));
+        assert!(
+            s.iter().any(|q| near(q, Point::new(5.0, -5.0))),
+            "through the middle: {s:?}"
+        );
+        // Above the straight segment (0, 0)-(5, 5) at x = 2.5 (page y is down).
+        let quarter = s.iter().min_by(|a, b| (a.x - 2.5).abs().total_cmp(&(b.x - 2.5).abs()));
+        assert!(quarter.is_some_and(|q| -q.y > 2.5 + 0.3), "{quarter:?}");
         Ok(())
+    }
+
+    #[test]
+    fn interpolation_through_fit_points_holds_them_all() {
+        // A wave of 50 points: the curve passes through each one.
+        let fit: Vec<(f64, f64)> = (0..50).map(|i| (i as f64, (i as f64 * 0.4).sin() * 3.0)).collect();
+        let pts = through_fit_points(&fit, 3, (None, None)).unwrap_or_default();
+        assert!(!pts.is_empty(), "a wave can be interpolated");
+        for f in &fit {
+            let d = pts
+                .iter()
+                .map(|q| (q.0 - f.0).hypot(q.1 - f.1))
+                .fold(f64::MAX, f64::min);
+            assert!(d < 0.05, "{f:?} is {d} away");
+        }
+        // Two distinct points, a repeated point and points that are not numbers give none.
+        assert!(through_fit_points(&[(0.0, 0.0), (1.0, 1.0)], 3, (None, None)).is_none());
+        assert!(through_fit_points(&[(0.0, 0.0), (0.0, 0.0), (0.0, 0.0)], 3, (None, None)).is_none());
+        assert!(through_fit_points(&[(0.0, 0.0), (f64::NAN, 1.0), (2.0, 0.0)], 3, (None, None)).is_none());
+        // Straight points stay on their line.
+        let line = through_fit_points(&[(0.0, 0.0), (1.0, 1.0), (3.0, 3.0), (4.0, 4.0)], 3, (None, None));
+        assert!(line.is_some_and(|l| l.iter().all(|q| (q.0 - q.1).abs() < 1e-9)));
+    }
+
+    #[test]
+    fn a_closed_spline_by_fit_points_closes_without_a_corner() -> Result<()> {
+        // Four points on a circle of radius 10, closed (70 bit 1): a round loop.
+        let ents = "0\nSPLINE\n70\n1\n71\n3\n74\n4\n11\n10\n21\n0\n11\n0\n21\n10\n11\n-10\n21\n0\n11\n0\n21\n-10\n";
+        let (g, _) = drawn(ents, "")?;
+        let (s, closed, _) = poly(&g[0]);
+        assert!(closed);
+        assert!(s.len() > 20, "{s:?}");
+        let near = |a: &Point, b: Point| a.distance(b) < 1e-6;
+        // It passes through all four points and ends where it starts.
+        for (x, y) in [(10.0, 0.0), (0.0, -10.0), (-10.0, 0.0), (0.0, 10.0)] {
+            assert!(s.iter().any(|q| near(q, Point::new(x, y))), "through ({x}, {y})");
+        }
+        let (first, last) = (s[0], s[s.len() - 1]);
+        assert!(near(&first, last), "{first:?} {last:?}");
+        // The direction turns at the start no more than between any two samples elsewhere:
+        // a smooth loop, not a corner (sampling alone turns a few degrees per step).
+        let dir = |a: Point, b: Point| (b.y - a.y).atan2(b.x - a.x);
+        let turn = |a: f64, b: f64| {
+            ((b - a + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI)
+                .abs()
+                .to_degrees()
+        };
+        let seam = turn(dir(s[s.len() - 2], last), dir(first, s[1]));
+        let most = s
+            .windows(3)
+            .map(|w| turn(dir(w[0], w[1]), dir(w[1], w[2])))
+            .fold(0.0, f64::max);
+        assert!(
+            seam < most * 1.1 + 0.1 && seam < 6.0,
+            "{seam} degrees at the start, {most} elsewhere"
+        );
+        // Symmetric points give a round curve: never far from the circle.
+        assert!(s.iter().all(|q| (q.x.hypot(q.y) - 10.0).abs() < 0.6), "{s:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn closed_interpolation_in_any_degree() {
+        let square = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)];
+        for degree in [0, 2, 3, 4, 5] {
+            // The first point repeated at the end is the same loop.
+            let mut repeated = square.to_vec();
+            repeated.push(square[0]);
+            let a = through_fit_points_closed(&square, degree).unwrap_or_default();
+            let b = through_fit_points_closed(&repeated, degree).unwrap_or_default();
+            assert!(a.len() > 10, "degree {degree}");
+            assert_eq!(a, b, "degree {degree}");
+            assert_eq!(a.first(), a.last(), "degree {degree}");
+            for f in square {
+                let d = a.iter().map(|q| (q.0 - f.0).hypot(q.1 - f.1)).fold(f64::MAX, f64::min);
+                assert!(d < 0.05, "degree {degree}: {f:?} is {d} away");
+            }
+        }
+        // Degree 1 is the closed polygon, every vertex kept, even ones closer than the
+        // repeat tolerance.
+        assert_eq!(
+            through_fit_points_closed(&square, 1),
+            Some(vec![square[0], square[1], square[2], square[3], square[0]])
+        );
+        let tiny = [(0.0, 0.0), (0.0, 5e-13), (2e-12, 0.0), (4e-12, 0.0)];
+        assert_eq!(
+            through_fit_points_closed(&tiny, 1),
+            Some(vec![tiny[0], tiny[1], tiny[2], tiny[3], tiny[0]])
+        );
+        // Degrees 4 and 5 need more than four points to be used as asked: eight on a circle.
+        let ring: Vec<(f64, f64)> = (0..8)
+            .map(|k| {
+                let t = k as f64 * std::f64::consts::TAU / 8.0;
+                (10.0 * t.cos(), 10.0 * t.sin())
+            })
+            .collect();
+        for degree in [4, 5] {
+            let a = through_fit_points_closed(&ring, degree).unwrap_or_default();
+            assert!(a.len() > 10, "degree {degree}");
+            assert_eq!(a.first(), a.last(), "degree {degree}");
+            for f in &ring {
+                let d = a.iter().map(|q| (q.0 - f.0).hypot(q.1 - f.1)).fold(f64::MAX, f64::min);
+                assert!(d < 0.05, "degree {degree}: {f:?} is {d} away");
+            }
+            // A round curve: close to the circle everywhere.
+            assert!(a.iter().all(|q| (q.0.hypot(q.1) - 10.0).abs() < 0.2), "degree {degree}");
+        }
+        // Too few distinct points, or points that are not numbers, give none.
+        assert!(through_fit_points_closed(&[(0.0, 0.0), (1.0, 1.0), (0.0, 0.0)], 3).is_none());
+        assert!(through_fit_points_closed(&[(0.0, 0.0), (f64::NAN, 1.0), (2.0, 0.0)], 3).is_none());
     }
 
     #[test]
@@ -1498,7 +2592,7 @@ mod tests {
     fn a_bulge_in_a_hatch_loop_is_an_arc() {
         // From (0,0) to (10,0) with bulge 1: a half circle turning counter-clockwise around
         // (5,0), so it passes (5,-5).
-        let pts = bulged(&[((0.0, 0.0), 1.0), ((10.0, 0.0), 0.0)], false);
+        let pts = bulged(&[((0.0, 0.0), 1.0), ((10.0, 0.0), 0.0)], false).unwrap_or_default();
         assert!(
             pts.iter().any(|p| (p.0 - 5.0).abs() < 1e-9 && (p.1 + 5.0).abs() < 1e-9),
             "{pts:?}"
@@ -1744,9 +2838,25 @@ mod tests {
     #[test]
     fn spline_points_that_are_not_numbers_are_left_out() -> Result<()> {
         let ents = "0\nSPLINE\n71\n3\n11\n0\n21\n0\n11\nNaN\n21\n1\n11\n5\n21\n1e999\n11\n10\n21\n0\n";
-        let (g, _) = drawn(ents, "")?;
+        let (g, skipped) = drawn(ents, "")?;
         let (s, _, _) = poly(&g[0]);
         assert_eq!(s, [Point::new(0.0, 0.0), Point::new(10.0, 0.0)]);
+        // Joined straight because points were left out: said.
+        assert_eq!(skipped.get(SPLINE_FIT_FAILED), Some(&1), "{skipped:?}");
+        // Also when a coordinate is not read as a number at all.
+        let ents = "0\nSPLINE\n71\n3\n11\n0\n21\n0\n11\nbad\n21\n1\n11\n10\n21\n0\n";
+        let (g, skipped) = drawn(ents, "")?;
+        assert_eq!(g.len(), 1);
+        assert_eq!(skipped.get(SPLINE_FIT_FAILED), Some(&1), "{skipped:?}");
+        // Three points left: still joined straight, and each x keeps its own y.
+        let ents = "0\nSPLINE\n71\n3\n11\n0\n21\n0\n11\nbad\n21\n9\n11\n10\n21\n0\n11\n10\n21\n10\n";
+        let (g, skipped) = drawn(ents, "")?;
+        let (s, _, _) = poly(&g[0]);
+        assert_eq!(
+            s,
+            [Point::new(0.0, 0.0), Point::new(10.0, 0.0), Point::new(10.0, -10.0)]
+        );
+        assert_eq!(skipped.get(SPLINE_FIT_FAILED), Some(&1), "{skipped:?}");
         Ok(())
     }
 
@@ -1971,6 +3081,257 @@ mod tests {
                 b: Point::new(5.0, 0.0)
             }]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn end_tangents_set_the_directions_and_degree_1_is_the_points() {
+        // Through (0, 0), (5, 5), (10, 0) leaving along +x and arriving along +x.
+        let pts = through_fit_points(
+            &[(0.0, 0.0), (5.0, 5.0), (10.0, 0.0)],
+            3,
+            (Some((1.0, 0.0)), Some((1.0, 0.0))),
+        )
+        .unwrap_or_default();
+        assert!(pts.len() > 10, "{pts:?}");
+        // The slope of the first and last sampled chords: near flat along the tangents, steep
+        // (about 2) without them.
+        let slope = |a: (f64, f64), b: (f64, f64)| ((b.1 - a.1) / (b.0 - a.0)).abs();
+        let free = through_fit_points(&[(0.0, 0.0), (5.0, 5.0), (10.0, 0.0)], 3, (None, None)).unwrap_or_default();
+        assert!(slope(pts[0], pts[1]) < 0.15, "leaves along x: {:?}", &pts[..2]);
+        assert!(slope(pts[pts.len() - 2], pts[pts.len() - 1]) < 0.15, "arrives along x");
+        assert!(slope(free[0], free[1]) > 1.0, "without tangents it leaves steeply");
+        // And along +x, not -x, at both ends.
+        assert!(
+            pts[1].0 > pts[0].0 && pts[pts.len() - 1].0 > pts[pts.len() - 2].0,
+            "towards +x"
+        );
+        let d = pts
+            .iter()
+            .map(|q| (q.0 - 5.0).hypot(q.1 - 5.0))
+            .fold(f64::MAX, f64::min);
+        assert!(d < 0.05, "through the middle point: {d}");
+        // Two points with tangents make a curve; degree 1 is the points themselves.
+        assert!(through_fit_points(&[(0.0, 0.0), (10.0, 0.0)], 3, (Some((0.0, 1.0)), Some((0.0, -1.0)))).is_some());
+        let corner = [(0.0, 0.0), (1.0, 1.0), (100.0, 0.0)];
+        assert_eq!(through_fit_points(&corner, 1, (None, None)), Some(corner.to_vec()));
+        // Degree 1 keeps points closer than the repeat tolerance.
+        let tiny = [(0.0, 0.0), (0.0, 5e-13), (2e-12, 0.0), (4e-12, 0.0)];
+        assert_eq!(through_fit_points(&tiny, 1, (None, None)), Some(tiny.to_vec()));
+        // A start tangent alone still sets the start direction.
+        let one =
+            through_fit_points(&[(0.0, 0.0), (5.0, 5.0), (10.0, 0.0)], 3, (Some((1.0, 0.0)), None)).unwrap_or_default();
+        assert!(
+            one.len() > 10 && slope(one[0], one[1]) < 0.15 && one[1].0 > one[0].0,
+            "{:?}",
+            &one[..2]
+        );
+    }
+
+    #[test]
+    fn a_tangent_that_is_not_a_number_is_ignored() -> Result<()> {
+        // Fit points (0, 0), (5, 5), (10, 0); start tangent (NaN, 1), end tangent (1, 0).
+        let ents = "0\nSPLINE\n71\n3\n12\nNaN\n22\n1\n13\n1\n23\n0\n\
+                    11\n0\n21\n0\n11\n5\n21\n5\n11\n10\n21\n0\n";
+        let (g, _) = drawn(ents, "")?;
+        let (s, _, _) = poly(&g[0]);
+        // The start tangent is ignored, so the start follows the first fit chord (slope 1, page y
+        // down: -1), not the vertical a tangent (0, 1) would give; the end follows (1, 0).
+        let slope = |a: &Point, b: &Point| (b.y - a.y) / (b.x - a.x);
+        let n = s.len();
+        assert!((slope(&s[0], &s[1]) + 1.0).abs() < 0.3, "{:?}", &s[..2]);
+        assert!(
+            slope(&s[n - 2], &s[n - 1]).abs() < 0.15 && s[n - 1].x > s[n - 2].x,
+            "{:?}",
+            &s[n - 2..]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_hatch_spline_edge_by_fit_points_is_a_curve_unless_one_is_not_a_number() -> Result<()> {
+        // One loop: a spline edge by fit points (0, 0), (5, 5), (10, 0), closed by a line.
+        let hatch = |mid: &str| {
+            format!(
+                "0\nHATCH\n2\nANSI31\n70\n0\n91\n1\n92\n1\n93\n2\n\
+                 72\n4\n94\n3\n73\n0\n74\n0\n95\n0\n96\n0\n97\n3\n11\n0\n21\n0\n11\n5\n21\n{mid}\n11\n10\n21\n0\n\
+                 72\n1\n10\n10\n20\n0\n11\n0\n21\n0\n97\n0\n"
+            )
+        };
+        let (g, _) = drawn(&hatch("5"), "")?;
+        let (s, _, _) = poly(&g[0]);
+        assert!(s.len() > 10, "a curve: {s:?}");
+        // A fit point that is not a number: joined straight, not interpolated through 0.
+        let (g, _) = drawn(&hatch("NaN"), "")?;
+        let (s, _, _) = poly(&g[0]);
+        assert!(s.len() <= 4, "straight: {s:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_spline_whose_knots_make_no_curve_says_so() -> Result<()> {
+        // A quadratic over three points whose knots leave no interval.
+        let ents = "0\nSPLINE\n71\n2\n40\n0\n40\n0\n40\n0\n40\n0\n40\n1\n40\n1\n\
+                    10\n0\n20\n0\n10\n5\n20\n10\n10\n10\n20\n0\n";
+        let (g, skipped) = drawn(ents, "")?;
+        assert_eq!(g.len(), 1, "drawn through its points");
+        assert_eq!(
+            skipped_warnings(skipped),
+            ["1 SPLINE whose knots make no curve, drawn through their points"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fit_points_that_cannot_be_interpolated_are_joined_and_said() -> Result<()> {
+        // Chords of 1e16 and 1 round two parameters to the same value: no curve through them,
+        // open or closed.
+        let fit = "11\n0\n21\n0\n11\n1e16\n21\n0\n11\n1e16\n21\n1\n11\n0\n21\n1\n";
+        for flags in ["0", "1"] {
+            let (g, skipped) = drawn(&format!("0\nSPLINE\n70\n{flags}\n71\n3\n{fit}"), "")?;
+            assert_eq!(g.len(), 1, "drawn through its points (flags {flags})");
+            let (s, _, _) = poly(&g[0]);
+            assert!(s.len() <= 5, "a polygon, not a curve: {s:?}");
+            assert_eq!(
+                skipped_warnings(skipped),
+                ["1 SPLINE whose fit points could not be interpolated, drawn through their points"],
+                "flags {flags}"
+            );
+        }
+        // Fit points that interpolate fine, and two that need no curve, are not said.
+        for ents in [
+            "0\nSPLINE\n71\n3\n11\n0\n21\n0\n11\n5\n21\n5\n11\n10\n21\n0\n",
+            "0\nSPLINE\n70\n1\n71\n3\n11\n0\n21\n0\n11\n5\n21\n5\n11\n10\n21\n0\n",
+            "0\nSPLINE\n71\n3\n11\n0\n21\n0\n11\n10\n21\n0\n",
+        ] {
+            let (g, skipped) = drawn(ents, "")?;
+            assert_eq!(g.len(), 1, "{ents:?}");
+            assert!(skipped.is_empty(), "{ents:?}: {skipped:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_hatch_spline_edge_whose_fit_points_cannot_be_interpolated_is_said() -> Result<()> {
+        // One loop: a spline edge by fit points that cannot be interpolated, closed by a line.
+        let hatch = |mid: &str| {
+            format!(
+                "0\nHATCH\n2\nANSI31\n70\n0\n91\n1\n92\n1\n93\n2\n\
+                 72\n4\n94\n3\n73\n0\n74\n0\n95\n0\n96\n0\n97\n4\n\
+                 11\n0\n21\n0\n11\n1e16\n21\n0\n11\n1e16\n21\n{mid}\n11\n0\n21\n1\n\
+                 72\n1\n10\n0\n20\n1\n11\n0\n21\n0\n97\n0\n"
+            )
+        };
+        let (g, skipped) = drawn(&hatch("1"), "")?;
+        assert_eq!(g.len(), 1);
+        assert_eq!(skipped.get(SPLINE_FIT_FAILED), Some(&1), "{skipped:?}");
+        // A fit point that is not a number is joined straight too, and said.
+        let (_, skipped) = drawn(&hatch("NaN"), "")?;
+        assert_eq!(skipped.get(SPLINE_FIT_FAILED), Some(&1), "{skipped:?}");
+        // At a scale where the loop overflows once placed, the loop is left out: only that is
+        // said, not a spline drawn through its points.
+        let d = parse(&dxf(&hatch("1"), ""))?;
+        let (mut raw, mut points, mut skipped, mut budget) = (Vec::new(), Vec::new(), BTreeMap::new(), MAX_DRAWN);
+        shapes(
+            &d,
+            &d.entities,
+            Xf::ID,
+            1e300,
+            0,
+            &|_| false,
+            &mut raw,
+            &mut points,
+            &mut skipped,
+            &mut budget,
+        );
+        assert_eq!(skipped.get(HATCH_NOT_NUMBERS), Some(&1), "{skipped:?}");
+        assert!(!skipped.contains_key(SPLINE_FIT_FAILED), "{skipped:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_spline_edge_on_an_island_the_style_ignores_is_not_said() -> Result<()> {
+        // A solid hatch: a big square, and inside it an island made of a spline edge whose fit
+        // points cannot be interpolated, closed by a line.
+        let hatch = |style: &str| {
+            format!(
+                "0\nHATCH\n2\nSOLID\n70\n1\n75\n{style}\n91\n2\n\
+                 92\n3\n72\n0\n73\n1\n93\n4\n10\n-1e17\n20\n-1e17\n10\n1e17\n20\n-1e17\n\
+                 10\n1e17\n20\n1e17\n10\n-1e17\n20\n1e17\n97\n0\n\
+                 92\n16\n93\n2\n72\n4\n94\n3\n73\n0\n74\n0\n95\n0\n96\n0\n97\n4\n\
+                 11\n1\n21\n1\n11\n1e16\n21\n1\n11\n1e16\n21\n2\n11\n1\n21\n2\n\
+                 72\n1\n10\n1\n20\n2\n11\n1\n21\n1\n97\n0\n"
+            )
+        };
+        // Normal style: the island is a hole in the fill, and its spline is said.
+        let (_, skipped) = drawn(&hatch("0"), "")?;
+        assert_eq!(skipped.get(SPLINE_FIT_FAILED), Some(&1), "{skipped:?}");
+        // Ignore style: the island is not drawn, so neither is its spline.
+        let (g, skipped) = drawn(&hatch("2"), "")?;
+        assert_eq!(g.len(), 1, "only the outer square");
+        assert!(!skipped.contains_key(SPLINE_FIT_FAILED), "{skipped:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_hatch_spline_edge_follows_its_start_tangent() -> Result<()> {
+        // A spline edge by fit points (0, 0), (5, 5), (10, 0) with start and end tangents (1, 0)
+        // (the fit chords rise and fall at 45 degrees), then two lines back through (5, -5): the
+        // edge leaves and arrives flat, and the lines after it are kept.
+        let ents = "0\nHATCH\n2\nANSI31\n70\n0\n91\n1\n92\n1\n93\n3\n\
+                    72\n4\n94\n3\n73\n0\n74\n0\n95\n0\n96\n0\n97\n3\n11\n0\n21\n0\n11\n5\n21\n5\n11\n10\n21\n0\n\
+                    12\n1\n22\n0\n13\n1\n23\n0\n\
+                    72\n1\n10\n10\n20\n0\n11\n5\n21\n-5\n72\n1\n10\n5\n20\n-5\n11\n0\n21\n0\n97\n0\n";
+        let (g, _) = drawn(ents, "")?;
+        let (s, _, _) = poly(&g[0]);
+        assert!(s.len() > 10, "{s:?}");
+        let slope = (s[1].y - s[0].y) / (s[1].x - s[0].x);
+        assert!(slope.abs() < 0.15 && s[1].x > s[0].x, "leaves flat: {:?}", &s[..2]);
+        // It arrives at (10, 0) flat too, towards +x.
+        let end = s
+            .iter()
+            .position(|q| (q.x - 10.0).abs() < 1e-6 && q.y.abs() < 1e-6)
+            .unwrap_or(0);
+        let (a, b) = (s[end.saturating_sub(1)], s[end]);
+        assert!(
+            end > 0 && ((b.y - a.y) / (b.x - a.x)).abs() < 0.15 && b.x > a.x,
+            "{a:?} {b:?}"
+        );
+        // The two line edges back through (5, -5) (page (5, 5)), below the spline: that vertex
+        // is in the outline, so no edge after the spline was skipped.
+        assert!(
+            s.iter().any(|q| (q.x - 5.0).abs() < 1e-6 && (q.y - 5.0).abs() < 1e-6),
+            "the line edges are kept: {s:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_last_fit_point_is_kept_and_an_overflowing_curve_is_left_out() -> Result<()> {
+        // The last point is within the repeat tolerance of the one before: the curve still ends
+        // on it.
+        let fit = [(0.0, 0.0), (2e-12, 1e-12), (4e-12, 0.0), (4e-12, 5e-13)];
+        let pts = through_fit_points(&fit, 2, (None, None)).unwrap_or_default();
+        assert_eq!(pts.last(), Some(&(4e-12, 5e-13)), "{pts:?}");
+        // A curve that bulges past its points by a little overflows when placed at a huge
+        // scale; its points alone would not.
+        let ents = "0\nSPLINE\n71\n2\n11\n0\n21\n0\n11\n0.5\n21\n1\n11\n1\n21\n1\n";
+        let d = parse(&format!("0\nSECTION\n2\nENTITIES\n{ents}0\nENDSEC\n0\nEOF\n"))?;
+        let (mut raw, mut points, mut skipped, mut budget) = (Vec::new(), Vec::new(), BTreeMap::new(), MAX_DRAWN);
+        shapes(
+            &d,
+            &d.entities,
+            Xf::ID,
+            1.75e308,
+            0,
+            &|_| false,
+            &mut raw,
+            &mut points,
+            &mut skipped,
+            &mut budget,
+        );
+        assert!(raw.is_empty(), "{raw:?}");
+        assert_eq!(skipped.get(SPLINE_NOT_NUMBERS), Some(&1), "{skipped:?}");
         Ok(())
     }
 }

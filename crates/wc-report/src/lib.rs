@@ -1,13 +1,15 @@
 //! Reports generated from a project: parts list, device list, wire list, net list and terminal
-//! plan. Each report is a [`Table`] that can be written as CSV or Markdown, or laid out on PDF
-//! report pages.
+//! plan. Each report is a [`Table`] that can be written as CSV, Markdown or an Excel workbook, or
+//! laid out on PDF report pages.
 //!
 //! Reports are always derived from the schematic; they are never stored, so they can never be
 //! out of date.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use wc_core::connectivity::{self, PinRef};
+use wc_core::report_layout::ReportLayout;
 use wc_core::symbol::SymbolRole;
 use wc_core::{DeviceTag, Endpoint, Part, Project, Symbol};
 
@@ -15,19 +17,25 @@ pub mod aml;
 pub mod check;
 pub mod configurator;
 pub mod marking;
+pub mod network;
 pub mod plc;
 pub mod step;
 #[cfg(test)]
 mod tests;
+pub mod xlsx;
 
 pub use aml::{AmlCounts, automationml};
-pub use check::{Finding, Severity, check, check_table};
+pub use check::{Finding, Severity, check, check_table, check_with, cloud_index, cloud_item};
 pub use configurator::{CONFIGURATOR_COLUMNS, Configurator, Target, configurator_list};
 pub use marking::{
     LEVEL_SEPARATOR, Language, LineField, MARKER_PROPERTY, MarkerKind, MarkingOptions, formula_warnings, marking_list,
     marking_list_with, parse_kinds, parse_lines, terminal_strips, to_smartscript_csv,
 };
-pub use plc::{PlcVariables, plc_variables};
+pub use network::{network_list, network_warnings};
+pub use plc::{
+    CardChannel, CardPoint, PlcCardSheet, PlcVariables, plc_card_overview, plc_card_sheets, plc_rack_warnings,
+    plc_variables,
+};
 
 /// A finished report: a title, column headings and rows of text.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -40,6 +48,11 @@ pub struct Table {
     pub row_pages: Vec<String>,
     /// Printed before the schematic pages in a PDF, like the table of contents of a drawing set.
     pub front: bool,
+    /// The column the rows are grouped by ([`ReportLayout::group`]): rows of one value come
+    /// together, and a PDF prints the value once as a heading above them.
+    pub group: Option<usize>,
+    /// Title-block values a PDF prints above the table ([`ReportLayout::header`]).
+    pub header: Vec<String>,
 }
 
 impl Table {
@@ -51,19 +64,32 @@ impl Table {
         }
     }
 
-    /// RFC 4180 CSV with a header row; fields are quoted when they need it.
+    /// RFC 4180 CSV with a header row; fields are quoted when they need it, and cells a
+    /// spreadsheet would run as a formula are written as text (see [`formula_safe`]).
     pub fn to_csv(&self) -> String {
         self.to_csv_with(',')
     }
 
     /// CSV separated by `sep` (`,` or `;`), with a header row and CRLF line ends; fields are
-    /// quoted when they contain the separator, a quote or a line end.
+    /// quoted when they contain the separator, a quote or a line end. Every cell, the header
+    /// too, goes through [`formula_safe`].
     pub fn to_csv_with(&self, sep: char) -> String {
+        self.csv(sep, true)
+    }
+
+    /// [`Table::to_csv_with`] with every cell exactly as it is, for a file read by a program
+    /// that takes the text literally (a label printer), never for one meant for a spreadsheet.
+    pub fn to_csv_raw_with(&self, sep: char) -> String {
+        self.csv(sep, false)
+    }
+
+    fn csv(&self, sep: char, safe: bool) -> String {
         let field = |s: &str| {
+            let s = if safe { formula_safe(s) } else { Cow::Borrowed(s) };
             if s.contains([sep, '"', '\n', '\r']) {
                 format!("\"{}\"", s.replace('"', "\"\""))
             } else {
-                s.to_owned()
+                s.into_owned()
             }
         };
         let line = |cells: &[String]| {
@@ -82,13 +108,128 @@ impl Table {
         out
     }
 
+    /// This table in `layout`: its columns picked, ordered and renamed, and its rows sorted.
+    /// Columns and sort entries naming no column of the table are left out
+    /// ([`layout_warnings`] lists them). Each row keeps its page link.
+    pub fn with_layout(self, layout: &ReportLayout) -> Table {
+        let index = |name: &str| self.columns.iter().position(|c| c == name);
+        let sort: Vec<(usize, bool)> = layout
+            .sort
+            .iter()
+            .filter_map(|entry| {
+                let (c, descending) = ReportLayout::sort_key(entry);
+                index(c).map(|i| (i, descending))
+            })
+            .collect();
+        let mut picked: Vec<(usize, String)> = if layout.columns.is_empty() {
+            self.columns.iter().cloned().enumerate().collect()
+        } else {
+            layout
+                .columns
+                .iter()
+                .filter_map(|c| index(&c.from).map(|i| (i, c.heading.clone().unwrap_or_else(|| c.from.clone()))))
+                .collect()
+        };
+        // The group column, shown first when the layout leaves it out (every row keeps its value).
+        let group = layout.group.as_deref().and_then(|g| index(g.trim()));
+        let shown_group = group.map(|g| match picked.iter().position(|(i, _)| *i == g) {
+            Some(at) => at,
+            None => {
+                picked.insert(0, (g, self.columns[g].clone()));
+                0
+            }
+        });
+        let Table {
+            title,
+            rows,
+            row_pages,
+            front,
+            ..
+        } = self;
+        let mut rows: Vec<(Vec<String>, String)> = rows
+            .into_iter()
+            .enumerate()
+            .map(|(n, r)| (r, row_pages.get(n).cloned().unwrap_or_default()))
+            .collect();
+        if !sort.is_empty() {
+            let cell = |r: &[String], i: usize| r.get(i).map(|v| natural_key(v)).unwrap_or_default();
+            // A stable sort: rows equal in every sort column keep the built-in order.
+            rows.sort_by(|(a, _), (b, _)| {
+                sort.iter()
+                    .map(|&(i, descending)| {
+                        let o = cell(a, i).cmp(&cell(b, i));
+                        if descending { o.reverse() } else { o }
+                    })
+                    .find(|o| o.is_ne())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        if let Some(g) = group {
+            // Each group where its first row is; within it, the sorted order.
+            let mut first_seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            for (r, _) in &rows {
+                let next = first_seen.len();
+                first_seen.entry(r.get(g).cloned().unwrap_or_default()).or_insert(next);
+            }
+            let rank = |r: &[String]| {
+                let v = r.get(g).map(String::as_str).unwrap_or_default();
+                first_seen.get(v).copied().unwrap_or(usize::MAX)
+            };
+            rows.sort_by_key(|(r, _)| rank(r));
+        }
+        let mut row_pages: Vec<String> = rows.iter().map(|(_, p)| p.clone()).collect();
+        while row_pages.last().is_some_and(String::is_empty) {
+            row_pages.pop();
+        }
+        Table {
+            title: layout.title.clone().unwrap_or(title),
+            columns: picked.iter().map(|(_, h)| h.clone()).collect(),
+            rows: rows
+                .into_iter()
+                .map(|(r, _)| {
+                    picked
+                        .iter()
+                        .map(|(i, _)| r.get(*i).cloned().unwrap_or_default())
+                        .collect()
+                })
+                .collect(),
+            row_pages,
+            front,
+            group: shown_group,
+            header: layout.header.clone(),
+        }
+    }
+
+    /// Rows whose first column is empty take their first `columns` cells from the row above:
+    /// a continuation row gets the group it belongs to written out.
+    fn fill_down(&mut self, columns: usize) {
+        let mut above: Vec<String> = Vec::new();
+        for row in &mut self.rows {
+            if row.first().is_some_and(String::is_empty) && !above.is_empty() {
+                for (cell, value) in row.iter_mut().zip(&above) {
+                    cell.clone_from(value);
+                }
+            } else {
+                above = row.iter().take(columns).cloned().collect();
+            }
+        }
+    }
+
     /// A Markdown table under a level-2 heading.
     pub fn to_markdown(&self) -> String {
-        let cell = |s: &str| s.replace('|', "\\|").replace('\n', " ");
+        // One line of text: line ends (LF, CR or CRLF) become spaces, and `<` and `>` are
+        // written as entities so a value is never read as HTML.
+        let line = |s: &str| {
+            s.replace("\r\n", " ")
+                .replace(['\r', '\n'], " ")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+        };
+        let cell = |s: &str| line(s).replace('|', "\\|");
         let mut out = format!(
-            "## {}\n\n| {} |\n|{}|\n",
-            self.title,
-            self.columns.join(" | "),
+            "## {}\n\n| {} |\n|{}\n",
+            line(&self.title),
+            self.columns.iter().map(|c| cell(c)).collect::<Vec<_>>().join(" | "),
             "---|".repeat(self.columns.len())
         );
         for r in &self.rows {
@@ -101,8 +242,41 @@ impl Table {
     }
 }
 
+/// A cell as a spreadsheet should show it: text that Excel or LibreOffice would run as a formula
+/// when the CSV is opened (CWE-1236) gets a leading `'`, which makes it plain text there.
+///
+/// Guarded: cells starting with `=`, `+`, `@`, a tab or a carriage return, and cells starting
+/// with `-` unless they are a plain number (`-5`, `-0.75`, a value a column means as a number).
+/// Device tags with only a product aspect (`-K1`, `-X12`) are guarded too: Excel reads `-K1` as
+/// the formula `=-K1` and shows the negated cell K1 instead of the tag. WiringCraft's own CSV
+/// import (`wc_import::csv::records`) takes the `'` off again, so such a file reads back
+/// with the same tags. A cell that itself starts with `'`s before one of those characters
+/// (`'-K1` as typed) gets one more `'`, so it reads back with its own.
+pub fn formula_safe(cell: &str) -> Cow<'_, str> {
+    let guard = match cell.chars().next() {
+        Some('=' | '+' | '@' | '\t' | '\r') => true,
+        Some('-') => !plain_number(&cell[1..]),
+        Some('\'') => cell
+            .trim_start_matches('\'')
+            .starts_with(['=', '+', '-', '@', '\t', '\r']),
+        _ => false,
+    };
+    if guard {
+        Cow::Owned(format!("'{cell}"))
+    } else {
+        Cow::Borrowed(cell)
+    }
+}
+
+/// Digits with at most one decimal point or comma, such as `5`, `0.75` or `2,5`.
+fn plain_number(s: &str) -> bool {
+    s.chars().any(|c| c.is_ascii_digit())
+        && s.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ',')
+        && s.chars().filter(|c| matches!(c, '.' | ',')).count() <= 1
+}
+
 /// Which report to build.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Kind {
     Parts,
     Devices,
@@ -111,12 +285,14 @@ pub enum Kind {
     Terminals,
     Cables,
     Plc,
+    PlcCards,
     Contents,
     Locations,
+    Networks,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 9] = [
+    pub const ALL: [Kind; 11] = [
         Kind::Contents,
         Kind::Parts,
         Kind::Devices,
@@ -125,7 +301,9 @@ impl Kind {
         Kind::Terminals,
         Kind::Cables,
         Kind::Plc,
+        Kind::PlcCards,
         Kind::Locations,
+        Kind::Networks,
     ];
 
     pub fn name(self) -> &'static str {
@@ -137,8 +315,10 @@ impl Kind {
             Kind::Terminals => "terminals",
             Kind::Cables => "cables",
             Kind::Plc => "plc",
+            Kind::PlcCards => "plc-cards",
             Kind::Contents => "contents",
             Kind::Locations => "locations",
+            Kind::Networks => "networks",
         }
     }
 
@@ -156,7 +336,139 @@ pub struct Inputs<'a> {
     pub parts: &'a BTreeMap<String, Part>,
 }
 
+/// The report of `kind`, in the project's own layout for it if it has one
+/// ([`wc_core::report_layout`]), else in the built-in layout.
 pub fn build(kind: Kind, i: &Inputs<'_>) -> Table {
+    build_with(kind, i, layout_for(i.project, kind))
+}
+
+/// The report of `kind` in `layout`, or in the built-in layout when there is none: a layout
+/// being designed shows as it will print before it is kept in the project.
+pub fn build_with(kind: Kind, i: &Inputs<'_>, layout: Option<&ReportLayout>) -> Table {
+    let mut table = build_builtin(kind, i);
+    match layout {
+        Some(layout) => {
+            // The cable list names a cable only on its first core's row. A sort or a grouping
+            // can move the other rows away from it, so each row then names its cable itself.
+            if kind == Kind::Cables && (!layout.sort.is_empty() || layout.group.is_some()) {
+                table.fill_down(3);
+            }
+            table.with_layout(layout)
+        }
+        None => table,
+    }
+}
+
+/// The project's layout for `kind`: the first one that names it.
+pub fn layout_for(project: &Project, kind: Kind) -> Option<&ReportLayout> {
+    project.meta.reports.iter().find(|l| l.kind == kind.name())
+}
+
+/// What is wrong with the project's report layouts: an unknown report kind, a second layout
+/// for one kind (only the first is used), or a column or sort entry the report does not have
+/// (left out). Empty when they are all fine.
+pub fn layout_warnings(i: &Inputs<'_>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for layout in &i.project.meta.reports {
+        let Some(kind) = Kind::parse(&layout.kind) else {
+            let names: Vec<&str> = Kind::ALL.iter().map(|k| k.name()).collect();
+            out.push(format!(
+                "report layout for \"{}\": no such report (one of {})",
+                layout.kind,
+                names.join(", ")
+            ));
+            continue;
+        };
+        if !seen.insert(kind) {
+            out.push(format!(
+                "report layout for \"{}\": a second one, left unused",
+                layout.kind
+            ));
+            continue;
+        }
+        out.extend(layout_problems(kind, layout, i));
+    }
+    out
+}
+
+/// What in `layout`, a layout for the report of `kind`, names nothing: a column, sort or
+/// group column the report does not have, or a header key no title block knows. The report
+/// layout dialog shows these for the layout being edited.
+pub fn layout_problems(kind: Kind, layout: &ReportLayout, i: &Inputs<'_>) -> Vec<String> {
+    layout_problems_for(&build_builtin(kind, i).columns, layout, i.project)
+}
+
+/// [`layout_problems`] for a report whose built-in columns are `columns`, for a caller that
+/// has them already (the report layout dialog), so the report is not built again for it.
+pub fn layout_problems_for(columns: &[String], layout: &ReportLayout, project: &Project) -> Vec<String> {
+    let mut out = Vec::new();
+    let known = |c: &str| columns.iter().any(|b| b == c);
+    for c in &layout.columns {
+        if !known(&c.from) {
+            out.push(format!(
+                "report layout for \"{}\": no column \"{}\" (the columns are {})",
+                layout.kind,
+                c.from,
+                columns.join(", ")
+            ));
+        }
+    }
+    for entry in &layout.sort {
+        let (c, _) = ReportLayout::sort_key(entry);
+        if !known(c) {
+            out.push(format!(
+                "report layout for \"{}\": cannot sort by \"{c}\", no such column",
+                layout.kind
+            ));
+        }
+    }
+    if let Some(g) = layout.group.as_deref().map(str::trim)
+        && !known(g)
+    {
+        out.push(format!(
+            "report layout for \"{}\": cannot group by \"{g}\", no such column (the columns are {})",
+            layout.kind,
+            columns.join(", ")
+        ));
+    }
+    let keys = header_keys(project);
+    for key in &layout.header {
+        if !keys.contains(key) {
+            out.push(format!(
+                "report layout for \"{}\": header \"{key}\" is not a title-block field (one of {})",
+                layout.kind,
+                keys.join(", ")
+            ));
+        }
+    }
+    out
+}
+
+/// The keys a report layout's `header` can name: the project name, the page keys a title
+/// block uses, the usual title-block fields and any other the project or one of its pages has.
+fn header_keys(project: &Project) -> Vec<String> {
+    use wc_core::template::{PAGE_NUMBER, PAGE_TITLE, PROJECT_NAME, SHEET};
+    let mut keys: Vec<String> = [PROJECT_NAME, PAGE_TITLE, PAGE_NUMBER, SHEET]
+        .into_iter()
+        .chain(wc_core::project::TITLE_FIELDS.iter().map(|(k, _)| *k))
+        .map(str::to_owned)
+        .collect();
+    let others = project
+        .meta
+        .title_block
+        .keys()
+        .chain(project.pages.iter().flat_map(|p| p.title_block.keys()));
+    for k in others {
+        if !keys.contains(k) {
+            keys.push(k.clone());
+        }
+    }
+    keys
+}
+
+/// The report of `kind` in its built-in layout.
+pub fn build_builtin(kind: Kind, i: &Inputs<'_>) -> Table {
     match kind {
         Kind::Parts => parts_list(i),
         Kind::Devices => device_list(i),
@@ -165,8 +477,10 @@ pub fn build(kind: Kind, i: &Inputs<'_>) -> Table {
         Kind::Terminals => terminal_plan(i),
         Kind::Cables => cable_list(i),
         Kind::Plc => plc_io_list(i),
+        Kind::PlcCards => plc_card_overview(i),
         Kind::Contents => contents(i),
         Kind::Locations => location_list(i),
+        Kind::Networks => network_list(i),
     }
 }
 
@@ -496,7 +810,7 @@ pub fn net_list(i: &Inputs<'_>) -> Table {
 pub const LEVEL_PROPERTY: &str = "Level";
 
 /// A [`LEVEL_PROPERTY`] value as a level, or why it is not one.
-fn parse_level(value: &str) -> Result<u32, String> {
+pub fn parse_level(value: &str) -> Result<u32, String> {
     match value.trim().parse::<u32>() {
         Ok(0) => Err("levels start at 1".into()),
         Ok(l) => Ok(l),
@@ -538,6 +852,51 @@ pub fn level_warnings(project: &wc_core::Project) -> Vec<String> {
         .collect()
 }
 
+/// The level of each terminal of `strip` that has one: its own valid [`LEVEL_PROPERTY`], or 1
+/// for a terminal with no `Level` of its own right below one at level 2 or more. `drawn` is the
+/// strip's drawn terminals in the usual (number) order, each once.
+///
+/// Levels are inferred in that order, so moving terminals on the rail never changes a terminal's
+/// level or which block it is in. The strip's spares count only when they have a valid level of
+/// their own, so adding a spare without one never splits a block; a spare with a valid level
+/// joins the number order and can change the blocks (and their markers) like a drawn terminal
+/// with that level would. This is what the terminal plan's Level column
+/// shows; the terminal strip editor shows it too.
+pub fn strip_levels(project: &wc_core::Project, strip: &str, drawn: Vec<String>) -> BTreeMap<String, u32> {
+    let mut usual = drawn;
+    let layout = project.meta.strips.iter().find(|l| l.strip.to_string() == strip);
+    for spare in layout.iter().flat_map(|l| &l.spares) {
+        // Only a valid level of its own counts; a bad value is reported by level_warnings.
+        if usual.contains(spare) || terminal_level(project, strip, spare).is_none() {
+            continue;
+        }
+        let key = (natural_key(spare), spare.clone());
+        let at = usual.partition_point(|n| (natural_key(n), n.clone()) < key);
+        usual.insert(at, spare.clone());
+    }
+    let mut by_number = BTreeMap::new();
+    for (k, n) in usual.iter().enumerate() {
+        let own = terminal_level(project, strip, n);
+        // The bottom level of a block needs no property of its own: the level above says so.
+        // A bad value is not missing: that terminal stays single-level, as its warning says.
+        let missing = level_value(project, strip, n).is_none();
+        let below = || {
+            usual
+                .get(k + 1)
+                .and_then(|up| terminal_level(project, strip, up))
+                .filter(|l| missing && *l >= 2)
+                .map(|_| 1)
+        };
+        if let Some(l) = own.or_else(below) {
+            by_number.insert(n.clone(), l);
+        }
+    }
+    by_number
+}
+
+/// What the terminal plan's Page column says for a spare terminal, which no page draws.
+pub const SPARE_PAGE: &str = "spare";
+
 /// Terminal plan: for every terminal strip, each terminal with what connects to its two sides.
 ///
 /// The last column is the terminal's level on a multi-level terminal (see [`LEVEL_PROPERTY`]):
@@ -546,8 +905,27 @@ pub fn level_warnings(project: &wc_core::Project) -> Vec<String> {
 ///
 /// A terminal is a symbol with the terminal role. Its strip and number come from the tag:
 /// `-X1.3` is terminal 3 of strip `-X1`. Terminals tagged with just the strip (`-X1`) are
-/// numbered in drawing order (page, then left to right).
+/// numbered in drawing order (page, then left to right). Terminals come by number, unless the
+/// terminal strip editor put the strip in another order ([`wc_core::project::StripLayout`]);
+/// its spare terminals are listed with [`SPARE_PAGE`] in the Page column.
 pub fn terminal_plan(i: &Inputs<'_>) -> Table {
+    terminal_plan_with_spares(i).0
+}
+
+/// Whether a placed symbol is a terminal in the terminal plan and the exports: a symbol of
+/// known role is one when it is a terminal symbol; a symbol the project has no copy of is one
+/// when its tag has a terminal level (`-X1.3`), as in the strip editor and jumpers.
+pub(crate) fn counts_as_terminal(role: Option<SymbolRole>, tag: Option<&DeviceTag>) -> bool {
+    match role {
+        Some(r) => r == SymbolRole::Terminal,
+        None => tag.is_some_and(|t| wc_core::project::is_terminal(t, None)),
+    }
+}
+
+/// [`terminal_plan`], with which of its rows are spare terminals (by row index): a spare is
+/// known by where it comes from, not by what its Page cell says.
+pub(crate) fn terminal_plan_with_spares(i: &Inputs<'_>) -> (Table, BTreeSet<usize>) {
+    let mut spare_rows: BTreeSet<usize> = BTreeSet::new();
     let mut t = Table::new(
         "Terminal plan",
         &[
@@ -597,6 +975,8 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
         x: f64,
         /// The other terminals of its jumper, e.g. `3, 5`.
         jumpered: String,
+        /// Its symbol, when the project has no copy of it: what it connects is not known.
+        missing: Option<String>,
     }
     let mut terms: Vec<Term> = Vec::new();
     // The numbers jumpers refer to: a terminal tagged with only its strip gets the next one.
@@ -604,8 +984,11 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
     // An overview (line diagram) draws terminals again; the plan lists each one once.
     for page in i.project.pages.iter().filter(|pg| !pg.overview) {
         for s in &page.symbols {
-            let Some(sym) = i.symbols.get(&s.symbol) else { continue };
-            if sym.role != SymbolRole::Terminal {
+            // One rule with the strip editor and jumpers (terminal_numbers): a symbol the project
+            // has no copy of is a terminal when its tag has a terminal level (`-X1.3`). It is
+            // listed, marked, so the plan and the exports have the same terminals.
+            let sym = i.symbols.get(&s.symbol);
+            if !counts_as_terminal(sym.map(|y| y.role), s.tag.as_ref()) {
                 continue;
             }
             let (strip, number) = match &s.tag {
@@ -642,14 +1025,21 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
                 page: page.number.clone(),
                 page_id: page.id.clone(),
                 item: s.id.clone(),
-                pins: sym.pins.iter().map(|p| p.name.clone()).collect(),
+                pins: sym
+                    .map(|sym| sym.pins.iter().map(|p| p.name.clone()).collect())
+                    .unwrap_or_default(),
                 x: s.at.x,
+                missing: sym.is_none().then(|| s.symbol.clone()),
             });
         }
     }
     let mut strips: BTreeMap<String, Vec<Term>> = BTreeMap::new();
     for term in terms {
         strips.entry(term.strip.clone()).or_default().push(term);
+    }
+    // A strip arranged in the terminal strip editor is listed even when only spares are on it.
+    for l in &i.project.meta.strips {
+        strips.entry(l.strip.to_string()).or_default();
     }
     for (strip, mut list) in strips {
         // Numbered ones by number; unnumbered ones keep drawing order and are numbered after.
@@ -667,6 +1057,15 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
                     .then(a.x.total_cmp(&b.x)),
             }
         });
+        // As wc_core::project::terminal_numbers: a spare's number is taken.
+        let spares = i
+            .project
+            .meta
+            .strips
+            .iter()
+            .find(|l| l.strip.to_string() == strip)
+            .map(|l| l.spares.as_slice())
+            .unwrap_or(&[]);
         let mut next = list
             .iter()
             .filter_map(|t| t.number.as_deref()?.parse::<u64>().ok())
@@ -678,36 +1077,79 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
                 let number = term
                     .number
                     .clone()
-                    .or_else(|| wc_core::project::next_number(&mut next))
+                    .or_else(|| wc_core::project::next_free_number(&mut next, spares))
                     .unwrap_or_default();
                 (term, number)
             })
             .collect();
-        // Levels are inferred over distinct terminals: a terminal drawn twice has one level.
-        let mut distinct: Vec<&str> = numbered.iter().map(|(_, n)| n.as_str()).collect();
-        distinct.dedup();
-        let mut by_number: BTreeMap<&str, u32> = BTreeMap::new();
-        for (k, n) in distinct.iter().enumerate() {
-            let own = terminal_level(i.project, &strip, n);
-            // The bottom level of a block needs no property of its own: the level above says so.
-            // A bad value is not missing: that terminal stays single-level, as its warning says.
-            let missing = level_value(i.project, &strip, n).is_none();
-            let below = || {
-                distinct
-                    .get(k + 1)
-                    .and_then(|up| terminal_level(i.project, &strip, up))
-                    .filter(|l| missing && *l >= 2)
-                    .map(|_| 1)
-            };
-            if let Some(l) = own.or_else(below) {
-                by_number.insert(n, l);
+        // The rail order and spares the terminal strip editor set: a terminal drawn twice
+        // stays together, a spare gets a row of its own with nothing connected.
+        let layout = i.project.meta.strips.iter().find(|l| l.strip.to_string() == strip);
+        let mut usual: Vec<String> = numbered.iter().map(|(_, n)| n.clone()).collect();
+        usual.dedup();
+        let by_number = strip_levels(i.project, &strip, usual);
+        let numbered: Vec<(Option<Term>, String)> = match layout {
+            None => numbered.into_iter().map(|(t, n)| (Some(t), n)).collect(),
+            Some(layout) => {
+                let mut drawn: Vec<String> = numbered.iter().map(|(_, n)| n.clone()).collect();
+                drawn.dedup();
+                let mut rest: Vec<Option<(Term, String)>> = numbered.into_iter().map(Some).collect();
+                let mut out = Vec::new();
+                for (n, spare) in layout.arrange(&drawn) {
+                    if spare {
+                        out.push((None, n));
+                        continue;
+                    }
+                    for slot in rest.iter_mut() {
+                        if slot.as_ref().is_some_and(|(_, m)| *m == n)
+                            && let Some((t, m)) = slot.take()
+                        {
+                            out.push((Some(t), m));
+                        }
+                    }
+                }
+                out
             }
-        }
+        };
         let levels: Vec<Option<u32>> = numbered
             .iter()
             .map(|(_, n)| by_number.get(n.as_str()).copied())
             .collect();
         for ((term, number), level) in numbered.into_iter().zip(levels) {
+            let level = level.map(|l| l.to_string()).unwrap_or_default();
+            let Some(term) = term else {
+                // A spare: on the rail, not drawn. Its jumper can still be set.
+                let jumpered = DeviceTag::parse(&strip)
+                    .ok()
+                    .and_then(|st| {
+                        i.project
+                            .meta
+                            .jumpers
+                            .iter()
+                            .find(|j| j.strip == st && j.terminals.contains(&number))
+                    })
+                    .map(|j| {
+                        j.terminals
+                            .iter()
+                            .filter(|t| **t != number)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                spare_rows.insert(t.rows.len());
+                t.rows.push(vec![
+                    strip.clone(),
+                    number,
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    SPARE_PAGE.to_owned(),
+                    jumpered,
+                    level,
+                ]);
+                continue;
+            };
             let side = |n: usize| -> (String, Option<String>) {
                 let Some(pin) = term.pins.get(n) else {
                     return (String::new(), None);
@@ -715,8 +1157,11 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
                 let r: PinRef = (term.page_id.clone(), term.item.clone(), pin.clone());
                 (others(&r).join(", "), net_of.get(&r).cloned())
             };
-            let (upper, pa) = side(0);
+            let (mut upper, pa) = side(0);
             let (lower, pb) = side(1);
+            if let Some(symbol) = &term.missing {
+                upper = format!("(symbol {symbol} missing)");
+            }
             t.rows.push(vec![
                 strip.clone(),
                 number,
@@ -725,11 +1170,44 @@ pub fn terminal_plan(i: &Inputs<'_>) -> Table {
                 pa.or(pb).unwrap_or_default(),
                 term.page.clone(),
                 term.jumpered.clone(),
-                level.map(|l| l.to_string()).unwrap_or_default(),
+                level,
             ]);
         }
     }
-    t
+    // A spare has no wiring of its own, but a jumper to a drawn terminal puts it on that
+    // terminal's potential.
+    for &k in &spare_rows {
+        let cell = |r: &[String], c: usize| r.get(c).cloned().unwrap_or_default();
+        let Some(row) = t.rows.get(k) else { continue };
+        if !cell(row, 4).is_empty() {
+            continue;
+        }
+        let (strip, number) = (cell(row, 0), cell(row, 1));
+        let Some(jumper) = DeviceTag::parse(&strip).ok().and_then(|st| {
+            i.project
+                .meta
+                .jumpers
+                .iter()
+                .find(|j| j.strip == st && j.terminals.contains(&number))
+        }) else {
+            continue;
+        };
+        let potential = t
+            .rows
+            .iter()
+            .enumerate()
+            .find(|(n, r)| {
+                !spare_rows.contains(n)
+                    && cell(r, 0) == strip
+                    && jumper.terminals.contains(&cell(r, 1))
+                    && !cell(r, 4).is_empty()
+            })
+            .map(|(_, r)| cell(r, 4));
+        if let (Some(p), Some(slot)) = (potential, t.rows.get_mut(k).and_then(|r| r.get_mut(4))) {
+            *slot = p;
+        }
+    }
+    (t, spare_rows)
 }
 
 /// Table of contents: every schematic page with its title and what is drawn on it.
@@ -771,6 +1249,37 @@ fn plc_kind(sym: &Symbol) -> Option<&'static str> {
     }
 }
 
+/// One PLC input or output drawn on a page, as the PLC I/O list shows it.
+#[derive(Debug, Clone)]
+pub(crate) struct PlcPoint {
+    /// The device property `Address` (or `PLC address`), trimmed; empty when there is none.
+    pub address: String,
+    /// `Input` or `Output`.
+    pub kind: &'static str,
+    /// The device tag, or `<item id> (no tag)`.
+    pub device: String,
+    pub description: String,
+    /// What it is wired to.
+    pub connected: String,
+    /// The number and the id of the page it is drawn on.
+    pub page_number: String,
+    pub page_id: String,
+}
+
+impl PlcPoint {
+    /// Its row in the PLC I/O list.
+    fn row(&self) -> Vec<String> {
+        vec![
+            self.address.clone(),
+            self.kind.to_owned(),
+            self.device.clone(),
+            self.description.clone(),
+            self.connected.clone(),
+            self.page_number.clone(),
+        ]
+    }
+}
+
 /// PLC I/O list: every PLC input and output drawn, with its address, the device it belongs to
 /// and what it is wired to. The address is the device property `Address` (or `PLC address`);
 /// points without one sort last so the gaps are visible.
@@ -779,6 +1288,13 @@ pub fn plc_io_list(i: &Inputs<'_>) -> Table {
         "PLC I/O list",
         &["Address", "Type", "Device", "Description", "Connected to", "Page"],
     );
+    t.rows = plc_points(i).iter().map(PlcPoint::row).collect();
+    t
+}
+
+/// The drawn PLC inputs and outputs in the order of the PLC I/O list: by address, points without
+/// one last.
+pub(crate) fn plc_points(i: &Inputs<'_>) -> Vec<PlcPoint> {
     let (nets, _) = net_names(i);
     let mut net_of: BTreeMap<PinRef, usize> = BTreeMap::new();
     for (n, net) in nets.iter().enumerate() {
@@ -786,8 +1302,8 @@ pub fn plc_io_list(i: &Inputs<'_>) -> Table {
             net_of.insert(pin.clone(), n);
         }
     }
-    // (no address, address sort key, row)
-    type Row = (bool, Vec<(String, u64)>, Vec<String>);
+    // (no address, address sort key, point)
+    type Row = (bool, Vec<(String, u64)>, PlcPoint);
     let mut rows: Vec<Row> = Vec::new();
     for page in &i.project.pages {
         for s in &page.symbols {
@@ -815,21 +1331,22 @@ pub fn plc_io_list(i: &Inputs<'_>) -> Table {
             }
             let mut others: Vec<String> = others.into_iter().collect();
             others.sort_by_key(|o| natural_key(o));
-            let row = vec![
-                address.clone(),
-                kind.to_owned(),
-                s.tag
+            let point = PlcPoint {
+                address: address.clone(),
+                kind,
+                device: s
+                    .tag
                     .as_ref()
                     .map(ToString::to_string)
                     .unwrap_or_else(|| format!("{} (no tag)", s.id)),
-                dev.map(|d| d.description.clone()).unwrap_or_default(),
-                others.join(", "),
-                page.number.clone(),
-            ];
-            rows.push((address.is_empty(), natural_key(&address), row));
+                description: dev.map(|d| d.description.clone()).unwrap_or_default(),
+                connected: others.join(", "),
+                page_number: page.number.clone(),
+                page_id: page.id.clone(),
+            };
+            rows.push((address.is_empty(), natural_key(&address), point));
         }
     }
     rows.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
-    t.rows = rows.into_iter().map(|(_, _, r)| r).collect();
-    t
+    rows.into_iter().map(|(_, _, p)| p).collect()
 }

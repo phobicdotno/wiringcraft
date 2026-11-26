@@ -7,6 +7,7 @@
 
 mod layout;
 mod picture;
+mod topology;
 mod vector;
 mod writer;
 
@@ -39,6 +40,22 @@ pub struct Options {
     pub unreadable: BTreeMap<String, String>,
     /// Panel layouts printed after the schematic pages, one sheet each.
     pub panels: Vec<wc_core::panel::Panel>,
+    /// Fieldbus networks drawn as topology pages at the end, one sheet each.
+    pub networks: Vec<wc_core::network::Network>,
+    /// Footprint drawings by part id ([`footprints`]): a device whose part has one is drawn
+    /// with it on panel layouts instead of a plain box.
+    pub footprints: BTreeMap<String, wc_core::Footprint>,
+    /// PLC cards drawn after the panel layouts, one card per sheet (more for a long card),
+    /// with a terminal per channel and the point drawn there (#437).
+    pub plc_cards: Vec<wc_report::PlcCardSheet>,
+}
+
+/// The footprint drawings of `parts` by part id, for [`Options::footprints`].
+pub fn footprints<'a>(parts: impl IntoIterator<Item = &'a wc_core::Part>) -> BTreeMap<String, wc_core::Footprint> {
+    parts
+        .into_iter()
+        .filter_map(|p| p.footprint.clone().map(|f| (p.id.clone(), f)))
+        .collect()
 }
 
 impl Default for Options {
@@ -51,6 +68,9 @@ impl Default for Options {
             underlays: BTreeMap::new(),
             unreadable: BTreeMap::new(),
             panels: Vec::new(),
+            networks: Vec::new(),
+            footprints: BTreeMap::new(),
+            plc_cards: Vec::new(),
         }
     }
 }
@@ -97,10 +117,40 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
         }
     };
     let xref = layout::CrossRefs::build(project, symbols);
-    // Report pages use the size of the first schematic page and are counted in the sheet total.
-    let size = pages.first().map(|p| p.size).unwrap_or_default();
+    // Report pages use the size of the first schematic page (a larger one when that is too
+    // short for a table) and are counted in the sheet total. Panel layouts keep that page's size.
+    let first_size = pages.first().map(|p| p.size).unwrap_or_default();
+    // Room for a grouped table's heading with its first row, and its line of header values.
+    let lines = options
+        .reports
+        .iter()
+        .map(|t| usize::from(t.group.is_some()) + usize::from(!t.header.is_empty()) + 1)
+        .max()
+        .unwrap_or(1);
+    let size = layout::report_size(first_size, project.meta.template.band_height(), lines);
     let per_page = layout::rows_per_page(size, project.meta.template.band_height());
-    // Each report page: (table, first row, part, parts). Front tables (the table of contents)
+    // A sheet too short for a table's header values and a row (none is large enough) leaves
+    // the header values out, so no page holds more lines than it has room for.
+    let reports: Vec<std::borrow::Cow<'_, wc_report::Table>> = options
+        .reports
+        .iter()
+        .map(|t| {
+            if t.header.is_empty() || layout::prints_header(t, per_page) {
+                std::borrow::Cow::Borrowed(t)
+            } else {
+                let mut t = t.clone();
+                t.header.clear();
+                report.warnings.push(format!(
+                    "{}: the sheet has no room for the header values above the table; they are left out",
+                    t.title
+                ));
+                std::borrow::Cow::Owned(t)
+            }
+        })
+        .collect();
+    // The lines of each report table's pages.
+    let paged: Vec<Vec<Vec<layout::TableLine>>> = reports.iter().map(|t| layout::table_pages(t, per_page)).collect();
+    // Each report page: (table, its page, part, parts). Front tables (the table of contents)
     // come before the schematic pages, the rest after them.
     let split = |front: bool| -> Vec<(usize, usize, usize, usize)> {
         options
@@ -108,21 +158,39 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
             .iter()
             .enumerate()
             .filter(|(_, t)| t.front == front)
-            .flat_map(|(ti, t)| {
-                let n = t.rows.len().div_ceil(per_page).max(1);
-                (0..n).map(move |k| (ti, k * per_page, k + 1, n))
+            .flat_map(|(ti, _)| {
+                let n = paged.get(ti).map_or(1, Vec::len);
+                (0..n).map(move |k| (ti, k, k + 1, n))
             })
             .collect()
     };
     let (front_pages, back_pages) = (split(true), split(false));
-    let total = front_pages.len() + pages.len() + options.panels.len() + back_pages.len();
+    // Each drawn card sheet: (card, first row, part, parts).
+    let card_size = layout::card_size(first_size, project.meta.template.band_height());
+    let card_rows = layout::card_rows_per_page(card_size, project.meta.template.band_height());
+    let card_pages: Vec<(usize, usize, usize, usize)> = options
+        .plc_cards
+        .iter()
+        .enumerate()
+        .flat_map(|(ci, card)| {
+            let n = layout::card_rows_of(card).len().div_ceil(card_rows).max(1);
+            (0..n).map(move |k| (ci, k * card_rows, k + 1, n))
+        })
+        .collect();
+    let total = front_pages.len()
+        + pages.len()
+        + options.panels.len()
+        + card_pages.len()
+        + back_pages.len()
+        + options.networks.len();
     report.pages = total;
     let mut doc = writer::Doc::new(&project.meta.name);
     let mut sheet = 0;
     let mut report_no = 0;
     let mut add_reports = |doc: &mut writer::Doc, list: Vec<(usize, usize, usize, usize)>, sheet: &mut usize| {
-        for (ti, first, part, parts) in list {
-            let Some(table) = options.reports.get(ti) else { continue };
+        for (ti, k, part, parts) in list {
+            let Some(table) = reports.get(ti) else { continue };
+            let lines = paged.get(ti).and_then(|p| p.get(k)).map_or(&[][..], Vec::as_slice);
             report_no += 1;
             let mut page = wc_core::Page::new(
                 format!("report-{ti}-{part}"),
@@ -136,7 +204,7 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
                 *sheet,
                 total,
                 table,
-                first,
+                lines,
                 (part, parts),
                 &options.date,
             );
@@ -187,13 +255,57 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
     // Panel layouts follow the schematic pages, one sheet each.
     for (k, panel) in options.panels.iter().enumerate() {
         let mut page = wc_core::Page::new(format!("panel-{}", panel.id), format!("P{}", k + 1), panel.name.clone());
-        page.size = size;
-        let mut drawn = layout::draw_panel_page(project, &page, sheet, total, panel, &options.date);
+        page.size = first_size;
+        let mut drawn =
+            layout::draw_panel_page(project, &page, sheet, total, panel, &options.footprints, &options.date);
         place_logo(&mut drawn, &page);
-        doc.add_page(size.mm(), &format!("{} {}", page.number, panel.name), drawn);
+        doc.add_page(first_size.mm(), &format!("{} {}", page.number, panel.name), drawn);
+        sheet += 1;
+    }
+    // Drawn PLC cards follow the panel layouts.
+    for (k, &(ci, first, part, parts)) in card_pages.iter().enumerate() {
+        let Some(card) = options.plc_cards.get(ci) else {
+            continue;
+        };
+        let mut page = wc_core::Page::new(
+            format!("plc-card-{ci}-{part}"),
+            format!("C{}", k + 1),
+            format!("PLC card {}", card.card),
+        );
+        page.size = card_size;
+        let mut drawn = layout::draw_card_page(project, &page, sheet, total, card, first, (part, parts), &options.date);
+        place_logo(&mut drawn, &page);
+        doc.add_page(card_size.mm(), &format!("{} {}", page.number, page.title), drawn);
         sheet += 1;
     }
     add_reports(&mut doc, back_pages, &mut sheet);
+    // Network topologies close the document, after the network list.
+    // A topology box links to a page this PDF holds.
+    let exported: std::collections::BTreeSet<&str> = pages.iter().map(|p| p.id.as_str()).collect();
+    for (k, net) in options.networks.iter().enumerate() {
+        // A sheet the whole topology fits on: the first page's size, or a larger one.
+        let (size, warn) = topology::sheet(first_size, project.meta.template.band_height(), net);
+        report.warnings.extend(warn);
+        let mut page = wc_core::Page::new(
+            format!("network-{}", net.name),
+            format!("N{}", k + 1),
+            format!("Network {}", net.name),
+        );
+        page.size = size;
+        let mut drawn = topology::draw_network_page(
+            project,
+            &page,
+            sheet,
+            total,
+            net,
+            &options.date,
+            &exported,
+            &mut report.warnings,
+        );
+        place_logo(&mut drawn, &page);
+        doc.add_page(size.mm(), &format!("{} {}", page.number, page.title), drawn);
+        sheet += 1;
+    }
     // Links resolve against the exported page list, so links to pages left out are dropped.
     let index: BTreeMap<String, usize> = pages
         .iter()

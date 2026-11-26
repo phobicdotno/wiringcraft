@@ -31,14 +31,20 @@ separate rows with their level number, as in the terminal plan.
 
 ## Index
 
-The first column identifies each row: `<strip>/T<position>` for a terminal, `/J<n>` for a
-jumper, `/P<n>` for a plate and `/R<n>` for a rail, e.g. `-X1/T3`. An accessory row names the
+The first column identifies each row: `<strip>/T:<terminal number>` for a terminal, `/J<n>` for
+a jumper, `/P<n>` for a plate and `/R<n>` for a rail, e.g. `-X1/T:3`. An accessory row names the
 device slot it is: `<strip>/S` for the strip device's own part, `<strip>/A<n>` for the strip
-device's n-th accessory, and `<strip>/T<position>/A<n>` for the n-th accessory of the terminal
-device first at that position (`-X1/T2/A1`). It stays the same as long as the strip does not
-change (adding an accessory to one device leaves the other rows' indexes as they are), so a list
-that comes back from the configurator with articles chosen can be matched to the project's
-devices row by row.
+device's n-th accessory, and `<strip>/T:<terminal number>/A<n>` for the n-th accessory of the
+terminal device, named by its lowest terminal number (`-X1/T:2/A1`). A terminal's index goes with the terminal,
+so reordering the strip or adding a terminal before it leaves it as it is; the `Position` column
+is its place on the rail. Adding an accessory to one device leaves the other rows' indexes as
+they are, so a list that comes back from the configurator with articles chosen can be matched to
+the project's devices row by row.
+
+Lists written by earlier versions have the terminal's place on the rail in its index (`-X1/T3`,
+`-X1/T2/A1`). Such a row is taken only when its `Terminal` number (for an accessory, its
+`Connects`) is the terminal at that place now; without one it is not taken, as nothing tells
+which terminal it was. Export the list again to get the new indexes.
 
 ## Import back
 
@@ -68,11 +74,21 @@ devices and jumpers:
   without an index that is a Jumper, or has no Type but names terminals in Connects, is not taken:
   it may be a jumper that lost its index.
 - In the app it is one undo step.
+- A copy the project has of a part without its pin (left by an undone import) is matched as it
+  is and pinned again, never replaced by a newer library version. A pin names a library, so one
+  of the project's libraries must still have the part: otherwise the copy stays unpinned (and,
+  when no device uses it, it is not matched at all).
+- The command line import also pins every part the project already uses without a pin (left
+  by an earlier import whose lock could not be written), even one no row names: then only
+  `library.lock` is written (and the part's copy, when the project has none and a library has
+  the part). A used part no library has and the project has no copy of stays unpinned; `lib
+  lock` reports it, once every configured library can be opened (`import wago` itself goes on
+  past a library it cannot open). With every used part pinned and nothing to change, nothing is written.
 
 Every row with an article that is not taken is listed with the reason: an index the project no
 longer has, or whose type, terminal number or (for an accessory) terminal in Connects changed
-(export again), a jumper whose terminals in Connects changed (export again), a terminal's
-accessory or a jumper in a file without the Connects column, a plate or rail, an article no part has (import the maker's catalogue into a library
+(export again), a jumper whose terminals in Connects changed (export again), a jumper, or
+an accessory with an index from an earlier version, in a file without the Connects column, a plate or rail, an article no part has (import the maker's catalogue into a library
 first, e.g. `import parts-bmecat`), an article several parts have, or two rows that give one
 device part different articles or quantities (neither is taken, and both are listed). Importing the same list twice changes nothing the
 second time.

@@ -10,7 +10,8 @@
 //! import dialog maps the Article and Quantity columns, and the other columns describe where
 //! each item goes. See `docs/wago-configurator.md`.
 //!
-//! Every row has an `Index` that stays the same as long as the strip does not change, so a list
+//! Every row has an `Index` that stays the same as long as its item does (a terminal's goes with
+//! the terminal when the strip is reordered), so a list
 //! that comes back from the configurator with articles filled in can be matched to the project's
 //! devices row by row (the import back, #123).
 
@@ -51,18 +52,22 @@ pub const CONFIGURATOR_COLUMNS: [&str; 19] = [
 /// - `Plate` and `Rail` rows: each panel layout that holds the strip or one of its terminals,
 ///   with the plate's size, and each DIN rail they sit on with its length and rotation (rails
 ///   are horizontal, `0`).
-/// - `Terminal` rows in strip order (natural order of the terminal numbers), with the
+/// - `Terminal` rows in strip order (the terminal plan's: natural order of the terminal numbers,
+///   or the order the terminal strip editor set, spares included), with the
 ///   terminal's part, its level on a multi-level terminal, and the cross-section and colour of
 ///   the wires on its upper (pin 1) and lower (pin 2) side.
 /// - `Jumper` rows: the terminals each jumper joins, with the jumper's part when it has one.
 /// - `Accessory` rows: the strip device's own part and accessories (end plates, end stops,
 ///   marker carriers) and each terminal's accessories, with their quantities.
 ///
-/// The `Index` column is `<strip>/T<position>` for a terminal, `/J<n>` for a jumper, `/P<n>` for
-/// a plate and `/R<n>` for a rail (`-X1/T3`). Accessory rows name the device slot they are:
-/// `<strip>/S` for the strip device's own part, `<strip>/A<n>` for its n-th accessory, and
-/// `<strip>/T<position>/A<n>` for the n-th accessory of the terminal device first at that
-/// position (`-X1/T2/A1`).
+/// The `Index` column is `<strip>/T:<terminal number>` for a terminal (`-X1/T:3`), so it stays
+/// with the terminal when the strip is reordered or a terminal is added before it; `Position`
+/// is its place on the rail. It is `/J<n>` for a jumper, `/P<n>` for a plate and `/R<n>` for a
+/// rail. Accessory rows name the device slot they are: `<strip>/S` for the strip device's own
+/// part, `<strip>/A<n>` for its n-th accessory, and `<strip>/T:<terminal number>/A<n>` for the
+/// n-th accessory of a terminal device, named by its lowest terminal number (`-X1/T:2/A1`).
+/// Lists written before #340 had the place on the rail in place of the terminal number
+/// (`-X1/T3`).
 pub fn configurator_list(i: &Inputs<'_>) -> Configurator {
     let mut out = Configurator {
         table: Table::new("WAGO configurator", &CONFIGURATOR_COLUMNS),
@@ -70,6 +75,18 @@ pub fn configurator_list(i: &Inputs<'_>) -> Configurator {
         targets: BTreeMap::new(),
     };
     let info = terminal_info(i);
+    // A terminal whose symbol the project has no copy of is still on the rail (as in the
+    // terminal plan), but nothing tells its sides apart.
+    for page in i.project.pages.iter().filter(|pg| !pg.overview) {
+        for s in page.symbols.iter().filter(|s| !i.symbols.contains_key(&s.symbol)) {
+            if let Some(tag) = s.tag.as_ref().filter(|t| wc_core::project::is_terminal(t, None)) {
+                out.warnings.push(format!(
+                    "terminal {tag} on page {}: its symbol {} is missing from the project, so its wiring is not known",
+                    page.number, s.symbol
+                ));
+            }
+        }
+    }
     // (number, level) of each terminal in strip order, each terminal once, by strip.
     let mut strips: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     for r in terminal_plan(i).rows {
@@ -105,13 +122,22 @@ pub fn configurator_list(i: &Inputs<'_>) -> Configurator {
             strip: strip.clone(),
             ..Row::default()
         };
+        // A spare terminal (not drawn) is the device `-X1.<number>`, when the project has one.
+        let spare_tag = |number: &str| -> Option<DeviceTag> {
+            if info.contains_key(&(strip.clone(), number.to_owned())) {
+                return None;
+            }
+            let mut tag = strip_tag.clone();
+            tag.product.push(number.to_owned());
+            Some(tag)
+        };
         // The device each terminal is drawn as: `-X1.3`, or the strip itself for a terminal
         // tagged only with its strip (numbered in drawing order).
         let device_of = |number: &str| -> Option<(&DeviceTag, &wc_core::Device)> {
-            let tag = info
-                .get(&(strip.clone(), number.to_owned()))
-                .and_then(|t| t.tag.as_ref())?;
-            i.project.devices.get_key_value(tag)
+            match info.get(&(strip.clone(), number.to_owned())) {
+                Some(t) => i.project.devices.get_key_value(t.tag.as_ref()?),
+                None => i.project.devices.get_key_value(&spare_tag(number)?),
+            }
         };
 
         let (mut plates, mut rails) = (0, 0);
@@ -145,7 +171,7 @@ pub fn configurator_list(i: &Inputs<'_>) -> Configurator {
                 terminal: number.clone(),
                 level: level.clone(),
                 quantity: "1".into(),
-                ..row(format!("{strip}/T{}", pos + 1), "Terminal")
+                ..row(format!("{strip}/T:{number}"), "Terminal")
             };
             if let Some((tag, d)) = device_of(number) {
                 if let Some(part) = d.part.as_deref() {
@@ -155,6 +181,9 @@ pub fn configurator_list(i: &Inputs<'_>) -> Configurator {
             } else if let Some(tag) = info.get(&(strip.clone(), number.clone())).and_then(|t| t.tag.as_ref()) {
                 // Drawn but without a device entry yet: the import back makes one.
                 r.target = Some(Target::Part(tag.clone()));
+            } else if let Some(tag) = spare_tag(number) {
+                // A spare without a device entry: the import back makes one too.
+                r.target = Some(Target::Part(tag));
             }
             if let Some([(us, uc), (ls, lc)]) = info.get(&(strip.clone(), number.clone())).map(|t| &t.sides) {
                 r.upper_section = join(us);
@@ -218,14 +247,31 @@ pub fn configurator_list(i: &Inputs<'_>) -> Configurator {
                 )
             }));
         }
+        // A device several terminals are drawn as (terminals tagged only with the strip) is
+        // named by its lowest terminal number, not the first on the rail, so reordering the
+        // strip leaves its accessories' indexes as they are.
+        let mut first: BTreeMap<&DeviceTag, &String> = BTreeMap::new();
+        for (number, _) in terminals {
+            if let Some((tag, _)) = device_of(number) {
+                let at = first.entry(tag).or_insert(number);
+                if natural_key(number)
+                    .cmp(&natural_key(at))
+                    .then_with(|| number.cmp(at))
+                    .is_lt()
+                {
+                    *at = number;
+                }
+            }
+        }
         let mut seen: BTreeSet<&DeviceTag> = BTreeSet::new();
-        for (pos, (number, _)) in terminals.iter().enumerate() {
+        for (number, _) in terminals {
             if let Some((tag, d)) = device_of(number)
                 && seen.insert(tag)
             {
+                let number = first.get(tag).copied().unwrap_or(number);
                 accessories.extend(d.accessories.iter().enumerate().map(|(k, a)| {
                     (
-                        format!("{strip}/T{}/A{}", pos + 1, k + 1),
+                        format!("{strip}/T:{number}/A{}", k + 1),
                         a.part.clone(),
                         a.qty,
                         number.clone(),
@@ -428,8 +474,8 @@ fn mounting(i: &Inputs<'_>, strip: &DeviceTag) -> Vec<Mounting> {
             .items
             .iter()
             .filter_map(|it| match it {
-                PanelItem::Device { tag, at, width, height } if tag == strip || tag.terminal_parts().0 == *strip => {
-                    Some((at.x, at.y, at.x + width, at.y + height))
+                PanelItem::Device { tag, .. } if tag == strip || tag.terminal_parts().0 == *strip => {
+                    it.device_bounds().map(|(a, b)| (a.x, a.y, b.x, b.y))
                 }
                 _ => None,
             })

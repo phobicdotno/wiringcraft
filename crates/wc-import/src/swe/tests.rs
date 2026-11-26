@@ -1506,7 +1506,9 @@ fn wire_records_without_a_drawn_line_are_counted_with_their_reason() {
         .find(|c| c.what == "wire ends (from/to terminals)")
         .unwrap();
     assert!(
-        ends.note.contains("1 are jumpers between terminals of one strip"),
+        ends.note.contains(
+            "1 are jumpers between terminals of one strip that no drawn line carries, made into the strip's jumpers"
+        ),
         "{}",
         ends.note
     );
@@ -1647,6 +1649,7 @@ fn lib_coil(id: &str, a2_at: f64) -> Symbol {
         dir,
     };
     Symbol {
+        source: String::new(),
         id: id.into(),
         name: "Relay coil".into(),
         category: "relays".into(),
@@ -2368,7 +2371,7 @@ fn refused_drawing_files_count_against_the_archive_total() {
         file,
         total: 2 * (file + 1),
     };
-    let drawings = drawings::drawings_within(buf, "Projects/3", lim).unwrap();
+    let drawings = drawings::drawings_within(buf, "Projects/3", lim, None).unwrap();
     assert!(!drawings.has_block("D"), "{:?}", drawings.warnings);
     assert!(
         drawings
@@ -2443,6 +2446,28 @@ fn a_drawing_read_in_part_keeps_its_graphics_and_says_why() {
 }
 
 #[test]
+fn a_damaged_class_section_and_object_are_each_warned_with_their_own_cause() {
+    let mut d = SweDrawings::default();
+    let classes = Some(vec![0u8; 40]);
+    let dwg = crate::dwg::objects::tests::model_space_dwg_with_classes(
+        &[E::Line((0.0, 0.0), (0.0, 6.0)), E::Damaged],
+        classes,
+    );
+    d.add_block("Coil", &dwg).unwrap();
+    assert_eq!(d.warnings.len(), 2, "{:?}", d.warnings);
+    let classes = d.warnings.iter().find(|w| w.contains("custom entities")).unwrap();
+    assert!(
+        classes.starts_with("block Coil: DWG: the class section (AcDb:Classes) is damaged"),
+        "{classes}"
+    );
+    assert!(classes.contains("sentinel"), "{classes}");
+    let object = d.warnings.iter().find(|w| w.contains("object(s)")).unwrap();
+    assert!(object.contains("the first because of: object 101 at"), "{object}");
+    assert!(object.contains("past the end"), "{object}");
+    assert!(!object.contains("AcDb:Classes"), "{object}");
+}
+
+#[test]
 fn a_symbol_at_the_join_boundary_is_drawn_and_sized_alike_by_both_checks() {
     let mut sw = read(&sample()).unwrap();
     // A2 sits 5.5002 below the origin: 5.500 when the difference is rounded (a library fit,
@@ -2466,4 +2491,158 @@ fn a_symbol_at_the_join_boundary_is_drawn_and_sized_alike_by_both_checks() {
     );
     let (w, h) = page(&built, "01").size.mm();
     assert!(w >= 350.0 && h >= 350.0, "the sheet has room for the block: {w} x {h}");
+}
+
+#[test]
+fn jumpers_from_the_terminal_strip_editor_become_the_strips_jumper() {
+    let c = sample_with_strip();
+    // A third terminal, and two records no line carries: 1 to 2 and 2 to 3, chained.
+    c.execute_batch(
+        "INSERT INTO tew_component (com_id, com_tag, com_tagpath, com_type, com_com_id, com_tagorderno) VALUES (203, '3', '-X1 3', 4, 200, 3);
+         INSERT INTO tew_symbol VALUES (22, 10, 203, 'Terminal', 190, 200, 0, 1, 1, NULL, NULL);
+         INSERT INTO tew_symbolpt VALUES (22, 0, 0, 0, 5), (22, 0, 1, 0, -5);
+         INSERT INTO tew_componentelement VALUES (62, 22, 0, 203, 0);
+         INSERT INTO tew_componentterminal VALUES (62, 0, NULL), (62, 1, NULL);
+         INSERT INTO tew_wire (wir_id, wir_cab_id, wir_caw_no, wir_tag, wir_cel_idfrom, wir_cte_nofrom, wir_cel_idto, wir_cte_noto)
+           VALUES (90, NULL, -1, '', 60, 0, 61, 1), (92, NULL, -1, '', 61, 0, 62, 1);",
+    )
+    .unwrap();
+    let (built, _, report) = build(&read(&c).unwrap(), None);
+    assert_eq!(built.jumpers.len(), 1, "{:?}", built.jumpers);
+    let j = &built.jumpers[0];
+    assert_eq!(j.strip, DeviceTag::parse("-X1").unwrap());
+    let mut terminals = j.terminals.clone();
+    terminals.sort();
+    assert_eq!(terminals, ["1", "2", "3"]);
+    let jumpers = report.iter().find(|c| c.what == "terminal jumpers").unwrap();
+    assert_eq!((jumpers.source, jumpers.imported), (1, 1));
+    assert!(jumpers.note.contains("2 wire record(s)"), "{}", jumpers.note);
+    let ends = report
+        .iter()
+        .find(|c| c.what == "wire ends (from/to terminals)")
+        .unwrap();
+    assert!(!ends.note.contains("WiringCraft has no jumpers"), "{}", ends.note);
+}
+
+#[test]
+fn a_jumper_counts_even_where_the_drawing_already_joins_its_terminals() {
+    let c = sample_with_strip();
+    // A drawn line from terminal 1's upper pin to terminal 2's lower pin, not linked to the
+    // record 90 between the same two pins.
+    c.execute_batch(
+        "INSERT INTO tew_line VALUES (12, 10, 150, 205, 170, 195, NULL);
+         INSERT INTO tew_wire (wir_id, wir_cab_id, wir_caw_no, wir_tag, wir_cel_idfrom, wir_cte_nofrom, wir_cel_idto, wir_cte_noto)
+           VALUES (90, NULL, -1, '', 60, 0, 61, 1);",
+    )
+    .unwrap();
+    let (built, _, _) = build(&read(&c).unwrap(), None);
+    assert_eq!(built.jumpers.len(), 1, "{:?}", built.jumpers);
+    let mut terminals = built.jumpers[0].terminals.clone();
+    terminals.sort();
+    assert_eq!(terminals, ["1", "2"]);
+}
+
+#[test]
+fn a_jumper_to_a_terminal_whose_tag_was_taken_names_both_tags() {
+    let c = sample_with_strip();
+    // Another device already has -X1.2, so terminal 2 is renamed.
+    c.execute_batch(
+        "INSERT INTO tew_component (com_id, com_tag, com_tagpath, com_type) VALUES (205, 'X1.2', '-X1.2', -1);
+         INSERT INTO tew_wire (wir_id, wir_cab_id, wir_caw_no, wir_tag, wir_cel_idfrom, wir_cte_nofrom, wir_cel_idto, wir_cte_noto)
+           VALUES (90, NULL, -1, '', 60, 0, 61, 1);",
+    )
+    .unwrap();
+    let (built, warnings, _) = build(&read(&c).unwrap(), None);
+    assert!(built.jumpers.is_empty(), "{:?}", built.jumpers);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("the tag -X1.2 was taken by another device")
+                && w.contains("so the terminal became -X1.2_2")),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn a_jumper_to_a_terminal_not_drawn_is_refused_with_its_reason() {
+    let c = sample_with_strip();
+    // Terminal 3 on the strip has no symbol: its circuit is in no drawing.
+    c.execute_batch(
+        "INSERT INTO tew_component (com_id, com_tag, com_tagpath, com_type, com_com_id, com_tagorderno) VALUES (203, '3', '-X1 3', 4, 200, 3);
+         INSERT INTO tew_componentelement VALUES (62, NULL, 0, 203, 0);
+         INSERT INTO tew_componentterminal VALUES (62, 0, NULL), (62, 1, NULL);
+         INSERT INTO tew_wire (wir_id, wir_cab_id, wir_caw_no, wir_tag, wir_cel_idfrom, wir_cte_nofrom, wir_cel_idto, wir_cte_noto)
+           VALUES (90, NULL, -1, '', 61, 0, 62, 1);",
+    )
+    .unwrap();
+    let (built, warnings, _) = build(&read(&c).unwrap(), None);
+    // Its number would join whichever terminal later gets it, and no plan would show it.
+    assert!(built.jumpers.is_empty(), "{:?}", built.jumpers);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("1 jumper record(s)") && w.contains("a terminal is not drawn on any schematic page")),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn a_jumper_to_a_terminal_without_a_number_is_refused_with_its_reason() {
+    let c = sample_with_strip();
+    // A terminal on the strip with no name: its tag path `-X1.9` must not stand in for a number.
+    c.execute_batch(
+        "INSERT INTO tew_component (com_id, com_tag, com_tagpath, com_type, com_com_id, com_tagorderno) VALUES (204, '', '-X1.9', 4, 200, 4);
+         INSERT INTO tew_symbol VALUES (23, 10, 204, 'Terminal', 210, 200, 0, 1, 1, NULL, NULL);
+         INSERT INTO tew_symbolpt VALUES (23, 0, 0, 0, 5), (23, 0, 1, 0, -5);
+         INSERT INTO tew_componentelement VALUES (63, 23, 0, 204, 0);
+         INSERT INTO tew_componentterminal VALUES (63, 0, NULL), (63, 1, NULL);
+         INSERT INTO tew_wire (wir_id, wir_cab_id, wir_caw_no, wir_tag, wir_cel_idfrom, wir_cte_nofrom, wir_cel_idto, wir_cte_noto)
+           VALUES (93, NULL, -1, '', 60, 0, 63, 1);",
+    )
+    .unwrap();
+    let (built, warnings, report) = build(&read(&c).unwrap(), None);
+    assert!(built.jumpers.is_empty(), "{:?}", built.jumpers);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("1 jumper record(s)") && w.contains("a terminal has no number of its own")),
+        "{warnings:?}"
+    );
+    let ends = report
+        .iter()
+        .find(|c| c.what == "wire ends (from/to terminals)")
+        .unwrap();
+    assert!(
+        ends.note
+            .contains("1 are jumpers between terminals of one strip that no drawn line carries, not imported"),
+        "{}",
+        ends.note
+    );
+}
+
+#[test]
+fn archive_names_with_dot_slash_are_read_like_plain_ones() {
+    let library = model_space_dwg(&[E::Line((0.0, 0.0), (1.0, 0.0))]);
+    let other = model_space_dwg(&[E::Line((0.0, 0.0), (9.0, 9.0))]);
+    let page = model_space_dwg(&[E::Line((0.0, 0.0), (5.0, 0.0))]);
+    // Another project's block comes after the library's: it must not replace it.
+    let buf = archive(&[
+        ("Block/Coil.dwg", &library),
+        ("./Projects/2/Block/Coil.dwg", &other),
+        ("./Projects/4/Drawings/17.ewg", &page),
+    ]);
+    let lim = drawings::Limits {
+        file: 1 << 20,
+        total: 1 << 24,
+    };
+    let drawings = drawings::drawings_within(buf, "Projects/4", lim, None).unwrap();
+    assert!(drawings.warnings.is_empty(), "{:?}", drawings.warnings);
+    let (mut budget, mut skipped) = (usize::MAX, BTreeMap::new());
+    let coil = drawings.block_graphics("Coil", &mut budget, &mut skipped).unwrap();
+    assert!(
+        matches!(coil[..], [Shape::Line { b, .. }] if (b.x - 1.0).abs() < 1e-9 && b.y.abs() < 1e-9),
+        "{coil:?}"
+    );
+    assert_eq!(drawings.page_count(), 1);
+    assert!(!drawings.page_graphics(17, &[], &mut budget, &mut skipped).is_empty());
 }

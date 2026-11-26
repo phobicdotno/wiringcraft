@@ -154,6 +154,339 @@ fn other_prefixes_are_found_and_missing_fields_are_warnings() {
     assert_eq!(lib.warnings.len(), 3, "{:?}", lib.warnings);
 }
 
+/// The same rows as [`CATALOG`] and [`APP_DATA`] in a layout like the one newer installations
+/// write (#293): the key fields keep one prefix while most columns carry another, so the
+/// table's prefix is not the one its id and name columns use. Terminals use bare names.
+const OTHER_LAYOUT: &str = "
+CREATE TABLE tew_catreference (ref_id INTEGER, ref_reference TEXT, ref_manufacturer TEXT, cre_description TEXT,
+  cre_typedesignation TEXT, cre_width TEXT, cre_deleted INTEGER, cre_guid TEXT);
+CREATE TABLE tew_catelement (ele_id INTEGER, ele_ref_id INTEGER, ele_orderno INTEGER, ele_name TEXT);
+CREATE TABLE tew_catterminal (ter_ele_id INTEGER, no INTEGER, txt TEXT);
+INSERT INTO tew_catreference VALUES
+  (1, 'RLY-24', 'Maker A', 'Relay 24 V DC', 'R24', '18 mm', 0, 'a'),
+  (2, 'MCB C10', 'Maker B', NULL, NULL, NULL, 0, 'b'),
+  (3, '', 'Maker C', 'no reference', NULL, NULL, 0, 'c'),
+  (4, 'RLY-24', 'Maker A', 'same again', NULL, NULL, 0, 'd');
+INSERT INTO tew_catelement VALUES (10, 1, 1, 'Coil'), (11, 1, 2, 'CO'), (20, 2, 1, '');
+INSERT INTO tew_catterminal VALUES (10, 1, 'A1'), (10, 2, 'A2'), (11, 3, '14'), (11, 1, '11'), (11, 2, '12'),
+  (20, 1, '1'), (20, 2, '2'), (99, 1, 'X');
+CREATE TABLE tew_cablereference (cbr_id INTEGER, cbr_reference TEXT, cbr_manufacturer TEXT, car_description TEXT,
+  car_guid TEXT, car_deleted INTEGER, car_family TEXT);
+CREATE TABLE tew_cablereferencewire (crw_cbr_id INTEGER, crw_no TEXT, crw_color TEXT, crw_section TEXT);
+CREATE TABLE tew_block (blk_id INTEGER, blk_name TEXT, blo_description TEXT, blo_guid TEXT, blo_path TEXT);
+CREATE TABLE tew_blockpt (bpt_blk_id INTEGER, bpt_no INTEGER, bpt_txt TEXT, bpt_dx REAL, bpt_dy REAL);
+INSERT INTO tew_cablereference VALUES (1, 'CBL-3G1', 'Maker C', 'Control cable 3G1', 'g', 0, ''),
+  (2, 'CBL-2', 'Maker C', NULL, 'h', 0, '');
+INSERT INTO tew_cablereferencewire VALUES (1, '1', 'BN', '1 mm2'), (1, '2', 'BU', '1 mm2'), (1, '3', 'GNYE', '1 mm2'),
+  (2, '1', '', ''), (2, '2', '', '');
+INSERT INTO tew_block VALUES (1, 'Coil', 'Relay coil', 'x', ''), (2, 'Frame A3', '', 'y', ''),
+  (3, 'Coil', 'Another coil', 'z', '');
+INSERT INTO tew_blockpt VALUES (1, 2, 'A2', 0, -5), (1, 1, 'A1', 0, 5), (3, 1, '', 0, 0);
+";
+
+#[test]
+fn a_layout_with_mixed_prefixes_gives_the_same_library() {
+    let known = read(Some(&db(CATALOG)), Some(&db(APP_DATA))).unwrap();
+    let other = db(OTHER_LAYOUT);
+    let lib = read(Some(&other), Some(&other)).unwrap();
+    assert_eq!(lib.parts, known.parts);
+    // The same blocks, only what names them differs: this layout has GUIDs.
+    let unsourced = |l: &SweLibrary| -> Vec<Symbol> {
+        l.symbols
+            .iter()
+            .cloned()
+            .map(|s| Symbol {
+                source: String::new(),
+                ..s
+            })
+            .collect()
+    };
+    assert_eq!(unsourced(&lib), unsourced(&known));
+    let sources: Vec<&str> = lib.symbols.iter().map(|s| s.source.as_str()).collect();
+    assert_eq!(
+        sources,
+        [
+            "solidworks-electrical:block:guid:x",
+            "solidworks-electrical:block:guid:z"
+        ]
+    );
+    assert_eq!(lib.report, known.report);
+    assert!(!lib.warnings.iter().any(|w| w.contains("column")), "{:?}", lib.warnings);
+}
+
+/// Blocks with GUIDs: `Coil` twice and `COIL` once, all cleaning up to `swe.lib.coil`.
+/// Each block's one pin is given by `points` (`(row, 1, 'A1', 0, 1)`, ...).
+fn guid_blocks(rows: &str, points: &str) -> Connection {
+    db(&format!(
+        "CREATE TABLE tew_block (blk_id INTEGER, blk_name TEXT, blk_description TEXT, blk_guid TEXT);
+CREATE TABLE tew_blockpt (bpt_blk_id INTEGER, bpt_no INTEGER, bpt_txt TEXT, bpt_dx REAL, bpt_dy REAL);
+INSERT INTO tew_block VALUES {rows};
+INSERT INTO tew_blockpt VALUES {points};"
+    ))
+}
+
+/// Pins A1, B1 and C1 on rows 1, 2 and 3.
+const POINTS: &str = "(1, 1, 'A1', 0, 1), (2, 1, 'B1', 0, 2), (3, 1, 'C1', 0, 3)";
+
+/// Which block each id names, by the pin it has.
+fn ids_to_pins(conn: &Connection) -> Vec<(String, String, String)> {
+    let (mut report, mut warnings) = (LibraryReport::default(), Vec::new());
+    let mut out: Vec<_> = read_blocks(conn, None, &mut report, &mut warnings)
+        .unwrap()
+        .into_iter()
+        .map(|s| (s.id, s.pins[0].name.clone(), s.source))
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn an_id_stays_on_its_block_when_another_catalog_lists_the_blocks_in_another_order() {
+    // #301: the same three blocks, the second catalog with their rows in another order and a
+    // GUID spelled in braces and capitals.
+    let first = guid_blocks(
+        "(1, 'Coil', '', 'aaa'), (2, 'COIL', '', 'bbb'), (3, 'Coil', '', 'ccc')",
+        POINTS,
+    );
+    // The same blocks under other row ids (ccc first), each with its own pin.
+    let second = guid_blocks(
+        "(7, 'Coil', '', 'ccc'), (8, 'Coil', '', '{AAA}'), (9, 'COIL', '', 'bbb')",
+        "(7, 1, 'C1', 0, 3), (8, 1, 'A1', 0, 1), (9, 1, 'B1', 0, 2)",
+    );
+    let a = ids_to_pins(&first);
+    assert_eq!(
+        a.iter().map(|x| x.0.as_str()).collect::<Vec<_>>(),
+        ["swe.lib.coil", "swe.lib.coil.2", "swe.lib.coil.3"]
+    );
+    assert_eq!(a, ids_to_pins(&second));
+    // A block with a GUID that sorts before the others, added in a later catalog, takes the
+    // plain id: the source tells the import it is another block (see `replace_refused`).
+    let later = guid_blocks(
+        "(1, 'Coil', '', 'aaa'), (2, 'COIL', '', 'bbb'), (3, 'Coil', '', '000')",
+        POINTS,
+    );
+    let b = ids_to_pins(&later);
+    assert_eq!(b[0].0, "swe.lib.coil");
+    assert_eq!(b[0].2, "solidworks-electrical:block:guid:000");
+    let (mut report, mut warnings) = (LibraryReport::default(), Vec::new());
+    let old = read_blocks(&first, None, &mut report, &mut warnings).unwrap();
+    let new = read_blocks(&later, None, &mut report, &mut warnings).unwrap();
+    let (old, new) = (&old[0], &new[0]);
+    assert_eq!((old.id.as_str(), new.id.as_str()), ("swe.lib.coil", "swe.lib.coil"));
+    assert!(wc_core::symbol::replace_refused(old, new).is_some());
+    assert!(wc_core::symbol::replace_refused(old, old).is_none());
+}
+
+#[test]
+fn blocks_named_alike_without_a_guid_or_path_are_ambiguous() {
+    // APP_DATA has two blocks named `Coil` and no GUIDs.
+    let (mut report, mut warnings) = (LibraryReport::default(), Vec::new());
+    let symbols = read_blocks(&db(APP_DATA), None, &mut report, &mut warnings).unwrap();
+    for s in &symbols {
+        assert!(s.source.starts_with(wc_core::symbol::AMBIGUOUS_SOURCE), "{}", s.source);
+    }
+}
+
+#[test]
+fn a_link_is_never_the_tables_own_id() {
+    // Both tables carry the prefix `cre`: the element table's bare-looking `cre_id` is its own
+    // id (10, 20), not the part's (1, 2); its link to the part is `cre_ref_id`.
+    let c = db("
+CREATE TABLE tew_catreference (ref_id INTEGER, ref_reference TEXT, ref_manufacturer TEXT, cre_a TEXT, cre_b TEXT,
+  cre_c TEXT, cre_d TEXT);
+CREATE TABLE tew_catelement (cre_id INTEGER, cre_ref_id INTEGER, cre_orderno INTEGER, cre_name TEXT);
+CREATE TABLE tew_catterminal (ter_cre_id INTEGER, ter_no INTEGER, ter_txt TEXT);
+INSERT INTO tew_catreference VALUES (1, 'RLY-24', 'Maker A', '', '', '', ''), (2, 'MCB', 'Maker B', '', '', '', '');
+INSERT INTO tew_catelement VALUES (10, 1, 1, 'Coil'), (20, 2, 1, '');
+INSERT INTO tew_catterminal VALUES (10, 1, 'A1'), (10, 2, 'A2'), (20, 1, '1');
+");
+    let (mut report, mut warnings) = (LibraryReport::default(), Vec::new());
+    let parts = read_catalog(&c, &mut report, &mut warnings).unwrap();
+    let terminals: Vec<(&str, &str)> = parts
+        .iter()
+        .map(|p| (p.id.as_str(), p.properties[PROP_TERMINALS].as_str()))
+        .collect();
+    assert_eq!(terminals, [("maker-a.rly-24", "Coil: A1 A2"), ("maker-b.mcb", "1")]);
+
+    // Without a link column the element table's own id is not taken for one: a warning.
+    let c = db("
+CREATE TABLE tew_catreference (cre_id INTEGER, cre_reference TEXT, cre_manufacturer TEXT);
+CREATE TABLE tew_catelement (cre_id INTEGER, cre_orderno INTEGER, cre_name TEXT);
+CREATE TABLE tew_catterminal (ter_cre_id INTEGER, ter_no INTEGER, ter_txt TEXT);
+INSERT INTO tew_catreference VALUES (1, 'RLY-24', 'Maker A');
+INSERT INTO tew_catelement VALUES (1, 1, 'Coil');
+INSERT INTO tew_catterminal VALUES (1, 1, 'A1');
+");
+    let mut warnings = Vec::new();
+    let parts = read_catalog(&c, &mut report, &mut warnings).unwrap();
+    assert!(
+        !parts[0].properties.contains_key(PROP_TERMINALS),
+        "{:?}",
+        parts[0].properties
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("tew_catelement has no")),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn a_bare_foreign_key_or_one_past_the_own_id_is_a_link() {
+    // Terminals whose only `id` column is the link to the element (`ele_id`): it is a link,
+    // not the terminal table's own id.
+    let c = db("
+CREATE TABLE tew_catreference (ref_id INTEGER, ref_reference TEXT, ref_manufacturer TEXT);
+CREATE TABLE tew_catelement (ele_id INTEGER, ele_ref_id INTEGER, ele_orderno INTEGER, ele_name TEXT);
+CREATE TABLE tew_catterminal (ele_id INTEGER, ter_no INTEGER, ter_txt TEXT);
+INSERT INTO tew_catreference VALUES (1, 'RLY-24', 'Maker A');
+INSERT INTO tew_catelement VALUES (10, 1, 1, 'Coil');
+INSERT INTO tew_catterminal VALUES (10, 1, 'A1'), (10, 2, 'A2');
+");
+    let (mut report, mut warnings) = (LibraryReport::default(), Vec::new());
+    let parts = read_catalog(&c, &mut report, &mut warnings).unwrap();
+    assert_eq!(parts[0].properties[PROP_TERMINALS], "Coil: A1 A2");
+    assert!(!warnings.iter().any(|w| w.contains("has no")), "{warnings:?}");
+
+    // The same with no prefix on the terminal table's other columns: `ele_id` is the only
+    // prefixed column, and still the link rather than the terminal table's own id.
+    let c = db("
+CREATE TABLE tew_catreference (ref_id INTEGER, ref_reference TEXT, ref_manufacturer TEXT);
+CREATE TABLE tew_catelement (ele_id INTEGER, ele_ref_id INTEGER, ele_orderno INTEGER, ele_name TEXT);
+CREATE TABLE tew_catterminal (ele_id INTEGER, no INTEGER, txt TEXT);
+INSERT INTO tew_catreference VALUES (1, 'RLY-24', 'Maker A');
+INSERT INTO tew_catelement VALUES (10, 1, 1, 'Coil');
+INSERT INTO tew_catterminal VALUES (10, 1, 'A1'), (10, 2, 'A2');
+");
+    let mut warnings = Vec::new();
+    let parts = read_catalog(&c, &mut report, &mut warnings).unwrap();
+    assert_eq!(parts[0].properties[PROP_TERMINALS], "Coil: A1 A2", "{warnings:?}");
+    assert!(!warnings.iter().any(|w| w.contains("has no")), "{warnings:?}");
+
+    // Elements whose own id is the bare `ref_id`: the link is the one other `*_ref_id` column.
+    let c = db("
+CREATE TABLE tew_catreference (ref_id INTEGER, ref_reference TEXT, ref_manufacturer TEXT);
+CREATE TABLE tew_catelement (ref_id INTEGER, x_ref_id INTEGER, ref_orderno INTEGER, ref_name TEXT);
+CREATE TABLE tew_catterminal (ter_ref_id INTEGER, ter_no INTEGER, ter_txt TEXT);
+INSERT INTO tew_catreference VALUES (1, 'RLY-24', 'Maker A');
+INSERT INTO tew_catelement VALUES (10, 1, 1, 'Coil');
+INSERT INTO tew_catterminal VALUES (10, 1, 'A1');
+");
+    let mut warnings = Vec::new();
+    let parts = read_catalog(&c, &mut report, &mut warnings).unwrap();
+    assert_eq!(parts[0].properties[PROP_TERMINALS], "Coil: A1", "{warnings:?}");
+
+    // The same with the element table's other columns under `ele`: its id `ref_id` is found
+    // only under another prefix, and the link is still `x_ref_id`.
+    let c = db("
+CREATE TABLE tew_catreference (ref_id INTEGER, ref_reference TEXT, ref_manufacturer TEXT);
+CREATE TABLE tew_catelement (ref_id INTEGER, x_ref_id INTEGER, ele_orderno INTEGER, ele_name TEXT,
+  ele_description TEXT);
+CREATE TABLE tew_catterminal (ter_ref_id INTEGER, ter_no INTEGER, ter_txt TEXT);
+INSERT INTO tew_catreference VALUES (1, 'RLY-24', 'Maker A');
+INSERT INTO tew_catelement VALUES (10, 1, 1, 'Coil', '');
+INSERT INTO tew_catterminal VALUES (10, 1, 'A1');
+");
+    let mut warnings = Vec::new();
+    let parts = read_catalog(&c, &mut report, &mut warnings).unwrap();
+    assert_eq!(parts[0].properties[PROP_TERMINALS], "Coil: A1", "{warnings:?}");
+
+    // Without `x_ref_id` the element's id `ref_id` is not taken for its link, even though it
+    // could name a part (element 1, part 1): a warning, no terminals.
+    let c = db("
+CREATE TABLE tew_catreference (ref_id INTEGER, ref_reference TEXT, ref_manufacturer TEXT);
+CREATE TABLE tew_catelement (ref_id INTEGER, ele_orderno INTEGER, ele_name TEXT, ele_description TEXT);
+CREATE TABLE tew_catterminal (ter_ref_id INTEGER, ter_no INTEGER, ter_txt TEXT);
+INSERT INTO tew_catreference VALUES (1, 'RLY-24', 'Maker A');
+INSERT INTO tew_catelement VALUES (1, 1, 'Coil', '');
+INSERT INTO tew_catterminal VALUES (1, 1, 'A1');
+");
+    let mut warnings = Vec::new();
+    let parts = read_catalog(&c, &mut report, &mut warnings).unwrap();
+    assert!(
+        !parts[0].properties.contains_key(PROP_TERMINALS),
+        "{:?}",
+        parts[0].properties
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("tew_catelement has no")),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn a_missing_link_column_lists_the_tables_columns() {
+    let has = |warnings: &[String], w: &str| assert!(warnings.iter().any(|x| x.contains(w)), "{w}\n{warnings:?}");
+    let mut report = LibraryReport::default();
+
+    // Circuits that name no part.
+    let c = db("
+CREATE TABLE tew_catreference (ref_id INTEGER, ref_reference TEXT, ref_manufacturer TEXT);
+CREATE TABLE tew_catelement (ele_id INTEGER, ele_orderno INTEGER, ele_name TEXT);
+CREATE TABLE tew_catterminal (ter_ele_id INTEGER, ter_no INTEGER, ter_txt TEXT);
+INSERT INTO tew_catreference VALUES (1, 'RLY-24', 'Maker A');
+");
+    let mut warnings = Vec::new();
+    read_catalog(&c, &mut report, &mut warnings).unwrap();
+    has(
+        &warnings,
+        "tew_catelement has no ele_ref_id column (its columns: ele_id, ele_orderno, ele_name)",
+    );
+
+    // Terminals that name no circuit.
+    let c = db("
+CREATE TABLE tew_catreference (ref_id INTEGER, ref_reference TEXT, ref_manufacturer TEXT);
+CREATE TABLE tew_catelement (ele_id INTEGER, ele_ref_id INTEGER, ele_name TEXT);
+CREATE TABLE tew_catterminal (ter_no INTEGER, ter_txt TEXT);
+INSERT INTO tew_catreference VALUES (1, 'RLY-24', 'Maker A');
+");
+    let mut warnings = Vec::new();
+    read_catalog(&c, &mut report, &mut warnings).unwrap();
+    has(
+        &warnings,
+        "tew_catterminal has no ter_ele_id column (its columns: ter_no, ter_txt)",
+    );
+
+    // Cores that name no cable type, and block points that name no block.
+    let c = db("
+CREATE TABLE tew_cablereference (cbr_id INTEGER, cbr_reference TEXT, cbr_manufacturer TEXT);
+CREATE TABLE tew_cablereferencewire (crw_no TEXT, crw_color TEXT, crw_section TEXT);
+CREATE TABLE tew_block (blk_id INTEGER, blk_name TEXT);
+CREATE TABLE tew_blockpt (bpt_no INTEGER, bpt_txt TEXT, bpt_dx REAL, bpt_dy REAL);
+INSERT INTO tew_cablereference VALUES (1, 'CBL-3G1', 'Maker C');
+INSERT INTO tew_block VALUES (1, 'Coil');
+");
+    let mut warnings = Vec::new();
+    read_cable_types(&c, &mut report, &mut warnings).unwrap();
+    has(
+        &warnings,
+        "cable types come without cores: tew_cablereferencewire has no crw_cbr_id column (its columns: crw_no, crw_color, crw_section)",
+    );
+    let mut warnings = Vec::new();
+    read_blocks(&c, None, &mut report, &mut warnings).unwrap();
+    has(
+        &warnings,
+        "tew_blockpt has no bpt_blk_id column (its columns: bpt_no, bpt_txt, bpt_dx, bpt_dy)",
+    );
+}
+
+#[test]
+fn a_field_two_columns_could_be_is_not_guessed() {
+    // Neither `a_reference` nor `b_reference` has the table's prefix `c`: no guess, and the
+    // warning lists the columns so the layout can be mapped.
+    let c = db(
+        "CREATE TABLE tew_catreference (c_id INTEGER, a_reference TEXT, b_reference TEXT, c_manufacturer TEXT);
+         INSERT INTO tew_catreference VALUES (1, 'X-1', 'X-2', 'M');",
+    );
+    let (mut report, mut warnings) = (LibraryReport::default(), Vec::new());
+    let parts = read_catalog(&c, &mut report, &mut warnings).unwrap();
+    assert!(parts.is_empty());
+    assert!(
+        warnings.iter().any(|w| w.contains("has no c_reference column")
+            && w.contains("its columns: c_id, a_reference, b_reference, c_manufacturer")),
+        "{warnings:?}"
+    );
+}
+
 #[test]
 fn rows_of_the_wrong_type_are_counted_not_fatal() {
     let c = db(CATALOG);
@@ -613,4 +946,152 @@ INSERT INTO tew_blockpt VALUES (1, 1, 'A1', 0, 5);
     .unwrap();
     let symbols = read_blocks(&app, Some(&d), &mut report, &mut warnings).unwrap();
     assert_eq!(symbols[0].graphics.len(), 2, "{:?}", symbols[0].graphics);
+}
+
+#[test]
+fn only_drawings_of_imported_blocks_count_against_the_limits() {
+    use crate::dwg::objects::tests::{TestEntity as E, model_space_dwg};
+    use wc_core::geom::Shape;
+    // The coil has connection points; the frame has none and is not imported.
+    let app = bytes(&db("
+CREATE TABLE tew_block (blk_id INTEGER, blk_name TEXT, blk_description TEXT);
+CREATE TABLE tew_blockpt (bpt_blk_id INTEGER, bpt_no INTEGER, bpt_txt TEXT, bpt_dx REAL, bpt_dy REAL);
+INSERT INTO tew_block VALUES (1, 'Coil', ''), (2, 'Frame', '');
+INSERT INTO tew_blockpt VALUES (1, 1, 'A1', 0, 5);
+"));
+    let drawing = model_space_dwg(&[E::Circle((0.0, 0.0), 4.0)]);
+    let file = drawing.len() as u64;
+    // Room for one drawing only, and many drawings of blocks the library does not import first.
+    let lim = super::super::drawings::Limits { file, total: file + 1 };
+    let names: Vec<String> = (0..20).map(|i| format!("Library/Block/Unused {i}.dwg")).collect();
+    let mut entries: Vec<(&str, &[u8])> = vec![("Database/tew_app_data.sqlite", &app)];
+    entries.extend(names.iter().map(|n| (n.as_str(), drawing.as_slice())));
+    entries.push(("Library/Block/Frame.dwg", &drawing));
+    entries.push(("Library/Block/ Coil .dwg", &drawing));
+    let lib = from_archive_within(archive(&entries), true, lim).unwrap();
+    assert_eq!(lib.report.blocks_drawn, 1, "{:?}", lib.warnings);
+    assert!(
+        lib.symbols[0]
+            .graphics
+            .iter()
+            .any(|g| matches!(g, Shape::Circle { radius, .. } if *radius == 4.0)),
+        "{:?}",
+        lib.symbols[0].graphics
+    );
+    assert!(
+        !lib.warnings.iter().any(|w| w.contains("not read")),
+        "{:?}",
+        lib.warnings
+    );
+
+    // Two copies of the coil's drawing and room for one: the second is left out, and no block
+    // stays a box for it. A second imported block left out by the limit is named as a box.
+    let app = bytes(&db("
+CREATE TABLE tew_block (blk_id INTEGER, blk_name TEXT, blk_description TEXT);
+CREATE TABLE tew_blockpt (bpt_blk_id INTEGER, bpt_no INTEGER, bpt_txt TEXT, bpt_dx REAL, bpt_dy REAL);
+INSERT INTO tew_block VALUES (1, 'Coil', ''), (2, 'Lamp', '');
+INSERT INTO tew_blockpt VALUES (1, 1, 'A1', 0, 5), (2, 1, 'X1', 0, 5);
+"));
+    let buf = archive(&[
+        ("Database/tew_app_data.sqlite", &app),
+        ("Library/Block/Coil.dwg", &drawing),
+        ("Other/Block/coil.dwg", &drawing),
+        ("Library/Block/Lamp.dwg", &drawing),
+    ]);
+    let lib = from_archive_within(buf, true, lim).unwrap();
+    assert_eq!(lib.report.blocks_drawn, 1, "{:?}", lib.warnings);
+    assert!(
+        lib.warnings
+            .iter()
+            .any(|w| w.contains("drawing file(s) were not read") && w.ends_with("; 1 block(s) stay boxes")),
+        "{:?}",
+        lib.warnings
+    );
+}
+
+#[test]
+fn a_block_the_total_refuses_is_counted_as_a_box() {
+    use crate::dwg::objects::tests::{TestEntity as E, model_space_dwg};
+    let app = bytes(&db("
+CREATE TABLE tew_block (blk_id INTEGER, blk_name TEXT, blk_description TEXT);
+CREATE TABLE tew_blockpt (bpt_blk_id INTEGER, bpt_no INTEGER, bpt_txt TEXT, bpt_dx REAL, bpt_dy REAL);
+INSERT INTO tew_block VALUES (1, 'Coil', ''), (2, 'Lamp', '');
+INSERT INTO tew_blockpt VALUES (1, 1, 'A1', 0, 5), (2, 1, 'X1', 0, 5);
+"));
+    let drawing = model_space_dwg(&[E::Circle((0.0, 0.0), 4.0)]);
+    let file = drawing.len() as u64;
+    // The coil is read; one byte is left, so the lamp's drawing is refused for the total.
+    let lim = super::super::drawings::Limits { file, total: file + 1 };
+    let buf = archive(&[
+        ("Database/tew_app_data.sqlite", &app),
+        ("Library/Block/Coil.dwg", &drawing),
+        ("Library/Block/Lamp.dwg", &drawing),
+    ]);
+    let lib = from_archive_within(buf, true, lim).unwrap();
+    assert_eq!(lib.report.blocks_drawn, 1, "{:?}", lib.warnings);
+    assert!(
+        lib.warnings.iter().any(|w| w.contains("1 block(s) stay boxes")),
+        "{:?}",
+        lib.warnings
+    );
+}
+
+#[test]
+fn a_block_without_a_name_finds_its_drawing() {
+    use crate::dwg::objects::tests::{TestEntity as E, model_space_dwg};
+    use wc_core::geom::Shape;
+    // The block's name is empty in the source; its drawing's file name is only a space.
+    let app = bytes(&db("
+CREATE TABLE tew_block (blk_id INTEGER, blk_name TEXT, blk_description TEXT);
+CREATE TABLE tew_blockpt (bpt_blk_id INTEGER, bpt_no INTEGER, bpt_txt TEXT, bpt_dx REAL, bpt_dy REAL);
+INSERT INTO tew_block VALUES (1, '', '');
+INSERT INTO tew_blockpt VALUES (1, 1, 'A1', 0, 5);
+"));
+    let drawing = model_space_dwg(&[E::Circle((0.0, 0.0), 4.0)]);
+    let buf = archive(&[
+        ("Database/tew_app_data.sqlite", &app),
+        ("Library/Block/ .dwg", &drawing),
+    ]);
+    let lib = from_archive(buf).unwrap();
+    assert_eq!(lib.report.blocks_drawn, 1, "{:?}", lib.warnings);
+    assert!(
+        lib.symbols[0]
+            .graphics
+            .iter()
+            .any(|g| matches!(g, Shape::Circle { radius, .. } if *radius == 4.0)),
+        "{:?}",
+        lib.symbols[0].graphics
+    );
+}
+
+#[test]
+fn blocks_sharing_a_name_each_count_as_a_box() {
+    use crate::dwg::objects::tests::{TestEntity as E, model_space_dwg};
+    // Two imported blocks named Coil share one drawing, which the total refuses after the lamp's.
+    let app = bytes(&db("
+CREATE TABLE tew_block (blk_id INTEGER, blk_name TEXT, blk_description TEXT);
+CREATE TABLE tew_blockpt (bpt_blk_id INTEGER, bpt_no INTEGER, bpt_txt TEXT, bpt_dx REAL, bpt_dy REAL);
+INSERT INTO tew_block VALUES (1, 'Lamp', ''), (2, 'Coil', ''), (3, 'Coil', '');
+INSERT INTO tew_blockpt VALUES (1, 1, 'X1', 0, 5), (2, 1, 'A1', 0, 5), (3, 1, 'A1', 0, 5);
+"));
+    let drawing = model_space_dwg(&[E::Circle((0.0, 0.0), 4.0)]);
+    let file = drawing.len() as u64;
+    let lim = super::super::drawings::Limits { file, total: file + 1 };
+    let buf = archive(&[
+        ("Database/tew_app_data.sqlite", &app),
+        ("Library/Block/Lamp.dwg", &drawing),
+        ("Library/Block/Coil.dwg", &drawing),
+    ]);
+    let lib = from_archive_within(buf, true, lim).unwrap();
+    assert_eq!(
+        (lib.report.blocks_out, lib.report.blocks_drawn),
+        (3, 1),
+        "{:?}",
+        lib.warnings
+    );
+    assert!(
+        lib.warnings.iter().any(|w| w.contains("2 block(s) stay boxes")),
+        "{:?}",
+        lib.warnings
+    );
 }

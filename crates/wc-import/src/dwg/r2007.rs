@@ -49,42 +49,45 @@ const MAX_REPEAT: u64 = 0x100;
 
 /// GF(256) for Reed-Solomon words, from its field polynomial.
 pub(super) struct Field {
-    exp: [u8; 512],
+    /// The generator's powers 0 to 254.
+    exp: [u8; 255],
+    /// The power each non-zero byte is (0 for 0, never looked up).
     log: [u8; 256],
 }
 
 impl Field {
+    /// Built at compile time: an index out of range would fail the build, not a read.
     const fn new(poly: u16) -> Self {
-        let mut exp = [0u8; 512];
+        let mut exp = [0u8; 255];
         let mut log = [0u8; 256];
         let mut x: u16 = 1;
         let mut i = 0;
         while i < 255 {
             exp[i] = x as u8;
-            log[x as usize] = i as u8;
+            log[(x & 0xFF) as usize] = i as u8;
             x <<= 1;
             if x & 0x100 != 0 {
                 x ^= poly;
             }
             i += 1;
         }
-        while i < 512 {
-            exp[i] = exp[i - 255];
-            i += 1;
-        }
         Field { exp, log }
+    }
+
+    fn log(&self, a: u8) -> usize {
+        usize::from(self.log.get(usize::from(a)).copied().unwrap_or(0))
     }
 
     pub(super) fn mul(&self, a: u8, b: u8) -> u8 {
         if a == 0 || b == 0 {
             return 0;
         }
-        self.exp[usize::from(self.log[usize::from(a)]) + usize::from(self.log[usize::from(b)])]
+        self.power(self.log(a) + self.log(b))
     }
 
     /// The `i`th power of the field's generator.
     pub(super) fn power(&self, i: usize) -> u8 {
-        self.exp[i % 255]
+        self.exp.get(i % 255).copied().unwrap_or(0)
     }
 
     /// Whether `word` (byte `i` the coefficient of x^i) is a code word with `parity` check
@@ -112,7 +115,7 @@ pub(super) fn read_sections(bytes: &[u8], max_total: usize) -> Result<Sections> 
         .u64(0x38)?
         .checked_add(PAGES_START)
         .ok_or_else(|| bad("the page map address is out of range"))?;
-    let page_map = system_page(
+    let (page_map, page_map_length) = system_page(
         bytes,
         page_map_at,
         None,
@@ -124,13 +127,23 @@ pub(super) fn read_sections(bytes: &[u8], max_total: usize) -> Result<Sections> 
         "page map",
     )?;
     let pages = parse_page_map(&page_map, bytes.len())?;
+    // The page map lists itself: there it must be where the header puts it, and at least as
+    // long as what was read of it before its size was known.
+    let page_map_id = h.u64(0x40)?;
+    if let Some(&(at, extent)) = pages.get(&page_map_id)
+        && (at != page_map_at || extent < page_map_length)
+    {
+        return Err(bad(format!(
+            "the page map (page {page_map_id}) is listed at {at:#x} with {extent} bytes, but is read at {page_map_at:#x} with {page_map_length}"
+        )));
+    }
     let section_map_id = h.u64(0xC0)?;
     let (section_map_at, extent) = *pages.get(&section_map_id).ok_or_else(|| {
         bad(format!(
             "the section map (page {section_map_id}) is not in the page map"
         ))
     })?;
-    let section_map = system_page(
+    let (section_map, _) = system_page(
         bytes,
         section_map_at,
         Some(extent),
@@ -185,7 +198,7 @@ fn deinterleave(raw: &[u8], words: usize, data: usize, field: &Field) -> Result<
         if !field.is_code_word(&word, WORD - data) {
             return Err(bad("a Reed-Solomon word is damaged"));
         }
-        out.extend_from_slice(&word[..data]);
+        out.extend(word.iter().take(data));
     }
     Ok(out)
 }
@@ -198,8 +211,9 @@ struct Stored {
 }
 
 /// Read a system page (page map or section map) at `at`. `extent` is the page's size from the
-/// page map, which it stays in (the page map itself is read before there is one).
-fn system_page(bytes: &[u8], at: u64, extent: Option<u64>, how: Stored, what: &str) -> Result<Vec<u8>> {
+/// page map, which it stays in (the page map itself is read before there is one). Gives the
+/// data and the length of the code words read.
+fn system_page(bytes: &[u8], at: u64, extent: Option<u64>, how: Stored, what: &str) -> Result<(Vec<u8>, u64)> {
     let start = offset(at, bytes.len(), what)?;
     let size = to_usize(u32::try_from(how.size).unwrap_or(u32::MAX), MAX_PAGE, what)?;
     let compressed = to_usize(u32::try_from(how.compressed).unwrap_or(u32::MAX), MAX_PAGE, what)?;
@@ -221,7 +235,8 @@ fn system_page(bytes: &[u8], at: u64, extent: Option<u64>, how: Stored, what: &s
     let packed = data
         .get(..compressed)
         .ok_or_else(|| bad(format!("the {what} is cut off")))?;
-    unpack(packed, size).map_err(|e| bad(format!("the {what}: {e}")))
+    let data = unpack(packed, size).map_err(|e| bad(format!("the {what}: {e}")))?;
+    Ok((data, length))
 }
 
 /// Data stored compressed when that made it shorter, else as it is.
@@ -236,6 +251,12 @@ fn unpack(packed: &[u8], size: usize) -> Result<Vec<u8>> {
 /// The address and size of each page, by page number, from the decompressed page map: pairs of
 /// size and number, a negative number for unused space.
 fn parse_page_map(map: &[u8], file_len: usize) -> Result<BTreeMap<u64, (u64, u64)>> {
+    if !map.len().is_multiple_of(16) {
+        return Err(bad(format!(
+            "the page map ends inside an entry ({} bytes, entries of 16)",
+            map.len()
+        )));
+    }
     let r = Reader(map);
     let mut pages = BTreeMap::new();
     let mut at = PAGES_START;
@@ -282,7 +303,12 @@ fn read_section_map(bytes: &[u8], map: &[u8], pages: &BTreeMap<u64, (u64, u64)>,
         let page_count = r.u64(pos + 0x38)?;
         pos += SECTION_DESCRIPTION;
         index += 1;
-        // The name in UTF-16, its length in bytes with the ending zero.
+        // The name in UTF-16, its length in bytes with the ending zero: even (0 for none).
+        if !name_len.is_multiple_of(2) {
+            return Err(bad(format!(
+                "a section name in the section map has an odd length ({name_len} bytes)"
+            )));
+        }
         let name_len = usize::try_from(name_len)
             .ok()
             .filter(|n| *n as u64 <= MAX_NAME && pos + n <= map.len())
@@ -313,7 +339,17 @@ fn read_section_map(bytes: &[u8], map: &[u8], pages: &BTreeMap<u64, (u64, u64)>,
             1 => false,
             e => return Err(bad(format!("section {name} has unknown encoding {e}"))),
         };
-        let mut data = vec![0u8; size];
+        // Allocated fallibly: a caller's limit may let a size through that memory cannot hold.
+        let mut data = Vec::new();
+        data.try_reserve_exact(size)
+            .map_err(|e| bad(format!("section {name} ({size} bytes) cannot be allocated: {e}")))?;
+        data.resize(size, 0);
+        // Every page listed so far, by start: a start may only be listed again for the same
+        // page with the same sizes and checksum. Empty pages are in here too.
+        let mut listed: BTreeMap<usize, PageEntry> = BTreeMap::new();
+        // The ends of the pages that hold bytes, by start, for the overlap check. Empty pages
+        // are left out, so that one inside another page cannot hide it from a later page.
+        let mut filled: BTreeMap<usize, usize> = BTreeMap::new();
         for i in 0..page_count as usize {
             let at = list + i * PAGE_DESCRIPTION;
             let page = PageEntry {
@@ -333,21 +369,67 @@ fn read_section_map(bytes: &[u8], map: &[u8], pages: &BTreeMap<u64, (u64, u64)>,
                 .ok()
                 .filter(|s| *s <= size)
                 .ok_or_else(|| bad(format!("section {name}, page {number} starts past its end")))?;
+            // A start already used: the same page listed again is skipped (its bytes are
+            // there), anything else is refused before it is read or copied.
+            if let Some(other) = listed.get(&start) {
+                if other.number != number {
+                    return Err(bad(format!(
+                        "section {name}, page {number} starts where page {} does",
+                        other.number
+                    )));
+                }
+                if (other.size, other.compressed, other.checksum) != (page.size, page.compressed, page.checksum) {
+                    return Err(bad(format!(
+                        "section {name}, page {number} is listed again with other sizes or another checksum"
+                    )));
+                }
+                // A repeat costs what reading the page again would, so that repeats stay bounded.
+                let cost = usize::try_from(page.size.max(page.compressed))
+                    .unwrap_or(usize::MAX)
+                    .max(1);
+                budget = budget
+                    .checked_sub(cost)
+                    .ok_or_else(|| bad("the file's pages decompress to too much"))?;
+                continue;
+            }
             let read = data_page(bytes, address, extent, &page, interleaved, &mut budget)
                 .map_err(|e| bad(format!("section {name}, page {number}: {e}")))?;
-            let to = start
+            let end = start
                 .checked_add(read.len())
-                .and_then(|end| data.get_mut(start..end))
+                .filter(|e| *e <= data.len())
                 .ok_or_else(|| bad(format!("section {name}, page {number} reaches past its end")))?;
-            to.copy_from_slice(&read);
+            // Pages that hold bytes may not overlap.
+            if end > start {
+                let before = filled.range(..start).next_back().is_some_and(|(_, e)| *e > start);
+                let after = filled.range(start + 1..).next().is_some_and(|(s, _)| *s < end);
+                if before || after {
+                    return Err(bad(format!("section {name}, page {number} overlaps another page")));
+                }
+                filled.insert(start, end);
+            }
+            if let Some(to) = data.get_mut(start..end) {
+                to.copy_from_slice(&read);
+            }
+            listed.insert(start, page);
         }
         total += size;
         sections.push(Section { name, id: index, data });
+    }
+    if pos != map.len() {
+        return Err(bad(format!(
+            "the section map ends inside a section description ({} bytes left)",
+            map.len() - pos
+        )));
     }
     Ok(Sections {
         version: Version::R2007,
         sections,
         skipped,
+        maint: bytes.get(0x0B).copied().unwrap_or(0),
+        codepage: bytes
+            .get(0x13..0x15)
+            .and_then(|b| b.try_into().ok())
+            .map_or(0, u16::from_le_bytes),
     })
 }
 
@@ -433,9 +515,9 @@ pub(super) fn page_checksum(seed: u64, data: &[u8]) -> u32 {
     let (mut low, mut high) = (seed & 0xFFFF, (seed >> 16) & 0xFFFF);
     for chunk in data.chunks(0x15B0) {
         let (groups, rest) = chunk.as_chunks::<8>();
-        for group in groups {
-            for i in [6, 7, 4, 5, 2, 3, 0, 1] {
-                low += u64::from(group[i]);
+        for &[b0, b1, b2, b3, b4, b5, b6, b7] in groups {
+            for b in [b6, b7, b4, b5, b2, b3, b0, b1] {
+                low += u64::from(b);
                 high += low;
             }
         }
@@ -534,6 +616,7 @@ pub fn decompress(src: &[u8], size: usize) -> Result<Vec<u8>> {
         }
         have_op = false;
         literal(&mut r, &mut out, len, size)?;
+        len = 0;
         if r.pos >= src.len() {
             break;
         }
@@ -555,6 +638,9 @@ pub fn decompress(src: &[u8], size: usize) -> Result<Vec<u8>> {
             }
             (next, back, count) = instruction(&mut r, op)?;
         }
+    }
+    if len != 0 || have_op {
+        return Err(bad("compressed data ends before a literal run it announces"));
     }
     if out.len() != size {
         return Err(bad(format!(
@@ -645,7 +731,12 @@ fn literal(r: &mut Stream, out: &mut Vec<u8>, n: usize, size: usize) -> Result<(
     }
     let stored = r
         .src
-        .get(r.pos..r.pos + n)
+        .get(
+            r.pos
+                ..r.pos
+                    .checked_add(n)
+                    .ok_or_else(|| bad("compressed data ends too early"))?,
+        )
         .ok_or_else(|| bad("compressed data ends too early"))?;
     for run in stored.chunks(32) {
         unshuffle(run, out);

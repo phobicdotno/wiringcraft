@@ -18,21 +18,13 @@ fn compress(data: &[u8]) -> Vec<u8> {
     let mut pos = 0;
     while pos < data.len() {
         let mut best: Option<(usize, usize)> = None; // (length, distance)
-        if let Some(key) = data.get(pos..pos + 3).and_then(|k| <[u8; 3]>::try_from(k).ok()) {
-            if let Some(&prev) = seen.get(&key) {
-                let distance = pos - prev;
-                let mut len = 0;
-                while pos + len < data.len() && data[prev + len] == data[pos + len] && len < 2000 {
-                    len += 1;
-                }
-                // Far copies (distance over 0x4000) need at least 4 bytes; the very first
-                // literal run must be at least 4 bytes (or none) to be written as one.
-                let first_ok = lit_slot.is_some() || pending.len() >= 4;
-                if distance <= 0x7FFF && (len >= 4 || (len >= 3 && distance <= 0x4000)) && first_ok {
-                    best = Some((len, distance));
-                }
+        if let Some((len, distance)) = find_repeat(data, pos, &mut seen, 2000) {
+            // Far copies (distance over 0x4000) need at least 4 bytes; the very first
+            // literal run must be at least 4 bytes (or none) to be written as one.
+            let first_ok = lit_slot.is_some() || pending.len() >= 4;
+            if distance <= 0x7FFF && (len >= 4 || (len >= 3 && distance <= 0x4000)) && first_ok {
+                best = Some((len, distance));
             }
-            seen.insert(key, pos);
         }
         match best {
             None => {
@@ -42,11 +34,7 @@ fn compress(data: &[u8]) -> Vec<u8> {
             Some((len, distance)) => {
                 flush_literals(&mut out, &mut pending, lit_slot);
                 lit_slot = Some(copy(&mut out, len, distance - 1));
-                for p in pos + 1..pos + len {
-                    if let Some(key) = data.get(p..p + 3).and_then(|k| <[u8; 3]>::try_from(k).ok()) {
-                        seen.insert(key, p);
-                    }
-                }
+                remember(data, pos + 1..pos + len, &mut seen);
                 pos += len;
             }
         }
@@ -54,6 +42,31 @@ fn compress(data: &[u8]) -> Vec<u8> {
     flush_literals(&mut out, &mut pending, lit_slot);
     out.push(0x11);
     out
+}
+
+/// The test compressors' search for repeats: the last earlier place the three bytes at `pos`
+/// were seen, as the length (at most `max_len`) and distance of the repeat there. `pos` is
+/// remembered for later searches.
+fn find_repeat(data: &[u8], pos: usize, seen: &mut HashMap<[u8; 3], usize>, max_len: usize) -> Option<(usize, usize)> {
+    let key = <[u8; 3]>::try_from(data.get(pos..pos + 3)?).ok()?;
+    let found = seen.get(&key).map(|&prev| {
+        let mut len = 0;
+        while pos + len < data.len() && data[prev + len] == data[pos + len] && len < max_len {
+            len += 1;
+        }
+        (len, pos - prev)
+    });
+    seen.insert(key, pos);
+    found
+}
+
+/// Remember the places in `range` (bytes a copy covered) for later searches.
+fn remember(data: &[u8], range: std::ops::Range<usize>, seen: &mut HashMap<[u8; 3], usize>) {
+    for p in range {
+        if let Some(key) = data.get(p..p + 3).and_then(|k| <[u8; 3]>::try_from(k).ok()) {
+            seen.insert(key, p);
+        }
+    }
 }
 
 fn flush_literals(out: &mut Vec<u8>, pending: &mut Vec<u8>, lit_slot: Option<usize>) {
@@ -850,20 +863,7 @@ pub(super) fn compress_2007(data: &[u8]) -> Vec<u8> {
     let mut slot: Option<usize> = None;
     let mut pos = 0;
     while pos < data.len() {
-        let mut best = None;
-        if let Some(key) = data.get(pos..pos + 3).and_then(|k| <[u8; 3]>::try_from(k).ok()) {
-            if let Some(&prev) = seen.get(&key) {
-                let back = pos - prev;
-                let mut len = 0;
-                while pos + len < data.len() && data[prev + len] == data[pos + len] && len < 0x1_00FF {
-                    len += 1;
-                }
-                if back <= 0xFFFF && len >= 3 {
-                    best = Some((len, back));
-                }
-            }
-            seen.insert(key, pos);
-        }
+        let best = find_repeat(data, pos, &mut seen, 0x1_00FF).filter(|&(len, back)| back <= 0xFFFF && len >= 3);
         match best {
             None => {
                 pending.push(data[pos]);
@@ -872,11 +872,7 @@ pub(super) fn compress_2007(data: &[u8]) -> Vec<u8> {
             Some((len, back)) => {
                 literals_2007(&mut out, &mut pending, slot);
                 slot = Some(copy_2007(&mut out, len, back));
-                for p in pos + 1..pos + len {
-                    if let Some(key) = data.get(p..p + 3).and_then(|k| <[u8; 3]>::try_from(k).ok()) {
-                        seen.insert(key, p);
-                    }
-                }
+                remember(data, pos + 1..pos + len, &mut seen);
                 pos += len;
             }
         }
@@ -1011,15 +1007,12 @@ pub(super) fn write_dwg_2007(sections: &[TestSection]) -> Vec<u8> {
     write_dwg_2007_with(sections, &|_| {}, &|_| {})
 }
 
-/// A page map entry: page number and size.
-type PageEntry2007 = (i64, i64);
-
-/// [`write_dwg_2007`] with the section map's bytes and the page map's entries (number, size)
-/// changed before they are written (a hostile file whose maps are still good code words).
+/// [`write_dwg_2007`] with the section map's and the page map's bytes (pairs of size and
+/// number) changed before they are written (a hostile file whose maps are still good code words).
 fn write_dwg_2007_with(
     sections: &[TestSection],
     edit_section_map: &dyn Fn(&mut Vec<u8>),
-    edit_page_map: &dyn Fn(&mut Vec<PageEntry2007>),
+    edit_page_map: &dyn Fn(&mut Vec<u8>),
 ) -> Vec<u8> {
     let mut file = vec![0u8; 0x480];
     file[..6].copy_from_slice(b"AC1021");
@@ -1107,14 +1100,12 @@ fn write_dwg_2007_with(
     let page_map_at = file.len() as u64;
     let mut size = 0x400;
     let (page_map, pm_stored, pm_size) = loop {
-        let mut listed = pages.clone();
-        listed.push((page_map_id as i64, size));
-        edit_page_map(&mut listed);
         let mut entries = Vec::new();
-        for (number, len) in &listed {
+        for (number, len) in pages.iter().chain([&(page_map_id as i64, size)]) {
             entries.extend(len.to_le_bytes());
             entries.extend(number.to_le_bytes());
         }
+        edit_page_map(&mut entries);
         let (mut page, stored, full) = system_page_2007(&entries, 3);
         if page.len() <= size as usize {
             page.resize(size as usize, 0);
@@ -1214,7 +1205,7 @@ fn reed_solomon_words_are_checked() {
 fn a_hand_written_2007_stream_decompresses() -> TestResult {
     // Started by 0x20 and two bytes, a literal run of two (stored backwards), then a copy of
     // six bytes from one back.
-    let stream = [0x20, 0x00, 0x00, 0x02, 0x00, 0x70, 0x60, 0x03];
+    let stream = [0x20, 0x00, 0x00, 0x02, 0x00, 0x70, 0x60, 0x00];
     assert_eq!(r2007::decompress(&stream, 8)?, [0x70, 0, 0, 0, 0, 0, 0, 0]);
     // A literal run of 32 bytes (0x0F, then 9 more than 0x17) comes out in groups of eight
     // from the end.
@@ -1396,11 +1387,27 @@ fn a_2007_page_claiming_more_than_its_page_is_refused() {
         data: noise(300, 3),
         stored: true,
         plain: true,
-        claimed_extra: 0x10_0000,
+        // The page takes 512 bytes; 300 + 0x100 stored bytes reach past it but stay inside
+        // the file (the section map follows), so only the page's extent refuses them.
+        claimed_extra: 0x100,
         ..TestSection::default()
     };
-    let m = error_of(&write_dwg_2007(&[section]));
-    assert!(m.contains("AcDb:Classes") && m.contains("page 1"), "{m}");
+    let file = write_dwg_2007(&[section]);
+    assert!(file.len() > 0x480 + 300 + 0x100);
+    let m = error_of(&file);
+    assert!(
+        m.contains("AcDb:Classes") && m.contains("page 1") && m.contains("reaches past its page"),
+        "{m}"
+    );
+}
+
+#[test]
+fn a_2007_section_too_large_to_allocate_gives_an_error() {
+    // Past what a Vec may hold: refused with an error, not an abort, also without a limit.
+    let huge = |m: &mut Vec<u8>| m[..8].copy_from_slice(&(1u64 << 63).to_le_bytes());
+    let file = write_dwg_2007_with(&sample_sections()[..1], &huge, &|_| {});
+    let m = read_sections_with(&file, usize::MAX).map_err(|e| e.to_string());
+    assert!(m.as_ref().is_err_and(|m| m.contains("cannot be allocated")), "{m:?}");
 }
 
 #[test]
@@ -1440,9 +1447,17 @@ fn cut_or_flipped_2007_files_give_errors_not_panics() -> TestResult {
         damaged[at] ^= 1 << (i % 8);
         let _ = read_sections(&damaged);
     }
-    // Every byte of the file header's words and of the maps, each set to 0xFF.
+    // Every byte of the file header's words is part of a checked code word: any change to
+    // one is refused.
+    for at in 0x80..0x80 + 3 * 255 {
+        let mut damaged = file.clone();
+        damaged[at] ^= 0x01;
+        assert!(read_sections(&damaged).is_err(), "header byte {at:#x} changed");
+    }
+    // The maps and the pages before them, each byte set to 0xFF: only no panic is asked
+    // here, as this range also holds padding after the code words that is never read.
     let maps = page_map.saturating_sub(0x1000)..file.len() - 0x400;
-    for at in (0x80..0x80 + 3 * 255).chain(maps) {
+    for at in maps {
         let mut damaged = file.clone();
         damaged[at] = 0xFF;
         let _ = read_sections(&damaged);
@@ -1453,10 +1468,10 @@ fn cut_or_flipped_2007_files_give_errors_not_panics() -> TestResult {
 #[test]
 fn hostile_2007_maps_that_are_good_code_words_give_errors() {
     let sections = || sample_sections().into_iter().take(2).collect::<Vec<_>>();
-    let message = |section_map: &dyn Fn(&mut Vec<u8>), page_map: &dyn Fn(&mut Vec<PageEntry2007>)| {
+    let message = |section_map: &dyn Fn(&mut Vec<u8>), page_map: &dyn Fn(&mut Vec<u8>)| {
         error_of(&write_dwg_2007_with(&sections(), section_map, page_map))
     };
-    let no_map = |_: &mut Vec<(i64, i64)>| {};
+    let no_map = |_: &mut Vec<u8>| {};
     let no_sections = |_: &mut Vec<u8>| {};
     // The first section's fields: page count at 0x38, encoding at 0x30, name length at 0x20;
     // its name (AcDb:Header) takes 24 bytes, then the first page's number at 0x10.
@@ -1481,15 +1496,169 @@ fn hostile_2007_maps_that_are_good_code_words_give_errors() {
         let m = message(&set(at, value), &no_map);
         assert!(m.contains(want), "{what}: {m}");
     }
-    // The page map: a page of size 0 or less, a page listed twice, and a section map page too
-    // small for it.
-    let m = message(&no_sections, &|p: &mut Vec<(i64, i64)>| p[0].1 = -0x20);
+    // The page map (entries of size, then number): a page of size 0 or less, a page listed
+    // twice, a section map page too small for it, and a half entry at the end.
+    let m = message(&no_sections, &set(0, (-0x20i64) as u64));
     assert!(m.contains("has size -32"), "{m}");
-    let m = message(&no_sections, &|p: &mut Vec<(i64, i64)>| p[1].0 = p[0].0);
+    let m = message(&no_sections, &|p: &mut Vec<u8>| {
+        let first = p[8..16].to_vec();
+        p[24..32].copy_from_slice(&first);
+    });
     assert!(m.contains("listed twice"), "{m}");
-    let m = message(&no_sections, &|p: &mut Vec<(i64, i64)>| {
-        let n = p.len();
-        p[n - 2].1 = 0x20;
+    // The section map's entry shrunk to 32 bytes, with unused space (a negative number) for
+    // the rest, so that the page map after it stays where the header puts it.
+    let m = message(&no_sections, &|p: &mut Vec<u8>| {
+        let at = p.len() - 32;
+        let mut size = [0u8; 8];
+        size.copy_from_slice(&p[at..at + 8]);
+        let rest = u64::from_le_bytes(size) - 0x20;
+        p[at..at + 8].copy_from_slice(&0x20u64.to_le_bytes());
+        let filler: Vec<u8> = rest.to_le_bytes().into_iter().chain((-1i64).to_le_bytes()).collect();
+        p.splice(at + 16..at + 16, filler);
     });
     assert!(m.contains("section map") && m.contains("reaches past its page"), "{m}");
+    let m = message(&no_sections, &|p: &mut Vec<u8>| p.extend([0u8; 8]));
+    assert!(m.contains("page map ends inside an entry"), "{m}");
+    // The page map's own entry (the last) too small for what was read of it.
+    let m = message(&no_sections, &|p: &mut Vec<u8>| {
+        let at = p.len() - 16;
+        p[at..at + 8].copy_from_slice(&0x20u64.to_le_bytes());
+    });
+    assert!(m.contains("page map (page") && m.contains("with 32 bytes"), "{m}");
+    // A name length one byte past the name's.
+    let m = message(&set(0x20, 25), &no_map);
+    assert!(m.contains("odd length (25 bytes)"), "{m}");
+    // The section map cut inside its last description (the unnamed one at the end).
+    let m = message(&|m: &mut Vec<u8>| m.truncate(m.len() - 8), &no_map);
+    assert!(m.contains("section map ends inside a section description"), "{m}");
+}
+
+#[test]
+fn a_2007_stream_ending_before_an_announced_literal_run_is_refused() -> TestResult {
+    // A literal run of two, a copy of six from one back: complete.
+    let whole = [0x20, 0x00, 0x00, 0x02, 0x00, 0x70, 0x60, 0x00];
+    assert_eq!(r2007::decompress(&whole, 8)?.len(), 8);
+    // The copy's last byte announces three literal bytes that never come.
+    let m = r2007::decompress(&[0x20, 0x00, 0x00, 0x02, 0x00, 0x70, 0x60, 0x03], 8).map_err(|e| e.to_string());
+    assert!(m.as_ref().is_err_and(|m| m.contains("literal run")), "{m:?}");
+    // A literal run's instruction at the very end, without its bytes.
+    let m = r2007::decompress(&[0x20, 0x00, 0x00, 0x02, 0x00, 0x70, 0x60, 0x00, 0x05], 8).map_err(|e| e.to_string());
+    assert!(m.as_ref().is_err_and(|m| m.contains("literal run")), "{m:?}");
+    // Started by 0x20 with a literal length, and nothing after it.
+    assert!(r2007::decompress(&[0x20, 0x00, 0x00, 0x02], 0).is_err());
+    Ok(())
+}
+
+#[test]
+fn overlapping_2007_pages_are_refused() -> TestResult {
+    let section = || {
+        vec![TestSection {
+            name: "AcDb:AcDbObjects",
+            data: noise(MAX_PAGE_DATA + 300, 31),
+            stored: true,
+            ..TestSection::default()
+        }]
+    };
+    assert!(read_sections(&write_dwg_2007(&section())).is_ok());
+    // The second page's start moved into the first page: the description (0x40 bytes), the
+    // name (16 characters and a zero, 34 bytes), then the first page's 56 bytes.
+    let at = 0x40 + 34 + 56;
+    let moved = |m: &mut Vec<u8>| m[at..at + 8].copy_from_slice(&((MAX_PAGE_DATA - 0x100) as u64).to_le_bytes());
+    let m = error_of(&write_dwg_2007_with(&section(), &moved, &|_| {}));
+    assert!(m.contains("page 2 overlaps another page"), "{m}");
+    // The second page at the first page's start: refused before it overwrites it, whatever the
+    // pages' lengths.
+    let same = |m: &mut Vec<u8>| m[at..at + 8].copy_from_slice(&0u64.to_le_bytes());
+    let m = error_of(&write_dwg_2007_with(&section(), &same, &|_| {}));
+    assert!(m.contains("page 2 starts where page 1 does"), "{m}");
+    // A page listed again at the same place is not an overlap.
+    let again = vec![TestSection {
+        listed_again: 1,
+        ..section().remove(0)
+    }];
+    assert!(read_sections(&write_dwg_2007(&again)).is_ok());
+    Ok(())
+}
+
+#[test]
+fn a_2007_page_listed_again_must_match_its_first_listing() -> TestResult {
+    let again = || {
+        vec![TestSection {
+            name: "AcDb:AcDbObjects",
+            data: noise(MAX_PAGE_DATA + 300, 37),
+            listed_again: 1,
+            ..TestSection::default()
+        }]
+    };
+    // The exact repeat is read, and the section comes out whole.
+    let file = write_dwg_2007(&again());
+    let read = read_sections(&file)?;
+    let first = read.sections.first().ok_or("no section")?;
+    assert_eq!(first.data, noise(MAX_PAGE_DATA + 300, 37));
+    // The second listing of page 1 (after the description, the name of 16 characters and a
+    // zero, and the first listing) with another stored size or another checksum.
+    let at = 0x40 + 34 + 56;
+    for field in [0x20, 0x28] {
+        let other = |m: &mut Vec<u8>| m[at + field] ^= 0x01;
+        let m = error_of(&write_dwg_2007_with(&again(), &other, &|_| {}));
+        assert!(
+            m.contains("page 1 is listed again with other sizes or another checksum"),
+            "{m}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn an_empty_2007_page_does_not_hide_a_page_from_the_overlap_check() -> TestResult {
+    let section = || {
+        vec![TestSection {
+            name: "AcDb:AcDbObjects",
+            data: noise(2 * MAX_PAGE_DATA + 300, 41),
+            stored: true,
+            ..TestSection::default()
+        }]
+    };
+    // The listings of pages 2 and 3, after the description and the name.
+    let second = 0x40 + 34 + 56;
+    let third = second + 56;
+    let set = |m: &mut Vec<u8>, at: usize, v: u64| m[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    // Page 2 made empty, inside page 1.
+    let empty = |m: &mut Vec<u8>| {
+        set(m, second, (MAX_PAGE_DATA / 2) as u64);
+        set(m, second + 0x18, 0);
+        set(m, second + 0x20, 0);
+        set(m, second + 0x28, u64::from(r2007::page_checksum(0, &[])));
+    };
+    // Page 3 then starts inside page 1, after the empty page: still an overlap.
+    let into = |m: &mut Vec<u8>| {
+        empty(m);
+        set(m, third, (MAX_PAGE_DATA - 0x100) as u64);
+    };
+    let m = error_of(&write_dwg_2007_with(&section(), &into, &|_| {}));
+    assert!(m.contains("page 3 overlaps another page"), "{m}");
+    // Page 3 right after page 1 is not.
+    let next_to = |m: &mut Vec<u8>| {
+        empty(m);
+        set(m, third, MAX_PAGE_DATA as u64);
+    };
+    assert!(read_sections(&write_dwg_2007_with(&section(), &next_to, &|_| {})).is_ok());
+    // A page at the empty page's start is still refused.
+    let same = |m: &mut Vec<u8>| {
+        empty(m);
+        set(m, third, (MAX_PAGE_DATA / 2) as u64);
+    };
+    let m = error_of(&write_dwg_2007_with(&section(), &same, &|_| {}));
+    assert!(m.contains("page 3 starts where page 2 does"), "{m}");
+    Ok(())
+}
+
+#[test]
+fn the_code_page_is_read_from_the_file_header() -> TestResult {
+    let mut file = write_dwg(b"AC1018", &sample_sections()[..1]);
+    assert_eq!(read_sections(&file)?.codepage, 0);
+    // ANSI_1251, at 0x13 of the file header (outside the second header and its CRC).
+    file[0x13..0x15].copy_from_slice(&29u16.to_le_bytes());
+    assert_eq!(read_sections(&file)?.codepage, 29);
+    Ok(())
 }

@@ -13,12 +13,14 @@
 //! are counted and skipped.
 //!
 //! The entities read are LINE, ARC, CIRCLE, LWPOLYLINE, POLYLINE (2D and 3D) with their
-//! VERTEXes, TEXT, MTEXT, ATTDEF, ATTRIB, INSERT, DIMENSION (drawn by its anonymous block), SOLID,
+//! VERTEXes, TEXT, MTEXT, ATTDEF, ATTRIB, INSERT, DIMENSION (drawn by its anonymous block), HATCH,
+//! ELLIPSE, SPLINE, SOLID,
 //! TRACE and POINT. Each entity belongs to
 //! the block whose BLOCK_HEADER owns it, or to model space; vertices belong to their polyline
 //! and attributes to their INSERT. The entities become the same entities the DXF reader works
 //! with, so a DWG drawing is drawn exactly like a DXF one: y flipped, block references expanded.
-//! Other entity types, and objects that cannot be decoded, are counted and skipped.
+//! Other entity types (custom ones, numbered 500 and up, under the DXF name their class in
+//! `AcDb:Classes` gives), and objects that cannot be decoded, are counted and skipped.
 //!
 //! Written from the published Open Design Specification for .dwg files only, and checked with
 //! objects the tests write themselves. Input is treated as hostile: every read is checked, and a
@@ -29,6 +31,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use wc_core::geom::{Point, Shape};
 
 use super::bits::{Bits, modular_char, modular_short};
+use super::classes::{Class, read_classes};
+use super::codepage::Decoding;
 use super::{Sections, Version, bad, read_sections};
 use crate::Result;
 use crate::dxf::{self, Entity};
@@ -38,6 +42,10 @@ pub const MAX_OBJECTS: usize = 4_000_000;
 
 /// The key under which objects that could not be decoded are counted in [`Drawing::skipped`].
 pub const DAMAGED: &str = "damaged objects";
+
+/// The skipped-count key for a class section that could not be read: custom entities (types 500
+/// and up) are then not named or counted.
+pub const CLASSES_DAMAGED: &str = "class section damaged (custom entities not counted)";
 
 /// The skipped-count key for blocks whose base point could not be read: they are kept, placed
 /// as if their base point were (0, 0).
@@ -59,10 +67,13 @@ pub struct Drawing {
     pub model_points: Vec<Point>,
     /// How many of each kind of entity or object were not read, by type name.
     pub skipped: BTreeMap<String, usize>,
-    /// Why objects counted under [`DAMAGED`] could not be decoded (handle, offset and reason),
-    /// then why base points counted under [`BASE_UNREAD`] could not be read, for the first
-    /// [`MAX_REASONS`] of them.
+    /// Why the class section could not be read when it is counted under [`CLASSES_DAMAGED`]
+    /// (always first), then why objects counted under [`DAMAGED`] could not be decoded (handle,
+    /// offset and reason), then why base points counted under [`BASE_UNREAD`] could not be
+    /// read, for the first [`MAX_REASONS`] of them.
     pub damaged: Vec<String>,
+    /// Notes about the file as a whole, such as a code page its texts cannot be decoded in.
+    pub warnings: Vec<String>,
 }
 
 /// The most reasons [`Drawing::damaged`] keeps.
@@ -79,6 +90,7 @@ pub fn drawing(sections: &Sections) -> Result<Drawing> {
         drawing: d,
         mut skipped,
         damaged,
+        warnings,
     } = dxf_drawing(sections)?;
     // One budget for model space and every block, so nested blocks cannot multiply the work.
     let mut budget = dxf::MAX_DRAWN;
@@ -106,6 +118,7 @@ pub fn drawing(sections: &Sections) -> Result<Drawing> {
         model_points,
         skipped,
         damaged,
+        warnings,
     })
 }
 
@@ -113,7 +126,10 @@ pub fn drawing(sections: &Sections) -> Result<Drawing> {
 pub(crate) struct Read {
     pub(crate) drawing: dxf::Drawing,
     pub(crate) skipped: BTreeMap<String, usize>,
+    /// As [`Drawing::damaged`]: the class section's reason first when it is damaged.
     pub(crate) damaged: Vec<String>,
+    /// Notes about the file as a whole (an unknown code page).
+    pub(crate) warnings: Vec<String>,
 }
 
 /// The entities of a DWG file as the DXF reader's entities, by block and model space, with a
@@ -129,8 +145,38 @@ pub(crate) fn dxf_drawing(sections: &Sections) -> Result<Read> {
     let mut skipped = BTreeMap::new();
     let mut decoded = Decoded::default();
     let mut damaged = Vec::new();
+    // The classes name the custom types (500 and up); without them those are not counted.
+    let classes = match sections.get("AcDb:Classes") {
+        None => HashMap::new(),
+        Some(data) => read_classes(data, sections.version, sections.maint).unwrap_or_else(|e| {
+            // A section, not an object: counted under its own key, its reason with the others.
+            *skipped.entry(CLASSES_DAMAGED.to_owned()).or_default() += 1;
+            damaged.push(e.to_string());
+            HashMap::new()
+        }),
+    };
+    // 2004 texts are in the drawing's code page; one this reader does not know is read as
+    // before (UTF-8 or Windows-1252) and said.
+    let (decoding, known) = Decoding::of(sections.codepage);
+    let mut warnings = Vec::new();
+    if sections.version == Version::R2004 && !known {
+        warnings.push(format!(
+            "its texts are in {}, which is not supported: read with the legacy decoder (UTF-8 \
+             when they are, else byte for byte as Latin-1)",
+            Decoding::name(sections.codepage)
+        ));
+    }
     for (handle, at) in map {
-        if let Err(e) = decode(objects, at, handle, sections.version, &mut decoded, &mut skipped) {
+        if let Err(e) = decode(
+            objects,
+            at,
+            handle,
+            sections.version,
+            &classes,
+            decoding,
+            &mut decoded,
+            &mut skipped,
+        ) {
             *skipped.entry(DAMAGED.to_owned()).or_default() += 1;
             if damaged.len() < MAX_REASONS {
                 damaged.push(format!("object {handle:X} at {at}: {e}"));
@@ -147,6 +193,7 @@ pub(crate) fn dxf_drawing(sections: &Sections) -> Result<Read> {
         drawing: decoded.assemble(&mut skipped),
         skipped,
         damaged,
+        warnings,
     })
 }
 
@@ -201,6 +248,8 @@ pub(crate) fn object_map(data: &[u8]) -> Result<Vec<(u64, usize)>> {
 /// One object's streams, after its type and own handle are read.
 struct Object<'a> {
     version: Version,
+    /// How its 2004 texts are decoded.
+    decoding: Decoding,
     kind: u16,
     handle: u64,
     data: Bits<'a>,
@@ -212,7 +261,7 @@ impl Object<'_> {
     /// TV: a text, from the data stream (2004) or the string stream (2007 on).
     fn text(&mut self) -> Result<String> {
         match self.version {
-            Version::R2004 => self.data.t8(),
+            Version::R2004 => Ok(self.decoding.decode(&self.data.t8_bytes()?)),
             _ => self
                 .strings
                 .as_mut()
@@ -239,7 +288,7 @@ impl Object<'_> {
 }
 
 /// Split the object at `at` of the objects section into its streams.
-fn object(objects: &[u8], at: usize, version: Version) -> Result<Object<'_>> {
+fn object(objects: &[u8], at: usize, version: Version, decoding: Decoding) -> Result<Object<'_>> {
     let rest = objects.get(at..).ok_or_else(|| bad("an object is past the end"))?;
     let (size, n) = modular_short(rest)?;
     let mut start = at + n;
@@ -277,14 +326,20 @@ fn object(objects: &[u8], at: usize, version: Version) -> Result<Object<'_>> {
     if end > total || end < head.pos() {
         return Err(bad("an object's data size is out of range"));
     }
-    let mut data = Bits::new(bytes, head.pos(), end);
-    let handle = data.h()?.1;
-    let strings = match version {
-        Version::R2004 => None,
+    // From 2007 on the texts and their size and flag end the data: the other fields stop
+    // where they start.
+    let (data_end, strings) = match version {
+        Version::R2004 => (end, None),
         _ => string_stream(bytes, end)?,
     };
+    if data_end < head.pos() {
+        return Err(bad("an object's texts overlap its type"));
+    }
+    let mut data = Bits::new(bytes, head.pos(), data_end);
+    let handle = data.h()?.1;
     Ok(Object {
         version,
+        decoding,
         kind,
         handle,
         data,
@@ -294,14 +349,15 @@ fn object(objects: &[u8], at: usize, version: Version) -> Result<Object<'_>> {
 }
 
 /// The string stream of a 2007 or 2010 object whose data ends at bit `end`: a flag in the last
-/// bit, a size before it (in one or two 16-bit parts), and the texts before that.
-fn string_stream(bytes: &[u8], end: usize) -> Result<Option<Bits<'_>>> {
+/// bit, a size before it (in one or two 16-bit parts), and the texts before that. Also returns
+/// where the other fields end: where the texts start, or at the flag when there are none.
+pub(crate) fn string_stream(bytes: &[u8], end: usize) -> Result<(usize, Option<Bits<'_>>)> {
     let all = Bits::new(bytes, 0, end);
     let Some(flag_at) = end.checked_sub(1) else {
-        return Ok(None);
+        return Ok((0, None));
     };
     if !all.bit_at(flag_at)? {
-        return Ok(None);
+        return Ok((flag_at, None));
     }
     let cut = || bad("an object's texts are cut off");
     let mut at = flag_at.checked_sub(16).ok_or_else(cut)?;
@@ -312,7 +368,7 @@ fn string_stream(bytes: &[u8], end: usize) -> Result<Option<Bits<'_>>> {
         size = (size & 0x7FFF) | (hi << 15);
     }
     let start = at.checked_sub(size).ok_or_else(cut)?;
-    Ok(Some(Bits::new(bytes, start, at)))
+    Ok((start, Some(Bits::new(bytes, start, at))))
 }
 
 /// Where an entity belongs.
@@ -366,8 +422,6 @@ fn unread_entity(kind: u16) -> Option<&'static str> {
         29 => "POLYLINE_PFACE",
         30 => "POLYLINE_MESH",
         33 => "SHAPE",
-        35 => "ELLIPSE",
-        36 => "SPLINE",
         37 => "REGION",
         38 => "3DSOLID",
         39 => "BODY",
@@ -376,7 +430,6 @@ fn unread_entity(kind: u16) -> Option<&'static str> {
         45 => "LEADER",
         46 => "TOLERANCE",
         47 => "MLINE",
-        78 => "HATCH",
         498 => "ACAD_PROXY_ENTITY",
         _ => return None,
     })
@@ -402,8 +455,11 @@ fn read_entity(kind: u16) -> Option<&'static str> {
         27 => "POINT",
         31 | 32 => "SOLID",
         34 => "VIEWPORT",
+        35 => "ELLIPSE",
+        36 => "SPLINE",
         44 => "MTEXT",
         77 => "LWPOLYLINE",
+        78 => "HATCH",
         _ => return None,
     })
 }
@@ -437,16 +493,294 @@ fn block_base(o: &mut Object) -> Result<(f64, f64)> {
     Ok((x, y))
 }
 
+/// The most boundary paths, edges, knots, control or fit points or gradient colours a HATCH
+/// may list; more is a damaged object.
+const MAX_HATCH_ITEMS: u32 = 10_000;
+
+/// A count of a HATCH list, refused above [`MAX_HATCH_ITEMS`].
+fn hatch_count(o: &mut Object, what: &str) -> Result<u32> {
+    let n = o.data.bl()?;
+    if n > MAX_HATCH_ITEMS {
+        return Err(bad(format!("a hatch lists {n} {what}")));
+    }
+    Ok(n)
+}
+
+/// A colour (CMC) of 2004 and later: index, true colour, flags, then a name and a book name
+/// when the flags say so.
+fn skip_color(o: &mut Object) -> Result<()> {
+    o.data.bs()?;
+    o.data.bl()?;
+    let flags = o.data.rc()?;
+    if flags < 4 {
+        if flags & 1 != 0 {
+            o.text()?;
+        }
+        if flags & 2 != 0 {
+            o.text()?;
+        }
+    }
+    Ok(())
+}
+
+/// A point of a HATCH boundary: both coordinates numbers.
+fn hatch_point(o: &mut Object) -> Result<(f64, f64)> {
+    let (x, y) = o.data.rd2()?;
+    if !(x.is_finite() && y.is_finite()) {
+        return Err(bad("a hatch boundary point is not a number"));
+    }
+    Ok((x, y))
+}
+
+/// Two edge angles in degrees: numbers still after the conversion (a huge angle in radians is
+/// no number of degrees).
+fn hatch_degrees(a0: f64, a1: f64) -> Result<(f64, f64)> {
+    let (d0, d1) = (a0.to_degrees(), a1.to_degrees());
+    if !(d0.is_finite() && d1.is_finite()) {
+        return Err(bad("a hatch edge angle is too large"));
+    }
+    // Angles so far apart that their difference is no number are taken round the circle, so
+    // the sweep can be measured; ordinary angles are kept as they are.
+    if !(d1 - d0).is_finite() {
+        return Ok((d0.rem_euclid(360.0), d1.rem_euclid(360.0)));
+    }
+    Ok((d0, d1))
+}
+
+/// A value of a HATCH boundary (radius, angle, ratio, knot, weight): a number.
+fn hatch_value(o: &mut Object) -> Result<f64> {
+    let v = o.data.bd()?;
+    if !v.is_finite() {
+        return Err(bad("a hatch boundary value is not a number"));
+    }
+    Ok(v)
+}
+
+/// HATCH: the pattern name, the solid-fill flag, the boundary paths and the style, as the DXF
+/// codes the DXF reader draws a hatch from (2, 70, 91, 92, 72, 73, 93, 10/20, 42, ..., 75).
+/// Angles are radians in DWG and degrees in DXF. The pattern lines and seed points after the
+/// style are not needed.
+fn hatch(o: &mut Object, e: &mut Codes) -> Result<()> {
+    // Gradient fill: kind, reserved, angle, shift, single colour, tint, the colours, a name.
+    o.data.bl()?;
+    o.data.bl()?;
+    o.data.bd()?;
+    o.data.bd()?;
+    o.data.bl()?;
+    o.data.bd()?;
+    for _ in 0..hatch_count(o, "gradient colours")? {
+        o.data.bd()?;
+        skip_color(o)?;
+    }
+    o.text()?;
+    // Elevation and extrusion (a downward one mirrors the hatch, as for other entities).
+    o.data.bd()?;
+    let (_, _, z) = o.data.bd3()?;
+    let name = o.text()?;
+    let solid = o.data.b()?;
+    o.data.b()?;
+    let paths = hatch_count(o, "boundary paths")?;
+    let mut boundary = 0u32;
+    e.f(230, z).s(2, name).i(70, i64::from(solid)).i(91, i64::from(paths));
+    for _ in 0..paths {
+        let flags = o.data.bl()?;
+        e.i(92, i64::from(flags));
+        if flags & 2 == 0 {
+            let edges = hatch_count(o, "edges")?;
+            e.i(93, i64::from(edges));
+            for _ in 0..edges {
+                let kind = o.data.rc()?;
+                e.i(72, i64::from(kind));
+                match kind {
+                    1 => {
+                        let (a, b) = (hatch_point(o)?, hatch_point(o)?);
+                        e.f(10, a.0).f(20, a.1).f(11, b.0).f(21, b.1);
+                    }
+                    2 => {
+                        let c = hatch_point(o)?;
+                        let r = hatch_value(o)?;
+                        let (a0, a1) = (hatch_value(o)?, hatch_value(o)?);
+                        let ccw = o.data.b()?;
+                        e.f(10, c.0).f(20, c.1).f(40, r);
+                        let (d0, d1) = hatch_degrees(a0, a1)?;
+                        e.f(50, d0).f(51, d1).i(73, i64::from(ccw));
+                    }
+                    3 => {
+                        let (c, m) = (hatch_point(o)?, hatch_point(o)?);
+                        let ratio = hatch_value(o)?;
+                        let (a0, a1) = (hatch_value(o)?, hatch_value(o)?);
+                        let ccw = o.data.b()?;
+                        e.f(10, c.0).f(20, c.1).f(11, m.0).f(21, m.1).f(40, ratio);
+                        let (d0, d1) = hatch_degrees(a0, a1)?;
+                        e.f(50, d0).f(51, d1).i(73, i64::from(ccw));
+                    }
+                    4 => {
+                        let degree = o.data.bl()?;
+                        let rational = o.data.b()?;
+                        let periodic = o.data.b()?;
+                        let knots = hatch_count(o, "knots")?;
+                        let points = hatch_count(o, "control points")?;
+                        e.i(94, i64::from(degree))
+                            .i(73, i64::from(rational))
+                            .i(74, i64::from(periodic));
+                        e.i(95, i64::from(knots)).i(96, i64::from(points));
+                        for _ in 0..knots {
+                            e.f(40, hatch_value(o)?);
+                        }
+                        for _ in 0..points {
+                            let p = hatch_point(o)?;
+                            e.f(10, p.0).f(20, p.1);
+                            if rational {
+                                e.f(42, hatch_value(o)?);
+                            }
+                        }
+                        // Fit points and their end tangents, from 2010.
+                        if o.version >= Version::R2010 {
+                            let fit = hatch_count(o, "fit points")?;
+                            e.i(97, i64::from(fit));
+                            for _ in 0..fit {
+                                let p = hatch_point(o)?;
+                                e.f(11, p.0).f(21, p.1);
+                            }
+                            if fit > 0 {
+                                let (s, t) = (hatch_point(o)?, hatch_point(o)?);
+                                e.f(12, s.0).f(22, s.1).f(13, t.0).f(23, t.1);
+                            }
+                        }
+                    }
+                    k => return Err(bad(format!("a hatch edge has unknown type {k}"))),
+                }
+            }
+        } else {
+            let bulges = o.data.b()?;
+            let closed = o.data.b()?;
+            let n = hatch_count(o, "polyline points")?;
+            e.i(72, i64::from(bulges)).i(73, i64::from(closed)).i(93, i64::from(n));
+            for _ in 0..n {
+                let p = hatch_point(o)?;
+                e.f(10, p.0).f(20, p.1);
+                if bulges {
+                    e.f(42, hatch_value(o)?);
+                }
+            }
+        }
+        // The boundary objects: a count here, their handles in the handle stream (read after
+        // the data, so a hatch missing them is damaged).
+        boundary += hatch_count(o, "boundary objects")?;
+        e.i(97, 0);
+    }
+    e.i(75, i64::from(o.data.bs()?));
+    for _ in 0..boundary {
+        o.handle_ref()?;
+    }
+    Ok(())
+}
+
+/// ELLIPSE: centre, major axis end (relative), extrusion, axis ratio and the start and end
+/// parameters (radians, as in DXF).
+fn ellipse(o: &mut Object, e: &mut Codes) -> Result<()> {
+    let d = &mut o.data;
+    let (cx, cy, cz) = d.bd3()?;
+    let (mx, my, mz) = d.bd3()?;
+    let (ex, ey, z) = d.bd3()?;
+    let ratio = d.bd()?;
+    let (start, end) = (d.bd()?, d.bd()?);
+    if ![cx, cy, cz, mx, my, mz, ex, ey, z, ratio, start, end]
+        .iter()
+        .all(|v| v.is_finite())
+    {
+        return Err(bad("an ellipse has a value that is not a number"));
+    }
+    e.f(10, cx).f(20, cy).f(11, mx).f(21, my).f(230, z);
+    e.f(40, ratio).f(41, start).f(42, end);
+    Ok(())
+}
+
+/// The most knots, control points or fit points a SPLINE may list; more is a damaged object.
+const MAX_SPLINE_POINTS: u32 = 10_000;
+
+fn spline_count(o: &mut Object, what: &str) -> Result<u32> {
+    let n = o.data.bl()?;
+    if n > MAX_SPLINE_POINTS {
+        return Err(bad(format!("a spline lists {n} {what}")));
+    }
+    Ok(n)
+}
+
+/// SPLINE, as DXF codes: 70 (closed), 71 degree, and either knots (40), control points (10/20)
+/// and weights (41), or fit points (11/21). Before 2013 a scenario says which: 1 control
+/// points, 2 fit points.
+fn spline(o: &mut Object, e: &mut Codes) -> Result<()> {
+    let scenario = o.data.bl()?;
+    if scenario != 1 && scenario != 2 {
+        return Err(bad(format!("a spline has unknown scenario {scenario}")));
+    }
+    let degree = o.data.bl()?;
+    if scenario == 1 {
+        let d = &mut o.data;
+        let _rational = d.b()?;
+        let closed = d.b()?;
+        let periodic = d.b()?;
+        d.bd()?;
+        d.bd()?;
+        let knots = spline_count(o, "knots")?;
+        let points = spline_count(o, "control points")?;
+        let weighted = o.data.b()?;
+        // A curve of degree d over n control points needs n + d + 1 knots; a periodic one may
+        // list fewer, but never fewer than n + 1.
+        let full = points.saturating_add(degree).saturating_add(1);
+        if knots < points.saturating_add(1) || (!periodic && knots != full) {
+            return Err(bad(format!(
+                "a spline of degree {degree} lists {knots} knots for {points} control points"
+            )));
+        }
+        e.i(70, i64::from(closed)).i(71, i64::from(degree));
+        let mut last = f64::NEG_INFINITY;
+        for _ in 0..knots {
+            let k = o.data.bd()?;
+            // Knots are numbers that never decrease (repeats are fine).
+            if !k.is_finite() || k < last {
+                return Err(bad("a spline's knots are not numbers in order"));
+            }
+            last = k;
+            e.f(40, k);
+        }
+        for _ in 0..points {
+            let (x, y, _) = o.data.bd3()?;
+            e.f(10, x).f(20, y);
+            if weighted {
+                e.f(41, o.data.bd()?);
+            }
+        }
+    } else {
+        // Fit tolerance, the start and end tangents (DXF 12/22 and 13/23), then the fit points.
+        o.data.bd()?;
+        let (sx, sy, _) = o.data.bd3()?;
+        let (ex, ey, _) = o.data.bd3()?;
+        let fit = spline_count(o, "fit points")?;
+        e.i(70, 0).i(71, i64::from(degree));
+        e.f(12, sx).f(22, sy).f(13, ex).f(23, ey);
+        for _ in 0..fit {
+            let (x, y, _) = o.data.bd3()?;
+            e.f(11, x).f(21, y);
+        }
+    }
+    Ok(())
+}
+
 /// Decode the object at `at` into `out`.
+#[allow(clippy::too_many_arguments)]
 fn decode(
     objects: &[u8],
     at: usize,
     handle: u64,
     version: Version,
+    classes: &HashMap<u16, Class>,
+    decoding: Decoding,
     out: &mut Decoded,
     skipped: &mut BTreeMap<String, usize>,
 ) -> Result<()> {
-    let mut o = object(objects, at, version)?;
+    let mut o = object(objects, at, version, decoding)?;
     if o.handle != handle {
         return Err(bad("an object's handle differs from the object map"));
     }
@@ -477,6 +811,28 @@ fn decode(
         }
         return Ok(());
     }
+    // A custom type: an entity of its class is counted under the class's DXF name; a custom
+    // object (dictionary entries, layouts and the like) draws nothing and is not counted.
+    if o.kind >= 500 {
+        if let Some(class) = classes.get(&o.kind)
+            && class.entity
+        {
+            // A DXF name is upper-case letters, digits and _ or $; anything else (which could
+            // look like one of the reader's own counters) is named by its type number.
+            let plain = !class.dxf_name.is_empty()
+                && class
+                    .dxf_name
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_' || c == '$');
+            let name = if plain {
+                class.dxf_name.clone()
+            } else {
+                format!("custom entity type {}", o.kind)
+            };
+            *skipped.entry(name).or_default() += 1;
+        }
+        return Ok(());
+    }
     if let Some(name) = unread_entity(o.kind) {
         *skipped.entry(name.to_owned()).or_default() += 1;
         return Ok(());
@@ -501,6 +857,9 @@ fn decode(
             }
         }
         7 => block = Some(insert(&mut o, &mut e)?),
+        78 => hatch(&mut o, &mut e)?,
+        35 => ellipse(&mut o, &mut e)?,
+        36 => spline(&mut o, &mut e)?,
         // Drawn by its anonymous block, which comes after the dimension style in the handles.
         20..=26 => {
             o.handle_ref()?;
@@ -754,8 +1113,13 @@ fn text(o: &mut Object, e: &mut Codes) -> Result<bool> {
     // From 2018 on, the attribute type: 1 a single line, 2 and 4 multi-line. A multi-line one
     // holds a whole MTEXT before its tag and flags, which the specification does not lay out
     // clearly enough to read; without its flags it could be a hidden one, so it is left out.
-    if o.version >= Version::R2018 && o.data.rc()? != 1 {
-        return Ok(false);
+    // Any other type is damage.
+    if o.version >= Version::R2018 {
+        match o.data.rc()? {
+            1 => {}
+            2 | 4 => return Ok(false),
+            other => return Err(bad(format!("an attribute has an unknown type {other}"))),
+        }
     }
     let tag = o.text()?;
     o.data.bs()?;

@@ -22,27 +22,8 @@ pub const DEFAULT_DEPTH: f64 = 75.0;
 /// One axis-aligned box: name, min corner and max corner.
 type Block = (String, [f64; 3], [f64; 3]);
 
-/// A part's depth (out of the plate) from its `Depth` property.
-pub fn part_depth(part: &Part) -> Option<f64> {
-    part.properties
-        .iter()
-        .find(|(k, _)| {
-            matches!(
-                k.trim().to_lowercase().as_str(),
-                "depth" | "depth mm" | "tiefe" | "dybde"
-            )
-        })
-        .and_then(|(_, v)| {
-            let s: String = v
-                .trim()
-                .chars()
-                .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == ',')
-                .map(|c| if c == ',' { '.' } else { c })
-                .collect();
-            s.parse::<f64>().ok()
-        })
-        .filter(|d| d.is_finite() && *d > 0.0 && *d <= 2000.0)
-}
+/// A part's depth (out of the plate): its `Depth` property, else its 3D model's depth.
+pub use wc_core::panel::part_depth;
 
 /// The boxes of a panel layout: plate, rails, ducts and devices.
 fn blocks(project: &Project, panel: &Panel, parts: &BTreeMap<String, Part>) -> Vec<Block> {
@@ -74,7 +55,9 @@ fn blocks(project: &Project, panel: &Panel, parts: &BTreeMap<String, Part>) -> V
         }
     }
     for item in &panel.items {
-        if let PanelItem::Device { tag, at, width, height } = item {
+        if let (PanelItem::Device { tag, .. }, Some((min, max))) = (item, item.device_bounds()) {
+            // The block covers the turned outline.
+            let (at, width, height) = (min, max.x - min.x, max.y - min.y);
             let depth = project
                 .devices
                 .get(tag)
@@ -299,6 +282,24 @@ mod tests {
     use wc_core::project::Device;
 
     #[test]
+    fn a_turned_device_is_a_turned_block() -> Result<(), wc_core::Error> {
+        let project = Project::new("x");
+        let mut panel = Panel::new("main", "Cabinet", 400.0, 300.0);
+        panel.items.push(PanelItem::Device {
+            tag: DeviceTag::parse("-G1")?,
+            at: Point::new(50.0, 100.0),
+            width: 20.0,
+            height: 100.0,
+            rotation: wc_core::geom::Rotation::R90,
+        });
+        let step = panel_step(&project, &panel, &BTreeMap::new(), "2026-11-19T23:00:00");
+        // Lying on its side it covers x 50..150 and y 100..120 (model y 180..200).
+        assert!(step.contains("CARTESIAN_POINT('',(50.,180.,2.))"), "{step}");
+        assert!(step.contains("CARTESIAN_POINT('',(150.,200.,77.))"));
+        Ok(())
+    }
+
+    #[test]
     fn panel_as_step_solids() -> Result<(), wc_core::Error> {
         let mut project = Project::new("Pump station Ålesund");
         let tag = DeviceTag::parse("+CAB1-K1")?;
@@ -319,12 +320,14 @@ mod tests {
             at: Point::new(45.0, 60.0),
             width: 45.0,
             height: 85.0,
+            rotation: wc_core::geom::Rotation::R0,
         });
         panel.items.push(PanelItem::Device {
             tag: DeviceTag::parse("-X9")?,
             at: Point::new(300.0, 50.0),
             width: 10.0,
             height: 10.0,
+            rotation: wc_core::geom::Rotation::R0,
         });
         let step = panel_step(&project, &panel, &parts, "2026-11-16T23:00:00");
         assert!(step.starts_with("ISO-10303-21;"));

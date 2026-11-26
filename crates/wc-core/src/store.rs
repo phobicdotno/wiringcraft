@@ -33,11 +33,11 @@ pub const DEVICES_FILE: &str = "devices.json";
 pub const LOCK_FILE: &str = "library.lock";
 pub const PAGES_DIR: &str = "pages";
 pub const VENDOR_DIR: &str = "vendor";
-const PAGE_SUFFIX: &str = ".page.json";
+pub const PAGE_SUFFIX: &str = ".page.json";
 pub const PANELS_DIR: &str = "panels";
-const PANEL_SUFFIX: &str = ".panel.json";
+pub const PANEL_SUFFIX: &str = ".panel.json";
 pub const COMMENTS_DIR: &str = "comments";
-const COMMENTS_SUFFIX: &str = ".comments.json";
+pub const COMMENTS_SUFFIX: &str = ".comments.json";
 
 /// Ids become file names, so they are restricted to a portable set.
 pub fn check_id(id: &str) -> Result<()> {
@@ -102,12 +102,52 @@ pub fn write_if_changed(path: &Path, content: &str) -> Result<bool> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
     }
+    replace_whole(path, content.as_bytes())?;
+    Ok(true)
+}
+
+/// Replace the file at `path` with `bytes` as a whole: staged next to it in `<file>.tmp`, then
+/// renamed over it, so a failed write leaves the file as it was rather than cut short. The
+/// staging file is one this call creates itself (opened with `create_new`): a link left at that
+/// path is never written through. The folder must exist.
+pub fn replace_whole(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
-    fs::write(&tmp, content).map_err(|e| Error::io(&tmp, e))?;
-    fs::rename(&tmp, path).map_err(|e| Error::io(path, e))?;
-    Ok(true)
+    // A staging file left by a failed write or rename is removed again (a folder in its way is
+    // not ours to remove).
+    let drop_tmp = || {
+        if fs::symlink_metadata(&tmp).is_ok_and(|m| m.is_file()) {
+            let _ = fs::remove_file(&tmp);
+        }
+    };
+    if let Err(e) = write_staging(&tmp, bytes) {
+        drop_tmp();
+        return Err(Error::io(&tmp, e));
+    }
+    if let Err(e) = fs::rename(&tmp, path) {
+        drop_tmp();
+        return Err(Error::io(path, e));
+    }
+    Ok(())
+}
+
+/// Write `content` to a staging file at `tmp` that this call creates itself.
+///
+/// The file is opened with `create_new`, which never follows a link: a symbolic link left at
+/// `tmp` by something else in the project folder is removed (the link, not its target), and a
+/// link that shows up again before the file is created makes the write fail instead of writing
+/// through it. A regular file left by an earlier failed write is replaced the same way. Anything
+/// else in the way, such as a folder, is not ours to remove and fails the write.
+fn write_staging(tmp: &Path, content: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Ok(meta) = fs::symlink_metadata(tmp)
+        && (meta.is_symlink() || meta.is_file())
+    {
+        fs::remove_file(tmp)?;
+    }
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(tmp)?;
+    file.write_all(content)
 }
 
 /// Load a whole project folder.
@@ -216,8 +256,21 @@ pub fn load(dir: &Path) -> Result<Project> {
     Ok(project)
 }
 
+/// Write only the project's `library.lock`; true when it changed. For a change that pins new
+/// items: written before the files that use them, a failed save leaves a pin nothing uses yet
+/// (harmless, and the next try finds it), never a use without its pin.
+pub fn save_lock(dir: &Path, project: &Project) -> Result<bool> {
+    let path = dir.join(LOCK_FILE);
+    write_if_changed(&path, &to_toml(&project.lock, &path)?)
+}
+
 /// Save a project folder. Page files of deleted pages are removed. Returns the files written.
+///
+/// Ids that differ only in case are refused before anything is written: on a folder that ignores
+/// case (macOS and Windows by default) they would be one file.
 pub fn save(dir: &Path, project: &Project) -> Result<Vec<PathBuf>> {
+    unique_ignoring_case("page", project.pages.iter().map(|p| p.id.as_str()))?;
+    unique_ignoring_case("panel", project.panels.iter().map(|p| p.id.as_str()))?;
     let mut written = Vec::new();
     let mut put = |path: PathBuf, content: String| -> Result<()> {
         if write_if_changed(&path, &content)? {
@@ -237,15 +290,7 @@ pub fn save(dir: &Path, project: &Project) -> Result<Vec<PathBuf>> {
         put(pages_dir.join(&name), to_json(page)?)?;
         keep.insert(name);
     }
-    if pages_dir.exists() {
-        let entries = fs::read_dir(&pages_dir).map_err(|e| Error::io(&pages_dir, e))?;
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.ends_with(PAGE_SUFFIX) && !keep.contains(&name) {
-                fs::remove_file(entry.path()).map_err(|e| Error::io(entry.path(), e))?;
-            }
-        }
-    }
+    clean_up(&pages_dir, &keep, PAGE_SUFFIX)?;
     let panels_dir = dir.join(PANELS_DIR);
     let mut keep = std::collections::BTreeSet::new();
     for panel in &project.panels {
@@ -254,15 +299,7 @@ pub fn save(dir: &Path, project: &Project) -> Result<Vec<PathBuf>> {
         put(panels_dir.join(&name), to_json(panel)?)?;
         keep.insert(name);
     }
-    if panels_dir.exists() {
-        let entries = fs::read_dir(&panels_dir).map_err(|e| Error::io(&panels_dir, e))?;
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.ends_with(PANEL_SUFFIX) && !keep.contains(&name) {
-                fs::remove_file(entry.path()).map_err(|e| Error::io(entry.path(), e))?;
-            }
-        }
-    }
+    clean_up(&panels_dir, &keep, PANEL_SUFFIX)?;
     let comments_dir = dir.join(COMMENTS_DIR);
     let mut by_page: BTreeMap<&str, Vec<&crate::review::Comment>> = BTreeMap::new();
     // Comments on a page that was deleted go with it.
@@ -276,16 +313,172 @@ pub fn save(dir: &Path, project: &Project) -> Result<Vec<PathBuf>> {
         put(comments_dir.join(&name), to_json(list)?)?;
         keep.insert(name);
     }
-    if comments_dir.exists() {
-        let entries = fs::read_dir(&comments_dir).map_err(|e| Error::io(&comments_dir, e))?;
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.ends_with(COMMENTS_SUFFIX) && !keep.contains(&name) {
-                fs::remove_file(entry.path()).map_err(|e| Error::io(entry.path(), e))?;
+    clean_up(&comments_dir, &keep, COMMENTS_SUFFIX)?;
+    remove_unused_box_symbols(dir, project)?;
+    Ok(written)
+}
+
+/// Remove the files of black box symbols (`box.<page>.<id>`, the project's own symbols for the
+/// boxes drawn on its pages) that no page places and the lock does not pin: left behind by a box
+/// that was undone, or drawn and never saved. Other vendored symbols are left alone.
+fn remove_unused_box_symbols(dir: &Path, project: &Project) -> Result<()> {
+    let folder = dir.join(VENDOR_DIR).join(ItemKind::Symbol.dir());
+    let resolved = match folder.canonicalize() {
+        Ok(resolved) => resolved,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(Error::io(&folder, e)),
+    };
+    // Only inside the project folder: when `vendor` or `vendor/symbols` is a link to somewhere
+    // else, the files there are not this project's to remove.
+    let root = dir.canonicalize().map_err(|e| Error::io(dir, e))?;
+    if !resolved.starts_with(&root) {
+        return Ok(());
+    }
+    let used: Vec<String> = project
+        .lock
+        .symbols
+        .keys()
+        .chain(project.pages.iter().flat_map(|p| p.symbols.iter().map(|s| &s.symbol)))
+        .filter(|id| is_box_symbol(id))
+        .map(|id| format!("{id}.json"))
+        .collect();
+    let listed = fs::read_dir(&resolved)
+        .map_err(|e| Error::io(&folder, e))?
+        .map(|entry| entry.map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect::<std::io::Result<Vec<String>>>()
+        .map_err(|e| Error::io(&folder, e))?;
+    // A used name that is a link keeps the file it points to.
+    let mut targets: Vec<std::ffi::OsString> = Vec::new();
+    for u in &used {
+        let path = resolved.join(u);
+        let target = match path.canonicalize() {
+            Ok(target) => target,
+            // A used name with no file (or a dangling link) protects nothing.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(Error::io(&path, e)),
+        };
+        if target.parent() == Some(resolved.as_path())
+            && let Some(name) = target.file_name()
+        {
+            targets.push(name.to_owned());
+        }
+    }
+    for name in &listed {
+        // A case variant of a used name is kept only when the used name itself is not
+        // listed: then the folder ignores case and the variant is the used file. When both are
+        // listed, the variant is a separate, unused file.
+        if !is_box_symbol(name)
+            || !name.ends_with(".json")
+            || used
+                .iter()
+                .any(|u| u.eq_ignore_ascii_case(name) && (u == name || !listed.contains(u)))
+            || targets.iter().any(|t| t.as_os_str() == std::ffi::OsStr::new(name))
+        {
+            continue;
+        }
+        let path = resolved.join(name);
+        // Only plain files: never a folder or a link someone put there.
+        match fs::symlink_metadata(&path) {
+            Ok(m) if m.file_type().is_file() => {}
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(Error::io(&path, e)),
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Error::io(&path, e)),
+        }
+    }
+    Ok(())
+}
+
+/// Whether a symbol id (or its file name) is a black box's own symbol, `box.<page>.<id>`.
+fn is_box_symbol(id: &str) -> bool {
+    id.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("box."))
+}
+
+/// Refuse two ids that differ only in case, naming both.
+fn unique_ignoring_case<'a>(kind: &str, ids: impl Iterator<Item = &'a str>) -> Result<()> {
+    let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+    for id in ids {
+        if let Some(other) = seen.insert(id.to_ascii_lowercase(), id)
+            && other != id
+        {
+            return Err(Error::Invalid(format!(
+                "{kind} ids {other:?} and {id:?} differ only in case, so they would be one file on \
+                 macOS and Windows; rename one of them"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// What to do with a file left in a folder after a save.
+#[derive(Debug, PartialEq, Eq)]
+enum Tidy {
+    /// Nothing uses it any more.
+    Remove(String),
+    /// It is a file just written, listed under the old case of its name: the folder ignores case.
+    Rename { from: String, to: String },
+}
+
+/// Which of the `listed` file names ending in `suffix` are not among the `keep` names written.
+///
+/// A name that differs from a kept one only in case is the same file on a folder that ignores
+/// case, which still lists it under its old name: it is renamed to the new name, never removed.
+/// When the folder lists both names, they are two files and the old one goes.
+fn tidy(listed: &[String], keep: &std::collections::BTreeSet<String>, suffix: &str) -> Vec<Tidy> {
+    let mut out = Vec::new();
+    for name in listed {
+        if !name.ends_with(suffix) || keep.contains(name) {
+            continue;
+        }
+        match keep.iter().find(|k| k.eq_ignore_ascii_case(name)) {
+            Some(k) if !listed.contains(k) => out.push(Tidy::Rename {
+                from: name.clone(),
+                to: k.clone(),
+            }),
+            _ => out.push(Tidy::Remove(name.clone())),
+        }
+    }
+    out
+}
+
+/// Remove the files in `dir` ending in `suffix` that the save did not write (see [`tidy`]).
+fn clean_up(dir: &Path, keep: &std::collections::BTreeSet<String>, suffix: &str) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    let entries = fs::read_dir(dir).map_err(|e| Error::io(dir, e))?;
+    let names = entries.map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()));
+    clean_up_listed(dir, names, keep, suffix)
+}
+
+/// [`clean_up`] on the names a listing of `dir` gave.
+fn clean_up_listed(
+    dir: &Path,
+    names: impl Iterator<Item = std::io::Result<String>>,
+    keep: &std::collections::BTreeSet<String>,
+    suffix: &str,
+) -> Result<()> {
+    // A listing cut short would look like a folder without the file just written: stop instead.
+    let listed = names
+        .collect::<std::io::Result<Vec<String>>>()
+        .map_err(|e| Error::io(dir, e))?;
+    for step in tidy(&listed, keep, suffix) {
+        match step {
+            Tidy::Remove(name) => {
+                let path = dir.join(name);
+                fs::remove_file(&path).map_err(|e| Error::io(&path, e))?;
+            }
+            Tidy::Rename { from, to } => {
+                let to = dir.join(to);
+                fs::rename(dir.join(from), &to).map_err(|e| Error::io(&to, e))?;
             }
         }
     }
-    Ok(written)
+    Ok(())
 }
 
 /// Create a new, empty project folder. Refuses a folder that already holds a project.
@@ -386,6 +579,7 @@ mod tests {
             at: Point::new(50.0, 100.0),
             width: 45.0,
             height: 85.0,
+            rotation: crate::geom::Rotation::R0,
         });
         p.panels.push(panel);
         p.add_comment(
@@ -411,6 +605,284 @@ mod tests {
         assert!(again.is_empty(), "unchanged project rewrote {again:?}");
         let back = load(dir.path())?;
         assert_eq!(back, p);
+        Ok(())
+    }
+
+    #[test]
+    fn a_save_removes_only_box_symbols_no_page_places_and_the_lock_does_not_pin() -> Result<()> {
+        let tmp = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
+        let dir = tmp.path();
+        let mut p = sample()?;
+        p.pages[0].symbols[0].symbol = "box.p0002.s1".into();
+        p.lock.symbols.insert(
+            "box.p0002.s7".into(),
+            crate::LockEntry {
+                source: "project".into(),
+                hash: "h".into(),
+            },
+        );
+        let folder = dir.join(VENDOR_DIR).join(ItemKind::Symbol.dir());
+        fs::create_dir_all(folder.join("box.p0002.s9.json")).map_err(|e| Error::io(&folder, e))?;
+        for name in [
+            "box.p0002.s1.json",
+            "box.p0002.s7.json",
+            "box.p0002.s2.json",
+            "BOX.P0002.S3.json",
+            "box.p0002.s4.txt",
+            "wc.coil.json",
+        ] {
+            fs::write(folder.join(name), "{}").map_err(|e| Error::io(name, e))?;
+        }
+        save(dir, &p)?;
+        let mut left: Vec<String> = fs::read_dir(&folder)
+            .map_err(|e| Error::io(&folder, e))?
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "box.p0002.s1.json",
+                "box.p0002.s4.txt",
+                "box.p0002.s7.json",
+                "box.p0002.s9.json",
+                "wc.coil.json"
+            ],
+            "placed, pinned, not a symbol file, a folder and other symbols stay"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_save_never_removes_box_symbols_outside_the_project_folder() -> Result<()> {
+        let tmp = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
+        let other = tmp.path().join("other");
+        let elsewhere = other.join("symbols");
+        fs::create_dir_all(&elsewhere).map_err(|e| Error::io(&elsewhere, e))?;
+        fs::write(elsewhere.join("box.p1.s1.json"), "{}").map_err(|e| Error::io("write", e))?;
+        let dir = tmp.path().join("proj");
+        fs::create_dir_all(&dir).map_err(|e| Error::io(&dir, e))?;
+        // `vendor` itself is a link to another project's folder.
+        std::os::unix::fs::symlink(&other, dir.join(VENDOR_DIR)).map_err(|e| Error::io("link", e))?;
+        save(&dir, &Project::new("Empty"))?;
+        assert!(elsewhere.join("box.p1.s1.json").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_save_keeps_the_file_a_used_box_symbol_links_to() -> Result<()> {
+        let tmp = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
+        let dir = tmp.path();
+        let mut p = Project::new("Linked");
+        let mut page = Page::new("p1", "1", "One");
+        page.symbols.push(PlacedSymbol {
+            id: "s1".into(),
+            symbol: "box.p1.s1".into(),
+            at: Point::new(0.0, 0.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: None,
+        });
+        p.pages.push(page);
+        let folder = dir.join(VENDOR_DIR).join(ItemKind::Symbol.dir());
+        fs::create_dir_all(&folder).map_err(|e| Error::io(&folder, e))?;
+        fs::write(folder.join("box.p1.s9.json"), "{}").map_err(|e| Error::io("write", e))?;
+        std::os::unix::fs::symlink("box.p1.s9.json", folder.join("box.p1.s1.json"))
+            .map_err(|e| Error::io("link", e))?;
+        save(dir, &p)?;
+        assert!(folder.join("box.p1.s9.json").exists(), "the link's target stays");
+        assert!(
+            fs::read(folder.join("box.p1.s1.json")).is_ok(),
+            "the placed symbol reads"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_save_reports_a_used_box_symbol_it_cannot_resolve_and_removes_nothing() -> Result<()> {
+        let tmp = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
+        let dir = tmp.path();
+        let mut p = Project::new("Loop");
+        let mut page = Page::new("p1", "1", "One");
+        page.symbols.push(PlacedSymbol {
+            id: "s1".into(),
+            symbol: "box.p1.s1".into(),
+            at: Point::new(0.0, 0.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: None,
+        });
+        p.pages.push(page);
+        let folder = dir.join(VENDOR_DIR).join(ItemKind::Symbol.dir());
+        fs::create_dir_all(&folder).map_err(|e| Error::io(&folder, e))?;
+        fs::write(folder.join("box.p1.s2.json"), "{}").map_err(|e| Error::io("write", e))?;
+        // The used name is a link to itself: resolving it fails with something other than
+        // NotFound.
+        std::os::unix::fs::symlink("box.p1.s1.json", folder.join("box.p1.s1.json"))
+            .map_err(|e| Error::io("link", e))?;
+        assert!(save(dir, &p).is_err(), "the resolution error is reported");
+        assert!(
+            folder.join("box.p1.s2.json").exists(),
+            "nothing is removed when a used name cannot be resolved"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_save_removes_an_unused_case_duplicate_but_keeps_a_link_target() -> Result<()> {
+        let tmp = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
+        let dir = tmp.path();
+        let mut p = Project::new("Cases");
+        let mut page = Page::new("p1", "1", "One");
+        for (id, symbol) in [("s1", "box.p1.s1"), ("s2", "box.p1.s2")] {
+            page.symbols.push(PlacedSymbol {
+                id: id.into(),
+                symbol: symbol.into(),
+                at: Point::new(0.0, 0.0),
+                rotation: Default::default(),
+                mirror: false,
+                tag: None,
+            });
+        }
+        p.pages.push(page);
+        let folder = dir.join(VENDOR_DIR).join(ItemKind::Symbol.dir());
+        fs::create_dir_all(&folder).map_err(|e| Error::io(&folder, e))?;
+        // Only on a folder that tells case apart; one that ignores case has no duplicates.
+        fs::write(folder.join("probe.txt"), "").map_err(|e| Error::io("write", e))?;
+        let ignores_case = folder.join("PROBE.txt").exists();
+        fs::remove_file(folder.join("probe.txt")).map_err(|e| Error::io("remove", e))?;
+        if ignores_case {
+            return Ok(());
+        }
+        // A folder that tells case apart: the duplicate is its own, unused file.
+        for name in ["box.p1.s1.json", "BOX.P1.S1.json", "Box.P1.S2.json"] {
+            fs::write(folder.join(name), "{}").map_err(|e| Error::io("write", e))?;
+        }
+        // The used name is a link to a case variant, which must stay.
+        std::os::unix::fs::symlink("Box.P1.S2.json", folder.join("box.p1.s2.json"))
+            .map_err(|e| Error::io("link", e))?;
+        save(dir, &p)?;
+        assert!(folder.join("box.p1.s1.json").exists(), "the used file stays");
+        assert!(!folder.join("BOX.P1.S1.json").exists(), "the unused duplicate goes");
+        assert!(folder.join("Box.P1.S2.json").exists(), "the link's target stays");
+        assert!(
+            fs::read(folder.join("box.p1.s2.json")).is_ok(),
+            "the linked symbol reads"
+        );
+        Ok(())
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_save_never_removes_a_file_it_wrote_under_another_case() {
+        let keep = names(&["DXF-300.page.json", "p1.page.json"]).into_iter().collect();
+        // A folder that ignores case lists the file just written under its old name.
+        let listed = names(&["dxf-300.page.json", "p1.page.json", "gone.page.json", "notes.txt"]);
+        assert_eq!(
+            tidy(&listed, &keep, PAGE_SUFFIX),
+            vec![
+                Tidy::Rename {
+                    from: "dxf-300.page.json".into(),
+                    to: "DXF-300.page.json".into()
+                },
+                Tidy::Remove("gone.page.json".into()),
+            ]
+        );
+        // A folder that keeps case lists both: two files, and the old one goes.
+        let listed = names(&["dxf-300.page.json", "DXF-300.page.json", "p1.page.json"]);
+        assert_eq!(
+            tidy(&listed, &keep, PAGE_SUFFIX),
+            vec![Tidy::Remove("dxf-300.page.json".into())]
+        );
+    }
+
+    #[test]
+    fn a_listing_cut_short_changes_nothing() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
+        // Names that differ by more than case, so this holds on every folder: a complete listing
+        // would rename the first and remove the second.
+        let files = [("dxf-300.page.json", "old"), ("gone.page.json", "stale")];
+        for (name, body) in files {
+            fs::write(dir.path().join(name), body).map_err(|e| Error::io(name, e))?;
+        }
+        let keep = names(&["DXF-300.page.json"]).into_iter().collect();
+        let listing = vec![
+            Ok("dxf-300.page.json".to_string()),
+            Ok("gone.page.json".to_string()),
+            Err(std::io::Error::other("listing cut short")),
+        ];
+        let out = clean_up_listed(dir.path(), listing.into_iter(), &keep, PAGE_SUFFIX);
+        assert!(out.is_err_and(|e| e.to_string().contains("listing cut short")));
+        let mut left = names(&[]);
+        for entry in fs::read_dir(dir.path()).map_err(|e| Error::io("tmp", e))? {
+            left.push(
+                entry
+                    .map_err(|e| Error::io("tmp", e))?
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        left.sort();
+        assert_eq!(left, names(&["dxf-300.page.json", "gone.page.json"]));
+        for (name, body) in files {
+            let path = dir.path().join(name);
+            assert_eq!(fs::read_to_string(&path).map_err(|e| Error::io(&path, e))?, body);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_page_renamed_only_in_case_is_saved_and_loads() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
+        let mut p = sample()?;
+        save(dir.path(), &p)?;
+        let old = p.pages[0].id.clone();
+        p.pages[0].id = old.to_ascii_uppercase();
+        assert_ne!(p.pages[0].id, old);
+        for c in p.comments.iter_mut().filter(|c| c.page == old) {
+            c.page = p.pages[0].id.clone();
+        }
+        save(dir.path(), &p)?;
+        let back = load(dir.path())?;
+        assert_eq!(back, p);
+        Ok(())
+    }
+
+    fn refused<T>(r: Result<T>) -> Result<String> {
+        match r {
+            Ok(_) => Err(Error::Invalid("saved ids that differ only in case".into())),
+            Err(e) => Ok(e.to_string()),
+        }
+    }
+
+    #[test]
+    fn ids_that_differ_only_in_case_are_refused_before_anything_is_written() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
+        let mut p = sample()?;
+        let mut twin = p.pages[0].clone();
+        twin.id = twin.id.to_ascii_uppercase();
+        let (a, b) = (p.pages[0].id.clone(), twin.id.clone());
+        p.pages.push(twin);
+        let err = refused(save(dir.path(), &p))?;
+        assert!(
+            err.contains(&format!("{a:?}")) && err.contains(&format!("{b:?}")),
+            "{err}"
+        );
+        assert!(!dir.path().join(PROJECT_FILE).exists());
+        p.pages.pop();
+        let mut twin = p.panels[0].clone();
+        twin.id = twin.id.to_ascii_uppercase();
+        p.panels.push(twin);
+        let err = refused(save(dir.path(), &p))?;
+        assert!(err.contains("panel ids"), "{err}");
         Ok(())
     }
 
@@ -463,5 +935,58 @@ mod tests {
             assert!(check_id(bad).is_err(), "{bad}");
         }
         assert!(check_id("wc.contact-no_1").is_ok());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod staging_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_at_the_staging_path_is_not_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("outside.txt");
+        fs::write(&target, "keep me").unwrap();
+        let path = dir.path().join("devices.json");
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        std::os::unix::fs::symlink(&target, PathBuf::from(&tmp)).unwrap();
+
+        assert!(write_if_changed(&path, "new content\n").unwrap());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep me");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new content\n");
+        assert!(fs::symlink_metadata(PathBuf::from(&tmp)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_link_at_the_staging_path_creates_nothing_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere").join("created.txt");
+        fs::create_dir(dir.path().join("elsewhere")).unwrap();
+        let path = dir.path().join("pages").join("p1.page.json");
+        fs::create_dir(dir.path().join("pages")).unwrap();
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        std::os::unix::fs::symlink(&target, PathBuf::from(&tmp)).unwrap();
+
+        assert!(write_if_changed(&path, "{}\n").unwrap());
+        assert!(!target.exists());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{}\n");
+    }
+
+    #[test]
+    fn a_staging_file_left_by_a_failed_write_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("project.toml");
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        fs::write(PathBuf::from(&tmp), "stale and much longer than the new content").unwrap();
+
+        assert!(write_if_changed(&path, "x\n").unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "x\n");
+        assert!(!PathBuf::from(&tmp).exists());
     }
 }

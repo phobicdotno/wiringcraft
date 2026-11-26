@@ -10,8 +10,8 @@ use crate::Options;
 use crate::writer::{Drawn, Layer, Link, Pen, text_width_mm};
 
 pub use wc_core::project::FRAME_COLUMNS;
-const MARGIN: f64 = wc_core::project::FRAME_MARGIN;
-const HEADER: f64 = 6.0;
+pub(crate) const MARGIN: f64 = wc_core::project::FRAME_MARGIN;
+pub(crate) const HEADER: f64 = 6.0;
 #[cfg(test)]
 const TITLE_H: f64 = wc_core::template::TITLE_HEIGHT;
 
@@ -220,6 +220,11 @@ pub(crate) fn draw_shape(pen: &mut Pen, s: &Shape) {
             };
             pen.text_at_angle(tuple(*at), *height, a, *angle, text);
         }
+        Shape::Dimension { .. } => {
+            for part in s.dimension_parts().unwrap_or_default() {
+                draw_shape(pen, &part);
+            }
+        }
     }
 }
 
@@ -280,6 +285,19 @@ fn merge_segments(mut segs: Vec<(f64, f64, f64)>) -> Vec<(f64, f64, f64)> {
         }
     }
     out
+}
+
+/// The value of title-block field `key` on sheet `index` of `total`: the page's own fields
+/// (its revision, date, ...) win over the project's, and a blank date is `date`.
+fn title_value(project: &Project, page: &Page, index: usize, total: usize, date: &str, key: &str) -> String {
+    match key {
+        template::PROJECT_NAME => project.meta.name.clone(),
+        template::PAGE_TITLE => page.title.clone(),
+        template::PAGE_NUMBER => page.number.clone(),
+        template::SHEET => format!("{} / {}", index + 1, total),
+        "date" if page.title_field(&project.meta, "date").trim().is_empty() => date.to_owned(),
+        k => page.title_field(&project.meta, k).to_owned(),
+    }
 }
 
 pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, date: &str) -> Vec<FrameMark> {
@@ -367,11 +385,7 @@ pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, d
     let band = template.band_height();
     let ty = y1 - band;
     line((x0, ty), (x1, ty), Ink::Thick, &mut out);
-    let boxes: Vec<_> = template
-        .boxes
-        .iter()
-        .filter_map(|b| b.resolve(x0, x1, band).map(|r| (b, r)))
-        .collect();
+    let boxes = template.boxes_on(x0, x1, band);
     // Box sides, less those on the band's outline, with overlapping pieces drawn once.
     let mut across: Vec<(f64, f64, f64)> = Vec::new();
     let mut down: Vec<(f64, f64, f64)> = Vec::new();
@@ -393,18 +407,7 @@ pub fn frame_marks(project: &Project, page: &Page, index: usize, total: usize, d
     for (y, a, b) in merge_segments(across) {
         line((a, y), (b, y), Ink::Thin, &mut out);
     }
-    // The page's own fields (its revision, date, ...) win over the project's.
-    let sheet = format!("{} / {}", index + 1, total);
-    let value = |key: &str| -> String {
-        match key {
-            template::PROJECT_NAME => project.meta.name.clone(),
-            template::PAGE_TITLE => page.title.clone(),
-            template::PAGE_NUMBER => page.number.clone(),
-            template::SHEET => sheet.clone(),
-            "date" if page.title_field(&project.meta, "date").trim().is_empty() => date.to_owned(),
-            k => page.title_field(&project.meta, k).to_owned(),
-        }
-    };
+    let value = |key: &str| title_value(project, page, index, total, date, key);
     for (b, (l, t, r, bottom)) in &boxes {
         let top = ty + t;
         let bottom = ty + bottom;
@@ -505,11 +508,14 @@ pub fn title_logo_boxes(project: &Project, page: &Page) -> Vec<(Point, Point)> {
     project
         .meta
         .template
-        .boxes
-        .iter()
-        .filter(|b| b.logo)
-        .filter_map(|b| b.resolve(x0, x1, band))
-        .map(|(l, t, r, b)| (Point::new(l + 1.0, ty + t + 1.0), Point::new(r - 1.0, ty + b - 1.0)))
+        .boxes_on(x0, x1, band)
+        .into_iter()
+        .filter(|(b, _)| b.logo)
+        .map(|(_, (l, t, r, b))| {
+            // 1 mm of padding, less in a box narrowed below 4 mm, so the logo keeps an area.
+            let (ix, iy) = (((r - l) / 4.0).min(1.0), ((b - t) / 4.0).min(1.0));
+            (Point::new(l + ix, ty + t + iy), Point::new(r - ix, ty + b - iy))
+        })
         .filter(|(a, b)| a.x < b.x && a.y < b.y)
         .collect()
 }
@@ -521,9 +527,9 @@ pub fn cover_logo_default(project: &Project, page: &Page) -> (Point, Point) {
     let band = project.meta.template.band_height();
     let (x0, y0, x1, ty) = (MARGIN, MARGIN + HEADER, w - MARGIN, h - MARGIN - band);
     let cx = (x0 + x1) / 2.0;
-    let name_y = y0 + (ty - y0) * 0.2;
-    let top = y0 + 4.0;
-    let bottom = (name_y - 10.0).max(top + 5.0);
+    let name_y = cover_name_y(cover_rows(project, "").len(), default_cover_logo(project), y0, ty);
+    let top = y0 + COVER_LOGO_TOP;
+    let bottom = (name_y - COVER_LOGO_TO_NAME).max(top + COVER_LOGO_MIN);
     let half = 45.0_f64.min((x1 - x0) / 2.0 - 5.0);
     (Point::new(cx - half, top), Point::new(cx + half, bottom))
 }
@@ -569,6 +575,70 @@ pub fn fit_picture((min, max): (Point, Point), (width, height): (u32, u32)) -> (
     (Point::new(x, y), Point::new(x + w, y + h))
 }
 
+/// From the top of the cover's drawing area to its default logo box.
+const COVER_LOGO_TOP: f64 = 4.0;
+/// The smallest height of the cover's default logo box.
+const COVER_LOGO_MIN: f64 = 5.0;
+/// From the bottom of the cover's default logo box to the project name's baseline.
+const COVER_LOGO_TO_NAME: f64 = 10.0;
+/// The smallest height a row of the cover's field table gets; below it, rows are left out.
+const COVER_MIN_ROW: f64 = 4.0;
+/// The room under the cover's table, above the title block.
+const COVER_TABLE_GAP: f64 = 8.0;
+/// From the project's name to the top of the cover's table: the description sits between.
+const COVER_NAME_TO_TABLE: f64 = 18.0;
+
+/// Where the project's name stands on a cover whose drawing area runs from `y0` to `y1` and
+/// lists `rows` fields: a fifth of the way down, or higher on a short sheet so the table has
+/// room for its rows, but never closer to the top than the name's height, or, with a `logo`,
+/// than the smallest default logo box above it (see [`cover_logo_default`]).
+fn cover_name_y(rows: usize, logo: bool, y0: f64, y1: f64) -> f64 {
+    let ideal = y0 + (y1 - y0) * 0.2;
+    let needed = rows as f64 * COVER_MIN_ROW + COVER_TABLE_GAP + COVER_NAME_TO_TABLE;
+    let highest = y0
+        + if logo {
+            COVER_LOGO_TOP + COVER_LOGO_MIN + COVER_LOGO_TO_NAME
+        } else {
+            10.0
+        };
+    ideal.min(y1 - needed).max(highest)
+}
+
+/// Whether the cover shows the project's logo in its default place, above the name: only then
+/// does the name leave room for it.
+fn default_cover_logo(project: &Project) -> bool {
+    project.meta.logo.as_ref().is_some_and(|l| l.cover.is_none())
+}
+
+/// How many rows of the cover's field table fit on a cover whose drawing area runs from `y0`
+/// to `y1` and lists `rows` fields, at no less than [`COVER_MIN_ROW`] each.
+fn cover_fits(rows: usize, logo: bool, y0: f64, y1: f64) -> usize {
+    let room = y1 - COVER_TABLE_GAP - cover_name_y(rows, logo, y0, y1) - COVER_NAME_TO_TABLE;
+    (room / COVER_MIN_ROW).floor().max(0.0) as usize
+}
+
+/// The rows of the cover's field table, label and value. Standard fields are listed even
+/// when empty, so the cover reads as a form; other fields are listed when they have a value.
+/// An empty date shows `date`.
+fn cover_rows<'a>(project: &'a Project, date: &'a str) -> Vec<(&'a str, &'a str)> {
+    let tb = &project.meta.title_block;
+    let mut rows: Vec<(&str, &str)> = wc_core::project::TITLE_FIELDS
+        .iter()
+        .filter(|(k, _)| *k != "description")
+        .map(|(k, label)| {
+            let v = tb.get(*k).map(String::as_str).unwrap_or("");
+            let v = if *k == "date" && v.trim().is_empty() { date } else { v };
+            (*label, v)
+        })
+        .collect();
+    for (k, v) in tb {
+        if !wc_core::project::TITLE_FIELDS.iter().any(|(f, _)| f == k) && !v.trim().is_empty() {
+            rows.push((k.as_str(), v.as_str()));
+        }
+    }
+    rows
+}
+
 /// The cover page's content inside the drawing area `(x0, y0, x1, y1)`: the project's name
 /// large, its description under it, and a table of the project fields. Every value comes from
 /// the project, so it always matches the title blocks. Standard fields are listed even when
@@ -576,7 +646,6 @@ pub fn fit_picture((min, max): (Point, Point), (width, height): (u32, u32)) -> (
 fn cover_marks(project: &Project, (x0, y0, x1, y1): (f64, f64, f64, f64), date: &str, out: &mut Vec<FrameMark>) {
     let tb = &project.meta.title_block;
     let cx = (x0 + x1) / 2.0;
-    let h = y1 - y0;
     let push_text = |at: (f64, f64), height: f64, align: Align, t: &str, ink: Ink, out: &mut Vec<FrameMark>| {
         if !t.trim().is_empty() {
             out.push(FrameMark {
@@ -592,29 +661,41 @@ fn cover_marks(project: &Project, (x0, y0, x1, y1): (f64, f64, f64, f64), date: 
         }
     };
     let fit = |t: &str, height: f64| fit_height(t, height, x1 - x0 - 10.0);
-    let name_y = y0 + h * 0.2;
+    let mut rows = cover_rows(project, date);
+    let logo = default_cover_logo(project);
+    let name_y = cover_name_y(rows.len(), logo, y0, y1);
     let name = &project.meta.name;
     push_text((cx, name_y), fit(name, 9.0), Align::Center, name, Ink::Thin, out);
+    // On a sheet too short for it, the description is left out rather than drawn into the
+    // title block.
     let desc = tb.get("description").map(String::as_str).unwrap_or("");
-    push_text((cx, name_y + 9.0), fit(desc, 4.0), Align::Center, desc, Ink::Thin, out);
+    if name_y + 9.0 + BELOW_BASELINE <= y1 {
+        push_text((cx, name_y + 9.0), fit(desc, 4.0), Align::Center, desc, Ink::Thin, out);
+    }
 
-    let mut rows: Vec<(&str, &str)> = wc_core::project::TITLE_FIELDS
-        .iter()
-        .filter(|(k, _)| *k != "description")
-        .map(|(k, label)| {
-            let v = tb.get(*k).map(String::as_str).unwrap_or("");
-            let v = if *k == "date" && v.trim().is_empty() { date } else { v };
-            (*label, v)
-        })
-        .collect();
-    for (k, v) in tb {
-        if !wc_core::project::TITLE_FIELDS.iter().any(|(f, _)| f == k) && !v.trim().is_empty() {
-            rows.push((k.as_str(), v.as_str()));
+    // The table fits under the description; rows shrink on small sheets. When they would be
+    // too small to read, empty fields are left out first, then the last filled-in ones, with a
+    // row that says how many filled-in fields are not shown (empty ones have nothing to show).
+    // When not even that row fits, the export warns (see `draw_page`).
+    let top = name_y + COVER_NAME_TO_TABLE;
+    let room = y1 - COVER_TABLE_GAP - top;
+    let fits = cover_fits(rows.len(), logo, y0, y1);
+    if rows.len() > fits {
+        rows.retain(|(_, v)| !v.trim().is_empty());
+    }
+    let more;
+    if rows.len() > fits {
+        let shown = fits.saturating_sub(1);
+        more = format!("{} more", rows.len() - shown);
+        rows.truncate(shown);
+        if fits > 0 {
+            rows.push(("...", more.as_str()));
         }
     }
-    // The table fits under the description; rows shrink a little on small sheets.
-    let top = name_y + 18.0;
-    let row_h = ((y1 - 8.0 - top) / rows.len().max(1) as f64).min(8.0);
+    if rows.is_empty() {
+        return;
+    }
+    let row_h = (room / rows.len() as f64).min(8.0);
     let (tx0, tx1) = (
         cx - 90.0_f64.min((x1 - x0) / 2.0 - 5.0),
         cx + 90.0_f64.min((x1 - x0) / 2.0 - 5.0),
@@ -642,7 +723,7 @@ fn cover_marks(project: &Project, (x0, y0, x1, y1): (f64, f64, f64, f64), date: 
     }
 }
 
-fn frame(pen: &mut Pen, project: &Project, page: &Page, index: usize, total: usize, date: &str) {
+pub(crate) fn frame(pen: &mut Pen, project: &Project, page: &Page, index: usize, total: usize, date: &str) {
     for m in frame_marks(project, page, index, total, date) {
         match m.ink {
             Ink::Thick => {
@@ -677,6 +758,23 @@ pub fn draw_page(
     pen.ops.push_str("1 J 1 j\n");
     pen.colour(0.0, 0.0, 0.0);
     frame(&mut pen, project, page, index, total, &options.date);
+    if page.cover {
+        let rows = cover_rows(project, &options.date);
+        let band = project.meta.template.band_height();
+        if rows.iter().any(|(_, v)| !v.trim().is_empty())
+            && cover_fits(
+                rows.len(),
+                default_cover_logo(project),
+                MARGIN + HEADER,
+                h - MARGIN - band,
+            ) == 0
+        {
+            warnings.push(format!(
+                "page {}: the cover page is too short to list the project fields",
+                page.number
+            ));
+        }
+    }
 
     // Free graphics: texts, lines and rectangles drawn on the sheet, and imported drawings.
     pen.colour(0.0, 0.0, 0.0);
@@ -687,6 +785,46 @@ pub fn draw_page(
             draw_shape(&mut pen, g);
         }
         pen.end_layer();
+    }
+
+    // Revision clouds and the revision table.
+    if !page.clouds.is_empty() || page.revision_table.is_some() {
+        pen.begin_layer(Layer::Drawings);
+        for c in &page.clouds {
+            if !c.is_valid() {
+                warnings.push(format!("page {}: a revision cloud has no area", page.number));
+            }
+            for s in c.shapes() {
+                draw_shape(&mut pen, &s);
+            }
+        }
+        if let Some(at) = page.revision_table {
+            for s in wc_core::revision::table_shapes(&project.meta.revisions, at) {
+                draw_shape(&mut pen, &s);
+            }
+        }
+        pen.end_layer();
+    }
+    for c in &page.clouds {
+        if project.cloud_revision(&c.revision).is_none() {
+            warnings.push(format!(
+                "page {}: a cloud carries revision {}, which the project does not list",
+                page.number, c.revision
+            ));
+        } else if !wc_core::revision::letter_prints(&c.revision) {
+            warnings.push(format!(
+                "page {}: the PDF cannot print revision {} on a cloud; it can read like another letter",
+                page.number, c.revision
+            ));
+        }
+    }
+    if page.revision_table.is_some() {
+        for letter in project.unprintable_revisions() {
+            warnings.push(format!(
+                "page {}: the PDF cannot print revision {letter} in the revision table; it can read like another letter",
+                page.number
+            ));
+        }
     }
 
     // Wires under symbols.
@@ -866,9 +1004,25 @@ const CELL_PAD: f64 = 1.5;
 /// How many table rows fit on one report page of this size (below the heading and header row),
 /// above a title block band `band` mm high.
 pub fn rows_per_page(size: PageSize, band: f64) -> usize {
+    (report_rows(size, band).floor() as usize).max(1)
+}
+
+/// How many table rows the sheet height leaves room for, before rounding down.
+fn report_rows(size: PageSize, band: f64) -> f64 {
     let (_, h) = size.mm();
     let usable = h - 2.0 * MARGIN - HEADER - band - 14.0 - ROW_H;
-    ((usable / ROW_H).floor() as usize).max(1)
+    usable / ROW_H
+}
+
+/// The sheet report pages are printed on: `wanted` (the first schematic page's size) when it
+/// has room for its title block and at least `lines` table lines, otherwise the smallest ISO
+/// sheet that does (A3 when none does). A grouped table needs two (a heading and a row), and
+/// one more for its header values.
+pub fn report_size(wanted: PageSize, band: f64, lines: usize) -> PageSize {
+    std::iter::once(wanted)
+        .chain(PageSize::NAMED)
+        .find(|s| report_rows(*s, band) >= lines.max(1) as f64)
+        .unwrap_or(PageSize::A3)
 }
 
 /// Column widths for a table that must fit `avail` mm: natural widths, shrunk proportionally
@@ -900,18 +1054,77 @@ fn column_widths(t: &wc_report::Table, avail: f64) -> Vec<f64> {
 
 /// Cut text to fit a width, marking the cut with "...".
 fn fit(s: &str, width: f64) -> String {
-    if text_width_mm(s, TABLE_TEXT) <= width {
+    fit_at(s, width, TABLE_TEXT)
+}
+
+/// `s` cut short with "..." so that, drawn `height` mm high, it is at most `width` mm wide.
+pub(crate) fn fit_at(s: &str, width: f64, height: f64) -> String {
+    if text_width_mm(s, height) <= width {
         return s.to_owned();
     }
     let mut out: String = s.to_owned();
-    while !out.is_empty() && text_width_mm(&format!("{out}..."), TABLE_TEXT) > width {
+    while !out.is_empty() && text_width_mm(&format!("{out}..."), height) > width {
         out.pop();
     }
     format!("{out}...")
 }
 
-/// One report page: frame and title block like a schematic page, the report title, and a slice
-/// of the table's rows starting at `first`.
+/// One line of a report page's table: a row of the table, by its index, or the heading of a
+/// group of rows ([`wc_report::Table::group`]) with its value, marked when it continues the
+/// group from the page before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TableLine {
+    Row(usize),
+    Group { value: String, continued: bool },
+}
+
+/// Whether report pages of `per_page` lines print `table`'s line of header values: only when
+/// a row still fits under it.
+pub fn prints_header(table: &wc_report::Table, per_page: usize) -> bool {
+    !table.header.is_empty() && per_page >= 2
+}
+
+/// The lines of each report page of `table`, with `per_page` lines on a page: its rows, and a
+/// heading above each group when it is grouped (again, marked as continued, at the top of a
+/// page a group runs onto; never alone at the foot of a page). A line fewer for the line of
+/// header values when the table prints it ([`prints_header`]). A page never holds more
+/// than `per_page` lines: when it has no room for a heading and a row, the headings are left
+/// out ([`report_size`] picks a sheet with room for them). An empty table has one empty page.
+pub fn table_pages(table: &wc_report::Table, per_page: usize) -> Vec<Vec<TableLine>> {
+    let cap = per_page
+        .saturating_sub(usize::from(prints_header(table, per_page)))
+        .max(1);
+    let headings = table.group.is_some() && cap > 1;
+    let mut pages: Vec<Vec<TableLine>> = vec![Vec::new()];
+    let mut current: Option<&str> = None;
+    for (n, row) in table.rows.iter().enumerate() {
+        let value = table.group.and_then(|g| row.get(g)).map(String::as_str);
+        let new_group = headings && value != current;
+        // A heading never takes the last line of a page: its first row goes with it.
+        let need = if new_group { 2 } else { 1 };
+        if pages.last().is_some_and(|p| p.len() + need > cap) {
+            pages.push(Vec::new());
+        }
+        let Some(page) = pages.last_mut() else { break };
+        if new_group {
+            page.push(TableLine::Group {
+                value: value.unwrap_or_default().to_owned(),
+                continued: false,
+            });
+            current = value;
+        } else if page.is_empty() && headings {
+            page.push(TableLine::Group {
+                value: value.unwrap_or_default().to_owned(),
+                continued: true,
+            });
+        }
+        page.push(TableLine::Row(n));
+    }
+    pages
+}
+
+/// One report page: frame and title block like a schematic page, the report title, the header
+/// values when the table has them, and the table `lines` ([`table_pages`]).
 #[allow(clippy::too_many_arguments)]
 pub fn draw_table_page(
     project: &Project,
@@ -919,7 +1132,7 @@ pub fn draw_table_page(
     index: usize,
     total: usize,
     table: &wc_report::Table,
-    first: usize,
+    lines: &[TableLine],
     part: (usize, usize),
     date: &str,
 ) -> Drawn {
@@ -937,18 +1150,42 @@ pub fn draw_table_page(
     };
     pen.text((x0, y), 4.0, 0, &heading);
     y += 4.0;
-    let widths = column_widths(table, x1 - x0);
-    let rows = table
-        .rows
-        .iter()
-        .skip(first)
-        .take(rows_per_page(page.size, project.meta.template.band_height()));
+    if !table.header.is_empty() {
+        // The title-block values the layout asks for, as on the page's title block.
+        let fields: Vec<String> = table
+            .header
+            .iter()
+            .map(|key| {
+                let value = title_value(project, page, index, total, date, key);
+                format!("{}: {value}", template::value_label(key))
+            })
+            .collect();
+        pen.text(
+            (x0, y + ROW_H - 1.4),
+            TABLE_TEXT,
+            0,
+            &fit(&fields.join("    "), x1 - x0),
+        );
+        y += ROW_H;
+    }
+    // The group column is shown in the group headings, not in the rows.
+    let shown: Vec<usize> = (0..table.columns.len()).filter(|i| Some(*i) != table.group).collect();
+    let view = wc_report::Table {
+        columns: shown.iter().map(|&i| table.columns[i].clone()).collect(),
+        rows: table
+            .rows
+            .iter()
+            .map(|r| shown.iter().map(|&i| r.get(i).cloned().unwrap_or_default()).collect())
+            .collect(),
+        ..wc_report::Table::default()
+    };
+    let widths = column_widths(&view, x1 - x0);
     // Header row on a grey band.
     pen.colour(0.88, 0.89, 0.91);
     pen.fill_rect((x0, y), (x1, y + ROW_H));
     pen.colour(0.0, 0.0, 0.0);
     let mut cx = x0;
-    for (c, wdt) in table.columns.iter().zip(&widths) {
+    for (c, wdt) in view.columns.iter().zip(&widths) {
         pen.text(
             (cx + CELL_PAD, y + ROW_H - 1.4),
             TABLE_TEXT,
@@ -962,13 +1199,36 @@ pub fn draw_table_page(
     y += ROW_H;
     pen.width(0.12);
     let mut links = Vec::new();
-    for (ri, r) in rows.enumerate() {
+    let group_name = table
+        .group
+        .and_then(|g| table.columns.get(g))
+        .cloned()
+        .unwrap_or_default();
+    for line in lines {
+        let ri = match line {
+            TableLine::Row(ri) => *ri,
+            TableLine::Group { value, continued } => {
+                pen.colour(0.95, 0.95, 0.96);
+                pen.fill_rect((x0, y), (x1, y + ROW_H));
+                pen.colour(0.0, 0.0, 0.0);
+                let shown = if value.is_empty() { "(none)" } else { value.as_str() };
+                let more = if *continued { " (continued)" } else { "" };
+                pen.text(
+                    (x0 + CELL_PAD, y + ROW_H - 1.4),
+                    TABLE_TEXT,
+                    0,
+                    &fit(&format!("{group_name}: {shown}{more}"), x1 - x0 - 2.0 * CELL_PAD),
+                );
+                y += ROW_H;
+                pen.colour(0.7, 0.7, 0.7);
+                pen.line((x0, y), (x1, y));
+                pen.colour(0.0, 0.0, 0.0);
+                continue;
+            }
+        };
+        let Some(r) = view.rows.get(ri) else { continue };
         // A row that describes a page jumps to it.
-        if let Some(target) = table
-            .row_pages
-            .get(first.saturating_add(ri))
-            .filter(|id| !id.is_empty())
-        {
+        if let Some(target) = table.row_pages.get(ri).filter(|id| !id.is_empty()) {
             links.push(Link {
                 min: (x0, y),
                 max: (x1, y + ROW_H),
@@ -1004,6 +1264,214 @@ pub fn draw_table_page(
     }
 }
 
+/// Height of one channel row on a drawn PLC card sheet, in mm.
+const CARD_ROW: f64 = 6.0;
+/// Text height on a drawn PLC card sheet, in mm.
+const CARD_TEXT: f64 = 2.5;
+/// Where the channel rows start below the top of the drawing area, in mm (room for the heading).
+const CARD_TOP: f64 = 22.0;
+/// Width, in mm, of the page column of a drawn PLC card, right-aligned at its edge.
+pub const CARD_PAGE: f64 = 12.0;
+
+/// How many rows of a drawn PLC card fit on one sheet of `size` (at least one: use
+/// [`card_size`] for a sheet with room for one).
+pub fn card_rows_per_page(size: PageSize, band: f64) -> usize {
+    (card_rows(size, band).floor() as usize).max(1)
+}
+
+/// How many rows of a drawn PLC card the sheet height leaves room for, before rounding down.
+fn card_rows(size: PageSize, band: f64) -> f64 {
+    let (_, h) = size.mm();
+    (h - 2.0 * MARGIN - HEADER - band - CARD_TOP - 14.0) / CARD_ROW
+}
+
+/// The narrowest room, in mm, the device, description and connection columns of a drawn PLC
+/// card need beside the card box and its terminal leads.
+const CARD_MIN_ROOM: f64 = 100.0;
+
+/// Where a drawn PLC card's point columns start and end on a sheet `w` mm wide: past the card
+/// box and the lead to its terminal, up to the right margin.
+fn card_point_columns(w: f64) -> (f64, f64) {
+    let x0 = MARGIN + 6.0;
+    (x0 + 58.0 + 18.0, w - MARGIN - 6.0)
+}
+
+/// Where the device, description, connection and page fields of a drawn PLC card start on a
+/// sheet `w` mm wide; the page field is right-aligned at its position.
+pub fn card_field_x(w: f64) -> [f64; 4] {
+    let (lead, x1) = card_point_columns(w);
+    let room = x1 - lead;
+    [lead + 2.0, lead + room * 0.2, lead + room * 0.55, x1 - 2.0]
+}
+
+/// The sheet size for drawn PLC cards: `wanted` (the first schematic page's) when it has room
+/// for the heading and a card row above the title block and is wide enough for the point
+/// columns, else the smallest named size that is.
+pub fn card_size(wanted: PageSize, band: f64) -> PageSize {
+    std::iter::once(wanted)
+        .chain(PageSize::NAMED)
+        .find(|s| {
+            let (lead, x1) = card_point_columns(s.mm().0);
+            card_rows(*s, band) >= 1.0 && x1 - lead >= CARD_MIN_ROOM
+        })
+        .unwrap_or(PageSize::A3)
+}
+
+/// The rows of a drawn PLC card: each channel with the point drawn there (`None` for a spare),
+/// a channel with several points on one row each.
+pub fn card_rows_of(card: &wc_report::PlcCardSheet) -> Vec<(&wc_report::CardChannel, Option<&wc_report::CardPoint>)> {
+    card.channels
+        .iter()
+        .flat_map(|ch| {
+            let points: Vec<Option<&wc_report::CardPoint>> = if ch.points.is_empty() {
+                vec![None]
+            } else {
+                ch.points.iter().map(Some).collect()
+            };
+            points.into_iter().map(move |p| (ch, p))
+        })
+        .collect()
+}
+
+/// A drawn PLC card overview sheet (#437): the card as a box with a terminal per channel, its
+/// channel number and address inside, and the device, description, connection and page of the
+/// point drawn there beside it. Rows `first..` that fit, part `part.0` of `part.1`; a row with a
+/// drawn point links to its page.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_card_page(
+    project: &Project,
+    page: &Page,
+    index: usize,
+    total: usize,
+    card: &wc_report::PlcCardSheet,
+    first: usize,
+    part: (usize, usize),
+    date: &str,
+) -> Drawn {
+    let (w, h) = page.size.mm();
+    let mut pen = Pen::new(h);
+    pen.ops.push_str("1 J 1 j\n");
+    pen.colour(0.0, 0.0, 0.0);
+    frame(&mut pen, project, page, index, total, date);
+    let (x0, x1) = (MARGIN + 6.0, w - MARGIN - 6.0);
+    let top = MARGIN + HEADER + 10.0;
+    let mut heading = format!("PLC card {}", card.card);
+    if part.1 > 1 {
+        heading.push_str(&format!(" ({} / {})", part.0, part.1));
+    }
+    pen.text((x0, top), 4.0, 0, &heading);
+    let mut about = vec![];
+    if !card.rack.is_empty() {
+        about.push(format!("Rack {}", card.rack));
+    }
+    about.push(format!("slot {}", card.slot));
+    if !card.kind.is_empty() && card.kind != card.card {
+        about.push(card.kind.clone());
+    }
+    about.push(format!("{} channels", card.channels.len()));
+    pen.colour(0.35, 0.35, 0.35);
+    pen.text((x0, top + 6.0), CARD_TEXT, 0, &about.join(", "));
+    pen.colour(0.0, 0.0, 0.0);
+    let rows = card_rows_of(card);
+    let per = card_rows_per_page(page.size, project.meta.template.band_height());
+    let shown: Vec<_> = rows.iter().skip(first).take(per).collect();
+    // Column positions: the card box, the wire to the terminal, then the point's fields.
+    let (bx0, bx1) = (x0 + 8.0, x0 + 58.0);
+    let (lead, _) = card_point_columns(w);
+    let [dev_x, desc_x, conn_x, page_x] = card_field_x(w);
+    let y0 = top + CARD_TOP - CARD_ROW;
+    // Column heads.
+    pen.colour(0.35, 0.35, 0.35);
+    for (x, align, text) in [
+        (bx0 + 2.0, 0, "Channel"),
+        (bx1 - 4.0, 2, "Address"),
+        (dev_x, 0, "Device"),
+        (desc_x, 0, "Description"),
+        (conn_x, 0, "Connected to"),
+        (page_x, 2, "Page"),
+    ] {
+        pen.text((x, y0 - 2.0), TABLE_TEXT, align, text);
+    }
+    pen.colour(0.0, 0.0, 0.0);
+    let mut links = Vec::new();
+    let mut last_channel = None;
+    for (k, (ch, point)) in shown.iter().enumerate() {
+        let y = y0 + CARD_ROW * k as f64;
+        let mid = y + CARD_ROW / 2.0;
+        let base = mid + CARD_TEXT / 2.0 - 0.3;
+        // A channel with several points shows its number and terminal once.
+        if last_channel != Some(ch.channel) {
+            pen.text((bx0 + 2.0, base), CARD_TEXT, 0, &ch.channel.to_string());
+            pen.text((bx1 - 4.0, base), CARD_TEXT, 2, &ch.address);
+            pen.width(0.25);
+            pen.circle((bx1, mid), 1.2, false);
+            if k > 0 {
+                pen.colour(0.75, 0.75, 0.75);
+                pen.width(0.12);
+                pen.line((bx0, y), (bx1, y));
+                pen.colour(0.0, 0.0, 0.0);
+            }
+        }
+        last_channel = Some(ch.channel);
+        let Some(point) = point else {
+            pen.colour(0.55, 0.55, 0.55);
+            pen.text((dev_x, base), CARD_TEXT, 0, "spare");
+            pen.colour(0.0, 0.0, 0.0);
+            continue;
+        };
+        pen.width(0.25);
+        pen.line((bx1 + 1.2, mid), (lead, mid));
+        // Cut to fit at the height they are drawn at, so none runs into the next column.
+        pen.text(
+            (dev_x, base),
+            CARD_TEXT,
+            0,
+            &fit_at(&point.device, desc_x - dev_x - 2.0, CARD_TEXT),
+        );
+        pen.text(
+            (desc_x, base),
+            CARD_TEXT,
+            0,
+            &fit_at(&point.description, conn_x - desc_x - 2.0, CARD_TEXT),
+        );
+        pen.text(
+            (conn_x, base),
+            CARD_TEXT,
+            0,
+            &fit_at(&point.connected, page_x - CARD_PAGE - 2.0 - conn_x, CARD_TEXT),
+        );
+        pen.text(
+            (page_x, base),
+            CARD_TEXT,
+            2,
+            &fit_at(&point.page_number, CARD_PAGE, CARD_TEXT),
+        );
+        if !point.page_id.is_empty() {
+            links.push(Link {
+                min: (lead, y),
+                max: (x1, y + CARD_ROW),
+                target_page_id: point.page_id.clone(),
+            });
+        }
+    }
+    // The card itself: a box around its channel rows on this sheet.
+    let y1 = y0 + CARD_ROW * shown.len().max(1) as f64;
+    pen.width(0.5);
+    pen.rect((bx0, y0), (bx1, y1));
+    if card.channels.is_empty() {
+        pen.colour(0.45, 0.45, 0.45);
+        pen.text((dev_x, y0 + CARD_ROW - 1.4), CARD_TEXT, 0, "No channels.");
+    }
+    Drawn {
+        ops: pen.ops,
+        links,
+        prims: pen.prims,
+        layers: pen.layers,
+        underlay: None,
+        pictures: Vec::new(),
+    }
+}
+
 /// One panel layout page: frame and title block, the mounting plate scaled to fit the drawing
 /// area with its ducts (hatched grey), DIN rails and device footprints labelled with their
 /// tags, and the scale and plate size under it.
@@ -1013,6 +1481,7 @@ pub fn draw_panel_page(
     index: usize,
     total: usize,
     panel: &wc_core::panel::Panel,
+    footprints: &BTreeMap<String, wc_core::Footprint>,
     date: &str,
 ) -> Drawn {
     use wc_core::panel::PanelItem;
@@ -1060,12 +1529,40 @@ pub fn draw_panel_page(
     pen.colour(0.0, 0.0, 0.0);
     pen.width(0.35);
     for item in &panel.items {
-        if let PanelItem::Device { tag, at, width, height } = item {
-            let (width, height) = (*width, *height);
+        if let PanelItem::Device {
+            tag,
+            at,
+            width: upright_w,
+            height: upright_h,
+            rotation,
+        } = item
+        {
+            // The box on the plate is the turned outline; a footprint drawing is fitted into the
+            // upright part and turned with it.
+            let (width, height) = wc_core::panel::turned_size(*upright_w, *upright_h, *rotation);
             pen.colour(1.0, 1.0, 1.0);
             pen.fill_rect(p(at.x, at.y), p(at.x + width, at.y + height));
-            pen.colour(0.0, 0.0, 0.0);
-            pen.rect(p(at.x, at.y), p(at.x + width, at.y + height));
+            let footprint = project
+                .devices
+                .get(tag)
+                .and_then(|d| d.part.as_ref())
+                .and_then(|id| footprints.get(id));
+            if let Some(f) = footprint {
+                // The maker's outline at its real size (shrunk to the box if the box is
+                // smaller), with the box itself as a faint frame.
+                pen.colour(0.7, 0.7, 0.7);
+                pen.width(0.1);
+                pen.rect(p(at.x, at.y), p(at.x + width, at.y + height));
+                pen.colour(0.0, 0.0, 0.0);
+                pen.width(0.18);
+                for s in f.placed_turned(*at, *upright_w, *upright_h, *rotation) {
+                    draw_shape(&mut pen, &s.scaled(k).translate(Point::new(ox, oy)));
+                }
+                pen.width(0.35);
+            } else {
+                pen.colour(0.0, 0.0, 0.0);
+                pen.rect(p(at.x, at.y), p(at.x + width, at.y + height));
+            }
             // The product aspect is what fits on a narrow device; the full tag is in the list.
             let label = tag.product.join(".");
             let label = format!("-{label}");
@@ -1352,7 +1849,16 @@ mod template_tests {
     #[test]
     #[allow(clippy::unwrap_used)]
     fn the_default_template_draws_the_title_block_as_before() {
-        for size in [PageSize::A4, PageSize::A3, PageSize::A2] {
+        // Every sheet wide enough for the layout draws it as before; the narrow ones are below.
+        let custom = PageSize::Custom {
+            width: 500,
+            height: 700,
+        };
+        let wide = PageSize::NAMED
+            .into_iter()
+            .chain([custom])
+            .filter(|s| s.mm().0 - 2.0 * MARGIN >= Project::new("").meta.template.needed_width());
+        for size in wide {
             for logo in [false, true] {
                 let (p, page) = demo(size, logo);
                 for date in ["", "2026-11-17"] {
@@ -1619,6 +2125,7 @@ mod template_tests {
         use wc_core::geom::Point;
         use wc_core::symbol::{Pin, PinDir, SymbolRole};
         let coil = Symbol {
+            source: String::new(),
             id: "coil".into(),
             name: "coil".into(),
             category: String::new(),

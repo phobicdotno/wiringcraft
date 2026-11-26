@@ -6,6 +6,7 @@ mod actions;
 mod agent;
 mod agent_panel;
 mod applog;
+mod black_box_tool;
 mod canvas;
 mod chrome;
 mod edit;
@@ -13,15 +14,23 @@ mod feedback;
 mod find_window;
 mod icons;
 mod import_symbols;
+mod layers;
+mod live_check;
+mod macro_form;
 mod panel_view;
 mod panels;
 mod prefs;
+mod racks_form;
+mod report_layout_form;
+mod rules_form;
 mod screenshot;
 mod share;
 mod state;
+mod strip_editor;
 mod symbol_editor;
 mod template_form;
 mod theme;
+mod translations_form;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,6 +53,9 @@ enum Dialog {
         /// The folder the project folder goes in.
         location: prefs::FolderField,
         name: String,
+        /// A base project to start from: a project folder or a git repository URL. Empty for
+        /// a blank project.
+        base: String,
         /// Why the last Browse could not be used.
         error: Option<String>,
     },
@@ -55,6 +67,10 @@ enum Dialog {
         /// The locations as the dialog opened with them: when they are unchanged, OK leaves the
         /// project's own (an assistant command may have changed them meanwhile).
         loaded_locations: Vec<(String, String)>,
+        /// The project's revisions, edited in place; left alone on OK while unchanged, as
+        /// the locations are.
+        revisions: Vec<state::RevisionRow>,
+        loaded_revisions: Vec<state::RevisionRow>,
     },
     /// The cover page form: changes show on the page as they are typed; `since` is the undo
     /// mark from when it opened, so OK keeps them as one undo step and Cancel takes them back.
@@ -76,6 +92,16 @@ enum Dialog {
         /// The project's history count the draft last matched (see `Cover`).
         seen: u64,
     },
+    /// The PLC racks and their cards, shown in the project as they are typed (see `Template`).
+    Racks {
+        draft: Vec<wc_core::plc_rack::PlcRack>,
+        since: usize,
+        before: Vec<wc_core::plc_rack::PlcRack>,
+        seen: u64,
+        /// The overview's warnings and the project revision they were made for, so they are
+        /// worked out again only after a change.
+        warnings: Option<(u64, Vec<String>)>,
+    },
     PageProps {
         /// The page the dialog edits, by id: in a shared session someone else can remove an
         /// earlier page while it is open, which moves every later page's index.
@@ -93,14 +119,53 @@ enum Dialog {
         error: Option<String>,
     },
     DeletePage(usize),
+    /// The project's texts with their translations, saved to `translations.toml`.
+    Translations(translations_form::Form),
+    /// The language to export the PDF in: an index into `langs` (the dictionary's languages,
+    /// the source first), and a second one shown with it (`second - 1`; 0 for none).
+    PdfLanguage {
+        langs: Vec<String>,
+        first: usize,
+        second: usize,
+    },
     /// Project check findings.
     Check(Vec<wc_report::Finding>),
+    /// The project's check rules, edited as rows; `loaded` is how the project had them when
+    /// the dialog opened.
+    Rules {
+        rows: Vec<rules_form::RuleRow>,
+        loaded: Vec<wc_core::check_rule::CheckRule>,
+        /// The folder of the project the rules are of: another project opened meanwhile
+        /// does not get them.
+        dir: PathBuf,
+    },
     /// Reports (parts, devices, wires, nets, terminals, cables, PLC I/O, contents, locations) as tables.
     Reports(wc_report::Kind),
+    /// One report's layout, edited next to a preview of the report in it.
+    ReportLayout {
+        form: Box<report_layout_form::Form>,
+        /// The folder of the project the layout is of: another project opened meanwhile
+        /// does not get it.
+        dir: PathBuf,
+    },
     /// Write a new text at this point on the current page.
     Text(wc_core::geom::Point, String, bool),
     /// Pin a review comment at this point on the current page.
     Comment(wc_core::geom::Point, String, bool),
+    /// Name a connection point of the black box being drawn, at this edge and offset.
+    BoxPin {
+        side: wc_core::BoxSide,
+        offset: f64,
+        name: String,
+        focused: bool,
+        error: Option<String>,
+    },
+    /// Tag the black box being drawn and put it on the page.
+    BoxTag {
+        tag: String,
+        focused: bool,
+        error: Option<String>,
+    },
     /// The recorded versions of one page, newest first.
     PageHistory(String, Vec<wc_vcs::PageVersion>),
     Commit(String),
@@ -108,6 +173,8 @@ enum Dialog {
     History(Vec<wc_vcs::subway::Row>),
     Library(Vec<wc_library::ItemStatus>),
     Message(String),
+    /// A base project being fetched from this git URL for a new project ([`App::fetch`]).
+    Fetching(String),
     /// Help, Report a problem: the masked log to look at before anything is sent.
     Report {
         log: String,
@@ -122,6 +189,11 @@ enum Dialog {
     },
     /// Macros to insert.
     Macros(Vec<state::MacroEntry>),
+    /// A project macro's placeholders and value sets (Insert macro, Placeholders…).
+    MacroEdit {
+        form: Box<macro_form::Form>,
+        error: Option<String>,
+    },
     /// Library, Import symbols: the library folders to import into and the one chosen.
     ImportSymbols {
         targets: Vec<import_symbols::ImportTarget>,
@@ -173,6 +245,38 @@ struct App {
     symbol_editor: Option<symbol_editor::SymbolEditor>,
     /// The find and replace window, while it is open.
     find: Option<find_window::FindState>,
+    /// The terminal strip editor, while open.
+    strip_editor: Option<strip_editor::StripEditor>,
+    /// The layer list window is open.
+    show_layers: bool,
+    /// The project check that runs after each edit (Check while drawing).
+    live: live_check::LiveCheck,
+    /// A base project being fetched from a git URL for a new project, off the window thread.
+    fetch: Option<BaseFetch>,
+}
+
+/// Make a new project's folder a repository with its first version.
+fn record_new_project(dir: &std::path::Path) -> Result<(), wc_vcs::Error> {
+    let git = wc_vcs::Git::new(dir);
+    git.init()?;
+    git.commit("New project").map(|_| ())
+}
+
+/// A new project's base project being fetched from a git repository on a thread of its own
+/// ([`App::start_new_project`]), so a slow server does not hold the window up.
+struct BaseFetch {
+    /// Where the new project goes.
+    dir: PathBuf,
+    /// The repository it comes from, shown while it is fetched.
+    source: String,
+    /// The project that was open when the fetch started: the new one replaces only that one.
+    was_open: Option<PathBuf>,
+    /// The project is made and waits to be opened: Cancel no longer applies.
+    made: bool,
+    /// Set to stop the fetch: nothing is made then.
+    cancel: std::sync::Arc<AtomicBool>,
+    /// The outcome: made, why not, or `None` when it was cancelled.
+    done: std::sync::mpsc::Receiver<Result<(), Option<String>>>,
 }
 
 struct StatusView<'a> {
@@ -184,6 +288,8 @@ struct StatusView<'a> {
     /// Undo and Redo in a shared session: whether this person has something to take back.
     share_undo: bool,
     share_redo: bool,
+    /// The layer list window is open.
+    show_layers: bool,
 }
 
 impl chrome::Status for StatusView<'_> {
@@ -196,8 +302,17 @@ impl chrome::Status for StatusView<'_> {
             Action::CommentTool => self.ed.tool == Tool::Comment,
             Action::LineTool => self.ed.tool == Tool::Line,
             Action::RectTool => self.ed.tool == Tool::Rect,
+            Action::CircleTool => self.ed.tool == Tool::Circle,
+            Action::ArcTool => self.ed.tool == Tool::Arc,
+            Action::PolylineTool => self.ed.tool == Tool::Polyline,
+            Action::DimensionTool => self.ed.tool == Tool::Dimension,
+            Action::CloudTool => self.ed.tool == Tool::Cloud,
+            Action::RevisionTableTool => self.ed.tool == Tool::RevisionTable,
+            Action::BlackBoxTool => self.ed.tool == Tool::BlackBox,
             Action::ToggleGrid => self.prefs.show_grid,
+            Action::Layers => self.show_layers,
             Action::ToggleAutoWire => self.prefs.auto_wire,
+            Action::LiveCheck => self.prefs.live_check,
             Action::ToggleChrome => self.prefs.chrome == Chrome::Ribbon,
             Action::ToggleTheme => self.prefs.theme == theme::Mode::Dark,
             Action::Assistant => self.prefs.show_assistant,
@@ -216,7 +331,9 @@ impl chrome::Status for StatusView<'_> {
             | Action::ToggleChrome
             | Action::ToggleTheme
             | Action::ToggleGrid
+            | Action::Layers
             | Action::ToggleAutoWire
+            | Action::LiveCheck
             | Action::Assistant
             | Action::ReportProblem
             | Action::RequestFunction
@@ -235,6 +352,8 @@ impl chrome::Status for StatusView<'_> {
             Action::Redo => self.open.is_some_and(Open::can_redo),
             Action::Delete if self.ed.panel.is_some() => has && self.ed.panel_pick.is_some(),
             Action::Delete | Action::Copy | Action::Cut | Action::SaveMacro => has && !self.ed.selection.is_empty(),
+            Action::Rotate if self.ed.panel.is_some() => has && self.ed.panel_pick.is_some(),
+            Action::Mirror if self.ed.panel.is_some() => false,
             Action::Rotate | Action::Mirror => {
                 has && self.ed.selection.iter().any(|s| matches!(s, Selection::Symbol(_)))
             }
@@ -259,7 +378,10 @@ impl App {
         // While an assistant command runs, its files are its own: nothing is sent, and a joined
         // copy waits, so the dirty project is not saved over the command's changes.
         let busy = ctx.input(|i| i.pointer.any_down())
-            || matches!(self.dialog, Some(Dialog::Cover { .. } | Dialog::Template { .. }))
+            || matches!(
+                self.dialog,
+                Some(Dialog::Cover { .. } | Dialog::Template { .. } | Dialog::Racks { .. })
+            )
             || self.assistant.command_running();
         self.share.set_command_running(self.assistant.command_running());
         self.sync_session_now(busy);
@@ -277,7 +399,29 @@ impl App {
             Some(_) => None,
             None => o.project.pages.get(self.ed.page).map(|p| p.id.clone()),
         });
-        let mut shown = page.clone();
+        // The page under the canvas, also under an open panel: it is found again after the
+        // sync, and so is what was selected on it.
+        let mut shown = self
+            .open
+            .as_ref()
+            .and_then(|o| o.project.pages.get(self.ed.page))
+            .map(|p| p.id.clone());
+        // The panel shown and its picked device, found again by id and tag after the sync: a
+        // merge replaces whole panels, so their places in the lists can change.
+        let panel_before = self.open.as_ref().and_then(|o| {
+            let p = o.project.panels.get(self.ed.panel?)?;
+            let tag = self.ed.panel_pick.and_then(|i| match p.items.get(i)? {
+                wc_core::panel::PanelItem::Device { tag, .. } => Some(tag.clone()),
+                _ => None,
+            });
+            Some((p.id.clone(), tag))
+        });
+        // The shown page's graphics, so a selection follows its items when a merge moves them.
+        let graphics_before = self
+            .open
+            .as_ref()
+            .and_then(|o| o.project.pages.get(self.ed.page))
+            .map(|p| (p.id.clone(), p.graphics.clone(), p.clouds.clone()));
         if let Some(joined) = self.share.frame(self.open.as_mut(), page, busy) {
             // The joined copy replaces the open project: keep its unsaved work first.
             if let Some(o) = self.open.as_mut()
@@ -298,6 +442,8 @@ impl App {
             self.open = Some(joined);
             // The id belonged to the project left behind.
             shown = None;
+        } else if let (Some((id, tag)), Some(o)) = (&panel_before, &self.open) {
+            follow_panel_pick(&mut self.ed, &o.project, id, tag.as_ref());
         }
         // Others may have added or removed pages before this one: keep showing the same page.
         if let (Some(id), Some(o)) = (&shown, &self.open)
@@ -310,6 +456,64 @@ impl App {
             && self.ed.page >= o.project.pages.len()
         {
             self.ed.page = o.project.pages.len().saturating_sub(1);
+        }
+        let waiting = self.share.unanswered_edits() > 0;
+        // A refused change of the page ends the wait: what comes back there is not the paste
+        // (the host may have added an equal drawing in the meantime).
+        let refused = self.share.take_refused_pages();
+        if self
+            .ed
+            .waiting_graphics
+            .as_ref()
+            .is_some_and(|w| refused.contains(&w.page))
+        {
+            self.ed.waiting_graphics = None;
+        }
+        // A selection made since the last sync is the user's, and ends the wait (looked at
+        // before this sync moves selected drawings to where they are now).
+        if self
+            .ed
+            .waiting_graphics
+            .as_ref()
+            .is_some_and(|w| w.selection != self.ed.selection)
+        {
+            self.ed.waiting_graphics = None;
+        }
+        if let Some((id, old, old_clouds)) = &graphics_before {
+            match self.open.as_ref().and_then(|o| o.project.pages.get(self.ed.page)) {
+                Some(p) if &p.id == id => {
+                    edit::remap_clouds(&mut self.ed.selection, old_clouds, &p.clouds);
+                    let before = self.ed.selection.clone();
+                    edit::remap_graphics(&mut self.ed.selection, old, &p.graphics);
+                    // A change of this person's that the host has not answered can show the
+                    // page without what it added (a whole page waits for the host): what was
+                    // selected of it is selected again once it is back.
+                    let lost = edit::lost_graphics(&before, old, &p.graphics);
+                    if waiting && !lost.is_empty() {
+                        let w = self.ed.waiting_graphics.get_or_insert_with(|| edit::WaitingGraphics {
+                            page: id.clone(),
+                            items: Vec::new(),
+                            selection: Vec::new(),
+                        });
+                        if &w.page == id {
+                            w.items.extend(lost);
+                        }
+                    }
+                }
+                // The page was removed: what was selected on it is not on the page shown now.
+                _ => self.ed.selection.clear(),
+            }
+        }
+        if let Some(mut w) = self.ed.waiting_graphics.take()
+            && let Some(p) = self.open.as_ref().and_then(|o| o.project.pages.get(self.ed.page))
+            && p.id == w.page
+        {
+            edit::restore_graphics(&mut w.items, &mut self.ed.selection, &p.graphics);
+            // Still away with every change answered: the host refused it.
+            if !w.items.is_empty() && waiting {
+                w.selection = self.ed.selection.clone();
+                self.ed.waiting_graphics = Some(w);
+            }
         }
         self.ed.held_by = self.share.held_by_others();
         if let Some(o) = self.open.as_mut() {
@@ -341,6 +545,10 @@ impl App {
             share: Default::default(),
             symbol_editor: None,
             find: None,
+            show_layers: false,
+            strip_editor: None,
+            live: Default::default(),
+            fetch: None,
         };
         let dir = dir.or_else(|| prefs.recent.first().cloned());
         if let Some(d) = dir {
@@ -410,6 +618,13 @@ impl App {
                 }
                 return;
             }
+            Action::TerminalStrips => {
+                if let Some(o) = self.open.as_ref() {
+                    self.strip_editor
+                        .get_or_insert_with(|| strip_editor::StripEditor::for_project(o));
+                }
+                return;
+            }
             Action::JoinSession => {
                 self.share.show_join();
                 return;
@@ -439,6 +654,7 @@ impl App {
                 self.dialog = Some(Dialog::NewProject {
                     location: field,
                     name: String::new(),
+                    base: String::new(),
                     error,
                 });
             }
@@ -460,6 +676,7 @@ impl App {
                 self.prefs.show_grid = !self.prefs.show_grid;
                 self.prefs.save();
             }
+            Action::Layers => self.show_layers = !self.show_layers,
             Action::ToggleAutoWire => {
                 self.prefs.auto_wire = !self.prefs.auto_wire;
                 self.prefs.save();
@@ -469,6 +686,15 @@ impl App {
                     "Auto-wiring is off.".into()
                 };
             }
+            Action::LiveCheck => {
+                self.prefs.live_check = !self.prefs.live_check;
+                self.prefs.save();
+                self.ed.message = if self.prefs.live_check {
+                    "Checking while drawing: problems are marked on the canvas shortly after each edit.".into()
+                } else {
+                    "Checking while drawing is off; Check (Ctrl+E) still checks the whole project.".into()
+                };
+            }
             Action::Assistant => {
                 self.prefs.show_assistant = !self.prefs.show_assistant;
                 self.prefs.save();
@@ -476,24 +702,56 @@ impl App {
             Action::Select => {
                 self.ed.tool = Tool::Select;
                 self.ed.wire = None;
+                self.ed.shape_points.clear();
             }
             Action::PlaceSymbol => {
                 self.ed.tool = Tool::Place;
                 self.ed.wire = None;
+                self.ed.shape_points.clear();
             }
-            Action::DrawWire => self.ed.tool = Tool::Wire,
-            Action::TextTool | Action::LineTool | Action::RectTool | Action::CommentTool => {
+            Action::DrawWire => {
+                self.ed.tool = Tool::Wire;
+                self.ed.shape_points.clear();
+            }
+            Action::BlackBoxTool => {
+                self.ed.tool = Tool::BlackBox;
+                self.ed.wire = None;
+                self.ed.shape_points.clear();
+                self.ed.black_box = None;
+                self.ed.message = black_box_tool::hint(None).into();
+            }
+            Action::TextTool
+            | Action::LineTool
+            | Action::RectTool
+            | Action::CircleTool
+            | Action::ArcTool
+            | Action::PolylineTool
+            | Action::DimensionTool
+            | Action::CloudTool
+            | Action::RevisionTableTool
+            | Action::CommentTool => {
                 self.ed.tool = match a {
                     Action::TextTool => Tool::Text,
                     Action::CommentTool => Tool::Comment,
                     Action::LineTool => Tool::Line,
+                    Action::CircleTool => Tool::Circle,
+                    Action::ArcTool => Tool::Arc,
+                    Action::PolylineTool => Tool::Polyline,
+                    Action::DimensionTool => Tool::Dimension,
+                    Action::CloudTool => Tool::Cloud,
+                    Action::RevisionTableTool => Tool::RevisionTable,
                     _ => Tool::Rect,
                 };
                 self.ed.wire = None;
-                self.ed.shape_start = None;
+                self.ed.shape_points.clear();
                 self.ed.message = match a {
                     Action::TextTool => "Click where the text goes.",
                     Action::CommentTool => "Click where the comment goes.",
+                    Action::CircleTool => "Click the centre of the circle.",
+                    Action::ArcTool => "Click the centre of the arc.",
+                    Action::DimensionTool => "Click the first point to measure from.",
+                    Action::CloudTool => "Click one corner of the area the cloud goes around.",
+                    Action::RevisionTableTool => "Click where the revision table's top-left corner goes.",
                     _ => "Click the first point.",
                 }
                 .into();
@@ -612,11 +870,18 @@ impl App {
                 let sel = std::mem::take(&mut self.ed.selection);
                 open.delete_many(page, &sel);
             }
+            Action::Rotate if self.ed.panel.is_some() => {
+                if let (Some(pi), Some(item)) = (self.ed.panel, self.ed.panel_pick)
+                    && !open.rotate_panel_device(pi, item)
+                {
+                    self.ed.message = "Turned, the device would not fit on the plate.".into();
+                }
+            }
             Action::Rotate => open.rotate_many(page, &self.ed.selection),
             Action::Mirror => open.mirror_many(page, &self.ed.selection),
             Action::SelectAll => {
                 self.ed.tool = Tool::Select;
-                self.ed.selection = open.select_all(page);
+                self.ed.selection = self.prefs.layers.keep(open.select_all(page));
             }
             Action::Copy | Action::Cut => {
                 let clip = open.copy(page, &self.ed.selection);
@@ -625,8 +890,13 @@ impl App {
                     self.copied_text = Some(clip.summary());
                     self.clipboard = clip;
                     if a == Action::Cut {
-                        let sel = std::mem::take(&mut self.ed.selection);
+                        // Revision clouds and the revision table are not copied: they stay,
+                        // selected, rather than go without a way back by Paste.
+                        let (kept, sel): (Vec<_>, Vec<_>) = std::mem::take(&mut self.ed.selection)
+                            .into_iter()
+                            .partition(|s| matches!(s, Selection::Cloud(_) | Selection::RevisionTable));
                         open.delete_many(page, &sel);
+                        self.ed.selection = kept;
                         self.ed.message = format!("Cut {n} items.");
                     } else {
                         self.ed.message = format!("Copied {n} items.");
@@ -639,10 +909,13 @@ impl App {
                     .ed
                     .cursor
                     .unwrap_or(self.clipboard.anchor + wc_core::geom::Point::new(10.0, 10.0));
-                let pasted = open.paste(page, &self.clipboard, at);
-                if !pasted.is_empty() {
-                    self.ed.tool = Tool::Select;
-                    self.ed.selection = pasted;
+                match open.paste(page, &self.clipboard, at) {
+                    Ok(pasted) if !pasted.is_empty() => {
+                        self.ed.tool = Tool::Select;
+                        self.ed.selection = pasted;
+                    }
+                    Ok(_) => {}
+                    Err(e) => self.ed.message = format!("Nothing was pasted: {e}"),
                 }
             }
             Action::AddPage => {
@@ -690,6 +963,8 @@ impl App {
                     fields: form_fields(&open.project.meta.title_block),
                     loaded_locations: locations.clone(),
                     locations,
+                    revisions: state::RevisionRow::of(&open.project.meta.revisions),
+                    loaded_revisions: state::RevisionRow::of(&open.project.meta.revisions),
                 });
             }
             Action::CoverPage => {
@@ -727,7 +1002,35 @@ impl App {
                     seen: open.history_count(),
                 });
             }
-            Action::ExportPdf => self.dialog = Some(Dialog::Message(export_pdf(open))),
+            Action::PlcRacks => {
+                let racks = open.project.meta.racks.clone();
+                self.dialog = Some(Dialog::Racks {
+                    draft: racks.clone(),
+                    since: open.start_live_form(),
+                    before: racks,
+                    seen: open.history_count(),
+                    warnings: None,
+                });
+            }
+            Action::ExportPdf => {
+                // A project with translations is asked which language to print; one without is
+                // exported at once, in the language it is drawn in.
+                self.dialog = Some(match wc_core::translate::Dictionary::load(&open.dir) {
+                    Ok(d) if d.languages().len() > 1 => Dialog::PdfLanguage {
+                        langs: d.languages(),
+                        first: 0,
+                        second: 0,
+                    },
+                    Ok(_) => Dialog::Message(export_pdf(open)),
+                    Err(e) => Dialog::Message(format!("Export failed: {e}")),
+                });
+            }
+            Action::Translations => {
+                self.dialog = Some(match translations_form::Form::open(&open.dir, &open.project) {
+                    Ok(f) => Dialog::Translations(f),
+                    Err(e) => Dialog::Message(format!("The translations could not be read:\n{e}")),
+                });
+            }
             Action::SaveMacro => {
                 let clip = open.copy(page, &self.ed.selection);
                 if !clip.is_empty() {
@@ -915,9 +1218,19 @@ impl App {
                     out.push(a);
                 }
             }
+            if i.key_pressed(Key::Enter)
+                && i.modifiers.is_none()
+                && matches!(self.ed.tool, Tool::Polyline | Tool::BlackBox)
+            {
+                self.ed.finish_shape = true;
+            }
             if i.key_pressed(Key::Escape) {
-                if self.ed.shape_start.is_some() {
-                    self.ed.shape_start = None;
+                if self.ed.tool == Tool::BlackBox && self.ed.black_box.is_some() {
+                    self.ed.black_box = None;
+                    self.ed.message = black_box_tool::hint(None).into();
+                } else if !self.ed.shape_points.is_empty() {
+                    self.ed.shape_points.clear();
+                    self.ed.message = canvas::shape_hint(self.ed.tool, 0).into();
                 } else if self.ed.wire.is_some() {
                     self.ed.wire = None;
                 } else {
@@ -938,25 +1251,37 @@ impl App {
             Dialog::ProjectProps { .. } => "Project properties",
             Dialog::Cover { .. } => "Cover page",
             Dialog::Template { .. } => "Page template",
+            Dialog::Racks { .. } => "PLC racks",
             Dialog::PageProps { .. } => "Page properties",
             Dialog::DeletePage(_) => "Delete page",
             Dialog::Text(..) => "Text",
             Dialog::Comment(..) => "Comment",
+            Dialog::BoxPin { .. } => "Connection point",
+            Dialog::BoxTag { .. } => "Black box",
             Dialog::PageHistory(..) => "Page history",
             Dialog::Reports(_) => "Reports",
+            Dialog::ReportLayout { .. } => "Report layout",
             Dialog::Check(_) => "Project check",
+            Dialog::Translations(_) => "Translations",
+            Dialog::PdfLanguage { .. } => "Export PDF",
+            Dialog::Rules { .. } => "Check rules",
             Dialog::Commit(_) => "Record a version",
             Dialog::NewBranch(_) => "New branch",
             Dialog::History(_) => "History",
             Dialog::Library(_) => "Library status",
             Dialog::Message(_) => "WiringCraft",
+            Dialog::Fetching(_) => "New project",
             Dialog::SaveMacro { .. } => "Save as macro",
             Dialog::Macros(_) => "Insert macro",
+            Dialog::MacroEdit { .. } => "Macro placeholders",
             Dialog::ImportSymbols { .. } => "Import symbols",
             Dialog::Report { .. } => "Report a problem",
             Dialog::WagoMarking { .. } => "WAGO marking",
         };
-        let wide = matches!(dialog, Dialog::Reports(_) | Dialog::Check(_));
+        let wide = matches!(
+            dialog,
+            Dialog::Reports(_) | Dialog::ReportLayout { .. } | Dialog::Check(_) | Dialog::Translations(_)
+        );
         let screen = ctx.screen_rect();
         egui::Window::new(title)
             .collapsible(false)
@@ -1034,7 +1359,7 @@ impl App {
                         );
                     }
                     egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
-                        egui::Grid::new("macros").striped(true).num_columns(3).show(ui, |ui| {
+                        egui::Grid::new("macros").striped(true).num_columns(4).show(ui, |ui| {
                             for m in list.iter() {
                                 ui.vertical(|ui| {
                                     ui.set_min_width(320.0);
@@ -1046,11 +1371,43 @@ impl App {
                                     }
                                 });
                                 ui.label(m.source.as_str());
-                                if ui.add_enabled(m.error.is_none(), egui::Button::new("Insert")).clicked() {
-                                    let path = m.path.clone();
-                                    let name = m.name.clone();
-                                    then = Some(Box::new(move |app: &mut App| app.insert_macro(&path, &name)));
-                                    keep = false;
+                                // A project macro's placeholders and variants are edited here; a
+                                // library's macros belong to the library.
+                                if m.project {
+                                    if ui
+                                        .button("Placeholders…")
+                                        .on_hover_text("Declare its placeholders and the value sets of its variants")
+                                        .clicked()
+                                    {
+                                        let path = m.path.clone();
+                                        then = Some(Box::new(move |app: &mut App| app.edit_macro(&path)));
+                                        keep = false;
+                                    }
+                                } else {
+                                    ui.label("");
+                                }
+                                if m.value_sets.is_empty() || m.error.is_some() {
+                                    if ui.add_enabled(m.error.is_none(), egui::Button::new("Insert")).clicked() {
+                                        let path = m.path.clone();
+                                        let name = m.name.clone();
+                                        then = Some(Box::new(move |app: &mut App| app.insert_macro(&path, &name, None)));
+                                        keep = false;
+                                    }
+                                } else {
+                                    // A macro with variants asks which one to insert.
+                                    ui.menu_button("Insert…", |ui| {
+                                        ui.label("Which variant?");
+                                        for set in &m.value_sets {
+                                            if ui.button(set.as_str()).clicked() {
+                                                let (path, name, set) = (m.path.clone(), m.name.clone(), set.clone());
+                                                then = Some(Box::new(move |app: &mut App| {
+                                                    app.insert_macro(&path, &name, Some(&set))
+                                                }));
+                                                keep = false;
+                                                ui.close_menu();
+                                            }
+                                        }
+                                    });
                                 }
                                 ui.end_row();
                             }
@@ -1059,6 +1416,40 @@ impl App {
                     if ui.button("Close").clicked() {
                         keep = false;
                     }
+                }
+                Dialog::MacroEdit { form, error } => {
+                    egui::ScrollArea::vertical()
+                        .id_salt("macro-edit-scroll")
+                        .max_height(ui.ctx().screen_rect().height() * 0.6)
+                        .show(ui, |ui| macro_form::show(ui, form));
+                    if let Some(e) = error {
+                        ui.colored_label(theme::Theme::of(ui.ctx()).error, e.as_str());
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            match form.save() {
+                                Ok(path) => {
+                                    then = Some(Box::new(move |app: &mut App| {
+                                        app.ed.message = format!("Saved macro {}", path.display());
+                                        if let Some(open) = &app.open {
+                                            app.dialog = Some(Dialog::Macros(open.macros()));
+                                        }
+                                    }));
+                                    keep = false;
+                                }
+                                Err(e) => *error = Some(e),
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            then = Some(Box::new(|app: &mut App| {
+                                if let Some(open) = &app.open {
+                                    app.dialog = Some(Dialog::Macros(open.macros()));
+                                }
+                            }));
+                            keep = false;
+                        }
+                    });
                 }
                 Dialog::Report { log, include } => {
                     ui.label(
@@ -1109,6 +1500,16 @@ impl App {
                             keep = false;
                         }
                     });
+                }
+                Dialog::Fetching(source) => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(format!("Fetching the base project from\n{source}…"));
+                    });
+                    if ui.button("Cancel").clicked() {
+                        then = Some(Box::new(|app: &mut App| app.cancel_fetch()));
+                        keep = false;
+                    }
                 }
                 Dialog::Message(m) => {
                     // A long message (an import listing every symbol) scrolls; OK stays in view.
@@ -1161,7 +1562,12 @@ impl App {
                         }
                     });
                 }
-                Dialog::NewProject { location, name, error } => {
+                Dialog::NewProject {
+                    location,
+                    name,
+                    base,
+                    error,
+                } => {
                     egui::Grid::new("newproj")
                         .num_columns(2)
                         .spacing([8.0, 6.0])
@@ -1185,6 +1591,25 @@ impl App {
                                 }
                             });
                             ui.end_row();
+                            ui.label("Start from");
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(base)
+                                        .hint_text("blank, or a base project folder or git URL")
+                                        .desired_width(300.0),
+                                );
+                                if ui.button("Browse…").clicked() {
+                                    match pick_folder("Base project to start from", base) {
+                                        Picked::Folder(d) => match d.to_str() {
+                                            Some(t) => *base = t.to_owned(),
+                                            None => *error = Some("That folder's name is not text.".into()),
+                                        },
+                                        Picked::Failed(e) => *error = Some(e),
+                                        Picked::Cancelled => {}
+                                    }
+                                }
+                            });
+                            ui.end_row();
                         });
                     // The folder follows the name and the location, whichever is typed last.
                     let target = location.path().and_then(|l| prefs::new_project_dir(&l, name));
@@ -1197,7 +1622,14 @@ impl App {
                         Err(e) => ui.label(RichText::new(e.as_str()).color(t.error)),
                     };
                     ui.label(
-                        RichText::new("A new folder with one cover page, recorded as a git repository.").color(t.faint),
+                        RichText::new(if base.trim().is_empty() {
+                            "A new folder with one cover page, recorded as a git repository."
+                        } else {
+                            "A new folder with the base project's pages, settings, title block and libraries \
+                             (not its comments or history), recorded as a git repository. {name} and {date} in \
+                             its title block and page titles become this project's name and today's date."
+                        })
+                        .color(t.faint),
                     );
                     ui.horizontal(|ui| {
                         if let Ok(d) = target
@@ -1206,11 +1638,101 @@ impl App {
                                 .clicked()
                         {
                             let n = name.trim().to_owned();
-                            then = Some(Box::new(move |app: &mut App| app.new_project(&d, &n)));
+                            let b = Some(base.trim().to_owned()).filter(|b| !b.is_empty());
+                            then = Some(Box::new(move |app: &mut App| app.start_new_project(&d, &n, b.as_deref())));
                             keep = false;
                         }
                         if ui.button("Cancel").clicked() {
                             keep = false;
+                        }
+                    });
+                }
+                Dialog::Translations(form) => {
+                    translations_form::show(ui, form);
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("OK").clicked() {
+                            match form.save() {
+                                Ok(m) => {
+                                    then = Some(Box::new(move |app: &mut App| app.ed.message = m));
+                                    keep = false;
+                                }
+                                Err(e) => form.error = Some(format!("Saving failed: {e}")),
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                }
+                Dialog::PdfLanguage { langs, first, second } => {
+                    egui::Grid::new("pdflang").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                        ui.label("Language");
+                        egui::ComboBox::from_id_salt("pdflang1")
+                            .selected_text(langs.get(*first).cloned().unwrap_or_default())
+                            .show_ui(ui, |ui| {
+                                for (k, l) in langs.iter().enumerate() {
+                                    ui.selectable_value(first, k, l);
+                                }
+                            });
+                        ui.end_row();
+                        ui.label("Shown with");
+                        let none = "(none)".to_owned();
+                        egui::ComboBox::from_id_salt("pdflang2")
+                            .selected_text(if *second == 0 { none.clone() } else { langs.get(*second - 1).cloned().unwrap_or(none.clone()) })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(second, 0, none);
+                                for (k, l) in langs.iter().enumerate() {
+                                    ui.selectable_value(second, k + 1, l);
+                                }
+                            });
+                        ui.end_row();
+                    });
+                    ui.label(
+                        RichText::new("Texts without a translation are printed as drawn and listed as warnings.")
+                            .color(theme::Theme::of(ui.ctx()).faint),
+                    );
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Export").clicked() {
+                            let mut chosen: Vec<String> = langs.get(*first).cloned().into_iter().collect();
+                            if let Some(l) = second.checked_sub(1).and_then(|k| langs.get(k))
+                                && !chosen.contains(l)
+                            {
+                                chosen.push(l.clone());
+                            }
+                            then = Some(Box::new(move |app: &mut App| {
+                                if let Some(open) = app.open.as_ref() {
+                                    app.dialog = Some(Dialog::Message(export_pdf_in(open, &chosen)));
+                                }
+                            }));
+                            keep = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                }
+                Dialog::Rules { rows, loaded, dir } => {
+                    rules_form::show(ui, rows);
+                    let bad = rules_form::rules_of(rows).err();
+                    if let Some(why) = &bad {
+                        ui.colored_label(theme::Theme::of(ui.ctx()).error, why);
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(bad.is_none(), egui::Button::new("OK")).clicked() {
+                            let (rows, loaded, dir) = (rows.clone(), loaded.clone(), dir.clone());
+                            then = Some(Box::new(move |app: &mut App| {
+                                if let Err(e) = app.apply_rules(&rows, &loaded, &dir) {
+                                    app.ed.message = e;
+                                }
+                            }));
+                            keep = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                            then = Some(Box::new(|app: &mut App| app.show_check()));
                         }
                     });
                 }
@@ -1219,6 +1741,8 @@ impl App {
                     fields,
                     locations,
                     loaded_locations,
+                    revisions,
+                    loaded_revisions,
                 } => {
                     egui::Grid::new("projprops")
                         .num_columns(2)
@@ -1270,7 +1794,50 @@ impl App {
                     if ui.button("Add location").clicked() {
                         locations.push((String::new(), String::new()));
                     }
-                    let bad = wc_core::project::location_rows(locations).err();
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Revisions").strong());
+                    let mut drop = None;
+                    egui::ScrollArea::vertical()
+                        .id_salt("projrevisions-scroll")
+                        .max_height(180.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            egui::Grid::new("projrevisions")
+                                .num_columns(5)
+                                .spacing([8.0, 6.0])
+                                .show(ui, |ui| {
+                                    for h in ["Rev.", "Date", "Description", "By", ""] {
+                                        ui.strong(h);
+                                    }
+                                    ui.end_row();
+                                    for (k, r) in revisions.iter_mut().enumerate() {
+                                        // A listed revision keeps its letter: its clouds carry it.
+                                        let new = r.was.trim().is_empty();
+                                        ui.add_enabled(
+                                            new,
+                                            egui::TextEdit::singleline(&mut r.letter).hint_text("A").desired_width(40.0),
+                                        );
+                                        ui.add(egui::TextEdit::singleline(&mut r.date).hint_text("2026-11-19").desired_width(90.0));
+                                        ui.add(egui::TextEdit::singleline(&mut r.text).hint_text("What changed").desired_width(200.0));
+                                        ui.add(egui::TextEdit::singleline(&mut r.author).desired_width(60.0));
+                                        if ui.button("Remove").clicked() {
+                                            drop = Some(k);
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                    if let Some(k) = drop {
+                        revisions.remove(k);
+                    }
+                    if ui.button("Add revision").clicked() {
+                        revisions.push(state::RevisionRow::default());
+                    }
+                    let rev_bad = self
+                        .open
+                        .as_ref()
+                        .and_then(|o| o.revision_draft_problem(loaded_revisions, revisions));
+                    let bad = wc_core::project::location_rows(locations).err().or(rev_bad);
                     if let Some(why) = &bad {
                         ui.colored_label(theme::Theme::of(ui.ctx()).error, why);
                     }
@@ -1283,10 +1850,16 @@ impl App {
                             let f = fields.clone();
                             // Untouched locations are left as the project has them now.
                             let l = (locations != loaded_locations).then(|| locations.clone());
+                            let r = (revisions != loaded_revisions).then(|| revisions.clone());
+                            let loaded = loaded_revisions.clone();
                             then = Some(Box::new(move |app: &mut App| {
-                                if let Some(o) = app.open.as_mut()
-                                    && let Err(e) = o.set_project_props(&n, &f, l.as_deref())
-                                {
+                                let Some(o) = app.open.as_mut() else {
+                                    return;
+                                };
+                                // Checked again: a sync may have come in since the dialog was drawn.
+                                if let Some(why) = r.as_deref().and_then(|r| o.revision_draft_problem(&loaded, r)) {
+                                    app.ed.message = why;
+                                } else if let Err(e) = o.set_project_props(&n, &f, l.as_deref(), r.as_deref()) {
                                     app.ed.message = e;
                                 }
                             }));
@@ -1419,6 +1992,63 @@ impl App {
                         }
                     });
                 }
+                Dialog::Racks {
+                    draft,
+                    since,
+                    before,
+                    seen,
+                    warnings,
+                } => {
+                    // A change made elsewhere (an undo, the assistant) is shown in the form.
+                    if let Some(o) = self.open.as_ref()
+                        && o.history_count() != *seen
+                    {
+                        draft.clone_from(&o.project.meta.racks);
+                        *seen = o.history_count();
+                    }
+                    if racks_form::show(ui, draft)
+                        && let Some(o) = self.open.as_mut()
+                    {
+                        o.set_racks_live(draft);
+                        *seen = o.history_count();
+                    }
+                    if let Some(o) = self.open.as_ref()
+                        && warnings.as_ref().is_none_or(|(rev, _)| *rev != o.revision())
+                    {
+                        *warnings = Some((o.revision(), rack_warnings(o)));
+                    }
+                    let warnings = warnings.as_ref().map(|(_, w)| w.as_slice()).unwrap_or_default();
+                    let t = theme::Theme::of(ui.ctx());
+                    // Many cards can give many warnings: they scroll, so OK and Cancel stay
+                    // on screen.
+                    let height = (ui.ctx().screen_rect().height() * 0.15).min(140.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("rack-warnings")
+                        .max_height(height)
+                        .show(ui, |ui| {
+                            for w in warnings {
+                                ui.label(RichText::new(w).color(t.warning));
+                            }
+                        });
+                    ui.label(
+                        RichText::new(
+                            "The PLC cards report shows each change at once. The racks are kept \
+                             in project.toml.",
+                        )
+                        .color(t.faint),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("OK").clicked() {
+                            keep = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            if let Some(o) = self.open.as_mut() {
+                                o.revert_racks(*since, before);
+                            }
+                            keep = false;
+                        }
+                    });
+                }
                 Dialog::PageProps {
                     id,
                     number,
@@ -1446,12 +2076,24 @@ impl App {
                             ui.end_row();
                             ui.label("Sheet size");
                             egui::ComboBox::from_id_salt("pagesize")
-                                .selected_text(size_label(*size))
+                                .selected_text(size.label())
                                 .show_ui(ui, |ui| {
-                                    for s in [PageSize::A4, PageSize::A3, PageSize::A2] {
-                                        ui.selectable_value(size, s, size_label(s));
+                                    for s in PageSize::NAMED {
+                                        ui.selectable_value(size, s, s.label());
+                                    }
+                                    if !matches!(size, PageSize::Custom { .. }) {
+                                        ui.selectable_value(size, custom_from(*size), "Custom size…");
                                     }
                                 });
+                            if let PageSize::Custom { width, height } = size {
+                                ui.end_row();
+                                ui.label("Custom size (mm)");
+                                ui.horizontal(|ui| {
+                                    let range = PageSize::MIN_MM..=PageSize::MAX_MM;
+                                    ui.add(egui::DragValue::new(width).range(range.clone()).suffix(" wide"));
+                                    ui.add(egui::DragValue::new(height).range(range).suffix(" high"));
+                                });
+                            }
                             ui.end_row();
                             ui.label("Overview");
                             ui.checkbox(overview, "Line diagram").on_hover_text(
@@ -1549,6 +2191,14 @@ impl App {
                         {
                             *found = run_check(o);
                         }
+                        if ui
+                            .button("Rules…")
+                            .on_hover_text("Add, change, reorder or delete the project's own check rules")
+                            .clicked()
+                        {
+                            keep = false;
+                            then = Some(Box::new(|app: &mut App| app.edit_rules()));
+                        }
                         if ui.button("Close").clicked() {
                             keep = false;
                         }
@@ -1604,6 +2254,25 @@ impl App {
                                     Err(e) => format!("Could not save {}: {e}", path.display()),
                                 };
                             }
+                            if ui.button("Save as Excel").clicked() {
+                                let path = o.dir.join("export").join(format!("{}.xlsx", kind.name()));
+                                let res = std::fs::create_dir_all(o.dir.join("export"))
+                                    .and_then(|()| table.to_xlsx())
+                                    .and_then(|bytes| std::fs::write(&path, bytes));
+                                self.ed.message = match res {
+                                    Ok(()) => format!("Saved {}", path.display()),
+                                    Err(e) => format!("Could not save {}: {e}", path.display()),
+                                };
+                            }
+                            if ui
+                                .button("Layout…")
+                                .on_hover_text("Pick, order and rename the columns, sort and group the rows")
+                                .clicked()
+                            {
+                                let k = *kind;
+                                then = Some(Box::new(move |app: &mut App| app.edit_report_layout(k)));
+                                keep = false;
+                            }
                             if ui.button("Close").clicked() {
                                 keep = false;
                             }
@@ -1611,6 +2280,59 @@ impl App {
                                 RichText::new(format!("{} rows", table.rows.len()))
                                     .color(theme::Theme::of(ui.ctx()).faint),
                             );
+                        });
+                    } else {
+                        keep = false;
+                    }
+                }
+                Dialog::ReportLayout { form, dir } => {
+                    if let Some(o) = self.open.as_ref() {
+                        // The form and preview scroll; OK and Cancel stay in view below them.
+                        egui::ScrollArea::vertical()
+                            .id_salt("reportlayout-scroll")
+                            .max_height(ui.ctx().screen_rect().height() * 0.6)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                report_layout_form::show(ui, form);
+                                // What the layout names that the report or the title block does
+                                // not have, in the scroll area so OK and Cancel stay in view.
+                                for p in form.problems(&o.project) {
+                                    ui.colored_label(theme::Theme::of(ui.ctx()).warning, p);
+                                }
+                                ui.separator();
+                                let inputs = wc_report::Inputs {
+                                    project: &o.project,
+                                    symbols: &o.symbols,
+                                    parts: &o.parts,
+                                };
+                                let draft = form.layout();
+                                let table = wc_report::build_with(form.kind, &inputs, draft.as_ref());
+                                ui.label(RichText::new(&table.title).strong());
+                                report_table(ui, &table);
+                            });
+                        let bad = form.problem();
+                        if let Some(why) = &bad {
+                            ui.colored_label(theme::Theme::of(ui.ctx()).error, why);
+                        }
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(bad.is_none(), egui::Button::new("OK")).clicked() {
+                                let (form, dir) = (form.as_ref().clone(), dir.clone());
+                                then = Some(Box::new(move |app: &mut App| {
+                                    if let Err(e) = app.apply_report_layout(&form, &dir) {
+                                        app.ed.message = e;
+                                    }
+                                }));
+                                keep = false;
+                            }
+                            if ui.button("Built-in layout").on_hover_text("Clear the form to the report's own columns").clicked() {
+                                **form = form.cleared();
+                            }
+                            if ui.button("Cancel").clicked() {
+                                let k = form.kind;
+                                then = Some(Box::new(move |app: &mut App| app.dialog = Some(Dialog::Reports(k))));
+                                keep = false;
+                            }
                         });
                     } else {
                         keep = false;
@@ -1630,24 +2352,7 @@ impl App {
                             || enter)
                             && !text.trim().is_empty()
                         {
-                            if let Some(o) = self.open.as_mut()
-                                && let Some(why) = o.held_reason(self.ed.page)
-                            {
-                                self.ed.message = why;
-                            } else if let Some(o) = self.open.as_mut()
-                                && let Some(sel) = o.add_graphic(
-                                    self.ed.page,
-                                    wc_core::geom::Shape::Text {
-                                        at: *at,
-                                        text: text.trim().to_owned(),
-                                        height: 3.5,
-                                        align: wc_core::geom::Align::Left,
-                                        angle: 0.0,
-                                    },
-                                )
-                            {
-                                self.ed.select_only(sel);
-                            }
+                            self.add_text(*at, text);
                             keep = false;
                         }
                         if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
@@ -1668,24 +2373,77 @@ impl App {
                         if ui
                             .add_enabled(!text.trim().is_empty(), egui::Button::new("Add comment"))
                             .clicked()
-                            && let Some(o) = self.open.as_mut()
-                            && let Some(page) = o.project.pages.get(self.ed.page).map(|p| p.id.clone())
                         {
-                            let mut next = o.project.clone();
-                            match next.add_comment(&page, Some(*at), &state::author_name(), state::now_secs(), text) {
-                                Ok(id) => {
-                                    o.checkpoint();
-                                    o.project = next;
-                                    self.ed.selection.clear();
-                                    self.ed.message = format!("Comment {id} added.");
-                                    self.ed.comment = Some(id);
-                                    self.ed.tool = Tool::Select;
-                                }
-                                Err(err) => self.ed.message = err.to_string(),
-                            }
+                            self.add_comment_at(*at, text);
                             keep = false;
                         }
                         if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                            keep = false;
+                        }
+                    });
+                }
+                Dialog::BoxPin {
+                    side,
+                    offset,
+                    name,
+                    focused,
+                    error,
+                } => {
+                    ui.label(format!("On the {} edge, {offset:.1} mm along it.", side_name(*side)));
+                    let r = ui.add(
+                        egui::TextEdit::singleline(name)
+                            .hint_text("Connection point name")
+                            .desired_width(240.0),
+                    );
+                    if !*focused {
+                        r.request_focus();
+                        *focused = true;
+                    }
+                    if let Some(e) = error.as_ref() {
+                        ui.colored_label(theme::Theme::of(ui.ctx()).error, e);
+                    }
+                    ui.horizontal(|ui| {
+                        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                        if ui.button("Add").clicked() || enter {
+                            match self.ed.black_box.as_mut() {
+                                Some(d) => match d.add_pin(*side, *offset, name) {
+                                    Ok(()) => {
+                                        self.ed.message = black_box_tool::hint(Some(d)).into();
+                                        keep = false;
+                                    }
+                                    Err(e) => *error = Some(e),
+                                },
+                                None => keep = false,
+                            }
+                        }
+                        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                            keep = false;
+                        }
+                    });
+                }
+                Dialog::BoxTag { tag, focused, error } => {
+                    let pins = self.ed.black_box.as_ref().map_or(0, |d| d.pins.len());
+                    ui.label(format!(
+                        "{pins} connection point{}. The tag can be left empty.",
+                        if pins == 1 { "" } else { "s" }
+                    ));
+                    let r = ui.add(egui::TextEdit::singleline(tag).hint_text("-A1").desired_width(240.0));
+                    if !*focused {
+                        r.request_focus();
+                        *focused = true;
+                    }
+                    if let Some(e) = error.as_ref() {
+                        ui.colored_label(theme::Theme::of(ui.ctx()).error, e);
+                    }
+                    ui.horizontal(|ui| {
+                        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                        if ui.button("Put on page").clicked() || enter {
+                            match self.add_black_box(tag) {
+                                Ok(()) => keep = false,
+                                Err(e) => *error = Some(e),
+                            }
+                        }
+                        if ui.button("Back").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
                             keep = false;
                         }
                     });
@@ -1936,7 +2694,7 @@ impl App {
                                     {
                                         open.checkpoint();
                                         open.project.meta.libraries.insert(0, source);
-                                        open.dirty = true;
+                                        open.edited();
                                     }
                                     open.refresh_library();
                                 }
@@ -2024,23 +2782,288 @@ impl App {
         }
     }
 
-    fn new_project(&mut self, dir: &std::path::Path, name: &str) {
-        let name = if name.is_empty() {
+    /// Open the check rules dialog on the project's rules.
+    fn edit_rules(&mut self) {
+        if let Some(o) = self.open.as_ref() {
+            let loaded = o.project.meta.rules.clone();
+            self.dialog = Some(Dialog::Rules {
+                rows: rules_form::rows_of(&loaded),
+                loaded,
+                dir: o.dir.clone(),
+            });
+        }
+    }
+
+    /// Open the layout dialog for report `kind` on the project's layout for it.
+    fn edit_report_layout(&mut self, kind: wc_report::Kind) {
+        if let Some(o) = self.open.as_ref() {
+            let inputs = wc_report::Inputs {
+                project: &o.project,
+                symbols: &o.symbols,
+                parts: &o.parts,
+            };
+            let builtin = wc_report::build_builtin(kind, &inputs).columns;
+            self.dialog = Some(Dialog::ReportLayout {
+                form: Box::new(report_layout_form::Form::new(
+                    kind,
+                    builtin,
+                    wc_report::layout_for(&o.project, kind),
+                )),
+                dir: o.dir.clone(),
+            });
+        }
+    }
+
+    /// Keep the layout dialog's layout (one undo step) and show the report in it. As with
+    /// [`App::apply_rules`], a layout changed in the project while the dialog was open keeps
+    /// the dialog open on the draft, and another project open now gets nothing.
+    fn apply_report_layout(&mut self, form: &report_layout_form::Form, dir: &std::path::Path) -> Result<(), String> {
+        if let Some(why) = form.problem() {
+            return Err(why);
+        }
+        let Some(o) = self.open.as_mut().filter(|o| o.dir == dir) else {
+            return Err("The report layout was not kept: another project was opened while it was edited.".into());
+        };
+        let now = wc_report::layout_for(&o.project, form.kind).cloned();
+        if form.edited() {
+            if now != form.loaded {
+                self.dialog = Some(Dialog::ReportLayout {
+                    // Against the layout as it is now: OK keeps the draft whenever it differs
+                    // from that one, even if it went back to the layout the dialog opened on.
+                    form: Box::new(report_layout_form::Form {
+                        initial: report_layout_form::Form::new(form.kind, form.builtin.clone(), now.as_ref()).layout(),
+                        loaded: now,
+                        ..form.clone()
+                    }),
+                    dir: dir.to_path_buf(),
+                });
+                return Err(
+                    "The report layout changed while you edited it. Your edits are still open: OK keeps them in place of the new layout, Cancel keeps the new one."
+                        .into(),
+                );
+            }
+            o.set_report_layout(form.kind, form.layout());
+        }
+        self.dialog = Some(Dialog::Reports(form.kind));
+        Ok(())
+    }
+
+    /// Show the project check, run now.
+    fn show_check(&mut self) {
+        if let Some(o) = self.open.as_ref() {
+            self.dialog = Some(Dialog::Check(run_check(o)));
+        }
+    }
+
+    /// Keep the rules of the check rules dialog (one undo step), then show the check with
+    /// them. Rows left as they were loaded leave the project's rules as they are now (the
+    /// assistant may have changed them meanwhile). `dir` is the project the dialog opened on:
+    /// when another one is open now, nothing is changed.
+    fn apply_rules(
+        &mut self,
+        rows: &[rules_form::RuleRow],
+        loaded: &[wc_core::check_rule::CheckRule],
+        dir: &std::path::Path,
+    ) -> Result<(), String> {
+        let rules = rules_form::rules_of(rows)?;
+        let Some(o) = self.open.as_mut().filter(|o| o.dir == dir) else {
+            return Err("The rules were not kept: another project was opened while they were edited.".into());
+        };
+        // Compared as rows: a value the dialog does not write (a cable rule's max) is no edit.
+        if rows != rules_form::rows_of(loaded) {
+            // The rules changed since the dialog opened (the assistant, someone in a shared
+            // session): the draft would put back what they changed. It stays open on the
+            // rules as they are now, so OK again keeps the draft and Cancel theirs.
+            if o.project.meta.rules != loaded {
+                self.dialog = Some(Dialog::Rules {
+                    rows: rows.to_vec(),
+                    loaded: o.project.meta.rules.clone(),
+                    dir: dir.to_path_buf(),
+                });
+                return Err(
+                    "The check rules changed while you edited them. Your edits are still open: OK keeps them in place of the new rules, Cancel keeps the new rules."
+                        .into(),
+                );
+            }
+            o.set_check_rules(rules);
+        }
+        self.show_check();
+        Ok(())
+    }
+
+    /// The name for a new project in `dir`: `name`, or the folder's name when it is blank.
+    fn project_name(dir: &std::path::Path, name: &str) -> String {
+        if name.is_empty() {
             dir.file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "Project".into())
         } else {
             name.to_owned()
+        }
+    }
+
+    /// New project, Create: as [`App::new_project`], except that a base project in a git
+    /// repository is fetched on a thread of its own ([`App::fetch`]), with a note and Cancel,
+    /// and the project opens once it is there.
+    fn start_new_project(&mut self, dir: &std::path::Path, name: &str, base: Option<&str>) {
+        let Some(source) = base.filter(|b| wc_vcs::base::is_url(b)) else {
+            self.new_project(dir, name, base);
+            return;
         };
-        if let Err(e) = wc_core::store::create(dir, &name) {
+        if let Some(f) = &self.fetch {
+            if f.made {
+                self.dialog = None;
+                self.ed.message = "The last new project is made and opens once the open project's work is done; create this one after that.".into();
+            } else {
+                // The running fetch keeps its note and Cancel.
+                self.dialog = Some(Dialog::Fetching(f.source.clone()));
+                self.ed.message = "A base project is being fetched already; wait for it or cancel it first.".into();
+            }
+            return;
+        }
+        let name = Self::project_name(dir, name);
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let (tx, done) = std::sync::mpsc::channel();
+        let (to, from, stop) = (dir.to_path_buf(), source.to_owned(), cancel.clone());
+        std::thread::spawn(move || {
+            let made = wc_vcs::base::create_from_base_until(&from, &to, &name, &wc_core::base::today(), &stop);
+            let _ = tx.send(made.map(|_| ()).map_err(|e| match e {
+                wc_vcs::Error::Cancelled => None,
+                e => Some(e.to_string()),
+            }));
+        });
+        self.fetch = Some(BaseFetch {
+            dir: dir.to_path_buf(),
+            source: source.to_owned(),
+            was_open: self.open.as_ref().map(|o| o.dir.clone()),
+            made: false,
+            cancel,
+            done,
+        });
+        self.dialog = Some(Dialog::Fetching(source.to_owned()));
+    }
+
+    /// Stop the base project being fetched: nothing is made.
+    fn cancel_fetch(&mut self) {
+        match &self.fetch {
+            Some(f) if f.made => {
+                self.ed.message =
+                    "The new project is made already; it opens once the open project's work is done.".into();
+            }
+            Some(f) => {
+                f.cancel.store(true, Ordering::Relaxed);
+                self.ed.message = "Cancelling the new project…".into();
+            }
+            None => {}
+        }
+    }
+
+    /// Take in the base project fetched for a new project, once it is there: the project opens,
+    /// or the reason it could not be made shows. Until then the window keeps drawing.
+    fn poll_fetch(&mut self, ctx: &egui::Context) {
+        let Some(f) = self.fetch.as_mut() else { return };
+        if !f.made {
+            let failed = match f.done.try_recv() {
+                Ok(Ok(())) => {
+                    f.made = true;
+                    None
+                }
+                Ok(Err(e)) => Some(e),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                    return;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(Some("the fetch stopped without an answer".into()))
+                }
+            };
+            // Cancelled or failed: said at once, whatever else is open.
+            if let Some(why) = failed {
+                let Some(f) = self.fetch.take() else { return };
+                let fetching = matches!(self.dialog, Some(Dialog::Fetching(_)));
+                if fetching {
+                    self.dialog = None;
+                }
+                match why {
+                    None => self.ed.message = "Cancelled: the new project was not made.".into(),
+                    Some(e) => {
+                        let m = format!("Could not create the project in\n{}:\n{e}", f.dir.display());
+                        if fetching || self.dialog.is_none() {
+                            self.dialog = Some(Dialog::Message(m));
+                        } else {
+                            self.ed.message = m.replace('\n', " ");
+                        }
+                    }
+                }
+                return;
+            }
+        }
+        // Made. The open project is not saved or replaced while something still works on it:
+        // an assistant turn or command, an open dialog, or the symbol or terminal strip editor.
+        // The new project waits until they are done, and Cancel is no longer offered.
+        if self.assistant.busy()
+            || self.assistant.command_running()
+            || self.symbol_editor.is_some()
+            || self.strip_editor.is_some()
+            || self.dialog.as_ref().is_some_and(|d| !matches!(d, Dialog::Fetching(_)))
+        {
+            if matches!(self.dialog, Some(Dialog::Fetching(_))) {
+                self.dialog = None;
+            }
+            self.ed.message = "The new project is made; it opens once the open project's work is done.".into();
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        }
+        let Some(f) = self.fetch.take() else { return };
+        if matches!(self.dialog, Some(Dialog::Fetching(_))) {
+            self.dialog = None;
+        }
+        if self.open.as_ref().map(|o| &o.dir) != f.was_open.as_ref() {
+            // Another project was opened meanwhile: it stays, and the new one waits.
+            let recorded = record_new_project(&f.dir);
+            self.prefs.remember(f.dir.clone());
+            self.prefs.save();
+            self.dialog = Some(Dialog::Message(match recorded {
+                Ok(()) => format!(
+                    "The new project is ready in\n{}\nOpen it from File, Open when you want it.",
+                    f.dir.display()
+                ),
+                Err(e) => format!(
+                    "The new project is in\n{}\nbut its first version could not be recorded:\n{e}",
+                    f.dir.display()
+                ),
+            }));
+        } else {
+            self.finish_new_project(&f.dir, false);
+        }
+    }
+
+    /// Create a project in `dir`: blank, or from the base project (folder or git URL) `base`.
+    fn new_project(&mut self, dir: &std::path::Path, name: &str, base: Option<&str>) {
+        let name = Self::project_name(dir, name);
+        let made = match base {
+            Some(b) => {
+                wc_vcs::base::create_from_base(b, dir, &name, &wc_core::base::today()).map_err(|e| e.to_string())
+            }
+            None => wc_core::store::create(dir, &name).map_err(|e| e.to_string()),
+        };
+        if let Err(e) = made {
             self.dialog = Some(Dialog::Message(format!(
                 "Could not create the project in\n{}:\n{e}",
                 dir.display()
             )));
             return;
         }
-        // A starter library next to the app, when there is one, so the symbol picker is not empty.
-        if let Some(lib) = starter_library()
+        self.finish_new_project(dir, base.is_none());
+    }
+
+    /// After a project was made in `dir`: a blank one gets the starter library, then it is
+    /// recorded as a first version and opened.
+    fn finish_new_project(&mut self, dir: &std::path::Path, blank: bool) {
+        // A starter library next to the app, when there is one, so the symbol picker is not
+        // empty. A base project brings its own library sources.
+        if blank
+            && let Some(lib) = starter_library()
             && let Ok(mut p) = wc_core::store::load(dir)
         {
             p.meta.libraries.push(wc_core::project::LibrarySource {
@@ -2051,20 +3074,58 @@ impl App {
             });
             let _ = wc_core::store::save(dir, &p);
         }
-        let git = wc_vcs::Git::new(dir);
-        let _ = git.init().and_then(|()| git.commit("New project").map(|_| ()));
+        let recorded = record_new_project(dir);
+        // The new project replaces the open one: keep its unsaved work first.
+        if let Some(o) = self.open.as_mut()
+            && o.dirty
+            && let Err(e) = o.save()
+        {
+            let mut m = format!(
+                "The new project is in\n{}\nbut the open project could not be saved first, so it stays open:\n{e}",
+                dir.display()
+            );
+            if let Err(e) = recorded {
+                m.push_str(&format!(
+                    "\nThe new project's first version could not be recorded either:\n{e}"
+                ));
+            }
+            self.dialog = Some(Dialog::Message(m));
+            return;
+        }
         let mut prefs = std::mem::take(&mut self.prefs);
         self.open_dir(dir, &mut prefs);
         self.prefs = prefs;
+        if let Err(e) = recorded {
+            self.dialog = Some(Dialog::Message(match self.dialog.take() {
+                // Opening it failed too: both reasons show.
+                Some(Dialog::Message(m)) => format!("{m}\nIts first version could not be recorded either:\n{e}"),
+                _ => format!("The new project is open, but its first version could not be recorded:\n{e}"),
+            }));
+        }
     }
 
     /// Insert a macro on the current page, selected so it can be dragged into place.
-    fn insert_macro(&mut self, path: &std::path::Path, name: &str) {
+    /// Open the placeholders dialog on the project macro in `path`.
+    fn edit_macro(&mut self, path: &std::path::Path) {
+        self.dialog = Some(match macro_form::Form::open(path) {
+            Ok(form) => Dialog::MacroEdit {
+                form: Box::new(form),
+                error: None,
+            },
+            Err(e) => Dialog::Message(format!("The macro could not be read:\n{e}")),
+        });
+    }
+
+    fn insert_macro(&mut self, path: &std::path::Path, name: &str, value_set: Option<&str>) {
         let page = self.ed.page;
         let Some(open) = self.open.as_mut() else { return };
-        match open.insert_macro(page, path) {
+        match open.insert_macro(page, path, value_set) {
             Ok(items) if !items.is_empty() => {
                 self.ed.tool = Tool::Select;
+                let name = match value_set {
+                    Some(set) => format!("{name} ({set})"),
+                    None => name.to_owned(),
+                };
                 self.ed.message = format!("Inserted macro {name}: drag it into place.");
                 self.ed.selection = items;
             }
@@ -2103,14 +3164,6 @@ impl App {
             }
             Err(e) => self.dialog = Some(Dialog::Message(format!("Could not create the branch:\n{e}"))),
         }
-    }
-}
-
-fn size_label(s: PageSize) -> &'static str {
-    match s {
-        PageSize::A4 => "A4 landscape",
-        PageSize::A3 => "A3 landscape",
-        PageSize::A2 => "A2 landscape",
     }
 }
 
@@ -2308,12 +3361,16 @@ fn subway(ui: &mut egui::Ui, rows: &[wc_vcs::subway::Row]) {
     });
 }
 
+/// The project check, with the check rules of the project's library sources as they are now.
 fn run_check(open: &Open) -> Vec<wc_report::Finding> {
-    wc_report::check(&wc_report::Inputs {
-        project: &open.project,
-        symbols: &open.symbols,
-        parts: &open.parts,
-    })
+    wc_report::check_with(
+        &wc_report::Inputs {
+            project: &open.project,
+            symbols: &open.symbols,
+            parts: &open.parts,
+        },
+        &wc_library::library_rules(&open.dir, &open.project),
+    )
 }
 
 fn report_title(k: wc_report::Kind) -> &'static str {
@@ -2325,8 +3382,10 @@ fn report_title(k: wc_report::Kind) -> &'static str {
         wc_report::Kind::Terminals => "Terminals",
         wc_report::Kind::Cables => "Cables",
         wc_report::Kind::Plc => "PLC I/O",
+        wc_report::Kind::PlcCards => "PLC cards",
         wc_report::Kind::Contents => "Contents",
         wc_report::Kind::Locations => "Locations",
+        wc_report::Kind::Networks => "Networks",
     }
 }
 
@@ -2415,9 +3474,35 @@ fn form_fields(block: &std::collections::BTreeMap<String, String>) -> Vec<(Strin
     fields
 }
 
+/// What is wrong with the project's PLC racks, as the PLC cards report would say.
+fn rack_warnings(open: &Open) -> Vec<String> {
+    wc_report::plc_rack_warnings(&wc_report::Inputs {
+        project: &open.project,
+        symbols: &open.symbols,
+        parts: &open.parts,
+    })
+}
+
 fn export_pdf(open: &Open) -> String {
-    let name: String = open
-        .project
+    export_pdf_in(open, &[])
+}
+
+/// [`export_pdf`] with the project's texts in `langs` (one language, or two shown together)
+/// from its `translations.toml`; empty prints them as drawn. Texts without a translation are
+/// listed as warnings.
+fn export_pdf_in(open: &Open, langs: &[String]) -> String {
+    let (translated, missing) = if langs.is_empty() {
+        (std::borrow::Cow::Borrowed(&open.project), Vec::new())
+    } else {
+        let dict = match wc_core::translate::Dictionary::load(&open.dir) {
+            Ok(d) => d,
+            Err(e) => return format!("Export failed: {e}"),
+        };
+        let (p, m) = wc_core::translate::translate(&open.project, &dict, langs);
+        (std::borrow::Cow::Owned(p), m)
+    };
+    let project: &wc_core::Project = &translated;
+    let name: String = project
         .meta
         .name
         .chars()
@@ -2428,11 +3513,11 @@ fn export_pdf(open: &Open) -> String {
     // The table of contents goes before the schematic pages and the other reports after them,
     // as in a finished drawing set.
     let inputs = wc_report::Inputs {
-        project: &open.project,
+        project,
         symbols: &open.symbols,
         parts: &open.parts,
     };
-    let pictures = wc_pdf::read_pictures(&open.dir, &open.project);
+    let pictures = wc_pdf::read_pictures(&open.dir, project);
     let options = wc_pdf::Options {
         reports: wc_report::Kind::ALL
             .into_iter()
@@ -2441,16 +3526,27 @@ fn export_pdf(open: &Open) -> String {
             .collect(),
         underlays: pictures.files,
         unreadable: pictures.unreadable,
-        panels: open.project.panels.clone(),
+        panels: project.panels.clone(),
+        networks: project.meta.networks.clone(),
+        footprints: wc_pdf::footprints(open.parts.values()),
         ..Default::default()
     };
-    let (bytes, report) = wc_pdf::export(&open.project, &open.symbols, &options);
+    let (bytes, report) = wc_pdf::export(project, &open.symbols, &options);
+    let mut warnings = report.warnings;
+    // The text itself stays out: this message goes to the diagnostic log, which never holds
+    // drawing content. File, Translations, "Only missing" lists the texts.
+    warnings.extend(missing.iter().map(|m| {
+        format!(
+            "no translation for a text ({}); see File, Translations, Only missing",
+            m.used.join(", ")
+        )
+    }));
     match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, bytes)) {
         Ok(()) => {
             let mut m = format!("Exported {} pages to\n{}", report.pages, path.display());
-            if !report.warnings.is_empty() {
+            if !warnings.is_empty() {
                 m.push_str("\n\nWarnings:\n");
-                m.push_str(&report.warnings.join("\n"));
+                m.push_str(&warnings.join("\n"));
             }
             m
         }
@@ -2683,6 +3779,7 @@ impl eframe::App for App {
             sharing: self.share.active(),
             share_undo: self.share.can_undo(),
             share_redo: self.share.can_redo(),
+            show_layers: self.show_layers,
         };
         for url in std::mem::take(&mut self.open_url) {
             ctx.open_url(egui::OpenUrl::new_tab(url));
@@ -2698,6 +3795,8 @@ impl eframe::App for App {
         if let Some(o) = self.open.as_mut() {
             o.follow_terminals();
         }
+        self.live_check(ctx);
+        self.poll_fetch(ctx);
         self.log_messages();
         self.assistant_poll(ctx);
         if self.applied_theme != self.prefs.theme {
@@ -2718,7 +3817,18 @@ impl eframe::App for App {
         egui::TopBottomPanel::bottom("status")
             .frame(side(t.toolbar_bg).inner_margin(egui::Margin::symmetric(10, 4)))
             .show_separator_line(false)
-            .show(ctx, |ui| panels::status_bar(ui, self.open.as_ref(), &self.ed));
+            .show(ctx, |ui| {
+                let live = self.prefs.live_check.then(|| {
+                    (
+                        self.live.status(&self.ed.live),
+                        self.live.busy(),
+                        self.live.failed.is_some(),
+                    )
+                });
+                if panels::status_bar(ui, self.open.as_ref(), &self.ed, live) {
+                    self.dialog = Some(Dialog::Check(self.ed.live.clone()));
+                }
+            });
         self.assistant_panel(ctx);
 
         let mut page_actions = Vec::new();
@@ -2743,6 +3853,7 @@ impl eframe::App for App {
                 });
             egui::CentralPanel::default().frame(egui::Frame::new()).show(ctx, |ui| {
                 self.ed.auto_wire = self.prefs.auto_wire;
+                self.ed.layers = self.prefs.layers.clone();
                 canvas::show(ui, open, &mut self.ed, self.prefs.show_grid, self.prefs.snap);
                 let held = open
                     .project
@@ -2781,11 +3892,39 @@ impl eframe::App for App {
         if let Some(at) = self.ed.ask_comment.take() {
             self.dialog = Some(Dialog::Comment(at, String::new(), false));
         }
+        // A click on the box while one of its dialogs is open does not replace that dialog.
+        if let Some((side, offset)) = self.ed.ask_box_pin.take()
+            && self.dialog.is_none()
+            && let Some(d) = self.ed.black_box.as_ref()
+        {
+            self.dialog = Some(Dialog::BoxPin {
+                side,
+                offset,
+                name: d.next_pin_name(),
+                focused: false,
+                error: None,
+            });
+        }
+        if std::mem::take(&mut self.ed.ask_box_tag) && self.dialog.is_none() && self.ed.black_box.is_some() {
+            let tag = self
+                .open
+                .as_ref()
+                .and_then(|o| o.next_tag(self.ed.page, "A"))
+                .map(|t| t.to_string())
+                .unwrap_or_default();
+            self.dialog = Some(Dialog::BoxTag {
+                tag,
+                focused: false,
+                error: None,
+            });
+        }
         self.dialogs(ctx);
         self.share
             .windows(ctx, self.open.as_mut(), self.assistant.command_running());
         self.symbol_editor_window(ctx);
         self.find_window(ctx);
+        self.layers_window(ctx);
+        self.strip_editor_window(ctx);
         self.sync_session(ctx);
 
         let title = match &self.open {
@@ -2801,6 +3940,44 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// Check while drawing: start a check once the last edit has settled, and show the
+    /// findings of one that finished.
+    fn live_check(&mut self, ctx: &egui::Context) {
+        let Some(o) = self.open.as_ref().filter(|_| self.prefs.live_check) else {
+            self.live.clear();
+            self.ed.live.clear();
+            return;
+        };
+        // A keystroke, a click or a drag may edit (even one that does not report itself in the
+        // revision): each one starts the wait again.
+        let editing = ctx.input(|i| {
+            i.pointer.any_down()
+                || i.events.iter().any(|e| {
+                    matches!(
+                        e,
+                        egui::Event::Key { .. }
+                            | egui::Event::Text(_)
+                            | egui::Event::Paste(_)
+                            | egui::Event::Cut
+                            | egui::Event::PointerButton { .. }
+                    )
+                })
+        });
+        let poll = self.live.poll(o, editing, std::time::Instant::now());
+        // Show findings only once they are of exactly these inputs: a finished check, or the
+        // checker's findings after the editor was replaced (the same project opened again, a
+        // session joined). While a check is pending they may be of other inputs (another
+        // project), so the editor keeps what it shows.
+        if let Some(found) = self.live.settled()
+            && self.ed.live != found
+        {
+            self.ed.live = found.to_vec();
+        }
+        if let Some(after) = poll.again {
+            ctx.request_repaint_after(after);
+        }
+    }
+
     /// The symbol editor, while open. A saved symbol shows up in the place list at once; when
     /// the project already uses it, its copy in the project is updated too (one undo step).
     /// While the symbol editor is open, Undo and Delete work on the symbol being drawn, and
@@ -2844,6 +4021,140 @@ impl App {
         }
     }
 
+    /// The Text dialog's OK: a free text at `at` on the page shown. Not on a page someone else
+    /// holds, nor while the drawings layer is hidden or locked (it may have changed while the
+    /// dialog was open).
+    fn add_text(&mut self, at: wc_core::geom::Point, text: &str) {
+        let Some(o) = self.open.as_mut() else { return };
+        if let Some(why) = o.held_reason(self.ed.page) {
+            self.ed.message = why;
+            return;
+        }
+        if let Some(why) = self.prefs.layers.refusal(layers::Layer::Drawings) {
+            self.ed.message = why;
+            return;
+        }
+        let shape = wc_core::geom::Shape::Text {
+            at,
+            text: text.trim().to_owned(),
+            height: 3.5,
+            align: wc_core::geom::Align::Left,
+            angle: 0.0,
+        };
+        if let Some(sel) = o.add_graphic(self.ed.page, shape) {
+            self.ed.select_only(sel);
+        }
+    }
+
+    /// The black box dialog's button: the box drawn with the black box tool goes on its page,
+    /// tagged `tag` (none when empty), and is selected.
+    fn add_black_box(&mut self, tag: &str) -> Result<(), String> {
+        let o = self.open.as_mut().ok_or("no project is open")?;
+        let d = self.ed.black_box.clone().ok_or("no black box is being drawn")?;
+        let (a, b) = d.rect().ok_or("the black box has no rectangle yet")?;
+        let page = o
+            .project
+            .pages
+            .iter()
+            .position(|p| p.id == d.page_id)
+            .ok_or("the page the box was drawn on is gone")?;
+        if let Some(why) = o.held_reason(page) {
+            return Err(why);
+        }
+        let tag = match tag.trim() {
+            "" => None,
+            t => Some(wc_core::DeviceTag::parse(t).map_err(|e| e.to_string())?),
+        };
+        let id = o.add_black_box(page, a, b, &d.pins, tag)?;
+        self.ed.black_box = None;
+        // The page the box went on is shown (the view may have moved meanwhile), so the
+        // selection names the new box and not an item of the same id elsewhere.
+        self.ed.page = page;
+        self.ed.panel = None;
+        self.ed.select_only(Selection::Symbol(id));
+        self.ed.message = format!(
+            "Black box with {} connection point{} put on the page.",
+            d.pins.len(),
+            if d.pins.len() == 1 { "" } else { "s" }
+        );
+        Ok(())
+    }
+
+    /// The Comment dialog's button: a review comment at `at` on the page shown, unless the
+    /// comments layer is hidden or locked by now.
+    fn add_comment_at(&mut self, at: wc_core::geom::Point, text: &str) {
+        if let Some(why) = self.prefs.layers.refusal(layers::Layer::Comments) {
+            self.ed.message = why;
+            return;
+        }
+        let Some(o) = self.open.as_mut() else { return };
+        let Some(page) = o.project.pages.get(self.ed.page).map(|p| p.id.clone()) else {
+            return;
+        };
+        let mut next = o.project.clone();
+        match next.add_comment(&page, Some(at), &state::author_name(), state::now_secs(), text) {
+            Ok(id) => {
+                o.checkpoint();
+                o.project = next;
+                self.ed.selection.clear();
+                self.ed.message = format!("Comment {id} added.");
+                self.ed.comment = Some(id);
+                self.ed.tool = Tool::Select;
+            }
+            Err(err) => self.ed.message = err.to_string(),
+        }
+    }
+
+    /// The layer list: show, hide and lock what the canvas shows. Kept in the preferences.
+    fn layers_window(&mut self, ctx: &egui::Context) {
+        if !self.show_layers {
+            return;
+        }
+        let mut open = true;
+        let mut changed = false;
+        egui::Window::new("Layers")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| changed = self.prefs.layers.ui(ui));
+        if changed {
+            self.layers_changed();
+        }
+        self.show_layers = open;
+    }
+
+    /// The layer list changed: save it and apply it to the editor at once, so a command run
+    /// before the canvas is drawn again (Delete, Cut, Rotate…) does not act on an item that
+    /// was just hidden or locked.
+    fn layers_changed(&mut self) {
+        self.prefs.save();
+        self.apply_layers();
+    }
+
+    /// Hand the layer list to the editor and drop what it no longer lets be selected.
+    fn apply_layers(&mut self) {
+        self.ed.layers = self.prefs.layers.clone();
+        let layers = &self.ed.layers;
+        self.ed.selection.retain(|s| layers.may_select(s));
+    }
+
+    /// The terminal strip editor, while open and its project is.
+    fn strip_editor_window(&mut self, ctx: &egui::Context) {
+        let (Some(ed), Some(open)) = (self.strip_editor.as_mut(), self.open.as_mut()) else {
+            self.strip_editor = None;
+            return;
+        };
+        // The window belongs to the project it was opened in: another project opened since
+        // (or a shared session joined) closes it, so nothing typed in it lands there.
+        if ed.owner.as_deref() != Some(open.dir.as_path()) {
+            self.strip_editor = None;
+            return;
+        }
+        if !ed.show(ctx, open) {
+            self.strip_editor = None;
+        }
+    }
+
     /// Show a find hit: open its page and select the item.
     fn show_found(&mut self, page: &str, select: Option<Selection>) {
         let Some(o) = self.open.as_ref() else { return };
@@ -2859,7 +4170,16 @@ impl App {
         self.ed.page = i;
         self.ed.tool = Tool::Select;
         self.ed.view.fit = true;
-        self.ed.selection = select.into_iter().collect();
+        // A hit on a hidden or locked layer would be dropped from the selection on the next
+        // frame without a word: say why instead.
+        let note = select.as_ref().and_then(|s| self.prefs.layers.unselectable_note(s));
+        self.ed.selection = self.prefs.layers.keep(select.into_iter().collect());
+        // Each go-to shows only its own note: a note from an earlier hit is cleared.
+        let note = note.unwrap_or_default();
+        if let Some(find) = self.find.as_mut() {
+            find.message = note.clone();
+        }
+        self.ed.message = note;
     }
 
     /// Replace in the ticked find hits, as one undo step.
@@ -3031,15 +4351,31 @@ fn confirm_page_props(
     o.set_page_props(i, number, title, size, overview, Some(fields))
 }
 
+/// After a shared-session sync: show panel `id` and pick the device `tag` on it again, wherever
+/// they are now; a panel or device that is gone is no longer shown or picked.
+fn follow_panel_pick(ed: &mut Editor, project: &wc_core::Project, id: &str, tag: Option<&wc_core::DeviceTag>) {
+    let Some((pi, panel)) = project.panels.iter().enumerate().find(|(_, p)| p.id == id) else {
+        ed.panel = None;
+        ed.panel_pick = None;
+        return;
+    };
+    ed.panel = Some(pi);
+    ed.panel_pick = tag.and_then(|tag| {
+        panel
+            .items
+            .iter()
+            .position(|i| matches!(i, wc_core::panel::PanelItem::Device { tag: t, .. } if t == tag))
+    });
+}
+
 /// Who holds the page action `a` would change, in a shared session: then it is refused. Page
 /// actions (properties, delete, move up or down) are about the current page even while a panel
 /// is shown; canvas actions only when the page itself is shown, as in the panel view they work
 /// on the panel.
 fn held_for(a: Action, ed: &Editor, project: &wc_core::Project) -> Option<String> {
-    // With a panel shown these still work on the schematic page under it (Delete goes to the
-    // panel first), so they follow that page's hold.
-    let on_page_under_panel =
-        ed.panel.is_some() && matches!(a, Action::Paste | Action::Cut | Action::Rotate | Action::Mirror);
+    // With a panel shown these still work on the schematic page under it (Delete and Rotate go
+    // to the panel's picked device instead), so they follow that page's hold.
+    let on_page_under_panel = ed.panel.is_some() && matches!(a, Action::Paste | Action::Cut | Action::Mirror);
     let name = if a.edits_page_itself() || on_page_under_panel {
         let page = project.pages.get(ed.page)?;
         // Moving a page up or down renumbers its neighbour too.
@@ -3197,6 +4533,16 @@ impl App {
             _ => self.logged.1.clear(),
         }
         new
+    }
+}
+
+/// The custom sheet "Custom size…" starts from: the size shown, as it is drawn (A4 portrait
+/// gives 210 x 297 mm).
+fn custom_from(size: PageSize) -> PageSize {
+    let (w, h) = size.mm();
+    PageSize::Custom {
+        width: w.round() as u32,
+        height: h.round() as u32,
     }
 }
 
@@ -3556,8 +4902,8 @@ mod marking_tests {
         assert!(msg.contains("Exported 2 terminal strips (3 rows)"), "{msg}");
         let csv = std::fs::read_to_string(&path).unwrap();
         let rows: Vec<&str> = csv.lines().map(|l| l.split(';').next().unwrap()).collect();
-        assert_eq!(rows, ["\u{feff}Index", "-X1/T1", "-X1/T2", "-X2/T1"]);
-        assert!(csv.contains("-X1/T1;Terminal;-X1;1;1;"), "{csv}");
+        assert_eq!(rows, ["\u{feff}Index", "-X1/T:1", "-X1/T:2", "-X2/T:1"]);
+        assert!(csv.contains("-X1/T:1;Terminal;-X1;1;1;"), "{csv}");
     }
 
     #[test]
@@ -3576,11 +4922,15 @@ mod marking_tests {
         export_wago_configurator(&o);
         let csv = std::fs::read_to_string(o.dir.join("export").join("wago-configurator.csv"))
             .unwrap()
-            .replace("-X1/T1;Terminal;-X1;1;1;;;", "-X1/T1;Terminal;-X1;1;1;;EX-TB-2.5;")
-            .replace("-X1/T2;Terminal;-X1;2;2;;;", "-X1/T2;Terminal;-X1;2;2;;NO-SUCH;")
+            .replace("-X1/T:1;Terminal;-X1;1;1;;;", "-X1/T:1;Terminal;-X1;1;1;;EX-TB-2.5;")
+            .replace("-X1/T:2;Terminal;-X1;2;2;;;", "-X1/T:2;Terminal;-X1;2;2;;NO-SUCH;")
             .replace("-X1/J1;Jumper;-X1;;;;;", "-X1/J1;Jumper;-X1;;;;EX-TB-2.5;");
         let before = o.undo_mark();
+        let pid = "example.ex-tb-2-5";
+        assert!(!o.project.lock.parts.contains_key(pid), "not pinned yet");
+        let lock = o.project.lock.clone();
         let msg = o.import_wago_configured(csv.as_bytes()).unwrap();
+        assert!(o.project.lock.parts.contains_key(pid), "taken and pinned");
         assert!(
             msg.starts_with(
                 "WAGO configurator: 2 device(s) or jumper(s) changed, 0 row(s) already up to date, 1 not matched."
@@ -3602,6 +4952,18 @@ mod marking_tests {
             o.project.meta.jumpers[0].part.is_none(),
             "the jumper in the same undo step"
         );
+        assert_eq!(o.project.lock, lock, "and the pin");
+        o.save().unwrap();
+        assert!(!wc_core::store::load(&o.dir).unwrap().lock.parts.contains_key(pid));
+        assert!(o.redo());
+        assert!(o.project.lock.parts.contains_key(pid), "Redo brings the pin back");
+        assert_eq!(o.project.devices.get(&x11).and_then(|d| d.part.as_deref()), Some(pid));
+        // Undone again, then given by hand: the copy left behind is pinned again.
+        assert!(o.undo());
+        o.set_device_part(&x11, Some(pid)).unwrap();
+        assert!(o.project.lock.parts.contains_key(pid));
+        assert!(o.undo());
+        assert_eq!(o.project.lock, lock, "setting a part is one undo step with its pin");
         assert!(o.import_wago_configured(b"Article\n1\n").is_err());
     }
 
@@ -3725,5 +5087,87 @@ mod marking_tests {
         let msg = export_wago_marking(&o, &options);
         assert!(msg.starts_with("Nothing exported") && msg.contains("-X1"), "{msg}");
         assert!(!o.dir.join("export").join("wago-marking--X1.csv").exists());
+    }
+}
+
+#[cfg(test)]
+mod page_size_tests {
+    use super::*;
+
+    #[test]
+    fn a_custom_sheet_starts_from_the_size_shown() {
+        assert_eq!(
+            custom_from(PageSize::A4Portrait),
+            PageSize::Custom {
+                width: 210,
+                height: 297
+            }
+        );
+        assert_eq!(
+            custom_from(PageSize::A3),
+            PageSize::Custom {
+                width: 420,
+                height: 297
+            }
+        );
+    }
+}
+
+/// How the connection point dialog names an edge of a black box.
+fn side_name(side: wc_core::BoxSide) -> &'static str {
+    match side {
+        wc_core::BoxSide::Top => "top",
+        wc_core::BoxSide::Bottom => "bottom",
+        wc_core::BoxSide::Left => "left",
+        wc_core::BoxSide::Right => "right",
+    }
+}
+
+#[cfg(test)]
+mod held_tests {
+    use super::*;
+
+    #[test]
+    fn rotate_on_a_panel_is_not_held_by_the_page_under_it() {
+        let mut project = wc_core::Project::new("x");
+        project.pages.push(wc_core::Page::new("p1", "1", "Mains"));
+        let mut ed = Editor::default();
+        ed.page = project.pages.len() - 1;
+        ed.held_by.insert("p1".into(), "Kim".into());
+        // On the page itself, Rotate turns its symbols: held.
+        assert_eq!(held_for(Action::Rotate, &ed, &project).as_deref(), Some("Kim"));
+        // With a panel shown, Rotate turns the picked panel device: not held; Paste still is.
+        ed.panel = Some(0);
+        ed.panel_pick = Some(0);
+        assert_eq!(held_for(Action::Rotate, &ed, &project), None);
+        assert_eq!(held_for(Action::Paste, &ed, &project).as_deref(), Some("Kim"));
+    }
+
+    #[test]
+    fn the_panel_pick_follows_its_device_after_a_sync() {
+        use wc_core::panel::{Panel, PanelItem};
+        let device = |tag: &str, x: f64| PanelItem::Device {
+            tag: wc_core::DeviceTag::parse(tag).unwrap_or_default(),
+            at: wc_core::Point::new(x, 0.0),
+            width: 10.0,
+            height: 10.0,
+            rotation: wc_core::geom::Rotation::R0,
+        };
+        let mut project = wc_core::Project::new("x");
+        let mut a = Panel::new("a", "A", 100.0, 100.0);
+        a.items = vec![device("-K2", 30.0), device("-K1", 0.0)];
+        project.panels = vec![Panel::new("0", "first", 10.0, 10.0), a];
+        let mut ed = Editor::default();
+        let k1 = wc_core::DeviceTag::parse("-K1").ok();
+        // Another panel came first and the devices were reordered: still panel "a", still -K1.
+        follow_panel_pick(&mut ed, &project, "a", k1.as_ref());
+        assert_eq!((ed.panel, ed.panel_pick), (Some(1), Some(1)));
+        // The device was taken off the plate: nothing picked, so Rotate and Delete do nothing.
+        project.panels[1].items.remove(1);
+        follow_panel_pick(&mut ed, &project, "a", k1.as_ref());
+        assert_eq!((ed.panel, ed.panel_pick), (Some(1), None));
+        // The panel was removed.
+        follow_panel_pick(&mut ed, &project, "gone", k1.as_ref());
+        assert_eq!((ed.panel, ed.panel_pick), (None, None));
     }
 }

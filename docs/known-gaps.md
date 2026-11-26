@@ -37,15 +37,14 @@ These branches can be deleted once their pull requests are merged.
 
 | Gap | Where it shows | Todo |
 |---|---|---|
-| EDZ exchange files: EPLAN macros (`.ema`) are listed and matched to parts, never drawn (closed binary format); pick a symbol by hand or with `--symbol-map` | `crates/wc-import/src/edz.rs` | done (#144) |
-| SolidWorks Electrical: symbol and page graphics come from the archive's DWG files (`Block/<name>.dwg`, `Projects/<n>/Drawings/<page id>.ewg`); the file layout is checked on synthetic archives only, circles, arcs and texts of a symbol scaled differently along x and y stay round and keep their size from the mean scale, and a bare database import still draws boxes | `crates/wc-import/src/swe/drawings.rs` | #163 |
+| EDZ exchange files: only the multi-line representation, variant A, of an EPLAN macro (`.ema`) becomes a symbol; panel layout, overview, single-line and 3D representations and other variants are counted, not imported. Symbols from EPLAN's own libraries (coils, contacts, lamps) are drawn as the WiringCraft symbol of the same kind, not with EPLAN's drawing, and connection points placed from those libraries keep their pin but not their drawing. Text alignment numbers are read as left, centre, right in rows of three (inferred), and only the horizontal part is used. Connection points that only other multi-line variants (or, without those, the overview) hold are added to the symbol as pins in a column to the right of its drawing, without their drawing (#511); symbols from EPLAN's own libraries get one pin per connection point designation (a terminal with 4 designations has 4, in top and bottom pairs a grid step apart, since #512) but their pin positions follow WiringCraft's drawing of the same kind, not EPLAN's; category 502 is drawn as fuses, one per pair of points (inferred from maker macros); device tag, connection designation and description text placements and terminal descriptions (A186) are not mapped, and the tag position is a guess; a macro whose maker cannot be told (no part names it and the archive holds parts of several makers, or none) keeps the id `eplan.<file name>`, with a warning, and can still be overwritten by another archive's macro of the same name | `crates/wc-import/src/edz/macros.rs` | #513 |
+| SolidWorks Electrical: symbol and page graphics come from the archive's DWG files (`Block/<name>.dwg`, `Projects/<n>/Drawings/<page id>.ewg`); the file layout is checked on synthetic archives only, texts of a symbol scaled differently along x and y keep their size from the mean scale (its circles and arcs are drawn as ellipses), and a bare database import still draws boxes | `crates/wc-import/src/swe/drawings.rs` | #307 |
 | SolidWorks Electrical: page revisions are read from `tew_revision` by column name (the layout is not published), checked on synthetic databases only; the project's own revision and checked-by are not read | `crates/wc-import/src/swe.rs` | #170 |
 | SolidWorks Electrical libraries (`import swe-library`): catalog parts bring their terminals as a text property, not as pins of a symbol; library blocks without a readable DWG file in the archive stay box symbols | `crates/wc-import/src/swe/library.rs` | #59 |
-| SolidWorks Electrical: terminal jumpers made in the terminal strip editor are counted in the import report, not imported (WiringCraft has no jumpers yet) | `crates/wc-import/src/swe.rs` | #108 |
-| PDF trace: pictures compressed other than Flate, LZW or DCT (CCITT fax, JBIG2, JPEG 2000), or in other sample layouts than 1-bit gray, 8- or 16-bit gray and RGB and 8-bit CMYK, are refused ("not supported yet"); LZW, CMYK and 16-bit are read since #171 | `crates/wc-import/src/pdf.rs` | not filed |
-| SolidWorks Electrical cabinet layouts: items are sorted by block name (rail, duct, plate) since the database has no item kind; a footprint without a box size takes its catalog part's width and height, else 18 x 90 mm; upright rails are left out (WiringCraft rails run left to right) | `crates/wc-import/src/swe/cabinet.rs` | #59 (sizes from the DWG blocks) |
+| PDF trace: pictures in other sample layouts than 1-bit gray, 8- or 16-bit gray and RGB and 8-bit CMYK, are refused ("not supported yet"). LZW, CMYK and 16-bit are read since #171; CCITT fax (G3 and G4), JBIG2 and JPEG 2000 since #271, RunLength since #418, checked on small generated samples only (a JPEG 2000 alpha channel is dropped; JBIG2 symbol dictionaries shared through `JBIG2Globals` are tested since #518, and a picture that refers to a segment neither it nor its `JBIG2Globals` holds in full is refused with a message instead of coming out blank since #523; segments after the end of the file segment are not read). The JBIG2 decoder stops once its bitmaps (regions, pattern and symbol dictionaries, page) go over a 256 MiB limit, half for the shared `JBIG2Globals` segments and half for the page, less what symbol dictionaries keep outside it, their decoder contexts and export lists (counted from their headers); text-like scans with symbol dictionaries are read since #423, using an unreleased `hayro-jbig2` commit until a release has the memory limit | `crates/wc-import/src/pdf.rs`, `crates/wc-import/src/pdf_codecs.rs` | #517 (crates.io release) |
+| SolidWorks Electrical cabinet layouts: items are sorted by block name (rail, duct, plate) since the database has no item kind; a footprint without a box size takes the box round its block's DWG drawing, else its catalog part's width and height, else 18 x 90 mm; upright rails are left out (WiringCraft rails run left to right) | `crates/wc-import/src/swe/cabinet.rs` | Known limit: the database has no item kind, so sorting by name stays |
 | Binary DXF | `crates/wc-import/src/dxf.rs` | Not planned: the error tells the user to save as ASCII DXF, which every CAD program can do. |
-| DWG | `crates/wc-import/src/dwg.rs` | Read for AutoCAD 2004 to 2018 drawings only (2007 checked against one real file, #215; 2013 and 2018 against 143 real files, #292); ELLIPSE, SPLINE and HATCH are skipped (#221 for HATCH), and so are multi-line attributes of 2018 drawings; a DWG page import (`import page-dwg`) still goes through an installed DWG to DXF converter. |
+| DWG | `crates/wc-import/src/dwg.rs` | Read for the DWG formats 2004, 2007, 2010, 2013 and 2018 only (`AC1018` to `AC1032`; AutoCAD releases after 2018 still save in the 2018 format, so their drawings are read too; 2007 checked against one real file, #215; 2013 and 2018 against 143 real files, #292; the class section of 2007, 2013 and 2018 is read as the specification gives it and has only been checked with drawings the tests write); multi-line attributes of 2018 drawings are counted and skipped; 2004 texts in a code page the reader has no table for (the multi-byte Chinese, Japanese and Korean pages, the DOS pages, ISO 8859 pages other than 8859-1) are read with the legacy decoder, UTF-8 when the bytes are and else byte for byte as Latin-1 (with the euro sign and the two dashes of Windows-1252), with a warning; a DWG page import (`import page-dwg`) still goes through an installed DWG to DXF converter. |
 | STEP (3D) | `docs/manufacturer-data.md` | Later: 3D belongs to the one-way export to SolidCraft (phase 5). |
 
 ## Editing and app
@@ -63,9 +62,25 @@ These branches can be deleted once their pull requests are merged.
 The core (#79), the network transport (#74), discovery (#75) and the app's Share session and
 Join session (#76) are in. In a session the app sends every change to the open page as one page
 edit and project-level changes (devices, comments, panels, pages, project properties) as project
-edits; Undo is off. Tools that change pages nobody else has open (wire numbering, a tag renamed
-on every page) send those pages together as one change (#77); wire numbering leaves pages other
-people hold as they are and says which. Still open: undo per change (#78). #43 tracks it.
+edits. Tools that change pages nobody else has open (wire numbering, a tag renamed on every page)
+send those pages together as one change (#77); wire numbering leaves pages other people hold as
+they are and says which. Undo takes back your own latest change, and "Undo this change" in the
+session's change list takes back any change whose parts were not changed again since (#78).
+Updating a symbol or part from the library during a session sends the new version to everyone
+as one change, refused when someone else updated it first or when wires in the session end on a
+pin the new version drops; undoing it puts the old version back in every copy (#197). An undo
+is refused while a wire ends on a pin the version it brings back does not have, for example a
+pin the update added that has been wired since: move or remove that wire, then undo again. A
+joining copy takes a symbol the session did not send from its own libraries only in the version
+the session pinned; otherwise it reports the symbol as missing. A page, device or jumper that uses
+a symbol or part the session does not have yet waits in the window until the session takes the
+item, however long that takes, and the session window says what it waits for (#198). Other changes
+go out and others' changes keep coming in meanwhile. When the session changes that same page,
+device or the project properties before it takes the item, the waiting change is dropped and a note
+says so; a change of the page's number alone keeps it. Undo while a change waits takes that change
+back here only. For the first few seconds after an item is sent, while the session answers,
+everything waits, as before. The host refuses a page that places a symbol the project does not lock
+(#286); placements a page already had stay editable.
 
 Host and guests must run builds with the same session protocol version
 (`wc_share::PROTOCOL_VERSION`, raised whenever a message changes). A guest on another version is

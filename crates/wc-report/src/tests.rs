@@ -7,6 +7,7 @@ use wc_core::{Device, Page, PlacedSymbol, Wire};
 
 fn sym(id: &str, role: SymbolRole, pins: &[&str]) -> Symbol {
     Symbol {
+        source: String::new(),
         id: id.into(),
         name: id.into(),
         category: String::new(),
@@ -558,6 +559,138 @@ fn the_location_list_counts_devices_and_names_unlisted_locations() {
 }
 
 #[test]
+fn the_network_list_shows_each_device_with_its_address_ports_and_cables() {
+    let mut p = Project::new("t");
+    let mut page = Page::new("p3", "3", "PLC");
+    page.symbols.push(place("s1", "plc", 20.0, Some("-A1")));
+    // An overview drawn before it shows -A1 again; the list keeps to schematic pages.
+    let mut overview = Page::new("p1", "1", "Overview");
+    overview.overview = true;
+    overview.symbols.push(place("s1", "plc", 20.0, Some("-A1")));
+    p.pages.push(overview);
+    p.pages.push(page);
+    for (t, d) in [
+        ("-K10", "Drive pump 1"),
+        ("-K11", "Drive pump 2"),
+        ("-K12", "Spare drive"),
+    ] {
+        p.devices.insert(
+            DeviceTag::parse(t).unwrap(),
+            Device {
+                description: d.into(),
+                ..Default::default()
+            },
+        );
+    }
+    use wc_core::network::{Link, Network, Node};
+    let node = |device: &str, address: &str, station: &str| Node {
+        device: device.into(),
+        address: address.into(),
+        station: station.into(),
+        ..Default::default()
+    };
+    let link = |from: &str, to: &str, cable: &str| Link {
+        from: from.into(),
+        to: to.into(),
+        cable: cable.into(),
+        ..Default::default()
+    };
+    p.meta.networks = vec![Network {
+        name: "PN1".into(),
+        kind: "profinet".into(),
+        nodes: vec![
+            node("-A1", "192.168.0.1", "plc"),
+            node("-K10", "192.168.0.10", ""),
+            node("-K11", "192.168.0.11", ""),
+            node("-K12", "", ""),
+            node("-K99", "192.168.0.11", ""),
+        ],
+        links: vec![link("-A1:X1P1", "-K10:P1", "-W20"), link("-K10:P2", "-K11:P1", "-W21")],
+        ..Default::default()
+    }];
+    let (symbols, parts) = (BTreeMap::new(), BTreeMap::new());
+    let i = Inputs {
+        project: &p,
+        symbols: &symbols,
+        parts: &parts,
+    };
+    let t = build(Kind::Networks, &i);
+    let row = |c: &[&str]| c.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    assert_eq!(
+        t.rows,
+        [
+            row(&[
+                "PN1",
+                "PROFINET",
+                "-A1",
+                "",
+                "192.168.0.1",
+                "plc",
+                "X1P1",
+                "-K10:P1",
+                "-W20",
+                "3"
+            ]),
+            row(&[
+                "PN1",
+                "PROFINET",
+                "-K10",
+                "Drive pump 1",
+                "192.168.0.10",
+                "",
+                "P1",
+                "-A1:X1P1",
+                "-W20",
+                ""
+            ]),
+            row(&[
+                "PN1",
+                "PROFINET",
+                "-K10",
+                "Drive pump 1",
+                "192.168.0.10",
+                "",
+                "P2",
+                "-K11:P1",
+                "-W21",
+                ""
+            ]),
+            row(&[
+                "PN1",
+                "PROFINET",
+                "-K11",
+                "Drive pump 2",
+                "192.168.0.11",
+                "",
+                "P1",
+                "-K10:P2",
+                "-W21",
+                ""
+            ]),
+            row(&["PN1", "PROFINET", "-K12", "Spare drive", "", "", "", "", "", ""]),
+            row(&["PN1", "PROFINET", "-K99", "", "192.168.0.11", "", "", "", "", ""]),
+        ]
+    );
+    // Only the drawn device links to its page.
+    assert_eq!(t.row_pages, ["p3"]);
+    assert_eq!(
+        network_warnings(&i),
+        [
+            "network PN1: -K11 and -K99 have the same address 192.168.0.11",
+            "network PN1: -K99 is not a device of the project",
+        ]
+    );
+    p.meta.networks.clear();
+    let i = Inputs {
+        project: &p,
+        symbols: &symbols,
+        parts: &parts,
+    };
+    assert!(build(Kind::Networks, &i).rows.is_empty());
+    assert!(network_warnings(&i).is_empty());
+}
+
+#[test]
 fn marking_list_has_every_marker_in_natural_order() {
     let (mut p, s, parts) = fixture();
     let w1 = DeviceTag::parse("-W1").unwrap();
@@ -667,6 +800,32 @@ fn a_cable_drawn_only_as_a_symbol_gets_its_markers() {
         Ok(vec![MarkerKind::Wires, MarkerKind::Cables])
     );
     assert!(parse_kinds(&["rails".into()]).is_err());
+}
+
+#[test]
+fn a_terminal_drawn_only_on_an_overview_does_not_take_a_cables_markers() {
+    let (mut p, s, parts) = fixture();
+    // -X1.W1 is drawn as a terminal on an overview only; -X1.W2 on a schematic page.
+    let mut overview = Page::new("ov", "9", "Overview");
+    overview.overview = true;
+    overview.symbols.push(place("o1", "term", 0.0, Some("-X1.W1")));
+    p.pages.push(overview);
+    p.pages[0].symbols.push(place("t9", "term", 150.0, Some("-X1.W2")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = marking_list(&i, &[MarkerKind::Cables, MarkerKind::Devices]);
+    let cables: Vec<&str> = t
+        .rows
+        .iter()
+        .filter(|r| r[0] == "Cable")
+        .map(|r| r[2].as_str())
+        .collect();
+    assert!(cables.contains(&"-X1.W1"), "{cables:?}");
+    assert!(!cables.contains(&"-X1.W2"), "{cables:?}");
+    assert!(!t.rows.iter().any(|r| r[0] == "Device" && r[2].starts_with("-X1.W")));
 }
 
 #[test]
@@ -863,6 +1022,14 @@ fn check_names_a_jumper_terminal_drawn_nowhere() {
         "{found:?}"
     );
     assert!(!found.iter().any(|m| m.contains("terminal 1 is drawn nowhere")));
+    // A spare terminal is on the rail, not drawn: no warning.
+    p.meta.add_spare(&x1, "9", None, &[]).unwrap();
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    assert!(!check(&i).iter().any(|f| f.message.contains("drawn nowhere")));
 }
 
 #[test]
@@ -937,6 +1104,68 @@ fn a_two_level_terminal_shows_its_levels_and_shares_one_marker() {
     assert_eq!(marked("+"), ["1+2", "3+4", "5"]);
     // Other strips are untouched.
     assert_eq!(plan.rows.iter().find(|r| r[0] == "-X2").unwrap()[7], "");
+}
+
+#[test]
+fn terminal_markers_of_an_arranged_strip_come_in_its_rail_order() {
+    let (mut p, s, parts) = fixture();
+    let x1 = DeviceTag::parse("-X1").unwrap();
+    // -X1.1 and -X1.2 are one two-level terminal.
+    p.devices
+        .entry(DeviceTag::parse("-X1.2").unwrap())
+        .or_default()
+        .properties
+        .insert(LEVEL_PROPERTY.into(), "2".into());
+    let markers = |p: &wc_core::Project| -> Vec<String> {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        let o = MarkingOptions {
+            kinds: vec![MarkerKind::Terminals],
+            level_separator: LEVEL_SEPARATOR.into(),
+            ..MarkingOptions::default()
+        };
+        marking_list_with(&i, &o)
+            .rows
+            .iter()
+            .map(|r| format!("{} {}", r[1], r[2]))
+            .collect()
+    };
+    // Nobody arranged a strip: today's order.
+    assert_eq!(markers(&p), ["-X1 1 / 2", "-X2 1"]);
+    // A spare S1 goes on the rail before the two-level terminal, and 2 is moved before 1.
+    p.meta
+        .add_spare(&x1, "S1", None, &[("1".to_owned(), false), ("2".to_owned(), false)])
+        .unwrap();
+    let current = vec![
+        ("1".to_owned(), false),
+        ("2".to_owned(), false),
+        ("S1".to_owned(), true),
+    ];
+    p.meta.move_terminal(&x1, "S1", 0, &current).unwrap();
+    let current = vec![
+        ("S1".to_owned(), true),
+        ("1".to_owned(), false),
+        ("2".to_owned(), false),
+    ];
+    p.meta.move_terminal(&x1, "2", 1, &current).unwrap();
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let rail: Vec<String> = terminal_plan(&i)
+        .rows
+        .iter()
+        .filter(|r| r[0] == "-X1")
+        .map(|r| r[1].clone())
+        .collect();
+    assert_eq!(rail, ["S1", "2", "1"]);
+    // The spare's marker goes first, as on the rail; the block keeps one marker, numbered
+    // upwards; the strip that nobody arranged is as before, and strips stay in tag order.
+    assert_eq!(markers(&p), ["-X1 S1", "-X1 1 / 2", "-X2 1"]);
 }
 
 #[test]
@@ -1154,6 +1383,7 @@ fn configurator_list_has_plates_rails_terminals_jumpers_and_accessories_per_stri
         at: Point::new(at.x + 10.0, at.y - 20.0),
         width: 5.2,
         height: 40.0,
+        rotation: wc_core::geom::Rotation::R0,
     });
     p.panels.push(plate);
 
@@ -1176,11 +1406,11 @@ fn configurator_list_has_plates_rails_terminals_jumpers_and_accessories_per_stri
         [
             ("-X1/P1", "Plate"),
             ("-X1/R1", "Rail"),
-            ("-X1/T1", "Terminal"),
-            ("-X1/T2", "Terminal"),
+            ("-X1/T:1", "Terminal"),
+            ("-X1/T:2", "Terminal"),
             ("-X1/J1", "Jumper"),
             ("-X1/A1", "Accessory"),
-            ("-X1/T2/A1", "Accessory"),
+            ("-X1/T:2/A1", "Accessory"),
         ]
     );
     let row = |index: &str| t.rows.iter().find(|r| r[0] == index).unwrap().clone();
@@ -1190,7 +1420,7 @@ fn configurator_list_has_plates_rails_terminals_jumpers_and_accessories_per_stri
         ("Main plate", "1")
     );
     assert_eq!(row("-X1/R1")[18], "0");
-    let t1 = row("-X1/T1");
+    let t1 = row("-X1/T:1");
     assert_eq!((t1[3].as_str(), t1[4].as_str()), ("1", "1"));
     assert_eq!((t1[6].as_str(), t1[7].as_str()), ("2002-1201", "WAGO"));
     assert_eq!(&t1[10..14], ["1.5 mm²", "BU", "2.5 mm²", ""]);
@@ -1200,7 +1430,7 @@ fn configurator_list_has_plates_rails_terminals_jumpers_and_accessories_per_stri
         (row("-X1/A1")[6].as_str(), row("-X1/A1")[9].as_str()),
         ("2002-1291", "1")
     );
-    let a2 = row("-X1/T2/A1");
+    let a2 = row("-X1/T:2/A1");
     assert_eq!(
         (a2[6].as_str(), a2[9].as_str(), a2[14].as_str()),
         ("acme.marker", "2", "2")
@@ -1208,7 +1438,7 @@ fn configurator_list_has_plates_rails_terminals_jumpers_and_accessories_per_stri
     // -X2 is on no plate and has no part: one bare terminal row.
     let x2: Vec<&Vec<String>> = t.rows.iter().filter(|r| r[2] == "-X2").collect();
     assert_eq!(x2.len(), 1);
-    assert_eq!((x2[0][0].as_str(), x2[0][6].as_str()), ("-X2/T1", ""));
+    assert_eq!((x2[0][0].as_str(), x2[0][6].as_str()), ("-X2/T:1", ""));
     assert!(to_smartscript_csv(&t).starts_with("\u{feff}Index;Type;Strip;"));
 }
 
@@ -1242,7 +1472,7 @@ fn a_terminal_tagged_with_only_its_strip_takes_the_strip_devices_part() {
     .table;
     let x2: Vec<&Vec<String>> = t.rows.iter().filter(|r| r[2] == "-X2").collect();
     assert_eq!(x2.len(), 2, "{x2:?}");
-    assert_eq!((x2[0][0].as_str(), x2[0][6].as_str()), ("-X2/T1", "2002-1201"));
+    assert_eq!((x2[0][0].as_str(), x2[0][6].as_str()), ("-X2/T:1", "2002-1201"));
     // Its accessory belongs to terminal 1, and the part is not listed again as an accessory.
     assert_eq!(
         (
@@ -1251,7 +1481,47 @@ fn a_terminal_tagged_with_only_its_strip_takes_the_strip_devices_part() {
             x2[1][9].as_str(),
             x2[1][14].as_str()
         ),
-        ("-X2/T1/A1", "acme.marker", "3", "1")
+        ("-X2/T:1/A1", "acme.marker", "3", "1")
+    );
+}
+
+#[test]
+fn an_accessory_of_terminals_drawn_as_the_strip_keeps_its_index_when_the_strip_is_reordered() {
+    use wc_core::DevicePart;
+    // Two terminals drawn with the tag of the strip itself: one device, -X2, for both.
+    let (mut p, s, parts) = fixture();
+    p.pages[0].symbols.push(place("s7", "term", 140.0, Some("-X2")));
+    let x2 = DeviceTag::parse("-X2").unwrap();
+    p.devices.insert(
+        x2.clone(),
+        Device {
+            accessories: vec![DevicePart {
+                part: "acme.marker".into(),
+                qty: 3,
+            }],
+            ..Default::default()
+        },
+    );
+    let accessory = |p: &Project| -> Vec<(String, String)> {
+        configurator_list(&Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        })
+        .table
+        .rows
+        .iter()
+        .filter(|r| r[2] == "-X2" && r[1] == "Accessory")
+        .map(|r| (r[0].clone(), r[14].clone()))
+        .collect()
+    };
+    let before = accessory(&p);
+    assert_eq!(before, [("-X2/T:1/A1".to_owned(), "1".to_owned())]);
+    assert_eq!(p.meta.set_terminal_order(&x2, &["2".into(), "1".into()]), Ok(true));
+    assert_eq!(
+        accessory(&p),
+        before,
+        "named by the lowest terminal, not the first on the rail"
     );
 }
 
@@ -1265,15 +1535,15 @@ fn configurator_tags_with_a_function_or_location_aspect_are_written_as_text() {
         parts: &parts,
     });
     let row = out.table.rows.iter().find(|r| r[2].contains("X9")).unwrap();
-    assert_eq!(row[0], "'=A+C1-X9/T1");
+    assert_eq!(row[0], "'=A+C1-X9/T:1");
     assert_eq!(row[2], "'=A+C1-X9");
     assert!(
         out.warnings.iter().any(|w| w.contains("Strip \"=A+C1-X9\"")),
         "{:?}",
         out.warnings
     );
-    assert!(out.warnings.iter().any(|w| w.contains("Index \"=A+C1-X9/T1\"")));
-    let plain = out.table.rows.iter().find(|r| r[0] == "-X1/T1").unwrap();
+    assert!(out.warnings.iter().any(|w| w.contains("Index \"=A+C1-X9/T:1\"")));
+    let plain = out.table.rows.iter().find(|r| r[0] == "-X1/T:1").unwrap();
     assert_eq!(plain[2], "-X1", "a plain tag stays as it is");
 }
 
@@ -1300,11 +1570,11 @@ fn configurator_free_texts_that_look_like_formulas_are_written_as_text() {
         symbols: &s,
         parts: &parts,
     });
-    let row = out.table.rows.iter().find(|r| r[0] == "-X1/T1").unwrap();
+    let row = out.table.rows.iter().find(|r| r[0] == "-X1/T:1").unwrap();
     assert_eq!(&row[6..9], ["'=1+1", "'@cme", "plain"]);
     assert_eq!(row[2], "-X1", "tags stay as they are");
     assert_eq!(out.warnings.len(), 2, "{:?}", out.warnings);
-    assert!(out.warnings[0].contains("-X1/T1") && out.warnings[0].contains("=1+1"));
+    assert!(out.warnings[0].contains("-X1/T:1") && out.warnings[0].contains("=1+1"));
 }
 
 #[test]
@@ -1363,4 +1633,1239 @@ fn a_jumper_part_is_counted_in_the_parts_list_and_written_for_the_configurator()
     .rows;
     let j1 = rows.iter().find(|r| r[0] == "-X1/J1").unwrap();
     assert_eq!((j1[6].as_str(), j1[8].as_str()), ("acme.bridge", "2-way jumper"));
+}
+
+#[test]
+fn the_terminal_strip_editors_order_and_spares_show_in_the_plan_and_the_configurator() {
+    let (mut p, s, mut parts) = fixture();
+    let x1 = DeviceTag::parse("-X1").unwrap();
+    let term = Part {
+        id: "wago.2002-1201".into(),
+        manufacturer: "WAGO".into(),
+        order_number: "2002-1201".into(),
+        description: "2-conductor through terminal block".into(),
+        ..Default::default()
+    };
+    parts.insert(term.id.clone(), term.clone());
+    // Terminal 2 first, a spare S1 between 2 and 1, jumpered with 1; the spare has a part.
+    let current = vec![("1".to_owned(), false), ("2".to_owned(), false)];
+    p.meta.move_terminal(&x1, "2", 0, &current).unwrap();
+    let current = vec![("2".to_owned(), false), ("1".to_owned(), false)];
+    p.meta.add_spare(&x1, "S1", Some("2"), &current).unwrap();
+    p.meta.add_jumper(&x1, &["S1".to_owned(), "1".to_owned()]).unwrap();
+    p.devices.insert(
+        DeviceTag::parse("-X1.S1").unwrap(),
+        Device {
+            part: Some(term.id.clone()),
+            ..Default::default()
+        },
+    );
+    // A strip that is only spares.
+    p.meta
+        .add_spare(&DeviceTag::parse("-X9").unwrap(), "1", None, &[])
+        .unwrap();
+    let inputs = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = terminal_plan(&inputs);
+    let x1_rows: Vec<(&str, &str, &str)> = t
+        .rows
+        .iter()
+        .filter(|r| r[0] == "-X1")
+        .map(|r| (r[1].as_str(), r[5].as_str(), r[6].as_str()))
+        .collect();
+    assert_eq!(x1_rows.len(), 3, "{x1_rows:?}");
+    assert_eq!(
+        (x1_rows[0].0, x1_rows[1], x1_rows[2].0),
+        ("2", ("S1", SPARE_PAGE, "1"), "1")
+    );
+    // The drawn terminals keep their wiring.
+    let one = t.rows.iter().find(|r| r[0] == "-X1" && r[1] == "1").unwrap();
+    assert_eq!(one[2], "=A+C1-K1:14");
+    assert_eq!(one[6], "S1");
+    let x9 = t.rows.iter().find(|r| r[0] == "-X9").unwrap();
+    assert_eq!((x9[1].as_str(), x9[5].as_str()), ("1", SPARE_PAGE));
+
+    let out = configurator_list(&inputs);
+    let terminals: Vec<(&str, &str, &str, &str)> = out
+        .table
+        .rows
+        .iter()
+        .filter(|r| r[1] == "Terminal" && r[2] == "-X1")
+        .map(|r| (r[3].as_str(), r[4].as_str(), r[6].as_str(), r[0].as_str()))
+        .collect();
+    assert_eq!(
+        terminals,
+        [
+            ("1", "2", "", "-X1/T:2"),
+            ("2", "S1", "2002-1201", "-X1/T:S1"),
+            ("3", "1", "", "-X1/T:1"),
+        ]
+    );
+    // The spare's row imports back onto its own device; the index names the terminal, the
+    // position its place on the rail.
+    assert!(matches!(
+        out.targets.get("-X1/T:S1"),
+        Some(configurator::Target::Part(t)) if t.to_string() == "-X1.S1"
+    ));
+    // A spare without a device entry still names its own device for the import back.
+    assert!(matches!(
+        out.targets.get("-X9/T:1"),
+        Some(configurator::Target::Part(t)) if t.to_string() == "-X9.1"
+    ));
+}
+
+#[test]
+fn a_rail_order_or_a_spare_keeps_levels_and_markers_and_a_jumpered_spare_takes_the_potential() {
+    let (mut p, s, parts) = fixture();
+    let x1 = DeviceTag::parse("-X1").unwrap();
+    // -X1.1 and -X1.2 are one two-level terminal (the level above says so).
+    p.devices
+        .entry(DeviceTag::parse("-X1.2").unwrap())
+        .or_default()
+        .properties
+        .insert(LEVEL_PROPERTY.into(), "2".into());
+    // On the rail 2 comes first, and a spare 1a (between 1 and 2 by number) is added.
+    let current = vec![("1".to_owned(), false), ("2".to_owned(), false)];
+    p.meta.move_terminal(&x1, "2", 0, &current).unwrap();
+    let current = vec![("2".to_owned(), false), ("1".to_owned(), false)];
+    p.meta.add_spare(&x1, "1a", None, &current).unwrap();
+    // -X2.1 is on 0V; a spare jumpered to it is too.
+    let x2 = DeviceTag::parse("-X2").unwrap();
+    p.meta.add_spare(&x2, "S1", None, &[("1".to_owned(), false)]).unwrap();
+    p.meta.add_jumper(&x2, &["1".to_owned(), "S1".to_owned()]).unwrap();
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let plan = terminal_plan(&i);
+    let levels: Vec<(&str, &str)> = plan
+        .rows
+        .iter()
+        .filter(|r| r[0] == "-X1")
+        .map(|r| (r[1].as_str(), r[7].as_str()))
+        .collect();
+    assert_eq!(levels, [("2", "2"), ("1", "1"), ("1a", "")]);
+    let o = MarkingOptions {
+        strip: Some("-X1".into()),
+        level_separator: LEVEL_SEPARATOR.into(),
+        ..MarkingOptions::default()
+    };
+    let marked: Vec<String> = marking_list_with(&i, &o).rows.iter().map(|r| r[2].clone()).collect();
+    assert_eq!(marked, ["1 / 2", "1a"]);
+    let spare = plan.rows.iter().find(|r| r[0] == "-X2" && r[1] == "S1").unwrap();
+    assert_eq!((spare[2].as_str(), spare[4].as_str()), ("", "0V"));
+
+    // A page numbered "spare" is not taken for a spare: the potential still comes through, and
+    // the drawn terminals keep their marker order.
+    for page in p.pages.iter_mut() {
+        page.number = SPARE_PAGE.into();
+    }
+    // A drawn terminal 0 without a level, on that page, is not taken for a spare either. -X1 is
+    // arranged, so its marker goes where the rail has it: a newly drawn terminal at the end.
+    let mut zero = p
+        .pages
+        .iter()
+        .flat_map(|pg| &pg.symbols)
+        .find(|s| s.tag.as_ref().is_some_and(|t| t.to_string() == "-X1.1"))
+        .cloned()
+        .unwrap();
+    zero.id = "zero".into();
+    zero.at.x += 200.0;
+    zero.tag = Some(DeviceTag::parse("-X1.0").unwrap());
+    p.pages[0].symbols.push(zero);
+    // A spare with a bad level does not join the inference: 1 keeps level 1.
+    p.devices
+        .entry(DeviceTag::parse("-X1.1a").unwrap())
+        .or_default()
+        .properties
+        .insert(LEVEL_PROPERTY.into(), "x".into());
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let plan = terminal_plan(&i);
+    let level_of = |n: &str| plan.rows.iter().find(|r| r[0] == "-X1" && r[1] == n).unwrap()[7].clone();
+    assert_eq!((level_of("1"), level_of("1a")), ("1".to_owned(), String::new()));
+    let spare = plan.rows.iter().find(|r| r[0] == "-X2" && r[1] == "S1").unwrap();
+    assert_eq!(spare[4], "0V");
+    let marked: Vec<String> = marking_list_with(&i, &o).rows.iter().map(|r| r[2].clone()).collect();
+    let rail: Vec<&str> = plan
+        .rows
+        .iter()
+        .filter(|r| r[0] == "-X1")
+        .map(|r| r[1].as_str())
+        .collect();
+    assert_eq!(rail, ["2", "1", "1a", "0"]);
+    assert_eq!(marked, ["1 / 2", "1a", "0"]);
+    // The spare -X1.1a has a device entry, but it is marked once, as a terminal.
+    let all = marking_list_with(&i, &MarkingOptions::default());
+    let named: Vec<&Vec<String>> = all.rows.iter().filter(|r| r.iter().any(|c| c.contains("1a"))).collect();
+    assert_eq!(named.len(), 1, "{named:?}");
+
+    // A spare named like a cable (W1) with a level of its own is a terminal, not a cable end.
+    p.meta.add_spare(&x1, "W1", None, &[]).unwrap();
+    p.devices
+        .entry(DeviceTag::parse("-X1.W1").unwrap())
+        .or_default()
+        .properties
+        .insert(LEVEL_PROPERTY.into(), "1".into());
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let all = marking_list_with(&i, &MarkingOptions::default());
+    let named: Vec<&Vec<String>> = all.rows.iter().filter(|r| r.iter().any(|c| c.contains("W1"))).collect();
+    assert_eq!(named.len(), 1, "{named:?}");
+    let terminal = MarkerKind::Terminals.label(MarkingOptions::default().language);
+    assert_eq!(named[0][..3], [terminal.to_owned(), "-X1".to_owned(), "W1".to_owned()]);
+}
+
+#[test]
+fn a_terminal_whose_symbol_is_missing_is_counted_the_same_everywhere() {
+    let (mut p, s, parts) = fixture();
+    // -X1.3 drawn with a symbol the project has no copy of; -K9 likewise, but no terminal.
+    p.pages[0].symbols.push(place("s8", "gone.term", 150.0, Some("-X1.3")));
+    p.pages[0].symbols.push(place("s9", "gone.relay", 160.0, Some("-K9")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    // The strip editor and jumpers count it ...
+    let numbers = wc_core::project::terminal_numbers(&p, |id| s.get(id).map(|s| s.role));
+    let x1 = DeviceTag::parse("-X1").unwrap();
+    assert_eq!(
+        numbers.get(&(p.pages[0].id.clone(), "s8".to_owned())),
+        Some(&(x1, "3".to_owned()))
+    );
+    assert!(!numbers.contains_key(&(p.pages[0].id.clone(), "s9".to_owned())));
+    // ... and so do the terminal plan (marked), the markers and the configurator (warned).
+    let plan = terminal_plan(&i);
+    let row = plan.rows.iter().find(|r| r[0] == "-X1" && r[1] == "3").unwrap();
+    assert_eq!(row[2], "(symbol gone.term missing)");
+    assert!(!plan.rows.iter().any(|r| r.iter().any(|c| c.contains("gone.relay"))));
+    let markers = marking_list(&i, &[MarkerKind::Terminals]);
+    assert!(
+        markers.rows.iter().any(|r| r[1] == "-X1" && r[2] == "3"),
+        "{:?}",
+        markers.rows
+    );
+    // With devices asked for too, -X1.3 has its terminal marker only, not a device marker.
+    let both = marking_list(&i, &[MarkerKind::Devices, MarkerKind::Terminals]);
+    let device = MarkerKind::Devices.label(MarkingOptions::default().language);
+    assert!(
+        !both
+            .rows
+            .iter()
+            .any(|r| r[0] == device && r.iter().any(|c| c.contains("X1.3"))),
+        "{:?}",
+        both.rows
+    );
+    assert!(
+        both.rows.iter().any(|r| r[1] == "-X1" && r[2] == "3"),
+        "{:?}",
+        both.rows
+    );
+    let out = configurator_list(&i);
+    assert!(
+        out.table.rows.iter().any(|r| r.iter().any(|c| c == "-X1/T:3")),
+        "{:?}",
+        out.table.rows
+    );
+    assert!(
+        out.warnings
+            .iter()
+            .any(|w| w.contains("-X1.3") && w.contains("gone.term")),
+        "{:?}",
+        out.warnings
+    );
+}
+
+#[test]
+fn check_warns_about_a_cloud_of_an_unlisted_revision() {
+    let (mut p, s, parts) = fixture();
+    p.add_revision("A", "", "", "").unwrap();
+    p.add_cloud("p2", Point::new(10.0, 10.0), Point::new(30.0, 30.0), None)
+        .unwrap();
+    let found = |p: &Project| -> Vec<Finding> {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        check(&i)
+            .into_iter()
+            .filter(|f| f.message.contains("does not list"))
+            .collect()
+    };
+    assert!(found(&p).is_empty());
+    p.meta.revisions.clear();
+    let f = found(&p);
+    assert_eq!(f.len(), 1, "{f:?}");
+    assert_eq!(f[0].severity, Severity::Warning);
+    assert_eq!(f[0].page_id.as_deref(), Some("p2"));
+    assert_eq!(f[0].item.as_deref(), Some("cloud 0"));
+    assert_eq!(
+        f[0].message,
+        "a cloud carries revision A, which the project does not list"
+    );
+}
+
+#[test]
+fn check_warns_about_a_revision_letter_the_pdf_cannot_print() {
+    let (mut p, s, parts) = fixture();
+    p.add_revision("A", "", "", "").unwrap();
+    let found = |p: &Project| -> Vec<Finding> {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        check(&i)
+            .into_iter()
+            .filter(|f| f.message.contains("cannot print apart"))
+            .collect()
+    };
+    assert!(found(&p).is_empty());
+    p.meta.revisions[0].letter = "Ж".into();
+    let f = found(&p);
+    assert_eq!(f.len(), 1, "{f:?}");
+    assert_eq!(f[0].severity, Severity::Warning);
+    assert!(f[0].message.starts_with("revision Ж "), "{f:?}");
+}
+
+#[test]
+fn check_finds_a_device_that_draws_more_contacts_than_its_parts_have() {
+    let (mut p, mut s, mut parts) = fixture();
+    s.insert("nc".into(), sym("nc", SymbolRole::Auxiliary, &["21", "22"]));
+    let k1 = DeviceTag::parse("=A+C1-K1").unwrap();
+    let overflow = |p: &Project, s: &BTreeMap<String, Symbol>, parts: &BTreeMap<String, Part>| -> Vec<Finding> {
+        let i = Inputs {
+            project: p,
+            symbols: s,
+            parts,
+        };
+        check(&i)
+            .into_iter()
+            .filter(|f| f.message.contains("too many"))
+            .collect()
+    };
+    // The relay's part does not list its contacts: nothing to compare with.
+    p.pages[0].symbols.push(place("s7", "no", 90.0, Some("=A+C1-K1")));
+    assert!(overflow(&p, &s, &parts).is_empty());
+
+    // One NO listed, two drawn: both drawings are named.
+    parts.get_mut("acme.r24").unwrap().contacts = Some(wc_core::Contacts {
+        no: 1,
+        ..Default::default()
+    });
+    let found = overflow(&p, &s, &parts);
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert_eq!(
+        found[0].message,
+        "=A+C1-K1 draws 2 NO contacts, its parts have 1 NO (1 NO too many)"
+    );
+    assert_eq!(found[0].severity, Severity::Warning);
+
+    // An auxiliary block fitted twice adds a NO and an NC each.
+    let block = Part {
+        id: "acme.aux11".into(),
+        contacts: Some(wc_core::Contacts {
+            no: 1,
+            nc: 1,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    parts.insert(block.id.clone(), block);
+    p.devices.get_mut(&k1).unwrap().accessories.push(wc_core::DevicePart {
+        part: "acme.aux11".into(),
+        qty: 2,
+    });
+    p.pages[0].symbols.push(place("s8", "nc", 100.0, Some("=A+C1-K1")));
+    p.pages[0].symbols.push(place("s9", "nc", 105.0, Some("=A+C1-K1")));
+    assert!(overflow(&p, &s, &parts).is_empty());
+    p.pages[0].symbols.push(place("s10", "nc", 106.0, Some("=A+C1-K1")));
+    let found = overflow(&p, &s, &parts);
+    assert!(found[0].message.ends_with("(1 NC too many)"), "{found:?}");
+
+    // A contact repeated on an overview page does not count.
+    p.pages[0].symbols.pop();
+    let mut overview = Page::new("p9", "9", "Overview");
+    overview.overview = true;
+    overview.symbols.push(place("s30", "nc", 10.0, Some("=A+C1-K1")));
+    p.pages.push(overview);
+    assert!(overflow(&p, &s, &parts).is_empty());
+}
+
+#[test]
+fn csv_cells_a_spreadsheet_would_run_are_written_as_text() {
+    for (cell, out) in [
+        ("=1+2", "'=1+2"),
+        ("+C1", "'+C1"),
+        ("@SUM(A1)", "'@SUM(A1)"),
+        ("\tx", "'\tx"),
+        ("\rx", "'\rx"),
+        ("-cmd|' /C calc'!A0", "'-cmd|' /C calc'!A0"),
+        ("=A+C1-K1", "'=A+C1-K1"),
+        ("+C1-K1", "'+C1-K1"),
+        // Excel reads -K1 as =-K1: product-aspect tags are guarded too.
+        ("-K1", "'-K1"),
+        ("-X12", "'-X12"),
+        // A typed `'` before such text gets a second one, so the import keeps the first.
+        ("'-K1", "''-K1"),
+        ("'=1", "''=1"),
+        ("''-K1", "'''-K1"),
+        ("'quoted'", "'quoted'"),
+        // Kept: ordinary text and plain numbers.
+        ("Motor 3", "Motor 3"),
+        ("", ""),
+        ("-5", "-5"),
+        ("-0.75", "-0.75"),
+        ("-2,5", "-2,5"),
+        ("a=b", "a=b"),
+    ] {
+        assert_eq!(formula_safe(cell), out, "{cell:?}");
+    }
+}
+
+#[test]
+fn every_csv_report_goes_through_the_guard_but_the_marker_list_keeps_its_text() {
+    let mut t = Table::new("T", &["Tag", "Text"]);
+    t.rows.push(vec!["-K1".into(), "=HYPERLINK(\"x\")".into()]);
+    t.rows.push(vec!["-5".into(), "@x".into()]);
+    let csv = t.to_csv();
+    assert_eq!(csv, "Tag,Text\r\n'-K1,\"'=HYPERLINK(\"\"x\"\")\"\r\n-5,'@x\r\n");
+    assert_eq!(t.to_csv_with(';'), csv.replace(',', ";"));
+    // smartScript prints the text on the marker: it is written as it is.
+    let raw = t.to_csv_raw_with(';');
+    assert!(
+        raw.contains(";\"=HYPERLINK(\"\"x\"\")\"\r\n") && raw.contains(";@x\r\n"),
+        "{raw}"
+    );
+    assert!(to_smartscript_csv(&t).contains(";@x\r\n"));
+}
+
+#[test]
+fn a_csv_header_that_looks_like_a_formula_is_written_as_text_too() {
+    let mut t = Table::new("T", &["=1+2", "Tag"]);
+    t.rows.push(vec!["a".into(), "-K1".into()]);
+    assert!(t.to_csv().starts_with("'=1+2,Tag\r\n"), "{}", t.to_csv());
+    assert!(t.to_csv_with(';').starts_with("'=1+2;Tag\r\n"));
+    assert!(t.to_csv_raw_with(';').starts_with("=1+2;Tag\r\n"));
+}
+
+#[test]
+fn a_report_layout_picks_orders_renames_and_sorts_columns() {
+    use wc_core::report_layout::{ReportColumn, ReportLayout};
+    let (mut p, s, mut parts) = fixture();
+    // A second part, so the rows have something to sort.
+    let part = Part {
+        id: "zeta.lamp".into(),
+        manufacturer: "Zeta".into(),
+        order_number: "L-1".into(),
+        description: "Lamp".into(),
+        ..Default::default()
+    };
+    p.devices.insert(
+        DeviceTag::parse("-P1").unwrap(),
+        Device {
+            part: Some(part.id.clone()),
+            ..Default::default()
+        },
+    );
+    parts.insert(part.id.clone(), part);
+    let column = |from: &str, heading: Option<&str>| ReportColumn {
+        from: from.into(),
+        heading: heading.map(Into::into),
+    };
+    p.meta.reports.push(ReportLayout {
+        kind: "parts".into(),
+        title: Some("Bill of materials".into()),
+        columns: vec![
+            column("Order number", Some("Art. no.")),
+            column("Manufacturer", None),
+            column("Qty", None),
+        ],
+        sort: vec!["-Manufacturer".into()],
+        ..Default::default()
+    });
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = build(Kind::Parts, &i);
+    assert_eq!(t.title, "Bill of materials");
+    assert_eq!(t.columns, ["Art. no.", "Manufacturer", "Qty"]);
+    // Descending by maker: Zeta, Acme, then the devices without a part (no maker).
+    assert_eq!(t.rows[0], ["L-1", "Zeta", "1"]);
+    assert_eq!(t.rows[1], ["R-24, DC", "Acme", "1"]);
+    assert_eq!(t.rows.len(), 5);
+    assert_eq!(
+        t.to_csv().lines().take(3).collect::<Vec<_>>(),
+        ["Art. no.,Manufacturer,Qty", "L-1,Zeta,1", "\"R-24, DC\",Acme,1"]
+    );
+    assert!(layout_warnings(&i).is_empty());
+    // The built-in layout is still there for whoever asks for it.
+    assert_eq!(build_builtin(Kind::Parts, &i).columns[0], "Pos");
+    // Other reports keep theirs.
+    assert_eq!(build(Kind::Devices, &i), device_list(&i));
+}
+
+#[test]
+fn a_report_layout_keeps_page_links_with_their_rows_and_sorts_numbers_by_value() {
+    use wc_core::report_layout::ReportLayout;
+    let t = Table {
+        title: "T".into(),
+        columns: vec!["Page".into(), "Title".into()],
+        rows: vec![
+            vec!["2".into(), "b".into()],
+            vec!["10".into(), "c".into()],
+            vec!["1".into(), "a".into()],
+        ],
+        row_pages: vec!["p2".into(), "p10".into()],
+        front: true,
+        ..Default::default()
+    };
+    let sorted = t.with_layout(&ReportLayout {
+        kind: "contents".into(),
+        sort: vec!["Page".into()],
+        ..Default::default()
+    });
+    assert_eq!(
+        sorted.rows.iter().map(|r| r[0].as_str()).collect::<Vec<_>>(),
+        ["1", "2", "10"]
+    );
+    assert_eq!(sorted.row_pages, ["", "p2", "p10"]);
+    assert!(sorted.front);
+}
+
+#[test]
+fn a_sorted_cable_list_keeps_each_core_with_its_cable() {
+    use wc_core::report_layout::ReportLayout;
+    let (mut p, s, parts) = fixture();
+    let w1 = DeviceTag::parse("-W1").unwrap();
+    let w2 = DeviceTag::parse("-W2").unwrap();
+    for (id, cable, core) in [("w1", &w1, "1"), ("w2", &w1, "2"), ("w3", &w2, "1"), ("w4", &w2, "2")] {
+        if let Some(w) = p.pages[0].wires.iter_mut().find(|w| w.id == id) {
+            w.cable = Some(wc_core::CableCore {
+                cable: cable.clone(),
+                core: core.into(),
+            });
+        }
+    }
+    // Without a sort, the built-in grouping is kept.
+    p.meta.reports.push(ReportLayout {
+        kind: "cables".into(),
+        ..Default::default()
+    });
+    let i2 = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let grouped = build(Kind::Cables, &i2);
+    let firsts: Vec<&str> = grouped.rows.iter().map(|r| r[0].as_str()).collect();
+    assert_eq!(firsts, ["-W1", "", "-W2", ""]);
+    // Sorted by core, every row names its own cable.
+    p.meta.reports[0].sort = vec!["Core".into(), "-Cable".into()];
+    let i3 = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let sorted = build(Kind::Cables, &i3);
+    let pairs: Vec<(&str, &str)> = sorted.rows.iter().map(|r| (r[0].as_str(), r[3].as_str())).collect();
+    assert_eq!(pairs, [("-W2", "1"), ("-W1", "1"), ("-W2", "2"), ("-W1", "2")]);
+    // A draft layout (the layout dialog's preview) gets the same fill-down without being
+    // kept; no layout given is the built-in one, whatever the project keeps.
+    let saved = p.meta.reports.clone();
+    let draft = ReportLayout {
+        kind: "cables".into(),
+        sort: vec!["Core".into()],
+        ..Default::default()
+    };
+    let i4 = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let preview = build_with(Kind::Cables, &i4, Some(&draft));
+    let pairs: Vec<(&str, &str)> = preview.rows.iter().map(|r| (r[0].as_str(), r[3].as_str())).collect();
+    assert_eq!(pairs, [("-W1", "1"), ("-W2", "1"), ("-W1", "2"), ("-W2", "2")]);
+    let builtin = build_with(Kind::Cables, &i4, None);
+    let firsts: Vec<&str> = builtin.rows.iter().map(|r| r[0].as_str()).collect();
+    assert_eq!(firsts, ["-W1", "", "-W2", ""]);
+    assert_eq!(p.meta.reports, saved);
+}
+
+#[test]
+fn a_cable_list_grouped_by_cable_without_a_sort_keeps_each_core_in_its_cable_group() {
+    use wc_core::report_layout::ReportLayout;
+    let (mut p, s, parts) = fixture();
+    let w1 = DeviceTag::parse("-W1").unwrap();
+    let w2 = DeviceTag::parse("-W2").unwrap();
+    for (id, cable, core) in [("w1", &w1, "1"), ("w2", &w1, "2"), ("w3", &w2, "1"), ("w4", &w2, "2")] {
+        if let Some(w) = p.pages[0].wires.iter_mut().find(|w| w.id == id) {
+            w.cable = Some(wc_core::CableCore {
+                cable: cable.clone(),
+                core: core.into(),
+            });
+        }
+    }
+    p.meta.reports.push(ReportLayout {
+        kind: "cables".into(),
+        group: Some("Cable".into()),
+        ..Default::default()
+    });
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = build(Kind::Cables, &i);
+    let g = t.group.unwrap();
+    let pairs: Vec<(&str, &str)> = t.rows.iter().map(|r| (r[g].as_str(), r[3].as_str())).collect();
+    assert_eq!(pairs, [("-W1", "1"), ("-W1", "2"), ("-W2", "1"), ("-W2", "2")]);
+}
+
+#[test]
+fn a_layout_sorts_by_every_key_in_turn_and_keeps_the_built_in_order_on_ties() {
+    use wc_core::report_layout::ReportLayout;
+    let row = |a: &str, b: &str, n: &str| vec![a.to_string(), b.to_string(), n.to_string()];
+    let t = Table {
+        title: "T".into(),
+        columns: vec!["Group".into(), "Item".into(), "Seen".into()],
+        rows: vec![
+            row("B", "1", "first"),
+            row("A", "2", "second"),
+            row("B", "2", "third"),
+            row("A", "1", "fourth"),
+            row("B", "2", "fifth"),
+        ],
+        ..Default::default()
+    };
+    let sorted = t.with_layout(&ReportLayout {
+        kind: "contents".into(),
+        sort: vec!["Group".into(), "-Item".into()],
+        ..Default::default()
+    });
+    assert_eq!(
+        sorted.rows.iter().map(|r| r[2].as_str()).collect::<Vec<_>>(),
+        ["second", "fourth", "third", "fifth", "first"]
+    );
+}
+
+#[test]
+fn a_layout_groups_rows_by_a_column_and_the_csv_keeps_one_row_per_record() {
+    use wc_core::report_layout::{ReportColumn, ReportLayout};
+    let row = |loc: &str, wire: &str| vec![loc.to_string(), wire.to_string(), format!("page of {wire}")];
+    let t = Table {
+        title: "Wires".into(),
+        columns: vec!["Location".into(), "Wire".into(), "Page".into()],
+        rows: vec![row("B1", "W1"), row("A1", "W3"), row("B1", "W2"), row("A1", "W4")],
+        row_pages: vec!["p1".into(), "p3".into(), "p2".into(), "p4".into()],
+        ..Default::default()
+    };
+    // The group column is left out of the picked columns: it comes first all the same.
+    let grouped = t.clone().with_layout(&ReportLayout {
+        kind: "wires".into(),
+        columns: vec![ReportColumn {
+            from: "Wire".into(),
+            heading: None,
+        }],
+        sort: vec!["-Wire".into()],
+        group: Some("Location".into()),
+        header: vec!["project.name".into(), "revision".into()],
+        ..Default::default()
+    });
+    assert_eq!(grouped.columns, ["Location", "Wire"]);
+    assert_eq!(grouped.group, Some(0));
+    assert_eq!(grouped.header, ["project.name", "revision"]);
+    // Groups in the order of their first row after sorting (W4 of A1 first), each sorted.
+    assert_eq!(
+        grouped.to_csv(),
+        "Location,Wire\r\nA1,W4\r\nA1,W3\r\nB1,W2\r\nB1,W1\r\n"
+    );
+    assert_eq!(
+        grouped.row_pages,
+        ["p4", "p3", "p2", "p1"],
+        "links stay with their rows"
+    );
+    // A group column the table does not have groups nothing.
+    let none = t.with_layout(&ReportLayout {
+        kind: "wires".into(),
+        group: Some("Colour".into()),
+        ..Default::default()
+    });
+    assert_eq!(none.group, None);
+    assert_eq!(none.columns.len(), 3);
+}
+
+#[test]
+fn layout_headings_with_a_pipe_or_a_line_break_keep_the_markdown_table_whole() {
+    use wc_core::report_layout::{ReportColumn, ReportLayout};
+    let mut t = Table::new("T", &["Tag", "Text"]);
+    t.rows.push(vec!["-K1".into(), "Relay".into()]);
+    let t = t.with_layout(&ReportLayout {
+        kind: "devices".into(),
+        title: Some("Two\nlines".into()),
+        columns: vec![
+            ReportColumn {
+                from: "Tag".into(),
+                heading: Some("Part | number".into()),
+            },
+            ReportColumn {
+                from: "Text".into(),
+                heading: Some("Long\ntext".into()),
+            },
+        ],
+        ..Default::default()
+    });
+    assert_eq!(
+        t.to_markdown(),
+        "## Two lines\n\n| Part \\| number | Long text |\n|---|---|\n| -K1 | Relay |\n"
+    );
+    // Carriage returns end a line too, and angle brackets are not read as HTML.
+    let mut t = Table::new("A\r\nB\rC", &["<b>Tag</b>"]);
+    t.rows.push(vec!["x\r\ny <script>".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## A B C\n\n| &lt;b&gt;Tag&lt;/b&gt; |\n|---|\n| x y &lt;script&gt; |\n"
+    );
+}
+
+#[test]
+fn report_layouts_that_name_nothing_are_reported() {
+    use wc_core::report_layout::{ReportColumn, ReportLayout};
+    let (mut p, s, parts) = fixture();
+    p.meta.reports = vec![
+        ReportLayout {
+            kind: "bom".into(),
+            ..Default::default()
+        },
+        ReportLayout {
+            kind: "wires".into(),
+            columns: vec![ReportColumn {
+                from: "Shade".into(),
+                heading: None,
+            }],
+            sort: vec!["-Length".into()],
+            ..Default::default()
+        },
+        ReportLayout {
+            kind: "wires".into(),
+            ..Default::default()
+        },
+    ];
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let w = layout_warnings(&i);
+    assert_eq!(w.len(), 4, "{w:?}");
+    assert!(w[0].contains("\"bom\": no such report"));
+    assert!(w[1].contains("no column \"Shade\""));
+    assert!(w[2].contains("cannot sort by \"Length\""));
+    assert!(w[3].contains("a second one"));
+    // The unknown column is left out; the report still builds.
+    assert!(build(Kind::Wires, &i).columns.is_empty());
+}
+
+#[test]
+fn a_report_layouts_unknown_group_column_and_header_keys_are_reported() {
+    use wc_core::report_layout::ReportLayout;
+    let (mut p, s, parts) = fixture();
+    p.meta.title_block.insert("contract".into(), "K-7".into());
+    p.pages[0].title_block.insert("approved_by".into(), "AB".into());
+    p.meta.reports = vec![ReportLayout {
+        kind: "wires".into(),
+        group: Some(" Maker ".into()),
+        header: [
+            "project.name",
+            "revision",
+            "contract",
+            "approved_by",
+            "page.sheet",
+            "revison",
+        ]
+        .map(String::from)
+        .to_vec(),
+        ..Default::default()
+    }];
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let w = layout_warnings(&i);
+    assert_eq!(w.len(), 2, "{w:?}");
+    assert!(w[0].contains("cannot group by \"Maker\", no such column"), "{w:?}");
+    assert!(w[1].contains("header \"revison\" is not a title-block field"), "{w:?}");
+    assert!(w[1].contains("contract") && w[1].contains("approved_by"), "{w:?}");
+
+    // A group column the report has, and known header keys only: nothing to say.
+    let column = build(Kind::Wires, &i).columns[0].clone();
+    p.meta.reports[0].group = Some(column);
+    p.meta.reports[0].header.pop();
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    assert!(layout_warnings(&i).is_empty(), "{:?}", layout_warnings(&i));
+}
+
+#[test]
+fn check_runs_the_projects_own_rules() {
+    let (mut p, s, parts) = fixture();
+    use wc_core::check_rule::CheckRule;
+    let rule = |kind: &str| CheckRule {
+        kind: kind.into(),
+        ..CheckRule::default()
+    };
+    p.meta.rules = vec![
+        CheckRule {
+            devices: Some("-P*".into()),
+            ..rule("cable")
+        },
+        CheckRule {
+            role: Some("terminal".into()),
+            pattern: Some("-X#.#".into()),
+            severity: Some("error".into()),
+            ..rule("tag")
+        },
+        CheckRule {
+            max: Some(1),
+            message: Some("{tag} is overcrowded".into()),
+            ..rule("max-wires")
+        },
+        rule("colour"),
+        CheckRule {
+            role: Some("coil".into()),
+            pattern: Some("-K#".into()),
+            ..rule("tag")
+        },
+        CheckRule {
+            devices: Some("-K*".into()),
+            ..rule("tag")
+        },
+        CheckRule {
+            devices: Some("-M*".into()),
+            ..rule("")
+        },
+        CheckRule {
+            pattern: Some("-K#".into()),
+            unknown: [("severty".to_owned(), "error".into())].into_iter().collect(),
+            ..rule("tag")
+        },
+    ];
+    // A second wire on terminal -X1.1 pin 1.
+    p.pages[0]
+        .wires
+        .push(wire("w5", pin("s4", "1"), pin("s6", "X2"), Some("4"), None));
+    let run = |p: &Project| {
+        check(&Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        })
+    };
+    let found = run(&p);
+    let has = |m: &str| found.iter().find(|f| f.message == m);
+    let cable = has("-P1 has no cable (check rule 1)").unwrap();
+    assert_eq!((cable.severity, cable.item.as_deref()), (Severity::Warning, Some("s6")));
+    let bad_tag = has("-X2 does not match -X#.# (check rule 2)").unwrap();
+    assert_eq!(
+        (bad_tag.severity, bad_tag.item.as_deref()),
+        (Severity::Error, Some("s5"))
+    );
+    assert!(!found.iter().any(|f| f.message.contains("-X1.1 does not match")));
+    // Only terminals count for max-wires without a role: the lamp's pin X2 is not checked.
+    assert!(has("-X1.1 is overcrowded").is_some(), "{found:?}");
+    assert_eq!(found.iter().filter(|f| f.message.contains("overcrowded")).count(), 1);
+    assert!(has("check rule 4 cannot run: kind \"colour\" is not one of cable, tag, max-wires").is_some());
+    assert!(
+        found
+            .iter()
+            .any(|f| f.message.starts_with("check rule 5 cannot run: role \"coil\""))
+    );
+    assert!(has("check rule 6 cannot run: a tag rule needs a pattern").is_some());
+    assert!(has("check rule 7 cannot run: it has no kind (cable, tag, max-wires)").is_some());
+    assert!(
+        found.iter().any(|f| f.severity == Severity::Error
+            && f.message
+                .starts_with("check rule 8 cannot run: it has a key \"severty\"")),
+        "{found:?}"
+    );
+
+    // A cable on the lamp's wire satisfies the cable rule.
+    p.pages[0].wires[2].cable = Some(wc_core::CableCore {
+        cable: DeviceTag::parse("-W1").unwrap(),
+        core: "1".into(),
+    });
+    assert!(!run(&p).iter().any(|f| f.message.contains("has no cable")));
+    // Overview pages do not count.
+    let mut overview = Page::new("p9", "9", "Overview");
+    overview.overview = true;
+    overview.symbols.push(place("s40", "lamp", 10.0, Some("-P7")));
+    p.pages.push(overview);
+    assert!(!run(&p).iter().any(|f| f.message.contains("has no cable")));
+}
+
+#[test]
+fn library_rules_run_before_the_projects_name_their_source_and_can_be_turned_off() {
+    use wc_core::check_rule::{CheckRule, RuleSet};
+    let (mut p, s, parts) = fixture();
+    let cable = CheckRule {
+        name: Some("lamp-cable".into()),
+        kind: "cable".into(),
+        devices: Some("-P*".into()),
+        ..CheckRule::default()
+    };
+    let tag = CheckRule {
+        kind: "tag".into(),
+        role: Some("terminal".into()),
+        pattern: Some("-X#.#".into()),
+        severity: Some("error".into()),
+        ..CheckRule::default()
+    };
+    let library = vec![
+        RuleSet {
+            source: "house".into(),
+            rules: Ok(vec![cable, tag]),
+        },
+        RuleSet {
+            source: "broken".into(),
+            rules: Err("expected `]`".into()),
+        },
+    ];
+    // The project's own rule is numbered on its own.
+    p.meta.rules = vec![CheckRule {
+        kind: "cable".into(),
+        devices: Some("-P*".into()),
+        message: Some("{tag} wants a cable".into()),
+        ..CheckRule::default()
+    }];
+    let run = |p: &Project| {
+        check_with(
+            &Inputs {
+                project: p,
+                symbols: &s,
+                parts: &parts,
+            },
+            &library,
+        )
+    };
+    let messages = |p: &Project| run(p).into_iter().map(|f| f.message).collect::<Vec<_>>();
+    let found = messages(&p);
+    let has = |m: &str| found.iter().any(|f| f == m);
+    assert!(
+        has("-P1 has no cable (check rule 1 \"lamp-cable\" of library house)"),
+        "{found:?}"
+    );
+    assert!(
+        has("-X2 does not match -X#.# (check rule 2 of library house)"),
+        "{found:?}"
+    );
+    assert!(has("-P1 wants a cable"), "{found:?}");
+    assert!(
+        has("the check rules of library broken cannot be read: expected `]`"),
+        "{found:?}"
+    );
+    // Without the library, only the project's rule.
+    let alone = check(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    assert!(!alone.iter().any(|f| f.message.contains("of library")));
+
+    // Turned off by name and by number; an entry that names nothing is reported, one for
+    // the source that could not be read is not.
+    p.meta.rules_off = vec![
+        "house:lamp-cable".into(),
+        "house:2".into(),
+        "house:9".into(),
+        "broken:1".into(),
+    ];
+    let found = messages(&p);
+    assert!(!found.iter().any(|f| f.contains("of library house")), "{found:?}");
+    assert!(found.iter().any(|f| f == "-P1 wants a cable"));
+    let unknown: Vec<_> = found.iter().filter(|f| f.starts_with("rules_off names")).collect();
+    assert_eq!(unknown.len(), 1, "{found:?}");
+    assert!(unknown[0].contains("\"house:9\""));
+}
+
+#[test]
+fn a_library_rules_own_message_still_names_the_rule_and_its_source() {
+    use wc_core::check_rule::{CheckRule, RuleSet};
+    let (p, s, parts) = fixture();
+    let library = vec![RuleSet {
+        source: "house".into(),
+        rules: Ok(vec![
+            CheckRule {
+                kind: "cable".into(),
+                devices: Some("-P*".into()),
+                message: Some("{tag} wants a house cable".into()),
+                ..CheckRule::default()
+            },
+            CheckRule {
+                kind: "tag".into(),
+                role: Some("terminal".into()),
+                pattern: Some("-X#.#".into()),
+                message: Some("{tag} breaks the house tags".into()),
+                ..CheckRule::default()
+            },
+        ]),
+    }];
+    let found: Vec<String> = check_with(
+        &Inputs {
+            project: &p,
+            symbols: &s,
+            parts: &parts,
+        },
+        &library,
+    )
+    .into_iter()
+    .map(|f| f.message)
+    .collect();
+    let has = |m: &str| found.iter().any(|f| f == m);
+    assert!(
+        has("-P1 wants a house cable (check rule 1 of library house)"),
+        "{found:?}"
+    );
+    assert!(
+        has("-X2 breaks the house tags (check rule 2 of library house)"),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn plc_card_overview_lays_out_three_cards_like_the_io_list() {
+    use wc_core::plc_rack::{PlcCard, PlcRack};
+    let (mut p, mut s, parts) = fixture();
+    let mut input = sym("wc.plc.input", SymbolRole::Standalone, &["I"]);
+    input.category = "plc".into();
+    input.name = "PLC digital input".into();
+    let mut output = sym("wc.plc.output", SymbolRole::Standalone, &["Q"]);
+    output.category = "plc".into();
+    for y in [input, output] {
+        s.insert(y.id.clone(), y);
+    }
+    let page = &mut p.pages[0];
+    page.symbols.push(place("i1", "wc.plc.input", 300.0, Some("-A1.I1")));
+    page.symbols.push(place("i2", "wc.plc.input", 310.0, Some("-A1.I2")));
+    page.symbols.push(place("q1", "wc.plc.output", 320.0, Some("-A1.Q1")));
+    page.symbols.push(place("a1", "wc.plc.input", 330.0, Some("-B1")));
+    page.symbols.push(place("x1", "wc.plc.input", 340.0, Some("-B9")));
+    page.wires.push(wire("w9", pin("s6", "X2"), pin("q1", "Q"), None, None));
+    for (tag, addr) in [
+        ("-A1.I1", "I0.1"),
+        ("-A1.I2", "%IX1.0"),
+        ("-A1.Q1", "A4.1"),
+        ("-B1", "IW66"),
+        ("-B9", "%I9.0"),
+    ] {
+        p.devices.insert(
+            DeviceTag::parse(tag).unwrap(),
+            Device {
+                description: format!("point {tag}"),
+                properties: [("Address".to_string(), addr.to_string())].into_iter().collect(),
+                ..Default::default()
+            },
+        );
+    }
+    let card = |slot: u32, tag: &str, kind: &str, channels: u32, start: &str| PlcCard {
+        slot,
+        tag: tag.into(),
+        kind: kind.into(),
+        channels,
+        start: start.into(),
+        ..Default::default()
+    };
+    p.meta.racks.push(PlcRack {
+        name: "-A1".into(),
+        description: "Main PLC".into(),
+        // Out of slot order on purpose; the overview sorts them.
+        cards: vec![
+            card(3, "", "AI 2x 4-20 mA", 2, "%IW64"),
+            card(1, "-A1.DI1", "DI 16", 16, "%IX0.0"),
+            card(2, "-A1.DO1", "DO 8", 8, "%QX4.0"),
+        ],
+        ..Default::default()
+    });
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = build(Kind::PlcCards, &i);
+    assert_eq!(t.columns[0..6], ["Rack", "Slot", "Card", "Type", "Channel", "Address"]);
+    assert_eq!(t.rows.len(), 16 + 8 + 2);
+    let row = |addr: &str| t.rows.iter().position(|r| r[5] == addr).unwrap();
+    // Every drawn point on a card shows the same device, description, connection and page as
+    // in the PLC I/O list.
+    let io = build(Kind::Plc, &i);
+    for (addr, tag) in [
+        ("%IX0.1", "-A1.I1"),
+        ("%IX1.0", "-A1.I2"),
+        ("%QX4.1", "-A1.Q1"),
+        ("%IW66", "-B1"),
+    ] {
+        let r = &t.rows[row(addr)];
+        let io_row = io.rows.iter().find(|x| x[2] == tag).unwrap();
+        assert_eq!(r[6..], io_row[2..], "{addr}");
+        assert_eq!(t.row_pages[row(addr)], p.pages[0].id, "{addr}");
+    }
+    assert_eq!(t.rows[row("%QX4.1")][8], "-P1:X2");
+    // Slot order, channel numbers from 0, and an untagged card named by its type.
+    assert_eq!(t.rows[0][..6], ["-A1", "1", "-A1.DI1", "DI 16", "0", "%IX0.0"]);
+    assert_eq!(t.rows[16][..6], ["-A1", "2", "-A1.DO1", "DO 8", "0", "%QX4.0"]);
+    assert_eq!(
+        t.rows[25][..6],
+        ["-A1", "3", "AI 2x 4-20 mA", "AI 2x 4-20 mA", "1", "%IW66"]
+    );
+    // A spare channel is listed empty and links nowhere.
+    assert_eq!(t.rows[0][6..], ["", "", "", ""]);
+    assert_eq!(t.row_pages.first().map(String::as_str).unwrap_or(""), "");
+    // The point at %IX9.0 is on no card.
+    let w = plc_rack_warnings(&i);
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(w[0].contains("-B9") && w[0].contains("%IX9.0"), "{w:?}");
+
+    // Broken racks are reported, not laid out.
+    p.meta.racks[0].cards.push(card(2, "", "", 4, "%QX4.4"));
+    p.meta.racks[0].cards.push(card(5, "", "", 4, "Slot 5"));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let w = plc_rack_warnings(&i);
+    assert!(w.iter().any(|w| w.contains("slot 2: a second card")), "{w:?}");
+    assert!(
+        w.iter()
+            .any(|w| w.contains("address %QX4.4 is also on PLC rack \"-A1\" slot 2")),
+        "{w:?}"
+    );
+    assert!(
+        w.iter().any(|w| w.contains("slot 5: start address \"Slot 5\"")),
+        "{w:?}"
+    );
+    assert_eq!(build(Kind::PlcCards, &i).rows.len(), 16 + 8 + 2 + 4);
+
+    // No racks: an empty overview and nothing to warn about.
+    p.meta.racks.clear();
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    assert!(build(Kind::PlcCards, &i).rows.is_empty());
+    assert!(plc_rack_warnings(&i).is_empty());
+}
+
+#[test]
+fn plc_card_overview_links_by_page_id_and_warns_on_points_and_shared_bytes() {
+    use wc_core::plc_rack::{PlcCard, PlcRack};
+    let (mut p, mut s, parts) = fixture();
+    let mut input = sym("wc.plc.input", SymbolRole::Standalone, &["I"]);
+    input.category = "plc".into();
+    input.name = "PLC digital input".into();
+    let mut output = sym("wc.plc.output", SymbolRole::Standalone, &["Q"]);
+    output.category = "plc".into();
+    for y in [input, output] {
+        s.insert(y.id.clone(), y);
+    }
+    // A second page with the same number as the first, as a hand-edited project file may have.
+    let mut twin = Page::new("p9", "2", "Twin");
+    twin.symbols.push(place("t1", "wc.plc.input", 10.0, Some("-T1")));
+    p.pages[0]
+        .symbols
+        .push(place("i1", "wc.plc.input", 300.0, Some("-A1.I1")));
+    p.pages[0]
+        .symbols
+        .push(place("q1", "wc.plc.output", 310.0, Some("-Q9")));
+    p.pages[0].symbols.push(place("i2", "wc.plc.input", 320.0, Some("-I9")));
+    p.pages[0]
+        .symbols
+        .push(place("i3", "wc.plc.input", 330.0, Some("-I10")));
+    p.pages[0]
+        .symbols
+        .push(place("i4", "wc.plc.input", 340.0, Some("-I11")));
+    p.pages.push(twin);
+    for (tag, addr) in [
+        ("-A1.I1", "%IX0.0"),
+        ("-T1", "%IX0.1"),
+        ("-Q9", "%IX0.2"),
+        ("-I9", "Slot 1"),
+        ("-I10", "%I0.10"),
+        ("-I11", ""),
+    ] {
+        p.devices.insert(
+            DeviceTag::parse(tag).unwrap(),
+            Device {
+                properties: [("Address".to_string(), addr.to_string())].into_iter().collect(),
+                ..Default::default()
+            },
+        );
+    }
+    let card = |slot: u32, channels: u32, start: &str| PlcCard {
+        slot,
+        channels,
+        start: start.into(),
+        ..Default::default()
+    };
+    p.meta.racks.push(PlcRack {
+        name: "R".into(),
+        cards: vec![
+            card(1, 8, "%IX0.0"),
+            card(2, 1, "%IW64"),
+            card(3, 1, "%IB65"),
+            card(4, 1, "%IB66"),
+        ],
+        ..Default::default()
+    });
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = build(Kind::PlcCards, &i);
+    // Each point links to the page it is drawn on, though both pages are numbered 2.
+    let link = |dev: &str| {
+        let n = t.rows.iter().position(|r| r[6] == dev).unwrap();
+        t.row_pages.get(n).cloned().unwrap_or_default()
+    };
+    assert_eq!(link("-A1.I1"), "p2");
+    assert_eq!(link("-T1"), "p9");
+    let w = plc_rack_warnings(&i);
+    let has = |s: &str| w.iter().any(|w| w.contains(s));
+    // An output at an input address, an address that is no PLC address and bit 10 are on no
+    // card; a point without an address is left to the I/O list.
+    assert!(has("-Q9 (page 2): address %IX0.2 is an input"), "{w:?}");
+    assert!(has("-I9 (page 2): address \"Slot 1\" is not a PLC address"), "{w:?}");
+    assert!(has("-I10 (page 2): address %IX0.10 names no bit"), "{w:?}");
+    assert!(!has("-I11"), "{w:?}");
+    // %IW64 covers bytes 64 and 65: the byte card at %IB65 shares one, the one at %IB66 none.
+    assert!(has("slot 3: address %IB65 is also on PLC rack \"R\" slot 2"), "{w:?}");
+    assert!(!has("slot 4"), "{w:?}");
+    assert_eq!(w.len(), 4, "{w:?}");
+    // A card with its own step is compared by address only.
+    p.meta.racks[0].cards[2].step = Some(1);
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    assert!(!plc_rack_warnings(&i).iter().any(|w| w.contains("slot 3")));
 }

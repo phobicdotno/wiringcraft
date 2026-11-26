@@ -5,6 +5,7 @@ use wc_core::symbol::{Pin, PinDir, SymbolRole};
 
 fn sym(id: &str, pin_y: f64) -> Symbol {
     Symbol {
+        source: String::new(),
         id: id.into(),
         name: "Coil".into(),
         category: "relays".into(),
@@ -379,5 +380,117 @@ fn lock_missing_reports_a_file_that_turns_wrong_after_the_scan_and_pins_the_rest
         assert!(f.project.lock.symbols.contains_key(id), "{id} pinned");
     }
     assert!(!f.project.lock.symbols.contains_key("bb"));
+    Ok(())
+}
+
+#[test]
+fn an_update_checks_every_item_before_it_writes_any() -> Result<()> {
+    let mut f = fixture()?;
+    // Both placed, so both are pinned.
+    f.project.pages[0].symbols.push(PlacedSymbol {
+        id: "s2".into(),
+        symbol: "other".into(),
+        at: Point::new(30.0, 10.0),
+        rotation: Default::default(),
+        mirror: false,
+        tag: None,
+    });
+    let lib = Library::open(&f.proj, &f.project)?;
+    assert!(lock_missing(&f.proj, &mut f.project, &lib)?.is_empty());
+    let lock = f.project.lock.clone();
+    write_symbol(&f.company, &sym("coil", 12.5))?;
+    write_symbol(&f.company, &sym("other", 6.0))?;
+    let all = status(&f.proj, &f.project, &lib);
+    let todo = changed(&all, None);
+    assert_eq!(todo.len(), 2);
+    // The second one changes again after it was looked at: nothing is taken, not even the
+    // first, so the files and the lock still agree.
+    write_symbol(&f.company, &sym("other", 7.0))?;
+    let r = update_items(&f.proj, &mut f.project, &lib, &todo);
+    assert!(r.is_err_and(|e| {
+        e.to_string()
+            .contains("changed in the library while it was being updated")
+    }));
+    assert_eq!(f.project.lock, lock);
+    assert_eq!(
+        wc_core::store::read_vendored_symbol(&f.proj, "coil")?.pins[1].at.y,
+        10.0
+    );
+    assert_eq!(
+        wc_core::store::read_vendored_symbol(&f.proj, "other")?.pins[1].at.y,
+        5.0
+    );
+
+    // A file that cannot be read stops the update before anything is written: it could not
+    // be put back after a later failure.
+    let todo = changed(&status(&f.proj, &f.project, &lib), None);
+    let other = wc_core::store::vendor_path(&f.proj, ItemKind::Symbol, "other")?;
+    let kept = std::fs::read(&other).map_err(|e| wc_core::Error::io("other", e))?;
+    std::fs::remove_file(&other).map_err(|e| wc_core::Error::io("other", e))?;
+    std::fs::create_dir(&other).map_err(|e| wc_core::Error::io("other", e))?;
+    assert!(update_items(&f.proj, &mut f.project, &lib, &todo).is_err());
+    assert_eq!(f.project.lock, lock);
+    assert_eq!(
+        wc_core::store::read_vendored_symbol(&f.proj, "coil")?.pins[1].at.y,
+        10.0
+    );
+    std::fs::remove_dir(&other).map_err(|e| wc_core::Error::io("other", e))?;
+    std::fs::write(&other, kept).map_err(|e| wc_core::Error::io("other", e))?;
+
+    // A write that fails puts back what was written before it and leaves the lock as it was.
+    let todo = changed(&status(&f.proj, &f.project, &lib), None);
+    let other = wc_core::store::vendor_path(&f.proj, ItemKind::Symbol, "other")?;
+    let mut tmp = other.as_os_str().to_owned();
+    tmp.push(".tmp");
+    std::fs::create_dir_all(PathBuf::from(&tmp)).map_err(|e| wc_core::Error::io("tmp", e))?;
+    assert!(update_items(&f.proj, &mut f.project, &lib, &todo).is_err());
+    assert_eq!(f.project.lock, lock);
+    assert_eq!(
+        wc_core::store::read_vendored_symbol(&f.proj, "coil")?.pins[1].at.y,
+        10.0
+    );
+    std::fs::remove_dir(PathBuf::from(&tmp)).map_err(|e| wc_core::Error::io("tmp", e))?;
+    assert_eq!(update_items(&f.proj, &mut f.project, &lib, &todo)?.len(), 2);
+    assert_eq!(
+        wc_core::store::read_vendored_symbol(&f.proj, "other")?.pins[1].at.y,
+        7.0
+    );
+    Ok(())
+}
+
+#[test]
+fn a_folder_source_with_a_rules_file_gives_its_rules_in_source_order() -> Result<()> {
+    let f = fixture()?;
+    let io = |e: std::io::Error| wc_core::Error::io("rules", e);
+    // No rules files: nothing.
+    assert!(library_rules(&f.proj, &f.project).is_empty());
+    std::fs::write(
+        f.company.join("rules.toml"),
+        "[[rule]]\nname = \"motor-cable\"\nkind = \"cable\"\ndevices = \"-M*\"\n",
+    )
+    .map_err(io)?;
+    let personal = f.proj.join("../personal");
+    std::fs::write(personal.join("rules.toml"), "[[rule]\n").map_err(io)?;
+    let sets = library_rules(&f.proj, &f.project);
+    assert_eq!(sets.len(), 2);
+    assert_eq!(sets[0].source, "company");
+    let rules = sets[0].rules.as_ref().map_err(|e| wc_core::Error::Invalid(e.clone()))?;
+    assert_eq!(rules[0].name.as_deref(), Some("motor-cable"));
+    assert_eq!(sets[1].source, "personal");
+    assert!(sets[1].rules.is_err(), "a file that does not parse says so");
+
+    // A source that cannot be resolved says why, under its name, rather than vanishing.
+    let mut project = f.project.clone();
+    project.meta.libraries.push(wc_core::project::LibrarySource {
+        name: "odd".into(),
+        kind: "zip".into(),
+        location: "x".into(),
+        reference: None,
+    });
+    let sets = library_rules(&f.proj, &project);
+    assert_eq!(sets.len(), 3);
+    assert_eq!(sets[2].source, "odd");
+    let why = sets[2].rules.as_ref().err().cloned().unwrap_or_default();
+    assert!(why.contains("unknown kind"), "{why}");
     Ok(())
 }

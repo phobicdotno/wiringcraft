@@ -40,6 +40,15 @@ pub struct ProjectMeta {
     /// Jumpers (bridges) between terminals of one strip; jumpered terminals are one potential.
     #[serde(default, rename = "jumper", skip_serializing_if = "Vec::is_empty")]
     pub jumpers: Vec<Jumper>,
+    /// Terminal strips arranged in the terminal strip editor: their terminal order and spare
+    /// terminals. A strip that is not listed keeps the usual order (by terminal number).
+    #[serde(
+        default,
+        rename = "strip",
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "unique_layouts"
+    )]
+    pub strips: Vec<StripLayout>,
     /// The project's logo, shown on the cover page and in every title block.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logo: Option<Logo>,
@@ -47,6 +56,30 @@ pub struct ProjectMeta {
     /// written once it differs from the built-in layout.
     #[serde(default, skip_serializing_if = "crate::template::PageTemplate::is_default")]
     pub template: crate::template::PageTemplate,
+    /// The project's issued revisions, oldest first: what a page's clouds and revision table
+    /// refer to.
+    #[serde(default, rename = "revision", skip_serializing_if = "Vec::is_empty")]
+    pub revisions: Vec<crate::revision::Revision>,
+    /// Report layouts the user designed, one per report kind: columns, headings, order and
+    /// sort ([`crate::report_layout`]).
+    #[serde(default, rename = "report", skip_serializing_if = "Vec::is_empty")]
+    pub reports: Vec<crate::report_layout::ReportLayout>,
+    /// Check rules the user wrote, run with the built-in project check
+    /// ([`crate::check_rule`]).
+    #[serde(default, rename = "rule", skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<crate::check_rule::CheckRule>,
+    /// Library check rules this project turns off, each as `source:number` or `source:name`
+    /// (a library source's `rules.toml`, [`crate::check_rule`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules_off: Vec<String>,
+    /// PLC racks and the cards in their slots, laid out on the PLC card overview pages
+    /// ([`crate::plc_rack`]).
+    #[serde(default, rename = "rack", skip_serializing_if = "Vec::is_empty")]
+    pub racks: Vec<crate::plc_rack::PlcRack>,
+    /// Fieldbus networks (PROFINET, EtherCAT, ...): their devices, addresses and cables
+    /// ([`crate::network`]).
+    #[serde(default, rename = "network", skip_serializing_if = "Vec::is_empty")]
+    pub networks: Vec<crate::network::Network>,
 }
 
 /// The project's logo: a JPEG or PNG file in the project folder. The title block shows it in
@@ -178,10 +211,165 @@ pub struct Jumper {
     pub part: Option<String>,
 }
 
+/// How a terminal strip is arranged on its rail: the order of its terminals and the spare
+/// terminals it has beyond those drawn on the schematic. Written by the terminal strip editor;
+/// the terminal plan and the WAGO configurator export follow it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "StoredStripLayout")]
+pub struct StripLayout {
+    /// The strip, e.g. `-X1`.
+    pub strip: DeviceTag,
+    /// Terminal numbers in rail order, spares included. Terminals it does not name (drawn
+    /// after the order was set) follow at the end in their usual order; numbers that are
+    /// neither drawn nor spare are skipped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub order: Vec<String>,
+    /// Spare terminals: on the rail but not drawn, e.g. `["S1"]`. A spare whose number is drawn
+    /// later is that drawn terminal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spares: Vec<String>,
+}
+
+/// Read the `[[strip]]` layouts, refusing two for the same strip: which one counts would
+/// depend on their order in the file.
+fn unique_layouts<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<StripLayout>, D::Error> {
+    let list = Vec::<StripLayout>::deserialize(d)?;
+    let mut seen = std::collections::BTreeSet::new();
+    for l in &list {
+        if !seen.insert(&l.strip) {
+            return Err(serde::de::Error::custom(format!(
+                "terminal strip {} is arranged twice in [[strip]]",
+                l.strip
+            )));
+        }
+    }
+    Ok(list)
+}
+
+/// A [`StripLayout`] as read from `project.toml`, before its terminal numbers are checked.
+#[derive(Deserialize)]
+struct StoredStripLayout {
+    strip: DeviceTag,
+    #[serde(default)]
+    order: Vec<String>,
+    #[serde(default)]
+    spares: Vec<String>,
+}
+
+impl TryFrom<StoredStripLayout> for StripLayout {
+    type Error = String;
+
+    /// Refuses a layout naming a number that cannot be a terminal of its strip (a hand edit
+    /// or another tool), so it never becomes a device tag the project cannot read back.
+    fn try_from(s: StoredStripLayout) -> Result<Self, String> {
+        for n in s.order.iter().chain(&s.spares) {
+            check_terminal_number(&s.strip, n)?;
+        }
+        Ok(StripLayout {
+            strip: s.strip,
+            order: s.order,
+            spares: s.spares,
+        })
+    }
+}
+
+impl StripLayout {
+    /// The strip's terminals in rail order, each once, with whether it is a spare (not drawn):
+    /// `drawn` are the drawn terminal numbers in their usual order. Terminals named in
+    /// [`StripLayout::order`] come first in that order; the others follow, drawn ones in their
+    /// usual order and then spares in natural order.
+    pub fn arrange(&self, drawn: &[String]) -> Vec<(String, bool)> {
+        let mut all: Vec<(String, bool)> = Vec::new();
+        for n in drawn {
+            if !all.iter().any(|(t, _)| t == n) {
+                all.push((n.clone(), false));
+            }
+        }
+        let mut spares: Vec<&String> = self.spares.iter().filter(|s| !drawn.contains(s)).collect();
+        spares.sort_by(|a, b| natural_key(a).cmp(&natural_key(b)).then_with(|| a.cmp(b)));
+        for s in spares {
+            if !all.iter().any(|(t, _)| t == s) {
+                all.push((s.clone(), true));
+            }
+        }
+        let mut out: Vec<(String, bool)> = Vec::with_capacity(all.len());
+        for n in &self.order {
+            if let Some(k) = all.iter().position(|(t, _)| t == n) {
+                out.push(all.remove(k));
+            }
+        }
+        out.extend(all);
+        out
+    }
+
+    /// Whether the layout says nothing: no order and no spares.
+    pub fn is_empty(&self) -> bool {
+        self.order.is_empty() && self.spares.is_empty()
+    }
+}
+
+/// Every terminal strip of the project with its terminals in rail order, each with whether it
+/// is a spare: the drawn terminals as [`terminal_numbers`] numbers them, arranged by the
+/// strip's [`StripLayout`], plus strips that only have spares.
+pub fn strip_terminals(
+    project: &Project,
+    role: impl Fn(&str) -> Option<SymbolRole>,
+) -> BTreeMap<DeviceTag, Vec<(String, bool)>> {
+    let numbers = terminal_numbers(project, role);
+    let mut drawn: BTreeMap<DeviceTag, Vec<String>> = BTreeMap::new();
+    for (strip, n) in numbers.values() {
+        let list = drawn.entry(strip.clone()).or_default();
+        if !list.contains(n) {
+            list.push(n.clone());
+        }
+    }
+    for list in drawn.values_mut() {
+        list.sort_by(|a, b| natural_key(a).cmp(&natural_key(b)).then_with(|| a.cmp(b)));
+    }
+    for l in &project.meta.strips {
+        drawn.entry(l.strip.clone()).or_default();
+    }
+    drawn
+        .into_iter()
+        .map(|(strip, list)| {
+            let arranged = match project.meta.strip_layout(&strip) {
+                Some(l) => l.arrange(&list),
+                None => list.into_iter().map(|n| (n, false)).collect(),
+            };
+            (strip, arranged)
+        })
+        .filter(|(_, list)| !list.is_empty())
+        .collect()
+}
+
+/// Whether `number` can be a terminal of `strip`: one more tag level (`1.2` would be two).
+fn check_terminal_number(strip: &DeviceTag, number: &str) -> Result<(), String> {
+    let mut tag = strip.clone();
+    tag.product.push(number.to_owned());
+    if number.is_empty() || DeviceTag::parse(&tag.to_string()).ok().as_ref() != Some(&tag) {
+        return Err(format!(
+            "{number:?} cannot be a terminal of {strip}: a terminal is one tag level"
+        ));
+    }
+    Ok(())
+}
+
 /// The next automatic terminal number after `last`, which it advances; `None` past the largest.
 pub fn next_number(last: &mut u64) -> Option<String> {
     *last = last.checked_add(1)?;
     Some(last.to_string())
+}
+
+/// [`next_number`], passing over the numbers in `taken` (a strip's spares): a terminal tagged
+/// with just the strip never takes a spare's number, and adding a spare past the drawn numbers
+/// never renumbers it.
+pub fn next_free_number(last: &mut u64, taken: &[String]) -> Option<String> {
+    loop {
+        let n = next_number(last)?;
+        if !taken.contains(&n) {
+            return Some(n);
+        }
+    }
 }
 
 /// Keep the jumpers of `project` on their terminals after a change: `before` is the
@@ -193,9 +381,79 @@ pub fn follow_terminals_in(
     before: &TerminalNumbers,
     role: impl Fn(&str) -> Option<SymbolRole>,
 ) -> bool {
-    if project.meta.jumpers.is_empty() {
+    if !project.meta.follows_terminals() {
         return false;
     }
+    let was = project.meta.clone();
+    let mut after = numbers_after(project, before, &role);
+    // A spare can only go with its strip to a tag no other device is drawn with there, nor has
+    // device data of its own: it would take over that device (its part, its panel place), as
+    // Project::add_spare refuses, and leave its own data behind. Judged by what is drawn with
+    // the tag, not by the numbers terminals tagged with just the strip happen to get, which
+    // change as spares move.
+    let drawn: std::collections::BTreeSet<DeviceTag> = project
+        .pages
+        .iter()
+        .flat_map(|p| p.symbols.iter())
+        .filter_map(|s| s.tag.clone().filter(|t| !is_terminal(t, role(&s.symbol))))
+        .collect();
+    // A strip's layout taken along to its new name brings its spares, which can change the
+    // numbers of terminals tagged with only the strip there: followed again from the start
+    // with the numbers those spares give.
+    let mut moves = Vec::new();
+    for pass in 0..2 {
+        let refuse = |to: &DeviceTag, layout: &StripLayout| {
+            layout.spares.iter().any(|n| {
+                let mut tag = to.clone();
+                tag.product.push(n.clone());
+                drawn.contains(&tag) || project.devices.contains_key(&tag)
+            })
+        };
+        // Layouts first: a jumper on a spare that went with its strip goes along too.
+        moves = project.meta.follow_layouts_refusing(before, &after, refuse);
+        let (mut jb, mut ja) = (before.clone(), after.clone());
+        for (from, to) in &moves {
+            for n in was.strip_layout(from).map(|l| l.spares.clone()).unwrap_or_default() {
+                if before.values().any(|(s, m)| s == from && *m == n) {
+                    continue;
+                }
+                let key = (String::new(), format!("spare {from} {n}"));
+                jb.insert(key.clone(), (from.clone(), n.clone()));
+                ja.insert(key, (to.clone(), n));
+            }
+        }
+        project.meta.follow_terminals(&jb, &ja);
+        let again = numbers_after(project, before, &role);
+        if again == after || pass == 1 {
+            break;
+        }
+        project.meta = was.clone();
+        after = again;
+    }
+    // The device data of a spare (its part, its level, its panel place) goes with it to the
+    // strip's new name, which has none of its own (a layout is not moved onto such a name).
+    for (from, to) in &moves {
+        let spares = was.strip_layout(from).map(|l| l.spares.clone()).unwrap_or_default();
+        for n in spares {
+            let (mut old, mut new) = (from.clone(), to.clone());
+            old.product.push(n.clone());
+            new.product.push(n);
+            if !project.devices.contains_key(&new) {
+                project.rename_device(&old, &new);
+            }
+        }
+    }
+    project.meta != was || !moves.is_empty()
+}
+
+/// The [`terminal_numbers`] of `project` after a change, for following it from `before`: a
+/// terminal still placed on a page that became an overview, or a registered spare whose
+/// drawing went, keeps its old number.
+fn numbers_after(
+    project: &Project,
+    before: &TerminalNumbers,
+    role: &impl Fn(&str) -> Option<SymbolRole>,
+) -> TerminalNumbers {
     let mut after = terminal_numbers(project, role);
     let taken: std::collections::BTreeSet<(DeviceTag, String)> = after.values().cloned().collect();
     for (key, was) in before {
@@ -206,11 +464,17 @@ pub fn follow_terminals_in(
             .is_some_and(|pg| pg.overview && pg.symbols.iter().any(|s| s.id == key.1));
         // Its old number now belongs to another terminal (strip-only terminals renumbered
         // without the overview page): it is no longer that terminal, and leaves its jumper.
-        if on_overview && !after.contains_key(key) && !taken.contains(was) {
+        // A registered spare whose drawing went is still on the rail as a spare: it keeps its
+        // place in the jumper, like a terminal that is not drawn.
+        let spare = project
+            .meta
+            .strip_layout(&was.0)
+            .is_some_and(|l| l.spares.contains(&was.1));
+        if (on_overview || spare) && !after.contains_key(key) && !taken.contains(was) {
             after.insert(key.clone(), was.clone());
         }
     }
-    project.meta.follow_terminals(before, &after)
+    after
 }
 
 /// Whether a placed symbol with `tag` and symbol `role` counts as a terminal: a terminal symbol,
@@ -267,6 +531,13 @@ pub fn terminal_numbers(project: &Project, role: impl Fn(&str) -> Option<SymbolR
             (None, Some(_)) => std::cmp::Ordering::Greater,
             (None, None) => a.page.cmp(&b.page).then(a.x.total_cmp(&b.x)),
         });
+        // Terminals tagged with just the strip are numbered after the largest drawn number,
+        // passing over the spares' numbers: a spare's number is taken though nothing draws it.
+        let spares = project
+            .meta
+            .strip_layout(&strip)
+            .map(|l| l.spares.as_slice())
+            .unwrap_or(&[]);
         let mut next = list
             .iter()
             .filter_map(|t| t.number.as_deref()?.parse::<u64>().ok())
@@ -276,7 +547,7 @@ pub fn terminal_numbers(project: &Project, role: impl Fn(&str) -> Option<SymbolR
             // A strip already at the largest number leaves the rest unnumbered.
             let number = match t.number {
                 Some(n) => n,
-                None => match next_number(&mut next) {
+                None => match next_free_number(&mut next, spares) {
                     Some(n) => n,
                     None => continue,
                 },
@@ -478,8 +749,15 @@ impl ProjectMeta {
             libraries: Vec::new(),
             locations: Vec::new(),
             jumpers: Vec::new(),
+            strips: Vec::new(),
             logo: None,
             template: crate::template::PageTemplate::default(),
+            revisions: Vec::new(),
+            reports: Vec::new(),
+            rules: Vec::new(),
+            rules_off: Vec::new(),
+            racks: Vec::new(),
+            networks: Vec::new(),
         }
     }
 
@@ -500,13 +778,7 @@ impl ProjectMeta {
     ) -> Result<(), String> {
         let mut set: Vec<String> = Vec::new();
         for t in terminals.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
-            let mut tag = strip.clone();
-            tag.product.push(t.to_owned());
-            if DeviceTag::parse(&tag.to_string()).ok().as_ref() != Some(&tag) {
-                return Err(format!(
-                    "{t:?} cannot be a terminal of {strip}: a terminal is one tag level"
-                ));
-            }
+            check_terminal_number(strip, t)?;
             if !set.iter().any(|s| s == t) {
                 set.push(t.to_owned());
             }
@@ -655,28 +927,457 @@ impl ProjectMeta {
         Ok(true)
     }
 
+    /// Whether anything names terminals by number (jumpers, or a strip's rail order and spares),
+    /// so a change that renames, renumbers or deletes terminals must be followed.
+    pub fn follows_terminals(&self) -> bool {
+        !self.jumpers.is_empty() || self.strips.iter().any(|l| !l.is_empty())
+    }
+
+    /// Keep each strip's rail order on the terminals it named, after a change (`before` to
+    /// `after`, as [`ProjectMeta::follow_terminals`]): a renamed or renumbered terminal keeps
+    /// its place under its new number, a deleted one leaves the order, and a strip whose drawn
+    /// terminals all went to one other strip (the strip renamed) takes its layout along. Spares
+    /// and numbers that were not drawn stay. Returns whether a layout changed.
+    pub fn follow_layouts(&mut self, before: &TerminalNumbers, after: &TerminalNumbers) -> bool {
+        let old = self.strips.clone();
+        self.follow_layouts_moving(before, after);
+        self.strips != old
+    }
+
+    /// [`ProjectMeta::follow_layouts`], returning the layouts taken to another strip, as
+    /// (old strip, new strip). Two strips whose terminals all went to the same new one do not
+    /// both take their layout there: the first (in strip order) does, the other stays.
+    pub fn follow_layouts_moving(
+        &mut self,
+        before: &TerminalNumbers,
+        after: &TerminalNumbers,
+    ) -> Vec<(DeviceTag, DeviceTag)> {
+        self.follow_layouts_refusing(before, after, |_, _| false)
+    }
+
+    /// [`ProjectMeta::follow_layouts_moving`], where a layout `refuse(new strip, layout)` says
+    /// may not go to the new strip stays under its old one.
+    pub fn follow_layouts_refusing(
+        &mut self,
+        before: &TerminalNumbers,
+        after: &TerminalNumbers,
+        refuse: impl Fn(&DeviceTag, &StripLayout) -> bool,
+    ) -> Vec<(DeviceTag, DeviceTag)> {
+        let old = self.strips.clone();
+        let mut moves: Vec<(DeviceTag, DeviceTag)> = Vec::new();
+        for layout in std::mem::take(&mut self.strips) {
+            let strip = &layout.strip;
+            // What became of each drawn terminal of the strip: kept, another number or strip,
+            // or deleted (None).
+            let went = |n: &str| -> Option<Option<(DeviceTag, String)>> {
+                let keys: Vec<&(String, String)> = before
+                    .iter()
+                    .filter(|(_, (s, m))| s == strip && m == n)
+                    .map(|(k, _)| k)
+                    .collect();
+                if keys.is_empty() {
+                    return None;
+                }
+                let same = (strip.clone(), n.to_owned());
+                if keys.iter().any(|k| after.get(*k) == Some(&same)) {
+                    return Some(Some(same));
+                }
+                Some(keys.iter().find_map(|k| after.get(*k).cloned()))
+            };
+            // The strip renamed: every drawn terminal of it went to one other strip, which has
+            // no layout of its own.
+            let drawn: Vec<Option<(DeviceTag, String)>> = before
+                .iter()
+                .filter(|(_, (s, _))| s == strip)
+                .map(|(k, _)| after.get(k).cloned())
+                .collect();
+            let mut targets: Vec<&DeviceTag> = drawn.iter().flatten().map(|(s, _)| s).collect();
+            targets.sort();
+            targets.dedup();
+            let moved_to = match (drawn.iter().all(Option::is_some), targets.as_slice()) {
+                (true, [only])
+                    if *only != strip
+                        && !old.iter().any(|l| &l.strip == *only)
+                        && !moves.iter().any(|(_, to)| to == *only)
+                        && !refuse(only, &layout) =>
+                {
+                    Some((*only).clone())
+                }
+                _ => None,
+            };
+            if let Some(to) = &moved_to {
+                moves.push((strip.clone(), to.clone()));
+            }
+            let home = moved_to.clone().unwrap_or_else(|| strip.clone());
+            let mut order: Vec<String> = Vec::new();
+            for n in &layout.order {
+                let number = match went(n) {
+                    Some(Some((s, m))) if s == home => Some(m),
+                    // A spare keeps its place unless its drawing got another number here.
+                    _ if layout.spares.contains(n) => Some(n.clone()),
+                    None => Some(n.clone()),
+                    // Deleted, or gone to another strip.
+                    Some(_) => None,
+                };
+                if let Some(m) = number
+                    && !order.contains(&m)
+                {
+                    order.push(m);
+                }
+            }
+            let layout = StripLayout {
+                strip: home.clone(),
+                order,
+                spares: layout.spares,
+            };
+            self.with_layout(&home, |l| *l = layout);
+        }
+        self.drop_empty_layouts();
+        moves
+    }
+
+    /// How `strip` is arranged in the terminal strip editor, if it was.
+    pub fn strip_layout(&self, strip: &DeviceTag) -> Option<&StripLayout> {
+        self.strips.iter().find(|l| &l.strip == strip)
+    }
+
+    /// Run `f` on the layout of `strip`, made when it has none; layouts stay in strip order.
+    fn with_layout<R>(&mut self, strip: &DeviceTag, f: impl FnOnce(&mut StripLayout) -> R) -> R {
+        let mut layout = match self.strips.iter().position(|l| &l.strip == strip) {
+            Some(k) => self.strips.remove(k),
+            None => StripLayout {
+                strip: strip.clone(),
+                order: Vec::new(),
+                spares: Vec::new(),
+            },
+        };
+        let r = f(&mut layout);
+        // Kept in strip order: the layout goes back where its strip sorts.
+        let key = |l: &StripLayout| {
+            let t = l.strip.to_string();
+            (natural_key(&t), t)
+        };
+        let at = self.strips.partition_point(|l| key(l) < key(&layout));
+        self.strips.insert(at, layout);
+        r
+    }
+
+    /// Drop layouts that say nothing any more.
+    fn drop_empty_layouts(&mut self) {
+        self.strips.retain(|l| !l.is_empty());
+    }
+
+    /// Put the terminals of `strip` in rail `order` (terminal numbers, spares included). An
+    /// empty order goes back to the usual order. Refused for a number given twice or one that
+    /// cannot be a terminal of the strip. Returns whether anything changed.
+    pub fn set_terminal_order(&mut self, strip: &DeviceTag, order: &[String]) -> Result<bool, String> {
+        let mut list: Vec<String> = Vec::new();
+        for n in order.iter().map(|n| n.trim()) {
+            check_terminal_number(strip, n)?;
+            if list.iter().any(|t| t == n) {
+                return Err(format!("terminal {n} of {strip} is given twice"));
+            }
+            list.push(n.to_owned());
+        }
+        let before = self.strips.clone();
+        self.with_layout(strip, |l| l.order = list);
+        self.drop_empty_layouts();
+        Ok(self.strips != before)
+    }
+
+    /// Add spare terminal `number` to `strip`, placed right after terminal `after` when given
+    /// (`current` is the strip's rail order, see [`strip_terminals`]), else at the end. Refused
+    /// when the strip already has that terminal or the number cannot be a terminal of it.
+    pub fn add_spare(
+        &mut self,
+        strip: &DeviceTag,
+        number: &str,
+        after: Option<&str>,
+        current: &[(String, bool)],
+    ) -> Result<(), String> {
+        let number = number.trim();
+        check_terminal_number(strip, number)?;
+        if current.iter().any(|(t, _)| t == number)
+            || self
+                .strip_layout(strip)
+                .is_some_and(|l| l.spares.iter().any(|s| s == number))
+        {
+            return Err(format!("{strip} already has terminal {number}"));
+        }
+        let mut order: Vec<String> = current.iter().map(|(t, _)| t.clone()).collect();
+        let at = match after {
+            Some(a) => order
+                .iter()
+                .position(|t| t == a)
+                .map(|k| k + 1)
+                .ok_or_else(|| format!("{strip} has no terminal {a}"))?,
+            None => order.len(),
+        };
+        order.insert(at, number.to_owned());
+        self.with_layout(strip, |l| {
+            l.spares.push(number.to_owned());
+            l.order = order;
+        });
+        Ok(())
+    }
+
+    /// Take spare terminal `number` off `strip`, and out of its jumper; `current` is the strip's
+    /// rail order (see [`strip_terminals`]). A spare that has been drawn since is that drawn
+    /// terminal: only its spare entry goes, its place and jumper stay. Returns whether it was
+    /// a spare.
+    pub fn remove_spare(&mut self, strip: &DeviceTag, number: &str, current: &[(String, bool)]) -> bool {
+        let drawn = current.iter().any(|(t, spare)| t == number && !spare);
+        let Some(l) = self.strips.iter_mut().find(|l| &l.strip == strip) else {
+            return false;
+        };
+        let before = l.spares.len();
+        l.spares.retain(|s| s != number);
+        if l.spares.len() == before {
+            return false;
+        }
+        if !drawn {
+            l.order.retain(|t| t != number);
+        }
+        self.drop_empty_layouts();
+        if !drawn {
+            self.remove_from_jumper(strip, number);
+        }
+        true
+    }
+
+    /// Move terminal `number` of `strip` to `to` (0 is first) in its rail order; `current` is
+    /// the strip's rail order (see [`strip_terminals`]). Returns whether anything changed.
+    pub fn move_terminal(
+        &mut self,
+        strip: &DeviceTag,
+        number: &str,
+        to: usize,
+        current: &[(String, bool)],
+    ) -> Result<bool, String> {
+        let mut order: Vec<String> = current.iter().map(|(t, _)| t.clone()).collect();
+        let from = order
+            .iter()
+            .position(|t| t == number)
+            .ok_or_else(|| format!("{strip} has no terminal {number}"))?;
+        let n = order.remove(from);
+        order.insert(to.min(order.len()), n);
+        if order.iter().eq(current.iter().map(|(t, _)| t)) {
+            return Ok(false);
+        }
+        self.set_terminal_order(strip, &order)
+    }
+
     /// The jumper a terminal (`-X1.4`) is in, if any.
     pub fn jumper_of(&self, terminal: &DeviceTag) -> Option<&Jumper> {
         self.jumpers.iter().find(|j| j.terminal_of(terminal).is_some())
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// A page's sheet: an ISO A size, landscape or portrait, or a size of its own. Stored by
+/// name (`A3`, `A4Portrait`) or as `{ Custom = { width, height } }`. A stored custom size
+/// outside [`PageSize::MIN_MM`] to [`PageSize::MAX_MM`] is refused when read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(try_from = "StoredPageSize")]
 pub enum PageSize {
     A4,
     #[default]
     A3,
     A2,
+    A1,
+    A0,
+    A4Portrait,
+    A3Portrait,
+    A2Portrait,
+    A1Portrait,
+    A0Portrait,
+    /// Width and height in whole millimetres, each from [`PageSize::MIN_MM`] to
+    /// [`PageSize::MAX_MM`].
+    Custom {
+        width: u32,
+        height: u32,
+    },
+}
+
+/// [`PageSize`] as stored, before a custom size is checked.
+#[derive(Deserialize)]
+enum StoredPageSize {
+    A4,
+    A3,
+    A2,
+    A1,
+    A0,
+    A4Portrait,
+    A3Portrait,
+    A2Portrait,
+    A1Portrait,
+    A0Portrait,
+    Custom { width: u32, height: u32 },
+}
+
+impl TryFrom<StoredPageSize> for PageSize {
+    type Error = String;
+
+    fn try_from(stored: StoredPageSize) -> Result<Self, String> {
+        Ok(match stored {
+            StoredPageSize::A4 => PageSize::A4,
+            StoredPageSize::A3 => PageSize::A3,
+            StoredPageSize::A2 => PageSize::A2,
+            StoredPageSize::A1 => PageSize::A1,
+            StoredPageSize::A0 => PageSize::A0,
+            StoredPageSize::A4Portrait => PageSize::A4Portrait,
+            StoredPageSize::A3Portrait => PageSize::A3Portrait,
+            StoredPageSize::A2Portrait => PageSize::A2Portrait,
+            StoredPageSize::A1Portrait => PageSize::A1Portrait,
+            StoredPageSize::A0Portrait => PageSize::A0Portrait,
+            StoredPageSize::Custom { width, height } => PageSize::custom(width, height)?,
+        })
+    }
 }
 
 impl PageSize {
-    /// Landscape width and height in millimetres.
+    /// The named sizes, in the order lists offer them.
+    pub const NAMED: [PageSize; 10] = [
+        PageSize::A4,
+        PageSize::A4Portrait,
+        PageSize::A3,
+        PageSize::A3Portrait,
+        PageSize::A2,
+        PageSize::A2Portrait,
+        PageSize::A1,
+        PageSize::A1Portrait,
+        PageSize::A0,
+        PageSize::A0Portrait,
+    ];
+    /// The smallest side of a custom sheet, in millimetres.
+    pub const MIN_MM: u32 = 100;
+    /// The largest side of a custom sheet, in millimetres (a little over A0's long side).
+    pub const MAX_MM: u32 = 2000;
+
+    /// Width and height in millimetres, as the sheet is drawn.
     pub fn mm(self) -> (f64, f64) {
+        let landscape = |(w, h): (f64, f64)| (w, h);
+        let portrait = |(w, h): (f64, f64)| (h, w);
         match self {
-            PageSize::A4 => (297.0, 210.0),
-            PageSize::A3 => (420.0, 297.0),
-            PageSize::A2 => (594.0, 420.0),
+            PageSize::A4 => landscape((297.0, 210.0)),
+            PageSize::A3 => landscape((420.0, 297.0)),
+            PageSize::A2 => landscape((594.0, 420.0)),
+            PageSize::A1 => landscape((841.0, 594.0)),
+            PageSize::A0 => landscape((1189.0, 841.0)),
+            PageSize::A4Portrait => portrait((297.0, 210.0)),
+            PageSize::A3Portrait => portrait((420.0, 297.0)),
+            PageSize::A2Portrait => portrait((594.0, 420.0)),
+            PageSize::A1Portrait => portrait((841.0, 594.0)),
+            PageSize::A0Portrait => portrait((1189.0, 841.0)),
+            PageSize::Custom { width, height } => (f64::from(width), f64::from(height)),
         }
+    }
+
+    pub fn is_portrait(self) -> bool {
+        let (w, h) = self.mm();
+        h > w
+    }
+
+    /// The name people read: `A4 landscape`, `A3 portrait`, `500 x 700 mm`.
+    pub fn label(self) -> String {
+        let iso = |n: &str, portrait: bool| format!("{n} {}", if portrait { "portrait" } else { "landscape" });
+        match self {
+            PageSize::A4 => iso("A4", false),
+            PageSize::A3 => iso("A3", false),
+            PageSize::A2 => iso("A2", false),
+            PageSize::A1 => iso("A1", false),
+            PageSize::A0 => iso("A0", false),
+            PageSize::A4Portrait => iso("A4", true),
+            PageSize::A3Portrait => iso("A3", true),
+            PageSize::A2Portrait => iso("A2", true),
+            PageSize::A1Portrait => iso("A1", true),
+            PageSize::A0Portrait => iso("A0", true),
+            PageSize::Custom { width, height } => format!("{width} x {height} mm"),
+        }
+    }
+
+    /// The short name commands take: `A4`, `A4-portrait`, `500x700`.
+    pub fn code(self) -> String {
+        match self {
+            PageSize::Custom { width, height } => format!("{width}x{height}"),
+            named => {
+                let label = named.label();
+                let (name, way) = label.split_once(' ').unwrap_or((label.as_str(), ""));
+                if way == "portrait" {
+                    format!("{name}-portrait")
+                } else {
+                    name.to_owned()
+                }
+            }
+        }
+    }
+
+    /// Read a size as people type it: `A4`, `a4 portrait`, `A4-portrait`, `A4P`, `A3
+    /// landscape`, or a custom `500x700` (millimetres, width first). The error says what is
+    /// accepted.
+    pub fn parse(text: &str) -> Result<PageSize, String> {
+        let lower = text.trim().to_ascii_lowercase();
+        // Hyphens join the words of a name (`A4-portrait`); a custom size keeps its signs.
+        let t = lower.replace(['-', '_'], " ");
+        let words: Vec<&str> = t.split_whitespace().collect();
+        let (name, portrait) = match words.as_slice() {
+            [one] => match one.strip_suffix('p') {
+                Some(prefix) if prefix.starts_with('a') => (prefix, true),
+                _ => (*one, false),
+            },
+            [one, "portrait"] => (*one, true),
+            [one, "landscape"] => (*one, false),
+            _ => ("", false),
+        };
+        let named = match (name, portrait) {
+            ("a4", false) => Some(PageSize::A4),
+            ("a3", false) => Some(PageSize::A3),
+            ("a2", false) => Some(PageSize::A2),
+            ("a1", false) => Some(PageSize::A1),
+            ("a0", false) => Some(PageSize::A0),
+            ("a4", true) => Some(PageSize::A4Portrait),
+            ("a3", true) => Some(PageSize::A3Portrait),
+            ("a2", true) => Some(PageSize::A2Portrait),
+            ("a1", true) => Some(PageSize::A1Portrait),
+            ("a0", true) => Some(PageSize::A0Portrait),
+            _ => None,
+        };
+        if let Some(size) = named {
+            return Ok(size);
+        }
+        let bad = || {
+            format!(
+                "size {text:?} is not A4, A3, A2, A1 or A0 (add \"portrait\" for an upright sheet) or a custom WIDTHxHEIGHT in millimetres"
+            )
+        };
+        // Spaces around `x` and before `mm` are fine; inside a number they are not.
+        let dims = lower.strip_suffix("mm").unwrap_or(&lower);
+        let (w, h) = dims.split_once('x').ok_or_else(bad)?;
+        let side = |name: &str, v: &str| {
+            v.trim().parse::<u32>().map_err(|e| {
+                format!(
+                    "size {text:?}: the {name} {:?} is not a whole number of millimetres ({e}); each side is {} to {} mm",
+                    v.trim(),
+                    Self::MIN_MM,
+                    Self::MAX_MM
+                )
+            })
+        };
+        let (width, height) = (side("width", w)?, side("height", h)?);
+        PageSize::custom(width, height)
+    }
+
+    /// A sheet of its own size, in whole millimetres.
+    pub fn custom(width: u32, height: u32) -> Result<PageSize, String> {
+        for side in [width, height] {
+            if !(Self::MIN_MM..=Self::MAX_MM).contains(&side) {
+                return Err(format!(
+                    "a sheet side of {side} mm is outside {} to {} mm",
+                    Self::MIN_MM,
+                    Self::MAX_MM
+                ));
+            }
+        }
+        Ok(PageSize::Custom { width, height })
     }
 
     /// The reference column (1-based, 1 to [`FRAME_COLUMNS`]) that `x` millimetres falls into,
@@ -698,12 +1399,19 @@ impl PageSize {
         (col as i64).saturating_add(1).clamp(1, columns as i64) as usize
     }
 
-    /// How many reference rows run down the sides of the frame: A to F on A4 and A3, A to H
-    /// on A2. Fixed per sheet size, so a reference never moves.
+    /// How many reference rows run down the sides of the frame, by the sheet's height: A to F
+    /// up to A3 landscape (297 mm), A to H up to A2 landscape (420 mm), A to K up to A1
+    /// landscape (594 mm), A to M above. Fixed per sheet size, so a reference never moves.
     pub fn frame_rows(self) -> usize {
-        match self {
-            PageSize::A4 | PageSize::A3 => 6,
-            PageSize::A2 => 8,
+        let (_, h) = self.mm();
+        if h <= 297.0 {
+            6
+        } else if h <= 420.0 {
+            8
+        } else if h <= 594.0 {
+            10
+        } else {
+            12
         }
     }
 
@@ -854,6 +1562,12 @@ pub struct Page {
     /// ([`ProjectMeta::title_block`]); fields the page does not set come from the project.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub title_block: BTreeMap<String, String>,
+    /// Clouds drawn around what a revision changed on this page.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clouds: Vec<crate::revision::RevisionCloud>,
+    /// Where this page shows the project's revision table (its top-left corner), if it does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_table: Option<Point>,
 }
 
 /// A raster picture under a page: a JPEG or PNG file in the project folder, stretched over a
@@ -892,6 +1606,8 @@ impl Page {
             overview: false,
             cover: false,
             title_block: BTreeMap::new(),
+            clouds: Vec::new(),
+            revision_table: None,
         }
     }
 
@@ -1012,7 +1728,154 @@ pub struct Project {
     pub comments: Vec<crate::review::Comment>,
 }
 
+/// One wire end on a pin its symbol does not have: see [`Project::dangling_ends`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DanglingEnd {
+    pub page: String,
+    pub wire: String,
+    /// The wire's `to` end (else its `from` end).
+    pub to: bool,
+    pub item: String,
+    pub pin: String,
+}
+
 impl Project {
+    /// Add spare terminal `number` to `strip` ([`ProjectMeta::add_spare`]), refused also when
+    /// its tag (`-X1.S1`) is drawn as a device that is not a terminal of the strip, or names
+    /// the cable of a wire core (`-X1.W1`): the spare would take over that device's part.
+    pub fn add_spare(
+        &mut self,
+        strip: &DeviceTag,
+        number: &str,
+        after: Option<&str>,
+        current: &[(String, bool)],
+    ) -> Result<(), String> {
+        let number = number.trim();
+        if let Ok(tag) = DeviceTag::parse(&format!("{strip}.{number}"))
+            && !current.iter().any(|(t, _)| t == number)
+            && self.is_drawn(&tag)
+        {
+            return Err(format!(
+                "{tag} is drawn as a device that is not a terminal of {strip}; pick another number"
+            ));
+        }
+        if let Ok(tag) = DeviceTag::parse(&format!("{strip}.{number}"))
+            && self.is_cable_of_a_core(&tag)
+        {
+            return Err(format!("{tag} is the cable of a wire core; pick another number"));
+        }
+        self.meta.add_spare(strip, number, after, current)
+    }
+
+    /// Take spare terminal `number` off `strip` ([`ProjectMeta::remove_spare`]). A spare that is
+    /// not drawn anywhere also loses its device entry (its part, level and the like), so the bill
+    /// of materials no longer counts it; a drawn one, or one a wire core names as its cable,
+    /// keeps it. Returns whether it was a spare.
+    pub fn remove_spare(&mut self, strip: &DeviceTag, number: &str, current: &[(String, bool)]) -> bool {
+        let number = number.trim();
+        if !self.meta.remove_spare(strip, number, current) {
+            return false;
+        }
+        if let Ok(tag) = DeviceTag::parse(&format!("{strip}.{number}"))
+            && !self.is_drawn(&tag)
+            && !self.is_cable_of_a_core(&tag)
+        {
+            self.devices.remove(&tag);
+        }
+        true
+    }
+
+    /// The device entry of terminal `number` of `strip` that is not a spare (any more): for
+    /// taking a spare off a second time, when its entry is still there (restored by hand, say).
+    /// `current` is the strip's rail order (see [`strip_terminals`]), so a terminal drawn with
+    /// just the strip's tag and numbered on the rail counts as drawn. An entry nothing uses is
+    /// removed (`Ok(true)`); one that is drawn or names the cable of a wire core stays, and the
+    /// error says why. `Ok(false)` when there is no such entry. Refused for a number that cannot
+    /// be a terminal of the strip (`2.3`), which names another strip's terminal.
+    pub fn remove_unused_terminal_entry(
+        &mut self,
+        strip: &DeviceTag,
+        number: &str,
+        current: &[(String, bool)],
+    ) -> Result<bool, String> {
+        let number = number.trim();
+        check_terminal_number(strip, number)?;
+        let tag = DeviceTag::parse(&format!("{strip}.{number}")).map_err(|e| e.to_string())?;
+        if !self.devices.contains_key(&tag) {
+            return Ok(false);
+        }
+        if self.is_drawn(&tag) || current.iter().any(|(t, spare)| t == number && !spare) {
+            return Err(format!("{tag} is drawn, so its device entry stays"));
+        }
+        if self.is_cable_of_a_core(&tag) {
+            return Err(format!("{tag} is the cable of a wire core, so its device entry stays"));
+        }
+        self.devices.remove(&tag);
+        Ok(true)
+    }
+
+    /// Whether a symbol on a page carries `tag`.
+    fn is_drawn(&self, tag: &DeviceTag) -> bool {
+        self.pages
+            .iter()
+            .any(|p| p.symbols.iter().any(|s| s.tag.as_ref() == Some(tag)))
+    }
+
+    /// Whether a wire on a page is a core of cable `tag`.
+    fn is_cable_of_a_core(&self, tag: &DeviceTag) -> bool {
+        self.pages.iter().any(|p| {
+            p.wires
+                .iter()
+                .any(|w| w.cable.as_ref().is_some_and(|c| &c.cable == tag))
+        })
+    }
+
+    /// Wire ends on pins of symbol `id` that `symbol` does not have: `page 3 -K1:13` each. What
+    /// replacing the symbol with that version would leave unconnected.
+    pub fn dangling_pins(&self, id: &str, symbol: &crate::Symbol) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .dangling_ends(id, symbol)
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The wire ends [`Self::dangling_pins`] reports, one by one: keyed by what the end is
+    /// (page id, wire id, which end, and the item and pin it names), so the same end is
+    /// recognised after a device is renamed and two wires on one missing pin are two ends. With
+    /// the end's label for a message. Every end is listed: two wires that share an id (as a
+    /// replaced page may have them) give two entries alike.
+    pub fn dangling_ends(&self, id: &str, symbol: &crate::Symbol) -> Vec<(DanglingEnd, String)> {
+        let mut out = Vec::new();
+        for page in &self.pages {
+            for w in &page.wires {
+                for (to, end) in [(false, &w.from), (true, &w.to)] {
+                    let crate::Endpoint::Pin { item, pin } = end else {
+                        continue;
+                    };
+                    let Some(placed) = page.symbol(item) else { continue };
+                    if placed.symbol == id && symbol.pin(pin).is_none() {
+                        let name = placed.tag.as_ref().map_or_else(|| item.clone(), ToString::to_string);
+                        out.push((
+                            DanglingEnd {
+                                page: page.id.clone(),
+                                wire: w.id.clone(),
+                                to,
+                                item: item.clone(),
+                                pin: pin.clone(),
+                            },
+                            format!("page {} {name}:{pin}", page.number),
+                        ));
+                    }
+                }
+            }
+        }
+        out
+    }
+
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             meta: ProjectMeta::new(name),
@@ -1134,6 +1997,9 @@ impl Project {
                 j.strip = to.clone();
             }
         }
+        for net in &mut self.meta.networks {
+            net.rename_device(from, to);
+        }
         n
     }
 
@@ -1231,8 +2097,125 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::unwrap_used)]
+    fn sheet_sizes_read_write_and_measure() {
+        assert_eq!(PageSize::A1.mm(), (841.0, 594.0));
+        assert_eq!(PageSize::A0.mm(), (1189.0, 841.0));
+        assert_eq!(PageSize::A4Portrait.mm(), (210.0, 297.0));
+        assert!(PageSize::A4Portrait.is_portrait() && !PageSize::A4.is_portrait());
+        for (text, want) in [
+            ("A4", PageSize::A4),
+            ("a3", PageSize::A3),
+            ("A4-portrait", PageSize::A4Portrait),
+            ("a4 portrait", PageSize::A4Portrait),
+            ("A4P", PageSize::A4Portrait),
+            ("A1 landscape", PageSize::A1),
+            ("A0_portrait", PageSize::A0Portrait),
+            (
+                "500x700",
+                PageSize::Custom {
+                    width: 500,
+                    height: 700,
+                },
+            ),
+            (
+                "500 x 700 mm",
+                PageSize::Custom {
+                    width: 500,
+                    height: 700,
+                },
+            ),
+        ] {
+            assert_eq!(PageSize::parse(text), Ok(want), "{text}");
+        }
+        for bad in [
+            "A5",
+            "B4",
+            "50x700",
+            "500x9000",
+            "500x",
+            "x",
+            "",
+            "-500x700",
+            "500x-700",
+            "ap",
+            "a4pp",
+            "50 0 x 700 mm",
+        ] {
+            assert!(PageSize::parse(bad).is_err(), "{bad}");
+        }
+        // The error says which side is wrong and why.
+        let err = PageSize::parse("5 00x700").unwrap_err();
+        assert!(
+            err.contains("the width \"5 00\"") && err.contains("100 to 2000 mm"),
+            "{err}"
+        );
+        let err = PageSize::parse("500x9000").unwrap_err();
+        assert!(err.contains("9000 mm is outside 100 to 2000 mm"), "{err}");
+        for size in PageSize::NAMED.into_iter().chain([PageSize::Custom {
+            width: 500,
+            height: 700,
+        }]) {
+            assert_eq!(PageSize::parse(&size.code()), Ok(size), "{}", size.code());
+        }
+        assert_eq!(PageSize::A3Portrait.label(), "A3 portrait");
+        assert_eq!(
+            PageSize::Custom {
+                width: 500,
+                height: 700
+            }
+            .label(),
+            "500 x 700 mm"
+        );
+        // Pages keep their old file form; the new sizes have their own.
+        let page = |size: PageSize| {
+            let mut p = Page::new("p1", "1", "One");
+            p.size = size;
+            p
+        };
+        let old = serde_json::to_value(page(PageSize::A2)).unwrap();
+        assert_eq!(old["size"], "A2");
+        assert_eq!(serde_json::from_value::<Page>(old).unwrap().size, PageSize::A2);
+        for size in [
+            PageSize::A0Portrait,
+            PageSize::Custom {
+                width: 500,
+                height: 700,
+            },
+        ] {
+            let text = serde_json::to_string(&page(size)).unwrap();
+            assert_eq!(serde_json::from_str::<Page>(&text).unwrap().size, size, "{text}");
+        }
+        // A custom size outside the allowed range is refused when read, as when typed.
+        let mut text = serde_json::to_value(page(PageSize::Custom {
+            width: 500,
+            height: 700,
+        }))
+        .unwrap();
+        text["size"]["Custom"]["width"] = 0.into();
+        let err = serde_json::from_value::<Page>(text).unwrap_err().to_string();
+        assert!(err.contains("outside 100 to 2000 mm"), "{err}");
+    }
+
+    #[test]
     fn rows_cover_the_frame_height_for_each_sheet_size() {
-        for (size, rows) in [(PageSize::A4, 6), (PageSize::A3, 6), (PageSize::A2, 8)] {
+        for (size, rows) in [
+            (PageSize::A4, 6),
+            (PageSize::A3, 6),
+            (PageSize::A2, 8),
+            (PageSize::A1, 10),
+            (PageSize::A0, 12),
+            (PageSize::A4Portrait, 6),
+            (PageSize::A3Portrait, 8),
+            (PageSize::A0Portrait, 12),
+            (
+                PageSize::Custom {
+                    width: 500,
+                    height: 300,
+                },
+                8,
+            ),
+        ] {
             let (_, h) = size.mm();
             assert_eq!(size.frame_rows(), rows);
             assert_eq!(size.row_of(0.0), 1, "above the frame is row A");
@@ -1581,6 +2564,556 @@ mod tests {
         m.add_jumper(&x1, &["01".into(), "1".into()])?;
         assert_eq!(m, once, "the same terminals in another order change nothing");
         assert_eq!(m.jumpers[0].terminals, ["01", "1"]);
+        Ok(())
+    }
+
+    #[test]
+    fn strip_layouts_order_terminals_add_spares_and_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+        let x1 = DeviceTag::parse("-X1")?;
+        let s = |v: &[&str]| v.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>();
+        let drawn = s(&["1", "2", "3"]);
+        let plain = |v: &[&str]| v.iter().map(|t| ((*t).to_owned(), false)).collect::<Vec<_>>();
+        let mut m = ProjectMeta::new("t");
+        assert!(m.strip_layout(&x1).is_none());
+
+        // Reorder: 3 to the front.
+        assert!(m.move_terminal(&x1, "3", 0, &plain(&["1", "2", "3"]))?);
+        let l = m.strip_layout(&x1).ok_or("no layout")?.clone();
+        assert_eq!(l.arrange(&drawn), plain(&["3", "1", "2"]));
+        // Moving it to where it is changes nothing.
+        assert!(!m.move_terminal(&x1, "3", 0, &l.arrange(&drawn))?);
+        assert!(m.move_terminal(&x1, "9", 0, &l.arrange(&drawn)).is_err());
+
+        // A spare after terminal 1, and one at the end.
+        m.add_spare(&x1, "S1", Some("1"), &l.arrange(&drawn))?;
+        let current = m.strip_layout(&x1).ok_or("no layout")?.arrange(&drawn);
+        m.add_spare(&x1, "S2", None, &current)?;
+        let l = m.strip_layout(&x1).ok_or("no layout")?.clone();
+        assert_eq!(
+            l.arrange(&drawn),
+            vec![
+                ("3".to_owned(), false),
+                ("1".to_owned(), false),
+                ("S1".to_owned(), true),
+                ("2".to_owned(), false),
+                ("S2".to_owned(), true),
+            ]
+        );
+        let current = l.arrange(&drawn);
+        assert!(m.add_spare(&x1, "2", None, &current).is_err(), "drawn already");
+        assert!(m.add_spare(&x1, "S1", None, &current).is_err(), "spare already");
+        assert!(m.add_spare(&x1, "1.2", None, &current).is_err(), "two levels");
+        assert!(m.add_spare(&x1, "S3", Some("7"), &current).is_err(), "no terminal 7");
+
+        // A terminal drawn later follows at the end; a spare that gets drawn is that terminal.
+        let later = s(&["1", "2", "3", "4", "S2"]);
+        assert_eq!(
+            l.arrange(&later)
+                .iter()
+                .map(|(t, sp)| format!("{t}{}", if *sp { "*" } else { "" }))
+                .collect::<Vec<_>>(),
+            s(&["3", "1", "S1*", "2", "S2", "4"])
+        );
+
+        // Saved and read back.
+        let text = toml::to_string(&m)?;
+        assert!(text.contains("[[strip]]"), "{text}");
+        assert_eq!(toml::from_str::<ProjectMeta>(&text)?.strips, m.strips);
+        assert!(!toml::to_string(&ProjectMeta::new("t"))?.contains("strip"));
+
+        // A jumpered spare taken off leaves its jumper; the last spare and the order gone, the
+        // layout goes.
+        m.add_jumper(&x1, &s(&["S1", "2"]))?;
+        let rail = m.strip_layout(&x1).ok_or("no layout")?.arrange(&drawn);
+        // Once S1 is drawn, unsparing it keeps its place and its jumper.
+        let mut drawn_later = m.clone();
+        let with_s1 = s(&["1", "2", "3", "S1"]);
+        let now = drawn_later.strip_layout(&x1).ok_or("no layout")?.arrange(&with_s1);
+        assert!(drawn_later.remove_spare(&x1, "S1", &now));
+        assert_eq!(drawn_later.jumpers.len(), 1);
+        assert_eq!(
+            drawn_later.strip_layout(&x1).ok_or("no layout")?.arrange(&with_s1),
+            plain(&["3", "1", "S1", "2"])
+                .into_iter()
+                .chain([("S2".to_owned(), true)])
+                .collect::<Vec<_>>()
+        );
+        assert!(m.remove_spare(&x1, "S1", &rail));
+        assert!(!m.remove_spare(&x1, "S1", &rail));
+        assert!(m.jumpers.is_empty());
+        assert!(m.remove_spare(&x1, "S2", &rail));
+        assert!(m.set_terminal_order(&x1, &[])?);
+        assert!(m.strips.is_empty());
+        assert!(m.set_terminal_order(&x1, &s(&["1", "1"])).is_err());
+
+        // A hand-edited layout naming something that cannot be a terminal is refused on load.
+        let bad = "name = \"t\"\n[[strip]]\nstrip = \"-X1\"\nspares = [\"=HYPERLINK(1)\"]\n";
+        let err = toml::from_str::<ProjectMeta>(bad).err().ok_or("loaded")?.to_string();
+        assert!(err.contains("cannot be a terminal of -X1"), "{err}");
+        let twice = "name = \"t\"\n[[strip]]\nstrip = \"-X1\"\norder = [\"1\", \"2\"]\n[[strip]]\nstrip = \"-X1\"\norder = [\"2\", \"1\"]\n";
+        let err = toml::from_str::<ProjectMeta>(twice).err().ok_or("loaded")?.to_string();
+        assert!(err.contains("-X1 is arranged twice"), "{err}");
+        assert!(toml::from_str::<ProjectMeta>("name = \"t\"\n")?.strips.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_strips_rail_order_follows_renamed_renumbered_and_deleted_terminals() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (x1, x2) = (DeviceTag::parse("-X1")?, DeviceTag::parse("-X2")?);
+        let mut p = Project::new("t");
+        let mut page = Page::new("a", "1", "A");
+        for (id, tag) in [("t1", "-X1.1"), ("t2", "-X1.2"), ("t3", "-X1.3")] {
+            page.symbols.push(PlacedSymbol {
+                id: id.into(),
+                symbol: "term".into(),
+                at: Point::default(),
+                rotation: Rotation::default(),
+                mirror: false,
+                tag: Some(DeviceTag::parse(tag)?),
+            });
+        }
+        p.pages.push(page);
+        let s = |v: &[&str]| v.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>();
+        p.meta.set_terminal_order(&x1, &s(&["3", "1", "2"]))?;
+        p.meta.add_spare(
+            &x1,
+            "S1",
+            Some("1"),
+            &[("3".into(), false), ("1".into(), false), ("2".into(), false)],
+        )?;
+        assert_eq!(
+            p.meta.strip_layout(&x1).ok_or("layout")?.order,
+            s(&["3", "1", "S1", "2"])
+        );
+        let role = |_: &str| None;
+        let tag = |p: &mut Project, id: &str, t: &str| -> Result<(), Box<dyn std::error::Error>> {
+            let sym = p.pages[0].symbols.iter_mut().find(|s| s.id == id).ok_or("symbol")?;
+            sym.tag = Some(DeviceTag::parse(t)?);
+            Ok(())
+        };
+
+        // -X1.3 renamed to -X1.7: it keeps its place at the front of the rail.
+        let before = terminal_numbers(&p, role);
+        tag(&mut p, "t3", "-X1.7")?;
+        assert!(follow_terminals_in(&mut p, &before, role));
+        assert_eq!(
+            p.meta.strip_layout(&x1).ok_or("layout")?.order,
+            s(&["7", "1", "S1", "2"])
+        );
+
+        // -X1.1 deleted: it leaves the order; the spare stays.
+        let before = terminal_numbers(&p, role);
+        p.pages[0].symbols.retain(|s| s.id != "t1");
+        assert!(follow_terminals_in(&mut p, &before, role));
+        assert_eq!(p.meta.strip_layout(&x1).ok_or("layout")?.order, s(&["7", "S1", "2"]));
+
+        // The whole strip renamed to -X2: the layout goes with it, spares included.
+        let before = terminal_numbers(&p, role);
+        tag(&mut p, "t3", "-X2.7")?;
+        tag(&mut p, "t2", "-X2.2")?;
+        assert!(follow_terminals_in(&mut p, &before, role));
+        assert!(p.meta.strip_layout(&x1).is_none());
+        let moved = p.meta.strip_layout(&x2).ok_or("layout moved")?;
+        assert_eq!(moved.order, s(&["7", "S1", "2"]));
+        assert_eq!(moved.spares, s(&["S1"]));
+        Ok(())
+    }
+
+    /// A project with one page of terminals (symbol id, tag) and the given strip layouts.
+    fn strips_project(
+        terminals: &[(&str, &str)],
+        layouts: &[(&str, &[&str], &[&str])],
+    ) -> Result<Project, Box<dyn std::error::Error>> {
+        let mut p = Project::new("t");
+        let mut page = Page::new("a", "1", "A");
+        for (i, (id, tag)) in terminals.iter().enumerate() {
+            page.symbols.push(PlacedSymbol {
+                id: (*id).into(),
+                symbol: "term".into(),
+                at: Point::new(i as f64 * 10.0, 0.0),
+                rotation: Rotation::default(),
+                mirror: false,
+                tag: Some(DeviceTag::parse(tag)?),
+            });
+        }
+        p.pages.push(page);
+        let s = |v: &[&str]| v.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>();
+        for (strip, order, spares) in layouts {
+            p.meta.strips.push(StripLayout {
+                strip: DeviceTag::parse(strip)?,
+                order: s(order),
+                spares: s(spares),
+            });
+        }
+        Ok(p)
+    }
+
+    /// Give placed symbol `id` on the first page the tag `t`.
+    fn retag(p: &mut Project, id: &str, t: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let sym = p.pages[0].symbols.iter_mut().find(|s| s.id == id).ok_or("symbol")?;
+        sym.tag = Some(DeviceTag::parse(t)?);
+        Ok(())
+    }
+
+    #[test]
+    fn two_strips_renamed_to_one_keep_both_layouts() -> Result<(), Box<dyn std::error::Error>> {
+        let mut p = strips_project(
+            &[("a", "-X1.1"), ("b", "-X1.2"), ("c", "-X3.1")],
+            &[("-X1", &["2", "1", "S1"], &["S1"]), ("-X3", &["S9", "1"], &["S9"])],
+        )?;
+        let role = |_: &str| None;
+        let before = terminal_numbers(&p, role);
+        retag(&mut p, "a", "-X2.1")?;
+        retag(&mut p, "b", "-X2.2")?;
+        retag(&mut p, "c", "-X2.5")?;
+        follow_terminals_in(&mut p, &before, role);
+        // The first strip takes its layout to -X2; the other keeps its own, spares included.
+        let x2 = p.meta.strip_layout(&DeviceTag::parse("-X2")?).ok_or("x2")?;
+        assert_eq!(x2.spares, ["S1"]);
+        assert_eq!(x2.order, ["2", "1", "S1"]);
+        let x3 = p.meta.strip_layout(&DeviceTag::parse("-X3")?).ok_or("x3 kept")?;
+        assert_eq!(x3.spares, ["S9"]);
+        assert_eq!(x3.order, ["S9"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_drawn_spare_renamed_keeps_its_place_on_the_rail() -> Result<(), Box<dyn std::error::Error>> {
+        let mut p = strips_project(&[("a", "-X1.1"), ("s", "-X1.S1")], &[("-X1", &["S1", "1"], &["S1"])])?;
+        let role = |_: &str| None;
+        let before = terminal_numbers(&p, role);
+        retag(&mut p, "s", "-X1.S5")?;
+        assert!(follow_terminals_in(&mut p, &before, role));
+        let x1 = p.meta.strip_layout(&DeviceTag::parse("-X1")?).ok_or("x1")?;
+        assert_eq!(x1.order.first().map(String::as_str), Some("S5"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_strip_renamed_with_its_spares_keeps_its_rail_and_their_device_data() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Terminal 1, a terminal tagged with just the strip (3: it passes over spare 2), and the
+        // spare 2, which has a part.
+        let mut p = strips_project(&[("a", "-X1.1"), ("b", "-X1")], &[("-X1", &["3", "2", "1"], &["2"])])?;
+        let spare = Device {
+            part: Some("WAGO 2002-1201".into()),
+            ..Device::default()
+        };
+        p.devices.insert(DeviceTag::parse("-X1.2")?, spare.clone());
+        let role = |id: &str| (id == "term").then_some(crate::symbol::SymbolRole::Terminal);
+        let before = terminal_numbers(&p, role);
+        assert!(before.values().any(|(_, n)| n == "3"));
+        retag(&mut p, "a", "-X2.1")?;
+        retag(&mut p, "b", "-X2")?;
+        assert!(follow_terminals_in(&mut p, &before, role));
+        let x2 = p.meta.strip_layout(&DeviceTag::parse("-X2")?).ok_or("x2")?;
+        assert_eq!(x2.order, ["3", "2", "1"]);
+        assert_eq!(x2.spares, ["2"]);
+        assert!(terminal_numbers(&p, role).values().any(|(_, n)| n == "3"));
+        assert_eq!(p.devices.get(&DeviceTag::parse("-X2.2")?), Some(&spare));
+        assert!(!p.devices.contains_key(&DeviceTag::parse("-X1.2")?));
+        Ok(())
+    }
+
+    #[test]
+    fn a_jumper_on_a_spare_goes_with_its_strip_when_the_strip_is_renamed() -> Result<(), Box<dyn std::error::Error>> {
+        let mut p = strips_project(
+            &[("a", "-X1.1"), ("b", "-X1.2")],
+            &[("-X1", &["1", "2", "S1"], &["S1"])],
+        )?;
+        let x1 = DeviceTag::parse("-X1")?;
+        p.meta.add_jumper(&x1, &["1".to_owned(), "S1".to_owned()])?;
+        let role = |_: &str| None;
+        let before = terminal_numbers(&p, role);
+        retag(&mut p, "a", "-X2.1")?;
+        retag(&mut p, "b", "-X2.2")?;
+        assert!(follow_terminals_in(&mut p, &before, role));
+        let x2 = DeviceTag::parse("-X2")?;
+        assert_eq!(p.meta.jumpers.len(), 1);
+        assert_eq!(p.meta.jumpers[0].strip, x2);
+        assert_eq!(p.meta.jumpers[0].terminals, ["1", "S1"]);
+        assert_eq!(
+            p.meta.strip_layout(&x2).map(|l| l.spares.clone()),
+            Some(vec!["S1".to_owned()])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_strip_renamed_onto_a_drawn_device_named_like_its_spare_keeps_its_layout()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // -X2.S1 is drawn as something that is no terminal, and has no device entry.
+        let mut p = strips_project(&[("a", "-X1.1"), ("k", "-X2.S1")], &[("-X1", &["S1", "1"], &["S1"])])?;
+        let spare = Device {
+            part: Some("WAGO 2002-1201".into()),
+            ..Device::default()
+        };
+        p.devices.insert(DeviceTag::parse("-X1.S1")?, spare.clone());
+        let role = |id: &str| {
+            Some(if id == "term" {
+                crate::symbol::SymbolRole::Terminal
+            } else {
+                crate::symbol::SymbolRole::Main
+            })
+        };
+        p.pages[0].symbols[1].symbol = "coil".into();
+        let before = terminal_numbers(&p, role);
+        retag(&mut p, "a", "-X2.1")?;
+        follow_terminals_in(&mut p, &before, role);
+        let x1 = p.meta.strip_layout(&DeviceTag::parse("-X1")?).ok_or("x1 kept")?;
+        assert_eq!(x1.spares, ["S1"]);
+        assert!(p.meta.strip_layout(&DeviceTag::parse("-X2")?).is_none());
+        assert_eq!(p.devices.get(&DeviceTag::parse("-X1.S1")?), Some(&spare));
+        assert!(!p.devices.contains_key(&DeviceTag::parse("-X2.S1")?));
+        Ok(())
+    }
+
+    #[test]
+    fn a_strip_renamed_onto_a_name_whose_spare_tag_has_its_own_part_keeps_its_layout()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // -X1.S1 and -X2.S1 (nothing drawn there) each have a part of their own.
+        let mut p = strips_project(&[("a", "-X1.1")], &[("-X1", &["S1", "1"], &["S1"])])?;
+        let mine = Device {
+            part: Some("WAGO 2002-1201".into()),
+            ..Device::default()
+        };
+        let theirs = Device {
+            part: Some("Phoenix PT 2,5".into()),
+            ..Device::default()
+        };
+        p.devices.insert(DeviceTag::parse("-X1.S1")?, mine.clone());
+        p.devices.insert(DeviceTag::parse("-X2.S1")?, theirs.clone());
+        let role = |_: &str| Some(crate::symbol::SymbolRole::Terminal);
+        let before = terminal_numbers(&p, role);
+        retag(&mut p, "a", "-X2.1")?;
+        follow_terminals_in(&mut p, &before, role);
+        let x1 = p.meta.strip_layout(&DeviceTag::parse("-X1")?).ok_or("x1 kept")?;
+        assert_eq!(x1.spares, ["S1"]);
+        assert!(p.meta.strip_layout(&DeviceTag::parse("-X2")?).is_none());
+        assert_eq!(p.devices.get(&DeviceTag::parse("-X1.S1")?), Some(&mine));
+        assert_eq!(p.devices.get(&DeviceTag::parse("-X2.S1")?), Some(&theirs));
+        Ok(())
+    }
+
+    #[test]
+    fn a_strip_only_terminal_numbered_like_a_blocked_spare_does_not_let_the_layout_move()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // -X1: terminal 1, a terminal tagged with just the strip (3, past spare 2), and spare 2.
+        // -X2.2 is drawn as something that is no terminal.
+        let mut p = strips_project(
+            &[("a", "-X1.1"), ("b", "-X1"), ("k", "-X2.2")],
+            &[("-X1", &["3", "2", "1"], &["2"])],
+        )?;
+        p.pages[0].symbols[2].symbol = "coil".into();
+        let x1 = DeviceTag::parse("-X1")?;
+        p.meta.add_jumper(&x1, &["1".to_owned(), "3".to_owned()])?;
+        let role = |id: &str| {
+            Some(if id == "term" {
+                crate::symbol::SymbolRole::Terminal
+            } else {
+                crate::symbol::SymbolRole::Main
+            })
+        };
+        let before = terminal_numbers(&p, role);
+        retag(&mut p, "a", "-X2.1")?;
+        retag(&mut p, "b", "-X2")?;
+        follow_terminals_in(&mut p, &before, role);
+        // The layout stays on -X1; the jumper names only terminals -X2 has.
+        assert!(p.meta.strip_layout(&DeviceTag::parse("-X2")?).is_none());
+        let now = terminal_numbers(&p, role);
+        for j in &p.meta.jumpers {
+            for t in &j.terminals {
+                assert!(now.values().any(|(s, n)| *s == j.strip && n == t), "{} {t}", j.strip);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_spare_moved_with_its_strip_keeps_its_panel_place() -> Result<(), Box<dyn std::error::Error>> {
+        let mut p = strips_project(&[("a", "-X1.1")], &[("-X1", &["1", "S1"], &["S1"])])?;
+        let mut panel = crate::panel::Panel::new("p", "P", 600.0, 400.0);
+        panel.items.push(crate::panel::PanelItem::Device {
+            tag: DeviceTag::parse("-X1.S1")?,
+            at: Point::default(),
+            width: 6.0,
+            height: 50.0,
+            rotation: crate::geom::Rotation::R0,
+        });
+        p.panels.push(panel);
+        let role = |_: &str| None;
+        let before = terminal_numbers(&p, role);
+        retag(&mut p, "a", "-X2.1")?;
+        assert!(follow_terminals_in(&mut p, &before, role));
+        let tags: Vec<String> = p.panels[0]
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                crate::panel::PanelItem::Device { tag, .. } => Some(tag.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tags, ["-X2.S1"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_jumpered_spare_keeps_its_jumper_when_its_drawing_is_deleted() -> Result<(), Box<dyn std::error::Error>> {
+        let x1 = DeviceTag::parse("-X1")?;
+        let mut p = Project::new("t");
+        let mut page = Page::new("a", "1", "A");
+        for (id, tag) in [("t1", "-X1.1"), ("t2", "-X1.2"), ("ts", "-X1.S1")] {
+            page.symbols.push(PlacedSymbol {
+                id: id.into(),
+                symbol: "term".into(),
+                at: Point::default(),
+                rotation: Rotation::default(),
+                mirror: false,
+                tag: Some(DeviceTag::parse(tag)?),
+            });
+        }
+        p.pages.push(page);
+        p.meta.add_spare(&x1, "S1", None, &[])?;
+        p.meta.add_jumper(&x1, &["1".to_owned(), "S1".to_owned()])?;
+        p.meta.add_jumper(&x1, &["2".to_owned(), "1".to_owned()])?;
+        let role = |_: &str| None;
+        // The registered spare's drawing goes: it is a spare again, still jumpered.
+        let before = terminal_numbers(&p, role);
+        p.pages[0].symbols.retain(|s| s.id != "ts");
+        follow_terminals_in(&mut p, &before, role);
+        assert_eq!(p.meta.jumpers[0].terminals, ["1", "2", "S1"]);
+        // A drawn terminal that is no spare still leaves its jumper when deleted.
+        let before = terminal_numbers(&p, role);
+        p.pages[0].symbols.retain(|s| s.id != "t2");
+        follow_terminals_in(&mut p, &before, role);
+        assert_eq!(p.meta.jumpers[0].terminals, ["1", "S1"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_spare_never_takes_over_another_device_and_leaves_no_part_behind() -> Result<(), Box<dyn std::error::Error>> {
+        let x1 = DeviceTag::parse("-X1")?;
+        let mut p = Project::new("t");
+        let mut page = Page::new("a", "1", "A");
+        // -X1.1 is a terminal; -X1.K1 is drawn as another kind of device.
+        for (id, tag) in [("t1", "-X1.1"), ("k1", "-X1.K1")] {
+            page.symbols.push(PlacedSymbol {
+                id: id.into(),
+                symbol: id.into(),
+                at: Point::default(),
+                rotation: Rotation::default(),
+                mirror: false,
+                tag: Some(DeviceTag::parse(tag)?),
+            });
+        }
+        p.pages.push(page);
+        let current = vec![("1".to_owned(), false)];
+        let err = p.add_spare(&x1, "K1", None, &current).err().unwrap_or_default();
+        assert!(err.contains("-X1.K1"), "{err}");
+        assert!(p.meta.strips.is_empty());
+        // A spare given a part (WAGO import) and taken off again leaves no device entry.
+        p.add_spare(&x1, "S1", None, &current)?;
+        let s1 = DeviceTag::parse("-X1.S1")?;
+        p.devices.entry(s1.clone()).or_default().part = Some("wago.2002-1201".into());
+        let current = vec![("1".to_owned(), false), ("S1".to_owned(), true)];
+        assert!(p.remove_spare(&x1, "S1", &current));
+        assert!(!p.devices.contains_key(&s1));
+        // A spare that is drawn by now keeps its device entry.
+        p.add_spare(&x1, "S2", None, &[("1".to_owned(), false)])?;
+        let s2 = DeviceTag::parse("-X1.S2")?;
+        p.devices.entry(s2.clone()).or_default().part = Some("wago.2002-1201".into());
+        p.pages[0].symbols.push(PlacedSymbol {
+            id: "t2".into(),
+            symbol: "term".into(),
+            at: Point::default(),
+            rotation: Rotation::default(),
+            mirror: false,
+            tag: Some(s2.clone()),
+        });
+        let current = vec![("1".to_owned(), false), ("S2".to_owned(), false)];
+        assert!(p.remove_spare(&x1, "S2", &current));
+        assert!(p.devices.contains_key(&s2));
+        Ok(())
+    }
+
+    #[test]
+    fn a_spare_never_takes_the_tag_of_a_cable_and_leaves_its_entry() -> Result<(), Box<dyn std::error::Error>> {
+        let x1 = DeviceTag::parse("-X1")?;
+        let w1 = DeviceTag::parse("-X1.W1")?;
+        let mut p = Project::new("t");
+        let mut page = Page::new("a", "1", "A");
+        // A wire runs as a core of cable -X1.W1; no symbol carries that tag.
+        page.wires.push(serde_json::from_str(
+            r#"{"id":"w1","from":{"at":{"x":0,"y":0}},"to":{"at":{"x":10,"y":0}},"cable":{"cable":"-X1.W1","core":"1"}}"#,
+        )?);
+        p.pages.push(page);
+        let err = p.add_spare(&x1, "W1", None, &[]).err().unwrap_or_default();
+        assert!(err.contains("-X1.W1") && err.contains("cable"), "{err}");
+        assert!(p.meta.strips.is_empty());
+        // A spare registered before the core named the cable keeps the cable's entry.
+        p.meta.add_spare(&x1, "W1", None, &[])?;
+        p.devices.entry(w1.clone()).or_default().part = Some("lapp.ölflex".into());
+        assert!(p.remove_spare(&x1, "W1", &[("W1".to_owned(), true)]));
+        assert!(p.devices.contains_key(&w1));
+        // Taken off a second time: the cable's entry stays and the reason is given.
+        assert!(!p.remove_spare(&x1, "W1", &[]));
+        let err = p.remove_unused_terminal_entry(&x1, "W1", &[]).err().unwrap_or_default();
+        assert!(err.contains("cable of a wire core"), "{err}");
+        assert!(p.devices.contains_key(&w1));
+        // An entry nothing uses (restored by hand after the spare went) is removed.
+        let s1 = DeviceTag::parse("-X1.S1")?;
+        p.devices.entry(s1.clone()).or_default().part = Some("wago.2002-1201".into());
+        assert_eq!(p.remove_unused_terminal_entry(&x1, "S1", &[]), Ok(true));
+        assert!(!p.devices.contains_key(&s1));
+        assert_eq!(p.remove_unused_terminal_entry(&x1, "S1", &[]), Ok(false));
+        // A terminal drawn with just the strip's tag and numbered 1 on the rail keeps its entry.
+        let one = DeviceTag::parse("-X1.1")?;
+        p.devices.entry(one.clone()).or_default().part = Some("wago.2002-1201".into());
+        let err = p
+            .remove_unused_terminal_entry(&x1, "1", &[("1".to_owned(), false)])
+            .err()
+            .unwrap_or_default();
+        assert!(err.contains("is drawn"), "{err}");
+        assert!(p.devices.contains_key(&one));
+        // A number of two levels names another strip's terminal (-X1.2's 3) and is refused.
+        let nested = DeviceTag::parse("-X1.2.3")?;
+        p.devices.entry(nested.clone()).or_default().part = Some("wago.2002-1201".into());
+        let err = p
+            .remove_unused_terminal_entry(&x1, "2.3", &[])
+            .err()
+            .unwrap_or_default();
+        assert!(err.contains("one tag level"), "{err}");
+        assert!(p.devices.contains_key(&nested));
+        Ok(())
+    }
+
+    #[test]
+    fn a_terminal_tagged_with_just_the_strip_never_takes_a_spares_number() -> Result<(), Box<dyn std::error::Error>> {
+        let x1 = DeviceTag::parse("-X1")?;
+        let mut p = Project::new("t");
+        let mut page = Page::new("a", "1", "A");
+        for (id, tag) in [("t1", "-X1.1"), ("t", "-X1")] {
+            page.symbols.push(PlacedSymbol {
+                id: id.into(),
+                symbol: "term".into(),
+                at: Point::default(),
+                rotation: Rotation::default(),
+                mirror: false,
+                tag: Some(DeviceTag::parse(tag)?),
+            });
+        }
+        p.pages.push(page);
+        p.meta.add_spare(&x1, "2", None, &[("1".to_owned(), false)])?;
+        let role = |id: &str| (id == "term").then_some(SymbolRole::Terminal);
+        let numbers: Vec<String> = terminal_numbers(&p, role).into_values().map(|(_, n)| n).collect();
+        assert!(numbers.contains(&"3".to_owned()), "{numbers:?}");
+        assert!(!numbers.contains(&"2".to_owned()), "{numbers:?}");
+        // A spare far past the drawn numbers does not renumber it.
+        p.meta
+            .add_spare(&x1, "10", None, &[("1".to_owned(), false), ("3".to_owned(), false)])?;
+        let numbers: Vec<String> = terminal_numbers(&p, role).into_values().map(|(_, n)| n).collect();
+        assert!(numbers.contains(&"3".to_owned()), "{numbers:?}");
         Ok(())
     }
 

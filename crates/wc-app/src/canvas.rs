@@ -8,6 +8,7 @@ use wc_core::geom::{Align, Point};
 use wc_core::route::Route;
 use wc_core::{Endpoint, Page, Shape};
 
+use crate::layers::Layer;
 use crate::state::{Open, Selection, Tool};
 use crate::theme;
 
@@ -47,12 +48,26 @@ pub struct Editor {
     pub view: View,
     pub cursor: Option<Point>,
     drag: Option<Drag>,
-    /// First corner of a line or rectangle being drawn.
-    pub shape_start: Option<Point>,
+    /// The clicks so far of a line, rectangle, circle, arc or polyline being drawn.
+    pub shape_points: Vec<Point>,
+    /// The id of the page those clicks were made on: on another page they are dropped.
+    pub shape_page: Option<String>,
+    /// Enter was pressed (and no dialog or text field took it): finish the polyline being drawn.
+    pub finish_shape: bool,
+    /// Where and when (egui time, seconds) the last drawing click landed, to tell a quick
+    /// repeat on a polyline's last point (which ends it) from a slow one.
+    pub last_shape_click: Option<(Point, f64)>,
     /// The text tool was clicked here; the app asks for the text.
     pub ask_text: Option<Point>,
     /// The comment tool was clicked here; the app asks for the comment.
     pub ask_comment: Option<Point>,
+    /// A black box being drawn with the black box tool.
+    pub black_box: Option<crate::black_box_tool::BoxDraft>,
+    /// The black box tool was clicked on an edge of its box; the app asks for the connection
+    /// point's name.
+    pub ask_box_pin: Option<(wc_core::BoxSide, f64)>,
+    /// The black box tool is done adding connection points; the app asks for the tag.
+    pub ask_box_tag: bool,
     /// The review comment shown in the properties panel, by id.
     pub comment: Option<String>,
     pub message: String,
@@ -71,6 +86,14 @@ pub struct Editor {
     /// The terminal strip a navigator menu asked to export markers of; the WAGO marking dialog
     /// opens with only that strip when it is set.
     pub marking_strip: Option<String>,
+    /// Layers hidden or locked on the canvas (the app sets it from the preferences).
+    pub layers: crate::layers::Layers,
+    /// Findings of the check that runs while drawing, marked on their items; empty when it is
+    /// off.
+    pub live: Vec<wc_report::Finding>,
+    /// Selected free drawings a sync showed the page without while this person's change was
+    /// on its way to the host: selected again when the host accepts it.
+    pub waiting_graphics: Option<crate::edit::WaitingGraphics>,
 }
 
 impl Default for Editor {
@@ -84,9 +107,15 @@ impl Default for Editor {
             view: View::default(),
             cursor: None,
             drag: None,
-            shape_start: None,
+            shape_points: Vec::new(),
+            shape_page: None,
+            finish_shape: false,
+            last_shape_click: None,
             ask_text: None,
             ask_comment: None,
+            black_box: None,
+            ask_box_pin: None,
+            ask_box_tag: false,
             comment: None,
             message: String::new(),
             marking_strip: None,
@@ -95,12 +124,15 @@ impl Default for Editor {
             panel_drag: None,
             auto_wire: false,
             held_by: Default::default(),
+            layers: Default::default(),
+            live: Vec::new(),
+            waiting_graphics: None,
         }
     }
 }
 
 /// What a primary-button drag in the select tool is doing.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum Drag {
     /// Moving the selection: the grab point (snapped, page mm) and whether the undo checkpoint
     /// for this drag was taken.
@@ -115,6 +147,19 @@ enum Drag {
         start: (Point, Point),
         size: bool,
         checkpoint: bool,
+    },
+    /// Sizing the selected black box from one of its corners (#524, #529): the box's item id
+    /// on the page, the corner held, the grab point (page mm, unsnapped), its size when the drag
+    /// started, its size now and how far its origin moves in its own frame (a near corner moves
+    /// it so the opposite corner stays put). The box changes once, on release; a box no longer
+    /// on the page changes nothing.
+    BoxSize {
+        id: String,
+        corner: crate::black_box_tool::Corner,
+        from: Point,
+        start: (f64, f64),
+        size: (f64, f64),
+        shift: Point,
     },
 }
 
@@ -171,12 +216,17 @@ fn snap(p: Point, step: f64) -> Point {
     Point::new((p.x / step).round() * step, (p.y / step).round() * step)
 }
 
-fn arc_points(center: Point, r: f64, start: f64, end: f64) -> Vec<Point> {
-    let mut sweep = end - start;
-    if sweep <= 0.0 {
-        sweep += 360.0;
-    }
-    let n = ((sweep / 10.0).ceil() as usize).clamp(2, 72);
+/// The signed sweep from `start` to `end` in degrees as an arc is drawn: counterclockwise,
+/// a full turn when they are equal. Angles stored past a full turn (from a file) can make it
+/// negative, which draws the other way round.
+pub(crate) fn arc_sweep(start: f64, end: f64) -> f64 {
+    let sweep = end - start;
+    if sweep <= 0.0 { sweep + 360.0 } else { sweep }
+}
+
+pub(crate) fn arc_points(center: Point, r: f64, start: f64, end: f64) -> Vec<Point> {
+    let sweep = arc_sweep(start, end);
+    let n = ((sweep.abs() / 10.0).ceil() as usize).clamp(2, 72);
     (0..=n)
         .map(|i| {
             let t = (start + sweep * i as f64 / n as f64).to_radians();
@@ -257,6 +307,11 @@ fn triangulate(pts: &[Pos2]) -> Vec<[u32; 3]> {
 
 pub(crate) fn paint_shape(p: &egui::Painter, xf: &Xf, s: &Shape, stroke: Stroke) {
     match s {
+        Shape::Dimension { .. } => {
+            for part in s.dimension_parts().unwrap_or_default() {
+                paint_shape(p, xf, &part, stroke);
+            }
+        }
         Shape::Line { a, b } => {
             p.line_segment([xf.s(*a), xf.s(*b)], stroke);
         }
@@ -441,6 +496,18 @@ impl Open {
                 return Some(Selection::Wire(w.id.clone()));
             }
         }
+        // Revision clouds and the table lie over the drawing, so they are found before it.
+        if let Some(i) = page.clouds.iter().rposition(|c| c.hit(at, tol)) {
+            return Some(Selection::Cloud(i));
+        }
+        if let Some((a, b)) = self.revision_table_bounds(page)
+            && at.x >= a.x - tol
+            && at.x <= b.x + tol
+            && at.y >= a.y - tol
+            && at.y <= b.y + tol
+        {
+            return Some(Selection::RevisionTable);
+        }
         page.graphics
             .iter()
             .rposition(|g| crate::edit::graphic_hit(g, at, tol))
@@ -513,6 +580,15 @@ pub(crate) fn value_placeholder(
 /// Show the canvas for the current page and handle the tools. Returns true when the project
 /// changed.
 pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool, snap_step: f64) {
+    drop_draft_of_other_page(open, ed);
+    // A black box being drawn belongs to its tool: another tool drops it.
+    if ed.tool != Tool::BlackBox {
+        ed.black_box = None;
+    }
+    // An item on a layer that was just hidden or locked does not stay selected.
+    let layers = ed.layers.clone();
+    ed.selection.retain(|s| layers.may_select(s));
+    let finish = std::mem::take(&mut ed.finish_shape);
     if let Some(panel) = ed.panel {
         crate::panel_view::show(ui, open, ed, panel, snap_step);
         return;
@@ -559,6 +635,12 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
         ed.view.fit = false;
     }
 
+    // The view the user saw when they clicked: a zoom or pan in the same frame must not move
+    // where a click lands.
+    let shown = Xf {
+        origin: rect.min + ed.view.offset,
+        zoom: ed.view.zoom,
+    };
     // Zoom about the pointer with the wheel; pan with the middle or right button.
     if resp.hovered() {
         let scroll = ui.input(|i| i.smooth_scroll_delta.y + i.zoom_delta().ln() * 200.0);
@@ -641,7 +723,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
     }
 
     // A scanned sheet under the page, toned down so what is drawn over it stands out.
-    if let Some(u) = &page.underlay {
+    if let Some(u) = page.underlay.as_ref().filter(|_| ed.layers.shown(Layer::Underlay)) {
         let area = Rect::from_two_pos(xf.s(u.min), xf.s(u.max));
         match open.underlay_texture(ui.ctx(), u) {
             Some(tex) => {
@@ -672,7 +754,12 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
         matches!(ed.tool, Tool::Select),
     );
 
-    for (i, g) in page.graphics.iter().enumerate() {
+    for (i, g) in page
+        .graphics
+        .iter()
+        .enumerate()
+        .filter(|_| ed.layers.shown(Layer::Drawings))
+    {
         let selected = ed.is_selected(&Selection::Graphic(i));
         let c = if selected { t.selection } else { t.ink };
         paint_shape(&painter, &xf, g, Stroke::new(xf.len(0.25).max(0.8), c));
@@ -680,6 +767,25 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
             let (a, b) = crate::edit::graphic_bounds(g);
             let r = Rect::from_two_pos(xf.s(a), xf.s(b)).expand(3.0);
             painter.rect_stroke(r, 2.0, Stroke::new(1.0_f32, t.selection), egui::StrokeKind::Outside);
+        }
+    }
+
+    // Revision clouds and the revision table, drawn from the same shapes as the PDF.
+    // A selected one is drawn in the selection colour, as a graphic is.
+    let revision_ink = |s: &Selection| {
+        let c = if ed.is_selected(s) { t.selection } else { t.ink };
+        Stroke::new(xf.len(0.25).max(0.8), c)
+    };
+    for (i, c) in page.clouds.iter().enumerate() {
+        let ink = revision_ink(&Selection::Cloud(i));
+        for s in c.shapes() {
+            paint_shape(&painter, &xf, &s, ink);
+        }
+    }
+    if let Some(at) = page.revision_table {
+        let ink = revision_ink(&Selection::RevisionTable);
+        for s in wc_core::revision::table_shapes(&open.project.meta.revisions, at) {
+            paint_shape(&painter, &xf, &s, ink);
         }
     }
 
@@ -702,7 +808,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
             .into_iter()
             .flatten()
             .collect();
-        if !label.is_empty() && pts.len() >= 2 {
+        if !label.is_empty() && pts.len() >= 2 && ed.layers.shown(Layer::WireNumbers) {
             let (a, b) = (pts[0], pts[1]);
             let mid = Point::new((a.x + b.x) / 2.0, (a.y + b.y) / 2.0);
             if (a.x - b.x).abs() < (a.y - b.y).abs() {
@@ -818,12 +924,16 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
     // opens the page it points at.
     let xref = wc_pdf::CrossRefs::build(&open.project, &open.symbols);
     let mut xref_warnings = Vec::new();
-    let marks = wc_pdf::xref_marks(&page, &open.symbols, &xref, &mut xref_warnings);
+    let marks = if ed.layers.shown(Layer::CrossReferences) {
+        wc_pdf::xref_marks(&page, &open.symbols, &xref, &mut xref_warnings)
+    } else {
+        Vec::new()
+    };
     let mut jump = None;
     for m in &marks {
         let (a, b) = crate::edit::text_box(m.at, wc_pdf::XREF_HEIGHT, m.align, &m.text);
         let r = Rect::from_two_pos(xf.s(a), xf.s(b));
-        let hovered = resp.hover_pos().is_some_and(|h| r.contains(h));
+        let hovered = ed.layers.pickable(Layer::CrossReferences) && resp.hover_pos().is_some_and(|h| r.contains(h));
         let c = if hovered { t.selection } else { t.wire_label };
         let al = match m.align {
             Align::Left => Align2::LEFT_BOTTOM,
@@ -848,16 +958,23 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
         return;
     }
 
+    paint_live_findings(&painter, &xf, open, &page, ed, resp.hover_pos(), &t);
+
     // Review comments pinned on the page: a numbered bubble whose tail points at the spot,
     // greyed once resolved. Hovering shows the start of the text; clicking opens it in the
     // properties panel.
     let mut clicked_comment = None;
-    for c in open.project.page_comments(&page.id) {
+    for c in open
+        .project
+        .page_comments(&page.id)
+        .filter(|_| ed.layers.shown(Layer::Comments))
+    {
         let Some(at) = c.at else { continue };
         let spot = xf.s(at);
         let r = 9.0_f32;
         let center = spot + Vec2::new(r + 2.0, -r - 2.0);
-        let hovered = resp.hover_pos().is_some_and(|h| h.distance(center) <= r + 2.0);
+        let hovered =
+            ed.layers.pickable(Layer::Comments) && resp.hover_pos().is_some_and(|h| h.distance(center) <= r + 2.0);
         let chosen = ed.comment.as_deref() == Some(c.id.as_str());
         let fill = if c.resolved { t.faint } else { t.accent };
         painter.add(EShape::convex_polygon(
@@ -911,8 +1028,10 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
     if held && !matches!(ed.tool, Tool::Select | Tool::Comment) {
         ed.tool = Tool::Select;
         ed.wire = None;
-        ed.shape_start = None;
+        ed.shape_points.clear();
+        ed.black_box = None;
     }
+    leave_unpickable_layer(ed);
 
     // Pointer position in page mm, snapped.
     let hover = resp.hover_pos().map(|hp| xf.mm(hp));
@@ -939,8 +1058,259 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
                 ed.ask_comment = Some(at);
             }
         }
-        Tool::Line | Tool::Rect => shape_tool(&painter, &resp, open, ed, &xf, &t),
+        Tool::Line | Tool::Rect | Tool::Circle | Tool::Arc | Tool::Polyline | Tool::Dimension | Tool::Cloud => {
+            shape_tool(&painter, &resp, open, ed, &xf, &shown, &t, finish, snap_step)
+        }
+        Tool::RevisionTable => {
+            if resp.clicked_by(egui::PointerButton::Primary)
+                && let Some(at) = primary_release_pos(&resp.ctx)
+                    .or(resp.interact_pointer_pos())
+                    .map(|p| snap(shown.mm(p), snap_step))
+            {
+                revision_table_click(open, ed, at);
+            }
+            // The table as it would be placed, under the pointer.
+            if let Some(cur) = ed.cursor {
+                let ghost = Stroke::new(1.5_f32, t.ghost);
+                for s in wc_core::revision::table_shapes(&open.project.meta.revisions, cur) {
+                    paint_shape(&painter, &xf, &s, ghost);
+                }
+            }
+        }
+        Tool::BlackBox => black_box_tool(&painter, &resp, ed, &page, &xf, &shown, &t, finish, tol, snap_step),
     }
+}
+
+/// The black box tool: a drag (or two clicks) draws the rectangle; then a click on an edge
+/// asks for a connection point there, and a click inside the box (or Enter) asks for the tag.
+#[allow(clippy::too_many_arguments)]
+fn black_box_tool(
+    painter: &egui::Painter,
+    resp: &egui::Response,
+    ed: &mut Editor,
+    page: &Page,
+    xf: &Xf,
+    shown: &Xf,
+    t: &theme::Theme,
+    enter: bool,
+    tol: f64,
+    snap_step: f64,
+) {
+    use crate::black_box_tool::{BoxDraft, edge_at, hint, inside};
+    if ed.black_box.as_ref().is_some_and(|d| d.page_id != page.id) {
+        ed.black_box = None;
+        ed.message = hint(None).into();
+    }
+    // A dialog for this box is waiting: the canvas takes no clicks for it meanwhile.
+    let asking = ed.ask_box_pin.is_some() || ed.ask_box_tag;
+    let cur = ed.cursor;
+    // Where a click or a drag ended, unsnapped: the release itself, since a touch screen
+    // clears the hover position (and so `ed.cursor`) in the frame it lets go.
+    // Pointer input is read in the view the user saw (`shown`): a zoom in the same frame must
+    // not move it. `xf` is the view drawn now.
+    let released_at = primary_release_pos(&resp.ctx)
+        .or(resp.interact_pointer_pos())
+        .map(|p| shown.mm(p));
+    // How near an edge a click must land, in that view too; `tol` (the view drawn now) is
+    // for the hover ring.
+    let click_tol = (6.0 / f64::from(shown.zoom)).max(0.8);
+    match ed.black_box.as_mut() {
+        None if !asking => {
+            // A drag is only seen once the pointer has moved: its corner is where the button
+            // went down, not where the pointer is by then.
+            let start = if resp.drag_started_by(egui::PointerButton::Primary) {
+                resp.ctx
+                    .input(|i| i.pointer.press_origin())
+                    .or(resp.interact_pointer_pos())
+                    .map(|p| snap(shown.mm(p), snap_step))
+            } else if resp.clicked_by(egui::PointerButton::Primary) {
+                released_at.map(|p| snap(p, snap_step))
+            } else {
+                None
+            };
+            if let Some(at) = start {
+                ed.black_box = Some(BoxDraft::new(&page.id, at));
+                ed.message = hint(ed.black_box.as_ref()).into();
+            }
+        }
+        Some(d) if d.to.is_none() && !asking => {
+            let released =
+                resp.drag_stopped_by(egui::PointerButton::Primary) || resp.clicked_by(egui::PointerButton::Primary);
+            let at = released_at.map(|p| snap(p, snap_step));
+            if released && let Some(at) = at.filter(|at| at.x != d.from.x && at.y != d.from.y) {
+                d.to = Some(at);
+                ed.message = hint(Some(d)).into();
+            }
+        }
+        Some(d) if !asking => {
+            let Some((min, max)) = d.rect() else { return };
+            if resp.clicked_by(egui::PointerButton::Primary)
+                && let Some(at) = released_at
+            {
+                if let Some(hit) = edge_at(min, max, at, click_tol) {
+                    // Snapped along the edge, like every other point on the page.
+                    let snapped = edge_at(min, max, snap(at, snap_step), f64::INFINITY);
+                    ed.ask_box_pin = Some(match snapped {
+                        Some((side, off)) if side == hit.0 => (side, off),
+                        _ => hit,
+                    });
+                } else if inside(min, max, at, click_tol) {
+                    ed.ask_box_tag = true;
+                }
+            } else if enter {
+                ed.ask_box_tag = true;
+            }
+        }
+        _ => {}
+    }
+
+    // The box so far, its points, and where a click on an edge would put the next one.
+    let ghost = Stroke::new(1.5_f32, t.ghost);
+    let Some(d) = ed.black_box.as_ref() else { return };
+    let (min, max) = match d.rect() {
+        Some(r) => r,
+        None => match cur {
+            Some(c) => crate::black_box_tool::corners(d.from, c),
+            None => return,
+        },
+    };
+    painter.rect_stroke(
+        Rect::from_two_pos(xf.s(min), xf.s(max)),
+        0.0,
+        ghost,
+        egui::StrokeKind::Middle,
+    );
+    for pin in &d.pins {
+        if let Some(at) = d.pin_at(pin) {
+            painter.circle_filled(xf.s(at), 3.0, t.accent);
+            painter.text(
+                xf.s(at) + Vec2::new(4.0, -4.0),
+                Align2::LEFT_BOTTOM,
+                &pin.name,
+                FontId::proportional(11.0),
+                t.ink,
+            );
+        }
+    }
+    if d.to.is_some()
+        && !asking
+        && let Some(c) = cur
+        && let Some((side, off)) = edge_at(min, max, c, tol.max(1.0))
+    {
+        let at = d.pin_at(&wc_core::BoxPin {
+            name: String::new(),
+            side,
+            offset: off,
+        });
+        if let Some(at) = at {
+            painter.circle_stroke(xf.s(at), 4.0, Stroke::new(1.5_f32, t.accent));
+        }
+    }
+}
+
+/// What is under `at` that can be picked: a free drawing only while its layer is shown and
+/// unlocked.
+/// Where a finding of the check while drawing is marked: around a placed symbol, or at the
+/// middle of a wire. `None` for anything else, or an item no longer on the page.
+fn live_spot(open: &Open, page: &Page, item: &str) -> Option<(Point, Point)> {
+    if let Some(b) = open.symbol_bounds(page, item) {
+        return Some(b);
+    }
+    // A revision cloud: the area it goes around.
+    if let Some(c) = wc_report::cloud_index(item).and_then(|n| page.clouds.get(n)) {
+        return Some((c.min, c.max));
+    }
+    let w = page.wires.iter().find(|w| w.id == item)?;
+    let pts = open.wire_points(page, w)?;
+    // The middle of the middle segment, or the one point of a wire that has only one.
+    let i = pts.len().saturating_sub(1) / 2;
+    let a = *pts.get(i)?;
+    let b = pts.get(i + 1).copied().unwrap_or(a);
+    let mid = Point::new((a.x + b.x) / 2.0, (a.y + b.y) / 2.0);
+    Some((mid, mid))
+}
+
+/// The findings of the check while drawing on this page: a ring in the colour of the worst
+/// finding around each item, with a badge that lists the findings when hovered.
+fn paint_live_findings(
+    painter: &egui::Painter,
+    xf: &Xf,
+    open: &Open,
+    page: &Page,
+    ed: &Editor,
+    hover: Option<Pos2>,
+    t: &crate::theme::Theme,
+) {
+    use wc_report::Severity;
+    let mut by_item: std::collections::BTreeMap<&str, Vec<&wc_report::Finding>> = Default::default();
+    for f in &ed.live {
+        if f.page_id.as_deref() == Some(page.id.as_str())
+            && f.severity != Severity::Note
+            && let Some(item) = f.item.as_deref()
+        {
+            by_item.entry(item).or_default().push(f);
+        }
+    }
+    let mut tip = None;
+    for (item, found) in by_item {
+        let Some((a, b)) = live_spot(open, page, item) else {
+            continue;
+        };
+        let worst = found.iter().map(|f| f.severity).min().unwrap_or(Severity::Warning);
+        let c = if worst == Severity::Error { t.error } else { t.warning };
+        let ring = Rect::from_two_pos(xf.s(a), xf.s(b)).expand(6.0);
+        painter.rect_stroke(ring, 4.0, Stroke::new(1.5_f32, c), egui::StrokeKind::Outside);
+        let badge = ring.right_top();
+        let r = 6.5_f32;
+        painter.circle_filled(badge, r, c);
+        painter.text(
+            badge,
+            Align2::CENTER_CENTER,
+            "!",
+            crate::theme::strong(10.0),
+            Color32::WHITE,
+        );
+        if hover.is_some_and(|h| h.distance(badge) <= r + 2.0 || ring.contains(h)) {
+            tip = Some((badge, found));
+        }
+    }
+    if let Some((badge, found)) = tip {
+        let text = found
+            .iter()
+            .map(|f| format!("{}: {}", f.severity.label(), f.message))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let galley = painter.layout_no_wrap(text, FontId::proportional(12.0), t.ink);
+        let size = galley.size() + Vec2::splat(10.0);
+        let rect = Rect::from_min_size(badge + Vec2::new(10.0, -size.y / 2.0), size);
+        painter.rect_filled(rect, 4.0, t.paper);
+        painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, t.faint), egui::StrokeKind::Inside);
+        painter.galley(rect.min + Vec2::splat(5.0), galley, t.ink);
+    }
+}
+
+fn pick(open: &Open, ed: &Editor, page: &Page, at: Point, tol: f64) -> Option<Selection> {
+    open.hit(page, at, tol).filter(|s| ed.layers.may_select(s))
+}
+
+/// A tool that adds to a hidden or locked layer (free drawings and texts, or review comments)
+/// falls back to Select, so nothing is drawn that cannot be seen or picked afterwards.
+fn leave_unpickable_layer(ed: &mut Editor) {
+    let layer = match ed.tool {
+        Tool::Text | Tool::Line | Tool::Rect | Tool::Circle | Tool::Arc | Tool::Polyline | Tool::Dimension => {
+            Layer::Drawings
+        }
+        Tool::Comment => Layer::Comments,
+        // Revision clouds and the revision table are on no layer.
+        Tool::Select | Tool::Place | Tool::Wire | Tool::Cloud | Tool::RevisionTable | Tool::BlackBox => return,
+    };
+    let Some(why) = ed.layers.refusal(layer) else {
+        return;
+    };
+    ed.tool = Tool::Select;
+    ed.shape_points.clear();
+    ed.shape_page = None;
+    ed.message = why;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -960,7 +1330,7 @@ fn select_tool(
     if resp.clicked_by(egui::PointerButton::Primary)
         && let Some(at) = resp.interact_pointer_pos().map(|p| xf.mm(p))
     {
-        match (open.hit(page, at, tol), shift) {
+        match (pick(open, ed, page, at, tol), shift) {
             (Some(h), true) => {
                 if let Some(i) = ed.selection.iter().position(|s| *s == h) {
                     ed.selection.remove(i);
@@ -978,18 +1348,25 @@ fn select_tool(
     if resp.secondary_clicked()
         && let Some(at) = resp.interact_pointer_pos().map(|p| xf.mm(p))
     {
-        right_clicked(ed, open.hit(page, at, tol));
+        let hit = pick(open, ed, page, at, tol);
+        right_clicked(ed, hit);
     }
     if !held && !selected_wires(ed).is_empty() {
         resp.context_menu(|ui| route_menu(ui, open, ed));
     }
+    // A drag is only seen once the pointer has moved: it starts where the button went down,
+    // so a small target (a sizing corner) is not missed by a quick drag.
     if resp.drag_started_by(egui::PointerButton::Primary)
-        && let Some(at) = resp.interact_pointer_pos().map(|p| xf.mm(p))
+        && let Some(at) = resp
+            .ctx
+            .input(|i| i.pointer.press_origin())
+            .or(resp.interact_pointer_pos())
+            .map(|p| xf.mm(p))
     {
         ed.drag = Some(drag_start(open, ed, page, at, tol, snap_step, shift, held));
     }
     stop_if_held(ed, held);
-    match ed.drag {
+    match ed.drag.clone() {
         Some(Drag::Logo {
             from,
             start,
@@ -1033,13 +1410,42 @@ fn select_tool(
                 }
             }
         }
+        // Also in the frame the button is let go: a last move that comes with the release counts.
+        Some(Drag::BoxSize {
+            id,
+            corner,
+            from,
+            start,
+            size,
+            shift,
+        }) if resp.dragged_by(egui::PointerButton::Primary) || resp.drag_stopped() => {
+            if let Some(cur) = primary_release_pos(&resp.ctx)
+                .or(resp.interact_pointer_pos())
+                .map(|p| xf.mm(p))
+                && let Some(s) = page.symbol(&id)
+            {
+                let d = Point::new(cur.x - from.x, cur.y - from.y);
+                let (now, moved) =
+                    crate::black_box_tool::dragged_box(start, corner, d, s.rotation, s.mirror, snap_step);
+                if now != size || moved != shift {
+                    ed.drag = Some(Drag::BoxSize {
+                        id,
+                        corner,
+                        from,
+                        start,
+                        size: now,
+                        shift: moved,
+                    });
+                }
+            }
+        }
         Some(Drag::Box { from }) => {
             if let Some(cur) = resp.interact_pointer_pos().or(resp.hover_pos()).map(|p| xf.mm(p)) {
                 let r = Rect::from_two_pos(xf.s(from), xf.s(cur));
                 painter.rect_filled(r, 0.0, t.selection.gamma_multiply(0.08));
                 painter.rect_stroke(r, 0.0, Stroke::new(1.0_f32, t.selection), egui::StrokeKind::Middle);
                 if resp.drag_stopped() {
-                    let found = open.select_in(ed.page, from, cur);
+                    let found = ed.layers.keep(open.select_in(ed.page, from, cur));
                     if shift {
                         for f in found {
                             if !ed.is_selected(&f) {
@@ -1054,10 +1460,85 @@ fn select_tool(
         }
         _ => {}
     }
+    paint_box_sizing(painter, open, ed, page, xf, &t, held);
     if resp.drag_stopped() {
         let alt = resp.ctx.input(|i| i.modifiers.alt);
         drag_released(open, ed, alt);
     }
+}
+
+/// The black box `id` on `page` that can be sized by its corners: its size, and each of its
+/// four sizing corners (far corner first) with where it is in page mm, turned and mirrored with
+/// the placement. `None` for any other item.
+type BoxCorners = ((f64, f64), [(crate::black_box_tool::Corner, Point); 4]);
+
+fn box_corners(open: &Open, page: &Page, id: &str) -> Option<BoxCorners> {
+    let s = page.symbol(id)?;
+    let (w, h, _) = wc_core::black_box_layout(open.symbols.get(&s.symbol)?)?;
+    let on_page = |c| {
+        (
+            c,
+            crate::black_box_tool::corner_at(c, w, h).transform(s.rotation, s.mirror) + s.at,
+        )
+    };
+    Some(((w, h), crate::black_box_tool::CORNERS.map(on_page)))
+}
+
+/// The sizing handle of the one selected black box, and while it is dragged the box's outline
+/// at the size it will get. Not on a page someone else holds.
+fn paint_box_sizing(
+    painter: &egui::Painter,
+    open: &Open,
+    ed: &Editor,
+    page: &Page,
+    xf: &Xf,
+    t: &theme::Theme,
+    held: bool,
+) {
+    if held {
+        return;
+    }
+    if let Some(Drag::BoxSize {
+        id,
+        corner,
+        size,
+        shift,
+        ..
+    }) = &ed.drag
+        && let Some(s) = page.symbol(id)
+    {
+        let (w, h) = *size;
+        let on_page = |p: Point| xf.s((p + *shift).transform(s.rotation, s.mirror) + s.at);
+        let pts: Vec<Pos2> = [(0.0, 0.0), (w, 0.0), (w, h), (0.0, h), (0.0, 0.0)]
+            .into_iter()
+            .map(|(x, y)| on_page(Point::new(x, y)))
+            .collect();
+        painter.add(egui::Shape::line(pts, Stroke::new(1.5_f32, t.ghost)));
+        painter.rect_filled(
+            Rect::from_center_size(
+                on_page(crate::black_box_tool::corner_at(*corner, w, h)),
+                Vec2::splat(7.0),
+            ),
+            1.0,
+            t.selection,
+        );
+        return;
+    }
+    if let Some(Selection::Symbol(id)) = ed.one()
+        && let Some((_, corners)) = box_corners(open, page, id)
+    {
+        for (_, at) in corners {
+            painter.rect_filled(Rect::from_center_size(xf.s(at), Vec2::splat(7.0)), 1.0, t.selection);
+        }
+    }
+}
+
+/// Whether `at` is on a sizing corner `c` of a black box of `size`: within reach of it, but
+/// no further than a quarter of the box's shorter side, so a small box keeps a middle part
+/// that moves it.
+fn box_corner_hit(c: Point, at: Point, tol: f64, size: (f64, f64)) -> bool {
+    let r = tol.max(2.0).min(size.0.min(size.1) / 4.0);
+    (at.x - c.x).abs() <= r && (at.y - c.y).abs() <= r
 }
 
 /// Whether `at` is on the sizing corner of a logo box whose bottom-right corner is `max`.
@@ -1078,8 +1559,26 @@ fn drag_start(
     if held {
         return Drag::Box { from: at };
     }
+    // A sizing corner of the one selected black box wins over whatever lies under it; the
+    // nearest one when a small box puts several within reach.
+    if let Some(Selection::Symbol(id)) = ed.one()
+        && let Some((start, corners)) = box_corners(open, page, id)
+        && let Some((corner, _)) = corners
+            .into_iter()
+            .filter(|(_, c)| box_corner_hit(*c, at, tol, start))
+            .min_by(|a, b| a.1.distance(at).total_cmp(&b.1.distance(at)))
+    {
+        return Drag::BoxSize {
+            id: id.clone(),
+            corner,
+            from: at,
+            start,
+            size: start,
+            shift: Point::new(0.0, 0.0),
+        };
+    }
     let logo = wc_pdf::cover_logo_box(&open.project, page);
-    let hit = open.hit(page, at, tol);
+    let hit = pick(open, ed, page, at, tol);
     match (logo, hit) {
         // The sizing corner wins over whatever lies under it; elsewhere the page's items do.
         (Some((a, b)), _) if logo_corner(b, at, tol) => Drag::Logo {
@@ -1184,12 +1683,24 @@ fn paint_logo(
 /// The page became held during a move: the move stops where it is, and its release does
 /// nothing more (no wiring of pins that now line up). A selection box goes on.
 fn stop_if_held(ed: &mut Editor, held: bool) {
-    if held && matches!(ed.drag, Some(Drag::Move { .. } | Drag::Logo { .. })) {
+    if held
+        && matches!(
+            ed.drag,
+            Some(Drag::Move { .. } | Drag::Logo { .. } | Drag::BoxSize { .. })
+        )
+    {
         ed.drag = None;
     }
 }
 
 fn drag_released(open: &mut Open, ed: &mut Editor, alt: bool) {
+    if let Some(Drag::BoxSize {
+        id, start, size, shift, ..
+    }) = ed.drag.clone()
+        && (size != start || shift != Point::new(0.0, 0.0))
+    {
+        box_sized(open, ed, &id, size, shift);
+    }
     if let Some(Drag::Move { checkpoint: true, .. }) = ed.drag {
         let moved = ed
             .selection
@@ -1205,6 +1716,34 @@ fn drag_released(open: &mut Open, ed: &mut Editor, alt: bool) {
         }
     }
     ed.drag = None;
+}
+
+/// The end of a drag on a black box's sizing corner: the box gets `size` and its origin moves
+/// by `shift` in its own frame (a near corner was dragged), its points kept where they were on
+/// the page where they can and on their edges, as one undo step with the same warnings as the
+/// properties panel's Apply.
+fn box_sized(open: &mut Open, ed: &mut Editor, id: &str, size: (f64, f64), shift: Point) {
+    let Some(s) = open.project.pages.get(ed.page).and_then(|p| p.symbol(id)) else {
+        ed.message = format!("The box was not sized: {id} is no longer on this page.");
+        return;
+    };
+    let Some((_, _, pins)) = open.symbols.get(&s.symbol).and_then(wc_core::black_box_layout) else {
+        return;
+    };
+    let pins = crate::black_box_tool::shifted_pins(&pins, shift, size.0, size.1);
+    let moved = shift.transform(s.rotation, s.mirror);
+    let none = std::collections::BTreeSet::new();
+    let none_renamed = std::collections::BTreeMap::new();
+    ed.message = match open.edit_black_box_moved(ed.page, id, size, &pins, &none_renamed, &none, moved) {
+        Ok(warnings) if warnings.is_empty() => format!("Black box {id} sized to {} x {} mm.", size.0, size.1),
+        Ok(warnings) => format!(
+            "Black box {id} sized to {} x {} mm. Check: {}.",
+            size.0,
+            size.1,
+            warnings.join("; ")
+        ),
+        Err(e) => format!("The box was not sized: {e}"),
+    };
 }
 
 /// Wire the pins of `items` that now line up, unless auto-wiring is off or Alt is held.
@@ -1301,40 +1840,290 @@ fn route_note(changed: usize, style: Route) -> String {
     }
 }
 
-/// Line and rectangle tools: click the first corner, then the second.
+/// How many clicks a drawing tool takes (`None`: a polyline takes clicks until it is finished).
+pub(crate) fn clicks_needed(tool: Tool) -> Option<usize> {
+    match tool {
+        Tool::Arc | Tool::Dimension => Some(3),
+        Tool::Polyline => None,
+        _ => Some(2),
+    }
+}
+
+/// The shape `tool` draws from the clicks `pts`, or `None` while it is too small to draw
+/// (both clicks on one point, a circle without a radius, an arc that ends at its centre).
+/// A line, rectangle and circle take two clicks (the circle: centre, then a point on it), an arc
+/// three (centre, start, end; it runs clockwise on paper) and a polyline two or more.
+pub(crate) fn drawn_shape(tool: Tool, pts: &[Point]) -> Option<Shape> {
+    match (tool, pts) {
+        (Tool::Line, &[a, b]) if a != b => Some(Shape::Line { a, b }),
+        // A cloud is shown as the rectangle it goes around while it is drawn.
+        (Tool::Rect | Tool::Cloud, &[a, b]) if a != b => Some(Shape::Rect {
+            min: Point::new(a.x.min(b.x), a.y.min(b.y)),
+            max: Point::new(a.x.max(b.x), a.y.max(b.y)),
+        }),
+        (Tool::Circle, &[c, p]) if c != p => Some(Shape::Circle {
+            center: c,
+            radius: c.distance(p),
+            filled: false,
+        }),
+        // An end on the start ray would make a full turn, which is a circle: not an arc.
+        (Tool::Arc, &[c, s, e])
+            if c != s
+                && c != e
+                && (crate::symbol_editor::angle(c, s) - crate::symbol_editor::angle(c, e)).abs() > 1e-9 =>
+        {
+            Some(Shape::Arc {
+                center: c,
+                radius: c.distance(s),
+                start: crate::symbol_editor::angle(c, s),
+                end: crate::symbol_editor::angle(c, e),
+            })
+        }
+        // Two clicks show it on the line measured; the third sets how far off the line goes.
+        (Tool::Dimension, &[a, b]) if a != b => Some(Shape::Dimension {
+            a,
+            b,
+            offset: 0.0,
+            height: DIMENSION_TEXT_HEIGHT,
+        }),
+        (Tool::Dimension, &[a, b, at]) if a != b => Some(Shape::Dimension {
+            a,
+            b,
+            offset: dimension_offset(a, b, at),
+            height: DIMENSION_TEXT_HEIGHT,
+        }),
+        (Tool::Polyline, pts) if pts.len() >= 2 => {
+            // A polyline that ends where it started is closed.
+            let mut points = pts.to_vec();
+            let closed = points.len() >= 4 && points.first() == points.last();
+            if closed {
+                points.pop();
+            }
+            Some(Shape::Polyline {
+                points,
+                closed,
+                filled: false,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Text height of a dimension drawn by hand, in mm.
+pub(crate) const DIMENSION_TEXT_HEIGHT: f64 = 2.5;
+
+/// How far `at` lies to the left of the line from `a` to `b` (as seen on paper; negative: to
+/// the right), in mm: the offset of a dimension line through `at`.
+pub(crate) fn dimension_offset(a: Point, b: Point, at: Point) -> f64 {
+    let len = a.distance(b);
+    if len <= 0.0 {
+        return 0.0;
+    }
+    // Left normal on a y-down page is (uy, -ux).
+    let (ux, uy) = ((b.x - a.x) / len, (b.y - a.y) / len);
+    let off = (at.x - a.x) * uy - (at.y - a.y) * ux;
+    (off * 1e6).round() / 1e6
+}
+
+/// What to click next, for the status line.
+pub(crate) fn shape_hint(tool: Tool, clicks: usize) -> &'static str {
+    match (tool, clicks) {
+        (Tool::Circle, 0) => "Click the centre of the circle.",
+        (Tool::Circle, _) => "Click a point on the circle (Esc cancels).",
+        (Tool::Arc, 0) => "Click the centre of the arc.",
+        (Tool::Arc, 1) => "Click where the arc starts (Esc cancels).",
+        (Tool::Arc, _) => "Click where the arc ends; it runs clockwise (Esc cancels).",
+        (Tool::Cloud, 0) => "Click one corner of the area the cloud goes around.",
+        (Tool::Cloud, _) => "Click the opposite corner; the cloud gets the latest revision (Esc cancels).",
+        (Tool::Dimension, 0) => "Click the first point to measure from.",
+        (Tool::Dimension, 1) => "Click the second point to measure to (Esc cancels).",
+        (Tool::Dimension, _) => "Click where the dimension line goes (Esc cancels).",
+        (Tool::Polyline, 0) => "Click the first point.",
+        (Tool::Polyline, _) => {
+            "Click the next point; double-click or Enter ends it, a click on the first point closes it (Esc cancels)."
+        }
+        (_, 0) => "Click the first point.",
+        _ => "Click the other end (Esc cancels).",
+    }
+}
+
+/// A click with the revision table tool: the page's table goes there (moved when it is on
+/// the page already) and is selected.
+pub(crate) fn revision_table_click(open: &mut Open, ed: &mut Editor, at: Point) {
+    match open.place_revision_table(ed.page, at) {
+        Ok(sel) => {
+            ed.select_only(sel);
+            ed.message = "Revision table placed. Drag it to move it; Delete takes it off.".into();
+        }
+        Err(why) => ed.message = why,
+    }
+}
+
+/// Put the shape drawn from `ed.shape_points` on the page and select it.
+pub(crate) fn finish_shape(open: &mut Open, ed: &mut Editor) {
+    let pts = std::mem::take(&mut ed.shape_points);
+    if ed.tool == Tool::Cloud {
+        if let &[a, b] = pts.as_slice() {
+            match open.add_cloud(ed.page, a, b) {
+                Ok(sel) => {
+                    ed.select_only(sel);
+                    ed.message = shape_hint(ed.tool, 0).into();
+                }
+                Err(why) => ed.message = why,
+            }
+        }
+        return;
+    }
+    if let Some(shape) = drawn_shape(ed.tool, &pts)
+        && let Some(sel) = open.add_graphic(ed.page, shape)
+    {
+        ed.select_only(sel);
+    }
+    ed.message = shape_hint(ed.tool, 0).into();
+}
+
+/// The drawing tools: line, rectangle, circle, arc and polyline. Each click adds a point; the
+/// shape goes on the page when it has all its clicks (a polyline: on a double-click, on Enter
+/// or on a click back on its first point).
+#[allow(clippy::too_many_arguments)]
 fn shape_tool(
     painter: &egui::Painter,
     resp: &egui::Response,
     open: &mut Open,
     ed: &mut Editor,
     xf: &Xf,
+    shown: &Xf,
     t: &theme::Theme,
+    enter: bool,
+    snap_step: f64,
 ) {
-    let Some(cur) = ed.cursor else { return };
-    let make = |a: Point, b: Point, tool: Tool| match tool {
-        Tool::Rect => Shape::Rect {
-            min: Point::new(a.x.min(b.x), a.y.min(b.y)),
-            max: Point::new(a.x.max(b.x), a.y.max(b.y)),
-        },
-        _ => Shape::Line { a, b },
-    };
-    if let Some(a) = ed.shape_start {
-        paint_shape(painter, xf, &make(a, cur, ed.tool), Stroke::new(1.5_f32, t.ghost));
+    // Enter ends a polyline wherever the pointer is.
+    if enter && ed.tool == Tool::Polyline && ed.shape_points.len() >= 2 {
+        finish_shape(open, ed);
+        return;
     }
-    if resp.clicked_by(egui::PointerButton::Primary) {
-        match ed.shape_start.take() {
-            None => {
-                ed.shape_start = Some(cur);
-                ed.message = "Click the other end (Esc cancels).".into();
+    // A click places its point where the button was released (a tap on a touch screen has
+    // no hover, and the pointer may have moved on before this frame).
+    if resp.clicked_by(egui::PointerButton::Primary)
+        && let Some(pos) = primary_release_pos(&resp.ctx).or(resp.interact_pointer_pos())
+    {
+        let now = resp.ctx.input(|i| i.time);
+        // Unsnapped, a repeat may land a little off the last point.
+        let tol = if snap_step > 0.0 {
+            0.0
+        } else {
+            f64::from(REPEAT_SLOP_PX / shown.zoom)
+        };
+        shape_input(open, ed, snap(shown.mm(pos), snap_step), now, tol);
+    }
+    let Some(cur) = ed.cursor else { return };
+    let ghost = Stroke::new(1.5_f32, t.ghost);
+    if !ed.shape_points.is_empty() {
+        let mut pts = ed.shape_points.clone();
+        pts.push(cur);
+        match drawn_shape(ed.tool, &pts) {
+            Some(s) => paint_shape(painter, xf, &s, ghost),
+            // An arc with its centre and start only: show the full circle it lies on.
+            None if ed.tool == Tool::Arc && pts.len() == 2 && pts[0] != pts[1] => {
+                painter.circle_stroke(xf.s(pts[0]), xf.len(pts[0].distance(pts[1])), ghost);
             }
-            Some(a) if a != cur => {
-                if let Some(sel) = open.add_graphic(ed.page, make(a, cur, ed.tool)) {
-                    ed.select_only(sel);
-                }
-                ed.message.clear();
-            }
-            Some(_) => {}
+            None => {}
         }
+    }
+}
+
+/// A drawing started on another page does not go on this one: its clicks are dropped when
+/// the page shown changes (by id, so the same page moved in the navigator keeps them).
+pub(crate) fn drop_draft_of_other_page(open: &Open, ed: &mut Editor) {
+    let page_id = open.project.pages.get(ed.page).map(|p| p.id.as_str());
+    if !ed.shape_points.is_empty() && ed.shape_page.as_deref() != page_id {
+        ed.shape_points.clear();
+        ed.message = shape_hint(ed.tool, 0).into();
+    }
+}
+
+/// Longest time between two clicks on a polyline's last point that ends it, in seconds (egui's
+/// double-click time).
+const REPEAT_SECS: f64 = 0.3;
+
+/// How far (in screen points) a repeat click may land from the last point with snapping off.
+const REPEAT_SLOP_PX: f32 = 4.0;
+
+/// Where the primary button was last released this frame, if it was.
+fn primary_release_pos(ctx: &egui::Context) -> Option<egui::Pos2> {
+    ctx.input(|i| {
+        i.events.iter().rev().find_map(|e| match e {
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                ..
+            } => Some(*pos),
+            _ => None,
+        })
+    })
+}
+
+/// A primary click at `at` at time `now` (seconds) with a drawing tool. A second click on a
+/// polyline's last point within [`REPEAT_SECS`] ends it; a slower one does nothing, and a quick
+/// click on another point adds that point. Points within `tol` (mm) of each other count as the
+/// same (0 when snapping, so a quick click on the next grid point still adds it).
+pub(crate) fn shape_input(open: &mut Open, ed: &mut Editor, at: Point, now: f64, tol: f64) {
+    let same = |p: &Point| p.distance(at) <= tol;
+    let repeat = ed.shape_points.last().is_some_and(same);
+    let quick = ed
+        .last_shape_click
+        .is_some_and(|(p, t)| same(&p) && now - t <= REPEAT_SECS);
+    ed.last_shape_click = Some((at, now));
+    if ed.tool == Tool::Polyline && repeat {
+        if quick && ed.shape_points.len() >= 2 {
+            finish_shape(open, ed);
+        }
+        return;
+    }
+    // A click near the first point of a polyline of three or more closes it on that point.
+    let at = match ed.shape_points.first() {
+        Some(&first) if ed.tool == Tool::Polyline && ed.shape_points.len() >= 3 && same(&first) => first,
+        _ => at,
+    };
+    shape_click(open, ed, at);
+}
+
+/// A click at `at` with a drawing tool: add the point, and put the shape on the page when it
+/// has all its clicks (a polyline: when the click is back on its first point).
+pub(crate) fn shape_click(open: &mut Open, ed: &mut Editor, at: Point) {
+    // A polyline does not take the same point twice in a row (a double-click on it ends it).
+    if ed.tool == Tool::Polyline && ed.shape_points.last() == Some(&at) {
+        return;
+    }
+    // An arc's start on its centre would refuse every end: ask for another start.
+    if ed.tool == Tool::Arc && ed.shape_points.len() == 1 && ed.shape_points[0] == at {
+        ed.message = "The start must be away from the centre; click another point (Esc cancels).".into();
+        return;
+    }
+    // A dimension measures between two different points.
+    if ed.tool == Tool::Dimension && ed.shape_points.len() == 1 && ed.shape_points[0] == at {
+        ed.message = "Click a point away from the first to measure to (Esc cancels).".into();
+        return;
+    }
+    if ed.shape_points.is_empty() {
+        ed.shape_page = open.project.pages.get(ed.page).map(|p| p.id.clone());
+    }
+    ed.shape_points.push(at);
+    let n = ed.shape_points.len();
+    let done = match clicks_needed(ed.tool) {
+        Some(k) => n >= k,
+        None => n >= 4 && ed.shape_points.first() == Some(&at),
+    };
+    if done && drawn_shape(ed.tool, &ed.shape_points).is_none() {
+        // The last click makes no shape (a line or circle of no length, an arc that ends on its
+        // centre or on its start ray): keep the others and ask for another point.
+        ed.shape_points.pop();
+        ed.message = "That point makes no shape; click another one (Esc cancels).".into();
+    } else if done {
+        finish_shape(open, ed);
+    } else {
+        ed.message = shape_hint(ed.tool, n).into();
     }
 }
 
@@ -1520,6 +2309,1101 @@ fn jumper_points(
 mod tests {
     use super::*;
     use crate::state::tests::project;
+
+    /// Click `pts` with `tool` as the canvas does.
+    fn draw(open: &mut Open, ed: &mut Editor, tool: Tool, pts: &[(f64, f64)]) {
+        ed.tool = tool;
+        for &(x, y) in pts {
+            shape_click(open, ed, Point::new(x, y));
+        }
+    }
+
+    #[test]
+    fn a_revision_is_added_a_cloud_drawn_and_the_table_placed_moved_and_taken_off() {
+        use crate::state::RevisionRow;
+        let (_tmp, mut open) = project();
+        let mut ed = Editor {
+            page: 1,
+            ..Editor::default()
+        };
+        // Without a revision the cloud tool says what to do first and draws nothing.
+        draw(&mut open, &mut ed, Tool::Cloud, &[(20.0, 20.0), (60.0, 40.0)]);
+        assert!(open.project.pages[1].clouds.is_empty());
+        assert!(ed.message.contains("Add a revision first"), "{}", ed.message);
+
+        let name = open.project.meta.name.clone();
+        let row = |letter: &str, text: &str| RevisionRow {
+            letter: letter.into(),
+            date: "2026-11-19".into(),
+            text: text.into(),
+            ..RevisionRow::default()
+        };
+        let mark = open.undo_mark();
+        open.set_project_props(
+            &name,
+            &[],
+            None,
+            Some(&[row("A", "First issue"), row("B", "Pumps added")]),
+        )
+        .unwrap();
+        assert_eq!(open.undo_mark(), mark + 1, "one undo step");
+        assert!(
+            open.set_project_props(&name, &[], None, Some(&[row("A", ""), row("A", "")]))
+                .is_err(),
+            "a letter twice is refused"
+        );
+
+        // Two clicks draw a cloud with the latest revision, selected.
+        let mark = open.undo_mark();
+        draw(&mut open, &mut ed, Tool::Cloud, &[(60.0, 40.0), (20.0, 20.0)]);
+        let clouds = &open.project.pages[1].clouds;
+        assert_eq!(clouds.len(), 1);
+        assert_eq!(
+            (clouds[0].min, clouds[0].max, clouds[0].revision.as_str()),
+            (Point::new(20.0, 20.0), Point::new(60.0, 40.0), "B")
+        );
+        assert_eq!(ed.selection, [Selection::Cloud(0)]);
+        assert_eq!(open.undo_mark(), mark + 1);
+        // Picked on its outline, retagged, moved and removed like a drawing.
+        let page = open.project.pages[1].clone();
+        let c = &page.clouds[0];
+        // A point on its revision tag, above the top-right corner.
+        let tag = (0..200)
+            .map(|k| Point::new(c.max.x, c.min.y - f64::from(k) * 0.1))
+            .find(|p| c.hit(*p, 0.2))
+            .unwrap();
+        assert_eq!(open.hit(&page, tag, 0.2), Some(Selection::Cloud(0)));
+        assert_eq!(
+            open.hit(&page, Point::new(40.0, 30.0), 0.2),
+            None,
+            "inside it is not the cloud"
+        );
+        assert!(open.set_cloud_revision(1, 0, "A"));
+        assert!(!open.set_cloud_revision(1, 0, "C"), "no such revision");
+        assert_eq!(open.project.pages[1].clouds[0].revision, "A");
+        // A revision a cloud carries cannot be removed.
+        let rows = RevisionRow::of(&open.project.meta.revisions);
+        let err = open.set_project_props(&name, &[], None, Some(&rows[1..])).unwrap_err();
+        assert!(err.contains("cloud of revision A"), "{err}");
+        open.move_by(1, &[Selection::Cloud(0)], Point::new(5.0, 5.0));
+        assert_eq!(open.project.pages[1].clouds[0].min, Point::new(25.0, 25.0));
+
+        // The table goes where the tool clicks, and a second click moves it.
+        ed.tool = Tool::RevisionTable;
+        revision_table_click(&mut open, &mut ed, Point::new(200.0, 150.0));
+        revision_table_click(&mut open, &mut ed, Point::new(210.0, 160.0));
+        assert_eq!(open.project.pages[1].revision_table, Some(Point::new(210.0, 160.0)));
+        assert_eq!(ed.selection, [Selection::RevisionTable]);
+        let page = open.project.pages[1].clone();
+        assert_eq!(
+            open.hit(&page, Point::new(212.0, 162.0), 1.0),
+            Some(Selection::RevisionTable)
+        );
+        assert!(open.select_all(1).contains(&Selection::RevisionTable));
+
+        // Saved and opened again, both are kept.
+        open.save().unwrap();
+        let mut again = Open::load(&open.dir).unwrap();
+        assert_eq!(again.project.pages[1].clouds, open.project.pages[1].clouds);
+        assert_eq!(again.project.pages[1].revision_table, Some(Point::new(210.0, 160.0)));
+        assert_eq!(again.project.meta.revisions.len(), 2);
+
+        // Delete takes both off; Undo puts them back.
+        again.delete_many(1, &[Selection::Cloud(0), Selection::RevisionTable]);
+        assert!(again.project.pages[1].clouds.is_empty() && again.project.pages[1].revision_table.is_none());
+        assert!(again.undo());
+        assert_eq!(again.project.pages[1].clouds.len(), 1);
+        assert!(again.project.pages[1].revision_table.is_some());
+    }
+
+    #[test]
+    fn a_cloud_with_an_unknown_revision_is_marked_around_its_area() {
+        let (_tmp, mut o) = project();
+        let cloud = wc_core::RevisionCloud {
+            min: Point::new(40.0, 30.0),
+            max: Point::new(90.0, 60.0),
+            revision: "Z".into(),
+        };
+        o.project.pages[1].clouds.push(cloud);
+        let found = crate::run_check(&o);
+        let f = found.iter().find(|f| f.message.contains("revision Z")).unwrap();
+        let page = &o.project.pages[1];
+        assert_eq!(f.page_id.as_deref(), Some(page.id.as_str()));
+        let spot = f.item.as_deref().and_then(|item| live_spot(&o, page, item));
+        assert_eq!(spot, Some((Point::new(40.0, 30.0), Point::new(90.0, 60.0))));
+        assert_eq!(live_spot(&o, page, "cloud 7"), None, "no such cloud");
+    }
+
+    #[test]
+    fn a_polyline_ends_on_a_quick_repeat_at_its_last_point_only() {
+        let (_tmp, mut open) = project();
+        let mut ed = Editor {
+            tool: Tool::Polyline,
+            ..Default::default()
+        };
+        let p = Point::new;
+        shape_input(&mut open, &mut ed, p(10.0, 10.0), 0.0, 0.0);
+        shape_input(&mut open, &mut ed, p(20.0, 10.0), 0.08, 0.0);
+        // A quick click on another point adds that point.
+        shape_input(&mut open, &mut ed, p(20.0, 20.0), 0.16, 0.0);
+        assert_eq!(ed.shape_points.len(), 3);
+        // A slow repeat on the last point (egui may still call it a triple-click) does nothing.
+        shape_input(&mut open, &mut ed, p(20.0, 20.0), 0.62, 0.0);
+        assert_eq!(ed.shape_points.len(), 3);
+        assert!(open.project.pages[0].graphics.is_empty());
+        // A quick repeat on the last point ends it with three points.
+        shape_input(&mut open, &mut ed, p(20.0, 20.0), 0.8, 0.0);
+        assert!(ed.shape_points.is_empty());
+        assert!(matches!(
+            &open.project.pages[0].graphics[..],
+            [Shape::Polyline { points, closed: false, .. }] if points.len() == 3
+        ));
+        // Unsnapped, a quick repeat a hair off the last point still ends the line; with no
+        // tolerance (snapping on) a quick click on a nearby grid point adds a vertex.
+        shape_input(&mut open, &mut ed, p(0.0, 0.0), 1.0, 0.5);
+        shape_input(&mut open, &mut ed, p(10.0, 0.0), 2.0, 0.5);
+        shape_input(&mut open, &mut ed, p(10.2, 0.1), 2.1, 0.5);
+        assert!(ed.shape_points.is_empty());
+        assert_eq!(open.project.pages[0].graphics.len(), 2);
+        shape_input(&mut open, &mut ed, p(0.0, 0.0), 3.0, 0.0);
+        shape_input(&mut open, &mut ed, p(10.0, 0.0), 4.0, 0.0);
+        shape_input(&mut open, &mut ed, p(11.0, 0.0), 4.1, 0.0);
+        assert_eq!(ed.shape_points.len(), 3);
+        // Unsnapped, a click a hair off the first point closes the line on that point.
+        ed.shape_points.clear();
+        for (i, q) in [p(0.0, 0.0), p(10.0, 0.0), p(10.0, 10.0), p(0.1, -0.2)]
+            .into_iter()
+            .enumerate()
+        {
+            shape_input(&mut open, &mut ed, q, 10.0 + i as f64, 0.5);
+        }
+        assert!(ed.shape_points.is_empty());
+        assert!(matches!(
+            open.project.pages[0].graphics.last(),
+            Some(Shape::Polyline { points, closed: true, .. }) if points.len() == 3
+        ));
+    }
+
+    #[test]
+    fn enter_ends_a_polyline_through_the_canvas_with_the_pointer_away() {
+        let (_tmp, mut open) = project();
+        let page_id = open.project.pages[0].id.clone();
+        let mut ed = Editor {
+            tool: Tool::Polyline,
+            shape_points: vec![Point::new(10.0, 10.0), Point::new(30.0, 10.0)],
+            shape_page: Some(page_id),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let frame = |open: &mut Open, ed: &mut Editor| {
+            // No pointer over the canvas at all.
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 600.0))),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| show(ui, open, ed, false, 1.0));
+            });
+        };
+        frame(&mut open, &mut ed);
+        assert_eq!(ed.shape_points.len(), 2, "nothing happens without Enter");
+        // The keyboard shortcut sets the flag (not while a dialog or text field has the keys).
+        ed.finish_shape = true;
+        frame(&mut open, &mut ed);
+        assert!(ed.shape_points.is_empty() && !ed.finish_shape);
+        assert!(matches!(
+            &open.project.pages[0].graphics[..],
+            [Shape::Polyline { points, .. }] if points.len() == 2
+        ));
+    }
+
+    #[test]
+    fn the_black_box_tool_takes_a_drag_edge_clicks_and_a_click_inside_through_egui_events() {
+        let (_tmp, mut open) = project();
+        let mut ed = Editor {
+            tool: Tool::BlackBox,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let button = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let (a, b) = (egui::pos2(300.0, 200.0), egui::pos2(500.0, 350.0));
+        // A first frame lays the canvas out, so the pointer is over it from then on.
+        painted(&ctx, &mut open, &mut ed, 0.5, vec![]);
+        painted(&ctx, &mut open, &mut ed, 1.0, vec![egui::Event::PointerMoved(a)]);
+        let corner = ed.cursor.unwrap();
+        painted(&ctx, &mut open, &mut ed, 1.01, vec![button(a, true)]);
+        // One move all the way: the drag is seen only now, with the pointer already at `b`.
+        painted(&ctx, &mut open, &mut ed, 1.05, vec![egui::Event::PointerMoved(b)]);
+        let other = ed.cursor.unwrap();
+        painted(&ctx, &mut open, &mut ed, 1.1, vec![button(b, false)]);
+        let d = ed.black_box.clone().unwrap();
+        assert_eq!(d.from, corner, "the drag's corner is where the button went down");
+        assert_eq!(d.to, Some(other));
+        assert!(ed.ask_box_pin.is_none() && !ed.ask_box_tag);
+
+        // A click on the top edge asks for a connection point there.
+        click_at(&ctx, &mut open, &mut ed, egui::pos2(400.0, 200.0), 2.0);
+        let Some((side, offset)) = ed.ask_box_pin.take() else {
+            unreachable!("a click on the edge asks for a point")
+        };
+        assert_eq!(side, wc_core::BoxSide::Top);
+        assert!(offset > 0.0 && offset < other.x - corner.x, "{offset}");
+        ed.black_box.as_mut().unwrap().add_pin(side, offset, "1").unwrap();
+        // A click inside asks for the tag; the page is not changed by any of it.
+        click_at(&ctx, &mut open, &mut ed, egui::pos2(400.0, 280.0), 3.0);
+        assert!(ed.ask_box_tag);
+        assert!(open.project.pages[0].symbols.is_empty());
+
+        // On a touch screen the release comes with PointerGone in the same frame, which clears
+        // the hover position: a tap still starts a box and a second one finishes it.
+        ed.ask_box_tag = false;
+        ed.black_box = None;
+        let tap = |open: &mut Open, ed: &mut Editor, pos: egui::Pos2, t: f64| {
+            painted(
+                &ctx,
+                open,
+                ed,
+                t,
+                vec![egui::Event::PointerMoved(pos), button(pos, true)],
+            );
+            painted(
+                &ctx,
+                open,
+                ed,
+                t + 0.02,
+                vec![button(pos, false), egui::Event::PointerGone],
+            );
+        };
+        tap(&mut open, &mut ed, a, 5.0);
+        assert!(ed.cursor.is_none(), "the hover position is gone after the tap");
+        assert_eq!(ed.black_box.as_ref().map(|d| d.from), Some(corner));
+        tap(&mut open, &mut ed, b, 6.0);
+        assert_eq!(ed.black_box.as_ref().and_then(|d| d.to), Some(other));
+
+        // Released at `b`, then moved and zoomed in the same frame: the corner is where `b` was
+        // in the view the user saw.
+        ed.black_box = None;
+        click_at(&ctx, &mut open, &mut ed, a, 7.0);
+        let zoom = ed.view.zoom;
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            8.0,
+            vec![egui::Event::PointerMoved(b), button(b, true)],
+        );
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            8.01,
+            // Moved on to `a` before the zoom, so the zoom is about `a` and moves `b`.
+            vec![button(b, false), egui::Event::PointerMoved(a), egui::Event::Zoom(2.0)],
+        );
+        assert!(ed.view.zoom > zoom, "the view zoomed");
+        assert_eq!(ed.black_box.as_ref().and_then(|d| d.to), Some(other));
+
+        // A click near an edge, released as the view zooms in: it is judged at the zoom the
+        // user saw, so it still lands on the edge (at the new zoom it would be inside).
+        ed.view = View {
+            zoom: 1.0,
+            offset: Vec2::ZERO,
+            fit: false,
+        };
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            8.5,
+            vec![egui::Event::PointerMoved(egui::pos2(100.0, 100.0))],
+        );
+        let seen = ed.cursor.unwrap();
+        let origin = egui::pos2(100.0 - seen.x as f32, 100.0 - seen.y as f32);
+        let mut d = crate::black_box_tool::BoxDraft::new(&open.project.pages[0].id, Point::new(50.0, 50.0));
+        d.to = Some(Point::new(150.0, 150.0));
+        ed.black_box = Some(d);
+        let near_top = origin + Vec2::new(100.0, 54.0);
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            8.6,
+            vec![egui::Event::PointerMoved(near_top), button(near_top, true)],
+        );
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            8.62,
+            vec![
+                button(near_top, false),
+                egui::Event::PointerMoved(origin + Vec2::new(400.0, 400.0)),
+                egui::Event::Zoom(2.0),
+            ],
+        );
+        assert!(ed.view.zoom > 1.5, "the view zoomed");
+        assert!(!ed.ask_box_tag, "not taken for a click inside");
+        assert_eq!(ed.ask_box_pin.take().map(|(side, _)| side), Some(wc_core::BoxSide::Top));
+
+        // Another tool drops the box being drawn.
+        ed.ask_box_tag = false;
+        ed.tool = Tool::Line;
+        painted(&ctx, &mut open, &mut ed, 9.0, vec![]);
+        assert!(ed.black_box.is_none());
+    }
+
+    #[test]
+    fn a_small_selected_black_box_keeps_a_middle_part_that_moves_it() {
+        let (_tmp, mut open) = project();
+        let id = open
+            .add_black_box(0, Point::new(40.0, 40.0), Point::new(50.0, 50.0), &[], None)
+            .unwrap();
+        let mut ed = Editor {
+            selection: vec![Selection::Symbol(id.clone())],
+            ..Default::default()
+        };
+        let page = open.project.pages[0].clone();
+        // The reach at zoom 1 (6 mm) would cover the whole 10 mm box: a quarter of it is kept.
+        let drag = drag_start(&open, &mut ed, &page, Point::new(42.0, 43.0), 6.0, 1.0, false, false);
+        assert!(matches!(drag, Drag::Move { .. }), "{drag:?}");
+        let drag = drag_start(&open, &mut ed, &page, Point::new(41.0, 41.0), 6.0, 1.0, false, false);
+        assert!(
+            matches!(
+                drag,
+                Drag::BoxSize {
+                    corner: (false, false),
+                    ..
+                }
+            ),
+            "{drag:?}"
+        );
+    }
+
+    /// A black box from (40, 40) to (60, 50) with `pins`, selected, on a canvas at zoom 1
+    /// painted once: the project, the box's id, the editor, the context and where the page
+    /// origin is on the screen.
+    fn selected_box(pins: &[wc_core::BoxPin]) -> (tempfile::TempDir, Open, String, Editor, egui::Context, egui::Pos2) {
+        let (tmp, mut open) = project();
+        let id = open
+            .add_black_box(0, Point::new(40.0, 40.0), Point::new(60.0, 50.0), pins, None)
+            .unwrap();
+        let mut ed = Editor {
+            selection: vec![Selection::Symbol(id.clone())],
+            view: View {
+                zoom: 1.0,
+                offset: Vec2::ZERO,
+                fit: false,
+            },
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        // Where the page origin is on the screen, from the pointer's place on the page.
+        painted(&ctx, &mut open, &mut ed, 0.5, vec![]);
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            1.0,
+            vec![egui::Event::PointerMoved(egui::pos2(300.0, 300.0))],
+        );
+        let seen = ed.cursor.unwrap();
+        let origin = egui::pos2(300.0 - seen.x as f32, 300.0 - seen.y as f32);
+        (tmp, open, id, ed, ctx, origin)
+    }
+
+    /// The symbol that item `id` on the first page places.
+    fn box_symbol(o: &Open, id: &str) -> wc_core::Symbol {
+        o.symbols[&o.project.pages[0].symbol(id).unwrap().symbol].clone()
+    }
+
+    #[test]
+    fn a_selected_black_box_is_sized_from_its_near_corner_through_egui_events() {
+        let pin = |name: &str, side, offset| wc_core::BoxPin {
+            name: name.into(),
+            side,
+            offset,
+        };
+        let pins = [
+            pin("1", wc_core::BoxSide::Top, 15.0),
+            pin("2", wc_core::BoxSide::Right, 5.0),
+        ];
+        let (_tmp, mut open, id, mut ed, ctx, origin) = selected_box(&pins);
+        // A wire on the right point: that edge does not move, so the point keeps its place on
+        // the page and there is no warning.
+        open.add_wire(
+            0,
+            Endpoint::Pin {
+                item: id.clone(),
+                pin: "2".into(),
+            },
+            Endpoint::Point {
+                at: Point::new(80.0, 45.0),
+            },
+            vec![],
+        );
+        let button = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let at = |x: f32, y: f32| origin + Vec2::new(x, y);
+        let symbol = |o: &Open| box_symbol(o, &id);
+        let undo_steps = open.undo_steps();
+
+        // Each of the four corners can be grabbed.
+        for (x, y, corner) in [
+            (60.0, 50.0, (true, true)),
+            (40.0, 50.0, (false, true)),
+            (60.0, 40.0, (true, false)),
+            (40.0, 40.0, (false, false)),
+        ] {
+            let held = Point::new(x, y);
+            let Drag::BoxSize { corner: got, .. } = drag_start(
+                &open,
+                &mut ed,
+                &open.project.pages[0].clone(),
+                held,
+                1.0,
+                1.0,
+                false,
+                false,
+            ) else {
+                unreachable!("a sizing drag at {held:?}")
+            };
+            assert_eq!(got, corner, "{held:?}");
+        }
+
+        // Drag the top-left corner up and left: bigger, moved, the bottom-right corner in place.
+        let (from, to) = (at(40.0, 40.0), at(35.0, 36.0));
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            2.0,
+            vec![egui::Event::PointerMoved(from), button(from, true)],
+        );
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            2.02,
+            vec![egui::Event::PointerMoved(at(37.0, 38.0))],
+        );
+        painted(&ctx, &mut open, &mut ed, 2.04, vec![egui::Event::PointerMoved(to)]);
+        painted(&ctx, &mut open, &mut ed, 2.06, vec![button(to, false)]);
+        let Some((w, h, now)) = wc_core::black_box_layout(&symbol(&open)) else {
+            unreachable!("still a black box")
+        };
+        assert_eq!((w, h), (25.0, 14.0), "{}", ed.message);
+        assert_eq!(open.project.pages[0].symbol(&id).unwrap().at, Point::new(35.0, 36.0));
+        assert_eq!(
+            now,
+            vec![
+                pin("1", wc_core::BoxSide::Top, 20.0),
+                pin("2", wc_core::BoxSide::Right, 9.0)
+            ],
+            "the points keep their place on the page"
+        );
+        assert_eq!(open.undo_steps(), undo_steps + 1, "one undo step");
+        assert!(ed.message.contains("25 x 14 mm"), "{}", ed.message);
+        assert!(!ed.message.contains("Check"), "{}", ed.message);
+
+        // One Undo takes back both the size and the move.
+        assert!(open.undo());
+        let Some((w, h, _)) = wc_core::black_box_layout(&symbol(&open)) else {
+            unreachable!("still a black box")
+        };
+        assert_eq!((w, h), (20.0, 10.0));
+        assert_eq!(open.project.pages[0].symbol(&id).unwrap().at, Point::new(40.0, 40.0));
+    }
+
+    #[test]
+    fn a_selected_black_box_is_sized_by_dragging_its_corner_through_egui_events() {
+        let pin = |name: &str, side, offset| wc_core::BoxPin {
+            name: name.into(),
+            side,
+            offset,
+        };
+        let pins = [
+            pin("1", wc_core::BoxSide::Top, 15.0),
+            pin("2", wc_core::BoxSide::Right, 5.0),
+        ];
+        let (_tmp, mut open, id, mut ed, ctx, origin) = selected_box(&pins);
+        let button = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let at = |x: f32, y: f32| origin + Vec2::new(x, y);
+        let symbol = |o: &Open| box_symbol(o, &id);
+        let undo_steps = open.undo_steps();
+        let wires = open.project.pages[0].wires.clone();
+
+        // Grab the corner, drag in two moves, release: one change, at the size let go at.
+        let drag_to = |o: &mut Open, ed: &mut Editor, from: egui::Pos2, to: egui::Pos2, t: f64| {
+            painted(
+                &ctx,
+                o,
+                ed,
+                t,
+                vec![egui::Event::PointerMoved(from), button(from, true)],
+            );
+            let mid = from + (to - from) / 2.0;
+            painted(&ctx, o, ed, t + 0.02, vec![egui::Event::PointerMoved(mid)]);
+            painted(&ctx, o, ed, t + 0.04, vec![egui::Event::PointerMoved(to)]);
+            painted(&ctx, o, ed, t + 0.06, vec![button(to, false)]);
+        };
+        drag_to(&mut open, &mut ed, at(60.0, 50.0), at(70.0, 58.0), 2.0);
+        let Some((w, h, now)) = wc_core::black_box_layout(&symbol(&open)) else {
+            unreachable!("still a black box")
+        };
+        assert_eq!((w, h), (30.0, 18.0), "{}", ed.message);
+        assert_eq!(now, pins.to_vec(), "the points stay where they were on their edges");
+        assert_eq!(open.undo_steps(), undo_steps + 1, "one undo step");
+        assert_eq!(
+            open.project.pages[0].symbol(&id).unwrap().at,
+            Point::new(40.0, 40.0),
+            "not moved"
+        );
+        assert!(ed.message.contains("30 x 18 mm"), "{}", ed.message);
+
+        // Smaller than its points: they are kept on their edges, at the ends.
+        drag_to(&mut open, &mut ed, at(70.0, 58.0), at(45.0, 45.0), 3.0);
+        let Some((w, h, now)) = wc_core::black_box_layout(&symbol(&open)) else {
+            unreachable!("still a black box")
+        };
+        assert_eq!((w, h), (5.0, 5.0));
+        assert_eq!(
+            now,
+            vec![
+                pin("1", wc_core::BoxSide::Top, 5.0),
+                pin("2", wc_core::BoxSide::Right, 5.0)
+            ]
+        );
+        assert_eq!(open.undo_steps(), undo_steps + 2);
+        assert_eq!(open.project.pages[0].wires, wires);
+        assert!(open.undo());
+        let Some((w, h, _)) = wc_core::black_box_layout(&symbol(&open)) else {
+            unreachable!("still a black box")
+        };
+        assert_eq!((w, h), (30.0, 18.0), "Undo takes the size back");
+
+        // A drag that starts away from the corner moves the box instead of sizing it.
+        drag_to(&mut open, &mut ed, at(50.0, 45.0), at(60.0, 45.0), 4.0);
+        assert_eq!(open.project.pages[0].symbol(&id).unwrap().at, Point::new(50.0, 40.0));
+        let Some((w, h, _)) = wc_core::black_box_layout(&symbol(&open)) else {
+            unreachable!("still a black box")
+        };
+        assert_eq!((w, h), (30.0, 18.0));
+
+        // On a page someone else holds, the corner sizes nothing.
+        let held = open.project.pages[0].id.clone();
+        ed.held_by.insert(held, "Ola".into());
+        let steps = open.undo_steps();
+        drag_to(&mut open, &mut ed, at(80.0, 58.0), at(90.0, 70.0), 5.0);
+        assert_eq!(open.undo_steps(), steps);
+        let Some((w, h, _)) = wc_core::black_box_layout(&symbol(&open)) else {
+            unreachable!("still a black box")
+        };
+        assert_eq!((w, h), (30.0, 18.0));
+        ed.held_by.clear();
+        // The selection box drawn there picked nothing: select the box again.
+        ed.select_only(Selection::Symbol(id.clone()));
+
+        // A last move that comes in the same frame as the release counts.
+        let (corner, end) = (at(80.0, 58.0), at(90.0, 62.0));
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            6.0,
+            vec![egui::Event::PointerMoved(corner), button(corner, true)],
+        );
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            6.02,
+            vec![egui::Event::PointerMoved(at(88.0, 58.0))],
+        );
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            6.04,
+            vec![egui::Event::PointerMoved(end), button(end, false)],
+        );
+        let Some((w, h, _)) = wc_core::black_box_layout(&symbol(&open)) else {
+            unreachable!("still a black box")
+        };
+        assert_eq!((w, h), (40.0, 22.0), "{}", ed.message);
+
+        // The box is deleted while its corner is held: another box that takes its place among
+        // the page's items is not sized on release.
+        let other = open
+            .add_black_box(0, Point::new(120.0, 40.0), Point::new(140.0, 50.0), &pins, None)
+            .unwrap();
+        ed.select_only(Selection::Symbol(id.clone()));
+        let corner = at(90.0, 62.0);
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            7.0,
+            vec![egui::Event::PointerMoved(corner), button(corner, true)],
+        );
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            7.02,
+            vec![egui::Event::PointerMoved(at(95.0, 66.0))],
+        );
+        assert!(matches!(ed.drag, Some(Drag::BoxSize { .. })));
+        open.delete_many(0, &[Selection::Symbol(id.clone())]);
+        let before = open.symbols[&open.project.pages[0].symbol(&other).unwrap().symbol].clone();
+        let steps = open.undo_steps();
+        painted(&ctx, &mut open, &mut ed, 7.04, vec![button(at(95.0, 66.0), false)]);
+        assert_eq!(open.undo_steps(), steps, "nothing changed");
+        assert_eq!(
+            open.symbols[&open.project.pages[0].symbol(&other).unwrap().symbol],
+            before
+        );
+        assert!(ed.message.contains("no longer on this page"), "{}", ed.message);
+    }
+
+    #[test]
+    fn a_quick_repeat_through_egui_pointer_events_ends_a_polyline() {
+        let (_tmp, mut open) = project();
+        let mut ed = Editor {
+            tool: Tool::Polyline,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let frame = |open: &mut Open, ed: &mut Editor, time: f64, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| show(ui, open, ed, false, 1.0));
+            });
+        };
+        let button = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        // A click: move there, press, release a moment later.
+        let click = |open: &mut Open, ed: &mut Editor, pos: egui::Pos2, t: f64| {
+            frame(open, ed, t, vec![egui::Event::PointerMoved(pos)]);
+            frame(open, ed, t + 0.01, vec![button(pos, true)]);
+            frame(open, ed, t + 0.02, vec![button(pos, false)]);
+        };
+        let (a, b) = (egui::pos2(300.0, 300.0), egui::pos2(400.0, 300.0));
+        click(&mut open, &mut ed, a, 1.0);
+        click(&mut open, &mut ed, b, 2.0);
+        assert_eq!(ed.shape_points.len(), 2, "two points placed");
+        // A slow repeat on the last point does nothing.
+        click(&mut open, &mut ed, b, 3.0);
+        assert_eq!(ed.shape_points.len(), 2);
+        assert!(open.project.pages[0].graphics.is_empty());
+        // A quick repeat on it ends the polyline.
+        click(&mut open, &mut ed, b, 3.1);
+        assert!(ed.shape_points.is_empty());
+        assert!(matches!(
+            &open.project.pages[0].graphics[..],
+            [Shape::Polyline { points, .. }] if points.len() == 2
+        ));
+        // A quick click on a new point C after B adds it (even though egui may count it as a
+        // double- or triple-click); a quick second click on C ends the line.
+        let c = egui::pos2(400.0, 400.0);
+        click(&mut open, &mut ed, a, 4.0);
+        click(&mut open, &mut ed, b, 4.1);
+        click(&mut open, &mut ed, c, 4.2);
+        assert_eq!(ed.shape_points.len(), 3, "C is added");
+        click(&mut open, &mut ed, c, 4.3);
+        assert!(ed.shape_points.is_empty());
+        assert!(matches!(
+            &open.project.pages[0].graphics[..],
+            [_, Shape::Polyline { points, .. }] if points.len() == 3
+        ));
+        // Released at A, then moved on to B in the same frame: the point goes at A (at B it
+        // would be a slow repeat and add nothing).
+        click(&mut open, &mut ed, b, 5.0);
+        frame(&mut open, &mut ed, 6.0, vec![egui::Event::PointerMoved(b)]);
+        frame(
+            &mut open,
+            &mut ed,
+            6.01,
+            vec![egui::Event::PointerMoved(a), button(a, true)],
+        );
+        frame(
+            &mut open,
+            &mut ed,
+            6.02,
+            vec![button(a, false), egui::Event::PointerMoved(b)],
+        );
+        assert_eq!(ed.shape_points.len(), 2);
+        assert_ne!(ed.shape_points[0], ed.shape_points[1], "the second point is at A");
+        // Released at A, then moved to B and zoomed in the same frame: the point still goes
+        // where A was in the view the user saw.
+        ed.shape_points.clear();
+        click(&mut open, &mut ed, b, 8.0);
+        let (p0, zoom) = (ed.shape_points[0], ed.view.zoom);
+        frame(
+            &mut open,
+            &mut ed,
+            9.0,
+            vec![egui::Event::PointerMoved(a), button(a, true)],
+        );
+        frame(
+            &mut open,
+            &mut ed,
+            9.01,
+            vec![button(a, false), egui::Event::PointerMoved(b), egui::Event::Zoom(2.0)],
+        );
+        assert!(ed.view.zoom > zoom, "the view zoomed");
+        let want = Point::new(p0.x - 100.0 / f64::from(zoom), p0.y);
+        assert!(ed.shape_points[1].distance(want) <= 1.0, "{:?}", ed.shape_points); // 1 mm snap
+    }
+
+    #[test]
+    fn a_dimension_is_drawn_in_three_clicks_and_edited_like_any_drawing() {
+        let (_tmp, mut open) = project();
+        let mut ed = Editor::default();
+        let before = open.project.pages[0].graphics.len();
+        // A second click on the first point is refused; the first stays.
+        draw(&mut open, &mut ed, Tool::Dimension, &[(40.0, 120.0), (40.0, 120.0)]);
+        assert_eq!(ed.shape_points.len(), 1);
+        assert!(ed.message.contains("away from the first"), "{}", ed.message);
+        draw(&mut open, &mut ed, Tool::Dimension, &[(65.0, 120.0), (50.0, 110.0)]);
+        assert!(ed.shape_points.is_empty());
+        let page = &open.project.pages[0];
+        assert_eq!(page.graphics.len(), before + 1);
+        let i = page.graphics.len() - 1;
+        let g = page.graphics[i].clone();
+        assert_eq!(
+            g,
+            Shape::Dimension {
+                a: Point::new(40.0, 120.0),
+                b: Point::new(65.0, 120.0),
+                offset: 10.0,
+                height: DIMENSION_TEXT_HEIGHT,
+            }
+        );
+        assert_eq!(
+            ed.selection,
+            vec![Selection::Graphic(i)],
+            "the new dimension is selected"
+        );
+        // Picked on its dimension line, not far from it.
+        assert!(crate::edit::graphic_hit(&g, Point::new(52.0, 110.0), 0.5));
+        assert!(!crate::edit::graphic_hit(&g, Point::new(52.0, 130.0), 0.5));
+        let (min, max) = crate::edit::graphic_bounds(&g);
+        assert!(min.x <= 40.0 && max.x >= 65.0 && min.y < 110.0 && max.y > 115.0);
+        // Moved, then deleted, each one undo step.
+        open.checkpoint();
+        open.move_by(0, &[Selection::Graphic(i)], Point::new(5.0, 0.0));
+        assert!(
+            matches!(open.project.pages[0].graphics[i], Shape::Dimension { a, .. } if a == Point::new(45.0, 120.0))
+        );
+        open.delete_many(0, &[Selection::Graphic(i)]);
+        assert_eq!(open.project.pages[0].graphics.len(), before);
+        assert!(open.undo());
+        assert!(
+            matches!(open.project.pages[0].graphics[i], Shape::Dimension { a, .. } if a == Point::new(45.0, 120.0))
+        );
+        assert!(open.undo());
+        assert_eq!(open.project.pages[0].graphics[i], g);
+        // Kept in the page file.
+        open.save().unwrap();
+        let saved = std::fs::read_dir(open.dir.join("pages"))
+            .unwrap()
+            .filter_map(|e| std::fs::read_to_string(e.ok()?.path()).ok())
+            .any(|text| text.contains("\"kind\": \"dimension\"") || text.contains("\"kind\":\"dimension\""));
+        assert!(saved, "a page file holds the dimension");
+    }
+
+    #[test]
+    fn an_arc_ending_on_its_centre_keeps_its_first_clicks() {
+        let (_tmp, mut open) = project();
+        let mut ed = Editor {
+            tool: Tool::Arc,
+            ..Default::default()
+        };
+        let c = Point::new(10.0, 10.0);
+        shape_click(&mut open, &mut ed, c);
+        shape_click(&mut open, &mut ed, Point::new(20.0, 10.0));
+        shape_click(&mut open, &mut ed, c);
+        assert_eq!(ed.shape_points.len(), 2, "centre and start stay");
+        assert!(ed.message.contains("no shape"), "{}", ed.message);
+        assert!(open.project.pages[0].graphics.is_empty());
+        // On the start point or further out on its ray: a full turn, refused the same way.
+        for end in [Point::new(20.0, 10.0), Point::new(30.0, 10.0)] {
+            shape_click(&mut open, &mut ed, end);
+            assert_eq!(ed.shape_points.len(), 2);
+            assert!(ed.message.contains("no shape"), "{}", ed.message);
+        }
+        shape_click(&mut open, &mut ed, Point::new(10.0, 20.0));
+        assert!(matches!(open.project.pages[0].graphics[..], [Shape::Arc { .. }]));
+        // A start on the centre is refused at once; the centre stays for a proper start.
+        shape_click(&mut open, &mut ed, c);
+        shape_click(&mut open, &mut ed, c);
+        assert_eq!(ed.shape_points, vec![c]);
+        assert!(ed.message.contains("away from the centre"), "{}", ed.message);
+        shape_click(&mut open, &mut ed, Point::new(20.0, 10.0));
+        shape_click(&mut open, &mut ed, Point::new(10.0, 20.0));
+        assert!(ed.shape_points.is_empty());
+        assert_eq!(open.project.pages[0].graphics.len(), 2);
+    }
+
+    #[test]
+    fn a_drawing_started_on_one_page_is_dropped_on_another() {
+        let (_tmp, mut open) = project();
+        let mut ed = Editor {
+            tool: Tool::Arc,
+            ..Default::default()
+        };
+        shape_click(&mut open, &mut ed, Point::new(10.0, 10.0));
+        shape_click(&mut open, &mut ed, Point::new(20.0, 10.0));
+        // The same page, moved to another place in the list: the clicks stay.
+        open.project.pages.swap(0, 1);
+        ed.page = 1;
+        drop_draft_of_other_page(&open, &mut ed);
+        assert_eq!(ed.shape_points.len(), 2);
+        // Another page: they go, and the next click starts a new arc there.
+        ed.page = 0;
+        drop_draft_of_other_page(&open, &mut ed);
+        assert!(ed.shape_points.is_empty());
+        assert_eq!(ed.message, "Click the centre of the arc.");
+        shape_click(&mut open, &mut ed, Point::new(50.0, 50.0));
+        assert!(open.project.pages.iter().all(|p| p.graphics.is_empty()));
+    }
+
+    #[test]
+    fn drawing_tools_make_their_shapes() {
+        let p = Point::new;
+        assert_eq!(
+            drawn_shape(Tool::Circle, &[p(10.0, 10.0), p(13.0, 14.0)]),
+            Some(Shape::Circle {
+                center: p(10.0, 10.0),
+                radius: 5.0,
+                filled: false
+            })
+        );
+        // Centre, start to the right, end below: a quarter turn clockwise on paper.
+        assert_eq!(
+            drawn_shape(Tool::Arc, &[p(10.0, 10.0), p(15.0, 10.0), p(10.0, 20.0)]),
+            Some(Shape::Arc {
+                center: p(10.0, 10.0),
+                radius: 5.0,
+                start: 0.0,
+                end: 90.0
+            })
+        );
+        let open = drawn_shape(Tool::Polyline, &[p(0.0, 0.0), p(10.0, 0.0), p(10.0, 5.0)]);
+        assert!(matches!(open, Some(Shape::Polyline { ref points, closed: false, .. }) if points.len() == 3));
+        let closed = drawn_shape(Tool::Polyline, &[p(0.0, 0.0), p(10.0, 0.0), p(10.0, 5.0), p(0.0, 0.0)]);
+        assert!(matches!(closed, Some(Shape::Polyline { ref points, closed: true, .. }) if points.len() == 3));
+        // Too small to draw: nothing.
+        assert_eq!(drawn_shape(Tool::Circle, &[p(1.0, 1.0), p(1.0, 1.0)]), None);
+        assert_eq!(drawn_shape(Tool::Arc, &[p(1.0, 1.0), p(1.0, 1.0), p(3.0, 1.0)]), None);
+        assert_eq!(drawn_shape(Tool::Polyline, &[p(1.0, 1.0)]), None);
+        assert_eq!(drawn_shape(Tool::Rect, &[p(1.0, 1.0), p(1.0, 1.0)]), None);
+    }
+
+    #[test]
+    fn drawn_circles_arcs_and_polylines_are_saved_picked_and_exported() {
+        let (_tmp, mut open) = project();
+        let mut ed = Editor::default();
+        draw(&mut open, &mut ed, Tool::Circle, &[(50.0, 50.0), (55.0, 50.0)]);
+        draw(
+            &mut open,
+            &mut ed,
+            Tool::Arc,
+            &[(100.0, 50.0), (110.0, 50.0), (100.0, 60.0)],
+        );
+        // The polyline ends with a click back on its first point, which closes it.
+        draw(
+            &mut open,
+            &mut ed,
+            Tool::Polyline,
+            &[
+                (150.0, 50.0),
+                (170.0, 50.0),
+                (170.0, 70.0),
+                (170.0, 70.0),
+                (150.0, 50.0),
+            ],
+        );
+        assert!(ed.shape_points.is_empty());
+        assert_eq!(ed.selection, vec![Selection::Graphic(2)]);
+        assert_eq!(open.project.pages[0].graphics.len(), 3);
+        let g = open.project.pages[0].graphics.clone();
+        assert_eq!(g.len(), 3, "{g:?}");
+        assert!(matches!(g[2], Shape::Polyline { closed: true, ref points, .. } if points.len() == 3));
+
+        // Picked on its line; the open part of the arc does not pick it.
+        use crate::edit::graphic_hit;
+        assert!(graphic_hit(&g[0], Point::new(50.0, 55.0), 0.5));
+        assert!(graphic_hit(&g[1], Point::new(107.07, 57.07), 0.5), "inside the sweep");
+        assert!(!graphic_hit(&g[1], Point::new(90.0, 50.0), 0.5), "the open part");
+        // A large arc is picked on the chords the canvas draws, not only on the true circle.
+        let big = Shape::Arc {
+            center: Point::new(0.0, 0.0),
+            radius: 250.0,
+            start: 0.0,
+            end: 90.0,
+        };
+        let chord_mid = {
+            let pts = arc_points(Point::new(0.0, 0.0), 250.0, 0.0, 90.0);
+            Point::new((pts[0].x + pts[1].x) / 2.0, (pts[0].y + pts[1].y) / 2.0)
+        };
+        assert!(graphic_hit(&big, chord_mid, 0.3), "on the drawn stroke");
+        // An arc past a full turn is picked all round, as it is drawn.
+        let more_than_full = Shape::Arc {
+            center: Point::new(0.0, 0.0),
+            radius: 10.0,
+            start: 0.0,
+            end: 450.0,
+        };
+        assert!(graphic_hit(&more_than_full, Point::new(-10.0, 0.0), 0.5));
+        // A negative sweep (720° to 100°, from a file) is drawn the long way back round: 260°
+        // in 26 steps, picked on that path and not on the 100° it leaves out.
+        let back = Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 9.0,
+            start: 720.0,
+            end: 100.0,
+        };
+        assert_eq!(arc_points(Point::new(150.0, 100.0), 9.0, 720.0, 100.0).len(), 27);
+        assert!(graphic_hit(&back, Point::new(141.0, 100.0), 0.3), "180° is drawn");
+        assert!(!graphic_hit(&back, Point::new(155.79, 106.89), 0.3), "50° is not");
+        // A box around the drawn quarter arc holds it (not the whole circle).
+        let quarter = Shape::Arc {
+            center: Point::new(100.0, 100.0),
+            radius: 10.0,
+            start: 0.0,
+            end: 90.0,
+        };
+        let (a, b) = crate::edit::graphic_bounds(&quarter);
+        assert!(
+            a.x >= 99.0 && a.y >= 99.0 && b.x <= 111.0 && b.y <= 111.0,
+            "{a:?} {b:?}"
+        );
+        assert!(graphic_hit(&g[2], Point::new(160.0, 60.0), 0.5), "the closing side");
+
+        // Undo takes the last one back off; moving and deleting work like other drawings.
+        open.undo();
+        assert_eq!(open.project.pages[0].graphics.len(), 2);
+        open.redo();
+        open.delete_many(0, &[Selection::Graphic(0)]);
+        assert_eq!(open.project.pages[0].graphics.len(), 2);
+        open.undo();
+
+        // Saved in the page file and read back the same.
+        open.save().unwrap();
+        let again = Open::load(&open.dir).unwrap();
+        assert_eq!(again.project.pages[0].graphics, g);
+
+        // In the SVG and DXF drawings.
+        let (pages, _) = wc_pdf::page_drawings(&again.project, &again.symbols, &wc_pdf::Options::default());
+        let svg = wc_pdf::svg(&pages[0]);
+        let dxf = wc_pdf::dxf(&pages[0]);
+        assert!(
+            svg.contains("<circle") && svg.contains(" A10 10 "),
+            "circle and arc in the SVG"
+        );
+        assert!(
+            svg.contains("<polygon points=\"150,50 170,50 170,70\""),
+            "the closed polyline in the SVG"
+        );
+        let mut bare = again.project.clone();
+        bare.pages[0].graphics.clear();
+        let (bare_pages, _) = wc_pdf::page_drawings(&bare, &again.symbols, &wc_pdf::Options::default());
+        let bare_dxf = wc_pdf::dxf(&bare_pages[0]);
+        // One more of each than the same page without the drawings (the frame has polylines too).
+        for kind in ["CIRCLE", "ARC", "POLYLINE"] {
+            let count = |d: &str| d.lines().filter(|l| l.trim() == kind).count();
+            assert_eq!(count(&dxf), count(&bare_dxf) + 1, "{kind} in the DXF");
+        }
+        // In the PDF: each drawing starts one more path than the page without them.
+        let paths = |p: &wc_core::Project| {
+            let (pdf, _) = wc_pdf::export(p, &again.symbols, &wc_pdf::Options::default());
+            String::from_utf8_lossy(&pdf).matches(" m\n").count()
+        };
+        assert_eq!(paths(&again.project), paths(&bare) + 3, "three more paths in the PDF");
+
+        // An arc stored past a full turn (720° to 100°) is exported along the path the canvas
+        // draws: 260° back round, through 180° and not through 50°.
+        let mut back = bare.clone();
+        back.pages[0].graphics = vec![Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 9.0,
+            start: 720.0,
+            end: 100.0,
+        }];
+        let (back_pages, _) = wc_pdf::page_drawings(&back, &again.symbols, &wc_pdf::Options::default());
+        let svg = wc_pdf::svg(&back_pages[0]);
+        // From 100° clockwise to 0° (360°): the large arc.
+        assert!(svg.contains(" A9 9 0 1 1 "), "the 260° arc in the SVG: {svg}");
+        let dxf = wc_pdf::dxf(&back_pages[0]);
+        let arc: Vec<&str> = dxf.lines().map(str::trim).skip_while(|l| *l != "ARC").collect();
+        let value = |code: &str| {
+            arc.iter()
+                .position(|l| *l == code)
+                .and_then(|k| arc.get(k + 1))
+                .copied()
+        };
+        // Counter-clockwise with y up from 0° to 260°: page angles 100° to 360°.
+        assert_eq!((value("50"), value("51")), (Some("0"), Some("260")), "{dxf}");
+        let curves = |p: &wc_core::Project| {
+            let (pdf, _) = wc_pdf::export(p, &again.symbols, &wc_pdf::Options::default());
+            String::from_utf8_lossy(&pdf).matches(" c\n").count()
+        };
+        assert_eq!(curves(&back), curves(&bare) + 3, "260° in three curves in the PDF");
+
+        // A full turn backwards (720° to 0°) is a circle in the SVG and DXF.
+        back.pages[0].graphics = vec![Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 9.0,
+            start: 720.0,
+            end: 0.0,
+        }];
+        let (full_pages, _) = wc_pdf::page_drawings(&back, &again.symbols, &wc_pdf::Options::default());
+        assert!(wc_pdf::svg(&full_pages[0]).contains("<circle"), "a circle in the SVG");
+        let count = |d: &str, kind: &str| d.lines().filter(|l| l.trim() == kind).count();
+        let full_dxf = wc_pdf::dxf(&full_pages[0]);
+        assert_eq!(
+            count(&full_dxf, "CIRCLE"),
+            count(&bare_dxf, "CIRCLE") + 1,
+            "a circle in the DXF"
+        );
+        // Angles stored far out draw one turn at most: a circle's four curves, not millions.
+        back.pages[0].graphics = vec![Shape::Arc {
+            center: Point::new(150.0, 100.0),
+            radius: 9.0,
+            start: 1e9,
+            end: 0.0,
+        }];
+        assert!(curves(&back) <= curves(&bare) + 4, "at most a full turn in the PDF");
+    }
 
     #[test]
     fn a_long_title_block_value_shows_as_a_bar_when_too_small_to_read() {
@@ -1776,6 +3660,278 @@ mod tests {
         // The panel view is not the page: it is not held.
         ed.panel = Some(0);
         assert_eq!(ed.held_page(&o.project), None);
+    }
+
+    #[test]
+    fn a_drawing_on_a_hidden_or_locked_layer_cannot_be_picked() {
+        let (_tmp, mut o) = project();
+        o.project.pages[0].graphics.push(Shape::Line {
+            a: Point::new(50.0, 50.0),
+            b: Point::new(80.0, 50.0),
+        });
+        let page = o.project.pages[0].clone();
+        let at = Point::new(60.0, 50.0);
+        let mut ed = Editor::default();
+        assert_eq!(pick(&o, &ed, &page, at, 1.0), Some(Selection::Graphic(0)));
+
+        for hide in [true, false] {
+            let mut ed = Editor::default();
+            if hide {
+                ed.layers.set_shown(Layer::Drawings, false);
+            } else {
+                ed.layers.set_locked(Layer::Drawings, true);
+            }
+            // A click finds nothing, and a drag there draws a selection box instead of
+            // picking the line up.
+            assert_eq!(pick(&o, &ed, &page, at, 1.0), None);
+            let d = drag_start(&o, &mut ed, &page, at, 1.0, 2.5, false, false);
+            assert!(matches!(d, Drag::Box { .. }));
+            assert!(ed.selection.is_empty());
+            // A selection box or Select all leaves it out.
+            let boxed = o.select_in(0, Point::new(0.0, 0.0), Point::new(200.0, 200.0));
+            assert!(boxed.contains(&Selection::Graphic(0)));
+            assert!(!ed.layers.keep(boxed).contains(&Selection::Graphic(0)));
+            assert!(!ed.layers.keep(o.select_all(0)).contains(&Selection::Graphic(0)));
+        }
+
+        // Hiding the layer while the line is selected drops it from the selection on the next
+        // frame, and a drawing tool falls back to Select so nothing invisible is drawn.
+        ed.selection = vec![Selection::Graphic(0)];
+        ed.tool = Tool::Line;
+        ed.layers.set_shown(Layer::Drawings, false);
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show(ui, &mut o, &mut ed, false, 1.0));
+        });
+        assert!(ed.selection.is_empty());
+        assert_eq!(ed.tool, Tool::Select);
+        assert!(ed.message.contains("Drawings and notes"), "{}", ed.message);
+        assert_eq!(o.project.pages[0], page, "the page is unchanged");
+    }
+
+    #[test]
+    fn a_selected_cloud_and_revision_table_are_painted_in_the_selection_colour() {
+        let (_tmp, mut o) = project();
+        o.project.add_revision("A", "2026-11-19", "First issue", "").unwrap();
+        o.add_cloud(1, Point::new(20.0, 20.0), Point::new(60.0, 40.0)).unwrap();
+        o.place_revision_table(1, Point::new(200.0, 150.0)).unwrap();
+        let mut ed = Editor {
+            page: 1,
+            ..Editor::default()
+        };
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let colour = crate::theme::Theme::of(&ctx).selection;
+        // How many lines of one frame are drawn in the selection colour.
+        let selected_lines = |o: &mut Open, ed: &mut Editor| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1000.0, 700.0))),
+                ..Default::default()
+            };
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| show(ui, o, ed, false, 1.0));
+            });
+            out.shapes
+                .iter()
+                .filter(|c| match &c.shape {
+                    EShape::Path(p) => p.stroke.color == egui::epaint::ColorMode::Solid(colour),
+                    EShape::LineSegment { stroke, .. } => stroke.color == colour,
+                    _ => false,
+                })
+                .count()
+        };
+        assert_eq!(selected_lines(&mut o, &mut ed), 0, "nothing selected");
+        ed.selection = vec![Selection::Cloud(0)];
+        let cloud = selected_lines(&mut o, &mut ed);
+        assert!(cloud > 0, "the selected cloud");
+        ed.selection = vec![Selection::RevisionTable];
+        let table = selected_lines(&mut o, &mut ed);
+        assert!(table > 0, "the selected table");
+        ed.selection = vec![Selection::Cloud(0), Selection::RevisionTable];
+        assert_eq!(selected_lines(&mut o, &mut ed), cloud + table, "each in its own colour");
+    }
+
+    /// Draw one frame of the canvas with `events`; returns every text painted and where.
+    fn painted(
+        ctx: &egui::Context,
+        o: &mut Open,
+        ed: &mut Editor,
+        time: f64,
+        events: Vec<egui::Event>,
+    ) -> Vec<(String, Rect)> {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1000.0, 700.0))),
+            time: Some(time),
+            events,
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show(ui, o, ed, false, 1.0));
+        });
+        out.shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                EShape::Text(t) => Some((t.galley.text().to_owned(), t.visual_bounding_rect())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Click at `pos`: move there, press, release.
+    fn click_at(ctx: &egui::Context, o: &mut Open, ed: &mut Editor, pos: egui::Pos2, t: f64) {
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        painted(ctx, o, ed, t, vec![egui::Event::PointerMoved(pos)]);
+        painted(ctx, o, ed, t + 0.01, vec![button(true)]);
+        painted(ctx, o, ed, t + 0.02, vec![button(false)]);
+    }
+
+    /// Page 2 with a free text, a numbered wire, a coil -K1 whose contact is on page 3 (so a
+    /// cross-reference shows under the coil), a review comment and a scanned sheet whose
+    /// picture is missing (so its placeholder text shows).
+    fn annotated() -> (tempfile::TempDir, Open, Editor) {
+        let (tmp, mut o) = project();
+        o.project.pages.push(Page::new("p0003", "3", "Contacts"));
+        let coil = o.place(1, "wc.coil", Point::new(100.0, 60.0)).unwrap();
+        let contact = o.place(2, "wc.contact.no", Point::new(100.0, 60.0)).unwrap();
+        for (page, id) in [(1, &coil), (2, &contact)] {
+            let s = o.project.pages[page].symbols.iter_mut().find(|s| &s.id == id).unwrap();
+            s.tag = Some(wc_core::DeviceTag::parse("-K1").unwrap());
+        }
+        let page = &mut o.project.pages[1];
+        page.underlay = Some(wc_core::Underlay {
+            file: "scans/missing-scan.png".into(),
+            min: Point::new(20.0, 100.0),
+            max: Point::new(120.0, 180.0),
+        });
+        page.graphics.push(
+            serde_json::from_value(serde_json::json!({
+                "kind": "text", "at": {"x": 40.0, "y": 150.0}, "text": "Hello note", "height": 5.0
+            }))
+            .unwrap(),
+        );
+        page.wires.push(
+            serde_json::from_value(serde_json::json!({
+                "id": "w1",
+                "from": {"at": {"x": 200.0, "y": 40.0}},
+                "to": {"at": {"x": 300.0, "y": 40.0}},
+                "number": "W101"
+            }))
+            .unwrap(),
+        );
+        o.project.comments.push(wc_core::Comment {
+            id: "c742".into(),
+            page: "p0002".into(),
+            at: Some(Point::new(250.0, 150.0)),
+            author: "Kari".into(),
+            time: 0,
+            text: "Check this".into(),
+            resolved: false,
+            replies: Vec::new(),
+        });
+        let ed = Editor {
+            page: 1,
+            ..Editor::default()
+        };
+        (tmp, o, ed)
+    }
+
+    #[test]
+    fn a_hidden_layer_is_not_painted_and_a_shown_one_is() {
+        let (_tmp, mut o, mut ed) = annotated();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let has = |texts: &[(String, Rect)], want: &str| texts.iter().any(|(t, _)| t.contains(want));
+        // A first frame fits the page; the second is drawn as it stays.
+        painted(&ctx, &mut o, &mut ed, 0.0, vec![]);
+        let all = painted(&ctx, &mut o, &mut ed, 0.1, vec![]);
+        let xref = all
+            .iter()
+            .find(|(t, _)| t.contains("3."))
+            .map(|(t, _)| t.clone())
+            .unwrap_or_default();
+        assert!(!xref.is_empty(), "a cross-reference to page 3 is drawn: {all:?}");
+        for want in ["Hello note", "W101", "742", "missing-scan", xref.as_str()] {
+            assert!(has(&all, want), "{want} is drawn: {all:?}");
+        }
+        for (layer, gone) in [
+            (Layer::Drawings, "Hello note"),
+            (Layer::WireNumbers, "W101"),
+            (Layer::CrossReferences, xref.as_str()),
+            (Layer::Comments, "742"),
+            (Layer::Underlay, "missing-scan"),
+        ] {
+            ed.layers = Default::default();
+            ed.layers.set_shown(layer, false);
+            let texts = painted(&ctx, &mut o, &mut ed, 0.2, vec![]);
+            assert!(!has(&texts, gone), "{layer:?} hidden: {gone} is not drawn");
+            for other in ["Hello note", "W101", "742", "missing-scan", xref.as_str()]
+                .into_iter()
+                .filter(|w| *w != gone)
+            {
+                assert!(has(&texts, other), "{layer:?} hidden: {other} is still drawn");
+            }
+            // Locked is still drawn.
+            ed.layers = Default::default();
+            ed.layers.set_locked(layer, true);
+            let texts = painted(&ctx, &mut o, &mut ed, 0.3, vec![]);
+            assert!(has(&texts, gone), "{layer:?} locked: {gone} is still drawn");
+        }
+    }
+
+    #[test]
+    fn a_locked_comment_or_cross_reference_does_not_open_on_a_click() {
+        let (_tmp, mut o, mut ed) = annotated();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        painted(&ctx, &mut o, &mut ed, 0.0, vec![]);
+        let texts = painted(&ctx, &mut o, &mut ed, 0.1, vec![]);
+        let at = |want: &str| {
+            texts
+                .iter()
+                .find(|(t, _)| t == want || (want == "xref" && t.contains("3.")))
+                .map(|(_, r)| r.center())
+                .unwrap()
+        };
+        let (bubble, xref) = (at("742"), at("xref"));
+
+        // Locked: a click on the bubble opens nothing, a click on the cross-reference stays.
+        ed.layers.set_locked(Layer::Comments, true);
+        ed.layers.set_locked(Layer::CrossReferences, true);
+        click_at(&ctx, &mut o, &mut ed, bubble, 1.0);
+        assert_eq!(ed.comment, None);
+        click_at(&ctx, &mut o, &mut ed, xref, 2.0);
+        assert_eq!(ed.page, 1, "still on page 2");
+
+        // Unlocked: the bubble opens its comment, the cross-reference goes to page 3.
+        ed.layers = Default::default();
+        click_at(&ctx, &mut o, &mut ed, bubble, 3.0);
+        assert_eq!(ed.comment.as_deref(), Some("c742"));
+        click_at(&ctx, &mut o, &mut ed, xref, 4.0);
+        assert_eq!(ed.page, 2, "on page 3");
+    }
+
+    #[test]
+    fn the_comment_tool_leaves_a_hidden_comment_layer() {
+        let mut ed = Editor {
+            tool: Tool::Comment,
+            ..Editor::default()
+        };
+        leave_unpickable_layer(&mut ed);
+        assert_eq!(ed.tool, Tool::Comment, "shown and unlocked: the tool stays");
+        ed.layers.set_locked(Layer::Comments, true);
+        leave_unpickable_layer(&mut ed);
+        assert_eq!(ed.tool, Tool::Select);
+        // Hiding wire numbers keeps the wire tool: wires are on no layer.
+        ed.tool = Tool::Wire;
+        ed.layers.set_shown(Layer::WireNumbers, false);
+        leave_unpickable_layer(&mut ed);
+        assert_eq!(ed.tool, Tool::Wire);
     }
 
     fn drag(o: &mut Open, ed: &mut Editor, d: Point) {

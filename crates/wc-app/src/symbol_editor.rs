@@ -183,6 +183,7 @@ pub struct Saved {
 
 fn blank() -> Symbol {
     Symbol {
+        source: String::new(),
         id: String::new(),
         name: String::new(),
         category: String::new(),
@@ -215,7 +216,8 @@ fn next_name(name: &str) -> String {
 }
 
 /// The angle (degrees, y down, as [`Shape::Arc`] uses) of `p` seen from `c`.
-fn angle(c: Point, p: Point) -> f64 {
+/// The angle of `p` seen from `c`, in degrees from 0 to 360 as [`Shape::Arc`] counts them.
+pub(crate) fn angle(c: Point, p: Point) -> f64 {
     let a = (p.y - c.y).atan2(p.x - c.x).to_degrees();
     if a < 0.0 { a + 360.0 } else { a }
 }
@@ -1023,6 +1025,10 @@ fn shape_properties(ui: &mut egui::Ui, shape: &mut Shape) {
             .suffix("°")
     }
     match shape {
+        Shape::Dimension { a, b, .. } => {
+            ui.label(RichText::new("Dimension").strong());
+            ui.label(format!("{} mm", wc_core::geom::format_length(a.distance(*b))));
+        }
         Shape::Line { a, b } => {
             ui.label(RichText::new("Line").strong());
             ui.label(format!("From {:.1}, {:.1} to {:.1}, {:.1}", a.x, a.y, b.x, b.y));
