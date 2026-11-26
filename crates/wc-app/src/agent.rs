@@ -3428,6 +3428,11 @@ impl App {
         let bin = cli_path();
         let mut cmd = std::process::Command::new(&bin);
         self.assistant.command_base = None;
+        // As in the `translations` tool: the session does not carry translations.toml, so a
+        // guest's edit would stay in its own copy and never reach the host.
+        if edits_translations(&args) && self.share.active() && !self.share.is_host() {
+            return Err("Not done: in a shared session only the host can change the translations (the session does not carry translations.toml). Ask the host to make this change.".into());
+        }
         if let Some(open) = self.open.as_mut() {
             // In a shared session a page someone else has open is read-only here, and the
             // command line writes the project folder directly: only commands that read it run.
@@ -3589,6 +3594,14 @@ fn find_macro(open: &Open, name: &str) -> Result<crate::state::MacroEntry, Strin
 /// it only reads the project.
 ///
 /// `cwd` is the folder the command runs in, which relative paths are taken from.
+/// Whether `wiringcraft <args>` sets or removes a translation (`translations set`/`remove`,
+/// also with `--lang` before the subcommand).
+fn edits_translations(args: &[String]) -> bool {
+    args.iter()
+        .position(|a| a == "translations")
+        .is_some_and(|i| args[i + 1..].iter().any(|a| a == "set" || a == "remove"))
+}
+
 fn writes_while_held(args: &[String], dir: &Path, held: &BTreeMap<String, String>, cwd: &Path) -> Option<String> {
     if held.is_empty() {
         return None;
@@ -5747,6 +5760,47 @@ mod tests {
         }
         assert!(!file.exists(), "nothing is written in the guest's copy");
         assert!(call(&mut a, "translations", json!({"action": "list"})).is_ok());
+    }
+
+    #[test]
+    fn a_guest_cannot_set_or_remove_translations_through_the_command_line() {
+        use wc_core::translate::TRANSLATIONS_FILE;
+        let tmp = tempfile::tempdir().unwrap();
+        let (_dir, mut a) = guest_app(tmp.path());
+        // With no page held by anyone else the read-only check lets every command through.
+        a.open.as_mut().unwrap().held_by_others.clear();
+        let file = a.open.as_ref().unwrap().dir.join(TRANSLATIONS_FILE);
+        for args in [
+            json!({"args": ["translations", "set", "Pumps", "Pumper", "--lang", "nb"]}),
+            json!({"args": ["translations", "--lang", "nb", "remove", "Pumps"]}),
+        ] {
+            let Started::Done(Err(e)) = wc_agent::Tools::start(&mut AppTools(&mut a), "run_command", &args) else {
+                unreachable!("{args} was not refused");
+            };
+            assert!(e.contains("only the host"), "{e}");
+        }
+        assert!(!file.exists(), "nothing is written in the guest's copy");
+        // Listing what is missing still runs.
+        let args = json!({"args": ["translations", "--lang", "nb"]});
+        let Started::Running(p) = wc_agent::Tools::start(&mut AppTools(&mut a), "run_command", &args) else {
+            unreachable!("listing was refused");
+        };
+        let _ = wc_agent::Tools::finish(&mut AppTools(&mut a), "run_command", &args, p.wait());
+    }
+
+    #[test]
+    fn edits_translations_tells_set_and_remove_from_listing() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(edits_translations(&args(&["translations", "set", "A", "B"])));
+        assert!(edits_translations(&args(&[
+            "translations",
+            "--lang",
+            "de",
+            "remove",
+            "A"
+        ])));
+        assert!(!edits_translations(&args(&["translations", "--lang", "nb"])));
+        assert!(!edits_translations(&args(&["page", "set"])));
     }
 
     #[test]
