@@ -103,6 +103,9 @@ pub struct SymbolEditor {
     pub tool: Tool,
     /// The clicks so far of a shape being drawn.
     clicks: Vec<Point>,
+    /// Where the last click closed a polyline on its first point, so the second click of a
+    /// double-click there does not start a new one.
+    closed_at: Option<Point>,
     pub selected: Option<Item>,
     /// Folders the symbol can be saved into, and the chosen one.
     pub targets: Vec<Target>,
@@ -262,6 +265,7 @@ impl SymbolEditor {
             symbol: blank(),
             tool: Tool::Line,
             clicks: Vec::new(),
+            closed_at: None,
             selected: None,
             targets,
             target: 0,
@@ -401,6 +405,7 @@ impl SymbolEditor {
                 // in a row is not taken (a double-click on it ends the polyline).
                 match (self.clicks.first(), self.clicks.last()) {
                     (Some(&first), _) if first == p && self.clicks.len() >= 3 => {
+                        self.closed_at = Some(p);
                         let points = std::mem::take(&mut self.clicks);
                         self.add_shape(Shape::Polyline {
                             points,
@@ -1040,7 +1045,9 @@ impl SymbolEditor {
         }
         if self.tool == Tool::Polyline {
             for w in self.clicks.windows(2) {
-                painter.line_segment([xf.s(w[0]), xf.s(w[1])], Stroke::new(1.0_f32, pick));
+                if let [a, b] = w {
+                    painter.line_segment([xf.s(*a), xf.s(*b)], Stroke::new(1.0_f32, pick));
+                }
             }
         }
         if let Some(h) = resp.hover_pos() {
@@ -1060,15 +1067,15 @@ impl SymbolEditor {
             && let Some(pos) = resp.interact_pointer_pos()
         {
             let at = xf.mm(pos);
+            let closed_at = self.closed_at.take();
+            let double = resp.double_clicked() && self.tool == Tool::Polyline;
             // egui calls two quick clicks a double-click wherever they land: only a second
-            // click on the polyline's last point ends it.
-            if resp.double_clicked()
-                && self.tool == Tool::Polyline
-                && self.clicks.len() >= 2
-                && self.clicks.last() == Some(&snap(at))
-            {
+            // click on the polyline's last point ends it, and the second click of a
+            // double-click that closed it on its first point does nothing more.
+            let paired = double && self.clicks.is_empty() && closed_at == Some(snap(at));
+            if double && self.clicks.len() >= 2 && self.clicks.last() == Some(&snap(at)) {
                 self.finish_polyline();
-            } else {
+            } else if !paired {
                 self.click(at);
             }
         }
@@ -2036,6 +2043,24 @@ mod tests {
             &e.symbol.graphics[..],
             [Shape::Polyline { points, closed: false, .. }] if points.len() == 4
         ));
+
+        // A double-click on the first point of a new one closes it, and starts nothing more.
+        t.set(t.get() + 1.0);
+        for (x, y) in [(-10.0, 0.0), (-5.0, 0.0), (-5.0, 5.0)] {
+            click(&mut e, x, y);
+        }
+        t.set(t.get() + 1.0);
+        click(&mut e, -10.0, 0.0);
+        click(&mut e, -10.0, 0.0);
+        assert!(e.clicks.is_empty(), "the second click started no new polyline");
+        assert!(matches!(
+            e.symbol.graphics.last(),
+            Some(Shape::Polyline { points, closed: true, .. }) if points.len() == 3
+        ));
+        // The next click (a new double-click pair is long over) starts one as usual.
+        t.set(t.get() + 1.0);
+        click(&mut e, -10.0, 0.0);
+        assert_eq!(e.clicks, [Point::new(-10.0, 0.0)]);
     }
 
     #[test]
