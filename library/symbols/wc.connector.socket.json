@@ -1,0 +1,54 @@
+{
+  "category": "terminals",
+  "description": "One contact of a plug-in connector, female side; the mating side is open at the bottom.",
+  "graphics": [
+    {
+      "a": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 5.0
+      },
+      "kind": "line"
+    },
+    {
+      "center": {
+        "x": 0.0,
+        "y": 7.5
+      },
+      "end": 360.0,
+      "kind": "arc",
+      "radius": 2.5,
+      "start": 180.0
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "1"
+    }
+  ],
+  "id": "wc.connector.socket",
+  "letter_code": "X",
+  "name": "Socket (female contact)",
+  "pins": [
+    {
+      "at": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "1"
+    }
+  ],
+  "role": "standalone",
+  "tag_at": {
+    "x": -6.0,
+    "y": 5.0
+  }
+}
