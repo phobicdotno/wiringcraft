@@ -1133,6 +1133,58 @@ fn a_spline_fitted_polyline_keeps_its_fit_vertices_without_its_control_ones() ->
     Ok(())
 }
 
+/// A classic 2D polyline keeps the bulge each vertex stores after its widths: from (0, 0) to
+/// (10, 0) with bulge 1 is a half circle, with bulge 0 a straight line. A negative start width
+/// (one width for both ends) has no end width after it, and the bulge is still found.
+#[test]
+fn a_classic_polyline_keeps_the_bulges_of_its_vertices() -> TestResult {
+    let v = Version::R2010;
+    let polyline = |bulge: f64, start_width: f64| -> std::result::Result<Drawing, Box<dyn std::error::Error>> {
+        let mut objs = vec![
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            entry(v, LAYER, LAYER_H, "0"),
+        ];
+        let mut pl = entity(v, 15, 0x100, head(None));
+        pl.data
+            .bs(0)
+            .bs(0)
+            .bd(0.0)
+            .bd(0.0)
+            .bt(0.0)
+            .bd(0.0)
+            .be((0.0, 0.0, 1.0))
+            .bl(2);
+        pl.handles.h(4, 0x101).h(4, 0x102).h(3, 0x103);
+        objs.push(pl);
+        for (n, (x, b)) in [(0.0, bulge), (10.0, 0.0)].into_iter().enumerate() {
+            let mut vx = entity(v, 10, 0x101 + n as u64, head(Some(0x100)));
+            vx.data.rc(0).bd3((x, 0.0, 0.0)).bd(start_width);
+            if start_width >= 0.0 {
+                vx.data.bd(start_width);
+            }
+            vx.data.bd(b).bd(0.0);
+            objs.push(vx);
+        }
+        objs.push(entity(v, 6, 0x103, head(Some(0x100))));
+        Ok(drawing(&sections(v, &objs, &[]))?)
+    };
+    for width in [0.0, -0.5] {
+        let d = polyline(1.0, width)?;
+        let [Shape::Polyline { points, .. }] = d.model.as_slice() else {
+            unreachable!("{:?} {:?}", d.model, d.skipped);
+        };
+        let top = points.iter().map(|p| p.y.abs()).fold(0.0, f64::max);
+        assert!(points.len() > 2 && (top - 5.0).abs() < 0.1, "width {width}: {points:?}");
+        let d = polyline(0.0, width)?;
+        let [Shape::Polyline { points, .. }] = d.model.as_slice() else {
+            unreachable!("{:?} {:?}", d.model, d.skipped);
+        };
+        assert_eq!(points.len(), 2, "width {width}: {points:?}");
+        assert!(points.iter().all(|p| p.y == 0.0), "width {width}: {points:?}");
+    }
+    Ok(())
+}
+
 #[test]
 fn bit_values_are_read_in_every_form() -> TestResult {
     let mut w = W::default();

@@ -908,6 +908,17 @@ fn decode(
                 return Ok(());
             }
             e.f(10, x).f(20, y);
+            // A 2D vertex (a 3D one stops at its point) has its widths and then the bulge of
+            // the segment it starts; a negative start width stands for both, with no end width.
+            if o.kind == 10 {
+                if o.data.bd()? >= 0.0 {
+                    o.data.bd()?;
+                }
+                let bulge = o.data.bd()?;
+                if bulge != 0.0 {
+                    e.f(42, bulge);
+                }
+            }
         }
         15 => {
             let flags = o.data.bs()?;
