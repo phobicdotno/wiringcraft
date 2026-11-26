@@ -284,6 +284,17 @@ enum Cmd {
         #[arg(long = "type")]
         kind: Option<String>,
     },
+    /// Delete symbols and wires from a page by their ids (as `place`, `box` and `wire` print
+    /// them). Wires that end on a pin of a deleted symbol go too, as in the app; devices keep
+    /// their data. An id that is not on the page is an error and nothing changes. Prints each
+    /// deleted id.
+    Delete {
+        /// The page's id.
+        page: String,
+        /// The ids of the symbols and wires to delete, e.g. `s1 w3`.
+        #[arg(required = true)]
+        ids: Vec<String>,
+    },
     /// The project's locations (cabinets, rooms, panels): the `+` part of device tags.
     #[command(subcommand)]
     Location(LocationCmd),
@@ -427,11 +438,12 @@ enum Cmd {
         out: PathBuf,
     },
     /// Check the project for mistakes: devices drawn twice, contacts without a coil, shorted
-    /// potentials, open pins, wires ending in the air, devices without a part, plus the
-    /// project's own `[[rule]]` tables in `project.toml` (a cable on every motor, a tag
-    /// pattern, at most N wires on a terminal) and the house rules in each library source's
-    /// `rules.toml`, less the ones `rules_off` turns off. Exits with an error when an error is
-    /// found, so it can guard a commit or a CI job.
+    /// potentials, open pins, wires ending in the air, wire numbers that do not name one
+    /// connection each, devices without a part, plus the project's own `[[rule]]` tables in
+    /// `project.toml` (a cable on every motor, a tag pattern, at most N wires on a terminal)
+    /// and the house rules in each library source's `rules.toml`, less the ones `rules_off`
+    /// turns off. Exits with an error when an error is found, so it can guard a commit or a CI
+    /// job.
     Check {
         /// Also list notes (open pins, devices without a part).
         #[arg(long)]
@@ -1443,8 +1455,9 @@ enum ImportCmd {
         #[arg(long)]
         lib: Option<PathBuf>,
     },
-    /// A DWG drawing onto a page, converted to DXF by an installed converter (ODA File
-    /// Converter, `dwg2dxf`, or the command in WIRINGCRAFT_DWG2DXF with {in} and {out}).
+    /// A DWG drawing onto a page, read by WiringCraft's own DWG reader (AutoCAD 2004 to 2018).
+    /// A file it refuses is converted to DXF by an installed converter (ODA File Converter,
+    /// `dwg2dxf`, or the command in WIRINGCRAFT_DWG2DXF with {in} and {out}).
     PageDwg {
         /// The DWG file.
         file: PathBuf,
@@ -1593,6 +1606,38 @@ fn parse_point(s: &str) -> Result<Point, String> {
     } else {
         Err("coordinates must be finite".into())
     }
+}
+
+/// `delete`: take the symbols and wires named by `ids` off `page`, and the wires ending on a
+/// deleted symbol's pin, as the app's Delete does. An id not on the page is an error and nothing
+/// changes. Returns the deleted ids: symbols first, then wires, each in page order.
+fn delete_items(page: &mut Page, ids: &[String]) -> Res<Vec<String>> {
+    let missing: Vec<String> = ids
+        .iter()
+        .filter(|id| page.symbol(id).is_none() && !page.wires.iter().any(|w| &w.id == *id))
+        .map(|id| format!("{:?}", id))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!("no symbol or wire {} on page {}", missing.join(", "), page.id));
+    }
+    let named = |id: &str| ids.iter().any(|x| x == id);
+    let on_deleted =
+        |end: &Endpoint| matches!(end, Endpoint::Pin { item, .. } if page.symbol(item).is_some() && named(item));
+    let gone_wires: Vec<String> = page
+        .wires
+        .iter()
+        .filter(|w| named(&w.id) || on_deleted(&w.from) || on_deleted(&w.to))
+        .map(|w| w.id.clone())
+        .collect();
+    let gone_symbols: Vec<String> = page
+        .symbols
+        .iter()
+        .filter(|s| named(&s.id))
+        .map(|s| s.id.clone())
+        .collect();
+    page.symbols.retain(|s| !gone_symbols.contains(&s.id));
+    page.wires.retain(|w| !gone_wires.contains(&w.id));
+    Ok(gone_symbols.into_iter().chain(gone_wires).collect())
 }
 
 /// A wire end from `item:pin` or `x,y`. A pin must be one the placed symbol has (its
@@ -3144,6 +3189,15 @@ fn run(mut cli: Cli) -> Res<()> {
             save(dir, &p)?;
             println!("{id}");
         }
+        Cmd::Delete { page, ids } => {
+            let mut p = load(dir)?;
+            let pg = page_mut(&mut p, &page)?;
+            let deleted = delete_items(pg, &ids)?;
+            save(dir, &p)?;
+            for id in deleted {
+                println!("{}", escape_field(&id));
+            }
+        }
         Cmd::Location(lc) => {
             let mut p = load(dir)?;
             match lc {
@@ -3719,6 +3773,7 @@ fn run(mut cli: Cli) -> Res<()> {
                     _ => true,
                 })
                 .collect();
+            warn_levels(&p, &kinds);
             // The network list is followed by a topology page per network.
             let networks = if kinds.contains(&wc_report::Kind::Networks) {
                 p.meta.networks.clone()
@@ -3950,6 +4005,7 @@ fn run(mut cli: Cli) -> Res<()> {
             };
             warn_report_layouts(&inputs);
             let kinds = report_kinds(std::slice::from_ref(&kind))?;
+            warn_levels(&p, &kinds);
             if format == "xlsx" {
                 let Some(path) = out else {
                     return Err("an Excel workbook is not text: pass --out <file>.xlsx".into());
@@ -4790,6 +4846,21 @@ fn warn_report_layouts(inputs: &wc_report::Inputs<'_>) {
     }
     for w in wc_report::network_warnings(inputs) {
         eprintln!("warning: {}", escape_field(&w));
+    }
+}
+
+/// Warns about each terminal `Level` value that is not a level, when `kinds` has the terminal
+/// plan: such a terminal shows no level there.
+fn warn_levels(project: &wc_core::Project, kinds: &[wc_report::Kind]) {
+    if !kinds.contains(&wc_report::Kind::Terminals) {
+        return;
+    }
+    use std::io::Write as _;
+    let mut err = std::io::stderr().lock();
+    for w in wc_report::level_warnings(project) {
+        // Tags and values come from the project file. A warning that cannot be written (stderr
+        // closed or full) is dropped: it must not stop the export.
+        let _ = writeln!(err, "warning: {}", escape_field(&w));
     }
 }
 
@@ -6490,8 +6561,9 @@ mod tests {
         let folder = tmp.path().to_owned();
         // A stand-in converter, as WIRINGCRAFT_DWG2DXF names one; a path with a space stays
         // one argument.
-        let out = dwg_to_dxf(&dwg, &folder, Some("cp {in} {out}".into())).unwrap();
+        let (out, by) = dwg_to_dxf(&dwg, &folder, Some("cp {in} {out}".into())).unwrap();
         assert_eq!(out, folder.join("Motor plan.dxf"));
+        assert_eq!(by, "the WIRINGCRAFT_DWG2DXF command");
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "0\nEOF\n");
         let err = dwg_to_dxf(&dwg, &folder, Some("false {in} {out}".into()))
             .err()
@@ -6547,8 +6619,16 @@ mod tests {
         assert!(err.as_ref().is_err_and(|e| e.contains("no-such-page")), "{err:?}");
         assert!(!folder().exists(), "removed after a failed import");
 
-        // And when it works.
+        // The converter makes a DXF that cannot be read: both reasons are given.
         let pages = load(&dir).unwrap().pages;
+        let junk = converter("junk.sh", "echo junk > \"$2\"");
+        let err = import_page_dwg(&dir, &dwg, pages[0].id.clone(), 1.0, Some(junk)).unwrap_err();
+        assert!(
+            err.contains("own DWG reader refused") && err.contains("could not be read either"),
+            "{err}"
+        );
+
+        // And when it works.
         import_page_dwg(&dir, &dwg, pages[0].id.clone(), 1.0, Some(copy)).unwrap();
         assert!(!folder().exists(), "removed after the import");
     }
@@ -6743,6 +6823,58 @@ mod tests {
         // One after the other: neither overwrote the other's page.
         let p = load(&dir).unwrap();
         assert!(p.page("p2").is_some() && p.page("p3").is_some());
+    }
+
+    #[test]
+    fn delete_takes_symbols_and_wires_off_a_page_with_the_wires_on_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        for (at, tag) in [("40,40", "-A1"), ("100,40", "-A2")] {
+            let args = ["box", "p1", "--at", at, "--size", "20,20", "--tag", tag];
+            cli(&dir, &[&args[..], &["--pin", "1:top:10"]].concat()).unwrap();
+        }
+        // w1 runs between the boxes, w2 from s2 into the air, w3 from point to point.
+        cli(&dir, &["wire", "p1", "s1:1", "s2:1"]).unwrap();
+        cli(&dir, &["wire", "p1", "s2:1", "150,20"]).unwrap();
+        cli(&dir, &["wire", "p1", "10,10", "20,10"]).unwrap();
+        let ids = |dir: &Path| {
+            let p = load(dir).unwrap();
+            let pg = p.page("p1").unwrap();
+            let mut ids: Vec<String> = pg.symbols.iter().map(|s| s.id.clone()).collect();
+            ids.extend(pg.wires.iter().map(|w| w.id.clone()));
+            ids
+        };
+
+        // An id that is not there changes nothing, though the others are.
+        let err = cli(&dir, &["delete", "p1", "w3", "nope", "s9"]).unwrap_err();
+        assert_eq!(err, "no symbol or wire \"nope\", \"s9\" on page p1");
+        assert_eq!(ids(&dir), ["s1", "s2", "w1", "w2", "w3"]);
+        assert!(
+            cli(&dir, &["delete", "p9", "w3"])
+                .unwrap_err()
+                .contains("no page \"p9\"")
+        );
+
+        // A wire alone.
+        let mut p = load(&dir).unwrap();
+        let deleted = delete_items(p.page_mut("p1").unwrap(), &["w3".into()]).unwrap();
+        assert_eq!(deleted, ["w3"]);
+        cli(&dir, &["delete", "p1", "w3"]).unwrap();
+        assert_eq!(ids(&dir), ["s1", "s2", "w1", "w2"]);
+
+        // A symbol takes the wires on its pins along; the other symbol and its device stay.
+        let mut p = load(&dir).unwrap();
+        let deleted = delete_items(p.page_mut("p1").unwrap(), &["s2".into()]).unwrap();
+        assert_eq!(deleted, ["s2", "w1", "w2"]);
+        cli(&dir, &["delete", "p1", "s2"]).unwrap();
+        assert_eq!(ids(&dir), ["s1"]);
+        let p = load(&dir).unwrap();
+        assert!(
+            p.devices.contains_key(&DeviceTag::parse("-A2").unwrap()),
+            "the device keeps its data"
+        );
     }
 
     #[test]
@@ -7869,6 +8001,24 @@ mod tests {
         );
         assert!(!load(&dir).unwrap().lock.symbols.contains_key("aa.good"));
         std::fs::remove_dir(&tmp_path).unwrap();
+
+        // A lock that cannot be written after both copies were taken puts them back, and the
+        // page is not saved.
+        let page_bytes =
+            std::fs::read(dir.join(store::PAGES_DIR).join(format!("{page}{}", store::PAGE_SUFFIX))).unwrap();
+        let lock_blocker = dir.join(format!("{}.tmp", store::LOCK_FILE));
+        std::fs::create_dir(&lock_blocker).unwrap();
+        cli(&dir, &args).unwrap_err();
+        std::fs::remove_dir(&lock_blocker).unwrap();
+        assert!(store::read_vendored_symbol(&dir, "aa.good").is_err(), "copy put back");
+        assert!(store::read_vendored_symbol(&dir, "zz.bad").is_err(), "copy put back");
+        let p = load(&dir).unwrap();
+        assert!(!p.lock.symbols.contains_key("aa.good"));
+        assert!(p.page(&page).is_some_and(|pg| pg.symbols.is_empty()), "page not saved");
+        assert_eq!(
+            std::fs::read(dir.join(store::PAGES_DIR).join(format!("{page}{}", store::PAGE_SUFFIX))).unwrap(),
+            page_bytes
+        );
 
         // And the retry pins both.
         cli(&dir, &args).unwrap();

@@ -1,7 +1,7 @@
 //! The panel layout view: the mounting plate with its ducts, DIN rails and device footprints,
-//! drawn to scale. Devices are picked and dragged with the primary button, and rails and ducts
-//! picked with it, so Delete takes them off; the wheel zooms and the middle or secondary button
-//! pans, as on the schematic canvas.
+//! drawn to scale. Devices are picked and dragged with the primary button, and the arrow keys move
+//! the picked device by one step; rails and ducts are picked with it, so Delete takes them off;
+//! the wheel zooms and the middle or secondary button pans, as on the schematic canvas.
 
 use eframe::egui::{self, Align2, FontId, Rect, Sense, Stroke, Vec2};
 use wc_core::Point;
@@ -17,6 +17,17 @@ fn device_at(items: &[PanelItem], at: Point) -> Option<usize> {
         let (a, b) = item.device_bounds()?;
         (at.x >= a.x && at.x <= b.x && at.y >= a.y && at.y <= b.y).then_some(i)
     })
+}
+
+/// Where a device at `at`, `size` big as turned, goes when an arrow key moves it `step` mm in
+/// the direction (`dx`, `dy`): kept on a plate `plate` big, as a drag keeps it.
+fn nudged(at: Point, size: (f64, f64), plate: (f64, f64), step: f64, dx: f64, dy: f64) -> Point {
+    let (w, h) = size;
+    let (pw, ph) = plate;
+    Point::new(
+        (at.x + dx * step).clamp(0.0, (pw - w).max(0.0)),
+        (at.y + dy * step).clamp(0.0, (ph - h).max(0.0)),
+    )
 }
 
 /// Which item lies under a plate position: a device first, as they are drawn on top, then a
@@ -45,7 +56,9 @@ fn item_at(items: &[PanelItem], at: Point) -> Option<usize> {
 /// so a large plate fits.
 pub const ZOOM_LIMITS: (f32, f32) = (0.05, 20.0);
 
-pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, snap_step: f64) {
+/// `keyboard_edits` is false while something else has the keyboard, such as an app dialog: the
+/// arrow keys then leave the picked device where it is.
+pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, snap_step: f64, keyboard_edits: bool) {
     let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
     ed.view.size = rect.size();
     let painter = ui.painter_at(rect);
@@ -96,13 +109,33 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
         if let Some(i) = ed.panel_pick
             && let Some(PanelItem::Device { at: a, .. }) = p.items.get(i)
         {
-            ed.panel_drag = Some((Point::new(at.x - a.x, at.y - a.y), false));
+            ed.panel_drag = Some((Point::new(at.x - a.x, at.y - a.y), None, *a));
+        }
+    }
+    // Escape puts the device back where the drag started and drops the drag's undo step; the
+    // release afterwards changes nothing.
+    if let (Some((_, checkpoint, start)), Some(i)) = (ed.panel_drag, ed.panel_pick)
+        && ui.input(|inp| inp.key_pressed(egui::Key::Escape))
+    {
+        ed.panel_drag = None;
+        if let Some(step) = checkpoint
+            && let Some(PanelItem::Device { at, .. }) =
+                open.project.panels.get_mut(panel).and_then(|x| x.items.get_mut(i))
+        {
+            *at = start;
+            open.edited();
+            // Only when the latest step is still this drag's (nothing has touched the history
+            // since its checkpoint): then it changes nothing any more.
+            if open.history_count() == step && open.before_last_change() == Some(&open.project) {
+                open.forget_terminal_change();
+                open.forget_last_change();
+            }
         }
     }
     if resp.clicked_by(egui::PointerButton::Primary) {
         ed.panel_pick = pointer.and_then(|at| item_at(&p.items, at));
     }
-    if let (Some((grab, checkpoint)), Some(i), Some(at)) = (ed.panel_drag, ed.panel_pick, pointer)
+    if let (Some((grab, checkpoint, start)), Some(i), Some(at)) = (ed.panel_drag, ed.panel_pick, pointer)
         && resp.dragged_by(egui::PointerButton::Primary)
     {
         let step = if snap_step > 0.0 { snap_step.min(5.0) } else { 1.0 };
@@ -127,9 +160,9 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
         }
         let moved = matches!(p.items.get(i), Some(PanelItem::Device { at: a, .. }) if *a != to);
         if moved {
-            if !checkpoint {
+            if checkpoint.is_none() {
                 open.checkpoint();
-                ed.panel_drag = Some((grab, true));
+                ed.panel_drag = Some((grab, Some(open.history_count()), start));
             }
             if let Some(PanelItem::Device {
                 at: a,
@@ -148,6 +181,68 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
     }
     if resp.drag_stopped() {
         ed.panel_drag = None;
+    }
+    // The arrow keys move the picked device by one step each press, one undo step a press, kept
+    // on the plate as a drag keeps it. The keys are used up here, so nothing else (such as the
+    // schematic page behind this view) acts on them too. Not while a dialog is open.
+    if keyboard_edits
+        && ed.panel_drag.is_none()
+        && !ui.ctx().wants_keyboard_input()
+        && let Some(i) = ed.panel_pick
+        && matches!(p.items.get(i), Some(PanelItem::Device { .. }))
+    {
+        let step = if snap_step > 0.0 { snap_step.min(5.0) } else { 1.0 };
+        // The presses in the order they came, so Right then Left ends where it started.
+        let mut presses: Vec<(f64, f64)> = Vec::new();
+        ui.input_mut(|inp| {
+            inp.events.retain(|e| {
+                let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = e
+                else {
+                    return true;
+                };
+                let d = match key {
+                    egui::Key::ArrowLeft => (-1.0, 0.0),
+                    egui::Key::ArrowRight => (1.0, 0.0),
+                    egui::Key::ArrowUp => (0.0, -1.0),
+                    egui::Key::ArrowDown => (0.0, 1.0),
+                    _ => return true,
+                };
+                if !modifiers.is_none() {
+                    return true;
+                }
+                presses.push(d);
+                false
+            });
+        });
+        for (dx, dy) in presses {
+            let Some(PanelItem::Device {
+                at,
+                width,
+                height,
+                rotation,
+                ..
+            }) = open.project.panels.get(panel).and_then(|x| x.items.get(i))
+            else {
+                break;
+            };
+            let size = wc_core::panel::turned_size(*width, *height, *rotation);
+            let to = nudged(*at, size, (pw, ph), step, dx, dy);
+            if to == *at {
+                continue;
+            }
+            open.checkpoint();
+            if let Some(PanelItem::Device { at, .. }) =
+                open.project.panels.get_mut(panel).and_then(|x| x.items.get_mut(i))
+            {
+                *at = to;
+            }
+            open.edited();
+        }
     }
     let p = open.project.panels.get(panel).cloned().unwrap_or(p);
 
@@ -387,6 +482,177 @@ mod tests {
     }
 
     #[test]
+    fn arrow_keys_move_a_device_one_step_and_keep_it_on_the_plate() {
+        let at = Point::new(100.0, 50.0);
+        assert_eq!(
+            nudged(at, (40.0, 60.0), (400.0, 300.0), 5.0, 1.0, 0.0),
+            Point::new(105.0, 50.0)
+        );
+        assert_eq!(
+            nudged(at, (40.0, 60.0), (400.0, 300.0), 2.5, 0.0, -1.0),
+            Point::new(100.0, 47.5)
+        );
+        // At the plate's edges it stays on the plate.
+        let corner = Point::new(0.0, 240.0);
+        assert_eq!(nudged(corner, (40.0, 60.0), (400.0, 300.0), 5.0, -1.0, 0.0), corner);
+        assert_eq!(nudged(corner, (40.0, 60.0), (400.0, 300.0), 5.0, 0.0, 1.0), corner);
+        assert_eq!(
+            nudged(Point::new(358.0, 0.0), (40.0, 60.0), (400.0, 300.0), 5.0, 1.0, 0.0),
+            Point::new(360.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn arrow_keys_in_the_panel_view_move_the_picked_device() {
+        let (_tmp, mut open) = crate::state::tests::project();
+        open.project.panels.push(wc_core::panel::Panel {
+            id: "panel1".into(),
+            name: "Panel 1".into(),
+            width: 400.0,
+            height: 300.0,
+            items: vec![PanelItem::Device {
+                tag: wc_core::DeviceTag::parse("-K1").unwrap_or_default(),
+                at: Point::new(100.0, 100.0),
+                width: 40.0,
+                height: 60.0,
+                rotation: wc_core::geom::Rotation::R0,
+            }],
+        });
+        let mut ed = Editor::default();
+        ed.panel = Some(0);
+        ed.panel_pick = Some(0);
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let input = egui::RawInput {
+            events: vec![
+                key(egui::Key::ArrowRight),
+                key(egui::Key::ArrowRight),
+                key(egui::Key::ArrowUp),
+            ],
+            ..Default::default()
+        };
+        let steps = open.undo_steps();
+        let mut left = 0;
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show(ui, &mut open, &mut ed, 0, 2.5, true));
+            // The keys are used up: nothing after the panel view sees them.
+            left = ctx.input(|i| i.events.len());
+        });
+        assert_eq!(left, 0);
+        let Some(PanelItem::Device { at, .. }) = open.project.panels[0].items.first() else {
+            unreachable!("the device is there")
+        };
+        assert_eq!(*at, Point::new(105.0, 97.5));
+        // One undo step a press.
+        assert_eq!(open.undo_steps(), steps + 3);
+        for _ in 0..3 {
+            assert!(open.undo());
+        }
+        let Some(PanelItem::Device { at, .. }) = open.project.panels[0].items.first() else {
+            unreachable!("the device is there")
+        };
+        assert_eq!(*at, Point::new(100.0, 100.0));
+    }
+
+    #[test]
+    fn arrow_keys_in_one_frame_move_the_device_in_the_order_pressed() {
+        let (_tmp, mut open) = crate::state::tests::project();
+        open.project.panels.push(wc_core::panel::Panel {
+            id: "panel1".into(),
+            name: "Panel 1".into(),
+            width: 400.0,
+            height: 300.0,
+            items: vec![PanelItem::Device {
+                tag: wc_core::DeviceTag::parse("-K1").unwrap_or_default(),
+                at: Point::new(0.0, 0.0),
+                width: 40.0,
+                height: 60.0,
+                rotation: wc_core::geom::Rotation::R0,
+            }],
+        });
+        let mut ed = Editor::default();
+        ed.panel = Some(0);
+        ed.panel_pick = Some(0);
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let input = egui::RawInput {
+            events: vec![key(egui::Key::ArrowRight), key(egui::Key::ArrowLeft)],
+            ..Default::default()
+        };
+        let steps = open.undo_steps();
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show(ui, &mut open, &mut ed, 0, 5.0, true));
+        });
+        // Right moves it off the edge, then Left brings it back: two undo steps.
+        let Some(PanelItem::Device { at, .. }) = open.project.panels[0].items.first() else {
+            unreachable!("the device is there")
+        };
+        assert_eq!(*at, Point::new(0.0, 0.0));
+        assert_eq!(open.undo_steps(), steps + 2);
+    }
+
+    #[test]
+    fn arrow_keys_leave_the_picked_device_alone_while_a_dialog_is_open() {
+        let (_tmp, mut open) = crate::state::tests::project();
+        open.project.panels.push(wc_core::panel::Panel {
+            id: "panel1".into(),
+            name: "Panel 1".into(),
+            width: 400.0,
+            height: 300.0,
+            items: vec![PanelItem::Device {
+                tag: wc_core::DeviceTag::parse("-K1").unwrap_or_default(),
+                at: Point::new(100.0, 100.0),
+                width: 40.0,
+                height: 60.0,
+                rotation: wc_core::geom::Rotation::R0,
+            }],
+        });
+        let mut ed = Editor::default();
+        ed.panel = Some(0);
+        ed.panel_pick = Some(0);
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let steps = open.undo_steps();
+        let mut left = 0;
+        let _ = ctx.run(input, |ctx| {
+            // A dialog is open: keyboard edits are not allowed.
+            egui::CentralPanel::default().show(ctx, |ui| show(ui, &mut open, &mut ed, 0, 5.0, false));
+            left = ctx.input(|i| i.events.len());
+        });
+        // The key is not used up, and the device and the undo history stay as they were.
+        assert_eq!(left, 1);
+        let Some(PanelItem::Device { at, .. }) = open.project.panels[0].items.first() else {
+            unreachable!("the device is there")
+        };
+        assert_eq!(*at, Point::new(100.0, 100.0));
+        assert_eq!(open.undo_steps(), steps);
+    }
+
+    #[test]
     fn picks_a_turned_device_by_its_turned_outline() {
         let items = vec![PanelItem::Device {
             tag: wc_core::DeviceTag::parse("-G1").unwrap_or_default(),
@@ -398,6 +664,181 @@ mod tests {
         // Turned, it covers 40 x 10 mm.
         assert_eq!(device_at(&items, Point::new(30.0, 5.0)), Some(0));
         assert_eq!(device_at(&items, Point::new(5.0, 30.0)), None);
+    }
+
+    #[test]
+    fn escape_during_a_device_drag_puts_the_device_back() {
+        let (_tmp, mut open) = crate::state::tests::project();
+        let mut panel = wc_core::panel::Panel {
+            id: "panel1".into(),
+            name: "Panel 1".into(),
+            width: 400.0,
+            height: 300.0,
+            items: Vec::new(),
+        };
+        let start = Point::new(100.0, 100.0);
+        panel.items.push(PanelItem::Device {
+            tag: wc_core::DeviceTag::parse("-K1").unwrap_or_default(),
+            at: start,
+            width: 40.0,
+            height: 60.0,
+            rotation: wc_core::geom::Rotation::R0,
+        });
+        open.project.panels.push(panel);
+        let mut ed = Editor::default();
+        ed.panel = Some(0);
+        ed.view.fit = true;
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let frame = |open: &mut Open, ed: &mut Editor, time: f64, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1000.0, 700.0))),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| show(ui, open, ed, 0, 1.0));
+            });
+        };
+        let button = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let device_at_now = |open: &Open| match open.project.panels[0].items.first() {
+            Some(PanelItem::Device { at, .. }) => *at,
+            _ => unreachable!("the device is there"),
+        };
+        // Lay the view out, then find where the device's middle is on screen.
+        frame(&mut open, &mut ed, 0.5, vec![]);
+        let probe = egui::pos2(500.0, 350.0);
+        frame(&mut open, &mut ed, 0.6, vec![egui::Event::PointerMoved(probe)]);
+        let Some(seen) = ed.cursor else {
+            unreachable!("the pointer is over the plate")
+        };
+        let zoom = ed.view.zoom;
+        let on_screen = |m: Point| probe + Vec2::new(((m.x - seen.x) as f32) * zoom, ((m.y - seen.y) as f32) * zoom);
+        let a = on_screen(Point::new(120.0, 130.0));
+        let steps_before = open.undo_steps();
+        frame(&mut open, &mut ed, 1.0, vec![egui::Event::PointerMoved(a)]);
+        frame(&mut open, &mut ed, 1.01, vec![button(a, true)]);
+        for (k, t) in [(1.0, 1.05), (2.0, 1.1), (3.0, 1.15)] {
+            let to = on_screen(Point::new(120.0 + 10.0 * k, 130.0));
+            frame(&mut open, &mut ed, t, vec![egui::Event::PointerMoved(to)]);
+        }
+        assert_ne!(device_at_now(&open), start, "the drag moves the device");
+        assert_eq!(open.undo_steps(), steps_before + 1);
+
+        let escape = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&mut open, &mut ed, 1.2, vec![escape]);
+        assert_eq!(device_at_now(&open), start, "Escape puts the device back");
+        assert_eq!(open.undo_steps(), steps_before, "and drops the drag's undo step");
+        assert!(ed.panel_drag.is_none());
+
+        // Moving on and letting go changes nothing.
+        let far = on_screen(Point::new(200.0, 160.0));
+        frame(&mut open, &mut ed, 1.25, vec![egui::Event::PointerMoved(far)]);
+        frame(&mut open, &mut ed, 1.3, vec![button(far, false)]);
+        frame(&mut open, &mut ed, 1.35, vec![]);
+        assert_eq!(device_at_now(&open), start);
+        assert_eq!(open.undo_steps(), steps_before);
+    }
+
+    /// Dragged away and back to its start with the button held, then a file-only edit (a
+    /// translation, as the assistant's `translations` tool sets one) makes an undo step whose
+    /// project is the start too: Escape keeps that step and drops nothing.
+    #[test]
+    fn escape_keeps_an_undo_step_made_after_the_drags_own() {
+        let (_tmp, mut open) = crate::state::tests::project();
+        let start = Point::new(100.0, 100.0);
+        open.project.panels.push(wc_core::panel::Panel {
+            id: "panel1".into(),
+            name: "Panel 1".into(),
+            width: 400.0,
+            height: 300.0,
+            items: vec![PanelItem::Device {
+                tag: wc_core::DeviceTag::parse("-K1").unwrap_or_default(),
+                at: start,
+                width: 40.0,
+                height: 60.0,
+                rotation: wc_core::geom::Rotation::R0,
+            }],
+        });
+        let mut ed = Editor::default();
+        ed.panel = Some(0);
+        ed.view.fit = true;
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let frame = |open: &mut Open, ed: &mut Editor, time: f64, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1000.0, 700.0))),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| show(ui, open, ed, 0, 1.0));
+            });
+        };
+        let device_at_now = |open: &Open| match open.project.panels[0].items.first() {
+            Some(PanelItem::Device { at, .. }) => *at,
+            _ => unreachable!("the device is there"),
+        };
+        frame(&mut open, &mut ed, 0.5, vec![]);
+        let probe = egui::pos2(500.0, 350.0);
+        frame(&mut open, &mut ed, 0.6, vec![egui::Event::PointerMoved(probe)]);
+        let Some(seen) = ed.cursor else {
+            unreachable!("the pointer is over the plate")
+        };
+        let zoom = ed.view.zoom;
+        let on_screen = |m: Point| probe + Vec2::new(((m.x - seen.x) as f32) * zoom, ((m.y - seen.y) as f32) * zoom);
+        let a = on_screen(Point::new(120.0, 130.0));
+        let steps_before = open.undo_steps();
+        frame(&mut open, &mut ed, 1.0, vec![egui::Event::PointerMoved(a)]);
+        let press = egui::Event::PointerButton {
+            pos: a,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&mut open, &mut ed, 1.01, vec![press]);
+        for (k, t) in [(1.0, 1.05), (2.0, 1.1), (3.0, 1.15), (0.0, 1.2)] {
+            let to = on_screen(Point::new(120.0 + 10.0 * k, 130.0));
+            frame(&mut open, &mut ed, t, vec![egui::Event::PointerMoved(to)]);
+        }
+        assert_eq!(device_at_now(&open), start, "dragged back to its start");
+        assert_eq!(open.undo_steps(), steps_before + 1);
+
+        let file = open.dir.join(wc_core::translate::TRANSLATIONS_FILE);
+        let set = open.translations_change(|dir| wc_core::translate::set_translation(dir, "Motor", "nb", "Motor"));
+        assert!(matches!(set, Ok(true)), "{set:?}");
+        assert_eq!(open.undo_steps(), steps_before + 2, "the translation is an undo step");
+        assert_eq!(open.before_last_change(), Some(&open.project));
+
+        let escape = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&mut open, &mut ed, 1.25, vec![escape]);
+        assert!(ed.panel_drag.is_none());
+        assert_eq!(device_at_now(&open), start);
+        assert_eq!(open.undo_steps(), steps_before + 2, "Escape drops no step");
+        assert!(file.exists());
+        // Undo takes back the translation, not the drag.
+        assert!(open.undo());
+        assert!(!file.exists(), "Undo takes the translation back");
+        assert_eq!(open.undo_steps(), steps_before + 1);
     }
 
     #[test]
