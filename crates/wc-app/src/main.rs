@@ -1652,6 +1652,11 @@ impl App {
                     self.ed.view.fit = true;
                 }
             }
+            Action::Delete | Action::Cut if self.ed.dragging() => {
+                // A delete would change the drag's history under it, and Escape could no
+                // longer take the move back (#863).
+                self.ed.message = "Let go of the move first, then delete.".into();
+            }
             Action::Delete => {
                 let sel = std::mem::take(&mut self.ed.selection);
                 open.delete_many(page, &sel);

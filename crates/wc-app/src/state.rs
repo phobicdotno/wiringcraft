@@ -1293,6 +1293,11 @@ impl Open {
         self.drag_offset = Point::new(0.0, 0.0);
     }
 
+    /// Whether the undo step `id` is still in the undo history.
+    pub fn has_undo_step(&self, id: u64) -> bool {
+        self.undo.iter().any(|s| s.id == id)
+    }
+
     /// Take back a move of `items` on page `page` whose checkpoint is the undo step `id`,
     /// keeping the changes recorded after it (a rotate during the move, #863): the items go back
     /// by as far as the drag had moved them, now and in every later undo and redo step (each by

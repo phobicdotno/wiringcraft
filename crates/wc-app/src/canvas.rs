@@ -1550,92 +1550,96 @@ fn select_tool(
     if std::mem::take(&mut ed.cancel_drag) {
         cancel_drag(open, ed);
     }
-    match ed.drag.clone() {
-        Some(Drag::Logo {
-            from,
-            start,
-            size,
-            checkpoint,
-            step,
-        }) if resp.dragged_by(egui::PointerButton::Primary) => {
-            // The raw pointer, like `from`: `ed.cursor` is snapped to the grid, and mixing the
-            // two would jump the logo on the first move.
-            if let Some(cur) = resp.interact_pointer_pos().map(|p| xf.mm(p)) {
-                let (a, b) = logo_dragged(start, size, Point::new(cur.x - from.x, cur.y - from.y));
-                let now = wc_pdf::cover_logo_box(&open.project, page);
-                if now != Some((a, b)) {
-                    let step = if checkpoint {
-                        step
-                    } else {
-                        open.checkpoint();
-                        open.history_count()
-                    };
-                    open.set_logo_place(a, b);
-                    ed.drag = Some(Drag::Logo {
-                        from,
-                        start,
-                        size,
-                        checkpoint: true,
-                        step,
-                    });
-                }
-            }
+    if matches!(ed.drag, Some(Drag::Move { .. })) {
+        // Not cloned like the other drags: a move carries the selection it began with.
+        if resp.dragged_by(egui::PointerButton::Primary)
+            && let Some(cur) = ed.cursor
+        {
+            // Move by whole snap steps so pins stay on the grid.
+            move_drag_to(open, ed, snap(cur, snap_step));
         }
-        Some(Drag::Move { .. }) if resp.dragged_by(egui::PointerButton::Primary) => {
-            if let Some(cur) = ed.cursor {
-                // Move by whole snap steps so pins stay on the grid.
-                move_drag_to(open, ed, snap(cur, snap_step));
-            }
-        }
-        // Also in the frame the button is let go: a last move that comes with the release counts.
-        Some(Drag::BoxSize {
-            id,
-            corner,
-            from,
-            start,
-            size,
-            shift,
-        }) if resp.dragged_by(egui::PointerButton::Primary) || resp.drag_stopped() => {
-            if let Some(cur) = primary_release_pos(&resp.ctx)
-                .or(resp.interact_pointer_pos())
-                .map(|p| xf.mm(p))
-                && let Some(s) = page.symbol(&id)
-            {
-                let d = Point::new(cur.x - from.x, cur.y - from.y);
-                let (now, moved) =
-                    crate::black_box_tool::dragged_box(start, corner, d, s.rotation, s.mirror, snap_step);
-                if now != size || moved != shift {
-                    ed.drag = Some(Drag::BoxSize {
-                        id,
-                        corner,
-                        from,
-                        start,
-                        size: now,
-                        shift: moved,
-                    });
-                }
-            }
-        }
-        Some(Drag::Box { from }) => {
-            if let Some(cur) = resp.interact_pointer_pos().or(resp.hover_pos()).map(|p| xf.mm(p)) {
-                let r = Rect::from_two_pos(xf.s(from), xf.s(cur));
-                painter.rect_filled(r, 0.0, t.selection.gamma_multiply(0.08));
-                painter.rect_stroke(r, 0.0, Stroke::new(1.0_f32, t.selection), egui::StrokeKind::Middle);
-                if resp.drag_stopped() {
-                    let found = ed.layers.keep(open.select_in(ed.page, from, cur));
-                    if shift {
-                        for f in found {
-                            if !ed.is_selected(&f) {
-                                ed.selection.push(f);
-                            }
-                        }
-                    } else {
-                        ed.selection = found;
+    } else {
+        match ed.drag.clone() {
+            Some(Drag::Logo {
+                from,
+                start,
+                size,
+                checkpoint,
+                step,
+            }) if resp.dragged_by(egui::PointerButton::Primary) => {
+                // The raw pointer, like `from`: `ed.cursor` is snapped to the grid, and mixing the
+                // two would jump the logo on the first move.
+                if let Some(cur) = resp.interact_pointer_pos().map(|p| xf.mm(p)) {
+                    let (a, b) = logo_dragged(start, size, Point::new(cur.x - from.x, cur.y - from.y));
+                    let now = wc_pdf::cover_logo_box(&open.project, page);
+                    if now != Some((a, b)) {
+                        let step = if checkpoint {
+                            step
+                        } else {
+                            open.checkpoint();
+                            open.history_count()
+                        };
+                        open.set_logo_place(a, b);
+                        ed.drag = Some(Drag::Logo {
+                            from,
+                            start,
+                            size,
+                            checkpoint: true,
+                            step,
+                        });
                     }
                 }
             }
+            // Also in the frame the button is let go: a last move that comes with the release counts.
+            Some(Drag::BoxSize {
+                id,
+                corner,
+                from,
+                start,
+                size,
+                shift,
+            }) if resp.dragged_by(egui::PointerButton::Primary) || resp.drag_stopped() => {
+                if let Some(cur) = primary_release_pos(&resp.ctx)
+                    .or(resp.interact_pointer_pos())
+                    .map(|p| xf.mm(p))
+                    && let Some(s) = page.symbol(&id)
+                {
+                    let d = Point::new(cur.x - from.x, cur.y - from.y);
+                    let (now, moved) =
+                        crate::black_box_tool::dragged_box(start, corner, d, s.rotation, s.mirror, snap_step);
+                    if now != size || moved != shift {
+                        ed.drag = Some(Drag::BoxSize {
+                            id,
+                            corner,
+                            from,
+                            start,
+                            size: now,
+                            shift: moved,
+                        });
+                    }
+                }
+            }
+            Some(Drag::Box { from }) => {
+                if let Some(cur) = resp.interact_pointer_pos().or(resp.hover_pos()).map(|p| xf.mm(p)) {
+                    let r = Rect::from_two_pos(xf.s(from), xf.s(cur));
+                    painter.rect_filled(r, 0.0, t.selection.gamma_multiply(0.08));
+                    painter.rect_stroke(r, 0.0, Stroke::new(1.0_f32, t.selection), egui::StrokeKind::Middle);
+                    if resp.drag_stopped() {
+                        let found = ed.layers.keep(open.select_in(ed.page, from, cur));
+                        if shift {
+                            for f in found {
+                                if !ed.is_selected(&f) {
+                                    ed.selection.push(f);
+                                }
+                            }
+                        } else {
+                            ed.selection = found;
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
-        _ => {}
     }
     paint_box_sizing(painter, open, ed, page, xf, &t, held);
     if resp.drag_stopped() {
@@ -1877,9 +1881,11 @@ fn move_drag_to(open: &mut Open, ed: &mut Editor, target: Point) {
     else {
         return;
     };
-    if target == from {
+    // Nothing selected moves nothing: the grab point follows the pointer, and the drag keeps
+    // its record for Escape.
+    if target == from || ed.selection.is_empty() {
         ed.drag = Some(Drag::Move {
-            from,
+            from: if target == from { from } else { target },
             checkpoint,
             page,
             step,
@@ -1903,8 +1909,14 @@ fn move_drag_to(open: &mut Open, ed: &mut Editor, target: Point) {
         page,
         step,
         id,
-        items: items.filter(|i| *i == sel),
+        items: items.filter(|i| same_items(i, &sel)),
     });
+}
+
+/// Whether two selections hold the same items, in any order (as [`crate::edit::move_items`]
+/// sees them).
+fn same_items(a: &[Selection], b: &[Selection]) -> bool {
+    a.iter().all(|x| b.contains(x)) && b.iter().all(|x| a.contains(x))
 }
 
 /// The end of a select-tool drag: a finished move wires the moved symbols' pins that now line
@@ -1976,7 +1988,13 @@ fn cancel_drag(open: &mut Open, ed: &mut Editor) {
             // unknown: then nothing is taken back. A selection changed without moving (a right
             // click on another item) still takes the drag's own items back.
         }) => {
-            open.take_back_move(id, &page, &items);
+            // Said only when the move is still there to undo: a move already undone has
+            // nothing to take back.
+            if open.has_undo_step(id) && !open.take_back_move(id, &page, &items) {
+                ed.message = "The move could not be taken back: a drawing or cloud was added or \
+                              deleted during it. Undo goes back step by step."
+                    .into();
+            }
         }
         Some(Drag::Logo {
             checkpoint: true, step, ..
@@ -4926,9 +4944,16 @@ mod tests {
         let at = |o: &Open| o.project.pages[page].symbol(&coil).map(|s| (s.at, s.rotation));
         let own = ed.selection.clone();
         drag(&mut o, &mut ed, Point::new(-40.0, 0.0));
-        // A frame of the drag moves another selection (nothing selected here): the drag forgets
-        // its own selection.
-        ed.selection.clear();
+        // A frame of the drag moves another selection (the contact): the drag forgets its own.
+        let Some(contact) = o.project.pages[page]
+            .symbols
+            .iter()
+            .find(|s| s.id != coil)
+            .map(|s| s.id.clone())
+        else {
+            unreachable!("the contact is on the page")
+        };
+        ed.selection = vec![Selection::Symbol(contact)];
         move_drag_to(&mut o, &mut ed, Point::new(-60.0, 0.0));
         // The first selection comes back and is turned.
         ed.selection = own;
@@ -4939,6 +4964,36 @@ mod tests {
         assert!(ed.drag.is_none());
         assert_eq!(at(&o), now, "nothing is moved back by a part it did not move");
         assert_eq!(o.undo_steps(), steps);
+    }
+
+    #[test]
+    fn escape_after_frames_with_nothing_selected_still_takes_the_move_back() {
+        let (_tmp, mut o, mut ed, coil) = moving_coil();
+        let page = ed.page;
+        let at = |o: &Open| o.project.pages[page].symbol(&coil).map(|s| (s.at, s.rotation));
+        let Some((start, _)) = at(&o) else { unreachable!() };
+        let contact = o.project.pages[page]
+            .symbols
+            .iter()
+            .find(|s| s.id != coil)
+            .map(|s| s.id.clone());
+        let Some(contact) = contact else {
+            unreachable!("the contact is on the page")
+        };
+        ed.selection.push(Selection::Symbol(contact));
+        let own = ed.selection.clone();
+        drag(&mut o, &mut ed, Point::new(-40.0, 0.0));
+        o.rotate_many(page, &ed.selection.clone());
+        let Some((_, turned)) = at(&o) else { unreachable!() };
+        // Nothing selected, and the pointer goes on: nothing moves, the drag keeps its record.
+        ed.selection.clear();
+        move_drag_to(&mut o, &mut ed, Point::new(-60.0, 0.0));
+        // The same items again, in another order of the list, moving on.
+        ed.selection = own.into_iter().rev().collect();
+        move_drag_to(&mut o, &mut ed, Point::new(-70.0, 0.0));
+        cancel_drag(&mut o, &mut ed);
+        assert_eq!(at(&o), Some((start, turned)), "the coil goes back, still turned");
+        assert!(ed.message.is_empty(), "{}", ed.message);
     }
 
     #[test]
