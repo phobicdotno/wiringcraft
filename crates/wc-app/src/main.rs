@@ -597,16 +597,9 @@ impl App {
             .as_ref()
             .and_then(|o| o.project.pages.get(self.ed.page))
             .map(|p| p.id.clone());
-        // The panel shown and its picked device, found again by id and tag after the sync: a
-        // merge replaces whole panels, so their places in the lists can change.
-        let panel_before = self.open.as_ref().and_then(|o| {
-            let p = o.project.panels.get(self.ed.panel?)?;
-            let tag = self.ed.panel_pick.and_then(|i| match p.items.get(i)? {
-                wc_core::panel::PanelItem::Device { tag, .. } => Some(tag.clone()),
-                _ => None,
-            });
-            Some((p.id.clone(), tag))
-        });
+        // The panel shown and its picked item, found again after the sync: a merge replaces
+        // whole panels, so their places in the lists can change.
+        let panel_before = self.open.as_ref().and_then(|o| panel_pick_before(&self.ed, &o.project));
         // The shown page's graphics, so a selection follows its items when a merge moves them.
         let graphics_before = self
             .open
@@ -633,8 +626,8 @@ impl App {
             self.open = Some(joined);
             // The id belonged to the project left behind.
             shown = None;
-        } else if let (Some((id, tag)), Some(o)) = (&panel_before, &self.open) {
-            follow_panel_pick(&mut self.ed, &o.project, id, tag.as_ref());
+        } else if let (Some((id, pick)), Some(o)) = (&panel_before, &self.open) {
+            follow_panel_pick(&mut self.ed, &o.project, id, pick.as_ref());
         }
         // Others may have added or removed pages before this one: keep showing the same page.
         if let (Some(id), Some(o)) = (&shown, &self.open)
@@ -5793,20 +5786,46 @@ fn confirm_page_props(
     o.set_page_props(i, number, title, size, overview, Some(fields))
 }
 
-/// After a shared-session sync: show panel `id` and pick the device `tag` on it again, wherever
-/// they are now; a panel or device that is gone is no longer shown or picked.
-fn follow_panel_pick(ed: &mut Editor, project: &wc_core::Project, id: &str, tag: Option<&wc_core::DeviceTag>) {
+/// The shown panel's id and its picked item with that item's place, kept before a shared-session
+/// sync so `follow_panel_pick` can find them again afterwards.
+fn panel_pick_before(
+    ed: &Editor,
+    project: &wc_core::Project,
+) -> Option<(String, Option<(usize, wc_core::panel::PanelItem)>)> {
+    let p = project.panels.get(ed.panel?)?;
+    let pick = ed.panel_pick.and_then(|i| Some((i, p.items.get(i)?.clone())));
+    Some((p.id.clone(), pick))
+}
+
+/// After a shared-session sync: show panel `id` and pick its item again, wherever they are now.
+/// A device is found by its tag; a rail or duct by its kind and exact place and size, at its old
+/// place in the list when it is still there. A panel or item that is gone is no longer shown or
+/// picked.
+fn follow_panel_pick(
+    ed: &mut Editor,
+    project: &wc_core::Project,
+    id: &str,
+    pick: Option<&(usize, wc_core::panel::PanelItem)>,
+) {
+    use wc_core::panel::PanelItem;
     let Some((pi, panel)) = project.panels.iter().enumerate().find(|(_, p)| p.id == id) else {
         ed.panel = None;
         ed.panel_pick = None;
         return;
     };
     ed.panel = Some(pi);
-    ed.panel_pick = tag.and_then(|tag| {
-        panel
+    ed.panel_pick = pick.and_then(|(old, item)| match item {
+        PanelItem::Device { tag, .. } => panel
             .items
             .iter()
-            .position(|i| matches!(i, wc_core::panel::PanelItem::Device { tag: t, .. } if t == tag))
+            .position(|i| matches!(i, PanelItem::Device { tag: t, .. } if t == tag)),
+        PanelItem::Rail { .. } | PanelItem::Duct { .. } => {
+            if panel.items.get(*old) == Some(item) {
+                Some(*old)
+            } else {
+                panel.items.iter().position(|i| i == item)
+            }
+        }
     });
 }
 
@@ -6836,7 +6855,8 @@ mod held_tests {
         a.items = vec![device("-K2", 30.0), device("-K1", 0.0)];
         project.panels = vec![Panel::new("0", "first", 10.0, 10.0), a];
         let mut ed = Editor::default();
-        let k1 = wc_core::DeviceTag::parse("-K1").ok();
+        // Picked at place 0 before the sync.
+        let k1 = Some((0, device("-K1", 0.0)));
         // Another panel came first and the devices were reordered: still panel "a", still -K1.
         follow_panel_pick(&mut ed, &project, "a", k1.as_ref());
         assert_eq!((ed.panel, ed.panel_pick), (Some(1), Some(1)));
@@ -6847,6 +6867,53 @@ mod held_tests {
         // The panel was removed.
         follow_panel_pick(&mut ed, &project, "gone", k1.as_ref());
         assert_eq!((ed.panel, ed.panel_pick), (None, None));
+    }
+
+    #[test]
+    fn a_picked_rail_or_duct_stays_picked_after_a_sync_and_delete_takes_it() {
+        use wc_core::panel::{Panel, PanelItem};
+        let rail = |y: f64| PanelItem::Rail {
+            at: wc_core::Point::new(20.0, y),
+            length: 560.0,
+        };
+        let duct = PanelItem::Duct {
+            min: wc_core::Point::new(0.0, 0.0),
+            max: wc_core::Point::new(600.0, 60.0),
+        };
+        let (_tmp, mut o) = crate::state::tests::project();
+        let mut panel = Panel::new("panel1", "Panel 1", 600.0, 800.0);
+        panel.items = vec![duct.clone(), rail(150.0), rail(300.0)];
+        o.project.panels.push(panel);
+        let mut ed = Editor::default();
+        ed.panel = Some(0);
+        for picked in [1, 0] {
+            ed.panel_pick = Some(picked);
+            // A sync that changed nothing keeps the pick.
+            let Some((id, pick)) = panel_pick_before(&ed, &o.project) else {
+                unreachable!("a panel is shown")
+            };
+            follow_panel_pick(&mut ed, &o.project, &id, pick.as_ref());
+            assert_eq!((ed.panel, ed.panel_pick), (Some(0), Some(picked)));
+        }
+        // Delete then takes the picked item off in one undo step.
+        let steps = o.undo_steps();
+        let (Some(pi), Some(item)) = (ed.panel, ed.panel_pick.take()) else {
+            unreachable!("the duct is picked")
+        };
+        assert!(o.delete_panel_item(pi, item));
+        assert_eq!(o.undo_steps(), steps + 1);
+        assert_eq!(o.project.panels[0].items, vec![rail(150.0), rail(300.0)]);
+
+        // Another person put a duct first: the same rail is found at its new place.
+        ed.panel_pick = Some(1);
+        let pick = panel_pick_before(&ed, &o.project).and_then(|(_, p)| p);
+        o.project.panels[0].items.insert(0, duct.clone());
+        follow_panel_pick(&mut ed, &o.project, "panel1", pick.as_ref());
+        assert_eq!(ed.panel_pick, Some(2));
+        // The rail was moved or removed by the other person: nothing picked.
+        o.project.panels[0].items[2] = rail(310.0);
+        follow_panel_pick(&mut ed, &o.project, "panel1", pick.as_ref());
+        assert_eq!(ed.panel_pick, None);
     }
 }
 
