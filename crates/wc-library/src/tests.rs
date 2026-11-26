@@ -744,6 +744,27 @@ fn the_starter_functional_earth_is_not_the_protective_earth() -> Result<()> {
 }
 
 #[test]
+fn the_starter_three_phase_transformer_has_primary_and_secondary_terminals() -> Result<()> {
+    // #763: a 3-phase transformer next to the 1-phase control transformer.
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
+    project.meta.libraries = vec![LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: starter.to_string_lossy().into(),
+        reference: None,
+    }];
+    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (t, _) = lib.symbol("wc.transformer.3ph")?;
+    assert_eq!(t.role, SymbolRole::Standalone);
+    assert_eq!(t.letter_code, "T");
+    let names: Vec<_> = t.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["1U", "1V", "1W", "2U", "2V", "2W"]);
+    Ok(())
+}
+
+#[test]
 fn the_starter_fuse_switch_disconnector_has_three_poles_and_its_own_tag() -> Result<()> {
     // The 3-pole fuse switch disconnector (#725): Q in IEC 81346-2 (it switches and isolates;
     // the fuses ride on the switch), pins 1 to 6 like the 3-pole breaker, and an example part.
