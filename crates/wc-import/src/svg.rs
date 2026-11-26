@@ -98,6 +98,27 @@ fn attr(e: &BytesStart, name: &str) -> Option<String> {
         .map(|v| v.into_owned())
 }
 
+/// A presentation value such as `fill`: a property of the same name in `style` wins over the
+/// attribute (`style="fill:#000"` over `fill="none"`).
+fn presentation(e: &BytesStart, name: &str) -> Option<String> {
+    attr(e, "style")
+        .and_then(|st| {
+            st.split(';').rev().find_map(|decl| {
+                let (k, v) = decl.split_once(':')?;
+                k.trim().eq_ignore_ascii_case(name).then(|| v.trim().to_owned())
+            })
+        })
+        .or_else(|| attr(e, name))
+}
+
+/// Whether a fill paints the shape: set, and not `none`, `transparent` or white.
+fn paints(fill: Option<&str>) -> bool {
+    fill.is_some_and(|f| {
+        let f = f.trim().to_ascii_lowercase();
+        !matches!(f.as_str(), "" | "none" | "transparent" | "white" | "#fff" | "#ffffff")
+    })
+}
+
 fn num(e: &BytesStart, name: &str) -> f64 {
     attr(e, name).and_then(|v| numbers(&v).first().copied()).unwrap_or(0.0)
 }
@@ -437,6 +458,8 @@ impl Arc {
 pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
     let mut reader = Reader::from_str(text);
     let mut stack: Vec<M> = vec![M::ID];
+    // The fill each open element passes to its children, kept in step with `stack`.
+    let mut fills: Vec<Option<String>> = vec![None];
     let mut shapes = Vec::new();
     let mut pins: Vec<(Option<String>, Point)> = Vec::new();
     let mut pending_text: Option<(Point, f64, Align)> = None;
@@ -454,6 +477,7 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                 }
                 if stack.len() > 1 {
                     stack.pop();
+                    fills.pop();
                 }
                 (None, false)
             }
@@ -491,6 +515,8 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
         let mut m = attr(&e, "transform")
             .map(|t| parent.mul(&parse_transform(&t)))
             .unwrap_or(parent);
+        let fill = presentation(&e, "fill").or_else(|| fills.last().cloned().flatten());
+        let filled = paints(fill.as_deref());
         let tag = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
         if tag == "svg" && !seen_root {
             seen_root = true;
@@ -523,7 +549,7 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                 Some(Shape::Polyline {
                     points: vec![m.p(x, y), m.p(x + w, y), m.p(x + w, y + h), m.p(x, y + h)],
                     closed: true,
-                    filled: false,
+                    filled,
                 })
             }
             "circle" | "ellipse" => {
@@ -532,9 +558,6 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                 } else {
                     (num(&e, "rx") + num(&e, "ry")) / 2.0
                 };
-                let filled = attr(&e, "fill").is_some_and(|f| {
-                    f != "none" && f != "transparent" && f != "white" && f != "#fff" && f != "#ffffff"
-                });
                 Some(Shape::Circle {
                     center: m.p(num(&e, "cx"), num(&e, "cy")),
                     radius: r * sc,
@@ -544,10 +567,12 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
             "polyline" | "polygon" => {
                 let v = numbers(&attr(&e, "points").unwrap_or_default());
                 let pts: Vec<Point> = v.as_chunks::<2>().0.iter().map(|p| m.p(p[0], p[1])).collect();
+                // A filled polyline is closed, as SVG fills it; two points stay a plain line.
+                let filled = filled && pts.len() >= 3;
                 (pts.len() >= 2).then(|| Shape::Polyline {
                     points: pts,
-                    closed: tag == "polygon",
-                    filled: false,
+                    closed: tag == "polygon" || filled,
+                    filled,
                 })
             }
             "path" => {
@@ -556,10 +581,11 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                 for (pts, closed) in parts {
                     first.get_or_insert(pts[0]);
                     if pin_name.is_none() {
+                        // Only a closed sub-path is filled; an open one stays a line.
                         shapes.push(Shape::Polyline {
                             points: pts,
                             closed,
-                            filled: false,
+                            filled: filled && closed,
                         });
                     }
                 }
@@ -602,6 +628,7 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
         }
         if !empty {
             stack.push(m);
+            fills.push(fill);
         }
     }
     if !seen_root {
@@ -731,6 +758,53 @@ mod tests {
                 (50.0, 1.0, false),
                 (60.0, 1.0, false),
                 (70.0, 1.0, true),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fills_from_attribute_style_and_group() -> Result<()> {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg">
+            <circle id="pin:1" cx="0" cy="0" r="0.5"/>
+            <polygon points="0 0 4 0 2 3" fill="black"/>
+            <path style="fill:#000" d="M0 0 L4 0 L2 3 Z"/>
+            <rect x="0" y="0" width="4" height="2" fill="none"/>
+            <rect x="0" y="0" width="4" height="2" style="stroke:red; fill:none" fill="black"/>
+            <polygon points="0 0 4 0 2 3" fill="#FFFFFF"/>
+            <circle cx="10" cy="0" r="1" style="fill:black"/>
+            <polyline points="0,0 4,0 2,3" fill="red"/>
+            <polyline points="0,0 4,0" fill="red"/>
+            <path fill="black" d="M0 0 L4 0 L2 3"/>
+            <g style="fill:#000000"><rect x="0" y="0" width="1" height="1"/></g>
+            <g fill="black"><rect x="0" y="0" width="1" height="1" fill="none"/></g>
+            <rect x="0" y="0" width="1" height="1"/>
+        </svg>"##;
+        let s = symbol(svg, "svg.fill", "Fill")?;
+        let got: Vec<(bool, bool)> = s
+            .graphics
+            .iter()
+            .map(|g| match g {
+                Shape::Polyline { closed, filled, .. } => (*closed, *filled),
+                Shape::Circle { filled, .. } => (true, *filled),
+                _ => (false, false),
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (true, true),   // polygon fill="black"
+                (true, true),   // closed path, fill in style
+                (true, false),  // rect fill="none"
+                (true, false),  // style fill:none wins over fill="black"
+                (true, false),  // white polygon, any case
+                (true, true),   // circle, fill in style
+                (true, true),   // filled 3-point polyline is closed
+                (false, false), // 2-point polyline stays a line
+                (false, false), // open path stays a line
+                (true, true),   // fill from the parent group
+                (true, false),  // own fill="none" wins over the group
+                (true, false),  // no fill after the groups close
             ]
         );
         Ok(())
