@@ -1,4 +1,7 @@
 {
+  "contacts": {
+    "nc": 1
+  },
   "description": "Emergency stop mushroom button red, latching, 1 NC (example data)",
   "id": "example.ex-es-red-nc",
   "manufacturer": "Example",

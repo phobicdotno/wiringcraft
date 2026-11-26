@@ -1,4 +1,7 @@
 {
+  "contacts": {
+    "no": 1
+  },
   "description": "Selector switch 2 positions, maintained, 1 NO (example data)",
   "id": "example.ex-ss-2p-no",
   "manufacturer": "Example",
