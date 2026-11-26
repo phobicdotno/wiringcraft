@@ -3170,6 +3170,8 @@ impl Open {
         // changed since is left as it is and named; the others are put back all the same, so
         // no file of the change stays behind unnamed.
         let mut errors: Vec<String> = self.write_back(&edits).err().into_iter().collect();
+        // The symbol versions the change pinned: the files it wrote hold those.
+        let pinned_by_change = self.project.lock.symbols.clone();
         self.put_back(mark.kept);
         if !self.unwritten_files.is_empty() {
             // A file still to be written is unsaved work, whatever the history put back says.
@@ -3178,15 +3180,34 @@ impl Open {
         // Symbols the change loaded are let go and those it replaced are put back, with the
         // symbol list as it was. One put back that is the version the project pins again (a
         // box edit taken back, say) is written to its file by the next save, as its file may
-        // hold the replaced version: that is unsaved work.
+        // hold the replaced version: that is unsaved work. Only a version the change pinned
+        // is taken for one it wrote: one another program wrote and that was read in meanwhile
+        // is left in its file.
         let pin = |o: &Self, id: &str| o.project.lock.symbols.get(id).map(|e| e.hash.clone());
         for (id, was) in &mark.symbols {
-            let replaced = self.symbols.get(id).is_some_and(|now| now.hash() != was.hash());
-            if replaced && pin(self, id) == Some(was.hash()) {
+            let replaced = self.symbols.get(id).filter(|now| now.hash() != was.hash());
+            let written = replaced.is_some_and(|now| pinned_by_change.get(id).is_some_and(|e| e.hash == now.hash()));
+            if written && pin(self, id) == Some(was.hash()) {
                 self.stale_symbol_files.insert(id.clone());
                 self.edited();
             }
         }
+        // A file waiting for the pinned version that is now loaded, where the symbol put back
+        // is another version (a box edit taken back inside a change that is taken back too):
+        // the next save writes that pinned version to the file all the same.
+        let mut pinned_files: Unwritten = Vec::new();
+        for id in &self.stale_symbol_files {
+            let (Some(now), Some(was)) = (self.symbols.get(id), mark.symbols.get(id)) else {
+                continue;
+            };
+            if now.hash() != was.hash()
+                && pin(self, id) == Some(now.hash())
+                && let (Ok(path), Ok(json)) = (store::vendor_path(&self.dir, ItemKind::Symbol, id), store::to_json(now))
+            {
+                pinned_files.push((path, Some(json.into_bytes())));
+            }
+        }
+        self.keep_unwritten(pinned_files, true);
         self.symbols = mark.symbols;
         self.library = mark.library;
         // A file waiting to be written (from a change taken back inside this one, say) is let
@@ -3201,6 +3222,11 @@ impl Open {
                     .is_some_and(|s| pin(self, id).is_none_or(|h| h == s.hash()))
             })
             .collect();
+        if !self.stale_symbol_files.is_empty() {
+            // A file still to be written back is unsaved work, also after a change taken back
+            // inside this one queued it.
+            self.edited();
+        }
         self.parts.retain(|id, _| mark.parts.contains(id));
         let (before, now) = match (mark.files, vendor_names(&self.dir)) {
             (Ok(before), Ok(now)) => (before, now),
@@ -6613,12 +6639,47 @@ pub(crate) mod tests {
         o.back_to(outer).unwrap();
         assert_eq!(o.symbols[&symbol_id], other, "the symbol loaded at the mark is back");
         assert_eq!(o.library, listed, "and so is its list row");
+        assert!(o.dirty, "the box file still holds the refused edit");
         o.save().unwrap();
-        assert_ne!(
+        assert_eq!(
             store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(),
-            other,
-            "a version the project does not pin is not written"
+            pinned,
+            "the file holds the version the project pins, not the refused edit or the loaded one"
         );
+    }
+
+    #[test]
+    fn a_box_edit_refused_inside_a_refused_change_is_unsaved_work() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let old = o.symbols[&symbol_id].clone();
+        let outer = o.mark();
+        let inner = o.mark();
+        widen_box(&mut o, &id);
+        o.back_to(inner).unwrap();
+        o.back_to(outer).unwrap();
+        assert!(o.dirty, "the box file still holds the refused edit");
+        o.save().unwrap();
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), old);
+    }
+
+    #[test]
+    fn a_symbol_file_another_program_wrote_during_a_refused_change_is_left_as_it_is() {
+        let (_tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let old = o.symbols["wc.coil"].clone();
+        o.save().unwrap();
+        let m = o.mark();
+        // Another program writes another version, which the change reads in.
+        let mut other = old.clone();
+        other.name = "Coil, changed".into();
+        store::write_vendored_symbol(&o.dir, &other).unwrap();
+        o.reload_symbols();
+        assert_eq!(o.symbols["wc.coil"], other);
+        o.back_to(m).unwrap();
+        assert_eq!(o.symbols["wc.coil"], old);
+        assert!(!o.stale_symbol_files.contains("wc.coil"));
+        o.save().unwrap();
+        assert_eq!(store::read_vendored_symbol(&o.dir, "wc.coil").unwrap(), other);
     }
 
     #[test]
