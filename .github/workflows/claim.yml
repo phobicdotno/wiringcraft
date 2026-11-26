@@ -18,7 +18,11 @@ on:
 permissions:
   contents: read
   issues: write
-  pull-requests: read # to list open pull requests
+  # To list open pull requests and to post the bot's notes on them ("add an Agent: line", "#N is
+  # locked by ..."). Safe with pull_request_target here: the checkout below takes only
+  # .github/scripts from the base branch, and no step checks out or runs a pull request's code.
+  # Keep it that way if this job ever changes.
+  pull-requests: write
 
 # One queue for every run in the repository: commands, pull requests and the sweep can all change
 # the same issue, so they never run at the same time. GitHub keeps only one waiting run and cancels
