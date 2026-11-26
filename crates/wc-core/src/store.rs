@@ -14,7 +14,10 @@
 //!
 //! Every file is written deterministically (sorted keys, fixed indentation, trailing newline),
 //! atomically (temporary file, then rename) and only when its content changed, so version
-//! control shows real changes only and a crash never leaves a half-written file.
+//! control shows real changes only and a crash never leaves a half-written file. A write counts
+//! as done only once it would last through a power loss: the new bytes are synced before the
+//! rename, and the folder is synced after it (see [`replace_whole`]). A folder whose sync failed
+//! stays owed until a later write or save in the same place gets it synced.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -43,7 +46,9 @@ pub const COMMENTS_SUFFIX: &str = ".comments.json";
 /// `wiringcraft` command in the project puts the files back from it.
 pub const BOX_EDIT_JOURNAL: &str = ".box-edit.journal";
 
-/// Ids become file names, so they are restricted to a portable set.
+/// Ids become file names, so they are restricted to a portable set. A name Windows keeps for a
+/// device (`con`, `nul`, `aux`, `com1`, ...) is refused too, whatever follows it after a dot:
+/// Windows opens the device instead of the file.
 pub fn check_id(id: &str) -> Result<()> {
     let ok = !id.is_empty()
         && id.len() <= 128
@@ -51,12 +56,28 @@ pub fn check_id(id: &str) -> Result<()> {
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-    if ok {
-        Ok(())
-    } else {
-        Err(Error::Invalid(format!(
+    if !ok {
+        return Err(Error::Invalid(format!(
             "id {id:?} must be 1-128 of A-Z a-z 0-9 . _ - and not start with '.'"
-        )))
+        )));
+    }
+    let stem = id.split('.').next().unwrap_or(id);
+    if is_windows_device_name(stem) {
+        return Err(Error::Invalid(format!(
+            "id {id:?} starts with {stem:?}, a name Windows keeps for a device: its file could not be opened there"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `name` is one Windows keeps for a device: `CON`, `PRN`, `AUX`, `NUL`, `COM0`-`COM9`
+/// or `LPT0`-`LPT9`, in any case.
+fn is_windows_device_name(name: &str) -> bool {
+    let n = name.to_ascii_uppercase();
+    match n.as_bytes() {
+        [_, _, _] => matches!(n.as_str(), "CON" | "PRN" | "AUX" | "NUL"),
+        [a, b, c, d] => matches!(&[*a, *b, *c], b"COM" | b"LPT") && d.is_ascii_digit(),
+        _ => false,
     }
 }
 
@@ -98,23 +119,232 @@ fn to_toml<T: Serialize>(value: &T, path: &Path) -> Result<String> {
 }
 
 /// Write `content` to `path` atomically, skipping the write when the file already holds it.
-/// Returns whether the file changed.
+/// Returns whether the file changed. A changed file is on disk when this returns (see
+/// [`replace_whole`]), and so is every folder this call had to make for it.
+///
+/// A folder sync that failed in an earlier write to this place is tried again here, also when
+/// the file already holds `content`: `Ok` means nothing is owed any more.
 pub fn write_if_changed(path: &Path, content: &str) -> Result<bool> {
+    let mut folders = Folders::new();
+    let changed = stage_if_changed(path, content, &mut folders);
+    add_owed(&folder_of(path), &mut folders);
+    synced(changed, &folders)
+}
+
+/// The folders whose entries changed (a file renamed into place or removed, a folder made) and
+/// that are not synced yet. A save that writes many files into one folder syncs it once, at the
+/// end, instead of once per file.
+type Folders = std::collections::BTreeSet<PathBuf>;
+
+/// [`write_if_changed`] without the folder sync: the folders to sync are added to `folders`,
+/// for the caller to pass to [`synced`] once all its files are in place.
+fn stage_if_changed(path: &Path, content: &str, folders: &mut Folders) -> Result<bool> {
     if fs::read_to_string(path).is_ok_and(|old| old == content) {
         return Ok(false);
     }
     if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
+        // A folder made here is a new entry in the folder above it.
+        let made: Vec<&Path> = dir
+            .ancestors()
+            .take_while(|a| !a.as_os_str().is_empty() && !a.exists())
+            .collect();
+        let created = fs::create_dir_all(dir).map_err(|e| Error::io(dir, e));
+        folders.extend(made.into_iter().filter(|m| m.exists()).map(folder_of));
+        created?;
     }
-    replace_whole(path, content.as_bytes())?;
+    rename_staged(path, content.as_bytes())?;
+    folders.insert(folder_of(path));
     Ok(true)
+}
+
+/// The folder that holds the entry for `path`.
+fn folder_of(path: &Path) -> PathBuf {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.to_owned(),
+        _ => PathBuf::from("."),
+    }
+}
+
+/// Sync `folders`, then hand back `result`. The folders are synced after a failure too, so the
+/// files that did get into place before it are on disk; the failure is what is reported then.
+/// A folder whose sync failed is owed from then on (see [`OWED`]), one that got synced is not.
+fn synced<T>(result: Result<T>, folders: &Folders) -> Result<T> {
+    let mut outcome = Ok(());
+    for dir in folders {
+        // A debt another thread notes for this folder while it is being synced is from a rename
+        // this sync may not cover: only debts noted before the sync are paid by it.
+        let before = OWED_NOTED.load(std::sync::atomic::Ordering::SeqCst);
+        let raw = sync_folder(dir);
+        // A folder that is not there has no entries left to keep.
+        let gone = raw.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+        let one = folder_synced(dir, raw);
+        settle(dir, one.is_err() && !gone, before);
+        if outcome.is_ok() {
+            outcome = one;
+        }
+    }
+    let value = result?;
+    outcome?;
+    Ok(value)
+}
+
+/// The folders whose sync failed and was reported, by resolved path, each with the path it was
+/// synced under. The write that reported the failure left its files in place, so a second try
+/// finds nothing to write and would sync nothing: this list is what makes it sync the folder
+/// after all. An entry leaves the list when its folder gets synced, or is gone.
+///
+/// It is empty unless a folder sync failed, and then a write costs one look at it and no sync.
+/// It lasts as long as the process: a failure the process did not get to try again was reported
+/// as a failed write, and is not known to the next process.
+static OWED: std::sync::Mutex<BTreeMap<PathBuf, Debt>> = std::sync::Mutex::new(BTreeMap::new());
+
+/// How many debts were noted so far; each debt keeps the count it was noted at.
+static OWED_NOTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A folder owed a sync: the path it was synced under, and when it was noted ([`OWED_NOTED`]).
+struct Debt {
+    spelled: PathBuf,
+    noted: u64,
+}
+
+fn owed() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, Debt>> {
+    OWED.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `dir` as a full path, as it is spelled (links not followed).
+fn spelled(dir: &Path) -> PathBuf {
+    std::path::absolute(dir).unwrap_or_else(|_| dir.to_owned())
+}
+
+/// `dir` as a full path with its links followed, so one folder has one name in [`OWED`].
+fn resolved(dir: &Path) -> PathBuf {
+    dir.canonicalize().unwrap_or_else(|_| spelled(dir))
+}
+
+/// Note whether the folder `dir` is owed a sync after an attempt that began when `before` debts
+/// had been noted. A sync that went through pays only a debt noted before it began.
+fn settle(dir: &Path, failed: bool, before: u64) {
+    let mut owed = owed();
+    if failed {
+        let noted = OWED_NOTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        owed.insert(
+            resolved(dir),
+            Debt {
+                spelled: spelled(dir),
+                noted,
+            },
+        );
+    } else if !owed.is_empty() {
+        let key = resolved(dir);
+        if owed.get(&key).is_some_and(|d| d.noted <= before) {
+            owed.remove(&key);
+        }
+    }
+}
+
+/// Add to `folders` the folders owed a sync around `at`: `at` itself, the folders it lies in (a
+/// folder made for a write is an entry in the one above it) and the folders inside it (a save of
+/// a project folder covers its page folders).
+fn add_owed(at: &Path, folders: &mut Folders) {
+    let mut owed = owed();
+    if owed.is_empty() {
+        return;
+    }
+    owed.retain(|dir, _| dir.exists());
+    let (real, given) = (resolved(at), spelled(at));
+    let listed: Vec<PathBuf> = folders.iter().map(|f| resolved(f)).collect();
+    let near = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
+    for (dir, debt) in owed.iter() {
+        if (near(dir, &real) || near(&debt.spelled, &given)) && !listed.contains(dir) {
+            folders.insert(dir.clone());
+        }
+    }
+}
+
+/// What a sync is of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Synced {
+    /// A staging file, before it gets its name.
+    File,
+    /// A folder, after its entries changed.
+    Folder,
+}
+
+/// Sync the staging `file` at `path`.
+fn sync_file(file: &fs::File, path: &Path) -> std::io::Result<()> {
+    watched(Synced::File, path)?;
+    file.sync_all()
+}
+
+/// [`sync_dir`] for the write path.
+fn sync_folder(dir: &Path) -> std::io::Result<()> {
+    watched(Synced::Folder, dir)?;
+    sync_dir(dir)
+}
+
+/// Every sync of the write path passes here first. Outside tests this does nothing.
+#[cfg(not(test))]
+fn watched(_what: Synced, _path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// What a test put in the way of the syncs its thread makes (see [`watched`]).
+#[cfg(test)]
+type SyncWatch = Box<dyn FnMut(Synced, &Path) -> std::io::Result<()>>;
+
+#[cfg(test)]
+thread_local! {
+    static SYNC_WATCH: std::cell::RefCell<Option<SyncWatch>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Every sync of the write path passes here first. A test sees each one through
+/// [`SYNC_WATCH`], and can fail it: the error it gives is the outcome of the sync.
+#[cfg(test)]
+fn watched(what: Synced, path: &Path) -> std::io::Result<()> {
+    SYNC_WATCH.with(|watch| match watch.borrow_mut().as_mut() {
+        Some(tell) => tell(what, path),
+        None => Ok(()),
+    })
+}
+
+/// Make the renames and removals in `dir` last on disk where the system allows it (Unix);
+/// elsewhere the rename itself is what the system keeps.
+pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    fs::File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+/// What the `outcome` of syncing the folder `dir` means for a write. A folder that cannot be
+/// synced here (some file systems answer that the call is not supported or not valid for a
+/// folder, and a folder that may be written to but not read cannot be opened for it) does not
+/// fail the write: the file itself is synced and in place. Any other failure does.
+fn folder_synced(dir: &Path, outcome: std::io::Result<()>) -> Result<()> {
+    use std::io::ErrorKind::{InvalidInput, PermissionDenied, Unsupported};
+    match outcome {
+        Err(e) if !matches!(e.kind(), InvalidInput | PermissionDenied | Unsupported) => Err(Error::io(dir, e)),
+        _ => Ok(()),
+    }
 }
 
 /// Replace the file at `path` with `bytes` as a whole: staged next to it in `<file>.tmp`, then
 /// renamed over it, so a failed write leaves the file as it was rather than cut short. The
 /// staging file is one this call creates itself (opened with `create_new`): a link left at that
 /// path is never written through. The folder must exist.
+///
+/// The write is on disk when this returns: the staged bytes are synced before the rename, so the
+/// new name never points at bytes a power loss can drop, and the folder is synced after it
+/// (Unix; elsewhere the rename is what the system keeps). A failed sync of the bytes fails the
+/// write and leaves the file as it was. A folder that cannot be synced does not fail it.
 pub fn replace_whole(path: &Path, bytes: &[u8]) -> Result<()> {
+    rename_staged(path, bytes)?;
+    synced(Ok(()), &Folders::from([folder_of(path)]))
+}
+
+/// [`replace_whole`] without the folder sync.
+fn rename_staged(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
@@ -136,7 +366,8 @@ pub fn replace_whole(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Write `content` to a staging file at `tmp` that this call creates itself.
+/// Write `content` to a staging file at `tmp` that this call creates itself, and sync it, so the
+/// bytes are on disk before the file gets its real name.
 ///
 /// The file is opened with `create_new`, which never follows a link: a symbolic link left at
 /// `tmp` by something else in the project folder is removed (the link, not its target), and a
@@ -151,7 +382,8 @@ fn write_staging(tmp: &Path, content: &[u8]) -> std::io::Result<()> {
         fs::remove_file(tmp)?;
     }
     let mut file = fs::OpenOptions::new().write(true).create_new(true).open(tmp)?;
-    file.write_all(content)
+    file.write_all(content)?;
+    sync_file(&file, tmp)
 }
 
 /// Load a whole project folder.
@@ -262,7 +494,8 @@ pub fn load(dir: &Path) -> Result<Project> {
 
 /// Write only the project's `library.lock`; true when it changed. For a change that pins new
 /// items: written before the files that use them, a failed save leaves a pin nothing uses yet
-/// (harmless, and the next try finds it), never a use without its pin.
+/// (harmless, and the next try finds it), never a use without its pin. A changed lock is on disk
+/// when this returns.
 pub fn save_lock(dir: &Path, project: &Project) -> Result<bool> {
     let path = dir.join(LOCK_FILE);
     write_if_changed(&path, &to_toml(&project.lock, &path)?)
@@ -271,39 +504,69 @@ pub fn save_lock(dir: &Path, project: &Project) -> Result<bool> {
 /// Save a project folder. Page files of deleted pages are removed. Returns the files written.
 ///
 /// Ids that differ only in case are refused before anything is written: on a folder that ignores
-/// case (macOS and Windows by default) they would be one file.
+/// case (macOS and Windows by default) they would be one file. A page or panel id that cannot be
+/// a file name ([`check_id`]) is refused before anything is written too.
+///
+/// Every file written is synced, and each folder the save changed (a file written or removed
+/// in it) is synced once at the end, so the whole save is on disk when this returns. Files that
+/// did not change cost no sync. A folder sync that failed in an earlier save of this folder is
+/// tried again here, also when no file changed: `Ok` means nothing is owed any more.
 pub fn save(dir: &Path, project: &Project) -> Result<Vec<PathBuf>> {
+    for id in project
+        .pages
+        .iter()
+        .map(|p| &p.id)
+        .chain(project.panels.iter().map(|p| &p.id))
+    {
+        check_id(id)?;
+    }
     unique_ignoring_case("page", project.pages.iter().map(|p| p.id.as_str()))?;
     unique_ignoring_case("panel", project.panels.iter().map(|p| p.id.as_str()))?;
+    let mut folders = Folders::new();
+    let written = save_files(dir, project, &mut folders);
+    add_owed(dir, &mut folders);
+    synced(written, &folders)
+}
+
+/// [`save`] without the folder syncs: the folders it changed are added to `folders`.
+fn save_files(dir: &Path, project: &Project, folders: &mut Folders) -> Result<Vec<PathBuf>> {
     let mut written = Vec::new();
-    let mut put = |path: PathBuf, content: String| -> Result<()> {
-        if write_if_changed(&path, &content)? {
+    let mut put = |path: PathBuf, content: String, folders: &mut Folders| -> Result<()> {
+        if stage_if_changed(&path, &content, folders)? {
             written.push(path);
         }
         Ok(())
     };
-    put(dir.join(PROJECT_FILE), to_toml(&project.meta, &dir.join(PROJECT_FILE))?)?;
-    put(dir.join(DEVICES_FILE), to_json(&project.devices)?)?;
-    put(dir.join(LOCK_FILE), to_toml(&project.lock, &dir.join(LOCK_FILE))?)?;
+    put(
+        dir.join(PROJECT_FILE),
+        to_toml(&project.meta, &dir.join(PROJECT_FILE))?,
+        folders,
+    )?;
+    put(dir.join(DEVICES_FILE), to_json(&project.devices)?, folders)?;
+    put(
+        dir.join(LOCK_FILE),
+        to_toml(&project.lock, &dir.join(LOCK_FILE))?,
+        folders,
+    )?;
 
     let pages_dir = dir.join(PAGES_DIR);
     let mut keep = std::collections::BTreeSet::new();
     for page in &project.pages {
         check_id(&page.id)?;
         let name = format!("{}{PAGE_SUFFIX}", page.id);
-        put(pages_dir.join(&name), to_json(page)?)?;
+        put(pages_dir.join(&name), to_json(page)?, folders)?;
         keep.insert(name);
     }
-    clean_up(&pages_dir, &keep, PAGE_SUFFIX)?;
+    clean_up(&pages_dir, &keep, PAGE_SUFFIX, folders)?;
     let panels_dir = dir.join(PANELS_DIR);
     let mut keep = std::collections::BTreeSet::new();
     for panel in &project.panels {
         check_id(&panel.id)?;
         let name = format!("{}{PANEL_SUFFIX}", panel.id);
-        put(panels_dir.join(&name), to_json(panel)?)?;
+        put(panels_dir.join(&name), to_json(panel)?, folders)?;
         keep.insert(name);
     }
-    clean_up(&panels_dir, &keep, PANEL_SUFFIX)?;
+    clean_up(&panels_dir, &keep, PANEL_SUFFIX, folders)?;
     let comments_dir = dir.join(COMMENTS_DIR);
     let mut by_page: BTreeMap<&str, Vec<&crate::review::Comment>> = BTreeMap::new();
     // Comments on a page that was deleted go with it.
@@ -314,18 +577,18 @@ pub fn save(dir: &Path, project: &Project) -> Result<Vec<PathBuf>> {
     for (page, list) in &by_page {
         check_id(page)?;
         let name = format!("{page}{COMMENTS_SUFFIX}");
-        put(comments_dir.join(&name), to_json(list)?)?;
+        put(comments_dir.join(&name), to_json(list)?, folders)?;
         keep.insert(name);
     }
-    clean_up(&comments_dir, &keep, COMMENTS_SUFFIX)?;
-    remove_unused_box_symbols(dir, project)?;
+    clean_up(&comments_dir, &keep, COMMENTS_SUFFIX, folders)?;
+    remove_unused_box_symbols(dir, project, folders)?;
     Ok(written)
 }
 
 /// Remove the files of black box symbols (`box.<page>.<id>`, the project's own symbols for the
 /// boxes drawn on its pages) that no page places and the lock does not pin: left behind by a box
 /// that was undone, or drawn and never saved. Other vendored symbols are left alone.
-fn remove_unused_box_symbols(dir: &Path, project: &Project) -> Result<()> {
+fn remove_unused_box_symbols(dir: &Path, project: &Project, folders: &mut Folders) -> Result<()> {
     let folder = dir.join(VENDOR_DIR).join(ItemKind::Symbol.dir());
     let Some(resolved) = box_symbol_folder(dir)? else {
         return Ok(());
@@ -381,7 +644,9 @@ fn remove_unused_box_symbols(dir: &Path, project: &Project) -> Result<()> {
             Err(e) => return Err(Error::io(&path, e)),
         }
         match fs::remove_file(&path) {
-            Ok(()) => {}
+            Ok(()) => {
+                folders.insert(resolved.clone());
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(Error::io(&path, e)),
         }
@@ -483,13 +748,13 @@ fn tidy(listed: &[String], keep: &std::collections::BTreeSet<String>, suffix: &s
 }
 
 /// Remove the files in `dir` ending in `suffix` that the save did not write (see [`tidy`]).
-fn clean_up(dir: &Path, keep: &std::collections::BTreeSet<String>, suffix: &str) -> Result<()> {
+fn clean_up(dir: &Path, keep: &std::collections::BTreeSet<String>, suffix: &str, folders: &mut Folders) -> Result<()> {
     if !dir.exists() {
         return Ok(());
     }
     let entries = fs::read_dir(dir).map_err(|e| Error::io(dir, e))?;
     let names = entries.map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()));
-    clean_up_listed(dir, names, keep, suffix)
+    clean_up_listed(dir, names, keep, suffix, folders)
 }
 
 /// [`clean_up`] on the names a listing of `dir` gave.
@@ -498,12 +763,15 @@ fn clean_up_listed(
     names: impl Iterator<Item = std::io::Result<String>>,
     keep: &std::collections::BTreeSet<String>,
     suffix: &str,
+    folders: &mut Folders,
 ) -> Result<()> {
     // A listing cut short would look like a folder without the file just written: stop instead.
     let listed = names
         .collect::<std::io::Result<Vec<String>>>()
         .map_err(|e| Error::io(dir, e))?;
     for step in tidy(&listed, keep, suffix) {
+        // Each step changes the folder's entries, so the folder is synced with the save.
+        folders.insert(dir.to_owned());
         match step {
             Tidy::Remove(name) => {
                 let path = dir.join(name);
@@ -855,7 +1123,7 @@ mod tests {
             Ok("gone.page.json".to_string()),
             Err(std::io::Error::other("listing cut short")),
         ];
-        let out = clean_up_listed(dir.path(), listing.into_iter(), &keep, PAGE_SUFFIX);
+        let out = clean_up_listed(dir.path(), listing.into_iter(), &keep, PAGE_SUFFIX, &mut Folders::new());
         assert!(out.is_err_and(|e| e.to_string().contains("listing cut short")));
         let mut left = names(&[]);
         for entry in fs::read_dir(dir.path()).map_err(|e| Error::io("tmp", e))? {
@@ -924,6 +1192,23 @@ mod tests {
     }
 
     #[test]
+    fn a_bad_page_or_panel_id_is_refused_before_anything_is_written() -> Result<()> {
+        for bad_page in [true, false] {
+            let dir = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
+            let mut p = sample()?;
+            if bad_page {
+                p.pages[0].id = "nul".into();
+            } else {
+                p.panels[0].id = "../x".into();
+            }
+            refused(save(dir.path(), &p))?;
+            let left = fs::read_dir(dir.path()).map_err(|e| Error::io(dir.path(), e))?.count();
+            assert_eq!(left, 0, "the folder stays empty (bad page id: {bad_page})");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn deleted_pages_lose_their_file() -> Result<()> {
         let dir = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
         let mut p = sample()?;
@@ -973,6 +1258,16 @@ mod tests {
         }
         assert!(check_id("wc.contact-no_1").is_ok());
     }
+
+    #[test]
+    fn windows_device_names_are_refused() {
+        for bad in ["con", "NUL", "Aux.page", "prn", "com1", "COM0", "lpt9.x.y"] {
+            assert!(check_id(bad).is_err(), "{bad}");
+        }
+        for good in ["console", "com10", "aux1", "acme.aux", "nul_", "com", "lptx"] {
+            assert!(check_id(good).is_ok(), "{good}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1014,6 +1309,162 @@ mod staging_tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "{}\n");
     }
 
+    /// Every file under `dir`, named from it, in order.
+    fn files_under(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut todo = vec![dir.to_owned()];
+        while let Some(folder) = todo.pop() {
+            for entry in fs::read_dir(&folder).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    todo.push(path);
+                } else {
+                    out.push(path.strip_prefix(dir).unwrap().to_owned());
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn a_save_leaves_no_staging_file_and_replaces_each_file_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = Project::new("Demo");
+        for i in 0..5 {
+            p.pages.push(Page::new(
+                format!("p{i:04}"),
+                i.to_string(),
+                "A long page title that the second save cuts short",
+            ));
+        }
+        save(dir.path(), &p).unwrap();
+        for page in &mut p.pages {
+            page.title = "T".into();
+        }
+        p.pages.pop();
+        let written = save(dir.path(), &p).unwrap();
+
+        assert_eq!(written.len(), 4, "{written:?}");
+        let files = files_under(dir.path());
+        assert!(
+            files.iter().all(|f| f.extension().is_none_or(|x| x != "tmp")),
+            "a staging file is left: {files:?}"
+        );
+        assert_eq!(files.iter().filter(|f| f.starts_with(PAGES_DIR)).count(), 4);
+        for page in &p.pages {
+            let file = dir.path().join(PAGES_DIR).join(format!("{}{PAGE_SUFFIX}", page.id));
+            assert_eq!(fs::read_to_string(file).unwrap(), to_json(page).unwrap());
+        }
+        assert_eq!(load(dir.path()).unwrap(), p);
+    }
+
+    #[test]
+    fn replace_whole_leaves_the_new_bytes_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.bin");
+        fs::write(&path, "old and much longer than what replaces it").unwrap();
+
+        replace_whole(&path, b"new").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert_eq!(files_under(dir.path()), [PathBuf::from("notes.bin")]);
+    }
+
+    #[test]
+    fn a_write_that_cannot_take_its_name_leaves_no_staging_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // A folder that is not empty is in the way of the name, so the rename fails.
+        let path = dir.path().join("taken");
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("inside.txt"), "keep me").unwrap();
+
+        assert!(replace_whole(&path, b"new").is_err());
+        assert_eq!(files_under(dir.path()), [Path::new("taken").join("inside.txt")]);
+        assert_eq!(fs::read_to_string(path.join("inside.txt")).unwrap(), "keep me");
+    }
+
+    #[test]
+    fn a_folder_that_cannot_be_synced_does_not_fail_the_write() {
+        use std::io::ErrorKind::{InvalidInput, PermissionDenied, Unsupported};
+        let dir = Path::new("pages");
+        assert!(folder_synced(dir, Ok(())).is_ok());
+        for kind in [InvalidInput, PermissionDenied, Unsupported] {
+            assert!(folder_synced(dir, Err(kind.into())).is_ok(), "{kind:?}");
+        }
+        // Anything else is a real failure, and names the folder.
+        let failed = folder_synced(dir, Err(std::io::Error::other("the disk went away")));
+        assert!(failed.unwrap_err().to_string().contains("pages"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_sync_the_system_calls_not_valid_is_tolerated_and_a_missing_folder_is_not() {
+        // EINVAL: what a file system that cannot sync a folder answers.
+        let not_valid = std::io::Error::from_raw_os_error(22);
+        assert!(folder_synced(Path::new("pages"), Err(not_valid)).is_ok());
+
+        let dir = tempfile::tempdir().unwrap();
+        assert!(sync_dir(dir.path()).is_ok());
+        let gone: Folders = [dir.path().join("gone")].into();
+        assert!(sync_dir(&dir.path().join("gone")).is_err());
+        assert!(synced(Ok(()), &gone).is_err());
+    }
+
+    #[test]
+    fn a_failure_is_still_the_one_reported_once_the_folders_are_synced() {
+        let dir = tempfile::tempdir().unwrap();
+        let folders: Folders = [dir.path().to_owned()].into();
+        assert_eq!(synced(Ok(7), &folders).unwrap(), 7);
+        let failed: Result<u8> = synced(Err(Error::Invalid("first".into())), &folders);
+        assert!(matches!(failed, Err(Error::Invalid(m)) if m == "first"));
+    }
+
+    #[test]
+    fn a_write_names_each_folder_whose_entries_it_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let symbols = root.join("vendor").join("symbols");
+        let path = symbols.join("a.json");
+
+        // Two folders are made on the way: each is a new entry in the one above it.
+        let mut folders = Folders::new();
+        assert!(stage_if_changed(&path, "{}\n", &mut folders).unwrap());
+        let expected: Folders = [root.to_owned(), root.join("vendor"), symbols.clone()].into();
+        assert_eq!(folders, expected);
+
+        let mut folders = Folders::new();
+        assert!(!stage_if_changed(&path, "{}\n", &mut folders).unwrap());
+        assert!(folders.is_empty(), "an unchanged file asked for {folders:?}");
+
+        assert!(stage_if_changed(&path, "[]\n", &mut folders).unwrap());
+        assert_eq!(folders, Folders::from([symbols]));
+    }
+
+    #[test]
+    fn a_save_syncs_only_the_folders_it_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let pages = root.join(PAGES_DIR);
+        let mut p = Project::new("Demo");
+        for i in 0..3 {
+            p.pages.push(Page::new(format!("p{i:04}"), i.to_string(), "Page"));
+        }
+
+        // However many pages are written, their folder is in the list once.
+        let mut folders = Folders::new();
+        assert_eq!(save_files(root, &p, &mut folders).unwrap().len(), 6);
+        assert_eq!(folders, Folders::from([root.to_owned(), pages.clone()]));
+
+        let mut folders = Folders::new();
+        assert!(save_files(root, &p, &mut folders).unwrap().is_empty());
+        assert!(folders.is_empty(), "an unchanged project asked for {folders:?}");
+
+        // A removed page file changes its folder too.
+        p.pages.pop();
+        assert!(save_files(root, &p, &mut folders).unwrap().is_empty());
+        assert_eq!(folders, Folders::from([pages]));
+    }
+
     #[test]
     fn a_staging_file_left_by_a_failed_write_is_replaced() {
         let dir = tempfile::tempdir().unwrap();
@@ -1025,5 +1476,289 @@ mod staging_tests {
         assert!(write_if_changed(&path, "x\n").unwrap());
         assert_eq!(fs::read_to_string(&path).unwrap(), "x\n");
         assert!(!PathBuf::from(&tmp).exists());
+    }
+
+    /// Each sync this thread makes, in order, while the watch lives.
+    type Seen = std::rc::Rc<std::cell::RefCell<Vec<(Synced, PathBuf)>>>;
+
+    /// Takes the watch off the syncs again when it goes.
+    struct Watch;
+
+    impl Drop for Watch {
+        fn drop(&mut self) {
+            SYNC_WATCH.with(|watch| *watch.borrow_mut() = None);
+        }
+    }
+
+    /// Record every sync this thread makes, and fail the ones `fail` picks.
+    fn watch(fail: impl Fn(Synced, &Path) -> bool + 'static) -> (Watch, Seen) {
+        let seen = Seen::default();
+        let log = seen.clone();
+        let tell = move |what: Synced, path: &Path| {
+            log.borrow_mut().push((what, path.to_owned()));
+            if fail(what, path) {
+                return Err(std::io::Error::other("the disk went away"));
+            }
+            Ok(())
+        };
+        SYNC_WATCH.with(|watch| *watch.borrow_mut() = Some(Box::new(tell)));
+        (Watch, seen)
+    }
+
+    /// The syncs seen so far, and none of them after this.
+    fn taken(seen: &Seen) -> Vec<(Synced, PathBuf)> {
+        std::mem::take(&mut *seen.borrow_mut())
+    }
+
+    fn folders_of(seen: &Seen) -> Vec<PathBuf> {
+        let all = taken(seen);
+        all.into_iter()
+            .filter(|(what, _)| *what == Synced::Folder)
+            .map(|(_, p)| p)
+            .collect()
+    }
+
+    fn staging_of(path: &Path) -> PathBuf {
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        PathBuf::from(tmp)
+    }
+
+    #[test]
+    fn the_staged_file_is_synced_before_it_gets_its_name_and_the_folder_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = resolved(dir.path());
+        let path = root.join("devices.json");
+        fs::write(&path, "old\n").unwrap();
+
+        // What the file under the real name held at each sync.
+        let held = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (at, log) = (path.clone(), held.clone());
+        let tell = move |what: Synced, synced: &Path| {
+            let holds = fs::read_to_string(&at)?;
+            log.borrow_mut().push((what, synced.to_owned(), holds));
+            Ok(())
+        };
+        SYNC_WATCH.with(|watch| *watch.borrow_mut() = Some(Box::new(tell)));
+        let _watch = Watch;
+
+        assert!(write_if_changed(&path, "new\n").unwrap());
+        assert_eq!(
+            *held.borrow(),
+            [
+                (Synced::File, staging_of(&path), "old\n".to_string()),
+                (Synced::Folder, root.clone(), "new\n".to_string()),
+            ]
+        );
+
+        held.borrow_mut().clear();
+        replace_whole(&path, b"newer\n").unwrap();
+        assert_eq!(
+            *held.borrow(),
+            [
+                (Synced::File, staging_of(&path), "new\n".to_string()),
+                (Synced::Folder, root, "newer\n".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_staged_file_that_cannot_be_synced_never_gets_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = resolved(dir.path());
+        let path = root.join("devices.json");
+        fs::write(&path, "old\n").unwrap();
+        let (_watch, seen) = watch(|what, _| what == Synced::File);
+
+        let failed = write_if_changed(&path, "new\n").unwrap_err().to_string();
+        assert!(
+            failed.contains("devices.json.tmp") && failed.contains("the disk went away"),
+            "{failed}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "old\n");
+        assert_eq!(files_under(&root), [PathBuf::from("devices.json")]);
+        // No entry changed, so no folder is synced.
+        assert_eq!(taken(&seen), [(Synced::File, staging_of(&path))]);
+
+        assert!(replace_whole(&path, b"new\n").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "old\n");
+        assert_eq!(files_under(&root), [PathBuf::from("devices.json")]);
+        assert_eq!(taken(&seen), [(Synced::File, staging_of(&path))]);
+    }
+
+    fn three_pages() -> Project {
+        let mut p = Project::new("Demo");
+        for i in 0..3 {
+            p.pages.push(Page::new(format!("p{i:04}"), i.to_string(), "Page"));
+        }
+        p
+    }
+
+    #[test]
+    fn a_save_syncs_each_file_it_writes_and_each_folder_it_changed_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = resolved(dir.path());
+        let pages = root.join(PAGES_DIR);
+        let mut p = three_pages();
+        let (_watch, seen) = watch(|_, _| false);
+
+        // Six files, two folders: the three pages share one folder sync, after all the files.
+        let written = save(&root, &p).unwrap();
+        assert_eq!(written.len(), 6);
+        let mut expected: Vec<(Synced, PathBuf)> = written.iter().map(|w| (Synced::File, staging_of(w))).collect();
+        expected.push((Synced::Folder, root.clone()));
+        expected.push((Synced::Folder, pages.clone()));
+        assert_eq!(taken(&seen), expected);
+
+        // Nothing changed: no sync at all.
+        assert!(save(&root, &p).unwrap().is_empty());
+        assert_eq!(taken(&seen), []);
+
+        // One page changed: its file and its folder, nothing else.
+        p.pages[1].title = "Changed".into();
+        let page = pages.join(format!("p0001{PAGE_SUFFIX}"));
+        assert_eq!(save(&root, &p).unwrap(), std::slice::from_ref(&page));
+        assert_eq!(
+            taken(&seen),
+            [(Synced::File, staging_of(&page)), (Synced::Folder, pages.clone())]
+        );
+
+        // A page removed: no file to sync, and the folder it left.
+        p.pages.pop();
+        assert!(save(&root, &p).unwrap().is_empty());
+        assert_eq!(taken(&seen), [(Synced::Folder, pages)]);
+    }
+
+    #[test]
+    fn a_folder_sync_that_fails_after_a_failed_write_leaves_the_first_failure_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = resolved(dir.path());
+        let pages = root.join(PAGES_DIR);
+        let p = three_pages();
+        // The second page cannot be written, after the first is in place: a folder that is not
+        // empty stands where its file goes. (An id that is no file name is refused before any
+        // write, so it cannot make a write fail half way.)
+        let blocker = pages.join(format!("p0001{PAGE_SUFFIX}"));
+        fs::create_dir_all(blocker.join("in-the-way")).unwrap();
+        let (_watch, seen) = watch(|what, _| what == Synced::Folder);
+
+        let failed = save(&root, &p);
+        // The page write failure is the one reported, not the folder sync failure after it.
+        assert!(
+            matches!(&failed, Err(Error::Io { path, .. }) if *path == blocker),
+            "{failed:?}"
+        );
+        // Both folders with a file in place were still synced, failing or not.
+        assert_eq!(folders_of(&seen), [root.clone(), pages.clone()]);
+        assert!(pages.join(format!("p0000{PAGE_SUFFIX}")).exists());
+
+        // With no write failure, the folder sync failure is the one reported.
+        fs::remove_dir_all(&blocker).unwrap();
+        let failed = save(&root, &p).unwrap_err().to_string();
+        assert!(failed.contains("the disk went away"), "{failed}");
+    }
+
+    #[test]
+    fn a_folder_whose_sync_failed_is_synced_by_the_next_write_of_the_same_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = resolved(dir.path());
+        let symbols = root.join("vendor").join("symbols");
+        let path = symbols.join("a.json");
+        let broken = std::rc::Rc::new(std::cell::Cell::new(true));
+        let now = broken.clone();
+        let (_watch, seen) = watch(move |what, _| what == Synced::Folder && now.get());
+        let owed = [root.clone(), root.join("vendor"), symbols.clone()];
+
+        // The file gets into place, with the two folders made for it; no folder sync holds.
+        assert!(write_if_changed(&path, "{}\n").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{}\n");
+        assert_eq!(folders_of(&seen), owed);
+
+        // A second try has nothing to write. It still fails while the folders cannot be synced.
+        assert!(write_if_changed(&path, "{}\n").is_err());
+        assert_eq!(taken(&seen), owed.clone().map(|dir| (Synced::Folder, dir)));
+
+        // Once they can, it syncs all three and says the file did not change.
+        broken.set(false);
+        assert!(!write_if_changed(&path, "{}\n").unwrap());
+        assert_eq!(taken(&seen), owed.map(|dir| (Synced::Folder, dir)));
+
+        // Nothing is owed after that: an unchanged file costs no sync again.
+        assert!(!write_if_changed(&path, "{}\n").unwrap());
+        assert_eq!(taken(&seen), []);
+
+        // A changed file whose folder is owed syncs that folder once, not twice.
+        broken.set(true);
+        assert!(write_if_changed(&path, "[]\n").is_err());
+        broken.set(false);
+        taken(&seen);
+        assert!(write_if_changed(&path, "{}\n").unwrap());
+        assert_eq!(folders_of(&seen), [symbols]);
+    }
+
+    #[test]
+    fn a_save_that_only_removed_a_file_still_owes_the_folder_sync_that_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = resolved(dir.path());
+        let pages = root.join(PAGES_DIR);
+        let mut p = three_pages();
+        save(&root, &p).unwrap();
+
+        let broken = std::rc::Rc::new(std::cell::Cell::new(true));
+        let now = broken.clone();
+        let (_watch, seen) = watch(move |what, _| what == Synced::Folder && now.get());
+        p.pages.pop();
+        assert!(save(&root, &p).is_err());
+        assert!(!pages.join(format!("p0002{PAGE_SUFFIX}")).exists());
+        assert_eq!(taken(&seen), [(Synced::Folder, pages.clone())]);
+
+        // The file is gone, so the next save finds nothing to do but the sync it owes.
+        broken.set(false);
+        assert!(save(&root, &p).unwrap().is_empty());
+        assert_eq!(taken(&seen), [(Synced::Folder, pages.clone())]);
+        assert!(save(&root, &p).unwrap().is_empty());
+        assert_eq!(taken(&seen), []);
+
+        // A write elsewhere in the project folder gets an owed page folder synced too.
+        broken.set(true);
+        p.pages.pop();
+        assert!(save(&root, &p).is_err());
+        broken.set(false);
+        taken(&seen);
+        let meta = fs::read_to_string(root.join(PROJECT_FILE)).unwrap();
+        assert!(!write_if_changed(&root.join(PROJECT_FILE), &meta).unwrap());
+        assert_eq!(taken(&seen), [(Synced::Folder, pages)]);
+    }
+
+    #[test]
+    fn an_owed_folder_that_is_gone_is_owed_no_more() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = resolved(dir.path());
+        let pages = root.join(PAGES_DIR);
+        let path = pages.join("a.json");
+        fs::create_dir(&pages).unwrap();
+        let (_watch, seen) = watch(|what, path| what == Synced::Folder && path.ends_with(PAGES_DIR));
+
+        assert!(write_if_changed(&path, "{}\n").is_err());
+        fs::remove_dir_all(&pages).unwrap();
+        taken(&seen);
+        assert!(write_if_changed(&root.join("b.json"), "{}\n").unwrap());
+        assert_eq!(folders_of(&seen), [root]);
+    }
+
+    #[test]
+    fn a_sync_does_not_pay_a_debt_noted_while_it_ran() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = resolved(dir.path());
+        let is_owed = || owed().contains_key(&root);
+        // A sync begins; while it runs, another write's sync of the folder fails and is noted.
+        let before = OWED_NOTED.load(std::sync::atomic::Ordering::SeqCst);
+        settle(&root, true, before);
+        // The first sync went through, but may not have covered the other write's rename.
+        settle(&root, false, before);
+        assert!(is_owed());
+        // A sync that began after the debt was noted pays it.
+        settle(&root, false, OWED_NOTED.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!is_owed());
     }
 }

@@ -1,0 +1,14 @@
+{
+  "description": "Photoelectric sensor, diffuse, 3-wire PNP, NO, 10-30 V DC, M18 (example data)",
+  "id": "example.ex-ps-m18-pnp",
+  "manufacturer": "Example",
+  "order_number": "EX-PS-M18-PNP",
+  "properties": {
+    "Housing": "M18",
+    "Output": "PNP, NO",
+    "Sensing distance": "400 mm",
+    "Sensing mode": "Diffuse",
+    "Supply voltage": "10-30 V DC"
+  },
+  "symbol": "wc.sensor.photo3"
+}
