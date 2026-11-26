@@ -2957,7 +2957,7 @@ impl Open {
 
     /// Why a guest's window does not change the translations in a shared session: the session
     /// does not carry `translations.toml`, so the edit would stay in the guest's own copy.
-    pub(crate) const TRANSLATIONS_GUEST: &str = "Not done: in a shared session only the host can change the          translations (the session does not carry translations.toml). Ask the host to make this change.";
+    pub(crate) const TRANSLATIONS_GUEST: &str = "Not done: in a shared session only the host can change the translations (the session does not carry translations.toml). Ask the host to make this change.";
 
     /// The project's `translations.toml` as it is on disk: `None` when there is none, an error
     /// when it cannot be read as text.
