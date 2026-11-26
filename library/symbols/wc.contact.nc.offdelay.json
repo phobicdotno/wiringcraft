@@ -1,0 +1,126 @@
+{
+  "category": "contacts",
+  "description": "Time-delayed break contact of an off-delay timer: it opens at once when the coil is switched on, and closes once the set time has run after it is switched off.",
+  "graphics": [
+    {
+      "a": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 5.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 5.0
+      },
+      "b": {
+        "x": 2.5,
+        "y": 5.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 10.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 10.0
+      },
+      "b": {
+        "x": 3.0,
+        "y": 4.2
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 1.81,
+        "y": 6.5
+      },
+      "b": {
+        "x": 3.42,
+        "y": 6.5
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 1.19,
+        "y": 7.7
+      },
+      "b": {
+        "x": 3.42,
+        "y": 7.7
+      },
+      "kind": "line"
+    },
+    {
+      "center": {
+        "x": 4.9,
+        "y": 7.1
+      },
+      "end": 270.0,
+      "kind": "arc",
+      "radius": 1.6,
+      "start": 90.0
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "15"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 14.4
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "16"
+    }
+  ],
+  "id": "wc.contact.nc.offdelay",
+  "letter_code": "K",
+  "name": "Delayed break contact, off-delay",
+  "pins": [
+    {
+      "at": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "15"
+    },
+    {
+      "at": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "dir": "down",
+      "name": "16"
+    }
+  ],
+  "role": "auxiliary",
+  "tag_at": {
+    "x": -6.0,
+    "y": 8.0
+  }
+}

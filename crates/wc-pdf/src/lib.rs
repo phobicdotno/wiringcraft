@@ -135,10 +135,17 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
         .reports
         .iter()
         .map(|t| {
-            if t.header.is_empty() || layout::prints_header(t, per_page) {
-                std::borrow::Cow::Borrowed(t)
+            // A front table (the table of contents) lists only the pages this PDF holds: a page
+            // left out with `pages` would otherwise show as a row without a link (#692).
+            let t = if t.front && !options.pages.is_empty() {
+                std::borrow::Cow::Owned(only_exported_rows(t, &options.pages))
             } else {
-                let mut t = t.clone();
+                std::borrow::Cow::Borrowed(t)
+            };
+            if t.header.is_empty() || layout::prints_header(&t, per_page) {
+                t
+            } else {
+                let mut t = t.into_owned();
                 t.header.clear();
                 report.warnings.push(format!(
                     "{}: the sheet has no room for the header values above the table; they are left out",
@@ -313,6 +320,24 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
         .map(|(i, p)| (p.id.clone(), offset + i))
         .collect();
     (doc.finish(&index), report)
+}
+
+/// `table` without the rows that describe a page not in `pages`. Rows that describe no page
+/// stay.
+fn only_exported_rows(table: &wc_report::Table, pages: &[String]) -> wc_report::Table {
+    let page_of = |n: usize| table.row_pages.get(n).map_or("", String::as_str);
+    let kept: Vec<usize> = (0..table.rows.len())
+        .filter(|&n| page_of(n).is_empty() || pages.iter().any(|p| p == page_of(n)))
+        .collect();
+    let mut row_pages: Vec<String> = kept.iter().map(|&n| page_of(n).to_owned()).collect();
+    while row_pages.last().is_some_and(String::is_empty) {
+        row_pages.pop();
+    }
+    wc_report::Table {
+        rows: kept.iter().filter_map(|&n| table.rows.get(n).cloned()).collect(),
+        row_pages,
+        ..table.clone()
+    }
 }
 
 #[cfg(test)]

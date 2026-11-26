@@ -158,6 +158,25 @@ fn search_finds_by_category() -> Result<()> {
 }
 
 #[test]
+fn search_matches_every_word_in_any_order_and_the_letter_code() -> Result<()> {
+    let f = fixture()?;
+    let mut breaker = sym("breaker3", 10.0);
+    breaker.name = "Circuit breaker, 3-pole".into();
+    breaker.category = "protection".into();
+    breaker.letter_code = "Q".into();
+    write_symbol(&f.company, &breaker)?;
+    let lib = Library::open(&f.proj, &f.project)?;
+    let ids = |q: &str| lib.search(q).into_iter().map(|h| h.id).collect::<Vec<_>>();
+    assert_eq!(ids("breaker 3-pole"), ["breaker3"]);
+    assert_eq!(ids("3-POLE   Circuit"), ["breaker3"]);
+    assert!(ids("breaker 4-pole").is_empty());
+    assert_eq!(ids("q protection"), ["breaker3"]);
+    assert_eq!(ids("k relays").len(), 2);
+    assert_eq!(ids("").len(), 3);
+    Ok(())
+}
+
+#[test]
 fn macros_are_listed_per_source_in_order() -> Result<()> {
     let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
     let m = wc_core::macros::Macro {
@@ -512,6 +531,8 @@ fn every_starter_symbol_loads_under_its_file_name_with_distinct_pins() -> Result
         let (s, _) = lib.symbol(id)?;
         assert_eq!(&s.id, id, "file name and id differ");
         assert!(!s.pins.is_empty(), "{id} has no pins");
+        // Shown when browsing and matched by library search (#684).
+        assert!(!s.description.trim().is_empty(), "{id} has no description");
         let names: std::collections::BTreeSet<_> = s.pins.iter().map(|p| &p.name).collect();
         assert_eq!(names.len(), s.pins.len(), "{id} repeats a pin name");
     }
@@ -521,6 +542,8 @@ fn every_starter_symbol_loads_under_its_file_name_with_distinct_pins() -> Result
         ("wc.coil.offdelay", SymbolRole::Main),
         ("wc.contact.no.ondelay", SymbolRole::Auxiliary),
         ("wc.contact.nc.ondelay", SymbolRole::Auxiliary),
+        ("wc.contact.no.offdelay", SymbolRole::Auxiliary),
+        ("wc.contact.nc.offdelay", SymbolRole::Auxiliary),
     ] {
         assert_eq!(lib.symbol(id)?.0.role, role, "{id}");
     }
@@ -533,6 +556,38 @@ fn every_starter_symbol_loads_under_its_file_name_with_distinct_pins() -> Result
     assert_eq!(
         lib.part("example.ex-ms-3p-40")?.0.symbol.as_deref(),
         Some("wc.switch.disconnector.3p")
+    );
+    // The diode (#722): its own tag, anode on top and cathode below.
+    let (diode, _) = lib.symbol("wc.diode")?;
+    assert_eq!(diode.role, SymbolRole::Standalone);
+    assert_eq!(diode.letter_code, "R");
+    let names: Vec<_> = diode.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["A", "K"]);
+    Ok(())
+}
+
+#[test]
+fn starter_solenoid_valve_coil_and_its_example_part_load() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
+    project.meta.libraries = vec![LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: starter.to_string_lossy().into(),
+        reference: None,
+    }];
+    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    // The solenoid valve coil (#724): its own tag (no contacts follow it), letter code M for an
+    // actuator in IEC 81346-2, and the coil pins of a relay coil.
+    let (valve, _) = lib.symbol("wc.coil.valve")?;
+    assert_eq!(valve.role, SymbolRole::Standalone);
+    assert_eq!(valve.letter_code, "M");
+    let names: Vec<_> = valve.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["A1", "A2"]);
+    assert_eq!(
+        lib.part("example.ex-sv-24dc")?.0.symbol.as_deref(),
+        Some("wc.coil.valve")
     );
     Ok(())
 }

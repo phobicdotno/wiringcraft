@@ -396,7 +396,8 @@ enum Cmd {
         /// `text`, `csv`, `md` or `xlsx`.
         #[arg(long, default_value = "text")]
         format: String,
-        /// Write to a file instead of standard output.
+        /// Write to a file instead of standard output. With `all` and `--format csv` this is
+        /// a folder, which gets one `<report>.csv` per report.
         #[arg(long)]
         out: Option<PathBuf>,
     },
@@ -1170,9 +1171,11 @@ enum LibCmd {
     /// Pin every used item that is not pinned yet, and write a pinned item's vendored copy again
     /// when it is missing or unreadable.
     Lock,
-    /// Find symbols and parts in the library sources by id, name, category or description.
+    /// Find symbols and parts in the library sources by id, name, category, letter code or
+    /// description.
     Search {
-        /// The text to look for; upper and lower case are alike.
+        /// The words to look for: an item matches when it contains every word, in any order;
+        /// upper and lower case are alike.
         query: String,
     },
     /// Offer the project's copy of an item back to a source for review.
@@ -1776,6 +1779,217 @@ fn rules_list(p: &Project, library: &[wc_core::check_rule::RuleSet], json: bool)
     Ok(out)
 }
 
+impl Cmd {
+    /// Every path this command reads as an input file, as named on the command line (so `-`
+    /// for stdin, and a folder where an importer takes one). Output paths and library folders
+    /// are not inputs. [`spool_inputs`] goes through them before the project lock is taken.
+    fn inputs_mut(&mut self) -> Vec<&mut PathBuf> {
+        match self {
+            Cmd::Inspect { file }
+            | Cmd::Logo(LogoCmd::Set { file })
+            | Cmd::Rules(RulesCmd::Set { file })
+            | Cmd::ReportLayout(ReportLayoutCmd::Set { file, .. }) => vec![file],
+            // Every import is listed, so a new one has to say what it reads.
+            Cmd::Import(import) => match import {
+                ImportCmd::SymbolDxf { file, .. }
+                | ImportCmd::FootprintDxf { file, .. }
+                | ImportCmd::ModelStep { file, .. }
+                | ImportCmd::SymbolSvg { file, .. }
+                | ImportCmd::PlcCsv { file }
+                | ImportCmd::Wago { file }
+                | ImportCmd::SymbolKicad { file, .. }
+                | ImportCmd::PartsBmecat { file, .. }
+                | ImportCmd::PartsCsv { file, .. }
+                | ImportCmd::Archive { file, .. }
+                | ImportCmd::PageDwg { file, .. }
+                | ImportCmd::Pdf { file, .. }
+                | ImportCmd::Aml { file, .. }
+                | ImportCmd::PageDxf { file, .. } => vec![file],
+                ImportCmd::Eplan { path, .. } | ImportCmd::SweLibrary { path, .. } => vec![path],
+                ImportCmd::PartsEdz { file, symbol_map, .. } => std::iter::once(file).chain(symbol_map).collect(),
+                ImportCmd::Swe { path, symbol_map, .. } => std::iter::once(path).chain(symbol_map).collect(),
+                ImportCmd::SymbolQet { files, .. } => files.iter_mut().collect(),
+            },
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// The most [`spool_inputs`] copies of one stream that no importer limit applies to: the
+/// operand is refused when it has more. A stream without an end (`/dev/zero`, a FIFO whose
+/// writer never stops) would otherwise hold the command up until the temporary folder is
+/// full. Above every limit an importer has for what it unpacks, so an archive it would read
+/// from a file is read from a stream too. Regular files are not copied and have no such limit.
+const MAX_SPOOLED_BYTES: u64 = 4 << 30;
+
+/// How much of one stream [`spool_inputs_within`] copies at most.
+#[derive(Clone, Copy)]
+struct SpoolLimits {
+    /// A SolidWorks Electrical database given to `import swe` as it is, not in an archive.
+    database: u64,
+    /// Any other stream, but an `import symbol-qet` element, which has the importer's limit.
+    stream: u64,
+}
+
+/// [`spool_inputs_within`] the limits the commands have: every copy has one.
+fn spool_inputs(cmd: &mut Cmd) -> Res<Option<tempfile::TempDir>> {
+    let limits = SpoolLimits {
+        database: wc_import::swe::MAX_DATABASE_BYTES,
+        stream: MAX_SPOOLED_BYTES,
+    };
+    spool_inputs_within(cmd, limits)
+}
+
+/// Copy every input of `cmd` that is not a regular file (a FIFO, a character device) into a
+/// private temporary folder, under the name it has, and point the command at the copy (no
+/// more of it than the importer reads). Every copy is bounded: an `import symbol-qet` element
+/// is cut one byte over the importer's limit, which then refuses that element as too large; a
+/// database for `import swe` (a stream that starts with the SQLite header) larger than
+/// `limits.database`, and any other stream larger than `limits.stream`, is refused here, by
+/// the name the operand has. An input named again, under the same or another name,
+/// is read once: each operand gets the same bytes in a folder of its own, under its own name,
+/// as an importer may take an id from the name. Called
+/// before the project lock is taken: a FIFO that another command on the same project fills
+/// would otherwise never be read, as its writer waits for the lock this command holds while it
+/// waits for the writer (#658). Regular files, folders, `-` and paths that do not exist are
+/// left as they are, for the command to read (or report) itself, and so is a stream that cannot
+/// be opened, and an element stream `import symbol-qet` refuses unread for its id, which an
+/// earlier element has. On Unix the `.edb` folder an
+/// Eplan `.elk` stream names stays beside its copy, as a link to the one beside the operand.
+/// The copies are removed when the returned folder is dropped; `None` when nothing was copied.
+fn spool_inputs_within(cmd: &mut Cmd, limits: SpoolLimits) -> Res<Option<tempfile::TempDir>> {
+    use std::io::{Read, Write};
+    // A database is told from an archive by its first bytes, as the importer does.
+    const SQLITE: &[u8] = b"SQLite format 3\0";
+    #[cfg(unix)]
+    let eplan = matches!(cmd, Cmd::Import(ImportCmd::Eplan { .. }));
+    // The first input of `import swe` is a database or an archive; its symbol map is neither.
+    let swe = matches!(cmd, Cmd::Import(ImportCmd::Swe { .. }));
+    // An importer that reads no more than so much of its input gets no more than that: a
+    // stream without an end (`/dev/zero`) would otherwise be copied until the disk is full.
+    // One byte over the limit is kept, which is how the importer sees the input is too large.
+    let element = matches!(cmd, Cmd::Import(ImportCmd::SymbolQet { .. })).then_some(wc_import::qet::MAX_LEN as u64);
+    let qet = match cmd {
+        Cmd::Import(ImportCmd::SymbolQet { prefix, scale, .. }) => Some((prefix.clone(), *scale)),
+        _ => None,
+    };
+    // The elements before this one, as `import symbol-qet` will read them, each with its id.
+    let mut earlier: Vec<(String, PathBuf)> = Vec::new();
+    let mut spool = None;
+    // A stream can be read once: an input named again gets the copy made the first time.
+    let mut copied: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for (n, path) in cmd.inputs_mut().into_iter().enumerate() {
+        let id = qet.as_ref().map(|(prefix, _)| qet_id(path, prefix));
+        let stream = path.as_os_str() != "-" && std::fs::metadata(&*path).is_ok_and(|m| !m.is_file() && !m.is_dir());
+        if !stream {
+            earlier.extend(id.map(|id| (id, path.clone())));
+            continue;
+        }
+        // An element whose id an earlier one has is refused without being opened: it is not
+        // opened here either, where a FIFO without a writer would hold the command up. The
+        // earlier one has the id when it can be read as an element, as the import decides.
+        if let (Some(id), Some((_, scale))) = (&id, &qet)
+            && earlier
+                .iter()
+                .any(|(other, file)| other == id && qet_element(file, id, *scale).is_ok())
+        {
+            continue;
+        }
+        let same = std::fs::canonicalize(&*path).unwrap_or_else(|_| path.clone());
+        let first = copied
+            .iter()
+            .find(|(from, _)| *from == same)
+            .map(|(_, copy)| copy.clone());
+        // A stream that cannot be opened is left for the command to report, as a path that
+        // does not exist is: nothing of it was read.
+        let from = match &first {
+            Some(_) => None,
+            None => match std::fs::File::open(&*path) {
+                Ok(from) => Some(from),
+                Err(_) => {
+                    earlier.extend(id.map(|id| (id, path.clone())));
+                    continue;
+                }
+            },
+        };
+        let fail = |x: std::io::Error| format!("{}: {x}", escape_field(&path.display().to_string()));
+        let folder = match &spool {
+            Some(folder) => folder,
+            None => spool.insert(run::staging_dir("wc-input-").map_err(|x| format!("temporary folder: {x}"))?),
+        };
+        // One folder per input: two inputs may share a file name.
+        let own = folder.path().join(n.to_string());
+        std::fs::create_dir(&own).map_err(|x| format!("{}: {x}", own.display()))?;
+        let copy = own.join(path.file_name().unwrap_or(std::ffi::OsStr::new("input")));
+        let at_copy = |x: std::io::Error| format!("{}: {x}", copy.display());
+        if let Some(first) = &first {
+            // The bytes read the first time, under the name this operand has.
+            std::fs::hard_link(first, &copy)
+                .or_else(|_| std::fs::copy(first, &copy).map(|_| ()))
+                .map_err(at_copy)?;
+        } else if let Some(from) = from {
+            let mut to = std::fs::File::create(&copy).map_err(at_copy)?;
+            let mut head = Vec::new();
+            if swe && n == 0 {
+                (&from).take(SQLITE.len() as u64).read_to_end(&mut head).map_err(fail)?;
+                to.write_all(&head).map_err(at_copy)?;
+            }
+            // The most this copy may hold, and whether one byte more is refused here (with
+            // the importer's own words for a database) or left for the importer to refuse.
+            let (most, refused) = match element {
+                Some(most) => (most, None),
+                None if head == SQLITE => (limits.database, Some("")),
+                None => (limits.stream, Some("the stream ")),
+            };
+            let rest = most.saturating_add(1).saturating_sub(head.len() as u64);
+            let len = std::io::copy(&mut (&from).take(rest), &mut to).map_err(fail)? + head.len() as u64;
+            if let (true, Some(what)) = (len > most, refused) {
+                return Err(format!(
+                    "{}: {what}is larger than {} MB",
+                    escape_field(&path.display().to_string()),
+                    most >> 20
+                ));
+            }
+            copied.push((same, copy.clone()));
+        }
+        #[cfg(unix)]
+        if eplan {
+            link_elk_folder(path, &copy)?;
+        }
+        earlier.extend(id.map(|id| (id, copy.clone())));
+        *path = copy;
+    }
+    Ok(spool)
+}
+
+/// Beside `copy`, the copy of the Eplan `.elk` stream `operand`, a link to the `.edb` folder
+/// the file names, which the importer looks for beside the file it is given: the folder is
+/// beside the operand, not beside its copy. Nothing when the copy is not an `.elk` file or
+/// names no folder that is there, which the importer then reports itself.
+#[cfg(unix)]
+fn link_elk_folder(operand: &Path, copy: &Path) -> Res<()> {
+    use std::io::Read;
+    // The folder name is the first line; a zip of the folder is not an `.elk` file.
+    let mut head = Vec::new();
+    std::fs::File::open(copy)
+        .and_then(|f| f.take(1 << 16).read_to_end(&mut head))
+        .map_err(|x| format!("{}: {x}", copy.display()))?;
+    if head.starts_with(b"PK") {
+        return Ok(());
+    }
+    let Some(name) = wc_import::eplan::elk_target(&head) else {
+        return Ok(());
+    };
+    let folder = operand.with_file_name(&name);
+    let link = copy.with_file_name(&name);
+    if name == "." || name == ".." || link == copy || !folder.is_dir() {
+        return Ok(());
+    }
+    // An absolute target: a relative one would be looked up from the link's folder.
+    let folder = std::fs::canonicalize(&folder).map_err(|x| format!("{}: {x}", folder.display()))?;
+    std::os::unix::fs::symlink(&folder, &link).map_err(|x| format!("{}: {x}", link.display()))
+}
+
 /// The rules in `file` for `rules set`, in order, each as the check runs it: `[[rule]]`
 /// tables, or a JSON list (or `{"rules": [...]}`) for a `.json` name; `-` is TOML on stdin.
 /// `stdin` is what was read from standard input for `-`, when it already was.
@@ -2072,13 +2286,16 @@ fn edit_macro(
     Ok(())
 }
 
-fn run(cli: Cli) -> Res<()> {
-    let dir = cli.project.as_path();
+fn run(mut cli: Cli) -> Res<()> {
     // One command at a time on a project: a second run waits, so it reads what the first one
     // wrote instead of overwriting it with an edit planned from the old files (#610).
     // An input file (or stdin) is read before the lock is taken: fed by another command on the
     // same project, through a pipe or a named FIFO, waiting for the lock before reading would
-    // hold both up for good.
+    // hold both up for good. Any command's input that is such a stream is copied to a
+    // temporary file first (#658); the commands below also read theirs here when it is a
+    // regular file.
+    let _spooled = spool_inputs(&mut cli.cmd)?;
+    let dir = cli.project.as_path();
     let mut input_text = match &cli.cmd {
         Cmd::Rules(RulesCmd::Set { file }) | Cmd::ReportLayout(ReportLayoutCmd::Set { file, .. }) => {
             Some(read_input(file)?)
@@ -3531,6 +3748,20 @@ fn run(cli: Cli) -> Res<()> {
                 let refs: Vec<&wc_report::Table> = tables.iter().collect();
                 let bytes = wc_report::xlsx::workbook(&refs).map_err(e)?;
                 write_out(&path, bytes).map_err(e)?;
+                return Ok(());
+            }
+            // Several tables in one CSV file is not a CSV any reader takes: `--out` names a
+            // folder then, with one `<report>.csv` in it per report, as `drawing` does per page.
+            if format == "csv"
+                && kinds.len() > 1
+                && let Some(folder) = &out
+            {
+                make_out_dir(folder)?;
+                for k in &kinds {
+                    let t = wc_report::build(*k, &inputs);
+                    write_out(folder.join(format!("{}.csv", k.name())), t.to_csv()).map_err(e)?;
+                }
+                println!("wrote {} csv file(s) to {}", kinds.len(), folder.display());
                 return Ok(());
             }
             let mut text = String::new();
@@ -5505,6 +5736,31 @@ fn import_kicad(text: &str, lib: &Path, prefix: &str, scale: f64, category: &str
     Ok(n)
 }
 
+/// The symbol id `import symbol-qet` gives the element in `file`: the prefix and the file stem.
+fn qet_id(file: &Path, prefix: &str) -> String {
+    let stem = wc_import::id_segment(
+        &file
+            .file_stem()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    );
+    format!("{}.{stem}", prefix.trim_end_matches('.'))
+}
+
+/// The element in `file` as the symbol `id`, with warnings.
+fn qet_element(file: &Path, id: &str, scale: f64) -> Res<(wc_import::qet::Imported, Vec<String>)> {
+    use std::io::Read;
+    std::fs::File::open(file)
+        .and_then(|f| {
+            // Read at most one byte past the limit, so a huge file is refused cheaply.
+            let mut text = String::new();
+            f.take(wc_import::qet::MAX_LEN as u64 + 1).read_to_string(&mut text)?;
+            Ok(text)
+        })
+        .map_err(e)
+        .and_then(|text| wc_import::qet::element(&text, id, scale).map_err(e))
+}
+
 fn import_qet(
     files: &[PathBuf],
     lib: &Path,
@@ -5513,29 +5769,14 @@ fn import_qet(
     category: &str,
     letter_code: &str,
 ) -> Res<(usize, usize)> {
-    use std::io::Read;
     let (mut written, mut failed) = (0, 0);
     // Two files whose names give the same id would overwrite each other: the later one fails.
     let mut ids: std::collections::BTreeMap<String, PathBuf> = Default::default();
     for file in files {
-        let stem = wc_import::id_segment(
-            &file
-                .file_stem()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-        );
-        let id = format!("{}.{stem}", prefix.trim_end_matches('.'));
+        let id = qet_id(file, prefix);
         let read = match ids.get(&id) {
             Some(first) => Err(format!("gives the same id {id} as {}, skipped", first.display())),
-            None => std::fs::File::open(file)
-                .and_then(|f| {
-                    // Read at most one byte past the limit, so a huge file is refused cheaply.
-                    let mut text = String::new();
-                    f.take(wc_import::qet::MAX_LEN as u64 + 1).read_to_string(&mut text)?;
-                    Ok(text)
-                })
-                .map_err(e)
-                .and_then(|text| wc_import::qet::element(&text, &id, scale).map_err(e)),
+            None => qet_element(file, &id, scale),
         };
         let (mut imp, warnings) = match read {
             Ok(r) => r,
@@ -9083,6 +9324,39 @@ mod tests {
     }
 
     #[test]
+    fn all_reports_as_csv_go_to_one_file_each() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let out = tmp.path().join("reports");
+        cli(
+            &dir,
+            &["report", "all", "--format", "csv", "--out", out.to_str().unwrap()],
+        )
+        .unwrap();
+        let mut names: Vec<String> = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|f| f.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        let mut want: Vec<String> = wc_report::Kind::ALL
+            .iter()
+            .map(|k| format!("{}.csv", k.name()))
+            .collect();
+        want.sort();
+        assert_eq!(names, want);
+        // Each file is that one report's table alone, the same as asking for it by name.
+        let one = tmp.path().join("wires.csv");
+        cli(
+            &dir,
+            &["report", "wires", "--format", "csv", "--out", one.to_str().unwrap()],
+        )
+        .unwrap();
+        let wires = std::fs::read_to_string(out.join("wires.csv")).unwrap();
+        assert_eq!(format!("{wires}\n"), std::fs::read_to_string(&one).unwrap());
+    }
+
+    #[test]
     fn excel_workbooks_import_parts_and_reports_save_as_xlsx() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
@@ -10945,5 +11219,551 @@ mod box_cleanup_rollback_tests {
         );
         #[cfg(unix)]
         assert!(std::fs::symlink_metadata(folder.join("box.p1.s3.json")).is_ok_and(|m| m.file_type().is_symlink()));
+    }
+}
+
+/// Inputs are found for every command that names one, and only streams are copied (#658).
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod input_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    include!("input_commands.rs");
+
+    /// Path arguments that are not input files: where output goes, library and project folders.
+    const NOT_INPUTS: &[&str] = &["project", "dir", "out", "lib", "svg"];
+
+    /// The commands under `command` that take a path argument which is not in [`NOT_INPUTS`],
+    /// each as the words that name it.
+    fn commands_with_a_path(command: &clap::Command, words: &mut Vec<String>, found: &mut Vec<Vec<String>>) {
+        let path = clap::builder::ValueParser::path_buf().type_id();
+        let takes_one = command
+            .get_arguments()
+            .any(|a| a.get_value_parser().type_id() == path && !NOT_INPUTS.contains(&a.get_id().as_str()));
+        if takes_one && !words.is_empty() {
+            found.push(words.clone());
+        }
+        for sub in command.get_subcommands() {
+            words.push(sub.get_name().to_owned());
+            commands_with_a_path(sub, words, found);
+            words.pop();
+        }
+    }
+
+    #[test]
+    fn every_command_with_an_input_file_lists_it() {
+        for args in INPUT_COMMANDS {
+            let mut cli = Cli::try_parse_from(["wiringcraft"].iter().chain(*args)).unwrap();
+            let got: Vec<PathBuf> = cli.cmd.inputs_mut().into_iter().map(|p| p.clone()).collect();
+            let want: Vec<PathBuf> = args
+                .iter()
+                .filter(|a| ["FIFO", "FILE"].contains(a))
+                .map(PathBuf::from)
+                .collect();
+            assert_eq!(got, want, "{args:?}");
+        }
+        // A library folder is not an input, also where the command can do without one.
+        for args in [
+            &["import", "archive", "in", "--lib", "lib"][..],
+            &["import", "swe-library", "in", "--lib", "lib"],
+        ] {
+            let mut cli = Cli::try_parse_from(["wiringcraft"].iter().chain(args)).unwrap();
+            let got: Vec<PathBuf> = cli.cmd.inputs_mut().into_iter().map(|p| p.clone()).collect();
+            assert_eq!(got, [PathBuf::from("in")], "{args:?}");
+        }
+        // A command that takes a path which is not an output or a folder is in the list above,
+        // so a new command with an input file fails here until it is covered.
+        let mut found = Vec::new();
+        commands_with_a_path(&Cli::command(), &mut Vec::new(), &mut found);
+        assert!(found.len() >= 23, "{found:?}");
+        for words in found {
+            assert!(
+                INPUT_COMMANDS
+                    .iter()
+                    .any(|args| args.iter().zip(&words).filter(|(a, w)| a == w).count() == words.len()),
+                "`{}` takes a path that Cmd::inputs_mut and this test do not know",
+                words.join(" ")
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_without_an_input_file_has_none() {
+        for args in [
+            &["check"][..],
+            &["pdf", "out.pdf"],
+            &["export", "wago-marking", "out.csv"],
+        ] {
+            let mut cli = Cli::try_parse_from(["wiringcraft"].iter().chain(args)).unwrap();
+            assert!(cli.cmd.inputs_mut().is_empty(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn regular_files_folders_and_stdin_are_not_copied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("a.elmt");
+        std::fs::write(&file, "<definition/>").unwrap();
+        let folder = tmp.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        let missing = tmp.path().join("missing.elmt");
+        let lib = tmp.path().join("lib");
+        let mut cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "symbol-qet".as_ref(),
+            file.as_os_str(),
+            folder.as_os_str(),
+            missing.as_os_str(),
+            "--lib".as_ref(),
+            lib.as_os_str(),
+        ])
+        .unwrap();
+        assert!(spool_inputs(&mut cli.cmd).unwrap().is_none());
+        let after: Vec<PathBuf> = cli.cmd.inputs_mut().into_iter().map(|p| p.clone()).collect();
+        assert_eq!(after, [file, folder, missing]);
+
+        let mut cli = Cli::try_parse_from(["wiringcraft", "rules", "set", "-"]).unwrap();
+        assert!(spool_inputs(&mut cli.cmd).unwrap().is_none());
+        assert!(matches!(cli.cmd, Cmd::Rules(RulesCmd::Set { ref file }) if file.as_os_str() == "-"));
+    }
+
+    /// [`spool_inputs`] on another thread, given twenty seconds: a copy that waits for a
+    /// writer that never comes, or that has no end, fails the test instead of holding it up.
+    #[cfg(unix)]
+    fn spooled(cli: Cli) -> (Vec<PathBuf>, Option<tempfile::TempDir>) {
+        let limits = SpoolLimits {
+            database: wc_import::swe::MAX_DATABASE_BYTES,
+            stream: MAX_SPOOLED_BYTES,
+        };
+        let (inputs, spool) = spooled_within(cli, limits);
+        (inputs, spool.unwrap())
+    }
+
+    /// [`spooled`] with `limits` in place of the ones the commands have, and what it said.
+    #[cfg(unix)]
+    fn spooled_within(mut cli: Cli, limits: SpoolLimits) -> (Vec<PathBuf>, Res<Option<tempfile::TempDir>>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let spool = spool_inputs_within(&mut cli.cmd, limits);
+            let inputs: Vec<PathBuf> = cli.cmd.inputs_mut().into_iter().map(|p| p.clone()).collect();
+            let _ = tx.send((inputs, spool));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap()
+    }
+
+    /// Small limits for a test: a database of 64 KiB, any other stream of 1 MiB.
+    #[cfg(unix)]
+    const SMALL: SpoolLimits = SpoolLimits {
+        database: 1 << 16,
+        stream: 1 << 20,
+    };
+
+    /// One writer on another thread that opens the FIFO at `fifo` once and writes `head`, then
+    /// zeros until the reader is gone or `most` bytes are written. The bytes it wrote.
+    #[cfg(unix)]
+    fn endless_writer(
+        fifo: &Path,
+        head: &'static [u8],
+        most: u64,
+    ) -> std::thread::JoinHandle<(u64, std::io::Result<()>)> {
+        use std::io::Write;
+        let fifo = fifo.to_path_buf();
+        std::thread::spawn(move || {
+            let mut to = match std::fs::OpenOptions::new().write(true).open(&fifo) {
+                Ok(to) => to,
+                Err(x) => return (0, Err(x)),
+            };
+            let mut sent = 0;
+            let mut block: &[u8] = head;
+            while sent < most {
+                if let Err(x) = to.write_all(block) {
+                    return (sent, Err(x));
+                }
+                sent += block.len() as u64;
+                block = &[0; 4096];
+            }
+            (sent, Ok(()))
+        })
+    }
+
+    /// A database for `import swe` on a FIFO whose writer does not stop: the copy ends one
+    /// byte over the database limit, well under the limit of other streams, and the command
+    /// is refused with the importer's words for a database that is too large.
+    #[cfg(unix)]
+    #[test]
+    fn an_endless_swe_database_stream_is_refused_as_too_large() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("plant.db");
+        mkfifo(&fifo);
+        let writer = endless_writer(&fifo, b"SQLite format 3\0", 8 << 20);
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "swe".as_ref(),
+            fifo.as_os_str(),
+        ])
+        .unwrap();
+        let (_, spool) = spooled_within(cli, SMALL);
+        let why = spool.map(|_| ()).unwrap_err();
+        assert_eq!(why, format!("{}: is larger than 0 MB", fifo.display()));
+        // The reader left: the writer was stopped, long before the limit of other streams.
+        let (sent, end) = writer.join().unwrap();
+        assert_eq!(end.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(sent < SMALL.stream, "{sent}");
+    }
+
+    /// The database limit is for a database only: an archive for `import swe` and its symbol
+    /// map, both larger than that on FIFOs that end, are copied whole.
+    #[cfg(unix)]
+    #[test]
+    fn a_finite_swe_archive_stream_and_its_symbol_map_are_copied_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (archive, map) = (tmp.path().join("plant.tewzip"), tmp.path().join("map.toml"));
+        mkfifo(&archive);
+        mkfifo(&map);
+        let len = SMALL.database as usize + 4096;
+        let mut zip = b"PK\x03\x04".to_vec();
+        zip.resize(len, 0);
+        // The header on the symbol map: only the first input is a database.
+        let mut text = b"SQLite format 3\0".to_vec();
+        text.resize(len, b'#');
+        let writers = [writer(&archive, zip.clone()), writer(&map, text.clone())];
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "swe".as_ref(),
+            archive.as_os_str(),
+            "--symbol-map".as_ref(),
+            map.as_os_str(),
+        ])
+        .unwrap();
+        let (inputs, spool) = spooled_within(cli, SMALL);
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+        let spool = spool.unwrap().unwrap();
+        assert_eq!(inputs.len(), 2);
+        assert!(inputs.iter().all(|i| i.starts_with(spool.path())), "{inputs:?}");
+        assert!(std::fs::read(&inputs[0]).unwrap() == zip);
+        assert!(std::fs::read(&inputs[1]).unwrap() == text);
+    }
+
+    /// A stream no importer limit applies to is refused when it has more than the limit for
+    /// every stream, by the name the operand has; a regular file larger than that is not
+    /// copied and not refused.
+    #[cfg(unix)]
+    #[test]
+    fn an_endless_stream_without_an_importer_limit_is_refused_by_its_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cli = Cli::try_parse_from(["wiringcraft", "import", "pdf", "/dev/zero"]).unwrap();
+        let (_, spool) = spooled_within(cli, SMALL);
+        assert_eq!(
+            spool.map(|_| ()).unwrap_err(),
+            "/dev/zero: the stream is larger than 1 MB"
+        );
+        // A database header does not make another command's input a database.
+        let fifo = tmp.path().join("plan.pdf");
+        mkfifo(&fifo);
+        let writer = endless_writer(&fifo, b"SQLite format 3\0", 8 << 20);
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "pdf".as_ref(),
+            fifo.as_os_str(),
+        ])
+        .unwrap();
+        let (_, spool) = spooled_within(cli, SMALL);
+        let why = spool.map(|_| ()).unwrap_err();
+        assert_eq!(why, format!("{}: the stream is larger than 1 MB", fifo.display()));
+        let (sent, end) = writer.join().unwrap();
+        assert_eq!(end.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(sent > SMALL.stream, "{sent}");
+
+        let file = tmp.path().join("large.pdf");
+        std::fs::write(&file, vec![0; SMALL.stream as usize + 4096]).unwrap();
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "pdf".as_ref(),
+            file.as_os_str(),
+        ])
+        .unwrap();
+        let (inputs, spool) = spooled_within(cli, SMALL);
+        assert!(spool.unwrap().is_none());
+        assert_eq!(inputs, [file]);
+    }
+
+    /// A FIFO made with `mkfifo` at `path`.
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(path)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    /// One writer on another thread that opens the FIFO at `fifo` once and writes `bytes`.
+    #[cfg(unix)]
+    fn writer(fifo: &Path, bytes: Vec<u8>) -> std::thread::JoinHandle<std::io::Result<()>> {
+        use std::io::Write;
+        let fifo = fifo.to_path_buf();
+        std::thread::spawn(move || std::fs::OpenOptions::new().write(true).open(&fifo)?.write_all(&bytes))
+    }
+
+    /// Two differently named operands that are one FIFO: it is read once, each operand keeps
+    /// its own name, so the importer gives each its own id.
+    #[cfg(unix)]
+    #[test]
+    fn two_names_of_one_fifo_keep_their_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("pipe");
+        mkfifo(&fifo);
+        let (first, second) = (tmp.path().join("first.elmt"), tmp.path().join("second.elmt"));
+        std::os::unix::fs::symlink(&fifo, &first).unwrap();
+        std::os::unix::fs::symlink(&fifo, &second).unwrap();
+        let element =
+            "<definition type=\"element\"><description><terminal x=\"0\" y=\"0\"/></description></definition>";
+        let writer = writer(&fifo, element.as_bytes().to_vec());
+        let lib = tmp.path().join("lib");
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "symbol-qet".as_ref(),
+            first.as_os_str(),
+            second.as_os_str(),
+            "--lib".as_ref(),
+            lib.as_os_str(),
+        ])
+        .unwrap();
+        let (inputs, spool) = spooled(cli);
+        writer.join().unwrap().unwrap();
+        let spool = spool.unwrap();
+        assert_eq!(inputs.len(), 2);
+        for (input, operand) in inputs.iter().zip([&first, &second]) {
+            assert!(input.starts_with(spool.path()), "{inputs:?}");
+            assert_eq!(input.file_name(), operand.file_name());
+            assert_eq!(std::fs::read_to_string(input).unwrap(), element);
+        }
+        let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
+        assert_eq!((written, failed), (2, 0));
+        assert!(lib.join("symbols").join("qet.first.json").exists());
+        assert!(lib.join("symbols").join("qet.second.json").exists());
+    }
+
+    /// An Eplan `.elk` FIFO whose `.edb` folder is beside it: the importer, given the copy,
+    /// still finds the folder and reads the project's page from it.
+    #[cfg(unix)]
+    #[test]
+    fn the_folder_of_an_elk_fifo_is_found_from_its_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let edb = tmp.path().join("plant.edb");
+        std::fs::create_dir(&edb).unwrap();
+        // One page record as the importer reads it: padding, the record start, its own
+        // reference (class 4, a page, id 10), the page name and its properties block.
+        let mut page = vec![0u8; 24];
+        page.extend([0x0a, 0, 0, 0, 0x38, 0, 0xff, 0xff]);
+        page.extend(60001u16.to_le_bytes());
+        page.extend(4u16.to_le_bytes());
+        page.extend(10u32.to_le_bytes());
+        page.extend(61101u16.to_le_bytes());
+        page.extend(b"1\0");
+        page.extend(60011u16.to_le_bytes());
+        page.extend(11011u16.to_le_bytes());
+        page.extend(0u16.to_le_bytes());
+        page.extend(b"en_US@MAIN CIRCUIT;\0");
+        page.extend([0xff, 0xff]);
+        std::fs::write(edb.join("page.eod"), &page).unwrap();
+        let fifo = tmp.path().join("plant.elk");
+        mkfifo(&fifo);
+        let writer = writer(&fifo, b"plant.edb\r\n12.0\r\n".to_vec());
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "eplan".as_ref(),
+            fifo.as_os_str(),
+        ])
+        .unwrap();
+        let (inputs, spool) = spooled(cli);
+        writer.join().unwrap().unwrap();
+        let spool = spool.unwrap();
+        assert!(inputs[0].starts_with(spool.path()), "{inputs:?}");
+        let (tables, warnings) = wc_import::run::eplan_tables(&inputs[0]).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(tables.get("page.eod"), Some(&page));
+        let project = wc_import::eplan::read(&tables).unwrap();
+        let pages: Vec<(&str, &str)> = project
+            .pages
+            .iter()
+            .map(|p| (p.name.as_str(), p.description.as_str()))
+            .collect();
+        assert_eq!(pages, [("1", "MAIN CIRCUIT")]);
+        // The original folder is linked, not copied or moved: it is still where it was.
+        drop(spool);
+        assert!(edb.join("page.eod").exists());
+    }
+
+    // Used by the stream tests, which run on Unix only.
+    #[cfg(unix)]
+    const ELEMENT: &str =
+        "<definition type=\"element\"><description><terminal x=\"0\" y=\"0\"/></description></definition>";
+
+    /// A FIFO whose id an earlier element has is not opened: the import refuses it for its
+    /// id, so a FIFO without a writer does not hold the command up. When the earlier file is
+    /// no element, the FIFO is read and imported.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_with_the_id_of_an_earlier_element_is_not_opened() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let (file, fifo) = (a.join("lamp.elmt"), b.join("lamp.elmt"));
+        mkfifo(&fifo);
+        let parse = |lib: &Path| {
+            Cli::try_parse_from([
+                "wiringcraft".as_ref(),
+                "import".as_ref(),
+                "symbol-qet".as_ref(),
+                file.as_os_str(),
+                fifo.as_os_str(),
+                "--lib".as_ref(),
+                lib.as_os_str(),
+            ])
+            .unwrap()
+        };
+        // No writer: a copy of the FIFO would never end.
+        std::fs::write(&file, ELEMENT).unwrap();
+        let lib = tmp.path().join("lib");
+        let (inputs, spool) = spooled(parse(&lib));
+        assert!(spool.is_none());
+        assert_eq!(inputs, [file.clone(), fifo.clone()]);
+        let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
+        assert_eq!((written, failed), (1, 1));
+
+        std::fs::write(&file, "no element").unwrap();
+        let lib = tmp.path().join("lib2");
+        let writer = writer(&fifo, ELEMENT.as_bytes().to_vec());
+        let (inputs, spool) = spooled(parse(&lib));
+        writer.join().unwrap().unwrap();
+        let spool = spool.unwrap();
+        assert!(inputs[1].starts_with(spool.path()), "{inputs:?}");
+        let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
+        assert_eq!((written, failed), (1, 1));
+        assert!(lib.join("symbols").join("qet.lamp.json").exists());
+    }
+
+    /// A stream that cannot be opened (a socket) is left to the import, which counts it as
+    /// failed and imports the elements before and after it.
+    #[cfg(unix)]
+    #[test]
+    fn a_stream_that_cannot_be_opened_fails_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (before, socket, after) = (
+            tmp.path().join("before.elmt"),
+            tmp.path().join("socket.elmt"),
+            tmp.path().join("after.elmt"),
+        );
+        std::fs::write(&before, ELEMENT).unwrap();
+        std::fs::write(&after, ELEMENT).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let lib = tmp.path().join("lib");
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "symbol-qet".as_ref(),
+            before.as_os_str(),
+            socket.as_os_str(),
+            after.as_os_str(),
+            "--lib".as_ref(),
+            lib.as_os_str(),
+        ])
+        .unwrap();
+        let (inputs, spool) = spooled(cli);
+        assert!(spool.is_none());
+        assert_eq!(inputs, [before, socket, after]);
+        let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
+        assert_eq!((written, failed), (2, 1));
+        assert!(lib.join("symbols").join("qet.before.json").exists());
+        assert!(lib.join("symbols").join("qet.after.json").exists());
+    }
+
+    /// A FIFO named twice is read once: its one writer writes one element, the first operand
+    /// gets the copy, and the second is left unread, as the importer refuses it for its id as
+    /// it does for a file.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_named_twice_is_copied_once() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("lamp.elmt");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let element =
+            "<definition type=\"element\"><description><terminal x=\"0\" y=\"0\"/></description></definition>";
+        let writer = {
+            let fifo = fifo.clone();
+            std::thread::spawn(move || {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&fifo)?
+                    .write_all(element.as_bytes())
+            })
+        };
+        let lib = tmp.path().join("lib");
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "symbol-qet".as_ref(),
+            fifo.as_os_str(),
+            fifo.as_os_str(),
+            "--lib".as_ref(),
+            lib.as_os_str(),
+        ])
+        .unwrap();
+        let (inputs, spool) = spooled(cli);
+        writer.join().unwrap().unwrap();
+        let spool = spool.unwrap();
+        assert_eq!(inputs.len(), 2);
+        assert!(inputs[0].starts_with(spool.path()), "{inputs:?}");
+        assert_eq!(inputs[0].file_name(), fifo.file_name());
+        assert_eq!(std::fs::read_to_string(&inputs[0]).unwrap(), element);
+        assert_eq!(inputs[1], fifo);
+        let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
+        assert_eq!((written, failed), (1, 1));
+        assert!(lib.join("symbols").join("qet.lamp.json").exists());
+    }
+
+    /// An element stream without an end is copied up to one byte over what the importer
+    /// reads, and refused by it as too large: that element fails, the command does not.
+    #[cfg(unix)]
+    #[test]
+    fn an_endless_element_stream_is_copied_up_to_the_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("lib");
+        let cli = Cli::try_parse_from([
+            "wiringcraft".as_ref(),
+            "import".as_ref(),
+            "symbol-qet".as_ref(),
+            "/dev/zero".as_ref(),
+            "--lib".as_ref(),
+            lib.as_os_str(),
+        ])
+        .unwrap();
+        let (inputs, spool) = spooled(cli);
+        assert!(spool.is_some());
+        let len = std::fs::metadata(&inputs[0]).unwrap().len();
+        assert_eq!(len, wc_import::qet::MAX_LEN as u64 + 1);
+        let (written, failed) = import_qet(&inputs, &lib, "qet.", 0.5, "", "").unwrap();
+        assert_eq!((written, failed), (0, 1));
     }
 }
