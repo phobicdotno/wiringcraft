@@ -195,13 +195,26 @@ struct Kept {
 struct Step {
     project: Project,
     files: Vec<FileEdit>,
+    /// Tells this step apart from every other, for finding it again (see
+    /// [`Open::take_back_move`]). A step keeps it when Undo and Redo move it between the two
+    /// histories.
+    id: u64,
+    /// How far the running move drag had moved its items in `project` (see
+    /// [`Open::drag_offset`]); zero outside a drag.
+    offset: Point,
+    /// Later steps were folded into this one (an assistant turn, a command): what happened in
+    /// between is no longer in the history, so [`Open::take_back_move`] cannot check it.
+    folded: bool,
 }
 
 impl Step {
-    fn of(project: Project) -> Step {
+    fn new(project: Project, files: Vec<FileEdit>, offset: Point) -> Step {
         Step {
             project,
-            files: Vec::new(),
+            files,
+            id: next_revision(),
+            offset,
+            folded: false,
         }
     }
 }
@@ -487,6 +500,10 @@ pub struct Open {
     /// The terminal numbering before the change in progress (taken at its checkpoint), so
     /// jumpers can follow their terminals once it is done.
     terminals_before: Option<wc_core::project::TerminalNumbers>,
+    /// How far the running select-tool move drag has moved its items in `project`: kept with
+    /// every undo and redo step taken during the drag, so Escape can take back from each just
+    /// the part of the move it holds (#863). Zero outside a drag.
+    drag_offset: Point,
     /// In a shared session, the pages someone else has open (page id to their name). Tools that
     /// work on every page leave these alone; the session would refuse the change otherwise.
     pub held_by_others: BTreeMap<String, String>,
@@ -601,6 +618,7 @@ impl Open {
             underlays: BTreeMap::new(),
             picture_problems: BTreeMap::new(),
             terminals_before: None,
+            drag_offset: Point::new(0.0, 0.0),
             held_by_others: BTreeMap::new(),
             symbol_versions: BTreeMap::new(),
             part_versions: BTreeMap::new(),
@@ -1215,7 +1233,8 @@ impl Open {
         // snapshot and this change start from that.
         self.follow_terminals();
         self.terminals_before = Some(self.terminal_numbers());
-        self.undo.push(Step::of(self.project.clone()));
+        self.undo
+            .push(Step::new(self.project.clone(), Vec::new(), self.drag_offset));
         self.trim_undo();
         self.redo.clear();
         self.edited();
@@ -1261,6 +1280,99 @@ impl Open {
     /// only part of that change (in a shared session, the part that waits here).
     pub fn before_last_change(&self) -> Option<&Project> {
         self.undo.last().map(|s| &s.project)
+    }
+
+    /// The id of the latest undo step: right after a [`Open::checkpoint`], the step it took.
+    pub fn last_step_id(&self) -> Option<u64> {
+        self.undo.last().map(|s| s.id)
+    }
+
+    /// A select-tool move drag begins: its checkpoint, from which [`Open::drag_move_by`]
+    /// counts how far the items moved.
+    pub fn begin_drag_move(&mut self) {
+        self.drag_offset = Point::new(0.0, 0.0);
+        self.checkpoint();
+    }
+
+    /// One frame of a move drag: [`Open::move_by`], counted in the drag's offset.
+    pub fn drag_move_by(&mut self, page: usize, sel: &[Selection], d: Point) {
+        self.move_by(page, sel, d);
+        self.drag_offset = self.drag_offset + d;
+    }
+
+    /// A move drag ended: later steps are no part of it.
+    pub fn end_drag_move(&mut self) {
+        self.drag_offset = Point::new(0.0, 0.0);
+    }
+
+    /// Whether the undo step `id` is still in the undo history.
+    pub fn has_undo_step(&self, id: u64) -> bool {
+        self.undo.iter().any(|s| s.id == id)
+    }
+
+    /// Take back a move of `items` on page `page` whose checkpoint is the undo step `id`,
+    /// keeping the changes recorded after it (a rotate during the move, #863): the items go back
+    /// by as far as the drag had moved them, now and in every later undo and redo step (each by
+    /// its own part of the move), and the move's own step is dropped, so Undo and Redo then work
+    /// as if the changes after it were made at the start position. Jumpers and strip layouts
+    /// follow the terminals back in each. Refuses with the reason, changing nothing, when that
+    /// step is no longer in the history (the move was undone, or trimmed off the oldest end),
+    /// carries file edits a move never makes, has later steps folded into it or after it (an
+    /// assistant turn, whose steps in between can no longer be checked), or a drawing, cloud or
+    /// wire on the page was added or deleted since (`items` names those by place in their list).
+    pub fn take_back_move(&mut self, id: u64, page: &str, items: &[Selection]) -> Result<(), &'static str> {
+        let Some(at) = self.undo.iter().position(|s| s.id == id) else {
+            return Err("the move is no longer in the undo history");
+        };
+        let Some(first) = self.undo.get(at) else {
+            return Err("the move is no longer in the undo history");
+        };
+        let counts = |p: &Project| p.page(page).map(|p| (p.graphics.len(), p.clouds.len(), p.wires.len()));
+        let start = counts(&first.project);
+        let later = self.undo.iter().skip(at + 1).chain(&self.redo).map(|s| &s.project);
+        // Dropping the move's step would shift the start of an assistant turn begun after it,
+        // and the turn would no longer fold into one step.
+        if self.turn.is_some_and(|t| t > self.undo_dropped + at) {
+            return Err("an assistant turn started after it is still running");
+        }
+        if self.undo.iter().skip(at).chain(&self.redo).any(|s| s.folded) {
+            return Err("an assistant turn during it was recorded as one step");
+        }
+        if !first.files.is_empty() {
+            return Err("project files were changed with it");
+        }
+        if later.chain([&self.project]).any(|p| counts(p) != start) {
+            return Err("items were added or deleted during it");
+        }
+        // The change in progress (the move's frames since the last checkpoint) is followed first.
+        self.follow_terminals();
+        let symbols = &self.symbols;
+        let role = |id: &str| symbols.get(id).map(|s| s.role);
+        let back = |p: &mut Project, d: Point| {
+            let before = p
+                .meta
+                .follows_terminals()
+                .then(|| wc_core::project::terminal_numbers(p, role));
+            if let Some(pg) = p.page_mut(page) {
+                crate::edit::move_items(pg, items, Point::new(-d.x, -d.y));
+            }
+            if let Some(before) = before {
+                wc_core::project::follow_terminals_in(p, &before, role);
+            }
+        };
+        for s in self.undo.iter_mut().skip(at + 1).chain(self.redo.iter_mut()) {
+            back(&mut s.project, s.offset);
+            s.offset = Point::new(0.0, 0.0);
+        }
+        back(&mut self.project, self.drag_offset);
+        self.drag_offset = Point::new(0.0, 0.0);
+        if self.terminals_before.is_some() {
+            self.terminals_before = Some(self.terminal_numbers());
+        }
+        self.undo.remove(at);
+        self.history += 1;
+        self.edited();
+        Ok(())
     }
 
     /// Forget the latest undo step, once its change was taken back another way.
@@ -1334,7 +1446,11 @@ impl Open {
             let held = self.marks == 0 && self.turn.is_some_and(|t| t <= self.undo_dropped);
             if held {
                 let next = self.undo.remove(1);
-                self.undo[0].files.extend(next.files);
+                if let Some(first) = self.undo.first_mut() {
+                    first.files.extend(next.files);
+                    // What the folded step did is no longer checkable on its own.
+                    first.folded = true;
+                }
             } else {
                 self.undo.remove(0);
             }
@@ -1370,6 +1486,7 @@ impl Open {
             let later: Vec<FileEdit> = self.undo.drain(start + 1..).flat_map(|s| s.files).collect();
             if let Some(first) = self.undo.get_mut(start) {
                 first.files.extend(later);
+                first.folded = true;
             }
             self.history += 1;
             self.touch();
@@ -1405,10 +1522,22 @@ impl Open {
                     }
                 };
                 self.forget_terminal_change();
-                let Step { project, files } = prev;
-                self.redo.push(Step {
-                    project: std::mem::replace(&mut self.project, project),
+                let Step {
+                    project,
                     files,
+                    id,
+                    offset,
+                    folded,
+                } = prev;
+                let now = std::mem::replace(&mut self.project, project);
+                // The step keeps its id across Undo and Redo, so a move redone during its drag
+                // is still found by Escape.
+                self.redo.push(Step {
+                    project: now,
+                    files,
+                    id,
+                    offset: std::mem::replace(&mut self.drag_offset, offset),
+                    folded,
                 });
                 let left = self
                     .redo
@@ -1429,9 +1558,12 @@ impl Open {
                         };
                         let restored = std::mem::replace(&mut self.project, cur.project);
                         self.undo_error = Some(e);
+                        let offset = std::mem::replace(&mut self.drag_offset, cur.offset);
+                        // The step goes back whole: its id and folded mark too.
                         self.undo.push(Step {
                             project: restored,
-                            files: cur.files,
+                            offset,
+                            ..cur
                         });
                     }
                     return false;
@@ -1462,10 +1594,22 @@ impl Open {
                     }
                 };
                 self.forget_terminal_change();
-                let Step { project, files } = next;
-                self.undo.push(Step {
-                    project: std::mem::replace(&mut self.project, project),
+                let Step {
+                    project,
                     files,
+                    id,
+                    offset,
+                    folded,
+                } = next;
+                let now = std::mem::replace(&mut self.project, project);
+                // The step keeps its id across Undo and Redo, so a move redone during its drag
+                // is still found by Escape.
+                self.undo.push(Step {
+                    project: now,
+                    files,
+                    id,
+                    offset: std::mem::replace(&mut self.drag_offset, offset),
+                    folded,
                 });
                 let left = self
                     .undo
@@ -1485,9 +1629,12 @@ impl Open {
                         };
                         let restored = std::mem::replace(&mut self.project, cur.project);
                         self.undo_error = Some(e);
+                        let offset = std::mem::replace(&mut self.drag_offset, cur.offset);
+                        // The step goes back whole: its id and folded mark too.
                         self.redo.push(Step {
                             project: restored,
-                            files: cur.files,
+                            offset,
+                            ..cur
                         });
                     }
                     return false;
@@ -5042,6 +5189,70 @@ pub(crate) mod tests {
 
     /// A project with a macro saved twice from its form (descriptions "A coil", then "Two"),
     /// and the file's text after each save.
+    #[test]
+    fn a_failed_undo_or_redo_keeps_the_steps_mark_for_taking_a_move_back() {
+        use wc_core::geom::Shape;
+        let line = |x: f64| Shape::Line {
+            a: Point::new(x, 100.0),
+            b: Point::new(x + 10.0, 100.0),
+        };
+        let (_tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let Some(g) = o.add_graphic(1, line(10.0)) else {
+            unreachable!()
+        };
+        let page = o.project.pages[1].id.clone();
+        // A move's checkpoint, then an assistant turn that deletes the line and draws another:
+        // the same count of drawings, folded into one step.
+        o.begin_drag_move();
+        let Some(id) = o.last_step_id() else { unreachable!() };
+        o.drag_move_by(1, std::slice::from_ref(&g), Point::new(-40.0, 0.0));
+        let mark = o.start_turn();
+        o.delete_many(1, std::slice::from_ref(&g));
+        o.add_graphic(1, line(200.0));
+        o.squash_undo(mark);
+        let symbol = o.project.lock.symbols.keys().next().unwrap().clone();
+        let fail = |o: &mut Open| {
+            o.stale_symbol_files.insert(symbol.clone());
+            o.fail_symbol_writes = [true].into();
+        };
+        let pass = |o: &mut Open| {
+            o.stale_symbol_files.clear();
+            o.fail_symbol_writes = Default::default();
+        };
+        // A failed Undo puts the folded step back as it was.
+        fail(&mut o);
+        assert!(!o.undo());
+        assert!(o.take_undo_error().is_some());
+        pass(&mut o);
+        assert!(o.take_back_move(id, &page, std::slice::from_ref(&g)).is_err());
+        // The same for a failed Redo, with the folded step waiting in the redo history.
+        assert!(o.undo(), "{:?}", o.take_undo_error());
+        fail(&mut o);
+        assert!(!o.redo());
+        assert!(o.take_undo_error().is_some());
+        pass(&mut o);
+        assert!(o.take_back_move(id, &page, std::slice::from_ref(&g)).is_err());
+    }
+
+    #[test]
+    fn a_move_is_not_taken_back_under_an_assistant_turn_begun_after_it() {
+        let (_tmp, mut o) = project();
+        let id = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let sel = [Selection::Symbol(id)];
+        let page = o.project.pages[1].id.clone();
+        o.begin_drag_move();
+        let Some(step) = o.last_step_id() else { unreachable!() };
+        o.drag_move_by(1, &sel, Point::new(-10.0, 0.0));
+        let mark = o.start_turn();
+        o.rotate_many(1, &sel);
+        o.rotate_many(1, &sel);
+        assert!(o.take_back_move(step, &page, &sel).is_err());
+        let steps = o.undo_steps();
+        o.squash_undo(mark);
+        assert_eq!(o.undo_steps(), steps - 1, "the turn's two steps fold into one");
+    }
+
     fn macro_edited_twice() -> (tempfile::TempDir, Open, PathBuf, [String; 3]) {
         let (tmp, mut o) = project();
         let id = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
