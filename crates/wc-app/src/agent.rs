@@ -4643,6 +4643,21 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_stopped_before_it_began_ends_its_undo_mark() {
+        let (_tmp, mut a) = app(vec![]);
+        let o = a.open.as_mut().unwrap();
+        let steps = o.undo_steps();
+        a.assistant.turn = Some((o.dir.clone(), o.start_turn()));
+        o.checkpoint();
+        o.checkpoint();
+        assert!(!a.assistant.busy());
+        a.assistant_stop();
+        assert!(a.assistant.turn.is_none());
+        let o = a.open.as_ref().unwrap();
+        assert_eq!(o.undo_steps(), steps + 1, "what the turn did is one step");
+    }
+
+    #[test]
     fn the_assistant_reads_and_replaces_the_plc_racks_as_one_undo_step() {
         let (_tmp, mut a) = app(vec![]);
         let read = |a: &mut App| -> Value {

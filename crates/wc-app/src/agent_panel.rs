@@ -232,12 +232,7 @@ impl App {
             }
         }
         if finished {
-            // Everything the assistant changed in this turn is one undo step.
-            if let (Some((dir, mark)), Some(open)) = (self.assistant.turn.take(), self.open.as_mut())
-                && open.dir == dir
-            {
-                open.squash_undo(mark);
-            }
+            self.end_turn();
         }
         if self.assistant.busy()
             || self
@@ -250,10 +245,25 @@ impl App {
         }
     }
 
-    fn assistant_stop(&mut self) {
+    pub(crate) fn assistant_stop(&mut self) {
         self.assistant.session.stop();
         if let Some(c) = self.assistant.acp.as_mut() {
             c.cancel();
+        }
+        // Stopped before it began (Claude Code still starting): no finish will end the turn.
+        // A turn still running keeps its mark and ends when it finishes.
+        if !self.assistant.busy() {
+            self.end_turn();
+        }
+    }
+
+    /// The assistant's turn is over: everything it changed is one undo step, and the project
+    /// no longer holds the turn's first step at the front of a full history.
+    fn end_turn(&mut self) {
+        if let (Some((dir, mark)), Some(open)) = (self.assistant.turn.take(), self.open.as_mut())
+            && open.dir == dir
+        {
+            open.squash_undo(mark);
         }
     }
 
