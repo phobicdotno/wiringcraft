@@ -4710,7 +4710,8 @@ mod tests {
     /// assistant knows each one exists (the names come from `enum Cmd` in wc-cli's main.rs).
     #[test]
     fn run_command_names_every_command_line_command() {
-        let cli = include_str!("../../wc-cli/src/main.rs");
+        // A Windows checkout may have CRLF line endings; normalise so the delimiters match.
+        let cli = include_str!("../../wc-cli/src/main.rs").replace("\r\n", "\n");
         let body = cli.split("\nenum Cmd {\n").nth(1).unwrap();
         let body = &body[..body.find("\n}\n").unwrap()];
         let commands: Vec<String> = body
