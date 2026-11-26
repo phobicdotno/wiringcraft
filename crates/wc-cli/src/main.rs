@@ -7761,6 +7761,35 @@ mod tests {
     }
 
     #[test]
+    fn place_checks_the_turn_and_tag_before_taking_the_symbol() {
+        let Ok(tmp) = tempfile::tempdir() else { unreachable!() };
+        let dir = tmp.path().join("proj");
+        let Some(path) = dir.to_str() else { unreachable!() };
+        let Ok(cmd) = Cli::try_parse_from(["wiringcraft", "new", path, "--no-git"]) else {
+            unreachable!()
+        };
+        assert!(run(cmd).is_ok());
+        let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+        let Some(starter) = starter.to_str() else {
+            unreachable!()
+        };
+        assert!(cli(&dir, &["lib", "add", "starter", "folder", starter]).is_ok());
+        assert!(cli(&dir, &["page", "add", "p1", "--number", "1"]).is_ok());
+
+        for bad in [["--rotate", "45"], ["--tag", "-K1."]] {
+            let mut args = vec!["place", "p1", "wc.coil", "--at", "50,50"];
+            args.extend(bad);
+            assert!(cli(&dir, &args).is_err(), "{bad:?}");
+            assert!(
+                store::read_vendored_symbol(&dir, "wc.coil").is_err(),
+                "no copy left by {bad:?}"
+            );
+            let Ok(p) = load(&dir) else { unreachable!() };
+            assert!(!p.lock.symbols.contains_key("wc.coil"), "no lock entry from {bad:?}");
+        }
+    }
+
+    #[test]
     fn a_black_box_is_drawn_wired_tagged_listed_and_reloaded() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
