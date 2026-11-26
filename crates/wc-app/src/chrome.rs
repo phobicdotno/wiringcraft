@@ -66,6 +66,7 @@ const MENUS: &[(&str, &[Option<Action>])] = &[
             Some(Action::Cut),
             Some(Action::Copy),
             Some(Action::Paste),
+            Some(Action::Duplicate),
             Some(Action::SelectAll),
             Some(Action::Find),
             None,
