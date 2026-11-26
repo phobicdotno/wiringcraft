@@ -7475,6 +7475,86 @@ mod nudge_tests {
         );
     }
 
+    /// A base project fetched for a new project while Ctrl+S waits a frame for a typed value
+    /// does not replace the open project first: the open project is saved with the typed value,
+    /// and the new one still waits (#932).
+    #[test]
+    fn a_fetched_project_waits_while_a_save_waits_for_a_typed_value() {
+        let (tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        let mut frame = eframe::Frame::_new_kittest();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        let field = egui::Id::new(panels::TAG_FIELD);
+        let mut frame_with = |app: &mut App, events: Vec<egui::Event>, modifiers: Modifiers| {
+            let raw = egui::RawInput {
+                events,
+                modifiers,
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| eframe::App::update(app, ctx, &mut frame));
+        };
+        let tag = |app: &App| {
+            let open = app.open.as_ref().unwrap();
+            open.project.pages[app.ed.page].symbols[1]
+                .tag
+                .as_ref()
+                .map(ToString::to_string)
+        };
+        frame_with(&mut app, Vec::new(), Modifiers::NONE);
+        ctx.memory_mut(|m| m.request_focus(field));
+        frame_with(&mut app, Vec::new(), Modifiers::NONE);
+        assert!(
+            ctx.memory(|m| m.has_focus(field)),
+            "the device tag field has the keyboard"
+        );
+        let typed = format!("{}7", tag(&app).unwrap());
+        let was_open = app.open.as_ref().unwrap().dir.clone();
+        // A new project's base project is fetched, and its outcome is already in.
+        let new_dir = tmp.path().join("fetched");
+        wc_core::store::create(&new_dir, "Fetched").unwrap();
+        let (tx, done) = std::sync::mpsc::channel();
+        tx.send(Ok(())).unwrap();
+        app.fetch = Some(BaseFetch {
+            dir: new_dir,
+            source: "https://example.invalid/base.git".into(),
+            was_open: Some(was_open.clone()),
+            made: false,
+            cancel: std::sync::Arc::default(),
+            done,
+        });
+        let save = egui::Event::Key {
+            key: Key::S,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        };
+        frame_with(&mut app, vec![egui::Event::Text("7".into()), save], Modifiers::COMMAND);
+        assert_eq!(app.after_typed, [Action::Save], "the save waits a frame");
+        assert_eq!(
+            app.open.as_ref().map(|o| &o.dir),
+            Some(&was_open),
+            "the fetched project does not replace the open one while the save waits"
+        );
+        frame_with(&mut app, Vec::new(), Modifiers::NONE);
+        assert!(app.after_typed.is_empty(), "the save ran");
+        let open = app.open.as_ref().unwrap();
+        assert_eq!(open.dir, was_open, "the open project was saved before any replacement");
+        assert!(!open.dirty, "saved after the value was entered");
+        assert_eq!(tag(&app).as_ref(), Some(&typed), "entered before the save");
+        let saved = wc_core::store::load(&was_open).unwrap();
+        assert!(
+            saved.pages[app.ed.page]
+                .symbols
+                .iter()
+                .any(|s| s.tag.as_ref().is_some_and(|t| t.to_string() == typed)),
+            "the saved project has the typed tag"
+        );
+        assert!(app.fetch.is_some(), "the fetched project still waits to be opened");
+        // Not opened here: opening it would remember it in the user's own settings.
+        app.fetch = None;
+    }
+
     /// A black box form changed and not applied is applied by Ctrl+S: the project read back
     /// from disk has the new point name (#932).
     #[test]
