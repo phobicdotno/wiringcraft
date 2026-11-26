@@ -69,22 +69,37 @@ impl Clipboard {
         self.symbols.is_empty() && self.wires.is_empty() && self.graphics.is_empty()
     }
 
-    /// A plain-text line for the system clipboard: the copied device tags.
+    /// How many items were copied, in words: "1 item", "3 items". Drawings count too.
+    pub fn count(&self) -> String {
+        plural(
+            self.symbols.len() + self.wires.len() + self.graphics.len(),
+            "item",
+            "items",
+        )
+    }
+
+    /// A plain-text line for the system clipboard: what was copied and the copied device tags.
     pub fn summary(&self) -> String {
         let tags: Vec<String> = self
             .symbols
             .iter()
             .filter_map(|s| s.tag.as_ref().map(ToString::to_string))
             .collect();
-        format!(
-            "WiringCraft: {} symbols, {} wires {}",
-            self.symbols.len(),
-            self.wires.len(),
-            tags.join(" ")
-        )
-        .trim_end()
-        .to_owned()
+        let mut what = format!(
+            "{}, {}",
+            plural(self.symbols.len(), "symbol", "symbols"),
+            plural(self.wires.len(), "wire", "wires")
+        );
+        if !self.graphics.is_empty() {
+            what += &format!(", {}", plural(self.graphics.len(), "drawing", "drawings"));
+        }
+        format!("WiringCraft: {what} {}", tags.join(" ")).trim_end().to_owned()
     }
+}
+
+/// `n` with the word for one or for many.
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
 }
 
 fn ids(sel: &[Selection]) -> (BTreeSet<&str>, BTreeSet<&str>) {
@@ -1577,6 +1592,29 @@ mod tests {
         let left = &o.project.pages[page].graphics;
         assert_eq!(left.len(), 3);
         assert!(matches!(&left[0], Shape::Text { text, .. } if text == "Pump 2"));
+    }
+
+    #[test]
+    fn copying_only_a_drawing_counts_it() {
+        let (_tmp, mut o, page, _a, _b) = setup();
+        let line = o
+            .add_graphic(
+                page,
+                Shape::Line {
+                    a: Point::new(200.0, 20.0),
+                    b: Point::new(260.0, 20.0),
+                },
+            )
+            .unwrap();
+        let clip = o.copy(page, &[line]);
+        assert!(!clip.is_empty());
+        assert_eq!(clip.count(), "1 item");
+        assert_eq!(clip.summary(), "WiringCraft: 0 symbols, 0 wires, 1 drawing");
+        // With symbols and the wire too, the drawing is counted with them.
+        let all = o.select_all(page);
+        let clip = o.copy(page, &all);
+        assert_eq!(clip.count(), "4 items");
+        assert!(clip.summary().starts_with("WiringCraft: 2 symbols, 1 wire, 1 drawing "));
     }
 
     #[test]

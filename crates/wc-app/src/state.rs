@@ -1237,6 +1237,13 @@ impl Open {
         changed
     }
 
+    /// Follow the terminals from `before` (numbers taken earlier) to now: for taking a change
+    /// back, the jumpers go back with their terminals the way they followed them there.
+    pub fn follow_terminals_from(&mut self, before: wc_core::project::TerminalNumbers) -> bool {
+        self.terminals_before = Some(before);
+        self.follow_terminals()
+    }
+
     /// Forget the change in progress without following it: the project was replaced as a whole
     /// (undo, redo, a command's result), and its jumpers already belong to its drawing.
     pub fn forget_terminal_change(&mut self) {
