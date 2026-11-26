@@ -1585,11 +1585,16 @@ impl App {
             }
             Action::SaveAs => self.pending = Some(Pending::SaveAs),
             Action::Undo | Action::Redo => {
+                let before = panel_pick_before(&self.ed, &open.project);
                 // As in a shared session: a panel device drag going on ends here.
                 self.ed.panel_drag = None;
                 let done = if a == Action::Undo { open.undo() } else { open.redo() };
                 if done {
                     self.ed.selection.clear();
+                    // The whole project is swapped: show the same panel and pick the same item.
+                    if let Some((id, pick)) = &before {
+                        follow_panel_pick(&mut self.ed, &open.project, id, pick.as_ref());
+                    }
                     if let Some(w) = open.take_step_warning() {
                         self.ed.message = format!("Done, but {w}.");
                     }
@@ -6047,7 +6052,7 @@ fn confirm_page_props(
 }
 
 /// The shown panel's id and its picked item with that item's place, kept before a shared-session
-/// sync so `follow_panel_pick` can find them again afterwards.
+/// sync, undo or redo so `follow_panel_pick` can find them again afterwards.
 fn panel_pick_before(
     ed: &Editor,
     project: &wc_core::Project,
@@ -6057,7 +6062,7 @@ fn panel_pick_before(
     Some((p.id.clone(), pick))
 }
 
-/// After a shared-session sync: show panel `id` and pick its item again, wherever they are now.
+/// After a shared-session sync, or an undo or redo: show panel `id` and pick its item again, wherever they are now.
 /// A device is found by its tag; a rail or duct by its kind and exact place and size, at its old
 /// place in the list when it is still there. A panel or item that is gone is no longer shown or
 /// picked.
@@ -7554,6 +7559,55 @@ mod menu_action_tests {
         assert_eq!(rotation(&a, &id), wc_core::geom::Rotation::R90);
         assert!(a.ed.menu_action.is_none(), "run once");
         assert!(a.open.as_ref().unwrap().can_undo());
+    }
+
+    #[test]
+    fn undo_and_redo_keep_the_panel_and_its_picked_device() {
+        use wc_core::panel::{Panel, PanelItem};
+        let device = |tag: &str, x: f64| PanelItem::Device {
+            tag: wc_core::DeviceTag::parse(tag).unwrap(),
+            at: wc_core::Point::new(x, 0.0),
+            width: 10.0,
+            height: 10.0,
+            rotation: wc_core::geom::Rotation::R0,
+        };
+        let (_tmp, mut a, _) = app();
+        let mut panel = Panel::new("panel2", "Panel 2", 600.0, 800.0);
+        panel.items = vec![device("-A1", 0.0), device("-B1", 30.0)];
+        a.open.as_mut().unwrap().project.panels.push(panel);
+        a.ed.selection.clear();
+        a.ed.panel = Some(0);
+        // Delete device A, then pick device B.
+        a.ed.panel_pick = Some(0);
+        a.ed.menu_action = Some(Action::Delete);
+        a.run_menu_action();
+        assert_eq!(
+            a.open.as_ref().unwrap().project.panels[0].items,
+            vec![device("-B1", 30.0)]
+        );
+        a.ed.panel_pick = Some(0);
+        // A new panel sorted first, so the shown one moves in the list after Undo and Redo.
+        a.open
+            .as_mut()
+            .unwrap()
+            .project
+            .panels
+            .insert(0, Panel::new("panel1", "Panel 1", 10.0, 10.0));
+        a.ed.panel = Some(1);
+        // Undo brings A back in front of B: B stays picked, on the same panel.
+        a.ed.menu_action = Some(Action::Undo);
+        a.run_menu_action();
+        let o = a.open.as_ref().unwrap();
+        assert_eq!(o.project.panels.len(), 1);
+        assert_eq!((a.ed.panel, a.ed.panel_pick), (Some(0), Some(1)));
+        // Redo takes A off again and brings back the first panel: still panel 2, still B.
+        a.ed.menu_action = Some(Action::Redo);
+        a.run_menu_action();
+        assert_eq!((a.ed.panel, a.ed.panel_pick), (Some(1), Some(0)));
+        assert_eq!(
+            a.open.as_ref().unwrap().project.panels[1].items,
+            vec![device("-B1", 30.0)]
+        );
     }
 
     #[test]
