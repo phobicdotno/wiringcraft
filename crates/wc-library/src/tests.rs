@@ -744,6 +744,53 @@ fn the_starter_functional_earth_is_not_the_protective_earth() -> Result<()> {
 }
 
 #[test]
+fn the_starter_three_phase_transformer_has_primary_and_secondary_terminals() -> Result<()> {
+    // #763: a 3-phase transformer next to the 1-phase control transformer.
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
+    project.meta.libraries = vec![LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: starter.to_string_lossy().into(),
+        reference: None,
+    }];
+    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (t, _) = lib.symbol("wc.transformer.3ph")?;
+    assert_eq!(t.role, SymbolRole::Standalone);
+    assert_eq!(t.letter_code, "T");
+    let names: Vec<_> = t.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["1U", "1V", "1W", "2U", "2V", "2W"]);
+    Ok(())
+}
+
+#[test]
+fn the_starter_fuse_switch_disconnector_has_three_poles_and_its_own_tag() -> Result<()> {
+    // The 3-pole fuse switch disconnector (#725): Q in IEC 81346-2 (it switches and isolates;
+    // the fuses ride on the switch), pins 1 to 6 like the 3-pole breaker, and an example part.
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
+    project.meta.libraries = vec![LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: starter.to_string_lossy().into(),
+        reference: None,
+    }];
+    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (fsd, _) = lib.symbol("wc.fuse.3p")?;
+    assert_eq!(fsd.role, SymbolRole::Standalone);
+    assert_eq!(fsd.letter_code, "Q");
+    let names: Vec<_> = fsd.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["1", "2", "3", "4", "5", "6"]);
+    assert_eq!(
+        lib.part("example.ex-fsd-3p-32")?.0.symbol.as_deref(),
+        Some("wc.fuse.3p")
+    );
+    Ok(())
+}
+
+#[test]
 fn lock_restores_a_deleted_vendored_copy_at_the_pinned_version() -> Result<()> {
     let mut f = fixture()?;
     let lib = Library::open(&f.proj, &f.project)?;
@@ -867,6 +914,33 @@ fn the_starter_ammeter_and_voltmeter_are_measuring_instruments() -> Result<()> {
         let names: Vec<_> = m.pins.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["1", "2"], "{id}");
     }
+    Ok(())
+}
+
+#[test]
+fn starter_two_wire_proximity_sensor_and_its_example_part_load() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
+    project.meta.libraries = vec![LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: starter.to_string_lossy().into(),
+        reference: None,
+    }];
+    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    // The 2-wire proximity sensor (#757): letter code B for a sensor in IEC 81346-2, one wire
+    // in and one out, so it sits in series with the load like a switch.
+    let (prox, _) = lib.symbol("wc.sensor.prox2")?;
+    assert_eq!(prox.role, SymbolRole::Standalone);
+    assert_eq!(prox.letter_code, "B");
+    assert_eq!(prox.category, "sensors");
+    let names: Vec<_> = prox.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["BN", "BU"]);
+    assert_eq!(
+        lib.part("example.ex-px-m12-2w")?.0.symbol.as_deref(),
+        Some("wc.sensor.prox2")
+    );
     Ok(())
 }
 

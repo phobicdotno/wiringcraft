@@ -538,6 +538,57 @@ fn wires_on_an_overview_page_are_not_listed_twice() {
 }
 
 #[test]
+fn an_overview_page_keeps_the_net_names_of_schematic_pages() {
+    let (mut p, s, parts) = fixture();
+    let rows = |p: &Project| {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        wire_list(&i).rows
+    };
+    // The generated name of the net list row with these connections.
+    let net_name = |p: &Project, connections: &str| {
+        let t = net_list(&Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        });
+        let Some(row) = t.rows.iter().find(|r| r[2] == connections) else {
+            unreachable!("no net with {connections}")
+        };
+        row[0].clone()
+    };
+    let schematic_net = "-X1.1:1, =A+C1-K1:14";
+    let before = rows(&p);
+    let before_name = net_name(&p, schematic_net);
+    assert!(before_name.starts_with('N'), "{before_name} is a generated name");
+    assert!(
+        before.iter().any(|r| r[2].starts_with('N')),
+        "the fixture has a net with a generated name"
+    );
+    // The same schematic again, drawn on a line diagram placed before it.
+    let mut overview = p.pages[0].clone();
+    overview.id = "p0".into();
+    overview.number = "0".into();
+    overview.overview = true;
+    // Untagged, so the net list tells the overview's own nets from the schematic's by their pins.
+    for sym in &mut overview.symbols {
+        sym.tag = None;
+    }
+    p.pages.insert(0, overview.clone());
+    assert_eq!(rows(&p), before, "an overview page before the schematic");
+    assert_eq!(net_name(&p, schematic_net), before_name, "net list, overview before");
+    p.pages.remove(0);
+    overview.id = "p9".into();
+    overview.number = "9".into();
+    p.pages.push(overview);
+    assert_eq!(rows(&p), before, "an overview page after the schematic");
+    assert_eq!(net_name(&p, schematic_net), before_name, "net list, overview after");
+}
+
+#[test]
 fn project_check_finds_the_usual_mistakes() {
     let (mut p, s, parts) = fixture();
     {
@@ -3086,6 +3137,30 @@ fn plc_card_overview_links_by_page_id_and_warns_on_points_and_shared_bytes() {
         parts: &parts,
     };
     assert!(!plc_rack_warnings(&i).iter().any(|w| w.contains("slot 3")));
+}
+
+#[test]
+fn project_check_flags_a_wire_on_one_pin_at_both_ends() {
+    let (mut p, s, parts) = fixture();
+    p.pages[0]
+        .wires
+        .push(wire("w5", pin("s2", "13"), pin("s2", "13"), Some("7"), None));
+    p.pages[0]
+        .wires
+        .push(wire("w6", pin("s2", "13"), pin("s2", "14"), Some("8"), None));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found: Vec<_> = check(&i)
+        .into_iter()
+        .filter(|f| f.message.contains("starts and ends on"))
+        .collect();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].severity, Severity::Warning);
+    assert_eq!(found[0].message, "wire 7 starts and ends on =A+C1-K1:13");
+    assert_eq!(found[0].item.as_deref(), Some("w5"));
 }
 
 #[test]

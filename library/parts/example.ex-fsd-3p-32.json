@@ -1,0 +1,14 @@
+{
+  "description": "Fuse switch disconnector 3-pole 32 A, for 10 x 38 mm fuses (example data)",
+  "id": "example.ex-fsd-3p-32",
+  "manufacturer": "Example",
+  "order_number": "EX-FSD-3P-32",
+  "properties": {
+    "Depth": "68 mm",
+    "Fuse size": "10 x 38 mm",
+    "Height": "81 mm",
+    "Rated current": "32 A",
+    "Width": "54 mm"
+  },
+  "symbol": "wc.fuse.3p"
+}

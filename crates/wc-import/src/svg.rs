@@ -122,6 +122,89 @@ fn attr(e: &BytesStart, name: &str) -> Option<String> {
         .map(|v| v.into_owned())
 }
 
+/// A presentation value such as `fill`: a property of the same name in `style` wins over the
+/// attribute (`style="fill:#000"` over `fill="none"`). Within `style`, an `!important`
+/// declaration wins over a normal one, and the last one wins between equals.
+fn presentation(e: &BytesStart, name: &str) -> Option<String> {
+    attr(e, "style")
+        .and_then(|st| {
+            let decls: Vec<String> = st
+                .split(';')
+                .filter_map(|decl| {
+                    let (k, v) = decl.split_once(':')?;
+                    k.trim().eq_ignore_ascii_case(name).then(|| v.trim().to_owned())
+                })
+                .collect();
+            decls
+                .iter()
+                .rev()
+                .find(|v| split_important(v).1)
+                .or_else(|| decls.last())
+                .cloned()
+        })
+        .or_else(|| attr(e, name))
+}
+
+/// Splits a trailing `!important` (any case, with or without spaces around the `!`) off a
+/// declaration value: the trimmed value, and whether it was important.
+fn split_important(v: &str) -> (&str, bool) {
+    let v = v.trim();
+    let word = "important";
+    let Some(i) = v.len().checked_sub(word.len()) else {
+        return (v, false);
+    };
+    if !v.is_char_boundary(i) || !v[i..].eq_ignore_ascii_case(word) {
+        return (v, false);
+    }
+    match v[..i].trim_end().strip_suffix('!') {
+        Some(rest) => (rest.trim_end(), true),
+        None => (v, false),
+    }
+}
+
+/// Elements whose content a browser never draws in place: definitions, markers, clip paths,
+/// masks and patterns. A `<symbol>` is drawn only through `<use>`, which is not imported.
+const NOT_DRAWN: [&str; 6] = ["defs", "symbol", "marker", "clipPath", "mask", "pattern"];
+
+/// Whether an element is drawn at all, and whether it is visible, from its parent's
+/// `(drawn, visible)`. `display:none` and the containers in [`NOT_DRAWN`] hide everything under
+/// them for good; `visibility` is passed down like a fill, so a child can set `visible` again.
+fn shown(e: &BytesStart, tag: &str, (drawn, visible): (bool, bool)) -> (bool, bool) {
+    let value = |name| presentation(e, name).map(|v| split_important(&v).0.trim().to_ascii_lowercase());
+    let drawn = drawn && !NOT_DRAWN.contains(&tag) && value("display").as_deref() != Some("none");
+    let visible = match value("visibility").as_deref() {
+        Some("hidden" | "collapse") => false,
+        Some("visible") => true,
+        _ => visible,
+    };
+    (drawn, visible)
+}
+
+/// Whether a fill paints the shape: not `none`, `transparent` or white (`#fff`, `white`,
+/// `rgb(255,255,255)`, `rgb(100%,100%,100%)`). No fill, or `inherit`, takes the parent's answer.
+/// A trailing `!important` is ignored.
+fn paints(fill: Option<&str>, parent: bool) -> bool {
+    let Some(f) = fill else { return parent };
+    let f = split_important(f).0.to_ascii_lowercase();
+    match f.as_str() {
+        "inherit" => parent,
+        "" | "none" | "transparent" | "white" | "#fff" | "#ffffff" => false,
+        _ => !is_white_rgb(&f),
+    }
+}
+
+/// `rgb(255,255,255)` or `rgb(100%,100%,100%)`, any spacing, already lower case.
+fn is_white_rgb(f: &str) -> bool {
+    let Some(inner) = f.strip_prefix("rgb").map(str::trim_start) else {
+        return false;
+    };
+    let Some(inner) = inner.strip_prefix('(').and_then(|r| r.strip_suffix(')')) else {
+        return false;
+    };
+    let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+    parts.len() == 3 && parts.iter().all(|p| matches!(*p, "255" | "100%"))
+}
+
 fn num(e: &BytesStart, name: &str) -> f64 {
     attr(e, name).and_then(|v| numbers(&v).first().copied()).unwrap_or(0.0)
 }
@@ -463,6 +546,11 @@ impl Arc {
 pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
     let mut reader = Reader::from_str(text);
     let mut stack: Vec<M> = vec![M::ID];
+    // Whether each open element's fill paints, passed to its children; kept in step with `stack`.
+    // A bool, not the fill text, so deep nesting under a long fill value keeps no copies of it.
+    let mut fills: Vec<bool> = vec![false];
+    // `(drawn, visible)` of each open element (see [`shown`]); kept in step with `stack`.
+    let mut shows: Vec<(bool, bool)> = vec![(true, true)];
     let mut shapes = Vec::new();
     let mut pins: Vec<(Option<String>, Point)> = Vec::new();
     let mut pending_text: Option<(Point, f64, Align)> = None;
@@ -480,12 +568,17 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                 }
                 if stack.len() > 1 {
                     stack.pop();
+                    fills.pop();
+                    shows.pop();
                 }
                 (None, false)
             }
             Event::Text(t) => {
-                // Only text for a pending label is read; other text is ignored.
-                if let Some((at, h, align)) = pending_text {
+                // Only text for a pending label is read; other text is ignored. A hidden run
+                // (a `<tspan>` with `display="none"` or `visibility="hidden"`) is skipped and
+                // leaves the label waiting for a visible one.
+                let shown_run = shows.last().copied().unwrap_or((true, true)) == (true, true);
+                if let (Some((at, h, align)), true) = (pending_text, shown_run) {
                     let s = t
                         .unescape()
                         .map_err(|e| Error::Format(format!("SVG: {e}")))?
@@ -517,6 +610,10 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
         let mut m = attr(&e, "transform")
             .map(|t| parent.mul(&parse_transform(&t)))
             .unwrap_or(parent);
+        let filled = paints(
+            presentation(&e, "fill").as_deref(),
+            fills.last().copied().unwrap_or(false),
+        );
         let tag = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
         if tag == "svg" && !seen_root {
             seen_root = true;
@@ -529,6 +626,18 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                     m = m.mul(&M([s, 0.0, 0.0, s, -vbn[0] * s, -vbn[1] * s]));
                 }
             }
+        }
+        let show = shown(&e, &tag, shows.last().copied().unwrap_or((true, true)));
+        // An invisible `<text>` still sets up its label: a `<tspan>` in it can be visible again,
+        // and each run of words is checked on its own.
+        if !show.0 || (!show.1 && tag != "text") {
+            // Hidden: no shapes, pins or text, but its children still need its state.
+            if !empty {
+                stack.push(m);
+                fills.push(filled);
+                shows.push(show);
+            }
+            continue;
         }
         let pin_name = attr(&e, "data-pin")
             .or_else(|| attr(&e, "id").and_then(|i| i.strip_prefix("pin:").map(str::to_owned)))
@@ -549,7 +658,7 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                 Some(Shape::Polyline {
                     points: vec![m.p(x, y), m.p(x + w, y), m.p(x + w, y + h), m.p(x, y + h)],
                     closed: true,
-                    filled: false,
+                    filled,
                 })
             }
             "circle" | "ellipse" => {
@@ -570,9 +679,6 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                     }
                 };
                 let (cx, cy) = (num(&e, "cx"), num(&e, "cy"));
-                let filled = attr(&e, "fill").is_some_and(|f| {
-                    f != "none" && f != "transparent" && f != "white" && f != "#fff" && f != "#ffffff"
-                });
                 if m.is_singular() && pin_name.is_none() && !(rx == ry && m.keeps_circles()) {
                     // Squashed flat: SVG draws nothing, and an outline would only stretch
                     // the symbol's bounds. (`scale(0)` still keeps the radius-0 dot it had,
@@ -603,22 +709,29 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
             "polyline" | "polygon" => {
                 let v = numbers(&attr(&e, "points").unwrap_or_default());
                 let pts: Vec<Point> = v.as_chunks::<2>().0.iter().map(|p| m.p(p[0], p[1])).collect();
+                // A filled polyline is closed, as SVG fills it; two points stay a plain line.
+                let filled = filled && pts.len() >= 3;
                 (pts.len() >= 2).then(|| Shape::Polyline {
                     points: pts,
-                    closed: tag == "polygon",
-                    filled: false,
+                    closed: tag == "polygon" || filled,
+                    filled,
                 })
             }
             "path" => {
                 let parts = path(&attr(&e, "d").unwrap_or_default(), &m);
+                // Shapes have no holes or fill rule, so a `d` with several closed sub-paths
+                // (a ring, a letter O) would have its holes painted over. Such paths stay
+                // outlines; a single closed sub-path is filled.
+                let filled = filled && parts.iter().filter(|(_, closed)| *closed).count() <= 1;
                 let mut first = None;
                 for (pts, closed) in parts {
                     first.get_or_insert(pts[0]);
                     if pin_name.is_none() {
+                        // Only a closed sub-path is filled; an open one stays a line.
                         shapes.push(Shape::Polyline {
                             points: pts,
                             closed,
-                            filled: false,
+                            filled: filled && closed,
                         });
                     }
                 }
@@ -661,6 +774,8 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
         }
         if !empty {
             stack.push(m);
+            fills.push(filled);
+            shows.push(show);
         }
     }
     if !seen_root {
@@ -945,6 +1060,191 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn fills_from_attribute_style_and_group() -> Result<()> {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg">
+            <circle id="pin:1" cx="0" cy="0" r="0.5"/>
+            <polygon points="0 0 4 0 2 3" fill="black"/>
+            <path style="fill:#000" d="M0 0 L4 0 L2 3 Z"/>
+            <rect x="0" y="0" width="4" height="2" fill="none"/>
+            <rect x="0" y="0" width="4" height="2" style="stroke:red; fill:none" fill="black"/>
+            <polygon points="0 0 4 0 2 3" fill="#FFFFFF"/>
+            <circle cx="10" cy="0" r="1" style="fill:black"/>
+            <polyline points="0,0 4,0 2,3" fill="red"/>
+            <polyline points="0,0 4,0" fill="red"/>
+            <path fill="black" d="M0 0 L4 0 L2 3"/>
+            <g style="fill:#000000"><rect x="0" y="0" width="1" height="1"/></g>
+            <g fill="black"><rect x="0" y="0" width="1" height="1" fill="none"/></g>
+            <rect x="0" y="0" width="1" height="1"/>
+        </svg>"##;
+        let s = symbol(svg, "svg.fill", "Fill")?;
+        let got: Vec<(bool, bool)> = s
+            .graphics
+            .iter()
+            .map(|g| match g {
+                Shape::Polyline { closed, filled, .. } => (*closed, *filled),
+                Shape::Circle { filled, .. } => (true, *filled),
+                _ => (false, false),
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (true, true),   // polygon fill="black"
+                (true, true),   // closed path, fill in style
+                (true, false),  // rect fill="none"
+                (true, false),  // style fill:none wins over fill="black"
+                (true, false),  // white polygon, any case
+                (true, true),   // circle, fill in style
+                (true, true),   // filled 3-point polyline is closed
+                (false, false), // 2-point polyline stays a line
+                (false, false), // open path stays a line
+                (true, true),   // fill from the parent group
+                (true, false),  // own fill="none" wins over the group
+                (true, false),  // no fill after the groups close
+            ]
+        );
+        Ok(())
+    }
+
+    /// `filled` of each imported shape, in order.
+    fn fills_of(svg: &str) -> Result<Vec<bool>> {
+        let s = symbol(svg, "svg.fill", "Fill")?;
+        Ok(s.graphics
+            .iter()
+            .map(|g| match g {
+                Shape::Polyline { filled, .. } | Shape::Circle { filled, .. } => *filled,
+                _ => false,
+            })
+            .collect())
+    }
+
+    #[test]
+    fn fill_ignores_important_and_reads_white_rgb() -> Result<()> {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg">
+            <rect width="1" height="1" style="fill:none!important" fill="black"/>
+            <rect width="1" height="1" style="fill: none !IMPORTANT"/>
+            <rect width="1" height="1" style="fill:#000 !important"/>
+            <rect width="1" height="1" fill="rgb(255,255,255)"/>
+            <rect width="1" height="1" fill="RGB( 255 , 255 , 255 )"/>
+            <rect width="1" height="1" style="fill:rgb(100%, 100%, 100%)"/>
+            <rect width="1" height="1" fill="rgb(255,0,0)"/>
+            <rect width="1" height="1" fill="rgb(0%,0%,0%)"/>
+            <rect width="1" height="1" style="fill:none!important;fill:black"/>
+            <rect width="1" height="1" style="fill:black !important;fill:none"/>
+            <rect width="1" height="1" style="fill:black;fill:none"/>
+            <rect width="1" height="1" style="fill:none;fill:black"/>
+            <rect width="1" height="1" style="fill:none ! important"/>
+            <rect width="1" height="1" style="fill:none ! IMPORTANT;fill:black"/>
+        </svg>"##;
+        assert_eq!(
+            fills_of(svg)?,
+            vec![
+                false, false, true, false, false, false, true, true, false, true, false, true, false, false,
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fill_inherit_takes_the_parent_fill() -> Result<()> {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg">
+            <g fill="none"><rect width="1" height="1" fill="inherit"/></g>
+            <g fill="black"><rect width="1" height="1" fill="inherit"/></g>
+            <g fill="none"><g fill="inherit"><rect width="1" height="1" fill="inherit"/></g></g>
+            <g fill="none"><rect width="1" height="1" fill="black"/></g>
+            <rect width="1" height="1" fill="inherit"/>
+        </svg>"##;
+        assert_eq!(fills_of(svg)?, vec![false, true, false, true, false]);
+        Ok(())
+    }
+
+    #[test]
+    fn defs_markers_and_hidden_groups_are_skipped() -> Result<()> {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg">
+            <defs>
+                <circle cx="5" cy="5" r="2"/>
+                <path d="M0 0 L9 9"/>
+                <marker id="arrow"><path d="M0 0 L2 1 L0 2 Z" fill="black"/></marker>
+            </defs>
+            <defs/>
+            <line x1="0" y1="0" x2="10" y2="0"/>
+            <g display="none"><line x1="0" y1="1" x2="10" y2="1"/><circle data-pin="1" r="1"/></g>
+            <g style="display: none"><g><text x="0" y="0">Hidden</text></g></g>
+            <symbol id="s"><rect width="3" height="3"/></symbol>
+            <clipPath id="c"><rect width="4" height="4"/></clipPath>
+            <mask id="m"><rect width="5" height="5"/></mask>
+            <pattern id="p"><rect width="6" height="6"/></pattern>
+            <rect width="7" height="7" display="none"/>
+            <g display="none"><g display="inline"><line x1="0" y1="2" x2="10" y2="2"/></g></g>
+            <line x1="0" y1="3" x2="10" y2="3" visibility="hidden"/>
+            <g style="visibility:hidden"><line x1="0" y1="4" x2="10" y2="4"/></g>
+            <g visibility="hidden"><line x1="0" y1="5" x2="10" y2="5" visibility="visible"/></g>
+            <line x1="0" y1="6" x2="10" y2="6"/>
+            <text x="0" y="7"><tspan display="none">No1</tspan><tspan>Yes1</tspan></text>
+            <text x="0" y="8"><tspan visibility="hidden">No2</tspan><tspan>Yes2</tspan></text>
+            <text x="0" y="9" visibility="hidden"><tspan visibility="visible">Yes3</tspan></text>
+            <text x="0" y="10" visibility="hidden">No3</text>
+            <text x="0" y="11" display="none"><tspan visibility="visible">No4</tspan></text>
+        </svg>"##;
+        let s = symbol(svg, "svg.hidden", "Hidden")?;
+        assert!(s.pins.is_empty(), "pin in a hidden group: {:?}", s.pins);
+        // Only the visible lines and texts come in; anything else shows up as NaN.
+        let ys: Vec<(f64, &str)> = s
+            .graphics
+            .iter()
+            .map(|g| match g {
+                Shape::Line { a, .. } => (a.y, ""),
+                Shape::Text { at, text, .. } => (at.y, text.as_str()),
+                _ => (f64::NAN, ""),
+            })
+            .collect();
+        assert_eq!(
+            ys,
+            vec![
+                (0.0, ""),
+                (5.0, ""),
+                (6.0, ""),
+                (7.0, "Yes1"),
+                (8.0, "Yes2"),
+                (9.0, "Yes3")
+            ],
+            "{:?}",
+            s.graphics
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn long_fill_under_deep_nesting_is_not_copied_per_level() -> Result<()> {
+        // A 1 MB fill value with 5,000 nested `inherit` groups under it. Copying the fill
+        // text per level would need about 5 GB; the per-level state is a bool, so this stays
+        // small and quick.
+        let long = format!("url(#{})", "a".repeat(1 << 20));
+        let depth = 5_000;
+        let mut svg = format!(r#"<svg xmlns="http://www.w3.org/2000/svg"><g fill="{long}">"#);
+        svg.push_str(&r#"<g fill="inherit">"#.repeat(depth));
+        svg.push_str(r#"<rect width="1" height="1" fill="inherit"/>"#);
+        svg.push_str(r#"<rect width="1" height="1" fill="none"/>"#);
+        svg.push_str(&"</g>".repeat(depth));
+        svg.push_str("</g></svg>");
+        // A `url(...)` paint fills; `inherit` carries it all the way down.
+        assert_eq!(fills_of(&svg)?, vec![true, false]);
+        Ok(())
+    }
+
+    #[test]
+    fn path_with_several_closed_subpaths_stays_outlines() -> Result<()> {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg">
+            <path fill="black" d="M0 0H10V10H0Z M3 3V7H7V3Z"/>
+            <path fill="black" d="M0 0H10V10H0Z M20 0 L30 0"/>
+        </svg>"##;
+        // The square with a hole: both outlines, unfilled. One closed sub-path plus an open
+        // line: the closed one is filled.
+        assert_eq!(fills_of(svg)?, vec![false, false, true, false]);
         Ok(())
     }
 
