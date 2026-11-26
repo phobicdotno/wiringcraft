@@ -941,6 +941,88 @@ fn box_size_field(ui: &mut egui::Ui, value: &mut f64) {
     }
 }
 
+/// Apply the black box form shown in the Properties panel when it has changes not applied yet,
+/// as its Apply button does (one undo step): called before the project is saved (#932). A form
+/// read for another version of the box (after an Undo, say) is left alone, as the panel reads
+/// it again. Returns what to check after the change went in (`Ok(Some)`), or why it was refused
+/// (`Err`), which the form also shows.
+pub fn apply_black_box_draft(open: &mut Open, ed: &mut Editor, ps: &mut PanelState) -> Result<Option<String>, String> {
+    let Some(((page, id, hash), form)) = ps.black_box.as_mut() else {
+        return Ok(None);
+    };
+    let current = open
+        .project
+        .pages
+        .get(*page)
+        .and_then(|p| p.symbol(id))
+        .and_then(|s| open.symbols.get(&s.symbol))
+        .map(|sym| sym.hash());
+    if current.as_ref() != Some(hash) || !form.changed() {
+        return Ok(None);
+    }
+    match apply_box_form(open, ed, form, *page, id) {
+        Ok(warnings) => {
+            ps.black_box = None;
+            Ok((!warnings.is_empty()).then(|| format!("Black box changed. Check: {}.", warnings.join("; "))))
+        }
+        Err(e) => {
+            form.error = Some(e.clone());
+            Err(format!("The black box was not changed: {e}"))
+        }
+    }
+}
+
+/// The black box form shown, for tests that type in it.
+#[cfg(test)]
+pub(crate) fn black_box_form_mut(ps: &mut PanelState) -> Option<&mut crate::black_box_tool::BoxEdit> {
+    ps.black_box.as_mut().map(|(_, f)| f)
+}
+
+/// Apply the black box form to the box `id` on `page` as one undo step, for its Apply button
+/// and before a save: the warnings, or why it was refused. A wire being drawn from a point the
+/// change removed or renamed is dropped, as it could no longer be drawn.
+fn apply_box_form(
+    open: &mut Open,
+    ed: &mut Editor,
+    form: &crate::black_box_tool::BoxEdit,
+    page: usize,
+    id: &str,
+) -> Result<Vec<String>, String> {
+    let symbol_id = open
+        .project
+        .pages
+        .get(page)
+        .and_then(|p| p.symbol(id))
+        .map(|placed| placed.symbol.clone())
+        .unwrap_or_default();
+    let (pins, renamed, removed) = (form.pins(), form.renamed(), form.removed());
+    let warnings = open.edit_black_box(page, id, (form.width, form.height), &pins, &renamed, &removed)?;
+    // A wire being drawn from a point of the box that was renamed, moved or taken off, or
+    // whose name another point took (also a new point just like the one taken off), would be
+    // saved on a stale point: it is dropped, as the assistant's black box edit does. So is one
+    // whose start no longer resolves at all.
+    let point_changed = |pin: &str| {
+        renamed.contains_key(pin)
+            || removed.contains(pin)
+            || renamed.values().any(|to| to == pin)
+            || form.old_pins().iter().find(|p| p.name == pin) != pins.iter().find(|p| p.name == pin)
+    };
+    let shown = open.project.pages.get(ed.page);
+    let lost = ed.wire.as_ref().is_some_and(|(start, _)| {
+        let changed = matches!(
+            start,
+            wc_core::Endpoint::Pin { item, pin }
+                if shown.and_then(|p| p.symbol(item)).is_some_and(|s| s.symbol == symbol_id)
+                    && point_changed(pin)
+        );
+        changed || shown.is_some_and(|pg| open.end_pos(pg, start).is_none())
+    });
+    if lost {
+        ed.wire = None;
+    }
+    Ok(warnings)
+}
+
 /// The fields of the black box form; `true` when it is done with (applied or reset).
 fn black_box_form(
     ui: &mut egui::Ui,
@@ -1003,14 +1085,7 @@ fn black_box_form(
         return true;
     }
     if apply {
-        match open.edit_black_box(
-            page,
-            id,
-            (form.width, form.height),
-            &form.pins(),
-            &form.renamed(),
-            &form.removed(),
-        ) {
+        match apply_box_form(open, ed, form, page, id) {
             Ok(warnings) => {
                 ed.message = if warnings.is_empty() {
                     "Black box changed.".into()
@@ -1027,6 +1102,9 @@ fn black_box_form(
     }
     false
 }
+
+/// The id of the selected symbol's device tag field.
+pub(crate) const TAG_FIELD: &str = "wc.properties.device_tag";
 
 fn committed(r: &egui::Response) -> bool {
     r.lost_focus() || (r.has_focus() && r.ctx.input(|i| i.key_pressed(egui::Key::Enter)))
@@ -1146,7 +1224,7 @@ fn selection_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps:
                     ui.label(sym_name).on_hover_text(&placed.symbol);
                     ui.end_row();
                     ui.label("Device tag");
-                    let r = ui.text_edit_singleline(&mut ps.tag);
+                    let r = ui.add(egui::TextEdit::singleline(&mut ps.tag).id(egui::Id::new(TAG_FIELD)));
                     if committed(&r) {
                         let new = if ps.tag.trim().is_empty() {
                             Ok(None)
@@ -2631,6 +2709,166 @@ mod tests {
         }
         frame(&mut o, &mut ps);
         assert_eq!(form(&ps), Some((0.5, true)));
+        Ok(())
+    }
+
+    /// A black box form changed and not applied is applied before a save, as one undo step;
+    /// a refused change keeps the form and gives the reason (#932).
+    #[test]
+    fn a_black_box_draft_is_applied_before_saving() -> Result<(), Box<dyn std::error::Error>> {
+        use wc_core::{BoxPin, BoxSide};
+        let (_tmp, mut o) = crate::state::tests::project();
+        let pins = [BoxPin {
+            name: "1".into(),
+            side: BoxSide::Left,
+            offset: 5.0,
+        }];
+        let id = o.add_black_box(
+            1,
+            wc_core::geom::Point::new(40.0, 40.0),
+            wc_core::geom::Point::new(60.0, 50.0),
+            &pins,
+            None,
+        )?;
+        let mut ed = Editor::default();
+        let mut ps = PanelState::default();
+        assert_eq!(
+            apply_black_box_draft(&mut o, &mut ed, &mut ps),
+            Ok(None),
+            "no form shown"
+        );
+        let t = Theme::of(&egui::Context::default());
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| black_box_section(ui, &mut o, &mut ed, &mut ps, 1, &id, &t));
+        });
+        let steps = o.undo_steps();
+        assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), Ok(None));
+        assert_eq!(o.undo_steps(), steps, "an unchanged form applies nothing");
+        if let Some((_, f)) = ps.black_box.as_mut() {
+            f.rows[0].name = "A".into();
+        }
+        // A wire being drawn from the point renamed can no longer be drawn: it is dropped.
+        ed.page = 1;
+        ed.wire = Some((
+            wc_core::Endpoint::Pin {
+                item: id.clone(),
+                pin: "1".into(),
+            },
+            Vec::new(),
+        ));
+        assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), Ok(None));
+        assert!(ed.wire.is_none(), "the wire from the renamed point is dropped");
+        assert_eq!(o.undo_steps(), steps + 1, "one undo step");
+        assert!(ps.black_box.is_none(), "the form is read again");
+        let symbol = o.project.pages[1]
+            .symbol(&id)
+            .map(|s| s.symbol.clone())
+            .unwrap_or_default();
+        let pin_names: Vec<String> = o.symbols[&symbol].pins.iter().map(|p| p.name.clone()).collect();
+        assert_eq!(pin_names, ["A"]);
+        // A refused change (two points with one name) stays in the form, with its reason.
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| black_box_section(ui, &mut o, &mut ed, &mut ps, 1, &id, &t));
+        });
+        if let Some((_, f)) = ps.black_box.as_mut() {
+            f.add_row();
+            let last = f.rows.len() - 1;
+            f.rows[last].name = "A".into();
+        }
+        let refused = apply_black_box_draft(&mut o, &mut ed, &mut ps);
+        assert!(refused.is_err(), "a duplicate point name is refused");
+        assert_eq!(o.undo_steps(), steps + 1);
+        assert!(ps.black_box.as_ref().is_some_and(|(_, f)| f.error.is_some()));
+        Ok(())
+    }
+
+    /// Two points of the box swap names: a wire being drawn from one of them still finds a
+    /// point with its start's name, but another one, so it is dropped too.
+    #[test]
+    fn a_wire_from_a_point_whose_name_another_point_takes_is_dropped() -> Result<(), Box<dyn std::error::Error>> {
+        use wc_core::{BoxPin, BoxSide};
+        let (_tmp, mut o) = crate::state::tests::project();
+        let pin = |name: &str, offset| BoxPin {
+            name: name.into(),
+            side: BoxSide::Left,
+            offset,
+        };
+        let id = o.add_black_box(
+            1,
+            wc_core::geom::Point::new(40.0, 40.0),
+            wc_core::geom::Point::new(60.0, 60.0),
+            &[pin("1", 5.0), pin("2", 10.0)],
+            None,
+        )?;
+        let mut ed = Editor::default();
+        let mut ps = PanelState::default();
+        let t = Theme::of(&egui::Context::default());
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| black_box_section(ui, &mut o, &mut ed, &mut ps, 1, &id, &t));
+        });
+        if let Some((_, f)) = ps.black_box.as_mut() {
+            f.rows[0].name = "2".into();
+            f.rows[1].name = "1".into();
+        }
+        ed.page = 1;
+        ed.wire = Some((
+            wc_core::Endpoint::Pin {
+                item: id.clone(),
+                pin: "1".into(),
+            },
+            Vec::new(),
+        ));
+        assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), Ok(None));
+        assert!(ps.black_box.is_none(), "applied");
+        assert!(ed.wire.is_none(), "the wire from the point now named 2 is dropped");
+        Ok(())
+    }
+
+    #[test]
+    fn a_wire_from_a_point_taken_off_and_added_again_is_dropped() -> Result<(), Box<dyn std::error::Error>> {
+        use wc_core::{BoxPin, BoxSide};
+        let (_tmp, mut o) = crate::state::tests::project();
+        let pin = |name: &str, offset| BoxPin {
+            name: name.into(),
+            side: BoxSide::Left,
+            offset,
+        };
+        let id = o.add_black_box(
+            1,
+            wc_core::geom::Point::new(40.0, 40.0),
+            wc_core::geom::Point::new(60.0, 60.0),
+            &[pin("1", 5.0), pin("2", 10.0)],
+            None,
+        )?;
+        let mut ed = Editor::default();
+        let mut ps = PanelState::default();
+        let t = Theme::of(&egui::Context::default());
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| black_box_section(ui, &mut o, &mut ed, &mut ps, 1, &id, &t));
+        });
+        // Point 1 taken off, then a new point added: it gets the same name, edge and place.
+        if let Some((_, f)) = ps.black_box.as_mut() {
+            f.rows.remove(0);
+            f.add_row();
+            assert_eq!(f.pins(), [pin("2", 10.0), pin("1", 5.0)]);
+        }
+        ed.page = 1;
+        ed.wire = Some((
+            wc_core::Endpoint::Pin {
+                item: id.clone(),
+                pin: "1".into(),
+            },
+            Vec::new(),
+        ));
+        assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), Ok(None));
+        assert!(ps.black_box.is_none(), "applied");
+        assert!(ed.wire.is_none(), "the wire from the point taken off is dropped");
         Ok(())
     }
 
