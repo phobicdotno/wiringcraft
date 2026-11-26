@@ -71,13 +71,32 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
         if let Some(i) = ed.panel_pick
             && let Some(PanelItem::Device { at: a, .. }) = p.items.get(i)
         {
-            ed.panel_drag = Some((Point::new(at.x - a.x, at.y - a.y), false));
+            ed.panel_drag = Some((Point::new(at.x - a.x, at.y - a.y), false, *a));
+        }
+    }
+    // Escape puts the device back where the drag started and drops the drag's undo step; the
+    // release afterwards changes nothing.
+    if let (Some((_, checkpoint, start)), Some(i)) = (ed.panel_drag, ed.panel_pick)
+        && ui.input(|inp| inp.key_pressed(egui::Key::Escape))
+    {
+        ed.panel_drag = None;
+        if checkpoint
+            && let Some(PanelItem::Device { at, .. }) =
+                open.project.panels.get_mut(panel).and_then(|x| x.items.get_mut(i))
+        {
+            *at = start;
+            open.edited();
+            // Only when the latest step is this drag's: then it changes nothing any more.
+            if open.before_last_change() == Some(&open.project) {
+                open.forget_terminal_change();
+                open.forget_last_change();
+            }
         }
     }
     if resp.clicked_by(egui::PointerButton::Primary) {
         ed.panel_pick = pointer.and_then(|at| device_at(&p.items, at));
     }
-    if let (Some((grab, checkpoint)), Some(i), Some(at)) = (ed.panel_drag, ed.panel_pick, pointer)
+    if let (Some((grab, checkpoint, start)), Some(i), Some(at)) = (ed.panel_drag, ed.panel_pick, pointer)
         && resp.dragged_by(egui::PointerButton::Primary)
     {
         let step = if snap_step > 0.0 { snap_step.min(5.0) } else { 1.0 };
@@ -104,7 +123,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
         if moved {
             if !checkpoint {
                 open.checkpoint();
-                ed.panel_drag = Some((grab, true));
+                ed.panel_drag = Some((grab, true, start));
             }
             if let Some(PanelItem::Device {
                 at: a,
@@ -325,5 +344,91 @@ mod tests {
         // Turned, it covers 40 x 10 mm.
         assert_eq!(device_at(&items, Point::new(30.0, 5.0)), Some(0));
         assert_eq!(device_at(&items, Point::new(5.0, 30.0)), None);
+    }
+
+    #[test]
+    fn escape_during_a_device_drag_puts_the_device_back() {
+        let (_tmp, mut open) = crate::state::tests::project();
+        let mut panel = wc_core::panel::Panel {
+            id: "panel1".into(),
+            name: "Panel 1".into(),
+            width: 400.0,
+            height: 300.0,
+            items: Vec::new(),
+        };
+        let start = Point::new(100.0, 100.0);
+        panel.items.push(PanelItem::Device {
+            tag: wc_core::DeviceTag::parse("-K1").unwrap_or_default(),
+            at: start,
+            width: 40.0,
+            height: 60.0,
+            rotation: wc_core::geom::Rotation::R0,
+        });
+        open.project.panels.push(panel);
+        let mut ed = Editor::default();
+        ed.panel = Some(0);
+        ed.view.fit = true;
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let frame = |open: &mut Open, ed: &mut Editor, time: f64, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1000.0, 700.0))),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| show(ui, open, ed, 0, 1.0));
+            });
+        };
+        let button = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let device_at_now = |open: &Open| match open.project.panels[0].items.first() {
+            Some(PanelItem::Device { at, .. }) => *at,
+            _ => unreachable!("the device is there"),
+        };
+        // Lay the view out, then find where the device's middle is on screen.
+        frame(&mut open, &mut ed, 0.5, vec![]);
+        let probe = egui::pos2(500.0, 350.0);
+        frame(&mut open, &mut ed, 0.6, vec![egui::Event::PointerMoved(probe)]);
+        let Some(seen) = ed.cursor else {
+            unreachable!("the pointer is over the plate")
+        };
+        let zoom = ed.view.zoom;
+        let on_screen = |m: Point| probe + Vec2::new(((m.x - seen.x) as f32) * zoom, ((m.y - seen.y) as f32) * zoom);
+        let a = on_screen(Point::new(120.0, 130.0));
+        let steps_before = open.undo_steps();
+        frame(&mut open, &mut ed, 1.0, vec![egui::Event::PointerMoved(a)]);
+        frame(&mut open, &mut ed, 1.01, vec![button(a, true)]);
+        for (k, t) in [(1.0, 1.05), (2.0, 1.1), (3.0, 1.15)] {
+            let to = on_screen(Point::new(120.0 + 10.0 * k, 130.0));
+            frame(&mut open, &mut ed, t, vec![egui::Event::PointerMoved(to)]);
+        }
+        assert_ne!(device_at_now(&open), start, "the drag moves the device");
+        assert_eq!(open.undo_steps(), steps_before + 1);
+
+        let escape = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&mut open, &mut ed, 1.2, vec![escape]);
+        assert_eq!(device_at_now(&open), start, "Escape puts the device back");
+        assert_eq!(open.undo_steps(), steps_before, "and drops the drag's undo step");
+        assert!(ed.panel_drag.is_none());
+
+        // Moving on and letting go changes nothing.
+        let far = on_screen(Point::new(200.0, 160.0));
+        frame(&mut open, &mut ed, 1.25, vec![egui::Event::PointerMoved(far)]);
+        frame(&mut open, &mut ed, 1.3, vec![button(far, false)]);
+        frame(&mut open, &mut ed, 1.35, vec![]);
+        assert_eq!(device_at_now(&open), start);
+        assert_eq!(open.undo_steps(), steps_before);
     }
 }
