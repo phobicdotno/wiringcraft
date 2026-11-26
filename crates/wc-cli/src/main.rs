@@ -2161,13 +2161,7 @@ fn run(cli: Cli) -> Res<()> {
                     if p.panels.iter().any(|x| x.id == id) {
                         return Err(format!("panel {id:?} exists"));
                     }
-                    if !(width.is_finite()
-                        && height.is_finite()
-                        && (200.0..=5000.0).contains(&width)
-                        && (200.0..=5000.0).contains(&height))
-                    {
-                        return Err("plate width and height must be 200 to 5000 mm".into());
-                    }
+                    check_plate_size(width, height)?;
                     let name = if name.is_empty() { id.clone() } else { name };
                     let panel = wc_core::panel::Panel::with_rails(id, name, width, height);
                     let rails = panel
@@ -2192,15 +2186,12 @@ fn run(cli: Cli) -> Res<()> {
                         return Err(format!("no panel {id:?}"));
                     };
                     let (w, h) = (width.unwrap_or(panel.width), height.unwrap_or(panel.height));
-                    if (width.is_some() || height.is_some())
-                        && !(w.is_finite()
-                            && h.is_finite()
-                            && (200.0..=5000.0).contains(&w)
-                            && (200.0..=5000.0).contains(&h))
-                    {
-                        return Err("plate width and height must be 200 to 5000 mm".into());
+                    // A name-only edit leaves the plate alone, so it still works when something
+                    // already sticks out past an edge (as `panel arrange` can leave it).
+                    if width.is_some() || height.is_some() {
+                        check_plate_size(w, h)?;
+                        panel.resize(w, h)?;
                     }
-                    panel.resize(w, h)?;
                     if let Some(name) = name {
                         panel.name = if name.is_empty() { id.clone() } else { name };
                     }
@@ -5626,6 +5617,19 @@ fn import_qet(
     Ok((written, failed))
 }
 
+/// Refuses a plate size outside the 200 to 5000 mm range `panel new` and `panel edit` accept.
+fn check_plate_size(width: f64, height: f64) -> Result<(), String> {
+    if width.is_finite()
+        && height.is_finite()
+        && (200.0..=5000.0).contains(&width)
+        && (200.0..=5000.0).contains(&height)
+    {
+        Ok(())
+    } else {
+        Err("plate width and height must be 200 to 5000 mm".into())
+    }
+}
+
 fn vendored_parts(dir: &Path, p: &wc_core::Project) -> std::collections::BTreeMap<String, wc_core::Part> {
     p.used_parts()
         .into_iter()
@@ -6209,6 +6213,23 @@ mod tests {
         // An empty name falls back to the id, as `panel new` does.
         cli(&dir, &["panel", "edit", "main", "--name", ""]).unwrap();
         assert_eq!(load(&dir).unwrap().panels[0].name, "main");
+
+        // A device taller than the plate (as `panel arrange` can leave it) does not block a
+        // name-only edit, which keeps the plate size; resizing is still refused.
+        let mut p = load(&dir).unwrap();
+        for item in &mut p.panels[0].items {
+            if let wc_core::panel::PanelItem::Device { at, height, .. } = item {
+                *at = Point::new(100.0, 0.0);
+                *height = 1200.0;
+            }
+        }
+        store::save(&dir, &p).unwrap();
+        cli(&dir, &["panel", "edit", "main", "--name", "Tall"]).unwrap();
+        let after = load(&dir).unwrap().panels[0].clone();
+        assert_eq!(after.name, "Tall");
+        assert_eq!((after.width, after.height), (600.0, 1000.0));
+        assert!(cli(&dir, &["panel", "edit", "main", "--name", "x", "--width", "700"]).is_err());
+        assert_eq!(load(&dir).unwrap().panels[0].name, "Tall");
     }
 
     #[test]
