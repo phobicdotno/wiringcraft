@@ -538,6 +538,12 @@ fn every_starter_symbol_loads_under_its_file_name_with_distinct_pins() -> Result
         lib.part("example.ex-ms-3p-40")?.0.symbol.as_deref(),
         Some("wc.switch.disconnector.3p")
     );
+    // The diode (#722): its own tag, anode on top and cathode below.
+    let (diode, _) = lib.symbol("wc.diode")?;
+    assert_eq!(diode.role, SymbolRole::Standalone);
+    assert_eq!(diode.letter_code, "R");
+    let names: Vec<_> = diode.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["A", "K"]);
     Ok(())
 }
 
