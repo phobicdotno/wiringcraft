@@ -2084,6 +2084,8 @@ impl App {
                     if !can && self.share.is_host() {
                         return Ok("Nothing to undo or redo.".into());
                     }
+                    // A panel device drag going on ends, as with Undo in the window.
+                    self.ed.panel_drag = None;
                     if redo { self.share.redo() } else { self.share.undo() }?;
                     self.ed.selection.clear();
                     return Ok(if can {
@@ -2094,6 +2096,7 @@ impl App {
                     .into());
                 }
                 let open = need_open(self.open.as_mut())?;
+                self.ed.panel_drag = None;
                 let done = if redo { open.redo() } else { open.undo() };
                 if let Some(e) = open.take_undo_error() {
                     return Err(format!("Not done: {e}"));
@@ -10593,5 +10596,130 @@ mod tests {
         assert_eq!(press(egui::Key::Enter, none, none), (vec![], true));
         // Ctrl pressed after the key, before the frame: the bare press still counts.
         assert_eq!(press(egui::Key::R, none, ctrl).0, vec![Action::Rotate]);
+    }
+
+    /// A panel with one device at the first returned point, moved once to the second, then
+    /// dragged from there (the drag's checkpoint taken), with the button still held.
+    fn panel_drag_going_on(a: &mut App) -> (Point, Point) {
+        use wc_core::panel::{Panel, PanelItem};
+        let first = Point::new(100.0, 100.0);
+        let (from, to) = (Point::new(150.0, 100.0), Point::new(200.0, 100.0));
+        let Some(open) = a.open.as_mut() else {
+            unreachable!("a project is open")
+        };
+        open.project.panels.push(Panel {
+            id: "panel1".into(),
+            name: "Panel 1".into(),
+            width: 400.0,
+            height: 300.0,
+            items: vec![PanelItem::Device {
+                tag: wc_core::DeviceTag::parse("-K1").unwrap_or_default(),
+                at: first,
+                width: 40.0,
+                height: 60.0,
+                rotation: wc_core::geom::Rotation::R0,
+            }],
+        });
+        for p in [from, to] {
+            open.checkpoint();
+            if let Some(PanelItem::Device { at, .. }) = open.project.panels[0].items.first_mut() {
+                *at = p;
+            }
+        }
+        let step = open.history_count();
+        a.ed.panel = Some(0);
+        a.ed.panel_pick = Some(0);
+        a.ed.panel_drag = Some((Point::new(20.0, 30.0), Some(step), from));
+        (first, from)
+    }
+
+    fn panel_device_at(a: &App) -> Point {
+        match a.open.as_ref().and_then(|o| o.project.panels[0].items.first()) {
+            Some(wc_core::panel::PanelItem::Device { at, .. }) => *at,
+            _ => unreachable!("the device is there"),
+        }
+    }
+
+    /// One frame of the panel view with Escape pressed.
+    fn escape_in_panel_view(a: &mut App) {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 700.0))),
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let Some(open) = a.open.as_mut() else {
+            unreachable!("a project is open")
+        };
+        let ed = &mut a.ed;
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| crate::panel_view::show(ui, open, ed, 0, 1.0));
+        });
+    }
+
+    #[test]
+    fn undo_during_a_panel_drag_ends_it_so_escape_keeps_what_undo_put_back() {
+        let (_tmp, mut a) = app(vec![]);
+        let (first, _) = panel_drag_going_on(&mut a);
+        // Undo twice while the button is still held: the device is back where it first was.
+        a.run(Action::Undo);
+        a.run(Action::Undo);
+        assert_eq!(panel_device_at(&a), first);
+        assert!(a.ed.panel_drag.is_none(), "Undo ends the drag");
+        // Escape now must not put back the drag's start, which the history no longer has.
+        escape_in_panel_view(&mut a);
+        assert_eq!(panel_device_at(&a), first);
+    }
+
+    #[test]
+    fn the_assistants_undo_during_a_panel_drag_ends_it_too() {
+        let (_tmp, mut a) = app(vec![]);
+        let (first, _) = panel_drag_going_on(&mut a);
+        for _ in 0..2 {
+            assert!(call(&mut a, "undo", json!({})).is_ok());
+        }
+        assert_eq!(panel_device_at(&a), first);
+        assert!(a.ed.panel_drag.is_none(), "the undo tool ends the drag");
+        escape_in_panel_view(&mut a);
+        assert_eq!(panel_device_at(&a), first);
+    }
+
+    #[test]
+    fn undo_in_a_session_during_a_panel_drag_ends_it_too() {
+        use wc_core::panel::PanelItem;
+        let (_tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        a.share.start_host(open, "Hanna", "hanna@example.com").unwrap();
+        let (first, from) = panel_drag_going_on(&mut a);
+        // In the session each sync is a step: the panel at `first`, the move to `from`, the
+        // drag's move.
+        let set = |a: &mut App, p: Point| {
+            if let Some(PanelItem::Device { at, .. }) =
+                a.open.as_mut().and_then(|o| o.project.panels[0].items.first_mut())
+            {
+                *at = p;
+            }
+        };
+        let to = panel_device_at(&a);
+        for p in [first, from, to] {
+            set(&mut a, p);
+            a.share.frame(a.open.as_mut(), None, false);
+        }
+        for _ in 0..2 {
+            a.run(Action::Undo);
+            a.share.frame(a.open.as_mut(), None, false);
+        }
+        assert_eq!(panel_device_at(&a), first);
+        assert!(a.ed.panel_drag.is_none(), "Undo in a session ends the drag");
+        escape_in_panel_view(&mut a);
+        assert_eq!(panel_device_at(&a), first);
+        a.share.stop();
     }
 }
