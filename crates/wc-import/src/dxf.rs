@@ -78,6 +78,11 @@ pub const TOO_DEEP: &str = "entities in blocks nested too deep (or inserting the
 /// each insert the next many times would otherwise fill the memory.
 pub const MAX_DRAWN: usize = 2_000_000;
 
+/// The most points one polyline or HATCH boundary loop with bulges is sampled into (each bulged
+/// side becomes up to 72 points). Real drawings stay far below it; past it the polyline or loop
+/// is left out before its points are made, and counted.
+pub const MAX_BULGED_POINTS: usize = 200_000;
+
 /// The key under which entities left out over [`MAX_DRAWN`] are counted.
 pub(crate) const OVER_LIMIT: &str = "over the limit";
 
@@ -461,14 +466,19 @@ fn shapes(
                 let raw = if vs.iter().any(|(_, b)| b.abs() >= 1e-9) {
                     bulged(&vs, closed)
                 } else {
-                    Some(vs.iter().map(|(p, _)| *p).collect())
+                    Ok(vs.iter().map(|(p, _)| *p).collect())
                 };
-                // A bulge that gives no arc, or points that are not numbers once placed (a huge
-                // INSERT scale), leave the polyline out, and say so.
-                let pts: Option<Vec<Point>> = raw.map(|r| r.into_iter().map(|(x, y)| q(x, y)).collect());
+                // Bulges that would give too many points, a bulge that gives no arc, or points
+                // that are not numbers once placed (a huge INSERT scale), leave the polyline
+                // out, and say so.
+                let pts = raw.map(|r| r.into_iter().map(|(x, y)| q(x, y)).collect::<Vec<Point>>());
                 match pts {
-                    Some(pts) if pts.len() < 2 => None,
-                    Some(pts) if pts.iter().all(|p| p.x.is_finite() && p.y.is_finite()) => Some(Shape::Polyline {
+                    Err(BulgeError::TooManyPoints) => {
+                        *skipped.entry(POLYLINE_TOO_MANY_POINTS.to_owned()).or_default() += 1;
+                        None
+                    }
+                    Ok(pts) if pts.len() < 2 => None,
+                    Ok(pts) if pts.iter().all(|p| p.x.is_finite() && p.y.is_finite()) => Some(Shape::Polyline {
                         points: pts,
                         closed,
                         filled: false,
@@ -523,7 +533,14 @@ fn shapes(
                     let pt = q(x, y);
                     x.is_finite() && y.is_finite() && pt.x.is_finite() && pt.y.is_finite()
                 };
-                let (loops, bad): (Vec<_>, Vec<_>) = hatch_loops(e)
+                let (all_loops, too_many) = hatch_loops(e);
+                // A loop whose bulges would give too many points is left out before its points
+                // are made, and counted: a solid hatch that lost one is drawn as outlines too.
+                if too_many > 0 {
+                    *skipped.entry(HATCH_TOO_MANY_POINTS.to_owned()).or_default() += 1;
+                    solid = false;
+                }
+                let (loops, bad): (Vec<_>, Vec<_>) = all_loops
                     .into_iter()
                     .partition(|(lp, _)| lp.iter().all(|pt| placed(*pt)));
                 let (loops, fit_failed): (Vec<_>, Vec<usize>) = loops.into_iter().unzip();
@@ -826,6 +843,14 @@ const STRETCHED_NOT_NUMBERS: &str = "CIRCLE or ARC of a stretched block whose po
 /// placed.
 const POLYLINE_NOT_NUMBERS: &str = "LWPOLYLINE whose points are not numbers once placed";
 const HATCH_NOT_NUMBERS: &str = "HATCH with a boundary that is not numbers";
+
+/// The `skipped` key of a polyline left out because its bulges would give more than
+/// [`MAX_BULGED_POINTS`] points.
+const POLYLINE_TOO_MANY_POINTS: &str = "polyline with too many bulged points";
+
+/// The `skipped` key of a HATCH with a boundary loop left out because its bulges would give more
+/// than [`MAX_BULGED_POINTS`] points.
+const HATCH_TOO_MANY_POINTS: &str = "HATCH with too many bulged boundary points";
 
 /// Points along a B-spline from its control points, knots and weights, sampled evenly over the
 /// knot range. `None` when the data do not make a spline.
@@ -1382,11 +1407,26 @@ impl Cursor<'_> {
 
 /// Points of a polyline vertex list with bulges: an arc between two points where the bulge is
 /// not zero (bulge = tan(sweep / 4), positive counter-clockwise).
-/// `None` when a bulged segment cannot be sampled (its numbers overflow), so the caller does not
-/// draw a straight side in place of an arc.
-fn bulged(vertices: &[((f64, f64), f64)], closed: bool) -> Option<Vec<(f64, f64)>> {
-    let mut out = Vec::new();
+/// An error when a bulged segment cannot be sampled (its numbers overflow), so the caller does
+/// not draw a straight side in place of an arc, or when the points would number more than
+/// [`MAX_BULGED_POINTS`] (checked before any is made).
+fn bulged(vertices: &[((f64, f64), f64)], closed: bool) -> std::result::Result<Vec<(f64, f64)>, BulgeError> {
     let n = vertices.len();
+    // Each bulged side adds at most the steps of its sweep (4 atan(bulge)) to its start vertex,
+    // as `arc_points` samples it.
+    let total = vertices.iter().fold(n, |sum, (_, bulge)| {
+        let sweep = (4.0 * bulge.atan()).abs();
+        let steps = if bulge.abs() < 1e-9 {
+            0
+        } else {
+            ((TURN_STEPS * sweep / std::f64::consts::TAU).ceil() as usize).max(2)
+        };
+        sum.saturating_add(steps)
+    });
+    if total > MAX_BULGED_POINTS {
+        return Err(BulgeError::TooManyPoints);
+    }
+    let mut out = Vec::with_capacity(total);
     for i in 0..n {
         let (a, bulge) = vertices[i];
         out.push(a);
@@ -1411,25 +1451,39 @@ fn bulged(vertices: &[((f64, f64), f64)], closed: bool) -> Option<Vec<(f64, f64)
         let a1 = (b.1 - c.1).atan2(b.0 - c.0).to_degrees();
         let pts = arc_points(c, r, a0, a1, bulge > 0.0);
         if pts.len() < 2 || !pts.iter().all(|p| p.0.is_finite() && p.1.is_finite()) {
-            return None;
+            return Err(BulgeError::NotNumbers);
         }
         out.extend(pts.iter().skip(1).take(pts.len().saturating_sub(2)));
     }
-    Some(out)
+    Ok(out)
 }
 
+/// Why a polyline with bulges gives no points.
+#[derive(Debug, PartialEq)]
+enum BulgeError {
+    /// A bulged side's numbers overflow.
+    NotNumbers,
+    /// The points would number more than [`MAX_BULGED_POINTS`].
+    TooManyPoints,
+}
+
+/// A HATCH boundary loop as DXF points, with how many of its spline edges were joined straight.
+type HatchLoop = (Vec<(f64, f64)>, usize);
+
 /// The boundary loops of a HATCH, as DXF points, each with how many of its spline edges were
-/// joined straight because their fit points could not be interpolated. Unreadable loops are left
-/// out.
-fn hatch_loops(e: &Entity) -> Vec<(Vec<(f64, f64)>, usize)> {
+/// joined straight because their fit points could not be interpolated, and how many loops were
+/// left out because their bulges would give more than [`MAX_BULGED_POINTS`] points. Unreadable
+/// loops are left out.
+fn hatch_loops(e: &Entity) -> (Vec<HatchLoop>, usize) {
     let mut cur = Cursor { codes: &e.codes, i: 0 };
     // Skip the elevation point, extrusion, pattern name and flags up to the loop count.
     let Some(start) = e.codes.iter().position(|(c, _)| *c == 91) else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
     cur.i = start;
     let loops = cur.count(91);
     let mut out = Vec::new();
+    let mut too_many = 0;
     for _ in 0..loops {
         let Some(flags) = cur.take(92) else { break };
         let mut pts: Vec<(f64, f64)> = Vec::new();
@@ -1447,7 +1501,15 @@ fn hatch_loops(e: &Entity) -> Vec<(Vec<(f64, f64)>, usize)> {
             }
             // A bulge that cannot be sampled marks the loop as not numbers, so the HATCH arm
             // leaves it out and counts it rather than drawing a straight side.
-            pts = bulged(&vs, true).unwrap_or_else(|| vec![(f64::NAN, f64::NAN); 3]);
+            pts = match bulged(&vs, true) {
+                Ok(pts) => pts,
+                Err(BulgeError::NotNumbers) => vec![(f64::NAN, f64::NAN); 3],
+                // Left out before its points are made: an empty loop is not kept below.
+                Err(BulgeError::TooManyPoints) => {
+                    too_many += 1;
+                    Vec::new()
+                }
+            };
         } else {
             let edges = cur.count(93);
             for edge in 0..edges {
@@ -1578,7 +1640,7 @@ fn hatch_loops(e: &Entity) -> Vec<(Vec<(f64, f64)>, usize)> {
             out.push((pts, fit_failed));
         }
     }
-    out
+    (out, too_many)
 }
 
 /// The edges of a loop as point pairs, the last one closing it.
@@ -1789,6 +1851,14 @@ fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
             } else if kind == HATCH_NOT_NUMBERS {
                 let s = if n == 1 { "" } else { "es" };
                 format!("{n} HATCH{s} with a boundary that is not numbers: that boundary left out")
+            } else if kind == POLYLINE_TOO_MANY_POINTS {
+                let s = if n == 1 { "" } else { "s" };
+                format!("{n} polyline{s} whose arcs would need more than {MAX_BULGED_POINTS} points, left out")
+            } else if kind == HATCH_TOO_MANY_POINTS {
+                let s = if n == 1 { "" } else { "es" };
+                format!(
+                    "{n} HATCH{s} with a boundary whose arcs would need more than {MAX_BULGED_POINTS} points: that boundary left out"
+                )
             } else if kind == HATCH_UNFILLED {
                 let s = if n == 1 { "" } else { "es" };
                 format!("{n} solid HATCH{s} with too many or too complex holes drawn as outline only, not filled")
@@ -2682,6 +2752,53 @@ mod tests {
             "{pts:?}"
         );
         assert!(pts.iter().all(|p| ((p.0 - 5.0).hypot(p.1) - 5.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn bulges_that_would_give_too_many_points_are_left_out() -> Result<()> {
+        // 6000 vertices each bulged 1 (a half circle, 36 steps) would give about 222 000 points.
+        let n = 6000;
+        let vertices: String = (0..n).map(|i| format!("10\n{i}\n20\n0\n42\n1\n")).collect();
+        let many = format!("0\nLWPOLYLINE\n8\n0\n90\n{n}\n70\n0\n{vertices}");
+        let loop_vertices: String = (0..n).map(|i| format!("10\n{i}\n20\n0\n42\n1\n")).collect();
+        let hatch = format!(
+            "0\nHATCH\n8\n0\n2\nSOLID\n70\n1\n91\n2\n\
+             92\n2\n72\n1\n73\n1\n93\n{n}\n{loop_vertices}97\n0\n\
+             92\n2\n72\n0\n73\n1\n93\n3\n10\n0\n20\n0\n10\n5\n20\n0\n10\n0\n20\n5\n97\n0\n"
+        );
+        // An ordinary bulged polyline still draws its arc.
+        let half = "0\nLWPOLYLINE\n8\n0\n90\n2\n70\n0\n10\n0\n20\n0\n42\n1\n10\n10\n20\n0\n";
+        let (g, skipped) = drawn(&format!("{many}{hatch}{half}"), "")?;
+        assert_eq!(skipped.get(POLYLINE_TOO_MANY_POINTS), Some(&1), "{skipped:?}");
+        assert_eq!(skipped.get(HATCH_TOO_MANY_POINTS), Some(&1), "{skipped:?}");
+        assert!(!skipped.contains_key(POLYLINE_NOT_NUMBERS), "{skipped:?}");
+        assert!(!skipped.contains_key(HATCH_NOT_NUMBERS), "{skipped:?}");
+        // The hatch keeps its other loop, as an outline (the lost one may have been a hole);
+        // the half circle is drawn.
+        assert_eq!(g.len(), 2, "{g:?}");
+        let (triangle, closed, filled) = poly(&g[0]);
+        assert!(closed && !filled);
+        assert_eq!(triangle.len(), 3);
+        let (arc, _, _) = poly(&g[1]);
+        assert!(arc.iter().any(|q| near(*q, Point::new(5.0, 5.0))), "{arc:?}");
+        // The warnings name the limit.
+        let warnings = skipped_warnings(skipped);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w == "1 polyline whose arcs would need more than 200000 points, left out"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("1 HATCH with a boundary whose arcs")),
+            "{warnings:?}"
+        );
+        // Just under the limit, a polyline is still sampled.
+        let ok: Vec<((f64, f64), f64)> = (0..5000).map(|i| ((f64::from(i), 0.0), 1.0)).collect();
+        assert!(bulged(&ok, false).is_ok_and(|pts| pts.len() > 100_000));
+        Ok(())
     }
 
     #[test]
