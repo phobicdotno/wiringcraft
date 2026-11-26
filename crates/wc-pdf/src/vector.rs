@@ -246,20 +246,28 @@ pub fn svg(page: &PageDrawing) -> String {
         w = num(w),
         h = num(h)
     );
-    // The underlay goes under the drawing: out of the group, before it.
+    // Prims on an optional layer go in a group of their own that Inkscape shows as a layer. A new
+    // group opens whenever the layer changes, so the drawing order stays as it is.
+    let mut current: Option<Layer> = None;
+    let mut opened: BTreeMap<Layer, usize> = BTreeMap::new();
+    // The underlay (the scanned sheet) goes under the drawing, before the group the header
+    // opened, in a layer of its own.
     let mut under = String::new();
     for p in page.pictures.iter().filter(|p| !p.on_top) {
         svg_image(&mut under, p);
     }
     if !under.is_empty() {
-        // Put them just before the group the header opened.
+        opened.insert(Layer::Scans, 1);
         let at = out.rfind("<g ").unwrap_or(out.len());
-        out.insert_str(at, &under);
+        out.insert_str(
+            at,
+            &format!(
+                "<g id=\"{}\" inkscape:groupmode=\"layer\" inkscape:label=\"{}\">\n{under}</g>\n",
+                Layer::Scans.dxf_name().to_ascii_lowercase(),
+                xml(Layer::Scans.title())
+            ),
+        );
     }
-    // Prims on an optional layer go in a group of their own that Inkscape shows as a layer. A new
-    // group opens whenever the layer changes, so the drawing order stays as it is.
-    let mut current: Option<Layer> = None;
-    let mut opened: BTreeMap<Layer, usize> = BTreeMap::new();
     for p in &page.prims {
         let (Prim::Path { layer, .. } | Prim::Arc { layer, .. } | Prim::Text { layer, .. }) = p;
         if *layer != current {

@@ -287,8 +287,7 @@ fn wire_numbers_cross_references_and_drawings_are_optional_layers() {
     };
     let last_open = s[..k1].rfind("<g ").unwrap_or(0);
     assert!(!s[last_open..k1].contains("inkscape:groupmode"));
-    // Groups stay balanced, so the file still parses as XML.
-    assert_eq!(s.matches("<g ").count(), s.matches("</g>").count(), "{s}");
+    assert_well_formed(&s);
 
     // A page with nothing optional declares no layers.
     project.pages[0].wires.clear();
@@ -1727,6 +1726,23 @@ fn svg_images(s: &str) -> Vec<(f64, f64, f64, f64, String)> {
         .collect()
 }
 
+/// Fails unless `s` parses as XML with every element closed.
+fn assert_well_formed(s: &str) {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(s);
+    let mut depth = 0usize;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(_)) => depth += 1,
+            Ok(Event::End(_)) => depth -= 1,
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(e) => unreachable!("not XML at {}: {e}\n{s}", reader.buffer_position()),
+        }
+    }
+    assert_eq!(depth, 0, "unclosed elements:\n{s}");
+}
+
 #[test]
 fn svg_drawings_show_the_logo_and_the_underlay() {
     let mut png = Vec::new();
@@ -1784,7 +1800,11 @@ fn svg_drawings_show_the_logo_and_the_underlay() {
         (images[0].0, images[0].1, images[0].2, images[0].3),
         (0.0, 0.0, 420.0, 297.0)
     );
-    assert!(page.find("<image").unwrap_or(usize::MAX) < page.find("<g ").unwrap_or(0));
+    // The underlay sits in its own "scans" layer, before the drawing's group.
+    let scans = "<g id=\"scans\" inkscape:groupmode=\"layer\" inkscape:label=\"Scanned sheets\">\n<image";
+    assert!(page.contains(scans), "{page}");
+    assert!(page.find(scans).unwrap_or(usize::MAX) < page.find("<g fill").unwrap_or(0));
+    assert_well_formed(&page);
     assert!(page.rfind("<image").unwrap_or(0) > page.find("</g>").unwrap_or(usize::MAX));
     // DXF has no pictures and stays as it was.
     assert!(!dxf(&pages[1]).contains("base64"));
