@@ -2670,17 +2670,26 @@ impl App {
                     form.description = d.to_owned();
                 }
                 if let Some(list) = v.get("placeholders") {
+                    // A field left out is empty; one given as something other than a text is
+                    // a mistake, not a request to clear it.
+                    let text = |p: &Value, field: &str| match p.get(field) {
+                        None => Ok(String::new()),
+                        Some(Value::String(t)) => Ok(t.clone()),
+                        Some(other) => Err(format!("A placeholder's {field} is a text, not {other}.")),
+                    };
                     let rows = list
                         .as_array()
                         .ok_or("placeholders is a list.")?
                         .iter()
-                        .map(|p| crate::macro_form::PlaceholderRow {
-                            was: s(p, "was").unwrap_or_default().to_owned(),
-                            name: s(p, "name").unwrap_or_default().to_owned(),
-                            description: s(p, "description").unwrap_or_default().to_owned(),
-                            default: s(p, "default").unwrap_or_default().to_owned(),
+                        .map(|p| {
+                            Ok(crate::macro_form::PlaceholderRow {
+                                was: text(p, "was")?,
+                                name: text(p, "name")?,
+                                description: text(p, "description")?,
+                                default: text(p, "default")?,
+                            })
                         })
-                        .collect();
+                        .collect::<Result<_, String>>()?;
                     form.set_placeholders(rows);
                 }
                 if let Some(list) = v.get("value_sets") {
@@ -5760,6 +5769,32 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("POWER") && err.contains("power"), "{err}");
         assert_eq!(std::fs::read(&path).unwrap(), before);
+        // A placeholder field given as something other than a text is refused rather than
+        // cleared: the file is kept.
+        let err = call(
+            &mut a,
+            "macros",
+            json!({"action": "edit", "name": "Starter", "placeholders": [{"name": "power", "was": "power", "default": 42}]}),
+        )
+        .unwrap_err();
+        assert!(err.contains("default"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        // Renamed, a placeholder keeps its values; a new one with its old name is new, with
+        // its own default and none of the renamed one's values.
+        call(
+            &mut a,
+            "macros",
+            json!({"action": "edit", "name": "Starter",
+                   "placeholders": [{"name": "watts", "was": "power"}, {"name": "power", "default": "9"}]}),
+        )
+        .unwrap();
+        let m = wc_core::macros::read_macro(&path).unwrap();
+        assert_eq!(m.used_placeholders(), ["watts"]);
+        let small = &m.value_set("small").unwrap().values;
+        assert_eq!(small.get("watts").map(String::as_str), Some("0.75"));
+        assert_eq!(small.get("power"), None);
+        assert_eq!(m.placeholders[1].default, "9");
 
         // A library's macro is not edited.
         let lib = tmp.path().join("lib");

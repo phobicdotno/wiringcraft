@@ -118,14 +118,20 @@ impl Form {
 
     /// Put `rows` in place of the placeholders, keeping each value set's values for the ones
     /// kept (by [`PlaceholderRow::was`]; a row without one that names a placeholder already
-    /// there keeps it).
+    /// there keeps it, unless another row renames that placeholder).
     pub fn set_placeholders(&mut self, mut rows: Vec<PlaceholderRow>) {
+        // A placeholder a row renames is that row's: a new row with its old name is new.
+        let claimed: Vec<String> = rows
+            .iter()
+            .filter(|r| !r.was.trim().is_empty())
+            .map(|r| key(&r.was))
+            .collect();
         for r in &mut rows {
             if r.was.trim().is_empty()
                 && let Some(p) = self
                     .placeholders
                     .iter()
-                    .find(|p| !p.was.is_empty() && key(&p.was) == key(&r.name))
+                    .find(|p| !p.was.is_empty() && key(&p.was) == key(&r.name) && !claimed.contains(&key(&p.was)))
             {
                 r.was = p.was.clone();
             }
