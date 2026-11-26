@@ -51,8 +51,10 @@ in `crates/wc-app/assets/fonts`).
 
 ![dark mode](docs/screenshots/app-dark.png)
 
-Tools: select and drag (Esc; Esc during a drag puts it back), place symbol (S, pick one in the library), draw wire (W: click a
-pin, click bends, click a pin to finish or double-click a free point), rotate (R), delete (Del),
+Tools: select and drag (Esc; Esc during a drag puts it back, else clears the selection), place
+symbol (S, pick one in the library; R and M turn and mirror it before the click), draw wire (W:
+click a pin, click bends, click a pin to finish or double-click a free point), rotate (R), mirror
+(M), delete (Del),
 duplicate the selection one grid step down and right (Ctrl+D).
 Wheel zooms around the pointer, right or middle drag pans, F fits the page, G toggles the grid.
 New devices get the next free tag, with the function and location used on that page.

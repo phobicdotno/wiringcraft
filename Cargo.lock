@@ -3874,6 +3874,7 @@ dependencies = [
 name = "wc-report"
 version = "0.1.0"
 dependencies = [
+ "quick-xml 0.37.5",
  "wc-core",
  "zip",
 ]
