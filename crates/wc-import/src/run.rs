@@ -1444,9 +1444,19 @@ pub fn add_built(
             page.number
         ));
     }
-    // A new version of a symbol must keep every pin a wire in the project ends on.
+    // A new version of a symbol must keep every pin a wire in the project ends on: one the lock
+    // pins in another version, and one the project only has a copy of (no lock entry), which
+    // the import replaces just the same.
     for symbol in &built.symbols {
-        if p.lock.symbols.get(&symbol.id).is_some_and(|e| e.hash != symbol.hash()) {
+        let replaced = match p.lock.symbols.get(&symbol.id) {
+            Some(entry) => entry.hash != symbol.hash(),
+            None => match store::read_vendored_symbol(dir, &symbol.id) {
+                Ok(have) => have.hash() != symbol.hash(),
+                // A copy that cannot be read is replaced too; no copy at all is nothing replaced.
+                Err(_) => vendored_bytes(dir, ItemKind::Symbol, &symbol.id)?.1.is_some(),
+            },
+        };
+        if replaced {
             let lost = wired_pins_lost(p, symbol);
             if !lost.is_empty() {
                 return Err(format!(
@@ -1896,6 +1906,93 @@ mod tests {
             "the import was not added before the save"
         );
         assert_eq!(files(&dir), before);
+    }
+
+    /// A symbol `id` with the pins `pins`.
+    fn symbol_with_pins(id: &str, pins: &[&str]) -> wc_core::Symbol {
+        wc_core::Symbol {
+            source: String::new(),
+            id: id.into(),
+            name: "Coil".into(),
+            category: String::new(),
+            letter_code: "K".into(),
+            role: Default::default(),
+            graphics: vec![],
+            pins: pins
+                .iter()
+                .zip(0u8..)
+                .map(|(name, k)| wc_core::symbol::Pin {
+                    name: (*name).into(),
+                    at: wc_core::geom::Point::new(0.0, f64::from(k) * 10.0),
+                    dir: Default::default(),
+                })
+                .collect(),
+            tag_at: Default::default(),
+            description: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_vendored_symbol_without_a_lock_entry_keeps_the_pins_wires_use() {
+        let t = tmp();
+        let dir = t.path().join("p");
+        let mut p = Project::new("t");
+        let mut page = wc_core::Page::new("p0001", "1", "Plan");
+        page.symbols.push(wc_core::PlacedSymbol {
+            id: "s1".into(),
+            symbol: "imp.coil".into(),
+            at: wc_core::geom::Point::new(50.0, 50.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: None,
+        });
+        page.wires.push(wc_core::Wire {
+            id: "w1".into(),
+            from: wc_core::Endpoint::Pin {
+                item: "s1".into(),
+                pin: "A2".into(),
+            },
+            to: wc_core::Endpoint::Point {
+                at: wc_core::geom::Point::new(50.0, 90.0),
+            },
+            via: vec![],
+            number: None,
+            potential: None,
+            cable: None,
+            route: Default::default(),
+            spec: Default::default(),
+        });
+        p.pages.push(page);
+        assert!(store::save(&dir, &p).is_ok());
+        // The project's copy has no lock entry: put there by hand, or its pin was lost.
+        assert!(store::write_vendored_symbol(&dir, &symbol_with_pins("imp.coil", &["A1", "A2"])).is_ok());
+        assert_eq!(p.lock.symbols.get("imp.coil"), None);
+        let before = files(&dir);
+
+        // A new version without the wired pin A2 is refused, and nothing is written.
+        let built = |pins: &[&str]| crate::aml::Built {
+            symbols: vec![symbol_with_pins("imp.coil", pins)],
+            ..Default::default()
+        };
+        let mut q = p.clone();
+        let err = match add_built(&dir, &mut q, built(&["A1"]), "import:t", Replace::No) {
+            Err(why) => why,
+            Ok(_) => String::new(),
+        };
+        assert!(err.contains("symbol imp.coil: wires end on pins"), "{err}");
+        assert!(err.contains("page 1 s1:A2"), "{err}");
+        assert_eq!(files(&dir), before);
+        assert_eq!(q, p, "the project was changed by a refused import");
+
+        // One that keeps A2 (and adds a pin) replaces the copy and pins it.
+        let mut q = p.clone();
+        let r = add_built(&dir, &mut q, built(&["A1", "A2", "A3"]), "import:t", Replace::No);
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(
+            store::read_vendored_symbol(&dir, "imp.coil").map(|s| s.pins.len()).ok(),
+            Some(3)
+        );
+        assert!(q.lock.symbols.contains_key("imp.coil"));
     }
 
     #[test]
