@@ -33,11 +33,24 @@ pub fn part_label(p: &Part) -> String {
 pub fn unreadable_parts(dir: &Path, project: &Project, parts: &BTreeMap<String, Part>) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for id in project.used_parts() {
-        if parts.contains_key(&id) || !store::vendor_path(dir, ItemKind::Part, &id).is_ok_and(|f| f.exists()) {
+        let Some(path) = store::vendor_path(dir, ItemKind::Part, &id)
+            .ok()
+            .filter(|_| !parts.contains_key(&id))
+        else {
             continue;
-        }
-        if let Err(e) = store::read_vendored_part(dir, &id) {
-            out.insert(id, e.to_string());
+        };
+        // Only a copy known to be absent is missing: one that cannot even be looked for (a
+        // folder that may not be entered) is unreadable, with that reason.
+        match path.try_exists() {
+            Ok(false) => {}
+            Ok(true) => {
+                if let Err(e) = store::read_vendored_part(dir, &id) {
+                    out.insert(id, e.to_string());
+                }
+            }
+            Err(e) => {
+                out.insert(id, format!("{}: {e}", path.display()));
+            }
         }
     }
     out
@@ -505,6 +518,9 @@ pub struct Open {
     /// differs between any two opened projects: checks while drawing look at this instead of
     /// comparing the whole project each frame.
     revision: u64,
+    /// Changes with every library reload ([`Open::refresh_library`]), which may find the
+    /// files of the project's library copy changed while the loaded project stays the same.
+    library_load: u64,
     /// The `history` count right after a properties form made its own undo step, so later
     /// typing in the form joins that step only while nothing else has touched the history.
     form_step: Option<u64>,
@@ -630,6 +646,7 @@ impl Open {
             undo_dropped: 0,
             history: 0,
             revision: next_revision(),
+            library_load: next_revision(),
             form_step: None,
             branch: wc_vcs::Git::new(dir).current_branch().unwrap_or_default(),
             underlays: BTreeMap::new(),
@@ -768,6 +785,7 @@ impl Open {
     pub fn refresh_library(&mut self) {
         self.relist_symbols();
         self.library_rules = wc_library::library_rules(&self.dir, &self.project);
+        self.library_load = next_revision();
         self.touch();
 
         self.parts = self
@@ -1231,6 +1249,11 @@ impl Open {
     /// Which edit of the project is shown: see the `revision` field.
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Which library reload is shown: see the `library_load` field.
+    pub fn library_load(&self) -> u64 {
+        self.library_load
     }
 
     /// Note an edit of the project, its symbols or its parts made without an undo step (a
@@ -5123,6 +5146,40 @@ fn version_fits(item_id: &str, hash: &str, id: &str, pin: &str) -> Result<(), St
 #[allow(clippy::unwrap_used)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A part copy in a folder that may not be entered cannot be looked for: it is reported as
+    /// unreadable with the reason, not as missing (#1035). As root every folder may be
+    /// entered, so there the test has nothing to show.
+    #[cfg(unix)]
+    #[test]
+    fn a_part_copy_that_cannot_be_looked_for_is_unreadable_with_the_reason() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, mut o) = project();
+        o.project.devices.insert(
+            DeviceTag::parse("-K1").unwrap(),
+            wc_core::project::Device {
+                part: Some("maker.contactor".into()),
+                ..Default::default()
+            },
+        );
+        let path = store::vendor_path(&o.dir, ItemKind::Part, "maker.contactor").unwrap();
+        let folder = path.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&folder).unwrap();
+        assert!(
+            unreadable_parts(&o.dir, &o.project, &BTreeMap::new()).is_empty(),
+            "absent is missing"
+        );
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let entered = std::fs::read_dir(&folder).is_ok();
+        let found = unreadable_parts(&o.dir, &o.project, &BTreeMap::new());
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if entered {
+            return;
+        }
+        let why = found.get("maker.contactor").map(String::as_str).unwrap_or_default();
+        assert!(why.contains("maker.contactor.json"), "names the file: {found:?}");
+        assert!(why.to_lowercase().contains("permission denied"), "and why: {found:?}");
+    }
 
     thread_local! {
         /// A file whose writes by `restore_file` fail, after letting this many through.

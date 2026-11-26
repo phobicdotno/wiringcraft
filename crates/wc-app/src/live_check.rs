@@ -34,6 +34,12 @@ struct Snapshot {
     /// The library sources' check rules, as last loaded
     /// ([`Open::library_rules`](crate::state::Open::library_rules)).
     library: Vec<RuleSet>,
+    /// The library reload the inputs come from ([`Open::library_load`]): a reload checks
+    /// again even when the loaded inputs are equal, as a part copy that could not be read
+    /// may now be gone, or the other way round.
+    ///
+    /// [`Open::library_load`]: crate::state::Open::library_load
+    library_load: u64,
 }
 
 impl Snapshot {
@@ -43,6 +49,7 @@ impl Snapshot {
             && self.parts == open.parts
             && self.dir.as_path() == open.dir.as_path()
             && self.library == open.library_rules
+            && self.library_load == open.library_load()
     }
 }
 
@@ -186,6 +193,7 @@ impl LiveCheck {
             parts: open.parts.clone(),
             dir: open.dir.clone(),
             library: open.library_rules.clone(),
+            library_load: open.library_load(),
         });
         let (tx, rx) = channel();
         let input = Arc::clone(&snap);
@@ -687,6 +695,30 @@ mod tests {
         live.poll(&o, false, now);
         now += SETTLE;
         settle(&mut live, &o, &mut now);
+        assert_eq!(unreadable(&live.findings), 1, "{:?}", live.findings);
+        assert_eq!(
+            missing(&live.findings),
+            ["-K2: part maker.relay is missing from the project's library copy"]
+        );
+
+        // The copy is taken away and the library reloaded: the loaded parts stay the same
+        // (none), yet the reload checks again and the part is now missing.
+        std::fs::remove_file(&path).unwrap();
+        o.refresh_library();
+        checks_the_edit(&mut live, &o, &mut now);
+        assert_eq!(unreadable(&live.findings), 0, "{:?}", live.findings);
+        assert_eq!(
+            missing(&live.findings),
+            [
+                "-K1: part maker.contactor is missing from the project's library copy",
+                "-K2: part maker.relay is missing from the project's library copy",
+            ]
+        );
+
+        // And back: a copy that cannot be read turns up.
+        std::fs::write(&path, "{ not json").unwrap();
+        o.refresh_library();
+        checks_the_edit(&mut live, &o, &mut now);
         assert_eq!(unreadable(&live.findings), 1, "{:?}", live.findings);
         assert_eq!(
             missing(&live.findings),
