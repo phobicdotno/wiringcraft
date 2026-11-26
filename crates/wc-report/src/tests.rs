@@ -422,6 +422,21 @@ fn check_names_a_cable_core_on_two_connections() {
             "cable core -W1:1 is on 2 connections".to_owned()
         )]
     );
+    // Wire ids need not be unique on a page (a replaced page can repeat them): the second
+    // connection's wire still counts when it shares the first one's id.
+    let w4 = p.pages[1].wires.iter_mut().find(|w| w.id == "w4");
+    let Some(w4) = w4 else {
+        unreachable!("the fixture has w4")
+    };
+    w4.id = "w2".into();
+    assert_eq!(
+        found(&p),
+        [(
+            Some("p2".to_owned()),
+            Some("w2".to_owned()),
+            "cable core -W1:1 is on 2 connections".to_owned()
+        )]
+    );
 }
 
 #[test]

@@ -734,18 +734,19 @@ fn on_segment(p: Point, a: Point, b: Point) -> bool {
 /// no conductor.
 fn cable_cores(i: &Inputs<'_>, out: &mut Vec<Finding>) {
     let p = i.project;
-    let (_, wire_net) = wc_core::connectivity::wire_nets(p, |id| i.symbols.get(id).map(|s| s.role));
+    // Wires are known by their place: ids need not be unique on a page.
+    let (_, wire_net) = wc_core::connectivity::wire_nets_by_place(p, |id| i.symbols.get(id).map(|s| s.role));
     // Per core: the nets it is on, in drawing order, each with the first wire naming it there.
     type Uses<'p> = Vec<(usize, &'p Page, &'p str)>;
     let mut by_core: BTreeMap<(&DeviceTag, &str), Uses> = BTreeMap::new();
-    for page in p.pages.iter().filter(|pg| !pg.overview) {
-        for w in &page.wires {
+    for (pi, page) in p.pages.iter().enumerate().filter(|(_, pg)| !pg.overview) {
+        for (wi, w) in page.wires.iter().enumerate() {
             let Some(c) = &w.cable else { continue };
             let core = c.core.trim();
             if core.is_empty() {
                 continue;
             }
-            let Some(&net) = wire_net.get(&(page.id.clone(), w.id.clone())) else {
+            let Some(&net) = wire_net.get(&(pi, wi)) else {
                 continue;
             };
             let nets = by_core.entry((&c.cable, core)).or_default();
