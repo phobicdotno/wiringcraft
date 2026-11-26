@@ -4259,7 +4259,16 @@ fn import_page_dwg(dir: &Path, file: &Path, page: String, scale: f64, template: 
     let (dxf, converter) = dwg_to_dxf(file, tmp.path(), template)
         .map_err(|why| format!("WiringCraft's own DWG reader refused the file ({refused}); {why}"))?;
     println!("converted to DXF with {converter}: WiringCraft's own DWG reader refused the file ({refused})");
-    import_cmd(dir, ImportCmd::PageDxf { file: dxf, page, scale })
+    let text = read_file(&dxf)?;
+    import_onto_page(dir, &page, |known| {
+        // Only a DXF that cannot be read gets both reasons; project errors stay as they are.
+        wc_import::dxf::page(&String::from_utf8_lossy(&text), scale, known).map_err(|why| {
+            format!(
+                "WiringCraft's own DWG reader refused the file ({refused}); the DXF {converter} made from it could not be read either: {}",
+                escape_field(&why.to_string())
+            )
+        })
+    })
 }
 
 /// Convert DWG to a DXF in `tmp` (a private folder, see [`staging_dir`]) with whatever
@@ -5887,8 +5896,16 @@ mod tests {
         assert!(err.as_ref().is_err_and(|e| e.contains("no-such-page")), "{err:?}");
         assert!(!folder().exists(), "removed after a failed import");
 
-        // And when it works.
+        // The converter makes a DXF that cannot be read: both reasons are given.
         let pages = load(&dir).unwrap().pages;
+        let junk = converter("junk.sh", "echo junk > \"$2\"");
+        let err = import_page_dwg(&dir, &dwg, pages[0].id.clone(), 1.0, Some(junk)).unwrap_err();
+        assert!(
+            err.contains("own DWG reader refused") && err.contains("could not be read either"),
+            "{err}"
+        );
+
+        // And when it works.
         import_page_dwg(&dir, &dwg, pages[0].id.clone(), 1.0, Some(copy)).unwrap();
         assert!(!folder().exists(), "removed after the import");
     }
