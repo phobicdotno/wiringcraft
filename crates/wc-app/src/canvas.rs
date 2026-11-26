@@ -110,6 +110,9 @@ pub struct Editor {
     /// when the drag started (Escape puts it back so). The drag ends when the history count
     /// moves on without it.
     pub panel_drag: Option<(Point, Option<u64>, wc_core::panel::PanelItem)>,
+    /// The panel drag changes a rail's length or a duct's size by its handle instead of
+    /// moving it; the grab offset is then from the handle.
+    pub panel_resize: bool,
     /// Wire pins that line up when a symbol is placed or moved (the app sets it from the
     /// preferences). Holding Alt skips it once.
     pub auto_wire: bool,
@@ -160,6 +163,7 @@ impl Default for Editor {
             panel: None,
             panel_pick: None,
             panel_drag: None,
+            panel_resize: false,
             auto_wire: false,
             held_by: Default::default(),
             layers: Default::default(),
