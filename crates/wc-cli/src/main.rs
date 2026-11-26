@@ -2379,6 +2379,24 @@ fn run(cli: Cli) -> Res<()> {
                     "the file of symbol {symbol_id} is a link; box-edit does not replace it (copy its target over it first)"
                 ));
             }
+            // The same for the project's own files (pages, panels, lock, ...): both the save and
+            // the rollback would put a plain file where the link was (#614), so refuse before any
+            // write.
+            let linked: Vec<String> = before
+                .iter()
+                .filter(|(path, _)| std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()))
+                .map(|(path, _)| escape_field(&path.display().to_string()))
+                .collect();
+            if !linked.is_empty() {
+                return Err(format!(
+                    "{} a link; box-edit does not replace project files that are links (copy each target over its link first)",
+                    if linked.len() == 1 {
+                        format!("{} is", linked[0])
+                    } else {
+                        format!("{} are", linked.join(", "))
+                    }
+                ));
+            }
             store::write_vendored_symbol(dir, &new).map_err(e)?;
             if let Err(err) = save(dir, &p) {
                 let mut failed = put_files_back(&before);
@@ -8366,6 +8384,44 @@ mod tests {
             assert_eq!(std::fs::read_link(&path).unwrap(), target);
             assert_eq!(std::fs::read(&target).unwrap(), before);
         }
+    }
+
+    /// A page file that is a link is refused before anything is written, so neither the save
+    /// nor a rollback replaces the link with a plain file (#614).
+    #[cfg(unix)]
+    #[test]
+    fn box_edit_refuses_a_linked_page_file_before_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        cli(
+            &dir,
+            &["box", "p1", "--at", "40,40", "--size", "20,10", "--pin", "1:left:5"],
+        )
+        .unwrap();
+        let page = dir.join(store::PAGES_DIR).join(format!("p1{}", store::PAGE_SUFFIX));
+        let target = tmp.path().join("p1-elsewhere.json");
+        std::fs::rename(&page, &target).unwrap();
+        std::os::unix::fs::symlink(&target, &page).unwrap();
+        let page_before = std::fs::read(&target).unwrap();
+        let symbol_before = store::read_vendored_symbol(&dir, "box.p1.s1").unwrap();
+        let lock_before = std::fs::read(dir.join(store::LOCK_FILE)).unwrap();
+
+        let err = cli(&dir, &["box-edit", "p1", "s1", "--size", "30,10"]).unwrap_err();
+        assert!(err.contains("link"), "{err}");
+        assert!(err.contains(&format!("p1{}", store::PAGE_SUFFIX)), "{err}");
+        assert!(std::fs::symlink_metadata(&page).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_link(&page).unwrap(), target);
+        assert_eq!(std::fs::read(&target).unwrap(), page_before);
+        assert_eq!(store::read_vendored_symbol(&dir, "box.p1.s1").unwrap(), symbol_before);
+        assert_eq!(std::fs::read(dir.join(store::LOCK_FILE)).unwrap(), lock_before);
+
+        // With the link replaced by its target's bytes the same edit goes through.
+        std::fs::remove_file(&page).unwrap();
+        std::fs::copy(&target, &page).unwrap();
+        cli(&dir, &["box-edit", "p1", "s1", "--size", "30,10"]).unwrap();
+        assert_ne!(store::read_vendored_symbol(&dir, "box.p1.s1").unwrap(), symbol_before);
     }
 
     #[test]
