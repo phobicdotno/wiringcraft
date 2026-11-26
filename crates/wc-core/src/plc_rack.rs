@@ -75,6 +75,33 @@ pub struct PlcCard {
 /// Most channels a card may have: more is a typing error, and would fill pages with rows.
 pub const MAX_CHANNELS: u32 = 256;
 
+/// The highest slot number a card may have in the PLC racks form and the command line.
+pub const MAX_SLOT: u32 = 999;
+
+/// The largest channel step the PLC racks form and the command line take.
+pub const MAX_STEP: u32 = 64;
+
+/// Why `racks` holds a number the PLC racks form would not let the user type (a slot past
+/// [`MAX_SLOT`], more than [`MAX_CHANNELS`] channels, a step outside 1 to [`MAX_STEP`]);
+/// `None` when every number is in range. The assistant and the command line check racks they
+/// are given by this.
+pub fn problem(racks: &[PlcRack]) -> Option<String> {
+    racks.iter().find_map(|rack| {
+        rack.cards.iter().find_map(|c| {
+            let at = || format!("rack {:?}, card in slot {}", rack.name, c.slot);
+            if c.slot > MAX_SLOT {
+                Some(format!("{}: the slot must be from 0 to {MAX_SLOT}", at()))
+            } else if c.channels > MAX_CHANNELS {
+                Some(format!("{}: a card has at most {MAX_CHANNELS} channels", at()))
+            } else if c.step.is_some_and(|s| !(1..=MAX_STEP).contains(&s)) {
+                Some(format!("{}: the step must be from 1 to {MAX_STEP}", at()))
+            } else {
+                None
+            }
+        })
+    })
+}
+
 /// A PLC address read from one of its common spellings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PlcAddress {
@@ -291,6 +318,55 @@ mod tests {
         assert!(list(card("%IX0.0", 0, None)).is_err());
         assert!(list(card("%IX0.0", MAX_CHANNELS + 1, None)).is_err());
         assert!(list(card("%IW0", 2, Some(0))).is_err());
+    }
+
+    #[test]
+    fn problem_names_the_first_number_out_of_range() {
+        let rack = |card: PlcCard| PlcRack {
+            name: "-A1".into(),
+            cards: vec![card],
+            ..PlcRack::default()
+        };
+        let ok = PlcCard {
+            slot: MAX_SLOT,
+            channels: MAX_CHANNELS,
+            step: Some(MAX_STEP),
+            ..PlcCard::default()
+        };
+        assert_eq!(problem(&[rack(ok.clone())]), None);
+        for (bad, why) in [
+            (
+                PlcCard {
+                    slot: MAX_SLOT + 1,
+                    ..ok.clone()
+                },
+                "the slot must be from 0 to 999",
+            ),
+            (
+                PlcCard {
+                    channels: MAX_CHANNELS + 1,
+                    ..ok.clone()
+                },
+                "at most 256 channels",
+            ),
+            (
+                PlcCard {
+                    step: Some(0),
+                    ..ok.clone()
+                },
+                "the step must be from 1 to 64",
+            ),
+            (
+                PlcCard {
+                    step: Some(MAX_STEP + 1),
+                    ..ok.clone()
+                },
+                "the step must be from 1 to 64",
+            ),
+        ] {
+            let got = problem(&[rack(bad)]).unwrap_or_default();
+            assert!(got.contains(why) && got.starts_with("rack \"-A1\""), "{got}");
+        }
     }
 
     #[test]

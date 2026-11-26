@@ -210,6 +210,139 @@ fn a_library_symbol_is_drawn_as_the_symbol_of_its_kind_turned_by_its_variant() -
     Ok(())
 }
 
+/// A coil whose macro shows its device tag and the description of its first connection point,
+/// a connection point with its description shown, and one whose property placements run in a
+/// loop. Reference point (50, 100).
+const SHOWN_TEXTS: &str = r#"<EplanPxfRoot Name="K">
+ <MacroVariant VariantId="0" ReferencePoint="50/100" MacroFuncType="1" DocumentType="1">
+  <ESymLib Name="IEC_symbol" ID="1"/>
+  <ESymLib Name="SPECIAL" ID="0"/>
+  <O4>
+   <O17 A1="17/50" A1261="1" A1262="20" A1263="0" A1381="200" A1382="1" A1383="1" A185="A1;A2" A186="Coil;Return">
+    <S53x5 A4="1" R7="17/50" A771="20010" A953="0" A501="-6/3">
+     <S54x505 A961="L" A966="7"/>
+    </S53x5>
+    <S53x5 A4="2" R7="17/50" A771="20028" A953="1" A501="1/0"/>
+    <S53x5 A4="3" R7="17/50" A771="20029" A953="0" A502="17/50/2" A501="0/-2">
+     <S54x505 A961="1.5" A962="1.5707963267949" A966="1"/>
+    </S53x5>
+    <P11 P20051="0"/>
+    <S40x1201 A762="60/90"/>
+    <P144 P20013="K" P20014="1"/>
+   </O17>
+   <O17 A1="17/51" A1261="0" A1262="40" A1263="0" A1381="300" A1382="1" A1383="2" A185="1" A186="IN1">
+    <S53x5 A4="1" R7="17/51" A771="20029" A953="0" A501="2/1"/>
+    <S53x5 A4="2" R7="17/51" A771="20010" A953="0" A501="-50/-50"/>
+    <S40x1201 A762="80/90"/>
+   </O17>
+   <O17 A1="17/52" A1261="0" A1262="40" A1263="0" A1381="300" A1382="1" A1383="2" A185="2" A186="Loop">
+    <S53x5 A4="1" R7="17/52" A771="20029" A953="0" A502="17/52/2"/>
+    <S53x5 A4="2" R7="17/52" A771="20028" A953="0" A502="17/52/1"/>
+    <S40x1201 A762="90/90"/>
+   </O17>
+  </O4>
+ </MacroVariant>
+</EplanPxfRoot>"#;
+
+fn text_at(s: &Symbol, text: &str) -> std::result::Result<(Point, f64, f64, Align), String> {
+    s.graphics
+        .iter()
+        .find_map(|g| match g {
+            Shape::Text {
+                at,
+                text: t,
+                height,
+                align,
+                angle,
+            } if t == text => Some((*at, *height, *angle, *align)),
+            _ => None,
+        })
+        .ok_or_else(|| format!("no text {text} in {:?}", s.graphics))
+}
+
+#[test]
+fn the_device_tag_and_connection_point_descriptions_go_where_the_macro_shows_them() -> TestResult {
+    let m = read("coil.ema", SHOWN_TEXTS)?;
+    let s = &m.symbol;
+    // The coil's displayed device tag: 6 left of and 3 above its point (60, 90), on the page
+    // (4, 7); not the tag shown by the connection point, which has no device tag.
+    assert!(near(s.tag_at, 4.0, 7.0), "{:?}", s.tag_at);
+    // "Coil" is anchored to the first point's designation (1 right of the point) and 2 below
+    // it, reads bottom to top, left aligned, 1.5 high.
+    let (at, height, angle, align) = text_at(s, "Coil")?;
+    assert!(near(at, 11.0, 12.0), "{at:?}");
+    assert!((height - 1.5).abs() < 1e-9 && (angle - 90.0).abs() < 1e-9 && align == Align::Left);
+    // "Return" has no placement of its own: it is printed beside its pin, A2 8 below A1.
+    let a2 = pin(s, "A2")?;
+    let (at, ..) = text_at(s, "Return")?;
+    assert!(near(at, a2.at.x + 1.0, a2.at.y - 1.0), "{at:?} beside {a2:?}");
+    // A connection point of its own shows its description 2 right of and 1 above it.
+    let (at, ..) = text_at(s, "IN1")?;
+    assert!(near(at, 32.0, 9.0), "{at:?}");
+    // Placements anchored in a loop are not followed: beside the pin (40, 10).
+    let (at, ..) = text_at(s, "Loop")?;
+    assert!(near(at, 41.0, 9.0), "{at:?}");
+    Ok(())
+}
+
+#[test]
+fn without_a_shown_device_tag_the_tag_goes_above_the_drawing() -> TestResult {
+    let s = read("BES_contactor.ema", COIL)?.symbol;
+    let mut pts: Vec<Point> = s.pins.iter().map(|p| p.at).collect();
+    for g in &s.graphics {
+        let (a, b) = g.bounds();
+        pts.extend([a, b]);
+    }
+    let (min, _) = bounds_of(&pts);
+    assert!(near(s.tag_at, min.x, min.y - 2.0), "{:?}", s.tag_at);
+    Ok(())
+}
+
+#[test]
+fn a_description_of_a_point_without_a_pin_is_counted() -> TestResult {
+    // A coil has two designations and pins; a third description belongs to no point.
+    let xml = SHOWN_TEXTS.replace(
+        r#"A185="A1;A2" A186="Coil;Return""#,
+        r#"A185="A1;A2" A186="Coil;Return;Spare""#,
+    );
+    let m = read("coil.ema", &xml)?;
+    assert!(text_at(&m.symbol, "Spare").is_err());
+    assert_eq!(
+        m.left_out.get("connection point descriptions of points without a pin"),
+        Some(&1),
+        "{:?}",
+        m.left_out
+    );
+    Ok(())
+}
+
+#[test]
+fn many_descriptions_are_cut_and_too_many_shown_properties_refused() -> TestResult {
+    let long = vec!["x"; 2 * MAX_DESIGNATIONS].join(";");
+    let xml = SHOWN_TEXTS.replace(r#"A186="IN1""#, &format!(r#"A186="IN1;{long}""#));
+    let m = read("coil.ema", &xml)?;
+    assert!(text_at(&m.symbol, "IN1").is_ok());
+    let kept = variants(&xml)?
+        .iter()
+        .flat_map(|v| v.placements.iter())
+        .find(|p| p.id == "17/51")
+        .map(|p| p.descriptions.len());
+    assert_eq!(kept, Some(MAX_DESIGNATIONS));
+
+    let many: String = (0..=MAX_PROPS)
+        .map(|k| format!(r#"<S53x5 A4="{}" A771="20029" A953="0" A502="17/52/{k}"/>"#, k + 10))
+        .collect();
+    let xml = SHOWN_TEXTS.replace(
+        r#"<S40x1201 A762="90/90"/>"#,
+        &format!(r#"{many}<S40x1201 A762="90/90"/>"#),
+    );
+    let Err(e) = read("coil.ema", &xml) else {
+        unreachable!("too many shown properties are refused")
+    };
+    assert!(e.to_string().contains("properties"), "{e}");
+    Ok(())
+}
+
 #[test]
 fn a_macro_without_a_multi_line_representation_says_what_it_has() {
     let layout = r#"<EplanPxfRoot><MacroVariant MacroFuncType="6" DocumentType="7" ReferencePoint="0/0"/>
@@ -624,5 +757,50 @@ fn a_terminal_gets_a_pin_per_designation_and_a_fuse_is_drawn_as_fuses() -> TestR
     let m = read("fuse1.ema", &fuse.replace("1;2;3;4", "A1;A2"))?;
     assert_eq!(m.symbol.role, SymbolRole::Standalone, "not a coil");
     assert!(near(pin(&m.symbol, "A2")?.at, 10.0, 18.0));
+    Ok(())
+}
+
+#[test]
+fn a_single_points_shown_description_is_its_first_and_formatting_stays_with_its_own_property() -> TestResult {
+    // A second description of a single point has no point of its own: counted, not drawn over
+    // the first. A property placement that is not read keeps its formatting to itself.
+    let xml = SHOWN_TEXTS.replace(r#"A186="IN1""#, r#"A186="IN1;Spare""#).replace(
+        r#"<S53x5 A4="2" R7="17/51" A771="20010" A953="0" A501="-50/-50"/>"#,
+        r#"<S53x5 A4="2" R7="17/51" A771="x" A953="0"><S54x505 A961="9" A962="1"/></S53x5>"#,
+    );
+    let m = read("coil.ema", &xml)?;
+    let (at, height, angle, _) = text_at(&m.symbol, "IN1")?;
+    assert!(near(at, 32.0, 9.0), "{at:?}");
+    assert!(
+        (height - TEXT_HEIGHT).abs() < 1e-9 && angle.abs() < 1e-9,
+        "{height} {angle}"
+    );
+    assert!(text_at(&m.symbol, "Spare").is_err());
+    assert_eq!(
+        m.left_out.get("connection point descriptions of points without a pin"),
+        Some(&1),
+        "{:?}",
+        m.left_out
+    );
+    Ok(())
+}
+
+#[test]
+fn repeated_designations_put_each_description_beside_its_own_pin() -> TestResult {
+    // A coil with its designation repeated gets pins A1 and A1'; neither description is shown
+    // by the macro, so each goes beside its own pin.
+    let xml = SHOWN_TEXTS
+        .replace(
+            r#"A185="A1;A2" A186="Coil;Return""#,
+            r#"A185="A1;A1" A186="First;Second""#,
+        )
+        .replace(
+            r#"A771="20029" A953="0" A502="17/50/2""#,
+            r#"A771="20011" A953="0" A502="17/50/2""#,
+        );
+    let s = read("coil.ema", &xml)?.symbol;
+    let (first, ..) = text_at(&s, "First")?;
+    let (second, ..) = text_at(&s, "Second")?;
+    assert!(first.distance(second) > 1.0, "{first:?} {second:?}");
     Ok(())
 }
