@@ -179,6 +179,9 @@ pub struct Form {
     /// The projects of a SolidWorks Electrical archive, as shown (number, folder, name); the
     /// choice is offered when there are several.
     pub projects: Vec<String>,
+    /// Why the archive's project names could not be read, when they could not: shown with the
+    /// choice, which then lists the folders alone.
+    pub projects_note: Option<String>,
     /// The project chosen, an index into `projects`.
     pub project: usize,
     /// The symbol map file, typed or picked with Browse; empty: none.
@@ -194,24 +197,70 @@ pub struct Form {
 }
 
 /// The projects of the SolidWorks Electrical archive `file` as the options dialog lists them.
-/// None for a file that is no archive (a bare database, or a file the import will refuse).
-fn swe_projects(file: &Path) -> Vec<String> {
-    std::fs::File::open(file)
+/// None for a file that is no archive (a bare database, or a file the import will refuse with
+/// its reason). With them, why the project names could not be read, when they could not.
+fn swe_projects(file: &Path) -> (Vec<String>, Option<String>) {
+    let Some(listing) = std::fs::File::open(file)
         .ok()
         .and_then(|f| wc_import::swe::archive_projects(std::io::BufReader::new(f)).ok())
-        .unwrap_or_default()
+    else {
+        return (Vec::new(), None);
+    };
+    let shown = listing
+        .projects
         .iter()
         .enumerate()
         .map(|(i, p)| match p.name.is_empty() {
             true => format!("{}: {}", i + 1, p.folder),
             false => format!("{}: {} ({})", i + 1, p.folder, p.name),
         })
-        .collect()
+        .collect();
+    let note = listing
+        .names_warning
+        .map(|why| format!("Only the folders are listed: {why}"));
+    (shown, note)
+}
+
+/// What the symbol map field says while it is empty: a path typed there is read as the typed
+/// import file is ([`crate::prefs::project_path`]), so a relative one is taken inside the
+/// projects folder.
+pub fn symbol_map_hint() -> String {
+    format!(
+        "none; a relative path is taken inside {}",
+        crate::prefs::projects_dir().display()
+    )
+}
+
+/// The files under a folder with their size and time of change: what an import wrote there
+/// shows as a difference.
+type Files = std::collections::BTreeMap<PathBuf, (u64, Option<std::time::SystemTime>)>;
+
+/// The files under `dir`, in its subfolders too. Links are not followed.
+fn files_under(dir: &Path) -> Files {
+    let mut out = Files::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else { continue };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_dir() {
+                todo.push(entry.path());
+            } else if let Ok(meta) = entry.metadata() {
+                out.insert(entry.path(), (meta.len(), meta.modified().ok()));
+            }
+        }
+    }
+    out
 }
 
 impl Form {
     /// The form for importing `file` as `kind` into `open`, with the defaults filled in.
     pub fn new(open: &Open, kind: Kind, file: &Path) -> Self {
+        let (projects, projects_note) = if kind == Kind::Swe {
+            swe_projects(file)
+        } else {
+            (Vec::new(), None)
+        };
         Self {
             kind,
             scale: "1".to_owned(),
@@ -219,11 +268,8 @@ impl Form {
                 .map(|n| n.to_string())
                 .unwrap_or_default(),
             keep_numbers: false,
-            projects: if kind == Kind::Swe {
-                swe_projects(file)
-            } else {
-                Vec::new()
-            },
+            projects,
+            projects_note,
             project: 0,
             symbol_map: crate::prefs::FolderField::default(),
             libraries: Vec::new(),
@@ -345,6 +391,8 @@ pub struct Job {
     /// The project folder it writes to (or whose library list it reads again).
     pub dir: PathBuf,
     lib: Option<PathBuf>,
+    /// An archive's library folder as it was before the import ([`Job::wrote_to_library`]).
+    lib_before: Option<Files>,
     /// Said before the import's own result (the changes saved first).
     note: String,
     adopt: Adopt,
@@ -397,12 +445,16 @@ pub fn start(open: &mut Open, kind: Kind, file: &Path, lib: Option<&Path>, page:
             Ok(()) => (Adopt::Project, project_work(open, kind, f, page, options)),
         }
     };
+    let lib = lib.map(Path::to_path_buf).or_else(|| options.lib.clone());
+    // Looked at before the worker starts writing.
+    let lib_before = lib.as_deref().filter(|_| !kind.needs_library()).map(files_under);
     let (lines, done) = spawn(work);
     Job {
         kind,
         name,
         dir: open.dir.clone(),
-        lib: lib.map(Path::to_path_buf).or_else(|| options.lib.clone()),
+        lib,
+        lib_before,
         note,
         adopt,
         lines,
@@ -496,6 +548,16 @@ impl Job {
     /// What the import has said so far.
     pub fn lines(&self) -> Vec<String> {
         self.lines.lock().map(|l| l.clone()).unwrap_or_default()
+    }
+
+    /// Whether the ended import wrote into its library folder. A parts import always counts;
+    /// an archive only when a symbol library or a part of it went there, which shows as a file
+    /// that is new or changed since the import started.
+    pub fn wrote_to_library(&self) -> bool {
+        match (&self.lib, &self.lib_before) {
+            (Some(lib), Some(before)) => files_under(lib) != *before,
+            _ => self.kind.needs_library(),
+        }
     }
 
     /// The import's result once the worker has ended, without waiting.
@@ -838,6 +900,22 @@ pub(crate) mod tests {
         for kind in [Kind::Eplan, Kind::Swe, Kind::Aml, Kind::Pdf, Kind::PartsEdz] {
             assert!(!Form::new(&open, kind, &file).has(Opt::Library), "{kind:?}");
         }
+        // A symbol map typed as a relative path is taken inside the projects folder, as the
+        // typed import file is, and the field says so.
+        let map = Form {
+            symbol_map: crate::prefs::FolderField::typed("maps/blocks.txt"),
+            ..Form::new(&open, Kind::Swe, &file)
+        };
+        let inside = crate::prefs::project_path("maps/blocks.txt");
+        let Ok(inside) = inside else {
+            unreachable!("{inside:?}");
+        };
+        assert!(inside.starts_with(crate::prefs::projects_dir()), "{inside:?}");
+        assert_eq!(
+            map.options(),
+            Err(format!("The symbol map {} is not a file.", inside.display()))
+        );
+        assert!(symbol_map_hint().contains(&crate::prefs::projects_dir().display().to_string()));
         // The symbol map is the SolidWorks project's and the EDZ parts' alone.
         for kind in [Kind::Eplan, Kind::Aml, Kind::Pdf, Kind::Archive, Kind::PageDxf] {
             assert!(!Form::new(&open, kind, &file).has(Opt::SymbolMap), "{kind:?}");
@@ -885,7 +963,7 @@ pub(crate) mod tests {
     }
 
     /// Write a zip at `path` with `entries` (name, bytes).
-    fn write_zip(path: &Path, entries: &[(&str, &[u8])]) -> bool {
+    pub(crate) fn write_zip(path: &Path, entries: &[(&str, &[u8])]) -> bool {
         use std::io::Write;
         let Ok(file) = std::fs::File::create(path) else {
             return false;
@@ -1145,6 +1223,7 @@ INSERT INTO tew_componentterminal VALUES (50, 0, 'A1'), (50, 1, 'A2');
             name: "plant.aml".to_owned(),
             dir: open.dir.clone(),
             lib: None,
+            lib_before: None,
             note: String::new(),
             adopt: Adopt::Project,
             lines,

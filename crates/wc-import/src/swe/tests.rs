@@ -1197,20 +1197,54 @@ fn the_projects_of_an_archive_are_listed_in_the_order_they_are_picked() {
         ("Database/tew_app_project.sqlite", &list),
     ]);
     let got = archive_projects(buf.clone()).unwrap();
-    let shown: Vec<(&str, &str)> = got.iter().map(|p| (p.folder.as_str(), p.name.as_str())).collect();
+    let shown: Vec<(&str, &str)> = got
+        .projects
+        .iter()
+        .map(|p| (p.folder.as_str(), p.name.as_str()))
+        .collect();
     assert_eq!(shown, [("Projects/3", "Pump station"), ("Projects/12", "Other")]);
+    assert_eq!(got.names_warning, None);
     // The same order as the pick.
     assert_eq!(database_from_archive(buf, 2).unwrap().folder, "Projects/12");
     // Without the project list the folders are still listed.
     let bare = archive(&[("Projects/3/Database/tew_project_data.sqlite", &db)]);
     assert_eq!(
         archive_projects(bare).unwrap(),
-        [ArchiveProject {
-            folder: "Projects/3".into(),
-            name: String::new()
-        }]
+        ArchiveListing {
+            projects: vec![ArchiveProject {
+                folder: "Projects/3".into(),
+                name: String::new()
+            }],
+            names_warning: None,
+        }
     );
     assert!(archive_projects(std::io::Cursor::new(b"not a zip".to_vec())).is_err());
+}
+
+#[test]
+fn a_project_list_that_cannot_be_read_leaves_the_folders_and_says_why() {
+    let db = sample().serialize(rusqlite::MAIN_DB).unwrap().to_vec();
+    // A list that is no database, and one that is a database without the project table.
+    let other = Connection::open_in_memory().unwrap();
+    other.execute_batch("CREATE TABLE t (a)").unwrap();
+    let no_table = other.serialize(rusqlite::MAIN_DB).unwrap().to_vec();
+    for list in [b"not a database".to_vec(), no_table] {
+        let buf = archive(&[
+            ("Projects/12/Database/tew_project_data.sqlite", &db),
+            ("Projects/3/Database/tew_project_data.sqlite", &db),
+            ("Database/tew_app_project.sqlite", &list),
+        ]);
+        let got = archive_projects(buf).unwrap();
+        let shown: Vec<(&str, &str)> = got
+            .projects
+            .iter()
+            .map(|p| (p.folder.as_str(), p.name.as_str()))
+            .collect();
+        assert_eq!(shown, [("Projects/3", ""), ("Projects/12", "")]);
+        let why = got.names_warning.unwrap();
+        assert!(why.starts_with("the project names were not read: "), "{why}");
+        assert!(why.len() > "the project names were not read: ".len(), "{why}");
+    }
 }
 
 #[test]

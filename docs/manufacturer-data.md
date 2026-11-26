@@ -58,19 +58,24 @@ is the CLI's default, or one above the project's highest numeric page number whe
 (with page 101 in use, 102 even when 100 is free, since the imported pages follow on from one
 number); for a SolidWorks archive it is offered from 100 in the same way, with its own page
 numbers as the other choice. A SolidWorks archive that holds several projects lists them (number,
-folder and name) and the first is chosen, as `--pick 1`. A first page number above 1 000 000 000
-is refused, on the command line too.
+folder and name) and the first is chosen, as `--pick 1`; when the archive's project list cannot
+be read, the folders are listed alone and the dialog says why. A first page number above
+1 000 000 000 is refused, on the command line too.
 
 A SolidWorks Electrical project and an EDZ parts import have the symbol map file
 (`--symbol-map`): a field with a Browse button, empty by default, which imports with no map as
 the command line does without the option. A file that is not there is refused before the import
-starts.
+starts. A relative path typed there is taken inside the projects folder, as a typed import file
+is; the empty field names that folder.
 
 An archive has the library folder for the KiCad symbol libraries and parts lists inside it
 (`--lib`): "Do not import them" by default, which lists them with a warning as the command line
 does without `--lib`, or the project's own `library/`, one of its other library folders, or
 another folder typed or picked with Browse, as for a parts import. A folder that is not among
-the project's libraries yet is added to them once something was written there.
+the project's libraries yet is added to them once something was written there (a symbol
+library or a part), also when the folder was there before. The SolidWorks Electrical libraries
+import vendors into the project, as `import swe-library` does without `--lib`; writing them
+into a library folder instead (`import swe-library --lib`) is on the command line only.
 
 In the app, **Library → Import symbols…** takes DXF, SVG, `.kicad_sym` and `.elmt` files together,
 each read by its extension, and writes them into one of the project's library folders. The

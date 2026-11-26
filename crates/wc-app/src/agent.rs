@@ -3959,6 +3959,63 @@ mod tests {
     }
 
     #[test]
+    fn an_archives_other_library_folder_is_declared_only_once_something_is_written_there() {
+        use crate::imports::{Kind, Options, tests::write_zip};
+        let (tmp, mut a) = app(vec![]);
+        // "Another folder": there already, and not among the project's library folders.
+        let other = tmp.path().join("shared lib");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("notes.txt"), "kept").unwrap();
+        let options = Options {
+            lib: Some(other.clone()),
+            ..Options::default()
+        };
+        let declared = |a: &App| a.open.as_ref().unwrap().project.meta.libraries.clone();
+        let before = declared(&a);
+        let said = |a: &App| match &a.dialog {
+            Some(Dialog::Message(msg)) => msg.clone(),
+            _ => String::new(),
+        };
+
+        // An archive with no symbol library or parts list writes nothing there.
+        let plain = tmp.path().join("plain.zip");
+        assert!(write_zip(
+            &plain,
+            &[("plant.aml", crate::imports::tests::AML.as_bytes())]
+        ));
+        a.import_from(Kind::Archive, &plain, Some(&other), None, &options);
+        until_imported(&mut a);
+        assert!(said(&a).starts_with("Imported plain.zip."), "{}", said(&a));
+        assert_eq!(declared(&a), before, "nothing was written to the folder");
+
+        // One with a KiCad library and a parts list does, and the folder is declared.
+        let vendor = tmp.path().join("vendor.zip");
+        let kicad = br#"(kicad_symbol_lib
+  (symbol "K" (property "Reference" "K" (at 0 0 0))
+    (symbol "K_1_1" (pin passive line (at 0 3 270) (length 1) (name "~") (number "A1")))))"#;
+        let parts = b"order number;manufacturer;description\nX-1;Acme;Relay\n";
+        assert!(write_zip(
+            &vendor,
+            &[("symbols/My Relays.kicad_sym", kicad), ("lists/parts.csv", parts)]
+        ));
+        a.import_from(Kind::Archive, &vendor, Some(&other), None, &options);
+        until_imported(&mut a);
+        assert!(said(&a).starts_with("Imported vendor.zip."), "{}", said(&a));
+        let after = declared(&a);
+        assert_eq!(after.len(), before.len() + 1, "{after:?}");
+        assert_eq!(
+            (after[0].kind.as_str(), std::path::Path::new(&after[0].location)),
+            ("folder", other.as_path())
+        );
+        assert!(a.open.as_ref().unwrap().dirty);
+
+        // Declared once: importing into it again adds nothing.
+        a.import_from(Kind::Archive, &vendor, Some(&other), None, &options);
+        until_imported(&mut a);
+        assert_eq!(declared(&a), after);
+    }
+
+    #[test]
     fn an_import_runs_off_the_window_thread_with_edits_held_until_it_is_taken_in() {
         let (tmp, mut a) = app(vec![]);
         let aml = tmp.path().join("plant.aml");

@@ -1106,8 +1106,8 @@ impl App {
             (None, _) => None,
         };
         // An archive may hold no symbol library or parts list: its folder is listed only once
-        // something was written there.
-        let written = kind.needs_library() || lib.as_deref().is_some_and(Path::is_dir);
+        // something was written there, also when the folder was there before.
+        let written = job.wrote_to_library();
         if done
             && written
             && let Some(source) = source
@@ -3407,6 +3407,11 @@ impl App {
                                     }
                                 });
                             ui.end_row();
+                            if let Some(note) = &form.projects_note {
+                                ui.label("");
+                                ui.label(RichText::new(note.as_str()).weak());
+                                ui.end_row();
+                            }
                         }
                         if form.has(imports::Opt::FirstPage) {
                             ui.label("First page number")
@@ -3467,11 +3472,14 @@ impl App {
                                 "Optional: a text file with one `source name = symbol id` per line, which gives a source block or macro a library symbol",
                             );
                             ui.horizontal(|ui| {
+                                // The hint is cut short in a narrow field: it is the hover text too.
+                                let hint = imports::symbol_map_hint();
                                 ui.add(
                                     egui::TextEdit::singleline(&mut form.symbol_map.text)
-                                        .hint_text("none")
+                                        .hint_text(hint.as_str())
                                         .desired_width(300.0),
-                                );
+                                )
+                                .on_hover_text(hint);
                                 if ui.button("Browse…").clicked() {
                                     let start = file.parent().unwrap_or(file.as_path());
                                     match pick_open("Symbol map", start, ("Symbol map (text file)", &["txt", "map", "*"])) {
