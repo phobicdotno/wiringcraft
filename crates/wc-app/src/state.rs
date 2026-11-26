@@ -240,7 +240,12 @@ fn write_edits(dir: &Path, edits: &[FileEdit], undo: bool) -> Result<Written, (S
                 .map_err(|err| format!("{} could not be written: {err}", path.display()))
         });
         match done {
-            Ok(was) => written.push((path, was)),
+            // A file the step edits twice is put back once, as it was before the first write.
+            Ok(was) => {
+                if !written.iter().any(|(p, _)| *p == path) {
+                    written.push((path, was));
+                }
+            }
             Err(mut msg) => {
                 let (back, stuck, unwritten) = put_back_files(&written);
                 let left: Vec<String> = order
@@ -1211,13 +1216,12 @@ impl Open {
                 let written = match write_edits(&self.dir, &prev.files, true) {
                     Ok(written) => written,
                     Err((e, unwritten)) => {
-                        self.keep_unwritten(unwritten);
+                        self.keep_unwritten(unwritten, false);
                         self.undo_error = Some(e);
                         self.undo.push(prev);
                         return false;
                     }
                 };
-                self.written_as_needed(&written);
                 self.forget_terminal_change();
                 let Step { project, files } = prev;
                 self.redo.push(Step {
@@ -1235,7 +1239,7 @@ impl Open {
                         // The files go back as they were before this step, not as recorded:
                         // a change made to one outside since stays.
                         let (_, stuck, unwritten) = put_back_files(&written);
-                        self.keep_unwritten(unwritten);
+                        self.keep_unwritten(unwritten, false);
                         let e = if stuck.is_empty() {
                             e
                         } else {
@@ -1250,6 +1254,8 @@ impl Open {
                     }
                     return false;
                 }
+                // Only now are the files as the project needs them: a failed sync puts them back.
+                self.written_as_needed(&written);
                 let sources = self.redo.last().map(|s| &s.project.meta.libraries) != Some(&self.project.meta.libraries);
                 self.follow_step(sources);
                 self.edited();
@@ -1267,13 +1273,12 @@ impl Open {
                 let written = match write_edits(&self.dir, &next.files, false) {
                     Ok(written) => written,
                     Err((e, unwritten)) => {
-                        self.keep_unwritten(unwritten);
+                        self.keep_unwritten(unwritten, false);
                         self.undo_error = Some(e);
                         self.redo.push(next);
                         return false;
                     }
                 };
-                self.written_as_needed(&written);
                 self.forget_terminal_change();
                 let Step { project, files } = next;
                 self.undo.push(Step {
@@ -1290,7 +1295,7 @@ impl Open {
                         // The files go back as they were before this step, not as recorded:
                         // a change made to one outside since stays.
                         let (_, stuck, unwritten) = put_back_files(&written);
-                        self.keep_unwritten(unwritten);
+                        self.keep_unwritten(unwritten, false);
                         let e = if stuck.is_empty() {
                             e
                         } else {
@@ -1305,6 +1310,7 @@ impl Open {
                     }
                     return false;
                 }
+                self.written_as_needed(&written);
                 let sources = self.undo.last().map(|s| &s.project.meta.libraries) != Some(&self.project.meta.libraries);
                 self.follow_step(sources);
                 self.edited();
@@ -1971,7 +1977,11 @@ impl Open {
     /// Note project files left holding something other than what the project now needs, each
     /// with what it should hold, to be written before the next save. The file still has to be
     /// written: unsaved work, so Save is offered and asked for.
-    fn keep_unwritten(&mut self, files: Written) {
+    ///
+    /// A failed Undo or Redo leaves the project as it was, so a file already waiting keeps
+    /// what it waits for (this failure's snapshot may be of the file as an earlier failure
+    /// left it). A change taken back changes the project: `replace` puts its target in.
+    fn keep_unwritten(&mut self, files: Written, replace: bool) {
         if files.is_empty() {
             return;
         }
@@ -1979,7 +1989,11 @@ impl Open {
             let rel = path
                 .strip_prefix(&self.dir)
                 .map_or_else(|_| path.clone(), Path::to_path_buf);
-            self.unwritten_files.insert(rel, should);
+            if replace {
+                self.unwritten_files.insert(rel, should);
+            } else {
+                self.unwritten_files.entry(rel).or_insert(should);
+            }
         }
         self.edited();
     }
@@ -2022,7 +2036,7 @@ impl Open {
                 }
             }
         }
-        self.keep_unwritten(unwritten);
+        self.keep_unwritten(unwritten, true);
         if failed.is_empty() {
             Ok(())
         } else {
@@ -4216,6 +4230,68 @@ pub(crate) mod tests {
         let mine = std::fs::read_to_string(&path).unwrap();
         o.save().unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), mine);
+    }
+
+    #[test]
+    fn failed_undos_in_a_row_keep_the_first_repair_until_one_goes_through() {
+        let (_tmp, mut o, path, [_, one, two]) = macro_edited_twice();
+        let symbol = o.project.lock.symbols.keys().next().unwrap().clone();
+        let fail_sync = |o: &mut Open| {
+            o.stale_symbol_files.insert(symbol.clone());
+            o.fail_symbol_writes = [true].into();
+        };
+        // The macro is left as Undo wrote it ("one") and waits to be "two" again.
+        fail_sync(&mut o);
+        fail_restores(&path, 1);
+        assert!(!o.undo());
+        assert!(o.take_undo_error().is_some());
+        let_restores_through();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), one);
+        // Fails again, its put back too: its snapshot ("one") does not replace the repair.
+        fail_sync(&mut o);
+        fail_restores(&path, 1);
+        assert!(!o.undo());
+        assert!(o.take_undo_error().is_some());
+        let_restores_through();
+        // Fails again after writing the macro, and puts it back as found: the repair stays.
+        fail_sync(&mut o);
+        assert!(!o.undo());
+        assert!(o.take_undo_error().is_some());
+        assert_eq!(o.unwritten_files.values().next(), Some(&Some(two.clone().into_bytes())));
+        o.stale_symbol_files.clear();
+        o.fail_symbol_writes = Default::default();
+        o.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), two);
+    }
+
+    #[test]
+    fn a_step_editing_one_macro_twice_is_put_back_once_as_it_was_before() {
+        let (_tmp, mut o) = project();
+        let id = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let clip = o.copy(1, &[Selection::Symbol(id)]);
+        let path = o.save_macro(&clip, "Coil", "").unwrap();
+        let mark = o.undo_mark();
+        for d in ["B", "C"] {
+            let mut form = crate::macro_form::Form::open(&path).unwrap();
+            form.description = d.into();
+            o.save_macro_form(&form).unwrap();
+        }
+        o.squash_undo(mark);
+        let c = std::fs::read_to_string(&path).unwrap();
+        let symbol = o.project.lock.symbols.keys().next().unwrap().clone();
+        o.stale_symbol_files.insert(symbol);
+        o.fail_symbol_writes = [true].into();
+        // Undo writes the file twice (to B, then A); putting it back to C fails.
+        fail_restores(&path, 2);
+        assert!(!o.undo());
+        assert!(o.take_undo_error().is_some());
+        let_restores_through();
+        assert_eq!(o.unwritten_files.len(), 1);
+        assert_eq!(o.unwritten_files.values().next(), Some(&Some(c.clone().into_bytes())));
+        o.stale_symbol_files.clear();
+        o.fail_symbol_writes = Default::default();
+        o.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), c);
     }
 
     #[test]
