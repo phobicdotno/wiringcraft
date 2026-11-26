@@ -51,7 +51,7 @@ in `crates/wc-app/assets/fonts`).
 
 ![dark mode](docs/screenshots/app-dark.png)
 
-Tools: select and drag (Esc), place symbol (S, pick one in the library), draw wire (W: click a
+Tools: select and drag (Esc; Esc during a drag puts it back), place symbol (S, pick one in the library), draw wire (W: click a
 pin, click bends, click a pin to finish or double-click a free point), rotate (R), delete (Del),
 duplicate the selection one grid step down and right (Ctrl+D).
 Wheel zooms around the pointer, right or middle drag pans, F fits the page, G toggles the grid.
