@@ -3163,3 +3163,17 @@ fn markdown_cells_with_a_backslash_keep_their_columns() {
         "## Paths\n\n| Path | Text | Next |\n|---|---|---|\n| C:\\\\ | a\\\\\\|b | next |\n"
     );
 }
+
+#[test]
+fn markdown_cells_show_markdown_characters_as_typed() {
+    let mut t = Table::new("Notes", &["*Tag*", "Text"]);
+    t.rows
+        .push(vec!["*a*".into(), "b_c_d `x` <tag> [l](u) ~s~ & ![i](p)".into()]);
+    t.rows.push(vec!["#1".into(), "-K1 2.5 mm² plain".into()]);
+    assert_eq!(
+        t.to_markdown(),
+        "## Notes\n\n| \\*Tag\\* | Text |\n|---|---|\n\
+         | \\*a\\* | b\\_c\\_d \\`x\\` &lt;tag&gt; \\[l\\](u) \\~s\\~ \\& \\!\\[i\\](p) |\n\
+         | \\#1 | -K1 2.5 mm² plain |\n"
+    );
+}

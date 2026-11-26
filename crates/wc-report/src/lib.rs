@@ -254,9 +254,26 @@ impl Table {
                 .replace('<', "&lt;")
                 .replace('>', "&gt;")
         };
-        // In a cell a backslash is doubled before `|` is escaped, so a cell ending in `\` does
-        // not escape the column bar after it and each cell shows its text as written.
-        let cell = |s: &str| line(s).replace('\\', "\\\\").replace('|', "\\|");
+        // In a cell, Markdown punctuation gets a backslash so the table shows the text as typed:
+        // `*spare*` is not italic, `motor_1_ready` keeps its underscores, `` `X1` `` is not code.
+        // A backslash is doubled, so a cell ending in `\` does not escape the column bar after
+        // it. Letters, digits, spaces and other characters stay as they are.
+        let cell = |s: &str| {
+            let mut out = String::with_capacity(s.len());
+            let mut chars = s.chars().peekable();
+            while let Some(c) = chars.next() {
+                match c {
+                    '\\' | '|' | '`' | '*' | '_' | '[' | ']' | '~' | '&' => {
+                        out.push('\\');
+                        out.push(c);
+                    }
+                    '!' if chars.peek() == Some(&'[') => out.push_str("\\!"),
+                    '#' if out.is_empty() => out.push_str("\\#"),
+                    _ => out.push(c),
+                }
+            }
+            line(&out)
+        };
         let mut out = format!(
             "## {}\n\n| {} |\n|{}\n",
             line(&self.title),
