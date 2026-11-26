@@ -400,6 +400,11 @@ enum Cmd {
         /// a folder, which gets one `<report>.csv` per report.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// CSV field separator: `,` (the default) or `;`. With `;` a file written with `--out`
+        /// also starts with a UTF-8 byte order mark, so Excel in a comma-decimal locale opens
+        /// it in columns with letters like æ ø å intact.
+        #[arg(long, default_value = ",")]
+        sep: char,
     },
     /// List the potentials (connected pins) across all pages.
     Nets,
@@ -584,6 +589,21 @@ enum PanelCmd {
         #[arg(long, default_value_t = 800.0)]
         height: f64,
     },
+    /// Change a layout's name or plate size. Rails, ducts and devices stay where they are; a
+    /// size that would leave any of them sticking out of the plate is refused.
+    Edit {
+        /// The layout's id.
+        id: String,
+        /// The new name, shown on its page; `""` uses the id.
+        #[arg(long)]
+        name: Option<String>,
+        /// New plate width in mm.
+        #[arg(long)]
+        width: Option<f64>,
+        /// New plate height in mm.
+        #[arg(long)]
+        height: Option<f64>,
+    },
     /// Put devices that have a part and are not on the plate yet onto its rails, sized by the
     /// part's `Width` and `Height` properties.
     Arrange {
@@ -621,7 +641,44 @@ enum PanelCmd {
         #[arg(long)]
         remove: bool,
     },
-    /// Print a layout's plate and each device on it with its position, size and turn.
+    /// Add a 35 mm DIN rail to a plate, or take one off with `--remove N` (rails numbered as
+    /// `panel show` lists them).
+    Rail {
+        /// The layout's id.
+        id: String,
+        /// Left end of the rail on its centre line in mm, `x,y`.
+        #[arg(long, value_parser = parse_point, required_unless_present = "remove", conflicts_with = "remove")]
+        at: Option<Point>,
+        /// Length in mm, to the right of `--at`.
+        #[arg(long, required_unless_present = "remove", conflicts_with = "remove")]
+        length: Option<f64>,
+        /// Take off the rail with this number.
+        #[arg(long, value_name = "N")]
+        remove: Option<usize>,
+    },
+    /// Add a wire duct to a plate, or take one off with `--remove N` (ducts numbered as
+    /// `panel show` lists them).
+    Duct {
+        /// The layout's id.
+        id: String,
+        /// Top-left corner of the duct in mm, `x,y`.
+        #[arg(long, value_parser = parse_point, required_unless_present = "remove", conflicts_with = "remove")]
+        at: Option<Point>,
+        /// Length in mm: to the right, or down with `--vertical`.
+        #[arg(long, required_unless_present = "remove", conflicts_with = "remove")]
+        length: Option<f64>,
+        /// Width in mm, across the length.
+        #[arg(long, default_value_t = wc_core::panel::DUCT, conflicts_with = "remove")]
+        width: f64,
+        /// Run the duct down the plate instead of across.
+        #[arg(long, conflicts_with = "remove")]
+        vertical: bool,
+        /// Take off the duct with this number.
+        #[arg(long, value_name = "N")]
+        remove: Option<usize>,
+    },
+    /// Print a layout's plate, its numbered rails and ducts, and each device on it with its
+    /// position, size and turn.
     Show {
         /// The layout's id.
         id: String,
@@ -2362,13 +2419,7 @@ fn run(mut cli: Cli) -> Res<()> {
                     if p.panels.iter().any(|x| x.id == id) {
                         return Err(format!("panel {id:?} exists"));
                     }
-                    if !(width.is_finite()
-                        && height.is_finite()
-                        && (200.0..=5000.0).contains(&width)
-                        && (200.0..=5000.0).contains(&height))
-                    {
-                        return Err("plate width and height must be 200 to 5000 mm".into());
-                    }
+                    check_plate_size(width, height)?;
                     let name = if name.is_empty() { id.clone() } else { name };
                     let panel = wc_core::panel::Panel::with_rails(id, name, width, height);
                     let rails = panel
@@ -2379,6 +2430,35 @@ fn run(mut cli: Cli) -> Res<()> {
                     println!("panel {}: {width} x {height} mm, {rails} rail(s)", panel.id);
                     p.panels.push(panel);
                     p.panels.sort_by(|a, b| a.id.cmp(&b.id));
+                }
+                PanelCmd::Edit {
+                    id,
+                    name,
+                    width,
+                    height,
+                } => {
+                    if name.is_none() && width.is_none() && height.is_none() {
+                        return Err("nothing to change: give --name, --width or --height".into());
+                    }
+                    let Some(panel) = p.panels.iter_mut().find(|x| x.id == id) else {
+                        return Err(format!("no panel {id:?}"));
+                    };
+                    let (w, h) = (width.unwrap_or(panel.width), height.unwrap_or(panel.height));
+                    // A name-only edit leaves the plate alone, so it still works when something
+                    // already sticks out past an edge (as `panel arrange` can leave it).
+                    if width.is_some() || height.is_some() {
+                        check_plate_size(w, h)?;
+                        panel.resize(w, h)?;
+                    }
+                    if let Some(name) = name {
+                        panel.name = if name.is_empty() { id.clone() } else { name };
+                    }
+                    println!(
+                        "panel {id}: {} ({} x {} mm)",
+                        escape_field(&panel.name),
+                        panel.width,
+                        panel.height
+                    );
                 }
                 PanelCmd::Arrange { id, location } => {
                     let parts = vendored_parts(dir, &p);
@@ -2477,6 +2557,46 @@ fn run(mut cli: Cli) -> Res<()> {
                         }
                     }
                 }
+                PanelCmd::Rail { id, at, length, remove } => {
+                    let Some(panel) = p.panels.iter_mut().find(|x| x.id == id) else {
+                        return Err(format!("no panel {id:?}"));
+                    };
+                    if let Some(n) = remove {
+                        remove_rail_or_duct(panel, true, n)?;
+                        println!("removed rail {n} from {id}");
+                    } else {
+                        let (Some(at), Some(length)) = (at, length) else {
+                            return Err("give --at x,y and --length".into());
+                        };
+                        let rail = panel_rail(panel, at, length)?;
+                        panel.items.push(rail);
+                        println!("rail on {id} at {},{}, {length} mm long", at.x, at.y);
+                    }
+                }
+                PanelCmd::Duct {
+                    id,
+                    at,
+                    length,
+                    width,
+                    vertical,
+                    remove,
+                } => {
+                    let Some(panel) = p.panels.iter_mut().find(|x| x.id == id) else {
+                        return Err(format!("no panel {id:?}"));
+                    };
+                    if let Some(n) = remove {
+                        remove_rail_or_duct(panel, false, n)?;
+                        println!("removed duct {n} from {id}");
+                    } else {
+                        let (Some(at), Some(length)) = (at, length) else {
+                            return Err("give --at x,y and --length".into());
+                        };
+                        let (w, h) = if vertical { (width, length) } else { (length, width) };
+                        let duct = panel_duct(panel, at, w, h)?;
+                        panel.items.push(duct);
+                        println!("duct on {id} at {},{}, {w} x {h} mm", at.x, at.y);
+                    }
+                }
                 PanelCmd::Show { id } => {
                     let Some(panel) = p.panels.iter().find(|x| x.id == id) else {
                         return Err(format!("no panel {id:?}"));
@@ -2552,11 +2672,14 @@ fn run(mut cli: Cli) -> Res<()> {
                     return Ok(());
                 }
                 PageCmd::Remove { id } => {
-                    let before = p.pages.len();
-                    p.pages.retain(|pg| pg.id != id);
-                    if p.pages.len() == before {
+                    if !p.pages.iter().any(|pg| pg.id == id) {
                         return Err(format!("no page {id:?}"));
                     }
+                    // Same rule as the app: a project keeps at least one page.
+                    if p.pages.len() <= 1 {
+                        return Err("A project needs at least one page.".into());
+                    }
+                    p.pages.retain(|pg| pg.id != id);
                 }
                 PageCmd::Overview { id, off } => {
                     let page = p
@@ -3729,7 +3852,19 @@ fn run(mut cli: Cli) -> Res<()> {
                 return Err(format!("the project check found {errors} errors"));
             }
         }
-        Cmd::Report { kind, format, out } => {
+        Cmd::Report { kind, format, out, sep } => {
+            if !matches!(sep, ',' | ';') {
+                return Err(format!("unknown separator {sep:?} (, or ;)"));
+            }
+            if sep != ',' && format != "csv" {
+                return Err("--sep is for --format csv".into());
+            }
+            // Excel reads a `;` file as the comma-decimal locales write it, and needs the byte
+            // order mark to take it as UTF-8; standard output stays without one.
+            let csv_file = |t: &wc_report::Table| {
+                let bom = if sep == ';' { "\u{feff}" } else { "" };
+                format!("{bom}{}", t.to_csv_with(sep))
+            };
             let p = load(dir)?;
             let (symbols, _) = store::vendored_symbols(dir, &p);
             let parts = vendored_parts(dir, &p);
@@ -3759,16 +3894,19 @@ fn run(mut cli: Cli) -> Res<()> {
                 make_out_dir(folder)?;
                 for k in &kinds {
                     let t = wc_report::build(*k, &inputs);
-                    write_out(folder.join(format!("{}.csv", k.name())), t.to_csv()).map_err(e)?;
+                    write_out(folder.join(format!("{}.csv", k.name())), csv_file(&t)).map_err(e)?;
                 }
                 println!("wrote {} csv file(s) to {}", kinds.len(), folder.display());
                 return Ok(());
             }
             let mut text = String::new();
+            if format == "csv" && sep == ';' && out.is_some() {
+                text.push('\u{feff}');
+            }
             for k in kinds {
                 let t = wc_report::build(k, &inputs);
                 text.push_str(&match format.as_str() {
-                    "csv" => t.to_csv(),
+                    "csv" => t.to_csv_with(sep),
                     "md" | "markdown" => t.to_markdown(),
                     "text" => plain_table(&t),
                     other => return Err(format!("unknown format {other:?} (text, csv, md, xlsx)")),
@@ -5795,6 +5933,19 @@ fn import_qet(
     Ok((written, failed))
 }
 
+/// Refuses a plate size outside the 200 to 5000 mm range `panel new` and `panel edit` accept.
+fn check_plate_size(width: f64, height: f64) -> Result<(), String> {
+    if width.is_finite()
+        && height.is_finite()
+        && (200.0..=5000.0).contains(&width)
+        && (200.0..=5000.0).contains(&height)
+    {
+        Ok(())
+    } else {
+        Err("plate width and height must be 200 to 5000 mm".into())
+    }
+}
+
 fn vendored_parts(dir: &Path, p: &wc_core::Project) -> std::collections::BTreeMap<String, wc_core::Part> {
     p.used_parts()
         .into_iter()
@@ -5837,7 +5988,82 @@ fn device_part_size(dir: &Path, p: &wc_core::Project, tag: &DeviceTag) -> Result
     }
 }
 
-/// `panel show`: the plate, then each device with its place, size and turn, one per line.
+/// Height of a DIN rail on the plate, centred on its line.
+const RAIL_HEIGHT: f64 = 35.0;
+
+/// A rail for `panel rail`, or an error when its length is not positive or the rail is not
+/// wholly on the plate.
+fn panel_rail(panel: &wc_core::panel::Panel, at: Point, length: f64) -> Result<wc_core::panel::PanelItem, String> {
+    if !(length.is_finite() && length > 0.0) {
+        return Err(format!("rail length must be more than 0 mm, got {length}"));
+    }
+    let half = RAIL_HEIGHT / 2.0;
+    check_on_plate(panel, "rail", Point::new(at.x, at.y - half), length, RAIL_HEIGHT)?;
+    Ok(wc_core::panel::PanelItem::Rail { at, length })
+}
+
+/// A `width` x `height` duct with its top-left corner at `at` for `panel duct`, or an error
+/// when a size is not positive or the duct is not wholly on the plate.
+fn panel_duct(
+    panel: &wc_core::panel::Panel,
+    at: Point,
+    width: f64,
+    height: f64,
+) -> Result<wc_core::panel::PanelItem, String> {
+    if !(width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0) {
+        return Err(format!(
+            "duct length and width must be more than 0 mm, got {width} x {height}"
+        ));
+    }
+    check_on_plate(panel, "duct", at, width, height)?;
+    Ok(wc_core::panel::PanelItem::Duct {
+        min: at,
+        max: Point::new(at.x + width, at.y + height),
+    })
+}
+
+/// An error naming `what` when a `w` x `h` box with its top-left corner at `at` is not on the
+/// plate. A small tolerance lets a box typed flush with the plate's edge through.
+fn check_on_plate(panel: &wc_core::panel::Panel, what: &str, at: Point, w: f64, h: f64) -> Result<(), String> {
+    if !(at.x.is_finite() && at.y.is_finite()) {
+        return Err(format!("{what}: position must be finite"));
+    }
+    let eps = 1e-9;
+    if at.x < -eps || at.y < -eps || at.x + w > panel.width + eps || at.y + h > panel.height + eps {
+        return Err(format!(
+            "{what}: a {w} x {h} mm outline at {},{} is not on the {} x {} mm plate",
+            at.x, at.y, panel.width, panel.height
+        ));
+    }
+    Ok(())
+}
+
+/// Take rail (or duct) number `n`, counted from 1 as `panel show` lists them, off the plate.
+fn remove_rail_or_duct(panel: &mut wc_core::panel::Panel, rail: bool, n: usize) -> Result<(), String> {
+    let what = if rail { "rail" } else { "duct" };
+    let index = panel
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| match i {
+            wc_core::panel::PanelItem::Rail { .. } => rail,
+            wc_core::panel::PanelItem::Duct { .. } => !rail,
+            wc_core::panel::PanelItem::Device { .. } => false,
+        })
+        .nth(n.wrapping_sub(1))
+        .map(|(i, _)| i);
+    let Some(index) = index else {
+        return Err(format!(
+            "no {what} {n} on panel {:?}: `panel show` numbers them",
+            panel.id
+        ));
+    };
+    panel.items.remove(index);
+    Ok(())
+}
+
+/// `panel show`: the plate, its numbered rails and ducts, then each device with its place,
+/// size and turn, one per line.
 fn panel_show(panel: &wc_core::panel::Panel) -> String {
     let mut out = format!(
         "{} {} ({} x {} mm)\n",
@@ -5846,6 +6072,28 @@ fn panel_show(panel: &wc_core::panel::Panel) -> String {
         panel.width,
         panel.height
     );
+    let (mut rails, mut ducts) = (0, 0);
+    for item in &panel.items {
+        match item {
+            wc_core::panel::PanelItem::Rail { at, length } => {
+                rails += 1;
+                let name = format!("rail {rails}");
+                out.push_str(&format!("{name:<12} at {},{}  {length} mm long\n", at.x, at.y));
+            }
+            wc_core::panel::PanelItem::Duct { min, max } => {
+                ducts += 1;
+                let name = format!("duct {ducts}");
+                out.push_str(&format!(
+                    "{name:<12} at {},{}  {} x {} mm\n",
+                    min.x,
+                    min.y,
+                    max.x - min.x,
+                    max.y - min.y
+                ));
+            }
+            wc_core::panel::PanelItem::Device { .. } => {}
+        }
+    }
     for item in &panel.items {
         if let wc_core::panel::PanelItem::Device {
             tag,
@@ -6214,6 +6462,119 @@ mod tests {
     }
 
     #[test]
+    fn panel_rail_and_duct_add_list_and_remove() {
+        use wc_core::panel::PanelItem;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        store::create(&dir, "Test").unwrap();
+        cli(&dir, &["panel", "new", "main"]).unwrap();
+        let items = || load(&dir).unwrap().panels[0].items.clone();
+        let count = |rail: bool| {
+            items()
+                .iter()
+                .filter(|i| matches!(i, PanelItem::Rail { .. }) == rail && !matches!(i, PanelItem::Device { .. }))
+                .count()
+        };
+        let (rails, ducts) = (count(true), count(false));
+
+        // Added at the end, and listed with the next number.
+        cli(&dir, &["panel", "rail", "main", "--at", "50,700", "--length", "300"]).unwrap();
+        assert_eq!(
+            items().last(),
+            Some(&PanelItem::Rail {
+                at: Point::new(50.0, 700.0),
+                length: 300.0
+            })
+        );
+        cli(
+            &dir,
+            &[
+                "panel",
+                "duct",
+                "main",
+                "--at",
+                "300,100",
+                "--length",
+                "500",
+                "--vertical",
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            items().last(),
+            Some(&PanelItem::Duct {
+                min: Point::new(300.0, 100.0),
+                max: Point::new(340.0, 600.0)
+            })
+        );
+        cli(
+            &dir,
+            &[
+                "panel", "duct", "main", "--at", "0,760", "--length", "600", "--width", "40",
+            ],
+        )
+        .unwrap();
+        assert_eq!(count(true), rails + 1);
+        assert_eq!(count(false), ducts + 2);
+        let shown = panel_show(&load(&dir).unwrap().panels[0]);
+        let rail_line = format!("{:<12} at 50,700  300 mm long", format!("rail {}", rails + 1));
+        assert!(shown.contains(&rail_line), "{shown}");
+        let duct_line = format!("{:<12} at 300,100  40 x 500 mm", format!("duct {}", ducts + 1));
+        assert!(shown.contains(&duct_line), "{shown}");
+
+        // Bad sizes, places off the plate and missing values are refused; nothing changes.
+        let before = items();
+        for args in [
+            &["panel", "rail", "main", "--at", "50,700", "--length", "0"][..],
+            &["panel", "rail", "main", "--at", "50,700", "--length", "NaN"],
+            &["panel", "rail", "main", "--at", "400,700", "--length", "300"],
+            &["panel", "rail", "main", "--at", "50,790", "--length", "100"],
+            &["panel", "rail", "main", "--at", "50,700"],
+            &["panel", "rail", "nope", "--at", "50,700", "--length", "100"],
+            &[
+                "panel", "duct", "main", "--at", "0,0", "--length", "100", "--width", "-5",
+            ],
+            &["panel", "duct", "main", "--at", "-1,0", "--length", "100"],
+            &[
+                "panel",
+                "duct",
+                "main",
+                "--at",
+                "0,500",
+                "--length",
+                "400",
+                "--vertical",
+            ],
+            &[
+                "panel", "duct", "main", "--at", "0,0", "--length", "100", "--remove", "1",
+            ],
+            &["panel", "rail", "main", "--remove", "0"],
+            &["panel", "rail", "main", "--remove", "99"],
+            &["panel", "duct", "main", "--remove", "99"],
+        ] {
+            assert!(cli(&dir, args).is_err(), "{args:?}");
+        }
+        assert_eq!(items(), before);
+
+        // Removed by the number `panel show` gives; the others keep their order.
+        let n = (rails + 1).to_string();
+        cli(&dir, &["panel", "rail", "main", "--remove", &n]).unwrap();
+        assert_eq!(count(true), rails);
+        let n = (ducts + 1).to_string();
+        cli(&dir, &["panel", "duct", "main", "--remove", &n]).unwrap();
+        assert_eq!(count(false), ducts + 1);
+        assert_eq!(
+            items().last(),
+            Some(&PanelItem::Duct {
+                min: Point::new(0.0, 760.0),
+                max: Point::new(600.0, 800.0)
+            })
+        );
+        cli(&dir, &["panel", "rail", "main", "--remove", "1"]).unwrap();
+        assert_eq!(count(true), rails - 1);
+    }
+
+    #[test]
     fn a_command_waits_while_another_holds_the_project() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
@@ -6342,6 +6703,59 @@ mod tests {
         std::fs::remove_file(&vendored).unwrap();
         cli(&dir, &["wire", "p1", &format!("{s1}:1"), "0,0"]).unwrap();
         assert_eq!(load(&dir).unwrap().page("p1").unwrap().wires.len(), 3);
+    }
+
+    #[test]
+    fn a_panel_is_renamed_and_resized_keeping_its_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["device", "--", "-K1"]).unwrap();
+        cli(&dir, &["panel", "new", "main"]).unwrap();
+        cli(&dir, &["panel", "device", "main", "-K1", "--at", "100,600"]).unwrap();
+        let before = load(&dir).unwrap().panels[0].clone();
+
+        cli(
+            &dir,
+            &["panel", "edit", "main", "--name", "Main plate", "--height", "1000"],
+        )
+        .unwrap();
+        let after = load(&dir).unwrap().panels[0].clone();
+        assert_eq!(after.name, "Main plate");
+        assert_eq!((after.width, after.height), (600.0, 1000.0));
+        assert_eq!(after.items, before.items, "rails, ducts and devices are not rebuilt");
+
+        // Too small for the rails, or for the device at y 600..690; out of range; nothing to do;
+        // no such panel: refused, nothing changes.
+        let err = cli(&dir, &["panel", "edit", "main", "--height", "650"]).unwrap_err();
+        assert!(err.contains("sticking out") && err.contains("-K1"), "{err}");
+        assert!(cli(&dir, &["panel", "edit", "main", "--width", "300"]).is_err());
+        assert!(cli(&dir, &["panel", "edit", "main", "--width", "100"]).is_err());
+        assert!(cli(&dir, &["panel", "edit", "main", "--width", "NaN"]).is_err());
+        assert!(cli(&dir, &["panel", "edit", "main"]).is_err());
+        assert!(cli(&dir, &["panel", "edit", "nope", "--name", "x"]).is_err());
+        assert_eq!(load(&dir).unwrap().panels[0], after);
+
+        // An empty name falls back to the id, as `panel new` does.
+        cli(&dir, &["panel", "edit", "main", "--name", ""]).unwrap();
+        assert_eq!(load(&dir).unwrap().panels[0].name, "main");
+
+        // A device taller than the plate (as `panel arrange` can leave it) does not block a
+        // name-only edit, which keeps the plate size; resizing is still refused.
+        let mut p = load(&dir).unwrap();
+        for item in &mut p.panels[0].items {
+            if let wc_core::panel::PanelItem::Device { at, height, .. } = item {
+                *at = Point::new(100.0, 0.0);
+                *height = 1200.0;
+            }
+        }
+        store::save(&dir, &p).unwrap();
+        cli(&dir, &["panel", "edit", "main", "--name", "Tall"]).unwrap();
+        let after = load(&dir).unwrap().panels[0].clone();
+        assert_eq!(after.name, "Tall");
+        assert_eq!((after.width, after.height), (600.0, 1000.0));
+        assert!(cli(&dir, &["panel", "edit", "main", "--name", "x", "--width", "700"]).is_err());
+        assert_eq!(load(&dir).unwrap().panels[0].name, "Tall");
     }
 
     #[test]
@@ -6937,6 +7351,24 @@ mod tests {
         cli(&dir, &["page", "cover", "c2", "--off"]).unwrap();
         assert!(covers(&dir).is_empty());
         assert!(cli(&dir, &["page", "cover", "nope"]).unwrap_err().contains("no page"));
+    }
+
+    #[test]
+    fn page_remove_keeps_the_last_page_of_a_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let ids = |dir: &Path| -> Vec<String> { load(dir).unwrap().pages.iter().map(|p| p.id.clone()).collect() };
+        let only = ids(&dir);
+        assert_eq!(only.len(), 1);
+        let err = cli(&dir, &["page", "remove", &only[0]]).unwrap_err();
+        assert!(err.contains("at least one page"), "{err}");
+        assert_eq!(ids(&dir), only);
+        // With two pages, removing one works.
+        cli(&dir, &["page", "add", "p0002", "--number", "2"]).unwrap();
+        cli(&dir, &["page", "remove", &only[0]]).unwrap();
+        assert_eq!(ids(&dir), ["p0002"]);
+        assert!(cli(&dir, &["page", "remove", "nope"]).unwrap_err().contains("no page"));
     }
 
     #[test]
@@ -9344,6 +9776,68 @@ mod tests {
         .unwrap();
         let wires = std::fs::read_to_string(out.join("wires.csv")).unwrap();
         assert_eq!(format!("{wires}\n"), std::fs::read_to_string(&one).unwrap());
+    }
+
+    #[test]
+    fn report_csv_for_excel_is_semicolon_separated_with_a_bom() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        // One report to a file: `;` between fields and a byte order mark first.
+        let one = tmp.path().join("wires.csv");
+        cli(
+            &dir,
+            &[
+                "report",
+                "wires",
+                "--format",
+                "csv",
+                "--sep",
+                ";",
+                "--out",
+                one.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        let semi = std::fs::read_to_string(&one).unwrap();
+        let plain = tmp.path().join("plain.csv");
+        cli(
+            &dir,
+            &["report", "wires", "--format", "csv", "--out", plain.to_str().unwrap()],
+        )
+        .unwrap();
+        let plain = std::fs::read_to_string(&plain).unwrap();
+        // The default stays comma-separated without a byte order mark (a new project's wires
+        // report is its header row alone, with no comma inside a field).
+        assert!(!plain.starts_with('\u{feff}'), "{plain}");
+        let first = plain.lines().next().unwrap();
+        assert!(first.contains(','), "{first}");
+        assert_eq!(semi, format!("\u{feff}{}", plain.replace(',', ";")));
+        // `report all` writes every file of the folder the same way.
+        let out = tmp.path().join("reports");
+        cli(
+            &dir,
+            &[
+                "report",
+                "all",
+                "--format",
+                "csv",
+                "--sep",
+                ";",
+                "--out",
+                out.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        for k in wc_report::Kind::ALL {
+            let csv = std::fs::read_to_string(out.join(format!("{}.csv", k.name()))).unwrap();
+            assert!(csv.starts_with('\u{feff}'), "{}: {csv}", k.name());
+        }
+        let wires = std::fs::read_to_string(out.join("wires.csv")).unwrap();
+        assert_eq!(format!("{wires}\n"), semi);
+        // Only `,` and `;`, and only for CSV.
+        assert!(cli(&dir, &["report", "wires", "--format", "csv", "--sep", "|"]).is_err());
+        assert!(cli(&dir, &["report", "wires", "--format", "md", "--sep", ";"]).is_err());
     }
 
     #[test]
