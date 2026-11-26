@@ -5865,6 +5865,14 @@ mod tests {
             "--replace",
             "set"
         ])));
+        assert!(!edits_translations(&args(&["translations", "--lang", "set"])));
+        assert!(!edits_translations(&args(&[
+            "page",
+            "add",
+            "translations",
+            "--title",
+            "set"
+        ])));
         assert!(!edits_translations(&args(&["-C", "translations", "check", "set"])));
     }
 
