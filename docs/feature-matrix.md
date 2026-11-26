@@ -194,7 +194,7 @@ For the other areas, the chapter to read in each help is:
 
 | Function | EPLAN | SWE | WiringCraft | Triage |
 |---|---|---|---|---|
-| 2D mounting plate with rails and ducts | add-on (Pro Panel) | yes | yes | done |
+| 2D mounting plate with rails and ducts | add-on (Pro Panel) | yes | yes: `panel rail <panel> --at x,y --length L` and `panel duct <panel> --at x,y --length L [--width W] [--vertical]` add one, `--remove N` takes one off, numbered as `panel show` lists them (#817) | done |
 | Place devices onto rails from the schematic | add-on | yes | yes: `panel arrange`, or one device at a time with `panel device <panel> <tag> --at x,y [--rotate 90]` (or `--remove`); `panel show` lists each device with its place, size and turn (#507) | done |
 | Maker outline drawings as device footprints | yes (2D macros of the part) | yes (2D footprint) | yes: `import footprint-dxf`, or Attach footprint drawing in the app's panel layout properties, stores a maker DXF with the part; layout pages in the app and the PDF draw it at real size (shrunk to fit a smaller device box), and a part without a `Width` or `Height` takes it from the drawing. A device can be turned in quarter steps (Rotate 90° in its properties, or R on the layout); its box, its drawing and its STEP block turn with it (#485) | done (#312, #485) |
 | 3D model export (STEP) | add-on | yes | yes | done |
