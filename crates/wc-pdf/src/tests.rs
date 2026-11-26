@@ -561,6 +561,36 @@ fn later_sheets_fill_the_columns_of_a_contents_layout() {
 }
 
 #[test]
+fn the_reader_page_box_shows_each_sheet_own_number() {
+    // Page labels: typing a sheet's number into the reader's page box opens that sheet (#727).
+    let mut project = Project::new("x");
+    project.pages = vec![
+        Page::new("p1", "3", "Mains"),
+        Page::new("p2", "=A1/5 (b)", "Control"),
+        Page::new("p3", "", "Unnumbered"),
+        Page::new("p4", "Å1", "Nordic"),
+    ];
+    let contents = wc_report::Table {
+        title: "Table of contents".into(),
+        columns: vec!["Page".into(), "Title".into()],
+        front: true,
+        ..Default::default()
+    };
+    let opts = Options {
+        reports: vec![contents],
+        panels: vec![wc_core::panel::Panel::with_rails("main", "Cabinet", 600.0, 800.0)],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    assert_eq!(report.pages, 6);
+    let labels = "/PageLabels << /Nums [0 << /P (R1) >> 1 << /P (3) >> 2 << /P (=A1/5 \\(b\\)) >> \
+                  3 << /S /D /St 4 >> 4 << /P <FEFF00C50031> >> 5 << /P (P1) >>] >>";
+    let found = text.find("/PageLabels").map_or("", |at| &text[at..]);
+    assert!(text.contains(labels), "{}", found.lines().next().unwrap_or(""));
+}
+
+#[test]
 fn a_contents_grouped_by_page_counts_a_heading_per_later_sheet() {
     use wc_core::report_layout::ReportLayout;
     let mut project = Project::new("x");
