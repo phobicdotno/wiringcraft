@@ -918,15 +918,35 @@ fn parse_point(s: &str) -> Result<Point, String> {
     }
 }
 
-fn parse_end(page: &Page, s: &str) -> Res<Endpoint> {
+/// A wire end from `item:pin` or `x,y`. A pin must be one the placed symbol has (its
+/// definition read from the project's vendored symbols in `dir`).
+fn parse_end(dir: &Path, page: &Page, s: &str) -> Res<Endpoint> {
     if let Ok(p) = parse_point(s) {
         return Ok(Endpoint::Point { at: p });
     }
     let (item, pin) = s
         .split_once(':')
         .ok_or_else(|| format!("{s:?}: expected item:pin or x,y"))?;
-    if page.symbol(item).is_none() {
+    let Some(placed) = page.symbol(item) else {
         return Err(format!("no symbol {item:?} on page {}", page.id));
+    };
+    if let Ok(symbol) = store::read_vendored_symbol(dir, &placed.symbol)
+        && symbol.pin(pin).is_none()
+    {
+        let name = placed
+            .tag
+            .as_ref()
+            .map_or_else(|| item.to_owned(), |t| format!("{item} ({t})"));
+        let pins: Vec<&str> = symbol.pins.iter().map(|p| p.name.as_str()).collect();
+        return Err(format!(
+            "symbol {name} on page {} has no pin {pin:?}; its pins are {}",
+            page.id,
+            if pins.is_empty() {
+                "none".to_owned()
+            } else {
+                pins.join(", ")
+            }
+        ));
     }
     Ok(Endpoint::Pin {
         item: item.into(),
@@ -1523,8 +1543,8 @@ fn run(cli: Cli) -> Res<()> {
                 None => None,
             };
             let pg = page_mut(&mut p, &page)?;
-            let from = parse_end(pg, &from)?;
-            let to = parse_end(pg, &to)?;
+            let from = parse_end(dir, pg, &from)?;
+            let to = parse_end(dir, pg, &to)?;
             let id = pg.next_id("w");
             pg.wires.push(Wire {
                 id: id.clone(),
@@ -5034,6 +5054,34 @@ mod tests {
         let mut all = vec!["wiringcraft", "-C", dir.to_str().unwrap()];
         all.extend_from_slice(args);
         run(Cli::try_parse_from(all).map_err(|e| e.to_string())?)
+    }
+
+    #[test]
+    fn a_wire_to_a_pin_the_symbol_does_not_have_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        let args = ["box", "p1", "--at", "50,50", "--size", "20,20", "--tag", "-F1"];
+        cli(
+            &dir,
+            &[&args[..], &["--pin", "1:top:10", "--pin", "2:bottom:10"]].concat(),
+        )
+        .unwrap();
+        let s1 = load(&dir).unwrap().page("p1").unwrap().symbols[0].id.clone();
+
+        let err = cli(&dir, &["wire", "p1", &format!("{s1}:99"), &format!("{s1}:1")]).unwrap_err();
+        assert_eq!(
+            err,
+            format!("symbol {s1} (-F1) on page p1 has no pin \"99\"; its pins are 1, 2")
+        );
+        assert!(
+            load(&dir).unwrap().page("p1").unwrap().wires.is_empty(),
+            "nothing saved"
+        );
+
+        cli(&dir, &["wire", "p1", &format!("{s1}:2"), &format!("{s1}:1")]).unwrap();
+        assert_eq!(load(&dir).unwrap().page("p1").unwrap().wires.len(), 1);
     }
 
     #[test]
