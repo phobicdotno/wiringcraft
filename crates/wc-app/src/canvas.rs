@@ -76,6 +76,8 @@ pub struct Editor {
     pub shape_page: Option<String>,
     /// Enter was pressed (and no dialog or text field took it): finish the polyline being drawn.
     pub finish_shape: bool,
+    /// Escape was pressed during a select-tool drag (see [`Editor::dragging`]): cancel it.
+    pub cancel_drag: bool,
     /// Where and when (egui time, seconds) the last drawing click landed, to tell a quick
     /// repeat on a polyline's last point (which ends it) from a slow one.
     pub last_shape_click: Option<(Point, f64)>,
@@ -138,6 +140,7 @@ impl Default for Editor {
             shape_points: Vec::new(),
             shape_page: None,
             finish_shape: false,
+            cancel_drag: false,
             last_shape_click: None,
             ask_text: None,
             ask_comment: None,
@@ -165,18 +168,26 @@ impl Default for Editor {
 #[derive(Debug, Clone)]
 enum Drag {
     /// Moving the selection: the grab point (snapped, page mm) and whether the undo checkpoint
-    /// for this drag was taken.
-    Move { from: Point, checkpoint: bool },
+    /// for this drag was taken. Escape (#737) needs the rest: the id of the page it moves on, and
+    /// the history count right after its checkpoint (any other count means a change was recorded
+    /// during the drag, a rotate say).
+    Move {
+        from: Point,
+        checkpoint: bool,
+        page: String,
+        step: u64,
+    },
     /// Drawing a selection box from this corner.
     Box { from: Point },
     /// Moving the logo on the cover page, or with `size` sizing it from its bottom-right
     /// corner: the grab point, the logo's box when the drag started, and whether the undo
-    /// checkpoint for this drag was taken.
+    /// checkpoint for this drag was taken, and the history count right after it (see `Move`).
     Logo {
         from: Point,
         start: (Point, Point),
         size: bool,
         checkpoint: bool,
+        step: u64,
     },
     /// Sizing the selected black box from one of its corners (#524, #529): the box's item id
     /// on the page, the corner held, the grab point (page mm, unsnapped), its size when the drag
@@ -194,6 +205,32 @@ enum Drag {
 }
 
 impl Editor {
+    /// Whether a select-tool drag (a move, a selection box, a logo or black box sizing drag)
+    /// is going on, so Escape cancels it instead of doing what it does otherwise.
+    pub fn select_dragging(&self) -> bool {
+        self.tool == Tool::Select && self.drag.is_some()
+    }
+
+    /// Escape on the canvas: cancel the select-tool drag going on (the canvas takes it back on
+    /// its next frame, #737), else drop the black box, shape or wire being drawn. Returns true
+    /// when there was nothing to drop, and Escape goes back to the Select tool.
+    pub fn escape(&mut self) -> bool {
+        if self.select_dragging() {
+            self.cancel_drag = true;
+        } else if self.tool == Tool::BlackBox && self.black_box.is_some() {
+            self.black_box = None;
+            self.message = crate::black_box_tool::hint(None).into();
+        } else if !self.shape_points.is_empty() {
+            self.shape_points.clear();
+            self.message = shape_hint(self.tool, 0).into();
+        } else if self.wire.is_some() {
+            self.wire = None;
+        } else {
+            return true;
+        }
+        false
+    }
+
     /// Zoom in or out by `factor` from the keys or buttons, about the centre of the visible
     /// canvas, within the zoom limits of the schematic or of the panel view.
     pub fn zoom_keys(&mut self, factor: f32) {
@@ -260,6 +297,8 @@ impl Editor {
         self.drag = Some(Drag::Move {
             from: Point::new(0.0, 0.0),
             checkpoint: false,
+            page: String::new(),
+            step: 0,
         });
     }
 }
@@ -1108,6 +1147,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
     ed.cursor = hover.map(|p| snap(p, snap_step));
     let tol = (6.0 / f64::from(xf.zoom)).max(0.8);
 
+    end_drag_off_select(ed);
     match ed.tool {
         Tool::Select => select_tool(&painter, &resp, open, ed, &page, &xf, tol, snap_step, held),
         Tool::Place => place_tool(&painter, &resp, open, ed, &xf, &t),
@@ -1442,12 +1482,16 @@ fn select_tool(
         ed.drag = Some(drag_start(open, ed, page, at, tol, snap_step, shift, held));
     }
     stop_if_held(ed, held);
+    if std::mem::take(&mut ed.cancel_drag) {
+        cancel_drag(open, ed);
+    }
     match ed.drag.clone() {
         Some(Drag::Logo {
             from,
             start,
             size,
             checkpoint,
+            step,
         }) if resp.dragged_by(egui::PointerButton::Primary) => {
             // The raw pointer, like `from`: `ed.cursor` is snapped to the grid, and mixing the
             // two would jump the logo on the first move.
@@ -1455,33 +1499,47 @@ fn select_tool(
                 let (a, b) = logo_dragged(start, size, Point::new(cur.x - from.x, cur.y - from.y));
                 let now = wc_pdf::cover_logo_box(&open.project, page);
                 if now != Some((a, b)) {
-                    if !checkpoint {
+                    let step = if checkpoint {
+                        step
+                    } else {
                         open.checkpoint();
-                    }
+                        open.history_count()
+                    };
                     open.set_logo_place(a, b);
                     ed.drag = Some(Drag::Logo {
                         from,
                         start,
                         size,
                         checkpoint: true,
+                        step,
                     });
                 }
             }
         }
-        Some(Drag::Move { from, checkpoint }) if resp.dragged_by(egui::PointerButton::Primary) => {
+        Some(Drag::Move {
+            from,
+            checkpoint,
+            page: on,
+            step,
+        }) if resp.dragged_by(egui::PointerButton::Primary) => {
             if let Some(cur) = ed.cursor {
                 // Move by whole snap steps so pins stay on the grid.
                 let target = snap(cur, snap_step);
                 if target != from {
-                    if !checkpoint {
+                    let step = if checkpoint {
+                        step
+                    } else {
                         open.checkpoint();
-                    }
+                        open.history_count()
+                    };
                     let d = Point::new(target.x - from.x, target.y - from.y);
                     let sel = ed.selection.clone();
                     open.move_by(ed.page, &sel, d);
                     ed.drag = Some(Drag::Move {
                         from: target,
                         checkpoint: true,
+                        page: on,
+                        step,
                     });
                 }
             }
@@ -1662,12 +1720,14 @@ fn drag_start(
             start: (a, b),
             size: true,
             checkpoint: false,
+            step: 0,
         },
         (Some((a, b)), None) if a.x <= at.x && at.x <= b.x && a.y <= at.y && at.y <= b.y => Drag::Logo {
             from: at,
             start: (a, b),
             size: false,
             checkpoint: false,
+            step: 0,
         },
         (_, Some(h)) => {
             if !ed.is_selected(&h) {
@@ -1680,6 +1740,8 @@ fn drag_start(
             Drag::Move {
                 from: snap(at, snap_step),
                 checkpoint: false,
+                page: page.id.clone(),
+                step: 0,
             }
         }
         (_, None) => Drag::Box { from: at },
@@ -1766,6 +1828,73 @@ fn stop_if_held(ed: &mut Editor, held: bool) {
         )
     {
         ed.drag = None;
+    }
+}
+
+/// Escape during a select-tool drag (#737): a move puts the page it began on back as it was
+/// when the drag started, and a logo drag puts the logo back; the drag's undo checkpoint is
+/// dropped, so it is as if the drag never happened. When another change was recorded since that
+/// checkpoint (a rotate during the move, an Undo), the drag is only ended: what was done stays,
+/// with its undo steps, so Undo takes it back in order and no snapshot is left out of step. A
+/// black box sizing drag (which only changes the box on release) and a selection box are just
+/// dropped. The drag ends, so the release that follows does nothing (no wiring of pins that line
+/// up).
+fn cancel_drag(open: &mut Open, ed: &mut Editor) {
+    match ed.drag.take() {
+        Some(Drag::Move {
+            checkpoint: true,
+            page,
+            step,
+            ..
+        }) if open.history_count() == step => {
+            let Some(at) = open.project.pages.iter().position(|p| p.id == page) else {
+                return;
+            };
+            let was = open
+                .before_last_change()
+                .and_then(|b| b.pages.iter().find(|p| p.id == page))
+                .cloned();
+            // Only the page moved on: a sync of other pages since the drag began stays.
+            if let Some(was) = was
+                && at < open.project.pages.len()
+            {
+                // The jumpers, strip layouts and spare device data the moved terminals took
+                // along (followed every frame of the drag) follow them back to where they were,
+                // the same way: whatever else changed meanwhile (a sync) stays.
+                open.follow_terminals();
+                let moved = open.terminal_numbers();
+                open.project.pages[at] = was;
+                open.follow_terminals_from(moved);
+                open.forget_terminal_change();
+                open.forget_last_change();
+                // A save while the button was held wrote the moved page: this is unsaved again.
+                open.edited();
+            }
+        }
+        Some(Drag::Logo {
+            checkpoint: true, step, ..
+        }) if open.history_count() == step => {
+            let was = open
+                .before_last_change()
+                .and_then(|b| b.meta.logo.as_ref())
+                .map(|l| l.cover);
+            if let (Some(was), Some(logo)) = (was, open.project.meta.logo.as_mut()) {
+                logo.cover = was;
+                open.forget_last_change();
+                open.edited();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A select-tool drag ends when the tool changes (W during a move, say): what moved stays
+/// where it is, without the wiring a release does, so no drag is left for a later release or
+/// Escape to act on.
+fn end_drag_off_select(ed: &mut Editor) {
+    if ed.tool != Tool::Select {
+        ed.drag = None;
+        ed.cancel_drag = false;
     }
 }
 
@@ -2466,6 +2595,7 @@ mod tests {
                 start: (from, from),
                 size: false,
                 checkpoint: true,
+                step: 0,
             }),
             ..Editor::default()
         };
@@ -3080,6 +3210,37 @@ mod tests {
             "not moved"
         );
         assert!(ed.message.contains("30 x 18 mm"), "{}", ed.message);
+
+        // Escape while the corner is held: the release afterwards changes nothing (#737).
+        let held = symbol(&open);
+        let steps = open.undo_steps();
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            2.5,
+            vec![egui::Event::PointerMoved(at(70.0, 58.0)), button(at(70.0, 58.0), true)],
+        );
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            2.52,
+            vec![egui::Event::PointerMoved(at(80.0, 66.0))],
+        );
+        assert!(matches!(ed.drag, Some(Drag::BoxSize { .. })));
+        ed.cancel_drag = true;
+        painted(
+            &ctx,
+            &mut open,
+            &mut ed,
+            2.54,
+            vec![egui::Event::PointerMoved(at(82.0, 68.0))],
+        );
+        assert!(ed.drag.is_none());
+        painted(&ctx, &mut open, &mut ed, 2.56, vec![button(at(82.0, 68.0), false)]);
+        assert_eq!(symbol(&open), held, "not sized");
+        assert_eq!(open.undo_steps(), steps, "no undo step");
 
         // Smaller than its points: they are kept on their edges, at the ends.
         drag_to(&mut open, &mut ed, at(70.0, 58.0), at(45.0, 45.0), 3.0);
@@ -4010,7 +4171,7 @@ mod tests {
             zoom: 3.0,
             offset: Vec2::new(300.0, 300.0),
             fit: false,
-            ..Default::default()
+            ..View::default()
         };
         let (off, on) = (egui::pos2(40.0, 40.0), egui::pos2(500.0, 450.0));
         let wires = |o: &Open| o.project.pages[0].wires.len();
@@ -4234,8 +4395,10 @@ mod tests {
         o.checkpoint();
         o.move_by(ed.page, &ed.selection.clone(), d);
         ed.drag = Some(Drag::Move {
-            from: Point::new(0.0, 0.0),
+            from: d,
             checkpoint: true,
+            page: o.project.pages[ed.page].id.clone(),
+            step: o.history_count(),
         });
     }
 
@@ -4388,6 +4551,7 @@ mod tests {
             start: (Point::new(0.0, 0.0), Point::new(10.0, 10.0)),
             size: false,
             checkpoint: true,
+            step: 0,
         });
         stop_if_held(&mut ed, true);
         assert!(ed.drag.is_none());
@@ -4396,6 +4560,195 @@ mod tests {
         });
         stop_if_held(&mut ed, true);
         assert!(matches!(ed.drag, Some(Drag::Box { .. })));
+    }
+
+    #[test]
+    fn escape_during_a_move_puts_it_back_and_wires_nothing() {
+        let (_tmp, mut o, mut ed, _) = moving_coil();
+        let before = o.project.clone();
+        let steps = o.undo_steps();
+        drag(&mut o, &mut ed, Point::new(-40.0, 0.0));
+        assert_ne!(o.project.pages, before.pages);
+        assert!(ed.select_dragging());
+        // Saved while the button is held: the file has the moved page.
+        o.dirty = false;
+        cancel_drag(&mut o, &mut ed);
+        assert!(o.dirty, "the page put back is unsaved again");
+        assert!(!ed.select_dragging());
+        assert_eq!(o.project.pages, before.pages, "the move is taken back");
+        assert_eq!(o.undo_steps(), steps, "and leaves no undo step behind");
+        // The release that follows adds no wires.
+        drag_released(&mut o, &mut ed, false);
+        assert!(o.project.pages[ed.page].wires.is_empty());
+        assert!(ed.message.is_empty());
+    }
+
+    #[test]
+    fn escape_during_a_move_puts_followed_jumpers_back_and_keeps_other_changes() {
+        let (_tmp, mut o) = project();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        let x1 = wc_core::DeviceTag::parse("-X1").unwrap();
+        // Terminals numbered by position: A 1, B 2, C 3; the jumper joins B and C.
+        let mut put = |x: f64| {
+            let id = o.place(page, "wc.terminal", Point::new(x, 20.0)).unwrap();
+            let s = o.project.pages[page].symbols.iter_mut().find(|s| s.id == id).unwrap();
+            s.tag = Some(x1.clone());
+            id
+        };
+        let a = put(20.0);
+        put(40.0);
+        put(60.0);
+        o.project.meta.add_jumper(&x1, &["2".into(), "3".into()]).unwrap();
+        // A rail order that names the terminals by number: C, A, B.
+        o.project.meta.strips.push(wc_core::project::StripLayout {
+            strip: x1.clone(),
+            order: vec!["3".into(), "1".into(), "2".into()],
+            spares: Vec::new(),
+        });
+        let before = o.project.clone();
+        let mut ed = Editor {
+            page,
+            selection: vec![Selection::Symbol(a)],
+            ..Editor::default()
+        };
+        // A goes past C: B is 1, C 2, A 3, and the jumper follows B and C to 1 and 2.
+        drag(&mut o, &mut ed, Point::new(60.0, 0.0));
+        o.follow_terminals();
+        let jumper = |o: &Open| o.project.meta.jumpers[0].terminals.clone();
+        assert_eq!(jumper(&o), ["1", "2"], "followed during the drag");
+        assert_ne!(o.project.meta.strips, before.meta.strips, "the rail order followed too");
+        // A sync brings someone else's device in meanwhile.
+        let other = wc_core::DeviceTag::parse("-K9").unwrap();
+        o.project.devices.insert(other.clone(), Default::default());
+        cancel_drag(&mut o, &mut ed);
+        assert_eq!(o.project.pages, before.pages);
+        assert_eq!(jumper(&o), ["2", "3"], "the jumper joins B and C again");
+        assert_eq!(
+            o.project.meta.strips, before.meta.strips,
+            "and the rail order is C, A, B again"
+        );
+        assert!(o.project.devices.contains_key(&other), "the synced device stays");
+    }
+
+    #[test]
+    fn escape_after_a_rotate_during_a_move_ends_the_drag_and_undo_takes_both_back() {
+        let (_tmp, mut o, mut ed, coil) = moving_coil();
+        let page = ed.page;
+        let at = |o: &Open| o.project.pages[page].symbol(&coil).map(|s| (s.at, s.rotation));
+        let Some((start, r0)) = at(&o) else { unreachable!() };
+        drag(&mut o, &mut ed, Point::new(-40.0, 0.0));
+        let Some((moved, _)) = at(&o) else { unreachable!() };
+        o.rotate_many(page, &ed.selection.clone());
+        let Some((_, turned)) = at(&o) else { unreachable!() };
+        assert_ne!(turned, r0);
+        let steps = o.undo_steps();
+        cancel_drag(&mut o, &mut ed);
+        assert!(ed.drag.is_none());
+        assert_eq!(at(&o), Some((moved, turned)), "the drag only ends");
+        assert_eq!(o.undo_steps(), steps, "both changes keep their undo steps");
+        assert!(o.undo());
+        assert_eq!(at(&o), Some((moved, r0)), "Undo takes back the rotate");
+        assert!(o.undo());
+        assert_eq!(at(&o), Some((start, r0)), "and then the move");
+    }
+
+    #[test]
+    fn escape_after_an_undo_during_a_move_changes_nothing_more() {
+        let (_tmp, mut o, mut ed, _) = moving_coil();
+        let before = o.project.pages.clone();
+        drag(&mut o, &mut ed, Point::new(-40.0, 0.0));
+        assert!(o.undo());
+        assert_eq!(o.project.pages, before);
+        let steps = o.undo_steps();
+        cancel_drag(&mut o, &mut ed);
+        assert_eq!(o.project.pages, before);
+        assert_eq!(o.undo_steps(), steps, "an earlier change keeps its undo step");
+    }
+
+    #[test]
+    fn escape_puts_a_moved_or_sized_logo_back_and_drops_its_step() {
+        let (_tmp, mut o, mut ed, _) = moving_coil();
+        let start = (Point::new(10.0, 10.0), Point::new(40.0, 30.0));
+        o.project.meta.logo = Some(wc_core::Logo {
+            file: "pictures/logo.png".into(),
+            cover: Some(start),
+        });
+        for size in [false, true] {
+            let steps = o.undo_steps();
+            o.checkpoint();
+            o.set_logo_place(Point::new(20.0, 15.0), Point::new(60.0, 45.0));
+            ed.drag = Some(Drag::Logo {
+                from: Point::new(0.0, 0.0),
+                start,
+                size,
+                checkpoint: true,
+                step: o.history_count(),
+            });
+            o.dirty = false;
+            cancel_drag(&mut o, &mut ed);
+            assert!(ed.drag.is_none());
+            assert!(o.dirty, "unsaved again");
+            assert_eq!(o.project.meta.logo.as_ref().and_then(|l| l.cover), Some(start));
+            assert_eq!(o.undo_steps(), steps, "no step left behind");
+        }
+    }
+
+    #[test]
+    fn escape_takes_back_a_move_on_the_page_it_began_on() {
+        let (_tmp, mut o, mut ed, _) = moving_coil();
+        let before = o.project.pages.clone();
+        let page = ed.page;
+        drag(&mut o, &mut ed, Point::new(-40.0, 0.0));
+        // Page Up during the move: another page is shown when Escape comes.
+        ed.page = if page == 0 { 1 } else { 0 };
+        cancel_drag(&mut o, &mut ed);
+        assert_eq!(o.project.pages, before);
+    }
+
+    #[test]
+    fn a_tool_change_ends_a_drag_so_escape_leaves_the_new_tool() {
+        let (_tmp, mut o, mut ed, _) = moving_coil();
+        drag(&mut o, &mut ed, Point::new(-40.0, 0.0));
+        assert!(ed.select_dragging());
+        // W during the move, the button let go, a wire started, then Escape twice.
+        ed.tool = Tool::Wire;
+        end_drag_off_select(&mut ed);
+        assert!(ed.drag.is_none(), "the tool change ends the drag");
+        let moved = o.project.pages.clone();
+        drag_released(&mut o, &mut ed, false);
+        assert_eq!(o.project.pages, moved, "its release does nothing");
+        ed.wire = Some((
+            Endpoint::Point {
+                at: Point::new(0.0, 0.0),
+            },
+            Vec::new(),
+        ));
+        assert!(!ed.escape(), "the first Escape drops the wire being drawn");
+        assert!(ed.wire.is_none());
+        assert!(!ed.cancel_drag, "and leaves no drag to cancel");
+        assert!(ed.escape(), "the next leaves the wire tool");
+    }
+
+    #[test]
+    fn escape_before_a_move_has_moved_or_during_a_selection_box_just_ends_the_drag() {
+        let (_tmp, mut o, mut ed, _) = moving_coil();
+        let before = o.project.clone();
+        let steps = o.undo_steps();
+        ed.drag = Some(Drag::Move {
+            from: Point::new(0.0, 0.0),
+            checkpoint: false,
+            page: o.project.pages[ed.page].id.clone(),
+            step: 0,
+        });
+        cancel_drag(&mut o, &mut ed);
+        assert!(ed.drag.is_none());
+        ed.drag = Some(Drag::Box {
+            from: Point::new(0.0, 0.0),
+        });
+        cancel_drag(&mut o, &mut ed);
+        assert!(ed.drag.is_none());
+        assert_eq!(o.project, before);
+        assert_eq!(o.undo_steps(), steps);
     }
 
     #[test]
