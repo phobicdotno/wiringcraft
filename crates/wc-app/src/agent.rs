@@ -9155,11 +9155,25 @@ mod tests {
         assert!(a.ed.wire.is_none(), "Undo in a session drops the wire being drawn");
         a.share.frame(a.open.as_mut(), None, false);
         assert!(page2(&a).symbols.iter().all(|s| s.id != id), "the lamp is gone");
+        // Redo: the lamp is deleted, Undo brings it back, a wire is started on it, and Redo
+        // deletes it again.
+        a.run(Action::Redo);
+        a.share.frame(a.open.as_mut(), None, false);
+        let open = a.open.as_mut().unwrap();
+        open.checkpoint();
+        open.project.pages[1].symbols.retain(|s| s.id != id);
+        a.share.frame(a.open.as_mut(), None, false);
+        a.run(Action::Undo);
+        a.share.frame(a.open.as_mut(), None, false);
+        assert!(page2(&a).symbols.iter().any(|s| s.id == id), "the lamp is back");
         a.ed.wire = Some((start, Vec::new()));
         a.run(Action::Redo);
         assert!(a.ed.wire.is_none(), "Redo in a session drops the wire being drawn");
         a.share.frame(a.open.as_mut(), None, false);
-        assert!(page2(&a).symbols.iter().any(|s| s.id == id), "the lamp is back");
+        assert!(
+            page2(&a).symbols.iter().all(|s| s.id != id),
+            "the lamp is deleted again"
+        );
         a.share.stop();
     }
 
