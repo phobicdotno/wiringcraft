@@ -97,7 +97,7 @@ pub struct Editor {
     /// Selected free drawings a sync showed the page without while this person's change was
     /// on its way to the host: selected again when the host accepts it.
     pub waiting_graphics: Option<crate::edit::WaitingGraphics>,
-    /// A command picked in the symbol right-click menu (Rotate, Mirror, Copy, Cut, Delete):
+    /// A command picked in the canvas right-click menu (Rotate, Mirror, Copy, Cut, Delete):
     /// the app runs it like the toolbar button.
     pub menu_action: Option<crate::actions::Action>,
 }
@@ -1351,22 +1351,21 @@ fn select_tool(
             (None, false) => ed.selection.clear(),
         }
     }
-    // Right-click on a wire or symbol: select it (keeping a selection it is part of) and offer
-    // the route styles for every selected wire and the usual edits for selected symbols.
+    // Right-click on a wire, symbol, free text or drawing: select it (keeping a selection it is
+    // part of) and offer the route styles for every selected wire and the usual edits for the
+    // selected symbols, text and drawings.
     if resp.secondary_clicked()
         && let Some(at) = resp.interact_pointer_pos().map(|p| xf.mm(p))
     {
         let hit = pick(open, ed, page, at, tol);
         right_clicked(ed, hit);
     }
-    if !held && (has_symbols(ed) || !selected_wires(ed).is_empty()) {
+    if !held && (!edit_menu_actions(ed).is_empty() || !selected_wires(ed).is_empty()) {
         resp.context_menu(|ui| {
             if !selected_wires(ed).is_empty() {
                 route_menu(ui, open, ed);
             }
-            if has_symbols(ed) {
-                symbol_menu(ui, ed);
-            }
+            edit_menu(ui, ed);
         });
     }
     // A drag is only seen once the pointer has moved: it starts where the button went down,
@@ -1777,11 +1776,11 @@ fn wired_note(n: usize) -> String {
     }
 }
 
-/// A right-click on `hit`: a wire or symbol that is not selected becomes the only selection; a
-/// selected one keeps the selection it is part of, so the menu acts on all of it. Anything else
-/// leaves the selection alone.
+/// A right-click on `hit`: a wire, symbol, free text or drawing that is not selected becomes the
+/// only selection; a selected one keeps the selection it is part of, so the menu acts on all of
+/// it. Anything else leaves the selection alone.
 fn right_clicked(ed: &mut Editor, hit: Option<Selection>) {
-    if let Some(h @ (Selection::Wire(_) | Selection::Symbol(_))) = hit
+    if let Some(h @ (Selection::Wire(_) | Selection::Symbol(_) | Selection::Graphic(_))) = hit
         && !ed.is_selected(&h)
     {
         ed.select_only(h);
@@ -1804,25 +1803,37 @@ fn has_symbols(ed: &Editor) -> bool {
     ed.selection.iter().any(|s| matches!(s, Selection::Symbol(_)))
 }
 
-/// The edits of the symbol right-click menu, run as the toolbar runs them.
-const SYMBOL_MENU: [crate::actions::Action; 5] = {
+/// The edits the right-click menu offers for the selection, run as the toolbar runs them:
+/// Rotate, Mirror, Copy, Cut and Delete with a symbol selected; Copy, Cut and Delete with only
+/// free text or drawings (Rotate and Mirror turn symbols only); none otherwise.
+fn edit_menu_actions(ed: &Editor) -> &'static [crate::actions::Action] {
     use crate::actions::Action;
-    [
-        Action::Rotate,
-        Action::Mirror,
-        Action::Copy,
-        Action::Cut,
-        Action::Delete,
-    ]
-};
+    if has_symbols(ed) {
+        &[
+            Action::Rotate,
+            Action::Mirror,
+            Action::Copy,
+            Action::Cut,
+            Action::Delete,
+        ]
+    } else if ed.selection.iter().any(|s| matches!(s, Selection::Graphic(_))) {
+        &[Action::Copy, Action::Cut, Action::Delete]
+    } else {
+        &[]
+    }
+}
 
-/// The symbol right-click menu: Rotate, Mirror, Copy, Cut and Delete for the selection. The
-/// picked command is left in [`Editor::menu_action`] for the app to run.
-fn symbol_menu(ui: &mut egui::Ui, ed: &mut Editor) {
+/// The edit entries of the right-click menu (see [`edit_menu_actions`]). The picked command is
+/// left in [`Editor::menu_action`] for the app to run.
+fn edit_menu(ui: &mut egui::Ui, ed: &mut Editor) {
+    let actions = edit_menu_actions(ed);
+    if actions.is_empty() {
+        return;
+    }
     if !selected_wires(ed).is_empty() {
         ui.separator();
     }
-    for a in SYMBOL_MENU {
+    for &a in actions {
         let info = a.info();
         if ui
             .add(egui::Button::new(info.label).shortcut_text(info.shortcut))
@@ -1859,8 +1870,9 @@ fn route_menu(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor) {
             ui.close_menu();
         }
     }
-    // With symbols selected too, the symbol menu's Delete removes the whole selection.
-    if has_symbols(ed) {
+    // With symbols, text or drawings selected too, the edit entries' Delete removes the whole
+    // selection.
+    if !edit_menu_actions(ed).is_empty() {
         return;
     }
     ui.separator();
@@ -4006,12 +4018,13 @@ mod tests {
         };
         right_clicked(&mut ed, Some(wire("w1")));
         assert_eq!(ed.selection, [wire("w1"), wire("w2")]);
-        right_clicked(&mut ed, Some(Selection::Graphic(0)));
+        right_clicked(&mut ed, Some(Selection::Cloud(0)));
+        right_clicked(&mut ed, Some(Selection::RevisionTable));
         right_clicked(&mut ed, None);
         assert_eq!(
             ed.selection,
             [wire("w1"), wire("w2")],
-            "only wires and symbols change it"
+            "only wires, symbols and drawings change it"
         );
         right_clicked(&mut ed, Some(wire("w3")));
         assert_eq!(ed.selection, [wire("w3")]);
@@ -4035,10 +4048,44 @@ mod tests {
         right_clicked(&mut ed, Some(sym("s2")));
         assert_eq!(ed.selection, [sym("s2")], "one not selected becomes the only selection");
         assert!(selected_wires(&ed).is_empty());
+        let labels = |ed: &Editor| -> Vec<&str> { edit_menu_actions(ed).iter().map(|a| a.info().label).collect() };
+        assert_eq!(labels(&ed), ["Rotate", "Mirror", "Copy", "Cut", "Delete"]);
+    }
+
+    #[test]
+    fn right_click_on_text_or_a_drawing_offers_copy_cut_and_delete() {
+        let labels = |ed: &Editor| -> Vec<&str> { edit_menu_actions(ed).iter().map(|a| a.info().label).collect() };
+        // Not selected: it becomes the only selection, and the menu has the edits that work on it.
+        let mut ed = Editor {
+            selection: vec![Selection::Wire("w1".into())],
+            ..Editor::default()
+        };
+        assert!(labels(&ed).is_empty(), "wires alone keep only the route menu");
+        right_clicked(&mut ed, Some(Selection::Graphic(2)));
+        assert_eq!(ed.selection, [Selection::Graphic(2)]);
+        assert_eq!(labels(&ed), ["Copy", "Cut", "Delete"]);
+        // Selected: the selection it is part of stays.
+        let mut ed = Editor {
+            selection: vec![
+                Selection::Graphic(0),
+                Selection::Graphic(1),
+                Selection::Wire("w1".into()),
+            ],
+            ..Editor::default()
+        };
+        right_clicked(&mut ed, Some(Selection::Graphic(1)));
         assert_eq!(
-            SYMBOL_MENU.map(|a| a.info().label),
-            ["Rotate", "Mirror", "Copy", "Cut", "Delete"]
+            ed.selection,
+            [
+                Selection::Graphic(0),
+                Selection::Graphic(1),
+                Selection::Wire("w1".into())
+            ]
         );
+        assert_eq!(labels(&ed), ["Copy", "Cut", "Delete"]);
+        // With a symbol among them, Rotate and Mirror come back.
+        ed.selection.push(Selection::Symbol("s1".into()));
+        assert_eq!(labels(&ed), ["Rotate", "Mirror", "Copy", "Cut", "Delete"]);
     }
 
     #[test]
