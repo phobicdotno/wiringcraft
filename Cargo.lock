@@ -3841,6 +3841,7 @@ dependencies = [
  "thiserror 2.0.21",
  "wc-core",
  "wc-library",
+ "wc-pdf",
  "wc-report",
  "zip",
 ]
@@ -3863,6 +3864,7 @@ version = "0.1.0"
 dependencies = [
  "image",
  "miniz_oxide 0.8.9",
+ "quick-xml 0.37.5",
  "tempfile",
  "wc-core",
  "wc-report",
