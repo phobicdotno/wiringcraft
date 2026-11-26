@@ -217,34 +217,52 @@ struct FileEdit {
 
 /// Write `edits` (in project folder `dir`) as they were before them (`undo`, newest first) or
 /// after them, each replaced whole ([`restore_file`]), so a failed write leaves the file as it
-/// was. When one cannot be written, those already written are put back; the error names the
-/// file, and each file that could not be put back with its reason.
+/// was. When one cannot be written, those already written are put back as they were just
+/// before this call (a change made outside since stays). The error names every file of
+/// `edits` left other than written: the one that failed with its reason, those put back,
+/// those that could not be put back with their reason, and those not reached.
 fn write_edits(dir: &Path, edits: &[FileEdit], undo: bool) -> Result<(), String> {
     let order: Vec<&FileEdit> = if undo {
         edits.iter().rev().collect()
     } else {
         edits.iter().collect()
     };
+    // Each file as it was just before it was written, in the order written.
+    let mut written: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
     for (i, e) in order.iter().enumerate() {
         let text = if undo { &e.before } else { &e.after };
         let path = dir.join(&e.path);
-        if let Err(err) = restore_file(&path, Some(text.as_bytes())) {
-            let mut msg = format!("{} could not be written: {err}", path.display());
-            let stuck: Vec<String> = order[..i]
-                .iter()
-                .rev()
-                .filter_map(|done| {
-                    let path = dir.join(&done.path);
-                    let was = if undo { &done.after } else { &done.before };
-                    restore_file(&path, Some(was.as_bytes()))
-                        .err()
-                        .map(|e| format!("{}: {e}", path.display()))
-                })
-                .collect();
-            if !stuck.is_empty() {
-                msg.push_str(&format!("; written already and not put back: {}", stuck.join("; ")));
+        let done = snapshot_file(&path).and_then(|was| {
+            restore_file(&path, Some(text.as_bytes()))
+                .map(|()| was)
+                .map_err(|err| format!("{} could not be written: {err}", path.display()))
+        });
+        match done {
+            Ok(was) => written.push((path, was)),
+            Err(mut msg) => {
+                let (mut back, mut stuck) = (Vec::new(), Vec::new());
+                for (path, was) in written.iter().rev() {
+                    match restore_file(path, was.as_deref()) {
+                        Ok(()) => back.push(path.display().to_string()),
+                        Err(e) => stuck.push(format!("{}: {e}", path.display())),
+                    }
+                }
+                let left: Vec<String> = order
+                    .iter()
+                    .skip(i + 1)
+                    .map(|e| dir.join(&e.path).display().to_string())
+                    .collect();
+                for (what, files) in [
+                    ("put back as it was", back),
+                    ("written already and not put back", stuck),
+                    ("not written", left),
+                ] {
+                    if !files.is_empty() {
+                        msg.push_str(&format!("; {what}: {}", files.join("; ")));
+                    }
+                }
+                return Err(msg);
             }
-            return Err(msg);
         }
     }
     Ok(())
@@ -1140,7 +1158,9 @@ impl Open {
         if self.undo.len() > start + 1 {
             // The files the later steps rewrote are taken back and written with the first.
             let later: Vec<FileEdit> = self.undo.drain(start + 1..).flat_map(|s| s.files).collect();
-            self.undo[start].files.extend(later);
+            if let Some(first) = self.undo.get_mut(start) {
+                first.files.extend(later);
+            }
             self.history += 1;
             self.touch();
         }
@@ -2782,14 +2802,16 @@ impl Open {
         // from the undo history, which may have dropped their steps.
         let edits = self.mark_edits.split_off(mark.edits_from.min(self.mark_edits.len()));
         self.end_mark();
-        let files = write_edits(&self.dir, &edits, true);
+        // Every problem is reported, the files not put back first.
+        let mut errors: Vec<String> = write_edits(&self.dir, &edits, true).err().into_iter().collect();
         self.put_back(mark.kept);
         self.symbols.retain(|id, _| mark.symbols.contains(id));
         self.parts.retain(|id, _| mark.parts.contains(id));
         let (before, now) = match (mark.files, vendor_names(&self.dir)) {
             (Ok(before), Ok(now)) => (before, now),
             (Err(e), _) | (_, Err(e)) => {
-                return Err(format!("Library files it may have added were not checked: {e}"));
+                errors.push(format!("Library files it may have added were not checked: {e}"));
+                return Err(errors.join("\n"));
             }
         };
         let lock = &self.project.lock;
@@ -2808,14 +2830,16 @@ impl Open {
                 failed.push(format!("{}: {e}", path.display()));
             }
         }
-        files?;
-        if failed.is_empty() {
-            Ok(())
-        } else {
-            Err(format!(
+        if !failed.is_empty() {
+            errors.push(format!(
                 "Library files it added could not be removed: {}",
                 failed.join("; ")
-            ))
+            ));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("\n"))
         }
     }
 
@@ -7745,6 +7769,57 @@ pub(crate) mod tests {
         std::fs::remove_dir(dir.join("b.json.tmp")).unwrap();
         write_edits(dir, &edits, false).unwrap();
         assert_eq!(std::fs::read_to_string(dir.join("b.json")).unwrap(), "B1");
+    }
+
+    #[test]
+    fn a_failed_replay_puts_files_back_as_they_were_and_names_every_file_left() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // a was changed outside since its edit was recorded.
+        for (name, text) in [("a.json", "outside"), ("b.json", "B0"), ("c.json", "C0")] {
+            std::fs::write(dir.join(name), text).unwrap();
+        }
+        let edit = |name: &str, before: &str, after: &str| FileEdit {
+            path: PathBuf::from(name),
+            before: before.into(),
+            after: after.into(),
+        };
+        let edits = [
+            edit("a.json", "A0", "A1"),
+            edit("b.json", "B0", "B1"),
+            edit("c.json", "C0", "C1"),
+        ];
+        std::fs::create_dir(dir.join("b.json.tmp")).unwrap();
+        let err = write_edits(dir, &edits, false).unwrap_err();
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
+        assert_eq!(read("a.json"), "outside", "as it was, not as recorded");
+        assert_eq!((read("b.json"), read("c.json")), ("B0".into(), "C0".into()));
+        assert!(err.contains("b.json could not be written"), "{err}");
+        assert!(err.contains("put back as it was:") && err.contains("a.json"), "{err}");
+        assert!(err.contains("not written:") && err.contains("c.json"), "{err}");
+    }
+
+    #[test]
+    fn a_change_taken_back_reports_a_file_not_put_back_and_the_library_check_together() {
+        let (_tmp, mut o) = project();
+        let id = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let clip = o.copy(1, &[Selection::Symbol(id)]);
+        let path = o.save_macro(&clip, "Coil", "").unwrap();
+        let mut m = o.mark();
+        let mut form = crate::macro_form::Form::open(&path).unwrap();
+        form.description = "Gone".into();
+        o.save_macro_form(&form).unwrap();
+        // The macro cannot be put back, and the library files were not known.
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        m.files = Err("not listed".into());
+        let err = o.back_to(m).unwrap_err();
+        assert!(
+            err.contains(&format!("{} could not be written", path.display())),
+            "{err}"
+        );
+        assert!(err.contains("not checked: not listed"), "{err}");
     }
 
     #[test]
