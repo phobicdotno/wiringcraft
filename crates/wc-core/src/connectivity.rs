@@ -202,18 +202,31 @@ pub fn nets_linked(project: &Project, role: impl Fn(&str) -> Option<SymbolRole>)
 pub type WireRef = (String, String);
 
 /// Like [`nets_linked`], and also says which net each wire belongs to (an index into the nets).
-/// A wire that touches no pin, directly or through other wires, belongs to no net.
+/// A wire that touches no pin, directly or through other wires, belongs to no net. Two wires
+/// with the same id on one page share a key here: [`wire_nets_by_place`] tells them apart.
 pub fn wire_nets(project: &Project, role: impl Fn(&str) -> Option<SymbolRole>) -> (Vec<Net>, BTreeMap<WireRef, usize>) {
+    let (nets, by_place) = wire_nets_by_place(project, role);
+    let wires = by_place
+        .into_iter()
+        .filter_map(|((pi, wi), n)| {
+            let page = project.pages.get(pi)?;
+            Some(((page.id.clone(), page.wires.get(wi)?.id.clone()), n))
+        })
+        .collect();
+    (nets, wires)
+}
+
+/// Like [`wire_nets`], with each wire known by its place: (page index, wire index in the page),
+/// as wire ids need not be unique on a page.
+pub fn wire_nets_by_place(
+    project: &Project,
+    role: impl Fn(&str) -> Option<SymbolRole>,
+) -> (Vec<Net>, BTreeMap<(usize, usize), usize>) {
     let mut g = Graph::default();
-    let mut wire_nodes: Vec<(WireRef, usize)> = Vec::new();
-    for page in &project.pages {
+    let mut wire_nodes: Vec<((usize, usize), usize)> = Vec::new();
+    for (pi, page) in project.pages.iter().enumerate() {
         let from = g.add_wires(page);
-        wire_nodes.extend(
-            page.wires
-                .iter()
-                .zip(from)
-                .map(|(w, a)| ((page.id.clone(), w.id.clone()), a)),
-        );
+        wire_nodes.extend(from.into_iter().enumerate().map(|(wi, a)| ((pi, wi), a)));
         for s in &page.symbols {
             let Some(tag) = &s.tag else { continue };
             if role(&s.symbol) != Some(SymbolRole::Interruption) {

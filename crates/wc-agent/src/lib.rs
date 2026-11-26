@@ -140,6 +140,8 @@ pub enum Stop {
     EndTurn,
     /// The reply hit the length limit.
     MaxTokens,
+    /// The conversation has filled the model's context window.
+    ContextFull,
     /// The request was declined; the text says why when the API gives a reason.
     Refusal(String),
     Other(String),
@@ -272,6 +274,7 @@ impl Conversation {
             Some("tool_use") => Stop::ToolUse,
             Some("end_turn") | Some("stop_sequence") => Stop::EndTurn,
             Some("max_tokens") => Stop::MaxTokens,
+            Some("model_context_window_exceeded") => Stop::ContextFull,
             Some("refusal") => Stop::Refusal(
                 response["stop_details"]["explanation"]
                     .as_str()
@@ -725,8 +728,14 @@ impl Session {
                 break;
             };
             if !b.can_go_on || self.stop {
-                b.results
-                    .push((call.id, Err("Not run: the turn was stopped.".to_owned())));
+                let why = if self.stop {
+                    "Not run: the turn was stopped."
+                } else if matches!(b.stop, Stop::MaxTokens | Stop::ContextFull) {
+                    "Not run: the answer was cut off."
+                } else {
+                    "Not run: the answer ended without asking for tool results."
+                };
+                b.results.push((call.id, Err(why.to_owned())));
                 continue;
             }
             let what = tools.describe(&call.name, &call.input);
@@ -767,6 +776,12 @@ impl Session {
             Stop::MaxTokens => {
                 self.log.push(Entry::Note(
                     "The answer was cut off at its length limit. Say \"go on\" to continue.".into(),
+                ));
+                out.finished = true;
+            }
+            Stop::ContextFull => {
+                self.log.push(Entry::Note(
+                    "The conversation is too long for the model. Start a new conversation to go on.".into(),
                 ));
                 out.finished = true;
             }
@@ -1076,6 +1091,63 @@ mod tests {
         s.conversation.user("again");
         let last = s.conversation.messages().last().cloned().unwrap_or_default();
         assert_eq!(last["content"].as_array().map(Vec::len), Some(2));
+    }
+
+    /// The text of the tool results in the conversation's last message.
+    fn last_tool_results(s: &Session) -> Vec<String> {
+        let last = s.conversation.messages().last().cloned().unwrap_or_default();
+        last["content"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter(|b| b["type"] == "tool_result")
+            .map(|b| b["content"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_full_context_window_is_said_in_plain_words() {
+        let t = script(vec![Ok(json!({
+            "stop_reason": "model_context_window_exceeded",
+            "content": [{"type": "text", "text": "Partly"}]
+        }))]);
+        let mut s = Session::new(t);
+        let mut tools = Counter::default();
+        let set = settings();
+        assert!(s.send("go", &[], "", &set, "sys", &[]).is_ok());
+        let p = s.poll(&mut tools, &set, "sys", true);
+        assert!(p.finished);
+        assert_eq!(
+            s.log.last(),
+            Some(&Entry::Note(
+                "The conversation is too long for the model. Start a new conversation to go on.".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn calls_in_a_cut_off_answer_are_not_run_and_say_why() {
+        let cut_off = "Not run: the answer was cut off.";
+        let ended = "Not run: the answer ended without asking for tool results.";
+        for (reason, want) in [
+            ("max_tokens", cut_off),
+            ("model_context_window_exceeded", cut_off),
+            ("end_turn", ended),
+        ] {
+            let t = script(vec![Ok(json!({
+                "stop_reason": reason,
+                "content": [{"type": "tool_use", "id": "t1", "name": "add", "input": {}}]
+            }))]);
+            let mut s = Session::new(t);
+            let mut tools = Counter::default();
+            let set = settings();
+            assert!(s.send("go", &[], "", &set, "sys", &[]).is_ok());
+            let p = s.poll(&mut tools, &set, "sys", true);
+            assert!(p.finished);
+            assert!(tools.calls.is_empty(), "{reason}");
+            assert_eq!(last_tool_results(&s), vec![want.to_owned()], "{reason}");
+        }
     }
 
     #[test]

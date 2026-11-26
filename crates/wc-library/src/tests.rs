@@ -542,6 +542,15 @@ fn every_starter_symbol_loads_under_its_file_name_with_distinct_pins() -> Result
     assert_eq!(capacitor.letter_code, "C");
     let names: Vec<_> = capacitor.pins.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, ["1", "2"]);
+    // The potentiometer (#881): letter code R, ends 1 and 3, the wiper 2 off to the side.
+    let (pot, _) = lib.symbol("wc.potentiometer")?;
+    assert_eq!(pot.role, SymbolRole::Standalone);
+    assert_eq!(pot.letter_code, "R");
+    let names: Vec<_> = pot.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["1", "2", "3"]);
+    let [end1, wiper, end3] = [0, 1, 2].map(|i| pot.pins[i].at);
+    assert_eq!(end1.x, end3.x, "pins 1 and 3 share a vertical line");
+    assert_ne!(wiper.x, end1.x, "the wiper sits off the line between 1 and 3");
     // The timer relay set (#531): coils drive, delayed contacts follow them.
     for (id, role) in [
         ("wc.coil.ondelay", SymbolRole::Main),
@@ -621,6 +630,48 @@ fn starter_photoelectric_sensor_and_its_example_part_load() -> Result<()> {
         lib.part("example.ex-ps-m18-pnp")?.0.symbol.as_deref(),
         Some("wc.sensor.photo3")
     );
+    Ok(())
+}
+
+#[test]
+fn the_starter_key_switch_is_a_make_contact_tagged_s() -> Result<()> {
+    // #767: a key-operated switch next to the push buttons and selector switch.
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
+    project.meta.libraries = vec![LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: starter.to_string_lossy().into(),
+        reference: None,
+    }];
+    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (s, _) = lib.symbol("wc.switch.key")?;
+    assert_eq!(s.role, SymbolRole::Standalone);
+    assert_eq!(s.letter_code, "S");
+    let names: Vec<_> = s.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["13", "14"]);
+    Ok(())
+}
+
+#[test]
+fn the_starter_current_transformer_has_primary_and_secondary_terminals() -> Result<()> {
+    // #769: a current transformer for panel ammeters and energy meters.
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
+    project.meta.libraries = vec![LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: starter.to_string_lossy().into(),
+        reference: None,
+    }];
+    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let (ct, _) = lib.symbol("wc.transformer.current")?;
+    assert_eq!(ct.role, SymbolRole::Standalone);
+    assert_eq!(ct.letter_code, "T");
+    let names: Vec<_> = ct.pins.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["P1", "P2", "S1", "S2"]);
     Ok(())
 }
 
@@ -724,5 +775,29 @@ fn lock_does_not_restore_another_version_or_an_item_gone_from_the_library() -> R
     let left = lock_missing(&f.proj, &mut f.project, &lib)?;
     assert_eq!(left.unrestorable.len(), 1, "{left:?}");
     assert!(left.unrestorable[0].2.contains("no library has it"), "{left:?}");
+    Ok(())
+}
+
+#[test]
+fn the_starter_ammeter_and_voltmeter_are_measuring_instruments() -> Result<()> {
+    // #765: panel ammeters and voltmeters on supply and motor circuits.
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
+    project.meta.libraries = vec![LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: starter.to_string_lossy().into(),
+        reference: None,
+    }];
+    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    for id in ["wc.meter.ammeter", "wc.meter.voltmeter"] {
+        let (m, _) = lib.symbol(id)?;
+        assert_eq!(m.role, SymbolRole::Standalone, "{id}");
+        assert_eq!(m.letter_code, "P", "{id}");
+        assert_eq!(m.category, "measuring", "{id}");
+        let names: Vec<_> = m.pins.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["1", "2"], "{id}");
+    }
     Ok(())
 }

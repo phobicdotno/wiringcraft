@@ -30,8 +30,13 @@ fn nudged(at: Point, size: (f64, f64), plate: (f64, f64), step: f64, dx: f64, dy
     )
 }
 
+/// The panel view's zoom limits, in screen points per millimetre: lower than the schematic's,
+/// so a large plate fits.
+pub const ZOOM_LIMITS: (f32, f32) = (0.05, 20.0);
+
 pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, snap_step: f64) {
     let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+    ed.view.size = rect.size();
     let painter = ui.painter_at(rect);
     let t = theme::Theme::of(ui.ctx());
     painter.rect_filled(rect, 0.0, t.backdrop);
@@ -56,10 +61,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
         if scroll.abs() > 0.0
             && let Some(hp) = resp.hover_pos()
         {
-            let new_zoom = (ed.view.zoom * (scroll / 300.0).exp()).clamp(0.05, 20.0);
-            let anchor = hp - rect.min - ed.view.offset;
-            ed.view.offset += anchor - anchor * (new_zoom / ed.view.zoom);
-            ed.view.zoom = new_zoom;
+            ed.view.zoom_about(hp - rect.min, (scroll / 300.0).exp(), ZOOM_LIMITS);
         }
     }
     if resp.dragged_by(egui::PointerButton::Middle) || resp.dragged_by(egui::PointerButton::Secondary) {
@@ -363,6 +365,28 @@ pub fn turned_note(rotation: wc_core::geom::Rotation) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// In the panel view Zoom out uses the panel view's limits, below the schematic's, and
+    /// keeps the centre of the view in place (#826).
+    #[test]
+    fn zoom_keys_use_the_panel_limits() {
+        let mut ed = Editor::default();
+        ed.panel = Some(0);
+        ed.view = crate::canvas::View {
+            zoom: 0.1,
+            offset: Vec2::new(100.0, 50.0),
+            fit: false,
+            size: Vec2::new(1000.0, 700.0),
+        };
+        let centre = |ed: &Editor| (ed.view.size / 2.0 - ed.view.offset) / ed.view.zoom;
+        let before = centre(&ed);
+        ed.zoom_keys(0.8);
+        assert!((ed.view.zoom - 0.08).abs() < 1e-6, "{}", ed.view.zoom);
+        assert!((centre(&ed) - before).length() < 1e-2, "{:?} {before:?}", centre(&ed));
+        ed.view.zoom = 0.05;
+        ed.zoom_keys(0.8);
+        assert!((ed.view.zoom - 0.05).abs() < 1e-6, "{}", ed.view.zoom);
+    }
 
     #[test]
     fn picks_the_topmost_device() {

@@ -210,6 +210,20 @@ fn pages_export_as_svg_and_dxf() {
 }
 
 #[test]
+fn dxf_text_keeps_percent_signs_backslashes_and_wide_characters_literal() {
+    // `%%c` would be read as a diameter sign and `\U+0041` as `A` (#832).
+    assert_eq!(vector::dxf_text("50%%c"), "50\\U+0025\\U+0025c");
+    assert_eq!(vector::dxf_text("a%%%b"), "a\\U+0025\\U+0025\\U+0025b");
+    assert_eq!(vector::dxf_text("a\\U+0041"), "a\\U+005CU+0041");
+    // A lone percent sign starts no code and stays readable.
+    assert_eq!(vector::dxf_text("100 % on"), "100 % on");
+    assert_eq!(vector::dxf_text("%\t%d"), "\\U+0025\\U+0025d");
+    // Beyond U+FFFF there is no four-digit code; a five-digit one would be misread.
+    assert_eq!(vector::dxf_text("ok \u{1F600}"), "ok ?");
+    assert_eq!(vector::dxf_text("Ålesund\n"), "\\U+00C5lesund");
+}
+
+#[test]
 fn arcs_keep_their_side_in_svg_and_dxf() {
     // A quarter arc from 0 to 90 degrees clockwise on the page: from the right of the centre to
     // below it. In DXF (y up) that is from 270 to 360 counter-clockwise.
@@ -225,6 +239,106 @@ fn arcs_keep_their_side_in_svg_and_dxf() {
     };
     assert!(svg(&page).contains("d=\"M60 50 A10 10 0 0 1 50 60\""));
     assert!(dxf(&page).contains("0\nARC\n8\n0\n62\n7\n10\n50\n20\n50\n40\n10\n50\n270\n51\n0\n"));
+}
+
+#[test]
+fn dxf_fills_junction_dots_and_filled_shapes() {
+    let wire = |id: &str, a: (f64, f64), b: (f64, f64)| Wire {
+        id: id.into(),
+        from: Endpoint::Point {
+            at: Point::new(a.0, a.1),
+        },
+        to: Endpoint::Point {
+            at: Point::new(b.0, b.1),
+        },
+        via: vec![],
+        number: None,
+        potential: None,
+        cable: None,
+        route: Default::default(),
+        spec: Default::default(),
+    };
+    let mut project = Project::new("Fills");
+    let mut p1 = Page::new("p1", "1", "Control");
+    // A T: the second wire ends in the middle of the first, a junction at (100, 50).
+    p1.wires.push(wire("w1", (50.0, 50.0), (150.0, 50.0)));
+    p1.wires.push(wire("w2", (100.0, 50.0), (100.0, 100.0)));
+    p1.graphics.push(Shape::Polyline {
+        points: vec![
+            Point::new(200.0, 100.0),
+            Point::new(210.0, 100.0),
+            Point::new(205.0, 90.0),
+        ],
+        closed: true,
+        filled: true,
+    });
+    project.pages = vec![p1];
+    let (pages, _) = page_drawings(&project, &BTreeMap::new(), &Options::default());
+    let h = pages[0].size_mm.1;
+    let d = dxf(&pages[0]);
+    assert!(!d.contains("0\nCIRCLE\n"), "no hollow circle for the dot: {d}");
+    // The dot: a closed polyline 0.6 wide of two half circles through 99.7 and 100.3.
+    let dot = format!(
+        "66\n1\n70\n1\n40\n0.6\n41\n0.6\n0\nVERTEX\n8\n0\n10\n99.7\n20\n{y}\n40\n0.6\n41\n0.6\n42\n1\n\
+         0\nVERTEX\n8\n0\n10\n100.3\n20\n{y}\n40\n0.6\n41\n0.6\n42\n1\n0\nSEQEND\n",
+        y = h - 50.0
+    );
+    assert!(d.contains(&dot), "{d}");
+    // The triangle: one SOLID with its last corner repeated.
+    let solid = format!(
+        "0\nSOLID\n8\nDRAWINGS\n62\n7\n10\n200\n20\n{a}\n11\n210\n21\n{a}\n12\n205\n22\n{b}\n13\n205\n23\n{b}\n",
+        a = h - 100.0,
+        b = h - 90.0
+    );
+    assert!(d.contains(&solid), "{d}");
+}
+
+#[test]
+fn filled_outlines_become_dxf_solids_when_convex() {
+    let Some(quad) = crate::vector::solid_triangles(&[(0.0, 0.0), (4.0, 0.0), (4.0, 3.0), (0.0, 3.0), (0.0, 0.0)])
+    else {
+        unreachable!("a rectangle is convex")
+    };
+    assert_eq!(quad, vec![[(0.0, 0.0), (4.0, 0.0), (0.0, 3.0), (4.0, 3.0)]]);
+    let Some(fan) = crate::vector::solid_triangles(&[(0.0, 0.0), (2.0, 0.0), (3.0, 1.0), (2.0, 2.0), (0.0, 2.0)])
+    else {
+        unreachable!("a pentagon is convex")
+    };
+    assert_eq!(fan.len(), 3);
+    // An arrow with a notch is not convex: it stays an outline.
+    assert!(crate::vector::solid_triangles(&[(0.0, 0.0), (4.0, 2.0), (0.0, 4.0), (1.0, 2.0)]).is_none());
+    // A rectangle with a segment drawn back over itself turns half a turn each way at the
+    // reversals: a fan would paint outside it, so it stays an outline.
+    assert!(
+        crate::vector::solid_triangles(&[(4.0, 4.0), (0.0, 4.0), (0.0, 0.0), (8.0, 0.0), (0.0, 0.0), (4.0, 0.0)])
+            .is_none()
+    );
+}
+
+#[test]
+fn dxf_keeps_a_filled_path_that_is_not_convex_as_a_closed_outline() {
+    // An open, filled notched arrow: PDF and SVG fill it as if closed, so the DXF outline is
+    // closed too (group 70 is 1), and there is no SOLID.
+    let page = PageDrawing {
+        id: "a".into(),
+        number: "1".into(),
+        title: String::new(),
+        size_mm: (100.0, 100.0),
+        prims: vec![crate::writer::Prim::Path {
+            points: vec![(0.0, 0.0), (4.0, 2.0), (0.0, 4.0), (1.0, 2.0)],
+            closed: false,
+            filled: true,
+            ink: crate::writer::Stroke {
+                rgb: (0.0, 0.0, 0.0),
+                width: 0.25,
+            },
+            layer: None,
+        }],
+        pictures: Vec::new(),
+    };
+    let d = dxf(&page);
+    assert!(!d.contains("0\nSOLID\n"), "{d}");
+    assert!(d.contains("0\nPOLYLINE\n8\n0\n62\n7\n66\n1\n70\n1\n"), "{d}");
 }
 
 #[test]
@@ -270,6 +384,24 @@ fn wire_numbers_cross_references_and_drawings_are_optional_layers() {
     let d = dxf(&pages[0]);
     assert!(d.contains("0\nTEXT\n8\nWIRE-NUMBERS\n"));
     assert!(d.contains("0\nLINE\n8\nDRAWINGS\n"));
+
+    // In SVG the wire number sits in its own group that Inkscape shows as a layer.
+    let s = svg(&pages[0]);
+    assert!(s.contains("xmlns:inkscape=\"http://www.inkscape.org/namespaces/inkscape\""));
+    let open = "id=\"wire-numbers\" inkscape:groupmode=\"layer\" inkscape:label=\"Wire numbers\">";
+    let Some(at) = s.find(open) else {
+        unreachable!("no wire-numbers group: {s}")
+    };
+    let group = &s[at..at + s[at..].find("</g>").unwrap_or(0)];
+    assert!(group.contains(">101</text>"), "{group}");
+    assert!(s.contains("id=\"drawings\" inkscape:groupmode=\"layer\""));
+    // Symbol labels have no layer and stay outside the layer groups.
+    let Some(k1) = s.find(">-K1</text>") else {
+        unreachable!("no -K1 label")
+    };
+    let last_open = s[..k1].rfind("<g ").unwrap_or(0);
+    assert!(!s[last_open..k1].contains("inkscape:groupmode"));
+    assert_well_formed(&s);
 
     // A page with nothing optional declares no layers.
     project.pages[0].wires.clear();
@@ -1708,6 +1840,23 @@ fn svg_images(s: &str) -> Vec<(f64, f64, f64, f64, String)> {
         .collect()
 }
 
+/// Fails unless `s` parses as XML with every element closed.
+fn assert_well_formed(s: &str) {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(s);
+    let mut depth = 0usize;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(_)) => depth += 1,
+            Ok(Event::End(_)) => depth -= 1,
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(e) => unreachable!("not XML at {}: {e}\n{s}", reader.buffer_position()),
+        }
+    }
+    assert_eq!(depth, 0, "unclosed elements:\n{s}");
+}
+
 #[test]
 fn svg_drawings_show_the_logo_and_the_underlay() {
     let mut png = Vec::new();
@@ -1765,7 +1914,11 @@ fn svg_drawings_show_the_logo_and_the_underlay() {
         (images[0].0, images[0].1, images[0].2, images[0].3),
         (0.0, 0.0, 420.0, 297.0)
     );
-    assert!(page.find("<image").unwrap_or(usize::MAX) < page.find("<g ").unwrap_or(0));
+    // The underlay sits in its own "scans" layer, before the drawing's group.
+    let scans = "<g id=\"scans\" inkscape:groupmode=\"layer\" inkscape:label=\"Scanned sheets\">\n<image";
+    assert!(page.contains(scans), "{page}");
+    assert!(page.find(scans).unwrap_or(usize::MAX) < page.find("<g fill").unwrap_or(0));
+    assert_well_formed(&page);
     assert!(page.rfind("<image").unwrap_or(0) > page.find("</g>").unwrap_or(usize::MAX));
     // DXF has no pictures and stays as it was.
     assert!(!dxf(&pages[1]).contains("base64"));
