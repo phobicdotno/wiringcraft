@@ -286,7 +286,8 @@ enum Cmd {
     },
     /// Delete symbols and wires from a page by their ids (as `place`, `box` and `wire` print
     /// them). Wires that end on a pin of a deleted symbol go too, as in the app; devices keep
-    /// their data. An id that is not on the page changes nothing. Prints each deleted id.
+    /// their data. An id that is not on the page is an error and nothing changes. Prints each
+    /// deleted id.
     Delete {
         /// The page's id.
         page: String,
@@ -1534,8 +1535,6 @@ fn parse_point(s: &str) -> Result<Point, String> {
     }
 }
 
-/// A wire end from `item:pin` or `x,y`. A pin must be one the placed symbol has (its
-/// definition read from the project's vendored symbols in `dir`).
 /// `delete`: take the symbols and wires named by `ids` off `page`, and the wires ending on a
 /// deleted symbol's pin, as the app's Delete does. An id not on the page is an error and nothing
 /// changes. Returns the deleted ids: symbols first, then wires, each in page order.
@@ -1568,6 +1567,8 @@ fn delete_items(page: &mut Page, ids: &[String]) -> Res<Vec<String>> {
     Ok(gone_symbols.into_iter().chain(gone_wires).collect())
 }
 
+/// A wire end from `item:pin` or `x,y`. A pin must be one the placed symbol has (its
+/// definition read from the project's vendored symbols in `dir`).
 fn parse_end(dir: &Path, page: &Page, s: &str) -> Res<Endpoint> {
     if let Ok(p) = parse_point(s) {
         return Ok(Endpoint::Point { at: p });
