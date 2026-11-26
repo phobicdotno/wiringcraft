@@ -19,6 +19,25 @@ fn device_at(items: &[PanelItem], at: Point) -> Option<usize> {
     })
 }
 
+/// Where a dragged device lands when its corner is asked to go to `to`: kept, as turned, on a
+/// `pw` x `ph` plate. `None` for an item that is not a device.
+fn kept_on_plate(item: &PanelItem, to: Point, pw: f64, ph: f64) -> Option<Point> {
+    let PanelItem::Device {
+        width,
+        height,
+        rotation,
+        ..
+    } = item
+    else {
+        return None;
+    };
+    let (w, h) = wc_core::panel::turned_size(*width, *height, *rotation);
+    Some(Point::new(
+        to.x.clamp(0.0, (pw - w).max(0.0)),
+        to.y.clamp(0.0, (ph - h).max(0.0)),
+    ))
+}
+
 /// Where a device at `at`, `size` big as turned, goes when an arrow key moves it `step` mm in
 /// the direction (`dx`, `dy`): kept on a plate `plate` big, as a drag keeps it.
 fn nudged(at: Point, size: (f64, f64), plate: (f64, f64), step: f64, dx: f64, dy: f64) -> Point {
@@ -158,23 +177,19 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
                 to.y = y - height / 2.0;
             }
         }
+        // Keep the device on the plate before comparing, so a drag against an edge that leaves
+        // the device where it is takes no undo step.
+        let to = p.items.get(i).and_then(|d| kept_on_plate(d, to, pw, ph)).unwrap_or(to);
         let moved = matches!(p.items.get(i), Some(PanelItem::Device { at: a, .. }) if *a != to);
         if moved {
             if checkpoint.is_none() {
                 open.checkpoint();
                 ed.panel_drag = Some((grab, Some(open.history_count()), start));
             }
-            if let Some(PanelItem::Device {
-                at: a,
-                width,
-                height,
-                rotation,
-                ..
-            }) = open.project.panels.get_mut(panel).and_then(|x| x.items.get_mut(i))
+            if let Some(PanelItem::Device { at: a, .. }) =
+                open.project.panels.get_mut(panel).and_then(|x| x.items.get_mut(i))
             {
-                // Keep the device, as turned, on the plate.
-                let (w, h) = wc_core::panel::turned_size(*width, *height, *rotation);
-                *a = Point::new(to.x.clamp(0.0, (pw - w).max(0.0)), to.y.clamp(0.0, (ph - h).max(0.0)));
+                *a = to;
                 open.edited();
             }
         }
@@ -479,6 +494,100 @@ mod tests {
         assert_eq!(device_at(&items, Point::new(7.0, 5.0)), Some(2));
         assert_eq!(device_at(&items, Point::new(2.0, 5.0)), Some(1));
         assert_eq!(device_at(&items, Point::new(50.0, 5.0)), None);
+    }
+
+    #[test]
+    fn a_device_against_the_plate_edge_stays_put() {
+        let item = PanelItem::Device {
+            tag: wc_core::DeviceTag::parse("-K1").unwrap_or_default(),
+            at: Point::new(0.0, 0.0),
+            width: 10.0,
+            height: 40.0,
+            rotation: wc_core::geom::Rotation::R90,
+        };
+        // Dragged further out past the top-left corner, it stays where it is.
+        assert_eq!(
+            kept_on_plate(&item, Point::new(-15.0, -5.0), 100.0, 100.0),
+            Some(Point::new(0.0, 0.0))
+        );
+        // Turned, it is 40 mm wide: the right edge stops it at x = 60.
+        assert_eq!(
+            kept_on_plate(&item, Point::new(90.0, 95.0), 100.0, 100.0),
+            Some(Point::new(60.0, 90.0))
+        );
+        assert_eq!(
+            kept_on_plate(&item, Point::new(20.0, 30.0), 100.0, 100.0),
+            Some(Point::new(20.0, 30.0))
+        );
+        let rail = PanelItem::Rail {
+            at: Point::new(0.0, 0.0),
+            length: 10.0,
+        };
+        assert_eq!(kept_on_plate(&rail, Point::new(-5.0, 0.0), 100.0, 100.0), None);
+    }
+
+    #[test]
+    fn dragging_an_edge_device_outward_takes_no_undo_step() {
+        let (_tmp, mut o) = crate::state::tests::project();
+        let mut plate = wc_core::panel::Panel::new("pl1", "Plate", 200.0, 100.0);
+        plate.items.push(PanelItem::Device {
+            tag: wc_core::DeviceTag::parse("-K1").unwrap_or_default(),
+            at: Point::new(0.0, 0.0),
+            width: 20.0,
+            height: 20.0,
+            rotation: wc_core::geom::Rotation::R0,
+        });
+        o.project.panels.push(plate);
+        o.dirty = false;
+        let panel = o.project.panels.len() - 1;
+        assert!(!o.can_undo());
+        let mut ed = Editor::default();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let frame = |o: &mut Open, ed: &mut Editor, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 600.0))),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| show(ui, o, ed, panel, 0.0, true));
+            });
+        };
+        // Find where the device's middle (10, 10 mm) is on screen.
+        let probe = egui::pos2(400.0, 300.0);
+        frame(&mut o, &mut ed, vec![egui::Event::PointerMoved(probe)]);
+        frame(&mut o, &mut ed, vec![egui::Event::PointerMoved(probe)]);
+        let Some(c) = ed.cursor else {
+            unreachable!("the pointer is over the plate")
+        };
+        let z = ed.view.zoom;
+        let start = probe + Vec2::new((10.0 - c.x) as f32 * z, (10.0 - c.y) as f32 * z);
+        let button = |at: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        frame(
+            &mut o,
+            &mut ed,
+            vec![egui::Event::PointerMoved(start), button(start, true)],
+        );
+        // Drag left, past the plate's left edge, in 10 px steps.
+        let mut at = start;
+        for _ in 0..4 {
+            at.x -= 10.0;
+            frame(&mut o, &mut ed, vec![egui::Event::PointerMoved(at)]);
+        }
+        frame(&mut o, &mut ed, vec![button(at, false)]);
+        frame(&mut o, &mut ed, Vec::new());
+        assert!(matches!(
+            o.project.panels[panel].items[0],
+            PanelItem::Device { at, .. } if at == Point::new(0.0, 0.0)
+        ));
+        assert!(!o.can_undo(), "no undo step for a drag that moves nothing");
+        assert!(!o.dirty, "the project is not marked as changed");
     }
 
     #[test]

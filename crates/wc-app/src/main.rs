@@ -2098,9 +2098,9 @@ impl App {
                     out.push(a);
                 }
             }
-            // A shape half drawn in the symbol editor takes Enter and Escape; the editor
-            // handles them itself, so the schematic's drawing is left alone.
-            if self.symbol_editor.as_ref().is_some_and(|e| e.drawing_shape()) {
+            // While the symbol editor is open, Enter and Escape are the editor's (it ends or
+            // drops its own half-drawn shape), so the schematic's drawing and tool are left alone.
+            if self.symbol_editor.is_some() {
                 return;
             }
             if pressed_with(i, Key::Enter, Modifiers::is_none)
@@ -5308,14 +5308,7 @@ fn export_drawings_to(open: &Open, dir: &Path) -> String {
             let mut stem = if page.panel {
                 wc_pdf::panel_file_stem(page)
             } else {
-                let base = if page.number.trim().is_empty() {
-                    &page.id
-                } else {
-                    page.number.trim()
-                };
-                base.chars()
-                    .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
-                    .collect()
+                wc_pdf::page_file_stem(page)
             };
             // Compared without case: `A1` and `a1` are one file name on Windows and macOS.
             while !used.insert(stem.to_lowercase()) {
@@ -5666,8 +5659,15 @@ impl App {
                     self.ed.message = symbol_editor_refusal(a.info().label);
                     false
                 }
-                // The page behind the symbol editor stays as it is.
-                Action::PrevPage | Action::NextPage => false,
+                // The page behind the symbol editor stays as it is, and so does its tool: the
+                // tool keys would switch it out of sight (the menu and toolbar still can).
+                Action::PrevPage
+                | Action::NextPage
+                | Action::PlaceSymbol
+                | Action::DrawWire
+                | Action::TextTool
+                | Action::CommentTool
+                | Action::LineTool => false,
                 _ => true,
             })
             .collect()
@@ -6849,6 +6849,18 @@ mod marking_tests {
             .collect();
         names.sort();
         assert_eq!(names, ["a1.dxf", "a1.svg", "a1_.dxf", "a1_.svg"]);
+    }
+
+    #[test]
+    fn a_page_number_with_a_dot_keeps_its_dot_in_the_drawing_file_names() {
+        let (_tmp, mut o) = state::tests::project();
+        o.project.pages.truncate(1);
+        o.project.pages[0].number = "1.2".into();
+        let own = o.dir.join("export").join("drawings");
+        let msg = export_drawings_to(&o, &own);
+        assert!(msg.starts_with("Exported 1 pages"), "{msg}");
+        assert!(own.join("1.2.svg").is_file());
+        assert!(own.join("1.2.dxf").is_file());
     }
 
     #[test]
