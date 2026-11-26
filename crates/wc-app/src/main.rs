@@ -4930,7 +4930,6 @@ fn arrow_steps(i: &egui::InputState, step: f64) -> Vec<wc_core::geom::Point> {
 
 /// A project's title-block fields as form rows: the standard fields first (empty when not
 /// set), then any others the project has.
-/// The Ctrl shortcuts pressed this frame, none while a dialog is open.
 /// Whether `a` saves the open project: what was typed in a field and not entered yet is
 /// entered first.
 fn saves_project(a: Action) -> bool {
@@ -4963,6 +4962,7 @@ fn enter_typed_value(ctx: &egui::Context) {
     }
 }
 
+/// The Ctrl shortcuts pressed this frame, none while a dialog is open.
 fn ctrl_shortcuts(ctx: &egui::Context, dialog_open: bool) -> Vec<Action> {
     let mut out = Vec::new();
     if dialog_open {
