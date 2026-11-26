@@ -1605,6 +1605,29 @@ fn bulges_past_the_points_are_read_but_not_kept() -> TestResult {
 }
 
 #[test]
+fn a_bulge_that_is_not_a_number_is_damage() -> TestResult {
+    for bad in [f64::NAN, f64::INFINITY] {
+        let mut w = W::default();
+        w.bd(0.0);
+        w.bd(bad);
+        let bytes = w.bytes();
+        let mut r = Bits::new(&bytes, 0, w.0.len());
+        let Err(e) = kept_bulges(&mut r, 2, 2) else {
+            unreachable!("a bulge of {bad} was kept");
+        };
+        assert!(e.to_string().contains("bulge is not a number"), "{e}");
+    }
+    // Past the points it is read but not kept, so it does no harm.
+    let mut w = W::default();
+    w.bd(0.5);
+    w.bd(f64::NAN);
+    let bytes = w.bytes();
+    let mut r = Bits::new(&bytes, 0, w.0.len());
+    assert_eq!(kept_bulges(&mut r, 2, 1)?, [0.5]);
+    Ok(())
+}
+
+#[test]
 fn a_bulged_lightweight_polyline_is_drawn_with_its_arc() -> TestResult {
     for v in [Version::R2004, Version::R2010, Version::R2018] {
         // Open, two points 10 apart, the segment between them a half circle (bulge 1); from

@@ -664,7 +664,13 @@ fn shapes(
             // Anything else not numbers once placed (a radius near the limit times the scale)
             // is left out and said too: the page could not be read back.
             let (a, b) = s.bounds();
-            if [a.x, a.y, b.x, b.y].iter().all(|v| v.is_finite()) {
+            // Bounds miss a text's height and an arc's angles.
+            let more = match &s {
+                Shape::Text { height, angle, .. } => vec![*height, *angle],
+                Shape::Arc { start, end, .. } => vec![*start, *end],
+                _ => Vec::new(),
+            };
+            if [a.x, a.y, b.x, b.y].iter().chain(&more).all(|v| v.is_finite()) {
                 out.push((layer, s));
             } else {
                 *skipped.entry(NOT_NUMBERS_PLACED.to_owned()).or_default() += 1;
@@ -2147,6 +2153,29 @@ mod tests {
             unreachable!("nothing left to draw");
         };
         assert!(err.to_string().contains("1000 km"), "{err}");
+        Ok(())
+    }
+
+    /// A text whose height overflows once scaled is left out and said (its bounds are only its
+    /// anchor); an ordinary text comes through unchanged and survives a save and reload.
+    #[test]
+    fn a_text_whose_height_overflows_once_scaled_is_left_out_and_said() -> Result<()> {
+        let ents = "0\nTEXT\n10\n0\n20\n0\n40\n1e308\n1\nHUGE\n0\nTEXT\n10\n0\n20\n0\n40\n2.5\n1\nA1\n";
+        let p = page(&dxf(ents, ""), 10.0, &BTreeSet::new())?;
+        let [Shape::Text { text, height, .. }] = p.graphics.as_slice() else {
+            unreachable!("{:?}", p.graphics);
+        };
+        assert_eq!((text.as_str(), *height), ("A1", 25.0));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("1 entity whose size is not a number once placed")),
+            "{:?}",
+            p.warnings
+        );
+        let json = serde_json::to_string(&p.graphics).map_err(|e| Error::Format(e.to_string()))?;
+        let back: Vec<Shape> = serde_json::from_str(&json).map_err(|e| Error::Format(e.to_string()))?;
+        assert_eq!(back, p.graphics);
         Ok(())
     }
 

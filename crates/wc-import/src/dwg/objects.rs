@@ -1292,6 +1292,10 @@ fn kept_bulges(d: &mut Bits<'_>, count: u32, points: usize) -> Result<Vec<f64>> 
     for _ in 0..count {
         let b = d.bd()?;
         if kept.len() < points {
+            // A bulge that is not a number would silently draw its arc as a straight line.
+            if !b.is_finite() {
+                return Err(bad("a polyline bulge is not a number"));
+            }
             kept.push(b);
         }
     }
