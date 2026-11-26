@@ -494,3 +494,35 @@ fn a_folder_source_with_a_rules_file_gives_its_rules_in_source_order() -> Result
     assert!(why.contains("unknown kind"), "{why}");
     Ok(())
 }
+
+#[test]
+fn every_starter_symbol_loads_under_its_file_name_with_distinct_pins() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+    let mut project = wc_core::store::create(&tmp.path().join("p"), "T")?;
+    project.meta.libraries = vec![LibrarySource {
+        name: "starter".into(),
+        kind: "folder".into(),
+        location: starter.to_string_lossy().into(),
+        reference: None,
+    }];
+    let lib = Library::open(&tmp.path().join("p"), &project)?;
+    let ids = lib.index(ItemKind::Symbol);
+    for id in ids.keys() {
+        let (s, _) = lib.symbol(id)?;
+        assert_eq!(&s.id, id, "file name and id differ");
+        assert!(!s.pins.is_empty(), "{id} has no pins");
+        let names: std::collections::BTreeSet<_> = s.pins.iter().map(|p| &p.name).collect();
+        assert_eq!(names.len(), s.pins.len(), "{id} repeats a pin name");
+    }
+    // The timer relay set (#531): coils drive, delayed contacts follow them.
+    for (id, role) in [
+        ("wc.coil.ondelay", SymbolRole::Main),
+        ("wc.coil.offdelay", SymbolRole::Main),
+        ("wc.contact.no.ondelay", SymbolRole::Auxiliary),
+        ("wc.contact.nc.ondelay", SymbolRole::Auxiliary),
+    ] {
+        assert_eq!(lib.symbol(id)?.0.role, role, "{id}");
+    }
+    Ok(())
+}
