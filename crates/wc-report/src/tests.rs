@@ -681,6 +681,76 @@ fn project_check_warns_about_parts_missing_from_the_library_copy() {
 }
 
 #[test]
+fn project_check_warns_about_a_missing_part_of_a_device_drawn_only_as_interruption_points() {
+    let (mut p, mut s, parts) = fixture();
+    let arrow = sym("arrow", SymbolRole::Interruption, &["1"]);
+    s.insert(arrow.id.clone(), arrow);
+    p.pages[0].symbols.push(place("s9", "arrow", 200.0, Some("-L1")));
+    let Ok(l1) = DeviceTag::parse("-L1") else {
+        unreachable!()
+    };
+    p.devices.insert(
+        l1,
+        Device {
+            part: Some("acme.gone".into()),
+            ..Default::default()
+        },
+    );
+    let found: Vec<String> = check(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    })
+    .into_iter()
+    .map(|f| f.message)
+    .collect();
+    assert!(
+        found.contains(&"-L1: part acme.gone is missing from the project's library copy".to_owned()),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn project_check_names_an_unreadable_part_copy_with_its_reason() {
+    let (mut p, s, parts) = fixture();
+    let Ok(p1) = DeviceTag::parse("-P1") else {
+        unreachable!()
+    };
+    p.devices.insert(
+        p1,
+        Device {
+            part: Some("acme.broken".into()),
+            ..Default::default()
+        },
+    );
+    let unreadable = [("acme.broken".to_owned(), "expected value at line 1".to_owned())]
+        .into_iter()
+        .collect();
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found: Vec<String> = check_with_unreadable(&i, &[], &unreadable)
+        .into_iter()
+        .map(|f| f.message)
+        .collect();
+    assert!(
+        found.contains(
+            &"-P1: part acme.broken in the project's library copy cannot be read: expected value at line 1".to_owned()
+        ),
+        "{found:?}"
+    );
+    assert!(!found.iter().any(|m| m.contains("acme.broken is missing")), "{found:?}");
+    // Without the reason it is reported as missing.
+    assert!(
+        check(&i)
+            .iter()
+            .any(|f| f.message == "-P1: part acme.broken is missing from the project's library copy")
+    );
+}
+
+#[test]
 fn a_device_repeated_on_an_overview_page_is_not_drawn_twice() {
     let (mut p, s, parts) = fixture();
     // The coil -K1 again, on a line diagram.
