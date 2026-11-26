@@ -290,7 +290,52 @@ struct App {
     live: live_check::LiveCheck,
     /// A base project being fetched from a git URL for a new project, off the window thread.
     fetch: Option<BaseFetch>,
+    /// File > Import running on a worker thread ([`App::poll_import`]).
+    importing: Option<Importing>,
 }
+
+/// File > Import running on a worker thread, and what to do with the project when it ends.
+struct Importing {
+    job: imports::Job,
+    kind: imports::Kind,
+    file: PathBuf,
+    /// The library folder parts go into.
+    lib: Option<PathBuf>,
+    /// The library folder chosen in the parts dialog, declared in the project when it is new.
+    target: Option<import_symbols::ImportTarget>,
+}
+
+/// Said when something waits for an import that is running.
+const IMPORT_RUNNING: &str = "An import is running; wait until it is done.";
+
+/// The actions that do not change the project, its folder or which project is open: the only
+/// ones carried out while an import runs.
+fn allowed_while_importing(a: Action) -> bool {
+    matches!(
+        a,
+        Action::ZoomIn
+            | Action::ZoomOut
+            | Action::ZoomFit
+            | Action::ToggleGrid
+            | Action::ToggleTheme
+            | Action::ToggleChrome
+            | Action::Layers
+            | Action::Assistant
+            | Action::RequestFunction
+            | Action::ReportMissing
+    )
+}
+
+/// The view controls shown in the import window: while it is up the window takes every click,
+/// so the toolbar's own are out of reach. All are [`allowed_while_importing`].
+const IMPORT_VIEW_CONTROLS: &[Action] = &[
+    Action::ZoomIn,
+    Action::ZoomOut,
+    Action::ZoomFit,
+    Action::ToggleGrid,
+    Action::ToggleTheme,
+    Action::Layers,
+];
 
 /// Make a new project's folder a repository with its first version.
 fn record_new_project(dir: &std::path::Path) -> Result<(), wc_vcs::Error> {
@@ -448,6 +493,24 @@ impl chrome::Status for StatusView<'_> {
 }
 
 impl App {
+    /// OK in the Translations dialog: save `form`'s dictionary. For the open project the save
+    /// is one undo step, however many cells changed (#589). A guest in a shared session is
+    /// refused as the assistant's `translations` tool refuses, and nothing is written: the
+    /// session does not carry the file. A form that is not for the open project just saves.
+    pub(crate) fn save_translations(
+        open: Option<&mut Open>,
+        share: &share::Share,
+        form: &translations_form::Form,
+    ) -> Result<String, String> {
+        if share.active() && !share.is_host() {
+            return Err(Open::TRANSLATIONS_GUEST.to_owned());
+        }
+        match open {
+            Some(open) if form.is_for(&open.dir) => open.translations_change(|_| form.save()),
+            _ => form.save(),
+        }
+    }
+
     /// Keep the open project in step with the shared session, at the end of the frame so this
     /// frame's change goes out. Nothing goes out while a button is held or the live cover form
     /// is open, so one action is one change.
@@ -635,6 +698,7 @@ impl App {
             strip_editor: None,
             live: Default::default(),
             fetch: None,
+            importing: None,
         };
         let dir = dir.or_else(|| prefs.recent.first().cloned());
         if let Some(d) = dir {
@@ -645,6 +709,11 @@ impl App {
     }
 
     fn open_dir(&mut self, dir: &std::path::Path, prefs: &mut Prefs) {
+        // The import writes to the open project's folder and is taken into it when it ends.
+        if self.importing.is_some() {
+            self.dialog = Some(Dialog::Message(format!("The project was not opened: {IMPORT_RUNNING}")));
+            return;
+        }
         let dir = &match prefs::absolute(dir) {
             Ok(d) => d,
             Err(e) => {
@@ -707,7 +776,9 @@ impl App {
     /// Why Save as cannot be done now, checked again when its dialog would open: the assistant
     /// can start a command or a session can start between the action and its dialog.
     fn save_as_refused(&self) -> Option<&'static str> {
-        if self.share.active() {
+        if self.importing.is_some() {
+            Some(IMPORT_RUNNING)
+        } else if self.share.active() {
             Some(
                 "Save as is not available in a shared session: it would end the session. Stop sharing (or leave) first.",
             )
@@ -924,7 +995,12 @@ impl App {
     /// Why an import cannot run now: it writes to the project folder, which a shared session or
     /// a running assistant command owns.
     fn import_refused(&self) -> Option<&'static str> {
-        if self.share.active() {
+        if self.importing.is_some() {
+            Some(IMPORT_RUNNING)
+        } else if self.assistant.busy() {
+            // Its turn's undo step would take the import's in with it.
+            Some("The assistant is working on the project; import when it is done.")
+        } else if self.share.active() {
             Some("Imports are not available in a shared session: leave the session, import, and share again.")
         } else if self.assistant.command_running() {
             Some("The assistant is running a command on the project; import when it is done.")
@@ -933,7 +1009,8 @@ impl App {
         }
     }
 
-    /// Run the import of `file` (parts into `lib`) and show what it said; `target` is the
+    /// Start the import of `file` (parts into `lib`) on a worker thread; [`App::poll_import`]
+    /// shows what it says while it runs and takes the result in when it ends. `target` is the
     /// library folder chosen in the parts dialog, declared in the project when it is new.
     fn import_from(
         &mut self,
@@ -948,10 +1025,56 @@ impl App {
             return;
         }
         let Some(open) = self.open.as_mut() else { return };
-        let (done, msg) = imports::import(open, kind, file, lib, self.ed.page);
+        applog::info(&format!("import {kind:?} {}", file.display()));
+        let job = imports::start(open, kind, file, lib, self.ed.page);
+        // Nothing half done is left: a tool's preview, a wire being drawn.
+        self.ed.wire = None;
+        self.ed.shape_points.clear();
+        self.dialog = None;
+        self.importing = Some(Importing {
+            job,
+            kind,
+            file: file.to_path_buf(),
+            lib: lib.map(Path::to_path_buf),
+            target,
+        });
+    }
+
+    /// The import that runs: take its result in once the worker has ended (one Undo step, and
+    /// the message of what it said), else ask for the next frame to look again.
+    fn poll_import(&mut self, ctx: &egui::Context) {
+        let Some(running) = self.importing.as_ref() else { return };
+        let Some((r, log)) = running.job.poll() else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        };
+        let Some(running) = self.importing.take() else { return };
+        self.end_import(running, r, &log);
+    }
+
+    /// Take an ended import's result into the project it was started on.
+    fn end_import(&mut self, running: Importing, r: wc_import::run::Res<()>, log: &wc_import::run::Log) {
+        let Importing {
+            job,
+            kind,
+            file,
+            lib,
+            target,
+        } = running;
+        // Opening another project is refused while it runs; should it be gone all the same, the
+        // result is not taken into another one.
+        let Some(open) = self.open.as_mut().filter(|o| o.dir == job.dir) else {
+            self.dialog = Some(Dialog::Message(format!(
+                "The import of {} ended, but the project it was for ({}) is no longer open: open it again to see what it holds.",
+                job.name,
+                job.dir.display()
+            )));
+            return;
+        };
+        let (done, msg) = job.finish(open, r, log);
         // The project's own folder is listed first once parts are in it, as for symbols; so is
         // a new folder chosen outside the library list.
-        let source = match (target, lib) {
+        let source = match (target, lib.as_deref()) {
             (Some(t), _) => t.declare,
             (None, Some(l)) if kind.needs_library() => new_folder_source(&open.dir, l, &open.project.meta.libraries),
             (None, _) => None,
@@ -962,9 +1085,71 @@ impl App {
             open.dirty = true;
             open.refresh_library();
         }
-        applog::info(&format!("import {kind:?} {}", file.display()));
+        applog::info(&format!("import {kind:?} {} ended", file.display()));
         self.prune_selection();
         self.dialog = Some(Dialog::Message(msg));
+    }
+
+    /// While an import runs: a window with what it has said so far, over the editor, which
+    /// takes no clicks until the import is done. The window takes the clicks for everything
+    /// under it, so the view controls that still work ([`IMPORT_VIEW_CONTROLS`]) and the layer
+    /// list are shown in it.
+    fn import_window(&mut self, ctx: &egui::Context) {
+        let Some(running) = self.importing.as_ref() else { return };
+        let lines = running.job.lines();
+        let name = running.job.name.clone();
+        let mut actions = Vec::new();
+        let mut layers_changed = false;
+        egui::Modal::new(egui::Id::new("importing")).show(ctx, |ui| {
+            ui.set_width(520.0);
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.strong(format!("Importing {name}…"));
+            });
+            ui.label("The project can be edited again when the import is done.");
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .max_height(260.0)
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    if lines.is_empty() {
+                        ui.weak("Reading the file…");
+                    }
+                    for line in &lines {
+                        ui.label(RichText::new(line).monospace());
+                    }
+                });
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.weak("View:");
+                for a in IMPORT_VIEW_CONTROLS {
+                    let info = a.info();
+                    let on = *a == Action::Layers && self.show_layers;
+                    if ui.selectable_label(on, info.label).on_hover_text(info.tip).clicked() {
+                        actions.push(*a);
+                    }
+                }
+            });
+            if self.show_layers {
+                ui.separator();
+                layers_changed = self.prefs.layers.ui(ui);
+            }
+        });
+        if layers_changed {
+            self.layers_changed();
+        }
+        for a in actions {
+            self.run(a);
+        }
+    }
+
+    /// Closing the window would stop the import half way through writing the project folder:
+    /// while one runs, a close that was asked for is called off.
+    fn hold_close_while_importing(&mut self, ctx: &egui::Context) {
+        if self.importing.is_some() && ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.ed.message = format!("The window was not closed: {IMPORT_RUNNING}");
+        }
     }
 
     /// Carry out an action. A picker it asks for waits until the frame's actions have run; while
@@ -988,6 +1173,10 @@ impl App {
 
     /// Show the picker that waits, if it is still for the project open now.
     fn ask_pending(&mut self) {
+        // A picker asked for before the import started waits until it is done.
+        if self.importing.is_some() {
+            return;
+        }
         let Some(p) = self.pending.take() else { return };
         let asked_for = self.pending_for.take();
         let now = self.open.as_ref().map(|o| o.dir.clone());
@@ -1010,6 +1199,11 @@ impl App {
     fn carry_out(&mut self, a: Action) {
         let page = self.ed.page;
         applog::info(&format!("command {a:?}"));
+        // The import owns the project folder until its result is taken in.
+        if self.importing.is_some() && !allowed_while_importing(a) {
+            self.ed.message = format!("{} was not done: {IMPORT_RUNNING}", a.info().label);
+            return;
+        }
         if let Some(name) = self.open.as_ref().and_then(|o| held_for(a, &self.ed, &o.project)) {
             self.ed.message = format!("{name} has this page open; it is read-only here until they leave it.");
             return;
@@ -1856,18 +2050,28 @@ impl App {
                     ui.separator();
                     ui.horizontal(|ui| {
                         if ui.button("Save").clicked() {
-                            match form.save() {
-                                Ok(path) => {
-                                    then = Some(Box::new(move |app: &mut App| {
+                            // Saved through the project, so the save is one undo step.
+                            let form = form.clone();
+                            then = Some(Box::new(move |app: &mut App| {
+                                let Some(open) = app.open.as_mut() else {
+                                    return;
+                                };
+                                let saved = if app.share.active() {
+                                    Err(Open::MACRO_SAVE_SHARED.to_owned())
+                                } else {
+                                    open.save_macro_form(&form)
+                                };
+                                match saved {
+                                    Ok(path) => {
                                         app.ed.message = format!("Saved macro {}", path.display());
-                                        if let Some(open) = &app.open {
-                                            app.dialog = Some(Dialog::Macros(open.macros()));
-                                        }
-                                    }));
-                                    keep = false;
+                                        app.dialog = Some(Dialog::Macros(open.macros()));
+                                    }
+                                    Err(e) => {
+                                        app.dialog = Some(Dialog::MacroEdit { form, error: Some(e) });
+                                    }
                                 }
-                                Err(e) => *error = Some(e),
-                            }
+                            }));
+                            keep = false;
                         }
                         if ui.button("Cancel").clicked() {
                             then = Some(Box::new(|app: &mut App| {
@@ -2111,16 +2315,12 @@ impl App {
                     ui.separator();
                     ui.horizontal(|ui| {
                         if ui.button("OK").clicked() {
-                            // What the dialog saves is one undo step (#589).
-                            let saved = match self.open.as_mut() {
-                                Some(open) if form.is_for(&open.dir) => open.translations_change(|_| form.save()),
-                                _ => form.save(),
-                            };
-                            match saved {
+                            match App::save_translations(self.open.as_mut(), &self.share, form) {
                                 Ok(m) => {
                                     then = Some(Box::new(move |app: &mut App| app.ed.message = m));
                                     keep = false;
                                 }
+                                Err(e) if e == Open::TRANSLATIONS_GUEST => form.error = Some(e),
                                 Err(e) => form.error = Some(format!("Saving failed: {e}")),
                             }
                         }
@@ -3520,6 +3720,7 @@ impl App {
         // The new project waits until they are done, and Cancel is no longer offered.
         if self.assistant.busy()
             || self.assistant.command_running()
+            || self.importing.is_some()
             || self.symbol_editor.is_some()
             || self.strip_editor.is_some()
             || self.dialog.as_ref().is_some_and(|d| !matches!(d, Dialog::Fetching(_)))
@@ -4629,6 +4830,7 @@ fn export_drawings_to(open: &Open, dir: &Path) -> String {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.hold_close_while_importing(ctx);
         // The last edit is done: jumpers follow their terminals before anything shows or copies them.
         if let Some(o) = self.open.as_mut() {
             o.follow_terminals();
@@ -4648,7 +4850,13 @@ impl eframe::App for App {
         }
         let mut actions = chrome::show(ctx, self.prefs.chrome, &mut self.chrome, &status);
         let keys = self.shortcuts(ctx);
-        actions.extend(self.route_to_symbol_editor(keys));
+        // While an import runs no key edits the symbol being drawn either: the keys go to the
+        // actions, which wait for the import.
+        if self.importing.is_some() {
+            actions.extend(keys);
+        } else {
+            actions.extend(self.route_to_symbol_editor(keys));
+        }
         for a in actions {
             self.run(a);
         }
@@ -4659,6 +4867,7 @@ impl eframe::App for App {
         }
         self.live_check(ctx);
         self.poll_fetch(ctx);
+        self.poll_import(ctx);
         self.log_messages();
         self.assistant_poll(ctx);
         self.ask_pending();
@@ -4782,12 +4991,18 @@ impl eframe::App for App {
             });
         }
         self.dialogs(ctx);
-        self.share
-            .windows(ctx, self.open.as_mut(), self.assistant.command_running());
-        self.symbol_editor_window(ctx);
-        self.find_window(ctx);
-        self.layers_window(ctx);
-        self.strip_editor_window(ctx);
+        // While an import runs, the windows that edit the project, a library or the session
+        // wait (they show again when it is done), not only behind the import window.
+        if self.importing.is_none() {
+            self.share
+                .windows(ctx, self.open.as_mut(), self.assistant.command_running());
+            self.symbol_editor_window(ctx);
+            self.find_window(ctx);
+            self.strip_editor_window(ctx);
+            self.layers_window(ctx);
+        }
+        // The import window shows the layer list itself: it takes the clicks for any other.
+        self.import_window(ctx);
         self.sync_session(ctx);
 
         let title = match &self.open {
