@@ -1696,7 +1696,8 @@ mod discovery {
     #[test]
     fn a_full_session_list_takes_new_sessions_once_old_ones_are_forgotten() -> TestResult {
         use crate::discovery::MAX_SESSIONS;
-        let forget = Duration::from_millis(50);
+        // A timeout no pause of the test thread comes near, so the new session stays fresh.
+        let forget = Duration::from_secs(60);
         let mut b = Browser::bind("127.0.0.1:0".parse()?, forget)?;
         let from: SocketAddr = "192.168.1.41:5000".parse()?;
         let send = |b: &mut Browser, ports: std::ops::Range<usize>| -> TestResult {
@@ -1713,7 +1714,8 @@ mod discovery {
             Ok(())
         };
         send(&mut b, 0..MAX_SESSIONS)?;
-        std::thread::sleep(forget * 3);
+        // Silent for longer than the timeout, without waiting on the clock.
+        b.age(forget * 2);
         // No poll in between: the full list makes room by forgetting the silent sessions.
         send(&mut b, MAX_SESSIONS..MAX_SESSIONS + 1)?;
         let list = b.poll()?;

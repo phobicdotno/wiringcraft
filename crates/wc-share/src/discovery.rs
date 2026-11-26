@@ -268,6 +268,15 @@ impl Browser {
         Ok(list)
     }
 
+    /// Make every listed session look heard from `by` earlier (tests: expire sessions without
+    /// waiting on the clock).
+    #[cfg(test)]
+    pub(crate) fn age(&mut self, by: Duration) {
+        for (_, at) in self.heard.values_mut() {
+            *at = at.checked_sub(by).unwrap_or(*at);
+        }
+    }
+
     /// Drop the sessions not heard from within the timeout.
     fn forget_silent(&mut self, now: Instant) {
         let keep = self.forget_after;
