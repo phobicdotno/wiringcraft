@@ -2314,6 +2314,12 @@ impl Open {
                 // Nothing known about what was there: written as before.
                 None => restore_file(&path, should.as_deref()).map_err(cannot)?,
             }
+            // A symbol file repaired with the loaded version is not written again unchecked.
+            if let Some((id, hash)) = self.symbol_repairs.get(&rel)
+                && self.symbols.get(id).is_some_and(|s| s.hash() == *hash)
+            {
+                self.stale_symbol_files.remove(id);
+            }
             self.drop_unwritten(&rel);
         }
         Ok(())
@@ -2915,8 +2921,13 @@ impl Open {
         let new = plan.symbol.clone();
         self.check_box_file_unchanged(&symbol_id, &old)?;
         self.write_symbol_file(&new)?;
-        // The file holds the loaded version again: a later change on disk is checked for.
+        // The file holds the loaded version again: a later change on disk is checked for, and a
+        // repair a refused change queued for it would write an older version over this one.
         self.stale_symbol_files.remove(&symbol_id);
+        if let Ok(path) = store::vendor_path(&self.dir, ItemKind::Symbol, &symbol_id) {
+            let rel = path.strip_prefix(&self.dir).unwrap_or(&path).to_path_buf();
+            self.drop_unwritten(&rel);
+        }
         self.checkpoint();
         self.project.lock.symbols.insert(
             symbol_id.clone(),
@@ -3125,22 +3136,29 @@ impl Open {
 
     /// Queue the file of symbol `id` to be written with `sym` by the next save, as a repair
     /// [`Open::back_to`] tracks. A file already waiting keeps what it held when first queued,
-    /// so a change made outside since is still asked about; otherwise what it holds now.
-    fn queue_symbol_repair(&mut self, id: &str, sym: &Symbol) {
-        let (Ok(path), Ok(json)) = (store::vendor_path(&self.dir, ItemKind::Symbol, id), store::to_json(sym)) else {
-            return;
-        };
+    /// so a change made outside since is still asked about; otherwise what the app `wrote` to
+    /// it (what it holds now when not known). The error says why it could not be queued.
+    fn queue_symbol_repair(&mut self, id: &str, sym: &Symbol, wrote: Option<&Symbol>) -> Result<(), String> {
+        let why = |e: wc_core::Error| format!("The file of symbol {id} is not written back: {e}");
+        let path = store::vendor_path(&self.dir, ItemKind::Symbol, id).map_err(why)?;
+        let bytes = Some(store::to_json(sym).map_err(why)?.into_bytes());
+        let wrote = wrote.map(store::to_json).transpose().map_err(why)?;
         let rel = path
             .strip_prefix(&self.dir)
             .map_or_else(|_| path.clone(), Path::to_path_buf);
-        let bytes = Some(json.into_bytes());
         if self.unwritten_found.contains_key(&rel) {
             self.unwritten_files.insert(rel.clone(), bytes);
             self.edited();
         } else {
             self.keep_unwritten(vec![(path, bytes)], true);
+            // A change another program made after the app wrote the file is asked about too.
+            if let Some(json) = wrote {
+                self.unwritten_found
+                    .insert(rel.clone(), Found::Bytes(Some(json.into_bytes())));
+            }
         }
         self.symbol_repairs.insert(rel, (id.to_owned(), sym.hash()));
+        Ok(())
     }
 
     /// Start a change that may be refused as a whole: the project and the symbols and parts
@@ -3219,12 +3237,18 @@ impl Open {
         let pin = |o: &Self, id: &str| o.project.lock.symbols.get(id).map(|e| e.hash.clone());
         for (id, was) in &mark.symbols {
             let replaced = self.symbols.get(id).filter(|now| now.hash() != was.hash());
-            let written = replaced.is_some_and(|now| pinned_by_change.get(id).is_some_and(|e| e.hash == now.hash()));
-            if written && pin(self, id) == Some(was.hash()) {
+            let written = replaced
+                .filter(|now| pinned_by_change.get(id).is_some_and(|e| e.hash == now.hash()))
+                .cloned();
+            if let Some(wrote) = written
+                && pin(self, id) == Some(was.hash())
+            {
                 self.stale_symbol_files.insert(id.clone());
-                // Queued with what the file holds now, so the next save does not write over a
-                // change another program makes to it meanwhile.
-                self.queue_symbol_repair(id, was);
+                // Queued with what the app wrote there, so the next save does not write over a
+                // change another program made to it since.
+                if let Err(e) = self.queue_symbol_repair(id, was, Some(&wrote)) {
+                    errors.push(e);
+                }
                 self.edited();
             }
         }
@@ -3237,7 +3261,9 @@ impl Open {
             };
             if now.hash() != was.hash() && pin(self, &id) == Some(now.hash()) {
                 let now = now.clone();
-                self.queue_symbol_repair(&id, &now);
+                if let Err(e) = self.queue_symbol_repair(&id, &now, None) {
+                    errors.push(e);
+                }
             }
         }
         self.symbols = mark.symbols;
@@ -3264,15 +3290,20 @@ impl Open {
                 continue;
             }
             match self.symbols.get(&id).filter(|s| wanted == Some(s.hash())).cloned() {
-                Some(sym) => {
-                    if let Ok(json) = store::to_json(&sym) {
+                Some(sym) => match store::to_json(&sym) {
+                    Ok(json) => {
                         self.unwritten_files.insert(rel.clone(), Some(json.into_bytes()));
                         self.symbol_repairs.insert(rel, (id.clone(), sym.hash()));
                         self.stale_symbol_files.insert(id);
-                    } else {
-                        self.drop_unwritten(&rel);
                     }
-                }
+                    // The queued version is not the pinned one: let go, and the next save writes
+                    // the pinned one as the loaded symbol.
+                    Err(e) => {
+                        errors.push(format!("The file of symbol {id} is not written back as queued: {e}"));
+                        self.drop_unwritten(&rel);
+                        self.stale_symbol_files.insert(id);
+                    }
+                },
                 None => self.drop_unwritten(&rel),
             }
         }
@@ -6666,6 +6697,53 @@ pub(crate) mod tests {
         o.back_to(m).unwrap();
         assert_eq!(o.symbols[&symbol_id], old);
         assert!(o.dirty, "the box file still holds the refused edit");
+        o.save().unwrap();
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), old);
+    }
+
+    #[test]
+    fn a_box_edit_repeated_after_a_refusal_is_not_saved_over_by_the_repair() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let m = o.mark();
+        widen_box(&mut o, &id);
+        o.back_to(m).unwrap();
+        // The same edit again, kept: its file holds the version the project now pins.
+        widen_box(&mut o, &id);
+        let accepted = o.symbols[&symbol_id].clone();
+        assert_eq!(o.project.lock.symbols[&symbol_id].hash, accepted.hash());
+        o.save().unwrap();
+        assert_eq!(
+            store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(),
+            accepted,
+            "the repair queued by the refusal does not write the old version over it"
+        );
+    }
+
+    #[test]
+    fn a_symbol_file_changed_outside_before_a_box_edit_is_refused_is_not_written_over_unasked() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let old = o.symbols[&symbol_id].clone();
+        let m = o.mark();
+        widen_box(&mut o, &id);
+        // Another program changes the box file before the edit is refused.
+        let mut other = old.clone();
+        other.name = "Box, changed".into();
+        store::write_vendored_symbol(&o.dir, &other).unwrap();
+        o.back_to(m).unwrap();
+        let err = o.save().unwrap_err();
+        assert!(err.contains(Open::CHANGED_OUTSIDE), "{err}");
+        assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), other);
+    }
+
+    #[test]
+    fn a_symbol_file_repaired_on_save_is_not_written_again_unchecked() {
+        let (_tmp, mut o, id, symbol_id) = saved_box();
+        let old = o.symbols[&symbol_id].clone();
+        let m = o.mark();
+        widen_box(&mut o, &id);
+        o.back_to(m).unwrap();
+        // The checked repair writes the file; a second, unchecked write would fail here.
+        o.fail_symbol_writes = [true].into();
         o.save().unwrap();
         assert_eq!(store::read_vendored_symbol(&o.dir, &symbol_id).unwrap(), old);
     }
