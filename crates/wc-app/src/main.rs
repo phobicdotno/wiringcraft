@@ -7646,6 +7646,27 @@ mod held_tests {
     use super::*;
 
     #[test]
+    fn escape_cancels_what_is_in_progress_then_clears_the_selection() {
+        let sym = || Selection::Symbol("s1".into());
+        // Another tool: Escape goes back to Select and keeps the selection.
+        let mut ed = Editor::default();
+        ed.tool = Tool::Line;
+        ed.selection = vec![sym()];
+        assert!(ed.escape());
+        assert_eq!(ed.selection, [sym()]);
+        // A shape in progress is cancelled first, nothing else changes.
+        ed.shape_points = vec![wc_core::Point::new(0.0, 0.0)];
+        assert!(!ed.escape());
+        assert!(ed.shape_points.is_empty());
+        assert_eq!(ed.selection, [sym()]);
+        // The Select tool with a selection: Escape clears it; once more, nothing is left to do.
+        ed.tool = Tool::Select;
+        assert!(!ed.escape());
+        assert!(ed.selection.is_empty());
+        assert!(ed.escape());
+    }
+
+    #[test]
     fn rotate_on_a_panel_is_not_held_by_the_page_under_it() {
         let mut project = wc_core::Project::new("x");
         project.pages.push(wc_core::Page::new("p1", "1", "Mains"));

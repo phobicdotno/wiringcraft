@@ -219,8 +219,9 @@ impl Editor {
     }
 
     /// Escape on the canvas: cancel the select-tool drag going on (the canvas takes it back on
-    /// its next frame, #737), else drop the black box, shape or wire being drawn. Returns true
-    /// when there was nothing to drop, and Escape goes back to the Select tool.
+    /// its next frame, #737), else drop the black box, shape or wire being drawn, else clear the
+    /// Select tool's selection (#736). Returns true when there was nothing to drop, and Escape
+    /// goes back to the Select tool.
     pub fn escape(&mut self) -> bool {
         if self.select_dragging() {
             self.cancel_drag = true;
@@ -232,6 +233,8 @@ impl Editor {
             self.message = shape_hint(self.tool, 0).into();
         } else if self.wire.is_some() {
             self.wire = None;
+        } else if self.tool == Tool::Select && !self.selection.is_empty() {
+            self.selection.clear();
         } else {
             return true;
         }
