@@ -1133,13 +1133,14 @@ fn a_spline_fitted_polyline_keeps_its_fit_vertices_without_its_control_ones() ->
     Ok(())
 }
 
-/// A classic 2D polyline keeps the bulge each vertex stores after its widths: from (0, 0) to
-/// (10, 0) with bulge 1 is a half circle, with bulge 0 a straight line. A negative start width
-/// (one width for both ends) has no end width after it, and the bulge is still found.
+/// A classic 2D polyline keeps the bulge each vertex stores after its widths, in the drawing and
+/// on the page made from it: from (0, 0) to (10, 0) with bulge 1 is a half circle, with bulge 0
+/// a straight line. A negative start width (one width for both ends) has no end width after it,
+/// and the bulge is still found.
 #[test]
 fn a_classic_polyline_keeps_the_bulges_of_its_vertices() -> TestResult {
     let v = Version::R2010;
-    let polyline = |bulge: f64, start_width: f64| -> std::result::Result<Drawing, Box<dyn std::error::Error>> {
+    let polyline = |bulge: f64, start_width: f64| {
         let mut objs = vec![
             entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
             entry(v, LAYER, LAYER_H, "0"),
@@ -1166,21 +1167,35 @@ fn a_classic_polyline_keeps_the_bulges_of_its_vertices() -> TestResult {
             objs.push(vx);
         }
         objs.push(entity(v, 6, 0x103, head(Some(0x100))));
-        Ok(drawing(&sections(v, &objs, &[]))?)
+        sections(v, &objs, &[])
+    };
+    // Both in the drawing read and on the page made from it.
+    let shapes = |s: &Sections| -> std::result::Result<[Vec<Point>; 2], Box<dyn std::error::Error>> {
+        let d = drawing(s)?;
+        let page = crate::dwg::page_of(s, 1.0, &Default::default())?;
+        let [Shape::Polyline { points: a, .. }] = d.model.as_slice() else {
+            unreachable!("{:?} {:?}", d.model, d.skipped);
+        };
+        let [Shape::Polyline { points: b, .. }] = page.graphics.as_slice() else {
+            unreachable!("{:?} {:?}", page.graphics, page.warnings);
+        };
+        Ok([a.clone(), b.clone()])
+    };
+    let height = |p: &[Point]| {
+        let ys = p.iter().map(|p| p.y);
+        ys.clone().fold(f64::MIN, f64::max) - ys.fold(f64::MAX, f64::min)
     };
     for width in [0.0, -0.5] {
-        let d = polyline(1.0, width)?;
-        let [Shape::Polyline { points, .. }] = d.model.as_slice() else {
-            unreachable!("{:?} {:?}", d.model, d.skipped);
-        };
-        let top = points.iter().map(|p| p.y.abs()).fold(0.0, f64::max);
-        assert!(points.len() > 2 && (top - 5.0).abs() < 0.1, "width {width}: {points:?}");
-        let d = polyline(0.0, width)?;
-        let [Shape::Polyline { points, .. }] = d.model.as_slice() else {
-            unreachable!("{:?} {:?}", d.model, d.skipped);
-        };
-        assert_eq!(points.len(), 2, "width {width}: {points:?}");
-        assert!(points.iter().all(|p| p.y == 0.0), "width {width}: {points:?}");
+        for points in shapes(&polyline(1.0, width))? {
+            assert!(
+                points.len() > 2 && (height(&points) - 5.0).abs() < 0.1,
+                "width {width}: {points:?}"
+            );
+        }
+        for points in shapes(&polyline(0.0, width))? {
+            assert_eq!(points.len(), 2, "width {width}: {points:?}");
+            assert!(height(&points).abs() < 1e-9, "width {width}: {points:?}");
+        }
     }
     Ok(())
 }
