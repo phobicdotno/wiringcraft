@@ -218,7 +218,7 @@ For the other areas, the chapter to read in each help is:
 | PDF export with links and layers | yes | yes | yes | done |
 | DXF / SVG export | yes (DXF/DWG) | yes (DWG/DXF) | yes | done |
 | DXF import: ELLIPSE, SPLINE, HATCH | yes | yes | yes: sampled curves, solid hatches filled | done |
-| DWG read and write | yes | yes | read: AutoCAD 2004, 2007 and 2010 drawings, for SolidWorks Electrical symbols and pages; no write | read done (#161, #162, #163, #215); 2013 and 2018 drawings todo (#292, open PR #299); write not planned, DXF covers it |
+| DWG read and write | yes | yes | read: AutoCAD 2004 to 2018 drawings (AC1018 to AC1032; later releases still save in the 2018 format), for SolidWorks Electrical symbols and pages; no write | read done (#161, #162, #163, #215, #292); write not planned, DXF covers it |
 | Import EPLAN projects | - | yes (some) | yes | done |
 | Import SolidWorks Electrical projects | no | - | yes | done; library parts, cable types and symbol blocks with `import swe-library` (#62, blocks drawn from their DWG files #59); cabinet layouts as panels (#60, footprints sized from the catalog part #149); symbol and page graphics from the DWG files (#163, stretched circles and arcs as ellipses #307); cover page and title block data, with the project's revision and checked by (#61, #170); terminal strips and wire ends (#70) and their jumpers (#108, #247) |
 | PDF trace import (turn a PDF drawing into a page) | partly | no | yes | done |

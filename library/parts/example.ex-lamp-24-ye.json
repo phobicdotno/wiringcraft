@@ -1,0 +1,12 @@
+{
+  "description": "Indicator lamp yellow 24 V (example data)",
+  "id": "example.ex-lamp-24-ye",
+  "manufacturer": "Example",
+  "order_number": "EX-LAMP-24-YE",
+  "properties": {
+    "Coil voltage": "24 V",
+    "Colour": "Yellow",
+    "Mounting": "Door"
+  },
+  "symbol": "wc.lamp"
+}

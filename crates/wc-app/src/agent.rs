@@ -204,6 +204,7 @@ fn point_list() -> Value {
 /// Every tool the assistant has.
 pub fn specs() -> Vec<Value> {
     let actions: Vec<String> = Action::ALL.iter().map(|a| a.name()).collect();
+    let reports: Vec<&str> = wc_report::Kind::ALL.iter().map(|k| k.name()).collect();
     vec![
         tool(
             "get_state",
@@ -291,13 +292,13 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "update_graphic",
-            "Replace a free drawing (line, polyline, rect, circle, arc, text) by its id from get_page (g0, g1 ...). Ids are positions: a write is refused when the page's drawings changed since get_page, so read it again then.",
+            "Replace a free drawing (line, polyline, rect, circle, arc, text, dimension) by its id from get_page (g0, g1 ...). Ids are positions: a write is refused when the page's drawings changed since get_page, so read it again then.",
             json!({"id": {"type": "string"}, "shape": shape_arg(), "page": page_arg()}),
             &["id", "shape"],
         ),
         tool(
             "add_graphic",
-            "Add a free drawing to a page: a line, polyline, rectangle, circle, arc or text (labels, notes, frames, boxes around a group).",
+            "Add a free drawing to a page: a line, polyline (closed or filled), rectangle, circle, arc, text (labels, notes, frames, boxes around a group) or dimension (a measured distance in mm with arrows and extension lines).",
             json!({"shape": shape_arg(), "page": page_arg()}),
             &["shape"],
         ),
@@ -415,6 +416,15 @@ pub fn specs() -> Vec<Value> {
             &[],
         ),
         tool(
+            "plc_racks",
+            "PLC racks and the I/O cards in their slots, as the PLC racks form edits them (kept in project.toml, laid out on the PLC cards report). get returns them as JSON: a list of racks, each with name, description and card (its cards: slot, tag, type, channels, start address such as %IX0.0 or %IW64, and step when the channels are numbered with a step of their own). replace sets the whole list (in get's format; an empty list removes every rack) as one undo step, and answers with the PLC cards report's warnings about the result.",
+            json!({
+                "action": {"type": "string", "enum": ["get", "replace"]},
+                "racks": {"type": "array", "items": {"type": "object"}, "description": "replace: every rack, as get returns them."}
+            }),
+            &["action"],
+        ),
+        tool(
             "jumpers",
             "Jumpers bridging terminals of one strip: list them (strip, terminals in strip order, part), add (jumper the terminals of a strip together; a jumper that shares a terminal is merged), remove (take the terminals out of their jumpers; one left with fewer than two terminals goes), or part (give the jumper holding a terminal a part id from the project or its libraries; an empty part clears it).",
             json!({
@@ -477,7 +487,7 @@ pub fn specs() -> Vec<Value> {
         tool(
             "get_report",
             "A report as a Markdown table.",
-            json!({"kind": {"type": "string", "enum": ["contents", "parts", "devices", "wires", "nets", "terminals", "cables", "plc", "locations"]}}),
+            json!({"kind": {"type": "string", "enum": reports}}),
             &["kind"],
         ),
         tool(
@@ -500,8 +510,14 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "export",
-            "Export into the project's export folder: pdf (all pages and reports), drawings (SVG and DXF per page) or aml (AutomationML).",
-            json!({"format": {"type": "string", "enum": ["pdf", "drawings", "aml"]}}),
+            "Export into the project's export folder: pdf (all pages and reports), drawings (SVG and DXF per page), aml (AutomationML), wago-marking (WAGO smartScript marker list CSV) or wago-configurator (terminal strips as a WAGO configurator article list CSV).",
+            json!({
+                "format": {"type": "string", "enum": ["pdf", "drawings", "aml", "wago-marking", "wago-configurator"]},
+                "lang": {"type": "string", "description": "pdf: print the texts in this language from translations.toml, e.g. \"nb\", or two as \"nb,en\" (default: as drawn). wago-marking: language of the header row and type column: en (default), de or nb."},
+                "kinds": {"type": "array", "items": {"type": "string", "enum": ["terminals", "wires", "devices", "cables"]}, "description": "wago-marking: only these marker kinds (default: all)."},
+                "lines": {"type": "array", "items": {"type": "string", "enum": ["marker", "tag", "description", "location"]}, "description": "wago-marking: the text lines of each marker, one column each (default: marker)."},
+                "strip": {"type": "string", "description": "wago-marking: only this terminal strip's terminals, e.g. \"-X1\"."}
+            }),
             &["format"],
         ),
         tool(
@@ -533,7 +549,17 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "run_command",
-            "Run a wiringcraft command-line command on the open project (unsaved changes are saved first, and the project is reloaded after). Covers everything: page, place, wire, device, number-wires, library (add, sync, status, update, lock, search, propose), import (DXF/SVG/KiCad/QElectroTech symbols, parts CSV and BMEcat, PLC address CSV, archives, DWG, PDF, Eplan and SolidWorks Electrical projects), pdf, drawing, report, nets, aml, plc-vars, check, inspect, vcs (commit, branch, switch, merge, history, page-log), comment, panel (new, arrange, step, list, remove). Use [\"--help\"] to list commands.",
+            "Run a wiringcraft command-line command on the open project (unsaved changes are saved first, and the project is reloaded after). Covers everything. \
+             Project and pages: new (a project folder, --template), page (add, list, remove, overview, size, cover, fields), template (show, columns, reset: frame columns and title block), logo (show, set, remove), location (list, set, remove). \
+             Drawing: place, box (a black box with connection points, --pin name:side:offset), wire, device (part, description), number-wires, macro (list, place), find (text in pages, --replace, --match-case). \
+             Terminals: strip (list, order, move, spare, unspare, level), jumper (add, remove, part, list). \
+             Revisions: revision (list, add, edit, remove, cloud, uncloud, table). \
+             Panels: panel (new, arrange, step, device, show, list, remove). \
+             Libraries: lib (add, sync, status, update, lock, search, propose). \
+             Import: import (symbol-dxf, symbol-svg, symbol-kicad, symbol-qet, footprint-dxf, model-step, parts-csv, parts-bmecat, parts-edz, plc-csv, wago, archive, page-dxf, page-dwg, pdf, eplan, swe, swe-library, aml). \
+             Output: pdf (--page, --report, --lang for a translated print), drawing (SVG/DXF per page), report, nets, aml, plc-vars, export (wago-marking, wago-configurator), translations (texts missing a translation, --lang). \
+             Checks and history: check, inspect (another tool's archive), vcs (init, commit, branch, switch, merge, log, changes, page-log), comment (add, reply, resolve, reopen, remove, list). \
+             Use [\"--help\"] or [\"<command>\", \"--help\"] for the arguments.",
             json!({"args": {"type": "array", "items": {"type": "string"}, "description": "Arguments, e.g. [\"plc-vars\", \"export/io.st\"]. The project folder is passed for you."}}),
             &["args"],
         ),
@@ -558,8 +584,8 @@ pub fn specs() -> Vec<Value> {
 fn shape_arg() -> Value {
     json!({
         "type": "object",
-        "description": "{\"kind\": \"line\", \"a\": {x,y}, \"b\": {x,y}} | {\"kind\": \"polyline\", \"points\": [...], \"closed\": bool} | {\"kind\": \"rect\", \"min\": {x,y}, \"max\": {x,y}} | {\"kind\": \"circle\", \"center\": {x,y}, \"radius\": r, \"filled\": bool} | {\"kind\": \"arc\", \"center\": {x,y}, \"radius\": r, \"start\": deg, \"end\": deg} | {\"kind\": \"text\", \"at\": {x,y}, \"text\": \"...\", \"height\": 2.5, \"align\": \"left|center|right\", \"angle\": deg}",
-        "properties": {"kind": {"type": "string", "enum": ["line", "polyline", "rect", "circle", "arc", "text"]}},
+        "description": "{\"kind\": \"line\", \"a\": {x,y}, \"b\": {x,y}} | {\"kind\": \"polyline\", \"points\": [...], \"closed\": bool, \"filled\": bool (solid, implies closed)} | {\"kind\": \"rect\", \"min\": {x,y}, \"max\": {x,y}} | {\"kind\": \"circle\", \"center\": {x,y}, \"radius\": r, \"filled\": bool} | {\"kind\": \"arc\", \"center\": {x,y}, \"radius\": r, \"start\": deg, \"end\": deg} | {\"kind\": \"text\", \"at\": {x,y}, \"text\": \"...\", \"height\": 2.5, \"align\": \"left|center|right\", \"angle\": deg} | {\"kind\": \"dimension\", \"a\": {x,y}, \"b\": {x,y}, \"offset\": mm (dimension line to the left of a to b, negative: right), \"height\": 2.5}",
+        "properties": {"kind": {"type": "string", "enum": ["line", "polyline", "rect", "circle", "arc", "text", "dimension"]}},
         "required": ["kind"]
     })
 }
@@ -630,6 +656,24 @@ fn strings(v: &Value, key: &str) -> Vec<String> {
         .and_then(Value::as_array)
         .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect())
         .unwrap_or_default()
+}
+
+/// A list of strings under `key`: left out (or null) is empty, anything else but strings is an
+/// error that names the value.
+fn string_list(v: &Value, key: &str) -> Result<Vec<String>, String> {
+    let Some(items) = v.get(key).filter(|x| !x.is_null()) else {
+        return Ok(Vec::new());
+    };
+    items
+        .as_array()
+        .ok_or_else(|| format!("`{key}` must be a list of strings, not {items}."))?
+        .iter()
+        .map(|x| {
+            x.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("`{key}` holds {x}, which is not a string in quotes."))
+        })
+        .collect()
 }
 
 fn rotation(v: &Value) -> Result<Option<Rotation>, String> {
@@ -1143,6 +1187,7 @@ impl wc_agent::Tools for AppTools<'_> {
             "get_report" => format!("Read the {} report", s(input, "kind").unwrap_or_default()),
             "get_page" => format!("Looked at page {}", s(input, "page").unwrap_or("shown")),
             "find_symbols" | "find_parts" => format!("Searched {:?}", s(input, "query").unwrap_or_default()),
+            "plc_racks" => format!("PLC racks: {}", s(input, "action").unwrap_or_default()),
             _ => name.replace('_', " "),
         }
     }
@@ -1741,6 +1786,7 @@ impl App {
                 })))
             }
             "set_template" => self.tool_set_template(v),
+            "plc_racks" => self.tool_plc_racks(v),
             "comments" => self.tool_comments(v),
             "jumpers" => self.tool_jumpers(v),
             "strips" => self.tool_strips(v),
@@ -1825,9 +1871,33 @@ impl App {
             "export" => {
                 let open = need_open(self.open.as_mut())?;
                 Ok(match need_s(v, "format")? {
-                    "pdf" => crate::export_pdf(open),
+                    "pdf" => match s(v, "lang").map(str::trim).filter(|l| !l.is_empty()) {
+                        None => crate::export_pdf(open),
+                        Some(l) => crate::export_pdf_in(
+                            open,
+                            &wc_core::translate::parse_languages(l).ok_or_else(|| {
+                                format!("Bad language {l:?}: use a code such as nb, or two as nb,en.")
+                            })?,
+                        ),
+                    },
                     "drawings" => crate::export_drawings(open),
                     "aml" => crate::export_aml(open),
+                    "wago-marking" => {
+                        let lang = s(v, "lang").unwrap_or("en");
+                        let options = wc_report::MarkingOptions {
+                            kinds: wc_report::parse_kinds(&string_list(v, "kinds")?)?,
+                            lines: wc_report::parse_lines(&string_list(v, "lines")?)?,
+                            language: wc_report::Language::parse(lang)
+                                .ok_or_else(|| format!("Unknown language {lang:?} (en, de, nb)."))?,
+                            strip: s(v, "strip")
+                                .map(str::trim)
+                                .filter(|x| !x.is_empty())
+                                .map(str::to_owned),
+                            ..Default::default()
+                        };
+                        crate::export_wago_marking(open, &options)
+                    }
+                    "wago-configurator" => crate::export_wago_configurator(open),
                     f => return Err(format!("Unknown format {f}.")),
                 })
             }
@@ -2332,6 +2402,35 @@ impl App {
         open.checkpoint();
         open.project.meta.template = t;
         Ok("Template set.".into())
+    }
+
+    /// The PLC racks form for the assistant: the same range checks, and the same warnings
+    /// the form shows under it.
+    fn tool_plc_racks(&mut self, v: &Value) -> Result<String, String> {
+        let open = need_open(self.open.as_mut())?;
+        match need_s(v, "action")? {
+            "get" => serde_json::to_string_pretty(&open.project.meta.racks).map_err(|e| e.to_string()),
+            "replace" => {
+                let racks: Vec<wc_core::plc_rack::PlcRack> =
+                    serde_json::from_value(v.get("racks").cloned().ok_or("replace needs racks")?)
+                        .map_err(|e| format!("racks: {e}"))?;
+                if let Some(why) = crate::racks_form::problem(&racks) {
+                    return Err(format!("The racks were not changed: {why}."));
+                }
+                if racks == open.project.meta.racks {
+                    return Ok("The racks are already like that.".into());
+                }
+                open.checkpoint();
+                open.project.meta.racks = racks;
+                let warnings = crate::rack_warnings(open);
+                Ok(if warnings.is_empty() {
+                    "Racks set.".into()
+                } else {
+                    format!("Racks set. Warnings:\n{}", warnings.join("\n"))
+                })
+            }
+            other => Err(format!("Unknown action {other:?}: use get or replace.")),
+        }
     }
 
     fn tool_comments(&mut self, v: &Value) -> Result<String, String> {
@@ -3723,6 +3822,55 @@ mod tests {
     }
 
     #[test]
+    fn the_assistant_reads_and_replaces_the_plc_racks_as_one_undo_step() {
+        let (_tmp, mut a) = app(vec![]);
+        let read = |a: &mut App| -> Value {
+            serde_json::from_str(&call(a, "plc_racks", json!({"action": "get"})).unwrap()).unwrap()
+        };
+        assert_eq!(read(&mut a), json!([]));
+        let mark = a.open.as_ref().unwrap().undo_mark();
+
+        // Numbers the form would not take, and racks that are not racks, change nothing.
+        for bad in [
+            json!({"action": "replace"}),
+            json!({"action": "replace", "racks": "none"}),
+            json!({"action": "replace", "racks": [{"name": "-A1", "card": [{"slot": 1000, "start": "%IX0.0"}]}]}),
+            json!({"action": "replace", "racks": [{"name": "-A1", "card": [{"slot": 1, "channels": 257}]}]}),
+            json!({"action": "replace", "racks": [{"name": "-A1", "card": [{"slot": 1, "step": 0}]}]}),
+            json!({"action": "rename"}),
+        ] {
+            assert!(call(&mut a, "plc_racks", bad.clone()).is_err(), "{bad}");
+        }
+        assert_eq!(read(&mut a), json!([]));
+        assert_eq!(a.open.as_ref().unwrap().undo_mark(), mark);
+
+        // A rack with two cards, one without its start address: set, with the form's warning.
+        let racks = json!([{"name": "-A1", "description": "Main PLC", "card": [
+            {"slot": 1, "tag": "-A1.DI1", "type": "DI 16x24 V DC", "channels": 16, "start": "%IX0.0"},
+            {"slot": 2, "type": "AI 4x 4-20 mA", "channels": 4, "start": ""}
+        ]}]);
+        let said = call(&mut a, "plc_racks", json!({"action": "replace", "racks": racks})).unwrap();
+        assert!(said.contains("Warnings"), "{said}");
+        let got = read(&mut a);
+        assert_eq!(got[0]["name"], json!("-A1"));
+        assert_eq!(got[0]["card"][0]["type"], json!("DI 16x24 V DC"));
+        assert_eq!(got[0]["card"].as_array().map(Vec::len), Some(2));
+        assert_eq!(a.open.as_ref().unwrap().undo_mark(), mark + 1);
+        // The same racks again is no new step.
+        call(&mut a, "plc_racks", json!({"action": "replace", "racks": got.clone()})).unwrap();
+        assert_eq!(a.open.as_ref().unwrap().undo_mark(), mark + 1);
+
+        assert!(a.open.as_mut().unwrap().undo());
+        assert_eq!(read(&mut a), json!([]));
+        assert!(a.open.as_mut().unwrap().redo());
+        assert_eq!(read(&mut a), got);
+
+        // An empty list removes every rack.
+        call(&mut a, "plc_racks", json!({"action": "replace", "racks": []})).unwrap();
+        assert_eq!(read(&mut a), json!([]));
+    }
+
+    #[test]
     fn the_assistant_lists_adds_removes_and_gives_parts_to_jumpers() {
         let (_tmp, mut a) = app(vec![]);
         let list = |a: &mut App| -> Value {
@@ -4714,6 +4862,71 @@ mod tests {
     }
 
     #[test]
+    fn add_graphic_draws_a_dimension_and_a_filled_polyline() {
+        let (_tmp, mut a) = app(vec![]);
+        let spec = specs().into_iter().find(|t| t["name"] == "add_graphic").unwrap();
+        let kinds = &spec["input_schema"]["properties"]["shape"]["properties"]["kind"]["enum"];
+        assert!(kinds.as_array().unwrap().iter().any(|k| k == "dimension"));
+        let dimension = json!({"kind": "dimension", "a": {"x": 10, "y": 20}, "b": {"x": 50, "y": 20}, "offset": 8});
+        call(&mut a, "add_graphic", json!({"page": "p0002", "shape": dimension})).unwrap();
+        let arrow = json!({"kind": "polyline", "points": [{"x": 0, "y": 0}, {"x": 4, "y": 1}, {"x": 0, "y": 2}], "filled": true});
+        call(&mut a, "add_graphic", json!({"page": "p0002", "shape": arrow})).unwrap();
+        let graphics = &a.open.as_ref().unwrap().project.pages[1].graphics;
+        assert_eq!(
+            graphics[graphics.len() - 2],
+            Shape::Dimension {
+                a: Point::new(10.0, 20.0),
+                b: Point::new(50.0, 20.0),
+                offset: 8.0,
+                height: 2.5,
+            }
+        );
+        assert!(matches!(
+            graphics[graphics.len() - 1],
+            Shape::Polyline { filled: true, .. }
+        ));
+    }
+
+    /// `run_command`'s description names every top-level command of the command line, so the
+    /// assistant knows each one exists (the names come from `enum Cmd` in wc-cli's main.rs).
+    #[test]
+    fn run_command_names_every_command_line_command() {
+        // A Windows checkout may have CRLF line endings; normalise so the delimiters match.
+        let cli = include_str!("../../wc-cli/src/main.rs").replace("\r\n", "\n");
+        let body = cli.split("\nenum Cmd {\n").nth(1).unwrap();
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let commands: Vec<String> = body
+            .lines()
+            .filter_map(|l| l.strip_prefix("    "))
+            .filter(|l| l.starts_with(|c: char| c.is_ascii_uppercase()))
+            .map(|l| {
+                let name = l.split(|c: char| !c.is_ascii_alphanumeric()).next().unwrap();
+                let mut kebab = String::new();
+                for (i, c) in name.chars().enumerate() {
+                    if c.is_ascii_uppercase() && i > 0 {
+                        kebab.push('-');
+                    }
+                    kebab.push(c.to_ascii_lowercase());
+                }
+                kebab
+            })
+            .collect();
+        assert!(commands.len() >= 30, "only found {commands:?}");
+        let spec = specs().into_iter().find(|t| t["name"] == "run_command").unwrap();
+        let text = spec["description"].as_str().unwrap();
+        let named = |w: &str| {
+            text.match_indices(w).any(|(i, _)| {
+                let before = text[..i].chars().next_back();
+                let after = text[i + w.len()..].chars().next();
+                let edge = |c: Option<char>| c.is_none_or(|c| !c.is_ascii_alphanumeric() && c != '-');
+                edge(before) && edge(after)
+            })
+        };
+        let missing: Vec<&String> = commands.iter().filter(|c| !named(c)).collect();
+        assert!(missing.is_empty(), "run_command does not name {missing:?}");
+    }
+
+    #[test]
     fn a_graphic_named_by_position_is_refused_after_a_sync_reorders_the_page() {
         let line = |x: f64| Shape::Line {
             a: Point::new(x, 0.0),
@@ -5250,6 +5463,85 @@ mod tests {
         let text = String::from_utf8_lossy(&std::fs::read(pdf).unwrap()).into_owned();
         let title: String = "N1 Network PN1".bytes().map(|b| format!("{b:02X}")).collect();
         assert!(text.contains(&format!("/Title <{title}>")));
+    }
+
+    #[test]
+    fn the_assistant_exports_the_wago_lists_and_a_pdf_in_another_language() {
+        let (_tmp, mut a) = app(vec![]);
+        let dir = a.open.as_ref().unwrap().dir.join("export");
+        let m = call(&mut a, "export", json!({"format": "wago-configurator"})).unwrap();
+        assert!(m.starts_with("Nothing exported"), "{m}");
+        let open = a.open.as_mut().unwrap();
+        for (x, tag) in [(20.0, "-X1.2"), (40.0, "-X1.1"), (60.0, "-X2.1")] {
+            let id = open.place(1, "wc.terminal", Point::new(x, 20.0)).unwrap();
+            let s = open.project.pages[1].symbols.iter_mut().find(|s| s.id == id).unwrap();
+            s.tag = Some(wc_core::DeviceTag::parse(tag).unwrap());
+        }
+        let m = call(&mut a, "export", json!({"format": "wago-configurator"})).unwrap();
+        assert!(m.contains("Exported 2 terminal strips (3 rows)"), "{m}");
+        assert!(dir.join("wago-configurator.csv").exists());
+
+        let m = call(
+            &mut a,
+            "export",
+            json!({"format": "wago-marking", "strip": "-X1", "lang": "de", "kinds": ["terminals"], "lines": ["marker", "tag"]}),
+        )
+        .unwrap();
+        assert!(m.starts_with("Exported 2 markers"), "{m}");
+        let csv = std::fs::read_to_string(dir.join("wago-marking--X1.csv")).unwrap();
+        assert!(csv.starts_with("\u{feff}Typ;Gruppe;Zeile 1;Zeile 2;"), "{csv}");
+        let m = call(&mut a, "export", json!({"format": "wago-marking"})).unwrap();
+        assert!(m.starts_with("Exported "), "{m}");
+        assert!(dir.join("wago-marking.csv").exists());
+        assert!(call(&mut a, "export", json!({"format": "wago-marking", "lang": "fr"})).is_err());
+        assert!(call(&mut a, "export", json!({"format": "wago-marking", "kinds": ["lamps"]})).is_err());
+        // A member that is not a string, or a value that is not a list, is refused by name.
+        let err = call(
+            &mut a,
+            "export",
+            json!({"format": "wago-marking", "kinds": ["terminals", 42]}),
+        )
+        .unwrap_err();
+        assert!(err.contains("`kinds` holds 42"), "{err}");
+        let err = call(
+            &mut a,
+            "export",
+            json!({"format": "wago-marking", "lines": ["marker", null]}),
+        )
+        .unwrap_err();
+        assert!(err.contains("`lines` holds null"), "{err}");
+        let err = call(
+            &mut a,
+            "export",
+            json!({"format": "wago-marking", "kinds": "terminals"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("`kinds` must be a list"), "{err}");
+        let err = call(&mut a, "export", json!({"format": "wago-marking", "lines": {"a": 1}})).unwrap_err();
+        assert!(err.contains("`lines` must be a list"), "{err}");
+
+        let project_dir = a.open.as_ref().unwrap().dir.clone();
+        a.open.as_mut().unwrap().project.pages[1].title = "Pumps".into();
+        std::fs::write(
+            project_dir.join(wc_core::translate::TRANSLATIONS_FILE),
+            "source = \"en\"\n\n[[text]]\nen = \"Pumps\"\nnb = \"Pumper\"\n",
+        )
+        .unwrap();
+        assert!(call(&mut a, "export", json!({"format": "pdf", "lang": "nb,en,de"})).is_err());
+        let m = call(&mut a, "export", json!({"format": "pdf", "lang": "nb"})).unwrap();
+        assert!(m.starts_with("Exported"), "{m}");
+        let pdf = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "pdf"))
+            .unwrap();
+        let text = String::from_utf8_lossy(&std::fs::read(pdf).unwrap()).into_owned();
+        let pumper: String = "Pumper".bytes().map(|b| format!("{b:02X}")).collect();
+        assert!(
+            text.contains(&format!("<{pumper}>")),
+            "the page title is printed in Norwegian"
+        );
     }
 
     #[test]
@@ -6242,6 +6534,21 @@ mod tests {
             if let Err(e) = a.agent_tool(&name, &json!({})) {
                 assert!(!e.starts_with("Unknown tool"), "{name}: {e}");
             }
+        }
+    }
+
+    #[test]
+    fn get_report_offers_and_reads_every_report() {
+        let (_tmp, mut a) = app(vec![]);
+        let spec = specs().into_iter().find(|t| t["name"] == "get_report").unwrap();
+        let offered = &spec["input_schema"]["properties"]["kind"]["enum"];
+        for kind in wc_report::Kind::ALL {
+            assert!(
+                offered.as_array().unwrap().iter().any(|k| k == kind.name()),
+                "{} is not offered",
+                kind.name()
+            );
+            call(&mut a, "get_report", json!({"kind": kind.name()})).unwrap();
         }
     }
 
