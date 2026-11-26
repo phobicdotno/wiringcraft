@@ -1943,7 +1943,8 @@ impl Project {
         Some(moved)
     }
 
-    /// `number` as a page may carry it: trimmed, not empty, and not the number of another page.
+    /// `number` as a page may carry it: trimmed, not empty, and not the number of another page
+    /// (blanks around a saved number do not make it another number).
     /// `own` is the id of the page that gets the number, which may keep the number it has;
     /// `None` for a page that is not in the project yet.
     pub fn free_page_number(&self, number: &str, own: Option<&str>) -> Result<String, PageNumberError> {
@@ -1954,7 +1955,7 @@ impl Project {
         match self
             .pages
             .iter()
-            .find(|p| p.number == number && Some(p.id.as_str()) != own)
+            .find(|p| p.number.trim() == number && Some(p.id.as_str()) != own)
         {
             Some(other) => Err(PageNumberError::Taken {
                 number: number.to_owned(),
@@ -2545,6 +2546,14 @@ mod tests {
         assert_eq!(taken.to_string(), "page \"b\" already has number \"2.1\"");
         // A page may keep its own number.
         assert_eq!(p.free_page_number("2.1", Some("b")), Ok("2.1".to_owned()));
+        // A number saved with blanks around it (an older project file) is taken all the same.
+        p.pages.push(Page::new("c", " 4 ", ""));
+        let padded = PageNumberError::Taken {
+            number: "4".into(),
+            page: "c".into(),
+        };
+        assert_eq!(p.free_page_number("4", None), Err(padded));
+        assert_eq!(p.free_page_number("4", Some("c")), Ok("4".to_owned()));
     }
 
     #[test]
