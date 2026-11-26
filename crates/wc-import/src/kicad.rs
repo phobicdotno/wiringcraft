@@ -593,7 +593,8 @@ mod tests {
     (symbol "J_0_1"
       (text "L" (at 0 0 0) (effects (font (size 1.27 1.27)) (justify left)))
       (text "R" (at 0 2 0) (effects (font (size 1.27 1.27)) (justify right bottom)))
-      (text "C" (at 0 4 0) (effects (font (size 1.27 1.27)) (justify top))))
+      (text "C" (at 0 4 0) (effects (font (size 1.27 1.27)) (justify top)))
+      (text "N" (at 0 6 0) (effects (font (size 1.27 1.27)))))
     (symbol "J_1_1" (pin passive line (at 0 0 0) (length 1) (name "~") (number "1")))))"#;
         let (syms, warnings) = symbols(lib, "k", 1.0)?;
         assert_eq!(syms.len(), 1, "{warnings:?}");
@@ -608,7 +609,12 @@ mod tests {
             .collect();
         assert_eq!(
             aligns,
-            vec![("L", Align::Left), ("R", Align::Right), ("C", Align::Center)]
+            vec![
+                ("L", Align::Left),
+                ("R", Align::Right),
+                ("C", Align::Center),
+                ("N", Align::Center)
+            ]
         );
         Ok(())
     }
