@@ -162,6 +162,24 @@ fn split_important(v: &str) -> (&str, bool) {
     }
 }
 
+/// Elements whose content a browser never draws in place: definitions, markers, clip paths,
+/// masks and patterns. A `<symbol>` is drawn only through `<use>`, which is not imported.
+const NOT_DRAWN: [&str; 6] = ["defs", "symbol", "marker", "clipPath", "mask", "pattern"];
+
+/// Whether an element is drawn at all, and whether it is visible, from its parent's
+/// `(drawn, visible)`. `display:none` and the containers in [`NOT_DRAWN`] hide everything under
+/// them for good; `visibility` is passed down like a fill, so a child can set `visible` again.
+fn shown(e: &BytesStart, tag: &str, (drawn, visible): (bool, bool)) -> (bool, bool) {
+    let value = |name| presentation(e, name).map(|v| split_important(&v).0.trim().to_ascii_lowercase());
+    let drawn = drawn && !NOT_DRAWN.contains(&tag) && value("display").as_deref() != Some("none");
+    let visible = match value("visibility").as_deref() {
+        Some("hidden" | "collapse") => false,
+        Some("visible") => true,
+        _ => visible,
+    };
+    (drawn, visible)
+}
+
 /// Whether a fill paints the shape: not `none`, `transparent` or white (`#fff`, `white`,
 /// `rgb(255,255,255)`, `rgb(100%,100%,100%)`). No fill, or `inherit`, takes the parent's answer.
 /// A trailing `!important` is ignored.
@@ -531,6 +549,8 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
     // Whether each open element's fill paints, passed to its children; kept in step with `stack`.
     // A bool, not the fill text, so deep nesting under a long fill value keeps no copies of it.
     let mut fills: Vec<bool> = vec![false];
+    // `(drawn, visible)` of each open element (see [`shown`]); kept in step with `stack`.
+    let mut shows: Vec<(bool, bool)> = vec![(true, true)];
     let mut shapes = Vec::new();
     let mut pins: Vec<(Option<String>, Point)> = Vec::new();
     let mut pending_text: Option<(Point, f64, Align)> = None;
@@ -549,6 +569,7 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                 if stack.len() > 1 {
                     stack.pop();
                     fills.pop();
+                    shows.pop();
                 }
                 (None, false)
             }
@@ -602,6 +623,16 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                     m = m.mul(&M([s, 0.0, 0.0, s, -vbn[0] * s, -vbn[1] * s]));
                 }
             }
+        }
+        let show = shown(&e, &tag, shows.last().copied().unwrap_or((true, true)));
+        if show != (true, true) {
+            // Hidden: no shapes, pins or text, but its children still need its state.
+            if !empty {
+                stack.push(m);
+                fills.push(filled);
+                shows.push(show);
+            }
+            continue;
         }
         let pin_name = attr(&e, "data-pin")
             .or_else(|| attr(&e, "id").and_then(|i| i.strip_prefix("pin:").map(str::to_owned)))
@@ -739,6 +770,7 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
         if !empty {
             stack.push(m);
             fills.push(filled);
+            shows.push(show);
         }
     }
     if !seen_root {
@@ -1122,6 +1154,44 @@ mod tests {
             <rect width="1" height="1" fill="inherit"/>
         </svg>"##;
         assert_eq!(fills_of(svg)?, vec![false, true, false, true, false]);
+        Ok(())
+    }
+
+    #[test]
+    fn defs_markers_and_hidden_groups_are_skipped() -> Result<()> {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg">
+            <defs>
+                <circle cx="5" cy="5" r="2"/>
+                <path d="M0 0 L9 9"/>
+                <marker id="arrow"><path d="M0 0 L2 1 L0 2 Z" fill="black"/></marker>
+            </defs>
+            <defs/>
+            <line x1="0" y1="0" x2="10" y2="0"/>
+            <g display="none"><line x1="0" y1="1" x2="10" y2="1"/><circle data-pin="1" r="1"/></g>
+            <g style="display: none"><g><text x="0" y="0">Hidden</text></g></g>
+            <symbol id="s"><rect width="3" height="3"/></symbol>
+            <clipPath id="c"><rect width="4" height="4"/></clipPath>
+            <mask id="m"><rect width="5" height="5"/></mask>
+            <pattern id="p"><rect width="6" height="6"/></pattern>
+            <rect width="7" height="7" display="none"/>
+            <g display="none"><g display="inline"><line x1="0" y1="2" x2="10" y2="2"/></g></g>
+            <line x1="0" y1="3" x2="10" y2="3" visibility="hidden"/>
+            <g style="visibility:hidden"><line x1="0" y1="4" x2="10" y2="4"/></g>
+            <g visibility="hidden"><line x1="0" y1="5" x2="10" y2="5" visibility="visible"/></g>
+            <line x1="0" y1="6" x2="10" y2="6"/>
+        </svg>"##;
+        let s = symbol(svg, "svg.hidden", "Hidden")?;
+        assert!(s.pins.is_empty(), "pin in a hidden group: {:?}", s.pins);
+        // Only the visible lines come in; anything else shows up as NaN.
+        let ys: Vec<f64> = s
+            .graphics
+            .iter()
+            .map(|g| match g {
+                Shape::Line { a, .. } => a.y,
+                _ => f64::NAN,
+            })
+            .collect();
+        assert_eq!(ys, vec![0.0, 5.0, 6.0], "{:?}", s.graphics);
         Ok(())
     }
 
