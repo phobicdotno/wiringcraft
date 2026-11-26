@@ -552,14 +552,14 @@ impl Action {
             ),
             Action::ImportPlcCsv => i(
                 "PLC addresses",
-                "Import PLC addresses from a CSV list (device and address columns) onto the project's devices",
+                "Import PLC addresses from a CSV or Excel list (device and address columns) onto the project's devices",
                 Icon::Open,
                 "",
             ),
             Action::ImportPdf => i("PDF pages", "Import PDF pages as trace pages", Icon::Pdf, ""),
             Action::ImportArchive => i(
                 "Project archive",
-                "Import the PDF, DXF, AutomationML and CSV files of another tool's project archive",
+                "Import the PDF, DXF, AutomationML, CSV and Excel files of another tool's project archive",
                 Icon::Open,
                 "",
             ),
@@ -577,7 +577,7 @@ impl Action {
             ),
             Action::ImportPartsCsv => i(
                 "Parts from CSV",
-                "Import parts from a CSV list into a library folder",
+                "Import parts from a CSV or Excel list into a library folder",
                 Icon::Library,
                 "",
             ),

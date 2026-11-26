@@ -3020,6 +3020,16 @@ impl Open {
         self.project.meta.rules = rules;
     }
 
+    /// Replace the project's `rules_off` (the library check rules it turns off). One undo
+    /// step; nothing changes when it is the same.
+    pub fn set_rules_off(&mut self, off: Vec<String>) {
+        if off == self.project.meta.rules_off {
+            return;
+        }
+        self.checkpoint();
+        self.project.meta.rules_off = off;
+    }
+
     /// Keep `layout` as the project's layout for report `kind`, in place of its first one
     /// (later ones for the kind are left, unused, for [`wc_report::layout_warnings`] to name);
     /// `None` drops every one of the kind, so the report is built in. One undo step; nothing

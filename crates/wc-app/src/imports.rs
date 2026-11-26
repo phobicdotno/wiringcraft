@@ -55,12 +55,12 @@ impl Kind {
             Kind::Aml => "Import AutomationML",
             Kind::PageDwg => "Import a DWG drawing onto the current page",
             Kind::PageDxf => "Import a DXF drawing onto the current page",
-            Kind::PlcCsv => "Import PLC addresses from a CSV list",
+            Kind::PlcCsv => "Import PLC addresses from a CSV or Excel list",
             Kind::Pdf => "Import PDF pages",
             Kind::Archive => "Import another tool's project archive",
             Kind::PartsEdz => "Import parts from an EDZ file",
             Kind::PartsBmecat => "Import parts from a BMEcat catalogue",
-            Kind::PartsCsv => "Import parts from a CSV list",
+            Kind::PartsCsv => "Import parts from a CSV or Excel list",
         }
     }
 
@@ -73,12 +73,12 @@ impl Kind {
             Kind::Aml => ("AutomationML", &["aml", "xml"]),
             Kind::PageDwg => ("DWG drawing", &["dwg"]),
             Kind::PageDxf => ("DXF drawing", &["dxf"]),
-            Kind::PlcCsv => ("CSV list", &["csv", "txt"]),
+            Kind::PlcCsv => ("CSV or Excel list", &["csv", "txt", "xlsx"]),
             Kind::Pdf => ("PDF", &["pdf"]),
             Kind::Archive => ("Project archive", &["zip"]),
             Kind::PartsEdz => ("EPLAN Data Exchange", &["edz"]),
             Kind::PartsBmecat => ("BMEcat catalogue", &["xml"]),
-            Kind::PartsCsv => ("CSV list", &["csv", "txt"]),
+            Kind::PartsCsv => ("CSV or Excel list", &["csv", "txt", "xlsx"]),
         }
     }
 
@@ -211,6 +211,10 @@ fn app_wording(text: &str) -> String {
             "the app does not import these from an archive yet",
         ),
         ("; run `wiringcraft inspect` to see what is there", ""),
+        (
+            ": use -C <folder> or create one with wiringcraft new <folder>",
+            ": open the project again, or another one",
+        ),
     ];
     let mut out = text.to_owned();
     for (cli, app) in SAID {
@@ -325,7 +329,8 @@ mod tests {
             "page pdf-200 exists; pick another --first-page",
             "no project 2 in the archive (use --pick)",
             "warning: a.kicad_sym: KiCad symbols, not imported: pass --lib <folder>",
-            "no importable PDF, DXF, AutomationML, KiCad symbols or CSV lists inside; run `wiringcraft inspect` to see what is there",
+            "no importable PDF, DXF, AutomationML, KiCad symbols, CSV lists or Excel lists inside; run `wiringcraft inspect` to see what is there",
+            "no WiringCraft project in /tmp/x (no project.toml): use -C <folder> or create one with wiringcraft new <folder>",
         ] {
             let app = app_wording(said);
             assert!(!app.contains("remove it or"), "{app}");

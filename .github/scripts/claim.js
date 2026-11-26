@@ -259,11 +259,24 @@ async function handleComment({ github, context, now = Date.now() }) {
   return backlog({ github, context, now });
 }
 
-/** Post a note on a pull request once: skipped when a bot note with the same key is there. */
-async function noteOnce(github, owner, repo, number, key, text) {
+/** A warning in the run log (an annotation in GitHub Actions) that does not fail the run. */
+function warn(log, text) {
+  (log || ((t) => console.log(`::warning::${t}`)))(text);
+}
+
+/**
+ * Post a note on a pull request once: skipped when a bot note with the same key is there. A note is
+ * a courtesy: when GitHub refuses it (permissions, rate limit) the failure is logged, not thrown,
+ * so it never fails the claim itself.
+ */
+async function noteOnce(github, owner, repo, number, key, text, log) {
   const tag = `<!-- ${MARK}-note ${key} -->`;
-  if ((await comments(github, owner, repo, number)).some((c) => isClaimBot(c) && String(c.body).includes(tag))) return;
-  await github.rest.issues.createComment({ owner, repo, issue_number: number, body: `${text}\n\n${tag}` });
+  try {
+    if ((await comments(github, owner, repo, number)).some((c) => isClaimBot(c) && String(c.body).includes(tag))) return;
+    await github.rest.issues.createComment({ owner, repo, issue_number: number, body: `${text}\n\n${tag}` });
+  } catch (e) {
+    warn(log, `PR #${number}: could not post note ${key}: ${e.message || e}`);
+  }
 }
 
 /**
@@ -271,7 +284,7 @@ async function noteOnce(github, owner, repo, number, key, text) {
  * activity (`updated_at`: pushes, edits), so the result does not depend on which event or run
  * computes it, and an event GitHub dropped from the queue loses nothing.
  */
-async function claimForPull({ github, owner, repo, pr, now }) {
+async function claimForPull({ github, owner, repo, pr, now, log }) {
   const refs = parseRefs(pr.title, pr.body);
   if (!refs.length) return [];
   if (!(await canWrite(github, owner, repo, pr.user && pr.user.login, pr.author_association))) {
@@ -280,7 +293,7 @@ async function claimForPull({ github, owner, repo, pr, now }) {
   const agent = parseAgent(pr.body) || (AGENT.test(pr.head.ref) ? pr.head.ref : null);
   if (!agent) {
     await noteOnce(github, owner, repo, pr.number, 'no-agent',
-      `The branch name \`${pr.head.ref}\` cannot be an agent name; add a line \`Agent: <name>\` to the description to claim ${refs.map((n) => `#${n}`).join(', ')}.`);
+      `The branch name \`${pr.head.ref}\` cannot be an agent name; add a line \`Agent: <name>\` to the description to claim ${refs.map((n) => `#${n}`).join(', ')}.`, log);
     return refs.map((n) => `#${n} no agent`);
   }
   const until = (Date.parse(pr.updated_at || '') || now) + DEFAULT_HOURS * HOUR;
@@ -298,7 +311,7 @@ async function claimForPull({ github, owner, repo, pr, now }) {
     const state = readState(await comments(github, owner, repo, n));
     if (isActive(state, now) && state.agent !== agent) {
       await noteOnce(github, owner, repo, pr.number, `held-${n}-${state.agent}`,
-        `#${n} is locked by \`${state.agent}\` until ${stamp(Date.parse(state.until))}; this pull request does not hold it.`);
+        `#${n} is locked by \`${state.agent}\` until ${stamp(Date.parse(state.until))}; this pull request does not hold it.`, log);
       out.push(`#${n} held by ${state.agent}`);
       continue;
     }
@@ -325,21 +338,38 @@ async function claimForPull({ github, owner, repo, pr, now }) {
   return out;
 }
 
-/** Reconcile the claims of every open pull request (each run does this). */
-async function pulls({ github, context, now = Date.now() }) {
+/**
+ * Reconcile the claims of every open pull request (each run does this). Each pull request is
+ * handled on its own: an error on one is logged and the others still run, so one pull request's
+ * problem never turns another's check red. The run fails only when the pull request the event is
+ * about (pull_request_target) itself failed.
+ */
+async function pulls({ github, context, now = Date.now(), log }) {
   const { owner, repo } = context.repo;
   const open = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', per_page: 100 });
+  const own = context.payload && context.payload.pull_request ? context.payload.pull_request.number : null;
   const out = [];
-  for (const pr of open) out.push(...(await claimForPull({ github, owner, repo, pr, now })).map((s) => `PR #${pr.number}: ${s}`));
+  let ownError = null;
+  for (const pr of open) {
+    try {
+      out.push(...(await claimForPull({ github, owner, repo, pr, now, log })).map((s) => `PR #${pr.number}: ${s}`));
+    } catch (e) {
+      const text = `PR #${pr.number}: error: ${e.message || e}`;
+      warn(log, text);
+      out.push(text);
+      if (pr.number === own) ownError = e;
+    }
+  }
+  if (ownError) throw ownError;
   return out;
 }
 
 /** One pull request, from its event payload (kept for direct use and tests). */
-async function handlePull({ github, context, now = Date.now() }) {
+async function handlePull({ github, context, now = Date.now(), log }) {
   const pr = context.payload.pull_request;
   if (!pr || pr.state !== 'open') return [];
   const { owner, repo } = context.repo;
-  return claimForPull({ github, owner, repo, pr, now });
+  return claimForPull({ github, owner, repo, pr, now, log });
 }
 
 async function sweep({ github, context, now = Date.now() }) {
