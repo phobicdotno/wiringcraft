@@ -744,6 +744,33 @@ fn panel_layouts_print_after_the_schematic_pages() {
 }
 
 #[test]
+fn devices_with_the_same_product_part_are_labelled_with_their_full_tags() {
+    use wc_core::panel::{Panel, PanelItem};
+    let mut panel = Panel::new("main", "Cabinet", 600.0, 800.0);
+    for (i, tag) in ["+CAB1-K1", "+CAB2-K1", "+CAB1-K2"].into_iter().enumerate() {
+        let Ok(tag) = DeviceTag::parse(tag) else {
+            unreachable!("a valid tag")
+        };
+        panel.items.push(PanelItem::Device {
+            tag,
+            at: Point::new(50.0 + 100.0 * i as f64, 100.0),
+            width: 45.0,
+            height: 85.0,
+            rotation: wc_core::geom::Rotation::R0,
+        });
+    }
+    let project = Project::new("x");
+    let page = Page::new("panel-main", "P1", "Cabinet");
+    let drawn = layout::draw_panel_page(&project, &page, 0, 1, &panel, &BTreeMap::new(), "");
+    // The two `-K1` devices print their full tags, so they can be told apart.
+    assert!(drawn.ops.contains(&writer::pdf_text("+CAB1-K1")));
+    assert!(drawn.ops.contains(&writer::pdf_text("+CAB2-K1")));
+    // A device whose product part is unique keeps the short label.
+    assert!(drawn.ops.contains(&writer::pdf_text("-K2")));
+    assert!(!drawn.ops.contains(&writer::pdf_text("+CAB1-K2")));
+}
+
+#[test]
 fn a_device_with_a_footprint_drawing_is_drawn_with_it_on_the_layout() {
     use wc_core::panel::{Panel, PanelItem};
     let Ok(tag) = DeviceTag::parse("+CAB1-A1") else {
