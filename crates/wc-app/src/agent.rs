@@ -3769,6 +3769,9 @@ impl App {
             open.project = fresh.project;
             open.forget_terminal_change();
             open.dirty = false;
+            // A panel drag going on ends, as with Undo: Escape must not put its start back
+            // over the command's change.
+            self.ed.panel_drag = None;
         }
         open.refresh_library();
         self.prune_selection();
@@ -10986,6 +10989,45 @@ mod tests {
         assert!(a.ed.panel_drag.is_none(), "the undo tool ends the drag");
         escape_in_panel_view(&mut a);
         assert_eq!(panel_device_at(&a), first);
+    }
+
+    /// A command that changes the project while a panel drag has started (nothing moved yet)
+    /// ends the drag, so Escape keeps what the command did.
+    #[test]
+    fn a_command_during_a_panel_drag_ends_it() {
+        use wc_core::panel::{Panel, PanelItem};
+        let (_tmp, mut a) = app(vec![]);
+        let device = |at: Point| PanelItem::Device {
+            tag: wc_core::DeviceTag::parse("-K1").unwrap_or_default(),
+            at,
+            width: 40.0,
+            height: 60.0,
+            rotation: wc_core::geom::Rotation::R0,
+        };
+        let (start, by_command) = (Point::new(100.0, 100.0), Point::new(200.0, 150.0));
+        let Some(open) = a.open.as_mut() else {
+            unreachable!("a project is open")
+        };
+        open.project.panels.push(Panel {
+            id: "panel1".into(),
+            name: "Panel 1".into(),
+            width: 400.0,
+            height: 300.0,
+            items: vec![device(start)],
+        });
+        open.save().unwrap();
+        a.assistant.command_base = Some((open.dir.clone(), open.project.clone()));
+        let mut on_disk = open.project.clone();
+        on_disk.panels[0].items[0] = device(by_command);
+        wc_core::store::save(&open.dir, &on_disk).unwrap();
+        a.ed.panel = Some(0);
+        a.ed.panel_pick = Some(0);
+        a.ed.panel_drag = Some((Point::new(20.0, 30.0), None, device(start)));
+        a.command_finish(Ok("Done.".into())).unwrap();
+        assert_eq!(panel_device_at(&a), by_command);
+        assert!(a.ed.panel_drag.is_none(), "the command ends the drag");
+        escape_in_panel_view(&mut a);
+        assert_eq!(panel_device_at(&a), by_command, "Escape keeps the command's change");
     }
 
     #[test]
