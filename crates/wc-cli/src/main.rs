@@ -2324,6 +2324,7 @@ fn run(cli: Cli) -> Res<()> {
                 }
                 (!renamed.values().any(|to| to == pin) && new.pin(pin).is_some()).then(|| pin.to_owned())
             };
+            let pages_before = p.pages.clone();
             let mut warnings = Vec::new();
             let mut others = 0usize;
             for pg in &mut p.pages {
@@ -2366,6 +2367,15 @@ fn run(cli: Cli) -> Res<()> {
                             }
                         }
                     }
+                }
+            }
+            // A removed point's free end on another wire's free end would join them (#609).
+            for (before, after) in pages_before.iter().zip(&p.pages) {
+                if let Some(j) = wc_core::connectivity::new_point_joins(before, after).first() {
+                    return Err(escape_field(&format!(
+                        "wire {} on page {} would keep a free end at ({}, {}), where wire {} already ends, and the two would be joined; move one of these wire ends first",
+                        j.wire, after.number, j.at.x, j.at.y, j.other
+                    )));
                 }
             }
             if others > 0 {
@@ -9586,6 +9596,31 @@ mod tests {
             assert_eq!(std::fs::read_link(&path).unwrap(), target);
             assert_eq!(std::fs::read(&target).unwrap(), before);
         }
+    }
+
+    #[test]
+    fn box_edit_refuses_to_join_a_removed_points_wire_to_a_free_wire_end_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        cli(
+            &dir,
+            &["box", "p1", "--at", "40,40", "--size", "20,10", "--pin", "IN:left:5"],
+        )
+        .unwrap();
+        cli(&dir, &["wire", "p1", "s1:IN", "0,0"]).unwrap();
+        let p = load(&dir).unwrap();
+        let pg = p.page("p1").unwrap();
+        let sym = store::read_vendored_symbol(&dir, &pg.symbols[0].symbol).unwrap();
+        let at = wc_pdf::pin_position(&pg.symbols[0], &sym, "IN").unwrap();
+        // Another wire ends freely where IN is, not joined to it.
+        cli(&dir, &["wire", "p1", &format!("{},{}", at.x, at.y), "0,90"]).unwrap();
+        let before = load(&dir).unwrap();
+        let err = cli(&dir, &["box-edit", "p1", "s1", "--clear-pins"]).unwrap_err();
+        assert!(err.contains("would be joined"), "{err}");
+        assert_eq!(load(&dir).unwrap(), before, "nothing changes");
+        assert_eq!(store::read_vendored_symbol(&dir, &sym.id).unwrap(), sym);
     }
 
     #[test]

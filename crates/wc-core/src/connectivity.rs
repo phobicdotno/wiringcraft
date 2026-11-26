@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::geom::Point;
 use crate::project::{Endpoint, Page, Project};
 use crate::symbol::SymbolRole;
 
@@ -46,6 +47,60 @@ enum Node {
     Potential(String),
     /// Interruption points sharing a device tag.
     Link(String),
+}
+
+/// Where a free wire end is, as connectivity tells ends apart: in hundredths of a millimetre.
+/// Two free ends with the same key on one page are joined.
+fn point_key(at: Point) -> (i64, i64) {
+    ((at.x * 100.0).round() as i64, (at.y * 100.0).round() as i64)
+}
+
+/// A free wire end that would join another wire there, which it did not before.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewJoin {
+    /// The wire whose end was on a pin and is now a free end.
+    pub wire: String,
+    /// The other wire with a free end at the same place.
+    pub other: String,
+    pub at: Point,
+}
+
+/// The free wire ends of `after` that join another wire's free end at the same place,
+/// although in `before` (the same page, its wires known by id) that end was on a pin and the
+/// two wires did not meet there. This is what turning wire ends on pins into free ends (a
+/// black box point that is removed keeps its wires' ends where it was) must not do: it would
+/// join nets that were separate (#609). Two wires that were on the same pin still meet, as
+/// before.
+pub fn new_point_joins(before: &Page, after: &Page) -> Vec<NewJoin> {
+    // Every free end of `after`: (wire id, the pin it was on before, if it was).
+    type FreeEnd<'a> = (&'a str, Option<&'a Endpoint>, Point);
+    let mut at: BTreeMap<(i64, i64), Vec<FreeEnd>> = BTreeMap::new();
+    for w in &after.wires {
+        let was = before.wires.iter().find(|b| b.id == w.id);
+        for (k, end) in [&w.from, &w.to].into_iter().enumerate() {
+            let Endpoint::Point { at: p } = end else {
+                continue;
+            };
+            let on_pin = was
+                .map(|b| if k == 0 { &b.from } else { &b.to })
+                .filter(|e| matches!(e, Endpoint::Pin { .. }));
+            at.entry(point_key(*p)).or_default().push((&w.id, on_pin, *p));
+        }
+    }
+    let mut joins = Vec::new();
+    for ends in at.values() {
+        for (wire, pin, p) in ends {
+            let Some(pin) = pin else { continue };
+            if let Some((other, ..)) = ends.iter().find(|(o, opin, _)| o != wire && *opin != Some(*pin)) {
+                joins.push(NewJoin {
+                    wire: (*wire).to_owned(),
+                    other: (*other).to_owned(),
+                    at: *p,
+                });
+            }
+        }
+    }
+    joins
 }
 
 /// Every wire end on a pin of placed symbol `item` of `page`: the pin's name and its node.
@@ -93,11 +148,10 @@ pub fn wire_nets(project: &Project, role: impl Fn(&str) -> Option<SymbolRole>) -
     for page in &project.pages {
         let node = |e: &Endpoint| match e {
             Endpoint::Pin { item, pin } => Node::Pin((page.id.clone(), item.clone(), pin.clone())),
-            Endpoint::Point { at } => Node::Point(
-                page.id.clone(),
-                (at.x * 100.0).round() as i64,
-                (at.y * 100.0).round() as i64,
-            ),
+            Endpoint::Point { at } => {
+                let (x, y) = point_key(*at);
+                Node::Point(page.id.clone(), x, y)
+            }
         };
         for w in &page.wires {
             let a = id_of(node(&w.from), &mut dsu);
@@ -199,6 +253,47 @@ mod tests {
             item: item.into(),
             pin: pin.into(),
         }
+    }
+
+    #[test]
+    fn a_pin_end_made_free_where_another_free_end_is_is_a_new_join() {
+        let free = |x: f64, y: f64| Endpoint::Point { at: Point::new(x, y) };
+        let mut before = Page::new("a", "1", "");
+        before.wires = vec![
+            wire("w1", pin("b1", "IN"), pin("k1", "A1"), None),
+            wire("w2", pin("b1", "IN"), pin("k2", "A1"), None),
+            wire("w3", free(40.0, 45.0), pin("k3", "A1"), None),
+            wire("w4", pin("b1", "OUT"), pin("k4", "A1"), None),
+        ];
+        // IN (at 40, 45) and OUT (at 60, 45) are removed: their wires keep free ends there.
+        let mut after = before.clone();
+        after.wires[0].from = free(40.0, 45.0);
+        after.wires[1].from = free(40.0, 45.0);
+        after.wires[3].from = free(60.0, 45.0);
+        let joins = new_point_joins(&before, &after);
+        // w1 and w2 were on the same point and still meet; w3's free end was there already.
+        assert_eq!(
+            joins,
+            vec![
+                NewJoin {
+                    wire: "w1".into(),
+                    other: "w3".into(),
+                    at: Point::new(40.0, 45.0)
+                },
+                NewJoin {
+                    wire: "w2".into(),
+                    other: "w3".into(),
+                    at: Point::new(40.0, 45.0)
+                },
+            ]
+        );
+        // Without w3 nothing new joins.
+        before.wires.remove(2);
+        after.wires.remove(2);
+        assert_eq!(new_point_joins(&before, &after), vec![]);
+        // Two points removed at one place (boxes on top of each other) join their wires.
+        after.wires[2].from = free(40.0, 45.0);
+        assert_eq!(new_point_joins(&before, &after).len(), 3);
     }
 
     #[test]
