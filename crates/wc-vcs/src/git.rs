@@ -515,8 +515,15 @@ impl Git {
         Ok(())
     }
 
-    /// Merge another branch into the current one.
+    /// Merge another branch into the current one. Refuses while an earlier merge is still
+    /// being finished, so that merge's conflicts are never reported as this one's.
     pub fn merge(&self, other: &str) -> Result<MergeOutcome> {
+        if self.git_path("MERGE_HEAD")?.exists() {
+            return Err(Error::Git {
+                args: format!("merge {other}"),
+                message: "another merge is in progress; resolve its conflicts and commit, or abort it first".into(),
+            });
+        }
         let before = self.head();
         let msg = format!("Merge {other}");
         let mut args = vec!["merge", "--no-ff", "-m", msg.as_str(), END_OF_OPTIONS, other];
