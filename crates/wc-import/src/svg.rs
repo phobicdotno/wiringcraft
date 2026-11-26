@@ -300,7 +300,13 @@ impl Arc {
         }
         let (rx2, ry2) = (rx * rx, ry * ry);
         let den = rx2 * y1p * y1p + ry2 * x1p * x1p;
-        let root = ((rx2 * ry2 - den) / den).max(0.0).sqrt();
+        // Huge radii overflow to infinity and NaN here, which the clamp below would hide.
+        let product = rx2 * ry2;
+        let ratio = (product - den) / den;
+        if ![product, den, ratio].iter().all(|v| v.is_finite()) {
+            return line;
+        }
+        let root = ratio.max(0.0).sqrt();
         let coef = if self.large == self.sweep { -root } else { root };
         let (cxp, cyp) = (coef * rx * y1p / ry, -coef * ry * x1p / rx);
         let (cx, cy) = (
@@ -607,6 +613,9 @@ mod tests {
         }
         // A zero radius is a straight line.
         assert_eq!(one_line("M 0 0 A 0 5 0 0 1 10 0").len(), 2);
+        assert_eq!(one_line("M 0 0 A 0 0 0 0 1 10 0").len(), 2);
+        // Radii whose squares overflow are a straight line too, not a guessed arc.
+        assert_eq!(one_line("M 0 0 A 1e308 1e308 0 0 1 10 0").len(), 2);
     }
 
     #[test]
