@@ -52,7 +52,8 @@ enum Cmd {
         /// Position in mm, `x,y`.
         #[arg(long, value_parser = parse_point)]
         at: Point,
-        #[arg(long)]
+        /// Device tag, e.g. `-K1` (taken as a value, though it starts with `-`).
+        #[arg(long, allow_hyphen_values = true)]
         tag: Option<String>,
         /// 0, 90, 180 or 270.
         #[arg(long, default_value_t = 0)]
@@ -7730,6 +7731,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(std::fs::read_dir(lib2.join("parts")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn place_takes_a_tag_that_starts_with_a_dash_as_box_does() {
+        let Ok(tmp) = tempfile::tempdir() else { unreachable!() };
+        let dir = tmp.path().join("proj");
+        let Some(path) = dir.to_str() else { unreachable!() };
+        let Ok(cmd) = Cli::try_parse_from(["wiringcraft", "new", path, "--no-git"]) else {
+            unreachable!()
+        };
+        assert!(run(cmd).is_ok());
+        let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+        let Some(starter) = starter.to_str() else {
+            unreachable!()
+        };
+        assert!(cli(&dir, &["lib", "add", "starter", "folder", starter]).is_ok());
+        assert!(cli(&dir, &["page", "add", "p1", "--number", "1"]).is_ok());
+
+        let placed = cli(&dir, &["place", "p1", "wc.coil", "--at", "50,50", "--tag", "-K1"]);
+        assert!(placed.is_ok(), "{placed:?}");
+        let Ok(p) = load(&dir) else { unreachable!() };
+        let Some(pg) = p.pages.iter().find(|pg| pg.id == "p1") else {
+            unreachable!()
+        };
+        let Some(s) = pg.symbols.first() else { unreachable!() };
+        assert_eq!(s.tag.as_ref().map(ToString::to_string).as_deref(), Some("-K1"));
     }
 
     #[test]
