@@ -14,9 +14,12 @@ use wc_import::run::{
 };
 #[cfg(test)]
 use wc_import::run::{
-    Replace, add_and_save, add_built, add_swe_built, dwg_to_dxf, import_bmecat, import_edz, keep_library_sources,
-    keep_one_cover, project_copy, save_imported, sheet_for, staging_dir, swe_symbol_choice,
+    Replace, add_and_save, add_built, add_swe_built, import_bmecat, import_edz, keep_library_sources, keep_one_cover,
+    project_copy, save_imported, sheet_for, swe_symbol_choice,
 };
+// Only the Unix tests run a converter through a shell command.
+#[cfg(all(test, unix))]
+use wc_import::run::{dwg_to_dxf, staging_dir};
 
 type Res<T> = Result<T, String>;
 
