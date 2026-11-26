@@ -2890,7 +2890,7 @@ impl App {
     /// The `rules` tool: the project's check rules and the library rules it turns off, kept
     /// as the check rules dialog keeps them (its checks, one undo step).
     fn tool_rules(&mut self, v: &Value) -> Result<String, String> {
-        use wc_core::check_rule::{CheckRule, turned_off};
+        use wc_core::check_rule::{CheckRule, check_rule, turn_rule, turned_off};
         let action = need_s(v, "action")?;
         let open = need_open(self.open.as_mut())?;
         let library = wc_library::library_rules(&open.dir, &open.project);
@@ -2926,16 +2926,9 @@ impl App {
                 for (k, r) in list.iter().enumerate() {
                     let rule: CheckRule =
                         serde_json::from_value(r.clone()).map_err(|e| format!("Rule {}: {e}.", k + 1))?;
-                    if !rule.unknown.is_empty() {
-                        let keys: Vec<&str> = rule.unknown.keys().map(String::as_str).collect();
-                        return Err(format!(
-                            "Rule {}: no such key {} (a rule has kind, devices, role, pattern, max, severity, message and name).",
-                            k + 1,
-                            keys.join(", ")
-                        ));
-                    }
-                    // The dialog's checks: the check would report such a rule instead of running it.
-                    rules.push(crate::rules_form::RuleRow::of(&rule).rule(k + 1)?);
+                    // The dialog's checks, and no unknown keys: the check would report such a
+                    // rule instead of running it.
+                    rules.push(check_rule(&rule, k + 1)?);
                 }
                 let n = rules.len();
                 open.set_check_rules(rules);
@@ -2943,65 +2936,11 @@ impl App {
             }
             "off" | "on" => {
                 let which = need_s(v, "rule")?.trim();
-                // The one rule `which` names, as `turned_off` reads it: by number, or by name.
-                // A selector that could stand for two rules (a rule named "2" and rule 2,
-                // or two rules of one name) is refused rather than guessed.
-                let mut found = None;
-                if let Some((src, sel)) = which.split_once(':')
-                    && let Some(set) = library.iter().find(|set| set.source == src.trim())
-                {
-                    let rules = match &set.rules {
-                        Ok(rules) => rules,
-                        // `on` can still drop the entry as written, below.
-                        Err(e) if action == "off" => {
-                            return Err(format!(
-                                "The check rules of library {} cannot be read, so {which:?} cannot be turned off: {e}",
-                                set.source
-                            ));
-                        }
-                        Err(_) => &Vec::new(),
-                    };
-                    let one = [which.to_owned()];
-                    let hits: Vec<(usize, &CheckRule)> = rules
-                        .iter()
-                        .enumerate()
-                        .map(|(k, r)| (k + 1, r))
-                        .filter(|&(n, r)| turned_off(&one, &set.source, n, r))
-                        .collect();
-                    if hits.len() > 1 {
-                        let list: Vec<String> = hits.iter().map(|(n, _)| format!("{}:{n}", set.source)).collect();
-                        return Err(format!(
-                            "{which:?} could be rule {} of library {}: {:?} is a number and a rule's name too, or two rules share it. An entry in rules_off turns off all of them; name the rule another way (list shows each rule's number and name).",
-                            list.join(" or "),
-                            set.source,
-                            sel.trim()
-                        ));
-                    }
-                    found = hits.first().map(|&(n, r)| (set.source.clone(), n, r.clone()));
-                }
-                let mut now = off.clone();
-                match (action, found) {
-                    ("off", None) => {
-                        return Err(format!(
-                            "No library check rule {which:?}: write source:number or source:name (list shows them)."
-                        ));
-                    }
-                    ("off", Some((src, n, r))) => {
-                        if turned_off(&now, &src, n, &r) {
-                            return Ok(format!("{which} is off already."));
-                        }
-                        now.push(which.to_owned());
-                    }
-                    (_, Some((src, n, r))) => {
-                        // Every entry that turns it off, by number or by name.
-                        now.retain(|o| !turned_off(std::slice::from_ref(o), &src, n, &r));
-                    }
-                    // An entry naming no rule (a source since removed) can still be dropped.
-                    (_, None) => now.retain(|o| o.trim() != which),
-                }
-                if now == *off {
-                    return Ok(format!("{which} is on already."));
-                }
+                // As the command line turns it: one rule by number or name, refusing a
+                // selector that could stand for two rules.
+                let Some(now) = turn_rule(off, &library, which, action == "off")? else {
+                    return Ok(format!("{which} is {action} already."));
+                };
                 open.set_rules_off(now);
                 Ok(format!("{which} is {action} now; run_check shows the effect."))
             }
@@ -3662,6 +3601,8 @@ fn writes_while_held(args: &[String], dir: &Path, held: &BTreeMap<String, String
         | (Some("export" | "plc-vars" | "inspect"), _) => true,
         (Some("find"), _) => !has("--replace"),
         (Some("vcs"), Some("log" | "changes" | "page-log")) => true,
+        // `rules set`, `off` and `on` change the project; only the listing reads it.
+        (Some("rules"), Some("list")) => true,
         (
             Some(
                 "page" | "panel" | "location" | "jumper" | "strip" | "macro" | "revision" | "template" | "lib"
@@ -8549,6 +8490,31 @@ mod tests {
             assert!(seen.unknown.is_none());
             assert!(seen.reached_by(far.path(), &far_path).unwrap());
             assert!(!seen.reached_by(copy.path(), &copy_path).unwrap());
+        }
+    }
+
+    #[test]
+    fn rules_list_runs_while_a_page_is_held_but_rule_changes_do_not() {
+        let project = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let held: BTreeMap<String, String> = [("p0002".to_owned(), "Ola".to_owned())].into();
+        let classify = |words: &[&str]| {
+            let args: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
+            writes_while_held(&args, project.path(), &held, elsewhere.path())
+        };
+        for words in [&["rules", "list"][..], &["rules", "list", "--json"]] {
+            assert!(classify(words).is_none(), "{words:?}");
+        }
+        for words in [
+            &["rules", "set", "rules.toml"][..],
+            &["rules", "off", "lib:1"],
+            &["rules", "on", "lib:1"],
+            &["rules"],
+        ] {
+            let Some(e) = classify(words) else {
+                unreachable!("{words:?} ran")
+            };
+            assert!(e.contains("Ola") && e.contains("shared session"), "{words:?}: {e}");
         }
     }
 
