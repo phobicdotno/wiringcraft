@@ -427,3 +427,265 @@ fn a_plc_csv_import_reads_a_named_fifo_before_it_waits_for_the_lock() -> TestRes
     assert!(!err.contains("cannot read"), "{err}");
     Ok(())
 }
+
+/// A symbol drawing small enough to write by hand.
+const SVG: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"20\" height=\"20\"><rect x=\"0\" y=\"0\" width=\"20\" height=\"20\"/></svg>\n";
+
+/// Run `import symbol-svg` on `file` for the project in `dir`, writing to the library `lib`,
+/// and return the symbol file it wrote.
+fn import_svg(dir: &Path, file: &Path, lib: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let out = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("-C")
+        .arg(dir)
+        .args(["import", "symbol-svg"])
+        .arg(file)
+        .args(["--id", "test.box", "--name", "Box", "--lib"])
+        .arg(lib)
+        .output()?;
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    Ok(std::fs::read(lib.join("symbols").join("test.box.json"))?)
+}
+
+/// A regular input file is read where it is, as before: nothing is copied, and the command
+/// names the file itself when it cannot be read.
+#[test]
+fn a_regular_input_file_is_read_as_before() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    new_project(&dir)?;
+    let file = tmp.path().join("box.svg");
+    std::fs::write(&file, SVG)?;
+    let symbol = import_svg(&dir, &file, &tmp.path().join("lib"))?;
+    assert!(String::from_utf8_lossy(&symbol).contains("test.box"));
+
+    let rules = tmp.path().join("rules.toml");
+    std::fs::write(&rules, "[[rule]]\nkind = \"max-wires\"\nmax = 2\n")?;
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("-C")
+        .arg(&dir)
+        .args(["rules", "set"])
+        .arg(&rules)
+        .stdout(Stdio::null())
+        .status()?;
+    assert!(status.success());
+    assert!(std::fs::read_to_string(dir.join("project.toml"))?.contains("max-wires"));
+
+    let missing = tmp.path().join("missing.svg");
+    let out = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("-C")
+        .arg(&dir)
+        .args(["import", "symbol-svg"])
+        .arg(&missing)
+        .args(["--id", "test.none", "--name", "None", "--lib"])
+        .arg(tmp.path().join("lib"))
+        .output()?;
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("missing.svg"), "{err}");
+    Ok(())
+}
+
+/// What a command reads through a FIFO is what the writer wrote: the symbol comes out the same
+/// as from a regular file with the same content.
+#[cfg(unix)]
+#[test]
+fn an_import_through_a_fifo_gives_what_the_file_gives() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    new_project(&dir)?;
+    let file = tmp.path().join("box.svg");
+    std::fs::write(&file, SVG)?;
+    let from_file = import_svg(&dir, &file, &tmp.path().join("lib"))?;
+    let fifo = tmp.path().join("fifo.svg");
+    assert!(Command::new("mkfifo").arg(&fifo).status()?.success());
+    let writer = {
+        let fifo = fifo.clone();
+        std::thread::spawn(move || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&fifo)?
+                .write_all(SVG.as_bytes())
+        })
+    };
+    let from_fifo = import_svg(&dir, &fifo, &tmp.path().join("lib2"))?;
+    let Some(Ok(())) = finish_writer(&fifo, writer)? else {
+        unreachable!("the input was written");
+    };
+    assert_eq!(from_fifo, from_file);
+    Ok(())
+}
+
+#[cfg(unix)]
+include!("../src/input_commands.rs");
+
+/// What a command says on stderr when it finds the project lock taken.
+#[cfg(unix)]
+const WAITS: &str = "waiting for another wiringcraft command";
+
+/// What `from` gives, piece by piece as it comes, until it ends.
+#[cfg(unix)]
+fn follow(mut from: impl std::io::Read + Send + 'static) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = from.read(&mut buf) {
+            if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+/// A command started with FIFO inputs: its name, the writers of its FIFOs, and its stderr.
+#[cfg(unix)]
+struct Running {
+    name: String,
+    child: Child,
+    writers: Vec<FifoWriter>,
+    stderr: std::sync::mpsc::Receiver<Vec<u8>>,
+    /// What it has said on stderr so far.
+    said: Vec<u8>,
+}
+
+#[cfg(unix)]
+impl Running {
+    /// Every FIFO of the command has been written in full, so the command has read them.
+    fn has_read(&self) -> bool {
+        self.writers.iter().all(|(_, w)| w.is_finished())
+    }
+
+    /// The command has said that it waits for the lock.
+    fn says_it_waits(&mut self) -> bool {
+        self.said.extend(self.stderr.try_iter().flatten());
+        String::from_utf8_lossy(&self.said).contains(WAITS)
+    }
+}
+
+/// A FIFO and the thread that writes to it.
+#[cfg(unix)]
+type FifoWriter = (std::path::PathBuf, std::thread::JoinHandle<std::io::Result<()>>);
+
+/// Every command that names an input file reads a FIFO before it waits for the lock (#658):
+/// a writer that cannot get through until the command opens and reads the FIFO finishes while
+/// the lock is still held by another command, and the command then waits for the lock. The
+/// lock is let go only once every command has said that it waits (or thirty seconds passed):
+/// one that got to the lock late would find it free and never say so.
+/// `FIFO` is the input under test (each one its own FIFO), `FILE` a regular file and `LIB` a
+/// library folder. What is written is not a valid input of any of them: each command fails
+/// once it has the lock, which is after the point this test is about.
+#[cfg(unix)]
+#[test]
+fn every_command_reads_a_fifo_input_before_it_waits_for_the_lock() -> TestResult {
+    let commands = INPUT_COMMANDS;
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    new_project(&dir)?;
+    let file = tmp.path().join("regular.txt");
+    std::fs::write(&file, "not an input of any kind\n")?;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(".wiringcraft.lock"))?;
+    lock.lock()?;
+
+    // All of them at once: each waits for the one lock held here.
+    let mut running = Vec::new();
+    for (n, args) in commands.iter().enumerate() {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_wiringcraft"));
+        command.arg("-C").arg(&dir);
+        let mut writers = Vec::new();
+        for (k, arg) in args.iter().enumerate() {
+            match *arg {
+                "FIFO" => {
+                    let fifo = tmp.path().join(format!("in-{n}-{k}.fifo"));
+                    assert!(Command::new("mkfifo").arg(&fifo).status()?.success());
+                    command.arg(&fifo);
+                    let writer = {
+                        let fifo = fifo.clone();
+                        std::thread::spawn(move || {
+                            std::fs::OpenOptions::new()
+                                .write(true)
+                                .open(&fifo)?
+                                .write_all(b"not an input of any kind\n")
+                        })
+                    };
+                    writers.push((fifo, writer));
+                }
+                "FILE" => {
+                    command.arg(&file);
+                }
+                "LIB" => {
+                    command.arg(tmp.path().join(format!("lib-{n}")));
+                }
+                other => {
+                    command.arg(other);
+                }
+            }
+        }
+        let mut child = command.stdout(Stdio::null()).stderr(Stdio::piped()).spawn()?;
+        let stderr = follow(child.stderr.take().ok_or("the command has no stderr")?);
+        running.push(Running {
+            name: args.join(" "),
+            child,
+            writers,
+            stderr,
+            said: Vec::new(),
+        });
+    }
+
+    // Until each one has read its input and said that it waits, within a limit.
+    let start = Instant::now();
+    let mut ready = Vec::new();
+    loop {
+        ready.clear();
+        for run in &mut running {
+            ready.push((run.has_read(), run.says_it_waits()));
+        }
+        if ready.iter().all(|(read, waits)| *read && *waits) || start.elapsed() >= Duration::from_secs(30) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let mut still_runs = Vec::new();
+    for run in &mut running {
+        still_runs.push(run.child.try_wait()?.is_none());
+    }
+    lock.unlock()?;
+
+    let mut failures = Vec::new();
+    for ((mut run, (read_first, said_it_waits)), still_runs) in running.into_iter().zip(ready).zip(still_runs) {
+        let ended = ends_within(&mut run.child, Duration::from_secs(30))?;
+        if !ended {
+            run.child.kill()?;
+        }
+        run.child.wait()?;
+        // The rest of what it said: its stderr ends with it.
+        run.said.extend(run.stderr.iter().flatten());
+        let name = &run.name;
+        let err = String::from_utf8_lossy(&run.said).into_owned();
+        let mut written = true;
+        for (fifo, writer) in run.writers {
+            written &= matches!(finish_writer(&fifo, writer)?, Some(Ok(())));
+        }
+        if !read_first {
+            failures.push(format!("`{name}` did not read its FIFO before the lock: {err}"));
+        }
+        if !said_it_waits {
+            failures.push(format!("`{name}` did not say it waits while the lock was held: {err}"));
+        }
+        if !still_runs {
+            failures.push(format!("`{name}` did not wait for the lock: {err}"));
+        }
+        if !ended {
+            failures.push(format!("`{name}` did not end once the lock was free: {err}"));
+        }
+        if !written {
+            failures.push(format!("the input of `{name}` was not written: {err}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    Ok(())
+}

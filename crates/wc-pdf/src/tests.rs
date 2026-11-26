@@ -210,6 +210,20 @@ fn pages_export_as_svg_and_dxf() {
 }
 
 #[test]
+fn dxf_text_keeps_percent_signs_backslashes_and_wide_characters_literal() {
+    // `%%c` would be read as a diameter sign and `\U+0041` as `A` (#832).
+    assert_eq!(vector::dxf_text("50%%c"), "50\\U+0025\\U+0025c");
+    assert_eq!(vector::dxf_text("a%%%b"), "a\\U+0025\\U+0025\\U+0025b");
+    assert_eq!(vector::dxf_text("a\\U+0041"), "a\\U+005CU+0041");
+    // A lone percent sign starts no code and stays readable.
+    assert_eq!(vector::dxf_text("100 % on"), "100 % on");
+    assert_eq!(vector::dxf_text("%\t%d"), "\\U+0025\\U+0025d");
+    // Beyond U+FFFF there is no four-digit code; a five-digit one would be misread.
+    assert_eq!(vector::dxf_text("ok \u{1F600}"), "ok ?");
+    assert_eq!(vector::dxf_text("Ålesund\n"), "\\U+00C5lesund");
+}
+
+#[test]
 fn arcs_keep_their_side_in_svg_and_dxf() {
     // A quarter arc from 0 to 90 degrees clockwise on the page: from the right of the centre to
     // below it. In DXF (y up) that is from 270 to 360 counter-clockwise.
@@ -225,6 +239,106 @@ fn arcs_keep_their_side_in_svg_and_dxf() {
     };
     assert!(svg(&page).contains("d=\"M60 50 A10 10 0 0 1 50 60\""));
     assert!(dxf(&page).contains("0\nARC\n8\n0\n62\n7\n10\n50\n20\n50\n40\n10\n50\n270\n51\n0\n"));
+}
+
+#[test]
+fn dxf_fills_junction_dots_and_filled_shapes() {
+    let wire = |id: &str, a: (f64, f64), b: (f64, f64)| Wire {
+        id: id.into(),
+        from: Endpoint::Point {
+            at: Point::new(a.0, a.1),
+        },
+        to: Endpoint::Point {
+            at: Point::new(b.0, b.1),
+        },
+        via: vec![],
+        number: None,
+        potential: None,
+        cable: None,
+        route: Default::default(),
+        spec: Default::default(),
+    };
+    let mut project = Project::new("Fills");
+    let mut p1 = Page::new("p1", "1", "Control");
+    // A T: the second wire ends in the middle of the first, a junction at (100, 50).
+    p1.wires.push(wire("w1", (50.0, 50.0), (150.0, 50.0)));
+    p1.wires.push(wire("w2", (100.0, 50.0), (100.0, 100.0)));
+    p1.graphics.push(Shape::Polyline {
+        points: vec![
+            Point::new(200.0, 100.0),
+            Point::new(210.0, 100.0),
+            Point::new(205.0, 90.0),
+        ],
+        closed: true,
+        filled: true,
+    });
+    project.pages = vec![p1];
+    let (pages, _) = page_drawings(&project, &BTreeMap::new(), &Options::default());
+    let h = pages[0].size_mm.1;
+    let d = dxf(&pages[0]);
+    assert!(!d.contains("0\nCIRCLE\n"), "no hollow circle for the dot: {d}");
+    // The dot: a closed polyline 0.6 wide of two half circles through 99.7 and 100.3.
+    let dot = format!(
+        "66\n1\n70\n1\n40\n0.6\n41\n0.6\n0\nVERTEX\n8\n0\n10\n99.7\n20\n{y}\n40\n0.6\n41\n0.6\n42\n1\n\
+         0\nVERTEX\n8\n0\n10\n100.3\n20\n{y}\n40\n0.6\n41\n0.6\n42\n1\n0\nSEQEND\n",
+        y = h - 50.0
+    );
+    assert!(d.contains(&dot), "{d}");
+    // The triangle: one SOLID with its last corner repeated.
+    let solid = format!(
+        "0\nSOLID\n8\nDRAWINGS\n62\n7\n10\n200\n20\n{a}\n11\n210\n21\n{a}\n12\n205\n22\n{b}\n13\n205\n23\n{b}\n",
+        a = h - 100.0,
+        b = h - 90.0
+    );
+    assert!(d.contains(&solid), "{d}");
+}
+
+#[test]
+fn filled_outlines_become_dxf_solids_when_convex() {
+    let Some(quad) = crate::vector::solid_triangles(&[(0.0, 0.0), (4.0, 0.0), (4.0, 3.0), (0.0, 3.0), (0.0, 0.0)])
+    else {
+        unreachable!("a rectangle is convex")
+    };
+    assert_eq!(quad, vec![[(0.0, 0.0), (4.0, 0.0), (0.0, 3.0), (4.0, 3.0)]]);
+    let Some(fan) = crate::vector::solid_triangles(&[(0.0, 0.0), (2.0, 0.0), (3.0, 1.0), (2.0, 2.0), (0.0, 2.0)])
+    else {
+        unreachable!("a pentagon is convex")
+    };
+    assert_eq!(fan.len(), 3);
+    // An arrow with a notch is not convex: it stays an outline.
+    assert!(crate::vector::solid_triangles(&[(0.0, 0.0), (4.0, 2.0), (0.0, 4.0), (1.0, 2.0)]).is_none());
+    // A rectangle with a segment drawn back over itself turns half a turn each way at the
+    // reversals: a fan would paint outside it, so it stays an outline.
+    assert!(
+        crate::vector::solid_triangles(&[(4.0, 4.0), (0.0, 4.0), (0.0, 0.0), (8.0, 0.0), (0.0, 0.0), (4.0, 0.0)])
+            .is_none()
+    );
+}
+
+#[test]
+fn dxf_keeps_a_filled_path_that_is_not_convex_as_a_closed_outline() {
+    // An open, filled notched arrow: PDF and SVG fill it as if closed, so the DXF outline is
+    // closed too (group 70 is 1), and there is no SOLID.
+    let page = PageDrawing {
+        id: "a".into(),
+        number: "1".into(),
+        title: String::new(),
+        size_mm: (100.0, 100.0),
+        prims: vec![crate::writer::Prim::Path {
+            points: vec![(0.0, 0.0), (4.0, 2.0), (0.0, 4.0), (1.0, 2.0)],
+            closed: false,
+            filled: true,
+            ink: crate::writer::Stroke {
+                rgb: (0.0, 0.0, 0.0),
+                width: 0.25,
+            },
+            layer: None,
+        }],
+        pictures: Vec::new(),
+    };
+    let d = dxf(&page);
+    assert!(!d.contains("0\nSOLID\n"), "{d}");
+    assert!(d.contains("0\nPOLYLINE\n8\n0\n62\n7\n66\n1\n70\n1\n"), "{d}");
 }
 
 #[test]
@@ -314,7 +428,157 @@ fn table_of_contents_goes_first_and_its_rows_link_to_pages() {
     // The contents rows jump to the schematic pages, which are now the 2nd and 3rd page objects.
     assert!(text.contains("/Dest [9 0 R /Fit]"), "row 1 -> page 1");
     assert!(text.contains("/Dest [12 0 R /Fit]"), "row 2 -> page 2");
+    // The third row is the parts list (#693).
+    assert_eq!(text.matches("/Subtype /Link").count(), 3);
+}
+
+#[test]
+fn table_of_contents_lists_the_sheets_after_the_schematic_pages() {
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Mains")];
+    let band = project.meta.template.band_height();
+    let per_page = layout::rows_per_page(layout::report_size(project.pages[0].size, band, 1), band);
+    // One row short of a full page, so the rows of the later sheets run onto a second page.
+    let mut rows = vec![vec!["1".to_owned(), "Mains".to_owned()]];
+    rows.resize(per_page - 1, vec![String::new(), "Note".to_owned()]);
+    let contents = wc_report::Table {
+        title: "Table of contents".into(),
+        columns: vec!["Page".into(), "Title".into()],
+        rows,
+        row_pages: vec!["p1".into()],
+        front: true,
+        ..Default::default()
+    };
+    let parts = wc_report::Table {
+        title: "Parts list".into(),
+        columns: vec!["Part".into()],
+        ..Default::default()
+    };
+    let opts = Options {
+        reports: vec![contents, parts],
+        panels: vec![wc_core::panel::Panel::with_rails("main", "Cabinet", 600.0, 800.0)],
+        networks: vec![wc_core::network::Network {
+            name: "PN1".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    // Two contents pages, the schematic page, the panel, the parts list and the network.
+    assert_eq!(report.pages, 6);
+    let at = |title: &str| {
+        text.find(&format!("/Title {}", writer::pdf_text(title)))
+            .unwrap_or(usize::MAX)
+    };
+    assert!(at("R2 Table of contents (2/2)") < usize::MAX);
+    // The parts list is the third report page, after the two contents pages.
+    assert!(at("R3 Parts list") < usize::MAX);
+    let shows = |s: &str| text.contains(&format!("{} Tj", writer::pdf_text(s)));
+    for cell in ["P1", "Cabinet", "R3", "Parts list", "N1", "Network PN1"] {
+        assert!(shows(cell), "{cell}");
+    }
+    // The schematic page and the three later sheets are linked from the contents.
+    assert_eq!(text.matches("/Subtype /Link").count(), 4);
+}
+
+/// A contents table as `wc_report::contents` builds it, with `rows` of (page, title).
+fn contents_table(rows: &[(&str, &str)], row_pages: &[&str]) -> wc_report::Table {
+    wc_report::Table {
+        title: "Table of contents".into(),
+        columns: ["Page", "Title", "Devices", "Wires"].map(String::from).to_vec(),
+        rows: rows
+            .iter()
+            .map(|(p, t)| vec![(*p).to_owned(), (*t).to_owned(), String::new(), String::new()])
+            .collect(),
+        row_pages: row_pages.iter().map(|p| (*p).to_owned()).collect(),
+        front: true,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn later_sheets_fill_the_columns_of_a_contents_layout() {
+    use wc_core::report_layout::{ReportColumn, ReportLayout};
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Mains")];
+    // The project's layout shows the title first and the page renamed, without the counts.
+    let layout = ReportLayout {
+        columns: vec![
+            ReportColumn {
+                from: "Title".into(),
+                heading: None,
+            },
+            ReportColumn {
+                from: "Page".into(),
+                heading: Some("Sheet".into()),
+            },
+        ],
+        ..Default::default()
+    };
+    let contents = contents_table(&[("1", "Mains")], &["p1"]).with_layout(&layout);
+    let parts = wc_report::Table {
+        title: "Parts list".into(),
+        columns: vec!["Part".into()],
+        ..Default::default()
+    };
+    let opts = Options {
+        reports: vec![contents, parts],
+        ..Default::default()
+    };
+    let (pdf, _) = export(&project, &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    let at = |s: &str| text.find(&format!("{} Tj", writer::pdf_text(s)));
+    // The row reads "Parts list | R2", like "Mains | 1" above it.
+    let (Some(mains), Some(sheet), Some(title), Some(number)) = (at("Mains"), at("Sheet"), at("Parts list"), at("R2"))
+    else {
+        unreachable!("the contents shows both rows")
+    };
+    assert!(sheet < mains && mains < title && title < number);
+    // Both on the contents page, not "R2" from the parts list's own sheet.
+    assert!(!text[title..number].contains("endstream"));
     assert_eq!(text.matches("/Subtype /Link").count(), 2);
+}
+
+#[test]
+fn a_contents_grouped_by_page_counts_a_heading_per_later_sheet() {
+    use wc_core::report_layout::ReportLayout;
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Mains")];
+    let band = project.meta.template.band_height();
+    let per_page = layout::rows_per_page(layout::report_size(project.pages[0].size, band, 2), band);
+    // Page 1 as a heading with its rows takes all but three lines. The panel and the parts
+    // list then each take a heading and a row: four lines, so the parts list row runs onto
+    // a second contents page and the parts list itself is R3.
+    let mut rows = vec![("1", "Mains")];
+    rows.resize(per_page - 4, ("1", "Note"));
+    let layout = ReportLayout {
+        group: Some("Page".into()),
+        ..Default::default()
+    };
+    let contents = contents_table(&rows, &["p1"]).with_layout(&layout);
+    let parts = wc_report::Table {
+        title: "Parts list".into(),
+        columns: vec!["Part".into()],
+        ..Default::default()
+    };
+    let opts = Options {
+        reports: vec![contents, parts],
+        panels: vec![wc_core::panel::Panel::with_rails("main", "Cabinet", 600.0, 800.0)],
+        ..Default::default()
+    };
+    let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+    let text = String::from_utf8_lossy(&pdf);
+    assert_eq!(report.pages, 5);
+    let has = |title: &str| text.contains(&format!("/Title {}", writer::pdf_text(title)));
+    assert!(has("R2 Table of contents (2/2)"));
+    assert!(has("R3 Parts list"));
+    // The parts list's row in the contents is headed R3: the last text before its title.
+    let Some(title) = text.find(&format!("{} Tj", writer::pdf_text("Parts list"))) else {
+        unreachable!("the contents lists the parts list")
+    };
+    let row = text[..title].rsplit("Tj").nth(1).unwrap_or_default();
+    assert!(row.contains(&writer::pdf_text("Page: R3")), "{row}");
 }
 
 #[test]
@@ -741,6 +1005,33 @@ fn panel_layouts_print_after_the_schematic_pages() {
     assert!(text.contains(&writer::pdf_text(
         "Cabinet CAB1  ·  plate 600 x 800 mm  ·  scale 1:5  ·  1 device(s)"
     )));
+}
+
+#[test]
+fn devices_with_the_same_product_part_are_labelled_with_their_full_tags() {
+    use wc_core::panel::{Panel, PanelItem};
+    let mut panel = Panel::new("main", "Cabinet", 600.0, 800.0);
+    for (i, tag) in ["+CAB1-K1", "+CAB2-K1", "+CAB1-K2"].into_iter().enumerate() {
+        let Ok(tag) = DeviceTag::parse(tag) else {
+            unreachable!("a valid tag")
+        };
+        panel.items.push(PanelItem::Device {
+            tag,
+            at: Point::new(50.0 + 100.0 * i as f64, 100.0),
+            width: 45.0,
+            height: 85.0,
+            rotation: wc_core::geom::Rotation::R0,
+        });
+    }
+    let project = Project::new("x");
+    let page = Page::new("panel-main", "P1", "Cabinet");
+    let drawn = layout::draw_panel_page(&project, &page, 0, 1, &panel, &BTreeMap::new(), "");
+    // The two `-K1` devices print their full tags, so they can be told apart.
+    assert!(drawn.ops.contains(&writer::pdf_text("+CAB1-K1")));
+    assert!(drawn.ops.contains(&writer::pdf_text("+CAB2-K1")));
+    // A device whose product part is unique keeps the short label.
+    assert!(drawn.ops.contains(&writer::pdf_text("-K2")));
+    assert!(!drawn.ops.contains(&writer::pdf_text("+CAB1-K2")));
 }
 
 #[test]
@@ -2406,4 +2697,25 @@ fn a_declared_node_with_a_blank_tag_keeps_its_box_address_and_station() {
         "{:?}",
         report.warnings
     );
+}
+
+#[test]
+fn bookmarks_and_the_document_title_are_text_strings_not_font_codes() {
+    // A reader decodes bookmark titles as PDFDocEncoding or UTF-16: the page font's WinAnsi
+    // en dash (0x96) would show as "Œ" there, and Ω could not be written at all (#726).
+    let mut project = Project::new("Pumpe – Ålesund");
+    project.pages = vec![Page::new("p1", "1", "Motor – pump Ω"), Page::new("p2", "2", "Control")];
+    let (pdf, _) = export(&project, &BTreeMap::new(), &Options::default());
+    let text = String::from_utf8_lossy(&pdf);
+    let utf16 = |s: &str| -> String {
+        let units: String = s.encode_utf16().map(|u| format!("{u:04X}")).collect();
+        format!("<FEFF{units}>")
+    };
+    assert_eq!(writer::pdf_text_string("1 Motor – pump Ω"), utf16("1 Motor – pump Ω"));
+    assert!(text.contains(&format!("/Title {}", utf16("1 Motor – pump Ω"))));
+    assert!(text.contains(&format!("/Title {} /Producer", utf16("Pumpe – Ålesund"))));
+    // Plain ASCII titles stay as they were, the same bytes in every encoding.
+    assert!(text.contains(&format!("/Title {}", writer::pdf_text("2 Control"))));
+    // The page itself still draws the title with the font's own codes.
+    assert!(text.contains(&format!("{} Tj", writer::pdf_text("Motor – pump Ω"))));
 }
