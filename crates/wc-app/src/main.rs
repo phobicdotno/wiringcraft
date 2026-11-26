@@ -641,6 +641,13 @@ impl App {
         {
             self.ed.page = o.project.pages.len().saturating_sub(1);
         }
+        // A wire being drawn may start on a pin that the sync removed.
+        if let Some(o) = &self.open
+            && let Some((wc_core::Endpoint::Pin { item, .. }, _)) = &self.ed.wire
+            && o.project.pages.get(self.ed.page).and_then(|p| p.symbol(item)).is_none()
+        {
+            self.ed.wire = None;
+        }
         let waiting = self.share.unanswered_edits() > 0;
         // A refused change of the page ends the wait: what comes back there is not the paste
         // (the host may have added an equal drawing in the meantime).
