@@ -1,0 +1,13 @@
+{
+  "description": "Solenoid valve 2/2-way, normally closed, G 1/4, 24 V DC coil (example data)",
+  "id": "example.ex-sv-24dc",
+  "manufacturer": "Example",
+  "order_number": "EX-SV-24DC",
+  "properties": {
+    "Coil power": "8 W",
+    "Coil voltage": "24 V DC",
+    "Port size": "G 1/4",
+    "Valve function": "2/2-way, normally closed"
+  },
+  "symbol": "wc.coil.valve"
+}

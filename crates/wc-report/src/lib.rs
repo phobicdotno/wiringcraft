@@ -53,6 +53,10 @@ pub struct Table {
     pub group: Option<usize>,
     /// Title-block values a PDF prints above the table ([`ReportLayout::header`]).
     pub header: Vec<String>,
+    /// The built-in column each column shows, by its built-in heading, when a layout
+    /// ([`Table::with_layout`]) reordered or renamed them; empty when the columns are the
+    /// built-in ones.
+    pub sources: Vec<String>,
 }
 
 impl Table {
@@ -61,6 +65,15 @@ impl Table {
             title: title.into(),
             columns: columns.iter().map(|c| (*c).to_owned()).collect(),
             ..Self::default()
+        }
+    }
+
+    /// The position of the built-in column `name` among the shown columns, if shown.
+    pub fn column_of(&self, name: &str) -> Option<usize> {
+        if self.sources.is_empty() {
+            self.columns.iter().position(|c| c == name)
+        } else {
+            self.sources.iter().position(|c| c == name)
         }
     }
 
@@ -139,6 +152,14 @@ impl Table {
                 0
             }
         });
+        let source = |i: usize| {
+            self.sources
+                .get(i)
+                .or_else(|| self.columns.get(i))
+                .cloned()
+                .unwrap_or_default()
+        };
+        let sources: Vec<String> = picked.iter().map(|&(i, _)| source(i)).collect();
         let Table {
             title,
             rows,
@@ -197,7 +218,15 @@ impl Table {
             front,
             group: shown_group,
             header: layout.header.clone(),
+            sources,
         }
+    }
+
+    /// Adds `row`, which describes the page with id `page_id`: in a PDF the row jumps to it.
+    fn push_linked(&mut self, row: Vec<String>, page_id: &str) {
+        self.row_pages.resize(self.rows.len(), String::new());
+        self.row_pages.push(page_id.to_owned());
+        self.rows.push(row);
     }
 
     /// Rows whose first column is empty take their first `columns` cells from the row above:
@@ -217,15 +246,13 @@ impl Table {
 
     /// A Markdown table under a level-2 heading.
     pub fn to_markdown(&self) -> String {
-        // One line of text: line ends (LF, CR or CRLF) become spaces, and `<` and `>` are
-        // written as entities so a value is never read as HTML.
-        let line = |s: &str| {
-            s.replace("\r\n", " ")
-                .replace(['\r', '\n'], " ")
-                .replace('<', "&lt;")
-                .replace('>', "&gt;")
-        };
-        let cell = |s: &str| line(s).replace('|', "\\|");
+        // One line of text: line ends (LF, CR or CRLF) become spaces.
+        let one_line = |s: &str| s.replace("\r\n", " ").replace(['\r', '\n'], " ");
+        // `<` and `>` are written as entities so a value is never read as HTML.
+        let line = |s: &str| one_line(s).replace('<', "&lt;").replace('>', "&gt;");
+        // In a cell, Markdown punctuation gets a backslash so the table shows the text as typed
+        // (see `markdown_cell`).
+        let cell = |s: &str| markdown_cell(&one_line(s));
         let mut out = format!(
             "## {}\n\n| {} |\n|{}\n",
             line(&self.title),
@@ -240,6 +267,155 @@ impl Table {
         }
         out
     }
+}
+
+/// One line of cell text for a Markdown table.
+///
+/// Markdown punctuation gets a backslash so the table shows the text as typed: `*spare*` is
+/// not italic, `motor_1_ready` keeps its underscores, `` `X1` `` is not code. A backslash is
+/// doubled, so a cell ending in `\` does not escape the column bar after it.
+///
+/// A word that a Markdown viewer turns into a link by itself (one starting with `http://`,
+/// `https://` or `www.`, or an e-mail address) is kept as typed, because a backslash there
+/// would end up in the link. A viewer also takes in the backslashes of a `|` or a last `\` in
+/// the word, or of escaped text right after it (`https://x.no/&copy;`). Such a word is written
+/// as text that is not a link (`https\://`, `www\.`, `a\@x_y.no`) with everything escaped;
+/// an e-mail address that CommonMark takes in `<...>` is written as `<a@x.no>`, which ends
+/// the link before the text after it.
+fn markdown_cell(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while !rest.is_empty() {
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let word = &rest[..end];
+        // Characters before the link that Markdown still lets a link start after.
+        let lead = word.len() - word.trim_start_matches(['*', '_', '~', '(']).len();
+        let (before, link) = word.split_at(lead);
+        markdown_text(before, &mut out);
+        // Markdown leaves trailing punctuation and a trailing entity such as `&copy;` out of
+        // a link: that part is plain text.
+        let mut body = link;
+        loop {
+            body = body.trim_end_matches(['?', '!', '.', ',', ':', '*', '_', '~']);
+            let Some(head) = body.strip_suffix(';') else {
+                break;
+            };
+            let name = head.trim_end_matches(|c: char| c.is_ascii_alphanumeric());
+            match name.strip_suffix('&') {
+                Some(kept) if name.len() < head.len() => body = kept,
+                _ => break,
+            }
+        }
+        if is_autolink(body) && !link.contains(['<', '>']) {
+            let mut tail = String::new();
+            markdown_text(link.strip_prefix(body).unwrap_or_default(), &mut tail);
+            let www = body.strip_prefix("www.");
+            if !tail.contains('\\') && !body.contains('|') && !body.ends_with('\\') {
+                // A plain link stays as typed, a `\` inside it too.
+                out.push_str(body);
+            } else if let Some((scheme, rest)) = body.split_once("://") {
+                // A viewer would take backslashes into the link, so the word is written as
+                // text that is not a link: `\:` shows as `:`.
+                out.push_str(scheme);
+                out.push_str("\\:");
+                markdown_text(&format!("//{rest}"), &mut out);
+            } else if let Some(rest) = www {
+                out.push_str("www\\.");
+                markdown_text(rest, &mut out);
+            } else if let Some((name, domain)) = body.split_once('@') {
+                if angle_email_domain(domain) {
+                    // `<...>` ends the e-mail link before the text after it.
+                    out.push('<');
+                    out.push_str(body);
+                    out.push('>');
+                } else {
+                    // A domain `<...>` does not take: `\@` shows as `@` and is not a link.
+                    markdown_text(name, &mut out);
+                    out.push_str("\\@");
+                    markdown_text(domain, &mut out);
+                }
+            }
+            out.push_str(&tail);
+        } else {
+            markdown_text(link, &mut out);
+        }
+        let space = rest[end..].len() - rest[end..].trim_start().len();
+        out.push_str(&rest[end..end + space]);
+        rest = &rest[end + space..];
+    }
+    out
+}
+
+/// Escapes the Markdown punctuation in plain cell text (see `markdown_cell`).
+fn markdown_text(s: &str, out: &mut String) {
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' | '|' | '`' | '*' | '_' | '[' | ']' | '~' | '&' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '!' if chars.peek() == Some(&'[') => out.push_str("\\!"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '#' if out.is_empty() => out.push_str("\\#"),
+            _ => out.push(c),
+        }
+    }
+}
+
+/// Whether `<name@domain>` is an e-mail link in CommonMark: parts of letters, digits and `-`
+/// between dots, each 1 to 63 long and not starting or ending with `-`. The name part that
+/// `is_autolink` accepts always fits.
+fn angle_email_domain(domain: &str) -> bool {
+    domain.split('.').all(|p| {
+        (1..=63).contains(&p.len())
+            && !p.starts_with('-')
+            && !p.ends_with('-')
+            && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
+}
+
+/// Whether a Markdown viewer turns this word into a link by itself: a web address starting
+/// with `http://`, `https://` or `www.`, or an e-mail address such as `a_b@example.com`.
+fn is_autolink(word: &str) -> bool {
+    let lower = word.to_ascii_lowercase();
+    let web = ["http://", "https://", "www."]
+        .iter()
+        // The scheme may be in any case, but only a lowercase `www.` is a link.
+        .find(|p| {
+            if **p == "www." {
+                word.starts_with("www.")
+            } else {
+                lower.starts_with(**p)
+            }
+        })
+        .map(|p| (&word[p.len()..], *p == "www."));
+    if let Some((after, www)) = web {
+        // The host must be a domain Markdown accepts: parts of letters, digits, `-` and `_`
+        // between dots, with no `_` in the last two parts.
+        let host_len = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+            .unwrap_or(after.len());
+        let host = if www { &word[..4 + host_len] } else { &after[..host_len] };
+        let host = host.trim_end_matches('.');
+        let parts: Vec<&str> = host.split('.').collect();
+        return parts.iter().all(|p| !p.is_empty())
+            && (!www || parts.len() > 1)
+            && parts.iter().rev().take(2).all(|p| !p.contains('_'));
+    }
+    let Some((name, domain)) = word.split_once('@') else {
+        return false;
+    };
+    let domain = domain.trim_end_matches(['.', ',', ':', '!', '?']);
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-' | '_'))
+        && domain.contains('.')
+        && domain
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
 }
 
 /// A cell as a spreadsheet should show it: text that Excel or LibreOffice would run as a formula
@@ -666,7 +842,9 @@ fn net_names(i: &Inputs) -> (Vec<connectivity::Net>, BTreeMap<PinRef, String>) {
 }
 
 /// Wire list: every drawn wire with both ends, then its cross-section, colour and type. A free
-/// end is reported as a junction point.
+/// end is reported as a junction point. Each row links to the page the wire is drawn on
+/// ([`Table::row_pages`]). Overview pages (`Page::overview`) are skipped, because an overview
+/// draws the schematic's connections again and would list each wire twice.
 pub fn wire_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new(
         "Wire list",
@@ -683,7 +861,8 @@ pub fn wire_list(i: &Inputs<'_>) -> Table {
         ],
     );
     let (_, net_of) = net_names(i);
-    for page in &i.project.pages {
+    // An overview (line diagram) draws connections again; the list shows each wire once.
+    for page in i.project.pages.iter().filter(|pg| !pg.overview) {
         for w in &page.wires {
             let end = |e: &Endpoint| match e {
                 Endpoint::Pin { item, pin } => pin_label(i.project, &page.id, item, pin),
@@ -695,17 +874,20 @@ pub fn wire_list(i: &Inputs<'_>) -> Table {
                     Endpoint::Point { .. } => None,
                 })
             });
-            t.rows.push(vec![
-                page.number.clone(),
-                w.number.clone().unwrap_or_default(),
-                potential.unwrap_or_default(),
-                w.cable.as_ref().map(cable_core_label).unwrap_or_default(),
-                end(&w.from),
-                end(&w.to),
-                w.spec.section.clone().unwrap_or_default(),
-                w.spec.colour.clone().unwrap_or_default(),
-                w.spec.kind.clone().unwrap_or_default(),
-            ]);
+            t.push_linked(
+                vec![
+                    page.number.clone(),
+                    w.number.clone().unwrap_or_default(),
+                    potential.unwrap_or_default(),
+                    w.cable.as_ref().map(cable_core_label).unwrap_or_default(),
+                    end(&w.from),
+                    end(&w.to),
+                    w.spec.section.clone().unwrap_or_default(),
+                    w.spec.colour.clone().unwrap_or_default(),
+                    w.spec.kind.clone().unwrap_or_default(),
+                ],
+                &page.id,
+            );
         }
     }
     t
@@ -719,14 +901,20 @@ fn cable_core_label(c: &wc_core::CableCore) -> String {
     }
 }
 
-/// Cable list: every cable with its type, then one row per core with the wire's two ends.
+/// Cable list: every cable with its type, then one row per core with the wire's two ends. Each
+/// row links to the page its core is drawn on ([`Table::row_pages`]). Overview pages
+/// (`Page::overview`) are skipped, because an overview draws the schematic's connections again
+/// and would list each core twice.
 pub fn cable_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new(
         "Cable list",
         &["Cable", "Type", "Description", "Core", "Page", "From", "To"],
     );
-    let mut cores: BTreeMap<DeviceTag, Vec<(String, String, String, String)>> = BTreeMap::new();
-    for page in &i.project.pages {
+    /// A core's row: core, page number, from, to, and the page id its row links to.
+    type Core = (String, String, String, String, String);
+    let mut cores: BTreeMap<DeviceTag, Vec<Core>> = BTreeMap::new();
+    // Overview pages repeat the schematic's cables; each core is listed once.
+    for page in i.project.pages.iter().filter(|pg| !pg.overview) {
         for w in &page.wires {
             let Some(c) = &w.cable else { continue };
             let end = |e: &Endpoint| match e {
@@ -738,6 +926,7 @@ pub fn cable_list(i: &Inputs<'_>) -> Table {
                 page.number.clone(),
                 end(&w.from),
                 end(&w.to),
+                page.id.clone(),
             ));
         }
     }
@@ -758,17 +947,20 @@ pub fn cable_list(i: &Inputs<'_>) -> Table {
             .filter(|d| !d.is_empty())
             .or_else(|| part.map(|p| p.description.clone()))
             .unwrap_or_default();
-        for (n, (core, page, from, to)) in list.into_iter().enumerate() {
+        for (n, (core, page, from, to, page_id)) in list.into_iter().enumerate() {
             let first = n == 0;
-            t.rows.push(vec![
-                if first { cable.to_string() } else { String::new() },
-                if first { kind.clone() } else { String::new() },
-                if first { description.clone() } else { String::new() },
-                core,
-                page,
-                from,
-                to,
-            ]);
+            t.push_linked(
+                vec![
+                    if first { cable.to_string() } else { String::new() },
+                    if first { kind.clone() } else { String::new() },
+                    if first { description.clone() } else { String::new() },
+                    core,
+                    page,
+                    from,
+                    to,
+                ],
+                &page_id,
+            );
         }
     }
     t
@@ -908,6 +1100,8 @@ pub const SPARE_PAGE: &str = "spare";
 /// numbered in drawing order (page, then left to right). Terminals come by number, unless the
 /// terminal strip editor put the strip in another order ([`wc_core::project::StripLayout`]);
 /// its spare terminals are listed with [`SPARE_PAGE`] in the Page column.
+///
+/// Each drawn terminal's row links to its page ([`Table::row_pages`]); a spare's links nowhere.
 pub fn terminal_plan(i: &Inputs<'_>) -> Table {
     terminal_plan_with_spares(i).0
 }
@@ -1162,16 +1356,19 @@ pub(crate) fn terminal_plan_with_spares(i: &Inputs<'_>) -> (Table, BTreeSet<usiz
             if let Some(symbol) = &term.missing {
                 upper = format!("(symbol {symbol} missing)");
             }
-            t.rows.push(vec![
-                strip.clone(),
-                number,
-                upper,
-                lower,
-                pa.or(pb).unwrap_or_default(),
-                term.page.clone(),
-                term.jumpered.clone(),
-                level,
-            ]);
+            t.push_linked(
+                vec![
+                    strip.clone(),
+                    number,
+                    upper,
+                    lower,
+                    pa.or(pb).unwrap_or_default(),
+                    term.page.clone(),
+                    term.jumpered.clone(),
+                    level,
+                ],
+                &term.page_id,
+            );
         }
     }
     // A spare has no wiring of its own, but a jumper to a drawn terminal puts it on that
@@ -1282,13 +1479,16 @@ impl PlcPoint {
 
 /// PLC I/O list: every PLC input and output drawn, with its address, the device it belongs to
 /// and what it is wired to. The address is the device property `Address` (or `PLC address`);
-/// points without one sort last so the gaps are visible.
+/// points without one sort last so the gaps are visible. Each row links to its page
+/// ([`Table::row_pages`]).
 pub fn plc_io_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new(
         "PLC I/O list",
         &["Address", "Type", "Device", "Description", "Connected to", "Page"],
     );
-    t.rows = plc_points(i).iter().map(PlcPoint::row).collect();
+    for point in plc_points(i) {
+        t.push_linked(point.row(), &point.page_id);
+    }
     t
 }
 
