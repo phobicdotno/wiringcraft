@@ -2,7 +2,7 @@
 
 WiringCraft writes the project's terminal strips as a list for the WAGO configurator
 (smartDESIGNER). The app has it under File → WAGO configurator (ribbon: Start → Project → WAGO
-configurator) and writes
+configurator) and asks where to save it, starting at
 `export/wago-configurator.csv`; the command line has `wiringcraft export wago-configurator <out>`.
 
 The file is written the same way as the [smartScript marker export](wago-marking.md):

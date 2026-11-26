@@ -139,3 +139,126 @@ fn check_runs_the_rules_in_project_toml() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn rules_lists_sets_and_turns_library_rules_off_and_on() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    let lib = tmp.path().join("lib");
+    std::fs::create_dir_all(lib.join("symbols"))?;
+    std::fs::write(
+        lib.join("rules.toml"),
+        "[[rule]]\nname = \"short-tags\"\nkind = \"tag\"\npattern = \"-?#\"\n\n[[rule]]\nkind = \"max-wires\"\nmax = 1\n\n[[rule]]\nname = \"2\"\nkind = \"cable\"\n",
+    )?;
+    wiringcraft(&dir, &["lib", "add", "mine", "folder", lib.to_str().ok_or("path")?])?;
+
+    // Nothing of the project's own yet; the library's rules all run.
+    let list = wiringcraft(&dir, &["rules", "list"])?;
+    assert_eq!(
+        list,
+        "mine:1\ton\ttag name=short-tags pattern=-?#\nmine:2\ton\tmax-wires max=1\nmine:3\ton\tcable name=2\n"
+    );
+
+    // Set the project's own rules from TOML; the dialog's checks normalise them.
+    let file = tmp.path().join("rules.toml");
+    std::fs::write(&file, RULES.replace("kind = \"cable\"", "kind = \"Cable\""))?;
+    assert_eq!(
+        wiringcraft(&dir, &["rules", "set", file.to_str().ok_or("path")?])?,
+        "3 check rules\n"
+    );
+    let list = wiringcraft(&dir, &["rules", "list"])?;
+    assert!(
+        list.starts_with(
+            "1\ton\tcable devices=-M*\n2\ton\ttag role=terminal pattern=-X#.# severity=error\n3\ton\tmax-wires max=1\n"
+        ),
+        "{list}"
+    );
+    let toml = std::fs::read_to_string(dir.join("project.toml"))?;
+    assert!(toml.contains("kind = \"cable\""), "{toml}");
+
+    // A rule the check could not run is refused, and nothing changes.
+    let bad = tmp.path().join("bad.json");
+    for (text, why) in [
+        (r#"[{"kind": "tag"}]"#, "Rule 1: a tag rule needs the pattern"),
+        (
+            r#"[{"kind": "cable"}, {"kind": "cable", "severty": "error"}]"#,
+            "Rule 2: no such key severty",
+        ),
+        (
+            r#"{"rules": [{"kind": "max-wires", "role": "boss", "max": 2}]}"#,
+            "Rule 1: pick a role",
+        ),
+        (r#"{"kind": "cable"}"#, "not a list of rules"),
+    ] {
+        std::fs::write(&bad, text)?;
+        let Err(err) = wiringcraft(&dir, &["rules", "set", bad.to_str().ok_or("path")?]) else {
+            unreachable!("{text} is refused");
+        };
+        assert!(err.contains(why), "{text}: {err}");
+    }
+    // A misspelt table name in TOML is refused too, rather than read as no rules.
+    let misspelt = tmp.path().join("misspelt.toml");
+    std::fs::write(&misspelt, "[[rules]]\nkind = \"cable\"\n")?;
+    let Err(err) = wiringcraft(&dir, &["rules", "set", misspelt.to_str().ok_or("path")?]) else {
+        unreachable!("[[rules]] is refused");
+    };
+    assert!(err.contains("\"rules\" is not a rule table"), "{err}");
+    assert_eq!(std::fs::read_to_string(dir.join("project.toml"))?, toml);
+
+    // JSON, as `rules list --json` prints them.
+    std::fs::write(&bad, r#"{"rules": [{"kind": "max-wires", "max": 2, "name": "two"}]}"#)?;
+    assert_eq!(
+        wiringcraft(&dir, &["rules", "set", bad.to_str().ok_or("path")?])?,
+        "1 check rules\n"
+    );
+    let json: serde_json::Value = serde_json::from_str(&wiringcraft(&dir, &["rules", "list", "--json"])?)?;
+    assert_eq!(
+        json["rules"],
+        serde_json::json!([{"kind": "max-wires", "max": 2, "name": "two"}])
+    );
+    assert_eq!(json["library"][0]["rules"][1]["rule"], "mine:2");
+
+    // Library rules off by name and by number, then on again.
+    assert_eq!(
+        wiringcraft(&dir, &["rules", "off", "mine:short-tags"])?,
+        "mine:short-tags is off\n"
+    );
+    assert_eq!(
+        wiringcraft(&dir, &["rules", "off", "mine:1"])?,
+        "mine:1 is off already\n"
+    );
+    assert_eq!(
+        wiringcraft(&dir, &["rules", "off", "mine:max-wires"])
+            .err()
+            .map(|e| e.contains("No library check rule \"mine:max-wires\"")),
+        Some(true)
+    );
+    // "mine:2" is rule 2 by number and rule 3 by name: refused rather than guessed.
+    let Err(err) = wiringcraft(&dir, &["rules", "off", "mine:2"]) else {
+        unreachable!("an ambiguous selector is refused");
+    };
+    assert!(err.contains("could be rule mine:2 or mine:3"), "{err}");
+    let list = wiringcraft(&dir, &["rules", "list"])?;
+    assert!(list.contains("mine:1\toff\t"), "{list}");
+    assert!(list.contains("mine:2\ton\t"), "{list}");
+    let check = String::from_utf8_lossy(&run(&dir, &["check", "--all"])?.stdout).into_owned();
+    assert!(!check.contains("short-tags"), "{check}");
+    assert_eq!(wiringcraft(&dir, &["rules", "on", "mine:1"])?, "mine:1 is on\n");
+    let list = wiringcraft(&dir, &["rules", "list"])?;
+    assert!(list.contains("mine:1\ton\t"), "{list}");
+    assert_eq!(wiringcraft(&dir, &["rules", "on", "mine:1"])?, "mine:1 is on already\n");
+
+    // An entry naming no rule is listed and can be dropped.
+    let text = std::fs::read_to_string(dir.join("project.toml"))?;
+    std::fs::write(dir.join("project.toml"), format!("rules_off = [\"gone:4\"]\n{text}"))?;
+    assert!(wiringcraft(&dir, &["rules", "list"])?.ends_with("gone:4\toff\tnames no library rule\n"));
+    assert_eq!(wiringcraft(&dir, &["rules", "on", "gone:4"])?, "gone:4 is on\n");
+    assert!(!std::fs::read_to_string(dir.join("project.toml"))?.contains("gone:4"));
+    Ok(())
+}
