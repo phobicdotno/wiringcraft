@@ -2916,3 +2916,32 @@ fn check_warns_about_panel_devices_that_overlap_stick_out_or_left_the_project() 
     );
     assert_eq!(found.len(), 3, "{found:?}");
 }
+
+#[test]
+fn check_keeps_panel_devices_whose_tag_is_only_drawn_as_interruption_points() {
+    use wc_core::panel::Panel;
+    let (mut p, mut s, parts) = fixture();
+    let arrow = sym("arrow", SymbolRole::Interruption, &["1"]);
+    s.insert(arrow.id.clone(), arrow);
+    p.pages[0].symbols.push(place("s9", "arrow", 200.0, Some("-L1")));
+    let Ok(l1) = DeviceTag::parse("-L1") else {
+        unreachable!()
+    };
+    p.devices.entry(l1.clone()).or_default();
+    let mut plate = Panel::new("p1", "Main", 400.0, 300.0);
+    let Ok(()) = plate.place_device(l1, Point::new(10.0, 10.0), (40.0, 80.0), Rotation::R0) else {
+        unreachable!()
+    };
+    p.panels.push(plate);
+    let found: Vec<String> = check(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    })
+    .into_iter()
+    .map(|f| f.message)
+    .collect();
+    assert!(!found.iter().any(|m| m.starts_with("panel ")), "{found:?}");
+    // The tag still only names a connection, so it gets no "has no part" note.
+    assert!(!found.iter().any(|m| m == "-L1 has no part"), "{found:?}");
+}
