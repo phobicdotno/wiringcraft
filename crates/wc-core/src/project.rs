@@ -1901,7 +1901,6 @@ impl Project {
         page.size.column_in(self.meta.template.column_count(), x)
     }
 
-    /// Sort pages by their display number, comparing numeric parts as numbers.
     /// The index of the cover page, if the project has one (the first page marked as cover).
     pub fn cover_page(&self) -> Option<usize> {
         self.pages.iter().position(|p| p.cover)
@@ -1924,6 +1923,8 @@ impl Project {
         Some(moved)
     }
 
+    /// Sort pages by their display number, comparing numeric parts as numbers.
+    /// Pages with the same number are ordered by their id.
     pub fn sort_pages(&mut self) {
         self.pages.sort_by(|a, b| {
             natural_key(&a.number)

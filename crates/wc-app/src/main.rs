@@ -1945,7 +1945,7 @@ impl App {
     }
 
     fn zoom(&mut self, f: f32) {
-        self.ed.view.zoom = (self.ed.view.zoom * f).clamp(0.3, 60.0);
+        self.ed.zoom_keys(f);
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) -> Vec<Action> {
