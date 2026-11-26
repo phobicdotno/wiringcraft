@@ -486,7 +486,7 @@ pub struct Open {
     marks: usize,
     /// `translations.toml` as it was when a command of the assistant started
     /// ([`Open::before_translations_command`]); the inner `None` is no file.
-    command_translations: Option<Option<String>>,
+    command_translations: Option<Result<Option<String>, String>>,
     /// The undo mark of the assistant turn running ([`Open::start_turn`]): while its first
     /// step is the oldest, a full history folds the steps after it into it instead of
     /// dropping it, so [`Open::squash_undo`] still makes the turn one step (#641).
@@ -2154,6 +2154,8 @@ impl Open {
             match outside_changes(&self.dir, &own, true, &self.unwritten_files) {
                 Ok(found) if found.is_empty() => {}
                 Ok(_) => {
+                    // Left as it is for good: nothing waits to be written over it either.
+                    self.unwritten_files.remove(rel);
                     changed.push(path.display().to_string());
                     continue;
                 }
@@ -3278,13 +3280,14 @@ impl Open {
         // Written on purpose: what was waiting to be written to it is let go. It held the
         // wrong text while it waited, so Undo, or a change taken back, goes back to what the
         // project needed it to hold.
-        let before = match self.unwritten_files.remove(&path) {
+        let before = match self.unwritten_files.get(&path) {
             Some(Some(bytes)) => {
-                Some(String::from_utf8(bytes).map_err(|e| format!("{}: {e}", self.dir.join(&path).display()))?)
+                Some(String::from_utf8(bytes.clone()).map_err(|e| format!("{}: {e}", self.dir.join(&path).display()))?)
             }
             Some(None) => None,
             None => before,
         };
+        self.unwritten_files.remove(&path);
         if after != before {
             self.record_file_edit(FileEdit { path, before, after });
         }
@@ -3295,7 +3298,8 @@ impl Open {
     /// what it changed there one undo step (#589): Undo puts the file back as it was just
     /// before `f` (removed when there was none), Redo writes it again. Nothing is recorded when
     /// the file is the same. A file that cannot be read as text refuses the change with the
-    /// read error before `f` runs, so it is never written over.
+    /// read error before `f` runs, so it is never written over. When `f` fails and what it left
+    /// cannot be read either, the error gives both reasons: there is no undo step for it.
     pub fn translations_change<R, E: std::fmt::Display>(
         &mut self,
         f: impl FnOnce(&Path) -> Result<R, E>,
@@ -3304,24 +3308,36 @@ impl Open {
         let r = f(&self.dir);
         // Whatever `f` answered, what it left in the file is what Undo takes back.
         let noted = self.note_translations_since(before);
-        let r = r.map_err(|e| e.to_string())?;
-        noted?;
-        Ok(r)
+        match (r, noted) {
+            (Ok(r), Ok(_)) => Ok(r),
+            (Ok(_), Err(why)) => Err(why),
+            (Err(e), Ok(_)) => Err(e.to_string()),
+            (Err(e), Err(why)) => Err(format!("{e}\n{}: {why}", Self::TRANSLATIONS_NO_STEP)),
+        }
     }
+
+    /// What is said when a change of `translations.toml` could not be made an undo step,
+    /// before the reason.
+    pub(crate) const TRANSLATIONS_NO_STEP: &str = "Undo will not take back what was changed in translations.toml";
 
     /// Before a command that may write `translations.toml` runs: keep the file as it is, so
     /// [`Open::note_translations`] after the command makes an undo step of the command's
-    /// change. A file that cannot be read is left out: no step is made for it.
+    /// change. A file that cannot be read is kept as that, with the reason: no step is made
+    /// for it, and [`Open::note_translations`] says why. No file is a file to start from.
     pub fn before_translations_command(&mut self) {
-        self.command_translations = self.read_translations().ok();
+        self.command_translations = Some(self.read_translations());
     }
 
     /// After the command [`Open::before_translations_command`] was called for: what it changed
-    /// in `translations.toml` is one undo step. Returns whether there is such a step.
-    pub fn note_translations(&mut self) -> bool {
+    /// in `translations.toml` is one undo step. Returns whether there is such a step. An error,
+    /// with the reason, when the file could not be read before the command or cannot be after
+    /// it: what the command changed in it, if anything, is then no undo step.
+    pub fn note_translations(&mut self) -> Result<bool, String> {
+        let no_step = |why: String| format!("{}: {why}", Self::TRANSLATIONS_NO_STEP);
         match self.command_translations.take() {
-            Some(before) => self.note_translations_since(before).unwrap_or(false),
-            None => false,
+            Some(Ok(before)) => self.note_translations_since(before).map_err(no_step),
+            Some(Err(why)) => Err(no_step(why)),
+            None => Ok(false),
         }
     }
 
@@ -9375,8 +9391,72 @@ pub(crate) mod tests {
         assert_eq!(o.undo_steps(), 0);
         // A command's change of such a file is no step either.
         o.before_translations_command();
-        assert!(!o.note_translations());
+        let err = o.note_translations().unwrap_err();
+        assert!(
+            err.starts_with(Open::TRANSLATIONS_NO_STEP) && err.contains("cannot be read"),
+            "{err}"
+        );
         assert_eq!(o.undo_steps(), 0);
+        // No command started: nothing to note, and nothing to report.
+        assert_eq!(o.note_translations(), Ok(false));
+    }
+
+    #[test]
+    fn a_translations_file_left_unreadable_is_reported_with_its_reason() {
+        let (_tmp, mut o) = project();
+        let file = o.dir.join(wc_core::translate::TRANSLATIONS_FILE);
+        let bytes = [0xff_u8, 0xfe, 0x00, 0x41];
+        // A change that fails after it left the file unreadable: both reasons.
+        let err = o
+            .translations_change(|_| {
+                std::fs::write(&file, bytes).and_then(|()| Err::<(), _>(std::io::Error::other("no room")))
+            })
+            .unwrap_err();
+        assert!(err.contains("no room"), "{err}");
+        assert!(
+            err.contains(Open::TRANSLATIONS_NO_STEP) && err.contains("cannot be read"),
+            "{err}"
+        );
+        assert_eq!(o.undo_steps(), 0);
+        // A command that leaves it so: no step, and the reason is not lost. No file before
+        // the command is a file to start from.
+        std::fs::remove_file(&file).unwrap();
+        o.before_translations_command();
+        std::fs::write(&file, bytes).unwrap();
+        let err = o.note_translations().unwrap_err();
+        assert!(
+            err.starts_with(Open::TRANSLATIONS_NO_STEP) && err.contains("cannot be read"),
+            "{err}"
+        );
+        assert_eq!(o.undo_steps(), 0);
+        std::fs::remove_file(&file).unwrap();
+        o.before_translations_command();
+        std::fs::write(&file, "source = \"en\"\n").unwrap();
+        assert_eq!(o.note_translations(), Ok(true));
+        assert_eq!(o.undo_steps(), 1);
+    }
+
+    #[test]
+    fn a_change_taken_back_puts_the_translations_back_when_the_macro_cannot_be_written() {
+        let (_tmp, mut o) = project();
+        let id = o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let clip = o.copy(1, &[Selection::Symbol(id)]);
+        let path = o.save_macro(&clip, "Coil", "").unwrap();
+        let first = std::fs::read_to_string(&path).unwrap();
+        let mark = o.mark();
+        assert!(translate(&mut o, "Control", "Styring"));
+        let mut form = crate::macro_form::Form::open(&path).unwrap();
+        form.description = "Gone".into();
+        o.save_macro_form(&form).unwrap();
+        // The macro, written last, is put back first and fails: the translations still go back.
+        fail_restores(&path, 0);
+        let err = o.back_to(mark).unwrap_err();
+        assert!(err.contains("written again on the next Save"), "{err}");
+        assert_eq!(translations_file(&o), None, "put back all the same");
+        assert!(o.mark_edits.is_empty());
+        let_restores_through();
+        o.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
     }
 
     #[test]

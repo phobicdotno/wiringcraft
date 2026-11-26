@@ -3570,8 +3570,15 @@ impl App {
         if let (Some(dir), Some(mark), Some(open)) = (ran_in, mark, self.open.as_mut())
             && open.dir == dir
         {
-            open.note_translations();
+            let noted = open.note_translations();
             open.squash_undo(mark);
+            // A file that could not be read makes no step: the answer says so, with why.
+            if let Err(why) = noted {
+                return match r {
+                    Ok(text) => Ok(format!("{text}\n{why}")),
+                    Err(e) => Err(format!("{e}\n{why}")),
+                };
+            }
         }
         r
     }
@@ -7441,6 +7448,38 @@ mod tests {
         let open = a.open.as_ref().unwrap();
         assert_eq!(open.undo_mark(), steps);
         assert!(!open.can_redo());
+    }
+
+    #[test]
+    fn a_command_that_leaves_the_translations_unreadable_says_there_is_no_undo_step() {
+        use wc_core::translate::TRANSLATIONS_FILE;
+        for failed in [false, true] {
+            let (_tmp, mut a) = app(vec![]);
+            let open = a.open.as_mut().unwrap();
+            open.save().unwrap();
+            let (dir, mark) = (open.dir.clone(), open.undo_mark());
+            open.before_translations_command();
+            a.assistant.command_base = Some((open.dir.clone(), open.project.clone()));
+            // Not UTF-8.
+            std::fs::write(dir.join(TRANSLATIONS_FILE), [0xff_u8, 0xfe, 0x00, 0x41]).unwrap();
+            let r = if failed {
+                Err("The command failed.".to_owned())
+            } else {
+                Ok("Done.".to_owned())
+            };
+            let answer = a.command_finish(r);
+            assert_eq!(answer.is_err(), failed, "{answer:?}");
+            let text = answer.unwrap_or_else(|e| e);
+            assert!(
+                text.contains(Open::TRANSLATIONS_NO_STEP) && text.contains("cannot be read"),
+                "{text}"
+            );
+            assert!(
+                text.starts_with(if failed { "The command failed." } else { "Done." }),
+                "{text}"
+            );
+            assert_eq!(a.open.as_ref().map(Open::undo_mark), Some(mark), "no undo step");
+        }
     }
 
     #[test]
