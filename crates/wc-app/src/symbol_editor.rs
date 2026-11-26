@@ -216,7 +216,8 @@ fn with_handle(shape: &Shape, k: usize, to: Point) -> Option<Shape> {
                 1 => (*start, a),
                 _ => return None,
             };
-            if start == end {
+            // The same direction, also when one is stored as 360 and the other as 0.
+            if (start - end).rem_euclid(360.0) == 0.0 {
                 return None;
             }
             Shape::Arc {
@@ -661,7 +662,13 @@ impl SymbolEditor {
             (Item::Shape(i), Some(k)) => {
                 if let Some(g) = self.symbol.graphics.get_mut(i)
                     && let Some(h) = handles(g).get(k).copied()
-                    && let Some(new) = with_handle(g, k, snap(h + raw))
+                    // A circle or arc rounds its own radius; snapping the point first would
+                    // lose radius and angle when dragging off the axes.
+                    && let to = match g {
+                        Shape::Circle { .. } | Shape::Arc { .. } => h + raw,
+                        _ => snap(h + raw),
+                    }
+                    && let Some(new) = with_handle(g, k, to)
                 {
                     *g = new;
                 }
@@ -1687,6 +1694,24 @@ mod tests {
         );
         assert_eq!(with_handle(&arc, 1, Point::new(2.5, 0.0)), None, "ends meet");
         assert_eq!(with_handle(&arc, 0, c), None, "no direction");
+        // An end stored as 360 meets an end dragged to 0 degrees.
+        let full = Shape::Arc {
+            center: c,
+            radius: 5.0,
+            start: 360.0,
+            end: 90.0,
+        };
+        assert_eq!(with_handle(&full, 1, Point::new(5.0, 0.0)), None, "360 and 0 meet");
+        assert_eq!(
+            with_handle(&full, 1, Point::new(-5.0, 0.0)),
+            Some(Shape::Arc {
+                center: c,
+                radius: 5.0,
+                start: 360.0,
+                end: 180.0
+            }),
+            "another direction is taken; the stored 360 stays"
+        );
     }
 
     #[test]
@@ -1714,6 +1739,35 @@ mod tests {
         assert_eq!(e.undo.len(), steps + 1, "one drag is one step");
         e.undo();
         assert_eq!(e.symbol, drawn, "undo brings the old circle back");
+        // Off the axes: the pointer is not snapped first (that would give (5, 2.5) and keep
+        // radius 5); its distance 6.64 rounds to 7.5.
+        e.selected = Some(Item::Shape(0));
+        e.start_drag(Point::new(5.0, 0.0));
+        e.drag_to(Point::new(6.2, 2.4));
+        e.end_drag();
+        assert!(matches!(e.symbol.graphics[0], Shape::Circle { radius, .. } if radius == 7.5));
+    }
+
+    #[test]
+    fn dragging_an_arc_end_off_the_axes_keeps_its_angle() {
+        let mut e = SymbolEditor::new(Vec::new());
+        e.symbol.graphics.push(Shape::Arc {
+            center: Point::new(0.0, 0.0),
+            radius: 5.0,
+            start: 90.0,
+            end: 180.0,
+        });
+        e.set_tool(Tool::Select);
+        e.selected = Some(Item::Shape(0));
+        // Grab the end at (-5, 0) and drag it to (5, 1): about 11.3 degrees, not 0.
+        e.start_drag(Point::new(-5.0, 0.0));
+        e.drag_to(Point::new(5.0, 1.0));
+        e.end_drag();
+        let Shape::Arc { radius, start, end, .. } = e.symbol.graphics[0] else {
+            unreachable!()
+        };
+        assert_eq!((radius, start), (5.0, 90.0));
+        assert!((end - 1.0_f64.atan2(5.0).to_degrees()).abs() < 1e-9, "end is {end}");
     }
 
     #[test]
