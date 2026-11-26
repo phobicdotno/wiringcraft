@@ -186,6 +186,21 @@ impl Editor {
         }
     }
 
+    /// Show page `page` instead of the page or panel shown now: the panel view closes, and
+    /// the selection is cleared and the view fitted. Nothing changes when `page` is shown
+    /// already; returns whether something did.
+    pub fn show_page(&mut self, page: usize) -> bool {
+        if self.page == page && self.panel.is_none() {
+            return false;
+        }
+        self.page = page;
+        self.panel = None;
+        self.panel_pick = None;
+        self.selection.clear();
+        self.view.fit = true;
+        true
+    }
+
     pub fn select_only(&mut self, s: Selection) {
         self.selection = vec![s];
     }

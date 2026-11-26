@@ -1676,12 +1676,11 @@ impl App {
                     Action::PrevPage => page.checked_sub(1),
                     _ => Some(page + 1),
                 };
-                if let Some(i) = to.filter(|&i| i < open.project.pages.len()) {
-                    self.ed.panel = None;
-                    self.ed.page = i;
-                    self.ed.selection.clear();
+                // A wire started on this page cannot end on another one.
+                if let Some(i) = to.filter(|&i| i < open.project.pages.len())
+                    && self.ed.show_page(i)
+                {
                     self.ed.wire = None;
-                    self.ed.view.fit = true;
                 }
             }
             Action::PageProps => {
@@ -5458,9 +5457,15 @@ impl App {
                     ed.delete_selected();
                     false
                 }
-                Action::Cut | Action::Copy | Action::Paste | Action::Rotate | Action::Mirror | Action::SelectAll => {
-                    false
-                }
+                // The page behind the symbol editor stays as it is.
+                Action::Cut
+                | Action::Copy
+                | Action::Paste
+                | Action::Rotate
+                | Action::Mirror
+                | Action::SelectAll
+                | Action::PrevPage
+                | Action::NextPage => false,
                 _ => true,
             })
             .collect()

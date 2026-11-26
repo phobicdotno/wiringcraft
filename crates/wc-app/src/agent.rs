@@ -1452,13 +1452,7 @@ impl App {
 
     /// Show a page on screen.
     fn go_to(&mut self, page: usize) {
-        if self.ed.page != page || self.ed.panel.is_some() {
-            self.ed.page = page;
-            self.ed.panel = None;
-            self.ed.panel_pick = None;
-            self.ed.selection.clear();
-            self.ed.view.fit = true;
-        }
+        self.ed.show_page(page);
     }
 
     /// Take the message a command left in a dialog, so the model gets it as a result.
@@ -5632,6 +5626,62 @@ mod tests {
             "the editor redid the delete"
         );
         assert_eq!(a.open.as_ref().unwrap().project, before, "the project was not touched");
+    }
+
+    #[test]
+    fn page_keys_do_not_switch_the_page_behind_the_symbol_editor() {
+        let (_tmp, mut a) = app(vec![]);
+        let keys = vec![Action::PrevPage, Action::NextPage, Action::ZoomIn];
+        assert_eq!(
+            a.route_to_symbol_editor(keys.clone()),
+            keys,
+            "closed: the project gets them"
+        );
+        a.symbol_editor = Some(crate::symbol_editor::SymbolEditor::new(Vec::new()));
+        a.ed.page = 0;
+        for act in a.route_to_symbol_editor(keys) {
+            a.run(act);
+        }
+        assert_eq!(a.ed.page, 0, "the page under the symbol editor stays");
+    }
+
+    #[test]
+    fn going_to_a_page_closes_the_panel_and_clears_the_selection() {
+        let (_tmp, mut a) = app(vec![]);
+        let fresh = |a: &mut App| {
+            a.ed.view.fit = false;
+            a.ed.selection = vec![crate::state::Selection::Graphic(0)];
+        };
+        fresh(&mut a);
+        a.ed.page = 0;
+        a.go_to(0);
+        assert!(
+            !a.ed.view.fit && a.ed.selection.len() == 1,
+            "the page shown: nothing changes"
+        );
+
+        a.go_to(1);
+        assert_eq!(a.ed.page, 1);
+        assert!(a.ed.view.fit && a.ed.selection.is_empty());
+
+        // From a panel back to the page under it: the panel and its pick go.
+        fresh(&mut a);
+        a.ed.panel = Some(0);
+        a.ed.panel_pick = Some(0);
+        a.go_to(1);
+        assert_eq!((a.ed.panel, a.ed.panel_pick), (None, None));
+        assert!(a.ed.view.fit && a.ed.selection.is_empty());
+
+        // Next page does the same, and also drops a wire being drawn.
+        fresh(&mut a);
+        a.ed.page = 0;
+        a.ed.panel = Some(0);
+        a.ed.panel_pick = Some(0);
+        let at = wc_core::geom::Point::new(0.0, 0.0);
+        a.ed.wire = Some((wc_core::Endpoint::Point { at }, Vec::new()));
+        a.run(Action::NextPage);
+        assert_eq!((a.ed.page, a.ed.panel, a.ed.panel_pick), (1, None, None));
+        assert!(a.ed.view.fit && a.ed.selection.is_empty() && a.ed.wire.is_none());
     }
 
     #[test]
