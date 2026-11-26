@@ -70,6 +70,17 @@ pub fn cloud_index(item: &str) -> Option<usize> {
 /// `wc_library::library_rules`): they run before the project's own, less the ones the project
 /// turns off.
 pub fn check_with(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet]) -> Vec<Finding> {
+    check_with_unreadable(i, library, &BTreeMap::new())
+}
+
+/// [`check_with`], told which used parts have a copy in the project's library that cannot be
+/// read, by id with the reason. Such a part is reported with its reason, not as missing from
+/// the library copy.
+pub fn check_with_unreadable(
+    i: &Inputs<'_>,
+    library: &[wc_core::check_rule::RuleSet],
+    unreadable: &BTreeMap<String, String>,
+) -> Vec<Finding> {
     let p = i.project;
     let mut out = Vec::new();
     let role = |symbol: &str| i.symbols.get(symbol).map(|s| s.role);
@@ -442,7 +453,41 @@ pub fn check_with(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet]) -> V
         }
     }
 
-    // Devices without a part.
+    // Devices without a part, and parts (main, accessory or a jumper's) that the project's
+    // library copy does not have: the parts list shows those without a maker, and their
+    // contacts cannot be checked.
+    // Every device in the devices file counts, even one drawn only as interruption points:
+    // its parts are named explicitly.
+    let missing = |part: &str| match unreadable.get(part) {
+        _ if i.parts.contains_key(part) => None,
+        Some(why) => Some(format!(
+            "part {part} in the project's library copy cannot be read: {why}"
+        )),
+        None => Some(format!("part {part} is missing from the project's library copy")),
+    };
+    for (tag, device) in &p.devices {
+        // A part named twice gives one warning: equal findings are merged below.
+        for (part, _) in device.all_parts() {
+            if let Some(what) = missing(part) {
+                out.push(Finding {
+                    severity: Severity::Warning,
+                    page_id: None,
+                    item: None,
+                    message: format!("{tag}: {what}"),
+                });
+            }
+        }
+    }
+    for j in &p.meta.jumpers {
+        if let Some(what) = j.part.as_deref().and_then(missing) {
+            out.push(Finding {
+                severity: Severity::Warning,
+                page_id: None,
+                item: None,
+                message: format!("jumper of {}: {what}", j.strip),
+            });
+        }
+    }
     for tag in crate::all_tags(i) {
         if p.devices.get(&tag).and_then(|d| d.part.as_ref()).is_none() {
             out.push(Finding {
