@@ -4481,6 +4481,12 @@ mod tests {
         put(40.0);
         put(60.0);
         o.project.meta.add_jumper(&x1, &["2".into(), "3".into()]).unwrap();
+        // A rail order that names the terminals by number: C, A, B.
+        o.project.meta.strips.push(wc_core::project::StripLayout {
+            strip: x1.clone(),
+            order: vec!["3".into(), "1".into(), "2".into()],
+            spares: Vec::new(),
+        });
         let before = o.project.clone();
         let mut ed = Editor {
             page,
@@ -4492,13 +4498,17 @@ mod tests {
         o.follow_terminals();
         let jumper = |o: &Open| o.project.meta.jumpers[0].terminals.clone();
         assert_eq!(jumper(&o), ["1", "2"], "followed during the drag");
+        assert_ne!(o.project.meta.strips, before.meta.strips, "the rail order followed too");
         // A sync brings someone else's device in meanwhile.
         let other = wc_core::DeviceTag::parse("-K9").unwrap();
         o.project.devices.insert(other.clone(), Default::default());
         cancel_drag(&mut o, &mut ed);
         assert_eq!(o.project.pages, before.pages);
         assert_eq!(jumper(&o), ["2", "3"], "the jumper joins B and C again");
-        assert_eq!(o.project.meta.strips, before.meta.strips);
+        assert_eq!(
+            o.project.meta.strips, before.meta.strips,
+            "and the rail order is C, A, B again"
+        );
         assert!(o.project.devices.contains_key(&other), "the synced device stays");
     }
 
