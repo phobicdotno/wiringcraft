@@ -30,6 +30,14 @@ fn ends_within(child: &mut Child, limit: Duration) -> Result<bool, Box<dyn std::
     Ok(false)
 }
 
+/// Let a writer still waiting to open `fifo` through, so a failing test ends instead of
+/// hanging. Opened for reading and writing, which does not wait for the other end, so it never
+/// blocks, also when the writer is already gone.
+#[cfg(unix)]
+fn release_fifo_writer(fifo: &Path) {
+    drop(std::fs::OpenOptions::new().read(true).write(true).open(fifo));
+}
+
 #[test]
 fn a_command_waits_for_the_lock_another_process_holds() -> TestResult {
     let tmp = tempfile::tempdir()?;
@@ -208,10 +216,7 @@ fn a_command_reads_a_named_fifo_before_it_waits_for_the_lock() -> TestResult {
         child.kill()?;
     }
     let out = child.wait_with_output()?;
-    if !writer.is_finished() {
-        // Unblock a writer still waiting for a reader, so the test ends.
-        drop(std::fs::File::open(&fifo));
-    }
+    release_fifo_writer(&fifo);
     let written = writer.join();
     assert!(read_first, "the FIFO is read before the lock is taken");
     assert!(waits, "it waits for the lock");
@@ -277,9 +282,7 @@ fn a_wago_import_reads_a_named_fifo_before_it_waits_for_the_lock() -> TestResult
         child.kill()?;
     }
     let out = child.wait_with_output()?;
-    if !writer.is_finished() {
-        drop(std::fs::File::open(&fifo));
-    }
+    release_fifo_writer(&fifo);
     let written = writer.join();
     assert!(read_first, "the FIFO is read before the lock is taken");
     assert!(waits, "it waits for the lock");
@@ -400,9 +403,7 @@ fn a_plc_csv_import_reads_a_named_fifo_before_it_waits_for_the_lock() -> TestRes
         child.kill()?;
     }
     let out = child.wait_with_output()?;
-    if !writer.is_finished() {
-        drop(std::fs::File::open(&fifo));
-    }
+    release_fifo_writer(&fifo);
     let written = writer.join();
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(read_first, "the FIFO is read before the lock is taken: {err}");
