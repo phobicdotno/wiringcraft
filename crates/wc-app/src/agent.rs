@@ -526,7 +526,7 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "run_check",
-            "Check the project: devices drawn twice, contacts without a coil, shorted potentials, open pins, wires ending in the air, wires with both ends on one pin, devices without a part, then the check rules of the project's library sources (less the ones the project turns off) and the project's own check rules (see the rules tool).",
+            "Check the project: devices drawn twice, contacts without a coil, shorted potentials, open pins, wires ending in the air, wires with both ends on one pin, a connection with two wire numbers or a wire number on two connections, devices without a part, then the check rules of the project's library sources (less the ones the project turns off) and the project's own check rules (see the rules tool).",
             json!({}),
             &[],
         ),
@@ -622,7 +622,7 @@ pub fn specs() -> Vec<Value> {
             "run_command",
             "Run a wiringcraft command-line command on the open project (unsaved changes are saved first, and the project is reloaded after). Covers everything. \
              Project and pages: new (a project folder, --template), page (add, list, remove, overview, size, cover, fields), template (show, columns, reset: frame columns and title block), logo (show, set, remove), location (list, set, remove). \
-             Drawing: place, box (a black box with connection points, --pin name:side:offset), box-edit (resize a black box, rename or move its points), wire, device (part, description), number-wires, macro (list, place, show, edit: a project macro's placeholders and value sets), find (text in pages, --replace, --match-case). \
+             Drawing: place, box (a black box with connection points, --pin name:side:offset), box-edit (resize a black box, rename or move its points), wire, delete (symbols and wires by id), device (part, description), number-wires, macro (list, place, show, edit: a project macro's placeholders and value sets), find (text in pages, --replace, --match-case). \
              Terminals: strip (list, order, move, spare, unspare, level), jumper (add, remove, part, list). \
              Revisions: revision (list, add, edit, remove, cloud, uncloud, table). \
              Panels: panel (new, arrange, step, device, show, list, remove). PLC: rack (list, add, set, remove, card add/set/remove: PLC racks and their cards by slot). \
@@ -5333,6 +5333,30 @@ mod tests {
             );
         }
         assert!(shortcuts_for(&mut a, egui::Key::Backspace, egui::Modifiers::COMMAND).is_empty());
+    }
+
+    /// The plus key zooms in with or without Shift, and so does the unshifted = key it shares
+    /// on many keyboards; Alt with them is not a zoom shortcut here (#685).
+    #[test]
+    fn plus_zooms_in_with_or_without_shift() {
+        let (_tmp, mut a) = app(vec![]);
+        for key in [egui::Key::Plus, egui::Key::Equals] {
+            for m in [egui::Modifiers::NONE, egui::Modifiers::SHIFT] {
+                assert_eq!(shortcuts_for(&mut a, key, m), vec![Action::ZoomIn], "{key:?} {m:?}");
+            }
+            assert!(!shortcuts_for(&mut a, key, egui::Modifiers::ALT).contains(&Action::ZoomIn));
+            // Ctrl+Shift on a Mac: Ctrl set, Command not.
+            let mac_ctrl_shift = egui::Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            };
+            assert!(!shortcuts_for(&mut a, key, mac_ctrl_shift).contains(&Action::ZoomIn));
+        }
+        assert_eq!(
+            shortcuts_for(&mut a, egui::Key::Minus, egui::Modifiers::NONE),
+            vec![Action::ZoomOut]
+        );
     }
 
     #[test]

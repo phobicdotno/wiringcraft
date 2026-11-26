@@ -88,7 +88,7 @@ For the other areas, the chapter to read in each help is:
 | Function | EPLAN | SWE | WiringCraft | Triage |
 |---|---|---|---|---|
 | Place, move, rotate, mirror symbols | yes | yes | yes | done |
-| Select, box select, copy, cut, paste, duplicate (Ctrl+D), delete, undo/redo | yes | yes | yes | done |
+| Select, box select, copy, cut, paste, duplicate (Ctrl+D), delete, undo/redo | yes | yes | yes; `wiringcraft delete <page> <ids>` deletes symbols and wires (and the wires on a deleted symbol) from the command line | done (#845) |
 | Grid, snap, zoom, pan, fit page | yes | yes | yes | done |
 | Free graphics: lines, rectangles, texts | yes | yes | yes | done |
 | Circles, arcs and polylines in the editor | yes | yes | yes: drawn by hand (Graphics toolbar), picked, moved, deleted and exported like other drawings | done |
@@ -216,7 +216,7 @@ For the other areas, the chapter to read in each help is:
 | Function | EPLAN | SWE | WiringCraft | Triage |
 |---|---|---|---|---|
 | PDF export with links and layers | yes | yes | yes | done |
-| DXF / SVG export | yes (DXF/DWG) | yes (DWG/DXF) | yes | done |
+| DXF / SVG export | yes (DXF/DWG) | yes (DWG/DXF) | yes: one file per schematic page and one per panel layout (`panel-<name>`: plate, rails, ducts, device outlines and tags as on its PDF sheet) | done (#927) |
 | DXF import: ELLIPSE, SPLINE, HATCH | yes | yes | yes: sampled curves, solid hatches filled | done |
 | DWG read and write | yes | yes | read: AutoCAD 2004 to 2018 drawings (AC1018 to AC1032; later releases still save in the 2018 format), for SolidWorks Electrical symbols and pages; no write | read done (#161, #162, #163, #215, #292); write not planned, DXF covers it |
 | Import EPLAN projects | - | yes (some) | yes | done |

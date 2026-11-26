@@ -509,7 +509,14 @@ impl chrome::Status for StatusView<'_> {
             Action::Delete | Action::Copy | Action::Cut | Action::Duplicate | Action::SaveMacro => {
                 has && !self.ed.selection.is_empty()
             }
-            Action::Rotate if self.ed.panel.is_some() => has && self.ed.panel_pick.is_some(),
+            // Only a device turns; a picked rail or duct does not.
+            Action::Rotate if self.ed.panel.is_some() => {
+                has && self.open.as_ref().is_some_and(|o| {
+                    let picked = self.ed.panel.zip(self.ed.panel_pick);
+                    let item = picked.and_then(|(pi, i)| o.project.panels.get(pi)?.items.get(i));
+                    matches!(item, Some(wc_core::panel::PanelItem::Device { .. }))
+                })
+            }
             Action::Mirror if self.ed.panel.is_some() => false,
             Action::Rotate | Action::Mirror => {
                 has && self.ed.selection.iter().any(|s| matches!(s, Selection::Symbol(_)))
@@ -595,16 +602,9 @@ impl App {
             .as_ref()
             .and_then(|o| o.project.pages.get(self.ed.page))
             .map(|p| p.id.clone());
-        // The panel shown and its picked device, found again by id and tag after the sync: a
-        // merge replaces whole panels, so their places in the lists can change.
-        let panel_before = self.open.as_ref().and_then(|o| {
-            let p = o.project.panels.get(self.ed.panel?)?;
-            let tag = self.ed.panel_pick.and_then(|i| match p.items.get(i)? {
-                wc_core::panel::PanelItem::Device { tag, .. } => Some(tag.clone()),
-                _ => None,
-            });
-            Some((p.id.clone(), tag))
-        });
+        // The panel shown and its picked item, found again after the sync: a merge replaces
+        // whole panels, so their places in the lists can change.
+        let panel_before = self.open.as_ref().and_then(|o| panel_pick_before(&self.ed, &o.project));
         // The shown page's graphics, so a selection follows its items when a merge moves them.
         let graphics_before = self
             .open
@@ -631,8 +631,8 @@ impl App {
             self.open = Some(joined);
             // The id belonged to the project left behind.
             shown = None;
-        } else if let (Some((id, tag)), Some(o)) = (&panel_before, &self.open) {
-            follow_panel_pick(&mut self.ed, &o.project, id, tag.as_ref());
+        } else if let (Some((id, pick)), Some(o)) = (&panel_before, &self.open) {
+            follow_panel_pick(&mut self.ed, &o.project, id, pick.as_ref());
         }
         // Others may have added or removed pages before this one: keep showing the same page.
         if let (Some(id), Some(o)) = (&shown, &self.open)
@@ -1565,12 +1565,7 @@ impl App {
             }
             Action::Delete if self.ed.panel.is_some() => {
                 if let (Some(pi), Some(item)) = (self.ed.panel, self.ed.panel_pick.take()) {
-                    open.checkpoint();
-                    if let Some(panel) = open.project.panels.get_mut(pi)
-                        && item < panel.items.len()
-                    {
-                        panel.items.remove(item);
-                    }
+                    open.delete_panel_item(pi, item);
                 }
             }
             Action::NewPanel => {
@@ -2054,11 +2049,18 @@ impl App {
                 (Key::G, Action::ToggleGrid),
                 (Key::F, Action::ZoomFit),
                 (Key::Plus, Action::ZoomIn),
+                // The unshifted key that has + on it on many keyboards (US: = and +).
+                (Key::Equals, Action::ZoomIn),
                 (Key::Minus, Action::ZoomOut),
                 (Key::PageUp, Action::PrevPage),
                 (Key::PageDown, Action::NextPage),
             ] {
-                if pressed_with(i, k, Modifiers::is_none) {
+                // + often needs Shift, so the zoom-in keys also count with Shift held.
+                // Shift and nothing else: `shift_only` does not look at the Mac's Ctrl key.
+                let zoom_in = matches!(k, Key::Plus | Key::Equals);
+                let ok =
+                    |m: &Modifiers| m.is_none() || (zoom_in && m.shift && !(m.ctrl || m.alt || m.command || m.mac_cmd));
+                if pressed_with(i, k, ok) {
                     out.push(a);
                 }
             }
@@ -5252,7 +5254,8 @@ fn same_dir(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// Every page as SVG and DXF in `export/drawings`, named by page number.
+/// Every page as SVG and DXF in `export/drawings`, named by page number, and every panel
+/// layout, named `panel-<name>`.
 fn export_drawings(open: &Open) -> String {
     export_drawings_to(open, &open.dir.join("export").join("drawings"))
 }
@@ -5263,6 +5266,8 @@ fn export_drawings_to(open: &Open, dir: &Path) -> String {
     let options = wc_pdf::Options {
         underlays: pictures.files,
         unreadable: pictures.unreadable,
+        panels: open.project.panels.clone(),
+        footprints: wc_pdf::footprints(open.parts.values()),
         ..Default::default()
     };
     let (pages, report) = wc_pdf::page_drawings(&open.project, &open.symbols, &options);
@@ -5270,15 +5275,19 @@ fn export_drawings_to(open: &Open, dir: &Path) -> String {
     let files: Vec<(String, &wc_pdf::PageDrawing)> = pages
         .iter()
         .map(|page| {
-            let base = if page.number.trim().is_empty() {
-                &page.id
+            // A panel layout is named after itself (`panel-Main_cabinet`), a page by its number.
+            let mut stem = if page.panel {
+                wc_pdf::panel_file_stem(page)
             } else {
-                page.number.trim()
+                let base = if page.number.trim().is_empty() {
+                    &page.id
+                } else {
+                    page.number.trim()
+                };
+                base.chars()
+                    .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+                    .collect()
             };
-            let mut stem: String = base
-                .chars()
-                .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
-                .collect();
             // Compared without case: `A1` and `a1` are one file name on Windows and macOS.
             while !used.insert(stem.to_lowercase()) {
                 stem.push('_');
@@ -5340,7 +5349,12 @@ fn export_drawings_to(open: &Open, dir: &Path) -> String {
     }
     match written {
         Ok(()) => {
-            let mut m = format!("Exported {} pages as SVG and DXF to\n{}", pages.len(), dir.display());
+            let panels = pages.iter().filter(|p| p.panel).count();
+            let mut m = format!("Exported {} pages", pages.len() - panels);
+            if panels > 0 {
+                m.push_str(&format!(" and {panels} panel layout(s)"));
+            }
+            m.push_str(&format!(" as SVG and DXF to\n{}", dir.display()));
             if !report.warnings.is_empty() {
                 m.push_str("\n\nWarnings:\n");
                 m.push_str(&report.warnings.join("\n"));
@@ -5992,20 +6006,46 @@ fn confirm_page_props(
     o.set_page_props(i, number, title, size, overview, Some(fields))
 }
 
-/// After a shared-session sync: show panel `id` and pick the device `tag` on it again, wherever
-/// they are now; a panel or device that is gone is no longer shown or picked.
-fn follow_panel_pick(ed: &mut Editor, project: &wc_core::Project, id: &str, tag: Option<&wc_core::DeviceTag>) {
+/// The shown panel's id and its picked item with that item's place, kept before a shared-session
+/// sync so `follow_panel_pick` can find them again afterwards.
+fn panel_pick_before(
+    ed: &Editor,
+    project: &wc_core::Project,
+) -> Option<(String, Option<(usize, wc_core::panel::PanelItem)>)> {
+    let p = project.panels.get(ed.panel?)?;
+    let pick = ed.panel_pick.and_then(|i| Some((i, p.items.get(i)?.clone())));
+    Some((p.id.clone(), pick))
+}
+
+/// After a shared-session sync: show panel `id` and pick its item again, wherever they are now.
+/// A device is found by its tag; a rail or duct by its kind and exact place and size, at its old
+/// place in the list when it is still there. A panel or item that is gone is no longer shown or
+/// picked.
+fn follow_panel_pick(
+    ed: &mut Editor,
+    project: &wc_core::Project,
+    id: &str,
+    pick: Option<&(usize, wc_core::panel::PanelItem)>,
+) {
+    use wc_core::panel::PanelItem;
     let Some((pi, panel)) = project.panels.iter().enumerate().find(|(_, p)| p.id == id) else {
         ed.panel = None;
         ed.panel_pick = None;
         return;
     };
     ed.panel = Some(pi);
-    ed.panel_pick = tag.and_then(|tag| {
-        panel
+    ed.panel_pick = pick.and_then(|(old, item)| match item {
+        PanelItem::Device { tag, .. } => panel
             .items
             .iter()
-            .position(|i| matches!(i, wc_core::panel::PanelItem::Device { tag: t, .. } if t == tag))
+            .position(|i| matches!(i, PanelItem::Device { tag: t, .. } if t == tag)),
+        PanelItem::Rail { .. } | PanelItem::Duct { .. } => {
+            if panel.items.get(*old) == Some(item) {
+                Some(*old)
+            } else {
+                panel.items.iter().position(|i| i == item)
+            }
+        }
     });
 }
 
@@ -6776,6 +6816,31 @@ mod marking_tests {
     }
 
     #[test]
+    fn drawings_include_a_file_per_panel_layout() {
+        let (_tmp, mut o) = state::tests::project();
+        o.project.pages.truncate(1);
+        o.project.pages[0].number = "1".into();
+        o.project.panels.push(wc_core::panel::Panel::with_rails(
+            "plate1",
+            "Main cabinet",
+            600.0,
+            800.0,
+        ));
+        let own = o.dir.join("export").join("drawings");
+        let msg = export_drawings_to(&o, &own);
+        assert!(msg.starts_with("Exported 1 pages and 1 panel layout(s)"), "{msg}");
+        let mut names: Vec<String> = std::fs::read_dir(&own)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["1.dxf", "1.svg", "panel-Main_cabinet.dxf", "panel-Main_cabinet.svg"]
+        );
+    }
+
+    #[test]
     fn drawings_replace_their_own_folder_also_when_it_is_picked_by_another_route() {
         let (_tmp, o) = state::tests::project();
         let own = o.dir.join("export").join("drawings");
@@ -7252,7 +7317,8 @@ mod held_tests {
         a.items = vec![device("-K2", 30.0), device("-K1", 0.0)];
         project.panels = vec![Panel::new("0", "first", 10.0, 10.0), a];
         let mut ed = Editor::default();
-        let k1 = wc_core::DeviceTag::parse("-K1").ok();
+        // Picked at place 0 before the sync.
+        let k1 = Some((0, device("-K1", 0.0)));
         // Another panel came first and the devices were reordered: still panel "a", still -K1.
         follow_panel_pick(&mut ed, &project, "a", k1.as_ref());
         assert_eq!((ed.panel, ed.panel_pick), (Some(1), Some(1)));
@@ -7263,6 +7329,53 @@ mod held_tests {
         // The panel was removed.
         follow_panel_pick(&mut ed, &project, "gone", k1.as_ref());
         assert_eq!((ed.panel, ed.panel_pick), (None, None));
+    }
+
+    #[test]
+    fn a_picked_rail_or_duct_stays_picked_after_a_sync_and_delete_takes_it() {
+        use wc_core::panel::{Panel, PanelItem};
+        let rail = |y: f64| PanelItem::Rail {
+            at: wc_core::Point::new(20.0, y),
+            length: 560.0,
+        };
+        let duct = PanelItem::Duct {
+            min: wc_core::Point::new(0.0, 0.0),
+            max: wc_core::Point::new(600.0, 60.0),
+        };
+        let (_tmp, mut o) = crate::state::tests::project();
+        let mut panel = Panel::new("panel1", "Panel 1", 600.0, 800.0);
+        panel.items = vec![duct.clone(), rail(150.0), rail(300.0)];
+        o.project.panels.push(panel);
+        let mut ed = Editor::default();
+        ed.panel = Some(0);
+        for picked in [1, 0] {
+            ed.panel_pick = Some(picked);
+            // A sync that changed nothing keeps the pick.
+            let Some((id, pick)) = panel_pick_before(&ed, &o.project) else {
+                unreachable!("a panel is shown")
+            };
+            follow_panel_pick(&mut ed, &o.project, &id, pick.as_ref());
+            assert_eq!((ed.panel, ed.panel_pick), (Some(0), Some(picked)));
+        }
+        // Delete then takes the picked item off in one undo step.
+        let steps = o.undo_steps();
+        let (Some(pi), Some(item)) = (ed.panel, ed.panel_pick.take()) else {
+            unreachable!("the duct is picked")
+        };
+        assert!(o.delete_panel_item(pi, item));
+        assert_eq!(o.undo_steps(), steps + 1);
+        assert_eq!(o.project.panels[0].items, vec![rail(150.0), rail(300.0)]);
+
+        // Another person put a duct first: the same rail is found at its new place.
+        ed.panel_pick = Some(1);
+        let pick = panel_pick_before(&ed, &o.project).and_then(|(_, p)| p);
+        o.project.panels[0].items.insert(0, duct.clone());
+        follow_panel_pick(&mut ed, &o.project, "panel1", pick.as_ref());
+        assert_eq!(ed.panel_pick, Some(2));
+        // The rail was moved or removed by the other person: nothing picked.
+        o.project.panels[0].items[2] = rail(310.0);
+        follow_panel_pick(&mut ed, &o.project, "panel1", pick.as_ref());
+        assert_eq!(ed.panel_pick, None);
     }
 }
 

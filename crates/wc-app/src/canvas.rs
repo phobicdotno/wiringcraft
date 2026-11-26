@@ -1111,7 +1111,7 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, show_grid: bool
     match ed.tool {
         Tool::Select => select_tool(&painter, &resp, open, ed, &page, &xf, tol, snap_step, held),
         Tool::Place => place_tool(&painter, &resp, open, ed, &xf, &t),
-        Tool::Wire => wire_tool(&painter, &resp, open, ed, &page, &xf, &t),
+        Tool::Wire => wire_tool(&painter, &resp, open, ed, &page, &xf, &shown, &t, snap_step),
         Tool::Text => {
             if resp.clicked_by(egui::PointerButton::Primary)
                 && let Some(at) = ed.cursor
@@ -2310,6 +2310,7 @@ fn place_tool(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn wire_tool(
     painter: &egui::Painter,
     resp: &egui::Response,
@@ -2317,31 +2318,46 @@ fn wire_tool(
     ed: &mut Editor,
     page: &Page,
     xf: &Xf,
+    shown: &Xf,
     t: &theme::Theme,
+    snap_step: f64,
 ) {
-    let Some(cur) = ed.cursor else { return };
-    let raw = resp.hover_pos().map(|p| xf.mm(p)).unwrap_or(cur);
-    let near = open.pin_near(page, raw, PIN_CATCH);
-    let target = near.as_ref().map(|(_, _, p)| *p).unwrap_or(cur);
-    if let Some((_, _, p)) = &near {
-        painter.circle_stroke(xf.s(*p), 6.0, Stroke::new(1.5_f32, t.selection));
-    }
-    if let Some((start, via)) = &ed.wire {
-        let mut pts = vec![open.end_pos(page, start).unwrap_or(target)];
-        pts.extend(via.iter().copied());
-        // Rubber band: an orthogonal elbow from the last point to the pointer.
-        if let Some(last) = pts.last().copied()
-            && last.x != target.x
-            && last.y != target.y
-        {
-            pts.push(Point::new(last.x, target.y));
+    // The pin under the pointer and the rubber band follow the hover position.
+    if let Some(cur) = ed.cursor {
+        let raw = resp.hover_pos().map(|p| xf.mm(p)).unwrap_or(cur);
+        let near = open.pin_near(page, raw, PIN_CATCH);
+        let target = near.as_ref().map(|(_, _, p)| *p).unwrap_or(cur);
+        if let Some((_, _, p)) = &near {
+            painter.circle_stroke(xf.s(*p), 6.0, Stroke::new(1.5_f32, t.selection));
         }
-        pts.push(target);
-        painter.add(EShape::line(
-            pts.iter().map(|q| xf.s(*q)).collect(),
-            Stroke::new(1.5_f32, t.ghost),
-        ));
+        if let Some((start, via)) = &ed.wire {
+            let mut pts = vec![open.end_pos(page, start).unwrap_or(target)];
+            pts.extend(via.iter().copied());
+            // Rubber band: an orthogonal elbow from the last point to the pointer.
+            if let Some(last) = pts.last().copied()
+                && last.x != target.x
+                && last.y != target.y
+            {
+                pts.push(Point::new(last.x, target.y));
+            }
+            pts.push(target);
+            painter.add(EShape::line(
+                pts.iter().map(|q| xf.s(*q)).collect(),
+                Stroke::new(1.5_f32, t.ghost),
+            ));
+        }
     }
+    if !resp.double_clicked() && !resp.clicked_by(egui::PointerButton::Primary) {
+        return;
+    }
+    // A click places its point where the button was released (the pointer may have moved on
+    // before this frame), in the view the user saw.
+    let Some(pos) = primary_release_pos(&resp.ctx).or(resp.interact_pointer_pos()) else {
+        return;
+    };
+    let raw = shown.mm(pos);
+    let cur = snap(raw, snap_step);
+    let near = open.pin_near(page, raw, PIN_CATCH);
     let end = match &near {
         Some((item, pin, _)) => Endpoint::Pin {
             item: item.clone(),
@@ -4020,6 +4036,55 @@ mod tests {
         click_at(&ctx, &mut o, &mut ed, end, 4.1);
         assert!(ed.wire.is_none());
         assert_eq!(wires(&o), 1);
+    }
+
+    #[test]
+    fn the_wire_tool_places_points_where_the_button_was_released() {
+        let (_tmp, mut o) = project();
+        let mut ed = Editor {
+            tool: Tool::Wire,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        painted(&ctx, &mut o, &mut ed, 0.5, vec![]);
+        ed.view = View {
+            zoom: 3.0,
+            offset: Vec2::new(300.0, 300.0),
+            fit: false,
+            ..Default::default()
+        };
+        let off = egui::pos2(40.0, 40.0);
+        // Press at `pos`, then release there and move off the sheet in the same frame; returns
+        // where the pointer was when the button went down, in page mm.
+        let click_then_leave = |o: &mut Open, ed: &mut Editor, pos: egui::Pos2, t: f64| {
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            painted(&ctx, o, ed, t, vec![egui::Event::PointerMoved(pos)]);
+            let at = ed.cursor.unwrap();
+            painted(&ctx, o, ed, t + 0.01, vec![button(true)]);
+            painted(
+                &ctx,
+                o,
+                ed,
+                t + 0.02,
+                vec![button(false), egui::Event::PointerMoved(off)],
+            );
+            assert!(!on_paper(o, 0, ed.cursor.unwrap()), "{:?}", ed.cursor);
+            at
+        };
+
+        let start = click_then_leave(&mut o, &mut ed, egui::pos2(500.0, 450.0), 1.0);
+        assert!(on_paper(&o, 0, start), "{start:?}");
+        assert_ne!(ed.message, "Click on the sheet to draw the wire.");
+        assert_eq!(ed.wire, Some((Endpoint::Point { at: start }, Vec::new())));
+
+        let bend = click_then_leave(&mut o, &mut ed, egui::pos2(500.0, 550.0), 2.0);
+        assert_eq!(ed.wire, Some((Endpoint::Point { at: start }, vec![bend])));
     }
 
     /// Page 2 with a free text, a numbered wire, a coil -K1 whose contact is on page 3 (so a
