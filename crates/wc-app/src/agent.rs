@@ -628,7 +628,7 @@ pub fn specs() -> Vec<Value> {
              Panels: panel (new, arrange, step, device, show, list, remove). PLC: rack (list, add, set, remove, card add/set/remove: PLC racks and their cards by slot). \
              Libraries: lib (add, sync, status, update, lock, search, propose). \
              Import: import (symbol-dxf, symbol-svg, symbol-kicad, symbol-qet, footprint-dxf, model-step, parts-csv, parts-bmecat, parts-edz, plc-csv, wago, archive, page-dxf, page-dwg, pdf, eplan, swe, swe-library, aml). \
-             Output: pdf (--page, --report, --lang for a translated print), drawing (SVG/DXF per page), report, nets, aml, plc-vars, export (wago-marking, wago-configurator), translations (texts missing a translation, --lang). \
+             Output: pdf (--page, --report, --lang for a translated print), drawing (SVG/DXF per page), report, report-layout (show, set, reset: a report's columns, sorting, grouping and title-block values), nets, aml, plc-vars, export (wago-marking, wago-configurator), translations (texts missing a translation, --lang). \
              Checks and history: check, rules (list, set, off, on: the check rules and library rules the project turns off), inspect (another tool's archive), vcs (init, commit, branch, switch, merge, log, changes, page-log), comment (add, reply, resolve, reopen, remove, list). \
              Use [\"--help\"] or [\"<command>\", \"--help\"] for the arguments.",
             json!({"args": {"type": "array", "items": {"type": "string"}, "description": "Arguments, e.g. [\"plc-vars\", \"export/io.st\"]. The project folder is passed for you."}}),
@@ -864,45 +864,6 @@ fn selection_id(sel: &Selection) -> String {
 /// The open project, or the error the model sees when there is none.
 fn need_open(open: Option<&mut Open>) -> Result<&mut Open, String> {
     open.ok_or_else(|| "No project is open. Use open_project first.".to_owned())
-}
-
-/// An error naming the first key of a report layout (or of one of its column entries) that
-/// [`wc_core::report_layout::ReportLayout`] does not have, since serde would drop it silently
-/// (`columns` for `column` would then keep the built-in columns). The known keys are the ones
-/// the layout itself serializes, so they follow its fields.
-fn report_layout_unknown_key(layout: &serde_json::Map<String, Value>) -> Result<(), String> {
-    use wc_core::report_layout::{ReportColumn, ReportLayout};
-    let keys = |v: Value| -> Vec<String> { v.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default() };
-    let column = ReportColumn {
-        from: "x".into(),
-        heading: Some("x".into()),
-    };
-    let known = keys(json!(ReportLayout {
-        kind: "x".into(),
-        title: Some("x".into()),
-        columns: vec![column.clone()],
-        sort: vec!["x".into()],
-        group: Some("x".into()),
-        header: vec!["x".into()],
-    }));
-    let known_column = keys(json!(column));
-    let unknown = |fields: &serde_json::Map<String, Value>, known: &[String], what: &str| match fields
-        .keys()
-        .find(|k| !known.contains(k))
-    {
-        Some(k) => Err(format!(
-            "Unknown {what} key {k:?}; known keys are {}.",
-            known.join(", ")
-        )),
-        None => Ok(()),
-    };
-    unknown(layout, &known, "layout")?;
-    if let Some(Value::Array(columns)) = layout.get("column") {
-        for c in columns.iter().filter_map(Value::as_object) {
-            unknown(c, &known_column, "column")?;
-        }
-    }
-    Ok(())
 }
 
 impl Open {
@@ -3261,14 +3222,8 @@ impl App {
                 let form = if action == "reset" {
                     Form::new(kind, columns, wc_report::layout_for(&open.project, kind)).cleared()
                 } else {
-                    let mut given = v.get("layout").cloned().ok_or("Give the layout.")?;
-                    let Some(fields) = given.as_object_mut() else {
-                        return Err("The layout must be an object.".into());
-                    };
-                    report_layout_unknown_key(fields)?;
-                    fields.insert("kind".into(), json!(kind.name()));
-                    let layout: wc_core::report_layout::ReportLayout =
-                        serde_json::from_value(given).map_err(|e| format!("Bad layout: {e}"))?;
+                    let given = v.get("layout").cloned().ok_or("Give the layout.")?;
+                    let layout = wc_core::report_layout::ReportLayout::from_json(kind.name(), given)?;
                     // Read into the dialog's form as the dialog would show it, so it is kept
                     // as OK keeps it (a layout that shows the built-in one keeps none).
                     Form::new(kind, columns, Some(&layout))
@@ -3738,7 +3693,7 @@ fn writes_while_held(args: &[String], dir: &Path, held: &BTreeMap<String, String
         (
             Some(
                 "page" | "panel" | "location" | "jumper" | "strip" | "macro" | "revision" | "template" | "lib"
-                | "comment",
+                | "comment" | "report-layout",
             ),
             Some("list" | "show"),
         ) => true,
@@ -3755,8 +3710,13 @@ fn writes_while_held(args: &[String], dir: &Path, held: &BTreeMap<String, String
     let project = Guarded::new(dir);
     // Run from inside the project folder, even a bare file name could land on a held page: only
     // a command with nothing after its own words (`check`, `page list`) runs there.
+    // `report-layout show <kind>` names a report, not a file: a word of the command too.
+    let layout_kind = arg(0) == Some("report-layout")
+        && arg(1) == Some("show")
+        && arg(2).is_some_and(|k| wc_report::Kind::parse(k).is_some());
     let words = match arg(0) {
         Some("vcs") => 2,
+        _ if layout_kind => 3,
         _ if matches!(arg(1), Some("list" | "show")) => 2,
         _ => 1,
     };
@@ -3769,7 +3729,7 @@ fn writes_while_held(args: &[String], dir: &Path, held: &BTreeMap<String, String
             args.join(" ")
         ));
     }
-    for a in args {
+    for a in args.iter().skip(if layout_kind { 3 } else { 0 }) {
         let why = match project.reached_by(cwd, split_flag(a).1) {
             Ok(false) => continue,
             Ok(true) => "is in the project folder or links to a file in it".to_owned(),
@@ -8946,6 +8906,8 @@ mod tests {
             vec!["page", "list"],
             vec!["vcs", "log"],
             vec!["find", "-K1"],
+            vec!["report-layout", "show"],
+            vec!["report-layout", "show", "devices"],
         ] {
             let args: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
             assert!(
@@ -8953,6 +8915,9 @@ mod tests {
                 "{args:?}"
             );
         }
+        // A word that is not a report could be a file.
+        let unknown: Vec<String> = ["report-layout", "show", "out.json"].map(String::from).to_vec();
+        assert!(writes_while_held(&unknown, &dir, &held, &dir.join("pages")).is_some());
         assert!(writes_while_held(&args, &dir, &held, out.path()).is_none());
         // An export writes its own file names into the folder it is given: a file there that
         // links to a held page, by name or as the same file, is a way onto the page.
