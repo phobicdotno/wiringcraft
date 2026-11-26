@@ -739,12 +739,11 @@ fn shapes(
                     let name: String = e
                         .get(2)
                         .unwrap_or_default()
-                        .trim_start()
                         .chars()
                         .take(MISSING_BLOCK_NAME_LEN)
                         .map(|c| if c.is_control() { '?' } else { c })
                         .collect();
-                    let name = name.trim_end();
+                    let name = name.trim();
                     *skipped.entry(format!("{MISSING_BLOCK}{name}")).or_default() += 1;
                 }
                 None
@@ -2737,6 +2736,15 @@ mod tests {
             [format!(
                 "20 block inserts not drawn: their block is not in the file ({short})"
             )]
+        );
+
+        // Leading spaces count toward the cut too: a name past them is not looked for.
+        let spaced = format!("{}X", " ".repeat(10_000));
+        let blocks = format!("0\nBLOCK\n2\nARR\n0\nINSERT\n2\n{spaced}\n10\n0\n20\n0\n0\nENDBLK\n");
+        let (_, warnings) = symbol_with_warnings(&dxf(&ents, &blocks), "my.part", "Part")?;
+        assert_eq!(
+            warnings,
+            ["20 block inserts not drawn: their block is not in the file ((no name))"]
         );
         Ok(())
     }
