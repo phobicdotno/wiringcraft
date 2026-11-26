@@ -1938,7 +1938,10 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
                     })
                     .and_then(|a| a.get(1))
                     .and_then(|v| DeviceTag::parse(v).ok());
-                let rotation = Rotation::from_degrees(-(e.f(50).round() as i64)).unwrap_or_default();
+                // Taken to a turn first: a huge angle (a damaged file) would saturate the cast
+                // and overflow when negated.
+                let turn = e.f(50).round().rem_euclid(360.0);
+                let rotation = Rotation::from_degrees(-(turn as i64)).unwrap_or_default();
                 out.symbols.push(PlacedSymbol {
                     id: String::new(),
                     symbol: (*id).clone(),
@@ -2042,6 +2045,26 @@ mod tests {
         assert_eq!(p.symbols.len(), 1);
         assert_eq!(p.symbols[0].tag.as_ref().map(|t| t.to_string()).as_deref(), Some("-K7"));
         assert_eq!(p.graphics.len(), 3, "logo exploded into two lines plus the polyline");
+        Ok(())
+    }
+
+    /// A symbol's rotation is read as a quarter turn; a huge angle (a damaged file, or a DWG
+    /// angle of -1e18 radians) does not overflow.
+    #[test]
+    fn a_symbol_rotation_of_any_size_is_read() -> Result<()> {
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        for (angle, want) in [
+            ("90", Rotation::R270),
+            ("-90", Rotation::R90),
+            ("450", Rotation::R270),
+            ("-5.7e19", Rotation::R0),
+            ("1e300", Rotation::R0),
+        ] {
+            let ents = format!("0\nINSERT\n2\nWC.COIL\n10\n0\n20\n0\n50\n{angle}\n");
+            let p = page(&dxf(&ents, ""), 1.0, &known)?;
+            assert_eq!(p.symbols.len(), 1, "{angle}");
+            assert_eq!(p.symbols[0].rotation, want, "{angle}");
+        }
         Ok(())
     }
 
