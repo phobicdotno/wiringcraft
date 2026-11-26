@@ -734,8 +734,15 @@ fn on_segment(p: Point, a: Point, b: Point) -> bool {
 /// no conductor.
 fn cable_cores(i: &Inputs<'_>, out: &mut Vec<Finding>) {
     let p = i.project;
+    // Connections come from the wiring outside overview pages only: an overview wire can carry
+    // potentials or link interruption points and so join two connections into one net, which
+    // would hide a reused core. Pages keep their places, so page indices stay the same.
+    let mut wiring = p.clone();
+    for page in wiring.pages.iter_mut().filter(|pg| pg.overview) {
+        page.wires.clear();
+    }
     // Wires are known by their place: ids need not be unique on a page.
-    let (_, wire_net) = wc_core::connectivity::wire_nets_by_place(p, |id| i.symbols.get(id).map(|s| s.role));
+    let (_, wire_net) = wc_core::connectivity::wire_nets_by_place(&wiring, |id| i.symbols.get(id).map(|s| s.role));
     // Per core: the nets it is on, in drawing order, each with the first wire naming it there.
     type Uses<'p> = Vec<(usize, &'p Page, &'p str)>;
     let mut by_core: BTreeMap<(&DeviceTag, &str), Uses> = BTreeMap::new();

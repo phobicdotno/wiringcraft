@@ -440,6 +440,62 @@ fn check_names_a_cable_core_on_two_connections() {
 }
 
 #[test]
+fn check_cable_cores_ignore_overview_wiring_that_joins_connections() {
+    let (mut p, s, parts) = fixture();
+    let found = |p: &Project| {
+        let i = Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        };
+        check(&i)
+            .into_iter()
+            .filter(|f| f.message.contains("cable core"))
+            .map(|f| (f.page_id, f.item, f.message))
+            .collect::<Vec<_>>()
+    };
+    // w1 (24V, at -K1:A1) and w4 (0V, at -K1:A2) are two connections sharing core -W1:1.
+    for w in p.pages[0].wires.iter_mut().filter(|w| w.id == "w1" || w.id == "w4") {
+        w.cable = Some(wc_core::CableCore {
+            cable: DeviceTag::parse("-W1").unwrap(),
+            core: "1".into(),
+        });
+    }
+    let expected = [(
+        Some("p2".to_owned()),
+        Some("w4".to_owned()),
+        "cable core -W1:1 is on 2 connections".to_owned(),
+    )];
+    assert_eq!(found(&p), expected);
+    // An overview page whose wiring joins the 24V and 0V potentials into one net.
+    let mut overview = Page::new("ov", "1", "Overview");
+    overview.overview = true;
+    let mid = Point::new(20.0, 20.0);
+    overview.wires = vec![
+        wire(
+            "o1",
+            Endpoint::Point {
+                at: Point::new(10.0, 20.0),
+            },
+            Endpoint::Point { at: mid },
+            None,
+            Some("24V"),
+        ),
+        wire(
+            "o2",
+            Endpoint::Point { at: mid },
+            Endpoint::Point {
+                at: Point::new(30.0, 20.0),
+            },
+            None,
+            Some("0V"),
+        ),
+    ];
+    p.pages.insert(0, overview);
+    assert_eq!(found(&p), expected);
+}
+
+#[test]
 fn project_check_finds_the_usual_mistakes() {
     let (mut p, s, parts) = fixture();
     {
