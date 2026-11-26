@@ -683,21 +683,17 @@ fn shapes(
                     let (bx, by) = d.bases.get(name).copied().unwrap_or_default();
                     // An array (MINSERT): one copy per column and row, the spacings along the
                     // block's own turned axes (not scaled), as AutoCAD draws it.
-                    let count = |code: i32| e.f_or(code, 1.0).clamp(1.0, f64::from(u32::MAX)) as usize;
-                    let (cols, rows) = (count(70), count(71));
-                    let (dx, dy) = (e.f(44), e.f(45));
-                    let rot = e.f(50);
-                    let (s, c) = rot.to_radians().sin_cos();
-                    let cells = cols.saturating_mul(rows);
+                    let array = ArrayCells::of(e);
+                    let cells = array.len();
                     // Read once: a group code is found by a scan of the entity.
-                    let (ix, iy, sx, sy) = (e.f(10), e.f(20), e.f_or(41, 1.0), e.f_or(42, 1.0));
-                    // The placement of the copy in a column and row, inside the outer placement.
-                    // A copy placed past the range of numbers is not refused here: its shapes
-                    // are, one by one, and each copy takes from the budget like any other.
-                    let cell_xf = |col: usize, row: usize| {
-                        let (col, row) = (col as f64 * dx, row as f64 * dy);
-                        let at = (ix + c * col - s * row, iy + s * col + c * row);
-                        Xf::shift((-bx, -by)).then(&Xf::insert(at, sx, sy, rot)).then(&xf)
+                    let (ix, iy, sx, sy, rot) = (e.f(10), e.f(20), e.f_or(41, 1.0), e.f_or(42, 1.0), e.f(50));
+                    // The placement of a copy, inside the outer placement. A copy placed past
+                    // the range of numbers is not refused here: its shapes are, one by one, and
+                    // each copy takes from the budget like any other.
+                    let cell_xf = |cell: usize| {
+                        Xf::shift((-bx, -by))
+                            .then(&Xf::insert(array.at(cell, (ix, iy)), sx, sy, rot))
+                            .then(&xf)
                     };
                     // Copies too deep would only be turned away, without taking from the
                     // budget: counted at once instead of one by one.
@@ -713,7 +709,7 @@ fn shapes(
                             *over = over.saturating_add((cells - cell).saturating_mul(inner.len()));
                             break;
                         }
-                        let ixf = cell_xf(cell % cols, cell / cols);
+                        let ixf = cell_xf(cell);
                         shapes(
                             d,
                             inner,
@@ -732,6 +728,19 @@ fn shapes(
                             break;
                         }
                     }
+                } else {
+                    // A cut-down file or an xref: the block is not here to draw.
+                    // The name goes into a warning a terminal shows: no control characters.
+                    // Cut to a short length first: an array can visit this INSERT many times.
+                    let name: String = e
+                        .get(2)
+                        .unwrap_or_default()
+                        .chars()
+                        .take(MISSING_BLOCK_NAME_LEN)
+                        .map(|c| if c.is_control() { '?' } else { c })
+                        .collect();
+                    let name = name.trim();
+                    *skipped.entry(format!("{MISSING_BLOCK}{name}")).or_default() += 1;
                 }
                 None
             }
@@ -1012,6 +1021,16 @@ const STRETCHED_NOT_NUMBERS: &str = "CIRCLE or ARC of a stretched block whose po
 
 /// The `skipped` key of the vertices left out of a drawn LEADER because they are not numbers.
 const LEADER_BAD_VERTICES: &str = "LEADER vertex that is not numbers";
+
+/// The start of the `skipped` key of an INSERT whose block is not in the file; the block's
+/// name follows (empty when the INSERT names none), so the warning can name a few of them.
+const MISSING_BLOCK: &str = "INSERT of a block not in the file: ";
+
+/// How many missing block names the warning lists.
+const MISSING_BLOCK_NAMES: usize = 3;
+
+/// How many characters of a missing block's name the warning keeps.
+const MISSING_BLOCK_NAME_LEN: usize = 64;
 
 /// The key under which hatches with a boundary that is not all numbers are counted.
 /// The `skipped` key of a polyline whose points, or the arcs of its bulges, are not numbers once
@@ -2041,6 +2060,25 @@ fn with_holes_kept(loops: &[Vec<(f64, f64)>], style: i64) -> Option<(Vec<Loop>, 
 
 /// One warning per entity kind that was not read.
 pub(crate) fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> {
+    // Inserts of missing blocks make one line together, naming a few of the blocks.
+    let (missing, skipped): (Vec<_>, Vec<_>) = skipped.into_iter().partition(|(k, _)| k.starts_with(MISSING_BLOCK));
+    let missing_line = (!missing.is_empty()).then(|| {
+        let n: usize = missing.iter().map(|(_, n)| n).sum();
+        let mut names: Vec<&str> = missing
+            .iter()
+            .map(|(k, _)| k.get(MISSING_BLOCK.len()..).unwrap_or_default())
+            .map(|name| if name.is_empty() { "(no name)" } else { name })
+            .take(MISSING_BLOCK_NAMES)
+            .collect();
+        if missing.len() > MISSING_BLOCK_NAMES {
+            names.push("...");
+        }
+        let (s, its) = if n == 1 { ("", "its") } else { ("s", "their") };
+        format!(
+            "{n} block insert{s} not drawn: {its} block is not in the file ({})",
+            names.join(", ")
+        )
+    });
     skipped
         .into_iter()
         .map(|(kind, n)| {
@@ -2099,6 +2137,7 @@ pub(crate) fn skipped_warnings(skipped: BTreeMap<String, usize>) -> Vec<String> 
                 format!("{n} {kind} entit{} not read", if n == 1 { "y" } else { "ies" })
             }
         })
+        .chain(missing_line)
         .collect()
 }
 
@@ -2318,6 +2357,45 @@ fn normalise_block_name(n: &str) -> String {
     n.trim().to_lowercase().replace([' ', '/'], "-")
 }
 
+/// The copies of an INSERT placed as an array (MINSERT): column and row counts (codes 70 and
+/// 71) and spacings (44 and 45), the spacings along the block's own axes turned by code 50 and
+/// not scaled, as AutoCAD draws it. A plain INSERT is one copy.
+struct ArrayCells {
+    cols: usize,
+    rows: usize,
+    spacing: (f64, f64),
+    /// Sine and cosine of the turn.
+    turn: (f64, f64),
+}
+
+impl ArrayCells {
+    fn of(e: &Entity) -> Self {
+        let count = |code: i32| e.f_or(code, 1.0).clamp(1.0, f64::from(u32::MAX)) as usize;
+        ArrayCells {
+            cols: count(70),
+            rows: count(71),
+            spacing: (e.f(44), e.f(45)),
+            turn: e.f(50).to_radians().sin_cos(),
+        }
+    }
+
+    /// How many copies, stopping at `usize::MAX`.
+    fn len(&self) -> usize {
+        self.cols.saturating_mul(self.rows)
+    }
+
+    /// Where copy `cell` (counted along the first row, then the next) lies for an insertion
+    /// point `(ix, iy)`, in the drawing's own coordinates. The column step is added to the
+    /// insertion point before the row step: summed on their own first, two steps near the
+    /// limit could overflow where the copy itself is in range.
+    fn at(&self, cell: usize, (ix, iy): (f64, f64)) -> (f64, f64) {
+        let (s, c) = self.turn;
+        let col = (cell % self.cols) as f64 * self.spacing.0;
+        let row = (cell / self.cols) as f64 * self.spacing.1;
+        (ix + c * col - s * row, iy + s * col + c * row)
+    }
+}
+
 /// Import a whole drawing. Block references whose name matches a library symbol id
 /// (case-insensitive) become placed symbols, with a device tag from an attribute named TAG,
 /// DEVICE, BMK or REF; everything else is kept as graphics. The drawing is moved so its top-left
@@ -2343,6 +2421,9 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
     let mut raw = Vec::new();
     let mut points = Vec::new();
     let mut plain = Vec::new();
+    let mut skipped: BTreeMap<String, usize> = BTreeMap::new();
+    // Placed symbols take from the same budget as the drawn entities.
+    let mut budget = MAX_DRAWN;
     // Attributes follow their INSERT in the entity list.
     let mut i = 0;
     while i < d.entities.len() {
@@ -2381,14 +2462,37 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
                 // and overflow when negated.
                 let turn = e.f(50).round().rem_euclid(360.0);
                 let rotation = Rotation::from_degrees(-(turn as i64)).unwrap_or_default();
-                out.symbols.push(PlacedSymbol {
-                    id: String::new(),
-                    symbol: (*id).clone(),
-                    at: Point::new(e.f(10) * scale, -e.f(20) * scale),
-                    rotation,
-                    mirror: e.f_or(41, 1.0) < 0.0,
-                    tag,
-                });
+                // An array places one symbol per copy. The copies share the attributes, so
+                // only the first keeps the device tag: the rest would repeat it.
+                let cells = ArrayCells::of(e);
+                let copies = cells.len();
+                if copies > 1
+                    && let Some(t) = &tag
+                {
+                    tag_warnings.push(format!(
+                        "{id}: an array of {copies} copies, only the first keeps the device tag {t}, the others are placed without a tag"
+                    ));
+                }
+                let (ix, iy, mirror) = (e.f(10), e.f(20), e.f_or(41, 1.0) < 0.0);
+                let mut tag = tag;
+                for cell in 0..copies {
+                    if budget == 0 {
+                        let over = skipped.entry(OVER_LIMIT.to_owned()).or_default();
+                        *over = over.saturating_add(copies - cell);
+                        break;
+                    }
+                    budget -= 1;
+                    let (x, y) = cells.at(cell, (ix, iy));
+                    out.symbols.push(PlacedSymbol {
+                        id: String::new(),
+                        symbol: (*id).clone(),
+                        // Past the range of numbers, it is left out and said below.
+                        at: Point::new(x * scale, -y * scale),
+                        rotation,
+                        mirror,
+                        tag: tag.take(),
+                    });
+                }
             }
             None => {
                 plain.push(e.clone());
@@ -2397,7 +2501,6 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
         }
         i = j;
     }
-    let mut skipped = BTreeMap::new();
     shapes(
         d,
         &plain,
@@ -2409,7 +2512,7 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
         &mut raw,
         &mut points,
         &mut skipped,
-        &mut { MAX_DRAWN },
+        &mut budget,
     );
     out.graphics = raw.into_iter().map(|(_, s)| s).collect();
     out.warnings = skipped_warnings(skipped.clone());
@@ -2641,6 +2744,67 @@ mod tests {
             !s.graphics.iter().any(|g| matches!(g, Shape::Text { .. })),
             "{:?}",
             s.graphics
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_insert_of_a_block_not_in_the_file_is_said() -> Result<()> {
+        let line = "0\nLINE\n8\n0\n10\n0\n20\n0\n11\n10\n21\n0\n";
+        let ents = format!("{line}0\nINSERT\n2\nNOPE\n10\n5\n20\n5\n");
+        let (s, warnings) = symbol_with_warnings(&dxf(&ents, ""), "my.part", "Part")?;
+        assert_eq!(s.graphics.len(), 1, "the line comes in: {:?}", s.graphics);
+        assert_eq!(
+            warnings,
+            ["1 block insert not drawn: its block is not in the file (NOPE)"]
+        );
+
+        // The block is there: drawn, and nothing said.
+        let blocks = "0\nBLOCK\n2\nNOPE\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n0\nENDBLK\n";
+        let (s, warnings) = symbol_with_warnings(&dxf(&ents, blocks), "my.part", "Part")?;
+        assert_eq!(s.graphics.len(), 2);
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        // Several missing blocks make one line, naming the first few; one with no name too.
+        let ents: String = ["A", "B", "B", "C", "D"]
+            .iter()
+            .map(|b| format!("0\nINSERT\n2\n{b}\n10\n0\n20\n0\n"))
+            .chain(["0\nINSERT\n10\n0\n20\n0\n".to_owned()])
+            .collect();
+        let (_, warnings) = symbol_with_warnings(&dxf(&format!("{line}{ents}"), ""), "my.part", "Part")?;
+        assert_eq!(
+            warnings,
+            ["6 block inserts not drawn: their block is not in the file ((no name), A, B, ...)"]
+        );
+
+        // A name with control characters is shown without them.
+        let ents = format!("{line}0\nINSERT\n2\nX\u{1b}[2J\n10\n0\n20\n0\n");
+        let (_, warnings) = symbol_with_warnings(&dxf(&ents, ""), "my.part", "Part")?;
+        assert_eq!(
+            warnings,
+            ["1 block insert not drawn: its block is not in the file (X?[2J)"]
+        );
+
+        // A long name inside a block placed as an array: cut short, every copy counted.
+        let long = "L".repeat(10_000);
+        let blocks = format!("0\nBLOCK\n2\nARR\n0\nINSERT\n2\n{long}\n10\n0\n20\n0\n0\nENDBLK\n");
+        let ents = format!("{line}0\nINSERT\n2\nARR\n10\n0\n20\n0\n70\n4\n71\n5\n44\n1\n45\n1\n");
+        let (_, warnings) = symbol_with_warnings(&dxf(&ents, &blocks), "my.part", "Part")?;
+        let short = "L".repeat(MISSING_BLOCK_NAME_LEN);
+        assert_eq!(
+            warnings,
+            [format!(
+                "20 block inserts not drawn: their block is not in the file ({short})"
+            )]
+        );
+
+        // Leading spaces count toward the cut too: a name past them is not looked for.
+        let spaced = format!("{}X", " ".repeat(10_000));
+        let blocks = format!("0\nBLOCK\n2\nARR\n0\nINSERT\n2\n{spaced}\n10\n0\n20\n0\n0\nENDBLK\n");
+        let (_, warnings) = symbol_with_warnings(&dxf(&ents, &blocks), "my.part", "Part")?;
+        assert_eq!(
+            warnings,
+            ["20 block inserts not drawn: their block is not in the file ((no name))"]
         );
         Ok(())
     }
@@ -3874,6 +4038,98 @@ mod tests {
             assert_eq!(skipped.get(LINE_NOT_NUMBERS), Some(&1), "{skipped:?}");
             assert_eq!(skipped.get(PLACED_NOT_NUMBERS), Some(&1), "{skipped:?}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn an_arrayed_known_symbol_places_every_copy() -> Result<()> {
+        let blocks = "0\nBLOCK\n2\nWC.COIL\n10\n0\n20\n0\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n0\nENDBLK\n";
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        let at = |p: &ImportedPage| -> Vec<(f64, f64)> { p.symbols.iter().map(|s| (s.at.x, s.at.y)).collect() };
+        // 3 columns 10 apart, 2 rows 5 apart (y flipped on the page), moved so the lowest
+        // left copy sits at the frame corner (20, 20).
+        let ents = "0\nINSERT\n66\n1\n2\nWC.COIL\n10\n1\n20\n2\n70\n3\n71\n2\n44\n10\n45\n5\n0\nATTRIB\n2\nTAG\n1\n-K1\n0\nSEQEND\n";
+        let p = page(&dxf(ents, blocks), 1.0, &known)?;
+        assert_eq!(
+            at(&p),
+            [
+                (20.0, 25.0),
+                (30.0, 25.0),
+                (40.0, 25.0),
+                (20.0, 20.0),
+                (30.0, 20.0),
+                (40.0, 20.0)
+            ]
+        );
+        assert!(p.symbols.iter().all(|s| s.symbol == "wc.coil"));
+        // Only the first copy keeps the tag, and that is said.
+        let tags: Vec<_> = p
+            .symbols
+            .iter()
+            .map(|s| s.tag.as_ref().map(|t| t.to_string()))
+            .collect();
+        assert_eq!(tags[0].as_deref(), Some("-K1"));
+        assert!(tags[1..].iter().all(Option::is_none), "{tags:?}");
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("an array of 6 copies, only the first keeps the device tag -K1")),
+            "{:?}",
+            p.warnings
+        );
+        // Turned by 90 degrees: the columns run up, the rows run left; the spacing is not scaled.
+        let turned = "0\nINSERT\n2\nWC.COIL\n10\n0\n20\n0\n41\n2\n42\n2\n50\n90\n70\n2\n71\n2\n44\n10\n45\n5\n";
+        let p = page(&dxf(turned, blocks), 1.0, &known)?;
+        assert_eq!(at(&p), [(25.0, 30.0), (25.0, 20.0), (20.0, 30.0), (20.0, 20.0)]);
+        assert!(p.symbols.iter().all(|s| s.rotation == p.symbols[0].rotation));
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+        // A copy whose position is not a number once scaled is left out and said.
+        let far = "0\nINSERT\n2\nWC.COIL\n10\n0\n20\n0\n70\n2\n44\n1e308\n";
+        let p = page(&dxf(far, blocks), 10.0, &known)?;
+        assert_eq!(p.symbols.len(), 1);
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("1 entity whose size is not a number once placed")),
+            "{:?}",
+            p.warnings
+        );
+        // A huge array stops at the shared limit and counts the copies left out. The symbols
+        // use up the budget the drawn entities share, so the line after them is left out too.
+        let huge = "0\nINSERT\n2\nWC.COIL\n70\n2000\n71\n1001\n44\n1e-9\n45\n1e-9\n\
+                    0\nLINE\n10\n0\n20\n0\n11\n1e-9\n21\n0\n";
+        let p = page(&dxf(huge, blocks), 1.0, &known)?;
+        assert_eq!(p.symbols.len(), MAX_DRAWN);
+        assert!(p.graphics.is_empty(), "{:?}", p.graphics);
+        // 2000 x 1001 copies, 2000 of them past the limit, plus the line.
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.starts_with("2001 entities not drawn: the drawing expands")),
+            "{:?}",
+            p.warnings
+        );
+        Ok(())
+    }
+
+    /// A copy in range whose column and row steps would overflow summed on their own is kept:
+    /// the steps are added to the insertion point one at a time.
+    #[test]
+    fn an_array_copy_in_range_past_two_large_steps_is_kept() -> Result<()> {
+        let ins = "0\nINSERT\n2\nB\n10\n-1e308\n20\n0\n50\n45\n70\n2\n71\n2\n44\n1.5e308\n45\n-1.5e308\n";
+        let d = parse(&dxf(ins, ""))?;
+        let cells = ArrayCells::of(&d.entities[0]);
+        let (x, y) = cells.at(3, (-1e308, 0.0));
+        assert!(x.is_finite() && y.is_finite() && x > 1e308, "{x} {y}");
+        // Drawn: all four copies of the line are kept, the last one included.
+        let blocks = "0\nBLOCK\n2\nB\n10\n0\n20\n0\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n0\n0\nENDBLK\n";
+        let (g, skipped) = drawn(ins, blocks)?;
+        assert_eq!(g.len(), 4, "{g:?} {skipped:?}");
+        assert!(g.iter().all(finite_shape), "{g:?}");
+        assert!(
+            g.iter().any(|s| matches!(s, Shape::Line { a, .. } if a.x > 1e308)),
+            "{g:?}"
+        );
         Ok(())
     }
 
