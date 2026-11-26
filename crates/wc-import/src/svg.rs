@@ -111,19 +111,31 @@ fn presentation(e: &BytesStart, name: &str) -> Option<String> {
                     k.trim().eq_ignore_ascii_case(name).then(|| v.trim().to_owned())
                 })
                 .collect();
-            let important = |v: &String| {
-                v.len()
-                    .checked_sub("!important".len())
-                    .is_some_and(|i| v.is_char_boundary(i) && v[i..].eq_ignore_ascii_case("!important"))
-            };
             decls
                 .iter()
                 .rev()
-                .find(|v| important(v))
+                .find(|v| split_important(v).1)
                 .or_else(|| decls.last())
                 .cloned()
         })
         .or_else(|| attr(e, name))
+}
+
+/// Splits a trailing `!important` (any case, with or without spaces around the `!`) off a
+/// declaration value: the trimmed value, and whether it was important.
+fn split_important(v: &str) -> (&str, bool) {
+    let v = v.trim();
+    let word = "important";
+    let Some(i) = v.len().checked_sub(word.len()) else {
+        return (v, false);
+    };
+    if !v.is_char_boundary(i) || !v[i..].eq_ignore_ascii_case(word) {
+        return (v, false);
+    }
+    match v[..i].trim_end().strip_suffix('!') {
+        Some(rest) => (rest.trim_end(), true),
+        None => (v, false),
+    }
 }
 
 /// Whether a fill paints the shape: not `none`, `transparent` or white (`#fff`, `white`,
@@ -131,13 +143,7 @@ fn presentation(e: &BytesStart, name: &str) -> Option<String> {
 /// A trailing `!important` is ignored.
 fn paints(fill: Option<&str>, parent: bool) -> bool {
     let Some(f) = fill else { return parent };
-    let f = f.trim();
-    let f = f
-        .len()
-        .checked_sub("!important".len())
-        .filter(|&i| f.is_char_boundary(i) && f[i..].eq_ignore_ascii_case("!important"))
-        .map_or(f, |i| f[..i].trim_end());
-    let f = f.to_ascii_lowercase();
+    let f = split_important(f).0.to_ascii_lowercase();
     match f.as_str() {
         "inherit" => parent,
         "" | "none" | "transparent" | "white" | "#fff" | "#ffffff" => false,
@@ -882,11 +888,13 @@ mod tests {
             <rect width="1" height="1" style="fill:black !important;fill:none"/>
             <rect width="1" height="1" style="fill:black;fill:none"/>
             <rect width="1" height="1" style="fill:none;fill:black"/>
+            <rect width="1" height="1" style="fill:none ! important"/>
+            <rect width="1" height="1" style="fill:none ! IMPORTANT;fill:black"/>
         </svg>"##;
         assert_eq!(
             fills_of(svg)?,
             vec![
-                false, false, true, false, false, false, true, true, false, true, false, true
+                false, false, true, false, false, false, true, true, false, true, false, true, false, false,
             ]
         );
         Ok(())
