@@ -239,7 +239,11 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
             }
             Event::Text(t) => {
                 // Skip the line breaks and indents between `<text>` and a `<tspan>`.
-                let s = t.unescape().map(|s| s.trim().to_owned()).unwrap_or_default();
+                let s = t
+                    .unescape()
+                    .map_err(|e| Error::Format(format!("SVG: {e}")))?
+                    .trim()
+                    .to_owned();
                 if !s.is_empty()
                     && let Some((at, h, align)) = pending_text.take()
                 {
@@ -435,6 +439,9 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, vec!["K1"]);
+        // Text that cannot be read is an error, not a skipped line break.
+        let bad = r#"<svg><text x="0" y="0">&missing;<tspan>K1</tspan></text></svg>"#;
+        assert!(symbol(bad, "svg.bad", "Bad").is_err());
         Ok(())
     }
 
