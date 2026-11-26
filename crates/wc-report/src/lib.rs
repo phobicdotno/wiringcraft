@@ -666,7 +666,8 @@ fn net_names(i: &Inputs) -> (Vec<connectivity::Net>, BTreeMap<PinRef, String>) {
 }
 
 /// Wire list: every drawn wire with both ends, then its cross-section, colour and type. A free
-/// end is reported as a junction point.
+/// end is reported as a junction point. Overview pages (`Page::overview`) are skipped, because
+/// an overview draws the schematic's connections again and would list each wire twice.
 pub fn wire_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new(
         "Wire list",
@@ -721,6 +722,8 @@ fn cable_core_label(c: &wc_core::CableCore) -> String {
 }
 
 /// Cable list: every cable with its type, then one row per core with the wire's two ends.
+/// Overview pages (`Page::overview`) are skipped, because an overview draws the schematic's
+/// connections again and would list each core twice.
 pub fn cable_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new(
         "Cable list",
