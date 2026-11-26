@@ -1273,9 +1273,14 @@ fn lwpolyline(o: &mut Object, e: &mut Codes) -> Result<()> {
         }
         at.push((x, y));
     }
+    // Only a bulge per point is kept: a count beyond that (a damaged or hostile file) is read
+    // past, not stored.
     let mut bulge = Vec::new();
     for _ in 0..bulges {
-        bulge.push(d.bd()?);
+        let b = d.bd()?;
+        if bulge.len() < at.len() {
+            bulge.push(b);
+        }
     }
     for (i, (x, y)) in at.into_iter().enumerate() {
         e.f(10, x).f(20, y);

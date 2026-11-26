@@ -1562,6 +1562,31 @@ fn an_encrypted_class_section_is_said() -> TestResult {
     Ok(())
 }
 
+/// A lightweight polyline declaring far more bulges than points: the extra ones are read past
+/// (not kept), and the polyline is drawn as with one bulge per point.
+#[test]
+fn extra_bulges_of_a_lightweight_polyline_are_not_kept() -> TestResult {
+    let v = Version::R2004;
+    let poly = |bulges: u32| {
+        let mut p = entity(v, 77, 0x200, head(None));
+        p.data.bs(16).bl(2).bl(bulges);
+        p.data.rd(0.0).rd(0.0).dd(10.0, 0.0).dd(0.0, 0.0).bd(1.0);
+        for _ in 1..bulges {
+            p.data.bd(0.0);
+        }
+        let objs = vec![
+            entry(v, LAYER, LAYER_H, "0"),
+            entry(v, BLOCK_HEADER, MODEL_H, "*Model_Space"),
+            p,
+        ];
+        drawing(&sections(v, &objs, &[]))
+    };
+    let (two, many) = (poly(2)?, poly(10_000)?);
+    assert!(many.skipped.is_empty(), "{:?}", many.skipped);
+    assert_eq!(format!("{:?}", many.model), format!("{:?}", two.model));
+    Ok(())
+}
+
 #[test]
 fn a_bulged_lightweight_polyline_is_drawn_with_its_arc() -> TestResult {
     for v in [Version::R2004, Version::R2010, Version::R2018] {
