@@ -207,7 +207,7 @@ For the other areas, the chapter to read in each help is:
 
 | Function | EPLAN | SWE | WiringCraft | Triage |
 |---|---|---|---|---|
-| Project check with errors and warnings | yes | yes | yes, in the app and the CLI | done |
+| Project check with errors and warnings | yes | yes | yes, in the app and the CLI; it also warns about panel layout devices that overlap, stick out of the plate or are no longer in the project | done (#733) |
 | Online check while drawing | yes | partly | yes: the check runs again shortly after each edit, off the window thread; problems are ringed on the canvas and counted in the status bar (File → Check while drawing turns it off) | done (#269) |
 | User-defined check rules | yes | no | yes: `[[rule]]` tables in `project.toml` (a cable on matching devices, a tag pattern, at most N wires per pin), run with the built-in check in the app and `wiringcraft check`; added, changed, reordered and deleted in the Rules dialog next to the check list (one undo step); house rules in a library source's `rules.toml` run for every project using it, named by source, and a project turns one off with `rules_off = ["source:2"]` or by name; listed, replaced from a TOML or JSON file and turned off or on with `wiringcraft rules list/set/off/on`, with the dialog's checks; see `wc_core::check_rule` | done (#274, #429, #430, #587) |
 
