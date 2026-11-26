@@ -7018,6 +7018,35 @@ mod nudge_tests {
     }
 
     #[test]
+    fn an_arrow_press_through_the_app_frame_moves_the_selection() {
+        let (_tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        let mut frame = eframe::Frame::_new_kittest();
+        // As App::new does; the fonts take effect from the next frame.
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame)
+        });
+        assert_eq!(coil_at(&app), Point::new(80.0, 60.0));
+        let raw = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| eframe::App::update(&mut app, ctx, &mut frame));
+        assert_eq!(
+            coil_at(&app),
+            Point::new(85.0, 60.0),
+            "the app's frame nudges the selection"
+        );
+    }
+
+    #[test]
     fn each_arrow_press_is_one_snap_step_and_one_undo_step() {
         let (_tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
         press(&mut app, &ctx, Key::ArrowRight, false);
