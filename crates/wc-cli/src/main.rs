@@ -2155,7 +2155,8 @@ fn run(cli: Cli) -> Res<()> {
             match p.lock.symbols.get(&symbol_id) {
                 None => {
                     return Err(format!(
-                        "the project does not pin symbol {symbol_id}; run `wiringcraft lib lock` first"
+                        "the project does not pin symbol {symbol_id}; put its entry in {} back from the project's history (e.g. `git checkout`), or run `wiringcraft lib lock` when a configured library has the symbol",
+                        store::LOCK_FILE
                     ));
                 }
                 Some(l) if l.hash != old.hash() => {
