@@ -442,13 +442,13 @@ enum Cmd {
     /// copy and wires on pins that do not exist, devices drawn twice, more contacts than a
     /// device's parts have, contacts without a coil, interruption points without a partner,
     /// open pins, wires ending in the air, jumpers naming a terminal drawn nowhere, one cable
-    /// core on two connections, shorted potentials, wire numbers that do not name one
-    /// connection each, panel layouts with overlapping devices, devices sticking out of the
-    /// plate or no longer in the project, devices without a part, plus the project's own
-    /// `[[rule]]` tables in `project.toml` (a cable on every motor, a tag pattern, at most N
-    /// wires on a terminal) and the house rules in each library source's `rules.toml`, less the
-    /// ones `rules_off` turns off. Exits with an error when an error is found, so it can guard a
-    /// commit or a CI job.
+    /// core on two connections, shorted potentials, a wire number used on more than one
+    /// connection or one connection carrying several wire numbers, panel layouts with
+    /// overlapping devices, devices sticking out of the plate or no longer in the project,
+    /// devices without a part, then the house rules in each library source's `rules.toml`, less
+    /// the ones `rules_off` turns off, and last the project's own `[[rule]]` tables in
+    /// `project.toml` (a cable on every motor, a tag pattern, at most N wires on a terminal).
+    /// Exits with an error when an error is found, so it can guard a commit or a CI job.
     Check {
         /// Also list notes (open pins, devices without a part).
         #[arg(long)]
