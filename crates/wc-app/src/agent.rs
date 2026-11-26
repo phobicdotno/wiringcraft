@@ -487,11 +487,19 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "macros",
-            "Macros (saved groups of symbols, wires and drawings): list them, insert one on a page (its top-left corner at x, y), or save items from a page as a new project macro. A macro with value sets (variants, such as sizes of a motor starter) needs value_set when inserted; list shows them.",
+            "Macros (saved groups of symbols, wires and drawings): list them, get one's placeholders and value sets, insert one on a page (its top-left corner at x, y), save items from a page as a new project macro, or edit a project macro's description, placeholders and value sets. A macro with value sets (variants, such as sizes of a motor starter) needs value_set when inserted; list shows them. Placeholders are written {{name}} in the macro's texts.",
             json!({
-                "action": {"type": "string", "enum": ["list", "insert", "save"]},
+                "action": {"type": "string", "enum": ["list", "get", "insert", "save", "edit"]},
                 "name": {"type": "string"}, "description": {"type": "string"},
                 "value_set": {"type": "string", "description": "insert: which of the macro's value sets fills its placeholders."},
+                "placeholders": {"type": "array", "description": "edit: all the macro's placeholders, in place of the ones it has (left out keeps them). Give was to rename one: its uses in the macro's texts are renamed too.", "items": {"type": "object", "properties": {
+                    "name": {"type": "string"}, "was": {"type": "string"},
+                    "description": {"type": "string"}, "default": {"type": "string"}
+                }, "required": ["name"]}},
+                "value_sets": {"type": "array", "description": "edit: all the macro's value sets, in place of the ones it has (left out keeps them). values maps a placeholder's name to its value; a placeholder left out uses its default.", "items": {"type": "object", "properties": {
+                    "name": {"type": "string"}, "description": {"type": "string"},
+                    "values": {"type": "object", "additionalProperties": {"type": "string"}}
+                }, "required": ["name"]}},
                 "ids": ids_arg(), "page": page_arg(),
                 "x": {"type": "number"}, "y": {"type": "number"}
             }),
@@ -529,6 +537,16 @@ pub fn specs() -> Vec<Value> {
             "A report as a Markdown table.",
             json!({"kind": {"type": "string", "enum": reports}}),
             &["kind"],
+        ),
+        tool(
+            "report_layouts",
+            "Report layouts (as the report layout dialog edits them): get (each report's layout as JSON, null when built in, with its built-in columns and what in the layout names nothing, plus any stored layout for a report that does not exist, with null built-in columns; one report with kind), set (replace one report's layout) or reset (back to the built-in layout). A layout is {title, column: [{from, heading}], sort, group, header}: column lists the shown columns in order by their built-in heading (empty keeps them all), sort names columns with - in front for descending, group a column to group rows by, header title-block keys printed above the table (project.name, revision ...). Each change is one undo step.",
+            json!({
+                "action": {"type": "string", "enum": ["get", "set", "reset"]},
+                "kind": {"type": "string", "enum": reports, "description": "The report (optional for get)."},
+                "layout": {"type": "object", "description": "set: the report's whole layout, in get's format."}
+            }),
+            &["action"],
         ),
         tool(
             "panels",
@@ -594,7 +612,7 @@ pub fn specs() -> Vec<Value> {
              Drawing: place, box (a black box with connection points, --pin name:side:offset), box-edit (resize a black box, rename or move its points), wire, device (part, description), number-wires, macro (list, place), find (text in pages, --replace, --match-case). \
              Terminals: strip (list, order, move, spare, unspare, level), jumper (add, remove, part, list). \
              Revisions: revision (list, add, edit, remove, cloud, uncloud, table). \
-             Panels: panel (new, arrange, step, device, show, list, remove). \
+             Panels: panel (new, arrange, step, device, show, list, remove). PLC: rack (list, add, set, remove, card add/set/remove: PLC racks and their cards by slot). \
              Libraries: lib (add, sync, status, update, lock, search, propose). \
              Import: import (symbol-dxf, symbol-svg, symbol-kicad, symbol-qet, footprint-dxf, model-step, parts-csv, parts-bmecat, parts-edz, plc-csv, wago, archive, page-dxf, page-dwg, pdf, eplan, swe, swe-library, aml). \
              Output: pdf (--page, --report, --lang for a translated print), drawing (SVG/DXF per page), report, nets, aml, plc-vars, export (wago-marking, wago-configurator), translations (texts missing a translation, --lang). \
@@ -794,6 +812,45 @@ fn selection_id(sel: &Selection) -> String {
 /// The open project, or the error the model sees when there is none.
 fn need_open(open: Option<&mut Open>) -> Result<&mut Open, String> {
     open.ok_or_else(|| "No project is open. Use open_project first.".to_owned())
+}
+
+/// An error naming the first key of a report layout (or of one of its column entries) that
+/// [`wc_core::report_layout::ReportLayout`] does not have, since serde would drop it silently
+/// (`columns` for `column` would then keep the built-in columns). The known keys are the ones
+/// the layout itself serializes, so they follow its fields.
+fn report_layout_unknown_key(layout: &serde_json::Map<String, Value>) -> Result<(), String> {
+    use wc_core::report_layout::{ReportColumn, ReportLayout};
+    let keys = |v: Value| -> Vec<String> { v.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default() };
+    let column = ReportColumn {
+        from: "x".into(),
+        heading: Some("x".into()),
+    };
+    let known = keys(json!(ReportLayout {
+        kind: "x".into(),
+        title: Some("x".into()),
+        columns: vec![column.clone()],
+        sort: vec!["x".into()],
+        group: Some("x".into()),
+        header: vec!["x".into()],
+    }));
+    let known_column = keys(json!(column));
+    let unknown = |fields: &serde_json::Map<String, Value>, known: &[String], what: &str| match fields
+        .keys()
+        .find(|k| !known.contains(k))
+    {
+        Some(k) => Err(format!(
+            "Unknown {what} key {k:?}; known keys are {}.",
+            known.join(", ")
+        )),
+        None => Ok(()),
+    };
+    unknown(layout, &known, "layout")?;
+    if let Some(Value::Array(columns)) = layout.get("column") {
+        for c in columns.iter().filter_map(Value::as_object) {
+            unknown(c, &known_column, "column")?;
+        }
+    }
+    Ok(())
 }
 
 impl Open {
@@ -1233,7 +1290,7 @@ impl wc_agent::Tools for AppTools<'_> {
             "set_device" => format!("Set device {}", s(input, "tag").unwrap_or_default()),
             "run_action" => format!("Ran {}", s(input, "action").unwrap_or_default()),
             "run_command" => format!("wiringcraft {}", strings(input, "args").join(" ")),
-            "comments" | "macros" | "panels" | "library" | "versions" | "jumpers" | "strips" => {
+            "comments" | "macros" | "panels" | "library" | "versions" | "jumpers" | "strips" | "report_layouts" => {
                 format!("{name}: {}", s(input, "action").unwrap_or_default())
             }
             "export" => format!("Exported {}", s(input, "format").unwrap_or_default()),
@@ -1897,6 +1954,7 @@ impl App {
                 Ok(clip_text(wc_report::build(kind, &inputs).to_markdown(), 60_000))
             }
             "panels" => self.tool_panels(v),
+            "report_layouts" => self.tool_report_layouts(v),
             "library" => {
                 let open = need_open(self.open.as_mut())?;
                 let lib = wc_library::Library::open(&open.dir, &open.project).map_err(|e| e.to_string())?;
@@ -2396,15 +2454,7 @@ impl App {
                     return Err(format!("Two connection points are renamed to {to}."));
                 }
                 // Left out, the points stay (renamed as asked), kept on their edges.
-                let pins = pins.unwrap_or_else(|| {
-                    let mut kept = crate::black_box_tool::resized_pins(&old, width, height);
-                    for p in &mut kept {
-                        if let Some(to) = renamed.get(&p.name) {
-                            p.name.clone_from(to);
-                        }
-                    }
-                    kept
-                });
+                let pins = pins.unwrap_or_else(|| wc_core::box_edit::kept_pins(&old, &renamed, width, height));
                 // Every rename lands on a point of the new list, a name kept as it is too: else
                 // the point would be taken off and its wires cut loose.
                 if let Some(to) = renamed.values().find(|to| !pins.iter().any(|p| &p.name == *to)) {
@@ -2840,7 +2890,7 @@ impl App {
     /// The `rules` tool: the project's check rules and the library rules it turns off, kept
     /// as the check rules dialog keeps them (its checks, one undo step).
     fn tool_rules(&mut self, v: &Value) -> Result<String, String> {
-        use wc_core::check_rule::{CheckRule, turned_off};
+        use wc_core::check_rule::{CheckRule, check_rule, turn_rule, turned_off};
         let action = need_s(v, "action")?;
         let open = need_open(self.open.as_mut())?;
         let library = wc_library::library_rules(&open.dir, &open.project);
@@ -2876,16 +2926,9 @@ impl App {
                 for (k, r) in list.iter().enumerate() {
                     let rule: CheckRule =
                         serde_json::from_value(r.clone()).map_err(|e| format!("Rule {}: {e}.", k + 1))?;
-                    if !rule.unknown.is_empty() {
-                        let keys: Vec<&str> = rule.unknown.keys().map(String::as_str).collect();
-                        return Err(format!(
-                            "Rule {}: no such key {} (a rule has kind, devices, role, pattern, max, severity, message and name).",
-                            k + 1,
-                            keys.join(", ")
-                        ));
-                    }
-                    // The dialog's checks: the check would report such a rule instead of running it.
-                    rules.push(crate::rules_form::RuleRow::of(&rule).rule(k + 1)?);
+                    // The dialog's checks, and no unknown keys: the check would report such a
+                    // rule instead of running it.
+                    rules.push(check_rule(&rule, k + 1)?);
                 }
                 let n = rules.len();
                 open.set_check_rules(rules);
@@ -2893,65 +2936,11 @@ impl App {
             }
             "off" | "on" => {
                 let which = need_s(v, "rule")?.trim();
-                // The one rule `which` names, as `turned_off` reads it: by number, or by name.
-                // A selector that could stand for two rules (a rule named "2" and rule 2,
-                // or two rules of one name) is refused rather than guessed.
-                let mut found = None;
-                if let Some((src, sel)) = which.split_once(':')
-                    && let Some(set) = library.iter().find(|set| set.source == src.trim())
-                {
-                    let rules = match &set.rules {
-                        Ok(rules) => rules,
-                        // `on` can still drop the entry as written, below.
-                        Err(e) if action == "off" => {
-                            return Err(format!(
-                                "The check rules of library {} cannot be read, so {which:?} cannot be turned off: {e}",
-                                set.source
-                            ));
-                        }
-                        Err(_) => &Vec::new(),
-                    };
-                    let one = [which.to_owned()];
-                    let hits: Vec<(usize, &CheckRule)> = rules
-                        .iter()
-                        .enumerate()
-                        .map(|(k, r)| (k + 1, r))
-                        .filter(|&(n, r)| turned_off(&one, &set.source, n, r))
-                        .collect();
-                    if hits.len() > 1 {
-                        let list: Vec<String> = hits.iter().map(|(n, _)| format!("{}:{n}", set.source)).collect();
-                        return Err(format!(
-                            "{which:?} could be rule {} of library {}: {:?} is a number and a rule's name too, or two rules share it. An entry in rules_off turns off all of them; name the rule another way (list shows each rule's number and name).",
-                            list.join(" or "),
-                            set.source,
-                            sel.trim()
-                        ));
-                    }
-                    found = hits.first().map(|&(n, r)| (set.source.clone(), n, r.clone()));
-                }
-                let mut now = off.clone();
-                match (action, found) {
-                    ("off", None) => {
-                        return Err(format!(
-                            "No library check rule {which:?}: write source:number or source:name (list shows them)."
-                        ));
-                    }
-                    ("off", Some((src, n, r))) => {
-                        if turned_off(&now, &src, n, &r) {
-                            return Ok(format!("{which} is off already."));
-                        }
-                        now.push(which.to_owned());
-                    }
-                    (_, Some((src, n, r))) => {
-                        // Every entry that turns it off, by number or by name.
-                        now.retain(|o| !turned_off(std::slice::from_ref(o), &src, n, &r));
-                    }
-                    // An entry naming no rule (a source since removed) can still be dropped.
-                    (_, None) => now.retain(|o| o.trim() != which),
-                }
-                if now == *off {
-                    return Ok(format!("{which} is on already."));
-                }
+                // As the command line turns it: one rule by number or name, refusing a
+                // selector that could stand for two rules.
+                let Some(now) = turn_rule(off, &library, which, action == "off")? else {
+                    return Ok(format!("{which} is {action} already."));
+                };
                 open.set_rules_off(now);
                 Ok(format!("{which} is {action} now; run_check shows the effect."))
             }
@@ -2961,7 +2950,11 @@ impl App {
 
     fn tool_macros(&mut self, v: &Value) -> Result<String, String> {
         let action = need_s(v, "action")?;
-        let page = self.page_of(v, "page")?;
+        // Only inserting and saving work on a page: the others work in a project without pages.
+        let page = match action {
+            "insert" | "save" => self.page_of(v, "page")?,
+            _ => 0,
+        };
         let open = need_open(self.open.as_mut())?;
         match action {
             "list" => {
@@ -2974,13 +2967,100 @@ impl App {
                     .collect();
                 Ok(pretty(&json!(list)))
             }
+            "get" => {
+                let entry = find_macro(open, need_s(v, "name")?)?;
+                let m = wc_core::macros::read_macro(&entry.path).map_err(|e| e.to_string())?;
+                Ok(pretty(&json!({
+                    "name": m.name, "description": m.description, "source": entry.source,
+                    "placeholders": m.placeholders, "value_sets": m.value_sets,
+                    "used_in_texts": m.used_placeholders(), "error": entry.error
+                })))
+            }
+            "edit" => {
+                let entry = find_macro(open, need_s(v, "name")?)?;
+                if !entry.project {
+                    return Err(format!(
+                        "{} belongs to the {} library; only the project's own macros are edited here.",
+                        entry.name, entry.source
+                    ));
+                }
+                let mut form = crate::macro_form::Form::open(&entry.path)?;
+                if let Some(d) = s(v, "description") {
+                    form.description = d.to_owned();
+                }
+                // A field left out is empty; one given as something other than a text is a
+                // mistake, not a request to clear it.
+                let text = |o: &Value, what: &str, field: &str| match o.get(field) {
+                    None => Ok(String::new()),
+                    Some(Value::String(t)) => Ok(t.clone()),
+                    Some(other) => Err(format!("A {what}'s {field} is a text, not {other}.")),
+                };
+                if let Some(list) = v.get("placeholders") {
+                    let rows: Vec<crate::macro_form::PlaceholderRow> = list
+                        .as_array()
+                        .ok_or("placeholders is a list.")?
+                        .iter()
+                        .map(|p| {
+                            Ok(crate::macro_form::PlaceholderRow {
+                                was: text(p, "placeholder", "was")?,
+                                name: text(p, "placeholder", "name")?,
+                                description: text(p, "placeholder", "description")?,
+                                default: text(p, "placeholder", "default")?,
+                            })
+                        })
+                        .collect::<Result<_, String>>()?;
+                    // Two rows renaming one placeholder would both take its values.
+                    let mut renamed = std::collections::BTreeSet::new();
+                    for r in rows.iter().filter(|r| !r.was.trim().is_empty()) {
+                        if !renamed.insert(wc_core::macros::key(&r.was)) {
+                            return Err(format!("Placeholder {} is renamed by two rows.", r.was.trim()));
+                        }
+                    }
+                    form.set_placeholders(rows);
+                }
+                if let Some(list) = v.get("value_sets") {
+                    let mut sets = Vec::new();
+                    for set in list.as_array().ok_or("value_sets is a list.")? {
+                        let mut values = std::collections::BTreeMap::new();
+                        // Left out, the set uses the defaults; given, it must be an object, or
+                        // the set's values would be cleared by mistake.
+                        let given = match set.get("values") {
+                            None => None,
+                            Some(Value::Object(o)) => Some(o),
+                            Some(other) => {
+                                return Err(format!(
+                                    "The values of a value set are an object of placeholder names to texts, not {other}."
+                                ));
+                            }
+                        };
+                        for (k, val) in given.into_iter().flatten() {
+                            let val = match val {
+                                Value::String(t) => t.clone(),
+                                Value::Number(n) => n.to_string(),
+                                other => return Err(format!("The value of {k} is not a text: {other}.")),
+                            };
+                            values.insert(k.clone(), val);
+                        }
+                        sets.push(crate::macro_form::NamedSet {
+                            name: text(set, "value set", "name")?,
+                            description: text(set, "value set", "description")?,
+                            values,
+                        });
+                    }
+                    form.set_value_sets(sets)?;
+                }
+                let path = form.save()?;
+                let m = wc_core::macros::read_macro(&path).map_err(|e| e.to_string())?;
+                let names = |v: Vec<&str>| if v.is_empty() { "none".to_owned() } else { v.join(", ") };
+                Ok(format!(
+                    "Saved {}: placeholders {}; value sets {}.",
+                    m.name,
+                    names(m.placeholders.iter().map(|p| p.name.as_str()).collect()),
+                    names(m.value_sets.iter().map(|v| v.name.as_str()).collect())
+                ))
+            }
             "insert" => {
-                let name = need_s(v, "name")?;
-                let entry = open
-                    .macros()
-                    .into_iter()
-                    .find(|m| m.name.eq_ignore_ascii_case(name) || stem(&m.path).eq_ignore_ascii_case(name))
-                    .ok_or_else(|| format!("No macro {name:?}."))?;
+                let entry = find_macro(open, need_s(v, "name")?)?;
                 let anchor = wc_core::macros::read_macro(&entry.path)
                     .map_err(|e| e.to_string())?
                     .anchor;
@@ -2998,6 +3078,110 @@ impl App {
                 Ok(format!("Saved the macro to {}.", path.display()))
             }
             other => Err(format!("Unknown macros action {other}.")),
+        }
+    }
+
+    /// The `report_layouts` tool: read, replace or reset a report's layout through the report
+    /// layout dialog's form, so a layout is checked and kept as OK in the dialog keeps it.
+    fn tool_report_layouts(&mut self, v: &Value) -> Result<String, String> {
+        use crate::report_layout_form::Form;
+        let action = need_s(v, "action")?;
+        let kind = s(v, "kind")
+            .map(|k| wc_report::Kind::parse(k.trim()).ok_or_else(|| format!("Unknown report {k:?}.")))
+            .transpose()?;
+        let open = need_open(self.open.as_mut())?;
+        let builtin = |open: &crate::state::Open, kind| {
+            let inputs = wc_report::Inputs {
+                project: &open.project,
+                symbols: &open.symbols,
+                parts: &open.parts,
+            };
+            wc_report::build_builtin(kind, &inputs).columns
+        };
+        // What wc_report warns about the project's report layouts (as `wc_report` and
+        // `wiringcraft report` name it), and which of those are about `kind`.
+        let all_warnings = |open: &crate::state::Open| -> Vec<String> {
+            let inputs = wc_report::Inputs {
+                project: &open.project,
+                symbols: &open.symbols,
+                parts: &open.parts,
+            };
+            wc_report::layout_warnings(&inputs)
+        };
+        let warnings_for = |all: &[String], kind: wc_report::Kind| -> Vec<String> {
+            let about = format!("report layout for \"{}\":", kind.name());
+            all.iter().filter(|w| w.starts_with(&about)).cloned().collect()
+        };
+        match action {
+            "get" => {
+                let kinds = kind.map_or_else(|| wc_report::Kind::ALL.to_vec(), |k| vec![k]);
+                let all = all_warnings(open);
+                let mut out: Vec<Value> = kinds
+                    .into_iter()
+                    .map(|k| {
+                        json!({
+                            "kind": k.name(),
+                            "layout": wc_report::layout_for(&open.project, k),
+                            "builtin_columns": builtin(open, k),
+                            "warnings": warnings_for(&all, k),
+                        })
+                    })
+                    .collect();
+                // Without a kind, a stored layout for a report that does not exist is listed
+                // too (with no built-in columns), so its warnings are not lost.
+                if kind.is_none() {
+                    let mut unknown: Vec<&str> = Vec::new();
+                    for l in &open.project.meta.reports {
+                        if wc_report::Kind::parse(&l.kind).is_none() && !unknown.contains(&l.kind.as_str()) {
+                            unknown.push(&l.kind);
+                        }
+                    }
+                    for name in unknown {
+                        let about = format!("report layout for \"{name}\":");
+                        let layout = open.project.meta.reports.iter().find(|l| l.kind == name);
+                        out.push(json!({
+                            "kind": name,
+                            "layout": layout,
+                            "builtin_columns": null,
+                            "warnings": all.iter().filter(|w| w.starts_with(&about)).collect::<Vec<_>>(),
+                        }));
+                    }
+                }
+                Ok(pretty(&json!(out)))
+            }
+            "set" | "reset" => {
+                let kind = kind.ok_or("Give the report's kind.")?;
+                let columns = builtin(open, kind);
+                let form = if action == "reset" {
+                    Form::new(kind, columns, wc_report::layout_for(&open.project, kind)).cleared()
+                } else {
+                    let mut given = v.get("layout").cloned().ok_or("Give the layout.")?;
+                    let Some(fields) = given.as_object_mut() else {
+                        return Err("The layout must be an object.".into());
+                    };
+                    report_layout_unknown_key(fields)?;
+                    fields.insert("kind".into(), json!(kind.name()));
+                    let layout: wc_core::report_layout::ReportLayout =
+                        serde_json::from_value(given).map_err(|e| format!("Bad layout: {e}"))?;
+                    // Read into the dialog's form as the dialog would show it, so it is kept
+                    // as OK keeps it (a layout that shows the built-in one keeps none).
+                    Form::new(kind, columns, Some(&layout))
+                };
+                let layout = form.kept()?;
+                let built_in = layout.is_none();
+                open.set_report_layout(kind, layout);
+                let mut said = if built_in {
+                    format!("The {} report has its built-in layout.", kind.name())
+                } else {
+                    format!("The {} report's layout is set.", kind.name())
+                };
+                let warned = warnings_for(&all_warnings(open), kind);
+                if !warned.is_empty() {
+                    said.push_str(&format!(" Warnings:\n{}", warned.join("\n")));
+                }
+                Ok(said)
+            }
+            a => Err(format!("Unknown report_layouts action {a}.")),
         }
     }
 
@@ -3386,6 +3570,15 @@ fn stem(p: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// The macro named `name` (its name or file name, without regard to case), the project's own
+/// before a library's.
+fn find_macro(open: &Open, name: &str) -> Result<crate::state::MacroEntry, String> {
+    open.macros()
+        .into_iter()
+        .find(|m| m.name.eq_ignore_ascii_case(name) || stem(&m.path).eq_ignore_ascii_case(name))
+        .ok_or_else(|| format!("No macro {name:?}."))
+}
+
 /// Why the `wiringcraft` command `args` does not run on the project folder `dir` while others
 /// hold pages (`held`, page id to name): it may change the project, or it names a path into the
 /// project folder (an export written over a page). `None` when it runs: nobody holds a page, or
@@ -3408,6 +3601,8 @@ fn writes_while_held(args: &[String], dir: &Path, held: &BTreeMap<String, String
         | (Some("export" | "plc-vars" | "inspect"), _) => true,
         (Some("find"), _) => !has("--replace"),
         (Some("vcs"), Some("log" | "changes" | "page-log")) => true,
+        // `rules set`, `off` and `on` change the project; only the listing reads it.
+        (Some("rules"), Some("list")) => true,
         (
             Some(
                 "page" | "panel" | "location" | "jumper" | "strip" | "macro" | "revision" | "template" | "lib"
@@ -5946,6 +6141,186 @@ mod tests {
     }
 
     #[test]
+    fn the_assistant_edits_a_project_macros_placeholders_and_value_sets_as_the_dialog_saves_them() {
+        let (tmp, mut a) = app(vec![]);
+        let open = a.open.as_mut().unwrap();
+        let id = open.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let mut clip = open.copy(1, &[Selection::Symbol(id)]);
+        clip.graphics.push(wc_core::Shape::Text {
+            at: Point::new(20.0, 40.0),
+            text: "{{kW}} kW".into(),
+            height: 2.5,
+            align: Default::default(),
+            angle: 0.0,
+        });
+        let path = open.save_macro(&clip, "Starter", "").unwrap();
+
+        // The dialog's checks apply: a placeholder declared twice is refused, the file kept.
+        let before = std::fs::read(&path).unwrap();
+        let err = call(
+            &mut a,
+            "macros",
+            json!({"action": "edit", "name": "starter", "placeholders": [{"name": "kW"}, {"name": "KW"}]}),
+        )
+        .unwrap_err();
+        assert!(err.contains("declared twice"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let r = call(
+            &mut a,
+            "macros",
+            json!({
+                "action": "edit", "name": "Starter", "description": "Motor starter",
+                "placeholders": [{"name": "kW", "description": "Motor power", "default": "1.5"}],
+                "value_sets": [
+                    {"name": "Small", "values": {"kw": "0.75"}},
+                    {"name": "Large", "description": "Big pump", "values": {"kW": 3}},
+                    {"name": "Default"}
+                ]
+            }),
+        )
+        .unwrap();
+        assert!(r.contains("value sets Small, Large, Default"), "{r}");
+        let got: Value =
+            serde_json::from_str(&call(&mut a, "macros", json!({"action": "get", "name": "Starter"})).unwrap())
+                .unwrap();
+        assert_eq!(got["description"], "Motor starter");
+        assert_eq!(got["placeholders"][0]["default"], "1.5");
+        assert_eq!(got["value_sets"][1]["values"]["kW"], "3");
+        assert_eq!(got["value_sets"][1]["description"], "Big pump");
+        assert_eq!(got["used_in_texts"], json!(["kW"]));
+        assert!(got["error"].is_null());
+
+        // Renamed by `was`, the placeholder is renamed in the text and keeps its values, as in
+        // the dialog; the value sets left out are kept.
+        call(
+            &mut a,
+            "macros",
+            json!({"action": "edit", "name": "Starter", "placeholders": [{"name": "power", "was": "kW"}]}),
+        )
+        .unwrap();
+        let m = wc_core::macros::read_macro(&path).unwrap();
+        assert_eq!(m.used_placeholders(), ["power"]);
+        assert_eq!(m.description, "Motor starter");
+        assert_eq!(m.value_set("small").unwrap().values["power"], "0.75");
+        assert!(m.value_set("default").unwrap().values.is_empty());
+        // A value for a placeholder the macro does not declare is refused.
+        let err = call(
+            &mut a,
+            "macros",
+            json!({"action": "edit", "name": "Starter", "value_sets": [{"name": "X", "values": {"kW": "1"}}]}),
+        )
+        .unwrap_err();
+        assert!(err.contains("kW"), "{err}");
+        // `values` given as something other than an object is refused rather than read as
+        // left out (which would clear the set's values), and two values for one placeholder
+        // that differ only in case are refused rather than one of them dropped: the file is kept.
+        let before = std::fs::read(&path).unwrap();
+        for values in [json!([]), json!("3"), json!(null)] {
+            let err = call(
+                &mut a,
+                "macros",
+                json!({"action": "edit", "name": "Starter", "value_sets": [{"name": "Small", "values": values}]}),
+            )
+            .unwrap_err();
+            assert!(err.contains("object"), "{err}");
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+        let err = call(
+            &mut a,
+            "macros",
+            json!({"action": "edit", "name": "Starter",
+                   "value_sets": [{"name": "Small", "values": {"POWER": "0.75", "power": "3"}}]}),
+        )
+        .unwrap_err();
+        assert!(err.contains("POWER") && err.contains("power"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        // A placeholder field given as something other than a text is refused rather than
+        // cleared: the file is kept.
+        let err = call(
+            &mut a,
+            "macros",
+            json!({"action": "edit", "name": "Starter", "placeholders": [{"name": "power", "was": "power", "default": 42}]}),
+        )
+        .unwrap_err();
+        assert!(err.contains("default"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        // So is a value set's description given as something other than a text, and two rows
+        // renaming one placeholder (which would both take its values).
+        let err = call(
+            &mut a,
+            "macros",
+            json!({"action": "edit", "name": "Starter", "value_sets": [{"name": "Small", "description": 5}]}),
+        )
+        .unwrap_err();
+        assert!(err.contains("description"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let err = call(
+            &mut a,
+            "macros",
+            json!({"action": "edit", "name": "Starter",
+                   "placeholders": [{"name": "a", "was": "power"}, {"name": "b", "was": "POWER"}]}),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_lowercase().contains("placeholder power is renamed by two rows"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        // Renamed, a placeholder keeps its values; a new one with its old name is new, with
+        // its own default and none of the renamed one's values.
+        call(
+            &mut a,
+            "macros",
+            json!({"action": "edit", "name": "Starter",
+                   "placeholders": [{"name": "watts", "was": "power"}, {"name": "power", "default": "9"}]}),
+        )
+        .unwrap();
+        let m = wc_core::macros::read_macro(&path).unwrap();
+        assert_eq!(m.used_placeholders(), ["watts"]);
+        let small = &m.value_set("small").unwrap().values;
+        assert_eq!(small.get("watts").map(String::as_str), Some("0.75"));
+        assert_eq!(small.get("power"), None);
+        assert_eq!(m.placeholders[1].default, "9");
+
+        // Listing, reading and editing macros needs no page.
+        a.open.as_mut().unwrap().project.pages.clear();
+        assert!(
+            call(&mut a, "macros", json!({"action": "list"}))
+                .unwrap()
+                .contains("Starter")
+        );
+        assert!(call(&mut a, "macros", json!({"action": "get", "name": "Starter"})).is_ok());
+        call(
+            &mut a,
+            "macros",
+            json!({"action": "edit", "name": "Starter", "description": "Starter"}),
+        )
+        .unwrap();
+        let err = call(&mut a, "macros", json!({"action": "insert", "name": "Starter"})).unwrap_err();
+        assert!(err.contains("no pages"), "{err}");
+
+        // A library's macro is not edited.
+        let lib = tmp.path().join("lib");
+        wc_core::macros::write_macro(&lib, "lamp", &m).unwrap();
+        let open = a.open.as_mut().unwrap();
+        open.project.meta.libraries.push(wc_core::project::LibrarySource {
+            name: "parts".into(),
+            kind: "folder".into(),
+            location: lib.display().to_string(),
+            reference: None,
+        });
+        let err = call(
+            &mut a,
+            "macros",
+            json!({"action": "edit", "name": "lamp", "description": "x"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("library"), "{err}");
+    }
+
+    #[test]
     fn the_placeholders_dialog_keeps_what_it_does_not_edit_and_renames_together() {
         use wc_core::macros::{Macro, Placeholder, ValueSet};
         let (tmp, mut a) = app(vec![]);
@@ -6446,6 +6821,140 @@ mod tests {
         let err = a.apply_rules(&[], &odd, Path::new("elsewhere")).err().unwrap();
         assert!(err.contains("another project"), "{err}");
         assert_eq!(rules(&a).len(), 2);
+    }
+
+    #[test]
+    fn the_assistant_reads_sets_and_resets_a_report_layout_as_one_undo_step_each() {
+        let (_tmp, mut a) = app(vec![]);
+        let get =
+            |a: &mut App, v: Value| -> Value { serde_json::from_str(&call(a, "report_layouts", v).unwrap()).unwrap() };
+        let reports = |a: &App| a.open.as_ref().unwrap().project.meta.reports.clone();
+        let all = get(&mut a, json!({"action": "get"}));
+        assert_eq!(all.as_array().map(Vec::len), Some(wc_report::Kind::ALL.len()));
+        let parts = get(&mut a, json!({"action": "get", "kind": "parts"}));
+        assert_eq!(parts[0]["layout"], Value::Null);
+        let builtin: Vec<String> = serde_json::from_value(parts[0]["builtin_columns"].clone()).unwrap();
+        assert!(builtin.len() >= 2, "{builtin:?}");
+
+        // Bad input changes nothing.
+        for bad in [
+            json!({"action": "set", "kind": "parts"}),
+            json!({"action": "set", "layout": {}}),
+            json!({"action": "set", "kind": "nope", "layout": {}}),
+            json!({"action": "set", "kind": "parts", "layout": {"column": "Tag"}}),
+            json!({"action": "shuffle", "kind": "parts"}),
+        ] {
+            assert!(call(&mut a, "report_layouts", bad.clone()).is_err(), "{bad}");
+        }
+        assert!(reports(&a).is_empty());
+
+        // Unknown keys, at the top or in a column entry, are named and change nothing, even
+        // over a kept layout; an empty layout is the built-in one.
+        let tag = json!({"action": "set", "kind": "parts", "layout": {"title": "Kept"}});
+        call(&mut a, "report_layouts", tag).unwrap();
+        let before = reports(&a);
+        assert_eq!(before.len(), 1);
+        for (layout, key) in [
+            (json!({"columns": [{"from": builtin[0]}]}), "\"columns\""),
+            (json!({"column": [{"from": builtin[0], "title": "X"}]}), "\"title\""),
+        ] {
+            let err = call(
+                &mut a,
+                "report_layouts",
+                json!({"action": "set", "kind": "parts", "layout": layout}),
+            )
+            .unwrap_err();
+            assert!(err.contains(key), "{err}");
+            assert_eq!(reports(&a), before);
+        }
+        call(
+            &mut a,
+            "report_layouts",
+            json!({"action": "set", "kind": "parts", "layout": {}}),
+        )
+        .unwrap();
+        assert!(reports(&a).is_empty());
+        let mark = a.open.as_ref().unwrap().undo_mark();
+
+        // Set: kept as the dialog keeps it (trimmed), with wc_report's warnings in the answer.
+        let said = call(
+            &mut a,
+            "report_layouts",
+            json!({"action": "set", "kind": "parts", "layout": {
+                "title": " Bill of materials ",
+                "column": [{"from": builtin[1], "heading": "Second"}, {"from": builtin[0]}],
+                "sort": [format!("-{}", builtin[0])],
+                "group": "Maker",
+                "header": ["project.name", "revison"]
+            }}),
+        )
+        .unwrap();
+        assert!(said.contains("cannot group by \"Maker\""), "{said}");
+        assert!(said.contains("header \"revison\""), "{said}");
+        let kept = reports(&a);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].kind, "parts");
+        assert_eq!(kept[0].title.as_deref(), Some("Bill of materials"));
+        assert_eq!(kept[0].columns.len(), 2);
+        assert_eq!(kept[0].columns[0].heading.as_deref(), Some("Second"));
+        assert_eq!(kept[0].sort, [format!("-{}", builtin[0])]);
+        let read = get(&mut a, json!({"action": "get", "kind": "parts"}));
+        assert_eq!(read[0]["layout"]["title"], json!("Bill of materials"));
+        assert_eq!(read[0]["warnings"].as_array().map(Vec::len), Some(2));
+        assert!(a.open.as_mut().unwrap().undo());
+        assert!(reports(&a).is_empty(), "one undo step");
+        assert_eq!(a.open.as_ref().unwrap().undo_mark(), mark);
+        assert!(a.open.as_mut().unwrap().redo());
+        assert_eq!(reports(&a), kept);
+
+        // A layout that shows the built-in one keeps none, as in the dialog.
+        let every: Vec<Value> = builtin.iter().map(|c| json!({"from": c})).collect();
+        call(
+            &mut a,
+            "report_layouts",
+            json!({"action": "set", "kind": "parts", "layout": {"column": every}}),
+        )
+        .unwrap();
+        assert!(reports(&a).is_empty());
+        assert!(a.open.as_mut().unwrap().undo());
+        assert_eq!(reports(&a), kept);
+
+        // Reset: back to the built-in layout, one undo step.
+        let said = call(&mut a, "report_layouts", json!({"action": "reset", "kind": "parts"})).unwrap();
+        assert!(said.contains("built-in"), "{said}");
+        assert!(reports(&a).is_empty());
+        assert!(a.open.as_mut().unwrap().undo());
+        assert_eq!(reports(&a), kept);
+    }
+
+    #[test]
+    fn the_assistant_gets_the_warnings_of_a_stored_layout_for_an_unknown_report() {
+        let (_tmp, mut a) = app(vec![]);
+        let get =
+            |a: &mut App, v: Value| -> Value { serde_json::from_str(&call(a, "report_layouts", v).unwrap()).unwrap() };
+        let layout: wc_core::report_layout::ReportLayout =
+            serde_json::from_value(json!({"kind": "parst", "title": "Typo"})).unwrap();
+        a.open.as_mut().unwrap().project.meta.reports.push(layout);
+
+        // Without a kind: the known reports, then the unknown one with its warning.
+        let all = get(&mut a, json!({"action": "get"}));
+        let all = all.as_array().unwrap();
+        assert_eq!(all.len(), wc_report::Kind::ALL.len() + 1);
+        let odd = &all[wc_report::Kind::ALL.len()];
+        assert_eq!(odd["kind"], json!("parst"));
+        assert_eq!(odd["layout"]["title"], json!("Typo"));
+        assert_eq!(odd["builtin_columns"], Value::Null);
+        let warned: Vec<String> = serde_json::from_value(odd["warnings"].clone()).unwrap();
+        assert_eq!(warned.len(), 1);
+        assert!(warned[0].contains("no such report"), "{warned:?}");
+        for known in &all[..wc_report::Kind::ALL.len()] {
+            assert_eq!(known["warnings"], json!([]), "{known}");
+        }
+
+        // With a kind: only that report, still filtered.
+        let parts = get(&mut a, json!({"action": "get", "kind": "parts"}));
+        assert_eq!(parts.as_array().map(Vec::len), Some(1));
+        assert_eq!(parts[0]["warnings"], json!([]));
     }
 
     #[test]
@@ -8018,6 +8527,31 @@ mod tests {
             assert!(seen.unknown.is_none());
             assert!(seen.reached_by(far.path(), &far_path).unwrap());
             assert!(!seen.reached_by(copy.path(), &copy_path).unwrap());
+        }
+    }
+
+    #[test]
+    fn rules_list_runs_while_a_page_is_held_but_rule_changes_do_not() {
+        let project = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let held: BTreeMap<String, String> = [("p0002".to_owned(), "Ola".to_owned())].into();
+        let classify = |words: &[&str]| {
+            let args: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
+            writes_while_held(&args, project.path(), &held, elsewhere.path())
+        };
+        for words in [&["rules", "list"][..], &["rules", "list", "--json"]] {
+            assert!(classify(words).is_none(), "{words:?}");
+        }
+        for words in [
+            &["rules", "set", "rules.toml"][..],
+            &["rules", "off", "lib:1"],
+            &["rules", "on", "lib:1"],
+            &["rules"],
+        ] {
+            let Some(e) = classify(words) else {
+                unreachable!("{words:?} ran")
+            };
+            assert!(e.contains("Ola") && e.contains("shared session"), "{words:?}: {e}");
         }
     }
 

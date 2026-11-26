@@ -323,17 +323,9 @@ pub fn save(dir: &Path, project: &Project) -> Result<Vec<PathBuf>> {
 /// that was undone, or drawn and never saved. Other vendored symbols are left alone.
 fn remove_unused_box_symbols(dir: &Path, project: &Project) -> Result<()> {
     let folder = dir.join(VENDOR_DIR).join(ItemKind::Symbol.dir());
-    let resolved = match folder.canonicalize() {
-        Ok(resolved) => resolved,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(Error::io(&folder, e)),
-    };
-    // Only inside the project folder: when `vendor` or `vendor/symbols` is a link to somewhere
-    // else, the files there are not this project's to remove.
-    let root = dir.canonicalize().map_err(|e| Error::io(dir, e))?;
-    if !resolved.starts_with(&root) {
+    let Some(resolved) = box_symbol_folder(dir)? else {
         return Ok(());
-    }
+    };
     let used: Vec<String> = project
         .lock
         .symbols
@@ -391,6 +383,47 @@ fn remove_unused_box_symbols(dir: &Path, project: &Project) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The project's vendored symbol folder, resolved, when a save may remove black box symbol
+/// files from it: `None` when it does not exist or is a link to outside the project folder
+/// (the files there are not this project's to remove).
+fn box_symbol_folder(dir: &Path) -> Result<Option<PathBuf>> {
+    let folder = dir.join(VENDOR_DIR).join(ItemKind::Symbol.dir());
+    let resolved = match folder.canonicalize() {
+        Ok(resolved) => resolved,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Error::io(&folder, e)),
+    };
+    let root = dir.canonicalize().map_err(|e| Error::io(dir, e))?;
+    Ok(resolved.starts_with(&root).then_some(resolved))
+}
+
+/// Every file that [`save`] may remove as an unused black box symbol: the plain
+/// `box.<page>.<id>.json` files in the project's vendored symbol folder. A command that puts the
+/// project back after a failed save keeps a copy of these too, so a cleanup that removed some
+/// of them before failing can be undone.
+pub fn removable_box_symbol_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let Some(resolved) = box_symbol_folder(dir)? else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for entry in fs::read_dir(&resolved).map_err(|e| Error::io(&resolved, e))? {
+        let entry = entry.map_err(|e| Error::io(&resolved, e))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !is_box_symbol(&name) || !name.ends_with(".json") {
+            continue;
+        }
+        let path = entry.path();
+        match fs::symlink_metadata(&path) {
+            Ok(m) if m.file_type().is_file() => out.push(path),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Error::io(&path, e)),
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 /// Whether a symbol id (or its file name) is a black box's own symbol, `box.<page>.<id>`.
