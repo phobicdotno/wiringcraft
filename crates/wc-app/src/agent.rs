@@ -1995,7 +1995,17 @@ impl App {
                     ));
                 }
                 let before = self.dialog.is_some();
+                let waiting = self.pending.is_some();
                 self.run(a);
+                // Only a picker this action asked for: one already waiting is another action's
+                // (and makes this one's refused, which its message says). Told before any
+                // message, which may be an earlier one still showing.
+                if !waiting && self.pending.is_some() {
+                    return Ok(format!(
+                        "{} queued a file dialog on the user's screen for them to pick in; it has not been answered yet.",
+                        a.info().label
+                    ));
+                }
                 if let Some(m) = self.take_message() {
                     return Ok(m);
                 }
@@ -3394,6 +3404,8 @@ mod tests {
             share: Default::default(),
             symbol_editor: None,
             find: None,
+            pending: None,
+            pending_for: None,
             strip_editor: None,
             show_layers: false,
             live: Default::default(),
@@ -3813,6 +3825,38 @@ mod tests {
             "Check: checking",
             "no counts of the first project"
         );
+    }
+
+    #[test]
+    fn a_queued_picker_is_told_even_with_an_earlier_message_showing() {
+        let (_tmp, mut a) = app(vec![]);
+        a.dialog = Some(Dialog::Message("Exported 3 pages".into()));
+        let r = call(&mut a, "run_action", json!({"action": Action::ExportAml.name()})).unwrap();
+        assert!(r.contains("queued a file dialog"), "{r}");
+        assert!(matches!(a.pending, Some(crate::Pending::Export(crate::Export::Aml))));
+    }
+
+    #[test]
+    fn a_picker_waits_for_its_own_project_and_a_second_one_is_not_taken() {
+        let (_tmp, mut a) = app(vec![]);
+        let r = call(&mut a, "run_action", json!({"action": Action::ExportPdf.name()})).unwrap();
+        assert!(r.contains("queued a file dialog"), "{r}");
+        // A second picker in the same reply does not replace the first, and says so.
+        let r = call(&mut a, "run_action", json!({"action": Action::ExportAml.name()})).unwrap();
+        assert!(r.contains("was not done"), "{r}");
+        assert!(matches!(a.pending, Some(crate::Pending::Export(crate::Export::Pdf(_)))));
+        // An action without a picker is not taken for one while a picker waits (the status
+        // line still holds the refusal, as the frame would show it, so it is cleared first).
+        a.ed.message.clear();
+        let r = call(&mut a, "run_action", json!({"action": "ZoomFit"})).unwrap();
+        assert!(r.starts_with("Ran"), "{r}");
+        assert!(a.pending.is_some());
+        // Another project opened before the picker could show: it is not shown for that one.
+        let (_other_tmp, other) = crate::state::tests::project();
+        a.open = Some(other);
+        a.ask_pending();
+        assert!(a.pending.is_none());
+        assert!(a.ed.message.contains("another project"), "{}", a.ed.message);
     }
 
     #[test]
@@ -5882,9 +5926,15 @@ mod tests {
                 align: Default::default(),
                 angle: 0.0,
             });
-        // Without a dictionary the PDF is exported at once, as drawn.
+        // Without a dictionary no language is asked for: only where to save, and the PDF is
+        // printed as drawn.
         a.run(Action::ExportPdf);
-        assert!(matches!(&a.dialog, Some(Dialog::Message(m)) if m.starts_with("Exported")));
+        assert!(a.dialog.is_none());
+        assert!(matches!(
+            &a.pending,
+            Some(crate::Pending::Export(crate::Export::Pdf(langs))) if langs.is_empty()
+        ));
+        a.pending = None;
         std::fs::write(
             dir.join(TRANSLATIONS_FILE),
             "source = \"en\"\n\n[[text]]\nen = \"Pumps\"\nnb = \"Pumper\"\n",
@@ -8102,6 +8152,37 @@ mod tests {
             wc_core::store::load(&other).unwrap(),
             "nothing of the old project in it"
         );
+    }
+
+    #[test]
+    fn opening_another_project_closes_the_forms_of_the_old_one() {
+        let (tmp, mut a) = app(vec![]);
+        let other = tmp.path().join("other");
+        let mut p = wc_core::store::create(&other, "Other").unwrap();
+        p.pages.push(wc_core::Page::new("p0002", "2", "Control"));
+        wc_core::store::save(&other, &p).unwrap();
+        // Delete page of the old project: through the assistant, the new one must not get it.
+        a.dialog = Some(crate::Dialog::DeletePage(1));
+        let r = call(&mut a, "open_project", json!({"path": other.to_string_lossy()}));
+        assert!(r.is_ok(), "{r:?}");
+        assert!(a.dialog.is_none());
+        assert_eq!(a.open.as_ref().unwrap().project.pages.len(), 2);
+        // The typed Save as form names a copy of the old one: closed too, from File > Open.
+        let first = tmp.path().join("p");
+        a.dialog = Some(crate::Dialog::SaveAsPath(
+            crate::prefs::FolderField::typed("old copy"),
+            None,
+        ));
+        let mut prefs = std::mem::take(&mut a.prefs);
+        a.open_dir(&first, &mut prefs);
+        a.prefs = prefs;
+        assert!(a.dialog.is_none());
+        // A form that is not about the project stays.
+        a.dialog = Some(crate::Dialog::OpenPath(crate::prefs::FolderField::typed("x"), None));
+        let mut prefs = std::mem::take(&mut a.prefs);
+        a.open_dir(&other, &mut prefs);
+        a.prefs = prefs;
+        assert!(matches!(a.dialog, Some(crate::Dialog::OpenPath(..))));
     }
 
     #[test]
