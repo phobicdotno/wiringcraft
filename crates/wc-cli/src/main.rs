@@ -27,7 +27,9 @@ struct Cli {
 enum Cmd {
     /// Create a new project folder (also a git repository).
     New {
+        /// The folder to create the project in; it must not hold a project already.
         dir: PathBuf,
+        /// The project's name (default: the folder's name).
         #[arg(long)]
         name: Option<String>,
         /// Do not make it a git repository.
@@ -49,7 +51,9 @@ enum Cmd {
     Panel(PanelCmd),
     /// Place a library symbol on a page.
     Place {
+        /// The page's id.
         page: String,
+        /// The library symbol's id, e.g. `iec.contactor.coil`.
         symbol: String,
         /// Position in mm, `x,y`.
         #[arg(long, value_parser = parse_point)]
@@ -60,6 +64,7 @@ enum Cmd {
         /// 0, 90, 180 or 270.
         #[arg(long, default_value_t = 0)]
         rotate: i64,
+        /// Mirror the symbol left to right (before turning it).
         #[arg(long)]
         mirror: bool,
     },
@@ -68,6 +73,7 @@ enum Cmd {
     /// symbol pins. It is stored as a symbol of the project (`box.<page>.<id>`), so it carries a
     /// device tag and part and shows in the reports and checks like any symbol. Prints its id.
     Box {
+        /// The page's id.
         page: String,
         /// Top-left corner in mm, `x,y`.
         #[arg(long, value_parser = parse_point)]
@@ -84,10 +90,38 @@ enum Cmd {
         #[arg(long = "pin")]
         pins: Vec<String>,
     },
+    /// Change a black box drawn with `box`: its size and its connection points. Sizes, sides
+    /// and offsets are in the box's own frame, and the corner that stays put is its origin (its
+    /// own top-left; the page top-left only when the box is not turned or mirrored). `--pin` given replaces every point (an old point not named again is
+    /// taken off, and a wire on it keeps a free end where it was); left out, the points stay,
+    /// pulled onto the edges of the new size. `--rename OLD=NEW` keeps a point under a new name
+    /// and its wires follow. Every box placing the same symbol changes. Prints what to check.
+    BoxEdit {
+        /// The page's id.
+        page: String,
+        /// The box's item id, e.g. `s3`.
+        id: String,
+        /// New width and height in mm, `w,h`.
+        #[arg(long, value_parser = parse_point)]
+        size: Option<Point>,
+        /// A connection point, `name:side:offset` as for `box`. Repeat for each point.
+        #[arg(long = "pin")]
+        pins: Vec<String>,
+        /// Take every connection point off (wires on them keep a free end).
+        #[arg(long, conflicts_with = "pins")]
+        clear_pins: bool,
+        /// Rename a point, `OLD=NEW`. Repeat for each.
+        #[arg(long = "rename")]
+        renames: Vec<String>,
+        /// Rename a point given as two values, `OLD NEW`: for a name holding `=`. Repeat for each.
+        #[arg(long = "rename-pair", num_args = 2, value_names = ["OLD", "NEW"])]
+        rename_pairs: Vec<String>,
+    },
     /// Number the wires by rule. Every wire of one connection gets the same number.
     /// Rules: `sequential` (1, 2, 3 in drawing order), `page-column` (`3.4`: page and column
     /// where the connection starts) or `potential` (the potential's name, else sequential).
     NumberWires {
+        /// `sequential`, `page-column` or `potential`.
         #[arg(long, default_value = "page-column")]
         rule: String,
         /// Renumber connections that already have a number too.
@@ -96,14 +130,19 @@ enum Cmd {
     },
     /// Draw a wire. Ends are `item:pin` (e.g. `s1:13`) or a point `x,y`.
     Wire {
+        /// The page's id.
         page: String,
+        /// Start: `item:pin` (e.g. `s1:13`) or a point `x,y` in mm.
         from: String,
+        /// End: `item:pin` or a point `x,y` in mm.
         to: String,
         /// Bend points, `x,y` each.
         #[arg(long = "via", value_parser = parse_point)]
         via: Vec<Point>,
+        /// Wire number, e.g. `101`.
         #[arg(long)]
         number: Option<String>,
+        /// Potential name, e.g. `L1` or `24V`.
         #[arg(long)]
         potential: Option<String>,
         /// The cable this wire is a core of, e.g. `=PUMP-W1` or `-W1` (taken as a value, though
@@ -136,6 +175,11 @@ enum Cmd {
     /// The project logo, shown on the cover page and in every title block.
     #[command(subcommand)]
     Logo(LogoCmd),
+    /// The check rules `check` runs: the project's own `[[rule]]` tables in `project.toml`,
+    /// and the house rules in each library source's `rules.toml`, which the project can turn
+    /// off one by one (`rules_off`).
+    #[command(subcommand)]
+    Rules(RulesCmd),
     /// Macros: saved groups of symbols, wires and drawings in the project's `macros` folder or a
     /// library source's. A macro can hold placeholders (`{{name}}` in its device texts, wire
     /// values and drawn texts) and named value sets that fill them, one per variant.
@@ -153,8 +197,10 @@ enum Cmd {
         /// Device tag, e.g. `-K1` (taken as a value, though it starts with `-`).
         #[arg(allow_hyphen_values = true)]
         tag: String,
+        /// The part's library id; it is taken from the libraries when the project lacks it.
         #[arg(long)]
         part: Option<String>,
+        /// What the device does, e.g. `Pump motor`.
         #[arg(long)]
         description: Option<String>,
     },
@@ -166,10 +212,13 @@ enum Cmd {
     Import(ImportCmd),
     /// Export to PDF.
     Pdf {
+        /// The PDF file to write.
         out: PathBuf,
         /// Page ids to export (default: all).
         #[arg(long = "page")]
         pages: Vec<String>,
+        /// Date for the title block where the page and project set none; free text, printed as
+        /// given, e.g. `2026-11-26`.
         #[arg(long, default_value = "")]
         date: String,
         /// Append report pages: contents, parts, devices, wires, nets, terminals, cables, plc, plc-cards, locations, networks, or all.
@@ -200,12 +249,16 @@ enum Cmd {
         /// Page ids to export (default: all).
         #[arg(long = "page")]
         pages: Vec<String>,
+        /// Date for the title block where the page and project set none; free text, printed as
+        /// given, e.g. `2026-11-26`.
         #[arg(long, default_value = "")]
         date: String,
     },
     /// Print a report (contents, parts, devices, wires, nets, terminals, cables, plc, plc-cards, locations, networks) as a table, CSV or Markdown,
     /// or save it as an Excel workbook (`--format xlsx --out <file>`, one sheet per report).
     Report {
+        /// contents, parts, devices, wires, nets, terminals, cables, plc, plc-cards, locations,
+        /// networks, or `all` (every report; one sheet each with `--format xlsx`).
         kind: String,
         /// `text`, `csv`, `md` or `xlsx`.
         #[arg(long, default_value = "text")]
@@ -218,14 +271,20 @@ enum Cmd {
     Nets,
     /// Export devices, their part data and connection points, and the connections between them
     /// as AutomationML (CAEX 3.0), for tools that take engineering data rather than drawings.
-    Aml { out: PathBuf },
+    Aml {
+        /// The AutomationML (`.aml`) file to write.
+        out: PathBuf,
+    },
     /// Export data for other tools: marker lists for printing marking strips.
     #[command(subcommand)]
     Export(ExportCmd),
     /// Write the PLC inputs and outputs as an IEC 61131-3 global variable list (structured
     /// text) for TwinCAT, CODESYS and similar tools: one variable per point, named after its
     /// device tag and located at its address (`%I*`/`%Q*` when it has none).
-    PlcVars { out: PathBuf },
+    PlcVars {
+        /// The structured text file to write, e.g. `GVL_IO.st`.
+        out: PathBuf,
+    },
     /// Check the project for mistakes: devices drawn twice, contacts without a coil, shorted
     /// potentials, open pins, wires ending in the air, devices without a part, plus the
     /// project's own `[[rule]]` tables in `project.toml` (a cable on every motor, a tag
@@ -242,6 +301,7 @@ enum Cmd {
     /// hit (a device tag renames the device everywhere it appears). Status lines go to stderr,
     /// so stdout holds only hits.
     Find {
+        /// The text to find; upper and lower case are alike unless --match-case.
         query: String,
         /// Replace the found text with this, in every hit.
         #[arg(long)]
@@ -251,7 +311,10 @@ enum Cmd {
         match_case: bool,
     },
     /// Show what is inside a project archive from another tool (.tewzip, .zw1, .elk, .zip).
-    Inspect { file: PathBuf },
+    Inspect {
+        /// The archive file.
+        file: PathBuf,
+    },
     /// Version control: commit, branches, merge, history.
     #[command(subcommand)]
     Vcs(VcsCmd),
@@ -267,6 +330,7 @@ enum ExportCmd {
     /// tag order. In smartScript, import it as Excel/CSV data and map the Marker column (or
     /// the Line columns, one per text line of the marker).
     WagoMarking {
+        /// The CSV file to write.
         out: PathBuf,
         #[command(flatten)]
         args: MarkingArgs,
@@ -275,7 +339,10 @@ enum ExportCmd {
     /// (UTF-8) with, for every strip in natural tag order, its plates and DIN rails, its
     /// terminals in strip order (part, level, wire cross-section and colour on each side), its
     /// jumpers and its accessories. Each row has a stable Index for importing the list back.
-    WagoConfigurator { out: PathBuf },
+    WagoConfigurator {
+        /// The CSV file to write.
+        out: PathBuf,
+    },
 }
 
 /// Options of `export wago-marking`.
@@ -304,7 +371,9 @@ struct MarkingArgs {
 enum CommentCmd {
     /// Pin a comment on a page. Prints its id.
     Add {
+        /// The page's id.
         page: String,
+        /// The comment.
         text: String,
         /// Where on the page, in mm, `x,y`; without it the comment is about the whole page.
         #[arg(long, value_parser = parse_point)]
@@ -315,20 +384,34 @@ enum CommentCmd {
     },
     /// Answer a comment; this opens a resolved one again.
     Reply {
+        /// The comment's id, as `comment list` shows it.
         id: String,
+        /// The answer.
         text: String,
+        /// Who is writing (default: WIRINGCRAFT_USER, then git's user.name, then the login).
         #[arg(long)]
         author: Option<String>,
     },
     /// Mark a comment resolved.
-    Resolve { id: String },
+    Resolve {
+        /// The comment's id, as `comment list` shows it.
+        id: String,
+    },
     /// Open a resolved comment again.
-    Reopen { id: String },
+    Reopen {
+        /// The comment's id, as `comment list` shows it.
+        id: String,
+    },
     /// Delete a comment and its replies.
-    Remove { id: String },
+    Remove {
+        /// The comment's id, as `comment list` shows it.
+        id: String,
+    },
     /// List the comments, of one page or all; open ones only unless --all.
     List {
+        /// Only this page's comments (page id).
         page: Option<String>,
+        /// Resolved comments too.
         #[arg(long)]
         all: bool,
     },
@@ -338,7 +421,9 @@ enum CommentCmd {
 enum PanelCmd {
     /// A new mounting plate with ducts around the edge and a DIN rail in every 125 mm row.
     New {
+        /// The new layout's id, e.g. `plate1`.
         id: String,
+        /// The layout's name, shown on its page.
         #[arg(long, default_value = "")]
         name: String,
         /// Plate width in mm.
@@ -351,6 +436,7 @@ enum PanelCmd {
     /// Put devices that have a part and are not on the plate yet onto its rails, sized by the
     /// part's `Width` and `Height` properties.
     Arrange {
+        /// The layout's id.
         id: String,
         /// Only devices in this location, e.g. `+CAB1`.
         #[arg(long)]
@@ -359,12 +445,15 @@ enum PanelCmd {
     /// Write a layout as a 3D STEP model (plate, rails, ducts and devices as solids, depths
     /// from the part's `Depth` property) for SolidCraft or any other CAD program.
     Step {
+        /// The layout's id.
         id: String,
+        /// The STEP file to write.
         out: PathBuf,
     },
     /// Put one device on a plate, or move or turn it when it is there already, or take it off
     /// with `--remove`. Its size comes from its part as `arrange` sizes it.
     Device {
+        /// The layout's id.
         id: String,
         /// Device tag, e.g. `-K1` (taken as a value, though it starts with `-`).
         #[arg(allow_hyphen_values = true)]
@@ -383,11 +472,14 @@ enum PanelCmd {
     },
     /// Print a layout's plate and each device on it with its position, size and turn.
     Show {
+        /// The layout's id.
         id: String,
     },
     /// List the layouts and what is on them.
     List,
+    /// Delete a layout.
     Remove {
+        /// The layout's id.
         id: String,
     },
 }
@@ -404,7 +496,10 @@ enum LocationCmd {
         description: Option<String>,
     },
     /// Remove a location from the list (devices keep their tags).
-    Remove { path: String },
+    Remove {
+        /// The location, with or without its `+`.
+        path: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -415,6 +510,7 @@ enum MacroCmd {
     /// free tags and its devices the macro's data, placeholders filled from `--set`. Prints
     /// the new symbol and wire ids.
     Place {
+        /// The page's id.
         page: String,
         /// The macro's name or file name.
         name: String,
@@ -436,9 +532,45 @@ enum LogoCmd {
     Show,
     /// Make a PNG or JPEG picture the logo: it is copied into the project's `pictures` folder
     /// (a picture already there is used as it is). Its place on the cover page is kept.
-    Set { file: PathBuf },
+    Set {
+        /// The PNG or JPEG file.
+        file: PathBuf,
+    },
     /// Take the logo off the cover page and the title blocks; its file stays in the project.
     Remove,
+}
+
+#[derive(Subcommand)]
+enum RulesCmd {
+    /// List the project's own rules (by number), then each library source's rules
+    /// (`source:number`, on or off), one per line: the rule, whether it runs, and its kind and
+    /// values. Entries of `rules_off` that name no rule are listed last.
+    List {
+        /// Print everything as JSON instead: `rules`, `library` and `rules_off`.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Replace the project's own rules with the ones in a file, in order: `[[rule]]` tables
+    /// (TOML, as in `project.toml`), or with a `.json` name a list of rules (or `{"rules":
+    /// [...]}`). `-` reads TOML from stdin. A rule has `kind` (cable, tag, max-wires) and
+    /// optionally `devices`, `role`, `pattern`, `max`, `severity`, `message` and `name`; a rule
+    /// the check could not run is refused and nothing is changed. An empty file removes them
+    /// all.
+    Set {
+        /// The rules file (`.toml` or `.json`), or `-` for TOML from stdin.
+        file: PathBuf,
+    },
+    /// Turn a library rule off for this project, by `source:number` or `source:name`.
+    Off {
+        /// The library rule, `source:number` or `source:name`.
+        rule: String,
+    },
+    /// Turn a library rule back on, by `source:number` or `source:name`: every `rules_off`
+    /// entry that turns it off is removed.
+    On {
+        /// The library rule, `source:number` or `source:name`.
+        rule: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -447,10 +579,13 @@ enum RevisionCmd {
     List,
     /// Add a revision after the others.
     Add {
+        /// The revision's letter or name, e.g. `A`.
         letter: String,
         /// What changed.
         #[arg(long, default_value = "")]
         text: String,
+        /// Date of the revision, shown in `revision list` and the revision table; free text,
+        /// printed as given, e.g. `2026-11-26`.
         #[arg(long, default_value = "")]
         date: String,
         /// Who made it.
@@ -459,22 +594,34 @@ enum RevisionCmd {
     },
     /// Change a revision's description, date and author.
     Edit {
+        /// The revision's letter, e.g. `A`.
         letter: String,
+        /// New description of what changed.
         #[arg(long)]
         text: Option<String>,
+        /// New date; free text, printed as given.
         #[arg(long)]
         date: Option<String>,
+        /// New author.
         #[arg(long)]
         by: Option<String>,
     },
     /// Remove a revision; refused while a cloud carries it.
-    Remove { letter: String },
+    Remove {
+        /// The revision's letter, e.g. `A`.
+        letter: String,
+    },
     /// Draw a cloud on a page around the rectangle from (x1, y1) to (x2, y2), in mm.
     Cloud {
+        /// The page's id.
         page: String,
+        /// One corner's x in mm.
         x1: f64,
+        /// One corner's y in mm.
         y1: f64,
+        /// The opposite corner's x in mm.
         x2: f64,
+        /// The opposite corner's y in mm.
         y2: f64,
         /// The revision in its tag; the latest when left out.
         #[arg(long)]
@@ -483,17 +630,24 @@ enum RevisionCmd {
     /// Remove a page's clouds: the one at an index `revision list` shows, or with `--rev` every
     /// cloud of that revision.
     Uncloud {
+        /// The page's id.
         page: String,
+        /// The cloud's index on the page, as `revision list` shows it.
         index: Option<usize>,
+        /// Remove every cloud of this revision instead.
         #[arg(long)]
         rev: Option<String>,
     },
     /// Show the revision table on a page with its top-left corner at (x, y) in mm, or take it
     /// off with `--off`.
     Table {
+        /// The page's id.
         page: String,
+        /// Left edge of the table in mm.
         x: Option<f64>,
+        /// Top edge of the table in mm.
         y: Option<f64>,
+        /// Take the table off the page.
         #[arg(long)]
         off: bool,
     },
@@ -504,7 +658,10 @@ enum TemplateCmd {
     /// Print the template as TOML (the built-in one when the project has none).
     Show,
     /// Set the number of reference columns across the frame (1 to 40).
-    Columns { count: usize },
+    Columns {
+        /// How many columns, 1 to 40.
+        count: usize,
+    },
     /// Go back to the built-in layout (removes `[template]` from project.toml).
     Reset,
 }
@@ -522,17 +679,22 @@ enum JumperCmd {
     },
     /// Take terminals out of their jumper, e.g. `jumper remove -X1 4`.
     Remove {
+        /// The strip, e.g. `-X1` (taken as a value, though it starts with `-`).
         #[arg(allow_hyphen_values = true)]
         strip: String,
+        /// Terminal numbers.
         terminals: Vec<String>,
     },
     /// Give the jumper holding a terminal a part (article), e.g.
     /// `jumper part -X1 3 wago.2002-402`; leave the part out to clear it. A part the project
     /// does not have yet is taken from its libraries.
     Part {
+        /// The strip, e.g. `-X1` (taken as a value, though it starts with `-`).
         #[arg(allow_hyphen_values = true)]
         strip: String,
+        /// A terminal the jumper holds.
         terminal: String,
+        /// The part's library id; left out clears it.
         part: Option<String>,
     },
     /// List the project's jumpers.
@@ -544,28 +706,36 @@ enum StripCmd {
     /// List terminal strips with their terminals in rail order; spares are marked `(spare)`.
     /// Give a strip to list only that one, e.g. `strip list -X1`.
     List {
+        /// Only this strip, e.g. `-X1` (taken as a value, though it starts with `-`).
         #[arg(allow_hyphen_values = true)]
         strip: Option<String>,
     },
     /// Put a strip's terminals in this rail order, e.g. `strip order -X1 3 1 2`. Terminals
     /// left out follow at the end; no terminals goes back to the order by number.
     Order {
+        /// The strip, e.g. `-X1` (taken as a value, though it starts with `-`).
         #[arg(allow_hyphen_values = true)]
         strip: String,
+        /// Terminal numbers in their new rail order.
         terminals: Vec<String>,
     },
     /// Move a terminal to a place on the rail (1 is first), e.g. `strip move -X1 3 1`.
     Move {
+        /// The strip, e.g. `-X1` (taken as a value, though it starts with `-`).
         #[arg(allow_hyphen_values = true)]
         strip: String,
+        /// The terminal to move.
         terminal: String,
+        /// Its new place on the rail, 1 being first.
         to: usize,
     },
     /// Add a spare terminal (on the rail, not drawn), e.g. `strip spare -X1 S1 --after 2`;
     /// without `--after` it goes at the end.
     Spare {
+        /// The strip, e.g. `-X1` (taken as a value, though it starts with `-`).
         #[arg(allow_hyphen_values = true)]
         strip: String,
+        /// The spare terminal's number, e.g. `S1`.
         terminal: String,
         /// The terminal it goes right after.
         #[arg(long)]
@@ -574,8 +744,10 @@ enum StripCmd {
     /// Take a spare terminal off the strip (and out of its jumper), e.g.
     /// `strip unspare -X1 S1`.
     Unspare {
+        /// The strip, e.g. `-X1` (taken as a value, though it starts with `-`).
         #[arg(allow_hyphen_values = true)]
         strip: String,
+        /// The spare terminal's number.
         terminal: String,
     },
     /// Set a terminal's level on a multi-level terminal (1 is the bottom), e.g.
@@ -583,19 +755,26 @@ enum StripCmd {
     /// property. Levels are inferred in number order, not rail order: a terminal whose next
     /// number up has level 2 or more is still level 1.
     Level {
+        /// The strip, e.g. `-X1` (taken as a value, though it starts with `-`).
         #[arg(allow_hyphen_values = true)]
         strip: String,
+        /// The terminal's number.
         terminal: String,
+        /// Its level, 1 being the bottom; left out clears it.
         level: Option<u32>,
     },
 }
 
 #[derive(Subcommand)]
 enum PageCmd {
+    /// Add a page, placed by its `--number` among the existing pages.
     Add {
+        /// The new page's id, e.g. `p1`; other commands name the page by it.
         id: String,
+        /// The page number printed in the title block, e.g. `1` or `=A1/3`.
         #[arg(long)]
         number: String,
+        /// The page's title, shown in the title block.
         #[arg(long, default_value = "")]
         title: String,
         /// A4, A3, A2, A1 or A0, landscape unless followed by `-portrait` (`A4-portrait`), or
@@ -610,26 +789,35 @@ enum PageCmd {
         #[arg(long)]
         cover: bool,
     },
+    /// List the pages: id, number, title, and how many symbols and wires each has.
     List,
+    /// Delete a page and everything drawn on it.
     Remove {
+        /// The page's id.
         id: String,
     },
     /// Mark a page as an overview (line diagram), or with `--off` as a normal page again.
     Overview {
+        /// The page's id.
         id: String,
+        /// Make it a normal page again.
         #[arg(long)]
         off: bool,
     },
     /// Change a page's sheet size (as `page add --size` takes it). What is drawn stays where it
     /// is; a smaller sheet can leave some of it outside the frame.
     Size {
+        /// The page's id.
         id: String,
+        /// The new size, e.g. `A3`, `A4-portrait` or `500x700`.
         size: String,
     },
     /// Make a page the project's cover page (any other page loses the mark), or with `--off` a
     /// normal page again.
     Cover {
+        /// The page's id.
         id: String,
+        /// Make it a normal page again.
         #[arg(long)]
         off: bool,
     },
@@ -637,6 +825,7 @@ enum PageCmd {
     /// date, drawn_by, checked_by, ...). The page's own values win over the project's on that
     /// page; `key=` clears one, so the project's shows again.
     Fields {
+        /// The page's id.
         id: String,
         /// `key=value` pairs to set; none lists the fields.
         set: Vec<String>,
@@ -647,10 +836,13 @@ enum PageCmd {
 enum LibCmd {
     /// Add a source. Earlier sources win over later ones.
     Add {
+        /// The source's name, used in item listings.
         name: String,
         /// `folder` or `git`.
         kind: String,
+        /// The folder's path, or the git repository's URL.
         location: String,
+        /// For git: the branch, tag or commit to use (default: the default branch).
         #[arg(long)]
         reference: Option<String>,
     },
@@ -660,18 +852,24 @@ enum LibCmd {
     Status,
     /// Take newer library versions (all changed items, or the ids given).
     Update {
+        /// Symbol or part ids to update (default: all changed items).
         ids: Vec<String>,
     },
     /// Pin every used item that is not pinned yet, and write a pinned item's vendored copy again
     /// when it is missing or unreadable.
     Lock,
+    /// Find symbols and parts in the library sources by id, name, category or description.
     Search {
+        /// The text to look for; upper and lower case are alike.
         query: String,
     },
     /// Offer the project's copy of an item back to a source for review.
     Propose {
+        /// The library source's name.
         source: String,
+        /// The symbol's or part's id.
         id: String,
+        /// The id is a part, not a symbol.
         #[arg(long)]
         part: bool,
     },
@@ -681,15 +879,21 @@ enum LibCmd {
 enum ImportCmd {
     /// A symbol from a DXF drawing. Pins: POINT entities, or entities on a layer named PIN.
     SymbolDxf {
+        /// The DXF file.
         file: PathBuf,
+        /// The new symbol's id, e.g. `my.relay.coil`.
         #[arg(long)]
         id: String,
+        /// The symbol's name, shown in the library.
         #[arg(long)]
         name: String,
+        /// The library folder to write into.
         #[arg(long)]
         lib: PathBuf,
+        /// Library category to file it under, e.g. `relays`.
         #[arg(long, default_value = "")]
         category: String,
+        /// Letter code for new devices, e.g. `K`.
         #[arg(long, default_value = "")]
         letter_code: String,
     },
@@ -700,6 +904,7 @@ enum ImportCmd {
     /// or the project takes the part from another source (a warning says so). The project's own
     /// pinned copy cannot be named with --lib.
     FootprintDxf {
+        /// The DXF file.
         file: PathBuf,
         /// The part's library id.
         #[arg(long)]
@@ -717,6 +922,7 @@ enum ImportCmd {
     /// too, unless that copy has local changes or the project takes the part from another
     /// source (a warning says so). The project's own pinned copy cannot be named with --lib.
     ModelStep {
+        /// The STEP file.
         file: PathBuf,
         /// The part's library id.
         #[arg(long)]
@@ -728,32 +934,46 @@ enum ImportCmd {
     },
     /// A symbol from an SVG drawing. Pins: elements with `id="pin:NAME"` or `data-pin="NAME"`.
     SymbolSvg {
+        /// The SVG file.
         file: PathBuf,
+        /// The new symbol's id, e.g. `my.relay.coil`.
         #[arg(long)]
         id: String,
+        /// The symbol's name, shown in the library.
         #[arg(long)]
         name: String,
+        /// The library folder to write into.
         #[arg(long)]
         lib: PathBuf,
+        /// Library category to file it under, e.g. `relays`.
         #[arg(long, default_value = "")]
         category: String,
+        /// Letter code for new devices, e.g. `K`.
         #[arg(long, default_value = "")]
         letter_code: String,
     },
     /// PLC addresses from a CSV list or an Excel workbook (device and address columns,
     /// description optional), as a PLC tool or spreadsheet writes it. `report plc --format csv`
     /// (or `xlsx`) writes one that reads back.
-    PlcCsv { file: PathBuf },
+    PlcCsv {
+        /// The CSV or `.xlsx` file.
+        file: PathBuf,
+    },
     /// The WAGO configurator list back: a list written by `export wago-configurator`, with the
     /// articles and accessories chosen in the configurator. Each row is matched by its Index to
     /// the terminal or strip device it stands for, and its article to a part of the project or
     /// its libraries (by order number, or part id); matched articles become the devices' parts
     /// and accessories. Rows that cannot be matched are listed with the reason.
-    Wago { file: PathBuf },
+    Wago {
+        /// The CSV file from the configurator.
+        file: PathBuf,
+    },
     /// Every symbol of a KiCad symbol library (`.kicad_sym`, KiCad 6 or later). Ids are
     /// `<prefix>.<symbol name>`; the first pin becomes the origin.
     SymbolKicad {
+        /// The `.kicad_sym` file.
         file: PathBuf,
+        /// The library folder to write into.
         #[arg(long)]
         lib: PathBuf,
         /// Id prefix (default: `kicad.<file name>`).
@@ -762,13 +982,16 @@ enum ImportCmd {
         /// Multiply coordinates, e.g. 2 to put KiCad's 2.54 mm pin grid near a 5 mm grid.
         #[arg(long, default_value_t = 1.0)]
         scale: f64,
+        /// Library category to file the symbols under.
         #[arg(long, default_value = "")]
         category: String,
     },
     /// Parts from a BMEcat catalogue (XML, version 1.2 or 2005): order number, maker,
     /// description, the maker's part number, GTIN, and ECLASS class and features as properties.
     PartsBmecat {
+        /// The BMEcat XML file.
         file: PathBuf,
+        /// The library folder to write into.
         #[arg(long)]
         lib: PathBuf,
     },
@@ -778,7 +1001,9 @@ enum ImportCmd {
     /// pins, and each part gets the symbol made from the macro it names; what the macros leave
     /// out is reported. Pictures are counted.
     PartsEdz {
+        /// The `.edz` file.
         file: PathBuf,
+        /// The library folder to write into.
         #[arg(long)]
         lib: PathBuf,
         /// Which library symbol to give parts by their macro: a text file with one
@@ -790,8 +1015,10 @@ enum ImportCmd {
     /// QElectroTech elements (`.elmt`), one symbol per file. Ids are `<prefix>.<file name>`;
     /// the first terminal becomes the origin.
     SymbolQet {
+        /// The `.elmt` files.
         #[arg(required = true)]
         files: Vec<PathBuf>,
+        /// The library folder to write into.
         #[arg(long)]
         lib: PathBuf,
         /// Id prefix.
@@ -800,6 +1027,7 @@ enum ImportCmd {
         /// Millimetres per QElectroTech pixel; 0.5 puts its 10 px grid on a 5 mm grid.
         #[arg(long, default_value_t = wc_import::qet::DEFAULT_SCALE)]
         scale: f64,
+        /// Library category to file the symbols under.
         #[arg(long, default_value = "")]
         category: String,
         /// Letter code for new devices, e.g. `K`.
@@ -809,7 +1037,9 @@ enum ImportCmd {
     /// Parts from a CSV or semicolon-separated export, or straight from an Excel workbook
     /// (`.xlsx`, its first visible sheet), with the same column names either way.
     PartsCsv {
+        /// The CSV or `.xlsx` file.
         file: PathBuf,
+        /// The library folder to write into.
         #[arg(long)]
         lib: PathBuf,
     },
@@ -817,7 +1047,9 @@ enum ImportCmd {
     /// DXF drawings as pages, AutomationML devices and connections, PLC address lists onto the
     /// project's devices, KiCad symbol libraries and CSV parts lists into `--lib`).
     Archive {
+        /// The archive file.
         file: PathBuf,
+        /// Number of the first new page; the others follow it.
         #[arg(long, default_value_t = 300)]
         first_page: usize,
         /// Library folder for the symbols of `.kicad_sym` entries and the parts of CSV parts
@@ -828,15 +1060,20 @@ enum ImportCmd {
     /// A DWG drawing onto a page, converted to DXF by an installed converter (ODA File
     /// Converter, `dwg2dxf`, or the command in WIRINGCRAFT_DWG2DXF with {in} and {out}).
     PageDwg {
+        /// The DWG file.
         file: PathBuf,
+        /// The id of the page to draw onto; it must exist.
         #[arg(long)]
         page: String,
+        /// Multiply the drawing's coordinates by this to get mm.
         #[arg(long, default_value = "1.0")]
         scale: f64,
     },
     /// PDF pages as trace graphics on new pages (vector content; scanned pages have none).
     Pdf {
+        /// The PDF file.
         file: PathBuf,
+        /// Number of the first new page; the others follow it.
         #[arg(long, default_value_t = 200)]
         first_page: usize,
     },
@@ -844,7 +1081,9 @@ enum ImportCmd {
     /// drawn, with devices at their original positions and wires traced, plus devices, parts and
     /// connections not on a drawn page as overview pages.
     Eplan {
+        /// The `.elk` file, its `.edb` folder, or a zip of the folder.
         path: PathBuf,
+        /// Number of the first new page; the others follow it.
         #[arg(long, default_value_t = 400)]
         first_page: usize,
     },
@@ -855,6 +1094,7 @@ enum ImportCmd {
     /// wires joined to the symbols, and devices with part data, linked to the archive catalog's
     /// part when it has it.
     Swe {
+        /// The `.tewzip` archive or `tew_project_data.sqlite` file.
         path: PathBuf,
         /// Which project of the archive, counted from 1 (archives can hold several).
         #[arg(long, default_value_t = 1)]
@@ -879,6 +1119,7 @@ enum ImportCmd {
     /// source with the same id, and run `lib update <id>`. Into a library folder with --lib,
     /// else vendored into the project.
     SweLibrary {
+        /// The `.tewzip` archive.
         path: PathBuf,
         /// A library folder to write into instead of the project.
         #[arg(long)]
@@ -886,15 +1127,20 @@ enum ImportCmd {
     },
     /// AutomationML (CAEX) devices, properties and connections, laid out as overview pages.
     Aml {
+        /// The AutomationML (`.aml`) file.
         file: PathBuf,
+        /// Number of the first new page; the others follow it.
         #[arg(long, default_value_t = 100)]
         first_page: usize,
     },
     /// A DXF drawing onto a page as graphics; blocks named like library symbols become symbols.
     PageDxf {
+        /// The DXF file.
         file: PathBuf,
+        /// The id of the page to draw onto; it must exist.
         #[arg(long)]
         page: String,
+        /// Multiply the drawing's coordinates by this to get mm.
         #[arg(long, default_value = "1.0")]
         scale: f64,
     },
@@ -902,36 +1148,51 @@ enum ImportCmd {
 
 #[derive(Subcommand)]
 enum VcsCmd {
+    /// Make the project folder a git repository.
     Init,
+    /// Record every change in the project as a new version. Prints its short id.
     Commit {
+        /// What changed and why.
         #[arg(short, long)]
         message: String,
     },
+    /// List the branches (the current one marked `*`), or create one.
     Branch {
+        /// The new branch's name; left out lists the branches.
         name: Option<String>,
     },
+    /// Switch the project to another branch.
     Switch {
+        /// The branch's name.
         name: String,
     },
+    /// Merge another branch into the current one; conflicting files are listed.
     Merge {
+        /// The branch to merge.
         name: String,
     },
     /// History as a subway map (terminal), or as SVG with --svg.
     Log {
+        /// Write the map as SVG to this file.
         #[arg(long)]
         svg: Option<PathBuf>,
+        /// At most this many versions, newest first.
         #[arg(long, default_value_t = 200)]
         limit: usize,
     },
     /// What changed, in schematic terms. Defaults to uncommitted changes.
     Changes {
+        /// The version to compare from: a commit, branch or tag.
         #[arg(default_value = "HEAD")]
         from: String,
+        /// The version to compare to (default: the uncommitted files).
         to: Option<String>,
     },
     /// One page's history: who changed it, when, and what changed, newest first.
     PageLog {
+        /// The page's id or number.
         page: String,
+        /// At most this many versions.
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
@@ -1143,6 +1404,178 @@ fn translated(dir: &Path, p: &Project, lang: &str) -> Res<(Project, Vec<wc_core:
         .ok_or_else(|| format!("bad language {lang:?}: use a code such as nb, or two as nb,en"))?;
     let dict = Dictionary::load(dir).map_err(e)?;
     Ok(translate(p, &dict, &langs))
+}
+
+/// One check rule on a line: its kind, then each value it sets as `key=value` (keys it does
+/// not know too, so a misspelt one shows).
+fn rule_line(r: &wc_core::check_rule::CheckRule) -> String {
+    let mut line = if r.kind.trim().is_empty() {
+        "(no kind)".to_owned()
+    } else {
+        r.kind.clone()
+    };
+    let max = r.max.map(|m| m.to_string());
+    let values = [
+        ("name", r.name.as_ref()),
+        ("devices", r.devices.as_ref()),
+        ("role", r.role.as_ref()),
+        ("pattern", r.pattern.as_ref()),
+        ("max", max.as_ref()),
+        ("severity", r.severity.as_ref()),
+        ("message", r.message.as_ref()),
+    ];
+    for (key, v) in values {
+        if let Some(v) = v {
+            line.push_str(&format!(" {key}={v}"));
+        }
+    }
+    for (key, v) in &r.unknown {
+        line.push_str(&format!(" {key}={v}"));
+    }
+    escape_field(&line)
+}
+
+/// The `rules list` output: the project's rules, each library source's rules with whether the
+/// project turns them off, and `rules_off` entries that name no rule; or all of it as JSON.
+fn rules_list(p: &Project, library: &[wc_core::check_rule::RuleSet], json: bool) -> Res<String> {
+    use wc_core::check_rule::turned_off;
+    let off = &p.meta.rules_off;
+    // An entry turns something off when it names a rule of a source that can be read.
+    let names_a_rule = |o: &String| {
+        library.iter().any(|set| {
+            set.rules.as_ref().is_ok_and(|rules| {
+                rules
+                    .iter()
+                    .enumerate()
+                    .any(|(k, r)| turned_off(std::slice::from_ref(o), &set.source, k + 1, r))
+            })
+        })
+    };
+    if json {
+        let sources: Vec<serde_json::Value> = library
+            .iter()
+            .map(|set| match &set.rules {
+                Ok(rules) => {
+                    let rules: Vec<serde_json::Value> = rules
+                        .iter()
+                        .enumerate()
+                        .map(|(k, r)| {
+                            serde_json::json!({
+                                "rule": format!("{}:{}", set.source, k + 1),
+                                "off": turned_off(off, &set.source, k + 1, r),
+                                "is": r,
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({"source": set.source, "rules": rules})
+                }
+                Err(why) => serde_json::json!({"source": set.source, "error": why}),
+            })
+            .collect();
+        let all = serde_json::json!({"rules": p.meta.rules, "library": sources, "rules_off": off});
+        return serde_json::to_string_pretty(&all).map(|t| t + "\n").map_err(e);
+    }
+    let mut out = String::new();
+    for (k, r) in p.meta.rules.iter().enumerate() {
+        out.push_str(&format!("{}\ton\t{}\n", k + 1, rule_line(r)));
+    }
+    for set in library {
+        match &set.rules {
+            Ok(rules) => {
+                for (k, r) in rules.iter().enumerate() {
+                    let state = if turned_off(off, &set.source, k + 1, r) {
+                        "off"
+                    } else {
+                        "on"
+                    };
+                    out.push_str(&format!(
+                        "{}:{}\t{state}\t{}\n",
+                        escape_field(&set.source),
+                        k + 1,
+                        rule_line(r)
+                    ));
+                }
+            }
+            Err(why) => out.push_str(&format!(
+                "{}\terror\t{}\n",
+                escape_field(&set.source),
+                escape_field(&format!("{}: {why}", wc_core::check_rule::LIBRARY_RULES_FILE))
+            )),
+        }
+    }
+    for o in off.iter().filter(|o| !names_a_rule(o)) {
+        out.push_str(&format!("{}\toff\tnames no library rule\n", escape_field(o)));
+    }
+    Ok(out)
+}
+
+/// The rules in `file` for `rules set`, in order, each as the check runs it: `[[rule]]`
+/// tables, or a JSON list (or `{"rules": [...]}`) for a `.json` name; `-` is TOML on stdin.
+fn rules_from_file(file: &Path) -> Res<Vec<wc_core::check_rule::CheckRule>> {
+    use wc_core::check_rule::{CheckRule, check_rule, parse_rules};
+    let text = if file.as_os_str() == "-" {
+        std::io::read_to_string(std::io::stdin()).map_err(|err| format!("stdin: {err}"))?
+    } else {
+        std::fs::read_to_string(file).map_err(|err| format!("{}: {err}", file.display()))?
+    };
+    let json = file.extension().is_some_and(|x| x.eq_ignore_ascii_case("json"));
+    let rules: Vec<CheckRule> = if json {
+        let value: serde_json::Value =
+            serde_json::from_str(&text).map_err(|err| format!("{}: {err}", file.display()))?;
+        let list = match value {
+            serde_json::Value::Array(l) => l,
+            serde_json::Value::Object(mut o) if o.len() == 1 && o.get("rules").is_some_and(|r| r.is_array()) => {
+                match o.remove("rules") {
+                    Some(serde_json::Value::Array(l)) => l,
+                    _ => Vec::new(),
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "{}: not a list of rules or {{\"rules\": [...]}}",
+                    file.display()
+                ));
+            }
+        };
+        list.into_iter()
+            .enumerate()
+            .map(|(k, r)| serde_json::from_value(r).map_err(|err| format!("Rule {}: {err}.", k + 1)))
+            .collect::<Res<_>>()?
+    } else {
+        // Only `[[rule]]` tables: a misspelt `[[rules]]` would otherwise read as no rules and
+        // remove the project's.
+        let table: toml::Table = text
+            .parse()
+            .map_err(|err: toml::de::Error| format!("{}: {}", file.display(), err.message()))?;
+        if let Some(key) = table.keys().find(|k| *k != "rule") {
+            return Err(format!(
+                "{}: {key:?} is not a rule table: write [[rule]] tables",
+                file.display()
+            ));
+        }
+        parse_rules(&text).map_err(|why| format!("{}: {why}", file.display()))?
+    };
+    rules.iter().enumerate().map(|(k, r)| check_rule(r, k + 1)).collect()
+}
+
+/// `rules off` / `rules on`: turn the library rule `which` off or back on in `rules_off`.
+fn turn_library_rule(
+    dir: &Path,
+    p: &mut Project,
+    library: &[wc_core::check_rule::RuleSet],
+    which: &str,
+    off: bool,
+) -> Res<()> {
+    let state = if off { "off" } else { "on" };
+    match wc_core::check_rule::turn_rule(&p.meta.rules_off, library, which, off)? {
+        None => println!("{} is {state} already", which.trim()),
+        Some(now) => {
+            p.meta.rules_off = now;
+            save(dir, p)?;
+            println!("{} is {state}", which.trim());
+        }
+    }
+    Ok(())
 }
 
 /// Save the project. Jumpers and strip layouts first follow their terminals: what the command
@@ -1627,6 +2060,196 @@ fn run(cli: Cli) -> Res<()> {
             }
             println!("{id}");
         }
+        Cmd::BoxEdit {
+            page,
+            id,
+            size,
+            pins,
+            clear_pins,
+            renames,
+            rename_pairs,
+        } => {
+            let mut p = load(dir)?;
+            let pins = pins.iter().map(|s| parse_box_pin(s)).collect::<Res<Vec<_>>>()?;
+            let mut renamed = std::collections::BTreeMap::new();
+            let mut pairs = Vec::new();
+            for r in &renames {
+                pairs.push(
+                    r.split_once('=')
+                        .ok_or_else(|| format!("{r:?}: expected OLD=NEW, e.g. OUT=Q"))?,
+                );
+            }
+            pairs.extend(
+                rename_pairs
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|[a, b]| (a.as_str(), b.as_str())),
+            );
+            for (from, to) in pairs {
+                if renamed.insert(from.trim().to_owned(), to.trim().to_owned()).is_some() {
+                    return Err(format!(
+                        "connection point {} is renamed twice",
+                        escape_field(from.trim())
+                    ));
+                }
+            }
+            let pg = p.page(&page).ok_or_else(|| format!("no page {page:?}"))?;
+            let symbol_id = pg
+                .symbol(&id)
+                .ok_or_else(|| format!("no symbol {id:?} on page {page}"))?
+                .symbol
+                .clone();
+            let old = store::read_vendored_symbol(dir, &symbol_id).map_err(e)?;
+            let Some((w, h, old_pins)) = wc_core::black_box_layout(&old) else {
+                return Err(format!("{id} is not a black box"));
+            };
+            match p.lock.symbols.get(&symbol_id) {
+                None => {
+                    return Err(format!(
+                        "the project does not pin symbol {symbol_id}; run `wiringcraft lib lock` first"
+                    ));
+                }
+                Some(l) if l.hash != old.hash() => {
+                    return Err(format!(
+                        "the file of symbol {symbol_id} is not the version the project pins (changed outside wiringcraft?); put the pinned version back from the project's history (e.g. `git checkout`) before editing the box"
+                    ));
+                }
+                Some(_) => {}
+            }
+            if let Some(from) = renamed.keys().find(|f| old.pin(f).is_none()) {
+                return Err(format!("the box has no connection point {from} to rename"));
+            }
+            // Two points renamed to one name would join their wires into one connection.
+            let mut targets = std::collections::BTreeSet::new();
+            if let Some(to) = renamed.values().find(|to| !targets.insert(to.as_str())) {
+                return Err(format!("two connection points are renamed to {to}"));
+            }
+            let (width, height) = size.map_or((w, h), |s| (s.x, s.y));
+            // As `wc_core::black_box` asks, checked before the points are fitted to the size.
+            if !(width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0) {
+                return Err(format!(
+                    "a black box needs a width and height above zero, not {width} by {height}"
+                ));
+            }
+            let pins = if !pins.is_empty() || clear_pins {
+                pins
+            } else {
+                // The points stay (renamed as asked), each kept on its edge of the new size.
+                old_pins
+                    .iter()
+                    .map(|b| wc_core::BoxPin {
+                        name: renamed.get(&b.name).unwrap_or(&b.name).clone(),
+                        side: b.side,
+                        offset: match b.side {
+                            wc_core::BoxSide::Top | wc_core::BoxSide::Bottom => b.offset.clamp(0.0, width),
+                            wc_core::BoxSide::Left | wc_core::BoxSide::Right => b.offset.clamp(0.0, height),
+                        },
+                    })
+                    .collect()
+            };
+            // The reason may name points from the project file: escaped for the terminal.
+            let mut new = wc_core::black_box(&symbol_id, &old.name, width, height, &pins)
+                .map_err(|err| escape_field(&err.to_string()))?;
+            new.tag_at = old.tag_at;
+            new.description.clone_from(&old.description);
+            new.source.clone_from(&old.source);
+            new.role = old.role;
+            new.letter_code.clone_from(&old.letter_code);
+            if let Some(to) = renamed.values().find(|to| new.pin(to).is_none()) {
+                return Err(format!("the box has no connection point {to} to rename a point to"));
+            }
+            // What an old point is now: its new name, or none when it is gone. A name another
+            // point was renamed to is that point's.
+            let now_of = |pin: &str| -> Option<String> {
+                if let Some(to) = renamed.get(pin) {
+                    return Some(to.clone());
+                }
+                (!renamed.values().any(|to| to == pin) && new.pin(pin).is_some()).then(|| pin.to_owned())
+            };
+            let mut warnings = Vec::new();
+            let mut others = 0usize;
+            for pg in &mut p.pages {
+                let users: Vec<PlacedSymbol> = pg.symbols.iter().filter(|s| s.symbol == symbol_id).cloned().collect();
+                others += users.iter().filter(|u| !(pg.id == page && u.id == id)).count();
+                for wire in &mut pg.wires {
+                    for end in [&mut wire.from, &mut wire.to] {
+                        let Endpoint::Pin { item, pin } = end else {
+                            continue;
+                        };
+                        let Some(placed) = users.iter().find(|u| u.id == *item) else {
+                            continue;
+                        };
+                        match (old.pin(pin), now_of(pin).and_then(|n| new.pin(&n))) {
+                            (_, None) => {
+                                warnings.push(format!(
+                                    "wire {} on page {} ended on connection point {pin} of {item}, which is gone: its end stays where the point was",
+                                    wire.id, pg.number
+                                ));
+                                if let Some(at) = wc_pdf::pin_position(placed, &old, pin) {
+                                    *end = Endpoint::Point { at };
+                                }
+                            }
+                            (Some(a), Some(b)) => {
+                                if a.at.distance(b.at) > 1e-6 || a.dir != b.dir {
+                                    warnings.push(format!(
+                                        "wire {} on page {} ends on connection point {} of {item}, which moved: check its route",
+                                        wire.id, pg.number, b.name
+                                    ));
+                                }
+                                if b.name != *pin {
+                                    *pin = b.name.clone();
+                                }
+                            }
+                            (None, Some(_)) => {
+                                warnings.push(format!(
+                                    "wire {} on page {} ends on connection point {pin} of {item}, which the box did not have before: it now ends on the new point",
+                                    wire.id, pg.number
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            if others > 0 {
+                warnings.push(format!(
+                    "{others} other box(es) place the same symbol {symbol_id} and changed too"
+                ));
+            }
+            p.lock.symbols.insert(
+                symbol_id.clone(),
+                wc_core::LockEntry {
+                    source: "project".into(),
+                    hash: new.hash(),
+                },
+            );
+            // As for `box`: a save that fails half way puts back the project files and the
+            // box's symbol file.
+            let before = snapshot_project(dir, &[], &[])?;
+            let (symbol_path, symbol_before) = vendored_bytes(dir, ItemKind::Symbol, &symbol_id)?;
+            // A link would be replaced by a plain file, and a failed save could not put it back.
+            if std::fs::symlink_metadata(&symbol_path).is_ok_and(|m| m.file_type().is_symlink()) {
+                return Err(format!(
+                    "the file of symbol {symbol_id} is a link; box-edit does not replace it (copy its target over it first)"
+                ));
+            }
+            store::write_vendored_symbol(dir, &new).map_err(e)?;
+            if let Err(err) = save(dir, &p) {
+                let mut failed = put_files_back(&before);
+                failed.extend(put_file_back(&symbol_path, symbol_before.as_deref()).err());
+                return Err(if failed.is_empty() {
+                    err
+                } else {
+                    format!(
+                        "{err}; putting back the project files failed too: {}",
+                        failed.join("; ")
+                    )
+                });
+            }
+            for w in warnings {
+                eprintln!("warning: {}", escape_field(&w));
+            }
+        }
         Cmd::Wire {
             page,
             from,
@@ -1837,6 +2460,24 @@ fn run(cli: Cli) -> Res<()> {
                         save(dir, &p)?;
                     }
                 }
+            }
+        }
+        Cmd::Rules(rc) => {
+            let mut p = load(dir)?;
+            let library = wc_library::library_rules(dir, &p);
+            match rc {
+                RulesCmd::List { json } => print!("{}", rules_list(&p, &library, json)?),
+                RulesCmd::Set { file } => {
+                    let rules = rules_from_file(&file)?;
+                    let n = rules.len();
+                    if rules != p.meta.rules {
+                        p.meta.rules = rules;
+                        save(dir, &p)?;
+                    }
+                    println!("{n} check rules");
+                }
+                RulesCmd::Off { rule } => turn_library_rule(dir, &mut p, &library, &rule, true)?,
+                RulesCmd::On { rule } => turn_library_rule(dir, &mut p, &library, &rule, false)?,
             }
         }
         Cmd::Revision(rc) => {
@@ -5107,6 +5748,35 @@ fn staging_dir(prefix: &str) -> std::io::Result<tempfile::TempDir> {
 mod tests {
     use super::*;
 
+    /// Walks the whole command tree and lists every subcommand and argument
+    /// (positional or option) whose `--help` line would be blank.
+    fn commands_and_args_without_help(cmd: &clap::Command, path: &str, out: &mut Vec<String>) {
+        for arg in cmd.get_arguments() {
+            let id = arg.get_id().as_str();
+            if id == "help" || id == "version" {
+                continue;
+            }
+            if arg.get_help().is_none() && arg.get_long_help().is_none() {
+                out.push(format!("{path} <{id}>"));
+            }
+        }
+        for sub in cmd.get_subcommands() {
+            let sub_path = format!("{path} {}", sub.get_name());
+            if sub.get_about().is_none() && sub.get_long_about().is_none() {
+                out.push(sub_path.clone());
+            }
+            commands_and_args_without_help(sub, &sub_path, out);
+        }
+    }
+
+    #[test]
+    fn every_subcommand_and_argument_has_help_text() {
+        use clap::CommandFactory;
+        let mut missing = Vec::new();
+        commands_and_args_without_help(&Cli::command(), "wiringcraft", &mut missing);
+        assert!(missing.is_empty(), "no help text for: {missing:#?}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_archive_staging_folder_is_readable_only_by_its_owner() {
@@ -8189,6 +8859,109 @@ mod tests {
     }
 
     #[test]
+    fn a_black_box_is_resized_and_its_points_edited() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        let pins = ["--pin", "IN:left:5", "--pin", "OUT:right:5", "--pin", "PE:bottom:18"];
+        let mut args = vec!["box", "p1", "--at", "40,40", "--size", "20,10"];
+        args.extend_from_slice(&pins);
+        cli(&dir, &args).unwrap();
+        for pin in ["IN", "OUT", "PE"] {
+            cli(&dir, &["wire", "p1", &format!("s1:{pin}"), "0,0"]).unwrap();
+        }
+        let layout = || {
+            let p = load(&dir).unwrap();
+            let sym = store::read_vendored_symbol(&dir, "box.p1.s1").unwrap();
+            assert_eq!(
+                p.lock.symbols["box.p1.s1"].hash,
+                sym.hash(),
+                "the lock pins the new version"
+            );
+            wc_core::black_box_layout(&sym).unwrap()
+        };
+
+        // Narrower: the points stay on their edges, PE pulled in to the new width.
+        cli(&dir, &["box-edit", "p1", "s1", "--size", "10,10"]).unwrap();
+        let (w, h, now) = layout();
+        assert_eq!((w, h), (10.0, 10.0));
+        assert_eq!(now.iter().find(|b| b.name == "PE").unwrap().offset, 10.0);
+
+        // A new list: OUT renamed to Q (its wire follows), PE taken off (its wire keeps a free
+        // end where the point was), A added.
+        cli(
+            &dir,
+            &[
+                "box-edit",
+                "p1",
+                "s1",
+                "--size",
+                "10,20",
+                "--rename",
+                "OUT=Q",
+                "--pin",
+                "IN:left:5",
+                "--pin",
+                "Q:right:5",
+                "--pin",
+                "A:top:2",
+            ],
+        )
+        .unwrap();
+        let names: Vec<String> = layout().2.into_iter().map(|b| b.name).collect();
+        assert_eq!(names, ["IN", "Q", "A"]);
+        let p = load(&dir).unwrap();
+        let ends: Vec<Endpoint> = p.page("p1").unwrap().wires.iter().map(|w| w.from.clone()).collect();
+        let pin = |n: &str| Endpoint::Pin {
+            item: "s1".into(),
+            pin: n.into(),
+        };
+        assert_eq!(
+            ends,
+            [
+                pin("IN"),
+                pin("Q"),
+                Endpoint::Point {
+                    at: Point::new(50.0, 50.0)
+                }
+            ]
+        );
+
+        // Refused, and nothing changes: a rename of a point the box does not have, a point off
+        // its edge, a box without area and an item that is not a box.
+        let before = layout();
+        assert!(cli(&dir, &["box-edit", "p1", "s1", "--rename", "X=Y"]).is_err());
+        assert!(cli(&dir, &["box-edit", "p1", "s1", "--pin", "IN:top:99"]).is_err());
+        assert!(cli(&dir, &["box-edit", "p1", "s1", "--size", "0,5"]).is_err());
+        assert!(cli(&dir, &["box-edit", "p1", "s1", "--size=-1,10"]).is_err());
+        assert!(cli(&dir, &["box-edit", "p1", "s1", "--size=10,-1"]).is_err());
+        assert!(cli(&dir, &["box-edit", "p1", "s1", "--rename", "IN=Z", "--rename", "Q=Z"]).is_err());
+        assert!(cli(&dir, &["box-edit", "p1", "w1", "--size", "5,5"]).is_err());
+        assert_eq!(layout(), before);
+        assert_eq!(load(&dir).unwrap().page("p1").unwrap().wires.len(), 3);
+        // A swap of two names is fine: each wire follows its point.
+        cli(&dir, &["box-edit", "p1", "s1", "--rename", "IN=Q", "--rename", "Q=IN"]).unwrap();
+        let names: Vec<String> = layout().2.into_iter().map(|b| b.name).collect();
+        assert_eq!(names, ["Q", "IN", "A"]);
+        let p = load(&dir).unwrap();
+        let ends: Vec<Endpoint> = p.page("p1").unwrap().wires.iter().map(|w| w.from.clone()).collect();
+        assert_eq!(ends[..2], [pin("Q"), pin("IN")]);
+
+        // One point renamed twice is refused; `--clear-pins` cannot go with `--pin`.
+        assert!(cli(&dir, &["box-edit", "p1", "s1", "--rename", "Q=Z", "--rename", "Q=Y"]).is_err());
+        assert!(cli(&dir, &["box-edit", "p1", "s1", "--clear-pins", "--pin", "Q:left:5"]).is_err());
+        assert_eq!(layout().2.len(), 3);
+        // Every point taken off: the wires keep free ends where the points were.
+        cli(&dir, &["box-edit", "p1", "s1", "--clear-pins"]).unwrap();
+        assert!(layout().2.is_empty());
+        let p = load(&dir).unwrap();
+        let ends: Vec<Endpoint> = p.page("p1").unwrap().wires.iter().map(|w| w.from.clone()).collect();
+        let at = |x, y| Endpoint::Point { at: Point::new(x, y) };
+        assert_eq!(ends[..2], [at(40.0, 45.0), at(50.0, 45.0)]);
+    }
+
+    #[test]
     fn place_takes_a_tag_that_starts_with_a_dash_as_box_does() {
         let Ok(tmp) = tempfile::tempdir() else { unreachable!() };
         let dir = tmp.path().join("proj");
@@ -8240,6 +9013,56 @@ mod tests {
             );
             let Ok(p) = load(&dir) else { unreachable!() };
             assert!(!p.lock.symbols.contains_key("wc.coil"), "no lock entry from {bad:?}");
+        }
+    }
+
+    #[test]
+    fn box_edit_renames_a_name_holding_an_equals_sign_and_refuses_links_and_other_symbols() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
+        cli(&dir, &["lib", "add", "starter", "folder", starter.to_str().unwrap()]).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        cli(
+            &dir,
+            &["box", "p1", "--at", "40,40", "--size", "20,10", "--pin", "X=1:left:5"],
+        )
+        .unwrap();
+        cli(&dir, &["wire", "p1", "s1:X=1", "0,0"]).unwrap();
+
+        // `--rename X=1=Q` splits at the first `=`; `--rename-pair` takes the names apart.
+        assert!(cli(&dir, &["box-edit", "p1", "s1", "--rename", "X=1=Q"]).is_err());
+        cli(&dir, &["box-edit", "p1", "s1", "--rename-pair", "X=1", "Q"]).unwrap();
+        let p = load(&dir).unwrap();
+        let wire = &p.page("p1").unwrap().wires[0];
+        assert_eq!(
+            wire.from,
+            Endpoint::Pin {
+                item: "s1".into(),
+                pin: "Q".into()
+            }
+        );
+
+        // A placed symbol that is not a box is refused as one.
+        cli(&dir, &["place", "p1", "wc.coil", "--at", "100,100"]).unwrap();
+        let coil = load(&dir).unwrap().page("p1").unwrap().symbols[1].id.clone();
+        let err = cli(&dir, &["box-edit", "p1", &coil, "--size", "5,5"]).unwrap_err();
+        assert!(err.contains("is not a black box"), "{err}");
+
+        // A symbol file that is a link is not replaced: the link and the project stay.
+        #[cfg(unix)]
+        {
+            let path = store::vendor_path(&dir, ItemKind::Symbol, "box.p1.s1").unwrap();
+            let target = tmp.path().join("elsewhere.toml");
+            std::fs::rename(&path, &target).unwrap();
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            let before = std::fs::read(&target).unwrap();
+            let err = cli(&dir, &["box-edit", "p1", "s1", "--size", "30,10"]).unwrap_err();
+            assert!(err.contains("link"), "{err}");
+            assert!(std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+            assert_eq!(std::fs::read_link(&path).unwrap(), target);
+            assert_eq!(std::fs::read(&target).unwrap(), before);
         }
     }
 

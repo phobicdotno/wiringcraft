@@ -276,6 +276,31 @@ pub fn specs() -> Vec<Value> {
             &["id"],
         ),
         tool(
+            "black_box",
+            "Black boxes (device boxes) for devices without a symbol of their own: a rectangle with connection points on its edges that wires attach to like pins. `add` draws one with its top-left corner at x, y; `edit` resizes a placed one and/or replaces its connection points. Width, height, sides and offsets are in the box's own frame: the corner that stays put on `edit` is its origin (its own top-left, which is the page top-left only when it is not turned or mirrored). On `edit`, `pins` is the whole new list (left out: the points stay, kept on their edges); an old point whose name is not in it is removed, and `rename` maps an old point name to the new name it keeps, so its wires follow. Wires on a removed point keep a free end. Returns the id (add) or warnings to check (edit).",
+            json!({
+                "action": {"type": "string", "enum": ["add", "edit"]},
+                "page": page_arg(),
+                "id": {"type": "string", "description": "edit: the box's item id, e.g. s3."},
+                "x": {"type": "number", "description": "add: left edge in mm."},
+                "y": {"type": "number", "description": "add: top edge in mm."},
+                "width": {"type": "number", "description": "mm; on edit default the current width."},
+                "height": {"type": "number", "description": "mm; on edit default the current height."},
+                "tag": {"type": "string", "description": "add: device tag, e.g. -A1."},
+                "pins": {
+                    "type": "array",
+                    "description": "Connection points: name, the edge it sits on and its offset in mm along that edge from the edge's left or top end.",
+                    "items": {"type": "object", "properties": {
+                        "name": {"type": "string"},
+                        "side": {"type": "string", "enum": ["left", "right", "top", "bottom"]},
+                        "offset": {"type": "number"}
+                    }, "required": ["name", "side", "offset"]}
+                },
+                "rename": {"type": "object", "additionalProperties": {"type": "string"}, "description": "edit: old point name -> new point name, e.g. {\"OUT\": \"Q\"}."}
+            }),
+            &["action"],
+        ),
+        tool(
             "update_wire",
             "Change a wire: its ends, bends, number, potential, the cable it is a core of, or its cross-section, colour and type. Empty strings clear number, potential, cable, section, colour or type.",
             json!({
@@ -488,9 +513,24 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "run_check",
-            "Check the project: devices drawn twice, contacts without a coil, shorted potentials, open pins, wires ending in the air, devices without a part.",
+            "Check the project: devices drawn twice, contacts without a coil, shorted potentials, open pins, wires ending in the air, devices without a part, then the check rules of the project's library sources (less the ones the project turns off) and the project's own check rules (see the rules tool).",
             json!({}),
             &[],
+        ),
+        tool(
+            "rules",
+            "The project's check rules, which run_check runs: list (the project's own rules, each library source's rules numbered from 1 and whether the project turns it off, and rules_off), set (replace the project's own rules with `rules`, a list in order; send the whole list), off or on (turn a library rule off or back on by `rule`, written source:number or source:name). A rule has kind (cable: the devices have a cable on a pin; tag: their tags match `pattern`, where * is any run, ? one character, # a number; max-wires: at most `max` wire ends on one pin, terminals unless devices or role says otherwise), and optionally devices (tag pattern such as -M*), role (main, auxiliary, standalone, terminal, interruption), severity (error, warning, note; default warning), message ({tag} stands for the tag) and name.",
+            json!({
+                "action": {"type": "string", "enum": ["list", "set", "off", "on"]},
+                "rules": {"type": "array", "items": {"type": "object", "properties": {
+                    "kind": {"type": "string", "enum": wc_core::check_rule::KINDS},
+                    "devices": {"type": "string"}, "role": {"type": "string"}, "pattern": {"type": "string"},
+                    "max": {"type": "integer"}, "severity": {"type": "string"}, "message": {"type": "string"},
+                    "name": {"type": "string"}
+                }, "required": ["kind"]}},
+                "rule": {"type": "string", "description": "off/on: the library rule, as source:number or source:name."}
+            }),
+            &["action"],
         ),
         tool(
             "get_report",
@@ -559,14 +599,14 @@ pub fn specs() -> Vec<Value> {
             "run_command",
             "Run a wiringcraft command-line command on the open project (unsaved changes are saved first, and the project is reloaded after). Covers everything. \
              Project and pages: new (a project folder, --template), page (add, list, remove, overview, size, cover, fields), template (show, columns, reset: frame columns and title block), logo (show, set, remove), location (list, set, remove). \
-             Drawing: place, box (a black box with connection points, --pin name:side:offset), wire, device (part, description), number-wires, macro (list, place), find (text in pages, --replace, --match-case). \
+             Drawing: place, box (a black box with connection points, --pin name:side:offset), box-edit (resize a black box, rename or move its points), wire, device (part, description), number-wires, macro (list, place), find (text in pages, --replace, --match-case). \
              Terminals: strip (list, order, move, spare, unspare, level), jumper (add, remove, part, list). \
              Revisions: revision (list, add, edit, remove, cloud, uncloud, table). \
              Panels: panel (new, arrange, step, device, show, list, remove). \
              Libraries: lib (add, sync, status, update, lock, search, propose). \
              Import: import (symbol-dxf, symbol-svg, symbol-kicad, symbol-qet, footprint-dxf, model-step, parts-csv, parts-bmecat, parts-edz, plc-csv, wago, archive, page-dxf, page-dwg, pdf, eplan, swe, swe-library, aml). \
              Output: pdf (--page, --report, --lang for a translated print), drawing (SVG/DXF per page), report, nets, aml, plc-vars, export (wago-marking, wago-configurator), translations (texts missing a translation, --lang). \
-             Checks and history: check, inspect (another tool's archive), vcs (init, commit, branch, switch, merge, log, changes, page-log), comment (add, reply, resolve, reopen, remove, list). \
+             Checks and history: check, rules (list, set, off, on: the check rules and library rules the project turns off), inspect (another tool's archive), vcs (init, commit, branch, switch, merge, log, changes, page-log), comment (add, reply, resolve, reopen, remove, list). \
              Use [\"--help\"] or [\"<command>\", \"--help\"] for the arguments.",
             json!({"args": {"type": "array", "items": {"type": "string"}, "description": "Arguments, e.g. [\"plc-vars\", \"export/io.st\"]. The project folder is passed for you."}}),
             &["args"],
@@ -949,6 +989,18 @@ impl Open {
     }
 }
 
+/// A black box's width and height, both above zero (as [`wc_core::black_box`] asks), checked
+/// before a box is drawn from a corner or its points are fitted to the size.
+fn box_size_ok(width: f64, height: f64) -> Result<(), String> {
+    if width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "A black box needs a width and height above zero, not {width} by {height}."
+        ))
+    }
+}
+
 /// The app as the assistant's toolbox.
 pub struct AppTools<'a>(pub &'a mut App);
 
@@ -957,7 +1009,8 @@ pub struct AppTools<'a>(pub &'a mut App);
 fn edits_page(name: &str, v: &Value) -> bool {
     match name {
         "place_symbol" | "add_wire" | "update_symbol" | "update_wire" | "add_graphic" | "update_graphic"
-        | "delete_items" | "move_items" | "rotate_items" | "mirror_items" | "delete_page" | "edit_page_json" => true,
+        | "black_box" | "delete_items" | "move_items" | "rotate_items" | "mirror_items" | "delete_page"
+        | "edit_page_json" => true,
         "macros" => s(v, "action") == Some("insert"),
         _ => false,
     }
@@ -1171,6 +1224,10 @@ impl wc_agent::Tools for AppTools<'_> {
                 s(input, "tag").map(|t| format!(" as {t}")).unwrap_or_default()
             ),
             "add_wire" => format!("Drew a wire{page}"),
+            "black_box" => match s(input, "action") {
+                Some("add") => format!("Drew a black box{page}"),
+                _ => format!("Changed black box {}{page}", s(input, "id").unwrap_or_default()),
+            },
             "update_symbol" | "update_wire" | "update_graphic" => {
                 format!("Changed {}{page}", s(input, "id").unwrap_or("an item"))
             }
@@ -1487,6 +1544,7 @@ impl App {
             "place_symbol" => self.tool_place(v),
             "add_wire" => self.tool_wire(v),
             "update_symbol" => self.tool_update_symbol(v),
+            "black_box" => self.tool_black_box(v),
             "update_wire" => self.tool_update_wire(v),
             "add_graphic" | "update_graphic" => {
                 let page = self.page_of(v, "page")?;
@@ -1799,6 +1857,7 @@ impl App {
             "jumpers" => self.tool_jumpers(v),
             "strips" => self.tool_strips(v),
             "macros" => self.tool_macros(v),
+            "rules" => self.tool_rules(v),
             "number_wires" => {
                 use wc_core::numbering::Rule;
                 let rule = match s(v, "rule").unwrap_or("page_column") {
@@ -1987,7 +2046,17 @@ impl App {
                     ));
                 }
                 let before = self.dialog.is_some();
+                let waiting = self.pending.is_some();
                 self.run(a);
+                // Only a picker this action asked for: one already waiting is another action's
+                // (and makes this one's refused, which its message says). Told before any
+                // message, which may be an earlier one still showing.
+                if !waiting && self.pending.is_some() {
+                    return Ok(format!(
+                        "{} queued a file dialog on the user's screen for them to pick in; it has not been answered yet.",
+                        a.info().label
+                    ));
+                }
                 if let Some(m) = self.take_message() {
                     return Ok(m);
                 }
@@ -2249,6 +2318,149 @@ impl App {
             placed.symbol = sym.to_owned();
         }
         Ok(format!("Changed {id}."))
+    }
+
+    /// `black_box`: draw a black box, or resize one and edit its connection points, through
+    /// the same [`crate::state::Open::add_black_box`] and [`crate::state::Open::edit_black_box`]
+    /// the black box tool and the properties panel use (#542).
+    fn tool_black_box(&mut self, v: &Value) -> Result<String, String> {
+        let page = self.page_of(v, "page")?;
+        let pins = match v.get("pins") {
+            None | Some(Value::Null) => None,
+            Some(Value::Array(list)) => Some(
+                list.iter()
+                    .map(|p| {
+                        let name = need_s(p, "name")?;
+                        let side = need_s(p, "side")?;
+                        Ok(wc_core::BoxPin {
+                            name: name.trim().to_owned(),
+                            side: wc_core::BoxSide::parse(side)
+                                .ok_or_else(|| format!("Point {name}: side must be left, right, top or bottom."))?,
+                            offset: need_num(p, "offset")?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+            ),
+            Some(_) => return Err("`pins` must be a list of {name, side, offset}.".into()),
+        };
+        match need_s(v, "action")? {
+            "add" => {
+                let at = Point::new(need_num(v, "x")?, need_num(v, "y")?);
+                let size = Point::new(need_num(v, "width")?, need_num(v, "height")?);
+                box_size_ok(size.x, size.y)?;
+                let device = match v.get("tag") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(t)) if t.trim().is_empty() => None,
+                    Some(Value::String(t)) => Some(tag(t)?),
+                    Some(other) => return Err(format!("`tag` must be a device tag such as -A1, not {other}.")),
+                };
+                let open = need_open(self.open.as_mut())?;
+                let id = open.add_black_box_sized(page, at, (size.x, size.y), &pins.unwrap_or_default(), device)?;
+                Ok(format!("Drew black box {id}."))
+            }
+            "edit" => {
+                let id = need_s(v, "id")?;
+                let open = need_open(self.open.as_mut())?;
+                let layout = open
+                    .project
+                    .pages
+                    .get(page)
+                    .and_then(|p| p.symbol(id))
+                    .and_then(|placed| open.symbols.get(&placed.symbol))
+                    .ok_or_else(|| format!("No symbol {id:?} on that page."))
+                    .map(wc_core::black_box_layout)?;
+                let Some((w, h, old)) = layout else {
+                    return Err(format!("{id} is not a black box."));
+                };
+                // Given, a size must be a number: a bad one is refused, not taken as left out.
+                let width = if v.get("width").is_some() {
+                    need_num(v, "width")?
+                } else {
+                    w
+                };
+                let height = if v.get("height").is_some() {
+                    need_num(v, "height")?
+                } else {
+                    h
+                };
+                box_size_ok(width, height)?;
+                let renamed: BTreeMap<String, String> = match v.get("rename") {
+                    None | Some(Value::Null) => BTreeMap::new(),
+                    Some(Value::Object(m)) => m
+                        .iter()
+                        .map(|(from, to)| {
+                            let to = to.as_str().ok_or("`rename` maps point names to point names.")?;
+                            Ok((from.clone(), to.trim().to_owned()))
+                        })
+                        .collect::<Result<_, String>>()?,
+                    Some(_) => return Err("`rename` must map old point names to new ones.".into()),
+                };
+                if let Some(from) = renamed.keys().find(|f| !old.iter().any(|p| &p.name == *f)) {
+                    return Err(format!("The box has no connection point {from} to rename."));
+                }
+                // Two points renamed to one name would join their wires into one connection.
+                let mut targets = std::collections::BTreeSet::new();
+                if let Some(to) = renamed.values().find(|to| !targets.insert(to.as_str())) {
+                    return Err(format!("Two connection points are renamed to {to}."));
+                }
+                // Left out, the points stay (renamed as asked), kept on their edges.
+                let pins = pins.unwrap_or_else(|| {
+                    let mut kept = crate::black_box_tool::resized_pins(&old, width, height);
+                    for p in &mut kept {
+                        if let Some(to) = renamed.get(&p.name) {
+                            p.name.clone_from(to);
+                        }
+                    }
+                    kept
+                });
+                // Every rename lands on a point of the new list, a name kept as it is too: else
+                // the point would be taken off and its wires cut loose.
+                if let Some(to) = renamed.values().find(|to| !pins.iter().any(|p| &p.name == *to)) {
+                    return Err(format!("The new points have no {to} to rename a point to."));
+                }
+                // An old point that is neither renamed nor in the new list is taken off.
+                let removed: std::collections::BTreeSet<String> = old
+                    .iter()
+                    .map(|p| p.name.clone())
+                    .filter(|n| !renamed.contains_key(n) && !pins.iter().any(|p| &p.name == n))
+                    .collect();
+                let symbol_id = open
+                    .project
+                    .pages
+                    .get(page)
+                    .and_then(|p| p.symbol(id))
+                    .map(|placed| placed.symbol.clone())
+                    .unwrap_or_default();
+                let warnings = open.edit_black_box(page, id, (width, height), &pins, &renamed, &removed)?;
+                // A wire being drawn from a point of the box that was renamed, moved or taken off
+                // would be saved on a stale point: it is dropped, to be started again.
+                let point_changed = |pin: &str| {
+                    renamed.contains_key(pin)
+                        || renamed.values().any(|to| to == pin)
+                        || old.iter().find(|p| p.name == pin) != pins.iter().find(|p| p.name == pin)
+                };
+                let shown = open.project.pages.get(self.ed.page);
+                let dropped = matches!(
+                    &self.ed.wire,
+                    Some((Endpoint::Pin { item, pin }, _))
+                        if shown.and_then(|p| p.symbol(item)).is_some_and(|s| s.symbol == symbol_id)
+                            && point_changed(pin)
+                );
+                if dropped {
+                    self.ed.wire = None;
+                }
+                let mut out = if warnings.is_empty() {
+                    format!("Changed black box {id}.")
+                } else {
+                    format!("Changed black box {id}. Check: {}.", warnings.join("; "))
+                };
+                if dropped {
+                    out.push_str(" The wire being drawn from one of its changed points was dropped; start it again.");
+                }
+                Ok(out)
+            }
+            other => Err(format!("Unknown action {other:?}: use add or edit.")),
+        }
     }
 
     fn tool_update_wire(&mut self, v: &Value) -> Result<String, String> {
@@ -2630,6 +2842,128 @@ impl App {
                 })
             }
             other => Err(format!("Unknown strips action {other}.")),
+        }
+    }
+
+    /// The `rules` tool: the project's check rules and the library rules it turns off, kept
+    /// as the check rules dialog keeps them (its checks, one undo step).
+    fn tool_rules(&mut self, v: &Value) -> Result<String, String> {
+        use wc_core::check_rule::{CheckRule, turned_off};
+        let action = need_s(v, "action")?;
+        let open = need_open(self.open.as_mut())?;
+        let library = wc_library::library_rules(&open.dir, &open.project);
+        let off = &open.project.meta.rules_off;
+        match action {
+            "list" => {
+                let sources: Vec<Value> = library
+                    .iter()
+                    .map(|set| match &set.rules {
+                        Ok(rules) => {
+                            let rules: Vec<Value> = rules
+                                .iter()
+                                .enumerate()
+                                .map(|(k, r)| {
+                                    json!({"rule": format!("{}:{}", set.source, k + 1), "off": turned_off(off, &set.source, k + 1, r), "is": r})
+                                })
+                                .collect();
+                            json!({"source": set.source, "rules": rules})
+                        }
+                        Err(e) => json!({"source": set.source, "error": e}),
+                    })
+                    .collect();
+                Ok(pretty(
+                    &json!({"rules": open.project.meta.rules, "library": sources, "rules_off": off}),
+                ))
+            }
+            "set" => {
+                let list = v
+                    .get("rules")
+                    .and_then(Value::as_array)
+                    .ok_or("`rules` must be a list of rules (an empty list removes them all).")?;
+                let mut rules = Vec::with_capacity(list.len());
+                for (k, r) in list.iter().enumerate() {
+                    let rule: CheckRule =
+                        serde_json::from_value(r.clone()).map_err(|e| format!("Rule {}: {e}.", k + 1))?;
+                    if !rule.unknown.is_empty() {
+                        let keys: Vec<&str> = rule.unknown.keys().map(String::as_str).collect();
+                        return Err(format!(
+                            "Rule {}: no such key {} (a rule has kind, devices, role, pattern, max, severity, message and name).",
+                            k + 1,
+                            keys.join(", ")
+                        ));
+                    }
+                    // The dialog's checks: the check would report such a rule instead of running it.
+                    rules.push(crate::rules_form::RuleRow::of(&rule).rule(k + 1)?);
+                }
+                let n = rules.len();
+                open.set_check_rules(rules);
+                Ok(format!("The project has {n} check rule(s) now; run_check runs them."))
+            }
+            "off" | "on" => {
+                let which = need_s(v, "rule")?.trim();
+                // The one rule `which` names, as `turned_off` reads it: by number, or by name.
+                // A selector that could stand for two rules (a rule named "2" and rule 2,
+                // or two rules of one name) is refused rather than guessed.
+                let mut found = None;
+                if let Some((src, sel)) = which.split_once(':')
+                    && let Some(set) = library.iter().find(|set| set.source == src.trim())
+                {
+                    let rules = match &set.rules {
+                        Ok(rules) => rules,
+                        // `on` can still drop the entry as written, below.
+                        Err(e) if action == "off" => {
+                            return Err(format!(
+                                "The check rules of library {} cannot be read, so {which:?} cannot be turned off: {e}",
+                                set.source
+                            ));
+                        }
+                        Err(_) => &Vec::new(),
+                    };
+                    let one = [which.to_owned()];
+                    let hits: Vec<(usize, &CheckRule)> = rules
+                        .iter()
+                        .enumerate()
+                        .map(|(k, r)| (k + 1, r))
+                        .filter(|&(n, r)| turned_off(&one, &set.source, n, r))
+                        .collect();
+                    if hits.len() > 1 {
+                        let list: Vec<String> = hits.iter().map(|(n, _)| format!("{}:{n}", set.source)).collect();
+                        return Err(format!(
+                            "{which:?} could be rule {} of library {}: {:?} is a number and a rule's name too, or two rules share it. An entry in rules_off turns off all of them; name the rule another way (list shows each rule's number and name).",
+                            list.join(" or "),
+                            set.source,
+                            sel.trim()
+                        ));
+                    }
+                    found = hits.first().map(|&(n, r)| (set.source.clone(), n, r.clone()));
+                }
+                let mut now = off.clone();
+                match (action, found) {
+                    ("off", None) => {
+                        return Err(format!(
+                            "No library check rule {which:?}: write source:number or source:name (list shows them)."
+                        ));
+                    }
+                    ("off", Some((src, n, r))) => {
+                        if turned_off(&now, &src, n, &r) {
+                            return Ok(format!("{which} is off already."));
+                        }
+                        now.push(which.to_owned());
+                    }
+                    (_, Some((src, n, r))) => {
+                        // Every entry that turns it off, by number or by name.
+                        now.retain(|o| !turned_off(std::slice::from_ref(o), &src, n, &r));
+                    }
+                    // An entry naming no rule (a source since removed) can still be dropped.
+                    (_, None) => now.retain(|o| o.trim() != which),
+                }
+                if now == *off {
+                    return Ok(format!("{which} is on already."));
+                }
+                open.set_rules_off(now);
+                Ok(format!("{which} is {action} now; run_check shows the effect."))
+            }
+            other => Err(format!("Unknown action {other:?}: use list, set, off or on.")),
         }
     }
 
@@ -3364,6 +3698,8 @@ mod tests {
             share: Default::default(),
             symbol_editor: None,
             find: None,
+            pending: None,
+            pending_for: None,
             strip_editor: None,
             show_layers: false,
             live: Default::default(),
@@ -3783,6 +4119,38 @@ mod tests {
             "Check: checking",
             "no counts of the first project"
         );
+    }
+
+    #[test]
+    fn a_queued_picker_is_told_even_with_an_earlier_message_showing() {
+        let (_tmp, mut a) = app(vec![]);
+        a.dialog = Some(Dialog::Message("Exported 3 pages".into()));
+        let r = call(&mut a, "run_action", json!({"action": Action::ExportAml.name()})).unwrap();
+        assert!(r.contains("queued a file dialog"), "{r}");
+        assert!(matches!(a.pending, Some(crate::Pending::Export(crate::Export::Aml))));
+    }
+
+    #[test]
+    fn a_picker_waits_for_its_own_project_and_a_second_one_is_not_taken() {
+        let (_tmp, mut a) = app(vec![]);
+        let r = call(&mut a, "run_action", json!({"action": Action::ExportPdf.name()})).unwrap();
+        assert!(r.contains("queued a file dialog"), "{r}");
+        // A second picker in the same reply does not replace the first, and says so.
+        let r = call(&mut a, "run_action", json!({"action": Action::ExportAml.name()})).unwrap();
+        assert!(r.contains("was not done"), "{r}");
+        assert!(matches!(a.pending, Some(crate::Pending::Export(crate::Export::Pdf(_)))));
+        // An action without a picker is not taken for one while a picker waits (the status
+        // line still holds the refusal, as the frame would show it, so it is cleared first).
+        a.ed.message.clear();
+        let r = call(&mut a, "run_action", json!({"action": "ZoomFit"})).unwrap();
+        assert!(r.starts_with("Ran"), "{r}");
+        assert!(a.pending.is_some());
+        // Another project opened before the picker could show: it is not shown for that one.
+        let (_other_tmp, other) = crate::state::tests::project();
+        a.open = Some(other);
+        a.ask_pending();
+        assert!(a.pending.is_none());
+        assert!(a.ed.message.contains("another project"), "{}", a.ed.message);
     }
 
     #[test]
@@ -6032,9 +6400,15 @@ mod tests {
                 align: Default::default(),
                 angle: 0.0,
             });
-        // Without a dictionary the PDF is exported at once, as drawn.
+        // Without a dictionary no language is asked for: only where to save, and the PDF is
+        // printed as drawn.
         a.run(Action::ExportPdf);
-        assert!(matches!(&a.dialog, Some(Dialog::Message(m)) if m.starts_with("Exported")));
+        assert!(a.dialog.is_none());
+        assert!(matches!(
+            &a.pending,
+            Some(crate::Pending::Export(crate::Export::Pdf(langs))) if langs.is_empty()
+        ));
+        a.pending = None;
         std::fs::write(
             dir.join(TRANSLATIONS_FILE),
             "source = \"en\"\n\n[[text]]\nen = \"Pumps\"\nnb = \"Pumper\"\n",
@@ -6100,6 +6474,143 @@ mod tests {
         let pdf = String::from_utf8_lossy(&std::fs::read(pdf_path).unwrap()).into_owned();
         assert!(pdf.contains(&hex("Reserve / Spare")), "the texts are in both languages");
         assert!(pdf.contains(&hex("Pumpene / Pumps")));
+    }
+
+    #[test]
+    fn the_rules_tool_refuses_a_selector_that_names_two_library_rules() {
+        let (tmp, mut a) = app(vec![]);
+        let odd = tmp.path().join("odd");
+        std::fs::create_dir_all(&odd).unwrap();
+        let rule = |name: &str| format!("[[rule]]\nname = \"{name}\"\nkind = \"cable\"\n\n");
+        let text = ["2", "tags", "dup", "dup"].map(rule).concat();
+        std::fs::write(odd.join("rules.toml"), text).unwrap();
+        a.open.as_mut().unwrap().project.meta.libraries = vec![wc_core::project::LibrarySource {
+            name: "odd".into(),
+            kind: "folder".into(),
+            location: odd.to_string_lossy().into(),
+            reference: None,
+        }];
+        let off = |a: &App| a.open.as_ref().unwrap().project.meta.rules_off.clone();
+        let is_off = |a: &mut App| -> Vec<bool> {
+            let list: Value = serde_json::from_str(&call(a, "rules", json!({"action": "list"})).unwrap()).unwrap();
+            let rules = list["library"][0]["rules"].as_array().unwrap().clone();
+            rules.iter().map(|r| r["off"] == true).collect()
+        };
+        let rules = |a: &mut App, action: &str, rule: &str| call(a, "rules", json!({"action": action, "rule": rule}));
+
+        // "2" is rule 2 by number and rule 1 by name: refused, nothing changes.
+        rules(&mut a, "off", "odd:tags").unwrap();
+        for action in ["on", "off"] {
+            let r = rules(&mut a, action, "odd:2");
+            assert!(r.as_ref().is_err_and(|e| e.contains("odd:1 or odd:2")), "{r:?}");
+        }
+        assert_eq!(off(&a), vec!["odd:tags".to_owned()]);
+        rules(&mut a, "on", "odd:tags").unwrap();
+        assert_eq!(is_off(&mut a), [false; 4], "list agrees with the tool");
+
+        // Two rules named dup: refused by name, each kept apart by number.
+        assert!(rules(&mut a, "off", "odd:dup").is_err());
+        rules(&mut a, "off", "odd:3").unwrap();
+        rules(&mut a, "off", "odd:4").unwrap();
+        rules(&mut a, "on", "odd:3").unwrap();
+        assert_eq!(is_off(&mut a), [false, false, false, true]);
+        assert!(rules(&mut a, "on", "odd:dup").is_err());
+
+        // An entry turning off two rules goes when either is turned on, so list shows both on.
+        a.open.as_mut().unwrap().project.meta.rules_off = vec!["odd:2".into()];
+        assert_eq!(is_off(&mut a), [true, true, false, false]);
+        rules(&mut a, "on", "odd:1").unwrap();
+        assert_eq!(is_off(&mut a), [false; 4]);
+
+        // A rules file that cannot be read: off says why; on still drops the entry as written.
+        std::fs::write(odd.join("rules.toml"), "[[rule]\n").unwrap();
+        let r = rules(&mut a, "off", "odd:1");
+        assert!(r.as_ref().is_err_and(|e| e.contains("cannot be read")), "{r:?}");
+        assert!(off(&a).is_empty());
+        a.open.as_mut().unwrap().project.meta.rules_off = vec!["odd:1".into()];
+        rules(&mut a, "on", "odd:1").unwrap();
+        assert!(off(&a).is_empty());
+    }
+
+    #[test]
+    fn the_rules_tool_lists_sets_and_turns_library_rules_off_and_on() {
+        let (tmp, mut a) = app(vec![]);
+        let house = tmp.path().join("house");
+        std::fs::create_dir_all(&house).unwrap();
+        std::fs::write(
+            house.join("rules.toml"),
+            "[[rule]]\nkind = \"cable\"\n\n[[rule]]\nname = \"tags\"\nkind = \"tag\"\npattern = \"-QQ#\"\n",
+        )
+        .unwrap();
+        a.open.as_mut().unwrap().project.meta.libraries = vec![wc_core::project::LibrarySource {
+            name: "house".into(),
+            kind: "folder".into(),
+            location: house.to_string_lossy().into(),
+            reference: None,
+        }];
+        a.open.as_mut().unwrap().project.pages[1]
+            .symbols
+            .push(wc_core::project::PlacedSymbol {
+                id: "s1".into(),
+                symbol: "wc.coil".into(),
+                at: Point::new(50.0, 50.0),
+                rotation: Default::default(),
+                mirror: false,
+                tag: DeviceTag::parse("-K1").ok(),
+            });
+        let meta = |a: &App| a.open.as_ref().unwrap().project.meta.clone();
+        let check = |a: &mut App| call(a, "run_check", json!({})).unwrap();
+
+        let list: Value = serde_json::from_str(&call(&mut a, "rules", json!({"action": "list"})).unwrap()).unwrap();
+        assert_eq!(list["library"][0]["rules"][1]["rule"], "house:2");
+        assert_eq!(list["library"][0]["rules"][1]["off"], false);
+        let tags = "check rule 2 \"tags\" of library house";
+        assert!(check(&mut a).contains(tags), "the library rule runs");
+
+        // Set: kept as the dialog keeps them, and run by the check.
+        call(
+            &mut a,
+            "rules",
+            json!({"action": "set", "rules": [{"kind": "tag", "pattern": "-ZZ#", "severity": "error", "message": "{tag} breaks the house rule"}]}),
+        )
+        .unwrap();
+        assert_eq!(meta(&a).rules[0].pattern.as_deref(), Some("-ZZ#"));
+        assert!(check(&mut a).contains("-K1 breaks the house rule"));
+        // The dialog's checks refuse a rule the check could not run, and a misspelt key.
+        for bad in [
+            json!([{"kind": "tag"}]),
+            json!([{"kind": "max-wires"}]),
+            json!([{"kind": "cable", "role": "bogus"}]),
+            json!([{"kind": "cable", "severty": "error"}]),
+            json!([{"kind": "nope"}]),
+        ] {
+            let r = call(&mut a, "rules", json!({"action": "set", "rules": bad}));
+            assert!(r.as_ref().is_err_and(|e| e.starts_with("Rule 1")), "{bad}: {r:?}");
+        }
+        assert_eq!(meta(&a).rules.len(), 1, "a refused list changes nothing");
+
+        // Off by name, on by number: both entries that turn it off go.
+        call(&mut a, "rules", json!({"action": "off", "rule": "house:tags"})).unwrap();
+        assert_eq!(meta(&a).rules_off, vec!["house:tags".to_owned()]);
+        assert!(!check(&mut a).contains(tags));
+        assert!(call(&mut a, "rules", json!({"action": "off", "rule": "house:9"})).is_err());
+        call(&mut a, "rules", json!({"action": "off", "rule": "house:1"})).unwrap();
+        let list: Value = serde_json::from_str(&call(&mut a, "rules", json!({"action": "list"})).unwrap()).unwrap();
+        assert_eq!(list["library"][0]["rules"][1]["off"], true);
+        call(&mut a, "rules", json!({"action": "on", "rule": "house:2"})).unwrap();
+        assert_eq!(meta(&a).rules_off, vec!["house:1".to_owned()]);
+
+        // Each change is one undo step; saved into project.toml.
+        let o = a.open.as_mut().unwrap();
+        o.save().unwrap();
+        let toml = std::fs::read_to_string(o.dir.join("project.toml")).unwrap();
+        assert!(toml.contains("rules_off") && toml.contains("-ZZ#"), "{toml}");
+        assert!(o.undo());
+        assert_eq!(o.project.meta.rules_off.len(), 2);
+        assert!(o.undo() && o.undo());
+        assert!(o.project.meta.rules_off.is_empty());
+        assert!(o.undo());
+        assert!(o.project.meta.rules.is_empty());
     }
 
     #[test]
@@ -6773,6 +7284,159 @@ mod tests {
                 assert!(!e.starts_with("Unknown tool"), "{name}: {e}");
             }
         }
+    }
+
+    #[test]
+    fn the_assistant_draws_resizes_and_edits_a_black_box() {
+        let (_tmp, mut a) = app(vec![]);
+        let out = call(
+            &mut a,
+            "black_box",
+            json!({"action": "add", "page": "2", "x": 40, "y": 40, "width": 20, "height": 10, "tag": "-A1",
+                   "pins": [{"name": "IN", "side": "left", "offset": 5}, {"name": "OUT", "side": "right", "offset": 5},
+                            {"name": "PE", "side": "bottom", "offset": 18}]}),
+        )
+        .unwrap();
+        let id = out
+            .trim_start_matches("Drew black box ")
+            .trim_end_matches('.')
+            .to_owned();
+        // A negative size would draw the box off its given corner: refused, the page unchanged.
+        let count = page2(&a).symbols.len();
+        let flipped = json!({"action": "add", "page": "2", "x": 40, "y": 40, "width": -10, "height": 10});
+        assert!(call(&mut a, "black_box", flipped).is_err());
+        let numbered = json!({"action": "add", "page": "2", "x": 40, "y": 40, "width": 10, "height": 10, "tag": 42});
+        assert!(call(&mut a, "black_box", numbered).is_err());
+        assert_eq!(page2(&a).symbols.len(), count);
+        // A fractional width takes a point at the very end of its edge.
+        let fraction = json!({"action": "add", "page": "2", "x": 40, "y": 70, "width": 20.3, "height": 10,
+                              "pins": [{"name": "E", "side": "bottom", "offset": 20.3}]});
+        call(&mut a, "black_box", fraction).unwrap();
+        assert_eq!(page2(&a).symbols.len(), count + 1);
+        let layout = |a: &App| {
+            let o = a.open.as_ref().unwrap();
+            let placed = page2(a).symbol(&id).unwrap();
+            wc_core::black_box_layout(&o.symbols[&placed.symbol]).unwrap()
+        };
+        assert_eq!(layout(&a).0, 20.0);
+        assert_eq!(page2(&a).symbol(&id).unwrap().tag.as_ref().unwrap().to_string(), "-A1");
+        for p in ["IN", "OUT", "PE"] {
+            call(
+                &mut a,
+                "add_wire",
+                json!({"page": "2", "from": {"item": id, "pin": p}, "to": {"x": 0, "y": 0}}),
+            )
+            .unwrap();
+        }
+
+        // Narrower: the points stay on their edges, PE pulled in to the new width.
+        call(
+            &mut a,
+            "black_box",
+            json!({"action": "edit", "page": "2", "id": id, "width": 10}),
+        )
+        .unwrap();
+        let (w, h, pins) = layout(&a);
+        assert_eq!((w, h), (10.0, 10.0));
+        assert_eq!(pins.iter().find(|p| p.name == "PE").unwrap().offset, 10.0);
+
+        // A new list: OUT renamed to Q (its wire follows), PE taken off, A added.
+        let out = call(
+            &mut a,
+            "black_box",
+            json!({"action": "edit", "page": "2", "id": id, "height": 20, "rename": {"OUT": "Q"},
+                   "pins": [{"name": "IN", "side": "left", "offset": 5}, {"name": "Q", "side": "right", "offset": 5},
+                            {"name": "A", "side": "top", "offset": 2}]}),
+        )
+        .unwrap();
+        assert!(out.contains("PE") && out.contains("gone"), "{out}");
+        let names: Vec<String> = layout(&a).2.into_iter().map(|p| p.name).collect();
+        assert_eq!(names, ["IN", "Q", "A"]);
+        let ends: Vec<String> = page2(&a)
+            .wires
+            .iter()
+            .map(|w| match &w.from {
+                Endpoint::Pin { pin, .. } => pin.clone(),
+                Endpoint::Point { .. } => String::new(),
+            })
+            .collect();
+        assert_eq!(ends, ["IN", "Q", ""]);
+
+        // A rename of a point the box does not have, a point off its edge and a symbol that is
+        // not a box are refused, and nothing changes.
+        assert!(
+            call(
+                &mut a,
+                "black_box",
+                json!({"action": "edit", "page": "2", "id": id, "rename": {"X": "Y"}})
+            )
+            .is_err()
+        );
+        let off =
+            json!({"action": "edit", "page": "2", "id": id, "pins": [{"name": "IN", "side": "top", "offset": 99}]});
+        assert!(call(&mut a, "black_box", off).is_err());
+        assert_eq!(layout(&a).2.len(), 3);
+        // A size without area is refused before the points are fitted to it (#581), and two
+        // points renamed to one name would join their wires: refused too.
+        for size in [json!({"width": -1}), json!({"height": -5}), json!({"width": 0})] {
+            let mut args = json!({"action": "edit", "page": "2", "id": id});
+            args.as_object_mut().unwrap().extend(size.as_object().unwrap().clone());
+            assert!(call(&mut a, "black_box", args).is_err());
+        }
+        // A size that is not a number is refused, not taken as left out.
+        let text = json!({"action": "edit", "page": "2", "id": id, "width": "30", "height": 30});
+        assert!(call(&mut a, "black_box", text).is_err());
+        assert_eq!((layout(&a).0, layout(&a).1), (10.0, 20.0));
+        // A name kept as it is must still be one of the new points.
+        let keep = json!({"action": "edit", "page": "2", "id": id, "rename": {"Q": "Q"}, "pins": []});
+        assert!(call(&mut a, "black_box", keep).is_err());
+        let merge = json!({"action": "edit", "page": "2", "id": id, "rename": {"IN": "Z", "Q": "Z"}});
+        assert!(call(&mut a, "black_box", merge).unwrap_err().contains("renamed to Z"));
+        assert_eq!(layout(&a).0, 10.0);
+        let names: Vec<String> = layout(&a).2.into_iter().map(|p| p.name).collect();
+        assert_eq!(names, ["IN", "Q", "A"]);
+        // A swap is still fine, and each wire follows its point. A wire being drawn from a
+        // point the edit leaves alone is kept.
+        let draft = |pin: &str| {
+            Some((
+                Endpoint::Pin {
+                    item: id.clone(),
+                    pin: pin.into(),
+                },
+                Vec::new(),
+            ))
+        };
+        a.ed.page = 1;
+        a.ed.wire = draft("A");
+        let swap = json!({"action": "edit", "page": "2", "id": id, "rename": {"IN": "Q", "Q": "IN"}});
+        call(&mut a, "black_box", swap.clone()).unwrap();
+        let names: Vec<String> = layout(&a).2.into_iter().map(|p| p.name).collect();
+        assert_eq!(names, ["Q", "IN", "A"]);
+        let ends: Vec<Endpoint> = page2(&a).wires.iter().map(|w| w.from.clone()).collect();
+        let on = |pin: &str| Endpoint::Pin {
+            item: id.clone(),
+            pin: pin.into(),
+        };
+        assert_eq!(ends[..2], [on("Q"), on("IN")]);
+        assert_eq!(a.ed.wire, draft("A"));
+        // One drawn from a point that is renamed is dropped, not saved on a stale point.
+        a.ed.wire = draft("Q");
+        let out = call(&mut a, "black_box", swap).unwrap();
+        assert!(out.contains("dropped"), "{out}");
+        assert_eq!(a.ed.wire, None);
+        let coil = a
+            .open
+            .as_mut()
+            .unwrap()
+            .place(1, "wc.coil", Point::new(100.0, 100.0))
+            .unwrap();
+        let err = call(
+            &mut a,
+            "black_box",
+            json!({"action": "edit", "page": "2", "id": coil, "width": 5}),
+        )
+        .unwrap_err();
+        assert!(err.contains("not a black box"), "{err}");
     }
 
     #[test]
@@ -8115,6 +8779,37 @@ mod tests {
             wc_core::store::load(&other).unwrap(),
             "nothing of the old project in it"
         );
+    }
+
+    #[test]
+    fn opening_another_project_closes_the_forms_of_the_old_one() {
+        let (tmp, mut a) = app(vec![]);
+        let other = tmp.path().join("other");
+        let mut p = wc_core::store::create(&other, "Other").unwrap();
+        p.pages.push(wc_core::Page::new("p0002", "2", "Control"));
+        wc_core::store::save(&other, &p).unwrap();
+        // Delete page of the old project: through the assistant, the new one must not get it.
+        a.dialog = Some(crate::Dialog::DeletePage(1));
+        let r = call(&mut a, "open_project", json!({"path": other.to_string_lossy()}));
+        assert!(r.is_ok(), "{r:?}");
+        assert!(a.dialog.is_none());
+        assert_eq!(a.open.as_ref().unwrap().project.pages.len(), 2);
+        // The typed Save as form names a copy of the old one: closed too, from File > Open.
+        let first = tmp.path().join("p");
+        a.dialog = Some(crate::Dialog::SaveAsPath(
+            crate::prefs::FolderField::typed("old copy"),
+            None,
+        ));
+        let mut prefs = std::mem::take(&mut a.prefs);
+        a.open_dir(&first, &mut prefs);
+        a.prefs = prefs;
+        assert!(a.dialog.is_none());
+        // A form that is not about the project stays.
+        a.dialog = Some(crate::Dialog::OpenPath(crate::prefs::FolderField::typed("x"), None));
+        let mut prefs = std::mem::take(&mut a.prefs);
+        a.open_dir(&other, &mut prefs);
+        a.prefs = prefs;
+        assert!(matches!(a.dialog, Some(crate::Dialog::OpenPath(..))));
     }
 
     #[test]
