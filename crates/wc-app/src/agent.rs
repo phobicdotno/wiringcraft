@@ -1066,6 +1066,22 @@ fn box_size_ok(width: f64, height: f64) -> Result<(), String> {
 /// The app as the assistant's toolbox.
 pub struct AppTools<'a>(pub &'a mut App);
 
+/// The tools that change neither the project, its folder nor which project is open: the only
+/// ones run while an import runs.
+const READ_TOOLS: &[&str] = &[
+    "get_state",
+    "get_page",
+    "find_symbols",
+    "find_parts",
+    "get_devices",
+    "select_items",
+    "show",
+    "get_template",
+    "run_check",
+    "get_report",
+    "todo",
+];
+
 /// Whether tool `name` with input `v` changes the page its `page` field names (the shown page
 /// without one). Tools that only read, select, show or comment do not.
 fn edits_page(name: &str, v: &Value) -> bool {
@@ -3385,6 +3401,13 @@ impl App {
     /// `gh` calls) run on a worker thread, so the window keeps drawing; [`App::agent_finish`]
     /// applies their result on the window thread. Every other tool runs here and now.
     pub(crate) fn agent_start(&mut self, name: &str, v: &Value) -> Started {
+        // While File > Import runs the project folder is the import's: only the tools that
+        // read (or show a page, or file a todo) run.
+        if self.importing.is_some() && !READ_TOOLS.contains(&name) {
+            return Started::Done(Err(format!(
+                "{name} was not run: an import is running in the app; wait until it is done."
+            )));
+        }
         match name {
             "run_command" => match self.command_start(v) {
                 Ok(p) => Started::Running(p),
@@ -3884,6 +3907,7 @@ mod tests {
             show_layers: false,
             live: Default::default(),
             fetch: None,
+            importing: None,
         };
         (tmp, app)
     }
@@ -3896,6 +3920,191 @@ mod tests {
         } else {
             format!("file:///{path}")
         }
+    }
+
+    /// Frames until the running import is taken in (at most a few seconds).
+    fn until_imported(a: &mut App) {
+        let ctx = egui::Context::default();
+        for _ in 0..1000 {
+            a.poll_import(&ctx);
+            if a.importing.is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(a.importing.is_none(), "the import did not end");
+    }
+
+    #[test]
+    fn an_import_runs_off_the_window_thread_with_edits_held_until_it_is_taken_in() {
+        let (tmp, mut a) = app(vec![]);
+        let aml = tmp.path().join("plant.aml");
+        std::fs::write(&aml, crate::imports::tests::AML).unwrap();
+        let pages = a.open.as_ref().unwrap().project.pages.len();
+        a.import_from(crate::imports::Kind::Aml, &aml, None, None);
+        assert!(a.importing.is_some());
+        assert!(a.dialog.is_none());
+
+        // Until the result is taken in, nothing edits, saves or replaces the project.
+        a.run(Action::AddPage);
+        assert!(a.ed.message.contains("import is running"), "{}", a.ed.message);
+        a.run(Action::SaveAs);
+        assert!(a.pending.is_none());
+        let refused = a.agent_start("add_page", &json!({}));
+        assert!(matches!(&refused, Started::Done(Err(e)) if e.contains("import is running")));
+        assert!(matches!(a.agent_start("get_state", &json!({})), Started::Done(Ok(_))));
+        let other = tmp.path().join("other");
+        wc_core::store::create(&other, "Other").unwrap();
+        let mut prefs = crate::prefs::Prefs::default();
+        let dir = a.open.as_ref().unwrap().dir.clone();
+        a.open_dir(&other, &mut prefs);
+        assert_eq!(a.open.as_ref().unwrap().dir, dir);
+        assert!(matches!(&a.dialog, Some(Dialog::Message(m)) if m.contains("import is running")));
+        a.dialog = None;
+        a.import_from(crate::imports::Kind::Aml, &aml, None, None);
+        assert!(matches!(&a.dialog, Some(Dialog::Message(m)) if m.contains("import is running")));
+        a.dialog = None;
+        assert_eq!(a.open.as_ref().unwrap().project.pages.len(), pages);
+
+        // Taken in as one undo step, with the message the import gave.
+        until_imported(&mut a);
+        let Some(Dialog::Message(msg)) = &a.dialog else {
+            unreachable!("no message: {:?}", a.dialog.is_some());
+        };
+        assert!(msg.starts_with("Imported plant.aml."), "{msg}");
+        let open = a.open.as_mut().unwrap();
+        assert!(open.project.pages.len() > pages, "{msg}");
+        assert!(!open.dirty);
+        assert!(open.undo());
+        assert_eq!(open.project.pages.len(), pages);
+        assert!(!open.can_undo());
+
+        // Edits work again.
+        a.run(Action::AddPage);
+        assert_eq!(a.open.as_ref().unwrap().project.pages.len(), pages + 1);
+    }
+
+    #[test]
+    fn a_failing_import_shows_why_once_it_ends() {
+        let (tmp, mut a) = app(vec![]);
+        let before = a.open.as_ref().unwrap().project.clone();
+        a.import_from(crate::imports::Kind::Aml, &tmp.path().join("missing.aml"), None, None);
+        until_imported(&mut a);
+        let Some(Dialog::Message(msg)) = &a.dialog else {
+            unreachable!("no message");
+        };
+        assert!(msg.starts_with("missing.aml was not imported"), "{msg}");
+        let open = a.open.as_ref().unwrap();
+        assert_eq!(open.project, before);
+        assert!(!open.can_undo());
+    }
+
+    #[test]
+    fn a_message_is_not_sent_while_an_import_runs_and_stays_in_the_box() {
+        let (tmp, mut a) = app(vec![]);
+        let aml = tmp.path().join("plant.aml");
+        std::fs::write(&aml, crate::imports::tests::AML).unwrap();
+        a.import_from(crate::imports::Kind::Aml, &aml, None, None);
+        assert!(a.importing.is_some());
+        a.assistant.input = "add a page".into();
+        let shot = crate::screenshot::Shot::from_rgba(1, 1, vec![0, 0, 0, 255]).unwrap();
+        a.assistant.waiting.push((shot, None));
+
+        a.assistant_send(&egui::Context::default());
+        assert_eq!(a.assistant.input, "add a page");
+        assert_eq!(a.assistant.waiting.len(), 1);
+        assert!(a.assistant.turn.is_none());
+        assert!(!a.assistant.busy());
+        assert!(a.assistant.sent.is_empty() && a.assistant.sent_text.is_empty());
+        // Said in the conversation that is showing, whichever backend it is.
+        let said = [&a.assistant.session.log, &a.assistant.login_log]
+            .into_iter()
+            .flatten()
+            .filter(|e| matches!(e, wc_agent::Entry::Error(e) if e.contains("import is running")))
+            .count();
+        assert_eq!(said, 1);
+        assert_eq!(a.assistant.session.log.len() + a.assistant.login_log.len(), 1);
+        until_imported(&mut a);
+    }
+
+    #[test]
+    fn an_import_that_ends_with_another_project_open_is_not_taken_into_it() {
+        let (tmp, mut a) = app(vec![]);
+        let aml = tmp.path().join("plant.aml");
+        std::fs::write(&aml, crate::imports::tests::AML).unwrap();
+        a.import_from(crate::imports::Kind::Aml, &aml, None, None);
+        // Opening another project is refused while it runs; this one got there all the same.
+        let other = tmp.path().join("other");
+        wc_core::store::create(&other, "Other").unwrap();
+        a.open = Some(crate::state::Open::load(&other).unwrap());
+        let before = a.open.as_ref().unwrap().project.clone();
+
+        until_imported(&mut a);
+        let Some(Dialog::Message(msg)) = &a.dialog else {
+            unreachable!("no message");
+        };
+        assert!(msg.contains("plant.aml") && msg.contains("is no longer open"), "{msg}");
+        let open = a.open.as_ref().unwrap();
+        assert_eq!(open.dir, other);
+        assert_eq!(open.project, before);
+        assert!(!open.dirty && !open.can_undo());
+    }
+
+    #[test]
+    fn closing_the_window_is_called_off_while_an_import_runs() {
+        let close = || {
+            let mut input = egui::RawInput::default();
+            input
+                .viewports
+                .entry(egui::ViewportId::ROOT)
+                .or_default()
+                .events
+                .push(egui::ViewportEvent::Close);
+            input
+        };
+        let cancelled = |a: &mut App| {
+            let out = egui::Context::default().run(close(), |ctx| a.hold_close_while_importing(ctx));
+            out.viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .is_some_and(|v| v.commands.contains(&egui::ViewportCommand::CancelClose))
+        };
+        let (tmp, mut a) = app(vec![]);
+        // Nothing runs: the window closes.
+        assert!(!cancelled(&mut a));
+        assert!(a.ed.message.is_empty(), "{}", a.ed.message);
+
+        let aml = tmp.path().join("plant.aml");
+        std::fs::write(&aml, crate::imports::tests::AML).unwrap();
+        a.import_from(crate::imports::Kind::Aml, &aml, None, None);
+        assert!(cancelled(&mut a));
+        assert!(a.ed.message.contains("not closed"), "{}", a.ed.message);
+        until_imported(&mut a);
+        assert!(!cancelled(&mut a));
+    }
+
+    #[test]
+    fn the_view_controls_in_the_import_window_work_while_an_import_runs() {
+        let (tmp, mut a) = app(vec![]);
+        let aml = tmp.path().join("plant.aml");
+        std::fs::write(&aml, crate::imports::tests::AML).unwrap();
+        a.import_from(crate::imports::Kind::Aml, &aml, None, None);
+        assert!(a.importing.is_some());
+        let zoom = a.ed.view.zoom;
+        a.run(Action::ZoomIn);
+        assert!(a.ed.view.zoom > zoom);
+        for c in crate::IMPORT_VIEW_CONTROLS {
+            assert!(crate::allowed_while_importing(*c), "{c:?}");
+        }
+        // The grid and the theme are left alone here: they save the settings file.
+        for c in [Action::ZoomOut, Action::ZoomFit, Action::Layers] {
+            a.ed.message.clear();
+            a.run(c);
+            assert!(!a.ed.message.contains("import is running"), "{c:?}: {}", a.ed.message);
+        }
+        // Layers shows its list, drawn in the import window with the controls.
+        assert!(a.show_layers);
+        let _ = egui::Context::default().run(egui::RawInput::default(), |ctx| a.import_window(ctx));
+        until_imported(&mut a);
     }
 
     /// Frames until the base project fetch is over (at most a few seconds).
