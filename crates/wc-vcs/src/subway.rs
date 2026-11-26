@@ -182,9 +182,10 @@ fn text_width(text: &str, size: f64) -> f64 {
     text.chars().count() as f64 * size
 }
 
-/// Width of a bold 12 px branch/tag badge.
+/// Width of a bold 12 px branch/tag badge: 5 px padding each side plus the same 1.0 em per
+/// character upper bound as [`text_width`], so even wide-glyph names stay inside the pill.
 fn badge_width(name: &str) -> f64 {
-    10.0 + name.chars().count() as f64 * 6.6
+    10.0 + text_width(name, 12.0)
 }
 
 /// Draw the map as a standalone SVG.
@@ -374,6 +375,21 @@ mod tests {
         let svg = subway_svg(&layout(vec![wide]));
         let text_x = 20.0 + 22.0 + 12.0;
         let need = text_x + 200.0 * 1.0 * 12.0;
+        assert!(svg_width(&svg) >= need, "width {} < needed {need}", svg_width(&svg));
+    }
+
+    #[test]
+    fn svg_fits_wide_glyph_badges() {
+        let mut wide = c("w", &[]);
+        wide.refs = vec!["W".repeat(200)];
+        let svg = subway_svg(&layout(vec![wide]));
+        let text_x = 20.0 + 22.0 + 12.0;
+        let badge = 10.0 + 200.0 * 1.0 * 12.0;
+        assert!(
+            svg.contains(&format!(r#"width="{badge}""#)),
+            "badge rect grows with the name"
+        );
+        let need = text_x + badge;
         assert!(svg_width(&svg) >= need, "width {} < needed {need}", svg_width(&svg));
     }
 
