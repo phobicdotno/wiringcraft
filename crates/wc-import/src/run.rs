@@ -1528,6 +1528,7 @@ pub fn add_built(
     // it in the project, so the import replaces it (a block now drawn, a newer catalog). Every
     // file is read first, so a failed write can put them all back as they were.
     let mut files: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
+    let mut kept: Vec<bool> = Vec::new();
     let items = built
         .symbols
         .iter()
@@ -1585,6 +1586,9 @@ pub fn add_built(
                 }
             }
         }
+        // Not replacing, a copy that passed the checks above holds the incoming content: it is
+        // not written again, so the file keeps its own bytes whatever its layout.
+        kept.push(replace == Replace::No && before.is_some());
         files.push((path, before));
     }
     if let Some(panel) = built
@@ -1661,11 +1665,25 @@ pub fn add_built(
     // A write that fails puts back the files written before it (and removes the ones it made),
     // so each copy still matches its pin. Only files this import changed are put back: one it
     // left as it was keeps whatever it holds now.
+    let (keep_symbols, keep_parts) = kept.split_at(built.symbols.len().min(kept.len()));
     let writes = built
         .symbols
         .iter()
-        .map(|s| store::write_vendored_symbol(dir, s))
-        .chain(built.parts.iter().map(|x| store::write_vendored_part(dir, x)));
+        .zip(keep_symbols)
+        .map(|(s, keep)| {
+            if *keep {
+                Ok(false)
+            } else {
+                store::write_vendored_symbol(dir, s)
+            }
+        })
+        .chain(built.parts.iter().zip(keep_parts).map(|(x, keep)| {
+            if *keep {
+                Ok(false)
+            } else {
+                store::write_vendored_part(dir, x)
+            }
+        }));
     let mut changed: Written = Vec::new();
     for (file, written) in files.into_iter().zip(writes) {
         match written {
@@ -2229,6 +2247,28 @@ mod tests {
         assert_eq!(files(&dir), before);
         assert!(q.lock.symbols.contains_key("imp.coil"));
         assert!(q.lock.parts.contains_key("imp.relay"));
+
+        // Also when the copies are laid out another way than this program writes them: the
+        // content is the same, so the bytes stay.
+        for (kind, id) in [(ItemKind::Symbol, "imp.coil"), (ItemKind::Part, "imp.relay")] {
+            let path = dir.join(store::VENDOR_DIR).join(kind.dir()).join(format!("{id}.json"));
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            assert!(!text.is_empty());
+            assert!(std::fs::write(&path, format!("\n  {text}\n\n")).is_ok());
+        }
+        let own_layout = files(&dir);
+        assert_ne!(own_layout, before);
+        let mut q = p.clone();
+        let mut same = symbols(&["A1", "A2"]);
+        same.parts = parts("Relay").parts;
+        let r = add_built(&dir, &mut q, same, "import:t", Replace::No);
+        assert!(r.is_ok_and(|(written, _)| written.is_empty()));
+        assert_eq!(files(&dir), own_layout);
+        assert!(q.lock.symbols.contains_key("imp.coil"));
+        assert!(q.lock.parts.contains_key("imp.relay"));
+        for (path, bytes) in &before {
+            assert!(std::fs::write(path, bytes).is_ok());
+        }
 
         // A copy that cannot be read is not written over either.
         let path = dir
