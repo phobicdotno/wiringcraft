@@ -1069,6 +1069,7 @@ mod tests {
       (rectangle private (start 0 0) (end 2 2))
       (circle private (center 0 0) (radius 1))
       (arc private (start 0 1) (mid 1 0) (end 0 -1))
+      (bezier private (pts (xy 0 0) (xy 1 2) (xy 3 2) (xy 4 0)))
       (polyline (pts (xy 0 0) (xy 3 0))))
     (symbol "P_1_1"
       (pin passive line (at 0 0 0) (length 0) (name "~") (number "1")))))"#;
@@ -1078,6 +1079,8 @@ mod tests {
         // Only the public line and the text that reads "private" are drawn.
         assert_eq!(g.len(), 2, "{g:?}");
         assert!(g.iter().any(|s| matches!(s, Shape::Line { .. })), "{g:?}");
+        // The private bezier would come in as a flattened polyline.
+        assert!(!g.iter().any(|s| matches!(s, Shape::Polyline { .. })), "{g:?}");
         assert!(
             g.iter()
                 .any(|s| matches!(s, Shape::Text { text, at, .. } if text == "private" && at.y < -7.0)),
