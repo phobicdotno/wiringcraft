@@ -13,8 +13,12 @@ output. A command that fails prints `error: ...` and exits with code 1. Texts ta
 Commands that add pages refuse a page number or page id the project already has, before anything
 is written, and name the page that holds it: import again with `--first-page` set to a free
 number. One exception: `pdf` checks each page's id (`pdf-<number>`) only as it gets to that page,
-so a scanned page before it may already have left its picture in `underlays/`; delete that file. A first page number above 1000000000 is
-refused.
+so a scanned page before it may already have left its picture in `underlays/` (as
+`underlays/pdf-<number>.png` or `.jpg`), writing over a file of that name. Before you delete
+that file, check that no other page uses it (search `pages/` for its name); if one does, get the
+old file back from the project's history instead (`git checkout -- underlays/<file>` when it was
+committed). A first
+page number above 1000000000 is refused.
 
 Imports that add devices, symbols or parts to the project (`aml`, `eplan`, `swe`, `swe-library`
 without `--lib`) check everything first, so a refused import leaves the project as it was. They
