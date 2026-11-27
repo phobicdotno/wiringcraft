@@ -1095,6 +1095,30 @@ fn project_check_warns_about_parts_missing_from_the_library_copy() {
 }
 
 #[test]
+fn project_check_notes_a_drawn_device_whose_main_part_is_blank() {
+    let (mut p, s, parts) = fixture();
+    // A blank main part is no part: the device gets the "has no part" note, not silence.
+    p.devices.insert(
+        DeviceTag::parse("-P1").unwrap(),
+        Device {
+            part: Some("  ".into()),
+            ..Default::default()
+        },
+    );
+    let found = check(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    assert!(
+        found
+            .iter()
+            .any(|f| f.severity == Severity::Note && f.message == "-P1 has no part"),
+        "{found:?}"
+    );
+}
+
+#[test]
 fn project_check_warns_about_a_missing_part_of_a_device_drawn_only_as_interruption_points() {
     let (mut p, mut s, parts) = fixture();
     let arrow = sym("arrow", SymbolRole::Interruption, &["1"]);

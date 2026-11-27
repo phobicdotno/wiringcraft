@@ -578,7 +578,11 @@ pub fn check_with_unreadable(
         }
     }
     for tag in crate::all_tags(i) {
-        if p.devices.get(&tag).and_then(|d| d.part.as_ref()).is_none() {
+        if p.devices
+            .get(&tag)
+            .and_then(|d| d.part.as_deref())
+            .is_none_or(|part| part.trim().is_empty())
+        {
             out.push(Finding {
                 severity: Severity::Note,
                 page_id: None,
