@@ -426,6 +426,30 @@ pub fn replace_renaming(
         // A device no page draws changes only its entry: still one change.
         changed += p.rename_device(temp, to).max(1);
     }
+    // A spare renamed along with its strip (`-X12.S2` -> `-X15.S5` with `-X12` -> `-X15`) keeps
+    // its place on the rail under its new number.
+    let split = |t: &DeviceTag| {
+        let mut strip = t.clone();
+        strip.product.pop().map(|n| (strip, n))
+    };
+    for (from, to) in &renames {
+        let (Some((old_strip, old_n)), Some((new_strip, new_n))) = (split(from), split(to)) else {
+            continue;
+        };
+        if renames.get(&old_strip) != Some(&new_strip) {
+            continue;
+        }
+        if let Some(l) = p.meta.strips.iter_mut().find(|l| l.strip == new_strip)
+            && l.spares.contains(&old_n)
+            && !l.spares.contains(&new_n)
+        {
+            for n in l.spares.iter_mut().chain(l.order.iter_mut()) {
+                if *n == old_n {
+                    *n = new_n.clone();
+                }
+            }
+        }
+    }
     *project = p;
     Ok((changed, renames))
 }
@@ -745,7 +769,7 @@ mod tests {
         };
         p.meta.strips.push(crate::project::StripLayout {
             strip: tag("-X12"),
-            order: Vec::new(),
+            order: vec!["S2".into()],
             spares: vec!["S2".into()],
         });
         p.devices.insert(tag("-X12"), Device::default());
@@ -774,6 +798,16 @@ mod tests {
         assert_eq!(renamed.get(&tag("-X12.S2")), Some(&tag("-X15.S5")));
         assert_eq!(part(&p, "-X15.S5"), Some("A".into()));
         assert!(!p.devices.contains_key(&tag("-X15.S2")));
+        let layout = &p.meta.strips[0];
+        assert_eq!(
+            (layout.spares.clone(), layout.order.clone()),
+            (vec!["S5".into()], vec!["S5".into()])
+        );
+        assert_eq!(
+            layout.arrange(&[]),
+            [("S5".to_owned(), true)],
+            "the part's spare is on the rail"
+        );
         assert_eq!(part(&p, "-X2.S12"), Some("B".into()));
         assert!(p.devices.keys().all(|t| !t.to_string().contains("WCFIND")));
 
