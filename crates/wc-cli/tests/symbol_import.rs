@@ -448,3 +448,22 @@ fn symbol_kicad_takes_an_old_library_s_descriptions_from_its_dcm_file() -> TestR
     );
     Ok(())
 }
+
+#[test]
+fn symbol_kicad_imports_an_old_library_whose_dcm_file_cannot_be_read() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let lib = "EESchema-LIBRARY Version 2.4\nDEF LAMP H 0 40 N N 1 F N\nF0 \"H\" 100 0 50 H V L CNN\nDRAW\nX X1 X1 0 200 130 D 50 50 1 1 P\nENDDRAW\nENDDEF\n";
+    std::fs::write(tmp.path().join("lamps.lib"), lib)?;
+    // Not UTF-8: a warning, and the symbols come without descriptions.
+    std::fs::write(
+        tmp.path().join("lamps.dcm"),
+        b"EESchema-DOCLIB\n$CMP LAMP\nD \xff\xfe\n$ENDCMP\n",
+    )?;
+    let (_, err) = run_ok(tmp.path(), &["import", "symbol-kicad", "lamps.lib", "--lib", "lib"])?;
+    assert!(
+        err.contains("warning: descriptions not read") && err.contains("lamps.dcm"),
+        "{err}"
+    );
+    assert_eq!(symbol(&tmp.path().join("lib"), "kicad.lamps.lamp")?.description, "");
+    Ok(())
+}

@@ -27,9 +27,10 @@ const MAX_SYMBOLS: usize = 20_000;
 pub const DOC_HEADER: &str = "EESchema-DOCLIB";
 
 /// The descriptions of an old library's `.dcm` file, by symbol (or alias) name: each record's
-/// `D` line. Keywords (`K`) and links (`F`) are not read; a record without a description is
-/// left out.
-pub fn descriptions(text: &str) -> Result<std::collections::BTreeMap<String, String>> {
+/// `D` line, taken when its `$ENDCMP` is read. Keywords (`K`) and links (`F`) are not read; a
+/// record without a description is left out. A record the file ends inside (cut short) is left
+/// out with a warning, the records before it kept.
+pub fn descriptions(text: &str) -> Result<(std::collections::BTreeMap<String, String>, Vec<String>)> {
     let starts = text
         .trim_start_matches('\u{feff}')
         .trim_start()
@@ -41,29 +42,37 @@ pub fn descriptions(text: &str) -> Result<std::collections::BTreeMap<String, Str
         )));
     }
     let mut out = std::collections::BTreeMap::new();
-    let mut name: Option<String> = None;
-    for line in text.lines().map(str::trim) {
+    let mut warnings = Vec::new();
+    // The open record: its name, the line it starts on, and its description so far.
+    let mut open: Option<(String, usize, Option<String>)> = None;
+    for (i, line) in text.lines().map(str::trim).enumerate() {
         if let Some(rest) = line.strip_prefix("$CMP") {
             // `$CMP` and the name are one word apart; `$CMPX` is no record.
-            name = rest
+            open = rest
                 .starts_with(char::is_whitespace)
                 .then(|| rest.trim().to_owned())
-                .filter(|n| !n.is_empty());
+                .filter(|n| !n.is_empty())
+                .map(|n| (n, i + 1, None));
         } else if line == "$ENDCMP" {
-            name = None;
-        } else if let (Some(n), Some(d)) = (&name, line.strip_prefix("D ")) {
-            let d = d.trim();
-            if !d.is_empty() {
-                if out.len() >= MAX_SYMBOLS && !out.contains_key(n) {
+            if let Some((name, _, Some(d))) = open.take() {
+                if out.len() >= MAX_SYMBOLS && !out.contains_key(&name) {
                     return Err(Error::Format(format!(
                         "more than {MAX_SYMBOLS} descriptions in one file"
                     )));
                 }
-                out.insert(n.clone(), d.to_owned());
+                out.insert(name, d);
             }
+        } else if let (Some((_, _, d)), Some(text)) = (open.as_mut(), line.strip_prefix("D ")) {
+            let text = text.trim();
+            *d = (!text.is_empty()).then(|| text.to_owned());
         }
     }
-    Ok(out)
+    if let Some((name, line, _)) = open {
+        warnings.push(format!(
+            "descriptions: the record for {name} from line {line} has no $ENDCMP (the file is cut short); its description was not read"
+        ));
+    }
+    Ok((out, warnings))
 }
 
 /// Whether `text` is an old KiCad symbol library.
@@ -713,8 +722,17 @@ ENDDEF
     #[test]
     fn a_dcm_file_gives_each_symbol_and_alias_its_description() -> Result<()> {
         let dcm = "\u{feff}EESchema-DOCLIB  Version 2.0\n#\n$CMP RELAY\nD Relay, two units\nK relay\nF ~\n$ENDCMP\n#\n$CMP RELAY_24V\nD 24 V relay \\ coil\n$ENDCMP\n$CMP EMPTY\nD   \n$ENDCMP\nD outside a record\n#End Doc Library\n";
-        let docs = descriptions(dcm)?;
+        let (docs, warnings) = descriptions(dcm)?;
         assert_eq!(docs.len(), 2, "{docs:?}");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // A file cut short inside a record: the records before it are kept, the open one is not.
+        let (cut, warnings) =
+            descriptions("EESchema-DOCLIB Version 2.0\n$CMP LAMP\nD Lamp\n$ENDCMP\n$CMP RELAY\nD Relay coil desc")?;
+        assert_eq!(cut.keys().collect::<Vec<_>>(), ["LAMP"]);
+        assert!(
+            warnings.len() == 1 && warnings[0].contains("RELAY from line 5"),
+            "{warnings:?}"
+        );
         assert!(descriptions("EESchema-DOCLIBX\n").is_err());
         let (sym, _) = to_kicad_sym_described(RELAY, &docs)?;
         let (symbols, _) = crate::kicad::symbols(&sym, "kicad.relays", 1.0)?;

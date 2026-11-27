@@ -155,7 +155,10 @@ pub fn symbols_described(
     let converted;
     let text = if crate::kicad_legacy::is_legacy(text) {
         let docs = match docs.map(crate::kicad_legacy::descriptions) {
-            Some(Ok(docs)) => docs,
+            Some(Ok((docs, more))) => {
+                warnings.extend(more);
+                docs
+            }
             Some(Err(e)) => {
                 warnings.push(format!("descriptions not read: {e}"));
                 Default::default()

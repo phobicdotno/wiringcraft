@@ -4923,7 +4923,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd, input: Option<Vec<u8>>) -> Res<()> {
             let text = read_text(&file)?;
             let prefix = prefix.unwrap_or_else(|| kicad_prefix(&file.to_string_lossy()));
             // An old library keeps its descriptions beside it, in a `.dcm` file of the same name.
-            let docs = kicad_docs(&file, &text)?;
+            let docs = kicad_docs(&file, &text);
             import_kicad(&text, docs.as_deref(), &lib, &prefix, scale, &category)?;
         }
         ImportCmd::SymbolQet {
@@ -6715,15 +6715,18 @@ fn import_wago_bytes(dir: &Path, bytes: &[u8]) -> Res<WagoImported> {
 
 /// The text of the `.dcm` file beside an old KiCad library `file` (the same name), which holds
 /// its symbols' descriptions; None for a new `.kicad_sym` library or when there is no such file.
-fn kicad_docs(file: &Path, text: &str) -> Res<Option<String>> {
+/// One that cannot be read is a warning: the symbols are imported without descriptions.
+fn kicad_docs(file: &Path, text: &str) -> Option<String> {
     if !wc_import::kicad_legacy::is_legacy(text) {
-        return Ok(None);
+        return None;
     }
     let dcm = file.with_extension("dcm");
     if !dcm.is_file() {
-        return Ok(None);
+        return None;
     }
-    read_text(&dcm).map(Some)
+    read_text(&dcm)
+        .map_err(|why| eprintln!("warning: descriptions not read: {why}"))
+        .ok()
 }
 
 /// Import every symbol (one per unit) of a KiCad library text into `lib`, printing each.
