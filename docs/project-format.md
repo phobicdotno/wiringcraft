@@ -19,12 +19,13 @@ my-project/
   macros/<id>.json                  the project's own macros
   translations.toml                 translation dictionary
   pictures/                         the logo and other pictures
-  .gitattributes, .gitignore        written by `wiringcraft new`
+  .gitattributes, .gitignore        written by `wiringcraft new` unless --no-git
 ```
 
 Only `project.toml` is needed. A missing `devices.json` or `library.lock` reads as empty, and a
 missing folder as one with nothing in it. A new project has `project.toml`, `devices.json`,
-`library.lock`, the cover page `pages/p0001.page.json` and the two git files. The other files
+`library.lock` and the cover page `pages/p0001.page.json`, plus the two git files when
+`wiringcraft new` sets up git (not with `--no-git`; a later plain `git init` does not add them). The other files
 and folders appear when something is first put in them.
 
 ## project.toml
@@ -226,7 +227,9 @@ such as `pictures/logo.png`. A different picture of the same name gets a new nam
 ## Files that are not part of the project
 
 - `.wiringcraft.lock`: locked while a `wiringcraft` command works on the project, so commands
-  take turns. It is never committed: the new project's `.gitignore` lists it, and in a repository
+  take turns. The lock is best effort: when it cannot be opened or taken, the command prints a
+  warning and runs without it, so do not run another command on the project until it is done.
+  It is never committed: the new project's `.gitignore` lists it, and in a repository
   whose `.gitignore` does not, it goes in git's local exclude list.
 - `translations.toml.lock.tmp`: locked while `translations.toml` is read and changed.
 - `*.tmp`: staging files of a write in progress.
@@ -252,9 +255,13 @@ Every project file is written so that a diff shows real changes only:
   panels and comments are kept in a fixed order.
 - **Only when changed.** A file that already holds the new content is not written, so its
   modification time stays and git sees nothing.
-- **Atomic.** Each file is written to `<name>.tmp`, synced to disk, then renamed over the old
-  file, and the folder is synced after the rename. A crash or power loss leaves the old file or
-  the new one, never half of one.
+- **Atomic.** Each project file is written to `<name>.tmp`, synced to disk, then renamed over
+  the old file. A crash leaves the old file or the new one, never half of one. On Unix the folder
+  is also synced after the rename, so the rename survives a power loss; a folder that cannot be
+  synced (the file system does not support it, or the folder cannot be read) is accepted without
+  it. On other systems the folder is not synced.
+  Pictures in `pictures/` are the exception: `logo set` writes a new picture straight to its own
+  new name, so a crash can leave a partial picture there (the old one is never touched).
 - **LF line endings.** The new project's `.gitattributes` makes the text files LF everywhere, so
   Windows and Linux produce identical files:
 
