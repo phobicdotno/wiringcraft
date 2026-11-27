@@ -5215,6 +5215,11 @@ mod status_colour_tests {
                 let c = severity_colour(&t, s);
                 assert!(contrast(c, t.surface) >= 3.0, "{s:?} text in dark={dark}");
             }
+            // The interface tokens, not the sheet colours they replaced.
+            assert_eq!(severity_colour(&t, Severity::Warning), t.warning);
+            assert_eq!(severity_colour(&t, Severity::Note), t.muted);
+            assert_eq!(library_state_look(&t, State::UpToDate).0, t.success);
+            assert_eq!(library_state_look(&t, State::NotLocked).0, t.accent);
         }
     }
 }
