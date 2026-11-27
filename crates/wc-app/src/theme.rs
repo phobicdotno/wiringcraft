@@ -171,6 +171,10 @@ pub fn install_fonts(ctx: &egui::Context) {
 /// Apply the WiringCraft style for `mode` to the whole app.
 pub fn apply(ctx: &egui::Context, mode: Mode) {
     let dark = mode == Mode::Dark;
+    // Pin egui to the chosen mode. Left on "follow the system", egui keeps a
+    // second, unstyled style for the other OS mode and swaps to it as soon as
+    // the OS changes between dark and light, throwing away all of the below.
+    ctx.set_theme(if dark { egui::Theme::Dark } else { egui::Theme::Light });
     let t = Theme::new(dark);
     let mut v = if dark {
         egui::Visuals::dark()

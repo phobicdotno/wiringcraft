@@ -355,3 +355,113 @@ fn sync_messages_do_not_show_a_password_in_the_location() -> Result<()> {
     assert!(!message.contains("secret"), "{message}");
     Ok(())
 }
+
+#[test]
+fn list_gives_the_sorted_json_ids_of_one_kind() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(io)?;
+    let parts = tmp.path().join("parts");
+    let symbols = tmp.path().join("symbols");
+    std::fs::create_dir(&parts).map_err(io)?;
+    std::fs::create_dir(&symbols).map_err(io)?;
+    for name in ["relay.json", "button.json", "notes.txt", "fuse.json.bak"] {
+        std::fs::write(parts.join(name), "{}").map_err(io)?;
+    }
+    std::fs::write(symbols.join("lamp.json"), "{}").map_err(io)?;
+    let s = Source {
+        name: "lib".into(),
+        root: tmp.path().to_path_buf(),
+    };
+    assert_eq!(s.list(ItemKind::Part), ["button", "relay"]);
+    assert_eq!(s.list(ItemKind::Symbol), ["lamp"]);
+    Ok(())
+}
+
+#[test]
+fn list_of_a_missing_folder_is_empty() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(io)?;
+    let s = Source {
+        name: "gone".into(),
+        root: tmp.path().join("no-such-folder"),
+    };
+    assert!(s.list(ItemKind::Part).is_empty());
+    // A source folder without the kind's folder lists nothing either.
+    let s = Source {
+        name: "bare".into(),
+        root: tmp.path().to_path_buf(),
+    };
+    assert!(s.list(ItemKind::Symbol).is_empty());
+    Ok(())
+}
+
+#[test]
+fn folder_location_is_taken_from_the_project_unless_absolute() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(io)?;
+    let proj = tmp.path().join("proj");
+    let rel = Source::resolve(&proj, &src("rel", "folder", "../shared", None))?;
+    assert_eq!(
+        rel,
+        Source {
+            name: "rel".into(),
+            root: proj.join("../shared"),
+        }
+    );
+    let abs_dir = tmp.path().join("abs");
+    let abs = Source::resolve(&proj, &src("abs", "folder", &abs_dir.to_string_lossy(), None))?;
+    assert_eq!(abs.root, abs_dir);
+    Ok(())
+}
+
+#[test]
+fn git_source_without_a_cache_folder_is_an_error() {
+    let s = src("lib", "git", "/nowhere", None);
+    let (name, message) = source_message(Source::resolve_in(Path::new("."), &s, None));
+    assert_eq!(name, "lib");
+    assert!(message.contains("WIRINGCRAFT_CACHE"), "{message}");
+    let (_, message) = source_message(sync_one_in(Path::new("."), &s, None));
+    assert!(message.contains("WIRINGCRAFT_CACHE"), "{message}");
+}
+
+#[test]
+fn percent_decode_leaves_what_it_cannot_decode() {
+    assert_eq!(percent_decode("a%2Ab%2a"), "a*b*");
+    // Not hex, cut short, or at the very end: kept as it is.
+    assert_eq!(percent_decode("%zz%4"), "%zz%4");
+    assert_eq!(percent_decode("x%"), "x%");
+    // A byte that is not UTF-8 by itself: the whole text is kept.
+    assert_eq!(percent_decode("a%FFb"), "a%FFb");
+    // Multi-byte UTF-8 is decoded.
+    assert_eq!(percent_decode("%C3%A9"), "\u{e9}");
+}
+
+#[test]
+fn percent_encode_and_normalize_differ_only_on_existing_escapes() {
+    assert_eq!(percent_encode("a-._~Z9", true), "a-._~Z9");
+    assert_eq!(percent_encode("a b*", true), "a%20b%2A");
+    assert_eq!(percent_encode("a b*", false), "a%20b%2a");
+    // An existing escape is encoded again by percent_encode, kept by percent_normalize.
+    assert_eq!(percent_encode("%2a", true), "%252a");
+    assert_eq!(percent_normalize("%2a*"), "%2a%2A");
+    // A % that does not start a valid escape is encoded.
+    assert_eq!(percent_normalize("%zz%4"), "%25zz%254");
+    assert_eq!(percent_normalize("\u{e9}"), "%C3%A9");
+}
+
+#[test]
+fn mask_before_at_takes_the_longest_secret_and_skips_empty_ones() {
+    let secrets = ["ab".to_owned(), "abc".to_owned(), String::new()];
+    assert_eq!(mask_before_at("abc@h ab@h", &secrets), "***@h ***@h");
+    // A secret not followed by @ is left alone, and an empty secret hides nothing.
+    assert_eq!(mask_before_at("abc h @x", &secrets), "abc h @x");
+    assert_eq!(mask_before_at("caf\u{e9} ab@", &secrets), "caf\u{e9} ***@");
+}
+
+#[test]
+fn credential_forms_of_a_user_name_alone() {
+    let forms = credential_forms("t*k");
+    assert_eq!(forms, ["t*k", "t%2Ak", "t%2ak", "t*k", "t%2Ak"]);
+    // With a password, the user name alone follows the user:password forms.
+    let forms = credential_forms("u:p*");
+    assert_eq!(forms.len(), 10);
+    assert_eq!(forms.first().map(String::as_str), Some("u:p*"));
+    assert!(forms.iter().skip(5).all(|f| f == "u"), "{forms:?}");
+}

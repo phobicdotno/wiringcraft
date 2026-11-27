@@ -62,6 +62,20 @@ pub fn number_wires(
     role: impl Fn(&str) -> Option<crate::symbol::SymbolRole>,
     position: impl Fn(&Page, &Endpoint) -> Option<Point>,
 ) -> Numbered {
+    number_wires_keeping(project, rule, overwrite, |_| false, role, position)
+}
+
+/// [`number_wires`], where the numbers on the pages `kept(page)` picks stay as they are even
+/// with `overwrite` (pages someone else has open): a connection with a number on such a page
+/// keeps that number, and no other connection is given it.
+pub fn number_wires_keeping(
+    project: &mut Project,
+    rule: Rule,
+    overwrite: bool,
+    kept: impl Fn(&Page) -> bool,
+    role: impl Fn(&str) -> Option<crate::symbol::SymbolRole>,
+    position: impl Fn(&Page, &Endpoint) -> Option<Point>,
+) -> Numbered {
     // Overview pages keep their place (page indices stay valid) but draw nothing here.
     let mut schematic = project.clone();
     for page in schematic.pages.iter_mut().filter(|p| p.overview) {
@@ -72,14 +86,26 @@ pub fn number_wires(
     // Where each net starts: the first page it is drawn on, then its leftmost, topmost point.
     let mut start: BTreeMap<usize, (usize, f64, f64)> = BTreeMap::new();
     let mut existing: BTreeMap<usize, String> = BTreeMap::new();
+    // Every number on a kept page stays there: a second one on the same connection, and one on
+    // a wire that touches no pin, too.
+    let mut reserved: BTreeSet<String> = BTreeSet::new();
     for (pi, page) in project.pages.iter().enumerate() {
         for w in &page.wires {
+            // Kept trimmed, so `" 5"` and a new `"5"` cannot both exist.
+            let number = w.number.as_deref().map(str::trim).filter(|s| !s.is_empty());
+            if let Some(num) = number
+                && kept(page)
+            {
+                reserved.insert(num.to_string());
+            }
             let Some(&n) = wire_net.get(&(page.id.clone(), w.id.clone())) else {
                 continue;
             };
-            // Kept trimmed, so `" 5"` and a new `"5"` cannot both exist.
-            if let Some(num) = w.number.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                existing.entry(n).or_insert_with(|| num.to_string());
+            if let Some(num) = number {
+                // With `overwrite` only the numbers on kept pages count as existing.
+                if !overwrite || kept(page) {
+                    existing.entry(n).or_insert_with(|| num.to_string());
+                }
             }
             let mut pts: Vec<Point> = w.via.clone();
             pts.extend([&w.from, &w.to].into_iter().filter_map(|e| position(page, e)));
@@ -96,11 +122,7 @@ pub fn number_wires(
     let mut order: Vec<(usize, (usize, f64, f64))> = start.into_iter().collect();
     order.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    let mut used: BTreeSet<String> = if overwrite {
-        BTreeSet::new()
-    } else {
-        existing.values().cloned().collect()
-    };
+    let mut used: BTreeSet<String> = existing.values().cloned().chain(reserved).collect();
     let mut counter = 0usize;
     let mut next_sequential = |used: &mut BTreeSet<String>| loop {
         counter += 1;
@@ -109,23 +131,37 @@ pub fn number_wires(
             return s;
         }
     };
+    // By potential, a net's own name comes before any running number: it is set aside first,
+    // so a net drawn further left without a name cannot take it as its running number.
+    let mut named: BTreeMap<usize, String> = BTreeMap::new();
+    if rule == Rule::Potential {
+        for (n, _) in &order {
+            if !overwrite && existing.contains_key(n) {
+                continue;
+            }
+            // Trimmed like kept numbers, so `" 1 "` cannot sit beside a kept `"1"`.
+            if let Some(name) = nets
+                .get(*n)
+                .and_then(|net| net.names.first())
+                .map(|name| name.trim())
+                .filter(|name| !name.is_empty())
+                && used.insert(name.to_string())
+            {
+                named.insert(*n, name.to_string());
+            }
+        }
+    }
     let mut chosen: BTreeMap<usize, String> = BTreeMap::new();
     for (n, (pi, x, _)) in &order {
-        if !overwrite && let Some(num) = existing.get(n) {
+        if let Some(num) = existing.get(n) {
             chosen.insert(*n, num.clone());
             continue;
         }
         let number = match rule {
             Rule::Sequential => next_sequential(&mut used),
-            // Trimmed like kept numbers, so `" 1 "` cannot sit beside a kept `"1"`.
-            Rule::Potential => match nets
-                .get(*n)
-                .and_then(|net| net.names.first())
-                .map(|name| name.trim())
-                .filter(|name| !name.is_empty())
-            {
-                Some(name) if used.insert(name.to_string()) => name.to_string(),
-                _ => next_sequential(&mut used),
+            Rule::Potential => match named.get(n) {
+                Some(name) => name.clone(),
+                None => next_sequential(&mut used),
             },
             Rule::PageColumn => {
                 let page = project.pages.get(*pi);
@@ -280,6 +316,26 @@ mod tests {
     }
 
     #[test]
+    fn overwrite_keeps_the_numbers_on_kept_pages_and_does_not_give_them_again() {
+        let mut p = project();
+        p.pages[0].wires[1].number = Some("1".into());
+        // The only page is kept: a/b keep 1 and nothing else gets it, as without overwrite.
+        number_wires_keeping(&mut p, Rule::Sequential, true, |_| true, |_| None, pos);
+        assert_eq!(numbers(&p), [Some("1"), Some("1"), Some("2"), None, Some("3")]);
+        // One kept connection with two numbers: neither is given to another connection.
+        let mut p = project();
+        p.pages[0].wires[0].number = Some("2".into());
+        p.pages[0].wires[1].number = Some("1".into());
+        number_wires_keeping(&mut p, Rule::Sequential, true, |_| true, |_| None, pos);
+        assert_eq!(numbers(&p), [Some("2"), Some("2"), Some("3"), None, Some("4")]);
+        // A numbered wire that touches no pin keeps its number from the others too.
+        let mut p = project();
+        p.pages[0].wires[3].number = Some("1".into());
+        number_wires_keeping(&mut p, Rule::Sequential, true, |_| true, |_| None, pos);
+        assert_eq!(numbers(&p), [Some("4"), Some("4"), Some("2"), Some("1"), Some("3")]);
+    }
+
+    #[test]
     fn kept_numbers_are_trimmed_so_they_are_not_given_twice() {
         let mut p = project();
         p.pages[0].wires[2].number = Some(" 1 ".into());
@@ -296,6 +352,18 @@ mod tests {
         number_wires(&mut p, Rule::Potential, false, |_| None, pos);
         // c keeps 1; e's potential reads as 1 too, so it falls back to the next free number.
         assert_eq!(numbers(&p), [Some("3"), Some("3"), Some("1"), None, Some("2")]);
+    }
+
+    #[test]
+    fn a_potential_name_is_not_taken_by_a_running_number_drawn_before_it() {
+        let mut p = project();
+        p.pages[0].wires[4].potential = Some("1".into());
+        number_wires(&mut p, Rule::Potential, false, |_| None, pos);
+        // c is drawn first and has no name, but 1 is e's potential, so c gets 2 and a/b 3.
+        assert_eq!(numbers(&p), [Some("3"), Some("3"), Some("2"), None, Some("1")]);
+        // Renumbering over the kept numbers gives the same.
+        number_wires(&mut p, Rule::Potential, true, |_| None, pos);
+        assert_eq!(numbers(&p), [Some("3"), Some("3"), Some("2"), None, Some("1")]);
     }
 
     #[test]

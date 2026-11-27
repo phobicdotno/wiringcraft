@@ -594,3 +594,150 @@ pub fn parse_lines(names: &[String]) -> Result<Vec<LineField>, String> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tag(s: &str) -> DeviceTag {
+        let Ok(t) = DeviceTag::parse(s) else {
+            unreachable!("{s} is a tag")
+        };
+        t
+    }
+
+    fn table(rows: &[&[&str]]) -> Table {
+        Table {
+            title: "Marking list".into(),
+            columns: vec!["Type".into(), "Group".into(), "Marker".into(), "Count".into()],
+            rows: rows
+                .iter()
+                .map(|r| r.iter().map(|c| (*c).to_owned()).collect())
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cable_tags_are_w_followed_by_a_digit_an_uppercase_letter_or_nothing() {
+        for t in ["-W1", "-WD3", "-W", "=A+C1-W2", "-X1.W1"] {
+            assert!(is_cable_tag(&tag(t)), "{t}");
+        }
+        for t in ["-K1", "-XW1", "-Wa1", "+W1-K1"] {
+            assert!(!is_cable_tag(&tag(t)), "{t}");
+        }
+    }
+
+    #[test]
+    fn location_of_writes_only_the_location_part() {
+        assert_eq!(location_of(&tag("-K1")), "");
+        assert_eq!(location_of(&tag("=A+C1-K1")), "+C1");
+        assert_eq!(location_of(&tag("=A-K1")), "", "a function is no location");
+    }
+
+    #[test]
+    fn is_tag_wants_the_tag_written_exactly() {
+        assert!(is_tag("-K1"));
+        assert!(is_tag("=A+C1-K1"));
+        assert!(!is_tag("=SUM(A1)"));
+        assert!(!is_tag(""));
+    }
+
+    #[test]
+    fn names_and_codes_parse_back_trimmed_and_in_any_case() {
+        for k in MarkerKind::ALL {
+            assert_eq!(MarkerKind::parse(k.name()), Some(k));
+            assert_eq!(MarkerKind::parse(&format!(" {} ", k.name().to_uppercase())), Some(k));
+            assert_eq!(MarkerKind::parse(k.name().trim_end_matches('s')), Some(k));
+        }
+        for f in LineField::ALL {
+            assert_eq!(LineField::parse(&format!(" {} ", f.name().to_uppercase())), Some(f));
+        }
+        assert_eq!(LineField::parse("tags"), None, "line fields have no plural");
+        for l in Language::ALL {
+            assert_eq!(Language::parse(&format!(" {} ", l.code().to_uppercase())), Some(l));
+        }
+        assert_eq!(MarkerKind::parse(""), None);
+        assert_eq!(Language::parse(""), None);
+    }
+
+    #[test]
+    fn every_language_has_its_own_label_for_each_kind() {
+        for l in Language::ALL {
+            let labels: BTreeSet<&str> = MarkerKind::ALL.iter().map(|k| k.label(l)).collect();
+            assert_eq!(labels.len(), MarkerKind::ALL.len(), "{l:?}");
+        }
+        assert_eq!(Language::default(), Language::En);
+        assert_eq!(MarkingOptions::default().level_separator, LEVEL_SEPARATOR);
+    }
+
+    #[test]
+    fn parse_errors_name_the_bad_value_and_empty_input_is_fine() {
+        let Err(e) = parse_kinds(&["wires".into(), "rails".into()]) else {
+            unreachable!("rails is no kind")
+        };
+        assert!(e.contains("\"rails\"") && e.contains("terminals"), "{e}");
+        let Err(e) = parse_lines(&["colour".into()]) else {
+            unreachable!("colour is no line")
+        };
+        assert!(e.contains("\"colour\"") && e.contains("location"), "{e}");
+        assert_eq!(parse_kinds(&[]), Ok(vec![]));
+        assert_eq!(parse_lines(&[]), Ok(vec![]));
+    }
+
+    #[test]
+    fn a_text_repeated_on_lines_of_one_row_is_warned_about_once() {
+        let mut t = table(&[
+            &["Leiter", "", "=1", "=1", "2"],
+            &["Leder", "", "-1", "2"],
+            &["Betriebsmittel", "", "=x", "@y", "=x", "1"],
+        ]);
+        t.columns = vec![
+            "Typ".into(),
+            "Gruppe".into(),
+            "Zeile 1".into(),
+            "Zeile 2".into(),
+            "Anzahl".into(),
+        ];
+        let w = formula_warnings(&t);
+        assert_eq!(w.len(), 4, "{w:?}");
+        // German and Norwegian wire rows are wire rows: a tag-shaped number is still warned about.
+        assert!(w[0].starts_with("wire number \"=1\""), "{}", w[0]);
+        assert!(w[1].starts_with("wire number \"-1\""), "{}", w[1]);
+        assert!(w[2].contains("\"=x\"") && w[3].contains("\"@y\""), "{w:?}");
+    }
+
+    #[test]
+    fn the_type_group_and_count_columns_are_not_checked() {
+        let t = table(&[&["=Device", "+C1", "ok", "=1"], &["Wire", "", "1"], &["Wire"], &[]]);
+        assert!(formula_warnings(&t).is_empty(), "{:?}", formula_warnings(&t));
+    }
+
+    #[test]
+    fn smartscript_csv_quotes_quotes_and_line_ends() {
+        let t = table(&[&["Device", "", "say \"hi\"", "1"], &["Device", "", "two\nlines", "1"]]);
+        assert_eq!(
+            to_smartscript_csv(&t),
+            "\u{feff}Type;Group;Marker;Count\r\nDevice;;\"say \"\"hi\"\"\";1\r\nDevice;;\"two\nlines\";1\r\n"
+        );
+    }
+
+    #[test]
+    fn a_block_starts_at_the_first_rail_place_of_any_of_its_levels() {
+        let rows = vec![
+            ("-X1".to_owned(), "1".to_owned(), Some(1), Some(5)),
+            ("-X1".to_owned(), "2".to_owned(), Some(2), Some(2)),
+            ("-X1".to_owned(), "3".to_owned(), Some(1), None),
+            ("-X1".to_owned(), "4".to_owned(), Some(2), Some(7)),
+            ("-X2".to_owned(), "1".to_owned(), Some(1), None),
+        ];
+        assert_eq!(
+            blocks(rows, "+"),
+            [
+                ("-X1".to_owned(), "1+2".to_owned(), Some(2)),
+                ("-X1".to_owned(), "3+4".to_owned(), Some(7)),
+                ("-X2".to_owned(), "1".to_owned(), None),
+            ]
+        );
+    }
+}
