@@ -70,3 +70,22 @@ fn vcs_commands_say_when_git_cannot_be_run() -> TestResult {
     assert!(!err.contains("vcs init"), "{err}");
     Ok(())
 }
+
+#[test]
+fn the_folder_name_in_the_vcs_init_hint_is_escaped() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    // A newline would split the message; ESC could steer the terminal.
+    let dir = tmp.path().join("a\nb\u{1b}[31mc");
+    std::fs::create_dir(&dir)?;
+    let Some(dir_arg) = dir.to_str() else {
+        unreachable!("temporary path is not UTF-8")
+    };
+    let out = run(tmp.path(), &["-C", dir_arg, "vcs", "log"])?;
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("is not under version control"), "{err}");
+    assert!(err.contains("a\\nb\\u{1b}[31mc"), "{err}");
+    assert!(!err.contains('\u{1b}'), "{err:?}");
+    assert_eq!(err.trim_end().lines().count(), 1, "{err:?}");
+    Ok(())
+}

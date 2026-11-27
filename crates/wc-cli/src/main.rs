@@ -5081,7 +5081,7 @@ fn vcs_cmd(dir: &Path, vc: VcsCmd) -> Res<()> {
     if !matches!(vc, VcsCmd::Init) && !git.in_work_tree().map_err(e)? {
         return Err(format!(
             "{} is not under version control; run `wiringcraft vcs init` first",
-            dir.display()
+            escape_field(&dir.display().to_string())
         ));
     }
     match vc {
