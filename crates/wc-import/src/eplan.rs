@@ -766,6 +766,21 @@ pub fn split_end(end: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// Every device name of the project: the functions' tags and the device of every connection end
+/// with a pin (`W5` of `W5:1`), whichever order the connections come in.
+pub(crate) fn device_names(p: &EplanProject) -> BTreeSet<&str> {
+    p.functions
+        .iter()
+        .map(|f| f.tag.as_str())
+        .chain(
+            p.connections
+                .iter()
+                .flat_map(|c| [split_end(&c.from), split_end(&c.to)])
+                .filter_map(|(d, pin)| pin.map(|_| d)),
+        )
+        .collect()
+}
+
 /// For a connection with a pin at one end and a bare name at the other (`K1:A1` to `L1`): the
 /// device, the pin and the potential's name. `None` when both or neither end has a pin, or when
 /// the bare name is a device of the project (a cable end, say), which is no potential.
@@ -822,6 +837,8 @@ pub fn build(p: &EplanProject, first_page_number: usize) -> (aml::Built, Vec<Str
             page_of.entry(i).or_insert(pg);
         }
     }
+    let devices = device_names(p);
+    let is_device = |n: &str| devices.contains(n);
     let mut pins: BTreeMap<usize, BTreeSet<String>> = BTreeMap::new();
     let mut links = Vec::new();
     let mut potentials = Vec::new();
@@ -831,7 +848,6 @@ pub fn build(p: &EplanProject, first_page_number: usize) -> (aml::Built, Vec<Str
         let (db, pb) = split_end(&c.to);
         let (Some(pa), Some(pb)) = (pa, pb) else {
             // A pin to a named potential (`K1:A1` to `L1`) puts the pin on that potential.
-            let is_device = |n: &str| p.functions.iter().any(|f| f.tag == n);
             let Some((dev, pin, name)) = potential_end(&is_device, (da, pa), (db, pb)) else {
                 skipped += 1;
                 continue;

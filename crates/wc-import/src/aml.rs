@@ -686,7 +686,11 @@ pub fn layout(imp: &AmlImport, sections: &[Section], prefix: &str, first_page_nu
         let Some(sym) = symbol_of.get(pot.a.0).copied().flatten() else {
             continue;
         };
-        let Some(pin) = built.symbols[sym].pins.iter().find(|p| p.name == pot.a.1) else {
+        let Some(pin) = built
+            .symbols
+            .get(sym)
+            .and_then(|s| s.pins.iter().find(|p| p.name == pot.a.1))
+        else {
             continue;
         };
         let (name, p) = (pin.name.clone(), *at + pin.at);

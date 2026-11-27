@@ -656,10 +656,17 @@ fn drawn_wires_get_the_section_and_colour_of_their_connection() {
     }
     assert!(page.wires[3].spec.is_empty(), "w4 is not on the connection");
     // K1:22 to potential L1 names w4; a bare name that is a device (cable W5) names nothing.
-    let to_potential = vec![conn("L1", "K1:22", "", ""), conn("K1:21", "W5", "", "")];
+    // It also takes the connection's colour and section; the wires already given one keep it.
+    let to_potential = vec![conn("L1", "K1:22", "2.5", "RD"), conn("K1:21", "W5", "", "")];
     let is_device = |n: &str| n == "W5";
-    drawing::spec_from_connections(&mut page, &owners, &to_potential, &is_device);
+    assert_eq!(
+        drawing::spec_from_connections(&mut page, &owners, &to_potential, &is_device),
+        1
+    );
     assert_eq!(page.wires[3].potential.as_deref(), Some("L1"));
+    assert_eq!(page.wires[3].spec.colour.as_deref(), Some("RD"));
+    assert_eq!(page.wires[3].spec.section.as_deref(), Some("2.5 mm²"));
+    assert_eq!(page.wires[0].spec.colour.as_deref(), Some("BU"));
     assert!(page.wires[..3].iter().all(|w| w.potential.is_none()));
     assert_eq!(conn("a:1", "b:1", "0", "").spec(), wc_core::WireSpec::default());
     assert_eq!(
@@ -868,4 +875,34 @@ fn a_pin_to_a_named_potential_becomes_a_potential_stub() {
             .any(|w| w.starts_with("2 connection(s) without a pin at either end")),
         "{warnings:?}"
     );
+}
+
+#[test]
+fn a_device_known_only_from_a_pinned_end_is_no_potential() {
+    let conn = |from: &str, to: &str| EplanConnection {
+        from: from.into(),
+        to: to.into(),
+        ..Default::default()
+    };
+    // W5 has no function record, only the pinned end `W5:1`; in either order `K1:A1` to `W5`
+    // is a cable end, skipped and counted, not a potential.
+    for order in [[("W5:1", "X2:1"), ("K1:A1", "W5")], [("K1:A1", "W5"), ("W5:1", "X2:1")]] {
+        let p = EplanProject {
+            connections: order.iter().map(|&(a, b)| conn(a, b)).collect(),
+            ..Default::default()
+        };
+        let (b, warnings) = build(&p, 1);
+        let named = b
+            .pages
+            .iter()
+            .flat_map(|pg| &pg.wires)
+            .filter(|w| w.potential.as_deref() == Some("W5"));
+        assert_eq!(named.count(), 0, "{order:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("1 connection(s) without a pin at either end")),
+            "{order:?}: {warnings:?}"
+        );
+    }
 }
