@@ -251,14 +251,14 @@ fn placing_a_macro_copies_and_pins_the_parts_its_devices_name() -> TestResult {
         lib.join(format!("parts/{lamp}.json")),
     )?;
     wiringcraft(&dir, &["lib", "add", "mine", "folder", lib.to_str().ok_or("path")?])?;
-    // The lamp as a device's part, and an accessory and a value-set part no library has.
+    // The lamp as a device's part (with spaces around it), and an accessory part no library has.
     std::fs::create_dir_all(dir.join("macros"))?;
     std::fs::write(
         dir.join("macros/lamp.json"),
         format!(
             r#"{{"name": "Lamp", "anchor": {{"x": 0.0, "y": 0.0}},
             "symbols": [{{"id": "s1", "symbol": "wc.coil", "at": {{"x": 10.0, "y": 10.0}}, "tag": "-P1"}}],
-            "devices": {{"-P1": {{"part": "{lamp}", "accessories": [{{"part": "nowhere.cap"}}]}}}}}}"#
+            "devices": {{"-P1": {{"part": " {lamp} ", "accessories": [{{"part": "nowhere.cap"}}]}}}}}}"#
         ),
     )?;
 

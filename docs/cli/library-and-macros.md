@@ -208,8 +208,9 @@ s2
 ```
 
 The symbols get the next free tags (here `-F2`), and the devices get the macro's data with the
-placeholders filled (`Feeder Pump`). Symbols the project does not have yet are copied and pinned.
-Parts named by the macro are not: run `lib lock` after placing to pin them.
+placeholders filled (`Feeder Pump`). Symbols the project does not have yet are copied and pinned,
+and so are the parts the macro's devices and accessories name. A part no library source has stays
+a plain name on the device; `check` reports it.
 
 ## template
 
