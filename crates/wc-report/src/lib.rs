@@ -965,7 +965,7 @@ fn pin_label(p: &Project, page_id: &str, item: &str, pin: &str) -> String {
 
 /// The net each pin belongs to, with its potential name (or a generated one).
 fn net_names(i: &Inputs) -> (Vec<connectivity::Net>, BTreeMap<PinRef, String>) {
-    let nets = connectivity::nets_linked(i.project, |id| i.symbols.get(id).map(|s| s.role));
+    let nets = connectivity::nets_linked(i.project, |id| i.symbols.get(id));
     let auto = auto_net_names(i, &nets);
     let mut by_pin = BTreeMap::new();
     for (net, auto) in nets.iter().zip(auto) {
@@ -987,7 +987,7 @@ fn auto_net_names(i: &Inputs, nets: &[connectivity::Net]) -> Vec<String> {
     }
     let mut schematic = i.project.clone();
     schematic.pages.retain(|pg| !pg.overview);
-    let base = connectivity::nets_linked(&schematic, |id| i.symbols.get(id).map(|s| s.role));
+    let base = connectivity::nets_linked(&schematic, |id| i.symbols.get(id));
     let mut by_pin: BTreeMap<&PinRef, usize> = BTreeMap::new();
     for (n, net) in base.iter().enumerate() {
         for pin in &net.pins {
@@ -1031,7 +1031,7 @@ pub fn wire_list(i: &Inputs<'_>) -> Table {
     );
     // The net of each wire itself, so a wire between two junction points, which has no pin end,
     // still shows its net's name.
-    let (nets, net_of) = connectivity::wire_nets_by_place(i.project, |id| i.symbols.get(id).map(|s| s.role));
+    let (nets, net_of) = connectivity::wire_nets_by_place(i.project, |id| i.symbols.get(id));
     let names: Vec<String> = nets
         .iter()
         .zip(auto_net_names(i, &nets))
@@ -1188,7 +1188,7 @@ pub fn net_list(i: &Inputs<'_>) -> Table {
     } else {
         i.project
     };
-    let nets = connectivity::nets_linked(project, |id| i.symbols.get(id).map(|s| s.role));
+    let nets = connectivity::nets_linked(project, |id| i.symbols.get(id));
     let auto = auto_net_names(i, &nets);
     let mut rows: Vec<(String, Vec<String>)> = nets
         .iter()

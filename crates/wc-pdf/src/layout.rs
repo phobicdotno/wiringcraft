@@ -22,11 +22,7 @@ pub fn column_of(size: PageSize, x: f64) -> usize {
 }
 
 /// A pin's position on the page.
-pub fn pin_position(placed: &PlacedSymbol, symbol: &Symbol, pin: &str) -> Option<Point> {
-    symbol
-        .pin(pin)
-        .map(|p| p.at.transform(placed.rotation, placed.mirror) + placed.at)
-}
+pub use wc_core::pin_position;
 
 /// One appearance of a tagged symbol.
 #[derive(Debug, Clone)]

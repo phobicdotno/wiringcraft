@@ -411,11 +411,13 @@ pub fn check_with_unreadable(
         let paths: Vec<(&str, Vec<Point>)> = page
             .wires
             .iter()
-            .filter_map(|w| {
-                let mut pts = vec![end_pos(i, page, &w.from)?];
+            .map(|w| {
+                // As connectivity does: an end on a pin of an unknown symbol leaves out only
+                // the segment to it, so the rest of the wire still counts.
+                let mut pts: Vec<Point> = end_pos(i, page, &w.from).into_iter().collect();
                 pts.extend(w.via.iter().copied());
-                pts.push(end_pos(i, page, &w.to)?);
-                Some((w.id.as_str(), pts))
+                pts.extend(end_pos(i, page, &w.to));
+                (w.id.as_str(), pts)
             })
             .collect();
         for w in &page.wires {
@@ -429,7 +431,11 @@ pub fn check_with_unreadable(
                 let touches = paths
                     .iter()
                     .filter(|(id, _)| *id != w.id)
-                    .any(|(_, pts)| pts.windows(2).any(|ab| on_segment(*q, ab[0], ab[1])));
+                    .any(|(_, pts)| match pts.as_slice() {
+                        // A free end of a wire whose other end is not placed here.
+                        [only] => on_segment(*q, *only, *only),
+                        _ => pts.windows(2).any(|ab| on_segment(*q, ab[0], ab[1])),
+                    });
                 if !touches {
                     out.push(at(
                         page,
@@ -486,7 +492,7 @@ pub fn check_with_unreadable(
 
     // Shorts: one net carrying two potential names (for example L1 and L2), also when only
     // wires and junctions join them.
-    let nets = wc_core::connectivity::shorted_nets(p, |id| i.symbols.get(id).map(|s| s.role));
+    let nets = wc_core::connectivity::shorted_nets(p, |id| i.symbols.get(id));
     for n in nets {
         let names: BTreeSet<&str> = n.names.iter().map(String::as_str).collect();
         if names.len() > 1 {
@@ -683,7 +689,7 @@ fn wire_nets_off_overview(i: &Inputs<'_>) -> WireNets {
     for page in wiring.pages.iter_mut().filter(|pg| pg.overview) {
         page.wires.clear();
     }
-    wc_core::connectivity::wire_nets_by_place(&wiring, |id| i.symbols.get(id).map(|s| s.role)).1
+    wc_core::connectivity::wire_nets_by_place(&wiring, |id| i.symbols.get(id)).1
 }
 
 /// Wire numbers that do not name one connection each: a connection (net) whose wires carry
@@ -990,8 +996,7 @@ fn end_pos(i: &Inputs<'_>, page: &Page, e: &Endpoint) -> Option<Point> {
         Endpoint::Point { at } => Some(*at),
         Endpoint::Pin { item, pin } => {
             let s = page.symbol(item)?;
-            let p = i.symbols.get(&s.symbol)?.pin(pin)?;
-            Some(p.at.transform(s.rotation, s.mirror) + s.at)
+            wc_core::pin_position(s, i.symbols.get(&s.symbol)?, pin)
         }
     }
 }
