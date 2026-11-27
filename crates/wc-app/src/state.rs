@@ -1211,6 +1211,13 @@ impl Open {
             // is, never replaced by a newer library version, to the library that has the part.
             (None, true) => {
                 let copy = store::read_vendored_part(&self.dir, id).map_err(|e| e.to_string())?;
+                // A copy holding another part is not pinned under this one's name.
+                if copy.id != id {
+                    return Err(format!(
+                        "part {id}: its copy in the project declares id {:?}; put the right copy back or update the part from the library",
+                        copy.id
+                    ));
+                }
                 let (found, source) = lib()?.part(id).map_err(|e| match e {
                     wc_library::Error::NotFound { .. } => {
                         format!("part {id} has a copy in the project but no pin, and no library has it to pin it to")

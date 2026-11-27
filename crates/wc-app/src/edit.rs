@@ -1697,6 +1697,30 @@ mod tests {
     }
 
     #[test]
+    fn an_unpinned_part_copy_is_pinned_only_when_it_holds_that_part() {
+        let (_tmp, mut o, page, _a, _b) = setup();
+        let path = macro_with_parts(&mut o, page, MAIN, "NO-SUCH");
+        // A copy left without a pin (an undone change took it back) that holds another part.
+        let lib = wc_library::Library::open(&o.dir, &o.project).unwrap();
+        let (other, _) = lib.part(ACCESSORY).unwrap();
+        wc_core::store::write_vendored_part(&o.dir, &other).unwrap();
+        std::fs::rename(copy_of(&o, ACCESSORY), copy_of(&o, MAIN)).unwrap();
+        let lock = o.project.lock.clone();
+        let err = o.insert_macro(page, &path, None).unwrap_err();
+        assert!(err.contains("declares id"), "{err}");
+        assert_eq!(o.project.lock, lock);
+        // The right part's copy without a pin is pinned as it is.
+        let (mut main, _) = lib.part(MAIN).unwrap();
+        main.description = "kept as it is".into();
+        wc_core::store::write_vendored_part(&o.dir, &main).unwrap();
+        o.insert_macro(page, &path, None).unwrap();
+        assert_eq!(
+            o.project.lock.parts.get(MAIN).map(|e| e.hash.clone()),
+            Some(main.hash())
+        );
+    }
+
+    #[test]
     fn a_pasted_cable_takes_the_part_the_destination_gives_its_tag() {
         let (_tmp, mut o, page, _a, _b) = setup();
         let w1 = wc_core::DeviceTag::parse("-W1").unwrap();
