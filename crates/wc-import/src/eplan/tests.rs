@@ -506,7 +506,16 @@ fn builds_overview_pages_per_eplan_page() {
     // Both wires cross pages, so each becomes two stubs; the pin-less one is reported.
     let wires: usize = b.pages.iter().map(|pg| pg.wires.len()).sum();
     assert_eq!(wires, 4);
-    assert!(warnings.iter().any(|w| w.contains("1 connection")));
+    // It is dropped, not kept anywhere: the warning says so and its ends become no device.
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w == "1 connection(s) to a name without a pin (potentials, cable ends) were not imported"),
+        "{warnings:?}"
+    );
+    for end in ["-L", "-PE"] {
+        assert!(!b.devices.contains_key(&DeviceTag::parse(end).unwrap()), "{end}");
+    }
     let specced: Vec<&wc_core::Wire> = b
         .pages
         .iter()
