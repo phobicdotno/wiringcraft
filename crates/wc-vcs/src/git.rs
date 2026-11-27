@@ -579,9 +579,15 @@ impl Git {
 
     /// Where git keeps an operation file such as `REVERT_HEAD`. In a linked worktree `.git` is a
     /// file pointing elsewhere, so git is asked.
-    fn git_path(&self, name: &str) -> Result<PathBuf> {
-        let out = self.run(&["rev-parse", "--git-path", name])?;
-        Ok(self.dir.join(out.trim()))
+    /// Where git keeps `name` (`MERGE_HEAD`, `REVERT_HEAD`, ...) for this checkout. Read as the
+    /// bytes git printed, so a linked worktree of a repository in a folder whose name is not
+    /// UTF-8, or ends in a space, still gets its real path. Only git's line end is taken off.
+    pub(crate) fn git_path(&self, name: &str) -> Result<PathBuf> {
+        let out = self.run_bytes(&["rev-parse", "--git-path", name])?;
+        let out = out.strip_suffix(b"\n").unwrap_or(&out);
+        #[cfg(windows)]
+        let out = out.strip_suffix(b"\r").unwrap_or(out);
+        Ok(self.dir.join(os_path(out)))
     }
 
     /// The author (`Name <email>`) and subject of a commit.
