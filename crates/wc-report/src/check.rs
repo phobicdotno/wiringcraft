@@ -905,12 +905,12 @@ fn on_segment(p: Point, a: Point, b: Point) -> bool {
 /// Cable cores on two connections: a core is one conductor, so all wires that name it must be
 /// one connection (net). Wires on overview pages repeat connections on purpose and do not count;
 /// wires that touch no pin are no connection, and a wire naming only its cable (no core) names
-/// no conductor.
+/// no conductor. Core names match ignoring case ("bn" is core BN), named as first drawn.
 fn cable_cores(i: &Inputs<'_>, wire_net: &WireNets, out: &mut Vec<Finding>) {
     let p = i.project;
     // Per core: the nets it is on, in drawing order, each with the first wire naming it there.
     type Uses<'p> = Vec<(usize, &'p Page, &'p str)>;
-    let mut by_core: BTreeMap<(&DeviceTag, &str), Uses> = BTreeMap::new();
+    let mut by_core: BTreeMap<(&DeviceTag, String), (&str, Uses)> = BTreeMap::new();
     for (pi, page) in p.pages.iter().enumerate().filter(|(_, pg)| !pg.overview) {
         for (wi, w) in page.wires.iter().enumerate() {
             let Some(c) = &w.cable else { continue };
@@ -921,13 +921,15 @@ fn cable_cores(i: &Inputs<'_>, wire_net: &WireNets, out: &mut Vec<Finding>) {
             let Some(&net) = wire_net.get(&(pi, wi)) else {
                 continue;
             };
-            let nets = by_core.entry((&c.cable, core)).or_default();
+            let (_, nets) = by_core
+                .entry((&c.cable, core.to_uppercase()))
+                .or_insert((core, Vec::new()));
             if !nets.iter().any(|(n, ..)| *n == net) {
                 nets.push((net, page, w.id.as_str()));
             }
         }
     }
-    for ((cable, core), nets) in by_core.iter().filter(|(_, n)| n.len() > 1) {
+    for ((cable, _), (core, nets)) in by_core.iter().filter(|(_, (_, n))| n.len() > 1) {
         // Named on the wire of the second connection: the first may well be the right one.
         let Some((_, page, wire)) = nets.get(1) else { continue };
         out.push(at(
