@@ -281,6 +281,13 @@ fn next_name(name: &str) -> String {
     }
 }
 
+/// The name of the one pin `after` has more than `before`, the rest of the pins the same: a
+/// step that placed a pin.
+fn added_pin(before: &Symbol, after: &Symbol) -> Option<String> {
+    let (last, rest) = after.pins.split_last()?;
+    (rest == before.pins.as_slice()).then(|| last.name.clone())
+}
+
 /// The angle (degrees, y down, as [`Shape::Arc`] uses) of `p` seen from `c`.
 /// The angle of `p` seen from `c`, in degrees from 0 to 360 as [`Shape::Arc`] counts them.
 pub(crate) fn angle(c: Point, p: Point) -> f64 {
@@ -385,6 +392,13 @@ impl SymbolEditor {
         self.end_drag();
         if let Some(s) = self.undo.pop() {
             let now = std::mem::replace(&mut self.symbol, s);
+            // A pin placed by the Pin tool and taken back here gives its name back to the
+            // next pin, unless the field was changed since.
+            if let Some(name) = added_pin(&self.symbol, &now)
+                && self.pin_name == next_name(&name)
+            {
+                self.pin_name = name;
+            }
             self.redo.push(now);
             self.after_history_step();
         }
@@ -395,6 +409,11 @@ impl SymbolEditor {
         self.end_drag();
         if let Some(s) = self.redo.pop() {
             let now = std::mem::replace(&mut self.symbol, s);
+            if let Some(name) = added_pin(&now, &self.symbol)
+                && self.pin_name == name
+            {
+                self.pin_name = next_name(&name);
+            }
             self.undo.push(now);
             self.after_history_step();
         }
@@ -532,7 +551,8 @@ impl SymbolEditor {
                     self.message = "Give the pin a name first.".into();
                     return;
                 }
-                if self.symbol.pin(&name).is_some() {
+                // Spaces around a name are dropped on save, so `A1 ` is already `A1`.
+                if self.symbol.pins.iter().any(|q| q.name.trim() == name) {
                     self.message = format!("There is already a pin {name}.");
                     return;
                 }
@@ -728,6 +748,12 @@ impl SymbolEditor {
         self.drag.is_some()
     }
 
+    /// Whether Enter and Escape are the editor's this frame: a shape is half drawn or a drag
+    /// is under way, and no text field has the keyboard.
+    pub fn wants_escape(&self, ctx: &egui::Context) -> bool {
+        (self.drawing_shape() || self.dragging()) && ctx.memory(|m| m.focused().is_none())
+    }
+
     /// Whether `p` is on `item`: within 1.3 mm of a pin, or inside a shape's box made 1 mm
     /// wider. [`Self::pick`] and dragging both use it.
     fn under(&self, item: Item, p: Point) -> bool {
@@ -759,11 +785,18 @@ impl SymbolEditor {
         self.selected = Some(Item::Shape(self.symbol.graphics.len() - 1));
     }
 
-    /// The pin at `p`, else the last drawn shape whose box (1 mm wider) holds `p`.
+    /// The pin at `p`, else an empty text there, else the last drawn shape whose box (1 mm
+    /// wider) holds `p`. An empty text draws nothing, so it comes before the shapes over it:
+    /// otherwise it could not be picked to type its words or delete it.
     fn pick(&self, p: Point) -> Option<Item> {
+        let g = &self.symbol.graphics;
         let pins = (0..self.symbol.pins.len()).map(Item::Pin);
-        let shapes = (0..self.symbol.graphics.len()).rev().map(Item::Shape);
-        pins.chain(shapes).find(|&item| self.under(item, p))
+        let empty_texts = (0..g.len())
+            .rev()
+            .filter(|&i| matches!(&g[i], Shape::Text { text, .. } if text.trim().is_empty()))
+            .map(Item::Shape);
+        let shapes = (0..g.len()).rev().map(Item::Shape);
+        pins.chain(empty_texts).chain(shapes).find(|&item| self.under(item, p))
     }
 
     pub fn delete_selected(&mut self) {
@@ -796,6 +829,13 @@ impl SymbolEditor {
         }
         if s.graphics.is_empty() {
             out.push("Draw the symbol: it has no lines or shapes yet.".into());
+        }
+        // A text cleared in its properties draws nothing and cannot be seen to select it.
+        if s.graphics
+            .iter()
+            .any(|g| matches!(g, Shape::Text { text, .. } if text.trim().is_empty()))
+        {
+            out.push("A text in the drawing is empty; type its words or delete it.".into());
         }
         let mut names = std::collections::BTreeSet::new();
         for p in &s.pins {
@@ -909,7 +949,7 @@ impl SymbolEditor {
                     }
                 }
                 // Enter ends a polyline, Escape drops the shape being drawn or cancels a drag.
-                if (self.drawing_shape() || self.dragging()) && ctx.memory(|m| m.focused().is_none()) {
+                if self.wants_escape(ctx) {
                     let (enter, escape) =
                         ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
                     if escape && self.dragging() {
@@ -1981,6 +2021,67 @@ mod tests {
     }
 
     #[test]
+    fn the_pin_tool_refuses_a_name_that_differs_only_by_spaces() {
+        let mut e = SymbolEditor::new(Vec::new());
+        draw_coil(&mut e);
+        e.symbol.pins[0].name = " A1 ".into();
+        e.set_tool(Tool::Pin);
+        e.pin_name = "A1".into();
+        e.click(Point::new(10.0, 0.0));
+        assert_eq!(e.message, "There is already a pin A1.");
+        assert_eq!(e.symbol.pins.len(), 2);
+    }
+
+    #[test]
+    fn a_text_cleared_in_its_properties_cannot_be_saved() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let mut e = SymbolEditor::new(vec![("mine".into(), tmp.path().join("lib"))]);
+        draw_coil(&mut e);
+        e.text = "K1".into();
+        e.set_tool(Tool::Text);
+        e.click(Point::new(5.0, 5.0));
+        assert!(e.problems().is_empty(), "{:?}", e.problems());
+        // Its words cleared in the Text field, leaving only spaces.
+        let Some(Shape::Text { text, .. }) = e.symbol.graphics.last_mut() else {
+            return Err("the text should be drawn last".into());
+        };
+        *text = "  ".into();
+        assert_eq!(
+            e.problems(),
+            ["A text in the drawing is empty; type its words or delete it."]
+        );
+        assert!(e.save().is_err_and(|m| m.contains("text in the drawing is empty")));
+        // Deleting it clears the problem.
+        e.selected = Some(Item::Shape(e.symbol.graphics.len() - 1));
+        e.delete_selected();
+        assert!(e.problems().is_empty(), "{:?}", e.problems());
+        e.save()?;
+        Ok(())
+    }
+
+    #[test]
+    fn an_empty_text_under_a_later_shape_can_still_be_picked() {
+        let mut e = SymbolEditor::new(Vec::new());
+        e.text = "K1".into();
+        e.set_tool(Tool::Text);
+        e.click(Point::new(5.0, 5.0));
+        e.set_tool(Tool::Rect);
+        e.click(Point::new(0.0, 0.0));
+        e.click(Point::new(10.0, 10.0));
+        e.set_tool(Tool::Select);
+        // With words the text is picked as before: the later rectangle is on top.
+        e.click(Point::new(5.0, 5.0));
+        assert_eq!(e.selected, Some(Item::Shape(1)));
+        if let Shape::Text { text, .. } = &mut e.symbol.graphics[0] {
+            text.clear();
+        }
+        e.click(Point::new(5.0, 5.0));
+        assert_eq!(e.selected, Some(Item::Shape(0)));
+        e.delete_selected();
+        assert!(matches!(e.symbol.graphics[..], [Shape::Rect { .. }]));
+    }
+
+    #[test]
     fn a_dragged_pin_stays_on_the_grid_and_off_other_pins() {
         let mut e = SymbolEditor::new(Vec::new());
         draw_coil(&mut e);
@@ -2188,6 +2289,29 @@ mod tests {
         // The mouse moving on after that moves nothing.
         e.drag_to(Point::new(5.0, 0.0));
         assert_eq!(e.symbol, moved);
+    }
+
+    #[test]
+    fn undoing_a_placed_pin_gives_its_name_back_to_the_next_pin() {
+        let mut e = SymbolEditor::new(Vec::new());
+        e.set_tool(Tool::Pin);
+        e.pin_name = "1".into();
+        e.click(Point::new(0.0, -5.0));
+        assert_eq!(e.pin_name, "2");
+        e.undo();
+        assert!(e.symbol.pins.is_empty());
+        assert_eq!(e.pin_name, "1", "the next pin is called 1 again");
+        e.redo();
+        assert_eq!(e.symbol.pins.len(), 1);
+        assert_eq!(e.pin_name, "2", "redo counts on again");
+
+        // A name typed in the field after placing stays as typed.
+        e.undo();
+        e.pin_name = "A1".into();
+        e.redo();
+        assert_eq!(e.pin_name, "A1");
+        e.undo();
+        assert_eq!(e.pin_name, "A1");
     }
 
     #[test]
