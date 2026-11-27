@@ -294,7 +294,8 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
             }
             match (tag.as_str(), path.last().map(String::as_str)) {
                 ("description", Some("definition")) => in_description = true,
-                ("name", Some("names")) => name_lang = Some(attr(&e, "lang").unwrap_or_default()),
+                // An empty `<name/>` has no end tag to close it, so it opens nothing.
+                ("name", Some("names")) if !empty => name_lang = Some(attr(&e, "lang").unwrap_or_default()),
                 ("elementInformation", Some("elementInformations")) if path.len() == 2 && !empty => {
                     in_info = match attr(&e, "name").as_deref() {
                         Some("description") => Some("description"),
@@ -1170,6 +1171,23 @@ mod tests {
             radius: 5.0,
             filled: false
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn an_empty_name_does_not_take_the_texts_after_it() -> Result<()> {
+        let el = r#"<definition type="element" width="20" height="20" hotspot_x="10" hotspot_y="10">
+  <names><name lang="fr"/></names>
+  <informations>hand-written test element</informations>
+  <description>
+    <circle x="-5" y="-5" diameter="10"/>
+    <dynamic_text x="-25" y="-5" text_from="ElementInfo"><text></text><info_name>label</info_name></dynamic_text>
+    <terminal x="-10" y="0" orientation="w"/>
+  </description>
+</definition>"#;
+        let (imp, _) = element(el, "qet.lamp", 1.0)?;
+        assert_eq!(imp.qet_name, "lamp");
+        assert_eq!(imp.symbol.tag_at, Point::new(-15.0, -5.0));
         Ok(())
     }
 
