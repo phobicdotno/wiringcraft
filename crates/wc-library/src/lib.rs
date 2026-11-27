@@ -40,6 +40,22 @@ pub enum Error {
         failed: String,
         written: usize,
     },
+    /// An item to be taken has an id that differs only in case from one the project already
+    /// pins (`pinned`). On a folder that ignores case (macOS and Windows) both copies would be
+    /// one file, so the pinned item's copy would be written over.
+    #[error(
+        "{} ids {pinned:?} and {id:?} differ only in case, so their copies would be one file on macOS and Windows; rename one of them",
+        kind_name(*kind)
+    )]
+    CaseTwin { kind: ItemKind, pinned: String, id: String },
+}
+
+/// `kind` as messages name it.
+fn kind_name(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::Symbol => "symbol",
+        ItemKind::Part => "part",
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -445,8 +461,33 @@ fn fetch(lib: &Library, kind: ItemKind, id: &str, hash: Option<&str>) -> Result<
     })
 }
 
-/// Write a fetched item into the project folder and pin it.
+/// Refuse to pin `id` when the project does not pin it yet but pins another id of `kind` that
+/// differs from it only in case: both name one file in `vendor/` on a folder that ignores case.
+/// A project that already pins both keeps getting either updated, as before.
+fn check_case_twin(project: &Project, kind: ItemKind, id: &str) -> Result<()> {
+    let pinned = project.lock.map(kind);
+    if pinned.contains_key(id) {
+        return Ok(());
+    }
+    match pinned.keys().find(|other| other.eq_ignore_ascii_case(id)) {
+        Some(other) => Err(Error::CaseTwin {
+            kind,
+            pinned: other.clone(),
+            id: id.to_owned(),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Write a fetched item into the project folder and pin it. Every way an item is taken goes
+/// through here, so an id that differs only in case from a pinned one is refused here, before
+/// anything is written ([`check_case_twin`]).
 fn store_item(project_dir: &Path, project: &mut Project, id: &str, item: Fetched) -> Result<LockEntry> {
+    let kind = match &item {
+        Fetched::Symbol(..) => ItemKind::Symbol,
+        Fetched::Part(..) => ItemKind::Part,
+    };
+    check_case_twin(project, kind, id)?;
     let (kind, entry) = match item {
         Fetched::Symbol(s, entry) => {
             store::write_vendored_symbol(project_dir, &s)?;
