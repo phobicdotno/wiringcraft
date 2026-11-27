@@ -132,6 +132,40 @@ fn parts_list_groups_by_part_and_lists_gaps() {
 }
 
 #[test]
+fn parts_list_sorts_numbers_by_value() {
+    let (mut p, s, parts) = fixture();
+    p.pages[0].symbols.extend([
+        place("s10", "lamp", 200.0, Some("-P10")),
+        place("s11", "lamp", 210.0, Some("-P2")),
+        place("s12", "coil", 220.0, Some("-K10")),
+        place("s13", "coil", 230.0, Some("-K2")),
+    ]);
+    for tag in ["-K10", "-K2"] {
+        p.devices.insert(
+            DeviceTag::parse(tag).unwrap(),
+            Device {
+                part: Some("acme.r24".into()),
+                ..Default::default()
+            },
+        );
+    }
+    let t = parts_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    assert_eq!(t.rows[0][5], "-K2, -K10, =A+C1-K1");
+    let lamps: Vec<&str> = t
+        .rows
+        .iter()
+        .filter(|r| r[4] == "no part assigned")
+        .map(|r| r[5].as_str())
+        .filter(|d| d.starts_with("-P"))
+        .collect();
+    assert_eq!(lamps, ["-P1", "-P2", "-P10"]);
+}
+
+#[test]
 fn parts_list_counts_accessories_with_their_quantity() {
     let (mut p, s, mut parts) = fixture();
     let marker = wc_core::Part {
@@ -205,6 +239,27 @@ fn device_list_merges_symbols_of_one_device() {
     });
     let k1 = t.rows.iter().find(|r| r[0] == "=A+C1-K1").unwrap();
     assert_eq!(k1, &["=A+C1-K1", "Pump relay", "acme.r24", "coil, no", "2"]);
+}
+
+#[test]
+fn device_list_sorts_numbers_by_value() {
+    let (mut p, s, parts) = fixture();
+    p.pages[0].symbols.extend([
+        place("s10", "lamp", 200.0, Some("-P10")),
+        place("s11", "lamp", 210.0, Some("-P2")),
+    ]);
+    let t = device_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    let lamps: Vec<&str> = t
+        .rows
+        .iter()
+        .map(|r| r[0].as_str())
+        .filter(|d| d.starts_with("-P"))
+        .collect();
+    assert_eq!(lamps, ["-P1", "-P2", "-P10"]);
 }
 
 #[test]
@@ -352,6 +407,35 @@ fn natural_order() {
     let mut v = vec!["X10", "X2", "X1"];
     v.sort_by_key(|s| natural_key(s));
     assert_eq!(v, ["X1", "X2", "X10"]);
+}
+
+#[test]
+fn terminal_plan_sorts_strips_by_number_value() {
+    let (mut p, s, parts) = fixture();
+    p.pages[0].symbols.push(place("s10", "term", 140.0, Some("-X10.1")));
+    let t = terminal_plan(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    let mut strips: Vec<&str> = t.rows.iter().map(|r| r[0].as_str()).collect();
+    strips.dedup();
+    assert_eq!(strips, ["-X1", "-X2", "-X10"]);
+}
+
+#[test]
+fn cable_list_sorts_cables_by_number_value() {
+    let (mut p, s, parts) = fixture();
+    for tag in ["-W10", "-W2"] {
+        p.devices.insert(DeviceTag::parse(tag).unwrap(), Device::default());
+    }
+    let t = cable_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    let cables: Vec<&str> = t.rows.iter().map(|r| r[0].as_str()).collect();
+    assert_eq!(cables, ["-W2", "-W10"]);
 }
 
 #[test]

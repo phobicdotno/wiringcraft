@@ -5,7 +5,8 @@
 //! `arc`, `polygon`, `text`, `dynamic_text`/`input` (texts filled in on the schematic) and
 //! `terminal` (connection points with an orientation `n`, `e`, `s` or `w`). Coordinates are
 //! screen pixels (y down) around the element's hotspot; QElectroTech's grid is 10 px. Written
-//! from the published element format; no element files are copied into WiringCraft.
+//! from the published element format; no element files are copied into WiringCraft. The
+//! symbol's description comes from `<elementInformations>`, the entry named `description`.
 
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
@@ -245,6 +246,9 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
     // Open elements, to know where a `<name>` text or a dynamic text's `<info_name>` belongs.
     let mut path: Vec<String> = Vec::new();
     let mut name_lang: Option<String> = None;
+    // The element's `<elementInformation name="description">` text, and whether one is open.
+    let mut description = String::new();
+    let mut in_info_description = false;
     // A dynamic text waiting for its `<info_name>`: its position.
     let mut dynamic_at: Option<Point> = None;
     let mut unknown: std::collections::BTreeMap<String, usize> = Default::default();
@@ -271,6 +275,11 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
             match (tag.as_str(), path.last().map(String::as_str)) {
                 ("description", Some("definition")) => in_description = true,
                 ("name", Some("names")) => name_lang = Some(attr(&e, "lang").unwrap_or_default()),
+                ("elementInformation", Some("elementInformations"))
+                    if path.len() == 2 && attr(&e, "name").as_deref() == Some("description") =>
+                {
+                    in_info_description = !empty;
+                }
                 _ if in_description && path.last().map(String::as_str) == Some("description") => {
                     shape(
                         &tag,
@@ -302,11 +311,20 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
                     match tag.as_str() {
                         "description" => in_description = false,
                         "name" => name_lang = None,
+                        "elementInformation" => in_info_description = false,
                         "dynamic_text" => dynamic_at = None,
                         _ => {}
                     }
                 }
             }
+            // The description is kept whole (text around a comment, CDATA) and trimmed once at the end.
+            Event::Text(t) if in_info_description => match t.unescape() {
+                Ok(v) => description.push_str(&v),
+                Err(e) => warnings.push(format!(
+                    "the element's description has text that cannot be read ({e}); it is left out"
+                )),
+            },
+            Event::CData(t) if in_info_description => description.push_str(&String::from_utf8_lossy(&t)),
             Event::Text(t) => {
                 let v = t.unescape().map(|s| s.trim().to_owned()).unwrap_or_default();
                 if let Some(lang) = &name_lang {
@@ -411,7 +429,7 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
         graphics,
         pins: out_pins,
         tag_at,
-        description: String::new(),
+        description: description.trim().to_owned(),
     };
     Ok((Imported { symbol, qet_name }, warnings))
 }
@@ -649,6 +667,50 @@ mod tests {
     <mystery x="1"/>
   </description>
 </definition>"#;
+
+    #[test]
+    fn description_comes_from_the_element_information() -> Result<()> {
+        let el = |infos: &str| {
+            format!(
+                r#"<definition type="element"><names><name lang="en">K</name></names>
+<elementInformations>{infos}</elementInformations>
+<informations>author notes</informations>
+<description><line x1="0" y1="0" x2="10" y2="0"/></description></definition>"#
+            )
+        };
+        let with = el(
+            r#"<elementInformation show="1" name="manufacturer">ACME</elementInformation>
+<elementInformation show="1" name="description"> Relay coil &amp; contact </elementInformation>"#,
+        );
+        let (imp, _) = element(&with, "q.k", DEFAULT_SCALE)?;
+        assert_eq!(imp.symbol.description, "Relay coil & contact");
+        // Text around a comment keeps its spaces, and CDATA counts as text.
+        let split = el(
+            r#"<elementInformation name="description"> Relay <!-- x --> coil <![CDATA[& <contact>]]> </elementInformation>"#,
+        );
+        let (imp, warnings) = element(&split, "q.k", DEFAULT_SCALE)?;
+        assert_eq!(imp.symbol.description, "Relay  coil & <contact>");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // Text that cannot be decoded is left out with a warning that says why.
+        let bad = el(r#"<elementInformation name="description">Relay &bogus; coil</elementInformation>"#);
+        let (imp, warnings) = element(&bad, "q.k", DEFAULT_SCALE)?;
+        assert_eq!(imp.symbol.description, "");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("description") && w.contains("bogus")),
+            "{warnings:?}"
+        );
+        for infos in [
+            "",
+            r#"<elementInformation show="1" name="description"/>"#,
+            r#"<elementInformation show="1" name="designation">Coil</elementInformation>"#,
+        ] {
+            let (imp, _) = element(&el(infos), "q.k", DEFAULT_SCALE)?;
+            assert_eq!(imp.symbol.description, "", "{infos}");
+        }
+        Ok(())
+    }
 
     #[test]
     fn reads_shapes_terminals_name_and_label_place() -> Result<()> {

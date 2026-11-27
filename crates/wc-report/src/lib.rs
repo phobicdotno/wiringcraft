@@ -729,7 +729,7 @@ fn pages_of(p: &Project, uses: &[(String, String)]) -> String {
 
 /// Parts list (bill of materials): one row per part, with quantity and the devices using it.
 /// A device's accessories count with their quantity. Devices without any part come last so the
-/// gaps are visible.
+/// gaps are visible. Tags are sorted with numbers by value (`-K2` before `-K10`).
 pub fn parts_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new(
         "Parts list",
@@ -761,6 +761,10 @@ pub fn parts_list(i: &Inputs<'_>) -> Table {
             }
         }
     }
+    for (_, tags) in by_part.values_mut() {
+        tags.sort_by_cached_key(|t| natural_key(&t.to_string()));
+    }
+    without.sort_by_cached_key(|t| natural_key(&t.to_string()));
     let mut pos = 0;
     for (part_id, (qty, tags)) in &by_part {
         pos += 1;
@@ -788,11 +792,14 @@ pub fn parts_list(i: &Inputs<'_>) -> Table {
     t
 }
 
-/// Device list: every tag with its description, part and the pages it appears on.
+/// Device list: every tag with its description, part and the pages it appears on, with
+/// numbers sorted by value (`-K2` before `-K10`).
 pub fn device_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new("Device list", &["Device", "Description", "Part", "Symbols", "Pages"]);
     let index = i.project.tag_index();
-    for tag in all_tags(i) {
+    let mut tags: Vec<DeviceTag> = all_tags(i).into_iter().collect();
+    tags.sort_by_cached_key(|t| natural_key(&t.to_string()));
+    for tag in tags {
         let dev = i.project.devices.get(&tag);
         let uses = index.get(&tag).map(Vec::as_slice).unwrap_or(&[]);
         let symbols: BTreeSet<String> = uses
@@ -990,6 +997,9 @@ pub fn cable_list(i: &Inputs<'_>) -> Table {
             cores.entry(tag.clone()).or_default();
         }
     }
+    // Numbers by value (`-W2` before `-W10`), as the device list.
+    let mut cores: Vec<(DeviceTag, Vec<Core>)> = cores.into_iter().collect();
+    cores.sort_by_cached_key(|(tag, _)| natural_key(&tag.to_string()));
     for (cable, mut list) in cores {
         if list.is_empty() {
             list.push(Default::default());
@@ -1300,6 +1310,9 @@ pub(crate) fn terminal_plan_with_spares(i: &Inputs<'_>) -> (Table, BTreeSet<usiz
     for l in &i.project.meta.strips {
         strips.entry(l.strip.to_string()).or_default();
     }
+    // Strips by number value (`-X2` before `-X10`), as the device list.
+    let mut strips: Vec<(String, Vec<Term>)> = strips.into_iter().collect();
+    strips.sort_by_cached_key(|(strip, _)| natural_key(strip));
     for (strip, mut list) in strips {
         // Numbered ones by number; unnumbered ones keep drawing order and are numbered after.
         let page_order = |id: &str| i.project.pages.iter().position(|p| p.id == id).unwrap_or(usize::MAX);

@@ -2172,8 +2172,9 @@ fn has_symbols(ed: &Editor) -> bool {
 }
 
 /// The edits the right-click menu offers for the selection, run as the toolbar runs them:
-/// Rotate, Mirror, Copy, Cut and Delete with a symbol selected; Copy, Cut and Delete with only
-/// free text or drawings (Rotate and Mirror turn symbols only); none otherwise.
+/// Rotate, Mirror, Copy, Cut, Duplicate and Delete with a symbol selected; Copy, Cut, Duplicate
+/// and Delete with only free text or drawings (Rotate and Mirror turn symbols only); none
+/// otherwise.
 fn edit_menu_actions(ed: &Editor) -> &'static [crate::actions::Action] {
     use crate::actions::Action;
     if has_symbols(ed) {
@@ -2182,10 +2183,11 @@ fn edit_menu_actions(ed: &Editor) -> &'static [crate::actions::Action] {
             Action::Mirror,
             Action::Copy,
             Action::Cut,
+            Action::Duplicate,
             Action::Delete,
         ]
     } else if ed.selection.iter().any(|s| matches!(s, Selection::Graphic(_))) {
-        &[Action::Copy, Action::Cut, Action::Delete]
+        &[Action::Copy, Action::Cut, Action::Duplicate, Action::Delete]
     } else {
         &[]
     }
@@ -4792,11 +4794,11 @@ mod tests {
         assert_eq!(ed.selection, [sym("s2")], "one not selected becomes the only selection");
         assert!(selected_wires(&ed).is_empty());
         let labels = |ed: &Editor| -> Vec<&str> { edit_menu_actions(ed).iter().map(|a| a.info().label).collect() };
-        assert_eq!(labels(&ed), ["Rotate", "Mirror", "Copy", "Cut", "Delete"]);
+        assert_eq!(labels(&ed), ["Rotate", "Mirror", "Copy", "Cut", "Duplicate", "Delete"]);
     }
 
     #[test]
-    fn right_click_on_text_or_a_drawing_offers_copy_cut_and_delete() {
+    fn right_click_on_text_or_a_drawing_offers_copy_cut_duplicate_and_delete() {
         let labels = |ed: &Editor| -> Vec<&str> { edit_menu_actions(ed).iter().map(|a| a.info().label).collect() };
         // Not selected: it becomes the only selection, and the menu has the edits that work on it.
         let mut ed = Editor {
@@ -4806,7 +4808,7 @@ mod tests {
         assert!(labels(&ed).is_empty(), "wires alone keep only the route menu");
         right_clicked(&mut ed, Some(Selection::Graphic(2)));
         assert_eq!(ed.selection, [Selection::Graphic(2)]);
-        assert_eq!(labels(&ed), ["Copy", "Cut", "Delete"]);
+        assert_eq!(labels(&ed), ["Copy", "Cut", "Duplicate", "Delete"]);
         // Selected: the selection it is part of stays.
         let mut ed = Editor {
             selection: vec![
@@ -4825,10 +4827,69 @@ mod tests {
                 Selection::Wire("w1".into())
             ]
         );
-        assert_eq!(labels(&ed), ["Copy", "Cut", "Delete"]);
+        assert_eq!(labels(&ed), ["Copy", "Cut", "Duplicate", "Delete"]);
         // With a symbol among them, Rotate and Mirror come back.
         ed.selection.push(Selection::Symbol("s1".into()));
-        assert_eq!(labels(&ed), ["Rotate", "Mirror", "Copy", "Cut", "Delete"]);
+        assert_eq!(labels(&ed), ["Rotate", "Mirror", "Copy", "Cut", "Duplicate", "Delete"]);
+    }
+
+    /// Right-click a symbol through egui events, then click Duplicate in the menu: the command
+    /// is left for the app to run, as Ctrl+D runs it (#1122).
+    #[test]
+    fn duplicate_is_picked_from_the_right_click_menu_of_a_symbol() {
+        let (_tmp, mut o, mut ed, coil) = moving_coil();
+        ed.selection.clear();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        painted(&ctx, &mut o, &mut ed, 0.5, vec![]);
+        ed.view = View {
+            zoom: 3.0,
+            offset: Vec2::new(100.0, 100.0),
+            fit: false,
+            ..View::default()
+        };
+        // Where page mm (0, 0) is on the screen, from the cursor seen on a grid point.
+        let probe = egui::pos2(400.0, 400.0);
+        painted(&ctx, &mut o, &mut ed, 0.6, vec![egui::Event::PointerMoved(probe)]);
+        let seen = ed.cursor.unwrap();
+        let screen = |p: Point| probe + Vec2::new((p.x - seen.x) as f32, (p.y - seen.y) as f32) * 3.0;
+        let at = o.project.pages[ed.page].symbol(&coil).unwrap().at;
+        let on_coil = screen(at);
+        let button = |pos, button, pressed| egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        painted(&ctx, &mut o, &mut ed, 1.0, vec![egui::Event::PointerMoved(on_coil)]);
+        painted(
+            &ctx,
+            &mut o,
+            &mut ed,
+            1.01,
+            vec![button(on_coil, egui::PointerButton::Secondary, true)],
+        );
+        painted(
+            &ctx,
+            &mut o,
+            &mut ed,
+            1.02,
+            vec![button(on_coil, egui::PointerButton::Secondary, false)],
+        );
+        assert_eq!(
+            ed.selection,
+            [Selection::Symbol(coil.clone())],
+            "the right-click selects it"
+        );
+        let texts = painted(&ctx, &mut o, &mut ed, 1.1, vec![]);
+        let item = texts.iter().find(|(t, _)| t == "Duplicate");
+        assert!(item.is_some(), "no Duplicate in the menu: {texts:?}");
+        let item = item.unwrap().1.center();
+        let left = |pressed| button(item, egui::PointerButton::Primary, pressed);
+        painted(&ctx, &mut o, &mut ed, 1.2, vec![egui::Event::PointerMoved(item)]);
+        painted(&ctx, &mut o, &mut ed, 1.21, vec![left(true)]);
+        painted(&ctx, &mut o, &mut ed, 1.22, vec![left(false)]);
+        assert_eq!(ed.menu_action, Some(crate::actions::Action::Duplicate));
     }
 
     #[test]

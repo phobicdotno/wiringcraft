@@ -9371,6 +9371,19 @@ mod menu_action_tests {
     }
 
     #[test]
+    fn duplicate_picked_in_the_menu_copies_the_selected_symbol() {
+        let (_tmp, mut a, id) = app();
+        a.ed.menu_action = Some(Action::Duplicate);
+        a.run_menu_action();
+        let symbols = &a.open.as_ref().unwrap().project.pages[0].symbols;
+        assert_eq!(symbols.len(), 2, "{symbols:?}");
+        assert_eq!(a.ed.message, "Duplicated 1 item.");
+        assert!(!a.ed.selection.contains(&Selection::Symbol(id)), "the copy is selected");
+        assert!(a.open.as_mut().unwrap().undo());
+        assert_eq!(a.open.as_ref().unwrap().project.pages[0].symbols.len(), 1);
+    }
+
+    #[test]
     fn undo_and_redo_keep_the_panel_and_its_picked_device() {
         use wc_core::panel::{Panel, PanelItem};
         let device = |tag: &str, x: f64| PanelItem::Device {

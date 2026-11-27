@@ -382,56 +382,7 @@ fn convert(
                 }
                 Some("text") => {
                     if let (Some(t), Some(at)) = (g.arg(1), g.first("at")) {
-                        let effects = g.first("effects");
-                        let justify = effects.and_then(|e| e.first("justify"));
-                        let has =
-                            |word: &str| justify.is_some_and(|j| j.items().iter().any(|w| w.atom() == Some(word)));
-                        let align = if has("left") {
-                            Align::Left
-                        } else if has("right") {
-                            Align::Right
-                        } else {
-                            Align::Center
-                        };
-                        let height = effects
-                            .and_then(|e| e.first("font"))
-                            .and_then(|f| f.first("size"))
-                            .and_then(|s| s.num(1))
-                            .unwrap_or(1.27);
-                        let height = height * scale;
-                        // KiCad stores tenths of a degree in old files and degrees now.
-                        let angle = at.num(3).map(|a| if a > 360.0 { a / 10.0 } else { a }).unwrap_or(0.0);
-                        let first = pt(at.num(1).unwrap_or(0.0), at.num(2).unwrap_or(0.0));
-                        let (sin, cos) = angle.to_radians().sin_cos();
-                        // KiCad puts `at` at the middle of the text block unless `justify` says
-                        // `top` or `bottom`; WiringCraft's `at` is the baseline of the first line.
-                        // So move the first baseline down: by the text height from the top edge,
-                        // and up by the other lines from the bottom edge.
-                        let pitch = 1.5 * height;
-                        let below = pitch * t.lines().count().saturating_sub(1) as f64;
-                        let drop = if has("top") {
-                            height
-                        } else if has("bottom") {
-                            -below
-                        } else {
-                            (height - below) / 2.0
-                        };
-                        // A text with line breaks becomes one text per line, each one line pitch
-                        // further down, square to the reading direction (y runs down here).
-                        for (k, line) in t.lines().enumerate() {
-                            let line: String = line.chars().filter(|c| !c.is_control()).collect();
-                            if line.trim().is_empty() {
-                                continue;
-                            }
-                            let step = drop + pitch * k as f64;
-                            graphics.push(Shape::Text {
-                                at: Point::new(first.x + step * sin, first.y + step * cos),
-                                text: line,
-                                height,
-                                align,
-                                angle,
-                            });
-                        }
+                        graphics.extend(text_shapes(t, at, g.first("effects"), &pt, scale));
                     }
                 }
                 Some("pin") => {
@@ -539,6 +490,8 @@ fn convert(
     if graphics.is_empty() && pins.is_empty() {
         return Err(Error::Format("the symbol draws nothing".into()));
     }
+    // A derived symbol shows its own fields (its Value is its own name).
+    graphics.extend(visible_fields(sym, &pt, scale));
     // Pins without a designation are numbered; repeated designations get a mark.
     let mut used = std::collections::BTreeSet::new();
     for (i, p) in pins.iter_mut().enumerate() {
@@ -577,6 +530,90 @@ fn convert(
             .unwrap_or("")
             .to_owned(),
     })
+}
+
+/// A KiCad text at `at` with its `effects` (size, justification), as one text per line.
+fn text_shapes(t: &str, at: &Sexp, effects: Option<&Sexp>, pt: &impl Fn(f64, f64) -> Point, scale: f64) -> Vec<Shape> {
+    let justify = effects.and_then(|e| e.first("justify"));
+    let has = |word: &str| justify.is_some_and(|j| j.items().iter().any(|w| w.atom() == Some(word)));
+    let align = if has("left") {
+        Align::Left
+    } else if has("right") {
+        Align::Right
+    } else {
+        Align::Center
+    };
+    let height = effects
+        .and_then(|e| e.first("font"))
+        .and_then(|f| f.first("size"))
+        .and_then(|s| s.num(1))
+        .unwrap_or(1.27);
+    let height = height * scale;
+    // KiCad stores tenths of a degree in old files and degrees now.
+    let angle = at.num(3).map(|a| if a > 360.0 { a / 10.0 } else { a }).unwrap_or(0.0);
+    let first = pt(at.num(1).unwrap_or(0.0), at.num(2).unwrap_or(0.0));
+    let (sin, cos) = angle.to_radians().sin_cos();
+    // KiCad puts `at` at the middle of the text block unless `justify` says
+    // `top` or `bottom`; WiringCraft's `at` is the baseline of the first line.
+    // So move the first baseline down: by the text height from the top edge,
+    // and up by the other lines from the bottom edge.
+    let pitch = 1.5 * height;
+    let below = pitch * t.lines().count().saturating_sub(1) as f64;
+    let drop = if has("top") {
+        height
+    } else if has("bottom") {
+        -below
+    } else {
+        (height - below) / 2.0
+    };
+    // A text with line breaks becomes one text per line, each one line pitch
+    // further down, square to the reading direction (y runs down here).
+    let mut out = Vec::new();
+    for (k, line) in t.lines().enumerate() {
+        let line: String = line.chars().filter(|c| !c.is_control()).collect();
+        if line.trim().is_empty() {
+            continue;
+        }
+        let step = drop + pitch * k as f64;
+        out.push(Shape::Text {
+            at: Point::new(first.x + step * sin, first.y + step * cos),
+            text: line,
+            height,
+            align,
+            angle,
+        });
+    }
+    out
+}
+
+/// The fields KiCad shows on the symbol, other than `Reference` (the tag) and `Description`:
+/// usually Value. Hidden ones (KiCad 6/7 `(effects ... hide)`, KiCad 8+ `(hide yes)`) and
+/// KiCad's own `ki_` keys are left out.
+fn visible_fields(sym: &Sexp, pt: &impl Fn(f64, f64) -> Point, scale: f64) -> Vec<Shape> {
+    // A bare `hide` flag is read from item `from` on: a property's key and value come first,
+    // and a field whose key or text is "hide" is not hidden by it.
+    let hidden = |s: &Sexp, from: usize| {
+        s.items().iter().skip(from).any(|i| i.atom() == Some("hide"))
+            || s.first("hide").and_then(|h| h.arg(1)) == Some("yes")
+    };
+    let mut out = Vec::new();
+    for p in sym.all("property") {
+        let (Some(key), Some(value), Some(at)) = (p.arg(1), p.arg(2), p.first("at")) else {
+            continue;
+        };
+        let effects = p.first("effects");
+        if matches!(key, "Reference" | "Description")
+            || key.starts_with("ki_")
+            || value.trim().is_empty()
+            || value == "~"
+            || hidden(p, 3)
+            || effects.is_some_and(|e| hidden(e, 1))
+        {
+            continue;
+        }
+        out.extend(text_shapes(value, at, effects, pt, scale));
+    }
+    out
 }
 
 /// A rectangle from `min` to `max`. A rectangle has no fill of its own: a filled one becomes a
@@ -690,8 +727,8 @@ mod tests {
                 ("A2", Point::new(0.0, 7.62), PinDir::Down)
             ]
         );
-        // rectangle, polyline (as a line), arc, circle, text, two pin lines
-        assert_eq!(coil.graphics.len(), 7, "{:?}", coil.graphics);
+        // rectangle, polyline (as a line), arc, circle, text, two pin lines, the Value field
+        assert_eq!(coil.graphics.len(), 8, "{:?}", coil.graphics);
         assert!(coil.graphics.iter().any(|g| matches!(g, Shape::Rect { min, max }
             if (min.x + 2.54).abs() < 1e-9 && (min.y - 2.54).abs() < 1e-9 && (max.y - 5.08).abs() < 1e-9)));
         assert!(
@@ -1104,6 +1141,57 @@ mod tests {
         assert!(near(points[points.len() - 1], 4.0, 0.0), "{points:?}");
         // At t = 0.5 the curve is at (2, 3) in KiCad, (2, -3) on the page.
         assert!(points.iter().any(|p| near(*p, 2.0, -3.0)), "{points:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn visible_fields_such_as_value_come_in_as_texts() -> Result<()> {
+        let lib = r#"(kicad_symbol_lib (version 20231120) (generator "test")
+  (symbol "Lamp"
+    (property "Reference" "H" (at 2 2 0) (effects (font (size 1.27 1.27))))
+    (property "Value" "Lamp" (at 0 -3 90) (effects (font (size 2 2)) (justify left)))
+    (property "Footprint" "Lamp:Big" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
+    (property "Datasheet" "https://example.com" (at 0 0 0) (effects (font (size 1.27 1.27))) (hide yes))
+    (property "Description" "A lamp" (at 0 0 0) (effects (font (size 1.27 1.27))))
+    (property "ki_keywords" "light" (at 0 0 0) (effects (font (size 1.27 1.27))))
+    (property "Voltage" "24 V" (at 4 1 0) (effects (font (size 1 1))))
+    (property "Spare" "~" (at 0 0 0))
+    (property "Note" "hide" (at 6 0 0) (effects (font (size 1 1))))
+    (symbol "Lamp_1_1" (pin passive line (at 0 0 270) (length 0) (name "1") (number "1"))))
+)"#;
+        let (syms, warnings) = symbols(lib, "k", 1.0)?;
+        let [lamp] = syms.as_slice() else {
+            unreachable!("one symbol expected: {warnings:?}")
+        };
+        let texts: Vec<(&str, Point, f64, f64, Align)> = lamp
+            .symbol
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Text {
+                    text,
+                    at,
+                    height,
+                    align,
+                    angle,
+                } => Some((text.as_str(), *at, *height, *angle, *align)),
+                _ => None,
+            })
+            .collect();
+        let names: Vec<&str> = texts.iter().map(|t| t.0).collect();
+        // Reference, Description, KiCad's own keys, hidden fields and empty ones are not drawn.
+        // A field whose text is "hide" is still shown.
+        assert_eq!(names, vec!["Lamp", "24 V", "hide"], "{texts:?}");
+        // Placed like a text item: the Value reads bottom to top, its baseline half its
+        // height to the right of `at` (0, 3 on the page).
+        let (_, at, height, angle, align) = texts[0];
+        assert!((at.x - 1.0).abs() < 1e-9 && (at.y - 3.0).abs() < 1e-9, "{at:?}");
+        assert!((height - 2.0).abs() < 1e-9 && (angle - 90.0).abs() < 1e-9);
+        assert_eq!(align, Align::Left);
+        let (_, at, height, _, align) = texts[1];
+        assert!((at.x - 4.0).abs() < 1e-9 && (at.y + 0.5).abs() < 1e-9, "{at:?}");
+        assert!((height - 1.0).abs() < 1e-9);
+        assert_eq!(align, Align::Center);
         Ok(())
     }
 
