@@ -6268,6 +6268,44 @@ mod tests {
         assert_eq!(a.clipboard.graphics.len(), 1);
     }
 
+    /// Copy, Cut and Duplicate of only the revision table, which is not copied, say so and
+    /// change nothing: the table stays and the earlier copy is still there to paste (#1651).
+    #[test]
+    fn copying_only_the_revision_table_says_it_is_not_copied() {
+        use crate::state::Selection;
+        let (_tmp, mut a) = app(vec![]);
+        let o = a.open.as_mut().unwrap();
+        o.project.pages[0].graphics.push(wc_core::Shape::Line {
+            a: wc_core::geom::Point::new(50.0, 50.0),
+            b: wc_core::geom::Point::new(80.0, 50.0),
+        });
+        o.project.pages[0].revision_table = Some(wc_core::geom::Point::new(200.0, 150.0));
+        a.ed.selection = vec![Selection::Graphic(0)];
+        a.run(Action::Copy);
+        let steps = a.open.as_ref().unwrap().undo_steps();
+        a.ed.selection = vec![Selection::RevisionTable];
+        a.run(Action::Copy);
+        assert_eq!(
+            a.ed.message,
+            "Copy was not done: revision clouds and the revision table are not copied."
+        );
+        assert_eq!(a.clipboard.graphics.len(), 1, "the earlier copy stays");
+        a.run(Action::Cut);
+        assert_eq!(
+            a.ed.message,
+            "Cut was not done: revision clouds and the revision table are not copied."
+        );
+        a.run(Action::Duplicate);
+        assert_eq!(
+            a.ed.message,
+            "Nothing was duplicated: revision clouds and the revision table are not copied."
+        );
+        let o = a.open.as_ref().unwrap();
+        assert!(o.project.pages[0].revision_table.is_some(), "the table stays");
+        assert_eq!(o.undo_steps(), steps, "no undo step");
+        assert_eq!(a.ed.selection, vec![Selection::RevisionTable]);
+    }
+
     #[test]
     fn cut_leaves_a_wire_the_copy_left_out_on_the_page_and_selected() {
         use crate::state::Selection;

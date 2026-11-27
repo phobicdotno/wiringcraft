@@ -1962,7 +1962,9 @@ impl App {
             }
             Action::Copy | Action::Cut => {
                 let clip = open.copy(page, &self.ed.selection);
-                if !clip.is_empty() {
+                if clip.is_empty() && only_uncopied(&self.ed.selection) {
+                    self.ed.message = format!("{} was not done: {NOT_COPIED}", a.info().label);
+                } else if !clip.is_empty() {
                     let n = clip.count();
                     self.copied_text = Some(clip.summary());
                     let copied_wires: std::collections::BTreeSet<String> =
@@ -2028,6 +2030,9 @@ impl App {
                         self.ed.message = format!("Duplicated {n} {}.", if n == 1 { "item" } else { "items" });
                         self.ed.tool = Tool::Select;
                         self.ed.selection = copies;
+                    }
+                    Ok(_) if only_uncopied(&self.ed.selection) => {
+                        self.ed.message = format!("Nothing was duplicated: {NOT_COPIED}");
                     }
                     Ok(_) => {}
                     Err(e) => self.ed.message = format!("Nothing was duplicated: {e}"),
@@ -6636,6 +6641,18 @@ fn follow_panel_pick(
 /// actions (properties, delete, move up or down) are about the current page even while a panel
 /// is shown; canvas actions only when the page itself is shown, as in the panel view they work
 /// on the panel.
+/// Why Copy, Cut and Duplicate leave a selection of only these alone.
+const NOT_COPIED: &str = "revision clouds and the revision table are not copied.";
+
+/// Whether `sel` holds something, but only revision clouds and the revision table, which a
+/// copy leaves out: then Copy, Cut and Duplicate say so rather than do nothing without a word.
+fn only_uncopied(sel: &[Selection]) -> bool {
+    !sel.is_empty()
+        && sel
+            .iter()
+            .all(|s| matches!(s, Selection::Cloud(_) | Selection::RevisionTable))
+}
+
 fn held_for(a: Action, ed: &Editor, project: &wc_core::Project) -> Option<String> {
     // With a panel shown Duplicate and Mirror still work on the schematic page under it (Delete
     // and Rotate go to the panel's picked device instead; Select all, Copy, Cut and Paste are
