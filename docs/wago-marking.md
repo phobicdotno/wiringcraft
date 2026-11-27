@@ -1,7 +1,8 @@
 # WAGO smartScript marker export
 
 WiringCraft writes marker lists that WAGO smartScript reads through its Excel/CSV import. The
-app has it under Export, WAGO marking; the command line has `wiringcraft export wago-marking`.
+app has it under File → WAGO marking (ribbon: Start → Project → WAGO marking); the command line
+has `wiringcraft export wago-marking <out>`.
 
 The file is semicolon-separated UTF-8 with a byte-order mark and CRLF line ends, so Excel and
 smartScript read it in European locales without garbling `æøå`. There is one row per marker,

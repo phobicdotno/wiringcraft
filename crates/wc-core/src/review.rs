@@ -211,3 +211,172 @@ mod tests {
         let _ = utc_date(i64::MIN);
     }
 }
+
+#[cfg(test)]
+mod edge_tests {
+    use super::*;
+    use crate::Page;
+
+    fn project() -> Project {
+        let mut p = Project::new("t");
+        p.pages.push(Page::new("p1", "1", "Power"));
+        p.pages.push(Page::new("p2", "2", "Control"));
+        p
+    }
+
+    fn comment(id: &str, page: &str) -> Comment {
+        Comment {
+            id: id.into(),
+            page: page.into(),
+            at: None,
+            author: "a".into(),
+            time: 0,
+            text: "t".into(),
+            resolved: false,
+            replies: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn sorting_goes_by_page_then_number_with_odd_ids_last() {
+        let mut p = project();
+        p.comments = ["c10", "cx", "c2", "c1"].iter().map(|id| comment(id, "p2")).collect();
+        p.comments.push(comment("c3", "p1"));
+        p.sort_comments();
+        let order: Vec<(&str, &str)> = p.comments.iter().map(|c| (c.page.as_str(), c.id.as_str())).collect();
+        assert_eq!(
+            order,
+            [("p1", "c3"), ("p2", "c1"), ("p2", "c2"), ("p2", "c10"), ("p2", "cx")]
+        );
+    }
+
+    #[test]
+    fn numbering_skips_ids_that_are_not_numbers_and_counts_across_pages() {
+        let mut p = project();
+        p.comments = vec![comment("cx", "p1"), comment("note", "p1"), comment("c7", "p2")];
+        let Ok(id) = p.add_comment("p1", None, "x", 1, "hi") else {
+            unreachable!()
+        };
+        assert_eq!(id, "c8");
+        assert_eq!(p.page_comments("p1").count(), 3);
+        assert_eq!(p.page_comments("p2").count(), 1);
+        assert_eq!(p.page_comments("p3").count(), 0);
+    }
+
+    #[test]
+    fn authors_lose_control_characters_and_are_cut_to_80_characters() {
+        let mut p = project();
+        let Ok(a) = p.add_comment("p1", None, "Ka\nri\t\u{7}", 1, "hi") else {
+            unreachable!()
+        };
+        let long = "ø".repeat(100);
+        let Ok(b) = p.add_comment("p1", None, &long, 1, "hi") else {
+            unreachable!()
+        };
+        let Ok(c) = p.add_comment("p1", None, "\n\t", 1, "hi") else {
+            unreachable!()
+        };
+        let author = |p: &mut Project, id: &str| match p.comment_mut(id) {
+            Ok(c) => c.author.clone(),
+            Err(_) => unreachable!(),
+        };
+        assert_eq!(author(&mut p, &a), "Kari");
+        assert_eq!(author(&mut p, &b), "ø".repeat(80));
+        assert_eq!(author(&mut p, &c), "someone");
+    }
+
+    #[test]
+    fn long_text_is_cut_by_characters_not_bytes() {
+        let mut p = project();
+        let text = "æ".repeat(MAX_TEXT + 1);
+        let Ok(id) = p.add_comment("p1", Some(Point::new(1.0, 2.0)), "x", 1, &text) else {
+            unreachable!()
+        };
+        let Ok(c) = p.comment_mut(&id) else { unreachable!() };
+        assert_eq!(c.text, "æ".repeat(MAX_TEXT));
+    }
+
+    #[test]
+    fn an_infinite_position_is_refused_and_nothing_is_added() {
+        let mut p = project();
+        assert!(
+            p.add_comment("p1", Some(Point::new(0.0, f64::INFINITY)), "x", 1, "hi")
+                .is_err()
+        );
+        assert!(p.comments.is_empty());
+    }
+
+    #[test]
+    fn an_empty_reply_is_refused_and_leaves_the_comment_alone() {
+        let mut p = project();
+        let Ok(id) = p.add_comment("p1", None, "x", 1, "hi") else {
+            unreachable!()
+        };
+        assert!(p.resolve_comment(&id, true).is_ok());
+        assert!(p.reply_to_comment(&id, "y", 2, " \n ").is_err());
+        let Ok(c) = p.comment_mut(&id) else { unreachable!() };
+        assert!(c.resolved, "a refused reply does not open the comment");
+        assert!(c.replies.is_empty());
+        assert!(p.resolve_comment(&id, false).is_ok());
+        let Ok(c) = p.comment_mut(&id) else { unreachable!() };
+        assert!(!c.resolved);
+    }
+
+    #[test]
+    fn unknown_ids_are_refused_by_resolve_remove_and_lookup() {
+        let mut p = project();
+        assert!(matches!(p.resolve_comment("c1", true), Err(Error::Invalid(_))));
+        assert!(matches!(p.remove_comment("c1"), Err(Error::Invalid(_))));
+        assert!(matches!(p.comment_mut("c1"), Err(Error::Invalid(_))));
+        let Ok(id) = p.add_comment("p2", None, "x", 1, "hi") else {
+            unreachable!()
+        };
+        let Ok(gone) = p.remove_comment(&id) else {
+            unreachable!()
+        };
+        assert_eq!((gone.id.as_str(), gone.page.as_str()), ("c1", "p2"));
+        assert!(p.remove_comment(&id).is_err(), "removed only once");
+    }
+
+    #[test]
+    fn json_leaves_out_defaults_and_reads_them_back() {
+        let c = comment("c1", "p1");
+        let Ok(text) = serde_json::to_string(&c) else {
+            unreachable!()
+        };
+        assert!(
+            !text.contains("resolved") && !text.contains("replies") && !text.contains("\"at\""),
+            "{text}"
+        );
+        let Ok(back) = serde_json::from_str::<Comment>(&text) else {
+            unreachable!()
+        };
+        assert_eq!(back, c);
+        let full = Comment {
+            at: Some(Point::new(1.5, -2.0)),
+            resolved: true,
+            replies: vec![Reply {
+                author: "b".into(),
+                time: 5,
+                text: "ok".into(),
+            }],
+            ..c
+        };
+        let Ok(text) = serde_json::to_string(&full) else {
+            unreachable!()
+        };
+        let Ok(back) = serde_json::from_str::<Comment>(&text) else {
+            unreachable!()
+        };
+        assert_eq!(back, full);
+    }
+
+    #[test]
+    fn dates_before_1970_and_within_a_day() {
+        assert_eq!(utc_date(-1), "1969-12-31 23:59");
+        assert_eq!(utc_date(-86_400), "1969-12-31 00:00");
+        assert_eq!(utc_date(86_399), "1970-01-01 23:59");
+        assert_eq!(utc_date(3_661), "1970-01-01 01:01");
+        assert_eq!(utc_date(4_107_542_400), "2100-03-01 00:00");
+    }
+}
