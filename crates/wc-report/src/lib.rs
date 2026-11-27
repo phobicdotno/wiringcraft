@@ -699,7 +699,10 @@ pub fn location_list(i: &Inputs<'_>) -> Table {
         };
         t.rows.push(vec![format!("+{path}"), description, n.to_string(), note]);
     }
-    for (path, n) in count {
+    // Unlisted locations with numbers by value (`+L2` before `+L10`), like the other reports.
+    let mut unlisted: Vec<(String, usize)> = count.into_iter().collect();
+    unlisted.sort_by_cached_key(|(path, _)| natural_key(path));
+    for (path, n) in unlisted {
         t.rows.push(vec![
             format!("+{path}"),
             String::new(),
