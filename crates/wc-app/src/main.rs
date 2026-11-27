@@ -3031,7 +3031,7 @@ impl App {
                              (not its comments or history), recorded as a git repository. {name} and {date} in \
                              its title block and page titles become this project's name and today's date."
                         })
-                        .color(t.faint),
+                        .color(t.muted),
                     );
                     ui.horizontal(|ui| {
                         if let Ok(d) = target
@@ -3100,7 +3100,7 @@ impl App {
                     });
                     ui.label(
                         RichText::new("Texts without a translation are printed as drawn and listed as warnings.")
-                            .color(theme::Theme::of(ui.ctx()).faint),
+                            .color(theme::Theme::of(ui.ctx()).muted),
                     );
                     ui.separator();
                     ui.horizontal(|ui| {
@@ -3171,7 +3171,7 @@ impl App {
                         });
                     ui.label(
                         RichText::new("These fields fill the title block on every page.")
-                            .color(theme::Theme::of(ui.ctx()).faint),
+                            .color(theme::Theme::of(ui.ctx()).muted),
                     );
                     ui.add_space(8.0);
                     ui.label(RichText::new("Locations").strong());
@@ -3318,7 +3318,7 @@ impl App {
                             let current = o.project.meta.logo.as_ref().map(|l| l.file.clone());
                             ui.label(
                                 RichText::new(current.as_deref().unwrap_or("none"))
-                                    .color(theme::Theme::of(ui.ctx()).faint),
+                                    .color(theme::Theme::of(ui.ctx()).muted),
                             );
                             if ui
                                 .button("Logo...")
@@ -3347,7 +3347,7 @@ impl App {
                              Add free text on the cover with the Text tool. Drag the logo on the \
                              cover to move it, or its bottom-right corner to size it.",
                         )
-                        .color(theme::Theme::of(ui.ctx()).faint),
+                        .color(theme::Theme::of(ui.ctx()).muted),
                     );
                     ui.horizontal(|ui| {
                         if ui.button("OK").clicked() {
@@ -3390,7 +3390,7 @@ impl App {
                             "Every page shows each change at once. The layout is kept in \
                              project.toml; a project on the built-in layout leaves it out.",
                         )
-                        .color(theme::Theme::of(ui.ctx()).faint),
+                        .color(theme::Theme::of(ui.ctx()).muted),
                     );
                     ui.horizontal(|ui| {
                         if ui.button("OK").clicked() {
@@ -3447,7 +3447,7 @@ impl App {
                             "The PLC cards report shows each change at once. The racks are kept \
                              in project.toml.",
                         )
-                        .color(t.faint),
+                        .color(t.muted),
                     );
                     ui.horizontal(|ui| {
                         if ui.button("OK").clicked() {
@@ -3676,7 +3676,7 @@ impl App {
                             }
                             ui.label(
                                 RichText::new(format!("{} rows", table.rows.len()))
-                                    .color(theme::Theme::of(ui.ctx()).faint),
+                                    .color(theme::Theme::of(ui.ctx()).muted),
                             );
                         });
                     } else {
@@ -3764,7 +3764,7 @@ impl App {
                 }
                 Dialog::Comment(at, text, focused) => {
                     ui.label(
-                        RichText::new(format!("As {}", state::author_name())).color(theme::Theme::of(ui.ctx()).faint),
+                        RichText::new(format!("As {}", state::author_name())).color(theme::Theme::of(ui.ctx()).muted),
                     );
                     let r = ui.add(egui::TextEdit::multiline(text).desired_width(360.0).desired_rows(4));
                     if !*focused {
@@ -3856,7 +3856,7 @@ impl App {
                     if versions.is_empty() {
                         ui.label(format!("Page {page} has no recorded versions yet."));
                         ui.label(
-                            RichText::new("Record a version (Versions menu) to start its history.").color(t.faint),
+                            RichText::new("Record a version (Versions menu) to start its history.").color(t.muted),
                         );
                     }
                     egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
@@ -3865,7 +3865,7 @@ impl App {
                                 ui.label(
                                     RichText::new(&v.commit[..v.commit.len().min(8)])
                                         .monospace()
-                                        .color(t.faint),
+                                        .color(t.muted),
                                 );
                                 ui.label(RichText::new(&v.subject).strong());
                             });
@@ -3881,7 +3881,7 @@ impl App {
                                 ui.label(
                                     RichText::new("   no changes to symbols or wires")
                                         .small()
-                                        .color(t.faint),
+                                        .color(t.muted),
                                 );
                             }
                             ui.add_space(6.0);
@@ -5421,7 +5421,7 @@ fn report_table(ui: &mut egui::Ui, t: &wc_report::Table) {
         .auto_shrink([false, true])
         .show(ui, |ui| {
             if t.rows.is_empty() {
-                ui.label(RichText::new("Nothing to list yet.").color(theme.faint));
+                ui.label(RichText::new("Nothing to list yet.").color(theme.muted));
                 return;
             }
             egui::Grid::new(("report", t.title.as_str()))
