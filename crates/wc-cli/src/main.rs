@@ -190,7 +190,7 @@ enum Cmd {
     Place {
         /// The page's id.
         page: String,
-        /// The library symbol's id, e.g. `iec.contactor.coil`.
+        /// The library symbol's id, e.g. `wc.coil`.
         symbol: String,
         /// Position in mm, `x,y`.
         #[arg(long, value_parser = parse_point)]
@@ -392,7 +392,7 @@ enum Cmd {
     /// translation into a language (exits with an error when any is missing, so it can guard a
     /// release), or set or remove one text's translation.
     Translations {
-        /// The language, such as `nb`.
+        /// The language, such as `nb`. Needed.
         #[arg(long, global = true)]
         lang: Option<String>,
         #[command(subcommand)]
@@ -448,7 +448,8 @@ enum Cmd {
         /// The AutomationML (`.aml`) file to write.
         out: PathBuf,
     },
-    /// Export data for other tools: marker lists for printing marking strips.
+    /// Export data for other tools: marker lists for printing marking strips, and terminal
+    /// strip lists for the WAGO configurator.
     #[command(subcommand)]
     Export(ExportCmd),
     /// Write the PLC inputs and outputs as an IEC 61131-3 global variable list (structured
@@ -559,7 +560,8 @@ struct MarkingArgs {
     /// Language of the header row and the type column: en, de, nb.
     #[arg(long, default_value = "en")]
     lang: String,
-    /// Only the terminals of this strip (as the terminal plan names it, e.g. -X1).
+    /// Only the terminals of this strip, by its full name as the terminal plan shows it, e.g.
+    /// `-X1` or `=PUMP+CAB1-X1`.
     #[arg(long, allow_hyphen_values = true)]
     strip: Option<String>,
     /// Written between the numbers of a multi-level terminal's levels on its one marker
@@ -620,7 +622,8 @@ enum CommentCmd {
 
 #[derive(Subcommand)]
 enum PanelCmd {
-    /// A new mounting plate with ducts around the edge and a DIN rail in every 125 mm row.
+    /// A new mounting plate with ducts around the edge and between rows, and a DIN rail in the
+    /// middle of each row: as many rows at least 125 mm high as fit, sharing the height evenly.
     New {
         /// The new layout's id, e.g. `plate1`.
         id: String,
@@ -899,7 +902,8 @@ enum RevisionCmd {
         /// The revision's letter, e.g. `A`.
         letter: String,
     },
-    /// Draw a cloud on a page around the rectangle from (x1, y1) to (x2, y2), in mm.
+    /// Draw a cloud on a page around the rectangle from (x1, y1) to (x2, y2), in mm. Prints its
+    /// index, as `revision list` shows it.
     Cloud {
         /// The page's id.
         page: String,
@@ -911,7 +915,7 @@ enum RevisionCmd {
         x2: f64,
         /// The opposite corner's y in mm.
         y2: f64,
-        /// The revision in its tag; the latest when left out.
+        /// The revision letter shown in the cloud's tag; the latest when left out.
         #[arg(long)]
         rev: Option<String>,
     },
@@ -998,7 +1002,7 @@ enum JumperCmd {
         terminals: Vec<String>,
     },
     /// Give the jumper holding a terminal a part (article), e.g.
-    /// `jumper part -X1 3 wago.2002-402`; leave the part out to clear it. A part the project
+    /// `jumper part -X1 3 example.ex-tb-2-5`; leave the part out to clear it. A part the project
     /// does not have yet is taken from its libraries.
     Part {
         /// The strip, e.g. `-X1` (taken as a value, though it starts with `-`).
