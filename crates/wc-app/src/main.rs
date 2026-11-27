@@ -7756,6 +7756,16 @@ mod escape_tests {
         key(false)
     }
 
+    fn release() -> egui::Event {
+        egui::Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
     pub(super) fn key(repeat: bool) -> egui::Event {
         egui::Event::Key {
             key: Key::Escape,
@@ -7773,6 +7783,8 @@ mod escape_tests {
         assert!(frame(&ctx, vec![escape()]));
         // Escape held down: its repeats do not cancel the form.
         assert!(!frame(&ctx, vec![key(true)]));
+        // Let go of Escape so the popup case below is a fresh press, not a repeat.
+        assert!(!frame(&ctx, vec![release()]));
         ctx.memory_mut(|m| m.open_popup(egui::Id::new("combo")));
         assert!(!frame(&ctx, vec![escape()]));
     }
