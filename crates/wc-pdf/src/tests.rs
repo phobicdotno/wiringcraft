@@ -1422,6 +1422,40 @@ fn a_contact_points_to_the_schematic_coil_not_the_overview_repeat() {
 }
 
 #[test]
+fn a_coil_does_not_list_a_contact_repeated_on_an_overview_page() {
+    let mut symbols = BTreeMap::new();
+    symbols.insert("coil".to_owned(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
+    symbols.insert("no".to_owned(), sym("no", SymbolRole::Auxiliary, ["13", "14"]));
+    let mut project = wc_core::Project::new("x");
+    let mut overview = Page::new("p1", "1", "Line diagram");
+    overview.overview = true;
+    overview.symbols.push(place("s1", "no", 50.0, "-K1"));
+    let mut schematic = Page::new("p2", "2", "Control");
+    schematic.symbols.push(place("s2", "coil", 50.0, "-K1"));
+    schematic.symbols.push(place("s3", "no", 150.0, "-K1"));
+    project.pages = vec![overview, schematic];
+    let x = layout::CrossRefs::build(&project, &symbols);
+    let Some(page) = project.pages.get(1) else {
+        unreachable!("two pages")
+    };
+    let mut warnings = Vec::new();
+    let marks = layout::xref_marks(page, &symbols, &x, &mut warnings);
+    let listed: Vec<&str> = marks
+        .iter()
+        .filter(|m| m.text.starts_with("13-14"))
+        .map(|m| m.target_page_id.as_str())
+        .collect();
+    assert_eq!(listed, ["p2"], "the contact is listed once, on its schematic page");
+    // The repeat on the overview still points back to its coil.
+    let Some(overview) = project.pages.first() else {
+        unreachable!("two pages")
+    };
+    let back = layout::xref_marks(overview, &symbols, &x, &mut warnings);
+    assert!(back.iter().any(|m| m.target_page_id == "p2"), "{back:?}");
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
 fn cross_references_give_page_column_and_row() {
     let mut symbols = BTreeMap::new();
     symbols.insert("coil".to_owned(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
@@ -2933,6 +2967,52 @@ fn a_declared_node_with_a_blank_tag_keeps_its_box_address_and_station() {
 }
 
 #[test]
+fn the_reader_title_bar_shows_the_project_name_not_the_file_name() {
+    // One page, so there is a sheet to print (#833).
+    let mut project = Project::new("Pump station");
+    project.pages.push(Page::new("p1", "1", "Main"));
+    let (pdf, _) = export(&project, &BTreeMap::new(), &Options::default());
+    let text = String::from_utf8_lossy(&pdf);
+    let Some(catalog) = text.split("endobj").find(|o| o.contains("/Type /Catalog")) else {
+        unreachable!("no catalog in {text}");
+    };
+    assert!(
+        catalog.contains("/ViewerPreferences << /DisplayDocTitle true >>"),
+        "{catalog}"
+    );
+    assert!(text.contains(&format!("/Title {}", writer::pdf_text("Pump station"))));
+
+    // The file still opens: the trailer points at the xref table, and every object it lists
+    // starts where the table says, so the added catalog entry did not shift any offset.
+    let find = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).rposition(|w| w == needle);
+    let Some(sx) = find(&pdf, b"startxref\n") else {
+        unreachable!("no startxref");
+    };
+    let start: usize = std::str::from_utf8(&pdf[sx + 10..])
+        .ok()
+        .and_then(|s| s.lines().next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(usize::MAX);
+    assert!(pdf.get(start..).is_some_and(|t| t.starts_with(b"xref")));
+    let table = std::str::from_utf8(&pdf[start..]).unwrap_or("");
+    let mut lines = table.lines().skip(1);
+    let count: usize = lines
+        .next()
+        .and_then(|l| l.split(' ').nth(1))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+    assert!(count > 1, "{table}");
+    for (n, line) in lines.take(count).enumerate().skip(1) {
+        let offset: usize = line.split(' ').next().and_then(|o| o.parse().ok()).unwrap_or(0);
+        let head = format!("{n} 0 obj");
+        assert!(
+            pdf.get(offset..).is_some_and(|o| o.starts_with(head.as_bytes())),
+            "object {n} is not at {offset}"
+        );
+    }
+}
+
+#[test]
 fn a_project_with_nothing_to_print_says_so() {
     // No pages and no report tables: no sheet, so the caller is told instead of being handed a
     // PDF no reader opens (#833).
@@ -3060,4 +3140,20 @@ fn layer_names_are_text_strings() {
         unreachable!("non-ASCII names are written as UTF-16")
     };
     assert_eq!(name, "Leitungen → Ω 日本");
+}
+
+#[test]
+fn text_the_pdf_cannot_print_is_warned_about_once_per_sheet() {
+    // Helvetica's WinAnsi has no Ω or Cyrillic: they print as '?', so say so (Latin-1, the
+    // euro and dashes print, and an arrow prints as '>' on purpose).
+    let mut project = Project::new("Demo");
+    project.pages = vec![
+        Page::new("p1", "1", "Motor 10 kΩ Ω Жар"),
+        Page::new("p2", "2", "Pumpe – Ålesund 200 € → B"),
+    ];
+    let (_, report) = export(&project, &BTreeMap::new(), &Options::default());
+    assert_eq!(
+        report.warnings,
+        vec!["page 1: the PDF cannot print Ω Ж а р in its text; they show as ?".to_string()]
+    );
 }

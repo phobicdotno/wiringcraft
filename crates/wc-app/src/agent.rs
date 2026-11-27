@@ -208,7 +208,7 @@ pub fn specs() -> Vec<Value> {
     vec![
         tool(
             "get_state",
-            "Overview of the open project: name, folder, branch, unsaved changes, pages (id, number, title, size, overview, cover, counts), panel layouts, devices count, open comments, the page or panel shown, the selection and whether undo is possible.",
+            "Overview of the open project: name, folder, branch, unsaved changes, pages (id, number, title, size, overview, cover, counts), panel layouts, devices count, open comments, the page or panel shown, the selection, whether undo is possible, and the shared session (null outside one; else role host or guest and the participants, each with name, the page number they have open, which is read-only for everyone else, and you: true for this person).",
             json!({}),
             &[],
         ),
@@ -1866,7 +1866,11 @@ impl App {
             }
             "move_page" => {
                 let page = self.page_of(v, "page")?;
-                let up = need_s(v, "direction")? == "up";
+                let up = match need_s(v, "direction")? {
+                    "up" => true,
+                    "down" => false,
+                    other => return Err(format!("Unknown direction {other:?}: use up or down.")),
+                };
                 let open = need_open(self.open.as_mut())?;
                 let other = if up { page.checked_sub(1) } else { Some(page + 1) };
                 if let Some(why) = open
@@ -2039,10 +2043,17 @@ impl App {
             "rules" => self.tool_rules(v),
             "number_wires" => {
                 use wc_core::numbering::Rule;
-                let rule = match s(v, "rule").unwrap_or("page_column") {
+                // The CLI writes page-column; accept both spellings, and refuse anything else
+                // rather than numbering the whole project by a rule nobody asked for.
+                let rule = match s(v, "rule").map(str::trim).unwrap_or("page_column") {
                     "sequential" => Rule::Sequential,
                     "potential" => Rule::Potential,
-                    _ => Rule::PageColumn,
+                    "page_column" | "page-column" => Rule::PageColumn,
+                    other => {
+                        return Err(format!(
+                            "Unknown rule {other:?}: use page_column, sequential or potential."
+                        ));
+                    }
                 };
                 let open = need_open(self.open.as_mut())?;
                 Ok(open.number_wires(rule).report())
@@ -2284,6 +2295,7 @@ impl App {
             return Ok(pretty(&json!({
                 "open": false,
                 "recent_projects": self.prefs.recent,
+                "session": Value::Null,
             })));
         };
         let pages: Vec<Value> = open
@@ -2332,7 +2344,30 @@ impl App {
                 .collect::<Vec<_>>(),
             // In a session, Undo takes back only this person's changes made in it.
             "can_undo": if self.share.active() { self.share.can_undo() } else { open.can_undo() },
+            "session": self.session_state(&open.project),
         })))
+    }
+
+    /// The shared session as `get_state` gives it: `null` outside one, else this window's
+    /// role and who has joined, each with the page they have open (read-only for the others).
+    fn session_state(&self, project: &wc_core::Project) -> Value {
+        if !self.share.active() {
+            return Value::Null;
+        }
+        let participants: Vec<Value> = self
+            .share
+            .participants()
+            .into_iter()
+            .map(|(p, you)| {
+                // A page the session has that this copy does not have yet is named by its id.
+                let page = p.page.map(|id| project.page(&id).map_or(id, |pg| pg.number.clone()));
+                json!({"name": p.name, "page": page, "you": you})
+            })
+            .collect();
+        json!({
+            "role": if self.share.is_host() { "host" } else { "guest" },
+            "participants": participants,
+        })
     }
 
     /// The `layers` tool: list the editor layers, or show, hide, lock or unlock one, as the
@@ -5075,8 +5110,65 @@ mod tests {
         wc_agent::Tools::run(&mut AppTools(app), name, &input)
     }
 
+    #[test]
+    fn number_wires_refuses_an_unknown_rule() {
+        let (_tmp, mut a) = app(vec![]);
+        let place = |a: &mut App, symbol: &str, x: i32| -> String {
+            let placed = call(
+                a,
+                "place_symbol",
+                json!({"symbol": symbol, "x": x, "y": 60, "page": "2"}),
+            )
+            .unwrap();
+            serde_json::from_str::<Value>(&placed).unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let (c, k) = (place(&mut a, "wc.coil", 50), place(&mut a, "wc.contact.no", 120));
+        call(
+            &mut a,
+            "add_wire",
+            json!({"page": "2", "from": {"item": c, "pin": "A1"}, "to": {"item": k, "pin": "13"}}),
+        )
+        .unwrap();
+        let numbered = |a: &App| page2(a).wires.iter().filter(|w| w.number.is_some()).count();
+        assert_eq!(numbered(&a), 0);
+        let err = call(&mut a, "number_wires", json!({"rule": "potentials"})).unwrap_err();
+        assert!(err.contains("page_column, sequential or potential"), "{err}");
+        assert_eq!(numbered(&a), 0, "a refused rule numbers nothing");
+        // The CLI's spelling works too.
+        call(&mut a, "number_wires", json!({"rule": "page-column"})).unwrap();
+        assert_eq!(numbered(&a), 1);
+    }
+
     fn page2(app: &App) -> &Page {
         app.open.as_ref().unwrap().project.page("p0002").unwrap()
+    }
+
+    #[test]
+    fn move_page_refuses_a_direction_other_than_up_or_down() {
+        let (_tmp, mut a) = app(vec![]);
+        call(&mut a, "add_page", json!({"title": "Pumps"})).unwrap();
+        let order = |a: &App| -> Vec<String> {
+            a.open
+                .as_ref()
+                .unwrap()
+                .project
+                .pages
+                .iter()
+                .map(|p| p.id.clone())
+                .collect()
+        };
+        let before = order(&a);
+        let first = before[0].clone();
+        for bad in ["Up", "sideways"] {
+            let err = call(&mut a, "move_page", json!({"page": first, "direction": bad})).unwrap_err();
+            assert!(err.contains("up or down"), "{bad:?}: {err}");
+            assert_eq!(order(&a), before, "{bad:?} moved a page");
+        }
+        call(&mut a, "move_page", json!({"page": first, "direction": "down"})).unwrap();
+        assert_eq!(order(&a)[1], first);
     }
 
     #[test]
@@ -7392,6 +7484,49 @@ mod tests {
         a.share = h;
         let out = call(&mut a, "add_page", json!({"title": "Pumps"})).unwrap();
         assert!(!out.contains("Pending"), "{out}");
+    }
+
+    #[test]
+    fn get_state_without_a_project_gives_the_session_as_null() {
+        let (_tmp, mut a) = app(vec![]);
+        a.open = None;
+        let state: Value = serde_json::from_str(&call(&mut a, "get_state", json!({})).unwrap()).unwrap();
+        assert_eq!(state["open"], json!(false));
+        assert!(state.get("session").is_some_and(Value::is_null), "{state}");
+    }
+
+    #[test]
+    fn get_state_tells_the_session_role_and_who_has_which_page_open() {
+        let (_tmp, mut a) = app(vec![]);
+        let state: Value = serde_json::from_str(&call(&mut a, "get_state", json!({})).unwrap()).unwrap();
+        assert_eq!(state["session"], Value::Null, "no session yet");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (_dir, mut a, mut h, mut host_open) = guest_window(tmp.path());
+        let state: Value = serde_json::from_str(&call(&mut a, "get_state", json!({})).unwrap()).unwrap();
+        let number = |open: &Open, id: &str| open.project.page(id).unwrap().number.clone();
+        assert_eq!(state["session"]["role"], json!("guest"));
+        let participants = state["session"]["participants"].as_array().unwrap();
+        assert_eq!(participants.len(), 2, "{state}");
+        assert_eq!(participants[0]["page"], json!(number(&host_open, "p0002")), "{state}");
+        assert_eq!(participants[0]["you"], json!(false));
+        assert_eq!(participants[1]["name"], json!("Ola"));
+        assert_eq!(
+            participants[1]["page"],
+            Value::Null,
+            "the guest shows a panel and holds no page"
+        );
+        assert_eq!(participants[1]["you"], json!(true));
+
+        // The host's window says it hosts, and marks the host as this person.
+        h.frame(Some(&mut host_open), Some("p0002".into()), false);
+        let (_host_dir, mut b) = app(vec![]);
+        b.open = Some(host_open);
+        b.share = h;
+        let state: Value = serde_json::from_str(&call(&mut b, "get_state", json!({})).unwrap()).unwrap();
+        assert_eq!(state["session"]["role"], json!("host"));
+        assert_eq!(state["session"]["participants"][0]["you"], json!(true), "{state}");
+        assert_eq!(state["session"]["participants"][1]["you"], json!(false), "{state}");
     }
 
     #[test]

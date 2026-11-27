@@ -103,6 +103,29 @@ fn symbol_level_changes() -> std::result::Result<(), wc_core::Error> {
 }
 
 #[test]
+fn a_symbol_swapped_for_another_is_named() -> std::result::Result<(), wc_core::Error> {
+    let mut a = Page::new("p", "3", "X");
+    place(&mut a, "s1", "-K1", 10.0)?;
+    let shown = |b: &Page| -> Vec<String> {
+        changes::page_changes(Some(&a), Some(b))
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    };
+    // Alone: named, not the catch-all "page changed".
+    let mut b = a.clone();
+    b.symbols[0].symbol = "contact.nc".into();
+    assert_eq!(shown(&b), ["page 3: -K1 symbol coil -> contact.nc"]);
+    // Together with a move of the same symbol: still listed.
+    b.symbols[0].at.x = 30.0;
+    assert_eq!(
+        shown(&b),
+        ["page 3: -K1 symbol coil -> contact.nc", "page 3: contact.nc -K1 moved"]
+    );
+    Ok(())
+}
+
+#[test]
 fn page_setting_changes_are_reported() -> std::result::Result<(), wc_core::Error> {
     let mut a = Page::new("p", "3", "X");
     place(&mut a, "s1", "-K1", 10.0)?;
@@ -303,6 +326,40 @@ fn a_merge_while_another_is_unfinished_is_refused() -> Result<()> {
     // The first merge is untouched and can still be aborted.
     git.abort_merge()?;
     assert!(git.run(&["status", "--porcelain"])?.trim().is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_merge_with_unrecorded_changes_is_refused() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    let git = Git::new(dir);
+    git.init()?;
+    let write = |name: &str, text: &str| std::fs::write(dir.join(name), text).map_err(|e| wc_core::Error::io(name, e));
+    write("notes.txt", "base\n")?;
+    write("other.txt", "one\n")?;
+    git.commit("base")?;
+    git.create_branch("other")?;
+    write("notes.txt", "other\n")?;
+    git.commit("other")?;
+    git.switch("main")?;
+    write("notes.txt", "main\n")?;
+    git.commit("main")?;
+    // An edit not recorded yet: committing the conflicted merge would take it in too.
+    write("other.txt", "edited\n")?;
+    let head = git.head();
+    let r = git.merge("other");
+    let Err(Error::Git { message, .. }) = &r else {
+        unreachable!("{r:?}")
+    };
+    assert!(message.contains("record or discard your changes first"), "{message}");
+    assert_eq!(git.head(), head, "nothing was merged");
+    assert!(!dir.join(".git").join("MERGE_HEAD").exists(), "no merge was started");
+    let kept = std::fs::read_to_string(dir.join("other.txt")).map_err(|e| wc_core::Error::io("read", e))?;
+    assert_eq!(kept, "edited\n", "the edit stays");
+    // Recorded first, the merge goes ahead.
+    git.commit("Edit other")?;
+    assert_eq!(git.merge("other")?, MergeOutcome::Conflicts(vec!["notes.txt".into()]));
     Ok(())
 }
 
@@ -621,6 +678,64 @@ fn a_name_that_starts_with_a_dash_is_never_a_git_option() -> Result<()> {
     assert!(
         !names.iter().any(|n| n.starts_with("shown") || n.starts_with("log")),
         "git wrote no file: {names:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_page_file_that_cannot_be_read_is_listed_as_a_file() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    store::create(dir, "Demo")?;
+    let git = Git::new(dir);
+    git.init()?;
+    let base = git.head().ok_or_else(|| wc_core::Error::Invalid("no head".into()))?;
+    let path = dir.join("pages/p0001.page.json");
+    let changed = [Change::File {
+        path: "pages/p0001.page.json".into(),
+        status: "changed".into(),
+    }];
+
+    // Readable before, not now (left with merge conflict markers): changed, not removed.
+    std::fs::write(&path, "<<<<<<< ours\n{}\n=======\n{}\n>>>>>>> theirs\n")
+        .map_err(|e| wc_core::Error::io(&path, e))?;
+    assert_eq!(changes(&git, &base, None)?, changed);
+    git.commit("Broken")?;
+    let broken = git.head().ok_or_else(|| wc_core::Error::Invalid("no head".into()))?;
+    assert_eq!(changes(&git, &base, Some(&broken))?, changed);
+
+    // Unreadable on both sides, and changed: still listed.
+    std::fs::write(&path, "not a page").map_err(|e| wc_core::Error::io(&path, e))?;
+    assert_eq!(changes(&git, &broken, None)?, changed);
+    Ok(())
+}
+
+#[test]
+fn a_page_file_that_is_not_text_is_changed_not_removed() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    store::create(dir, "Demo")?;
+    let git = Git::new(dir);
+    git.init()?;
+    let base = git.head().ok_or_else(|| wc_core::Error::Invalid("no head".into()))?;
+    let path = dir.join("pages/p0001.page.json");
+
+    // Bytes that are not UTF-8: the file is still there, so it is listed, not removed.
+    std::fs::write(&path, [0xff, 0xfe, b'{', 0x80, b'}']).map_err(|e| wc_core::Error::io(&path, e))?;
+    assert_eq!(
+        changes(&git, &base, None)?,
+        [Change::File {
+            path: "pages/p0001.page.json".into(),
+            status: "changed".into(),
+        }]
+    );
+
+    // Really gone: still reported as a removed page.
+    std::fs::remove_file(&path).map_err(|e| wc_core::Error::io(&path, e))?;
+    let ch = changes(&git, &base, None)?;
+    assert!(
+        matches!(ch.as_slice(), [Change::PageRemoved { page, .. }] if page == "1"),
+        "{ch:?}"
     );
     Ok(())
 }

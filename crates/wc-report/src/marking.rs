@@ -391,9 +391,10 @@ pub fn marking_list_with(i: &Inputs<'_>, o: &MarkingOptions) -> Table {
 
     if wanted(MarkerKind::Wires) {
         // One marker at each end of every numbered wire; wires of one connection share a
-        // number, so a number's count is the number of wire ends that carry it.
+        // number, so a number's count is the number of wire ends that carry it. Wires on an
+        // overview page repeat schematic wires and get no markers of their own.
         let mut ends: BTreeMap<String, usize> = BTreeMap::new();
-        for page in &i.project.pages {
+        for page in i.project.pages.iter().filter(|pg| !pg.overview) {
             for w in &page.wires {
                 if let Some(n) = w.number.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
                     *ends.entry(n.to_owned()).or_default() += 2;
