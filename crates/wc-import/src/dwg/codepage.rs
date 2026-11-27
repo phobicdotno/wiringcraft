@@ -170,8 +170,8 @@ fn table(n: u16) -> Option<(&'static Upper, &'static str)> {
 /// How the texts of a drawing with code page number `n` are decoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decoding {
-    /// The reader's legacy text decoder: UTF-8 when the bytes are, else byte for byte as Latin-1
-    /// (with the euro sign and the two dashes of Windows-1252). For code pages 0 (UTF-8) and 1
+    /// The reader's legacy text decoder: UTF-8 when the bytes are, else as Windows-1252
+    /// ([`crate::csv::decode`]). For code pages 0 (UTF-8) and 1
     /// (ASCII), and the fallback for a page this reader does not know.
     Legacy,
     /// A single-byte page of [`table`].

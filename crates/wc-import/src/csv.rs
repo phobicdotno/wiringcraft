@@ -7,21 +7,14 @@ use wc_core::{Contacts, DeviceTag, Part, Project};
 
 use crate::{Error, Result};
 
-/// Decode bytes as UTF-8 (with or without BOM), falling back to Windows-1252/Latin-1, which is
-/// what Excel writes on most European Windows machines.
+/// Decode bytes as UTF-8 (with or without BOM), falling back to Windows-1252, which is what
+/// Excel writes on most European Windows machines (its curly quotes `“ ”`, `…`, `Š` and the
+/// rest; the five bytes Windows-1252 has no character for keep their own value).
 pub fn decode(bytes: &[u8]) -> String {
     let b = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
     match std::str::from_utf8(b) {
         Ok(s) => s.to_owned(),
-        Err(_) => b
-            .iter()
-            .map(|&c| match c {
-                0x80 => '€',
-                0x96 => '–',
-                0x97 => '—',
-                c => c as char,
-            })
-            .collect(),
+        Err(_) => crate::dwg::codepage::Decoding::Page(30).decode(b),
     }
 }
 
@@ -608,6 +601,24 @@ mod tests {
         );
         assert_eq!(rows[1], ["-K1", "-5"]);
         assert_eq!(rows[2], ["'-K1", "'quoted'"]);
+    }
+
+    #[test]
+    fn a_windows_1252_file_reads_its_curly_quotes_and_letters() -> Result<()> {
+        // Excel's "CSV (semicolon)" on a Western European Windows: “ ” … • ™ Š ž and the euro.
+        let bytes = b"Bestellnummer;Beschreibung\r\nX1;\x93grau\x94 \x85 \x95 \x99 \x8a\x9e \x80\r\n";
+        let (parts, warnings) = parts(&decode(bytes))?;
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let [p] = parts.as_slice() else {
+            unreachable!("one part: {parts:?}");
+        };
+        assert_eq!(
+            p.description,
+            "\u{201c}grau\u{201d} \u{2026} \u{2022} \u{2122} \u{160}\u{17e} \u{20ac}"
+        );
+        // A byte Windows-1252 has no character for keeps its value; Latin-1 letters stay as they are.
+        assert_eq!(decode(b"\x81\xe6\xf8\xe5"), "\u{81}\u{e6}\u{f8}\u{e5}");
+        Ok(())
     }
 
     #[test]
