@@ -70,3 +70,41 @@ fn vcs_commands_say_when_git_cannot_be_run() -> TestResult {
     assert!(!err.contains("vcs init"), "{err}");
     Ok(())
 }
+
+#[test]
+fn the_vcs_init_hint_names_an_ordinary_folder_as_it_is() -> TestResult {
+    // Portable: on Windows the temporary path's backslashes must print as they are.
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("plain project");
+    std::fs::create_dir(&dir)?;
+    let Some(dir_arg) = dir.to_str() else {
+        unreachable!("temporary path is not UTF-8")
+    };
+    let out = run(tmp.path(), &["-C", dir_arg, "vcs", "log"])?;
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    let want = format!("{dir_arg} is not under version control");
+    assert!(err.contains(&want), "{err}");
+    Ok(())
+}
+
+/// Windows refuses line breaks, ESC and backslashes in a folder name; Linux and macOS take them.
+#[cfg(unix)]
+#[test]
+fn the_folder_name_in_the_vcs_init_hint_is_escaped() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    // A newline would split the message and ESC could steer the terminal; a backslash is kept.
+    let dir = tmp.path().join("a\nb\u{1b}[31mc\\d");
+    std::fs::create_dir(&dir)?;
+    let Some(dir_arg) = dir.to_str() else {
+        unreachable!("temporary path is not UTF-8")
+    };
+    let out = run(tmp.path(), &["-C", dir_arg, "vcs", "log"])?;
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("is not under version control"), "{err}");
+    assert!(err.contains("a\\u{a}b\\u{1b}[31mc\\d is not"), "{err}");
+    assert!(!err.contains('\u{1b}'), "{err:?}");
+    assert_eq!(err.trim_end().lines().count(), 1, "{err:?}");
+    Ok(())
+}
