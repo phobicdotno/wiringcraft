@@ -386,6 +386,38 @@ fn write_staging(tmp: &Path, content: &[u8]) -> std::io::Result<()> {
     sync_file(&file, tmp)
 }
 
+/// The devices of `devices.json`, refusing two entries for one device: a map would keep only
+/// the last of them, and the next save would drop the other without a word. Two spellings of
+/// one tag (`-K1+X1` and `+X1-K1`) are one device too.
+struct UniqueDevices(BTreeMap<DeviceTag, Device>);
+
+impl<'de> serde::Deserialize<'de> for UniqueDevices {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct Entries;
+        impl<'de> serde::de::Visitor<'de> for Entries {
+            type Value = UniqueDevices;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a map of device tags to devices")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> std::result::Result<Self::Value, A::Error> {
+                let mut devices = BTreeMap::new();
+                let mut spelled: BTreeMap<DeviceTag, String> = BTreeMap::new();
+                while let Some((key, device)) = map.next_entry::<String, Device>()? {
+                    let tag = DeviceTag::parse(&key).map_err(serde::de::Error::custom)?;
+                    if let Some(first) = spelled.insert(tag.clone(), key.clone()) {
+                        return Err(serde::de::Error::custom(format!(
+                            "devices {first:?} and {key:?} are the same device; keep one of them"
+                        )));
+                    }
+                    devices.insert(tag, device);
+                }
+                Ok(UniqueDevices(devices))
+            }
+        }
+        d.deserialize_map(Entries)
+    }
+}
+
 /// Load a whole project folder.
 pub fn load(dir: &Path) -> Result<Project> {
     let meta_path = dir.join(PROJECT_FILE);
@@ -401,7 +433,7 @@ pub fn load(dir: &Path) -> Result<Project> {
     }
     let devices_path = dir.join(DEVICES_FILE);
     let devices: BTreeMap<DeviceTag, Device> = if devices_path.exists() {
-        read_json(&devices_path)?
+        read_json::<UniqueDevices>(&devices_path)?.0
     } else {
         BTreeMap::new()
     };
@@ -913,6 +945,27 @@ mod tests {
         assert!(again.is_empty(), "unchanged project rewrote {again:?}");
         let back = load(dir.path())?;
         assert_eq!(back, p);
+        Ok(())
+    }
+
+    #[test]
+    fn a_load_refuses_two_devices_json_entries_for_one_device() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
+        save(dir.path(), &Project::new("Demo"))?;
+        let path = dir.path().join(DEVICES_FILE);
+        // The same tag twice, and one tag in two spellings: either would keep only the last.
+        for (first, second) in [("-K1", "-K1"), ("+X1-K1", "-K1+X1")] {
+            let text = format!("{{\n  {first:?}: {{ \"part\": \"a\" }},\n  {second:?}: {{ \"part\": \"b\" }}\n}}\n");
+            fs::write(&path, text).map_err(|e| Error::io(&path, e))?;
+            let Err(e) = load(dir.path()) else {
+                unreachable!("{first} and {second} loaded as one device");
+            };
+            let message = format!("{e} {:?}", std::error::Error::source(&e).map(ToString::to_string));
+            assert!(
+                message.contains(&format!("{first:?}")) && message.contains(&format!("{second:?}")),
+                "{message}"
+            );
+        }
         Ok(())
     }
 

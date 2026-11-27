@@ -1,9 +1,10 @@
-//! Vector PDF export of schematic pages.
+//! Vector PDF export: schematic pages, report tables, panel layouts, PLC card sheets and
+//! network topology sheets.
 //!
 //! Output is plain PDF 1.7 written by hand (no dependencies): lines and curves stay vectors,
 //! text uses the standard Helvetica font so tags are searchable, every page gets a bookmark,
-//! and cross-references between a coil and its contacts are clickable links. The same pages
-//! also export as SVG and DXF (`vector`).
+//! and cross-references between a coil and its contacts are clickable links. The schematic
+//! pages also export as SVG and DXF (`vector`).
 
 mod layout;
 mod picture;
@@ -17,10 +18,13 @@ use wc_core::{Project, Symbol};
 
 pub use layout::{
     CrossRefs, FRAME_COLUMNS, FrameMark, Ink, XREF_HEIGHT, XrefMark, column_of, cover_logo_box, cover_logo_default,
-    fit_picture, frame_marks, junctions, logo_boxes, pin_position, title_logo_box, title_logo_boxes, xref_marks,
+    fit_picture, frame_marks, jumper_points, junctions, logo_boxes, pin_position, tag_lines, title_logo_box,
+    title_logo_boxes, xref_marks,
 };
 pub use picture::{Pictures, read_picture, read_pictures};
-pub use vector::{PageDrawing, Picture, dxf, page_drawings, page_file_stem, page_lines, panel_file_stem, svg};
+pub use vector::{
+    PageDrawing, Picture, dxf, dxf_warnings, page_drawings, page_file_stem, page_lines, panel_file_stem, svg,
+};
 pub use writer::{Layer, Prim, Stroke, text_width_mm};
 
 #[derive(Debug, Clone)]
@@ -207,7 +211,10 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
     let mut doc = writer::Doc::new(&project.meta.name);
     let mut sheet = 0;
     let mut report_no = 0;
-    let mut add_reports = |doc: &mut writer::Doc, list: Vec<(usize, usize, usize, usize)>, sheet: &mut usize| {
+    let mut add_reports = |doc: &mut writer::Doc,
+                           list: Vec<(usize, usize, usize, usize)>,
+                           sheet: &mut usize,
+                           warnings: &mut Vec<String>| {
         for (ti, k, part, parts) in list {
             let Some(table) = reports.get(ti) else { continue };
             let lines = paged.get(ti).and_then(|p| p.get(k)).map_or(&[][..], Vec::as_slice);
@@ -234,11 +241,12 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
             } else {
                 format!("{} {}", page.number, table.title)
             };
+            warnings.extend(unprintable(&page.number, &drawn));
             doc.add_page(size.mm(), &page.number, &title, drawn);
             *sheet += 1;
         }
     };
-    add_reports(&mut doc, front_pages, &mut sheet);
+    add_reports(&mut doc, front_pages, &mut sheet, &mut report.warnings);
     let offset = sheet;
     for page in &pages {
         let mut drawn = layout::draw_page(
@@ -269,6 +277,7 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
             }
         }
         place_logo(&mut drawn, page);
+        report.warnings.extend(unprintable(&page.number, &drawn));
         doc.add_page(
             page.size.mm(),
             &page.number,
@@ -284,6 +293,7 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
         let mut drawn =
             layout::draw_panel_page(project, &page, sheet, total, panel, &options.footprints, &options.date);
         place_logo(&mut drawn, &page);
+        report.warnings.extend(unprintable(&page.number, &drawn));
         doc.add_page(
             first_size.mm(),
             &page.number,
@@ -305,6 +315,7 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
         page.size = card_size;
         let mut drawn = layout::draw_card_page(project, &page, sheet, total, card, first, (part, parts), &options.date);
         place_logo(&mut drawn, &page);
+        report.warnings.extend(unprintable(&page.number, &drawn));
         doc.add_page(
             card_size.mm(),
             &page.number,
@@ -313,7 +324,7 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
         );
         sheet += 1;
     }
-    add_reports(&mut doc, back_pages, &mut sheet);
+    add_reports(&mut doc, back_pages, &mut sheet, &mut report.warnings);
     // Network topologies close the document, after the network list.
     // A topology box links to a page this PDF holds.
     let exported: std::collections::BTreeSet<&str> = pages.iter().map(|p| p.id.as_str()).collect();
@@ -338,6 +349,7 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
             &mut report.warnings,
         );
         place_logo(&mut drawn, &page);
+        report.warnings.extend(unprintable(&page.number, &drawn));
         doc.add_page(
             size.mm(),
             &page.number,
@@ -356,6 +368,31 @@ pub fn export(project: &Project, symbols: &BTreeMap<String, Symbol>, options: &O
         .map(|(i, id)| (id, offset + i))
         .collect();
     (doc.finish(&index), report)
+}
+
+/// The warning for a sheet whose text has characters the PDF's Helvetica cannot print, naming
+/// each once: they come out as `?`, so a "10 kΩ" note reads "10 k?". An arrow, which prints
+/// as `>`, is not one of them. `None` when every character prints as itself.
+fn unprintable(number: &str, drawn: &writer::Drawn) -> Option<String> {
+    let mut missing: Vec<char> = Vec::new();
+    for prim in &drawn.prims {
+        let writer::Prim::Text { text, .. } = prim else {
+            continue;
+        };
+        for c in text.chars() {
+            if c != '\u{2192}' && !wc_core::font::pdf_prints(c) && !missing.contains(&c) {
+                missing.push(c);
+            }
+        }
+    }
+    if missing.is_empty() {
+        return None;
+    }
+    let list: Vec<String> = missing.iter().map(|c| c.escape_debug().to_string()).collect();
+    Some(format!(
+        "page {number}: the PDF cannot print {} in its text; they show as ?",
+        list.join(" ")
+    ))
 }
 
 /// Link target of the `n`th sheet after the schematic pages; no page id starts with a

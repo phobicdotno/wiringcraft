@@ -80,6 +80,21 @@ where
     r
 }
 
+/// Print `warnings` on standard error, one `warning:` line each, with [`escape_field`].
+fn warn<W: AsRef<str>>(warnings: impl IntoIterator<Item = W>) {
+    warn_to(&mut std::io::stderr(), warnings);
+}
+
+/// [`warn`] onto `err`. A line that cannot be written (a closed pipe) is dropped with the ones
+/// after it instead of panicking as `eprintln!` does, so the command still prints its result.
+fn warn_to<W: AsRef<str>>(err: &mut impl std::io::Write, warnings: impl IntoIterator<Item = W>) {
+    for w in warnings {
+        if writeln!(err, "warning: {}", escape_field(w.as_ref())).is_err() {
+            return;
+        }
+    }
+}
+
 /// `import page-dwg`: [`run::import_page_dwg`], printing what it said.
 fn import_page_dwg(dir: &Path, file: &Path, page: String, scale: f64, template: Option<String>) -> Res<()> {
     logged(|log| run::import_page_dwg(dir, file, &page, scale, template, log))
@@ -243,7 +258,7 @@ enum Cmd {
     /// Rules: `sequential` (1, 2, 3 in drawing order), `page-column` (`3.4`: page and column
     /// where the connection starts) or `potential` (the potential's name, else sequential).
     NumberWires {
-        /// `sequential`, `page-column` or `potential`.
+        /// `sequential`, `page-column` or `potential` (any case; `page_column` works too).
         #[arg(long, default_value = "page-column")]
         rule: String,
         /// Renumber connections that already have a number too.
@@ -340,6 +355,7 @@ enum Cmd {
         #[arg(allow_hyphen_values = true)]
         tag: String,
         /// The part's library id; it is taken from the libraries when the project lacks it.
+        /// An empty id (`--part ""`) takes the device's part off.
         #[arg(long)]
         part: Option<String>,
         /// What the device does, e.g. `Pump motor`.
@@ -399,6 +415,11 @@ enum Cmd {
         /// given, e.g. `2026-11-26`.
         #[arg(long, default_value = "")]
         date: String,
+        /// Draw the project's texts in this language from `translations.toml`, such as `nb`,
+        /// or in two (`nb,en`), as `pdf --lang` does. Texts without a translation are drawn as
+        /// they are and listed as warnings.
+        #[arg(long)]
+        lang: Option<String>,
     },
     /// Print a report (contents, parts, devices, wires, nets, terminals, cables, plc, plc-cards, locations, networks) as a table, CSV or Markdown,
     /// or save it as an Excel workbook (`--format xlsx --out <file>`, one sheet per report).
@@ -1105,7 +1126,8 @@ enum StripCmd {
         strip: Option<String>,
     },
     /// Put a strip's terminals in this rail order, e.g. `strip order -X1 3 1 2`. Terminals
-    /// left out follow at the end; no terminals goes back to the order by number.
+    /// left out follow at the end; no terminals goes back to the order by number. Every
+    /// terminal given must be on the strip, drawn or spare.
     Order {
         /// The strip, e.g. `-X1` (taken as a value, though it starts with `-`).
         #[arg(allow_hyphen_values = true)]
@@ -1438,7 +1460,8 @@ enum ImportCmd {
         /// Library category to file the symbols under.
         #[arg(long, default_value = "")]
         category: String,
-        /// Letter code for new devices, e.g. `K`.
+        /// Letter code for new devices, e.g. `K`. Left out, each element keeps the letter code
+        /// read from its label (`-K1` gives `K`).
         #[arg(long, default_value = "")]
         letter_code: String,
     },
@@ -1578,7 +1601,11 @@ enum VcsCmd {
     /// Merge another branch into the current one; conflicting files are listed.
     Merge {
         /// The branch to merge.
-        name: String,
+        #[arg(required_unless_present = "abort")]
+        name: Option<String>,
+        /// Undo a merge that stopped on conflicts instead, restoring the files.
+        #[arg(long, conflicts_with = "name")]
+        abort: bool,
     },
     /// History as a subway map (terminal), or as SVG with --svg.
     Log {
@@ -1729,6 +1756,15 @@ fn page_index(p: &Project, key: &str) -> Res<usize> {
         .ok_or_else(|| format!("no page {key:?}"))
 }
 
+/// The id of the page [`page_index`] finds for `key`.
+fn page_id_of(p: &Project, key: &str) -> Res<String> {
+    let i = page_index(p, key)?;
+    p.pages
+        .get(i)
+        .map(|pg| pg.id.clone())
+        .ok_or_else(|| format!("no page {key:?}"))
+}
+
 /// Refuse `--page` ids the project does not have, naming the ids it does, so a typo fails
 /// instead of writing an empty export (#551).
 fn check_pages(p: &Project, pages: &[String]) -> Res<()> {
@@ -1741,11 +1777,80 @@ fn check_pages(p: &Project, pages: &[String]) -> Res<()> {
     }
 }
 
-/// Write an output file the user named. Under [`output_guard`] the file is written so that it
+/// The project's own files and folders in its folder: an output file must never replace one.
+const PROJECT_DATA: [&str; 9] = [
+    store::PROJECT_FILE,
+    store::DEVICES_FILE,
+    store::LOCK_FILE,
+    wc_core::translate::TRANSLATIONS_FILE,
+    store::PAGES_DIR,
+    store::PANELS_DIR,
+    store::COMMENTS_DIR,
+    store::VENDOR_DIR,
+    wc_core::macros::MACROS_DIR,
+];
+
+/// The project file or folder of the project in `dir` that the output file `path` would land
+/// on, as the file system resolves both (a link to one included), if it would (#1252). Every
+/// name along a chain of links counts, not only where the chain ends: a link inside a project
+/// folder that leads out of it, and a link whose target does not exist yet, are both judged by
+/// each place the write passes through.
+fn project_data_at(dir: &Path, path: &Path) -> Option<&'static str> {
+    // Where a name really is: its folder resolved, the name itself not followed.
+    let placed = |p: &Path| -> Option<PathBuf> {
+        let name = p.file_name()?;
+        let parent = p
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        Some(std::fs::canonicalize(parent).ok()?.join(name))
+    };
+    let mut places: Vec<PathBuf> = std::fs::canonicalize(path).ok().into_iter().collect();
+    let mut hop = path.to_path_buf();
+    // A bounded walk, as the file system bounds a chain of links.
+    for _ in 0..40 {
+        let Some(at) = placed(&hop) else { break };
+        places.push(at.clone());
+        let is_link = std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink());
+        let Some(next) = is_link.then(|| std::fs::read_link(&at).ok()).flatten() else {
+            break;
+        };
+        hop = match at.parent() {
+            Some(folder) if next.is_relative() => folder.join(next),
+            _ => next,
+        };
+    }
+    // Where the walk stopped, the last link followed included.
+    if let Some(at) = placed(&hop) {
+        places.push(at);
+    }
+    let root = std::fs::canonicalize(dir).ok()?;
+    PROJECT_DATA.into_iter().find(|name| {
+        let at = std::fs::canonicalize(root.join(name)).unwrap_or_else(|_| root.join(name));
+        places
+            .iter()
+            .any(|p| p.starts_with(&at) || p.starts_with(root.join(name)))
+    })
+}
+
+/// Write an output file the user named, into the project in `dir`'s folder too but never onto
+/// one of the project's own files (#1252). Under [`output_guard`] the file is written so that it
 /// cannot land on a project file, a link swapped in after the app's own look included (#458).
 /// A failure names the file: the guarded write does that itself, a plain one is given it here.
-fn write_out(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
+fn write_out(dir: &Path, path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
     let path = path.as_ref();
+    // The guard refuses these itself, with the shared session as the reason.
+    if output_guard().is_none()
+        && let Some(name) = project_data_at(dir, path)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "will not write {}: it is the project's {name}; name another file",
+                escape_field(&path.display().to_string())
+            ),
+        ));
+    }
     match output_guard() {
         Some(g) => wc_core::guard::write_output(Some(g), path, bytes),
         None => std::fs::write(path, bytes).map_err(|err| {
@@ -1765,7 +1870,7 @@ fn read_text(path: impl AsRef<Path>) -> Res<String> {
 }
 
 /// Make the output folder `out`; under [`output_guard`] a folder in the project is refused
-/// before any folder is made.
+/// before any folder is made. A failure names the folder.
 fn make_out_dir(out: &Path) -> Res<()> {
     if let Some(g) = output_guard() {
         match g.holds(out) {
@@ -1784,7 +1889,8 @@ fn make_out_dir(out: &Path) -> Res<()> {
             }
         }
     }
-    std::fs::create_dir_all(out).map_err(e)
+    std::fs::create_dir_all(out)
+        .map_err(|err| format!("cannot make folder {}: {err}", escape_field(&out.display().to_string())))
 }
 
 fn e<E: std::fmt::Display>(err: E) -> String {
@@ -1819,6 +1925,31 @@ fn translated(dir: &Path, p: &Project, lang: &str) -> Res<(Project, Vec<wc_core:
         .ok_or_else(|| format!("bad language {lang:?}: use a code such as nb, or two as nb,en"))?;
     let dict = Dictionary::load(dir).map_err(e)?;
     Ok(translate(p, &dict, &langs))
+}
+
+/// `p` with its texts in `lang` (see [`translated`]), warning about each text that has no
+/// translation; `p` as it is without a language.
+fn in_language(dir: &Path, p: Project, lang: Option<String>) -> Res<Project> {
+    let Some(lang) = lang else { return Ok(p) };
+    let (p, missing) = translated(dir, &p, &lang)?;
+    warn_missing(&mut std::io::stderr().lock(), &missing);
+    Ok(p)
+}
+
+/// One warning on `err` for each text with no translation. As in [`warn_to`], a warning that
+/// cannot be written (stderr closed or full) is dropped with the rest: it must not stop the export.
+fn warn_missing(err: &mut impl std::io::Write, missing: &[wc_core::translate::Missing]) {
+    for m in missing {
+        let line = writeln!(
+            err,
+            "warning: no translation for {:?} ({})",
+            escape_field(&m.text),
+            escape_field(&m.used.join(", "))
+        );
+        if line.is_err() {
+            return;
+        }
+    }
 }
 
 /// One check rule on a line: its kind, then each value it sets as `key=value` (keys it does
@@ -2553,7 +2684,7 @@ fn run(mut cli: Cli) -> Res<()> {
                     };
                     let parts = vendored_parts(dir, &p);
                     let step = wc_report::step::panel_step(&p, panel, &parts, &utc_now());
-                    write_out(&out, &step.text).map_err(e)?;
+                    write_out(dir, &out, &step.text).map_err(e)?;
                     println!(
                         "wrote {} ({} solids)",
                         out.display(),
@@ -2724,6 +2855,7 @@ fn run(mut cli: Cli) -> Res<()> {
                     if p.page(&id).is_some() {
                         return Err(format!("page {id:?} exists"));
                     }
+                    let number = p.free_page_number(&number, None).map_err(e)?;
                     let mut page = Page::new(id, number, title);
                     page.overview = overview;
                     page.size = PageSize::parse(&size)?;
@@ -2777,8 +2909,8 @@ fn run(mut cli: Cli) -> Res<()> {
                         if n.is_empty() {
                             return Err("the page number cannot be empty".into());
                         }
-                        let id = &p.pages[i].id;
-                        if let Some(other) = p.pages.iter().find(|pg| pg.number == *n && pg.id != *id) {
+                        let id = page_id_of(&p, &id)?;
+                        if let Some(other) = p.pages.iter().find(|pg| pg.number == *n && pg.id != id) {
                             return Err(format!("page {:?} already has number {n:?}", other.id));
                         }
                     }
@@ -3467,6 +3599,10 @@ fn run(mut cli: Cli) -> Res<()> {
                     println!("{i}");
                 }
                 RevisionCmd::Uncloud { page, index, rev } => {
+                    // The letter `revision cloud --rev` would have tagged the clouds with, so the
+                    // same typed letter takes them off again; the typed tag itself still matches
+                    // a cloud whose revision is gone.
+                    let kept = rev.as_deref().and_then(|r| p.revision(r)).map(|r| r.letter.clone());
                     let pg = p.page_mut(&page).ok_or_else(|| format!("no page {page:?}"))?;
                     let before = pg.clouds.len();
                     match (index, rev) {
@@ -3474,8 +3610,18 @@ fn run(mut cli: Cli) -> Res<()> {
                             pg.clouds.remove(i);
                         }
                         (Some(i), None) => return Err(format!("page {page:?} has no cloud {i}")),
-                        (None, Some(r)) => pg.clouds.retain(|c| c.revision != r.trim()),
-                        _ => return Err("give a cloud's index or --rev, not both".into()),
+                        (None, Some(r)) => {
+                            pg.clouds
+                                .retain(|c| c.revision != r.trim() && Some(&c.revision) != kept.as_ref());
+                            if pg.clouds.len() == before {
+                                return Err(format!(
+                                    "page {page:?} has no cloud of revision {}",
+                                    escape_field(r.trim())
+                                ));
+                            }
+                        }
+                        (Some(_), Some(_)) => return Err("give a cloud's index or --rev, not both".into()),
+                        (None, None) => return Err("give a cloud's index or --rev".into()),
                     }
                     if pg.clouds.len() != before {
                         save(dir, &p)?;
@@ -3630,6 +3776,19 @@ fn run(mut cli: Cli) -> Res<()> {
                 }
                 StripCmd::Order { strip, terminals } => {
                     let strip = DeviceTag::parse(&strip).map_err(e)?;
+                    // A strip or terminal the project does not have is refused, as `jumper add`
+                    // does; no terminals (back to the order by number) needs no check.
+                    if !terminals.is_empty() {
+                        let current = rail(&p, &strip);
+                        if current.is_empty() {
+                            return Err(no_strip(&strip, &unreadable));
+                        }
+                        for t in terminals.iter().map(|t| t.trim()) {
+                            if !current.iter().any(|(n, _)| n == t) {
+                                return Err(format!("{strip} has no terminal {}", escape_field(t)));
+                            }
+                        }
+                    }
                     if p.meta.set_terminal_order(&strip, &terminals)? {
                         save(dir, &p)?;
                     }
@@ -3702,15 +3861,17 @@ fn run(mut cli: Cli) -> Res<()> {
                 print!("{info}");
                 return Ok(());
             }
-            if let Some(part) = &part
+            // An empty id takes the part off, as the assistant's `set_device` does.
+            let part = part.map(|id| id.trim().to_owned());
+            if let Some(part) = part.as_deref().filter(|id| !id.is_empty())
                 && store::read_vendored_part(dir, part).is_err()
             {
                 let lib = wc_library::Library::open(dir, &p).map_err(e)?;
                 wc_library::take(dir, &mut p, &lib, ItemKind::Part, part).map_err(e)?;
             }
             let d = p.devices.entry(t).or_default();
-            if part.is_some() {
-                d.part = part;
+            if let Some(part) = part {
+                d.part = (!part.is_empty()).then_some(part);
             }
             if let Some(desc) = description {
                 d.description = desc;
@@ -3726,21 +3887,7 @@ fn run(mut cli: Cli) -> Res<()> {
             reports,
             lang,
         } => {
-            let p = load(dir)?;
-            let p = match lang {
-                Some(lang) => {
-                    let (p, missing) = translated(dir, &p, &lang)?;
-                    for m in &missing {
-                        eprintln!(
-                            "warning: no translation for {:?} ({})",
-                            escape_field(&m.text),
-                            escape_field(&m.used.join(", "))
-                        );
-                    }
-                    p
-                }
-                None => p,
-            };
+            let p = in_language(dir, load(dir)?, lang)?;
             check_pages(&p, &pages)?;
             let (symbols, missing) = store::vendored_symbols(dir, &p);
             for m in missing {
@@ -3799,7 +3946,7 @@ fn run(mut cli: Cli) -> Res<()> {
             if report.pages == 0 {
                 return Err(wc_pdf::NOTHING_TO_EXPORT.into());
             }
-            write_out(&out, bytes).map_err(e)?;
+            write_out(dir, &out, bytes).map_err(e)?;
             for w in &report.warnings {
                 eprintln!("warning: {}", escape_field(w));
             }
@@ -3846,6 +3993,7 @@ fn run(mut cli: Cli) -> Res<()> {
             format,
             pages,
             date,
+            lang,
         } => {
             let render: fn(&wc_pdf::PageDrawing) -> String = match format.to_ascii_lowercase().as_str() {
                 "svg" => wc_pdf::svg,
@@ -3853,7 +4001,7 @@ fn run(mut cli: Cli) -> Res<()> {
                 other => return Err(format!("unknown drawing format {other:?}: use svg or dxf")),
             };
             let ext = format.to_ascii_lowercase();
-            let p = load(dir)?;
+            let p = in_language(dir, load(dir)?, lang)?;
             check_pages(&p, &pages)?;
             let (symbols, missing) = store::vendored_symbols(dir, &p);
             for m in missing {
@@ -3897,7 +4045,7 @@ fn run(mut cli: Cli) -> Res<()> {
                 while !used.insert(stem.to_lowercase()) {
                     stem.push('_');
                 }
-                write_out(out.join(format!("{stem}.{ext}")), render(d)).map_err(e)?;
+                write_out(dir, out.join(format!("{stem}.{ext}")), render(d)).map_err(e)?;
             }
             for w in &report.warnings {
                 eprintln!("warning: {}", escape_field(w));
@@ -4008,7 +4156,7 @@ fn run(mut cli: Cli) -> Res<()> {
                 let tables: Vec<wc_report::Table> = kinds.iter().map(|k| wc_report::build(*k, &inputs)).collect();
                 let refs: Vec<&wc_report::Table> = tables.iter().collect();
                 let bytes = wc_report::xlsx::workbook(&refs).map_err(e)?;
-                write_out(&path, bytes).map_err(e)?;
+                write_out(dir, &path, bytes).map_err(e)?;
                 return Ok(());
             }
             // Several tables in one CSV file is not a CSV any reader takes: `--out` names a
@@ -4020,7 +4168,7 @@ fn run(mut cli: Cli) -> Res<()> {
                 make_out_dir(folder)?;
                 for k in &kinds {
                     let t = wc_report::build(*k, &inputs);
-                    write_out(folder.join(format!("{}.csv", k.name())), csv_file(&t)).map_err(e)?;
+                    write_out(dir, folder.join(format!("{}.csv", k.name())), csv_file(&t)).map_err(e)?;
                 }
                 println!("wrote {} csv file(s) to {}", kinds.len(), folder.display());
                 return Ok(());
@@ -4040,7 +4188,7 @@ fn run(mut cli: Cli) -> Res<()> {
                 text.push('\n');
             }
             match out {
-                Some(path) => write_out(&path, text).map_err(e)?,
+                Some(path) => write_out(dir, &path, text).map_err(e)?,
                 None => print!("{text}"),
             }
         }
@@ -4072,7 +4220,7 @@ fn run(mut cli: Cli) -> Res<()> {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
             let (text, counts) = wc_report::automationml(&inputs, &utc_now(), &file_name);
-            write_out(&out, text).map_err(e)?;
+            write_out(dir, &out, text).map_err(e)?;
             if counts.untagged_pins > 0 {
                 eprintln!(
                     "warning: {} connected pin(s) on symbols without a tag were left out",
@@ -4096,7 +4244,7 @@ fn run(mut cli: Cli) -> Res<()> {
                 parts: &parts,
             };
             let v = wc_report::plc_variables(&inputs);
-            write_out(&out, &v.text).map_err(e)?;
+            write_out(dir, &out, &v.text).map_err(e)?;
             if v.unlocated > 0 {
                 eprintln!(
                     "warning: {} point(s) have no PLC address and are declared at %I* or %Q*",
@@ -4265,9 +4413,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd, input: Option<Vec<u8>>) -> Res<()> {
             let text = read_file(&file)?;
             let (mut s, warnings) =
                 wc_import::dxf::symbol_with_warnings(&String::from_utf8_lossy(&text), &id, &name).map_err(e)?;
-            for w in &warnings {
-                eprintln!("warning: {}", escape_field(w));
-            }
+            warn(&warnings);
             s.category = category;
             s.letter_code = letter_code;
             let path = wc_library::write_symbol(&lib, &s).map_err(e)?;
@@ -4281,9 +4427,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd, input: Option<Vec<u8>>) -> Res<()> {
         ImportCmd::FootprintDxf { file, part, lib } => {
             let text = read_file(&file)?;
             let (footprint, warnings) = wc_import::dxf::footprint(&String::from_utf8_lossy(&text)).map_err(e)?;
-            for w in &warnings {
-                eprintln!("warning: {}", escape_field(w));
-            }
+            warn(&warnings);
             update_library_part(
                 dir,
                 &part,
@@ -4305,9 +4449,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd, input: Option<Vec<u8>>) -> Res<()> {
         ImportCmd::ModelStep { file, part, lib } => {
             let text = read_file(&file)?;
             let (size, warnings) = wc_import::step::model_size(&String::from_utf8_lossy(&text)).map_err(e)?;
-            for w in &warnings {
-                eprintln!("warning: {}", escape_field(w));
-            }
+            warn(&warnings);
             update_library_part(
                 dir,
                 &part,
@@ -4334,7 +4476,8 @@ fn import_cmd(dir: &Path, ic: ImportCmd, input: Option<Vec<u8>>) -> Res<()> {
             letter_code,
         } => {
             let text = read_text(&file)?;
-            let mut s = wc_import::svg::symbol(&text, &id, &name).map_err(e)?;
+            let (mut s, warnings) = wc_import::svg::symbol_with_warnings(&text, &id, &name).map_err(e)?;
+            warn(&warnings);
             s.category = category;
             s.letter_code = letter_code;
             let path = wc_library::write_symbol(&lib, &s).map_err(e)?;
@@ -4377,9 +4520,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd, input: Option<Vec<u8>>) -> Res<()> {
                 Some(bytes) => import_wago_bytes(dir, &bytes)?,
                 None => import_wago(dir, &file)?,
             };
-            for w in &done.warnings {
-                eprintln!("warning: {}", escape_field(w));
-            }
+            warn(&done.warnings);
             println!(
                 "WAGO configurator: {} device(s) or jumper(s) changed, {} row(s) already up to date, {} not matched",
                 done.changed,
@@ -4457,10 +4598,9 @@ fn update_library_part(
         && dir.join(store::PROJECT_FILE).exists()
         && let Err(err) = &project
     {
-        eprintln!(
-            "warning: the project could not be read, so its copy of {part} is not updated: {}",
-            escape_field(err)
-        );
+        warn([format!(
+            "the project could not be read, so its copy of {part} is not updated: {err}"
+        )]);
     }
     let path = match &lib {
         Some(root) => {
@@ -4619,10 +4759,7 @@ fn update_library_part(
                     Ok(bytes) => put_file_back(&vendored, bytes.as_deref()),
                     Err(_) => Ok(()),
                 };
-                eprintln!(
-                    "warning: the project's copy of {part} was not updated: {}",
-                    escape_field(&why)
-                );
+                warn([format!("the project's copy of {part} was not updated: {why}")]);
                 if let Err(err) = restored {
                     return Err(format!(
                         "the project's copy of {part} could not be put back: {err}; run `lib status`"
@@ -4899,22 +5036,34 @@ fn vcs_cmd(dir: &Path, vc: VcsCmd) -> Res<()> {
             }
         }
         VcsCmd::Switch { name } => git.switch(&name).map_err(e)?,
-        VcsCmd::Merge { name } => match git.merge(&name).map_err(e)? {
-            wc_vcs::MergeOutcome::UpToDate => println!("already up to date"),
-            wc_vcs::MergeOutcome::Merged => println!("merged {name}"),
-            wc_vcs::MergeOutcome::Conflicts(files) => {
-                println!("conflicts in:");
-                for f in files {
-                    println!("  {f}");
+        VcsCmd::Merge { abort: true, .. } => {
+            git.abort_merge().map_err(e)?;
+            println!("merge aborted");
+        }
+        VcsCmd::Merge { name, .. } => {
+            // Clap requires a name unless `--abort` was given.
+            let name = name.unwrap_or_default();
+            match git.merge(&name).map_err(e)? {
+                wc_vcs::MergeOutcome::UpToDate => println!("already up to date"),
+                wc_vcs::MergeOutcome::Merged => println!("merged {name}"),
+                wc_vcs::MergeOutcome::Conflicts(files) => {
+                    println!("conflicts in:");
+                    for f in files {
+                        // A file name from git can hold ESC or other control characters.
+                        println!("  {}", escape_field(&f));
+                    }
+                    return Err(
+                    "resolve the files, then `wiringcraft vcs commit`, or undo the merge with `wiringcraft vcs merge --abort`"
+                        .into(),
+                );
                 }
-                return Err("resolve the files, then `wiringcraft vcs commit`".into());
             }
-        },
+        }
         VcsCmd::Log { svg, limit } => {
             let rows = wc_vcs::history(&git, limit).map_err(e)?;
             match svg {
                 Some(path) => {
-                    write_out(&path, wc_vcs::subway_svg(&rows)).map_err(e)?;
+                    write_out(dir, &path, wc_vcs::subway_svg(&rows)).map_err(e)?;
                     println!("wrote {}", path.display());
                 }
                 None => print!("{}", wc_vcs::subway_text(&rows)),
@@ -4922,18 +5071,18 @@ fn vcs_cmd(dir: &Path, vc: VcsCmd) -> Res<()> {
         }
         VcsCmd::Changes { from, to } => {
             for c in wc_vcs::changes(&git, &from, to.as_deref()).map_err(e)? {
-                println!("{c}");
+                println!("{}", change_line(&c));
             }
         }
         VcsCmd::PageLog { page, limit } => {
             let p = load(dir)?;
-            let page_id = p
-                .pages
-                .iter()
-                .find(|pg| pg.id == page || pg.number == page)
-                .map(|pg| pg.id.clone())
-                .unwrap_or(page);
+            let known = p.pages.iter().find(|pg| pg.id == page || pg.number == page);
+            let page_id = known.map(|pg| pg.id.clone()).unwrap_or(page);
             let versions = wc_vcs::page_history(&git, &page_id, limit).map_err(e)?;
+            // A removed page keeps its recorded history; a page neither here nor recorded is a typo.
+            if known.is_none() && versions.is_empty() {
+                check_pages(&p, std::slice::from_ref(&page_id))?;
+            }
             if versions.is_empty() {
                 println!("no recorded versions of page {page_id}");
             }
@@ -4946,12 +5095,21 @@ fn vcs_cmd(dir: &Path, vc: VcsCmd) -> Res<()> {
                     v.subject
                 );
                 for c in &v.changes {
-                    println!("    {c}");
+                    println!("    {}", change_line(c));
                 }
             }
         }
     }
     Ok(())
+}
+
+/// One recorded change as a line of text, with a file name from git escaped by [`escape_field`]
+/// so a control character in it cannot steer the terminal.
+fn change_line(c: &wc_vcs::Change) -> String {
+    match c {
+        wc_vcs::Change::File { path, status } => format!("{} {status}", escape_field(path)),
+        c => c.to_string(),
+    }
 }
 
 /// Who is writing a comment: the --author option, WIRINGCRAFT_USER, git's user.name, the login.
@@ -4981,7 +5139,7 @@ fn now_secs() -> i64 {
 
 fn comment_cmd(dir: &Path, cc: CommentCmd) -> Res<()> {
     let mut p = load(dir)?;
-    let page_id = |p: &Project, page: &str| page_index(p, page).map(|i| p.pages[i].id.clone());
+    let page_id = page_id_of;
     match cc {
         CommentCmd::Add { page, text, at, author } => {
             let page = page_id(&p, &page)?;
@@ -5845,7 +6003,7 @@ fn export_wago_marking(dir: &Path, out: &Path, args: &MarkingArgs) -> Res<Export
             .unwrap_or_else(|| wc_report::LEVEL_SEPARATOR.to_owned()),
     };
     let t = wc_report::marking_list_with(&inputs, &options);
-    write_out(out, wc_report::to_smartscript_csv(&t)).map_err(e)?;
+    write_out(dir, out, wc_report::to_smartscript_csv(&t)).map_err(e)?;
     warnings.extend(wc_report::formula_warnings(&t));
     warnings.extend(wc_report::level_warnings(inputs.project));
     Ok(Exported {
@@ -5896,7 +6054,7 @@ fn export_wago_configurator(dir: &Path, out: &Path) -> Res<Exported> {
     if t.rows.is_empty() {
         warnings.push("the project has no numbered terminals on its schematic pages".into());
     }
-    write_out(out, wc_report::to_smartscript_csv(&t)).map_err(e)?;
+    write_out(dir, out, wc_report::to_smartscript_csv(&t)).map_err(e)?;
     warnings.extend(wc_report::level_warnings(inputs.project));
     Ok(Exported {
         markers: t.rows.len(),
@@ -6062,11 +6220,11 @@ fn import_qet(
             }
         };
         ids.insert(id, file.clone());
-        for w in warnings {
-            eprintln!("warning: {}: {w}", file.display());
-        }
+        warn(warnings.iter().map(|w| format!("{}: {w}", file.display())));
         imp.symbol.category = category.to_owned();
-        imp.symbol.letter_code = letter_code.to_owned();
+        if !letter_code.is_empty() {
+            imp.symbol.letter_code = letter_code.to_owned();
+        }
         let path = wc_library::write_symbol(lib, &imp.symbol).map_err(e)?;
         println!(
             "{} -> {} ({} pins, {} shapes)",
@@ -6292,8 +6450,13 @@ fn panel_show(panel: &wc_core::panel::Panel) -> String {
 
 /// A report as aligned plain text for the terminal.
 fn plain_table(t: &wc_report::Table) -> String {
-    let mut w: Vec<usize> = t.columns.iter().map(|c| c.chars().count()).collect();
-    for r in &t.rows {
+    // Every value is written with `escape_field`: a line break in a cell would end its row
+    // early and a control character could steer the terminal.
+    let escape = |cells: &[String]| cells.iter().map(|c| escape_field(c)).collect::<Vec<_>>();
+    let columns = escape(&t.columns);
+    let rows: Vec<Vec<String>> = t.rows.iter().map(|r| escape(r)).collect();
+    let mut w: Vec<usize> = columns.iter().map(|c| c.chars().count()).collect();
+    for r in &rows {
         for (i, c) in r.iter().enumerate() {
             if let Some(x) = w.get_mut(i) {
                 *x = (*x).max(c.chars().count());
@@ -6304,10 +6467,10 @@ fn plain_table(t: &wc_report::Table) -> String {
         let parts: Vec<String> = cells.iter().zip(&w).map(|(c, n)| format!("{c:<n$}")).collect();
         parts.join("  ").trim_end().to_owned()
     };
-    let mut out = format!("{}\n{}\n", t.title, line(&t.columns));
+    let mut out = format!("{}\n{}\n", escape_field(&t.title), line(&columns));
     out.push_str(&w.iter().map(|n| "-".repeat(*n)).collect::<Vec<_>>().join("  "));
     out.push('\n');
-    for r in &t.rows {
+    for r in &rows {
         out.push_str(&line(r));
         out.push('\n');
     }
@@ -6390,6 +6553,44 @@ fn utc_date(secs: i64) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_text_report_keeps_each_row_on_one_line() {
+        let t = wc_report::Table {
+            title: "Locations\u{1b}[2J".into(),
+            columns: vec!["Location".into(), "Note\nmore\tx".into()],
+            rows: vec![
+                vec!["+A1".into(), "first line\nsecond\tline".into()],
+                vec!["+A2".into(), "red \u{1b}[31m".into()],
+            ],
+            ..Default::default()
+        };
+        let text = plain_table(&t);
+        assert_eq!(
+            text,
+            "Locations\\u{1b}[2J\n\
+             Location  Note\\nmore\\tx\n\
+             --------  ------------------------\n\
+             +A1       first line\\nsecond\\tline\n\
+             +A2       red \\u{1b}[31m\n"
+        );
+        assert!(!text.contains('\u{1b}'), "{text}");
+
+        // An escaped heading wider than every cell sets its column's width.
+        let t = wc_report::Table {
+            title: "Tags".into(),
+            columns: vec!["Tag\t".into(), "Kind".into()],
+            rows: vec![vec!["K1".into(), "x".into()]],
+            ..Default::default()
+        };
+        assert_eq!(
+            plain_table(&t),
+            "Tags\n\
+             Tag\\t  Kind\n\
+             -----  ----\n\
+             K1     x\n"
+        );
+    }
 
     thread_local! {
         /// Set by a test to stop `box-edit` after its symbol write, as a kill would.
@@ -6550,6 +6751,34 @@ mod tests {
             "{shown}"
         );
         assert_eq!(shown.matches("could not be printed").count(), 1, "{shown}");
+    }
+
+    #[test]
+    fn a_missing_translation_warning_that_cannot_be_written_does_not_panic() {
+        let missing = vec![wc_core::translate::Missing {
+            text: "Motor".into(),
+            used: vec!["page 1 text".into()],
+        }];
+        // A closed standard error: the warning is dropped, and the export goes on.
+        warn_missing(&mut Closed, &missing);
+        let mut err = Vec::new();
+        warn_missing(&mut err, &missing);
+        let Ok(shown) = String::from_utf8(err) else {
+            unreachable!("the warning is UTF-8")
+        };
+        assert_eq!(shown, "warning: no translation for \"Motor\" (page 1 text)\n");
+    }
+
+    #[test]
+    fn an_import_warning_that_cannot_be_written_does_not_panic() {
+        // A closed standard error: every warning is dropped, and the caller goes on.
+        warn_to(&mut Closed, ["no pins", "a second one"]);
+        let mut err = Vec::new();
+        warn_to(&mut err, vec!["line\nbreak".to_string()]);
+        let Ok(shown) = String::from_utf8(err) else {
+            unreachable!("the warning is UTF-8")
+        };
+        assert_eq!(shown, format!("warning: {}\n", escape_field("line\nbreak")));
     }
 
     #[cfg(unix)]
@@ -6840,7 +7069,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
-        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "2"]).unwrap();
         for (at, tag) in [("40,40", "-A1"), ("100,40", "-A2")] {
             let args = ["box", "p1", "--at", at, "--size", "20,20", "--tag", tag];
             cli(&dir, &[&args[..], &["--pin", "1:top:10"]].concat()).unwrap();
@@ -6892,7 +7121,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
-        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "2"]).unwrap();
         let args = ["box", "p1", "--at", "50,50", "--size", "20,20", "--tag", "-F1"];
         cli(
             &dir,
@@ -7010,6 +7239,52 @@ mod tests {
         cli(&dir, &["device", "-K9", "--description", "Spare"]).unwrap();
         let p = load(&dir).unwrap();
         assert_eq!(p.devices[&DeviceTag::parse("-K9").unwrap()].description, "Spare");
+    }
+
+    #[test]
+    fn an_empty_part_takes_the_part_off_a_device() {
+        let Ok(tmp) = tempfile::tempdir() else { unreachable!() };
+        let dir = tmp.path().join("p");
+        let Some(path) = dir.to_str() else { unreachable!() };
+        let Ok(cmd) = Cli::try_parse_from(["wiringcraft", "new", path, "--no-git"]) else {
+            unreachable!()
+        };
+        assert!(run(cmd).is_ok());
+        let lib = tmp.path().join("lib");
+        let part = wc_core::Part {
+            id: "maker.contactor".into(),
+            ..wc_core::Part::default()
+        };
+        assert!(wc_library::write_part(&lib, &part).is_ok());
+        let Some(lib) = lib.to_str() else { unreachable!() };
+        assert!(cli(&dir, &["lib", "add", "shop", "folder", lib]).is_ok());
+        let set = cli(
+            &dir,
+            &["device", "-K1", "--part", "maker.contactor", "--description", "Pump"],
+        );
+        assert!(set.is_ok(), "{set:?}");
+        let Ok(k1) = DeviceTag::parse("-K1") else {
+            unreachable!()
+        };
+        let info = |dir: &Path| load(dir).and_then(|p| device_info(&p, &k1));
+        assert_eq!(
+            info(&dir),
+            Ok("part         maker.contactor\ndescription  Pump\n".to_owned())
+        );
+
+        // Empty or blank, the part goes and the description stays.
+        let off = cli(&dir, &["device", "-K1", "--part", ""]);
+        assert!(off.is_ok(), "{off:?}");
+        assert_eq!(info(&dir), Ok("part         -\ndescription  Pump\n".to_owned()));
+        let reset = cli(&dir, &["device", "-K1", "--part", " maker.contactor "]);
+        assert!(reset.is_ok(), "{reset:?}");
+        assert_eq!(
+            info(&dir),
+            Ok("part         maker.contactor\ndescription  Pump\n".to_owned())
+        );
+        let again = cli(&dir, &["device", "-K1", "--part", " "]);
+        assert!(again.is_ok(), "{again:?}");
+        assert_eq!(info(&dir), Ok("part         -\ndescription  Pump\n".to_owned()));
     }
 
     #[test]
@@ -7704,6 +7979,9 @@ mod tests {
         cli(&dir, &["page", "edit", "8", "--number", "9", "--title", "Ctl"]).unwrap();
         assert_eq!(page(&dir, "7").number, "9");
         assert_eq!(page(&dir, "7").title, "Ctl");
+        // Keeping its own number, typed by that number, is no clash with itself.
+        cli(&dir, &["page", "edit", "9", "--number", "9"]).unwrap();
+        assert_eq!(page(&dir, "7").number, "9");
         let err = cli(&dir, &["page", "edit", "9", "--number", "7"]).unwrap_err();
         assert!(err.contains("already has number"), "{err}");
         assert!(cli(&dir, &["page", "fields", "42"]).unwrap_err().contains("no page"));
@@ -7711,6 +7989,39 @@ mod tests {
         cli(&dir, &["page", "remove", "9"]).unwrap();
         assert!(load(&dir).unwrap().page("7").is_none());
         assert!(load(&dir).unwrap().page("a").is_some());
+    }
+
+    #[test]
+    fn page_add_refuses_a_number_in_use_and_a_blank_number() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["page", "add", "a", "--number", " 2 ", "--title", "Power"]).unwrap();
+        let pages = |dir: &Path| -> Vec<(String, String)> {
+            load(dir)
+                .unwrap()
+                .pages
+                .iter()
+                .map(|p| (p.id.clone(), p.number.clone()))
+                .collect()
+        };
+        let before = pages(&dir);
+        assert_eq!(
+            before,
+            [("p0001".to_owned(), "1".to_owned()), ("a".to_owned(), "2".to_owned())],
+            "the number is trimmed"
+        );
+        // The page `new` made has number 1, and `a` has 2 (also with blanks around it).
+        for taken in ["1", "2", " 2"] {
+            let err = cli(&dir, &["page", "add", "b", "--number", taken]).unwrap_err();
+            assert!(err.contains("already has number"), "{err}");
+        }
+        for blank in ["", "  "] {
+            let err = cli(&dir, &["page", "add", "b", "--number", blank]).unwrap_err();
+            assert!(err.contains("cannot be empty"), "{err}");
+        }
+        assert_eq!(pages(&dir), before);
+        assert!(!dir.join("pages").join("b.page.json").exists());
     }
 
     #[test]
@@ -8433,7 +8744,7 @@ mod tests {
     }
 
     #[test]
-    fn pdf_prints_the_texts_in_the_language_asked_for_and_translations_lists_what_is_missing() {
+    fn pdf_and_drawing_print_the_texts_in_the_language_asked_for_and_translations_lists_what_is_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("p");
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
@@ -8472,6 +8783,21 @@ mod tests {
         assert!(nb.contains(&hex("Pumper")) && !nb.contains(&hex("Pumps")));
         assert!(pdf(&["--lang", "nb,en"]).contains(&hex("Pumper / Pumps")));
         assert!(cli(&dir, &["pdf", "x.pdf", "--lang", "nb,en,de"]).is_err());
+        // The SVG and DXF drawings take the language too.
+        for ext in ["svg", "dxf"] {
+            let out = tmp.path().join(format!("drawn-{ext}"));
+            let draw = |args: &[&str]| {
+                let mut all = vec!["drawing", out.to_str().unwrap(), "--format", ext, "--page", "p9"];
+                all.extend_from_slice(args);
+                cli(&dir, &all).unwrap();
+                std::fs::read_to_string(out.join(format!("9.{ext}"))).unwrap()
+            };
+            assert!(draw(&[]).contains("Pumps"), "{ext}");
+            let nb = draw(&["--lang", "nb"]);
+            assert!(nb.contains("Pumper") && !nb.contains("Pumps"), "{ext}");
+            assert!(draw(&["--lang", "nb,en"]).contains("Pumper / Pumps"), "{ext}");
+        }
+        assert!(cli(&dir, &["drawing", "d", "--lang", "nb,en,de"]).is_err());
 
         // The new project's cover page title and the device description have none yet.
         let err = cli(&dir, &["translations", "--lang", "nb"]).unwrap_err();
@@ -8681,6 +9007,25 @@ mod tests {
     }
 
     #[test]
+    fn strip_order_refuses_a_strip_or_terminal_the_project_does_not_have() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let err = cli(&dir, &["strip", "order", "--", "-X1", "3", "1"]).unwrap_err();
+        assert_eq!(err, "no terminal strip -X1");
+        assert!(load(&dir).unwrap().meta.strips.is_empty(), "nothing saved");
+        draw_x1_terminals(&dir);
+        let err = cli(&dir, &["strip", "order", "--", "-X1", "3", "99"]).unwrap_err();
+        assert_eq!(err, "-X1 has no terminal 99");
+        assert!(load(&dir).unwrap().meta.strips.is_empty(), "nothing saved");
+        cli(&dir, &["strip", "order", "--", "-X1", "3", "1"]).unwrap();
+        assert_eq!(load(&dir).unwrap().meta.strips.len(), 1);
+        // No terminals still goes back to the order by number.
+        cli(&dir, &["strip", "order", "--", "-X1"]).unwrap();
+        assert!(load(&dir).unwrap().meta.strips.is_empty());
+    }
+
+    #[test]
     fn rack_commands_add_list_edit_and_remove_racks_and_cards() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("p");
@@ -8805,7 +9150,7 @@ mod tests {
             unreachable!()
         };
         assert!(run(cmd).is_ok());
-        assert!(cli(&dir, &["page", "add", "p1", "--number", "1"]).is_ok());
+        assert!(cli(&dir, &["page", "add", "p1", "--number", "2"]).is_ok());
         let tag = |t: &str| DeviceTag::parse(t).ok();
 
         // A cable tag right after `--cable`, before or after other options.
@@ -10399,7 +10744,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
-        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "2"]).unwrap();
         let pins = ["--pin", "IN:left:5", "--pin", "OUT:right:5", "--pin", "PE:bottom:18"];
         let mut args = vec!["box", "p1", "--at", "40,40", "--size", "20,10"];
         args.extend_from_slice(&pins);
@@ -10543,7 +10888,7 @@ mod tests {
             unreachable!()
         };
         assert!(cli(&dir, &["lib", "add", "starter", "folder", starter]).is_ok());
-        assert!(cli(&dir, &["page", "add", "p1", "--number", "1"]).is_ok());
+        assert!(cli(&dir, &["page", "add", "p1", "--number", "2"]).is_ok());
 
         let placed = cli(&dir, &["place", "p1", "wc.coil", "--at", "50,50", "--tag", "-K1"]);
         assert!(placed.is_ok(), "{placed:?}");
@@ -10569,7 +10914,7 @@ mod tests {
             unreachable!()
         };
         assert!(cli(&dir, &["lib", "add", "starter", "folder", starter]).is_ok());
-        assert!(cli(&dir, &["page", "add", "p1", "--number", "1"]).is_ok());
+        assert!(cli(&dir, &["page", "add", "p1", "--number", "2"]).is_ok());
 
         let missing_page = ["place", "nope", "wc.coil", "--at", "50,50"];
         let bad_turn = ["place", "p1", "wc.coil", "--at", "50,50", "--rotate", "45"];
@@ -10593,7 +10938,7 @@ mod tests {
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
         let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
         cli(&dir, &["lib", "add", "starter", "folder", starter.to_str().unwrap()]).unwrap();
-        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "2"]).unwrap();
         cli(
             &dir,
             &["box", "p1", "--at", "40,40", "--size", "20,10", "--pin", "X=1:left:5"],
@@ -10662,7 +11007,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
-        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "2"]).unwrap();
         cli(
             &dir,
             &["box", "p1", "--at", "40,40", "--size", "20,10", "--pin", "1:left:5"],
@@ -10697,7 +11042,7 @@ mod tests {
     fn box_edit_project(tmp: &Path) -> (PathBuf, PathBuf, run::Written) {
         let dir = tmp.join("proj");
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
-        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "2"]).unwrap();
         cli(
             &dir,
             &["box", "p1", "--at", "40,40", "--size", "20,10", "--pin", "1:left:5"],
@@ -11197,7 +11542,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
-        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "2"]).unwrap();
         cli(
             &dir,
             &["box", "p1", "--at", "40,40", "--size", "20,10", "--pin", "IN:left:5"],
@@ -11222,7 +11567,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
-        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "2"]).unwrap();
         let boxed = |args: &[&str]| {
             let mut all = vec!["box", "p1"];
             all.extend_from_slice(args);
@@ -11325,7 +11670,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
-        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "2"]).unwrap();
         let args = [
             "box",
             "p1",

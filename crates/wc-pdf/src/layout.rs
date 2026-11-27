@@ -74,6 +74,31 @@ pub struct XrefMark {
 
 pub const XREF_HEIGHT: f64 = 1.8;
 
+/// A placed symbol's device tag as drawn: how its lines align, and each line (`=function`,
+/// `+location`, `-product`) with its baseline anchor in page mm, centred on the tag position.
+/// The lines are right-aligned there, so they grow away from a drawing to their right; where
+/// the placement turns that side round (a mirror, or half a turn) they are left-aligned.
+pub fn tag_lines(placed: &PlacedSymbol, symbol: &Symbol, tag: &DeviceTag) -> (Align, Vec<(Point, String)>) {
+    let ta = symbol.tag_at.transform(placed.rotation, placed.mirror) + placed.at;
+    let reversed = Point::new(1.0, 0.0).transform(placed.rotation, placed.mirror).x < -0.5;
+    let align = if reversed { Align::Left } else { Align::Right };
+    let mut lines = Vec::new();
+    if !tag.function.is_empty() {
+        lines.push(format!("={}", tag.function.join(".")));
+    }
+    if !tag.location.is_empty() {
+        lines.push(format!("+{}", tag.location.join(".")));
+    }
+    lines.push(format!("-{}", tag.product.join(".")));
+    let top = ta.y - (lines.len() as f64 - 1.0) * 1.5 + 1.2;
+    let lines = lines
+        .into_iter()
+        .enumerate()
+        .map(|(i, l)| (Point::new(ta.x, top + 3.0 * i as f64), l))
+        .collect();
+    (align, lines)
+}
+
 /// Cross-reference texts for a page: a coil lists its contacts with their pins and locations,
 /// a contact points back to its coil, an interruption point lists where the wire continues.
 /// Problems (a contact without a coil, an interruption point without a partner) go to `warnings`.
@@ -96,9 +121,7 @@ pub fn xref_marks(
             .collect();
         let below = placed.iter().map(|g| g.bounds().1.y).fold(s.at.y, f64::max);
         let right = placed.iter().map(|g| g.bounds().1.x).fold(s.at.x, f64::max);
-        let ta = sym.tag_at.transform(s.rotation, s.mirror) + s.at;
-        let tag_lines = 1 + usize::from(!tag.function.is_empty()) + usize::from(!tag.location.is_empty());
-        let tag_top = ta.y - (tag_lines as f64 - 1.0) * 1.5 + 1.2;
+        let (tag_align, tag_at) = tag_lines(s, sym, tag);
         match sym.role {
             SymbolRole::Main => {
                 for (i, a) in xref.auxes.get(tag).map(Vec::as_slice).unwrap_or(&[]).iter().enumerate() {
@@ -112,8 +135,8 @@ pub fn xref_marks(
             }
             SymbolRole::Auxiliary => match xref.mains.get(tag).and_then(|m| m.first()) {
                 Some(main) => out.push(XrefMark {
-                    at: Point::new(ta.x, tag_top + 3.0 * tag_lines as f64),
-                    align: Align::Right,
+                    at: tag_at.last().map_or(s.at, |(at, _)| *at + Point::new(0.0, 3.0)),
+                    align: tag_align,
                     text: format!("> {}", main.location()),
                     target_page_id: main.page_id.clone(),
                 }),
@@ -162,7 +185,9 @@ impl CrossRefs {
                 };
                 match sym.role {
                     SymbolRole::Main => x.mains.entry(tag.clone()).or_default().push(a),
-                    SymbolRole::Auxiliary => x.auxes.entry(tag.clone()).or_default().push(a),
+                    // A contact repeated on an overview page (line diagram) is not listed
+                    // under its coil again: the schematic page draws it in detail (#1076).
+                    SymbolRole::Auxiliary if !page.overview => x.auxes.entry(tag.clone()).or_default().push(a),
                     SymbolRole::Interruption => x.links.entry(tag.clone()).or_default().push(a),
                     _ => {}
                 }
@@ -541,13 +566,21 @@ pub fn cover_logo_box(project: &Project, page: &Page) -> Option<(Point, Point)> 
     if !page.cover {
         return None;
     }
-    Some(match logo.cover {
+    Some(match placed_cover_box(logo) {
         Some((a, b)) => (
             Point::new(a.x.min(b.x), a.y.min(b.y)),
             Point::new(a.x.max(b.x), a.y.max(b.y)),
         ),
         None => cover_logo_default(project, page),
     })
+}
+
+/// The cover box the user put the logo in, unless a corner is not a number (`nan` or `inf`
+/// typed into `project.toml`): such a box is drawn nowhere, so the logo takes its default place
+/// instead of writing `NaN` into the page (#1183).
+fn placed_cover_box(logo: &wc_core::Logo) -> Option<(Point, Point)> {
+    logo.cover
+        .filter(|(a, b)| [a.x, a.y, b.x, b.y].iter().all(|v| v.is_finite()))
 }
 
 /// Every box the project's logo is drawn in on `page`: the title block's, and on the cover
@@ -607,7 +640,11 @@ fn cover_name_y(rows: usize, logo: bool, y0: f64, y1: f64) -> f64 {
 /// Whether the cover shows the project's logo in its default place, above the name: only then
 /// does the name leave room for it.
 fn default_cover_logo(project: &Project) -> bool {
-    project.meta.logo.as_ref().is_some_and(|l| l.cover.is_none())
+    project
+        .meta
+        .logo
+        .as_ref()
+        .is_some_and(|l| placed_cover_box(l).is_none())
 }
 
 /// How many rows of the cover's field table fit on a cover whose drawing area runs from `y0`
@@ -791,9 +828,6 @@ pub fn draw_page(
     if !page.clouds.is_empty() || page.revision_table.is_some() {
         pen.begin_layer(Layer::Drawings);
         for c in &page.clouds {
-            if !c.is_valid() {
-                warnings.push(format!("page {}: a revision cloud has no area", page.number));
-            }
             for s in c.shapes() {
                 draw_shape(&mut pen, &s);
             }
@@ -805,18 +839,45 @@ pub fn draw_page(
         }
         pen.end_layer();
     }
+    // Each cloud problem is warned about once per page, with how many clouds share it.
+    let flat = page.clouds.iter().filter(|c| !c.is_valid()).count();
+    match flat {
+        0 => {}
+        1 => warnings.push(format!("page {}: a revision cloud has no area", page.number)),
+        n => warnings.push(format!("page {}: {n} revision clouds have no area", page.number)),
+    }
+    let mut unlisted: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut unprintable: BTreeMap<&str, usize> = BTreeMap::new();
     for c in &page.clouds {
         if project.cloud_revision(&c.revision).is_none() {
-            warnings.push(format!(
-                "page {}: a cloud carries revision {}, which the project does not list",
-                page.number, c.revision
-            ));
+            *unlisted.entry(c.revision.as_str()).or_insert(0) += 1;
         } else if !wc_core::revision::letter_prints(&c.revision) {
-            warnings.push(format!(
-                "page {}: the PDF cannot print revision {} on a cloud; it can read like another letter",
-                page.number, c.revision
-            ));
+            *unprintable.entry(c.revision.as_str()).or_insert(0) += 1;
         }
+    }
+    for (letter, n) in unlisted {
+        warnings.push(if n > 1 {
+            format!(
+                "page {}: {n} clouds carry revision {letter}, which the project does not list",
+                page.number
+            )
+        } else {
+            format!(
+                "page {}: a cloud carries revision {letter}, which the project does not list",
+                page.number
+            )
+        });
+    }
+    for (letter, n) in unprintable {
+        let on = if n > 1 {
+            format!("on {n} clouds")
+        } else {
+            "on a cloud".to_owned()
+        };
+        warnings.push(format!(
+            "page {}: the PDF cannot print revision {letter} {on}; it can read like another letter",
+            page.number
+        ));
     }
     if page.revision_table.is_some() {
         for letter in project.unprintable_revisions() {
@@ -883,14 +944,33 @@ pub fn draw_page(
         pen.circle((x, y), 0.6, true);
     }
 
-    // Symbols.
+    // Jumpers: a bar through the jumpered terminals on this page, in strip order, with a dot
+    // on each, as the editor draws them.
+    if !project.meta.jumpers.is_empty() {
+        let numbers = wc_core::project::terminal_numbers(project, |id| symbols.get(id).map(|s| s.role));
+        pen.width(0.6);
+        for j in &project.meta.jumpers {
+            let at: Vec<(f64, f64)> = jumper_points(page, symbols, &numbers, j)
+                .into_iter()
+                .map(tuple)
+                .collect();
+            if at.len() < 2 {
+                continue;
+            }
+            pen.polyline(&at, false);
+            for p in at {
+                pen.circle(p, 0.9, true);
+            }
+        }
+    }
+
+    // Symbols. A symbol missing from the library copy is warned about once per page, with
+    // how many placements it has there, however often it is placed.
     pen.width(0.3);
+    let mut missing: BTreeMap<&str, usize> = BTreeMap::new();
     for s in &page.symbols {
         let Some(sym) = symbols.get(&s.symbol) else {
-            warnings.push(format!(
-                "page {}: symbol {:?} is not in the project's library copy",
-                page.number, s.symbol
-            ));
+            *missing.entry(s.symbol.as_str()).or_insert(0) += 1;
             pen.colour(0.85, 0.1, 0.1);
             pen.rect((s.at.x - 4.0, s.at.y - 4.0), (s.at.x + 4.0, s.at.y + 4.0));
             pen.text((s.at.x, s.at.y + 1.0), 2.5, 1, "?");
@@ -901,20 +981,24 @@ pub fn draw_page(
             draw_shape(&mut pen, &g.placed(s.at, s.rotation, s.mirror));
         }
         let Some(tag) = &s.tag else { continue };
-        let ta = sym.tag_at.transform(s.rotation, s.mirror) + s.at;
-        // One aspect per line, right-aligned, centred on the tag position.
-        let mut lines = Vec::new();
-        if !tag.function.is_empty() {
-            lines.push(format!("={}", tag.function.join(".")));
+        // One aspect per line, centred on the tag position.
+        let (align, lines) = tag_lines(s, sym, tag);
+        let a = if align == Align::Left { 0 } else { 2 };
+        for (at, l) in lines {
+            pen.text(tuple(at), 2.5, a, &l);
         }
-        if !tag.location.is_empty() {
-            lines.push(format!("+{}", tag.location.join(".")));
-        }
-        lines.push(format!("-{}", tag.product.join(".")));
-        let top = ta.y - (lines.len() as f64 - 1.0) * 1.5 + 1.2;
-        for (i, l) in lines.iter().enumerate() {
-            pen.text((ta.x, top + 3.0 * i as f64), 2.5, 2, l);
-        }
+    }
+
+    for (symbol, n) in missing {
+        let placements = if n > 1 {
+            format!(" ({n} placements)")
+        } else {
+            String::new()
+        };
+        warnings.push(format!(
+            "page {}: symbol {symbol:?} is not in the project's library copy{placements}",
+            page.number
+        ));
     }
 
     // Cross-references, as links to the page they point at.
@@ -952,6 +1036,34 @@ pub fn draw_page(
         underlay: None,
         pictures: Vec::new(),
     }
+}
+
+/// Where the jumper's bar passes on `page`: the terminal symbols of its terminals, in strip order.
+/// Other symbols with a terminal's tag (a device drawn with it) are no bar end. The editor and
+/// the page export both draw the bar through these points.
+pub fn jumper_points(
+    page: &Page,
+    symbols: &BTreeMap<String, Symbol>,
+    numbers: &wc_core::project::TerminalNumbers,
+    j: &wc_core::project::Jumper,
+) -> Vec<Point> {
+    let mut at: Vec<(&str, Point)> = page
+        .symbols
+        .iter()
+        .filter(|s| {
+            symbols.get(&s.symbol).is_some_and(|y| y.role == SymbolRole::Terminal) && j.has(numbers, page, s, true)
+        })
+        .filter_map(|s| {
+            let n = match numbers.get(&(page.id.clone(), s.id.clone())) {
+                Some((_, n)) => n.as_str(),
+                None => j.terminal_of(s.tag.as_ref()?)?,
+            };
+            Some((n, s.at))
+        })
+        .collect();
+    let key = wc_core::project::natural_key;
+    at.sort_by(|a, b| key(a.0).cmp(&key(b.0)).then_with(|| a.0.cmp(b.0)));
+    at.into_iter().map(|(_, p)| p).collect()
 }
 
 /// Points where three or more wire branches meet: wire ends and bends count once per wire
@@ -1062,11 +1174,31 @@ pub(crate) fn fit_at(s: &str, width: f64, height: f64) -> String {
     if text_width_mm(s, height) <= width {
         return s.to_owned();
     }
-    let mut out: String = s.to_owned();
-    while !out.is_empty() && text_width_mm(&format!("{out}..."), height) > width {
-        out.pop();
+    // The longest start of `s` that still fits with "..." after it. A longer start is never
+    // narrower, so the cut point is found by halving: a few measures, not one per character.
+    let ends: Vec<usize> = s.char_indices().map(|(i, _)| i).skip(1).collect();
+    let fits = |end: usize| {
+        s.get(..end)
+            .is_some_and(|start| text_width_mm(&format!("{start}..."), height) <= width)
+    };
+    let (mut lo, mut hi) = (0, ends.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if ends.get(mid - 1).is_some_and(|&end| fits(end)) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
     }
-    format!("{out}...")
+    let end = lo.checked_sub(1).and_then(|i| ends.get(i)).map_or(0, |&e| e);
+    format!("{}...", s.get(..end).unwrap_or_default())
+}
+
+/// A sheet heading drawn 4 mm high, at most `width` mm wide: `title` cut short with "..." when
+/// it is too long, followed by `counter` (such as " (2 / 3)"), which is always kept whole.
+pub(crate) fn fit_heading(title: &str, counter: &str, width: f64) -> String {
+    let room = width - text_width_mm(counter, 4.0);
+    format!("{}{counter}", fit_at(title, room, 4.0))
 }
 
 /// One line of a report page's table: a row of the table, by its index, or the heading of a
@@ -1143,12 +1275,12 @@ pub fn draw_table_page(
     frame(&mut pen, project, page, index, total, date);
     let (x0, x1) = (MARGIN + 6.0, w - MARGIN - 6.0);
     let mut y = MARGIN + HEADER + 10.0;
-    let heading = if part.1 > 1 {
-        format!("{} ({} / {})", table.title, part.0, part.1)
+    let counter = if part.1 > 1 {
+        format!(" ({} / {})", part.0, part.1)
     } else {
-        table.title.clone()
+        String::new()
     };
-    pen.text((x0, y), 4.0, 0, &heading);
+    pen.text((x0, y), 4.0, 0, &fit_heading(&table.title, &counter, x1 - x0));
     y += 4.0;
     if !table.header.is_empty() {
         // The title-block values the layout asks for, as on the page's title block.
@@ -1170,7 +1302,7 @@ pub fn draw_table_page(
     }
     // The group column is shown in the group headings, not in the rows.
     let shown: Vec<usize> = (0..table.columns.len()).filter(|i| Some(*i) != table.group).collect();
-    let view = wc_report::Table {
+    let mut view = wc_report::Table {
         columns: shown.iter().map(|&i| table.columns[i].clone()).collect(),
         rows: table
             .rows
@@ -1179,6 +1311,7 @@ pub fn draw_table_page(
             .collect(),
         ..wc_report::Table::default()
     };
+    carry_cable_onto_page(table, &shown, lines, &mut view.rows);
     let widths = column_widths(&view, x1 - x0);
     // Header row on a grey band.
     pen.colour(0.88, 0.89, 0.91);
@@ -1261,6 +1394,40 @@ pub fn draw_table_page(
         layers: pen.layers,
         underlay: None,
         pictures: Vec::new(),
+    }
+}
+
+/// The cable list names a cable, its type and description only on its first core's row
+/// ([`wc_report::cable_list`]). When a cable's cores run onto this page, its first row names
+/// the cable again, so the page can be read on its own. `shown` maps `rows`' columns to the
+/// table's; other tables are left as they are.
+fn carry_cable_onto_page(table: &wc_report::Table, shown: &[usize], lines: &[TableLine], rows: &mut [Vec<String>]) {
+    let (Some(cable), Some(_)) = (table.column_of("Cable"), table.column_of("Core")) else {
+        return;
+    };
+    let Some(first) = lines.iter().find_map(|l| match l {
+        TableLine::Row(ri) => Some(*ri),
+        TableLine::Group { .. } => None,
+    }) else {
+        return;
+    };
+    let cell = |r: usize, c: usize| table.rows.get(r).and_then(|row| row.get(c)).map_or("", String::as_str);
+    if !cell(first, cable).is_empty() {
+        return;
+    }
+    let Some(above) = (0..first).rev().find(|&r| !cell(r, cable).is_empty()) else {
+        return;
+    };
+    for name in ["Cable", "Type", "Description"] {
+        let Some(c) = table.column_of(name) else { continue };
+        let Some(v) = shown.iter().position(|&i| i == c) else {
+            continue;
+        };
+        if let Some(slot) = rows.get_mut(first).and_then(|r| r.get_mut(v))
+            && slot.is_empty()
+        {
+            *slot = cell(above, c).to_owned();
+        }
     }
 }
 
@@ -1355,10 +1522,12 @@ pub fn draw_card_page(
     frame(&mut pen, project, page, index, total, date);
     let (x0, x1) = (MARGIN + 6.0, w - MARGIN - 6.0);
     let top = MARGIN + HEADER + 10.0;
-    let mut heading = format!("PLC card {}", card.card);
-    if part.1 > 1 {
-        heading.push_str(&format!(" ({} / {})", part.0, part.1));
-    }
+    let counter = if part.1 > 1 {
+        format!(" ({} / {})", part.0, part.1)
+    } else {
+        String::new()
+    };
+    let heading = fit_heading(&format!("PLC card {}", card.card), &counter, x1 - x0);
     pen.text((x0, top), 4.0, 0, &heading);
     let mut about = vec![];
     if !card.rack.is_empty() {
@@ -1370,7 +1539,12 @@ pub fn draw_card_page(
     }
     about.push(format!("{} channels", card.channels.len()));
     pen.colour(0.35, 0.35, 0.35);
-    pen.text((x0, top + 6.0), CARD_TEXT, 0, &about.join(", "));
+    pen.text(
+        (x0, top + 6.0),
+        CARD_TEXT,
+        0,
+        &fit_at(&about.join(", "), x1 - x0, CARD_TEXT),
+    );
     pen.colour(0.0, 0.0, 0.0);
     let rows = card_rows_of(card);
     let per = card_rows_per_page(page.size, project.meta.template.band_height());
@@ -1590,15 +1764,13 @@ pub fn draw_panel_page(
         }
     }
     let devices = panel.device_tags().len();
-    pen.text(
-        (ax0, h - MARGIN - band - 5.0),
-        2.5,
-        0,
-        &format!(
-            "{}  ·  plate {} x {} mm  ·  scale 1:{}  ·  {} device(s)",
-            panel.name, panel.width, panel.height, scale, devices
-        ),
+    // A long panel name is cut short so the plate size and scale stay on the sheet.
+    let facts = format!(
+        "  ·  plate {} x {} mm  ·  scale 1:{}  ·  {} device(s)",
+        panel.width, panel.height, scale, devices
     );
+    let name = fit_at(&panel.name, ax1 - ax0 - text_width_mm(&facts, 2.5), 2.5);
+    pen.text((ax0, h - MARGIN - band - 5.0), 2.5, 0, &format!("{name}{facts}"));
     Drawn {
         ops: pen.ops,
         links: Vec::new(),

@@ -1,6 +1,7 @@
 //! The panel layout view: the mounting plate with its ducts, DIN rails and device footprints,
 //! drawn to scale. Devices, rails and ducts are picked and dragged with the primary button, and
-//! Escape during a drag puts the item back; the arrow keys move the picked device by one step,
+//! Escape during a drag puts the item back; a rail's right end or a duct's bottom-right corner
+//! is dragged to change its length or size; the arrow keys move the picked device by one step,
 //! and Delete takes a picked item off; the wheel zooms and the middle or secondary button pans,
 //! as on the schematic canvas.
 
@@ -165,6 +166,30 @@ fn item_at(items: &[PanelItem], at: Point) -> Option<usize> {
         })
 }
 
+/// A rail's or duct's resize handle: the middle of a rail's right end, a duct's bottom-right
+/// corner. Devices have none.
+fn handle(item: &PanelItem) -> Option<Point> {
+    match item {
+        PanelItem::Rail { at, length } => Some(Point::new(at.x + length, at.y)),
+        PanelItem::Duct { .. } => Some(item.bounds().1),
+        PanelItem::Device { .. } => None,
+    }
+}
+
+/// Side of the square drawn on a picked rail's or duct's resize handle, in screen points; a
+/// press inside that square, and only there, resizes.
+const HANDLE: f32 = 8.0;
+
+/// The rail or duct whose resize handle's square, `reach` millimetres either way of the
+/// handle, holds `at`, with the handle: the picked item's first, then the item under `at`.
+fn handle_at(items: &[PanelItem], pick: Option<usize>, at: Point, reach: f64) -> Option<(usize, Point)> {
+    let near = |i: usize| {
+        let h = handle(items.get(i)?)?;
+        ((at.x - h.x).abs() <= reach && (at.y - h.y).abs() <= reach).then_some((i, h))
+    };
+    pick.and_then(near).or_else(|| item_at(items, at).and_then(near))
+}
+
 /// The panel view's zoom limits, in screen points per millimetre: lower than the schematic's,
 /// so a large plate fits.
 pub const ZOOM_LIMITS: (f32, f32) = (0.05, 20.0);
@@ -218,9 +243,14 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
     if resp.drag_started_by(egui::PointerButton::Primary)
         && let Some(at) = pressed_at.or(pointer)
     {
-        ed.panel_pick = item_at(&p.items, at);
+        // A press inside the square drawn on a rail's right end or a duct's bottom-right
+        // corner resizes it.
+        let reach = f64::from(HANDLE / 2.0) / f64::from(ed.view.zoom.max(0.01));
+        let resize = handle_at(&p.items, ed.panel_pick, at, reach);
+        ed.panel_resize = resize.is_some();
+        ed.panel_pick = resize.map(|(i, _)| i).or_else(|| item_at(&p.items, at));
         if let Some(item) = ed.panel_pick.and_then(|i| p.items.get(i)) {
-            let a = item.anchor();
+            let a = resize.map_or_else(|| item.anchor(), |(_, h)| h);
             ed.panel_drag = Some((Point::new(at.x - a.x, at.y - a.y), None, item.clone()));
         }
     }
@@ -256,6 +286,12 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
     if resp.clicked_by(egui::PointerButton::Primary) {
         ed.panel_pick = pointer.and_then(|at| item_at(&p.items, at));
     }
+    // A right-click picks the item under the pointer too, before the arrow keys below act on the
+    // pick; a right-click drag still pans the view. Not during a drag: the dragged item stays
+    // the picked one, so Escape and the release still apply to it.
+    if resp.secondary_clicked() && ed.panel_drag.is_none() {
+        ed.panel_pick = pointer.and_then(|at| item_at(&p.items, at));
+    }
     if let (Some((grab, checkpoint, start)), Some(i), Some(at)) = (ed.panel_drag.clone(), ed.panel_pick, pointer)
         && resp.dragged_by(egui::PointerButton::Primary)
     {
@@ -279,8 +315,26 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
                 to.y = y - height / 2.0;
             }
         }
+        // A rail's length or a duct's size changes by its handle, kept on the plate, a rail
+        // never shorter than the devices on it.
+        if ed.panel_resize {
+            let mut resized = p.clone();
+            if resized.resize_item(i, to) {
+                if checkpoint.is_none() {
+                    open.checkpoint();
+                    ed.panel_drag = Some((grab, Some(open.history_count()), start.clone()));
+                }
+                if let (Some(slot), Some(item)) = (
+                    open.project.panels.get_mut(panel).and_then(|x| x.items.get_mut(i)),
+                    resized.items.get(i),
+                ) {
+                    *slot = item.clone();
+                    open.edited();
+                }
+            }
+        }
         // A rail or a duct moves whole, kept on the plate.
-        if let Some(item) = p.items.get(i).filter(|it| !matches!(it, PanelItem::Device { .. })) {
+        else if let Some(item) = p.items.get(i).filter(|it| !matches!(it, PanelItem::Device { .. })) {
             let mut moved = item.clone();
             moved.move_on_plate(to, pw, ph);
             if moved != *item {
@@ -331,6 +385,22 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
         }
     }
     let p = open.project.panels.get(panel).cloned().unwrap_or(p);
+    // The right-click menu: the toolbar's edits for the picked item, as on a schematic page.
+    let actions = ed.panel_pick.and_then(|i| p.items.get(i)).map_or(&[][..], menu_actions);
+    if !actions.is_empty() {
+        resp.context_menu(|ui| {
+            for &a in actions {
+                let info = a.info();
+                if ui
+                    .add(egui::Button::new(info.label).shortcut_text(info.shortcut))
+                    .clicked()
+                {
+                    ed.menu_action = Some(a);
+                    ui.close_menu();
+                }
+            }
+        });
+    }
 
     // The plate.
     let plate = Rect::from_two_pos(xf.s(Point::new(0.0, 0.0)), xf.s(Point::new(pw, ph)));
@@ -466,6 +536,11 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
             }
         }
     }
+    // The picked rail's or duct's resize handle, over the devices: a press
+    // inside it resizes even where a device covers the rail's end.
+    if let Some(h) = ed.panel_pick.and_then(|i| p.items.get(i)).and_then(handle) {
+        painter.rect_filled(Rect::from_center_size(xf.s(h), Vec2::splat(HANDLE)), 1.0, t.selection);
+    }
     // The picked item's full tag or kind, size and place, at the bottom of the view.
     let info = ed.panel_pick.and_then(|i| p.items.get(i)).map(|item| match item {
         PanelItem::Device {
@@ -481,13 +556,13 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
             at.y
         ),
         PanelItem::Rail { at, length } => format!(
-            "DIN rail  ·  {length:.0} mm long at x {:.0}, y {:.0}  ·  Delete to take it off the plate",
+            "DIN rail  ·  {length:.0} mm long at x {:.0}, y {:.0}  ·  drag to move, drag its right end to change its length (not shorter than the devices on it), Delete to take it off the plate",
             at.x, at.y
         ),
         PanelItem::Duct { .. } => {
             let (a, b) = item.bounds();
             format!(
-                "Wire duct  ·  {:.0} x {:.0} mm at x {:.0}, y {:.0}  ·  Delete to take it off the plate",
+                "Wire duct  ·  {:.0} x {:.0} mm at x {:.0}, y {:.0}  ·  drag to move, drag its bottom-right corner to resize, Delete to take it off the plate",
                 b.x - a.x,
                 b.y - a.y,
                 a.x,
@@ -508,6 +583,17 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
     );
 }
 
+/// The right-click menu's commands for a picked panel item: a device turns and comes off the
+/// plate, a rail or duct only comes off. The picked one is left in [`Editor::menu_action`] for
+/// the app to run, as its toolbar button would be.
+fn menu_actions(item: &PanelItem) -> &'static [crate::actions::Action] {
+    use crate::actions::Action;
+    match item {
+        PanelItem::Device { .. } => &[Action::Rotate, Action::Delete],
+        PanelItem::Rail { .. } | PanelItem::Duct { .. } => &[Action::Delete],
+    }
+}
+
 /// ", turned 90°" for a turned device, nothing for an upright one.
 pub fn turned_note(rotation: wc_core::geom::Rotation) -> String {
     use wc_core::geom::Rotation;
@@ -522,6 +608,144 @@ pub fn turned_note(rotation: wc_core::geom::Rotation) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness::{Harness, device_pos, key, primary};
+
+    /// What the tests that run the panel view in egui frames share (#977).
+    mod harness {
+        use std::cell::Cell;
+
+        use super::*;
+
+        /// Runs the panel view in egui frames, one context for all of them, and finds where a
+        /// plate position is on screen.
+        pub(super) struct Harness {
+            ctx: egui::Context,
+            screen: Option<Vec2>,
+            margin: bool,
+            panel: usize,
+            snap: f64,
+            keyboard_edits: bool,
+            /// The top-left corner of the view's area in the last frame.
+            corner: Cell<egui::Pos2>,
+        }
+
+        /// What one frame gives back.
+        pub(super) struct Ran {
+            pub out: egui::FullOutput,
+            /// How many input events are left after the panel view: the ones it did not use up.
+            pub left: usize,
+        }
+
+        impl Harness {
+            /// Panel 0 in an 800 x 600 point window, the view filling it, snapping to 5 mm, with
+            /// keyboard edits allowed.
+            pub fn new() -> Self {
+                let ctx = egui::Context::default();
+                crate::theme::install_fonts(&ctx);
+                Self {
+                    ctx,
+                    screen: Some(Vec2::new(800.0, 600.0)),
+                    margin: false,
+                    panel: 0,
+                    snap: 5.0,
+                    keyboard_edits: true,
+                    corner: Cell::new(egui::Pos2::ZERO),
+                }
+            }
+
+            /// The window's size; `None` leaves it to egui.
+            pub fn screen(mut self, size: Option<Vec2>) -> Self {
+                self.screen = size;
+                self
+            }
+
+            /// The view sits inside the central panel's usual margin.
+            pub fn margin(mut self) -> Self {
+                self.margin = true;
+                self
+            }
+
+            pub fn panel(mut self, panel: usize) -> Self {
+                self.panel = panel;
+                self
+            }
+
+            pub fn snap(mut self, step: f64) -> Self {
+                self.snap = step;
+                self
+            }
+
+            /// Whether keyboard edits are allowed (they are not while a dialog is open).
+            pub fn keyboard_edits(mut self, on: bool) -> Self {
+                self.keyboard_edits = on;
+                self
+            }
+
+            /// One frame with `events`.
+            pub fn frame(&self, o: &mut Open, ed: &mut Editor, events: Vec<egui::Event>) -> Ran {
+                self.frame_at(o, ed, None, events)
+            }
+
+            /// One frame with `events`, at `time` seconds when given.
+            pub fn frame_at(&self, o: &mut Open, ed: &mut Editor, time: Option<f64>, events: Vec<egui::Event>) -> Ran {
+                let input = egui::RawInput {
+                    screen_rect: self.screen.map(|size| Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    time,
+                    events,
+                    ..Default::default()
+                };
+                let mut left = 0;
+                let out = self.ctx.run(input, |ctx| {
+                    let central = egui::CentralPanel::default();
+                    let central = if self.margin {
+                        central
+                    } else {
+                        central.frame(egui::Frame::NONE)
+                    };
+                    central.show(ctx, |ui| {
+                        self.corner.set(ui.cursor().min);
+                        show(ui, o, ed, self.panel, self.snap, self.keyboard_edits);
+                    });
+                    left = ctx.input(|i| i.events.len());
+                });
+                Ran { out, left }
+            }
+
+            /// Where plate position `q` (millimetres) is on screen, as of the last frame.
+            pub fn to_screen(&self, ed: &Editor, q: Point) -> egui::Pos2 {
+                self.corner.get() + ed.view.offset + Vec2::new(q.x as f32, q.y as f32) * ed.view.zoom
+            }
+        }
+
+        /// The primary button pressed or let go at `pos`.
+        pub fn primary(pos: egui::Pos2, pressed: bool) -> egui::Event {
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }
+        }
+
+        /// `key` pressed, with no modifiers.
+        pub fn key(key: egui::Key) -> egui::Event {
+            egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }
+        }
+
+        /// Where device `i` of panel 0 is.
+        pub fn device_pos(o: &Open, i: usize) -> Point {
+            match o.project.panels[0].items.get(i) {
+                Some(PanelItem::Device { at, .. }) => *at,
+                _ => unreachable!("the device is there"),
+            }
+        }
+    }
 
     /// In the panel view Zoom out uses the panel view's limits, below the schematic's, and
     /// keeps the centre of the view in place (#826).
@@ -613,46 +837,23 @@ mod tests {
         let panel = o.project.panels.len() - 1;
         assert!(!o.can_undo());
         let mut ed = Editor::default();
-        let ctx = egui::Context::default();
-        crate::theme::install_fonts(&ctx);
-        let frame = |o: &mut Open, ed: &mut Editor, events: Vec<egui::Event>| {
-            let input = egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 600.0))),
-                events,
-                ..Default::default()
-            };
-            let _ = ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| show(ui, o, ed, panel, 0.0, true));
-            });
-        };
+        let h = Harness::new().margin().panel(panel).snap(0.0);
         // Find where the device's middle (10, 10 mm) is on screen.
-        let probe = egui::pos2(400.0, 300.0);
-        frame(&mut o, &mut ed, vec![egui::Event::PointerMoved(probe)]);
-        frame(&mut o, &mut ed, vec![egui::Event::PointerMoved(probe)]);
-        let Some(c) = ed.cursor else {
-            unreachable!("the pointer is over the plate")
-        };
-        let z = ed.view.zoom;
-        let start = probe + Vec2::new((10.0 - c.x) as f32 * z, (10.0 - c.y) as f32 * z);
-        let button = |at: egui::Pos2, pressed: bool| egui::Event::PointerButton {
-            pos: at,
-            button: egui::PointerButton::Primary,
-            pressed,
-            modifiers: Default::default(),
-        };
-        frame(
+        h.frame(&mut o, &mut ed, Vec::new());
+        let start = h.to_screen(&ed, Point::new(10.0, 10.0));
+        h.frame(
             &mut o,
             &mut ed,
-            vec![egui::Event::PointerMoved(start), button(start, true)],
+            vec![egui::Event::PointerMoved(start), primary(start, true)],
         );
         // Drag left, past the plate's left edge, in 10 px steps.
         let mut at = start;
         for _ in 0..4 {
             at.x -= 10.0;
-            frame(&mut o, &mut ed, vec![egui::Event::PointerMoved(at)]);
+            h.frame(&mut o, &mut ed, vec![egui::Event::PointerMoved(at)]);
         }
-        frame(&mut o, &mut ed, vec![button(at, false)]);
-        frame(&mut o, &mut ed, Vec::new());
+        h.frame(&mut o, &mut ed, vec![primary(at, false)]);
+        h.frame(&mut o, &mut ed, Vec::new());
         assert!(matches!(
             o.project.panels[panel].items[0],
             PanelItem::Device { at, .. } if at == Point::new(0.0, 0.0)
@@ -757,44 +958,26 @@ mod tests {
         let mut ed = Editor::default();
         ed.panel = Some(0);
         ed.panel_pick = Some(0);
-        let ctx = egui::Context::default();
-        crate::theme::install_fonts(&ctx);
-        let key = |key| egui::Event::Key {
-            key,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::NONE,
-        };
-        let input = egui::RawInput {
-            events: vec![
+        let h = Harness::new().screen(None).margin().snap(2.5);
+        let steps = open.undo_steps();
+        let ran = h.frame(
+            &mut open,
+            &mut ed,
+            vec![
                 key(egui::Key::ArrowRight),
                 key(egui::Key::ArrowRight),
                 key(egui::Key::ArrowUp),
             ],
-            ..Default::default()
-        };
-        let steps = open.undo_steps();
-        let mut left = 0;
-        let _ = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| show(ui, &mut open, &mut ed, 0, 2.5, true));
-            // The keys are used up: nothing after the panel view sees them.
-            left = ctx.input(|i| i.events.len());
-        });
-        assert_eq!(left, 0);
-        let Some(PanelItem::Device { at, .. }) = open.project.panels[0].items.first() else {
-            unreachable!("the device is there")
-        };
-        assert_eq!(*at, Point::new(105.0, 97.5));
+        );
+        // The keys are used up: nothing after the panel view sees them.
+        assert_eq!(ran.left, 0);
+        assert_eq!(device_pos(&open, 0), Point::new(105.0, 97.5));
         // One undo step a press.
         assert_eq!(open.undo_steps(), steps + 3);
         for _ in 0..3 {
             assert!(open.undo());
         }
-        let Some(PanelItem::Device { at, .. }) = open.project.panels[0].items.first() else {
-            unreachable!("the device is there")
-        };
-        assert_eq!(*at, Point::new(100.0, 100.0));
+        assert_eq!(device_pos(&open, 0), Point::new(100.0, 100.0));
     }
 
     #[test]
@@ -816,28 +999,15 @@ mod tests {
         let mut ed = Editor::default();
         ed.panel = Some(0);
         ed.panel_pick = Some(0);
-        let ctx = egui::Context::default();
-        crate::theme::install_fonts(&ctx);
-        let key = |key| egui::Event::Key {
-            key,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::NONE,
-        };
-        let input = egui::RawInput {
-            events: vec![key(egui::Key::ArrowRight), key(egui::Key::ArrowLeft)],
-            ..Default::default()
-        };
+        let h = Harness::new().screen(None).margin();
         let steps = open.undo_steps();
-        let _ = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| show(ui, &mut open, &mut ed, 0, 5.0, true));
-        });
+        h.frame(
+            &mut open,
+            &mut ed,
+            vec![key(egui::Key::ArrowRight), key(egui::Key::ArrowLeft)],
+        );
         // Right moves it off the edge, then Left brings it back: two undo steps.
-        let Some(PanelItem::Device { at, .. }) = open.project.panels[0].items.first() else {
-            unreachable!("the device is there")
-        };
-        assert_eq!(*at, Point::new(0.0, 0.0));
+        assert_eq!(device_pos(&open, 0), Point::new(0.0, 0.0));
         assert_eq!(open.undo_steps(), steps + 2);
     }
 
@@ -860,31 +1030,13 @@ mod tests {
         let mut ed = Editor::default();
         ed.panel = Some(0);
         ed.panel_pick = Some(0);
-        let ctx = egui::Context::default();
-        crate::theme::install_fonts(&ctx);
-        let input = egui::RawInput {
-            events: vec![egui::Event::Key {
-                key: egui::Key::ArrowRight,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: egui::Modifiers::NONE,
-            }],
-            ..Default::default()
-        };
+        // A dialog is open: keyboard edits are not allowed.
+        let h = Harness::new().screen(None).margin().keyboard_edits(false);
         let steps = open.undo_steps();
-        let mut left = 0;
-        let _ = ctx.run(input, |ctx| {
-            // A dialog is open: keyboard edits are not allowed.
-            egui::CentralPanel::default().show(ctx, |ui| show(ui, &mut open, &mut ed, 0, 5.0, false));
-            left = ctx.input(|i| i.events.len());
-        });
+        let ran = h.frame(&mut open, &mut ed, vec![key(egui::Key::ArrowRight)]);
         // The key is not used up, and the device and the undo history stay as they were.
-        assert_eq!(left, 1);
-        let Some(PanelItem::Device { at, .. }) = open.project.panels[0].items.first() else {
-            unreachable!("the device is there")
-        };
-        assert_eq!(*at, Point::new(100.0, 100.0));
+        assert_eq!(ran.left, 1);
+        assert_eq!(device_pos(&open, 0), Point::new(100.0, 100.0));
         assert_eq!(open.undo_steps(), steps);
     }
 
@@ -924,67 +1076,31 @@ mod tests {
         let mut ed = Editor::default();
         ed.panel = Some(0);
         ed.view.fit = true;
-        let ctx = egui::Context::default();
-        crate::theme::install_fonts(&ctx);
-        let frame = |open: &mut Open, ed: &mut Editor, time: f64, events: Vec<egui::Event>| {
-            let input = egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1000.0, 700.0))),
-                time: Some(time),
-                events,
-                ..Default::default()
-            };
-            let _ = ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| show(ui, open, ed, 0, 1.0, true));
-            });
-        };
-        let button = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
-            pos,
-            button: egui::PointerButton::Primary,
-            pressed,
-            modifiers: egui::Modifiers::NONE,
-        };
-        let device_at_now = |open: &Open| match open.project.panels[0].items.first() {
-            Some(PanelItem::Device { at, .. }) => *at,
-            _ => unreachable!("the device is there"),
-        };
+        let h = Harness::new().screen(Some(Vec2::new(1000.0, 700.0))).margin().snap(1.0);
         // Lay the view out, then find where the device's middle is on screen.
-        frame(&mut open, &mut ed, 0.5, vec![]);
-        let probe = egui::pos2(500.0, 350.0);
-        frame(&mut open, &mut ed, 0.6, vec![egui::Event::PointerMoved(probe)]);
-        let Some(seen) = ed.cursor else {
-            unreachable!("the pointer is over the plate")
-        };
-        let zoom = ed.view.zoom;
-        let on_screen = |m: Point| probe + Vec2::new(((m.x - seen.x) as f32) * zoom, ((m.y - seen.y) as f32) * zoom);
-        let a = on_screen(Point::new(120.0, 130.0));
+        h.frame_at(&mut open, &mut ed, Some(0.5), vec![]);
+        let a = h.to_screen(&ed, Point::new(120.0, 130.0));
         let steps_before = open.undo_steps();
-        frame(&mut open, &mut ed, 1.0, vec![egui::Event::PointerMoved(a)]);
-        frame(&mut open, &mut ed, 1.01, vec![button(a, true)]);
+        h.frame_at(&mut open, &mut ed, Some(1.0), vec![egui::Event::PointerMoved(a)]);
+        h.frame_at(&mut open, &mut ed, Some(1.01), vec![primary(a, true)]);
         for (k, t) in [(1.0, 1.05), (2.0, 1.1), (3.0, 1.15)] {
-            let to = on_screen(Point::new(120.0 + 10.0 * k, 130.0));
-            frame(&mut open, &mut ed, t, vec![egui::Event::PointerMoved(to)]);
+            let to = h.to_screen(&ed, Point::new(120.0 + 10.0 * k, 130.0));
+            h.frame_at(&mut open, &mut ed, Some(t), vec![egui::Event::PointerMoved(to)]);
         }
-        assert_ne!(device_at_now(&open), start, "the drag moves the device");
+        assert_ne!(device_pos(&open, 0), start, "the drag moves the device");
         assert_eq!(open.undo_steps(), steps_before + 1);
 
-        let escape = egui::Event::Key {
-            key: egui::Key::Escape,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::NONE,
-        };
-        frame(&mut open, &mut ed, 1.2, vec![escape]);
-        assert_eq!(device_at_now(&open), start, "Escape puts the device back");
+        h.frame_at(&mut open, &mut ed, Some(1.2), vec![key(egui::Key::Escape)]);
+        assert_eq!(device_pos(&open, 0), start, "Escape puts the device back");
         assert_eq!(open.undo_steps(), steps_before, "and drops the drag's undo step");
         assert!(ed.panel_drag.is_none());
 
         // Moving on and letting go changes nothing.
-        let far = on_screen(Point::new(200.0, 160.0));
-        frame(&mut open, &mut ed, 1.25, vec![egui::Event::PointerMoved(far)]);
-        frame(&mut open, &mut ed, 1.3, vec![button(far, false)]);
-        frame(&mut open, &mut ed, 1.35, vec![]);
-        assert_eq!(device_at_now(&open), start);
+        let far = h.to_screen(&ed, Point::new(200.0, 160.0));
+        h.frame_at(&mut open, &mut ed, Some(1.25), vec![egui::Event::PointerMoved(far)]);
+        h.frame_at(&mut open, &mut ed, Some(1.3), vec![primary(far, false)]);
+        h.frame_at(&mut open, &mut ed, Some(1.35), vec![]);
+        assert_eq!(device_pos(&open, 0), start);
         assert_eq!(open.undo_steps(), steps_before);
     }
 
@@ -1011,46 +1127,17 @@ mod tests {
         let mut ed = Editor::default();
         ed.panel = Some(0);
         ed.view.fit = true;
-        let ctx = egui::Context::default();
-        crate::theme::install_fonts(&ctx);
-        let frame = |open: &mut Open, ed: &mut Editor, time: f64, events: Vec<egui::Event>| {
-            let input = egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1000.0, 700.0))),
-                time: Some(time),
-                events,
-                ..Default::default()
-            };
-            let _ = ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| show(ui, open, ed, 0, 1.0, true));
-            });
-        };
-        let device_at_now = |open: &Open| match open.project.panels[0].items.first() {
-            Some(PanelItem::Device { at, .. }) => *at,
-            _ => unreachable!("the device is there"),
-        };
-        frame(&mut open, &mut ed, 0.5, vec![]);
-        let probe = egui::pos2(500.0, 350.0);
-        frame(&mut open, &mut ed, 0.6, vec![egui::Event::PointerMoved(probe)]);
-        let Some(seen) = ed.cursor else {
-            unreachable!("the pointer is over the plate")
-        };
-        let zoom = ed.view.zoom;
-        let on_screen = |m: Point| probe + Vec2::new(((m.x - seen.x) as f32) * zoom, ((m.y - seen.y) as f32) * zoom);
-        let a = on_screen(Point::new(120.0, 130.0));
+        let h = Harness::new().screen(Some(Vec2::new(1000.0, 700.0))).margin().snap(1.0);
+        h.frame_at(&mut open, &mut ed, Some(0.5), vec![]);
+        let a = h.to_screen(&ed, Point::new(120.0, 130.0));
         let steps_before = open.undo_steps();
-        frame(&mut open, &mut ed, 1.0, vec![egui::Event::PointerMoved(a)]);
-        let press = egui::Event::PointerButton {
-            pos: a,
-            button: egui::PointerButton::Primary,
-            pressed: true,
-            modifiers: egui::Modifiers::NONE,
-        };
-        frame(&mut open, &mut ed, 1.01, vec![press]);
+        h.frame_at(&mut open, &mut ed, Some(1.0), vec![egui::Event::PointerMoved(a)]);
+        h.frame_at(&mut open, &mut ed, Some(1.01), vec![primary(a, true)]);
         for (k, t) in [(1.0, 1.05), (2.0, 1.1), (3.0, 1.15), (0.0, 1.2)] {
-            let to = on_screen(Point::new(120.0 + 10.0 * k, 130.0));
-            frame(&mut open, &mut ed, t, vec![egui::Event::PointerMoved(to)]);
+            let to = h.to_screen(&ed, Point::new(120.0 + 10.0 * k, 130.0));
+            h.frame_at(&mut open, &mut ed, Some(t), vec![egui::Event::PointerMoved(to)]);
         }
-        assert_eq!(device_at_now(&open), start, "dragged back to its start");
+        assert_eq!(device_pos(&open, 0), start, "dragged back to its start");
         assert_eq!(open.undo_steps(), steps_before + 1);
 
         let file = open.dir.join(wc_core::translate::TRANSLATIONS_FILE);
@@ -1059,16 +1146,9 @@ mod tests {
         assert_eq!(open.undo_steps(), steps_before + 2, "the translation is an undo step");
         assert_eq!(open.before_last_change(), Some(&open.project));
 
-        let escape = egui::Event::Key {
-            key: egui::Key::Escape,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::NONE,
-        };
-        frame(&mut open, &mut ed, 1.25, vec![escape]);
+        h.frame_at(&mut open, &mut ed, Some(1.25), vec![key(egui::Key::Escape)]);
         assert!(ed.panel_drag.is_none());
-        assert_eq!(device_at_now(&open), start);
+        assert_eq!(device_pos(&open, 0), start);
         assert_eq!(open.undo_steps(), steps_before + 2, "Escape drops no step");
         assert!(file.exists());
         // Undo takes back the translation, not the drag.
@@ -1106,41 +1186,16 @@ mod tests {
 
     /// Drags from `from` to `to` (plate millimetres) with the primary button, a frame per step.
     fn drag_on_plate(o: &mut Open, ed: &mut Editor, from: Point, to: Point) {
-        let ctx = egui::Context::default();
-        crate::theme::install_fonts(&ctx);
-        let frame = |o: &mut Open, ed: &mut Editor, events: Vec<egui::Event>| {
-            let input = egui::RawInput {
-                events,
-                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 600.0))),
-                ..Default::default()
-            };
-            let _ = ctx.run(input, |ctx| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| show(ui, o, ed, 0, 5.0, true));
-            });
-        };
-        frame(o, ed, Vec::new());
-        let screen = |ed: &Editor, q: Point| {
-            egui::pos2(
-                ed.view.offset.x + q.x as f32 * ed.view.zoom,
-                ed.view.offset.y + q.y as f32 * ed.view.zoom,
-            )
-        };
-        let button = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
-            pos,
-            button: egui::PointerButton::Primary,
-            pressed,
-            modifiers: Default::default(),
-        };
-        let (a, b) = (screen(ed, from), screen(ed, to));
-        frame(o, ed, vec![egui::Event::PointerMoved(a), button(a, true)]);
+        let h = Harness::new();
+        h.frame(o, ed, Vec::new());
+        let (a, b) = (h.to_screen(ed, from), h.to_screen(ed, to));
+        h.frame(o, ed, vec![egui::Event::PointerMoved(a), primary(a, true)]);
         for k in 1..=4 {
             let q = a + (b - a) * (k as f32 / 4.0);
-            frame(o, ed, vec![egui::Event::PointerMoved(q)]);
+            h.frame(o, ed, vec![egui::Event::PointerMoved(q)]);
         }
-        frame(o, ed, vec![button(b, false)]);
-        frame(o, ed, Vec::new());
+        h.frame(o, ed, vec![primary(b, false)]);
+        h.frame(o, ed, Vec::new());
     }
 
     fn plate_with_rail_and_duct() -> (tempfile::TempDir, Open, Editor) {
@@ -1194,35 +1249,140 @@ mod tests {
         );
     }
 
-    /// One frame of the panel view, 800 x 600 points, snapping to 5 mm.
-    fn plate_frame(ctx: &egui::Context, o: &mut Open, ed: &mut Editor, events: Vec<egui::Event>) {
-        let input = egui::RawInput {
-            events,
-            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 600.0))),
-            ..Default::default()
-        };
-        let _ = ctx.run(input, |ctx| {
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE)
-                .show(ctx, |ui| show(ui, o, ed, 0, 5.0, true));
+    /// A rail's right end dragged changes its length, snapped, as one undo step, and stops
+    /// at the plate's edge (#983).
+    #[test]
+    fn dragging_a_rails_right_end_changes_its_length_in_one_undo_step() {
+        let (_tmp, mut o, mut ed) = plate_with_rail_and_duct();
+        let mark = o.undo_mark();
+        drag_on_plate(&mut o, &mut ed, Point::new(300.0, 101.0), Point::new(452.0, 131.0));
+        assert_eq!(ed.panel_pick, Some(1));
+        let rail = |o: &Open| o.project.panels[0].items[1].clone();
+        assert_eq!(
+            rail(&o),
+            PanelItem::Rail {
+                at: Point::new(100.0, 100.0),
+                length: 350.0,
+            }
+        );
+        drag_on_plate(&mut o, &mut ed, Point::new(450.0, 100.0), Point::new(700.0, 100.0));
+        assert_eq!(rail(&o).bounds().1.x, 600.0, "kept on the plate");
+        assert!(o.undo());
+        assert!(o.undo());
+        assert_eq!(o.undo_mark(), mark);
+        assert_eq!(rail(&o).bounds().1.x, 300.0);
+    }
+
+    /// A rail's right end dragged in past a device on it stops at the device (#983).
+    #[test]
+    fn a_rail_is_not_shortened_past_the_device_on_it() {
+        let (_tmp, mut o, mut ed) = plate_with_rail_and_duct();
+        o.project.panels[0].items.push(PanelItem::Device {
+            tag: wc_core::DeviceTag::parse("-K1").unwrap_or_default(),
+            at: Point::new(160.0, 55.0),
+            width: 50.0,
+            height: 90.0,
+            rotation: wc_core::geom::Rotation::R0,
         });
+        drag_on_plate(&mut o, &mut ed, Point::new(300.0, 100.0), Point::new(120.0, 100.0));
+        assert_eq!(o.project.panels[0].items[1].bounds().1.x, 210.0);
+        assert_eq!(o.project.panels[0].items[2].anchor(), Point::new(160.0, 55.0));
     }
 
-    /// Where plate position `q` is on screen in [`plate_frame`].
-    fn on_plate_screen(ed: &Editor, q: Point) -> egui::Pos2 {
-        egui::pos2(
-            ed.view.offset.x + q.x as f32 * ed.view.zoom,
-            ed.view.offset.y + q.y as f32 * ed.view.zoom,
-        )
+    /// A rail with a device at its right end, picked: `(tmp, open, editor)`.
+    fn rail_with_device_at_its_end() -> (tempfile::TempDir, Open, Editor) {
+        let (tmp, mut o, mut ed) = plate_with_rail_and_duct();
+        o.project.panels[0].items.push(PanelItem::Device {
+            tag: wc_core::DeviceTag::parse("-K1").unwrap_or_default(),
+            at: Point::new(270.0, 55.0),
+            width: 30.0,
+            height: 90.0,
+            rotation: wc_core::geom::Rotation::R0,
+        });
+        ed.panel_pick = Some(1);
+        (tmp, o, ed)
     }
 
-    fn primary(pos: egui::Pos2, pressed: bool) -> egui::Event {
-        egui::Event::PointerButton {
-            pos,
-            button: egui::PointerButton::Primary,
-            pressed,
-            modifiers: Default::default(),
-        }
+    /// With the rail picked, a press on a device at its right end but outside the drawn
+    /// handle moves the device, not the rail's end (#983).
+    #[test]
+    fn a_press_on_a_device_beside_the_handle_moves_the_device() {
+        let (_tmp, mut o, mut ed) = rail_with_device_at_its_end();
+        drag_on_plate(&mut o, &mut ed, Point::new(295.0, 80.0), Point::new(255.0, 30.0));
+        assert_eq!(ed.panel_pick, Some(2));
+        assert_ne!(
+            o.project.panels[0].items[2].anchor(),
+            Point::new(270.0, 55.0),
+            "the device moved"
+        );
+        assert_eq!(
+            o.project.panels[0].items[1].bounds().1.x,
+            300.0,
+            "the rail's length is unchanged"
+        );
+    }
+
+    /// With the rail picked, a press inside the drawn handle resizes the rail even with a
+    /// device over its end; it stops no shorter than the device (#983).
+    #[test]
+    fn a_press_inside_the_handle_resizes_the_rail() {
+        let (_tmp, mut o, mut ed) = rail_with_device_at_its_end();
+        drag_on_plate(&mut o, &mut ed, Point::new(299.0, 101.0), Point::new(400.0, 101.0));
+        assert_eq!(ed.panel_pick, Some(1));
+        assert_eq!(o.project.panels[0].items[1].bounds().1.x, 400.0);
+        assert_eq!(
+            o.project.panels[0].items[2].anchor(),
+            Point::new(270.0, 55.0),
+            "the device stays"
+        );
+    }
+
+    /// A duct's bottom-right corner dragged resizes it, its top-left corner staying (#983).
+    #[test]
+    fn dragging_a_ducts_corner_resizes_it() {
+        let (_tmp, mut o, mut ed) = plate_with_rail_and_duct();
+        drag_on_plate(&mut o, &mut ed, Point::new(598.0, 358.0), Point::new(500.0, 380.0));
+        assert_eq!(ed.panel_pick, Some(0));
+        assert_eq!(
+            o.project.panels[0].items[0].bounds(),
+            (Point::new(0.0, 300.0), Point::new(500.0, 380.0))
+        );
+    }
+
+    /// The picked rail's handle is painted after the devices, so a device over the rail's
+    /// right end does not hide it (#983).
+    #[test]
+    fn the_resize_handle_is_painted_over_a_device_at_the_rails_end() {
+        let (_tmp, mut o, mut ed) = plate_with_rail_and_duct();
+        o.project.panels[0].items.push(PanelItem::Device {
+            tag: wc_core::DeviceTag::parse("-K1").unwrap_or_default(),
+            at: Point::new(280.0, 55.0),
+            width: 50.0,
+            height: 90.0,
+            rotation: wc_core::geom::Rotation::R0,
+        });
+        ed.panel_pick = Some(1);
+        let h = Harness::new();
+        h.frame(&mut o, &mut ed, Vec::new());
+        let out = h.frame(&mut o, &mut ed, Vec::new()).out;
+        let at = |want: Rect| {
+            out.shapes.iter().position(|c| {
+                matches!(&c.shape, egui::Shape::Rect(r) if (r.rect.min - want.min).length() < 0.01
+                    && (r.rect.max - want.max).length() < 0.01)
+            })
+        };
+        let handle = Rect::from_center_size(h.to_screen(&ed, Point::new(300.0, 100.0)), Vec2::splat(HANDLE));
+        let device = Rect::from_two_pos(
+            h.to_screen(&ed, Point::new(280.0, 55.0)),
+            h.to_screen(&ed, Point::new(330.0, 145.0)),
+        );
+        let (Some(handle), Some(device)) = (at(handle), at(device)) else {
+            unreachable!("the handle and the device are painted")
+        };
+        assert!(
+            handle > device,
+            "the handle ({handle}) comes after the device ({device})"
+        );
     }
 
     /// A duct with corners that are not whole millimetres, dragged and then Escape: it is
@@ -1236,22 +1396,16 @@ mod tests {
         };
         o.project.panels[0].items[0] = duct.clone();
         let steps = o.undo_steps();
-        let ctx = egui::Context::default();
-        crate::theme::install_fonts(&ctx);
-        plate_frame(&ctx, &mut o, &mut ed, Vec::new());
+        let h = Harness::new();
+        h.frame(&mut o, &mut ed, Vec::new());
         let (a, b) = (
-            on_plate_screen(&ed, Point::new(30.0, 330.0)),
-            on_plate_screen(&ed, Point::new(130.0, 330.0)),
+            h.to_screen(&ed, Point::new(30.0, 330.0)),
+            h.to_screen(&ed, Point::new(130.0, 330.0)),
         );
-        plate_frame(
-            &ctx,
-            &mut o,
-            &mut ed,
-            vec![egui::Event::PointerMoved(a), primary(a, true)],
-        );
+        h.frame(&mut o, &mut ed, vec![egui::Event::PointerMoved(a), primary(a, true)]);
         for k in 1..=4 {
             let q = a + (b - a) * (k as f32 / 4.0);
-            plate_frame(&ctx, &mut o, &mut ed, vec![egui::Event::PointerMoved(q)]);
+            h.frame(&mut o, &mut ed, vec![egui::Event::PointerMoved(q)]);
         }
         assert_eq!(
             o.project.panels[0].items[0].anchor(),
@@ -1259,16 +1413,9 @@ mod tests {
             "dragged"
         );
         assert_eq!(o.undo_steps(), steps + 1);
-        let escape = egui::Event::Key {
-            key: egui::Key::Escape,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::NONE,
-        };
-        plate_frame(&ctx, &mut o, &mut ed, vec![escape]);
-        plate_frame(&ctx, &mut o, &mut ed, vec![primary(b, false)]);
-        plate_frame(&ctx, &mut o, &mut ed, Vec::new());
+        h.frame(&mut o, &mut ed, vec![key(egui::Key::Escape)]);
+        h.frame(&mut o, &mut ed, vec![primary(b, false)]);
+        h.frame(&mut o, &mut ed, Vec::new());
         assert_eq!(o.project.panels[0].items[0], duct, "back exactly as it was");
         assert_eq!(o.undo_steps(), steps, "and no undo step is left");
     }
@@ -1280,19 +1427,13 @@ mod tests {
     fn drag_ends_when_another_step_comes(mut o: Open, mut ed: Editor, i: usize, from: Point, to: Point) {
         let before = o.project.panels[0].items[i].clone();
         let steps = o.undo_steps();
-        let ctx = egui::Context::default();
-        crate::theme::install_fonts(&ctx);
-        plate_frame(&ctx, &mut o, &mut ed, Vec::new());
-        let (a, b) = (on_plate_screen(&ed, from), on_plate_screen(&ed, to));
-        plate_frame(
-            &ctx,
-            &mut o,
-            &mut ed,
-            vec![egui::Event::PointerMoved(a), primary(a, true)],
-        );
+        let h = Harness::new();
+        h.frame(&mut o, &mut ed, Vec::new());
+        let (a, b) = (h.to_screen(&ed, from), h.to_screen(&ed, to));
+        h.frame(&mut o, &mut ed, vec![egui::Event::PointerMoved(a), primary(a, true)]);
         for k in 1..=2 {
             let q = a + (b - a) * (k as f32 / 4.0);
-            plate_frame(&ctx, &mut o, &mut ed, vec![egui::Event::PointerMoved(q)]);
+            h.frame(&mut o, &mut ed, vec![egui::Event::PointerMoved(q)]);
         }
         let halfway = o.project.panels[0].items[i].clone();
         assert_ne!(halfway, before, "the drag moves it");
@@ -1305,10 +1446,10 @@ mod tests {
 
         for k in 3..=4 {
             let q = a + (b - a) * (k as f32 / 4.0);
-            plate_frame(&ctx, &mut o, &mut ed, vec![egui::Event::PointerMoved(q)]);
+            h.frame(&mut o, &mut ed, vec![egui::Event::PointerMoved(q)]);
         }
-        plate_frame(&ctx, &mut o, &mut ed, vec![primary(b, false)]);
-        plate_frame(&ctx, &mut o, &mut ed, Vec::new());
+        h.frame(&mut o, &mut ed, vec![primary(b, false)]);
+        h.frame(&mut o, &mut ed, Vec::new());
         assert!(ed.panel_drag.is_none());
         assert_eq!(o.project.panels[0].items[i], halfway, "the drag stopped where it was");
         assert_eq!(o.undo_steps(), steps + 2);
@@ -1340,5 +1481,150 @@ mod tests {
             rotation: wc_core::geom::Rotation::R0,
         });
         drag_ends_when_another_step_comes(o, ed, 2, Point::new(420.0, 180.0), Point::new(520.0, 180.0));
+    }
+
+    /// The secondary button pressed or let go at `pos`.
+    fn secondary(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// Where the frame painted the text `label`, the topmost one first.
+    fn painted(ran: &harness::Ran, label: &str) -> Option<egui::Pos2> {
+        ran.out.shapes.iter().rev().find_map(|c| match &c.shape {
+            egui::Shape::Text(t) if t.galley.text() == label => Some(t.visual_bounding_rect().center()),
+            _ => None,
+        })
+    }
+
+    /// A right-click on a rail picks it and opens a menu with Delete (no Rotate: a rail does not
+    /// turn); Delete there leaves the command for the app to run, as the toolbar does (#1131).
+    #[test]
+    fn right_click_on_a_rail_picks_it_and_offers_delete() {
+        let (_tmp, mut o, mut ed) = plate_with_rail_and_duct();
+        let h = Harness::new();
+        h.frame(&mut o, &mut ed, Vec::new());
+        let at = h.to_screen(&ed, Point::new(150.0, 100.0));
+        h.frame(
+            &mut o,
+            &mut ed,
+            vec![egui::Event::PointerMoved(at), secondary(at, true)],
+        );
+        h.frame(&mut o, &mut ed, vec![secondary(at, false)]);
+        assert_eq!(ed.panel_pick, Some(1), "the rail is picked");
+        let ran = h.frame(&mut o, &mut ed, Vec::new());
+        assert!(painted(&ran, "Rotate").is_none(), "a rail does not turn");
+        let Some(delete) = painted(&ran, "Delete") else {
+            unreachable!("the menu offers Delete")
+        };
+        h.frame(&mut o, &mut ed, vec![egui::Event::PointerMoved(delete)]);
+        h.frame(&mut o, &mut ed, vec![primary(delete, true)]);
+        h.frame(&mut o, &mut ed, vec![primary(delete, false)]);
+        assert_eq!(ed.menu_action, Some(crate::actions::Action::Delete));
+        assert_eq!(o.project.panels[0].items.len(), 2, "the app runs it, not the view");
+    }
+
+    /// A right-click on a device offers Rotate as well; a right-click drag pans the view and
+    /// picks nothing.
+    #[test]
+    fn right_click_on_a_device_offers_rotate_and_a_right_drag_pans() {
+        let (_tmp, mut o, mut ed) = rail_with_device_at_its_end();
+        ed.panel_pick = None;
+        let h = Harness::new();
+        h.frame(&mut o, &mut ed, Vec::new());
+        let Some(PanelItem::Device { at, width, height, .. }) = o.project.panels[0].items.get(2).cloned() else {
+            unreachable!("the device is item 2")
+        };
+        let at = h.to_screen(&ed, Point::new(at.x + width / 2.0, at.y + height / 2.0));
+        // Drag first: the view moves and nothing is picked.
+        let offset = ed.view.offset;
+        h.frame(
+            &mut o,
+            &mut ed,
+            vec![egui::Event::PointerMoved(at), secondary(at, true)],
+        );
+        for k in 1..=3 {
+            h.frame(
+                &mut o,
+                &mut ed,
+                vec![egui::Event::PointerMoved(at + Vec2::new(10.0 * k as f32, 0.0))],
+            );
+        }
+        h.frame(&mut o, &mut ed, vec![secondary(at + Vec2::new(30.0, 0.0), false)]);
+        let ran = h.frame(&mut o, &mut ed, Vec::new());
+        assert_ne!(ed.view.offset, offset, "the drag pans");
+        assert_eq!(ed.panel_pick, None);
+        assert!(painted(&ran, "Delete").is_none(), "and opens no menu");
+        // Then a right-click on the device where it is now.
+        let at = at + (ed.view.offset - offset);
+        h.frame(
+            &mut o,
+            &mut ed,
+            vec![egui::Event::PointerMoved(at), secondary(at, true)],
+        );
+        h.frame(&mut o, &mut ed, vec![secondary(at, false)]);
+        assert_eq!(ed.panel_pick, Some(2));
+        let ran = h.frame(&mut o, &mut ed, Vec::new());
+        assert!(painted(&ran, "Rotate").is_some() && painted(&ran, "Delete").is_some());
+    }
+
+    /// The plate with a rail and a duct and two devices away from both, A (item 2) picked.
+    fn plate_with_two_devices() -> (tempfile::TempDir, Open, Editor) {
+        let (tmp, mut o, mut ed) = plate_with_rail_and_duct();
+        for (tag, x) in [("-A1", 100.0), ("-B1", 300.0)] {
+            o.project.panels[0].items.push(PanelItem::Device {
+                tag: wc_core::DeviceTag::parse(tag).unwrap_or_default(),
+                at: Point::new(x, 180.0),
+                width: 20.0,
+                height: 40.0,
+                rotation: wc_core::geom::Rotation::R0,
+            });
+        }
+        ed.panel_pick = Some(2);
+        (tmp, o, ed)
+    }
+
+    /// A right-click on B and an arrow key in the same frame move B, not A that was picked.
+    #[test]
+    fn an_arrow_key_with_a_right_click_moves_the_device_right_clicked() {
+        let (_tmp, mut o, mut ed) = plate_with_two_devices();
+        let h = Harness::new();
+        h.frame(&mut o, &mut ed, Vec::new());
+        let b = h.to_screen(&ed, Point::new(310.0, 200.0));
+        h.frame(&mut o, &mut ed, vec![egui::Event::PointerMoved(b), secondary(b, true)]);
+        h.frame(&mut o, &mut ed, vec![secondary(b, false), key(egui::Key::ArrowRight)]);
+        assert_eq!(ed.panel_pick, Some(3));
+        assert_eq!(device_pos(&o, 2), Point::new(100.0, 180.0), "A stays");
+        assert_eq!(device_pos(&o, 3), Point::new(305.0, 180.0), "B moves");
+    }
+
+    /// A right-click during a left-button drag leaves the dragged device picked, and the drag
+    /// still moves it.
+    #[test]
+    fn a_right_click_during_a_drag_keeps_the_dragged_device_picked() {
+        let (_tmp, mut o, mut ed) = plate_with_two_devices();
+        let h = Harness::new();
+        h.frame(&mut o, &mut ed, Vec::new());
+        let a = h.to_screen(&ed, Point::new(110.0, 200.0));
+        let b = h.to_screen(&ed, Point::new(310.0, 200.0));
+        h.frame(&mut o, &mut ed, vec![egui::Event::PointerMoved(a), primary(a, true)]);
+        for k in 1..=3 {
+            h.frame(
+                &mut o,
+                &mut ed,
+                vec![egui::Event::PointerMoved(a + Vec2::new(0.0, 10.0 * k as f32))],
+            );
+        }
+        assert!(ed.panel_drag.is_some(), "the drag is on");
+        h.frame(&mut o, &mut ed, vec![egui::Event::PointerMoved(b), secondary(b, true)]);
+        h.frame(&mut o, &mut ed, vec![secondary(b, false)]);
+        assert_eq!(ed.panel_pick, Some(2), "A stays picked");
+        h.frame(&mut o, &mut ed, vec![primary(b, false)]);
+        assert_eq!(device_pos(&o, 3), Point::new(300.0, 180.0), "B is not moved");
+        assert_ne!(device_pos(&o, 2), Point::new(100.0, 180.0), "the drag moved A");
     }
 }

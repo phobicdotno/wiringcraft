@@ -130,6 +130,14 @@ fn sync_one_in(project_dir: &Path, s: &LibrarySource, cache: Option<&Path>) -> R
             let dir = git_cache_dir(&s.name, cache)?;
             let reference = s.reference.as_deref().unwrap_or("HEAD");
             if dir.join(".git").is_dir() {
+                // Fetch from the location as it is now, not the one the cache was cloned from.
+                // A local relative path is made absolute, as the clone resolved it.
+                let loc = Path::new(&s.location);
+                let url = match std::path::absolute(loc) {
+                    Ok(abs) if loc.is_relative() && loc.exists() => abs.to_string_lossy().into_owned(),
+                    _ => s.location.clone(),
+                };
+                git(&["remote", "set-url", "origin", &url], Some(&dir), &s.name)?;
                 git(&["fetch", "--depth", "1", "origin", reference], Some(&dir), &s.name)?;
                 git(&["reset", "--hard", "FETCH_HEAD"], Some(&dir), &s.name)?;
                 Ok(format!("{}: updated from {}", s.name, s.location))

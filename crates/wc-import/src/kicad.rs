@@ -307,6 +307,11 @@ fn convert(
             continue;
         }
         for g in unit.items() {
+            // KiCad 8+: `(text private "text" ...)`, `(polyline private ...)`: a private item
+            // shows only in KiCad's symbol editor. A text that reads "private" is not one.
+            if g.arg(1) == Some("private") && (g.arg(2).is_some() || !matches!(g.head(), Some("text" | "text_box"))) {
+                continue;
+            }
             match g.head() {
                 Some("polyline") => {
                     let mut points: Vec<Point> = g
@@ -381,57 +386,12 @@ fn convert(
                     }
                 }
                 Some("text") => {
+                    // A hidden text shows only in KiCad's symbol editor.
+                    if g.first("effects").is_some_and(|e| hidden_from(e, 1)) {
+                        continue;
+                    }
                     if let (Some(t), Some(at)) = (g.arg(1), g.first("at")) {
-                        let effects = g.first("effects");
-                        let justify = effects.and_then(|e| e.first("justify"));
-                        let has =
-                            |word: &str| justify.is_some_and(|j| j.items().iter().any(|w| w.atom() == Some(word)));
-                        let align = if has("left") {
-                            Align::Left
-                        } else if has("right") {
-                            Align::Right
-                        } else {
-                            Align::Center
-                        };
-                        let height = effects
-                            .and_then(|e| e.first("font"))
-                            .and_then(|f| f.first("size"))
-                            .and_then(|s| s.num(1))
-                            .unwrap_or(1.27);
-                        let height = height * scale;
-                        // KiCad stores tenths of a degree in old files and degrees now.
-                        let angle = at.num(3).map(|a| if a > 360.0 { a / 10.0 } else { a }).unwrap_or(0.0);
-                        let first = pt(at.num(1).unwrap_or(0.0), at.num(2).unwrap_or(0.0));
-                        let (sin, cos) = angle.to_radians().sin_cos();
-                        // KiCad puts `at` at the middle of the text block unless `justify` says
-                        // `top` or `bottom`; WiringCraft's `at` is the baseline of the first line.
-                        // So move the first baseline down: by the text height from the top edge,
-                        // and up by the other lines from the bottom edge.
-                        let pitch = 1.5 * height;
-                        let below = pitch * t.lines().count().saturating_sub(1) as f64;
-                        let drop = if has("top") {
-                            height
-                        } else if has("bottom") {
-                            -below
-                        } else {
-                            (height - below) / 2.0
-                        };
-                        // A text with line breaks becomes one text per line, each one line pitch
-                        // further down, square to the reading direction (y runs down here).
-                        for (k, line) in t.lines().enumerate() {
-                            let line: String = line.chars().filter(|c| !c.is_control()).collect();
-                            if line.trim().is_empty() {
-                                continue;
-                            }
-                            let step = drop + pitch * k as f64;
-                            graphics.push(Shape::Text {
-                                at: Point::new(first.x + step * sin, first.y + step * cos),
-                                text: line,
-                                height,
-                                align,
-                                angle,
-                            });
-                        }
+                        graphics.extend(text_shapes(t, at, g.first("effects"), &pt, scale));
                     }
                 }
                 Some("pin") => {
@@ -463,10 +423,7 @@ fn convert(
                         continue;
                     }
                     if length > 0.0 {
-                        graphics.push(Shape::Line {
-                            a: tip,
-                            b: Point::new(tip.x + inward.x, tip.y + inward.y),
-                        });
+                        graphics.extend(pin_shapes(g, tip, inward, length, scale));
                     }
                     pins.push(Pin {
                         name: pin_name,
@@ -477,10 +434,6 @@ fn convert(
                 // KiCad 7+: a text with an optional border, `at` its top-left corner. Its lines
                 // are joined with a space into one text; margins are not kept.
                 Some("text_box") => {
-                    // `(text_box private "text" ...)`: a private box shows only in KiCad's editor.
-                    if g.arg(1) == Some("private") && g.arg(2).is_some() {
-                        continue;
-                    }
                     let (Some(t), Some(at)) = (g.arg(1), g.first("at")) else {
                         continue;
                     };
@@ -539,6 +492,8 @@ fn convert(
     if graphics.is_empty() && pins.is_empty() {
         return Err(Error::Format("the symbol draws nothing".into()));
     }
+    // A derived symbol shows its own fields (its Value is its own name).
+    graphics.extend(visible_fields(sym, &pt, scale));
     // Pins without a designation are numbered; repeated designations get a mark.
     let mut used = std::collections::BTreeSet::new();
     for (i, p) in pins.iter_mut().enumerate() {
@@ -577,6 +532,148 @@ fn convert(
             .unwrap_or("")
             .to_owned(),
     })
+}
+
+/// The pin line from `tip` to the body (`tip + inward`, `length` long) with KiCad's marks for
+/// the pin's shape, the word after its type: `inverted` draws a circle at the body end (radius
+/// half the pin number's text size), `clock` a triangle into the body (half the pin name's
+/// size), `inverted_clock` both. Other shapes draw the plain line.
+fn pin_shapes(pin: &Sexp, tip: Point, inward: Point, length: f64, scale: f64) -> Vec<Shape> {
+    let font = |head: &str| {
+        pin.first(head)
+            .and_then(|n| n.first("effects"))
+            .and_then(|e| e.first("font"))
+            .and_then(|f| f.first("size"))
+            .and_then(|s| s.num(1))
+            .filter(|v| *v > 0.0)
+    };
+    let number_size = font("number").unwrap_or(1.27);
+    let radius = number_size / 2.0 * scale;
+    let clock = font("name").unwrap_or(number_size) / 2.0 * scale;
+    let shape = pin.arg(2).unwrap_or("line");
+    let (inverted, clocked) = match shape {
+        "inverted" => (true, false),
+        "clock" => (false, true),
+        "inverted_clock" => (true, true),
+        _ => (false, false),
+    };
+    // `u` points from the tip into the body, `n` square to it.
+    let u = Point::new(inward.x / length, inward.y / length);
+    let n = Point::new(-u.y, u.x);
+    let root = Point::new(tip.x + inward.x, tip.y + inward.y);
+    let at = |from: Point, along: f64, across: f64| {
+        Point::new(from.x + u.x * along + n.x * across, from.y + u.y * along + n.y * across)
+    };
+    let mut out = Vec::new();
+    if inverted {
+        out.push(Shape::Circle {
+            center: at(root, -radius, 0.0),
+            radius,
+            filled: false,
+        });
+        if length > 2.0 * radius {
+            out.push(Shape::Line {
+                a: tip,
+                b: at(root, -2.0 * radius, 0.0),
+            });
+        }
+    } else {
+        out.push(Shape::Line { a: tip, b: root });
+    }
+    if clocked {
+        out.push(Shape::Polyline {
+            points: vec![at(root, 0.0, clock), at(root, clock, 0.0), at(root, 0.0, -clock)],
+            closed: false,
+            filled: false,
+        });
+    }
+    out
+}
+
+/// A KiCad text at `at` with its `effects` (size, justification), as one text per line.
+fn text_shapes(t: &str, at: &Sexp, effects: Option<&Sexp>, pt: &impl Fn(f64, f64) -> Point, scale: f64) -> Vec<Shape> {
+    let justify = effects.and_then(|e| e.first("justify"));
+    let has = |word: &str| justify.is_some_and(|j| j.items().iter().any(|w| w.atom() == Some(word)));
+    let align = if has("left") {
+        Align::Left
+    } else if has("right") {
+        Align::Right
+    } else {
+        Align::Center
+    };
+    let height = effects
+        .and_then(|e| e.first("font"))
+        .and_then(|f| f.first("size"))
+        .and_then(|s| s.num(1))
+        .unwrap_or(1.27);
+    let height = height * scale;
+    // KiCad stores tenths of a degree in old files and degrees now.
+    let angle = at.num(3).map(|a| if a > 360.0 { a / 10.0 } else { a }).unwrap_or(0.0);
+    let first = pt(at.num(1).unwrap_or(0.0), at.num(2).unwrap_or(0.0));
+    let (sin, cos) = angle.to_radians().sin_cos();
+    // KiCad puts `at` at the middle of the text block unless `justify` says
+    // `top` or `bottom`; WiringCraft's `at` is the baseline of the first line.
+    // So move the first baseline down: by the text height from the top edge,
+    // and up by the other lines from the bottom edge.
+    let pitch = 1.5 * height;
+    let below = pitch * t.lines().count().saturating_sub(1) as f64;
+    let drop = if has("top") {
+        height
+    } else if has("bottom") {
+        -below
+    } else {
+        (height - below) / 2.0
+    };
+    // A text with line breaks becomes one text per line, each one line pitch
+    // further down, square to the reading direction (y runs down here).
+    let mut out = Vec::new();
+    for (k, line) in t.lines().enumerate() {
+        let line: String = line.chars().filter(|c| !c.is_control()).collect();
+        if line.trim().is_empty() {
+            continue;
+        }
+        let step = drop + pitch * k as f64;
+        out.push(Shape::Text {
+            at: Point::new(first.x + step * sin, first.y + step * cos),
+            text: line,
+            height,
+            align,
+            angle,
+        });
+    }
+    out
+}
+
+/// The fields KiCad shows on the symbol, other than `Reference` (the tag) and `Description`:
+/// usually Value. Hidden ones (KiCad 6/7 `(effects ... hide)`, KiCad 8+ `(hide yes)`) and
+/// KiCad's own `ki_` keys are left out.
+fn visible_fields(sym: &Sexp, pt: &impl Fn(f64, f64) -> Point, scale: f64) -> Vec<Shape> {
+    let mut out = Vec::new();
+    for p in sym.all("property") {
+        let (Some(key), Some(value), Some(at)) = (p.arg(1), p.arg(2), p.first("at")) else {
+            continue;
+        };
+        let effects = p.first("effects");
+        if matches!(key, "Reference" | "Description")
+            || key.starts_with("ki_")
+            || value.trim().is_empty()
+            || value == "~"
+            || hidden_from(p, 3)
+            || effects.is_some_and(|e| hidden_from(e, 1))
+        {
+            continue;
+        }
+        out.extend(text_shapes(value, at, effects, pt, scale));
+    }
+    out
+}
+
+/// Whether `s` is hidden: a bare `hide` flag (KiCad 6/7), read from item `from` on so a
+/// property's key and value, or a text that reads "hide", do not count, or `(hide yes)`
+/// (KiCad 8+).
+fn hidden_from(s: &Sexp, from: usize) -> bool {
+    s.items().iter().skip(from).any(|i| i.atom() == Some("hide"))
+        || s.first("hide").and_then(|h| h.arg(1)) == Some("yes")
 }
 
 /// A rectangle from `min` to `max`. A rectangle has no fill of its own: a filled one becomes a
@@ -690,8 +787,8 @@ mod tests {
                 ("A2", Point::new(0.0, 7.62), PinDir::Down)
             ]
         );
-        // rectangle, polyline (as a line), arc, circle, text, two pin lines
-        assert_eq!(coil.graphics.len(), 7, "{:?}", coil.graphics);
+        // rectangle, polyline (as a line), arc, circle, text, two pin lines, the Value field
+        assert_eq!(coil.graphics.len(), 8, "{:?}", coil.graphics);
         assert!(coil.graphics.iter().any(|g| matches!(g, Shape::Rect { min, max }
             if (min.x + 2.54).abs() < 1e-9 && (min.y - 2.54).abs() < 1e-9 && (max.y - 5.08).abs() < 1e-9)));
         assert!(
@@ -1020,6 +1117,68 @@ mod tests {
     }
 
     #[test]
+    fn hidden_texts_are_left_out() -> Result<()> {
+        // KiCad draws a hidden text only in its symbol editor: `hide` (KiCad 6/7) or
+        // `(hide yes)` (KiCad 8+) in its effects.
+        let lib = r#"(kicad_symbol_lib
+  (symbol "H" (property "Reference" "H" (at 0 0 0))
+    (symbol "H_0_1"
+      (text "old" (at 0 5 0) (effects (font (size 1 1)) hide))
+      (text "new" (at 0 6 0) (effects (font (size 1 1)) (hide yes)))
+      (text "hide" (at 0 7 0) (effects (font (size 1 1))))
+      (text "shown" (at 0 8 0) (effects (font (size 1 1)) (hide no))))
+    (symbol "H_1_1"
+      (pin passive line (at 0 0 0) (length 0) (name "~") (number "1")))))"#;
+        let (syms, warnings) = symbols(lib, "k", 1.0)?;
+        assert_eq!(syms.len(), 1, "{warnings:?}");
+        let texts: Vec<&str> = syms[0]
+            .symbol
+            .graphics
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        // A text that reads "hide" is not hidden by its own content.
+        assert_eq!(texts, ["hide", "shown"]);
+        Ok(())
+    }
+
+    #[test]
+    fn private_texts_and_shapes_are_left_out() -> Result<()> {
+        // KiCad 8+: a private item shows only in KiCad's symbol editor.
+        let lib = r#"(kicad_symbol_lib
+  (symbol "P" (property "Reference" "P" (at 0 0 0))
+    (symbol "P_0_1"
+      (text private "editor note" (at 0 5 0) (effects (font (size 1 1))))
+      (text "private" (at 0 8 0) (effects (font (size 1 1))))
+      (polyline private (pts (xy 0 0) (xy 5 5)))
+      (rectangle private (start 0 0) (end 2 2))
+      (circle private (center 0 0) (radius 1))
+      (arc private (start 0 1) (mid 1 0) (end 0 -1))
+      (bezier private (pts (xy 0 0) (xy 1 2) (xy 3 2) (xy 4 0)))
+      (polyline (pts (xy 0 0) (xy 3 0))))
+    (symbol "P_1_1"
+      (pin passive line (at 0 0 0) (length 0) (name "~") (number "1")))))"#;
+        let (syms, warnings) = symbols(lib, "k", 1.0)?;
+        assert_eq!(syms.len(), 1, "{warnings:?}");
+        let g = &syms[0].symbol.graphics;
+        // Only the public line and the text that reads "private" are drawn.
+        assert_eq!(g.len(), 2, "{g:?}");
+        assert!(g.iter().any(|s| matches!(s, Shape::Line { .. })), "{g:?}");
+        // The private bezier would come in as a flattened polyline.
+        assert!(!g.iter().any(|s| matches!(s, Shape::Polyline { .. })), "{g:?}");
+        assert!(
+            g.iter()
+                .any(|s| matches!(s, Shape::Text { text, at, .. } if text == "private" && at.y < -7.0)),
+            "{g:?}"
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        Ok(())
+    }
+
+    #[test]
     fn a_symbol_that_fails_leaves_its_id_to_the_next() -> Result<()> {
         let lib = r#"(kicad_symbol_lib
   (symbol "A")
@@ -1104,6 +1263,116 @@ mod tests {
         assert!(near(points[points.len() - 1], 4.0, 0.0), "{points:?}");
         // At t = 0.5 the curve is at (2, 3) in KiCad, (2, -3) on the page.
         assert!(points.iter().any(|p| near(*p, 2.0, -3.0)), "{points:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn visible_fields_such_as_value_come_in_as_texts() -> Result<()> {
+        let lib = r#"(kicad_symbol_lib (version 20231120) (generator "test")
+  (symbol "Lamp"
+    (property "Reference" "H" (at 2 2 0) (effects (font (size 1.27 1.27))))
+    (property "Value" "Lamp" (at 0 -3 90) (effects (font (size 2 2)) (justify left)))
+    (property "Footprint" "Lamp:Big" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
+    (property "Datasheet" "https://example.com" (at 0 0 0) (effects (font (size 1.27 1.27))) (hide yes))
+    (property "Description" "A lamp" (at 0 0 0) (effects (font (size 1.27 1.27))))
+    (property "ki_keywords" "light" (at 0 0 0) (effects (font (size 1.27 1.27))))
+    (property "Voltage" "24 V" (at 4 1 0) (effects (font (size 1 1))))
+    (property "Spare" "~" (at 0 0 0))
+    (property "Note" "hide" (at 6 0 0) (effects (font (size 1 1))))
+    (symbol "Lamp_1_1" (pin passive line (at 0 0 270) (length 0) (name "1") (number "1"))))
+)"#;
+        let (syms, warnings) = symbols(lib, "k", 1.0)?;
+        let [lamp] = syms.as_slice() else {
+            unreachable!("one symbol expected: {warnings:?}")
+        };
+        let texts: Vec<(&str, Point, f64, f64, Align)> = lamp
+            .symbol
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Text {
+                    text,
+                    at,
+                    height,
+                    align,
+                    angle,
+                } => Some((text.as_str(), *at, *height, *angle, *align)),
+                _ => None,
+            })
+            .collect();
+        let names: Vec<&str> = texts.iter().map(|t| t.0).collect();
+        // Reference, Description, KiCad's own keys, hidden fields and empty ones are not drawn.
+        // A field whose text is "hide" is still shown.
+        assert_eq!(names, vec!["Lamp", "24 V", "hide"], "{texts:?}");
+        // Placed like a text item: the Value reads bottom to top, its baseline half its
+        // height to the right of `at` (0, 3 on the page).
+        let (_, at, height, angle, align) = texts[0];
+        assert!((at.x - 1.0).abs() < 1e-9 && (at.y - 3.0).abs() < 1e-9, "{at:?}");
+        assert!((height - 2.0).abs() < 1e-9 && (angle - 90.0).abs() < 1e-9);
+        assert_eq!(align, Align::Left);
+        let (_, at, height, _, align) = texts[1];
+        assert!((at.x - 4.0).abs() < 1e-9 && (at.y + 0.5).abs() < 1e-9, "{at:?}");
+        assert!((height - 1.0).abs() < 1e-9);
+        assert_eq!(align, Align::Center);
+        Ok(())
+    }
+
+    #[test]
+    fn inverted_and_clock_pins_draw_their_circle_and_triangle() -> Result<()> {
+        // A NAND output with its inversion circle, and a flip-flop's clock input.
+        let lib = r#"(kicad_symbol_lib
+  (symbol "Nand" (property "Reference" "U" (at 0 0 0))
+    (symbol "Nand_1_1"
+      (pin output inverted (at 10 0 180) (length 5) (name "~") (number "3" (effects (font (size 1.27 1.27)))))))
+  (symbol "Clk" (property "Reference" "U" (at 0 0 0))
+    (symbol "Clk_1_1"
+      (pin input clock (at 0 0 0) (length 5) (name "C" (effects (font (size 1 1)))) (number "1"))))
+  (symbol "Both" (property "Reference" "U" (at 0 0 0))
+    (symbol "Both_1_1"
+      (pin input inverted_clock (at 0 0 0) (length 5) (name "C") (number "1")))))"#;
+        let (syms, warnings) = symbols(lib, "k", 1.0)?;
+        assert_eq!(syms.len(), 3, "{warnings:?}");
+        let near = |p: Point, x: f64, y: f64| (p.x - x).abs() < 1e-6 && (p.y - y).abs() < 1e-6;
+        let graphics = |name: &str| {
+            syms.iter()
+                .find(|s| s.kicad_name == name)
+                .map(|s| s.symbol.graphics.clone())
+                .unwrap_or_default()
+        };
+        // The tip is the origin; the body is 5 mm to the left. The circle touches the body end
+        // and the line stops at the circle.
+        let g = graphics("Nand");
+        assert_eq!(g.len(), 2, "{g:?}");
+        assert!(
+            g.iter()
+                .any(|s| matches!(s, Shape::Circle { center, radius, filled: false }
+                if near(*center, -4.365, 0.0) && (radius - 0.635).abs() < 1e-6)),
+            "{g:?}"
+        );
+        assert!(
+            g.iter()
+                .any(|s| matches!(s, Shape::Line { a, b } if near(*a, 0.0, 0.0) && near(*b, -3.73, 0.0))),
+            "{g:?}"
+        );
+        // The clock triangle points into the body, half the name's text size deep.
+        let g = graphics("Clk");
+        assert_eq!(g.len(), 2, "{g:?}");
+        assert!(
+            g.iter()
+                .any(|s| matches!(s, Shape::Line { a, b } if near(*a, 0.0, 0.0) && near(*b, 5.0, 0.0))),
+            "{g:?}"
+        );
+        assert!(
+            g.iter()
+                .any(|s| matches!(s, Shape::Polyline { points, closed: false, .. }
+                if points.len() == 3 && near(points[1], 5.5, 0.0)
+                    && near(points[0], 5.0, 0.5) && near(points[2], 5.0, -0.5))),
+            "{g:?}"
+        );
+        // Both marks at once.
+        let g = graphics("Both");
+        assert!(g.iter().any(|s| matches!(s, Shape::Circle { .. })), "{g:?}");
+        assert!(g.iter().any(|s| matches!(s, Shape::Polyline { .. })), "{g:?}");
         Ok(())
     }
 

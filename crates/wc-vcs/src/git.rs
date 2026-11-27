@@ -1,3 +1,4 @@
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -40,6 +41,52 @@ pub(crate) fn exclude_scratch(at: &Path) -> PathBuf {
     let mut name = at.file_name().map(|n| n.to_os_string()).unwrap_or_default();
     name.push(format!(".{}.new", std::process::id()));
     at.with_file_name(name)
+}
+
+/// A path from git's `-z` output as the OS string it names, to hand back to git: its bytes
+/// as they are on Unix, where a file name may hold any bytes. Elsewhere names are Unicode and
+/// git prints them as UTF-8, so they are read as text.
+fn os_path(bytes: &[u8]) -> OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        OsString::from_vec(bytes.to_vec())
+    }
+    #[cfg(not(unix))]
+    {
+        OsString::from(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
+/// A path from git's `-z` output as text: as it is when it is UTF-8. A name that is not (a
+/// Unix file name may hold any bytes) comes back in git's own quoted form, `"`, the name with
+/// `"` and `\` escaped and each byte that is not UTF-8 as a `\` and three octal digits, then
+/// `"` (`"pages/\377.page.json"`). Two names that differ in such a byte so stay two entries,
+/// where reading them lossily would give both the same text. The quoted form names no file:
+/// such an entry can be listed, not opened. A UTF-8 name made of exactly that quoted text (a file
+/// literally named `"a\377.txt"` beside `a\xff.txt`) reads the same; telling those two apart
+/// needs the paths kept as bytes, as [`os_path`] keeps the ones handed back to git (#1223).
+pub(crate) fn path_text(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    // A UTF-8 name is always its own text, so it can be opened and handed back to git.
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_owned();
+    }
+    let mut out = String::from("\"");
+    for chunk in bytes.utf8_chunks() {
+        for c in chunk.valid().chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                c => out.push(c),
+            }
+        }
+        for b in chunk.invalid() {
+            let _ = write!(out, "\\{b:03o}");
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// A project folder's git repository.
@@ -132,6 +179,24 @@ impl Git {
     }
 
     pub(crate) fn run(&self, args: &[&str]) -> Result<String> {
+        self.run_bytes(args)
+            .map(|out| String::from_utf8_lossy(&out).into_owned())
+    }
+
+    /// [`Git::run`] for `-z` output that lists paths: its NUL-ended fields, each read with
+    /// [`path_text`], so a name that is not UTF-8 never comes back as another name's text.
+    pub(crate) fn run_paths(&self, args: &[&str]) -> Result<Vec<String>> {
+        Ok(self
+            .run_bytes(args)?
+            .split(|&b| b == 0)
+            .filter(|field| !field.is_empty())
+            .map(path_text)
+            .collect())
+    }
+
+    /// [`Git::run`] with git's output as the bytes it printed. The arguments are OS strings,
+    /// so a path read back from git as bytes ([`os_path`]) is handed to it byte for byte.
+    fn run_bytes<S: AsRef<OsStr>>(&self, args: &[S]) -> Result<Vec<u8>> {
         let out = Command::new("git")
             .args(args)
             .current_dir(&self.dir)
@@ -144,14 +209,18 @@ impl Git {
             .output()
             .map_err(Error::Spawn)?;
         if out.status.success() {
-            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+            Ok(out.stdout)
         } else {
             let mut message = String::from_utf8_lossy(&out.stderr).trim().to_owned();
             if message.is_empty() {
                 message = String::from_utf8_lossy(&out.stdout).trim().to_owned();
             }
             Err(Error::Git {
-                args: args.join(" "),
+                args: args
+                    .iter()
+                    .map(|a| a.as_ref().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(" "),
                 message,
             })
         }
@@ -280,20 +349,22 @@ impl Git {
             "--",
         ];
         args.extend(paths);
-        let out = self.run(&args)?;
+        // Bytes, not text: these paths go back to git, so a name that is not UTF-8 must stay
+        // the name it is (#1223).
+        let out = self.run_bytes(&args)?;
         let mut changed = Changed::default();
-        for entry in out.split('\0') {
+        for entry in out.split(|&b| b == 0) {
             let (Some(code), Some(path)) = (entry.get(..2), entry.get(3..)) else {
                 continue;
             };
             if path.is_empty() {
                 continue;
             }
-            changed.commit.push(path.to_owned());
+            changed.commit.push(os_path(path));
             // A removal staged already (`git rm`) is in neither the index nor the folder, so
             // `git add` would not find it; the commit takes it as it is staged.
-            if code != "D " {
-                changed.add.push(path.to_owned());
+            if code != b"D " {
+                changed.add.push(os_path(path));
             }
         }
         changed.commit.sort();
@@ -321,9 +392,12 @@ impl Git {
             }
             Some(changed) => {
                 if !changed.add.is_empty() {
-                    let mut add = vec!["--literal-pathspecs", "add", "-A", "--"];
-                    add.extend(changed.add.iter().map(String::as_str));
-                    self.run(&add)?;
+                    let mut add: Vec<&OsStr> = ["--literal-pathspecs", "add", "-A", "--"]
+                        .into_iter()
+                        .map(OsStr::new)
+                        .collect();
+                    add.extend(changed.add.iter().map(OsString::as_os_str));
+                    self.run_bytes(&add)?;
                 }
             }
         }
@@ -334,21 +408,24 @@ impl Git {
             None => None,
             Some(changed) => {
                 let head = self.head();
-                let mut diff = vec![
+                let mut diff: Vec<&OsStr> = [
                     "--literal-pathspecs",
                     "diff",
                     "--cached",
                     "--name-only",
                     "--no-renames",
                     "-z",
-                ];
+                ]
+                .into_iter()
+                .map(OsStr::new)
+                .collect();
                 if let Some(h) = &head {
-                    diff.push(h);
+                    diff.push(OsStr::new(h));
                 }
-                diff.push("--");
-                diff.extend(changed.commit.iter().map(String::as_str));
-                let out = self.run(&diff)?;
-                let paths: Vec<String> = out.split('\0').filter(|p| !p.is_empty()).map(str::to_owned).collect();
+                diff.push(OsStr::new("--"));
+                diff.extend(changed.commit.iter().map(OsString::as_os_str));
+                let out = self.run_bytes(&diff)?;
+                let paths: Vec<OsString> = out.split(|&b| b == 0).filter(|p| !p.is_empty()).map(os_path).collect();
                 if paths.is_empty() {
                     return Ok(None);
                 }
@@ -356,25 +433,25 @@ impl Git {
             }
         };
         let author_arg = author.map(|a| format!("--author={a}"));
-        let mut args: Vec<&str> = Vec::new();
+        let mut args: Vec<&OsStr> = Vec::new();
         // Commit as the configured user; fall back to a neutral identity so a fresh machine works.
         if self.run(&["config", "user.email"]).is_err() {
-            args.extend(["-c", "user.name=WiringCraft", "-c", "user.email=wiringcraft@localhost"]);
+            args.extend(["-c", "user.name=WiringCraft", "-c", "user.email=wiringcraft@localhost"].map(OsStr::new));
         }
         if only.is_some() {
-            args.push("--literal-pathspecs");
+            args.push(OsStr::new("--literal-pathspecs"));
         }
-        args.extend(["commit", "-q", "--allow-empty", "-m", message]);
+        args.extend(["commit", "-q", "--allow-empty", "-m", message].map(OsStr::new));
         if let Some(a) = &author_arg {
-            args.push(a);
+            args.push(OsStr::new(a));
         }
         // Only these paths' changes, whatever else is staged.
         if let Some(paths) = &selected {
-            args.push("--only");
-            args.push("--");
-            args.extend(paths.iter().map(String::as_str));
+            args.push(OsStr::new("--only"));
+            args.push(OsStr::new("--"));
+            args.extend(paths.iter().map(OsString::as_os_str));
         }
-        if let Err(e) = self.run(&args) {
+        if let Err(e) = self.run_bytes(&args) {
             let undo = match &index_before {
                 Ok(tree) => self.run(&["read-tree", tree]).err(),
                 Err(snapshot) => Some(Error::Git {
@@ -496,7 +573,9 @@ impl Git {
             .collect())
     }
 
-    /// Create a branch at the current version and switch to it.
+    /// Create a branch at the current version and switch to it. Changes not yet recorded come
+    /// along unchanged, so there is no need (and, with such changes, no way) to [`Git::switch`]
+    /// to it afterwards.
     pub fn create_branch(&self, name: &str) -> Result<()> {
         self.run(&["check-ref-format", "--branch", name])?;
         self.run(&["switch", "-q", "-c", name])?;
@@ -516,12 +595,21 @@ impl Git {
     }
 
     /// Merge another branch into the current one. Refuses while an earlier merge is still
-    /// being finished, so that merge's conflicts are never reported as this one's.
+    /// being finished, so that merge's conflicts are never reported as this one's. Refuses too
+    /// when there are unrecorded changes, like [`Git::switch`]: committing a merge that stopped
+    /// on conflicts records every change, so they would end up inside the merge, and aborting
+    /// it cannot always bring them back.
     pub fn merge(&self, other: &str) -> Result<MergeOutcome> {
         if self.git_path("MERGE_HEAD")?.exists() {
             return Err(Error::Git {
                 args: format!("merge {other}"),
                 message: "another merge is in progress; resolve its conflicts and commit, or abort it first".into(),
+            });
+        }
+        if !self.run(&["status", "--porcelain"])?.trim().is_empty() {
+            return Err(Error::Git {
+                args: format!("merge {other}"),
+                message: "record or discard your changes first (commit)".into(),
             });
         }
         let before = self.head();
@@ -540,12 +628,10 @@ impl Git {
                 MergeOutcome::Merged
             }),
             Err(e) => {
-                let conflicts: Vec<String> = self
-                    .run(&["diff", "--name-only", "--diff-filter=U"])
-                    .unwrap_or_default()
-                    .lines()
-                    .map(str::to_owned)
-                    .collect();
+                // `-z`: paths as they are (no quoting of accents, tabs or quotes), NUL-ended.
+                let conflicts = self
+                    .run_paths(&["diff", "--name-only", "--diff-filter=U", "-z"])
+                    .unwrap_or_default();
                 if conflicts.is_empty() {
                     Err(e)
                 } else {
@@ -555,7 +641,15 @@ impl Git {
         }
     }
 
+    /// Undo a merge that stopped on conflicts, bringing the files back to how they were before
+    /// it. Says so plainly when no merge is in progress.
     pub fn abort_merge(&self) -> Result<()> {
+        if !self.git_path("MERGE_HEAD")?.exists() {
+            return Err(Error::Git {
+                args: "merge --abort".into(),
+                message: "no merge in progress".into(),
+            });
+        }
         self.run(&["merge", "--abort"])?;
         Ok(())
     }
@@ -578,6 +672,6 @@ fn no_such_version(commit: &str) -> Error {
 /// `git add` can take (all but removals staged already).
 #[derive(Debug, Default)]
 struct Changed {
-    commit: Vec<String>,
-    add: Vec<String>,
+    commit: Vec<OsString>,
+    add: Vec<OsString>,
 }
