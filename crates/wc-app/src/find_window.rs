@@ -357,6 +357,23 @@ mod tests {
     }
 
     #[test]
+    fn escape_in_the_replace_field_closes_the_window() {
+        let p = project();
+        let ctx = egui::Context::default();
+        let mut f = FindState::default();
+        assert_eq!(frame(&ctx, &mut f, &p, vec![]), FindOutcome::None);
+        // Tab takes the keyboard from the Find field to Replace with.
+        frame(&ctx, &mut f, &p, vec![key(egui::Key::Tab)]);
+        frame(&ctx, &mut f, &p, vec![egui::Event::Text("motor".into())]);
+        assert_eq!(f.with, "motor", "Replace with has the keyboard");
+        assert_eq!(f.query, "");
+        assert_eq!(
+            frame(&ctx, &mut f, &p, vec![key(egui::Key::Escape)]),
+            FindOutcome::Close
+        );
+    }
+
+    #[test]
     fn escape_right_after_opening_closes_the_window() {
         // Opened by Find, which asks for the keyboard: that request is used up on the first
         // pass, so it cannot put the keyboard back after Escape on the next one.
