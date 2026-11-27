@@ -64,6 +64,11 @@ check read that copy, not the library. So a change in the library does not chang
 drawing by itself: `wiringcraft lib status` shows which parts changed, and `wiringcraft lib
 update` takes the new versions. See [versions.md](versions.md).
 
+The exception is `import footprint-dxf` and `import model-step`: when the project uses the part
+and takes it from the library source the import writes to, they update the project's pinned
+copy too (unless that copy has local changes, which a warning names). The device's size on a
+cabinet layout can then change without `lib update`.
+
 ## The parts list (bill of materials)
 
 `wiringcraft report parts` (and `pdf --report parts`) lists one row per part with its quantity,
@@ -129,8 +134,11 @@ $ wiringcraft lib add mine folder mylib
 $ wiringcraft device -K2 --part acme.ab-123
 ```
 
-In the app, **File → Import** asks for the library folder first and adds it to the project's
-libraries once parts are in it.
+In the app, the parts imports in the **File** menu (EDZ, BMEcat and CSV) ask for the library
+folder after the file and add it to the project's libraries once parts are in it. The
+SolidWorks Electrical libraries import is different: the app puts its parts, cable types and
+symbols into the project itself and asks for no folder. To write them into a library folder,
+use `import swe-library --lib` on the command line.
 
 Importing again writes the part files again. A project that already uses one of those parts
 keeps its own copy until `lib update` takes the new version, as above.
