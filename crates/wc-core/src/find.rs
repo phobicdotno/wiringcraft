@@ -265,6 +265,9 @@ pub fn replace_renaming(
         return Ok((0, BTreeMap::new()));
     }
     let mut p = project.clone();
+    // Terminals renamed by their numbered tags (`-X1.3` to `-X2.3`) take their strip's jumpers
+    // and layout along, though no device or symbol is tagged with the strip itself.
+    let terminals = crate::project::terminal_numbers(&p, |_| None);
     let mut changed = 0usize;
     let mut renames: BTreeMap<DeviceTag, DeviceTag> = BTreeMap::new();
     let stale = || "The project changed since the search; search again.".to_owned();
@@ -415,6 +418,7 @@ pub fn replace_renaming(
         // A device no page draws changes only its entry: still one change.
         changed += p.rename_device(temp, to).max(1);
     }
+    crate::project::follow_terminals_in(&mut p, &terminals, |_| None);
     *project = p;
     Ok((changed, renames))
 }
@@ -722,6 +726,38 @@ mod tests {
             Err("-X4.S1 is already used.".into())
         );
         assert_eq!(p, before);
+    }
+
+    #[test]
+    fn jumpers_follow_terminals_renamed_by_their_numbered_tags() {
+        let mut p = sample();
+        for (id, t) in [("t1", "-X1.1"), ("t2", "-X1.2")] {
+            p.pages[1].symbols.push(PlacedSymbol {
+                id: id.into(),
+                symbol: "wc.terminal".into(),
+                at: Point::new(40.0, 20.0),
+                rotation: Default::default(),
+                mirror: false,
+                tag: Some(tag(t)),
+            });
+        }
+        let jumper = |strip: &str| crate::project::Jumper {
+            strip: tag(strip),
+            terminals: vec!["1".into(), "2".into()],
+            part: None,
+        };
+        p.meta.jumpers.push(jumper("-X1"));
+        let layout = |strip: &str| crate::project::StripLayout {
+            strip: tag(strip),
+            order: vec!["2".into(), "1".into()],
+            spares: Vec::new(),
+        };
+        p.meta.strips.push(layout("-X1"));
+        let opts = FindOptions { match_case: true };
+        let hits = find(&p, "X1", opts);
+        assert_eq!(replace(&mut p, &hits, "X1", "X2", opts), Ok(2));
+        assert_eq!(p.meta.jumpers, [jumper("-X2")], "the jumper follows its terminals");
+        assert_eq!(p.meta.strips, [layout("-X2")], "the layout follows its terminals");
     }
 
     #[test]
