@@ -277,6 +277,19 @@ fn git_credential_prompts_do_not_show_the_user_name_or_password() {
     }
 }
 
+#[test]
+fn credentials_with_a_star_are_redacted_too() {
+    let location = "https://a*b:c*d@host/lib.git";
+    for printed in ["https://a*b:c*d@host", "https://a*b@host", "a*b:c*d@host"] {
+        let text = redact_text(&format!("fatal: could not read Password for '{printed}'"), location);
+        assert!(!text.contains("a*b") && !text.contains("c*d"), "{text}");
+        assert!(
+            text.contains("'https://***@host'") || text.contains("'***@host'"),
+            "{text}"
+        );
+    }
+}
+
 // A file URL with a host needs a Unix path after it.
 #[cfg(unix)]
 #[test]

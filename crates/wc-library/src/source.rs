@@ -146,8 +146,9 @@ fn split_url(rest: &str) -> (Option<&str>, &str, &str) {
 /// `text` with every form of `location` that shows a secret replaced by [`redact_location`]:
 /// the location as given, and (when it has a query or fragment) the location without its user
 /// name and password and its bare host and path, as git may print it. The user name and
-/// password are then replaced by `***` wherever they are still followed by `@`, as in git's
-/// credential prompts (`https://user@host`), which leave out the path and the password.
+/// password are then replaced by `***` wherever they are still followed by `@` (see
+/// [`mask_before_at`]), as in git's credential prompts (`https://user@host`), which leave out
+/// the path and the password.
 fn redact_text(text: &str, location: &str) -> String {
     let shown = redact_location(location);
     let mut text = text.replace(location, &shown);
@@ -159,15 +160,36 @@ fn redact_text(text: &str, location: &str) -> String {
                 .replace(&format!("{scheme}://{bare}"), &shown)
                 .replace(&bare, &shown);
         }
-        if let Some(userinfo) = userinfo.filter(|u| !u.is_empty() && !u.contains('*')) {
-            // The whole user name and password first, then the user name alone.
-            text = text.replace(&format!("{userinfo}@"), "***@");
-            if let Some((user, _)) = userinfo.split_once(':').filter(|(u, _)| !u.is_empty()) {
-                text = text.replace(&format!("{user}@"), "***@");
-            }
+        if let Some(userinfo) = userinfo {
+            // The whole user name and password, then the user name alone.
+            let user = userinfo.split_once(':').map_or(userinfo, |(user, _)| user);
+            text = mask_before_at(&text, &[userinfo, user]);
         }
     }
     text
+}
+
+/// `text` with each `secret` that is followed by `@` replaced by `***@`, in one pass from left
+/// to right: at each place the first (longest) secret that matches is taken, so the `***` put in
+/// is never looked at again. An empty secret hides nothing and is not looked for.
+fn mask_before_at(text: &str, secrets: &[&str]) -> String {
+    let forms: Vec<String> = secrets
+        .iter()
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("{s}@"))
+        .collect();
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        if let Some(form) = forms.iter().find(|f| rest.starts_with(f.as_str())) {
+            out.push_str("***@");
+            rest = rest.get(form.len()..).unwrap_or_default();
+        } else {
+            out.push(c);
+            rest = rest.get(c.len_utf8()..).unwrap_or_default();
+        }
+    }
+    out
 }
 
 /// Sync every source in order, one outcome each, going on past a source that fails.
