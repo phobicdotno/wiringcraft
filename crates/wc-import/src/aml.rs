@@ -409,12 +409,20 @@ pub struct Section {
 pub fn device_entry(d: &AmlDevice, parts: &mut Vec<wc_core::Part>) -> Option<(DeviceTag, Device)> {
     let tag = d.tag.clone()?;
     let (manufacturer, order) = part_fields(&d.properties);
+    // Our own export writes the part's description as `PartDescription`.
+    let explicit = |props: &BTreeMap<String, String>| {
+        props
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("PartDescription"))
+            .map(|(k, v)| (k.clone(), v.clone()))
+    };
+    let given = explicit(&d.properties);
     let part = order.map(|o| {
         let p = wc_core::Part {
             id: wc_core::Part::make_id(manufacturer.as_deref().unwrap_or(""), &o),
             manufacturer: manufacturer.unwrap_or_default(),
             order_number: o,
-            description: d.name.clone(),
+            description: given.as_ref().map_or_else(|| d.name.clone(), |(_, v)| v.clone()),
             symbol: None,
             properties: d.properties.clone(),
             contacts: None,
@@ -422,8 +430,16 @@ pub fn device_entry(d: &AmlDevice, parts: &mut Vec<wc_core::Part>) -> Option<(De
             model: None,
         };
         let id = p.id.clone();
-        if !parts.iter().any(|q| q.id == id) {
-            parts.push(p);
+        match parts.iter_mut().find(|q| q.id == id) {
+            // A part met before with only the element name as its description takes the first
+            // `PartDescription` a later device gives it.
+            Some(q) => {
+                if let Some((k, v)) = given.filter(|_| explicit(&q.properties).is_none()) {
+                    q.description = v.clone();
+                    q.properties.insert(k, v);
+                }
+            }
+            None => parts.push(p),
         }
         id
     });
@@ -750,6 +766,7 @@ mod tests {
             id: "acme.r24".into(),
             manufacturer: "Acme".into(),
             order_number: "R-24".into(),
+            description: "Relay 24 V".into(),
             ..Default::default()
         };
         project.devices.insert(
@@ -787,6 +804,7 @@ mod tests {
             (parts_out[0].manufacturer.as_str(), parts_out[0].order_number.as_str()),
             ("Acme", "R-24")
         );
+        assert_eq!(parts_out[0].description, "Relay 24 V");
         assert_eq!(imp.links.len(), 1);
         let l = &imp.links[0];
         assert_eq!(l.name, "L+");
@@ -795,6 +813,60 @@ mod tests {
             (imp.devices[l.b.0].name.as_str(), l.b.1.as_str()),
         ];
         assert_eq!(ends, [("=A-K1", "14"), ("=A-P1", "X1")]);
+        Ok(())
+    }
+
+    #[test]
+    fn part_description_is_matched_in_any_letter_case() -> Result<()> {
+        let d = AmlDevice {
+            name: "=A-K1".into(),
+            tag: Some(DeviceTag::parse("=A-K1").map_err(|_| Error::Format("tag".into()))?),
+            properties: [
+                ("OrderNumber".to_string(), "R-24".to_string()),
+                ("partdescription".to_string(), "Relay 24 V".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let mut parts = Vec::new();
+        device_entry(&d, &mut parts).ok_or_else(|| Error::Format("no device".into()))?;
+        let Some(part) = parts.first() else {
+            unreachable!("the device names an order number")
+        };
+        assert_eq!(part.description, "Relay 24 V");
+        Ok(())
+    }
+
+    #[test]
+    fn shared_part_takes_the_first_part_description_given() -> Result<()> {
+        let device = |tag: &str, description: Option<&str>| -> Result<AmlDevice> {
+            let mut properties: BTreeMap<String, String> = [
+                ("Manufacturer".to_string(), "Acme".to_string()),
+                ("OrderNumber".to_string(), "R-24".to_string()),
+            ]
+            .into_iter()
+            .collect();
+            if let Some(text) = description {
+                properties.insert("PartDescription".into(), text.into());
+            }
+            Ok(AmlDevice {
+                name: tag.into(),
+                tag: Some(DeviceTag::parse(tag).map_err(|_| Error::Format(tag.into()))?),
+                properties,
+                ..Default::default()
+            })
+        };
+        let mut parts = Vec::new();
+        for d in [
+            device("=A-K1", None)?,
+            device("=A-K2", Some("Relay 24 V"))?,
+            device("=A-K3", Some("Other text"))?,
+        ] {
+            device_entry(&d, &mut parts).ok_or_else(|| Error::Format("no device".into()))?;
+        }
+        let descriptions: Vec<&str> = parts.iter().map(|p| p.description.as_str()).collect();
+        assert_eq!(descriptions, ["Relay 24 V"]);
         Ok(())
     }
 
