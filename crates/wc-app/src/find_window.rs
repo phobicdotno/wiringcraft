@@ -157,8 +157,13 @@ impl FindState {
                     }
                     ui.end_row();
                     ui.label("Replace with");
-                    ui.add(egui::TextEdit::singleline(&mut self.with).desired_width(280.0));
+                    let with = ui.add(egui::TextEdit::singleline(&mut self.with).desired_width(280.0));
                     ui.end_row();
+                    // Escape in either field closes the window, as Cancel does in a dialog. The
+                    // field had the keyboard, so the canvas did not take the Escape as well.
+                    if (field.response.lost_focus() || with.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        out = FindOutcome::Close;
+                    }
                 });
                 ui.checkbox(&mut self.match_case, "Match case");
                 self.refresh(project);
@@ -364,6 +369,78 @@ mod tests {
         q.pages[0].graphics.clear();
         f.refresh(&q);
         assert!(f.hits.is_empty());
+    }
+
+    fn frame(ctx: &egui::Context, f: &mut FindState, p: &Project, events: Vec<egui::Event>) -> FindOutcome {
+        let mut out = FindOutcome::None;
+        let input = egui::RawInput {
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| out = f.show(ctx, p));
+        out
+    }
+
+    fn key(k: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        }
+    }
+
+    #[test]
+    fn escape_in_the_find_field_closes_the_window() {
+        let p = project();
+        let ctx = egui::Context::default();
+        let mut f = FindState::default();
+        assert_eq!(frame(&ctx, &mut f, &p, vec![]), FindOutcome::None);
+        assert_eq!(
+            frame(&ctx, &mut f, &p, vec![egui::Event::Text("pump".into())]),
+            FindOutcome::None
+        );
+        assert_eq!(f.query, "pump", "the Find field has the keyboard when the window opens");
+        assert_eq!(
+            frame(&ctx, &mut f, &p, vec![key(egui::Key::Escape)]),
+            FindOutcome::Close
+        );
+    }
+
+    #[test]
+    fn escape_in_the_replace_field_closes_the_window() {
+        let p = project();
+        let ctx = egui::Context::default();
+        let mut f = FindState::default();
+        assert_eq!(frame(&ctx, &mut f, &p, vec![]), FindOutcome::None);
+        // Tab takes the keyboard from the Find field to Replace with.
+        frame(&ctx, &mut f, &p, vec![key(egui::Key::Tab)]);
+        frame(&ctx, &mut f, &p, vec![egui::Event::Text("motor".into())]);
+        assert_eq!(f.with, "motor", "Replace with has the keyboard");
+        assert_eq!(f.query, "");
+        assert_eq!(
+            frame(&ctx, &mut f, &p, vec![key(egui::Key::Escape)]),
+            FindOutcome::Close
+        );
+    }
+
+    #[test]
+    fn escape_right_after_opening_closes_the_window() {
+        // Opened by Find, which asks for the keyboard: that request is used up on the first
+        // pass, so it cannot put the keyboard back after Escape on the next one.
+        let p = project();
+        let ctx = egui::Context::default();
+        let mut f = FindState {
+            focus_query: true,
+            ..Default::default()
+        };
+        assert_eq!(frame(&ctx, &mut f, &p, vec![]), FindOutcome::None);
+        assert!(!f.focus_query);
+        assert_eq!(
+            frame(&ctx, &mut f, &p, vec![key(egui::Key::Escape)]),
+            FindOutcome::Close
+        );
     }
 
     /// Find (Ctrl+F) with the window already open gives the Find field the keyboard again,
