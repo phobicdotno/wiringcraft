@@ -488,6 +488,9 @@ pub struct LibraryEntry {
     pub id: String,
     pub name: String,
     pub description: String,
+    /// Searched like the name, as `wiringcraft library search` does.
+    pub category: String,
+    pub letter_code: String,
 }
 
 impl LibraryEntry {
@@ -497,15 +500,28 @@ impl LibraryEntry {
             id: id.to_owned(),
             name: s.name.clone(),
             description: s.description.clone(),
+            category: s.category.clone(),
+            letter_code: s.letter_code.clone(),
         }
     }
 
-    /// Whether every word of `query` appears, ignoring case, in the id, name or description.
-    /// An empty query matches everything.
+    /// Whether every word of `query` appears, ignoring case, in the id, name, category,
+    /// letter code or description. An empty query matches everything.
     pub fn matches(&self, query: &str) -> bool {
-        let hay = format!("{} {} {}", self.id, self.name, self.description).to_lowercase();
+        let hay = format!(
+            "{} {} {} {} {}",
+            self.id, self.name, self.category, self.letter_code, self.description
+        )
+        .to_lowercase();
         query.to_lowercase().split_whitespace().all(|w| hay.contains(w))
     }
+}
+
+/// What [`Open::take_parts`] took into the project: parts loaded and part copies written.
+#[derive(Default)]
+struct TakenParts {
+    loaded: Vec<String>,
+    copies: Vec<PathBuf>,
 }
 
 pub struct Open {
@@ -1170,12 +1186,21 @@ impl Open {
     }
 
     /// Check that every part can be used (taken from the library when needed) without pinning
-    /// any of them, so a change can be refused before anything else of it is applied.
-    pub fn check_parts<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
+    /// any of them, then run `then`, the rest of the change: when a part or `then` is refused,
+    /// the copies and loaded parts the check got are taken back (those there before are kept),
+    /// so a refused change leaves no part copy behind. `then` runs with the lock as it was.
+    pub fn check_parts_then<'a, R>(
+        &mut self,
+        ids: impl IntoIterator<Item = &'a str>,
+        then: impl FnOnce(&mut Self) -> Result<R, String>,
+    ) -> Result<R, String> {
         let lock = self.project.lock.clone();
-        let r = self.ensure_parts(ids);
-        self.project.lock = lock;
-        r
+        let (taken, r) = self.take_parts(ids);
+        self.project.lock = lock.clone();
+        match r.and_then(|()| then(self)) {
+            Ok(v) => Ok(v),
+            r => self.give_back(taken, lock, r),
+        }
     }
 
     /// [`Open::ensure_part`] for every part, all or none: when one cannot be used, the copies
@@ -1183,8 +1208,17 @@ impl Open {
     /// and so is the lock.
     fn ensure_parts<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
         let lock = self.project.lock.clone();
-        // What this call added: the parts loaded here and the copies written that were not there.
-        let (mut loaded, mut copies) = (Vec::new(), Vec::new());
+        let (taken, r) = self.take_parts(ids);
+        if r.is_err() {
+            return self.give_back(taken, lock, r);
+        }
+        r
+    }
+
+    /// [`Open::ensure_part`] for each part until one cannot be used, with what this call added:
+    /// the parts loaded here and the copies written that were not there.
+    fn take_parts<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) -> (TakenParts, Result<(), String>) {
+        let mut taken = TakenParts::default();
         let mut r = Ok(());
         for id in ids {
             let was_loaded = self.parts.contains_key(id);
@@ -1193,39 +1227,44 @@ impl Open {
                 .filter(|path| !path.try_exists().unwrap_or(true));
             r = self.ensure_part(id);
             if !was_loaded && self.parts.contains_key(id) {
-                loaded.push(id.to_owned());
+                taken.loaded.push(id.to_owned());
             }
-            copies.extend(missing.filter(|path| path.exists()));
+            taken.copies.extend(missing.filter(|path| path.exists()));
             if r.is_err() {
                 break;
             }
         }
-        if r.is_err() {
-            for id in loaded {
-                self.parts.remove(&id);
+        (taken, r)
+    }
+
+    /// Take back what [`Open::take_parts`] added and put `lock` back, for a change refused with
+    /// `r`; a copy that cannot be removed is named in the error.
+    fn give_back<R>(&mut self, taken: TakenParts, lock: wc_core::Lockfile, r: Result<R, String>) -> Result<R, String> {
+        for id in taken.loaded {
+            self.parts.remove(&id);
+        }
+        let mut left = Vec::new();
+        for path in taken.copies {
+            #[cfg(test)]
+            if self.block_copy_removal {
+                let _ = std::fs::remove_file(&path);
+                let _ = std::fs::create_dir(&path).and_then(|()| std::fs::write(path.join("x"), ""));
             }
-            let mut left = Vec::new();
-            for path in copies {
-                #[cfg(test)]
-                if self.block_copy_removal {
-                    let _ = std::fs::remove_file(&path);
-                    let _ = std::fs::create_dir(&path).and_then(|()| std::fs::write(path.join("x"), ""));
-                }
-                if let Err(e) = std::fs::remove_file(&path) {
-                    left.push(format!("{} ({e})", path.display()));
-                }
-            }
-            self.project.lock = lock;
-            if !left.is_empty() {
-                r = r.map_err(|e| {
-                    format!(
-                        "{e}; these part copies taken into the project could not be removed: {}",
-                        left.join("; ")
-                    )
-                });
+            if let Err(e) = std::fs::remove_file(&path) {
+                left.push(format!("{} ({e})", path.display()));
             }
         }
-        r
+        self.project.lock = lock;
+        if left.is_empty() {
+            r
+        } else {
+            r.map_err(|e| {
+                format!(
+                    "{e}; these part copies taken into the project could not be removed: {}",
+                    left.join("; ")
+                )
+            })
+        }
     }
 
     /// Replace a device's accessories (its parts after the main part). New parts are taken from
@@ -3037,11 +3076,9 @@ impl Open {
             .max_by_key(|(_, n)| *n)
             .map(|(k, _)| k)
             .unwrap_or_default();
-        let used: std::collections::BTreeSet<String> =
-            self.project.tag_index().keys().map(|t| t.product.join(".")).collect();
-        let product = (1..10_000)
-            .map(|n| format!("{letter}{n}"))
-            .find(|p| !used.contains(p))?;
+        // Device data counts too: a deleted symbol's device keeps its entry (and part), which a
+        // new device must not take over.
+        let product = wc_core::placement::free_product(&wc_core::placement::used_tags(&self.project), letter)?;
         let mut text = String::new();
         if !function.is_empty() {
             text.push_str(&format!("={}", function.join(".")));
@@ -4706,6 +4743,11 @@ fn title_block_of(fields: &[(String, String)]) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// The status line after a Save that wrote `n` files, counted in words that agree.
+pub fn saved_message(n: usize) -> String {
+    format!("Saved ({n} {} changed).", if n == 1 { "file" } else { "files" })
+}
+
 pub fn author_name() -> String {
     std::env::var("WIRINGCRAFT_USER")
         .ok()
@@ -5222,6 +5264,14 @@ fn version_fits(item_id: &str, hash: &str, id: &str, pin: &str) -> Result<(), St
 #[allow(clippy::unwrap_used)]
 pub(crate) mod tests {
     use super::*;
+
+    /// The Save status line counts one file as one file (#1629).
+    #[test]
+    fn the_saved_message_counts_files_in_words_that_agree() {
+        assert_eq!(saved_message(0), "Saved (0 files changed).");
+        assert_eq!(saved_message(1), "Saved (1 file changed).");
+        assert_eq!(saved_message(3), "Saved (3 files changed).");
+    }
 
     /// A part copy that cannot be looked for (say, in a folder that may not be entered) is
     /// reported as unreadable with the reason, not as missing (#1035). The failing lookup is
@@ -7731,6 +7781,7 @@ pub(crate) mod tests {
         // A breaker, which the library has and the project doesn't yet: loaded before the coil
         // (ids are loaded in order), and taken back with it.
         let mut breaker = clip.symbols[0].clone();
+        breaker.id = format!("{}-breaker", breaker.id);
         breaker.symbol = "wc.breaker.1p".into();
         breaker.tag = None;
         clip.symbols.insert(0, breaker);
@@ -9491,6 +9542,18 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_symbol_list_searches_category_and_letter_code() {
+        let (_tmp, o) = project();
+        let breaker = o.library.iter().find(|e| e.id == "wc.breaker.1p").unwrap();
+        // Neither word is in its id, name or description, only in its category and letter code.
+        let text = format!("{} {} {}", breaker.id, breaker.name, breaker.description).to_lowercase();
+        assert!(!text.contains("protection") && !text.contains('q'), "{text}");
+        assert!(breaker.matches("protection Q"), "{breaker:?}");
+        assert!(breaker.matches("q breaker"));
+        assert!(!breaker.matches("protection relays"));
+    }
+
+    #[test]
     fn placing_vendors_the_symbol_and_tags_the_device() {
         let (_tmp, mut o) = project();
         assert!(o.library.iter().any(|e| e.id == "wc.coil"));
@@ -9513,6 +9576,24 @@ pub(crate) mod tests {
                 .to_string(),
             "=PUMP+CAB1-K2"
         );
+    }
+
+    #[test]
+    fn placing_skips_the_tag_of_a_deleted_symbols_device_data() {
+        let (_tmp, mut o) = project();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        let id = o.place(page, "wc.coil", Point::new(50.0, 50.0)).unwrap();
+        o.project
+            .devices
+            .get_mut(&DeviceTag::parse("-K1").unwrap())
+            .unwrap()
+            .description = "old".into();
+        o.project.pages[page].remove_symbols_and_wires(&[id.as_str()], &[]);
+        let id2 = o.place(page, "wc.coil", Point::new(80.0, 50.0)).unwrap();
+        let tag = o.project.pages[page].symbol(&id2).unwrap().tag.clone().unwrap();
+        // -K1 keeps its device data, so the new coil does not take it over.
+        assert_eq!(tag.to_string(), "-K2");
+        assert_eq!(o.project.devices[&tag].description, "");
     }
 
     #[test]
@@ -9916,7 +9997,10 @@ pub(crate) mod tests {
                 qty: 1,
             },
         ];
-        assert!(o.check_parts(list.iter().map(|a| a.part.as_str())).is_err());
+        assert!(
+            o.check_parts_then(list.iter().map(|a| a.part.as_str()), |_| Ok(()))
+                .is_err()
+        );
         assert!(!copy.exists(), "no copy left by a refused check");
         assert!(!o.parts.contains_key(&id), "not loaded by a refused check");
         assert!(o.set_device_accessories(&tag, list).is_err());
@@ -9927,7 +10011,8 @@ pub(crate) mod tests {
             part: id.clone(),
             qty: 1,
         }];
-        o.check_parts(good.iter().map(|a| a.part.as_str())).unwrap();
+        o.check_parts_then(good.iter().map(|a| a.part.as_str()), |_| Ok(()))
+            .unwrap();
         o.set_device_accessories(&tag, good).unwrap();
         assert!(copy.exists());
         assert!(o.parts.contains_key(&id));
@@ -9945,10 +10030,10 @@ pub(crate) mod tests {
             .unwrap();
         let copy = store::vendor_path(&o.dir, ItemKind::Part, &id).unwrap();
         let ids = [id.as_str(), "no.such.part"];
-        let plain = o.check_parts(ids).unwrap_err();
+        let plain = o.check_parts_then(ids, |_| Ok(())).unwrap_err();
         assert!(!plain.contains("could not be removed"), "{plain}");
         o.block_copy_removal = true;
-        let e = o.check_parts(ids).unwrap_err();
+        let e = o.check_parts_then(ids, |_| Ok(())).unwrap_err();
         assert!(e.starts_with(&plain), "the lookup error is kept: {e}");
         assert!(e.contains("could not be removed"), "{e}");
         assert!(e.contains(&copy.display().to_string()), "the copy is named: {e}");

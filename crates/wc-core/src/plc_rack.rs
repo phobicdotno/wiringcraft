@@ -82,10 +82,15 @@ pub const MAX_SLOT: u32 = 999;
 pub const MAX_STEP: u32 = 64;
 
 /// Why `racks` holds a number the PLC racks form would not let the user type (a slot past
-/// [`MAX_SLOT`], more than [`MAX_CHANNELS`] channels, a step outside 1 to [`MAX_STEP`]);
-/// `None` when every number is in range. The assistant and the command line check racks they
-/// are given by this.
+/// [`MAX_SLOT`], more than [`MAX_CHANNELS`] channels, a step outside 1 to [`MAX_STEP`]), or
+/// has two racks with one name (spaces around it do not count), which the command line could
+/// not tell apart; `None` when all is well. The assistant and the command line check racks
+/// they are given by this.
 pub fn problem(racks: &[PlcRack]) -> Option<String> {
+    let mut names = std::collections::BTreeSet::new();
+    if let Some(twice) = racks.iter().map(|r| r.name.trim()).find(|n| !names.insert(*n)) {
+        return Some(format!("two racks are named {twice:?}"));
+    }
     racks.iter().find_map(|rack| {
         rack.cards.iter().find_map(|c| {
             let at = || format!("rack {:?}, card in slot {}", rack.name, c.slot);
@@ -117,8 +122,9 @@ pub struct PlcAddress {
 
 impl PlcAddress {
     /// Reads `%IX0.0`, `%I0.0`, `I0.0`, `E0.0`, `IW64`, `A4.1`, `%QD8` and the like (spaces and
-    /// case do not matter). `None` when it is not a PLC address, a bit number is past 7 or a
-    /// bit address has no bit (or a word address has one).
+    /// case do not matter). Siemens peripheral spellings (`PEW256`, `PIW256`, `PAB4`, `PQD8`,
+    /// `%IW256:P`) read as the address they access directly. `None` when it is not a PLC
+    /// address, a bit number is past 7 or a bit address has no bit (or a word address has one).
     pub fn parse(address: &str) -> Option<Self> {
         Self::parse_any_bit(address).filter(|a| a.bit.is_none_or(|b| b <= 7))
     }
@@ -132,6 +138,14 @@ impl PlcAddress {
             .collect::<String>()
             .to_ascii_uppercase();
         let a = a.strip_prefix('%').unwrap_or(&a);
+        // TIA Portal marks a peripheral access with `:P` after the address.
+        let a = a.strip_suffix(":P").unwrap_or(a);
+        // STEP 7 writes it with a `P` in front of a byte, word or double word (`PEW256`).
+        let a = match a.strip_prefix('P') {
+            Some(rest) if matches!(rest.get(1..2), Some("B" | "W" | "D")) => rest,
+            Some(_) => return None,
+            None => a,
+        };
         let mut chars = a.chars();
         let output = match chars.next()? {
             'I' | 'E' => false,
@@ -283,7 +297,17 @@ mod tests {
         assert_eq!(iec("A4.1").as_deref(), Some("%QX4.1"));
         assert_eq!(iec("IW064").as_deref(), Some("%IW64"));
         assert_eq!(iec("%qd8").as_deref(), Some("%QD8"));
-        for bad in ["", "I", "IX3", "IW64.1", "%I0.8", "DI1", "%I0..1", "%I0.1.2", "Slot 2"] {
+        // Siemens peripheral access names the same address.
+        assert_eq!(iec("PEW256").as_deref(), Some("%IW256"));
+        assert_eq!(iec("piw 256").as_deref(), Some("%IW256"));
+        assert_eq!(iec("PAB4").as_deref(), Some("%QB4"));
+        assert_eq!(iec("PQD8").as_deref(), Some("%QD8"));
+        assert_eq!(iec("%IW256:P").as_deref(), Some("%IW256"));
+        assert_eq!(iec("%I0.1:P").as_deref(), Some("%IX0.1"));
+        for bad in [
+            "", "I", "IX3", "IW64.1", "%I0.8", "DI1", "%I0..1", "%I0.1.2", "Slot 2", "PE0.0", "PEX0.0", "P", "PW4",
+            "PPEW4", ":P", "%IW4:PP", "%IW4P",
+        ] {
             assert_eq!(PlcAddress::parse(bad), None, "{bad}");
         }
         // Bit 10 is read only when asked for.
@@ -314,6 +338,7 @@ mod tests {
         );
         assert_eq!(list(card("QW64", 3, None)).unwrap(), ["%QW64", "%QW66", "%QW68"]);
         assert_eq!(list(card("%IW0", 2, Some(1))).unwrap(), ["%IW0", "%IW1"]);
+        assert_eq!(list(card("PEW256", 2, None)).unwrap(), ["%IW256", "%IW258"]);
         assert!(list(card("Slot 1", 4, None)).is_err());
         assert!(list(card("%IX0.0", 0, None)).is_err());
         assert!(list(card("%IX0.0", MAX_CHANNELS + 1, None)).is_err());
@@ -370,6 +395,23 @@ mod tests {
     }
 
     #[test]
+    fn problem_names_a_rack_name_used_twice() {
+        let rack = |name: &str| PlcRack {
+            name: name.into(),
+            ..PlcRack::default()
+        };
+        assert_eq!(problem(&[rack("-A1"), rack("-A2")]), None);
+        assert_eq!(
+            problem(&[rack("-A1"), rack("-A2"), rack(" -A1 ")]).as_deref(),
+            Some("two racks are named \"-A1\"")
+        );
+        assert_eq!(
+            problem(&[rack(""), rack("  ")]).as_deref(),
+            Some("two racks are named \"\"")
+        );
+    }
+
+    #[test]
     fn racks_round_trip_through_toml_with_unknown_keys() {
         let text = r#"
 name = "-A1"
@@ -389,5 +431,173 @@ start = "%IX0.0"
         assert!(rack.unknown.contains_key("colour"));
         let back: PlcRack = toml::from_str(&toml::to_string(&rack).unwrap()).unwrap();
         assert_eq!(back, rack);
+    }
+}
+
+#[cfg(test)]
+mod edge_tests {
+    use super::*;
+
+    fn card(start: &str, channels: u32, step: Option<u32>) -> PlcCard {
+        PlcCard {
+            start: start.into(),
+            channels,
+            step,
+            ..PlcCard::default()
+        }
+    }
+
+    fn iecs(c: &PlcCard) -> Vec<String> {
+        let Ok(list) = c.addresses() else {
+            unreachable!("{:?} should have addresses", c.start)
+        };
+        list.iter().map(PlcAddress::iec).collect()
+    }
+
+    #[test]
+    fn german_and_byte_spellings_read_as_their_iec_area() {
+        let parsed = |a: &str| PlcAddress::parse(a);
+        assert_eq!(
+            parsed("EB4"),
+            Some(PlcAddress {
+                output: false,
+                size: 'B',
+                number: 4,
+                bit: None
+            })
+        );
+        assert_eq!(parsed("aw 2").map(|a| a.iec()).as_deref(), Some("%QW2"));
+        assert_eq!(parsed(" % q x 3 . 5 ").map(|a| a.iec()).as_deref(), Some("%QX3.5"));
+        // Only one leading percent sign, and a size letter needs a number after it.
+        for bad in [
+            "%", "%%I0.0", "ID", "QB", "I-1.0", "I+1.0", "IX.1", "I1.", "MW10", "IZ4",
+        ] {
+            assert_eq!(parsed(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn numbers_take_up_to_eighteen_digits() {
+        let eighteen = "9".repeat(18);
+        let Some(a) = PlcAddress::parse(&format!("IW{eighteen}")) else {
+            unreachable!("18 digits is a number")
+        };
+        assert_eq!(a.number, 999_999_999_999_999_999);
+        assert_eq!(PlcAddress::parse(&format!("IW{eighteen}9")), None);
+        assert_eq!(PlcAddress::parse_any_bit(&format!("I0.{eighteen}9")), None);
+    }
+
+    #[test]
+    fn elementary_types_follow_the_size() {
+        let ty = |a: &str| PlcAddress::parse(a).map(|a| a.elementary_type());
+        assert_eq!(ty("%IX0.0"), Some("BOOL"));
+        assert_eq!(ty("%IB0"), Some("BYTE"));
+        assert_eq!(ty("%QW0"), Some("WORD"));
+        assert_eq!(ty("%QD0"), Some("DWORD"));
+    }
+
+    #[test]
+    fn bits_of_a_double_word_and_of_a_wide_bit_number() {
+        assert_eq!(PlcAddress::parse("%ID8").map(|a| a.bits()), Some(64..96));
+        // A bit past 7 still counts from bit 0 of its byte.
+        assert_eq!(PlcAddress::parse_any_bit("%IX1.10").map(|a| a.bits()), Some(18..19));
+    }
+
+    #[test]
+    fn channels_follow_the_size_or_the_step() {
+        assert_eq!(iecs(&card("%QD8", 3, None)), ["%QD8", "%QD12", "%QD16"]);
+        assert_eq!(iecs(&card("%IB4", 2, None)), ["%IB4", "%IB5"]);
+        assert_eq!(iecs(&card("%IB4", 3, Some(4))), ["%IB4", "%IB8", "%IB12"]);
+        // A bit card counts bit by bit whatever the step says.
+        assert_eq!(iecs(&card("%IX0.7", 2, Some(4))), ["%IX0.7", "%IX1.0"]);
+        // Exactly the most channels is taken, and keeps the area.
+        let Ok(full) = card("A0.0", MAX_CHANNELS, None).addresses() else {
+            unreachable!()
+        };
+        assert_eq!(full.len(), MAX_CHANNELS as usize);
+        assert!(full.iter().all(|a| a.output));
+        assert_eq!(full.last().map(PlcAddress::iec).as_deref(), Some("%QX31.7"));
+    }
+
+    #[test]
+    fn a_start_past_bit_seven_names_no_channel() {
+        let Err(why) = card("%IX0.8", 4, None).addresses() else {
+            unreachable!("bit 8 is no channel")
+        };
+        assert!(why.contains("\"%IX0.8\""), "{why}");
+        let Err(why) = card("%IW0", 0, Some(1)).addresses() else {
+            unreachable!()
+        };
+        assert_eq!(why, "no channels");
+    }
+
+    #[test]
+    fn labels_fall_back_from_tag_to_type_to_slot() {
+        let mut c = PlcCard {
+            slot: 7,
+            tag: "-A1.DO2".into(),
+            kind: "DO 8".into(),
+            ..PlcCard::default()
+        };
+        assert_eq!(c.label(), "-A1.DO2");
+        c.tag.clear();
+        assert_eq!(c.label(), "DO 8");
+        c.kind.clear();
+        assert_eq!(c.label(), "slot 7");
+    }
+
+    #[test]
+    fn problem_looks_through_every_rack_and_checks_the_slot_first() {
+        assert_eq!(problem(&[]), None);
+        let good = PlcRack {
+            name: "-A1".into(),
+            cards: vec![PlcCard::default()],
+            ..PlcRack::default()
+        };
+        let bad = PlcRack {
+            name: "-A2".into(),
+            cards: vec![
+                PlcCard::default(),
+                PlcCard {
+                    slot: MAX_SLOT + 1,
+                    channels: MAX_CHANNELS + 1,
+                    ..PlcCard::default()
+                },
+            ],
+            ..PlcRack::default()
+        };
+        let got = problem(&[good, bad]).unwrap_or_default();
+        assert!(got.starts_with("rack \"-A2\", card in slot 1000"), "{got}");
+        assert!(got.contains("the slot must be"), "{got}");
+        // A step of 1, the least, is in range.
+        let one = PlcRack {
+            cards: vec![PlcCard {
+                step: Some(1),
+                ..PlcCard::default()
+            }],
+            ..PlcRack::default()
+        };
+        assert_eq!(problem(&[one]), None);
+    }
+
+    #[test]
+    fn empty_fields_are_left_out_when_saved() {
+        let rack = PlcRack {
+            name: "-A1".into(),
+            cards: vec![card("%IW0", 2, None)],
+            ..PlcRack::default()
+        };
+        let Ok(text) = toml::to_string(&rack) else {
+            unreachable!()
+        };
+        for absent in ["description", "tag", "type", "step"] {
+            assert!(!text.contains(absent), "{absent} in {text}");
+        }
+        let Ok(back) = toml::from_str::<PlcRack>(&text) else {
+            unreachable!()
+        };
+        assert_eq!(back, rack);
+        // A rack with no keys at all reads as the default.
+        assert_eq!(toml::from_str::<PlcRack>("").ok(), Some(PlcRack::default()));
     }
 }
