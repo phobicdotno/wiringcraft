@@ -2829,6 +2829,8 @@ fn wire_tool(
     // A pin is always on the sheet; a free start, bend or end must be too.
     let off_sheet = near.is_none() && !on_paper(open, ed.page, cur);
     if off_sheet && (resp.double_clicked() || resp.clicked_by(egui::PointerButton::Primary)) {
+        // An ignored click adds no bends, so a double click after it has none to take back.
+        ed.wire_before_click = None;
         ed.message = "Click on the sheet to draw the wire.".into();
         return;
     }
