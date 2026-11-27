@@ -2617,7 +2617,7 @@ impl App {
                                 Err(e) => *error = Some(e),
                             }
                         }
-                        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                        if ui.button("Cancel").clicked() || ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
                             keep = false;
                         }
                     });
@@ -2910,7 +2910,7 @@ impl App {
                                 Err(e) => *error = Some(e),
                             }
                         }
-                        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                        if ui.button("Cancel").clicked() || ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
                             keep = false;
                         }
                     });
@@ -2942,7 +2942,7 @@ impl App {
                                 Err(e) => *error = Some(e),
                             }
                         }
-                        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                        if ui.button("Cancel").clicked() || ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
                             keep = false;
                         }
                     });
@@ -3027,7 +3027,7 @@ impl App {
                             then = Some(Box::new(move |app: &mut App| app.start_new_project(&d, &n, b.as_deref())));
                             keep = false;
                         }
-                        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                        if ui.button("Cancel").clicked() || ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
                             keep = false;
                         }
                     });
@@ -8354,6 +8354,58 @@ mod nudge_tests {
             };
             app_frame(&mut app, &ctx, vec![escape], false);
             assert!(app.dialog.is_none(), "Escape cancels");
+        }
+    }
+
+    /// Escape that cancels one of those dialogs is used up there: a shape half drawn in the
+    /// symbol editor behind it is kept.
+    #[test]
+    fn escape_on_a_path_or_macro_dialog_keeps_a_half_drawn_symbol_shape() {
+        let dialogs: [fn() -> Dialog; 4] = [
+            || Dialog::OpenPath(prefs::FolderField::typed(""), None),
+            || Dialog::SaveAsPath(prefs::FolderField::typed(""), None),
+            || Dialog::NewProject {
+                location: prefs::FolderField::typed(""),
+                name: String::new(),
+                base: String::new(),
+                error: None,
+            },
+            || Dialog::SaveMacro {
+                clip: Default::default(),
+                name: "M".into(),
+                description: String::new(),
+                error: None,
+            },
+        ];
+        for make in dialogs {
+            let (_tmp, mut app, ctx) = app(Point::new(55.0, 60.0), false);
+            theme::install_fonts(&ctx);
+            theme::apply(&ctx, app.prefs.theme);
+            let mut ed = symbol_editor::SymbolEditor::new(Vec::new());
+            ed.set_tool(symbol_editor::Tool::Line);
+            ed.click(Point::new(0.0, 0.0));
+            ed.owner = app.open.as_ref().map(|o| o.dir.clone());
+            assert!(ed.drawing_shape());
+            app.symbol_editor = Some(ed);
+            app.dialog = Some(make());
+            app_frame(&mut app, &ctx, Vec::new(), false);
+            app_frame(&mut app, &ctx, Vec::new(), false);
+            ctx.memory_mut(|m| m.stop_text_input());
+            let escape = egui::Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            };
+            app_frame(&mut app, &ctx, vec![escape], false);
+            assert!(app.dialog.is_none(), "Escape cancels");
+            assert!(
+                app.symbol_editor
+                    .as_ref()
+                    .is_some_and(symbol_editor::SymbolEditor::drawing_shape),
+                "the half drawn shape is kept"
+            );
         }
     }
 
