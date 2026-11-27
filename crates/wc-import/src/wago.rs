@@ -40,14 +40,18 @@ pub struct ConfiguredRow {
     pub quantity: Option<u32>,
 }
 
-/// How often `delim` appears in `line` outside double-quoted text, so a `;` inside a quoted
-/// header such as `"Notes; one; two"` does not make `;` look like the separator.
-fn count_unquoted(line: &str, delim: char) -> usize {
+/// How often `delim` appears in the header record of `text` outside double-quoted text, so a
+/// `;` inside a quoted header such as `"Notes; one; two"` does not make `;` look like the
+/// separator. The header ends at the first line break outside quotes, so a quoted header text
+/// that runs over a line break keeps the rest of the header in the count.
+fn count_unquoted(text: &str, delim: char) -> usize {
     let mut quoted = false;
     let mut count = 0;
-    for c in line.chars() {
+    for c in text.chars() {
         if c == '"' {
             quoted = !quoted;
+        } else if !quoted && (c == '\n' || c == '\r') {
+            break;
         } else if c == delim && !quoted {
             count += 1;
         }
@@ -58,14 +62,13 @@ fn count_unquoted(line: &str, delim: char) -> usize {
 /// Read a configured list (bytes as saved: UTF-8 with or without BOM, or Latin-1). The header
 /// must name an Index and an Article column; Type, Strip, Terminal, Manufacturer and Quantity
 /// are read when present. Rows whose quantity is not a whole number are read without one, with
-/// a warning. The separator (`;`, tab or `,`) is the one the header line holds most often
+/// a warning. The separator (`;`, tab or `,`) is the one the header holds most often
 /// outside quoted text.
 pub fn read_configured(bytes: &[u8]) -> Result<(Vec<ConfiguredRow>, Vec<String>)> {
     let text = decode(bytes);
-    let first_line = text.lines().next().unwrap_or("");
     let delim = [';', '\t', ',']
         .into_iter()
-        .max_by_key(|d| count_unquoted(first_line, *d))
+        .max_by_key(|d| count_unquoted(&text, *d))
         .unwrap_or(';');
     let rows = records(&text, delim);
     let Some((header, body)) = rows.split_first() else {
@@ -1127,6 +1130,11 @@ mod tests {
         assert_eq!(rows[0].article, "2002-1201");
         // A semicolon list keeps reading as one, commas in quoted text and all.
         let text = "Index;Article;\"Notes, one, two, three\"\r\n-X1:1;2002-1201;x\r\n";
+        let (rows, _) = read_configured(text.as_bytes()).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].article, "2002-1201");
+        // A quoted header text over a line break: the separators after it still count.
+        let text = "\"Notes\r\nmore\";Index;Article\r\nx;-X1:1;2002-1201\r\n";
         let (rows, _) = read_configured(text.as_bytes()).unwrap();
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].article, "2002-1201");
