@@ -3,7 +3,7 @@
 //! points out), run as a program.
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -59,5 +59,19 @@ fn a_symbol_without_a_vendored_copy_is_warned_about_in_reports() -> TestResult {
     let xlsx = xlsx.to_str().ok_or("path")?;
     let err = stderr(&dir, &["report", "all", "--format", "xlsx", "--out", xlsx])?;
     assert_eq!(err.matches(warning).count(), 1, "{err}");
+
+    // A closed stderr (its reader gone) drops the warning; the report is still printed.
+    let (reader, writer) = std::io::pipe()?;
+    drop(reader);
+    let out = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("-C")
+        .arg(&dir)
+        .args(["report", "plc", "--format", "csv"])
+        .stdout(Stdio::piped())
+        .stderr(writer)
+        .output()?;
+    assert!(out.status.success(), "{:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.starts_with("Address,Type,Device"), "{stdout}");
     Ok(())
 }

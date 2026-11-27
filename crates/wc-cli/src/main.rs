@@ -4140,12 +4140,12 @@ fn run(mut cli: Cli) -> Res<()> {
             // The reports are built without such a symbol (the PLC I/O list leaves its points
             // out), so it is warned about as `pdf` does.
             let (symbols, missing) = store::vendored_symbols(dir, &p);
-            for m in missing {
-                eprintln!(
-                    "warning: symbol {} has no vendored copy (run `wiringcraft lib lock`)",
-                    escape_field(&m)
-                );
-            }
+            // `warn` stops at a closed stderr instead of panicking, so the report still prints.
+            warn(
+                missing
+                    .iter()
+                    .map(|m| format!("symbol {m} has no vendored copy (run `wiringcraft lib lock`)")),
+            );
             let parts = vendored_parts(dir, &p);
             let inputs = wc_report::Inputs {
                 project: &p,
