@@ -35,11 +35,12 @@ number. Only `page add` takes the id alone, and `place`, `box`, `box-edit`, `wir
 
 | Command | What it does |
 |---|---|
-| `page add <ID> --number <N>` | Add a page. `--title`, `--size` (default `A3`), `--overview`, `--cover` |
-| `page list` | List the pages: id, number, title, symbol and wire counts, and the `cover` or `overview` mark |
+| `page add <ID> --number <N>` | Add a page. `--title`, `--size` (default `A3`), `--overview`, `--cover`, `--graphic` |
+| `page list` | List the pages: id, number, title, symbol and wire counts, and the `cover`, `overview` or `graphic` mark |
 | `page edit <ID>` | Change the `--number` and `--title`. A number another page has is refused |
 | `page size <ID> <SIZE>` | Change the sheet size. What is drawn stays where it is |
 | `page overview <ID>` | Mark it as an overview (line diagram); `--off` makes it a normal page |
+| `page graphic <ID>` | Mark it as a graphic page (drawings only; symbols and wires are refused on it). A page that has symbols or wires is refused; `--off` makes it a normal page |
 | `page cover <ID>` | Make it the cover page (any other page loses the mark); `--off` takes the mark off |
 | `page fields <ID> [key=value]...` | List the page's title-block fields, or set the page's own values |
 | `page remove <ID>` | Delete the page and everything drawn on it |
