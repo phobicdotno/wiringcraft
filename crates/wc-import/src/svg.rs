@@ -246,6 +246,21 @@ fn paints(fill: Option<&str>, parent: bool) -> bool {
     }
 }
 
+/// Whether a `fill-opacity` (a number or a percentage, a trailing `!important` ignored) is 0,
+/// so the fill draws nothing. No value, `inherit` or one that is not read takes the parent's.
+fn clear_fill(opacity: Option<&str>, parent: bool) -> bool {
+    let Some(v) = opacity else { return parent };
+    let v = split_important(v).0;
+    let n = match v.strip_suffix('%') {
+        Some(p) => p.trim().parse::<f64>().ok(),
+        None => v.parse::<f64>().ok(),
+    };
+    match n {
+        Some(n) if !n.is_nan() => n <= 0.0,
+        _ => parent,
+    }
+}
+
 /// `rgb(255,255,255)` or `rgb(100%,100%,100%)`, any spacing, already lower case.
 fn is_white_rgb(f: &str) -> bool {
     let Some(inner) = f.strip_prefix("rgb").map(str::trim_start) else {
@@ -784,6 +799,10 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
     // Whether each open element's fill paints, passed to its children; kept in step with `stack`.
     // A bool, not the fill text, so deep nesting under a long fill value keeps no copies of it.
     let mut fills: Vec<bool> = vec![false];
+    // Whether each open element's `fill-opacity` is 0, passed to its children; kept in step with
+    // `stack`. Kept apart from `fills`, so a child that sets the opacity again fills in its
+    // parent's colour.
+    let mut clear_fills: Vec<bool> = vec![false];
     // Whether each open element's `fill-rule` is `evenodd` (else `nonzero`, the default),
     // passed to its children; kept in step with `stack`.
     let mut even_odd_rules: Vec<bool> = vec![false];
@@ -819,6 +838,7 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
                 if stack.len() > 1 {
                     stack.pop();
                     fills.pop();
+                    clear_fills.pop();
                     even_odd_rules.pop();
                     shows.pop();
                     fonts.pop();
@@ -878,10 +898,16 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
         let mut m = attr(&e, "transform")
             .map(|t| parent.mul(&parse_transform(&t)))
             .unwrap_or(parent);
-        let filled = paints(
+        let paint = paints(
             presentation(&e, "fill").as_deref(),
             fills.last().copied().unwrap_or(false),
         );
+        let clear = clear_fill(
+            presentation(&e, "fill-opacity").as_deref(),
+            clear_fills.last().copied().unwrap_or(false),
+        );
+        // A fill with opacity 0 draws nothing; the outline stays.
+        let filled = paint && !clear;
         let parent_even_odd = even_odd_rules.last().copied().unwrap_or(false);
         let even_odd = match presentation(&e, "fill-rule").map(|v| split_important(&v).0.to_ascii_lowercase()) {
             Some(v) if v == "evenodd" => true,
@@ -914,7 +940,8 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
             // Hidden: no shapes, pins or text, but its children still need its state.
             if !empty {
                 stack.push(m);
-                fills.push(filled);
+                fills.push(paint);
+                clear_fills.push(clear);
                 even_odd_rules.push(even_odd);
                 shows.push(show);
                 fonts.push(fnt);
@@ -1118,7 +1145,8 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
         }
         if !empty {
             stack.push(m);
-            fills.push(filled);
+            fills.push(paint);
+            clear_fills.push(clear);
             even_odd_rules.push(even_odd);
             shows.push(show);
             fonts.push(fnt);
@@ -1557,6 +1585,25 @@ mod tests {
             <rect width="1" height="1" fill="inherit"/>
         </svg>"##;
         assert_eq!(fills_of(svg)?, vec![false, true, false, true, false]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_fill_with_opacity_zero_does_not_fill() -> Result<()> {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg">
+            <rect width="1" height="1" fill="#000" fill-opacity="0"/>
+            <rect width="1" height="1" style="fill:#000000;fill-opacity:0"/>
+            <rect width="1" height="1" fill="#000" fill-opacity="0%"/>
+            <rect width="1" height="1" fill="#000" fill-opacity="0.5"/>
+            <g fill="#000" fill-opacity="0"><rect width="1" height="1"/></g>
+            <g fill-opacity="0"><rect width="1" height="1" fill="#000"/></g>
+            <g fill="#000" fill-opacity="0"><rect width="1" height="1" fill-opacity="1"/></g>
+            <rect width="1" height="1" fill="#000" style="fill-opacity:0" fill-opacity="1"/>
+        </svg>"##;
+        assert_eq!(
+            fills_of(svg)?,
+            vec![false, false, false, true, false, false, true, false]
+        );
         Ok(())
     }
 
