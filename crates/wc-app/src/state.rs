@@ -488,6 +488,9 @@ pub struct LibraryEntry {
     pub id: String,
     pub name: String,
     pub description: String,
+    /// Searched like the name, as `wiringcraft library search` does.
+    pub category: String,
+    pub letter_code: String,
 }
 
 impl LibraryEntry {
@@ -497,13 +500,19 @@ impl LibraryEntry {
             id: id.to_owned(),
             name: s.name.clone(),
             description: s.description.clone(),
+            category: s.category.clone(),
+            letter_code: s.letter_code.clone(),
         }
     }
 
-    /// Whether every word of `query` appears, ignoring case, in the id, name or description.
-    /// An empty query matches everything.
+    /// Whether every word of `query` appears, ignoring case, in the id, name, category,
+    /// letter code or description. An empty query matches everything.
     pub fn matches(&self, query: &str) -> bool {
-        let hay = format!("{} {} {}", self.id, self.name, self.description).to_lowercase();
+        let hay = format!(
+            "{} {} {} {} {}",
+            self.id, self.name, self.category, self.letter_code, self.description
+        )
+        .to_lowercase();
         query.to_lowercase().split_whitespace().all(|w| hay.contains(w))
     }
 }
@@ -9488,6 +9497,18 @@ pub(crate) mod tests {
         o.refresh_library();
         let coil = o.library.iter().find(|e| e.id == "wc.coil").unwrap();
         assert!(coil.matches("relay"));
+    }
+
+    #[test]
+    fn the_symbol_list_searches_category_and_letter_code() {
+        let (_tmp, o) = project();
+        let breaker = o.library.iter().find(|e| e.id == "wc.breaker.1p").unwrap();
+        // Neither word is in its id, name or description, only in its category and letter code.
+        let text = format!("{} {} {}", breaker.id, breaker.name, breaker.description).to_lowercase();
+        assert!(!text.contains("protection") && !text.contains('q'), "{text}");
+        assert!(breaker.matches("protection Q"), "{breaker:?}");
+        assert!(breaker.matches("q breaker"));
+        assert!(!breaker.matches("protection relays"));
     }
 
     #[test]
