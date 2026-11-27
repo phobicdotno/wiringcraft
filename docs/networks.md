@@ -137,9 +137,9 @@ The sheet size and the frame are described in [What the PDF contains](pdf-output
 
 | Export | Networks report | Topology pages |
 |---|---|---|
-| `wiringcraft pdf --report networks` | always, also when it is empty | one per network |
-| `wiringcraft pdf --report all` | when the project has networks | one per network |
-| `wiringcraft pdf` with other reports or none | no | no |
+| `wiringcraft pdf out.pdf --report networks` | always, also when it is empty | one per network |
+| `wiringcraft pdf out.pdf --report all` | when the project has networks | one per network |
+| `wiringcraft pdf out.pdf` with other reports or none | no | no |
 | Export, PDF in the app | when it has rows | one per network |
 
 The topology pages are the last sheets in the file, after the report tables. `--page` does
