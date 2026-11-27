@@ -247,12 +247,27 @@ pub fn assistant_dir() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// The largest snap step (mm) taken from prefs.toml.
+const MAX_SNAP: f64 = 100.0;
+
 impl Prefs {
     pub fn load() -> Self {
         path()
             .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|t| toml::from_str(&t).ok())
+            .map(|t| Self::parse(&t))
             .unwrap_or_default()
+    }
+
+    /// Preferences from the text of prefs.toml, with values the app cannot use put back to
+    /// their defaults. Text that is not valid gives the defaults.
+    fn parse(text: &str) -> Self {
+        let mut p: Self = toml::from_str(text).unwrap_or_default();
+        // A snap step of 0, below 0, NaN or huge would stop the arrow keys, turn them around,
+        // place things at NaN or pull everything to the page origin.
+        if !(p.snap.is_finite() && p.snap > 0.0 && p.snap <= MAX_SNAP) {
+            p.snap = Self::default().snap;
+        }
+        p
     }
 
     pub fn save(&self) {
@@ -339,6 +354,17 @@ mod tests {
         let mut f = FolderField::typed("keep");
         assert!(f.pick(odd).is_err());
         assert_eq!(f.text, "keep", "the field is left as it was");
+    }
+
+    #[test]
+    fn a_snap_step_the_app_cannot_use_goes_back_to_the_default() {
+        assert_eq!(Prefs::parse("snap = 5.0").snap, 5.0);
+        for bad in ["snap = 0.0", "snap = -2.5", "snap = nan", "snap = inf", "snap = 1e9"] {
+            let p = Prefs::parse(&format!("show_grid = false\n{bad}"));
+            assert_eq!(p.snap, 2.5, "{bad}");
+            assert!(!p.show_grid, "the other settings are kept: {bad}");
+        }
+        assert_eq!(Prefs::parse("snap = \"x\""), Prefs::default());
     }
 
     #[test]
