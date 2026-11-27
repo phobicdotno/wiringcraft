@@ -257,15 +257,13 @@ impl PlcCard {
         })
     }
 
-    /// What the card is called on the overview: its tag, else its type, else its slot.
+    /// What the card is called on the overview: its tag, else its type, else its slot. Spaces
+    /// around the tag and type are left out, and one that is only spaces counts as none.
     pub fn label(&self) -> String {
-        if !self.tag.is_empty() {
-            self.tag.clone()
-        } else if !self.kind.is_empty() {
-            self.kind.clone()
-        } else {
-            format!("slot {}", self.slot)
-        }
+        [self.tag.trim(), self.kind.trim()]
+            .into_iter()
+            .find(|s| !s.is_empty())
+            .map_or_else(|| format!("slot {}", self.slot), str::to_owned)
     }
 }
 
@@ -367,6 +365,20 @@ mod tests {
             let got = problem(&[rack(bad)]).unwrap_or_default();
             assert!(got.contains(why) && got.starts_with("rack \"-A1\""), "{got}");
         }
+    }
+
+    #[test]
+    fn label_skips_a_tag_or_type_of_only_spaces() {
+        let card = |tag: &str, kind: &str| PlcCard {
+            slot: 3,
+            tag: tag.into(),
+            kind: kind.into(),
+            ..PlcCard::default()
+        };
+        assert_eq!(card(" -A1.DI1 ", "DI 16").label(), "-A1.DI1");
+        assert_eq!(card("  ", " DI 16x24 V DC ").label(), "DI 16x24 V DC");
+        assert_eq!(card(" ", "\t").label(), "slot 3");
+        assert_eq!(card("", "").label(), "slot 3");
     }
 
     #[test]
