@@ -805,9 +805,6 @@ pub fn draw_page(
     if !page.clouds.is_empty() || page.revision_table.is_some() {
         pen.begin_layer(Layer::Drawings);
         for c in &page.clouds {
-            if !c.is_valid() {
-                warnings.push(format!("page {}: a revision cloud has no area", page.number));
-            }
             for s in c.shapes() {
                 draw_shape(&mut pen, &s);
             }
@@ -819,18 +816,45 @@ pub fn draw_page(
         }
         pen.end_layer();
     }
+    // Each cloud problem is warned about once per page, with how many clouds share it.
+    let flat = page.clouds.iter().filter(|c| !c.is_valid()).count();
+    match flat {
+        0 => {}
+        1 => warnings.push(format!("page {}: a revision cloud has no area", page.number)),
+        n => warnings.push(format!("page {}: {n} revision clouds have no area", page.number)),
+    }
+    let mut unlisted: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut unprintable: BTreeMap<&str, usize> = BTreeMap::new();
     for c in &page.clouds {
         if project.cloud_revision(&c.revision).is_none() {
-            warnings.push(format!(
-                "page {}: a cloud carries revision {}, which the project does not list",
-                page.number, c.revision
-            ));
+            *unlisted.entry(c.revision.as_str()).or_insert(0) += 1;
         } else if !wc_core::revision::letter_prints(&c.revision) {
-            warnings.push(format!(
-                "page {}: the PDF cannot print revision {} on a cloud; it can read like another letter",
-                page.number, c.revision
-            ));
+            *unprintable.entry(c.revision.as_str()).or_insert(0) += 1;
         }
+    }
+    for (letter, n) in unlisted {
+        warnings.push(if n > 1 {
+            format!(
+                "page {}: {n} clouds carry revision {letter}, which the project does not list",
+                page.number
+            )
+        } else {
+            format!(
+                "page {}: a cloud carries revision {letter}, which the project does not list",
+                page.number
+            )
+        });
+    }
+    for (letter, n) in unprintable {
+        let on = if n > 1 {
+            format!("on {n} clouds")
+        } else {
+            "on a cloud".to_owned()
+        };
+        warnings.push(format!(
+            "page {}: the PDF cannot print revision {letter} {on}; it can read like another letter",
+            page.number
+        ));
     }
     if page.revision_table.is_some() {
         for letter in project.unprintable_revisions() {

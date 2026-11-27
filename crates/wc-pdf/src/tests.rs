@@ -2540,6 +2540,66 @@ fn an_unlisted_revision_is_reported_only_for_the_page_that_has_the_cloud() -> Re
 }
 
 #[test]
+fn cloud_warnings_are_given_once_per_page_with_a_count() -> Result<(), String> {
+    let mut project = Project::new("Revisions");
+    project.pages = vec![Page::new("p1", "1", "Power")];
+    project.add_revision("A", "", "", "").map_err(|e| e.to_string())?;
+    project.add_revision("B", "", "", "").map_err(|e| e.to_string())?;
+    for x in [20.0, 60.0, 100.0] {
+        project
+            .add_cloud("p1", Point::new(x, 50.0), Point::new(x + 30.0, 80.0), Some("B"))
+            .map_err(|e| e.to_string())?;
+    }
+    project
+        .add_cloud("p1", Point::new(20.0, 100.0), Point::new(50.0, 130.0), Some("A"))
+        .map_err(|e| e.to_string())?;
+    // Revision B is removed: its three clouds give one warning, the cloud of A none.
+    project.meta.revisions.pop();
+    let (_, report) = export(&project, &BTreeMap::new(), &Options::default());
+    let unlisted: Vec<&String> = report
+        .warnings
+        .iter()
+        .filter(|w| w.contains("which the project does not list"))
+        .collect();
+    assert_eq!(
+        unlisted,
+        ["page 1: 3 clouds carry revision B, which the project does not list"],
+        "{:?}",
+        report.warnings
+    );
+    // Two clouds without area give one warning as well.
+    for c in project.pages[0].clouds.iter_mut().take(2) {
+        c.max = c.min;
+    }
+    let (_, report) = export(&project, &BTreeMap::new(), &Options::default());
+    let flat: Vec<&String> = report.warnings.iter().filter(|w| w.contains("no area")).collect();
+    assert_eq!(
+        flat,
+        ["page 1: 2 revision clouds have no area"],
+        "{:?}",
+        report.warnings
+    );
+    // A letter the PDF cannot print, on two clouds, is reported once for them.
+    project.meta.revisions[0].letter = "Ж".into();
+    for c in project.pages[0].clouds.iter_mut().skip(2) {
+        c.revision = "Ж".into();
+    }
+    let (_, report) = export(&project, &BTreeMap::new(), &Options::default());
+    let unprintable: Vec<&String> = report
+        .warnings
+        .iter()
+        .filter(|w| w.contains("cannot print revision"))
+        .collect();
+    assert_eq!(
+        unprintable,
+        ["page 1: the PDF cannot print revision Ж on 2 clouds; it can read like another letter"],
+        "{:?}",
+        report.warnings
+    );
+    Ok(())
+}
+
+#[test]
 fn a_rack_of_three_cards_gives_plc_card_overview_pages() {
     use wc_core::plc_rack::{PlcCard, PlcRack};
     let mut project = Project::new("x");
