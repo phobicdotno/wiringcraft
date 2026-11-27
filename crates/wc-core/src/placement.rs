@@ -192,6 +192,21 @@ pub fn place(
             // A terminal (or other sub-tag) of a strip the group holds follows the strip to its
             // new tag, keeping its own number when that is free there, else taking the next free
             // number on that strip.
+            // A part of a device the group holds but placed untagged (out of tags) is untagged
+            // too: on its own it would join the family of the project's device of that name.
+            let parent_untagged = old.product.split_last().is_some_and(|(_, rest)| {
+                !rest.is_empty()
+                    && renamed
+                        .get(&DeviceTag {
+                            product: rest.to_vec(),
+                            ..old.clone()
+                        })
+                        .is_some_and(Option::is_none)
+            });
+            if parent_untagged {
+                renamed.insert(old, None);
+                continue;
+            }
             let followed = under_renamed_parent(&renamed, old);
             if first {
                 let parent_deferred = old.product.split_last().is_some_and(|(_, rest)| {
@@ -563,6 +578,45 @@ mod tests {
         .unwrap();
         assert_eq!(cable_of(&p, &placed), Some(("-W1".into(), "BN".into())));
         assert!(!p.devices.contains_key(&tag("-W2")));
+    }
+
+    #[test]
+    fn a_part_of_a_device_placed_untagged_is_placed_untagged_too() {
+        let mut p = project();
+        // Every -K1 to -K9999 is taken, -K1 by its part -K1.1 only.
+        p.devices.insert(tag("-K1.1"), Device::default());
+        for n in 2..10_000 {
+            p.devices.insert(tag(&format!("-K{n}")), Device::default());
+        }
+        let symbols = [symbol("a", "-K1"), symbol("b", "-K1.2")];
+        let none = BTreeMap::new();
+        let group = Group {
+            symbols: &symbols,
+            wires: &[],
+            graphics: &[],
+            devices: &none,
+            anchor: Point::new(0.0, 0.0),
+        };
+        let Ok(placed) = place(
+            &mut p,
+            0,
+            group,
+            Point::new(5.0, 0.0),
+            DeviceData::ProjectFirst,
+            OutOfTags::Untagged,
+        ) else {
+            unreachable!("placed")
+        };
+        let Some(page) = p.pages.first() else {
+            unreachable!("page 1")
+        };
+        let tags: Vec<Option<String>> = placed
+            .symbols
+            .iter()
+            .map(|id| page.symbol(id).and_then(|s| s.tag.as_ref()).map(ToString::to_string))
+            .collect();
+        // -K1.2 does not join the project's -K1.
+        assert_eq!(tags, [None, None]);
     }
 
     #[test]
