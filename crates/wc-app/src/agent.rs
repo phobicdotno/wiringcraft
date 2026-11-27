@@ -21,7 +21,7 @@ use wc_core::{DeviceTag, Endpoint, Page};
 
 use crate::actions::Action;
 use crate::screenshot::{self, Shot};
-use crate::state::{Open, Selection};
+use crate::state::{Open, PageKind, Selection};
 use crate::{App, Dialog};
 use wc_agent::{Pending, Started};
 
@@ -233,7 +233,7 @@ pub fn specs() -> Vec<Value> {
     vec![
         tool(
             "get_state",
-            "Overview of the open project: name, folder, branch, unsaved changes, pages (id, number, title, size, overview, cover, counts), panel layouts, devices count, open comments, the page or panel shown, the selection, whether undo is possible, and the shared session (null outside one; else role host or guest and the participants, each with name, the page number they have open, which is read-only for everyone else, and you: true for this person). Also `view`, the drawing aids as they are set now (given with or without a project open): grid (shown), auto_wire (pins that line up get a wire when the user places or moves a symbol on the canvas; symbols you place with the tools get no wire from it), live_check (checking while drawing), theme (light or dark) and chrome (classic or ribbon). Read it before run_action ToggleGrid, ToggleAutoWire, LiveCheck, ToggleTheme or ToggleChrome: those flip the setting.",
+            "Overview of the open project: name, folder, branch, unsaved changes, pages (id, number, title, size, overview, graphic, cover, counts), panel layouts, devices count, open comments, the page or panel shown, the selection, whether undo is possible, and the shared session (null outside one; else role host or guest and the participants, each with name, the page number they have open, which is read-only for everyone else, and you: true for this person). Also `view`, the drawing aids as they are set now (given with or without a project open): grid (shown), auto_wire (pins that line up get a wire when the user places or moves a symbol on the canvas; symbols you place with the tools get no wire from it), live_check (checking while drawing), theme (light or dark) and chrome (classic or ribbon). Read it before run_action ToggleGrid, ToggleAutoWire, LiveCheck, ToggleTheme or ToggleChrome: those flip the setting.",
             json!({}),
             &[],
         ),
@@ -396,8 +396,8 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "update_page",
-            "Change a page's number, title or sheet size, mark it as an overview (a line diagram: its devices do not count as drawings in the project check), make it the project's cover page (it shows the project's name and fields; any other cover page loses the mark), or set the page's own title-block fields (get_page lists them).",
-            json!({"page": page_arg(), "number": {"type": "string"}, "title": {"type": "string"}, "size": {"type": "string", "description": "A4, A3, A2, A1 or A0 (landscape), the same with -portrait (A4-portrait), or WIDTHxHEIGHT in millimetres (500x700)"}, "overview": {"type": "boolean"}, "cover": {"type": "boolean"}, "title_block": {"type": "object", "additionalProperties": {"type": ["string", "null"]}, "description": "The page's own title-block fields to change, such as revision, date, drawn_by, checked_by. They win over the project's on this page. An empty text or null clears a field so the project's shows again; fields left out are kept."}}),
+            "Change a page's number, title or sheet size, mark it as an overview (a line diagram: its devices do not count as drawings in the project check) or as a graphic page (drawings only: symbols and wires are refused on it, and a page that has some cannot become one; overview and graphic exclude each other), make it the project's cover page (it shows the project's name and fields; any other cover page loses the mark), or set the page's own title-block fields (get_page lists them).",
+            json!({"page": page_arg(), "number": {"type": "string"}, "title": {"type": "string"}, "size": {"type": "string", "description": "A4, A3, A2, A1 or A0 (landscape), the same with -portrait (A4-portrait), or WIDTHxHEIGHT in millimetres (500x700)"}, "overview": {"type": "boolean"}, "graphic": {"type": "boolean"}, "cover": {"type": "boolean"}, "title_block": {"type": "object", "additionalProperties": {"type": ["string", "null"]}, "description": "The page's own title-block fields to change, such as revision, date, drawn_by, checked_by. They win over the project's on this page. An empty text or null clears a field so the project's shows again; fields left out are kept."}}),
             &[],
         ),
         tool(
@@ -1092,7 +1092,7 @@ impl Open {
         let (w, h) = p.size.mm();
         json!({
             "id": p.id, "number": p.number, "title": p.title, "size": p.size,
-            "overview": p.overview, "cover": p.cover,
+            "overview": p.overview, "graphic": p.graphic, "cover": p.cover,
             "title_block": p.title_block,
             "size_mm": [w, h],
             "symbols": symbols, "wires": wires, "graphics": graphics,
@@ -1894,7 +1894,7 @@ impl App {
                 let cur = open.project.pages.get(i).cloned().ok_or("The page was not added.")?;
                 let number = s(v, "number").unwrap_or(&cur.number).to_owned();
                 let title = s(v, "title").unwrap_or(&cur.title).to_owned();
-                i = open.set_page_props(i, &number, &title, size.unwrap_or(cur.size), cur.overview, None)?;
+                i = open.set_page_props(i, &number, &title, size.unwrap_or(cur.size), PageKind::of(&cur), None)?;
                 let p = open.project.pages.get(i).cloned().ok_or("The page was not added.")?;
                 self.go_to(i);
                 Ok(format!("Added page {} ({}), id {}.", p.number, p.title, p.id))
@@ -1922,12 +1922,22 @@ impl App {
                     ),
                     Some(_) => return Err("title_block must be an object of field names and texts.".into()),
                 };
+                let overview = v.get("overview").and_then(Value::as_bool).unwrap_or(cur.overview);
+                let graphic = v.get("graphic").and_then(Value::as_bool).unwrap_or(cur.graphic);
+                let kind = match (overview, graphic) {
+                    (true, true) => {
+                        return Err("A page cannot be both an overview and a graphic page.".into());
+                    }
+                    (true, false) => PageKind::Overview,
+                    (false, true) => PageKind::Graphic,
+                    (false, false) => PageKind::Schematic,
+                };
                 let i = open.set_page_props(
                     page,
                     s(v, "number").unwrap_or(&cur.number),
                     s(v, "title").unwrap_or(&cur.title),
                     size.unwrap_or(cur.size),
-                    v.get("overview").and_then(Value::as_bool).unwrap_or(cur.overview),
+                    kind,
                     fields.as_ref(),
                 )?;
                 if let Some(cover) = v.get("cover").and_then(Value::as_bool) {
@@ -2446,7 +2456,7 @@ impl App {
             .map(|p| {
                 json!({
                     "id": p.id, "number": p.number, "title": p.title, "size": p.size,
-                    "overview": p.overview, "cover": p.cover,
+                    "overview": p.overview, "graphic": p.graphic, "cover": p.cover,
                     "symbols": p.symbols.len(), "wires": p.wires.len(), "graphics": p.graphics.len()
                 })
             })
@@ -2696,6 +2706,9 @@ impl App {
         let page = self.page_of(v, "page")?;
         let via = points(v, "via")?.unwrap_or_default();
         let open = need_open(self.open.as_mut())?;
+        if let Some(why) = open.graphic_reason(page, "Wires") {
+            return Err(why);
+        }
         let from = open.endpoint(page, v.get("from"))?;
         let to = open.endpoint(page, v.get("to"))?;
         if from == to {
@@ -7055,7 +7068,7 @@ mod tests {
             "99",
             "Renamed",
             schematic.size,
-            false,
+            PageKind::Schematic,
             &Default::default(),
         );
         assert!(refused.is_err_and(|e| e.contains("Ola")));

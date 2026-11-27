@@ -916,6 +916,11 @@ impl Open {
         if clip.is_empty() || self.project.pages.get(page).is_none() || self.held_reason(page).is_some() {
             return Ok(Vec::new());
         }
+        if (!clip.symbols.is_empty() || !clip.wires.is_empty())
+            && let Some(why) = self.graphic_reason(page, "Symbols and wires")
+        {
+            return Err(why);
+        }
         // Every symbol it uses, checked against its pin (a loaded copy may be another version);
         // those copied from another project are taken from the library when possible.
         let ids: std::collections::BTreeSet<&str> = clip.symbols.iter().map(|s| s.symbol.as_str()).collect();
