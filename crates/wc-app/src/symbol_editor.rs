@@ -474,16 +474,26 @@ impl SymbolEditor {
             Tool::Arc => {
                 self.clicks.push(p);
                 if let [c, s, e] = self.clicks[..] {
-                    self.clicks.clear();
                     let radius = ((s.x - c.x).powi(2) + (s.y - c.y).powi(2)).sqrt();
                     if radius == 0.0 || e == c {
+                        self.clicks.clear();
                         return;
                     }
+                    let (start, end) = (angle(c, s), angle(c, e));
+                    // An end in the start's direction would make a full circle: keep the
+                    // centre and start and wait for another end, as dragging an end does.
+                    let turn = (end - start).rem_euclid(360.0);
+                    if !(1e-9..=360.0 - 1e-9).contains(&turn) {
+                        self.clicks.pop();
+                        self.message = "The arc would end where it starts; click another end.".into();
+                        return;
+                    }
+                    self.clicks.clear();
                     self.add_shape(Shape::Arc {
                         center: c,
                         radius,
-                        start: angle(c, s),
-                        end: angle(c, e),
+                        start,
+                        end,
                     });
                 }
             }
@@ -1813,6 +1823,31 @@ mod tests {
         e.end_drag();
         assert_eq!(e.symbol.graphics[0], arc);
         assert!(e.undo.is_empty());
+    }
+
+    #[test]
+    fn an_arc_end_clicked_in_the_start_direction_draws_no_circle() {
+        let mut e = SymbolEditor::new(Vec::new());
+        e.set_tool(Tool::Arc);
+        // The end on the start itself, then further out on the same line from the centre.
+        for p in [(0.0, 0.0), (5.0, 0.0), (5.0, 0.0), (10.0, 0.0)] {
+            e.click(Point::new(p.0, p.1));
+        }
+        assert!(e.symbol.graphics.is_empty());
+        assert!(e.undo.is_empty());
+        assert!(!e.message.is_empty());
+        assert_eq!(e.clicks, [Point::new(0.0, 0.0), Point::new(5.0, 0.0)]);
+        // Another end still finishes the arc from the same centre and start.
+        e.click(Point::new(0.0, 5.0));
+        assert_eq!(
+            e.symbol.graphics,
+            [Shape::Arc {
+                center: Point::new(0.0, 0.0),
+                radius: 5.0,
+                start: 0.0,
+                end: 90.0
+            }]
+        );
     }
 
     #[test]
