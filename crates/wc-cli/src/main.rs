@@ -10,7 +10,7 @@ use wc_core::project::LibrarySource;
 use wc_core::{DeviceTag, Endpoint, Page, PageSize, PlacedSymbol, Project, Wire, store};
 use wc_import::run::{
     self, escape_field, kicad_prefix, load, page_mut, put_file_back, put_files_back, read_file, read_kicad_described,
-    save, snapshot_project, terminal_numbers_with, vendored_bytes, write_kicad,
+    save, snapshot_project, terminal_numbers_after, vendored_bytes, write_kicad,
 };
 #[cfg(test)]
 use wc_import::run::{
@@ -2488,20 +2488,34 @@ fn take_macro_items(dir: &Path, p: &mut Project, m: &wc_core::macros::Macro, aga
     // back with the macro, and can turn placed items into terminals. A strip
     // that renumbers is refused here, before any copy is written, as the
     // imports do. A symbol that cannot be fetched is reported by the loop below.
+    // A symbol without a pin is taken from the library also when the project
+    // has a readable copy, so the library's version is checked against that
+    // copy the same way. The loop below writes the version checked here, by
+    // its hash.
+    let mut checked: std::collections::BTreeMap<&str, String> = std::collections::BTreeMap::new();
     if p.meta.follows_terminals() {
         let mut brings: Vec<wc_core::Symbol> = Vec::new();
+        let mut replaces: Vec<wc_core::Symbol> = Vec::new();
         for id in symbols.iter().copied() {
             let placed = p.pages.iter().any(|pg| pg.symbols.iter().any(|ps| ps.symbol == id));
-            if !placed || store::read_vendored_symbol(dir, id).is_ok() {
+            if !placed {
                 continue;
             }
+            let readable = store::read_vendored_symbol(dir, id).is_ok();
             let pin = p.lock.symbols.get(id);
-            // A pinned copy that is there but cannot be read is not replaced.
-            if pin.is_some() && store::vendor_path(dir, ItemKind::Symbol, id).is_ok_and(|f| f.exists()) {
+            // A pinned copy is kept, also one that is there but cannot be read.
+            if pin.is_some() && (readable || store::vendor_path(dir, ItemKind::Symbol, id).is_ok_and(|f| f.exists())) {
                 continue;
             }
+            // A library that cannot be opened or read for a symbol without a pin stops here:
+            // the loop below would read it again, and could then write a version this check
+            // never saw.
             if lib.is_none() {
-                lib = wc_library::Library::open(dir, p).ok();
+                lib = match (wc_library::Library::open(dir, p), pin) {
+                    (Ok(lib), _) => Some(lib),
+                    (Err(why), None) => return Err(e(why)),
+                    (Err(_), Some(_)) => None,
+                };
             }
             let Some(lib) = &lib else { break };
             let found = match pin {
@@ -2514,11 +2528,19 @@ fn take_macro_items(dir: &Path, p: &mut Project, m: &wc_core::macros::Macro, aga
                         }
                     })
                     .ok(),
-                None => lib.symbol(id).ok().map(|(s, _)| s),
+                None => Some(lib.symbol(id).map_err(e)?.0),
             };
-            brings.extend(found);
+            let Some(found) = found else { continue };
+            if pin.is_none() {
+                checked.insert(id, found.hash());
+            }
+            if readable {
+                replaces.push(found);
+            } else {
+                brings.push(found);
+            }
         }
-        terminal_numbers_with(dir, p, &brings, "macro", again)?;
+        terminal_numbers_after(dir, p, &brings, &replaces, "macro", again)?;
     }
     let items = symbols
         .into_iter()
@@ -2597,7 +2619,11 @@ fn take_macro_items(dir: &Path, p: &mut Project, m: &wc_core::macros::Macro, aga
                 }
             }
             None => {
-                wc_library::take(dir, p, lib, kind, id).map_err(e)?;
+                match checked.get(id).filter(|_| kind == ItemKind::Symbol) {
+                    Some(hash) => wc_library::take_version(dir, p, lib, kind, id, hash),
+                    None => wc_library::take(dir, p, lib, kind, id),
+                }
+                .map_err(e)?;
             }
         }
     }
@@ -10820,6 +10846,103 @@ mod tests {
         let p = load(&dir).unwrap();
         assert_eq!(p.meta.jumpers[0].terminals, ["1", "2"]);
         assert_eq!(p.pages[0].symbols.len(), 4);
+    }
+
+    #[test]
+    fn a_macro_that_replaces_an_unpinned_symbol_does_not_move_jumpers_to_other_terminals() {
+        replacing_an_unpinned_symbol_keeps_jumpers(false);
+    }
+
+    #[test]
+    fn generated_pages_that_replace_an_unpinned_symbol_do_not_move_jumpers_to_other_terminals() {
+        replacing_an_unpinned_symbol_keeps_jumpers(true);
+    }
+
+    /// `macro place`, or with `generate` `macro generate`, of a macro whose symbol the project
+    /// has an unpinned copy of that differs from the library's.
+    fn replacing_an_unpinned_symbol_keeps_jumpers(generate: bool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let sym = |id: &str, name: &str, role: wc_core::symbol::SymbolRole| wc_core::Symbol {
+            source: String::new(),
+            id: id.into(),
+            name: name.into(),
+            category: String::new(),
+            letter_code: "X".into(),
+            role,
+            graphics: vec![],
+            pins: vec![],
+            tag_at: Default::default(),
+            description: String::new(),
+        };
+        let terminal = wc_core::symbol::SymbolRole::Terminal;
+        let placed = |id: &str, symbol: &str, x: f64| PlacedSymbol {
+            id: id.into(),
+            symbol: symbol.into(),
+            at: Point::new(x, 10.0),
+            rotation: Rotation::default(),
+            mirror: false,
+            tag: DeviceTag::parse("-X1").ok(),
+        };
+        // The library's version of the symbol is a terminal; the project's readable copy, which
+        // has no pin, is not. A project macro uses the symbol.
+        let lib = tmp.path().join("lib");
+        wc_library::write_symbol(&lib, &sym("test.loose", "Library", terminal)).unwrap();
+        cli(&dir, &["lib", "add", "mine", "folder", lib.to_str().unwrap()]).unwrap();
+        std::fs::create_dir_all(dir.join("macros")).unwrap();
+        std::fs::write(
+            dir.join("macros/one.json"),
+            r#"{"name": "One", "anchor": {"x": 0.0, "y": 0.0}, "placeholders": [{"name": "note", "default": "-"}],
+            "symbols": [{"id": "s1", "symbol": "test.loose", "at": {"x": 10.0, "y": 10.0}, "tag": "-K1"}]}"#,
+        )
+        .unwrap();
+        let table = tmp.path().join("rows.csv");
+        std::fs::write(&table, "note\nfirst\nsecond\n").unwrap();
+        let mut p = load(&dir).unwrap();
+        // Jumper 1-2 is b-c. With the library's version a becomes terminal 1 and the jumper
+        // would sit on a-b.
+        store::write_vendored_symbol(&dir, &sym("test.loose", "Own", Default::default())).unwrap();
+        store::write_vendored_symbol(&dir, &sym("test.term", "Terminal", terminal)).unwrap();
+        p.pages[0].symbols.extend([
+            placed("a", "test.loose", 10.0),
+            placed("b", "test.term", 20.0),
+            placed("c", "test.term", 30.0),
+        ]);
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        p.meta.add_jumper(&x1, &["1".into(), "2".into()]).unwrap();
+        store::save(&dir, &p).unwrap();
+        let page = p.pages[0].id.clone();
+        let place = || {
+            if generate {
+                cli(&dir, &["macro", "generate", "one", "--table", table.to_str().unwrap()])
+            } else {
+                cli(&dir, &["macro", "place", &page, "one", "--at", "100,100"])
+            }
+        };
+        let before = load(&dir).unwrap();
+        let err = place().unwrap_err();
+        assert!(err.contains("jumpers and rail order of -X1"), "{err}");
+        assert!(
+            err.contains("the macro replaces the project's copy of test.loose"),
+            "{err}"
+        );
+        let again = if generate {
+            "generate the pages again"
+        } else {
+            "place the macro again"
+        };
+        assert!(err.contains(again), "{err}");
+        assert_eq!(store::read_vendored_symbol(&dir, "test.loose").unwrap().name, "Own");
+        assert_eq!(load(&dir).unwrap(), before, "nothing saved");
+        // A library version that leaves the terminals as they are is taken and pinned.
+        let same = sym("test.loose", "Library", Default::default());
+        wc_library::write_symbol(&lib, &same).unwrap();
+        place().unwrap();
+        let p = load(&dir).unwrap();
+        assert_eq!(p.meta.jumpers[0].terminals, ["1", "2"]);
+        assert_eq!(p.lock.symbols["test.loose"].hash, same.hash());
+        assert_eq!(store::read_vendored_symbol(&dir, "test.loose").unwrap().name, "Library");
     }
 
     #[test]

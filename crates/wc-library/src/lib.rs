@@ -386,6 +386,30 @@ pub fn take(project_dir: &Path, project: &mut Project, lib: &Library, kind: Item
     store_item(project_dir, project, id, item)
 }
 
+/// [`take`], but only the version with `hash`, which the caller has looked at: a library that
+/// holds another version by now is refused and nothing is written.
+pub fn take_version(
+    project_dir: &Path,
+    project: &mut Project,
+    lib: &Library,
+    kind: ItemKind,
+    id: &str,
+    hash: &str,
+) -> Result<LockEntry> {
+    let item = fetch(lib, kind, id, None)?;
+    let (what, entry) = match &item {
+        Fetched::Symbol(_, entry) => ("symbol", entry),
+        Fetched::Part(_, entry) => ("part", entry),
+    };
+    if entry.hash != hash {
+        return Err(Error::Source {
+            name: entry.source.clone(),
+            message: format!("the {what} {id} changed in the library while it was being read; run the command again"),
+        });
+    }
+    store_item(project_dir, project, id, item)
+}
+
 /// An item read from the library to be written into a project, with its lock entry.
 enum Fetched {
     Symbol(Symbol, LockEntry),

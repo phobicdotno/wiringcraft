@@ -169,7 +169,7 @@ places them. Texts in a macro can hold placeholders, `{{name}}`, filled from a n
 | `macro list` | The macros, project first, with their value sets. |
 | `macro show <name>` | Description, placeholders, value sets, the placeholders its texts use, and a problem `edit` would refuse to save. |
 | `macro edit <name> [options]` | Change a project macro's description, placeholders and value sets. A library's macros are not edited here. |
-| `macro place <page> <name> --at x,y` | Place it with its top-left corner at `--at` (mm). `--set <set>` picks the value set (needed when it has any); `--value name=value` (repeatable) overrides one value. The symbols it uses and the parts its devices and accessories name are copied into the project and pinned, as `device --part` does (a part no library has stays a plain name). When that would bring back a symbol the project already places but has no readable copy of, and a strip with jumpers or a rail order would be numbered differently with it, nothing is placed: restore the file first. Prints the new symbol ids. |
+| `macro place <page> <name> --at x,y` | Place it with its top-left corner at `--at` (mm). `--set <set>` picks the value set (needed when it has any); `--value name=value` (repeatable) overrides one value. The symbols it uses and the parts its devices and accessories name are copied into the project and pinned, as `device --part` does (a part no library has stays a plain name). When that would bring back a symbol the project already places but has no readable copy of, and a strip with jumpers or a rail order would be numbered differently with it, nothing is placed: restore the file first. The same holds when a symbol without a pin, which is taken from the library again, is a terminal in the library and not in the project's copy (or the other way round). Prints the new symbol ids. |
 | `macro generate <name> --table <file>` | Generate pages from a table (CSV or `.xlsx`): one copy of the macro per row, the cells filling its placeholders. See [Pages from a table](#pages-from-a-table). Prints the new page ids and the number of copies. |
 
 `macro edit` options, all repeatable except `--description`:
@@ -248,6 +248,9 @@ Set;kW;Section
   10 mm apart (counting the widest text any copy draws), with the macro's anchor on the 5 mm
   grid. A full page starts the next one. A
   macro larger than the page's drawing area is refused.
+- The symbols and parts are taken as `macro place` takes them, with the same refusals for a
+  strip with jumpers or a rail order: a symbol the project places but has no readable copy of,
+  and a symbol without a pin whose library version changes which items are terminals.
 - Tags are renumbered as `macro place` does them: three rows of a `-Q1` starter give `-Q1`,
   `-Q2` and `-Q3` (or the next free ones).
 - The table can be a CSV file (comma, semicolon or tab, UTF-8 or Windows-1252) or an Excel
