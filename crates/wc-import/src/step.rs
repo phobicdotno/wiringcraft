@@ -1041,9 +1041,12 @@ mod edge_tests {
 
     #[test]
     fn bezier_and_uniform_curves_count_their_control_points() {
+        // The end points are vertices, so loose points are not measured: only the curve's
+        // middle control point gives the height.
         for kind in ["BEZIER_CURVE", "UNIFORM_CURVE", "QUASI_UNIFORM_CURVE"] {
             let data = format!(
                 "#1=CARTESIAN_POINT('',(0.,0.,0.));#2=CARTESIAN_POINT('',(4.,9.,0.));#3=CARTESIAN_POINT('',(8.,0.,2.));\n\
+                 #5=VERTEX_POINT('',#1);#6=VERTEX_POINT('',#3);\n\
                  #4={kind}('',2,(#1,#2,#3),.UNSPECIFIED.,.F.,.F.);"
             );
             let (s, _) = size(&step(MM, &data));
