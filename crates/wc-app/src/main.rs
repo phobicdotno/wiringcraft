@@ -2834,6 +2834,7 @@ impl App {
                     let r = ui
                         .horizontal(|ui| {
                             let r = ui.add(egui::TextEdit::singleline(&mut path.text).desired_width(340.0));
+                            focus_on_open(ui, &r);
                             if ui.button("Browse…").clicked() {
                                 match pick_folder_for("Open project", path) {
                                     Picked::Path(d) => *error = path.pick(d).err(),
@@ -2874,6 +2875,7 @@ impl App {
                 Dialog::SaveAsPath(path, error) => {
                     ui.label("Folder for the copy (new, or empty):");
                     let r = ui.add(egui::TextEdit::singleline(&mut path.text).desired_width(380.0));
+                    focus_on_open(ui, &r);
                     if let Some(e) = error {
                         ui.label(RichText::new(e.as_str()).color(theme::Theme::of(ui.ctx()).error));
                     }
@@ -5308,6 +5310,19 @@ fn arrow_steps(i: &egui::InputState, step: f64) -> Vec<wc_core::geom::Point> {
         })
         .map(|(x, y)| wc_core::geom::Point::new(x, y))
         .collect()
+}
+
+/// Puts the cursor in `field` in the first frame a dialog shows it, as a person opening the
+/// dialog expects to type straight away. Remembered per field: a field seen in the previous
+/// frame keeps whatever focus the person gave it; one not seen then is a dialog just opened.
+fn focus_on_open(ui: &egui::Ui, field: &egui::Response) {
+    let key = field.id.with("seen in pass");
+    let pass = ui.ctx().cumulative_pass_nr();
+    let seen: Option<u64> = ui.data(|d| d.get_temp(key));
+    if seen.is_none_or(|s| s + 1 < pass) {
+        field.request_focus();
+    }
+    ui.data_mut(|d| d.insert_temp(key, pass));
 }
 
 /// A project's title-block fields as form rows: the standard fields first (empty when not
@@ -9348,6 +9363,35 @@ mod nudge_tests {
             Point::new(205.0, 100.0),
             "the second moves"
         );
+    }
+
+    /// What the open path dialog's field holds; None when no path dialog is open.
+    fn typed_path(app: &App) -> Option<&str> {
+        match &app.dialog {
+            Some(Dialog::OpenPath(p, _) | Dialog::SaveAsPath(p, _)) => Some(&p.text),
+            _ => None,
+        }
+    }
+
+    /// Open project and Save as take typing at once: the path field has the cursor.
+    #[test]
+    fn the_path_dialogs_open_with_the_cursor_in_the_path_field() {
+        let dialogs: [fn() -> Dialog; 2] = [
+            || Dialog::OpenPath(prefs::FolderField::typed(""), None),
+            || Dialog::SaveAsPath(prefs::FolderField::typed(""), None),
+        ];
+        for make in dialogs {
+            let (_tmp, mut app, ctx) = app(Point::new(55.0, 60.0), false);
+            theme::install_fonts(&ctx);
+            app.dialog = Some(make());
+            app_frame(&mut app, &ctx, Vec::new(), false);
+            app_frame(&mut app, &ctx, vec![egui::Event::Text("x".into())], false);
+            assert_eq!(typed_path(&app), Some("x"));
+            // Focus taken away stays away: the field asks for it only when the dialog opens.
+            ctx.memory_mut(|m| m.stop_text_input());
+            app_frame(&mut app, &ctx, vec![egui::Event::Text("y".into())], false);
+            assert_eq!(typed_path(&app), Some("x"));
+        }
     }
 }
 
