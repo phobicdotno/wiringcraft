@@ -486,3 +486,97 @@ fn an_unreadable_macro_file_is_named_escaped() -> TestResult {
     assert!(err.contains("p\\u{1b}[2J"), "{err:?}");
     Ok(())
 }
+
+#[test]
+fn a_table_generates_pages_with_one_macro_copy_per_row() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    wiringcraft(&dir, &["page", "add", "p1", "--number", "2"])?;
+    let coil = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library/symbols/wc.coil.json");
+    let lib = tmp.path().join("lib");
+    std::fs::create_dir_all(lib.join("symbols"))?;
+    std::fs::create_dir_all(lib.join("macros"))?;
+    std::fs::copy(coil, lib.join("symbols/wc.coil.json"))?;
+    std::fs::write(lib.join("macros/starter.json"), STARTER)?;
+    wiringcraft(&dir, &["lib", "add", "mine", "folder", lib.to_str().ok_or("path")?])?;
+    let pages_before = wc_core::store::load(&dir)?.pages.len();
+
+    // A typo in a column name is refused before anything changes.
+    let typo = tmp.path().join("typo.csv");
+    std::fs::write(&typo, "kw;sectoin\n1;2\n")?;
+    let Err(err) = wiringcraft(
+        &dir,
+        &["macro", "generate", "starter", "--table", typo.to_str().ok_or("path")?],
+    ) else {
+        return Err("generated from a table with an unknown column".into());
+    };
+    assert!(
+        err.contains("\"sectoin\"") && err.contains("kW, part, section"),
+        "{err}"
+    );
+    // A row without a value set names its line, and nothing is placed.
+    let table = tmp.path().join("motors.csv");
+    std::fs::write(&table, "Set;kW;Section\n3 kW;;\n\n0.75 kW;0.8;\n;5.5;4 mm²\n")?;
+    let Err(err) = wiringcraft(
+        &dir,
+        &["macro", "generate", "starter", "--table", table.to_str().ok_or("path")?],
+    ) else {
+        return Err("generated a row without a value set".into());
+    };
+    assert!(err.contains("line 5") && err.contains("choose a value set"), "{err}");
+    assert_eq!(wc_core::store::load(&dir)?.pages.len(), pages_before);
+
+    let out = wiringcraft(
+        &dir,
+        &[
+            "macro",
+            "generate",
+            "starter",
+            "--table",
+            table.to_str().ok_or("path")?,
+            "--set",
+            "3 kW",
+            "--title",
+            "Motors",
+            "--size",
+            "A4",
+        ],
+    )?;
+    assert_eq!(out, "p0002\n3 copies of Motor starter on 1 page\n");
+    let p = wc_core::store::load(&dir)?;
+    let page = p.page("p0002").ok_or("page")?;
+    assert_eq!((page.number.as_str(), page.title.as_str()), ("3", "Motors"));
+    let rows: Vec<(String, String, Option<String>)> = page
+        .symbols
+        .iter()
+        .map(|s| {
+            let tag = s.tag.clone().ok_or("tag")?;
+            let device = p.devices.get(&tag).ok_or("device")?;
+            Ok((tag.to_string(), device.description.clone(), device.part.clone()))
+        })
+        .collect::<Result<_, &str>>()?;
+    assert_eq!(
+        rows,
+        [
+            ("-Q1".into(), "Starter 3 kW".into(), Some("SIE.3RV2011-1GA10".into())),
+            ("-Q2".into(), "Starter 0.8 kW".into(), Some("SIE.3RV2011-1AA10".into())),
+            ("-Q3".into(), "Starter 5.5 kW".into(), Some("SIE.3RV2011-1GA10".into())),
+        ]
+    );
+    let sections: Vec<Option<&str>> = page.wires.iter().map(|w| w.spec.section.as_deref()).collect();
+    assert_eq!(sections, [Some("2.5 mm²"), Some("1.5 mm²"), Some("4 mm²")]);
+    // Side by side, on the grid, in the same row.
+    let xs: Vec<f64> = page.symbols.iter().map(|s| s.at.x).collect();
+    let ys: Vec<f64> = page.symbols.iter().map(|s| s.at.y).collect();
+    assert!(xs.windows(2).all(|w| w[0] < w[1]), "{xs:?}");
+    assert!(ys.windows(2).all(|w| w[0] == w[1]), "{ys:?}");
+    assert!(xs.iter().chain(&ys).all(|v| v % 5.0 == 0.0), "{xs:?} {ys:?}");
+    assert!(p.lock.symbols.contains_key("wc.coil"));
+    Ok(())
+}

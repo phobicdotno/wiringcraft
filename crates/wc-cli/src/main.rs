@@ -786,6 +786,28 @@ enum MacroCmd {
         #[arg(long = "value", value_name = "NAME=VALUE")]
         values: Vec<String>,
     },
+    /// Generate schematic pages from a table: place the macro once per row, each row's cells
+    /// filling its placeholders. The table (CSV or an `.xlsx` workbook) names its columns in
+    /// its first row: a placeholder's name fills that placeholder, a column `set` picks the
+    /// row's value set (over `--set`), and an empty cell leaves the value set's or default
+    /// value. The copies go on new pages after the last one, left to right and row below
+    /// row, each with the next free tags. Prints the new pages' ids and the number of copies.
+    Generate {
+        /// The macro's name or file name.
+        name: String,
+        /// The table, a CSV file or an Excel workbook (`.xlsx`, its first visible sheet).
+        #[arg(long)]
+        table: PathBuf,
+        /// The value set for rows that do not name one in a `set` column.
+        #[arg(long)]
+        set: Option<String>,
+        /// The new pages' title (the macro's name if left out).
+        #[arg(long)]
+        title: Option<String>,
+        /// The new pages' size, as `page add --size` takes it.
+        #[arg(long, default_value = "A3")]
+        size: String,
+    },
     /// Show a macro: its description, placeholders (name, default, description), value sets,
     /// the placeholders its texts use, and a problem `edit` would refuse to save.
     Show {
@@ -2088,6 +2110,7 @@ impl Cmd {
                 ImportCmd::Swe { path, symbol_map, .. } => std::iter::once(path).chain(symbol_map).collect(),
                 ImportCmd::SymbolQet { files, .. } => files.iter_mut().collect(),
             },
+            Cmd::Macro(MacroCmd::Generate { table, .. }) => vec![table],
             _ => Vec::new(),
         }
     }
@@ -2416,6 +2439,110 @@ struct FoundMacro {
     project: bool,
 }
 
+/// Make sure the symbols and parts `m` (an applied macro) uses are in the project, as
+/// `macro place` needs them.
+fn take_macro_items(dir: &Path, p: &mut Project, m: &wc_core::macros::Macro) -> Res<()> {
+    // A pinned symbol or part keeps its pinned version: a missing copy is put
+    // back from a library that still has that version, never from a newer one.
+    // One without a pin is taken from the library and pinned, also when a copy
+    // is left from an earlier attempt that failed before it was pinned. The
+    // parts are those the macro's devices and their accessories name, as
+    // `device --part` takes them; a part no library has is left as it is.
+    let symbols: std::collections::BTreeSet<&str> = m.symbols.iter().map(|s| s.symbol.as_str()).collect();
+    let parts: std::collections::BTreeSet<&str> = m
+        .devices
+        .values()
+        .flat_map(|d| d.part.iter().chain(d.accessories.iter().map(|a| &a.part)))
+        .map(|id| id.trim())
+        .filter(|id| !id.is_empty())
+        .collect();
+    let items = symbols
+        .into_iter()
+        .map(|id| (ItemKind::Symbol, id))
+        .chain(parts.into_iter().map(|id| (ItemKind::Part, id)));
+    // The library is opened only when an item needs it, so a macro whose
+    // symbols and parts all have their pinned copies works without it.
+    let mut lib: Option<wc_library::Library> = None;
+    for (kind, id) in items {
+        let what = match kind {
+            ItemKind::Symbol => "symbol",
+            ItemKind::Part => "part",
+        };
+        let pin = match kind {
+            ItemKind::Symbol => p.lock.symbols.get(id),
+            ItemKind::Part => p.lock.parts.get(id),
+        }
+        .cloned();
+        if pin.is_some() {
+            let vendored = store::vendor_path(dir, kind, id).map_err(e)?;
+            if vendored.exists() {
+                // A copy that cannot be read is reported now, not after saving.
+                match kind {
+                    ItemKind::Symbol => store::read_vendored_symbol(dir, id).map(drop),
+                    ItemKind::Part => store::read_vendored_part(dir, id).map(drop),
+                }
+                .map_err(e)?;
+                continue;
+            }
+        }
+        // A part no library has stays a name on the device, as before: `check`
+        // reports it, and value sets may name parts kept elsewhere.
+        if pin.is_none() && kind == ItemKind::Part {
+            if lib.is_none() {
+                match wc_library::Library::open(dir, p) {
+                    Ok(opened) => lib = Some(opened),
+                    Err(_) => continue,
+                }
+            }
+            if lib.as_ref().is_none_or(|lib| lib.locate(kind, id).is_none()) {
+                continue;
+            }
+        }
+        let lib = match &mut lib {
+            Some(lib) => &*lib,
+            None => &*lib.insert(wc_library::Library::open(dir, p).map_err(e)?),
+        };
+        match pin {
+            Some(pin) => {
+                let fits = |found: &str, hash: String| {
+                    if found != id {
+                        Err(format!("its file holds {found}"))
+                    } else if hash != pin.hash {
+                        Err("another version".to_owned())
+                    } else {
+                        Ok(())
+                    }
+                };
+                let missing = |why: String| {
+                    format!(
+                        "{what} {id}: its copy in the project is missing and no library has the version the project pins ({why})"
+                    )
+                };
+                match kind {
+                    ItemKind::Symbol => {
+                        let s = lib
+                            .find_version(kind, id, &pin.source, |s: &wc_core::Symbol| fits(&s.id, s.hash()))
+                            .map_err(missing)?;
+                        store::write_vendored_symbol(dir, &s).map_err(e)?;
+                    }
+                    ItemKind::Part => {
+                        let part = lib
+                            .find_version(kind, id, &pin.source, |part: &wc_core::Part| {
+                                fits(&part.id, part.hash())
+                            })
+                            .map_err(missing)?;
+                        store::write_vendored_part(dir, &part).map_err(e)?;
+                    }
+                }
+            }
+            None => {
+                wc_library::take(dir, p, lib, kind, id).map_err(e)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The macro named `name` among `found`: a file id match first, then one by its name, both
 /// without regard to case. With no match, files that could not be read are named with why.
 fn find_macro<'a>(found: &'a [FoundMacro], name: &str) -> Res<&'a FoundMacro> {
@@ -2610,7 +2737,9 @@ fn run(mut cli: Cli) -> Res<()> {
         Cmd::Import(ImportCmd::Wago { file }) => {
             Some(std::fs::read(file).map_err(|x| format!("{}: {x}", file.display()))?)
         }
-        Cmd::Import(ImportCmd::PlcCsv { file }) => Some(run::read_file(file)?),
+        Cmd::Import(ImportCmd::PlcCsv { file }) | Cmd::Macro(MacroCmd::Generate { table: file, .. }) => {
+            Some(run::read_file(file)?)
+        }
         _ => None,
     };
     let _lock = match cli.cmd {
@@ -3470,6 +3599,44 @@ fn run(mut cli: Cli) -> Res<()> {
                     wc_core::macros::write_macro_file(&f.path, &m).map_err(e)?;
                     print!("{}", macro_text(&m, &f.source));
                 }
+                MacroCmd::Generate {
+                    name,
+                    table,
+                    set,
+                    title,
+                    size,
+                } => {
+                    let path = find_macro(&found, &name)?.path.clone();
+                    let size = PageSize::parse(&size)?;
+                    let m = wc_core::macros::read_macro(&path).map_err(e)?;
+                    // Read before the project lock was taken (#658).
+                    let bytes = match import_bytes.take() {
+                        Some(bytes) => bytes,
+                        None => run::read_file(&table)?,
+                    };
+                    let rows = wc_import::csv::file_rows(&bytes)
+                        .map_err(|err| format!("{}: {}", escape_field(&table.display().to_string()), e(err)))?;
+                    let rows = wc_core::generate::rows_from_table(&m, &rows.cells, &rows.numbers).map_err(e)?;
+                    let copies = wc_core::generate::apply_rows(&m, &rows, set.as_deref()).map_err(e)?;
+                    for copy in &copies {
+                        take_macro_items(dir, &mut p, copy)?;
+                    }
+                    let extent = copies
+                        .first()
+                        .map(|first| wc_core::generate::extent(first, |id| store::read_vendored_symbol(dir, id).ok()))
+                        .unwrap_or_default();
+                    let title = title.unwrap_or_else(|| m.name.clone());
+                    let generated = wc_core::generate::generate(&mut p, &copies, extent, size, &title).map_err(e)?;
+                    save(dir, &p)?;
+                    println!("{}", generated.pages.join(" "));
+                    let plural = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+                    println!(
+                        "{} of {} on {}",
+                        plural(generated.copies, "copy", "copies"),
+                        escape_field(&m.name),
+                        plural(generated.pages.len(), "page", "pages")
+                    );
+                }
                 MacroCmd::Place {
                     page,
                     name,
@@ -3488,107 +3655,7 @@ fn run(mut cli: Cli) -> Res<()> {
                     let m = wc_core::macros::read_macro(&path)
                         .and_then(|m| m.apply(set.as_deref(), &typed))
                         .map_err(e)?;
-                    // A pinned symbol or part keeps its pinned version: a missing copy is put
-                    // back from a library that still has that version, never from a newer one.
-                    // One without a pin is taken from the library and pinned, also when a copy
-                    // is left from an earlier attempt that failed before it was pinned. The
-                    // parts are those the macro's devices and their accessories name, as
-                    // `device --part` takes them; a part no library has is left as it is.
-                    let symbols: std::collections::BTreeSet<&str> =
-                        m.symbols.iter().map(|s| s.symbol.as_str()).collect();
-                    let parts: std::collections::BTreeSet<&str> = m
-                        .devices
-                        .values()
-                        .flat_map(|d| d.part.iter().chain(d.accessories.iter().map(|a| &a.part)))
-                        .map(|id| id.trim())
-                        .filter(|id| !id.is_empty())
-                        .collect();
-                    let items = symbols
-                        .into_iter()
-                        .map(|id| (ItemKind::Symbol, id))
-                        .chain(parts.into_iter().map(|id| (ItemKind::Part, id)));
-                    // The library is opened only when an item needs it, so a macro whose
-                    // symbols and parts all have their pinned copies works without it.
-                    let mut lib: Option<wc_library::Library> = None;
-                    for (kind, id) in items {
-                        let what = match kind {
-                            ItemKind::Symbol => "symbol",
-                            ItemKind::Part => "part",
-                        };
-                        let pin = match kind {
-                            ItemKind::Symbol => p.lock.symbols.get(id),
-                            ItemKind::Part => p.lock.parts.get(id),
-                        }
-                        .cloned();
-                        if pin.is_some() {
-                            let vendored = store::vendor_path(dir, kind, id).map_err(e)?;
-                            if vendored.exists() {
-                                // A copy that cannot be read is reported now, not after saving.
-                                match kind {
-                                    ItemKind::Symbol => store::read_vendored_symbol(dir, id).map(drop),
-                                    ItemKind::Part => store::read_vendored_part(dir, id).map(drop),
-                                }
-                                .map_err(e)?;
-                                continue;
-                            }
-                        }
-                        // A part no library has stays a name on the device, as before: `check`
-                        // reports it, and value sets may name parts kept elsewhere.
-                        if pin.is_none() && kind == ItemKind::Part {
-                            if lib.is_none() {
-                                match wc_library::Library::open(dir, &p) {
-                                    Ok(opened) => lib = Some(opened),
-                                    Err(_) => continue,
-                                }
-                            }
-                            if lib.as_ref().is_none_or(|lib| lib.locate(kind, id).is_none()) {
-                                continue;
-                            }
-                        }
-                        let lib = match &mut lib {
-                            Some(lib) => &*lib,
-                            None => &*lib.insert(wc_library::Library::open(dir, &p).map_err(e)?),
-                        };
-                        match pin {
-                            Some(pin) => {
-                                let fits = |found: &str, hash: String| {
-                                    if found != id {
-                                        Err(format!("its file holds {found}"))
-                                    } else if hash != pin.hash {
-                                        Err("another version".to_owned())
-                                    } else {
-                                        Ok(())
-                                    }
-                                };
-                                let missing = |why: String| {
-                                    format!(
-                                        "{what} {id}: its copy in the project is missing and no library has the version the project pins ({why})"
-                                    )
-                                };
-                                match kind {
-                                    ItemKind::Symbol => {
-                                        let s = lib
-                                            .find_version(kind, id, &pin.source, |s: &wc_core::Symbol| {
-                                                fits(&s.id, s.hash())
-                                            })
-                                            .map_err(missing)?;
-                                        store::write_vendored_symbol(dir, &s).map_err(e)?;
-                                    }
-                                    ItemKind::Part => {
-                                        let part = lib
-                                            .find_version(kind, id, &pin.source, |part: &wc_core::Part| {
-                                                fits(&part.id, part.hash())
-                                            })
-                                            .map_err(missing)?;
-                                        store::write_vendored_part(dir, &part).map_err(e)?;
-                                    }
-                                }
-                            }
-                            None => {
-                                wc_library::take(dir, &mut p, lib, kind, id).map_err(e)?;
-                            }
-                        }
-                    }
+                    take_macro_items(dir, &mut p, &m)?;
                     let page_id = page_mut(&mut p, &page)?.id.clone();
                     let ids = wc_core::macros::place(&mut p, &page_id, &m, at).map_err(e)?;
                     save(dir, &p)?;

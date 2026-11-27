@@ -49,6 +49,7 @@ const INPUT_COMMANDS: &[&[&str]] = &[
     &["import", "swe-library", "FIFO"],
     &["import", "aml", "FIFO"],
     &["import", "page-dxf", "FIFO", "--page", "p1"],
+    &["macro", "generate", "starter", "--table", "FIFO"],
 ];
 
 /// The table above is well formed: the lock test (#658) only proves something for a command
