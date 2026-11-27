@@ -4367,8 +4367,11 @@ fn markdown_titles_show_markdown_characters_as_typed() {
     assert_eq!(heading("Wires #"), "## Wires \\#");
     assert_eq!(heading("Panel 2 ## "), "## Panel 2 \\## ");
     assert_eq!(heading("#"), "## \\#");
-    // A typed backslash before the run is escaped itself and does not escape the `#`.
-    assert_eq!(heading("a \\#"), "## a \\\\\\#");
+    // A run right after other text is not a closing sequence: it is shown as typed.
+    assert_eq!(heading("Wires#"), "## Wires#");
+    assert_eq!(heading("a \\#"), "## a \\\\#");
+    // A link ending in `#` keeps it without a backslash, which a viewer would take into it.
+    assert_eq!(heading("See https://example.com/#"), "## See https://example.com/#");
     assert_eq!(heading("Parts list"), "## Parts list");
 }
 

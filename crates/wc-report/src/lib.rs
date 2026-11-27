@@ -267,17 +267,18 @@ impl Table {
     }
 }
 
-/// Escaped title text for an ATX heading: a run of `#` at its end, which a viewer would take
-/// as the heading's closing sequence and drop (`Wires #`), gets a backslash before its first `#`.
+/// Escaped title text for an ATX heading: a run of `#` at its end that a viewer would take as
+/// the heading's closing sequence and drop gets a backslash before its first `#`. That is a run
+/// after a space or tab (`Wires #`) or making up the whole title; a run right after other text
+/// (`Wires#`, a link ending in `/#`, an escaped `\#`) is shown as typed, so it is left alone.
 fn markdown_heading(title: &str) -> String {
     let text = title.trim_end();
     let run = text.trim_end_matches('#');
-    // An odd number of backslashes before the run means its first `#` is escaped already.
-    let escaped = (run.len() - run.trim_end_matches('\\').len()) % 2 == 1;
-    if run.len() == text.len() || escaped {
-        return title.to_owned();
+    let closes = run.is_empty() || run.ends_with([' ', '\t']);
+    match title.get(run.len()..) {
+        Some(hashes) if closes && run.len() < text.len() => format!("{run}\\{hashes}"),
+        _ => title.to_owned(),
     }
-    format!("{run}\\{}", &title[run.len()..])
 }
 
 /// One line of cell text for a Markdown table.
