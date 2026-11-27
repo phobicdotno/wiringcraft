@@ -395,13 +395,14 @@ fn convert(
                     }
                 }
                 Some("pin") => {
-                    let Some(at) = g.first("at") else { continue };
-                    let (Some(x), Some(y)) = (at.num(1), at.num(2)) else {
+                    // A pin without a readable position is reported, not silently dropped.
+                    let tip = g.first("at").and_then(|at| Some((at, pt(at.num(1)?, at.num(2)?))));
+                    let Some((at, tip)) = tip.filter(|(_, p)| p.x.is_finite() && p.y.is_finite()) else {
+                        *skipped.entry("pin".to_owned()).or_default() += 1;
                         continue;
                     };
                     let angle = at.num(3).unwrap_or(0.0).rem_euclid(360.0).round() as i64;
                     let length = g.first("length").and_then(|l| l.num(1)).unwrap_or(2.54) * scale;
-                    let tip = pt(x, y);
                     // The pin line runs from its connection point towards the body at `angle`
                     // (y up), so the wire leaves the other way.
                     let (dir, inward) = match angle {
@@ -1117,6 +1118,25 @@ mod tests {
     }
 
     #[test]
+    fn pins_without_a_readable_position_are_reported() -> Result<()> {
+        // No `at`, a coordinate that is not a number, and one that overflows at scale 100.
+        let lib = r#"(kicad_symbol_lib
+  (symbol "P" (property "Reference" "X" (at 0 0 0))
+    (symbol "P_1_1"
+      (pin passive line (at 0 0 0) (length 1) (name "ok") (number "1"))
+      (pin passive line (length 1) (name "a") (number "2"))
+      (pin passive line (at nan 0 0) (length 1) (name "b") (number "3"))
+      (pin passive line (at 1e307 0 0) (length 1) (name "c") (number "4")))))"#;
+        let (syms, warnings) = symbols(lib, "k", 100.0)?;
+        let Some(sym) = syms.first() else {
+            unreachable!("{warnings:?}")
+        };
+        assert_eq!(sym.symbol.pins.len(), 1);
+        assert_eq!(warnings, ["P: 3 pin item(s) not read"]);
+        Ok(())
+    }
+
+    #[test]
     fn hidden_texts_are_left_out() -> Result<()> {
         // KiCad draws a hidden text only in its symbol editor: `hide` (KiCad 6/7) or
         // `(hide yes)` (KiCad 8+) in its effects.
@@ -1391,6 +1411,7 @@ mod tests {
             "k",
             1.0,
         );
-        assert!(r.is_ok_and(|(s, w)| s.is_empty() && w.len() == 1));
+        // The unreadable pin is reported, then the symbol that draws nothing.
+        assert!(r.is_ok_and(|(s, w)| s.is_empty() && w.len() == 2 && w[0] == "x: 1 pin item(s) not read"));
     }
 }

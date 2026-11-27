@@ -104,7 +104,7 @@ fn check_limits(t: &Table) -> std::io::Result<()> {
 }
 
 /// A sheet name Excel accepts: no `[]:*?/\`, no leading or trailing apostrophe, at most 31
-/// characters, not empty, not used by an earlier sheet (names compare without case) and not
+/// characters as Excel counts them (UTF-16 code units, so an emoji counts twice), not empty, not used by an earlier sheet (names compare without case) and not
 /// `History`, which Excel keeps for its change tracking: it repairs a workbook with a sheet of
 /// that name when opening it.
 fn sheet_name(title: &str, number: usize, taken: &mut BTreeSet<String>) -> String {
@@ -121,7 +121,15 @@ fn sheet_name(title: &str, number: usize, taken: &mut BTreeSet<String>) -> Strin
     // Spaces and apostrophes cut from both ends, also after shortening, which can bring an
     // inner apostrophe to the end.
     let tidy = |s: &str, keep: usize| -> String {
-        let s: String = s.trim_matches([' ', '\'']).chars().take(keep).collect();
+        let mut units = 0;
+        let s: String = s
+            .trim_matches([' ', '\''])
+            .chars()
+            .take_while(|c| {
+                units += c.len_utf16();
+                units <= keep
+            })
+            .collect();
         s.trim_matches([' ', '\'']).to_owned()
     };
     let base = match tidy(&clean, MAX_SHEET_NAME) {
@@ -132,7 +140,7 @@ fn sheet_name(title: &str, number: usize, taken: &mut BTreeSet<String>) -> Strin
     let mut n = 2;
     while name.eq_ignore_ascii_case(RESERVED_SHEET_NAME) || taken.contains(&name.to_lowercase()) {
         let suffix = format!(" ({n})");
-        let keep = MAX_SHEET_NAME - suffix.chars().count();
+        let keep = MAX_SHEET_NAME - suffix.len();
         name = format!("{}{suffix}", tidy(&base, keep));
         n += 1;
     }
@@ -319,6 +327,22 @@ mod tests {
         assert_eq!(sheet_name("History", 8, &mut taken), "History (2)");
         assert_eq!(sheet_name(" history ", 9, &mut taken), "history (3)");
         assert_eq!(sheet_name("History list", 10, &mut taken), "History list");
+    }
+
+    #[test]
+    fn sheet_names_fit_excel_limit_in_utf16_units() {
+        let units = |s: &str| s.encode_utf16().count();
+        let mut taken = BTreeSet::new();
+        // Each of these takes two UTF-16 code units, as Excel counts the 31 characters.
+        let wide = "\u{1F50C}".repeat(20);
+        let first = sheet_name(&wide, 1, &mut taken);
+        assert_eq!(first, "\u{1F50C}".repeat(15));
+        let second = sheet_name(&wide, 2, &mut taken);
+        assert!(units(&second) <= MAX_SHEET_NAME, "{second}");
+        assert_eq!(second, format!("{} (2)", "\u{1F50C}".repeat(13)));
+        // A name of single-unit characters still gets all 31.
+        let latin = sheet_name(&"\u{e6}".repeat(40), 3, &mut taken);
+        assert_eq!(latin.chars().count(), 31);
     }
 
     #[test]
