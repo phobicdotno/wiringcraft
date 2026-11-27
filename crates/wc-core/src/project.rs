@@ -280,9 +280,17 @@ pub struct StripLayout {
 fn merged_jumpers<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Jumper>, D::Error> {
     let list = Vec::<Jumper>::deserialize(d)?;
     let mut meta = ProjectMeta::new("");
-    for j in list {
+    for j in &list {
         // Each jumper was checked when read, so this only merges.
-        let _ = meta.add_jumper_with(&j.strip, &j.terminals, j.part);
+        let _ = meta.add_jumper_with(&j.strip, &j.terminals, None);
+    }
+    // Each entry ended up in exactly one merged jumper; its part is the first one in file order
+    // among them, however later entries joined the groups.
+    for m in &mut meta.jumpers {
+        m.part = list
+            .iter()
+            .filter(|j| j.strip == m.strip && j.terminals.iter().any(|t| m.terminals.iter().any(|u| u == t.trim())))
+            .find_map(|j| j.part.clone());
     }
     Ok(meta.jumpers)
 }
@@ -2665,6 +2673,24 @@ mod tests {
         assert_eq!(shared.jumpers.len(), 2, "{:?}", shared.jumpers);
         assert_eq!(shared.jumpers[0].terminals, s(&["1", "3", "4"]));
         assert_eq!(shared.jumpers[0].part.as_deref(), Some("acme.bridge"));
+        // Conflicting parts: the first in the file counts, also when a later entry bridges two
+        // groups that were apart until then.
+        let conflict = read(&format!(
+            "{}part = \"first\"\n{}part = \"second\"\n",
+            jumper("-X1", "\"1\", \"2\""),
+            jumper("-X1", "\"2\", \"3\"")
+        ))?;
+        assert_eq!(conflict.jumpers[0].terminals, s(&["1", "2", "3"]));
+        assert_eq!(conflict.jumpers[0].part.as_deref(), Some("first"));
+        let bridged = read(&format!(
+            "{}part = \"first\"\n{}part = \"second\"\n{}",
+            jumper("-X1", "\"8\", \"9\""),
+            jumper("-X1", "\"1\", \"2\""),
+            jumper("-X1", "\"2\", \"8\"")
+        ))?;
+        assert_eq!(bridged.jumpers.len(), 1, "{:?}", bridged.jumpers);
+        assert_eq!(bridged.jumpers[0].terminals, s(&["1", "2", "8", "9"]));
+        assert_eq!(bridged.jumpers[0].part.as_deref(), Some("first"));
         assert_eq!(shared.jumpers[1].strip, DeviceTag::parse("-X2")?);
         // Extended by another jumper: the part stays.
         m.add_jumper(&x1, &s(&["2", "3"]))?;
