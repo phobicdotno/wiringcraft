@@ -1245,6 +1245,23 @@ fn the_location_list_counts_devices_and_names_unlisted_locations() {
 }
 
 #[test]
+fn the_location_list_sorts_unlisted_locations_with_numbers_by_value() {
+    let mut p = Project::new("t");
+    for t in ["+L10-K1", "+L2-K2", "+L3-K3"] {
+        p.devices.insert(DeviceTag::parse(t).unwrap(), Default::default());
+    }
+    let (symbols, parts) = (BTreeMap::new(), BTreeMap::new());
+    let i = Inputs {
+        project: &p,
+        symbols: &symbols,
+        parts: &parts,
+    };
+    let t = build(Kind::Locations, &i);
+    let paths: Vec<&str> = t.rows.iter().map(|r| r[0].as_str()).collect();
+    assert_eq!(paths, ["+L2", "+L3", "+L10"]);
+}
+
+#[test]
 fn the_location_list_reads_a_location_stored_with_its_plus() {
     let mut p = Project::new("t");
     p.devices
