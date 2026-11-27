@@ -31,7 +31,9 @@ In the app: New project (Ctrl+Shift+N).
 ## 2. Add a library source
 
 The repository's own `library/` folder holds a starter set of symbols (`wc.*`) and example
-parts (`example.*`). Add it as a folder source, giving its full path:
+parts (`example.*`). A project made with `wiringcraft new` has no library source, so until you
+add one, `place` stops with `Symbol "wc.lamp" is not in any library source`. (The app adds the
+starter library to a blank new project by itself.) Add it as a folder source, giving its full path:
 
 ```console
 $ wiringcraft lib add starter folder /path/to/wiringcraft/library
