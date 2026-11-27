@@ -7203,15 +7203,18 @@ mod icon_tests {
         };
         // At GUI zoom 1.2 a 1440 x 960 window measures 1200 x 800 points.
         super::remember_window(&mut window, &v, 1.2);
-        let [w, h] = window.size.unwrap();
-        assert!((w - 1440.0).abs() < 0.01 && (h - 960.0).abs() < 0.01, "{w} x {h}");
+        let kept = window.size;
+        assert!(
+            matches!(kept, Some([w, h]) if (w - 1440.0).abs() < 0.01 && (h - 960.0).abs() < 0.01),
+            "{kept:?}"
+        );
         // A minimized window changes nothing, not even the maximized state.
         v.minimized = Some(true);
         v.maximized = Some(true);
         v.inner_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(0.0, 0.0)));
         super::remember_window(&mut window, &v, 1.0);
         assert!(!window.maximized);
-        assert_eq!(window.size, Some([w, h]));
+        assert_eq!(window.size, kept);
     }
 }
 
