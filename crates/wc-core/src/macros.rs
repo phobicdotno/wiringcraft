@@ -1130,9 +1130,13 @@ mod edge_tests {
             write_macro(tmp.path(), id, &m)?;
         }
         let dir = tmp.path().join(MACROS_DIR);
-        for name in [".hidden.json", "bad name.json", "con.json", "alpha.json.bak"] {
+        for name in [".hidden.json", "bad name.json", "alpha.json.bak"] {
             std::fs::write(dir.join(name), "{}").map_err(|e| Error::io("w", e))?;
         }
+        // A name Windows keeps for a device is not a usable id; its file cannot be made there.
+        assert!(check_id("con").is_err());
+        #[cfg(not(windows))]
+        std::fs::write(dir.join("con.json"), "{}").map_err(|e| Error::io("w", e))?;
         let listed = list_macros(tmp.path());
         let ids: Vec<&str> = listed.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(ids, ["alpha", "mid-1", "zeta"]);
