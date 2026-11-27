@@ -428,6 +428,35 @@ fn net_list_joins_across_wires() {
 }
 
 #[test]
+fn net_list_leaves_out_interruption_points() {
+    let (mut p, mut s, parts) = fixture();
+    let arrow = sym("arrow", SymbolRole::Interruption, &["1"]);
+    s.insert(arrow.id.clone(), arrow);
+    // The 0V net goes on to page 3 through the interruption point -0V, drawn on both pages.
+    p.pages[0].symbols.push(place("s9", "arrow", 200.0, Some("-0V")));
+    p.pages[0]
+        .wires
+        .push(wire("w5", pin("s1", "A2"), pin("s9", "1"), None, None));
+    let mut page = Page::new("p3", "3", "More");
+    page.symbols = vec![
+        place("s1", "arrow", 20.0, Some("-0V")),
+        place("s2", "lamp", 60.0, Some("-P2")),
+    ];
+    page.wires = vec![wire("w1", pin("s1", "1"), pin("s2", "X2"), None, None)];
+    p.pages.push(page);
+    let t = net_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    let Some(zero) = t.rows.iter().find(|r| r[0] == "0V") else {
+        unreachable!("no 0V net: {:?}", t.rows)
+    };
+    assert_eq!(zero[1], "3", "{zero:?}");
+    assert_eq!(zero[2], "-P2:X2, -X2:1, =A+C1-K1:A2");
+}
+
+#[test]
 fn natural_order() {
     let mut v = vec!["X10", "X2", "X1"];
     v.sort_by_key(|s| natural_key(s));

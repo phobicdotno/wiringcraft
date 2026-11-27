@@ -1066,7 +1066,9 @@ pub fn cable_list(i: &Inputs<'_>) -> Table {
 
 /// Net list: each electrically connected group of pins, across pages. Overview pages
 /// (`Page::overview`) are skipped, because an overview draws the schematic's connections again
-/// and would list each net and pin twice.
+/// and would list each net and pin twice. Interruption points are left out of the pins: they only
+/// name the connection to another page, so a net drawn on two pages does not list its
+/// interruption point once per page.
 pub fn net_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new("Net list", &["Net", "Pins", "Connections"]);
     let schematic;
@@ -1092,6 +1094,11 @@ pub fn net_list(i: &Inputs<'_>) -> Table {
             let mut pins: Vec<String> = net
                 .pins
                 .iter()
+                .filter(|(pg, item, _)| {
+                    let sym = project.page(pg).and_then(|p| p.symbol(item));
+                    sym.and_then(|s| i.symbols.get(&s.symbol))
+                        .is_none_or(|y| y.role != SymbolRole::Interruption)
+                })
                 .map(|(pg, item, pin)| pin_label(i.project, pg, item, pin))
                 .collect();
             pins.sort_by_key(|s| natural_key(s));
