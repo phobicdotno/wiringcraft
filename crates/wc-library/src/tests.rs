@@ -180,6 +180,21 @@ fn propose_writes_to_review_folder() -> Result<()> {
 }
 
 #[test]
+fn propose_matches_source_ignoring_case_and_lists_sources_when_unknown() -> Result<()> {
+    let mut f = fixture()?;
+    let lib = Library::open(&f.proj, &f.project)?;
+    lock_missing(&f.proj, &mut f.project, &lib)?;
+    let path = propose(&f.proj, &lib, "Company", ItemKind::Symbol, "coil")?;
+    assert!(path.starts_with(&f.company));
+    let err = propose(&f.proj, &lib, "nope", ItemKind::Symbol, "coil")
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(err.contains("\"company\", \"personal\""), "{err}");
+    Ok(())
+}
+
+#[test]
 fn search_finds_by_category() -> Result<()> {
     let f = fixture()?;
     let lib = Library::open(&f.proj, &f.project)?;
