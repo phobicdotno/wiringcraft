@@ -932,7 +932,7 @@ impl Open {
             self.library.clone(),
             self.terminals_before.clone(),
         );
-        self.ensure_symbols(ids)?;
+        let symbol_copies = self.take_symbols(ids)?;
         use wc_core::placement::{DeviceData, OutOfTags};
         // The copied data first for a macro or a copy from another project; within one project
         // the project's own, which may have changed since the copy.
@@ -954,6 +954,8 @@ impl Open {
             Ok(parts) => self.take_parts(parts.iter().map(String::as_str)),
             Err(e) => (Default::default(), Err(e)),
         };
+        // A refused paste takes back the symbol copies too (#1861).
+        let taken = taken.and_copies(symbol_copies);
         if let Err(e) = r {
             let r = self.give_back(taken, lock, Err(e));
             self.project = project;
@@ -974,7 +976,18 @@ impl Open {
         // A device for which no tag is left is pasted without one.
         let placed = match wc_core::placement::place(&mut self.project, page, group, at, data, OutOfTags::Untagged) {
             Ok(placed) => placed,
-            Err(e) => return self.give_back(taken, lock, Err(e.to_string())),
+            Err(e) => {
+                // Nothing is pasted: the undo step goes, and so do the pins, loaded symbols and
+                // copies taken for it (#1861).
+                let r = self.give_back(taken, lock, Err(e.to_string()));
+                self.forget_last_change();
+                self.project = project;
+                self.symbols = symbols;
+                self.library = library;
+                self.terminals_before = terminals;
+                self.touch();
+                return r;
+            }
         };
         let out = (placed.symbols.into_iter().map(Selection::Symbol))
             .chain(placed.wires.into_iter().map(Selection::Wire))
@@ -1511,6 +1524,8 @@ mod tests {
         wc_core::macros::write_macro_file(&path, &m).unwrap();
         let before = o.project.clone();
         assert!(!before.lock.symbols.contains_key("wc.coil.valve"));
+        let valve = symbol_copy_of(&o, "wc.coil.valve");
+        assert!(!valve.exists());
         let table = o.dir.join("valves.csv");
         std::fs::write(&table, "what\nV1\n").unwrap();
         // Too wide for any page: nothing is placed, and the pin and loaded symbol go back.
@@ -1518,6 +1533,7 @@ mod tests {
         assert!(err.contains("does not fit"), "{err}");
         assert_eq!(o.project, before);
         assert!(!o.symbols.contains_key("wc.coil.valve"));
+        assert!(!valve.exists(), "the symbol copy taken for it is removed (#1861)");
 
         m.symbols[1].at = at;
         wc_core::macros::write_macro_file(&path, &m).unwrap();
@@ -1551,6 +1567,10 @@ mod tests {
 
     fn copy_of(o: &Open, id: &str) -> std::path::PathBuf {
         wc_core::store::vendor_path(&o.dir, wc_core::lock::ItemKind::Part, id).unwrap()
+    }
+
+    fn symbol_copy_of(o: &Open, id: &str) -> std::path::PathBuf {
+        wc_core::store::vendor_path(&o.dir, wc_core::lock::ItemKind::Symbol, id).unwrap()
     }
 
     #[test]
@@ -1593,12 +1613,19 @@ mod tests {
         let path = macro_with_parts(&mut o, page, MAIN, ACCESSORY);
         let before = o.project.clone();
         let mark = o.undo_mark();
+        let used: Vec<String> = o.project.pages[page].symbols.iter().map(|s| s.symbol.clone()).collect();
         let err = o.insert_macro(page, &path, None).unwrap_err();
         assert!(err.contains(ACCESSORY), "{err}");
         assert_eq!(o.project, before, "nothing placed, no pin");
         assert_eq!(o.undo_mark(), mark, "no undo step");
         assert!(!o.parts.contains_key(MAIN));
         assert!(!copy_of(&o, MAIN).exists(), "the copy taken on the way is removed");
+        for id in &used {
+            assert!(
+                symbol_copy_of(&o, id).exists(),
+                "a symbol copy there before stays: {id}"
+            );
+        }
 
         // A symbol the project does not pin yet is taken first: it goes back too.
         let mut m = wc_core::macros::read_macro(&path).unwrap();
@@ -1607,10 +1634,13 @@ mod tests {
         }
         wc_core::macros::write_macro_file(&path, &m).unwrap();
         assert!(!before.lock.symbols.contains_key("wc.coil.valve"));
+        let valve = symbol_copy_of(&o, "wc.coil.valve");
+        assert!(!valve.exists());
         let err = o.insert_macro(page, &path, None).unwrap_err();
         assert!(err.contains(ACCESSORY), "{err}");
         assert_eq!(o.project, before, "no symbol pin either");
         assert!(!o.symbols.contains_key("wc.coil.valve"), "nor a loaded symbol");
+        assert!(!valve.exists(), "nor the symbol copy taken for it (#1861)");
         assert_eq!(o.undo_mark(), mark);
     }
 
