@@ -248,14 +248,12 @@ impl Table {
     pub fn to_markdown(&self) -> String {
         // One line of text: line ends (LF, CR or CRLF) become spaces.
         let one_line = |s: &str| s.replace("\r\n", " ").replace(['\r', '\n'], " ");
-        // `<` and `>` are written as entities so a value is never read as HTML.
-        let line = |s: &str| one_line(s).replace('<', "&lt;").replace('>', "&gt;");
-        // In a cell, Markdown punctuation gets a backslash so the table shows the text as typed
-        // (see `markdown_cell`).
+        // Markdown punctuation gets a backslash so the table shows the text as typed (see
+        // `markdown_cell`).
         let cell = |s: &str| markdown_cell(&one_line(s));
         let mut out = format!(
             "## {}\n\n| {} |\n|{}\n",
-            line(&self.title),
+            markdown_heading(&cell(&self.title)),
             self.columns.iter().map(|c| cell(c)).collect::<Vec<_>>().join(" | "),
             "---|".repeat(self.columns.len())
         );
@@ -267,6 +265,19 @@ impl Table {
         }
         out
     }
+}
+
+/// Escaped title text for an ATX heading: a run of `#` at its end, which a viewer would take
+/// as the heading's closing sequence and drop (`Wires #`), gets a backslash before its first `#`.
+fn markdown_heading(title: &str) -> String {
+    let text = title.trim_end();
+    let run = text.trim_end_matches('#');
+    // An odd number of backslashes before the run means its first `#` is escaped already.
+    let escaped = (run.len() - run.trim_end_matches('\\').len()) % 2 == 1;
+    if run.len() == text.len() || escaped {
+        return title.to_owned();
+    }
+    format!("{run}\\{}", &title[run.len()..])
 }
 
 /// One line of cell text for a Markdown table.

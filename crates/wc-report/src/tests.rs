@@ -4353,6 +4353,26 @@ fn check_keeps_panel_devices_whose_tag_is_only_drawn_as_interruption_points() {
 }
 
 #[test]
+fn markdown_titles_show_markdown_characters_as_typed() {
+    let heading = |title: &str| {
+        Table::new(title, &["Tag"])
+            .to_markdown()
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert_eq!(heading("Spare *draft* [rev](x)"), "## Spare \\*draft\\* \\[rev\\](x)");
+    // A trailing run of `#` is not the heading's closing sequence, so it stays.
+    assert_eq!(heading("Wires #"), "## Wires \\#");
+    assert_eq!(heading("Panel 2 ## "), "## Panel 2 \\## ");
+    assert_eq!(heading("#"), "## \\#");
+    // A typed backslash before the run is escaped itself and does not escape the `#`.
+    assert_eq!(heading("a \\#"), "## a \\\\\\#");
+    assert_eq!(heading("Parts list"), "## Parts list");
+}
+
+#[test]
 fn markdown_cells_with_a_backslash_keep_their_columns() {
     let mut t = Table::new("Paths", &["Path", "Text", "Next"]);
     t.rows.push(vec!["C:\\".into(), "a\\|b".into(), "next".into()]);
