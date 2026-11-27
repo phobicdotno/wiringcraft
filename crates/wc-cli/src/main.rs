@@ -4200,7 +4200,12 @@ fn run(mut cli: Cli) -> Res<()> {
             if format == "csv" && sep == ';' && out.is_some() {
                 text.push('\u{feff}');
             }
-            for k in kinds {
+            for (i, k) in kinds.into_iter().enumerate() {
+                // CSV tables end with their own line end: a blank line only goes between two of
+                // them, so a file of one table has no empty record at its end.
+                if format == "csv" && i > 0 {
+                    text.push('\n');
+                }
                 let t = wc_report::build(k, &inputs);
                 text.push_str(&match format.as_str() {
                     "csv" => t.to_csv_with(sep),
@@ -4208,7 +4213,9 @@ fn run(mut cli: Cli) -> Res<()> {
                     "text" => plain_table(&t),
                     other => return Err(format!("unknown format {other:?} (text, csv, md, xlsx)")),
                 });
-                text.push('\n');
+                if format != "csv" {
+                    text.push('\n');
+                }
             }
             match out {
                 Some(path) => write_out(dir, &path, text).map_err(e)?,
@@ -10712,7 +10719,8 @@ mod tests {
         )
         .unwrap();
         let wires = std::fs::read_to_string(out.join("wires.csv")).unwrap();
-        assert_eq!(format!("{wires}\n"), std::fs::read_to_string(&one).unwrap());
+        assert_eq!(wires, std::fs::read_to_string(&one).unwrap());
+        assert!(wires.ends_with("\r\n") && !wires.ends_with("\r\n\n"), "{wires:?}");
     }
 
     #[test]
@@ -10771,7 +10779,7 @@ mod tests {
             assert!(csv.starts_with('\u{feff}'), "{}: {csv}", k.name());
         }
         let wires = std::fs::read_to_string(out.join("wires.csv")).unwrap();
-        assert_eq!(format!("{wires}\n"), semi);
+        assert_eq!(wires, semi);
         // Only `,` and `;`, and only for CSV.
         assert!(cli(&dir, &["report", "wires", "--format", "csv", "--sep", "|"]).is_err());
         assert!(cli(&dir, &["report", "wires", "--format", "md", "--sep", ";"]).is_err());

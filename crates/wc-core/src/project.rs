@@ -874,6 +874,7 @@ impl ProjectMeta {
     /// Take `terminal` of `strip` out of its jumper; a jumper left with one terminal goes.
     /// Returns whether anything changed.
     pub fn remove_from_jumper(&mut self, strip: &DeviceTag, terminal: &str) -> bool {
+        let terminal = terminal.trim();
         let mut changed = false;
         for j in self.jumpers.iter_mut().filter(|j| &j.strip == strip) {
             let before = j.terminals.len();
@@ -965,6 +966,7 @@ impl ProjectMeta {
     /// Give the jumper that holds `terminal` of `strip` a part, or none. Returns whether that
     /// changed anything; `Err` when the terminal is in no jumper.
     pub fn set_jumper_part(&mut self, strip: &DeviceTag, terminal: &str, part: Option<&str>) -> Result<bool, String> {
+        let terminal = terminal.trim();
         let j = self
             .jumpers
             .iter_mut()
@@ -2555,6 +2557,20 @@ mod tests {
         assert!(!m.remove_from_jumper(&x2, "1"));
         let plain = toml::to_string(&ProjectMeta::new("t"))?;
         assert!(!plain.contains("jumper"), "nothing written without jumpers");
+        Ok(())
+    }
+
+    #[test]
+    fn jumper_edits_trim_the_terminal_number_like_adding_does() -> Result<(), Box<dyn std::error::Error>> {
+        let x1 = DeviceTag::parse("-X1")?;
+        let s = |v: &[&str]| v.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>();
+        let mut m = ProjectMeta::new("t");
+        m.add_jumper(&x1, &s(&[" 1 ", "2", "3"]))?;
+        assert_eq!(m.jumpers[0].terminals, s(&["1", "2", "3"]));
+        assert!(m.set_jumper_part(&x1, " 2 ", Some("wago.2002-403"))?);
+        assert_eq!(m.jumpers[0].part.as_deref(), Some("wago.2002-403"));
+        assert!(m.remove_from_jumper(&x1, " 3 "));
+        assert_eq!(m.jumpers[0].terminals, s(&["1", "2"]));
         Ok(())
     }
 
