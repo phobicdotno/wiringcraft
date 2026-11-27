@@ -715,3 +715,184 @@ nb = ""
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod translate_edge_tests {
+    use super::*;
+    use crate::{Page, Point};
+
+    type R<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+    fn text(t: &str) -> Shape {
+        Shape::Text {
+            at: Point { x: 0.0, y: 0.0 },
+            text: t.into(),
+            height: 2.5,
+            align: Default::default(),
+            angle: 0.0,
+        }
+    }
+
+    fn page_texts(p: &Project) -> Vec<String> {
+        p.pages
+            .iter()
+            .flat_map(|page| {
+                std::iter::once(page.title.clone()).chain(page.graphics.iter().filter_map(|g| match g {
+                    Shape::Text { text, .. } => Some(text.clone()),
+                    _ => None,
+                }))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_text_needs_a_run_of_two_letters_to_need_a_translation() {
+        for t in ["24 V", "-K1", "3~", "A B C", "L1 L2 L3", "", "  "] {
+            assert!(!has_word(t), "{t:?}");
+        }
+        for t in ["Pumps", "On", "24 VDC", "Æø", "x-ab"] {
+            assert!(has_word(t), "{t:?}");
+        }
+    }
+
+    #[test]
+    fn a_dictionary_with_another_source_language_translates_from_it() -> R {
+        let d = Dictionary::parse("source = \" NB \"\n[[text]]\nnb = \"Pumpe\"\nen = \"Pump\"\n")?;
+        assert_eq!(d.source(), "nb");
+        assert_eq!(d.languages(), ["nb", "en"]);
+        assert_eq!(d.lookup("Pumpe", "EN").as_deref(), Some("Pump"));
+        // The source language gives the text back as written, even one not in the dictionary.
+        assert_eq!(d.lookup(" Ukjent ", "nb").as_deref(), Some(" Ukjent "));
+        // `en` is no longer the source: a text not in the dictionary has no `en` translation.
+        assert_eq!(d.lookup("Ukjent", "en"), None);
+        Ok(())
+    }
+
+    #[test]
+    fn lookup_ignores_spaces_around_texts_and_skips_blank_entries_for_a_later_one() -> R {
+        let d = Dictionary::parse(
+            "[[text]]\nen = \" Pumps \"\nnb = \"  \"\n[[text]]\nen = \"Pumps\"\nnb = \" Pumper \"\n[[text]]\nen = \"Pumps\"\nnb = \"Pumpene\"\n",
+        )?;
+        assert_eq!(d.source(), "en");
+        assert_eq!(d.lookup("  Pumps", "nb").as_deref(), Some("Pumper"));
+        assert_eq!(d.lookup("pumps", "nb"), None, "texts are matched as written");
+        Ok(())
+    }
+
+    #[test]
+    fn set_ignores_an_empty_language_the_source_language_and_a_blank_text() -> R {
+        let mut d = Dictionary::parse("source = \"nb\"\n")?;
+        let before = d.clone();
+        d.set("Pumpe", "", "x");
+        d.set("Pumpe", " NB ", "x");
+        d.set("  ", "en", "x");
+        assert_eq!(d, before);
+        d.set(" Pumpe ", "EN", " Pump ");
+        assert_eq!(
+            d.texts,
+            [BTreeMap::from([
+                ("en".to_owned(), "Pump".to_owned()),
+                ("nb".to_owned(), "Pumpe".to_owned())
+            ])]
+        );
+        // A second set for the same text changes that entry rather than adding one.
+        d.set("Pumpe", "en", "Pump unit");
+        assert_eq!(d.texts.len(), 1);
+        assert_eq!(d.lookup("Pumpe", "en").as_deref(), Some("Pump unit"));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_languages_trims_lowercases_and_rejects_a_missing_second_code() {
+        assert_eq!(
+            parse_languages(" nb , EN "),
+            Some(vec!["nb".to_owned(), "en".to_owned()])
+        );
+        assert_eq!(parse_languages("de-AT"), Some(vec!["de-at".to_owned()]));
+        assert_eq!(
+            parse_languages("nb_NO+en"),
+            Some(vec!["nb_no".to_owned(), "en".to_owned()])
+        );
+        for spec in ["nb,", "+en", ",", "nb,,en", "nb;en", "nb.en", "nø"] {
+            assert_eq!(parse_languages(spec), None, "{spec:?}");
+        }
+    }
+
+    #[test]
+    fn two_languages_with_the_same_text_show_it_once_and_a_missing_text_is_listed_once() -> R {
+        let d = Dictionary::parse("[[text]]\nen = \"Pumps\"\nnb = \"Pumps\"\n")?;
+        let mut p = Project::new("demo");
+        let mut page = Page::new("p1", "1", "Pumps");
+        page.graphics.extend([text("Spare"), text(" Spare "), text("   ")]);
+        p.pages.push(page);
+        let (both, missing) = translate(&p, &d, &["nb".into(), "en".into()]);
+        // A text without a translation keeps its spaces only when shown in one language.
+        assert_eq!(page_texts(&both), ["Pumps", "Spare", "Spare", "   "]);
+        assert_eq!(
+            missing,
+            [Missing {
+                text: "Spare".into(),
+                used: vec!["page 1 text".into()]
+            }]
+        );
+        // Missing in both of two other languages, the text is still listed once.
+        let (_, missing) = translate(&p, &d, &["de".into(), "fr".into()]);
+        assert_eq!(
+            missing.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+            ["Pumps", "Spare"]
+        );
+        let (one, _) = translate(&p, &d, &["de".into()]);
+        assert_eq!(page_texts(&one), ["Pumps", "Spare", " Spare ", "   "]);
+        Ok(())
+    }
+
+    #[test]
+    fn the_same_language_twice_shows_each_text_once() -> R {
+        let d = Dictionary::parse("[[text]]\nen = \"Pumps\"\nnb = \"Pumper\"\n")?;
+        let mut p = Project::new("demo");
+        p.pages.push(Page::new("p1", "1", "Pumps"));
+        let (out, _) = translate(&p, &d, &parse_languages("nb,NB").ok_or("languages")?);
+        assert_eq!(page_texts(&out), ["Pumper"]);
+        Ok(())
+    }
+
+    #[test]
+    fn set_translation_rejects_the_files_own_source_language_and_a_bad_file() -> R {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join(TRANSLATIONS_FILE);
+        std::fs::write(&file, "source = \"nb\"\n")?;
+        assert!(matches!(
+            set_translation(dir.path(), "Pumpe", "nb", "x"),
+            Err(Error::Invalid(m)) if m.contains("source language")
+        ));
+        assert!(set_translation(dir.path(), "Pumpe", "en", "Pump")?);
+        assert_eq!(
+            Dictionary::load(dir.path())?.lookup("Pumpe", "en").as_deref(),
+            Some("Pump")
+        );
+        std::fs::write(&file, "[[text]\n")?;
+        assert!(matches!(
+            set_translation(dir.path(), "Pumpe", "en", "Pump"),
+            Err(Error::Toml { .. })
+        ));
+        assert_eq!(std::fs::read_to_string(&file)?, "[[text]\n");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_at_the_lock_name_is_refused_and_its_target_is_untouched() -> R {
+        let dir = tempfile::tempdir()?;
+        let target = dir.path().join("elsewhere.txt");
+        std::fs::write(&target, "keep")?;
+        std::os::unix::fs::symlink(&target, dir.path().join(TRANSLATIONS_LOCK))?;
+        assert!(matches!(lock_translations(dir.path()), Err(Error::Invalid(m)) if m.contains("link")));
+        assert!(matches!(
+            set_translation(dir.path(), "Pumps", "nb", "Pumper"),
+            Err(Error::Invalid(_))
+        ));
+        assert_eq!(std::fs::read_to_string(&target)?, "keep");
+        assert!(!dir.path().join(TRANSLATIONS_FILE).exists());
+        Ok(())
+    }
+}
