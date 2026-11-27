@@ -705,6 +705,46 @@ fn a_generation_refuses_project_files_that_are_links() -> TestResult {
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn a_generation_refuses_a_symbol_copy_that_is_a_dangling_link() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    let coil = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library/symbols/wc.coil.json");
+    let lib = tmp.path().join("lib");
+    std::fs::create_dir_all(lib.join("symbols"))?;
+    std::fs::create_dir_all(lib.join("macros"))?;
+    std::fs::copy(coil, lib.join("symbols/wc.coil.json"))?;
+    std::fs::write(lib.join("macros/starter.json"), STARTER)?;
+    wiringcraft(&dir, &["lib", "add", "mine", "folder", lib.to_str().ok_or("path")?])?;
+    // The coil's copy is a link to a file that is not there: a rollback would remove it.
+    let copy = wc_core::store::vendor_path(&dir, wc_core::lock::ItemKind::Symbol, "wc.coil")?;
+    std::fs::create_dir_all(copy.parent().ok_or("parent")?)?;
+    std::os::unix::fs::symlink(tmp.path().join("gone.json"), &copy)?;
+    let table = tmp.path().join("motors.csv");
+    std::fs::write(&table, "set\n3 kW\n")?;
+    let err = wiringcraft(
+        &dir,
+        &["macro", "generate", "starter", "--table", table.to_str().ok_or("path")?],
+    )
+    .err()
+    .ok_or("a linked symbol copy is refused")?
+    .to_string();
+    assert!(err.contains("is a link; macro generate"), "{err}");
+    assert!(
+        std::fs::symlink_metadata(&copy)?.file_type().is_symlink(),
+        "the link stays"
+    );
+    assert!(!dir.join("pages/p0002.page.json").exists(), "nothing is written");
+    Ok(())
+}
+
 #[test]
 fn a_table_cut_short_inside_a_quoted_cell_places_nothing() -> TestResult {
     let tmp = tempfile::tempdir()?;

@@ -179,20 +179,27 @@ fn tag_points(s: &crate::project::PlacedSymbol, def: &Symbol, tag: &crate::tag::
     // Each product level as it is or, when wider, as its letters with the largest number: a
     // renumbered tag (`-K` placed as `-K1000`) and a level under a renumbered parent (`-K.1`
     // placed as `-K1000.1`) are both within it.
-    let mut widest = tag.clone();
-    for level in &mut widest.product {
-        let letters: String = level.chars().take_while(|c| !c.is_ascii_digit()).collect();
-        let numbered = format!("{letters}9999");
-        if crate::font::text_width_mm(&numbered, TAG_HEIGHT) > crate::font::text_width_mm(level, TAG_HEIGHT) {
-            *level = numbered;
-        }
-    }
+    let widest = widest_tag(tag, TAG_HEIGHT);
     for t in [tag, &widest] {
         let (align, lines) = crate::tag::tag_lines(s, def, t);
         for (at, line) in &lines {
             pts.extend(text_corners(*at, line, TAG_HEIGHT, align, 0.0));
         }
     }
+}
+
+/// `tag` with each product level as it is or, when wider at `height`, as its letters with the
+/// largest number placing can give it.
+fn widest_tag(tag: &crate::tag::DeviceTag, height: f64) -> crate::tag::DeviceTag {
+    let mut widest = tag.clone();
+    for level in &mut widest.product {
+        let letters: String = level.chars().take_while(|c| !c.is_ascii_digit()).collect();
+        let numbered = format!("{letters}9999");
+        if crate::font::text_width_mm(&numbered, height) > crate::font::text_width_mm(level, height) {
+            *level = numbered;
+        }
+    }
+    widest
 }
 
 /// Points round a wire's label (its number, potential and cable core) as the PDF draws it: on
@@ -205,20 +212,40 @@ fn wire_label_points(
     symbol: &impl Fn(&str) -> Option<Symbol>,
     pts: &mut Vec<Point>,
 ) {
-    let core = w.cable.as_ref().map(|c| {
-        if c.core.is_empty() {
-            c.cable.to_string()
-        } else {
-            format!("{}:{}", c.cable, c.core)
+    // A core follows its cable to the tag placing gives it (`-W1` placed as `-W1000`), so the
+    // label is measured with the cable tag as it is and at its widest.
+    let cores: Vec<Option<String>> = match &w.cable {
+        None => vec![None],
+        Some(c) => [c.cable.clone(), widest_tag(&c.cable, 2.0)]
+            .iter()
+            .map(|t| {
+                Some(if c.core.is_empty() {
+                    t.to_string()
+                } else {
+                    format!("{t}:{}", c.core)
+                })
+            })
+            .collect(),
+    };
+    for core in &cores {
+        let label: Vec<&str> = [w.number.as_deref(), w.potential.as_deref(), core.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect();
+        if !label.is_empty() {
+            label_points(m, w, symbol, &label.join(" "), pts);
         }
-    });
-    let label: Vec<&str> = [w.number.as_deref(), w.potential.as_deref(), core.as_deref()]
-        .into_iter()
-        .flatten()
-        .collect();
-    if label.is_empty() {
-        return;
     }
+}
+
+/// Points round `text` drawn as `w`'s label (see [`wire_label_points`]).
+fn label_points(
+    m: &Macro,
+    w: &crate::project::Wire,
+    symbol: &impl Fn(&str) -> Option<Symbol>,
+    text: &str,
+    pts: &mut Vec<Point>,
+) {
     let end = |e: &Endpoint| match e {
         Endpoint::Point { at } => Some(*at),
         Endpoint::Pin { item, pin } => {
@@ -233,11 +260,10 @@ fn wire_label_points(
         return;
     };
     let mid = Point::new((p.x + q.x) / 2.0, (p.y + q.y) / 2.0);
-    let text = label.join(" ");
     if (p.x - q.x).abs() < (p.y - q.y).abs() {
         pts.extend(text_corners(
             Point::new(mid.x - 1.0, mid.y + 0.8),
-            &text,
+            text,
             2.0,
             Align::Right,
             0.0,
@@ -245,7 +271,7 @@ fn wire_label_points(
     } else {
         pts.extend(text_corners(
             Point::new(mid.x, mid.y - 1.0),
-            &text,
+            text,
             2.0,
             Align::Center,
             0.0,
@@ -807,6 +833,37 @@ mod tests {
             "{min:?} {max:?}"
         );
         assert!(min.x < plain_min.x && max.x >= plain_max.x);
+        Ok(())
+    }
+
+    #[test]
+    fn a_cable_core_label_counts_with_the_cable_tag_placing_can_give() -> Result<()> {
+        let mut one = starter()?.apply(Some("small"), &BTreeMap::new())?;
+        // A 10 mm horizontal wire, a core of `-W1`, which placing can renumber to `-W9999`.
+        one.wires = vec![crate::project::Wire {
+            id: "wc".into(),
+            from: Endpoint::Point {
+                at: Point::new(0.0, 0.0),
+            },
+            to: Endpoint::Point {
+                at: Point::new(10.0, 0.0),
+            },
+            via: vec![],
+            number: None,
+            potential: None,
+            cable: Some(crate::project::CableCore {
+                cable: DeviceTag::parse("-W1")?,
+                core: "BN".into(),
+            }),
+            route: Default::default(),
+            spec: Default::default(),
+        }];
+        let (min, max) = extent(std::slice::from_ref(&one), |_| None);
+        let half = crate::font::text_width_mm("-W9999:BN", 2.0) / 2.0;
+        assert!(
+            min.x <= 5.0 - half + 1e-9 && max.x >= 5.0 + half - 1e-9,
+            "{min:?} {max:?}"
+        );
         Ok(())
     }
 

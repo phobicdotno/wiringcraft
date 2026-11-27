@@ -3731,6 +3731,8 @@ fn run(mut cli: Cli) -> Res<()> {
                         .iter()
                         .map(|(kind, id)| vendored_bytes(dir, *kind, id))
                         .collect::<Res<_>>()?;
+                    // A link would become a plain file on the rollback, or be removed (#614).
+                    refuse_linked_files(&vendored, "macro generate")?;
                     let undo_vendored = |err: String| -> String {
                         let failed = put_files_back(&vendored);
                         if failed.is_empty() {
