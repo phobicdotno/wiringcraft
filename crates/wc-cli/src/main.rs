@@ -2551,26 +2551,57 @@ impl MacroCopies {
     }
 }
 
-/// Make sure the symbols and parts `m` (an applied macro) uses are in the project, as
-/// `macro place` needs them.
-fn take_macro_items(dir: &Path, p: &mut Project, m: &wc_core::macros::Macro, again: &str) -> Res<()> {
+/// Make sure the symbols and parts `macros` (applied macros: the one `macro place` places, or
+/// the copies of `macro generate`, one per row) use are in the project.
+///
+/// Each item is taken once, with the copy that names it first, and the library is opened at
+/// most once: a later copy naming the same symbol or part finds what the first one left, so
+/// looking it up again would change nothing.
+fn take_macro_items(dir: &Path, p: &mut Project, macros: &[wc_core::macros::Macro], again: &str) -> Res<()> {
+    let mut lib = None;
+    let mut seen = std::collections::BTreeSet::new();
+    for m in macros {
+        take_new_macro_items(dir, p, m, again, &mut lib, &mut seen)?;
+    }
+    Ok(())
+}
+
+/// [`take_macro_items`] for one macro: the items no macro before it named (`seen`), with the
+/// library an earlier one opened (`held`).
+fn take_new_macro_items<'a>(
+    dir: &Path,
+    p: &mut Project,
+    m: &'a wc_core::macros::Macro,
+    again: &str,
+    held: &mut Option<wc_library::Library>,
+    seen: &mut std::collections::BTreeSet<(ItemKind, &'a str)>,
+) -> Res<()> {
     // A pinned symbol or part keeps its pinned version: a missing copy is put
     // back from a library that still has that version, never from a newer one.
     // One without a pin is taken from the library and pinned, also when a copy
     // is left from an earlier attempt that failed before it was pinned. The
     // parts are those the macro's devices and their accessories name, as
     // `device --part` takes them; a part no library has is left as it is.
-    let symbols: std::collections::BTreeSet<&str> = m.symbols.iter().map(|s| s.symbol.as_str()).collect();
+    let symbols: std::collections::BTreeSet<&str> = m
+        .symbols
+        .iter()
+        .map(|s| s.symbol.as_str())
+        .filter(|id| !seen.contains(&(ItemKind::Symbol, *id)))
+        .collect();
     let parts: std::collections::BTreeSet<&str> = m
         .devices
         .values()
         .flat_map(|d| d.part.iter().chain(d.accessories.iter().map(|a| &a.part)))
         .map(|id| id.trim())
-        .filter(|id| !id.is_empty())
+        .filter(|id| !id.is_empty() && !seen.contains(&(ItemKind::Part, *id)))
         .collect();
+    seen.extend(symbols.iter().map(|id| (ItemKind::Symbol, *id)));
+    seen.extend(parts.iter().map(|id| (ItemKind::Part, *id)));
     // The library is opened only when an item needs it, so a macro whose
-    // symbols and parts all have their pinned copies works without it.
-    let mut lib: Option<wc_library::Library> = None;
+    // symbols and parts all have their pinned copies works without it. One
+    // opened for an earlier macro of the run is used again, and handed on at
+    // the end.
+    let mut lib: Option<wc_library::Library> = held.take();
     // A symbol the project already places but has no readable copy of comes
     // back with the macro, and can turn placed items into terminals. A strip
     // that renumbers is refused here, before any copy is written, as the
@@ -2580,7 +2611,9 @@ fn take_macro_items(dir: &Path, p: &mut Project, m: &wc_core::macros::Macro, aga
     // copy the same way. The loop below writes the version checked here, by
     // its hash.
     let mut checked: std::collections::BTreeMap<&str, String> = std::collections::BTreeMap::new();
-    if p.meta.follows_terminals() {
+    // With no symbol of its own left to take, a macro brings and replaces none: the check
+    // would compare the project's terminal numbers with themselves.
+    if p.meta.follows_terminals() && !symbols.is_empty() {
         let mut brings: Vec<wc_core::Symbol> = Vec::new();
         let mut replaces: Vec<wc_core::Symbol> = Vec::new();
         for id in symbols.iter().copied() {
@@ -2717,6 +2750,7 @@ fn take_macro_items(dir: &Path, p: &mut Project, m: &wc_core::macros::Macro, aga
             }
         }
     }
+    *held = lib;
     Ok(())
 }
 
@@ -3818,24 +3852,12 @@ fn run(mut cli: Cli) -> Res<()> {
                         Some(bytes) => bytes,
                         None => run::read_file(&table)?,
                     };
-                    let shown = escape_field(&table.display().to_string());
-                    let rows = wc_import::csv::file_rows(&bytes).map_err(|err| format!("{shown}: {}", e(err)))?;
-                    // A file cut short inside a quoted cell would place a row with half a value.
-                    if let Some(line) = rows.open_quote {
-                        return Err(format!(
-                            "{shown}: line {line}: a quoted cell is not closed before the end of the file; nothing was placed"
-                        ));
-                    }
-                    let rows = wc_core::generate::rows_from_table(&m, &rows.cells, &rows.numbers).map_err(e)?;
-                    let copies = wc_core::generate::apply_rows(&m, &rows, set.as_deref()).map_err(e)?;
+                    let copies = run::macro_table_copies(&m, &bytes, &table.display().to_string(), set.as_deref())?;
                     // The symbol and part copies taking the macro's items may write, read first:
                     // a run that fails after them (a macro too large for the page, a placement or
                     // a save that fails) puts them back, so no page draws a symbol it did not.
                     let vendored = MacroCopies::read(dir, &copies, "macro generate")?;
-                    for copy in &copies {
-                        take_macro_items(dir, &mut p, copy, "generate the pages again")
-                            .map_err(|x| vendored.undo(x))?;
-                    }
+                    take_macro_items(dir, &mut p, &copies, "generate the pages again").map_err(|x| vendored.undo(x))?;
                     let title = title.unwrap_or_else(|| m.name.clone());
                     let symbol = |id: &str| store::read_vendored_symbol(dir, id).ok();
                     let generated = wc_core::generate::generate(&mut p, &copies, symbol, size, &title)
@@ -3878,7 +3900,8 @@ fn run(mut cli: Cli) -> Res<()> {
                     // As `macro generate`: a run that fails after a copy was written (an item that
                     // cannot be taken, the placement, the save) leaves the folder as it was.
                     let vendored = MacroCopies::read(dir, [&m], "macro place")?;
-                    take_macro_items(dir, &mut p, &m, "place the macro again").map_err(|x| vendored.undo(x))?;
+                    take_macro_items(dir, &mut p, std::slice::from_ref(&m), "place the macro again")
+                        .map_err(|x| vendored.undo(x))?;
                     let page_id = page_mut(&mut p, &page).map_err(|x| vendored.undo(x))?.id.clone();
                     let ids = wc_core::macros::place(&mut p, &page_id, &m, at).map_err(|x| vendored.undo(e(x)))?;
                     vendored.save(dir, &p, &[])?;

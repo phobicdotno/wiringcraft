@@ -4218,17 +4218,11 @@ impl Open {
     ) -> Result<wc_core::generate::Generated, String> {
         use wc_core::generate;
         let m = wc_core::macros::read_macro(path).map_err(|e| e.to_string())?;
-        let bytes = std::fs::read(table).map_err(|e| format!("{}: {e}", table.display()))?;
-        let rows = wc_import::csv::file_rows(&bytes).map_err(|e| format!("{}: {e}", table.display()))?;
-        // A file cut short inside a quoted cell would place a row with half a value.
-        if let Some(line) = rows.open_quote {
-            return Err(format!(
-                "{}: line {line}: a quoted cell is not closed before the end of the file; nothing was placed",
-                table.display()
-            ));
-        }
-        let rows = generate::rows_from_table(&m, &rows.cells, &rows.numbers).map_err(|e| e.to_string())?;
-        let copies = generate::apply_rows(&m, &rows, default_set).map_err(|e| e.to_string())?;
+        // The path is shown escaped, as `macro generate` shows it: a file name can hold
+        // control characters.
+        let shown = table.display().to_string();
+        let bytes = std::fs::read(table).map_err(|e| format!("{}: {e}", wc_import::run::escape_field(&shown)))?;
+        let copies = wc_import::run::macro_table_copies(&m, &bytes, &shown, default_set)?;
         if copies.is_empty() {
             return Ok(generate::Generated::default());
         }

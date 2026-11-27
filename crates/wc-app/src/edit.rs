@@ -1504,6 +1504,36 @@ mod tests {
         assert_eq!(o.project, before, "one undo step takes it all back");
     }
 
+    /// The table's path is shown escaped, as `macro generate` shows it (#1865). Unix only: a
+    /// Windows file name cannot hold a control character.
+    #[cfg(unix)]
+    #[test]
+    fn a_table_whose_name_holds_a_control_character_is_named_escaped() {
+        let (_tmp, mut o, page, _a, _b) = setup();
+        let sel = o.select_all(page);
+        let clip = o.copy(page, &sel);
+        let path = o.save_macro(&clip, "Two coils", "").unwrap();
+        let table = o.dir.join("pu\u{1b}[2Jmps.csv");
+        let shown = table.display().to_string().replace('\u{1b}', "\\u{1b}");
+        // A table that is not there.
+        let err = o.generate_from_table(page, &path, &table, None).unwrap_err();
+        assert!(err.starts_with(&format!("{shown}: ")), "{err:?}");
+        // One cut short inside a quoted cell.
+        std::fs::write(&table, "what\nPump 1\n\"Pump 2\n").unwrap();
+        let err = o.generate_from_table(page, &path, &table, None).unwrap_err();
+        assert_eq!(
+            err,
+            format!("{shown}: line 3: a quoted cell is not closed before the end of the file; nothing was placed")
+        );
+        // One no reader takes.
+        std::fs::write(&table, b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1").unwrap();
+        let err = o.generate_from_table(page, &path, &table, None).unwrap_err();
+        assert!(
+            err.starts_with(&format!("{shown}: ")) && err.contains(".xls"),
+            "{err:?}"
+        );
+    }
+
     #[test]
     fn a_table_generation_that_fails_takes_back_the_symbol_it_pinned_and_undo_does_too() {
         let (_tmp, mut o, page, _a, _b) = setup();
