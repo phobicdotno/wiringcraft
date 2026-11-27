@@ -5076,12 +5076,29 @@ fn lock_warnings(left: &wc_library::Unpinned) -> Vec<String> {
         .collect()
 }
 
+/// `path` for a message line: control characters (line breaks, ESC, ...) written as `\u{1b}`,
+/// so the line stays one line and cannot steer the terminal. Unlike [`escape_field`], backslashes
+/// are kept, so a Windows path prints as written.
+fn printable_path(path: &Path) -> String {
+    path.display()
+        .to_string()
+        .chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_unicode().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
 fn vcs_cmd(dir: &Path, vc: VcsCmd) -> Res<()> {
     let git = wc_vcs::Git::new(dir);
     if !matches!(vc, VcsCmd::Init) && !git.in_work_tree().map_err(e)? {
         return Err(format!(
             "{} is not under version control; run `wiringcraft vcs init` first",
-            escape_field(&dir.display().to_string())
+            printable_path(dir)
         ));
     }
     match vc {
