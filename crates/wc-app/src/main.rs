@@ -6653,7 +6653,7 @@ impl App {
         };
         let hits = find.chosen_hits();
         find.message = match open.replace_found(&hits, &find.query, &find.with, find.options()) {
-            Ok(n) => find_window::replaced_note(n, &hits),
+            Ok(n) => find.replaced_note(n, &hits),
             Err(e) => e,
         };
         // The items replaced may no longer match; what is selected may be gone.

@@ -481,8 +481,9 @@ enum Cmd {
     },
     /// Find text in free texts, device tags, wire numbers, potentials and device descriptions
     /// on every page; one hit per line: page, kind, value. With --replace, replace it in every
-    /// hit (a device tag renames the device everywhere it appears). Status lines go to stderr,
-    /// so stdout holds only hits.
+    /// hit (a device tag renames the device everywhere it appears). A hit the replace does not
+    /// change, such as the tag `-K15` for `-K1`, gets a fourth field `not changed: another tag`,
+    /// and the status line counts them. Status lines go to stderr, so stdout holds only hits.
     Find {
         /// The text to find; upper and lower case are alike unless --match-case. A device tag
         /// such as `-K1` is taken as the text, though it starts with `-`.
@@ -2344,6 +2345,16 @@ fn turn_library_rule(
 /// The `find` output: one hit per line, the page number (`-` for a device not drawn), the
 /// kind and the value, separated by tabs.
 fn find_lines(p: &Project, hits: &[wc_core::find::Hit]) -> String {
+    find_lines_noted(p, hits, |_| None)
+}
+
+/// [`find_lines`] for a replace: a hit that `alone` names a reason for gets a fourth field,
+/// `not changed: <reason>`.
+fn find_lines_noted(
+    p: &Project,
+    hits: &[wc_core::find::Hit],
+    alone: impl Fn(&wc_core::find::Hit) -> Option<wc_core::find::LeftAlone>,
+) -> String {
     hits.iter()
         .map(|h| {
             let page = h
@@ -2351,14 +2362,30 @@ fn find_lines(p: &Project, hits: &[wc_core::find::Hit]) -> String {
                 .page()
                 .and_then(|id| p.page(id))
                 .map_or_else(|| "-".to_owned(), |pg| pg.number.clone());
+            let note = alone(h).map_or_else(String::new, |why| format!("\tnot changed: {}", why.reason()));
             format!(
-                "{}\t{}\t{}\n",
+                "{}\t{}\t{}{note}\n",
                 escape_field(&page),
                 h.kind.label(),
                 escape_field(&h.value)
             )
         })
         .collect()
+}
+
+/// The status line of `find --replace`: how many values changed, and how many hits were left
+/// alone for which reason.
+fn replaced_line(n: usize, alone: &[wc_core::find::LeftAlone]) -> String {
+    let mut by_reason: std::collections::BTreeMap<wc_core::find::LeftAlone, usize> = std::collections::BTreeMap::new();
+    for why in alone {
+        *by_reason.entry(*why).or_default() += 1;
+    }
+    let mut line = format!("replaced {n} value(s)");
+    for (i, (why, count)) in by_reason.iter().enumerate() {
+        line.push_str(if i == 0 { "; left alone: " } else { ", " });
+        line.push_str(&format!("{count} hit(s) {}", why.reason()));
+    }
+    line
 }
 
 /// The `location list` output: one location per line, `+path`, then a tab and the description
@@ -4178,15 +4205,20 @@ fn run(mut cli: Cli) -> Res<()> {
             let mut p = load(dir)?;
             let opts = wc_core::find::FindOptions { match_case };
             let hits = wc_core::find::find(&p, &query, opts);
-            print!("{}", find_lines(&p, &hits));
             if let Some(with) = replace {
+                let alone = |h: &wc_core::find::Hit| wc_core::find::left_alone(h, &query, &with, opts);
+                print!("{}", find_lines_noted(&p, &hits, alone));
+                let left: Vec<wc_core::find::LeftAlone> = hits.iter().filter_map(alone).collect();
                 let n = wc_core::find::replace(&mut p, &hits, &query, &with, opts)?;
                 if n > 0 {
                     save(dir, &p)?;
                 }
-                eprintln!("replaced {n} value(s)");
-            } else if hits.is_empty() {
-                eprintln!("nothing found");
+                eprintln!("{}", replaced_line(n, &left));
+            } else {
+                print!("{}", find_lines(&p, &hits));
+                if hits.is_empty() {
+                    eprintln!("nothing found");
+                }
             }
         }
         Cmd::Check { all } => {
@@ -8475,6 +8507,61 @@ mod tests {
         assert_eq!(p.pages[0].symbols[0].tag.as_ref(), Some(&k2));
         assert!(p.devices.contains_key(&k2));
         assert!(cli(&dir, &["find", "K2", "--replace", "?"]).is_err(), "not a tag");
+    }
+
+    /// With --replace a tag hit the replace does not change says so in the list, and the status
+    /// line counts it.
+    #[test]
+    fn find_replace_says_which_hits_it_left_alone_and_why() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let mut p = load(&dir).unwrap();
+        for (id, t) in [("s1", "-K1"), ("s2", "-K15")] {
+            let tag = wc_core::DeviceTag::parse(t).unwrap();
+            p.pages[0].symbols.push(wc_core::PlacedSymbol {
+                id: id.into(),
+                symbol: "wc.coil".into(),
+                at: wc_core::Point::new(10.0, 10.0),
+                rotation: Default::default(),
+                mirror: false,
+                tag: Some(tag.clone()),
+            });
+            p.devices.insert(tag, wc_core::Device::default());
+        }
+        save(&dir, &p).unwrap();
+        let opts = wc_core::find::FindOptions::default();
+        let hits = wc_core::find::find(&p, "-K1", opts);
+        let alone = |h: &wc_core::find::Hit| wc_core::find::left_alone(h, "-K1", "-K2", opts);
+        let number = p.pages[0].number.clone();
+        assert_eq!(
+            find_lines_noted(&p, &hits, alone),
+            format!("{number}\tDevice tag\t-K1\n{number}\tDevice tag\t-K15\tnot changed: another tag\n")
+        );
+        // A plain search lists both, without a note.
+        assert_eq!(
+            find_lines(&p, &hits),
+            format!("{number}\tDevice tag\t-K1\n{number}\tDevice tag\t-K15\n")
+        );
+        let left: Vec<_> = hits.iter().filter_map(alone).collect();
+        assert_eq!(
+            replaced_line(1, &left),
+            "replaced 1 value(s); left alone: 1 hit(s) another tag"
+        );
+        assert_eq!(replaced_line(2, &[]), "replaced 2 value(s)");
+        use wc_core::find::LeftAlone::{AnotherTag, SameValue};
+        assert_eq!(
+            replaced_line(0, &[SameValue, AnotherTag, AnotherTag]),
+            "replaced 0 value(s); left alone: 2 hit(s) another tag, 1 hit(s) already so"
+        );
+        cli(&dir, &["find", "-K1", "--replace", "-K2"]).unwrap();
+        let p = load(&dir).unwrap();
+        let tags: Vec<String> = p.pages[0]
+            .symbols
+            .iter()
+            .filter_map(|s| s.tag.as_ref().map(ToString::to_string))
+            .collect();
+        assert_eq!(tags, ["-K2", "-K15"]);
     }
 
     #[test]

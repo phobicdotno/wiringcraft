@@ -185,6 +185,44 @@ fn replace_at(hay: &str, needle: &str, with: &str, at: &[usize]) -> String {
     out
 }
 
+/// Why a replace leaves a hit as it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LeftAlone {
+    /// The text was found inside a part of the tag, so the tag is another device's: `-K15`
+    /// for `-K1` ([`replace_in_tag`]).
+    AnotherTag,
+    /// The value is the same after the replace: the replacement is what already stands there.
+    SameValue,
+}
+
+impl LeftAlone {
+    /// The reason in a few words, as shown next to the hit.
+    pub fn reason(self) -> &'static str {
+        match self {
+            LeftAlone::AnotherTag => "another tag",
+            LeftAlone::SameValue => "already so",
+        }
+    }
+}
+
+/// Whether [`replace`] of `query` with `with` would leave this hit (from [`find`] with the same
+/// query and options) as it is, and why. `None` when the replace changes it, also when the
+/// change would be refused (a renamed tag that is not a valid tag).
+pub fn left_alone(hit: &Hit, query: &str, with: &str, opts: FindOptions) -> Option<LeftAlone> {
+    if hit.kind == FindKind::Tag {
+        if positions(&hit.value, query, opts, true).is_empty() {
+            return Some(LeftAlone::AnotherTag);
+        }
+        let new = replace_in_tag(&hit.value, query, with, opts);
+        let same = match (DeviceTag::parse(&hit.value), DeviceTag::parse(&new)) {
+            (Ok(from), Ok(to)) => from == to,
+            _ => new == hit.value,
+        };
+        return same.then_some(LeftAlone::SameValue);
+    }
+    (replace_text(&hit.value, query, with, opts) == hit.value).then_some(LeftAlone::SameValue)
+}
+
 /// Every hit for `query` in the project, page by page in page order, then the device
 /// descriptions. An empty query finds nothing.
 pub fn find(project: &Project, query: &str, opts: FindOptions) -> Vec<Hit> {
@@ -1140,5 +1178,65 @@ mod tests {
             replace_text("Pump", "pump", "Fan", FindOptions { match_case: true }),
             "Pump"
         );
+    }
+
+    /// A hit the replace will not change is told apart before the replace, with the reason, and
+    /// what [`left_alone`] says agrees with what [`replace`] then does.
+    #[test]
+    fn a_hit_the_replace_leaves_alone_is_told_with_the_reason() -> Result<(), String> {
+        let p = sample();
+        let opts = FindOptions::default();
+        let hits = find(&p, "-K1", opts);
+        let told: Vec<(&str, Option<LeftAlone>)> = hits
+            .iter()
+            .filter(|h| h.kind == FindKind::Tag)
+            .map(|h| (h.value.as_str(), left_alone(h, "-K1", "-K2", opts)))
+            .collect();
+        assert_eq!(
+            told,
+            [("-K1", None), ("-K12", Some(LeftAlone::AnotherTag)), ("-K1", None)]
+        );
+        // A letter part is whole in `-K12`, so `K` to `Q` changes it.
+        let hits = find(&p, "K", opts);
+        assert!(
+            hits.iter()
+                .filter(|h| h.kind == FindKind::Tag)
+                .all(|h| left_alone(h, "K", "Q", opts).is_none())
+        );
+        // The replacement is what stands there already: nothing changes, in a tag or a text.
+        let hits = find(&p, "k1", opts);
+        assert!(hits.len() > 3, "{hits:?}");
+        for h in &hits {
+            let expect = if h.value == "-K12" {
+                LeftAlone::AnotherTag
+            } else {
+                LeftAlone::SameValue
+            };
+            assert_eq!(left_alone(h, "k1", "K1", opts), Some(expect), "{h:?}");
+        }
+        // It agrees with the replace: only the hits not left alone change.
+        let hits = find(&p, "-K1", opts);
+        let alone: Vec<Hit> = hits
+            .iter()
+            .filter(|h| left_alone(h, "-K1", "-K2", opts).is_some())
+            .cloned()
+            .collect();
+        assert_eq!(alone.len(), 1);
+        let mut q = p.clone();
+        assert_eq!(replace(&mut q, &alone, "-K1", "-K2", opts)?, 0);
+        assert_eq!(q, p);
+        // One occurrence in the tag changes and another does not: the hit counts as changed.
+        let mixed = Hit {
+            kind: FindKind::Tag,
+            target: hits[0].target.clone(),
+            value: "=A1+C1-K11".into(),
+        };
+        assert_eq!(replace_in_tag(&mixed.value, "1", "2", opts), "=A2+C2-K11");
+        assert_eq!(left_alone(&mixed, "1", "2", opts), None);
+        // A change that would be refused is not "left alone".
+        let hits = find(&p, "-K1", opts);
+        assert_eq!(left_alone(&hits[0], "-K1", "?", opts), None);
+        assert_eq!(LeftAlone::AnotherTag.reason(), "another tag");
+        Ok(())
     }
 }
