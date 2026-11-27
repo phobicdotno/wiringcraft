@@ -322,7 +322,12 @@ pub fn parse(text: &str) -> Result<AmlImport> {
         let idx = *elem_ids
             .get(el)
             .or_else(|| elem_ids.get(&format!("{{{}}}", el.trim_matches(|c| c == '{' || c == '}'))))?;
-        Some((idx, iface.to_owned()))
+        // A name the element does not have would give a wire with no pin to end on.
+        out.devices[idx]
+            .interfaces
+            .iter()
+            .any(|n| n == iface)
+            .then(|| (idx, iface.to_owned()))
     };
     for (name, a, b) in raw_links {
         match (resolve(&a), resolve(&b)) {
@@ -755,6 +760,27 @@ mod tests {
                 ("PE'".to_string(), "2".to_string())
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn link_to_a_connection_point_name_the_element_lacks_is_warned_about() -> Result<()> {
+        let aml = r#"<CAEXFile><InstanceHierarchy Name="P">
+  <InternalElement Name="K1" ID="{e1}">
+    <ExternalInterface Name="A1" ID="i1"/>
+    <ExternalInterface Name="A2" ID="i2"/>
+  </InternalElement>
+  <InternalElement Name="X1" ID="e2">
+    <ExternalInterface Name="1" ID="i3"/>
+  </InternalElement>
+  <InternalLink Name="ok" RefPartnerSideA="{e1}:A2" RefPartnerSideB="e2:1"/>
+  <InternalLink Name="typo" RefPartnerSideA="{e1}:A9" RefPartnerSideB="i3"/>
+</InstanceHierarchy></CAEXFile>"#;
+        let imp = parse(aml)?;
+        assert_eq!(imp.links.len(), 1);
+        assert_eq!(imp.links[0].name, "ok");
+        assert_eq!(imp.warnings.len(), 1, "{:?}", imp.warnings);
+        assert!(imp.warnings[0].contains("\"typo\"") && imp.warnings[0].contains("{e1}:A9"));
         Ok(())
     }
 
