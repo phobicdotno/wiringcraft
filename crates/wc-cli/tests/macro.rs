@@ -329,6 +329,84 @@ fn placing_a_macro_copies_and_pins_the_parts_its_devices_name() -> TestResult {
 }
 
 #[test]
+fn a_part_id_that_differs_only_in_case_from_a_pinned_one_is_refused() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    wiringcraft(&dir, &["page", "add", "p1", "--number", "2"])?;
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let lib = tmp.path().join("lib");
+    std::fs::create_dir_all(lib.join("symbols"))?;
+    std::fs::create_dir_all(lib.join("parts"))?;
+    std::fs::copy(
+        repo.join("library/symbols/wc.coil.json"),
+        lib.join("symbols/wc.coil.json"),
+    )?;
+    let lamp = "example.ex-lamp-24-rd";
+    let file = lib.join(format!("parts/{lamp}.json"));
+    std::fs::copy(repo.join(format!("library/parts/{lamp}.json")), &file)?;
+    wiringcraft(&dir, &["lib", "add", "mine", "folder", lib.to_str().ok_or("path")?])?;
+    let lamp_macro = |part: &str| {
+        format!(
+            r#"{{"name": "Lamp", "anchor": {{"x": 0.0, "y": 0.0}},
+            "symbols": [{{"id": "s1", "symbol": "wc.coil", "at": {{"x": 10.0, "y": 10.0}}, "tag": "-P1"}}],
+            "devices": {{"-P1": {{"part": "{part}"}}}}}}"#
+        )
+    };
+    std::fs::create_dir_all(dir.join("macros"))?;
+    std::fs::write(dir.join("macros/lamp.json"), lamp_macro(lamp))?;
+    wiringcraft(&dir, &["macro", "place", "p1", "lamp", "--at", "0,0"])?;
+    assert!(wc_core::store::load(&dir)?.lock.parts.contains_key(lamp));
+
+    // The library now holds the part under an id in other case (one file, so this also works
+    // on a folder that ignores case), and a second macro names it that way.
+    let upper = "EXAMPLE.ex-lamp-24-rd";
+    let mut part: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file)?)?;
+    part["id"] = upper.into();
+    std::fs::remove_file(&file)?;
+    std::fs::write(lib.join(format!("parts/{upper}.json")), part.to_string())?;
+    std::fs::write(dir.join("macros/upper.json"), lamp_macro(upper))?;
+    let before = folder(&dir)?;
+    let Err(err) = wiringcraft(&dir, &["macro", "place", "p1", "upper", "--at", "50,0"]) else {
+        return Err("took a part whose copy would be the pinned part's file".into());
+    };
+    assert!(err.contains("differ only in case"), "{err}");
+    assert!(err.contains(lamp) && err.contains(upper), "both ids are named: {err}");
+    assert_eq!(
+        changed(&before, &folder(&dir)?),
+        Vec::<&Path>::new(),
+        "nothing is written"
+    );
+
+    // A table row naming it is refused the same way.
+    let table = tmp.path().join("rows.csv");
+    std::fs::write(
+        dir.join("macros/row.json"),
+        lamp_macro("{{part}}").replace(r#""devices""#, r#""placeholders": [{"name": "part"}], "devices""#),
+    )?;
+    std::fs::write(&table, format!("part\n{lamp}\n{upper}\n"))?;
+    let before = folder(&dir)?;
+    let Err(err) = wiringcraft(
+        &dir,
+        &["macro", "generate", "row", "--table", table.to_str().ok_or("path")?],
+    ) else {
+        return Err("generated pages with a part whose copy would be the pinned part's file".into());
+    };
+    assert!(err.contains("differ only in case"), "{err}");
+    assert_eq!(
+        changed(&before, &folder(&dir)?),
+        Vec::<&Path>::new(),
+        "nothing is written"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_project_macro_is_shown_and_edited_and_a_library_one_is_not() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let dir = tmp.path().join("p");
