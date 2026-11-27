@@ -2,15 +2,32 @@
 //!
 //! ```text
 //! my-project/
-//!   project.toml            name, title block, library sources
-//!   devices.json            device tag -> part and properties
+//!   project.toml            name, format version, title block, library sources and settings
+//!   devices.json            device tag -> part, description and properties
 //!   library.lock            exact version of every library item in use
 //!   pages/<id>.page.json    one file per page
-//!   vendor/symbols/<id>.json  copies of the library items in use
-//!   vendor/parts/<id>.json
 //!   panels/<id>.panel.json  cabinet panel layouts
 //!   comments/<page id>.comments.json  review comments on a page
+//!   vendor/symbols/<id>.json  copies of the library symbols in use
+//!   vendor/parts/<id>.json    copies of the library parts in use
+//!   macros/<id>.json        the project's own macros ([`crate::macros`])
+//!   translations.toml       translation dictionary ([`crate::translate`])
+//!   pictures/               the logo and other pictures ([`crate::Logo::DIR`])
+//!   underlays/              pictures drawn under a page ([`crate::Underlay::DIR`])
 //! ```
+//!
+//! `project.toml` holds `name`, `format_version`, `[title_block]` and the `[[library]]`
+//! sources, then one table or key per kind of project setting: `[[location]]`, `[[jumper]]`,
+//! `[[strip]]`, `[logo]`, `[template]`, `[[revision]]`, `[[report]]`, `[[rule]]`, `rules_off`,
+//! `[[rack]]` and `[[network]]` (see [`ProjectMeta`]). A setting that would be empty, or a
+//! `[template]` that is the built-in one, is left out.
+//!
+//! This module reads and writes `project.toml`, `devices.json`, `library.lock`, pages, panels,
+//! comments and `vendor/`. Macros and the translation dictionary are read and written by their
+//! own modules, with the same write helpers. Only `project.toml` is needed: a missing
+//! `devices.json` or `library.lock` reads as empty, and a missing folder as one with nothing in
+//! it. [`docs/project-format.md`](https://github.com/phobicdotno/wiringcraft/blob/main/docs/project-format.md)
+//! in the repository is the full reference for the format.
 //!
 //! Every file is written deterministically (sorted keys, fixed indentation, trailing newline),
 //! atomically (temporary file, then rename) and only when its content changed, so version
@@ -524,6 +541,8 @@ pub fn load(dir: &Path) -> Result<Project> {
     };
     project.sort_pages();
     project.sort_comments();
+    // A file saved before locations were kept in natural order lists them as it was written.
+    crate::project::sort_locations(&mut project.meta.locations);
     Ok(project)
 }
 
@@ -735,18 +754,22 @@ fn is_box_symbol(id: &str) -> bool {
     id.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("box."))
 }
 
-/// Refuse two ids that differ only in case, naming both.
+/// Refuse two ids that are the same or differ only in case, naming both: either way the two
+/// would be saved to one file and one of them lost.
 fn unique_ignoring_case<'a>(kind: &str, ids: impl Iterator<Item = &'a str>) -> Result<()> {
     let mut seen: BTreeMap<String, &str> = BTreeMap::new();
     for id in ids {
-        if let Some(other) = seen.insert(id.to_ascii_lowercase(), id)
-            && other != id
-        {
-            return Err(Error::Invalid(format!(
+        let Some(other) = seen.insert(id.to_ascii_lowercase(), id) else {
+            continue;
+        };
+        return Err(Error::Invalid(if other == id {
+            format!("two {kind}s have the id {id:?}, so one would overwrite the other; rename one of them")
+        } else {
+            format!(
                 "{kind} ids {other:?} and {id:?} differ only in case, so they would be one file on \
                  macOS and Windows; rename one of them"
-            )));
-        }
+            )
+        }));
     }
     Ok(())
 }
@@ -945,6 +968,22 @@ mod tests {
         assert!(again.is_empty(), "unchanged project rewrote {again:?}");
         let back = load(dir.path())?;
         assert_eq!(back, p);
+        Ok(())
+    }
+
+    #[test]
+    fn a_load_lists_locations_in_natural_order() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
+        let mut p = Project::new("Demo");
+        for path in ["+CAB10", "CAB2", "CAB3"] {
+            p.meta.locations.push(crate::project::Location {
+                path: path.into(),
+                description: String::new(),
+            });
+        }
+        save(dir.path(), &p)?;
+        let paths: Vec<String> = load(dir.path())?.meta.locations.into_iter().map(|l| l.path).collect();
+        assert_eq!(paths, ["CAB2", "CAB3", "+CAB10"]);
         Ok(())
     }
 
@@ -1217,6 +1256,42 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn a_save_refuses_two_pages_or_panels_of_one_id_and_writes_nothing() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
+        let mut p = sample()?;
+        save(dir.path(), &p)?;
+        let file = dir
+            .path()
+            .join(PAGES_DIR)
+            .join(format!("{}{PAGE_SUFFIX}", p.pages[0].id));
+        let before = fs::read_to_string(&file).map_err(|e| Error::io(&file, e))?;
+        let mut twin = p.pages[0].clone();
+        twin.title = "Twin".into();
+        p.pages.push(twin);
+        let Err(e) = save(dir.path(), &p) else {
+            unreachable!("two pages of one id saved");
+        };
+        let id = &p.pages[0].id;
+        assert!(e.to_string().contains(&format!("two pages have the id {id:?}")), "{e}");
+        assert_eq!(fs::read_to_string(&file).map_err(|e| Error::io(&file, e))?, before);
+
+        p.pages.pop();
+        p.panels.push(crate::panel::Panel::new("panel1", "Main", 600.0, 400.0));
+        p.panels.push(crate::panel::Panel::new("panel1", "Spare", 300.0, 200.0));
+        let Err(e) = save(dir.path(), &p) else {
+            unreachable!("two panels of one id saved");
+        };
+        assert!(e.to_string().contains("two panels have the id \"panel1\""), "{e}");
+        assert!(
+            !dir.path()
+                .join(PANELS_DIR)
+                .join(format!("panel1{PANEL_SUFFIX}"))
+                .exists()
+        );
+        Ok(())
+    }
+
     /// The message of the error `load` gave, or an error when it loaded.
     fn load_refused(dir: &Path) -> Result<String> {
         match load(dir) {
@@ -1253,8 +1328,7 @@ mod tests {
     #[test]
     fn a_page_or_panel_file_whose_id_differs_from_its_name_is_refused() -> Result<()> {
         let dir = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
-        let mut p = sample()?;
-        p.panels.push(crate::panel::Panel::new("main", "Main", 600.0, 800.0));
+        let p = sample()?;
         save(dir.path(), &p)?;
         let page = p.pages[0].id.clone();
         let pages = dir.path().join(PAGES_DIR);
