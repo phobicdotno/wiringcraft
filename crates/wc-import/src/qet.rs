@@ -401,6 +401,7 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
     // Unnamed terminals are numbered in order; a repeated name gets a mark and a count
     // (`x`, `x'`, `x'2`, ...), so names stay short however often one repeats. The names the
     // file gives are taken first, so an unnamed terminal's number never renames a named one.
+    // Spaces around a name are dropped, so ` 13 ` is the same terminal name as `13`.
     let mut used = std::collections::BTreeSet::new();
     let mut repeats: std::collections::BTreeMap<String, usize> = Default::default();
     let mut unique = |base: String| {
@@ -418,7 +419,7 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
     };
     let named: Vec<Option<String>> = pins
         .iter()
-        .map(|(name, ..)| (!name.trim().is_empty()).then(|| unique(name.clone())))
+        .map(|(name, ..)| (!name.trim().is_empty()).then(|| unique(name.trim().to_owned())))
         .collect();
     let mut out_pins: Vec<Pin> = Vec::new();
     for (i, ((_, at, dir), name)) in pins.into_iter().zip(named).enumerate() {
@@ -1222,6 +1223,20 @@ mod tests {
         let (imp, _) = element(el, "qet.x", 1.0)?;
         let names: Vec<&str> = imp.symbol.pins.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["1'", "1", "2", "4"]);
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_names_lose_surrounding_spaces() -> Result<()> {
+        let el = r#"<definition type="element"><description>
+<line x1="0" y1="0" x2="0" y2="20"/>
+<terminal x="0" y="0" orientation="n" name=" 13 "/>
+<terminal x="0" y="10" orientation="s" name="13"/>
+<terminal x="0" y="20" orientation="s" name="   "/>
+</description></definition>"#;
+        let (imp, _) = element(el, "qet.x", 1.0)?;
+        let names: Vec<&str> = imp.symbol.pins.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["13", "13'", "3"]);
         Ok(())
     }
 

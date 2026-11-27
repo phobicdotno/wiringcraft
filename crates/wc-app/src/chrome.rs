@@ -20,6 +20,16 @@ pub struct ChromeState {
     pub ribbon_tab: usize,
 }
 
+impl ChromeState {
+    /// The chrome with ribbon tab `ribbon_tab` open (from the preferences); a tab the ribbon
+    /// does not have (an edited or older file) opens the first one, not an empty ribbon.
+    pub fn with_ribbon_tab(ribbon_tab: usize) -> Self {
+        Self {
+            ribbon_tab: if ribbon_tab < RIBBON.len() { ribbon_tab } else { 0 },
+        }
+    }
+}
+
 const MENUS: &[(&str, &[Option<Action>])] = &[
     (
         "File",
@@ -935,6 +945,17 @@ mod tests {
         frame(&mut state, &mut out, vec![press(true)]);
         frame(&mut state, &mut out, vec![press(false)]);
         assert_eq!(state.ribbon_tab, 0, "the point is not on the first tab");
+    }
+
+    #[test]
+    fn a_remembered_ribbon_tab_opens_again_and_one_out_of_range_opens_the_first() {
+        assert_eq!(ChromeState::with_ribbon_tab(1).ribbon_tab, 1);
+        assert_eq!(
+            ChromeState::with_ribbon_tab(RIBBON.len() - 1).ribbon_tab,
+            RIBBON.len() - 1
+        );
+        assert_eq!(ChromeState::with_ribbon_tab(RIBBON.len()).ribbon_tab, 0);
+        assert_eq!(ChromeState::with_ribbon_tab(usize::MAX).ribbon_tab, 0);
     }
 
     #[test]

@@ -524,6 +524,8 @@ pub fn load(dir: &Path) -> Result<Project> {
     };
     project.sort_pages();
     project.sort_comments();
+    // A file saved before locations were kept in natural order lists them as it was written.
+    crate::project::sort_locations(&mut project.meta.locations);
     Ok(project)
 }
 
@@ -945,6 +947,22 @@ mod tests {
         assert!(again.is_empty(), "unchanged project rewrote {again:?}");
         let back = load(dir.path())?;
         assert_eq!(back, p);
+        Ok(())
+    }
+
+    #[test]
+    fn a_load_lists_locations_in_natural_order() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
+        let mut p = Project::new("Demo");
+        for path in ["+CAB10", "CAB2", "CAB3"] {
+            p.meta.locations.push(crate::project::Location {
+                path: path.into(),
+                description: String::new(),
+            });
+        }
+        save(dir.path(), &p)?;
+        let paths: Vec<String> = load(dir.path())?.meta.locations.into_iter().map(|l| l.path).collect();
+        assert_eq!(paths, ["CAB2", "CAB3", "+CAB10"]);
         Ok(())
     }
 
