@@ -1082,7 +1082,7 @@ fn black_box_form(
             box_size_field(ui, &mut form.height);
             ui.end_row();
         });
-    ui.label(RichText::new("Connection points: name, edge and mm along it").color(t.faint));
+    ui.label(RichText::new("Connection points: name, edge and mm along it").color(t.muted));
     let mut remove = None;
     egui::Grid::new("box-pins")
         .num_columns(4)
@@ -1168,9 +1168,9 @@ pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut 
         // a page someone else holds.
         if let Some(p) = open.project.pages.get(ed.page) {
             ui.label(format!("Page {} · {}", p.number, p.title));
-            ui.label(RichText::new(format!("{} symbols, {} wires", p.symbols.len(), p.wires.len())).color(t.faint));
+            ui.label(RichText::new(format!("{} symbols, {} wires", p.symbols.len(), p.wires.len())).color(t.muted));
         }
-        ui.label(RichText::new("Select an item on the sheet to edit it.").color(t.faint));
+        ui.label(RichText::new("Select an item on the sheet to edit it.").color(t.muted));
         page_comments(ui, open, ed, &t);
         return;
     }
@@ -1222,23 +1222,23 @@ fn selection_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps:
                 .num_columns(2)
                 .spacing([8.0, 6.0])
                 .show(ui, |ui| spec_rows(ui, open, page_idx, &wires, ps));
-            ui.label(RichText::new("A value typed here is set on all of them.").color(t.faint));
+            ui.label(RichText::new("A value typed here is set on all of them.").color(t.muted));
         } else {
             ui.label(format!("{n} items selected"));
         }
         if symbols.len() == n {
             jumper_controls(ui, open, page_idx, &symbols);
         }
-        ui.label(RichText::new("Move, rotate, mirror, copy or delete them together.").color(t.faint));
+        ui.label(RichText::new("Move, rotate, mirror, copy or delete them together.").color(t.muted));
         return;
     }
     match ed.one().cloned() {
         None => {
             if let Some(p) = open.project.pages.get(page_idx) {
                 ui.label(format!("Page {} · {}", p.number, p.title));
-                ui.label(RichText::new(format!("{} symbols, {} wires", p.symbols.len(), p.wires.len())).color(t.faint));
+                ui.label(RichText::new(format!("{} symbols, {} wires", p.symbols.len(), p.wires.len())).color(t.muted));
             }
-            ui.label(RichText::new("Select an item on the sheet to edit it.").color(t.faint));
+            ui.label(RichText::new("Select an item on the sheet to edit it.").color(t.muted));
             page_comments(ui, open, ed, t);
         }
         Some(Selection::Symbol(id)) => {
@@ -1369,11 +1369,11 @@ fn selection_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps:
                 open.set_cloud_revision(page_idx, i, &chosen);
             }
             if let Some(r) = open.project.cloud_revision(&cloud.revision) {
-                ui.label(RichText::new(format!("{} {}", r.date, r.text)).color(t.faint));
+                ui.label(RichText::new(format!("{} {}", r.date, r.text)).color(t.muted));
             } else {
                 ui.colored_label(t.warning, format!("No revision {} in the project.", cloud.revision));
             }
-            ui.label(RichText::new("Drag to move it; Delete takes it off.").color(t.faint));
+            ui.label(RichText::new("Drag to move it; Delete takes it off.").color(t.muted));
         }
         Some(Selection::RevisionTable) => {
             ui.strong("Revision table");
@@ -1383,7 +1383,7 @@ fn selection_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps:
                     "Drag to move it; Delete takes it off the page. Revisions are listed in File → Project \
                      properties.",
                 )
-                .color(t.faint),
+                .color(t.muted),
             );
         }
         Some(Selection::Graphic(i)) => {
@@ -1721,7 +1721,7 @@ fn accessories_section(ui: &mut egui::Ui, open: &mut Open, ps: &mut PanelState, 
     if current.is_empty() {
         ui.label(
             RichText::new("None. Add parts that come with the main part.")
-                .color(t.faint)
+                .color(t.muted)
                 .small(),
         );
     }
@@ -1813,7 +1813,7 @@ fn device_section(ui: &mut egui::Ui, open: &mut Open, ps: &mut PanelState, tag: 
             if !v.is_empty() {
                 let mut job = egui::text::LayoutJob::default();
                 let font = egui::TextStyle::Body.resolve(ui.style());
-                job.append(&format!("{k}  "), 0.0, egui::TextFormat::simple(font.clone(), t.faint));
+                job.append(&format!("{k}  "), 0.0, egui::TextFormat::simple(font.clone(), t.muted));
                 job.append(v, 0.0, egui::TextFormat::simple(font, ui.visuals().text_color()));
                 ui.add(egui::Label::new(job).wrap());
             }
@@ -1856,7 +1856,7 @@ fn device_section(ui: &mut egui::Ui, open: &mut Open, ps: &mut PanelState, tag: 
         });
     ui.label(
         RichText::new("Shared by every symbol with this tag. Clear a value to remove it.")
-            .color(t.faint)
+            .color(t.muted)
             .small(),
     );
 }
@@ -1877,11 +1877,11 @@ fn page_comments(ui: &mut egui::Ui, open: &Open, ed: &mut Editor, t: &Theme) {
     for c in list {
         let first: String = c.text.lines().next().unwrap_or_default().chars().take(40).collect();
         let text = RichText::new(format!("{}  {first}", c.id));
-        let text = if c.resolved { text.color(t.faint) } else { text };
+        let text = if c.resolved { text.color(t.muted) } else { text };
         if row(
             ui,
             false,
-            Lead::Dot(if c.resolved { t.faint } else { t.accent }),
+            Lead::Dot(if c.resolved { t.muted } else { t.accent }),
             text,
             false,
         )
@@ -1905,7 +1905,7 @@ fn comment_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &
         ui.label(RichText::new(format!("Comment {}", c.id)).strong());
         badge(ui, if c.resolved { "Resolved" } else { "Open" }, t);
     });
-    ui.label(RichText::new(format!("Page {number}")).color(t.faint).small());
+    ui.label(RichText::new(format!("Page {number}")).color(t.muted).small());
     ui.add_space(6.0);
     let entry = |ui: &mut egui::Ui, author: &str, time: i64, text: &str| {
         ui.label(
@@ -2363,7 +2363,7 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mu
         }
         ui.add_space(6.0);
     } else {
-        ui.label(RichText::new("Click a device on the plate to see it; drag it to move it.").color(t.faint));
+        ui.label(RichText::new("Click a device on the plate to see it; drag it to move it.").color(t.muted));
         ui.add_space(6.0);
     }
     // Devices with a part that could go on the plate but are not on it.
@@ -2384,7 +2384,7 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mu
     // Set when a Place button is pressed, applied once the panel is no longer borrowed (#928).
     let mut place: Option<wc_core::DeviceTag> = None;
     if missing.is_empty() {
-        ui.label(RichText::new("Every device with a part is on the plate.").color(t.faint));
+        ui.label(RichText::new("Every device with a part is on the plate.").color(t.muted));
     } else {
         ui.label(RichText::new(format!("Not on the plate yet ({})", missing.len())).color(t.muted));
         for (tag, m) in missing {
@@ -2399,7 +2399,7 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mu
                 ui.label(RichText::new(m).monospace());
             });
         }
-        ui.label(RichText::new("Page menu → Arrange devices puts them on the rails.").color(t.faint));
+        ui.label(RichText::new("Page menu → Arrange devices puts them on the rails.").color(t.muted));
     }
     if let Some(tag) = place {
         match open.place_panel_device(pi, &tag) {
