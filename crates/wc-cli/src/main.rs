@@ -3911,7 +3911,9 @@ fn run(mut cli: Cli) -> Res<()> {
             for m in missing {
                 eprintln!("warning: symbol {m} has no vendored copy (run `wiringcraft lib lock`)");
             }
-            let parts = vendored_parts(dir, &p);
+            // A part whose copy cannot be read is left out of the reports and the panel sheets,
+            // so it is named in a warning rather than left out without a word.
+            let parts = vendored_parts_warning_unreadable(dir, &p);
             let inputs = wc_report::Inputs {
                 project: &p,
                 symbols: &symbols,
@@ -3957,7 +3959,7 @@ fn run(mut cli: Cli) -> Res<()> {
                     unreadable: pictures.unreadable,
                     panels: p.panels.clone(),
                     networks,
-                    footprints: wc_pdf::footprints(vendored_parts(dir, &p).values()),
+                    footprints: wc_pdf::footprints(parts.values()),
                     plc_cards,
                 },
             );
