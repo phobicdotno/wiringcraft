@@ -668,6 +668,15 @@ fn drawn_wires_get_the_section_and_colour_of_their_connection() {
     assert_eq!(page.wires[3].spec.section.as_deref(), Some("2.5 mm²"));
     assert_eq!(page.wires[0].spec.colour.as_deref(), Some("BU"));
     assert!(page.wires[..3].iter().all(|w| w.potential.is_none()));
+    // A potential on a pin whose wire already has a spec names it and leaves the spec.
+    let on_specced = vec![conn("L2", "K1:21", "4", "GN")];
+    assert_eq!(
+        drawing::spec_from_connections(&mut page, &owners, &on_specced, &is_device),
+        0
+    );
+    assert_eq!(page.wires[0].potential.as_deref(), Some("L2"));
+    assert_eq!(page.wires[0].spec.colour.as_deref(), Some("BU"));
+    assert_eq!(page.wires[0].spec.section.as_deref(), Some("1.5 mm²"));
     assert_eq!(conn("a:1", "b:1", "0", "").spec(), wc_core::WireSpec::default());
     assert_eq!(
         conn("a:1", "b:1", "18 AWG", "").spec().section.as_deref(),
