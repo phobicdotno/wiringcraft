@@ -128,8 +128,9 @@ folder, such as a `macros` folder that is a link, is left out). Then:
 - Library sources keep pointing at the same libraries. A folder source inside the base project is
   copied along; a relative folder outside it (such as `../library`) is written as the absolute
   folder it named. That works only for a base project in a folder: a base project fetched from
-  a git repository cannot name library folders outside the repository, and `new` stops with an
-  error. Start from a local copy of it, or point those sources at absolute folders or git.
+  a git repository cannot have a relative folder source that leads outside the repository
+  (such as `../library`), and `new` stops with an error. Absolute folders and git sources are
+  fine there. Start from a local copy of it, or point those sources at absolute folders or git.
 
 ## Page template and title block
 
