@@ -481,7 +481,7 @@ pub fn to_kicad_sym(text_in: &str) -> Result<(String, Vec<String>)> {
                 )));
             }
             ("ENDDEF", Some(_)) => {
-                let Some(done) = def.take() else { continue };
+                let Some(mut done) = def.take() else { continue };
                 if done.name.is_empty() {
                     continue;
                 }
@@ -493,6 +493,18 @@ pub fn to_kicad_sym(text_in: &str) -> Result<(String, Vec<String>)> {
                     for (kind, k) in std::mem::take(&mut skipped) {
                         warnings.push(format!("{}: {k} {kind}(s) not read", done.name));
                     }
+                }
+                // Units past the importer's limit are left out here, drawn or not, and said
+                // once (the importer would only count the drawn ones).
+                let max = crate::kicad::MAX_UNITS as i64;
+                if done.units > max {
+                    warnings.push(format!(
+                        "{}: only the first {max} units were read, {} skipped",
+                        done.name,
+                        done.units - max
+                    ));
+                    done.items.retain(|(unit, _), _| *unit <= max);
+                    done.units = max;
                 }
                 write_symbol(&mut out, &done);
             }
@@ -560,9 +572,9 @@ fn write_symbol(out: &mut String, d: &Def) {
         let unit = if d.units > 1 { *unit } else { (*unit).min(1) };
         blocks.entry((unit, style)).or_default().extend(items);
     }
-    // Every unit the `DEF` line declares, also one drawn only by the common items, up to the
-    // importer's own limit (a `DEF` may declare up to 1000).
-    for unit in 1..=d.units.min(crate::kicad::MAX_UNITS as _) {
+    // Every unit the `DEF` line declares, also one drawn only by the common items (at most the
+    // importer's own limit, see `to_kicad_sym`).
+    for unit in 1..=d.units {
         blocks.entry((unit, 1)).or_default();
     }
     for ((unit, style), items) in &blocks {
@@ -751,8 +763,20 @@ ENDDEF
     #[test]
     fn declared_units_are_written_up_to_the_importer_s_limit() -> Result<()> {
         let lib = "EESchema-LIBRARY Version 2.4\nDEF MANY U 0 40 Y Y 1000 L N\nDRAW\nX 1 1 0 0 100 R 50 50 1 1 P\nENDDRAW\nENDDEF\n";
-        let (sym, _) = to_kicad_sym(lib)?;
+        let (sym, warnings) = to_kicad_sym(lib)?;
         assert_eq!(sym.matches("(symbol \"MANY_").count(), crate::kicad::MAX_UNITS, "{sym}");
+        assert_eq!(warnings, ["MANY: only the first 64 units were read, 936 skipped"]);
+        // A unit drawn past the limit is left out too, and said once.
+        let drawn = lib.replace("50 50 1 1 P", "50 50 900 1 P");
+        let (sym, warnings) = to_kicad_sym(&drawn)?;
+        assert!(!sym.contains("MANY_900_1"), "{sym}");
+        let (_, more) = crate::kicad::symbols(&sym, "kicad.x", 1.0)?;
+        let said: Vec<&String> = warnings
+            .iter()
+            .chain(&more)
+            .filter(|w| w.contains("units were read"))
+            .collect();
+        assert_eq!(said.len(), 1, "{warnings:?} {more:?}");
         Ok(())
     }
 
