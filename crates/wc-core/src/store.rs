@@ -735,18 +735,22 @@ fn is_box_symbol(id: &str) -> bool {
     id.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("box."))
 }
 
-/// Refuse two ids that differ only in case, naming both.
+/// Refuse two ids that are the same or differ only in case, naming both: either way the two
+/// would be saved to one file and one of them lost.
 fn unique_ignoring_case<'a>(kind: &str, ids: impl Iterator<Item = &'a str>) -> Result<()> {
     let mut seen: BTreeMap<String, &str> = BTreeMap::new();
     for id in ids {
-        if let Some(other) = seen.insert(id.to_ascii_lowercase(), id)
-            && other != id
-        {
-            return Err(Error::Invalid(format!(
+        let Some(other) = seen.insert(id.to_ascii_lowercase(), id) else {
+            continue;
+        };
+        return Err(Error::Invalid(if other == id {
+            format!("two {kind}s have the id {id:?}, so one would overwrite the other; rename one of them")
+        } else {
+            format!(
                 "{kind} ids {other:?} and {id:?} differ only in case, so they would be one file on \
                  macOS and Windows; rename one of them"
-            )));
-        }
+            )
+        }));
     }
     Ok(())
 }
@@ -1217,6 +1221,42 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn a_save_refuses_two_pages_or_panels_of_one_id_and_writes_nothing() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
+        let mut p = sample()?;
+        save(dir.path(), &p)?;
+        let file = dir
+            .path()
+            .join(PAGES_DIR)
+            .join(format!("{}{PAGE_SUFFIX}", p.pages[0].id));
+        let before = fs::read_to_string(&file).map_err(|e| Error::io(&file, e))?;
+        let mut twin = p.pages[0].clone();
+        twin.title = "Twin".into();
+        p.pages.push(twin);
+        let Err(e) = save(dir.path(), &p) else {
+            unreachable!("two pages of one id saved");
+        };
+        let id = &p.pages[0].id;
+        assert!(e.to_string().contains(&format!("two pages have the id {id:?}")), "{e}");
+        assert_eq!(fs::read_to_string(&file).map_err(|e| Error::io(&file, e))?, before);
+
+        p.pages.pop();
+        p.panels.push(crate::panel::Panel::new("panel1", "Main", 600.0, 400.0));
+        p.panels.push(crate::panel::Panel::new("panel1", "Spare", 300.0, 200.0));
+        let Err(e) = save(dir.path(), &p) else {
+            unreachable!("two panels of one id saved");
+        };
+        assert!(e.to_string().contains("two panels have the id \"panel1\""), "{e}");
+        assert!(
+            !dir.path()
+                .join(PANELS_DIR)
+                .join(format!("panel1{PANEL_SUFFIX}"))
+                .exists()
+        );
+        Ok(())
+    }
+
     /// The message of the error `load` gave, or an error when it loaded.
     fn load_refused(dir: &Path) -> Result<String> {
         match load(dir) {
@@ -1253,8 +1293,7 @@ mod tests {
     #[test]
     fn a_page_or_panel_file_whose_id_differs_from_its_name_is_refused() -> Result<()> {
         let dir = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
-        let mut p = sample()?;
-        p.panels.push(crate::panel::Panel::new("main", "Main", 600.0, 800.0));
+        let p = sample()?;
         save(dir.path(), &p)?;
         let page = p.pages[0].id.clone();
         let pages = dir.path().join(PAGES_DIR);
