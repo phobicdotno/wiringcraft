@@ -243,7 +243,7 @@ enum Cmd {
     /// Rules: `sequential` (1, 2, 3 in drawing order), `page-column` (`3.4`: page and column
     /// where the connection starts) or `potential` (the potential's name, else sequential).
     NumberWires {
-        /// `sequential`, `page-column` or `potential`.
+        /// `sequential`, `page-column` or `potential` (any case; `page_column` works too).
         #[arg(long, default_value = "page-column")]
         rule: String,
         /// Renumber connections that already have a number too.

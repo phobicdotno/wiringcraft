@@ -3143,6 +3143,34 @@ fn layer_names_are_text_strings() {
 }
 
 #[test]
+fn a_missing_symbol_is_warned_about_once_per_page_with_its_placements() {
+    let mut project = Project::new("x");
+    let mut p1 = Page::new("p1", "1", "A");
+    for (k, x) in [40.0, 80.0, 120.0].into_iter().enumerate() {
+        p1.symbols.push(place(&format!("r{k}"), "relay", x, &format!("-K{k}")));
+    }
+    p1.symbols.push(place("t1", "lamp", 160.0, "-P1"));
+    let mut p2 = Page::new("p2", "2", "B");
+    p2.symbols.push(place("r9", "relay", 40.0, "-K9"));
+    project.pages = vec![p1, p2];
+    let (pdf, report) = export(&project, &BTreeMap::new(), &Options::default());
+    assert_eq!(
+        report.warnings,
+        vec![
+            "page 1: symbol \"lamp\" is not in the project's library copy".to_string(),
+            "page 1: symbol \"relay\" is not in the project's library copy (3 placements)".to_string(),
+            "page 2: symbol \"relay\" is not in the project's library copy".to_string(),
+        ]
+    );
+    // Every placement is still drawn as a box with a question mark.
+    let text = String::from_utf8_lossy(&pdf);
+    assert_eq!(text.matches(&format!("{} Tj", writer::pdf_text("?"))).count(), 5);
+    // The SVG and DXF exports warn the same way.
+    let (_, lines) = page_lines(&project, &BTreeMap::new(), &Options::default());
+    assert_eq!(lines.warnings, report.warnings);
+}
+
+#[test]
 fn text_the_pdf_cannot_print_is_warned_about_once_per_sheet() {
     // Helvetica's WinAnsi has no Ω or Cyrillic: they print as '?', so say so (Latin-1, the
     // euro and dashes print, and an arrow prints as '>' on purpose).

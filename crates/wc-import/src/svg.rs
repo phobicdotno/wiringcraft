@@ -204,6 +204,31 @@ fn shown(e: &BytesStart, tag: &str, (drawn, visible): (bool, bool)) -> (bool, bo
     (drawn, visible)
 }
 
+/// Font size and text alignment set on an element or passed down from its parents, as a fill
+/// is. `None` is set nowhere above: the size falls back to 3.5, the alignment to the left.
+#[derive(Clone, Copy, Default)]
+struct Font {
+    size: Option<f64>,
+    align: Option<Align>,
+}
+
+/// The font of an element from its parent's: its own `font-size` and `text-anchor` (from
+/// `style` first, then the attribute) win, and a value that is not read (`inherit`, `em`, ...)
+/// keeps the parent's.
+fn font(e: &BytesStart, parent: Font) -> Font {
+    let value = |name| presentation(e, name).map(|v| split_important(&v).0.trim().to_ascii_lowercase());
+    let align = match value("text-anchor").as_deref() {
+        Some("start") => Some(Align::Left),
+        Some("middle") => Some(Align::Center),
+        Some("end") => Some(Align::Right),
+        _ => parent.align,
+    };
+    Font {
+        size: value("font-size").and_then(|s| font_size(&s)).or(parent.size),
+        align,
+    }
+}
+
 /// Whether a fill paints the shape: not `none`, `transparent` or white (`#fff`, `white`,
 /// `rgb(255,255,255)`, `rgb(100%,100%,100%)`). No fill, or `inherit`, takes the parent's answer.
 /// A trailing `!important` is ignored.
@@ -575,9 +600,12 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
     let mut fills: Vec<bool> = vec![false];
     // `(drawn, visible)` of each open element (see [`shown`]); kept in step with `stack`.
     let mut shows: Vec<(bool, bool)> = vec![(true, true)];
+    // The font of each open element (see [`font`]); kept in step with `stack`.
+    let mut fonts: Vec<Font> = vec![Font::default()];
     let mut shapes = Vec::new();
     let mut pins: Vec<(Option<String>, Point)> = Vec::new();
-    let mut pending_text: Option<(Point, f64, Align, f64)> = None;
+    // Where a `<text>` still waiting for its words starts, and its angle.
+    let mut pending_text: Option<(Point, f64)> = None;
     let mut seen_root = false;
     let mut depth_guard = 0usize;
     loop {
@@ -594,15 +622,17 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                     stack.pop();
                     fills.pop();
                     shows.pop();
+                    fonts.pop();
                 }
                 (None, false)
             }
             Event::Text(t) => {
                 // Only text for a pending label is read; other text is ignored. A hidden run
                 // (a `<tspan>` with `display="none"` or `visibility="hidden"`) is skipped and
-                // leaves the label waiting for a visible one.
+                // leaves the label waiting for a visible one. The run's own element (the `<text>`
+                // or a `<tspan>` in it) gives the size and alignment.
                 let shown_run = shows.last().copied().unwrap_or((true, true)) == (true, true);
-                if let (Some((at, h, align, angle)), true) = (pending_text, shown_run) {
+                if let (Some((at, angle)), true) = (pending_text, shown_run) {
                     let s = t
                         .unescape()
                         .map_err(|e| Error::Format(format!("SVG: {e}")))?
@@ -611,11 +641,13 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                     // Skip the line breaks and indents between `<text>` and a `<tspan>`.
                     if !s.is_empty() {
                         pending_text = None;
+                        let f = fonts.last().copied().unwrap_or_default();
+                        let sc = stack.last().copied().unwrap_or(M::ID).scale();
                         shapes.push(Shape::Text {
                             at,
                             text: s,
-                            height: h,
-                            align,
+                            height: f.size.unwrap_or(3.5) * sc * 0.72,
+                            align: f.align.unwrap_or(Align::Left),
                             angle,
                         });
                     }
@@ -652,6 +684,7 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
             }
         }
         let show = shown(&e, &tag, shows.last().copied().unwrap_or((true, true)));
+        let fnt = font(&e, fonts.last().copied().unwrap_or_default());
         // An invisible `<text>` still sets up its label: a `<tspan>` in it can be visible again,
         // and each run of words is checked on its own.
         if !show.0 || (!show.1 && tag != "text") {
@@ -660,6 +693,7 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                 stack.push(m);
                 fills.push(filled);
                 shows.push(show);
+                fonts.push(fnt);
             }
             continue;
         }
@@ -765,17 +799,9 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
                 None
             }
             "text" => {
-                // Read from `style` first (Inkscape writes them there), then the attribute.
-                let value = |name| presentation(&e, name).map(|v| split_important(&v).0.trim().to_ascii_lowercase());
-                let size = value("font-size").and_then(|s| font_size(&s)).unwrap_or(3.5);
-                let align = match value("text-anchor").as_deref() {
-                    Some("middle") => Align::Center,
-                    Some("end") => Align::Right,
-                    _ => Align::Left,
-                };
+                // The size and alignment are read when its words come (see `fonts`).
                 if !empty {
-                    let at = m.p(num(&e, "x"), num(&e, "y"));
-                    pending_text = Some((at, size * sc * 0.72, align, m.text_angle()));
+                    pending_text = Some((m.p(num(&e, "x"), num(&e, "y")), m.text_angle()));
                 }
                 None
             }
@@ -801,6 +827,7 @@ pub fn symbol(text: &str, id: &str, name: &str) -> Result<wc_core::Symbol> {
             stack.push(m);
             fills.push(filled);
             shows.push(show);
+            fonts.push(fnt);
         }
     }
     if !seen_root {
@@ -1395,6 +1422,47 @@ mod tests {
         assert!((e.0 - 0.8 * a.0).abs() < 1e-9, "6pt is 8px");
         assert_eq!(e.1, Align::Center);
         assert_eq!(f.0, d.0, "em is not read: the fallback");
+        Ok(())
+    }
+
+    #[test]
+    fn text_size_and_alignment_from_group_and_tspan() -> Result<()> {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg">
+            <circle id="pin:1" cx="0" cy="0" r="0.5"/>
+            <text font-size="10" x="0" y="0">REF</text>
+            <g style="font-size:10px;text-anchor:end"><text x="0" y="5">G</text></g>
+            <g font-size="4" text-anchor="end"><text style="font-size:10px;text-anchor:start" x="0" y="10">W</text></g>
+            <text x="0" y="15"><tspan style="font-size:10px;text-anchor:middle">T</tspan></text>
+            <g font-size="10"><g><text font-size="inherit" x="0" y="20">N</text></g></g>
+            <g font-size="10"><text transform="scale(2)" x="0" y="25">S</text></g>
+            <text x="0" y="30" text-anchor="end"><tspan>A</tspan></text>
+        </svg>"#;
+        let s = symbol(svg, "svg.text", "Text")?;
+        let texts: Vec<(&str, f64, Align)> = s
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Text {
+                    text, height, align, ..
+                } => Some((text.as_str(), *height, *align)),
+                _ => None,
+            })
+            .collect();
+        let h = |name: &str| texts.iter().find(|t| t.0 == name).map(|t| (t.1, t.2));
+        let (Some(r), Some(g), Some(w), Some(t), Some(n), Some(sc), Some(a)) =
+            (h("REF"), h("G"), h("W"), h("T"), h("N"), h("S"), h("A"))
+        else {
+            unreachable!("all texts come in: {texts:?}");
+        };
+        assert_eq!(g, (r.0, Align::Right), "a parent group's size and alignment");
+        assert_eq!(w, (r.0, Align::Left), "the text's own values win over its group's");
+        assert_eq!(t, (r.0, Align::Center), "a tspan holding the words sets them");
+        assert_eq!(n.0, r.0, "inherited through nested groups and `inherit`");
+        assert!(
+            (sc.0 - 2.0 * r.0).abs() < 1e-9,
+            "an inherited size scales with the text"
+        );
+        assert_eq!(a.1, Align::Right, "a tspan without values keeps the text's");
         Ok(())
     }
 

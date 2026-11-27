@@ -941,7 +941,24 @@ fn box_size_field(ui: &mut egui::Ui, value: &mut f64) {
     }
 }
 
-/// Apply the black box form shown in the Properties panel when it has changes not applied yet,
+/// Whether the black box form of the box `id` on page `page` is the one the Properties panel
+/// shows now: that box alone is selected on the page shown, with no panel layout open. A form
+/// left behind when another item was picked is kept for when the box is picked again, but it
+/// is neither applied by a save nor counted as refused (#1019).
+fn black_box_form_shown(ed: &Editor, page: usize, id: &str) -> bool {
+    ed.panel.is_none() && ed.page == page && matches!(ed.selection.as_slice(), [Selection::Symbol(s)] if s == id)
+}
+
+/// Whether the black box form shown holds a change that [`apply_black_box_draft`] refused: it
+/// stays in the form, with its reason, for the person to correct.
+pub fn black_box_draft_refused(ps: &PanelState, ed: &Editor) -> bool {
+    ps.black_box.as_ref().is_some_and(|((page, id, _), form)| {
+        form.error.is_some() && form.changed() && black_box_form_shown(ed, *page, id)
+    })
+}
+
+/// Apply the black box form shown in the Properties panel when it has changes not applied yet
+/// (a form of a box no longer selected is left alone),
 /// as its Apply button does (one undo step): called before the project is saved (#932). A form
 /// read for another version of the box (after an Undo, say) is left alone, as the panel reads
 /// it again. Returns what to check after the change went in (`Ok(Some)`), or why it was refused
@@ -950,6 +967,9 @@ pub fn apply_black_box_draft(open: &mut Open, ed: &mut Editor, ps: &mut PanelSta
     let Some(((page, id, hash), form)) = ps.black_box.as_mut() else {
         return Ok(None);
     };
+    if !black_box_form_shown(ed, *page, id) {
+        return Ok(None);
+    }
     let current = open
         .project
         .pages
@@ -1001,12 +1021,8 @@ fn apply_box_form(
     // whose name another point took (also a new point just like the one taken off), would be
     // saved on a stale point: it is dropped, as the assistant's black box edit does. So is one
     // whose start no longer resolves at all.
-    let point_changed = |pin: &str| {
-        renamed.contains_key(pin)
-            || removed.contains(pin)
-            || renamed.values().any(|to| to == pin)
-            || form.old_pins().iter().find(|p| p.name == pin) != pins.iter().find(|p| p.name == pin)
-    };
+    let point_changed =
+        |pin: &str| crate::black_box_tool::point_changed(pin, form.old_pins(), &pins, &renamed, &removed);
     let shown = open.project.pages.get(ed.page);
     let lost = ed.wire.as_ref().is_some_and(|(start, _)| {
         let changed = matches!(
@@ -2731,6 +2747,8 @@ mod tests {
             None,
         )?;
         let mut ed = Editor::default();
+        ed.page = 1;
+        ed.selection = vec![Selection::Symbol(id.clone())];
         let mut ps = PanelState::default();
         assert_eq!(
             apply_black_box_draft(&mut o, &mut ed, &mut ps),
@@ -2781,6 +2799,22 @@ mod tests {
         assert!(refused.is_err(), "a duplicate point name is refused");
         assert_eq!(o.undo_steps(), steps + 1);
         assert!(ps.black_box.as_ref().is_some_and(|(_, f)| f.error.is_some()));
+        assert!(black_box_draft_refused(&ps, &ed));
+        // Another item picked: the form is not shown, so a save neither applies it nor counts
+        // it as refused; it is kept for when the box is picked again (#1019).
+        ed.selection = vec![Selection::Symbol("other".into())];
+        assert!(!black_box_draft_refused(&ps, &ed));
+        if let Some((_, f)) = ps.black_box.as_mut() {
+            f.rows.truncate(1);
+            f.rows[0].name = "B".into();
+            f.error = None;
+        }
+        assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), Ok(None));
+        assert_eq!(o.undo_steps(), steps + 1, "a hidden form is not applied");
+        assert!(ps.black_box.is_some(), "and is kept");
+        ed.selection = vec![Selection::Symbol(id.clone())];
+        assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), Ok(None));
+        assert_eq!(o.undo_steps(), steps + 2, "applied once shown again");
         Ok(())
     }
 
@@ -2803,6 +2837,8 @@ mod tests {
             None,
         )?;
         let mut ed = Editor::default();
+        ed.page = 1;
+        ed.selection = vec![Selection::Symbol(id.clone())];
         let mut ps = PanelState::default();
         let t = Theme::of(&egui::Context::default());
         let ctx = egui::Context::default();
@@ -2845,6 +2881,8 @@ mod tests {
             None,
         )?;
         let mut ed = Editor::default();
+        ed.page = 1;
+        ed.selection = vec![Selection::Symbol(id.clone())];
         let mut ps = PanelState::default();
         let t = Theme::of(&egui::Context::default());
         let ctx = egui::Context::default();
