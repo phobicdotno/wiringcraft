@@ -1771,6 +1771,19 @@ pub struct Device {
     pub properties: BTreeMap<String, String>,
 }
 
+impl Device {
+    /// Set the description to `text` without the spaces around it; a blank text clears it.
+    /// Returns whether the description changed.
+    pub fn set_description(&mut self, text: &str) -> bool {
+        let text = text.trim();
+        if self.description == text {
+            return false;
+        }
+        text.clone_into(&mut self.description);
+        true
+    }
+}
+
 /// One more part of a device, with how many of it the device needs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DevicePart {
@@ -2263,6 +2276,18 @@ mod tests {
         p.devices.insert(DeviceTag::parse("-K1")?, d);
         assert_eq!(p.used_parts().len(), 3);
         Ok(())
+    }
+
+    #[test]
+    fn a_device_description_is_trimmed_and_a_blank_one_cleared() {
+        let mut d = Device::default();
+        assert!(d.set_description("  Pump motor\t"));
+        assert_eq!(d.description, "Pump motor");
+        assert!(!d.set_description("Pump motor "));
+        assert!(d.set_description("   "));
+        assert_eq!(d.description, "");
+        assert!(!d.set_description(""));
+        assert_eq!(serde_json::to_string(&d).ok().as_deref(), Some("{}"));
     }
 
     #[test]
