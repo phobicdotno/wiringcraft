@@ -5,7 +5,9 @@
 //! `arc`, `polygon`, `text`, `dynamic_text`/`input` (texts filled in on the schematic) and
 //! `terminal` (connection points with an orientation `n`, `e`, `s` or `w`). Coordinates are
 //! screen pixels (y down) around the element's hotspot; QElectroTech's grid is 10 px. Written
-//! from the published element format; no element files are copied into WiringCraft.
+//! from the published element format; no element files are copied into WiringCraft. The
+//! symbol's description comes from `<elementInformations>`, the entry named `description`, and
+//! its letter code from the entry named `label` when that reads as a reference such as `-K1`.
 
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
@@ -26,6 +28,8 @@ const MAX_TERMINALS: usize = 1000;
 const MAX_REASONS: usize = 20;
 /// Points used for an ellipse that is not a circle, or an elliptic arc.
 const ELLIPSE_STEPS: usize = 48;
+/// Segments in each quarter-ellipse corner of a rounded rectangle.
+const CORNER_STEPS: usize = 6;
 
 /// One imported element.
 #[derive(Debug, Clone)]
@@ -82,14 +86,93 @@ fn finite(s: &Shape) -> bool {
     }
 }
 
-/// `filling:...` from a QElectroTech style string; anything but `none` fills.
-fn filled(e: &BytesStart) -> bool {
+/// Whether a rectangle, ellipse, circle or polygon comes in solid (#875, #924): WiringCraft fills in the line colour, so
+/// only a dark filling is kept. `white`, light grey and the hatch patterns stay hollow, as does
+/// `none`, since drawing them solid in the line colour would hide what the element shows.
+fn solid_fill(e: &BytesStart) -> bool {
     attr(e, "style").is_some_and(|s| {
         s.split(';').any(|kv| {
-            kv.split_once(':')
-                .is_some_and(|(k, v)| k.trim() == "filling" && !matches!(v.trim(), "" | "none"))
+            kv.split_once(':').is_some_and(|(k, v)| {
+                k.trim() == "filling"
+                    && !matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "" | "none" | "white" | "lightgray" | "hor" | "ver" | "bdiag" | "fdiag"
+                    )
+            })
         })
     })
+}
+
+/// A closed outline, plus a fill under it when `fill` is set. QElectroTech draws a filled shape
+/// with its outline, while WiringCraft draws a filled polyline without one, so both are kept.
+fn push_closed(graphics: &mut Vec<Shape>, points: Vec<Point>, fill: bool) {
+    if fill {
+        graphics.push(Shape::Polyline {
+            points: points.clone(),
+            closed: true,
+            filled: true,
+        });
+    }
+    graphics.push(Shape::Polyline {
+        points,
+        closed: true,
+        filled: false,
+    });
+}
+
+/// The end shape QElectroTech draws at `tip` of a line coming from `from` (`end1`/`end2`), sized
+/// as QElectroTech sizes it from `len` (`lengthN`): `simple` is an open arrow and `triangle` a
+/// filled one, both `len` long and `len` to each side; `circle` is a dot of radius `len` touching
+/// the end; `diamond` reaches `2 * len` along the line and `len` to each side. `none` and unknown
+/// values add nothing. Returns how far the line's shaft is cut back from `tip`, so that it stops
+/// at the marker's inner edge, as QElectroTech draws it (0 for `simple`, `none` and unknown).
+fn line_end(graphics: &mut Vec<Shape>, kind: &str, tip: Point, from: Point, len: f64, fill: bool) -> f64 {
+    let (dx, dy) = (tip.x - from.x, tip.y - from.y);
+    let d = dx.hypot(dy);
+    if !(d > 1e-9 && len.is_finite() && len > 0.0) {
+        return 0.0;
+    }
+    // Unit vector out of the line end, and one across it.
+    let (ux, uy) = (dx / d, dy / d);
+    let at = |along: f64, across: f64| Point::new(tip.x - ux * along - uy * across, tip.y - uy * along + ux * across);
+    match kind {
+        "simple" => {
+            graphics.push(Shape::Line {
+                a: at(len, len),
+                b: tip,
+            });
+            graphics.push(Shape::Line {
+                a: at(len, -len),
+                b: tip,
+            });
+            0.0
+        }
+        "triangle" => {
+            graphics.push(Shape::Polyline {
+                points: vec![tip, at(len, len), at(len, -len)],
+                closed: true,
+                filled: true,
+            });
+            len
+        }
+        "circle" => {
+            graphics.push(Shape::Circle {
+                center: at(len, 0.0),
+                radius: len,
+                filled: fill,
+            });
+            2.0 * len
+        }
+        "diamond" => {
+            graphics.push(Shape::Polyline {
+                points: vec![tip, at(len, len), at(2.0 * len, 0.0), at(len, -len)],
+                closed: true,
+                filled: false,
+            });
+            2.0 * len
+        }
+        _ => 0.0,
+    }
 }
 
 /// Points on the ellipse in the box (`x`, `y`, `w`, `h`), from `start` sweeping `sweep` degrees
@@ -103,6 +186,60 @@ fn ellipse_points(x: f64, y: f64, w: f64, h: f64, start: f64, sweep: f64) -> Vec
             Point::new(cx + rx * a.cos(), cy - ry * a.sin())
         })
         .collect()
+}
+
+/// The outline of the rectangle from (`x0`, `y0`) to (`x1`, `y1`) with quarter-ellipse corners of
+/// radii `rx` and `ry` (both above 0 and at most half the side), clockwise on screen from the
+/// top-left corner. Straight sides join the corners.
+fn rounded_rect_points(x0: f64, y0: f64, x1: f64, y1: f64, rx: f64, ry: f64) -> Vec<Point> {
+    // Corner centres and the screen angle (y down) each quarter starts at.
+    let corners = [
+        (x0 + rx, y0 + ry, 180.0),
+        (x1 - rx, y0 + ry, 270.0),
+        (x1 - rx, y1 - ry, 0.0),
+        (x0 + rx, y1 - ry, 90.0),
+    ];
+    let mut points: Vec<Point> = Vec::with_capacity(4 * (CORNER_STEPS + 1));
+    for (cx, cy, start) in corners {
+        for i in 0..=CORNER_STEPS {
+            let a = (start + 90.0 * i as f64 / CORNER_STEPS as f64).to_radians();
+            let p = Point::new(cx + rx * a.cos(), cy + ry * a.sin());
+            // A radius of half the side makes two corners meet; keep the point once.
+            if points
+                .last()
+                .is_none_or(|q| (q.x - p.x).abs() > 1e-9 || (q.y - p.y).abs() > 1e-9)
+            {
+                points.push(p);
+            }
+        }
+    }
+    if points.len() > 1
+        && points
+            .first()
+            .zip(points.last())
+            .is_some_and(|(a, b)| (a.x - b.x).abs() <= 1e-9 && (a.y - b.y).abs() <= 1e-9)
+    {
+        points.pop();
+    }
+    points
+}
+
+/// The letter code in an element's default label: `-K1` and `K1` give `K`, `-PG1` gives `PG`.
+/// QElectroTech's label is free text, so only a label of an optional `-` (the product sign of
+/// IEC 81346), one to three letters and then digits counts; a name such as `SICK UM 30` or a
+/// formula such as `%prefix` gives no letter code.
+fn letter_code(label: &str) -> String {
+    let l = label.trim();
+    let l = l.strip_prefix('-').unwrap_or(l);
+    let letters = l.chars().take_while(|c| c.is_ascii_alphabetic()).count();
+    match (l.get(..letters), l.get(letters..)) {
+        (Some(code), Some(number))
+            if (1..=3).contains(&letters) && !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            code.to_ascii_uppercase()
+        }
+        _ => String::new(),
+    }
 }
 
 /// Read one `.elmt` element. The id is `<prefix>.<file stem>`-style text given by the caller,
@@ -128,6 +265,10 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
     // Open elements, to know where a `<name>` text or a dynamic text's `<info_name>` belongs.
     let mut path: Vec<String> = Vec::new();
     let mut name_lang: Option<String> = None;
+    // The element's `<elementInformation>` texts named `description` and `label`, and which one is open.
+    let mut description = String::new();
+    let mut label = String::new();
+    let mut in_info: Option<&'static str> = None;
     // A dynamic text waiting for its `<info_name>`: its position.
     let mut dynamic_at: Option<Point> = None;
     let mut unknown: std::collections::BTreeMap<String, usize> = Default::default();
@@ -154,6 +295,13 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
             match (tag.as_str(), path.last().map(String::as_str)) {
                 ("description", Some("definition")) => in_description = true,
                 ("name", Some("names")) => name_lang = Some(attr(&e, "lang").unwrap_or_default()),
+                ("elementInformation", Some("elementInformations")) if path.len() == 2 && !empty => {
+                    in_info = match attr(&e, "name").as_deref() {
+                        Some("description") => Some("description"),
+                        Some("label") => Some("label"),
+                        _ => None,
+                    };
+                }
                 _ if in_description && path.last().map(String::as_str) == Some("description") => {
                     shape(
                         &tag,
@@ -185,11 +333,29 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
                     match tag.as_str() {
                         "description" => in_description = false,
                         "name" => name_lang = None,
+                        "elementInformation" => in_info = None,
                         "dynamic_text" => dynamic_at = None,
                         _ => {}
                     }
                 }
             }
+            // An information is kept whole (text around a comment, CDATA) and trimmed once at the end.
+            Event::Text(t) if in_info.is_some() => {
+                let (info, into) = match in_info {
+                    Some("label") => ("label", &mut label),
+                    _ => ("description", &mut description),
+                };
+                match t.unescape() {
+                    Ok(v) => into.push_str(&v),
+                    Err(e) => warnings.push(format!(
+                        "the element's {info} has text that cannot be read ({e}); it is left out"
+                    )),
+                }
+            }
+            Event::CData(t) if in_info.is_some() => match in_info {
+                Some("label") => label.push_str(&String::from_utf8_lossy(&t)),
+                _ => description.push_str(&String::from_utf8_lossy(&t)),
+            },
             Event::Text(t) => {
                 let v = t.unescape().map(|s| s.trim().to_owned()).unwrap_or_default();
                 if let Some(lang) = &name_lang {
@@ -289,12 +455,12 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
         id: id.to_owned(),
         name: qet_name.clone(),
         category: String::new(),
-        letter_code: String::new(),
+        letter_code: letter_code(&label),
         role,
         graphics,
         pins: out_pins,
         tag_at,
-        description: String::new(),
+        description: description.trim().to_owned(),
     };
     Ok((Imported { symbol, qet_name }, warnings))
 }
@@ -318,17 +484,60 @@ fn shape(
     let mut skip = || *unknown.entry(tag.to_owned()).or_default() += 1;
     match tag {
         "line" => match (n("x1"), n("y1"), n("x2"), n("y2")) {
-            (Some(x1), Some(y1), Some(x2), Some(y2)) => graphics.push(Shape::Line {
-                a: pt(x1, y1),
-                b: pt(x2, y2),
-            }),
+            (Some(x1), Some(y1), Some(x2), Some(y2)) => {
+                let (a, b) = (pt(x1, y1), pt(x2, y2));
+                let (mut cut_a, mut cut_b) = (0.0, 0.0);
+                for (i, tip, from, cut) in [(1, a, b, &mut cut_a), (2, b, a, &mut cut_b)] {
+                    let Some(kind) = attr(e, &format!("end{i}")) else {
+                        continue;
+                    };
+                    let len = n(&format!("length{i}")).unwrap_or(1.5) * scale;
+                    *cut = line_end(graphics, &kind, tip, from, len, solid_fill(e));
+                }
+                // The shaft stops at the inner edge of the end shapes; none is left when they
+                // meet or overlap.
+                let d = (b.x - a.x).hypot(b.y - a.y);
+                if cut_a == 0.0 && cut_b == 0.0 {
+                    graphics.push(Shape::Line { a, b });
+                } else if cut_a + cut_b < d {
+                    let (ux, uy) = ((b.x - a.x) / d, (b.y - a.y) / d);
+                    graphics.push(Shape::Line {
+                        a: Point::new(a.x + ux * cut_a, a.y + uy * cut_a),
+                        b: Point::new(b.x - ux * cut_b, b.y - uy * cut_b),
+                    });
+                }
+            }
             _ => skip(),
         },
         "rect" => match (n("x"), n("y"), n("width"), n("height")) {
-            (Some(x), Some(y), Some(w), Some(h)) => graphics.push(Shape::Rect {
-                min: pt(x.min(x + w), y.min(y + h)),
-                max: pt(x.max(x + w), y.max(y + h)),
-            }),
+            (Some(x), Some(y), Some(w), Some(h)) => {
+                let (x0, y0, x1, y1) = (x.min(x + w), y.min(y + h), x.max(x + w), y.max(y + h));
+                // QElectroTech 0.8+ saves corner radii as `rx`/`ry` in absolute element units
+                // (it draws them with Qt's `drawRoundedRect` in absolute size mode), and Qt keeps
+                // each one to at most half the side, so they are clamped the same way here.
+                // A radius of 0 or less means no rounding, as in Qt.
+                let rx = n("rx").unwrap_or(0.0).min((x1 - x0) / 2.0);
+                let ry = n("ry").unwrap_or(0.0).min((y1 - y0) / 2.0);
+                if rx > 0.0 && ry > 0.0 {
+                    let points = rounded_rect_points(x0, y0, x1, y1, rx, ry)
+                        .into_iter()
+                        .map(|p| pt(p.x, p.y))
+                        .collect();
+                    push_closed(graphics, points, solid_fill(e));
+                    return;
+                }
+                let (min, max) = (pt(x0, y0), pt(x1, y1));
+                if solid_fill(e) {
+                    // WiringCraft's rectangle has no fill, so a solid one also gets a filled
+                    // closed polyline under its outline, as `push_closed` does for polygons.
+                    graphics.push(Shape::Polyline {
+                        points: vec![min, Point::new(max.x, min.y), max, Point::new(min.x, max.y)],
+                        closed: true,
+                        filled: true,
+                    });
+                }
+                graphics.push(Shape::Rect { min, max });
+            }
             _ => skip(),
         },
         "ellipse" | "circle" => {
@@ -343,7 +552,7 @@ fn shape(
                         graphics.push(Shape::Circle {
                             center: pt(x + w / 2.0, y + h / 2.0),
                             radius: w / 2.0 * scale,
-                            filled: filled(e),
+                            filled: solid_fill(e),
                         });
                     } else {
                         let points = ellipse_points(x, y, w, h, 0.0, 360.0)
@@ -351,11 +560,7 @@ fn shape(
                             .take(ELLIPSE_STEPS)
                             .map(|p| pt(p.x, p.y))
                             .collect();
-                        graphics.push(Shape::Polyline {
-                            points,
-                            closed: true,
-                            filled: false,
-                        });
+                        push_closed(graphics, points, solid_fill(e));
                     }
                 }
                 _ => skip(),
@@ -404,11 +609,14 @@ fn shape(
                 }
             }
             let closed = attr(e, "closed").is_none_or(|c| c != "false");
+            // A filled shape has no open side, so it is drawn closed whatever `closed` says.
+            let fill = solid_fill(e);
             match points.as_slice() {
                 [a, b] if !closed => graphics.push(Shape::Line { a: *a, b: *b }),
+                [_, _, ..] if closed || fill => push_closed(graphics, points, fill),
                 [_, _, ..] => graphics.push(Shape::Polyline {
                     points,
-                    closed,
+                    closed: false,
                     filled: false,
                 }),
                 _ => skip(),
@@ -423,11 +631,22 @@ fn shape(
                     .unwrap_or(9.0);
                 // Qt turns clockwise on screen; WiringCraft's angle turns the other way.
                 let angle = (-n("rotation").unwrap_or(0.0)).rem_euclid(360.0);
+                // `x`/`y` is the left end of the baseline, unless `anchor="alignment"` makes it the
+                // point `Halignment` names (centre or right end; absent is left). Without the
+                // anchor, `Halignment` only lines up the lines of a multi-line text, so the text
+                // stays left-aligned at its left end. `Valignment` does not move the point, which
+                // stays on the baseline.
+                let align = match attr(e, "Halignment").as_deref() {
+                    _ if attr(e, "anchor").as_deref() != Some("alignment") => Align::Left,
+                    Some("AlignHCenter") => Align::Center,
+                    Some("AlignRight") => Align::Right,
+                    _ => Align::Left,
+                };
                 graphics.push(Shape::Text {
                     at: pt(x, y),
                     text: t,
                     height: size * 0.75 * scale,
-                    align: Align::Left,
+                    align,
                     angle,
                 });
             }
@@ -490,6 +709,119 @@ mod tests {
     <mystery x="1"/>
   </description>
 </definition>"#;
+
+    #[test]
+    fn description_comes_from_the_element_information() -> Result<()> {
+        let el = |infos: &str| {
+            format!(
+                r#"<definition type="element"><names><name lang="en">K</name></names>
+<elementInformations>{infos}</elementInformations>
+<informations>author notes</informations>
+<description><line x1="0" y1="0" x2="10" y2="0"/></description></definition>"#
+            )
+        };
+        let with = el(
+            r#"<elementInformation show="1" name="manufacturer">ACME</elementInformation>
+<elementInformation show="1" name="description"> Relay coil &amp; contact </elementInformation>"#,
+        );
+        let (imp, _) = element(&with, "q.k", DEFAULT_SCALE)?;
+        assert_eq!(imp.symbol.description, "Relay coil & contact");
+        // Text around a comment keeps its spaces, and CDATA counts as text.
+        let split = el(
+            r#"<elementInformation name="description"> Relay <!-- x --> coil <![CDATA[& <contact>]]> </elementInformation>"#,
+        );
+        let (imp, warnings) = element(&split, "q.k", DEFAULT_SCALE)?;
+        assert_eq!(imp.symbol.description, "Relay  coil & <contact>");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // Text that cannot be decoded is left out with a warning that says why.
+        let bad = el(r#"<elementInformation name="description">Relay &bogus; coil</elementInformation>"#);
+        let (imp, warnings) = element(&bad, "q.k", DEFAULT_SCALE)?;
+        assert_eq!(imp.symbol.description, "");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("description") && w.contains("bogus")),
+            "{warnings:?}"
+        );
+        for infos in [
+            "",
+            r#"<elementInformation show="1" name="description"/>"#,
+            r#"<elementInformation show="1" name="designation">Coil</elementInformation>"#,
+        ] {
+            let (imp, _) = element(&el(infos), "q.k", DEFAULT_SCALE)?;
+            assert_eq!(imp.symbol.description, "", "{infos}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn letter_code_comes_from_the_label_information() -> Result<()> {
+        let el = |infos: &str| {
+            format!(
+                r#"<definition type="element"><elementInformations>{infos}</elementInformations>
+<description><line x1="0" y1="0" x2="10" y2="0"/></description></definition>"#
+            )
+        };
+        for (label, code) in [
+            ("-K1", "K"),
+            (" -PG1 ", "PG"),
+            ("A", ""),
+            ("-PG", ""),
+            ("q12", "Q"),
+            ("<![CDATA[-F]]>3", "F"),
+            ("SICK UM 30", ""),
+            ("Motor", ""),
+            ("%prefix%autonum", ""),
+            ("-K1.2", ""),
+            ("", ""),
+        ] {
+            let infos = format!(
+                r#"<elementInformation show="1" name="description">Relay</elementInformation>
+<elementInformation show="1" name="label">{label}</elementInformation>"#
+            );
+            let (imp, warnings) = element(&el(&infos), "q.k", DEFAULT_SCALE)?;
+            assert_eq!(imp.symbol.letter_code, code, "{label}");
+            assert_eq!(imp.symbol.description, "Relay", "{label}");
+            assert!(warnings.is_empty(), "{label}: {warnings:?}");
+        }
+        // No label information, or an empty one, gives no letter code.
+        for infos in ["", r#"<elementInformation name="label"/>"#] {
+            let (imp, _) = element(&el(infos), "q.k", DEFAULT_SCALE)?;
+            assert_eq!(imp.symbol.letter_code, "", "{infos}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn text_alignment_follows_halignment_with_the_alignment_anchor() -> Result<()> {
+        let align = |attrs: &str| -> Result<Align> {
+            let el = format!(
+                r#"<definition type="element"><description><text x="10" y="4" text="K" size="9" {attrs}/></description></definition>"#
+            );
+            let (imp, _) = element(&el, "q.k", DEFAULT_SCALE)?;
+            let Some(Shape::Text { align, at, .. }) = imp.symbol.graphics.first() else {
+                unreachable!("{:?}", imp.symbol.graphics)
+            };
+            // The point stays where the file puts it, whatever the alignment.
+            assert_eq!((at.x, at.y), (5.0, 2.0), "{attrs}");
+            Ok(*align)
+        };
+        assert_eq!(align("")?, Align::Left);
+        assert_eq!(align(r#"Halignment="AlignHCenter" anchor="alignment""#)?, Align::Center);
+        assert_eq!(
+            align(r#"Halignment="AlignRight" anchor="alignment" Valignment="AlignBottom""#)?,
+            Align::Right
+        );
+        assert_eq!(align(r#"Halignment="AlignLeft" anchor="alignment""#)?, Align::Left);
+        assert_eq!(align(r#"anchor="alignment""#)?, Align::Left);
+        // Without the anchor, x/y is the text's left end, so it stays left-aligned there.
+        assert_eq!(align(r#"Halignment="AlignRight""#)?, Align::Left);
+        assert_eq!(
+            align(r#"Halignment="AlignHCenter" Valignment="AlignVCenter""#)?,
+            Align::Left
+        );
+        Ok(())
+    }
 
     #[test]
     fn reads_shapes_terminals_name_and_label_place() -> Result<()> {
@@ -563,6 +895,250 @@ mod tests {
         );
         // The label's dynamic text gives the tag place.
         assert_eq!(s.tag_at, Point::new(-12.5, 7.5));
+        Ok(())
+    }
+
+    #[test]
+    fn filled_polygons_and_ellipses_come_in_filled() -> Result<()> {
+        let el = r#"<definition type="element"><description>
+<polygon x1="0" y1="0" x2="4" y2="0" x3="2" y3="4" closed="false" style="filling:black"/>
+<polygon x1="10" y1="0" x2="14" y2="0" x3="12" y3="4" style="filling:none"/>
+<ellipse x="-6" y="-3" width="12" height="6" style="filling:black"/>
+<ellipse x="-6" y="7" width="12" height="6" style="filling:none"/>
+<polygon x1="20" y1="0" x2="24" y2="0" x3="22" y3="4" style="filling:white"/>
+<ellipse x="-6" y="17" width="12" height="6" style="filling:white"/>
+<terminal x="0" y="0" orientation="n"/>
+</description></definition>"#;
+        let (imp, _) = element(el, "qet.filled", 1.0)?;
+        let polys: Vec<(usize, bool, bool)> = imp
+            .symbol
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Polyline { points, closed, filled } => Some((points.len(), *closed, *filled)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            polys,
+            // A filled shape comes in as its fill plus its outline.
+            vec![
+                (3, true, true),
+                (3, true, false),
+                (3, true, false),
+                (ELLIPSE_STEPS, true, true),
+                (ELLIPSE_STEPS, true, false),
+                (ELLIPSE_STEPS, true, false),
+                (3, true, false),
+                (ELLIPSE_STEPS, true, false)
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn line_ends_come_in_as_arrows_dots_and_diamonds() -> Result<()> {
+        let el = r#"<definition type="element"><description>
+<line x1="0" y1="0" x2="10" y2="0" end1="none" end2="triangle" length2="2" style="filling:none"/>
+<line x1="0" y1="10" x2="10" y2="10" end1="simple" end2="none"/>
+<line x1="0" y1="20" x2="0" y2="40" end1="circle" end2="diamond" length1="4" style="filling:black"/>
+<line x1="0" y1="50" x2="10" y2="50" end1="none" end2="wiggle"/>
+<line x1="0" y1="60" x2="3" y2="60" end1="circle" end2="none"/>
+<terminal x="0" y="0" orientation="n"/>
+</description></definition>"#;
+        let (imp, warnings) = element(el, "qet.ends", 1.0)?;
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let g = &imp.symbol.graphics;
+        let close = |a: Point, b: Point| (a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() < 1e-9;
+        // The filled arrow: tip at (x2, y2), 2 long and 2 to each side.
+        let tris: Vec<&Vec<Point>> = g
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Polyline {
+                    points, filled: true, ..
+                } => Some(points),
+                _ => None,
+            })
+            .collect();
+        let [tri] = tris.as_slice() else {
+            unreachable!("one filled arrow: {g:?}")
+        };
+        assert_eq!(tri.len(), 3);
+        assert!(close(tri[0], Point::new(10.0, 0.0)), "{tri:?}");
+        assert!(
+            tri[1..]
+                .iter()
+                .all(|p| (p.x - 8.0).abs() < 1e-9 && (p.y.abs() - 2.0).abs() < 1e-9)
+        );
+        // The open arrow: two short lines meeting at (x1, y1), 1.5 long and 1.5 to each side.
+        let tip = Point::new(0.0, 10.0);
+        let arms: Vec<Point> = g
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Line { a, b } if close(*b, tip) => Some(*a),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            arms.len() == 2
+                && arms
+                    .iter()
+                    .all(|a| close(*a, Point::new(1.5, 8.5)) || close(*a, Point::new(1.5, 11.5))),
+            "{arms:?}"
+        );
+        // A dot of radius 4 touching (x1, y1), filled as the style says, and a hollow diamond
+        // reaching 2 * 1.5 back from (x2, y2).
+        assert!(
+            g.iter()
+                .any(|s| matches!(s, Shape::Circle { center, radius, filled: true }
+            if close(*center, Point::new(0.0, 24.0)) && (*radius - 4.0).abs() < 1e-9))
+        );
+        assert!(g.iter().any(|s| matches!(s, Shape::Polyline { points, closed: true, filled: false }
+            if points.len() == 4 && close(points[0], Point::new(0.0, 40.0)) && close(points[2], Point::new(0.0, 37.0)))));
+        // The shafts stop at the inner edge of the markers; `simple`, `none` and unknown ends
+        // keep theirs.
+        for shaft in [
+            (Point::new(0.0, 0.0), Point::new(8.0, 0.0)),
+            (Point::new(0.0, 10.0), Point::new(10.0, 10.0)),
+            (Point::new(0.0, 28.0), Point::new(0.0, 37.0)),
+            (Point::new(0.0, 50.0), Point::new(10.0, 50.0)),
+        ] {
+            assert!(
+                g.iter()
+                    .any(|s| matches!(s, Shape::Line { a, b } if close(*a, shaft.0) && close(*b, shaft.1))),
+                "{shaft:?} in {g:?}"
+            );
+        }
+        // Four shafts, two arrow arms, one arrow, two dots, one diamond: the dot on the last
+        // line covers all of it, so no shaft is left there.
+        assert_eq!(g.len(), 10, "{g:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn light_filled_circles_and_rects_stay_hollow_dark_ones_fill() -> Result<()> {
+        let el = r#"<definition type="element"><description>
+<circle x="0" y="0" diameter="4" style="filling:white"/>
+<ellipse x="10" y="0" width="4" height="4" style="filling:black"/>
+<ellipse x="20" y="0" width="4" height="4" style="filling:hor"/>
+<rect x="0" y="10" width="4" height="2" style="filling:black"/>
+<rect x="10" y="10" width="4" height="2" style="filling:white"/>
+<terminal x="0" y="0" orientation="n"/>
+</description></definition>"#;
+        let (imp, _) = element(el, "qet.fills", 1.0)?;
+        let circles: Vec<bool> = imp
+            .symbol
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Circle { filled, .. } => Some(*filled),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(circles, vec![false, true, false]);
+        let rects: Vec<&Shape> = imp
+            .symbol
+            .graphics
+            .iter()
+            .filter(|g| matches!(g, Shape::Rect { .. } | Shape::Polyline { .. }))
+            .collect();
+        let (a, b) = (Point::new(0.0, 10.0), Point::new(4.0, 12.0));
+        assert_eq!(
+            rects,
+            vec![
+                // The black rectangle: its fill, then its outline.
+                &Shape::Polyline {
+                    points: vec![a, Point::new(4.0, 10.0), b, Point::new(0.0, 12.0)],
+                    closed: true,
+                    filled: true
+                },
+                &Shape::Rect { min: a, max: b },
+                // The white one stays a plain rectangle.
+                &Shape::Rect {
+                    min: Point::new(10.0, 10.0),
+                    max: Point::new(14.0, 12.0)
+                }
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rounded_rects_come_in_as_closed_polylines_with_round_corners() -> Result<()> {
+        let el = r#"<definition type="element"><description>
+<rect x="0" y="0" width="20" height="10" rx="2" ry="2" style="filling:none"/>
+<rect x="0" y="20" width="20" height="10" style="filling:none"/>
+<rect x="0" y="40" width="20" height="10" rx="0" ry="0" style="filling:none"/>
+<rect x="0" y="60" width="4" height="10" rx="50" ry="3" style="filling:black"/>
+<rect x="0" y="80" width="20" height="10" rx="-2" ry="2" style="filling:none"/>
+<terminal x="0" y="0" orientation="n"/>
+</description></definition>"#;
+        let (imp, _) = element(el, "qet.rounded", 1.0)?;
+        let g = &imp.symbol.graphics;
+        let Some(Shape::Polyline {
+            points,
+            closed: true,
+            filled: false,
+        }) = g.first()
+        else {
+            unreachable!("expected a closed polyline, got {:?}", g.first())
+        };
+        let (mut lo, mut hi) = (Point::new(f64::MAX, f64::MAX), Point::new(f64::MIN, f64::MIN));
+        for p in points {
+            (lo.x, lo.y, hi.x, hi.y) = (lo.x.min(p.x), lo.y.min(p.y), hi.x.max(p.x), hi.y.max(p.y));
+        }
+        assert!(lo.x.abs() < 1e-9 && lo.y.abs() < 1e-9);
+        assert!((hi.x - 20.0).abs() < 1e-9 && (hi.y - 10.0).abs() < 1e-9);
+        for corner in [(0.0, 0.0), (20.0, 0.0), (20.0, 10.0), (0.0, 10.0)] {
+            assert!(
+                !points
+                    .iter()
+                    .any(|p| (p.x - corner.0).abs() < 1e-6 && (p.y - corner.1).abs() < 1e-6),
+                "a point sits on the square corner {corner:?}"
+            );
+        }
+        // No radii, or radii of 0: still a plain rectangle.
+        assert_eq!(
+            g[1],
+            Shape::Rect {
+                min: Point::new(0.0, 20.0),
+                max: Point::new(20.0, 30.0)
+            }
+        );
+        assert_eq!(
+            g[2],
+            Shape::Rect {
+                min: Point::new(0.0, 40.0),
+                max: Point::new(20.0, 50.0)
+            }
+        );
+        // A radius past half the side is clamped to it, and a filled one gets its fill.
+        let (
+            Shape::Polyline {
+                points: fill,
+                filled: true,
+                ..
+            },
+            Shape::Polyline { points: line, .. },
+        ) = (&g[3], &g[4])
+        else {
+            unreachable!("expected a fill and an outline, got {:?}", &g[3..])
+        };
+        assert_eq!(fill, line);
+        assert!(line.iter().all(|p| (0.0..=4.0 + 1e-9).contains(&p.x)));
+        assert!(
+            line.iter()
+                .any(|p| (p.x - 2.0).abs() < 1e-9 && (p.y - 60.0).abs() < 1e-9)
+        );
+        // A negative radius means no rounding, as in Qt.
+        assert_eq!(
+            g[5],
+            Shape::Rect {
+                min: Point::new(0.0, 80.0),
+                max: Point::new(20.0, 90.0)
+            }
+        );
+        assert_eq!(g.len(), 6);
         Ok(())
     }
 

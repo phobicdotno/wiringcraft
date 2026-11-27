@@ -26,6 +26,8 @@ hayro-jbig2.workspace = true
 hayro-jpeg2000.workspace = true
 
 [dev-dependencies]
+# A page exported to DXF reads back in (wc-pdf does not depend on wc-import).
+wc-pdf.workspace = true
 # Tests write 7-Zip archives.
 sevenz-rust2 = { workspace = true, features = ["compress"] }
 tempfile.workspace = true

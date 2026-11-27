@@ -604,6 +604,17 @@ impl Host {
         if self.project == before && !fills {
             return Ok(false);
         }
+        // Two people renumbering at once may each pick a number free in their own copy.
+        let clashes = number_clashes(&before, &self.project);
+        if !clashes.is_empty() {
+            self.project = before;
+            return Err(Refusal::Invalid {
+                reason: format!(
+                    "another page already has number {}; someone else numbered a page meanwhile, pick another number",
+                    clashes.join(", ")
+                ),
+            });
+        }
         // Pages set whole, as a page edit: a wire may not newly end on a pin the locked version of
         // its symbol lacks (an update may have dropped the pin after the author drew the wire).
         let set: BTreeSet<&str> = edit.set_pages().map(|p| p.id.as_str()).collect();
@@ -817,6 +828,16 @@ impl Host {
                 "\"{}\" cannot be taken back: wires end on pins the earlier versions do not have ({}); move those wires first",
                 entry.info.message,
                 dangling.join(", ")
+            ));
+        }
+        // A number it gives back may have been given to another page since.
+        let clashes = number_clashes(&before, &self.project);
+        if !clashes.is_empty() {
+            self.project = before;
+            return invalid(format!(
+                "\"{}\" cannot be taken back: another page has number {} now; renumber that page first",
+                entry.info.message,
+                clashes.join(", ")
             ));
         }
         // What it brings back was drawn with the versions it used then: one locked in another
@@ -1157,6 +1178,22 @@ impl Host {
         self.send_others(except, locks);
         self.send_others(except, peers);
     }
+}
+
+/// The display numbers `after` gives a page (one that is new, or numbered anew) that another
+/// page of `after` has too. Numbers a change leaves alone are not looked at, so a project that
+/// already has two pages of one number stays editable.
+fn number_clashes(before: &Project, after: &Project) -> Vec<String> {
+    let mut out: Vec<String> = after
+        .pages
+        .iter()
+        .filter(|p| before.page(&p.id).is_none_or(|b| b.number != p.number))
+        .filter(|p| after.pages.iter().any(|o| o.id != p.id && o.number == p.number))
+        .map(|p| p.number.clone())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// A page may not start using a symbol the project does not lock: the app sends the item first

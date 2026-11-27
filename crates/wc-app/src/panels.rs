@@ -68,6 +68,12 @@ pub struct PanelState {
     /// The form for the selected black box's size and points: the page, item and symbol
     /// version it was read from (another version, after an Undo say, reads it again).
     black_box: Option<((usize, String, String), crate::black_box_tool::BoxEdit)>,
+    /// Edit buffers for the shown panel layout's name, plate width and plate height, and the
+    /// id of the panel they belong to.
+    panel_for: Option<String>,
+    panel_fields: [PanelField; 3],
+    /// Why the last name or size entered for the panel layout was refused.
+    panel_error: Option<String>,
 }
 
 impl PanelState {
@@ -550,31 +556,34 @@ pub fn library(ui: &mut egui::Ui, open: &Open, ed: &mut Editor, ps: &mut PanelSt
             .margin(egui::Margin::symmetric(8, 5)),
     );
     ui.add_space(2.0);
-    let q = ps.search.to_lowercase();
     egui::ScrollArea::vertical()
         .id_salt("library")
         .max_height(ui.available_height() * 0.45)
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
             let t = Theme::of(ui.ctx());
-            for (id, name) in &open.library {
-                if !q.is_empty() && !id.to_lowercase().contains(&q) && !name.to_lowercase().contains(&q) {
+            for entry in &open.library {
+                if !entry.matches(&ps.search) {
                     continue;
                 }
+                let (id, name) = (&entry.id, &entry.name);
                 let picked = ed.place_symbol.as_deref() == Some(id.as_str()) && ed.tool == Tool::Place;
                 let vendored = open.symbols.contains_key(id);
                 let text = RichText::new(name);
                 let lead = Lead::Dot(if vendored { t.accent } else { t.border });
-                let r = row(ui, picked, lead, if vendored { text } else { text.italics() }, false).on_hover_text(
-                    if vendored {
-                        format!("{id}\nIn this project")
-                    } else {
-                        format!("{id}\nFrom the library; copied into the project when placed")
-                    },
-                );
+                let whence = if vendored {
+                    "In this project"
+                } else {
+                    "From the library; copied into the project when placed"
+                };
+                let hover = match entry.description.trim() {
+                    "" => format!("{id}\n{whence}"),
+                    d => format!("{id}\n{d}\n{whence}"),
+                };
+                let r = row(ui, picked, lead, if vendored { text } else { text.italics() }, false).on_hover_text(hover);
                 if r.clicked() {
                     ed.place_symbol = Some(id.clone());
-                    ed.tool = Tool::Place;
+                    ed.set_tool(Tool::Place);
                     ed.wire = None;
                 }
             }
@@ -932,6 +941,118 @@ fn box_size_field(ui: &mut egui::Ui, value: &mut f64) {
     }
 }
 
+/// Whether the black box form of the box `id` on page `page` is the one the Properties panel
+/// shows now: that box alone is selected on the page shown, with no panel layout open. A form
+/// left behind when another item was picked is kept for when the box is picked again, but it
+/// is neither applied by a save nor counted as refused (#1019).
+fn black_box_form_shown(ed: &Editor, page: usize, id: &str) -> bool {
+    ed.panel.is_none() && ed.page == page && matches!(ed.selection.as_slice(), [Selection::Symbol(s)] if s == id)
+}
+
+/// Whether the black box form shown holds a change that [`apply_black_box_draft`] refused: it
+/// stays in the form, with its reason, for the person to correct.
+pub fn black_box_draft_refused(ps: &PanelState, ed: &Editor) -> bool {
+    ps.black_box.as_ref().is_some_and(|((page, id, _), form)| {
+        form.error.is_some() && form.changed() && black_box_form_shown(ed, *page, id)
+    })
+}
+
+/// Whether the black box form shown holds a change [`apply_black_box_draft`] would apply: the
+/// box is still selected, the form was changed, and the box's symbol is still the one the
+/// form was read from.
+pub fn black_box_draft_applies(open: &Open, ps: &PanelState, ed: &Editor) -> bool {
+    ps.black_box.as_ref().is_some_and(|((page, id, hash), form)| {
+        black_box_form_shown(ed, *page, id)
+            && form.changed()
+            && open
+                .project
+                .pages
+                .get(*page)
+                .and_then(|p| p.symbol(id))
+                .and_then(|s| open.symbols.get(&s.symbol))
+                .is_some_and(|sym| &sym.hash() == hash)
+    })
+}
+
+/// Whether the black box form shown holds a change not in the project: one
+/// [`apply_black_box_draft`] would apply, or one it refused. Closing the window or opening
+/// another project asks about it as about other unsaved changes (#1024).
+pub fn black_box_draft_pending(open: &Open, ps: &PanelState, ed: &Editor) -> bool {
+    black_box_draft_refused(ps, ed) || black_box_draft_applies(open, ps, ed)
+}
+
+/// Apply the black box form shown in the Properties panel when it has changes not applied yet
+/// (a form of a box no longer selected is left alone),
+/// as its Apply button does (one undo step): called before the project is saved (#932). A form
+/// read for another version of the box (after an Undo, say) is left alone, as the panel reads
+/// it again. Returns what to check after the change went in (`Ok(Some)`), or why it was refused
+/// (`Err`), which the form also shows.
+pub fn apply_black_box_draft(open: &mut Open, ed: &mut Editor, ps: &mut PanelState) -> Result<Option<String>, String> {
+    if !black_box_draft_applies(open, ps, ed) {
+        return Ok(None);
+    }
+    let Some(((page, id, _), form)) = ps.black_box.as_mut() else {
+        return Ok(None);
+    };
+    match apply_box_form(open, ed, form, *page, id) {
+        Ok(warnings) => {
+            ps.black_box = None;
+            Ok((!warnings.is_empty()).then(|| format!("Black box changed. Check: {}.", warnings.join("; "))))
+        }
+        Err(e) => {
+            form.error = Some(e.clone());
+            Err(format!("The black box was not changed: {e}"))
+        }
+    }
+}
+
+/// The black box form shown, for tests that type in it.
+#[cfg(test)]
+pub(crate) fn black_box_form_mut(ps: &mut PanelState) -> Option<&mut crate::black_box_tool::BoxEdit> {
+    ps.black_box.as_mut().map(|(_, f)| f)
+}
+
+/// Apply the black box form to the box `id` on `page` as one undo step, for its Apply button
+/// and before a save: the warnings, or why it was refused. A wire being drawn from a point the
+/// change removed or renamed is dropped, as it could no longer be drawn.
+fn apply_box_form(
+    open: &mut Open,
+    ed: &mut Editor,
+    form: &crate::black_box_tool::BoxEdit,
+    page: usize,
+    id: &str,
+) -> Result<Vec<String>, String> {
+    let symbol_id = open
+        .project
+        .pages
+        .get(page)
+        .and_then(|p| p.symbol(id))
+        .map(|placed| placed.symbol.clone())
+        .unwrap_or_default();
+    let (pins, renamed, removed) = (form.pins(), form.renamed(), form.removed());
+    let warnings = open.edit_black_box(page, id, (form.width, form.height), &pins, &renamed, &removed)?;
+    // A wire being drawn from a point of the box that was renamed, moved or taken off, or
+    // whose name another point took (also a new point just like the one taken off), would be
+    // saved on a stale point: it is dropped, as the assistant's black box edit does. So is one
+    // whose start no longer resolves at all.
+    let point_changed =
+        |pin: &str| crate::black_box_tool::point_changed(pin, form.old_pins(), &pins, &renamed, &removed);
+    let shown = open.project.pages.get(ed.page);
+    let lost = ed.wire.as_ref().is_some_and(|(start, _)| {
+        let changed = matches!(
+            start,
+            wc_core::Endpoint::Pin { item, pin }
+                if shown.and_then(|p| p.symbol(item)).is_some_and(|s| s.symbol == symbol_id)
+                    && point_changed(pin)
+        );
+        changed || shown.is_some_and(|pg| open.end_pos(pg, start).is_none())
+    });
+    if lost {
+        ed.wire = None;
+    }
+    Ok(warnings)
+}
+
 /// The fields of the black box form; `true` when it is done with (applied or reset).
 fn black_box_form(
     ui: &mut egui::Ui,
@@ -994,14 +1115,7 @@ fn black_box_form(
         return true;
     }
     if apply {
-        match open.edit_black_box(
-            page,
-            id,
-            (form.width, form.height),
-            &form.pins(),
-            &form.renamed(),
-            &form.removed(),
-        ) {
+        match apply_box_form(open, ed, form, page, id) {
             Ok(warnings) => {
                 ed.message = if warnings.is_empty() {
                     "Black box changed.".into()
@@ -1019,6 +1133,9 @@ fn black_box_form(
     false
 }
 
+/// The id of the selected symbol's device tag field.
+pub(crate) const TAG_FIELD: &str = "wc.properties.device_tag";
+
 fn committed(r: &egui::Response) -> bool {
     r.lost_focus() || (r.has_focus() && r.ctx.input(|i| i.key_pressed(egui::Key::Enter)))
 }
@@ -1028,8 +1145,11 @@ pub fn properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut 
     section(ui, "Properties", None);
     forget_spec_unless_wires(ed, ps);
     if let Some(pi) = ed.panel {
-        panel_properties(ui, open, ed, pi);
+        panel_properties(ui, open, ed, ps, pi);
         return;
+    }
+    if let Some(refused) = enter_panel_draft(open, ps) {
+        ed.message = refused;
     }
     if ed.selection.is_empty()
         && let Some(id) = ed.comment.clone()
@@ -1134,7 +1254,7 @@ fn selection_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps:
                     ui.label(sym_name).on_hover_text(&placed.symbol);
                     ui.end_row();
                     ui.label("Device tag");
-                    let r = ui.text_edit_singleline(&mut ps.tag);
+                    let r = ui.add(egui::TextEdit::singleline(&mut ps.tag).id(egui::Id::new(TAG_FIELD)));
                     if committed(&r) {
                         let new = if ps.tag.trim().is_empty() {
                             Ok(None)
@@ -1979,16 +2099,153 @@ impl Attach {
     }
 }
 
-/// The properties of the panel layout shown: plate size, the picked device, and the devices
-/// with a part that are not on the plate yet.
-fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, pi: usize) {
-    use wc_core::panel::{PanelItem, on_door, part_size};
+/// The smallest and largest mounting plate side, in mm, that the panel layout fields take.
+const PLATE_SIDE: std::ops::RangeInclusive<f64> = 10.0..=10_000.0;
+
+/// The panel layout fields, in order: name, plate width, plate height.
+const PANEL_FIELDS: [&str; 3] = ["Name", "Plate width", "Plate height"];
+
+/// One panel layout field: what it shows, and whether it was typed in since it was last read
+/// from the project or entered.
+#[derive(Default, Clone, Debug, PartialEq)]
+struct PanelField {
+    text: String,
+    edited: bool,
+}
+
+/// Enter `text` in field `field` (of [`PANEL_FIELDS`]) of the panel layout `id`, as one undo
+/// step when it changes the panel; a value that is not taken is refused with the reason.
+fn enter_panel_field(open: &mut Open, id: &str, field: usize, text: &str) -> Result<(), String> {
+    let Some(mut changed) = open.project.panels.iter().find(|p| p.id == id).cloned() else {
+        return Ok(());
+    };
+    let text = text.trim();
+    if field == 0 {
+        if text.is_empty() {
+            return Err("A panel layout needs a name.".into());
+        }
+        changed.name = text.to_owned();
+    } else {
+        let side = if field == 1 { "width" } else { "height" };
+        let v = parse_number(text).filter(|v| PLATE_SIDE.contains(v)).ok_or_else(|| {
+            format!(
+                "The plate {side} must be a number from {} to {} mm.",
+                PLATE_SIDE.start(),
+                PLATE_SIDE.end()
+            )
+        })?;
+        let (w, h) = if field == 1 {
+            (v, changed.height)
+        } else {
+            (changed.width, v)
+        };
+        // As `panel edit` in the CLI: rails, ducts and devices stay where they are, and a size
+        // that would leave any of them sticking out is refused.
+        changed.resize(w, h).map_err(|e| format!("{}.", capitalised(&e)))?;
+    }
+    if open.project.panels.iter().any(|p| p.id == id && *p != changed) {
+        open.checkpoint();
+        if let Some(p) = open.project.panels.iter_mut().find(|p| p.id == id) {
+            *p = changed;
+        }
+    }
+    Ok(())
+}
+
+/// `s` with its first letter in upper case.
+fn capitalised(s: &str) -> String {
+    let mut c = s.chars();
+    c.next()
+        .map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
+}
+
+/// Enter what was typed in the panel layout fields and not entered yet, in the panel it was
+/// typed for: called when another panel layout, or no panel layout, is shown. Returns why a
+/// value was refused, as a message naming the panel layout.
+fn enter_panel_draft(open: &mut Open, ps: &mut PanelState) -> Option<String> {
+    let id = ps.panel_for.take()?;
+    ps.panel_error = None;
+    let mut refused = None;
+    for (i, field) in ps.panel_fields.iter_mut().enumerate() {
+        if std::mem::take(&mut field.edited)
+            && let Err(e) = enter_panel_field(open, &id, i, &field.text)
+        {
+            let name = open
+                .project
+                .panels
+                .iter()
+                .find(|p| p.id == id)
+                .map_or(id.as_str(), |p| p.name.as_str());
+            refused = Some(format!("{name} not changed: {e}"));
+        }
+    }
+    refused
+}
+
+/// The panel layout's name and plate size fields. Each is entered on Enter or when it is left,
+/// as one undo step; a field not typed in shows the project's value (after an Undo, say), also
+/// while it has the focus.
+fn panel_fields(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut PanelState, pi: usize) {
     let t = Theme::of(ui.ctx());
+    let Some(id) = open.project.panels.get(pi).map(|p| p.id.clone()) else {
+        return;
+    };
+    if ps.panel_for.as_deref() != Some(id.as_str()) {
+        if let Some(refused) = enter_panel_draft(open, ps) {
+            ed.message = refused;
+        }
+        ps.panel_for = Some(id.clone());
+    }
     let Some(panel) = open.project.panels.get(pi) else {
         return;
     };
-    ui.label(RichText::new(&panel.name).strong());
-    ui.label(RichText::new(format!("Mounting plate {} x {} mm", panel.width, panel.height)).color(t.faint));
+    let values = [panel.name.clone(), panel.width.to_string(), panel.height.to_string()];
+    for (field, value) in ps.panel_fields.iter_mut().zip(values) {
+        if !field.edited {
+            field.text = value;
+        }
+    }
+    let mut entered = Vec::new();
+    egui::Grid::new("panel-props")
+        .num_columns(2)
+        .spacing([10.0, 4.0])
+        .show(ui, |ui| {
+            for (i, (field, label)) in ps.panel_fields.iter_mut().zip(PANEL_FIELDS).enumerate() {
+                ui.label(RichText::new(label).color(t.muted));
+                let r = ui
+                    .horizontal(|ui| {
+                        let width = if i == 0 { 160.0 } else { 70.0 };
+                        let r = ui.add(egui::TextEdit::singleline(&mut field.text).desired_width(width));
+                        if i > 0 {
+                            ui.label("mm");
+                        }
+                        r
+                    })
+                    .inner;
+                field.edited |= r.changed();
+                if committed(&r) && std::mem::take(&mut field.edited) {
+                    entered.push((i, field.text.clone()));
+                }
+                ui.end_row();
+            }
+        });
+    for (i, text) in entered {
+        ps.panel_error = enter_panel_field(open, &id, i, &text).err();
+    }
+    if let Some(err) = &ps.panel_error {
+        ui.label(RichText::new(err).color(t.error).small());
+    }
+}
+
+/// The properties of the panel layout shown: plate size, the picked device, and the devices
+/// with a part that are not on the plate yet.
+fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, ps: &mut PanelState, pi: usize) {
+    use wc_core::panel::{PanelItem, on_door, part_size};
+    let t = Theme::of(ui.ctx());
+    panel_fields(ui, open, ed, ps, pi);
+    let Some(panel) = open.project.panels.get(pi) else {
+        return;
+    };
     ui.add_space(6.0);
     // Set when the Rotate button is pressed, applied once the panel is no longer borrowed.
     let mut turn: Option<usize> = None;
@@ -2091,7 +2348,7 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, pi: usi
     }
     // Devices with a part that could go on the plate but are not on it.
     let on_plate = panel.device_tags();
-    let missing: Vec<String> = open
+    let missing: Vec<(wc_core::DeviceTag, String)> = open
         .project
         .devices
         .iter()
@@ -2100,18 +2357,38 @@ fn panel_properties(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, pi: usi
             let part = open.parts.get(d.part.as_ref()?)?;
             (!on_door(part)).then(|| {
                 let size = part_size(part).map_or_else(|| "no size".to_owned(), |(w, h)| format!("{w} x {h}"));
-                format!("{tag}  ({size})")
+                (tag.clone(), format!("{tag}  ({size})"))
             })
         })
         .collect();
+    // Set when a Place button is pressed, applied once the panel is no longer borrowed (#928).
+    let mut place: Option<wc_core::DeviceTag> = None;
     if missing.is_empty() {
         ui.label(RichText::new("Every device with a part is on the plate.").color(t.faint));
     } else {
         ui.label(RichText::new(format!("Not on the plate yet ({})", missing.len())).color(t.muted));
-        for m in missing {
-            ui.label(RichText::new(m).monospace());
+        for (tag, m) in missing {
+            ui.horizontal(|ui| {
+                if ui
+                    .small_button("Place")
+                    .on_hover_text("Put this device on the first DIN rail with room, else in a free spot")
+                    .clicked()
+                {
+                    place = Some(tag);
+                }
+                ui.label(RichText::new(m).monospace());
+            });
         }
         ui.label(RichText::new("Page menu → Arrange devices puts them on the rails.").color(t.faint));
+    }
+    if let Some(tag) = place {
+        match open.place_panel_device(pi, &tag) {
+            Ok(item) => {
+                ed.panel_pick = Some(item);
+                ed.message = format!("Placed {tag} on the plate; drag it to move it.");
+            }
+            Err(e) => ed.message = e,
+        }
     }
     if let Some(item) = turn
         && !open.rotate_panel_device(pi, item)
@@ -2196,6 +2473,229 @@ mod tests {
         Ok(())
     }
 
+    /// A project with two panel layouts, the first shown, and a function drawing one frame of
+    /// the properties with the given input events.
+    struct PanelHarness {
+        _tmp: tempfile::TempDir,
+        o: Open,
+        ed: Editor,
+        ps: PanelState,
+        ctx: egui::Context,
+    }
+
+    impl PanelHarness {
+        fn new() -> Self {
+            let (tmp, mut o) = crate::state::tests::project();
+            for n in [1, 2] {
+                o.project.panels.push(wc_core::panel::Panel::with_rails(
+                    format!("panel{n}"),
+                    format!("Panel {n}"),
+                    600.0,
+                    800.0,
+                ));
+            }
+            let mut ed = Editor::default();
+            ed.panel = Some(0);
+            let ctx = egui::Context::default();
+            crate::theme::install_fonts(&ctx);
+            Self {
+                _tmp: tmp,
+                o,
+                ed,
+                ps: PanelState::default(),
+                ctx,
+            }
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) {
+            let input = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let Self { o, ed, ps, ctx, .. } = self;
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| properties(ui, o, ed, ps));
+            });
+        }
+
+        fn key(&mut self, key: egui::Key) {
+            self.frame(vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }]);
+        }
+
+        fn type_text(&mut self, text: &str) {
+            self.frame(vec![egui::Event::Text(text.into())]);
+        }
+
+        fn texts(&self) -> Vec<String> {
+            self.ps.panel_fields.iter().map(|f| f.text.clone()).collect()
+        }
+
+        /// Tab to the name field and type `text` at its end; false when it never took it.
+        fn type_in_name(&mut self, text: &str) -> bool {
+            for _ in 0..6 {
+                self.key(egui::Key::Tab);
+                self.type_text(text);
+                if self.ps.panel_fields[0].text.ends_with(text) {
+                    return true;
+                }
+            }
+            false
+        }
+    }
+
+    #[test]
+    fn a_panel_layouts_name_and_plate_size_are_typed_in_its_properties() {
+        let mut h = PanelHarness::new();
+        h.frame(Vec::new());
+        assert_eq!(h.texts(), ["Panel 1", "600", "800"]);
+        let mark = h.o.undo_mark();
+
+        // Type in the name field, then Tab on to the width field and type there.
+        assert!(h.type_in_name("A"), "the name field never took the typing");
+        assert_eq!(h.o.project.panels[0].name, "Panel 1", "nothing is changed while typing");
+        h.key(egui::Key::Tab);
+        h.type_text("5");
+        h.key(egui::Key::Tab);
+        h.frame(Vec::new());
+        assert_eq!(h.o.project.panels[0].name, "Panel 1A");
+        assert_eq!(h.o.project.panels[0].width, 6005.0);
+        assert_eq!(h.o.project.panels[0].height, 800.0);
+        assert_eq!(h.o.undo_mark(), mark + 2, "one undo step each");
+
+        // A height of zero typed in the focused height field is refused with a reason.
+        h.ps.panel_fields[2] = PanelField {
+            text: "0".into(),
+            edited: true,
+        };
+        h.key(egui::Key::Enter);
+        h.frame(Vec::new());
+        assert_eq!(h.o.project.panels[0].height, 800.0);
+        assert_eq!(h.o.undo_mark(), mark + 2);
+        assert!(
+            h.ps.panel_error.as_deref().is_some_and(|e| e.contains("height")),
+            "{:?}",
+            h.ps.panel_error
+        );
+        assert_eq!(h.ps.panel_fields[2].text, "800");
+
+        // One Undo puts the width back, the next the name; the fields follow.
+        assert!(h.o.undo());
+        h.frame(Vec::new());
+        assert_eq!(h.o.project.panels[0].width, 600.0);
+        assert_eq!(h.o.project.panels[0].name, "Panel 1A");
+        assert!(h.o.undo());
+        h.frame(Vec::new());
+        assert_eq!(h.o.project.panels[0].name, "Panel 1");
+        assert_eq!(h.texts(), ["Panel 1", "600", "800"]);
+    }
+
+    #[test]
+    fn a_focused_panel_field_not_typed_in_follows_the_project_and_enters_nothing() {
+        let mut h = PanelHarness::new();
+        h.frame(Vec::new());
+        // The name field takes the focus, then the name changes underneath (an Undo, say).
+        h.key(egui::Key::Tab);
+        h.o.project.panels[0].name = "Other".into();
+        let mark = h.o.undo_mark();
+        h.frame(Vec::new());
+        assert_eq!(h.ps.panel_fields[0].text, "Other");
+        // Leaving the field enters nothing: the width field, next, takes the typing.
+        h.key(egui::Key::Tab);
+        h.frame(Vec::new());
+        assert_eq!(h.o.project.panels[0].name, "Other");
+        assert_eq!(h.o.undo_mark(), mark, "no undo step");
+        h.type_text("5");
+        assert_eq!(h.ps.panel_fields[1].text, "6005");
+    }
+
+    #[test]
+    fn a_panel_field_typed_in_is_entered_in_its_panel_when_another_is_shown() {
+        let mut h = PanelHarness::new();
+        h.frame(Vec::new());
+        let mark = h.o.undo_mark();
+        assert!(h.type_in_name("A"), "the name field never took the typing");
+        // Panel 2 is picked in the navigator with the name half typed.
+        h.ed.panel = Some(1);
+        h.frame(Vec::new());
+        assert_eq!(h.o.project.panels[0].name, "Panel 1A");
+        assert_eq!(h.o.project.panels[1].name, "Panel 2");
+        assert_eq!(h.o.undo_mark(), mark + 1);
+        assert_eq!(h.texts(), ["Panel 2", "600", "800"]);
+        // The same when a page is shown instead.
+        assert!(h.type_in_name("B"), "the name field never took the typing");
+        h.ed.panel = None;
+        h.frame(Vec::new());
+        assert_eq!(h.o.project.panels[1].name, "Panel 2B");
+        assert_eq!(h.o.undo_mark(), mark + 2);
+        // A draft that is refused changes nothing and says why.
+        h.ed.panel = Some(0);
+        h.frame(Vec::new());
+        h.ps.panel_fields[1] = PanelField {
+            text: "0".into(),
+            edited: true,
+        };
+        h.ed.panel = Some(1);
+        h.frame(Vec::new());
+        assert_eq!(h.o.project.panels[0].width, 600.0);
+        assert_eq!(h.o.undo_mark(), mark + 2);
+        assert!(h.ed.message.contains("Panel 1A not changed"), "{}", h.ed.message);
+    }
+
+    #[test]
+    fn panel_layout_values_outside_the_limits_are_refused() {
+        let mut h = PanelHarness::new();
+        let refused = [
+            (0, "  "),
+            (1, "abc"),
+            (1, "12x"),
+            (1, "9.99"),
+            (2, "10000.01"),
+            (2, "-600"),
+            (2, "0"),
+        ];
+        for (field, text) in refused {
+            let (before, mark) = (h.o.project.clone(), h.o.undo_mark());
+            let r = enter_panel_field(&mut h.o, "panel1", field, text);
+            assert!(r.as_ref().is_err_and(|e| !e.is_empty()), "{text:?}: {r:?}");
+            assert_eq!(h.o.project, before, "{text:?}");
+            assert_eq!(h.o.undo_mark(), mark, "{text:?}");
+        }
+        // A plate too small for the ducts and rails on it is refused, naming them, as the CLI's
+        // `panel edit` does.
+        for (field, text) in [(1, "100"), (2, "300")] {
+            let (before, mark) = (h.o.project.clone(), h.o.undo_mark());
+            let r = enter_panel_field(&mut h.o, "panel1", field, text);
+            assert!(
+                r.as_ref()
+                    .is_err_and(|e| e.contains("sticking out") && e.contains("duct")),
+                "{text:?}: {r:?}"
+            );
+            assert_eq!(h.o.project, before, "{text:?}");
+            assert_eq!(h.o.undo_mark(), mark, "{text:?}");
+        }
+        // With nothing on it, the plate takes any size in the limits.
+        h.o.project.panels[0].items.clear();
+        for (field, text, width, height) in [(1, "10", 10.0, 800.0), (2, " 10000 ", 10.0, 10000.0)] {
+            let mark = h.o.undo_mark();
+            assert_eq!(enter_panel_field(&mut h.o, "panel1", field, text), Ok(()));
+            assert_eq!(
+                (h.o.project.panels[0].width, h.o.project.panels[0].height),
+                (width, height)
+            );
+            assert_eq!(h.o.undo_mark(), mark + 1);
+        }
+        // The same value again is no undo step.
+        let mark = h.o.undo_mark();
+        assert_eq!(enter_panel_field(&mut h.o, "panel1", 2, "10000"), Ok(()));
+        assert_eq!(h.o.undo_mark(), mark);
+    }
+
     #[test]
     fn a_black_box_size_outside_the_field_range_is_kept_until_it_is_edited() -> Result<(), Box<dyn std::error::Error>> {
         use wc_core::{BoxPin, BoxSide};
@@ -2264,6 +2764,192 @@ mod tests {
         }
         frame(&mut o, &mut ps);
         assert_eq!(form(&ps), Some((0.5, true)));
+        Ok(())
+    }
+
+    /// A black box form changed and not applied is applied before a save, as one undo step;
+    /// a refused change keeps the form and gives the reason (#932).
+    #[test]
+    fn a_black_box_draft_is_applied_before_saving() -> Result<(), Box<dyn std::error::Error>> {
+        use wc_core::{BoxPin, BoxSide};
+        let (_tmp, mut o) = crate::state::tests::project();
+        let pins = [BoxPin {
+            name: "1".into(),
+            side: BoxSide::Left,
+            offset: 5.0,
+        }];
+        let id = o.add_black_box(
+            1,
+            wc_core::geom::Point::new(40.0, 40.0),
+            wc_core::geom::Point::new(60.0, 50.0),
+            &pins,
+            None,
+        )?;
+        let mut ed = Editor::default();
+        ed.page = 1;
+        ed.selection = vec![Selection::Symbol(id.clone())];
+        let mut ps = PanelState::default();
+        assert_eq!(
+            apply_black_box_draft(&mut o, &mut ed, &mut ps),
+            Ok(None),
+            "no form shown"
+        );
+        let t = Theme::of(&egui::Context::default());
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| black_box_section(ui, &mut o, &mut ed, &mut ps, 1, &id, &t));
+        });
+        let steps = o.undo_steps();
+        assert!(!black_box_draft_applies(&o, &ps, &ed));
+        assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), Ok(None));
+        assert_eq!(o.undo_steps(), steps, "an unchanged form applies nothing");
+        if let Some((_, f)) = ps.black_box.as_mut() {
+            f.rows[0].name = "A".into();
+        }
+        // A wire being drawn from the point renamed can no longer be drawn: it is dropped.
+        ed.page = 1;
+        ed.wire = Some((
+            wc_core::Endpoint::Pin {
+                item: id.clone(),
+                pin: "1".into(),
+            },
+            Vec::new(),
+        ));
+        assert!(black_box_draft_applies(&o, &ps, &ed));
+        assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), Ok(None));
+        assert!(ed.wire.is_none(), "the wire from the renamed point is dropped");
+        assert_eq!(o.undo_steps(), steps + 1, "one undo step");
+        assert!(ps.black_box.is_none(), "the form is read again");
+        let symbol = o.project.pages[1]
+            .symbol(&id)
+            .map(|s| s.symbol.clone())
+            .unwrap_or_default();
+        let pin_names: Vec<String> = o.symbols[&symbol].pins.iter().map(|p| p.name.clone()).collect();
+        assert_eq!(pin_names, ["A"]);
+        // A refused change (two points with one name) stays in the form, with its reason.
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| black_box_section(ui, &mut o, &mut ed, &mut ps, 1, &id, &t));
+        });
+        if let Some((_, f)) = ps.black_box.as_mut() {
+            f.add_row();
+            let last = f.rows.len() - 1;
+            f.rows[last].name = "A".into();
+        }
+        let refused = apply_black_box_draft(&mut o, &mut ed, &mut ps);
+        assert!(refused.is_err(), "a duplicate point name is refused");
+        assert_eq!(o.undo_steps(), steps + 1);
+        assert!(ps.black_box.as_ref().is_some_and(|(_, f)| f.error.is_some()));
+        assert!(black_box_draft_refused(&ps, &ed));
+        // Another item picked: the form is not shown, so a save neither applies it nor counts
+        // it as refused; it is kept for when the box is picked again (#1019).
+        ed.selection = vec![Selection::Symbol("other".into())];
+        assert!(!black_box_draft_refused(&ps, &ed));
+        if let Some((_, f)) = ps.black_box.as_mut() {
+            f.rows.truncate(1);
+            f.rows[0].name = "B".into();
+            f.error = None;
+        }
+        assert!(!black_box_draft_applies(&o, &ps, &ed));
+        assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), Ok(None));
+        assert_eq!(o.undo_steps(), steps + 1, "a hidden form is not applied");
+        assert!(ps.black_box.is_some(), "and is kept");
+        ed.selection = vec![Selection::Symbol(id.clone())];
+        assert!(black_box_draft_applies(&o, &ps, &ed));
+        assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), Ok(None));
+        assert_eq!(o.undo_steps(), steps + 2, "applied once shown again");
+        Ok(())
+    }
+
+    /// Two points of the box swap names: a wire being drawn from one of them still finds a
+    /// point with its start's name, but another one, so it is dropped too.
+    #[test]
+    fn a_wire_from_a_point_whose_name_another_point_takes_is_dropped() -> Result<(), Box<dyn std::error::Error>> {
+        use wc_core::{BoxPin, BoxSide};
+        let (_tmp, mut o) = crate::state::tests::project();
+        let pin = |name: &str, offset| BoxPin {
+            name: name.into(),
+            side: BoxSide::Left,
+            offset,
+        };
+        let id = o.add_black_box(
+            1,
+            wc_core::geom::Point::new(40.0, 40.0),
+            wc_core::geom::Point::new(60.0, 60.0),
+            &[pin("1", 5.0), pin("2", 10.0)],
+            None,
+        )?;
+        let mut ed = Editor::default();
+        ed.page = 1;
+        ed.selection = vec![Selection::Symbol(id.clone())];
+        let mut ps = PanelState::default();
+        let t = Theme::of(&egui::Context::default());
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| black_box_section(ui, &mut o, &mut ed, &mut ps, 1, &id, &t));
+        });
+        if let Some((_, f)) = ps.black_box.as_mut() {
+            f.rows[0].name = "2".into();
+            f.rows[1].name = "1".into();
+        }
+        ed.page = 1;
+        ed.wire = Some((
+            wc_core::Endpoint::Pin {
+                item: id.clone(),
+                pin: "1".into(),
+            },
+            Vec::new(),
+        ));
+        assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), Ok(None));
+        assert!(ps.black_box.is_none(), "applied");
+        assert!(ed.wire.is_none(), "the wire from the point now named 2 is dropped");
+        Ok(())
+    }
+
+    #[test]
+    fn a_wire_from_a_point_taken_off_and_added_again_is_dropped() -> Result<(), Box<dyn std::error::Error>> {
+        use wc_core::{BoxPin, BoxSide};
+        let (_tmp, mut o) = crate::state::tests::project();
+        let pin = |name: &str, offset| BoxPin {
+            name: name.into(),
+            side: BoxSide::Left,
+            offset,
+        };
+        let id = o.add_black_box(
+            1,
+            wc_core::geom::Point::new(40.0, 40.0),
+            wc_core::geom::Point::new(60.0, 60.0),
+            &[pin("1", 5.0), pin("2", 10.0)],
+            None,
+        )?;
+        let mut ed = Editor::default();
+        ed.page = 1;
+        ed.selection = vec![Selection::Symbol(id.clone())];
+        let mut ps = PanelState::default();
+        let t = Theme::of(&egui::Context::default());
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| black_box_section(ui, &mut o, &mut ed, &mut ps, 1, &id, &t));
+        });
+        // Point 1 taken off, then a new point added: it gets the same name, edge and place.
+        if let Some((_, f)) = ps.black_box.as_mut() {
+            f.rows.remove(0);
+            f.add_row();
+            assert_eq!(f.pins(), [pin("2", 10.0), pin("1", 5.0)]);
+        }
+        ed.page = 1;
+        ed.wire = Some((
+            wc_core::Endpoint::Pin {
+                item: id.clone(),
+                pin: "1".into(),
+            },
+            Vec::new(),
+        ));
+        assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), Ok(None));
+        assert!(ps.black_box.is_none(), "applied");
+        assert!(ed.wire.is_none(), "the wire from the point taken off is dropped");
         Ok(())
     }
 

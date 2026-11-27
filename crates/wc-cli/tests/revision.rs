@@ -161,3 +161,44 @@ fn revision_list_escapes_a_page_id_from_a_hand_made_file_name() -> TestResult {
     assert!(list.contains("page p\\u{1b}[2J table at 200.0,20.0"), "{list:?}");
     Ok(())
 }
+
+#[test]
+fn uncloud_says_when_no_cloud_has_the_revision_and_takes_the_letter_as_cloud_does() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    wiringcraft(&dir, &["page", "add", "p1", "--number", "1"])?;
+    wiringcraft(&dir, &["revision", "add", "A 1"])?;
+    // Typed with a no-break space, as `revision cloud` and `revision remove` take it.
+    wiringcraft(
+        &dir,
+        &["revision", "cloud", "p1", "10", "10", "50", "40", "--rev", "A\u{a0}1"],
+    )?;
+
+    let Err(err) = wiringcraft(&dir, &["revision", "uncloud", "p1", "--rev", "Z"]) else {
+        unreachable!("no cloud carries Z");
+    };
+    assert!(err.contains("page \"p1\" has no cloud of revision Z"), "{err}");
+    let Err(err) = wiringcraft(&dir, &["revision", "uncloud", "p1"]) else {
+        unreachable!("neither an index nor --rev");
+    };
+    assert!(
+        err.contains("give a cloud's index or --rev") && !err.contains("not both"),
+        "{err}"
+    );
+    let Err(err) = wiringcraft(&dir, &["revision", "uncloud", "p1", "0", "--rev", "A 1"]) else {
+        unreachable!("both an index and --rev");
+    };
+    assert!(err.contains("not both"), "{err}");
+    assert!(wiringcraft(&dir, &["revision", "list"])?.contains("cloud 0"));
+
+    wiringcraft(&dir, &["revision", "uncloud", "p1", "--rev", "A\u{a0}1"])?;
+    let list = wiringcraft(&dir, &["revision", "list"])?;
+    assert!(!list.contains("cloud"), "{list}");
+    Ok(())
+}
