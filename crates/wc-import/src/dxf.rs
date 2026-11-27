@@ -1040,7 +1040,7 @@ const BRIDGE_BUDGET: usize = 4_000_000;
 
 /// The most vertex visits spent finding which loop of a hatch lies in which; past it the hatch
 /// is left unfilled.
-const NESTING_BUDGET: usize = 20_000_000;
+pub(crate) const NESTING_BUDGET: usize = 20_000_000;
 
 /// The most work (point pairs, wall edges collected and crossing tests) spent on all the bridges
 /// of one hatch together; past it the hatch is left unfilled.
@@ -1918,7 +1918,7 @@ fn loop_edges(lp: &[(f64, f64)]) -> impl Iterator<Item = ((f64, f64), (f64, f64)
 
 /// Twice the signed area of a loop (positive when counter-clockwise). Taken relative to its first
 /// point, so loops far from the origin keep their small area terms.
-fn area2(lp: &[(f64, f64)]) -> f64 {
+pub(crate) fn area2(lp: &[(f64, f64)]) -> f64 {
     let Some(&o) = lp.first() else { return 0.0 };
     loop_edges(lp)
         .map(|(a, b)| (a.0 - o.0) * (b.1 - o.1) - (b.0 - o.0) * (a.1 - o.1))
@@ -1942,7 +1942,7 @@ fn tally_work(n: usize) {
 }
 
 /// Whether `pt` lies inside the loop (even-odd rule).
-fn inside(pt: (f64, f64), lp: &[(f64, f64)]) -> bool {
+pub(crate) fn inside(pt: (f64, f64), lp: &[(f64, f64)]) -> bool {
     tally_work(lp.len());
     let mut odd = false;
     for (b, a) in loop_edges(lp) {
@@ -1973,7 +1973,7 @@ fn crosses(p: (f64, f64), q: (f64, f64), c: (f64, f64), d: (f64, f64)) -> bool {
 }
 
 /// A closed boundary, as DXF points.
-type Loop = Vec<(f64, f64)>;
+pub(crate) type Loop = Vec<(f64, f64)>;
 
 /// [`with_holes_kept`] without the loops it kept.
 #[cfg(test)]
@@ -1988,7 +1988,7 @@ fn with_holes(loops: &[Vec<(f64, f64)>], style: i64) -> Option<Vec<Vec<(f64, f64
 /// islands, Ignore every island; a loop of fewer than three points is dropped). `None` when the
 /// loops are too many or too big to work out within the budgets: a fill that covered the holes
 /// would be wrong.
-fn with_holes_kept(loops: &[Vec<(f64, f64)>], style: i64) -> Option<(Vec<Loop>, Vec<bool>)> {
+pub(crate) fn with_holes_kept(loops: &[Vec<(f64, f64)>], style: i64) -> Option<(Vec<Loop>, Vec<bool>)> {
     let mut kept = vec![false; loops.len()];
     let mut order: Vec<usize> = (0..loops.len())
         .filter(|&i| loops.get(i).is_some_and(|l| l.len() >= 3))
