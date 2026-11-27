@@ -70,9 +70,22 @@ pub fn cloud_index(item: &str) -> Option<usize> {
 /// `wc_library::library_rules`): they run before the project's own, less the ones the project
 /// turns off.
 pub fn check_with(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet]) -> Vec<Finding> {
+    check_with_unreadable(i, library, &BTreeMap::new())
+}
+
+/// [`check_with`], told which used parts have a copy in the project's library that cannot be
+/// read, by id with the reason. Such a part is reported with its reason, not as missing from
+/// the library copy.
+pub fn check_with_unreadable(
+    i: &Inputs<'_>,
+    library: &[wc_core::check_rule::RuleSet],
+    unreadable: &BTreeMap<String, String>,
+) -> Vec<Finding> {
     let p = i.project;
     let mut out = Vec::new();
     let role = |symbol: &str| i.symbols.get(symbol).map(|s| s.role);
+    // Connections outside overview pages, by wire place; cable cores and wire numbers share them.
+    let wire_net = wire_nets_off_overview(i);
 
     // Revision clouds whose revision the project does not list.
     for page in &p.pages {
@@ -239,22 +252,34 @@ pub fn check_with(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet]) -> V
         }
     }
 
-    // Contacts without a coil, interruption points without a partner.
+    // Contacts without a coil, interruption points without a partner. A copy on an overview
+    // page links nothing in the schematic, so it is no partner of an interruption point on a
+    // schematic page; one on an overview page may have its partner anywhere.
     let mut links: BTreeMap<DeviceTag, usize> = BTreeMap::new();
+    let mut overview_links: BTreeMap<DeviceTag, usize> = BTreeMap::new();
     for page in &p.pages {
         for s in &page.symbols {
             if let (Some(tag), Some(SymbolRole::Interruption)) = (&s.tag, role(&s.symbol)) {
-                *links.entry(tag.clone()).or_default() += 1;
+                let count = if page.overview { &mut overview_links } else { &mut links };
+                *count.entry(tag.clone()).or_default() += 1;
             }
         }
     }
+    let partnered = |page: &Page, tag: &DeviceTag| {
+        let schematic = links.get(tag).copied().unwrap_or(0);
+        if page.overview {
+            schematic + overview_links.get(tag).copied().unwrap_or(0) >= 2
+        } else {
+            schematic >= 2
+        }
+    };
     for page in &p.pages {
         for s in &page.symbols {
             match (role(&s.symbol), &s.tag) {
                 (Some(SymbolRole::Auxiliary), Some(tag)) if !mains.contains(tag) => {
                     out.push(at(page, &s.id, Severity::Warning, format!("contact {tag} has no coil")))
                 }
-                (Some(SymbolRole::Interruption), Some(tag)) if links.get(tag).copied().unwrap_or(0) < 2 => {
+                (Some(SymbolRole::Interruption), Some(tag)) if !partnered(page, tag) => {
                     out.push(at(
                         page,
                         &s.id,
@@ -343,6 +368,8 @@ pub fn check_with(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet]) -> V
         }
     }
 
+    same_pin_wires(i, &mut out);
+
     // Jumpers naming a terminal that is drawn nowhere join nothing there; a spare terminal of
     // the strip (terminal strip editor) is on the rail without a drawing.
     if !p.meta.jumpers.is_empty() {
@@ -376,6 +403,8 @@ pub fn check_with(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet]) -> V
         }
     }
 
+    cable_cores(i, &wire_net, &mut out);
+
     // Shorts: one net carrying two potential names (for example L1 and L2).
     let nets = wc_core::connectivity::nets_linked(p, |id| i.symbols.get(id).map(|s| s.role));
     for n in nets {
@@ -398,10 +427,13 @@ pub fn check_with(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet]) -> V
         }
     }
 
-    // Panel layouts: devices covering each other, sticking out of the plate, or whose tag is
-    // no longer in the project. Outlines that only touch do not overlap. A tag is in the project
-    // when it is drawn on a page or listed in the devices file; unlike `all_tags`, a tag drawn
-    // only as interruption points still counts, so its plate entry is not called stale.
+    wire_numbers(i, &wire_net, &mut out);
+
+    // Panel layouts: rails and ducts sticking out of the plate, and devices covering each
+    // other, sticking out of the plate, or whose tag is no longer in the project. Outlines that
+    // only touch do not overlap. A tag is in the project when it is drawn on a page or listed in
+    // the devices file; unlike `all_tags`, a tag drawn only as interruption points still counts,
+    // so its plate entry is not called stale.
     let index = p.tag_index();
     for panel in &p.panels {
         let warn = |message: String| Finding {
@@ -419,11 +451,34 @@ pub fn check_with(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet]) -> V
                 _ => None,
             })
             .collect();
+        let on_plate = |min: Point, max: Point| wc_core::panel::outline_on_plate(panel.width, panel.height, min, max);
+        // Rails and ducts too, named as a plate resize names them.
+        for it in &panel.items {
+            let (min, max) = it.bounds();
+            let what = match it {
+                wc_core::panel::PanelItem::Rail { at, .. } => format!("rail at {},{}", at.x, at.y),
+                wc_core::panel::PanelItem::Duct { min, max } => {
+                    format!("duct {},{} to {},{}", min.x, min.y, max.x, max.y)
+                }
+                wc_core::panel::PanelItem::Device { .. } => continue,
+            };
+            // `bounds` sorts a duct's corners with `min`/`max`, which drop a NaN, so the
+            // corners as written must be numbers too.
+            let written_finite = match it {
+                wc_core::panel::PanelItem::Duct { min, max } => {
+                    [min.x, min.y, max.x, max.y].iter().all(|v| v.is_finite())
+                }
+                _ => true,
+            };
+            if !written_finite || !on_plate(min, max) {
+                out.push(warn(format!("{what} sticks out of the plate")));
+            }
+        }
         for (n, (tag, min, max)) in devices.iter().enumerate() {
             if !index.contains_key(*tag) && !p.devices.contains_key(*tag) {
                 out.push(warn(format!("{tag} is on the plate but no longer in the project")));
             }
-            if min.x < -eps || min.y < -eps || max.x > panel.width + eps || max.y > panel.height + eps {
+            if !on_plate(*min, *max) {
                 out.push(warn(format!("{tag} sticks out of the plate")));
             }
             for (other, omin, omax) in &devices[n + 1..] {
@@ -434,7 +489,41 @@ pub fn check_with(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet]) -> V
         }
     }
 
-    // Devices without a part.
+    // Devices without a part, and parts (main, accessory or a jumper's) that the project's
+    // library copy does not have: the parts list shows those without a maker, and their
+    // contacts cannot be checked.
+    // Every device in the devices file counts, even one drawn only as interruption points:
+    // its parts are named explicitly.
+    let missing = |part: &str| match unreadable.get(part) {
+        _ if i.parts.contains_key(part) => None,
+        Some(why) => Some(format!(
+            "part {part} in the project's library copy cannot be read: {why}"
+        )),
+        None => Some(format!("part {part} is missing from the project's library copy")),
+    };
+    for (tag, device) in &p.devices {
+        // A part named twice gives one warning: equal findings are merged below.
+        for (part, _) in device.all_parts() {
+            if let Some(what) = missing(part) {
+                out.push(Finding {
+                    severity: Severity::Warning,
+                    page_id: None,
+                    item: None,
+                    message: format!("{tag}: {what}"),
+                });
+            }
+        }
+    }
+    for j in &p.meta.jumpers {
+        if let Some(what) = j.part.as_deref().and_then(missing) {
+            out.push(Finding {
+                severity: Severity::Warning,
+                page_id: None,
+                item: None,
+                message: format!("jumper of {}: {what}", j.strip),
+            });
+        }
+    }
     for tag in crate::all_tags(i) {
         if p.devices.get(&tag).and_then(|d| d.part.as_ref()).is_none() {
             out.push(Finding {
@@ -471,6 +560,90 @@ pub fn check_with(i: &Inputs<'_>, library: &[wc_core::check_rule::RuleSet]) -> V
     });
     out.dedup();
     out
+}
+
+/// Each wire's connection (net), keyed by its place (page index, wire index): ids need not be
+/// unique on a page.
+type WireNets = BTreeMap<(usize, usize), usize>;
+
+/// The connections of the wiring outside overview pages, by wire place. An overview wire can
+/// carry potentials or link interruption points and so join two connections into one net, which
+/// would hide a reused wire number or cable core, or make up two numbers on one connection.
+/// Pages keep their places, so page indices stay the same; overview wires get no entry.
+fn wire_nets_off_overview(i: &Inputs<'_>) -> WireNets {
+    let mut wiring = i.project.clone();
+    for page in wiring.pages.iter_mut().filter(|pg| pg.overview) {
+        page.wires.clear();
+    }
+    wc_core::connectivity::wire_nets_by_place(&wiring, |id| i.symbols.get(id).map(|s| s.role)).1
+}
+
+/// Wire numbers that do not name one connection each: a connection (net) whose wires carry
+/// two different numbers, and one number on wires of two connections. Wire numbering never
+/// makes either; numbers typed or imported can. Wires on overview pages repeat connections on
+/// purpose and do not count; wires that touch no pin are no connection, as for numbering.
+fn wire_numbers(i: &Inputs<'_>, wire_net: &WireNets, out: &mut Vec<Finding>) {
+    let p = i.project;
+    // Per net: its numbers.
+    let mut by_net: BTreeMap<usize, BTreeSet<&str>> = BTreeMap::new();
+    // Per number: the nets it is on, each with the first wire carrying it.
+    let mut by_number: BTreeMap<&str, Vec<(usize, &Page, &str)>> = BTreeMap::new();
+    // Where each net is first drawn, by any of its wires, numbered or not: its place in
+    // drawing order and that first wire (page, wire id).
+    let mut first_drawn: BTreeMap<usize, (usize, &Page, &str)> = BTreeMap::new();
+    for (pi, page) in p.pages.iter().enumerate().filter(|(_, pg)| !pg.overview) {
+        for (wi, w) in page.wires.iter().enumerate() {
+            if let Some(&net) = wire_net.get(&(pi, wi)) {
+                let next = first_drawn.len();
+                first_drawn.entry(net).or_insert((next, page, w.id.as_str()));
+            }
+        }
+    }
+    for (pi, page) in p.pages.iter().enumerate().filter(|(_, pg)| !pg.overview) {
+        for (wi, w) in page.wires.iter().enumerate() {
+            let Some(number) = w.number.as_deref().map(str::trim).filter(|n| !n.is_empty()) else {
+                continue;
+            };
+            let Some(&net) = wire_net.get(&(pi, wi)) else {
+                continue;
+            };
+            by_net.entry(net).or_default().insert(number);
+            let nets = by_number.entry(number).or_default();
+            if !nets.iter().any(|(n, ..)| *n == net) {
+                nets.push((net, page, w.id.as_str()));
+            }
+        }
+    }
+    // Named on the net's first wire, numbered or not.
+    for (net, numbers) in by_net.iter().filter(|(_, n)| n.len() > 1) {
+        let Some(&(_, page, wire)) = first_drawn.get(net) else {
+            continue;
+        };
+        let mut list: Vec<&str> = numbers.iter().copied().collect();
+        list.sort_by_key(|n| natural_key(n));
+        let list = match list.split_last() {
+            Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+            None => continue,
+        };
+        out.push(at(
+            page,
+            wire,
+            Severity::Warning,
+            format!("one connection has wire numbers {list}"),
+        ));
+    }
+    for (number, nets) in by_number.iter_mut().filter(|(_, n)| n.len() > 1) {
+        nets.sort_by_key(|(net, ..)| first_drawn.get(net).map_or(usize::MAX, |&(order, ..)| order));
+        // Named on the second connection in drawing order (by any of its wires): the first may
+        // well be the right one.
+        let Some((_, page, wire)) = nets.get(1) else { continue };
+        out.push(at(
+            page,
+            wire,
+            Severity::Warning,
+            format!("wire number {number} is on {} connections", nets.len()),
+        ));
+    }
 }
 
 /// The library sources' check rules, less the ones the project turns off, then the
@@ -726,6 +899,43 @@ fn on_segment(p: Point, a: Point, b: Point) -> bool {
     p.distance(Point::new(a.x + t * dx, a.y + t * dy)) < EPS
 }
 
+/// Cable cores on two connections: a core is one conductor, so all wires that name it must be
+/// one connection (net). Wires on overview pages repeat connections on purpose and do not count;
+/// wires that touch no pin are no connection, and a wire naming only its cable (no core) names
+/// no conductor.
+fn cable_cores(i: &Inputs<'_>, wire_net: &WireNets, out: &mut Vec<Finding>) {
+    let p = i.project;
+    // Per core: the nets it is on, in drawing order, each with the first wire naming it there.
+    type Uses<'p> = Vec<(usize, &'p Page, &'p str)>;
+    let mut by_core: BTreeMap<(&DeviceTag, &str), Uses> = BTreeMap::new();
+    for (pi, page) in p.pages.iter().enumerate().filter(|(_, pg)| !pg.overview) {
+        for (wi, w) in page.wires.iter().enumerate() {
+            let Some(c) = &w.cable else { continue };
+            let core = c.core.trim();
+            if core.is_empty() {
+                continue;
+            }
+            let Some(&net) = wire_net.get(&(pi, wi)) else {
+                continue;
+            };
+            let nets = by_core.entry((&c.cable, core)).or_default();
+            if !nets.iter().any(|(n, ..)| *n == net) {
+                nets.push((net, page, w.id.as_str()));
+            }
+        }
+    }
+    for ((cable, core), nets) in by_core.iter().filter(|(_, n)| n.len() > 1) {
+        // Named on the wire of the second connection: the first may well be the right one.
+        let Some((_, page, wire)) = nets.get(1) else { continue };
+        out.push(at(
+            page,
+            wire,
+            Severity::Warning,
+            format!("cable core {cable}:{core} is on {} connections", nets.len()),
+        ));
+    }
+}
+
 /// The findings as a report table.
 pub fn check_table(i: &Inputs<'_>) -> Table {
     let mut t = Table::new("Project check", &["Severity", "Page", "Problem"]);
@@ -739,4 +949,37 @@ pub fn check_table(i: &Inputs<'_>) -> Table {
         t.rows.push(vec![f.severity.label().into(), page, f.message]);
     }
     t
+}
+
+/// Wires whose two ends are on the same pin of the same symbol: they connect nothing, yet show
+/// in the wire list and silence the pin's open-pin note. Wire ids need not be unique, so a wire
+/// that shares its id with others on the page says which of them it is: otherwise two such wires
+/// would give the same finding and the check would show only one.
+fn same_pin_wires(i: &Inputs<'_>, out: &mut Vec<Finding>) {
+    for page in &i.project.pages {
+        for (n, w) in page.wires.iter().enumerate() {
+            if let (Endpoint::Pin { item, pin }, Endpoint::Pin { item: item2, pin: pin2 }) = (&w.from, &w.to)
+                && item == item2
+                && pin == pin2
+            {
+                let same_id = page.wires.iter().filter(|x| x.id == w.id).count();
+                let which = if same_id > 1 {
+                    let k = page.wires.iter().take(n).filter(|x| x.id == w.id).count() + 1;
+                    format!(" (wire {k} of {same_id} with id {} on this page)", w.id)
+                } else {
+                    String::new()
+                };
+                out.push(at(
+                    page,
+                    &w.id,
+                    Severity::Warning,
+                    format!(
+                        "wire{} starts and ends on {}{which}",
+                        w.number.as_ref().map(|n| format!(" {n}")).unwrap_or_default(),
+                        crate::pin_label(i.project, &page.id, item, pin)
+                    ),
+                ));
+            }
+        }
+    }
 }

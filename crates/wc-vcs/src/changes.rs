@@ -52,6 +52,14 @@ pub enum Change {
         from: String,
         to: String,
     },
+    /// The placed symbol kept its id but now draws another library symbol (`from` -> `to`),
+    /// for example a make contact turned into a break contact.
+    SymbolReplaced {
+        page: String,
+        item: String,
+        from: String,
+        to: String,
+    },
     WireAdded {
         page: String,
         wire: String,
@@ -86,6 +94,9 @@ impl std::fmt::Display for Change {
             Change::SymbolRemoved { page, item, what } => write!(f, "page {page}: {what} {item} removed"),
             Change::SymbolMoved { page, item, what } => write!(f, "page {page}: {what} {item} moved"),
             Change::SymbolRetagged { page, item, from, to } => write!(f, "page {page}: {item} tag {from} -> {to}"),
+            Change::SymbolReplaced { page, item, from, to } => {
+                write!(f, "page {page}: {item} symbol {from} -> {to}")
+            }
             Change::WireAdded { page, wire } => write!(f, "page {page}: wire {wire} added"),
             Change::WireRemoved { page, wire } => write!(f, "page {page}: wire {wire} removed"),
             Change::WireChanged { page, wire } => write!(f, "page {page}: wire {wire} changed"),
@@ -97,6 +108,30 @@ impl std::fmt::Display for Change {
 
 fn parse_page(text: Option<String>) -> Option<Page> {
     text.and_then(|t| serde_json::from_str(&t).ok())
+}
+
+/// One side of a page file: `Ok(None)` when the file is not there, `Err` (saying why) when it
+/// is there but cannot be read as a page.
+fn read_side(path: &str, text: Option<String>) -> wc_core::Result<Option<Page>> {
+    match text {
+        None => Ok(None),
+        Some(t) => serde_json::from_str(&t)
+            .map(Some)
+            .map_err(|source| wc_core::Error::Json {
+                path: path.into(),
+                source,
+            }),
+    }
+}
+
+/// A file in the working folder: `Ok(None)` only when it is not there; any other failure to
+/// read it (no permission, not UTF-8) is an error, since the file still exists.
+fn read_working(path: &std::path::Path) -> wc_core::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(wc_core::Error::io(path, e)),
+    }
 }
 
 fn tag_or_symbol(s: &wc_core::PlacedSymbol) -> String {
@@ -149,6 +184,14 @@ pub fn page_changes(old: Option<&Page>, new: Option<&Page>) -> Vec<Change> {
                                 item: s.id.clone(),
                                 from: prev.tag.as_ref().map(|t| t.to_string()).unwrap_or_default(),
                                 to: s.tag.as_ref().map(|t| t.to_string()).unwrap_or_default(),
+                            });
+                        }
+                        if prev.symbol != s.symbol {
+                            out.push(Change::SymbolReplaced {
+                                page: page.clone(),
+                                item: tag_or_symbol(s),
+                                from: prev.symbol.clone(),
+                                to: s.symbol.clone(),
                             });
                         }
                         if prev.at != s.at || prev.rotation != s.rotation || prev.mirror != s.mirror {
@@ -254,12 +297,23 @@ pub fn changes(git: &Git, from: &str, to: Option<&str>) -> Result<Vec<Change>> {
     let mut out = Vec::new();
     for (status, path) in &entries {
         let (status, path) = (status.as_str(), path.as_str());
-        if path.starts_with("pages/") && path.ends_with(".page.json") {
-            let old = parse_page(git.show(from, path));
+        let pages = if path.starts_with("pages/") && path.ends_with(".page.json") {
+            let old = read_side(path, git.show(from, path));
             let new = match to {
-                Some(t) => parse_page(git.show(t, path)),
-                None => parse_page(std::fs::read_to_string(git.dir.join(path)).ok()),
+                Some(t) => read_side(path, git.show(t, path)),
+                None => read_working(&git.dir.join(path)).and_then(|text| read_side(path, text)),
             };
+            // A side whose file is there but is no page (conflict markers, a hand edit, a
+            // newer format, bytes that are not text) cannot be compared: the file itself is
+            // listed instead.
+            match (old, new) {
+                (Ok(old), Ok(new)) => Some((old, new)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some((old, new)) = pages {
             out.extend(page_changes(old.as_ref(), new.as_ref()));
         } else {
             let status = match status {

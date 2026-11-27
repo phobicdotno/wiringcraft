@@ -1,0 +1,112 @@
+{
+  "category": "passive",
+  "description": "Inductor or choke, such as a line or DC choke on a drive or a filter choke.",
+  "graphics": [
+    {
+      "a": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 3.5
+      },
+      "kind": "line"
+    },
+    {
+      "center": {
+        "x": 0.0,
+        "y": 4.5
+      },
+      "end": 90.0,
+      "kind": "arc",
+      "radius": 1.0,
+      "start": 270.0
+    },
+    {
+      "center": {
+        "x": 0.0,
+        "y": 6.5
+      },
+      "end": 90.0,
+      "kind": "arc",
+      "radius": 1.0,
+      "start": 270.0
+    },
+    {
+      "center": {
+        "x": 0.0,
+        "y": 8.5
+      },
+      "end": 90.0,
+      "kind": "arc",
+      "radius": 1.0,
+      "start": 270.0
+    },
+    {
+      "center": {
+        "x": 0.0,
+        "y": 10.5
+      },
+      "end": 90.0,
+      "kind": "arc",
+      "radius": 1.0,
+      "start": 270.0
+    },
+    {
+      "a": {
+        "x": 0.0,
+        "y": 11.5
+      },
+      "b": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "kind": "line"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "1"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 14.4
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "2"
+    }
+  ],
+  "id": "wc.inductor",
+  "letter_code": "R",
+  "name": "Inductor",
+  "pins": [
+    {
+      "at": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "1"
+    },
+    {
+      "at": {
+        "x": 0.0,
+        "y": 15.0
+      },
+      "dir": "down",
+      "name": "2"
+    }
+  ],
+  "role": "standalone",
+  "tag_at": {
+    "x": -5.0,
+    "y": 8.0
+  }
+}

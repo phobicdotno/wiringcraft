@@ -1,0 +1,134 @@
+{
+  "category": "drives",
+  "description": "DC motor (for example a 24 V DC drive, pump or actuator); + and - are the armature terminals.",
+  "graphics": [
+    {
+      "a": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": 0.0,
+        "y": 4.67
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 5.0,
+        "y": 0.0
+      },
+      "b": {
+        "x": 5.0,
+        "y": 4.67
+      },
+      "kind": "line"
+    },
+    {
+      "center": {
+        "x": 2.5,
+        "y": 9.0
+      },
+      "kind": "circle",
+      "radius": 5.0
+    },
+    {
+      "align": "center",
+      "at": {
+        "x": 2.5,
+        "y": 10.3
+      },
+      "height": 3.5,
+      "kind": "text",
+      "text": "M"
+    },
+    {
+      "a": {
+        "x": 1.0,
+        "y": 11.8
+      },
+      "b": {
+        "x": 4.0,
+        "y": 11.8
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 1.0,
+        "y": 12.8
+      },
+      "b": {
+        "x": 1.7,
+        "y": 12.8
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 2.15,
+        "y": 12.8
+      },
+      "b": {
+        "x": 2.85,
+        "y": 12.8
+      },
+      "kind": "line"
+    },
+    {
+      "a": {
+        "x": 3.3,
+        "y": 12.8
+      },
+      "b": {
+        "x": 4.0,
+        "y": 12.8
+      },
+      "kind": "line"
+    },
+    {
+      "at": {
+        "x": 1.2,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "+"
+    },
+    {
+      "at": {
+        "x": 6.2,
+        "y": 2.5
+      },
+      "height": 2.0,
+      "kind": "text",
+      "text": "-"
+    }
+  ],
+  "id": "wc.motor.dc",
+  "letter_code": "M",
+  "name": "DC motor",
+  "pins": [
+    {
+      "at": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "+"
+    },
+    {
+      "at": {
+        "x": 5.0,
+        "y": 0.0
+      },
+      "dir": "up",
+      "name": "-"
+    }
+  ],
+  "role": "standalone",
+  "tag_at": {
+    "x": -6.5,
+    "y": 9.0
+  }
+}
