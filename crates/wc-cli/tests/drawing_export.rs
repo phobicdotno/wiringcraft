@@ -1,5 +1,6 @@
 //! `wiringcraft drawing` writes a file per panel layout (#927). A part that cannot be read is
-//! named in a warning with the reason, and the readable parts still draw their footprints.
+//! named in a warning with the reason, and the readable parts still draw their footprints. The
+//! PDF export warns about it the same way (#1521).
 
 use std::process::Command;
 
@@ -90,5 +91,24 @@ fn an_unreadable_part_is_warned_about_and_the_readable_footprint_is_still_drawn(
             "{ext}"
         );
     }
+
+    // `pdf` names the damaged part once, with the reason, and still writes the PDF.
+    let pdf = tmp.path().join("out.pdf");
+    let out = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("-C")
+        .arg(&dir)
+        .arg("pdf")
+        .arg(&pdf)
+        .output()?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "pdf: {stderr}");
+    let warned: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("cannot read part maker.bad"))
+        .collect();
+    assert_eq!(warned.len(), 1, "pdf: {stderr}");
+    assert!(warned[0].starts_with("warning: ") && warned[0].len() > "warning: cannot read part maker.bad: ".len());
+    assert!(!stderr.contains("maker.good"), "pdf: {stderr}");
+    assert!(std::fs::read(&pdf)?.starts_with(b"%PDF"));
     Ok(())
 }

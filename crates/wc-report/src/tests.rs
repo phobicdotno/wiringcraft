@@ -1203,6 +1203,23 @@ fn a_coil_drawn_only_on_an_overview_page_still_exists_for_its_contacts() {
 }
 
 #[test]
+fn an_auxiliary_contact_of_a_standalone_breaker_has_no_missing_coil() {
+    // A breaker or MPCB is one standalone symbol; its aux contact belongs to it (#1467).
+    let (mut p, s, parts) = fixture();
+    p.pages[0].symbols.push(place("s11", "no", 320.0, Some("-Q9")));
+    p.pages[0].symbols.push(place("s12", "lamp", 360.0, Some("-Q9")));
+    p.pages[0].symbols.push(place("s13", "no", 400.0, Some("-Q8")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let findings = check(&i);
+    assert!(!findings.iter().any(|f| f.message.contains("contact -Q9 has no coil")));
+    assert!(findings.iter().any(|f| f.message.contains("contact -Q8 has no coil")));
+}
+
+#[test]
 fn an_interruption_point_repeated_on_an_overview_page_is_not_its_own_partner() {
     let (mut p, mut s, parts) = fixture();
     let arrow = sym("arrow", SymbolRole::Interruption, &["1"]);
@@ -1229,6 +1246,38 @@ fn an_interruption_point_repeated_on_an_overview_page_is_not_its_own_partner() {
         lonely(&p),
         vec![Some(p.pages[0].id.clone())],
         "the schematic point has no partner; the overview copy still has the schematic one"
+    );
+}
+
+#[test]
+fn check_warns_about_a_coil_or_contact_without_a_tag() {
+    let (mut p, s, parts) = fixture();
+    p.pages[0].symbols.push(place("s10", "coil", 200.0, None));
+    p.pages[0].symbols.push(place("s11", "no", 230.0, None));
+    p.pages[0].symbols.push(place("s12", "lamp", 260.0, None));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let untagged: Vec<(Option<String>, String)> = check(&i)
+        .into_iter()
+        .filter(|f| f.message.contains("has no tag"))
+        .map(|f| (f.item, f.message))
+        .collect();
+    assert_eq!(
+        untagged,
+        vec![
+            (
+                Some("s10".into()),
+                "coil has no tag, so it links nothing in cross-references".into()
+            ),
+            (
+                Some("s11".into()),
+                "contact has no tag, so it links nothing in cross-references".into()
+            ),
+        ],
+        "a lamp needs no tag to work; the tagged coil and contact are fine"
     );
 }
 
@@ -1305,6 +1354,72 @@ fn automationml_has_devices_pins_and_one_link_per_join() {
     assert_eq!(k1.matches("<ExternalInterface").count(), 4);
     // The same project gives the same file.
     assert_eq!(automationml(&i, "2026-11-16T22:00:00Z", "plant-v2.aml").0, xml);
+}
+
+#[test]
+fn automationml_link_names_never_repeat() {
+    let (mut p, s, parts) = fixture();
+    // Potential `A` joins three terminals (links `A` and `A#2`); another potential is really
+    // named `A#2`.
+    let page = &mut p.pages[0];
+    for (n, x) in [(1, 300.0), (2, 310.0), (3, 320.0), (4, 330.0), (5, 340.0)] {
+        page.symbols
+            .push(place(&format!("t{n}"), "term", x, Some(&format!("-X9.{n}"))));
+    }
+    page.wires
+        .push(wire("a1", pin("t1", "1"), pin("t2", "1"), None, Some("A")));
+    page.wires
+        .push(wire("a2", pin("t2", "1"), pin("t3", "1"), None, Some("A")));
+    page.wires
+        .push(wire("b1", pin("t4", "1"), pin("t5", "1"), None, Some("A#2")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let (xml, _) = automationml(&i, "2026-11-16T22:00:00Z", "plant.aml");
+    let mut names: Vec<&str> = xml
+        .split("<InternalLink Name=\"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .collect();
+    assert!(names.contains(&"A") && names.contains(&"A#2"), "{xml}");
+    let all = names.len();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), all, "{xml}");
+}
+
+#[test]
+fn automationml_link_names_differ_once_written() {
+    let (mut p, s, parts) = fixture();
+    // `A` and `A\u{FFFE}` differ, but the character XML cannot hold is left out when written,
+    // so both would be written as `A`.
+    let page = &mut p.pages[0];
+    for (n, x) in [(1, 300.0), (2, 310.0), (3, 320.0), (4, 330.0)] {
+        page.symbols
+            .push(place(&format!("t{n}"), "term", x, Some(&format!("-X9.{n}"))));
+    }
+    page.wires
+        .push(wire("a1", pin("t1", "1"), pin("t2", "1"), None, Some("A")));
+    page.wires
+        .push(wire("b1", pin("t3", "1"), pin("t4", "1"), None, Some("A\u{FFFE}")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let (xml, _) = automationml(&i, "2026-11-16T22:00:00Z", "plant.aml");
+    let mut names: Vec<&str> = xml
+        .split("<InternalLink Name=\"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .collect();
+    assert!(names.contains(&"A") && names.contains(&"A#2"), "{xml}");
+    let all = names.len();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), all, "{xml}");
 }
 
 #[test]
