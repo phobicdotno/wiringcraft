@@ -574,7 +574,8 @@ struct MarkingArgs {
 enum CommentCmd {
     /// Pin a comment on a page. Prints its id.
     Add {
-        /// The page's id.
+        /// The page's id or number. An id wins: when one page's number is another page's id,
+        /// the page with that id is taken, so give the id of the page you mean.
         page: String,
         /// The comment.
         text: String,
@@ -612,7 +613,8 @@ enum CommentCmd {
     },
     /// List the comments, of one page or all; open ones only unless --all.
     List {
-        /// Only this page's comments (page id).
+        /// Only this page's comments: the page's id or number. An id wins when one page's
+        /// number is another page's id.
         page: Option<String>,
         /// Resolved comments too.
         #[arg(long)]
@@ -4156,9 +4158,21 @@ fn run(mut cli: Cli) -> Res<()> {
                 count(wc_report::Severity::Warning),
                 count(wc_report::Severity::Note),
             );
-            println!("{errors} errors, {warnings} warnings, {notes} notes");
+            let counted = |n: usize, one: &str| {
+                if n == 1 {
+                    format!("1 {one}")
+                } else {
+                    format!("{n} {one}s")
+                }
+            };
+            println!(
+                "{}, {}, {}",
+                counted(errors, "error"),
+                counted(warnings, "warning"),
+                counted(notes, "note")
+            );
             if errors > 0 {
-                return Err(format!("the project check found {errors} errors"));
+                return Err(format!("the project check found {}", counted(errors, "error")));
             }
         }
         Cmd::Report { kind, format, out, sep } => {

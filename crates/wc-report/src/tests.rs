@@ -1356,6 +1356,258 @@ fn automationml_has_devices_pins_and_one_link_per_join() {
     assert_eq!(automationml(&i, "2026-11-16T22:00:00Z", "plant-v2.aml").0, xml);
 }
 
+/// An XML element's name and its attributes, unescaped.
+type XmlElement = (String, BTreeMap<String, String>);
+
+/// Every element of `xml` as (name, attributes), read with an XML reader, or why the document
+/// is not well formed: a reader error, a bad attribute or entity reference, text outside the
+/// root element, a second root, or an element left open.
+fn xml_elements(xml: &str) -> Result<Vec<XmlElement>, String> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut root_closed = false;
+    loop {
+        let at = reader.buffer_position();
+        let event = reader.read_event().map_err(|e| format!("at byte {at}: {e}"))?;
+        let (e, opens) = match event {
+            Event::Start(e) => (e, true),
+            Event::Empty(e) => (e, false),
+            Event::End(_) => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| format!("at byte {at}: end tag without a start"))?;
+                root_closed = depth == 0;
+                continue;
+            }
+            Event::Text(t) => {
+                let text = t.unescape().map_err(|e| format!("at byte {at}: {e}"))?;
+                if depth == 0 && !text.trim().is_empty() {
+                    return Err(format!("at byte {at}: text outside the root element: {text:?}"));
+                }
+                continue;
+            }
+            Event::Eof if depth == 0 && root_closed => return Ok(out),
+            Event::Eof => return Err(format!("ended with {depth} element(s) open or no root")),
+            _ => continue,
+        };
+        if depth == 0 && root_closed {
+            return Err(format!("at byte {at}: a second root element"));
+        }
+        if opens {
+            depth += 1;
+        } else if depth == 0 {
+            root_closed = true;
+        }
+        let name = String::from_utf8(e.name().as_ref().to_vec()).map_err(|e| format!("at byte {at}: {e}"))?;
+        let mut attrs = BTreeMap::new();
+        for a in e.attributes() {
+            let a = a.map_err(|e| format!("at byte {at}: {e}"))?;
+            let k = String::from_utf8(a.key.as_ref().to_vec()).map_err(|e| format!("at byte {at}: {e}"))?;
+            let v = a.unescape_value().map_err(|e| format!("at byte {at}: {k}: {e}"))?;
+            attrs.insert(k, v.into_owned());
+        }
+        out.push((name, attrs));
+    }
+}
+
+#[test]
+fn the_xml_helper_rejects_documents_that_are_not_well_formed() {
+    assert!(xml_elements("<a x=\"1\"><b/></a>\n").is_ok());
+    for bad in [
+        "<a>&unknown;</a>",
+        "<a x=\"&unknown;\"/>",
+        "stray<a/>",
+        "<a/>stray",
+        "<a/><b/>",
+        "<a><b></a>",
+        "<a>",
+        "",
+    ] {
+        assert!(xml_elements(bad).is_err(), "{bad:?} was accepted");
+    }
+}
+
+#[test]
+fn automationml_of_an_empty_project_is_a_well_formed_skeleton() {
+    let p = Project::new("   ");
+    let (symbols, parts) = (BTreeMap::new(), BTreeMap::new());
+    let i = Inputs {
+        project: &p,
+        symbols: &symbols,
+        parts: &parts,
+    };
+    let (xml, counts) = automationml(&i, "", "");
+    assert_eq!(counts, AmlCounts::default());
+    // A blank name falls back to "Project", and a missing time stamp to the epoch.
+    assert!(xml.contains("<CAEXFile FileName=\"Project.aml\""), "{xml}");
+    assert!(xml.contains("LastWritingDateTime=\"1970-01-01T00:00:00Z\""), "{xml}");
+    assert!(xml.contains("<InstanceHierarchy Name=\"Project\""), "{xml}");
+    let elements = xml_elements(&xml).unwrap_or_else(|e| unreachable!("not well formed ({e}): {xml}"));
+    let names: Vec<&str> = elements.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "CAEXFile",
+            "SourceDocumentInformation",
+            "InstanceHierarchy",
+            "InternalElement"
+        ]
+    );
+    assert!(xml.ends_with("</CAEXFile>\n"));
+}
+
+#[test]
+fn automationml_trims_and_escapes_the_project_name_and_time_stamp() {
+    let p = Project::new("  A&B <\"plant\">  ");
+    let (symbols, parts) = (BTreeMap::new(), BTreeMap::new());
+    let i = Inputs {
+        project: &p,
+        symbols: &symbols,
+        parts: &parts,
+    };
+    let (xml, _) = automationml(&i, "x<y", "");
+    assert!(
+        xml.contains("<CAEXFile FileName=\"A&amp;B &lt;&quot;plant&quot;&gt;.aml\""),
+        "{xml}"
+    );
+    assert!(xml.contains("LastWritingDateTime=\"x&lt;y\""), "{xml}");
+    let elements = xml_elements(&xml).unwrap_or_else(|e| unreachable!("not well formed ({e}): {xml}"));
+    let get = |el: &str, attr: &str| {
+        elements
+            .iter()
+            .find(|(n, _)| n == el)
+            .and_then(|(_, a)| a.get(attr).cloned())
+    };
+    // A reader gets the trimmed name back in every place it is used.
+    assert_eq!(get("CAEXFile", "FileName").as_deref(), Some("A&B <\"plant\">.aml"));
+    assert_eq!(get("InstanceHierarchy", "Name").as_deref(), Some("A&B <\"plant\">"));
+    assert_eq!(get("InternalElement", "Name").as_deref(), Some("A&B <\"plant\">"));
+}
+
+#[test]
+fn automationml_keeps_register_devices_without_symbols_and_unknown_parts() {
+    let mut p = Project::new("t");
+    p.devices.insert(
+        DeviceTag::parse("-Q1").unwrap(),
+        Device {
+            part: Some("not.in.library".into()),
+            properties: [
+                ("OrderNumber".to_string(), "shadowed".to_string()),
+                ("Function text".to_string(), "shadowed".to_string()),
+                ("Rated current".to_string(), "16 A".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        },
+    );
+    let (symbols, parts) = (BTreeMap::new(), BTreeMap::new());
+    let i = Inputs {
+        project: &p,
+        symbols: &symbols,
+        parts: &parts,
+    };
+    let (xml, counts) = automationml(&i, "2026-11-16T22:00:00Z", "t.aml");
+    assert_eq!((counts.devices, counts.links), (1, 0), "{xml}");
+    let q1 = xml.split("<InternalElement Name=\"-Q1\" ID=\"d1\">").nth(1).unwrap();
+    let q1 = q1.split("</InternalElement>").next().unwrap();
+    // A part id with no library entry is written as the order number.
+    assert!(q1.contains("Name=\"OrderNumber\" AttributeDataType=\"xs:string\"><Value>not.in.library</Value>"));
+    // Properties named like a built-in attribute do not repeat it; others are kept.
+    assert!(!q1.contains("shadowed"), "{q1}");
+    assert_eq!(q1.matches("Name=\"OrderNumber\"").count(), 1);
+    assert!(q1.contains("Name=\"Rated current\" AttributeDataType=\"xs:string\"><Value>16 A</Value>"));
+    // No empty description and no connection points without a symbol.
+    assert!(!q1.contains("Function text"), "{q1}");
+    assert!(!q1.contains("<ExternalInterface"), "{q1}");
+}
+
+#[test]
+fn automationml_numbers_devices_in_natural_tag_order() {
+    let mut p = Project::new("t");
+    for t in ["-K10", "-K2", "-K1"] {
+        p.devices.insert(DeviceTag::parse(t).unwrap(), Default::default());
+    }
+    let (symbols, parts) = (BTreeMap::new(), BTreeMap::new());
+    let i = Inputs {
+        project: &p,
+        symbols: &symbols,
+        parts: &parts,
+    };
+    let (xml, _) = automationml(&i, "", "");
+    let elements = xml_elements(&xml).unwrap_or_else(|e| unreachable!("not well formed ({e}): {xml}"));
+    let devices: Vec<(&str, &str)> = elements
+        .iter()
+        .filter(|(n, a)| n == "InternalElement" && a.get("ID").is_some_and(|id| id != "project"))
+        .filter_map(|(_, a)| Some((a.get("Name")?.as_str(), a.get("ID")?.as_str())))
+        .collect();
+    assert_eq!(devices, [("-K1", "d1"), ("-K2", "d2"), ("-K10", "d3")]);
+}
+
+#[test]
+fn automationml_chains_a_net_of_three_pins_with_numbered_link_names() {
+    let (mut p, s, parts) = fixture();
+    // 0V joins -K1:A2 and -X2:1 already; add -P1:X2 to the same potential.
+    p.pages[0]
+        .wires
+        .push(wire("w6", pin("s5", "1"), pin("s6", "X2"), None, None));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let (xml, counts) = automationml(&i, "", "");
+    assert_eq!(counts.links, 4, "{xml}");
+    let elements = xml_elements(&xml).unwrap_or_else(|e| unreachable!("not well formed ({e}): {xml}"));
+    let links: Vec<&str> = elements
+        .iter()
+        .filter(|(n, _)| n == "InternalLink")
+        .filter_map(|(_, a)| a.get("Name").map(String::as_str))
+        .filter(|n| n.starts_with("0V"))
+        .collect();
+    assert_eq!(links, ["0V", "0V#2"], "{xml}");
+}
+
+#[test]
+fn automationml_links_only_name_interfaces_that_exist() {
+    let (p, s, parts) = fixture();
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let (xml, counts) = automationml(&i, "2026-11-16T22:00:00Z", "plant.aml");
+    let elements = xml_elements(&xml).unwrap_or_else(|e| unreachable!("not well formed ({e}): {xml}"));
+    let ids: Vec<&str> = elements
+        .iter()
+        .filter_map(|(_, a)| a.get("ID").map(String::as_str))
+        .collect();
+    let unique: BTreeSet<&str> = ids.iter().copied().collect();
+    assert_eq!(unique.len(), ids.len(), "IDs repeat: {ids:?}");
+    let interfaces: BTreeSet<&str> = elements
+        .iter()
+        .filter(|(n, _)| n == "ExternalInterface")
+        .filter_map(|(_, a)| a.get("ID").map(String::as_str))
+        .collect();
+    let links: Vec<&BTreeMap<String, String>> = elements
+        .iter()
+        .filter(|(n, _)| n == "InternalLink")
+        .map(|(_, a)| a)
+        .collect();
+    assert_eq!(links.len(), counts.links);
+    for a in links {
+        for side in ["RefPartnerSideA", "RefPartnerSideB"] {
+            let Some(r) = a.get(side) else {
+                unreachable!("{side} missing: {a:?}")
+            };
+            assert!(interfaces.contains(r.as_str()), "{r} is not an interface: {xml}");
+        }
+        assert_ne!(a.get("RefPartnerSideA"), a.get("RefPartnerSideB"));
+    }
+}
+
 #[test]
 fn automationml_link_names_never_repeat() {
     let (mut p, s, parts) = fixture();
