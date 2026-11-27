@@ -759,11 +759,18 @@ impl SymbolEditor {
         self.selected = Some(Item::Shape(self.symbol.graphics.len() - 1));
     }
 
-    /// The pin at `p`, else the last drawn shape whose box (1 mm wider) holds `p`.
+    /// The pin at `p`, else an empty text there, else the last drawn shape whose box (1 mm
+    /// wider) holds `p`. An empty text draws nothing, so it comes before the shapes over it:
+    /// otherwise it could not be picked to type its words or delete it.
     fn pick(&self, p: Point) -> Option<Item> {
+        let g = &self.symbol.graphics;
         let pins = (0..self.symbol.pins.len()).map(Item::Pin);
-        let shapes = (0..self.symbol.graphics.len()).rev().map(Item::Shape);
-        pins.chain(shapes).find(|&item| self.under(item, p))
+        let empty_texts = (0..g.len())
+            .rev()
+            .filter(|&i| matches!(&g[i], Shape::Text { text, .. } if text.trim().is_empty()))
+            .map(Item::Shape);
+        let shapes = (0..g.len()).rev().map(Item::Shape);
+        pins.chain(empty_texts).chain(shapes).find(|&item| self.under(item, p))
     }
 
     pub fn delete_selected(&mut self) {
@@ -796,6 +803,13 @@ impl SymbolEditor {
         }
         if s.graphics.is_empty() {
             out.push("Draw the symbol: it has no lines or shapes yet.".into());
+        }
+        // A text cleared in its properties draws nothing and cannot be seen to select it.
+        if s.graphics
+            .iter()
+            .any(|g| matches!(g, Shape::Text { text, .. } if text.trim().is_empty()))
+        {
+            out.push("A text in the drawing is empty; type its words or delete it.".into());
         }
         let mut names = std::collections::BTreeSet::new();
         for p in &s.pins {
@@ -1978,6 +1992,55 @@ mod tests {
         let back: Symbol = serde_json::from_str(&std::fs::read_to_string(&saved.path)?)?;
         assert!(back.pin("A2").is_some(), "{:?}", back.pins);
         Ok(())
+    }
+
+    #[test]
+    fn a_text_cleared_in_its_properties_cannot_be_saved() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let mut e = SymbolEditor::new(vec![("mine".into(), tmp.path().join("lib"))]);
+        draw_coil(&mut e);
+        e.text = "K1".into();
+        e.set_tool(Tool::Text);
+        e.click(Point::new(5.0, 5.0));
+        assert!(e.problems().is_empty(), "{:?}", e.problems());
+        // Its words cleared in the Text field, leaving only spaces.
+        let Some(Shape::Text { text, .. }) = e.symbol.graphics.last_mut() else {
+            return Err("the text should be drawn last".into());
+        };
+        *text = "  ".into();
+        assert_eq!(
+            e.problems(),
+            ["A text in the drawing is empty; type its words or delete it."]
+        );
+        assert!(e.save().is_err_and(|m| m.contains("text in the drawing is empty")));
+        // Deleting it clears the problem.
+        e.selected = Some(Item::Shape(e.symbol.graphics.len() - 1));
+        e.delete_selected();
+        assert!(e.problems().is_empty(), "{:?}", e.problems());
+        e.save()?;
+        Ok(())
+    }
+
+    #[test]
+    fn an_empty_text_under_a_later_shape_can_still_be_picked() {
+        let mut e = SymbolEditor::new(Vec::new());
+        e.text = "K1".into();
+        e.set_tool(Tool::Text);
+        e.click(Point::new(5.0, 5.0));
+        e.set_tool(Tool::Rect);
+        e.click(Point::new(0.0, 0.0));
+        e.click(Point::new(10.0, 10.0));
+        e.set_tool(Tool::Select);
+        // With words the text is picked as before: the later rectangle is on top.
+        e.click(Point::new(5.0, 5.0));
+        assert_eq!(e.selected, Some(Item::Shape(1)));
+        if let Shape::Text { text, .. } = &mut e.symbol.graphics[0] {
+            text.clear();
+        }
+        e.click(Point::new(5.0, 5.0));
+        assert_eq!(e.selected, Some(Item::Shape(0)));
+        e.delete_selected();
+        assert!(matches!(e.symbol.graphics[..], [Shape::Rect { .. }]));
     }
 
     #[test]

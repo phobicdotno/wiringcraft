@@ -460,8 +460,8 @@ pub fn specs() -> Vec<Value> {
         ),
         tool(
             "set_project",
-            "Rename the project, set title-block fields (customer, project_number, plant, drawn_by, checked_by, revision, date, or any other; empty value removes one) and set or remove the logo.",
-            json!({"name": {"type": "string"}, "title_block": {"type": "object", "additionalProperties": {"type": "string"}}, "logo": {"type": "string", "description": "A PNG or JPEG file in the project folder (path relative to it) to make the logo; it is copied into pictures/ when it is elsewhere. An empty text removes the logo (its file stays)."}}),
+            "Rename the project, set title-block fields (customer, project_number, plant, drawn_by, checked_by, revision, date, or any other; an empty or null value removes one) and set or remove the logo.",
+            json!({"name": {"type": "string"}, "title_block": {"type": "object", "additionalProperties": {"type": ["string", "null", "number", "boolean"]}, "description": "The project's title-block fields to change, such as customer and project_number. A number or yes/no is taken as its text; an empty text or null clears a field; fields left out are kept."}, "logo": {"type": "string", "description": "A PNG or JPEG file in the project folder (path relative to it) to make the logo; it is copied into pictures/ when it is elsewhere. An empty text removes the logo (its file stays)."}}),
             &[],
         ),
         tool(
@@ -1540,6 +1540,26 @@ impl App {
         self.ed.show_page(page);
     }
 
+    /// The id of the page the editor shows, to find it again after pages are re-sorted.
+    fn shown_page_id(&self) -> Option<String> {
+        self.open
+            .as_ref()?
+            .project
+            .pages
+            .get(self.ed.page)
+            .map(|p| p.id.clone())
+    }
+
+    /// Show again the page with id `shown` (from [`Self::shown_page_id`]) at its index now, keeping
+    /// the selection. `false`, changing nothing, when that page is gone.
+    fn keep_shown(&mut self, shown: Option<String>) -> bool {
+        let Some(i) = shown.and_then(|id| self.open.as_ref()?.project.pages.iter().position(|p| p.id == id)) else {
+            return false;
+        };
+        self.ed.page = i;
+        true
+    }
+
     /// Take the message a command left in a dialog, so the model gets it as a result.
     fn take_message(&mut self) -> Option<String> {
         // Log it first: once taken, the frame's own logging never sees it.
@@ -1881,6 +1901,7 @@ impl App {
             "update_page" => {
                 let page = self.page_of(v, "page")?;
                 let size = page_size(v)?;
+                let shown = self.shown_page_id();
                 let open = need_open(self.open.as_mut())?;
                 // Someone else in a shared session has the page open: it is theirs to change.
                 if let Some(why) = open.held_reason(page) {
@@ -1911,17 +1932,22 @@ impl App {
                 if let Some(cover) = v.get("cover").and_then(Value::as_bool) {
                     open.set_page_cover(i, cover)?;
                 }
-                if self.ed.page == page {
-                    self.ed.page = i;
-                }
+                // A new number can re-sort the pages: the page shown stays shown.
+                self.keep_shown(shown);
                 Ok("Page changed.".into())
             }
             "delete_page" => {
                 let page = self.page_of(v, "page")?;
+                let shown = self.shown_page_id();
                 let open = need_open(self.open.as_mut())?;
                 let next = open.delete_page(page)?;
-                self.ed.page = next;
-                self.ed.selection.clear();
+                // Another page deleted: the page shown stays shown. The shown one deleted: the
+                // next page is shown instead.
+                if !self.keep_shown(shown) {
+                    self.ed.page = next;
+                    self.ed.selection.clear();
+                    self.ed.wire = None;
+                }
                 Ok("Page deleted.".into())
             }
             "duplicate_page" => {
@@ -1939,6 +1965,7 @@ impl App {
                     "down" => false,
                     other => return Err(format!("Unknown direction {other:?}: use up or down.")),
                 };
+                let shown = self.shown_page_id();
                 let open = need_open(self.open.as_mut())?;
                 let other = if up { page.checked_sub(1) } else { Some(page + 1) };
                 if let Some(why) = open
@@ -1947,8 +1974,9 @@ impl App {
                 {
                     return Err(why);
                 }
-                let i = open.move_page(page, up).ok_or("The page is already at that end.")?;
-                self.ed.page = i;
+                open.move_page(page, up).ok_or("The page is already at that end.")?;
+                // The page shown stays shown, whether it was the one moved or not.
+                self.keep_shown(shown);
                 Ok("Page moved.".into())
             }
             "show" => {
@@ -2042,11 +2070,29 @@ impl App {
                 let open = need_open(self.open.as_mut())?;
                 let name = s(v, "name").unwrap_or(&open.project.meta.name).to_owned();
                 let mut fields = open.project.meta.title_block.clone();
-                if let Some(map) = v.get("title_block").and_then(Value::as_object) {
-                    for (k, val) in map {
-                        let val = val.as_str().map(str::to_owned).unwrap_or_else(|| val.to_string());
-                        fields.insert(k.clone(), val);
+                // Like update_page: null (or an empty text) clears a field, and a value that is
+                // no text is refused rather than stored as its JSON spelling. A number or yes/no
+                // is still taken as its text, as a project number is often given as a number.
+                // Only a title_block left out is no change: an explicit null is refused like
+                // any other value that is no object, so it does not rename on its own.
+                match v.get("title_block") {
+                    None => {}
+                    Some(Value::Object(map)) => {
+                        for (k, val) in map {
+                            let val = match val {
+                                Value::String(t) => t.clone(),
+                                Value::Null => String::new(),
+                                Value::Number(_) | Value::Bool(_) => val.to_string(),
+                                _ => {
+                                    return Err(format!(
+                                        "title_block.{k} must be a text, or empty or null to clear it"
+                                    ));
+                                }
+                            };
+                            fields.insert(k.clone(), val);
+                        }
                     }
+                    Some(_) => return Err("title_block must be an object of field names and texts.".into()),
                 }
                 // The logo first: a file that cannot be used changes nothing.
                 let logo = match s(v, "logo").map(str::trim) {
@@ -2921,16 +2967,18 @@ impl App {
         let current = open.project.devices.get(&t).and_then(|d| d.part.as_deref());
         // A part the device already has is not taken again, as set_device_part leaves it alone.
         let new_part = part.filter(|p| !p.is_empty() && Some(*p) != current);
-        if new_part.is_some() || list.is_some() {
-            let ids = new_part
-                .into_iter()
-                .chain(list.iter().flatten().map(|a| a.part.as_str()));
-            open.check_parts(ids)?;
-        }
+        let ids = new_part
+            .into_iter()
+            .chain(list.iter().flatten().map(|a| a.part.as_str()));
+        let rename_to = s(v, "rename_to").map(tag).transpose()?;
+        // A refused rename takes back the part copies the check took into the project.
+        let renamed = open.check_parts_then(ids, |o| {
+            rename_to
+                .map(|to| o.rename_device(&t, &to).map(|n| (to, n)))
+                .transpose()
+        })?;
         let mut done = Vec::new();
-        if let Some(to) = s(v, "rename_to") {
-            let to = tag(to)?;
-            let n = open.rename_device(&t, &to)?;
+        if let Some((to, n)) = renamed {
             done.push(format!("renamed to {to} ({n} symbol(s))"));
             t = to;
         }
@@ -5340,6 +5388,65 @@ mod tests {
     }
 
     #[test]
+    fn the_page_shown_stays_shown_when_the_assistant_changes_another_page() {
+        let (_tmp, mut a) = app(vec![]);
+        call(&mut a, "add_page", json!({"title": "Pumps"})).unwrap();
+        call(&mut a, "add_page", json!({"title": "Valves"})).unwrap();
+        let ids = |a: &App| -> Vec<String> {
+            a.open
+                .as_ref()
+                .unwrap()
+                .project
+                .pages
+                .iter()
+                .map(|p| p.id.clone())
+                .collect()
+        };
+        let shown = |a: &App| ids(a)[a.ed.page].clone();
+        let before = ids(&a);
+        assert!(before.len() >= 4, "{before:?}");
+        // The user looks at the third page.
+        a.ed.page = 2;
+        let mine = before[2].clone();
+        // Moving the last page up swaps it with the page shown.
+        let last = before[before.len() - 1].clone();
+        call(&mut a, "move_page", json!({"page": last, "direction": "up"})).unwrap();
+        assert_eq!(shown(&a), mine);
+        // A first page renumbered to sort last moves the page shown one place up.
+        let first = before[0].clone();
+        call(&mut a, "update_page", json!({"page": first, "number": "99"})).unwrap();
+        assert_eq!(ids(&a).last(), Some(&first));
+        assert_eq!(shown(&a), mine);
+        // Deleting another page keeps the page shown, its selection and a wire started on it.
+        let line = Shape::Line {
+            a: Point::new(0.0, 0.0),
+            b: Point::new(5.0, 0.0),
+        };
+        a.open.as_mut().unwrap().project.pages[a.ed.page].graphics = vec![line];
+        let sel = vec![crate::state::Selection::Graphic(0)];
+        let wire = Some((
+            wc_core::Endpoint::Point {
+                at: Point::new(10.0, 10.0),
+            },
+            Vec::new(),
+        ));
+        a.ed.selection = sel.clone();
+        a.ed.wire = wire.clone();
+        let other = ids(&a).into_iter().find(|id| *id != mine).unwrap();
+        call(&mut a, "delete_page", json!({"page": other})).unwrap();
+        assert_eq!(shown(&a), mine);
+        assert_eq!(a.ed.selection, sel);
+        assert_eq!(a.ed.wire, wire);
+        // Deleting the page shown shows the next one, with no selection and no started wire.
+        let at = a.ed.page;
+        let next = ids(&a)[at + 1].clone();
+        call(&mut a, "delete_page", json!({"page": mine})).unwrap();
+        assert_eq!(shown(&a), next);
+        assert!(a.ed.selection.is_empty());
+        assert_eq!(a.ed.wire, None);
+    }
+
+    #[test]
     fn the_assistant_reads_and_changes_the_page_template_as_one_undo_step() {
         let (_tmp, mut a) = app(vec![]);
         let read =
@@ -5589,6 +5696,43 @@ mod tests {
                 .and_then(|d| d.part.as_deref()),
             Some("no.such")
         );
+    }
+
+    #[test]
+    fn set_device_with_a_refused_rename_takes_no_part_into_the_project() {
+        let (_tmp, mut a) = app(vec![]);
+        call(&mut a, "set_device", json!({"tag": "-K1"})).unwrap();
+        call(&mut a, "set_device", json!({"tag": "-K2"})).unwrap();
+        let open = a.open.as_ref().unwrap();
+        let mark = open.undo_mark();
+        let id = "example.ex-tb-2-5";
+        let copy = wc_core::store::vendor_path(&open.dir, wc_core::lock::ItemKind::Part, id).unwrap();
+        assert!(
+            !copy.exists() && !open.parts.contains_key(id),
+            "the project does not have the part yet"
+        );
+        for v in [
+            json!({"tag": "-K1", "rename_to": "-K2", "part": id}),
+            json!({"tag": "-K1", "rename_to": "-K2", "accessories": [{"part": id}]}),
+        ] {
+            let r = call(&mut a, "set_device", v.clone());
+            assert!(r.as_ref().is_err_and(|e| e.contains("already used")), "{v}: {r:?}");
+            let open = a.open.as_ref().unwrap();
+            assert!(!copy.exists(), "{v}: no part copy left in the project");
+            assert!(!open.parts.contains_key(id), "{v}: the part is not loaded");
+            assert!(!open.project.lock.parts.contains_key(id), "{v}: no pin");
+            assert_eq!(open.undo_mark(), mark, "{v}: no undo step");
+        }
+        // The same change with a free tag goes through and takes the part.
+        let said = call(
+            &mut a,
+            "set_device",
+            json!({"tag": "-K1", "rename_to": "-K3", "part": id}),
+        )
+        .unwrap();
+        assert!(said.contains("renamed to -K3") && said.contains(id), "{said}");
+        let open = a.open.as_ref().unwrap();
+        assert!(copy.exists() && open.parts.contains_key(id) && open.project.lock.parts.contains_key(id));
     }
 
     #[test]
@@ -9216,6 +9360,34 @@ mod tests {
     }
 
     #[test]
+    fn escape_closes_the_project_check_list() {
+        let (_tmp, mut a) = app(vec![]);
+        let ctx = egui::Context::default();
+        let frame = |a: &mut App, events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| a.dialogs(ctx));
+        };
+        a.show_check();
+        assert!(matches!(a.dialog, Some(Dialog::Check(_))));
+        frame(&mut a, Vec::new());
+        assert!(matches!(a.dialog, Some(Dialog::Check(_))), "stays open without a key");
+        frame(
+            &mut a,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(a.dialog.is_none());
+    }
+
+    #[test]
     fn check_rules_added_changed_and_deleted_in_the_dialog_are_kept_checked_and_undone() {
         use crate::rules_form::{Change, RuleRow, change, rows_of};
         use wc_core::check_rule::CheckRule;
@@ -10251,6 +10423,19 @@ mod tests {
     }
 
     #[test]
+    fn set_project_schema_offers_every_title_block_value_it_takes() {
+        let spec = specs().into_iter().find(|t| t["name"] == "set_project").unwrap();
+        let types = &spec["input_schema"]["properties"]["title_block"]["additionalProperties"]["type"];
+        let types: Vec<&str> = types.as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        for kind in ["string", "null", "number", "boolean"] {
+            assert!(types.contains(&kind), "{kind} is not offered: {types:?}");
+        }
+        for kind in ["object", "array"] {
+            assert!(!types.contains(&kind), "{kind} is offered but refused: {types:?}");
+        }
+    }
+
+    #[test]
     fn get_report_offers_and_reads_every_report() {
         let (_tmp, mut a) = app(vec![]);
         let spec = specs().into_iter().find(|t| t["name"] == "get_report").unwrap();
@@ -10663,6 +10848,39 @@ mod tests {
 
         call(&mut a, "set_project", json!({"title_block": {"customer": "ACME"}})).unwrap();
         assert_eq!(a.open.as_ref().unwrap().project.meta.title_block["customer"], "ACME");
+        // A number is taken as its text; null clears a field rather than writing "null".
+        call(
+            &mut a,
+            "set_project",
+            json!({"title_block": {"project_number": 1234, "plant": "North"}}),
+        )
+        .unwrap();
+        assert_eq!(
+            a.open.as_ref().unwrap().project.meta.title_block["project_number"],
+            "1234"
+        );
+        call(&mut a, "set_project", json!({"title_block": {"customer": null}})).unwrap();
+        assert!(
+            !a.open
+                .as_ref()
+                .unwrap()
+                .project
+                .meta
+                .title_block
+                .contains_key("customer")
+        );
+        // An object or list value, or a title_block that is no object, is refused and changes
+        // nothing, the name with it.
+        let before = a.open.as_ref().unwrap().project.meta.clone();
+        for bad in [
+            json!({"name": "Renamed", "title_block": {"plant": {"a": 1}}}),
+            json!({"name": "Renamed", "title_block": {"plant": ["x"]}}),
+            json!({"name": "Renamed", "title_block": "plant"}),
+            json!({"name": "Renamed", "title_block": null}),
+        ] {
+            assert!(call(&mut a, "set_project", bad.clone()).is_err(), "{bad}");
+        }
+        assert_eq!(a.open.as_ref().unwrap().project.meta, before);
 
         assert!(
             call(&mut a, "get_report", json!({"kind": "devices"}))
@@ -11958,6 +12176,36 @@ mod tests {
             unreachable!("a second line is pasted: {:?}", page2(&a).graphics);
         };
         assert_eq!(*from, on);
+    }
+
+    #[test]
+    fn paste_onto_a_smaller_page_with_no_pointer_on_the_sheet_keeps_the_copy_on_the_page() {
+        let (_tmp, mut a) = app(vec![]);
+        // Near the lower right of an A3 sheet: below it is past the edge of an A4 one (#1545).
+        call(
+            &mut a,
+            "add_graphic",
+            json!({"page": "p0002", "shape": {"kind": "line", "a": {"x": 380, "y": 250}, "b": {"x": 390, "y": 250}}}),
+        )
+        .unwrap();
+        a.ed.page = 1;
+        call(&mut a, "select_items", json!({"page": "p0002", "ids": ["g0"]})).unwrap();
+        a.run(Action::Copy);
+        let open = a.open.as_mut().unwrap();
+        if let Some(p) = open.project.pages.get_mut(1) {
+            p.size = PageSize::A4;
+        }
+        a.ed.cursor = None;
+        a.run(Action::Paste);
+        assert_eq!(a.ed.message, "Pasted 1 item.");
+        let Some(Shape::Line { a: from, .. }) = page2(&a).graphics.get(1) else {
+            unreachable!("a line is pasted: {:?}", page2(&a).graphics);
+        };
+        assert_eq!(
+            *from,
+            Point::new(10.0, 10.0),
+            "near the top-left corner of the A4 sheet"
+        );
     }
 
     #[test]

@@ -108,10 +108,19 @@ impl PanelItem {
     }
 
     /// The outline the item covers on the plate, as (top-left, bottom-right): a rail is 35 mm
-    /// tall about its centre line, a duct is its rectangle, a device is turned as it stands.
+    /// tall about its centre line, running left from `at` when its length is negative; a duct
+    /// is its rectangle, a device is turned as it stands.
     pub fn bounds(&self) -> (Point, Point) {
         match self {
-            PanelItem::Rail { at, length } => (Point::new(at.x, at.y - 17.5), Point::new(at.x + length, at.y + 17.5)),
+            PanelItem::Rail { at, length } => {
+                // A NaN length is kept as it is, so a check on the plate still refuses it.
+                let (left, right) = if *length < 0.0 {
+                    (at.x + length, at.x)
+                } else {
+                    (at.x, at.x + length)
+                };
+                (Point::new(left, at.y - 17.5), Point::new(right, at.y + 17.5))
+            }
             PanelItem::Duct { min, max } => (
                 Point::new(min.x.min(max.x), min.y.min(max.y)),
                 Point::new(min.x.max(max.x), min.y.max(max.y)),
@@ -517,7 +526,7 @@ pub struct Arranged {
 /// Put the project's devices that have a part and are not on the plate yet onto its rails, in
 /// tag order, left to right and then rail by rail, each centred on its rail. A device that would
 /// stick out over the plate's top or bottom edge on a rail goes on a later rail where it does not,
-/// or is listed as not fitting. Door-mounted parts ([`on_door`]) are left out. `location` (such as `CAB1`, with or without
+/// or is listed as not fitting; only the part of a rail on the plate is used. Door-mounted parts ([`on_door`]) are left out. `location` (such as `CAB1`, with or without
 /// the `+`) keeps only devices in that location. Devices already placed stay where they are.
 pub fn arrange(
     panel: &mut Panel,
@@ -573,7 +582,8 @@ pub fn arrange(
                     // along the same row does not use up this one.
                     .filter(|(min, max)| min.y <= at.y && max.y >= at.y && max.x > at.x && min.x < at.x + length)
                     .map(|(_, max)| max.x + GAP)
-                    .fold(at.x, f64::max);
+                    // A rail starting left of the plate is used from the plate's edge.
+                    .fold(at.x.max(0.0), f64::max);
                 Some((*at, *length, used_to))
             }
             _ => None,
@@ -605,7 +615,8 @@ pub fn arrange(
             {
                 x = past;
             }
-            let along = x + w <= at.x + *length + 1e-9;
+            // Only the part of the rail that lies on the plate counts.
+            let along = x + w <= (at.x + *length).min(panel.width) + 1e-9;
             if along && on_plate {
                 panel.items.push(PanelItem::Device {
                     tag: tag.clone(),
@@ -1270,6 +1281,25 @@ mod tests {
     }
 
     #[test]
+    fn a_rail_drawn_right_to_left_has_its_outline_from_its_left_end_and_drags_on_the_plate() {
+        let mut rail = PanelItem::Rail {
+            at: Point::new(300.0, 100.0),
+            length: -200.0,
+        };
+        assert_eq!(rail.bounds(), (Point::new(100.0, 82.5), Point::new(300.0, 117.5)));
+        // Dragged far right on a 400 mm plate, its right end stops at the edge.
+        rail.move_on_plate(Point::new(900.0, 100.0), 400.0, 300.0);
+        assert_eq!(rail.bounds(), (Point::new(200.0, 82.5), Point::new(400.0, 117.5)));
+        // A NaN length still makes an outline no plate takes.
+        let nan = PanelItem::Rail {
+            at: Point::new(10.0, 100.0),
+            length: f64::NAN,
+        };
+        let (a, b) = nan.bounds();
+        assert!(!outline_on_plate(400.0, 300.0, a, b));
+    }
+
+    #[test]
     fn a_duct_moves_whole_and_stays_on_the_plate() {
         let mut duct = PanelItem::Duct {
             min: Point::new(0.0, 0.0),
@@ -1423,5 +1453,55 @@ mod tests {
             Some((Point::new(10.0, 105.0), Point::new(55.0, 195.0))),
             "the empty left rail takes it from its own left end"
         );
+    }
+
+    #[test]
+    fn arrange_uses_only_the_part_of_a_rail_on_the_plate() {
+        // One rail starts 30 mm left of the plate, the other runs 50 mm past its right edge.
+        let mut panel = Panel::new("p", "P", 200.0, 300.0);
+        panel.items.push(PanelItem::Rail {
+            at: Point::new(-30.0, 75.0),
+            length: 100.0,
+        });
+        panel.items.push(PanelItem::Rail {
+            at: Point::new(100.0, 225.0),
+            length: 150.0,
+        });
+        let mut project = Project::new("x");
+        let mut parts = BTreeMap::new();
+        let mut part = Part {
+            id: "c".into(),
+            ..Default::default()
+        };
+        part.properties.insert("Width".into(), "45".into());
+        part.properties.insert("Height".into(), "90".into());
+        parts.insert("c".to_string(), part);
+        let tags: Vec<DeviceTag> = ["-K1", "-K2", "-K3", "-K4"].iter().filter_map(|t| tag(t)).collect();
+        for t in &tags {
+            project.devices.insert(
+                t.clone(),
+                Device {
+                    part: Some("c".into()),
+                    ..Default::default()
+                },
+            );
+        }
+        let done = arrange(&mut panel, &project, &parts, None);
+        // 0..70 on the plate holds one 45 mm device; 100..200 holds two.
+        assert_eq!(done.placed.len(), 3, "{done:?}");
+        assert_eq!(done.did_not_fit, vec![tags[3].to_string()]);
+        assert_eq!(
+            panel.device(&tags[0]).and_then(PanelItem::device_bounds),
+            Some((Point::new(0.0, 30.0), Point::new(45.0, 120.0)))
+        );
+        for t in &tags[..3] {
+            let Some((min, max)) = panel.device(t).and_then(PanelItem::device_bounds) else {
+                unreachable!()
+            };
+            assert!(
+                panel.outline_fits(min, max.x - min.x, max.y - min.y),
+                "{t} at {min:?} is on the plate"
+            );
+        }
     }
 }

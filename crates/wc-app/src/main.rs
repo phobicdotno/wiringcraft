@@ -857,6 +857,7 @@ impl App {
         if let Some(d) = dir {
             app.open_dir(&d, &mut prefs);
         }
+        app.chrome = chrome::ChromeState::with_ribbon_tab(prefs.ribbon_tab);
         app.prefs = prefs;
         app
     }
@@ -1998,11 +1999,16 @@ impl App {
             Action::Paste => {
                 // At the pointer when it is over the sheet, otherwise a little below the original.
                 // The pointer on the desk beside the sheet would paste off the page (#1293).
+                // Below the original is off a smaller page, or past an edge: then near the
+                // sheet's top-left corner (#1545).
+                let near = |p: wc_core::geom::Point| p + wc_core::geom::Point::new(10.0, 10.0);
+                let below = Some(near(self.clipboard.anchor)).filter(|&at| canvas::on_paper(open, page, at));
                 let at = self
                     .ed
                     .cursor
                     .filter(|&at| canvas::on_paper(open, page, at))
-                    .unwrap_or(self.clipboard.anchor + wc_core::geom::Point::new(10.0, 10.0));
+                    .or(below)
+                    .unwrap_or(near(wc_core::geom::Point::new(0.0, 0.0)));
                 match open.paste(page, &self.clipboard, at) {
                     Ok(pasted) if !pasted.is_empty() => {
                         self.ed.message = format!(
@@ -3545,7 +3551,8 @@ impl App {
                             keep = false;
                             then = Some(Box::new(|app: &mut App| app.edit_rules()));
                         }
-                        if ui.button("Close").clicked() {
+                        // Escape closes the list, as it does the other read-only dialogs.
+                        if ui.button("Close").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
                             keep = false;
                         }
                     });
@@ -5883,6 +5890,11 @@ impl eframe::App for App {
             ctx.open_url(egui::OpenUrl::new_tab(url));
         }
         let mut actions = chrome::show(ctx, self.prefs.chrome, &mut self.chrome, &status);
+        // A ribbon tab the user opened is the one the ribbon opens on next time.
+        if self.chrome.ribbon_tab != self.prefs.ribbon_tab {
+            self.prefs.ribbon_tab = self.chrome.ribbon_tab;
+            self.prefs.save();
+        }
         if self.importing.is_none() {
             actions = self.route_menu_to_symbol_editor(actions);
         }

@@ -401,6 +401,7 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
     // Unnamed terminals are numbered in order; a repeated name gets a mark and a count
     // (`x`, `x'`, `x'2`, ...), so names stay short however often one repeats. The names the
     // file gives are taken first, so an unnamed terminal's number never renames a named one.
+    // Spaces around a name are dropped, so ` 13 ` is the same terminal name as `13`.
     let mut used = std::collections::BTreeSet::new();
     let mut repeats: std::collections::BTreeMap<String, usize> = Default::default();
     let mut unique = |base: String| {
@@ -418,7 +419,7 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
     };
     let named: Vec<Option<String>> = pins
         .iter()
-        .map(|(name, ..)| (!name.trim().is_empty()).then(|| unique(name.clone())))
+        .map(|(name, ..)| (!name.trim().is_empty()).then(|| unique(name.trim().to_owned())))
         .collect();
     let mut out_pins: Vec<Pin> = Vec::new();
     for (i, ((_, at, dir), name)) in pins.into_iter().zip(named).enumerate() {
@@ -668,13 +669,29 @@ fn shape(
         "dynamic_text" => *dynamic_at = n("x").zip(n("y")).map(|(x, y)| pt(x, y)),
         "terminal" => match (n("x"), n("y")) {
             (Some(x), Some(y)) => {
-                let dir = match attr(e, "orientation").as_deref() {
+                let name = attr(e, "name").unwrap_or_default();
+                let orientation = attr(e, "orientation");
+                let dir = match orientation.as_deref().map(str::trim) {
                     Some("n") => PinDir::Up,
                     Some("e") => PinDir::Right,
                     Some("w") => PinDir::Left,
-                    _ => PinDir::Down,
+                    Some("s") => PinDir::Down,
+                    // Anything else still imports, pointing down, but the user is told.
+                    other => {
+                        let which = match name.trim() {
+                            "" => format!("at {x}, {y}"),
+                            named => format!("{named:?}"),
+                        };
+                        let why = match other {
+                            None => "has no orientation".to_owned(),
+                            Some(v) => format!("has an unknown orientation {v:?}"),
+                        };
+                        bad.borrow_mut()
+                            .push(format!("<terminal> {which} {why}; it points down"));
+                        PinDir::Down
+                    }
                 };
-                pins.push((attr(e, "name").unwrap_or_default(), pt(x, y), dir));
+                pins.push((name, pt(x, y), dir));
             }
             _ => skip(),
         },
@@ -1226,6 +1243,20 @@ mod tests {
     }
 
     #[test]
+    fn terminal_names_lose_surrounding_spaces() -> Result<()> {
+        let el = r#"<definition type="element"><description>
+<line x1="0" y1="0" x2="0" y2="20"/>
+<terminal x="0" y="0" orientation="n" name=" 13 "/>
+<terminal x="0" y="10" orientation="s" name="13"/>
+<terminal x="0" y="20" orientation="s" name="   "/>
+</description></definition>"#;
+        let (imp, _) = element(el, "qet.x", 1.0)?;
+        let names: Vec<&str> = imp.symbol.pins.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["13", "13'", "3"]);
+        Ok(())
+    }
+
+    #[test]
     fn too_many_terminals_and_huge_coordinates_are_errors() {
         let many = format!(
             "<definition type=\"element\"><description>{}</description></definition>",
@@ -1256,5 +1287,37 @@ mod tests {
             1.0,
         );
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn a_terminal_without_a_known_orientation_points_down_with_a_warning() -> Result<()> {
+        let el = r#"<definition type="element"><description>
+<terminal x="0" y="0" orientation="s" name="1"/>
+<terminal x="0" y="10" name="2"/>
+<terminal x="5" y="10" orientation="up"/>
+</description></definition>"#;
+        let (imp, warnings) = element(el, "qet.x", 1.0)?;
+        let dirs: Vec<PinDir> = imp.symbol.pins.iter().map(|p| p.dir).collect();
+        assert_eq!(dirs, vec![PinDir::Down; 3]);
+        assert_eq!(
+            warnings,
+            vec![
+                "<terminal> \"2\" has no orientation; it points down".to_owned(),
+                "<terminal> at 5, 10 has an unknown orientation \"up\"; it points down".to_owned(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_orientation_with_spaces_around_it_is_still_read() -> Result<()> {
+        let el = r#"<definition type="element"><description>
+<terminal x="0" y="0" orientation=" n " name="1"/>
+</description></definition>"#;
+        let (imp, warnings) = element(el, "qet.x", 1.0)?;
+        let dirs: Vec<PinDir> = imp.symbol.pins.iter().map(|p| p.dir).collect();
+        assert_eq!(dirs, vec![PinDir::Up]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        Ok(())
     }
 }
