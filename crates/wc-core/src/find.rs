@@ -374,6 +374,7 @@ pub fn replace_renaming(
     // A renamed strip's spares that are not renamed themselves go with it, so their new tags
     // must be free, also of the other renames and of each other.
     let mut spare_targets: std::collections::BTreeSet<DeviceTag> = std::collections::BTreeSet::new();
+    let drawn = p.tag_index();
     for (from, to) in &renames {
         for spare in p
             .meta
@@ -387,7 +388,7 @@ pub fn replace_renaming(
             if !p.devices.contains_key(&old) || renames.contains_key(&old) {
                 continue;
             }
-            let held = p.devices.contains_key(&new) && !renames.contains_key(&new);
+            let held = (p.devices.contains_key(&new) || drawn.contains_key(&new)) && !renames.contains_key(&new);
             if held || targets.contains_key(&new) || !spare_targets.insert(new.clone()) {
                 return Err(format!("{new} is already used."));
             }
@@ -411,10 +412,17 @@ pub fn replace_renaming(
     let mut order: Vec<(&DeviceTag, &DeviceTag)> = renames.iter().collect();
     order.sort_by_key(|(from, _)| std::cmp::Reverse(from.product.len()));
     for (from, to) in order {
+        // The strip's spares go through the placeholder too, so their tags there must be free.
+        let spares: Vec<String> = p.meta.strip_layout(from).map(|l| l.spares.clone()).unwrap_or_default();
         let temp = loop {
             let t = DeviceTag::parse(&format!("-WCFIND{next}")).map_err(|e| e.to_string())?;
             next += 1;
-            if !used.contains(&t) {
+            let spare_free = spares.iter().all(|n| {
+                let mut s = t.clone();
+                s.product.push(n.clone());
+                !used.contains(&s)
+            });
+            if !used.contains(&t) && spare_free {
                 break t;
             }
         };
@@ -426,27 +434,33 @@ pub fn replace_renaming(
         // A device no page draws changes only its entry: still one change.
         changed += p.rename_device(temp, to).max(1);
     }
-    // A spare renamed along with its strip (`-X12.S2` -> `-X15.S5` with `-X12` -> `-X15`) keeps
-    // its place on the rail under its new number.
+    // A terminal or spare renamed along with its strip (`-X12.S2` -> `-X15.S5` with `-X12` ->
+    // `-X15`) keeps its place on the rail under its new number. Each layout's numbers are
+    // mapped from one snapshot, so `S1` -> `S11` and `S11` -> `S1111` do not run into each other.
     let split = |t: &DeviceTag| {
         let mut strip = t.clone();
         strip.product.pop().map(|n| (strip, n))
     };
+    let mut numbers: BTreeMap<DeviceTag, BTreeMap<String, String>> = BTreeMap::new();
     for (from, to) in &renames {
         let (Some((old_strip, old_n)), Some((new_strip, new_n))) = (split(from), split(to)) else {
             continue;
         };
-        if renames.get(&old_strip) != Some(&new_strip) {
-            continue;
+        if renames.get(&old_strip) == Some(&new_strip) {
+            numbers.entry(new_strip).or_default().insert(old_n, new_n);
         }
-        if let Some(l) = p.meta.strips.iter_mut().find(|l| l.strip == new_strip)
-            && l.spares.contains(&old_n)
-            && !l.spares.contains(&new_n)
-        {
-            for n in l.spares.iter_mut().chain(l.order.iter_mut()) {
-                if *n == old_n {
-                    *n = new_n.clone();
+    }
+    for l in &mut p.meta.strips {
+        if let Some(map) = numbers.get(&l.strip) {
+            for list in [&mut l.spares, &mut l.order] {
+                let mut out: Vec<String> = Vec::new();
+                for n in list.iter() {
+                    let m = map.get(n).unwrap_or(n);
+                    if !out.contains(m) {
+                        out.push(m.clone());
+                    }
                 }
+                *list = out;
             }
         }
     }
@@ -757,6 +771,84 @@ mod tests {
             Err("-X4.S1 is already used.".into())
         );
         assert_eq!(p, before);
+    }
+
+    #[test]
+    fn strip_numbers_and_spare_tags_follow_a_rename() {
+        let opts = FindOptions { match_case: true };
+        let sym = |id: &str, t: &str| PlacedSymbol {
+            id: id.into(),
+            symbol: "wc.terminal".into(),
+            at: Point::new(40.0, 20.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: Some(tag(t)),
+        };
+        let layout = |strip: &str, order: &[&str], spares: &[&str]| crate::project::StripLayout {
+            strip: tag(strip),
+            order: order.iter().map(|n| n.to_string()).collect(),
+            spares: spares.iter().map(|n| n.to_string()).collect(),
+        };
+        let part = Device {
+            part: Some("A".into()),
+            ..Default::default()
+        };
+        let all = |p: &Project, q: &str| -> Vec<Hit> {
+            find(p, q, opts)
+                .into_iter()
+                .filter(|h| h.kind == FindKind::Tag)
+                .collect()
+        };
+
+        // Drawn terminals renamed with their strip keep their rail order.
+        let mut p = Project::new("Strip");
+        let mut pg = Page::new("p1", "1", "Strip");
+        pg.symbols = vec![sym("a", "-X12"), sym("b", "-X12.2"), sym("c", "-X12.1")];
+        p.pages = vec![pg];
+        p.meta.strips = vec![layout("-X12", &["2", "1"], &[])];
+        let hits = all(&p, "2");
+        assert!(replace(&mut p, &hits, "2", "5", opts).is_ok());
+        assert_eq!(p.meta.strips, [layout("-X15", &["5", "1"], &[])]);
+
+        // Spare numbers are mapped from one snapshot: S1 -> S11 and S11 -> S1111.
+        let mut p = Project::new("Strip");
+        let mut pg = Page::new("p1", "1", "Strip");
+        pg.symbols = vec![sym("a", "-X1")];
+        p.pages = vec![pg];
+        p.meta.strips = vec![layout("-X1", &["S1", "S11"], &["S1", "S11"])];
+        p.devices.insert(tag("-X1.S1"), part.clone());
+        p.devices.insert(tag("-X1.S11"), part.clone());
+        let hits = all(&p, "1");
+        assert!(replace(&mut p, &hits, "1", "11", opts).is_ok());
+        let l = &p.meta.strips[0];
+        assert_eq!(
+            (l.spares.as_slice(), l.order.as_slice()),
+            (
+                &["S11".to_owned(), "S1111".to_owned()][..],
+                &["S11".to_owned(), "S1111".to_owned()][..]
+            )
+        );
+
+        // A spare may not move onto a drawn tag, nor go through a placeholder whose spare tag
+        // is in use.
+        let mut p = Project::new("Strip");
+        let mut pg = Page::new("p1", "1", "Strip");
+        pg.symbols = vec![sym("a", "-X1"), sym("b", "-X2.S1")];
+        p.pages = vec![pg];
+        p.meta.strips = vec![layout("-X1", &[], &["S1"])];
+        p.devices.insert(tag("-X1.S1"), part.clone());
+        let hits: Vec<Hit> = all(&p, "X1").into_iter().filter(|h| h.value == "-X1").collect();
+        let before = p.clone();
+        assert_eq!(
+            replace(&mut p, &hits, "X1", "X2", opts),
+            Err("-X2.S1 is already used.".into())
+        );
+        assert_eq!(p, before);
+        p.pages[0].symbols.pop();
+        p.devices.insert(tag("-WCFIND0.S1"), Device::default());
+        assert!(replace(&mut p, &hits, "X1", "X2", opts).is_ok());
+        assert_eq!(p.devices.get(&tag("-X2.S1")), Some(&part));
+        assert_eq!(p.devices.get(&tag("-WCFIND0.S1")), Some(&Device::default()));
     }
 
     #[test]
