@@ -461,7 +461,7 @@ pub fn specs() -> Vec<Value> {
         tool(
             "set_project",
             "Rename the project, set title-block fields (customer, project_number, plant, drawn_by, checked_by, revision, date, or any other; an empty or null value removes one) and set or remove the logo.",
-            json!({"name": {"type": "string"}, "title_block": {"type": "object", "additionalProperties": {"type": "string"}}, "logo": {"type": "string", "description": "A PNG or JPEG file in the project folder (path relative to it) to make the logo; it is copied into pictures/ when it is elsewhere. An empty text removes the logo (its file stays)."}}),
+            json!({"name": {"type": "string"}, "title_block": {"type": "object", "additionalProperties": {"type": ["string", "null", "number", "boolean"]}, "description": "The project's title-block fields to change, such as customer and project_number. A number or yes/no is taken as its text; an empty text or null clears a field; fields left out are kept."}, "logo": {"type": "string", "description": "A PNG or JPEG file in the project folder (path relative to it) to make the logo; it is copied into pictures/ when it is elsewhere. An empty text removes the logo (its file stays)."}}),
             &[],
         ),
         tool(
@@ -2045,8 +2045,10 @@ impl App {
                 // Like update_page: null (or an empty text) clears a field, and a value that is
                 // no text is refused rather than stored as its JSON spelling. A number or yes/no
                 // is still taken as its text, as a project number is often given as a number.
+                // Only a title_block left out is no change: an explicit null is refused like
+                // any other value that is no object, so it does not rename on its own.
                 match v.get("title_block") {
-                    None | Some(Value::Null) => {}
+                    None => {}
                     Some(Value::Object(map)) => {
                         for (k, val) in map {
                             let val = match val {
@@ -10267,6 +10269,19 @@ mod tests {
     }
 
     #[test]
+    fn set_project_schema_offers_every_title_block_value_it_takes() {
+        let spec = specs().into_iter().find(|t| t["name"] == "set_project").unwrap();
+        let types = &spec["input_schema"]["properties"]["title_block"]["additionalProperties"]["type"];
+        let types: Vec<&str> = types.as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        for kind in ["string", "null", "number", "boolean"] {
+            assert!(types.contains(&kind), "{kind} is not offered: {types:?}");
+        }
+        for kind in ["object", "array"] {
+            assert!(!types.contains(&kind), "{kind} is offered but refused: {types:?}");
+        }
+    }
+
+    #[test]
     fn get_report_offers_and_reads_every_report() {
         let (_tmp, mut a) = app(vec![]);
         let spec = specs().into_iter().find(|t| t["name"] == "get_report").unwrap();
@@ -10707,6 +10722,7 @@ mod tests {
             json!({"name": "Renamed", "title_block": {"plant": {"a": 1}}}),
             json!({"name": "Renamed", "title_block": {"plant": ["x"]}}),
             json!({"name": "Renamed", "title_block": "plant"}),
+            json!({"name": "Renamed", "title_block": null}),
         ] {
             assert!(call(&mut a, "set_project", bad.clone()).is_err(), "{bad}");
         }
