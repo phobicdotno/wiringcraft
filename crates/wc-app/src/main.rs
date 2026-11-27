@@ -343,6 +343,9 @@ struct App {
     show_layers: bool,
     /// The project check that runs after each edit (Check while drawing).
     live: live_check::LiveCheck,
+    /// The open Project check list was opened from the live-check count in the status bar:
+    /// it shows the live check's latest findings, not those of when it was opened.
+    check_follows_live: bool,
     /// A base project being fetched from a git URL for a new project, off the window thread.
     fetch: Option<BaseFetch>,
     /// File > Import running on a worker thread ([`App::poll_import`]).
@@ -850,6 +853,7 @@ impl App {
             show_layers: false,
             strip_editor: None,
             live: Default::default(),
+            check_follows_live: false,
             fetch: None,
             importing: None,
             after_typed: Vec::new(),
@@ -1531,6 +1535,10 @@ impl App {
             return;
         }
         let earlier = self.pending.take();
+        if a == Action::Check {
+            // Check project shows a check run now, which the live check must not replace.
+            self.check_follows_live = false;
+        }
         self.carry_out(a);
         // The turn for the symbol on the pointer belongs to the place tool: an action that
         // leaves it sets the turn back, also before the canvas is next drawn.
@@ -3568,6 +3576,7 @@ impl App {
                             && let Some(o) = self.open.as_ref()
                         {
                             *found = run_check(o);
+                            self.check_follows_live = false;
                         }
                         if ui
                             .button("Rules…")
@@ -4479,6 +4488,7 @@ impl App {
     /// Show the project check, run now.
     fn show_check(&mut self) {
         if let Some(o) = self.open.as_ref() {
+            self.check_follows_live = false;
             self.dialog = Some(Dialog::Check(run_check(o)));
         }
     }
@@ -6042,7 +6052,7 @@ impl eframe::App for App {
                     )
                 });
                 if panels::status_bar(ui, self.open.as_ref(), &self.ed, live) {
-                    self.dialog = Some(Dialog::Check(self.ed.live.clone()));
+                    self.show_live_check_list();
                 }
             });
         self.assistant_panel(ctx);
@@ -6203,6 +6213,8 @@ impl App {
         let Some(o) = self.open.as_ref().filter(|_| self.prefs.live_check) else {
             self.live.clear();
             self.ed.live.clear();
+            // The list keeps the findings it shows once there is no live check to follow.
+            self.check_follows_live = false;
             return;
         };
         // A keystroke, a click or a drag may edit (even one that does not report itself in the
@@ -6232,6 +6244,27 @@ impl App {
         }
         if let Some(after) = poll.again {
             ctx.request_repaint_after(after);
+        }
+        self.follow_live_check();
+    }
+
+    /// Show the Project check list from the live-check count: it follows the live check's
+    /// findings while it is open, so it does not go stale as the check finds more.
+    fn show_live_check_list(&mut self) {
+        self.dialog = Some(Dialog::Check(self.ed.live.clone()));
+        self.check_follows_live = true;
+    }
+
+    /// Bring the check list opened from the live-check count up to the latest live findings;
+    /// any other dialog (or none) ends the following.
+    fn follow_live_check(&mut self) {
+        match &mut self.dialog {
+            Some(Dialog::Check(found)) if self.check_follows_live => {
+                if *found != self.ed.live {
+                    found.clone_from(&self.ed.live);
+                }
+            }
+            _ => self.check_follows_live = false,
         }
     }
 
@@ -7892,6 +7925,7 @@ mod nudge_tests {
             strip_editor: None,
             show_layers: false,
             live: Default::default(),
+            check_follows_live: false,
             fetch: None,
             importing: None,
             after_typed: Vec::new(),
@@ -9735,6 +9769,7 @@ mod menu_action_tests {
             strip_editor: None,
             show_layers: false,
             live: Default::default(),
+            check_follows_live: false,
             fetch: None,
             importing: None,
             after_typed: Vec::new(),

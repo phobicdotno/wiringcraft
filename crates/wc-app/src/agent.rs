@@ -4364,6 +4364,7 @@ mod tests {
             strip_editor: None,
             show_layers: false,
             live: Default::default(),
+            check_follows_live: false,
             fetch: None,
             importing: None,
             after_typed: Vec::new(),
@@ -12751,5 +12752,38 @@ mod tests {
         escape_in_panel_view(&mut a);
         assert_eq!(panel_device_at(&a), first);
         a.share.stop();
+    }
+
+    #[test]
+    fn the_check_list_from_the_live_count_follows_the_live_check() {
+        let (_tmp, mut a) = app(vec![]);
+        let f = |message: &str| wc_report::Finding {
+            severity: wc_report::Severity::Error,
+            page_id: None,
+            item: None,
+            message: message.into(),
+        };
+        let shown = |a: &App| match &a.dialog {
+            Some(Dialog::Check(found)) => found.iter().map(|f| f.message.clone()).collect::<Vec<_>>(),
+            _ => vec!["(the check list is not open)".to_string()],
+        };
+        a.ed.live = vec![f("one")];
+        a.show_live_check_list();
+        a.ed.live = vec![f("one"), f("two")];
+        a.follow_live_check();
+        assert_eq!(shown(&a), ["one", "two"], "follows what the live check found since");
+        // Check project shows a check run now: the live findings no longer replace it.
+        a.show_check();
+        let run = shown(&a);
+        a.ed.live = vec![f("three")];
+        a.follow_live_check();
+        assert_eq!(shown(&a), run);
+        // Closed, and opened again from the count: it follows again.
+        a.dialog = None;
+        a.follow_live_check();
+        a.show_live_check_list();
+        a.ed.live = vec![f("four")];
+        a.follow_live_check();
+        assert_eq!(shown(&a), ["four"]);
     }
 }
