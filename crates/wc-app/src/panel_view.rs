@@ -379,6 +379,26 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
         }
     }
     let p = open.project.panels.get(panel).cloned().unwrap_or(p);
+    // A right-click on a device, rail or duct picks it and offers the toolbar's edits for it, as
+    // on a schematic page; a right-click drag still pans the view.
+    if resp.secondary_clicked() {
+        ed.panel_pick = pointer.and_then(|at| item_at(&p.items, at));
+    }
+    let actions = ed.panel_pick.and_then(|i| p.items.get(i)).map_or(&[][..], menu_actions);
+    if !actions.is_empty() {
+        resp.context_menu(|ui| {
+            for &a in actions {
+                let info = a.info();
+                if ui
+                    .add(egui::Button::new(info.label).shortcut_text(info.shortcut))
+                    .clicked()
+                {
+                    ed.menu_action = Some(a);
+                    ui.close_menu();
+                }
+            }
+        });
+    }
 
     // The plate.
     let plate = Rect::from_two_pos(xf.s(Point::new(0.0, 0.0)), xf.s(Point::new(pw, ph)));
@@ -559,6 +579,17 @@ pub fn show(ui: &mut egui::Ui, open: &mut Open, ed: &mut Editor, panel: usize, s
         FontId::proportional(12.0),
         t.muted,
     );
+}
+
+/// The right-click menu's commands for a picked panel item: a device turns and comes off the
+/// plate, a rail or duct only comes off. The picked one is left in [`Editor::menu_action`] for
+/// the app to run, as its toolbar button would be.
+fn menu_actions(item: &PanelItem) -> &'static [crate::actions::Action] {
+    use crate::actions::Action;
+    match item {
+        PanelItem::Device { .. } => &[Action::Rotate, Action::Delete],
+        PanelItem::Rail { .. } | PanelItem::Duct { .. } => &[Action::Delete],
+    }
 }
 
 /// ", turned 90°" for a turned device, nothing for an upright one.
@@ -1448,5 +1479,94 @@ mod tests {
             rotation: wc_core::geom::Rotation::R0,
         });
         drag_ends_when_another_step_comes(o, ed, 2, Point::new(420.0, 180.0), Point::new(520.0, 180.0));
+    }
+
+    /// The secondary button pressed or let go at `pos`.
+    fn secondary(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// Where the frame painted the text `label`, the topmost one first.
+    fn painted(ran: &harness::Ran, label: &str) -> Option<egui::Pos2> {
+        ran.out.shapes.iter().rev().find_map(|c| match &c.shape {
+            egui::Shape::Text(t) if t.galley.text() == label => Some(t.visual_bounding_rect().center()),
+            _ => None,
+        })
+    }
+
+    /// A right-click on a rail picks it and opens a menu with Delete (no Rotate: a rail does not
+    /// turn); Delete there leaves the command for the app to run, as the toolbar does (#1131).
+    #[test]
+    fn right_click_on_a_rail_picks_it_and_offers_delete() {
+        let (_tmp, mut o, mut ed) = plate_with_rail_and_duct();
+        let h = Harness::new();
+        h.frame(&mut o, &mut ed, Vec::new());
+        let at = h.to_screen(&ed, Point::new(150.0, 100.0));
+        h.frame(
+            &mut o,
+            &mut ed,
+            vec![egui::Event::PointerMoved(at), secondary(at, true)],
+        );
+        h.frame(&mut o, &mut ed, vec![secondary(at, false)]);
+        assert_eq!(ed.panel_pick, Some(1), "the rail is picked");
+        let ran = h.frame(&mut o, &mut ed, Vec::new());
+        assert!(painted(&ran, "Rotate").is_none(), "a rail does not turn");
+        let Some(delete) = painted(&ran, "Delete") else {
+            unreachable!("the menu offers Delete")
+        };
+        h.frame(&mut o, &mut ed, vec![egui::Event::PointerMoved(delete)]);
+        h.frame(&mut o, &mut ed, vec![primary(delete, true)]);
+        h.frame(&mut o, &mut ed, vec![primary(delete, false)]);
+        assert_eq!(ed.menu_action, Some(crate::actions::Action::Delete));
+        assert_eq!(o.project.panels[0].items.len(), 2, "the app runs it, not the view");
+    }
+
+    /// A right-click on a device offers Rotate as well; a right-click drag pans the view and
+    /// picks nothing.
+    #[test]
+    fn right_click_on_a_device_offers_rotate_and_a_right_drag_pans() {
+        let (_tmp, mut o, mut ed) = rail_with_device_at_its_end();
+        ed.panel_pick = None;
+        let h = Harness::new();
+        h.frame(&mut o, &mut ed, Vec::new());
+        let Some(PanelItem::Device { at, width, height, .. }) = o.project.panels[0].items.get(2).cloned() else {
+            unreachable!("the device is item 2")
+        };
+        let at = h.to_screen(&ed, Point::new(at.x + width / 2.0, at.y + height / 2.0));
+        // Drag first: the view moves and nothing is picked.
+        let offset = ed.view.offset;
+        h.frame(
+            &mut o,
+            &mut ed,
+            vec![egui::Event::PointerMoved(at), secondary(at, true)],
+        );
+        for k in 1..=3 {
+            h.frame(
+                &mut o,
+                &mut ed,
+                vec![egui::Event::PointerMoved(at + Vec2::new(10.0 * k as f32, 0.0))],
+            );
+        }
+        h.frame(&mut o, &mut ed, vec![secondary(at + Vec2::new(30.0, 0.0), false)]);
+        let ran = h.frame(&mut o, &mut ed, Vec::new());
+        assert_ne!(ed.view.offset, offset, "the drag pans");
+        assert_eq!(ed.panel_pick, None);
+        assert!(painted(&ran, "Delete").is_none(), "and opens no menu");
+        // Then a right-click on the device where it is now.
+        let at = at + (ed.view.offset - offset);
+        h.frame(
+            &mut o,
+            &mut ed,
+            vec![egui::Event::PointerMoved(at), secondary(at, true)],
+        );
+        h.frame(&mut o, &mut ed, vec![secondary(at, false)]);
+        assert_eq!(ed.panel_pick, Some(2));
+        let ran = h.frame(&mut o, &mut ed, Vec::new());
+        assert!(painted(&ran, "Rotate").is_some() && painted(&ran, "Delete").is_some());
     }
 }
