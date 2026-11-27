@@ -1596,7 +1596,11 @@ enum VcsCmd {
     /// Merge another branch into the current one; conflicting files are listed.
     Merge {
         /// The branch to merge.
-        name: String,
+        #[arg(required_unless_present = "abort")]
+        name: Option<String>,
+        /// Undo a merge that stopped on conflicts instead, restoring the files.
+        #[arg(long, conflicts_with = "name")]
+        abort: bool,
     },
     /// History as a subway map (terminal), or as SVG with --svg.
     Log {
@@ -4928,17 +4932,28 @@ fn vcs_cmd(dir: &Path, vc: VcsCmd) -> Res<()> {
             }
         }
         VcsCmd::Switch { name } => git.switch(&name).map_err(e)?,
-        VcsCmd::Merge { name } => match git.merge(&name).map_err(e)? {
-            wc_vcs::MergeOutcome::UpToDate => println!("already up to date"),
-            wc_vcs::MergeOutcome::Merged => println!("merged {name}"),
-            wc_vcs::MergeOutcome::Conflicts(files) => {
-                println!("conflicts in:");
-                for f in files {
-                    println!("  {f}");
+        VcsCmd::Merge { abort: true, .. } => {
+            git.abort_merge().map_err(e)?;
+            println!("merge aborted");
+        }
+        VcsCmd::Merge { name, .. } => {
+            // Clap requires a name unless `--abort` was given.
+            let name = name.unwrap_or_default();
+            match git.merge(&name).map_err(e)? {
+                wc_vcs::MergeOutcome::UpToDate => println!("already up to date"),
+                wc_vcs::MergeOutcome::Merged => println!("merged {name}"),
+                wc_vcs::MergeOutcome::Conflicts(files) => {
+                    println!("conflicts in:");
+                    for f in files {
+                        println!("  {f}");
+                    }
+                    return Err(
+                    "resolve the files, then `wiringcraft vcs commit`, or undo the merge with `wiringcraft vcs merge --abort`"
+                        .into(),
+                );
                 }
-                return Err("resolve the files, then `wiringcraft vcs commit`".into());
             }
-        },
+        }
         VcsCmd::Log { svg, limit } => {
             let rows = wc_vcs::history(&git, limit).map_err(e)?;
             match svg {

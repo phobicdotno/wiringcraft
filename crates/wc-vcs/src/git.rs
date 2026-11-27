@@ -566,7 +566,15 @@ impl Git {
         }
     }
 
+    /// Undo a merge that stopped on conflicts, bringing the files back to how they were before
+    /// it. Says so plainly when no merge is in progress.
     pub fn abort_merge(&self) -> Result<()> {
+        if !self.git_path("MERGE_HEAD")?.exists() {
+            return Err(Error::Git {
+                args: "merge --abort".into(),
+                message: "no merge in progress".into(),
+            });
+        }
         self.run(&["merge", "--abort"])?;
         Ok(())
     }
