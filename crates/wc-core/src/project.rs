@@ -649,8 +649,18 @@ pub fn location_rows(rows: &[(String, String)]) -> Result<Vec<Location>, String>
             description: description.trim().to_owned(),
         });
     }
-    out.sort_by(|a, b| a.path.cmp(&b.path));
+    sort_locations(&mut out);
     Ok(out)
+}
+
+/// Sort locations in natural order of their paths, as tags are listed: `+CAB2` before `+CAB10`.
+/// Paths alike in natural order (`L01` and `L1`) keep a fixed order by their text.
+pub fn sort_locations(locations: &mut [Location]) {
+    locations.sort_by(|a, b| {
+        natural_key(&a.path)
+            .cmp(&natural_key(&b.path))
+            .then_with(|| a.path.cmp(&b.path))
+    });
 }
 
 /// A location of the project, such as a cabinet or a room.
@@ -693,12 +703,12 @@ impl ProjectMeta {
             Some(l) => {
                 l.path = path;
                 l.description = description;
-                self.locations.sort_by(|a, b| a.path.cmp(&b.path));
+                sort_locations(&mut self.locations);
                 Ok(true)
             }
             None => {
                 self.locations.push(Location { path, description });
-                self.locations.sort_by(|a, b| a.path.cmp(&b.path));
+                sort_locations(&mut self.locations);
                 Ok(true)
             }
         }
@@ -744,7 +754,7 @@ impl ProjectMeta {
             Some(_) => false,
             None => {
                 self.locations.push(loc);
-                self.locations.sort_by(|a, b| a.path.cmp(&b.path));
+                sort_locations(&mut self.locations);
                 true
             }
         }
@@ -2768,6 +2778,31 @@ mod tests {
         let l7: Vec<&Location> = m.locations.iter().filter(|l| l.path.ends_with("L7")).collect();
         assert_eq!(l7.len(), 1, "no second entry");
         assert_eq!((l7[0].path.as_str(), l7[0].description.as_str()), ("L7", "Desk 2"));
+    }
+
+    #[test]
+    fn locations_are_kept_in_natural_order() -> Result<(), String> {
+        let paths = |l: &[Location]| l.iter().map(|l| l.path.clone()).collect::<Vec<_>>();
+        let want = ["CAB2", "CAB2.R2", "CAB2.R10", "CAB10"];
+        let mut m = ProjectMeta::new("t");
+        for p in ["CAB10", "CAB2.R10", "CAB2", "CAB2.R2"] {
+            m.set_location(p, "")?;
+        }
+        assert_eq!(paths(&m.locations), want);
+        let mut m = ProjectMeta::new("t");
+        for p in ["CAB10", "CAB2.R10", "CAB2", "CAB2.R2"] {
+            m.merge_location(Location {
+                path: p.into(),
+                description: String::new(),
+            });
+        }
+        assert_eq!(paths(&m.locations), want);
+        let rows: Vec<(String, String)> = ["+CAB10", "CAB2.R10", "CAB2", "+CAB2.R2"]
+            .into_iter()
+            .map(|p| (p.to_owned(), String::new()))
+            .collect();
+        assert_eq!(paths(&location_rows(&rows)?), want);
+        Ok(())
     }
 
     #[test]
