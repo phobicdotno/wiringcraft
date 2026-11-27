@@ -5084,6 +5084,39 @@ fn a_device_drawn_twice_lists_its_pages_in_page_order() {
 }
 
 #[test]
+fn project_check_warns_once_about_a_symbol_with_two_pins_of_one_name() {
+    let (mut p, mut s, parts) = fixture();
+    s.insert("no2".into(), sym("no2", SymbolRole::Auxiliary, &["13", "14", "13"]));
+    p.pages[0].symbols.push(place("s20", "no2", 300.0, Some("=A+C1-K1")));
+    p.pages[0].symbols.push(place("s21", "no2", 320.0, Some("=A+C1-K1")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found = check(&i);
+    let twice: Vec<&Finding> = found
+        .iter()
+        .filter(|f| f.message.contains("more than one pin"))
+        .collect();
+    assert_eq!(twice.len(), 1, "{found:?}");
+    assert_eq!(twice[0].severity, Severity::Warning);
+    assert_eq!(twice[0].item.as_deref(), Some("s20"));
+    assert_eq!(
+        twice[0].message,
+        "symbol no2 has more than one pin named 13: wires reach only the first"
+    );
+    // Symbols whose pins all differ are not told.
+    let (p, s, parts) = fixture();
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    assert!(!check(&i).iter().any(|f| f.message.contains("more than one pin")));
+}
+
+#[test]
 fn terminals_tagged_with_only_their_strip_are_not_drawn_twice_but_one_number_is() {
     let (mut p, mut s, parts) = fixture();
     // Two more -X2 terminals: the strip numbers them 2 and 3, they are three terminals.
