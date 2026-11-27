@@ -1,14 +1,16 @@
 #!/usr/bin/env sh
 # Build a small motor-starter project from the command line and export it to PDF.
 # Usage: examples/demo.sh [output-folder]   (run from the repository root)
+# Set WIRINGCRAFT to the absolute path of a built wiringcraft binary to use it
+# instead of `cargo run`.
 set -eu
 OUT=${1:-target/demo}
-WC="cargo run -q -p wc-cli --"
+WC=${WIRINGCRAFT:-"cargo run -q -p wc-cli --"}
 LIB=$(pwd)/library
 rm -rf "$OUT"
 $WC new "$OUT" --name "Pump station P1"
 cd "$OUT"
-WC="cargo run -q --manifest-path $OLDPWD/Cargo.toml -p wc-cli --"
+[ -n "${WIRINGCRAFT:-}" ] || WC="cargo run -q --manifest-path $OLDPWD/Cargo.toml -p wc-cli --"
 $WC lib add starter folder "$LIB"
 $WC page add p0002 --number 2 --title "Main circuit"
 $WC page add p0003 --number 3 --title "Control circuit"
