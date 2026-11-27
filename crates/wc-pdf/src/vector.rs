@@ -852,6 +852,8 @@ pub fn dxf(page: &PageDrawing) -> String {
             }
             Prim::Text {
                 at,
+                anchor,
+                align,
                 height,
                 angle,
                 text,
@@ -867,6 +869,14 @@ pub fn dxf(page: &PageDrawing) -> String {
                 pair(1, &dxf_text(text));
                 if *angle != 0.0 {
                     pair(50, &num(angle.rem_euclid(360.0)));
+                }
+                // A CAD program draws the text in its own font, wider or narrower than the
+                // PDF's: a centred or right-aligned text keeps its alignment and the point it
+                // lines up at (11/21), which the program places it by.
+                if matches!(align, 1 | 2) {
+                    pair(72, &align.to_string());
+                    pair(11, &num(anchor.0));
+                    pair(21, &num(y(anchor.1)));
                 }
             }
         }
