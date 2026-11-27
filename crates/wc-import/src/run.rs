@@ -518,7 +518,10 @@ pub fn archive(dir: &Path, file: &Path, first_page: usize, lib: Option<&Path>, l
         }
         // Read first: an entry that cannot be read writes nothing and keeps its prefix free.
         let read = match read_kicad(&String::from_utf8_lossy(&data), &prefix, 1.0, log) {
-            Ok(symbols) if symbols.is_empty() => continue,
+            Ok(symbols) if symbols.is_empty() => {
+                err!(log, "warning: {name}: no symbol could be imported");
+                continue;
+            }
             Ok(symbols) => symbols,
             Err(err) => {
                 err!(log, "warning: {name}: {err}");
@@ -2111,6 +2114,30 @@ mod tests {
         let want: Vec<String> = (0..3).map(|i| (MAX_FIRST_PAGE + i).to_string()).collect();
         assert_eq!(numbers, want, "{}", log.text());
         assert!(p.page(&format!("pdf-{}", MAX_FIRST_PAGE + 1)).is_some());
+    }
+
+    #[test]
+    fn a_kicad_library_with_no_symbols_in_an_archive_is_warned_about() {
+        let tmp = tmp();
+        let dir = tmp.path().join("p");
+        assert!(store::save(&dir, &Project::new("t")).is_ok());
+        let file = tmp.path().join("plant.zip");
+        let empty: &[u8] = b"(kicad_symbol_lib (version 20231120))";
+        let bytes = zip_of(&[("a.pdf", &one_page_pdf()), ("empty.kicad_sym", empty)]);
+        assert!(std::fs::write(&file, bytes).is_ok());
+        let lib = tmp.path().join("lib");
+        let mut log = Log::default();
+        let r = archive(&dir, &file, 1, Some(&lib), &mut log);
+        assert!(r.is_ok(), "{r:?}");
+        let warnings: Vec<_> = log.warnings().collect();
+        assert_eq!(
+            warnings,
+            vec!["warning: empty.kicad_sym: no symbol could be imported"],
+            "{}",
+            log.text()
+        );
+        // The other entries still come in.
+        assert!(matches!(load(&dir), Ok(p) if p.pages.len() == 1));
     }
 
     #[test]

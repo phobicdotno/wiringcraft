@@ -3661,21 +3661,19 @@ fn document_properties_show_drawn_by_and_the_description() {
     project
         .meta
         .title_block
-        .insert("drawn_by".into(), "Kari Nordmann".into());
+        .insert("drawn_by".into(), "Сергей Иванов 日本".into());
     project
         .meta
         .title_block
         .insert("description".into(), "Pumpe – Ålesund".into());
     let dict = info(&project);
-    assert!(
-        dict.contains(&format!("/Author {}", writer::pdf_text_string("Kari Nordmann"))),
-        "{dict}"
-    );
-    let Some(at) = dict.find("/Subject ") else {
-        unreachable!("no subject in {dict}");
+    // Both entries decode back to the text as typed, independent of the encoder.
+    let entry = |key: &str| -> Option<String> {
+        let at = dict.find(key)?;
+        decode_text_string(dict[at + key.len()..].split_whitespace().next()?)
     };
-    let subject = dict[at + "/Subject ".len()..].split_whitespace().next().unwrap_or("");
-    assert_eq!(decode_text_string(subject).as_deref(), Some("Pumpe – Ålesund"));
+    assert_eq!(entry("/Author ").as_deref(), Some("Сергей Иванов 日本"), "{dict}");
+    assert_eq!(entry("/Subject ").as_deref(), Some("Pumpe – Ålesund"), "{dict}");
     // The title still comes first, next to the producer.
     assert!(dict.contains(&format!("/Title {} /Producer", writer::pdf_text("Pump station"))));
 
