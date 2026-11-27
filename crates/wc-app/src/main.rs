@@ -355,6 +355,9 @@ struct App {
     after_typed: Vec<Action>,
     /// A window close the person asked for, while it waits for a typed value or is let through.
     closing: Closing,
+    /// The window title last sent: it is sent again only when it changes, as the window would
+    /// otherwise be retitled on every frame.
+    title: String,
 }
 
 /// File > Import running on a worker thread, and what to do with the project when it ends.
@@ -860,6 +863,7 @@ impl App {
             importing: None,
             after_typed: Vec::new(),
             closing: Closing::No,
+            title: String::new(),
         };
         let dir = dir.or_else(|| prefs.recent.first().cloned());
         if let Some(d) = dir {
@@ -6253,7 +6257,10 @@ impl eframe::App for App {
             ),
             None => "WiringCraft".into(),
         };
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        if title != self.title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.title = title;
+        }
     }
 }
 
@@ -8113,6 +8120,7 @@ mod nudge_tests {
             importing: None,
             after_typed: Vec::new(),
             closing: Closing::No,
+            title: String::new(),
         };
         (tmp, app, egui::Context::default())
     }
@@ -8604,6 +8612,46 @@ mod nudge_tests {
         let sent = app_frame(&mut app, &ctx, Vec::new(), true);
         assert!(!sent.contains(&CancelClose));
         assert!(app.dialog.is_none());
+    }
+
+    /// The window title is sent once when it changes, not on every frame (#1544).
+    #[test]
+    fn the_window_title_is_sent_only_when_it_changes() {
+        let titles = |sent: Vec<egui::ViewportCommand>| {
+            sent.into_iter()
+                .filter_map(|c| match c {
+                    egui::ViewportCommand::Title(t) => Some(t),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let (_tmp, mut app, ctx) = app(Point::new(55.0, 60.0), false);
+        theme::install_fonts(&ctx);
+        app.open.as_mut().unwrap().save().unwrap();
+        let name = app.open.as_ref().unwrap().project.meta.name.clone();
+        let first = titles(app_frame(&mut app, &ctx, Vec::new(), false));
+        assert_eq!(
+            first,
+            vec![format!("{name} – WiringCraft")],
+            "the first frame titles the window"
+        );
+        let again = titles(app_frame(&mut app, &ctx, Vec::new(), false));
+        assert!(again.is_empty(), "nothing changed: not sent again, got {again:?}");
+        // A real edit (the selected coil nudged left) makes the project unsaved.
+        let mut dirty = titles(app_frame(
+            &mut app,
+            &ctx,
+            vec![key(Key::ArrowLeft, Modifiers::NONE)],
+            false,
+        ));
+        assert!(app.open.as_ref().unwrap().dirty, "the nudge is not saved yet");
+        dirty.extend(titles(app_frame(&mut app, &ctx, Vec::new(), false)));
+        assert_eq!(
+            dirty,
+            vec![format!("• {name} – WiringCraft")],
+            "the unsaved marker shows"
+        );
+        assert!(titles(app_frame(&mut app, &ctx, Vec::new(), false)).is_empty());
     }
 
     /// Escape answers the unsaved-changes question as Cancel: the window stays open, the
@@ -10014,6 +10062,7 @@ mod menu_action_tests {
             importing: None,
             after_typed: Vec::new(),
             closing: Closing::No,
+            title: String::new(),
         };
         (tmp, app, id)
     }
