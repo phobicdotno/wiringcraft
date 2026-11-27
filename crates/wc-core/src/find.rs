@@ -102,9 +102,15 @@ fn one_part(a: char, b: char) -> bool {
     (a.is_alphabetic() && b.is_alphabetic()) || (a.is_numeric() && b.is_numeric())
 }
 
+/// Whether a match may not end between `a` and `b`: [`one_part`], or a number and the letter
+/// that follows it (`1` and `A` in `-K1A`, which is another device than `-K1`).
+fn one_part_at_end(a: char, b: char) -> bool {
+    one_part(a, b) || (a.is_numeric() && b.is_alphabetic())
+}
+
 /// The char positions in `hay` where `needle` starts, without overlaps, left to right. With
 /// `whole_parts` only where it covers whole runs of letters and of digits, so `-K1` is not
-/// found in `-K15`.
+/// found in `-K15`, and where no letter follows its last digit, so not in `-K1A` either.
 fn positions(hay: &str, needle: &str, opts: FindOptions, whole_parts: bool) -> Vec<usize> {
     let h: Vec<char> = hay.chars().collect();
     let n: Vec<char> = needle.chars().collect();
@@ -124,8 +130,15 @@ fn positions(hay: &str, needle: &str, opts: FindOptions, whole_parts: bool) -> V
         let here = h
             .get(i..i + n.len())
             .is_some_and(|w| w.iter().zip(&n).all(|(&a, &b)| same(a, b)));
-        let cut = |at: usize| matches!((at.checked_sub(1).and_then(|b| h.get(b)), h.get(at)), (Some(&a), Some(&b)) if one_part(a, b));
-        if here && !(whole_parts && (cut(i) || cut(i + n.len()))) {
+        let around = |at: usize| {
+            at.checked_sub(1)
+                .and_then(|b| h.get(b))
+                .copied()
+                .zip(h.get(at).copied())
+        };
+        let cut = around(i).is_some_and(|(a, b)| one_part(a, b))
+            || around(i + n.len()).is_some_and(|(a, b)| one_part_at_end(a, b));
+        if here && !(whole_parts && cut) {
             out.push(i);
             i += n.len();
         } else {
@@ -611,6 +624,10 @@ mod tests {
         assert_eq!(replace_in_tag("-K15", "5", "6", opts), "-K15");
         assert_eq!(replace_in_tag("-XK1", "K1", "K2", opts), "-XK1", "K is half of XK");
         assert_eq!(replace_in_tag("-K15", "k", "Q", opts), "-Q15", "a whole letter code");
+        assert_eq!(replace_in_tag("-K1A", "-K1", "-K2", opts), "-K1A", "1A is one number");
+        assert_eq!(replace_in_tag("-K1A", "1", "2", opts), "-K1A");
+        assert_eq!(replace_in_tag("-K1A", "1A", "2B", opts), "-K2B");
+        assert_eq!(replace_in_tag("-K1.A", "-K1", "-K2", opts), "-K2.A");
         assert_eq!(replace_in_tag("=A1+C1-K1", "1", "2", opts), "=A2+C2-K2");
         assert_eq!(replace_in_tag("-X1.11", "X1", "X2", opts), "-X2.11");
         assert_eq!(replace_in_tag("-X1.11", "-X1.11", "-X1.1", opts), "-X1.1");
