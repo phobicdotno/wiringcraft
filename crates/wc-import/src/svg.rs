@@ -8,7 +8,7 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
 use wc_core::geom::{Align, Point, Shape};
 
-use crate::{Error, Result, make_symbol};
+use crate::{Error, Result, make_symbol, printable};
 
 /// 2D affine transform `[a c e; b d f]`.
 #[derive(Debug, Clone, Copy)]
@@ -55,6 +55,15 @@ impl M {
     /// (turns, mirrors and moves are fine; a `scale(2, 1)` or a skew is not).
     fn keeps_circles(&self) -> bool {
         let [a, b, c, d, ..] = self.0;
+        // Divided by the largest coefficient first, so a finite but huge stretch
+        // (`preserveAspectRatio="none"` over a viewBox 1e-199 high) can't square to infinity
+        // and pass as round. A transform of all zeros stays as it was.
+        let big = a.abs().max(b.abs()).max(c.abs()).max(d.abs());
+        let (a, b, c, d) = if big > 0.0 {
+            (a / big, b / big, c / big, d / big)
+        } else {
+            (a, b, c, d)
+        };
         let (x, y) = (a * a + b * b, c * c + d * d);
         // Relative to the transform's own scale, so a tiny `scale(0.00001 0.00002)` still counts
         // as stretched. A transform that shrinks to nothing leaves a dot either way.
@@ -322,20 +331,6 @@ fn viewbox_fit(w: f64, h: Option<f64>, vb: [f64; 4], par: &str) -> M {
         }
     };
     M([sx, 0.0, 0.0, sy, -vb[0] * sx, -vb[1] * sy])
-}
-
-/// The file's text, for a message: control characters (an ESC that would drive a terminal) are
-/// written as escapes.
-fn printable(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_control() {
-                c.escape_default().to_string()
-            } else {
-                c.to_string()
-            }
-        })
-        .collect()
 }
 
 fn num(e: &BytesStart, name: &str) -> f64 {
@@ -1381,6 +1376,28 @@ mod tests {
             })
             .collect();
         assert!(heights.len() == 1 && (heights[0] - 2.88).abs() < 1e-9, "{heights:?}");
+        // The same huge y scale turns a circle into a tall ellipse, not a dot-sized circle.
+        let tall = r#"<svg xmlns="http://www.w3.org/2000/svg" width="40mm" height="40mm" viewBox="0 0 80 1e-199" preserveAspectRatio="none">
+            <line x1="0" y1="0" x2="80" y2="0"/><circle cx="40" cy="5e-200" r="1e-200"/></svg>"#;
+        let s = symbol(tall, "svg.e", "E")?;
+        assert!(
+            !s.graphics.iter().any(|g| matches!(g, Shape::Circle { .. })),
+            "{:?}",
+            s.graphics
+        );
+        let ys: Vec<f64> = s
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Polyline { points, .. } if points.len() > 2 => {
+                    let lo = points.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
+                    let hi = points.iter().map(|p| p.y).fold(f64::NEG_INFINITY, f64::max);
+                    Some(hi - lo)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(ys.len() == 1 && (ys[0] - 8.0).abs() < 1e-6, "{ys:?}");
         Ok(())
     }
 
