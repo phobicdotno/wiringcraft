@@ -2295,3 +2295,147 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+
+    fn lex_all(b: &[u8]) -> Vec<Obj> {
+        let mut lx = Lexer::new(b);
+        let mut out = Vec::new();
+        while let Some(o) = lx.next(0) {
+            out.push(o);
+        }
+        out
+    }
+
+    fn parms(pairs: &[(&str, f64)]) -> BTreeMap<String, Obj> {
+        pairs.iter().map(|(k, v)| ((*k).to_owned(), Obj::Num(*v))).collect()
+    }
+
+    #[test]
+    fn names_decode_hex_escapes_and_keep_a_short_one() {
+        let toks = lex_all(b"/A#20B /C#4 /D#zzE /Plain");
+        assert_eq!(
+            toks,
+            vec![
+                Obj::Name("A B".into()),
+                Obj::Name("C#4".into()),
+                Obj::Name("D#zzE".into()),
+                Obj::Name("Plain".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn literal_strings_take_escapes_octal_nesting_and_line_continuations() {
+        let toks = lex_all(b"(a\\(b\\)c\\101\\7x\\n (in) \\q) (ab\\\ncd)");
+        assert_eq!(
+            toks,
+            vec![Obj::Str(b"a(b)cA\x07x\n (in) q".to_vec()), Obj::Str(b"abcd".to_vec()),]
+        );
+    }
+
+    #[test]
+    fn hex_strings_pad_an_odd_digit_and_skip_spaces() {
+        assert_eq!(lex_all(b"<41 4>"), vec![Obj::Str(vec![0x41, 0x40])]);
+        assert_eq!(lex_all(b"<>"), vec![Obj::Str(Vec::new())]);
+    }
+
+    #[test]
+    fn arrays_fold_references_and_words_become_values() {
+        let toks = lex_all(b"[1 0 R 2 R] true false null 3.5 1e999 % comment\n re");
+        assert_eq!(
+            toks,
+            vec![
+                Obj::Array(vec![Obj::Ref(1), Obj::Num(2.0), Obj::Op("R".into())]),
+                Obj::Bool(true),
+                Obj::Bool(false),
+                Obj::Null,
+                Obj::Num(3.5),
+                Obj::Num(0.0),
+                Obj::Op("re".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn deep_nesting_stops_without_overflowing() {
+        let deep = "[".repeat(10_000);
+        let toks = lex_all(deep.as_bytes());
+        assert!(matches!(toks.first(), Some(Obj::Array(_))));
+    }
+
+    #[test]
+    fn png_predictors_sub_up_average_and_paeth() {
+        // One gray 8-bit channel, three columns: each row is a filter byte and three samples.
+        let data = [1, 10, 5, 5, 2, 1, 1, 1, 3, 0, 0, 0, 4, 1, 1, 1, 0, 7, 8, 9];
+        let out = png_unpredict(&data, 1, 8, 3);
+        assert_eq!(out, Some(vec![10, 15, 20, 11, 16, 21, 5, 10, 15, 6, 11, 16, 7, 8, 9]));
+    }
+
+    #[test]
+    fn png_predictor_refuses_an_unknown_filter_and_drops_a_short_row() {
+        assert_eq!(png_unpredict(&[5, 1, 2, 3], 1, 8, 3), None);
+        assert_eq!(png_unpredict(&[0, 1, 2, 3, 0, 9], 1, 8, 3), Some(vec![1, 2, 3]));
+        // Two channels: the left neighbour is a whole pixel back.
+        assert_eq!(png_unpredict(&[1, 1, 2, 3, 4], 2, 8, 2), Some(vec![1, 2, 4, 6]));
+    }
+
+    #[test]
+    fn tiff_predictor_starts_again_on_each_row() {
+        let p = parms(&[("Predictor", 2.0), ("Columns", 2.0)]);
+        assert_eq!(unpredict(vec![1, 1, 5, 1], Some(&p)), Ok(vec![1, 2, 5, 6]));
+        let rgb = parms(&[("Predictor", 2.0), ("Colors", 3.0), ("Columns", 2.0)]);
+        assert_eq!(
+            unpredict(vec![1, 2, 3, 1, 1, 255], Some(&rgb)),
+            Ok(vec![1, 2, 3, 2, 3, 2])
+        );
+    }
+
+    #[test]
+    fn predictor_settings_that_cannot_work_are_refused() {
+        let data = vec![1, 2, 3];
+        assert_eq!(unpredict(data.clone(), None), Ok(data.clone()));
+        assert_eq!(
+            unpredict(data.clone(), Some(&parms(&[("Predictor", 1.0)]))),
+            Ok(data.clone())
+        );
+        for bad in [
+            parms(&[("Predictor", 12.0), ("Columns", 0.0)]),
+            parms(&[("Predictor", 12.0), ("Colors", 5.0)]),
+            parms(&[("Predictor", 12.0), ("BitsPerComponent", 32.0)]),
+        ] {
+            let Err(e) = unpredict(data.clone(), Some(&bad)) else {
+                unreachable!("{bad:?} was accepted")
+            };
+            assert!(e.contains("impossible"), "{e}");
+        }
+        let Err(e) = unpredict(data, Some(&parms(&[("Predictor", 2.0), ("BitsPerComponent", 16.0)]))) else {
+            unreachable!("a 16-bit TIFF predictor was accepted")
+        };
+        assert!(e.contains("not supported"), "{e}");
+    }
+
+    #[test]
+    fn font_maps_decode_one_and_two_byte_codes() {
+        let simple = FontMap::default();
+        assert_eq!(simple.decode(&[b'H', 0x07, b'i', 0x80, 0xe9]), "Hi\u{e9}");
+
+        let mut map = BTreeMap::new();
+        map.insert(0x0041, "A".to_owned());
+        map.insert(0x0002, "\n".to_owned());
+        map.insert(0x4100, "Z".to_owned());
+        let composite = FontMap { two_byte: true, map };
+        // Unmapped two-byte codes are dropped, mapped control text is filtered and an odd last
+        // byte reads as the high byte of a code.
+        assert_eq!(composite.decode(&[0x00, 0x41, 0x00, 0x42, 0x00, 0x02, 0x41]), "AZ");
+    }
+
+    #[test]
+    fn utf16_reads_surrogate_pairs_and_replaces_lone_halves() {
+        assert_eq!(utf16(&[0xd8, 0x3d, 0xde, 0x00]), "\u{1f600}");
+        assert_eq!(utf16(&[0xd8, 0x3d]), "\u{fffd}");
+        assert_eq!(utf16(&[0x00]), "\u{0}");
+    }
+}
