@@ -1729,6 +1729,65 @@ fn a_breaker_contact_points_to_its_breaker_and_a_coil_still_wins() {
 }
 
 #[test]
+fn a_breaker_lists_its_contacts_unless_a_coil_of_its_tag_does() {
+    // A breaker or MPCB lists its aux contacts under its symbol as a coil does (#1467).
+    let mut symbols = BTreeMap::new();
+    symbols.insert("mpcb".to_owned(), sym("mpcb", SymbolRole::Standalone, ["1", "2"]));
+    symbols.insert("coil".to_owned(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
+    symbols.insert("no".to_owned(), sym("no", SymbolRole::Auxiliary, ["13", "14"]));
+    let mut project = wc_core::Project::new("x");
+    let mut power = Page::new("p1", "1", "Power");
+    power.symbols.push(place("s1", "mpcb", 50.0, "-Q1"));
+    power.symbols.push(place("s2", "mpcb", 150.0, "-K1"));
+    let mut control = Page::new("p2", "2", "Control");
+    control.symbols.push(place("s3", "no", 50.0, "-Q1"));
+    control.symbols.push(place("s4", "coil", 100.0, "-K1"));
+    control.symbols.push(place("s5", "no", 150.0, "-K1"));
+    project.pages = vec![power, control];
+    let x = layout::CrossRefs::build(&project, &symbols);
+    let Some(page) = project.pages.first() else {
+        unreachable!("two pages")
+    };
+    let mut warnings = Vec::new();
+    let marks = layout::xref_marks(page, &symbols, &x, &mut warnings);
+    let listed: Vec<(&str, &str)> = marks
+        .iter()
+        .map(|m| (m.text.as_str(), m.target_page_id.as_str()))
+        .collect();
+    // -Q1 lists its contact; -K1's contact is listed under its coil, not again here.
+    assert_eq!(listed, [("13-14 2/2.B", "p2")], "{marks:?}");
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn a_breaker_contact_points_to_the_schematic_breaker_not_its_overview_copy() {
+    // An overview page (line diagram) before the schematic repeats the breaker (#1467).
+    let mut symbols = BTreeMap::new();
+    symbols.insert("mpcb".to_owned(), sym("mpcb", SymbolRole::Standalone, ["1", "2"]));
+    symbols.insert("no".to_owned(), sym("no", SymbolRole::Auxiliary, ["13", "14"]));
+    let mut project = wc_core::Project::new("x");
+    let mut overview = Page::new("p0", "0", "Overview");
+    overview.overview = true;
+    overview.symbols.push(place("s0", "mpcb", 50.0, "-Q1"));
+    let mut power = Page::new("p1", "1", "Power");
+    power.symbols.push(place("s1", "mpcb", 50.0, "-Q1"));
+    power.symbols.push(place("s2", "no", 150.0, "-Q1"));
+    project.pages = vec![overview, power];
+    let x = layout::CrossRefs::build(&project, &symbols);
+    let Some(page) = project.pages.get(1) else {
+        unreachable!("two pages")
+    };
+    let mut warnings = Vec::new();
+    let marks = layout::xref_marks(page, &symbols, &x, &mut warnings);
+    let back: Vec<&str> = marks
+        .iter()
+        .filter(|m| m.text.starts_with('>'))
+        .map(|m| m.target_page_id.as_str())
+        .collect();
+    assert_eq!(back, ["p1"], "{marks:?}");
+}
+
+#[test]
 fn an_interruption_point_does_not_point_to_its_copy_on_an_overview_page() {
     let mut symbols = BTreeMap::new();
     symbols.insert("arrow".to_owned(), sym("arrow", SymbolRole::Interruption, ["1", "2"]));
