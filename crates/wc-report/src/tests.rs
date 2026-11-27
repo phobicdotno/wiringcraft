@@ -3910,6 +3910,16 @@ fn check_warns_about_panel_rails_and_ducts_that_stick_out_of_the_plate() {
             min: Point::new(0.0, 280.0),
             max: Point::new(40.0, 320.0),
         },
+        // A corner that is not a number, which sorting the corners would hide.
+        PanelItem::Duct {
+            min: Point::new(f64::NAN, 10.0),
+            max: Point::new(40.0, 50.0),
+        },
+        // Corners written the other way round are still on the plate.
+        PanelItem::Duct {
+            min: Point::new(80.0, 50.0),
+            max: Point::new(60.0, 10.0),
+        },
     ];
     let Ok(k1) = DeviceTag::parse("=A+C1-K1") else {
         unreachable!()
@@ -3938,8 +3948,12 @@ fn check_warns_about_panel_rails_and_ducts_that_stick_out_of_the_plate() {
         has("panel Main: duct 0,280 to 40,320 sticks out of the plate"),
         "{found:?}"
     );
+    assert!(
+        has("panel Main: duct NaN,10 to 40,50 sticks out of the plate"),
+        "{found:?}"
+    );
     assert!(has("panel Main: =A+C1-K1 sticks out of the plate"), "{found:?}");
-    assert_eq!(found.len(), 3, "{found:?}");
+    assert_eq!(found.len(), 4, "{found:?}");
 }
 
 #[test]

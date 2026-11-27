@@ -462,7 +462,15 @@ pub fn check_with_unreadable(
                 }
                 wc_core::panel::PanelItem::Device { .. } => continue,
             };
-            if !on_plate(min, max) {
+            // `bounds` sorts a duct's corners with `min`/`max`, which drop a NaN, so the
+            // corners as written must be numbers too.
+            let written_finite = match it {
+                wc_core::panel::PanelItem::Duct { min, max } => {
+                    [min.x, min.y, max.x, max.y].iter().all(|v| v.is_finite())
+                }
+                _ => true,
+            };
+            if !written_finite || !on_plate(min, max) {
                 out.push(warn(format!("{what} sticks out of the plate")));
             }
         }
