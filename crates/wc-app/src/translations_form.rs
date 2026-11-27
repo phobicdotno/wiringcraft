@@ -238,8 +238,8 @@ pub fn show(ui: &mut egui::Ui, form: &mut Form) {
                     ui.label(egui::RichText::new(l).strong());
                 }
                 ui.end_row();
-                for (i, r) in form.rows.iter_mut().enumerate() {
-                    if hidden[i] {
+                for ((i, r), &hide) in form.rows.iter_mut().enumerate().zip(&hidden) {
+                    if hide {
                         continue;
                     }
                     ui.label(&r.text).on_hover_text(r.used.join("\n"));
@@ -379,6 +379,35 @@ mod tests {
         assert!(f.hidden(spare), "every row is translated: the table is empty");
         f.editing = Some(spare);
         assert!(!f.hidden(spare));
+    }
+
+    /// The texts `show` paints for `form` in one frame.
+    fn painted(form: &mut Form) -> Vec<String> {
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show(ui, form));
+        });
+        out.shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Text(t) => Some(t.galley.text().to_owned()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn only_missing_says_so_when_it_hides_every_row() {
+        const DONE: &str = "Every text has a translation into every language.";
+        let (_tmp, mut f) = form("source = \"en\"\n[[text]]\nen = \"Pumps\"\nnb = \"Pumper\"\n");
+        f.only_missing = true;
+        assert!(!painted(&mut f).iter().any(|t| t == DONE), "Spare still misses one");
+        let spare = f.rows.iter().position(|r| r.text == "Spare").unwrap();
+        f.rows[spare].cells[0] = "Reserve".into();
+        assert!(painted(&mut f).iter().any(|t| t == DONE), "every row is hidden");
+        // Without the filter nothing is hidden, so there is nothing to explain.
+        f.only_missing = false;
+        assert!(!painted(&mut f).iter().any(|t| t == DONE));
     }
 
     #[test]
