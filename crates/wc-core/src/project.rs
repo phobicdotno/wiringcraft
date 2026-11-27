@@ -748,9 +748,11 @@ impl ProjectMeta {
         let parsed = location_path(path);
         let raw = path.trim();
         let before = self.locations.len();
-        // The normal form first, then the path as typed (an entry stored as `+L1`).
+        // By normal form, so an entry stored as typed (`+L1`) goes by `L1` too, as
+        // [`Self::set_location`] finds it; then by the path as typed (an unreadable entry).
         if let Ok(key) = &parsed {
-            self.locations.retain(|l| l.path != *key);
+            self.locations
+                .retain(|l| l.path != *key && location_path(&l.path).as_ref() != Ok(key));
         }
         if self.locations.len() == before {
             self.locations.retain(|l| l.path != raw);
@@ -2810,6 +2812,13 @@ mod tests {
         });
         assert_eq!(m.remove_location("+L5"), Ok(()));
         assert!(!m.locations.iter().any(|l| l.path == "+L5"));
+        // Removed without its sign as well, as setting it would find it.
+        m.locations.push(Location {
+            path: "+L6".into(),
+            description: String::new(),
+        });
+        assert_eq!(m.remove_location("L6"), Ok(()));
+        assert!(!m.locations.iter().any(|l| l.path.ends_with("L6")));
         let why = m.remove_location("+L1-K1");
         assert!(why.as_ref().is_err_and(|e| e.contains("not a location")), "{why:?}");
         assert_eq!(m.locations.len(), 1);
