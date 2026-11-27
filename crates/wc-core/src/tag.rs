@@ -9,6 +9,15 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{Error, Result};
 
+/// Hyphens, dashes and minus signs that a tag pasted from a document may carry for `-`.
+const LOOKS_LIKE_DASH: [char; 9] = [
+    '\u{2010}', '\u{2011}', '\u{2012}', '\u{2013}', '\u{2014}', '\u{2015}', '\u{2212}', '\u{FE63}', '\u{FF0D}',
+];
+/// Small and full-width plus signs, for `+`.
+const LOOKS_LIKE_PLUS: [char; 2] = ['\u{FE62}', '\u{FF0B}'];
+/// Small and full-width equals signs, for `=`.
+const LOOKS_LIKE_EQUALS: [char; 2] = ['\u{FE66}', '\u{FF1D}'];
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct DeviceTag {
     pub function: Vec<String>,
@@ -75,19 +84,16 @@ impl DeviceTag {
                     current = Some(c);
                 }
                 c if c.is_alphanumeric() || c == '.' || c == '_' => buf.push(c),
-                // Pasted from a word processor or a PDF, a dash is often one of these.
-                '\u{2010}'..='\u{2015}'
-                | '\u{2212}'
-                | '\u{FE63}'
-                | '\u{FF0D}'
-                | '\u{FE62}'
-                | '\u{FF0B}'
-                | '\u{FE66}'
-                | '\u{FF1D}' => {
-                    return Err(Error::Tag(
-                        s.into(),
-                        "a sign that only looks like =, + or -: type the plain one",
-                    ));
+                // Pasted from a word processor or a PDF, a sign is often one that only looks
+                // like the plain one.
+                c if LOOKS_LIKE_DASH.contains(&c) => {
+                    return Err(Error::Tag(s.into(), "a sign that only looks like -: type a plain -"));
+                }
+                c if LOOKS_LIKE_PLUS.contains(&c) => {
+                    return Err(Error::Tag(s.into(), "a sign that only looks like +: type a plain +"));
+                }
+                c if LOOKS_LIKE_EQUALS.contains(&c) => {
+                    return Err(Error::Tag(s.into(), "a sign that only looks like =: type a plain ="));
                 }
                 _ => return Err(Error::Tag(s.into(), "only letters, digits, '.', '_' allowed")),
             }
@@ -202,28 +208,34 @@ mod tests {
             ("+C1..R2-K1", "the location aspect (+) has an empty level"),
             ("=-K1", "the function aspect (=) has no name"),
             ("K1", "must start with =, + or -"),
-            (
-                "\u{2013}K1",
-                "a sign that only looks like =, + or -: type the plain one",
-            ),
-            (
-                "=A+C1\u{2212}K1",
-                "a sign that only looks like =, + or -: type the plain one",
-            ),
-            (
-                "\u{FF0B}C1-K1",
-                "a sign that only looks like =, + or -: type the plain one",
-            ),
-            (
-                "=A\u{FF1D}B-K1",
-                "a sign that only looks like =, + or -: type the plain one",
-            ),
         ] {
             let Err(e) = DeviceTag::parse(bad) else {
                 unreachable!("{bad} should fail");
             };
             assert_eq!(e.to_string(), format!("invalid device tag {bad:?}: {why}"));
         }
+    }
+
+    #[test]
+    fn a_look_alike_sign_names_the_plain_one_to_type() {
+        let cases = [
+            (&LOOKS_LIKE_DASH[..], "=A+C1{}K1", '-'),
+            (&LOOKS_LIKE_PLUS[..], "=A{}C1-K1", '+'),
+            (&LOOKS_LIKE_EQUALS[..], "{}A+C1-K1", '='),
+        ];
+        for (signs, shape, plain) in cases {
+            for &c in signs {
+                let bad = shape.replace("{}", &c.to_string());
+                let Err(e) = DeviceTag::parse(&bad) else {
+                    unreachable!("{bad} should fail");
+                };
+                let why = format!("a sign that only looks like {plain}: type a plain {plain}");
+                assert_eq!(e.to_string(), format!("invalid device tag {bad:?}: {why}"));
+            }
+        }
+        // Every look-alike is caught, not only the common en dash.
+        let all = [LOOKS_LIKE_DASH.len(), LOOKS_LIKE_PLUS.len(), LOOKS_LIKE_EQUALS.len()];
+        assert_eq!(all, [9, 2, 2]);
     }
 
     #[test]
