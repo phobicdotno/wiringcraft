@@ -1156,7 +1156,8 @@ impl ProjectMeta {
             spares: l.spares.clone(),
         }
         .arrange(&drawn);
-        if !l.order.is_empty() && l.order.iter().eq(usual.iter().map(|(t, _)| t)) {
+        // The rail as arranged, not the stored order: that can leave out terminals drawn since.
+        if !l.order.is_empty() && l.arrange(&drawn) == usual {
             l.order.clear();
             self.drop_empty_layouts();
         }
@@ -2946,6 +2947,21 @@ mod tests {
         assert_eq!(rail(&m, &drawn), s(&["4", "1", "2", "S1"]));
         assert!(m.move_terminal(&x1, "4", 2, &current(&m))?);
         assert_eq!(m.strip_layout(&x1).map(|l| l.order.clone()), Some(vec![]));
+        // An order set before terminal 5 was drawn names only 1, 4 and the spare: with the
+        // spare off, the rail is in number order and the order goes, so 3 drawn later goes
+        // between 1 and 4.
+        let mut n = ProjectMeta::new("t");
+        let early = s(&["1", "4"]);
+        let rail_of = |m: &ProjectMeta, d: &[String]| m.strip_layout(&x1).map(|l| l.arrange(d)).unwrap_or_default();
+        n.add_spare(
+            &x1,
+            "S1",
+            Some("1"),
+            &early.iter().map(|t| (t.clone(), false)).collect::<Vec<_>>(),
+        )?;
+        let later = s(&["1", "4", "5"]);
+        assert!(n.remove_spare(&x1, "S1", &rail_of(&n, &later)));
+        assert!(n.strips.is_empty(), "{:?}", n.strips);
         // Without spares nothing is left of the layout.
         assert!(m.remove_spare(&x1, "S1", &current(&m)));
         assert!(m.move_terminal(&x1, "2", 0, &current(&m))?);
