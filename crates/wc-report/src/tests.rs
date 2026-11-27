@@ -1096,6 +1096,29 @@ fn project_check_finds_the_usual_mistakes() {
 }
 
 #[test]
+fn project_check_finds_a_short_made_only_of_wires() {
+    let (mut p, s, parts) = fixture();
+    let at = |x: f64| Endpoint::Point {
+        at: Point::new(x, 500.0),
+    };
+    // An L1 wire and an L2 wire meet at a junction, with no device pin on either.
+    p.pages[0].wires.push(wire("w8", at(0.0), at(10.0), None, Some("L1")));
+    p.pages[0].wires.push(wire("w9", at(10.0), at(20.0), None, Some("L2")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found = check(&i);
+    assert!(
+        found
+            .iter()
+            .any(|f| f.severity == Severity::Error && f.message == "potentials L1 and L2 are connected to each other"),
+        "{found:?}"
+    );
+}
+
+#[test]
 fn project_check_warns_about_parts_missing_from_the_library_copy() {
     let (mut p, s, parts) = fixture();
     // -P1 names a part the library copy lacks, as its main part and twice as an accessory;

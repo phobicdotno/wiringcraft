@@ -465,8 +465,9 @@ pub fn check_with_unreadable(
 
     cable_cores(i, &wire_net, &mut out);
 
-    // Shorts: one net carrying two potential names (for example L1 and L2).
-    let nets = wc_core::connectivity::nets_linked(p, |id| i.symbols.get(id).map(|s| s.role));
+    // Shorts: one net carrying two potential names (for example L1 and L2), also when only
+    // wires and junctions join them.
+    let nets = wc_core::connectivity::shorted_nets(p, |id| i.symbols.get(id).map(|s| s.role));
     for n in nets {
         let names: BTreeSet<&str> = n.names.iter().map(String::as_str).collect();
         if names.len() > 1 {
