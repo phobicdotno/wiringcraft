@@ -87,10 +87,20 @@ impl Beacon {
     }
 }
 
+/// A name from a beacon as a browser lists it: any device on the network can send one, so a
+/// control character (a line break, a tab, an escape) becomes a space and the ends are
+/// trimmed, keeping each session to one tidy row of the Join dialog.
+fn listable(name: &str) -> String {
+    let s: String = name.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    s.trim().to_owned()
+}
+
 /// A session a browser has heard of.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
+    /// The announced project name, with control characters turned into spaces.
     pub project: String,
+    /// The announced host name, with control characters turned into spaces.
     pub host: String,
     /// Where to connect to join: the sender's IP address with the announced port.
     pub addr: SocketAddr,
@@ -231,8 +241,8 @@ impl Browser {
                     if let Some(b) = Beacon::decode(&buf[..n.min(buf.len())]) {
                         let addr = SocketAddr::new(from.ip(), b.port);
                         let s = Session {
-                            project: b.project,
-                            host: b.host,
+                            project: listable(&b.project),
+                            host: listable(&b.host),
                             addr,
                             protocol: b.protocol,
                         };
