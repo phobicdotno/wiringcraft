@@ -216,7 +216,9 @@ a plain name on the device; `check` reports it.
 ### Pages from a table
 
 `macro generate` places a macro once per row of a table, so a list of motors, valves or I/O
-channels becomes schematic pages in one step:
+channels becomes schematic pages in one step. The example needs a macro `starter` (made in the
+app like `feeder` above) with the placeholders `kW` and `Section` and the value sets `0.75 kW`
+and `3 kW`:
 
 ```sh
 wiringcraft macro generate starter --table motors.csv --set "3 kW" --title Motors --size A3
@@ -237,10 +239,14 @@ Set;kW;Section
 - Any other column name is an error that lists the placeholders, so a typo is not ignored.
 - Every row is checked before anything is placed. A row that cannot be filled (no value set, an
   unknown set, a placeholder left without a value) places nothing, and the error names its line.
-- The copies go on new pages after the last page, numbered on from the highest page number and
+  So does a CSV file that ends inside a quoted cell. A row whose cells are all empty, such as
+  `;;`, is skipped like a blank line, as spreadsheets write those under the last row.
+- The copies go on new pages after the last page, numbered on from the last page's first number
+  (`12.3` gives `13`, `A7` gives `A8`) and
   titled `--title` (the macro's name if left out), in the `--size` given (A3 if left out). They
   are placed left to right, then row below row, inside the frame and above the title block,
-  10 mm apart, with the macro's anchor on the 5 mm grid. A full page starts the next one. A
+  10 mm apart (counting the widest text any copy draws), with the macro's anchor on the 5 mm
+  grid. A full page starts the next one. A
   macro larger than the page's drawing area is refused.
 - Tags are renumbered as `macro place` does them: three rows of a `-Q1` starter give `-Q1`,
   `-Q2` and `-Q3` (or the next free ones).

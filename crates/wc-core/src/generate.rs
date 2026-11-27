@@ -8,9 +8,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::geom::{Align, Shape};
 use crate::geom::{Point, bounds_of};
 use crate::macros::{Macro, key};
-use crate::project::{Endpoint, FRAME_MARGIN, Page, PageSize, Project};
+use crate::project::{Endpoint, FRAME_MARGIN, Page, PageSize, Project, natural_key};
 use crate::symbol::Symbol;
 use crate::{Error, Result};
 
@@ -44,7 +45,8 @@ enum Column {
 /// line or worksheet row of each of `cells` for messages (row `i` is line `i + 1` without it).
 pub fn rows_from_table(m: &Macro, cells: &[Vec<String>], lines: &[usize]) -> Result<Vec<TableRow>> {
     let line = |i: usize| lines.get(i).copied().unwrap_or(i + 1);
-    let bad = |why: String| Err(Error::Invalid(format!("macro {}: {why}", m.name)));
+    // Escaped: a macro's name comes from its file and could hold control characters.
+    let bad = |why: String| Err(Error::Invalid(format!("macro {:?}: {why}", m.name)));
     let Some((header, body)) = cells.split_first() else {
         return bad("the table is empty; its first row names the placeholders".into());
     };
@@ -119,33 +121,88 @@ pub fn apply_rows(m: &Macro, rows: &[TableRow], default_set: Option<&str>) -> Re
         .collect()
 }
 
-/// The box round everything `m` draws: its symbols (through `symbol`, a missing one as
-/// [`Symbol::unknown_bounds`]), its wires' free ends and bends, and its drawings.
-pub fn extent(m: &Macro, symbol: impl Fn(&str) -> Option<Symbol>) -> (Point, Point) {
+/// The box round everything the copies draw, so one pitch fits each of them: their symbols
+/// (through `symbol`, a missing one as [`Symbol::unknown_bounds`]) with their pins, their wires'
+/// free ends and bends, and their drawings, texts as wide as they are drawn (their filled-in
+/// values can differ from copy to copy).
+pub fn extent(copies: &[Macro], symbol: impl Fn(&str) -> Option<Symbol>) -> (Point, Point) {
     let mut pts = Vec::new();
-    for s in &m.symbols {
-        let (a, b) = match symbol(&s.symbol) {
-            Some(def) => def.placed_bounds(s.at, s.rotation, s.mirror),
-            None => Symbol::unknown_bounds(s.at),
-        };
-        pts.extend([a, b]);
-    }
-    for w in &m.wires {
-        for end in [&w.from, &w.to] {
-            if let Endpoint::Point { at } = end {
-                pts.push(*at);
+    for m in copies {
+        for s in &m.symbols {
+            match symbol(&s.symbol) {
+                Some(def) => {
+                    pts.push(s.at);
+                    for g in &def.graphics {
+                        drawn_points(&g.placed(s.at, s.rotation, s.mirror), &mut pts);
+                    }
+                    pts.extend(def.pins.iter().map(|pin| s.at + pin.at.transform(s.rotation, s.mirror)));
+                }
+                None => {
+                    let (a, b) = Symbol::unknown_bounds(s.at);
+                    pts.extend([a, b]);
+                }
             }
         }
-        pts.extend(w.via.iter().copied());
-    }
-    for g in &m.graphics {
-        let (a, b) = g.bounds();
-        pts.extend([a, b]);
+        for w in &m.wires {
+            for end in [&w.from, &w.to] {
+                if let Endpoint::Point { at } = end {
+                    pts.push(*at);
+                }
+            }
+            pts.extend(w.via.iter().copied());
+        }
+        for g in &m.graphics {
+            drawn_points(g, &mut pts);
+        }
     }
     if pts.is_empty() {
-        pts.push(m.anchor);
+        pts.extend(copies.first().map(|m| m.anchor));
     }
     bounds_of(&pts)
+}
+
+/// Points round what a shape draws: a text as wide as it is drawn ([`text_corners`]), and a
+/// dimension through its parts, so its measured-length label counts the same way.
+fn drawn_points(g: &Shape, pts: &mut Vec<Point>) {
+    match g {
+        Shape::Text {
+            at,
+            text,
+            height,
+            align,
+            angle,
+        } => pts.extend(text_corners(*at, text, *height, *align, *angle)),
+        Shape::Dimension { a, b, .. } => match g.dimension_parts() {
+            Some(parts) if !parts.is_empty() => parts.iter().for_each(|p| drawn_points(p, pts)),
+            _ => pts.extend([*a, *b]),
+        },
+        _ => {
+            let (a, b) = g.bounds();
+            pts.extend([a, b]);
+        }
+    }
+}
+
+/// The corners of the box a text is drawn in: `at` on its baseline, as wide as the PDF draws it
+/// ([`crate::font::text_width_mm`]) on the side its alignment gives, `height` above the
+/// baseline, turned `angle` degrees anticlockwise (y runs down).
+fn text_corners(at: Point, text: &str, height: f64, align: Align, angle: f64) -> [Point; 4] {
+    let width = crate::font::text_width_mm(text, height);
+    let (from, to) = match align {
+        Align::Left => (0.0, width),
+        Align::Center => (-width / 2.0, width / 2.0),
+        Align::Right => (-width, 0.0),
+    };
+    let (sin, cos) = angle.to_radians().sin_cos();
+    // Along the text, and up from its baseline.
+    let along = |u: f64| Point::new(u * cos, -u * sin);
+    let rise = Point::new(-height * sin, -height * cos);
+    [
+        at + along(from),
+        at + along(to),
+        at + along(from) + rise,
+        at + along(to) + rise,
+    ]
 }
 
 /// What [`generate`] added.
@@ -203,27 +260,34 @@ pub fn generate(
     let per_page = across.saturating_mul(down).max(1);
 
     let mut work = project.clone();
-    let mut next_number = work
+    // After the last page in page order (see `Project::sort_pages`): its first number, one up.
+    // `12.3` gives `13`, `A7` gives `A8`, so every new page sorts after every page there is.
+    let last = work
         .pages
         .iter()
-        .filter_map(|p| p.number.trim().parse::<u64>().ok())
+        .map(|p| natural_key(p.number.trim()))
         .max()
-        .unwrap_or(0);
+        .and_then(|key| key.into_iter().next());
+    let (prefix, mut next_number) = last.unwrap_or_default();
     let mut out = Generated::default();
     let mut page_id = String::new();
     for (i, m) in copies.iter().enumerate() {
         let slot = i % per_page;
         if slot == 0 {
             let mut n = 1u64;
-            while work.pages.iter().any(|p| p.id == format!("p{n:04}")) {
+            // Ids are told apart without regard to case, as the store does.
+            while work
+                .pages
+                .iter()
+                .any(|p| p.id.eq_ignore_ascii_case(&format!("p{n:04}")))
+            {
                 n += 1;
             }
             page_id = format!("p{n:04}");
-            next_number += 1;
-            while work.pages.iter().any(|p| p.number.trim() == next_number.to_string()) {
-                next_number += 1;
-            }
-            let mut page = Page::new(page_id.clone(), next_number.to_string(), title);
+            next_number = next_number
+                .checked_add(1)
+                .ok_or_else(|| Error::Invalid(format!("no page number is left after {prefix}{next_number}")))?;
+            let mut page = Page::new(page_id.clone(), format!("{prefix}{next_number}"), title);
             page.size = size;
             work.pages.push(page);
             out.pages.push(page_id.clone());
@@ -382,7 +446,7 @@ mod tests {
             .collect();
         let copies = apply_rows(&m, &rows, None)?;
         // The coil drawn as an unknown symbol: 8 mm round (20, 30), with the wire up to y 10.
-        let ext = extent(&copies[0], |_| None);
+        let ext = extent(&copies, |_| None);
         assert_eq!(ext, (Point::new(16.0, 10.0), Point::new(24.0, 34.0)));
         let generated = generate(&mut project, &copies, ext, PageSize::A4, "Motors")?;
         assert_eq!(generated.copies, 60);
@@ -405,6 +469,134 @@ mod tests {
         }
         assert_eq!(tags.len(), 60);
         assert!(project.devices.values().all(|d| d.description == "Motor 0.75 kW"));
+        Ok(())
+    }
+
+    #[test]
+    fn the_extent_holds_every_copy_s_texts_and_the_pins() -> Result<()> {
+        let m = starter()?;
+        let label = |text: &str| -> Result<Macro> {
+            let mut c = m.apply(Some("small"), &BTreeMap::new())?;
+            c.graphics.push(Shape::Text {
+                at: Point::new(20.0, 40.0),
+                text: text.into(),
+                height: 5.0,
+                align: Align::Left,
+                angle: 0.0,
+            });
+            Ok(c)
+        };
+        let (short, long) = (label("M1")?, label("Main extract fan, north wing")?);
+        let width = crate::font::text_width_mm("Main extract fan, north wing", 5.0);
+        let (_, max) = extent(&[short.clone(), long.clone()], |_| None);
+        assert!((max.x - (20.0 + width)).abs() < 1e-9, "{max:?}");
+        // The copies stay apart on the page: the second starts past the long label.
+        let mut project = Project::new("x");
+        let copies = [long.clone(), short, long];
+        let ext = extent(&copies, |_| None);
+        generate(&mut project, &copies, ext, PageSize::A3, "Fans")?;
+        let xs: Vec<f64> = project
+            .pages
+            .iter()
+            .flat_map(|p| p.symbols.iter().map(|s| s.at.x))
+            .collect();
+        assert!(xs.windows(2).all(|w| w[1] - w[0] >= width + GAP - 1e-9), "{xs:?}");
+        // A pin far out on a symbol that draws nothing counts too.
+        let def = Symbol {
+            id: "wc.coil".into(),
+            pins: vec![crate::symbol::Pin {
+                name: "1".into(),
+                at: Point::new(400.0, 0.0),
+                dir: Default::default(),
+            }],
+            name: "Coil".into(),
+            category: String::new(),
+            letter_code: String::new(),
+            role: Default::default(),
+            graphics: Vec::new(),
+            tag_at: Point::default(),
+            description: String::new(),
+            source: String::new(),
+        };
+        let one = m.apply(Some("small"), &BTreeMap::new())?;
+        let ext = extent(std::slice::from_ref(&one), |_| Some(def.clone()));
+        assert_eq!(ext.1.x, 420.0);
+        let err = err_of(generate(
+            &mut Project::new("x"),
+            std::slice::from_ref(&one),
+            ext,
+            PageSize::A4,
+            "Wide",
+        ));
+        assert!(err.contains("does not fit"), "{err}");
+        // A symbol drawn as text alone counts as wide as the text is drawn.
+        let words = "Emergency stop, main cabinet";
+        let def = Symbol {
+            pins: Vec::new(),
+            graphics: vec![Shape::Text {
+                at: Point::default(),
+                text: words.into(),
+                height: 5.0,
+                align: Align::Left,
+                angle: 0.0,
+            }],
+            ..def
+        };
+        let at = one.symbols.first().map(|s| s.at).unwrap_or_default();
+        let ext = extent(std::slice::from_ref(&one), |_| Some(def.clone()));
+        let width = crate::font::text_width_mm(words, 5.0);
+        assert!(ext.1.x >= at.x + width - 1e-9, "{ext:?} {at:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_dimension_s_label_counts_as_wide_as_it_is_drawn() -> Result<()> {
+        let mut c = starter()?.apply(Some("small"), &BTreeMap::new())?;
+        // A 1 mm dimension whose label is wider than its line.
+        let dim = Shape::Dimension {
+            a: Point::new(200.0, 40.0),
+            b: Point::new(201.0, 40.0),
+            offset: 10.0,
+            height: 5.0,
+        };
+        c.graphics.push(dim.clone());
+        let (min, max) = extent(std::slice::from_ref(&c), |_| None);
+        let parts = dim.dimension_parts().unwrap_or_default();
+        let mut label = Vec::new();
+        for p in parts.iter().filter(|p| matches!(p, Shape::Text { .. })) {
+            drawn_points(p, &mut label);
+        }
+        assert!(!label.is_empty());
+        let (lmin, lmax) = bounds_of(&label);
+        assert!(lmax.x > 201.0 && lmin.x < 200.0, "{lmin:?} {lmax:?}");
+        assert!(min.x <= lmin.x && min.y <= lmin.y && max.x >= lmax.x && max.y >= lmax.y);
+        Ok(())
+    }
+
+    #[test]
+    fn new_pages_come_after_every_page_with_free_ids() -> Result<()> {
+        let one = starter()?.apply(Some("small"), &BTreeMap::new())?;
+        let ext = extent(std::slice::from_ref(&one), |_| None);
+        for (numbers, want) in [(&["1", "12.3", "4"][..], "13"), (&["A7", "3"], "A8"), (&[], "1")] {
+            let mut project = Project::new("x");
+            for (i, n) in numbers.iter().enumerate() {
+                // Ids differing only in case from the next free one are skipped.
+                project.pages.push(Page::new(format!("P{:04}", i + 1), *n, "Old"));
+            }
+            let done = generate(&mut project, std::slice::from_ref(&one), ext, PageSize::A3, "New")?;
+            let id = format!("p{:04}", numbers.len() + 1);
+            assert_eq!(done.pages, std::slice::from_ref(&id));
+            assert_eq!(project.page(&id).map(|p| p.number.as_str()), Some(want));
+            assert_eq!(
+                project.pages.last().map(|p| p.id.as_str()),
+                Some(id.as_str()),
+                "sorted last"
+            );
+        }
+        let mut project = Project::new("x");
+        project.pages.push(Page::new("p0001", u64::MAX.to_string(), "Last"));
+        let err = err_of(generate(&mut project, &[one], ext, PageSize::A3, "New"));
+        assert!(err.contains("no page number is left"), "{err}");
         Ok(())
     }
 

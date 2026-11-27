@@ -790,7 +790,8 @@ enum MacroCmd {
     /// filling its placeholders. The table (CSV or an `.xlsx` workbook) names its columns in
     /// its first row: a placeholder's name fills that placeholder, a column `set` picks the
     /// row's value set (over `--set`), and an empty cell leaves the value set's or default
-    /// value. The copies go on new pages after the last one, left to right and row below
+    /// value. A macro that declares a placeholder `set` takes that column as the placeholder,
+    /// and then `--set` alone picks the value set. The copies go on new pages after the last one, left to right and row below
     /// row, each with the next free tags. Prints the new pages' ids and the number of copies.
     Generate {
         /// The macro's name or file name.
@@ -3391,22 +3392,7 @@ fn run(mut cli: Cli) -> Res<()> {
             // The same for the project's own files (pages, panels, lock, ...): both the save and
             // the rollback would put a plain file where the link was (#614), so refuse before any
             // write.
-            let mut linked: Vec<String> = Vec::new();
-            for (path, _) in &before {
-                if is_link(path)? {
-                    linked.push(escape_field(&path.display().to_string()));
-                }
-            }
-            if !linked.is_empty() {
-                return Err(format!(
-                    "{} a link; box-edit does not replace project files that are links (copy each target over its link first)",
-                    if linked.len() == 1 {
-                        format!("{} is", linked[0])
-                    } else {
-                        format!("{} are", linked.join(", "))
-                    }
-                ));
-            }
+            refuse_linked_files(&before, "box-edit")?;
             // A run that stops between these writes leaves the journal: the next run puts the
             // files back from it (#653).
             let mut journaled = before.clone();
@@ -3614,20 +3600,38 @@ fn run(mut cli: Cli) -> Res<()> {
                         Some(bytes) => bytes,
                         None => run::read_file(&table)?,
                     };
-                    let rows = wc_import::csv::file_rows(&bytes)
-                        .map_err(|err| format!("{}: {}", escape_field(&table.display().to_string()), e(err)))?;
+                    let shown = escape_field(&table.display().to_string());
+                    let rows = wc_import::csv::file_rows(&bytes).map_err(|err| format!("{shown}: {}", e(err)))?;
+                    // A file cut short inside a quoted cell would place a row with half a value.
+                    if let Some(line) = rows.open_quote {
+                        return Err(format!(
+                            "{shown}: line {line}: a quoted cell is not closed before the end of the file; nothing was placed"
+                        ));
+                    }
                     let rows = wc_core::generate::rows_from_table(&m, &rows.cells, &rows.numbers).map_err(e)?;
                     let copies = wc_core::generate::apply_rows(&m, &rows, set.as_deref()).map_err(e)?;
                     for copy in &copies {
                         take_macro_items(dir, &mut p, copy)?;
                     }
-                    let extent = copies
-                        .first()
-                        .map(|first| wc_core::generate::extent(first, |id| store::read_vendored_symbol(dir, id).ok()))
-                        .unwrap_or_default();
+                    let extent = wc_core::generate::extent(&copies, |id| store::read_vendored_symbol(dir, id).ok());
                     let title = title.unwrap_or_else(|| m.name.clone());
                     let generated = wc_core::generate::generate(&mut p, &copies, extent, size, &title).map_err(e)?;
-                    save(dir, &p)?;
+                    // A save that fails half way puts the project's files back, so a second run
+                    // does not place the rows already written again.
+                    let new_pages: Vec<&str> = generated.pages.iter().map(String::as_str).collect();
+                    let before = snapshot_project(dir, &new_pages, &[])?;
+                    // A link would become a plain file on the save and on the rollback (#614).
+                    refuse_linked_files(&before, "macro generate")?;
+                    if let Err(err) = save(dir, &p) {
+                        let failed = put_files_back(&before);
+                        if failed.is_empty() {
+                            return Err(err);
+                        }
+                        return Err(format!(
+                            "{err}; putting the project's files back failed too: {}",
+                            failed.join("; ")
+                        ));
+                    }
                     println!("{}", generated.pages.join(" "));
                     let plural = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
                     println!(
@@ -6087,6 +6091,25 @@ fn same_file(at: &std::fs::Metadata, file: &std::fs::File) -> std::io::Result<bo
 
 /// Whether `path` is a symbolic link. A missing file is not one; any other error reading its
 /// metadata is returned with the path, so a check that cannot tell refuses instead of guessing.
+/// Refuse, before any write, when a project file about to be saved is a link: the save and a
+/// rollback would both put a plain file where the link was (#614).
+fn refuse_linked_files<T>(files: &[(PathBuf, T)], command: &str) -> Result<(), String> {
+    let mut linked: Vec<String> = Vec::new();
+    for (path, _) in files {
+        if is_link(path)? {
+            linked.push(escape_field(&path.display().to_string()));
+        }
+    }
+    if linked.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} {} a link; {command} does not replace project files that are links (copy each target over its link first)",
+        linked.join(", "),
+        if linked.len() == 1 { "is" } else { "are" }
+    ))
+}
+
 fn is_link(path: &Path) -> Result<bool, String> {
     match std::fs::symlink_metadata(path) {
         Ok(m) => Ok(m.file_type().is_symlink()),
