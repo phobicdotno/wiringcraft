@@ -72,13 +72,20 @@ pub fn number_wires(
     // Where each net starts: the first page it is drawn on, then its leftmost, topmost point.
     let mut start: BTreeMap<usize, (usize, f64, f64)> = BTreeMap::new();
     let mut existing: BTreeMap<usize, String> = BTreeMap::new();
+    // Numbers on schematic wires that touch no pin: those wires are left alone, so their
+    // numbers stay in use even when overwriting and are never given to a connection.
+    let mut loose: BTreeSet<String> = BTreeSet::new();
     for (pi, page) in project.pages.iter().enumerate() {
         for w in &page.wires {
+            // Kept trimmed, so `" 5"` and a new `"5"` cannot both exist.
+            let number = w.number.as_deref().map(str::trim).filter(|s| !s.is_empty());
             let Some(&n) = wire_net.get(&(page.id.clone(), w.id.clone())) else {
+                if let Some(num) = number.filter(|_| !page.overview) {
+                    loose.insert(num.to_string());
+                }
                 continue;
             };
-            // Kept trimmed, so `" 5"` and a new `"5"` cannot both exist.
-            if let Some(num) = w.number.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(num) = number {
                 existing.entry(n).or_insert_with(|| num.to_string());
             }
             let mut pts: Vec<Point> = w.via.clone();
@@ -96,11 +103,10 @@ pub fn number_wires(
     let mut order: Vec<(usize, (usize, f64, f64))> = start.into_iter().collect();
     order.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    let mut used: BTreeSet<String> = if overwrite {
-        BTreeSet::new()
-    } else {
-        existing.values().cloned().collect()
-    };
+    let mut used: BTreeSet<String> = loose;
+    if !overwrite {
+        used.extend(existing.values().cloned());
+    }
     let mut counter = 0usize;
     let mut next_sequential = |used: &mut BTreeSet<String>| loop {
         counter += 1;
@@ -296,6 +302,23 @@ mod tests {
         number_wires(&mut p, Rule::Potential, false, |_| None, pos);
         // c keeps 1; e's potential reads as 1 too, so it falls back to the next free number.
         assert_eq!(numbers(&p), [Some("3"), Some("3"), Some("1"), None, Some("2")]);
+    }
+
+    #[test]
+    fn a_number_on_a_wire_that_touches_no_pin_is_not_given_again() {
+        let mut p = project();
+        p.pages[0].wires[3].number = Some(" 1 ".into());
+        number_wires(&mut p, Rule::Sequential, false, |_| None, pos);
+        // d keeps its 1 untouched, so the connections skip it.
+        assert_eq!(numbers(&p), [Some("4"), Some("4"), Some("2"), Some(" 1 "), Some("3")]);
+        // Overwriting renumbers the connections but d is still left alone, so 1 stays taken.
+        number_wires(&mut p, Rule::Sequential, true, |_| None, pos);
+        assert_eq!(numbers(&p), [Some("4"), Some("4"), Some("2"), Some(" 1 "), Some("3")]);
+        // The same holds for page-column numbers.
+        let mut p = project();
+        p.pages[0].wires[3].number = Some("3.2".into());
+        number_wires(&mut p, Rule::PageColumn, true, |_| None, pos);
+        assert_eq!(numbers(&p)[2], Some("3.2.2"));
     }
 
     #[test]
