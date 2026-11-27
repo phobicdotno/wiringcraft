@@ -1399,7 +1399,8 @@ enum ImportCmd {
         file: PathBuf,
     },
     /// Every symbol of a KiCad symbol library (`.kicad_sym`, KiCad 6 or later). Ids are
-    /// `<prefix>.<symbol name>`; the first pin becomes the origin.
+    /// `<prefix>.<symbol name>`; the first pin becomes the origin. Fails when no symbol
+    /// could be imported.
     SymbolKicad {
         /// The `.kicad_sym` file.
         file: PathBuf,
@@ -6189,6 +6190,10 @@ fn import_kicad(text: &str, lib: &Path, prefix: &str, scale: f64, category: &str
         n = write_kicad(read_kicad(text, prefix, scale, log)?, lib, category, log)?;
         Ok(())
     })?;
+    // A library with no symbols, or whose every symbol was skipped, is not a success.
+    if n == 0 {
+        return Err("no symbol could be imported from the file".into());
+    }
     Ok(n)
 }
 
