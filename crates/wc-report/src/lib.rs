@@ -670,9 +670,11 @@ pub fn location_list(i: &Inputs<'_>) -> Table {
         *count.entry(tag.location.join(".")).or_default() += 1;
     }
     for l in &i.project.meta.locations {
-        let n = count.remove(&l.path).unwrap_or(0);
+        // A path may be stored as typed (`+L1`): it is compared and shown in its normal form.
+        let path = wc_core::project::location_path(&l.path).unwrap_or_else(|_| l.path.clone());
+        let n = count.remove(&path).unwrap_or(0);
         t.rows.push(vec![
-            format!("+{}", l.path),
+            format!("+{path}"),
             l.description.clone(),
             n.to_string(),
             String::new(),

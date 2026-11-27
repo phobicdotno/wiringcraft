@@ -1220,6 +1220,24 @@ fn the_location_list_counts_devices_and_names_unlisted_locations() {
 }
 
 #[test]
+fn the_location_list_reads_a_location_stored_with_its_plus() {
+    let mut p = Project::new("t");
+    p.devices
+        .insert(DeviceTag::parse("+L1-K1").unwrap(), Default::default());
+    p.meta.locations.push(wc_core::project::Location {
+        path: "+L1".into(),
+        description: "Main cabinet".into(),
+    });
+    let (symbols, parts) = (BTreeMap::new(), BTreeMap::new());
+    let i = Inputs {
+        project: &p,
+        symbols: &symbols,
+        parts: &parts,
+    };
+    assert_eq!(build(Kind::Locations, &i).rows, [["+L1", "Main cabinet", "1", ""]]);
+}
+
+#[test]
 fn the_network_list_shows_each_device_with_its_address_ports_and_cables() {
     let mut p = Project::new("t");
     let mut page = Page::new("p3", "3", "PLC");
