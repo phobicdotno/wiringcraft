@@ -167,7 +167,13 @@ gives the details.
 - [docs/cli/panel-layouts.md](docs/cli/panel-layouts.md): panel layouts
 - [docs/cli/imports.md](docs/cli/imports.md): the `wiringcraft import` commands
 - [docs/project-format.md](docs/project-format.md): the project folder format
+- [docs/library-format.md](docs/library-format.md): the library folder format
+- [docs/pdf-output.md](docs/pdf-output.md): what the exported PDF contains
+- [docs/check-reference.md](docs/check-reference.md): every finding the project check can report
+- [docs/eplan-import.md](docs/eplan-import.md): what the EPLAN import reads and what it leaves out
 - [docs/app-shortcuts.md](docs/app-shortcuts.md): every key and mouse gesture in the desktop app
+- [docs/preferences.md](docs/preferences.md): the app preferences file
+- [docs/troubleshooting.md](docs/troubleshooting.md): common problems and what to do
 - [docs/assistant.md](docs/assistant.md): the assistant
 - [docs/share-sessions.md](docs/share-sessions.md): working in one project together over the office network
 - [docs/packaging.md](docs/packaging.md): how the install packages and releases are built
