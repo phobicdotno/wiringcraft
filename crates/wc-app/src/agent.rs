@@ -11305,6 +11305,7 @@ mod tests {
     fn panels_new_and_replace_refuse_a_plate_size_or_item_off_the_plate() {
         let (_tmp, mut a) = app(vec![]);
         let project = a.open.as_ref().unwrap().project.clone();
+        let mark = a.open.as_ref().unwrap().undo_mark();
         for (w, h) in [(-600.0, 800.0), (0.0, 800.0), (600.0, 5.0), (600.0, 1e9)] {
             let r = call(&mut a, "panels", json!({"action": "new", "width": w, "height": h}));
             assert!(r.as_ref().is_err_and(|e| e.contains("plate width and height")), "{r:?}");
@@ -11313,9 +11314,11 @@ mod tests {
                 project,
                 "no layout added for {w} x {h}"
             );
+            assert_eq!(a.open.as_ref().unwrap().undo_mark(), mark, "no undo step for {w} x {h}");
         }
         call(&mut a, "panels", json!({"action": "new", "width": 600, "height": 800})).unwrap();
         let project = a.open.as_ref().unwrap().project.clone();
+        let mark = a.open.as_ref().unwrap().undo_mark();
         let rail = json!({"kind": "rail", "at": {"x": 10.0, "y": 100.0}, "length": 100.0});
         let off =
             json!({"kind": "device", "tag": "-K1", "at": {"x": 550.0, "y": 100.0}, "width": 90.0, "height": 90.0});
@@ -11326,6 +11329,7 @@ mod tests {
             let r = call(&mut a, "panels", json!({"action": "replace", "content": content}));
             assert!(r.is_err(), "{r:?}");
             assert_eq!(a.open.as_ref().unwrap().project, project, "the layout stays as it was");
+            assert_eq!(a.open.as_ref().unwrap().undo_mark(), mark, "no undo step");
         }
         let r = call(
             &mut a,
