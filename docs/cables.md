@@ -65,8 +65,9 @@ In the page file the wire stores it as:
 
 ## The cable list
 
-`report cables` prints one block per cable: tag, type, description, then one row per core with
-the page and the two ends of its wire.
+`report cables` prints one block per cable: tag, type, description, then one row per wire that
+names a core of it, with the page and the two ends of that wire. A core drawn as two wires (two
+wires naming `-W1:1`) has two rows, so count cores, not rows.
 
 ```
 $ wiringcraft report cables
@@ -96,7 +97,8 @@ sorts or groups the rows (`report-layout`), each row names its cable. In the PDF
 (`pdf --report cables`) a cable whose cores run onto the next page is named again at the top of
 that page, and each row links to the page its core is drawn on.
 
-The same table comes out as CSV, Markdown or an Excel sheet with `--format csv|md|xlsx`.
+The same table comes out as CSV, Markdown or an Excel sheet with `--format csv|md|xlsx`. An Excel
+sheet needs a file to go in: `wiringcraft report cables --format xlsx --out cables.xlsx`.
 
 ## Cables in other reports and exports
 
@@ -113,7 +115,9 @@ The same table comes out as CSV, Markdown or an Excel sheet with `--format csv|m
   connections, it warns: `cable core -W1:3 is on 2 connections`. Wires that touch no pin, wires
   on overview pages and wires that name no core are not counted.
 - A check rule of kind `cable` warns about matching devices that have no cabled wire on any of
-  their pins. For example, every motor needs a cable:
+  their pins. For example, every motor needs a cable. `rules set` replaces all of the project's
+own rules with the ones it reads, so on a project that has rules already, put its other
+`[[rule]]` tables in the input too (`rules list` shows them):
 
 ```
 printf '[[rule]]\nname = "motor-cable"\nkind = "cable"\ndevices = "-M*"\n' | wiringcraft rules set -
