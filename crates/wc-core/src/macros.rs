@@ -209,7 +209,8 @@ impl Macro {
             missing.retain(|n| seen.insert(key(n)));
             return bad(format!("no value for {}", missing.join(", ")));
         }
-        // A wire value is stored as typed in anywhere else: trimmed, and no value when empty.
+        // A wire value is stored as typed in anywhere else: trimmed, and no value when empty;
+        // a device value that came out empty is no value.
         for w in &mut out.wires {
             for v in [&mut w.spec.section, &mut w.spec.colour, &mut w.spec.kind] {
                 *v = v.as_deref().and_then(WireSpec::value);
@@ -220,6 +221,8 @@ impl Macro {
                 d.part = None;
             }
             d.accessories.retain(|a| !a.part.trim().is_empty());
+            // An empty property is no property, as when typed empty in the device's form.
+            d.properties.retain(|_, v| !v.trim().is_empty());
         }
         Ok(out)
     }
@@ -738,6 +741,14 @@ mod tests {
         let placed = m.apply(None, &all)?;
         // An empty part is no part.
         assert_eq!(placed.devices[&DeviceTag::parse("-Q1")?].part, None);
+        // A property that comes out empty is no property; one with text is kept.
+        let mut blank = m.clone();
+        if let Some(d) = blank.devices.values_mut().next() {
+            d.properties.insert("Address".into(), " {{part}} ".into());
+        }
+        let d = blank.apply(None, &all)?.devices[&DeviceTag::parse("-Q1")?].clone();
+        assert!(!d.properties.contains_key("Address"), "{:?}", d.properties);
+        assert_eq!(d.properties["Setting"], "3.2 A");
         assert!(m.apply(Some("3 kW"), &none).is_err());
 
         let mut undeclared = starter()?;

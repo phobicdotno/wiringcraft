@@ -267,3 +267,141 @@ from = "Qty"
         assert!(none.kept(&[]).is_err());
     }
 }
+
+#[cfg(test)]
+mod edge_tests {
+    use super::{ReportColumn, ReportLayout};
+    use serde_json::json;
+
+    fn col(from: &str, heading: Option<&str>) -> ReportColumn {
+        ReportColumn {
+            from: from.into(),
+            heading: heading.map(str::to_owned),
+        }
+    }
+
+    fn builtin() -> Vec<String> {
+        vec!["Tag".to_owned(), "Qty".to_owned()]
+    }
+
+    #[test]
+    fn sort_keys_trim_and_take_only_one_minus() {
+        assert_eq!(ReportLayout::sort_key(" Qty "), ("Qty", false));
+        assert_eq!(ReportLayout::sort_key("- Qty"), ("Qty", true));
+        assert_eq!(ReportLayout::sort_key("--Qty"), ("-Qty", true));
+        assert_eq!(ReportLayout::sort_key("-"), ("", true));
+        assert_eq!(ReportLayout::sort_key(""), ("", false));
+    }
+
+    #[test]
+    fn built_in_columns_reordered_cut_or_renamed_are_kept() {
+        let layout = |columns| ReportLayout {
+            kind: "parts".into(),
+            columns,
+            ..ReportLayout::default()
+        };
+        for columns in [
+            vec![col("Qty", None), col("Tag", None)],
+            vec![col("Tag", None)],
+            vec![col("Tag", Some("Ref")), col("Qty", None)],
+            vec![col("Tag", None), col("Qty", None), col("Tag", None)],
+        ] {
+            let Ok(Some(kept)) = layout(columns.clone()).kept(&builtin()) else {
+                unreachable!("{columns:?}")
+            };
+            assert_eq!(kept.columns, columns);
+            assert_eq!(kept.kind, "parts");
+        }
+    }
+
+    #[test]
+    fn built_in_columns_with_a_sort_keep_the_sort_and_no_columns() {
+        let l = ReportLayout {
+            kind: "wires".into(),
+            columns: vec![col("Tag", None), col("Qty", Some("  "))],
+            sort: vec!["-Qty".into()],
+            ..ReportLayout::default()
+        };
+        let Ok(Some(kept)) = l.kept(&builtin()) else {
+            unreachable!()
+        };
+        assert!(kept.columns.is_empty());
+        assert_eq!(kept.sort, ["-Qty"]);
+        assert_eq!(kept.kind, "wires");
+        // Kept twice gives the same layout.
+        assert_eq!(kept.kept(&builtin()), Ok(Some(kept.clone())));
+    }
+
+    #[test]
+    fn columns_given_for_a_report_without_built_in_ones_are_kept() {
+        let l = ReportLayout {
+            kind: "plc".into(),
+            columns: vec![col("Address", None)],
+            ..ReportLayout::default()
+        };
+        let Ok(Some(kept)) = l.kept(&[]) else { unreachable!() };
+        assert_eq!(kept.columns, [col("Address", None)]);
+    }
+
+    #[test]
+    fn json_checks_each_column_and_refuses_a_bad_column_list() {
+        let e = ReportLayout::from_json(
+            "parts",
+            json!({"column": [{"from": "Tag"}, {"from": "Qty", "head": "x"}]}),
+        );
+        let Err(e) = e else { unreachable!() };
+        assert!(e.contains("Unknown column key \"head\""), "{e}");
+        assert!(e.contains("from") && e.contains("heading"), "names the known keys: {e}");
+        let Err(e) = ReportLayout::from_json("parts", json!({"column": {"from": "Qty"}})) else {
+            unreachable!()
+        };
+        assert!(e.starts_with("Bad layout"), "{e}");
+        let Err(e) = ReportLayout::from_json("parts", json!({"column": ["Qty"]})) else {
+            unreachable!()
+        };
+        assert!(e.starts_with("Bad layout"), "{e}");
+        let Err(e) = ReportLayout::from_json("parts", json!("parts")) else {
+            unreachable!()
+        };
+        assert_eq!(e, "The layout must be an object.");
+    }
+
+    #[test]
+    fn an_empty_json_object_is_the_built_in_layout_of_the_kind() {
+        let Ok(l) = ReportLayout::from_json("cables", json!({})) else {
+            unreachable!()
+        };
+        assert_eq!(
+            l,
+            ReportLayout {
+                kind: "cables".into(),
+                ..ReportLayout::default()
+            }
+        );
+        assert_eq!(l.kept(&builtin()), Ok(None));
+    }
+
+    #[test]
+    fn a_full_json_layout_reads_every_key() {
+        let Ok(l) = ReportLayout::from_json(
+            "parts",
+            json!({
+                "title": "BOM",
+                "column": [{"from": "Qty", "heading": "Count"}],
+                "sort": ["-Qty", "Tag"],
+                "group": "Tag",
+                "header": ["project.name"],
+            }),
+        ) else {
+            unreachable!()
+        };
+        assert_eq!(l.columns, [col("Qty", Some("Count"))]);
+        assert_eq!(l.sort, ["-Qty", "Tag"]);
+        assert_eq!(l.group.as_deref(), Some("Tag"));
+        assert_eq!(l.header, ["project.name"]);
+        let Ok(back) = ReportLayout::from_json("parts", json!(l)) else {
+            unreachable!()
+        };
+        assert_eq!(back, l);
+    }
+}
