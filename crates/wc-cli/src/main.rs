@@ -401,7 +401,8 @@ enum Cmd {
     },
     /// Export pages as drawings for other tools: one SVG or DXF file per page in a folder,
     /// drawn like the PDF (frame, title block, symbols, wires, cross-references), and one per
-    /// panel layout (plate, rails, ducts, devices).
+    /// panel layout (plate, rails, ducts, devices). With `--page`, only those pages are written
+    /// and no panel layouts.
     Drawing {
         /// Output folder; files are named `<page number>.<format>`, and `panel-<name>.<format>`
         /// for panel layouts.
@@ -409,7 +410,8 @@ enum Cmd {
         /// `svg` or `dxf`.
         #[arg(long, default_value = "svg")]
         format: String,
-        /// Page ids to export (default: all).
+        /// Page ids to export (default: all pages and all panel layouts). With it, only these
+        /// pages are written, without the panel layouts.
         #[arg(long = "page")]
         pages: Vec<String>,
         /// Date for the title block where the page and project set none; free text, printed as
@@ -1274,7 +1276,8 @@ enum PageCmd {
 
 #[derive(Subcommand)]
 enum LibCmd {
-    /// Add a source. Earlier sources win over later ones.
+    /// Add a source after the existing ones. Earlier sources win over later ones, so the new
+    /// one loses to them; to change the order, move the `[[library]]` tables in `project.toml`.
     Add {
         /// The source's name, used in item listings.
         name: String,
@@ -1562,9 +1565,11 @@ enum ImportCmd {
     /// the project already vendors is replaced by the new version (an earlier import's box by
     /// the drawn block) when its copy is still the one the project pins; a copy changed in the
     /// project is refused, not replaced. To take the new version into such a project, import
-    /// with --lib into a library folder, add that folder as a source (`lib add`) ahead of any
-    /// source with the same id, and run `lib update <id>`. Into a library folder with --lib,
-    /// else vendored into the project.
+    /// with --lib into a library folder, add that folder as a source (`lib add`) and run
+    /// `lib update <id>`. `lib add` puts the new source last and earlier sources win: when
+    /// another source has the same id, first move the new source's `[[library]]` table above
+    /// that source's in `project.toml`. Into a library folder with --lib, else vendored into
+    /// the project.
     SweLibrary {
         /// The `.tewzip` archive.
         path: PathBuf,
@@ -4128,17 +4133,19 @@ fn run(mut cli: Cli) -> Res<()> {
             for m in missing {
                 eprintln!("warning: symbol {m} has no vendored copy (run `wiringcraft lib lock`)");
             }
-            // Panel layouts follow the pages, one file each, as their PDF sheets.
+            // Panel layouts follow the pages, one file each, as their PDF sheets. Picking pages
+            // with --page leaves them out: only the named pages are written.
+            let panels = if pages.is_empty() { p.panels.clone() } else { Vec::new() };
             let options = wc_pdf::Options {
                 pages,
                 date,
-                panels: p.panels.clone(),
                 // A part that cannot be read is named in a warning; the others still export.
-                footprints: if p.panels.is_empty() {
+                footprints: if panels.is_empty() {
                     Default::default()
                 } else {
                     wc_pdf::footprints(vendored_parts_warning_unreadable(dir, &p).values())
                 },
+                panels,
                 ..Default::default()
             };
             // Only SVG shows pictures; a DXF export neither reads nor checks them.

@@ -86,7 +86,8 @@ $ ls out
 1.dxf  1.svg  2.dxf  2.svg  panel-Main_cabinet.dxf  panel-Main_cabinet.svg
 ```
 
-`--page` picks the schematic pages (by id); the panel layouts are always written as well. An
+`--page` picks the schematic pages (by id) and leaves the panel layouts out; without it every
+page and every panel layout is written. An
 unknown page id is an error and nothing is written. `--date` fills the title block's date where
 the page and project set none. Files with the same name in the folder are replaced, and files
 from earlier runs that no longer match a sheet stay.
