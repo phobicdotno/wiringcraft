@@ -5901,20 +5901,25 @@ fn keep_lock_out_of_git(dir: &Path) {
     }
 }
 
-/// Parse report names; `all` means every report.
+/// The reports `names` asks for, in order. A report named twice (or named besides `all`) is
+/// kept once, where it is first asked for, so it does not print twice.
 fn report_kinds(names: &[String]) -> Result<Vec<wc_report::Kind>, String> {
     let mut out = Vec::new();
     for n in names {
-        if n == "all" {
-            out.extend(wc_report::Kind::ALL);
-            continue;
+        let kinds = if n == "all" {
+            wc_report::Kind::ALL.to_vec()
+        } else {
+            vec![wc_report::Kind::parse(n).ok_or_else(|| {
+                format!(
+                    "unknown report {n:?} (contents, parts, devices, wires, nets, terminals, cables, plc, plc-cards, locations, networks, all)"
+                )
+            })?]
+        };
+        for k in kinds {
+            if !out.contains(&k) {
+                out.push(k);
+            }
         }
-        let k = wc_report::Kind::parse(n).ok_or_else(|| {
-            format!(
-                "unknown report {n:?} (contents, parts, devices, wires, nets, terminals, cables, plc, plc-cards, locations, networks, all)"
-            )
-        })?;
-        out.push(k);
     }
     Ok(out)
 }
