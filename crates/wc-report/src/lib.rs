@@ -1496,7 +1496,8 @@ pub(crate) fn terminal_plan_with_spares(i: &Inputs<'_>) -> (Table, BTreeSet<usiz
     (t, spare_rows)
 }
 
-/// Table of contents: every schematic page with its title and what is drawn on it.
+/// Table of contents: every schematic page with its title and what is drawn on it. Tags on
+/// interruption points are not devices (they only name a connection), so they are not counted.
 pub fn contents(i: &Inputs<'_>) -> Table {
     let mut t = Table::new("Table of contents", &["Page", "Title", "Devices", "Wires"]);
     t.front = true;
@@ -1505,6 +1506,11 @@ pub fn contents(i: &Inputs<'_>) -> Table {
         let tags: BTreeSet<String> = page
             .symbols
             .iter()
+            .filter(|s| {
+                i.symbols
+                    .get(&s.symbol)
+                    .is_none_or(|y| y.role != SymbolRole::Interruption)
+            })
             .filter_map(|s| s.tag.as_ref().map(ToString::to_string))
             .collect();
         t.rows.push(vec![
