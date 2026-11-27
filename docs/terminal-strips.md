@@ -90,8 +90,9 @@ this:
 4. For each terminal the plan shows:
    - **Upper (pin 1)** and **Lower (pin 2)**: what is wired to that side of this terminal
      itself, without the jumpers.
-   - **Potential**: the potential name of the terminal's net, with the jumpers. A spare
-     jumpered to a drawn terminal shows that terminal's potential.
+   - **Potential**: the potential name of the terminal's net, with the jumpers. A drawn terminal
+     with no wire of its own shows none, even when it is jumpered. A spare jumpered to a drawn
+     terminal shows that terminal's potential.
    - **Page**: the page the terminal is drawn on, or `spare`.
    - **Jumpered with**: the other terminals of its jumper.
    - **Level**: its level on a multi-level terminal, empty for a single-level terminal.
@@ -101,7 +102,9 @@ The columns, sorting and grouping of the report can be changed with a report lay
 
 ## Example
 
-Three drawn terminals, a lamp wired to `-X1.1`, and two terminals tagged with just `-X1`:
+Three drawn terminals, a lamp wired to `-X1.1`, and two terminals tagged with just `-X1`, on a
+page `p2` with nothing on it yet. `place` prints each symbol's id (`s1` to `s6` here), and
+`wire` uses those ids; on a page that already has symbols, use the ids `place` printed:
 
 ```sh
 wiringcraft place p2 wc.terminal --at 40,60 --tag "-X1.1"
