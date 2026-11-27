@@ -295,10 +295,18 @@ pub fn show(ui: &mut egui::Ui, form: &mut Form) {
                                 .hint_text("heading as built in")
                                 .desired_width(160.0),
                         );
-                        if ui.add_enabled(i > 0, egui::Button::new("Up")).clicked() {
+                        if ui
+                            .add_enabled(i > 0, egui::Button::new("Up"))
+                            .on_disabled_hover_text("Already the first column.")
+                            .clicked()
+                        {
                             moved = Some((i, -1));
                         }
-                        if ui.add_enabled(i + 1 < n, egui::Button::new("Down")).clicked() {
+                        if ui
+                            .add_enabled(i + 1 < n, egui::Button::new("Down"))
+                            .on_disabled_hover_text("Already the last column.")
+                            .clicked()
+                        {
                             moved = Some((i, 1));
                         }
                         ui.end_row();
