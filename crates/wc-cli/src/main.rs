@@ -1001,9 +1001,11 @@ enum JumperCmd {
         /// Terminal numbers.
         terminals: Vec<String>,
     },
-    /// Give the jumper holding a terminal a part (article), e.g.
-    /// `jumper part -X1 3 example.ex-tb-2-5`; leave the part out to clear it. A part the project
-    /// does not have yet is taken from its libraries.
+    /// Give the jumper holding a terminal a part (article), e.g. `jumper part -X1 3 <part id>`
+    /// with the id of a jumper part; leave the part out to clear it. Any part is accepted and
+    /// becomes the jumper's article in reports, so pick a jumper, not a terminal. A part the
+    /// project does not have yet is taken from its libraries (the bundled library has no jumper
+    /// parts).
     Part {
         /// The strip, e.g. `-X1` (taken as a value, though it starts with `-`).
         #[arg(allow_hyphen_values = true)]
