@@ -1209,12 +1209,12 @@ enum PageCmd {
     List,
     /// Delete a page and everything drawn on it.
     Remove {
-        /// The page's id.
+        /// The page's id or number.
         id: String,
     },
     /// Mark a page as an overview (line diagram), or with `--off` as a normal page again.
     Overview {
-        /// The page's id.
+        /// The page's id or number.
         id: String,
         /// Make it a normal page again.
         #[arg(long)]
@@ -1223,7 +1223,7 @@ enum PageCmd {
     /// Change a page's number or title. A number another page already uses is refused; the
     /// pages are sorted by number again afterwards.
     Edit {
-        /// The page's id.
+        /// The page's id or number.
         id: String,
         /// The new page number, e.g. `3` or `3.1`.
         #[arg(long)]
@@ -1235,7 +1235,7 @@ enum PageCmd {
     /// Change a page's sheet size (as `page add --size` takes it). What is drawn stays where it
     /// is; a smaller sheet can leave some of it outside the frame.
     Size {
-        /// The page's id.
+        /// The page's id or number.
         id: String,
         /// The new size, e.g. `A3`, `A4-portrait` or `500x700`.
         size: String,
@@ -1243,7 +1243,7 @@ enum PageCmd {
     /// Make a page the project's cover page (any other page loses the mark), or with `--off` a
     /// normal page again.
     Cover {
-        /// The page's id.
+        /// The page's id or number.
         id: String,
         /// Make it a normal page again.
         #[arg(long)]
@@ -1253,7 +1253,7 @@ enum PageCmd {
     /// date, drawn_by, checked_by, ...). The page's own values win over the project's on that
     /// page; `key=` clears one, so the project's shows again.
     Fields {
-        /// The page's id.
+        /// The page's id or number.
         id: String,
         /// `key=value` pairs to set; none lists the fields.
         set: Vec<String>,
@@ -1744,6 +1744,25 @@ fn parse_box_pin(s: &str) -> Res<wc_core::BoxPin> {
 fn output_guard() -> Option<&'static wc_core::guard::ProjectFiles> {
     static GUARD: std::sync::OnceLock<Option<wc_core::guard::ProjectFiles>> = std::sync::OnceLock::new();
     GUARD.get_or_init(wc_core::guard::ProjectFiles::from_env).as_ref()
+}
+
+/// The index of the page named by `key`: its id, or else its page number, as `comment` takes
+/// it. An id wins over another page's number.
+fn page_index(p: &Project, key: &str) -> Res<usize> {
+    p.pages
+        .iter()
+        .position(|pg| pg.id == key)
+        .or_else(|| p.pages.iter().position(|pg| pg.number == key))
+        .ok_or_else(|| format!("no page {key:?}"))
+}
+
+/// The id of the page [`page_index`] finds for `key`.
+fn page_id_of(p: &Project, key: &str) -> Res<String> {
+    let i = page_index(p, key)?;
+    p.pages
+        .get(i)
+        .map(|pg| pg.id.clone())
+        .ok_or_else(|| format!("no page {key:?}"))
 }
 
 /// Refuse `--page` ids the project does not have, naming the ids it does, so a typo fails
@@ -2867,37 +2886,30 @@ fn run(mut cli: Cli) -> Res<()> {
                     return Ok(());
                 }
                 PageCmd::Remove { id } => {
-                    if !p.pages.iter().any(|pg| pg.id == id) {
-                        return Err(format!("no page {id:?}"));
-                    }
+                    let i = page_index(&p, &id)?;
                     // Same rule as the app: a project keeps at least one page.
                     if p.pages.len() <= 1 {
                         return Err("A project needs at least one page.".into());
                     }
-                    p.pages.retain(|pg| pg.id != id);
+                    p.pages.remove(i);
                 }
                 PageCmd::Overview { id, off } => {
-                    let page = p
-                        .pages
-                        .iter_mut()
-                        .find(|pg| pg.id == id)
-                        .ok_or_else(|| format!("no page {id:?}"))?;
-                    page.overview = !off;
+                    let i = page_index(&p, &id)?;
+                    if let Some(page) = p.pages.get_mut(i) {
+                        page.overview = !off;
+                    }
                 }
                 PageCmd::Edit { id, number, title } => {
                     if number.is_none() && title.is_none() {
                         return Err("give --number, --title or both".into());
                     }
-                    let i = p
-                        .pages
-                        .iter()
-                        .position(|pg| pg.id == id)
-                        .ok_or_else(|| format!("no page {id:?}"))?;
+                    let i = page_index(&p, &id)?;
                     let number = number.map(|n| n.trim().to_owned());
                     if let Some(n) = &number {
                         if n.is_empty() {
                             return Err("the page number cannot be empty".into());
                         }
+                        let id = page_id_of(&p, &id)?;
                         if let Some(other) = p.pages.iter().find(|pg| pg.number == *n && pg.id != id) {
                             return Err(format!("page {:?} already has number {n:?}", other.id));
                         }
@@ -2914,27 +2926,17 @@ fn run(mut cli: Cli) -> Res<()> {
                 }
                 PageCmd::Size { id, size } => {
                     let size = PageSize::parse(&size)?;
-                    let page = p
-                        .pages
-                        .iter_mut()
-                        .find(|pg| pg.id == id)
-                        .ok_or_else(|| format!("no page {id:?}"))?;
-                    page.size = size;
+                    let i = page_index(&p, &id)?;
+                    if let Some(page) = p.pages.get_mut(i) {
+                        page.size = size;
+                    }
                 }
                 PageCmd::Cover { id, off } => {
-                    let i = p
-                        .pages
-                        .iter()
-                        .position(|pg| pg.id == id)
-                        .ok_or_else(|| format!("no page {id:?}"))?;
+                    let i = page_index(&p, &id)?;
                     cover_moved(p.set_cover(i, !off).unwrap_or_default());
                 }
                 PageCmd::Fields { id, set } => {
-                    let i = p
-                        .pages
-                        .iter()
-                        .position(|pg| pg.id == id)
-                        .ok_or_else(|| format!("no page {id:?}"))?;
+                    let i = page_index(&p, &id)?;
                     if set.is_empty() {
                         print!("{}", page_fields(&p, i));
                         return Ok(());
@@ -5148,13 +5150,7 @@ fn now_secs() -> i64 {
 
 fn comment_cmd(dir: &Path, cc: CommentCmd) -> Res<()> {
     let mut p = load(dir)?;
-    let page_id = |p: &Project, page: &str| {
-        p.pages
-            .iter()
-            .find(|pg| pg.id == page || pg.number == page)
-            .map(|pg| pg.id.clone())
-            .ok_or_else(|| format!("no page {page:?}"))
-    };
+    let page_id = page_id_of;
     match cc {
         CommentCmd::Add { page, text, at, author } => {
             let page = page_id(&p, &page)?;
@@ -7969,6 +7965,51 @@ mod tests {
         // Its own number again is fine.
         cli(&dir, &["page", "edit", "a", "--number", "2", "--title", "Power"]).unwrap();
         assert_eq!(pages(&dir)[2], ("a".into(), "2".into(), "Power".into()));
+    }
+
+    #[test]
+    fn page_commands_take_the_page_number_as_well_as_the_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["page", "add", "a", "--number", "7", "--title", "Power"]).unwrap();
+        // A page whose id is another page's number: the id wins.
+        cli(&dir, &["page", "add", "7", "--number", "8", "--title", "Control"]).unwrap();
+        let page = |dir: &Path, id: &str| load(dir).unwrap().page(id).cloned().unwrap();
+
+        cli(&dir, &["page", "fields", "7", "revision=B"]).unwrap();
+        assert_eq!(
+            page(&dir, "7").title_block.get("revision").map(String::as_str),
+            Some("B")
+        );
+        assert!(!page(&dir, "a").title_block.contains_key("revision"));
+
+        cli(&dir, &["page", "fields", "8", "revision=C"]).unwrap();
+        assert_eq!(
+            page(&dir, "7").title_block.get("revision").map(String::as_str),
+            Some("C")
+        );
+        cli(&dir, &["page", "size", "8", "A4"]).unwrap();
+        cli(&dir, &["page", "overview", "8"]).unwrap();
+        cli(&dir, &["page", "cover", "8"]).unwrap();
+        let pg = page(&dir, "7");
+        assert!(pg.overview && pg.cover);
+        assert_eq!(pg.size, PageSize::parse("A4").unwrap());
+
+        // Renumbering by number checks the clash against that page, not the key typed.
+        cli(&dir, &["page", "edit", "8", "--number", "9", "--title", "Ctl"]).unwrap();
+        assert_eq!(page(&dir, "7").number, "9");
+        assert_eq!(page(&dir, "7").title, "Ctl");
+        // Keeping its own number, typed by that number, is no clash with itself.
+        cli(&dir, &["page", "edit", "9", "--number", "9"]).unwrap();
+        assert_eq!(page(&dir, "7").number, "9");
+        let err = cli(&dir, &["page", "edit", "9", "--number", "7"]).unwrap_err();
+        assert!(err.contains("already has number"), "{err}");
+        assert!(cli(&dir, &["page", "fields", "42"]).unwrap_err().contains("no page"));
+
+        cli(&dir, &["page", "remove", "9"]).unwrap();
+        assert!(load(&dir).unwrap().page("7").is_none());
+        assert!(load(&dir).unwrap().page("a").is_some());
     }
 
     #[test]
