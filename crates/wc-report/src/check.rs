@@ -432,6 +432,30 @@ pub fn check_with_unreadable(
 
     wire_numbers(i, &wire_net, &mut out);
 
+    // Wire specs that cannot be right: a cross-section of 0 or less, a colour that is no IEC
+    // 60757 code. They come from free text (typed or imported) and go into the wire list as is.
+    for page in &p.pages {
+        for w in &page.wires {
+            let name = w.number.as_ref().map(|n| format!(" {n}")).unwrap_or_default();
+            if let Some(s) = w.spec.section.as_deref().filter(|_| w.spec.section_is_bad()) {
+                out.push(at(
+                    page,
+                    &w.id,
+                    Severity::Warning,
+                    format!("wire{name} has cross-section {s}, which is not above 0"),
+                ));
+            }
+            if let Some(c) = w.spec.colour.as_deref().filter(|_| !w.spec.colour_is_iec()) {
+                out.push(at(
+                    page,
+                    &w.id,
+                    Severity::Note,
+                    format!("wire{name} has colour {c}, which is not an IEC 60757 code such as BU or GNYE"),
+                ));
+            }
+        }
+    }
+
     // Panel layouts: rails and ducts sticking out of the plate, and devices covering each
     // other, sticking out of the plate, or whose tag is no longer in the project. Outlines that
     // only touch do not overlap. A tag is in the project when it is drawn on a page or listed in

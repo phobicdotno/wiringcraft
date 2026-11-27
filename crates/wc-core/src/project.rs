@@ -1534,6 +1534,46 @@ impl WireSpec {
     pub fn value(text: &str) -> Option<String> {
         Some(text.trim().to_owned()).filter(|s| !s.is_empty())
     }
+
+    /// Whether the cross-section is clearly wrong: a size in mm² (or a plain number, mm² as in
+    /// EPLAN) that is not above 0, or a negative AWG gauge. AWG 0 and `1/0` are real gauges.
+    /// Other text is left alone.
+    pub fn section_is_bad(&self) -> bool {
+        let Some(s) = self.section.as_deref().map(str::trim) else {
+            return false;
+        };
+        let lower = s.to_lowercase();
+        if let Some(n) = lower.strip_suffix("awg").or_else(|| lower.strip_prefix("awg")) {
+            return n.trim().starts_with('-');
+        }
+        let n = ["mm²", "mm2", "mm"]
+            .iter()
+            .find_map(|u| lower.strip_suffix(u))
+            .unwrap_or(&lower);
+        n.trim()
+            .replace(',', ".")
+            .parse::<f64>()
+            .is_ok_and(|v| !(v.is_finite() && v > 0.0))
+    }
+
+    /// Whether the colour is made of IEC 60757 codes (`BU`, `GNYE`, `GN/YE`, any case), or
+    /// there is none.
+    pub fn colour_is_iec(&self) -> bool {
+        const CODES: [&str; 14] = [
+            "BK", "BN", "RD", "OG", "YE", "GN", "BU", "VT", "GY", "WH", "PK", "GD", "TQ", "SR",
+        ];
+        let Some(c) = &self.colour else { return true };
+        let letters: Vec<char> = c
+            .to_uppercase()
+            .chars()
+            .filter(|ch| !matches!(ch, '/' | '-' | '+' | ' '))
+            .collect();
+        !letters.is_empty()
+            && letters.len().is_multiple_of(2)
+            && letters
+                .chunks(2)
+                .all(|p| CODES.contains(&p.iter().collect::<String>().as_str()))
+    }
 }
 
 /// A wire's place in a cable: the cable device (for example `-W1`) and the core's name
@@ -2656,6 +2696,38 @@ mod tests {
         assert_eq!(serde_json::from_str::<Wire>(&text)?, w);
         assert_eq!(WireSpec::value("  "), None);
         Ok(())
+    }
+
+    #[test]
+    fn a_wire_spec_knows_a_bad_section_and_a_colour_that_is_no_iec_code() {
+        let spec = |section: &str, colour: &str| WireSpec {
+            section: WireSpec::value(section),
+            colour: WireSpec::value(colour),
+            kind: None,
+        };
+        for bad in [
+            "0 mm²",
+            "-1.5 mm²",
+            "0",
+            "0,0 mm2",
+            "NaN",
+            "inf mm²",
+            "-2 AWG",
+            "AWG -1",
+        ] {
+            assert!(spec(bad, "").section_is_bad(), "{bad}");
+        }
+        for good in [
+            "", "1.5 mm²", "0,75mm²", "2.5", "18 AWG", "0 AWG", "1/0 AWG", "3x1.5", "LiYY",
+        ] {
+            assert!(!spec(good, "").section_is_bad(), "{good}");
+        }
+        for good in ["", "BU", "bu", "GNYE", "gn/ye", "GN-YE", "WH BK"] {
+            assert!(spec("", good).colour_is_iec(), "{good}");
+        }
+        for bad in ["XX", "BLUE", "B", "GNY", "sw", "1"] {
+            assert!(!spec("", bad).colour_is_iec(), "{bad}");
+        }
     }
 
     #[test]
