@@ -6498,6 +6498,21 @@ mod tests {
              +A2       red \\u{1b}[31m\n"
         );
         assert!(!text.contains('\u{1b}'), "{text}");
+
+        // An escaped heading wider than every cell sets its column's width.
+        let t = wc_report::Table {
+            title: "Tags".into(),
+            columns: vec!["Tag\t".into(), "Kind".into()],
+            rows: vec![vec!["K1".into(), "x".into()]],
+            ..Default::default()
+        };
+        assert_eq!(
+            plain_table(&t),
+            "Tags\n\
+             Tag\\t  Kind\n\
+             -----  ----\n\
+             K1     x\n"
+        );
     }
 
     thread_local! {
