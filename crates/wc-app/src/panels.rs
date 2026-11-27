@@ -957,6 +957,24 @@ pub fn black_box_draft_refused(ps: &PanelState, ed: &Editor) -> bool {
     })
 }
 
+/// Whether the black box form shown holds a change not in the project: one
+/// [`apply_black_box_draft`] would apply, or one it refused. Closing the window or opening
+/// another project asks about it as about other unsaved changes (#1024).
+pub fn black_box_draft_pending(open: &Open, ps: &PanelState, ed: &Editor) -> bool {
+    black_box_draft_refused(ps, ed)
+        || ps.black_box.as_ref().is_some_and(|((page, id, hash), form)| {
+            black_box_form_shown(ed, *page, id)
+                && form.changed()
+                && open
+                    .project
+                    .pages
+                    .get(*page)
+                    .and_then(|p| p.symbol(id))
+                    .and_then(|s| open.symbols.get(&s.symbol))
+                    .is_some_and(|sym| &sym.hash() == hash)
+        })
+}
+
 /// Apply the black box form shown in the Properties panel when it has changes not applied yet
 /// (a form of a box no longer selected is left alone),
 /// as its Apply button does (one undo step): called before the project is saved (#932). A form
