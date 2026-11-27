@@ -43,7 +43,7 @@ fn a_macro_is_placed_with_the_chosen_value_set() -> TestResult {
         .arg("--no-git")
         .status()?;
     assert!(status.success());
-    wiringcraft(&dir, &["page", "add", "p1", "--number", "1"])?;
+    wiringcraft(&dir, &["page", "add", "p1", "--number", "2"])?;
     // A library source with the coil and the macro.
     let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library/symbols/wc.coil.json");
     let lib = tmp.path().join("lib");
@@ -182,7 +182,7 @@ fn a_retry_after_a_failed_placement_pins_every_symbol() -> TestResult {
         .arg("--no-git")
         .status()?;
     assert!(status.success());
-    wiringcraft(&dir, &["page", "add", "p1", "--number", "1"])?;
+    wiringcraft(&dir, &["page", "add", "p1", "--number", "2"])?;
     let coil = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library/symbols/wc.coil.json");
     let lib = tmp.path().join("lib");
     std::fs::create_dir_all(lib.join("symbols"))?;
