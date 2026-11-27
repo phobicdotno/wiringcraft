@@ -370,9 +370,9 @@ fn markers_are_found_in_a_project_inside_a_parent_repository() -> Result<()> {
 
 #[cfg(unix)]
 #[test]
-fn markers_are_found_in_a_repository_whose_folder_ends_in_a_space_or_is_not_utf8() -> Result<()> {
+fn markers_are_found_in_a_repository_whose_folder_ends_in_a_space_or_cr_or_is_not_utf8() -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
-    let mut names: Vec<&[u8]> = vec![b"repo "];
+    let mut names: Vec<&[u8]> = vec![b"repo ", b"repo\r"];
     // macOS refuses a file name that is not UTF-8.
     if cfg!(target_os = "linux") {
         names.push(b"repo\xff");

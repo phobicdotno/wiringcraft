@@ -516,10 +516,14 @@ impl Git {
         if !self.git_path("MERGE_HEAD")?.exists() {
             return Ok(());
         }
-        // As bytes, without only git's line end: a root can end in a space or not be UTF-8.
+        // As bytes, without only git's line end: a root can end in a space or not be UTF-8, and
+        // on Unix in a CR, so a CR is only part of the line end on Windows.
         let top = self.run_bytes(&["rev-parse", "--show-toplevel"])?;
-        let top = top.strip_suffix(b"\n").unwrap_or(&top);
-        let root = self.dir.join(os_path(top.strip_suffix(b"\r").unwrap_or(top)));
+        let mut top = top.strip_suffix(b"\n").unwrap_or(&top);
+        if cfg!(windows) {
+            top = top.strip_suffix(b"\r").unwrap_or(top);
+        }
+        let root = self.dir.join(os_path(top));
         let out = self.run_bytes(&["diff", "--no-relative", "--name-only", "--diff-filter=U", "-z"])?;
         let mut left = Vec::new();
         for path in out.split(|&b| b == 0).filter(|p| !p.is_empty()) {
