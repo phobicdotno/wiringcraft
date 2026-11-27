@@ -3569,11 +3569,7 @@ impl App {
                                 .spacing([12.0, 4.0])
                                 .show(ui, |ui| {
                                     for f in found.iter() {
-                                        let c = match f.severity {
-                                            wc_report::Severity::Error => t.error,
-                                            wc_report::Severity::Warning => t.selection,
-                                            wc_report::Severity::Note => t.faint,
-                                        };
+                                        let c = severity_colour(&t, f.severity);
                                         ui.label(RichText::new(f.severity.label()).color(c));
                                         let page = f
                                             .page_id
@@ -4405,15 +4401,7 @@ impl App {
                             .num_columns(3)
                             .show(ui, |ui| {
                                 for it in items.iter() {
-                                    let (c, s) = match it.state {
-                                        wc_library::State::UpToDate => {
-                                            (egui::Color32::from_rgb(0x2e, 0x8b, 0x57), "up to date")
-                                        }
-                                        wc_library::State::Changed => (t.selection, "newer in library"),
-                                        wc_library::State::NotLocked => (t.wire, "not pinned"),
-                                        wc_library::State::GoneFromLibrary => (t.error, "gone from library"),
-                                        wc_library::State::WrongId => (t.error, "library file has another id"),
-                                    };
+                                    let (c, s) = library_state_look(&t, it.state);
                                     chrome::dot(ui, c);
                                     ui.label(RichText::new(&it.id).monospace());
                                     if it.state == wc_library::State::WrongId {
@@ -5258,6 +5246,79 @@ fn find_library(exe_dir: Option<&Path>, source: &Path) -> Option<PathBuf> {
         .flatten()
         .find(|d| d.join("symbols").is_dir())
         .and_then(|d| d.canonicalize().ok())
+}
+
+/// The text colour for a Check finding. Interface tokens only: the sheet colours are tuned
+/// for the white paper and fade on the dark window.
+fn severity_colour(t: &theme::Theme, severity: wc_report::Severity) -> egui::Color32 {
+    match severity {
+        wc_report::Severity::Error => t.error,
+        wc_report::Severity::Warning => t.warning,
+        wc_report::Severity::Note => t.muted,
+    }
+}
+
+/// The dot colour and words for a pinned library item in the Library status dialog.
+fn library_state_look(t: &theme::Theme, state: wc_library::State) -> (egui::Color32, &'static str) {
+    match state {
+        wc_library::State::UpToDate => (t.success, "up to date"),
+        wc_library::State::Changed => (t.warning, "newer in library"),
+        wc_library::State::NotLocked => (t.accent, "not pinned"),
+        wc_library::State::GoneFromLibrary => (t.error, "gone from library"),
+        wc_library::State::WrongId => (t.error, "library file has another id"),
+    }
+}
+
+#[cfg(test)]
+mod status_colour_tests {
+    use super::{library_state_look, severity_colour, theme};
+
+    fn luminance(c: eframe::egui::Color32) -> f32 {
+        let ch = |v: u8| {
+            let v = v as f32 / 255.0;
+            if v <= 0.040_45 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
+    }
+
+    fn contrast(a: eframe::egui::Color32, b: eframe::egui::Color32) -> f32 {
+        let (x, y) = (luminance(a), luminance(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    #[test]
+    fn status_colours_stay_readable_on_the_window_in_both_modes() {
+        use wc_library::State;
+        use wc_report::Severity;
+        for dark in [false, true] {
+            let t = theme::Theme::new(dark);
+            let states = [
+                State::UpToDate,
+                State::Changed,
+                State::NotLocked,
+                State::GoneFromLibrary,
+                State::WrongId,
+            ];
+            for s in states {
+                let (c, _) = library_state_look(&t, s);
+                assert!(contrast(c, t.surface) >= 3.0, "{s:?} dot in dark={dark}");
+            }
+            for s in [Severity::Error, Severity::Warning, Severity::Note] {
+                let c = severity_colour(&t, s);
+                assert!(contrast(c, t.surface) >= 3.0, "{s:?} text in dark={dark}");
+            }
+            // The interface tokens, not the sheet colours they replaced.
+            assert_eq!(severity_colour(&t, Severity::Warning), t.warning);
+            assert_eq!(severity_colour(&t, Severity::Note), t.muted);
+            assert_eq!(library_state_look(&t, State::UpToDate).0, t.success);
+            assert_eq!(library_state_look(&t, State::NotLocked).0, t.accent);
+            assert_eq!(library_state_look(&t, State::Changed).0, t.warning);
+        }
+    }
 }
 
 /// The version history drawn as a subway map: one coloured line per branch lane.
