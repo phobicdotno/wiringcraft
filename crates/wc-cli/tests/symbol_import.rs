@@ -272,6 +272,48 @@ fn symbol_kicad_fails_with_a_message_on_a_missing_or_broken_file() -> TestResult
     Ok(())
 }
 
+#[test]
+fn symbol_kicad_fails_when_no_symbol_could_be_imported() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    // The warnings naming each skipped symbol come first, then the error.
+    let fails = |args: &[&str]| -> Result<String, Box<dyn std::error::Error>> {
+        let out = run(tmp.path(), args)?;
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.status.code(), Some(1), "{err}");
+        assert!(
+            err.contains("error: no symbol could be imported from the file"),
+            "{err}"
+        );
+        Ok(err)
+    };
+    // No symbols at all, and one whose only symbol draws nothing.
+    std::fs::write(
+        tmp.path().join("empty.kicad_sym"),
+        "(kicad_symbol_lib (version 20231120))",
+    )?;
+    std::fs::write(
+        tmp.path().join("blank.kicad_sym"),
+        r#"(kicad_symbol_lib (symbol "Blank" (property "Reference" "X" (at 0 0 0))))"#,
+    )?;
+    for file in ["empty.kicad_sym", "blank.kicad_sym"] {
+        fails(&["import", "symbol-kicad", file, "--lib", "lib"])?;
+    }
+    // An id prefix that is not a valid id skips every symbol.
+    std::fs::write(tmp.path().join("lamps.kicad_sym"), KICAD)?;
+    let err = fails(&[
+        "import",
+        "symbol-kicad",
+        "lamps.kicad_sym",
+        "--lib",
+        "lib",
+        "--prefix",
+        "bad prefix!",
+    ])?;
+    assert!(err.contains("Lamp:"), "{err}");
+    assert!(!tmp.path().join("lib").join("symbols").exists());
+    Ok(())
+}
+
 /// A normally open contact: a line between two terminals.
 const QET: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <definition type="element" width="20" height="40" hotspot_x="10" hotspot_y="20" version="0.80">
