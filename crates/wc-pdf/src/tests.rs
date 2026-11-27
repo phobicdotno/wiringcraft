@@ -1621,6 +1621,40 @@ fn a_coil_does_not_list_a_contact_repeated_on_an_overview_page() {
 }
 
 #[test]
+fn an_interruption_point_does_not_point_to_its_copy_on_an_overview_page() {
+    let mut symbols = BTreeMap::new();
+    symbols.insert("arrow".to_owned(), sym("arrow", SymbolRole::Interruption, ["1", "2"]));
+    let mut project = wc_core::Project::new("x");
+    let mut overview = Page::new("p1", "1", "Line diagram");
+    overview.overview = true;
+    overview.symbols.push(place("s1", "arrow", 50.0, "-L1"));
+    overview.symbols.push(place("s2", "arrow", 50.0, "-L2"));
+    let mut schematic = Page::new("p2", "2", "Power");
+    schematic.symbols.push(place("s3", "arrow", 50.0, "-L1"));
+    schematic.symbols.push(place("s4", "arrow", 150.0, "-L2"));
+    let mut feed = Page::new("p3", "3", "Control");
+    feed.symbols.push(place("s5", "arrow", 50.0, "-L2"));
+    project.pages = vec![overview, schematic, feed];
+    let x = layout::CrossRefs::build(&project, &symbols);
+    let (Some(overview), Some(schematic)) = (project.pages.first(), project.pages.get(1)) else {
+        unreachable!("three pages")
+    };
+    let mut warnings = Vec::new();
+    let marks = layout::xref_marks(schematic, &symbols, &x, &mut warnings);
+    // -L1 is repeated on the overview only: on the schematic it continues nowhere.
+    assert_eq!(marks.len(), 1, "{marks:?}");
+    assert_eq!(marks.first().map(|m| m.target_page_id.as_str()), Some("p3"));
+    assert_eq!(marks.first().map(|m| m.text.as_str()), Some("3/2.B"));
+    assert_eq!(warnings, ["page 2: interruption point -L1 has no partner"]);
+    // The copies on the overview still point to their schematic drawings.
+    let mut warnings = Vec::new();
+    let back = layout::xref_marks(overview, &symbols, &x, &mut warnings);
+    let targets: Vec<&str> = back.iter().map(|m| m.target_page_id.as_str()).collect();
+    assert_eq!(targets, ["p2", "p2"], "{back:?}");
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
 fn cross_references_give_page_column_and_row() {
     let mut symbols = BTreeMap::new();
     symbols.insert("coil".to_owned(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
