@@ -409,12 +409,18 @@ pub struct Section {
 pub fn device_entry(d: &AmlDevice, parts: &mut Vec<wc_core::Part>) -> Option<(DeviceTag, Device)> {
     let tag = d.tag.clone()?;
     let (manufacturer, order) = part_fields(&d.properties);
+    // Our own export writes the part's description as `PartDescription`.
+    let part_description = d
+        .properties
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("PartDescription"))
+        .map_or_else(|| d.name.clone(), |(_, v)| v.clone());
     let part = order.map(|o| {
         let p = wc_core::Part {
             id: wc_core::Part::make_id(manufacturer.as_deref().unwrap_or(""), &o),
             manufacturer: manufacturer.unwrap_or_default(),
             order_number: o,
-            description: d.name.clone(),
+            description: part_description,
             symbol: None,
             properties: d.properties.clone(),
             contacts: None,
@@ -750,6 +756,7 @@ mod tests {
             id: "acme.r24".into(),
             manufacturer: "Acme".into(),
             order_number: "R-24".into(),
+            description: "Relay 24 V".into(),
             ..Default::default()
         };
         project.devices.insert(
@@ -787,6 +794,7 @@ mod tests {
             (parts_out[0].manufacturer.as_str(), parts_out[0].order_number.as_str()),
             ("Acme", "R-24")
         );
+        assert_eq!(parts_out[0].description, "Relay 24 V");
         assert_eq!(imp.links.len(), 1);
         let l = &imp.links[0];
         assert_eq!(l.name, "L+");
