@@ -418,7 +418,27 @@ pub fn replace_renaming(
         // A device no page draws changes only its entry: still one change.
         changed += p.rename_device(temp, to).max(1);
     }
+    // A spare of a strip that moves only through its numbered terminals goes with the layout:
+    // put back first, so the layout is not refused for the data at its new tag, and moved on
+    // its own only when the layout stays.
+    let spares: Vec<(DeviceTag, DeviceTag)> = renames
+        .iter()
+        .filter(|(from, _)| {
+            let (strip, n) = from.terminal_parts();
+            !renames.contains_key(&strip)
+                && n.is_some_and(|n| project.meta.strip_layout(&strip).is_some_and(|l| l.spares.contains(&n)))
+        })
+        .map(|(from, to)| (from.clone(), to.clone()))
+        .collect();
+    for (from, to) in &spares {
+        p.rename_device(to, from);
+    }
     crate::project::follow_terminals_in(&mut p, &terminals, |_| None);
+    for (from, to) in &spares {
+        if p.devices.contains_key(from) && !p.devices.contains_key(to) {
+            p.rename_device(from, to);
+        }
+    }
     *project = p;
     Ok((changed, renames))
 }
@@ -750,14 +770,27 @@ mod tests {
         let layout = |strip: &str| crate::project::StripLayout {
             strip: tag(strip),
             order: vec!["2".into(), "1".into()],
-            spares: Vec::new(),
+            spares: vec!["S1".into()],
         };
         p.meta.strips.push(layout("-X1"));
+        p.devices.insert(
+            tag("-X1.S1"),
+            Device {
+                part: Some("WAGO.2002-1201".into()),
+                ..Default::default()
+            },
+        );
         let opts = FindOptions { match_case: true };
         let hits = find(&p, "X1", opts);
-        assert_eq!(replace(&mut p, &hits, "X1", "X2", opts), Ok(2));
+        assert_eq!(replace(&mut p, &hits, "X1", "X2", opts), Ok(3));
         assert_eq!(p.meta.jumpers, [jumper("-X2")], "the jumper follows its terminals");
         assert_eq!(p.meta.strips, [layout("-X2")], "the layout follows its terminals");
+        assert_eq!(
+            p.devices.get(&tag("-X2.S1")).and_then(|d| d.part.as_deref()),
+            Some("WAGO.2002-1201"),
+            "the spare's part goes with it"
+        );
+        assert!(!p.devices.contains_key(&tag("-X1.S1")));
     }
 
     #[test]
