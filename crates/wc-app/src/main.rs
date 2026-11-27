@@ -2751,7 +2751,8 @@ impl App {
                         {
                             self.open_url.push(format!("file://{}", dir.display()));
                         }
-                        if ui.button("Cancel").clicked() {
+                        // Escape is Cancel, as in the other dialogs: no form opens.
+                        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
                             keep = false;
                         }
                     });
@@ -8143,6 +8144,27 @@ mod nudge_tests {
     fn coil_on_disk(app: &App) -> Point {
         let saved = wc_core::store::load(&app.open.as_ref().unwrap().dir).unwrap();
         saved.pages[app.ed.page].symbols[1].at
+    }
+
+    /// Escape closes Help, Report a problem as Cancel does: no form is opened (#1632).
+    #[test]
+    fn escape_cancels_the_report_a_problem_dialog() {
+        let (_tmp, mut app, ctx) = app(Point::new(55.0, 60.0), false);
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        app.carry_out(Action::ReportProblem);
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        assert!(matches!(app.dialog, Some(Dialog::Report { .. })), "the dialog is open");
+        let escape = egui::Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        app_frame(&mut app, &ctx, vec![escape], false);
+        assert!(app.dialog.is_none(), "Escape cancels");
+        assert!(app.copied_text.is_none(), "no log is copied for a form");
     }
 
     /// Closing the window with unsaved changes asks first: Cancel keeps the window and the
