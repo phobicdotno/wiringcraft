@@ -1082,6 +1082,13 @@ pub(crate) fn fit_at(s: &str, width: f64, height: f64) -> String {
     format!("{out}...")
 }
 
+/// A sheet heading drawn 4 mm high, at most `width` mm wide: `title` cut short with "..." when
+/// it is too long, followed by `counter` (such as " (2 / 3)"), which is always kept whole.
+pub(crate) fn fit_heading(title: &str, counter: &str, width: f64) -> String {
+    let room = width - text_width_mm(counter, 4.0);
+    format!("{}{counter}", fit_at(title, room, 4.0))
+}
+
 /// One line of a report page's table: a row of the table, by its index, or the heading of a
 /// group of rows ([`wc_report::Table::group`]) with its value, marked when it continues the
 /// group from the page before.
@@ -1156,12 +1163,12 @@ pub fn draw_table_page(
     frame(&mut pen, project, page, index, total, date);
     let (x0, x1) = (MARGIN + 6.0, w - MARGIN - 6.0);
     let mut y = MARGIN + HEADER + 10.0;
-    let heading = if part.1 > 1 {
-        format!("{} ({} / {})", table.title, part.0, part.1)
+    let counter = if part.1 > 1 {
+        format!(" ({} / {})", part.0, part.1)
     } else {
-        table.title.clone()
+        String::new()
     };
-    pen.text((x0, y), 4.0, 0, &heading);
+    pen.text((x0, y), 4.0, 0, &fit_heading(&table.title, &counter, x1 - x0));
     y += 4.0;
     if !table.header.is_empty() {
         // The title-block values the layout asks for, as on the page's title block.
@@ -1368,10 +1375,12 @@ pub fn draw_card_page(
     frame(&mut pen, project, page, index, total, date);
     let (x0, x1) = (MARGIN + 6.0, w - MARGIN - 6.0);
     let top = MARGIN + HEADER + 10.0;
-    let mut heading = format!("PLC card {}", card.card);
-    if part.1 > 1 {
-        heading.push_str(&format!(" ({} / {})", part.0, part.1));
-    }
+    let counter = if part.1 > 1 {
+        format!(" ({} / {})", part.0, part.1)
+    } else {
+        String::new()
+    };
+    let heading = fit_heading(&format!("PLC card {}", card.card), &counter, x1 - x0);
     pen.text((x0, top), 4.0, 0, &heading);
     let mut about = vec![];
     if !card.rack.is_empty() {

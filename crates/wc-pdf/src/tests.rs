@@ -3185,3 +3185,69 @@ fn text_the_pdf_cannot_print_is_warned_about_once_per_sheet() {
         vec!["page 1: the PDF cannot print Ω Ж а р in its text; they show as ?".to_string()]
     );
 }
+
+#[test]
+fn a_long_report_or_plc_card_heading_is_cut_to_the_frame_and_keeps_its_counter() {
+    let mut project = Project::new("x");
+    project.pages = vec![Page::new("p1", "1", "Inputs")];
+    let long = "Device list for the north basin pumping station, the second pump hall and its \
+                cabinets, with every spare and every terminal named on the drawings, listed \
+                again for the south basin, its pump hall, its cabinets and every spare there";
+    let table = wc_report::Table {
+        title: long.into(),
+        columns: vec!["Tag".into()],
+        ..Default::default()
+    };
+    let card = wc_report::PlcCardSheet {
+        card: long.into(),
+        ..Default::default()
+    };
+    let page = Page::new("r", "R1", "Report");
+    let (w, _) = page.size.mm();
+    let right = w - layout::MARGIN - 6.0;
+    let headings = |drawn: &writer::Drawn| -> Vec<(f64, String)> {
+        drawn
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                writer::Prim::Text { at, height, text, .. } if (*height - 4.0).abs() < 1e-9 => {
+                    Some((at.0 + writer::text_width_mm(text, 4.0), text.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let report = layout::draw_table_page(&project, &page, 0, 3, &table, &[], (2, 3), "");
+    let card_sheet = layout::draw_card_page(&project, &page, 0, 3, &card, 0, (2, 3), "");
+    for (what, drawn, start) in [
+        ("report", &report, "Device list"),
+        ("card", &card_sheet, "PLC card Device"),
+    ] {
+        let found: Vec<(f64, String)> = headings(drawn)
+            .into_iter()
+            .filter(|(_, t)| t.starts_with(start))
+            .collect();
+        let [(end, text)] = found.as_slice() else {
+            unreachable!("one {what} heading, got {found:?}")
+        };
+        assert!(
+            *end <= right + 1e-6,
+            "{what} heading {text:?} ends at {end} mm, past {right} mm"
+        );
+        assert!(
+            text.ends_with("... (2 / 3)"),
+            "{what} heading {text:?} is cut and keeps its counter"
+        );
+    }
+    // A short title is drawn whole.
+    let short = wc_report::Table {
+        title: "Devices".into(),
+        ..table
+    };
+    let drawn = layout::draw_table_page(&project, &page, 0, 1, &short, &[], (1, 1), "");
+    assert!(
+        headings(&drawn).iter().any(|(_, t)| t == "Devices"),
+        "{:?}",
+        headings(&drawn)
+    );
+}
