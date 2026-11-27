@@ -27,6 +27,13 @@ The version comes from the first `version = "..."` line in the root `Cargo.toml`
 for `version = "0.1.0"`), or the job fails with "tag ... does not match version ... in
 Cargo.toml".
 
+The Linux and macOS steps of `release.yml` set `v=${{ steps.version.outputs.version }}`, which
+only works in CI. For a local build, set `v` yourself from the repository root first:
+
+```sh
+v=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+```
+
 ## Windows: setup .exe
 
 Built on `windows-latest` with Inno Setup 6 from `packaging/windows/wiringcraft.iss`. Output:
@@ -92,12 +99,13 @@ Package fields: `Depends: libc6 (>= 2.35), libgcc-s1, git` and
 `sudo apt remove wiringcraft`.
 
 Build it locally on Linux (Rust stable, `dpkg-deb`). There is no script for it: run the commands
-of the "Package (Linux)" step in `release.yml`. In short, `cargo build --release -p wc-cli -p wc-app`,
-copy the files above into a folder `wiringcraft_<version>_amd64` with `install -D`, write
+of the "Package (Linux)" step in `release.yml`, with `v` set as in the Version section. In short,
+`cargo build --release -p wc-cli -p wc-app`, copy the files above into a folder `wiringcraft_<version>_amd64` with `install -D`, write
 `DEBIAN/control` as in the step, then:
 
 ```sh
-dpkg-deb --root-owner-group --build wiringcraft_0.1.0_amd64 dist/wiringcraft-0.1.0-linux-amd64.deb
+mkdir -p dist
+dpkg-deb --root-owner-group --build "wiringcraft_${v}_amd64" "dist/wiringcraft-$v-linux-amd64.deb"
 ```
 
 ## macOS: .dmg
@@ -125,10 +133,16 @@ for t in aarch64-apple-darwin x86_64-apple-darwin; do
 done
 ```
 
-Then run the rest of the "Package (macOS)" step in `release.yml`: build `stage/WiringCraft.app`
-with `lipo -create`, the `sed` on `Info.plist` and the copies, sign it ad hoc
-(`codesign --force --deep --sign - stage/WiringCraft.app`), add the `Applications` link and run
-`hdiutil create -volname WiringCraft -srcfolder stage -format UDZO -ov dist/wiringcraft-<version>-macos-universal.dmg`.
+Then set `v` as in the Version section (without it the `sed` on `Info.plist` replaces
+`@VERSION@` with nothing) and run the rest of the "Package (macOS)" step in `release.yml`: build
+`stage/WiringCraft.app` with `lipo -create`, the `sed` on `Info.plist` and the copies, sign it ad
+hoc (`codesign --force --deep --sign - stage/WiringCraft.app`) and add the `Applications` link.
+Then:
+
+```sh
+mkdir -p dist
+hdiutil create -volname WiringCraft -srcfolder stage -format UDZO -ov "dist/wiringcraft-$v-macos-universal.dmg"
+```
 
 ## Where the app finds the starter library
 
