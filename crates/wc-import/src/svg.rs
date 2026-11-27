@@ -187,8 +187,12 @@ fn font_size(v: &str) -> Option<f64> {
 }
 
 /// Elements whose content a browser never draws in place: definitions, markers, clip paths,
-/// masks and patterns. A `<symbol>` is drawn only through `<use>`, which is not imported.
-const NOT_DRAWN: [&str; 6] = ["defs", "symbol", "marker", "clipPath", "mask", "pattern"];
+/// masks and patterns, and the tooltip and notes elements (`<title>`, `<desc>`, `<metadata>`),
+/// whose words never join a label. A `<symbol>` is drawn only through `<use>`, which is not
+/// imported.
+const NOT_DRAWN: [&str; 9] = [
+    "defs", "symbol", "marker", "clipPath", "mask", "pattern", "title", "desc", "metadata",
+];
 
 /// Whether an element is drawn at all, and whether it is visible, from its parent's
 /// `(drawn, visible)`. `display:none` and the containers in [`NOT_DRAWN`] hide everything under
@@ -791,6 +795,11 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
     let mut pins: Vec<(Option<String>, Point)> = Vec::new();
     // Where a `<text>` still waiting for its words starts, and its angle.
     let mut pending_text: Option<(Point, f64)> = None;
+    // The open `<text>`'s own `x` and `y`, for a `<tspan>` that sets only one of them.
+    let mut text_xy: Option<(f64, f64)> = None;
+    // The label the open `<text>` is writing into (an index in `shapes`), and whether a space
+    // comes before its next words.
+    let mut label: Option<(usize, bool)> = None;
     let mut seen_root = false;
     let mut depth_guard = 0usize;
     loop {
@@ -799,9 +808,13 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
             Event::Start(e) => (Some(e.clone()), false),
             Event::Empty(e) => (Some(e.clone()), true),
             Event::End(e) => {
-                // A `<text>` with no words in it must not hand its place to later text.
-                if e.local_name().as_ref() == b"text" {
+                // A `<text>` with no words in it must not hand its place to later text. A
+                // `<text>` that is not drawn (one in another namespace inside `<metadata>`, say)
+                // never took the state, so its end leaves the open `<text>`'s state alone.
+                if e.local_name().as_ref() == b"text" && shows.last().is_none_or(|s| s.0) {
                     pending_text = None;
+                    text_xy = None;
+                    label = None;
                 }
                 if stack.len() > 1 {
                     stack.pop();
@@ -813,20 +826,33 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
                 (None, false)
             }
             Event::Text(t) => {
-                // Only text for a pending label is read; other text is ignored. A hidden run
+                // Only text in a `<text>` is read; other text is ignored. A hidden run
                 // (a `<tspan>` with `display="none"` or `visibility="hidden"`) is skipped and
-                // leaves the label waiting for a visible one. The run's own element (the `<text>`
-                // or a `<tspan>` in it) gives the size and alignment.
+                // leaves the label waiting for a visible one. The first run's own element (the
+                // `<text>` or a `<tspan>` in it) gives the size and alignment; later runs on the
+                // same line (`K<tspan>1</tspan>`) are added to its words, with one space where
+                // the file has white space between them.
                 let shown_run = shows.last().copied().unwrap_or((true, true)) == (true, true);
-                if let (Some((at, angle)), true) = (pending_text, shown_run) {
-                    let s = t
-                        .unescape()
-                        .map_err(|e| Error::Format(format!("SVG: {e}")))?
-                        .trim()
-                        .to_owned();
-                    // Skip the line breaks and indents between `<text>` and a `<tspan>`.
-                    if !s.is_empty() {
+                if (pending_text.is_some() || label.is_some()) && shown_run {
+                    let raw = t.unescape().map_err(|e| Error::Format(format!("SVG: {e}")))?;
+                    let s = raw.trim().to_owned();
+                    let space_after = raw.ends_with(char::is_whitespace);
+                    if let Some((i, space)) = label
+                        && pending_text.is_none()
+                    {
+                        if s.is_empty() {
+                            label = Some((i, space || !raw.is_empty()));
+                        } else if let Some(Shape::Text { text, .. }) = shapes.get_mut(i) {
+                            if space || raw.starts_with(char::is_whitespace) {
+                                text.push(' ');
+                            }
+                            text.push_str(&s);
+                            label = Some((i, space_after));
+                        }
+                    } else if let (Some((at, angle)), false) = (pending_text, s.is_empty()) {
+                        // Skip the line breaks and indents between `<text>` and a `<tspan>`.
                         pending_text = None;
+                        label = Some((shapes.len(), space_after));
                         let f = fonts.last().copied().unwrap_or_default();
                         let sc = stack.last().copied().unwrap_or(M::ID).scale();
                         shapes.push(Shape::Text {
@@ -882,9 +908,9 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
             path_count += 1;
         }
         let fnt = font(&e, fonts.last().copied().unwrap_or_default());
-        // An invisible `<text>` still sets up its label: a `<tspan>` in it can be visible again,
-        // and each run of words is checked on its own.
-        if !show.0 || (!show.1 && tag != "text") {
+        // An invisible `<text>` or `<tspan>` still sets up its label and place: a `<tspan>` in
+        // it can be visible again, and each run of words is checked on its own.
+        if !show.0 || (!show.1 && tag != "text" && tag != "tspan") {
             // Hidden: no shapes, pins or text, but its children still need its state.
             if !empty {
                 stack.push(m);
@@ -1052,7 +1078,23 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
             "text" => {
                 // The size and alignment are read when its words come (see `fonts`).
                 if !empty {
-                    pending_text = Some((m.p(num(&e, "x"), num(&e, "y")), m.text_angle()));
+                    let xy = (num(&e, "x"), num(&e, "y"));
+                    pending_text = Some((m.p(xy.0, xy.1), m.text_angle()));
+                    text_xy = Some(xy);
+                    label = None;
+                }
+                None
+            }
+            // A `<tspan>` placed with its own `x` or `y` (a new line, as Inkscape writes one)
+            // starts a label of its own there; the other coordinate is the text's.
+            "tspan" => {
+                if let Some((tx, ty)) = text_xy
+                    && (attr(&e, "x").is_some() || attr(&e, "y").is_some())
+                {
+                    let x = attr(&e, "x").map_or(tx, |_| num(&e, "x"));
+                    let y = attr(&e, "y").map_or(ty, |_| num(&e, "y"));
+                    pending_text = Some((m.p(x, y), m.text_angle()));
+                    label = None;
                 }
                 None
             }
@@ -1975,6 +2017,84 @@ mod tests {
         // Unreadable text with no label waiting for it is ignored, as before.
         let title = r#"<svg><title>&missing;</title><line x1="0" y1="0" x2="1" y2="1"/></svg>"#;
         assert!(symbol(title, "svg.title", "Title").is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn words_after_a_tspan_stay_in_the_label() -> Result<()> {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg">
+            <circle id="pin:1" cx="0" cy="0" r="0.5"/>
+            <text x="0" y="0">-K<tspan font-weight="bold">1</tspan></text>
+            <text x="0" y="5">Relay <tspan>coil</tspan>
+              <tspan>A1</tspan></text>
+            <text x="1" y="10"><tspan x="1" y="10">Line one</tspan><tspan x="1" y="14">Line two</tspan></text>
+            <text x="2" y="20">Top<tspan y="24">Low</tspan></text>
+        </svg>"#;
+        let s = symbol(svg, "svg.runs", "Runs")?;
+        let o = pin_at(&s, "1");
+        let texts: Vec<(&str, Point)> = s
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Text { text, at, .. } => Some((text.as_str(), Point::new(at.x + o.x, at.y + o.y))),
+                _ => None,
+            })
+            .collect();
+        let words: Vec<&str> = texts.iter().map(|t| t.0).collect();
+        assert_eq!(
+            words,
+            vec!["-K1", "Relay coil A1", "Line one", "Line two", "Top", "Low"],
+            "no words are lost"
+        );
+        assert!(
+            near(texts[3].1, Point::new(1.0, 14.0)),
+            "a tspan line starts at its own place"
+        );
+        assert!(near(texts[5].1, Point::new(2.0, 24.0)), "a missing x is the text's");
+        Ok(())
+    }
+
+    #[test]
+    fn a_hidden_tspan_places_its_visible_words_and_notes_stay_out() -> Result<()> {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg">
+            <circle id="pin:1" cx="0" cy="0" r="0.5"/>
+            <text x="0" y="0">A<tspan y="10" visibility="hidden"><tspan visibility="visible">B</tspan></tspan></text>
+            <text x="0" y="20">C<tspan><title>tooltip</title>D</tspan><desc>note</desc></text>
+            <text x="0" y="30">E<tspan y="40" display="none"><tspan visibility="visible">F</tspan></tspan></text>
+        </svg>"#;
+        let s = symbol(svg, "svg.hidden", "Hidden")?;
+        let texts: Vec<(&str, Point)> = s
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Text { text, at, .. } => Some((text.as_str(), *at)),
+                _ => None,
+            })
+            .collect();
+        let words: Vec<&str> = texts.iter().map(|t| t.0).collect();
+        assert_eq!(words, vec!["A", "B", "CD", "E"]);
+        assert!(near(texts[1].1, Point::new(0.0, 10.0)), "the hidden tspan's y places B");
+        Ok(())
+    }
+
+    #[test]
+    fn a_text_inside_metadata_does_not_end_the_open_text() -> Result<()> {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg">
+            <circle id="pin:1" cx="0" cy="0" r="0.5"/>
+            <text x="0" y="5"><metadata><text xmlns="urn:notes">note</text></metadata>Relay</text>
+        </svg>"#;
+        let s = symbol(svg, "svg.meta", "Meta")?;
+        let texts: Vec<(&str, Point)> = s
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Text { text, at, .. } => Some((text.as_str(), *at)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        assert_eq!(texts[0].0, "Relay");
+        assert!(near(texts[0].1, Point::new(0.0, 5.0)));
         Ok(())
     }
 
