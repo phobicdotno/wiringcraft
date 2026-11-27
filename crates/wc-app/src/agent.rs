@@ -2939,16 +2939,18 @@ impl App {
         let current = open.project.devices.get(&t).and_then(|d| d.part.as_deref());
         // A part the device already has is not taken again, as set_device_part leaves it alone.
         let new_part = part.filter(|p| !p.is_empty() && Some(*p) != current);
-        if new_part.is_some() || list.is_some() {
-            let ids = new_part
-                .into_iter()
-                .chain(list.iter().flatten().map(|a| a.part.as_str()));
-            open.check_parts(ids)?;
-        }
+        let ids = new_part
+            .into_iter()
+            .chain(list.iter().flatten().map(|a| a.part.as_str()));
+        let rename_to = s(v, "rename_to").map(tag).transpose()?;
+        // A refused rename takes back the part copies the check took into the project.
+        let renamed = open.check_parts_then(ids, |o| {
+            rename_to
+                .map(|to| o.rename_device(&t, &to).map(|n| (to, n)))
+                .transpose()
+        })?;
         let mut done = Vec::new();
-        if let Some(to) = s(v, "rename_to") {
-            let to = tag(to)?;
-            let n = open.rename_device(&t, &to)?;
+        if let Some((to, n)) = renamed {
             done.push(format!("renamed to {to} ({n} symbol(s))"));
             t = to;
         }
@@ -5607,6 +5609,43 @@ mod tests {
                 .and_then(|d| d.part.as_deref()),
             Some("no.such")
         );
+    }
+
+    #[test]
+    fn set_device_with_a_refused_rename_takes_no_part_into_the_project() {
+        let (_tmp, mut a) = app(vec![]);
+        call(&mut a, "set_device", json!({"tag": "-K1"})).unwrap();
+        call(&mut a, "set_device", json!({"tag": "-K2"})).unwrap();
+        let open = a.open.as_ref().unwrap();
+        let mark = open.undo_mark();
+        let id = "example.ex-tb-2-5";
+        let copy = wc_core::store::vendor_path(&open.dir, wc_core::lock::ItemKind::Part, id).unwrap();
+        assert!(
+            !copy.exists() && !open.parts.contains_key(id),
+            "the project does not have the part yet"
+        );
+        for v in [
+            json!({"tag": "-K1", "rename_to": "-K2", "part": id}),
+            json!({"tag": "-K1", "rename_to": "-K2", "accessories": [{"part": id}]}),
+        ] {
+            let r = call(&mut a, "set_device", v.clone());
+            assert!(r.as_ref().is_err_and(|e| e.contains("already used")), "{v}: {r:?}");
+            let open = a.open.as_ref().unwrap();
+            assert!(!copy.exists(), "{v}: no part copy left in the project");
+            assert!(!open.parts.contains_key(id), "{v}: the part is not loaded");
+            assert!(!open.project.lock.parts.contains_key(id), "{v}: no pin");
+            assert_eq!(open.undo_mark(), mark, "{v}: no undo step");
+        }
+        // The same change with a free tag goes through and takes the part.
+        let said = call(
+            &mut a,
+            "set_device",
+            json!({"tag": "-K1", "rename_to": "-K3", "part": id}),
+        )
+        .unwrap();
+        assert!(said.contains("renamed to -K3") && said.contains(id), "{said}");
+        let open = a.open.as_ref().unwrap();
+        assert!(copy.exists() && open.parts.contains_key(id) && open.project.lock.parts.contains_key(id));
     }
 
     #[test]
