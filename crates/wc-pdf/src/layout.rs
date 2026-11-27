@@ -1078,7 +1078,10 @@ pub(crate) fn fit_at(s: &str, width: f64, height: f64) -> String {
     // The longest start of `s` that still fits with "..." after it. A longer start is never
     // narrower, so the cut point is found by halving: a few measures, not one per character.
     let ends: Vec<usize> = s.char_indices().map(|(i, _)| i).skip(1).collect();
-    let fits = |end: usize| text_width_mm(&format!("{}...", &s[..end]), height) <= width;
+    let fits = |end: usize| {
+        s.get(..end)
+            .is_some_and(|start| text_width_mm(&format!("{start}..."), height) <= width)
+    };
     let (mut lo, mut hi) = (0, ends.len());
     while lo < hi {
         let mid = (lo + hi).div_ceil(2);
@@ -1089,7 +1092,7 @@ pub(crate) fn fit_at(s: &str, width: f64, height: f64) -> String {
         }
     }
     let end = lo.checked_sub(1).and_then(|i| ends.get(i)).map_or(0, |&e| e);
-    format!("{}...", &s[..end])
+    format!("{}...", s.get(..end).unwrap_or_default())
 }
 
 /// A sheet heading drawn 4 mm high, at most `width` mm wide: `title` cut short with "..." when
