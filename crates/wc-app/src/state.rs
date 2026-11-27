@@ -4028,7 +4028,7 @@ impl Open {
             rule,
             overwrite,
             |page| held.contains_key(&page.id),
-            |id| symbols.get(id).map(|s| s.role),
+            |id| symbols.get(id),
             |page, end| match end {
                 wc_core::Endpoint::Point { at } => Some(*at),
                 wc_core::Endpoint::Pin { item, pin } => {

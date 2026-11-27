@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use crate::geom::Point;
 use crate::project::{Endpoint, Page, Project};
-use crate::symbol::SymbolRole;
+use crate::symbol::{Symbol, SymbolRole};
 
 /// A pin on a placed symbol: (page id, placed symbol id, pin name).
 pub type PinRef = (String, String, String);
@@ -60,7 +60,9 @@ impl Graph {
 
     /// Join each wire of `page` to its two ends and to its potential name. Returns each
     /// wire's `from` node, in the page's wire order.
-    fn add_wires(&mut self, page: &Page) -> Vec<usize> {
+    /// `symbol(library id)` gives a placed symbol's library symbol, so a wire end on a pin has a
+    /// place; with `None` the segments that end on that pin are not known here.
+    fn add_wires<'s>(&mut self, page: &Page, symbol: &dyn Fn(&str) -> Option<&'s Symbol>) -> Vec<usize> {
         let node = |e: &Endpoint| match e {
             Endpoint::Pin { item, pin } => Node::Pin((page.id.clone(), item.clone(), pin.clone())),
             Endpoint::Point { at } => {
@@ -83,7 +85,7 @@ impl Graph {
         }
         // A free end on another wire's segment (a T, where the drawing puts a junction dot)
         // joins that wire.
-        let paths = known_paths(page);
+        let paths = known_paths(page, symbol);
         for (wi, w) in page.wires.iter().enumerate() {
             for e in [&w.from, &w.to] {
                 let Endpoint::Point { at: q } = e else { continue };
@@ -103,20 +105,24 @@ impl Graph {
 }
 
 /// The part of each wire of `page` whose place is known here, in the page's wire order: its
-/// free ends and its bends. A pin's place needs its symbol, so a segment that ends on a pin is
-/// left out.
-fn known_paths(page: &Page) -> Vec<Vec<Point>> {
-    let free = |e: &Endpoint| match e {
+/// free ends, its bends, and its ends on pins whose symbol `symbol` knows. A segment that ends
+/// on a pin of an unknown symbol is left out.
+fn known_paths<'s>(page: &Page, symbol: &dyn Fn(&str) -> Option<&'s Symbol>) -> Vec<Vec<Point>> {
+    let place = |e: &Endpoint| match e {
         Endpoint::Point { at } => Some(*at),
-        Endpoint::Pin { .. } => None,
+        Endpoint::Pin { item, pin } => {
+            let placed = page.symbol(item)?;
+            let p = symbol(&placed.symbol)?.pin(pin)?;
+            Some(p.at.transform(placed.rotation, placed.mirror) + placed.at)
+        }
     };
     page.wires
         .iter()
         .map(|w| {
-            free(&w.from)
+            place(&w.from)
                 .into_iter()
                 .chain(w.via.iter().copied())
-                .chain(free(&w.to))
+                .chain(place(&w.to))
                 .collect()
         })
         .collect()
@@ -179,7 +185,12 @@ fn wire_groups(project: &Project) -> BTreeMap<(usize, usize), usize> {
     let mut g = Graph::default();
     let mut first = Vec::new();
     for (pi, page) in project.pages.iter().enumerate() {
-        first.extend(g.add_wires(page).into_iter().enumerate().map(|(wi, a)| ((pi, wi), a)));
+        first.extend(
+            g.add_wires(page, &|_| None)
+                .into_iter()
+                .enumerate()
+                .map(|(wi, a)| ((pi, wi), a)),
+        );
     }
     first.into_iter().map(|(w, a)| (w, g.dsu.find(a))).collect()
 }
@@ -212,7 +223,9 @@ pub fn new_point_joins(before: &Project, after: &Project) -> Vec<NewJoin> {
             }
         }
         let id = |wi: usize| ap.wires.get(wi).map_or_else(String::new, |w| w.id.clone());
-        let paths = known_paths(ap);
+        // Without symbols here, only free ends and bends have a place: a segment that ends on a
+        // pin is not looked at (the box edit that calls this knows no pin places).
+        let paths = known_paths(ap, &|_| None);
         for ends in at.values() {
             for &(wi, on_pin, p) in ends {
                 if !on_pin {
@@ -272,13 +285,14 @@ pub fn nets(project: &Project) -> Vec<Net> {
     nets_linked(project, |_| None)
 }
 
-/// Like [`nets`], and also joins interruption points. `role(symbol id)` is the role of a placed
-/// symbol's library symbol (`None` when it is not known): every interruption point is connected
+/// Like [`nets`], and also joins interruption points. `symbol(library id)` is a placed symbol's
+/// library symbol (`None` when it is not known): it gives each symbol's role and pin places,
+/// so a free wire end on a segment that ends on a pin joins that wire. Every interruption point is connected
 /// to the others with the same device tag (one on an overview page, `Page::overview`, only to
 /// those on overview pages), and only terminals (or symbols of unknown role) take part in
 /// jumpers.
-pub fn nets_linked(project: &Project, role: impl Fn(&str) -> Option<SymbolRole>) -> Vec<Net> {
-    wire_nets(project, role).0
+pub fn nets_linked<'s>(project: &Project, symbol: impl Fn(&str) -> Option<&'s Symbol>) -> Vec<Net> {
+    wire_nets(project, symbol).0
 }
 
 /// A wire: (page id, wire id).
@@ -287,8 +301,11 @@ pub type WireRef = (String, String);
 /// Like [`nets_linked`], and also says which net each wire belongs to (an index into the nets).
 /// A wire that touches no pin, directly or through other wires, belongs to no net. Two wires
 /// with the same id on one page share a key here: [`wire_nets_by_place`] tells them apart.
-pub fn wire_nets(project: &Project, role: impl Fn(&str) -> Option<SymbolRole>) -> (Vec<Net>, BTreeMap<WireRef, usize>) {
-    let (nets, by_place) = wire_nets_by_place(project, role);
+pub fn wire_nets<'s>(
+    project: &Project,
+    symbol: impl Fn(&str) -> Option<&'s Symbol>,
+) -> (Vec<Net>, BTreeMap<WireRef, usize>) {
+    let (nets, by_place) = wire_nets_by_place(project, symbol);
     let wires = by_place
         .into_iter()
         .filter_map(|((pi, wi), n)| {
@@ -301,11 +318,11 @@ pub fn wire_nets(project: &Project, role: impl Fn(&str) -> Option<SymbolRole>) -
 
 /// Like [`wire_nets`], with each wire known by its place: (page index, wire index in the page),
 /// as wire ids need not be unique on a page.
-pub fn wire_nets_by_place(
+pub fn wire_nets_by_place<'s>(
     project: &Project,
-    role: impl Fn(&str) -> Option<SymbolRole>,
+    symbol: impl Fn(&str) -> Option<&'s Symbol>,
 ) -> (Vec<Net>, BTreeMap<(usize, usize), usize>) {
-    let (mut g, wire_nodes) = linked_graph(project, role);
+    let (mut g, wire_nodes) = linked_graph(project, symbol);
     let mut index_of_root: BTreeMap<usize, usize> = BTreeMap::new();
     let mut nets = Vec::new();
     for (root, net) in groups(&mut g) {
@@ -324,8 +341,8 @@ pub fn wire_nets_by_place(
 /// The nets of [`nets_linked`] that carry more than one potential name (a short, such as L1
 /// joined to L2), together with such groups that touch no pin: wires that meet only each other
 /// at junctions still short their potentials, though they make no net of their own.
-pub fn shorted_nets(project: &Project, role: impl Fn(&str) -> Option<SymbolRole>) -> Vec<Net> {
-    let (mut g, _) = linked_graph(project, role);
+pub fn shorted_nets<'s>(project: &Project, symbol: impl Fn(&str) -> Option<&'s Symbol>) -> Vec<Net> {
+    let (mut g, _) = linked_graph(project, symbol);
     groups(&mut g).into_values().filter(|n| n.names.len() > 1).collect()
 }
 
@@ -348,11 +365,12 @@ fn groups(g: &mut Graph) -> BTreeMap<usize, Net> {
 type WireNodes = Vec<((usize, usize), usize)>;
 
 /// The connection graph of [`wire_nets_by_place`], with each wire's `from` node by its place.
-fn linked_graph(project: &Project, role: impl Fn(&str) -> Option<SymbolRole>) -> (Graph, WireNodes) {
+fn linked_graph<'s>(project: &Project, symbol: impl Fn(&str) -> Option<&'s Symbol>) -> (Graph, WireNodes) {
+    let role = |id: &str| symbol(id).map(|s| s.role);
     let mut g = Graph::default();
     let mut wire_nodes: WireNodes = Vec::new();
     for (pi, page) in project.pages.iter().enumerate() {
-        let from = g.add_wires(page);
+        let from = g.add_wires(page, &symbol);
         wire_nodes.extend(from.into_iter().enumerate().map(|(wi, a)| ((pi, wi), a)));
         for s in &page.symbols {
             let Some(tag) = &s.tag else { continue };
@@ -382,7 +400,7 @@ fn linked_graph(project: &Project, role: impl Fn(&str) -> Option<SymbolRole>) ->
     let numbers = if project.meta.jumpers.is_empty() {
         Default::default()
     } else {
-        crate::project::terminal_numbers(project, &role)
+        crate::project::terminal_numbers(project, role)
     };
     for (k, j) in project.meta.jumpers.iter().enumerate() {
         for page in &project.pages {
@@ -409,6 +427,29 @@ mod tests {
     use super::*;
     use crate::geom::Point;
     use crate::project::{Page, Wire};
+
+    /// A library symbol with `role` and these pins (name, place).
+    fn lib(id: &str, role: SymbolRole, pins: &[(&str, Point)]) -> Symbol {
+        Symbol {
+            id: id.into(),
+            name: id.into(),
+            category: String::new(),
+            letter_code: String::new(),
+            role,
+            graphics: vec![],
+            pins: pins
+                .iter()
+                .map(|(n, at)| crate::symbol::Pin {
+                    name: (*n).into(),
+                    at: *at,
+                    dir: Default::default(),
+                })
+                .collect(),
+            tag_at: Point::default(),
+            description: String::new(),
+            source: String::new(),
+        }
+    }
 
     fn wire(id: &str, from: Endpoint, to: Endpoint, potential: Option<&str>) -> Wire {
         Wire {
@@ -552,13 +593,11 @@ mod tests {
         coil.symbol = "wc.coil".into();
         p.pages[1].symbols.push(coil);
         p.pages[1].wires.push(wire("w5", pin("c1", "1"), pin("m3", "W"), None));
-        let role = |id: &str| {
-            Some(if id == "wc.terminal" {
-                SymbolRole::Terminal
-            } else {
-                SymbolRole::Standalone
-            })
-        };
+        let (t, other) = (
+            lib("wc.terminal", SymbolRole::Terminal, &[]),
+            lib("x", SymbolRole::Standalone, &[]),
+        );
+        let role = |id: &str| Some(if id == "wc.terminal" { &t } else { &other });
         let w_net = |nets: &[Net]| {
             nets.iter()
                 .find(|n| n.pins.iter().any(|q| q.2 == "W"))
@@ -592,13 +631,15 @@ mod tests {
         ];
         p.pages = vec![a];
         let role = |id: &str| (id == "wc.terminal").then_some(SymbolRole::Terminal);
+        let t = lib("wc.terminal", SymbolRole::Terminal, &[]);
+        let symbol = |id: &str| (id == "wc.terminal").then_some(&t);
         let numbers = crate::project::terminal_numbers(&p, role);
         assert_eq!(numbers[&("a".to_owned(), "tb".to_owned())].1, "1");
         assert_eq!(numbers[&("a".to_owned(), "ta".to_owned())].1, "2");
-        assert_eq!(nets_linked(&p, role).len(), 4, "no jumper");
+        assert_eq!(nets_linked(&p, symbol).len(), 4, "no jumper");
         let x1 = DeviceTag::parse("-X1").unwrap_or_default();
         assert!(p.meta.add_jumper(&x1, &["1".to_owned(), "2".to_owned()]).is_ok());
-        let joined = nets_linked(&p, role);
+        let joined = nets_linked(&p, symbol);
         assert_eq!(joined.len(), 2, "one net per side");
         assert!(joined.iter().all(|n| n.pins.len() == 4));
     }
@@ -737,6 +778,46 @@ mod tests {
     }
 
     #[test]
+    fn a_free_end_on_a_pin_to_pin_wire_joins_it() {
+        use crate::project::PlacedSymbol;
+        // A two-pin symbol: pin 1 at 0,0 and pin 2 at 0,10.
+        let lib = lib(
+            "wc.two",
+            SymbolRole::default(),
+            &[("1", Point::new(0.0, 0.0)), ("2", Point::new(0.0, 10.0))],
+        );
+        let placed = |id: &str, x: f64| PlacedSymbol {
+            id: id.into(),
+            symbol: "wc.two".into(),
+            at: Point::new(x, 40.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: None,
+        };
+        let mut p = Project::new("t");
+        let mut a = Page::new("p2", "2", "");
+        // -K1:2 (at 20,50) straight across to -S1:2 (at 100,50); -Q1:1 ends on its middle.
+        a.symbols = vec![placed("k1", 20.0), placed("s1", 100.0), placed("q1", 60.0)];
+        a.wires = vec![
+            wire("w1", pin("k1", "2"), pin("s1", "2"), None),
+            wire(
+                "w2",
+                pin("q1", "1"),
+                Endpoint::Point {
+                    at: Point::new(60.0, 50.0),
+                },
+                None,
+            ),
+        ];
+        p.pages = vec![a];
+        let net_pins = |n: &[Net]| -> Vec<usize> { n.iter().map(|n| n.pins.len()).collect() };
+        // With the symbol known, the three pins are one net.
+        assert_eq!(net_pins(&nets_linked(&p, |id| (id == "wc.two").then_some(&lib))), [3]);
+        // Without it the pin places are unknown, and the wires stay apart.
+        assert_eq!(net_pins(&nets(&p)), [2, 1]);
+    }
+
+    #[test]
     fn a_short_segment_is_measured_the_same_both_ways() {
         let (a, b, p) = (Point::new(0.0, 0.0), Point::new(0.009, 0.0), Point::new(0.018, 0.0));
         assert!(on_segment(p, a, b));
@@ -842,7 +923,8 @@ mod tests {
         b.wires.push(wire("w1", pin("s9", "1"), pin("s2", "1"), None));
         p.pages = vec![a, b];
         assert_eq!(nets(&p).len(), 2);
-        let linked = nets_linked(&p, |s| (s == "arrow").then_some(SymbolRole::Interruption));
+        let arrow = lib("arrow", SymbolRole::Interruption, &[]);
+        let linked = nets_linked(&p, |s| (s == "arrow").then_some(&arrow));
         assert_eq!(linked.len(), 1);
         assert_eq!(linked[0].pins.len(), 4);
     }
@@ -873,7 +955,8 @@ mod tests {
             page("o", "s3", true),
             page("q", "s4", true),
         ];
-        let linked = nets_linked(&p, |s| (s == "arrow").then_some(SymbolRole::Interruption));
+        let arrow = lib("arrow", SymbolRole::Interruption, &[]);
+        let linked = nets_linked(&p, |s| (s == "arrow").then_some(&arrow));
         let mut found: Vec<BTreeSet<&str>> = linked
             .iter()
             .map(|n| n.pins.iter().map(|(pg, _, _)| pg.as_str()).collect())

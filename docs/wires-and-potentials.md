@@ -33,7 +33,10 @@ into one graph and joins them by these rules:
 1. A wire joins its two ends.
 2. Wire ends on the same pin are joined, since they are the same pin.
 3. Free ends at the same point on the same page are joined. Points are compared to a hundredth
-   of a millimetre.
+   of a millimetre. A free end on another wire, at its end, a bend or anywhere along a segment
+   (a T, where a junction dot is drawn), joins that wire too, within 0.01 mm. A segment that
+   ends on a pin counts when the pin's symbol is known (vendored in the project); a pin of an
+   unknown symbol has no place, so its segment is left out.
 4. Wires with the same potential name are joined, on the same page or on any other page.
    Spaces around a name are no part of it, and a blank name joins nothing.
 5. Interruption points (symbols whose role is `interruption`, such as `wc.interruption`) with
@@ -47,9 +50,8 @@ between two free points) is no net, and its wires belong to no connection.
 
 Some things do not connect:
 
-- A free end that lies on the middle of another wire is not joined to it, even though a junction
-  dot is drawn there. End both wires at the same point instead (see issue #1655).
-- A free end placed where a pin is drawn is not joined to the pin. Draw the end on the pin
+- A free end placed where a pin is drawn is not joined to the pin itself. It joins a wire that
+  ends on that pin (rule 3), but a pin with no wire stays apart: draw the end on the pin
   (`item:pin`).
 - A symbol does not join its own pins. Two of its pins are one net only when the rules above
   join them: a wire drawn between them, a path of wires through other pins or shared free ends,

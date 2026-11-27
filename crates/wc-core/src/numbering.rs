@@ -53,27 +53,28 @@ pub struct Numbered {
 /// overview pages (`Page::overview`): an overview draws the schematic's connections again, so
 /// its wires take no numbers and adding one does not change the schematic's numbers.
 ///
-/// `role(symbol id)` joins interruption points and jumpers as for the net list, and
+/// `symbol(library id)` joins interruption points, jumpers and wire ends on pinned segments as
+/// for the net list, and
 /// `position(page, end)` gives a wire end's place on the page (pin ends need the symbol).
-pub fn number_wires(
+pub fn number_wires<'s>(
     project: &mut Project,
     rule: Rule,
     overwrite: bool,
-    role: impl Fn(&str) -> Option<crate::symbol::SymbolRole>,
+    symbol: impl Fn(&str) -> Option<&'s crate::symbol::Symbol>,
     position: impl Fn(&Page, &Endpoint) -> Option<Point>,
 ) -> Numbered {
-    number_wires_keeping(project, rule, overwrite, |_| false, role, position)
+    number_wires_keeping(project, rule, overwrite, |_| false, symbol, position)
 }
 
 /// [`number_wires`], where the numbers on the pages `kept(page)` picks stay as they are even
 /// with `overwrite` (pages someone else has open): a connection with a number on such a page
 /// keeps that number, and no other connection is given it.
-pub fn number_wires_keeping(
+pub fn number_wires_keeping<'s>(
     project: &mut Project,
     rule: Rule,
     overwrite: bool,
     kept: impl Fn(&Page) -> bool,
-    role: impl Fn(&str) -> Option<crate::symbol::SymbolRole>,
+    symbol: impl Fn(&str) -> Option<&'s crate::symbol::Symbol>,
     position: impl Fn(&Page, &Endpoint) -> Option<Point>,
 ) -> Numbered {
     // Overview pages keep their place (page indices stay valid) but draw nothing here.
@@ -82,7 +83,7 @@ pub fn number_wires_keeping(
         page.wires.clear();
         page.symbols.clear();
     }
-    let (nets, wire_net) = wire_nets(&schematic, role);
+    let (nets, wire_net) = wire_nets(&schematic, symbol);
     // Where each net starts: the first page it is drawn on, then its leftmost, topmost point.
     let mut start: BTreeMap<usize, (usize, f64, f64)> = BTreeMap::new();
     let mut existing: BTreeMap<usize, String> = BTreeMap::new();

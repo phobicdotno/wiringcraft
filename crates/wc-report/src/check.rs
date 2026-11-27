@@ -485,7 +485,7 @@ pub fn check_with_unreadable(
 
     // Shorts: one net carrying two potential names (for example L1 and L2), also when only
     // wires and junctions join them.
-    let nets = wc_core::connectivity::shorted_nets(p, |id| i.symbols.get(id).map(|s| s.role));
+    let nets = wc_core::connectivity::shorted_nets(p, |id| i.symbols.get(id));
     for n in nets {
         let names: BTreeSet<&str> = n.names.iter().map(String::as_str).collect();
         if names.len() > 1 {
@@ -682,7 +682,7 @@ fn wire_nets_off_overview(i: &Inputs<'_>) -> WireNets {
     for page in wiring.pages.iter_mut().filter(|pg| pg.overview) {
         page.wires.clear();
     }
-    wc_core::connectivity::wire_nets_by_place(&wiring, |id| i.symbols.get(id).map(|s| s.role)).1
+    wc_core::connectivity::wire_nets_by_place(&wiring, |id| i.symbols.get(id)).1
 }
 
 /// Wire numbers that do not name one connection each: a connection (net) whose wires carry

@@ -4182,7 +4182,7 @@ fn run(mut cli: Cli) -> Res<()> {
                 &mut p,
                 rule,
                 overwrite,
-                |id| symbols.get(id).map(|s| s.role),
+                |id| symbols.get(id),
                 |page, end| match end {
                     wc_core::Endpoint::Point { at } => Some(*at),
                     wc_core::Endpoint::Pin { item, pin } => {
@@ -4430,7 +4430,7 @@ fn run(mut cli: Cli) -> Res<()> {
                     .iter()
                     .map(|m| format!("symbol {m} has no vendored copy (run `wiringcraft lib lock`)")),
             );
-            let linked = wc_core::connectivity::nets_linked(&p, |id| symbols.get(id).map(|s| s.role));
+            let linked = wc_core::connectivity::nets_linked(&p, |id| symbols.get(id));
             for (i, n) in linked.iter().enumerate() {
                 let pins: Vec<String> = n
                     .pins
