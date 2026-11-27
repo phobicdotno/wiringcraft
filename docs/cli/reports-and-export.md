@@ -24,7 +24,7 @@ wiringcraft report <KIND> [--format text|csv|md|xlsx] [--out <file>] [--sep ,|;]
 | `wires` | every wire: page, number, potential, cable, from, to, section, colour, type |
 | `nets` | every connection (potential) and the pins on it |
 | `terminals` | the terminal plan: strip, terminal, what is on each side, potential, jumpers, level |
-| `cables` | every cable core: page, from, to |
+| `cables` | every cable core: cable, type, description, core, page, from, to |
 | `plc` | the PLC I/O list: address, type, device, what it is connected to |
 | `plc-cards` | the PLC cards by rack and slot, channel by channel (see `wiringcraft rack`) |
 | `locations` | the locations (`+` part of the tags) and how many devices each holds |
