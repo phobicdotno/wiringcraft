@@ -18,7 +18,7 @@ use wc_core::project::Jumper;
 use wc_core::{Device, DevicePart, DeviceTag, Part, Project, store};
 use wc_report::{Inputs, Target};
 
-use crate::csv::{decode, records};
+use crate::csv::{Rows, decode, records};
 use crate::{Error, Result};
 
 /// One row of a configured list, as far as the import reads it.
@@ -62,33 +62,41 @@ fn count_unquoted(text: &str, delim: char) -> usize {
 /// Read a configured list (bytes as saved: UTF-8 with or without BOM, or Latin-1). The header
 /// must name an Index and an Article column; Type, Strip, Terminal, Manufacturer and Quantity
 /// are read when present. Rows whose quantity is not a whole number are read without one, with
-/// a warning. The separator (`;`, tab or `,`) is the one the header holds most often
-/// outside quoted text.
+/// a warning. The separator (`;`, tab or `,`) is the one the header holds most often outside
+/// quoted text that still gives an Index and an Article column, so a comma in a column name of
+/// a semicolon list does not win.
 pub fn read_configured(bytes: &[u8]) -> Result<(Vec<ConfiguredRow>, Vec<String>)> {
+    const INDEX: &[&str] = &["index"];
+    const ARTICLE: &[&str] = &[
+        "article",
+        "articleno",
+        "articlenumber",
+        "itemnumber",
+        "ordernumber",
+        "artikelnummer",
+        "bestellnummer",
+        "artikel",
+    ];
     let text = decode(bytes);
-    let delim = [';', '\t', ',']
-        .into_iter()
-        .max_by_key(|d| count_unquoted(&text, *d))
-        .unwrap_or(';');
-    let rows = records(&text, delim);
+    let key = |h: &str| -> String { h.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect() };
+    let column = |header: &[String], names: &[&str]| header.iter().position(|h| names.contains(&key(h).as_str()));
+    let usable = |rows: &Rows| {
+        rows.first()
+            .is_some_and(|h| column(h, INDEX).is_some() && column(h, ARTICLE).is_some())
+    };
+    // Most often first; a stable sort keeps `;` (the export's own) first on a tie.
+    let mut delims = [';', '\t', ','];
+    delims.sort_by_key(|d| std::cmp::Reverse(count_unquoted(&text, *d)));
+    let rows = delims
+        .iter()
+        .map(|d| records(&text, *d))
+        .find(|rows| usable(rows))
+        .unwrap_or_else(|| records(&text, delims.first().copied().unwrap_or(';')));
     let Some((header, body)) = rows.split_first() else {
         return Err(Error::Format("the file is empty".into()));
     };
-    let key = |h: &str| -> String { h.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect() };
-    let find = |names: &[&str]| header.iter().position(|h| names.contains(&key(h).as_str()));
-    let (Some(index), Some(article)) = (
-        find(&["index"]),
-        find(&[
-            "article",
-            "articleno",
-            "articlenumber",
-            "itemnumber",
-            "ordernumber",
-            "artikelnummer",
-            "bestellnummer",
-            "artikel",
-        ]),
-    ) else {
+    let find = |names: &[&str]| column(header, names);
+    let (Some(index), Some(article)) = (find(INDEX), find(ARTICLE)) else {
         return Err(Error::Format(format!(
             "need an Index and an Article column (as `export wago-configurator` writes them) among {header:?}"
         )));
@@ -102,7 +110,8 @@ pub fn read_configured(bytes: &[u8]) -> Result<(Vec<ConfiguredRow>, Vec<String>)
     let mut out = Vec::new();
     let mut warnings = Vec::new();
     for (n, row) in body.iter().enumerate() {
-        let line = n + 2;
+        // The line the row starts on, past quoted line breaks before it.
+        let line = rows.number(n + 1);
         let cell = |c: Option<usize>| -> String {
             let v = c.and_then(|c| row.get(c)).map(|v| v.trim()).unwrap_or("");
             // The export guards cells a spreadsheet would run as a formula with a leading `'`.
@@ -1133,8 +1142,16 @@ mod tests {
         let (rows, _) = read_configured(text.as_bytes()).unwrap();
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].article, "2002-1201");
-        // A quoted header text over a line break: the separators after it still count.
+        // A quoted header text over a line break: the separators after it still count, and the
+        // row's line is the one it starts on.
         let text = "\"Notes\r\nmore\";Index;Article\r\nx;-X1:1;2002-1201\r\n";
+        let (rows, _) = read_configured(text.as_bytes()).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].article, "2002-1201");
+        assert_eq!(rows[0].line, 3);
+        // More unquoted commas than semicolons, but only `;` finds the Index and Article columns.
+        let text =
+            "Index;Article;Part, number, maker, code, location;\"Notes; detail; more\"\r\n-X1:1;2002-1201;a;b\r\n";
         let (rows, _) = read_configured(text.as_bytes()).unwrap();
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].article, "2002-1201");
