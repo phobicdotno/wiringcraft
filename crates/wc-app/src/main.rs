@@ -7938,6 +7938,40 @@ mod nudge_tests {
             .unwrap_or_default()
     }
 
+    /// Clicks the button labelled `label` in the dialog window titled `title`, as the person
+    /// would: frames draw the dialog (with the widgets' labels recorded), then the pointer
+    /// presses and releases on the button (#1092). Gives back the window commands of the
+    /// frame the click lands in.
+    fn click_dialog_button(app: &mut App, ctx: &egui::Context, title: &str, label: &str) -> Vec<egui::ViewportCommand> {
+        ctx.style_mut(|s| s.debug.show_interactive_widgets = true);
+        // A new window sizes itself unseen in its first frame: the second has it in place.
+        app_frame(app, ctx, Vec::new(), false);
+        app_frame(app, ctx, Vec::new(), false);
+        let window = egui::Id::new(title);
+        let at = ctx.viewport(|v| {
+            let widgets = &v.this_pass.widgets;
+            widgets
+                .layers()
+                .filter(|(layer, _)| layer.id == window)
+                .flat_map(|(_, rects)| rects.iter())
+                .find(|r| widgets.info(r.id).and_then(|i| i.label.as_deref()) == Some(label))
+                .map(|r| r.rect.center())
+        });
+        let Some(at) = at else {
+            unreachable!("no {label:?} button in the {title:?} dialog")
+        };
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        app_frame(app, ctx, vec![egui::Event::PointerMoved(at), button(true)], false);
+        let sent = app_frame(app, ctx, vec![button(false)], false);
+        ctx.style_mut(|s| s.debug.show_interactive_widgets = false);
+        sent
+    }
+
     /// An app with its coil moved one step: the project has unsaved changes.
     fn changed_app() -> (tempfile::TempDir, App, egui::Context) {
         let (tmp, mut app, ctx) = app(Point::new(55.0, 60.0), false);
@@ -7968,14 +8002,11 @@ mod nudge_tests {
                 matches!(app.dialog, Some(Dialog::Unsaved(Leave::Close))),
                 "{answer}: the person is asked"
             );
-            // The buttons close the dialog and run their work.
-            app.dialog = None;
-            match answer {
-                "Don't save" => app.leave(Leave::Close),
-                "Save" => app.save_and_leave(Leave::Close),
-                _ => {}
-            }
-            let sent = app_frame(&mut app, &ctx, Vec::new(), false);
+            // The person answers with the dialog's button: it closes the dialog and runs its
+            // work, which asks the window to close.
+            let mut sent = click_dialog_button(&mut app, &ctx, "Unsaved changes", answer);
+            assert!(app.dialog.is_none(), "{answer}: the question is answered");
+            sent.extend(app_frame(&mut app, &ctx, Vec::new(), false));
             assert_eq!(sent.contains(&Close), answer != "Cancel", "{answer}: the window closes");
             if answer != "Cancel" {
                 // The close request that makes is let through, without asking again.
@@ -8080,14 +8111,12 @@ mod nudge_tests {
             let mut prefs = Prefs::default();
             app.open_dir(&other, &mut prefs);
             assert_eq!(app.open.as_ref().unwrap().dir, first, "{answer}: not replaced yet");
-            let Some(Dialog::Unsaved(Leave::Open(asked))) = app.dialog.take() else {
-                unreachable!("{answer}: the person is asked")
-            };
-            match answer {
-                "Don't save" => app.leave(Leave::Open(asked)),
-                "Save" => app.save_and_leave(Leave::Open(asked)),
-                _ => {}
-            }
+            assert!(
+                matches!(app.dialog, Some(Dialog::Unsaved(Leave::Open(_)))),
+                "{answer}: the person is asked"
+            );
+            let _ = click_dialog_button(&mut app, &ctx, "Unsaved changes", answer);
+            assert!(app.dialog.is_none(), "{answer}: the question is answered");
             app_frame(&mut app, &ctx, Vec::new(), false);
             let open = app.open.as_ref().unwrap();
             let opened = answer != "Cancel";
