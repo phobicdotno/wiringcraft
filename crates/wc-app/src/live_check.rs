@@ -256,18 +256,37 @@ impl LiveCheck {
     }
 }
 
+/// `n` of `one`, with the plural for any count but one: "1 error", "2 errors".
+fn plural(n: usize, one: &str) -> String {
+    if n == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{n} {one}s")
+    }
+}
+
+/// The message after Check → Check project: its errors and all its findings, counted in words
+/// that agree with the count ("1 error", not "1 errors").
+pub fn check_message(found: &[Finding]) -> String {
+    if found.is_empty() {
+        return "Project check: no problems found.".into();
+    }
+    let errors = found
+        .iter()
+        .filter(|f| f.severity == wc_report::Severity::Error)
+        .count();
+    format!(
+        "Project check: {}, {} in all.",
+        plural(errors, "error"),
+        plural(found.len(), "finding")
+    )
+}
+
 /// The status bar text for a set of findings: errors and warnings, or that all is well.
 pub fn summary(found: &[Finding]) -> String {
     use wc_report::Severity;
     let errors = found.iter().filter(|f| f.severity == Severity::Error).count();
     let warnings = found.iter().filter(|f| f.severity == Severity::Warning).count();
-    let plural = |n: usize, one: &str| {
-        if n == 1 {
-            format!("1 {one}")
-        } else {
-            format!("{n} {one}s")
-        }
-    };
     match (errors, warnings) {
         (0, 0) => "Check: no problems".into(),
         (0, w) => format!("Check: {}", plural(w, "warning")),
@@ -647,6 +666,29 @@ mod tests {
             live.status(&live.findings),
             "Check: not run, the check could not be started: no threads",
             "a failure is not shown as a clean result"
+        );
+    }
+
+    #[test]
+    fn the_check_message_counts_in_words_that_agree() {
+        let f = |severity| Finding {
+            severity,
+            page_id: None,
+            item: None,
+            message: String::new(),
+        };
+        assert_eq!(check_message(&[]), "Project check: no problems found.");
+        assert_eq!(
+            check_message(&[f(Severity::Error)]),
+            "Project check: 1 error, 1 finding in all."
+        );
+        assert_eq!(
+            check_message(&[f(Severity::Warning), f(Severity::Note)]),
+            "Project check: 0 errors, 2 findings in all."
+        );
+        assert_eq!(
+            check_message(&[f(Severity::Error), f(Severity::Error), f(Severity::Warning)]),
+            "Project check: 2 errors, 3 findings in all."
         );
     }
 

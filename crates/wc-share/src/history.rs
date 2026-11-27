@@ -387,3 +387,226 @@ pub fn note(history: &mut Vec<ChangeInfo>, info: ChangeInfo) {
 
 /// How many changes a session keeps for undo.
 pub const MAX_HISTORY: usize = 500;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wc_core::PlacedSymbol;
+    use wc_core::geom::Point;
+
+    fn info(id: u64, by: PeerId, kind: ChangeKind, reverts: Option<u64>) -> ChangeInfo {
+        ChangeInfo {
+            id,
+            by,
+            name: format!("peer {by}"),
+            message: format!("change {id}"),
+            page: None,
+            kind,
+            reverts,
+            undone_by: None,
+        }
+    }
+
+    fn entry(hash: &str) -> LockEntry {
+        LockEntry {
+            source: "test".into(),
+            hash: hash.into(),
+        }
+    }
+
+    /// A page that places `symbol` once.
+    fn page_using(id: &str, symbol: &str) -> Page {
+        let mut page = Page::new(id, id, "Page");
+        page.symbols.push(PlacedSymbol {
+            id: "s1".into(),
+            symbol: symbol.into(),
+            at: Point::new(10.0, 10.0),
+            rotation: Default::default(),
+            mirror: false,
+            tag: None,
+        });
+        page
+    }
+
+    #[test]
+    fn undo_takes_back_my_latest_change_not_yet_undone() {
+        let mut history = Vec::new();
+        note(&mut history, info(1, 1, ChangeKind::Edit, None));
+        note(&mut history, info(2, 1, ChangeKind::Edit, None));
+        note(&mut history, info(3, 2, ChangeKind::Edit, None));
+        // Someone else's later change is not mine to undo.
+        assert_eq!(undo_target(&history, 1), Some(2));
+        assert_eq!(undo_target(&history, 2), Some(3));
+        assert_eq!(undo_target(&history, 9), None);
+
+        // Once 2 is undone, the next undo goes to 1; the undo itself is never a target.
+        note(&mut history, info(4, 1, ChangeKind::Undo, Some(2)));
+        assert_eq!(undo_target(&history, 1), Some(1));
+        // A redo is undone like an edit.
+        note(&mut history, info(5, 1, ChangeKind::Redo, Some(4)));
+        assert_eq!(undo_target(&history, 1), Some(5));
+    }
+
+    #[test]
+    fn redo_takes_back_my_latest_undo_until_a_new_edit() {
+        let mut history = Vec::new();
+        note(&mut history, info(1, 1, ChangeKind::Edit, None));
+        note(&mut history, info(2, 1, ChangeKind::Edit, None));
+        assert_eq!(redo_target(&history, 1), None, "nothing undone yet");
+
+        note(&mut history, info(3, 1, ChangeKind::Undo, Some(2)));
+        note(&mut history, info(4, 1, ChangeKind::Undo, Some(1)));
+        // Another peer's edit does not end my redo.
+        note(&mut history, info(5, 2, ChangeKind::Edit, None));
+        assert_eq!(redo_target(&history, 1), Some(4));
+
+        // Redoing 4 leaves 3 to redo next.
+        note(&mut history, info(6, 1, ChangeKind::Redo, Some(4)));
+        assert_eq!(redo_target(&history, 1), Some(3));
+
+        // My own new edit ends what can be redone.
+        note(&mut history, info(7, 1, ChangeKind::Edit, None));
+        assert_eq!(redo_target(&history, 1), None);
+    }
+
+    #[test]
+    fn note_marks_what_it_took_back_and_keeps_the_latest_changes() {
+        let mut history = Vec::new();
+        note(&mut history, info(1, 1, ChangeKind::Edit, None));
+        note(&mut history, info(2, 1, ChangeKind::Undo, Some(1)));
+        assert_eq!(history.first().and_then(|c| c.undone_by), Some(2));
+        // Taking back a change no longer kept is still noted.
+        note(&mut history, info(3, 1, ChangeKind::Undo, Some(99)));
+        assert_eq!(history.len(), 3);
+
+        let mut long = Vec::new();
+        for id in 1..=(MAX_HISTORY as u64 + 3) {
+            note(&mut long, info(id, 1, ChangeKind::Edit, None));
+        }
+        assert_eq!(long.len(), MAX_HISTORY);
+        assert_eq!(long.first().map(|c| c.id), Some(4), "the oldest are dropped");
+        assert_eq!(long.last().map(|c| c.id), Some(MAX_HISTORY as u64 + 3));
+    }
+
+    #[test]
+    fn merge_keeps_the_newer_record_and_the_older_meta_when_newer_has_none() {
+        let mut older = Parts {
+            meta: Some(Box::new(Project::new("Old").meta)),
+            ..Parts::default()
+        };
+        older.pages.insert("p1".into(), None);
+        older.pages.insert("p2".into(), Some(Page::new("p2", "2", "Old")));
+        older.lock_symbols.insert("relay".into(), Some(entry("v1")));
+
+        let mut newer = Parts::default();
+        newer.pages.insert("p2".into(), Some(Page::new("p2", "2", "New")));
+        newer.lock_symbols.insert("relay".into(), None);
+        newer.lock_parts.insert("k1".into(), Some(entry("k")));
+        older.merge(newer);
+
+        assert_eq!(older.meta.as_ref().map(|m| m.name.as_str()), Some("Old"));
+        assert_eq!(older.pages.get("p1"), Some(&None));
+        assert!(matches!(older.pages.get("p2"), Some(Some(p)) if p.title == "New"));
+        assert_eq!(older.lock_symbols.get("relay"), Some(&None));
+        assert_eq!(older.lock_parts.get("k1"), Some(&Some(entry("k"))));
+        assert!(!older.is_empty());
+    }
+
+    #[test]
+    fn a_new_page_records_its_comments_even_when_there_are_none() {
+        let before = Project::new("Demo");
+        let mut after = before.clone();
+        after.pages.push(Page::new("p1", "1", "Cover"));
+        let (was, now) = Parts::delta(&before, &after);
+        assert_eq!(was.comments.get("p1"), Some(&Vec::new()));
+        assert_eq!(now.comments.get("p1"), Some(&Vec::new()));
+
+        // Someone comments on it later: reading the same keys now differs from the record.
+        let mut later = after.clone();
+        later.comments.push(Comment {
+            id: "c1".into(),
+            page: "p1".into(),
+            at: None,
+            author: "Kari".into(),
+            time: 0,
+            text: "hm".into(),
+            resolved: false,
+            replies: Vec::new(),
+        });
+        assert_ne!(Parts::read(&later, &now), now);
+        assert_eq!(Parts::read(&after, &now), now);
+    }
+
+    #[test]
+    fn lock_entries_round_trip_through_delta_and_apply() {
+        let mut before = Project::new("Demo");
+        before.lock.symbols.insert("relay".into(), entry("v1"));
+        before.lock.parts.insert("gone".into(), entry("g"));
+        let mut after = before.clone();
+        after.lock.symbols.insert("relay".into(), entry("v2"));
+        after.lock.parts.remove("gone");
+        after.lock.parts.insert("new".into(), entry("n"));
+
+        let (was, now) = Parts::delta(&before, &after);
+        assert_eq!(was.lock(ItemKind::Part).get("new"), Some(&None));
+        assert_eq!(now.lock(ItemKind::Part).get("gone"), Some(&None));
+        assert_eq!(was.lock(ItemKind::Symbol).len(), 1);
+
+        let mut back = after.clone();
+        was.apply(&mut back);
+        assert_eq!(back, before);
+        let mut forward = before.clone();
+        now.apply(&mut forward);
+        assert_eq!(forward, after);
+    }
+
+    #[test]
+    fn other_versions_names_only_items_locked_in_another_version() {
+        let mut lock = Lockfile::default();
+        lock.symbols.insert("same".into(), entry("a"));
+        lock.symbols.insert("moved".into(), entry("b2"));
+        let mut recorded = Uses::new();
+        recorded.insert((ItemKind::Symbol, "same".into()), "a".into());
+        recorded.insert((ItemKind::Symbol, "moved".into()), "b1".into());
+        recorded.insert((ItemKind::Part, "unlocked".into()), "c".into());
+        assert_eq!(Parts::other_versions(&recorded, &lock), vec!["symbol moved".to_owned()]);
+    }
+
+    #[test]
+    fn uses_leaves_out_what_the_lock_does_not_lock() {
+        let mut parts = Parts::default();
+        parts.pages.insert("p1".into(), Some(page_using("p1", "relay")));
+        parts.pages.insert("p2".into(), Some(page_using("p2", "loose")));
+        parts.pages.insert("p3".into(), None);
+        let mut lock = Lockfile::default();
+        lock.symbols.insert("relay".into(), entry("r1"));
+        let uses = parts.uses(&lock);
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses.get(&(ItemKind::Symbol, "relay".into())), Some(&"r1".to_owned()));
+    }
+
+    #[test]
+    fn unlocked_uses_counts_only_items_newly_left_without_a_lock() {
+        let mut project = Project::new("Demo");
+        project.pages.push(page_using("p1", "relay"));
+        project.pages.push(page_using("p2", "already"));
+        project.lock.symbols.insert("relay".into(), entry("r1"));
+
+        // Taking out the lock of a symbol still placed leaves it unlocked.
+        let mut drop_lock = Parts::default();
+        drop_lock.lock_symbols.insert("relay".into(), None);
+        assert_eq!(drop_lock.unlocked_uses(&project), vec!["symbol relay".to_owned()]);
+
+        // Bringing back a page that uses an unlocked symbol counts it, unless it was already so.
+        let mut bring_back = Parts::default();
+        bring_back.pages.insert("p3".into(), Some(page_using("p3", "fresh")));
+        bring_back.pages.insert("p4".into(), Some(page_using("p4", "already")));
+        assert_eq!(bring_back.unlocked_uses(&project), vec!["symbol fresh".to_owned()]);
+
+        // Taking the page away with its lock leaves nothing unlocked.
+        let mut both = Parts::default();
+        both.pages.insert("p1".into(), None);
+        both.lock_symbols.insert("relay".into(), None);
+        assert!(both.unlocked_uses(&project).is_empty());
+    }
+}

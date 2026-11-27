@@ -200,6 +200,7 @@ pub fn relative_file_is_safe(f: &str) -> bool {
 
 /// Terminals of one strip bridged together by a jumper: they form one potential.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "StoredJumper")]
 pub struct Jumper {
     /// The strip, e.g. `-X1`.
     pub strip: DeviceTag,
@@ -209,6 +210,43 @@ pub struct Jumper {
     /// list and written in the WAGO configurator export.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub part: Option<String>,
+}
+
+/// A [`Jumper`] as read from `project.toml`, before its terminals are checked.
+#[derive(Deserialize)]
+struct StoredJumper {
+    strip: DeviceTag,
+    terminals: Vec<String>,
+    #[serde(default)]
+    part: Option<String>,
+}
+
+impl TryFrom<StoredJumper> for Jumper {
+    type Error = String;
+
+    /// Refuses a jumper naming a number that cannot be a terminal of its strip, or with fewer
+    /// than two different terminals (a hand edit or another tool), as
+    /// [`ProjectMeta::add_jumper`] does.
+    fn try_from(j: StoredJumper) -> Result<Self, String> {
+        let mut distinct: Vec<&String> = Vec::new();
+        for t in &j.terminals {
+            check_terminal_number(&j.strip, t)?;
+            if !distinct.contains(&t) {
+                distinct.push(t);
+            }
+        }
+        if distinct.len() < 2 {
+            return Err(format!(
+                "the jumper on {} needs at least two different terminals of the strip",
+                j.strip
+            ));
+        }
+        Ok(Jumper {
+            strip: j.strip,
+            terminals: j.terminals,
+            part: j.part,
+        })
+    }
 }
 
 /// How a terminal strip is arranged on its rail: the order of its terminals and the spare
@@ -649,8 +687,16 @@ pub fn location_rows(rows: &[(String, String)]) -> Result<Vec<Location>, String>
             description: description.trim().to_owned(),
         });
     }
-    out.sort_by(|a, b| a.path.cmp(&b.path));
+    sort_locations(&mut out);
     Ok(out)
+}
+
+/// Sort locations in natural order of their paths, as tags are listed: `+CAB2` before `+CAB10`.
+/// Paths alike in natural order (`L01` and `L1`, `+L1` and `L1`) keep a fixed order by their text.
+pub fn sort_locations(locations: &mut [Location]) {
+    // A path stored as typed (`+CAB10`) sorts by its normal form (`CAB10`).
+    let key = |l: &Location| natural_key(&location_path(&l.path).unwrap_or_else(|_| l.path.clone()));
+    locations.sort_by_cached_key(|l| (key(l), l.path.clone()));
 }
 
 /// A location of the project, such as a cabinet or a room.
@@ -693,12 +739,12 @@ impl ProjectMeta {
             Some(l) => {
                 l.path = path;
                 l.description = description;
-                self.locations.sort_by(|a, b| a.path.cmp(&b.path));
+                sort_locations(&mut self.locations);
                 Ok(true)
             }
             None => {
                 self.locations.push(Location { path, description });
-                self.locations.sort_by(|a, b| a.path.cmp(&b.path));
+                sort_locations(&mut self.locations);
                 Ok(true)
             }
         }
@@ -744,7 +790,7 @@ impl ProjectMeta {
             Some(_) => false,
             None => {
                 self.locations.push(loc);
-                self.locations.sort_by(|a, b| a.path.cmp(&b.path));
+                sort_locations(&mut self.locations);
                 true
             }
         }
@@ -836,6 +882,7 @@ impl ProjectMeta {
     /// Take `terminal` of `strip` out of its jumper; a jumper left with one terminal goes.
     /// Returns whether anything changed.
     pub fn remove_from_jumper(&mut self, strip: &DeviceTag, terminal: &str) -> bool {
+        let terminal = terminal.trim();
         let mut changed = false;
         for j in self.jumpers.iter_mut().filter(|j| &j.strip == strip) {
             let before = j.terminals.len();
@@ -927,6 +974,7 @@ impl ProjectMeta {
     /// Give the jumper that holds `terminal` of `strip` a part, or none. Returns whether that
     /// changed anything; `Err` when the terminal is in no jumper.
     pub fn set_jumper_part(&mut self, strip: &DeviceTag, terminal: &str, part: Option<&str>) -> Result<bool, String> {
+        let terminal = terminal.trim();
         let j = self
             .jumpers
             .iter_mut()
@@ -1100,7 +1148,8 @@ impl ProjectMeta {
 
     /// Add spare terminal `number` to `strip`, placed right after terminal `after` when given
     /// (`current` is the strip's rail order, see [`strip_terminals`]), else at the end. Refused
-    /// when the strip already has that terminal or the number cannot be a terminal of it.
+    /// when the strip already has that terminal or the number cannot be a terminal of it. A
+    /// spare that leaves the strip in number order sets no rail order.
     pub fn add_spare(
         &mut self,
         strip: &DeviceTag,
@@ -1131,7 +1180,35 @@ impl ProjectMeta {
             l.spares.push(number.to_owned());
             l.order = order;
         });
+        self.forget_usual_order(strip, current);
         Ok(())
+    }
+
+    /// Forget the rail order of `strip` when it is just the usual one for the terminals on its
+    /// rail (`current`, see [`strip_terminals`]): drawn terminals by number, then spares by
+    /// number. A spare added at the end, or a terminal moved back, then leaves the strip in
+    /// number order, so a terminal drawn later goes where its number puts it, not at the end.
+    fn forget_usual_order(&mut self, strip: &DeviceTag, current: &[(String, bool)]) {
+        let mut drawn: Vec<String> = current
+            .iter()
+            .filter(|(_, spare)| !spare)
+            .map(|(t, _)| t.clone())
+            .collect();
+        drawn.sort_by(|a, b| natural_key(a).cmp(&natural_key(b)).then_with(|| a.cmp(b)));
+        let Some(l) = self.strips.iter_mut().find(|l| &l.strip == strip) else {
+            return;
+        };
+        let usual = StripLayout {
+            strip: strip.clone(),
+            order: Vec::new(),
+            spares: l.spares.clone(),
+        }
+        .arrange(&drawn);
+        // The rail as arranged, not the stored order: that can leave out terminals drawn since.
+        if !l.order.is_empty() && l.arrange(&drawn) == usual {
+            l.order.clear();
+            self.drop_empty_layouts();
+        }
     }
 
     /// Take spare terminal `number` off `strip`, and out of its jumper; `current` is the strip's
@@ -1151,6 +1228,7 @@ impl ProjectMeta {
         if !drawn {
             l.order.retain(|t| t != number);
         }
+        self.forget_usual_order(strip, current);
         self.drop_empty_layouts();
         if !drawn {
             self.remove_from_jumper(strip, number);
@@ -1159,7 +1237,8 @@ impl ProjectMeta {
     }
 
     /// Move terminal `number` of `strip` to `to` (0 is first) in its rail order; `current` is
-    /// the strip's rail order (see [`strip_terminals`]). Returns whether anything changed.
+    /// the strip's rail order (see [`strip_terminals`]). A move back into number order forgets
+    /// the rail order. Returns whether anything changed.
     pub fn move_terminal(
         &mut self,
         strip: &DeviceTag,
@@ -1177,7 +1256,10 @@ impl ProjectMeta {
         if order.iter().eq(current.iter().map(|(t, _)| t)) {
             return Ok(false);
         }
-        self.set_terminal_order(strip, &order)
+        let before = self.strips.clone();
+        self.set_terminal_order(strip, &order)?;
+        self.forget_usual_order(strip, current);
+        Ok(self.strips != before)
     }
 
     /// The jumper a terminal (`-X1.4`) is in, if any.
@@ -1416,8 +1498,8 @@ impl PageSize {
     }
 
     /// How many reference rows run down the sides of the frame, by the sheet's height: A to F
-    /// up to A3 landscape (297 mm), A to H up to A2 landscape (420 mm), A to K up to A1
-    /// landscape (594 mm), A to M above. Fixed per sheet size, so a reference never moves.
+    /// up to A3 landscape (297 mm), A to H up to A2 landscape (420 mm), A to J up to A1
+    /// landscape (594 mm), A to L above. Fixed per sheet size, so a reference never moves.
     pub fn frame_rows(self) -> usize {
         let (_, h) = self.mm();
         if h <= 297.0 {
@@ -1533,6 +1615,47 @@ impl WireSpec {
     /// A value as stored: trimmed, and `None` when empty.
     pub fn value(text: &str) -> Option<String> {
         Some(text.trim().to_owned()).filter(|s| !s.is_empty())
+    }
+
+    /// Whether the cross-section is clearly wrong: a size in mm² (or a plain number, mm² as in
+    /// EPLAN) that is not above 0, or a negative AWG gauge. AWG 0 and `1/0` are real gauges.
+    /// Other text is left alone.
+    pub fn section_is_bad(&self) -> bool {
+        let Some(s) = self.section.as_deref().map(str::trim) else {
+            return false;
+        };
+        let lower = s.to_lowercase();
+        if let Some(n) = lower.strip_suffix("awg").or_else(|| lower.strip_prefix("awg")) {
+            return n.trim().starts_with('-');
+        }
+        let n = ["mm²", "mm2", "mm"]
+            .iter()
+            .find_map(|u| lower.strip_suffix(u))
+            .unwrap_or(&lower);
+        n.trim()
+            .replace(',', ".")
+            .parse::<f64>()
+            .is_ok_and(|v| !(v.is_finite() && v > 0.0))
+    }
+
+    /// Whether the colour is made of IEC 60757 codes (`BU`, `GNYE`, `GN/YE`, any case), or
+    /// there is none.
+    pub fn colour_is_iec(&self) -> bool {
+        const CODES: [&str; 14] = [
+            "BK", "BN", "RD", "OG", "YE", "GN", "BU", "VT", "GY", "WH", "PK", "GD", "TQ", "SR",
+        ];
+        let Some(c) = &self.colour else { return true };
+        // Each part between separators is whole codes, so `B/K` is not read as `BK`.
+        let upper = c.to_uppercase();
+        let mut parts = upper.split(['/', '-', '+', ' ']).filter(|p| !p.is_empty()).peekable();
+        parts.peek().is_some()
+            && parts.all(|p| {
+                let letters: Vec<char> = p.chars().collect();
+                letters.len().is_multiple_of(2)
+                    && letters
+                        .chunks(2)
+                        .all(|l| CODES.contains(&l.iter().collect::<String>().as_str()))
+            })
     }
 }
 
@@ -1723,6 +1846,19 @@ pub struct Device {
     pub properties: BTreeMap<String, String>,
 }
 
+impl Device {
+    /// Set the description to `text` without the spaces around it; a blank text clears it.
+    /// Returns whether the description changed.
+    pub fn set_description(&mut self, text: &str) -> bool {
+        let text = text.trim();
+        if self.description == text {
+            return false;
+        }
+        text.clone_into(&mut self.description);
+        true
+    }
+}
+
 /// One more part of a device, with how many of it the device needs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DevicePart {
@@ -1741,18 +1877,21 @@ fn is_one(n: &u32) -> bool {
 
 impl Device {
     /// Every part of the device with its quantity: the main part (once), then the accessories.
+    /// A blank part id is left out and a quantity of 0 is taken as 1, as the editor does, so a
+    /// hand-edited file cannot put an empty or zero line into the parts list.
     pub fn all_parts(&self) -> Vec<(&str, u32)> {
         self.part
             .as_deref()
             .map(|p| (p, 1))
             .into_iter()
-            .chain(self.accessories.iter().map(|a| (a.part.as_str(), a.qty)))
+            .chain(self.accessories.iter().map(|a| (a.part.as_str(), a.qty.max(1))))
+            .filter(|(p, _)| !p.trim().is_empty())
             .collect()
     }
 
     /// Whether the device uses part `id`, as its main part or as an accessory.
     pub fn uses_part(&self, id: &str) -> bool {
-        self.part.as_deref() == Some(id) || self.accessories.iter().any(|a| a.part == id)
+        self.all_parts().iter().any(|(p, _)| *p == id)
     }
 }
 
@@ -1900,7 +2039,8 @@ impl Project {
             .into_iter()
             .map(|(_, label)| label)
             .collect();
-        out.sort();
+        // Page 2 before page 10, -K2 before -K10, pin 2 before pin 13 (#1359).
+        out.sort_by(|a, b| natural_key(a).cmp(&natural_key(b)).then_with(|| a.cmp(b)));
         out.dedup();
         out
     }
@@ -2043,8 +2183,9 @@ impl Project {
     }
 
     /// Rename device `from` to `to` everywhere it appears: its device entry, the symbols that
-    /// carry its tag, the cable cores of a cable, panel items and terminal-strip jumpers.
-    /// Returns how many symbols were retagged. It does not check that `to` is free: callers do.
+    /// carry its tag, the cable cores of a cable, panel items, terminal-strip jumpers, fieldbus
+    /// networks, and the PLC racks and cards named by it. Returns how many symbols were
+    /// retagged. It does not check that `to` is free: callers do.
     pub fn rename_device(&mut self, from: &DeviceTag, to: &DeviceTag) -> usize {
         if from == to {
             return 0;
@@ -2082,8 +2223,47 @@ impl Project {
                 j.strip = to.clone();
             }
         }
+        // A strip's rail order and spares go with it, unless `to` has a layout of its own: two
+        // layouts for one strip would not load. The layout goes where `to` sorts, and each
+        // spare's device data (its part) goes along, unless the new spare tag has its own. A
+        // strip renamed to a tag below itself (`-X1` to `-X1.S1`) keeps its layout: its spares
+        // would follow it there level after level.
+        let below = to.function == from.function
+            && to.location == from.location
+            && to.product.len() > from.product.len()
+            && to.product.starts_with(&from.product);
+        if let Some(k) = self.meta.strips.iter().position(|l| &l.strip == from)
+            && !below
+            && !self.meta.strips.iter().any(|l| &l.strip == to)
+        {
+            let mut layout = self.meta.strips.remove(k);
+            layout.strip = to.clone();
+            let spares = layout.spares.clone();
+            self.meta.with_layout(to, |l| *l = layout);
+            for spare in spares {
+                let (mut old, mut new) = (from.clone(), to.clone());
+                old.product.push(spare.clone());
+                new.product.push(spare);
+                if !self.devices.contains_key(&new) {
+                    self.rename_device(&old, &new);
+                }
+            }
+        }
         for net in &mut self.meta.networks {
             net.rename_device(from, to);
+        }
+        // A PLC rack named after its head and a card carrying its tag follow, so the PLC card
+        // overview does not show the old tag. A name that is not this tag is left as typed.
+        let is_from = |s: &str| DeviceTag::parse(s).ok().as_ref() == Some(from);
+        for rack in &mut self.meta.racks {
+            if is_from(&rack.name) {
+                rack.name = to.to_string();
+            }
+            for card in &mut rack.cards {
+                if is_from(&card.tag) {
+                    card.tag = to.to_string();
+                }
+            }
         }
         n
     }
@@ -2133,6 +2313,44 @@ pub fn natural_key(s: &str) -> Vec<(String, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dangling_pins_sort_pages_tags_and_pins_by_number() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut p = Project::new("t");
+        for (n, tags) in [("10", ["-K1", "-K2"]), ("2", ["-K10", "-K2"])] {
+            let mut page = Page::new(format!("p{n}"), n, "");
+            for (i, tag) in tags.iter().enumerate() {
+                page.symbols.push(PlacedSymbol {
+                    id: format!("s{i}"),
+                    symbol: "k".into(),
+                    at: Point::default(),
+                    rotation: Rotation::default(),
+                    mirror: false,
+                    tag: Some(DeviceTag::parse(tag)?),
+                });
+            }
+            page.wires = serde_json::from_str(
+                r#"[{"id":"w1","from":{"item":"s0","pin":"13"},"to":{"item":"s0","pin":"2"}},
+                    {"id":"w2","from":{"item":"s1","pin":"13"},"to":{"item":"s1","pin":"2"}}]"#,
+            )?;
+            p.pages.push(page);
+        }
+        let symbol: crate::Symbol = serde_json::from_str(r#"{"id":"k","name":"K","graphics":[],"pins":[]}"#)?;
+        assert_eq!(
+            p.dangling_pins("k", &symbol),
+            [
+                "page 2 -K2:2",
+                "page 2 -K2:13",
+                "page 2 -K10:2",
+                "page 2 -K10:13",
+                "page 10 -K1:2",
+                "page 10 -K1:13",
+                "page 10 -K2:2",
+                "page 10 -K2:13",
+            ]
+        );
+        Ok(())
+    }
 
     #[test]
     fn removing_symbols_takes_the_wires_on_their_pins_too() -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -2215,6 +2433,34 @@ mod tests {
         p.devices.insert(DeviceTag::parse("-K1")?, d);
         assert_eq!(p.used_parts().len(), 3);
         Ok(())
+    }
+
+    #[test]
+    fn a_hand_edited_device_gives_no_blank_or_zero_part_line() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let text =
+            r#"{"part":" ","accessories":[{"part":"acme.block","qty":0},{"part":""},{"part":"acme.marker","qty":2}]}"#;
+        let d: Device = serde_json::from_str(text)?;
+        assert_eq!(d.all_parts(), [("acme.block", 1), ("acme.marker", 2)]);
+        assert!(!d.uses_part("") && !d.uses_part(" ") && d.uses_part("acme.block"));
+        let mut p = Project::new("x");
+        p.devices.insert(DeviceTag::parse("-K1")?, d);
+        assert_eq!(
+            p.used_parts().into_iter().collect::<Vec<_>>(),
+            ["acme.block", "acme.marker"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_device_description_is_trimmed_and_a_blank_one_cleared() {
+        let mut d = Device::default();
+        assert!(d.set_description("  Pump motor\t"));
+        assert_eq!(d.description, "Pump motor");
+        assert!(!d.set_description("Pump motor "));
+        assert!(d.set_description("   "));
+        assert_eq!(d.description, "");
+        assert!(!d.set_description(""));
+        assert_eq!(serde_json::to_string(&d).ok().as_deref(), Some("{}"));
     }
 
     #[test]
@@ -2424,8 +2670,8 @@ mod tests {
         assert!(!m.merge_location(loc("+L2", "Other")));
         assert!(m.merge_location(loc("+L5", "")));
         let paths: Vec<&str> = m.locations.iter().map(|l| l.path.as_str()).collect();
-        assert_eq!(paths, ["+L4", "L1.L3", "L2", "L5"]);
-        assert_eq!(m.locations[0].description, "Deck");
+        assert_eq!(paths, ["L1.L3", "L2", "+L4", "L5"], "+L4 sorts as L4");
+        assert_eq!(m.locations[2].description, "Deck");
         m.locations.retain(|l| l.path != "+L4" && l.path != "L5");
         let text = toml::to_string(&m).unwrap_or_default();
         assert!(text.contains("[[location]]"), "{text}");
@@ -2517,6 +2763,53 @@ mod tests {
         assert!(!m.remove_from_jumper(&x2, "1"));
         let plain = toml::to_string(&ProjectMeta::new("t"))?;
         assert!(!plain.contains("jumper"), "nothing written without jumpers");
+        Ok(())
+    }
+
+    #[test]
+    fn a_renamed_device_renames_the_plc_rack_and_card_it_names() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::plc_rack::{PlcCard, PlcRack};
+        let mut p = Project::new("t");
+        p.meta.racks.push(PlcRack {
+            name: " -A1 ".into(),
+            cards: vec![
+                PlcCard {
+                    slot: 1,
+                    tag: "-A1".into(),
+                    ..Default::default()
+                },
+                PlcCard {
+                    slot: 2,
+                    tag: "-A1.DI1".into(),
+                    ..Default::default()
+                },
+                PlcCard {
+                    slot: 3,
+                    tag: "Inputs".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        p.rename_device(&DeviceTag::parse("-A1")?, &DeviceTag::parse("+S2-A5")?);
+        let rack = &p.meta.racks[0];
+        assert_eq!(rack.name, "+S2-A5");
+        let tags: Vec<&str> = rack.cards.iter().map(|c| c.tag.as_str()).collect();
+        assert_eq!(tags, ["+S2-A5", "-A1.DI1", "Inputs"], "only the renamed tag follows");
+        Ok(())
+    }
+
+    #[test]
+    fn jumper_edits_trim_the_terminal_number_like_adding_does() -> Result<(), Box<dyn std::error::Error>> {
+        let x1 = DeviceTag::parse("-X1")?;
+        let s = |v: &[&str]| v.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>();
+        let mut m = ProjectMeta::new("t");
+        m.add_jumper(&x1, &s(&[" 1 ", "2", "3"]))?;
+        assert_eq!(m.jumpers[0].terminals, s(&["1", "2", "3"]));
+        assert!(m.set_jumper_part(&x1, " 2 ", Some("wago.2002-403"))?);
+        assert_eq!(m.jumpers[0].part.as_deref(), Some("wago.2002-403"));
+        assert!(m.remove_from_jumper(&x1, " 3 "));
+        assert_eq!(m.jumpers[0].terminals, s(&["1", "2"]));
         Ok(())
     }
 
@@ -2659,6 +2952,38 @@ mod tests {
     }
 
     #[test]
+    fn a_wire_spec_knows_a_bad_section_and_a_colour_that_is_no_iec_code() {
+        let spec = |section: &str, colour: &str| WireSpec {
+            section: WireSpec::value(section),
+            colour: WireSpec::value(colour),
+            kind: None,
+        };
+        for bad in [
+            "0 mm²",
+            "-1.5 mm²",
+            "0",
+            "0,0 mm2",
+            "NaN",
+            "inf mm²",
+            "-2 AWG",
+            "AWG -1",
+        ] {
+            assert!(spec(bad, "").section_is_bad(), "{bad}");
+        }
+        for good in [
+            "", "1.5 mm²", "0,75mm²", "2.5", "18 AWG", "0 AWG", "1/0 AWG", "3x1.5", "LiYY",
+        ] {
+            assert!(!spec(good, "").section_is_bad(), "{good}");
+        }
+        for good in ["", "BU", "bu", "GNYE", "gn/ye", "GN-YE", "WH BK"] {
+            assert!(spec("", good).colour_is_iec(), "{good}");
+        }
+        for bad in ["XX", "BLUE", "B", "GNY", "sw", "1", "B/K", "G/N/YE", "/"] {
+            assert!(!spec("", bad).colour_is_iec(), "{bad}");
+        }
+    }
+
+    #[test]
     fn a_page_number_is_free_when_no_other_page_has_it() {
         let mut p = Project::new("t");
         p.pages.push(Page::new("a", "1", ""));
@@ -2771,6 +3096,31 @@ mod tests {
     }
 
     #[test]
+    fn locations_are_kept_in_natural_order() -> Result<(), String> {
+        let paths = |l: &[Location]| l.iter().map(|l| l.path.clone()).collect::<Vec<_>>();
+        let want = ["CAB2", "CAB2.R2", "CAB2.R10", "CAB10"];
+        let mut m = ProjectMeta::new("t");
+        for p in ["CAB10", "CAB2.R10", "CAB2", "CAB2.R2"] {
+            m.set_location(p, "")?;
+        }
+        assert_eq!(paths(&m.locations), want);
+        let mut m = ProjectMeta::new("t");
+        for p in ["CAB10", "CAB2.R10", "CAB2", "CAB2.R2"] {
+            m.merge_location(Location {
+                path: p.into(),
+                description: String::new(),
+            });
+        }
+        assert_eq!(paths(&m.locations), want);
+        let rows: Vec<(String, String)> = ["+CAB10", "CAB2.R10", "CAB2", "+CAB2.R2"]
+            .into_iter()
+            .map(|p| (p.to_owned(), String::new()))
+            .collect();
+        assert_eq!(paths(&location_rows(&rows)?), want);
+        Ok(())
+    }
+
+    #[test]
     fn jumper_terminals_are_one_tag_level_and_keep_a_fixed_order() -> Result<(), String> {
         let x1 = DeviceTag::parse("-X1").map_err(|e| e.to_string())?;
         let mut m = ProjectMeta::new("t");
@@ -2786,6 +3136,24 @@ mod tests {
         assert_eq!(m, once, "the same terminals in another order change nothing");
         assert_eq!(m.jumpers[0].terminals, ["01", "1"]);
         Ok(())
+    }
+
+    #[test]
+    fn a_hand_edited_jumper_is_checked_on_load() {
+        let load = |terminals: &str| {
+            let text = format!("name = \"t\"\n[[jumper]]\nstrip = \"-X1\"\nterminals = {terminals}\n");
+            toml::from_str::<ProjectMeta>(&text).map_err(|e| e.to_string())
+        };
+        for bad in [r#"["1.2", "3"]"#, r#"["", "3"]"#, r#"["a b", "3"]"#] {
+            let err = load(bad).err().unwrap_or_default();
+            assert!(err.contains("cannot be a terminal of -X1"), "{bad}: {err}");
+        }
+        for single in [r#"["3"]"#, r#"["3", "3"]"#, "[]"] {
+            let err = load(single).err().unwrap_or_default();
+            assert!(err.contains("at least two different terminals"), "{single}: {err}");
+        }
+        let ok = load(r#"["3", "4"]"#).map(|m| m.jumpers.len());
+        assert_eq!(ok, Ok(1));
     }
 
     #[test]
@@ -2875,6 +3243,64 @@ mod tests {
         let err = toml::from_str::<ProjectMeta>(twice).err().ok_or("loaded")?.to_string();
         assert!(err.contains("-X1 is arranged twice"), "{err}");
         assert!(toml::from_str::<ProjectMeta>("name = \"t\"\n")?.strips.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_spare_at_the_end_or_a_move_back_leaves_the_strip_in_number_order() -> Result<(), String> {
+        let x1 = DeviceTag::parse("-X1").map_err(|e| e.to_string())?;
+        let s = |v: &[&str]| v.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>();
+        let drawn = s(&["1", "2", "4"]);
+        let rail = |m: &ProjectMeta, drawn: &[String]| -> Vec<String> {
+            let arranged = match m.strip_layout(&x1) {
+                Some(l) => l.arrange(drawn),
+                None => drawn.iter().map(|n| (n.clone(), false)).collect(),
+            };
+            arranged.into_iter().map(|(t, _)| t).collect()
+        };
+        let current = |m: &ProjectMeta| -> Vec<(String, bool)> {
+            let l = m.strip_layout(&x1).cloned();
+            l.map_or_else(
+                || drawn.iter().map(|n| (n.clone(), false)).collect(),
+                |l| l.arrange(&drawn),
+            )
+        };
+        let mut m = ProjectMeta::new("t");
+        // A spare at the end: the strip is still in number order, so no order is kept and a
+        // terminal 3 drawn later goes between 2 and 4, not after the spare.
+        m.add_spare(&x1, "S1", None, &current(&m))?;
+        assert_eq!(m.strip_layout(&x1).map(|l| l.order.clone()), Some(vec![]));
+        assert_eq!(rail(&m, &s(&["1", "2", "3", "4"])), s(&["1", "2", "3", "4", "S1"]));
+        // A spare out of number order keeps the order.
+        m.add_spare(&x1, "S0", None, &current(&m))?;
+        assert_eq!(rail(&m, &drawn), s(&["1", "2", "4", "S1", "S0"]));
+        assert!(m.remove_spare(&x1, "S0", &current(&m)));
+        assert_eq!(m.strip_layout(&x1).map(|l| l.order.clone()), Some(vec![]));
+        // Moved away and back: the order is forgotten again.
+        assert!(m.move_terminal(&x1, "4", 0, &current(&m))?);
+        assert_eq!(rail(&m, &drawn), s(&["4", "1", "2", "S1"]));
+        assert!(m.move_terminal(&x1, "4", 2, &current(&m))?);
+        assert_eq!(m.strip_layout(&x1).map(|l| l.order.clone()), Some(vec![]));
+        // An order set before terminal 5 was drawn names only 1, 4 and the spare: with the
+        // spare off, the rail is in number order and the order goes, so 3 drawn later goes
+        // between 1 and 4.
+        let mut n = ProjectMeta::new("t");
+        let early = s(&["1", "4"]);
+        let rail_of = |m: &ProjectMeta, d: &[String]| m.strip_layout(&x1).map(|l| l.arrange(d)).unwrap_or_default();
+        n.add_spare(
+            &x1,
+            "S1",
+            Some("1"),
+            &early.iter().map(|t| (t.clone(), false)).collect::<Vec<_>>(),
+        )?;
+        let later = s(&["1", "4", "5"]);
+        assert!(n.remove_spare(&x1, "S1", &rail_of(&n, &later)));
+        assert!(n.strips.is_empty(), "{:?}", n.strips);
+        // Without spares nothing is left of the layout.
+        assert!(m.remove_spare(&x1, "S1", &current(&m)));
+        assert!(m.move_terminal(&x1, "2", 0, &current(&m))?);
+        assert!(m.move_terminal(&x1, "2", 1, &current(&m))?);
+        assert!(m.strips.is_empty());
         Ok(())
     }
 

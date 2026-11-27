@@ -7,26 +7,37 @@ the todo that covers it, or why it has none. New gaps go straight to the todo li
 ## How the audit was done
 
 - **Code markers:** searched `crates/` and `tools/` for `TODO`, `FIXME` and `XXX`. None are left
-  (the only hit is the `\U+XXXX` escape described in `crates/wc-pdf/src/vector.rs`).
+  (the only hits are the `\U+XXXX` escape described in `crates/wc-pdf/src/vector.rs` and
+  `crates/wc-import/src/dxf.rs`).
 - **Limits in code:** searched for "not supported", "not yet", "left out" and "skipped" in
   `crates/`. Most hits are deliberate, documented behaviour (hostile input is skipped with a
   warning); the real feature gaps are listed below.
 - **README and docs:** read `README.md` and `docs/manufacturer-data.md`.
 - **Branches:** every remote branch not merged into `main` was checked against its pull request
-  (last checked 26 November 2026).
+  (last checked 27 November 2026).
 
 ## Branches
 
-There are 235 remote branches not merged into `main`. 231 of them belong to a merged pull
-request (squash-merged, so git does not see them as merged); they hold no lost work and can be
-deleted. The other four:
+There are 697 remote branches besides `main` (27 November 2026, 06:45 UTC). 660 of them belong
+to a merged pull request (squash-merged, so git does not see them as merged); they hold no lost
+work and can be deleted. `app/file-pickers` (#344), `app/imports` (#349) and
+`import/dwg-2013-2018` (#299), open at the last check, are among them now. Three push tests
+(`claude/clmssi-pushtest`, `claude/project-thread-1cr96r-pushtest`,
+`claude/project-thread-y5me9f-pushtest`) hold nothing `main` lacks and can be deleted. Seven
+belong to a pull request closed without merging, whose work reached `main` another way:
 
 | Branch | Pull request |
 |---|---|
-| `app/file-pickers` | #344 (open, #338) |
-| `app/imports` | #349 (open, #338) |
-| `import/dwg-2013-2018` | #299 (open, #292) |
-| `claude/issue-418-pdf-runlength` | #432 (closed without merging; the same work went in with #427, fixing #418), can be deleted |
+| `claude/issue-418-pdf-runlength` | #432 (the same work went in with #427, fixing #418) |
+| `claude/clmssi-cli-broken-pipe` | #566 (#550 was fixed on `main` another way) |
+| `import/follow-ups` | #646 (replaced by #660, #645 and #648) |
+| `claude/clmssi-vendorpins623` | #647 (the same fix went in with #660) |
+| `claude/fix-main-pdf-panel-field` | #996 (the same change went in with #995) |
+| `claude/project-thread-y5me9f-fix-panel-drag-test` | #1037 (the same fix went in with #1036) |
+| `claude/issue-1092-unsaved-buttons` | #1112 (#1092 is closed) |
+
+All seven can be deleted. The other 27 are work in progress on 27 November: branches of open
+pull requests, or pushed with no pull request yet.
 
 ## Import
 
@@ -38,8 +49,8 @@ deleted. The other four:
 | SolidWorks Electrical libraries (`import swe-library`): catalog parts bring their terminals as a text property, not as pins of a symbol; library blocks are drawn from their DWG files (#59), and blocks without a readable DWG file in the archive stay box symbols | `crates/wc-import/src/swe/library.rs` | Known limit: a catalog part names no symbol, so its terminals stay a property |
 | PDF trace: pictures in other sample layouts than 1-bit gray, 8- or 16-bit gray and RGB and 8-bit CMYK, are refused ("not supported yet"). LZW, CMYK and 16-bit are read since #171; CCITT fax (G3 and G4), JBIG2 and JPEG 2000 since #271, RunLength since #418, checked on small generated samples only (a JPEG 2000 alpha channel is dropped; JBIG2 symbol dictionaries shared through `JBIG2Globals` are tested since #518, and a picture that refers to a segment neither it nor its `JBIG2Globals` holds in full is refused with a message instead of coming out blank since #523; segments after the end of the file segment are not read). The JBIG2 decoder stops once its bitmaps (regions, pattern and symbol dictionaries, page) go over a 256 MiB limit, half for the shared `JBIG2Globals` segments and half for the page, less what symbol dictionaries keep outside it, their decoder contexts and export lists (counted from their headers); text-like scans with symbol dictionaries are read since #423, using an unreleased `hayro-jbig2` commit until a release has the memory limit | `crates/wc-import/src/pdf.rs`, `crates/wc-import/src/pdf_codecs.rs` | #517 (crates.io release) |
 | SolidWorks Electrical cabinet layouts: items are sorted by block name (rail, duct, plate) since the database has no item kind; a footprint without a box size takes the box round its block's DWG drawing, else its catalog part's width and height, else 18 x 90 mm; upright rails are left out (WiringCraft rails run left to right) | `crates/wc-import/src/swe/cabinet.rs` | Known limit: the database has no item kind, so sorting by name stays |
-| SVG symbols: the import gives no warnings for what it leaves out. `<use>`, `<image>` and other elements are skipped; `style` is read only for fill, fill opacity 0, fill rule, font and visibility; a filled path whose sub-paths cross each other is filled as if they were nested or apart, not where they overlap; an ellipse comes in as a circle; a `<tspan>` moved only with `dx`/`dy` stays on its text's line | `crates/wc-import/src/svg.rs` | #952, #953, #900, #1134 |
-| KiCad symbols: old `.lib` libraries are not read (KiCad 6 `.kicad_sym` only); alternate body styles and hidden pins are left out, with a warning; fields shown on the symbol, such as Value, come in as texts, and hidden ones are left out; units after the 64th are not read | `crates/wc-import/src/kicad.rs` | #957; Known limit for `.lib` (the format before KiCad 6) and the 64 units (real parts have a few) |
+| SVG symbols: the import gives no warning for an element it skips. `<use>`, `<image>` and other elements are skipped; `style` is read only for fill, fill opacity 0, fill rule, font size, text anchor, display and visibility; a filled path whose sub-paths cross each other is filled as if they were nested or apart, not where they overlap; a `<tspan>` moved only with `dx`/`dy` stays on its text's line | `crates/wc-import/src/svg.rs` | None open. Fills (#952), text size and alignment from `style` (#953), ellipses (#900) and filled paths with holes (#1134) are done |
+| KiCad symbols: old `.lib` libraries are not read (KiCad 6 `.kicad_sym` only); alternate body styles and hidden pins are left out, with a warning; fields shown on the symbol, such as Value, come in as texts, and hidden ones are left out; units after the 64th are not read | `crates/wc-import/src/kicad.rs` | Known limit for `.lib` (the format before KiCad 6) and the 64 units (real parts have a few) |
 | QElectroTech elements: the letter code is taken from the element's `label` information only when it reads as a reference (`-K1`, `PG2`), else it is left empty; a text keeps its centre or right alignment only when the file anchors its place to the alignment (`anchor="alignment"`), else it comes in left-aligned at its left end, and the lines of a multi-line text are not lined up | `crates/wc-import/src/qet.rs` | Known limit: QElectroTech's label is free text, and without the anchor the file gives no point other than the left end |
 | Binary DXF | `crates/wc-import/src/dxf.rs` | Not planned: the error tells the user to save as ASCII DXF, which every CAD program can do. |
 | DWG | `crates/wc-import/src/dwg.rs` | Read for AutoCAD 2004 to 2018 drawings only (`AC1018` to `AC1032`; AutoCAD releases after 2018 still save in the 2018 format, so their drawings are read too; 2007 checked against one real file, #215; 2013 and 2018 against 143 real files, #292; the class section is read as the specification gives it: 2007 without the second size field, 2010 and 2013 with it from maintenance release 4, 2018 always with it; the class layout of 2007, 2013 and 2018 has only been checked with drawings the tests write, and a class section that cannot be read gives a warning and the drawing is still read); 2004 texts in a code page the reader has no table for (the multi-byte Chinese, Japanese and Korean pages, the DOS pages, ISO 8859 pages other than 8859-1) are read with the legacy decoder, UTF-8 when the bytes are and else as Windows-1252, with a warning; a DWG page import (`import page-dwg`, and the app's File > Import > DWG page, which runs the same code since #600) uses this reader and turns to an installed DWG to DXF converter only for a file it refuses (#600). Multi-line attributes of 2018 drawings are counted and skipped: #300. |
@@ -47,17 +58,16 @@ deleted. The other four:
 
 ## Editing and app
 
-| Gap | Todo |
-|---|---|
-| Assistant: `get_report` cannot read the plc-cards and networks reports | #537 |
-| Assistant: `add_graphic` and `update_graphic` cannot make dimensions or filled polylines | #539 |
-| Assistant: the `run_command` tool description leaves out half the command line | #540 |
-| Starter library: symbols and example parts still missing (timer relays, motor protection, process switches, sensors, drives, special terminals, lamp and button colours) | #531 to #536, #538 |
+No open gaps are listed here.
 
 Fixed since the first audit: wire route styles (#52), Delete in the wire right-click menu (#88),
 row letters and grid coordinates (#54), slow assistant tools off the window thread (#67),
-editing a page's own title-block fields in the app, CLI and assistant (#169), and File > Import
-off the window thread with its progress shown (#356).
+editing a page's own title-block fields in the app, CLI and assistant (#169), File > Import
+off the window thread with its progress shown (#356), the assistant's `get_report` reading the
+plc-cards and networks reports (#537), dimensions and filled polylines in `add_graphic` and
+`update_graphic` (#539), `run_command`'s description naming every command (#540), and the
+starter library's timer relays, motor protection, process switches, sensors, drives, special
+terminals and lamp and button colours (#531 to #536, #538).
 
 ## Shared sessions
 
