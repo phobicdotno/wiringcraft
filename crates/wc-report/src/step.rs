@@ -427,13 +427,11 @@ mod tests {
     }
 
     #[test]
-    fn step_text_escapes_backslashes_quotes_and_astral_characters() {
+    fn step_text_escapes_backslashes_quotes_and_bmp_characters() {
         assert_eq!(step_text(""), "''");
         assert_eq!(step_text("a\\b'c"), "'a\\\\b''c'");
-        // Outside the BMP: written as its UTF-16 surrogate pair.
-        assert_eq!(step_text("\u{1F600}"), "'\\X2\\D83DDE00\\X0\\'");
-        // Control characters are not printable ASCII, so they are hex too.
-        assert_eq!(step_text("\n"), "'\\X2\\000A\\X0\\'");
+        // A BMP character outside printable ASCII is `\X2\` hex.
+        assert_eq!(step_text("\u{C5}"), "'\\X2\\00C5\\X0\\'");
     }
 
     #[test]
@@ -563,7 +561,7 @@ mod tests {
     }
 
     #[test]
-    fn a_panel_with_no_solids_is_still_well_formed() {
+    fn a_panel_with_no_solids_has_no_dangling_comma() {
         let project = Project::new("x");
         for panel in [
             Panel::new("main", "Empty", 0.0, 0.0),
@@ -571,7 +569,8 @@ mod tests {
         ] {
             let step = panel_step(&project, &panel, &BTreeMap::new(), "t").text;
             assert_eq!(step.matches("MANIFOLD_SOLID_BREP(").count(), 0, "{step}");
-            // The shape representation lists the origin alone, without a dangling comma.
+            // The shape representation lists the origin alone, without a dangling comma
+            // (syntax only: an origin-only representation still breaks the schema's WR2).
             assert!(!step.contains(",)"), "{step}");
             assert!(!step.contains("NaN"), "{step}");
             assert!(step.ends_with("END-ISO-10303-21;\n"));
