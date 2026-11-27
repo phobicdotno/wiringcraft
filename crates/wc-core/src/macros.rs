@@ -508,6 +508,7 @@ pub fn list_macros(root: &Path) -> Vec<(String, PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::DevicePart;
 
     fn err_of<T>(r: Result<T>) -> String {
         r.err().map(|e| e.to_string()).unwrap_or_default()
@@ -739,6 +740,28 @@ mod tests {
         assert_eq!(
             placed.devices[&DeviceTag::parse("-Q1")?].part.as_deref(),
             Some("SIE.3RV2011-1AA10")
+        );
+        // Accessory parts are trimmed too, and one that comes out blank is dropped.
+        let mut extras = m.clone();
+        if let Some(d) = extras.devices.values_mut().next() {
+            d.accessories = vec![
+                DevicePart {
+                    part: " nowhere.cap ".into(),
+                    qty: 2,
+                },
+                DevicePart {
+                    part: "  ".into(),
+                    qty: 1,
+                },
+            ];
+        }
+        let placed = extras.apply(None, &all)?;
+        assert_eq!(
+            placed.devices[&DeviceTag::parse("-Q1")?].accessories,
+            [DevicePart {
+                part: "nowhere.cap".into(),
+                qty: 2
+            }]
         );
         // A property that comes out empty is no property; one with text is kept.
         let mut blank = m.clone();

@@ -250,15 +250,21 @@ fn placing_a_macro_copies_and_pins_the_parts_its_devices_name() -> TestResult {
         repo.join(format!("library/parts/{lamp}.json")),
         lib.join(format!("parts/{lamp}.json")),
     )?;
+    let cap = "example.ex-lamp-24-gn";
+    std::fs::copy(
+        repo.join(format!("library/parts/{cap}.json")),
+        lib.join(format!("parts/{cap}.json")),
+    )?;
     wiringcraft(&dir, &["lib", "add", "mine", "folder", lib.to_str().ok_or("path")?])?;
-    // The lamp as a device's part (with spaces around it), and an accessory part no library has.
+    // The lamp as a device's part (with spaces around it), and as accessories a library part
+    // and a part no library has.
     std::fs::create_dir_all(dir.join("macros"))?;
     std::fs::write(
         dir.join("macros/lamp.json"),
         format!(
             r#"{{"name": "Lamp", "anchor": {{"x": 0.0, "y": 0.0}},
             "symbols": [{{"id": "s1", "symbol": "wc.coil", "at": {{"x": 10.0, "y": 10.0}}, "tag": "-P1"}}],
-            "devices": {{"-P1": {{"part": " {lamp} ", "accessories": [{{"part": "nowhere.cap"}}]}}}}}}"#
+            "devices": {{"-P1": {{"part": " {lamp} ", "accessories": [{{"part": " {cap} "}}, {{"part": "nowhere.cap"}}]}}}}}}"#
         ),
     )?;
 
@@ -267,6 +273,15 @@ fn placing_a_macro_copies_and_pins_the_parts_its_devices_name() -> TestResult {
     assert!(copy.exists(), "the part is copied into the project");
     let p = wc_core::store::load(&dir)?;
     let pin = p.lock.parts.get(lamp).cloned().ok_or("the part is pinned")?;
+    assert!(
+        p.lock.parts.contains_key(cap),
+        "the accessory is pinned: {:?}",
+        p.lock.parts
+    );
+    assert!(
+        wc_core::store::vendor_path(&dir, wc_core::lock::ItemKind::Part, cap)?.exists(),
+        "the accessory is copied into the project"
+    );
     assert!(!p.lock.parts.contains_key("nowhere.cap"), "{:?}", p.lock.parts);
     let status = wiringcraft(&dir, &["lib", "status"])?;
     assert!(
