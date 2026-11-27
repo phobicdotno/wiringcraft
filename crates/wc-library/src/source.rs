@@ -111,18 +111,60 @@ fn git(args: &[&str], cwd: Option<&Path>, name: &str) -> Result<()> {
     }
 }
 
+/// A source location as it may be shown: the user name and password of a URL
+/// (`https://user:token@host/path`) are replaced by `***`, so `https://***@host/path`.
+pub fn redact_location(location: &str) -> String {
+    let Some((scheme, rest)) = location.split_once("://") else {
+        return location.to_owned();
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest[..authority_end].rfind('@') {
+        Some(at) => format!("{scheme}://***{}", &rest[at..]),
+        None => location.to_owned(),
+    }
+}
+
 /// Sync every source in order, one outcome each, going on past a source that fails.
-pub(crate) fn sync_all(project_dir: &Path, sources: &[LibrarySource]) -> Vec<Result<String>> {
+/// Two sources with the same name would share one cache folder, so a list that has them is
+/// refused before anything is synced.
+pub(crate) fn sync_all(project_dir: &Path, sources: &[LibrarySource]) -> Result<Vec<Result<String>>> {
     sync_all_in(project_dir, sources, cache_root().as_deref())
 }
 
 /// [`sync_all`] with the git cache folder given instead of read from the environment.
-fn sync_all_in(project_dir: &Path, sources: &[LibrarySource], cache: Option<&Path>) -> Vec<Result<String>> {
-    sources.iter().map(|s| sync_one_in(project_dir, s, cache)).collect()
+fn sync_all_in(project_dir: &Path, sources: &[LibrarySource], cache: Option<&Path>) -> Result<Vec<Result<String>>> {
+    check_unique_names(sources)?;
+    Ok(sources.iter().map(|s| sync_one_in(project_dir, s, cache)).collect())
+}
+
+/// Refuses two sources whose names are the same, ignoring ASCII case (the cache folder is named
+/// after the source, and Windows and macOS file names ignore case).
+fn check_unique_names(sources: &[LibrarySource]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for s in sources {
+        if !seen.insert(s.name.to_ascii_lowercase()) {
+            return Err(Error::Source {
+                name: s.name.clone(),
+                message: "two library sources have this name; give each source its own name".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Sync one source. A failure's message has the location redacted as [`redact_location`] does.
+fn sync_one_in(project_dir: &Path, s: &LibrarySource, cache: Option<&Path>) -> Result<String> {
+    sync_one_raw(project_dir, s, cache).map_err(|e| match e {
+        Error::Source { name, message } if s.location.contains("://") => Error::Source {
+            name,
+            message: message.replace(&s.location, &redact_location(&s.location)),
+        },
+        other => other,
+    })
 }
 
 /// Sync one source, with the git cache folder given instead of read from the environment.
-fn sync_one_in(project_dir: &Path, s: &LibrarySource, cache: Option<&Path>) -> Result<String> {
+fn sync_one_raw(project_dir: &Path, s: &LibrarySource, cache: Option<&Path>) -> Result<String> {
     match s.kind.as_str() {
         "folder" => {
             let src = Source::resolve_in(project_dir, s, cache)?;
@@ -146,7 +188,7 @@ fn sync_one_in(project_dir: &Path, s: &LibrarySource, cache: Option<&Path>) -> R
                 git(&["remote", "set-url", "origin", &url], Some(&dir), &s.name)?;
                 git(&["fetch", "--depth", "1", "origin", reference], Some(&dir), &s.name)?;
                 git(&["reset", "--hard", "FETCH_HEAD"], Some(&dir), &s.name)?;
-                Ok(format!("{}: updated from {}", s.name, s.location))
+                Ok(format!("{}: updated from {}", s.name, redact_location(&s.location)))
             } else {
                 if let Some(parent) = dir.parent() {
                     std::fs::create_dir_all(parent).map_err(|e| Error::Core(wc_core::Error::io(parent, e)))?;
@@ -158,7 +200,7 @@ fn sync_one_in(project_dir: &Path, s: &LibrarySource, cache: Option<&Path>) -> R
                 }
                 args.extend([s.location.as_str(), dir_s.as_str()]);
                 git(&args, None, &s.name)?;
-                Ok(format!("{}: cloned {}", s.name, s.location))
+                Ok(format!("{}: cloned {}", s.name, redact_location(&s.location)))
             }
         }
         other => Err(Error::Source {

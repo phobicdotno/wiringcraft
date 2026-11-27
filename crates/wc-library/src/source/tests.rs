@@ -37,7 +37,7 @@ fn commit_file(repo: &Path, text: &str) -> Result<()> {
 
 /// One source synced through [`sync_all`], as the project's sync does it.
 fn sync_one(project_dir: &Path, s: &LibrarySource) -> Result<String> {
-    let mut outcomes = sync_all(project_dir, std::slice::from_ref(s));
+    let mut outcomes = sync_all(project_dir, std::slice::from_ref(s))?;
     assert_eq!(outcomes.len(), 1);
     outcomes.pop().unwrap_or_else(|| unreachable!())
 }
@@ -191,7 +191,7 @@ fn a_failing_source_does_not_stop_the_ones_after_it() -> Result<()> {
         src("good", "git", &loc, None),
     ];
 
-    let outcomes = sync_all_in(tmp.path(), &sources, Some(&cache));
+    let outcomes = sync_all_in(tmp.path(), &sources, Some(&cache))?;
     assert_eq!(outcomes.len(), 3);
     let mut outcomes = outcomes.into_iter();
     let (name, _) = source_message(outcomes.next().unwrap_or_else(|| unreachable!()));
@@ -205,5 +205,66 @@ fn a_failing_source_does_not_stop_the_ones_after_it() -> Result<()> {
         format!("good: cloned {loc}")
     );
     assert_eq!(read(&cache.join("git/good/lib.txt"))?, "v1");
+    Ok(())
+}
+
+#[test]
+fn two_sources_with_one_name_are_refused_before_anything_is_synced() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(io)?;
+    let cache = tmp.path().join("cache");
+    let upstream = tmp.path().join("upstream");
+    std::fs::create_dir(&upstream).map_err(io)?;
+    run_git(&upstream, &["init", "-q", "-b", "main"])?;
+    commit_file(&upstream, "v1")?;
+    let loc = upstream.to_string_lossy().into_owned();
+    // The names differ only in case: on Windows and macOS they would share one cache folder.
+    let sources = [src("lib", "git", &loc, None), src("Lib", "git", &loc, None)];
+
+    let (name, message) = source_message(sync_all_in(tmp.path(), &sources, Some(&cache)));
+    assert_eq!(name, "Lib");
+    assert!(message.contains("two library sources"), "{message}");
+    assert!(!cache.join("git").exists(), "nothing was synced");
+    Ok(())
+}
+
+#[test]
+fn redact_location_hides_the_user_and_password_of_a_url() {
+    assert_eq!(
+        redact_location("https://user:token@example.com/lib.git"),
+        "https://***@example.com/lib.git"
+    );
+    assert_eq!(redact_location("https://token@example.com"), "https://***@example.com");
+    // An @ after the host is part of the path, not a user name.
+    assert_eq!(
+        redact_location("https://example.com/a@b/lib.git"),
+        "https://example.com/a@b/lib.git"
+    );
+    assert_eq!(redact_location("git@example.com:lib.git"), "git@example.com:lib.git");
+    assert_eq!(redact_location("../lib"), "../lib");
+}
+
+// A file URL with a host needs a Unix path after it.
+#[cfg(unix)]
+#[test]
+fn sync_messages_do_not_show_a_password_in_the_location() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(io)?;
+    let cache = tmp.path().join("cache");
+    let upstream = tmp.path().join("upstream");
+    std::fs::create_dir(&upstream).map_err(io)?;
+    run_git(&upstream, &["init", "-q", "-b", "main"])?;
+    commit_file(&upstream, "v1")?;
+    let path = upstream.to_string_lossy();
+    let url = format!("file://user:secret@localhost{path}");
+    let shown = format!("file://***@localhost{path}");
+    let missing = format!("file://user:secret@localhost{path}-gone");
+
+    let sync = |s: &LibrarySource| sync_one_in(tmp.path(), s, Some(&cache));
+    assert_eq!(sync(&src("lib", "git", &url, None))?, format!("lib: cloned {shown}"));
+    assert_eq!(
+        sync(&src("lib", "git", &url, None))?,
+        format!("lib: updated from {shown}")
+    );
+    let (_, message) = source_message(sync(&src("gone", "git", &missing, None)));
+    assert!(!message.contains("secret"), "{message}");
     Ok(())
 }

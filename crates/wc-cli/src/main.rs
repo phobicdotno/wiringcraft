@@ -4256,7 +4256,7 @@ fn lib_cmd(dir: &Path, lc: LibCmd) -> Res<()> {
             save(dir, &p)?;
         }
         LibCmd::Sync => {
-            let outcomes = wc_library::sync(dir, &p);
+            let outcomes = wc_library::sync(dir, &p).map_err(e)?;
             let total = outcomes.len();
             let mut failed = 0;
             for outcome in outcomes {
