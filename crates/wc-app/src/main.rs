@@ -112,7 +112,10 @@ enum Dialog {
         number: String,
         title: String,
         size: PageSize,
-        overview: bool,
+        kind: state::PageKind,
+        /// The page type as the dialog opened: an unchanged choice keeps the type the page has
+        /// by then, so a graphic mark set meanwhile is not undone.
+        kind_loaded: state::PageKind,
         /// The page's own title-block fields, key and value, as the form shows them; a blank
         /// value shows the project's as a hint and is not stored.
         fields: Vec<(String, String)>,
@@ -2123,7 +2126,8 @@ impl App {
                         number: p.number.clone(),
                         title: p.title.clone(),
                         size: p.size,
-                        overview: p.overview,
+                        kind: state::PageKind::of(p),
+                        kind_loaded: state::PageKind::of(p),
                         fields: own_fields(p),
                         loaded: own_fields(p),
                         error: None,
@@ -3474,7 +3478,8 @@ impl App {
                     number,
                     title,
                     size,
-                    overview,
+                    kind,
+                    kind_loaded,
                     fields,
                     loaded,
                     error,
@@ -3515,10 +3520,18 @@ impl App {
                                 });
                             }
                             ui.end_row();
-                            ui.label("Overview");
-                            ui.checkbox(overview, "Line diagram").on_hover_text(
-                                "Shows devices again that schematic pages draw in detail. Its symbols do not count as drawings in the project check.",
-                            );
+                            ui.label("Page type");
+                            egui::ComboBox::from_id_salt("pagekind")
+                                .selected_text(kind.label())
+                                .show_ui(ui, |ui| {
+                                    for k in state::PageKind::ALL {
+                                        ui.selectable_value(kind, k, k.label());
+                                    }
+                                })
+                                .response
+                                .on_hover_text(
+                                    "A line diagram shows devices again that schematic pages draw in detail; its symbols do not count as drawings in the project check. A graphic page holds drawings only: symbols and wires are refused on it.",
+                                );
                             ui.end_row();
                         });
                     ui.add_space(6.0);
@@ -3548,7 +3561,16 @@ impl App {
                             && let Some(o) = self.open.as_mut()
                         {
                             let own = changed_fields(loaded, fields);
-                            match confirm_page_props(o, &self.ed, id, number, title, *size, *overview, &own)
+                            match confirm_page_props(
+                                o,
+                                &self.ed,
+                                id,
+                                number,
+                                title,
+                                *size,
+                                (*kind != *kind_loaded).then_some(*kind),
+                                &own,
+                            )
                             {
                                 Ok(i) => {
                                     self.ed.page = i;
@@ -6832,21 +6854,25 @@ fn confirm_page_props(
     number: &str,
     title: &str,
     size: wc_core::PageSize,
-    overview: bool,
+    // `None`: the type was not changed in the dialog, and the page keeps the one it has now.
+    kind: Option<state::PageKind>,
     fields: &std::collections::BTreeMap<String, String>,
 ) -> Result<usize, String> {
-    let i = o
+    let (i, now) = o
         .project
         .pages
         .iter()
-        .position(|p| p.id == id)
+        .enumerate()
+        .find(|(_, p)| p.id == id)
+        .map(|(i, p)| (i, state::PageKind::of(p)))
         .ok_or_else(|| "This page was removed by another participant.".to_owned())?;
     if let Some(name) = ed.held_by.get(id) {
         return Err(format!(
             "{name} has this page open; it is read-only here until they leave it."
         ));
     }
-    o.set_page_props(i, number, title, size, overview, Some(fields))
+    let kind = kind.unwrap_or(now);
+    o.set_page_props(i, number, title, size, kind, Some(fields))
 }
 
 /// The shown panel's id and its picked item with that item's place, kept before a shared-session

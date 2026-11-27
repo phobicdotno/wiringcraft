@@ -105,6 +105,37 @@ pub enum Selection {
     RevisionTable,
 }
 
+/// What a page is for, as the page dialog sets it: a schematic page, an overview (line
+/// diagram) or a graphic page (drawings only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PageKind {
+    #[default]
+    Schematic,
+    Overview,
+    Graphic,
+}
+
+impl PageKind {
+    pub const ALL: [PageKind; 3] = [PageKind::Schematic, PageKind::Overview, PageKind::Graphic];
+
+    /// The kind `page` is marked as now.
+    pub fn of(page: &wc_core::Page) -> Self {
+        match (page.overview, page.graphic) {
+            (true, _) => PageKind::Overview,
+            (false, true) => PageKind::Graphic,
+            (false, false) => PageKind::Schematic,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PageKind::Schematic => "Schematic",
+            PageKind::Overview => "Line diagram",
+            PageKind::Graphic => "Graphic (drawings only)",
+        }
+    }
+}
+
 /// One part of a wire's spec, edited on its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpecPart {
@@ -3117,6 +3148,9 @@ impl Open {
         rotation: Rotation,
         mirror: bool,
     ) -> Result<String, String> {
+        if let Some(why) = self.graphic_reason(page, "Symbols") {
+            return Err(why);
+        }
         self.ensure_symbol(symbol)?;
         let letter = self
             .symbols
@@ -3173,6 +3207,9 @@ impl Open {
         pins: &[wc_core::BoxPin],
         tag: Option<DeviceTag>,
     ) -> Result<String, String> {
+        if let Some(why) = self.graphic_reason(page, "Black boxes") {
+            return Err(why);
+        }
         let pg = self.project.pages.get(page).ok_or("no page")?;
         let (id, symbol_id) = {
             let mut n = 1usize;
@@ -3399,7 +3436,11 @@ impl Open {
         }
     }
 
+    /// Nothing is added on a graphic page ([`Open::graphic_reason`]), which holds drawings only.
     pub fn add_wire(&mut self, page: usize, from: Endpoint, to: Endpoint, via: Vec<Point>) {
+        if self.graphic_reason(page, "Wires").is_some() {
+            return;
+        }
         self.checkpoint();
         if let Some(pg) = self.project.pages.get_mut(page) {
             let id = pg.next_id("w");
@@ -3421,7 +3462,7 @@ impl Open {
     /// (just placed or moved). Part of the caller's undo step: no checkpoint is taken here.
     /// Returns how many wires were added.
     pub fn auto_wire(&mut self, page: usize, items: &std::collections::BTreeSet<String>) -> usize {
-        let Some(pg) = self.project.pages.get(page) else {
+        let Some(pg) = self.project.pages.get(page).filter(|pg| !pg.graphic) else {
             return 0;
         };
         let pairs = wc_core::autowire::suggest(pg, |id| self.symbols.get(id), items);
@@ -3471,19 +3512,30 @@ impl Open {
 
     /// Change a page's number, title and size, and with `fields` its own title-block fields
     /// (key to value; a blank value clears the field so the project's shows again, a key left
-    /// out is kept). A number another page already uses is refused. All of it is one undo step.
+    /// out is kept). A number another page already uses is refused. `kind` marks the page as an
+    /// overview, a graphic page or neither; a page that has symbols or wires cannot become a
+    /// graphic page. All of it is one undo step.
     pub fn set_page_props(
         &mut self,
         page: usize,
         number: &str,
         title: &str,
         size: PageSize,
-        overview: bool,
+        kind: PageKind,
         fields: Option<&BTreeMap<String, String>>,
     ) -> Result<usize, String> {
         let Some(current) = self.project.pages.get(page) else {
             return Err("No such page.".into());
         };
+        let (overview, graphic) = (kind == PageKind::Overview, kind == PageKind::Graphic);
+        if graphic && !current.graphic && (!current.symbols.is_empty() || !current.wires.is_empty()) {
+            return Err(format!(
+                "Page {} has {} symbol(s) and {} wire(s). A graphic page holds drawings only, so move or delete them first.",
+                current.number,
+                current.symbols.len(),
+                current.wires.len()
+            ));
+        }
         let id = current.id.clone();
         let number = match self.project.free_page_number(number, Some(&id)) {
             Ok(number) => number,
@@ -3499,6 +3551,7 @@ impl Open {
             && current.title == title
             && current.size == size
             && current.overview == overview
+            && current.graphic == graphic
             && current.title_block == own.title_block
         {
             return Ok(page);
@@ -3509,10 +3562,21 @@ impl Open {
             p.title = title.trim().to_owned();
             p.size = size;
             p.overview = overview;
+            p.graphic = graphic;
             p.title_block = own.title_block;
         }
         self.project.sort_pages();
         Ok(self.index_of(&id))
+    }
+
+    /// Why `what` (symbols, wires, ...) cannot go on `page`: it is a graphic page, which holds
+    /// drawings only.
+    pub fn graphic_reason(&self, page: usize, what: &str) -> Option<String> {
+        let pg = self.project.pages.get(page).filter(|pg| pg.graphic)?;
+        Some(format!(
+            "Page {} is a graphic page, for drawings only. {what} go on a schematic page.",
+            pg.number
+        ))
     }
 
     /// Why `page` cannot be changed here: in a shared session someone else has it open.
@@ -9778,7 +9842,7 @@ pub(crate) mod tests {
         fields.insert("revision".to_owned(), " B ".to_owned());
         fields.insert("checked_by".to_owned(), "OH".to_owned());
         let i = o
-            .set_page_props(1, &p.number, "Renamed", p.size, p.overview, Some(&fields))
+            .set_page_props(1, &p.number, "Renamed", p.size, PageKind::of(&p), Some(&fields))
             .unwrap();
         let page = &o.project.pages[i];
         assert_eq!(page.title_field(&o.project.meta, "revision"), "B");
@@ -9793,14 +9857,14 @@ pub(crate) mod tests {
         // Clearing a field falls back to the project's; a key left out is kept.
         let mut clear = BTreeMap::new();
         clear.insert("revision".to_owned(), String::new());
-        o.set_page_props(i, &p.number, "Renamed", p.size, p.overview, Some(&clear))
+        o.set_page_props(i, &p.number, "Renamed", p.size, PageKind::of(&p), Some(&clear))
             .unwrap();
         let page = &o.project.pages[i];
         assert_eq!(page.title_field(&o.project.meta, "revision"), "A");
         assert_eq!(page.title_block.get("checked_by").map(String::as_str), Some("OH"));
         // The same values again change nothing and record nothing.
         let mark = o.undo_mark();
-        o.set_page_props(i, &p.number, "Renamed", p.size, p.overview, Some(&clear))
+        o.set_page_props(i, &p.number, "Renamed", p.size, PageKind::of(&p), Some(&clear))
             .unwrap();
         assert_eq!(o.undo_mark(), mark);
 
@@ -9816,13 +9880,73 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_graphic_page_refuses_symbols_wires_and_pastes() {
+        let (_tmp, mut o) = project();
+        let p = o.project.pages[1].clone();
+        let i = o
+            .set_page_props(1, &p.number, &p.title, p.size, PageKind::Graphic, None)
+            .unwrap();
+        assert!(o.project.pages[i].graphic && !o.project.pages[i].overview);
+        assert_eq!(PageKind::of(&o.project.pages[i]), PageKind::Graphic);
+
+        let placed = o.place(i, "wc.coil", Point::new(20.0, 20.0)).unwrap_err();
+        assert!(
+            placed.contains("graphic page") && placed.starts_with("Page 2 "),
+            "{placed}"
+        );
+        let boxed = o
+            .add_black_box(i, Point::new(10.0, 10.0), Point::new(20.0, 20.0), &[], None)
+            .unwrap_err();
+        assert!(boxed.contains("Black boxes go on a schematic page"), "{boxed}");
+        let mark = o.undo_mark();
+        let free = |x: f64| Endpoint::Point { at: Point::new(x, 0.0) };
+        o.add_wire(i, free(0.0), free(10.0), Vec::new());
+        assert!(o.project.pages[i].wires.is_empty());
+        assert_eq!(o.undo_mark(), mark, "nothing was recorded");
+
+        // A copy with a symbol is refused; drawings alone go on.
+        let other = o.project.pages.iter().position(|pg| !pg.graphic).unwrap();
+        let id = o.place(other, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let clip = o.copy(other, &[Selection::Symbol(id)]);
+        let pasted = o.paste(i, &clip, Point::new(50.0, 50.0)).unwrap_err();
+        assert!(pasted.contains("graphic page"), "{pasted}");
+        assert!(o.project.pages[i].symbols.is_empty());
+        let line = o
+            .add_graphic(
+                other,
+                wc_core::geom::Shape::Line {
+                    a: Point::new(0.0, 0.0),
+                    b: Point::new(10.0, 0.0),
+                },
+            )
+            .unwrap();
+        let clip = o.copy(other, &[line]);
+        assert_eq!(o.paste(i, &clip, Point::new(50.0, 50.0)).unwrap().len(), 1);
+
+        // A page with a symbol cannot become a graphic page; back to schematic it takes them.
+        let q = o.project.pages[other].clone();
+        let err = o
+            .set_page_props(other, &q.number, &q.title, q.size, PageKind::Graphic, None)
+            .unwrap_err();
+        assert!(err.contains("1 symbol(s) and 0 wire(s)"), "{err}");
+        assert!(!o.project.pages[other].graphic);
+        let i = o
+            .set_page_props(i, &p.number, &p.title, p.size, PageKind::Schematic, None)
+            .unwrap();
+        assert!(o.place(i, "wc.coil", Point::new(20.0, 20.0)).is_ok());
+    }
+
+    #[test]
     fn pages_can_be_renamed_moved_duplicated_and_deleted() {
         let (_tmp, mut o) = project();
         assert_eq!(o.project.pages.len(), 2);
         // Renumbering resorts; a taken number is refused.
-        assert!(o.set_page_props(0, "2", "Cover", PageSize::A3, false, None).is_err());
+        assert!(
+            o.set_page_props(0, "2", "Cover", PageSize::A3, PageKind::Schematic, None)
+                .is_err()
+        );
         let i = o
-            .set_page_props(0, "10", "Cover sheet", PageSize::A4, true, None)
+            .set_page_props(0, "10", "Cover sheet", PageSize::A4, PageKind::Overview, None)
             .unwrap();
         assert!(o.project.pages[i].overview);
         assert_eq!(i, 1);
