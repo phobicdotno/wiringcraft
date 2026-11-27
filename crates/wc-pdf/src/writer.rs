@@ -151,6 +151,8 @@ struct PageData {
 
 pub struct Doc {
     title: String,
+    /// Extra document info entries (`Author`, `Subject`) by key, written after the title.
+    info: Vec<(&'static str, String)>,
     pages: Vec<PageData>,
 }
 
@@ -191,7 +193,17 @@ impl Doc {
     pub fn new(title: &str) -> Self {
         Self {
             title: title.to_owned(),
+            info: Vec::new(),
             pages: Vec::new(),
+        }
+    }
+
+    /// Add a document info entry such as `Author` or `Subject`, shown in the reader's document
+    /// properties; a blank value adds nothing.
+    pub fn set_info(&mut self, key: &'static str, value: &str) {
+        let value = value.trim();
+        if !value.is_empty() {
+            self.info.push((key, value.to_owned()));
         }
     }
 
@@ -327,7 +339,15 @@ impl Doc {
         }
         objs.push((
             5,
-            format!("<< /Title {} /Producer (WiringCraft) >>", pdf_text_string(&self.title)).into_bytes(),
+            format!(
+                "<< /Title {} /Producer (WiringCraft){} >>",
+                pdf_text_string(&self.title),
+                self.info
+                    .iter()
+                    .map(|(k, v)| format!(" /{k} {}", pdf_text_string(v)))
+                    .collect::<String>()
+            )
+            .into_bytes(),
         ));
         for (i, p) in self.pages.iter().enumerate() {
             let (w, h) = (p.size_mm.0 * PT_PER_MM, p.size_mm.1 * PT_PER_MM);
