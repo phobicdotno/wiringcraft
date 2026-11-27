@@ -226,11 +226,12 @@ impl TryFrom<StoredJumper> for Jumper {
 
     /// Refuses a jumper naming a number that cannot be a terminal of its strip, or with fewer
     /// than two different terminals (a hand edit or another tool), as
-    /// [`ProjectMeta::add_jumper`] does.
+    /// [`ProjectMeta::add_jumper`] does. A terminal named twice is kept once, so taking one
+    /// terminal out later never leaves a jumper on a single terminal that cannot be read back.
     fn try_from(j: StoredJumper) -> Result<Self, String> {
-        let mut distinct: Vec<&String> = Vec::new();
-        for t in &j.terminals {
-            check_terminal_number(&j.strip, t)?;
+        let mut distinct: Vec<String> = Vec::new();
+        for t in j.terminals {
+            check_terminal_number(&j.strip, &t)?;
             if !distinct.contains(&t) {
                 distinct.push(t);
             }
@@ -243,7 +244,7 @@ impl TryFrom<StoredJumper> for Jumper {
         }
         Ok(Jumper {
             strip: j.strip,
-            terminals: j.terminals,
+            terminals: distinct,
             part: j.part,
         })
     }
@@ -2843,7 +2844,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hand_edited_jumper_is_checked_on_load() {
+    fn a_hand_edited_jumper_is_checked_on_load() -> Result<(), String> {
         let load = |terminals: &str| {
             let text = format!("name = \"t\"\n[[jumper]]\nstrip = \"-X1\"\nterminals = {terminals}\n");
             toml::from_str::<ProjectMeta>(&text).map_err(|e| e.to_string())
@@ -2858,6 +2859,15 @@ mod tests {
         }
         let ok = load(r#"["3", "4"]"#).map(|m| m.jumpers.len());
         assert_eq!(ok, Ok(1));
+
+        // A terminal named twice is kept once: taking the other one out removes the jumper
+        // instead of leaving one on a single terminal, which the next load would refuse.
+        let mut m = load(r#"["3", "3", "4"]"#)?;
+        assert_eq!(m.jumpers[0].terminals, ["3", "4"]);
+        let x1 = m.jumpers[0].strip.clone();
+        assert!(m.remove_from_jumper(&x1, "4"));
+        assert!(m.jumpers.is_empty());
+        Ok(())
     }
 
     #[test]
