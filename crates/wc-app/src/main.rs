@@ -6858,18 +6858,20 @@ fn confirm_page_props(
     kind: Option<state::PageKind>,
     fields: &std::collections::BTreeMap<String, String>,
 ) -> Result<usize, String> {
-    let i = o
+    let (i, now) = o
         .project
         .pages
         .iter()
-        .position(|p| p.id == id)
+        .enumerate()
+        .find(|(_, p)| p.id == id)
+        .map(|(i, p)| (i, state::PageKind::of(p)))
         .ok_or_else(|| "This page was removed by another participant.".to_owned())?;
     if let Some(name) = ed.held_by.get(id) {
         return Err(format!(
             "{name} has this page open; it is read-only here until they leave it."
         ));
     }
-    let kind = kind.unwrap_or_else(|| state::PageKind::of(&o.project.pages[i]));
+    let kind = kind.unwrap_or(now);
     o.set_page_props(i, number, title, size, kind, Some(fields))
 }
 
