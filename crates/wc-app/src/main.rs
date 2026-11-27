@@ -2559,28 +2559,32 @@ impl App {
                         clip.wires.len(),
                         clip.graphics.len()
                     ));
-                    egui::Grid::new("macro")
+                    let enter = egui::Grid::new("macro")
                         .num_columns(2)
                         .spacing([8.0, 6.0])
                         .show(ui, |ui| {
                             ui.label("Name");
-                            ui.add(
+                            let n = ui.add(
                                 egui::TextEdit::singleline(name)
                                     .hint_text("Motor starter DOL")
                                     .desired_width(320.0),
                             );
                             ui.end_row();
                             ui.label("Description");
-                            ui.add(egui::TextEdit::singleline(description).desired_width(320.0));
+                            let d = ui.add(egui::TextEdit::singleline(description).desired_width(320.0));
                             ui.end_row();
-                        });
+                            (n.lost_focus() || d.lost_focus()) && ui.input(|i| i.key_pressed(Key::Enter))
+                        })
+                        .inner;
                     if let Some(e) = error {
                         ui.colored_label(theme::Theme::of(ui.ctx()).error, e.as_str());
                     }
                     ui.horizontal(|ui| {
-                        if ui
+                        if (ui
                             .add_enabled(!name.trim().is_empty(), egui::Button::new("Save"))
                             .clicked()
+                            || enter)
+                            && !name.trim().is_empty()
                             && let Some(open) = &mut self.open
                         {
                             match open.save_macro(clip, name, description) {
@@ -2591,7 +2595,7 @@ impl App {
                                 Err(e) => *error = Some(e),
                             }
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
                             keep = false;
                         }
                     });
@@ -2866,7 +2870,7 @@ impl App {
                                 Err(e) => *error = Some(e),
                             }
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
                             keep = false;
                         }
                     });
@@ -2897,7 +2901,7 @@ impl App {
                                 Err(e) => *error = Some(e),
                             }
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
                             keep = false;
                         }
                     });
@@ -2982,7 +2986,7 @@ impl App {
                             then = Some(Box::new(move |app: &mut App| app.start_new_project(&d, &n, b.as_deref())));
                             keep = false;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
                             keep = false;
                         }
                     });
@@ -8127,6 +8131,45 @@ mod nudge_tests {
             sent.extend(app_frame(app, ctx, events, false));
         }
         sent
+    }
+
+    /// Escape cancels the Open project, Save as, New project and Save as macro dialogs, as it
+    /// does the other small dialogs.
+    #[test]
+    fn escape_cancels_the_path_and_macro_dialogs() {
+        let dialogs: [fn() -> Dialog; 4] = [
+            || Dialog::OpenPath(prefs::FolderField::typed(""), None),
+            || Dialog::SaveAsPath(prefs::FolderField::typed(""), None),
+            || Dialog::NewProject {
+                location: prefs::FolderField::typed(""),
+                name: String::new(),
+                base: String::new(),
+                error: None,
+            },
+            || Dialog::SaveMacro {
+                clip: Default::default(),
+                name: "M".into(),
+                description: String::new(),
+                error: None,
+            },
+        ];
+        for make in dialogs {
+            let (_tmp, mut app, ctx) = app(Point::new(55.0, 60.0), false);
+            theme::install_fonts(&ctx);
+            theme::apply(&ctx, app.prefs.theme);
+            app.dialog = Some(make());
+            app_frame(&mut app, &ctx, Vec::new(), false);
+            assert!(app.dialog.is_some());
+            let escape = egui::Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            };
+            app_frame(&mut app, &ctx, vec![escape], false);
+            assert!(app.dialog.is_none(), "Escape cancels");
+        }
     }
 
     /// An app with its coil moved one step: the project has unsaved changes.
