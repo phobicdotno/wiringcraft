@@ -161,23 +161,84 @@ fn redact_text(text: &str, location: &str) -> String {
                 .replace(&bare, &shown);
         }
         if let Some(userinfo) = userinfo {
-            // The whole user name and password, then the user name alone.
-            let user = userinfo.split_once(':').map_or(userinfo, |(user, _)| user);
-            text = mask_before_at(&text, &[userinfo, user]);
+            text = mask_before_at(&text, &credential_forms(userinfo));
         }
     }
     text
 }
 
+/// The ways a URL's `user:password` may be printed: the user name and password together, then
+/// the user name alone, each as configured, percent-encoded (every character outside RFC 3986's
+/// unreserved set as `%XX`, with uppercase and with lowercase hex) and percent-decoded.
+fn credential_forms(userinfo: &str) -> Vec<String> {
+    let parts: Vec<&str> = match userinfo.split_once(':') {
+        Some((user, password)) => vec![user, password],
+        None => vec![userinfo],
+    };
+    let ways: [fn(&str) -> String; 4] = [
+        str::to_owned,
+        |s| percent_encode(s, true),
+        |s| percent_encode(s, false),
+        percent_decode,
+    ];
+    let mut forms = Vec::new();
+    for way in ways {
+        forms.push(parts.iter().map(|p| way(p)).collect::<Vec<_>>().join(":"));
+    }
+    if let Some(user) = parts.first().filter(|_| parts.len() > 1) {
+        forms.extend(ways.iter().map(|way| way(user)));
+    }
+    forms
+}
+
+/// `s` with every byte outside RFC 3986's unreserved characters (`A-Z a-z 0-9 - . _ ~`) written
+/// as `%XX`, with uppercase or lowercase hex.
+fn percent_encode(s: &str, upper: bool) -> String {
+    s.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+                char::from(b).to_string()
+            } else if upper {
+                format!("%{b:02X}")
+            } else {
+                format!("%{b:02x}")
+            }
+        })
+        .collect()
+}
+
+/// `s` with each `%XX` turned back into its byte (left as it is where it is not valid hex, or
+/// when the result is not UTF-8).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        let hex = bytes.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok());
+        match hex.filter(|_| b == b'%').and_then(|h| u8::from_str_radix(h, 16).ok()) {
+            Some(decoded) => {
+                out.push(decoded);
+                i += 3;
+            }
+            None => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_owned())
+}
+
 /// `text` with each `secret` that is followed by `@` replaced by `***@`, in one pass from left
-/// to right: at each place the first (longest) secret that matches is taken, so the `***` put in
-/// is never looked at again. An empty secret hides nothing and is not looked for.
-fn mask_before_at(text: &str, secrets: &[&str]) -> String {
-    let forms: Vec<String> = secrets
+/// to right: at each place the longest secret that matches is taken, so the `***` put in is
+/// never looked at again. An empty secret hides nothing and is not looked for.
+fn mask_before_at(text: &str, secrets: &[String]) -> String {
+    let mut forms: Vec<String> = secrets
         .iter()
         .filter(|s| !s.is_empty())
         .map(|s| format!("{s}@"))
         .collect();
+    forms.sort_by_key(|f| std::cmp::Reverse(f.len()));
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(c) = rest.chars().next() {

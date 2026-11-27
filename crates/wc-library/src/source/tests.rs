@@ -290,6 +290,22 @@ fn credentials_with_a_star_are_redacted_too() {
     }
 }
 
+#[test]
+fn percent_encoded_credentials_are_redacted_too() {
+    let location = "https://tok*x:p*w@host/lib.git";
+    for printed in [
+        "https://tok%2Ax@host",
+        "https://tok%2ax@host",
+        "https://tok%2Ax:p%2Aw@host",
+    ] {
+        let text = redact_text(&format!("fatal: could not read Password for '{printed}'"), location);
+        assert_eq!(text, "fatal: could not read Password for 'https://***@host'");
+    }
+    // A location that is already encoded is found in its decoded form too.
+    let text = redact_text("fatal: for 'https://tok*x@host'", "https://tok%2Ax:p%2Aw@host/lib.git");
+    assert_eq!(text, "fatal: for 'https://***@host'");
+}
+
 // A file URL with a host needs a Unix path after it.
 #[cfg(unix)]
 #[test]
