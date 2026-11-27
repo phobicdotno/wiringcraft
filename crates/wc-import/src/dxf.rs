@@ -475,8 +475,9 @@ fn shapes(
         }
         // Code 60 = 1: the entity is invisible, so it is not drawn (an INSERT draws nothing of
         // its block), except on the layers `hidden_text` names (a symbol's pin layers, where it
-        // still marks or names a pin; an INSERT there is left out like anywhere else).
-        if e.f(60) as i64 == 1 && (e.kind == "INSERT" || !hidden_text(&layer)) {
+        // still marks or names a pin; an INSERT there is left out like anywhere else). A POINT
+        // is never drawn and marks a pin on any layer, so it is kept whether shown or not.
+        if e.f(60) as i64 == 1 && e.kind != "POINT" && (e.kind == "INSERT" || !hidden_text(&layer)) {
             continue;
         }
         // An extrusion pointing down (left by mirroring in AutoCAD) mirrors the entity's own
@@ -3144,6 +3145,16 @@ mod tests {
         let sym = symbol(
             &dxf(
                 "0\nPOINT\n8\nPIN\n60\n1\n10\n0\n20\n0\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n",
+                "",
+            ),
+            "s",
+            "S",
+        )?;
+        assert_eq!(sym.pins.len(), 1);
+        // So does an invisible point on any other layer: a POINT marks a pin wherever it is.
+        let sym = symbol(
+            &dxf(
+                "0\nPOINT\n8\n0\n60\n1\n10\n0\n20\n0\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n",
                 "",
             ),
             "s",
