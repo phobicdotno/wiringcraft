@@ -127,7 +127,9 @@ folder, such as a `macros` folder that is a link, is left out). Then:
 - The project's `date` field is set to today, and the pages' own dates are dropped.
 - Library sources keep pointing at the same libraries. A folder source inside the base project is
   copied along; a relative folder outside it (such as `../library`) is written as the absolute
-  folder it named.
+  folder it named. That works only for a base project in a folder: a base project fetched from
+  a git repository cannot name library folders outside the repository, and `new` stops with an
+  error. Start from a local copy of it, or point those sources at absolute folders or git.
 
 ## Page template and title block
 
