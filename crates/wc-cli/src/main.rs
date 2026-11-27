@@ -993,12 +993,14 @@ enum JumperCmd {
         /// Terminal numbers, at least two.
         terminals: Vec<String>,
     },
-    /// Take terminals out of their jumper, e.g. `jumper remove -X1 4`.
+    /// Take terminals out of their jumper, e.g. `jumper remove -X1 4`. Nothing changes when
+    /// one of them is in no jumper of the strip.
     Remove {
         /// The strip, e.g. `-X1` (taken as a value, though it starts with `-`).
         #[arg(allow_hyphen_values = true)]
         strip: String,
-        /// Terminal numbers.
+        /// Terminal numbers, at least one.
+        #[arg(required = true)]
         terminals: Vec<String>,
     },
     /// Give the jumper holding a terminal a part (article), e.g. `jumper part -X1 3 <part id>`
@@ -3704,12 +3706,19 @@ fn run(mut cli: Cli) -> Res<()> {
                 }
                 JumperCmd::Remove { strip, terminals } => {
                     let strip = DeviceTag::parse(&strip).map_err(e)?;
-                    let mut changed = false;
-                    for t in &terminals {
-                        changed |= p.meta.remove_from_jumper(&strip, t.trim());
+                    // Every terminal is checked first, as `jumper add` does, so a typo among them
+                    // refuses the whole command instead of being passed over.
+                    let terminals: Vec<&str> = terminals.iter().map(|t| t.trim()).collect();
+                    if let Some(t) = terminals.iter().find(|t| {
+                        !p.meta
+                            .jumpers
+                            .iter()
+                            .any(|j| j.strip == strip && j.terminals.iter().any(|n| n == *t))
+                    }) {
+                        return Err(format!("no jumper of {strip} has terminal {}", escape_field(t)));
                     }
-                    if !changed {
-                        return Err(format!("no jumper of {strip} has terminal {}", terminals.join(", ")));
+                    for t in terminals {
+                        p.meta.remove_from_jumper(&strip, t);
                     }
                     save(dir, &p)?;
                 }
@@ -9189,6 +9198,23 @@ mod tests {
         let err = cli(&dir, &["jumper", "remove", "--", "-X1", "9"]).unwrap_err();
         assert!(err.contains("no jumper of -X1 has terminal 9"), "{err}");
         assert!(cli(&dir, &["jumper", "add", "--", "-X1", "1.2", "3.4"]).is_err());
+    }
+
+    #[test]
+    fn jumper_remove_changes_nothing_when_a_terminal_is_in_no_jumper() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        draw_x1_terminals(&dir);
+        cli(&dir, &["jumper", "add", "--", "-X1", "3", "4", "5"]).unwrap();
+        // 9 is a typo: 4 stays in the jumper and the error names 9.
+        let err = cli(&dir, &["jumper", "remove", "--", "-X1", "4", " 9 "]).unwrap_err();
+        assert_eq!(err, "no jumper of -X1 has terminal 9");
+        assert_eq!(load(&dir).unwrap().meta.jumpers[0].terminals, ["3", "4", "5"]);
+        // No terminal at all is a usage error, not a half-sentence.
+        assert!(Cli::try_parse_from(["wiringcraft", "jumper", "remove", "--", "-X1"]).is_err());
+        cli(&dir, &["jumper", "remove", "--", "-X1", "4", " 5 "]).unwrap();
+        assert!(load(&dir).unwrap().meta.jumpers.is_empty());
     }
 
     #[test]
