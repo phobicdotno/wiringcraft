@@ -2368,6 +2368,44 @@ fn one_strips_markers_are_only_that_strips_terminals() {
 }
 
 #[test]
+fn check_flags_a_wire_section_not_above_0_and_a_colour_that_is_no_iec_code() {
+    let (mut p, s, parts) = fixture();
+    for w in p.pages.iter_mut().flat_map(|pg| pg.wires.iter_mut()) {
+        match w.id.as_str() {
+            "w1" => (w.spec.section, w.spec.colour) = (Some("0 mm²".into()), Some("gnye".into())),
+            "w2" => (w.spec.section, w.spec.colour) = (Some("1.5 mm²".into()), Some("BLUE".into())),
+            _ => {}
+        }
+        w.number = None;
+    }
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let found: Vec<(Severity, Option<String>, String)> = check(&i)
+        .into_iter()
+        .filter(|f| f.message.contains("cross-section") || f.message.contains("IEC 60757"))
+        .map(|f| (f.severity, f.item, f.message))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            (
+                Severity::Warning,
+                Some("w1".into()),
+                "wire has cross-section 0 mm², which is not above 0".into()
+            ),
+            (
+                Severity::Note,
+                Some("w2".into()),
+                "wire has colour BLUE, which is not an IEC 60757 code such as BU or GNYE".into()
+            ),
+        ]
+    );
+}
+
+#[test]
 fn check_names_a_jumper_terminal_drawn_nowhere() {
     let (mut p, s, parts) = fixture();
     let x1 = DeviceTag::parse("-X1").unwrap();
