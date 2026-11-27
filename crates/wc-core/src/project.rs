@@ -1464,8 +1464,8 @@ impl PageSize {
     }
 
     /// How many reference rows run down the sides of the frame, by the sheet's height: A to F
-    /// up to A3 landscape (297 mm), A to H up to A2 landscape (420 mm), A to K up to A1
-    /// landscape (594 mm), A to M above. Fixed per sheet size, so a reference never moves.
+    /// up to A3 landscape (297 mm), A to H up to A2 landscape (420 mm), A to J up to A1
+    /// landscape (594 mm), A to L above. Fixed per sheet size, so a reference never moves.
     pub fn frame_rows(self) -> usize {
         let (_, h) = self.mm();
         if h <= 297.0 {
