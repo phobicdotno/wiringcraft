@@ -5705,7 +5705,9 @@ fn export_drawings_to(open: &Open, dir: &Path) -> String {
         footprints: wc_pdf::footprints(open.parts.values()),
         ..Default::default()
     };
-    let (pages, report) = wc_pdf::page_drawings(&open.project, &open.symbols, &options);
+    let (pages, mut report) = wc_pdf::page_drawings(&open.project, &open.symbols, &options);
+    // The DXF files write a character beyond U+FFFF as `?`; the warning names each such text.
+    report.warnings.extend(pages.iter().flat_map(wc_pdf::dxf_warnings));
     let mut used = std::collections::BTreeSet::new();
     let files: Vec<(String, &wc_pdf::PageDrawing)> = pages
         .iter()
@@ -7349,6 +7351,26 @@ mod marking_tests {
         assert_eq!(
             names,
             ["1.dxf", "1.svg", "panel-Main_cabinet.dxf", "panel-Main_cabinet.svg"]
+        );
+    }
+
+    #[test]
+    fn drawings_warn_about_a_text_the_dxf_writes_with_a_question_mark() {
+        let (_tmp, mut o) = state::tests::project();
+        o.project.pages.truncate(1);
+        o.project.pages[0].number = "1".into();
+        o.project.pages[0].graphics.push(wc_core::Shape::Text {
+            at: wc_core::geom::Point::new(50.0, 50.0),
+            text: "Pump \u{1F600}".into(),
+            height: 3.0,
+            align: Default::default(),
+            angle: 0.0,
+        });
+        let own = o.dir.join("export").join("drawings");
+        let msg = export_drawings_to(&o, &own);
+        assert!(
+            msg.contains("Warnings:\npage 1: the text \"Pump \u{1F600}\" is written as \"Pump ?\" in the DXF"),
+            "{msg}"
         );
     }
 

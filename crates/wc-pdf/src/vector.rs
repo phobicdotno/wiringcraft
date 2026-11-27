@@ -75,7 +75,8 @@ pub fn page_drawings(
 
 /// As [`page_drawings`], but without the logo and underlays, for formats that do not show
 /// pictures (DXF). Their files are not looked up; a warning names each page whose underlay is
-/// left out, and the logo once when a sheet has a place for it.
+/// left out, the logo once when a sheet has a place for it, and each text the DXF writes with
+/// a `?` ([`dxf_warnings`]).
 pub fn page_lines(
     project: &Project,
     symbols: &BTreeMap<String, Symbol>,
@@ -202,6 +203,11 @@ fn drawings(
             prims: drawn.prims,
             panel: true,
         });
+    }
+    if !with_pictures {
+        for d in &out {
+            report.warnings.extend(dxf_warnings(d));
+        }
     }
     if let Some(l) = project.meta.logo.as_ref().filter(|_| logo_left_out) {
         report.warnings.push(format!(
@@ -530,7 +536,7 @@ fn aci(ink: &Stroke) -> u8 {
 /// DXF text: ASCII as is, anything else as `\U+XXXX`, which DXF readers turn back into text.
 /// A backslash, and a `%` next to another `%`, are written as codes too, so readers do not take
 /// them for a `\U+XXXX` or `%%` code; a character beyond U+FFFF, which has no four-digit code,
-/// becomes `?`.
+/// becomes `?` ([`dxf_warnings`] names the texts that have one).
 pub(crate) fn dxf_text(s: &str) -> String {
     // Control characters are dropped first, so two `%` they stood between are seen as a pair.
     let chars: Vec<char> = s.chars().filter(|c| !c.is_control()).collect();
@@ -549,6 +555,32 @@ pub(crate) fn dxf_text(s: &str) -> String {
         }
     }
     out
+}
+
+/// A warning for each text on `page` that the DXF writes with a `?` (a character beyond U+FFFF),
+/// naming the page and the text, once per text however often it is on the page.
+pub fn dxf_warnings(page: &PageDrawing) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    page.prims
+        .iter()
+        .filter_map(|p| match p {
+            Prim::Text { text, .. } if text.chars().any(|c| u32::from(c) > 0xFFFF) => Some(text),
+            _ => None,
+        })
+        .filter(|text| seen.insert(text.as_str()))
+        .map(|text| {
+            let shown: String = text
+                .chars()
+                .filter(|c| !c.is_control())
+                .map(|c| if u32::from(c) > 0xFFFF { '?' } else { c })
+                .collect();
+            format!(
+                "page {}: the text \"{text}\" is written as \"{shown}\" in the DXF: a DXF has no code for \
+                 characters beyond U+FFFF, such as emoji (the SVG export keeps them)",
+                page.number
+            )
+        })
+        .collect()
 }
 
 /// A filled outline as DXF SOLID corners (10, 11, 12, 13 in that order; DXF draws them as
