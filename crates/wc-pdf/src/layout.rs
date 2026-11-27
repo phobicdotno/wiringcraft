@@ -2357,3 +2357,122 @@ mod template_tests {
         assert_eq!(merged, vec![(1.0, 0.0, 1.0), (5.0, 0.0, 3.0), (5.0, 4.0, 6.0)]);
     }
 }
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+
+    #[test]
+    fn a_plain_bend_or_two_wires_meeting_end_to_end_is_no_junction() {
+        let bend = vec![(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)];
+        assert!(junctions(std::slice::from_ref(&bend)).is_empty());
+        let a = vec![(0.0, 0.0), (10.0, 0.0)];
+        let b = vec![(10.0, 0.0), (20.0, 0.0)];
+        assert!(junctions(&[a, b]).is_empty());
+    }
+
+    #[test]
+    fn a_wire_ending_on_another_wires_middle_is_a_t_junction() {
+        let main = vec![(0.0, 0.0), (20.0, 0.0)];
+        let branch = vec![(10.0, 0.0), (10.0, 10.0)];
+        assert_eq!(junctions(&[main, branch]), vec![(10.0, 0.0)]);
+    }
+
+    #[test]
+    fn three_wire_ends_on_one_point_are_one_junction() {
+        let wires = vec![
+            vec![(5.0, 5.0), (0.0, 5.0)],
+            vec![(5.0, 5.0), (10.0, 5.0)],
+            vec![(5.0, 5.0), (5.0, 10.0)],
+        ];
+        assert_eq!(junctions(&wires), vec![(5.0, 5.0)]);
+        // Within the tolerance, a slightly-off end still meets the others.
+        let near = vec![
+            vec![(5.0, 5.0), (0.0, 5.0)],
+            vec![(5.004, 5.0), (10.0, 5.0)],
+            vec![(5.0, 4.996), (5.0, 10.0)],
+        ];
+        assert_eq!(junctions(&near).len(), 1);
+    }
+
+    #[test]
+    fn crossing_wires_are_no_junction_but_a_wire_ending_on_a_bend_is() {
+        let h = vec![(0.0, 5.0), (10.0, 5.0)];
+        let v = vec![(5.0, 0.0), (5.0, 10.0)];
+        assert!(junctions(&[h, v]).is_empty());
+        // A wire ending on another wire's bend makes three branches there.
+        let corner = vec![(0.0, 0.0), (5.0, 0.0), (5.0, 5.0)];
+        let stub = vec![(5.0, 0.0), (9.0, 0.0)];
+        assert_eq!(junctions(&[corner, stub]), vec![(5.0, 0.0)]);
+    }
+
+    #[test]
+    fn reversed_and_touching_segments_join_and_separate_lines_stay_apart() {
+        let merged = merge_segments(vec![
+            (2.0, 5.0, 3.0),
+            (2.0, 5.0, 8.0),
+            (1.0, 4.0, 0.0),
+            (2.0, 9.0, 10.0),
+        ]);
+        assert_eq!(merged, vec![(1.0, 0.0, 4.0), (2.0, 3.0, 8.0), (2.0, 9.0, 10.0)]);
+        assert!(merge_segments(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn text_in_a_title_block_box_moves_up_and_shrinks_or_is_left_out() {
+        // Room enough: the baseline and height stay.
+        assert_eq!(fit_in_box(0.0, 10.0, 5.0, 2.0), Some((5.0, 2.0)));
+        // A baseline too low moves up to stay above the box's bottom.
+        assert_eq!(fit_in_box(0.0, 10.0, 12.0, 2.0), Some((10.0 - BELOW_BASELINE, 2.0)));
+        // A box too short for the height shrinks the text.
+        let Some((y, h)) = fit_in_box(4.0, 6.0, 5.5, 3.0) else {
+            unreachable!()
+        };
+        assert!((y - 5.2).abs() < 1e-9 && (h - 1.2).abs() < 1e-9, "{y} {h}");
+        // No room for half a millimetre of text: nothing is drawn.
+        assert_eq!(fit_in_box(4.0, 5.0, 5.0, 3.0), None);
+    }
+
+    #[test]
+    fn a_long_text_is_drawn_smaller_to_fit_its_room() {
+        assert!((fit_height("A", 2.5, 100.0) - 2.5).abs() < f64::EPSILON);
+        let long = "A very long project name that never fits";
+        let h = fit_height(long, 2.5, 20.0);
+        assert!(h < 2.5);
+        assert!((text_width_mm(long, h) - 20.0).abs() < 1e-6);
+        // No room at all keeps the height instead of dividing by nothing.
+        assert!((fit_height(long, 2.5, 0.0) - 2.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn column_widths_fill_the_frame_or_shrink_to_it() {
+        let table = wc_report::Table {
+            columns: vec!["A".into(), "B".into()],
+            rows: vec![vec!["x".into(), "y".into()]],
+            ..Default::default()
+        };
+        let w = column_widths(&table, 100.0);
+        assert!((w.iter().sum::<f64>() - 100.0).abs() < 1e-9);
+        let Some(first) = w.first() else { unreachable!() };
+        assert!((first - (text_width_mm("A", TABLE_TEXT) + 2.0 * CELL_PAD)).abs() < 1e-9);
+        // A cell too wide for the frame: every column shrinks so the table fits exactly.
+        let wide = wc_report::Table {
+            columns: vec!["A".into(), "B".into()],
+            rows: vec![vec!["W".repeat(200), "W".repeat(200)]],
+            ..Default::default()
+        };
+        let w = column_widths(&wide, 50.0);
+        assert!((w.iter().sum::<f64>() - 50.0).abs() < 1e-9, "{w:?}");
+        assert!(w.iter().all(|x| *x > 0.0));
+    }
+
+    #[test]
+    fn a_table_cell_that_fits_is_kept_and_a_long_one_is_cut() {
+        assert_eq!(fit("short", 100.0), "short");
+        let cut = fit("a fairly long cell value for a narrow column", 15.0);
+        assert!(cut.ends_with("...") && text_width_mm(&cut, TABLE_TEXT) <= 15.0, "{cut}");
+        // Multi-byte text is cut on a character boundary.
+        let cut = fit("ÄÖÜäöüßéèêëñ".repeat(5).as_str(), 10.0);
+        assert!(cut.ends_with("..."), "{cut}");
+    }
+}
