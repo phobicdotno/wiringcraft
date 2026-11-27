@@ -688,7 +688,16 @@ fn shapes(
             "TEXT" | "MTEXT" | "ATTRIB" => {
                 let raw = e.get(1).unwrap_or("");
                 let text = if e.kind == "MTEXT" {
-                    mtext_plain(raw)
+                    // A text over 250 characters comes as code 3 chunks before the last one
+                    // (code 1): joined first, so a code split across two chunks still reads.
+                    let mut whole: String = e
+                        .codes
+                        .iter()
+                        .filter(|(c, _)| *c == 3)
+                        .map(|(_, v)| v.as_str())
+                        .collect();
+                    whole.push_str(raw);
+                    mtext_plain(&whole)
                 } else {
                     special_codes(raw)
                 };
@@ -3503,6 +3512,25 @@ mod tests {
             Some("-K\u{c5}1")
         );
         assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+        Ok(())
+    }
+
+    #[test]
+    fn a_long_mtext_keeps_its_first_chunks() -> Result<()> {
+        // Over 250 characters: code 3 chunks first, the last part as code 1; a `\U+00C5`
+        // split across two chunks.
+        let ents = "0\nMTEXT\n8\n0\n10\n5\n20\n9\n40\n2\n3\nMotor M1 feeds the pump\\U+0\n\
+                    3\n0C5 in hall\\P\n1\nB2\n";
+        let p = page(&dxf(ents, ""), 1.0, &BTreeSet::new())?;
+        let texts: Vec<&str> = p
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["Motor M1 feeds the pump\u{c5} in hall B2"]);
         Ok(())
     }
 
