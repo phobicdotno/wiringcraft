@@ -3685,6 +3685,30 @@ fn a_layout_sorts_by_every_key_in_turn_and_keeps_the_built_in_order_on_ties() {
 }
 
 #[test]
+fn a_sort_entry_with_spaces_around_its_minus_sorts_descending_without_a_warning() {
+    use wc_core::report_layout::ReportLayout;
+    let mut t = Table::new("T", &["Tag"]);
+    for tag in ["-K1", "-K3", "-K2"] {
+        t.rows.push(vec![tag.into()]);
+    }
+    let layout = ReportLayout {
+        kind: "devices".into(),
+        sort: vec![" -Tag ".into()],
+        ..Default::default()
+    };
+    let columns = t.columns.clone();
+    assert_eq!(
+        layout_problems_for(&columns, &layout, &wc_core::Project::new("P")),
+        Vec::<String>::new()
+    );
+    let sorted = t.with_layout(&layout);
+    assert_eq!(
+        sorted.rows.iter().map(|r| r[0].as_str()).collect::<Vec<_>>(),
+        ["-K3", "-K2", "-K1"]
+    );
+}
+
+#[test]
 fn a_layout_groups_rows_by_a_column_and_the_csv_keeps_one_row_per_record() {
     use wc_core::report_layout::{ReportColumn, ReportLayout};
     let row = |loc: &str, wire: &str| vec![loc.to_string(), wire.to_string(), format!("page of {wire}")];
@@ -4725,6 +4749,40 @@ fn check_keeps_panel_devices_whose_tag_is_only_drawn_as_interruption_points() {
     assert!(!found.iter().any(|m| m.starts_with("panel ")), "{found:?}");
     // The tag still only names a connection, so it gets no "has no part" note.
     assert!(!found.iter().any(|m| m == "-L1 has no part"), "{found:?}");
+}
+
+#[test]
+fn markdown_titles_show_markdown_characters_as_typed() {
+    let heading = |title: &str| {
+        Table::new(title, &["Tag"])
+            .to_markdown()
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert_eq!(heading("Spare *draft* [rev](x)"), "## Spare \\*draft\\* \\[rev\\](x)");
+    // A trailing run of `#` is not the heading's closing sequence, so it stays.
+    assert_eq!(heading("Wires #"), "## Wires \\#");
+    assert_eq!(heading("Panel 2 ## "), "## Panel 2 \\## ");
+    assert_eq!(heading("#"), "## \\#");
+    // A run right after other text is not a closing sequence: it is shown as typed.
+    assert_eq!(heading("Wires#"), "## Wires#");
+    assert_eq!(heading("a \\#"), "## a \\\\#");
+    // A link ending in `#` keeps it without a backslash, which a viewer would take into it.
+    assert_eq!(heading("See https://example.com/#"), "## See https://example.com/#");
+    assert_eq!(heading("Parts list"), "## Parts list");
+    // Emphasis inside a link would show before the link is made: the word is written as text.
+    assert_eq!(
+        heading("See https://example.com/*draft*/x"),
+        "## See https\\://example.com/\\*draft\\*/x"
+    );
+    assert_eq!(
+        heading("https://example.com/_draft_/x"),
+        "## https\\://example.com/\\_draft\\_/x"
+    );
+    // A `_` between letters is not emphasis, so that link stays as typed.
+    assert_eq!(heading("https://example.com/a_b"), "## https://example.com/a_b");
 }
 
 #[test]
