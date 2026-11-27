@@ -4309,6 +4309,10 @@ impl App {
                             then = Some(Box::new(move |app: &mut App| app.branch(&n)));
                             keep = false;
                         }
+                        else if enter {
+                            // Enter on a blank name took the keyboard from the field: give it back.
+                            r.request_focus();
+                        }
                         if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
                             keep = false;
                         }
@@ -8174,11 +8178,6 @@ mod nudge_tests {
             let confirm = key(Key::Enter, if commit { Modifiers::COMMAND } else { Modifiers::NONE });
             app_frame(&mut app, &ctx, vec![confirm], false);
             assert!(app.dialog.is_some(), "commit {commit}: nothing to confirm yet");
-            if !commit {
-                // Enter took the keyboard from the field; give it back as a click would.
-                app.dialog = Some(Dialog::NewBranch(String::new(), false));
-                app_frame(&mut app, &ctx, Vec::new(), false);
-            }
             app_frame(&mut app, &ctx, vec![egui::Event::Text("fix".into())], false);
             match &app.dialog {
                 Some(Dialog::Commit(text, _) | Dialog::NewBranch(text, _)) => {
