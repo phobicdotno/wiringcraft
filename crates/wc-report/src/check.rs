@@ -117,9 +117,32 @@ pub fn check_with_unreadable(
     }
 
     // Symbols missing from the project's library copy, and wires on missing symbols or pins.
+    // A symbol with two pins of one name is told once, where it is first drawn: a wire names a
+    // pin only by its name, so the second pin can never be reached.
+    let mut twice_told: BTreeSet<&str> = BTreeSet::new();
     for page in &p.pages {
         for s in &page.symbols {
-            if !i.symbols.contains_key(&s.symbol) {
+            if let Some(sym) = i.symbols.get(&s.symbol) {
+                let mut names = BTreeSet::new();
+                let twice: BTreeSet<&str> = sym
+                    .pins
+                    .iter()
+                    .map(|q| q.name.as_str())
+                    .filter(|n| !names.insert(*n))
+                    .collect();
+                if !twice.is_empty() && twice_told.insert(&s.symbol) {
+                    let list = twice.into_iter().collect::<Vec<_>>().join(", ");
+                    out.push(at(
+                        page,
+                        &s.id,
+                        Severity::Warning,
+                        format!(
+                            "symbol {} has more than one pin named {list}: wires reach only the first",
+                            s.symbol
+                        ),
+                    ));
+                }
+            } else {
                 out.push(at(
                     page,
                     &s.id,
