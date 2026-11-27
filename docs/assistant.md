@@ -2,7 +2,9 @@
 
 The assistant is a chat panel where you tell Claude what to draw or change in plain words. It
 works in the open project while you watch, through WiringCraft's own tools (listed at the end).
-Everything it changes in one turn is one undo step (Ctrl+Z).
+Everything it changes in the project in one turn is one undo step (Ctrl+Z). What happens
+outside the open project is not undone that way: a commit or branch made with `versions`,
+exported files, and a todo filed with `todo` stay.
 
 Open it with View → Assistant, Ctrl+J, or the speech-bubble button at the end of the toolbar.
 **New** starts a new conversation, **Stop** stops a running turn, and **Settings** shows the
@@ -22,9 +24,13 @@ WiringCraft starts Claude Code through its Agent Client Protocol connector
 One-time setup in a terminal:
 
 ```sh
+npm install -g @anthropic-ai/claude-code               # Claude Code itself (the `claude` command)
 npm install -g @agentclientprotocol/claude-agent-acp   # the Claude Code connector
 claude                                                 # then type /login and sign in
 ```
+
+The connector package does not install the `claude` command, so skip the first line only when
+Claude Code is already installed.
 
 WiringCraft looks for `claude-agent-acp` (or the older `claude-code-acp`) on your `PATH` and in
 the usual install folders (`~/.local/bin`, `~/.npm-global/bin`, `~/.npm-packages/bin`,
@@ -64,7 +70,7 @@ chosen one declines a request.
 
 With your Claude login:
 
-- **Only WiringCraft's tools.** Claude Code's own shell, file, web and sub-agent tools are
+- **Claude Code's own tools are off.** Claude Code's own shell, file, web and sub-agent tools are
   turned off for the session (`Bash`, `BashOutput`, `KillShell`, `Read`, `Write`, `Edit`,
   `MultiEdit`, `NotebookEdit`, `Glob`, `Grep`, `WebFetch`, `WebSearch`, `Task`). When Claude Code
   asks permission for a tool, WiringCraft allows only its own tools
@@ -84,7 +90,8 @@ With your Claude login:
 - Tool calls that arrive when no turn is running (after Stop, or late) are refused, not run.
 
 With an API key, WiringCraft talks to the Anthropic API itself and runs the tools in the app;
-no other program is started.
+Claude Code and its connector are not started. The `run_command` tool still starts the
+`wiringcraft` command-line program for the command it runs.
 
 ## Tools
 
