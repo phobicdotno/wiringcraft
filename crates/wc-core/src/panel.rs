@@ -162,6 +162,20 @@ pub fn outline_on_plate(width: f64, height: f64, min: Point, max: Point) -> bool
     !(min.x < -eps || min.y < -eps || max.x > width + eps || max.y > height + eps)
 }
 
+/// The rectangle two corners span, whichever way round they are given. A non-finite corner
+/// is passed through unchanged so [`outline_on_plate`] still refuses it, since `f64::min` and
+/// `f64::max` would otherwise drop a NaN in favour of the finite side.
+fn spanned(a: Point, b: Point) -> (Point, Point) {
+    if [a.x, a.y, b.x, b.y].iter().all(|v| v.is_finite()) {
+        (
+            Point::new(a.x.min(b.x), a.y.min(b.y)),
+            Point::new(a.x.max(b.x), a.y.max(b.y)),
+        )
+    } else {
+        (a, b)
+    }
+}
+
 impl Panel {
     /// Whether a `w` x `h` millimetre outline with its top-left corner at `at` lies on this
     /// plate, edges included. See [`outline_on_plate`].
@@ -388,15 +402,19 @@ impl Panel {
             .iter()
             .filter_map(|item| match item {
                 PanelItem::Rail { at, length } => {
-                    // A 35 mm rail on its centre line.
-                    let (min, max) = (Point::new(at.x, at.y - 17.5), Point::new(at.x + length, at.y + 17.5));
+                    // A 35 mm rail on its centre line. A negative length runs left from `at`.
+                    let (min, max) = spanned(Point::new(at.x, at.y - 17.5), Point::new(at.x + length, at.y + 17.5));
                     outside(min, max).then(|| format!("rail at {},{}", at.x, at.y))
                 }
                 PanelItem::Duct { min, max } => {
-                    outside(*min, *max).then(|| format!("duct {},{} to {},{}", min.x, min.y, max.x, max.y))
+                    // Corners may be given either way round; check the rectangle they span.
+                    let (lo, hi) = spanned(*min, *max);
+                    outside(lo, hi).then(|| format!("duct {},{} to {},{}", min.x, min.y, max.x, max.y))
                 }
                 PanelItem::Device { tag, .. } => {
                     let (min, max) = item.device_bounds()?;
+                    // A negative width or height runs back from `at`; check the whole outline.
+                    let (min, max) = spanned(min, max);
                     outside(min, max).then(|| tag.to_string())
                 }
             })
@@ -639,6 +657,51 @@ mod tests {
             max: Point::new(0.0, 0.0),
         };
         assert_eq!(duct.bounds(), (Point::new(0.0, 0.0), Point::new(60.0, 40.0)));
+    }
+
+    #[test]
+    fn resize_refuses_items_running_backwards_or_with_a_nan_corner_off_the_plate() {
+        let items = [
+            PanelItem::Rail {
+                at: Point::new(50.0, 100.0),
+                length: -100.0,
+            },
+            PanelItem::Rail {
+                at: Point::new(50.0, 100.0),
+                length: f64::NAN,
+            },
+            PanelItem::Duct {
+                min: Point::new(650.0, 100.0),
+                max: Point::new(590.0, 140.0),
+            },
+            PanelItem::Duct {
+                min: Point::new(f64::NAN, 100.0),
+                max: Point::new(590.0, 140.0),
+            },
+            PanelItem::Device {
+                tag: DeviceTag::default(),
+                at: Point::new(50.0, 50.0),
+                width: -100.0,
+                height: 40.0,
+                rotation: Rotation::R0,
+            },
+        ];
+        for item in items {
+            let mut p = Panel::new("p", "p", 600.0, 800.0);
+            p.items.push(item.clone());
+            assert!(p.resize(600.0, 800.0).is_err(), "{item:?} is refused");
+        }
+        // Reversed but on the plate is fine.
+        let mut p = Panel::new("p", "p", 600.0, 800.0);
+        p.items.push(PanelItem::Rail {
+            at: Point::new(150.0, 100.0),
+            length: -100.0,
+        });
+        p.items.push(PanelItem::Duct {
+            min: Point::new(590.0, 140.0),
+            max: Point::new(10.0, 100.0),
+        });
+        assert_eq!(p.resize(600.0, 800.0), Ok(()));
     }
 
     #[test]
