@@ -546,6 +546,13 @@ fn names_in(dir: &std::path::Path, commit: &str) -> Result<Vec<Vec<u8>>> {
         .args(["ls-tree", "-r", "-z", "--name-only", commit])
         .output()
         .map_err(|e| wc_core::Error::io("git", e))?;
+    if !out.status.success() {
+        return Err(wc_core::Error::Invalid(format!(
+            "git ls-tree {commit}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+        .into());
+    }
     let mut names: Vec<Vec<u8>> = out
         .stdout
         .split(|&b| b == 0)
