@@ -665,6 +665,42 @@ fn a_generation_whose_save_fails_leaves_the_project_as_it_was() -> TestResult {
 }
 
 #[test]
+fn a_generation_keeps_a_part_name_that_is_no_file_name() -> TestResult {
+    // `ACME R24` is no library id (it has a space): like `macro place`, generation keeps it as
+    // the device's part name instead of refusing the whole table.
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    let coil = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library/symbols/wc.coil.json");
+    let lib = tmp.path().join("lib");
+    std::fs::create_dir_all(lib.join("symbols"))?;
+    std::fs::create_dir_all(lib.join("macros"))?;
+    std::fs::copy(coil, lib.join("symbols/wc.coil.json"))?;
+    std::fs::write(lib.join("macros/starter.json"), STARTER)?;
+    wiringcraft(&dir, &["lib", "add", "mine", "folder", lib.to_str().ok_or("path")?])?;
+    let table = tmp.path().join("motors.csv");
+    std::fs::write(&table, "set,part\n3 kW,ACME R24\n")?;
+    let out = wiringcraft(
+        &dir,
+        &["macro", "generate", "starter", "--table", table.to_str().ok_or("path")?],
+    )?;
+    assert!(out.contains("1 copy"), "{out}");
+    let p = wc_core::store::load(&dir)?;
+    let parts: Vec<Option<&str>> = p.devices.values().map(|d| d.part.as_deref()).collect();
+    assert!(parts.contains(&Some("ACME R24")), "{parts:?}");
+    assert!(
+        !p.lock.parts.contains_key("ACME R24"),
+        "a name no library has stays unpinned"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_generation_whose_save_fails_takes_back_a_new_black_box_symbol_copy() -> TestResult {
     // A `box.*` symbol copy is also in the save's own snapshot (the save removes unused ones):
     // after a failed save it must end as it was before the run, absent.

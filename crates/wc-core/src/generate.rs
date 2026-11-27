@@ -296,24 +296,30 @@ fn drawn_points(g: &Shape, pts: &mut Vec<Point>) {
             Some(parts) if !parts.is_empty() => parts.iter().for_each(|p| drawn_points(p, pts)),
             _ => pts.extend([*a, *b]),
         },
-        // Only the swept part, as the PDF draws it: `center + radius (cos, sin)` from `start` to
-        // `end`, through each quarter-turn angle on the way.
+        // Only the swept part, as the PDF draws it (`Pen::arc`): `center + radius (cos, sin)`
+        // from `start` on through `end - start` degrees, one more turn when that is 0 or less
+        // (90 to 0 sweeps three quarters, equal angles a full circle), through each quarter-turn
+        // angle on the way. A sweep of a full turn or more draws the circle.
         Shape::Arc {
             center,
             radius,
             start,
             end,
-        } if (end - start).abs() < 360.0 => {
+        } if arc_sweep(*start, *end).is_some_and(|s| s < 360.0) => {
+            let sweep = arc_sweep(*start, *end).unwrap_or(360.0);
+            // Taken round to one turn first, so a large angle still steps by quarter turns.
+            let from = start.rem_euclid(360.0);
             let at = |deg: f64| {
                 let r = deg.to_radians();
                 Point::new(center.x + radius * r.cos(), center.y + radius * r.sin())
             };
-            let (lo, hi) = if start <= end { (*start, *end) } else { (*end, *start) };
-            pts.extend([at(lo), at(hi)]);
-            let mut q = (lo / 90.0).ceil() * 90.0;
-            while q < hi {
-                pts.push(at(q));
-                q += 90.0;
+            pts.extend([at(from), at(from + sweep)]);
+            let first = (from / 90.0).floor() as i32 + 1;
+            for k in first..first + 4 {
+                let q = f64::from(k) * 90.0;
+                if q < from + sweep {
+                    pts.push(at(q));
+                }
             }
         }
         _ => {
@@ -321,6 +327,15 @@ fn drawn_points(g: &Shape, pts: &mut Vec<Point>) {
             pts.extend([a, b]);
         }
     }
+}
+
+/// The degrees an arc from `start` to `end` turns through as the PDF draws it: `end - start`,
+/// one more turn when that is 0 or less. `None` for angles that are not finite.
+fn arc_sweep(start: f64, end: f64) -> Option<f64> {
+    let sweep = end - start;
+    sweep
+        .is_finite()
+        .then_some(if sweep <= 0.0 { sweep + 360.0 } else { sweep })
 }
 
 /// The corners of the box a text is drawn in: `at` on its baseline, as wide as the PDF draws it
@@ -859,7 +874,7 @@ mod tests {
     }
 
     #[test]
-    fn an_arc_counts_as_its_sweep_and_a_wire_number_not_at_all() {
+    fn an_arc_counts_as_its_sweep_and_a_wire_number_not_at_all() -> Result<()> {
         let mut pts = Vec::new();
         drawn_points(
             &Shape::Arc {
@@ -889,6 +904,59 @@ mod tests {
             "{min:?} {max:?}"
         );
         assert!(max.x < 10.0 && min.y > -10.0, "{min:?} {max:?}");
+        let arc = |start: f64, end: f64| {
+            let mut pts = Vec::new();
+            drawn_points(
+                &Shape::Arc {
+                    center: Point::new(0.0, 0.0),
+                    radius: 10.0,
+                    start,
+                    end,
+                },
+                &mut pts,
+            );
+            bounds_of(&pts)
+        };
+        let close = |a: (Point, Point), b: (Point, Point)| {
+            (a.0.x - b.0.x).abs() < 1e-6
+                && (a.0.y - b.0.y).abs() < 1e-6
+                && (a.1.x - b.1.x).abs() < 1e-6
+                && (a.1.y - b.1.y).abs() < 1e-6
+        };
+        let circle = (Point::new(-10.0, -10.0), Point::new(10.0, 10.0));
+        // 90 to 0 wraps round through 180 and 270: three quarters, as wide and high as the circle.
+        assert!(close(arc(90.0, 0.0), circle), "{:?}", arc(90.0, 0.0));
+        // Equal angles draw a full circle.
+        assert!(close(arc(30.0, 30.0), circle), "{:?}", arc(30.0, 30.0));
+        // Large angles end, and measure as the same quarter as small ones.
+        assert!(close(arc(3600.0, 3690.0), arc(0.0, 90.0)), "{:?}", arc(3600.0, 3690.0));
+        let huge = arc(2.2204913818014264e18, 2.2204913818014264e18 + 1e6);
+        assert!(huge.0.x.is_finite() && huge.1.x.is_finite());
+        // A wire with only a number adds nothing: placing clears the number.
+        let mut one = starter()?.apply(Some("small"), &BTreeMap::new())?;
+        let wire = crate::project::Wire {
+            id: "wn".into(),
+            from: Endpoint::Point {
+                at: Point::new(0.0, 0.0),
+            },
+            to: Endpoint::Point {
+                at: Point::new(10.0, 0.0),
+            },
+            via: vec![],
+            number: None,
+            potential: None,
+            cable: None,
+            route: Default::default(),
+            spec: Default::default(),
+        };
+        one.wires = vec![wire.clone()];
+        let plain = extent(std::slice::from_ref(&one), |_| None);
+        one.wires = vec![crate::project::Wire {
+            number: Some("A-VERY-LONG-SOURCE-WIRE-NUMBER-0001".into()),
+            ..wire
+        }];
+        assert_eq!(extent(std::slice::from_ref(&one), |_| None), plain);
+        Ok(())
     }
 
     #[test]
