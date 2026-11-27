@@ -687,8 +687,16 @@ pub fn location_rows(rows: &[(String, String)]) -> Result<Vec<Location>, String>
             description: description.trim().to_owned(),
         });
     }
-    out.sort_by(|a, b| a.path.cmp(&b.path));
+    sort_locations(&mut out);
     Ok(out)
+}
+
+/// Sort locations in natural order of their paths, as tags are listed: `+CAB2` before `+CAB10`.
+/// Paths alike in natural order (`L01` and `L1`, `+L1` and `L1`) keep a fixed order by their text.
+pub fn sort_locations(locations: &mut [Location]) {
+    // A path stored as typed (`+CAB10`) sorts by its normal form (`CAB10`).
+    let key = |l: &Location| natural_key(&location_path(&l.path).unwrap_or_else(|_| l.path.clone()));
+    locations.sort_by_cached_key(|l| (key(l), l.path.clone()));
 }
 
 /// A location of the project, such as a cabinet or a room.
@@ -731,12 +739,12 @@ impl ProjectMeta {
             Some(l) => {
                 l.path = path;
                 l.description = description;
-                self.locations.sort_by(|a, b| a.path.cmp(&b.path));
+                sort_locations(&mut self.locations);
                 Ok(true)
             }
             None => {
                 self.locations.push(Location { path, description });
-                self.locations.sort_by(|a, b| a.path.cmp(&b.path));
+                sort_locations(&mut self.locations);
                 Ok(true)
             }
         }
@@ -782,7 +790,7 @@ impl ProjectMeta {
             Some(_) => false,
             None => {
                 self.locations.push(loc);
-                self.locations.sort_by(|a, b| a.path.cmp(&b.path));
+                sort_locations(&mut self.locations);
                 true
             }
         }
@@ -874,6 +882,7 @@ impl ProjectMeta {
     /// Take `terminal` of `strip` out of its jumper; a jumper left with one terminal goes.
     /// Returns whether anything changed.
     pub fn remove_from_jumper(&mut self, strip: &DeviceTag, terminal: &str) -> bool {
+        let terminal = terminal.trim();
         let mut changed = false;
         for j in self.jumpers.iter_mut().filter(|j| &j.strip == strip) {
             let before = j.terminals.len();
@@ -965,6 +974,7 @@ impl ProjectMeta {
     /// Give the jumper that holds `terminal` of `strip` a part, or none. Returns whether that
     /// changed anything; `Err` when the terminal is in no jumper.
     pub fn set_jumper_part(&mut self, strip: &DeviceTag, terminal: &str, part: Option<&str>) -> Result<bool, String> {
+        let terminal = terminal.trim();
         let j = self
             .jumpers
             .iter_mut()
@@ -1761,6 +1771,19 @@ pub struct Device {
     pub properties: BTreeMap<String, String>,
 }
 
+impl Device {
+    /// Set the description to `text` without the spaces around it; a blank text clears it.
+    /// Returns whether the description changed.
+    pub fn set_description(&mut self, text: &str) -> bool {
+        let text = text.trim();
+        if self.description == text {
+            return false;
+        }
+        text.clone_into(&mut self.description);
+        true
+    }
+}
+
 /// One more part of a device, with how many of it the device needs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DevicePart {
@@ -2256,6 +2279,18 @@ mod tests {
     }
 
     #[test]
+    fn a_device_description_is_trimmed_and_a_blank_one_cleared() {
+        let mut d = Device::default();
+        assert!(d.set_description("  Pump motor\t"));
+        assert_eq!(d.description, "Pump motor");
+        assert!(!d.set_description("Pump motor "));
+        assert!(d.set_description("   "));
+        assert_eq!(d.description, "");
+        assert!(!d.set_description(""));
+        assert_eq!(serde_json::to_string(&d).ok().as_deref(), Some("{}"));
+    }
+
+    #[test]
     fn one_page_is_the_cover() {
         let mut p = Project::new("x");
         for (id, n) in [("a", "1"), ("b", "2"), ("c", "3")] {
@@ -2462,8 +2497,8 @@ mod tests {
         assert!(!m.merge_location(loc("+L2", "Other")));
         assert!(m.merge_location(loc("+L5", "")));
         let paths: Vec<&str> = m.locations.iter().map(|l| l.path.as_str()).collect();
-        assert_eq!(paths, ["+L4", "L1.L3", "L2", "L5"]);
-        assert_eq!(m.locations[0].description, "Deck");
+        assert_eq!(paths, ["L1.L3", "L2", "+L4", "L5"], "+L4 sorts as L4");
+        assert_eq!(m.locations[2].description, "Deck");
         m.locations.retain(|l| l.path != "+L4" && l.path != "L5");
         let text = toml::to_string(&m).unwrap_or_default();
         assert!(text.contains("[[location]]"), "{text}");
@@ -2555,6 +2590,20 @@ mod tests {
         assert!(!m.remove_from_jumper(&x2, "1"));
         let plain = toml::to_string(&ProjectMeta::new("t"))?;
         assert!(!plain.contains("jumper"), "nothing written without jumpers");
+        Ok(())
+    }
+
+    #[test]
+    fn jumper_edits_trim_the_terminal_number_like_adding_does() -> Result<(), Box<dyn std::error::Error>> {
+        let x1 = DeviceTag::parse("-X1")?;
+        let s = |v: &[&str]| v.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>();
+        let mut m = ProjectMeta::new("t");
+        m.add_jumper(&x1, &s(&[" 1 ", "2", "3"]))?;
+        assert_eq!(m.jumpers[0].terminals, s(&["1", "2", "3"]));
+        assert!(m.set_jumper_part(&x1, " 2 ", Some("wago.2002-403"))?);
+        assert_eq!(m.jumpers[0].part.as_deref(), Some("wago.2002-403"));
+        assert!(m.remove_from_jumper(&x1, " 3 "));
+        assert_eq!(m.jumpers[0].terminals, s(&["1", "2"]));
         Ok(())
     }
 
@@ -2806,6 +2855,31 @@ mod tests {
         let l7: Vec<&Location> = m.locations.iter().filter(|l| l.path.ends_with("L7")).collect();
         assert_eq!(l7.len(), 1, "no second entry");
         assert_eq!((l7[0].path.as_str(), l7[0].description.as_str()), ("L7", "Desk 2"));
+    }
+
+    #[test]
+    fn locations_are_kept_in_natural_order() -> Result<(), String> {
+        let paths = |l: &[Location]| l.iter().map(|l| l.path.clone()).collect::<Vec<_>>();
+        let want = ["CAB2", "CAB2.R2", "CAB2.R10", "CAB10"];
+        let mut m = ProjectMeta::new("t");
+        for p in ["CAB10", "CAB2.R10", "CAB2", "CAB2.R2"] {
+            m.set_location(p, "")?;
+        }
+        assert_eq!(paths(&m.locations), want);
+        let mut m = ProjectMeta::new("t");
+        for p in ["CAB10", "CAB2.R10", "CAB2", "CAB2.R2"] {
+            m.merge_location(Location {
+                path: p.into(),
+                description: String::new(),
+            });
+        }
+        assert_eq!(paths(&m.locations), want);
+        let rows: Vec<(String, String)> = ["+CAB10", "CAB2.R10", "CAB2", "+CAB2.R2"]
+            .into_iter()
+            .map(|p| (p.to_owned(), String::new()))
+            .collect();
+        assert_eq!(paths(&location_rows(&rows)?), want);
+        Ok(())
     }
 
     #[test]
