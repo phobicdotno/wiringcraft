@@ -2767,6 +2767,7 @@ fn run(mut cli: Cli) -> Res<()> {
                     if p.page(&id).is_some() {
                         return Err(format!("page {id:?} exists"));
                     }
+                    let number = p.free_page_number(&number, None).map_err(e)?;
                     let mut page = Page::new(id, number, title);
                     page.overview = overview;
                     page.size = PageSize::parse(&size)?;
@@ -6374,8 +6375,13 @@ fn panel_show(panel: &wc_core::panel::Panel) -> String {
 
 /// A report as aligned plain text for the terminal.
 fn plain_table(t: &wc_report::Table) -> String {
-    let mut w: Vec<usize> = t.columns.iter().map(|c| c.chars().count()).collect();
-    for r in &t.rows {
+    // Every value is written with `escape_field`: a line break in a cell would end its row
+    // early and a control character could steer the terminal.
+    let escape = |cells: &[String]| cells.iter().map(|c| escape_field(c)).collect::<Vec<_>>();
+    let columns = escape(&t.columns);
+    let rows: Vec<Vec<String>> = t.rows.iter().map(|r| escape(r)).collect();
+    let mut w: Vec<usize> = columns.iter().map(|c| c.chars().count()).collect();
+    for r in &rows {
         for (i, c) in r.iter().enumerate() {
             if let Some(x) = w.get_mut(i) {
                 *x = (*x).max(c.chars().count());
@@ -6386,10 +6392,10 @@ fn plain_table(t: &wc_report::Table) -> String {
         let parts: Vec<String> = cells.iter().zip(&w).map(|(c, n)| format!("{c:<n$}")).collect();
         parts.join("  ").trim_end().to_owned()
     };
-    let mut out = format!("{}\n{}\n", t.title, line(&t.columns));
+    let mut out = format!("{}\n{}\n", escape_field(&t.title), line(&columns));
     out.push_str(&w.iter().map(|n| "-".repeat(*n)).collect::<Vec<_>>().join("  "));
     out.push('\n');
-    for r in &t.rows {
+    for r in &rows {
         out.push_str(&line(r));
         out.push('\n');
     }
@@ -6472,6 +6478,44 @@ fn utc_date(secs: i64) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_text_report_keeps_each_row_on_one_line() {
+        let t = wc_report::Table {
+            title: "Locations\u{1b}[2J".into(),
+            columns: vec!["Location".into(), "Note\nmore\tx".into()],
+            rows: vec![
+                vec!["+A1".into(), "first line\nsecond\tline".into()],
+                vec!["+A2".into(), "red \u{1b}[31m".into()],
+            ],
+            ..Default::default()
+        };
+        let text = plain_table(&t);
+        assert_eq!(
+            text,
+            "Locations\\u{1b}[2J\n\
+             Location  Note\\nmore\\tx\n\
+             --------  ------------------------\n\
+             +A1       first line\\nsecond\\tline\n\
+             +A2       red \\u{1b}[31m\n"
+        );
+        assert!(!text.contains('\u{1b}'), "{text}");
+
+        // An escaped heading wider than every cell sets its column's width.
+        let t = wc_report::Table {
+            title: "Tags".into(),
+            columns: vec!["Tag\t".into(), "Kind".into()],
+            rows: vec![vec!["K1".into(), "x".into()]],
+            ..Default::default()
+        };
+        assert_eq!(
+            plain_table(&t),
+            "Tags\n\
+             Tag\\t  Kind\n\
+             -----  ----\n\
+             K1     x\n"
+        );
+    }
 
     thread_local! {
         /// Set by a test to stop `box-edit` after its symbol write, as a kill would.
@@ -6950,7 +6994,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
-        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "2"]).unwrap();
         for (at, tag) in [("40,40", "-A1"), ("100,40", "-A2")] {
             let args = ["box", "p1", "--at", at, "--size", "20,20", "--tag", tag];
             cli(&dir, &[&args[..], &["--pin", "1:top:10"]].concat()).unwrap();
@@ -7002,7 +7046,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
-        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "2"]).unwrap();
         let args = ["box", "p1", "--at", "50,50", "--size", "20,20", "--tag", "-F1"];
         cli(
             &dir,
@@ -7825,6 +7869,39 @@ mod tests {
         // Its own number again is fine.
         cli(&dir, &["page", "edit", "a", "--number", "2", "--title", "Power"]).unwrap();
         assert_eq!(pages(&dir)[2], ("a".into(), "2".into(), "Power".into()));
+    }
+
+    #[test]
+    fn page_add_refuses_a_number_in_use_and_a_blank_number() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("p");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        cli(&dir, &["page", "add", "a", "--number", " 2 ", "--title", "Power"]).unwrap();
+        let pages = |dir: &Path| -> Vec<(String, String)> {
+            load(dir)
+                .unwrap()
+                .pages
+                .iter()
+                .map(|p| (p.id.clone(), p.number.clone()))
+                .collect()
+        };
+        let before = pages(&dir);
+        assert_eq!(
+            before,
+            [("p0001".to_owned(), "1".to_owned()), ("a".to_owned(), "2".to_owned())],
+            "the number is trimmed"
+        );
+        // The page `new` made has number 1, and `a` has 2 (also with blanks around it).
+        for taken in ["1", "2", " 2"] {
+            let err = cli(&dir, &["page", "add", "b", "--number", taken]).unwrap_err();
+            assert!(err.contains("already has number"), "{err}");
+        }
+        for blank in ["", "  "] {
+            let err = cli(&dir, &["page", "add", "b", "--number", blank]).unwrap_err();
+            assert!(err.contains("cannot be empty"), "{err}");
+        }
+        assert_eq!(pages(&dir), before);
+        assert!(!dir.join("pages").join("b.page.json").exists());
     }
 
     #[test]
@@ -8953,7 +9030,7 @@ mod tests {
             unreachable!()
         };
         assert!(run(cmd).is_ok());
-        assert!(cli(&dir, &["page", "add", "p1", "--number", "1"]).is_ok());
+        assert!(cli(&dir, &["page", "add", "p1", "--number", "2"]).is_ok());
         let tag = |t: &str| DeviceTag::parse(t).ok();
 
         // A cable tag right after `--cable`, before or after other options.
@@ -10547,7 +10624,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
-        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "2"]).unwrap();
         let pins = ["--pin", "IN:left:5", "--pin", "OUT:right:5", "--pin", "PE:bottom:18"];
         let mut args = vec!["box", "p1", "--at", "40,40", "--size", "20,10"];
         args.extend_from_slice(&pins);
@@ -10691,7 +10768,7 @@ mod tests {
             unreachable!()
         };
         assert!(cli(&dir, &["lib", "add", "starter", "folder", starter]).is_ok());
-        assert!(cli(&dir, &["page", "add", "p1", "--number", "1"]).is_ok());
+        assert!(cli(&dir, &["page", "add", "p1", "--number", "2"]).is_ok());
 
         let placed = cli(&dir, &["place", "p1", "wc.coil", "--at", "50,50", "--tag", "-K1"]);
         assert!(placed.is_ok(), "{placed:?}");
@@ -10717,7 +10794,7 @@ mod tests {
             unreachable!()
         };
         assert!(cli(&dir, &["lib", "add", "starter", "folder", starter]).is_ok());
-        assert!(cli(&dir, &["page", "add", "p1", "--number", "1"]).is_ok());
+        assert!(cli(&dir, &["page", "add", "p1", "--number", "2"]).is_ok());
 
         let missing_page = ["place", "nope", "wc.coil", "--at", "50,50"];
         let bad_turn = ["place", "p1", "wc.coil", "--at", "50,50", "--rotate", "45"];
@@ -10741,7 +10818,7 @@ mod tests {
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
         let starter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
         cli(&dir, &["lib", "add", "starter", "folder", starter.to_str().unwrap()]).unwrap();
-        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "2"]).unwrap();
         cli(
             &dir,
             &["box", "p1", "--at", "40,40", "--size", "20,10", "--pin", "X=1:left:5"],
@@ -10810,7 +10887,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
-        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "2"]).unwrap();
         cli(
             &dir,
             &["box", "p1", "--at", "40,40", "--size", "20,10", "--pin", "1:left:5"],
@@ -10845,7 +10922,7 @@ mod tests {
     fn box_edit_project(tmp: &Path) -> (PathBuf, PathBuf, run::Written) {
         let dir = tmp.join("proj");
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
-        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "2"]).unwrap();
         cli(
             &dir,
             &["box", "p1", "--at", "40,40", "--size", "20,10", "--pin", "1:left:5"],
@@ -11345,7 +11422,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
-        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "2"]).unwrap();
         cli(
             &dir,
             &["box", "p1", "--at", "40,40", "--size", "20,10", "--pin", "IN:left:5"],
@@ -11370,7 +11447,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
-        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "2"]).unwrap();
         let boxed = |args: &[&str]| {
             let mut all = vec!["box", "p1"];
             all.extend_from_slice(args);
@@ -11473,7 +11550,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("proj");
         run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
-        cli(&dir, &["page", "add", "p1", "--number", "1"]).unwrap();
+        cli(&dir, &["page", "add", "p1", "--number", "2"]).unwrap();
         let args = [
             "box",
             "p1",

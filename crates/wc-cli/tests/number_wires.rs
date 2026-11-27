@@ -23,7 +23,7 @@ fn number_wires_reads_the_rule_as_the_assistant_writes_it() -> TestResult {
         .arg("--no-git")
         .status()?;
     assert!(status.success());
-    assert!(run(&dir, &["page", "add", "p1", "--number", "1"])?.status.success());
+    assert!(run(&dir, &["page", "add", "p1", "--number", "2"])?.status.success());
     for rule in ["page_column", "page-column", "Sequential", " potential "] {
         let out = run(&dir, &["number-wires", "--rule", rule])?;
         let stdout = String::from_utf8_lossy(&out.stdout);

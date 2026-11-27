@@ -1207,26 +1207,14 @@ pub fn show(
             painter.circle_filled(xf.s(pos), xf.len(0.45).max(1.5), t.pin);
         }
         if let Some(tag) = &s.tag {
-            let ta = sym.tag_at.transform(s.rotation, s.mirror) + s.at;
-            let mut lines = Vec::new();
-            if !tag.function.is_empty() {
-                lines.push(format!("={}", tag.function.join(".")));
-            }
-            if !tag.location.is_empty() {
-                lines.push(format!("+{}", tag.location.join(".")));
-            }
-            lines.push(format!("-{}", tag.product.join(".")));
-            let top = ta.y - (lines.len() as f64 - 1.0) * 1.5 + 1.2;
-            for (i, l) in lines.iter().enumerate() {
-                text_mm(
-                    &painter,
-                    &xf,
-                    Point::new(ta.x, top + 3.0 * i as f64),
-                    2.5,
-                    Align2::RIGHT_BOTTOM,
-                    l,
-                    c,
-                );
+            let (align, lines) = wc_pdf::tag_lines(s, sym, tag);
+            let a = if align == Align::Left {
+                Align2::LEFT_BOTTOM
+            } else {
+                Align2::RIGHT_BOTTOM
+            };
+            for (at, l) in &lines {
+                text_mm(&painter, &xf, *at, 2.5, a, l, c);
             }
         }
         if selected && let Some((a, b)) = open.symbol_bounds(&page, &s.id) {
@@ -4923,6 +4911,67 @@ mod tests {
             ..Editor::default()
         };
         (tmp, o, ed)
+    }
+
+    #[test]
+    fn a_mirrored_or_upside_down_symbol_shows_its_tag_away_from_the_drawing() {
+        let (_tmp, mut o) = project();
+        let id = o.place(1, "wc.coil", Point::new(100.0, 60.0)).unwrap();
+        let mut ed = Editor {
+            page: 1,
+            ..Editor::default()
+        };
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let pin = crate::theme::Theme::of(&ctx).pin;
+        for (rotation, mirror, left_of_drawing) in [
+            (Rotation::R0, false, true),
+            (Rotation::R0, true, false),
+            (Rotation::R180, false, false),
+            (Rotation::R180, true, true),
+        ] {
+            let s = o.project.pages[1].symbols.iter_mut().find(|s| s.id == id).unwrap();
+            s.rotation = rotation;
+            s.mirror = mirror;
+            s.tag = Some(wc_core::DeviceTag::parse("=PUMP.STATION+CABINET-K1").unwrap());
+            painted(&ctx, &mut o, &mut ed, 0.0, vec![]);
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1000.0, 700.0))),
+                time: Some(0.1),
+                ..Default::default()
+            };
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| show(ui, &mut o, &mut ed, false, 1.0, true));
+            });
+            // The coil's pins sit on its centre line, the tag 12 mm beside it.
+            let pins: Vec<f32> = out
+                .shapes
+                .iter()
+                .filter_map(|c| match &c.shape {
+                    EShape::Circle(c) if c.fill == pin => Some(c.center.x),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(pins.len(), 2, "{pins:?}");
+            let lines: Vec<Rect> = out
+                .shapes
+                .iter()
+                .filter_map(|c| match &c.shape {
+                    EShape::Text(t) if ["=PUMP", "+CAB", "-K1"].iter().any(|w| t.galley.text().starts_with(w)) => {
+                        Some(t.visual_bounding_rect())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(lines.len(), 3, "{rotation:?} {mirror}");
+            for r in lines {
+                if left_of_drawing {
+                    assert!(r.max.x < pins[0], "{rotation:?} {mirror}: {r:?} left of {pins:?}");
+                } else {
+                    assert!(r.min.x > pins[0], "{rotation:?} {mirror}: {r:?} right of {pins:?}");
+                }
+            }
+        }
     }
 
     #[test]

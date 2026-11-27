@@ -1092,10 +1092,11 @@ const MISSING_BLOCK_NAMES: usize = 3;
 /// How many characters of a missing block's name the warning keeps.
 const MISSING_BLOCK_NAME_LEN: usize = 64;
 
-/// The key under which hatches with a boundary that is not all numbers are counted.
 /// The `skipped` key of a polyline whose points, or the arcs of its bulges, are not numbers once
 /// placed.
 const POLYLINE_NOT_NUMBERS: &str = "LWPOLYLINE whose points are not numbers once placed";
+
+/// The key under which hatches with a boundary that is not all numbers are counted.
 const HATCH_NOT_NUMBERS: &str = "HATCH with a boundary that is not numbers";
 /// The `skipped` key of a line whose ends are not numbers once placed.
 const LINE_NOT_NUMBERS: &str = "LINE whose ends are not numbers once placed";
@@ -3574,6 +3575,44 @@ mod tests {
                 .any(|g| matches!(g, Shape::Text { text, .. } if text == "\u{c5}lesund")),
             "the import reads the character back"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_page_exported_to_dxf_reads_back_its_wide_wires() -> Result<()> {
+        let mut project = wc_core::Project::new("Round trip");
+        let mut drawn = wc_core::Page::new("p1", "1", "Page");
+        let at = |x: f64, y: f64| wc_core::Endpoint::Point { at: Point::new(x, y) };
+        drawn.wires.push(wc_core::Wire {
+            id: "w1".into(),
+            from: at(100.0, 50.0),
+            to: at(160.0, 50.0),
+            via: vec![],
+            number: None,
+            potential: None,
+            cable: None,
+            route: Default::default(),
+            spec: Default::default(),
+        });
+        project.pages = vec![drawn];
+        let (pages, _) = wc_pdf::page_lines(&project, &BTreeMap::new(), &wc_pdf::Options::default());
+        let Some(exported) = pages.first().map(wc_pdf::dxf) else {
+            unreachable!("one page is exported");
+        };
+        assert!(exported.contains("40\n0.35\n41\n0.35\n"), "the wire keeps its width");
+        let p = page(&exported, 1.0, &BTreeSet::new())?;
+        // The import moves the drawing to the page corner, so look for the wire by its shape:
+        // an open two-point polyline, level and 60 mm long.
+        let wire = p.graphics.iter().any(|g| match g {
+            Shape::Polyline {
+                points, closed: false, ..
+            } => match points.as_slice() {
+                [a, b] => (a.y - b.y).abs() < 1e-6 && ((a.x - b.x).abs() - 60.0).abs() < 1e-6,
+                _ => false,
+            },
+            _ => false,
+        });
+        assert!(wire, "the wide wire reads back as a line: {:?}", p.graphics);
         Ok(())
     }
 

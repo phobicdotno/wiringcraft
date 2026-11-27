@@ -28,7 +28,7 @@ fn revisions_clouds_and_the_table_are_kept_in_the_project() -> TestResult {
         .arg("--no-git")
         .status()?;
     assert!(status.success());
-    wiringcraft(&dir, &["page", "add", "p1", "--number", "1"])?;
+    wiringcraft(&dir, &["page", "add", "p1", "--number", "2"])?;
 
     assert!(
         wiringcraft(&dir, &["revision", "cloud", "p1", "10", "10", "50", "40"]).is_err(),
@@ -101,7 +101,7 @@ fn revision_list_escapes_control_characters_from_the_project_file() -> TestResul
     std::fs::write(&file, text)?;
 
     // A cloud whose revision a hand edit filled with control characters.
-    wiringcraft(&dir, &["page", "add", "p1", "--number", "1"])?;
+    wiringcraft(&dir, &["page", "add", "p1", "--number", "2"])?;
     wiringcraft(&dir, &["revision", "cloud", "p1", "10", "10", "50", "40"])?;
     let page = dir.join("pages").join("p1.page.json");
     let json = std::fs::read_to_string(&page)?;
@@ -142,7 +142,7 @@ fn revision_list_escapes_a_page_id_from_a_hand_made_file_name() -> TestResult {
         .arg("--no-git")
         .status()?;
     assert!(status.success());
-    wiringcraft(&dir, &["page", "add", "p1", "--number", "1"])?;
+    wiringcraft(&dir, &["page", "add", "p1", "--number", "2"])?;
     wiringcraft(&dir, &["revision", "add", "A"])?;
     wiringcraft(&dir, &["revision", "cloud", "p1", "10", "10", "50", "40"])?;
     wiringcraft(&dir, &["revision", "table", "p1", "200", "20"])?;
@@ -172,7 +172,7 @@ fn uncloud_says_when_no_cloud_has_the_revision_and_takes_the_letter_as_cloud_doe
         .arg("--no-git")
         .status()?;
     assert!(status.success());
-    wiringcraft(&dir, &["page", "add", "p1", "--number", "1"])?;
+    wiringcraft(&dir, &["page", "add", "p1", "--number", "2"])?;
     wiringcraft(&dir, &["revision", "add", "A 1"])?;
     // Typed with a no-break space, as `revision cloud` and `revision remove` take it.
     wiringcraft(

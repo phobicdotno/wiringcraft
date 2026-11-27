@@ -858,6 +858,33 @@ pub fn device_list(i: &Inputs<'_>) -> Table {
     t
 }
 
+/// The names of the pins a terminal or PLC point is wired to, sorted, each once. Interruption
+/// points are left out: they only mark where the connection goes on to another page, and the
+/// nets already join across pages, so the device on the other page is in the list. Only when the
+/// pins reach nothing but interruption points are those named, so the cell still says where
+/// the connection goes.
+fn connected_labels<'a>(i: &Inputs<'_>, pins: impl Iterator<Item = &'a PinRef>) -> Vec<String> {
+    let mut devices: BTreeSet<String> = BTreeSet::new();
+    let mut breaks: BTreeSet<String> = BTreeSet::new();
+    for (pg, item, pin) in pins {
+        let interruption = i
+            .project
+            .page(pg)
+            .and_then(|p| p.symbol(item))
+            .and_then(|s| i.symbols.get(&s.symbol))
+            .is_some_and(|y| y.role == SymbolRole::Interruption);
+        let label = pin_label(i.project, pg, item, pin);
+        if interruption {
+            breaks.insert(label);
+        } else {
+            devices.insert(label);
+        }
+    }
+    let mut v: Vec<String> = if devices.is_empty() { breaks } else { devices }.into_iter().collect();
+    v.sort_by_key(|s| natural_key(s));
+    v
+}
+
 /// How a pin is named in reports: `=A+B-K1:13`, or `page 3 s4:13` for an untagged symbol.
 fn pin_label(p: &Project, page_id: &str, item: &str, pin: &str) -> String {
     let page = p.page(page_id);
@@ -1077,7 +1104,9 @@ pub fn cable_list(i: &Inputs<'_>) -> Table {
 
 /// Net list: each electrically connected group of pins, across pages. Overview pages
 /// (`Page::overview`) are skipped, because an overview draws the schematic's connections again
-/// and would list each net and pin twice.
+/// and would list each net and pin twice. Interruption points are left out of the pins: they only
+/// name the connection to another page, so a net drawn on two pages does not list its
+/// interruption point once per page.
 pub fn net_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new("Net list", &["Net", "Pins", "Connections"]);
     let schematic;
@@ -1103,6 +1132,11 @@ pub fn net_list(i: &Inputs<'_>) -> Table {
             let mut pins: Vec<String> = net
                 .pins
                 .iter()
+                .filter(|(pg, item, _)| {
+                    let sym = project.page(pg).and_then(|p| p.symbol(item));
+                    sym.and_then(|s| i.symbols.get(&s.symbol))
+                        .is_none_or(|y| y.role != SymbolRole::Interruption)
+                })
                 .map(|(pg, item, pin)| pin_label(i.project, pg, item, pin))
                 .collect();
             pins.sort_by_key(|s| natural_key(s));
@@ -1268,16 +1302,7 @@ pub(crate) fn terminal_plan_with_spares(i: &Inputs<'_>) -> (Table, BTreeSet<usiz
     let others = |pin: &PinRef| -> Vec<String> {
         nets.iter()
             .find(|n| n.pins.contains(pin))
-            .map(|n| {
-                let mut v: Vec<String> = n
-                    .pins
-                    .iter()
-                    .filter(|p| *p != pin)
-                    .map(|(pg, it, pn)| pin_label(i.project, pg, it, pn))
-                    .collect();
-                v.sort_by_key(|s| natural_key(s));
-                v
-            })
+            .map(|n| connected_labels(i, n.pins.iter().filter(|p| *p != pin)))
             .unwrap_or_default()
     };
     struct Term {
@@ -1650,19 +1675,21 @@ pub(crate) fn plc_points(i: &Inputs<'_>) -> Vec<PlcPoint> {
                         .map(|(_, v)| v.trim().to_owned())
                 })
                 .unwrap_or_default();
-            let mut others: BTreeSet<String> = BTreeSet::new();
-            for p in &sym.pins {
-                let key = (page.id.clone(), s.id.clone(), p.name.clone());
-                let Some(n) = net_of.get(&key) else { continue };
+            let mut others: Vec<&PinRef> = Vec::new();
+            let own: Vec<PinRef> = sym
+                .pins
+                .iter()
+                .map(|p| (page.id.clone(), s.id.clone(), p.name.clone()))
+                .collect();
+            for key in &own {
+                let Some(n) = net_of.get(key) else { continue };
                 for other in nets.get(*n).map(|net| net.pins.as_slice()).unwrap_or(&[]) {
-                    if *other != key {
-                        let (pg, item, pin) = other;
-                        others.insert(pin_label(i.project, pg, item, pin));
+                    if other != key {
+                        others.push(other);
                     }
                 }
             }
-            let mut others: Vec<String> = others.into_iter().collect();
-            others.sort_by_key(|o| natural_key(o));
+            let others = connected_labels(i, others.into_iter());
             let point = PlcPoint {
                 address: address.clone(),
                 kind,

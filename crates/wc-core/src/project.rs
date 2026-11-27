@@ -1781,6 +1781,26 @@ pub struct DanglingEnd {
     pub pin: String,
 }
 
+/// Why a page cannot have a number ([`Project::free_page_number`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PageNumberError {
+    /// The number is empty or blank.
+    Empty,
+    /// Page `page` (its id) already has `number`.
+    Taken { number: String, page: String },
+}
+
+impl std::fmt::Display for PageNumberError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => f.write_str("the page number cannot be empty"),
+            Self::Taken { number, page } => write!(f, "page {page:?} already has number {number:?}"),
+        }
+    }
+}
+
+impl std::error::Error for PageNumberError {}
+
 impl Project {
     /// Add spare terminal `number` to `strip` ([`ProjectMeta::add_spare`]), refused also when
     /// its tag (`-X1.S1`) is drawn as a device that is not a terminal of the strip, or names
@@ -1963,6 +1983,28 @@ impl Project {
             }
         }
         Some(moved)
+    }
+
+    /// `number` as a page may carry it: trimmed, not empty, and not the number of another page
+    /// (blanks around a saved number do not make it another number).
+    /// `own` is the id of the page that gets the number, which may keep the number it has;
+    /// `None` for a page that is not in the project yet.
+    pub fn free_page_number(&self, number: &str, own: Option<&str>) -> Result<String, PageNumberError> {
+        let number = number.trim();
+        if number.is_empty() {
+            return Err(PageNumberError::Empty);
+        }
+        match self
+            .pages
+            .iter()
+            .find(|p| p.number.trim() == number && Some(p.id.as_str()) != own)
+        {
+            Some(other) => Err(PageNumberError::Taken {
+                number: number.to_owned(),
+                page: other.id.clone(),
+            }),
+            None => Ok(number.to_owned()),
+        }
     }
 
     /// Sort pages by their display number, comparing numeric parts as numbers.
@@ -2614,6 +2656,33 @@ mod tests {
         assert_eq!(serde_json::from_str::<Wire>(&text)?, w);
         assert_eq!(WireSpec::value("  "), None);
         Ok(())
+    }
+
+    #[test]
+    fn a_page_number_is_free_when_no_other_page_has_it() {
+        let mut p = Project::new("t");
+        p.pages.push(Page::new("a", "1", ""));
+        p.pages.push(Page::new("b", "2.1", ""));
+        assert_eq!(p.free_page_number(" 3 ", None), Ok("3".to_owned()));
+        assert_eq!(p.free_page_number("", None), Err(PageNumberError::Empty));
+        assert_eq!(p.free_page_number(" \t", Some("a")), Err(PageNumberError::Empty));
+        let taken = PageNumberError::Taken {
+            number: "2.1".into(),
+            page: "b".into(),
+        };
+        assert_eq!(p.free_page_number(" 2.1", None), Err(taken.clone()));
+        assert_eq!(p.free_page_number("2.1", Some("a")), Err(taken.clone()));
+        assert_eq!(taken.to_string(), "page \"b\" already has number \"2.1\"");
+        // A page may keep its own number.
+        assert_eq!(p.free_page_number("2.1", Some("b")), Ok("2.1".to_owned()));
+        // A number saved with blanks around it (an older project file) is taken all the same.
+        p.pages.push(Page::new("c", " 4 ", ""));
+        let padded = PageNumberError::Taken {
+            number: "4".into(),
+            page: "c".into(),
+        };
+        assert_eq!(p.free_page_number("4", None), Err(padded));
+        assert_eq!(p.free_page_number("4", Some("c")), Ok("4".to_owned()));
     }
 
     #[test]

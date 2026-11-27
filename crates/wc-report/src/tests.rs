@@ -387,6 +387,49 @@ fn terminal_plan_sorts_numbers_and_shows_both_sides() {
 }
 
 #[test]
+fn terminal_plan_and_plc_list_name_the_device_past_an_interruption_point() {
+    let (mut p, mut s, parts) = fixture();
+    let arrow = sym("arrow", SymbolRole::Interruption, &["1"]);
+    let mut input = sym("wc.plc.input", SymbolRole::Standalone, &["I"]);
+    input.category = "plc".into();
+    for y in [arrow, input] {
+        s.insert(y.id.clone(), y);
+    }
+    // -X1.2 and the input -A1 go to -P2 on page 3 through the interruption point -L, drawn on
+    // both pages. -X1.2's lower side goes to -M, which page 3 does not wire on.
+    let page = &mut p.pages[0];
+    page.symbols.push(place("s9", "arrow", 200.0, Some("-L")));
+    page.symbols.push(place("s10", "arrow", 210.0, Some("-M")));
+    page.symbols.push(place("i1", "wc.plc.input", 220.0, Some("-A1")));
+    page.wires.push(wire("w5", pin("s3", "1"), pin("s9", "1"), None, None));
+    page.wires.push(wire("w6", pin("i1", "I"), pin("s9", "1"), None, None));
+    page.wires.push(wire("w7", pin("s3", "2"), pin("s10", "1"), None, None));
+    let mut page = Page::new("p3", "3", "More");
+    page.symbols = vec![
+        place("s1", "arrow", 20.0, Some("-L")),
+        place("s2", "lamp", 60.0, Some("-P2")),
+        place("s3", "arrow", 100.0, Some("-M")),
+    ];
+    page.wires = vec![wire("w1", pin("s1", "1"), pin("s2", "X1"), None, None)];
+    p.pages.push(page);
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = terminal_plan(&i);
+    let Some(x12) = t.rows.iter().find(|r| r[0] == "-X1" && r[1] == "2") else {
+        unreachable!("no -X1.2: {:?}", t.rows)
+    };
+    assert_eq!(x12[2], "-A1:I, -P2:X1", "{x12:?}");
+    // Only interruption points on that side: the interruption point is named.
+    assert_eq!(x12[3], "-M:1", "{x12:?}");
+    let plc = plc_io_list(&i);
+    assert_eq!(plc.rows.len(), 1, "{:?}", plc.rows);
+    assert_eq!(plc.rows[0][4], "-P2:X1, -X1.2:1");
+}
+
+#[test]
 fn terminal_plan_shows_jumpers() {
     let (mut p, s, parts) = fixture();
     let x1 = wc_core::DeviceTag::parse("-X1").unwrap();
@@ -425,6 +468,35 @@ fn net_list_joins_across_wires() {
     let zero = t.rows.iter().find(|r| r[0] == "0V").unwrap();
     assert_eq!(zero[2], "-X2:1, =A+C1-K1:A2");
     assert!(Kind::ALL.iter().all(|k| Kind::parse(k.name()) == Some(*k)));
+}
+
+#[test]
+fn net_list_leaves_out_interruption_points() {
+    let (mut p, mut s, parts) = fixture();
+    let arrow = sym("arrow", SymbolRole::Interruption, &["1"]);
+    s.insert(arrow.id.clone(), arrow);
+    // The 0V net goes on to page 3 through the interruption point -0V, drawn on both pages.
+    p.pages[0].symbols.push(place("s9", "arrow", 200.0, Some("-0V")));
+    p.pages[0]
+        .wires
+        .push(wire("w5", pin("s1", "A2"), pin("s9", "1"), None, None));
+    let mut page = Page::new("p3", "3", "More");
+    page.symbols = vec![
+        place("s1", "arrow", 20.0, Some("-0V")),
+        place("s2", "lamp", 60.0, Some("-P2")),
+    ];
+    page.wires = vec![wire("w1", pin("s1", "1"), pin("s2", "X2"), None, None)];
+    p.pages.push(page);
+    let t = net_list(&Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    });
+    let Some(zero) = t.rows.iter().find(|r| r[0] == "0V") else {
+        unreachable!("no 0V net: {:?}", t.rows)
+    };
+    assert_eq!(zero[1], "3", "{zero:?}");
+    assert_eq!(zero[2], "-P2:X2, -X2:1, =A+C1-K1:A2");
 }
 
 #[test]
