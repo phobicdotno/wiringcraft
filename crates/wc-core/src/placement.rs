@@ -64,6 +64,41 @@ pub fn free_tag_like(used: &BTreeSet<DeviceTag>, like: &DeviceTag) -> Option<Dev
     })
 }
 
+/// `old` under the new tag of its parent (its tag one product level up), when the group holds
+/// that parent: `-X1.3` of a strip `-X1` placed as `-X2` is `-X2.3`, and placed as `-X1` it
+/// stays `-X1.3`.
+fn under_renamed_parent(renamed: &BTreeMap<&DeviceTag, Option<DeviceTag>>, old: &DeviceTag) -> Option<DeviceTag> {
+    let (last, rest) = old.product.split_last()?;
+    if rest.is_empty() {
+        return None;
+    }
+    let parent = DeviceTag {
+        product: rest.to_vec(),
+        ..old.clone()
+    };
+    let new_parent = renamed.get(&parent)?.as_ref()?;
+    let mut t = new_parent.clone();
+    t.product.push(last.clone());
+    Some(t)
+}
+
+/// The first product `<letter>1` to `<letter>9999` that no tag in `used` has, whatever its
+/// function and location, nor has as the first level of a longer product: terminal `-X1.3` or
+/// part `-K1.2` takes `X1` or `K1` too. `None` for an empty letter code or when all are taken.
+pub fn free_product(used: &BTreeSet<DeviceTag>, letter: &str) -> Option<String> {
+    if letter.is_empty() {
+        return None;
+    }
+    let taken: BTreeSet<&str> = used
+        .iter()
+        .filter_map(|t| t.product.first())
+        .map(String::as_str)
+        .collect();
+    (1..10_000)
+        .map(|n| format!("{letter}{n}"))
+        .find(|p| !taken.contains(p.as_str()))
+}
+
 /// Every tag the project uses: on its pages, in its device data and as the cable of a wire
 /// core (a cable with cores but no symbol drawn and no device entry is still taken).
 pub fn used_tags(project: &Project) -> BTreeSet<DeviceTag> {
@@ -105,31 +140,66 @@ pub fn place(
         .iter()
         .filter(|_| data != DeviceData::ProjectFirst)
         .filter_map(|w| w.cable.as_ref().map(|c| &c.cable));
-    for old in group.symbols.iter().filter_map(|s| s.tag.as_ref()).chain(cables) {
-        if renamed.contains_key(old) {
-            continue;
-        }
-        let new = match free_tag_like(&used, old) {
-            Some(t) => t,
-            None if out_of_tags == OutOfTags::Fail => {
-                return Err(Error::Invalid(format!("no free tag like {old}")));
-            }
-            None => {
-                renamed.insert(old, None);
+    // Shorter tags first, so a strip (`-X1`) has its new tag before its terminals (`-X1.3`).
+    let mut olds: Vec<&DeviceTag> = group
+        .symbols
+        .iter()
+        .filter_map(|s| s.tag.as_ref())
+        .chain(cables)
+        .collect();
+    olds.sort_by_key(|t| t.product.len());
+    // Two passes: first every tag that keeps its own number (on its own or on its strip's new
+    // tag), then the ones whose number is taken there, so a taken number never pushes another
+    // terminal off a number that was free (#1780).
+    let mut pending = olds;
+    for first in [true, false] {
+        let mut deferred: Vec<&DeviceTag> = Vec::new();
+        for old in std::mem::take(&mut pending) {
+            if renamed.contains_key(old) {
                 continue;
             }
-        };
-        let (project_data, group_data) = (project.devices.get(old), group.devices.get(old));
-        let device = match data {
-            DeviceData::ProjectFirst => project_data.or(group_data),
-            DeviceData::GroupFirst => group_data.or(project_data),
-            DeviceData::GroupOnly => group_data,
+            // A terminal (or other sub-tag) of a strip the group holds follows the strip to its
+            // new tag, keeping its own number when that is free there, else taking the next free
+            // number on that strip.
+            let followed = under_renamed_parent(&renamed, old);
+            if first {
+                let parent_deferred = old.product.split_last().is_some_and(|(_, rest)| {
+                    deferred.iter().any(|d| {
+                        d.product.as_slice() == rest && d.function == old.function && d.location == old.location
+                    })
+                });
+                if parent_deferred || followed.as_ref().is_some_and(|t| used.contains(t)) {
+                    deferred.push(old);
+                    continue;
+                }
+            }
+            let new = match followed
+                .clone()
+                .filter(|t| !used.contains(t))
+                .or_else(|| free_tag_like(&used, followed.as_ref().unwrap_or(old)))
+            {
+                Some(t) => t,
+                None if out_of_tags == OutOfTags::Fail => {
+                    return Err(Error::Invalid(format!("no free tag like {old}")));
+                }
+                None => {
+                    renamed.insert(old, None);
+                    continue;
+                }
+            };
+            let (project_data, group_data) = (project.devices.get(old), group.devices.get(old));
+            let device = match data {
+                DeviceData::ProjectFirst => project_data.or(group_data),
+                DeviceData::GroupFirst => group_data.or(project_data),
+                DeviceData::GroupOnly => group_data,
+            }
+            .cloned()
+            .unwrap_or_default();
+            used.insert(new.clone());
+            devices.push((new.clone(), device));
+            renamed.insert(old, Some(new));
         }
-        .cloned()
-        .unwrap_or_default();
-        used.insert(new.clone());
-        devices.push((new.clone(), device));
-        renamed.insert(old, Some(new));
+        pending = deferred;
     }
     project.devices.extend(devices);
 
@@ -220,6 +290,21 @@ mod tests {
         p.pages.push(page);
         p.devices.insert(tag("-K1"), device("project's"));
         p
+    }
+
+    #[test]
+    fn a_free_product_skips_device_data_terminals_and_other_functions() {
+        let mut p = project();
+        // -K2 has device data but no symbol (its symbol was deleted); -K3 is in another
+        // function; -X1 is drawn only as its terminals.
+        p.devices.insert(tag("-K2"), device("left behind"));
+        p.pages[0].symbols.push(symbol("s2", "=PUMP-K3"));
+        p.pages[0].symbols.push(symbol("s3", "-X1.3"));
+        let used = used_tags(&p);
+        assert_eq!(free_product(&used, "K").as_deref(), Some("K4"));
+        assert_eq!(free_product(&used, "X").as_deref(), Some("X2"));
+        assert_eq!(free_product(&used, "Q").as_deref(), Some("Q1"));
+        assert_eq!(free_product(&used, ""), None);
     }
 
     #[test]
@@ -423,5 +508,263 @@ mod tests {
             OutOfTags::Fail,
         );
         assert!(none.is_err());
+    }
+
+    fn tags(list: &[&str]) -> BTreeSet<DeviceTag> {
+        list.iter().map(|t| tag(t)).collect()
+    }
+
+    fn point_wire(id: &str, from: Endpoint, to: Endpoint) -> Wire {
+        Wire {
+            id: id.into(),
+            from,
+            to,
+            via: vec![],
+            number: None,
+            potential: None,
+            cable: None,
+            route: Default::default(),
+            spec: Default::default(),
+        }
+    }
+
+    #[test]
+    fn free_tag_like_keeps_function_and_location_and_takes_the_lowest_gap() {
+        let used = tags(&["=A1+L1-KF1", "=A1+L1-KF2", "=A1+L1-KF4", "-KF3"]);
+        let Some(t) = free_tag_like(&used, &tag("=A1+L1-KF2")) else {
+            unreachable!("a free tag")
+        };
+        // -KF3 is taken only without function and location, so it is free here.
+        assert_eq!(t.to_string(), "=A1+L1-KF3");
+        // The old number does not matter, only the letter code.
+        let Some(t) = free_tag_like(&used, &tag("=A1+L1-KF99")) else {
+            unreachable!("a free tag")
+        };
+        assert_eq!(t.to_string(), "=A1+L1-KF3");
+        let Some(t) = free_tag_like(&BTreeSet::new(), &tag("-X7")) else {
+            unreachable!("a free tag")
+        };
+        assert_eq!(t.to_string(), "-X1");
+    }
+
+    #[test]
+    fn free_tag_like_without_a_product_or_with_every_number_taken_is_none() {
+        // Parsing refuses such a tag, but the field is public.
+        let no_product = DeviceTag {
+            function: vec!["A1".into()],
+            ..DeviceTag::default()
+        };
+        assert_eq!(free_tag_like(&BTreeSet::new(), &no_product), None);
+        let used: BTreeSet<DeviceTag> = (1..10_000).map(|n| tag(&format!("-Q{n}"))).collect();
+        assert_eq!(free_tag_like(&used, &tag("-Q1")), None);
+        // Only 1 to 9999 count: -Q10000 is never offered.
+        let Some(t) = free_tag_like(&used, &tag("-QA1")) else {
+            unreachable!("another letter code is free")
+        };
+        assert_eq!(t.to_string(), "-QA1");
+    }
+
+    #[test]
+    fn used_tags_joins_page_tags_and_device_data() {
+        let mut p = project();
+        p.devices.insert(tag("-F3"), Device::default());
+        let Some(page) = p.pages.first_mut() else {
+            unreachable!("page 1")
+        };
+        page.symbols.push(symbol("s2", "-X2"));
+        page.symbols.push(PlacedSymbol {
+            tag: None,
+            ..symbol("s3", "-X9")
+        });
+        assert_eq!(used_tags(&p), tags(&["-K1", "-F3", "-X2"]));
+    }
+
+    #[test]
+    fn a_missing_page_is_an_error_naming_it_one_based_and_changes_nothing() {
+        let mut p = project();
+        let before = p.clone();
+        let symbols = [symbol("a", "-K1")];
+        let none = BTreeMap::new();
+        let group = Group {
+            symbols: &symbols,
+            wires: &[],
+            graphics: &[],
+            devices: &none,
+            anchor: Point::new(0.0, 0.0),
+        };
+        let res = place(
+            &mut p,
+            2,
+            group,
+            Point::new(0.0, 0.0),
+            DeviceData::GroupOnly,
+            OutOfTags::Fail,
+        );
+        let Err(e) = res else {
+            unreachable!("page 3 does not exist")
+        };
+        assert!(e.to_string().contains("no page 3"), "{e}");
+        assert_eq!(p, before);
+    }
+
+    #[test]
+    fn symbols_wires_and_drawings_move_by_anchor_to_point_and_wires_follow_new_ids() {
+        let mut p = project();
+        let mut a = symbol("s1", "-K1");
+        a.at = Point::new(10.0, 20.0);
+        let b = PlacedSymbol {
+            tag: None,
+            ..symbol("s2", "-X1")
+        };
+        let symbols = [a, b];
+        let mut w = point_wire(
+            "w1",
+            Endpoint::Pin {
+                item: "s1".into(),
+                pin: "A1".into(),
+            },
+            Endpoint::Point {
+                at: Point::new(30.0, 20.0),
+            },
+        );
+        w.via = vec![Point::new(20.0, 25.0)];
+        w.number = Some("7".into());
+        // A pin on an item outside the group keeps its id.
+        let outside = point_wire(
+            "w9",
+            Endpoint::Pin {
+                item: "s2".into(),
+                pin: "1".into(),
+            },
+            Endpoint::Pin {
+                item: "elsewhere".into(),
+                pin: "2".into(),
+            },
+        );
+        let wires = [w, outside];
+        let graphics = [Shape::Line {
+            a: Point::new(0.0, 0.0),
+            b: Point::new(10.0, 0.0),
+        }];
+        let none = BTreeMap::new();
+        let group = Group {
+            symbols: &symbols,
+            wires: &wires,
+            graphics: &graphics,
+            devices: &none,
+            anchor: Point::new(10.0, 20.0),
+        };
+        let Ok(placed) = place(
+            &mut p,
+            0,
+            group,
+            Point::new(100.0, 200.0),
+            DeviceData::ProjectFirst,
+            OutOfTags::Fail,
+        ) else {
+            unreachable!("placed")
+        };
+        // s1 is taken on the page, so the group's symbols get s2 and s3; its wires w1 and w2.
+        assert_eq!(placed.symbols, ["s2", "s3"]);
+        assert_eq!(placed.wires, ["w1", "w2"]);
+        assert_eq!(placed.graphics, [0]);
+        let Some(page) = p.pages.first() else {
+            unreachable!("page 1")
+        };
+        let Some(s) = page.symbol("s2") else { unreachable!("s2") };
+        assert_eq!(s.at, Point::new(100.0, 200.0));
+        assert_eq!(s.tag.as_ref().map(ToString::to_string).as_deref(), Some("-K2"));
+        let Some(s) = page.symbol("s3") else { unreachable!("s3") };
+        assert_eq!(s.tag, None);
+        assert_eq!(s.at, Point::new(100.0, 190.0));
+
+        let [w1, w2] = page.wires.as_slice() else {
+            unreachable!("two new wires")
+        };
+        assert_eq!((w1.id.as_str(), w2.id.as_str()), ("w1", "w2"));
+        assert!(matches!(&w1.from, Endpoint::Pin { item, pin } if item == "s2" && pin == "A1"));
+        assert!(matches!(w1.to, Endpoint::Point { at } if at == Point::new(120.0, 200.0)));
+        assert_eq!(w1.via, [Point::new(110.0, 205.0)]);
+        assert_eq!(w1.number, None, "a placed wire is numbered afresh");
+        assert!(matches!(&w2.from, Endpoint::Pin { item, .. } if item == "s3"));
+        assert!(matches!(&w2.to, Endpoint::Pin { item, .. } if item == "elsewhere"));
+        assert!(matches!(
+            page.graphics.first(),
+            Some(Shape::Line { a, b }) if *a == Point::new(90.0, 180.0) && *b == Point::new(100.0, 180.0)
+        ));
+    }
+
+    #[test]
+    fn one_device_of_the_group_becomes_one_new_device_and_its_cable_cores_follow() {
+        let mut p = project();
+        p.devices.insert(tag("-W1"), device("project cable"));
+        // Two symbols of -K1 (coil and contact) and a cable -W1 with a core.
+        let symbols = [symbol("a", "-K1"), symbol("b", "-K1"), symbol("c", "-W1")];
+        let mut core = point_wire(
+            "w1",
+            Endpoint::Point {
+                at: Point::new(0.0, 0.0),
+            },
+            Endpoint::Point {
+                at: Point::new(5.0, 0.0),
+            },
+        );
+        core.cable = Some(crate::project::CableCore {
+            cable: tag("-W1"),
+            core: "BU".into(),
+        });
+        // A core of a cable the group does not hold stays in that cable.
+        let mut other = core.clone();
+        other.id = "w2".into();
+        other.cable = Some(crate::project::CableCore {
+            cable: tag("-W8"),
+            core: "BK".into(),
+        });
+        let wires = [core, other];
+        let none = BTreeMap::new();
+        let group = Group {
+            symbols: &symbols,
+            wires: &wires,
+            graphics: &[],
+            devices: &none,
+            anchor: Point::new(0.0, 0.0),
+        };
+        let Ok(placed) = place(
+            &mut p,
+            0,
+            group,
+            Point::new(0.0, 0.0),
+            DeviceData::ProjectFirst,
+            OutOfTags::Fail,
+        ) else {
+            unreachable!("placed")
+        };
+        let Some(page) = p.pages.first() else {
+            unreachable!("page 1")
+        };
+        let new_tags: Vec<Option<String>> = placed
+            .symbols
+            .iter()
+            .map(|id| page.symbol(id).and_then(|s| s.tag.as_ref()).map(ToString::to_string))
+            .collect();
+        let want = |s: &str| Some(s.to_string());
+        assert_eq!(new_tags, [want("-K2"), want("-K2"), want("-W2")]);
+        assert_eq!(
+            p.devices.keys().map(ToString::to_string).collect::<Vec<_>>(),
+            ["-K1", "-K2", "-W1", "-W2"]
+        );
+        assert_eq!(
+            p.devices.get(&tag("-W2")).map(|d| d.description.as_str()),
+            Some("project cable")
+        );
+        let cable_of = |id: &str| {
+            page.wires
+                .iter()
+                .find(|w| w.id == id)
+                .and_then(|w| w.cable.as_ref())
+                .map(|c| (c.cable.to_string(), c.core.clone()))
+        };
+        assert_eq!(cable_of("w1"), Some(("-W2".into(), "BU".into())));
+        assert_eq!(cable_of("w2"), Some(("-W8".into(), "BK".into())));
     }
 }

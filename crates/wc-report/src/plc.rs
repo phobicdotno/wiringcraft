@@ -424,8 +424,9 @@ pub fn plc_card_overview(i: &Inputs<'_>) -> Table {
 /// last. Empty when there are no racks.
 ///
 /// Cards are compared by the bits their channels cover (a word covers two bytes, so `%IW64`
-/// and `%IB65` share one). A card with its own `step` numbers its addresses its own way, so it
-/// is compared by channel address only.
+/// and `%IB65` share one). A byte or word card with its own `step` numbers its addresses its own
+/// way, so it is compared by channel address only; a bit card ignores its step and is compared by
+/// bits like any other.
 pub fn plc_rack_warnings(i: &Inputs<'_>) -> Vec<String> {
     let racks = &i.project.meta.racks;
     let mut out = Vec::new();
@@ -449,10 +450,12 @@ pub fn plc_rack_warnings(i: &Inputs<'_>) -> Vec<String> {
                 }
                 Ok(a) => a,
             };
+            // The step only moves byte, word and double word channels; bit cards ignore it.
+            let own_step = card.step.is_some() && addresses.first().is_some_and(|a| a.bit.is_none());
             let mut clash: Option<(PlcAddress, String)> = None;
             for a in &addresses {
                 let shared = owner.get(a).cloned().or_else(|| {
-                    if card.step.is_some() {
+                    if own_step {
                         return None;
                     }
                     let bits = a.bits();
@@ -470,7 +473,7 @@ pub fn plc_rack_warnings(i: &Inputs<'_>) -> Vec<String> {
             }
             for a in addresses {
                 owner.entry(a).or_insert_with(|| here.clone());
-                if card.step.is_none() {
+                if !own_step {
                     covered.push((a.output, a.bits(), here.clone()));
                 }
             }
