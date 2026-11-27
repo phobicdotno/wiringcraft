@@ -10,7 +10,7 @@ use wc_core::project::LibrarySource;
 use wc_core::{DeviceTag, Endpoint, Page, PageSize, PlacedSymbol, Project, Wire, store};
 use wc_import::run::{
     self, escape_field, kicad_prefix, load, page_mut, put_file_back, put_files_back, read_file, read_kicad, save,
-    snapshot_project, vendored_bytes, write_kicad,
+    snapshot_project, terminal_numbers_with, vendored_bytes, write_kicad,
 };
 #[cfg(test)]
 use wc_import::run::{
@@ -3512,13 +3512,50 @@ fn run(mut cli: Cli) -> Res<()> {
                         .map(|id| id.trim())
                         .filter(|id| !id.is_empty())
                         .collect();
+                    // The library is opened only when an item needs it, so a macro whose
+                    // symbols and parts all have their pinned copies works without it.
+                    let mut lib: Option<wc_library::Library> = None;
+                    // A symbol the project already places but has no readable copy of comes
+                    // back with the macro, and can turn placed items into terminals. A strip
+                    // that renumbers is refused here, before any copy is written, as the
+                    // imports do. A symbol that cannot be fetched is reported by the loop below.
+                    if p.meta.follows_terminals() {
+                        let mut brings: Vec<wc_core::Symbol> = Vec::new();
+                        for id in symbols.iter().copied() {
+                            let placed = p.pages.iter().any(|pg| pg.symbols.iter().any(|ps| ps.symbol == id));
+                            if !placed || store::read_vendored_symbol(dir, id).is_ok() {
+                                continue;
+                            }
+                            let pin = p.lock.symbols.get(id);
+                            // A pinned copy that is there but cannot be read is not replaced.
+                            if pin.is_some() && store::vendor_path(dir, ItemKind::Symbol, id).is_ok_and(|f| f.exists())
+                            {
+                                continue;
+                            }
+                            if lib.is_none() {
+                                lib = wc_library::Library::open(dir, &p).ok();
+                            }
+                            let Some(lib) = &lib else { break };
+                            let found = match pin {
+                                Some(pin) => lib
+                                    .find_version(ItemKind::Symbol, id, &pin.source, |s: &wc_core::Symbol| {
+                                        if s.id == id && s.hash() == pin.hash {
+                                            Ok(())
+                                        } else {
+                                            Err(String::new())
+                                        }
+                                    })
+                                    .ok(),
+                                None => lib.symbol(id).ok().map(|(s, _)| s),
+                            };
+                            brings.extend(found);
+                        }
+                        terminal_numbers_with(dir, &p, &brings, "macro", "place the macro again")?;
+                    }
                     let items = symbols
                         .into_iter()
                         .map(|id| (ItemKind::Symbol, id))
                         .chain(parts.into_iter().map(|id| (ItemKind::Part, id)));
-                    // The library is opened only when an item needs it, so a macro whose
-                    // symbols and parts all have their pinned copies works without it.
-                    let mut lib: Option<wc_library::Library> = None;
                     for (kind, id) in items {
                         let what = match kind {
                             ItemKind::Symbol => "symbol",
@@ -10461,6 +10498,92 @@ mod tests {
         let mut p = load(&dir).unwrap();
         add_built(&dir, &mut p, built(), "import:a.tewzip", Replace::No).unwrap();
         assert_eq!(p.meta.jumpers[0].terminals, ["1", "2"]);
+    }
+
+    #[test]
+    fn a_macro_that_brings_a_missing_terminal_symbol_does_not_guess_where_jumpers_go() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        run(Cli::try_parse_from(["wiringcraft", "new", dir.to_str().unwrap(), "--no-git"]).unwrap()).unwrap();
+        let term = |id: &str| wc_core::Symbol {
+            source: String::new(),
+            id: id.into(),
+            name: "Terminal".into(),
+            category: String::new(),
+            letter_code: "X".into(),
+            role: wc_core::symbol::SymbolRole::Terminal,
+            graphics: vec![],
+            pins: vec![],
+            tag_at: Default::default(),
+            description: String::new(),
+        };
+        let placed = |id: &str, symbol: &str, x: f64| PlacedSymbol {
+            id: id.into(),
+            symbol: symbol.into(),
+            at: Point::new(x, 10.0),
+            rotation: Rotation::default(),
+            mirror: false,
+            tag: DeviceTag::parse("-X1").ok(),
+        };
+        // A library that has the symbol the project lost, and a project macro that uses it.
+        let lib = tmp.path().join("lib");
+        wc_library::write_symbol(&lib, &term("test.missing")).unwrap();
+        cli(&dir, &["lib", "add", "mine", "folder", lib.to_str().unwrap()]).unwrap();
+        std::fs::create_dir_all(dir.join("macros")).unwrap();
+        std::fs::write(
+            dir.join("macros/one.json"),
+            r#"{"name": "One", "anchor": {"x": 0.0, "y": 0.0},
+            "symbols": [{"id": "s1", "symbol": "test.missing", "at": {"x": 10.0, "y": 10.0}, "tag": "-K1"}]}"#,
+        )
+        .unwrap();
+        let mut p = load(&dir).unwrap();
+        // Three terminals tagged with only the strip; the first one's symbol has no copy in the
+        // project, and placing the macro would restore it. Jumper 1-2 is b-c if it was numbered
+        // without that symbol, a-b if with it.
+        store::write_vendored_symbol(&dir, &term("test.term")).unwrap();
+        p.pages[0].symbols.extend([
+            placed("a", "test.missing", 10.0),
+            placed("b", "test.term", 20.0),
+            placed("c", "test.term", 30.0),
+        ]);
+        let x1 = DeviceTag::parse("-X1").unwrap();
+        p.meta.add_jumper(&x1, &["1".into(), "2".into()]).unwrap();
+        store::save(&dir, &p).unwrap();
+        let page = p.pages[0].id.clone();
+        let place = || cli(&dir, &["macro", "place", &page, "one", "--at", "100,100"]);
+        // Without a pin the library's current version would be taken, with one the pinned version
+        // put back: neither is written.
+        for pinned in [false, true] {
+            if pinned {
+                let mut p = load(&dir).unwrap();
+                p.lock.symbols.insert(
+                    "test.missing".into(),
+                    wc_core::LockEntry {
+                        source: "mine".into(),
+                        hash: term("test.missing").hash(),
+                    },
+                );
+                store::save(&dir, &p).unwrap();
+            }
+            let before = load(&dir).unwrap();
+            let err = place().unwrap_err();
+            assert!(err.contains("jumpers and rail order of -X1"), "{err}");
+            assert!(
+                err.contains("no readable copy of test.missing that the macro brings"),
+                "{err}"
+            );
+            assert!(
+                store::read_vendored_symbol(&dir, "test.missing").is_err(),
+                "nothing written"
+            );
+            assert_eq!(load(&dir).unwrap(), before, "nothing saved");
+        }
+        // With the file back the numbering is known, and the macro is placed.
+        store::write_vendored_symbol(&dir, &term("test.missing")).unwrap();
+        place().unwrap();
+        let p = load(&dir).unwrap();
+        assert_eq!(p.meta.jumpers[0].terminals, ["1", "2"]);
+        assert_eq!(p.pages[0].symbols.len(), 4);
     }
 
     #[test]
