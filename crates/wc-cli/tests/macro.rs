@@ -1279,3 +1279,72 @@ fn a_placement_refuses_project_files_that_are_links() -> TestResult {
     );
     Ok(())
 }
+
+/// How many times one run of `args` opened the library, as the program reports it.
+fn library_opens(dir: &Path, args: &[&str]) -> Result<usize, String> {
+    let out = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("WIRINGCRAFT_COUNT_LIBRARY_OPENS", "1")
+        .output()
+        .map_err(|e| e.to_string())?;
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    if !out.status.success() {
+        return Err(stderr);
+    }
+    stderr
+        .lines()
+        .find_map(|l| l.strip_prefix("library opened: "))
+        .and_then(|n| n.trim().parse().ok())
+        .ok_or_else(|| format!("no count reported: {stderr}"))
+}
+
+#[test]
+fn a_macro_run_opens_the_library_once() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let lib = tmp.path().join("lib");
+    for folder in ["symbols", "parts", "macros"] {
+        std::fs::create_dir_all(lib.join(folder))?;
+    }
+    std::fs::copy(
+        repo.join("library/symbols/wc.coil.json"),
+        lib.join("symbols/wc.coil.json"),
+    )?;
+    let (red, green) = ("example.ex-lamp-24-rd", "example.ex-lamp-24-gn");
+    for part in [red, green] {
+        std::fs::copy(
+            repo.join(format!("library/parts/{part}.json")),
+            lib.join(format!("parts/{part}.json")),
+        )?;
+    }
+    std::fs::write(lib.join("macros/starter.json"), STARTER)?;
+    wiringcraft(&dir, &["lib", "add", "mine", "folder", lib.to_str().ok_or("path")?])?;
+
+    // Rows taking a symbol and two parts from the library, and one naming a part no library has.
+    let table = tmp.path().join("lamps.csv");
+    std::fs::write(&table, format!("kW;part\n1;{red}\n2;nowhere.cap\n3;{green}\n4;{red}\n"))?;
+    let table = table.to_str().ok_or("path")?;
+    let generate = ["macro", "generate", "starter", "--table", table, "--set", "3 kW"];
+    assert_eq!(library_opens(&dir, &generate)?, 1);
+    let p = wc_core::store::load(&dir)?;
+    assert!(p.lock.symbols.contains_key("wc.coil"));
+    assert_eq!(p.lock.parts.len(), 2);
+
+    // Placing looks for the value set's part, which is not pinned, in the library that listed
+    // the macros, not in a second one.
+    let page = p.pages.first().map(|pg| pg.id.clone()).ok_or("no page")?;
+    let place = [
+        "macro", "place", &page, "starter", "--at", "200,150", "--set", "0.75 kW",
+    ];
+    assert_eq!(library_opens(&dir, &place)?, 1);
+    Ok(())
+}

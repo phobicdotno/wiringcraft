@@ -20,6 +20,15 @@ use wc_core::{LockEntry, Part, Project, Symbol, store};
 pub use diff::{diff_parts, diff_symbols};
 pub use source::{Source, cache_root, redact_location};
 
+/// How many times [`Library::open`] ran in this process, see [`times_opened`].
+static OPENED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many times this process opened the library ([`Library::open`], also the calls that
+/// failed). Lets a command report it, so a test can check that a run opens the library once.
+pub fn times_opened() -> usize {
+    OPENED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
@@ -76,6 +85,7 @@ pub struct Library {
 impl Library {
     /// Open the sources listed in the project. Git sources must have been synced once.
     pub fn open(project_dir: &Path, project: &Project) -> Result<Self> {
+        OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let sources = project
             .meta
             .libraries

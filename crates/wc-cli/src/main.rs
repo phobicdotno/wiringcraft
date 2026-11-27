@@ -2556,9 +2556,17 @@ impl MacroCopies {
 ///
 /// Each item is taken once, with the copy that names it first, and the library is opened at
 /// most once: a later copy naming the same symbol or part finds what the first one left, so
-/// looking it up again would change nothing.
-fn take_macro_items(dir: &Path, p: &mut Project, macros: &[wc_core::macros::Macro], again: &str) -> Res<()> {
-    let mut lib = None;
+/// looking it up again would change nothing. `held` is a library the command already opened
+/// (to list the macros), used instead of opening it again; without one it is opened only when
+/// an item needs it.
+fn take_macro_items(
+    dir: &Path,
+    p: &mut Project,
+    macros: &[wc_core::macros::Macro],
+    again: &str,
+    held: Option<wc_library::Library>,
+) -> Res<()> {
+    let mut lib = held;
     let mut seen = std::collections::BTreeSet::new();
     for m in macros {
         take_new_macro_items(dir, p, m, again, &mut lib, &mut seen)?;
@@ -3784,15 +3792,22 @@ fn run(mut cli: Cli) -> Res<()> {
                 })
                 .collect();
             // A library that cannot be opened is reported; the project's macros stay usable.
-            match wc_library::Library::open(dir, &p) {
-                Ok(lib) => found.extend(lib.macros().into_iter().map(|(source, id, path)| FoundMacro {
-                    source,
-                    id,
-                    path,
-                    project: false,
-                })),
-                Err(err) => eprintln!("warning: the library's macros are not listed: {err}"),
-            }
+            // One that opens is kept for taking the macro's items, so a run opens it once.
+            let listed = match wc_library::Library::open(dir, &p) {
+                Ok(lib) => {
+                    found.extend(lib.macros().into_iter().map(|(source, id, path)| FoundMacro {
+                        source,
+                        id,
+                        path,
+                        project: false,
+                    }));
+                    Some(lib)
+                }
+                Err(err) => {
+                    eprintln!("warning: the library's macros are not listed: {err}");
+                    None
+                }
+            };
             match mc {
                 MacroCmd::List => {
                     for FoundMacro { source, id, path, .. } in &found {
@@ -3857,7 +3872,8 @@ fn run(mut cli: Cli) -> Res<()> {
                     // a run that fails after them (a macro too large for the page, a placement or
                     // a save that fails) puts them back, so no page draws a symbol it did not.
                     let vendored = MacroCopies::read(dir, &copies, "macro generate")?;
-                    take_macro_items(dir, &mut p, &copies, "generate the pages again").map_err(|x| vendored.undo(x))?;
+                    take_macro_items(dir, &mut p, &copies, "generate the pages again", listed)
+                        .map_err(|x| vendored.undo(x))?;
                     let title = title.unwrap_or_else(|| m.name.clone());
                     let symbol = |id: &str| store::read_vendored_symbol(dir, id).ok();
                     let generated = wc_core::generate::generate(&mut p, &copies, symbol, size, &title)
@@ -3900,7 +3916,7 @@ fn run(mut cli: Cli) -> Res<()> {
                     // As `macro generate`: a run that fails after a copy was written (an item that
                     // cannot be taken, the placement, the save) leaves the folder as it was.
                     let vendored = MacroCopies::read(dir, [&m], "macro place")?;
-                    take_macro_items(dir, &mut p, std::slice::from_ref(&m), "place the macro again")
+                    take_macro_items(dir, &mut p, std::slice::from_ref(&m), "place the macro again", listed)
                         .map_err(|x| vendored.undo(x))?;
                     let page_id = page_mut(&mut p, &page).map_err(|x| vendored.undo(x))?.id.clone();
                     let ids = wc_core::macros::place(&mut p, &page_id, &m, at).map_err(|x| vendored.undo(e(x)))?;
@@ -6392,6 +6408,11 @@ fn main() -> ExitCode {
             .unwrap_or_else(|_| Err("the command stopped unexpectedly".into())),
         Err(err) => Err(format!("could not start the command: {err}")),
     };
+    // For tests, which run the program and cannot count otherwise: how many times this run
+    // opened the library.
+    if std::env::var_os("WIRINGCRAFT_COUNT_LIBRARY_OPENS").is_some() {
+        eprintln!("library opened: {}", wc_library::times_opened());
+    }
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
