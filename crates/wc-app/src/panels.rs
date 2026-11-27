@@ -2445,6 +2445,7 @@ mod tests {
     /// A long status message is cut short to the room left by the right-hand texts, so the
     /// status bar stays inside a narrow window instead of running under them (#1478).
     #[test]
+    #[allow(clippy::unwrap_used)]
     fn a_long_status_message_stays_inside_the_status_bar() {
         let (_tmp, o) = crate::state::tests::project();
         let mut ed = Editor::default();
