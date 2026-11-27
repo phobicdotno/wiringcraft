@@ -594,6 +594,7 @@ fn corners_of(shape: &Shape) -> Vec<Point> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -670,5 +671,239 @@ mod tests {
         );
         // Non-ASCII names next to the folder never split a character.
         assert_eq!(kind_of("Projects/ø/Drawings/1.ewg", f), None);
+    }
+
+    fn zip_of(files: &[(&str, &[u8])]) -> std::io::Cursor<Vec<u8>> {
+        use std::io::Write;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut z = zip::ZipWriter::new(&mut buf);
+            let opt = zip::write::SimpleFileOptions::default();
+            for (name, bytes) in files {
+                z.start_file(*name, opt).unwrap();
+                z.write_all(bytes).unwrap();
+            }
+            z.finish().unwrap();
+        }
+        buf.set_position(0);
+        buf
+    }
+
+    fn symbol(angle: f64, scale: (f64, f64)) -> SweSymbol {
+        SweSymbol {
+            id: 1,
+            page: 1,
+            component: None,
+            block: "Coil".into(),
+            at: Point::new(0.0, 0.0),
+            corner: None,
+            pins: Vec::new(),
+            angle,
+            scale,
+        }
+    }
+
+    #[test]
+    fn block_keys_ignore_case_and_surrounding_spaces() {
+        assert_eq!(block_key("  Coil \t"), "coil");
+        assert_eq!(block_key("ÆØÅ Relay"), "æøå relay");
+        assert_eq!(block_key("a  b"), "a  b", "inner spaces are kept");
+        assert_eq!(block_key("   "), "");
+    }
+
+    #[test]
+    fn placement_turns_then_scales_along_the_page_axes() {
+        let apply = |m: [f64; 4], x: f64, y: f64| (m[0] * x + m[1] * y, m[2] * x + m[3] * y);
+        assert_eq!(placement(&symbol(0.0, (1.0, 1.0))), [1.0, 0.0, 0.0, 1.0]);
+        // A quarter turn takes x onto y; the x scale then applies to the page's x axis.
+        let (x, y) = apply(placement(&symbol(90.0, (2.0, 3.0))), 1.0, 0.0);
+        assert!(x.abs() < 1e-12 && (y - 3.0).abs() < 1e-12, "{x} {y}");
+        let (x, y) = apply(placement(&symbol(90.0, (2.0, 3.0))), 0.0, 1.0);
+        assert!((x + 2.0).abs() < 1e-12 && y.abs() < 1e-12, "{x} {y}");
+        // A negative scale mirrors.
+        assert_eq!(placement(&symbol(0.0, (-1.0, 1.0))), [-1.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn shapes_are_rounded_to_thousandths_and_non_finite_ones_dropped() {
+        let line = Shape::Line {
+            a: Point::new(1.23449, -0.0004),
+            b: Point::new(2.0006, 3.0),
+        };
+        assert_eq!(
+            rounded(&line),
+            Some(Shape::Line {
+                a: Point::new(1.234, -0.0),
+                b: Point::new(2.001, 3.0),
+            })
+        );
+        let Some(Shape::Text {
+            height, angle, text, ..
+        }) = rounded(&Shape::Text {
+            at: Point::new(0.0, 0.0),
+            text: "K1".into(),
+            height: 2.50049,
+            align: Default::default(),
+            angle: 89.99999,
+        })
+        else {
+            unreachable!()
+        };
+        assert_eq!((height, angle, text.as_str()), (2.5, 90.0, "K1"));
+        let Some(Shape::Circle { radius, filled, .. }) = rounded(&Shape::Circle {
+            center: Point::new(0.0, 0.0),
+            radius: 0.12345,
+            filled: true,
+        }) else {
+            unreachable!()
+        };
+        assert_eq!((radius, filled), (0.123, true));
+        // A coordinate that is not a finite number, or that overflows when rounded.
+        let far = Shape::Line {
+            a: Point::new(0.0, 0.0),
+            b: Point::new(f64::INFINITY, 0.0),
+        };
+        assert_eq!(rounded(&far), None);
+        let huge = Shape::Line {
+            a: Point::new(0.0, 0.0),
+            b: Point::new(f64::MAX, 0.0),
+        };
+        assert_eq!(rounded(&huge), None);
+        let nan = Shape::Circle {
+            center: Point::new(f64::NAN, 0.0),
+            radius: 1.0,
+            filled: false,
+        };
+        assert_eq!(rounded(&nan), None);
+    }
+
+    #[test]
+    fn page_graphics_are_moved_down_onto_the_sheet() {
+        let shapes = vec![
+            Shape::Line {
+                a: Point::new(10.0, -20.0),
+                b: Point::new(30.0, -40.0004),
+            },
+            Shape::Line {
+                a: Point::new(0.0, 0.0),
+                b: Point::new(f64::INFINITY, 0.0),
+            },
+        ];
+        assert_eq!(
+            on_sheet(shapes, 297.0),
+            vec![Shape::Line {
+                a: Point::new(10.0, 277.0),
+                b: Point::new(30.0, 257.0),
+            }]
+        );
+        assert!(on_sheet(Vec::new(), 210.0).is_empty());
+    }
+
+    #[test]
+    fn corners_bound_a_quarter_arc_and_other_shapes_by_their_box() {
+        let rect = Shape::Rect {
+            min: Point::new(-1.0, -2.0),
+            max: Point::new(3.0, 4.0),
+        };
+        assert_eq!(corners_of(&rect), vec![Point::new(-1.0, -2.0), Point::new(3.0, 4.0)]);
+        // The quarter from 0° to 90° reaches only the first quadrant.
+        let arc = Shape::Arc {
+            center: Point::new(5.0, 5.0),
+            radius: 2.0,
+            start: 0.0,
+            end: 90.0,
+        };
+        let (min, max) = wc_core::geom::bounds_of(&corners_of(&arc));
+        assert!((min.x - 5.0).abs() < 1e-9 && (min.y - 5.0).abs() < 1e-9, "{min:?}");
+        assert!((max.x - 7.0).abs() < 1e-9 && (max.y - 7.0).abs() < 1e-9, "{max:?}");
+        // An arc from 350° to 10° crosses 0°: it reaches right of the centre, not left.
+        let across = Shape::Arc {
+            center: Point::new(0.0, 0.0),
+            radius: 10.0,
+            start: 350.0,
+            end: 10.0,
+        };
+        let (min, max) = wc_core::geom::bounds_of(&corners_of(&across));
+        assert!((max.x - 10.0).abs() < 1e-9 && min.x > 9.0, "{min:?} {max:?}");
+    }
+
+    #[test]
+    fn an_empty_folder_takes_only_library_blocks() {
+        assert_eq!(kind_of("Block/Coil.dwg", ""), Some(Kind::Block("Coil".into(), false)));
+        assert_eq!(kind_of("Projects/4/Block/Coil.dwg", ""), None);
+        assert_eq!(kind_of("Projects/4/Drawings/17.ewg", ""), None);
+        // A block file outside a `Block` folder, a page id that is not a number, no extension.
+        assert_eq!(kind_of("Coil.dwg", "Projects/4"), None);
+        assert_eq!(kind_of("Projects/4/Drawings/-x.ewg", "Projects/4"), None);
+        assert_eq!(kind_of("Block/Coil", "Projects/4"), None);
+        // A stem with dots keeps all but the last one.
+        assert_eq!(
+            kind_of("Block/Coil.v2.dwg", "Projects/4"),
+            Some(Kind::Block("Coil.v2".into(), false))
+        );
+    }
+
+    #[test]
+    fn an_archive_without_drawings_gives_none_and_no_warnings() {
+        let d = drawings_from_archive(
+            zip_of(&[("Projects/4/Database/x.sqlite", b"db"), ("readme.txt", b"hi")]),
+            "Projects/4",
+        )
+        .unwrap();
+        assert!(d.is_empty());
+        assert_eq!((d.block_count(), d.page_count()), (0, 0));
+        assert!(d.warnings.is_empty(), "{:?}", d.warnings);
+        assert_eq!(d.draw_limit(), dxf::MAX_DRAWN);
+        let Err(Error::Format(e)) = drawings_from_archive(std::io::Cursor::new(Vec::new()), "") else {
+            unreachable!()
+        };
+        assert!(e.starts_with("not a SolidWorks Electrical archive"), "{e}");
+    }
+
+    #[test]
+    fn unreadable_drawings_are_named_up_to_ten_and_the_rest_counted() {
+        let names: Vec<String> = (0..12).map(|i| format!("Block/B{i:02}.dwg")).collect();
+        let files: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), &b"not a dwg"[..])).collect();
+        let d = drawings_from_archive(zip_of(&files), "Projects/4").unwrap();
+        assert!(d.is_empty());
+        let [w] = &d.warnings[..] else {
+            unreachable!("{:?}", d.warnings)
+        };
+        assert!(
+            w.starts_with("12 drawing file(s) could not be read: Block/B00.dwg: "),
+            "{w}"
+        );
+        assert!(w.contains("Block/B09.dwg") && !w.contains("Block/B10.dwg"), "{w}");
+        assert!(w.ends_with("; and 2 more"), "{w}");
+    }
+
+    #[test]
+    fn blocks_not_asked_for_are_never_read() {
+        let buf = zip_of(&[("Block/Coil.dwg", b"not a dwg"), ("Block/Lamp.dwg", b"not a dwg")]);
+        let only = BTreeMap::from([("lamp".to_owned(), 1)]);
+        let d = block_drawings_within(buf, &only, Limits::ARCHIVE).unwrap();
+        // Only the lamp's file was read, and failed; the coil's was never opened.
+        let [w] = &d.warnings[..] else {
+            unreachable!("{:?}", d.warnings)
+        };
+        assert!(
+            w.starts_with("1 drawing file(s) could not be read: Block/Lamp.dwg"),
+            "{w}"
+        );
+        assert!(!w.contains("Coil"), "{w}");
+    }
+
+    #[test]
+    fn a_file_over_its_own_limit_is_refused_by_size() {
+        let lim = Limits { file: 4, total: 100 };
+        let buf = zip_of(&[("Block/Big.dwg", b"0123456789")]);
+        let d = drawings_within(buf, "", lim, None).unwrap();
+        let [w] = &d.warnings[..] else {
+            unreachable!("{:?}", d.warnings)
+        };
+        assert_eq!(
+            w,
+            "1 drawing file(s) could not be read: Block/Big.dwg is larger than 0 MB"
+        );
     }
 }

@@ -661,3 +661,208 @@ fn long_maker_names_that_differ_past_the_cut_get_different_ids() {
     );
     assert_eq!(maker_segment("  "), None);
 }
+
+#[test]
+fn a_part_in_two_part_files_is_warned_about_and_the_later_one_kept() -> TestResult {
+    let first = r#"<partsmanagement><part P_ARTICLE_MANUFACTURER="ACME" P_ARTICLE_ORDERNR="K1" P_ARTICLE_DESCR1="old"/></partsmanagement>"#;
+    let second = r#"<partsmanagement><part P_ARTICLE_MANUFACTURER="ACME" P_ARTICLE_ORDERNR="K1" P_ARTICLE_DESCR1="new"/></partsmanagement>"#;
+    let edz = zip(&[("a.xml", first.as_bytes()), ("b.xml", second.as_bytes())])?;
+    let (parts, report, warnings) = read(&edz)?;
+    let id = Part::make_id("ACME", "K1");
+    assert_eq!(report.parts, 1);
+    assert_eq!(report.part_files, 2);
+    let [p] = parts.as_slice() else {
+        unreachable!("{parts:?}")
+    };
+    assert_eq!(p.description, "new");
+    assert_eq!(
+        warnings,
+        [format!("part {id} is in the archive twice; the later one is kept")]
+    );
+    Ok(())
+}
+
+#[test]
+fn part_numbers_fall_back_from_order_to_type_to_eplan_number() -> TestResult {
+    let xml = r#"<PartsManagement>
+  <part P_ARTICLE_MANUFACTURER="ACME" P_ARTICLE_TYPENR="T-1" P_ARTICLE_NOTE="from the note"/>
+  <part P_ARTICLE_MANUFACTURER="ACME" P_ARTICLE_ORDERNR="O-2" P_ARTICLE_TYPENR="T-2"/>
+  <part P_ARTICLE_MANUFACTURER="ACME" P_ARTICLE_PARTNR="OTHER.X-3"/>
+  <part P_ARTICLE_MANUFACTURER="ACME" P_ARTICLE_DESCR1="no number at all"/>
+</PartsManagement>"#;
+    let parts = part_xml(xml)?.ok_or("a root in another case is still part data")?;
+    assert_eq!(parts.len(), 3, "a part without any number is left out: {parts:?}");
+    let [t, o, x] = parts.as_slice() else { unreachable!() };
+
+    // The type number stands in for a missing order number, and is then not repeated.
+    assert_eq!(t.order_number, "T-1");
+    assert!(!t.properties.contains_key(PROP_TYPE));
+    assert_eq!(
+        t.description, "from the note",
+        "the note stands in for a missing description"
+    );
+    assert!(!t.properties.contains_key("P_ARTICLE_NOTE"));
+
+    // A type number other than the order number is kept as its own property.
+    assert_eq!(o.order_number, "O-2");
+    assert_eq!(o.properties.get(PROP_TYPE).map(String::as_str), Some("T-2"));
+
+    // An EPLAN part number of another maker's prefix is kept whole.
+    assert_eq!(x.order_number, "OTHER.X-3");
+    assert_eq!(x.properties.get(PROP_EPLAN_PART).map(String::as_str), Some("OTHER.X-3"));
+    Ok(())
+}
+
+#[test]
+fn only_the_first_variant_fills_a_part() -> TestResult {
+    let xml = r#"<partsmanagement><part P_ARTICLE_ORDERNR="K1">
+  <variant P_ARTICLE_DEPTH="10"/>
+  <variant P_ARTICLE_DEPTH="20" P_ARTICLE_HEIGHT="30"/>
+</part></partsmanagement>"#;
+    let parts = part_xml(xml)?.ok_or("not part data")?;
+    let [p] = parts.as_slice() else {
+        unreachable!("{parts:?}")
+    };
+    assert_eq!(p.properties.get("P_ARTICLE_DEPTH").map(String::as_str), Some("10"));
+    assert!(!p.properties.contains_key("P_ARTICLE_HEIGHT"), "{:?}", p.properties);
+    Ok(())
+}
+
+#[test]
+fn xml_that_is_not_part_data_or_ends_early_is_told_apart() -> TestResult {
+    assert!(part_xml("<settings><partsmanagement/></settings>")?.is_none());
+    assert_eq!(part_xml("<partsmanagement/>")?.map(|p| p.len()), Some(0));
+    let Err(err) = part_xml("<partsmanagement><part P_ARTICLE_ORDERNR=\"K1\"/>") else {
+        unreachable!("a file ending inside the root was taken")
+    };
+    assert!(err.to_string().contains("ends inside an element"), "{err}");
+    assert!(part_xml("<partsmanagement><part P_ARTICLE_ORDERNR=\"K1\" bad></partsmanagement>").is_err());
+    Ok(())
+}
+
+#[test]
+fn file_kinds_ignore_the_case_of_the_extension_and_folders_are_not_counted() -> TestResult {
+    let mut z = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let opts = zip::write::SimpleFileOptions::default();
+    z.add_directory("ITEMS/", opts)?;
+    for (name, data) in [
+        ("ITEMS/PARTS.XML", PARTS.as_bytes()),
+        ("ITEMS/PHOTO.JPEG", b"\xFF\xD8".as_slice()),
+        ("ITEMS/drawing.Svg", b"<svg/>".as_slice()),
+        ("ITEMS/noextension", b"x".as_slice()),
+    ] {
+        z.start_file(name, opts)?;
+        z.write_all(data)?;
+    }
+    let edz = z.finish()?.into_inner();
+    let (parts, report, _) = read(&edz)?;
+    assert_eq!(parts.len(), 2);
+    assert_eq!((report.part_files, report.pictures, report.other), (1, 2, 1));
+    Ok(())
+}
+
+#[test]
+fn macro_names_are_matched_without_their_folder_variable_and_case() {
+    assert_eq!(macro_file_name(" $(MD_MACROS)\\SIE\\3RT2015.EMA "), "3rt2015.ema");
+    assert_eq!(macro_file_name("plain.ema"), "plain.ema");
+    assert_eq!(macro_path("$(MD_MACROS)\\SIE\\3RT2015.ema"), "sie/3rt2015.ema");
+    assert_eq!(macro_path("/items/Macros/X.ema"), "items/macros/x.ema");
+    assert_eq!(
+        macro_path("$(unclosed\\x.ema"),
+        "",
+        "a variable without its end leaves nothing"
+    );
+    assert_eq!(
+        macro_keys("SIE\\Coil"),
+        ["sie\\coil", "coil", "coil", "coil.ema"].map(String::from)
+    );
+}
+
+#[test]
+fn of_several_macros_sharing_a_file_name_only_one_matching_path_is_taken() {
+    let one = [("anything/x.ema".to_owned(), 1)];
+    assert_eq!(
+        by_path("elsewhere\\x.ema", &one),
+        Some(&1),
+        "the only one is taken whatever its path"
+    );
+    let several = [
+        ("items/sie/x.ema".to_owned(), 1),
+        ("items/rit/x.ema".to_owned(), 2),
+        ("items/xsie/x.ema".to_owned(), 3),
+    ];
+    assert_eq!(by_path("$(MD_MACROS)\\RIT\\X", &several), Some(&2), "without .ema too");
+    // `sie/x.ema` is matched at a folder boundary, so `xsie/x.ema` is no second hit.
+    assert_eq!(by_path("SIE\\x.ema", &several), Some(&1));
+    assert_eq!(by_path("x.ema", &several), None, "every one matches: none is picked");
+    assert_eq!(by_path("phx\\x.ema", &several), None);
+}
+
+#[test]
+fn a_parts_own_macro_wins_over_its_group_symbol_macro_in_a_symbol_map() -> TestResult {
+    let xml = r#"<partsmanagement>
+  <part P_ARTICLE_MANUFACTURER="ACME" P_ARTICLE_ORDERNR="BOTH" P_ARTICLE_MACRO="own.ema" P_ARTICLE_GROUPSYMBOLMACRO="group.ema"/>
+  <part P_ARTICLE_MANUFACTURER="ACME" P_ARTICLE_ORDERNR="GROUP" P_ARTICLE_MACRO="unmapped.ema" P_ARTICLE_GROUPSYMBOLMACRO="group.ema"/>
+</partsmanagement>"#;
+    let edz = zip(&[("parts.xml", xml.as_bytes())])?;
+    let (mut parts, mut report, _) = read(&edz)?;
+    let map = BTreeMap::from([
+        (" OWN ".to_owned(), "wc.own".to_owned()),
+        ("group".to_owned(), "wc.group".to_owned()),
+    ]);
+    assert_eq!(apply_symbol_map(&mut parts, &map, &mut report), 2);
+    let (both, group) = (Part::make_id("ACME", "BOTH"), Part::make_id("ACME", "GROUP"));
+    let symbol = |id: &str| parts.iter().find(|p| p.id == id).and_then(|p| p.symbol.as_deref());
+    assert_eq!(symbol(&both), Some("wc.own"));
+    assert_eq!(
+        symbol(&group),
+        Some("wc.group"),
+        "the group macro is tried when the own one is not mapped"
+    );
+    // Only the macro that gave the symbol reports it.
+    let reported: Vec<(&str, &str, Option<&str>)> = report
+        .part_macros
+        .iter()
+        .map(|m| (m.part.as_str(), m.name.as_str(), m.symbol.as_deref()))
+        .collect();
+    assert_eq!(
+        reported,
+        [
+            (both.as_str(), "own.ema", Some("wc.own")),
+            (both.as_str(), "group.ema", None),
+            (group.as_str(), "unmapped.ema", None),
+            (group.as_str(), "group.ema", Some("wc.group")),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn the_report_lines_name_left_out_content_and_skipped_files() {
+    let report = Report {
+        parts: 0,
+        part_files: 0,
+        left_out: BTreeMap::from([("arcs".to_owned(), 2), ("texts".to_owned(), 5)]),
+        too_large: 3,
+        ..Report::default()
+    };
+    assert_eq!(
+        report.lines(),
+        [
+            "0 part(s) from 0 part file(s)",
+            "left out of the macros' symbols: 2 arcs",
+            "left out of the macros' symbols: 5 texts",
+            "3 XML or macro file(s) over the size limit: skipped",
+        ]
+    );
+}
+
+#[test]
+fn language_names_are_recognised_by_shape() {
+    assert_eq!(pick_language("zh_Hans@接触器;en@Contactor;"), "Contactor");
+    assert_eq!(pick_language("fr@Contacteur;"), "Contacteur");
+    // Not a language name: kept as it is.
+    assert_eq!(pick_language("english@Contactor;"), "english@Contactor;");
+    assert_eq!(pick_language("de_DE@Schütz;x1@y;"), "de_DE@Schütz;x1@y;");
+    assert_eq!(pick_language("  ;  "), ";", "no text: the value trimmed");
+}

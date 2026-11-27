@@ -260,4 +260,103 @@ mod tests {
         assert_eq!(Decoding::name(31), "code page 31");
         assert_eq!(Decoding::name(29), "Windows-1251");
     }
+
+    /// The page numbers of [`table`], in order.
+    const PAGES: [u16; 11] = [2, 28, 29, 30, 32, 33, 34, 35, 36, 37, 44];
+
+    #[test]
+    fn only_the_listed_pages_are_known_and_each_has_its_own_name() {
+        for n in 0..=u16::MAX {
+            let (d, known) = Decoding::of(n);
+            if PAGES.contains(&n) {
+                assert_eq!((d, known), (Decoding::Page(n), true), "page {n}");
+                assert!(!Decoding::name(n).starts_with("code page"), "page {n}");
+            } else {
+                assert_eq!(d, Decoding::Legacy, "page {n}");
+                assert_eq!(known, n <= 1, "page {n}");
+                assert_eq!(Decoding::name(n), format!("code page {n}"));
+            }
+        }
+        let names: std::collections::BTreeSet<String> = PAGES.iter().map(|&n| Decoding::name(n)).collect();
+        assert_eq!(names.len(), PAGES.len());
+    }
+
+    #[test]
+    fn ascii_and_empty_texts_are_the_same_in_every_page() {
+        let ascii: Vec<u8> = (0..0x80).collect();
+        let want: String = ascii.iter().map(|&b| char::from(b)).collect();
+        for n in PAGES {
+            let d = Decoding::Page(n);
+            assert_eq!(d.decode(&ascii), want, "page {n}");
+            assert_eq!(d.decode(&[]), "", "page {n}");
+        }
+        assert_eq!(Decoding::Legacy.decode(&ascii), want);
+        assert_eq!(Decoding::Legacy.decode(&[]), "");
+    }
+
+    #[test]
+    fn every_byte_gives_one_character_and_gaps_keep_their_byte() {
+        for n in PAGES {
+            let Some((upper, _)) = table(n) else { unreachable!() };
+            for (i, &u) in upper.iter().enumerate() {
+                let b = 0x80 + i as u8;
+                let got: Vec<char> = Decoding::Page(n).decode(&[b]).chars().collect();
+                let want = if u == 0xFFFD {
+                    char::from(b)
+                } else {
+                    char::from_u32(u32::from(u)).unwrap_or('?')
+                };
+                assert_eq!(got, [want], "page {n} byte {b:#04X}");
+            }
+        }
+    }
+
+    #[test]
+    fn no_two_bytes_of_a_page_decode_alike() {
+        // Names differing in one byte must stay apart, also where a byte is a gap of its page.
+        for n in PAGES {
+            let mut seen = std::collections::BTreeMap::new();
+            for b in 0..=u8::MAX {
+                let text = Decoding::Page(n).decode(&[b]);
+                let first = seen.insert(text.clone(), b);
+                assert_eq!(
+                    first, None,
+                    "page {n}: byte {b:#04X} reads {text:?} like an earlier byte"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn iso_8859_1_is_the_first_256_code_points() {
+        let all: Vec<u8> = (0..=u8::MAX).collect();
+        let want: String = all.iter().map(|&b| char::from(b)).collect();
+        assert_eq!(Decoding::Page(2).decode(&all), want);
+    }
+
+    #[test]
+    fn the_legacy_decoder_keeps_utf8_drops_a_bom_and_falls_back_to_windows_1252() {
+        let d = Decoding::of(1).0;
+        assert_eq!(d, Decoding::Legacy);
+        assert_eq!(d.decode("Relé K1".as_bytes()), "Relé K1");
+        assert_eq!(d.decode(b"\xEF\xBB\xBFK1"), "K1");
+        // Not UTF-8: read as Windows-1252, byte for byte.
+        assert_eq!(d.decode(&[b'K', 0x80, 0xE9]), "K\u{20AC}é");
+        assert_eq!(d.decode(&[0x80, 0xE9]), Decoding::Page(30).decode(&[0x80, 0xE9]));
+    }
+
+    #[test]
+    fn a_page_number_without_a_table_decodes_as_legacy() {
+        for bytes in [&b"K1"[..], "Relé".as_bytes(), &[0x80, 0xE9]] {
+            assert_eq!(Decoding::Page(31).decode(bytes), Decoding::Legacy.decode(bytes));
+            assert_eq!(Decoding::Page(u16::MAX).decode(bytes), Decoding::Legacy.decode(bytes));
+        }
+    }
+
+    #[test]
+    fn a_single_byte_page_does_not_read_utf8() {
+        // "é" as UTF-8 is two bytes, read one by one by a code page.
+        assert_eq!(Decoding::Page(30).decode("é".as_bytes()), "Ã©");
+        assert_eq!(Decoding::Page(29).decode("é".as_bytes()), "Г©");
+    }
 }
