@@ -3884,7 +3884,7 @@ fn run(mut cli: Cli) -> Res<()> {
                 d.part = (!part.is_empty()).then_some(part);
             }
             if let Some(desc) = description {
-                d.description = desc;
+                d.set_description(&desc);
             }
             save(dir, &p)?;
         }
@@ -7315,6 +7315,14 @@ mod tests {
         cli(&dir, &["device", "-K9", "--description", "Spare"]).unwrap();
         let p = load(&dir).unwrap();
         assert_eq!(p.devices[&DeviceTag::parse("-K9").unwrap()].description, "Spare");
+
+        // The spaces around a description go, and a blank one clears it.
+        cli(&dir, &["device", "-K9", "--description", "  Spare pump "]).unwrap();
+        let p = load(&dir).unwrap();
+        assert_eq!(p.devices[&DeviceTag::parse("-K9").unwrap()].description, "Spare pump");
+        cli(&dir, &["device", "-K9", "--description", "   "]).unwrap();
+        let p = load(&dir).unwrap();
+        assert_eq!(p.devices[&DeviceTag::parse("-K9").unwrap()].description, "");
     }
 
     #[test]
