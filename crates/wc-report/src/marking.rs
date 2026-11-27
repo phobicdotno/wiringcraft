@@ -381,10 +381,13 @@ pub fn marking_list_with(i: &Inputs<'_>, o: &MarkingOptions) -> Table {
         }
     }
 
+    // Cables named on wires of schematic pages: an overview repeats the schematic's wiring,
+    // so a cable named only there is no cable of the project (as in the cable list).
     let cables: BTreeSet<DeviceTag> = i
         .project
         .pages
         .iter()
+        .filter(|pg| !pg.overview)
         .flat_map(|p| p.wires.iter())
         .filter_map(|w| w.cable.as_ref().map(|c| c.cable.clone()))
         .collect();

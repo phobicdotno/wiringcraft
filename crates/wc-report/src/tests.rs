@@ -1840,6 +1840,36 @@ fn a_numbered_wire_repeated_on_an_overview_gets_no_extra_markers() {
 }
 
 #[test]
+fn a_cable_named_only_on_an_overview_gets_no_markers() {
+    let (mut p, s, parts) = fixture();
+    // A line diagram names cables on its wires: -W8, and -P1, which the schematic draws as a lamp.
+    let mut overview = Page::new("ov", "9", "Line diagram");
+    overview.overview = true;
+    overview.symbols = vec![
+        place("o1", "term", 10.0, Some("-X1.1")),
+        place("o2", "lamp", 40.0, Some("-P1")),
+    ];
+    for (id, cable) in [("o3", "-W8"), ("o4", "-P1")] {
+        let mut w = wire(id, pin("o1", "2"), pin("o2", "X1"), None, None);
+        w.cable = Some(wc_core::CableCore {
+            cable: DeviceTag::parse(cable).unwrap(),
+            core: "1".into(),
+        });
+        overview.wires.push(w);
+    }
+    p.pages.push(overview);
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let t = marking_list(&i, &[MarkerKind::Cables, MarkerKind::Devices]);
+    let rows: Vec<String> = t.rows.iter().map(|r| r.join("|")).collect();
+    assert!(!t.rows.iter().any(|r| r[0] == "Cable"), "{rows:?}");
+    assert!(rows.contains(&"Device||-P1|1".to_owned()), "{rows:?}");
+}
+
+#[test]
 fn formula_warnings_check_every_marker_line_and_free_marker_texts() {
     let (mut p, s, parts) = fixture();
     p.pages[0].wires[0].number = Some("=1".into());
