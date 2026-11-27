@@ -2,15 +2,31 @@
 //!
 //! ```text
 //! my-project/
-//!   project.toml            name, title block, library sources
-//!   devices.json            device tag -> part and properties
+//!   project.toml            name, format version, title block, library sources and settings
+//!   devices.json            device tag -> part, description and properties
 //!   library.lock            exact version of every library item in use
 //!   pages/<id>.page.json    one file per page
-//!   vendor/symbols/<id>.json  copies of the library items in use
-//!   vendor/parts/<id>.json
 //!   panels/<id>.panel.json  cabinet panel layouts
 //!   comments/<page id>.comments.json  review comments on a page
+//!   vendor/symbols/<id>.json  copies of the library symbols in use
+//!   vendor/parts/<id>.json    copies of the library parts in use
+//!   macros/<id>.json        the project's own macros ([`crate::macros`])
+//!   translations.toml       translation dictionary ([`crate::translate`])
+//!   pictures/               the logo and other pictures ([`crate::Logo::DIR`])
+//!   underlays/              pictures drawn under a page ([`crate::Underlay::DIR`])
 //! ```
+//!
+//! `project.toml` holds `name`, `format_version`, `[title_block]` and the `[[library]]`
+//! sources, then one table or key per kind of project setting: `[[location]]`, `[[jumper]]`,
+//! `[[strip]]`, `[logo]`, `[template]`, `[[revision]]`, `[[report]]`, `[[rule]]`, `rules_off`,
+//! `[[rack]]` and `[[network]]` (see [`ProjectMeta`]). A setting that would be empty, or a
+//! `[template]` that is the built-in one, is left out.
+//!
+//! This module reads and writes `project.toml`, `devices.json`, `library.lock`, pages, panels,
+//! comments and `vendor/`. Macros and the translation dictionary are read and written by their
+//! own modules, with the same write helpers. Only `project.toml` is needed: a missing
+//! `devices.json` or `library.lock` reads as empty, and a missing folder as one with nothing in
+//! it. `docs/project-format.md` in the repository is the full reference for the format.
 //!
 //! Every file is written deterministically (sorted keys, fixed indentation, trailing newline),
 //! atomically (temporary file, then rename) and only when its content changed, so version
