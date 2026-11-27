@@ -125,10 +125,30 @@ pub fn records(text: &str, delim: char) -> Rows {
     out
 }
 
+/// How often `delim` appears in the header record of `text` outside double-quoted text, so a
+/// `;` inside a quoted header such as `"Notes; one; two"` does not make `;` look like the
+/// separator. The header ends at the first line break outside quotes, so a quoted header text
+/// that runs over a line break keeps the rest of the header in the count.
+pub(crate) fn count_unquoted(text: &str, delim: char) -> usize {
+    let mut quoted = false;
+    let mut count = 0;
+    for c in text.chars() {
+        if c == '"' {
+            quoted = !quoted;
+        } else if !quoted && (c == '\n' || c == '\r') {
+            break;
+        } else if c == delim && !quoted {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// The separator a header uses: the one it holds most often outside double-quoted text.
 fn guess_delimiter(header: &str) -> char {
     [';', '\t', ',', '|']
         .into_iter()
-        .max_by_key(|d| header.matches(*d).count())
+        .max_by_key(|d| count_unquoted(header, *d))
         .unwrap_or(',')
 }
 
@@ -618,6 +638,45 @@ mod tests {
         );
         // A byte Windows-1252 has no character for keeps its value; Latin-1 letters stay as they are.
         assert_eq!(decode(b"\x81\xe6\xf8\xe5"), "\u{81}\u{e6}\u{f8}\u{e5}");
+        Ok(())
+    }
+
+    #[test]
+    fn separators_inside_quoted_header_text_do_not_set_the_separator() -> Result<()> {
+        let text = "Manufacturer,Order number,\"Notes; one; two; three\"\r\nABB,1SBL,\"a; b\"\r\n";
+        assert_eq!(
+            guess_delimiter("Manufacturer,Order number,\"Notes; one; two; three\""),
+            ','
+        );
+        assert_eq!(kind(text), Some(CsvKind::Parts));
+        let (parts, warnings) = parts(text)?;
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let [p] = parts.as_slice() else {
+            unreachable!("one part: {parts:?}");
+        };
+        assert_eq!(p.manufacturer, "ABB");
+        assert_eq!(p.order_number, "1SBL");
+        assert_eq!(
+            p.properties.get("Notes; one; two; three").map(String::as_str),
+            Some("a; b")
+        );
+        let Ok(rows) = file_rows(text.as_bytes()) else {
+            unreachable!("the list reads");
+        };
+        assert_eq!(rows[0], ["Manufacturer", "Order number", "Notes; one; two; three"]);
+        // A PLC address list the same way.
+        let (rows, warnings) = plc_addresses("Device,Address,\"Comment; a; b; c\"\n-K1,%I0.0,\"x; y\"\n")?;
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(rows.len(), 1);
+        // A semicolon list with commas in a quoted header stays a semicolon list.
+        assert_eq!(
+            guess_delimiter("Manufacturer;Order number;\"Notes, one, two, three\""),
+            ';'
+        );
+        // A doubled quote inside quoted text keeps the text quoted.
+        assert_eq!(count_unquoted("a,\"b \"\"c; d\"\" ; e\",f", ';'), 0);
+        // The count stops at the header's end, past a quoted line break.
+        assert_eq!(count_unquoted("\"a\nb\";c;d\ne;f;g;h", ';'), 2);
         Ok(())
     }
 
