@@ -111,11 +111,17 @@ fn git(args: &[&str], cwd: Option<&Path>, name: &str) -> Result<()> {
     }
 }
 
-pub(crate) fn sync_one(project_dir: &Path, s: &LibrarySource) -> Result<String> {
-    sync_one_in(project_dir, s, cache_root().as_deref())
+/// Sync every source in order, one outcome each, going on past a source that fails.
+pub(crate) fn sync_all(project_dir: &Path, sources: &[LibrarySource]) -> Vec<Result<String>> {
+    sync_all_in(project_dir, sources, cache_root().as_deref())
 }
 
-/// [`sync_one`] with the git cache folder given instead of read from the environment.
+/// [`sync_all`] with the git cache folder given instead of read from the environment.
+fn sync_all_in(project_dir: &Path, sources: &[LibrarySource], cache: Option<&Path>) -> Vec<Result<String>> {
+    sources.iter().map(|s| sync_one_in(project_dir, s, cache)).collect()
+}
+
+/// Sync one source, with the git cache folder given instead of read from the environment.
 fn sync_one_in(project_dir: &Path, s: &LibrarySource, cache: Option<&Path>) -> Result<String> {
     match s.kind.as_str() {
         "folder" => {

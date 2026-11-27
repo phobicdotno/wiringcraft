@@ -254,14 +254,10 @@ pub struct SearchHit {
 }
 
 /// Fetch or refresh every git source into the local cache. Folder sources need nothing.
-/// Returns one line of outcome per source.
-pub fn sync(project_dir: &Path, project: &Project) -> Result<Vec<String>> {
-    project
-        .meta
-        .libraries
-        .iter()
-        .map(|s| source::sync_one(project_dir, s))
-        .collect()
+/// Returns one outcome per source, in the project's order: a source that fails (an
+/// unreachable remote, say) does not stop the ones after it from being synced.
+pub fn sync(project_dir: &Path, project: &Project) -> Vec<Result<String>> {
+    source::sync_all(project_dir, &project.meta.libraries)
 }
 
 /// How a project's pinned item compares to the library.

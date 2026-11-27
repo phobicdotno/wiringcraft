@@ -35,6 +35,13 @@ fn commit_file(repo: &Path, text: &str) -> Result<()> {
     run_git(repo, &["commit", "-q", "-m", text])
 }
 
+/// One source synced through [`sync_all`], as the project's sync does it.
+fn sync_one(project_dir: &Path, s: &LibrarySource) -> Result<String> {
+    let mut outcomes = sync_all(project_dir, std::slice::from_ref(s));
+    assert_eq!(outcomes.len(), 1);
+    outcomes.pop().unwrap_or_else(|| unreachable!())
+}
+
 fn read(path: &Path) -> Result<String> {
     std::fs::read_to_string(path).map_err(io)
 }
@@ -165,5 +172,38 @@ fn git_source_follows_a_changed_location() -> Result<()> {
     // The user points the source at another repository: the next sync takes that one.
     assert_eq!(sync(&new)?, format!("lib: updated from {}", new.display()));
     assert_eq!(read(&cache.join("git/lib/lib.txt"))?, "new");
+    Ok(())
+}
+
+#[test]
+fn a_failing_source_does_not_stop_the_ones_after_it() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(io)?;
+    let cache = tmp.path().join("cache");
+    let upstream = tmp.path().join("upstream");
+    std::fs::create_dir(&upstream).map_err(io)?;
+    run_git(&upstream, &["init", "-q", "-b", "main"])?;
+    commit_file(&upstream, "v1")?;
+    let loc = upstream.to_string_lossy().into_owned();
+    let missing = tmp.path().join("no-such-repo").to_string_lossy().into_owned();
+    let sources = [
+        src("gone", "git", &missing, None),
+        src("odd", "ftp", "somewhere", None),
+        src("good", "git", &loc, None),
+    ];
+
+    let outcomes = sync_all_in(tmp.path(), &sources, Some(&cache));
+    assert_eq!(outcomes.len(), 3);
+    let mut outcomes = outcomes.into_iter();
+    let (name, _) = source_message(outcomes.next().unwrap_or_else(|| unreachable!()));
+    assert_eq!(name, "gone");
+    let (name, message) = source_message(outcomes.next().unwrap_or_else(|| unreachable!()));
+    assert_eq!(name, "odd");
+    assert!(message.contains("\"ftp\""), "{message}");
+    // The source after the failing ones is still cloned.
+    assert_eq!(
+        outcomes.next().unwrap_or_else(|| unreachable!())?,
+        format!("good: cloned {loc}")
+    );
+    assert_eq!(read(&cache.join("git/good/lib.txt"))?, "v1");
     Ok(())
 }

@@ -4256,8 +4256,20 @@ fn lib_cmd(dir: &Path, lc: LibCmd) -> Res<()> {
             save(dir, &p)?;
         }
         LibCmd::Sync => {
-            for line in wc_library::sync(dir, &p).map_err(e)? {
-                println!("{line}");
+            let outcomes = wc_library::sync(dir, &p);
+            let total = outcomes.len();
+            let mut failed = 0;
+            for outcome in outcomes {
+                match outcome {
+                    Ok(line) => println!("{line}"),
+                    Err(err) => {
+                        failed += 1;
+                        eprintln!("{err}");
+                    }
+                }
+            }
+            if failed > 0 {
+                return Err(format!("{failed} of {total} library sources could not be synced"));
             }
         }
         LibCmd::Status => {
