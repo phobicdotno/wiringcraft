@@ -2826,6 +2826,30 @@ fn plc_card_sheets_move_to_a_larger_sheet_and_fit_their_fields() {
 }
 
 #[test]
+fn a_very_long_heading_is_cut_quickly_and_keeps_its_counter() {
+    let title = "Cable list for the north basin pump station ".repeat(2_300);
+    let title = format!("{}\u{e9}", &title[..99_999]);
+    assert_eq!(title.chars().count(), 100_000);
+    let counter = " (2 / 3)";
+    let heading = layout::fit_heading(&title, counter, 180.0);
+    assert!(heading.ends_with(&format!("...{counter}")), "{heading:?}");
+    assert!(writer::text_width_mm(&heading, 4.0) <= 180.0, "{heading:?}");
+    // The cut is the longest start that fits: one more character would not.
+    let Some(kept) = heading.strip_suffix(&format!("...{counter}")) else {
+        unreachable!("the heading ends with the counter")
+    };
+    let Some(next) = title[kept.len()..].chars().next() else {
+        unreachable!("the title was cut")
+    };
+    let longer = format!("{kept}{next}...{counter}");
+    assert!(writer::text_width_mm(&longer, 4.0) > 180.0, "{longer:?}");
+    // A short heading is left as it is.
+    assert_eq!(layout::fit_heading("Cables", counter, 180.0), "Cables (2 / 3)");
+    // No room at all for the title leaves only "..." before the counter.
+    assert_eq!(layout::fit_heading(&title, counter, 1.0), format!("...{counter}"));
+}
+
+#[test]
 fn a_dimension_drawn_by_hand_shows_in_pdf_svg_and_dxf() {
     let mut project = Project::new("x");
     let mut page = Page::new("p1", "1", "Cabinet");
