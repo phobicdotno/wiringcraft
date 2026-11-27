@@ -78,7 +78,8 @@ Nothing is pushed to `main`; every change is a pull request.
      `git status --porcelain -- library/symbols`) are gone for good, and uncommitted edits to
      tracked files (` M`) are lost too, since git brings back only the committed version. So
      first commit or move out anything that command lists, or run the check in a separate
-     `git worktree`. Then run
+     `git worktree`. A worktree holds only committed files, so commit your change to
+     `tools/gen_starter_symbols.py` first, or the check runs the old generator. Then run
      `rm -f library/symbols/*.json`, then `python3 tools/gen_starter_symbols.py`, and check that
      `git status -- library/symbols` shows no change. This is what CI does: deleting the files
      first makes a symbol file the generator no longer writes show as deleted, which fails the check.
