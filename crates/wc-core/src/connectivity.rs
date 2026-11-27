@@ -122,7 +122,9 @@ fn on_segment(p: Point, a: Point, b: Point) -> bool {
     const EPS: f64 = 0.01;
     let (dx, dy) = (b.x - a.x, b.y - a.y);
     let len2 = dx * dx + dy * dy;
-    if len2 < EPS * EPS {
+    // Only a zero-length segment is a point: a short one is measured along its length, so the
+    // answer does not depend on which way the wire was drawn.
+    if len2 == 0.0 {
         return (p.x - a.x).hypot(p.y - a.y) < EPS;
     }
     let t = (((p.x - a.x) * dx + (p.y - a.y) * dy) / len2).clamp(0.0, 1.0);
@@ -589,6 +591,15 @@ mod tests {
             .collect();
         pins.sort();
         assert_eq!(pins, [vec!["s1", "s2"], vec!["s3", "s4", "s5"], vec!["s6"]]);
+    }
+
+    #[test]
+    fn a_short_segment_is_measured_the_same_both_ways() {
+        let (a, b, p) = (Point::new(0.0, 0.0), Point::new(0.009, 0.0), Point::new(0.018, 0.0));
+        assert!(on_segment(p, a, b));
+        assert!(on_segment(p, b, a));
+        assert!(on_segment(a, a, a));
+        assert!(!on_segment(Point::new(0.03, 0.0), a, b));
     }
 
     #[test]
