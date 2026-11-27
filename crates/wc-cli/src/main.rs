@@ -5092,13 +5092,19 @@ fn vcs_cmd(dir: &Path, vc: VcsCmd) -> Res<()> {
             }
         }
         VcsCmd::Log { svg, limit } => {
-            let rows = wc_vcs::history(&git, limit).map_err(e)?;
+            let mut rows = wc_vcs::history(&git, limit).map_err(e)?;
             match svg {
                 Some(path) => {
                     write_out(dir, &path, wc_vcs::subway_svg(&rows)).map_err(e)?;
                     println!("wrote {}", path.display());
                 }
-                None => print!("{}", wc_vcs::subway_text(&rows)),
+                None => {
+                    // A commit subject from git can hold ESC or other control characters.
+                    for r in &mut rows {
+                        r.commit.subject = escape_field(&r.commit.subject);
+                    }
+                    print!("{}", wc_vcs::subway_text(&rows));
+                }
             }
         }
         VcsCmd::Changes { from, to } => {
@@ -5123,8 +5129,9 @@ fn vcs_cmd(dir: &Path, vc: VcsCmd) -> Res<()> {
                     "{}  {}  {}  {}",
                     &v.commit[..v.commit.len().min(10)],
                     &utc_date(v.time)[..10],
-                    v.author,
-                    v.subject
+                    // Both come from git and can hold ESC or other control characters.
+                    escape_field(&v.author),
+                    escape_field(&v.subject)
                 );
                 for c in &v.changes {
                     println!("    {}", change_line(c));
