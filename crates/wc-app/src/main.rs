@@ -113,6 +113,9 @@ enum Dialog {
         title: String,
         size: PageSize,
         kind: state::PageKind,
+        /// The page type as the dialog opened: an unchanged choice keeps the type the page has
+        /// by then, so a graphic mark set meanwhile is not undone.
+        kind_loaded: state::PageKind,
         /// The page's own title-block fields, key and value, as the form shows them; a blank
         /// value shows the project's as a hint and is not stored.
         fields: Vec<(String, String)>,
@@ -2124,6 +2127,7 @@ impl App {
                         title: p.title.clone(),
                         size: p.size,
                         kind: state::PageKind::of(p),
+                        kind_loaded: state::PageKind::of(p),
                         fields: own_fields(p),
                         loaded: own_fields(p),
                         error: None,
@@ -3475,6 +3479,7 @@ impl App {
                     title,
                     size,
                     kind,
+                    kind_loaded,
                     fields,
                     loaded,
                     error,
@@ -3556,7 +3561,16 @@ impl App {
                             && let Some(o) = self.open.as_mut()
                         {
                             let own = changed_fields(loaded, fields);
-                            match confirm_page_props(o, &self.ed, id, number, title, *size, *kind, &own)
+                            match confirm_page_props(
+                                o,
+                                &self.ed,
+                                id,
+                                number,
+                                title,
+                                *size,
+                                (*kind != *kind_loaded).then_some(*kind),
+                                &own,
+                            )
                             {
                                 Ok(i) => {
                                     self.ed.page = i;
@@ -6840,7 +6854,8 @@ fn confirm_page_props(
     number: &str,
     title: &str,
     size: wc_core::PageSize,
-    kind: state::PageKind,
+    // `None`: the type was not changed in the dialog, and the page keeps the one it has now.
+    kind: Option<state::PageKind>,
     fields: &std::collections::BTreeMap<String, String>,
 ) -> Result<usize, String> {
     let i = o
@@ -6854,6 +6869,7 @@ fn confirm_page_props(
             "{name} has this page open; it is read-only here until they leave it."
         ));
     }
+    let kind = kind.unwrap_or_else(|| state::PageKind::of(&o.project.pages[i]));
     o.set_page_props(i, number, title, size, kind, Some(fields))
 }
 

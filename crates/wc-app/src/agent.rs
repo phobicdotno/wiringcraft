@@ -438,7 +438,7 @@ pub fn specs() -> Vec<Value> {
         tool(
             "edit_page_json",
             "Replace a whole page with new content in the page file format (as get_page returns it, without the extra pin and point fields). For bulk edits the other tools cannot do. The page id stays.",
-            json!({"page": page_arg(), "content": {"type": "object", "description": "The page: number, title, size, overview (true for a line diagram; leaving it out makes a normal page), cover (true for the cover page; leaving it out keeps the page's current value), title_block (the page's own title-block fields such as revision and date, which win over the project's; leaving it out keeps the page's current ones), symbols, wires, graphics, underlay."}}),
+            json!({"page": page_arg(), "content": {"type": "object", "description": "The page: number, title, size, overview (true for a line diagram; leaving it out makes a normal page), graphic (true for a graphic page, which holds no symbols or wires; leaving it out keeps the page's current value), cover (true for the cover page; leaving it out keeps the page's current value), title_block (the page's own title-block fields such as revision and date, which win over the project's; leaving it out keeps the page's current ones), symbols, wires, graphics, underlay."}}),
             &["content"],
         ),
         tool(
@@ -2045,7 +2045,21 @@ impl App {
                     let own = open.project.pages.get(page).and_then(|p| p.revision_table);
                     content["revision_table"] = json!(own);
                 }
+                // Nor does one without `graphic` unmark a graphic page.
+                if content.get("graphic").is_none() {
+                    let own = open.project.pages.get(page).is_some_and(|p| p.graphic);
+                    content["graphic"] = json!(own);
+                }
                 let new: Page = serde_json::from_value(content).map_err(|e| format!("Not a page: {e}"))?;
+                if new.graphic && new.overview {
+                    return Err("A page cannot be both a graphic page and a line diagram.".into());
+                }
+                if new.graphic && !(new.symbols.is_empty() && new.wires.is_empty()) {
+                    return Err(format!(
+                        "Page {} is a graphic page, which holds drawings only; remove its symbols and wires first.",
+                        new.number
+                    ));
+                }
                 open.ensure_page_symbols(&new)?;
                 open.checkpoint();
                 for s in &new.symbols {
@@ -7068,7 +7082,7 @@ mod tests {
             "99",
             "Renamed",
             schematic.size,
-            PageKind::Schematic,
+            Some(PageKind::Schematic),
             &Default::default(),
         );
         assert!(refused.is_err_and(|e| e.contains("Ola")));
@@ -10160,6 +10174,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(page2(&a).graphics, vec![line(5.0)]);
+    }
+
+    #[test]
+    fn edit_page_json_keeps_a_graphic_page_free_of_symbols_and_wires() {
+        let (_tmp, mut a) = app(vec![]);
+        {
+            let pg = &mut a.open.as_mut().unwrap().project.pages[1];
+            pg.symbols.clear();
+            pg.wires.clear();
+            pg.graphic = true;
+        }
+        let mut content: Value =
+            serde_json::from_str(&call(&mut a, "get_page", json!({"page": "p0002"})).unwrap()).unwrap();
+        // Left out, `graphic` keeps the mark; a wire on the graphic page is refused.
+        content.as_object_mut().unwrap().remove("graphic");
+        content["wires"] =
+            json!([{"id": "w1", "from": {"at": {"x": 0.0, "y": 0.0}}, "to": {"at": {"x": 10.0, "y": 0.0}}}]);
+        let err = call(
+            &mut a,
+            "edit_page_json",
+            json!({"page": "p0002", "content": content.clone()}),
+        )
+        .unwrap_err();
+        assert!(err.contains("graphic page"), "{err}");
+        assert!(page2(&a).wires.is_empty() && page2(&a).graphic);
+        // Drawings only are taken, and the page stays graphic.
+        content["wires"] = json!([]);
+        content["title"] = json!("Layout");
+        call(&mut a, "edit_page_json", json!({"page": "p0002", "content": content})).unwrap();
+        assert!(page2(&a).graphic);
+        assert_eq!(page2(&a).title, "Layout");
+        // A page properties dialog opened before the mark, its type left as it was, keeps it.
+        let size = page2(&a).size;
+        let o = a.open.as_mut().unwrap();
+        crate::confirm_page_props(o, &a.ed, "p0002", "2", "Layout", size, None, &Default::default()).unwrap();
+        assert!(page2(&a).graphic, "an unchanged type keeps the page's mark");
     }
 
     #[test]
