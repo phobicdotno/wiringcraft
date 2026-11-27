@@ -316,7 +316,8 @@ pub enum Lead<'a> {
     Dot(egui::Color32),
 }
 
-/// A full-width list row with hover and selection states. Returns the click response.
+/// A full-width list row with hover and selection states. Returns the click response. Text
+/// given a colour keeps it (a muted entry stays muted); other text takes the row's colour.
 pub fn row(ui: &mut egui::Ui, selected: bool, lead: Lead, text: RichText, mono: bool) -> egui::Response {
     let t = Theme::of(ui.ctx());
     let w = ui.available_width();
@@ -355,7 +356,7 @@ pub fn row(ui: &mut egui::Ui, selected: bool, lead: Lead, text: RichText, mono: 
     }
     let color = if selected { t.text } else { t.text.gamma_multiply(0.92) };
     let text = if mono { text.monospace() } else { text };
-    let galley = egui::WidgetText::from(text.color(color)).into_galley(
+    let galley = egui::WidgetText::from(text).into_galley(
         ui,
         Some(egui::TextWrapMode::Truncate),
         r.right() - x - 6.0,
