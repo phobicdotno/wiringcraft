@@ -25,7 +25,10 @@ Versions tab.
 Starting a session saves the project first if it has unsaved changes. The project folder is made
 a git repository if it is not one yet. The **Shared session** window then shows
 "Sharing. Others join at `<address>:<port>`." Give that address to anyone whose network does not
-pass the announcement (see Discovery below).
+pass the announcement (see Discovery below). The address shown is the one this computer uses
+for its default network route, which a guest on another network (a VPN, a second network card)
+may not reach; then give an address of this computer that the guest can reach, with the same
+port. When no address can be found the window shows "this computer" in its place.
 
 The project's vendored symbol and part files and its pictures (the logo, page underlays) are sent
 to each guest that joins. Files that cannot be read are listed in a note, and guests without the
@@ -99,8 +102,12 @@ could not be recorded.
 Undo takes back only your own last change, and only the parts that change touched, so other
 people's work stays. Redo takes back your last undo. The session window's **Changes** list shows
 every change with who made it; **Undo this change** takes back any one of them, whoever made it,
-as long as nobody changed the same parts since. Each undo is a commit of its own. The list keeps
-the last 500 changes.
+as long as nobody changed the same parts since. Even then the host can refuse an undo: when
+someone else has open a page the change touched, when the project would use a symbol or part
+that is not in its library, when the session no longer has the version of a symbol or part it
+would bring back, when wires would end on pins that version does not have, or when another page
+has taken a page number it would give back. The refusal says why. Each undo is a commit of its
+own. The list keeps the last 500 changes.
 
 ## Network and discovery
 
@@ -146,4 +153,6 @@ the last 500 changes.
   session ends on their side.
 - **The host declines a request.** The guest sees "The host declined your request to join."
 
-A guest's copy stays in its folder after the session ends.
+A guest's copy stays in its folder after the session ends. Other people's changes reach the
+open project in the window but are not saved to the copy's folder on their own, and leaving
+does not save them: save the project to keep the latest state in your copy.
