@@ -551,7 +551,8 @@ impl SymbolEditor {
                     self.message = "Give the pin a name first.".into();
                     return;
                 }
-                if self.symbol.pin(&name).is_some() {
+                // Spaces around a name are dropped on save, so `A1 ` is already `A1`.
+                if self.symbol.pins.iter().any(|q| q.name.trim() == name) {
                     self.message = format!("There is already a pin {name}.");
                     return;
                 }
@@ -745,6 +746,12 @@ impl SymbolEditor {
     /// True while a drag is under way.
     pub fn dragging(&self) -> bool {
         self.drag.is_some()
+    }
+
+    /// Whether Enter and Escape are the editor's this frame: a shape is half drawn or a drag
+    /// is under way, and no text field has the keyboard.
+    pub fn wants_escape(&self, ctx: &egui::Context) -> bool {
+        (self.drawing_shape() || self.dragging()) && ctx.memory(|m| m.focused().is_none())
     }
 
     /// Whether `p` is on `item`: within 1.3 mm of a pin, or inside a shape's box made 1 mm
@@ -942,7 +949,7 @@ impl SymbolEditor {
                     }
                 }
                 // Enter ends a polyline, Escape drops the shape being drawn or cancels a drag.
-                if (self.drawing_shape() || self.dragging()) && ctx.memory(|m| m.focused().is_none()) {
+                if self.wants_escape(ctx) {
                     let (enter, escape) =
                         ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
                     if escape && self.dragging() {
@@ -2011,6 +2018,18 @@ mod tests {
         let back: Symbol = serde_json::from_str(&std::fs::read_to_string(&saved.path)?)?;
         assert!(back.pin("A2").is_some(), "{:?}", back.pins);
         Ok(())
+    }
+
+    #[test]
+    fn the_pin_tool_refuses_a_name_that_differs_only_by_spaces() {
+        let mut e = SymbolEditor::new(Vec::new());
+        draw_coil(&mut e);
+        e.symbol.pins[0].name = " A1 ".into();
+        e.set_tool(Tool::Pin);
+        e.pin_name = "A1".into();
+        e.click(Point::new(10.0, 0.0));
+        assert_eq!(e.message, "There is already a pin A1.");
+        assert_eq!(e.symbol.pins.len(), 2);
     }
 
     #[test]

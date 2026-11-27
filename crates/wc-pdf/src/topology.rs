@@ -1764,3 +1764,154 @@ mod tests {
         assert_eq!(keys, ["[1]", "[2]"]);
     }
 }
+
+#[cfg(test)]
+mod walk_tests {
+    use super::*;
+    use wc_core::network::{Link as NetLink, Node};
+
+    fn node(d: &str) -> Node {
+        Node {
+            device: d.into(),
+            ..Node::default()
+        }
+    }
+
+    fn link(a: &str, b: &str) -> NetLink {
+        NetLink {
+            from: a.into(),
+            to: b.into(),
+            ..NetLink::default()
+        }
+    }
+
+    fn net(nodes: &[&str], links: &[(&str, &str)]) -> Network {
+        Network {
+            nodes: nodes.iter().map(|d| node(d)).collect(),
+            links: links.iter().map(|(a, b)| link(a, b)).collect(),
+            ..Network::default()
+        }
+    }
+
+    fn names(t: &Topology) -> Vec<&str> {
+        t.boxes.iter().map(|b| b.0.as_str()).collect()
+    }
+
+    #[test]
+    fn an_empty_network_has_no_boxes() {
+        assert_eq!(layout_network(&Network::default()), Topology::default());
+    }
+
+    #[test]
+    fn a_link_with_an_empty_end_is_unplaced_and_adds_no_box() {
+        let t = layout_network(&net(&[], &[("-A1:P1", ""), ("-A1:P2", "-K1:P1"), ("  ", "-K1:P2")]));
+        assert_eq!(t.unplaced, vec![0, 2]);
+        assert_eq!(names(&t), vec!["-A1", "-K1"]);
+        assert_eq!(t.tree, vec![(0, 1, 1)]);
+        assert!(t.under.is_empty() && t.own.is_empty());
+    }
+
+    #[test]
+    fn a_second_unlinked_part_starts_below_the_first() {
+        // -A1 fans out to two rows; -B1 - -B2 is not linked to it.
+        let t = layout_network(&net(
+            &[],
+            &[("-A1:P1", "-K1:P1"), ("-A1:P2", "-K2:P1"), ("-B1:P1", "-B2:P1")],
+        ));
+        let at = |n: &str| t.boxes.iter().find(|b| b.0 == n).map(|b| (b.1, b.2));
+        assert_eq!(at("-A1"), Some((0, 0)));
+        assert_eq!(at("-K1"), Some((1, 0)));
+        assert_eq!(at("-K2"), Some((1, 1)));
+        // Below the deepest row used so far, in column 0, with its partner beside it.
+        assert_eq!(at("-B1"), Some((0, 2)));
+        assert_eq!(at("-B2"), Some((1, 2)));
+    }
+
+    #[test]
+    fn a_lone_node_gets_its_own_row() {
+        let t = layout_network(&net(&["-A1", "-Z9"], &[("-A1:P1", "-K1:P1")]));
+        let at = |n: &str| t.boxes.iter().find(|b| b.0 == n).map(|b| (b.1, b.2));
+        assert_eq!(at("-A1"), Some((0, 0)));
+        assert_eq!(at("-K1"), Some((1, 0)));
+        assert_eq!(at("-Z9"), Some((0, 1)));
+    }
+
+    #[test]
+    fn a_device_reached_twice_is_joined_under_not_placed_again() {
+        // A diamond: -A1 to -K1 and -K2, both to -T1.
+        let t = layout_network(&net(
+            &[],
+            &[
+                ("-A1:P1", "-K1:P1"),
+                ("-A1:P2", "-K2:P1"),
+                ("-K1:P2", "-T1:P1"),
+                ("-K2:P2", "-T1:P2"),
+            ],
+        ));
+        assert_eq!(names(&t), vec!["-A1", "-K1", "-K2", "-T1"]);
+        assert_eq!(t.tree, vec![(0, 1, 0), (0, 2, 1), (1, 3, 2)]);
+        assert_eq!(t.under, vec![(2, 3, 3)]);
+        assert_eq!(t.boxes.get(3).map(|b| (b.1, b.2)), Some((2, 0)));
+    }
+
+    #[test]
+    fn blank_tag_nodes_keep_a_box_each_shown_by_number() {
+        let t = layout_network(&net(&["", "  ", "-A1"], &[]));
+        assert_eq!(t.boxes.len(), 3);
+        let shown_names: Vec<String> = t.boxes.iter().map(|b| shown(&b.0)).collect();
+        assert_eq!(shown_names, vec!["(node 1)", "(node 2)", "-A1"]);
+    }
+
+    #[test]
+    fn text_holding_the_blank_marker_never_passes_for_a_blank_node() {
+        // A node written as the marker and a digit is text, not node 2.
+        let odd = format!("{BLANK}2");
+        let t = layout_network(&net(&["", &odd], &[]));
+        assert_eq!(t.boxes.len(), 2);
+        let first = t.boxes.first().map(|b| shown(&b.0));
+        let second = t.boxes.get(1).map(|b| shown(&b.0));
+        assert_eq!(first.as_deref(), Some("(node 1)"));
+        assert_eq!(second, Some(odd));
+    }
+
+    #[test]
+    fn a_node_and_a_link_end_with_spaces_are_one_device() {
+        let t = layout_network(&net(&[" -A1 "], &[("-A1:P1", " -K1:P1 ")]));
+        assert_eq!(names(&t), vec!["-A1", "-K1"]);
+        assert_eq!(t.tree, vec![(0, 1, 0)]);
+    }
+
+    #[test]
+    fn a_legend_keeps_the_first_key_of_a_repeated_name() {
+        let mut legend = Legend::default();
+        assert_eq!(legend.key("long one"), "[1]");
+        assert_eq!(legend.key("long two"), "[2]");
+        assert_eq!(legend.key("long one"), "[1]");
+        assert_eq!(legend.0, vec!["long one", "long two"]);
+    }
+
+    #[test]
+    fn a_name_that_fits_is_drawn_whole_and_not_keyed() {
+        let mut legend = Legend::default();
+        assert_eq!(fitted("-K1", 100.0, TEXT, &mut legend), ("-K1".to_owned(), TEXT));
+        // No room at all: keyed, in the smallest type.
+        let (text, size) = fitted("-K1", -5.0, TEXT, &mut legend);
+        assert_eq!(text, "[1]");
+        assert!((size - LABEL_MIN).abs() < 1e-9);
+        assert_eq!(legend.0, vec!["-K1"]);
+    }
+
+    #[test]
+    fn link_labels_are_trimmed_and_empty_parts_leave_no_stray_spaces() {
+        assert_eq!(joined(" P1 ", "P2", " -W1 "), "P1 - P2 -W1");
+        assert_eq!(joined("P1", "P2", ""), "P1 - P2");
+        assert_eq!(joined("", "", ""), "-");
+    }
+
+    #[test]
+    fn a_tag_reason_is_given_only_for_text_that_is_not_a_tag() {
+        assert_eq!(tag_reason(" -K10 "), None);
+        assert!(tag_reason("not a tag!").is_some());
+        assert!(tag_reason("").is_some());
+    }
+}

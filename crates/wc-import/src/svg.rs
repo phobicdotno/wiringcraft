@@ -1,13 +1,14 @@
 //! SVG symbol import. Pins are marked by `id="pin:NAME"`, `data-pin="NAME"` or
 //! `class="pin"` (named by order). One SVG user unit is one millimetre unless the root element
 //! gives a width in an absolute unit (mm, cm, Q, in, pt, pc) together with a viewBox, or a height
-//! in one when the width is missing or a percentage.
+//! in one when the width is missing or a percentage. An absolute width and height together fit
+//! the viewBox into both by `preserveAspectRatio`, as a browser does.
 
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
 use wc_core::geom::{Align, Point, Shape};
 
-use crate::{Error, Result, make_symbol};
+use crate::{Error, Result, make_symbol, printable};
 
 /// 2D affine transform `[a c e; b d f]`.
 #[derive(Debug, Clone, Copy)]
@@ -43,10 +44,26 @@ impl M {
         let [a, b, ..] = self.0;
         (a * a + b * b).sqrt()
     }
+    /// How long a unit up the page comes out: a text's height, which follows the y axis when x
+    /// and y are scaled apart (`preserveAspectRatio="none"`, `scale(2, 1)`).
+    fn y_scale(&self) -> f64 {
+        let [_, _, c, d, ..] = self.0;
+        // hypot: a finite scale near f64::MAX must not overflow by being squared.
+        c.hypot(d)
+    }
     /// Whether a circle stays a circle: x and y are scaled alike and stay at right angles
     /// (turns, mirrors and moves are fine; a `scale(2, 1)` or a skew is not).
     fn keeps_circles(&self) -> bool {
         let [a, b, c, d, ..] = self.0;
+        // Divided by the largest coefficient first, so a finite but huge stretch
+        // (`preserveAspectRatio="none"` over a viewBox 1e-199 high) can't square to infinity
+        // and pass as round. A transform of all zeros stays as it was.
+        let big = a.abs().max(b.abs()).max(c.abs()).max(d.abs());
+        let (a, b, c, d) = if big > 0.0 {
+            (a / big, b / big, c / big, d / big)
+        } else {
+            (a, b, c, d)
+        };
         let (x, y) = (a * a + b * b, c * c + d * d);
         // Relative to the transform's own scale, so a tiny `scale(0.00001 0.00002)` still counts
         // as stretched. A transform that shrinks to nothing leaves a dot either way.
@@ -291,6 +308,29 @@ fn length_mm(v: &str) -> Option<f64> {
     .find_map(|(unit, per)| v.strip_suffix(unit).map(|n| (n, per)))?;
     let mm = n.trim().parse::<f64>().ok()? * per;
     mm.is_finite().then_some(mm)
+}
+
+/// The viewBox `vb` (x, y, width, height) fitted to a root `width` and `height` in millimetres,
+/// as a browser does. With no absolute height the width alone sets the scale. With both,
+/// `preserveAspectRatio` decides: `meet` (the default) takes the smaller scale, `slice` the
+/// larger, and `none` scales each axis on its own. Where the drawing sits inside the box does not
+/// matter here: the symbol is moved to its first pin afterwards.
+fn viewbox_fit(w: f64, h: Option<f64>, vb: [f64; 4], par: &str) -> M {
+    let sx = w / vb[2];
+    let (sx, sy) = match h.filter(|h| *h > 0.0 && vb[3] > 0.0).map(|h| h / vb[3]) {
+        None => (sx, sx),
+        Some(sy) => {
+            let par = par.to_ascii_lowercase();
+            // `defer` matters only for an image, and is passed over here.
+            let mut words = par.split_whitespace().skip_while(|w| *w == "defer");
+            match (words.next(), words.next()) {
+                (Some("none"), _) => (sx, sy),
+                (_, Some("slice")) => (sx.max(sy), sx.max(sy)),
+                _ => (sx.min(sy), sx.min(sy)),
+            }
+        }
+    };
+    M([sx, 0.0, 0.0, sy, -vb[0] * sx, -vb[1] * sy])
 }
 
 fn num(e: &BytesStart, name: &str) -> f64 {
@@ -875,7 +915,7 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
                         pending_text = None;
                         label = Some((shapes.len(), space_after));
                         let f = fonts.last().copied().unwrap_or_default();
-                        let sc = stack.last().copied().unwrap_or(M::ID).scale();
+                        let sc = stack.last().copied().unwrap_or(M::ID).y_scale();
                         shapes.push(Shape::Text {
                             at,
                             text: s,
@@ -925,16 +965,27 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
                 let w = attr(&e, "width");
                 let w = w.as_deref().map(str::trim);
                 let by_height = w.is_none_or(|w| w.ends_with('%') || w.eq_ignore_ascii_case("auto"));
-                let size = if by_height {
-                    attr(&e, "height").and_then(|h| length_mm(&h)).map(|h| (h, 3))
-                } else {
-                    w.and_then(length_mm).map(|w| (w, 2))
+                let hmm = attr(&e, "height").and_then(|h| length_mm(&h));
+                let fit = match vbn[..] {
+                    [x, y, _, vh] if by_height && vh > 0.0 => hmm.map(|h| {
+                        let s = h / vh;
+                        M([s, 0.0, 0.0, s, -x * s, -y * s])
+                    }),
+                    [x, y, vw, vh] if !by_height && vw > 0.0 => w.and_then(length_mm).map(|wmm| {
+                        let par = attr(&e, "preserveAspectRatio").unwrap_or_default();
+                        viewbox_fit(wmm, hmm, [x, y, vw, vh], &par)
+                    }),
+                    _ => None,
                 };
-                if let (Some((mm, i)), 4) = (size, vbn.len())
-                    && vbn[i] > 0.0
-                {
-                    let s = mm / vbn[i];
-                    m = m.mul(&M([s, 0.0, 0.0, s, -vbn[0] * s, -vbn[1] * s]));
+                if let Some(fit) = fit {
+                    if fit.0.iter().any(|v| !v.is_finite()) {
+                        let h = printable(&attr(&e, "height").unwrap_or_default());
+                        let (w, vb) = (printable(w.unwrap_or_default()), printable(&vb));
+                        return Err(Error::Format(format!(
+                            "SVG: width=\"{w}\" height=\"{h}\" viewBox=\"{vb}\" give a size that cannot be drawn"
+                        )));
+                    }
+                    m = m.mul(&fit);
                 }
             }
         }
@@ -1041,18 +1092,7 @@ pub fn symbol_with_warnings(text: &str, id: &str, name: &str) -> Result<(wc_core
                 if let Some(why) = stopped {
                     let which = match attr(&e, "id") {
                         Some(i) => {
-                            // The id is the file's text: control characters (an ESC that would
-                            // drive a terminal) are written as escapes.
-                            let i: String = i
-                                .chars()
-                                .map(|c| {
-                                    if c.is_control() {
-                                        c.escape_default().to_string()
-                                    } else {
-                                        c.to_string()
-                                    }
-                                })
-                                .collect();
+                            let i = printable(&i);
                             format!("path {path_count} (id \"{i}\")")
                         }
                         None => format!("path {path_count}"),
@@ -1269,6 +1309,99 @@ mod tests {
     }
 
     #[test]
+    fn viewbox_fits_an_absolute_width_and_height_by_preserve_aspect_ratio() -> Result<()> {
+        // A 40 x 40 mm box over a viewBox 80 x 160: the height limits it to 0.25 mm per unit,
+        // so the drawing is 20 x 40 mm, whatever the alignment.
+        let fit = |par: &str| -> Result<(Point, Point)> {
+            let svg = format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="40mm" height="40mm" viewBox="10 0 80 160" {par}>
+                    <circle id="pin:1" cx="10" cy="0" r="1"/><circle id="pin:2" cx="90" cy="160" r="1"/>
+                </svg>"#
+            );
+            let s = symbol(&svg, "svg.u", "U")?;
+            Ok((pin_at(&s, "1"), pin_at(&s, "2")))
+        };
+        let size = |(a, b): (Point, Point)| (b.x - a.x, b.y - a.y);
+        let close = |(x, y): (f64, f64), (ex, ey): (f64, f64)| (x - ex).abs() < 1e-3 && (y - ey).abs() < 1e-3;
+        for par in [
+            "",
+            r#"preserveAspectRatio="xMidYMid meet""#,
+            r#"preserveAspectRatio="xMinYMax""#,
+        ] {
+            let got = fit(par)?;
+            assert!(close(size(got), (20.0, 40.0)), "{par}: {got:?}");
+        }
+        // slice takes the larger scale, none scales each axis on its own.
+        let got = fit(r#"preserveAspectRatio="xMidYMid slice""#)?;
+        assert!(close(size(got), (40.0, 80.0)), "{got:?}");
+        let got = fit(r#"preserveAspectRatio="none""#)?;
+        assert!(close(size(got), (40.0, 40.0)), "{got:?}");
+        // `defer` in front is passed over.
+        let got = fit(r#"preserveAspectRatio="defer xMidYMid slice""#)?;
+        assert!(close(size(got), (40.0, 80.0)), "{got:?}");
+        // A viewBox so thin that its scale runs to infinity is an error, not a symbol of NaN.
+        let thin = r#"<svg xmlns="http://www.w3.org/2000/svg" width="40mm" height="40mm" viewBox="0 0 80 1e-308" preserveAspectRatio="none">
+            <line x1="0" y1="0" x2="80" y2="0"/></svg>"#;
+        assert!(symbol(thin, "svg.u", "U").is_err());
+        // The message quotes the file's text with its control characters escaped.
+        let esc = r#"<svg xmlns="http://www.w3.org/2000/svg" width="40mm" height="40mm" viewBox="0 0 80 1e-308&#27;[J" preserveAspectRatio="none">
+            <line x1="0" y1="0" x2="80" y2="0"/></svg>"#;
+        match symbol(esc, "svg.u", "U") {
+            Err(Error::Format(m)) => assert!(m.contains("1e-308\\u{1b}[J") && !m.contains('\u{1b}'), "{m}"),
+            other => unreachable!("{:?}", other.map(|s| s.id)),
+        }
+        // With none, a text is as high as the y axis makes it: 10 units at 0.25 mm.
+        let text = r#"<svg xmlns="http://www.w3.org/2000/svg" width="40mm" height="40mm" viewBox="0 0 80 160" preserveAspectRatio="none">
+            <line x1="0" y1="0" x2="80" y2="160"/><text x="0" y="20" font-size="10">K</text></svg>"#;
+        let s = symbol(text, "svg.u", "U")?;
+        let heights: Vec<f64> = s
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Text { height, .. } => Some(*height),
+                _ => None,
+            })
+            .collect();
+        assert!(heights.len() == 1 && (heights[0] - 1.8).abs() < 1e-9, "{heights:?}");
+        // A huge y scale that is still finite gives a finite height: 1e-200 units at 4e200 mm.
+        let huge = r#"<svg xmlns="http://www.w3.org/2000/svg" width="40mm" height="40mm" viewBox="0 0 80 1e-199" preserveAspectRatio="none">
+            <line x1="0" y1="0" x2="80" y2="0"/><text x="0" y="0" font-size="1e-200">K</text></svg>"#;
+        let s = symbol(huge, "svg.u", "U")?;
+        let heights: Vec<f64> = s
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Text { height, .. } => Some(*height),
+                _ => None,
+            })
+            .collect();
+        assert!(heights.len() == 1 && (heights[0] - 2.88).abs() < 1e-9, "{heights:?}");
+        // The same huge y scale turns a circle into a tall ellipse, not a dot-sized circle.
+        let tall = r#"<svg xmlns="http://www.w3.org/2000/svg" width="40mm" height="40mm" viewBox="0 0 80 1e-199" preserveAspectRatio="none">
+            <line x1="0" y1="0" x2="80" y2="0"/><circle cx="40" cy="5e-200" r="1e-200"/></svg>"#;
+        let s = symbol(tall, "svg.e", "E")?;
+        assert!(
+            !s.graphics.iter().any(|g| matches!(g, Shape::Circle { .. })),
+            "{:?}",
+            s.graphics
+        );
+        let ys: Vec<f64> = s
+            .graphics
+            .iter()
+            .filter_map(|g| match g {
+                Shape::Polyline { points, .. } if points.len() > 2 => {
+                    let lo = points.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
+                    let hi = points.iter().map(|p| p.y).fold(f64::NEG_INFINITY, f64::max);
+                    Some(hi - lo)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(ys.len() == 1 && (ys[0] - 8.0).abs() < 1e-6, "{ys:?}");
+        Ok(())
+    }
+
+    #[test]
     fn viewbox_height_sizes_the_symbol_when_the_width_is_missing_or_a_percentage() -> Result<()> {
         // 10 mm over a viewBox 20 high: 0.5 mm per unit, so 40 units come in as 20 mm.
         for w in ["", r#"width="100%""#, r#"width="auto""#] {
@@ -1284,8 +1417,8 @@ mod tests {
                 "{w}: {a:?} {b:?}"
             );
         }
-        // An absolute width still wins over the height.
-        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="80mm" height="10mm" viewBox="0 0 40 20">
+        // An absolute width still sets the x scale; with `none` the height does not shrink it.
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="80mm" height="10mm" viewBox="0 0 40 20" preserveAspectRatio="none">
             <circle id="pin:1" cx="0" cy="0" r="1"/><circle id="pin:2" cx="40" cy="0" r="1"/>
         </svg>"#;
         let s = symbol(svg, "svg.u", "U")?;
