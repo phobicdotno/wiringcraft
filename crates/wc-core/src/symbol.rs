@@ -158,7 +158,8 @@ pub struct BoxPin {
 /// A black box (device box): a rectangle `width` by `height` mm with its top-left corner at
 /// the origin and connection points on its edges, for a device that has no symbol of its own.
 /// Wires leave each point away from the box. Refuses a box without area, a point off its edge,
-/// a point without a name, two points of one name and two points at one place.
+/// a point without a name, two points of one name and two points at one place (less than
+/// 0.01 mm apart).
 pub fn black_box(id: &str, name: &str, width: f64, height: f64, pins: &[BoxPin]) -> crate::Result<Symbol> {
     let bad = |why: String| Err(crate::Error::Invalid(why));
     if !(width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0) {
@@ -191,7 +192,8 @@ pub fn black_box(id: &str, name: &str, width: f64, height: f64, pins: &[BoxPin])
         if out.iter().any(|q| q.name == pin_name) {
             return bad(format!("two connection points are named {pin_name}"));
         }
-        if let Some(q) = out.iter().find(|q| q.at.distance(at) < 1e-6) {
+        // Closer than 0.01 mm is one place, as auto-wiring and free wire ends see it (#1696).
+        if let Some(q) = out.iter().find(|q| q.at.distance(at) < 0.01) {
             return bad(format!(
                 "connection points {} and {pin_name} are at the same place",
                 q.name
@@ -299,6 +301,11 @@ mod black_box_tests {
         // The top-left corner is on the top and the left edge.
         let corner = [pin("1", BoxSide::Left, 0.0), pin("2", BoxSide::Top, 0.0)];
         assert!(black_box("b", "", 10.0, 10.0, &corner).is_err());
+        // A hair apart is one place too, as auto-wiring and free wire ends see it (#1696).
+        let close = [pin("1", BoxSide::Left, 5.0), pin("2", BoxSide::Left, 5.005)];
+        assert!(black_box("b", "", 10.0, 10.0, &close).is_err());
+        let apart = [pin("1", BoxSide::Left, 5.0), pin("2", BoxSide::Left, 5.02)];
+        assert!(black_box("b", "", 10.0, 10.0, &apart).is_ok());
     }
 
     #[test]
