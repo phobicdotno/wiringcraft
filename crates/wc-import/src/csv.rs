@@ -738,6 +738,19 @@ mod tests {
         assert_eq!(guess_delimiter("\"a\nb\";c;d\ne,f,g,h"), ';');
         // So does a quoted header with a line break and the other separator in it.
         assert_eq!(guess_delimiter("a,\"b;\r\nc;d;\",e\r\n1;2;3;4,5,6\r\n"), ',');
+        // The readers take the whole header, past its quoted line break.
+        let (parts, warnings) =
+            super::parts("Manufacturer;\"Notes,\nmore, and more, text\";Order number\nABB;x;1SBL\n")?;
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].order_number, "1SBL");
+        // A quote inside a cell is a plain character: the `;` after it still count.
+        let (parts, _) = parts_from_rows(&records(
+            "Size, 1\";Manufacturer;Order number\nM, 2\";ABB;1SBL\n",
+            guess_delimiter("Size, 1\";Manufacturer;Order number\nM, 2\";ABB;1SBL\n"),
+        ))?;
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].order_number, "1SBL");
         Ok(())
     }
 
