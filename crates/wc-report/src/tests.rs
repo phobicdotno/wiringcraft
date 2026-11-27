@@ -1307,35 +1307,76 @@ fn automationml_has_devices_pins_and_one_link_per_join() {
     assert_eq!(automationml(&i, "2026-11-16T22:00:00Z", "plant-v2.aml").0, xml);
 }
 
-/// Every element of `xml` as (name, attributes), read with an XML reader; `None` when the
-/// document is not well formed.
-fn xml_elements(xml: &str) -> Option<Vec<(String, BTreeMap<String, String>)>> {
+/// An XML element's name and its attributes, unescaped.
+type XmlElement = (String, BTreeMap<String, String>);
+
+/// Every element of `xml` as (name, attributes), read with an XML reader, or why the document
+/// is not well formed: a reader error, a bad attribute or entity reference, text outside the
+/// root element, a second root, or an element left open.
+fn xml_elements(xml: &str) -> Result<Vec<XmlElement>, String> {
     use quick_xml::events::Event;
     let mut reader = quick_xml::Reader::from_str(xml);
     let mut out = Vec::new();
     let mut depth = 0usize;
+    let mut root_closed = false;
     loop {
-        let (e, opens) = match reader.read_event().ok()? {
+        let at = reader.buffer_position();
+        let event = reader.read_event().map_err(|e| format!("at byte {at}: {e}"))?;
+        let (e, opens) = match event {
             Event::Start(e) => (e, true),
             Event::Empty(e) => (e, false),
             Event::End(_) => {
-                depth = depth.checked_sub(1)?;
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| format!("at byte {at}: end tag without a start"))?;
+                root_closed = depth == 0;
                 continue;
             }
-            Event::Eof => return (depth == 0).then_some(out),
+            Event::Text(t) => {
+                let text = t.unescape().map_err(|e| format!("at byte {at}: {e}"))?;
+                if depth == 0 && !text.trim().is_empty() {
+                    return Err(format!("at byte {at}: text outside the root element: {text:?}"));
+                }
+                continue;
+            }
+            Event::Eof if depth == 0 && root_closed => return Ok(out),
+            Event::Eof => return Err(format!("ended with {depth} element(s) open or no root")),
             _ => continue,
         };
+        if depth == 0 && root_closed {
+            return Err(format!("at byte {at}: a second root element"));
+        }
         if opens {
             depth += 1;
+        } else if depth == 0 {
+            root_closed = true;
         }
-        let name = String::from_utf8(e.name().as_ref().to_vec()).ok()?;
+        let name = String::from_utf8(e.name().as_ref().to_vec()).map_err(|e| format!("at byte {at}: {e}"))?;
         let mut attrs = BTreeMap::new();
         for a in e.attributes() {
-            let a = a.ok()?;
-            let k = String::from_utf8(a.key.as_ref().to_vec()).ok()?;
-            attrs.insert(k, a.unescape_value().ok()?.into_owned());
+            let a = a.map_err(|e| format!("at byte {at}: {e}"))?;
+            let k = String::from_utf8(a.key.as_ref().to_vec()).map_err(|e| format!("at byte {at}: {e}"))?;
+            let v = a.unescape_value().map_err(|e| format!("at byte {at}: {k}: {e}"))?;
+            attrs.insert(k, v.into_owned());
         }
         out.push((name, attrs));
+    }
+}
+
+#[test]
+fn the_xml_helper_rejects_documents_that_are_not_well_formed() {
+    assert!(xml_elements("<a x=\"1\"><b/></a>\n").is_ok());
+    for bad in [
+        "<a>&unknown;</a>",
+        "<a x=\"&unknown;\"/>",
+        "stray<a/>",
+        "<a/>stray",
+        "<a/><b/>",
+        "<a><b></a>",
+        "<a>",
+        "",
+    ] {
+        assert!(xml_elements(bad).is_err(), "{bad:?} was accepted");
     }
 }
 
@@ -1354,9 +1395,7 @@ fn automationml_of_an_empty_project_is_a_well_formed_skeleton() {
     assert!(xml.contains("<CAEXFile FileName=\"Project.aml\""), "{xml}");
     assert!(xml.contains("LastWritingDateTime=\"1970-01-01T00:00:00Z\""), "{xml}");
     assert!(xml.contains("<InstanceHierarchy Name=\"Project\""), "{xml}");
-    let Some(elements) = xml_elements(&xml) else {
-        unreachable!("not well formed: {xml}")
-    };
+    let elements = xml_elements(&xml).unwrap_or_else(|e| unreachable!("not well formed ({e}): {xml}"));
     let names: Vec<&str> = elements.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(
         names,
@@ -1385,9 +1424,7 @@ fn automationml_trims_and_escapes_the_project_name_and_time_stamp() {
         "{xml}"
     );
     assert!(xml.contains("LastWritingDateTime=\"x&lt;y\""), "{xml}");
-    let Some(elements) = xml_elements(&xml) else {
-        unreachable!("not well formed: {xml}")
-    };
+    let elements = xml_elements(&xml).unwrap_or_else(|e| unreachable!("not well formed ({e}): {xml}"));
     let get = |el: &str, attr: &str| {
         elements
             .iter()
@@ -1451,9 +1488,7 @@ fn automationml_numbers_devices_in_natural_tag_order() {
         parts: &parts,
     };
     let (xml, _) = automationml(&i, "", "");
-    let Some(elements) = xml_elements(&xml) else {
-        unreachable!("not well formed: {xml}")
-    };
+    let elements = xml_elements(&xml).unwrap_or_else(|e| unreachable!("not well formed ({e}): {xml}"));
     let devices: Vec<(&str, &str)> = elements
         .iter()
         .filter(|(n, a)| n == "InternalElement" && a.get("ID").is_some_and(|id| id != "project"))
@@ -1476,9 +1511,7 @@ fn automationml_chains_a_net_of_three_pins_with_numbered_link_names() {
     };
     let (xml, counts) = automationml(&i, "", "");
     assert_eq!(counts.links, 4, "{xml}");
-    let Some(elements) = xml_elements(&xml) else {
-        unreachable!("not well formed: {xml}")
-    };
+    let elements = xml_elements(&xml).unwrap_or_else(|e| unreachable!("not well formed ({e}): {xml}"));
     let links: Vec<&str> = elements
         .iter()
         .filter(|(n, _)| n == "InternalLink")
@@ -1497,9 +1530,7 @@ fn automationml_links_only_name_interfaces_that_exist() {
         parts: &parts,
     };
     let (xml, counts) = automationml(&i, "2026-11-16T22:00:00Z", "plant.aml");
-    let Some(elements) = xml_elements(&xml) else {
-        unreachable!("not well formed: {xml}")
-    };
+    let elements = xml_elements(&xml).unwrap_or_else(|e| unreachable!("not well formed ({e}): {xml}"));
     let ids: Vec<&str> = elements
         .iter()
         .filter_map(|(_, a)| a.get("ID").map(String::as_str))
