@@ -5235,8 +5235,7 @@ fn comment_cmd(dir: &Path, cc: CommentCmd) -> Res<()> {
                 // the text is not a line break and is printed escaped.
                 let lines = |t: &str| -> Vec<String> {
                     let mut parts: Vec<&str> = t.split('\n').collect();
-                    let last = parts.len() - 1;
-                    for part in &mut parts[..last] {
+                    for part in parts.iter_mut().rev().skip(1) {
                         *part = part.strip_suffix('\r').unwrap_or(part);
                     }
                     parts.into_iter().map(escape_field).collect()
