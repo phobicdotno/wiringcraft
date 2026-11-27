@@ -654,13 +654,11 @@ pub fn location_rows(rows: &[(String, String)]) -> Result<Vec<Location>, String>
 }
 
 /// Sort locations in natural order of their paths, as tags are listed: `+CAB2` before `+CAB10`.
-/// Paths alike in natural order (`L01` and `L1`) keep a fixed order by their text.
+/// Paths alike in natural order (`L01` and `L1`, `+L1` and `L1`) keep a fixed order by their text.
 pub fn sort_locations(locations: &mut [Location]) {
-    locations.sort_by(|a, b| {
-        natural_key(&a.path)
-            .cmp(&natural_key(&b.path))
-            .then_with(|| a.path.cmp(&b.path))
-    });
+    // A path stored as typed (`+CAB10`) sorts by its normal form (`CAB10`).
+    let key = |l: &Location| natural_key(&location_path(&l.path).unwrap_or_else(|_| l.path.clone()));
+    locations.sort_by_cached_key(|l| (key(l), l.path.clone()));
 }
 
 /// A location of the project, such as a cabinet or a room.
@@ -2434,8 +2432,8 @@ mod tests {
         assert!(!m.merge_location(loc("+L2", "Other")));
         assert!(m.merge_location(loc("+L5", "")));
         let paths: Vec<&str> = m.locations.iter().map(|l| l.path.as_str()).collect();
-        assert_eq!(paths, ["+L4", "L1.L3", "L2", "L5"]);
-        assert_eq!(m.locations[0].description, "Deck");
+        assert_eq!(paths, ["L1.L3", "L2", "+L4", "L5"], "+L4 sorts as L4");
+        assert_eq!(m.locations[2].description, "Deck");
         m.locations.retain(|l| l.path != "+L4" && l.path != "L5");
         let text = toml::to_string(&m).unwrap_or_default();
         assert!(text.contains("[[location]]"), "{text}");
