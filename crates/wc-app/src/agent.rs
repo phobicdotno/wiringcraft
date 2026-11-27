@@ -5850,6 +5850,7 @@ mod tests {
                 share_undo: false,
                 share_redo: false,
                 show_layers: false,
+                symbol_editor: None,
             }
             .enabled(act)
         };
@@ -6151,6 +6152,7 @@ mod tests {
                 share_undo: false,
                 share_redo: false,
                 show_layers: false,
+                symbol_editor: None,
             }
             .enabled(act)
         };
@@ -6459,6 +6461,7 @@ mod tests {
                 share_undo: false,
                 share_redo: false,
                 show_layers: false,
+                symbol_editor: None,
             }
             .enabled(act)
         };
@@ -6655,6 +6658,79 @@ mod tests {
             "the editor redid the delete"
         );
         assert_eq!(a.open.as_ref().unwrap().project, before, "the project was not touched");
+    }
+
+    #[test]
+    fn menu_delete_undo_and_redo_go_to_the_symbol_editor_while_it_is_open() {
+        use crate::chrome::Status;
+        let (_tmp, mut a) = app(vec![]);
+        let o = a.open.as_mut().unwrap();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        o.place(page, "wc.coil", Point::new(50.0, 50.0)).unwrap();
+        a.ed.page = page;
+        a.ed.selection = a.open.as_ref().unwrap().select_all(page);
+        assert!(!a.ed.selection.is_empty());
+        let menu = vec![Action::Delete, Action::Undo, Action::Redo, Action::ZoomIn];
+        assert_eq!(
+            a.route_menu_to_symbol_editor(menu.clone()),
+            menu,
+            "closed: the project gets them"
+        );
+
+        let mut ed = crate::symbol_editor::SymbolEditor::new(Vec::new());
+        ed.set_tool(crate::symbol_editor::Tool::Line);
+        ed.click(Point::new(0.0, 0.0));
+        ed.click(Point::new(10.0, 0.0));
+        ed.set_tool(crate::symbol_editor::Tool::Select);
+        ed.click(Point::new(5.0, 0.0));
+        a.symbol_editor = Some(ed);
+        let before = a.open.as_ref().unwrap().project.clone();
+        let undo_before = a.open.as_ref().unwrap().undo_mark();
+        let status = |a: &App, act: Action| {
+            crate::StatusView {
+                open: a.open.as_ref(),
+                ed: &a.ed,
+                prefs: &a.prefs,
+                clipboard: &a.clipboard,
+                sharing: false,
+                share_undo: false,
+                share_redo: false,
+                show_layers: false,
+                symbol_editor: a.symbol_editor.as_ref(),
+            }
+            .enabled(act)
+        };
+        assert!(status(&a, Action::Delete), "the editor's line can be deleted");
+        assert!(!status(&a, Action::Redo), "the editor has nothing to redo");
+
+        // Edit > Delete, then Edit > Undo and Edit > Redo.
+        for act in a.route_menu_to_symbol_editor(vec![Action::Delete]) {
+            a.run(act);
+        }
+        assert!(
+            a.symbol_editor.as_ref().unwrap().symbol.graphics.is_empty(),
+            "the editor deleted its line"
+        );
+        assert!(!status(&a, Action::Delete), "nothing is selected in the editor now");
+        for act in a.route_menu_to_symbol_editor(vec![Action::Undo, Action::ZoomIn]) {
+            assert_eq!(act, Action::ZoomIn);
+        }
+        assert_eq!(
+            a.symbol_editor.as_ref().unwrap().symbol.graphics.len(),
+            1,
+            "the editor undid"
+        );
+        assert!(status(&a, Action::Redo));
+        assert!(a.route_menu_to_symbol_editor(vec![Action::Redo]).is_empty());
+        assert!(
+            a.symbol_editor.as_ref().unwrap().symbol.graphics.is_empty(),
+            "the editor redid"
+        );
+
+        let o = a.open.as_ref().unwrap();
+        assert_eq!(o.project, before, "the schematic behind the editor was not touched");
+        assert_eq!(o.undo_mark(), undo_before, "and got no undo step");
+        assert!(!a.ed.selection.is_empty(), "its selection stays");
     }
 
     #[test]

@@ -381,6 +381,17 @@ fn held_by_symbol_editor(a: Action) -> bool {
     )
 }
 
+/// Undo, Redo or Delete done in the symbol editor `ed`; false when `a` is none of them.
+fn symbol_editor_edit(ed: &mut symbol_editor::SymbolEditor, a: Action) -> bool {
+    match a {
+        Action::Undo => ed.undo(),
+        Action::Redo => ed.redo(),
+        Action::Delete => ed.delete_selected(),
+        _ => return false,
+    }
+    true
+}
+
 /// Why `what` (an action's label, or what an assistant tool does) was refused while the symbol
 /// editor is open.
 fn symbol_editor_refusal(what: &str) -> String {
@@ -501,6 +512,8 @@ struct StatusView<'a> {
     share_redo: bool,
     /// The layer list window is open.
     show_layers: bool,
+    /// The symbol editor, while open: Undo, Redo and Delete work on it.
+    symbol_editor: Option<&'a symbol_editor::SymbolEditor>,
 }
 
 impl chrome::Status for StatusView<'_> {
@@ -533,6 +546,14 @@ impl chrome::Status for StatusView<'_> {
 
     fn enabled(&self, a: Action) -> bool {
         let has = self.open.is_some();
+        if let Some(se) = self.symbol_editor {
+            match a {
+                Action::Undo => return se.can_undo(),
+                Action::Redo => return se.can_redo(),
+                Action::Delete => return se.selected.is_some(),
+                _ => {}
+            }
+        }
         if self.open.is_some_and(|o| held_for(a, self.ed, &o.project).is_some()) {
             return false;
         }
@@ -5835,11 +5856,15 @@ impl eframe::App for App {
             share_undo: self.share.can_undo(),
             share_redo: self.share.can_redo(),
             show_layers: self.show_layers,
+            symbol_editor: self.symbol_editor.as_ref(),
         };
         for url in std::mem::take(&mut self.open_url) {
             ctx.open_url(egui::OpenUrl::new_tab(url));
         }
         let mut actions = chrome::show(ctx, self.prefs.chrome, &mut self.chrome, &status);
+        if self.importing.is_none() {
+            actions = self.route_menu_to_symbol_editor(actions);
+        }
         // Before the shortcuts: the panel view's arrow presses take the Undo and Redo among them,
         // so they apply in the order they came (#975).
         let panel_keys = self.panel_keys(ctx);
@@ -6122,16 +6147,8 @@ impl App {
         };
         keys.into_iter()
             .filter(|a| match a {
-                Action::Undo => {
-                    ed.undo();
-                    false
-                }
-                Action::Redo => {
-                    ed.redo();
-                    false
-                }
-                Action::Delete => {
-                    ed.delete_selected();
+                Action::Undo | Action::Redo | Action::Delete => {
+                    symbol_editor_edit(ed, *a);
                     false
                 }
                 a if held_by_symbol_editor(*a) => {
@@ -6151,6 +6168,15 @@ impl App {
                 _ => true,
             })
             .collect()
+    }
+
+    /// The menu's and toolbar's actions: while the symbol editor is open, Undo, Redo and Delete
+    /// work on the symbol being drawn, as their keys do, not on the schematic behind it (#1246).
+    fn route_menu_to_symbol_editor(&mut self, actions: Vec<Action>) -> Vec<Action> {
+        let Some(ed) = self.symbol_editor.as_mut() else {
+            return actions;
+        };
+        actions.into_iter().filter(|a| !symbol_editor_edit(ed, *a)).collect()
     }
 
     fn find_window(&mut self, ctx: &egui::Context) {
