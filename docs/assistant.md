@@ -86,7 +86,7 @@ With your Claude login:
   settings folder, never in the project folder. A project you were sent could carry files such as
   `.npmrc` or `.claude/` that run code when the connector or Claude Code starts in its folder.
   The settings folder is `$XDG_CONFIG_HOME/wiringcraft`, else `%APPDATA%\wiringcraft`, else
-  `~/.config/wiringcraft`.
+  `~/.config/wiringcraft` (an empty or relative value is skipped).
 - Claude Code is started without `ANTHROPIC_API_KEY` in its environment, so it uses the account
   it is logged in with, not a key that happens to be set.
 - Tool calls that arrive when no turn is running (after Stop, or late) are refused, not run.

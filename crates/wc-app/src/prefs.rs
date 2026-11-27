@@ -56,10 +56,25 @@ impl Default for Prefs {
 }
 
 pub(crate) fn config_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    config_dir_from(
+        std::env::var_os("XDG_CONFIG_HOME"),
+        std::env::var_os("APPDATA"),
+        std::env::var_os("HOME"),
+    )
+}
+
+/// The settings folder from `XDG_CONFIG_HOME`, else `APPDATA`, else `HOME/.config`. A value that
+/// is empty or not an absolute path is skipped, as the XDG spec says, so prefs.toml, logs and the
+/// assistant's files never land under whatever folder the app was started in.
+fn config_dir_from(
+    xdg: Option<std::ffi::OsString>,
+    appdata: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    let absolute = |v: Option<std::ffi::OsString>| v.map(PathBuf::from).filter(|p| p.is_absolute());
+    let base = absolute(xdg)
+        .or_else(|| absolute(appdata))
+        .or_else(|| absolute(home).map(|h| h.join(".config")))?;
     Some(base.join("wiringcraft"))
 }
 
@@ -289,6 +304,24 @@ impl Prefs {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_or_relative_config_home_is_skipped() {
+        let os = |s: &str| Some(std::ffi::OsString::from(s));
+        let (xdg, appdata, home) = if cfg!(windows) {
+            (r"C:\xdg", r"C:\Users\me\AppData\Roaming", r"C:\Users\me")
+        } else {
+            ("/xdg", "/appdata", "/home/me")
+        };
+        let at = |base: &str| Some(PathBuf::from(base).join("wiringcraft"));
+        let home_config = Some(PathBuf::from(home).join(".config").join("wiringcraft"));
+        assert_eq!(config_dir_from(os(xdg), os(appdata), os(home)), at(xdg));
+        assert_eq!(config_dir_from(os(""), os(appdata), os(home)), at(appdata));
+        assert_eq!(config_dir_from(os("conf"), None, os(home)), home_config);
+        assert_eq!(config_dir_from(os(""), os(""), os(home)), home_config);
+        assert_eq!(config_dir_from(os("conf"), os("data"), os("me")), None);
+        assert_eq!(config_dir_from(None, None, None), None);
+    }
 
     #[test]
     fn the_open_ribbon_tab_is_kept_and_older_files_open_on_the_first() {
