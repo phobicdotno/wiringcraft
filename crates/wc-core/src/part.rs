@@ -328,7 +328,13 @@ impl Part {
         };
         let m = norm(manufacturer);
         let o = norm(order_number);
-        if m.is_empty() { o } else { format!("{m}.{o}") }
+        if m.is_empty() {
+            o
+        } else if o.is_empty() {
+            m
+        } else {
+            format!("{m}.{o}")
+        }
     }
 }
 
@@ -399,5 +405,243 @@ mod tests {
     fn ids_are_safe() {
         assert_eq!(Part::make_id("Acme Corp", "AB 12/34"), "acme-corp.ab-12-34");
         assert_eq!(Part::make_id("", "X1"), "x1");
+        // No order number: no trailing dot.
+        assert_eq!(Part::make_id("Acme", ""), "acme");
+        assert_eq!(Part::make_id("Acme", " / "), "acme");
+    }
+
+    #[test]
+    fn usable_extents_are_finite_positive_and_at_most_the_limit() {
+        assert!(usable_extent(0.001));
+        assert!(usable_extent(MAX_EXTENT), "the limit itself is usable");
+        assert!(!usable_extent(MAX_EXTENT + 0.001));
+        assert!(!usable_extent(0.0));
+        assert!(!usable_extent(-0.0));
+        assert!(!usable_extent(-1.0));
+        assert!(!usable_extent(f64::NAN));
+        assert!(!usable_extent(f64::INFINITY));
+        let model = ModelSize {
+            width: 45.0,
+            height: 90.0,
+            depth: 60.0,
+        };
+        assert!(model.is_usable());
+        assert!(!ModelSize::default().is_usable(), "an empty model has no size");
+        for bad in [0.0, f64::NAN, ModelSize::MAX * 2.0] {
+            assert!(!ModelSize { width: bad, ..model }.is_usable());
+            assert!(!ModelSize { height: bad, ..model }.is_usable());
+            assert!(!ModelSize { depth: bad, ..model }.is_usable());
+        }
+    }
+
+    #[test]
+    fn contacts_count_up_and_saturate_instead_of_overflowing() {
+        let mut c = Contacts::default();
+        assert!(c.is_empty());
+        for k in [
+            ContactKind::Main,
+            ContactKind::Main,
+            ContactKind::No,
+            ContactKind::Nc,
+            ContactKind::Co,
+        ] {
+            c.add(k);
+        }
+        assert_eq!(
+            c,
+            Contacts {
+                main: 2,
+                no: 1,
+                nc: 1,
+                co: 1
+            }
+        );
+        assert!(!c.is_empty());
+        let mut total = Contacts::default();
+        total.add_all(&c, 3);
+        assert_eq!(total.describe(), "6 main, 3 NO, 3 NC, 3 CO");
+        total.add_all(&c, 0);
+        assert_eq!(
+            total.describe(),
+            "6 main, 3 NO, 3 NC, 3 CO",
+            "fitted no times adds nothing"
+        );
+        let mut full = Contacts {
+            main: u32::MAX,
+            ..Default::default()
+        };
+        full.add(ContactKind::Main);
+        assert_eq!(full.main, u32::MAX);
+        full.add_all(&c, u32::MAX);
+        assert_eq!(full.main, u32::MAX);
+        assert_eq!(full.no, u32::MAX, "a huge multiple saturates too");
+    }
+
+    #[test]
+    fn one_spare_changeover_covers_only_one_missing_contact() {
+        let has = Contacts {
+            co: 1,
+            ..Default::default()
+        };
+        let drawn = |main, no, nc, co| Contacts { main, no, nc, co };
+        assert_eq!(has.overflow(&Contacts::default()), None, "nothing drawn fits anything");
+        assert_eq!(
+            has.overflow(&drawn(0, 1, 1, 0)),
+            Some(drawn(0, 0, 1, 0)),
+            "the changeover serves as the NO, leaving the NC over"
+        );
+        let two = Contacts {
+            co: 2,
+            ..Default::default()
+        };
+        assert_eq!(two.overflow(&drawn(0, 1, 1, 0)), None, "two changeovers cover both");
+        assert_eq!(
+            Contacts::default().overflow(&drawn(0, 0, 0, 1)),
+            Some(drawn(0, 0, 0, 1)),
+            "a drawn changeover needs a real one"
+        );
+        assert_eq!(drawn(0, 0, 2, 0).describe(), "2 NC");
+    }
+
+    #[test]
+    fn contact_kinds_read_the_high_changeover_and_trimmed_pins() {
+        use ContactKind::*;
+        assert_eq!(contact_kinds(["15", "16", "18"]), [Co]);
+        assert_eq!(contact_kinds(["15", "16", "17", "18"]), [No, Nc], "x7 makes it NC + NO");
+        assert_eq!(contact_kinds(["11", "12", "14", "15", "16", "18"]), [Co, Co]);
+        assert_eq!(contact_kinds([" 13 ", "14"]), [No], "pins are trimmed");
+        assert_eq!(contact_kinds(["7", "8"]), [Main]);
+        assert!(contact_kinds(["1", "3", "5"]).is_empty(), "no pair is complete");
+        assert_eq!(
+            contact_kinds(["13", "24"]),
+            Vec::<ContactKind>::new(),
+            "halves of different contacts do not pair up"
+        );
+        assert!(contact_kinds(["", " ", "+1", "1.", "1a"]).is_empty());
+    }
+
+    #[test]
+    fn ids_drop_edge_punctuation_and_non_ascii_letters() {
+        assert_eq!(Part::make_id("  ABB  ", " 1SBL-137 "), "abb.1sbl-137");
+        assert_eq!(Part::make_id("-Siemens-", "(3RT2015)"), "siemens.3rt2015");
+        assert_eq!(Part::make_id("Phoenix_Contact", "3044102"), "phoenix-contact.3044102");
+        assert_eq!(Part::make_id("Müller", "A"), "m-ller.a");
+        assert_eq!(Part::make_id("***", "X"), "x", "a maker of only punctuation is none");
+        assert_eq!(Part::make_id("", ""), "");
+    }
+
+    #[test]
+    fn a_part_hash_is_stable_and_follows_its_content() {
+        let p = Part {
+            id: "acme.x1".into(),
+            manufacturer: "Acme".into(),
+            order_number: "X1".into(),
+            ..Part::default()
+        };
+        let h = p.hash();
+        assert!(h.starts_with("sha256:") && h.len() == "sha256:".len() + 16, "{h}");
+        assert_eq!(p.clone().hash(), h);
+        let mut q = p.clone();
+        q.properties.insert("Voltage".into(), "24 V".into());
+        assert_ne!(q.hash(), h);
+        let mut r = p;
+        r.contacts = Some(Contacts::default());
+        assert_ne!(r.hash(), h, "known-empty contacts differ from unknown ones");
+    }
+
+    #[test]
+    fn a_footprint_survives_a_json_round_trip_and_defaults_its_shapes() {
+        let Some(f) = Footprint::from_shapes(vec![crate::Shape::Line {
+            a: crate::Point::new(5.0, 5.0),
+            b: crate::Point::new(25.0, 15.0),
+        }]) else {
+            unreachable!("a diagonal line has a size")
+        };
+        assert_eq!((f.width, f.height), (20.0, 10.0));
+        let p = Part {
+            id: "x".into(),
+            footprint: Some(f.clone()),
+            model: Some(ModelSize {
+                width: 20.0,
+                height: 10.0,
+                depth: 5.0,
+            }),
+            ..Part::default()
+        };
+        let Ok(text) = serde_json::to_string(&p) else {
+            unreachable!()
+        };
+        let Ok(back) = serde_json::from_str::<Part>(&text) else {
+            unreachable!()
+        };
+        assert_eq!(back, p);
+        let Ok(bare) = serde_json::from_str::<Footprint>(r#"{"width": 3, "height": 4}"#) else {
+            unreachable!()
+        };
+        assert!(bare.shapes.is_empty());
+    }
+
+    #[test]
+    fn footprints_without_a_usable_size_are_refused() {
+        let line = |x: f64, y: f64| crate::Shape::Line {
+            a: crate::Point::new(0.0, 0.0),
+            b: crate::Point::new(x, y),
+        };
+        assert!(Footprint::from_shapes(vec![line(10.0, 0.0)]).is_none(), "no height");
+        assert!(
+            Footprint::from_shapes(vec![line(MAX_EXTENT + 1.0, 10.0)]).is_none(),
+            "too wide"
+        );
+        assert!(Footprint::from_shapes(vec![line(f64::NAN, 10.0)]).is_none());
+        assert!(Footprint::from_shapes(vec![line(MAX_EXTENT, MAX_EXTENT)]).is_some());
+    }
+
+    #[test]
+    fn a_footprint_in_a_degenerate_box_keeps_its_size() {
+        let Some(f) = Footprint::from_shapes(vec![crate::Shape::Rect {
+            min: crate::Point::new(0.0, 0.0),
+            max: crate::Point::new(20.0, 10.0),
+        }]) else {
+            unreachable!()
+        };
+        let at = crate::Point::new(100.0, 100.0);
+        for (w, h) in [(0.0, 0.0), (0.0, 10.0), (-5.0, 10.0)] {
+            let placed = f.placed(at, w, h);
+            let [s] = placed.as_slice() else {
+                unreachable!("one shape in, one out")
+            };
+            let (min, max) = s.bounds();
+            assert!(
+                (max.x - min.x - 20.0).abs() < 1e-9 && (max.y - min.y - 10.0).abs() < 1e-9,
+                "{w} x {h}: {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_turned_footprint_fills_the_turned_box() {
+        use crate::geom::Rotation;
+        let Some(f) = Footprint::from_shapes(vec![crate::Shape::Rect {
+            min: crate::Point::new(0.0, 0.0),
+            max: crate::Point::new(20.0, 10.0),
+        }]) else {
+            unreachable!()
+        };
+        let at = crate::Point::new(100.0, 50.0);
+        assert_eq!(f.placed_turned(at, 20.0, 10.0, Rotation::R0), f.placed(at, 20.0, 10.0));
+        for (rotation, w, h) in [
+            (Rotation::R90, 10.0, 20.0),
+            (Rotation::R180, 20.0, 10.0),
+            (Rotation::R270, 10.0, 20.0),
+        ] {
+            let placed = f.placed_turned(at, 20.0, 10.0, rotation);
+            let [s] = placed.as_slice() else { unreachable!() };
+            let (min, max) = s.bounds();
+            let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+            assert!(
+                near(min.x, at.x) && near(min.y, at.y) && near(max.x, at.x + w) && near(max.y, at.y + h),
+                "{rotation:?}: {s:?}"
+            );
+        }
     }
 }

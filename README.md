@@ -24,8 +24,8 @@ See the feature list for the full plan.
 | `wc-core` | data model, device tags (IEC 81346 style), project folder format, connectivity |
 | `wc-library` | library sources, lockfile, vendoring, update status |
 | `wc-import` | symbols from DXF, SVG, KiCad symbol libraries and QElectroTech elements; parts from CSV, Excel (.xlsx), BMEcat catalogues and EDZ files (with their macros as symbols); PLC address lists; WAGO configurator lists; maker footprint DXFs and STEP model sizes; pages from DXF, DWG and PDF (trace); AutomationML, Eplan P8 and SolidWorks Electrical projects and libraries (.tewzip); open-format parts of project archives |
-| `wc-report` | parts list, device list, wire list, net list, terminal plan, cable list, PLC I/O list, PLC card overview, table of contents |
-| `wc-pdf` | vector PDF export: schematic pages, report tables, panel layouts, PLC card sheets and network topology sheets; schematic pages also as SVG and DXF |
+| `wc-report` | parts list, device list, wire list, net list, terminal plan, cable list, PLC I/O list, PLC card overview, location list, network list, table of contents; project check; PLC variable lists, WAGO marker and configurator lists, AutomationML and STEP panel exports |
+| `wc-pdf` | vector PDF export: schematic pages, report tables, panel layouts, PLC card sheets and network topology sheets; schematic pages and panel layouts also as SVG and DXF |
 | `wc-vcs` | git versioning, subway-map history, schematic change lists |
 | `wc-agent` | the live AI assistant: Claude Code connection (your login), tool bridge, API client |
 | `wc-share` | shared work sessions: join approval, page locks, one commit per change, TCP transport, network discovery; used by the app's Share session and Join session |
@@ -142,7 +142,7 @@ gives the details.
 | `wago` | the WAGO configurator list back (written by `export wago-configurator`): articles and accessories onto terminals and strips |
 | `archive` | the open-format parts of another tool's project archive (PDF, DXF, AutomationML, PLC lists, KiCad, CSV) |
 | `page-dxf` | a DXF drawing onto a page as graphics; blocks named like library symbols become symbols |
-| `page-dwg` | a DWG drawing onto a page, converted to DXF by an installed converter (ODA File Converter, `dwg2dxf`, or `WIRINGCRAFT_DWG2DXF`) |
+| `page-dwg` | a DWG drawing onto a page, read by WiringCraft's own DWG reader (AutoCAD 2004 to 2018); a file it refuses is converted to DXF by an installed converter (ODA File Converter, `dwg2dxf`, or the command in `WIRINGCRAFT_DWG2DXF` with `{in}` and `{out}`) |
 | `pdf` | PDF pages as trace graphics on new pages (vector content; scanned pages have none) |
 | `aml` | AutomationML (CAEX) devices, properties and connections, laid out as overview pages |
 | `eplan` | an Eplan Electric P8 project (.elk, its .edb folder, or a zip of it): pages as drawn, plus overview pages |

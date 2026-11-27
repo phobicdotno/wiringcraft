@@ -17,6 +17,8 @@ pub enum Chrome {
 #[serde(default)]
 pub struct Prefs {
     pub chrome: Chrome,
+    /// The ribbon tab that was open last, so the ribbon opens on it again.
+    pub ribbon_tab: usize,
     /// Light or dark interface.
     pub theme: crate::theme::Mode,
     pub show_grid: bool,
@@ -27,6 +29,8 @@ pub struct Prefs {
     pub recent: Vec<PathBuf>,
     /// The assistant panel is shown.
     pub show_assistant: bool,
+    /// The Layers window (View > Layers) is open.
+    pub show_layers: bool,
     /// The assistant's model, effort and (when not in the environment) API key.
     pub assistant: wc_agent::Settings,
     /// Editor layers this user hid or locked on the canvas.
@@ -39,12 +43,14 @@ impl Default for Prefs {
     fn default() -> Self {
         Self {
             chrome: Chrome::Classic,
+            ribbon_tab: 0,
             theme: crate::theme::Mode::Light,
             show_grid: true,
             auto_wire: true,
             snap: 2.5,
             recent: Vec::new(),
             show_assistant: false,
+            show_layers: false,
             assistant: wc_agent::Settings::default(),
             layers: crate::layers::Layers::default(),
             live_check: true,
@@ -53,10 +59,25 @@ impl Default for Prefs {
 }
 
 pub(crate) fn config_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    config_dir_from(
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        std::env::var_os("APPDATA").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+/// The settings folder from the values of `XDG_CONFIG_HOME`, `APPDATA` and `HOME`, taken in that
+/// order. An empty or relative value is skipped, as the XDG spec asks, so the settings never land
+/// in whatever folder the app was started from.
+fn config_dir_from(
+    xdg: Option<&std::ffi::OsStr>,
+    appdata: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    let absolute = |v: Option<&std::ffi::OsStr>| v.map(PathBuf::from).filter(|p| p.is_absolute());
+    let base = absolute(xdg)
+        .or_else(|| absolute(appdata))
+        .or_else(|| absolute(home).map(|h| h.join(".config")))?;
     Some(base.join("wiringcraft"))
 }
 
@@ -288,6 +309,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_open_ribbon_tab_is_kept_and_older_files_open_on_the_first() {
+        let p = Prefs {
+            ribbon_tab: 2,
+            ..Prefs::default()
+        };
+        let back: Prefs = toml::from_str(&toml::to_string_pretty(&p).unwrap()).unwrap();
+        assert_eq!(back.ribbon_tab, 2);
+        let old: Prefs = toml::from_str("chrome = \"ribbon\"\n").unwrap();
+        assert_eq!(old.ribbon_tab, 0);
+    }
+
+    #[test]
+    fn an_empty_or_relative_config_variable_is_skipped() {
+        use std::ffi::OsStr;
+        let abs = std::env::temp_dir();
+        let a = abs.join("xdg");
+        let b = abs.join("appdata");
+        let h = abs.join("home");
+        // A good XDG_CONFIG_HOME wins.
+        assert_eq!(
+            config_dir_from(Some(a.as_os_str()), Some(b.as_os_str()), Some(h.as_os_str())),
+            Some(a.join("wiringcraft"))
+        );
+        // Empty or relative XDG_CONFIG_HOME falls through to APPDATA, then to HOME/.config.
+        for bad in ["", "rel", "./cfg"] {
+            assert_eq!(
+                config_dir_from(Some(OsStr::new(bad)), Some(b.as_os_str()), Some(h.as_os_str())),
+                Some(b.join("wiringcraft")),
+                "{bad:?}"
+            );
+            assert_eq!(
+                config_dir_from(Some(OsStr::new(bad)), Some(OsStr::new(bad)), Some(h.as_os_str())),
+                Some(h.join(".config").join("wiringcraft")),
+                "{bad:?}"
+            );
+            assert_eq!(
+                config_dir_from(Some(OsStr::new(bad)), None, Some(OsStr::new(bad))),
+                None,
+                "{bad:?}"
+            );
+        }
+        assert_eq!(config_dir_from(None, None, None), None);
+    }
+
+    #[test]
     fn the_default_projects_folder_is_absolute() {
         assert!(projects_dir().is_absolute());
         // Shown as the default location, then typed back: the same folder, not nested twice.
@@ -409,5 +475,17 @@ mod tests {
             home.join("Documents").join("WiringCraft")
         );
         assert!(projects_dir_in(None, None).is_absolute());
+    }
+
+    #[test]
+    fn the_layers_window_stays_open_across_a_restart_and_older_files_keep_it_closed() {
+        let p = Prefs {
+            show_layers: true,
+            ..Prefs::default()
+        };
+        let back: Prefs = toml::from_str(&toml::to_string_pretty(&p).unwrap()).unwrap();
+        assert!(back.show_layers);
+        let old: Prefs = toml::from_str("show_grid = false\n").unwrap();
+        assert!(!old.show_layers);
     }
 }
