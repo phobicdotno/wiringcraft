@@ -556,6 +556,8 @@ impl chrome::Status for StatusView<'_> {
                 Action::Undo => return se.can_undo(),
                 Action::Redo => return se.can_redo(),
                 Action::Delete => return se.selected.is_some(),
+                // Refused while the editor is open (`carry_out`): not offered either (#1345).
+                a if held_by_symbol_editor(a) => return false,
                 _ => {}
             }
         }
@@ -8034,6 +8036,42 @@ mod nudge_tests {
             closing: Closing::No,
         };
         (tmp, app, egui::Context::default())
+    }
+
+    /// The menu and toolbars do not offer what the symbol editor holds back: the commands it
+    /// refuses show disabled while it is open, and enabled again once it is closed (#1345).
+    #[test]
+    fn commands_held_by_the_symbol_editor_show_disabled() {
+        use chrome::Status;
+        let (_tmp, mut app, _) = app(Point::new(80.0, 60.0), false);
+        app.clipboard = app.open.as_ref().unwrap().copy(app.ed.page, &app.ed.selection);
+        let held = [
+            Action::Cut,
+            Action::Copy,
+            Action::Paste,
+            Action::Duplicate,
+            Action::Rotate,
+            Action::Mirror,
+            Action::SelectAll,
+        ];
+        let se = symbol_editor::SymbolEditor::new(Vec::new());
+        for editor in [None, Some(&se)] {
+            let status = StatusView {
+                open: app.open.as_ref(),
+                ed: &app.ed,
+                prefs: &app.prefs,
+                clipboard: &app.clipboard,
+                sharing: false,
+                share_undo: false,
+                share_redo: false,
+                show_layers: false,
+                symbol_editor: editor,
+            };
+            for a in held {
+                assert!(held_by_symbol_editor(a));
+                assert_eq!(status.enabled(a), editor.is_none(), "{a:?}");
+            }
+        }
     }
 
     /// One frame with `key` pressed; `focus_text` gives a text field the keyboard first.
