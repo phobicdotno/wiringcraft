@@ -607,6 +607,10 @@ pub struct Open {
     /// putting it back.
     #[cfg(test)]
     block_after_snapshot: Option<PathBuf>,
+    /// Tests: a part copy that a refused [`Open::ensure_parts`] takes back turns into a folder
+    /// with a file in it first, so removing it fails.
+    #[cfg(test)]
+    block_copy_removal: bool,
     /// Tests: a file whose backup read fails, though the file is a plain readable one.
     #[cfg(test)]
     unreadable: Option<PathBuf>,
@@ -687,6 +691,8 @@ impl Open {
             fail_part_writes: Default::default(),
             #[cfg(test)]
             block_after_snapshot: None,
+            #[cfg(test)]
+            block_copy_removal: false,
             #[cfg(test)]
             unreadable: None,
             #[cfg(test)]
@@ -1198,10 +1204,26 @@ impl Open {
             for id in loaded {
                 self.parts.remove(&id);
             }
+            let mut left = Vec::new();
             for path in copies {
-                let _ = std::fs::remove_file(path);
+                #[cfg(test)]
+                if self.block_copy_removal {
+                    let _ = std::fs::remove_file(&path);
+                    let _ = std::fs::create_dir(&path).and_then(|()| std::fs::write(path.join("x"), ""));
+                }
+                if let Err(e) = std::fs::remove_file(&path) {
+                    left.push(format!("{} ({e})", path.display()));
+                }
             }
             self.project.lock = lock;
+            if !left.is_empty() {
+                r = r.map_err(|e| {
+                    format!(
+                        "{e}; these part copies taken into the project could not be removed: {}",
+                        left.join("; ")
+                    )
+                });
+            }
         }
         r
     }
@@ -9911,6 +9933,28 @@ pub(crate) mod tests {
         assert!(copy.exists());
         assert!(o.parts.contains_key(&id));
         assert!(o.project.lock.parts.contains_key(&id));
+    }
+
+    #[test]
+    fn a_part_copy_that_cannot_be_taken_back_is_named_with_its_reason() {
+        let (_tmp, mut o) = project();
+        let id = o
+            .part_library
+            .iter()
+            .map(|(id, _)| id.clone())
+            .find(|id| !o.parts.contains_key(id))
+            .unwrap();
+        let copy = store::vendor_path(&o.dir, ItemKind::Part, &id).unwrap();
+        let ids = [id.as_str(), "no.such.part"];
+        let plain = o.check_parts(ids).unwrap_err();
+        assert!(!plain.contains("could not be removed"), "{plain}");
+        o.block_copy_removal = true;
+        let e = o.check_parts(ids).unwrap_err();
+        assert!(e.starts_with(&plain), "the lookup error is kept: {e}");
+        assert!(e.contains("could not be removed"), "{e}");
+        assert!(e.contains(&copy.display().to_string()), "the copy is named: {e}");
+        assert!(!o.parts.contains_key(&id), "not loaded by a refused check");
+        assert!(!o.project.lock.parts.contains_key(&id));
     }
 
     #[test]
