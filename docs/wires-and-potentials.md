@@ -53,7 +53,9 @@ Some things do not connect:
   (`item:pin`).
 - A symbol does not join its own pins. Two of its pins are one net only when the rules above
   join them: a wire drawn between them, a path of wires through other pins or shared free ends,
-  the same potential name, interruption points with the same tag, or a jumper.
+  the same potential name, interruption points with the same tag, or a jumper. A tagged
+  interruption point is the exception: all of its wired pins join under its tag, even when no
+  other interruption point has that tag.
 
 ## Listing the nets
 
@@ -82,8 +84,10 @@ counting wire ends and bend points.
 A connection that already has a number on any of its wires keeps it, and its other wires take
 it. When its wires carry different numbers, the first one found (page by page, in the order the
 wires are stored) is kept and the others are replaced without a warning, which also clears the
-`check` warning about several numbers. `--overwrite` gives every connection a new number. A new number never repeats one in use. Wires that touch
-no pin get no number, and neither do wires on overview pages.
+`check` warning about several numbers. `--overwrite` gives every connection a new number. A new number never repeats one in use.
+Wires in a group that reaches no pin are left as they are, and so are wires on overview pages.
+A wire between two free points that shares an end with a wire on a pin is in that wire's net,
+so it gets the net's number.
 
 A number typed with `--number` is not checked when the wire is drawn. `check` warns when one
 connection carries several numbers ("one connection has wire numbers 1 and 2") and when one
