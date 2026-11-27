@@ -2834,11 +2834,12 @@ fn wire_tool(
     }
     if resp.double_clicked() {
         if let Some((start, mut via)) = ed.wire.take() {
-            // The first click of the double click already added this point as a bend.
-            if via.last() == Some(&cur) {
+            // The first click of the double click already added this point as a bend, if it was
+            // a click on a free point (a click on a pin tried to end the wire and added none).
+            let before = ed.wire_before_click.take();
+            if before.is_some() && via.last() == Some(&cur) {
                 via.pop();
             }
-            let before = ed.wire_before_click.take();
             finish_wire(open, ed, page, start, via, end);
             // Refused: the draft as it was before the double click, without the elbow its
             // first click may have added.
@@ -2851,6 +2852,7 @@ fn wire_tool(
     if resp.clicked_by(egui::PointerButton::Primary) {
         match ed.wire.take() {
             None => {
+                ed.wire_before_click = None;
                 ed.wire = Some((end, Vec::new()));
                 ed.wire_page = Some(page.id.clone());
                 ed.message =
@@ -2858,6 +2860,7 @@ fn wire_tool(
             }
             Some((start, mut via)) => {
                 if near.is_some() {
+                    ed.wire_before_click = None;
                     finish_wire(open, ed, page, start, via, end);
                 } else {
                     ed.wire_before_click = Some(via.clone());
@@ -4826,6 +4829,49 @@ mod tests {
         click_at(&ctx, &mut o, &mut ed, start, 3.1);
         assert_eq!(ed.message, "A wire needs two different ends.");
         assert_eq!(ed.wire.as_ref().map(|(_, via)| via.clone()), drawn);
+        assert!(o.project.pages[0].wires.is_empty());
+    }
+
+    #[test]
+    fn a_double_click_on_a_pin_whose_first_click_was_refused_keeps_every_bend() {
+        let (_tmp, mut o) = project();
+        let mut ed = Editor {
+            tool: Tool::Wire,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        painted(&ctx, &mut o, &mut ed, 0.5, vec![]);
+        // Where a click at `at` lands on the page, and a coil whose A1 is just there.
+        let at = egui::pos2(300.0, 300.0);
+        click_at(&ctx, &mut o, &mut ed, at, 1.0);
+        let spot = ed.cursor.unwrap();
+        ed.wire = None;
+        let probe = o.place(0, "wc.coil", Point::new(100.0, 60.0)).unwrap();
+        let a1 = Endpoint::Pin {
+            item: probe.clone(),
+            pin: "A1".into(),
+        };
+        let off = o.end_pos(&o.project.pages[0], &a1).unwrap();
+        o.project.pages[0].symbols.retain(|s| s.id != probe);
+        let coil = o
+            .place(0, "wc.coil", Point::new(100.0 + spot.x - off.x, 60.0 + spot.y - off.y))
+            .unwrap();
+        let pin = Endpoint::Pin {
+            item: coil,
+            pin: "A1".into(),
+        };
+        assert_eq!(o.end_pos(&o.project.pages[0], &pin), Some(spot));
+        // A wire from that pin whose last bend was snapped onto the pin itself.
+        let bends = vec![Point::new(spot.x + 20.0, spot.y + 20.0), spot];
+        ed.wire = Some((pin.clone(), bends.clone()));
+        ed.wire_page = Some(o.project.pages[0].id.clone());
+        // A double click on the pin: its first click is refused, and so is the second, and
+        // neither takes a bend away.
+        click_at(&ctx, &mut o, &mut ed, at, 5.0);
+        click_at(&ctx, &mut o, &mut ed, at, 5.1);
+        assert_eq!(ed.message, "A wire needs two different ends.");
+        assert_eq!(ed.wire, Some((pin, bends)));
         assert!(o.project.pages[0].wires.is_empty());
     }
 
