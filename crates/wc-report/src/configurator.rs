@@ -509,3 +509,6 @@ fn mm(v: f64) -> String {
     let s = format!("{v:.1}");
     s.strip_suffix(".0").map(str::to_owned).unwrap_or(s)
 }
+
+#[cfg(test)]
+mod tests;
