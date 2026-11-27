@@ -41,7 +41,9 @@ description  Pump contactor
 $ wiringcraft device -K1 --part ""
 ```
 
-A tag that is drawn nowhere is an error (`error: no device -K9`).
+A tag that is neither drawn on a page nor in the devices table is an error
+(`error: no device -K9`). A device that is only stored, such as one given a description and not
+yet drawn, prints its data.
 
 ## location
 
@@ -198,8 +200,9 @@ VAR_GLOBAL
 END_VAR
 ```
 
-A point with no address, or one that is not a PLC address, is declared at `%I*` or `%Q*`, to be
-linked to the hardware in the PLC tool, and a warning says how many:
+A point with no address, or one that is not a PLC address for the point's direction (an input at
+`%Q0.0`, say), is declared at `%I*` or `%Q*`, to be linked to the hardware in the PLC tool, and
+a warning says how many:
 `warning: 2 point(s) have no PLC address and are declared at %I* or %Q*`. Addresses are read in
 the common spellings (`%IX0.0`, `%I0.0`, `I0.0`, `E0.0`, `IW64`, `A4.1`). `report plc` lists the
 same points as a table.
