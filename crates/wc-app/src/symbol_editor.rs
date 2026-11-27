@@ -281,6 +281,13 @@ fn next_name(name: &str) -> String {
     }
 }
 
+/// The name of the one pin `after` has more than `before`, the rest of the pins the same: a
+/// step that placed a pin.
+fn added_pin(before: &Symbol, after: &Symbol) -> Option<String> {
+    let (last, rest) = after.pins.split_last()?;
+    (rest == before.pins.as_slice()).then(|| last.name.clone())
+}
+
 /// The angle (degrees, y down, as [`Shape::Arc`] uses) of `p` seen from `c`.
 /// The angle of `p` seen from `c`, in degrees from 0 to 360 as [`Shape::Arc`] counts them.
 pub(crate) fn angle(c: Point, p: Point) -> f64 {
@@ -385,6 +392,13 @@ impl SymbolEditor {
         self.end_drag();
         if let Some(s) = self.undo.pop() {
             let now = std::mem::replace(&mut self.symbol, s);
+            // A pin placed by the Pin tool and taken back here gives its name back to the
+            // next pin, unless the field was changed since.
+            if let Some(name) = added_pin(&self.symbol, &now)
+                && self.pin_name == next_name(&name)
+            {
+                self.pin_name = name;
+            }
             self.redo.push(now);
             self.after_history_step();
         }
@@ -395,6 +409,11 @@ impl SymbolEditor {
         self.end_drag();
         if let Some(s) = self.redo.pop() {
             let now = std::mem::replace(&mut self.symbol, s);
+            if let Some(name) = added_pin(&now, &self.symbol)
+                && self.pin_name == name
+            {
+                self.pin_name = next_name(&name);
+            }
             self.undo.push(now);
             self.after_history_step();
         }
@@ -2188,6 +2207,29 @@ mod tests {
         // The mouse moving on after that moves nothing.
         e.drag_to(Point::new(5.0, 0.0));
         assert_eq!(e.symbol, moved);
+    }
+
+    #[test]
+    fn undoing_a_placed_pin_gives_its_name_back_to_the_next_pin() {
+        let mut e = SymbolEditor::new(Vec::new());
+        e.set_tool(Tool::Pin);
+        e.pin_name = "1".into();
+        e.click(Point::new(0.0, -5.0));
+        assert_eq!(e.pin_name, "2");
+        e.undo();
+        assert!(e.symbol.pins.is_empty());
+        assert_eq!(e.pin_name, "1", "the next pin is called 1 again");
+        e.redo();
+        assert_eq!(e.symbol.pins.len(), 1);
+        assert_eq!(e.pin_name, "2", "redo counts on again");
+
+        // A name typed in the field after placing stays as typed.
+        e.undo();
+        e.pin_name = "A1".into();
+        e.redo();
+        assert_eq!(e.pin_name, "A1");
+        e.undo();
+        assert_eq!(e.pin_name, "A1");
     }
 
     #[test]
