@@ -2416,7 +2416,7 @@ impl App {
         // An open dialog takes the keyboard: a shortcut would change the project under it (the
         // cover form's Cancel takes back only what the form changed).
         let dialog_open = self.dialog.is_some();
-        let mut out = ctrl_shortcuts(ctx, dialog_open, ctx.wants_keyboard_input());
+        let mut out = ctrl_shortcuts(ctx, dialog_open, text_field_focused(ctx));
         if dialog_open {
             return out;
         }
@@ -5393,6 +5393,14 @@ fn ctrl_shortcuts(ctx: &egui::Context, dialog_open: bool, typing: bool) -> Vec<A
     out
 }
 
+/// Whether a text field has the keyboard. `wants_keyboard_input` is not enough: it is true for
+/// any focused widget, such as a button reached with Tab, and that must not take Ctrl+A or undo
+/// from the app. Only a text field keeps an edit state under its id.
+fn text_field_focused(ctx: &egui::Context) -> bool {
+    ctx.memory(|m| m.focused())
+        .is_some_and(|id| egui::TextEdit::load_state(ctx, id).is_some())
+}
+
 /// The Ctrl keys a text field handles itself: select all, undo and redo.
 fn is_text_edit_key(k: Key) -> bool {
     matches!(k, Key::A | Key::Z | Key::Y)
@@ -7037,6 +7045,35 @@ mod renderer_tests {
         assert_eq!(typing(Modifiers::COMMAND, Key::F), [Action::Find]);
         // Out of a text field they are the app's again.
         assert_eq!(press_ctrl(&ctx, Modifiers::COMMAND, Key::A, false), [Action::SelectAll]);
+    }
+
+    /// A focused button is not a text field: Ctrl+A and undo stay the app's. A focused text
+    /// field is one.
+    #[test]
+    fn only_a_focused_text_field_counts_as_typing() {
+        let ctx = egui::Context::default();
+        let mut text = String::new();
+        let frame = |ctx: &egui::Context, text: &mut String| {
+            let mut button = egui::Id::NULL;
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    button = ui.add(egui::Button::new("Close")).id;
+                    ui.add(egui::TextEdit::singleline(text).id(egui::Id::new("field")));
+                });
+            });
+            button
+        };
+        let field = egui::Id::new("field");
+        let button = frame(&ctx, &mut text);
+        ctx.memory_mut(|m| m.request_focus(button));
+        frame(&ctx, &mut text);
+        assert!(ctx.wants_keyboard_input(), "the button has the focus");
+        assert!(!text_field_focused(&ctx), "a button is not a text field");
+        let ctrl_a = press_ctrl(&ctx, Modifiers::COMMAND, Key::A, text_field_focused(&ctx));
+        assert_eq!(ctrl_a, [Action::SelectAll]);
+        ctx.memory_mut(|m| m.request_focus(field));
+        frame(&ctx, &mut text);
+        assert!(text_field_focused(&ctx), "the text field has the keyboard");
     }
 
     /// The Ctrl shortcuts of one key press, with or without a text field having the keyboard.
