@@ -230,6 +230,31 @@ fn interruption_points_are_not_devices() {
 }
 
 #[test]
+fn the_contents_does_not_count_interruption_points_as_devices() {
+    let (mut p, mut s, parts) = fixture();
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    let before = contents(&i).rows[0][2].clone();
+    let arrow = sym("arrow", SymbolRole::Interruption, &["1"]);
+    s.insert(arrow.id.clone(), arrow);
+    p.pages[0].symbols.push(place("s9", "arrow", 200.0, Some("-L1")));
+    p.pages[0].symbols.push(place("s10", "lamp", 210.0, Some("-P9")));
+    let i = Inputs {
+        project: &p,
+        symbols: &s,
+        parts: &parts,
+    };
+    // The lamp adds a device, the tagged arrow does not.
+    let Ok(n) = before.parse::<usize>() else {
+        unreachable!("device count {before}")
+    };
+    assert_eq!(contents(&i).rows[0][2], (n + 1).to_string());
+}
+
+#[test]
 fn device_list_merges_symbols_of_one_device() {
     let (p, s, parts) = fixture();
     let t = device_list(&Inputs {
