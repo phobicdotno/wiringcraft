@@ -2512,6 +2512,8 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
     let known: BTreeMap<String, &String> = known_symbols.iter().map(|s| (normalise_block_name(s), s)).collect();
     let mut out = ImportedPage::default();
     let mut tag_warnings = Vec::new();
+    // Per symbol: how many were placed at an angle that is not a right angle, and the first.
+    let mut odd_angles: BTreeMap<String, (usize, f64)> = BTreeMap::new();
     let mut raw = Vec::new();
     let mut points = Vec::new();
     let mut plain = Vec::new();
@@ -2560,8 +2562,23 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
                     });
                 // Taken to a turn first: a huge angle (a damaged file) would saturate the cast
                 // and overflow when negated.
-                let turn = e.f(50).round().rem_euclid(360.0);
-                let rotation = Rotation::from_degrees(-(turn as i64)).unwrap_or_default();
+                // A symbol only turns in right angles: any other angle is taken to the nearest
+                // one and said, so a symbol turned 45 degrees in the file is not placed
+                // unturned without a word.
+                // Past a turn of a billion degrees (a damaged file) the angle has no meaning
+                // left: it is placed unturned, and said like any other odd angle.
+                let angle = e.f(50);
+                let turn = if angle.abs() < 1e9 {
+                    angle.round().rem_euclid(360.0)
+                } else {
+                    f64::NAN
+                };
+                let quarter = if turn.is_finite() { (turn / 90.0).round() } else { 0.0 };
+                if !turn.is_finite() || (turn - quarter * 90.0).abs() > 0.0 {
+                    let odd = odd_angles.entry((*id).clone()).or_insert((0, turn));
+                    odd.0 += 1;
+                }
+                let rotation = Rotation::from_degrees(-(quarter as i64) * 90).unwrap_or_default();
                 // An array places one symbol per copy. The copies share the attributes, so
                 // only the first keeps the device tag: the rest would repeat it.
                 let cells = ArrayCells::of(e);
@@ -2600,6 +2617,21 @@ pub(crate) fn page_of(d: &Drawing, scale: f64, known_symbols: &BTreeSet<String>)
             }
         }
         i = j;
+    }
+    for (id, (count, first)) in odd_angles {
+        let angle = if first.is_finite() {
+            format!("{first} degrees")
+        } else {
+            "an angle out of range".to_owned()
+        };
+        let what = if count == 1 {
+            "1 placed".to_owned()
+        } else {
+            format!("{count} placed, the first")
+        };
+        tag_warnings.push(format!(
+            "{id}: {what} at {angle}, turned to the nearest right angle (symbols only turn in right angles)"
+        ));
     }
     shapes(
         d,
@@ -3122,6 +3154,49 @@ mod tests {
             let p = page(&dxf(&ents, ""), 1.0, &known)?;
             assert_eq!(p.symbols.len(), 1, "{angle}");
             assert_eq!(p.symbols[0].rotation, want, "{angle}");
+        }
+        Ok(())
+    }
+
+    /// A symbol turned by an angle that is not a right angle is placed at the nearest one, and
+    /// the import says so, naming the symbol and the angle (#1793).
+    #[test]
+    fn a_symbol_at_an_odd_angle_is_turned_to_a_right_angle_and_said() -> Result<()> {
+        let known: BTreeSet<String> = ["wc.coil".to_string(), "wc.lamp".to_string()].into();
+        let ents = "0\nINSERT\n2\nWC.COIL\n10\n0\n20\n0\n50\n45\n\
+                    0\nINSERT\n2\nWC.COIL\n10\n9\n20\n0\n50\n100\n\
+                    0\nINSERT\n2\nWC.LAMP\n10\n0\n20\n9\n50\n90\n";
+        let p = page(&dxf(ents, ""), 1.0, &known)?;
+        let rotations: Vec<Rotation> = p.symbols.iter().map(|s| s.rotation).collect();
+        // 45 rounds up to a quarter turn, 100 down to one; DXF angles run the other way round.
+        assert_eq!(rotations, [Rotation::R270, Rotation::R270, Rotation::R270]);
+        let odd: Vec<&String> = p
+            .warnings
+            .iter()
+            .filter(|w| w.contains("nearest right angle"))
+            .collect();
+        assert_eq!(odd.len(), 1, "{:?}", p.warnings);
+        assert!(
+            odd.iter()
+                .any(|w| w.starts_with("wc.coil: 2 placed, the first at 45 degrees")),
+            "{:?}",
+            p.warnings
+        );
+        Ok(())
+    }
+
+    /// Right angles are placed as they are, without a warning.
+    #[test]
+    fn a_symbol_at_a_right_angle_is_not_warned_about() -> Result<()> {
+        let known: BTreeSet<String> = ["wc.coil".to_string()].into();
+        for angle in ["0", "90", "180", "270", "-90", "450"] {
+            let ents = format!("0\nINSERT\n2\nWC.COIL\n10\n0\n20\n0\n50\n{angle}\n");
+            let p = page(&dxf(&ents, ""), 1.0, &known)?;
+            assert!(
+                p.warnings.iter().all(|w| !w.contains("nearest right angle")),
+                "{angle}: {:?}",
+                p.warnings
+            );
         }
         Ok(())
     }
