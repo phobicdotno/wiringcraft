@@ -298,6 +298,13 @@ pub fn assistant_dir() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// The preferences saved as `on_disk` with only the window replaced.
+fn with_window(on_disk: Option<&str>, window: Window) -> Prefs {
+    let mut p: Prefs = on_disk.and_then(|t| toml::from_str(t).ok()).unwrap_or_default();
+    p.window = window;
+    p
+}
+
 impl Prefs {
     pub fn load() -> Self {
         path()
@@ -313,6 +320,19 @@ impl Prefs {
         }
         let Some(p) = path() else { return };
         if let Ok(text) = toml::to_string_pretty(self) {
+            let _ = wc_core::store::write_if_changed(&p, &text);
+        }
+    }
+
+    /// Save only the window's size and state over the preferences on disk, so closing one
+    /// instance never undoes a setting another instance saved meanwhile.
+    pub fn save_window(window: Window) {
+        if cfg!(test) {
+            return;
+        }
+        let Some(p) = path() else { return };
+        let on_disk = std::fs::read_to_string(&p).ok();
+        if let Ok(text) = toml::to_string_pretty(&with_window(on_disk.as_deref(), window)) {
             let _ = wc_core::store::write_if_changed(&p, &text);
         }
     }
@@ -354,6 +374,19 @@ mod tests {
         // A minimized window reports no usable size; the last one stays.
         w.remember(Some([0.0, 0.0]), None);
         assert_eq!(w.open_size(), [1000.0, 600.0]);
+    }
+
+    #[test]
+    fn closing_saves_the_window_over_what_another_instance_saved() {
+        let window = Window {
+            size: Some([1000.0, 700.0]),
+            maximized: false,
+        };
+        let on_disk = "live_check = false\n[window]\nsize = [1400.0, 860.0]\nmaximized = true\n";
+        let p = with_window(Some(on_disk), window);
+        assert!(!p.live_check, "a setting saved by another instance is kept");
+        assert_eq!(p.window, window);
+        assert_eq!(with_window(None, window).window, window);
     }
 
     #[test]

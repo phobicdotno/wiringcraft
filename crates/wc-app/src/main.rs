@@ -5878,7 +5878,7 @@ fn remember_window(window: &mut prefs::Window, v: &egui::ViewportInfo, zoom: f32
 impl eframe::App for App {
     /// The window's size and maximized state are kept for the next start.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.prefs.save();
+        prefs::Prefs::save_window(self.prefs.window);
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
