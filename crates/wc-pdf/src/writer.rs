@@ -357,6 +357,11 @@ impl Doc {
                 .iter()
                 .filter_map(|l| {
                     let target = index.get(&l.target_page_id)?;
+                    // A link placed at a position that is not a number (a hand-edited
+                    // project) is left out, like the text it covers, instead of a `NaN` rect.
+                    if !all_finite(&[l.min, l.max]) {
+                        return None;
+                    }
                     let x0 = l.min.0 * PT_PER_MM;
                     let x1 = l.max.0 * PT_PER_MM;
                     let y0 = h - l.max.1 * PT_PER_MM;
