@@ -8792,9 +8792,26 @@ mod tests {
         let file = dir.join(wc_core::translate::TRANSLATIONS_FILE);
         let before = std::fs::read_to_string(&file).unwrap();
         let err = cli(&dir, &["translations", "remove", "Cover", "--lang", "nb"]).unwrap_err();
-        assert!(err.contains("no translation") && err.contains("nb"), "{err}");
-        assert!(cli(&dir, &["translations", "remove", "Pumpz", "--lang", "de"]).is_err());
+        assert!(
+            err.contains("\"Cover\"") && err.contains("no translation into nb"),
+            "{err}"
+        );
+        let err = cli(&dir, &["translations", "remove", "Pumpz", "--lang", "de"]).unwrap_err();
+        assert!(
+            err.contains("\"Pumpz\"") && err.contains("no translation into de"),
+            "{err}"
+        );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+        // A hand-formatted file is not rewritten by a remove that finds nothing.
+        let hand = "# kept as typed\nsource = 'en'\n\n[[texts]]\nen = 'Pumps'\nnb = 'Pumper'\n";
+        std::fs::write(&file, hand).unwrap();
+        assert!(cli(&dir, &["translations", "remove", "Pumpz", "--lang", "nb"]).is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), hand);
+        std::fs::remove_file(&file).unwrap();
+        // Nor is one made when the project has none.
+        assert!(cli(&dir, &["translations", "remove", "Pumps", "--lang", "nb"]).is_err());
+        assert!(!file.exists());
+        std::fs::write(&file, before.as_str()).unwrap();
         // Setting a translation to what it already is stays a quiet success.
         cli(&dir, &["translations", "--lang", "de", "set", "Pumps", "Pumpen"]).unwrap();
         assert!(

@@ -158,7 +158,8 @@ impl Dictionary {
 
 /// Set the translation of `text` (in the source language) into `lang` in the project folder's
 /// `translations.toml`, or remove it when `translation` is blank. The other translations in
-/// the file stay as they were. Returns whether the file changed. One language code is
+/// the file stay as they were. Returns whether the file changed: a call that changes no
+/// translation writes nothing. One language code is
 /// required, and not the source language: its texts are the project's.
 ///
 /// Calls made at the same time (the command line and the assistant, say) take turns: each
@@ -259,7 +260,13 @@ fn set_translation_checked(
             "{lang} is the source language: its texts are the project's own"
         )));
     }
+    let was = dict.clone();
     dict.set(text, &lang, translation);
+    if dict == was {
+        // Nothing to set or remove (a text with no translation, say): the file, whatever its
+        // layout, is left as it was, and none is made where there was none.
+        return Ok(false);
+    }
     meanwhile();
     if read()? != before {
         return Err(Error::Invalid(format!(
@@ -560,6 +567,23 @@ nb = ""
             Dictionary::load(empty.path())?.lookup("Pumps", "de").as_deref(),
             Some("Pumpen")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn removing_a_translation_that_is_not_there_writes_nothing() -> R {
+        // A hand-formatted file stays byte for byte as it was.
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join(TRANSLATIONS_FILE);
+        let hand = "# kept as typed\nsource = 'en'\n\n[[texts]]\nen = 'Pumps'\nnb = 'Pumper'\n";
+        std::fs::write(&file, hand)?;
+        assert!(!set_translation(dir.path(), "Pumpz", "nb", "")?);
+        assert!(!set_translation(dir.path(), "Pumps", "de", "")?);
+        assert_eq!(std::fs::read_to_string(&file)?, hand);
+        // A project without a dictionary does not get one.
+        let empty = tempfile::tempdir()?;
+        assert!(!set_translation(empty.path(), "Pumps", "de", "")?);
+        assert!(!empty.path().join(TRANSLATIONS_FILE).exists());
         Ok(())
     }
 
