@@ -2248,6 +2248,45 @@ fn page_lines_say_which_pictures_they_leave_out() {
 }
 
 #[test]
+fn page_lines_say_which_texts_lose_a_character_beyond_u_ffff() {
+    let mut project = Project::new("Wide");
+    let mut p1 = Page::new("p1", "1", "One");
+    for text in ["Pump \u{1F600}", "Pump \u{1F600}", "Ålesund"] {
+        p1.graphics.push(Shape::Text {
+            at: Point::new(50.0, 50.0),
+            text: text.into(),
+            height: 3.0,
+            align: Default::default(),
+            angle: 0.0,
+        });
+    }
+    project.pages = vec![p1];
+    let (pages, report) = crate::page_lines(&project, &BTreeMap::new(), &Options::default());
+    assert!(dxf(&pages[0]).contains("\nPump ?\n"));
+    // Named once, however often the text is on the page; Å has a code and is not named.
+    assert_eq!(
+        report.warnings,
+        vec![
+            "page 1: the text \"Pump \u{1F600}\" is written as \"Pump ?\" in the DXF: a DXF has no code for \
+             characters beyond U+FFFF, such as emoji (the SVG export keeps them)"
+                .to_string()
+        ]
+    );
+    // For a log, the same warning without the text.
+    assert_eq!(
+        dxf_warnings(&pages[0], false),
+        vec![
+            "page 1: a text is written with \"?\" in the DXF: a DXF has no code for characters beyond \
+             U+FFFF, such as emoji (the SVG export keeps them)"
+                .to_string()
+        ]
+    );
+    // The SVG export keeps the character, so it says nothing.
+    let (_, svg_report) = page_drawings(&project, &BTreeMap::new(), &Options::default());
+    assert!(svg_report.warnings.is_empty(), "{:?}", svg_report.warnings);
+}
+
+#[test]
 fn portrait_large_and_custom_sheets_export_at_their_size() {
     let mut project = Project::new("Sizes");
     let sizes = [

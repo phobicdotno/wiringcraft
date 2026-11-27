@@ -322,6 +322,9 @@ struct App {
     open_url: Vec<String>,
     /// The last status message and message box written to the log, so each is logged once.
     logged: (String, String),
+    /// A message box's text and what the log gets instead, for a message that quotes drawing
+    /// text (drawings are never logged).
+    log_instead: Option<(String, String)>,
     /// The shared work session, when one is running, and its windows.
     share: share::Share,
     /// The symbol editor window, while it is open.
@@ -815,6 +818,7 @@ impl App {
             assistant: agent::Assistant::default(),
             open_url: Vec::new(),
             logged: Default::default(),
+            log_instead: None,
             share: Default::default(),
             symbol_editor: None,
             find: None,
@@ -1049,7 +1053,8 @@ impl App {
                     }
                     Picked::Cancelled => return,
                 };
-                self.dialog = Some(Dialog::Message(note + &export_drawings_to(open, &dir)));
+                let (shown, logged) = export_drawings_logged(open, &dir);
+                self.show_message_logged_as(note.clone() + &shown, note + &logged);
             }
             Pending::Export(Export::WagoConfigurator) if nothing_for_configurator(open) => {
                 self.dialog = Some(Dialog::Message(export_wago_configurator_to(
@@ -5697,6 +5702,12 @@ fn export_drawings(open: &Open) -> String {
 
 /// [`export_drawings`] into the folder `dir`.
 fn export_drawings_to(open: &Open, dir: &Path) -> String {
+    export_drawings_logged(open, dir).0
+}
+
+/// [`export_drawings_to`], and the same message for the log: a DXF warning there names the page
+/// but not the drawing text (drawings are never logged).
+fn export_drawings_logged(open: &Open, dir: &Path) -> (String, String) {
     let pictures = wc_pdf::read_pictures(&open.dir, &open.project);
     let options = wc_pdf::Options {
         underlays: pictures.files,
@@ -5706,6 +5717,12 @@ fn export_drawings_to(open: &Open, dir: &Path) -> String {
         ..Default::default()
     };
     let (pages, report) = wc_pdf::page_drawings(&open.project, &open.symbols, &options);
+    // The DXF files write a character beyond U+FFFF as `?`; the warning names each such text,
+    // but not in the log.
+    let warnings = |name_texts: bool| -> Vec<String> {
+        let dxf = pages.iter().flat_map(|p| wc_pdf::dxf_warnings(p, name_texts));
+        report.warnings.iter().cloned().chain(dxf).collect()
+    };
     let mut used = std::collections::BTreeSet::new();
     let files: Vec<(String, &wc_pdf::PageDrawing)> = pages
         .iter()
@@ -5733,12 +5750,13 @@ fn export_drawings_to(open: &Open, dir: &Path) -> String {
             .filter(|name| dir.join(name).exists())
             .collect();
         if let Some(first) = taken.first() {
-            return format!(
+            let m = format!(
                 "Nothing exported: {} already has {} of the files this export writes ({first} and \
                  others), and they are not replaced. Pick an empty folder.",
                 dir.display(),
                 taken.len()
             );
+            return (m.clone(), m);
         }
     }
     // In another folder, what a failed export made is taken away again, so it can be retried;
@@ -5783,13 +5801,19 @@ fn export_drawings_to(open: &Open, dir: &Path) -> String {
                 m.push_str(&format!(" and {panels} panel layout(s)"));
             }
             m.push_str(&format!(" as SVG and DXF to\n{}", dir.display()));
-            if !report.warnings.is_empty() {
-                m.push_str("\n\nWarnings:\n");
-                m.push_str(&report.warnings.join("\n"));
-            }
-            m
+            let with = |w: Vec<String>| {
+                if w.is_empty() {
+                    m.clone()
+                } else {
+                    format!("{m}\n\nWarnings:\n{}", w.join("\n"))
+                }
+            };
+            (with(warnings(true)), with(warnings(false)))
         }
-        Err(e) => format!("Export failed: {e}"),
+        Err(e) => {
+            let m = format!("Export failed: {e}");
+            (m.clone(), m)
+        }
     }
 }
 
@@ -6698,6 +6722,12 @@ impl App {
         }
     }
 
+    /// Show the message box `shown`, and log `logged` instead of it.
+    fn show_message_logged_as(&mut self, shown: String, logged: String) {
+        self.log_instead = Some((shown.clone(), logged));
+        self.dialog = Some(Dialog::Message(shown));
+    }
+
     /// Status messages and message boxes not logged yet. A message box is logged once while it
     /// is open; after it closes, the same text is logged again the next time it shows.
     fn new_messages(&mut self) -> Vec<(applog::Level, String)> {
@@ -6709,7 +6739,11 @@ impl App {
         match &self.dialog {
             Some(Dialog::Message(m)) if *m != self.logged.1 => {
                 self.logged.1 = m.clone();
-                new.push((applog::Level::Warn, m.clone()));
+                let text = match &self.log_instead {
+                    Some((shown, instead)) if shown == m => instead.clone(),
+                    _ => m.clone(),
+                };
+                new.push((applog::Level::Warn, text));
             }
             Some(Dialog::Message(_)) => {}
             _ => self.logged.1.clear(),
@@ -7353,6 +7387,26 @@ mod marking_tests {
     }
 
     #[test]
+    fn drawings_warn_about_a_text_the_dxf_writes_with_a_question_mark() {
+        let (_tmp, mut o) = state::tests::project();
+        o.project.pages.truncate(1);
+        o.project.pages[0].number = "1".into();
+        o.project.pages[0].graphics.push(wc_core::Shape::Text {
+            at: wc_core::geom::Point::new(50.0, 50.0),
+            text: "Pump \u{1F600}".into(),
+            height: 3.0,
+            align: Default::default(),
+            angle: 0.0,
+        });
+        let own = o.dir.join("export").join("drawings");
+        let msg = export_drawings_to(&o, &own);
+        assert!(
+            msg.contains("Warnings:\npage 1: the text \"Pump \u{1F600}\" is written as \"Pump ?\" in the DXF"),
+            "{msg}"
+        );
+    }
+
+    #[test]
     fn drawings_replace_their_own_folder_also_when_it_is_picked_by_another_route() {
         let (_tmp, o) = state::tests::project();
         let own = o.dir.join("export").join("drawings");
@@ -7665,6 +7719,7 @@ mod nudge_tests {
             assistant: Default::default(),
             open_url: Vec::new(),
             logged: Default::default(),
+            log_instead: None,
             share: Default::default(),
             symbol_editor: None,
             find: None,
@@ -9333,6 +9388,7 @@ mod menu_action_tests {
             assistant: Default::default(),
             open_url: Vec::new(),
             logged: Default::default(),
+            log_instead: None,
             share: Default::default(),
             symbol_editor: None,
             find: None,
