@@ -3727,8 +3727,11 @@ fn run(mut cli: Cli) -> Res<()> {
                                 .map(|id| (ItemKind::Part, id)),
                         );
                     }
+                    // A part whose name is no file name (`ACME R24`) is not taken from a library
+                    // and stays a name on the device, as `macro place` leaves it: nothing to put back.
                     let vendored: Vec<(PathBuf, Option<Vec<u8>>)> = item_ids
                         .iter()
+                        .filter(|(kind, id)| *kind == ItemKind::Symbol || store::vendor_path(dir, *kind, id).is_ok())
                         .map(|(kind, id)| vendored_bytes(dir, *kind, id))
                         .collect::<Res<_>>()?;
                     // A link would become a plain file on the rollback, or be removed (#614).
@@ -3759,7 +3762,12 @@ fn run(mut cli: Cli) -> Res<()> {
                     refuse_linked_files(&before, "macro generate").map_err(undo_vendored)?;
                     // The symbol and part copies go back with the project's files, as they were
                     // before this run.
-                    before.extend(vendored.iter().cloned());
+                    // `put_files_back` puts the last entry back first, so the state from before
+                    // this run (the copies, read before any was taken) goes last in that order: a
+                    // `box.*` symbol the save snapshot also holds ends as it was before the run.
+                    let mut earliest = vendored.clone();
+                    earliest.append(&mut before);
+                    let before = earliest;
                     if let Err(err) = save(dir, &p) {
                         let failed = put_files_back(&before);
                         if failed.is_empty() {
@@ -6246,7 +6254,7 @@ fn refuse_linked_files<T>(files: &[(PathBuf, T)], command: &str) -> Result<(), S
         return Ok(());
     }
     Err(format!(
-        "{} {} a link; {command} does not replace project files that are links (copy each target over its link first)",
+        "{} {} a link; {command} does not replace project files that are links (copy each target over its link first, or remove a link whose target is gone)",
         linked.join(", "),
         if linked.len() == 1 { "is" } else { "are" }
     ))

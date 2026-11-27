@@ -70,11 +70,12 @@ pub fn rows_from_table(m: &Macro, cells: &[Vec<String>], lines: &[usize]) -> Res
                 format!("it has {}", known.join(", "))
             };
             return bad(format!(
-                "column {name:?} is not one of its placeholders ({has}; a column \"{SET_COLUMN}\" picks the value set)"
+                "line {}: column {name:?} is not one of its placeholders ({has}; a column \"{SET_COLUMN}\" picks the value set)",
+                line(0)
             ));
         };
         if column != Column::Unnamed && !seen.insert(key(name)) {
-            return bad(format!("the table has two columns {name:?}"));
+            return bad(format!("line {}: the table has two columns {name:?}", line(0)));
         }
         columns.push(column);
     }
@@ -202,7 +203,7 @@ fn widest_tag(tag: &crate::tag::DeviceTag, height: f64) -> crate::tag::DeviceTag
     widest
 }
 
-/// Points round a wire's label (its number, potential and cable core) as the PDF draws it: on
+/// Points round a wire's label (its potential and cable core; placing clears its number) as the PDF draws it: on
 /// the middle of its first segment, 2 mm high, right-aligned left of a vertical segment and
 /// centred above a horizontal one. A wire without a label, or whose first end is on a pin that
 /// is not there, adds nothing.
@@ -228,7 +229,8 @@ fn wire_label_points(
             .collect(),
     };
     for core in &cores {
-        let label: Vec<&str> = [w.number.as_deref(), w.potential.as_deref(), core.as_deref()]
+        // Placing clears a wire's number (`placement::place`), so only what is left is drawn.
+        let label: Vec<&str> = [w.potential.as_deref(), core.as_deref()]
             .into_iter()
             .flatten()
             .collect();
@@ -294,6 +296,26 @@ fn drawn_points(g: &Shape, pts: &mut Vec<Point>) {
             Some(parts) if !parts.is_empty() => parts.iter().for_each(|p| drawn_points(p, pts)),
             _ => pts.extend([*a, *b]),
         },
+        // Only the swept part, as the PDF draws it: `center + radius (cos, sin)` from `start` to
+        // `end`, through each quarter-turn angle on the way.
+        Shape::Arc {
+            center,
+            radius,
+            start,
+            end,
+        } if (end - start).abs() < 360.0 => {
+            let at = |deg: f64| {
+                let r = deg.to_radians();
+                Point::new(center.x + radius * r.cos(), center.y + radius * r.sin())
+            };
+            let (lo, hi) = if start <= end { (*start, *end) } else { (*end, *start) };
+            pts.extend([at(lo), at(hi)]);
+            let mut q = (lo / 90.0).ceil() * 90.0;
+            while q < hi {
+                pts.push(at(q));
+                q += 90.0;
+            }
+        }
         _ => {
             let (a, b) = g.bounds();
             pts.extend([a, b]);
@@ -834,6 +856,39 @@ mod tests {
         );
         assert!(min.x < plain_min.x && max.x >= plain_max.x);
         Ok(())
+    }
+
+    #[test]
+    fn an_arc_counts_as_its_sweep_and_a_wire_number_not_at_all() {
+        let mut pts = Vec::new();
+        drawn_points(
+            &Shape::Arc {
+                center: Point::new(0.0, 0.0),
+                radius: 150.0,
+                start: 0.0,
+                end: 90.0,
+            },
+            &mut pts,
+        );
+        let (min, max) = bounds_of(&pts);
+        assert!((min.x - 0.0).abs() < 1e-9 && (min.y - 0.0).abs() < 1e-9, "{min:?}");
+        assert!((max.x - 150.0).abs() < 1e-9 && (max.y - 150.0).abs() < 1e-9, "{max:?}");
+        let mut pts = Vec::new();
+        drawn_points(
+            &Shape::Arc {
+                center: Point::new(0.0, 0.0),
+                radius: 10.0,
+                start: 45.0,
+                end: 225.0,
+            },
+            &mut pts,
+        );
+        let (min, max) = bounds_of(&pts);
+        assert!(
+            (min.x + 10.0).abs() < 1e-9 && (max.y - 10.0).abs() < 1e-9,
+            "{min:?} {max:?}"
+        );
+        assert!(max.x < 10.0 && min.y > -10.0, "{min:?} {max:?}");
     }
 
     #[test]
