@@ -178,7 +178,9 @@ impl Network {
             out.push("a network has no name".to_owned());
         }
         let mut devices = BTreeSet::new();
-        let mut addresses: BTreeMap<&str, &str> = BTreeMap::new();
+        // One address can be written in more than one way: `FE80::1` and `fe80:0:0:0:0:0:0:1` are
+        // the same IPv6 address, `0x1A` and `0x1a` the same station address.
+        let mut addresses: BTreeMap<String, &str> = BTreeMap::new();
         // Station names are DNS-style on PROFINET, so `PLC` and `plc` are the same name.
         let mut stations: BTreeMap<String, &str> = BTreeMap::new();
         for n in &self.nodes {
@@ -192,7 +194,7 @@ impl Network {
             }
             let a = n.address.trim();
             if !a.is_empty()
-                && let Some(other) = addresses.insert(a, n.device.as_str())
+                && let Some(other) = addresses.insert(address_key(a), n.device.as_str())
             {
                 out.push(format!(
                     "network {name}: {} and {} have the same address {a}",
@@ -241,6 +243,15 @@ impl Network {
             }
         }
         out
+    }
+}
+
+/// `address` as compared for duplicates: an IP address in its standard form, any other address
+/// in lower case.
+fn address_key(address: &str) -> String {
+    match address.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.to_string(),
+        Err(_) => address.to_lowercase(),
     }
 }
 
@@ -347,5 +358,32 @@ cable = "-W20"
             ]
         );
         Ok(())
+    }
+
+    #[test]
+    fn warns_about_one_address_written_two_ways() {
+        let node = |device: &str, address: &str| Node {
+            device: device.into(),
+            address: address.into(),
+            ..Node::default()
+        };
+        let net = Network {
+            name: "PN1".into(),
+            nodes: vec![
+                node("-A1", "FE80::1"),
+                node("-K10", "fe80:0:0:0:0:0:0:1"),
+                node("-K11", "0x1A"),
+                node("-K12", "0x1a"),
+                node("-K13", "192.168.0.13"),
+            ],
+            ..Network::default()
+        };
+        assert_eq!(
+            net.warnings(),
+            [
+                "network PN1: -A1 and -K10 have the same address fe80:0:0:0:0:0:0:1",
+                "network PN1: -K11 and -K12 have the same address 0x1a",
+            ]
+        );
     }
 }
