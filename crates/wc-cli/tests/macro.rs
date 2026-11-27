@@ -214,10 +214,10 @@ fn a_retry_after_a_failed_placement_pins_every_symbol() -> TestResult {
     )?;
     assert!(wiringcraft(&dir, &["macro", "place", "p1", "pair", "--at", "0,0"]).is_err());
     let copy = wc_core::store::vendor_path(&dir, wc_core::lock::ItemKind::Symbol, "wc.coil")?;
-    assert!(copy.exists(), "the coil was copied before the failure");
+    assert!(!copy.exists(), "the coil's copy is taken back with the failure");
     assert!(
         !wc_core::store::load(&dir)?.lock.symbols.contains_key("wc.coil"),
-        "but not pinned"
+        "and it is not pinned"
     );
 
     let mut second: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&coil)?)?;
@@ -914,5 +914,179 @@ fn a_table_cut_short_inside_a_quoted_cell_places_nothing() -> TestResult {
         return Err("generated from a table cut short".into());
     };
     assert!(err.contains("line 4") && err.contains("not closed"), "{err}");
+    Ok(())
+}
+
+type Folder = std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>;
+
+/// Every file under `dir` with its bytes, by path. Folders are not listed: an empty
+/// `vendor/symbols` folder made for a copy that was taken back stays, as after `macro generate`.
+fn folder(dir: &Path) -> Result<Folder, std::io::Error> {
+    let mut found = std::collections::BTreeMap::new();
+    let mut open = vec![dir.to_path_buf()];
+    while let Some(at) = open.pop() {
+        for entry in std::fs::read_dir(&at)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                open.push(path);
+            } else {
+                let bytes = std::fs::read(&path)?;
+                found.insert(path, bytes);
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// The paths that are in one of two [`folder`] listings only, or differ between them.
+fn changed<'a>(before: &'a Folder, after: &'a Folder) -> Vec<&'a Path> {
+    let mut paths: Vec<&Path> = before
+        .iter()
+        .filter(|(path, bytes)| after.get(*path) != Some(bytes))
+        .chain(after.iter().filter(|(path, _)| !before.contains_key(*path)))
+        .map(|(path, _)| path.as_path())
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// A project with a page `p1` and a library `mine` holding the coil and the macro `pair`: the
+/// coil and a symbol no library has. Returns the project folder and the library's.
+fn project_with_a_pair_macro(
+    tmp: &Path,
+    second: &str,
+) -> Result<(std::path::PathBuf, std::path::PathBuf), Box<dyn std::error::Error>> {
+    let dir = tmp.join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    wiringcraft(&dir, &["page", "add", "p1", "--number", "2"])?;
+    let coil = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library/symbols/wc.coil.json");
+    let lib = tmp.join("lib");
+    std::fs::create_dir_all(lib.join("symbols"))?;
+    std::fs::create_dir_all(lib.join("macros"))?;
+    std::fs::copy(coil, lib.join("symbols/wc.coil.json"))?;
+    let pair = r#"{
+  "name": "Pair",
+  "symbols": [{"id": "s1", "symbol": "wc.coil", "at": {"x": 20.0, "y": 30.0}, "tag": "-K1"},
+              {"id": "s2", "symbol": "SECOND", "at": {"x": 40.0, "y": 30.0}, "tag": "-K2"}],
+  "anchor": {"x": 10.0, "y": 10.0}
+}"#;
+    std::fs::write(lib.join("macros/pair.json"), pair.replace("SECOND", second))?;
+    wiringcraft(&dir, &["lib", "add", "mine", "folder", lib.to_str().ok_or("path")?])?;
+    Ok((dir, lib))
+}
+
+#[test]
+fn a_placement_whose_second_symbol_cannot_be_taken_leaves_the_folder_as_it_was() -> TestResult {
+    // `wc.coil` is taken before `zz.nowhere`, which no library has (#1856).
+    let tmp = tempfile::tempdir()?;
+    let (dir, lib) = project_with_a_pair_macro(tmp.path(), "zz.nowhere")?;
+    let args = ["macro", "place", "p1", "pair", "--at", "50,60"];
+    let before = folder(&dir)?;
+    let Err(err) = wiringcraft(&dir, &args) else {
+        return Err("placed a macro with a symbol no library has".into());
+    };
+    assert!(err.contains("zz.nowhere"), "{err}");
+    assert!(
+        !dir.join("vendor/symbols/wc.coil.json").exists(),
+        "the first symbol's copy is taken back"
+    );
+    assert_eq!(
+        changed(&before, &folder(&dir)?),
+        Vec::<&Path>::new(),
+        "the folder is as it was"
+    );
+    // A copy the project has that differs from the library's, unpinned, is replaced when the
+    // symbol is taken; the run that fails puts it back.
+    let vendored = dir.join("vendor/symbols/wc.coil.json");
+    std::fs::create_dir_all(dir.join("vendor/symbols"))?;
+    let own = std::fs::read_to_string(lib.join("symbols/wc.coil.json"))?.replace("\"Relay coil\"", "\"Own coil\"");
+    std::fs::write(&vendored, &own)?;
+    let before = folder(&dir)?;
+    assert!(wiringcraft(&dir, &args).is_err(), "the second symbol is still missing");
+    assert_eq!(
+        std::fs::read_to_string(&vendored)?,
+        own,
+        "the project's copy is put back"
+    );
+    assert_eq!(
+        changed(&before, &folder(&dir)?),
+        Vec::<&Path>::new(),
+        "the folder is as it was"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_placement_whose_save_fails_leaves_the_folder_as_it_was() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (dir, _lib) = project_with_a_pair_macro(tmp.path(), "wc.coil")?;
+    let args = ["macro", "place", "p1", "pair", "--at", "50,60"];
+    let before = folder(&dir)?;
+    // A folder where a page's staging file goes makes the save fail (the store writes
+    // `<file>.tmp` and renames it into place).
+    let mut blockers = Vec::new();
+    for entry in std::fs::read_dir(dir.join("pages"))? {
+        let mut name = entry?.path().into_os_string();
+        name.push(".tmp");
+        blockers.push(std::path::PathBuf::from(name));
+    }
+    for blocker in &blockers {
+        std::fs::create_dir_all(blocker)?;
+    }
+    assert!(wiringcraft(&dir, &args).is_err(), "the save failed");
+    for blocker in &blockers {
+        std::fs::remove_dir(blocker)?;
+    }
+    assert!(
+        !dir.join("vendor/symbols/wc.coil.json").exists(),
+        "the symbol copy taken for it is taken back"
+    );
+    assert_eq!(
+        changed(&before, &folder(&dir)?),
+        Vec::<&Path>::new(),
+        "the folder is as it was"
+    );
+    // The same run without the folders in the way places the macro.
+    let ids = wiringcraft(&dir, &args)?;
+    assert_eq!(ids.split_whitespace().count(), 2, "{ids}");
+    assert!(dir.join("vendor/symbols/wc.coil.json").exists());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_placement_refuses_project_files_that_are_links() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let (dir, _lib) = project_with_a_pair_macro(tmp.path(), "wc.coil")?;
+    // The cover page is a link to a file kept elsewhere: a save would put a plain file there.
+    let cover = dir.join("pages/p0001.page.json");
+    let kept = tmp.path().join("cover.page.json");
+    std::fs::rename(&cover, &kept)?;
+    std::os::unix::fs::symlink(&kept, &cover)?;
+    let target = std::fs::read(&kept)?;
+    let before = folder(&dir)?;
+    let err = wiringcraft(&dir, &["macro", "place", "p1", "pair", "--at", "50,60"])
+        .err()
+        .ok_or("a linked page is refused")?;
+    assert!(err.contains("is a link; macro place"), "{err}");
+    assert!(
+        std::fs::symlink_metadata(&cover)?.file_type().is_symlink(),
+        "the link stays"
+    );
+    assert_eq!(std::fs::read(&kept)?, target, "the file it points to is as it was");
+    assert!(
+        !dir.join("vendor/symbols/wc.coil.json").exists(),
+        "the symbol copy taken before the refusal is taken back"
+    );
+    assert_eq!(
+        changed(&before, &folder(&dir)?),
+        Vec::<&Path>::new(),
+        "the folder is as it was"
+    );
     Ok(())
 }
