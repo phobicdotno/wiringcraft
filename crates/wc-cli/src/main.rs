@@ -3298,8 +3298,9 @@ fn run(mut cli: Cli) -> Res<()> {
                 from,
                 to,
                 via,
-                number,
-                potential,
+                // Trimmed, and a blank one left out, as the app's wire panel keeps them.
+                number: number.as_deref().and_then(wc_core::WireSpec::value),
+                potential: potential.as_deref().and_then(wc_core::WireSpec::value),
                 cable,
                 route: Default::default(),
                 spec: wc_core::WireSpec {
