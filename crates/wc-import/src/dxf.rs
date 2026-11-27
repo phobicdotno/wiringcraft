@@ -457,10 +457,6 @@ fn shapes(
     // are left out with it, as on a page.
     let mut in_invisible_insert = false;
     for (i, e) in ents.iter().enumerate() {
-        if e.kind == "ATTRIB" && in_invisible_insert {
-            continue;
-        }
-        in_invisible_insert = e.kind == "INSERT" && e.f(60) as i64 == 1;
         if *budget == 0 {
             // This entity and every one after it at this level are left out.
             let over = skipped.entry(OVER_LIMIT.to_owned()).or_default();
@@ -468,6 +464,11 @@ fn shapes(
             return;
         }
         *budget -= 1;
+        // Charged to the budget like any other entity, so a repeated block cannot walk them free.
+        if e.kind == "ATTRIB" && in_invisible_insert {
+            continue;
+        }
+        in_invisible_insert = e.kind == "INSERT" && e.f(60) as i64 == 1;
         let layer = e.layer();
         if skip_layer(&layer) {
             continue;
