@@ -8172,6 +8172,66 @@ mod nudge_tests {
         }
     }
 
+    /// Enter in either field of Save as macro saves the macro when it has a name, and does
+    /// nothing while the name is blank.
+    #[test]
+    fn enter_in_a_macro_field_saves_only_a_named_macro() {
+        let key = |key: Key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        // Tab to the next widget and say what took the focus: its kind and its text.
+        let tab = |app: &mut App, ctx: &egui::Context| {
+            let out = app_frame_output(app, ctx, vec![key(Key::Tab)], false);
+            out.platform_output.events.iter().find_map(|e| match e {
+                egui::output::OutputEvent::FocusGained(w) => Some((w.typ, w.current_text_value.clone())),
+                _ => None,
+            })
+        };
+        for (name, in_description) in [("Starter", false), ("Starter", true), ("  ", false), ("  ", true)] {
+            let (_tmp, mut app, ctx) = app(Point::new(55.0, 60.0), false);
+            theme::install_fonts(&ctx);
+            theme::apply(&ctx, app.prefs.theme);
+            // The selected coil is what the macro holds.
+            let clip = app.open.as_ref().unwrap().copy(app.ed.page, &app.ed.selection);
+            assert!(!clip.is_empty());
+            app.dialog = Some(Dialog::SaveMacro {
+                clip,
+                name: name.into(),
+                description: String::new(),
+                error: None,
+            });
+            app_frame(&mut app, &ctx, Vec::new(), false);
+            // Tab past the menus to the Name field, and on to Description if asked.
+            let mut tabs = 0;
+            while tab(&mut app, &ctx) != Some((egui::WidgetType::TextEdit, Some(name.to_owned()))) {
+                tabs += 1;
+                assert!(tabs < 200, "no Name field to tab to");
+            }
+            if in_description {
+                assert_eq!(
+                    tab(&mut app, &ctx),
+                    Some((egui::WidgetType::TextEdit, Some(String::new()))),
+                    "Description follows Name"
+                );
+            }
+            // A frame with the field focused, so Enter makes it lose the focus.
+            app_frame(&mut app, &ctx, Vec::new(), false);
+            app_frame(&mut app, &ctx, vec![key(Key::Enter)], false);
+            let saved = app.ed.message.starts_with("Saved macro");
+            if name.trim().is_empty() {
+                assert!(app.dialog.is_some(), "a blank name is not saved ({in_description})");
+                assert!(!saved, "{}", app.ed.message);
+            } else {
+                assert!(app.dialog.is_none(), "Enter saves ({in_description})");
+                assert!(saved, "{}", app.ed.message);
+            }
+        }
+    }
+
     /// An app with its coil moved one step: the project has unsaved changes.
     fn changed_app() -> (tempfile::TempDir, App, egui::Context) {
         let (tmp, mut app, ctx) = app(Point::new(55.0, 60.0), false);
