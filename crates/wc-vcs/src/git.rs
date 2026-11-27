@@ -415,6 +415,7 @@ impl Git {
         // fail (an unmerged index while resolving a merge has no tree); the commit still goes on,
         // and the reason is kept for the error if the commit then fails.
         let index_before = self.run(&["write-tree"]).map(|t| t.trim().to_owned());
+        self.refuse_unresolved_markers()?;
         match only {
             None => {
                 self.run(&["add", "-A"])?;
@@ -502,6 +503,58 @@ impl Git {
             });
         }
         Ok(self.head())
+    }
+
+    /// While a merge is being finished, refuse to commit when a file git still lists as
+    /// conflicted holds a conflict marker line (`<<<<<<<` or `>>>>>>>`): committing would stage
+    /// it as resolved and record the markers. Nothing is staged, so the merge stays as it was.
+    /// A conflicted file that is gone (resolved by removing it) is fine, and so is a conflicted
+    /// directory (a submodule), which holds no text; any other file that cannot be read is an
+    /// error naming it. Paths are the worktree's (`--no-relative`), so this also holds for a
+    /// project inside a parent repository.
+    fn refuse_unresolved_markers(&self) -> Result<()> {
+        if !self.git_path("MERGE_HEAD")?.exists() {
+            return Ok(());
+        }
+        // As bytes, without only git's line end: a root can end in a space or not be UTF-8, and
+        // on Unix in a CR, so a CR is only part of the line end on Windows.
+        let top = self.run_bytes(&["rev-parse", "--show-toplevel"])?;
+        let mut top = top.strip_suffix(b"\n").unwrap_or(&top);
+        if cfg!(windows) {
+            top = top.strip_suffix(b"\r").unwrap_or(top);
+        }
+        let root = self.dir.join(os_path(top));
+        let out = self.run_bytes(&["diff", "--no-relative", "--name-only", "--diff-filter=U", "-z"])?;
+        let mut left = Vec::new();
+        for path in out.split(|&b| b == 0).filter(|p| !p.is_empty()) {
+            let file = root.join(os_path(path));
+            let bytes = match std::fs::read(&file) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound || file.is_dir() => continue,
+                Err(source) => {
+                    return Err(Error::Io {
+                        path: file.display().to_string(),
+                        source,
+                    });
+                }
+            };
+            let marked = bytes
+                .split(|&b| b == b'\n')
+                .any(|line| line.starts_with(b"<<<<<<<") || line.starts_with(b">>>>>>>"));
+            if marked {
+                left.push(path_text(path));
+            }
+        }
+        if left.is_empty() {
+            return Ok(());
+        }
+        Err(Error::Git {
+            args: "commit".into(),
+            message: format!(
+                "these files still have merge conflict markers; resolve them first, or abort the merge: {}",
+                left.join(", ")
+            ),
+        })
     }
 
     /// Undo one earlier commit with a new commit that reverses it (the history keeps both).
