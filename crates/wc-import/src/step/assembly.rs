@@ -598,3 +598,256 @@ pub(super) fn place(
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The instances of `data`, a list of `#id=...;` statements, and a point lookup over them.
+    fn parsed(data: &str) -> BTreeMap<u64, Instance> {
+        super::super::parse(data).0
+    }
+
+    fn point_in(instances: &BTreeMap<u64, Instance>) -> impl Fn(u64) -> Option<[f64; 3]> + '_ {
+        |id| {
+            let (name, args) = simple(instances, id)?;
+            (name == "CARTESIAN_POINT").then_some(())?;
+            coords(args.get(1)?)
+        }
+    }
+
+    fn close(a: [f64; 3], b: [f64; 3]) -> bool {
+        (0..3).all(|k| (a[k] - b[k]).abs() < 1e-9)
+    }
+
+    /// A placement turned a quarter about z (x to y) and moved to (1, 2, 3).
+    fn quarter_turn() -> Placement {
+        Placement {
+            r: [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+            t: [1.0, 2.0, 3.0],
+        }
+    }
+
+    #[test]
+    fn a_placement_and_its_inverse_cancel_out() {
+        let p = quarter_turn();
+        let back = p.then(&p.inverse());
+        for q in [[0.0; 3], [5.0, -7.0, 2.5], [1e3, 0.0, -1e-3]] {
+            assert!(close(back.apply(q), q), "{:?}", back.apply(q));
+            assert!(close(p.inverse().apply(p.apply(q)), q));
+        }
+        // `then` runs the inner placement first: turn then move, not move then turn.
+        let moved = Placement {
+            t: [10.0, 0.0, 0.0],
+            ..Placement::IDENTITY
+        };
+        let turned = Placement {
+            t: [0.0; 3],
+            ..quarter_turn()
+        };
+        assert!(close(moved.then(&turned).apply([0.0; 3]), [0.0, 10.0, 0.0]));
+        assert!(close(turned.then(&moved).apply([0.0; 3]), [10.0, 0.0, 0.0]));
+        // A unit change scales the move and keeps the turn.
+        let inch = quarter_turn().moved_in(25.4);
+        assert!(close(inch.apply([0.0; 3]), [25.4, 50.8, 76.2]));
+        assert!(close(inch.turn([1.0, 0.0, 0.0]), [0.0, 1.0, 0.0]));
+    }
+
+    #[test]
+    fn a_placed_conic_turns_its_axes_but_does_not_move_them() {
+        let g = Geom::Conic {
+            centre: [1.0, 0.0, 0.0],
+            u: [2.0, 0.0, 0.0],
+            v: [0.0, 3.0, 0.0],
+        };
+        let Geom::Conic { centre, u, v } = quarter_turn().place(&g) else {
+            unreachable!()
+        };
+        assert!(close(centre, [1.0, 3.0, 3.0]));
+        assert!(close(u, [0.0, 2.0, 0.0]));
+        assert!(close(v, [-3.0, 0.0, 0.0]));
+    }
+
+    #[test]
+    fn axis_placements_with_bad_references_are_not_read() {
+        let instances = parsed(
+            "#1=CARTESIAN_POINT('',(1.,2.,3.));\n#2=DIRECTION('',(0.,0.,2.));\n#3=DIRECTION('',(0.,0.,0.));\n\
+             #10=AXIS2_PLACEMENT_3D('',#1,#2,$);\n\
+             #11=AXIS2_PLACEMENT_3D('',#99,#2,$);\n\
+             #12=AXIS2_PLACEMENT_3D('',#1,#3,$);\n\
+             #13=AXIS2_PLACEMENT_3D('',#1,#1,$);\n\
+             #14=AXIS2_PLACEMENT_3D('',#1,#2,#2);\n\
+             #15=AXIS2_PLACEMENT_3D('',#1,'z',$);\n",
+        );
+        let point = point_in(&instances);
+        // A good one, its axis made unit and x the world's.
+        let Some(p) = axis_placement(&instances, 10, &point) else {
+            unreachable!("a usable placement")
+        };
+        assert!(close(p.apply([1.0, 0.0, 1.0]), [2.0, 2.0, 4.0]));
+        // A reference direction along the axis falls back to the world's x.
+        let Some(on_axis) = axis_placement(&instances, 14, &point) else {
+            unreachable!("a usable placement")
+        };
+        assert_eq!(on_axis, p);
+        // Its origin missing, its axis of no length, a point as its axis, a string as its axis,
+        // and an instance that is not an axis placement at all.
+        for id in [11, 12, 13, 15, 1, 404] {
+            assert!(axis_placement(&instances, id, &point).is_none(), "#{id}");
+        }
+    }
+
+    #[test]
+    fn operator_placements_read_their_scale_and_side() {
+        let instances = parsed(
+            "#1=CARTESIAN_POINT('',(0.,0.,0.));\n#2=DIRECTION('',(0.,-1.,0.));\n\
+             #20=CARTESIAN_TRANSFORMATION_OPERATOR_3D('','',$,$,#1,$,$);\n\
+             #21=CARTESIAN_TRANSFORMATION_OPERATOR_3D('','',$,$,#1,0.,$);\n\
+             #22=CARTESIAN_TRANSFORMATION_OPERATOR_3D('','',$,$,#1,-2.,$);\n\
+             #23=CARTESIAN_TRANSFORMATION_OPERATOR_3D('','',$,$,#1,'big',$);\n\
+             #24=CARTESIAN_TRANSFORMATION_OPERATOR_3D($,#1,$,$);\n\
+             #25=CARTESIAN_TRANSFORMATION_OPERATOR_3D('','',$,#2,#1,3.,$);\n",
+        );
+        let point = point_in(&instances);
+        // No scale given is a scale of one.
+        assert_eq!(operator_placement(&instances, 20, &point), Some(Placement::IDENTITY));
+        // A scale of nothing, below nothing or not a number; too few attributes.
+        for id in [21, 22, 23, 24] {
+            assert!(operator_placement(&instances, id, &point).is_none(), "#{id}");
+        }
+        // axis2 against the world's y mirrors y, and the scale applies to every axis.
+        let Some(m) = operator_placement(&instances, 25, &point) else {
+            unreachable!("a usable operator")
+        };
+        assert!(close(m.apply([1.0, 1.0, 1.0]), [3.0, -3.0, 3.0]));
+    }
+
+    #[test]
+    fn frames_join_into_one_root_and_shorten_their_paths() {
+        let mut f = Frames((1..=5).map(|id| (id, id)).collect());
+        f.join(1, 2);
+        f.join(2, 3);
+        f.join(4, 5);
+        assert_eq!(f.find(3), f.find(1));
+        assert_ne!(f.find(3), f.find(4));
+        // Joining what is already joined changes nothing; an unknown id is its own frame.
+        let root = f.find(1);
+        f.join(3, 1);
+        assert_eq!(f.find(2), root);
+        assert_eq!(f.find(42), 42);
+        // After a find every member of a long path points straight at its root.
+        let mut long = Frames([(1, 1), (2, 1), (3, 2), (4, 3)].into_iter().collect());
+        assert_eq!(long.find(4), 1);
+        assert_eq!((long.0.get(&4), long.0.get(&3)), (Some(&1), Some(&1)));
+    }
+
+    /// A chain of `n` placements: representation #(1000 + k) placed in #(1000 + k + 1), each 1
+    /// further along x, the first holding the point #1 at the origin.
+    fn chain(n: u64) -> String {
+        let mut out = String::from("#1=CARTESIAN_POINT('',(0.,0.,0.));\n#2=REPRESENTATION_CONTEXT('','');\n");
+        for k in 0..=n {
+            let items = if k == 0 {
+                format!("#{},#1", 3000 + k)
+            } else {
+                format!("#{}", 3000 + k)
+            };
+            out.push_str(&format!(
+                "#{}=SHAPE_REPRESENTATION('',({items}),#2);\n#{}=AXIS2_PLACEMENT_3D('',#{},$,$);\n#{}=CARTESIAN_POINT('',({}.,0.,0.));\n",
+                1000 + k,
+                3000 + k,
+                4000 + k,
+                4000 + k,
+                k
+            ));
+        }
+        for k in 0..n {
+            out.push_str(&format!(
+                "#{}=(REPRESENTATION_RELATIONSHIP('','',#{},#{}) REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#{}) SHAPE_REPRESENTATION_RELATIONSHIP());\n#{}=ITEM_DEFINED_TRANSFORMATION('','',#{},#{});\n",
+                5000 + k,
+                1000 + k,
+                1001 + k,
+                6000 + k,
+                6000 + k,
+                3000 + k,
+                3001 + k
+            ));
+        }
+        out
+    }
+
+    fn place_text(text: &str) -> Placed {
+        let instances = parsed(text);
+        let point = point_in(&instances);
+        let pts: Vec<(u64, Geom)> = point(1).map(|p| (1, Geom::Point(p))).into_iter().collect();
+        assert_eq!(pts.len(), 1);
+        place(text, &instances, pts, &point, 1.0, &|_| Some(1.0))
+    }
+
+    #[test]
+    fn a_chain_as_deep_as_allowed_adds_up_and_one_deeper_is_cut() {
+        let n = MAX_DEPTH as u64;
+        let deepest = place_text(&chain(n));
+        assert_eq!((deepest.placements, deepest.missed, deepest.cut), (MAX_DEPTH, 0, false));
+        // Each placement moves the part 1 along x (from origin k to origin k + 1).
+        assert_eq!(deepest.points, vec![Geom::Point([n as f64, 0.0, 0.0])]);
+
+        let too_deep = place_text(&chain(n + 1));
+        assert!(too_deep.cut);
+        assert_eq!(too_deep.missed, 0);
+        // The part is never reached from the top, so it is measured as drawn.
+        assert_eq!(too_deep.points, vec![Geom::Point([0.0; 3])]);
+    }
+
+    #[test]
+    fn placements_naming_what_is_not_there_are_missed() {
+        // The part placed through a transformation between placements that are not in the
+        // file, by a relationship whose transformation is not there, and by a mapped item whose
+        // map is not there: none applies, and the part stays as drawn.
+        let text = format!(
+            "{}#7000=SHAPE_REPRESENTATION('',(#7001),#2);\n#7001=MAPPED_ITEM('',#8888,#3001);\n\
+             #7100=(REPRESENTATION_RELATIONSHIP('','',#1000,#7000) REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#7777) SHAPE_REPRESENTATION_RELATIONSHIP());\n",
+            chain(1).replace(
+                "ITEM_DEFINED_TRANSFORMATION('','',#3000,#3001)",
+                "ITEM_DEFINED_TRANSFORMATION('','',#9998,#9999)"
+            )
+        );
+        let placed = place_text(&text);
+        assert_eq!((placed.placements, placed.missed), (3, 3));
+        assert!(!placed.cut);
+        assert_eq!(placed.points, vec![Geom::Point([0.0; 3])]);
+    }
+
+    #[test]
+    fn a_part_mapped_into_itself_is_not_a_placement() {
+        // #1000 lists a mapped item of itself: a loop of one, which is not applied.
+        let text = format!(
+            "{}#1000=SHAPE_REPRESENTATION('',(#3000,#1,#7001),#2);\n#7001=MAPPED_ITEM('',#7002,#3000);\n#7002=REPRESENTATION_MAP(#3000,#1000);\n",
+            chain(0).replace("#1000=SHAPE_REPRESENTATION('',(#3000,#1),#2);\n", "")
+        );
+        let placed = place_text(&text);
+        assert_eq!((placed.placements, placed.missed, placed.cut), (1, 1, false));
+        assert_eq!(placed.points, vec![Geom::Point([0.0; 3])]);
+    }
+
+    #[test]
+    fn without_placements_points_only_take_the_file_unit() {
+        let text = "#1=CARTESIAN_POINT('',(1.,2.,3.));\n#2=REPRESENTATION_CONTEXT('','');\n#1000=SHAPE_REPRESENTATION('',(#1),#2);\n";
+        let instances = parsed(text);
+        let point = point_in(&instances);
+        let placed = place(
+            text,
+            &instances,
+            vec![(1, Geom::Point([1.0, 2.0, 3.0]))],
+            &point,
+            25.4,
+            &|_| Some(1.0),
+        );
+        assert_eq!((placed.placements, placed.missed, placed.cut), (0, 0, false));
+        assert!(placed.file_unit_used);
+        assert!(!placed.context_unit_unknown);
+        let [Geom::Point(p)] = placed.points[..] else {
+            unreachable!("one point: {:?}", placed.points)
+        };
+        assert!(close(p, [25.4, 50.8, 76.2]), "{p:?}");
+    }
+}
