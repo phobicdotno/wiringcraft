@@ -133,10 +133,11 @@ pin layer is left out. The entities read and left out are those of a page import
 
 SVG: pins are shapes (`circle`, `rect`, `line` and the like) with `id="pin:NAME"`,
 `data-pin="NAME"` or `class="pin"` (numbered by their place); they are not drawn. The pin sits
-at a circle's centre, a line's start or the middle of another shape. The marker must be on the
+at a circle's centre, a line's start, a path's first point (`d="M 30 5 ..."` gives 30, 5) or
+the middle of another shape. The marker must be on the
 shape itself: on a `<g>` group or a text it makes no pin, and the shapes inside are drawn. One
 SVG unit is one millimetre, unless the root `<svg>` gives a width in mm, cm, Q, in, pt or pc
-together with a `viewBox`, or such a height when the width is missing or a percentage
+together with a `viewBox`, or such a height when the width is missing, a percentage or `auto`
 (`height="10mm"` with `viewBox="0 0 40 20"` makes 40 units 20 mm). With both an absolute width
 and height, the `viewBox` is fitted into both as a browser does. Pins keep the order of the
 file. It
