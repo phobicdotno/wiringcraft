@@ -4485,10 +4485,9 @@ fn update_library_part(
         && dir.join(store::PROJECT_FILE).exists()
         && let Err(err) = &project
     {
-        eprintln!(
-            "warning: the project could not be read, so its copy of {part} is not updated: {}",
-            escape_field(err)
-        );
+        warn([format!(
+            "the project could not be read, so its copy of {part} is not updated: {err}"
+        )]);
     }
     let path = match &lib {
         Some(root) => {
@@ -4647,10 +4646,7 @@ fn update_library_part(
                     Ok(bytes) => put_file_back(&vendored, bytes.as_deref()),
                     Err(_) => Ok(()),
                 };
-                eprintln!(
-                    "warning: the project's copy of {part} was not updated: {}",
-                    escape_field(&why)
-                );
+                warn([format!("the project's copy of {part} was not updated: {why}")]);
                 if let Err(err) = restored {
                     return Err(format!(
                         "the project's copy of {part} could not be put back: {err}; run `lib status`"
@@ -6096,9 +6092,7 @@ fn import_qet(
             }
         };
         ids.insert(id, file.clone());
-        for w in warnings {
-            eprintln!("warning: {}: {w}", file.display());
-        }
+        warn(warnings.iter().map(|w| format!("{}: {w}", file.display())));
         imp.symbol.category = category.to_owned();
         imp.symbol.letter_code = letter_code.to_owned();
         let path = wc_library::write_symbol(lib, &imp.symbol).map_err(e)?;
