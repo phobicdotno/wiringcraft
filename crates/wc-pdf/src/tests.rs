@@ -1664,6 +1664,31 @@ fn a_contact_points_to_the_schematic_coil_not_the_overview_repeat() {
 }
 
 #[test]
+fn coils_of_one_tag_on_one_page_are_listed_by_column_not_by_drawing_order() {
+    let mut symbols = BTreeMap::new();
+    symbols.insert("coil".to_owned(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
+    let mut project = wc_core::Project::new("x");
+    let mut page = Page::new("p1", "1", "Control");
+    // Drawn right to left: the coil at column 7 first, then the one at column 2.
+    page.symbols.push(place("s1", "coil", 260.0, "-K1"));
+    page.symbols.push(place("s2", "coil", 80.0, "-K1"));
+    project.pages = vec![page];
+    let x = layout::CrossRefs::build(&project, &symbols);
+    let tag = DeviceTag::parse("-K1").ok();
+    let mains = tag
+        .as_ref()
+        .and_then(|t| x.mains.get(t))
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let found: Vec<(&str, String)> = mains.iter().map(|a| (a.item.as_str(), a.location())).collect();
+    assert_eq!(
+        found,
+        [("s2", "1/2.B".to_owned()), ("s1", "1/7.B".to_owned())],
+        "the coil at column 2 first"
+    );
+}
+
+#[test]
 fn a_coil_does_not_list_a_contact_repeated_on_an_overview_page() {
     let mut symbols = BTreeMap::new();
     symbols.insert("coil".to_owned(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
