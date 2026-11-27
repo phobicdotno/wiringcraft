@@ -3872,9 +3872,9 @@ fn run(mut cli: Cli) -> Res<()> {
                     // a save that fails) puts them back, so no page draws a symbol it did not.
                     let vendored = MacroCopies::read(dir, &copies, "macro generate")?;
                     take_macro_items(dir, &mut p, &copies, "generate the pages again").map_err(|x| vendored.undo(x))?;
-                    let extent = wc_core::generate::extent(&copies, |id| store::read_vendored_symbol(dir, id).ok());
                     let title = title.unwrap_or_else(|| m.name.clone());
-                    let generated = wc_core::generate::generate(&mut p, &copies, extent, size, &title)
+                    let symbol = |id: &str| store::read_vendored_symbol(dir, id).ok();
+                    let generated = wc_core::generate::generate(&mut p, &copies, symbol, size, &title)
                         .map_err(|x| vendored.undo(e(x)))?;
                     // A save that fails half way puts the project's files back, so a second run
                     // does not place the rows already written again.
