@@ -273,41 +273,15 @@ pub struct StripLayout {
     pub spares: Vec<String>,
 }
 
-/// A [`Jumper`] as written in the file, before it is checked.
-#[derive(Deserialize)]
-struct StoredJumper {
-    strip: DeviceTag,
-    terminals: Vec<String>,
-    #[serde(default)]
-    part: Option<String>,
-}
-
-impl TryFrom<StoredJumper> for Jumper {
-    type Error = String;
-
-    /// Refuses a jumper naming a number that cannot be a terminal of its strip (a hand edit or
-    /// another tool), so it never becomes a device tag the project cannot read back.
-    fn try_from(s: StoredJumper) -> Result<Self, String> {
-        for t in &s.terminals {
-            check_terminal_number(&s.strip, t)?;
-        }
-        Ok(Jumper {
-            strip: s.strip,
-            terminals: s.terminals,
-            part: s.part,
-        })
-    }
-}
-
 /// Read the `[[jumper]]` list as [`ProjectMeta::add_jumper`] keeps it: jumpers of one strip
-/// that share a terminal are one jumper (the first part in file order counts), and a jumper of
-/// fewer than two different terminals joins nothing, so it is left out rather than counting
-/// its part and showing as a jumper in the terminal plan and the configurator export.
+/// that share a terminal are one jumper (the first part in file order counts), rather than two
+/// jumpers each counting its part and showing in the terminal plan and the configurator
+/// export. Each jumper was checked on its own when read (see [`StoredJumper`]).
 fn merged_jumpers<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Jumper>, D::Error> {
     let list = Vec::<Jumper>::deserialize(d)?;
     let mut meta = ProjectMeta::new("");
     for j in list {
-        // Refused only for fewer than two terminals: the numbers were checked above.
+        // Each jumper was checked when read, so this only merges.
         let _ = meta.add_jumper_with(&j.strip, &j.terminals, j.part);
     }
     Ok(meta.jumpers)
@@ -2671,13 +2645,17 @@ mod tests {
         let old: ProjectMeta =
             toml::from_str("name = \"t\"\n[[jumper]]\nstrip = \"-X1\"\nterminals = [\"1\", \"2\"]\n")?;
         assert_eq!(old.jumpers[0].part, None);
-        // Hand-edited jumpers read as add_jumper keeps them: a two-level number is refused,
-        // a jumper that joins nothing is left out, two sharing a terminal are one.
+        // Hand-edited jumpers read as add_jumper keeps them: a two-level number or a jumper
+        // that joins nothing is refused, two sharing a terminal are one.
         let read = |jumpers: &str| toml::from_str::<ProjectMeta>(&format!("name = \"t\"\n{jumpers}"));
         let jumper = |strip: &str, t: &str| format!("[[jumper]]\nstrip = \"{strip}\"\nterminals = [{t}]\n");
         let err = read(&jumper("-X1", "\"1\", \"2.3\"")).err().map(|e| e.to_string());
         assert!(err.as_deref().is_some_and(|e| e.contains("one tag level")), "{err:?}");
-        assert!(read(&jumper("-X1", "\"1\", \"1\""))?.jumpers.is_empty());
+        let err = read(&jumper("-X1", "\"1\", \"1\"")).err().map(|e| e.to_string());
+        assert!(
+            err.as_deref().is_some_and(|e| e.contains("two different terminals")),
+            "{err:?}"
+        );
         let shared = read(&format!(
             "{}part = \"acme.bridge\"\n{}{}",
             jumper("-X1", "\"3\", \"4\""),
