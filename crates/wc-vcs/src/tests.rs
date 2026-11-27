@@ -816,6 +816,50 @@ fn a_new_branch_is_current_and_keeps_changes_not_yet_recorded() -> Result<()> {
 }
 
 #[test]
+fn a_page_version_that_cannot_be_read_is_listed_as_a_file_in_its_history() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    store::create(dir, "Demo")?;
+    let git = Git::new(dir);
+    git.init()?;
+    let path = dir.join("pages/p0001.page.json");
+    let good = std::fs::read(&path).map_err(|e| wc_core::Error::io(&path, e))?;
+    let write = |bytes: &[u8]| std::fs::write(&path, bytes).map_err(|e| wc_core::Error::io(&path, e));
+
+    write(b"<<<<<<< ours\n{}\n=======\n{}\n>>>>>>> theirs\n")?;
+    git.commit("Broken")?;
+    write(b"not a page")?;
+    git.commit("Still broken")?;
+    write(&good)?;
+    git.commit("Fixed")?;
+    write(b"not a page")?;
+    git.commit("Broken again")?;
+    std::fs::remove_file(&path).map_err(|e| wc_core::Error::io(&path, e))?;
+    git.commit("Removed")?;
+
+    let file = |status: &str| {
+        vec![Change::File {
+            path: "pages/p0001.page.json".into(),
+            status: status.into(),
+        }]
+    };
+    let h = page_history(&git, "p0001", 10)?;
+    let got: Vec<(&str, &[Change])> = h.iter().map(|v| (v.subject.as_str(), v.changes.as_slice())).collect();
+    let (removed, changed) = (file("removed"), file("changed"));
+    let expected: Vec<(&str, &[Change])> = vec![
+        ("Removed", &removed),
+        ("Broken again", &changed),
+        ("Fixed", &changed),
+        ("Still broken", &changed),
+        ("Broken", &changed),
+    ];
+    assert_eq!(got[..5], expected[..], "{got:?}");
+    // The first version, readable, is still an added page.
+    assert!(matches!(got.get(5), Some((_, [Change::PageAdded { .. }]))), "{got:?}");
+    Ok(())
+}
+
+#[test]
 fn a_path_that_is_not_utf8_is_read_in_quoted_form() {
     assert_eq!(git::path_text(b"pages/\xc3\xb8vre.page.json"), "pages/øvre.page.json");
     assert_eq!(git::path_text(b"two words.txt"), "two words.txt");
