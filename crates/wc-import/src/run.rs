@@ -142,15 +142,22 @@ pub fn plc_csv_bytes(dir: &Path, bytes: &[u8], log: &mut Log) -> Res<()> {
     Ok(())
 }
 
-/// Parts from a BMEcat catalogue into the library folder `lib` (`import parts-bmecat`).
+/// Parts from a BMEcat catalogue into the library folder `lib` (`import parts-bmecat`). A
+/// catalogue that gives no part is an error.
 pub fn parts_bmecat(file: &Path, lib: &Path, log: &mut Log) -> Res<()> {
     let (n, warnings) = import_bmecat(file, lib)?;
     for w in warnings {
         err!(log, "warning: {}", escape_field(&w));
     }
+    if n == 0 {
+        return Err(NO_PART.into());
+    }
     out!(log, "imported {n} part(s) into {}", lib.display());
     Ok(())
 }
+
+/// Why `import parts-csv` and `import parts-bmecat` fail on a file that gives no part.
+const NO_PART: &str = "no part could be imported from the file";
 
 /// Parts from an EDZ archive into the library folder `lib` (`import parts-edz`).
 pub fn parts_edz(file: &Path, lib: &Path, symbol_map: Option<&Path>, log: &mut Log) -> Res<()> {
@@ -165,7 +172,8 @@ pub fn parts_edz(file: &Path, lib: &Path, symbol_map: Option<&Path>, log: &mut L
     Ok(())
 }
 
-/// Parts from a CSV list into the library folder `lib` (`import parts-csv`).
+/// Parts from a CSV list into the library folder `lib` (`import parts-csv`). A list that gives
+/// no part is an error.
 pub fn parts_csv(file: &Path, lib: &Path, log: &mut Log) -> Res<()> {
     let bytes = read_file(file)?;
     let (parts, warnings) = crate::csv::file_rows(&bytes)
@@ -176,6 +184,9 @@ pub fn parts_csv(file: &Path, lib: &Path, log: &mut Log) -> Res<()> {
     }
     for w in warnings {
         err!(log, "warning: {}", escape_field(&w));
+    }
+    if parts.is_empty() {
+        return Err(NO_PART.into());
     }
     out!(log, "imported {} part(s) into {}", parts.len(), lib.display());
     Ok(())
@@ -518,7 +529,10 @@ pub fn archive(dir: &Path, file: &Path, first_page: usize, lib: Option<&Path>, l
         }
         // Read first: an entry that cannot be read writes nothing and keeps its prefix free.
         let read = match read_kicad(&String::from_utf8_lossy(&data), &prefix, 1.0, log) {
-            Ok(symbols) if symbols.is_empty() => continue,
+            Ok(symbols) if symbols.is_empty() => {
+                err!(log, "warning: {name}: no symbol could be imported");
+                continue;
+            }
             Ok(symbols) => symbols,
             Err(err) => {
                 err!(log, "warning: {name}: {err}");
@@ -826,15 +840,42 @@ pub fn import_pdf(dir: &Path, file: &Path, first_page: usize, source: &str, log:
     for i in 0..traced.len() {
         number_free(&p, &(first_page + i).to_string())?;
     }
+    // Every page id too, and every picture a scanned page would be saved over: a later page's
+    // refusal must not come after an earlier page's scan replaced a picture (#1583).
+    for (i, t) in traced.iter().enumerate() {
+        let id = format!("pdf-{}", first_page + i);
+        // Page files are named by id, and the save refuses ids that differ only in case.
+        if let Some(pg) = p.pages.iter().find(|pg| pg.id.eq_ignore_ascii_case(&id)) {
+            return Err(format!(
+                "page {} exists; pick another --first-page",
+                escape_field(&pg.id)
+            ));
+        }
+        let Some(scan) = &t.scan else { continue };
+        let file = format!("{}/{id}.{}", wc_core::Underlay::DIR, scan.raster.format.extension());
+        // Some folders do not tell `PDF-5.png` from `pdf-5.png`, and `underlays/./pdf-5.png` or
+        // `underlays\pdf-5.png` in a project file names the same picture.
+        let parts = |f: &str| -> Vec<String> {
+            f.split(['/', '\\'])
+                .filter(|s| !s.is_empty() && *s != ".")
+                .map(str::to_ascii_lowercase)
+                .collect()
+        };
+        let uses = |pg: &&Page| pg.underlay.as_ref().is_some_and(|u| parts(&u.file) == parts(&file));
+        if let Some(pg) = p.pages.iter().find(uses) {
+            return Err(format!(
+                "the scanned sheet of page {} would replace {file}, the picture under page {}; pick another --first-page",
+                first_page + i,
+                escape_field(&pg.id)
+            ));
+        }
+    }
     let stem = file
         .file_stem()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     for (i, t) in traced.into_iter().enumerate() {
         let id = format!("pdf-{}", first_page + i);
-        if p.page(&id).is_some() {
-            return Err(format!("page {id} exists; pick another --first-page"));
-        }
         if t.graphics.is_empty() && t.scan.is_none() {
             // The reason can quote the file: written so it cannot send control sequences.
             let why = escape_field(t.scan_problem.as_deref().unwrap_or("no picture covers the page"));
@@ -2114,6 +2155,30 @@ mod tests {
     }
 
     #[test]
+    fn a_kicad_library_with_no_symbols_in_an_archive_is_warned_about() {
+        let tmp = tmp();
+        let dir = tmp.path().join("p");
+        assert!(store::save(&dir, &Project::new("t")).is_ok());
+        let file = tmp.path().join("plant.zip");
+        let empty: &[u8] = b"(kicad_symbol_lib (version 20231120))";
+        let bytes = zip_of(&[("a.pdf", &one_page_pdf()), ("empty.kicad_sym", empty)]);
+        assert!(std::fs::write(&file, bytes).is_ok());
+        let lib = tmp.path().join("lib");
+        let mut log = Log::default();
+        let r = archive(&dir, &file, 1, Some(&lib), &mut log);
+        assert!(r.is_ok(), "{r:?}");
+        let warnings: Vec<_> = log.warnings().collect();
+        assert_eq!(
+            warnings,
+            vec!["warning: empty.kicad_sym: no symbol could be imported"],
+            "{}",
+            log.text()
+        );
+        // The other entries still come in.
+        assert!(matches!(load(&dir), Ok(p) if p.pages.len() == 1));
+    }
+
+    #[test]
     fn an_old_xls_workbook_in_an_archive_is_skipped_with_a_reason() {
         let tmp = tmp();
         let dir = tmp.path().join("p");
@@ -2178,6 +2243,97 @@ mod tests {
         assert!(matches!(load(&dir), Ok(p) if p.pages.is_empty()));
         assert_eq!(page_after(MAX_FIRST_PAGE, 10), Ok(MAX_FIRST_PAGE + 10));
         assert!(page_after(usize::MAX - 1, 2).is_err());
+    }
+
+    /// A PDF of two scanned sheets: one grey picture over the whole of each page.
+    fn two_scans_pdf() -> Vec<u8> {
+        let content = "q 595 0 0 842 0 0 cm /Im Do Q";
+        let samples = [10u8, 20, 30, 40, 50, 60];
+        let page = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R /Resources << /XObject << /Im 5 0 R >> >> >>";
+        let mut b = format!(
+            "%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>\nendobj\n3 0 obj\n{page}\nendobj\n6 0 obj\n{page}\nendobj\n4 0 obj\n<< /Length {} >>\nstream\n{content}\nendstream\nendobj\n5 0 obj\n<< /Type /XObject /Subtype /Image /Width 3 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length {} >>\nstream\n",
+            content.len(),
+            samples.len()
+        )
+        .into_bytes();
+        b.extend_from_slice(&samples);
+        b.extend_from_slice(b"\nendstream\nendobj\n%%EOF\n");
+        b
+    }
+
+    /// A PDF import refuses a page id in use, or a scan that would be saved over a picture in
+    /// use, before the scan of any page is written (#1583): the project folder stays as it was.
+    #[test]
+    fn a_pdf_import_refuses_before_it_writes_the_scan_of_any_page() {
+        let tmp = tmp();
+        let file = tmp.path().join("scans.pdf");
+        assert!(std::fs::write(&file, two_scans_pdf()).is_ok());
+        let picture = format!("{}/pdf-5.png", wc_core::Underlay::DIR);
+        let project = |name: &str, pages: Vec<Page>| {
+            let dir = tmp.path().join(name);
+            let mut p = Project::new("t");
+            p.pages = pages;
+            assert!(store::save(&dir, &p).is_ok());
+            assert!(std::fs::create_dir_all(dir.join(wc_core::Underlay::DIR)).is_ok());
+            assert!(std::fs::write(dir.join(&picture), b"mine").is_ok());
+            dir
+        };
+
+        // The second page's id is taken: the first page's scan is not written over a picture.
+        let dir = project("id", vec![Page::new("pdf-6", "60", "Mine")]);
+        let before = files(&dir);
+        let r = pdf(&dir, &file, 5, &mut Log::default());
+        assert!(matches!(&r, Err(why) if why.starts_with("page pdf-6 exists;")), "{r:?}");
+        assert_eq!(files(&dir), before);
+
+        // An id that differs only in case is refused here too, not by the save after the write.
+        let dir = project("case", vec![Page::new("PDF-6", "60", "Mine")]);
+        let before = files(&dir);
+        let r = pdf(&dir, &file, 5, &mut Log::default());
+        assert!(matches!(&r, Err(why) if why.starts_with("page PDF-6 exists;")), "{r:?}");
+        assert_eq!(files(&dir), before);
+
+        // The first page's scan would replace the picture under another page.
+        let mut mine = Page::new("x", "60", "Mine");
+        mine.underlay = Some(wc_core::Underlay {
+            file: picture.clone(),
+            min: wc_core::Point::new(0.0, 0.0),
+            max: wc_core::Point::new(210.0, 297.0),
+        });
+        let dir = project("picture", vec![mine]);
+        let before = files(&dir);
+        let r = pdf(&dir, &file, 5, &mut Log::default());
+        assert!(
+            matches!(&r, Err(why) if why.contains(&format!("would replace {picture}, the picture under page x;"))),
+            "{r:?}"
+        );
+        assert_eq!(files(&dir), before);
+
+        // The same picture under another spelling of its path.
+        let mut dotted = Page::new("y", "61", "Mine");
+        dotted.underlay = Some(wc_core::Underlay {
+            file: format!("{}/./PDF-5.png", wc_core::Underlay::DIR),
+            min: wc_core::Point::new(0.0, 0.0),
+            max: wc_core::Point::new(210.0, 297.0),
+        });
+        let other = project("spelling", vec![dotted]);
+        let before_other = files(&other);
+        let r = pdf(&other, &file, 5, &mut Log::default());
+        assert!(
+            matches!(&r, Err(why) if why.contains("the picture under page y;")),
+            "{r:?}"
+        );
+        assert_eq!(files(&other), before_other);
+
+        // Free numbers go through, each page with its scan.
+        assert_eq!(pdf(&dir, &file, 7, &mut Log::default()), Ok(()));
+        for id in ["pdf-7", "pdf-8"] {
+            let scan = format!("{}/{id}.png", wc_core::Underlay::DIR);
+            assert!(dir.join(&scan).is_file(), "{scan}");
+            assert!(
+                matches!(load(&dir), Ok(p) if p.page(id).and_then(|pg| pg.underlay.as_ref()).is_some_and(|u| u.file == scan))
+            );
+        }
     }
 
     /// No import gives a new page a number another page has (#869): each route refuses, naming
@@ -2360,6 +2516,28 @@ mod tests {
                 .ends_with(&format!("imported 2 part(s) into {}", lib.display())),
             "{log:?}"
         );
+    }
+
+    #[test]
+    fn a_parts_list_or_catalogue_that_gives_no_part_fails() {
+        let t = tmp();
+        let lib = t.path().join("lib");
+        let csv = t.path().join("parts.csv");
+        assert!(std::fs::write(&csv, "order number;manufacturer\n").is_ok());
+        let mut log = Log::default();
+        assert_eq!(parts_csv(&csv, &lib, &mut log), Err(NO_PART.to_owned()));
+        assert!(!log.text().contains("imported"), "{log:?}");
+        let xml = t.path().join("cat.xml");
+        assert!(
+            std::fs::write(
+                &xml,
+                "<BMECAT version=\"2005\"><T_NEW_CATALOG></T_NEW_CATALOG></BMECAT>"
+            )
+            .is_ok()
+        );
+        let mut log = Log::default();
+        assert_eq!(parts_bmecat(&xml, &lib, &mut log), Err(NO_PART.to_owned()));
+        assert!(!lib.exists());
     }
 
     /// Every file under `dir` with its bytes.

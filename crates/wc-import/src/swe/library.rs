@@ -1144,3 +1144,6 @@ pub fn link_parts(built: &mut Built, parts: &[Part]) -> usize {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod edge_tests;

@@ -91,7 +91,8 @@ impl Macro {
     }
 
     /// Check the placeholders and value sets: names are unique and not empty, value sets only
-    /// fill declared placeholders, and every placeholder the texts use is declared.
+    /// fill declared placeholders, every placeholder the texts use is declared, symbol ids are
+    /// unique and wires only end on the macro's own symbols.
     pub fn check(&self) -> Result<()> {
         let bad = |why: String| Err(Error::Invalid(format!("macro {}: {why}", self.name)));
         let mut names: Vec<&str> = Vec::new();
@@ -105,7 +106,15 @@ impl Macro {
             }
             names.push(n);
         }
-        let symbols: BTreeSet<&str> = self.symbols.iter().map(|s| s.id.as_str()).collect();
+        let mut symbols: BTreeSet<&str> = BTreeSet::new();
+        for s in &self.symbols {
+            if !symbols.insert(s.id.as_str()) {
+                return bad(format!(
+                    "two symbols share the id {}, so wires to it would join the wrong one",
+                    s.id
+                ));
+            }
+        }
         for w in &self.wires {
             for end in [&w.from, &w.to] {
                 if let Endpoint::Pin { item, .. } = end
@@ -209,7 +218,7 @@ impl Macro {
             missing.retain(|n| seen.insert(key(n)));
             return bad(format!("no value for {}", missing.join(", ")));
         }
-        // A wire value that came out empty is no value.
+        // A wire or device value that came out empty is no value.
         for w in &mut out.wires {
             for v in [&mut w.spec.section, &mut w.spec.colour, &mut w.spec.kind] {
                 if v.as_deref().is_some_and(|s| s.trim().is_empty()) {
@@ -218,10 +227,14 @@ impl Macro {
             }
         }
         for d in out.devices.values_mut() {
-            if d.part.as_deref().is_some_and(|s| s.trim().is_empty()) {
-                d.part = None;
+            // A part id is kept trimmed, as `device --part` stores it, so it matches its pin.
+            d.part = d.part.take().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
+            for a in &mut d.accessories {
+                a.part = a.part.trim().to_owned();
             }
-            d.accessories.retain(|a| !a.part.trim().is_empty());
+            d.accessories.retain(|a| !a.part.is_empty());
+            // An empty property is no property, as when typed empty in the device's form.
+            d.properties.retain(|_, v| !v.trim().is_empty());
         }
         Ok(out)
     }
@@ -448,9 +461,16 @@ pub fn macro_id(name: &str) -> String {
             id.push('-');
         }
     }
-    let id = id.trim_end_matches('-');
     let id: String = id.chars().take(100).collect();
-    if id.is_empty() { "macro".into() } else { id }
+    let id = id.trim_end_matches('-');
+    if id.is_empty() {
+        "macro".into()
+    } else if check_id(id).is_err() {
+        // A name Windows keeps for a device (`CON`, `AUX`, `COM1`) cannot be a file name.
+        format!("{id}-macro")
+    } else {
+        id.to_owned()
+    }
 }
 
 /// Save a macro as `<root>/macros/<id>.json`. Returns the path.
@@ -504,6 +524,7 @@ pub fn list_macros(root: &Path) -> Vec<(String, PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::DevicePart;
 
     fn err_of<T>(r: Result<T>) -> String {
         r.err().map(|e| e.to_string()).unwrap_or_default()
@@ -728,6 +749,44 @@ mod tests {
         let placed = m.apply(None, &all)?;
         // An empty part is no part.
         assert_eq!(placed.devices[&DeviceTag::parse("-Q1")?].part, None);
+        // A part typed with spaces around it is kept trimmed.
+        let mut spaced = all.clone();
+        spaced.insert("part".into(), " SIE.3RV2011-1AA10 ".into());
+        let placed = m.apply(None, &spaced)?;
+        assert_eq!(
+            placed.devices[&DeviceTag::parse("-Q1")?].part.as_deref(),
+            Some("SIE.3RV2011-1AA10")
+        );
+        // Accessory parts are trimmed too, and one that comes out blank is dropped.
+        let mut extras = m.clone();
+        if let Some(d) = extras.devices.values_mut().next() {
+            d.accessories = vec![
+                DevicePart {
+                    part: " nowhere.cap ".into(),
+                    qty: 2,
+                },
+                DevicePart {
+                    part: "  ".into(),
+                    qty: 1,
+                },
+            ];
+        }
+        let placed = extras.apply(None, &all)?;
+        assert_eq!(
+            placed.devices[&DeviceTag::parse("-Q1")?].accessories,
+            [DevicePart {
+                part: "nowhere.cap".into(),
+                qty: 2
+            }]
+        );
+        // A property that comes out empty is no property; one with text is kept.
+        let mut blank = m.clone();
+        if let Some(d) = blank.devices.values_mut().next() {
+            d.properties.insert("Address".into(), " {{part}} ".into());
+        }
+        let d = blank.apply(None, &all)?.devices[&DeviceTag::parse("-Q1")?].clone();
+        assert!(!d.properties.contains_key("Address"), "{:?}", d.properties);
+        assert_eq!(d.properties["Setting"], "3.2 A");
         assert!(m.apply(Some("3 kW"), &none).is_err());
 
         let mut undeclared = starter()?;
@@ -760,6 +819,16 @@ mod tests {
             pin: "1".into(),
         };
         assert!(err_of(dangling.check()).contains("s9"));
+
+        // Two symbols with one id are refused: placing would hang the wires on the wrong one.
+        let mut shared = starter()?;
+        let first = shared.symbols[0].id.clone();
+        let mut twin = shared.symbols[0].clone();
+        twin.tag = None;
+        shared.symbols.push(twin);
+        let err = err_of(shared.check());
+        assert!(err.contains(&format!("two symbols share the id {first}")), "{err}");
+        assert!(shared.apply(Some("3 kW"), &none).is_err());
 
         let mut stray = starter()?;
         stray.value_sets[0].values.insert("voltage".into(), "400".into());
@@ -903,6 +972,250 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(p, before, "nothing is placed");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod edge_tests {
+    use super::*;
+    use crate::project::{DevicePart, WireSpec};
+
+    fn err_of<T>(r: Result<T>) -> String {
+        r.err().map(|e| e.to_string()).unwrap_or_default()
+    }
+
+    fn placeholder(name: &str, default: &str) -> Placeholder {
+        Placeholder {
+            name: name.into(),
+            default: default.into(),
+            ..Default::default()
+        }
+    }
+
+    /// A terminal -X1 whose wire section and accessory are placeholders.
+    fn terminal() -> Result<Macro> {
+        let tag = DeviceTag::parse("-X1")?;
+        let device = Device {
+            description: "Terminal {{size}}".into(),
+            accessories: vec![
+                DevicePart {
+                    part: "{{bridge}}".into(),
+                    qty: 2,
+                },
+                DevicePart {
+                    part: "PXC.3030336".into(),
+                    qty: 1,
+                },
+            ],
+            ..Default::default()
+        };
+        Ok(Macro {
+            name: "Terminal".into(),
+            symbols: vec![PlacedSymbol {
+                id: "s1".into(),
+                symbol: "wc.terminal".into(),
+                at: Point::new(0.0, 0.0),
+                rotation: Default::default(),
+                mirror: false,
+                tag: Some(tag.clone()),
+            }],
+            wires: vec![Wire {
+                id: "w1".into(),
+                from: Endpoint::Pin {
+                    item: "s1".into(),
+                    pin: "1".into(),
+                },
+                to: Endpoint::Point {
+                    at: Point::new(0.0, 10.0),
+                },
+                via: vec![],
+                number: None,
+                potential: None,
+                cable: None,
+                route: Default::default(),
+                spec: WireSpec {
+                    section: Some("{{size}}".into()),
+                    colour: Some(" {{colour}} ".into()),
+                    kind: None,
+                },
+            }],
+            devices: [(tag, device)].into_iter().collect(),
+            placeholders: vec![
+                placeholder("size", "2.5"),
+                placeholder("bridge", ""),
+                placeholder("colour", "BU"),
+            ],
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn macro_ids_are_always_usable_file_ids() -> Result<()> {
+        // Cut at 100 characters, the id does not end on a dash.
+        let long = format!("{} b", "a".repeat(99));
+        let id = macro_id(&long);
+        assert_eq!(id, "a".repeat(99));
+        // Names Windows keeps for a device get a suffix, so the macro can be saved.
+        assert_eq!(macro_id("Aux"), "aux-macro");
+        assert_eq!(macro_id(" COM1 "), "com1-macro");
+        assert_eq!(macro_id("Aux contacts"), "aux-contacts");
+        assert_eq!(macro_id("--Straße--"), "strasse");
+        for name in [long.as_str(), "Aux", "con", "NUL", "lpt9", "Ærø", "", "  "] {
+            let id = macro_id(name);
+            assert!(check_id(&id).is_ok(), "{name:?} gave {id:?}");
+        }
+        let tmp = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
+        let m = terminal()?;
+        let path = write_macro(tmp.path(), &macro_id("Con"), &m)?;
+        assert_eq!(read_macro(&path)?, m);
+        Ok(())
+    }
+
+    #[test]
+    fn unusable_names_are_refused_by_check() -> Result<()> {
+        for name in ["", "   ", "{{x}}", "a}}b"] {
+            let mut m = terminal()?;
+            m.placeholders.push(placeholder(name, ""));
+            assert!(err_of(m.check()).contains("is not usable"), "{name:?}");
+        }
+        // An empty `{{}}` is a use of a placeholder that cannot be declared.
+        let mut m = terminal()?;
+        if let Some(d) = m.devices.values_mut().next() {
+            d.description = "Terminal {{ }}".into();
+        }
+        assert!(err_of(m.check()).contains("{{}} is used"));
+
+        let mut unnamed = terminal()?;
+        unnamed.value_sets.push(ValueSet {
+            name: "  ".into(),
+            ..Default::default()
+        });
+        assert!(err_of(unnamed.check()).contains("has no name"));
+
+        let mut twice = terminal()?;
+        for name in ["Small", " small "] {
+            twice.value_sets.push(ValueSet {
+                name: name.into(),
+                ..Default::default()
+            });
+        }
+        assert!(err_of(twice.check()).contains("value set small is there twice"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_set_cannot_be_chosen_on_a_macro_without_sets() -> Result<()> {
+        let m = terminal()?;
+        let none = BTreeMap::new();
+        let err = err_of(m.apply(Some("Big"), &none));
+        assert!(
+            err.contains("it has no value sets, so \"Big\" cannot be chosen"),
+            "{err}"
+        );
+        // A blank choice is no choice: the defaults are used.
+        let bridge: BTreeMap<String, String> = [("BRIDGE".to_owned(), "PXC.3030161".to_owned())].into_iter().collect();
+        let blank = m.apply(Some("   "), &bridge)?;
+        assert_eq!(blank, m.apply(None, &bridge)?);
+        assert_eq!(blank.wires[0].spec.section.as_deref(), Some("2.5"));
+        assert_eq!(blank.wires[0].spec.colour.as_deref(), Some(" BU "));
+        // With sets, a blank choice still asks for one.
+        let mut with_sets = m.clone();
+        with_sets.value_sets.push(ValueSet {
+            name: "Big".into(),
+            ..Default::default()
+        });
+        assert!(err_of(with_sets.apply(Some(" "), &bridge)).contains("choose a value set: Big"));
+        Ok(())
+    }
+
+    #[test]
+    fn empty_values_drop_wire_values_and_accessories() -> Result<()> {
+        let mut m = terminal()?;
+        m.value_sets.push(ValueSet {
+            name: "Bare".into(),
+            values: [("size", ""), ("bridge", "  "), ("colour", "")]
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect(),
+            ..Default::default()
+        });
+        // An empty value given on purpose is a value, even over a default.
+        let bare = m.apply(Some("bare"), &BTreeMap::new())?;
+        assert_eq!(bare.wires[0].spec.section, None);
+        assert_eq!(bare.wires[0].spec.colour, None, "only spaces left is no value");
+        let d = &bare.devices[&DeviceTag::parse("-X1")?];
+        assert_eq!(d.description, "Terminal ");
+        let parts: Vec<&str> = d.accessories.iter().map(|a| a.part.as_str()).collect();
+        assert_eq!(parts, ["PXC.3030336"], "the empty accessory is dropped, the other kept");
+        // Leaving `bridge` without any value is an error, not a dropped accessory.
+        m.value_sets.clear();
+        assert!(err_of(m.apply(None, &BTreeMap::new())).contains("no value for bridge"));
+        Ok(())
+    }
+
+    #[test]
+    fn renaming_leaves_other_texts_alone() -> Result<()> {
+        let mut m = terminal()?;
+        let before = m.clone();
+        m.rename_placeholders(&[]);
+        m.rename_placeholder("volts", "v");
+        assert_eq!(m, before, "nothing to rename changes nothing");
+        // The new name is trimmed, and an unclosed tail is kept as written.
+        if let Some(d) = m.devices.values_mut().next() {
+            d.description = "{{ SIZE }} and {{size".into();
+        }
+        m.rename_placeholder("size", "  width ");
+        let d = &m.devices[&DeviceTag::parse("-X1")?];
+        assert_eq!(d.description, "{{width}} and {{size");
+        assert_eq!(m.wires[0].spec.section.as_deref(), Some("{{width}}"));
+        assert_eq!(m.wires[0].spec.colour.as_deref(), Some(" {{colour}} "));
+        Ok(())
+    }
+
+    #[test]
+    fn a_declared_placeholder_can_change_case_but_needs_a_name() -> Result<()> {
+        let mut m = terminal()?;
+        assert!(err_of(m.rename_declared("size", "  ")).contains("placeholder size needs a new name"));
+        m.rename_declared("SIZE", "Size")?;
+        assert_eq!(m.placeholders[0].name, "Size");
+        assert_eq!(m.wires[0].spec.section.as_deref(), Some("{{Size}}"));
+        m.check()?;
+        Ok(())
+    }
+
+    #[test]
+    fn listing_is_sorted_and_skips_unusable_ids() -> Result<()> {
+        let tmp = tempfile::tempdir().map_err(|e| Error::io("tmp", e))?;
+        let m = terminal()?;
+        for id in ["zeta", "alpha", "mid-1"] {
+            write_macro(tmp.path(), id, &m)?;
+        }
+        let dir = tmp.path().join(MACROS_DIR);
+        for name in [".hidden.json", "bad name.json", "alpha.json.bak"] {
+            std::fs::write(dir.join(name), "{}").map_err(|e| Error::io("w", e))?;
+        }
+        // A name Windows keeps for a device is not a usable id; its file cannot be made there.
+        assert!(check_id("con").is_err());
+        #[cfg(not(windows))]
+        std::fs::write(dir.join("con.json"), "{}").map_err(|e| Error::io("w", e))?;
+        let listed = list_macros(tmp.path());
+        let ids: Vec<&str> = listed.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["alpha", "mid-1", "zeta"]);
+        assert!(listed.iter().all(|(id, p)| *p == dir.join(format!("{id}.json"))));
+        Ok(())
+    }
+
+    #[test]
+    fn placing_on_a_missing_page_is_refused_untouched() -> Result<()> {
+        // `bridge` has no default: give it a value so the macro applies.
+        let bridge: BTreeMap<String, String> = [("bridge".to_owned(), "PXC.3030161".to_owned())].into_iter().collect();
+        let m = terminal()?.apply(None, &bridge)?;
+        let mut p = Project::new("x");
+        p.pages.push(crate::project::Page::new("p1", "1", "Terminals"));
+        let before = p.clone();
+        assert!(err_of(place(&mut p, "p2", &m, Point::new(0.0, 0.0))).contains("no page p2"));
+        assert_eq!(p, before);
         Ok(())
     }
 }
