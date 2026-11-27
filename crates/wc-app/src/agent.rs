@@ -1540,6 +1540,26 @@ impl App {
         self.ed.show_page(page);
     }
 
+    /// The id of the page the editor shows, to find it again after pages are re-sorted.
+    fn shown_page_id(&self) -> Option<String> {
+        self.open
+            .as_ref()?
+            .project
+            .pages
+            .get(self.ed.page)
+            .map(|p| p.id.clone())
+    }
+
+    /// Show again the page with id `shown` (from [`Self::shown_page_id`]) at its index now, keeping
+    /// the selection. `false`, changing nothing, when that page is gone.
+    fn keep_shown(&mut self, shown: Option<String>) -> bool {
+        let Some(i) = shown.and_then(|id| self.open.as_ref()?.project.pages.iter().position(|p| p.id == id)) else {
+            return false;
+        };
+        self.ed.page = i;
+        true
+    }
+
     /// Take the message a command left in a dialog, so the model gets it as a result.
     fn take_message(&mut self) -> Option<String> {
         // Log it first: once taken, the frame's own logging never sees it.
@@ -1881,6 +1901,7 @@ impl App {
             "update_page" => {
                 let page = self.page_of(v, "page")?;
                 let size = page_size(v)?;
+                let shown = self.shown_page_id();
                 let open = need_open(self.open.as_mut())?;
                 // Someone else in a shared session has the page open: it is theirs to change.
                 if let Some(why) = open.held_reason(page) {
@@ -1911,17 +1932,22 @@ impl App {
                 if let Some(cover) = v.get("cover").and_then(Value::as_bool) {
                     open.set_page_cover(i, cover)?;
                 }
-                if self.ed.page == page {
-                    self.ed.page = i;
-                }
+                // A new number can re-sort the pages: the page shown stays shown.
+                self.keep_shown(shown);
                 Ok("Page changed.".into())
             }
             "delete_page" => {
                 let page = self.page_of(v, "page")?;
+                let shown = self.shown_page_id();
                 let open = need_open(self.open.as_mut())?;
                 let next = open.delete_page(page)?;
-                self.ed.page = next;
-                self.ed.selection.clear();
+                // Another page deleted: the page shown stays shown. The shown one deleted: the
+                // next page is shown instead.
+                if !self.keep_shown(shown) {
+                    self.ed.page = next;
+                    self.ed.selection.clear();
+                    self.ed.wire = None;
+                }
                 Ok("Page deleted.".into())
             }
             "duplicate_page" => {
@@ -1939,6 +1965,7 @@ impl App {
                     "down" => false,
                     other => return Err(format!("Unknown direction {other:?}: use up or down.")),
                 };
+                let shown = self.shown_page_id();
                 let open = need_open(self.open.as_mut())?;
                 let other = if up { page.checked_sub(1) } else { Some(page + 1) };
                 if let Some(why) = open
@@ -1947,8 +1974,9 @@ impl App {
                 {
                     return Err(why);
                 }
-                let i = open.move_page(page, up).ok_or("The page is already at that end.")?;
-                self.ed.page = i;
+                open.move_page(page, up).ok_or("The page is already at that end.")?;
+                // The page shown stays shown, whether it was the one moved or not.
+                self.keep_shown(shown);
                 Ok("Page moved.".into())
             }
             "show" => {
@@ -5357,6 +5385,65 @@ mod tests {
         }
         call(&mut a, "move_page", json!({"page": first, "direction": "down"})).unwrap();
         assert_eq!(order(&a)[1], first);
+    }
+
+    #[test]
+    fn the_page_shown_stays_shown_when_the_assistant_changes_another_page() {
+        let (_tmp, mut a) = app(vec![]);
+        call(&mut a, "add_page", json!({"title": "Pumps"})).unwrap();
+        call(&mut a, "add_page", json!({"title": "Valves"})).unwrap();
+        let ids = |a: &App| -> Vec<String> {
+            a.open
+                .as_ref()
+                .unwrap()
+                .project
+                .pages
+                .iter()
+                .map(|p| p.id.clone())
+                .collect()
+        };
+        let shown = |a: &App| ids(a)[a.ed.page].clone();
+        let before = ids(&a);
+        assert!(before.len() >= 4, "{before:?}");
+        // The user looks at the third page.
+        a.ed.page = 2;
+        let mine = before[2].clone();
+        // Moving the last page up swaps it with the page shown.
+        let last = before[before.len() - 1].clone();
+        call(&mut a, "move_page", json!({"page": last, "direction": "up"})).unwrap();
+        assert_eq!(shown(&a), mine);
+        // A first page renumbered to sort last moves the page shown one place up.
+        let first = before[0].clone();
+        call(&mut a, "update_page", json!({"page": first, "number": "99"})).unwrap();
+        assert_eq!(ids(&a).last(), Some(&first));
+        assert_eq!(shown(&a), mine);
+        // Deleting another page keeps the page shown, its selection and a wire started on it.
+        let line = Shape::Line {
+            a: Point::new(0.0, 0.0),
+            b: Point::new(5.0, 0.0),
+        };
+        a.open.as_mut().unwrap().project.pages[a.ed.page].graphics = vec![line];
+        let sel = vec![crate::state::Selection::Graphic(0)];
+        let wire = Some((
+            wc_core::Endpoint::Point {
+                at: Point::new(10.0, 10.0),
+            },
+            Vec::new(),
+        ));
+        a.ed.selection = sel.clone();
+        a.ed.wire = wire.clone();
+        let other = ids(&a).into_iter().find(|id| *id != mine).unwrap();
+        call(&mut a, "delete_page", json!({"page": other})).unwrap();
+        assert_eq!(shown(&a), mine);
+        assert_eq!(a.ed.selection, sel);
+        assert_eq!(a.ed.wire, wire);
+        // Deleting the page shown shows the next one, with no selection and no started wire.
+        let at = a.ed.page;
+        let next = ids(&a)[at + 1].clone();
+        call(&mut a, "delete_page", json!({"page": mine})).unwrap();
+        assert_eq!(shown(&a), next);
+        assert!(a.ed.selection.is_empty());
+        assert_eq!(a.ed.wire, None);
     }
 
     #[test]
