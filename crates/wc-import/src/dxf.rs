@@ -465,6 +465,12 @@ fn shapes(
         if skip_layer(&layer) {
             continue;
         }
+        // Code 60 = 1: the entity is invisible, so it is not drawn (an INSERT draws nothing of
+        // its block), except on the layers `hidden_text` names (a symbol's pin layers, where it
+        // still marks or names a pin).
+        if e.f(60) as i64 == 1 && !hidden_text(&layer) {
+            continue;
+        }
         // An extrusion pointing down (left by mirroring in AutoCAD) mirrors the entity's own
         // coordinate system in x. LINE, ELLIPSE and SPLINE are in world coordinates already.
         let flip = e.f_or(230, 1.0) < 0.0;
@@ -3091,6 +3097,45 @@ mod tests {
             assert_eq!(p.symbols.len(), 1, "{angle}");
             assert_eq!(p.symbols[0].rotation, want, "{angle}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn invisible_entities_are_not_drawn() -> Result<()> {
+        // A visible and an invisible (60 = 1) line, and a visible and an invisible insert of a
+        // block with one line: only the visible ones are drawn, and nothing is said.
+        let blocks = "0\nBLOCK\n2\nBOX\n0\nLINE\n10\n0\n20\n0\n11\n0\n21\n7\n0\nENDBLK\n";
+        let ents = "0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n\
+                    0\nLINE\n60\n1\n10\n0\n20\n0\n11\n9\n21\n0\n\
+                    0\nINSERT\n2\nBOX\n10\n20\n20\n0\n\
+                    0\nINSERT\n2\nBOX\n60\n1\n10\n40\n20\n0\n";
+        let (shapes, skipped) = drawn(ents, blocks)?;
+        let lines: Vec<(Point, Point)> = shapes
+            .iter()
+            .filter_map(|s| match s {
+                Shape::Line { a, b } => Some((*a, *b)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                (Point::new(0.0, 0.0), Point::new(5.0, 0.0)),
+                (Point::new(20.0, 0.0), Point::new(20.0, -7.0))
+            ],
+            "{shapes:?}"
+        );
+        assert!(skipped.is_empty(), "{skipped:?}");
+        // On a symbol's pin layer an invisible point still marks a pin.
+        let sym = symbol(
+            &dxf(
+                "0\nPOINT\n8\nPIN\n60\n1\n10\n0\n20\n0\n0\nLINE\n10\n0\n20\n0\n11\n5\n21\n0\n",
+                "",
+            ),
+            "s",
+            "S",
+        )?;
+        assert_eq!(sym.pins.len(), 1);
         Ok(())
     }
 
