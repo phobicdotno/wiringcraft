@@ -1460,6 +1460,43 @@ mod tests {
     }
 
     #[test]
+    fn a_table_generation_that_fails_takes_back_the_symbol_it_pinned_and_undo_does_too() {
+        let (_tmp, mut o, page, _a, _b) = setup();
+        let sel = o.select_all(page);
+        let clip = o.copy(page, &sel);
+        let path = o.save_macro(&clip, "Valves", "").unwrap();
+        let mut m = wc_core::macros::read_macro(&path).unwrap();
+        m.placeholders.push(wc_core::macros::Placeholder {
+            name: "what".into(),
+            ..Default::default()
+        });
+        // A symbol the project does not pin yet: placing takes it from the library.
+        for s in &mut m.symbols {
+            s.symbol = "wc.coil.valve".into();
+        }
+        let at = m.symbols[1].at;
+        m.symbols[1].at = Point::new(at.x + 3000.0, at.y);
+        wc_core::macros::write_macro_file(&path, &m).unwrap();
+        let before = o.project.clone();
+        assert!(!before.lock.symbols.contains_key("wc.coil.valve"));
+        let table = o.dir.join("valves.csv");
+        std::fs::write(&table, "what\nV1\n").unwrap();
+        // Too wide for any page: nothing is placed, and the pin and loaded symbol go back.
+        let err = o.generate_from_table(page, &path, &table, None).unwrap_err();
+        assert!(err.contains("does not fit"), "{err}");
+        assert_eq!(o.project, before);
+        assert!(!o.symbols.contains_key("wc.coil.valve"));
+
+        m.symbols[1].at = at;
+        wc_core::macros::write_macro_file(&path, &m).unwrap();
+        let done = o.generate_from_table(page, &path, &table, None).unwrap();
+        assert_eq!(done.copies, 1);
+        assert!(o.project.lock.symbols.contains_key("wc.coil.valve"));
+        assert!(o.undo());
+        assert_eq!(o.project, before, "undo takes the new pin back too");
+    }
+
+    #[test]
     fn macros_save_list_and_insert_like_a_paste() {
         let (_tmp, mut o, page, _a, _b) = setup();
         o.project.pages[page].wires[0].number = Some("7".into());

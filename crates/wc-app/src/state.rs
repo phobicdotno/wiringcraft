@@ -4104,14 +4104,37 @@ impl Open {
             .iter()
             .flat_map(|c| c.symbols.iter().map(|s| s.symbol.as_str()))
             .collect();
+        // The change before this one is settled first (its jumpers follow their terminals),
+        // so neither the copy generated from nor the undo step loses it.
+        self.follow_terminals();
+        // A symbol taken from the library is pinned and loaded here: when no copy can be
+        // placed that is taken back, and undo goes back to the project before the pin.
+        let before = self.project.clone();
+        let (symbols, library, terminals) = (
+            self.symbols.clone(),
+            self.library.clone(),
+            self.terminals_before.clone(),
+        );
         self.ensure_symbols(ids)?;
         let extent = generate::extent(&copies, |id| self.symbols.get(id).cloned());
         let size = self.project.pages.get(page).map(|p| p.size).unwrap_or_default();
         let mut project = self.project.clone();
-        let done = generate::generate(&mut project, &copies, extent, size, &m.name).map_err(|e| e.to_string())?;
-        self.checkpoint();
-        self.project = project;
-        Ok(done)
+        match generate::generate(&mut project, &copies, extent, size, &m.name) {
+            Ok(done) => {
+                self.project = before;
+                self.checkpoint();
+                self.project = project;
+                Ok(done)
+            }
+            Err(e) => {
+                self.project = before;
+                self.symbols = symbols;
+                self.library = library;
+                self.terminals_before = terminals;
+                self.touch();
+                Err(e.to_string())
+            }
+        }
     }
 
     /// Number the wires by `rule`, keeping numbers already given. One undo step; nothing is
