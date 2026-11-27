@@ -2213,6 +2213,11 @@ fn mtext_plain(s: &str) -> String {
                 Some('\\') => out.push('\\'),
                 Some('{') => out.push('{'),
                 Some('}') => out.push('}'),
+                // Codes with no argument: underline, overline and strike-through on and off,
+                // and the stacked-dimension wrap. Dropped, the text after them kept.
+                Some('L' | 'l' | 'O' | 'o' | 'K' | 'k' | 'X') => {}
+                // A non-breaking space and a column break read as a space.
+                Some('~' | 'N') => out.push(' '),
                 Some('U') => {
                     // `\U+XXXX`: a character by its code. Decoded here, so an escaped backslash
                     // before `U+` (`\\U+00C5`) stays as written. Any other `\U` (no `+`, or not
@@ -3464,6 +3469,17 @@ mod tests {
     #[test]
     fn mtext_formatting_is_stripped() {
         assert_eq!(mtext_plain(r"{\fArial|b1;Motor}\PM1"), "Motor M1");
+    }
+
+    #[test]
+    fn mtext_codes_without_an_argument_keep_the_text_after_them() {
+        assert_eq!(mtext_plain(r"\LMotor 1\l; Pump"), "Motor 1; Pump");
+        assert_eq!(mtext_plain(r"\OTop\o \KOld\k; New"), "Top Old; New");
+        assert_eq!(mtext_plain(r"A\~B; C"), "A B; C");
+        assert_eq!(mtext_plain(r"Col 1\NCol 2; x"), "Col 1 Col 2; x");
+        assert_eq!(mtext_plain(r"12\X3; y"), "123; y");
+        // Codes that take an argument still drop it.
+        assert_eq!(mtext_plain(r"{\H2.5;\C1;\LBig}"), "Big");
     }
 
     #[test]
