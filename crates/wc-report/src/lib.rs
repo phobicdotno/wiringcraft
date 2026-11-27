@@ -130,7 +130,8 @@ impl Table {
             .sort
             .iter()
             .filter_map(|entry| {
-                let (c, descending) = ReportLayout::sort_key(entry);
+                // Trimmed first, as the report layout dialog reads it: ` -Tag` is Tag, descending.
+                let (c, descending) = ReportLayout::sort_key(entry.trim());
                 index(c).map(|i| (i, descending))
             })
             .collect();
@@ -591,7 +592,7 @@ pub fn layout_problems_for(columns: &[String], layout: &ReportLayout, project: &
         }
     }
     for entry in &layout.sort {
-        let (c, _) = ReportLayout::sort_key(entry);
+        let (c, _) = ReportLayout::sort_key(entry.trim());
         if !known(c) {
             out.push(format!(
                 "report layout for \"{}\": cannot sort by \"{c}\", no such column",
