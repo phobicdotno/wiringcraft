@@ -583,3 +583,117 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod applog_edge_tests {
+    use super::*;
+
+    #[test]
+    fn keep_zero_starts_over_in_one_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut l = Logger::new(tmp.path(), 80, 0);
+        for i in 0..10 {
+            l.write(Level::Info, &format!("entry {i} padded out a little"));
+        }
+        assert!(l.error().is_none());
+        assert!(!l.rotated(1).exists(), "no rotated files with keep 0");
+        let text = fs::read_to_string(l.path()).unwrap();
+        assert!(text.len() <= 80);
+        assert!(text.contains("entry 9 "), "{text}");
+        assert!(!text.contains("entry 0 "), "{text}");
+        assert_eq!(l.tail(10_000), text);
+    }
+
+    #[test]
+    fn tail_of_a_missing_or_tiny_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut l = Logger::new(tmp.path().join("never-made"), 1000, 2);
+        assert_eq!(l.tail(100), "", "no files yet");
+        l.write(Level::Info, "only line");
+        // Less than one line asked for: no whole line fits, so nothing is returned.
+        assert_eq!(l.tail(5), "");
+        let all = l.tail(1000);
+        assert!(all.ends_with(" INFO  only line\n"), "{all}");
+        assert_eq!(l.tail(0), "");
+    }
+
+    #[test]
+    fn levels_are_padded_to_one_width() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut l = Logger::new(tmp.path(), 10_000, 1);
+        l.write(Level::Info, "a");
+        l.write(Level::Warn, "b");
+        l.write(Level::Error, "c");
+        let text = l.tail(10_000);
+        let rest: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.split_once(' ').map(|(_, r)| r))
+            .collect();
+        assert_eq!(rest, ["INFO  a", "WARN  b", "ERROR c"]);
+        // Each line starts with a timestamp like 2026-11-17T03:04:05Z.
+        for line in text.lines() {
+            let ts = line.split(' ').next().unwrap();
+            assert_eq!(ts.len(), 20, "{ts}");
+            assert!(ts.ends_with('Z') && ts.as_bytes()[10] == b'T', "{ts}");
+        }
+    }
+
+    #[test]
+    fn short_or_prefix_only_secrets_stay() {
+        let m = |s: &str| mask(s, None);
+        assert_eq!(m("sk-1234567"), "sk-1234567", "too short for a key");
+        assert_eq!(m("sk-12345678"), "sk-***");
+        assert_eq!(m("sk-ant-12345678"), "sk-ant-***", "the longer prefix wins");
+        assert_eq!(m("AKIAABCDEFGH1234"), "AKIA***");
+        assert_eq!(m("github_pat_abcdefgh_ij"), "github_pat_***");
+    }
+
+    #[test]
+    fn key_words_need_an_exact_match() {
+        let m = |s: &str| mask(s, None);
+        assert_eq!(m("3 tokens left"), "3 tokens left", "a longer word is not a key");
+        assert_eq!(m("passwords match"), "passwords match");
+        assert_eq!(m("TOKEN: abc def"), "TOKEN: *** def", "any case");
+        assert_eq!(m("apikey:xyz next"), "apikey:*** next");
+        assert_eq!(
+            m("api-key= value next"),
+            "api-key= *** next",
+            "empty value hides the next word"
+        );
+        assert_eq!(
+            m("ends with token"),
+            "ends with token",
+            "a key at the end hides nothing"
+        );
+        assert_eq!(m("secret, then -K1"), "secret, *** <tag>", "only one word is hidden");
+    }
+
+    #[test]
+    fn email_and_tag_edges() {
+        let m = |s: &str| mask(s, None);
+        assert_eq!(m("@user.name"), "@user.name", "nothing before the @");
+        assert_eq!(m("user@localhost"), "user@localhost", "no dot after the @");
+        assert_eq!(m("a@b.c"), "<email>");
+        assert_eq!(m("- + ="), "- + =", "a sign alone is no tag");
+        assert_eq!(m("=A1"), "<tag>");
+        assert_eq!(m("+12"), "+12", "a number is no tag");
+    }
+
+    #[test]
+    fn home_is_masked_only_when_given() {
+        assert_eq!(mask("/home/ola/x", None), "/home/ola/x");
+        assert_eq!(mask("/home/ola/x and /home/ola/y", Some("/home/ola")), "~/x and ~/y");
+        assert_eq!(mask("line\r\nnext", None), "line  next");
+    }
+
+    #[test]
+    fn times_before_1970_read_as_the_epoch() {
+        let t = UNIX_EPOCH - std::time::Duration::from_secs(10);
+        assert_eq!(timestamp(t), "1970-01-01T00:00:00Z");
+        assert_eq!(
+            timestamp(UNIX_EPOCH + std::time::Duration::from_secs(86_400 * 365 - 1)),
+            "1970-12-31T23:59:59Z"
+        );
+    }
+}
