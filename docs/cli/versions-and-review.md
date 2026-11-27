@@ -12,6 +12,13 @@ The examples use the pump starter project that `examples/demo.sh` builds, with p
 ## vcs: versions, branches and history
 
 A project folder is a git repository. `wiringcraft new` makes one unless you pass `--no-git`.
+For a project made with `--no-git`, `vcs init` makes it one later. It prints nothing:
+
+```sh
+$ wiringcraft vcs init
+$ git log --oneline
+78b1607 New project
+```
 
 | Command | What it does |
 |---|---|
@@ -107,6 +114,15 @@ c1 page 3 at 60,150  Ann  2026-11-27  (resolved)
     Is K1 rated for 24 V DC?
     > Bob (2026-11-27): Yes, coil is 24 V DC
 0 open, 1 resolved
+$ wiringcraft comment reopen c1
+$ wiringcraft comment list
+c1 page 3 at 60,150  Ann  2026-11-27
+    Is K1 rated for 24 V DC?
+    > Bob (2026-11-27): Yes, coil is 24 V DC
+1 open, 0 resolved
+$ wiringcraft comment remove c1
+$ wiringcraft comment list --all
+0 open, 0 resolved
 ```
 
 ## revision: revisions, clouds and the revision table
@@ -129,7 +145,8 @@ The coordinates are separate arguments, not `x,y` pairs.
 
 ```sh
 $ wiringcraft revision add A --text "First issue" --date 2026-11-20 --by Ann
-$ wiringcraft revision add B --text "Second lamp" --date 2026-11-27 --by Bob
+$ wiringcraft revision add B --text "Second lamp" --date 2026-11-26 --by Bob
+$ wiringcraft revision edit B --date 2026-11-27
 $ wiringcraft revision cloud p0003 195 135 225 165
 0
 $ wiringcraft revision cloud p0003 40 130 80 170 --rev A
@@ -161,16 +178,19 @@ It exits with an error when it finds at least one error. Warnings and notes do n
 $ wiringcraft check
 error   page 2: =PUMP+FIELD-M1 has no cable (check rule 1)
 warning page 2: =PUMP+CAB1-K1 draws 3 main, 2 NO contacts, its parts have 3 main, 1 NO (1 NO too many)
-1 errors, 1 warnings, 4 notes
-error: the project check found 1 errors
+1 error, 1 warning, 4 notes
+error: the project check found 1 error
 $ echo $?
 1
 ```
 
 ### Guard a commit or a CI job with check
 
-A git pre-commit hook that runs the check stops a commit while the project has errors. Git runs
-the hook for `wiringcraft vcs commit` as well as for a plain `git commit`. In the project folder:
+A git pre-commit hook that runs the check stops a commit while the project folder has errors. Git runs
+the hook for `wiringcraft vcs commit` as well as for a plain `git commit`. The check reads the files
+in the project folder, not what is staged. `wiringcraft vcs commit` stages every change first, so
+the two match. For a plain `git commit`, stage every fix before you commit, or the hook can let
+through staged files that still have errors. In the project folder:
 
 ```sh
 cat > .git/hooks/pre-commit <<'EOF'
@@ -186,7 +206,7 @@ Now a commit with an error in the project is refused, and the check's findings a
 $ wiringcraft vcs commit -m "Second lamp"
 error: git commit -q --allow-empty -m Second lamp: error   page 2: =PUMP+FIELD-M1 has no cable (check rule 1)
 ...
-error: the project check found 1 errors
+error: the project check found 1 error
 ```
 
 In a CI job, run the check as one step, with `wiringcraft` on the `PATH`. The step fails when the
