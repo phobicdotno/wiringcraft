@@ -317,11 +317,17 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
                     }
                 }
             }
+            // The description is kept whole (text around a comment, CDATA) and trimmed once at the end.
+            Event::Text(t) if in_info_description => match t.unescape() {
+                Ok(v) => description.push_str(&v),
+                Err(e) => warnings.push(format!(
+                    "the element's description has text that cannot be read ({e}); it is left out"
+                )),
+            },
+            Event::CData(t) if in_info_description => description.push_str(&String::from_utf8_lossy(&t)),
             Event::Text(t) => {
                 let v = t.unescape().map(|s| s.trim().to_owned()).unwrap_or_default();
-                if in_info_description {
-                    description.push_str(&v);
-                } else if let Some(lang) = &name_lang {
+                if let Some(lang) = &name_lang {
                     if !v.is_empty() {
                         names.push((lang.clone(), v));
                     }
@@ -423,7 +429,7 @@ pub fn element(text: &str, id: &str, scale: f64) -> Result<(Imported, Vec<String
         graphics,
         pins: out_pins,
         tag_at,
-        description,
+        description: description.trim().to_owned(),
     };
     Ok((Imported { symbol, qet_name }, warnings))
 }
@@ -678,6 +684,23 @@ mod tests {
         );
         let (imp, _) = element(&with, "q.k", DEFAULT_SCALE)?;
         assert_eq!(imp.symbol.description, "Relay coil & contact");
+        // Text around a comment keeps its spaces, and CDATA counts as text.
+        let split = el(
+            r#"<elementInformation name="description"> Relay <!-- x --> coil <![CDATA[& <contact>]]> </elementInformation>"#,
+        );
+        let (imp, warnings) = element(&split, "q.k", DEFAULT_SCALE)?;
+        assert_eq!(imp.symbol.description, "Relay  coil & <contact>");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // Text that cannot be decoded is left out with a warning that says why.
+        let bad = el(r#"<elementInformation name="description">Relay &bogus; coil</elementInformation>"#);
+        let (imp, warnings) = element(&bad, "q.k", DEFAULT_SCALE)?;
+        assert_eq!(imp.symbol.description, "");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("description") && w.contains("bogus")),
+            "{warnings:?}"
+        );
         for infos in [
             "",
             r#"<elementInformation show="1" name="description"/>"#,
