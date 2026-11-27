@@ -173,9 +173,9 @@ enum Cmd {
         #[arg(long)]
         no_git: bool,
         /// Start from a base project: a project folder or a git repository URL. Everything in
-        /// it is copied except its review comments and history: pages, settings, title block,
-        /// library sources, pictures, macros (`macros/`), device data (`devices.json`) and the
-        /// vendored library items (`vendor/`). `{name}` and `{date}` in its title block and
+        /// it is copied except its review comments, its history and symbolic links: pages,
+        /// settings, title block, library sources, pictures, macros (`macros/`), device data
+        /// (`devices.json`) and the vendored library items (`vendor/`). `{name}` and `{date}` in its title block and
         /// page titles become the new project's name and today's date.
         #[arg(long, value_name = "FOLDER_OR_URL")]
         template: Option<String>,

@@ -119,7 +119,8 @@ wiringcraft new /work/pump-station --name "Pump station" --template /work/base-p
 ```
 
 `--template` takes a project folder or a git repository URL. Everything in the base project is
-copied except its review comments and its git history. Then:
+copied except its review comments, its git history and symbolic links (a linked file or
+folder, such as a `macros` folder that is a link, is left out). Then:
 
 - `{name}` and `{date}` in the title-block fields and page titles become the new project's name
   and today's date. A base page titled `{name} control` becomes `Pump station control`.

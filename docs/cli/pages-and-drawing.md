@@ -19,7 +19,7 @@ commit (`--no-git` skips that). The name defaults to the folder's name. A new pr
 page, `p0001`, number 1, marked as the cover page.
 
 `--template <folder or git URL>` starts from a base project instead. Everything in it is copied
-except its review comments and history: pages, settings, title block, library sources,
+except its review comments, its history and symbolic links: pages, settings, title block, library sources,
 pictures, macros (`macros/`), device data (`devices.json`) and the vendored library items
 (`vendor/`). `{name}` and `{date}` in its title block and page titles become the new project's
 name and today's date.
