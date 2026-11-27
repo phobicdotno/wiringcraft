@@ -797,6 +797,13 @@ impl SymbolEditor {
         if s.graphics.is_empty() {
             out.push("Draw the symbol: it has no lines or shapes yet.".into());
         }
+        // A text cleared in its properties draws nothing and cannot be seen to select it.
+        if s.graphics
+            .iter()
+            .any(|g| matches!(g, Shape::Text { text, .. } if text.trim().is_empty()))
+        {
+            out.push("A text in the drawing is empty; type its words or delete it.".into());
+        }
         let mut names = std::collections::BTreeSet::new();
         for p in &s.pins {
             // Spaces around a name are dropped on save, so `A1` and `A1 ` are one name.
@@ -1977,6 +1984,33 @@ mod tests {
         assert_eq!(saved.symbol.pins[1].name, "A2");
         let back: Symbol = serde_json::from_str(&std::fs::read_to_string(&saved.path)?)?;
         assert!(back.pin("A2").is_some(), "{:?}", back.pins);
+        Ok(())
+    }
+
+    #[test]
+    fn a_text_cleared_in_its_properties_cannot_be_saved() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let mut e = SymbolEditor::new(vec![("mine".into(), tmp.path().join("lib"))]);
+        draw_coil(&mut e);
+        e.text = "K1".into();
+        e.set_tool(Tool::Text);
+        e.click(Point::new(5.0, 5.0));
+        assert!(e.problems().is_empty(), "{:?}", e.problems());
+        // Its words cleared in the Text field, leaving only spaces.
+        let Some(Shape::Text { text, .. }) = e.symbol.graphics.last_mut() else {
+            return Err("the text should be drawn last".into());
+        };
+        *text = "  ".into();
+        assert_eq!(
+            e.problems(),
+            ["A text in the drawing is empty; type its words or delete it."]
+        );
+        assert!(e.save().is_err_and(|m| m.contains("text in the drawing is empty")));
+        // Deleting it clears the problem.
+        e.selected = Some(Item::Shape(e.symbol.graphics.len() - 1));
+        e.delete_selected();
+        assert!(e.problems().is_empty(), "{:?}", e.problems());
+        e.save()?;
         Ok(())
     }
 
