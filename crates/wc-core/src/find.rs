@@ -371,7 +371,9 @@ pub fn replace_renaming(
     if let Some(to) = renames.values().find(|to| taken.contains(to)) {
         return Err(format!("{to} is already used."));
     }
-    // A renamed strip's spares go with it, so their new tags must be free too.
+    // A renamed strip's spares that are not renamed themselves go with it, so their new tags
+    // must be free, also of the other renames and of each other.
+    let mut spare_targets: std::collections::BTreeSet<DeviceTag> = std::collections::BTreeSet::new();
     for (from, to) in &renames {
         for spare in p
             .meta
@@ -379,9 +381,14 @@ pub fn replace_renaming(
             .map(|l| l.spares.as_slice())
             .unwrap_or_default()
         {
-            let mut new = to.clone();
+            let (mut old, mut new) = (from.clone(), to.clone());
+            old.product.push(spare.clone());
             new.product.push(spare.clone());
-            if p.devices.contains_key(&new) && !renames.contains_key(&new) {
+            if !p.devices.contains_key(&old) || renames.contains_key(&old) {
+                continue;
+            }
+            let held = p.devices.contains_key(&new) && !renames.contains_key(&new);
+            if held || targets.contains_key(&new) || !spare_targets.insert(new.clone()) {
                 return Err(format!("{new} is already used."));
             }
         }
@@ -399,7 +406,11 @@ pub fn replace_renaming(
         .collect();
     let mut next = 0usize;
     let mut placed: Vec<(DeviceTag, DeviceTag)> = Vec::new();
-    for (from, to) in &renames {
+    // Deepest tags first: a strip's spare renamed in the same replace moves under its own
+    // rename before the strip would take it along.
+    let mut order: Vec<(&DeviceTag, &DeviceTag)> = renames.iter().collect();
+    order.sort_by_key(|(from, _)| std::cmp::Reverse(from.product.len()));
+    for (from, to) in order {
         let temp = loop {
             let t = DeviceTag::parse(&format!("-WCFIND{next}")).map_err(|e| e.to_string())?;
             next += 1;
@@ -722,6 +733,54 @@ mod tests {
             Err("-X4.S1 is already used.".into())
         );
         assert_eq!(p, before);
+    }
+
+    #[test]
+    fn a_strip_and_its_spares_renamed_together() {
+        let mut p = sample();
+        let part = |p: &Project, t: &str| p.devices.get(&tag(t)).and_then(|d| d.part.clone());
+        let with_part = |part: &str| Device {
+            part: Some(part.into()),
+            ..Default::default()
+        };
+        p.meta.strips.push(crate::project::StripLayout {
+            strip: tag("-X12"),
+            order: Vec::new(),
+            spares: vec!["S2".into()],
+        });
+        p.devices.insert(tag("-X12"), Device::default());
+        p.devices.insert(tag("-X12.S2"), with_part("A"));
+        p.devices.insert(tag("-X2.S12"), with_part("B"));
+        let opts = FindOptions { match_case: true };
+        let pick = |p: &Project, query: &str, tags: &[&str]| -> Vec<Hit> {
+            find(p, query, opts)
+                .into_iter()
+                .filter(|h| h.kind == FindKind::Tag && tags.contains(&h.value.as_str()))
+                .collect()
+        };
+        // -X12 takes its spare to -X2.S2, where -X2.S12 is renamed too.
+        let before = p.clone();
+        let hits = pick(&p, "1", &["-X12", "-X2.S12"]);
+        assert_eq!(
+            replace(&mut p, &hits, "1", "", opts),
+            Err("-X2.S2 is already used.".into())
+        );
+        assert_eq!(p, before);
+
+        // A spare renamed with its strip goes where its own rename says, not where the strip
+        // would take it.
+        let hits = pick(&p, "2", &["-X12", "-X12.S2"]);
+        let (_, renamed) = replace_renaming(&mut p, &hits, "2", "5", opts).unwrap_or_default();
+        assert_eq!(renamed.get(&tag("-X12.S2")), Some(&tag("-X15.S5")));
+        assert_eq!(part(&p, "-X15.S5"), Some("A".into()));
+        assert!(!p.devices.contains_key(&tag("-X15.S2")));
+        assert_eq!(part(&p, "-X2.S12"), Some("B".into()));
+        assert!(p.devices.keys().all(|t| !t.to_string().contains("WCFIND")));
+
+        // A strip renamed to its own unassigned spare returns, and its layout stays.
+        p.rename_device(&tag("-X15"), &tag("-X15.S2"));
+        assert_eq!(p.meta.strips.len(), 1);
+        assert_eq!(p.meta.strips[0].strip, tag("-X15"));
     }
 
     #[test]
