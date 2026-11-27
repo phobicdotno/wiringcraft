@@ -26,7 +26,8 @@
 //! comments and `vendor/`. Macros and the translation dictionary are read and written by their
 //! own modules, with the same write helpers. Only `project.toml` is needed: a missing
 //! `devices.json` or `library.lock` reads as empty, and a missing folder as one with nothing in
-//! it. `docs/project-format.md` in the repository is the full reference for the format.
+//! it. [`docs/project-format.md`](https://github.com/phobicdotno/wiringcraft/blob/main/docs/project-format.md)
+//! in the repository is the full reference for the format.
 //!
 //! Every file is written deterministically (sorted keys, fixed indentation, trailing newline),
 //! atomically (temporary file, then rename) and only when its content changed, so version
