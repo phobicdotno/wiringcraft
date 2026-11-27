@@ -1839,19 +1839,24 @@ fn translated(dir: &Path, p: &Project, lang: &str) -> Res<(Project, Vec<wc_core:
 fn in_language(dir: &Path, p: Project, lang: Option<String>) -> Res<Project> {
     let Some(lang) = lang else { return Ok(p) };
     let (p, missing) = translated(dir, &p, &lang)?;
-    use std::io::Write as _;
-    let mut err = std::io::stderr().lock();
-    for m in &missing {
-        // As in `warn_levels`: a warning that cannot be written (stderr closed or full) is
-        // dropped, it must not stop the export.
-        let _ = writeln!(
+    warn_missing(&mut std::io::stderr().lock(), &missing);
+    Ok(p)
+}
+
+/// One warning on `err` for each text with no translation. As in [`warn_to`], a warning that
+/// cannot be written (stderr closed or full) is dropped with the rest: it must not stop the export.
+fn warn_missing(err: &mut impl std::io::Write, missing: &[wc_core::translate::Missing]) {
+    for m in missing {
+        let line = writeln!(
             err,
             "warning: no translation for {:?} ({})",
             escape_field(&m.text),
             escape_field(&m.used.join(", "))
         );
+        if line.is_err() {
+            return;
+        }
     }
-    Ok(p)
 }
 
 /// One check rule on a line: its kind, then each value it sets as `key=value` (keys it does
@@ -6597,6 +6602,22 @@ mod tests {
             "{shown}"
         );
         assert_eq!(shown.matches("could not be printed").count(), 1, "{shown}");
+    }
+
+    #[test]
+    fn a_missing_translation_warning_that_cannot_be_written_does_not_panic() {
+        let missing = vec![wc_core::translate::Missing {
+            text: "Motor".into(),
+            used: vec!["page 1 text".into()],
+        }];
+        // A closed standard error: the warning is dropped, and the export goes on.
+        warn_missing(&mut Closed, &missing);
+        let mut err = Vec::new();
+        warn_missing(&mut err, &missing);
+        let Ok(shown) = String::from_utf8(err) else {
+            unreachable!("the warning is UTF-8")
+        };
+        assert_eq!(shown, "warning: no translation for \"Motor\" (page 1 text)\n");
     }
 
     #[test]
