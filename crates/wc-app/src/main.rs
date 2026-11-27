@@ -845,7 +845,7 @@ impl App {
             find: None,
             pending: None,
             pending_for: None,
-            show_layers: false,
+            show_layers: prefs.show_layers,
             strip_editor: None,
             live: Default::default(),
             fetch: None,
@@ -1679,7 +1679,7 @@ impl App {
                 self.prefs.show_grid = !self.prefs.show_grid;
                 self.prefs.save();
             }
-            Action::Layers => self.show_layers = !self.show_layers,
+            Action::Layers => self.set_layers_open(!self.show_layers),
             Action::ToggleAutoWire => {
                 self.prefs.auto_wire = !self.prefs.auto_wire;
                 self.prefs.save();
@@ -6312,7 +6312,16 @@ impl App {
         if changed {
             self.layers_changed();
         }
+        self.set_layers_open(open);
+    }
+
+    /// Open or close the Layers window, and keep that in the preferences for the next start.
+    fn set_layers_open(&mut self, open: bool) {
         self.show_layers = open;
+        if self.prefs.show_layers != open {
+            self.prefs.show_layers = open;
+            self.prefs.save();
+        }
     }
 
     /// The layer list changed: save it and apply it to the editor at once, so a command run

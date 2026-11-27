@@ -27,6 +27,8 @@ pub struct Prefs {
     pub recent: Vec<PathBuf>,
     /// The assistant panel is shown.
     pub show_assistant: bool,
+    /// The Layers window (View > Layers) is open.
+    pub show_layers: bool,
     /// The assistant's model, effort and (when not in the environment) API key.
     pub assistant: wc_agent::Settings,
     /// Editor layers this user hid or locked on the canvas.
@@ -45,6 +47,7 @@ impl Default for Prefs {
             snap: 2.5,
             recent: Vec::new(),
             show_assistant: false,
+            show_layers: false,
             assistant: wc_agent::Settings::default(),
             layers: crate::layers::Layers::default(),
             live_check: true,
@@ -409,5 +412,17 @@ mod tests {
             home.join("Documents").join("WiringCraft")
         );
         assert!(projects_dir_in(None, None).is_absolute());
+    }
+
+    #[test]
+    fn the_layers_window_stays_open_across_a_restart_and_older_files_keep_it_closed() {
+        let p = Prefs {
+            show_layers: true,
+            ..Prefs::default()
+        };
+        let back: Prefs = toml::from_str(&toml::to_string_pretty(&p).unwrap()).unwrap();
+        assert!(back.show_layers);
+        let old: Prefs = toml::from_str("show_grid = false\n").unwrap();
+        assert!(!old.show_layers);
     }
 }
