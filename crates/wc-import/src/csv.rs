@@ -128,7 +128,7 @@ pub fn records(text: &str, delim: char) -> Rows {
 /// The separator a CSV text uses, guessed from its first line that is not blank: the header
 /// [`records`] reads, also when blank lines come before it.
 fn guess_delimiter(text: &str) -> char {
-    let header = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let header = text.split(['\r', '\n']).find(|l| !l.trim().is_empty()).unwrap_or("");
     [';', '\t', ',', '|']
         .into_iter()
         .max_by_key(|d| header.matches(*d).count())
@@ -586,6 +586,12 @@ mod tests {
         let given = Rows::from(vec![vec!["Order number".to_owned()], vec![String::new()]]);
         assert_eq!(parts_from_rows(&given)?.1, ["row 2: no order number, skipped"]);
         Ok(())
+    }
+
+    #[test]
+    fn a_header_ended_by_a_lone_carriage_return_sets_the_separator() {
+        // Old Mac line endings: the header is only the text up to the first `\r`.
+        assert_eq!(guess_delimiter("\nManufacturer;Order number\rABB;1SBL,,,\r"), ';');
     }
 
     #[test]
