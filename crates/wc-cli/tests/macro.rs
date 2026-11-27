@@ -227,6 +227,77 @@ fn a_retry_after_a_failed_placement_pins_every_symbol() -> TestResult {
 }
 
 #[test]
+fn placing_a_macro_copies_and_pins_the_parts_its_devices_name() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    wiringcraft(&dir, &["page", "add", "p1", "--number", "2"])?;
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let lib = tmp.path().join("lib");
+    std::fs::create_dir_all(lib.join("symbols"))?;
+    std::fs::create_dir_all(lib.join("parts"))?;
+    std::fs::copy(
+        repo.join("library/symbols/wc.coil.json"),
+        lib.join("symbols/wc.coil.json"),
+    )?;
+    let lamp = "example.ex-lamp-24-rd";
+    std::fs::copy(
+        repo.join(format!("library/parts/{lamp}.json")),
+        lib.join(format!("parts/{lamp}.json")),
+    )?;
+    wiringcraft(&dir, &["lib", "add", "mine", "folder", lib.to_str().ok_or("path")?])?;
+    // The lamp as a device's part, and an accessory and a value-set part no library has.
+    std::fs::create_dir_all(dir.join("macros"))?;
+    std::fs::write(
+        dir.join("macros/lamp.json"),
+        format!(
+            r#"{{"name": "Lamp", "anchor": {{"x": 0.0, "y": 0.0}},
+            "symbols": [{{"id": "s1", "symbol": "wc.coil", "at": {{"x": 10.0, "y": 10.0}}, "tag": "-P1"}}],
+            "devices": {{"-P1": {{"part": "{lamp}", "accessories": [{{"part": "nowhere.cap"}}]}}}}}}"#
+        ),
+    )?;
+
+    wiringcraft(&dir, &["macro", "place", "p1", "lamp", "--at", "0,0"])?;
+    let copy = wc_core::store::vendor_path(&dir, wc_core::lock::ItemKind::Part, lamp)?;
+    assert!(copy.exists(), "the part is copied into the project");
+    let p = wc_core::store::load(&dir)?;
+    let pin = p.lock.parts.get(lamp).cloned().ok_or("the part is pinned")?;
+    assert!(!p.lock.parts.contains_key("nowhere.cap"), "{:?}", p.lock.parts);
+    let status = wiringcraft(&dir, &["lib", "status"])?;
+    assert!(
+        status.contains(&format!("part {lamp}: up to date; used by -P1")),
+        "{status}"
+    );
+
+    // A pinned part whose copy is gone comes back only in its pinned version.
+    std::fs::remove_file(&copy)?;
+    let file = lib.join(format!("parts/{lamp}.json"));
+    let original = std::fs::read_to_string(&file)?;
+    let mut newer: serde_json::Value = serde_json::from_str(&original)?;
+    newer["description"] = "A newer lamp".into();
+    std::fs::write(&file, newer.to_string())?;
+    let Err(err) = wiringcraft(&dir, &["macro", "place", "p1", "lamp", "--at", "0,0"]) else {
+        return Err("placed with a newer version of a pinned part".into());
+    };
+    assert!(err.contains(&format!("part {lamp}")), "{err}");
+    assert!(err.contains("no library has the version the project pins"), "{err}");
+    std::fs::write(&file, &original)?;
+    wiringcraft(&dir, &["macro", "place", "p1", "lamp", "--at", "0,0"])?;
+    assert!(copy.exists(), "the pinned copy is put back");
+    assert_eq!(
+        wc_core::store::load(&dir)?.lock.parts.get(lamp),
+        Some(&pin),
+        "the pin is kept"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_project_macro_is_shown_and_edited_and_a_library_one_is_not() -> TestResult {
     let tmp = tempfile::tempdir()?;
     let dir = tmp.path().join("p");
