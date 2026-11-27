@@ -4821,8 +4821,9 @@ mod tests {
         let bend = start + Vec2::new(60.0, 40.0);
         click_at(&ctx, &mut o, &mut ed, start, 1.0);
         click_at(&ctx, &mut o, &mut ed, bend, 2.0);
+        // The bend is off both axes of the start, so that click drew an elbow and the bend.
         let drawn = ed.wire.as_ref().map(|(_, via)| via.clone());
-        assert_eq!(drawn.as_ref().map(Vec::len), Some(1), "{drawn:?}");
+        assert_eq!(drawn.as_ref().map(Vec::len), Some(2), "{drawn:?}");
         // A double click back on the start: its first click adds an elbow and the start as
         // bends, then the end is refused, and the draft is the one drawn before it.
         click_at(&ctx, &mut o, &mut ed, start, 3.0);
