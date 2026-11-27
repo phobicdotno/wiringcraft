@@ -313,6 +313,20 @@ fn symbol_qet_writes_the_symbol_with_its_category_and_letter_code() -> TestResul
 }
 
 #[test]
+fn symbol_qet_keeps_the_letter_code_from_the_label_without_the_option() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let labelled = QET.replace(
+        "<names>",
+        r#"<elementInformations><elementInformation name="label" show="1">-K1</elementInformation></elementInformations><names>"#,
+    );
+    std::fs::write(tmp.path().join("no_contact.elmt"), labelled)?;
+    run_ok(tmp.path(), &["import", "symbol-qet", "no_contact.elmt", "--lib", "lib"])?;
+    let s = symbol(&tmp.path().join("lib"), "qet.no_contact")?;
+    assert_eq!(s.letter_code, "K");
+    Ok(())
+}
+
+#[test]
 fn symbol_qet_writes_the_good_files_and_fails_naming_the_missing_or_broken_ones() -> TestResult {
     let tmp = tempfile::tempdir()?;
     std::fs::write(tmp.path().join("good.elmt"), QET)?;

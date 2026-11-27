@@ -1455,7 +1455,8 @@ enum ImportCmd {
         /// Library category to file the symbols under.
         #[arg(long, default_value = "")]
         category: String,
-        /// Letter code for new devices, e.g. `K`.
+        /// Letter code for new devices, e.g. `K`. Left out, each element keeps the letter code
+        /// read from its label (`-K1` gives `K`).
         #[arg(long, default_value = "")]
         letter_code: String,
     },
@@ -6098,7 +6099,9 @@ fn import_qet(
         ids.insert(id, file.clone());
         warn(warnings.iter().map(|w| format!("{}: {w}", file.display())));
         imp.symbol.category = category.to_owned();
-        imp.symbol.letter_code = letter_code.to_owned();
+        if !letter_code.is_empty() {
+            imp.symbol.letter_code = letter_code.to_owned();
+        }
         let path = wc_library::write_symbol(lib, &imp.symbol).map_err(e)?;
         println!(
             "{} -> {} ({} pins, {} shapes)",
