@@ -46,16 +46,14 @@ pub(crate) fn exclude_scratch(at: &Path) -> PathBuf {
 /// Unix file name may hold any bytes) comes back in git's own quoted form, `"`, the name with
 /// `"` and `\` escaped and each byte that is not UTF-8 as a `\` and three octal digits, then
 /// `"` (`"pages/\377.page.json"`). Two names that differ in such a byte so stay two entries,
-/// where reading them lossily would give both the same text. A UTF-8 name that starts with `"`
-/// is quoted the same way, so no name is listed as another name's quoted form. The quoted form
-/// names no file: such an entry can be listed, not opened.
+/// where reading them lossily would give both the same text. The quoted form names no file:
+/// such an entry can be listed, not opened. A UTF-8 name made of exactly that quoted text (a file
+/// literally named `"a\377.txt"` beside `a\xff.txt`) reads the same; telling those two apart
+/// needs the paths kept as bytes (#1223).
 pub(crate) fn path_text(bytes: &[u8]) -> String {
     use std::fmt::Write;
-    // A UTF-8 name that itself starts with `"` is quoted too, so it never reads like the quoted
-    // form of another name (`"a\377.txt"` the file vs. `a\xff.txt` quoted).
-    if let Ok(text) = std::str::from_utf8(bytes)
-        && !text.starts_with('"')
-    {
+    // A UTF-8 name is always its own text, so it can be opened and handed back to git.
+    if let Ok(text) = std::str::from_utf8(bytes) {
         return text.to_owned();
     }
     let mut out = String::from("\"");
