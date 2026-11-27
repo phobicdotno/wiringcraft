@@ -130,7 +130,9 @@ fn on_path(p: Point, path: &[Point]) -> bool {
 
 /// Whether `p` lies on the segment from `a` to `b` (ends included), within 0.01 mm.
 fn on_segment(p: Point, a: Point, b: Point) -> bool {
-    const EPS: f64 = 0.01;
+    // The boundary counts, with a little room for rounding: away from the origin the distance
+    // to a point 0.01 mm off comes out a hair over 0.01.
+    const EPS: f64 = 0.01 + 1e-9;
     let (dx, dy) = (b.x - a.x, b.y - a.y);
     let len2 = dx * dx + dy * dy;
     // Only a zero-length segment is a point: a short one is measured along its length, so the
@@ -745,6 +747,10 @@ mod tests {
         let (c, d) = (Point::new(0.0, 0.0), Point::new(10.0, 0.0));
         assert!(on_segment(Point::new(5.0, 0.01), c, d));
         assert!(!on_segment(Point::new(5.0, 0.011), c, d));
+        let (c, d) = (Point::new(0.0, 80.0), Point::new(10.0, 80.0));
+        assert!(on_segment(Point::new(5.0, 80.01), c, d));
+        assert!(!on_segment(Point::new(5.0, 80.011), c, d));
+        assert!(on_segment(Point::new(0.0, 80.01), c, c));
     }
 
     #[test]
