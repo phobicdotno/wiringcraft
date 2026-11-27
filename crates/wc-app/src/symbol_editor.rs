@@ -444,6 +444,12 @@ impl SymbolEditor {
                     self.clicks.push(p);
                     return;
                 };
+                // A corner on the first one's row or column would make a rectangle without
+                // area: keep the first corner and wait for another, as dragging a corner does.
+                if self.tool == Tool::Rect && a != p && (a.x == p.x || a.y == p.y) {
+                    self.message = "The rectangle would have no area; click a corner off this row and column.".into();
+                    return;
+                }
                 self.clicks.clear();
                 if a == p {
                     return;
@@ -1366,6 +1372,29 @@ mod tests {
         e.symbol.name = "Test coil".into();
         e.symbol.letter_code = "K".into();
         e.symbol.role = SymbolRole::Main;
+    }
+
+    #[test]
+    fn a_rectangle_corner_on_the_first_ones_row_or_column_draws_nothing() {
+        let mut e = SymbolEditor::new(Vec::new());
+        e.set_tool(Tool::Rect);
+        e.click(Point::new(0.0, 0.0));
+        for flat in [Point::new(0.0, 5.0), Point::new(7.5, 0.0)] {
+            e.click(flat);
+            assert!(e.symbol.graphics.is_empty(), "no rectangle without area at {flat:?}");
+            assert!(!e.can_undo(), "and no undo step");
+            assert!(e.drawing_shape(), "the first corner is kept");
+            assert!(!e.message.is_empty(), "the status line says why");
+        }
+        e.click(Point::new(7.5, 5.0));
+        assert_eq!(
+            e.symbol.graphics,
+            vec![Shape::Rect {
+                min: Point::new(0.0, 0.0),
+                max: Point::new(7.5, 5.0),
+            }]
+        );
+        assert!(!e.drawing_shape());
     }
 
     #[test]
