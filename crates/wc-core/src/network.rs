@@ -170,7 +170,8 @@ impl Network {
 
     /// What is wrong with this network: a node or link end that is not a device tag, a device
     /// listed twice, two nodes with one address or one station name, a link end on a device that is not a node of
-    /// the network, a link from a port to itself, and a port used by two links.
+    /// the network, a link from a port to itself, a link cable that is not a device tag, and a port used by two
+    /// links.
     pub fn warnings(&self) -> Vec<String> {
         let name = &self.name;
         let mut out = Vec::new();
@@ -236,6 +237,13 @@ impl Network {
             }
             if looped && let [Ok(a), _] = &ends {
                 out.push(format!("network {name}: link {} joins {a} to itself", i + 1));
+            }
+            // A cable that is not a device tag is told like a node or link end that is not one;
+            // a link with no cable is fine.
+            if !l.cable.trim().is_empty()
+                && let Err(e) = l.cable.parse::<DeviceTag>()
+            {
+                out.push(format!("network {name}: link {} cable {:?}: {e}", i + 1, l.cable));
             }
         }
         for (port, n) in used {
@@ -323,6 +331,21 @@ cable = "-W20"
         assert_eq!(p.port, "");
         assert_eq!(p.to_string(), "=A1+L2-K3");
         assert!(Port::parse("K 3:P1").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_link_cable_that_is_not_a_device_tag_is_told() -> R {
+        let mut n: Network = toml::from_str(TOML)?;
+        n.links[0].cable = "W 30".into();
+        let w = n.warnings();
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].starts_with("network PN1: link 1 cable \"W 30\": "), "{w:?}");
+        // No cable, or only spaces, says nothing.
+        for blank in ["", "  "] {
+            n.links[0].cable = blank.into();
+            assert!(n.warnings().is_empty(), "{:?}", n.warnings());
+        }
         Ok(())
     }
 
