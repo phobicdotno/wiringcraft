@@ -1238,6 +1238,48 @@ fn the_location_list_reads_a_location_stored_with_its_plus() {
 }
 
 #[test]
+fn the_location_list_shows_a_location_stored_twice_once() {
+    let mut p = Project::new("t");
+    p.devices
+        .insert(DeviceTag::parse("+L1-K1").unwrap(), Default::default());
+    for (path, description) in [("L1", ""), ("+L1", "Main cabinet"), (" +L1", "Other")] {
+        p.meta.locations.push(wc_core::project::Location {
+            path: path.into(),
+            description: description.into(),
+        });
+    }
+    let (symbols, parts) = (BTreeMap::new(), BTreeMap::new());
+    let i = Inputs {
+        project: &p,
+        symbols: &symbols,
+        parts: &parts,
+    };
+    assert_eq!(build(Kind::Locations, &i).rows, [["+L1", "Main cabinet", "1", ""]]);
+}
+
+#[test]
+fn the_location_list_says_why_a_stored_path_is_no_location() {
+    let mut p = Project::new("t");
+    p.meta.locations.push(wc_core::project::Location {
+        path: "+A-B".into(),
+        description: "Typo".into(),
+    });
+    let (symbols, parts) = (BTreeMap::new(), BTreeMap::new());
+    let i = Inputs {
+        project: &p,
+        symbols: &symbols,
+        parts: &parts,
+    };
+    let rows = build(Kind::Locations, &i).rows;
+    let [row] = rows.as_slice() else {
+        unreachable!("one row: {rows:?}")
+    };
+    assert_eq!(row[..3], ["+A-B", "Typo", "0"]);
+    assert_eq!(row[3], wc_core::project::location_path("+A-B").unwrap_err());
+    assert!(row[3].contains("not a location"), "{}", row[3]);
+}
+
+#[test]
 fn the_network_list_shows_each_device_with_its_address_ports_and_cables() {
     let mut p = Project::new("t");
     let mut page = Page::new("p3", "3", "PLC");
