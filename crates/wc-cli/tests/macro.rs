@@ -517,7 +517,7 @@ fn a_table_generates_pages_with_one_macro_copy_per_row() -> TestResult {
         return Err("generated from a table with an unknown column".into());
     };
     assert!(
-        err.contains("\"sectoin\"") && err.contains("kW, part, section"),
+        err.contains("\"sectoin\"") && err.contains("\"kW\", \"part\", \"section\""),
         "{err}"
     );
     // A row without a value set names its line, and nothing is placed.
@@ -621,8 +621,24 @@ fn a_generation_whose_save_fails_leaves_the_project_as_it_was() -> TestResult {
         !dir.join("pages/p0002.page.json").exists(),
         "the first new page is taken back"
     );
+    let vendored = dir.join("vendor/symbols/wc.coil.json");
+    assert!(!vendored.exists(), "the symbol copy taken for it is taken back too");
     std::fs::remove_dir(&blocker)?;
     assert_eq!(wc_core::store::load(&dir)?.pages, before.pages);
+    // A copy the project has that differs from the library's, unpinned, is replaced by a run;
+    // a run that fails leaves it as it was.
+    std::fs::create_dir_all(dir.join("vendor/symbols"))?;
+    let own = std::fs::read_to_string(lib.join("symbols/wc.coil.json"))?.replace("\"Relay coil\"", "\"Own coil\"");
+    std::fs::write(&vendored, &own)?;
+    std::fs::create_dir_all(&blocker)?;
+    assert!(wiringcraft(&dir, &args).is_err(), "the save failed");
+    assert_eq!(
+        std::fs::read_to_string(&vendored)?,
+        own,
+        "the project's copy is put back"
+    );
+    std::fs::remove_dir(&blocker)?;
+    std::fs::remove_file(&vendored)?;
     let out = wiringcraft(&dir, &args)?;
     assert!(out.starts_with("p0002 p0003"), "{out}");
     assert!(out.contains("30 copies"), "{out}");
