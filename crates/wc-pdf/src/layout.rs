@@ -226,6 +226,10 @@ impl CrossRefs {
         for list in x.mains.values_mut() {
             list.sort_by_key(|a| overview.contains(a.page_id.as_str()));
         }
+        // The same for a breaker: its contacts point to its schematic drawing (#1467).
+        for list in x.standalones.values_mut() {
+            list.sort_by_key(|a| overview.contains(a.page_id.as_str()));
+        }
         x
     }
 }
