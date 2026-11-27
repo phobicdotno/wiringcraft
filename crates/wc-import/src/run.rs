@@ -884,10 +884,20 @@ pub fn import_pdf(dir: &Path, file: &Path, first_page: usize, source: &str, log:
     for (id, t) in ids.iter().zip(&traced) {
         let Some(scan) = &t.scan else { continue };
         let path = underlays.join(format!("{id}.{}", scan.raster.format.extension()));
-        let before = match std::fs::read(&path) {
-            Ok(bytes) => Some(bytes),
+        let shown = || escape_field(&path.display().to_string());
+        // The path itself, not what a link there points at: putting a link back as it was is
+        // not something `put_files_back` does (a dangling one reads as no file and would be
+        // removed), so anything but a regular file or nothing is refused.
+        let before = match std::fs::symlink_metadata(&path) {
             Err(x) if x.kind() == std::io::ErrorKind::NotFound => None,
-            Err(x) => return Err(format!("{}: {x}", escape_field(&path.display().to_string()))),
+            Err(x) => return Err(format!("{}: {x}", shown())),
+            Ok(m) if m.is_file() => Some(std::fs::read(&path).map_err(|x| format!("{}: {x}", shown()))?),
+            Ok(_) => {
+                return Err(format!(
+                    "{} is in the way of a scanned sheet and is not a regular file; move it or pick another --first-page",
+                    shown()
+                ));
+            }
         };
         scans.push((path, before));
     }
@@ -2454,6 +2464,43 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, ["pdf-5.png", "pdf-6.png"]);
+    }
+
+    /// A symbolic link where a scan goes is refused before any scan is written (#1751): a
+    /// dangling one reads as no file, and a failure later would remove it. The link stays, with
+    /// or without a file behind it, and the error names its path.
+    #[cfg(unix)]
+    #[test]
+    fn a_pdf_import_refuses_a_link_where_a_scan_goes() {
+        let tmp = tmp();
+        let file = tmp.path().join("scans.pdf");
+        assert!(std::fs::write(&file, two_scans_pdf()).is_ok());
+        let target = tmp.path().join("elsewhere.png");
+        for (name, behind) in [("dangling", false), ("live", true)] {
+            let dir = tmp.path().join(name);
+            assert!(store::save(&dir, &Project::new("t")).is_ok());
+            let underlays = dir.join(wc_core::Underlay::DIR);
+            assert!(std::fs::create_dir_all(&underlays).is_ok());
+            if behind {
+                assert!(std::fs::write(&target, b"mine").is_ok());
+            }
+            // Where the second page's scan goes: the first page's would be written before it.
+            let link = underlays.join("pdf-6.png");
+            assert!(std::os::unix::fs::symlink(&target, &link).is_ok());
+            let before = files(&dir);
+            let mut log = Log::default();
+            let r = pdf(&dir, &file, 5, &mut log);
+            assert!(
+                matches!(&r, Err(why) if why.contains("pdf-6.png") && why.contains("not a regular file")),
+                "{name}: {r:?}"
+            );
+            assert!(!log.text().contains("scanned sheet saved"), "{name}: {}", log.text());
+            assert!(std::fs::symlink_metadata(&link).is_ok_and(|m| m.is_symlink()), "{name}");
+            assert!(!underlays.join("pdf-5.png").exists(), "{name}");
+            assert_eq!(files(&dir), before, "{name}");
+            assert!(matches!(load(&dir), Ok(p) if p.pages.is_empty()), "{name}");
+        }
+        assert_eq!(std::fs::read(&target).ok().as_deref(), Some(&b"mine"[..]));
     }
 
     /// No import gives a new page a number another page has (#869): each route refuses, naming
