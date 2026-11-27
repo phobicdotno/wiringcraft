@@ -181,6 +181,9 @@ pub fn automationml(i: &Inputs<'_>, written: &str, file_name: &str) -> (String, 
     // Connections: each net's device pins, chained in a stable order.
     let (nets, _) = net_names(i);
     let mut used_names: BTreeMap<String, usize> = BTreeMap::new();
+    // Every link name written so far: a potential really named `A#2` must not share a name
+    // with the second link of potential `A`.
+    let mut written: BTreeSet<String> = BTreeSet::new();
     for (n, net) in nets.iter().enumerate() {
         let mut ends: Vec<(String, String)> = Vec::new();
         for (page, item, pin) in &net.pins {
@@ -207,11 +210,16 @@ pub fn automationml(i: &Inputs<'_>, written: &str, file_name: &str) -> (String, 
         let base = net.names.first().cloned().unwrap_or_else(|| format!("N{}", n + 1));
         for pair in ends.windows(2) {
             let count = used_names.entry(base.clone()).or_insert(0);
-            *count += 1;
-            let link = if *count == 1 {
-                base.clone()
-            } else {
-                format!("{base}#{count}")
+            let link = loop {
+                *count += 1;
+                let link = if *count == 1 {
+                    base.clone()
+                } else {
+                    format!("{base}#{count}")
+                };
+                if written.insert(link.clone()) {
+                    break link;
+                }
             };
             let _ = writeln!(
                 out,
