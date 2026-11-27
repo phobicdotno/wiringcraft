@@ -2048,7 +2048,12 @@ pub fn status_bar(ui: &mut egui::Ui, open: Option<&Open>, ed: &Editor, live: Opt
                     }
                 }
                 if !o.branch.is_empty() {
-                    ui.label(RichText::new(&o.branch).monospace().color(t.text));
+                    // A long branch name is cut short, so the status message keeps room of its own.
+                    ui.scope(|ui| {
+                        ui.set_max_width(160.0);
+                        ui.add(egui::Label::new(RichText::new(&o.branch).monospace().color(t.text)).truncate())
+                            .on_hover_text(&o.branch);
+                    });
                     let (r, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
                     crate::icons::paint(ui.painter(), r, crate::icons::Icon::Branch, t.muted, t.accent);
                 }
@@ -2466,6 +2471,37 @@ mod tests {
         });
         let (r, max) = used.unwrap();
         assert!(r.right() <= max.right() + 0.5, "{r:?} runs past {max:?}");
+        assert!(r.height() < 24.0, "the bar stays one line high: {r:?}");
+    }
+
+    /// A long branch name is cut short too: the bar stays inside the window and the message
+    /// keeps room to the left of it.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_long_branch_name_leaves_room_for_the_status_message() {
+        let (_tmp, mut o) = crate::state::tests::project();
+        o.branch = "customer-changes-".repeat(40);
+        let mut ed = Editor::default();
+        ed.message = "Saved".into();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0))),
+            ..Default::default()
+        };
+        let mut used = None;
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let room = ui.max_rect();
+                let r = ui.scope(|ui| status_bar(ui, Some(&o), &ed, None)).response.rect;
+                used = Some((r, room));
+            });
+        });
+        let (r, max) = used.unwrap();
+        assert!(
+            r.left() >= max.left() - 0.5 && r.right() <= max.right() + 0.5,
+            "{r:?} runs past {max:?}"
+        );
         assert!(r.height() < 24.0, "the bar stays one line high: {r:?}");
     }
 
