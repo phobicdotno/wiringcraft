@@ -200,14 +200,22 @@ pub struct WireNumbering {
     pub done: wc_core::numbering::Numbered,
     /// Numbers of the pages left alone because someone else has them open.
     pub skipped: Vec<String>,
+    /// The numbers wires had were replaced (`overwrite`), not kept.
+    pub overwritten: bool,
 }
 
 impl WireNumbering {
     /// One line for the person who asked.
     pub fn report(&self) -> String {
         let mut s = format!(
-            "Numbered {} connection(s); {} wire(s) changed. Existing numbers were kept.",
-            self.done.connections, self.done.wires
+            "Numbered {} connection(s); {} wire(s) changed. {}",
+            self.done.connections,
+            self.done.wires,
+            if self.overwritten {
+                "Existing numbers were replaced."
+            } else {
+                "Existing numbers were kept."
+            }
         );
         if !self.skipped.is_empty() {
             s.push_str(&format!(
@@ -3967,14 +3975,17 @@ impl Open {
 
     /// [`Self::number_wires`], or with `overwrite` give every connection a new number by
     /// `rule`, replacing the numbers wires already have (the CLI's `number-wires --overwrite`).
+    /// The numbers on pages someone else has open stay, and are given to no other connection.
     pub fn renumber_wires(&mut self, rule: wc_core::numbering::Rule, overwrite: bool) -> WireNumbering {
         self.follow_terminals();
         let mut project = self.project.clone();
         let symbols = &self.symbols;
-        let done = wc_core::numbering::number_wires(
+        let held = &self.held_by_others;
+        let done = wc_core::numbering::number_wires_keeping(
             &mut project,
             rule,
             overwrite,
+            |page| held.contains_key(&page.id),
             |id| symbols.get(id).map(|s| s.role),
             |page, end| match end {
                 wc_core::Endpoint::Point { at } => Some(*at),
@@ -4012,7 +4023,11 @@ impl Open {
             self.checkpoint();
             self.project = project;
         }
-        WireNumbering { done, skipped }
+        WireNumbering {
+            done,
+            skipped,
+            overwritten: overwrite,
+        }
     }
 
     /// Replace `query` with `with` in the chosen find `hits`, as one undo step

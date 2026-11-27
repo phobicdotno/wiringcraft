@@ -62,6 +62,20 @@ pub fn number_wires(
     role: impl Fn(&str) -> Option<crate::symbol::SymbolRole>,
     position: impl Fn(&Page, &Endpoint) -> Option<Point>,
 ) -> Numbered {
+    number_wires_keeping(project, rule, overwrite, |_| false, role, position)
+}
+
+/// [`number_wires`], where the numbers on the pages `kept(page)` picks stay as they are even
+/// with `overwrite` (pages someone else has open): a connection with a number on such a page
+/// keeps that number, and no other connection is given it.
+pub fn number_wires_keeping(
+    project: &mut Project,
+    rule: Rule,
+    overwrite: bool,
+    kept: impl Fn(&Page) -> bool,
+    role: impl Fn(&str) -> Option<crate::symbol::SymbolRole>,
+    position: impl Fn(&Page, &Endpoint) -> Option<Point>,
+) -> Numbered {
     // Overview pages keep their place (page indices stay valid) but draw nothing here.
     let mut schematic = project.clone();
     for page in schematic.pages.iter_mut().filter(|p| p.overview) {
@@ -79,7 +93,10 @@ pub fn number_wires(
             };
             // Kept trimmed, so `" 5"` and a new `"5"` cannot both exist.
             if let Some(num) = w.number.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                existing.entry(n).or_insert_with(|| num.to_string());
+                // With `overwrite` only the numbers on kept pages count as existing.
+                if !overwrite || kept(page) {
+                    existing.entry(n).or_insert_with(|| num.to_string());
+                }
             }
             let mut pts: Vec<Point> = w.via.clone();
             pts.extend([&w.from, &w.to].into_iter().filter_map(|e| position(page, e)));
@@ -96,11 +113,7 @@ pub fn number_wires(
     let mut order: Vec<(usize, (usize, f64, f64))> = start.into_iter().collect();
     order.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    let mut used: BTreeSet<String> = if overwrite {
-        BTreeSet::new()
-    } else {
-        existing.values().cloned().collect()
-    };
+    let mut used: BTreeSet<String> = existing.values().cloned().collect();
     let mut counter = 0usize;
     let mut next_sequential = |used: &mut BTreeSet<String>| loop {
         counter += 1;
@@ -111,7 +124,7 @@ pub fn number_wires(
     };
     let mut chosen: BTreeMap<usize, String> = BTreeMap::new();
     for (n, (pi, x, _)) in &order {
-        if !overwrite && let Some(num) = existing.get(n) {
+        if let Some(num) = existing.get(n) {
             chosen.insert(*n, num.clone());
             continue;
         }
@@ -277,6 +290,15 @@ mod tests {
         assert_eq!(numbers(&p), [Some("1"), Some("1"), Some("2"), None, Some("3")]);
         number_wires(&mut p, Rule::Sequential, true, |_| None, pos);
         assert_eq!(numbers(&p), [Some("3"), Some("3"), Some("1"), None, Some("2")]);
+    }
+
+    #[test]
+    fn overwrite_keeps_the_numbers_on_kept_pages_and_does_not_give_them_again() {
+        let mut p = project();
+        p.pages[0].wires[1].number = Some("1".into());
+        // The only page is kept: a/b keep 1 and nothing else gets it, as without overwrite.
+        number_wires_keeping(&mut p, Rule::Sequential, true, |_| true, |_| None, pos);
+        assert_eq!(numbers(&p), [Some("1"), Some("1"), Some("2"), None, Some("3")]);
     }
 
     #[test]
