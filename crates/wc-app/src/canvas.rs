@@ -2839,7 +2839,15 @@ fn wire_tool(
             // The first click of the double click already added this point as a bend, if it was
             // a click on a free point (a click on a pin tried to end the wire and added none).
             let before = ed.wire_before_click.take();
-            if before.is_some() && via.last() == Some(&cur) {
+            let first_click_added_cur = before.is_some() && via.last() == Some(&cur);
+            if near.is_none() && !first_click_added_cur {
+                // Its first click did not add this free point (it was refused on a pin, or landed
+                // elsewhere), so the two clicks were not one double click on this spot.
+                ed.wire = Some((start, via));
+                ed.message = "Double-click on one free spot to end the wire there.".into();
+                return;
+            }
+            if first_click_added_cur {
                 via.pop();
             }
             finish_wire(open, ed, page, start, via, end);
@@ -4876,6 +4884,77 @@ mod tests {
         assert_eq!(ed.message, "A wire needs two different ends.");
         assert_eq!(ed.wire, Some((pin, bends)));
         assert!(o.project.pages[0].wires.is_empty());
+    }
+
+    #[test]
+    fn a_quick_click_on_the_start_after_an_ignored_off_sheet_click_keeps_every_bend() {
+        let (_tmp, mut o) = project();
+        let mut ed = Editor {
+            tool: Tool::Wire,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        painted(&ctx, &mut o, &mut ed, 0.5, vec![]);
+        ed.view = View {
+            zoom: 3.0,
+            offset: Vec2::new(300.0, 300.0),
+            fit: false,
+            ..View::default()
+        };
+        let off = egui::pos2(40.0, 40.0);
+        let start = egui::pos2(500.0, 450.0);
+        click_at(&ctx, &mut o, &mut ed, start, 1.0);
+        click_at(&ctx, &mut o, &mut ed, start + Vec2::new(60.0, 40.0), 2.0);
+        let drawn = ed.wire.clone();
+        assert_eq!(drawn.as_ref().map(|(_, via)| via.len()), Some(2), "{drawn:?}");
+        // An ignored click off the sheet, then soon after one on the start: egui counts the
+        // two as a double click, but neither adds nor takes away a bend.
+        click_at(&ctx, &mut o, &mut ed, off, 3.0);
+        assert!(!on_paper(&o, 0, ed.cursor.unwrap()), "{:?}", ed.cursor);
+        click_at(&ctx, &mut o, &mut ed, start, 3.1);
+        assert_eq!(ed.wire, drawn);
+        assert!(o.project.pages[0].wires.is_empty());
+    }
+
+    #[test]
+    fn a_quick_click_elsewhere_after_a_refused_pin_click_does_not_end_the_wire() {
+        let (_tmp, mut o) = project();
+        let mut ed = Editor {
+            tool: Tool::Wire,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        painted(&ctx, &mut o, &mut ed, 0.5, vec![]);
+        let at = egui::pos2(300.0, 300.0);
+        click_at(&ctx, &mut o, &mut ed, at, 1.0);
+        let spot = ed.cursor.unwrap();
+        ed.wire = None;
+        let probe = o.place(0, "wc.coil", Point::new(100.0, 60.0)).unwrap();
+        let a1 = Endpoint::Pin {
+            item: probe.clone(),
+            pin: "A1".into(),
+        };
+        let off = o.end_pos(&o.project.pages[0], &a1).unwrap();
+        o.project.pages[0].symbols.retain(|s| s.id != probe);
+        let coil = o
+            .place(0, "wc.coil", Point::new(100.0 + spot.x - off.x, 60.0 + spot.y - off.y))
+            .unwrap();
+        let pin = Endpoint::Pin {
+            item: coil,
+            pin: "A1".into(),
+        };
+        let bends = vec![Point::new(spot.x + 20.0, spot.y + 20.0), spot];
+        ed.wire = Some((pin.clone(), bends.clone()));
+        ed.wire_page = Some(o.project.pages[0].id.clone());
+        // A refused click on the pin, then soon after a click on a free spot away from it: egui
+        // counts the two as a double click, but they were not one on that spot.
+        click_at(&ctx, &mut o, &mut ed, at, 5.0);
+        let away = egui::pos2(at.x - 40.0, at.y + 40.0);
+        click_at(&ctx, &mut o, &mut ed, away, 5.1);
+        assert!(o.project.pages[0].wires.is_empty());
+        assert_eq!(ed.wire, Some((pin, bends)));
     }
 
     #[test]
