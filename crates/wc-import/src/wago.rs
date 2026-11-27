@@ -40,16 +40,32 @@ pub struct ConfiguredRow {
     pub quantity: Option<u32>,
 }
 
+/// How often `delim` appears in `line` outside double-quoted text, so a `;` inside a quoted
+/// header such as `"Notes; one; two"` does not make `;` look like the separator.
+fn count_unquoted(line: &str, delim: char) -> usize {
+    let mut quoted = false;
+    let mut count = 0;
+    for c in line.chars() {
+        if c == '"' {
+            quoted = !quoted;
+        } else if c == delim && !quoted {
+            count += 1;
+        }
+    }
+    count
+}
+
 /// Read a configured list (bytes as saved: UTF-8 with or without BOM, or Latin-1). The header
 /// must name an Index and an Article column; Type, Strip, Terminal, Manufacturer and Quantity
 /// are read when present. Rows whose quantity is not a whole number are read without one, with
-/// a warning.
+/// a warning. The separator (`;`, tab or `,`) is the one the header line holds most often
+/// outside quoted text.
 pub fn read_configured(bytes: &[u8]) -> Result<(Vec<ConfiguredRow>, Vec<String>)> {
     let text = decode(bytes);
     let first_line = text.lines().next().unwrap_or("");
     let delim = [';', '\t', ',']
         .into_iter()
-        .max_by_key(|d| first_line.matches(*d).count())
+        .max_by_key(|d| count_unquoted(first_line, *d))
         .unwrap_or(';');
     let rows = records(&text, delim);
     let Some((header, body)) = rows.split_first() else {
@@ -1099,6 +1115,21 @@ mod tests {
         };
         let again = super::plan(&inputs, &library(&parts), &rows);
         assert!(again.assignments.is_empty(), "{again:#?}");
+    }
+
+    #[test]
+    fn a_comma_list_with_semicolons_in_a_quoted_header_is_read_with_commas() {
+        let text = "Index,Article,\"Notes; one; two; three\"\r\n-X1:1,2002-1201,\"a; b\"\r\n";
+        let (rows, warnings) = read_configured(text.as_bytes()).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].index, "-X1:1");
+        assert_eq!(rows[0].article, "2002-1201");
+        // A semicolon list keeps reading as one, commas in quoted text and all.
+        let text = "Index;Article;\"Notes, one, two, three\"\r\n-X1:1;2002-1201;x\r\n";
+        let (rows, _) = read_configured(text.as_bytes()).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].article, "2002-1201");
     }
 
     #[test]
