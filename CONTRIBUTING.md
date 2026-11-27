@@ -73,7 +73,9 @@ Nothing is pushed to `main`; every change is a pull request.
    because cargo runs each crate's tests from that crate's folder. CI also runs these, so run them when you touch the files:
    - `.github/scripts/claim.js`: `node --test .github/scripts/claim.test.js` (Node 22).
    - `tools/todo.py`: `python3 -m py_compile tools/todo.py`.
-   - `library/symbols`: every starter symbol must come from `tools/gen_starter_symbols.py`. Run
+   - `library/symbols`: every starter symbol must come from `tools/gen_starter_symbols.py`. The
+     `rm` below also deletes files git does not track, and git cannot bring those back, so first
+     move out any file that `git status --porcelain -- library/symbols` lists with `??`. Then run
      `rm -f library/symbols/*.json`, then `python3 tools/gen_starter_symbols.py`, and check that
      `git status -- library/symbols` shows no change. This is what CI does: deleting the files
      first makes a symbol file the generator no longer writes show as deleted, which fails the check.
