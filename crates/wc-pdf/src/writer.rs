@@ -636,6 +636,14 @@ impl Pen {
         if !all_finite(&[c, (r, start), (end, 0.0)]) {
             return;
         }
+        // A negative radius puts every point on the far side of the centre: the same circle, the
+        // arc turned half round. Stored as such, so the SVG and DXF, which need a radius of at
+        // least 0, draw what the PDF does.
+        let (r, start, end) = if r < 0.0 {
+            (-r, start + 180.0, end + 180.0)
+        } else {
+            (r, start, end)
+        };
         let mut sweep = end - start;
         if sweep <= 0.0 {
             sweep += 360.0;
