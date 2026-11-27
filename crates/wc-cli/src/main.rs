@@ -7077,6 +7077,12 @@ mod tests {
         let off = cli(&dir, &["device", "-K1", "--part", ""]);
         assert!(off.is_ok(), "{off:?}");
         assert_eq!(info(&dir), Ok("part         -\ndescription  Pump\n".to_owned()));
+        let reset = cli(&dir, &["device", "-K1", "--part", "maker.contactor"]);
+        assert!(reset.is_ok(), "{reset:?}");
+        assert_eq!(
+            info(&dir),
+            Ok("part         maker.contactor\ndescription  Pump\n".to_owned())
+        );
         let again = cli(&dir, &["device", "-K1", "--part", " "]);
         assert!(again.is_ok(), "{again:?}");
         assert_eq!(info(&dir), Ok("part         -\ndescription  Pump\n".to_owned()));
