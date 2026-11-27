@@ -47,3 +47,29 @@ fn page_list_and_check_escape_control_characters_in_a_page_number() -> TestResul
     assert_eq!(check.lines().count(), 3, "two findings and the count: {check:?}");
     Ok(())
 }
+
+/// A page ID is checked when saved but not when loaded, so a hand-edited page file can give a
+/// page an ID with control characters; `page list` prints it escaped too.
+#[cfg(unix)]
+#[test]
+fn page_list_escapes_control_characters_in_a_hand_edited_page_id() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    let pages = dir.join("pages");
+    let text = std::fs::read_to_string(pages.join("p0001.page.json"))?;
+    let edited = text.replace("\"p0001\"", "\"p\\u001b[2J\\tx\"");
+    assert_ne!(edited, text, "the page file names its ID");
+    std::fs::remove_file(pages.join("p0001.page.json"))?;
+    std::fs::write(pages.join("p\u{1b}[2J\tx.page.json"), edited)?;
+
+    let list = wiringcraft(&dir, &["page", "list"])?;
+    assert!(!list.contains('\u{1b}') && !list.contains('\t'), "{list:?}");
+    assert!(list.starts_with("p\\u{1b}[2J\\tx "), "{list:?}");
+    Ok(())
+}
