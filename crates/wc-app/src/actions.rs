@@ -263,7 +263,7 @@ impl Action {
             Action::Open => i("Open", "Open a project folder", Icon::Open, "Ctrl+O"),
             Action::ProjectProps => i(
                 "Project properties",
-                "Project name and title-block fields",
+                "Edit the project's name, title-block fields, locations and revisions",
                 Icon::Properties,
                 "",
             ),
@@ -281,7 +281,12 @@ impl Action {
                 "Ctrl+Shift+S",
             ),
             Action::Undo => i("Undo", "Undo the last change", Icon::Undo, "Ctrl+Z"),
-            Action::Redo => i("Redo", "Redo", Icon::Redo, "Ctrl+Y"),
+            Action::Redo => i(
+                "Redo",
+                "Redo the last change you undid (Ctrl+Shift+Z works too)",
+                Icon::Redo,
+                "Ctrl+Y",
+            ),
             Action::Select => i("Select", "Select and move", Icon::Select, "Esc"),
             Action::PlaceSymbol => i(
                 "Symbol",
@@ -390,7 +395,7 @@ impl Action {
             Action::Delete => i("Delete", "Delete the selection", Icon::Delete, "Del"),
             Action::Rotate => i(
                 "Rotate",
-                "Rotate the selected symbols 90°, or the symbol being placed",
+                "Rotate the selected symbols 90°, the symbol being placed, or the device picked on a panel layout",
                 Icon::Rotate,
                 "R",
             ),
@@ -442,7 +447,7 @@ impl Action {
             ),
             Action::PageProps => i(
                 "Page properties",
-                "Number, title and sheet size of this page",
+                "Edit this page's number, title, sheet size and its own title-block values",
                 Icon::PageProps,
                 "",
             ),
@@ -460,7 +465,7 @@ impl Action {
             ),
             Action::PrevPage => i("Previous page", "Open the page before this one", Icon::PagePrev, "PgUp"),
             Action::NextPage => i("Next page", "Open the page after this one", Icon::PageNext, "PgDn"),
-            Action::DeletePage => i("Delete page", "Delete this page", Icon::PageDelete, ""),
+            Action::DeletePage => i("Delete page", "Delete this page (asks first)", Icon::PageDelete, ""),
             Action::NewPanel => i(
                 "Panel layout",
                 "Add a cabinet panel layout: a 600 x 800 mm mounting plate with wire ducts and DIN rails",
@@ -479,8 +484,8 @@ impl Action {
                 Icon::PageDelete,
                 "",
             ),
-            Action::ZoomIn => i("Zoom in", "Zoom in", Icon::ZoomIn, "+"),
-            Action::ZoomOut => i("Zoom out", "Zoom out", Icon::ZoomOut, "-"),
+            Action::ZoomIn => i("Zoom in", "Show the page larger", Icon::ZoomIn, "+"),
+            Action::ZoomOut => i("Zoom out", "Show the page smaller", Icon::ZoomOut, "-"),
             Action::ZoomFit => i("Fit page", "Show the whole page", Icon::ZoomFit, "F"),
             Action::ToggleGrid => i("Grid", "Show or hide the grid", Icon::Grid, "G"),
             Action::Layers => i(
@@ -501,7 +506,12 @@ impl Action {
                 Icon::Library,
                 "",
             ),
-            Action::LibraryUpdate => i("Update", "Take the newer library versions", Icon::Update, ""),
+            Action::LibraryUpdate => i(
+                "Update",
+                "Take the newer library versions of the project's symbols and parts, then show the library status",
+                Icon::Update,
+                "",
+            ),
             Action::NewSymbol => i(
                 "New symbol",
                 "Draw a new symbol and save it into a library folder",
@@ -632,7 +642,7 @@ impl Action {
             ),
             Action::Check => i(
                 "Check",
-                "Check the project: devices drawn twice, missing coils, shorts, open pins",
+                "Check the project for problems such as devices drawn twice, contacts without a coil, shorts and open pins",
                 Icon::Check,
                 "Ctrl+E",
             ),
@@ -644,7 +654,7 @@ impl Action {
             ),
             Action::Reports => i(
                 "Reports",
-                "Contents, parts, devices, wires, nets, terminals, cables, PLC I/O and locations as tables",
+                "Show the contents, parts, devices, wires, nets, terminals, cables, PLC I/O, PLC cards, locations and networks as tables",
                 Icon::Reports,
                 "Ctrl+R",
             ),
@@ -683,7 +693,7 @@ impl Action {
             ),
             Action::Assistant => i(
                 "Assistant",
-                "Show the AI assistant: tell it what to draw or change and it works in the open project",
+                "Show or hide the AI assistant: tell it what to draw or change and it works in the open project",
                 Icon::Assistant,
                 "Ctrl+J",
             ),
@@ -894,3 +904,123 @@ pub const RIBBON: &[(&str, &[RibbonGroup])] = &[
         ],
     ),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn all_lists_each_action_once() {
+        let mut seen = HashSet::new();
+        for a in Action::ALL {
+            assert!(seen.insert(*a), "{a:?} is listed twice in Action::ALL");
+        }
+    }
+
+    #[test]
+    fn names_are_unique_ignoring_case_and_find_their_action() {
+        // The assistant looks actions up by name with `eq_ignore_ascii_case`, so two names
+        // that differ only in case would make one of them unreachable.
+        let mut seen = HashSet::new();
+        for a in Action::ALL {
+            let name = a.name();
+            assert!(!name.is_empty());
+            assert!(seen.insert(name.to_ascii_lowercase()), "{name} clashes");
+            let found = Action::ALL
+                .iter()
+                .find(|b| b.name().eq_ignore_ascii_case(&name.to_ascii_uppercase()));
+            assert_eq!(found, Some(a));
+        }
+        assert_eq!(Action::AddPage.name(), "AddPage");
+    }
+
+    #[test]
+    fn every_action_has_a_label_and_a_tip() {
+        for a in Action::ALL {
+            let info = a.info();
+            assert!(!info.label.trim().is_empty(), "{a:?} has no label");
+            assert_eq!(info.label, info.label.trim(), "{a:?} label has edge spaces");
+            assert!(!info.tip.trim().is_empty(), "{a:?} has no tip");
+            assert_eq!(info.shortcut, info.shortcut.trim(), "{a:?} shortcut");
+        }
+    }
+
+    #[test]
+    fn shortcuts_are_not_shared() {
+        let mut seen = HashSet::new();
+        for a in Action::ALL {
+            let s = a.info().shortcut;
+            if !s.is_empty() {
+                assert!(seen.insert(s), "{s} is bound to more than one action ({a:?})");
+            }
+        }
+    }
+
+    #[test]
+    fn page_wide_actions_also_count_as_page_edits() {
+        for a in Action::ALL {
+            if a.edits_page_itself() {
+                assert!(a.edits_page(), "{a:?}");
+            }
+        }
+        for a in [Action::PageProps, Action::DeletePage, Action::PageUp, Action::PageDown] {
+            assert!(a.edits_page_itself(), "{a:?}");
+        }
+    }
+
+    #[test]
+    fn drawing_tools_edit_the_page_but_viewing_and_saving_do_not() {
+        for a in [
+            Action::PlaceSymbol,
+            Action::DrawWire,
+            Action::TextTool,
+            Action::Delete,
+            Action::Paste,
+            Action::Duplicate,
+        ] {
+            assert!(a.edits_page(), "{a:?}");
+            assert!(!a.edits_page_itself(), "{a:?}");
+        }
+        for a in [
+            Action::Save,
+            Action::Open,
+            Action::Copy,
+            Action::Select,
+            Action::ZoomIn,
+            Action::ZoomFit,
+            Action::ToggleGrid,
+            Action::ExportPdf,
+            Action::Find,
+            Action::NextPage,
+            Action::AddPage,
+            Action::Undo,
+        ] {
+            assert!(!a.edits_page(), "{a:?}");
+        }
+    }
+
+    #[test]
+    fn toolbar_and_ribbon_only_show_known_actions_without_empty_groups() {
+        let all: HashSet<Action> = Action::ALL.iter().copied().collect();
+        for group in TOOLBAR {
+            assert!(!group.is_empty());
+            for a in *group {
+                assert!(all.contains(a), "toolbar shows {a:?}, missing from ALL");
+            }
+        }
+        let mut tabs = HashSet::new();
+        for (tab, groups) in RIBBON {
+            assert!(tabs.insert(*tab), "ribbon tab {tab} twice");
+            assert!(!groups.is_empty(), "ribbon tab {tab} is empty");
+            for (name, actions) in *groups {
+                assert!(!actions.is_empty(), "ribbon group {tab}/{name} is empty");
+                let mut in_group = HashSet::new();
+                for a in *actions {
+                    assert!(all.contains(a), "ribbon shows {a:?}, missing from ALL");
+                    assert!(in_group.insert(*a), "{a:?} twice in {tab}/{name}");
+                }
+            }
+        }
+    }
+}
