@@ -1115,8 +1115,9 @@ impl Open {
         if from == to {
             return Ok(0);
         }
-        let used = self.project.devices.contains_key(to) || self.project.tag_index().contains_key(to);
-        if used {
+        // A cable that only wire cores name (no symbol, no device entry) counts too, or the
+        // rename would merge this device into that cable.
+        if wc_core::placement::used_tags(&self.project).contains(to) {
             return Err(format!("{to} is already used."));
         }
         self.checkpoint();
@@ -10288,6 +10289,40 @@ mod tests {
         );
         let err = call(&mut a, "report_layouts", json!({"action": "get", "kind": "bom"})).unwrap_err();
         assert!(err.contains("plc-cards"), "{err}");
+    }
+
+    #[test]
+    fn set_device_refuses_a_cable_tag_only_wire_cores_name() {
+        let (_tmp, mut a) = app(vec![]);
+        let coil: Value = serde_json::from_str(
+            &call(
+                &mut a,
+                "place_symbol",
+                json!({"symbol": "wc.coil", "x": 60, "y": 120, "page": "2", "tag": "-K1"}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let c = coil["id"].as_str().unwrap().to_owned();
+        call(
+            &mut a,
+            "add_wire",
+            json!({"page": "2", "from": {"item": c, "pin": "A1"}, "to": {"item": c, "pin": "A2"}}),
+        )
+        .unwrap();
+        let id = page2(&a).wires[0].id.clone();
+        call(&mut a, "update_wire", json!({"page": "2", "id": id, "cable": "-W1"})).unwrap();
+        let w1 = DeviceTag::parse("-W1").unwrap();
+        // A project read from disk or an import can name a cable only on its cores.
+        a.open.as_mut().unwrap().project.devices.remove(&w1);
+        {
+            let project = &a.open.as_ref().unwrap().project;
+            assert!(!project.tag_index().contains_key(&w1), "no -W1 symbol");
+        }
+        let project = a.open.as_ref().unwrap().project.clone();
+        let r = call(&mut a, "set_device", json!({"tag": "-K1", "rename_to": "-W1"}));
+        assert!(r.as_ref().is_err_and(|e| e.contains("-W1 is already used")), "{r:?}");
+        assert_eq!(a.open.as_ref().unwrap().project, project, "nothing changed");
     }
 
     #[test]
