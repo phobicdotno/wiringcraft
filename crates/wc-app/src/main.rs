@@ -655,9 +655,11 @@ impl App {
         // So does a close, from the frame it waits for a typed value until the window is gone
         // (after Don't save, a join would save what the person chose to drop), and an Open
         // whose file dialog has not been shown yet. And so does the unsaved-changes question:
-        // its answer saves or drops the project it was asked about.
+        // its answer saves or drops the project it was asked about. And an assistant's open
+        // waiting for a typed value, until the panels have entered it (#1091).
         let busy = busy
             || !self.after_typed.is_empty()
+            || self.assistant.enter_typed
             || self.closing != Closing::No
             || matches!(self.pending, Some(Pending::Open))
             || matches!(self.dialog, Some(Dialog::Unsaved(_)));
@@ -4643,9 +4645,13 @@ impl App {
     /// a typed value, which first goes into the project it was asked for, nor while a close is
     /// under way, which asks about the project open now. Nor while an Open waits for its file
     /// dialog: it asks about the project open now too, and once the dialog has run (or was
-    /// cancelled) the fetch is taken up again.
+    /// cancelled) the fetch is taken up again. Nor while an assistant's open waits for a typed
+    /// value (#1091).
     fn fetch_may_open(&self) -> bool {
-        self.after_typed.is_empty() && self.closing == Closing::No && !matches!(self.pending, Some(Pending::Open))
+        self.after_typed.is_empty()
+            && !self.assistant.enter_typed
+            && self.closing == Closing::No
+            && !matches!(self.pending, Some(Pending::Open))
     }
 
     /// Insert a macro on the current page, selected so it can be dragged into place.
@@ -5792,7 +5798,10 @@ impl eframe::App for App {
         // A close that waited a frame for a typed value: the field gives up the keyboard, so
         // the panels enter its value before the close asks about unsaved changes.
         let close_waited = self.closing == Closing::WaitsForTyped;
-        if close_waited {
+        // An assistant's open waited for a typed value the same way (#1091).
+        // It stays set until the panels have entered the value: a session join waits for it.
+        let assistant_waited = self.assistant.enter_typed;
+        if close_waited || assistant_waited {
             enter_typed_value(ctx);
         }
         self.hold_close_while_importing(ctx);
@@ -5856,6 +5865,15 @@ impl eframe::App for App {
         }
         self.poll_import(ctx);
         self.log_messages();
+        // In the frame the field gives up the keyboard (for the assistant's open, a close or a
+        // save) its value is entered only by the panels, after the assistant's tools ran: an
+        // open asked in this frame still waits.
+        self.assistant.typed_field = assistant_waited
+            || close_waited
+            || typed_waits
+            || ctx
+                .memory(egui::Memory::focused)
+                .is_some_and(|f| Some(f) != self.assistant.input_id);
         self.assistant_poll(ctx);
         self.ask_pending();
         if self.applied_theme != self.prefs.theme {
@@ -5963,6 +5981,9 @@ impl eframe::App for App {
         };
         for a in after_panels {
             self.run(a);
+        }
+        if assistant_waited {
+            self.assistant.enter_typed = false;
         }
         if close_waited && self.closing == Closing::WaitsForTyped {
             self.close_or_ask();
@@ -7832,6 +7853,10 @@ mod nudge_tests {
             matches!(app.pending, Some(Pending::Open)),
             "the Open waited behind the save"
         );
+        assert!(
+            app.assistant.typed_field,
+            "an assistant's open in the frame the value is entered waits too (#1091)"
+        );
         assert_eq!(tag(&app).as_ref(), Some(&typed), "entered before the save");
         let open = app.open.as_ref().unwrap();
         assert!(!open.dirty, "saved after the value was entered");
@@ -8182,6 +8207,77 @@ mod nudge_tests {
         app.pending = None;
     }
 
+    /// The assistant's open_project while a field has a value typed and not entered yet is
+    /// refused once: the field gives up the keyboard in the next frame, the value is entered,
+    /// and asked again the assistant's open asks about the unsaved change (#1091).
+    #[test]
+    fn the_assistant_open_enters_a_typed_value_first() {
+        let (tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        app.open.as_mut().unwrap().save().unwrap();
+        let first = app.open.as_ref().unwrap().dir.clone();
+        let other = tmp.path().join("other");
+        wc_core::store::create(&other, "Other").unwrap();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        let field = egui::Id::new(panels::TAG_FIELD);
+        let tag = |app: &App| {
+            app.open.as_ref().unwrap().project.pages[app.ed.page].symbols[1]
+                .tag
+                .as_ref()
+                .map(ToString::to_string)
+        };
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        ctx.memory_mut(|m| m.request_focus(field));
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        let typed = format!("{}7", tag(&app).unwrap());
+        app_frame(&mut app, &ctx, vec![egui::Event::Text("7".into())], false);
+        assert!(ctx.memory(|m| m.has_focus(field)), "the field still has the keyboard");
+        assert!(!app.open.as_ref().unwrap().dirty, "typed, not entered yet");
+        let path = serde_json::json!({ "path": other.display().to_string() });
+        let r = app.agent_tool("open_project", &path);
+        assert!(
+            matches!(&r, Err(e) if e.contains("typed in a field")),
+            "refused for the typed value: {r:?}"
+        );
+        assert_eq!(app.open.as_ref().unwrap().dir, first, "not replaced");
+        assert!(!app.fetch_may_open(), "a fetched base project waits for the value too");
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        // The frame the field gives up the keyboard: the tools run before the panels enter the
+        // value, so an open asked again in it (through the assistant's poll) is refused too.
+        assert!(
+            app.assistant.typed_field,
+            "an open in the frame the value is entered still waits"
+        );
+        assert_eq!(tag(&app).as_ref(), Some(&typed), "entered");
+        assert!(app.open.as_ref().unwrap().dirty, "an unsaved change now");
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        assert!(!app.assistant.typed_field, "no field has the keyboard now");
+        let r = app.agent_tool("open_project", &path);
+        assert!(matches!(&r, Ok(m) if m.contains("unsaved changes")), "{r:?}");
+        assert!(matches!(app.dialog, Some(Dialog::Unsaved(Leave::Open(_)))));
+        assert_eq!(app.open.as_ref().unwrap().dir, first, "still not replaced");
+
+        // With the keyboard in the assistant's own message box the open goes ahead.
+        let (tmp, mut app, ctx) = self::app(Point::new(80.0, 60.0), false);
+        app.open.as_mut().unwrap().save().unwrap();
+        let other = tmp.path().join("other");
+        wc_core::store::create(&other, "Other").unwrap();
+        theme::install_fonts(&ctx);
+        app.prefs.show_assistant = true;
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        let Some(input) = app.assistant.input_id else {
+            unreachable!("the assistant panel shows its message box")
+        };
+        ctx.memory_mut(|m| m.request_focus(input));
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        assert!(ctx.memory(|m| m.has_focus(input)), "the message box has the keyboard");
+        assert!(!app.assistant.typed_field, "not a field with a typed value");
+        let path = serde_json::json!({ "path": other.display().to_string() });
+        assert!(app.agent_tool("open_project", &path).is_ok());
+        assert_eq!(app.open.as_ref().unwrap().dir, other);
+    }
+
     /// A session join that would replace the open project waits while a save waits for a
     /// typed value, also when something syncs the session before the panels have entered it
     /// (an assistant's Undo does): the typed value is saved in the project it was typed in,
@@ -8243,6 +8339,52 @@ mod nudge_tests {
             "the typed tag is saved in the project it was typed in"
         );
         assert_ne!(app.open.as_ref().unwrap().dir, first, "then the joined copy opened");
+    }
+
+    /// A session join waits while an assistant's open waits for a typed value: the value is
+    /// entered in the project it was typed in before the joined copy can open (#1091).
+    #[test]
+    fn a_session_join_waits_while_an_assistant_open_waits_for_a_typed_value() {
+        let (tmp, mut app, ctx) = app(Point::new(80.0, 60.0), false);
+        app.open.as_mut().unwrap().save().unwrap();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, app.prefs.theme);
+        let field = egui::Id::new(panels::TAG_FIELD);
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        ctx.memory_mut(|m| m.request_focus(field));
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        let first = app.open.as_ref().unwrap().dir.clone();
+        let page = app.ed.page;
+        let before = app.open.as_ref().unwrap().project.pages[page].symbols[1]
+            .tag
+            .as_ref()
+            .map(ToString::to_string);
+        let typed = format!("{}7", before.unwrap());
+        app_frame(&mut app, &ctx, vec![egui::Event::Text("7".into())], false);
+        let other = tmp.path().join("other");
+        wc_core::store::create(&other, "Other").unwrap();
+        let path = serde_json::json!({ "path": other.display().to_string() });
+        assert!(app.agent_tool("open_project", &path).is_err(), "the open waits");
+        // A host has let this window in: the joined copy opens at the next sync that may.
+        let (_host, guest) = crate::share::tests::let_in_guest(tmp.path()).unwrap();
+        app.share = guest;
+        app.sync_session_now(false);
+        assert_eq!(
+            app.open.as_ref().unwrap().dir,
+            first,
+            "the join waits for the typed value"
+        );
+        // The panels enter the value, then the frame's sync lets the join in: the joined copy
+        // replaces the project only after its unsaved work, the typed value, is saved.
+        app_frame(&mut app, &ctx, Vec::new(), false);
+        assert!(!app.assistant.enter_typed, "the wait is over once the value is entered");
+        assert_ne!(app.open.as_ref().unwrap().dir, first, "then the joined copy opened");
+        let saved = wc_core::store::load(&first).unwrap();
+        assert_eq!(
+            saved.pages[page].symbols[1].tag.as_ref().map(ToString::to_string),
+            Some(typed),
+            "the typed tag is saved in the project it was typed in"
+        );
     }
 
     /// A black box form changed and not applied is applied by Ctrl+S: the project read back
