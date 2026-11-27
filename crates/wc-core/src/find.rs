@@ -93,11 +93,25 @@ pub struct FindOptions {
 
 /// Whether `needle` occurs in `hay`.
 fn contains(hay: &str, needle: &str, opts: FindOptions) -> bool {
-    !positions(hay, needle, opts).is_empty()
+    !positions(hay, needle, opts, false).is_empty()
 }
 
-/// The char positions in `hay` where `needle` starts, without overlaps, left to right.
-fn positions(hay: &str, needle: &str, opts: FindOptions) -> Vec<usize> {
+/// Whether a match may not start or end between `a` and `b`: both are letters or both are
+/// digits, so they belong to one part of a tag (`K` and `15` in `-K15`).
+fn one_part(a: char, b: char) -> bool {
+    (a.is_alphabetic() && b.is_alphabetic()) || (a.is_numeric() && b.is_numeric())
+}
+
+/// Whether a match may not end between `a` and `b`: [`one_part`], or a number and the letter
+/// that follows it (`1` and `A` in `-K1A`, which is another device than `-K1`).
+fn one_part_at_end(a: char, b: char) -> bool {
+    one_part(a, b) || (a.is_numeric() && b.is_alphabetic())
+}
+
+/// The char positions in `hay` where `needle` starts, without overlaps, left to right. With
+/// `whole_parts` only where it covers whole runs of letters and of digits, so `-K1` is not
+/// found in `-K15`, and where no letter follows its last digit, so not in `-K1A` either.
+fn positions(hay: &str, needle: &str, opts: FindOptions, whole_parts: bool) -> Vec<usize> {
     let h: Vec<char> = hay.chars().collect();
     let n: Vec<char> = needle.chars().collect();
     let mut out = Vec::new();
@@ -116,7 +130,15 @@ fn positions(hay: &str, needle: &str, opts: FindOptions) -> Vec<usize> {
         let here = h
             .get(i..i + n.len())
             .is_some_and(|w| w.iter().zip(&n).all(|(&a, &b)| same(a, b)));
-        if here {
+        let around = |at: usize| {
+            at.checked_sub(1)
+                .and_then(|b| h.get(b))
+                .copied()
+                .zip(h.get(at).copied())
+        };
+        let cut = around(i).is_some_and(|(a, b)| one_part(a, b))
+            || around(i + n.len()).is_some_and(|(a, b)| one_part_at_end(a, b));
+        if here && !(whole_parts && cut) {
             out.push(i);
             i += n.len();
         } else {
@@ -128,7 +150,18 @@ fn positions(hay: &str, needle: &str, opts: FindOptions) -> Vec<usize> {
 
 /// `hay` with every occurrence of `needle` replaced by `with`.
 pub fn replace_text(hay: &str, needle: &str, with: &str, opts: FindOptions) -> String {
-    let at = positions(hay, needle, opts);
+    replace_at(hay, needle, with, &positions(hay, needle, opts, false))
+}
+
+/// A device tag with `needle` replaced by `with` where it covers whole parts of the tag: runs
+/// of letters and runs of digits are not cut, so `-K1` to `-K2` leaves `-K15` as it is, while
+/// `K` to `Q` makes it `-Q15`.
+pub fn replace_in_tag(tag: &str, needle: &str, with: &str, opts: FindOptions) -> String {
+    replace_at(tag, needle, with, &positions(tag, needle, opts, true))
+}
+
+/// `hay` with the `needle` at each of the char positions `at` replaced by `with`.
+fn replace_at(hay: &str, needle: &str, with: &str, at: &[usize]) -> String {
     if at.is_empty() {
         return hay.to_owned();
     }
@@ -242,7 +275,8 @@ pub fn find(project: &Project, query: &str, opts: FindOptions) -> Vec<Hit> {
 /// changes and the reason comes back. Returns how many values changed.
 ///
 /// A device tag hit renames that device everywhere it appears, once per device, even when
-/// several of its symbols are chosen.
+/// several of its symbols are chosen. In a tag the query counts only where it covers whole
+/// parts ([`replace_in_tag`]): a hit on `-K15` for `-K1` keeps its tag.
 pub fn replace(
     project: &mut Project,
     hits: &[Hit],
@@ -342,7 +376,7 @@ pub fn replace_renaming(
                     return Err(stale());
                 }
                 if let Some(from) = tag {
-                    let text = replace_text(&from.to_string(), query, with, opts);
+                    let text = replace_in_tag(&from.to_string(), query, with, opts);
                     let to = DeviceTag::parse(&text).map_err(|e| format!("{from} would become \"{text}\": {e}"))?;
                     if to != from {
                         renames.insert(from, to);
@@ -360,11 +394,9 @@ pub fn replace_renaming(
             return Err(format!("{other} and {from} would both become {to}."));
         }
     }
-    let taken: Vec<DeviceTag> = p
-        .devices
-        .keys()
-        .cloned()
-        .chain(p.tag_index().into_keys())
+    // A cable that only wire cores name is taken too.
+    let taken: Vec<DeviceTag> = crate::placement::used_tags(&p)
+        .into_iter()
         .filter(|t| !renames.contains_key(t))
         .collect();
     if let Some(to) = renames.values().find(|to| taken.contains(to)) {
@@ -373,13 +405,8 @@ pub fn replace_renaming(
     // Renamed in two steps through placeholders, so `-K1` -> `-K2` and `-K2` -> `-K3` in one
     // replace do not run into each other. A placeholder is a tag nothing in the project uses
     // and no rename gives.
-    let mut used: std::collections::BTreeSet<DeviceTag> = p
-        .devices
-        .keys()
-        .cloned()
-        .chain(p.tag_index().into_keys())
-        .chain(renames.values().cloned())
-        .collect();
+    let mut used = crate::placement::used_tags(&p);
+    used.extend(renames.values().cloned());
     let mut next = 0usize;
     let mut placed: Vec<(DeviceTag, DeviceTag)> = Vec::new();
     for (from, to) in &renames {
@@ -559,21 +586,51 @@ mod tests {
     #[test]
     fn tags_can_move_up_one_in_a_single_replace() {
         let mut p = sample();
+        p.devices.insert(tag("-K1.1"), Device::default());
         let opts = FindOptions::default();
-        // -K1 -> -K12 would clash with the existing -K12, unless -K12 moves too: "K1" -> "K12"
-        // makes -K12 into -K122, so both move and nothing clashes.
+        // -K1 -> -K1.1 would clash with the existing -K1.1, unless that moves too: "K1" ->
+        // "K1.1" makes it -K1.1.1, so both move and nothing clashes. -K12 is another device.
         let hits: Vec<Hit> = find(&p, "K1", opts)
             .into_iter()
             .filter(|h| h.kind == FindKind::Tag)
             .collect();
-        assert_eq!(replace(&mut p, &hits, "K1", "K12", opts), Ok(3));
-        assert!(p.devices.contains_key(&tag("-K12")));
+        assert_eq!(replace(&mut p, &hits, "K1", "K1.1", opts), Ok(3));
+        assert!(p.devices.contains_key(&tag("-K1.1")) && p.devices.contains_key(&tag("-K1.1.1")));
         let tags: Vec<String> = p.pages[0]
             .symbols
             .iter()
             .filter_map(|s| s.tag.as_ref().map(ToString::to_string))
             .collect();
-        assert_eq!(tags, ["-K12", "-K122", "-F1"]);
+        assert_eq!(tags, ["-K1.1", "-K12", "-F1"]);
+    }
+
+    #[test]
+    fn a_tag_replace_leaves_longer_tags_alone() {
+        let mut p = sample();
+        let opts = FindOptions::default();
+        // -K12 is listed as a hit for "-K1", but it is another device: only -K1 is renamed.
+        let hits = find(&p, "-K1", opts);
+        assert!(hits.iter().any(|h| h.value == "-K12"));
+        assert_eq!(replace(&mut p, &hits, "-K1", "-K2", opts), Ok(2));
+        let tags: Vec<String> = p.pages[0]
+            .symbols
+            .iter()
+            .filter_map(|s| s.tag.as_ref().map(ToString::to_string))
+            .collect();
+        assert_eq!(tags, ["-K2", "-K12", "-F1"]);
+        assert_eq!(p.pages[0].wires[0].number.as_deref(), Some("K1-101"), "no tag in it");
+
+        assert_eq!(replace_in_tag("-K15", "K1", "K2", opts), "-K15");
+        assert_eq!(replace_in_tag("-K15", "5", "6", opts), "-K15");
+        assert_eq!(replace_in_tag("-XK1", "K1", "K2", opts), "-XK1", "K is half of XK");
+        assert_eq!(replace_in_tag("-K15", "k", "Q", opts), "-Q15", "a whole letter code");
+        assert_eq!(replace_in_tag("-K1A", "-K1", "-K2", opts), "-K1A", "1A is one number");
+        assert_eq!(replace_in_tag("-K1A", "1", "2", opts), "-K1A");
+        assert_eq!(replace_in_tag("-K1A", "1A", "2B", opts), "-K2B");
+        assert_eq!(replace_in_tag("-K1.A", "-K1", "-K2", opts), "-K2.A");
+        assert_eq!(replace_in_tag("=A1+C1-K1", "1", "2", opts), "=A2+C2-K2");
+        assert_eq!(replace_in_tag("-X1.11", "X1", "X2", opts), "-X2.11");
+        assert_eq!(replace_in_tag("-X1.11", "-X1.11", "-X1.1", opts), "-X1.1");
     }
 
     #[test]
@@ -598,6 +655,37 @@ mod tests {
         // -K1 -> -F1 is taken; -K12 -> -F12 would be fine.
         assert!(replace(&mut p, &both, "K1", "F1", opts).is_err());
         assert_eq!(p, before);
+    }
+
+    #[test]
+    fn a_cable_only_wire_cores_name_is_taken() {
+        let mut p = sample();
+        // -W1 has a core drawn but no cable symbol and no device entry.
+        p.pages[0].wires[0].cable = Some(crate::project::CableCore {
+            cable: tag("-W1"),
+            core: "1".into(),
+        });
+        let before = p.clone();
+        let opts = FindOptions { match_case: true };
+        let hits = find(&p, "-F1", opts);
+        assert_eq!(
+            replace(&mut p, &hits, "-F1", "-W1", opts),
+            Err("-W1 is already used.".into())
+        );
+        assert_eq!(p, before, "the cores of -W1 are not joined by -F1");
+        assert!(crate::placement::used_tags(&p).contains(&tag("-W1")));
+        let free = crate::placement::free_tag_like(&crate::placement::used_tags(&p), &tag("-W1"));
+        assert_eq!(free, Some(tag("-W2")), "a new cable does not take over -W1's cores");
+
+        // A core-only cable with a placeholder's tag is not used as a placeholder either.
+        p.pages[0].wires[0].cable = Some(crate::project::CableCore {
+            cable: tag("-WCFIND0"),
+            core: "1".into(),
+        });
+        let hits = find(&p, "-F1", opts);
+        assert_eq!(replace(&mut p, &hits, "-F1", "-F2", opts), Ok(1));
+        let core = p.pages[0].wires[0].cable.as_ref().map(|c| c.cable.clone());
+        assert_eq!(core, Some(tag("-WCFIND0")), "the core keeps its cable");
     }
 
     #[test]

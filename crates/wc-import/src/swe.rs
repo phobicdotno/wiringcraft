@@ -2876,3 +2876,6 @@ pub mod cabinet;
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod helper_tests;

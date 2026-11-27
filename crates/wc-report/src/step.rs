@@ -53,24 +53,30 @@ fn blocks(project: &Project, panel: &Panel, parts: &BTreeMap<String, Part>) -> (
     for item in &panel.items {
         match item {
             PanelItem::Rail { at, length } => {
-                rails.push((at.x, at.x + length, at.y));
+                // A rail drawn right to left (negative length) covers the same span.
+                let (x0, x1) = (at.x.min(at.x + length), at.x.max(at.x + length));
+                rails.push((x0, x1, at.y));
                 out.push((
                     (
                         "DIN rail".into(),
-                        [at.x, y(at.y + 17.5), PLATE],
-                        [at.x + length, y(at.y - 17.5), PLATE + RAIL],
+                        [x0, y(at.y + 17.5), PLATE],
+                        [x1, y(at.y - 17.5), PLATE + RAIL],
                     ),
                     false,
                 ));
             }
-            PanelItem::Duct { min, max } => out.push((
-                (
-                    "Wire duct".into(),
-                    [min.x, y(max.y), PLATE],
-                    [max.x, y(min.y), PLATE + DUCT_HEIGHT],
-                ),
-                false,
-            )),
+            PanelItem::Duct { .. } => {
+                // Corners may be written either way round; draw the rectangle they span.
+                let (min, max) = item.bounds();
+                out.push((
+                    (
+                        "Wire duct".into(),
+                        [min.x, y(max.y), PLATE],
+                        [max.x, y(min.y), PLATE + DUCT_HEIGHT],
+                    ),
+                    false,
+                ));
+            }
             PanelItem::Device { .. } => {}
         }
     }
@@ -400,6 +406,41 @@ mod tests {
             let n: usize = n.parse().unwrap_or(0);
             assert!(n >= 1 && n <= count, "#{n} of {count}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_duct_with_swapped_corners_and_a_rail_drawn_right_to_left_are_kept() -> Result<(), wc_core::Error> {
+        let project = Project::new("x");
+        let mut panel = Panel::new("main", "Cabinet", 400.0, 300.0);
+        panel.items.push(PanelItem::Duct {
+            min: Point::new(80.0, 50.0),
+            max: Point::new(40.0, 10.0),
+        });
+        panel.items.push(PanelItem::Rail {
+            at: Point::new(300.0, 150.0),
+            length: -200.0,
+        });
+        panel.items.push(PanelItem::Device {
+            tag: DeviceTag::parse("-K1")?,
+            at: Point::new(150.0, 105.0),
+            width: 20.0,
+            height: 90.0,
+            rotation: wc_core::geom::Rotation::R0,
+        });
+        let step = panel_step(&project, &panel, &BTreeMap::new(), "2026-11-27T12:00:00").text;
+        // Plate, duct, rail and device.
+        assert_eq!(step.matches("MANIFOLD_SOLID_BREP(").count(), 4, "{step}");
+        // The duct spans 40..80 x 10..50 on the plate (y up: 250..290).
+        assert!(step.contains("CARTESIAN_POINT('',(40.,250.,2.))"), "duct corner");
+        assert!(step.contains("CARTESIAN_POINT('',(80.,290.,62.))"), "duct corner");
+        // The rail spans 100..300, and the device sits on it (z 9.5).
+        assert!(step.contains("CARTESIAN_POINT('',(100.,132.5,2.))"), "rail corner");
+        assert!(step.contains("CARTESIAN_POINT('',(300.,167.5,9.5))"), "rail corner");
+        assert!(
+            step.contains("CARTESIAN_POINT('',(150.,105.,9.5))"),
+            "device on the rail"
+        );
         Ok(())
     }
 
