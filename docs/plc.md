@@ -36,7 +36,8 @@ Column names are matched in several languages, for example `Device`, `Tag` or `B
 device and `Address`, `PLC address`, `IO address` or `Operand` for the address.
 
 Each row sets that device's address, and its description when the row has one. An empty address
-clears it. A tag that no symbol carries is reported and skipped, not added.
+clears it. A tag that is neither drawn nor already in the device list (`devices.json`) is reported and
+skipped, not added. A device in the list that no symbol carries yet is updated like a drawn one.
 
 ```
 $ wiringcraft import plc-csv io.csv
