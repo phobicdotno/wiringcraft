@@ -2464,6 +2464,89 @@ struct FoundMacro {
     project: bool,
 }
 
+/// The symbol and part copies taking a set of macros' items ([`take_macro_items`]) may write, as
+/// they were before the run: a run that fails after them (an item that cannot be taken, a macro
+/// too large for the page, a placement or a save that fails) puts them back, so no page draws a
+/// symbol it did not.
+struct MacroCopies {
+    files: Vec<(PathBuf, Option<Vec<u8>>)>,
+    /// The command named when a file is a link: `macro place` or `macro generate`.
+    command: &'static str,
+}
+
+impl MacroCopies {
+    /// Read the copies before any item of `macros` (applied macros) is taken. Refuses a copy
+    /// that is a link.
+    fn read<'a>(
+        dir: &Path,
+        macros: impl IntoIterator<Item = &'a wc_core::macros::Macro>,
+        command: &'static str,
+    ) -> Res<Self> {
+        let mut item_ids: std::collections::BTreeSet<(ItemKind, &str)> = std::collections::BTreeSet::new();
+        for m in macros {
+            item_ids.extend(m.symbols.iter().map(|s| (ItemKind::Symbol, s.symbol.as_str())));
+            item_ids.extend(
+                m.devices
+                    .values()
+                    .flat_map(|d| d.part.iter().chain(d.accessories.iter().map(|a| &a.part)))
+                    .map(|id| id.trim())
+                    .filter(|id| !id.is_empty())
+                    .map(|id| (ItemKind::Part, id)),
+            );
+        }
+        // A part whose name is no file name (`ACME R24`) is not taken from a library
+        // and stays a name on the device: nothing to put back.
+        let files: Vec<(PathBuf, Option<Vec<u8>>)> = item_ids
+            .iter()
+            .filter(|(kind, id)| *kind == ItemKind::Symbol || store::vendor_path(dir, *kind, id).is_ok())
+            .map(|(kind, id)| vendored_bytes(dir, *kind, id))
+            .collect::<Res<_>>()?;
+        // A link would become a plain file on the rollback, or be removed (#614).
+        refuse_linked_files(&files, command)?;
+        Ok(Self { files, command })
+    }
+
+    /// Put the copies back after a failure, and return `err` with what could not be put back.
+    fn undo(&self, err: String) -> String {
+        let failed = put_files_back(&self.files);
+        if failed.is_empty() {
+            err
+        } else {
+            format!(
+                "{err}; symbol and part copies could not be put back: {}",
+                failed.join("; ")
+            )
+        }
+    }
+
+    /// Save the project. A save that fails half way puts the project's files and the copies
+    /// back. `new_pages` are the pages the run added.
+    fn save(&self, dir: &Path, p: &Project, new_pages: &[&str]) -> Res<()> {
+        let mut before = snapshot_project(dir, new_pages, &[]).map_err(|x| self.undo(x))?;
+        // A link would become a plain file on the save and on the rollback (#614).
+        refuse_linked_files(&before, self.command).map_err(|x| self.undo(x))?;
+        // The symbol and part copies go back with the project's files, as they were
+        // before this run.
+        // `put_files_back` puts the last entry back first, so the state from before
+        // this run (the copies, read before any was taken) goes last in that order: a
+        // `box.*` symbol the save snapshot also holds ends as it was before the run.
+        let mut earliest = self.files.clone();
+        earliest.append(&mut before);
+        let before = earliest;
+        if let Err(err) = save(dir, p) {
+            let failed = put_files_back(&before);
+            if failed.is_empty() {
+                return Err(err);
+            }
+            return Err(format!(
+                "{err}; putting the project's files back failed too: {}",
+                failed.join("; ")
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Make sure the symbols and parts `m` (an applied macro) uses are in the project, as
 /// `macro place` needs them.
 fn take_macro_items(dir: &Path, p: &mut Project, m: &wc_core::macros::Macro, again: &str) -> Res<()> {
@@ -3741,69 +3824,19 @@ fn run(mut cli: Cli) -> Res<()> {
                     // The symbol and part copies taking the macro's items may write, read first:
                     // a run that fails after them (a macro too large for the page, a placement or
                     // a save that fails) puts them back, so no page draws a symbol it did not.
-                    let mut item_ids: std::collections::BTreeSet<(ItemKind, &str)> = std::collections::BTreeSet::new();
+                    let vendored = MacroCopies::read(dir, &copies, "macro generate")?;
                     for copy in &copies {
-                        item_ids.extend(copy.symbols.iter().map(|s| (ItemKind::Symbol, s.symbol.as_str())));
-                        item_ids.extend(
-                            copy.devices
-                                .values()
-                                .flat_map(|d| d.part.iter().chain(d.accessories.iter().map(|a| &a.part)))
-                                .map(|id| id.trim())
-                                .filter(|id| !id.is_empty())
-                                .map(|id| (ItemKind::Part, id)),
-                        );
-                    }
-                    // A part whose name is no file name (`ACME R24`) is not taken from a library
-                    // and stays a name on the device, as `macro place` leaves it: nothing to put back.
-                    let vendored: Vec<(PathBuf, Option<Vec<u8>>)> = item_ids
-                        .iter()
-                        .filter(|(kind, id)| *kind == ItemKind::Symbol || store::vendor_path(dir, *kind, id).is_ok())
-                        .map(|(kind, id)| vendored_bytes(dir, *kind, id))
-                        .collect::<Res<_>>()?;
-                    // A link would become a plain file on the rollback, or be removed (#614).
-                    refuse_linked_files(&vendored, "macro generate")?;
-                    let undo_vendored = |err: String| -> String {
-                        let failed = put_files_back(&vendored);
-                        if failed.is_empty() {
-                            err
-                        } else {
-                            format!(
-                                "{err}; symbol and part copies could not be put back: {}",
-                                failed.join("; ")
-                            )
-                        }
-                    };
-                    for copy in &copies {
-                        take_macro_items(dir, &mut p, copy, "generate the pages again").map_err(undo_vendored)?;
+                        take_macro_items(dir, &mut p, copy, "generate the pages again")
+                            .map_err(|x| vendored.undo(x))?;
                     }
                     let extent = wc_core::generate::extent(&copies, |id| store::read_vendored_symbol(dir, id).ok());
                     let title = title.unwrap_or_else(|| m.name.clone());
                     let generated = wc_core::generate::generate(&mut p, &copies, extent, size, &title)
-                        .map_err(|x| undo_vendored(e(x)))?;
+                        .map_err(|x| vendored.undo(e(x)))?;
                     // A save that fails half way puts the project's files back, so a second run
                     // does not place the rows already written again.
                     let new_pages: Vec<&str> = generated.pages.iter().map(String::as_str).collect();
-                    let mut before = snapshot_project(dir, &new_pages, &[]).map_err(undo_vendored)?;
-                    // A link would become a plain file on the save and on the rollback (#614).
-                    refuse_linked_files(&before, "macro generate").map_err(undo_vendored)?;
-                    // The symbol and part copies go back with the project's files, as they were
-                    // before this run.
-                    // `put_files_back` puts the last entry back first, so the state from before
-                    // this run (the copies, read before any was taken) goes last in that order: a
-                    // `box.*` symbol the save snapshot also holds ends as it was before the run.
-                    let mut earliest = vendored.clone();
-                    earliest.append(&mut before);
-                    let before = earliest;
-                    if let Err(err) = save(dir, &p) {
-                        let failed = put_files_back(&before);
-                        if failed.is_empty() {
-                            return Err(err);
-                        }
-                        return Err(format!(
-                            "{err}; putting the project's files back failed too: {}",
-                            failed.join("; ")
-                        ));
-                    }
+                    vendored.save(dir, &p, &new_pages)?;
                     println!("{}", generated.pages.join(" "));
                     let plural = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
                     println!(
@@ -3835,10 +3868,13 @@ fn run(mut cli: Cli) -> Res<()> {
                     if !m.symbols.is_empty() || !m.wires.is_empty() {
                         refuse_graphic(page_mut(&mut p, &page)?, "a macro with symbols or wires")?;
                     }
-                    take_macro_items(dir, &mut p, &m, "place the macro again")?;
-                    let page_id = page_mut(&mut p, &page)?.id.clone();
-                    let ids = wc_core::macros::place(&mut p, &page_id, &m, at).map_err(e)?;
-                    save(dir, &p)?;
+                    // As `macro generate`: a run that fails after a copy was written (an item that
+                    // cannot be taken, the placement, the save) leaves the folder as it was.
+                    let vendored = MacroCopies::read(dir, [&m], "macro place")?;
+                    take_macro_items(dir, &mut p, &m, "place the macro again").map_err(|x| vendored.undo(x))?;
+                    let page_id = page_mut(&mut p, &page).map_err(|x| vendored.undo(x))?.id.clone();
+                    let ids = wc_core::macros::place(&mut p, &page_id, &m, at).map_err(|x| vendored.undo(e(x)))?;
+                    vendored.save(dir, &p, &[])?;
                     println!("{}", ids.join(" "));
                 }
             }
