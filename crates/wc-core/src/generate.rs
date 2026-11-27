@@ -170,12 +170,20 @@ const TAG_HEIGHT: f64 = 2.5;
 /// Points round a placed symbol's device tag as [`crate::tag::tag_lines`] lays it out: one line
 /// per `=function`, `+location` and `-product`, centred on the tag position, right-aligned (left
 /// where the placement turns that side round). Placing a copy renumbers the tag
-/// ([`crate::placement::free_tag_like`]: its letter code and a number up to 9999), so the tag is
-/// measured as the macro has it and with the widest number placing can give it.
+/// ([`crate::placement::free_tag_like`]: its letter code and a number up to 9999) and the levels
+/// under it, so the tag is measured as the macro has it and with the widest numbers placing can
+/// give its levels.
 fn tag_points(s: &crate::project::PlacedSymbol, def: &Symbol, tag: &crate::tag::DeviceTag, pts: &mut Vec<Point>) {
+    // Each product level as it is or, when wider, as its letters with the largest number: a
+    // renumbered tag (`-K` placed as `-K1000`) and a level under a renumbered parent (`-K.1`
+    // placed as `-K1000.1`) are both within it.
     let mut widest = tag.clone();
-    if let Some(last) = widest.product.last_mut() {
-        *last = format!("{}9999", tag.letter_code());
+    for level in &mut widest.product {
+        let letters: String = level.chars().take_while(|c| !c.is_ascii_digit()).collect();
+        let numbered = format!("{letters}9999");
+        if crate::font::text_width_mm(&numbered, TAG_HEIGHT) > crate::font::text_width_mm(level, TAG_HEIGHT) {
+            *level = numbered;
+        }
     }
     for t in [tag, &widest] {
         let (align, lines) = crate::tag::tag_lines(s, def, t);
@@ -644,6 +652,13 @@ mod tests {
         }
         let (min, _) = extent(std::slice::from_ref(&bare), |_| Some(def.clone()));
         let width = crate::font::text_width_mm("-K1000", TAG_HEIGHT);
+        assert!(min.x <= s.at.x - 30.0 - width + 1e-9, "{min:?}");
+        // A level under a renumbered parent: -K.1 is placed as -K1000.1 beside -K1000.
+        if let Some(first) = bare.symbols.first_mut() {
+            first.tag = Some(crate::tag::DeviceTag::parse("-K.1")?);
+        }
+        let (min, _) = extent(std::slice::from_ref(&bare), |_| Some(def.clone()));
+        let width = crate::font::text_width_mm("-K1000.1", TAG_HEIGHT);
         assert!(min.x <= s.at.x - 30.0 - width + 1e-9, "{min:?}");
         Ok(())
     }
