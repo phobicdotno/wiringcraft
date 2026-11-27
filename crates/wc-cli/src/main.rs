@@ -6410,8 +6410,10 @@ fn main() -> ExitCode {
     };
     // For tests, which run the program and cannot count otherwise: how many times this run
     // opened the library.
+    // A stderr that cannot be written to does not change how the run ended.
     if std::env::var_os("WIRINGCRAFT_COUNT_LIBRARY_OPENS").is_some() {
-        eprintln!("library opened: {}", wc_library::times_opened());
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), "library opened: {}", wc_library::times_opened());
     }
     match result {
         Ok(()) => ExitCode::SUCCESS,
