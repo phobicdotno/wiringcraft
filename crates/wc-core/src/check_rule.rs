@@ -731,3 +731,212 @@ severty = "error"
         assert_eq!(turn_rule(&both, &sets, "odd:tags", true).unwrap(), None, "off already");
     }
 }
+
+#[cfg(test)]
+mod edge_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    fn tag(s: &str) -> DeviceTag {
+        DeviceTag::parse(s).unwrap()
+    }
+
+    fn rule(kind: &str) -> CheckRule {
+        CheckRule {
+            kind: kind.into(),
+            ..CheckRule::default()
+        }
+    }
+
+    #[test]
+    fn every_role_reads_in_any_case_and_trimmed() {
+        let with = |r: &str| CheckRule {
+            role: Some(r.into()),
+            ..CheckRule::default()
+        };
+        assert_eq!(CheckRule::default().role(), Ok(None));
+        assert_eq!(with(" MAIN ").role(), Ok(Some(SymbolRole::Main)));
+        assert_eq!(with("Auxiliary").role(), Ok(Some(SymbolRole::Auxiliary)));
+        assert_eq!(with("standalone").role(), Ok(Some(SymbolRole::Standalone)));
+        assert_eq!(with("terminal").role(), Ok(Some(SymbolRole::Terminal)));
+        assert_eq!(with("Interruption").role(), Ok(Some(SymbolRole::Interruption)));
+        // The error carries the text as written.
+        assert_eq!(with(" Coil ").role(), Err(" Coil ".into()));
+        // Every role `checked` accepts is one `role` reads.
+        for r in ROLES {
+            assert!(with(r).role().unwrap().is_some(), "{r}");
+        }
+    }
+
+    #[test]
+    fn checked_keeps_what_each_kind_uses_and_leaves_blank_values_out() {
+        let tag_rule = checked(
+            &CheckRule {
+                name: Some(" spaced ".into()),
+                devices: Some("  -K* ".into()),
+                role: Some("   ".into()),
+                pattern: Some(" -K# ".into()),
+                max: Some(2),
+                severity: Some(" ERROR ".into()),
+                message: Some(" {tag} is off ".into()),
+                ..rule("Tag")
+            },
+            1,
+        )
+        .unwrap();
+        assert_eq!(tag_rule.kind, "tag");
+        assert_eq!(
+            tag_rule.name.as_deref(),
+            Some(" spaced "),
+            "the name is kept as written"
+        );
+        assert_eq!(tag_rule.devices.as_deref(), Some("-K*"));
+        assert_eq!(tag_rule.role, None, "a blank role is no role");
+        assert_eq!(tag_rule.pattern.as_deref(), Some("-K#"));
+        assert_eq!(tag_rule.max, None, "only max-wires uses a maximum");
+        assert_eq!(
+            tag_rule.severity.as_deref(),
+            Some("ERROR"),
+            "known in any case, kept as written"
+        );
+        assert_eq!(tag_rule.message.as_deref(), Some("{tag} is off"));
+
+        let wires = checked(
+            &CheckRule {
+                pattern: Some("-X#".into()),
+                max: Some(0),
+                severity: Some("  ".into()),
+                ..rule("MAX-WIRES")
+            },
+            1,
+        )
+        .unwrap();
+        assert_eq!(wires.kind, "max-wires");
+        assert_eq!((wires.max, wires.pattern, wires.severity), (Some(0), None, None));
+
+        // A tag rule whose pattern is only blanks has no pattern.
+        let blank = CheckRule {
+            pattern: Some("  ".into()),
+            ..rule("tag")
+        };
+        assert!(checked(&blank, 5).unwrap_err().starts_with("Rule 5: a tag rule needs"));
+        // An empty kind is refused, listing the kinds.
+        assert_eq!(
+            checked(&rule(""), 7).unwrap_err(),
+            "Rule 7: pick a kind (cable, tag, max-wires)."
+        );
+    }
+
+    #[test]
+    fn checked_refuses_an_unknown_role_and_checks_role_before_severity() {
+        let both = CheckRule {
+            role: Some("coil".into()),
+            severity: Some("fatal".into()),
+            ..rule("cable")
+        };
+        let err = checked(&both, 3).unwrap_err();
+        assert!(err.starts_with("Rule 3: pick a role ("), "{err}");
+        assert!(err.ends_with("or none."), "{err}");
+        for s in SEVERITIES {
+            let ok = CheckRule {
+                severity: Some(s.to_ascii_uppercase()),
+                ..rule("cable")
+            };
+            assert!(checked(&ok, 1).is_ok(), "{s}");
+        }
+    }
+
+    #[test]
+    fn check_rule_lists_every_unknown_key_in_order() {
+        let mut r = rule("cable");
+        r.unknown.insert("zeta".into(), toml::Value::Integer(1));
+        r.unknown.insert("alpha".into(), toml::Value::Boolean(true));
+        let err = check_rule(&r, 2).unwrap_err();
+        assert!(err.starts_with("Rule 2: no such key alpha, zeta ("), "{err}");
+        // Without unknown keys it is just `checked`.
+        assert_eq!(check_rule(&rule(" Cable "), 1), checked(&rule(" Cable "), 1));
+    }
+
+    #[test]
+    fn a_rule_naming_role_and_devices_needs_both() {
+        let r = CheckRule {
+            role: Some("main".into()),
+            devices: Some("-K*".into()),
+            ..rule("cable")
+        };
+        let role = r.role().unwrap();
+        assert!(r.picks(&tag("-K1"), Some(SymbolRole::Main), role, None));
+        assert!(!r.picks(&tag("-K1"), Some(SymbolRole::Auxiliary), role, None));
+        assert!(!r.picks(&tag("-M1"), Some(SymbolRole::Main), role, None));
+        assert!(!r.picks(&tag("-K1"), None, role, None), "a symbol without a role");
+        // The rule's own role wins over the default.
+        assert!(r.picks(&tag("-K1"), Some(SymbolRole::Main), role, Some(SymbolRole::Terminal)));
+    }
+
+    #[test]
+    fn a_rule_naming_neither_role_nor_devices_uses_the_default_role() {
+        let r = rule("max-wires");
+        assert!(r.picks(
+            &tag("-X1"),
+            Some(SymbolRole::Terminal),
+            None,
+            Some(SymbolRole::Terminal)
+        ));
+        assert!(!r.picks(&tag("-K1"), Some(SymbolRole::Main), None, Some(SymbolRole::Terminal)));
+        // No default: every tagged symbol, with a role or without.
+        assert!(r.picks(&tag("-K1"), Some(SymbolRole::Main), None, None));
+        assert!(r.picks(&tag("-K1"), None, None, None));
+    }
+
+    #[test]
+    fn a_message_fills_in_every_tag_and_falls_back_to_the_default() {
+        let r = CheckRule {
+            message: Some("{tag}: see {tag}".into()),
+            ..rule("cable")
+        };
+        assert_eq!(r.text(&tag("=A1-M2"), "x".into()), "=A1-M2: see =A1-M2");
+        let plain = CheckRule {
+            message: Some("no tag here".into()),
+            ..rule("cable")
+        };
+        assert_eq!(plain.text(&tag("-M2"), "x".into()), "no tag here");
+        assert_eq!(rule("cable").text(&tag("-M2"), "built in".into()), "built in");
+    }
+
+    #[test]
+    fn tag_patterns_are_trimmed_and_match_multi_level_products() {
+        assert!(tag_matches("  -M*  ", &tag("-M3")));
+        assert!(tag_matches("-K#.#", &tag("+L2-K1.2")));
+        assert!(tag_matches("-K#.#", &tag("=A1-K1.2")));
+        assert!(!tag_matches("-K#", &tag("=A1-K1.2")));
+        // A pattern not starting with `-` is matched against the whole tag only.
+        assert!(!tag_matches("M*", &tag("=A1-M3")));
+        assert!(tag_matches("=A#-M#", &tag("=A1-M3")));
+        assert!(!tag_matches("=A#-M#", &tag("-M3")));
+    }
+
+    #[test]
+    fn globs_treat_other_characters_literally_and_handle_non_ascii() {
+        assert!(glob("-X1.2", "-X1.2"));
+        assert!(!glob("-X1.2", "-X1x2"), "a dot is a dot");
+        assert!(glob("-Ä?", "-Äö"));
+        assert!(glob("-Ä#", "-Ä12"));
+        assert!(!glob("#", ""));
+        assert!(!glob("?", ""));
+        assert!(glob("**", ""));
+        assert!(glob("-M**1", "-M1"));
+        assert!(!glob("-M1x", "-M1"), "a pattern longer than the text");
+        assert!(!glob("-m1", "-M1"), "case matters");
+        assert!(!glob("#", "٣"), "only ASCII digits are numbers");
+    }
+
+    #[test]
+    fn parse_rules_ignores_other_keys_and_refuses_a_single_rule_table() {
+        let rules = parse_rules("title = \"house\"\n[[rule]]\nkind = \"cable\"\n").unwrap();
+        assert_eq!(rules, vec![rule("cable")]);
+        assert!(parse_rules("[rule]\nkind = \"cable\"\n").is_err());
+        let err = parse_rules("[[rule]\n").unwrap_err();
+        assert!(!err.is_empty());
+    }
+}
