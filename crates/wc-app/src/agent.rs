@@ -4374,6 +4374,7 @@ mod tests {
             importing: None,
             after_typed: Vec::new(),
             closing: crate::Closing::No,
+            title: String::new(),
         };
         (tmp, app)
     }

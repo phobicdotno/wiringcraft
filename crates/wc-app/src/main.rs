@@ -355,6 +355,9 @@ struct App {
     after_typed: Vec<Action>,
     /// A window close the person asked for, while it waits for a typed value or is let through.
     closing: Closing,
+    /// The window title last sent: it is sent again only when it changes, as the window would
+    /// otherwise be retitled on every frame.
+    title: String,
 }
 
 /// File > Import running on a worker thread, and what to do with the project when it ends.
@@ -431,6 +434,17 @@ const IMPORT_VIEW_CONTROLS: &[Action] = &[
     Action::ToggleTheme,
     Action::Layers,
 ];
+
+/// Whether an import window view control ([`IMPORT_VIEW_CONTROLS`]) shows as on: the same
+/// state its toolbar button and menu item show, so the grid and dark theme read as on there too.
+fn import_view_control_on(a: Action, prefs: &Prefs, show_layers: bool) -> bool {
+    match a {
+        Action::ToggleGrid => prefs.show_grid,
+        Action::ToggleTheme => prefs.theme == theme::Mode::Dark,
+        Action::Layers => show_layers,
+        _ => false,
+    }
+}
 
 /// Make a new project's folder a repository with its first version.
 fn record_new_project(dir: &std::path::Path) -> Result<(), wc_vcs::Error> {
@@ -860,6 +874,7 @@ impl App {
             importing: None,
             after_typed: Vec::new(),
             closing: Closing::No,
+            title: String::new(),
         };
         let dir = dir.or_else(|| prefs.recent.first().cloned());
         if let Some(d) = dir {
@@ -1378,7 +1393,7 @@ impl App {
                 ui.weak("View:");
                 for a in IMPORT_VIEW_CONTROLS {
                     let info = a.info();
-                    let on = *a == Action::Layers && self.show_layers;
+                    let on = import_view_control_on(*a, &self.prefs, self.show_layers);
                     if ui
                         .selectable_label(on, info.label)
                         .on_hover_text(chrome::tip_hint(ui.ctx().os(), info.tip))
@@ -2443,7 +2458,7 @@ impl App {
         // An open dialog takes the keyboard: a shortcut would change the project under it (the
         // cover form's Cancel takes back only what the form changed).
         let dialog_open = self.dialog.is_some();
-        let mut out = ctrl_shortcuts(ctx, dialog_open);
+        let mut out = ctrl_shortcuts(ctx, dialog_open, text_field_focused(ctx));
         if dialog_open {
             return out;
         }
@@ -3558,11 +3573,7 @@ impl App {
                                 .spacing([12.0, 4.0])
                                 .show(ui, |ui| {
                                     for f in found.iter() {
-                                        let c = match f.severity {
-                                            wc_report::Severity::Error => t.error,
-                                            wc_report::Severity::Warning => t.selection,
-                                            wc_report::Severity::Note => t.faint,
-                                        };
+                                        let c = severity_colour(&t, f.severity);
                                         ui.label(RichText::new(f.severity.label()).color(c));
                                         let page = f
                                             .page_id
@@ -4394,15 +4405,7 @@ impl App {
                             .num_columns(3)
                             .show(ui, |ui| {
                                 for it in items.iter() {
-                                    let (c, s) = match it.state {
-                                        wc_library::State::UpToDate => {
-                                            (egui::Color32::from_rgb(0x2e, 0x8b, 0x57), "up to date")
-                                        }
-                                        wc_library::State::Changed => (t.selection, "newer in library"),
-                                        wc_library::State::NotLocked => (t.wire, "not pinned"),
-                                        wc_library::State::GoneFromLibrary => (t.error, "gone from library"),
-                                        wc_library::State::WrongId => (t.error, "library file has another id"),
-                                    };
+                                    let (c, s) = library_state_look(&t, it.state);
                                     chrome::dot(ui, c);
                                     ui.label(RichText::new(&it.id).monospace());
                                     if it.state == wc_library::State::WrongId {
@@ -5249,6 +5252,79 @@ fn find_library(exe_dir: Option<&Path>, source: &Path) -> Option<PathBuf> {
         .and_then(|d| d.canonicalize().ok())
 }
 
+/// The text colour for a Check finding. Interface tokens only: the sheet colours are tuned
+/// for the white paper and fade on the dark window.
+fn severity_colour(t: &theme::Theme, severity: wc_report::Severity) -> egui::Color32 {
+    match severity {
+        wc_report::Severity::Error => t.error,
+        wc_report::Severity::Warning => t.warning,
+        wc_report::Severity::Note => t.muted,
+    }
+}
+
+/// The dot colour and words for a pinned library item in the Library status dialog.
+fn library_state_look(t: &theme::Theme, state: wc_library::State) -> (egui::Color32, &'static str) {
+    match state {
+        wc_library::State::UpToDate => (t.success, "up to date"),
+        wc_library::State::Changed => (t.warning, "newer in library"),
+        wc_library::State::NotLocked => (t.accent, "not pinned"),
+        wc_library::State::GoneFromLibrary => (t.error, "gone from library"),
+        wc_library::State::WrongId => (t.error, "library file has another id"),
+    }
+}
+
+#[cfg(test)]
+mod status_colour_tests {
+    use super::{library_state_look, severity_colour, theme};
+
+    fn luminance(c: eframe::egui::Color32) -> f32 {
+        let ch = |v: u8| {
+            let v = v as f32 / 255.0;
+            if v <= 0.040_45 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
+    }
+
+    fn contrast(a: eframe::egui::Color32, b: eframe::egui::Color32) -> f32 {
+        let (x, y) = (luminance(a), luminance(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    #[test]
+    fn status_colours_stay_readable_on_the_window_in_both_modes() {
+        use wc_library::State;
+        use wc_report::Severity;
+        for dark in [false, true] {
+            let t = theme::Theme::new(dark);
+            let states = [
+                State::UpToDate,
+                State::Changed,
+                State::NotLocked,
+                State::GoneFromLibrary,
+                State::WrongId,
+            ];
+            for s in states {
+                let (c, _) = library_state_look(&t, s);
+                assert!(contrast(c, t.surface) >= 3.0, "{s:?} dot in dark={dark}");
+            }
+            for s in [Severity::Error, Severity::Warning, Severity::Note] {
+                let c = severity_colour(&t, s);
+                assert!(contrast(c, t.surface) >= 3.0, "{s:?} text in dark={dark}");
+            }
+            // The interface tokens, not the sheet colours they replaced.
+            assert_eq!(severity_colour(&t, Severity::Warning), t.warning);
+            assert_eq!(severity_colour(&t, Severity::Note), t.muted);
+            assert_eq!(library_state_look(&t, State::UpToDate).0, t.success);
+            assert_eq!(library_state_look(&t, State::NotLocked).0, t.accent);
+            assert_eq!(library_state_look(&t, State::Changed).0, t.warning);
+        }
+    }
+}
+
 /// The version history drawn as a subway map: one coloured line per branch lane.
 fn subway(ui: &mut egui::Ui, rows: &[wc_vcs::subway::Row]) {
     const LINES: [egui::Color32; 6] = [
@@ -5443,8 +5519,10 @@ fn enter_typed_value(ctx: &egui::Context) {
     }
 }
 
-/// The Ctrl shortcuts pressed this frame, none while a dialog is open.
-fn ctrl_shortcuts(ctx: &egui::Context, dialog_open: bool) -> Vec<Action> {
+/// The Ctrl shortcuts pressed this frame, none while a dialog is open. While a text field has
+/// the keyboard (`typing`), Ctrl+A, Ctrl+Z, Ctrl+Shift+Z and Ctrl+Y are left to the field: they
+/// select its text and undo or redo the typing, not select the page or undo the schematic.
+fn ctrl_shortcuts(ctx: &egui::Context, dialog_open: bool, typing: bool) -> Vec<Action> {
     let mut out = Vec::new();
     if dialog_open {
         return out;
@@ -5466,6 +5544,9 @@ fn ctrl_shortcuts(ctx: &egui::Context, dialog_open: bool) -> Vec<Action> {
             (Key::J, Action::Assistant),
             (Key::D, Action::Duplicate),
         ] {
+            if typing && is_text_edit_key(k) {
+                continue;
+            }
             // With Shift first: Ctrl+Shift+N is a new project, Ctrl+Shift+Z redoes (a plain Ctrl
             // shortcut would also take them, as it lets Shift through).
             let shifted = match k {
@@ -5484,6 +5565,19 @@ fn ctrl_shortcuts(ctx: &egui::Context, dialog_open: bool) -> Vec<Action> {
         }
     });
     out
+}
+
+/// Whether a text field has the keyboard. `wants_keyboard_input` is not enough: it is true for
+/// any focused widget, such as a button reached with Tab, and that must not take Ctrl+A or undo
+/// from the app. Only a text field keeps an edit state under its id.
+fn text_field_focused(ctx: &egui::Context) -> bool {
+    ctx.memory(|m| m.focused())
+        .is_some_and(|id| egui::TextEdit::load_state(ctx, id).is_some())
+}
+
+/// The Ctrl keys a text field handles itself: select all, undo and redo.
+fn is_text_edit_key(k: Key) -> bool {
+    matches!(k, Key::A | Key::Z | Key::Y)
 }
 
 /// Whether `key` was pressed this frame with modifiers that `ok` accepts. It looks at the
@@ -6160,11 +6254,16 @@ impl eframe::App for App {
         } else {
             let mut start = None;
             let mut recent = None;
+            let mut forget = None;
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(t.backdrop))
                 .show(ctx, |ui| {
-                    welcome(ui, &t, &self.prefs.recent, &mut start, &mut recent);
+                    welcome(ui, &t, &self.prefs.recent, &mut start, &mut recent, &mut forget);
                 });
+            if let Some(d) = forget {
+                self.prefs.forget(&d);
+                self.prefs.save();
+            }
             if let Some(d) = recent {
                 let mut prefs = std::mem::take(&mut self.prefs);
                 self.open_dir(&d, &mut prefs);
@@ -6257,7 +6356,10 @@ impl eframe::App for App {
             ),
             None => "WiringCraft".into(),
         };
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        if title != self.title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.title = title;
+        }
     }
 }
 
@@ -6865,14 +6967,27 @@ fn read_only_banner(ui: &egui::Ui, t: &theme::Theme, name: &str) {
     p.galley(rect.min + Vec2::new(12.0, 6.0), galley, t.text);
 }
 
+/// Why a recent project folder cannot be opened, or `None` when it is a folder. A folder that
+/// cannot be read keeps the reason, so it is not taken for a missing one.
+fn recent_problem(d: &Path) -> Option<String> {
+    match std::fs::metadata(d) {
+        Ok(m) if m.is_dir() => None,
+        Ok(_) => Some("not a folder".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some("folder not found".into()),
+        Err(e) => Some(format!("cannot be read: {e}")),
+    }
+}
+
 /// The start screen shown when no project is open: a card with the two ways in and the
-/// recently opened projects.
+/// recently opened projects. A recent folder that is gone is shown muted, and any entry can be
+/// taken out of the list from its right-click menu (`forget`).
 fn welcome(
     ui: &mut egui::Ui,
     t: &theme::Theme,
     recent: &[PathBuf],
     start: &mut Option<Action>,
     open_recent: &mut Option<PathBuf>,
+    forget: &mut Option<PathBuf>,
 ) {
     let width = 440.0;
     ui.add_space((ui.available_height() * 0.18).max(24.0));
@@ -6912,17 +7027,33 @@ fn welcome(
                 if !recent.is_empty() {
                     ui.add_space(18.0);
                     panels::section(ui, "Recent projects", None);
-                    for d in recent.iter().take(6) {
-                        let name = d
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| d.display().to_string());
-                        let r = panels::row(ui, false, panels::Lead::Dot(t.accent), RichText::new(name), false)
-                            .on_hover_text(d.display().to_string());
-                        if r.clicked() {
-                            *open_recent = Some(d.clone());
+                    // Every entry stays reachable in a short window.
+                    egui::ScrollArea::vertical().id_salt("recent").show(ui, |ui| {
+                        for d in recent {
+                            let name = d
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| d.display().to_string());
+                            let (dot, text, hover) = match recent_problem(d) {
+                                None => (t.accent, RichText::new(name), d.display().to_string()),
+                                Some(why) => (
+                                    t.muted,
+                                    RichText::new(name).color(t.muted),
+                                    format!("{} ({why})", d.display()),
+                                ),
+                            };
+                            let r = panels::row(ui, false, panels::Lead::Dot(dot), text, false).on_hover_text(hover);
+                            if r.clicked() {
+                                *open_recent = Some(d.clone());
+                            }
+                            r.context_menu(|ui| {
+                                if ui.button("Remove from recent projects").clicked() {
+                                    *forget = Some(d.clone());
+                                    ui.close_menu();
+                                }
+                            });
                         }
-                    }
+                    });
                 }
             });
     });
@@ -7129,7 +7260,7 @@ mod renderer_tests {
                 ..Default::default()
             };
             let mut got = Vec::new();
-            let _ = ctx.run(raw, |ctx| got = ctrl_shortcuts(ctx, dialog_open));
+            let _ = ctx.run(raw, |ctx| got = ctrl_shortcuts(ctx, dialog_open, false));
             got
         };
         assert!(press(true).is_empty(), "Ctrl+N does nothing under a dialog");
@@ -7192,27 +7323,81 @@ mod renderer_tests {
     #[test]
     fn ctrl_shift_z_redoes_and_ctrl_z_undoes() {
         let ctx = egui::Context::default();
-        let press = |modifiers: Modifiers, key: Key| {
-            let raw = egui::RawInput {
-                modifiers,
-                events: vec![egui::Event::Key {
-                    key,
-                    physical_key: None,
-                    pressed: true,
-                    repeat: false,
-                    modifiers,
-                }],
-                ..Default::default()
-            };
-            let mut got = Vec::new();
-            let _ = ctx.run(raw, |ctx| got = ctrl_shortcuts(ctx, false));
-            got
-        };
+        let press = |modifiers: Modifiers, key: Key| press_ctrl(&ctx, modifiers, key, false);
         let shift = Modifiers::COMMAND | Modifiers::SHIFT;
         assert_eq!(press(shift, Key::Z), [Action::Redo]);
         assert_eq!(press(Modifiers::COMMAND, Key::Z), [Action::Undo]);
         assert_eq!(press(Modifiers::COMMAND, Key::Y), [Action::Redo]);
         assert_eq!(press(shift, Key::N), [Action::NewProject]);
+    }
+
+    /// In a text field Ctrl+A, Ctrl+Z, Ctrl+Shift+Z and Ctrl+Y are the field's (select its
+    /// text, undo or redo the typing); the other Ctrl shortcuts still work.
+    #[test]
+    fn a_text_field_keeps_its_select_all_undo_and_redo_keys() {
+        let ctx = egui::Context::default();
+        let typing = |modifiers: Modifiers, key: Key| press_ctrl(&ctx, modifiers, key, true);
+        let shift = Modifiers::COMMAND | Modifiers::SHIFT;
+        for (m, k) in [
+            (Modifiers::COMMAND, Key::A),
+            (Modifiers::COMMAND, Key::Z),
+            (shift, Key::Z),
+            (Modifiers::COMMAND, Key::Y),
+        ] {
+            assert!(typing(m, k).is_empty(), "{m:?} {k:?} is left to the text field");
+        }
+        assert_eq!(typing(Modifiers::COMMAND, Key::S), [Action::Save]);
+        assert_eq!(typing(shift, Key::S), [Action::SaveAs]);
+        assert_eq!(typing(Modifiers::COMMAND, Key::F), [Action::Find]);
+        // Out of a text field they are the app's again.
+        assert_eq!(press_ctrl(&ctx, Modifiers::COMMAND, Key::A, false), [Action::SelectAll]);
+    }
+
+    /// A focused button is not a text field: Ctrl+A and undo stay the app's. A focused text
+    /// field is one.
+    #[test]
+    fn only_a_focused_text_field_counts_as_typing() {
+        let ctx = egui::Context::default();
+        let mut text = String::new();
+        let frame = |ctx: &egui::Context, text: &mut String| {
+            let mut button = egui::Id::NULL;
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    button = ui.add(egui::Button::new("Close")).id;
+                    ui.add(egui::TextEdit::singleline(text).id(egui::Id::new("field")));
+                });
+            });
+            button
+        };
+        let field = egui::Id::new("field");
+        let button = frame(&ctx, &mut text);
+        ctx.memory_mut(|m| m.request_focus(button));
+        frame(&ctx, &mut text);
+        assert!(ctx.wants_keyboard_input(), "the button has the focus");
+        assert!(!text_field_focused(&ctx), "a button is not a text field");
+        let ctrl_a = press_ctrl(&ctx, Modifiers::COMMAND, Key::A, text_field_focused(&ctx));
+        assert_eq!(ctrl_a, [Action::SelectAll]);
+        ctx.memory_mut(|m| m.request_focus(field));
+        frame(&ctx, &mut text);
+        assert!(text_field_focused(&ctx), "the text field has the keyboard");
+    }
+
+    /// The Ctrl shortcuts of one key press, with or without a text field having the keyboard.
+    fn press_ctrl(ctx: &egui::Context, modifiers: Modifiers, key: Key, typing: bool) -> Vec<Action> {
+        let raw = egui::RawInput {
+            modifiers,
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..Default::default()
+        };
+        let mut got = Vec::new();
+        let _ = ctx.run(raw, |ctx| got = ctrl_shortcuts(ctx, false, typing));
+        got
     }
 
     /// An empty log greys out "Include this log" and shows it unticked; a log leaves the choice.
@@ -7244,6 +7429,20 @@ mod renderer_tests {
 #[allow(clippy::unwrap_used)]
 mod library_tests {
     use super::*;
+
+    /// A recent folder that is there is fine; a missing one and a file each say why.
+    #[test]
+    fn a_recent_project_says_why_it_cannot_be_opened() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(recent_problem(tmp.path()), None);
+        assert_eq!(
+            recent_problem(&tmp.path().join("gone")).as_deref(),
+            Some("folder not found")
+        );
+        let file = tmp.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(recent_problem(&file).as_deref(), Some("not a folder"));
+    }
 
     #[test]
     fn wires_on_pins_a_new_symbol_version_drops_are_listed() {
@@ -8117,6 +8316,7 @@ mod nudge_tests {
             importing: None,
             after_typed: Vec::new(),
             closing: Closing::No,
+            title: String::new(),
         };
         (tmp, app, egui::Context::default())
     }
@@ -8491,6 +8691,53 @@ mod nudge_tests {
         sent
     }
 
+    /// While an import runs, its window's Grid and Dark mode controls read as on when the grid
+    /// is shown and the theme is dark, as the toolbar and menu show them.
+    #[test]
+    fn the_import_window_shows_the_grid_and_dark_mode_as_they_are() {
+        let tab = egui::Event::Key {
+            key: Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        for (grid, dark) in [(true, true), (false, false), (true, false), (false, true)] {
+            let (tmp, mut app, ctx) = app(Point::new(55.0, 60.0), false);
+            theme::install_fonts(&ctx);
+            app.prefs.show_grid = grid;
+            app.prefs.theme = if dark { theme::Mode::Dark } else { theme::Mode::Light };
+            theme::apply(&ctx, app.prefs.theme);
+            let (job, _running) = imports::Job::running("plan.edz", tmp.path());
+            app.importing = Some(Importing {
+                job,
+                kind: imports::Kind::Eplan,
+                file: tmp.path().join("plan.edz"),
+                lib: None,
+                target: None,
+            });
+            app_frame(&mut app, &ctx, Vec::new(), false);
+            // Tab through the window's controls and read whether each shows as on.
+            let mut seen: std::collections::BTreeMap<String, bool> = Default::default();
+            for _ in 0..200 {
+                let out = app_frame_output(&mut app, &ctx, vec![tab.clone()], false);
+                for e in &out.platform_output.events {
+                    if let egui::output::OutputEvent::FocusGained(w) = e
+                        && let (Some(label), Some(on)) = (&w.label, w.selected)
+                    {
+                        seen.insert(label.clone(), on);
+                    }
+                }
+                if seen.contains_key("Grid") && seen.contains_key("Dark mode") {
+                    break;
+                }
+            }
+            assert!(app.importing.is_some(), "the import still runs");
+            assert_eq!(seen.get("Grid"), Some(&grid), "grid {grid}, dark {dark}: {seen:?}");
+            assert_eq!(seen.get("Dark mode"), Some(&dark), "grid {grid}, dark {dark}: {seen:?}");
+        }
+    }
+
     fn key(key: Key, modifiers: Modifiers) -> egui::Event {
         egui::Event::Key {
             key,
@@ -8608,6 +8855,46 @@ mod nudge_tests {
         let sent = app_frame(&mut app, &ctx, Vec::new(), true);
         assert!(!sent.contains(&CancelClose));
         assert!(app.dialog.is_none());
+    }
+
+    /// The window title is sent once when it changes, not on every frame (#1544).
+    #[test]
+    fn the_window_title_is_sent_only_when_it_changes() {
+        let titles = |sent: Vec<egui::ViewportCommand>| {
+            sent.into_iter()
+                .filter_map(|c| match c {
+                    egui::ViewportCommand::Title(t) => Some(t),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let (_tmp, mut app, ctx) = app(Point::new(55.0, 60.0), false);
+        theme::install_fonts(&ctx);
+        app.open.as_mut().unwrap().save().unwrap();
+        let name = app.open.as_ref().unwrap().project.meta.name.clone();
+        let first = titles(app_frame(&mut app, &ctx, Vec::new(), false));
+        assert_eq!(
+            first,
+            vec![format!("{name} – WiringCraft")],
+            "the first frame titles the window"
+        );
+        let again = titles(app_frame(&mut app, &ctx, Vec::new(), false));
+        assert!(again.is_empty(), "nothing changed: not sent again, got {again:?}");
+        // A real edit (the selected coil nudged left) makes the project unsaved.
+        let mut dirty = titles(app_frame(
+            &mut app,
+            &ctx,
+            vec![key(Key::ArrowLeft, Modifiers::NONE)],
+            false,
+        ));
+        assert!(app.open.as_ref().unwrap().dirty, "the nudge is not saved yet");
+        dirty.extend(titles(app_frame(&mut app, &ctx, Vec::new(), false)));
+        assert_eq!(
+            dirty,
+            vec![format!("• {name} – WiringCraft")],
+            "the unsaved marker shows"
+        );
+        assert!(titles(app_frame(&mut app, &ctx, Vec::new(), false)).is_empty());
     }
 
     /// Escape answers the unsaved-changes question as Cancel: the window stays open, the
@@ -10018,6 +10305,7 @@ mod menu_action_tests {
             importing: None,
             after_typed: Vec::new(),
             closing: Closing::No,
+            title: String::new(),
         };
         (tmp, app, id)
     }
@@ -10268,5 +10556,48 @@ mod import_folder_tests {
         assert_eq!(got.kind, "folder");
         assert_eq!(got.name, "vendor-2");
         assert_eq!(Path::new(&got.location), other.as_path());
+    }
+}
+
+#[cfg(test)]
+mod import_view_control_tests {
+    use super::*;
+
+    /// The import window's view controls read as on exactly when their toolbar buttons and menu
+    /// items do: a shown grid and the dark theme too, not only an open layer list.
+    #[test]
+    fn the_import_window_view_controls_show_the_state_the_menu_shows() {
+        let ed = Editor::default();
+        let clipboard = edit::Clipboard::default();
+        for (grid, dark, layers) in [
+            (false, false, false),
+            (true, true, true),
+            (true, false, false),
+            (false, true, true),
+        ] {
+            let prefs = Prefs {
+                show_grid: grid,
+                theme: if dark { theme::Mode::Dark } else { theme::Mode::Light },
+                ..Prefs::default()
+            };
+            let status = StatusView {
+                open: None,
+                ed: &ed,
+                prefs: &prefs,
+                clipboard: &clipboard,
+                sharing: false,
+                share_undo: false,
+                share_redo: false,
+                show_layers: layers,
+                symbol_editor: None,
+            };
+            for a in IMPORT_VIEW_CONTROLS {
+                assert_eq!(
+                    import_view_control_on(*a, &prefs, layers),
+                    chrome::Status::active(&status, *a),
+                    "{a:?} with grid {grid}, dark {dark}, layers {layers}"
+                );
+            }
+        }
     }
 }

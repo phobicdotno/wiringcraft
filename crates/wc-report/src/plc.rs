@@ -247,7 +247,16 @@ pub fn plc_variables(i: &Inputs<'_>) -> PlcVariables {
         if !address.is_empty() && !at.ends_with('*') && address.trim() != at {
             note.push(format!("address {}", address.trim()));
         } else if !address.is_empty() && at.ends_with('*') {
-            note.push(format!("address {:?} is not a PLC address", address.trim()));
+            // Worded as the rack warnings word it: an address in the other direction is still
+            // a PLC address.
+            note.push(match PlcAddress::parse_any_bit(address) {
+                Some(a) => format!(
+                    "address {} is an {}",
+                    a.iec(),
+                    if a.output { "output" } else { "input" }
+                ),
+                None => format!("address {:?} is not a PLC address", address.trim()),
+            });
         }
         if !connected.is_empty() {
             note.push(format!("to {connected}"));
@@ -710,10 +719,7 @@ mod tests {
                 assert!(l.contains(" AT %I* : BOOL;") || l.contains(" AT %Q* : BOOL;"), "{l}");
             }
             let line = |var: &str| d.iter().find(|l| l.starts_with(&format!("    {var} "))).copied();
-            assert!(
-                line("Q1")
-                    .is_some_and(|l| l.contains("AT %Q*") && l.contains("address \"%I0.0\" is not a PLC address"))
-            );
+            assert!(line("Q1").is_some_and(|l| l.contains("AT %Q*") && l.contains("address %IX0.0 is an input")));
             assert!(line("S1").is_some_and(|l| l.contains("address \"Slot 2\" is not a PLC address")));
             assert!(line("S2").is_some_and(|l| !l.contains("address")));
             // The untagged point is named after its symbol id, without "(no tag)".

@@ -38,7 +38,12 @@ pub struct ProjectMeta {
     #[serde(default, rename = "location", skip_serializing_if = "Vec::is_empty")]
     pub locations: Vec<Location>,
     /// Jumpers (bridges) between terminals of one strip; jumpered terminals are one potential.
-    #[serde(default, rename = "jumper", skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        rename = "jumper",
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "merged_jumpers"
+    )]
     pub jumpers: Vec<Jumper>,
     /// Terminal strips arranged in the terminal strip editor: their terminal order and spare
     /// terminals. A strip that is not listed keeps the usual order (by terminal number).
@@ -266,6 +271,28 @@ pub struct StripLayout {
     /// later is that drawn terminal.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spares: Vec<String>,
+}
+
+/// Read the `[[jumper]]` list as [`ProjectMeta::add_jumper`] keeps it: jumpers of one strip
+/// that share a terminal are one jumper (the first part in file order counts), rather than two
+/// jumpers each counting its part and showing in the terminal plan and the configurator
+/// export. Each jumper was checked on its own when read (see [`StoredJumper`]).
+fn merged_jumpers<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Jumper>, D::Error> {
+    let list = Vec::<Jumper>::deserialize(d)?;
+    let mut meta = ProjectMeta::new("");
+    for j in &list {
+        // Each jumper was checked when read, so this only merges.
+        let _ = meta.add_jumper_with(&j.strip, &j.terminals, None);
+    }
+    // Each entry ended up in exactly one merged jumper; its part is the first one in file order
+    // among them, however later entries joined the groups.
+    for m in &mut meta.jumpers {
+        m.part = list
+            .iter()
+            .filter(|j| j.strip == m.strip && j.terminals.iter().any(|t| m.terminals.iter().any(|u| u == t.trim())))
+            .find_map(|j| j.part.clone());
+    }
+    Ok(meta.jumpers)
 }
 
 /// Read the `[[strip]]` layouts, refusing two for the same strip: which one counts would
@@ -756,9 +783,11 @@ impl ProjectMeta {
         let parsed = location_path(path);
         let raw = path.trim();
         let before = self.locations.len();
-        // The normal form first, then the path as typed (an entry stored as `+L1`).
+        // By normal form, so an entry stored as typed (`+L1`) goes by `L1` too, as
+        // [`Self::set_location`] finds it; then by the path as typed (an unreadable entry).
         if let Ok(key) = &parsed {
-            self.locations.retain(|l| l.path != *key);
+            self.locations
+                .retain(|l| l.path != *key && location_path(&l.path).as_ref() != Ok(key));
         }
         if self.locations.len() == before {
             self.locations.retain(|l| l.path != raw);
@@ -2832,6 +2861,45 @@ mod tests {
         let old: ProjectMeta =
             toml::from_str("name = \"t\"\n[[jumper]]\nstrip = \"-X1\"\nterminals = [\"1\", \"2\"]\n")?;
         assert_eq!(old.jumpers[0].part, None);
+        // Hand-edited jumpers read as add_jumper keeps them: a two-level number or a jumper
+        // that joins nothing is refused, two sharing a terminal are one.
+        let read = |jumpers: &str| toml::from_str::<ProjectMeta>(&format!("name = \"t\"\n{jumpers}"));
+        let jumper = |strip: &str, t: &str| format!("[[jumper]]\nstrip = \"{strip}\"\nterminals = [{t}]\n");
+        let err = read(&jumper("-X1", "\"1\", \"2.3\"")).err().map(|e| e.to_string());
+        assert!(err.as_deref().is_some_and(|e| e.contains("one tag level")), "{err:?}");
+        let err = read(&jumper("-X1", "\"1\", \"1\"")).err().map(|e| e.to_string());
+        assert!(
+            err.as_deref().is_some_and(|e| e.contains("two different terminals")),
+            "{err:?}"
+        );
+        let shared = read(&format!(
+            "{}part = \"acme.bridge\"\n{}{}",
+            jumper("-X1", "\"3\", \"4\""),
+            jumper("-X1", "\"1\", \"3\""),
+            jumper("-X2", "\"1\", \"3\"")
+        ))?;
+        assert_eq!(shared.jumpers.len(), 2, "{:?}", shared.jumpers);
+        assert_eq!(shared.jumpers[0].terminals, s(&["1", "3", "4"]));
+        assert_eq!(shared.jumpers[0].part.as_deref(), Some("acme.bridge"));
+        // Conflicting parts: the first in the file counts, also when a later entry bridges two
+        // groups that were apart until then.
+        let conflict = read(&format!(
+            "{}part = \"first\"\n{}part = \"second\"\n",
+            jumper("-X1", "\"1\", \"2\""),
+            jumper("-X1", "\"2\", \"3\"")
+        ))?;
+        assert_eq!(conflict.jumpers[0].terminals, s(&["1", "2", "3"]));
+        assert_eq!(conflict.jumpers[0].part.as_deref(), Some("first"));
+        let bridged = read(&format!(
+            "{}part = \"first\"\n{}part = \"second\"\n{}",
+            jumper("-X1", "\"8\", \"9\""),
+            jumper("-X1", "\"1\", \"2\""),
+            jumper("-X1", "\"2\", \"8\"")
+        ))?;
+        assert_eq!(bridged.jumpers.len(), 1, "{:?}", bridged.jumpers);
+        assert_eq!(bridged.jumpers[0].terminals, s(&["1", "2", "8", "9"]));
+        assert_eq!(bridged.jumpers[0].part.as_deref(), Some("first"));
+        assert_eq!(shared.jumpers[1].strip, DeviceTag::parse("-X2")?);
         // Extended by another jumper: the part stays.
         m.add_jumper(&x1, &s(&["2", "3"]))?;
         assert_eq!(m.jumpers[0].part.as_deref(), Some("wago.2002-402"));
@@ -3081,6 +3149,13 @@ mod tests {
         });
         assert_eq!(m.remove_location("+L5"), Ok(()));
         assert!(!m.locations.iter().any(|l| l.path == "+L5"));
+        // Removed without its sign as well, as setting it would find it.
+        m.locations.push(Location {
+            path: "+L6".into(),
+            description: String::new(),
+        });
+        assert_eq!(m.remove_location("L6"), Ok(()));
+        assert!(!m.locations.iter().any(|l| l.path.ends_with("L6")));
         let why = m.remove_location("+L1-K1");
         assert!(why.as_ref().is_err_and(|e| e.contains("not a location")), "{why:?}");
         assert_eq!(m.locations.len(), 1);
