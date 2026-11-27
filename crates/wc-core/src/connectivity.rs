@@ -220,21 +220,30 @@ pub fn new_point_joins(before: &Project, after: &Project) -> Vec<NewJoin> {
                 let group = |i: usize| groups.get(&(pi, i)).copied();
                 let connected = |o: usize| group(wi).is_some() && group(wi) == group(o);
                 // Another free end at the same place, or another wire's segment or bend
-                // there (a T, which connectivity joins too).
+                // there (a T, which connectivity joins too); or another wire's free end on the
+                // segment this end newly makes known.
+                let own = paths.get(wi).map_or(&[][..], Vec::as_slice);
                 let other = ends
                     .iter()
-                    .map(|&(o, ..)| o)
-                    .find(|&o| o != wi && !connected(o))
+                    .map(|&(o, ..)| (o, p))
+                    .find(|&(o, _)| o != wi && !connected(o))
                     .or_else(|| {
                         (0..paths.len())
                             .find(|&o| o != wi && !connected(o) && paths.get(o).is_some_and(|path| on_path(p, path)))
+                            .map(|o| (o, p))
+                    })
+                    .or_else(|| {
+                        at.values()
+                            .flatten()
+                            .map(|&(o, _, q)| (o, q))
+                            .find(|&(o, q)| o != wi && !connected(o) && on_path(q, own))
                     });
-                if let Some(other) = other {
+                if let Some((other, where_)) = other {
                     joins.push(NewJoin {
                         page: pi,
                         wire: id(wi),
                         other: id(other),
-                        at: p,
+                        at: where_,
                     });
                 }
             }
@@ -697,6 +706,32 @@ mod tests {
         after.pages[0].wires[2].to = pin("k1", "A1");
         after.pages[0].wires[0].from = free(40.0, 45.0);
         assert_eq!(new_point_joins(&before, &after), vec![]);
+    }
+
+    #[test]
+    fn a_free_end_on_a_segment_a_pin_end_made_free_newly_shows_is_a_new_join() {
+        let free = |x: f64, y: f64| Endpoint::Point { at: Point::new(x, y) };
+        let mut page = Page::new("a", "1", "");
+        // w1 runs from box point A through a bend at 100,0 to -K1:A1; w2 ends freely at 50,0,
+        // where the segment from A (at 0,0) to the bend will be once A is a free end.
+        let mut w1 = wire("w1", pin("b1", "A"), pin("k1", "A1"), None);
+        w1.via = vec![Point::new(100.0, 0.0)];
+        page.wires = vec![w1, wire("w2", free(50.0, 0.0), pin("k2", "A1"), None)];
+        let mut before = Project::new("t");
+        before.pages = vec![page];
+        let mut after = before.clone();
+        after.pages[0].wires[0].from = free(0.0, 0.0);
+        assert_eq!(
+            new_point_joins(&before, &after),
+            vec![NewJoin {
+                page: 0,
+                wire: "w1".into(),
+                other: "w2".into(),
+                at: Point::new(50.0, 0.0),
+            }]
+        );
+        // The connectivity check agrees: the two wires are one net.
+        assert_eq!(nets(&after).len(), 1);
     }
 
     #[test]
