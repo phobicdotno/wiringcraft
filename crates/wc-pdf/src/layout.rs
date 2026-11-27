@@ -57,8 +57,11 @@ impl Appearance {
 pub struct CrossRefs {
     pub mains: BTreeMap<DeviceTag, Vec<Appearance>>,
     pub auxes: BTreeMap<DeviceTag, Vec<Appearance>>,
-    /// Interruption points by tag.
+    /// Interruption points on schematic pages, by tag.
     pub links: BTreeMap<DeviceTag, Vec<Appearance>>,
+    /// Interruption points repeated on overview pages (line diagrams), by tag. They link
+    /// nothing in the schematic, so only a point on an overview page lists them.
+    pub overview_links: BTreeMap<DeviceTag, Vec<Appearance>>,
 }
 
 /// A cross-reference text next to a symbol, pointing at another page.
@@ -143,12 +146,15 @@ pub fn xref_marks(
                 None => warnings.push(format!("page {}: contact {tag} has no coil", page.number)),
             },
             SymbolRole::Interruption => {
+                // A point on a schematic page continues only on schematic pages; one on an
+                // overview page may have its partner anywhere (as the project check counts).
+                let repeats = xref.overview_links.get(tag).filter(|_| page.overview);
                 let others: Vec<&Appearance> = xref
                     .links
                     .get(tag)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[])
-                    .iter()
+                    .into_iter()
+                    .chain(repeats)
+                    .flatten()
                     .filter(|a| !(a.page_id == page.id && a.item == s.id))
                     .collect();
                 match others.first() {
@@ -188,6 +194,9 @@ impl CrossRefs {
                     // A contact repeated on an overview page (line diagram) is not listed
                     // under its coil again: the schematic page draws it in detail (#1076).
                     SymbolRole::Auxiliary if !page.overview => x.auxes.entry(tag.clone()).or_default().push(a),
+                    SymbolRole::Interruption if page.overview => {
+                        x.overview_links.entry(tag.clone()).or_default().push(a)
+                    }
                     SymbolRole::Interruption => x.links.entry(tag.clone()).or_default().push(a),
                     _ => {}
                 }
