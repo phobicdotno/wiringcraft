@@ -571,6 +571,14 @@ pub(crate) struct TakenParts {
     copies: Vec<PathBuf>,
 }
 
+impl TakenParts {
+    /// Also take back `copies`, the symbol copies [`Open::take_symbols`] wrote for the change.
+    pub(crate) fn and_copies(mut self, copies: Vec<PathBuf>) -> Self {
+        self.copies.extend(copies);
+        self
+    }
+}
+
 pub struct Open {
     pub dir: PathBuf,
     pub project: Project,
@@ -1332,7 +1340,7 @@ impl Open {
         } else {
             r.map_err(|e| {
                 format!(
-                    "{e}; these part copies taken into the project could not be removed: {}",
+                    "{e}; these copies taken into the project could not be removed: {}",
                     left.join("; ")
                 )
             })
@@ -3065,6 +3073,43 @@ impl Open {
     /// pins and loaded symbols the others added are taken back, and the error names the symbol.
     /// Terminal tracking goes back with them: a copy put back restarted it from that copy.
     pub fn ensure_symbols<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
+        self.take_symbols(ids).map(drop)
+    }
+
+    /// [`Open::ensure_symbols`], with the symbol copies it wrote that were not there before, for
+    /// a caller to remove when the rest of its change is refused (see [`TakenParts::and_copies`]).
+    /// When a symbol is refused here, those copies are removed before the error is returned.
+    pub(crate) fn take_symbols<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) -> Result<Vec<PathBuf>, String> {
+        let ids: Vec<&str> = ids.into_iter().collect();
+        // Copies a library symbol (or a pinned version put back) writes where none was.
+        let missing: Vec<PathBuf> = ids
+            .iter()
+            .filter_map(|id| store::vendor_path(&self.dir, ItemKind::Symbol, id).ok())
+            .filter(|path| !path.try_exists().unwrap_or(true))
+            .collect();
+        let written = |missing: Vec<PathBuf>| -> Vec<PathBuf> { missing.into_iter().filter(|p| p.exists()).collect() };
+        if let Err(e) = self.ensure_symbols_inner(&ids) {
+            let left: Vec<String> = written(missing)
+                .into_iter()
+                .filter_map(|path| {
+                    std::fs::remove_file(&path)
+                        .err()
+                        .map(|e| format!("{} ({e})", path.display()))
+                })
+                .collect();
+            return Err(if left.is_empty() {
+                e
+            } else {
+                format!(
+                    "{e}; these copies taken into the project could not be removed: {}",
+                    left.join("; ")
+                )
+            });
+        }
+        Ok(written(missing))
+    }
+
+    fn ensure_symbols_inner(&mut self, ids: &[&str]) -> Result<(), String> {
         self.touch();
         let (lock, symbols) = (self.project.lock.clone(), self.symbols.clone());
         let library = self.library.clone();
@@ -3072,7 +3117,7 @@ impl Open {
         // data and panel places of spares a strip took along all go back too.
         let (meta, terminals) = (self.project.meta.clone(), self.terminals_before.clone());
         let (devices, panels) = (self.project.devices.clone(), self.project.panels.clone());
-        for id in ids {
+        for &id in ids {
             if let Err(e) = self.ensure_symbol(id) {
                 self.project.lock = lock;
                 self.symbols = symbols;
@@ -4202,7 +4247,7 @@ impl Open {
             self.library.clone(),
             self.terminals_before.clone(),
         );
-        self.ensure_symbols(ids)?;
+        let symbol_copies = self.take_symbols(ids)?;
         // The parts the copies' devices name are taken too, all or none (#1855); the undo step
         // below goes back to the lock before them.
         let parts = self.parts_to_take(
@@ -4216,6 +4261,8 @@ impl Open {
             Ok(parts) => self.take_parts(parts.iter().map(String::as_str)),
             Err(e) => (TakenParts::default(), Err(e)),
         };
+        // A refused generation takes back the symbol copies too (#1861).
+        let taken = taken.and_copies(symbol_copies);
         if let Err(e) = r {
             let r = self.give_back(taken, lock, Err(e));
             self.project = before;
@@ -7981,6 +8028,23 @@ pub(crate) mod tests {
             o.project.meta.strip_layout(&x1).map(|l| l.order.clone()),
             Some(vec!["1".into(), "2".into()])
         );
+    }
+
+    #[test]
+    fn refused_symbols_leave_no_copy_they_wrote() {
+        let (_tmp, mut o) = project();
+        let coil = store::vendor_path(&o.dir, ItemKind::Symbol, "wc.coil").unwrap();
+        assert!(!coil.exists());
+        let e = o.ensure_symbols(["wc.coil", "no.such.symbol"]).unwrap_err();
+        assert!(e.contains("no.such.symbol"), "{e}");
+        assert!(!coil.exists(), "the copy written on the way is removed");
+        assert!(!o.project.lock.symbols.contains_key("wc.coil"));
+        // Taken for a change that is then refused: the caller gets the new copy to remove.
+        assert_eq!(o.take_symbols(["wc.coil"]).unwrap(), vec![coil.clone()]);
+        // A copy that was there is not one this call wrote.
+        assert!(o.take_symbols(["wc.coil"]).unwrap().is_empty());
+        assert!(o.ensure_symbols(["wc.coil", "no.such.symbol"]).is_err());
+        assert!(coil.exists(), "a copy there before stays");
     }
 
     #[test]
