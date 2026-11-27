@@ -906,3 +906,44 @@ fn a_device_known_only_from_a_pinned_end_is_no_potential() {
         );
     }
 }
+
+#[test]
+fn a_made_up_cross_page_name_avoids_an_imported_potential() {
+    let conn = |page: u32, from: &str, to: &str| EplanConnection {
+        page: Some(page),
+        from: from.into(),
+        to: to.into(),
+        ..Default::default()
+    };
+    let function = |tag: &str, page: u32| EplanFunction {
+        tag: tag.into(),
+        page: Some(page),
+        ..Default::default()
+    };
+    let page = |id: u32| EplanPage {
+        id,
+        name: id.to_string(),
+        ..Default::default()
+    };
+    // K1 (page 1) to S1 (page 2) crosses pages and gets a made-up name; Q1:1 is on `EPLAN1`.
+    let p = EplanProject {
+        pages: vec![page(1), page(2)],
+        functions: vec![function("K1", 1), function("S1", 2), function("Q1", 1)],
+        connections: vec![conn(1, "K1:1", "S1:1"), conn(1, "Q1:1", "EPLAN1")],
+        ..Default::default()
+    };
+    let (b, _) = build(&p, 1);
+    let names: Vec<(&str, usize)> = b
+        .pages
+        .iter()
+        .flat_map(|pg| &pg.wires)
+        .filter_map(|w| w.potential.as_deref())
+        .fold(Vec::new(), |mut v, n| {
+            match v.iter_mut().find(|(m, _)| *m == n) {
+                Some((_, c)) => *c += 1,
+                None => v.push((n, 1)),
+            }
+            v
+        });
+    assert_eq!(names, [("EPLAN1'", 2), ("EPLAN1", 1)], "{names:?}");
+}

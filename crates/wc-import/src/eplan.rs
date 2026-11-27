@@ -1020,6 +1020,12 @@ pub fn build(p: &EplanProject, first_page_number: usize) -> (aml::Built, Vec<Str
         devices,
         links,
         potentials,
+        taken_potentials: drawing
+            .pages
+            .iter()
+            .flat_map(|pg| &pg.wires)
+            .filter_map(|w| w.potential.clone())
+            .collect(),
         warnings: Vec::new(),
         locations: Vec::new(),
     };

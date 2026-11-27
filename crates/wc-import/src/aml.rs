@@ -6,7 +6,7 @@
 //! says. That makes an import visible and checkable immediately, and every wire is real
 //! connectivity that later redrawing keeps.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
@@ -51,6 +51,10 @@ pub struct AmlImport {
     pub links: Vec<AmlLink>,
     /// Pins on a named potential: each is drawn as a short wire from the pin carrying the name.
     pub potentials: Vec<AmlPotential>,
+    /// Potential names the source uses elsewhere (on drawn pages, say). The names [`layout`]
+    /// makes up for links across pages avoid these and those of `potentials`, else unrelated
+    /// connections would join.
+    pub taken_potentials: BTreeSet<String>,
     pub warnings: Vec<String>,
     /// Structure elements that are locations (`+L1`), with their description.
     pub locations: Vec<wc_core::Location>,
@@ -656,7 +660,11 @@ pub fn layout(imp: &AmlImport, sections: &[Section], prefix: &str, first_page_nu
             }
         } else {
             // Across pages: each end gets a stub to a named potential.
-            let potential = Some(format!("{}{}", prefix.to_uppercase(), k + 1));
+            let mut name = format!("{}{}", prefix.to_uppercase(), k + 1);
+            while imp.taken_potentials.contains(&name) || imp.potentials.iter().any(|p| p.name == name) {
+                name.push('\'');
+            }
+            let potential = Some(name);
             for (page, end, at, local) in [(pa, a, ata, la), (pb, b, atb, lb)] {
                 let p = at + local;
                 if let Some(pg) = built.pages.get_mut(page) {
