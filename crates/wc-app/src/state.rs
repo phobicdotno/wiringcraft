@@ -207,21 +207,26 @@ pub struct WireNumbering {
 impl WireNumbering {
     /// One line for the person who asked.
     pub fn report(&self) -> String {
+        let count = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
         let mut s = format!(
-            "Numbered {} connection(s); {} wire(s) changed. {}",
-            self.done.connections,
-            self.done.wires,
+            "Numbered {}; {} changed. {}",
+            count(self.done.connections, "connection", "connections"),
+            count(self.done.wires, "wire", "wires"),
             if self.overwritten {
                 "Existing numbers were replaced."
             } else {
                 "Existing numbers were kept."
             }
         );
-        if !self.skipped.is_empty() {
-            s.push_str(&format!(
-                " Page(s) {} were left as they are: someone else has them open. Number again once they are free.",
-                self.skipped.join(", ")
-            ));
+        match self.skipped.as_slice() {
+            [] => {}
+            [one] => s.push_str(&format!(
+                " Page {one} was left as it is: someone else has it open. Number again once it is free."
+            )),
+            many => s.push_str(&format!(
+                " Pages {} were left as they are: someone else has them open. Number again once they are free.",
+                many.join(", ")
+            )),
         }
         s
     }
@@ -5292,6 +5297,32 @@ fn version_fits(item_id: &str, hash: &str, id: &str, pin: &str) -> Result<(), St
 #[allow(clippy::unwrap_used)]
 pub(crate) mod tests {
     use super::*;
+
+    /// The wire numbering message counts in words that agree with the numbers.
+    #[test]
+    fn the_wire_numbering_message_counts_in_words_that_agree() {
+        let mut r = WireNumbering::default();
+        r.done.connections = 1;
+        r.done.wires = 1;
+        assert_eq!(
+            r.report(),
+            "Numbered 1 connection; 1 wire changed. Existing numbers were kept."
+        );
+        r.done.connections = 3;
+        r.done.wires = 0;
+        r.skipped = vec!["3".into()];
+        let one = r.report();
+        assert!(one.starts_with("Numbered 3 connections; 0 wires changed."), "{one}");
+        assert!(
+            one.contains(" Page 3 was left as it is: someone else has it open."),
+            "{one}"
+        );
+        r.skipped.push("4".into());
+        assert!(
+            r.report()
+                .contains(" Pages 3, 4 were left as they are: someone else has them open.")
+        );
+    }
 
     /// The Save status line counts one file as one file (#1629).
     #[test]

@@ -511,13 +511,26 @@ pub fn on_door(part: &Part) -> bool {
     })
 }
 
-/// The number at the start of a value like `17.5 mm` or `17,5`.
+/// The number at the start of a value like `17.5 mm` or `17,5`. With both `.` and `,` in it
+/// (`1,234.5` or `1.234,5`) the last one is the decimal point and the other groups thousands; a
+/// mark repeated (`1.234.567`) or left at the end (`17,5.`) is not a decimal point either.
 fn leading_number(v: &str) -> Option<f64> {
-    let s: String = v
+    let run: String = v
         .trim()
         .chars()
         .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == ',')
-        .map(|c| if c == ',' { '.' } else { c })
+        .collect();
+    let run = run.trim_end_matches(['.', ',']);
+    let decimal = run
+        .rfind(['.', ','])
+        .filter(|&i| run.get(i..=i).is_some_and(|mark| run.matches(mark).count() == 1));
+    let s: String = run
+        .char_indices()
+        .filter_map(|(i, c)| match c {
+            _ if Some(i) == decimal => Some('.'),
+            '0'..='9' => Some(c),
+            _ => None,
+        })
         .collect();
     s.parse().ok().filter(|v: &f64| v.is_finite())
 }
@@ -1507,6 +1520,23 @@ mod tests {
             Some((Point::new(10.0, 105.0), Point::new(55.0, 195.0))),
             "the empty left rail takes it from its own left end"
         );
+    }
+
+    #[test]
+    fn a_size_with_thousands_marks_or_a_trailing_mark_reads_whole() {
+        for (v, want) in [
+            ("17,5", Some(17.5)),
+            ("17.5 mm", Some(17.5)),
+            ("1,234.5 mm", Some(1234.5)),
+            ("1.234,5", Some(1234.5)),
+            ("1.234.567", Some(1_234_567.0)),
+            ("17,5.", Some(17.5)),
+            ("45,", Some(45.0)),
+            ("mm", None),
+            (",", None),
+        ] {
+            assert_eq!(leading_number(v), want, "{v:?}");
+        }
     }
 
     #[test]

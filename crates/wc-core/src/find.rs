@@ -185,6 +185,44 @@ fn replace_at(hay: &str, needle: &str, with: &str, at: &[usize]) -> String {
     out
 }
 
+/// Why a replace leaves a hit as it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LeftAlone {
+    /// The text was found inside a part of the tag, so the tag is another device's: `-K15`
+    /// for `-K1` ([`replace_in_tag`]).
+    AnotherTag,
+    /// The value is the same after the replace: the replacement is what already stands there.
+    SameValue,
+}
+
+impl LeftAlone {
+    /// The reason in a few words, as shown next to the hit.
+    pub fn reason(self) -> &'static str {
+        match self {
+            LeftAlone::AnotherTag => "another tag",
+            LeftAlone::SameValue => "already so",
+        }
+    }
+}
+
+/// Whether [`replace`] of `query` with `with` would leave this hit (from [`find`] with the same
+/// query and options) as it is, and why. `None` when the replace changes it, also when the
+/// change would be refused (a renamed tag that is not a valid tag).
+pub fn left_alone(hit: &Hit, query: &str, with: &str, opts: FindOptions) -> Option<LeftAlone> {
+    if hit.kind == FindKind::Tag {
+        if positions(&hit.value, query, opts, true).is_empty() {
+            return Some(LeftAlone::AnotherTag);
+        }
+        let new = replace_in_tag(&hit.value, query, with, opts);
+        let same = match (DeviceTag::parse(&hit.value), DeviceTag::parse(&new)) {
+            (Ok(from), Ok(to)) => from == to,
+            _ => new == hit.value,
+        };
+        return same.then_some(LeftAlone::SameValue);
+    }
+    (replace_text(&hit.value, query, with, opts) == hit.value).then_some(LeftAlone::SameValue)
+}
+
 /// Every hit for `query` in the project, page by page in page order, then the device
 /// descriptions. An empty query finds nothing.
 pub fn find(project: &Project, query: &str, opts: FindOptions) -> Vec<Hit> {
@@ -241,7 +279,14 @@ pub fn find(project: &Project, query: &str, opts: FindOptions) -> Vec<Hit> {
     }
     let shown = project.tag_index();
     // A device that no page draws is found by its tag here; a drawn one by its symbols above.
-    for tag in project.devices.keys().filter(|t| !shown.contains_key(*t)) {
+    // A cable that only wire cores name (no symbol, no device entry) is found here too.
+    let undrawn: std::collections::BTreeSet<&DeviceTag> = project
+        .devices
+        .keys()
+        .chain(core_cables(project))
+        .filter(|t| !shown.contains_key(*t))
+        .collect();
+    for tag in undrawn {
         let value = tag.to_string();
         if contains(&value, query, opts) {
             hits.push(Hit {
@@ -267,6 +312,14 @@ pub fn find(project: &Project, query: &str, opts: FindOptions) -> Vec<Hit> {
         }
     }
     hits
+}
+
+/// The cables named by wire cores on any page.
+fn core_cables(project: &Project) -> impl Iterator<Item = &DeviceTag> {
+    project
+        .pages
+        .iter()
+        .flat_map(|p| p.wires.iter().filter_map(|w| w.cable.as_ref().map(|c| &c.cable)))
 }
 
 /// Replace `query` with `with` in the chosen `hits` (from [`find`] with the same query and
@@ -369,7 +422,9 @@ pub fn replace_renaming(
                     FindTarget::Symbol { page, id } => {
                         p.page(page).and_then(|pg| pg.symbol(id)).and_then(|s| s.tag.clone())
                     }
-                    FindTarget::Device { tag, .. } => p.devices.contains_key(tag).then(|| tag.clone()),
+                    FindTarget::Device { tag, .. } => {
+                        (p.devices.contains_key(tag) || core_cables(&p).any(|c| c == tag)).then(|| tag.clone())
+                    }
                     _ => None,
                 };
                 if tag.as_ref().map(ToString::to_string).as_deref() != Some(hit.value.as_str()) {
@@ -764,6 +819,41 @@ mod tests {
     }
 
     #[test]
+    fn a_cable_only_wire_cores_name_is_found_and_renamed() {
+        let mut p = sample();
+        // -W1 has two cores drawn but no cable symbol and no device entry.
+        for (i, core) in ["1", "2"].into_iter().enumerate() {
+            if let Some(w) = p.pages.get_mut(i).and_then(|pg| pg.wires.first_mut()) {
+                w.cable = Some(crate::project::CableCore {
+                    cable: tag("-W1"),
+                    core: core.into(),
+                });
+            }
+        }
+        let opts = FindOptions { match_case: true };
+        let hits = find(&p, "-W1", opts);
+        assert_eq!(hits.len(), 1, "found once, not once per core: {hits:?}");
+        assert_eq!(hits[0].kind, FindKind::Tag);
+        assert_eq!(hits[0].target.page(), None);
+        assert_eq!(replace(&mut p, &hits, "-W1", "-W5", opts), Ok(1));
+        let cables: Vec<_> = p
+            .pages
+            .iter()
+            .flat_map(|pg| pg.wires.iter().filter_map(|w| w.cable.as_ref()))
+            .map(|c| (c.cable.to_string(), c.core.clone()))
+            .collect();
+        assert_eq!(cables, [("-W5".into(), "1".into()), ("-W5".into(), "2".into())]);
+        assert!(!p.devices.contains_key(&tag("-W5")), "no device entry is made up");
+        // A drawn cable is found by its symbol only.
+        p.pages[0].symbols[0].tag = Some(tag("-W5"));
+        assert!(
+            find(&p, "-W5", opts)
+                .iter()
+                .all(|h| matches!(h.target, FindTarget::Symbol { .. }))
+        );
+    }
+
+    #[test]
     fn a_renamed_strip_keeps_its_rail_order_and_spares() {
         let mut p = sample();
         p.pages[1].symbols.push(PlacedSymbol {
@@ -1088,5 +1178,65 @@ mod tests {
             replace_text("Pump", "pump", "Fan", FindOptions { match_case: true }),
             "Pump"
         );
+    }
+
+    /// A hit the replace will not change is told apart before the replace, with the reason, and
+    /// what [`left_alone`] says agrees with what [`replace`] then does.
+    #[test]
+    fn a_hit_the_replace_leaves_alone_is_told_with_the_reason() -> Result<(), String> {
+        let p = sample();
+        let opts = FindOptions::default();
+        let hits = find(&p, "-K1", opts);
+        let told: Vec<(&str, Option<LeftAlone>)> = hits
+            .iter()
+            .filter(|h| h.kind == FindKind::Tag)
+            .map(|h| (h.value.as_str(), left_alone(h, "-K1", "-K2", opts)))
+            .collect();
+        assert_eq!(
+            told,
+            [("-K1", None), ("-K12", Some(LeftAlone::AnotherTag)), ("-K1", None)]
+        );
+        // A letter part is whole in `-K12`, so `K` to `Q` changes it.
+        let hits = find(&p, "K", opts);
+        assert!(
+            hits.iter()
+                .filter(|h| h.kind == FindKind::Tag)
+                .all(|h| left_alone(h, "K", "Q", opts).is_none())
+        );
+        // The replacement is what stands there already: nothing changes, in a tag or a text.
+        let hits = find(&p, "k1", opts);
+        assert!(hits.len() > 3, "{hits:?}");
+        for h in &hits {
+            let expect = if h.value == "-K12" {
+                LeftAlone::AnotherTag
+            } else {
+                LeftAlone::SameValue
+            };
+            assert_eq!(left_alone(h, "k1", "K1", opts), Some(expect), "{h:?}");
+        }
+        // It agrees with the replace: only the hits not left alone change.
+        let hits = find(&p, "-K1", opts);
+        let alone: Vec<Hit> = hits
+            .iter()
+            .filter(|h| left_alone(h, "-K1", "-K2", opts).is_some())
+            .cloned()
+            .collect();
+        assert_eq!(alone.len(), 1);
+        let mut q = p.clone();
+        assert_eq!(replace(&mut q, &alone, "-K1", "-K2", opts)?, 0);
+        assert_eq!(q, p);
+        // One occurrence in the tag changes and another does not: the hit counts as changed.
+        let mixed = Hit {
+            kind: FindKind::Tag,
+            target: hits[0].target.clone(),
+            value: "=A1+C1-K11".into(),
+        };
+        assert_eq!(replace_in_tag(&mixed.value, "1", "2", opts), "=A2+C2-K11");
+        assert_eq!(left_alone(&mixed, "1", "2", opts), None);
+        // A change that would be refused is not "left alone".
+        let hits = find(&p, "-K1", opts);
+        assert_eq!(left_alone(&hits[0], "-K1", "?", opts), None);
+        assert_eq!(LeftAlone::AnotherTag.reason(), "another tag");
+        Ok(())
     }
 }

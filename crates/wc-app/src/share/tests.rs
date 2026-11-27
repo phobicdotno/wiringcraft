@@ -1211,7 +1211,7 @@ fn wire_numbering_in_a_session_leaves_pages_others_hold_and_says_so() -> TestRes
     let done = host_open.number_wires(wc_core::numbering::Rule::Sequential);
     assert_eq!(done.skipped, ["3"]);
     assert_eq!(done.done.wires, 2, "the cover and the host's own page");
-    assert!(done.report().contains("Page(s) 3 were left as they are"));
+    assert!(done.report().contains("Page 3 was left as it is"));
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
 
     let numbered = |o: &Open, page: &str| {
@@ -4384,6 +4384,17 @@ fn an_update_of_an_item_the_session_took_back_is_not_sent_as_an_add() -> TestRes
 /// A session where the guest placed `wc.contact.no` on page 3 and the host refuses to store
 /// it, past the first tries: the placement waits. Returns the placement's id too.
 fn waiting_session(tmp: &Path) -> std::result::Result<(Session, String), Box<dyn std::error::Error>> {
+    waiting_session_stalled(tmp, std::time::Duration::ZERO)
+}
+
+/// [`waiting_session`] on a machine that stands still for `stall` before the guest's last
+/// frame, as a loaded one does: with [`ITEM_RETRY_LATER`] that frame sends the given-up symbol
+/// again. The host answers everything sent before this returns, so nothing the guest sent is
+/// on its way when the test goes on, whatever the clock did.
+fn waiting_session_stalled(
+    tmp: &Path,
+    stall: std::time::Duration,
+) -> std::result::Result<(Session, String), Box<dyn std::error::Error>> {
     let (mut h, log, mut host_open, mut g, mut guest_open) = session(tmp)?;
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
     log.fail_vendor(true);
@@ -4393,6 +4404,9 @@ fn waiting_session(tmp: &Path) -> std::result::Result<(Session, String), Box<dyn
         std::thread::sleep(ITEM_WAIT);
     }
     frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
+    std::thread::sleep(stall);
+    g.frame(Some(&mut guest_open), Some("p0003".to_owned()), false);
+    h.frame(Some(&mut host_open), Some("p0002".to_owned()), false);
     Ok(((h, log, host_open, g, guest_open), item))
 }
 
@@ -4941,8 +4955,19 @@ fn a_page_renumbered_in_the_undo_history_keeps_the_pages_in_order() -> TestResul
 
 #[test]
 fn a_newer_version_taken_while_a_symbol_waits_still_goes_out() -> TestResult {
+    newer_version_goes_out(std::time::Duration::ZERO)
+}
+
+/// The given-up symbol was sent once more just before the newer version is taken: the host
+/// has answered that before the test goes on, so it cannot take the older version first.
+#[test]
+fn a_newer_version_still_goes_out_when_the_waiting_symbol_was_just_sent_again() -> TestResult {
+    newer_version_goes_out(ITEM_RETRY_LATER)
+}
+
+fn newer_version_goes_out(stall: std::time::Duration) -> TestResult {
     let tmp = tempfile::tempdir()?;
-    let ((mut h, log, mut host_open, mut g, mut guest_open), item) = waiting_session(tmp.path())?;
+    let ((mut h, log, mut host_open, mut g, mut guest_open), item) = waiting_session_stalled(tmp.path(), stall)?;
     // The guest takes another version of the waiting symbol from its library.
     let mut v2 = guest_open.symbols.get("wc.contact.no").cloned().ok_or("not loaded")?;
     v2.name = "Contact, newer".into();
@@ -4956,7 +4981,7 @@ fn a_newer_version_taken_while_a_symbol_waits_still_goes_out() -> TestResult {
         .hash = v2.hash();
     guest_open.symbols.insert(v2.id.clone(), v2.clone());
     log.fail_vendor(false);
-    std::thread::sleep(ITEM_RETRY_LATER);
+    // Another version is sent at once: no wait for the given-up one's next try.
     for _ in 0..3 {
         frames((&mut h, &mut host_open, "p0002"), (&mut g, &mut guest_open, "p0003"));
     }

@@ -12,7 +12,7 @@ use crate::project::{Endpoint, Page};
 use crate::symbol::{PinDir, Symbol};
 
 /// How close two coordinates must be to count as the same, in mm.
-const SAME: f64 = 0.01;
+pub(crate) const SAME: f64 = 0.01;
 
 /// A pin of a placed symbol, on the page.
 #[derive(Debug, Clone, PartialEq)]

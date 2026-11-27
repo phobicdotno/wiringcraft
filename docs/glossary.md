@@ -24,9 +24,9 @@ wiringcraft revision cloud p0002 40 50 70 70 --rev A
 **Accessory.** A further part of a device besides its main part, such as an auxiliary contact
 block, a marker or an end plate, with a quantity. It is counted in the parts list.
 
-**Base project.** A project that `wiringcraft new --template <folder or URL>` starts from. Its
-pages, settings, title block, library sources and pictures are copied, not its comments or
-history. Not the same as the page template.
+**Base project.** A project that `wiringcraft new --template <folder or URL>` starts from. Everything
+in it is copied (pages, settings, title block, library sources, pictures, macros, device data
+and vendored library items), not its comments or history. Not the same as the page template.
 
 **Black box (device box).** A rectangle with connection points on its edges, for a device that
 has no symbol of its own. Wires attach to its points like pins. It is stored as a symbol of the

@@ -520,3 +520,184 @@ fn only_exported_rows(table: &wc_report::Table, pages: &[String]) -> wc_report::
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod helper_tests {
+    use std::borrow::Cow;
+
+    use super::*;
+
+    fn text(s: &str) -> writer::Prim {
+        writer::Prim::Text {
+            at: (0.0, 0.0),
+            anchor: (0.0, 0.0),
+            align: 0,
+            height: 2.5,
+            angle: 0.0,
+            text: s.to_owned(),
+            ink: writer::Stroke {
+                rgb: (0.0, 0.0, 0.0),
+                width: 0.25,
+            },
+            layer: None,
+        }
+    }
+
+    fn drawn(texts: &[&str]) -> writer::Drawn {
+        writer::Drawn {
+            prims: texts.iter().map(|t| text(t)).collect(),
+            ..writer::Drawn::default()
+        }
+    }
+
+    fn table(title: &str, columns: &[&str], rows: usize, front: bool) -> wc_report::Table {
+        wc_report::Table {
+            title: title.to_owned(),
+            columns: columns.iter().map(|c| (*c).to_owned()).collect(),
+            rows: (0..rows).map(|n| vec![format!("{n}"); columns.len()]).collect(),
+            front,
+            ..wc_report::Table::default()
+        }
+    }
+
+    fn panel(name: &str) -> wc_core::panel::Panel {
+        wc_core::panel::Panel {
+            id: name.to_lowercase(),
+            name: name.to_owned(),
+            width: 600.0,
+            height: 800.0,
+            items: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn unprintable_is_none_for_latin_text_and_arrows() {
+        assert_eq!(
+            unprintable("1", &drawn(&["K1 \u{2192} 3.4", "Müller 10 °C", "€"])),
+            None
+        );
+        assert_eq!(unprintable("1", &writer::Drawn::default()), None);
+    }
+
+    #[test]
+    fn unprintable_names_each_character_once_in_first_seen_order() {
+        let warning = unprintable("7", &drawn(&["10 k\u{3a9}", "\u{4e2d}", "1 \u{3a9}", "a\tb"]));
+        assert_eq!(
+            warning.as_deref(),
+            Some("page 7: the PDF cannot print \u{3a9} \u{4e2d} \\t in its text; they show as ?")
+        );
+    }
+
+    #[test]
+    fn extra_sheet_ids_are_distinct_and_cannot_be_page_ids() {
+        assert_eq!(extra_sheet_id(0), "\u{1}sheet-0");
+        assert_ne!(extra_sheet_id(1), extra_sheet_id(10));
+        assert!(extra_sheet_id(3).starts_with('\u{1}'));
+    }
+
+    #[test]
+    fn extra_sheets_need_a_front_table_and_a_sheet_to_list() {
+        let reports = vec![Cow::Owned(table("Devices", &["Page", "Title"], 2, false))];
+        let options = Options {
+            panels: vec![panel("Main")],
+            ..Options::default()
+        };
+        let (out, ids) = list_extra_sheets(reports.clone(), &options, 40, 20);
+        assert!(ids.is_empty());
+        assert_eq!(out, reports);
+
+        let reports = vec![Cow::Owned(table("Contents", &["Page", "Title"], 2, true))];
+        let (out, ids) = list_extra_sheets(reports.clone(), &Options::default(), 40, 20);
+        assert!(ids.is_empty());
+        assert_eq!(out, reports);
+    }
+
+    #[test]
+    fn extra_sheets_are_numbered_in_order_after_the_front_pages() {
+        let mut contents = table("Contents", &["Page", "Title"], 2, true);
+        contents.row_pages = vec!["p1".to_owned()];
+        let reports = vec![
+            Cow::Owned(contents),
+            // Three report pages at two rows a page.
+            Cow::Owned(table("Wires", &["Wire"], 5, false)),
+        ];
+        let options = Options {
+            panels: vec![panel("Main"), panel("Door")],
+            networks: vec![wc_core::network::Network {
+                name: "PN1".to_owned(),
+                ..wc_core::network::Network::default()
+            }],
+            ..Options::default()
+        };
+        let (out, ids) = list_extra_sheets(reports, &options, 2, 20);
+        assert_eq!(ids, (0..6).map(extra_sheet_id).collect::<Vec<_>>());
+        let Some(front) = out.first() else { unreachable!() };
+        let added: Vec<(&str, &str)> = front
+            .rows
+            .iter()
+            .skip(2)
+            .map(|r| (r[0].as_str(), r[1].as_str()))
+            .collect();
+        // The contents itself now runs onto four pages, so the first report page is R5.
+        assert_eq!(
+            added,
+            [
+                ("P1", "Main"),
+                ("P2", "Door"),
+                ("R5", "Wires (1/3)"),
+                ("R6", "Wires (2/3)"),
+                ("R7", "Wires (3/3)"),
+                ("N1", "Network PN1"),
+            ]
+        );
+        // The row without a page keeps none; the new rows link to their sheets.
+        let mut row_pages = vec!["p1".to_owned(), String::new()];
+        row_pages.extend(ids);
+        assert_eq!(front.row_pages, row_pages);
+        // The other report is left as it was.
+        assert_eq!(out.get(1).map(|t| t.rows.len()), Some(5));
+    }
+
+    #[test]
+    fn extra_sheets_follow_renamed_and_hidden_columns() {
+        let mut contents = table("Contents", &["Name", "Sheet"], 0, true);
+        contents.sources = vec!["Title".to_owned(), "Page".to_owned()];
+        let options = Options {
+            panels: vec![panel("Main")],
+            ..Options::default()
+        };
+        let (out, _) = list_extra_sheets(vec![Cow::Owned(contents)], &options, 40, 20);
+        let rows = out.first().map(|t| t.rows.clone());
+        assert_eq!(rows, Some(vec![vec!["Main".to_owned(), "P1".to_owned()]]));
+
+        // Without a page column only the title is filled in.
+        let contents = table("Contents", &["Title", "Notes"], 0, true);
+        let (out, ids) = list_extra_sheets(vec![Cow::Owned(contents)], &options, 40, 20);
+        let rows = out.first().map(|t| t.rows.clone());
+        assert_eq!(rows, Some(vec![vec!["Main".to_owned(), String::new()]]));
+        assert_eq!(ids, [extra_sheet_id(0)]);
+    }
+
+    #[test]
+    fn only_exported_rows_keeps_rows_of_exported_pages_and_rows_of_none() {
+        let mut t = table("Devices", &["Tag"], 4, false);
+        t.row_pages = vec!["p1".to_owned(), "p2".to_owned(), String::new(), "p3".to_owned()];
+        let kept = only_exported_rows(&t, &["p1".to_owned(), "p2".to_owned()]);
+        assert_eq!(
+            kept.rows,
+            vec![vec!["0".to_owned()], vec!["1".to_owned()], vec!["2".to_owned()]]
+        );
+        // The trailing row without a page needs no entry.
+        assert_eq!(kept.row_pages, ["p1", "p2"]);
+        assert_eq!(kept.title, "Devices");
+    }
+
+    #[test]
+    fn only_exported_rows_keeps_rows_past_a_short_row_pages() {
+        let mut t = table("Devices", &["Tag"], 3, false);
+        t.row_pages = vec!["p9".to_owned()];
+        let kept = only_exported_rows(&t, &["p1".to_owned()]);
+        assert_eq!(kept.rows, vec![vec!["1".to_owned()], vec!["2".to_owned()]]);
+        assert!(kept.row_pages.is_empty());
+    }
+}
