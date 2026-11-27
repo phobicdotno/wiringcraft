@@ -2190,7 +2190,7 @@ fn svg_drawings_leave_out_a_missing_or_damaged_picture() {
 }
 
 #[test]
-fn page_lines_leave_out_pictures_without_warning() {
+fn page_lines_say_which_pictures_they_leave_out() {
     let mut project = Project::new("Lines");
     let mut p1 = Page::new("p1", "1", "One");
     p1.underlay = Some(wc_core::Underlay {
@@ -2203,11 +2203,25 @@ fn page_lines_leave_out_pictures_without_warning() {
         file: "pictures/logo.png".into(),
         cover: None,
     });
-    // No picture bytes are given: a DXF export does not read them, so none may be missed.
+    // No picture bytes are given: a DXF export does not read them, so none is called missing,
+    // but the user is told the DXF has neither the underlay nor the logo.
     let (pages, report) = crate::page_lines(&project, &BTreeMap::new(), &Options::default());
     assert_eq!(pages.len(), 1);
     assert!(pages[0].pictures.is_empty());
-    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert_eq!(
+        report.warnings,
+        vec![
+            "page 1: the underlay underlays/p1.png is left out: DXF has no pictures (the SVG export shows it)"
+                .to_string(),
+            "the logo pictures/logo.png is left out: DXF has no pictures (the SVG export shows it)".to_string(),
+        ]
+    );
+    // Without a logo or an underlay, nothing is said.
+    let mut plain = project.clone();
+    plain.meta.logo = None;
+    plain.pages[0].underlay = None;
+    let (_, quiet) = crate::page_lines(&plain, &BTreeMap::new(), &Options::default());
+    assert!(quiet.warnings.is_empty(), "{:?}", quiet.warnings);
     let (_, svg_report) = page_drawings(&project, &BTreeMap::new(), &Options::default());
     assert_eq!(svg_report.warnings.len(), 2, "{:?}", svg_report.warnings);
 }
