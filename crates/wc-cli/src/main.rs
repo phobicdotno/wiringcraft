@@ -2875,8 +2875,8 @@ fn run(mut cli: Cli) -> Res<()> {
                     for pg in &p.pages {
                         println!(
                             "{:<10} {:<6} {} ({} symbols, {} wires){}",
-                            pg.id,
-                            pg.number,
+                            escape_field(&pg.id),
+                            escape_field(&pg.number),
                             escape_field(&pg.title),
                             pg.symbols.len(),
                             pg.wires.len(),
@@ -4126,7 +4126,7 @@ fn run(mut cli: Cli) -> Res<()> {
                     .page_id
                     .as_deref()
                     .and_then(|id| p.page(id))
-                    .map(|pg| format!("page {}: ", pg.number))
+                    .map(|pg| format!("page {}: ", escape_field(&pg.number)))
                     .unwrap_or_default();
                 println!("{:<7} {page}{}", f.severity.label(), escape_field(&f.message));
             }
