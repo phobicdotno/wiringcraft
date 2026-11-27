@@ -172,7 +172,7 @@ fn uncloud_says_when_no_cloud_has_the_revision_and_takes_the_letter_as_cloud_doe
         .arg("--no-git")
         .status()?;
     assert!(status.success());
-    wiringcraft(&dir, &["page", "add", "p1", "--number", "1"])?;
+    wiringcraft(&dir, &["page", "add", "p1", "--number", "2"])?;
     wiringcraft(&dir, &["revision", "add", "A 1"])?;
     // Typed with a no-break space, as `revision cloud` and `revision remove` take it.
     wiringcraft(
