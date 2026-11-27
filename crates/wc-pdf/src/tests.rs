@@ -3359,6 +3359,22 @@ fn a_project_without_a_name_leaves_the_reader_title_bar_to_the_file_name() {
 }
 
 #[test]
+fn a_padded_project_name_is_trimmed_in_the_reader_title() {
+    let mut project = Project::new("  Pump station  ");
+    project.pages.push(Page::new("p1", "1", "Main"));
+    let (pdf, _) = export(&project, &BTreeMap::new(), &Options::default());
+    let text = String::from_utf8_lossy(&pdf);
+    let Some(info) = text.split("endobj").find(|o| o.contains("/Producer")) else {
+        unreachable!("no info dictionary in {text}");
+    };
+    assert!(
+        info.contains(&format!("/Title {} /Producer", writer::pdf_text("Pump station"))),
+        "{info}"
+    );
+    assert!(!info.contains(&writer::pdf_text("  Pump station  ")), "{info}");
+}
+
+#[test]
 fn the_reader_title_bar_shows_the_project_name_not_the_file_name() {
     // One page, so there is a sheet to print (#833).
     let mut project = Project::new("Pump station");
