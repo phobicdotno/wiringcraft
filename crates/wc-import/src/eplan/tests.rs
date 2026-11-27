@@ -649,3 +649,153 @@ fn drawn_wires_get_the_section_and_colour_of_their_connection() {
         Some("18 AWG")
     );
 }
+
+fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
+    use std::io::Write;
+    let mut buf = Cursor::new(Vec::new());
+    {
+        let mut z = zip::ZipWriter::new(&mut buf);
+        let opt = zip::write::SimpleFileOptions::default();
+        for (name, data) in files {
+            z.start_file(*name, opt).unwrap();
+            z.write_all(data).unwrap();
+        }
+        z.finish().unwrap();
+    }
+    buf.into_inner()
+}
+
+#[test]
+fn zip_tables_are_keyed_by_lower_case_file_name_at_any_depth() {
+    let bytes = zip_of(&[
+        ("Projects/Demo.edb/Page.EOD", b"page"),
+        ("Projects\\Demo.edb\\function.eod", b"func"),
+        ("Demo.edb/ProjectInfo.xml", b"<x/>"),
+        ("Demo.edb/readme.txt", b"skip"),
+        ("Demo.edb/page.eod.bak", b"skip"),
+    ]);
+    let (tables, warnings) = tables_from_zip(&bytes).unwrap();
+    assert!(warnings.is_empty());
+    let keys: Vec<&str> = tables.keys().map(String::as_str).collect();
+    assert_eq!(keys, ["function.eod", "page.eod", "projectinfo.xml"]);
+    assert_eq!(tables["page.eod"], b"page");
+    assert_eq!(tables["function.eod"], b"func");
+}
+
+#[test]
+fn zip_without_tables_is_an_error() {
+    let only_info = zip_of(&[("Demo.edb/ProjectInfo.xml", b"<x/>"), ("notes.txt", b"hi")]);
+    // ProjectInfo.xml alone is kept, but reading needs at least one table.
+    let (t, _) = tables_from_zip(&only_info).unwrap();
+    assert_eq!(t.keys().collect::<Vec<_>>(), ["projectinfo.xml"]);
+    assert!(read(&t).is_err());
+    let nothing = zip_of(&[("notes.txt", b"hi")]);
+    assert!(matches!(tables_from_zip(&nothing), Err(Error::Format(m)) if m.contains("no Eplan project tables")));
+}
+
+#[test]
+fn wanted_and_optional_files() {
+    assert!(wanted("page.eod"));
+    assert!(wanted("projectinfo.xml"));
+    assert!(!wanted("page.eod.bak"));
+    assert!(!wanted("project.elk"));
+    assert!(optional("projectinfo.xml"));
+    assert!(!optional("page.eod"));
+}
+
+#[test]
+fn project_info_reads_properties_and_picks_a_language() {
+    let xml = br#"<?xml version="1.0"?>
+<EplanPxfRoot>
+  <Property id="10011" name="Project name">  Pump station  </Property>
+  <Property id="10013" name="Customer">de_DE@Kunde &amp; Co;en_US@Customer &amp; Co;</Property>
+  <Property id="oops" name="Bad id">kept</Property>
+  <Other>ignored</Other>
+</EplanPxfRoot>"#;
+    let props = project_info(xml);
+    assert_eq!(
+        props,
+        [
+            (10011, "Project name".to_owned(), "Pump station".to_owned()),
+            (10013, "Customer".to_owned(), "Customer & Co".to_owned()),
+            (0, "Bad id".to_owned(), "kept".to_owned()),
+        ]
+    );
+    // Broken XML stops reading but keeps what came before.
+    let broken = br#"<R><Property id="1" name="A">a</Property><Property id="2" name="B">b</Wrong></R>"#;
+    let props = project_info(broken);
+    assert_eq!(props.first(), Some(&(1, "A".to_owned(), "a".to_owned())));
+    assert!(project_info(b"").is_empty());
+}
+
+#[test]
+fn project_info_from_tables_reaches_the_project() {
+    let mut t = sample();
+    t.insert(
+        "projectinfo.xml".into(),
+        br#"<R><Property id="10011" name="Project name">Demo</Property></R>"#.to_vec(),
+    );
+    let p = read(&t).unwrap();
+    assert_eq!(p.properties, [(10011, "Project name".to_owned(), "Demo".to_owned())]);
+}
+
+#[test]
+fn pick_language_fallbacks() {
+    // en_GB wins over neutral and other languages; neutral wins over the rest.
+    assert_eq!(pick_language("de_DE@Pumpe;??_??@P;en_GB@Pump;"), "Pump");
+    assert_eq!(pick_language("de_DE@Pumpe;??_??@P;"), "P");
+    // No preferred language: the first one.
+    assert_eq!(pick_language("fr_FR@Pompe;de_DE@Pumpe;"), "Pompe");
+    // An '@' without a language code is plain text.
+    assert_eq!(pick_language("user@example"), "user@example");
+}
+
+#[test]
+fn tag_text_joins_the_parts_that_are_present() {
+    assert_eq!(tag_text("PUMPE", "1", "M", "1"), "PUMPE1-M1");
+    assert_eq!(tag_text("K", "2", "", ""), "K2");
+    assert_eq!(tag_text("", "", "X", "3"), "X3");
+    assert_eq!(tag_text("", "", "", ""), "");
+}
+
+#[test]
+fn crate_natural_orders_numbers_by_value() {
+    assert_eq!(crate_natural("X10:2"), [("X".to_owned(), 10), (":".to_owned(), 2)]);
+    assert_eq!(crate_natural("PE"), [("PE".to_owned(), 0)]);
+    assert!(crate_natural("X2") < crate_natural("X10"));
+    assert!(crate_natural("X10:2") < crate_natural("X10:11"));
+    // Too many digits saturate rather than panic.
+    assert_eq!(crate_natural("A99999999999999999999999"), [("A".to_owned(), u64::MAX)]);
+}
+
+#[test]
+fn user_block_keeps_entries_before_damage() {
+    let mut body = block(F_PROPERTIES, &[(20001, 0, "first"), (20002, 1, "second")]);
+    // Corrupt the end marker into an out-of-range id followed by junk.
+    let len = body.len();
+    body[len - 2..].copy_from_slice(&u16le(5));
+    body.extend([0, 0, b'x', 0]);
+    let r = record(CLASS_PAGE, 1, &body);
+    let recs = records(&r);
+    let [rec] = recs.as_slice() else { unreachable!() };
+    let b = user_block(rec, F_PROPERTIES);
+    assert_eq!(b.len(), 2);
+    assert_eq!(prop(&b, 20001), "first");
+    assert_eq!(b.get(&(20002, 1)).map(String::as_str), Some("second"));
+    assert_eq!(prop(&b, 20002), "");
+    assert!(user_block(rec, F_TAG_PARTS).is_empty());
+}
+
+#[test]
+fn elk_target_encodings_and_rejections() {
+    assert_eq!(
+        elk_target("\u{feff}Plant.edb\n12\n".as_bytes()).as_deref(),
+        Some("Plant.edb")
+    );
+    // UTF-16 without a byte order mark is detected by its zero high bytes.
+    let units: Vec<u8> = "Plant.edb\r\n".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    assert_eq!(elk_target(&units).as_deref(), Some("Plant.edb"));
+    assert_eq!(elk_target(b""), None);
+    assert_eq!(elk_target(b"   \nPlant.edb\n"), None);
+    assert_eq!(elk_target(b"..\\evil.edb\n"), None);
+}

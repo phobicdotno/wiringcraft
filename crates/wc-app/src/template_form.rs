@@ -263,6 +263,14 @@ mod tests {
             .collect()
     }
 
+    fn standard() -> Vec<String> {
+        template::SPECIAL_VALUES
+            .iter()
+            .chain(wc_core::project::TITLE_FIELDS)
+            .map(|(k, _)| (*k).to_owned())
+            .collect()
+    }
+
     #[test]
     fn an_open_box_stays_open_when_it_moves_or_one_before_it_is_removed() {
         let ctx = egui::Context::default();
@@ -278,5 +286,49 @@ mod tests {
             o.remove(0);
         });
         assert_eq!(open(&ctx, &ids), [true, false, false]);
+    }
+
+    #[test]
+    fn a_new_project_offers_the_special_values_then_the_title_fields_in_order() {
+        let keys = value_keys(&wc_core::Project::new("x"));
+        assert_eq!(keys, standard());
+        assert_eq!(keys.first().map(String::as_str), Some(template::PROJECT_NAME));
+    }
+
+    #[test]
+    fn the_projects_own_fields_come_after_the_standard_ones_in_name_order() {
+        let mut p = wc_core::Project::new("x");
+        p.meta.title_block.insert("zone".into(), "B".into());
+        p.meta.title_block.insert("approved_by".into(), "Ann".into());
+        let keys = value_keys(&p);
+        let mut want = standard();
+        want.extend(["approved_by".to_owned(), "zone".to_owned()]);
+        assert_eq!(keys, want);
+    }
+
+    #[test]
+    fn a_field_the_project_fills_that_is_already_standard_is_listed_once() {
+        let mut p = wc_core::Project::new("x");
+        p.meta.title_block.insert("customer".into(), "Acme".into());
+        p.meta.title_block.insert(template::PAGE_TITLE.into(), "odd".into());
+        let keys = value_keys(&p);
+        assert_eq!(keys, standard());
+        assert_eq!(keys.iter().filter(|k| *k == "customer").count(), 1);
+        assert_eq!(keys.iter().filter(|k| *k == template::PAGE_TITLE).count(), 1);
+    }
+
+    #[test]
+    fn every_key_is_unique() {
+        let mut p = wc_core::Project::new("x");
+        for k in standard() {
+            p.meta.title_block.insert(k, "v".into());
+        }
+        p.meta.title_block.insert("extra".into(), "v".into());
+        let keys = value_keys(&p);
+        let mut sorted = keys.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), keys.len());
+        assert_eq!(keys.last().map(String::as_str), Some("extra"));
     }
 }
