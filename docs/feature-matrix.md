@@ -72,12 +72,12 @@ For the other areas, the chapter to read in each help is:
 |---|---|---|---|---|
 | Project with numbered schematic pages, page navigator | yes | yes | yes | done |
 | Page properties: number, title, size | yes | yes | yes (A4 to A0, landscape or portrait, or a custom size in mm; #261) | done |
-| Page types (schematic, single-line overview, graphic, report, panel layout) | yes | yes | partly: schematic, overview flag, panel layouts, report pages in the PDF | done for the basics; more types later |
+| Page types (schematic, single-line overview, graphic, report, panel layout) | yes | yes | partly: schematic, overview flag, cover page, panel layouts, report pages in the PDF | done for the basics; more types later |
 | Structure identifiers per page (function `=` and location `+`) | yes | yes (book / file / location) | yes: IEC 81346 tags, page defaults | done |
 | Locations list with descriptions | yes | yes | yes: project properties, `wiringcraft location`, Locations report, SolidWorks and AutomationML import | done |
 | Frame with column and row references (e.g. 3.C) | yes | yes | yes | done (#54) |
 | Title block shared by all pages | yes | yes | yes | done |
-| Cover page and page template editing | yes | yes | yes: cover page form, Page template form (columns and title-block boxes, kept in `project.toml`) | done (#53, #119) |
+| Cover page and page template editing | yes | yes | yes: cover page form, Page template form (columns and title-block boxes, kept in `project.toml`); `wiringcraft page cover` and `wiringcraft template` on the command line | done (#53, #119) |
 | Project templates and base projects | yes | yes (project templates) | yes: `wiringcraft new <dir> --template <folder or git URL>` and "Start from" in New project; `{name}` and `{date}` filled in | done (#270) |
 | Project properties (customer, dates, revision ...) | yes | yes | yes | done |
 | Project archive (pack and unpack) | yes | yes (.tewzip) | yes: import of archives, projects are plain folders | done |
@@ -177,7 +177,7 @@ For the other areas, the chapter to read in each help is:
 | PLC variable list export (structured text) | yes | partly | yes | done |
 | PLC card overview pages and rack configuration | yes | yes | partly: `[[rack]]` tables with their `[[rack.card]]`s in `project.toml` (slot, tag, type, channels, start address); the `plc-cards` report lists every card channel by channel with the device, connection and page from the PLC I/O list, as a table in the PDF (`pdf --report plc-cards`) and the app; see `wc_core::plc_rack`. The app edits racks and cards in File > PLC racks (#436), showing the report's rack warnings while typing. The command line lists and edits them too (`wiringcraft rack list`, `rack add`/`set`/`remove`, `rack card add`/`set`/`remove`), with the form's range checks, printing the rack warnings after a change (#592). The PDF draws a sheet per card: the card as a box with a terminal per channel, its address and the device and page of each point (#437) | done (#275, #436, #437, #592) |
 | Fieldbus (PROFINET, EtherCAT) topology | yes | partly | yes: `[[network]]` tables in `project.toml` (devices, addresses, station names, cabled ports), Networks report (`--report networks`) with checks, and a drawn topology page per network after the list in the PDF (boxes per device linking to its page, ports and cable tags on each link, rings drawn once, cables from different devices each on a track of their own so they do not look joined, cables fanning out of one device sharing one run; tags, port names and cables never cut: smaller type, then a numbered key with a legend under the drawing) | done: network list (#278), topology pages (#453), separate tracks (#486), whole names (#493) |
-| Exchange with PLC engineering tools (AutomationML) | yes | partly | yes (export) | done |
+| Exchange with PLC engineering tools (AutomationML) | yes | partly | yes: export (`wiringcraft aml`) and import (`import aml`; in the app the second File → AutomationML entry, among the imports below the exports, or AutomationML in the ribbon's Import tab) of devices and connections | done |
 
 ## 10. Reports
 
@@ -187,7 +187,7 @@ For the other areas, the chapter to read in each help is:
 | Device, wire, net, terminal, cable, PLC lists | yes | yes | yes | done |
 | Table of contents | yes | yes | yes, linked in the PDF | done |
 | Report pages in the drawing set | yes | yes | yes | done |
-| Report templates the user designs | yes | yes | partly: `[[report]]` layouts in `project.toml` pick, order, rename and sort the columns of any report, in the PDF, CSV, Markdown and Excel output; `group = "<column>"` prints a heading per group in the PDF (one row per record in the CSV), and `header = [...]` prints title-block values above the table | columns and sort done (#273), grouping and page header fields done (#421), an unknown group column or header key warned about (#481); an editor in the app later |
+| Report templates the user designs | yes | yes | yes: `[[report]]` layouts in `project.toml` pick, order, rename and sort the columns of any report, in the PDF, CSV, Markdown and Excel output; `group = "<column>"` prints a heading per group in the PDF (one row per record in the CSV), and `header = [...]` prints title-block values above the table; edited in the app (Reports, Layout…; #480), by the assistant (#545) and with `wiringcraft report-layout show/set/reset` (#604) | done: columns and sort (#273), grouping and page header fields (#421), an unknown group column or header key warned about (#481), editor in the app (#480) |
 | Reports as CSV / Markdown / Excel | yes (Excel) | yes (Excel) | yes: `report --format xlsx`, Reports → Save as Excel | done (#264) |
 
 ## 11. Panel layout and 3D
@@ -218,7 +218,7 @@ For the other areas, the chapter to read in each help is:
 | PDF export with links and layers | yes | yes | yes | done |
 | DXF / SVG export | yes (DXF/DWG) | yes (DWG/DXF) | yes: one file per schematic page and one per panel layout (`panel-<name>`: plate, rails, ducts, device outlines and tags as on its PDF sheet) | done (#927) |
 | DXF import: ELLIPSE, SPLINE, HATCH | yes | yes | yes: sampled curves, solid hatches filled | done |
-| DWG read and write | yes | yes | read: AutoCAD 2004 to 2018 drawings (AC1018 to AC1032; later releases still save in the 2018 format), for SolidWorks Electrical symbols and pages and for `import page-dwg` and File > Import > DWG page; no write | read done (#161, #162, #163, #215, #292); write not planned, DXF covers it |
+| DWG read and write | yes | yes | read: AutoCAD 2004 to 2018 drawings (AC1018 to AC1032; later releases still save in the 2018 format), for SolidWorks Electrical symbols and pages and for `import page-dwg` and File → DWG drawing; no write | read done (#161, #162, #163, #215, #292); write not planned, DXF covers it |
 | Import EPLAN projects | - | yes (some) | yes | done |
 | Import SolidWorks Electrical projects | no | - | yes | done; library parts, cable types and symbol blocks with `import swe-library` (#62, blocks drawn from their DWG files #59); cabinet layouts as panels (#60, footprints sized from the catalog part #149); symbol and page graphics from the DWG files (#163, stretched circles and arcs as ellipses #307); cover page and title block data, with the project's revision and checked by (#61, #170); terminal strips and wire ends (#70) and their jumpers (#108, #247) |
 | PDF trace import (turn a PDF drawing into a page) | partly | no | yes | done |
@@ -232,7 +232,7 @@ For the other areas, the chapter to read in each help is:
 | Function | EPLAN | SWE | WiringCraft | Triage |
 |---|---|---|---|---|
 | Revision tracking and compare | yes | yes | yes: git history, subway map, change lists | done |
-| Revision marks (clouds, revision table on pages) | yes | yes | yes: revisions listed in the project properties, revision clouds tagged with the latest revision and the revision table drawn on pages and in the PDF, made in the app (Cloud and Revision table tools) or with `wiringcraft revision` | done (#265, #377) |
+| Revision marks (clouds, revision table on pages) | yes | yes | yes: revisions listed in the project properties, revision clouds tagged with the latest revision and the revision table drawn on pages and in the PDF, made in the app (Revision cloud and Revision table tools) or with `wiringcraft revision` | done (#265, #377) |
 | Review comments on pages | yes (comments in PDF) | partly | yes | done |
 | Several people on one project at once | yes (multi-user) | yes (server database) | yes: share and join a session on the network in the app, page locks, one change per edit, undo per change ([known-gaps.md](known-gaps.md#shared-sessions)) | done (#43, with #74 to #78, #197, #198, #201, #286) |
 | User rights per project | yes | yes | no | not planned: git hosting already controls who can change a project |

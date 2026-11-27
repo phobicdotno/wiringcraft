@@ -229,6 +229,40 @@ fn dxf_text_keeps_percent_signs_backslashes_and_wide_characters_literal() {
 }
 
 #[test]
+fn dxf_texts_keep_their_centre_and_right_alignment() {
+    // A CAD program draws texts in its own font: a centred or right-aligned text is written
+    // with its alignment and the point it lines up at, not only a left end worked out from the
+    // PDF font's widths (#1318).
+    let mut pen = crate::writer::Pen::new(100.0);
+    pen.text((10.0, 20.0), 2.5, 0, "left");
+    pen.text((50.0, 30.0), 2.5, 1, "middle");
+    pen.text_at_angle((80.0, 40.0), 2.5, 2, 90.0, "right");
+    let page = PageDrawing {
+        id: "p1".into(),
+        number: "1".into(),
+        title: String::new(),
+        size_mm: (100.0, 100.0),
+        prims: pen.prims,
+        pictures: Vec::new(),
+        panel: false,
+    };
+    let d = dxf(&page);
+    let entity = |text: &str| -> String {
+        let at = d.find(&format!("\n1\n{text}\n")).unwrap_or(d.len());
+        let start = d[..at].rfind("0\nTEXT\n").unwrap_or(at);
+        let end = d[at..].find("\n0\n").map_or(d.len(), |e| at + e);
+        d[start..end].to_owned()
+    };
+    let left = entity("left");
+    assert!(left.contains("10\n10\n20\n80\n"), "{left}");
+    assert!(!left.contains("\n72\n") && !left.contains("\n11\n"), "{left}");
+    let middle = entity("middle");
+    assert!(middle.contains("\n72\n1\n11\n50\n21\n70"), "{middle}");
+    let right = entity("right");
+    assert!(right.contains("\n50\n90\n72\n2\n11\n80\n21\n60"), "{right}");
+}
+
+#[test]
 fn page_files_are_named_after_the_page_number() {
     let page = |number: &str| PageDrawing {
         id: "p-7".into(),
@@ -276,6 +310,49 @@ fn arcs_keep_their_side_in_svg_and_dxf() {
     };
     assert!(svg(&page).contains("d=\"M60 50 A10 10 0 0 1 50 60\""));
     assert!(dxf(&page).contains("0\nARC\n8\n0\n62\n7\n10\n50\n20\n50\n40\n10\n50\n270\n51\n0\n"));
+}
+
+#[test]
+fn a_negative_radius_is_drawn_in_svg_and_dxf_where_the_pdf_draws_it() {
+    // The PDF places the points at centre + r (cos, sin): a negative radius is the same circle
+    // and the arc turned half round. The SVG and DXF get the size and the turned angles (#1688).
+    let mut turned = crate::writer::Pen::new(100.0);
+    turned.arc((50.0, 50.0), -10.0, 180.0, 270.0, false);
+    let mut plain = crate::writer::Pen::new(100.0);
+    plain.arc((50.0, 50.0), 10.0, 0.0, 90.0, false);
+    assert_eq!(turned.ops, plain.ops, "the PDF draws the same arc");
+    turned.circle((20.0, 20.0), -3.0, false);
+    let page = PageDrawing {
+        id: "a".into(),
+        number: "1".into(),
+        title: String::new(),
+        size_mm: (100.0, 100.0),
+        prims: turned.prims,
+        pictures: Vec::new(),
+        panel: false,
+    };
+    let s = svg(&page);
+    assert!(s.contains("d=\"M60 50 A10 10 0 0 1 50 60\""), "{s}");
+    assert!(s.contains("<circle cx=\"20\" cy=\"20\" r=\"3\""), "{s}");
+    let d = dxf(&page);
+    assert!(
+        d.contains("0\nARC\n8\n0\n62\n7\n10\n50\n20\n50\n40\n10\n50\n270\n51\n0\n"),
+        "{d}"
+    );
+    assert!(d.contains("0\nCIRCLE\n8\n0\n62\n7\n10\n20\n20\n80\n40\n3\n"), "{d}");
+    assert!(!d.contains("\n40\n-"), "{d}");
+    // A tiny arc stays tiny: turned before its sweep was taken, it rounded to a full circle.
+    let mut tiny = crate::writer::Pen::new(100.0);
+    tiny.arc((50.0, 50.0), -10.0, 0.0, 1e-14, false);
+    let sweeps: Vec<f64> = tiny
+        .prims
+        .iter()
+        .filter_map(|p| match p {
+            crate::writer::Prim::Arc { start, end, .. } => Some(end - start),
+            _ => None,
+        })
+        .collect();
+    assert!(sweeps.len() == 1 && sweeps[0] < 1.0, "{sweeps:?}");
 }
 
 #[test]
@@ -1621,6 +1698,96 @@ fn a_coil_does_not_list_a_contact_repeated_on_an_overview_page() {
 }
 
 #[test]
+fn a_breaker_contact_points_to_its_breaker_and_a_coil_still_wins() {
+    // A breaker or MPCB is one standalone symbol; its aux contact belongs to it (#1467).
+    let mut symbols = BTreeMap::new();
+    symbols.insert("mpcb".to_owned(), sym("mpcb", SymbolRole::Standalone, ["1", "2"]));
+    symbols.insert("coil".to_owned(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
+    symbols.insert("no".to_owned(), sym("no", SymbolRole::Auxiliary, ["13", "14"]));
+    let mut project = wc_core::Project::new("x");
+    let mut power = Page::new("p1", "1", "Power");
+    power.symbols.push(place("s1", "mpcb", 50.0, "-Q1"));
+    power.symbols.push(place("s2", "mpcb", 150.0, "-K1"));
+    let mut control = Page::new("p2", "2", "Control");
+    control.symbols.push(place("s3", "no", 50.0, "-Q1"));
+    control.symbols.push(place("s4", "coil", 100.0, "-K1"));
+    control.symbols.push(place("s5", "no", 150.0, "-K1"));
+    project.pages = vec![power, control];
+    let x = layout::CrossRefs::build(&project, &symbols);
+    let Some(page) = project.pages.get(1) else {
+        unreachable!("two pages")
+    };
+    let mut warnings = Vec::new();
+    let marks = layout::xref_marks(page, &symbols, &x, &mut warnings);
+    let back: Vec<(&str, &str)> = marks
+        .iter()
+        .filter(|m| m.text.starts_with('>'))
+        .map(|m| (m.text.as_str(), m.target_page_id.as_str()))
+        .collect();
+    assert_eq!(back, [("> 1/2.B", "p1"), ("> 2/3.B", "p2")], "{marks:?}");
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn a_breaker_lists_its_contacts_unless_a_coil_of_its_tag_does() {
+    // A breaker or MPCB lists its aux contacts under its symbol as a coil does (#1467).
+    let mut symbols = BTreeMap::new();
+    symbols.insert("mpcb".to_owned(), sym("mpcb", SymbolRole::Standalone, ["1", "2"]));
+    symbols.insert("coil".to_owned(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
+    symbols.insert("no".to_owned(), sym("no", SymbolRole::Auxiliary, ["13", "14"]));
+    let mut project = wc_core::Project::new("x");
+    let mut power = Page::new("p1", "1", "Power");
+    power.symbols.push(place("s1", "mpcb", 50.0, "-Q1"));
+    power.symbols.push(place("s2", "mpcb", 150.0, "-K1"));
+    let mut control = Page::new("p2", "2", "Control");
+    control.symbols.push(place("s3", "no", 50.0, "-Q1"));
+    control.symbols.push(place("s4", "coil", 100.0, "-K1"));
+    control.symbols.push(place("s5", "no", 150.0, "-K1"));
+    project.pages = vec![power, control];
+    let x = layout::CrossRefs::build(&project, &symbols);
+    let Some(page) = project.pages.first() else {
+        unreachable!("two pages")
+    };
+    let mut warnings = Vec::new();
+    let marks = layout::xref_marks(page, &symbols, &x, &mut warnings);
+    let listed: Vec<(&str, &str)> = marks
+        .iter()
+        .map(|m| (m.text.as_str(), m.target_page_id.as_str()))
+        .collect();
+    // -Q1 lists its contact; -K1's contact is listed under its coil, not again here.
+    assert_eq!(listed, [("13-14 2/2.B", "p2")], "{marks:?}");
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn a_breaker_contact_points_to_the_schematic_breaker_not_its_overview_copy() {
+    // An overview page (line diagram) before the schematic repeats the breaker (#1467).
+    let mut symbols = BTreeMap::new();
+    symbols.insert("mpcb".to_owned(), sym("mpcb", SymbolRole::Standalone, ["1", "2"]));
+    symbols.insert("no".to_owned(), sym("no", SymbolRole::Auxiliary, ["13", "14"]));
+    let mut project = wc_core::Project::new("x");
+    let mut overview = Page::new("p0", "0", "Overview");
+    overview.overview = true;
+    overview.symbols.push(place("s0", "mpcb", 50.0, "-Q1"));
+    let mut power = Page::new("p1", "1", "Power");
+    power.symbols.push(place("s1", "mpcb", 50.0, "-Q1"));
+    power.symbols.push(place("s2", "no", 150.0, "-Q1"));
+    project.pages = vec![overview, power];
+    let x = layout::CrossRefs::build(&project, &symbols);
+    let Some(page) = project.pages.get(1) else {
+        unreachable!("two pages")
+    };
+    let mut warnings = Vec::new();
+    let marks = layout::xref_marks(page, &symbols, &x, &mut warnings);
+    let back: Vec<&str> = marks
+        .iter()
+        .filter(|m| m.text.starts_with('>'))
+        .map(|m| m.target_page_id.as_str())
+        .collect();
+    assert_eq!(back, ["p1"], "{marks:?}");
+}
+
+#[test]
 fn an_interruption_point_does_not_point_to_its_copy_on_an_overview_page() {
     let mut symbols = BTreeMap::new();
     symbols.insert("arrow".to_owned(), sym("arrow", SymbolRole::Interruption, ["1", "2"]));
@@ -1667,6 +1834,35 @@ fn cross_references_give_page_column_and_row() {
     let tag = DeviceTag::parse("-K1").ok();
     let first = tag.as_ref().and_then(|t| x.mains.get(t)).and_then(|m| m.first());
     assert_eq!(first.map(|a| a.location()).as_deref(), Some("12/3.B"));
+}
+
+#[test]
+fn cross_references_leave_out_page_number_blanks_and_unnamed_pins() {
+    let mut symbols = BTreeMap::new();
+    symbols.insert("coil".to_owned(), sym("coil", SymbolRole::Main, ["A1", "A2"]));
+    symbols.insert("no".to_owned(), sym("no", SymbolRole::Auxiliary, ["13", " "]));
+    let mut bare = sym("bare", SymbolRole::Auxiliary, ["", ""]);
+    bare.pins.clear();
+    symbols.insert("bare".to_owned(), bare);
+    let mut project = wc_core::Project::new("x");
+    // A hand-edited page number with blanks around it.
+    let mut control = Page::new("p1", " 3 ", "Control");
+    control.symbols.push(place("s1", "coil", 50.0, "-K1"));
+    control.symbols.push(place("s2", "no", 100.0, "-K1"));
+    control.symbols.push(place("s3", "bare", 150.0, "-K1"));
+    project.pages = vec![control];
+    let x = layout::CrossRefs::build(&project, &symbols);
+    let Some(page) = project.pages.first() else {
+        unreachable!("one page")
+    };
+    let mut warnings = Vec::new();
+    let mut texts: Vec<String> = layout::xref_marks(page, &symbols, &x, &mut warnings)
+        .into_iter()
+        .map(|m| m.text)
+        .collect();
+    texts.sort();
+    assert_eq!(texts, ["13 3/3.B", "3/4.B", "> 3/2.B", "> 3/2.B"]);
+    assert!(warnings.is_empty(), "{warnings:?}");
 }
 
 #[test]
@@ -3303,6 +3499,44 @@ fn a_declared_node_with_a_blank_tag_keeps_its_box_address_and_station() {
 }
 
 #[test]
+fn a_project_without_a_name_leaves_the_reader_title_bar_to_the_file_name() {
+    // A blank or all-space name would show as an empty title bar (#1628): the PDF then has no
+    // /Title and does not ask the reader to show it, so the file name shows instead.
+    for name in ["", "   "] {
+        let mut project = Project::new(name);
+        project.pages.push(Page::new("p1", "1", "Main"));
+        let (pdf, _) = export(&project, &BTreeMap::new(), &Options::default());
+        let text = String::from_utf8_lossy(&pdf);
+        let Some(catalog) = text.split("endobj").find(|o| o.contains("/Type /Catalog")) else {
+            unreachable!("no catalog in {text}");
+        };
+        assert!(!catalog.contains("DisplayDocTitle"), "{name:?}: {catalog}");
+        let Some(info) = text.split("endobj").find(|o| o.contains("/Producer")) else {
+            unreachable!("no info dictionary in {text}");
+        };
+        assert!(!info.contains("/Title"), "{name:?}: {info}");
+        // The page's bookmark keeps its title.
+        assert!(text.contains(&format!("/Title {}", writer::pdf_text("1 Main"))));
+    }
+}
+
+#[test]
+fn a_padded_project_name_is_trimmed_in_the_reader_title() {
+    let mut project = Project::new("  Pump station  ");
+    project.pages.push(Page::new("p1", "1", "Main"));
+    let (pdf, _) = export(&project, &BTreeMap::new(), &Options::default());
+    let text = String::from_utf8_lossy(&pdf);
+    let Some(info) = text.split("endobj").find(|o| o.contains("/Producer")) else {
+        unreachable!("no info dictionary in {text}");
+    };
+    assert!(
+        info.contains(&format!("/Title {} /Producer", writer::pdf_text("Pump station"))),
+        "{info}"
+    );
+    assert!(!info.contains(&writer::pdf_text("  Pump station  ")), "{info}");
+}
+
+#[test]
 fn the_reader_title_bar_shows_the_project_name_not_the_file_name() {
     // One page, so there is a sheet to print (#833).
     let mut project = Project::new("Pump station");
@@ -3537,21 +3771,19 @@ fn document_properties_show_drawn_by_and_the_description() {
     project
         .meta
         .title_block
-        .insert("drawn_by".into(), "Kari Nordmann".into());
+        .insert("drawn_by".into(), "Сергей Иванов 日本".into());
     project
         .meta
         .title_block
         .insert("description".into(), "Pumpe – Ålesund".into());
     let dict = info(&project);
-    assert!(
-        dict.contains(&format!("/Author {}", writer::pdf_text_string("Kari Nordmann"))),
-        "{dict}"
-    );
-    let Some(at) = dict.find("/Subject ") else {
-        unreachable!("no subject in {dict}");
+    // Both entries decode back to the text as typed, independent of the encoder.
+    let entry = |key: &str| -> Option<String> {
+        let at = dict.find(key)?;
+        decode_text_string(dict[at + key.len()..].split_whitespace().next()?)
     };
-    let subject = dict[at + "/Subject ".len()..].split_whitespace().next().unwrap_or("");
-    assert_eq!(decode_text_string(subject).as_deref(), Some("Pumpe – Ålesund"));
+    assert_eq!(entry("/Author ").as_deref(), Some("Сергей Иванов 日本"), "{dict}");
+    assert_eq!(entry("/Subject ").as_deref(), Some("Pumpe – Ålesund"), "{dict}");
     // The title still comes first, next to the producer.
     assert!(dict.contains(&format!("/Title {} /Producer", writer::pdf_text("Pump station"))));
 

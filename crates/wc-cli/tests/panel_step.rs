@@ -56,3 +56,36 @@ fn devices_without_a_depth_are_named_in_a_warning() -> TestResult {
     assert!(out.exists());
     Ok(())
 }
+
+#[test]
+fn arrange_names_a_device_whose_part_copy_cannot_be_read() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    let lib = tmp.path().join("lib");
+    let mut part = wc_core::Part {
+        id: "maker.contactor".into(),
+        ..wc_core::Part::default()
+    };
+    part.properties.insert("Width".into(), "45 mm".into());
+    part.properties.insert("Height".into(), "85 mm".into());
+    wc_library::write_part(&lib, &part)?;
+    run(&dir, &["lib", "add", "shop", "folder", lib.to_str().ok_or("path")?])?;
+    run(&dir, &["device", "--part", "maker.contactor", "--", "-K1"])?;
+    run(&dir, &["panel", "new", "main"])?;
+    // The project's copy of the part is damaged, so -K1 cannot be sized or placed.
+    let copy = wc_core::store::vendor_path(&dir, wc_core::lock::ItemKind::Part, "maker.contactor")?;
+    assert!(copy.exists(), "{}", copy.display());
+    std::fs::write(&copy, "{ not json")?;
+
+    let (stdout, stderr) = run(&dir, &["panel", "arrange", "main"])?;
+    assert!(stdout.starts_with("placed 0 device(s)"), "{stdout}");
+    // It is not left out without a word: the warning names the part that cannot be read.
+    assert!(stderr.contains("warning: cannot read part maker.contactor"), "{stderr}");
+    Ok(())
+}
