@@ -4365,9 +4365,7 @@ fn import_cmd(dir: &Path, ic: ImportCmd, input: Option<Vec<u8>>) -> Res<()> {
         } => {
             let text = read_text(&file)?;
             let (mut s, warnings) = wc_import::svg::symbol_with_warnings(&text, &id, &name).map_err(e)?;
-            for w in &warnings {
-                eprintln!("warning: {}", escape_field(w));
-            }
+            warn(&warnings);
             s.category = category;
             s.letter_code = letter_code;
             let path = wc_library::write_symbol(&lib, &s).map_err(e)?;
