@@ -153,16 +153,16 @@ fn drawings(
                 let found = picture_bytes(options, &u.file, "underlay")
                     .map_err(|w| format!("page {}: {w}", page.number))
                     .and_then(|b| {
-                        checked(b)
-                            .map(|(mime, _)| (mime, b))
+                        crate::picture::underlay_rect(u)
+                            .and_then(|rect| checked(b).map(|(mime, _)| (mime, b, rect)))
                             .map_err(|why| format!("page {}: underlay {}: {why}", page.number, u.file))
                     });
                 match found {
-                    Ok((mime, b)) => pictures.push(Picture {
+                    Ok((mime, b, (min, max))) => pictures.push(Picture {
                         mime,
                         bytes: std::sync::Arc::new(b.clone()),
-                        min: (u.min.x.min(u.max.x), u.min.y.min(u.max.y)),
-                        max: (u.min.x.max(u.max.x), u.min.y.max(u.max.y)),
+                        min,
+                        max,
                         on_top: false,
                     }),
                     Err(w) => report.warnings.push(w),

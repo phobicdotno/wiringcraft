@@ -3807,3 +3807,45 @@ fn a_graphic_that_is_not_a_number_is_left_out_of_every_export() {
         assert_eq!(svg_of(&project), (clean_svg.clone(), clean_dxf.clone()), "{bad}");
     }
 }
+
+#[test]
+fn an_underlay_corner_that_is_not_a_number_leaves_the_underlay_out() {
+    let mut png = Vec::new();
+    let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(4, 2, image::Rgb([200, 30, 30])));
+    assert!(
+        img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .is_ok()
+    );
+    let mut underlays = BTreeMap::new();
+    underlays.insert("underlays/p1.png".to_string(), png);
+    let opts = Options {
+        underlays,
+        ..Default::default()
+    };
+    // `nan` and `inf` are valid TOML numbers, so a hand-edited project.toml can hold them.
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let mut project = Project::new("x");
+        let mut page = Page::new("p1", "1", "Scanned");
+        page.underlay = Some(wc_core::Underlay {
+            file: "underlays/p1.png".into(),
+            min: Point::new(0.0, bad),
+            max: Point::new(420.0, 297.0),
+        });
+        project.pages = vec![page];
+        let (pdf, report) = export(&project, &BTreeMap::new(), &opts);
+        let text = String::from_utf8_lossy(&pdf);
+        assert!(!text.contains("NaN") && !text.contains("inf"), "{bad}: {text}");
+        assert!(!text.contains("/Im0"), "{bad}: the underlay is left out");
+        assert_eq!(
+            report.warnings,
+            ["page 1: underlay underlays/p1.png: a corner of its rectangle is not a number, so it is left out"],
+            "{bad}"
+        );
+        let (pages, report) = page_drawings(&project, &BTreeMap::new(), &opts);
+        let Some(drawing) = pages.first() else {
+            unreachable!("the page is drawn")
+        };
+        assert!(!svg(drawing).contains("<image"), "{bad}: no underlay in the SVG");
+        assert_eq!(report.warnings.len(), 1, "{bad}: {:?}", report.warnings);
+    }
+}

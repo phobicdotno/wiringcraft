@@ -71,10 +71,28 @@ pub fn read_picture(dir: &Path, file: &str) -> Result<Option<Vec<u8>>, String> {
 
 /// A picture file as an image object placed over the underlay's rectangle.
 pub fn page_image(u: &Underlay, bytes: &[u8]) -> Result<PageImage, String> {
+    let (min, max) = underlay_rect(u)?;
     let mut img = decode(bytes)?;
-    img.min = (u.min.x.min(u.max.x), u.min.y.min(u.max.y));
-    img.max = (u.min.x.max(u.max.x), u.min.y.max(u.max.y));
+    img.min = min;
+    img.max = max;
     Ok(img)
+}
+
+/// A corner of a rectangle on the page, in millimetres.
+pub(crate) type Corner = (f64, f64);
+
+/// The rectangle an underlay covers (top-left and bottom-right, in millimetres), whichever
+/// way round its corners are stored. Refused when a corner is not a finite number: `nan` and
+/// `inf` are valid TOML numbers, so a hand-edited project.toml can hold them, and a PDF reader
+/// refuses a page that places a picture at `NaN`.
+pub(crate) fn underlay_rect(u: &Underlay) -> Result<(Corner, Corner), String> {
+    if ![u.min.x, u.min.y, u.max.x, u.max.y].iter().all(|v| v.is_finite()) {
+        return Err("a corner of its rectangle is not a number, so it is left out".into());
+    }
+    Ok((
+        (u.min.x.min(u.max.x), u.min.y.min(u.max.y)),
+        (u.min.x.max(u.max.x), u.min.y.max(u.max.y)),
+    ))
 }
 
 /// A picture file as an image object, not yet placed (`min` and `max` are zero).
