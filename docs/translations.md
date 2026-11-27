@@ -62,7 +62,9 @@ Open it with File, Translations.
 - "Only missing" hides the rows that already have every translation.
 - OK saves the changed cells to `translations.toml`. Translations changed in the file by
   another program while the form was open are kept, as long as you did not change the same
-  cell.
+  cell. This covers changes written before you press OK. The command line and the assistant
+  wait for the save, but a text editor does not: do not save the file in an editor at the
+  moment you press OK, or that edit can be lost.
 
 Undo and Redo take back and bring back translation edits made in the app or by its assistant.
 In a shared session only the host can change the translations.
@@ -120,8 +122,9 @@ warning: no translation for "Cover" (page 1 title)
 wrote out.pdf (1 pages)
 ```
 
-Run `wiringcraft translations --lang nb` first if a missing translation should stop the
-export.
+Run `wiringcraft translations --lang <code>` first, once for each language in the export
+(for `--lang nb,de`: `--lang nb`, then `--lang de`), if a missing translation should stop it.
+That check takes one language at a time; the drawn language always passes.
 
 `wiringcraft export wago-marking --lang` is a different option: it sets the language of the
 marker list's header row and type column (en, de, nb), not of the project's texts.
