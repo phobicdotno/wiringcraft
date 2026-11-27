@@ -2641,11 +2641,13 @@ fn run(mut cli: Cli) -> Res<()> {
                     );
                 }
                 PanelCmd::Arrange { id, location } => {
-                    let parts = vendored_parts(dir, &p);
                     let mut panels = std::mem::take(&mut p.panels);
                     let Some(panel) = panels.iter_mut().find(|x| x.id == id) else {
                         return Err(format!("no panel {id:?}"));
                     };
+                    // A device whose part copy cannot be read is left off the plate, so the
+                    // part is named in a warning rather than left out without a word.
+                    let parts = vendored_parts_warning_unreadable(dir, &p);
                     let done = wc_core::panel::arrange(panel, &p, &parts, location.as_deref());
                     p.panels = panels;
                     println!("placed {} device(s): {}", done.placed.len(), done.placed.join(", "));
@@ -2663,7 +2665,9 @@ fn run(mut cli: Cli) -> Res<()> {
                     let Some(panel) = p.panels.iter().find(|x| x.id == id) else {
                         return Err(format!("no panel {id:?}"));
                     };
-                    let parts = vendored_parts(dir, &p);
+                    // Warned about, so a part that cannot be read is not taken for one
+                    // without a depth.
+                    let parts = vendored_parts_warning_unreadable(dir, &p);
                     let step = wc_report::step::panel_step(&p, panel, &parts, &utc_now());
                     write_out(dir, &out, &step.text).map_err(e)?;
                     println!(
