@@ -157,6 +157,36 @@ fn turned_text_gets_a_text_matrix() {
 }
 
 #[test]
+fn text_without_a_positive_height_is_left_out() {
+    for height in [0.0, -3.0] {
+        let mut pen = crate::writer::Pen::new(297.0);
+        pen.text((100.0, 100.0), height, 0, "flat");
+        pen.text_at_angle((100.0, 100.0), height, 1, 90.0, "turned");
+        assert!(!pen.ops.contains("Tj"), "{height}: {}", pen.ops);
+        assert!(pen.prims.is_empty(), "{height}: {:?}", pen.prims);
+    }
+    // A hand-edited page text with a negative height is not printed upside down.
+    let mut project = Project::new("Heights");
+    let mut p1 = Page::new("p1", "1", "Notes");
+    p1.graphics.push(Shape::Text {
+        at: Point::new(120.0, 80.0),
+        text: "upside down".into(),
+        height: -3.0,
+        align: Default::default(),
+        angle: 0.0,
+    });
+    project.pages = vec![p1];
+    let (pdf, _) = export(&project, &BTreeMap::new(), &Options::default());
+    let hex = crate::writer::pdf_text("upside down");
+    assert!(!String::from_utf8_lossy(&pdf).contains(&hex));
+    let (pages, _) = page_drawings(&project, &BTreeMap::new(), &Options::default());
+    let Some(page) = pages.first() else {
+        unreachable!("one page drawn");
+    };
+    assert!(!svg(page).contains("upside down"));
+}
+
+#[test]
 fn pages_export_as_svg_and_dxf() {
     let mut project = Project::new("Pump & <station>");
     let mut p1 = Page::new("p1", "1", "Control");
