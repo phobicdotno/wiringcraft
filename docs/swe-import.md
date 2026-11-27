@@ -58,7 +58,10 @@ Each placed symbol keeps its connection points at their original positions. It i
 1. a library symbol, when a block's pins match a built-in one (coil A1/A2, contacts 13/14 and
    11/12, lamp X1/X2, terminal 1/2) and sit where the block's points are, or when your symbol
    map (`--symbol-map`) names one for the block. The symbol must be in the project or its
-   libraries;
+   libraries, and a mapped symbol must fit the block too: the same pin names and number of
+   pins, each pin where the block's point is (in one of the eight right-angle turns and
+   mirrors), and a terminal or interruption point only for a terminal or interruption point
+   block. A mapped symbol that does not fit is not used, and the block is drawn as below;
 2. otherwise, its block's DWG drawing from the archive;
 3. otherwise, a box with its connection points.
 
@@ -147,6 +150,9 @@ Without `--lib`, a symbol or part the project already has is replaced only when 
 still the one the project pins; a copy changed in the project is refused, not replaced. A copy
 with no entry in `library.lock` (put there by hand, or its entry lost) has no pin to compare
 with and is replaced whatever it holds, so keep a copy of such a file before importing.
+
+Both ways below replace the project's changed copy, so save your edits to it first (a copy of
+the file under `vendor/`, or a commit) if you want to keep them.
 
 To take a new version into a project whose copy was changed, import with `--lib` into a
 library folder and add that folder as a source with `lib add`. `lib add` puts the new source
