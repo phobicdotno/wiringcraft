@@ -1,4 +1,5 @@
-//! Symbols from KiCad symbol libraries (`.kicad_sym`, KiCad 6 and later).
+//! Symbols from KiCad symbol libraries (`.kicad_sym`, KiCad 6 and later, and old `.lib`
+//! libraries through [`crate::kicad_legacy`]).
 //!
 //! The file is an S-expression: `(kicad_symbol_lib (symbol "Name" (property ...) (symbol
 //! "Name_0_1" graphics...) (symbol "Name_1_1" pins...)) ...)`. Coordinates are millimetres with
@@ -137,16 +138,26 @@ pub fn symbols(text: &str, prefix: &str, scale: f64) -> Result<(Vec<Imported>, V
     if !(scale.is_finite() && scale > 0.0 && scale <= 100.0) {
         return Err(Error::Format(format!("scale {scale} must be above 0 and at most 100")));
     }
+    // An old `.lib` library (KiCad 5 and before) is read as the same symbols in the new format.
+    let mut warnings = Vec::new();
+    let converted;
+    let text = if crate::kicad_legacy::is_legacy(text) {
+        let (new, old_warnings) = crate::kicad_legacy::to_kicad_sym(text)?;
+        warnings.extend(old_warnings);
+        converted = new;
+        converted.as_str()
+    } else {
+        text
+    };
     let top = parse(text)?;
     let lib = top
         .iter()
         .find(|s| s.head() == Some("kicad_symbol_lib"))
         .ok_or_else(|| {
-            Error::Format("not a KiCad symbol library (KiCad 6 or later; old .lib files are not read)".into())
+            Error::Format("not a KiCad symbol library (.kicad_sym, or an old EESchema-LIBRARY .lib)".into())
         })?;
     let by_name: BTreeMap<&str, &Sexp> = lib.all("symbol").filter_map(|s| Some((s.arg(1)?, s))).collect();
     let mut out = Vec::new();
-    let mut warnings = Vec::new();
     let id_of = |name: &str| format!("{}.{}", prefix.trim_end_matches('.'), crate::id_segment(name));
     // Every source symbol's own id is taken first, so a unit of `Relay` (`relay_a`) never
     // replaces a symbol the library itself calls `Relay_A`.
@@ -230,7 +241,7 @@ pub fn symbols(text: &str, prefix: &str, scale: f64) -> Result<(Vec<Imported>, V
 }
 
 /// Most units read from one symbol; real parts stay far below (a quad gate has four).
-const MAX_UNITS: usize = 64;
+pub(crate) const MAX_UNITS: usize = 64;
 
 /// A sub-symbol's unit and body style from its name, `<base>_<unit>_<style>`.
 fn unit_and_style(unit: &Sexp, base: &str) -> (u32, u32) {
@@ -431,6 +442,14 @@ fn convert(
                     }
                     if length > 0.0 {
                         graphics.extend(pin_shapes(g, tip, inward, length, scale));
+                    }
+                    // A mark other than inverted or clock is drawn as a plain pin: said, not lost
+                    // silently (the connection point stays).
+                    if let Some(mark) = g
+                        .arg(2)
+                        .filter(|m| !matches!(*m, "line" | "inverted" | "clock" | "inverted_clock"))
+                    {
+                        *skipped.entry(format!("pin mark ({mark})")).or_default() += 1;
                     }
                     pins.push(Pin {
                         name: pin_name,
@@ -1427,7 +1446,10 @@ mod tests {
         assert!(symbols("(kicad_symbol_lib (symbol \"a", "k", 1.0).is_err());
         assert!(symbols(&"(".repeat(100_000), "k", 1.0).is_err());
         assert!(symbols("(kicad_symbol_lib)", "k", f64::NAN).is_err());
-        assert!(symbols("EESchema-LIBRARY Version 2.4", "k", 1.0).is_err());
+        // An old library is read (see `kicad_legacy`): an empty one has no symbols, and one cut
+        // short is an error.
+        assert!(symbols("EESchema-LIBRARY Version 2.4", "k", 1.0).is_ok_and(|(s, _)| s.is_empty()));
+        assert!(symbols("EESchema-LIBRARY Version 2.4\nDEF A U 0 40 Y Y 1 F N\n", "k", 1.0).is_err());
         // Nonsense numbers and empty symbols are skipped with a warning.
         let r = symbols(
             "(kicad_symbol_lib (symbol \"x\" (symbol \"x_0_1\" (pin (at nan inf 0)) (arc (start 0 0) (mid 1 1) (end 2 2)))))",
