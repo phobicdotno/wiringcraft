@@ -169,22 +169,32 @@ gives the details.
 - [docs/project-format.md](docs/project-format.md): the project folder format
 - [docs/library-format.md](docs/library-format.md): the library folder format
 - [docs/pdf-output.md](docs/pdf-output.md): what the exported PDF contains
+- [docs/drawing-export.md](docs/drawing-export.md): SVG and DXF drawing export
+- [docs/aml-export.md](docs/aml-export.md): what the AutomationML export writes
 - [docs/check-reference.md](docs/check-reference.md): every finding the project check can report
 - [docs/eplan-import.md](docs/eplan-import.md): what the EPLAN import reads and what it leaves out
+- [docs/drawing-import.md](docs/drawing-import.md): what the DXF, DWG, SVG and PDF imports take and leave out
+- [docs/swe-import.md](docs/swe-import.md): what the SolidWorks Electrical imports take and leave out
 - [docs/glossary.md](docs/glossary.md): the terms WiringCraft uses
 - [docs/device-tags.md](docs/device-tags.md): device tags, functions and locations
 - [docs/wires-and-potentials.md](docs/wires-and-potentials.md): wires, potentials and how connections are worked out
 - [docs/cross-references.md](docs/cross-references.md): how cross-references work
 - [docs/symbols.md](docs/symbols.md): symbols and the project's library copies
+- [docs/parts.md](docs/parts.md): parts, accessories and the parts list
+- [docs/macros-and-templates.md](docs/macros-and-templates.md): macros, base projects and the page template
+- [docs/panel-layouts.md](docs/panel-layouts.md): cabinet panel layouts: rails, ducts, devices and the P sheets
 - [docs/black-boxes.md](docs/black-boxes.md): black boxes
 - [docs/terminal-strips.md](docs/terminal-strips.md): terminal strips, levels and jumpers
 - [docs/cables.md](docs/cables.md): cables, cable types and cores
 - [docs/plc.md](docs/plc.md): PLC addresses, racks, cards and exports
+- [docs/networks.md](docs/networks.md): fieldbus networks and the topology pages
 - [docs/reports.md](docs/reports.md): every report and its columns
 - [docs/revisions.md](docs/revisions.md): drawing revisions, clouds and the revision table
 - [docs/versions.md](docs/versions.md): how versions, branches and merges work
 - [docs/translations.md](docs/translations.md): multilingual project texts
 - [docs/app-shortcuts.md](docs/app-shortcuts.md): every key and mouse gesture in the desktop app
+- [docs/app-window.md](docs/app-window.md): the desktop app's window: toolbar, ribbon, panels and status bar
+- [docs/app-menus.md](docs/app-menus.md): every menu and right-click menu of the desktop app
 - [docs/preferences.md](docs/preferences.md): the app preferences file
 - [docs/troubleshooting.md](docs/troubleshooting.md): common problems and what to do
 - [docs/assistant.md](docs/assistant.md): the assistant
