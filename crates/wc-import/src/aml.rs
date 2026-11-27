@@ -84,6 +84,14 @@ const TAG_ATTRIBUTES: [&str; 6] = [
     "BMK",
 ];
 
+/// CAEX class libraries: their elements describe classes, not the plant.
+const LIBRARIES: [&str; 4] = [
+    "SystemUnitClassLib",
+    "RoleClassLib",
+    "InterfaceClassLib",
+    "AttributeTypeLib",
+];
+
 #[derive(Default)]
 struct Elem {
     name: String,
@@ -100,6 +108,8 @@ pub fn parse(text: &str) -> Result<AmlImport> {
     // Attribute nesting: names of open <Attribute> elements and whether we are in <Value>.
     let mut attr_stack: Vec<String> = Vec::new();
     let mut in_value = false;
+    // The text of the open <Value>, in pieces: plain text and CDATA sections.
+    let mut value = String::new();
     let mut raw_links: Vec<(String, String, String)> = Vec::new();
     let mut iface_index: BTreeMap<String, (usize, String)> = BTreeMap::new();
     let mut elem_ids: BTreeMap<String, usize> = BTreeMap::new();
@@ -119,6 +129,8 @@ pub fn parse(text: &str) -> Result<AmlImport> {
         }
     };
     let mut seen_caex = false;
+    // Depth inside class libraries: their elements are templates, not part of the plant.
+    let mut in_lib = 0usize;
     let mut events = 0usize;
     loop {
         events += 1;
@@ -132,6 +144,12 @@ pub fn parse(text: &str) -> Result<AmlImport> {
             Event::Start(ref e) | Event::Empty(ref e) => {
                 let empty = matches!(ev, Event::Empty(_));
                 let tag = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
+                if LIBRARIES.contains(&tag.as_str()) || in_lib > 0 {
+                    if !empty && LIBRARIES.contains(&tag.as_str()) {
+                        in_lib += 1;
+                    }
+                    continue;
+                }
                 match tag.as_str() {
                     "CAEXFile" => seen_caex = true,
                     "InternalElement" => {
@@ -159,7 +177,10 @@ pub fn parse(text: &str) -> Result<AmlImport> {
                         }
                     }
                     "Attribute" if !empty => attr_stack.push(attr(e, "Name").unwrap_or_default()),
-                    "Value" if !empty => in_value = true,
+                    "Value" if !empty => {
+                        in_value = true;
+                        value.clear();
+                    }
                     "InternalLink" => raw_links.push((
                         attr(e, "Name").unwrap_or_default(),
                         attr(e, "RefPartnerSideA").unwrap_or_default(),
@@ -169,19 +190,22 @@ pub fn parse(text: &str) -> Result<AmlImport> {
                 }
             }
             Event::Text(t) if in_value => {
-                let v = t.unescape().map(|s| s.trim().to_owned()).unwrap_or_default();
-                let interface = attr_stack.iter().any(|a| a == "\u{0}interface");
-                if let (Some(name), Some(top), false) = (attr_stack.last(), stack.last_mut(), interface)
-                    && !v.is_empty()
-                {
-                    // Nested attributes become dotted names.
-                    let full: Vec<&str> = attr_stack.iter().map(String::as_str).collect();
-                    let key = if full.len() > 1 { full.join(".") } else { name.clone() };
-                    top.attributes.insert(key, v);
+                // A value inside an interface is never kept, so a piece of it that cannot be read
+                // does not stop the import; one that is kept must be read whole.
+                if !attr_stack.iter().any(|a| a == "\u{0}interface") {
+                    let t = t.unescape().map_err(|e| Error::Format(format!("AutomationML: {e}")))?;
+                    value.push_str(&t);
                 }
             }
+            Event::CData(t) if in_value => value.push_str(&String::from_utf8_lossy(&t)),
             Event::End(e) => {
                 let tag = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
+                if in_lib > 0 {
+                    if LIBRARIES.contains(&tag.as_str()) {
+                        in_lib -= 1;
+                    }
+                    continue;
+                }
                 match tag.as_str() {
                     "InternalElement" => {
                         if let Some(el) = stack.pop() {
@@ -193,7 +217,19 @@ pub fn parse(text: &str) -> Result<AmlImport> {
                     "ExternalInterface" | "Attribute" => {
                         attr_stack.pop();
                     }
-                    "Value" => in_value = false,
+                    "Value" if in_value => {
+                        in_value = false;
+                        let v = value.trim().to_owned();
+                        let interface = attr_stack.iter().any(|a| a == "\u{0}interface");
+                        if let (Some(name), Some(top), false) = (attr_stack.last(), stack.last_mut(), interface)
+                            && !v.is_empty()
+                        {
+                            // Nested attributes become dotted names.
+                            let full: Vec<&str> = attr_stack.iter().map(String::as_str).collect();
+                            let key = if full.len() > 1 { full.join(".") } else { name.clone() };
+                            top.attributes.insert(key, v);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -238,8 +274,14 @@ pub fn parse(text: &str) -> Result<AmlImport> {
         }
         let idx = out.devices.len();
         elem_ids.insert(el.id.clone(), idx);
-        let mut names = Vec::new();
+        let mut names: Vec<String> = Vec::new();
         for (id, name) in &el.interfaces {
+            // A repeated name gets a mark, as its pin does, so a link to the second `PE` by its
+            // ID ends on that pin, not on the first `PE`.
+            let mut name = name.clone();
+            while names.contains(&name) {
+                name.push('\'');
+            }
             if !id.is_empty() {
                 iface_index.insert(id.clone(), (idx, name.clone()));
             }
@@ -387,12 +429,20 @@ pub struct Section {
 pub fn device_entry(d: &AmlDevice, parts: &mut Vec<wc_core::Part>) -> Option<(DeviceTag, Device)> {
     let tag = d.tag.clone()?;
     let (manufacturer, order) = part_fields(&d.properties);
+    // Our own export writes the part's description as `PartDescription`.
+    let explicit = |props: &BTreeMap<String, String>| {
+        props
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("PartDescription"))
+            .map(|(k, v)| (k.clone(), v.clone()))
+    };
+    let given = explicit(&d.properties);
     let part = order.map(|o| {
         let p = wc_core::Part {
             id: wc_core::Part::make_id(manufacturer.as_deref().unwrap_or(""), &o),
             manufacturer: manufacturer.unwrap_or_default(),
             order_number: o,
-            description: d.name.clone(),
+            description: given.as_ref().map_or_else(|| d.name.clone(), |(_, v)| v.clone()),
             symbol: None,
             properties: d.properties.clone(),
             contacts: None,
@@ -400,8 +450,16 @@ pub fn device_entry(d: &AmlDevice, parts: &mut Vec<wc_core::Part>) -> Option<(De
             model: None,
         };
         let id = p.id.clone();
-        if !parts.iter().any(|q| q.id == id) {
-            parts.push(p);
+        match parts.iter_mut().find(|q| q.id == id) {
+            // A part met before with only the element name as its description takes the first
+            // `PartDescription` a later device gives it.
+            Some(q) => {
+                if let Some((k, v)) = given.filter(|_| explicit(&q.properties).is_none()) {
+                    q.description = v.clone();
+                    q.properties.insert(k, v);
+                }
+            }
+            None => parts.push(p),
         }
         id
     });
@@ -666,6 +724,41 @@ mod tests {
     }
 
     #[test]
+    fn link_to_a_repeated_connection_point_name_ends_on_its_own_pin() -> Result<()> {
+        let aml = r#"<CAEXFile><InstanceHierarchy Name="P">
+  <InternalElement Name="M1" ID="e1">
+    <ExternalInterface Name="PE" ID="i1"/>
+    <ExternalInterface Name="PE" ID="i2"/>
+  </InternalElement>
+  <InternalElement Name="X1" ID="e2">
+    <ExternalInterface Name="1" ID="i3"/>
+    <ExternalInterface Name="2" ID="i4"/>
+  </InternalElement>
+  <InternalLink Name="a" RefPartnerSideA="i1" RefPartnerSideB="i3"/>
+  <InternalLink Name="b" RefPartnerSideA="i2" RefPartnerSideB="i4"/>
+</InstanceHierarchy></CAEXFile>"#;
+        let imp = parse(aml)?;
+        assert_eq!(imp.links[1].a, (0, "PE'".to_string()));
+        let b = build(&imp, 1);
+        let ends: Vec<(String, String)> = b.pages[0]
+            .wires
+            .iter()
+            .filter_map(|w| match (&w.from, &w.to) {
+                (Endpoint::Pin { pin: a, .. }, Endpoint::Pin { pin: z, .. }) => Some((a.clone(), z.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ends,
+            [
+                ("PE".to_string(), "1".to_string()),
+                ("PE'".to_string(), "2".to_string())
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn hostile() {
         assert!(parse("").is_err());
         assert!(parse("<html/>").is_err());
@@ -728,6 +821,7 @@ mod tests {
             id: "acme.r24".into(),
             manufacturer: "Acme".into(),
             order_number: "R-24".into(),
+            description: "Relay 24 V".into(),
             ..Default::default()
         };
         project.devices.insert(
@@ -765,6 +859,7 @@ mod tests {
             (parts_out[0].manufacturer.as_str(), parts_out[0].order_number.as_str()),
             ("Acme", "R-24")
         );
+        assert_eq!(parts_out[0].description, "Relay 24 V");
         assert_eq!(imp.links.len(), 1);
         let l = &imp.links[0];
         assert_eq!(l.name, "L+");
@@ -773,6 +868,60 @@ mod tests {
             (imp.devices[l.b.0].name.as_str(), l.b.1.as_str()),
         ];
         assert_eq!(ends, [("=A-K1", "14"), ("=A-P1", "X1")]);
+        Ok(())
+    }
+
+    #[test]
+    fn part_description_is_matched_in_any_letter_case() -> Result<()> {
+        let d = AmlDevice {
+            name: "=A-K1".into(),
+            tag: Some(DeviceTag::parse("=A-K1").map_err(|_| Error::Format("tag".into()))?),
+            properties: [
+                ("OrderNumber".to_string(), "R-24".to_string()),
+                ("partdescription".to_string(), "Relay 24 V".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let mut parts = Vec::new();
+        device_entry(&d, &mut parts).ok_or_else(|| Error::Format("no device".into()))?;
+        let Some(part) = parts.first() else {
+            unreachable!("the device names an order number")
+        };
+        assert_eq!(part.description, "Relay 24 V");
+        Ok(())
+    }
+
+    #[test]
+    fn shared_part_takes_the_first_part_description_given() -> Result<()> {
+        let device = |tag: &str, description: Option<&str>| -> Result<AmlDevice> {
+            let mut properties: BTreeMap<String, String> = [
+                ("Manufacturer".to_string(), "Acme".to_string()),
+                ("OrderNumber".to_string(), "R-24".to_string()),
+            ]
+            .into_iter()
+            .collect();
+            if let Some(text) = description {
+                properties.insert("PartDescription".into(), text.into());
+            }
+            Ok(AmlDevice {
+                name: tag.into(),
+                tag: Some(DeviceTag::parse(tag).map_err(|_| Error::Format(tag.into()))?),
+                properties,
+                ..Default::default()
+            })
+        };
+        let mut parts = Vec::new();
+        for d in [
+            device("=A-K1", None)?,
+            device("=A-K2", Some("Relay 24 V"))?,
+            device("=A-K3", Some("Other text"))?,
+        ] {
+            device_entry(&d, &mut parts).ok_or_else(|| Error::Format("no device".into()))?;
+        }
+        let descriptions: Vec<&str> = parts.iter().map(|p| p.description.as_str()).collect();
+        assert_eq!(descriptions, ["Relay 24 V"]);
         Ok(())
     }
 
@@ -828,6 +977,84 @@ mod tests {
                 .any(|w| w.contains("+L9-K2") && w.contains("not a location")),
             "{:?}",
             imp.warnings
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn class_libraries_are_not_devices() -> Result<()> {
+        // A system unit class may hold template elements with connection points; only the
+        // instance hierarchy gives devices, links and locations.
+        let text = r#"<CAEXFile>
+  <InterfaceClassLib Name="I"><InterfaceClass Name="Terminal"/></InterfaceClassLib>
+  <SystemUnitClassLib Name="Lib">
+    <SystemUnitClass Name="Relay">
+      <InternalElement Name="Coil" ID="t1">
+        <ExternalInterface Name="A1" ID="ti1"/>
+        <ExternalInterface Name="A2" ID="ti2"/>
+      </InternalElement>
+      <InternalElement Name="+L8" ID="t2"/>
+      <InternalLink Name="t" RefPartnerSideA="ti1" RefPartnerSideB="ti2"/>
+    </SystemUnitClass>
+  </SystemUnitClassLib>
+  <InstanceHierarchy Name="H">
+    <InternalElement Name="K1" ID="e1"><ExternalInterface Name="A1" ID="i1"/></InternalElement>
+  </InstanceHierarchy>
+</CAEXFile>"#;
+        let imp = parse(text)?;
+        let names: Vec<&str> = imp.devices.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["K1"]);
+        assert!(imp.links.is_empty(), "{:?}", imp.links);
+        assert!(imp.locations.is_empty(), "{:?}", imp.locations);
+        assert!(imp.warnings.is_empty(), "{:?}", imp.warnings);
+        Ok(())
+    }
+
+    #[test]
+    fn value_in_cdata_or_split_by_a_comment_is_read_whole() -> Result<()> {
+        let aml = r#"<CAEXFile><InstanceHierarchy Name="P">
+  <InternalElement Name="K1" ID="e1">
+    <Attribute Name="Manufacturer"><Value>ACME</Value></Attribute>
+    <Attribute Name="OrderNumber"><Value><![CDATA[R-24 <special>]]></Value></Attribute>
+    <Attribute Name="Voltage"><Value>24 V<!-- note --> DC</Value></Attribute>
+    <ExternalInterface Name="A1" ID="i1"/>
+  </InternalElement>
+</InstanceHierarchy></CAEXFile>"#;
+        let imp = parse(aml)?;
+        let props = &imp.devices[0].properties;
+        assert_eq!(props.get("OrderNumber").map(String::as_str), Some("R-24 <special>"));
+        assert_eq!(props.get("Voltage").map(String::as_str), Some("24 V DC"));
+        assert_eq!(build(&imp, 1).parts.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn value_with_a_bad_entity_between_cdata_pieces_is_refused_not_cut_short() {
+        let aml = r#"<CAEXFile><InstanceHierarchy Name="P">
+  <InternalElement Name="K1" ID="e1">
+    <Attribute Name="OrderNumber"><Value><![CDATA[R-]]>&unknown;<![CDATA[24]]></Value></Attribute>
+  </InternalElement>
+</InstanceHierarchy></CAEXFile>"#;
+        let res = parse(aml);
+        assert!(
+            matches!(&res, Err(Error::Format(msg)) if msg.starts_with("AutomationML:")),
+            "a broken value must be refused, got {:?}",
+            res.map(|imp| imp.devices.first().map(|d| d.properties.clone()))
+        );
+    }
+
+    #[test]
+    fn a_bad_entity_in_an_interface_value_does_not_stop_the_import() -> Result<()> {
+        let aml = r#"<CAEXFile><InstanceHierarchy Name="P">
+  <InternalElement Name="K1" ID="e1">
+    <Attribute Name="Manufacturer"><Value>ACME</Value></Attribute>
+    <ExternalInterface Name="A1" ID="i1"><Attribute Name="Note"><Value>&unknown;</Value></Attribute></ExternalInterface>
+  </InternalElement>
+</InstanceHierarchy></CAEXFile>"#;
+        let imp = parse(aml)?;
+        assert_eq!(
+            imp.devices[0].properties.get("Manufacturer").map(String::as_str),
+            Some("ACME")
         );
         Ok(())
     }

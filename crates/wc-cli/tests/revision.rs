@@ -28,7 +28,7 @@ fn revisions_clouds_and_the_table_are_kept_in_the_project() -> TestResult {
         .arg("--no-git")
         .status()?;
     assert!(status.success());
-    wiringcraft(&dir, &["page", "add", "p1", "--number", "1"])?;
+    wiringcraft(&dir, &["page", "add", "p1", "--number", "2"])?;
 
     assert!(
         wiringcraft(&dir, &["revision", "cloud", "p1", "10", "10", "50", "40"]).is_err(),
@@ -101,7 +101,7 @@ fn revision_list_escapes_control_characters_from_the_project_file() -> TestResul
     std::fs::write(&file, text)?;
 
     // A cloud whose revision a hand edit filled with control characters.
-    wiringcraft(&dir, &["page", "add", "p1", "--number", "1"])?;
+    wiringcraft(&dir, &["page", "add", "p1", "--number", "2"])?;
     wiringcraft(&dir, &["revision", "cloud", "p1", "10", "10", "50", "40"])?;
     let page = dir.join("pages").join("p1.page.json");
     let json = std::fs::read_to_string(&page)?;
@@ -142,7 +142,7 @@ fn revision_list_escapes_a_page_id_from_a_hand_made_file_name() -> TestResult {
         .arg("--no-git")
         .status()?;
     assert!(status.success());
-    wiringcraft(&dir, &["page", "add", "p1", "--number", "1"])?;
+    wiringcraft(&dir, &["page", "add", "p1", "--number", "2"])?;
     wiringcraft(&dir, &["revision", "add", "A"])?;
     wiringcraft(&dir, &["revision", "cloud", "p1", "10", "10", "50", "40"])?;
     wiringcraft(&dir, &["revision", "table", "p1", "200", "20"])?;
@@ -159,5 +159,46 @@ fn revision_list_escapes_a_page_id_from_a_hand_made_file_name() -> TestResult {
     assert!(!list.contains('\u{1b}'), "no raw ESC: {list:?}");
     assert!(list.contains("page p\\u{1b}[2J cloud 0: revision A"), "{list:?}");
     assert!(list.contains("page p\\u{1b}[2J table at 200.0,20.0"), "{list:?}");
+    Ok(())
+}
+
+#[test]
+fn uncloud_says_when_no_cloud_has_the_revision_and_takes_the_letter_as_cloud_does() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("p");
+    let status = Command::new(env!("CARGO_BIN_EXE_wiringcraft"))
+        .arg("new")
+        .arg(&dir)
+        .arg("--no-git")
+        .status()?;
+    assert!(status.success());
+    wiringcraft(&dir, &["page", "add", "p1", "--number", "2"])?;
+    wiringcraft(&dir, &["revision", "add", "A 1"])?;
+    // Typed with a no-break space, as `revision cloud` and `revision remove` take it.
+    wiringcraft(
+        &dir,
+        &["revision", "cloud", "p1", "10", "10", "50", "40", "--rev", "A\u{a0}1"],
+    )?;
+
+    let Err(err) = wiringcraft(&dir, &["revision", "uncloud", "p1", "--rev", "Z"]) else {
+        unreachable!("no cloud carries Z");
+    };
+    assert!(err.contains("page \"p1\" has no cloud of revision Z"), "{err}");
+    let Err(err) = wiringcraft(&dir, &["revision", "uncloud", "p1"]) else {
+        unreachable!("neither an index nor --rev");
+    };
+    assert!(
+        err.contains("give a cloud's index or --rev") && !err.contains("not both"),
+        "{err}"
+    );
+    let Err(err) = wiringcraft(&dir, &["revision", "uncloud", "p1", "0", "--rev", "A 1"]) else {
+        unreachable!("both an index and --rev");
+    };
+    assert!(err.contains("not both"), "{err}");
+    assert!(wiringcraft(&dir, &["revision", "list"])?.contains("cloud 0"));
+
+    wiringcraft(&dir, &["revision", "uncloud", "p1", "--rev", "A\u{a0}1"])?;
+    let list = wiringcraft(&dir, &["revision", "list"])?;
+    assert!(!list.contains("cloud"), "{list}");
     Ok(())
 }

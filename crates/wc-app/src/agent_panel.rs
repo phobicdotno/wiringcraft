@@ -359,6 +359,7 @@ impl App {
                     .desired_rows(3)
                     .desired_width(f32::INFINITY);
                 let r = ui.add_enabled(!busy, edit);
+                self.assistant.input_id = Some(r.id);
                 // Ctrl+V with a picture on the clipboard: the toolkit only pastes text, so the
                 // key's release is the sign to look for a picture.
                 let paste = r.has_focus() && ui.input(|i| paste_released(&i.events));

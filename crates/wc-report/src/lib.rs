@@ -669,16 +669,40 @@ pub fn location_list(i: &Inputs<'_>) -> Table {
     for tag in all_tags(i).iter().filter(|t| !t.location.is_empty()) {
         *count.entry(tag.location.join(".")).or_default() += 1;
     }
+    // One row per location as the project means it: a path stored as typed (`+L1`) is the
+    // same location as `L1`, so entries with one normal form share a row, where the first of
+    // them is, with the first description that is not empty. A path that is not a location
+    // keeps its row as stored, with the reason in the note.
+    let mut rows: Vec<(String, String, String)> = Vec::new();
     for l in &i.project.meta.locations {
-        let n = count.remove(&l.path).unwrap_or(0);
-        t.rows.push(vec![
-            format!("+{}", l.path),
-            l.description.clone(),
-            n.to_string(),
-            String::new(),
-        ]);
+        let (path, note) = match wc_core::project::location_path(&l.path) {
+            Ok(path) => (path, String::new()),
+            Err(why) => {
+                let raw = l.path.trim();
+                (raw.strip_prefix('+').unwrap_or(raw).to_owned(), why)
+            }
+        };
+        match rows
+            .iter_mut()
+            .find(|(p, n, _)| *p == path && n.is_empty() && note.is_empty())
+        {
+            Some((_, _, description)) if description.is_empty() => description.clone_from(&l.description),
+            Some(_) => {}
+            None => rows.push((path, note, l.description.clone())),
+        }
     }
-    for (path, n) in count {
+    for (path, note, description) in rows {
+        let n = if note.is_empty() {
+            count.remove(&path).unwrap_or(0)
+        } else {
+            0
+        };
+        t.rows.push(vec![format!("+{path}"), description, n.to_string(), note]);
+    }
+    // Unlisted locations with numbers by value (`+L2` before `+L10`), like the other reports.
+    let mut unlisted: Vec<(String, usize)> = count.into_iter().collect();
+    unlisted.sort_by_cached_key(|(path, _)| natural_key(path));
+    for (path, n) in unlisted {
         t.rows.push(vec![
             format!("+{path}"),
             String::new(),
@@ -694,6 +718,9 @@ pub use wc_core::project::natural_key;
 /// Every device tag in the project: drawn ones and ones only listed in `devices.json`.
 /// Every real device: tags drawn on pages or listed in the devices file. Interruption points
 /// carry tags too, but they only name a connection, so a tag used by nothing else is left out.
+/// A cable is a device as well, also when it is only named as the cable of wire cores and has
+/// no symbol and no entry in the devices file yet. Wires on overview pages (`Page::overview`)
+/// do not count: an overview draws the schematic's connections again.
 fn all_tags(i: &Inputs<'_>) -> BTreeSet<DeviceTag> {
     let p = i.project;
     let index = p.tag_index();
@@ -708,12 +735,20 @@ fn all_tags(i: &Inputs<'_>) -> BTreeSet<DeviceTag> {
                 })
         })
     };
-    index
+    let mut tags: BTreeSet<DeviceTag> = index
         .keys()
         .cloned()
         .chain(p.devices.keys().cloned())
         .filter(|t| !only_links(t))
-        .collect()
+        .collect();
+    tags.extend(
+        p.pages
+            .iter()
+            .filter(|pg| !pg.overview)
+            .flat_map(|pg| pg.wires.iter())
+            .filter_map(|w| w.cable.as_ref().map(|c| c.cable.clone())),
+    );
+    tags
 }
 
 /// Page numbers where a tag is drawn, as `2, 3`.
@@ -728,8 +763,9 @@ fn pages_of(p: &Project, uses: &[(String, String)]) -> String {
 }
 
 /// Parts list (bill of materials): one row per part, with quantity and the devices using it.
-/// A device's accessories count with their quantity. Devices without any part come last so the
-/// gaps are visible.
+/// A device's accessories count with their quantity. A device that terminals tagged with only
+/// their strip are drawn as (`-X2`) counts its part once per terminal. Devices without any part
+/// come last so the gaps are visible. Tags are sorted with numbers by value (`-K2` before `-K10`).
 pub fn parts_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new(
         "Parts list",
@@ -737,11 +773,35 @@ pub fn parts_list(i: &Inputs<'_>) -> Table {
     );
     let mut by_part: BTreeMap<String, (u64, Vec<DeviceTag>)> = BTreeMap::new();
     let mut without: Vec<DeviceTag> = Vec::new();
+    // Terminals tagged with only their strip (`-X2`) are each a terminal of the strip device's
+    // part, as in the WAGO configurator: that part counts once per terminal number.
+    let mut strip_terminals: BTreeMap<DeviceTag, BTreeSet<String>> = BTreeMap::new();
+    let numbers = wc_core::project::terminal_numbers(i.project, |id| i.symbols.get(id).map(|s| s.role));
+    for ((page, item), (strip, number)) in numbers {
+        let drawn_as_strip = i
+            .project
+            .page(&page)
+            .and_then(|pg| pg.symbol(&item))
+            .and_then(|s| s.tag.as_ref())
+            .is_some_and(|t| *t == strip);
+        if drawn_as_strip {
+            strip_terminals.entry(strip).or_default().insert(number);
+        }
+    }
     for tag in all_tags(i) {
-        let parts = i.project.devices.get(&tag).map(|d| d.all_parts()).unwrap_or_default();
+        let Some(device) = i.project.devices.get(&tag) else {
+            without.push(tag);
+            continue;
+        };
+        let mut parts = device.all_parts();
         if parts.is_empty() {
             without.push(tag);
             continue;
+        }
+        if device.part.is_some()
+            && let (Some(main), Some(terminals)) = (parts.first_mut(), strip_terminals.get(&tag))
+        {
+            main.1 = u32::try_from(terminals.len()).unwrap_or(u32::MAX).max(1);
         }
         for (part, qty) in parts {
             let (n, tags) = by_part.entry(part.to_owned()).or_default();
@@ -761,6 +821,10 @@ pub fn parts_list(i: &Inputs<'_>) -> Table {
             }
         }
     }
+    for (_, tags) in by_part.values_mut() {
+        tags.sort_by_cached_key(|t| natural_key(&t.to_string()));
+    }
+    without.sort_by_cached_key(|t| natural_key(&t.to_string()));
     let mut pos = 0;
     for (part_id, (qty, tags)) in &by_part {
         pos += 1;
@@ -788,11 +852,14 @@ pub fn parts_list(i: &Inputs<'_>) -> Table {
     t
 }
 
-/// Device list: every tag with its description, part and the pages it appears on.
+/// Device list: every tag with its description, part and the pages it appears on, with
+/// numbers sorted by value (`-K2` before `-K10`).
 pub fn device_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new("Device list", &["Device", "Description", "Part", "Symbols", "Pages"]);
     let index = i.project.tag_index();
-    for tag in all_tags(i) {
+    let mut tags: Vec<DeviceTag> = all_tags(i).into_iter().collect();
+    tags.sort_by_cached_key(|t| natural_key(&t.to_string()));
+    for tag in tags {
         let dev = i.project.devices.get(&tag);
         let uses = index.get(&tag).map(Vec::as_slice).unwrap_or(&[]);
         let symbols: BTreeSet<String> = uses
@@ -814,6 +881,33 @@ pub fn device_list(i: &Inputs<'_>) -> Table {
         ]);
     }
     t
+}
+
+/// The names of the pins a terminal or PLC point is wired to, sorted, each once. Interruption
+/// points are left out: they only mark where the connection goes on to another page, and the
+/// nets already join across pages, so the device on the other page is in the list. Only when the
+/// pins reach nothing but interruption points are those named, so the cell still says where
+/// the connection goes.
+fn connected_labels<'a>(i: &Inputs<'_>, pins: impl Iterator<Item = &'a PinRef>) -> Vec<String> {
+    let mut devices: BTreeSet<String> = BTreeSet::new();
+    let mut breaks: BTreeSet<String> = BTreeSet::new();
+    for (pg, item, pin) in pins {
+        let interruption = i
+            .project
+            .page(pg)
+            .and_then(|p| p.symbol(item))
+            .and_then(|s| i.symbols.get(&s.symbol))
+            .is_some_and(|y| y.role == SymbolRole::Interruption);
+        let label = pin_label(i.project, pg, item, pin);
+        if interruption {
+            breaks.insert(label);
+        } else {
+            devices.insert(label);
+        }
+    }
+    let mut v: Vec<String> = if devices.is_empty() { breaks } else { devices }.into_iter().collect();
+    v.sort_by_key(|s| natural_key(s));
+    v
 }
 
 /// How a pin is named in reports: `=A+B-K1:13`, or `page 3 s4:13` for an untagged symbol.
@@ -894,20 +988,25 @@ pub fn wire_list(i: &Inputs<'_>) -> Table {
             "Type",
         ],
     );
-    let (_, net_of) = net_names(i);
+    // The net of each wire itself, so a wire between two junction points, which has no pin end,
+    // still shows its net's name.
+    let (nets, net_of) = connectivity::wire_nets_by_place(i.project, |id| i.symbols.get(id).map(|s| s.role));
+    let names: Vec<String> = nets
+        .iter()
+        .zip(auto_net_names(i, &nets))
+        .map(|(net, auto)| net.names.first().cloned().unwrap_or(auto))
+        .collect();
     // An overview (line diagram) draws connections again; the list shows each wire once.
-    for page in i.project.pages.iter().filter(|pg| !pg.overview) {
-        for w in &page.wires {
+    for (pi, page) in i.project.pages.iter().enumerate().filter(|(_, pg)| !pg.overview) {
+        for (wi, w) in page.wires.iter().enumerate() {
             let end = |e: &Endpoint| match e {
                 Endpoint::Pin { item, pin } => pin_label(i.project, &page.id, item, pin),
                 Endpoint::Point { at } => format!("junction {:.1},{:.1}", at.x, at.y),
             };
-            let potential = w.potential.clone().or_else(|| {
-                [&w.from, &w.to].into_iter().find_map(|e| match e {
-                    Endpoint::Pin { item, pin } => net_of.get(&(page.id.clone(), item.clone(), pin.clone())).cloned(),
-                    Endpoint::Point { .. } => None,
-                })
-            });
+            let potential = w
+                .potential
+                .clone()
+                .or_else(|| net_of.get(&(pi, wi)).and_then(|n| names.get(*n)).cloned());
             t.push_linked(
                 vec![
                     page.number.clone(),
@@ -938,7 +1037,8 @@ fn cable_core_label(c: &wc_core::CableCore) -> String {
 /// Cable list: every cable with its type, then one row per core with the wire's two ends. Each
 /// row links to the page its core is drawn on ([`Table::row_pages`]). Overview pages
 /// (`Page::overview`) are skipped, because an overview draws the schematic's connections again
-/// and would list each core twice.
+/// and would list each core twice. A cable of the devices file with no cores drawn yet (`-W5`,
+/// named by the cable letter code) gets one row of its own with empty core cells.
 pub fn cable_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new(
         "Cable list",
@@ -964,18 +1064,45 @@ pub fn cable_list(i: &Inputs<'_>) -> Table {
             ));
         }
     }
+    // Cables listed before their cores are drawn, told from terminals named like a cable
+    // (`-X1.W1`) as the marking list does: a terminal on the rail is no cable. A tag drawn on a
+    // schematic page with a symbol of known role is a cable when that role is not a terminal
+    // (`-A1.WD3`); one not drawn so is a terminal when it has a terminal level.
+    let (_, on_rail) = marking::terminal_tags(i);
+    let drawn_with_role: BTreeSet<&DeviceTag> = i
+        .project
+        .pages
+        .iter()
+        .filter(|pg| !pg.overview)
+        .flat_map(|pg| &pg.symbols)
+        .filter(|s| i.symbols.contains_key(&s.symbol))
+        .filter_map(|s| s.tag.as_ref())
+        .collect();
+    for tag in i.project.devices.keys() {
+        let terminal = on_rail.contains(tag) || (!drawn_with_role.contains(tag) && counts_as_terminal(None, Some(tag)));
+        if !terminal && marking::is_cable_tag(tag) {
+            cores.entry(tag.clone()).or_default();
+        }
+    }
+    // Numbers by value (`-W2` before `-W10`), as the device list.
+    let mut cores: Vec<(DeviceTag, Vec<Core>)> = cores.into_iter().collect();
+    cores.sort_by_cached_key(|(tag, _)| natural_key(&tag.to_string()));
     for (cable, mut list) in cores {
+        if list.is_empty() {
+            list.push(Default::default());
+        }
         list.sort_by_key(|a| natural_key(&a.0));
         let device = i.project.devices.get(&cable);
-        let part = device.and_then(|d| d.part.as_ref()).and_then(|id| i.parts.get(id));
-        let kind = part
-            .map(|p| {
-                [p.manufacturer.as_str(), p.order_number.as_str()]
-                    .join(" ")
-                    .trim()
-                    .to_owned()
-            })
-            .unwrap_or_default();
+        let part_id = device.and_then(|d| d.part.as_ref());
+        let part = part_id.and_then(|id| i.parts.get(id));
+        // A part not in the library copy is still named by its id, as in the parts list.
+        let kind = match part {
+            Some(p) => [p.manufacturer.as_str(), p.order_number.as_str()]
+                .join(" ")
+                .trim()
+                .to_owned(),
+            None => part_id.cloned().unwrap_or_default(),
+        };
         let description = device
             .map(|d| d.description.clone())
             .filter(|d| !d.is_empty())
@@ -1000,10 +1127,23 @@ pub fn cable_list(i: &Inputs<'_>) -> Table {
     t
 }
 
-/// Net list: each electrically connected group of pins, across pages.
+/// Net list: each electrically connected group of pins, across pages. Overview pages
+/// (`Page::overview`) are skipped, because an overview draws the schematic's connections again
+/// and would list each net and pin twice. Interruption points are left out of the pins: they only
+/// name the connection to another page, so a net drawn on two pages does not list its
+/// interruption point once per page.
 pub fn net_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new("Net list", &["Net", "Pins", "Connections"]);
-    let nets = connectivity::nets_linked(i.project, |id| i.symbols.get(id).map(|s| s.role));
+    let schematic;
+    let project = if i.project.pages.iter().any(|pg| pg.overview) {
+        let mut p = i.project.clone();
+        p.pages.retain(|pg| !pg.overview);
+        schematic = p;
+        &schematic
+    } else {
+        i.project
+    };
+    let nets = connectivity::nets_linked(project, |id| i.symbols.get(id).map(|s| s.role));
     let auto = auto_net_names(i, &nets);
     let mut rows: Vec<(String, Vec<String>)> = nets
         .iter()
@@ -1017,6 +1157,11 @@ pub fn net_list(i: &Inputs<'_>) -> Table {
             let mut pins: Vec<String> = net
                 .pins
                 .iter()
+                .filter(|(pg, item, _)| {
+                    let sym = project.page(pg).and_then(|p| p.symbol(item));
+                    sym.and_then(|s| i.symbols.get(&s.symbol))
+                        .is_none_or(|y| y.role != SymbolRole::Interruption)
+                })
                 .map(|(pg, item, pin)| pin_label(i.project, pg, item, pin))
                 .collect();
             pins.sort_by_key(|s| natural_key(s));
@@ -1182,16 +1327,7 @@ pub(crate) fn terminal_plan_with_spares(i: &Inputs<'_>) -> (Table, BTreeSet<usiz
     let others = |pin: &PinRef| -> Vec<String> {
         nets.iter()
             .find(|n| n.pins.contains(pin))
-            .map(|n| {
-                let mut v: Vec<String> = n
-                    .pins
-                    .iter()
-                    .filter(|p| *p != pin)
-                    .map(|(pg, it, pn)| pin_label(i.project, pg, it, pn))
-                    .collect();
-                v.sort_by_key(|s| natural_key(s));
-                v
-            })
+            .map(|n| connected_labels(i, n.pins.iter().filter(|p| *p != pin)))
             .unwrap_or_default()
     };
     struct Term {
@@ -1270,6 +1406,9 @@ pub(crate) fn terminal_plan_with_spares(i: &Inputs<'_>) -> (Table, BTreeSet<usiz
     for l in &i.project.meta.strips {
         strips.entry(l.strip.to_string()).or_default();
     }
+    // Strips by number value (`-X2` before `-X10`), as the device list.
+    let mut strips: Vec<(String, Vec<Term>)> = strips.into_iter().collect();
+    strips.sort_by_cached_key(|(strip, _)| natural_key(strip));
     for (strip, mut list) in strips {
         // Numbered ones by number; unnumbered ones keep drawing order and are numbered after.
         let page_order = |id: &str| i.project.pages.iter().position(|p| p.id == id).unwrap_or(usize::MAX);
@@ -1442,7 +1581,8 @@ pub(crate) fn terminal_plan_with_spares(i: &Inputs<'_>) -> (Table, BTreeSet<usiz
     (t, spare_rows)
 }
 
-/// Table of contents: every schematic page with its title and what is drawn on it.
+/// Table of contents: every schematic page with its title and what is drawn on it. Tags on
+/// interruption points are not devices (they only name a connection), so they are not counted.
 pub fn contents(i: &Inputs<'_>) -> Table {
     let mut t = Table::new("Table of contents", &["Page", "Title", "Devices", "Wires"]);
     t.front = true;
@@ -1451,6 +1591,11 @@ pub fn contents(i: &Inputs<'_>) -> Table {
         let tags: BTreeSet<String> = page
             .symbols
             .iter()
+            .filter(|s| {
+                i.symbols
+                    .get(&s.symbol)
+                    .is_none_or(|y| y.role != SymbolRole::Interruption)
+            })
             .filter_map(|s| s.tag.as_ref().map(ToString::to_string))
             .collect();
         t.rows.push(vec![
@@ -1515,7 +1660,8 @@ impl PlcPoint {
 /// PLC I/O list: every PLC input and output drawn, with its address, the device it belongs to
 /// and what it is wired to. The address is the device property `Address` (or `PLC address`);
 /// points without one sort last so the gaps are visible. Each row links to its page
-/// ([`Table::row_pages`]).
+/// ([`Table::row_pages`]). Overview pages (`Page::overview`) are skipped, because an overview
+/// draws devices again and would list each point twice.
 pub fn plc_io_list(i: &Inputs<'_>) -> Table {
     let mut t = Table::new(
         "PLC I/O list",
@@ -1540,7 +1686,8 @@ pub(crate) fn plc_points(i: &Inputs<'_>) -> Vec<PlcPoint> {
     // (no address, address sort key, point)
     type Row = (bool, Vec<(String, u64)>, PlcPoint);
     let mut rows: Vec<Row> = Vec::new();
-    for page in &i.project.pages {
+    // An overview (line diagram) draws devices again; each point is listed once.
+    for page in i.project.pages.iter().filter(|pg| !pg.overview) {
         for s in &page.symbols {
             let Some(sym) = i.symbols.get(&s.symbol) else { continue };
             let Some(kind) = plc_kind(sym) else { continue };
@@ -1553,19 +1700,21 @@ pub(crate) fn plc_points(i: &Inputs<'_>) -> Vec<PlcPoint> {
                         .map(|(_, v)| v.trim().to_owned())
                 })
                 .unwrap_or_default();
-            let mut others: BTreeSet<String> = BTreeSet::new();
-            for p in &sym.pins {
-                let key = (page.id.clone(), s.id.clone(), p.name.clone());
-                let Some(n) = net_of.get(&key) else { continue };
+            let mut others: Vec<&PinRef> = Vec::new();
+            let own: Vec<PinRef> = sym
+                .pins
+                .iter()
+                .map(|p| (page.id.clone(), s.id.clone(), p.name.clone()))
+                .collect();
+            for key in &own {
+                let Some(n) = net_of.get(key) else { continue };
                 for other in nets.get(*n).map(|net| net.pins.as_slice()).unwrap_or(&[]) {
-                    if *other != key {
-                        let (pg, item, pin) = other;
-                        others.insert(pin_label(i.project, pg, item, pin));
+                    if other != key {
+                        others.push(other);
                     }
                 }
             }
-            let mut others: Vec<String> = others.into_iter().collect();
-            others.sort_by_key(|o| natural_key(o));
+            let others = connected_labels(i, others.into_iter());
             let point = PlcPoint {
                 address: address.clone(),
                 kind,

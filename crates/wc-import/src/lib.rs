@@ -1,4 +1,8 @@
-//! Importers: symbols from DXF and SVG, parts from CSV and Excel workbooks, schematic drawings from DXF.
+//! Importers: symbols from DXF, SVG, KiCad libraries and QElectroTech elements; parts from CSV,
+//! Excel workbooks, BMEcat catalogues and EDZ files; PLC address lists and WAGO configurator
+//! lists; part sizes from STEP models; pages from DXF, DWG and PDF (as a trace layer); and
+//! AutomationML, Eplan P8 and SolidWorks Electrical projects, with the open-format parts of
+//! other project archives. [`run`] is each import as the CLI and the app run it.
 //!
 //! Input is treated as hostile: malformed files produce errors or are skipped, never panics.
 

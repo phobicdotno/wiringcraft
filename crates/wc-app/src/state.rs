@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use wc_core::geom::{Point, Rotation};
 use wc_core::lock::ItemKind;
 use wc_core::plc_rack::PlcRack;
-use wc_core::project::PageSize;
+use wc_core::project::{PageNumberError, PageSize};
 use wc_core::route::{self, Axis, Route};
 use wc_core::template::PageTemplate;
 use wc_core::{DevicePart, DeviceTag, Endpoint, Page, Part, PlacedSymbol, Project, Symbol, Wire, store};
@@ -24,6 +24,52 @@ pub fn part_label(p: &Part) -> String {
         (false, true) => head.join(" "),
         (false, false) => format!("{} \u{2013} {}", head.join(" "), p.description),
     }
+}
+
+/// The parts the project uses that `parts` does not hold but whose copy in the project's
+/// library (`vendor/parts/`) is there and cannot be read, by id with the reason: the project
+/// check reports those as unreadable, not as missing
+/// ([`wc_report::check_with_unreadable`]). An id that cannot name a file there at all is
+/// unreadable too, with the reason the id is refused.
+pub fn unreadable_parts(dir: &Path, project: &Project, parts: &BTreeMap<String, Part>) -> BTreeMap<String, String> {
+    unreadable_parts_looked_up(dir, project, parts, Path::try_exists)
+}
+
+/// [`unreadable_parts`], with `exists` telling whether a copy's file is there: tests give a
+/// lookup that fails, which permission bits cannot do when they run as root.
+fn unreadable_parts_looked_up(
+    dir: &Path,
+    project: &Project,
+    parts: &BTreeMap<String, Part>,
+    exists: impl Fn(&Path) -> std::io::Result<bool>,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for id in project.used_parts() {
+        if parts.contains_key(&id) {
+            continue;
+        }
+        let path = match store::vendor_path(dir, ItemKind::Part, &id) {
+            Ok(path) => path,
+            Err(e) => {
+                out.insert(id, e.to_string());
+                continue;
+            }
+        };
+        // Only a copy known to be absent is missing: one that cannot even be looked for (a
+        // folder that may not be entered) is unreadable, with that reason.
+        match exists(&path) {
+            Ok(false) => {}
+            Ok(true) => {
+                if let Err(e) = store::read_vendored_part(dir, &id) {
+                    out.insert(id, e.to_string());
+                }
+            }
+            Err(e) => {
+                out.insert(id, format!("{}: {e}", path.display()));
+            }
+        }
+    }
+    out
 }
 
 /// What a click on the canvas does.
@@ -488,6 +534,9 @@ pub struct Open {
     /// differs between any two opened projects: checks while drawing look at this instead of
     /// comparing the whole project each frame.
     revision: u64,
+    /// Changes with every library reload ([`Open::refresh_library`]), which may find the
+    /// files of the project's library copy changed while the loaded project stays the same.
+    library_load: u64,
     /// The `history` count right after a properties form made its own undo step, so later
     /// typing in the form joins that step only while nothing else has touched the history.
     form_step: Option<u64>,
@@ -558,6 +607,10 @@ pub struct Open {
     /// putting it back.
     #[cfg(test)]
     block_after_snapshot: Option<PathBuf>,
+    /// Tests: a part copy that a refused [`Open::ensure_parts`] takes back turns into a folder
+    /// with a file in it first, so removing it fails.
+    #[cfg(test)]
+    block_copy_removal: bool,
     /// Tests: a file whose backup read fails, though the file is a plain readable one.
     #[cfg(test)]
     unreadable: Option<PathBuf>,
@@ -613,6 +666,7 @@ impl Open {
             undo_dropped: 0,
             history: 0,
             revision: next_revision(),
+            library_load: next_revision(),
             form_step: None,
             branch: wc_vcs::Git::new(dir).current_branch().unwrap_or_default(),
             underlays: BTreeMap::new(),
@@ -637,6 +691,8 @@ impl Open {
             fail_part_writes: Default::default(),
             #[cfg(test)]
             block_after_snapshot: None,
+            #[cfg(test)]
+            block_copy_removal: false,
             #[cfg(test)]
             unreadable: None,
             #[cfg(test)]
@@ -751,6 +807,7 @@ impl Open {
     pub fn refresh_library(&mut self) {
         self.relist_symbols();
         self.library_rules = wc_library::library_rules(&self.dir, &self.project);
+        self.library_load = next_revision();
         self.touch();
 
         self.parts = self
@@ -1112,6 +1169,65 @@ impl Open {
         Ok(())
     }
 
+    /// Check that every part can be used (taken from the library when needed) without pinning
+    /// any of them, so a change can be refused before anything else of it is applied.
+    pub fn check_parts<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
+        let lock = self.project.lock.clone();
+        let r = self.ensure_parts(ids);
+        self.project.lock = lock;
+        r
+    }
+
+    /// [`Open::ensure_part`] for every part, all or none: when one cannot be used, the copies
+    /// and loaded parts the earlier ones got here are taken back (those there before are kept),
+    /// and so is the lock.
+    fn ensure_parts<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
+        let lock = self.project.lock.clone();
+        // What this call added: the parts loaded here and the copies written that were not there.
+        let (mut loaded, mut copies) = (Vec::new(), Vec::new());
+        let mut r = Ok(());
+        for id in ids {
+            let was_loaded = self.parts.contains_key(id);
+            let missing = store::vendor_path(&self.dir, ItemKind::Part, id)
+                .ok()
+                .filter(|path| !path.try_exists().unwrap_or(true));
+            r = self.ensure_part(id);
+            if !was_loaded && self.parts.contains_key(id) {
+                loaded.push(id.to_owned());
+            }
+            copies.extend(missing.filter(|path| path.exists()));
+            if r.is_err() {
+                break;
+            }
+        }
+        if r.is_err() {
+            for id in loaded {
+                self.parts.remove(&id);
+            }
+            let mut left = Vec::new();
+            for path in copies {
+                #[cfg(test)]
+                if self.block_copy_removal {
+                    let _ = std::fs::remove_file(&path);
+                    let _ = std::fs::create_dir(&path).and_then(|()| std::fs::write(path.join("x"), ""));
+                }
+                if let Err(e) = std::fs::remove_file(&path) {
+                    left.push(format!("{} ({e})", path.display()));
+                }
+            }
+            self.project.lock = lock;
+            if !left.is_empty() {
+                r = r.map_err(|e| {
+                    format!(
+                        "{e}; these part copies taken into the project could not be removed: {}",
+                        left.join("; ")
+                    )
+                });
+            }
+        }
+        r
+    }
+
     /// Replace a device's accessories (its parts after the main part). New parts are taken from
     /// the library into the project; a quantity of 0 is taken as 1. One undo step.
     pub fn set_device_accessories(&mut self, tag: &DeviceTag, accessories: Vec<DevicePart>) -> Result<(), String> {
@@ -1123,13 +1239,8 @@ impl Open {
             return Ok(());
         }
         let lock = self.project.lock.clone();
-        for a in &accessories {
-            if let Err(e) = self.ensure_part(&a.part) {
-                // Parts taken before this one are not pinned without a change that uses them.
-                self.project.lock = lock;
-                return Err(e);
-            }
-        }
+        // Parts taken before one that cannot be used are taken back, copy and pin.
+        self.ensure_parts(accessories.iter().map(|a| a.part.as_str()))?;
         self.checkpoint_with_lock(lock);
         self.project.devices.entry(tag.clone()).or_default().accessories = accessories;
         Ok(())
@@ -1214,6 +1325,11 @@ impl Open {
     /// Which edit of the project is shown: see the `revision` field.
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Which library reload is shown: see the `library_load` field.
+    pub fn library_load(&self) -> u64 {
+        self.library_load
     }
 
     /// Note an edit of the project, its symbols or its parts made without an undo step (a
@@ -2032,8 +2148,9 @@ impl Open {
             .into_iter()
             .filter(|s| kind.is_none_or(|k| s.kind == k))
             .collect();
-        // An item named on purpose whose library file is wrong stops the update.
-        if let Some(bad) = wc_library::wrong_named(&all, only) {
+        // An item named on purpose that the project does not have, or whose library file is
+        // wrong, stops the update.
+        if let Some(bad) = wc_library::unknown_named(&all, only).or_else(|| wc_library::wrong_named(&all, only)) {
             return Err(bad.to_string());
         }
         // Exactly these versions are taken, as seen here: an item whose library file changes
@@ -3312,17 +3429,16 @@ impl Open {
         overview: bool,
         fields: Option<&BTreeMap<String, String>>,
     ) -> Result<usize, String> {
-        let number = number.trim();
-        if number.is_empty() {
-            return Err("The page number cannot be empty.".into());
-        }
         let Some(current) = self.project.pages.get(page) else {
             return Err("No such page.".into());
         };
         let id = current.id.clone();
-        if self.project.pages.iter().any(|p| p.number == number && p.id != id) {
-            return Err(format!("Page {number} already exists."));
-        }
+        let number = match self.project.free_page_number(number, Some(&id)) {
+            Ok(number) => number,
+            Err(PageNumberError::Empty) => return Err("The page number cannot be empty.".into()),
+            Err(PageNumberError::Taken { number, .. }) => return Err(format!("Page {number} already exists.")),
+        };
+        let number = number.as_str();
         let mut own = current.clone();
         for (k, v) in fields.into_iter().flatten() {
             own.set_title_field(k, v);
@@ -5106,6 +5222,53 @@ fn version_fits(item_id: &str, hash: &str, id: &str, pin: &str) -> Result<(), St
 #[allow(clippy::unwrap_used)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A part copy that cannot be looked for (say, in a folder that may not be entered) is
+    /// reported as unreadable with the reason, not as missing (#1035). The failing lookup is
+    /// injected, so this holds when the tests run as root too.
+    #[test]
+    fn a_part_copy_that_cannot_be_looked_for_is_unreadable_with_the_reason() {
+        let (_tmp, mut o) = project();
+        o.project.devices.insert(
+            DeviceTag::parse("-K1").unwrap(),
+            wc_core::project::Device {
+                part: Some("maker.contactor".into()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            unreadable_parts(&o.dir, &o.project, &BTreeMap::new()).is_empty(),
+            "absent is missing"
+        );
+        let found = unreadable_parts_looked_up(&o.dir, &o.project, &BTreeMap::new(), |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        });
+        let why = found.get("maker.contactor").map(String::as_str).unwrap_or_default();
+        assert!(why.contains("maker.contactor.json"), "names the file: {found:?}");
+        assert!(why.to_lowercase().contains("permission denied"), "and why: {found:?}");
+    }
+
+    /// A used part id that cannot name a file in the project's library is reported as
+    /// unreadable with the reason the id is refused, not skipped; a valid id whose copy is
+    /// absent stays missing (not listed here).
+    #[test]
+    fn a_used_part_id_that_cannot_name_a_file_is_unreadable_with_the_reason() {
+        let (_tmp, mut o) = project();
+        for (tag, part) in [("-K1", "../escape"), ("-K2", "maker.absent")] {
+            o.project.devices.insert(
+                DeviceTag::parse(tag).unwrap(),
+                wc_core::project::Device {
+                    part: Some(part.into()),
+                    ..Default::default()
+                },
+            );
+        }
+        let found = unreadable_parts(&o.dir, &o.project, &BTreeMap::new());
+        let why = found.get("../escape").map(String::as_str).unwrap_or_default();
+        assert!(why.contains("must be 1-128"), "keeps the reason: {found:?}");
+        assert!(!found.contains_key("maker.absent"), "absent is missing: {found:?}");
+        assert_eq!(found.len(), 1, "{found:?}");
+    }
 
     thread_local! {
         /// A file whose writes by `restore_file` fail, after letting this many through.
@@ -8106,6 +8269,41 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_update_naming_an_unknown_id_takes_nothing_and_keeps_the_history() {
+        let (tmp, mut o) = project();
+        o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
+        let pid = "example.ex-ct-9-24dc";
+        o.ensure_part(pid).unwrap();
+        o.place(1, "wc.coil", Point::new(60.0, 20.0)).unwrap();
+        changed_part_in_mine(&o, tmp.path(), pid);
+        let coil = o.symbols["wc.coil"].clone();
+        let lib = library_first(&mut o, tmp.path(), &coil);
+        // Something to undo and something to redo.
+        assert!(o.undo());
+        let (undo, redo, history, dirty) = (o.undo.len(), o.redo.len(), o.history, o.dirty);
+        assert!(undo > 0 && redo > 0);
+        let lock = o.project.lock.clone();
+        assert!(lock.parts.contains_key(pid), "the part is pinned");
+        let file = std::fs::read(store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap()).unwrap();
+        // The known part has a newer version, but the unknown id stops the whole update.
+        let only = [pid.to_owned(), "nosuch.item".to_owned()];
+        let err = o.update_library(&lib, Some(&only)).unwrap_err();
+        assert!(err.contains("nosuch.item"), "{err}");
+        assert_eq!(o.project.lock, lock);
+        assert_eq!(
+            std::fs::read(store::vendor_path(&o.dir, ItemKind::Part, pid).unwrap()).unwrap(),
+            file
+        );
+        assert_eq!(
+            (o.undo.len(), o.redo.len(), o.history, o.dirty),
+            (undo, redo, history, dirty)
+        );
+        // The known id alone is taken.
+        let done = o.update_library(&lib, Some(&only[..1])).unwrap();
+        assert_eq!(done, vec![(ItemKind::Part, pid.to_owned())]);
+    }
+
+    #[test]
     fn undo_puts_back_a_loaded_part_an_import_replaced() {
         let (_tmp, mut o) = project();
         o.place(1, "wc.coil", Point::new(20.0, 20.0)).unwrap();
@@ -9692,6 +9890,70 @@ pub(crate) mod tests {
         );
         assert!(o.undo());
         assert!(o.project.devices.get(&tag).is_none_or(|d| d.accessories.is_empty()));
+    }
+
+    #[test]
+    fn a_refused_accessory_list_takes_no_part_into_the_project() {
+        let (_tmp, mut o) = project();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        let a = o.place(page, "wc.coil", Point::new(50.0, 50.0)).unwrap();
+        let tag = o.project.pages[page].symbol(&a).unwrap().tag.clone().unwrap();
+        let id = o
+            .part_library
+            .iter()
+            .map(|(id, _)| id.clone())
+            .find(|id| !o.parts.contains_key(id))
+            .unwrap();
+        let copy = store::vendor_path(&o.dir, ItemKind::Part, &id).unwrap();
+        assert!(!copy.exists());
+        let list = vec![
+            DevicePart {
+                part: id.clone(),
+                qty: 1,
+            },
+            DevicePart {
+                part: "no.such.part".into(),
+                qty: 1,
+            },
+        ];
+        assert!(o.check_parts(list.iter().map(|a| a.part.as_str())).is_err());
+        assert!(!copy.exists(), "no copy left by a refused check");
+        assert!(!o.parts.contains_key(&id), "not loaded by a refused check");
+        assert!(o.set_device_accessories(&tag, list).is_err());
+        assert!(!copy.exists(), "no copy left by a refused change");
+        assert!(!o.parts.contains_key(&id), "not loaded by a refused change");
+        assert!(!o.project.lock.parts.contains_key(&id));
+        let good = vec![DevicePart {
+            part: id.clone(),
+            qty: 1,
+        }];
+        o.check_parts(good.iter().map(|a| a.part.as_str())).unwrap();
+        o.set_device_accessories(&tag, good).unwrap();
+        assert!(copy.exists());
+        assert!(o.parts.contains_key(&id));
+        assert!(o.project.lock.parts.contains_key(&id));
+    }
+
+    #[test]
+    fn a_part_copy_that_cannot_be_taken_back_is_named_with_its_reason() {
+        let (_tmp, mut o) = project();
+        let id = o
+            .part_library
+            .iter()
+            .map(|(id, _)| id.clone())
+            .find(|id| !o.parts.contains_key(id))
+            .unwrap();
+        let copy = store::vendor_path(&o.dir, ItemKind::Part, &id).unwrap();
+        let ids = [id.as_str(), "no.such.part"];
+        let plain = o.check_parts(ids).unwrap_err();
+        assert!(!plain.contains("could not be removed"), "{plain}");
+        o.block_copy_removal = true;
+        let e = o.check_parts(ids).unwrap_err();
+        assert!(e.starts_with(&plain), "the lookup error is kept: {e}");
+        assert!(e.contains("could not be removed"), "{e}");
+        assert!(e.contains(&copy.display().to_string()), "the copy is named: {e}");
+        assert!(!o.parts.contains_key(&id), "not loaded by a refused check");
+        assert!(!o.project.lock.parts.contains_key(&id));
     }
 
     #[test]

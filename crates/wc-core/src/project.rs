@@ -609,13 +609,19 @@ pub fn title_field_label(key: &str) -> &str {
 /// A location path as the project stores it (`L1.L3`), from what was typed (`+L1.L3` or
 /// `L1.L3`). Refused when it is not just the `+` part of a tag.
 pub fn location_path(s: &str) -> Result<String, String> {
-    let s = s.trim();
-    let s = s.strip_prefix('+').unwrap_or(s);
-    // A tag needs a product, so try it with one; a product or function in `s` is refused.
-    let tag = DeviceTag::parse(&format!("+{s}-X")).map_err(|e| format!("{s:?} is not a location: {e}"))?;
-    if !tag.function.is_empty() || tag.product != ["X"] {
-        return Err(format!("{s:?} is not a location: give only the + part of a tag"));
+    let typed = s.trim();
+    let s = typed.strip_prefix('+').unwrap_or(typed);
+    if s.contains(['-', '=']) {
+        return Err(format!("{typed:?} is not a location: give only the + part of a tag"));
     }
+    // Errors name the location with its `+`, as it would be written in a tag.
+    let shown = format!("+{s}");
+    // A tag needs a product, so try it with one. The error gives only the reason, since the
+    // tag it was found in is made up here.
+    let tag = DeviceTag::parse(&format!("+{s}-X")).map_err(|e| match e {
+        crate::Error::Tag(_, why) => format!("{shown:?} is not a location: {why}"),
+        e => format!("{shown:?} is not a location: {e}"),
+    })?;
     Ok(tag.location.join("."))
 }
 
@@ -721,9 +727,16 @@ impl ProjectMeta {
     }
 
     /// Add a location, or fill in the description of one the project already has. A description
-    /// already there is kept. Returns whether anything changed.
-    pub fn merge_location(&mut self, loc: Location) -> bool {
-        match self.locations.iter_mut().find(|l| l.path == loc.path) {
+    /// already there is kept. Paths match by their normal form, so a location stored as typed
+    /// (`+L1`) is found by `L1`. Returns whether anything changed.
+    pub fn merge_location(&mut self, mut loc: Location) -> bool {
+        let key = location_path(&loc.path).unwrap_or_else(|_| loc.path.clone());
+        let found = self
+            .locations
+            .iter_mut()
+            .find(|l| l.path == loc.path || location_path(&l.path).is_ok_and(|p| p == key));
+        loc.path = key;
+        match found {
             Some(have) if have.description.is_empty() && !loc.description.is_empty() => {
                 have.description = loc.description;
                 true
@@ -1349,10 +1362,13 @@ impl PageSize {
                 "size {text:?} is not A4, A3, A2, A1 or A0 (add \"portrait\" for an upright sheet) or a custom WIDTHxHEIGHT in millimetres"
             )
         };
-        // Spaces around `x` and before `mm` are fine; inside a number they are not.
-        let dims = lower.strip_suffix("mm").unwrap_or(&lower);
+        // Spaces around `x` (or `×`) and before `mm` are fine, and each side may carry its own
+        // `mm` (`500mm x 700mm`); spaces inside a number are not.
+        let dims = lower.replace('×', "x");
         let (w, h) = dims.split_once('x').ok_or_else(bad)?;
         let side = |name: &str, v: &str| {
+            let v = v.trim();
+            let v = v.strip_suffix("mm").unwrap_or(v);
             v.trim().parse::<u32>().map_err(|e| {
                 format!(
                     "size {text:?}: the {name} {:?} is not a whole number of millimetres ({e}); each side is {} to {} mm",
@@ -1765,6 +1781,26 @@ pub struct DanglingEnd {
     pub pin: String,
 }
 
+/// Why a page cannot have a number ([`Project::free_page_number`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PageNumberError {
+    /// The number is empty or blank.
+    Empty,
+    /// Page `page` (its id) already has `number`.
+    Taken { number: String, page: String },
+}
+
+impl std::fmt::Display for PageNumberError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => f.write_str("the page number cannot be empty"),
+            Self::Taken { number, page } => write!(f, "page {page:?} already has number {number:?}"),
+        }
+    }
+}
+
+impl std::error::Error for PageNumberError {}
+
 impl Project {
     /// Add spare terminal `number` to `strip` ([`ProjectMeta::add_spare`]), refused also when
     /// its tag (`-X1.S1`) is drawn as a device that is not a terminal of the strip, or names
@@ -1947,6 +1983,28 @@ impl Project {
             }
         }
         Some(moved)
+    }
+
+    /// `number` as a page may carry it: trimmed, not empty, and not the number of another page
+    /// (blanks around a saved number do not make it another number).
+    /// `own` is the id of the page that gets the number, which may keep the number it has;
+    /// `None` for a page that is not in the project yet.
+    pub fn free_page_number(&self, number: &str, own: Option<&str>) -> Result<String, PageNumberError> {
+        let number = number.trim();
+        if number.is_empty() {
+            return Err(PageNumberError::Empty);
+        }
+        match self
+            .pages
+            .iter()
+            .find(|p| p.number.trim() == number && Some(p.id.as_str()) != own)
+        {
+            Some(other) => Err(PageNumberError::Taken {
+                number: number.to_owned(),
+                page: other.id.clone(),
+            }),
+            None => Ok(number.to_owned()),
+        }
     }
 
     /// Sort pages by their display number, comparing numeric parts as numbers.
@@ -2206,6 +2264,27 @@ mod tests {
                     height: 700,
                 },
             ),
+            (
+                "500mm x 700mm",
+                PageSize::Custom {
+                    width: 500,
+                    height: 700,
+                },
+            ),
+            (
+                "500 mm x 700 mm",
+                PageSize::Custom {
+                    width: 500,
+                    height: 700,
+                },
+            ),
+            (
+                "500 × 700",
+                PageSize::Custom {
+                    width: 500,
+                    height: 700,
+                },
+            ),
         ] {
             assert_eq!(PageSize::parse(text), Ok(want), "{text}");
         }
@@ -2222,6 +2301,8 @@ mod tests {
             "ap",
             "a4pp",
             "50 0 x 700 mm",
+            "500mmmm x 700",
+            "500 x 700 mm mm",
         ] {
             assert!(PageSize::parse(bad).is_err(), "{bad}");
         }
@@ -2337,6 +2418,15 @@ mod tests {
         );
         let paths: Vec<&str> = m.locations.iter().map(|l| l.path.as_str()).collect();
         assert_eq!(paths, ["L1.L3", "L2"]);
+        // A location stored as typed is found by its normal form, and the other way round.
+        m.locations.push(loc("+L4", ""));
+        assert!(m.merge_location(loc("L4", "Deck")), "the stored +L4 is filled in");
+        assert!(!m.merge_location(loc("+L2", "Other")));
+        assert!(m.merge_location(loc("+L5", "")));
+        let paths: Vec<&str> = m.locations.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(paths, ["+L4", "L1.L3", "L2", "L5"]);
+        assert_eq!(m.locations[0].description, "Deck");
+        m.locations.retain(|l| l.path != "+L4" && l.path != "L5");
         let text = toml::to_string(&m).unwrap_or_default();
         assert!(text.contains("[[location]]"), "{text}");
         let back: ProjectMeta = toml::from_str(&text)?;
@@ -2569,6 +2659,33 @@ mod tests {
     }
 
     #[test]
+    fn a_page_number_is_free_when_no_other_page_has_it() {
+        let mut p = Project::new("t");
+        p.pages.push(Page::new("a", "1", ""));
+        p.pages.push(Page::new("b", "2.1", ""));
+        assert_eq!(p.free_page_number(" 3 ", None), Ok("3".to_owned()));
+        assert_eq!(p.free_page_number("", None), Err(PageNumberError::Empty));
+        assert_eq!(p.free_page_number(" \t", Some("a")), Err(PageNumberError::Empty));
+        let taken = PageNumberError::Taken {
+            number: "2.1".into(),
+            page: "b".into(),
+        };
+        assert_eq!(p.free_page_number(" 2.1", None), Err(taken.clone()));
+        assert_eq!(p.free_page_number("2.1", Some("a")), Err(taken.clone()));
+        assert_eq!(taken.to_string(), "page \"b\" already has number \"2.1\"");
+        // A page may keep its own number.
+        assert_eq!(p.free_page_number("2.1", Some("b")), Ok("2.1".to_owned()));
+        // A number saved with blanks around it (an older project file) is taken all the same.
+        p.pages.push(Page::new("c", " 4 ", ""));
+        let padded = PageNumberError::Taken {
+            number: "4".into(),
+            page: "c".into(),
+        };
+        assert_eq!(p.free_page_number("4", None), Err(padded));
+        assert_eq!(p.free_page_number("4", Some("c")), Ok("4".to_owned()));
+    }
+
+    #[test]
     fn pages_sort_naturally() {
         let mut p = Project::new("t");
         for n in ["10", "2", "1.5", "1"] {
@@ -2594,6 +2711,29 @@ mod tests {
             }
         );
         Ok(())
+    }
+
+    #[test]
+    fn a_bad_location_is_named_as_typed_without_the_made_up_tag() {
+        let cases = [
+            ("+", "\"+\" is not a location: the location aspect (+) has no name"),
+            ("", "\"+\" is not a location: the location aspect (+) has no name"),
+            (
+                "A..B",
+                "\"+A..B\" is not a location: the location aspect (+) has an empty level",
+            ),
+            (
+                "+A B",
+                "\"+A B\" is not a location: only letters, digits, '.', '_' allowed",
+            ),
+            ("+A-K1", "\"+A-K1\" is not a location: give only the + part of a tag"),
+            ("=F1+A", "\"=F1+A\" is not a location: give only the + part of a tag"),
+            ("-K1", "\"-K1\" is not a location: give only the + part of a tag"),
+        ];
+        for (typed, want) in cases {
+            assert_eq!(location_path(typed), Err(want.to_owned()), "{typed:?}");
+        }
+        assert_eq!(location_path(" +L1.L3 "), Ok("L1.L3".to_owned()));
     }
 
     #[test]

@@ -21,6 +21,8 @@ pub const GAP: f64 = 1.0;
 pub const DUCT: f64 = 40.0;
 /// Smallest height of a row of devices between two ducts.
 pub const ROW: f64 = 125.0;
+/// Shortest length a rail, and smallest width or height a duct, can be resized to.
+pub const MIN_RESIZE: f64 = 10.0;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Panel {
@@ -160,6 +162,20 @@ pub fn outline_on_plate(width: f64, height: f64, min: Point, max: Point) -> bool
     !(min.x < -eps || min.y < -eps || max.x > width + eps || max.y > height + eps)
 }
 
+/// The rectangle two corners span, whichever way round they are given. A non-finite corner
+/// is passed through unchanged so [`outline_on_plate`] still refuses it, since `f64::min` and
+/// `f64::max` would otherwise drop a NaN in favour of the finite side.
+fn spanned(a: Point, b: Point) -> (Point, Point) {
+    if [a.x, a.y, b.x, b.y].iter().all(|v| v.is_finite()) {
+        (
+            Point::new(a.x.min(b.x), a.y.min(b.y)),
+            Point::new(a.x.max(b.x), a.y.max(b.y)),
+        )
+    } else {
+        (a, b)
+    }
+}
+
 impl Panel {
     /// Whether a `w` x `h` millimetre outline with its top-left corner at `at` lies on this
     /// plate, edges included. See [`outline_on_plate`].
@@ -211,6 +227,65 @@ impl Panel {
             }
         }
         p
+    }
+
+    /// The right end a rail at `index` cannot be shortened past: the right edge of the
+    /// devices clipped onto it (their middle within 20 mm of its centre line and their outline
+    /// over its length). `None` when it is not a rail or carries no device.
+    pub fn rail_devices_end(&self, index: usize) -> Option<f64> {
+        let Some(PanelItem::Rail { at, length }) = self.items.get(index) else {
+            return None;
+        };
+        self.items
+            .iter()
+            .filter_map(PanelItem::device_bounds)
+            .filter(|(a, b)| ((a.y + b.y) / 2.0 - at.y).abs() < 20.0 && b.x > at.x && a.x < at.x + length)
+            .map(|(_, b)| b.x)
+            .reduce(f64::max)
+    }
+
+    /// Changes the length of the rail at `index` or the size of the duct there, so the rail's
+    /// right end or the duct's bottom-right corner goes to `to`, as near as it can: the left
+    /// end or top-left corner stays put, the item stays on the plate and at least
+    /// [`MIN_RESIZE`] millimetres long or wide, and a rail is never shortened past the
+    /// devices on it (see [`Panel::rail_devices_end`]); they stay where they are. Returns
+    /// whether anything changed; a device, an index past the end, or an item whose left end
+    /// or top-left corner is less than [`MIN_RESIZE`] from the plate's right or bottom edge
+    /// changes nothing.
+    pub fn resize_item(&mut self, index: usize, to: Point) -> bool {
+        let (pw, ph) = (self.width, self.height);
+        let devices_end = self.rail_devices_end(index);
+        let Some(item) = self.items.get_mut(index) else {
+            return false;
+        };
+        if !(to.x.is_finite() && to.y.is_finite()) {
+            return false;
+        }
+        let before = item.clone();
+        // The new length from `from`, or `None` when even the shortest one would stick out
+        // past the plate's edge.
+        let reach = |from: f64, to: f64, floor: f64, plate: f64| {
+            let lo = (from + MIN_RESIZE).max(floor);
+            (lo <= plate).then(|| to.clamp(lo, plate) - from)
+        };
+        match item {
+            PanelItem::Rail { at, length } => {
+                let Some(l) = reach(at.x, to.x, devices_end.unwrap_or(f64::MIN), pw) else {
+                    return false;
+                };
+                *length = l;
+            }
+            PanelItem::Duct { min, max } => {
+                let (a, _) = before.bounds();
+                let (Some(w), Some(h)) = (reach(a.x, to.x, f64::MIN, pw), reach(a.y, to.y, f64::MIN, ph)) else {
+                    return false;
+                };
+                *min = a;
+                *max = Point::new(a.x + w, a.y + h);
+            }
+            PanelItem::Device { .. } => return false,
+        }
+        *item != before
     }
 
     /// Turn the device at `index` a quarter clockwise about its middle, keeping it on the plate.
@@ -327,15 +402,19 @@ impl Panel {
             .iter()
             .filter_map(|item| match item {
                 PanelItem::Rail { at, length } => {
-                    // A 35 mm rail on its centre line.
-                    let (min, max) = (Point::new(at.x, at.y - 17.5), Point::new(at.x + length, at.y + 17.5));
+                    // A 35 mm rail on its centre line. A negative length runs left from `at`.
+                    let (min, max) = spanned(Point::new(at.x, at.y - 17.5), Point::new(at.x + length, at.y + 17.5));
                     outside(min, max).then(|| format!("rail at {},{}", at.x, at.y))
                 }
                 PanelItem::Duct { min, max } => {
-                    outside(*min, *max).then(|| format!("duct {},{} to {},{}", min.x, min.y, max.x, max.y))
+                    // Corners may be given either way round; check the rectangle they span.
+                    let (lo, hi) = spanned(*min, *max);
+                    outside(lo, hi).then(|| format!("duct {},{} to {},{}", min.x, min.y, max.x, max.y))
                 }
                 PanelItem::Device { tag, .. } => {
                     let (min, max) = item.device_bounds()?;
+                    // A negative width or height runs back from `at`; check the whole outline.
+                    let (min, max) = spanned(min, max);
                     outside(min, max).then(|| tag.to_string())
                 }
             })
@@ -578,6 +657,51 @@ mod tests {
             max: Point::new(0.0, 0.0),
         };
         assert_eq!(duct.bounds(), (Point::new(0.0, 0.0), Point::new(60.0, 40.0)));
+    }
+
+    #[test]
+    fn resize_refuses_items_running_backwards_or_with_a_nan_corner_off_the_plate() {
+        let items = [
+            PanelItem::Rail {
+                at: Point::new(50.0, 100.0),
+                length: -100.0,
+            },
+            PanelItem::Rail {
+                at: Point::new(50.0, 100.0),
+                length: f64::NAN,
+            },
+            PanelItem::Duct {
+                min: Point::new(650.0, 100.0),
+                max: Point::new(590.0, 140.0),
+            },
+            PanelItem::Duct {
+                min: Point::new(f64::NAN, 100.0),
+                max: Point::new(590.0, 140.0),
+            },
+            PanelItem::Device {
+                tag: DeviceTag::default(),
+                at: Point::new(50.0, 50.0),
+                width: -100.0,
+                height: 40.0,
+                rotation: Rotation::R0,
+            },
+        ];
+        for item in items {
+            let mut p = Panel::new("p", "p", 600.0, 800.0);
+            p.items.push(item.clone());
+            assert!(p.resize(600.0, 800.0).is_err(), "{item:?} is refused");
+        }
+        // Reversed but on the plate is fine.
+        let mut p = Panel::new("p", "p", 600.0, 800.0);
+        p.items.push(PanelItem::Rail {
+            at: Point::new(150.0, 100.0),
+            length: -100.0,
+        });
+        p.items.push(PanelItem::Duct {
+            min: Point::new(590.0, 140.0),
+            max: Point::new(10.0, 100.0),
+        });
+        assert_eq!(p.resize(600.0, 800.0), Ok(()));
     }
 
     #[test]
@@ -1156,5 +1280,101 @@ mod tests {
         // Larger than the plate: it goes to the top edge.
         duct.move_on_plate(Point::new(0.0, 50.0), 600.0, 200.0);
         assert_eq!(duct.bounds(), (Point::new(0.0, 0.0), Point::new(60.0, 300.0)));
+    }
+
+    /// A rail on a 600 x 400 plate from x 100 to 300 on y 100, with a 50 mm device on it
+    /// ending at x 210.
+    fn rail_with_device() -> Panel {
+        let mut p = Panel::new("p", "p", 600.0, 400.0);
+        p.items.push(PanelItem::Rail {
+            at: Point::new(100.0, 100.0),
+            length: 200.0,
+        });
+        p.items.push(PanelItem::Device {
+            tag: DeviceTag::default(),
+            at: Point::new(160.0, 55.0),
+            width: 50.0,
+            height: 90.0,
+            rotation: Rotation::R0,
+        });
+        p
+    }
+
+    fn rail_length(p: &Panel) -> f64 {
+        let Some(PanelItem::Rail { at, length }) = p.items.first() else {
+            unreachable!()
+        };
+        assert_eq!(*at, Point::new(100.0, 100.0), "the left end stays put");
+        *length
+    }
+
+    #[test]
+    fn a_rail_resizes_by_its_right_end_and_stays_on_the_plate() {
+        let mut p = rail_with_device();
+        assert!(p.resize_item(0, Point::new(450.0, 0.0)));
+        assert_eq!(rail_length(&p), 350.0);
+        // Past the plate's right edge it stops there.
+        assert!(p.resize_item(0, Point::new(900.0, 100.0)));
+        assert_eq!(rail_length(&p), 500.0);
+        assert!(
+            !p.resize_item(0, Point::new(900.0, 100.0)),
+            "no change, nothing to undo"
+        );
+        assert!(!p.resize_item(1, Point::new(300.0, 300.0)), "a device is not resized");
+        assert!(!p.resize_item(5, Point::new(300.0, 300.0)));
+    }
+
+    #[test]
+    fn a_rail_is_not_shortened_past_its_devices() {
+        let mut p = rail_with_device();
+        assert_eq!(p.rail_devices_end(0), Some(210.0));
+        assert!(p.resize_item(0, Point::new(120.0, 100.0)));
+        assert_eq!(rail_length(&p), 110.0);
+        assert_eq!(p.items[1].anchor(), Point::new(160.0, 55.0), "the device stays");
+        // Without the device it goes down to the shortest rail.
+        p.items.pop();
+        assert_eq!(p.rail_devices_end(0), None);
+        assert!(p.resize_item(0, Point::new(-50.0, 100.0)));
+        assert_eq!(rail_length(&p), MIN_RESIZE);
+    }
+
+    #[test]
+    fn a_duct_resizes_by_its_far_corner_and_stays_on_the_plate() {
+        let mut p = Panel::new("p", "p", 600.0, 400.0);
+        // Corners stored the other way round still resize from the top-left one.
+        p.items.push(PanelItem::Duct {
+            min: Point::new(100.0, 360.0),
+            max: Point::new(0.0, 300.0),
+        });
+        assert!(p.resize_item(0, Point::new(250.0, 340.0)));
+        assert_eq!(p.items[0].bounds(), (Point::new(0.0, 300.0), Point::new(250.0, 340.0)));
+        assert!(p.resize_item(0, Point::new(-20.0, 900.0)));
+        assert_eq!(
+            p.items[0].bounds(),
+            (Point::new(0.0, 300.0), Point::new(MIN_RESIZE, 400.0))
+        );
+        assert!(!p.resize_item(0, Point::new(f64::NAN, 10.0)));
+    }
+
+    #[test]
+    fn an_item_too_near_the_plates_far_edge_is_not_resized_off_it() {
+        let mut p = Panel::new("p", "p", 600.0, 400.0);
+        p.items.push(PanelItem::Rail {
+            at: Point::new(595.0, 100.0),
+            length: 5.0,
+        });
+        p.items.push(PanelItem::Duct {
+            min: Point::new(595.0, 100.0),
+            max: Point::new(600.0, 120.0),
+        });
+        p.items.push(PanelItem::Duct {
+            min: Point::new(100.0, 395.0),
+            max: Point::new(200.0, 400.0),
+        });
+        let before = p.items.clone();
+        assert!(!p.resize_item(0, Point::new(700.0, 100.0)));
+        assert!(!p.resize_item(1, Point::new(700.0, 300.0)));
+        assert!(!p.resize_item(2, Point::new(300.0, 500.0)));
+        assert_eq!(p.items, before, "nothing changes");
     }
 }

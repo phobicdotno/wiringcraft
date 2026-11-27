@@ -512,9 +512,7 @@ pub fn navigator(ui: &mut egui::Ui, open: &Open, ed: &mut Editor, out: &mut Vec<
                 && let Some((page_id, item)) = uses.first()
                 && let Some(i) = open.project.pages.iter().position(|p| &p.id == page_id)
             {
-                ed.page = i;
-                ed.select_only(Selection::Symbol(item.clone()));
-                ed.view.fit = true;
+                show_device(ed, i, item);
             }
             // A terminal's strip can have its markers exported on their own.
             if let Some(strip) = terminal_strip_of(open, &tag, &uses) {
@@ -588,6 +586,14 @@ pub fn library(ui: &mut egui::Ui, open: &Open, ed: &mut Editor, ps: &mut PanelSt
                 }
             }
         });
+}
+
+/// A click on a device in the Devices list: its page is shown (a panel layout shown closes, as
+/// from the Pages list) with symbol `item` selected.
+fn show_device(ed: &mut Editor, page: usize, item: &str) {
+    ed.show_page(page);
+    ed.select_only(Selection::Symbol(item.to_owned()));
+    ed.view.fit = true;
 }
 
 fn load_buffers(open: &Open, ed: &Editor, ps: &mut PanelState) {
@@ -941,25 +947,59 @@ fn box_size_field(ui: &mut egui::Ui, value: &mut f64) {
     }
 }
 
-/// Apply the black box form shown in the Properties panel when it has changes not applied yet,
+/// Whether the black box form of the box `id` on page `page` is the one the Properties panel
+/// shows now: that box alone is selected on the page shown, with no panel layout open. A form
+/// left behind when another item was picked is kept for when the box is picked again, but it
+/// is neither applied by a save nor counted as refused (#1019).
+fn black_box_form_shown(ed: &Editor, page: usize, id: &str) -> bool {
+    ed.panel.is_none() && ed.page == page && matches!(ed.selection.as_slice(), [Selection::Symbol(s)] if s == id)
+}
+
+/// Whether the black box form shown holds a change that [`apply_black_box_draft`] refused: it
+/// stays in the form, with its reason, for the person to correct.
+pub fn black_box_draft_refused(ps: &PanelState, ed: &Editor) -> bool {
+    ps.black_box.as_ref().is_some_and(|((page, id, _), form)| {
+        form.error.is_some() && form.changed() && black_box_form_shown(ed, *page, id)
+    })
+}
+
+/// Whether the black box form shown holds a change [`apply_black_box_draft`] would apply: the
+/// box is still selected, the form was changed, and the box's symbol is still the one the
+/// form was read from.
+pub fn black_box_draft_applies(open: &Open, ps: &PanelState, ed: &Editor) -> bool {
+    ps.black_box.as_ref().is_some_and(|((page, id, hash), form)| {
+        black_box_form_shown(ed, *page, id)
+            && form.changed()
+            && open
+                .project
+                .pages
+                .get(*page)
+                .and_then(|p| p.symbol(id))
+                .and_then(|s| open.symbols.get(&s.symbol))
+                .is_some_and(|sym| &sym.hash() == hash)
+    })
+}
+
+/// Whether the black box form shown holds a change not in the project: one
+/// [`apply_black_box_draft`] would apply, or one it refused. Closing the window or opening
+/// another project asks about it as about other unsaved changes (#1024).
+pub fn black_box_draft_pending(open: &Open, ps: &PanelState, ed: &Editor) -> bool {
+    black_box_draft_refused(ps, ed) || black_box_draft_applies(open, ps, ed)
+}
+
+/// Apply the black box form shown in the Properties panel when it has changes not applied yet
+/// (a form of a box no longer selected is left alone),
 /// as its Apply button does (one undo step): called before the project is saved (#932). A form
 /// read for another version of the box (after an Undo, say) is left alone, as the panel reads
 /// it again. Returns what to check after the change went in (`Ok(Some)`), or why it was refused
 /// (`Err`), which the form also shows.
 pub fn apply_black_box_draft(open: &mut Open, ed: &mut Editor, ps: &mut PanelState) -> Result<Option<String>, String> {
-    let Some(((page, id, hash), form)) = ps.black_box.as_mut() else {
-        return Ok(None);
-    };
-    let current = open
-        .project
-        .pages
-        .get(*page)
-        .and_then(|p| p.symbol(id))
-        .and_then(|s| open.symbols.get(&s.symbol))
-        .map(|sym| sym.hash());
-    if current.as_ref() != Some(hash) || !form.changed() {
+    if !black_box_draft_applies(open, ps, ed) {
         return Ok(None);
     }
+    let Some(((page, id, _), form)) = ps.black_box.as_mut() else {
+        return Ok(None);
+    };
     match apply_box_form(open, ed, form, *page, id) {
         Ok(warnings) => {
             ps.black_box = None;
@@ -1001,12 +1041,8 @@ fn apply_box_form(
     // whose name another point took (also a new point just like the one taken off), would be
     // saved on a stale point: it is dropped, as the assistant's black box edit does. So is one
     // whose start no longer resolves at all.
-    let point_changed = |pin: &str| {
-        renamed.contains_key(pin)
-            || removed.contains(pin)
-            || renamed.values().any(|to| to == pin)
-            || form.old_pins().iter().find(|p| p.name == pin) != pins.iter().find(|p| p.name == pin)
-    };
+    let point_changed =
+        |pin: &str| crate::black_box_tool::point_changed(pin, form.old_pins(), &pins, &renamed, &removed);
     let shown = open.project.pages.get(ed.page);
     let lost = ed.wire.as_ref().is_some_and(|(start, _)| {
         let changed = matches!(
@@ -2069,8 +2105,22 @@ impl Attach {
     }
 }
 
-/// The smallest and largest mounting plate side, in mm, that the panel layout fields take.
-const PLATE_SIDE: std::ops::RangeInclusive<f64> = 10.0..=10_000.0;
+/// The smallest and largest mounting plate side, in mm, that the panel layout fields and the
+/// assistant take.
+pub(crate) const PLATE_SIDE: std::ops::RangeInclusive<f64> = 10.0..=10_000.0;
+
+/// Refuses a plate `width` x `height` with a side outside [`PLATE_SIDE`].
+pub(crate) fn check_plate_size(width: f64, height: f64) -> Result<(), String> {
+    if PLATE_SIDE.contains(&width) && PLATE_SIDE.contains(&height) {
+        Ok(())
+    } else {
+        Err(format!(
+            "The plate width and height must be {} to {} mm, got {width} x {height} mm.",
+            PLATE_SIDE.start(),
+            PLATE_SIDE.end()
+        ))
+    }
+}
 
 /// The panel layout fields, in order: name, plate width, plate height.
 const PANEL_FIELDS: [&str; 3] = ["Name", "Plate width", "Plate height"];
@@ -2104,11 +2154,14 @@ fn enter_panel_field(open: &mut Open, id: &str, field: usize, text: &str) -> Res
                 PLATE_SIDE.end()
             )
         })?;
-        if field == 1 {
-            changed.width = v;
+        let (w, h) = if field == 1 {
+            (v, changed.height)
         } else {
-            changed.height = v;
-        }
+            (changed.width, v)
+        };
+        // As `panel edit` in the CLI: rails, ducts and devices stay where they are, and a size
+        // that would leave any of them sticking out is refused.
+        changed.resize(w, h).map_err(|e| format!("{}.", capitalised(&e)))?;
     }
     if open.project.panels.iter().any(|p| p.id == id && *p != changed) {
         open.checkpoint();
@@ -2117,6 +2170,13 @@ fn enter_panel_field(open: &mut Open, id: &str, field: usize, text: &str) -> Res
         }
     }
     Ok(())
+}
+
+/// `s` with its first letter in upper case.
+fn capitalised(s: &str) -> String {
+    let mut c = s.chars();
+    c.next()
+        .map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
 }
 
 /// Enter what was typed in the panel layout fields and not entered yet, in the panel it was
@@ -2378,6 +2438,24 @@ fn drawing_rows(g: &Shape) -> Vec<(&'static str, String)> {
 mod tests {
     use super::*;
 
+    /// A device picked in the Devices list while a panel layout is shown is shown on its page:
+    /// the panel view closes (#1203).
+    #[test]
+    fn a_device_picked_in_the_list_over_a_panel_shows_its_page() {
+        let mut ed = Editor::default();
+        ed.panel = Some(0);
+        ed.panel_pick = Some(2);
+        show_device(&mut ed, 1, "s1");
+        assert_eq!(ed.page, 1);
+        assert_eq!(ed.panel, None, "the panel view closes");
+        assert_eq!(ed.panel_pick, None);
+        assert_eq!(ed.selection, vec![Selection::Symbol("s1".into())]);
+        // On the page shown already, only the selection changes.
+        show_device(&mut ed, 1, "s2");
+        assert_eq!((ed.page, ed.panel), (1, None));
+        assert_eq!(ed.selection, vec![Selection::Symbol("s2".into())]);
+    }
+
     /// The texts drawn by one frame of `jumper_controls` for `ids` on page `page`.
     fn jumper_texts(o: &mut Open, page: usize, ids: &[String]) -> Vec<String> {
         let ctx = egui::Context::default();
@@ -2626,6 +2704,21 @@ mod tests {
             assert_eq!(h.o.project, before, "{text:?}");
             assert_eq!(h.o.undo_mark(), mark, "{text:?}");
         }
+        // A plate too small for the ducts and rails on it is refused, naming them, as the CLI's
+        // `panel edit` does.
+        for (field, text) in [(1, "100"), (2, "300")] {
+            let (before, mark) = (h.o.project.clone(), h.o.undo_mark());
+            let r = enter_panel_field(&mut h.o, "panel1", field, text);
+            assert!(
+                r.as_ref()
+                    .is_err_and(|e| e.contains("sticking out") && e.contains("duct")),
+                "{text:?}: {r:?}"
+            );
+            assert_eq!(h.o.project, before, "{text:?}");
+            assert_eq!(h.o.undo_mark(), mark, "{text:?}");
+        }
+        // With nothing on it, the plate takes any size in the limits.
+        h.o.project.panels[0].items.clear();
         for (field, text, width, height) in [(1, "10", 10.0, 800.0), (2, " 10000 ", 10.0, 10000.0)] {
             let mark = h.o.undo_mark();
             assert_eq!(enter_panel_field(&mut h.o, "panel1", field, text), Ok(()));
@@ -2731,6 +2824,8 @@ mod tests {
             None,
         )?;
         let mut ed = Editor::default();
+        ed.page = 1;
+        ed.selection = vec![Selection::Symbol(id.clone())];
         let mut ps = PanelState::default();
         assert_eq!(
             apply_black_box_draft(&mut o, &mut ed, &mut ps),
@@ -2744,6 +2839,7 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| black_box_section(ui, &mut o, &mut ed, &mut ps, 1, &id, &t));
         });
         let steps = o.undo_steps();
+        assert!(!black_box_draft_applies(&o, &ps, &ed));
         assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), Ok(None));
         assert_eq!(o.undo_steps(), steps, "an unchanged form applies nothing");
         if let Some((_, f)) = ps.black_box.as_mut() {
@@ -2758,6 +2854,7 @@ mod tests {
             },
             Vec::new(),
         ));
+        assert!(black_box_draft_applies(&o, &ps, &ed));
         assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), Ok(None));
         assert!(ed.wire.is_none(), "the wire from the renamed point is dropped");
         assert_eq!(o.undo_steps(), steps + 1, "one undo step");
@@ -2781,6 +2878,24 @@ mod tests {
         assert!(refused.is_err(), "a duplicate point name is refused");
         assert_eq!(o.undo_steps(), steps + 1);
         assert!(ps.black_box.as_ref().is_some_and(|(_, f)| f.error.is_some()));
+        assert!(black_box_draft_refused(&ps, &ed));
+        // Another item picked: the form is not shown, so a save neither applies it nor counts
+        // it as refused; it is kept for when the box is picked again (#1019).
+        ed.selection = vec![Selection::Symbol("other".into())];
+        assert!(!black_box_draft_refused(&ps, &ed));
+        if let Some((_, f)) = ps.black_box.as_mut() {
+            f.rows.truncate(1);
+            f.rows[0].name = "B".into();
+            f.error = None;
+        }
+        assert!(!black_box_draft_applies(&o, &ps, &ed));
+        assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), Ok(None));
+        assert_eq!(o.undo_steps(), steps + 1, "a hidden form is not applied");
+        assert!(ps.black_box.is_some(), "and is kept");
+        ed.selection = vec![Selection::Symbol(id.clone())];
+        assert!(black_box_draft_applies(&o, &ps, &ed));
+        assert_eq!(apply_black_box_draft(&mut o, &mut ed, &mut ps), Ok(None));
+        assert_eq!(o.undo_steps(), steps + 2, "applied once shown again");
         Ok(())
     }
 
@@ -2803,6 +2918,8 @@ mod tests {
             None,
         )?;
         let mut ed = Editor::default();
+        ed.page = 1;
+        ed.selection = vec![Selection::Symbol(id.clone())];
         let mut ps = PanelState::default();
         let t = Theme::of(&egui::Context::default());
         let ctx = egui::Context::default();
@@ -2845,6 +2962,8 @@ mod tests {
             None,
         )?;
         let mut ed = Editor::default();
+        ed.page = 1;
+        ed.selection = vec![Selection::Symbol(id.clone())];
         let mut ps = PanelState::default();
         let t = Theme::of(&egui::Context::default());
         let ctx = egui::Context::default();

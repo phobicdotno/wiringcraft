@@ -73,8 +73,10 @@ pub fn page_drawings(
     drawings(project, symbols, options, true)
 }
 
-/// As [`page_drawings`], but without the logo and underlays: they are neither looked up nor
-/// warned about, for formats that do not show pictures (DXF).
+/// As [`page_drawings`], but without the logo and underlays, for formats that do not show
+/// pictures (DXF). Their files are not looked up; a warning names each page whose underlay is
+/// left out, the logo once when a sheet has a place for it, and each text the DXF writes with
+/// a `?` ([`dxf_warnings`]).
 pub fn page_lines(
     project: &Project,
     symbols: &BTreeMap<String, Symbol>,
@@ -110,9 +112,14 @@ fn drawings(
             .ok()
             .map(|((mime, size), b)| (mime, size, std::sync::Arc::new(b.clone())))
     });
+    // Without pictures, whether a sheet had a place for the logo, to say it is left out.
+    let mut logo_left_out = false;
     let xref = layout::CrossRefs::build(project, symbols);
     let total = pages.len() + options.panels.len();
-    let logo_pictures = |page: &wc_core::Page| -> Vec<Picture> {
+    let mut logo_pictures = |page: &wc_core::Page| -> Vec<Picture> {
+        if !with_pictures {
+            logo_left_out |= !layout::logo_boxes(project, page).is_empty();
+        }
         let Some((mime, size, bytes)) = &logo else {
             return Vec::new();
         };
@@ -136,6 +143,12 @@ fn drawings(
         .map(|(i, page)| {
             let drawn = layout::draw_page(project, page, i, total, symbols, &xref, options, &mut report.warnings);
             let mut pictures = Vec::new();
+            if let Some(u) = page.underlay.as_ref().filter(|_| !with_pictures) {
+                report.warnings.push(format!(
+                    "page {}: the underlay {} is left out: DXF has no pictures (the SVG export shows it)",
+                    page.number, u.file
+                ));
+            }
             if let Some(u) = page.underlay.as_ref().filter(|_| with_pictures) {
                 let found = picture_bytes(options, &u.file, "underlay")
                     .map_err(|w| format!("page {}: {w}", page.number))
@@ -190,6 +203,17 @@ fn drawings(
             prims: drawn.prims,
             panel: true,
         });
+    }
+    if !with_pictures {
+        for d in &out {
+            report.warnings.extend(dxf_warnings(d, true));
+        }
+    }
+    if let Some(l) = project.meta.logo.as_ref().filter(|_| logo_left_out) {
+        report.warnings.push(format!(
+            "the logo {} is left out: DXF has no pictures (the SVG export shows it)",
+            l.file
+        ));
     }
     (out, report)
 }
@@ -305,6 +329,8 @@ fn rgb(ink: &Stroke) -> String {
     format!("#{:02x}{:02x}{:02x}", c(ink.rgb.0), c(ink.rgb.1), c(ink.rgb.2))
 }
 
+/// `s` escaped for SVG text and attributes. Control characters and U+FFFE and U+FFFF, which
+/// XML does not allow (a viewer refuses the whole file), are left out.
 fn xml(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -313,7 +339,7 @@ fn xml(s: &str) -> String {
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
-            c if c.is_control() => {}
+            c if c.is_control() || matches!(c, '\u{FFFE}' | '\u{FFFF}') => {}
             c => out.push(c),
         }
     }
@@ -512,7 +538,7 @@ fn aci(ink: &Stroke) -> u8 {
 /// DXF text: ASCII as is, anything else as `\U+XXXX`, which DXF readers turn back into text.
 /// A backslash, and a `%` next to another `%`, are written as codes too, so readers do not take
 /// them for a `\U+XXXX` or `%%` code; a character beyond U+FFFF, which has no four-digit code,
-/// becomes `?`.
+/// becomes `?` ([`dxf_warnings`] names the texts that have one).
 pub(crate) fn dxf_text(s: &str) -> String {
     // Control characters are dropped first, so two `%` they stood between are seen as a pair.
     let chars: Vec<char> = s.chars().filter(|c| !c.is_control()).collect();
@@ -523,6 +549,9 @@ pub(crate) fn dxf_text(s: &str) -> String {
         match ch {
             '\\' => out.push_str("\\U+005C"),
             '%' if percent_pair => out.push_str("\\U+0025"),
+            // Caret notation: `^J` is read as a line feed and `^ ` as a caret. A caret at the
+            // end starts no code and stays readable.
+            '^' if i + 1 < chars.len() => out.push_str("\\U+005E"),
             c if c.is_ascii() => out.push(c),
             c if u32::from(c) > 0xFFFF => out.push('?'),
             c => {
@@ -531,6 +560,38 @@ pub(crate) fn dxf_text(s: &str) -> String {
         }
     }
     out
+}
+
+/// A warning for each text on `page` that the DXF writes with a `?` (a character beyond U+FFFF),
+/// naming the page, once per text however often it is on the page. With `name_texts` it quotes
+/// the text and how it is written; without, it leaves the text out (for a log).
+pub fn dxf_warnings(page: &PageDrawing, name_texts: bool) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    page.prims
+        .iter()
+        .filter_map(|p| match p {
+            Prim::Text { text, .. } if text.chars().any(|c| u32::from(c) > 0xFFFF) => Some(text),
+            _ => None,
+        })
+        .filter(|text| seen.insert(text.as_str()))
+        .map(|text| {
+            let what = if name_texts {
+                let shown: String = text
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .map(|c| if u32::from(c) > 0xFFFF { '?' } else { c })
+                    .collect();
+                format!("the text \"{text}\" is written as \"{shown}\"")
+            } else {
+                "a text is written with \"?\"".to_string()
+            };
+            format!(
+                "page {}: {what} in the DXF: a DXF has no code for characters beyond U+FFFF, such as \
+                 emoji (the SVG export keeps them)",
+                page.number
+            )
+        })
+        .collect()
 }
 
 /// A filled outline as DXF SOLID corners (10, 11, 12, 13 in that order; DXF draws them as
@@ -585,6 +646,12 @@ pub(crate) fn solid_triangles(points: &[(f64, f64)]) -> Option<Vec<[(f64, f64); 
     })
 }
 
+/// Whether a stroke is drawn wider than the default 0.25 mm pen, so its DXF polyline carries
+/// the width. Thinner strokes stay plain lines, as a CAD tool draws them at its default weight.
+fn wide(ink: &Stroke) -> bool {
+    ink.width.is_finite() && ink.width > 0.25 + 1e-9
+}
+
 /// A DXF (R12, ASCII) drawing of one page in millimetres, y up with the origin at the page's
 /// bottom left corner, as CAD tools expect.
 pub fn dxf(page: &PageDrawing) -> String {
@@ -633,7 +700,7 @@ pub fn dxf(page: &PageDrawing) -> String {
                             pair(20 + i as u16, &num(y(*py)));
                         }
                     }
-                } else if points.len() == 2 && !closed {
+                } else if points.len() == 2 && !closed && !wide(ink) {
                     pair(0, "LINE");
                     pair(8, layer);
                     pair(62, &colour);
@@ -648,11 +715,22 @@ pub fn dxf(page: &PageDrawing) -> String {
                     pair(66, "1");
                     // A filled path that is not convex stays an outline, closed as its fill is.
                     pair(70, if *closed || *filled { "1" } else { "0" });
+                    // R12 has no line weight: a wide stroke keeps its width as the polyline's
+                    // start and end width, on the polyline and on each vertex.
+                    let w = wide(ink).then(|| num(ink.width));
+                    if let Some(w) = &w {
+                        pair(40, w);
+                        pair(41, w);
+                    }
                     for (px, py) in points {
                         pair(0, "VERTEX");
                         pair(8, layer);
                         pair(10, &num(*px));
                         pair(20, &num(y(*py)));
+                        if let Some(w) = &w {
+                            pair(40, w);
+                            pair(41, w);
+                        }
                     }
                     pair(0, "SEQEND");
                     pair(8, layer);

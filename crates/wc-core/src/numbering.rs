@@ -30,8 +30,11 @@ impl Rule {
         }
     }
 
+    /// The rule named `s`: its [`Rule::name`] in any case, with `_` for `-` (`page_column`,
+    /// as the assistant writes it) and spaces around it ignored.
     pub fn parse(s: &str) -> Option<Rule> {
-        Rule::ALL.into_iter().find(|r| r.name() == s)
+        let s = s.trim().replace('_', "-");
+        Rule::ALL.into_iter().find(|r| r.name().eq_ignore_ascii_case(&s))
     }
 }
 
@@ -207,6 +210,20 @@ mod tests {
             Endpoint::Pin { pin, .. } => pin.parse::<f64>().ok().map(|n| Point::new(n * 10.0, 50.0)),
             Endpoint::Point { at } => Some(*at),
         }
+    }
+
+    #[test]
+    fn a_rule_is_read_in_any_case_with_underscores_or_dashes() {
+        for r in Rule::ALL {
+            assert_eq!(Rule::parse(r.name()), Some(r));
+        }
+        assert_eq!(Rule::parse("page_column"), Some(Rule::PageColumn));
+        assert_eq!(Rule::parse(" Page-Column "), Some(Rule::PageColumn));
+        assert_eq!(Rule::parse("SEQUENTIAL"), Some(Rule::Sequential));
+        assert_eq!(Rule::parse("Potential\n"), Some(Rule::Potential));
+        assert_eq!(Rule::parse("potentials"), None);
+        assert_eq!(Rule::parse("pagecolumn"), None);
+        assert_eq!(Rule::parse(""), None);
     }
 
     #[test]
