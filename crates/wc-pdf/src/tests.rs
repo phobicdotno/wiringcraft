@@ -296,6 +296,27 @@ fn svg_texts_keep_their_spaces() {
 }
 
 #[test]
+fn svg_leaves_out_characters_xml_does_not_allow() {
+    // U+FFFE and U+FFFF are not allowed anywhere in XML: one of them makes viewers refuse the
+    // whole file, so they are left out like control characters.
+    let mut pen = crate::writer::Pen::new(100.0);
+    pen.text((10.0, 10.0), 3.0, 0, "K1\u{FFFE} \u{FFFF}24V\u{7}");
+    let page = PageDrawing {
+        id: "a".into(),
+        number: "1\u{FFFF}".into(),
+        title: "Main\u{FFFE}".into(),
+        size_mm: (100.0, 100.0),
+        prims: pen.prims,
+        pictures: Vec::new(),
+        panel: false,
+    };
+    let s = svg(&page);
+    assert!(!s.contains(['\u{FFFE}', '\u{FFFF}']), "{s}");
+    assert!(s.contains("<title>1 Main</title>"), "{s}");
+    assert!(s.contains(">K1 24V</text>"), "{s}");
+}
+
+#[test]
 fn dxf_fills_junction_dots_and_filled_shapes() {
     let wire = |id: &str, a: (f64, f64), b: (f64, f64)| Wire {
         id: id.into(),
