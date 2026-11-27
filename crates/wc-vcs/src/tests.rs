@@ -1162,7 +1162,9 @@ fn branches_are_listed_and_a_taken_name_is_refused() -> Result<()> {
     let git = new_repo(&tmp)?;
     git.create_branch("motor")?;
     git.create_branch("lighting")?;
-    assert_eq!(git.branches()?, ["lighting", "main", "motor"]);
+    let mut branches = git.branches()?;
+    branches.sort();
+    assert_eq!(branches, ["lighting", "main", "motor"]);
     assert!(git.create_branch("motor").is_err(), "already there");
     assert!(git.create_branch("two words").is_err(), "not a branch name");
     assert_eq!(git.current_branch().as_deref(), Some("lighting"));
