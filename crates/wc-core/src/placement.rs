@@ -64,6 +64,23 @@ pub fn free_tag_like(used: &BTreeSet<DeviceTag>, like: &DeviceTag) -> Option<Dev
     })
 }
 
+/// The first product `<letter>1` to `<letter>9999` that no tag in `used` has, whatever its
+/// function and location, nor has as the first level of a longer product: terminal `-X1.3` or
+/// part `-K1.2` takes `X1` or `K1` too. `None` for an empty letter code or when all are taken.
+pub fn free_product(used: &BTreeSet<DeviceTag>, letter: &str) -> Option<String> {
+    if letter.is_empty() {
+        return None;
+    }
+    let taken: BTreeSet<&str> = used
+        .iter()
+        .filter_map(|t| t.product.first())
+        .map(String::as_str)
+        .collect();
+    (1..10_000)
+        .map(|n| format!("{letter}{n}"))
+        .find(|p| !taken.contains(p.as_str()))
+}
+
 /// Every tag the project uses: on its pages and in its device data.
 pub fn used_tags(project: &Project) -> BTreeSet<DeviceTag> {
     let mut used: BTreeSet<DeviceTag> = project.tag_index().into_keys().collect();
@@ -204,6 +221,21 @@ mod tests {
         p.pages.push(page);
         p.devices.insert(tag("-K1"), device("project's"));
         p
+    }
+
+    #[test]
+    fn a_free_product_skips_device_data_terminals_and_other_functions() {
+        let mut p = project();
+        // -K2 has device data but no symbol (its symbol was deleted); -K3 is in another
+        // function; -X1 is drawn only as its terminals.
+        p.devices.insert(tag("-K2"), device("left behind"));
+        p.pages[0].symbols.push(symbol("s2", "=PUMP-K3"));
+        p.pages[0].symbols.push(symbol("s3", "-X1.3"));
+        let used = used_tags(&p);
+        assert_eq!(free_product(&used, "K").as_deref(), Some("K4"));
+        assert_eq!(free_product(&used, "X").as_deref(), Some("X2"));
+        assert_eq!(free_product(&used, "Q").as_deref(), Some("Q1"));
+        assert_eq!(free_product(&used, ""), None);
     }
 
     #[test]
