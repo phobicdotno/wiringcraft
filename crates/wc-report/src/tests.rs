@@ -3048,6 +3048,16 @@ fn check_finds_a_device_that_draws_more_contacts_than_its_parts_have() {
     overview.symbols.push(place("s30", "nc", 10.0, Some("=A+C1-K1")));
     p.pages.push(overview);
     assert!(overflow(&p, &s, &parts).is_empty());
+
+    // A hand-edited quantity of 0 counts the block once, as the parts list does (#1330):
+    // its NO covers the second NO drawn, and one of the two NCs drawn is too many.
+    p.devices.get_mut(&k1).unwrap().accessories[0].qty = 0;
+    let found = overflow(&p, &s, &parts);
+    assert!(!found.is_empty(), "{found:?}");
+    assert!(
+        found.iter().all(|f| f.message.ends_with("(1 NC too many)")),
+        "{found:?}"
+    );
 }
 
 #[test]
