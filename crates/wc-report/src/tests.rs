@@ -5199,6 +5199,27 @@ fn a_device_drawn_twice_lists_its_pages_in_page_order() {
 }
 
 #[test]
+fn a_symbol_on_an_overview_page_has_no_open_pins() {
+    let (mut p, s, parts) = fixture();
+    let mut overview = Page::new("p9", "9", "Line diagram");
+    overview.overview = true;
+    overview.symbols.push(place("s20", "lamp", 100.0, Some("-P7")));
+    p.pages.push(overview);
+    let open_on = |p: &Project| -> bool {
+        check(&Inputs {
+            project: p,
+            symbols: &s,
+            parts: &parts,
+        })
+        .iter()
+        .any(|f| f.message.starts_with("-P7: pin"))
+    };
+    assert!(!open_on(&p), "an overview copy wires nothing on purpose");
+    p.pages.last_mut().unwrap().overview = false;
+    assert!(open_on(&p), "on a normal page the open pins are noted");
+}
+
+#[test]
 fn project_check_warns_once_about_a_symbol_with_two_pins_of_one_name() {
     let (mut p, mut s, parts) = fixture();
     s.insert("no2".into(), sym("no2", SymbolRole::Auxiliary, &["13", "14", "13"]));
