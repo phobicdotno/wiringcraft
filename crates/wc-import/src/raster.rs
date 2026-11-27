@@ -251,4 +251,208 @@ mod tests {
             .is_none()
         );
     }
+
+    fn grey(w: u32, h: u32, px: &[u8]) -> Option<Raster> {
+        samples_to_png(w, h, 1, 8, false, px)
+    }
+
+    fn rgb_pixels(r: &Raster) -> Option<(u32, u32, Vec<u8>)> {
+        let img = decode(r)?.to_rgb8();
+        Some((img.width(), img.height(), img.into_raw()))
+    }
+
+    #[test]
+    fn sniff_and_extension() {
+        assert_eq!(RasterFormat::sniff(&[0xFF, 0xD8, 0xFF, 0xE0]), Some(RasterFormat::Jpeg));
+        assert_eq!(RasterFormat::sniff(b"\x89PNG\r\n\x1a\n"), Some(RasterFormat::Png));
+        assert_eq!(RasterFormat::sniff(b"GIF89a"), None);
+        assert_eq!(RasterFormat::sniff(&[0xFF]), None, "one byte is not enough for JPEG");
+        assert_eq!(RasterFormat::sniff(&[]), None);
+        assert_eq!(RasterFormat::Jpeg.extension(), "jpg");
+        assert_eq!(RasterFormat::Png.extension(), "png");
+        // What samples_to_png makes is recognised as PNG.
+        let png = grey(1, 1, &[7]);
+        assert_eq!(
+            png.as_ref().and_then(|r| RasterFormat::sniff(&r.bytes)),
+            Some(RasterFormat::Png)
+        );
+        assert_eq!(png.map(|r| r.format), Some(RasterFormat::Png));
+    }
+
+    #[test]
+    fn grey_samples_invert_and_ignore_extra_data() {
+        let plain = grey(2, 1, &[0, 200, 99]);
+        assert_eq!(plain.as_ref().and_then(pixels), Some((2, 1, vec![0, 200])));
+        let inverted = samples_to_png(2, 1, 1, 8, true, &[0, 200]);
+        assert_eq!(inverted.as_ref().and_then(pixels), Some((2, 1, vec![255, 55])));
+    }
+
+    #[test]
+    fn one_bit_rows_are_padded_and_invert_swaps_black_and_white() {
+        // 10 wide needs 2 bytes a row; the padding bits of each row are ignored.
+        let rows = [0b1000_0000, 0b0011_1111, 0b0000_0000, 0b0100_0000];
+        let expect_row0 = [255, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let expect_row1 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 255];
+        let png = samples_to_png(10, 2, 1, 1, false, &rows);
+        assert_eq!(
+            png.as_ref().and_then(pixels),
+            Some((10, 2, [expect_row0, expect_row1].concat()))
+        );
+        let inverted = samples_to_png(10, 2, 1, 1, true, &rows);
+        let flip = |row: [u8; 10]| row.map(|v| 255 - v);
+        assert_eq!(
+            inverted.as_ref().and_then(pixels),
+            Some((10, 2, [flip(expect_row0), flip(expect_row1)].concat()))
+        );
+        // One byte short of the second padded row.
+        assert!(samples_to_png(10, 2, 1, 1, false, &rows[..3]).is_none());
+    }
+
+    #[test]
+    fn rgb_and_cmyk_samples() {
+        let rgb = samples_to_png(2, 1, 3, 8, false, &[255, 0, 0, 10, 20, 30]);
+        assert_eq!(
+            rgb.as_ref().and_then(rgb_pixels),
+            Some((2, 1, vec![255, 0, 0, 10, 20, 30]))
+        );
+        let rgb_inv = samples_to_png(1, 1, 3, 8, true, &[255, 0, 10]);
+        assert_eq!(rgb_inv.as_ref().and_then(rgb_pixels), Some((1, 1, vec![0, 255, 245])));
+        // CMYK: no ink is white, full black is black, full cyan is (0, 255, 255),
+        // and half black halves the remaining colour.
+        let cmyk = samples_to_png(
+            4,
+            1,
+            4,
+            8,
+            false,
+            &[0, 0, 0, 0, 0, 0, 0, 255, 255, 0, 0, 0, 0, 255, 0, 255 - 128],
+        );
+        assert_eq!(
+            cmyk.as_ref().and_then(rgb_pixels),
+            Some((4, 1, vec![255, 255, 255, 0, 0, 0, 0, 255, 255, 128, 0, 128]))
+        );
+        // Inverted CMYK: all-255 samples mean no ink at all.
+        let cmyk_inv = samples_to_png(1, 1, 4, 8, true, &[255, 255, 255, 255]);
+        assert_eq!(
+            cmyk_inv.as_ref().and_then(rgb_pixels),
+            Some((1, 1, vec![255, 255, 255]))
+        );
+    }
+
+    #[test]
+    fn sixteen_bit_samples_keep_the_high_byte() {
+        let grey16 = samples_to_png(2, 1, 1, 16, false, &[0x12, 0xFF, 0xAB, 0x00]);
+        assert_eq!(grey16.as_ref().and_then(pixels), Some((2, 1, vec![0x12, 0xAB])));
+        let rgb16 = samples_to_png(1, 1, 3, 16, true, &[0x10, 1, 0x20, 2, 0x30, 3]);
+        assert_eq!(
+            rgb16.as_ref().and_then(rgb_pixels),
+            Some((1, 1, vec![0xEF, 0xDF, 0xCF]))
+        );
+        // 16-bit CMYK and other bit depths are not handled.
+        assert!(samples_to_png(1, 1, 4, 16, false, &[0; 8]).is_none());
+        assert!(samples_to_png(1, 1, 1, 4, false, &[0; 1]).is_none());
+        assert!(samples_to_png(1, 1, 3, 1, false, &[0; 1]).is_none());
+    }
+
+    #[test]
+    fn upright_flip_x_and_quarter_turn_with_both_flips() {
+        // 3 x 2: rows [10 20 30] and [40 50 60].
+        let Some(png) = grey(3, 2, &[10, 20, 30, 40, 50, 60]) else {
+            unreachable!()
+        };
+        let mirrored = upright(
+            png.clone(),
+            Orientation {
+                flip_x: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            mirrored.as_ref().and_then(pixels),
+            Some((3, 2, vec![30, 20, 10, 60, 50, 40]))
+        );
+        let both = upright(
+            png.clone(),
+            Orientation {
+                flip_x: true,
+                flip_y: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            both.as_ref().and_then(pixels),
+            Some((3, 2, vec![60, 50, 40, 30, 20, 10]))
+        );
+        let turned = upright(
+            png,
+            Orientation {
+                transposed: true,
+                flip_x: true,
+                flip_y: true,
+            },
+        );
+        assert_eq!(
+            turned.as_ref().and_then(pixels),
+            Some((2, 3, vec![60, 30, 50, 20, 40, 10]))
+        );
+    }
+
+    #[test]
+    fn upright_keeps_colour_and_format() {
+        let Some(png) = samples_to_png(2, 1, 3, 8, false, &[255, 0, 0, 0, 0, 255]) else {
+            unreachable!()
+        };
+        let mirrored = upright(
+            png,
+            Orientation {
+                flip_x: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(mirrored.as_ref().map(|r| r.format), Some(RasterFormat::Png));
+        assert_eq!(
+            mirrored.as_ref().and_then(rgb_pixels),
+            Some((2, 1, vec![0, 0, 255, 255, 0, 0]))
+        );
+
+        // A JPEG stays a JPEG and takes the turned size.
+        let Some(img) = grey(4, 2, &[0; 8]).as_ref().and_then(decode) else {
+            unreachable!()
+        };
+        let Some(jpeg) = encode(&img, RasterFormat::Jpeg) else {
+            unreachable!()
+        };
+        assert_eq!(RasterFormat::sniff(&jpeg.bytes), Some(RasterFormat::Jpeg));
+        let turned = upright(
+            jpeg,
+            Orientation {
+                transposed: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(turned.as_ref().map(|r| r.format), Some(RasterFormat::Jpeg));
+        let size = turned.as_ref().and_then(decode).map(|i| (i.width(), i.height()));
+        assert_eq!(size, Some((2, 4)));
+    }
+
+    #[test]
+    fn upright_of_broken_bytes_is_none_unless_already_upright() {
+        let junk = Raster {
+            format: RasterFormat::Png,
+            bytes: b"\x89PNG not really".to_vec(),
+        };
+        assert!(decode(&junk).is_none());
+        assert!(
+            upright(
+                junk.clone(),
+                Orientation {
+                    flip_y: true,
+                    ..Default::default()
+                }
+            )
+            .is_none()
+        );
+        // Upright pictures are passed through untouched, without decoding.
+        assert_eq!(upright(junk.clone(), Orientation::default()), Some(junk));
+    }
 }

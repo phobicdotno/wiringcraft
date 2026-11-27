@@ -98,8 +98,9 @@ pub struct BoxEdit<'a> {
 /// symbol, the wire ends that change and the warnings. A rename of a point the box does not
 /// have, one to itself, or one of a removed point is ignored. Returns `Ok(None)` when nothing
 /// would change. Refuses a symbol that is not a black box, a new box [`crate::black_box`]
-/// refuses, a rename to a point the new box does not have, and a removed point whose wire's
-/// free end would join another wire's free end there that it was not connected to.
+/// refuses, a rename to a point the new box does not have, a removed point whose wire's
+/// free end would join another wire's free end there that it was not connected to, and a
+/// rename to a name the box did not have that a wire already ends on (the two would join).
 pub fn plan(project: &Project, old: &Symbol, edit: &BoxEdit<'_>) -> crate::Result<Option<BoxEditPlan>> {
     let bad = |why: String| Err(crate::Error::Invalid(why));
     if crate::black_box_layout(old).is_none() {
@@ -173,22 +174,34 @@ pub fn plan(project: &Project, old: &Symbol, edit: &BoxEdit<'_>) -> crate::Resul
                 let Some(user) = users.iter().find(|u| u.id == *on) else {
                     continue;
                 };
-                match (old.pin(pin), now_of(pin).and_then(|n| new.pin(&n))) {
-                    (was, None) => {
+                let was = old.pin(pin);
+                // An end on a name the box does not have keeps that name, whatever the old
+                // points are renamed to.
+                let now = if was.is_some() {
+                    now_of(pin).and_then(|n| new.pin(&n))
+                } else {
+                    new.pin(pin)
+                };
+                match (was, now) {
+                    (None, None) => {
+                        warnings.push(format!(
+                            "wire {} on page {} ends on connection point {pin} of {on}, which the box does not have",
+                            w.id, p.number
+                        ));
+                    }
+                    (Some(a), None) => {
                         warnings.push(format!(
                             "wire {} on page {} ended on connection point {pin} of {on}, which is gone: its end stays where the point was",
                             w.id, p.number
                         ));
-                        if let Some(a) = was {
-                            ends.push(EndChange {
-                                page: pi,
-                                wire: wi,
-                                to_end,
-                                end: Endpoint::Point {
-                                    at: a.at.transform(user.rotation, user.mirror) + user.at,
-                                },
-                            });
-                        }
+                        ends.push(EndChange {
+                            page: pi,
+                            wire: wi,
+                            to_end,
+                            end: Endpoint::Point {
+                                at: a.at.transform(user.rotation, user.mirror) + user.at,
+                            },
+                        });
                     }
                     (Some(a), Some(b)) => {
                         // The moved box's points are compared where they are on the page.
@@ -219,6 +232,13 @@ pub fn plan(project: &Project, old: &Symbol, edit: &BoxEdit<'_>) -> crate::Resul
                         }
                     }
                     (None, Some(_)) => {
+                        // A point renamed to its name would join the point's wires to this one.
+                        if let Some((from, _)) = renamed.iter().find(|(_, to)| **to == pin.as_str()) {
+                            return bad(format!(
+                                "wire {} on page {} ends on connection point {pin} of {on}, which the box does not have, and point {from} would be renamed to {pin}: their wires would be joined; move that wire end first",
+                                w.id, p.number
+                            ));
+                        }
                         warnings.push(format!(
                             "wire {} on page {} ends on connection point {pin} of {on}, which the box did not have before: it now ends on the new point",
                             w.id, p.number
@@ -469,6 +489,34 @@ mod tests {
         let err = plan(&p, &sym, &e).err();
         assert!(
             err.as_ref().is_some_and(|e| e.to_string().contains("no box nope")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_rename_onto_a_name_a_wire_already_ends_on_is_refused() {
+        let (mut p, sym) = setup();
+        // w4 ends on Z, which the box does not have.
+        p.pages[0].wires.push(wire("w4", on("b1", "Z"), free(0.0, 0.0)));
+        let d = BTreeSet::new();
+        // A resize keeps w4 as it is and does not call Z gone.
+        let pins = [pin("A", BoxSide::Left, 5.0), pin("B", BoxSide::Right, 5.0)];
+        let plan = run(&p, &sym, &edit((30.0, 10.0), &pins, &BTreeMap::new(), &d));
+        assert!(plan.ends.is_empty());
+        assert!(
+            plan.warnings.contains(
+                &"wire w4 on page 1 ends on connection point Z of b1, which the box does not have".to_owned()
+            ),
+            "{:?}",
+            plan.warnings
+        );
+        // A renamed to Z would put w1 and w4 on one point.
+        let r: BTreeMap<String, String> = [("A".into(), "Z".into())].into();
+        let pins = [pin("Z", BoxSide::Left, 5.0), pin("B", BoxSide::Right, 5.0)];
+        let err = plan_err(&p, &sym, &edit((20.0, 10.0), &pins, &r, &d));
+        assert!(
+            err.as_ref()
+                .is_err_and(|e| e.contains("wire w4") && e.contains("joined")),
             "{err:?}"
         );
     }

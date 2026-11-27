@@ -1245,3 +1245,356 @@ fn check_placements(project: &Project, edit: &ProjectEdit) -> Result<(), Refusal
         _ => Ok(()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{MemoryJournal, Picture};
+
+    fn project() -> Project {
+        let mut p = Project::new("Demo");
+        p.pages.push(Page::new("p1", "1", "Cover"));
+        p.pages.push(Page::new("p2", "2", "Motor"));
+        p
+    }
+
+    fn host() -> Host {
+        Host::new(
+            project(),
+            "Hanna",
+            "hanna@example.com",
+            Box::new(MemoryJournal::default()),
+        )
+    }
+
+    /// A connection that asked to join as `name` and waits for the host.
+    fn pending(h: &mut Host, name: &str) -> PeerId {
+        let id = h.connect();
+        let join = GuestMsg::Join {
+            name: name.into(),
+            email: format!("{}@example.com", name.to_lowercase()),
+            protocol: crate::PROTOCOL_VERSION,
+        };
+        assert!(h.receive(id, join).is_ok());
+        id
+    }
+
+    /// A guest the host let in, with the outbox emptied.
+    fn joined(h: &mut Host, name: &str) -> PeerId {
+        let id = pending(h, name);
+        assert!(h.approve(id));
+        h.take_outbox();
+        id
+    }
+
+    fn to(out: &[(PeerId, HostMsg)], id: PeerId) -> Vec<&HostMsg> {
+        out.iter().filter(|(to, _)| *to == id).map(|(_, m)| m).collect()
+    }
+
+    #[test]
+    fn blank_names_fall_back_and_long_ones_are_cut() {
+        let mut h = Host::new(project(), " \n\t ", "<>", Box::new(MemoryJournal::default()));
+        let Some(me) = h.peers.get(&HOST) else { unreachable!() };
+        assert_eq!(me.author(), "Host <host@localhost>");
+        let id = pending(&mut h, &"x".repeat(150));
+        let Some((_, name, email)) = h.pending().into_iter().find(|(p, _, _)| *p == id) else {
+            unreachable!()
+        };
+        assert_eq!(name.chars().count(), 100);
+        assert_eq!(email, format!("{}@example.com", "x".repeat(150)));
+    }
+
+    #[test]
+    fn messages_under_the_host_id_or_from_an_unknown_connection_get_no_answer() {
+        let mut h = host();
+        assert!(matches!(h.receive(HOST, GuestMsg::Leave), Err(Refusal::Invalid { .. })));
+        assert!(matches!(
+            h.receive(
+                42,
+                GuestMsg::Open {
+                    page: Some("p1".into())
+                }
+            ),
+            Err(Refusal::NotApproved)
+        ));
+        // Nobody to answer: the host itself, or a connection the host does not know.
+        assert!(h.take_outbox().is_empty());
+        assert_eq!(h.peers().len(), 1, "the host stays in the session");
+        assert!(h.locks().is_empty());
+    }
+
+    #[test]
+    fn a_connection_that_has_not_joined_is_refused_and_told_which_request_it_was() {
+        let mut h = host();
+        let id = h.connect();
+        assert!(matches!(
+            h.receive(
+                id,
+                GuestMsg::Open {
+                    page: Some("p1".into())
+                }
+            ),
+            Err(Refusal::NotApproved)
+        ));
+        assert!(matches!(h.receive(id, GuestMsg::Undo), Err(Refusal::NotApproved)));
+        let out = h.take_outbox();
+        let msgs = to(&out, id);
+        assert_eq!(msgs.len(), 2);
+        assert!(matches!(
+            msgs.first(),
+            Some(HostMsg::Refused {
+                refusal: Refusal::NotApproved,
+                take_back: false,
+                edit: None,
+                put_back: None,
+            })
+        ));
+        assert!(matches!(
+            msgs.get(1),
+            Some(HostMsg::Refused {
+                take_back: true,
+                edit: None,
+                ..
+            })
+        ));
+        assert!(h.locks().is_empty());
+        // Leaving before joining tells nobody, and the connection is gone.
+        let other = joined(&mut h, "Otto");
+        assert!(h.receive(id, GuestMsg::Leave).is_ok());
+        assert!(to(&h.take_outbox(), other).is_empty());
+        assert!(matches!(h.receive(id, GuestMsg::Undo), Err(Refusal::NotApproved)));
+        assert!(h.take_outbox().is_empty());
+    }
+
+    #[test]
+    fn only_a_waiting_guest_can_be_approved_or_declined() {
+        let mut h = host();
+        let connected = h.connect();
+        assert!(!h.approve(connected), "it has not asked to join");
+        assert!(!h.decline(connected));
+        assert!(!h.approve(HOST));
+        assert!(!h.decline(HOST));
+        assert!(!h.approve(99));
+        assert!(h.take_outbox().is_empty());
+
+        let id = pending(&mut h, "Gina");
+        assert!(matches!(to(&h.take_outbox(), id).as_slice(), [HostMsg::Waiting]));
+        assert!(h.decline(id));
+        assert!(matches!(
+            to(&h.take_outbox(), id).as_slice(),
+            [HostMsg::Declined { version: None }]
+        ));
+        assert!(h.pending().is_empty());
+        assert!(!h.approve(id), "a declined guest is gone");
+        assert!(!h.decline(id));
+
+        let g = joined(&mut h, "Otto");
+        assert!(!h.approve(g), "already in");
+        assert!(!h.decline(g));
+        // A second join request from a joined guest changes nothing.
+        assert!(
+            h.receive(
+                g,
+                GuestMsg::Join {
+                    name: "Mallory".into(),
+                    email: String::new(),
+                    protocol: crate::PROTOCOL_VERSION,
+                }
+            )
+            .is_ok()
+        );
+        assert!(h.take_outbox().is_empty());
+        assert!(h.peers().iter().any(|p| p.id == g && p.name == "Otto"));
+    }
+
+    #[test]
+    fn only_pictures_in_the_picture_folders_and_of_a_sendable_size_are_shared() {
+        let mut h = host();
+        let logo = format!("{}/logo.png", wc_core::Logo::DIR);
+        let underlay = format!("{}/plan.png", wc_core::Underlay::DIR);
+        h.share_pictures(
+            [
+                (logo.clone(), vec![1, 2, 3]),
+                ("notes/readme.png".to_owned(), vec![1]),
+                (format!("{}/empty.png", wc_core::Logo::DIR), Vec::new()),
+                (underlay.clone(), vec![0; crate::MAX_PICTURE + 1]),
+                (format!("{}/../escape.png", wc_core::Logo::DIR), vec![1]),
+            ]
+            .into(),
+        );
+        let kept: Vec<&String> = h.pictures().keys().collect();
+        assert_eq!(kept, vec![&logo]);
+
+        // A guest gets its welcome first and then each picture; the others only hear who is in.
+        let a = joined(&mut h, "Ada");
+        let b = pending(&mut h, "Bo");
+        h.take_outbox();
+        assert!(h.approve(b));
+        let out = h.take_outbox();
+        let to_b = to(&out, b);
+        assert!(matches!(to_b.first(), Some(HostMsg::Welcome { you, .. }) if *you == b));
+        assert!(matches!(
+            to_b.get(1),
+            Some(HostMsg::Picture { picture: Picture { file, data } }) if *file == logo && *data == vec![1, 2, 3]
+        ));
+        assert_eq!(to_b.len(), 2, "no presence of its own: the welcome has it");
+        assert!(matches!(
+            to(&out, a).as_slice(),
+            [HostMsg::Locks { .. }, HostMsg::Peers { peers }] if peers.len() == 3
+        ));
+    }
+
+    #[test]
+    fn a_refused_open_still_gives_up_the_page_held_before() {
+        let mut h = host();
+        let g = joined(&mut h, "Gina");
+        assert!(
+            h.receive(
+                g,
+                GuestMsg::Open {
+                    page: Some("p1".into())
+                }
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            h.open(Some("p1")),
+            Err(Refusal::PageLocked {
+                page: "p1".into(),
+                by: g
+            })
+        );
+        h.take_outbox();
+
+        assert_eq!(
+            h.receive(
+                g,
+                GuestMsg::Open {
+                    page: Some("p9".into())
+                }
+            ),
+            Err(Refusal::UnknownPage { page: "p9".into() })
+        );
+        assert!(h.locks().is_empty());
+        assert!(h.peers().iter().all(|p| p.page.is_none()));
+        // The guest hears the lock list without its page, then why its switch was refused.
+        let out = h.take_outbox();
+        assert!(matches!(
+            to(&out, g).as_slice(),
+            [
+                HostMsg::Locks { locks },
+                HostMsg::Peers { .. },
+                HostMsg::Refused { refusal: Refusal::UnknownPage { .. }, .. },
+            ] if locks.is_empty()
+        ));
+        // Now the host gets the page.
+        assert!(h.open(Some("p1")).is_ok());
+        assert_eq!(h.locks().get("p1"), Some(&HOST));
+    }
+
+    #[test]
+    fn an_edit_that_changes_nothing_is_answered_only_to_its_author_and_not_recorded() {
+        let mut h = host();
+        let g = joined(&mut h, "Gina");
+        let other = joined(&mut h, "Otto");
+        assert!(
+            h.receive(
+                g,
+                GuestMsg::Open {
+                    page: Some("p1".into())
+                }
+            )
+            .is_ok()
+        );
+        h.take_outbox();
+        // Only the number differs, and a page edit never changes it.
+        let page = Page::new("p1", "77", "Cover");
+        assert!(h.receive(g, GuestMsg::EditPage { page }).is_ok());
+        let out = h.take_outbox();
+        assert!(matches!(
+            to(&out, g).as_slice(),
+            [HostMsg::PageChanged { page, by }] if page.number == "1" && *by == g
+        ));
+        assert!(to(&out, other).is_empty());
+        assert!(h.history().is_empty());
+
+        // The host's own unchanged edit sends nothing at all.
+        assert!(h.open(Some("p2")).is_ok());
+        h.take_outbox();
+        assert!(h.edit_page(Page::new("p2", "2", "Motor")).is_ok());
+        assert!(h.take_outbox().is_empty());
+        assert!(h.history().is_empty());
+    }
+
+    #[test]
+    fn a_page_edit_keeps_the_display_number_and_reaches_everyone() {
+        let mut h = host();
+        let g = joined(&mut h, "Gina");
+        assert!(h.open(Some("p1")).is_ok());
+        h.take_outbox();
+        assert!(h.edit_page(Page::new("p1", "99", "Title page")).is_ok());
+        let Some(page) = h.project().page("p1") else {
+            unreachable!()
+        };
+        assert_eq!((page.number.as_str(), page.title.as_str()), ("1", "Title page"));
+        let out = h.take_outbox();
+        assert!(matches!(
+            to(&out, g).as_slice(),
+            [HostMsg::PageChanged { page, by: HOST }, HostMsg::Recorded { change }]
+                if page.number == "1" && change.message == "Edit page 1 Title page" && change.by == HOST
+        ));
+        // A page someone else holds, or one not open, is not the host's to edit.
+        assert_eq!(
+            h.edit_page(Page::new("p2", "2", "x")),
+            Err(Refusal::NoLock { page: "p2".into() })
+        );
+        assert_eq!(
+            h.edit_page(Page::new("p9", "9", "x")),
+            Err(Refusal::UnknownPage { page: "p9".into() })
+        );
+    }
+
+    #[test]
+    fn take_backs_with_nothing_to_take_back_are_refused() {
+        let mut h = host();
+        assert!(matches!(h.undo(), Err(Refusal::Invalid { reason }) if reason.contains("no change of yours")));
+        assert!(matches!(h.redo(), Err(Refusal::Invalid { reason }) if reason.contains("no undo of yours")));
+        assert!(matches!(h.revert(42), Err(Refusal::Invalid { reason }) if reason.contains("change 42")));
+        let g = joined(&mut h, "Gina");
+        assert!(h.receive(g, GuestMsg::Revert { change: 1 }).is_err());
+        assert!(matches!(
+            to(&h.take_outbox(), g).as_slice(),
+            [HostMsg::Refused { take_back: true, .. }]
+        ));
+    }
+
+    #[test]
+    fn closing_tells_every_connection_and_frees_the_hosts_page_too() {
+        let mut h = host();
+        let g = joined(&mut h, "Gina");
+        let waiting = pending(&mut h, "Wim");
+        let connected = h.connect();
+        assert!(h.open(Some("p1")).is_ok());
+        h.take_outbox();
+        h.close();
+        let out = h.take_outbox();
+        for id in [g, waiting, connected] {
+            assert!(matches!(to(&out, id).as_slice(), [HostMsg::Closed]), "peer {id}");
+        }
+        assert!(to(&out, HOST).is_empty());
+        assert!(h.locks().is_empty());
+        assert!(h.pending().is_empty());
+        let peers = h.peers();
+        assert!(matches!(
+            peers.as_slice(),
+            [Peer {
+                id: HOST,
+                page: None,
+                ..
+            }]
+        ));
+        // Disconnecting the host is no way to drop it.
+        h.disconnect(HOST);
+        assert_eq!(h.peers().len(), 1);
+    }
+}
