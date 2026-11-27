@@ -3076,11 +3076,9 @@ impl Open {
             .max_by_key(|(_, n)| *n)
             .map(|(k, _)| k)
             .unwrap_or_default();
-        let used: std::collections::BTreeSet<String> =
-            self.project.tag_index().keys().map(|t| t.product.join(".")).collect();
-        let product = (1..10_000)
-            .map(|n| format!("{letter}{n}"))
-            .find(|p| !used.contains(p))?;
+        // Device data counts too: a deleted symbol's device keeps its entry (and part), which a
+        // new device must not take over.
+        let product = wc_core::placement::free_product(&wc_core::placement::used_tags(&self.project), letter)?;
         let mut text = String::new();
         if !function.is_empty() {
             text.push_str(&format!("={}", function.join(".")));
@@ -4745,6 +4743,11 @@ fn title_block_of(fields: &[(String, String)]) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// The status line after a Save that wrote `n` files, counted in words that agree.
+pub fn saved_message(n: usize) -> String {
+    format!("Saved ({n} {} changed).", if n == 1 { "file" } else { "files" })
+}
+
 pub fn author_name() -> String {
     std::env::var("WIRINGCRAFT_USER")
         .ok()
@@ -5261,6 +5264,14 @@ fn version_fits(item_id: &str, hash: &str, id: &str, pin: &str) -> Result<(), St
 #[allow(clippy::unwrap_used)]
 pub(crate) mod tests {
     use super::*;
+
+    /// The Save status line counts one file as one file (#1629).
+    #[test]
+    fn the_saved_message_counts_files_in_words_that_agree() {
+        assert_eq!(saved_message(0), "Saved (0 files changed).");
+        assert_eq!(saved_message(1), "Saved (1 file changed).");
+        assert_eq!(saved_message(3), "Saved (3 files changed).");
+    }
 
     /// A part copy that cannot be looked for (say, in a folder that may not be entered) is
     /// reported as unreadable with the reason, not as missing (#1035). The failing lookup is
@@ -9564,6 +9575,24 @@ pub(crate) mod tests {
                 .to_string(),
             "=PUMP+CAB1-K2"
         );
+    }
+
+    #[test]
+    fn placing_skips_the_tag_of_a_deleted_symbols_device_data() {
+        let (_tmp, mut o) = project();
+        let page = o.project.pages.iter().position(|p| p.id == "p0002").unwrap();
+        let id = o.place(page, "wc.coil", Point::new(50.0, 50.0)).unwrap();
+        o.project
+            .devices
+            .get_mut(&DeviceTag::parse("-K1").unwrap())
+            .unwrap()
+            .description = "old".into();
+        o.project.pages[page].remove_symbols_and_wires(&[id.as_str()], &[]);
+        let id2 = o.place(page, "wc.coil", Point::new(80.0, 50.0)).unwrap();
+        let tag = o.project.pages[page].symbol(&id2).unwrap().tag.clone().unwrap();
+        // -K1 keeps its device data, so the new coil does not take it over.
+        assert_eq!(tag.to_string(), "-K2");
+        assert_eq!(o.project.devices[&tag].description, "");
     }
 
     #[test]

@@ -269,6 +269,39 @@ fn a_failed_revert_in_a_linked_worktree_is_undone() -> Result<()> {
     Ok(())
 }
 
+/// A linked worktree of a repository in a folder whose name is not UTF-8 and ends in a space:
+/// `git_path` must name the worktree's real git folder. macOS refuses such file names.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn git_path_in_a_linked_worktree_of_an_odd_folder_is_exact() -> Result<()> {
+    use std::os::unix::ffi::OsStringExt;
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path().join(std::ffi::OsString::from_vec(b"main\xff ".to_vec()));
+    std::fs::create_dir(&dir).map_err(|e| wc_core::Error::io("mkdir", e))?;
+    let git = Git::new(&dir);
+    git.init()?;
+    std::fs::write(dir.join("note.txt"), "one\n").map_err(|e| wc_core::Error::io("write", e))?;
+    git.commit("one")?;
+    let wt = tmp.path().join("wt");
+    let ok = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["worktree", "add", "-q", "-b", "side"])
+        .arg(&wt)
+        .status()
+        .map_err(|e| wc_core::Error::io("git", e))?
+        .success();
+    assert!(ok, "worktree add");
+    let merge_head = Git::new(&wt).git_path("MERGE_HEAD")?;
+    let real = dir.join(".git").join("worktrees").join("wt");
+    assert_eq!(merge_head.parent(), Some(real.as_path()), "{}", merge_head.display());
+    assert!(real.is_dir());
+    // A name ending in a space keeps it.
+    let spaced = Git::new(&wt).git_path("odd ")?;
+    assert_eq!(spaced, real.join("odd "));
+    Ok(())
+}
+
 #[test]
 fn a_resolved_merge_conflict_can_be_committed() -> Result<()> {
     let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
@@ -296,6 +329,124 @@ fn a_resolved_merge_conflict_can_be_committed() -> Result<()> {
             .count(),
         2
     );
+    Ok(())
+}
+
+#[test]
+fn a_merge_conflict_left_with_markers_is_not_committed() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    let git = Git::new(dir);
+    git.init()?;
+    let write = |text: &str| std::fs::write(dir.join("notes.txt"), text).map_err(|e| wc_core::Error::io("notes", e));
+    write("base\n")?;
+    git.commit("base")?;
+    git.create_branch("other")?;
+    write("other\n")?;
+    git.commit("other")?;
+    git.switch("main")?;
+    write("main\n")?;
+    git.commit("main")?;
+    let before = git.head();
+    assert_eq!(git.merge("other")?, MergeOutcome::Conflicts(vec!["notes.txt".into()]));
+    // Not edited yet: git left its markers in the file.
+    let result = git.commit("Merge other");
+    assert!(result.is_err(), "committed {result:?} with conflict markers");
+    let err = result.err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(err.contains("conflict markers") && err.contains("notes.txt"), "{err}");
+    assert_eq!(git.head(), before);
+    assert!(dir.join(".git").join("MERGE_HEAD").exists());
+    // Still conflicted, so the merge can be resolved or aborted as before.
+    assert_eq!(
+        git.run(&["diff", "--name-only", "--diff-filter=U"])?.trim(),
+        "notes.txt"
+    );
+    assert!(git.commit_paths_as("Merge other", "A <a@b>", &["notes.txt"]).is_err());
+    write("both\n")?;
+    assert!(git.commit("Merge other")?.is_some());
+    assert!(!dir.join(".git").join("MERGE_HEAD").exists());
+    Ok(())
+}
+
+/// A merge left with `notes.txt` conflicted in the repository `git` works in, whose files are
+/// under `dir`. Returns the head before the merge.
+fn conflicted_merge(git: &Git, dir: &std::path::Path) -> Result<Option<String>> {
+    let write = |text: &str| std::fs::write(dir.join("notes.txt"), text).map_err(|e| wc_core::Error::io("notes", e));
+    write("base\n")?;
+    git.commit("base")?;
+    git.create_branch("other")?;
+    write("other\n")?;
+    git.commit("other")?;
+    git.switch("main")?;
+    write("main\n")?;
+    git.commit("main")?;
+    let before = git.head();
+    assert!(matches!(git.merge("other")?, MergeOutcome::Conflicts(_)));
+    Ok(before)
+}
+
+#[test]
+fn markers_are_found_in_a_project_inside_a_parent_repository() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    Git::new(tmp.path()).init()?;
+    let dir = tmp.path().join("project");
+    std::fs::create_dir(&dir).map_err(|e| wc_core::Error::io("project", e))?;
+    let git = Git::new(&dir);
+    let before = conflicted_merge(&git, &dir)?;
+    // git names the file project/notes.txt; it is read there, not at project/project/notes.txt.
+    let result = git.commit("Merge other");
+    let err = result.err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(err.contains("conflict markers") && err.contains("notes.txt"), "{err}");
+    assert_eq!(git.head(), before);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn markers_are_found_in_a_repository_whose_folder_ends_in_a_space_or_cr_or_is_not_utf8() -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut names: Vec<&[u8]> = vec![b"repo ", b"repo\r"];
+    // macOS refuses a file name that is not UTF-8.
+    if cfg!(target_os = "linux") {
+        names.push(b"repo\xff");
+    }
+    for name in names {
+        let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+        let dir = tmp.path().join(std::ffi::OsStr::from_bytes(name));
+        std::fs::create_dir(&dir).map_err(|e| wc_core::Error::io("repo", e))?;
+        let git = Git::new(&dir);
+        git.init()?;
+        let before = conflicted_merge(&git, &dir)?;
+        let result = git.commit("Merge other");
+        let err = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            err.contains("conflict markers") && err.contains("notes.txt"),
+            "{:?}: {err}",
+            dir
+        );
+        assert_eq!(git.head(), before);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_conflicted_file_that_cannot_be_read_is_an_error_naming_it() -> Result<()> {
+    let tmp = tempfile::tempdir().map_err(|e| wc_core::Error::io("tmp", e))?;
+    let dir = tmp.path();
+    let git = Git::new(dir);
+    git.init()?;
+    let before = conflicted_merge(&git, dir)?;
+    // A link to itself cannot be read (even by root), and is not a removed file.
+    let notes = dir.join("notes.txt");
+    std::fs::remove_file(&notes).map_err(|e| wc_core::Error::io("notes", e))?;
+    std::os::unix::fs::symlink("notes.txt", &notes).map_err(|e| wc_core::Error::io("link", e))?;
+    let result = git.commit("Merge other");
+    assert!(
+        matches!(&result, Err(Error::Io { path, .. }) if path.ends_with("notes.txt")),
+        "{result:?}"
+    );
+    assert_eq!(git.head(), before);
     Ok(())
 }
 

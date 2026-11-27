@@ -3119,9 +3119,16 @@ impl App {
                     .and_then(|i| open.project.pages.get(i))
                     .map(|p| p.id.clone())
                     .ok_or("No such page.")?;
-                let at = match (num(v, "x"), num(v, "y")) {
-                    (Some(x), Some(y)) => Some(Point::new(x, y)),
-                    _ => None,
+                // Both or neither: one alone, or a value that is not a number, is refused
+                // rather than quietly turned into a comment about the whole page.
+                let given = |key: &str| v.get(key).is_some_and(|x| !x.is_null());
+                let at = match (given("x"), given("y")) {
+                    (false, false) => None,
+                    (true, true) => match (num(v, "x"), num(v, "y")) {
+                        (Some(x), Some(y)) => Some(Point::new(x, y)),
+                        _ => return Err("`x` and `y` must be numbers.".into()),
+                    },
+                    _ => return Err("Give both `x` and `y` to pin the comment, or neither for the whole page.".into()),
                 };
                 let mut project = open.project.clone();
                 let id = project
@@ -3717,7 +3724,7 @@ impl App {
         match action {
             "save" => {
                 let n = open.save()?;
-                Ok(format!("Saved ({n} files changed)."))
+                Ok(crate::state::saved_message(n))
             }
             "commit" => {
                 let msg = need_s(v, "message")?;
@@ -4357,6 +4364,7 @@ mod tests {
             strip_editor: None,
             show_layers: false,
             live: Default::default(),
+            check_follows_live: false,
             fetch: None,
             importing: None,
             after_typed: Vec::new(),
@@ -10967,6 +10975,35 @@ mod tests {
     }
 
     #[test]
+    fn comments_add_refuses_half_a_position() {
+        let (_tmp, mut a) = app(vec![]);
+        for bad in [
+            json!({"action": "add", "page": "1", "text": "Here", "x": 10}),
+            json!({"action": "add", "page": "1", "text": "Here", "y": 10}),
+            json!({"action": "add", "page": "1", "text": "Here", "x": "10", "y": 10}),
+            json!({"action": "add", "page": "1", "text": "Here", "x": 10, "y": null}),
+        ] {
+            assert!(call(&mut a, "comments", bad.clone()).is_err(), "{bad}");
+        }
+        assert!(a.open.as_ref().unwrap().project.comments.is_empty());
+        call(
+            &mut a,
+            "comments",
+            json!({"action": "add", "page": "1", "text": "Page"}),
+        )
+        .unwrap();
+        call(
+            &mut a,
+            "comments",
+            json!({"action": "add", "page": "1", "text": "Pin", "x": 10, "y": 20}),
+        )
+        .unwrap();
+        let comments = &a.open.as_ref().unwrap().project.comments;
+        assert_eq!(comments[0].at, None);
+        assert_eq!(comments[1].at, Some(Point::new(10.0, 20.0)));
+    }
+
+    #[test]
     fn edit_page_json_replaces_the_page_and_keeps_its_id() {
         let (_tmp, mut a) = app(vec![]);
         let content = json!({
@@ -12715,5 +12752,38 @@ mod tests {
         escape_in_panel_view(&mut a);
         assert_eq!(panel_device_at(&a), first);
         a.share.stop();
+    }
+
+    #[test]
+    fn the_check_list_from_the_live_count_follows_the_live_check() {
+        let (_tmp, mut a) = app(vec![]);
+        let f = |message: &str| wc_report::Finding {
+            severity: wc_report::Severity::Error,
+            page_id: None,
+            item: None,
+            message: message.into(),
+        };
+        let shown = |a: &App| match &a.dialog {
+            Some(Dialog::Check(found)) => found.iter().map(|f| f.message.clone()).collect::<Vec<_>>(),
+            _ => vec!["(the check list is not open)".to_string()],
+        };
+        a.ed.live = vec![f("one")];
+        a.show_live_check_list();
+        a.ed.live = vec![f("one"), f("two")];
+        a.follow_live_check();
+        assert_eq!(shown(&a), ["one", "two"], "follows what the live check found since");
+        // Check project shows a check run now: the live findings no longer replace it.
+        a.show_check();
+        let run = shown(&a);
+        a.ed.live = vec![f("three")];
+        a.follow_live_check();
+        assert_eq!(shown(&a), run);
+        // Closed, and opened again from the count: it follows again.
+        a.dialog = None;
+        a.follow_live_check();
+        a.show_live_check_list();
+        a.ed.live = vec![f("four")];
+        a.follow_live_check();
+        assert_eq!(shown(&a), ["four"]);
     }
 }

@@ -578,3 +578,281 @@ impl Guest {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Parts, Picture, Snapshot, VersionMismatch};
+
+    const ME: PeerId = 7;
+    const OTHER: PeerId = 9;
+
+    fn project() -> Project {
+        let mut p = Project::new("Demo");
+        p.pages.push(Page::new("p1", "1", "Cover"));
+        p.pages.push(Page::new("p2", "2", "Motor"));
+        p
+    }
+
+    fn peer(id: PeerId, name: &str) -> Peer {
+        Peer {
+            id,
+            name: name.into(),
+            page: None,
+        }
+    }
+
+    /// A guest the host welcomed as `ME`, with `OTHER` in the session too.
+    fn joined(locks: &[(&str, PeerId)]) -> Guest {
+        let mut g = Guest::new();
+        let _ = g.join("Gina", "gina@example.com");
+        g.handle(HostMsg::Welcome {
+            you: ME,
+            project: Box::new(Snapshot::from(&project())),
+            locks: locks.iter().map(|(p, h)| ((*p).to_owned(), *h)).collect(),
+            peers: vec![peer(ME, "Gina"), peer(OTHER, "Otto")],
+            history: Vec::new(),
+            protocol: crate::PROTOCOL_VERSION,
+        });
+        g
+    }
+
+    fn title(g: &Guest, page: &str) -> Option<String> {
+        g.project.as_ref()?.page(page).map(|p| p.title.clone())
+    }
+
+    #[test]
+    fn locked_by_names_only_someone_else_and_only_a_known_peer() {
+        let g = joined(&[("p1", ME), ("p2", OTHER), ("p3", 42)]);
+        assert!(g.locked_by("p1").is_none(), "this guest's own page is not read-only");
+        assert_eq!(g.locked_by("p2").map(|p| p.name.as_str()), Some("Otto"));
+        // A holder not in the peer list (yet) is not named.
+        assert!(g.locked_by("p3").is_none());
+        assert!(g.locked_by("nope").is_none());
+        assert!(g.can_edit("p1"));
+        assert!(!g.can_edit("p2"));
+    }
+
+    #[test]
+    fn nothing_is_editable_before_the_welcome_even_with_no_lock() {
+        let mut g = Guest::new();
+        assert_eq!(g.status, GuestStatus::Idle);
+        // No id yet: an empty lock table must not read as "held by me".
+        assert!(!g.can_edit("p1"));
+        let msg = g.join("Gina", "gina@example.com");
+        assert_eq!(g.status, GuestStatus::Waiting);
+        assert!(matches!(
+            msg,
+            GuestMsg::Join { protocol, .. } if protocol == crate::PROTOCOL_VERSION
+        ));
+        assert!(g.edit_page(Page::new("p1", "1", "Cover")).is_none());
+    }
+
+    #[test]
+    fn closing_the_page_waits_for_a_lock_list_without_this_guest() {
+        let mut g = joined(&[("p1", ME), ("p2", OTHER)]);
+        let msg = g.open(None);
+        assert!(matches!(msg, GuestMsg::Open { page: None }));
+        // The own lock is dropped at once, the other's kept.
+        assert_eq!(g.locks.get("p1"), None);
+        assert_eq!(g.locks.get("p2"), Some(&OTHER));
+        // An old list still naming this guest does not end the switch.
+        g.handle(HostMsg::Locks {
+            locks: [("p1".to_owned(), ME)].into(),
+        });
+        assert!(!g.can_edit("p1"));
+        g.handle(HostMsg::Locks {
+            locks: [("p2".to_owned(), OTHER)].into(),
+        });
+        // Switch over: opening p1 again and getting it makes it editable.
+        let _ = g.open(Some("p1"));
+        g.handle(HostMsg::Locks {
+            locks: [("p1".to_owned(), ME), ("p2".to_owned(), OTHER)].into(),
+        });
+        assert!(g.can_edit("p1"));
+    }
+
+    #[test]
+    fn a_refused_switch_to_a_locked_or_missing_page_ends_the_wait() {
+        for refusal in [
+            Refusal::PageLocked {
+                page: "p2".into(),
+                by: OTHER,
+            },
+            Refusal::UnknownPage { page: "p2".into() },
+        ] {
+            let mut g = joined(&[("p2", OTHER)]);
+            let _ = g.open(Some("p2"));
+            g.handle(HostMsg::Locks {
+                locks: [("p1".to_owned(), ME)].into(),
+            });
+            // The list hands back a page, but the switch to p2 is still unanswered.
+            assert!(!g.can_edit("p1"));
+            g.handle(HostMsg::Refused {
+                refusal,
+                take_back: false,
+                edit: None,
+                put_back: None,
+            });
+            assert!(g.can_edit("p1"));
+            assert_eq!(g.refusals.len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_page_edit_keeps_the_display_number_and_only_the_last_answer_is_applied() {
+        let mut g = joined(&[("p1", ME)]);
+        assert!(g.edit_page(Page::new("p1", "99", "First")).is_some());
+        let number = g.project.as_ref().and_then(|p| p.page("p1")).map(|p| p.number.clone());
+        assert_eq!(
+            number.as_deref(),
+            Some("1"),
+            "the number is not the page edit's to change"
+        );
+        assert!(g.edit_page(Page::new("p1", "1", "Second")).is_some());
+        // The answer to the first edit arrives: the second is still on its way.
+        g.handle(HostMsg::PageChanged {
+            page: Page::new("p1", "1", "First (host)"),
+            by: ME,
+        });
+        assert_eq!(title(&g, "p1").as_deref(), Some("Second"));
+        g.handle(HostMsg::PageChanged {
+            page: Page::new("p1", "1", "Second (host)"),
+            by: ME,
+        });
+        assert_eq!(title(&g, "p1").as_deref(), Some("Second (host)"));
+        // A page this copy does not have is not edited.
+        assert!(g.edit_page(Page::new("p9", "9", "Ghost")).is_none());
+    }
+
+    #[test]
+    fn an_edit_of_a_page_that_is_gone_counts_as_answered() {
+        let mut g = joined(&[("p1", ME)]);
+        assert!(g.edit_page(Page::new("p1", "1", "Mine")).is_some());
+        g.handle(HostMsg::Refused {
+            refusal: Refusal::UnknownPage { page: "p1".into() },
+            take_back: false,
+            edit: None,
+            put_back: None,
+        });
+        // Nothing is in flight any more, so the next page from the host is taken.
+        g.handle(HostMsg::PageChanged {
+            page: Page::new("p1", "1", "Host"),
+            by: OTHER,
+        });
+        assert_eq!(title(&g, "p1").as_deref(), Some("Host"));
+    }
+
+    #[test]
+    fn only_a_restore_by_this_guest_ends_a_take_back() {
+        let mut g = joined(&[]);
+        let _ = g.undo();
+        let _ = g.revert(3);
+        let restore = || ProjectEdit::Restore {
+            parts: Box::new(Parts::default()),
+        };
+        g.handle(HostMsg::ProjectChanged {
+            edit: restore(),
+            by: OTHER,
+            seq: None,
+        });
+        assert!(g.taking_back());
+        g.handle(HostMsg::ProjectChanged {
+            edit: restore(),
+            by: ME,
+            seq: None,
+        });
+        assert!(g.taking_back(), "one of two take-backs is still on its way");
+        g.handle(HostMsg::ProjectChanged {
+            edit: restore(),
+            by: ME,
+            seq: None,
+        });
+        assert!(!g.taking_back());
+        // An extra one never wraps the count.
+        g.handle(HostMsg::ProjectChanged {
+            edit: restore(),
+            by: ME,
+            seq: None,
+        });
+        assert!(!g.taking_back());
+    }
+
+    #[test]
+    fn project_edits_are_numbered_and_each_answer_clears_one() {
+        let mut g = joined(&[]);
+        assert_eq!(g.last_edit(), 0);
+        let renumber = ProjectEdit::Renumber {
+            numbers: vec![("p2".into(), "20".into())],
+        };
+        let GuestMsg::EditProject { seq: one, .. } = g.edit_project(renumber.clone()) else {
+            unreachable!()
+        };
+        let GuestMsg::EditProject { seq: two, .. } = g.edit_project(ProjectEdit::RemovePanel { id: "x".into() }) else {
+            unreachable!()
+        };
+        assert_eq!((one, two), (1, 2));
+        assert_eq!(g.unanswered_edits(), 2);
+        // Applied here at once.
+        let number = g.project.as_ref().and_then(|p| p.page("p2")).map(|p| p.number.clone());
+        assert_eq!(number.as_deref(), Some("20"));
+        g.handle(HostMsg::Unchanged { seq: two });
+        assert_eq!(g.unanswered_edits(), 1);
+        g.handle(HostMsg::ProjectChanged {
+            edit: renumber,
+            by: ME,
+            seq: Some(one),
+        });
+        assert_eq!(g.unanswered_edits(), 0);
+        // An answer to an unknown seq changes nothing.
+        g.handle(HostMsg::Unchanged { seq: 99 });
+        assert_eq!(g.unanswered_edits(), 0);
+    }
+
+    #[test]
+    fn closing_drops_locks_and_every_wait() {
+        let mut g = joined(&[("p1", ME)]);
+        let _ = g.undo();
+        let _ = g.edit_project(ProjectEdit::RemovePage { id: "p2".into() });
+        g.handle(HostMsg::Closed);
+        assert_eq!(g.status, GuestStatus::Closed);
+        assert!(g.locks.is_empty());
+        assert!(!g.taking_back());
+        assert_eq!(g.unanswered_edits(), 0);
+        assert!(!g.can_edit("p1"));
+    }
+
+    #[test]
+    fn a_decline_reads_as_declined_or_as_the_wrong_version() {
+        let mut g = Guest::new();
+        let _ = g.join("Gina", "gina@example.com");
+        g.handle(HostMsg::Declined { version: None });
+        assert_eq!(g.status, GuestStatus::Declined);
+        let v = VersionMismatch { host: 1, guest: 2 };
+        g.handle(HostMsg::Declined { version: Some(v) });
+        assert_eq!(g.status, GuestStatus::WrongVersion(v));
+    }
+
+    #[test]
+    fn pictures_and_taken_picture_names_are_kept_with_their_edit() {
+        let mut g = joined(&[]);
+        g.handle(HostMsg::Picture {
+            picture: Picture {
+                file: "pictures/logo.png".into(),
+                data: vec![1, 2, 3],
+            },
+        });
+        assert_eq!(g.pictures.get("pictures/logo.png"), Some(&vec![1, 2, 3]));
+        g.handle(HostMsg::Refused {
+            refusal: Refusal::PictureNameTaken {
+                file: "pictures/logo.png".into(),
+            },
+            take_back: false,
+            edit: Some(4),
+            put_back: None,
+        });
+        assert_eq!(g.names_taken, vec![("pictures/logo.png".to_owned(), Some(4))]);
+        assert!(g.refused_edits.contains(&4));
+        assert_eq!(g.refusals.len(), 1);
+    }
+}
