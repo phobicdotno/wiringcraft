@@ -255,13 +255,14 @@ fn is_white_rgb(f: &str) -> bool {
 }
 
 /// A length in an absolute unit (`mm`, `cm`, `Q`, `in`, `pt`, `pc`) in millimetres. A bare
-/// number, `px` and relative units give `None`: the user unit then stays one millimetre.
+/// number, `px` and relative units give `None`: the user unit then stays one millimetre. Units
+/// are matched in any letter case, as CSS reads them (`160q` is `160Q`).
 fn length_mm(v: &str) -> Option<f64> {
-    let v = v.trim();
+    let v = v.trim().to_ascii_lowercase();
     let (n, per) = [
         ("mm", 1.0),
         ("cm", 10.0),
-        ("Q", 0.25),
+        ("q", 0.25),
         ("in", 25.4),
         ("pt", 25.4 / 72.0),
         ("pc", 25.4 / 6.0),
@@ -987,6 +988,8 @@ mod tests {
             "4cm",
             "40mm ",
             "160Q",
+            "160q",
+            "4CM",
             "113.38582677165354pt",
             "9.448818897637796pc",
         ] {
