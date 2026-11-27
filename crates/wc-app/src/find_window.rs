@@ -8,6 +8,8 @@ use wc_core::project::Project;
 
 use crate::state::Selection;
 
+const WINDOW_TITLE: &str = "Find and replace";
+
 /// The find window's fields and its last search.
 #[derive(Debug, Default)]
 pub struct FindState {
@@ -23,6 +25,10 @@ pub struct FindState {
     searched: Option<(String, bool)>,
     searched_in: Option<Project>,
     pub message: String,
+    /// Set by Find (Ctrl+F) while the window is already open: the next frame brings the window
+    /// to the front and gives the Find field the keyboard with its text selected, so typing
+    /// starts a new search.
+    pub focus_query: bool,
 }
 
 /// What the window asks the app to do.
@@ -87,7 +93,10 @@ impl FindState {
     pub fn show(&mut self, ctx: &egui::Context, project: &Project) -> FindOutcome {
         let mut out = FindOutcome::None;
         let mut open = true;
-        egui::Window::new("Find and replace")
+        if self.focus_query {
+            ctx.move_to_top(egui::LayerId::new(egui::Order::Middle, egui::Id::new(WINDOW_TITLE)));
+        }
+        egui::Window::new(WINDOW_TITLE)
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
@@ -95,9 +104,19 @@ impl FindState {
             .show(ctx, |ui| {
                 egui::Grid::new("find-fields").num_columns(2).show(ui, |ui| {
                     ui.label("Find");
-                    let field = ui.add(egui::TextEdit::singleline(&mut self.query).desired_width(280.0));
-                    if self.searched.is_none() {
-                        field.request_focus();
+                    let mut field = egui::TextEdit::singleline(&mut self.query)
+                        .desired_width(280.0)
+                        .show(ui);
+                    if self.searched.is_none() || self.focus_query {
+                        field.response.request_focus();
+                    }
+                    if std::mem::take(&mut self.focus_query) {
+                        let all = egui::text::CCursorRange::two(
+                            egui::text::CCursor::new(0),
+                            egui::text::CCursor::new(self.query.chars().count()),
+                        );
+                        field.state.cursor.set_char_range(Some(all));
+                        field.state.store(ui.ctx(), field.response.id);
                     }
                     ui.end_row();
                     ui.label("Replace with");
@@ -141,6 +160,7 @@ impl FindState {
                     if ui
                         .add_enabled(any, egui::Button::new("Replace ticked"))
                         .on_hover_text("Replace in the ticked hits, as one undo step. A device tag is renamed everywhere it appears.")
+                        .on_disabled_hover_text(self.replace_blocked())
                         .clicked()
                     {
                         out = FindOutcome::Replace;
@@ -157,6 +177,20 @@ impl FindState {
             out = FindOutcome::Close;
         }
         out
+    }
+}
+
+impl FindState {
+    /// Why Replace ticked is greyed out: egui shows no hover text on a disabled button, so
+    /// this one says what is missing instead.
+    fn replace_blocked(&self) -> &'static str {
+        if self.query.is_empty() {
+            "Type what to find first."
+        } else if self.hits.is_empty() {
+            "Nothing found to replace."
+        } else {
+            "Tick a hit to replace in it."
+        }
     }
 }
 
@@ -278,6 +312,65 @@ mod tests {
         q.pages[0].graphics.clear();
         f.refresh(&q);
         assert!(f.hits.is_empty());
+    }
+
+    /// Find (Ctrl+F) with the window already open gives the Find field the keyboard again,
+    /// with its text selected so typing replaces it.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn find_again_takes_the_keyboard_back_to_the_find_field() {
+        let p = project();
+        let ctx = egui::Context::default();
+        let mut f = FindState {
+            query: "pump".into(),
+            ..Default::default()
+        };
+        let frame = |f: &mut FindState| {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                f.show(ctx, &p);
+            });
+        };
+        frame(&mut f);
+        let focused = ctx.memory(|m| m.focused());
+        assert!(focused.is_some(), "a new window's Find field has the keyboard");
+        let field = focused.unwrap();
+        // The keyboard goes elsewhere (the Replace field, or the page).
+        ctx.memory_mut(|m| m.surrender_focus(field));
+        frame(&mut f);
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            None,
+            "an open window does not take it back by itself"
+        );
+        f.focus_query = true;
+        frame(&mut f);
+        assert!(!f.focus_query);
+        assert_eq!(ctx.memory(|m| m.focused()), Some(field));
+        let range = egui::TextEdit::load_state(&ctx, field)
+            .and_then(|s| s.cursor.char_range())
+            .unwrap();
+        let (a, b) = (
+            range.primary.index.min(range.secondary.index),
+            range.primary.index.max(range.secondary.index),
+        );
+        assert_eq!((a, b), (0, 4), "the whole text is selected");
+    }
+
+    #[test]
+    fn a_greyed_out_replace_says_what_is_missing() {
+        let p = project();
+        let mut f = FindState::default();
+        f.refresh(&p);
+        assert_eq!(f.replace_blocked(), "Type what to find first.");
+        f.query = "no such text anywhere".into();
+        f.refresh(&p);
+        assert!(f.hits.is_empty());
+        assert_eq!(f.replace_blocked(), "Nothing found to replace.");
+        f.query = "pump".into();
+        f.refresh(&p);
+        assert!(!f.hits.is_empty());
+        f.chosen.iter_mut().for_each(|c| *c = false);
+        assert_eq!(f.replace_blocked(), "Tick a hit to replace in it.");
     }
 
     #[test]

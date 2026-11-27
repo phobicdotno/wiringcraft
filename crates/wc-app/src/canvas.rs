@@ -2187,6 +2187,18 @@ fn drag_released(open: &mut Open, ed: &mut Editor, alt: bool) {
     if let Some(Drag::Move { .. }) = ed.drag {
         open.end_drag_move();
     }
+    // Dragged back to where it started, with nothing else recorded since its checkpoint: no
+    // move was made, so it leaves no undo step and wires nothing (#1350).
+    if let Some(Drag::Move {
+        checkpoint: true, step, ..
+    }) = ed.drag
+        && open.history_count() == step
+        && open.before_last_change() == Some(&open.project)
+    {
+        open.forget_last_change();
+        ed.drag = None;
+        return;
+    }
     if let Some(Drag::Move { checkpoint: true, .. }) = ed.drag {
         let moved = ed
             .selection
@@ -5474,6 +5486,48 @@ mod tests {
         assert_eq!(ed.message, "Deleted 2 wires.");
         assert!(o.undo());
         assert_eq!(o.project.pages[page], before, "one undo brings both back");
+    }
+
+    #[test]
+    fn a_move_dragged_back_to_its_start_leaves_no_undo_step_and_wires_nothing() {
+        let (_tmp, mut o, mut ed, coil) = moving_coil();
+        let page = ed.page;
+        // The coil already lines up under the contact, with no wire between them.
+        if let Some(s) = o.project.pages[page].symbols.iter_mut().find(|s| s.id == coil) {
+            s.at = Point::new(50.0, 60.0);
+        }
+        let before = o.project.clone();
+        let steps = o.undo_steps();
+        ed.drag = Some(Drag::Move {
+            from: Point::new(0.0, 0.0),
+            checkpoint: false,
+            page: o.project.pages[page].id.clone(),
+            step: 0,
+            id: 0,
+            items: Some(ed.selection.clone()),
+        });
+        move_drag_to(&mut o, &mut ed, Point::new(40.0, 0.0));
+        assert_ne!(o.project.pages, before.pages, "the coil moved away");
+        move_drag_to(&mut o, &mut ed, Point::new(0.0, 0.0));
+        drag_released(&mut o, &mut ed, false);
+        assert!(ed.drag.is_none());
+        assert_eq!(o.project, before, "back where it started");
+        assert!(o.project.pages[page].wires.is_empty(), "no wire added");
+        assert_eq!(o.undo_steps(), steps, "no undo step left behind");
+        assert!(ed.message.is_empty(), "{}", ed.message);
+
+        // A real move still wires and is one undo step.
+        ed.drag = Some(Drag::Move {
+            from: Point::new(0.0, 0.0),
+            checkpoint: false,
+            page: o.project.pages[page].id.clone(),
+            step: 0,
+            id: 0,
+            items: Some(ed.selection.clone()),
+        });
+        move_drag_to(&mut o, &mut ed, Point::new(40.0, 0.0));
+        drag_released(&mut o, &mut ed, false);
+        assert_eq!(o.undo_steps(), steps + 1);
     }
 
     #[test]

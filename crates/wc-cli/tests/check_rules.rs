@@ -94,6 +94,10 @@ fn check_runs_the_rules_in_project_toml() -> TestResult {
         "{stdout}"
     );
     assert!(!stdout.contains("-X1.1 does not match"), "{stdout}");
+    // One error is counted as one, not "1 errors".
+    assert!(stdout.contains("\n1 error, "), "{stdout}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("the project check found 1 error\n"), "{stderr}");
 
     // A cable on the motor's wire satisfies rule 1.
     wiringcraft(

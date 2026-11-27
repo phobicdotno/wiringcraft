@@ -64,10 +64,18 @@ pub fn free_tag_like(used: &BTreeSet<DeviceTag>, like: &DeviceTag) -> Option<Dev
     })
 }
 
-/// Every tag the project uses: on its pages and in its device data.
+/// Every tag the project uses: on its pages, in its device data and as the cable of a wire
+/// core (a cable with cores but no symbol drawn and no device entry is still taken).
 pub fn used_tags(project: &Project) -> BTreeSet<DeviceTag> {
     let mut used: BTreeSet<DeviceTag> = project.tag_index().into_keys().collect();
     used.extend(project.devices.keys().cloned());
+    used.extend(
+        project
+            .pages
+            .iter()
+            .flat_map(|p| &p.wires)
+            .filter_map(|w| w.cable.as_ref().map(|c| c.cable.clone())),
+    );
     used
 }
 
@@ -89,7 +97,15 @@ pub fn place(
     let mut used = used_tags(project);
     let mut renamed: BTreeMap<&DeviceTag, Option<DeviceTag>> = BTreeMap::new();
     let mut devices: Vec<(DeviceTag, Device)> = Vec::new();
-    for old in group.symbols.iter().filter_map(|s| s.tag.as_ref()) {
+    // The cable of a wire core is a device of the group too, unless the group is a copy within
+    // this project: there the tag names the same real cable, while a macro's or another
+    // project's `-W1` would join an unrelated cable of the project.
+    let cables = group
+        .wires
+        .iter()
+        .filter(|_| data != DeviceData::ProjectFirst)
+        .filter_map(|w| w.cable.as_ref().map(|c| &c.cable));
+    for old in group.symbols.iter().filter_map(|s| s.tag.as_ref()).chain(cables) {
         if renamed.contains_key(old) {
             continue;
         }
@@ -132,9 +148,9 @@ pub fn place(
     }
     for w in group.wires {
         let mut w = w.clone();
-        // A core of a cable the group holds runs in that cable under its new tag; when the
-        // cable is placed without a tag, the core runs in no cable (not in the project's cable
-        // of the old tag).
+        // A core of a cable the group holds (drawn in it, or named by its cores outside a copy
+        // within the project) runs in that cable under its new tag; when the cable is placed
+        // without a tag, the core runs in no cable (not in the project's cable of the old tag).
         if let Some(c) = &w.cable
             && let Some(new) = renamed.get(&c.cable)
         {
@@ -252,6 +268,66 @@ mod tests {
     }
 
     #[test]
+    fn a_core_whose_cable_is_not_drawn_in_the_group_gets_a_new_cable_unless_copied_within() {
+        // Core BN of -W1, with the group's data for -W1 but no symbol tagged -W1.
+        let core = Wire {
+            id: "w1".into(),
+            from: Endpoint::Point {
+                at: Point::new(0.0, 0.0),
+            },
+            to: Endpoint::Point {
+                at: Point::new(5.0, 0.0),
+            },
+            via: vec![],
+            number: None,
+            potential: None,
+            cable: Some(crate::project::CableCore {
+                cable: tag("-W1"),
+                core: "BN".into(),
+            }),
+            route: Default::default(),
+            spec: Default::default(),
+        };
+        let wires = [core];
+        let group_devices = BTreeMap::from([(tag("-W1"), device("group's cable"))]);
+        let group = Group {
+            symbols: &[],
+            wires: &wires,
+            graphics: &[],
+            devices: &group_devices,
+            anchor: Point::new(0.0, 0.0),
+        };
+        let cable_of = |p: &Project, placed: &Placed| {
+            let w = p.pages[0].wires.iter().find(|w| w.id == placed.wires[0]).unwrap();
+            w.cable.as_ref().map(|c| (c.cable.to_string(), c.core.clone()))
+        };
+        // The project already has a cable -W1 of its own.
+        let mut p = project();
+        p.devices.insert(tag("-W1"), device("project's cable"));
+        for data in [DeviceData::GroupOnly, DeviceData::GroupFirst] {
+            let mut p = p.clone();
+            let first = place(&mut p, 0, group, Point::new(0.0, 0.0), data, OutOfTags::Fail).unwrap();
+            let second = place(&mut p, 0, group, Point::new(0.0, 0.0), data, OutOfTags::Fail).unwrap();
+            assert_eq!(cable_of(&p, &first), Some(("-W2".into(), "BN".into())), "{data:?}");
+            assert_eq!(cable_of(&p, &second), Some(("-W3".into(), "BN".into())), "{data:?}");
+            assert_eq!(p.devices[&tag("-W2")].description, "group's cable");
+            assert_eq!(p.devices[&tag("-W1")].description, "project's cable");
+        }
+        // A copy within the project keeps the core in the project's cable.
+        let placed = place(
+            &mut p,
+            0,
+            group,
+            Point::new(0.0, 0.0),
+            DeviceData::ProjectFirst,
+            OutOfTags::Fail,
+        )
+        .unwrap();
+        assert_eq!(cable_of(&p, &placed), Some(("-W1".into(), "BN".into())));
+        assert!(!p.devices.contains_key(&tag("-W2")));
+    }
+
+    #[test]
     fn when_tags_run_out_it_fails_untouched_or_places_untagged() {
         let mut p = project();
         // Every -K1 to -K9999 is taken.
@@ -347,5 +423,263 @@ mod tests {
             OutOfTags::Fail,
         );
         assert!(none.is_err());
+    }
+
+    fn tags(list: &[&str]) -> BTreeSet<DeviceTag> {
+        list.iter().map(|t| tag(t)).collect()
+    }
+
+    fn point_wire(id: &str, from: Endpoint, to: Endpoint) -> Wire {
+        Wire {
+            id: id.into(),
+            from,
+            to,
+            via: vec![],
+            number: None,
+            potential: None,
+            cable: None,
+            route: Default::default(),
+            spec: Default::default(),
+        }
+    }
+
+    #[test]
+    fn free_tag_like_keeps_function_and_location_and_takes_the_lowest_gap() {
+        let used = tags(&["=A1+L1-KF1", "=A1+L1-KF2", "=A1+L1-KF4", "-KF3"]);
+        let Some(t) = free_tag_like(&used, &tag("=A1+L1-KF2")) else {
+            unreachable!("a free tag")
+        };
+        // -KF3 is taken only without function and location, so it is free here.
+        assert_eq!(t.to_string(), "=A1+L1-KF3");
+        // The old number does not matter, only the letter code.
+        let Some(t) = free_tag_like(&used, &tag("=A1+L1-KF99")) else {
+            unreachable!("a free tag")
+        };
+        assert_eq!(t.to_string(), "=A1+L1-KF3");
+        let Some(t) = free_tag_like(&BTreeSet::new(), &tag("-X7")) else {
+            unreachable!("a free tag")
+        };
+        assert_eq!(t.to_string(), "-X1");
+    }
+
+    #[test]
+    fn free_tag_like_without_a_product_or_with_every_number_taken_is_none() {
+        // Parsing refuses such a tag, but the field is public.
+        let no_product = DeviceTag {
+            function: vec!["A1".into()],
+            ..DeviceTag::default()
+        };
+        assert_eq!(free_tag_like(&BTreeSet::new(), &no_product), None);
+        let used: BTreeSet<DeviceTag> = (1..10_000).map(|n| tag(&format!("-Q{n}"))).collect();
+        assert_eq!(free_tag_like(&used, &tag("-Q1")), None);
+        // Only 1 to 9999 count: -Q10000 is never offered.
+        let Some(t) = free_tag_like(&used, &tag("-QA1")) else {
+            unreachable!("another letter code is free")
+        };
+        assert_eq!(t.to_string(), "-QA1");
+    }
+
+    #[test]
+    fn used_tags_joins_page_tags_and_device_data() {
+        let mut p = project();
+        p.devices.insert(tag("-F3"), Device::default());
+        let Some(page) = p.pages.first_mut() else {
+            unreachable!("page 1")
+        };
+        page.symbols.push(symbol("s2", "-X2"));
+        page.symbols.push(PlacedSymbol {
+            tag: None,
+            ..symbol("s3", "-X9")
+        });
+        assert_eq!(used_tags(&p), tags(&["-K1", "-F3", "-X2"]));
+    }
+
+    #[test]
+    fn a_missing_page_is_an_error_naming_it_one_based_and_changes_nothing() {
+        let mut p = project();
+        let before = p.clone();
+        let symbols = [symbol("a", "-K1")];
+        let none = BTreeMap::new();
+        let group = Group {
+            symbols: &symbols,
+            wires: &[],
+            graphics: &[],
+            devices: &none,
+            anchor: Point::new(0.0, 0.0),
+        };
+        let res = place(
+            &mut p,
+            2,
+            group,
+            Point::new(0.0, 0.0),
+            DeviceData::GroupOnly,
+            OutOfTags::Fail,
+        );
+        let Err(e) = res else {
+            unreachable!("page 3 does not exist")
+        };
+        assert!(e.to_string().contains("no page 3"), "{e}");
+        assert_eq!(p, before);
+    }
+
+    #[test]
+    fn symbols_wires_and_drawings_move_by_anchor_to_point_and_wires_follow_new_ids() {
+        let mut p = project();
+        let mut a = symbol("s1", "-K1");
+        a.at = Point::new(10.0, 20.0);
+        let b = PlacedSymbol {
+            tag: None,
+            ..symbol("s2", "-X1")
+        };
+        let symbols = [a, b];
+        let mut w = point_wire(
+            "w1",
+            Endpoint::Pin {
+                item: "s1".into(),
+                pin: "A1".into(),
+            },
+            Endpoint::Point {
+                at: Point::new(30.0, 20.0),
+            },
+        );
+        w.via = vec![Point::new(20.0, 25.0)];
+        w.number = Some("7".into());
+        // A pin on an item outside the group keeps its id.
+        let outside = point_wire(
+            "w9",
+            Endpoint::Pin {
+                item: "s2".into(),
+                pin: "1".into(),
+            },
+            Endpoint::Pin {
+                item: "elsewhere".into(),
+                pin: "2".into(),
+            },
+        );
+        let wires = [w, outside];
+        let graphics = [Shape::Line {
+            a: Point::new(0.0, 0.0),
+            b: Point::new(10.0, 0.0),
+        }];
+        let none = BTreeMap::new();
+        let group = Group {
+            symbols: &symbols,
+            wires: &wires,
+            graphics: &graphics,
+            devices: &none,
+            anchor: Point::new(10.0, 20.0),
+        };
+        let Ok(placed) = place(
+            &mut p,
+            0,
+            group,
+            Point::new(100.0, 200.0),
+            DeviceData::ProjectFirst,
+            OutOfTags::Fail,
+        ) else {
+            unreachable!("placed")
+        };
+        // s1 is taken on the page, so the group's symbols get s2 and s3; its wires w1 and w2.
+        assert_eq!(placed.symbols, ["s2", "s3"]);
+        assert_eq!(placed.wires, ["w1", "w2"]);
+        assert_eq!(placed.graphics, [0]);
+        let Some(page) = p.pages.first() else {
+            unreachable!("page 1")
+        };
+        let Some(s) = page.symbol("s2") else { unreachable!("s2") };
+        assert_eq!(s.at, Point::new(100.0, 200.0));
+        assert_eq!(s.tag.as_ref().map(ToString::to_string).as_deref(), Some("-K2"));
+        let Some(s) = page.symbol("s3") else { unreachable!("s3") };
+        assert_eq!(s.tag, None);
+        assert_eq!(s.at, Point::new(100.0, 190.0));
+
+        let [w1, w2] = page.wires.as_slice() else {
+            unreachable!("two new wires")
+        };
+        assert_eq!((w1.id.as_str(), w2.id.as_str()), ("w1", "w2"));
+        assert!(matches!(&w1.from, Endpoint::Pin { item, pin } if item == "s2" && pin == "A1"));
+        assert!(matches!(w1.to, Endpoint::Point { at } if at == Point::new(120.0, 200.0)));
+        assert_eq!(w1.via, [Point::new(110.0, 205.0)]);
+        assert_eq!(w1.number, None, "a placed wire is numbered afresh");
+        assert!(matches!(&w2.from, Endpoint::Pin { item, .. } if item == "s3"));
+        assert!(matches!(&w2.to, Endpoint::Pin { item, .. } if item == "elsewhere"));
+        assert!(matches!(
+            page.graphics.first(),
+            Some(Shape::Line { a, b }) if *a == Point::new(90.0, 180.0) && *b == Point::new(100.0, 180.0)
+        ));
+    }
+
+    #[test]
+    fn one_device_of_the_group_becomes_one_new_device_and_its_cable_cores_follow() {
+        let mut p = project();
+        p.devices.insert(tag("-W1"), device("project cable"));
+        // Two symbols of -K1 (coil and contact) and a cable -W1 with a core.
+        let symbols = [symbol("a", "-K1"), symbol("b", "-K1"), symbol("c", "-W1")];
+        let mut core = point_wire(
+            "w1",
+            Endpoint::Point {
+                at: Point::new(0.0, 0.0),
+            },
+            Endpoint::Point {
+                at: Point::new(5.0, 0.0),
+            },
+        );
+        core.cable = Some(crate::project::CableCore {
+            cable: tag("-W1"),
+            core: "BU".into(),
+        });
+        // A core of a cable the group does not hold stays in that cable.
+        let mut other = core.clone();
+        other.id = "w2".into();
+        other.cable = Some(crate::project::CableCore {
+            cable: tag("-W8"),
+            core: "BK".into(),
+        });
+        let wires = [core, other];
+        let none = BTreeMap::new();
+        let group = Group {
+            symbols: &symbols,
+            wires: &wires,
+            graphics: &[],
+            devices: &none,
+            anchor: Point::new(0.0, 0.0),
+        };
+        let Ok(placed) = place(
+            &mut p,
+            0,
+            group,
+            Point::new(0.0, 0.0),
+            DeviceData::ProjectFirst,
+            OutOfTags::Fail,
+        ) else {
+            unreachable!("placed")
+        };
+        let Some(page) = p.pages.first() else {
+            unreachable!("page 1")
+        };
+        let new_tags: Vec<Option<String>> = placed
+            .symbols
+            .iter()
+            .map(|id| page.symbol(id).and_then(|s| s.tag.as_ref()).map(ToString::to_string))
+            .collect();
+        let want = |s: &str| Some(s.to_string());
+        assert_eq!(new_tags, [want("-K2"), want("-K2"), want("-W2")]);
+        assert_eq!(
+            p.devices.keys().map(ToString::to_string).collect::<Vec<_>>(),
+            ["-K1", "-K2", "-W1", "-W2"]
+        );
+        assert_eq!(
+            p.devices.get(&tag("-W2")).map(|d| d.description.as_str()),
+            Some("project cable")
+        );
+        let cable_of = |id: &str| {
+            page.wires
+                .iter()
+                .find(|w| w.id == id)
+                .and_then(|w| w.cable.as_ref())
+                .map(|c| (c.cable.to_string(), c.core.clone()))
+        };
+        assert_eq!(cable_of("w1"), Some(("-W2".into(), "BU".into())));
+        assert_eq!(cable_of("w2"), Some(("-W8".into(), "BK".into())));
     }
 }
